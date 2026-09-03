@@ -38,7 +38,7 @@ jobs:
             tests/e2e-ui -> target
           shared-key: e2e-ui-offline
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -77,7 +77,7 @@ jobs:
             tests/e2e-ui -> target
           shared-key: e2e-ui-browser
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -218,7 +218,7 @@ jobs:
             tests/e2e-ui -> target
           shared-key: e2e-ui-local-gitops
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
