@@ -153,7 +153,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-ui-playwright-report
           path: |
@@ -768,7 +768,7 @@ jobs:
 
       - name: Upload Kubernetes Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-ui-k8s-playwright-report
           path: |
@@ -801,7 +801,7 @@ jobs:
 
       - name: Upload Kubernetes diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-ui-k8s-diagnostics
           path: |
