@@ -270,6 +270,8 @@ pub fn build_role_schema(
                         .unwrap_or_else(Session::new);
                     let authority = ctx.data_opt::<ExecutionAuthority>().cloned();
                     let protocol = ctx.data_opt::<ProtocolResponseAccumulator>().cloned();
+                    #[cfg(feature = "gateway-delivery")]
+                    let captured = ctx.data_opt::<super::delivery::PlanCapture>().cloned();
                     let selection = compile::selection_from_field(ctx.field());
                     SubscriptionFieldFuture::new(async move {
                         let inner = inner.ok_or_else(|| {
@@ -280,6 +282,31 @@ pub fn build_role_schema(
                             &session,
                             &inner.anonymous_role,
                         );
+                        #[cfg(feature = "gateway-delivery")]
+                        if let Some(captured) = captured {
+                            let plan = compile::compile_query(
+                                &inner,
+                                &session,
+                                &role,
+                                &model,
+                                compile::RootKind::List,
+                                &selection,
+                            )
+                            .map_err(async_graphql::Error::new)?;
+                            if let compile::QueryPlan::Sql(plan) = plan {
+                                captured
+                                    .0
+                                    .lock()
+                                    .map_err(|_| {
+                                        async_graphql::Error::new("plan capture unavailable")
+                                    })?
+                                    .push(plan);
+                                return Err(async_graphql::Error::new(super::delivery::CAPTURED));
+                            }
+                            return Err(async_graphql::Error::new(
+                                "query is ineligible for delivery reuse",
+                            ));
+                        }
                         let stream = super::subscribe::live_query_stream(
                             inner, session, role, model, selection, protocol,
                         )
@@ -756,6 +783,20 @@ async fn resolve_root(
     let selection = compile::selection_from_field(ctx.field());
     let plan = compile::compile_query(&inner, &session, &role, model, kind, &selection)
         .map_err(|e| client_error("BAD_REQUEST", sanitize_compile_error(&e)))?;
+    #[cfg(feature = "gateway-delivery")]
+    if let Some(captured) = ctx.data_opt::<super::delivery::PlanCapture>() {
+        if let QueryPlan::Sql(plan) = plan {
+            let mut plans = captured
+                .0
+                .lock()
+                .map_err(|_| client_error("INTERNAL", "plan capture unavailable"))?;
+            plans.push(plan);
+            return Err(async_graphql::Error::new(super::delivery::CAPTURED));
+        }
+        return Err(async_graphql::Error::new(
+            "query is ineligible for delivery reuse",
+        ));
+    }
     let value = match plan {
         QueryPlan::CellByKey {
             model,
@@ -765,12 +806,19 @@ async fn resolve_root(
             .await
             .map_err(|_| client_error("INTERNAL", "cell read dependency failed"))?,
         QueryPlan::Sql(plan) => {
+            let (pool, primary) = (&inner.pool, true);
+            #[cfg(feature = "gateway-delivery")]
+            let (pool, primary) = ctx
+                .data_opt::<super::engine::read_routing::ReadRequest>()
+                .map_or((pool, primary), |read| read.pool(&inner, &plan));
             if let Some(protocol) = ctx.data_opt::<ProtocolResponseAccumulator>().cloned() {
                 let role_surface = inner.role_surfaces.get(&role).cloned().ok_or_else(|| {
                     client_error("INTERNAL", "authorized GraphQL role surface is unavailable")
                 })?;
                 let executed = super::query_protocol::execute_query_with_protocol(
                     &inner,
+                    pool,
+                    primary,
                     role_surface,
                     protocol.clone(),
                     &plan,
@@ -783,7 +831,7 @@ async fn resolve_root(
                     .map_err(|_| client_error("INTERNAL", "query evidence encoding failed"))?;
                 executed.value
             } else {
-                super::engine::execute_plan(&inner, &plan)
+                super::execute::execute_sql_on_pool(&inner, pool, primary, &plan)
                     .await
                     .map_err(|e| client_error_for_execute_err(&e))?
             }

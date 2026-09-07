@@ -638,3 +638,92 @@ async fn domain_service_shaped_fixture() {
     assert_eq!(data["users"][0]["name"], "ada");
     assert_eq!(data["orders"][0]["name"], "widget");
 }
+
+#[cfg(feature = "gateway-delivery")]
+#[tokio::test]
+async fn gateway_dependency_inventory_includes_empty_relationship_filters() {
+    use distributed::graphql::{delivery::GatewayVersionStore, GraphqlPool};
+    use serde_json::{json, Value};
+    let pool = SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for sql in [
+        "CREATE TABLE m2m_players (player_id TEXT PRIMARY KEY, name TEXT NOT NULL)",
+        "CREATE TABLE m2m_weapons (weapon_id TEXT PRIMARY KEY, name TEXT NOT NULL)",
+        "CREATE TABLE m2m_player_weapon_links (player_ref TEXT NOT NULL, weapon_ref TEXT NOT NULL)",
+        "INSERT INTO m2m_players VALUES ('p1', 'Ada')",
+        "INSERT INTO m2m_weapons VALUES ('w1', 'Compiler')",
+    ] {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
+    let store = GatewayVersionStore::install(
+        &GraphqlPool::Sqlite(pool.clone()),
+        "relationship-test",
+        [
+            "m2m_players".into(),
+            "m2m_weapons".into(),
+            "m2m_player_weapon_links".into(),
+        ],
+    )
+    .await
+    .unwrap();
+    let engine = GraphqlEngine::builder(pool.clone())
+        .service_id("relationship-test")
+        .protocol_token_key([17; 32])
+        .table_schema(m2m_link_schema())
+        .model::<M2mPlayer>(ModelPermissions::new().grant("user", read().all_columns()))
+        .model::<M2mWeapon>(ModelPermissions::new().grant("user", read().all_columns()))
+        .roles(&["user"])
+        .gateway_versions(store)
+        .build()
+        .unwrap();
+    let document = r#"{ m2m_players(where: { weapons: { name: { _eq: "Compiler" } } }) { name } }"#;
+    let validate = || async {
+        let mut request = Request::new(document);
+        request.extensions.insert(
+            "gatewayDelivery".into(),
+            async_graphql::Value::from_json(json!({"action":"validate"})).unwrap(),
+        );
+        let response: Value =
+            serde_json::to_value(engine.execute(&session_role("user", "u1"), request).await)
+                .unwrap();
+        assert_eq!(
+            response["extensions"]["gatewayDelivery"]["eligible"], true,
+            "{response}"
+        );
+        response["extensions"]["gatewayDelivery"]["admission"]["validator"].clone()
+    };
+    let empty = validate().await;
+    sqlx::query("INSERT INTO m2m_player_weapon_links VALUES ('p1','w1')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let linked = validate().await;
+    assert_ne!(linked, empty);
+    let rows = engine
+        .execute(&session_role("user", "u1"), Request::new(document))
+        .await;
+    assert_eq!(
+        serde_json::to_value(rows.data).unwrap()["m2m_players"],
+        json!([{"name":"Ada"}])
+    );
+    sqlx::query("UPDATE m2m_weapons SET name='Debugger'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let changed_target = validate().await;
+    assert_ne!(changed_target, linked);
+    sqlx::query("DELETE FROM m2m_player_weapon_links")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_ne!(validate().await, changed_target);
+    let response = engine
+        .execute(&session_role("user", "u1"), Request::new(document))
+        .await;
+    assert_eq!(
+        serde_json::to_value(response.data).unwrap()["m2m_players"],
+        json!([])
+    );
+}

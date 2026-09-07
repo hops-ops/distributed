@@ -95,6 +95,8 @@ struct ProtocolResponseState {
     stream_frames: Mutex<Option<VecDeque<DistributedEnvelopeV1>>>,
     dispatch_claimed: Mutex<bool>,
     codec: ProtocolTokenCodec,
+    #[cfg(feature = "gateway-delivery")]
+    gateway: Mutex<Option<crate::graphql::delivery::GatewayCapture>>,
 }
 
 impl ProtocolResponseAccumulator {
@@ -108,6 +110,8 @@ impl ProtocolResponseAccumulator {
                 stream_frames: Mutex::new(None),
                 dispatch_claimed: Mutex::new(false),
                 codec,
+                #[cfg(feature = "gateway-delivery")]
+                gateway: Mutex::new(None),
             }),
         }
     }
@@ -974,6 +978,43 @@ impl ProtocolResponseAccumulator {
             .map_err(|_| ProtocolAccumulatorError::Poisoned)
     }
 
+    #[cfg(feature = "gateway-delivery")]
+    pub(crate) fn enable_gateway(
+        &self,
+        capture: crate::graphql::delivery::GatewayCapture,
+    ) -> Result<(), ProtocolAccumulatorError> {
+        *self
+            .inner
+            .gateway
+            .lock()
+            .map_err(|_| ProtocolAccumulatorError::Poisoned)? = Some(capture);
+        Ok(())
+    }
+    #[cfg(feature = "gateway-delivery")]
+    pub(crate) fn gateway_enabled(&self) -> bool {
+        self.inner.gateway.lock().is_ok_and(|state| state.is_some())
+    }
+    #[cfg(feature = "gateway-delivery")]
+    pub(crate) fn record_gateway_versions(
+        &self,
+        versions: &crate::graphql::delivery::VersionVector,
+    ) -> Result<(), String> {
+        let mut state = self
+            .inner
+            .gateway
+            .lock()
+            .map_err(|_| "gateway capture unavailable")?;
+        if let Some(state) = state.as_mut() {
+            state.validator = Some(crate::graphql::delivery::validator(
+                &self.inner.codec,
+                &state.identity,
+                &state.key,
+                versions,
+            )?);
+        }
+        Ok(())
+    }
+
     pub(crate) fn attach(&self, response: &mut Response) -> Result<(), ProtocolAccumulatorError> {
         if response.extensions.contains_key("distributed") {
             return Err(ProtocolAccumulatorError::ExtensionCollision);
@@ -998,6 +1039,21 @@ impl ProtocolResponseAccumulator {
             serde_json::to_value(envelope).map_err(|_| ProtocolAccumulatorError::Encoding)?;
         let value = Value::from_json(json).map_err(|_| ProtocolAccumulatorError::Encoding)?;
         response.extensions.insert("distributed".into(), value);
+        #[cfg(feature = "gateway-delivery")]
+        if response.errors.is_empty() {
+            let state = self
+                .inner
+                .gateway
+                .lock()
+                .map_err(|_| ProtocolAccumulatorError::Poisoned)?;
+            if let Some(validator) = state.as_ref().and_then(|state| state.validator.as_ref()) {
+                response.extensions.insert(
+                    "gatewayDelivery".into(),
+                    Value::from_json(serde_json::json!({"validator":validator}))
+                        .map_err(|_| ProtocolAccumulatorError::Encoding)?,
+                );
+            }
+        }
         Ok(())
     }
 }

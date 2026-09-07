@@ -2813,6 +2813,14 @@ mod tests {
     #[tokio::test]
     async fn sqlite_direct_projection_and_ledger_replay_commit_atomically() {
         let repository = repository().await;
+        #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+        let (cache_store, cache_pool, cache_tables, cache_before) = {
+            let pool = crate::graphql::GraphqlPool::Sqlite(repository.pool().clone());
+            let tables = vec!["sql_todo_views".to_owned()];
+            let store = crate::graphql::delivery::GatewayVersionStore::install(&pool, "atomic-cache-test", tables.clone()).await.unwrap();
+            let before = serde_json::to_value(store.current(&pool, &tables).await.unwrap()).unwrap();
+            (store, pool, tables, before)
+        };
         let command_id = uuid::Uuid::now_v7().hyphenated().to_string();
         let key = CommandLedgerKey::new(
             "projection-runtime-test",
@@ -2862,6 +2870,12 @@ mod tests {
             .await
             .unwrap();
 
+        #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+        let cache_committed = {
+            let committed = serde_json::to_value(cache_store.current(&cache_pool, &cache_tables).await.unwrap()).unwrap();
+            assert_ne!(committed, cache_before, "Atomic result and cache dependency versions commit together");
+            committed
+        };
         let metadata = repository
             .projection_record(&record_scope())
             .await
@@ -2956,6 +2970,9 @@ mod tests {
                 .unwrap(),
             CommandLookup::InProgress { .. }
         ));
+        #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+        assert_eq!(serde_json::to_value(cache_store.current(&cache_pool, &cache_tables).await.unwrap()).unwrap(), cache_committed,
+            "failed Atomic ledger completion must roll back cache versions too");
         sqlx::query("DROP TRIGGER fail_direct_ledger_completion")
             .execute(repository.pool())
             .await

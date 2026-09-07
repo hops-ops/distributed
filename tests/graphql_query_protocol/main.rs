@@ -1219,19 +1219,51 @@ async fn query_over_http_and_graphql_ws(
     (http, next["payload"].clone())
 }
 
+#[derive(Clone, Copy)]
+enum QueryGatewayMode {
+    Direct,
+    #[cfg(feature = "gateway-graphql-native")]
+    Embedded,
+    #[cfg(feature = "gateway-graphql-native")]
+    Remote,
+}
+
 #[tokio::test]
 async fn http_and_graphql_ws_serialize_the_same_query_revision_envelope() {
+    exercise_query_transport(QueryGatewayMode::Direct).await;
+}
+
+#[cfg(feature = "gateway-graphql-native")]
+#[tokio::test]
+async fn gateway_embedded_query_revision_parity() {
+    exercise_query_transport(QueryGatewayMode::Embedded).await;
+}
+
+#[cfg(feature = "gateway-graphql-native")]
+#[tokio::test]
+async fn gateway_remote_query_revision_parity() {
+    exercise_query_transport(QueryGatewayMode::Remote).await;
+}
+
+async fn exercise_query_transport(mode: QueryGatewayMode) {
     let fixture = protocol_fixture_with_retention(10).await;
-    let engine = GraphqlEngine::builder(&fixture.repository)
+    let builder = GraphqlEngine::builder(&fixture.repository)
         .service_id(SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
         .anonymous_role("user")
         .model::<CausalQueryView>(ModelPermissions::new().grant("user", read().all_columns()))
         .client_projectors([projector()])
-        .change_stream(fixture.repository.read_model_changes())
-        .build()
-        .expect("query transport parity engine");
+        .change_stream(fixture.repository.read_model_changes());
+    #[cfg(feature = "gateway-graphql-native")]
+    let builder = match mode {
+        QueryGatewayMode::Direct => builder,
+        _ => builder.identity(distributed::graphql::IdentityConfig::oidc_bearer(
+            distributed::graphql::OidcConfig::new("http://local-fixture.invalid", "query-api")
+                .require_auth(false),
+        )),
+    };
+    let engine = builder.build().expect("query transport parity engine");
     let service = Arc::new(
         Service::new()
             .named(SERVICE_ID)
@@ -1242,8 +1274,67 @@ async fn http_and_graphql_ws_serialize_the_same_query_revision_envelope() {
         .await
         .expect("query transport listener");
     let address = listener.local_addr().expect("query transport address");
+    #[allow(unused_mut)]
+    let mut upstream = None::<tokio::task::JoinHandle<()>>;
+    let router = match mode {
+        QueryGatewayMode::Direct => distributed::microsvc::router(service),
+        #[cfg(feature = "gateway-graphql-native")]
+        mode => {
+            use distributed::gateway::{native::*, *};
+            let caps = GraphqlCapabilities {
+                commands: false,
+                queries: true,
+                live: true,
+            };
+            let (executor, binding) = match mode {
+                QueryGatewayMode::Embedded => (
+                    GraphqlExecutor::Embedded,
+                    GraphqlBinding::Embedded(
+                        EmbeddedGraphql::new(service.graphql_engine().unwrap(), None, caps)
+                            .unwrap(),
+                    ),
+                ),
+                QueryGatewayMode::Remote => {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let origin = format!("http://{}", listener.local_addr().unwrap());
+                    upstream = Some(tokio::spawn(async move {
+                        axum::serve(listener, distributed::microsvc::router(service))
+                            .await
+                            .unwrap()
+                    }));
+                    (
+                        GraphqlExecutor::Remote { origin },
+                        GraphqlBinding::Remote(RemoteGraphql::default()),
+                    )
+                }
+                QueryGatewayMode::Direct => unreachable!(),
+            };
+            let config = GatewayConfig {
+                bindings: vec![Binding::new(
+                    "graphql",
+                    BindingKind::Graphql {
+                        executor,
+                        capabilities: caps,
+                        delivery: DeliveryCapabilities::default(),
+                        schema_extensions: vec![],
+                    },
+                )],
+                routes: vec![Route::new("api", RoutePath::prefix("/graphql"), "graphql")],
+            }
+            .build()
+            .unwrap();
+            NativeGateway::new(
+                config,
+                NativeOptions::new(format!("http://{address}")),
+                [("graphql".into(), NativeBinding::Graphql(binding))],
+                NativeAuth::anonymous(),
+            )
+            .unwrap()
+            .router()
+        }
+    };
     let server = tokio::spawn(async move {
-        axum::serve(listener, distributed::microsvc::router(service))
+        axum::serve(listener, router)
             .await
             .expect("query transport server");
     });
@@ -1261,7 +1352,117 @@ async fn http_and_graphql_ws_serialize_the_same_query_revision_envelope() {
             "{case}: HTTP and GraphQL-WS must preserve one canonical query/revision envelope"
         );
     }
+    // Exercise committed projection changes through the actual socket path,
+    // including redundant invalidation and immutable per-frame causal metadata.
+    let mut request = format!("ws://{address}/graphql/ws")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        SEC_WEBSOCKET_PROTOCOL,
+        "graphql-transport-ws".parse().unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket
+        .send(WsMessage::Text(
+            json!({"type":"connection_init"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    let ack = socket.next().await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(ack.to_text().unwrap()).unwrap()["type"],
+        "connection_ack"
+    );
+    socket
+        .send(WsMessage::Text(
+            json!({"id":"live-proof", "type":"subscribe", "payload":{"query":LIVE_SUBSCRIPTION}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    for position in 1..=3 {
+        if position > 1 {
+            project_item(
+                &fixture.repository,
+                &fixture.bus,
+                position,
+                &format!("causal row {position}"),
+            )
+            .await;
+        }
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["id"], "live-proof");
+        assert_eq!(frame["type"], "next");
+        let title = if position == 1 {
+            "causal row".into()
+        } else {
+            format!("causal row {position}")
+        };
+        assert_live_frame(
+            &frame["payload"],
+            "causal_query_views",
+            &title,
+            &position.to_string(),
+            false,
+        );
+        if position > 1 {
+            assert_eq!(
+                distributed_envelope(&frame["payload"])["snapshot"]["observations"][0]
+                    ["causationId"],
+                format!("query-protocol-command-{position}")
+            );
+        }
+        frames.push(frame["payload"].clone());
+        fixture
+            .repository
+            .publish_read_model_change(distributed::ReadModelChange::new(["causal_query_views"]));
+        let redundant = tokio::time::timeout(Duration::from_millis(350), socket.next()).await;
+        if position == 1 {
+            assert!(
+                redundant.is_err(),
+                "identical data and metadata must be suppressed"
+            );
+        } else {
+            // The origin emits a proof-only frame as its causation suffix moves
+            // to the new head. Preserve it even though domain data is identical.
+            let redundant = redundant.unwrap().unwrap().unwrap();
+            let proof: Value = serde_json::from_str(redundant.to_text().unwrap()).unwrap();
+            assert_eq!(proof["id"], "live-proof");
+            assert_eq!(proof["payload"]["data"], frame["payload"]["data"]);
+            assert_eq!(
+                distributed_envelope(&proof["payload"])["snapshot"]["observations"],
+                json!([])
+            );
+            fixture
+                .repository
+                .publish_read_model_change(distributed::ReadModelChange::new([
+                    "causal_query_views",
+                ]));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(350), socket.next())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+    for (i, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            distributed_envelope(frame)["snapshot"]["indexes"][0]["position"],
+            (i + 1).to_string()
+        );
+    }
+    socket.close(None).await.unwrap();
     server.abort();
+    if let Some(upstream) = upstream {
+        upstream.abort();
+    }
 }
 
 #[tokio::test]
@@ -1294,4 +1495,910 @@ async fn unowned_legacy_query_is_explicitly_incomplete_and_still_strips_keys() {
     assert_eq!(snapshot["indexes"], json!([]));
     assert_eq!(snapshot["observations"], json!([]));
     assert_opaque_token(&snapshot["scopeToken"], "query-snapshot");
+}
+
+#[cfg(feature = "gateway-delivery")]
+#[tokio::test]
+async fn freshness_context_binds_origin_and_rejects_unproven_minima() {
+    use distributed::gateway::delivery::{FreshnessContext, Minimum};
+    let fixture = protocol_fixture_with_retention(10).await;
+    let document = "query ReadFreshness { causal_query_views { title } }";
+    let request = || Request::new(document);
+    let identity = fixture
+        .engine
+        .delivery_identity(&user_session(), &request())
+        .unwrap();
+    let mut context = FreshnessContext::parse(&json!({
+        "version":1, "schemaHash":identity.schema_hash, "protocolHash":identity.protocol_hash,
+        "authorizationGeneration":identity.authorization_generation, "cacheScope":identity.cache_scope,
+        "pending":[{"complete":true,"models":["CausalQueryView"],"relationships":[]}], "minimum":[]
+    })).unwrap();
+    let with_context = |context: &FreshnessContext| {
+        let mut request = request();
+        request.extensions.insert(
+            "gatewayFreshness".into(),
+            async_graphql::Value::from_json(serde_json::to_value(context).unwrap()).unwrap(),
+        );
+        request
+    };
+    let before = wire_response(
+        fixture
+            .engine
+            .execute(&user_session(), with_context(&context))
+            .await,
+    );
+    assert_eq!(
+        before["data"]["causal_query_views"][0]["title"],
+        "causal row"
+    );
+    assert_eq!(
+        distributed_envelope(&before)["snapshot"]["observations"],
+        json!([])
+    );
+    project_item(&fixture.repository, &fixture.bus, 2, "committed").await;
+    let after = wire_response(
+        fixture
+            .engine
+            .execute(&user_session(), with_context(&context))
+            .await,
+    );
+    let index = &distributed_envelope(&after)["snapshot"]["indexes"][0];
+    context
+        .observe([Minimum::Index {
+            projection: index["projection"].as_str().unwrap().into(),
+            scope_token: index["scopeToken"].as_str().unwrap().into(),
+            position: "2".into(),
+        }])
+        .unwrap();
+    context.pending.clear();
+    assert_eq!(
+        wire_response(
+            fixture
+                .engine
+                .execute(&user_session(), with_context(&context))
+                .await
+        )["data"]["causal_query_views"][0]["title"],
+        "committed"
+    );
+    let mut future = context.clone();
+    if let Minimum::Index { position, .. } = &mut future.minimum[0] {
+        *position = "999".into();
+    }
+    let rejected = serde_json::to_value(
+        fixture
+            .engine
+            .execute(&user_session(), with_context(&future))
+            .await,
+    )
+    .unwrap();
+    assert_eq!(
+        rejected["errors"][0]["extensions"]["code"],
+        "FRESHNESS_PENDING"
+    );
+    assert!(rejected["data"].is_null());
+    let mut forged = context;
+    forged.cache_scope = "another-subject".into();
+    assert_eq!(
+        serde_json::to_value(
+            fixture
+                .engine
+                .execute(&user_session(), with_context(&forged))
+                .await
+        )
+        .unwrap()["errors"][0]["extensions"]["code"],
+        "FRESHNESS_SCOPE_CHANGED"
+    );
+}
+
+#[cfg(feature = "gateway-delivery")]
+#[tokio::test]
+async fn gateway_validator_tracks_projection_commit_in_the_result_snapshot() {
+    use distributed::graphql::delivery::GatewayVersionStore;
+    let fixture = protocol_fixture_with_retention(10).await;
+    let pool = distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone());
+    let store =
+        GatewayVersionStore::install(&pool, "query-protocol-cache", ["causal_query_views".into()])
+            .await
+            .unwrap();
+    let engine = GraphqlEngine::builder(&fixture.repository)
+        .service_id(SERVICE_ID)
+        .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
+        .roles(&["user"])
+        .anonymous_role("user")
+        .model::<CausalQueryView>(ModelPermissions::new().grant("user", read().all_columns()))
+        .client_projectors([projector()])
+        .gateway_versions(store.clone())
+        .build()
+        .unwrap();
+    let request = |action: &str| {
+        let mut request = Request::new("query CachedRows { causal_query_views { title } }");
+        request.extensions.insert(
+            "gatewayDelivery".into(),
+            async_graphql::Value::from_json(json!({"action":action})).unwrap(),
+        );
+        request
+    };
+    let validate = wire_response(engine.execute(&user_session(), request("validate")).await);
+    assert_eq!(
+        validate["extensions"]["gatewayDelivery"]["eligible"], true,
+        "{validate}"
+    );
+    let validator = validate["extensions"]["gatewayDelivery"]["admission"]["validator"].clone();
+    let first = wire_response(engine.execute(&user_session(), request("snapshot")).await);
+    assert_eq!(
+        first["extensions"]["gatewayDelivery"]["validator"], validator,
+        "{first}"
+    );
+    assert_eq!(
+        first["data"]["causal_query_views"][0]["title"],
+        "causal row"
+    );
+    project_item(&fixture.repository, &fixture.bus, 2, "changed").await;
+    let validate = wire_response(engine.execute(&user_session(), request("validate")).await);
+    assert_ne!(
+        validate["extensions"]["gatewayDelivery"]["admission"]["validator"],
+        validator
+    );
+    let second = wire_response(engine.execute(&user_session(), request("snapshot")).await);
+    assert_eq!(
+        second["extensions"]["gatewayDelivery"]["validator"],
+        validate["extensions"]["gatewayDelivery"]["admission"]["validator"]
+    );
+    assert_eq!(second["data"]["causal_query_views"][0]["title"], "changed");
+    assert_eq!(
+        distributed_envelope(&second)["snapshot"]["indexes"][0]["position"],
+        "2"
+    );
+    store.rotate_epoch(&pool).await.unwrap();
+    let next_epoch = wire_response(engine.execute(&user_session(), request("validate")).await);
+    assert_ne!(
+        next_epoch["extensions"]["gatewayDelivery"]["admission"]["validator"],
+        second["extensions"]["gatewayDelivery"]["validator"]
+    );
+    // A failed write transaction cannot advance the cache dependency version.
+    let mut tx = fixture.repository.pool().begin().await.unwrap();
+    sqlx::query("UPDATE causal_query_views SET title='rolled back'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    let rolled_back = wire_response(engine.execute(&user_session(), request("validate")).await);
+    assert_eq!(
+        rolled_back["extensions"]["gatewayDelivery"]["admission"]["validator"],
+        next_epoch["extensions"]["gatewayDelivery"]["admission"]["validator"]
+    );
+}
+
+#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[tokio::test]
+async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql() {
+    use axum::{routing::post, Router};
+    use distributed::gateway::{delivery::SnapshotLimits, native::*, *};
+    use distributed::graphql::delivery::GatewayVersionStore;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tower::ServiceExt;
+    let fixture = protocol_fixture_with_retention(10).await;
+    let pool = distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone());
+    let store = GatewayVersionStore::install(&pool, "native-cache", ["causal_query_views".into()])
+        .await
+        .unwrap();
+    let engine = Arc::new(
+        GraphqlEngine::builder(&fixture.repository)
+            .service_id(SERVICE_ID)
+            .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
+            .roles(&["user"])
+            .anonymous_role("user")
+            .subscriptions(false)
+            .model::<CausalQueryView>(
+                ModelPermissions::new().grant("user", read().all_columns().aggregations()),
+            )
+            .client_projectors([projector()])
+            .gateway_versions(store.clone())
+            .build()
+            .unwrap(),
+    );
+    let revoked = Arc::new(AtomicBool::new(false));
+    let origin = {
+        let engine = engine.clone();
+        let revoked = revoked.clone();
+        Router::new().route(
+            "/graphql",
+            post(move |axum::Json(value): axum::Json<serde_json::Value>| {
+                let engine = engine.clone();
+                let revoked = revoked.clone();
+                async move {
+                    if revoked.load(Ordering::SeqCst) {
+                        return (
+                            axum::http::StatusCode::UNAUTHORIZED,
+                            axum::Json(json!({"error":"denied"})),
+                        );
+                    }
+                    let request: Request = serde_json::from_value(value).unwrap();
+                    (
+                        axum::http::StatusCode::OK,
+                        axum::Json(
+                            serde_json::to_value(engine.execute(&user_session(), request).await)
+                                .unwrap(),
+                        ),
+                    )
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_url = format!("http://{}", listener.local_addr().unwrap());
+    let origin_task = tokio::spawn(async move { axum::serve(listener, origin).await.unwrap() });
+    struct Stop(tokio::task::JoinHandle<()>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _origin = Stop(origin_task);
+    for remote in [false, true] {
+        let caps = GraphqlCapabilities {
+            queries: true,
+            ..Default::default()
+        };
+        let executor = if remote {
+            GraphqlExecutor::Remote {
+                origin: origin_url.clone(),
+            }
+        } else {
+            GraphqlExecutor::Embedded
+        };
+        let binding = if remote {
+            GraphqlBinding::Remote(RemoteGraphql {
+                live_path: None,
+                ..Default::default()
+            })
+        } else {
+            GraphqlBinding::Embedded(EmbeddedGraphql::new(engine.clone(), None, caps).unwrap())
+        };
+        let delivery = Arc::new(NativeDelivery::snapshots(SnapshotLimits::default()).unwrap());
+        let config = GatewayConfig {
+            bindings: vec![Binding::new(
+                "api",
+                BindingKind::Graphql {
+                    executor,
+                    capabilities: caps,
+                    delivery: DeliveryCapabilities {
+                        snapshots: true,
+                        ..Default::default()
+                    },
+                    schema_extensions: vec![],
+                },
+            )],
+            routes: vec![Route::new("api", RoutePath::prefix("/graphql"), "api")],
+        }
+        .build()
+        .unwrap();
+        let gateway = NativeGateway::new(
+            config,
+            NativeOptions::new("http://public.invalid"),
+            [(
+                "api".into(),
+                NativeBinding::GraphqlWithDelivery(binding, delivery.clone()),
+            )],
+            NativeAuth::anonymous(),
+        )
+        .unwrap()
+        .router();
+        let run = |document: &str| {
+            let gateway = gateway.clone();
+            let body = serde_json::to_vec(&json!({"query": document})).unwrap();
+            async move {
+                let response = gateway
+                    .oneshot(
+                        axum::http::Request::post("/graphql")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                )
+            }
+        };
+        let document = "query Cache { causal_query_views { title } }";
+        let before = store.metrics();
+        let (status, first) = run(document).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(first.get("errors").is_none(), "{first}");
+        assert!(
+            first["extensions"]["gatewayDelivery"]["validator"].is_string(),
+            "{first}"
+        );
+        let filled = store.metrics();
+        assert_eq!(filled.result_executions, before.result_executions + 1);
+        assert_eq!(filled.validations, before.validations + 2);
+        for _ in 0..5 {
+            assert_eq!(run(document).await.1, first);
+        }
+        let hit = store.metrics();
+        assert_eq!(
+            hit.result_executions, filled.result_executions,
+            "cache hit ran result SQL"
+        );
+        assert_eq!(
+            hit.validations,
+            filled.validations + 5,
+            "each consumer needs fresh origin admission"
+        );
+        // No invalidation feed is connected: transactional dependency validation
+        // must still discover a supported external SQL producer's update.
+        sqlx::query("UPDATE causal_query_views SET title=title || '-external'")
+            .execute(fixture.repository.pool())
+            .await
+            .unwrap();
+        let changed = run(document).await.1;
+        assert_ne!(changed["data"], first["data"]);
+        assert_eq!(store.metrics().result_executions, hit.result_executions + 1);
+        assert_eq!(run(document).await.1, changed);
+        delivery.invalidate_all();
+        assert_eq!(run(document).await.1, changed);
+        assert_eq!(store.metrics().result_executions, hit.result_executions + 2);
+        if remote {
+            revoked.store(true, Ordering::SeqCst);
+            assert_eq!(
+                run(document).await.0,
+                axum::http::StatusCode::UNAUTHORIZED,
+                "no private stale-on-auth-error"
+            );
+            assert_eq!(store.metrics().result_executions, hit.result_executions + 2);
+            revoked.store(false, Ordering::SeqCst);
+        }
+        // A projection can advance evidence while leaving selected data equal.
+        let title = changed["data"]["causal_query_views"][0]["title"]
+            .as_str()
+            .unwrap();
+        project_item(
+            &fixture.repository,
+            &fixture.bus,
+            if remote { 3 } else { 2 },
+            title,
+        )
+        .await;
+        let proof_only = run(document).await.1;
+        assert_eq!(proof_only["data"], changed["data"]);
+        assert_ne!(
+            proof_only["extensions"]["gatewayDelivery"]["validator"],
+            changed["extensions"]["gatewayDelivery"]["validator"]
+        );
+        let filtered =
+            "query Filtered { causal_query_views(where: {title: {_eq: \"matching\"}}) { title } }";
+        let count = "query Count { causal_query_views_aggregate(where: {title: {_eq: \"matching\"}}) { aggregate { count } } }";
+        assert_eq!(
+            run(filtered).await.1["data"]["causal_query_views"],
+            json!([])
+        );
+        let empty_count = run(count).await.1;
+        assert!(empty_count.get("errors").is_none(), "{empty_count}");
+        assert_eq!(
+            empty_count["data"]["causal_query_views_aggregate"]["aggregate"]["count"],
+            0
+        );
+        let filled = store.metrics();
+        run(filtered).await;
+        run(count).await;
+        assert_eq!(store.metrics().result_executions, filled.result_executions);
+        sqlx::query("UPDATE causal_query_views SET title='matching'")
+            .execute(fixture.repository.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            run(filtered).await.1["data"]["causal_query_views"][0]["title"],
+            "matching"
+        );
+        assert_eq!(
+            run(count).await.1["data"]["causal_query_views_aggregate"]["aggregate"]["count"],
+            1
+        );
+    }
+}
+
+#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[tokio::test]
+async fn hundred_reads_one_execution_with_cache_disabled() {
+    use axum::{routing::post, Router};
+    use distributed::gateway::{delivery::FlightLimits, native::*, *};
+    use distributed::graphql::delivery::GatewayVersionStore;
+    use tower::ServiceExt;
+    let fixture = protocol_fixture_with_retention(10).await;
+    let store = GatewayVersionStore::install(
+        &distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone()),
+        "flight-test",
+        ["causal_query_views".into()],
+    )
+    .await
+    .unwrap();
+    let engine = Arc::new(
+        GraphqlEngine::builder(&fixture.repository)
+            .service_id(SERVICE_ID)
+            .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
+            .roles(&["user"])
+            .anonymous_role("user")
+            .subscriptions(false)
+            .model::<CausalQueryView>(ModelPermissions::new().grant("user", read().all_columns()))
+            .client_projectors([projector()])
+            .gateway_versions(store.clone())
+            .build()
+            .unwrap(),
+    );
+    let protocol_hash = engine
+        .delivery_identity(
+            &user_session(),
+            &Request::new("query Coalesced { causal_query_views { title } }"),
+        )
+        .unwrap()
+        .protocol_hash;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler_gate = gate.clone();
+    let origin = Router::new().route(
+        "/graphql",
+        post(move |axum::Json(value): axum::Json<serde_json::Value>| {
+            let engine = engine.clone();
+            let gate = handler_gate.clone();
+            async move {
+                if value["extensions"]["gatewayDelivery"]["action"] == "snapshot" {
+                    gate.acquire().await.unwrap().forget();
+                }
+                axum::Json(
+                    serde_json::to_value(
+                        engine
+                            .execute(
+                                &user_session(),
+                                serde_json::from_value::<Request>(value).unwrap(),
+                            )
+                            .await,
+                    )
+                    .unwrap(),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_url = format!("http://{}", listener.local_addr().unwrap());
+    struct Stop(tokio::task::JoinHandle<()>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _server = Stop(tokio::spawn(async move {
+        axum::serve(listener, origin).await.unwrap()
+    }));
+    let delivery = Arc::new(NativeDelivery::coalescing(FlightLimits::default()).unwrap());
+    let config = GatewayConfig {
+        bindings: vec![Binding::new(
+            "api",
+            BindingKind::Graphql {
+                executor: GraphqlExecutor::Remote { origin: origin_url },
+                capabilities: GraphqlCapabilities {
+                    queries: true,
+                    ..Default::default()
+                },
+                delivery: DeliveryCapabilities {
+                    coalescing: true,
+                    ..Default::default()
+                },
+                schema_extensions: vec![],
+            },
+        )],
+        routes: vec![Route::new("api", RoutePath::prefix("/graphql"), "api")],
+    }
+    .build()
+    .unwrap();
+    let router = NativeGateway::new(
+        config,
+        NativeOptions::new("http://public.invalid"),
+        [(
+            "api".into(),
+            NativeBinding::GraphqlWithDelivery(
+                GraphqlBinding::Remote(RemoteGraphql {
+                    live_path: None,
+                    ..Default::default()
+                }),
+                delivery.clone(),
+            ),
+        )],
+        NativeAuth::anonymous(),
+    )
+    .unwrap()
+    .router();
+    let document = "query Coalesced { causal_query_views { title } }";
+    let spawn = |extension: Option<serde_json::Value>| {
+        let router = router.clone();
+        let mut request = json!({"query":document});
+        if let Some(extension) = extension {
+            request["extensions"] = json!({"gatewayFreshness":extension});
+        }
+        tokio::spawn(async move {
+            let response = router
+                .oneshot(
+                    axum::http::Request::post("/graphql")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        })
+    };
+    let wait = |groups, consumers| {
+        let delivery = delivery.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while delivery.flight_counts() != (groups, consumers) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("all consumers admitted and joined before releasing result execution");
+        }
+    };
+    let mut consumers = Vec::new();
+    for _ in 0..100 {
+        consumers.push(spawn(None));
+    }
+    wait(1, 100).await;
+    assert_eq!(store.metrics().validations, 100);
+    assert_eq!(store.metrics().result_executions, 0);
+    gate.add_permits(1);
+    let first = consumers.pop().unwrap().await.unwrap();
+    assert!(first.get("errors").is_none(), "{first}");
+    for consumer in consumers {
+        assert_eq!(consumer.await.unwrap(), first);
+    }
+    assert_eq!(
+        store.metrics().result_executions,
+        1,
+        "100 overlapping consumers must execute result SQL exactly once"
+    );
+    assert_eq!(delivery.flight_counts(), (0, 0));
+    // Cache is disabled: a subsequent nonoverlapping request executes again.
+    let next = spawn(None);
+    wait(1, 1).await;
+    gate.add_permits(1);
+    assert_eq!(next.await.unwrap(), first);
+    assert_eq!(store.metrics().result_executions, 2);
+    // One consumer can cancel without aborting the other's execution.
+    let cancelled = spawn(None);
+    let survivor = spawn(None);
+    wait(1, 2).await;
+    cancelled.abort();
+    let _ = cancelled.await;
+    wait(1, 1).await;
+    gate.add_permits(1);
+    assert_eq!(survivor.await.unwrap(), first);
+    assert_eq!(store.metrics().result_executions, 3);
+    // A stronger floor must not join a flight admitted without that floor.
+    let protocol = &first["extensions"]["distributed"];
+    let index = &protocol["snapshot"]["indexes"][0];
+    let context = json!({"version":1,"schemaHash":protocol["schemaHash"],"protocolHash":protocol_hash,
+        "authorizationGeneration":protocol["authorizationGeneration"],"cacheScope":protocol["cacheScope"],"pending":[],
+        "minimum":[{"kind":"index","projection":index["projection"],"scopeToken":index["scopeToken"],"position":"1"}]});
+    let old = spawn(None);
+    wait(1, 1).await;
+    let stronger = spawn(Some(context));
+    wait(2, 2).await;
+    gate.add_permits(2);
+    assert_eq!(old.await.unwrap(), first);
+    let strong = stronger.await.unwrap();
+    assert!(strong.get("errors").is_none(), "{strong}");
+    assert_eq!(store.metrics().result_executions, 5);
+    assert_eq!(delivery.flight_counts(), (0, 0));
+}
+
+#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[tokio::test]
+async fn hundred_subscribers_one_upstream_over_embedded_and_remote_websockets() {
+    use axum::Router;
+    use distributed::gateway::{delivery::LiveLimits, native::*, *};
+    use distributed::graphql::{delivery::GatewayVersionStore, IdentityConfig, OidcConfig};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use rsa::{pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts, RsaPrivateKey, RsaPublicKey};
+    let private = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+    let public = RsaPublicKey::from(&private);
+    let encoding = EncodingKey::from_rsa_pem(
+        private
+            .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .as_bytes(),
+    )
+    .unwrap();
+    let jwks=json!({"keys":[{"kty":"RSA","kid":"live-test","alg":"RS256","use":"sig",
+        "n":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),"e":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.e().to_bytes_be())}]}).to_string();
+    let token = |subject: &str| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("live-test".into());
+        encode(&header,&json!({"iss":"https://live-fixture.invalid","aud":"live-fixture","sub":subject,"iat":now-1,"nbf":now-1,"exp":now+3600,"roles":["user"]}),&encoding).unwrap()
+    };
+    struct Server {
+        origin: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    async fn serve(router: Router) -> Server {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        Server {
+            origin,
+            task: tokio::spawn(async move { axum::serve(listener, router).await.unwrap() }),
+        }
+    }
+    type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+    async fn connect(origin: &str, token: &str, legacy: bool) -> Socket {
+        let mut request = format!("{}/graphql/ws", origin.replace("http:", "ws:"))
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            if legacy {
+                "graphql-ws"
+            } else {
+                "graphql-transport-ws"
+            }
+            .parse()
+            .unwrap(),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket.send(WsMessage::Text(json!({"type":"connection_init","payload":{"authorization":format!("Bearer {token}")}}).to_string().into())).await.unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(ack,WsMessage::Text(ref text) if serde_json::from_str::<Value>(text).unwrap()["type"]=="connection_ack"),
+            "{ack:?}"
+        );
+        socket
+    }
+    async fn next(socket: &mut Socket, id: &str, title: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = socket.next().await.unwrap().unwrap();
+                if let WsMessage::Text(text) = message {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if matches!(value["type"].as_str(), Some("next" | "data")) {
+                        assert_eq!(value["id"], id);
+                        assert!(value["payload"].get("errors").is_none(), "{value}");
+                        if value["payload"]["data"]["causal_query_views"][0]["title"] == title {
+                            return value["payload"].clone();
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("matching full live frame")
+    }
+    for remote in [false, true] {
+        eprintln!(
+            "shared live transport: {}",
+            if remote { "remote" } else { "embedded" }
+        );
+        let fixture = protocol_fixture_with_retention(10).await;
+        let versions = GatewayVersionStore::install(
+            &distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone()),
+            "live-fixture",
+            ["causal_query_views".into()],
+        )
+        .await
+        .unwrap();
+        let oidc = OidcConfig::new("https://live-fixture.invalid", "live-fixture")
+            .with_static_jwks(jwks.clone())
+            .engine_roles(&["user"]);
+        let engine = Arc::new(
+            GraphqlEngine::builder(&fixture.repository)
+                .service_id(SERVICE_ID)
+                .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
+                .roles(&["user"])
+                .anonymous_role("user")
+                .identity(IdentityConfig::oidc_bearer(oidc))
+                .model::<CausalQueryView>(
+                    ModelPermissions::new().grant("user", read().all_columns()),
+                )
+                .client_projectors([projector()])
+                .change_stream(fixture.repository.read_model_changes())
+                .gateway_versions(versions.clone())
+                .build()
+                .unwrap(),
+        );
+        let caps = GraphqlCapabilities {
+            queries: true,
+            live: true,
+            ..Default::default()
+        };
+        let origin = serve(distributed::graphql::graphql_router_composed(
+            engine.clone(),
+            None,
+            None,
+        ))
+        .await;
+        let executor = if remote {
+            GraphqlExecutor::Remote {
+                origin: origin.origin.clone(),
+            }
+        } else {
+            GraphqlExecutor::Embedded
+        };
+        let binding = if remote {
+            GraphqlBinding::Remote(RemoteGraphql::default())
+        } else {
+            GraphqlBinding::Embedded(EmbeddedGraphql::new(engine.clone(), None, caps).unwrap())
+        };
+        let delivery = Arc::new(NativeDelivery::live(LiveLimits::default()).unwrap());
+        let config = GatewayConfig {
+            bindings: vec![Binding::new(
+                "api",
+                BindingKind::Graphql {
+                    executor,
+                    capabilities: caps,
+                    delivery: DeliveryCapabilities {
+                        live_sharing: true,
+                        ..Default::default()
+                    },
+                    schema_extensions: vec![],
+                },
+            )],
+            routes: vec![Route::new("api", RoutePath::prefix("/graphql"), "api")],
+        }
+        .build()
+        .unwrap();
+        let gateway = serve(
+            NativeGateway::new(
+                config,
+                NativeOptions::new("http://public.invalid"),
+                [(
+                    "api".into(),
+                    NativeBinding::GraphqlWithDelivery(binding, delivery.clone()),
+                )],
+                NativeAuth::anonymous(),
+            )
+            .unwrap()
+            .router(),
+        )
+        .await;
+        let alice = token("alice");
+        let bob = token("bob");
+        let mut sockets = futures_util::future::join_all(
+            (0..100).map(|_| connect(&gateway.origin, &alice, false)),
+        )
+        .await;
+        for (n, socket) in sockets.iter_mut().enumerate() {
+            socket.send(WsMessage::Text(json!({"id":format!("consumer-{n}"),"type":"subscribe","payload":{"query":LIVE_SUBSCRIPTION}}).to_string().into())).await.unwrap();
+        }
+        let mut first = None;
+        for (n, socket) in sockets.iter_mut().enumerate() {
+            let payload = next(socket, &format!("consumer-{n}"), "causal row").await;
+            if let Some(first) = &first {
+                assert_eq!(&payload, first);
+            } else {
+                first = Some(payload);
+            }
+        }
+        assert_eq!(
+            (delivery.live_counts().0, delivery.live_counts().1),
+            (1, 100)
+        );
+        assert_eq!(engine.live_subscriber_count(), 1);
+        assert_eq!(versions.metrics().validations, 100);
+        assert_eq!(
+            versions.metrics().result_executions,
+            1,
+            "100 authenticated clients should own one origin live query"
+        );
+        let first = first.unwrap();
+        let mut bob_socket = connect(&gateway.origin, &bob, false).await;
+        bob_socket
+            .send(WsMessage::Text(
+                json!({"id":"consumer-0","type":"subscribe","payload":{"query":LIVE_SUBSCRIPTION}})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let bob_frame = next(&mut bob_socket, "consumer-0", "causal row").await;
+        assert_ne!(
+            first["extensions"]["distributed"]["cacheScope"],
+            bob_frame["extensions"]["distributed"]["cacheScope"]
+        );
+        assert_eq!(
+            (delivery.live_counts().0, engine.live_subscriber_count()),
+            (2, 2),
+            "identical roles/data must not cross subject scopes"
+        );
+        bob_socket
+            .send(WsMessage::Text(
+                json!({"id":"consumer-0","type":"complete"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = bob_socket.close(None).await;
+        project_item(&fixture.repository, &fixture.bus, 2, "committed-live").await;
+        for (n, socket) in sockets.iter_mut().enumerate() {
+            let frame = next(socket, &format!("consumer-{n}"), "committed-live").await;
+            assert_eq!(
+                frame["extensions"]["distributed"]["snapshot"]["indexes"][0]["position"],
+                "2"
+            );
+        }
+        let mut resumed = connect(&gateway.origin, &alice, true).await;
+        resumed.send(WsMessage::Text(json!({"id":"legacy-resume","type":"start","payload":{"query":LIVE_SUBSCRIPTION,"extensions":{"distributed":{"resume":{"cursors":first["extensions"]["distributed"]["live"]["cursors"]}}}}}).to_string().into())).await.unwrap();
+        let replay = next(&mut resumed, "legacy-resume", "committed-live").await;
+        assert_eq!(replay["extensions"]["distributed"]["live"]["reset"], false);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while delivery.live_counts().0 != 1 || engine.live_subscriber_count() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("independent replay handed off and released its origin producer");
+        assert!(delivery.live_counts().6 >= 1);
+        for (n, socket) in sockets.iter_mut().enumerate() {
+            socket
+                .send(WsMessage::Text(
+                    json!({"id":format!("consumer-{n}"),"type":"complete"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.close(None).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while delivery.live_counts().1 != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            engine.live_subscriber_count(),
+            1,
+            "remaining resumed client retains upstream ownership"
+        );
+        resumed
+            .send(WsMessage::Text(
+                json!({"id":"legacy-resume","type":"stop"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = resumed.close(None).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while delivery.live_counts().0 != 0 || engine.live_subscriber_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("last leave tears down gateway and origin live producers");
+    }
 }

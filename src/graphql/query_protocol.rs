@@ -14,7 +14,6 @@ use sqlx::{Encode, Executor, IntoArguments, Type};
 
 use super::compile::{ExtractedQueryEvidence, QueryResponsePathSegment, SqlPlan};
 use super::engine::EngineInner;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
 use super::engine::GraphqlPool;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use super::execute;
@@ -535,6 +534,8 @@ struct PreparedLiveMetadata {
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) async fn execute_query_with_protocol(
     inner: &EngineInner,
+    pool: &GraphqlPool,
+    primary: bool,
     role_surface: Arc<Surface>,
     accumulator: ProtocolResponseAccumulator,
     plan: &SqlPlan,
@@ -566,10 +567,13 @@ pub(crate) async fn execute_query_with_protocol(
     // The snapshot helper accepts an HRTB closure whose returned future may
     // borrow only its connection. Keep every other input owned by the closure
     // so plan/runtime references cannot escape into that future.
+    let _ = primary;
     let plan = plan.clone();
     let runtime = inner.query_protocol.clone();
     let statement_timeout = inner.statement_timeout;
-    match &inner.pool {
+    #[cfg(feature = "gateway-delivery")]
+    let gateway_versions = inner.gateway_versions.clone();
+    match pool {
         #[cfg(feature = "sqlite")]
         GraphqlPool::Sqlite(pool) => {
             let run = with_projection_read_snapshot(pool, move |connection| {
@@ -578,11 +582,17 @@ pub(crate) async fn execute_query_with_protocol(
                 let plan = plan.clone();
                 let runtime = runtime.clone();
                 let live_resume = live_resume.clone();
+                #[cfg(feature = "gateway-delivery")]
+                let gateway_versions = gateway_versions.clone();
                 Box::pin(async move {
+                    #[cfg(feature = "gateway-delivery")]
+                    if let Some(store) = &gateway_versions {
+                        store.record_result();
+                    }
                     let executed = execute::execute_sqlite_in_connection(connection, &plan)
                         .await
                         .map_err(query_execution_error)?;
-                    finish_protocol_query::<sqlx::Sqlite>(
+                    let result = finish_protocol_query::<sqlx::Sqlite>(
                         connection,
                         &runtime,
                         &role_surface,
@@ -591,7 +601,22 @@ pub(crate) async fn execute_query_with_protocol(
                         executed,
                         live_resume,
                     )
-                    .await
+                    .await?;
+                    #[cfg(feature = "gateway-delivery")]
+                    if accumulator.gateway_enabled() {
+                        if let Some(store) = &gateway_versions {
+                            if store.covers(&plan.tables_touched) {
+                                let versions = store
+                                    .sqlite(connection, &plan.tables_touched)
+                                    .await
+                                    .map_err(query_execution_error)?;
+                                accumulator
+                                    .record_gateway_versions(&versions)
+                                    .map_err(query_execution_error)?;
+                            }
+                        }
+                    }
+                    Ok(result)
                 })
             });
             execute::apply_statement_timeout(statement_timeout, async {
@@ -607,6 +632,8 @@ pub(crate) async fn execute_query_with_protocol(
                 let plan = plan.clone();
                 let runtime = runtime.clone();
                 let live_resume = live_resume.clone();
+                #[cfg(feature = "gateway-delivery")]
+                let gateway_versions = gateway_versions.clone();
                 Box::pin(async move {
                     let timeout_ms =
                         i64::try_from(statement_timeout.as_millis()).unwrap_or(i64::MAX);
@@ -618,10 +645,17 @@ pub(crate) async fn execute_query_with_protocol(
                     .map_err(|error| {
                         query_execution_error(format!("statement_timeout: {error}"))
                     })?;
+                    execute::ensure_primary_backend(connection, primary)
+                        .await
+                        .map_err(query_execution_error)?;
+                    #[cfg(feature = "gateway-delivery")]
+                    if let Some(store) = &gateway_versions {
+                        store.record_result();
+                    }
                     let executed = execute::execute_postgres_in_connection(connection, &plan)
                         .await
                         .map_err(query_execution_error)?;
-                    finish_protocol_query::<sqlx::Postgres>(
+                    let result = finish_protocol_query::<sqlx::Postgres>(
                         connection,
                         &runtime,
                         &role_surface,
@@ -630,7 +664,22 @@ pub(crate) async fn execute_query_with_protocol(
                         executed,
                         live_resume,
                     )
-                    .await
+                    .await?;
+                    #[cfg(feature = "gateway-delivery")]
+                    if accumulator.gateway_enabled() {
+                        if let Some(store) = &gateway_versions {
+                            if store.covers(&plan.tables_touched) {
+                                let versions = store
+                                    .postgres(connection, &plan.tables_touched)
+                                    .await
+                                    .map_err(query_execution_error)?;
+                                accumulator
+                                    .record_gateway_versions(&versions)
+                                    .map_err(query_execution_error)?;
+                            }
+                        }
+                    }
+                    Ok(result)
                 })
             });
             execute::apply_statement_timeout(statement_timeout, async {
@@ -646,6 +695,8 @@ pub(crate) async fn execute_query_with_protocol(
 #[cfg(not(any(feature = "sqlite", feature = "postgres")))]
 pub(crate) async fn execute_query_with_protocol(
     _inner: &EngineInner,
+    _pool: &GraphqlPool,
+    _primary: bool,
     _role_surface: Arc<Surface>,
     _accumulator: ProtocolResponseAccumulator,
     _plan: &SqlPlan,

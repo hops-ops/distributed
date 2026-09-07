@@ -34,6 +34,8 @@ pub(crate) mod command_ledger;
 mod commit_builder;
 #[cfg(feature = "emitter")]
 pub mod emitter;
+#[cfg(feature = "gateway")]
+pub mod gateway;
 pub mod graphql;
 mod in_memory_repo;
 pub mod lock;

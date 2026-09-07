@@ -517,6 +517,8 @@ export type ReplicaOperationSourceLocation = {
 };
 
 export type ReplicaOperationProtocol = {
+	/** Exact generated protocol generation for causal delivery context. */
+	readonly protocolHash?: string;
 	readonly version: 1;
 	/** Opaque service schema fingerprint, compared byte-for-byte. */
 	readonly schemaHash: string;

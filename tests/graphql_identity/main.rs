@@ -913,3 +913,67 @@ fn gateway_secret_wrong_is_401() {
         AuthError::Unauthorized
     );
 }
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn gateway_oidc_context_keeps_backend_authority() {
+    use distributed::gateway::{Admission, AuthProvider, BackendCredential, Credentials};
+    use distributed::graphql::identity::OidcGatewayProvider;
+    let keys = mint_keys();
+    let claims = json!({ "iss": "http://localhost:8080", "aud": "graphql-api", "sub": "user-a-001", "exp": now() + 3600, "iat": now(), "groups": ["customer", "unmapped"] });
+    let token = sign_claims(&keys, claims.clone());
+    let provider = OidcGatewayProvider::new(oidc_cfg(&keys), "oidc-v1");
+    let credentials = Credentials {
+        authorization: Some(format!("Bearer {token}")),
+        cookie: Some("forged-session".into()),
+    };
+    let context = provider.authenticate(&credentials).await.unwrap();
+    assert_eq!(Admission::Authenticated.check(&context, now()), Ok(()));
+    assert_eq!(context.identity().unwrap().subject(), "user-a-001");
+    assert_eq!(context.identity().unwrap().roles(), &["customer"]);
+    let BackendCredential::Bearer(forwarded) = context.backend_credential() else {
+        panic!("explicit bearer")
+    };
+    assert_eq!(forwarded, &token);
+
+    // A valid gateway assertion does not suppress backend credential checks.
+    let mut backend = oidc_cfg(&keys);
+    backend.audience = "another-api".into();
+    let app = graphql_router(engine_with_identity(IdentityConfig::oidc_bearer(backend)).await);
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/graphql")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {forwarded}"))
+                .header("x-user-id", "admin")
+                .body(axum::body::Body::from(r#"{"query":"{ id_items { id } }"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    for replacement in [
+        "invalid".to_string(),
+        sign_claims(&keys, {
+            let mut expired = claims;
+            expired["exp"] = json!(now() - 3600);
+            expired
+        }),
+    ] {
+        assert!(provider
+            .authenticate(&Credentials {
+                authorization: Some(format!("Bearer {replacement}")),
+                cookie: None
+            })
+            .await
+            .is_err());
+    }
+    let anon = provider
+        .authenticate(&Credentials::default())
+        .await
+        .unwrap();
+    assert!(anon.identity().is_none());
+}

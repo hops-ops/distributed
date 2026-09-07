@@ -35,6 +35,11 @@ impl ChangeHub {
         Self { tx }
     }
 
+    /// Active origin live readers, excluding the external invalidation forwarder.
+    pub fn subscriber_count(&self) -> usize {
+        self.tx.receiver_count()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<ReadModelChange> {
         self.tx.subscribe()
     }
@@ -126,15 +131,11 @@ pub(crate) async fn live_query_stream(
 
     tokio::spawn(async move {
         // 1) Initial execution + yield
-        let mut initial = match execute_list(
-            &inner,
-            &role,
-            &plan,
-            protocol.as_ref(),
-            requested_live_resume,
-        )
-        .await
-        {
+        let initial_result = tokio::select! {
+            _ = tx.closed() => return,
+            result = execute_list(&inner, &role, &plan, protocol.as_ref(), requested_live_resume) => result,
+        };
+        let mut initial = match initial_result {
             Ok(executed) => executed,
             Err(e) => {
                 let _ = tx.send(Err(async_graphql::Error::new(e))).await;
@@ -153,7 +154,10 @@ pub(crate) async fn live_query_stream(
 
         // 2) Change loop: dirty → debounce → re-exec → hash-gate → yield
         loop {
-            let change = match change_rx.recv().await {
+            let change = match tokio::select! {
+                _ = tx.closed() => break,
+                change = change_rx.recv() => change,
+            } {
                 Ok(c) => c,
                 Err(broadcast::error::RecvError::Lagged(_)) => ReadModelChange {
                     tables: BTreeSet::new(),
@@ -166,7 +170,10 @@ pub(crate) async fn live_query_stream(
             }
 
             // Debounce / coalesce
-            tokio::time::sleep(debounce).await;
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = tokio::time::sleep(debounce) => {},
+            }
             loop {
                 match change_rx.try_recv() {
                     Ok(more) => {
@@ -179,15 +186,11 @@ pub(crate) async fn live_query_stream(
                 }
             }
 
-            match execute_list(
-                &inner,
-                &role,
-                &plan,
-                protocol.as_ref(),
-                next_live_resume.clone(),
-            )
-            .await
-            {
+            let refreshed = tokio::select! {
+                _ = tx.closed() => break,
+                result = execute_list(&inner, &role, &plan, protocol.as_ref(), next_live_resume.clone()) => result,
+            };
+            match refreshed {
                 Ok(mut executed) => {
                     // Advance the private replay cursor even when a redundant
                     // execution is hash-gated. Protocol frame metadata is
@@ -275,6 +278,8 @@ async fn execute_list(
         .ok_or_else(|| "authorized GraphQL role surface is unavailable".to_string())?;
     let executed = super::query_protocol::execute_query_with_protocol(
         inner,
+        &inner.pool,
+        true,
         role_surface,
         protocol.clone(),
         plan,

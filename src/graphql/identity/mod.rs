@@ -31,3 +31,8 @@ pub fn session_from_all_headers(headers: &HeaderMap) -> Session {
     }
     Session::from_map(vars)
 }
+
+#[cfg(feature = "gateway")]
+mod gateway;
+#[cfg(feature = "gateway")]
+pub use gateway::OidcGatewayProvider;

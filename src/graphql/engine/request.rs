@@ -2,6 +2,10 @@ use super::*;
 
 impl GraphqlEngine {
     pub async fn execute(&self, session: &Session, mut request: Request) -> Response {
+        #[cfg(feature = "gateway-delivery")]
+        if delivery::action(&request).as_deref() == Some("validate") {
+            return self.validate_delivery(session, request).await;
+        }
         if selected_operation_type(&mut request)
             == Some(async_graphql::parser::types::OperationType::Mutation)
             && !crate::microsvc::lifecycle_mutations_open()
@@ -41,11 +45,27 @@ impl GraphqlEngine {
             Ok(accumulator) => accumulator,
             Err(()) => return protocol_internal_error_response(),
         };
+        #[cfg(feature = "gateway-delivery")]
+        if let Some(accumulator) = &accumulator {
+            if self
+                .enable_delivery_capture(session, &request, accumulator)
+                .is_err()
+            {
+                return protocol_internal_error_response();
+            }
+        }
         if introspection {
             // The relaxed schema is defense-in-depth restricted even if a
             // future classifier or request extension behaves unexpectedly.
             request = request.only_introspection();
         }
+        #[cfg(feature = "gateway-delivery")]
+        let read = match self.prepare_read(session, &request) {
+            Ok(read) => read,
+            Err(error) => return read_routing::delivery_error(error),
+        };
+        #[cfg(feature = "gateway-delivery")]
+        let request = request.data(read.clone());
         let mut request = request
             .data(session.clone())
             .data(authority)
@@ -56,6 +76,8 @@ impl GraphqlEngine {
         let start = std::time::Instant::now();
         let response =
             attach_protocol_response(schema.execute(request).await, accumulator.as_ref());
+        #[cfg(feature = "gateway-delivery")]
+        let response = read_routing::enforce_minimum(response, &read);
         let status = metrics_status_for_response(&response);
         let root_field = match &response.data {
             Value::Object(map) => map.keys().next().map(|s| s.as_str()).unwrap_or("_"),
@@ -126,6 +148,15 @@ impl GraphqlEngine {
         if introspection {
             request = request.only_introspection();
         }
+        #[cfg(feature = "gateway-delivery")]
+        let read = match self.prepare_read(session, &request) {
+            Ok(read) => read,
+            Err(error) => {
+                return stream::once(async move { read_routing::delivery_error(error) }).boxed()
+            }
+        };
+        #[cfg(feature = "gateway-delivery")]
+        let request = request.data(read.clone());
         let mut request = request
             .data(session.clone())
             .data(authority)
@@ -135,11 +166,16 @@ impl GraphqlEngine {
         }
         schema
             .execute_stream(request)
-            .map(move |response| attach_protocol_response(response, accumulator.as_ref()))
+            .map(move |response| {
+                let response = attach_protocol_response(response, accumulator.as_ref());
+                #[cfg(feature = "gateway-delivery")]
+                let response = read_routing::enforce_minimum(response, &read);
+                response
+            })
             .boxed()
     }
 
-    fn protocol_accumulator(
+    pub(super) fn protocol_accumulator(
         &self,
         authority: &ExecutionAuthority,
         session: &Session,

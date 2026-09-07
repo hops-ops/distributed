@@ -102,3 +102,11 @@ pub(crate) use validation::{execute_plan, validate_filter, validate_generated_na
 pub fn core_sdl_for_catalog(tables: &[TableSchema]) -> Result<String, String> {
     validation::core_sdl_for_catalog(tables)
 }
+
+#[cfg(feature = "gateway-delivery")]
+pub(crate) mod read_routing;
+#[cfg(feature = "gateway-delivery")]
+pub use read_routing::ReadRouting;
+
+#[cfg(feature = "gateway-delivery")]
+mod delivery;

@@ -1,0 +1,144 @@
+name: Application gateway
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'distributed_macros/**'
+      - 'Cargo.toml'
+      - 'build.rs'
+      - 'migrations/**'
+      - 'docs/gateway/**'
+      - 'tests/e2e-ui/ui/src/auth.ts'
+      - 'tests/e2e-ui/ui/src/lib/server/**'
+      - 'tests/e2e-ui/ui/src/routes/api/auth/**'
+      - 'tests/graphql_identity/**'
+      - 'tests/graphql_causal_transport/**'
+      - 'tests/graphql_query_protocol/**'
+      - 'tests/edge_query_delivery*'
+      - 'js/src/replica/**'
+      - 'js/tests/replica*'
+      - 'tests/gateway*'
+      - 'tests/gateway*/**'
+      - '.github/workflows/integration-gateway.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - name: Format contract and fixture sources
+        run: rustfmt --edition 2021 --check src/gateway/mod.rs tests/gateway_routing.rs tests/gateway_extensions.rs tests/gateway-portable/src/lib.rs
+      - name: Test portable routing and adapter contracts
+        run: cargo test --manifest-path tests/gateway-portable/Cargo.toml --locked
+      - name: Check fixture lints
+        run: cargo clippy --manifest-path tests/gateway-portable/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Compile the UI/auth consumer to Wasm
+        run: cargo check --manifest-path tests/gateway-portable/Cargo.toml --locked --target wasm32-unknown-unknown
+      - name: Test and compile portable GraphQL operation policy
+        run: |
+          cargo test --manifest-path tests/gateway-portable/Cargo.toml --locked --features gateway-delivery
+          cargo check --manifest-path tests/gateway-portable/Cargo.toml --locked --features gateway-delivery --target wasm32-unknown-unknown
+          python3 tests/gateway-portable/check_dependencies.py --features gateway-delivery
+      - name: Verify native and Wasm dependency isolation
+        run: python3 tests/gateway-portable/check_dependencies.py
+
+  auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - name: Verify gateway and backend identity
+        run: cargo test -p distributed --no-default-features --features gateway,graphql,sqlite --test graphql_identity
+      - name: Install pinned auth fixture dependencies
+        working-directory: tests/gateway-auth
+        run: npm ci
+      - name: Install Chromium
+        working-directory: tests/gateway-auth
+        run: npx playwright install --with-deps chromium
+      - name: Run production Auth.js lifecycle and browser security cases
+        working-directory: tests/gateway-auth
+        run: npm test
+
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy
+      - name: Test real native HTTP streams and upgrades
+        run: cargo test --manifest-path tests/gateway-native/Cargo.toml --locked
+      - name: Check native fixture lints
+        run: cargo clippy --manifest-path tests/gateway-native/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Verify UI/auth executor dependency isolation
+        run: python3 tests/gateway-native/check_dependencies.py
+
+  graphql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - name: Verify embedded and remote GraphQL protocols
+        run: cargo test -p distributed --no-default-features --features gateway-graphql-native,gateway-delivery,sqlite --test gateway_graphql --test gateway_graphql_operation --test graphql_causal_transport --test graphql_query_protocol --test graphql_identity --test graphql_sqlite --test sqlite_repository
+
+      - name: Verify shared query cancellation, expiry and deadlines
+        run: cargo test -p distributed --no-default-features --features gateway-graphql-native,gateway-delivery,sqlite --lib gateway::native::flight::tests
+      - name: Verify shared live replay, expiry, backpressure and teardown
+        run: cargo test -p distributed --no-default-features --features gateway-graphql-native,gateway-delivery,sqlite --lib gateway::native::live::tests
+      - name: Verify transactional cache coverage and Atomic rollback
+        run: |
+          cargo test -p distributed --no-default-features --features gateway-graphql-native,gateway-delivery,sqlite --lib graphql::delivery::versions::tests
+          cargo test -p distributed --no-default-features --features gateway-graphql-native,gateway-delivery,sqlite --lib sqlite_direct_projection_and_ledger_replay_commit_atomically
+
+  freshness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Prove primary routing with paused physical standby
+        run: python3 tests/gateway-postgres/run.py
+      - name: Verify client freshness and command protocol
+        run: |
+          npm ci --prefix js
+          npm --prefix js run build
+          node --test js/tests/replica-command-runtime.test.mjs js/tests/replica-protocol.test.mjs js/tests/replica-revalidation.test.mjs js/tests/replica-graphql-transport.test.mjs
+      - name: Verify generated delivery metadata
+        run: cargo test -p distributed_cli client_compiler

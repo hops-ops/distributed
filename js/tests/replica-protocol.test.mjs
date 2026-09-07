@@ -2761,3 +2761,50 @@ test('protocol record scopes remain opaque and never become replica identities',
 		undefined
 	);
 });
+
+test('issuing-user freshness keeps pending effects separate from confirmed floors', async () => {
+	const { replicaCommandFreshness } = await import('../dist/replica/command-runtime/symbols.js');
+	const artifact = { ...Todos, protocol: { ...Todos.protocol, protocolHash: 'protocol-a' } };
+	const requests = [];
+	let candidate = wireFrame({ position: '1', rows: [{ id: 'todo-1', title: 'base' }] });
+	const replica = createDistributedReplica({ transport: { async fetch(request) { requests.push(request); return candidate; } } });
+	write(replica, { position: '1', rows: [{ id: 'todo-1', title: 'base' }] }, 'network', artifact);
+	const watch = replica.watch(artifact, {});
+	const plan = { dependencies: ['todos'], models: [Todo.id], relationships: [] };
+	replica[replicaCommandFreshness]('cmd-1', plan);
+	replica.createOptimisticLayer('cmd-1', writer => writer.writeRecord(Todo, 'todo-1', { fields: { title: 'preview' } }));
+	replica.markOptimisticLayerAccepted('cmd-1', commandMetadata());
+	await watch.refresh();
+	assert.equal(requests.at(-1).extensions.gatewayFreshness.pending.length, 1);
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'preview');
+	candidate = wireFrame({ position: '2', revision: '2', rows: [{ id: 'todo-1', title: 'committed' }], observations: [{ causationId: 'cause-1', projection: 'todos-projector', model: Todo.id, scopeToken: 'expect:todo-1' }] });
+	await watch.refresh();
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'committed');
+	candidate = wireFrame({ position: '1', rows: [{ id: 'todo-1', title: 'lagging' }] });
+	await watch.refresh();
+	const context = requests.at(-1).extensions.gatewayFreshness;
+	assert.equal(context.pending.length, 0);
+	assert(context.minimum.some(floor => floor.kind === 'index' && floor.position === '2'));
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'committed');
+	watch.destroy();
+});
+
+test('Atomic installs a retained outgoing floor without an automatic fetch', async () => {
+	const { replicaCommandFreshness } = await import('../dist/replica/command-runtime/symbols.js');
+	const artifact = { ...Todos, protocol: { ...Todos.protocol, protocolHash: 'protocol-a' } };
+	const requests = [];
+	const replica = createDistributedReplica({ transport: { async fetch(request) { requests.push(request); return wireFrame({ position: '1', rows: [{ id: 'todo-1', title: 'lagging' }] }); } } });
+	write(replica, { position: '1', rows: [{ id: 'todo-1', title: 'base' }] }, 'network', artifact);
+	const watch = replica.watch(artifact, {});
+	replica[replicaCommandFreshness]('atomic', { dependencies: ['todos'], models: [Todo.id], relationships: [] });
+	replica.createOptimisticLayer('atomic', writer => writer.writeRecord(Todo, 'todo-1', { fields: { title: 'preview' } }));
+	replica[replicaCommandDirectProjection]('atomic', { model: Todo, identity: 'todo-1', evidence: { model: Todo.id, scopeToken: 'record:todo-1', incarnation: '1', revision: '2', tombstone: false }, fields: { id: 'todo-1', title: 'committed', __typename: Todo.id } });
+	assert.equal(requests.length, 0);
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'committed');
+	await watch.refresh();
+	const context = requests.at(-1).extensions.gatewayFreshness;
+	assert.equal(context.pending.length, 0);
+	assert(context.minimum.some(floor => floor.kind === 'record' && floor.revision === '2'));
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'committed');
+	watch.destroy();
+});

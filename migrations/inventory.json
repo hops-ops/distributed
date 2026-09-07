@@ -60,6 +60,18 @@
         "path": "migrations/postgres/0005_projection_source_snapshots.sql",
         "sha256": "2cb605be4ec190d9b3f156bdbbeb83a76e5f1f37287a8a7f3c2653dafbede442"
       }
+    },
+    {
+      "version": 6,
+      "description": "gateway dependency versions",
+      "sqlite": {
+        "path": "migrations/sqlite/0006_gateway_dependency_versions.sql",
+        "sha256": "c156bc51dddecd49b1beef7bb4069557b024c19cb1271f0ec9cc0efe71939471"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0006_gateway_dependency_versions.sql",
+        "sha256": "c156bc51dddecd49b1beef7bb4069557b024c19cb1271f0ec9cc0efe71939471"
+      }
     }
   ]
 }

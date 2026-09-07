@@ -57,6 +57,7 @@ export type FetchLiveHost = {
 	): DistributedProtocolEnvelope;
 	diagnosticEvent(event: ReplicaDiagnosticEventInput): void;
 	resumeCursors(key: string): readonly DistributedLiveCursor[];
+	freshness(artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>, key: string): Readonly<Record<string, unknown>> | undefined;
 };
 
 export function emitWatchState(host: FetchLiveHost, key: string, allowFetch: boolean): void {
@@ -151,7 +152,7 @@ export function fetchWatch<TData, TVariables extends GraphqlVariables>(
 		document: watch.artifact.document,
 		variables: watch.variables,
 		artifact: watch.artifact,
-		...replicaClientRequestExtensions(watch.artifact),
+		extensions: requestExtensions(host, watch.artifact, watch.key),
 		signal: controller.signal
 	});
 	let flight: Promise<void>;
@@ -251,7 +252,7 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 				document: watch.artifact.live.document,
 				variables: watch.variables,
 				artifact: watch.artifact,
-				...replicaClientRequestExtensions(watch.artifact),
+				extensions: requestExtensions(host, watch.artifact, watch.key),
 				...(resume === undefined || resume.length === 0
 					? {}
 					: { resume })
@@ -492,4 +493,16 @@ export function releaseLive(host: FetchLiveHost, key: string): void {
 	entry.unsubscribe();
 	host.queryState(key).live = 'off';
 	host.emitState(key, false);
+}
+
+function requestExtensions(
+	host: FetchLiveHost,
+	artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>,
+	key: string
+): Readonly<Record<string, unknown>> {
+	const freshness = host.freshness(artifact, key);
+	return Object.freeze({
+		...replicaClientRequestExtensions(artifact).extensions,
+		...(freshness === undefined ? {} : { gatewayFreshness: freshness })
+	});
 }

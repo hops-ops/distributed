@@ -47,6 +47,7 @@ import {
 import { ReplicaCommandRuntimeError } from './errors.js';
 import {
 	replicaCommandAuthority,
+	replicaCommandFreshness,
 	replicaCommandProjectionDelta,
 	replicaCommandProjectedLifecycle,
 	replicaCommandReadRecord,
@@ -601,6 +602,7 @@ export function createReplicaCommandRuntime<
 			return validated.requiresRevalidation;
 		}
 		const seam = replica[replicaCommandProjectionDelta]!;
+		if (validated.revalidation !== undefined) replica[replicaCommandFreshness]?.(prepared.commandId, validated.revalidation);
 		const actualPrepared = Object.freeze({
 			...prepared,
 			optimistic: Object.freeze({
@@ -1188,6 +1190,7 @@ export function createReplicaCommandRuntime<
 				readRecord: replica[replicaCommandReadRecord]?.bind(replica),
 				pureFunctions: options.pureFunctions
 			};
+			replica[replicaCommandFreshness]?.(prepared.commandId, prepared.revalidation);
 			(replica as SemanticReplica).createOptimisticLayer(
 				prepared.commandId,
 				(writer) =>

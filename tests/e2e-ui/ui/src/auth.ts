@@ -1,4 +1,5 @@
 import { SvelteKitAuth } from '@auth/sveltekit';
+import type { Handle } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import { cleanEnvValue } from '$lib/clean-env';
 import { oidcAudience, oidcScopes } from '$lib/server/oidc-scopes';
@@ -223,7 +224,7 @@ function userClaims(token: TokenRecord) {
 	return decodeJwtPayload(token.idToken) ?? decodeJwtPayload(token.accessToken) ?? {};
 }
 
-export const { handle, signIn, signOut } = SvelteKitAuth({
+const { handle: authHandle, signIn, signOut } = SvelteKitAuth({
 	providers: [
 		{
 			id: 'oidc',
@@ -240,7 +241,7 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 					scope: oidcScopes()
 				}
 			},
-			checks: ['pkce', 'state'],
+			checks: ['pkce', 'state', 'nonce'],
 			profile(profile: Record<string, unknown>) {
 				const groupClaims = envCsv('OIDC_GROUP_CLAIMS', DEFAULT_GROUP_CLAIMS);
 				const name =
@@ -262,7 +263,10 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 	],
 	callbacks: {
 		async jwt({ token, account, user, profile }) {
+			// Auth.js may assign an internal user UUID. UI and API identity must
+			// use the same OIDC subject established by the provider callback.
 			if (account) {
+				token.sub = account.providerAccountId;
 				token.accessToken = account.access_token;
 				token.refreshToken = account.refresh_token;
 				token.idToken = account.id_token;
@@ -293,7 +297,7 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 					if (groups.length) refreshed.groups = groups;
 					return refreshed;
 				} catch (error) {
-					console.error('Token refresh failed:', error);
+					console.error('Token refresh failed');
 					token.error = 'RefreshAccessTokenError';
 					return token;
 				}
@@ -347,10 +351,8 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 		signIn: '/',
 		error: '/'
 	},
-	// HARD false for this local fixture. Auth.js defaults secure from request
-	// protocol / AUTH_URL; on plain http://127.0.0.1 Secure cookies are dropped
-	// by the browser and every protected page looks broken (session never sticks).
-	// Production HTTPS deploys must set AUTH_USE_SECURE_COOKIES=true (or AUTH_URL=https…).
+	// Cookie overrides and Auth.js defaults share the configured public-origin
+	// policy. Local HTTP fixtures remain usable; HTTPS sets Secure throughout.
 	useSecureCookies: useSecureCookies(),
 	cookies: {
 		sessionToken: {
@@ -359,7 +361,7 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 				httpOnly: true,
 				sameSite: authSessionCookieSameSite(),
 				path: '/',
-				secure: false
+				secure: useSecureCookies()
 			}
 		},
 		callbackUrl: {
@@ -368,7 +370,7 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 				httpOnly: true,
 				sameSite: authSessionCookieSameSite(),
 				path: '/',
-				secure: false
+				secure: useSecureCookies()
 			}
 		},
 		csrfToken: {
@@ -377,7 +379,7 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 				httpOnly: true,
 				sameSite: authSessionCookieSameSite(),
 				path: '/',
-				secure: false
+				secure: useSecureCookies()
 			}
 		},
 		pkceCodeVerifier: {
@@ -386,7 +388,7 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 				httpOnly: true,
 				sameSite: authSessionCookieSameSite(),
 				path: '/',
-				secure: false,
+				secure: useSecureCookies(),
 				maxAge: 60 * 15
 			}
 		},
@@ -396,7 +398,7 @@ export const { handle, signIn, signOut } = SvelteKitAuth({
 				httpOnly: true,
 				sameSite: authSessionCookieSameSite(),
 				path: '/',
-				secure: false,
+				secure: useSecureCookies(),
 				maxAge: 60 * 15
 			}
 		}
@@ -474,3 +476,19 @@ async function oidcTokenEndpoint() {
 }
 
 export { engineRoleFromGroups } from './lib/roles';
+
+// Auth.js session renewal parses Set-Cookie before calling event.cookies.set.
+// An absent Secure attribute becomes undefined, which SvelteKit defaults to
+// true on HTTP 127.0.0.1. Preserve our explicit policy during that delegation,
+// including cookies renewed by locals.auth() on UI/API requests.
+export const handle: Handle = ({ event, resolve }) => {
+	const setCookie = event.cookies.set.bind(event.cookies);
+	event.cookies.set = (name, value, options) => {
+		if (name.startsWith('authjs.')) {
+			return setCookie(name, value, { ...options, secure: useSecureCookies() });
+		}
+		return setCookie(name, value, options);
+	};
+	return authHandle({ event, resolve });
+};
+export { signIn, signOut };

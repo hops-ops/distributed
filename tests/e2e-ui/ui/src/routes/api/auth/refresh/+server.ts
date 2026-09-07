@@ -1,11 +1,12 @@
 import { json } from '@sveltejs/kit';
+import { isCurrentSession } from '$lib/server/require-auth';
 import type { RequestHandler } from './$types';
 
 export const POST: RequestHandler = async ({ locals }) => {
 	const session = await locals.auth();
 
-	if (!session?.user) {
-		return json({ authenticated: false }, { status: 401 });
+	if (!isCurrentSession(session)) {
+		return json({ authenticated: false, error: session?.error }, { status: 401 });
 	}
 
 	return json({
