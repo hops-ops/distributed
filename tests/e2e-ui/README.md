@@ -80,6 +80,15 @@ transition, browser rejection before GraphQL dispatch, direct API rejection
 while generations disagree, URL/app-state retention, compatible replica
 restoration, and incompatible replica revalidation.
 
+The same proof covers two consecutive UI-only edits retaining the API process.
+After each transition it submits a real Todo command, checks the command receipt
+and active generation, waits for the exact persisted row through GraphQL, then
+reloads the page and checks its rendered data independently of browser optimism.
+Todo creation is Eventual: its receipt is not a projection-completion barrier.
+Because the Todos query is `@load`, not `@live`, an immediate reload can capture
+pre-projection data that will not update by itself. The test therefore waits on
+authoritative data, not a fixed sleep or a longer DOM timeout.
+
 This is the **default one-process playground**. Optional celld:
 
 ```bash

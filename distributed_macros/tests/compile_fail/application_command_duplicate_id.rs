@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 
 use distributed::application::{CommandDefinition, CommandSpec, CommandTypeField, CommandTypeSpec};
-use distributed::graphql::CommandConsistency;
+use distributed::command::CommandConsistency;
 
 fn spec() -> CommandSpec {
     CommandSpec::try_new(

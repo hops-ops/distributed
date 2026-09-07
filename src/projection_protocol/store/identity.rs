@@ -231,6 +231,7 @@ pub(crate) struct ProjectionRecordMutation {
     pub(crate) mutation: TableMutation,
     pub(crate) expectation: ProjectionRecordExpectation,
     pub(crate) kind: ProjectionMutationKind,
+    pub(crate) source_snapshot: Option<super::super::SourceSnapshotVersion>,
 }
 
 impl ProjectionRecordMutation {
@@ -239,6 +240,16 @@ impl ProjectionRecordMutation {
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
         kind: ProjectionMutationKind,
+    ) -> Result<Self, ProjectionProtocolError> {
+        Self::with_source_snapshot(scope, mutation, expectation, kind, None)
+    }
+
+    pub(crate) fn with_source_snapshot(
+        scope: ProjectionRecordScope,
+        mutation: TableMutation,
+        expectation: ProjectionRecordExpectation,
+        kind: ProjectionMutationKind,
+        source_snapshot: Option<super::super::SourceSnapshotVersion>,
     ) -> Result<Self, ProjectionProtocolError> {
         if let ProjectionRecordExpectation::Exact(revision) = &expectation {
             if revision.scope() != &scope {
@@ -253,10 +264,9 @@ impl ProjectionRecordMutation {
                 "projection delete kind and table mutation disagree".into(),
             ));
         }
-        if matches!(
-            kind,
-            ProjectionMutationKind::Delete | ProjectionMutationKind::Recreate
-        ) && !matches!(expectation, ProjectionRecordExpectation::Exact(_))
+        if (kind == ProjectionMutationKind::Recreate
+            || (kind == ProjectionMutationKind::Delete && source_snapshot.is_none()))
+            && !matches!(expectation, ProjectionRecordExpectation::Exact(_))
         {
             return Err(ProjectionProtocolError::InvalidBatch(
                 "projection delete/recreate requires an exact record revision".into(),
@@ -267,6 +277,7 @@ impl ProjectionRecordMutation {
             mutation,
             expectation,
             kind,
+            source_snapshot,
         })
     }
 }

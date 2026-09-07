@@ -4,10 +4,12 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
+import { waitForProjectedTodo } from './lifecycle-command-proof.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const frameworkRoot = resolve(root, '../../js');
 const application = resolve(root, 'crates/todo-domain/src/commands/force_archive.rs');
+const clientPage = resolve(root, 'ui/src/routes/todos/+page.svelte');
 const framework = resolve(frameworkRoot, 'src/sveltekit/lifecycle.ts');
 const lifecycleFile = resolve(root, '.distributed/lifecycle/dev.json');
 const baseURL = process.env.E2E_UI_ORIGIN || 'http://127.0.0.1:5180';
@@ -85,6 +87,7 @@ const fixtureIO = kubeWorkload
 		};
 const original = fixtureIO.read(application);
 const frameworkOriginal = fixtureIO.read(framework);
+const clientOriginal = fixtureIO.read(clientPage);
 
 async function waitFor(predicate, label, timeout = timeoutMs) {
 	const started = Date.now();
@@ -229,6 +232,54 @@ async function transition(page, path, source, expectedReplicaRestore, assertGate
 	}
 	page.off('framenavigated', onNavigation);
 	page.off('request', onRequest);
+	// Readability alone does not prove the retained API reopened its write gate.
+	const title = `after-reload-${Date.now()}`;
+	const response = page.waitForResponse((result) => result.request().method() === 'POST' &&
+		(result.request().postData() ?? '').includes('todos_create'));
+	await page.locator('#todo-title').fill(title);
+	await page.getByRole('button', { name: /^add$/i }).click();
+	const mutation = await response;
+	assert.equal(mutation.status(), 200, 'active generation must accept commands');
+	const body = await mutation.json();
+	assert.ok(!body.errors?.length);
+	assert.equal(body.extensions.distributed.generation.generationId, after.active.generationId);
+	assert.equal(body.extensions.distributed.generation.releaseId, after.active.releaseId);
+	assert.ok(body.extensions.distributed.command, 'actual command receipt required');
+	const todo = body.data.todos_create;
+	assert.equal(todo.title, title);
+	assert.equal(typeof todo.todo_id, 'string');
+	const requestHeaders = await mutation.request().allHeaders();
+	const headers = Object.fromEntries(
+		['authorization', 'x-user-id', 'x-roles']
+			.filter((name) => requestHeaders[name] !== undefined)
+			.map((name) => [name, requestHeaders[name]])
+	);
+	const attempts = await waitForProjectedTodo(async (remainingMs) => {
+		const result = await page.request.post(mutation.url(), {
+			headers,
+			timeout: remainingMs,
+			data: {
+				query: `query ReloadTodoProof($id: String!) {
+					todos(where: { todo_id: { _eq: $id } }, limit: 1) {
+						todo_id owner_id title status
+					}
+				}`,
+				variables: { id: todo.todo_id }
+			}
+		});
+		assert.equal(result.status(), 200, 'authoritative Todo query must succeed');
+		return result.json();
+	}, todo, timeoutMs);
+	console.log(`lifecycle-reload: ${relative(root, path)} command accepted and projected (${attempts} queries)`);
+	// @load is not @live. Reloading before projection can seed an empty result
+	// that never changes, even though the projector subsequently commits the row.
+	// Now discard browser optimism and prove fresh SSR + hydration independently.
+	await page.reload({waitUntil: 'domcontentloaded'});
+	await page.locator('[data-todo-id]').filter({hasText: title}).waitFor({timeout: timeoutMs});
+	console.log(`lifecycle-reload: ${relative(root, path)} fresh page confirmed ${todo.todo_id}`);
+	await waitFor(() => page.evaluate(() => globalThis.__distributedReloadState !== undefined), 'hydration after command proof');
+	await page.evaluate(() => { globalThis.__distributedReloadState.value = 'preserve-me'; });
+	await waitForBrowserParticipant(page);
 }
 
 const browser = await chromium.launch({ headless: true });
@@ -267,6 +318,11 @@ try {
 	await page.evaluate(() => {
 		globalThis.__distributedReloadState.value = 'preserve-me';
 	});
+	for (const suffix of ['first', 'second']) {
+		await transition(page, clientPage, `${clientOriginal}\n<!-- client-only reload ${suffix} -->\n`, true);
+		assert.deepEqual((await lifecycleState()).members.api, baseline.members.api,
+			'client-only reload must retain the same verified API instance');
+	}
 
 	const compatible = `${original}\n// lifecycle-compatible source-only rebuild\n`;
 	await transition(page, application, compatible, true, true);
@@ -280,10 +336,11 @@ try {
 	);
 	assert.notEqual(incompatible, compatible, 'incompatible fixture edit must apply');
 	await transition(page, application, incompatible, false);
-	console.log('lifecycle-reload: application + framework + incompatible transitions OK');
+	console.log('lifecycle-reload: client-only + application + framework + incompatible transitions accept commands');
 } finally {
 	fixtureIO.write(application, original);
 	fixtureIO.write(framework, frameworkOriginal);
+	fixtureIO.write(clientPage, clientOriginal);
 	await waitFor(async () => {
 		const state = await lifecycleState();
 		return state?.phase === 'active' &&

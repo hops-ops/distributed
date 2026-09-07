@@ -4,7 +4,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::graphql::command_contract::CommandProjectionPreviewSource;
+use crate::command::CommandProjectionPreviewSource;
 use crate::graphql::surface::{
     SurfaceProjectionArm, SurfaceProjectionOperation, SurfaceSelectedProjectionProgram,
 };
@@ -301,8 +301,8 @@ pub(super) fn command_projection_extension(
         .pure_reduces
         .iter()
         .map(|reduce| {
+            use crate::command::CommandProjectionPreviewSource as ServerSource;
             use crate::graphql::client_manifest::ClientProjectionPreviewSource as ClientSource;
-            use crate::graphql::command_contract::CommandProjectionPreviewSource as ServerSource;
             let map_source = |source: &ServerSource| -> Result<ClientSource, ClientManifestError> {
                 Ok(match source {
                     ServerSource::InputPath { path } => ClientSource::Input { path: path.clone() },
@@ -1341,9 +1341,9 @@ fn mutation_kind(kind: ProjectionMutationKind) -> ClientProjectionMutationKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{CommandProjectionPreview, CommandProjectionPreviewSource};
     use crate::graphql::{
-        build_surface, CommandProjectionPreview, CommandProjectionPreviewSource, SurfaceOptions,
-        SurfaceProjector, SurfaceTypeDef, SurfaceTypeField,
+        build_surface, SurfaceOptions, SurfaceProjector, SurfaceTypeDef, SurfaceTypeField,
     };
     use crate::projection::lower::ProjectionPortableType;
     use crate::projection::placement::{
@@ -1656,7 +1656,8 @@ mod tests {
 
     #[test]
     fn auto_optimism_maps_input_defaults_and_row_policy_claims() {
-        use crate::graphql::command_contract::{CommandInputDefault, InputDefaultGenerator};
+        use crate::command::{CommandInputDefault, InputDefaultGenerator};
+
         use crate::graphql::{claim, col};
 
         let selector = typed_selector::<PreviewA>();
@@ -1842,7 +1843,7 @@ mod tests {
             command.consistency = consistency;
             command.projections.add_event_set(crate::events![PreviewA]);
             command.projections.add_inferred_values(
-                crate::graphql::__command_projection_event_preview::<PreviewA, PreviewA>(vec![(
+                crate::command::__command_projection_event_preview::<PreviewA, PreviewA>(vec![(
                     "value",
                     CommandProjectionPreviewSource::constant(ProjectionValue::string(
                         "transition-value",

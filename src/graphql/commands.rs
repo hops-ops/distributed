@@ -9,22 +9,22 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 #[cfg(feature = "graphql")]
-use super::command_contract::CommandConsistency;
-use super::command_contract::TypedCommandContract;
-#[cfg(feature = "graphql")]
 use super::surface::{
     compile_projection_owner_topology, validate_direct_modeled_owner_compatibility,
     SurfaceProjectionOwner,
 };
 use super::surface::{SurfaceCommand, SurfaceCommandShape, SurfaceTypeDef, SurfaceTypeField};
-use super::types::GraphqlTypeDef;
+#[cfg(feature = "graphql")]
+use crate::command::CommandConsistency;
+use crate::command::CommandTypeDef;
+use crate::command::TypedCommandContract;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TypedCommandInventory {
     contracts: Vec<TypedCommandContract>,
 }
 
-fn surface_type(definition: &GraphqlTypeDef) -> SurfaceTypeDef {
+fn surface_type(definition: &CommandTypeDef) -> SurfaceTypeDef {
     SurfaceTypeDef {
         name: definition.name.clone(),
         fields: definition

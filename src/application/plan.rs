@@ -14,11 +14,9 @@ use super::capability::{
 use super::error::{ApplicationError, ApplicationResult};
 use super::identity::{canonical_json, sha256_fingerprint, LogicalId};
 use super::manifest::{ApplicationManifest, APPLICATION_MANIFEST_SCHEMA_VERSION};
-use super::mount::{
-    validate_mounts_against_manifest, MountSelector, ProcessPreset,
-};
+use super::mount::{validate_mounts_against_manifest, MountSelector, ProcessPreset};
 use super::topology::{derive_topology, TopologyIntent};
-use crate::graphql::command_contract::CommandConsistency;
+use crate::command::CommandConsistency;
 
 /// Wire schema version for deployment plans.
 pub const DEPLOYMENT_PLAN_SCHEMA_VERSION: u32 = 1;
@@ -207,8 +205,10 @@ pub fn compile_deployment_plan(
                         .insert(process.id.clone());
                 }
                 MountSelector::Projector { id } => {
-                    if let Some(projection) =
-                        manifest.projections.iter().find(|projection| projection.id == *id)
+                    if let Some(projection) = manifest
+                        .projections
+                        .iter()
+                        .find(|projection| projection.id == *id)
                     {
                         if projection.direct {
                             direct_projection_hosts
@@ -425,7 +425,9 @@ impl DeploymentPlan {
         }
         let expected = expected_fingerprints(self)?;
         if self.fingerprints != expected {
-            return Err(ApplicationError::NonCanonical("deployment plan fingerprints"));
+            return Err(ApplicationError::NonCanonical(
+                "deployment plan fingerprints",
+            ));
         }
         // Silence unused import when APPLICATION_MANIFEST_SCHEMA_VERSION is only
         // for documentation linkage in validate paths.

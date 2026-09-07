@@ -13,8 +13,8 @@ use super::{
     OpaqueProtocolToken, ProtocolTokenCodec, ProtocolTokenError, ProtocolTokenPurpose,
     RequestedLiveResume,
 };
+use crate::command::CommandConsistency;
 use crate::command_ledger::CommandLedgerState;
-use crate::graphql::command_contract::CommandConsistency;
 use crate::graphql::projection_delta::runtime::ModeledProjectionStatusDisposition;
 use crate::microsvc::{
     CausalCommandProjectionObligation, CausalCommandPublicState, CausalCommandPublicStatus,

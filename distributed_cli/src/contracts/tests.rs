@@ -1259,7 +1259,7 @@ fn migration_inventory_is_deterministic_and_preserves_runtime_order() {
         .iter()
         .map(|migration| migration.version)
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     assert_eq!(
         inventory.canonical_bytes().expect("canonical inventory"),
         inventory

@@ -48,6 +48,18 @@
         "path": "migrations/postgres/0004_command_ledger_atomic_state.sql",
         "sha256": "bc49ca9c58a294b7c5876c9fcde8a14a8b6110594a06c48b37720d320a22d97e"
       }
+    },
+    {
+      "version": 5,
+      "description": "projection source snapshots",
+      "sqlite": {
+        "path": "migrations/sqlite/0005_projection_source_snapshots.sql",
+        "sha256": "2cb605be4ec190d9b3f156bdbbeb83a76e5f1f37287a8a7f3c2653dafbede442"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0005_projection_source_snapshots.sql",
+        "sha256": "2cb605be4ec190d9b3f156bdbbeb83a76e5f1f37287a8a7f3c2653dafbede442"
+      }
     }
   ]
 }

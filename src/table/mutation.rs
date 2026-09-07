@@ -377,7 +377,8 @@ pub(crate) fn has_many_join_columns(
             relationship.field_name
         )));
     }
-    let pairs = super::registry::resolve_direct_join_keys(root_schema, relationship, target_schema)?;
+    let pairs =
+        super::registry::resolve_direct_join_keys(root_schema, relationship, target_schema)?;
     match pairs.as_slice() {
         [pair] => Ok((
             pair.foreign_key_column.clone(),

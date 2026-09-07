@@ -584,7 +584,7 @@ fn unmatched_document_glob_fails_before_creating_output() {
 
 #[test]
 fn component_load_intent_remains_framework_neutral_outside_route_conventions() {
-	let project = project_dir("client-component-load");
+    let project = project_dir("client-component-load");
     write_document(&project, "queries/todos.graphql", LOAD_TODOS_QUERY);
 
     let unplaced = generate(&project, "queries/*.graphql", &[]);
@@ -596,10 +596,10 @@ fn component_load_intent_remains_framework_neutral_outside_route_conventions() {
         "unplaced component island must retain its load intent for the adapter"
     );
 
-	assert!(
-		!project.join("generated/routes.ts").exists(),
-		"the framework-neutral compiler must not invent adapter route ownership"
-	);
+    assert!(
+        !project.join("generated/routes.ts").exists(),
+        "the framework-neutral compiler must not invent adapter route ownership"
+    );
 }
 
 #[test]

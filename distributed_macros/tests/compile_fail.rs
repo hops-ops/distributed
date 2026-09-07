@@ -5,6 +5,8 @@
 //! regressions in diagnostic quality are caught.
 //!
 //! Regenerate `.stderr` snapshots with:
+//! `rustup component add rust-src` (keeps standard-library source spans aligned
+//! with CI), then:
 //! `TRYBUILD=overwrite cargo test -p distributed_macros`
 
 #[test]

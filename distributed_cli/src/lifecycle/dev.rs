@@ -291,7 +291,7 @@ pub fn run_lifecycle_project_dev(
     initial_options.cancel = Some(Arc::clone(&options.stop));
     let initial = run_lifecycle_project_build(&options.project, &initial_options)?;
     let state = DevStateStore::new(&root, &options.project.out)?;
-    state.write_active(&initial)?;
+    state.write_active(&initial, &BTreeMap::new())?;
     for process in dev.processes.values_mut() {
         process.env.insert(
             "DISTRIBUTED_LIFECYCLE_DIR".to_string(),
@@ -299,6 +299,10 @@ pub fn run_lifecycle_project_dev(
         );
     }
     let mut children = ChildSet::start(&root, &dev, &initial, &options.stop)?;
+    if let Err(error) = state.write_active(&initial, &children.members) {
+        let _ = children.shutdown(Duration::from_millis(dev.shutdown_ms));
+        return Err(error);
+    }
     if options.progress {
         for (name, process) in &dev.processes {
             if let Some(url) = &process.url {
@@ -416,13 +420,18 @@ pub fn run_lifecycle_project_dev(
             // acknowledgements to this attempt so a persisted response from a
             // rejected/superseded attempt can never authorize the next one.
             let transition = state.begin_transition()?;
-            state.write_preparing(&active, &generation, transition.id(), dev.prepare_ms)?;
+            state.write_preparing(
+                &active,
+                &generation,
+                transition.id(),
+                dev.prepare_ms,
+                &children.members,
+            )?;
             if let Err(error) = state.wait_for_prepare(
                 transition.id(),
                 Duration::from_millis(dev.prepare_ms),
                 &options.stop,
             ) {
-                state.write_active(&active)?;
                 if options.stop.load(Ordering::SeqCst)
                     && error.reason() == LifecycleErrorReason::Canceled
                 {
@@ -433,6 +442,7 @@ pub fn run_lifecycle_project_dev(
 						"pending generation preparation failed: {error}; prior generation is no longer serving: {serving}"
 					))
 				})?;
+                state.write_active(&active, &children.members)?;
                 if options.progress {
                     eprintln!(
 						"lifecycle dev: rejected generation={} during preparation; prior generation remains active: {}",
@@ -460,15 +470,14 @@ pub fn run_lifecycle_project_dev(
                 if options.stop.load(Ordering::SeqCst)
                     && error.reason() == LifecycleErrorReason::Canceled
                 {
-                    state.write_active(&active)?;
                     return Ok(());
                 }
-                state.write_active(&active)?;
                 children.ensure_running().map_err(|serving| {
 					LifecycleError::new(format!(
 						"pending generation readiness failed: {error}; prior generation rollback is not serving: {serving}"
 					))
-				})?;
+                })?;
+                state.write_active(&active, &children.members)?;
                 if options.progress {
                     eprintln!(
 						"lifecycle dev: rejected generation={} during readiness; prior generation remains active: {}",
@@ -493,7 +502,8 @@ pub fn run_lifecycle_project_dev(
                 );
                 return match rollback {
 					Ok(()) => {
-						state.write_active(&active)?;
+						children.ensure_running()?;
+						state.write_active(&active, &children.members)?;
 						if options.progress {
 							eprintln!(
 								"lifecycle dev: rejected generation={} during activation; prior generation remains active: {}",
@@ -510,7 +520,8 @@ pub fn run_lifecycle_project_dev(
             }
             final_generation = generation.generation_id.clone();
             active = generation.clone();
-            state.write_active(&active)?;
+            children.ensure_running()?;
+            state.write_active(&active, &children.members)?;
             if options.progress {
                 eprintln!(
                     "lifecycle dev: activated generation={} invalidated={} restarted={}",
@@ -528,8 +539,10 @@ pub fn run_lifecycle_project_dev(
         Ok(())
     })();
 
+    let retired = state.write_active(&active, &BTreeMap::new());
     let shutdown = children.shutdown(Duration::from_millis(dev.shutdown_ms));
     result?;
+    retired?;
     shutdown?;
     Ok(LifecycleDevReport {
         initial_generation: initial.generation_id,
@@ -554,6 +567,7 @@ struct DevLifecycleState<'a> {
     schema_version: u32,
     phase: &'static str,
     active: DevGenerationState<'a>,
+    members: &'a BTreeMap<String, DevMemberState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pending: Option<DevGenerationState<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -580,11 +594,16 @@ impl DevStateStore {
         })
     }
 
-    fn write_active(&self, active: &LifecycleBuildReport) -> Result<(), LifecycleError> {
+    fn write_active(
+        &self,
+        active: &LifecycleBuildReport,
+        members: &BTreeMap<String, DevMemberState>,
+    ) -> Result<(), LifecycleError> {
         self.write(&DevLifecycleState {
             schema_version: 1,
             phase: "active",
             active: generation_state(active),
+            members,
             pending: None,
             transition_id: None,
             deadline_unix_ms: None,
@@ -617,12 +636,14 @@ impl DevStateStore {
         pending: &LifecycleBuildReport,
         transition_id: &str,
         prepare_ms: u64,
+        members: &BTreeMap<String, DevMemberState>,
     ) -> Result<(), LifecycleError> {
         let deadline = unix_ms()?.saturating_add(prepare_ms);
         self.write(&DevLifecycleState {
             schema_version: 1,
             phase: "preparing",
             active: generation_state(active),
+            members,
             pending: Some(generation_state(pending)),
             transition_id: Some(transition_id),
             deadline_unix_ms: Some(deadline),
@@ -865,8 +886,36 @@ fn changed_paths(
         .collect()
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DevMemberState {
+    instance_id: String,
+    generation_id: String,
+}
+
+impl DevMemberState {
+    fn new(generation: &LifecycleBuildReport) -> Result<Self, LifecycleError> {
+        let identity = tempfile::Builder::new()
+            .prefix("member-")
+            .rand_bytes(16)
+            .tempfile()
+            .map_err(dev_io("allocate lifecycle process identity"))?;
+        let instance_id = identity
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| LifecycleError::new("invalid lifecycle process identity"))?
+            .to_owned();
+        Ok(Self {
+            instance_id,
+            generation_id: generation.generation_id.clone(),
+        })
+    }
+}
+
 struct ChildSet {
     children: BTreeMap<String, Child>,
+    members: BTreeMap<String, DevMemberState>,
 }
 
 impl ChildSet {
@@ -878,11 +927,17 @@ impl ChildSet {
     ) -> Result<Self, LifecycleError> {
         let mut set = Self {
             children: BTreeMap::new(),
+            members: BTreeMap::new(),
         };
         for (name, process) in &config.processes {
-            match spawn_process(root, name, process, generation) {
-                Ok(child) => {
+            let spawned = DevMemberState::new(generation).and_then(|member| {
+                spawn_process(root, name, process, generation, &member.instance_id)
+                    .map(|child| (child, member))
+            });
+            match spawned {
+                Ok((child, member)) => {
                     set.children.insert(name.clone(), child);
+                    set.members.insert(name.clone(), member);
                 }
                 Err(error) => {
                     let _ = set.shutdown(Duration::from_millis(config.shutdown_ms));
@@ -907,6 +962,12 @@ impl ChildSet {
     }
 
     fn ensure_running(&mut self) -> Result<(), LifecycleError> {
+        if self.children.len() != self.members.len() || self.children.keys().ne(self.members.keys())
+        {
+            return Err(LifecycleError::new(
+                "lifecycle process cohort is incomplete",
+            ));
+        }
         for (name, child) in &mut self.children {
             if let Some(status) = child.try_wait().map_err(|error| {
                 LifecycleError::new(format!("failed to inspect dev process `{name}`: {error}"))
@@ -946,20 +1007,27 @@ impl ChildSet {
                 self.children.insert(name.clone(), previous_child);
                 return Err(error);
             }
-            let replacement =
-                spawn_process(root, name, process, generation).and_then(|mut child| {
-                    if let Err(error) =
-                        wait_ready(root, name, process, generation, &mut child, stop)
-                    {
-                        let _ =
-                            stop_child(name, &mut child, Duration::from_millis(config.shutdown_ms));
-                        return Err(error);
-                    }
-                    Ok(child)
-                });
+            let replacement = DevMemberState::new(generation).and_then(|member| {
+                spawn_process(root, name, process, generation, &member.instance_id).and_then(
+                    |mut child| {
+                        if let Err(error) =
+                            wait_ready(root, name, process, generation, &mut child, stop)
+                        {
+                            let _ = stop_child(
+                                name,
+                                &mut child,
+                                Duration::from_millis(config.shutdown_ms),
+                            );
+                            return Err(error);
+                        }
+                        Ok((child, member))
+                    },
+                )
+            });
             match replacement {
-                Ok(child) => {
+                Ok((child, member)) => {
                     self.children.insert(name.clone(), child);
+                    self.members.insert(name.clone(), member);
                     replaced.insert(name.clone());
                 }
                 Err(error) => {
@@ -1008,21 +1076,21 @@ impl ChildSet {
         for name in names {
             let process = &config.processes[name];
             if let Some(mut child) = self.children.remove(name) {
-                if let Err(error) = stop_child(
-                    name,
-                    &mut child,
-                    Duration::from_millis(config.shutdown_ms),
-                ) {
+                if let Err(error) =
+                    stop_child(name, &mut child, Duration::from_millis(config.shutdown_ms))
+                {
                     self.children.insert(name.clone(), child);
                     return Err(error);
                 }
             }
-            let mut child = spawn_process(root, name, process, replacement)?;
+            let member = DevMemberState::new(replacement)?;
+            let mut child = spawn_process(root, name, process, replacement, &member.instance_id)?;
             if let Err(error) = wait_ready(root, name, process, replacement, &mut child, stop) {
                 let _ = stop_child(name, &mut child, Duration::from_millis(config.shutdown_ms));
                 return Err(error);
             }
             self.children.insert(name.clone(), child);
+            self.members.insert(name.clone(), member);
         }
         Ok(())
     }
@@ -1187,6 +1255,7 @@ fn spawn_process(
     name: &str,
     process: &LifecycleDevProcess,
     generation: &LifecycleBuildReport,
+    instance_id: &str,
 ) -> Result<Child, LifecycleError> {
     let cwd = resolve_working_dir(root, process.cwd.as_deref(), process.external_cwd)?;
     let args = process
@@ -1205,6 +1274,7 @@ fn spawn_process(
         .env("DISTRIBUTED_TOPOLOGY_ID", &generation.graph_id)
         .env("DISTRIBUTED_COMPATIBILITY_ID", &generation.compatibility_id)
         .env("DISTRIBUTED_MEMBER_ID", name)
+        .env("DISTRIBUTED_PROCESS_INSTANCE_ID", instance_id)
         .stdin(Stdio::null());
     #[cfg(unix)]
     command.process_group(0);

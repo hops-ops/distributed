@@ -59,6 +59,13 @@ document, boundary binding, or UI build therefore leaves the prior generation
 active.
 Lifecycle receipts, the application manifest, and generated client trees are
 tool-owned state under `.distributed/lifecycle/`.
+During `distributed dev`, each process launch has a supervisor-owned identity.
+Client-only generations can retain an unchanged API process: the active cohort
+explicitly admits that instance, and its GraphQL responses advertise the current
+generation. Preparing, replaced and retired instances cannot dispatch mutations.
+Rollback launches receive new identities; schema compatibility alone never
+authorizes an old process. Upgrade the CLI and runtime together and restart dev
+after an upgrade so every member receives the matching lifecycle contract.
 Rust binaries remain in Cargo's target directory and SvelteKit output remains
 in its adapter-selected output directory.
 

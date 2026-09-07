@@ -5,10 +5,10 @@
 
 #![cfg(feature = "graphql")]
 
-use distributed::graphql::{
-    typed_command, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField, Succeeded,
-    VerifiedPrincipal,
+use distributed::command::{
+    typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField, Succeeded,
 };
+use distributed::graphql::VerifiedPrincipal;
 use distributed::microsvc::{Routes, Service, Session, USER_ID_KEY};
 use distributed::{Aggregate, AggregateBuilder, Entity, InMemoryRepository, Snapshot};
 use serde::{Deserialize, Serialize};
@@ -51,11 +51,11 @@ struct CompleteInput {
     id: String,
 }
 
-impl GraphqlInputType for CompleteInput {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandInputType for CompleteInput {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CompleteInput",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -73,11 +73,11 @@ struct CompletePayload {
     id: String,
 }
 
-impl GraphqlOutputType for CompletePayload {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandOutputType for CompletePayload {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CompletePayload",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -94,7 +94,9 @@ impl GraphqlOutputType for CompletePayload {
 async fn public_causal_invoke_returns_receipt_without_sqlx_or_celld() {
     let routes = Routes::new()
         .with_repo(InMemoryRepository::new().aggregate::<TodoHost>())
-        .typed_command(typed_command::<CompleteInput, Succeeded<CompletePayload>>("todo.create"))
+        .typed_command(typed_command::<CompleteInput, Succeeded<CompletePayload>>(
+            "todo.create",
+        ))
         .create()
         .invoke(|aggregate, input, _owner| {
             aggregate.record(input.id.clone())?;
@@ -103,9 +105,9 @@ async fn public_causal_invoke_returns_receipt_without_sqlx_or_celld() {
         .succeeded(|aggregate| CompletePayload {
             id: aggregate.entity().id().to_string(),
         })
-        .typed_command(
-            typed_command::<CompleteInput, Succeeded<CompletePayload>>("todo.complete"),
-        )
+        .typed_command(typed_command::<CompleteInput, Succeeded<CompletePayload>>(
+            "todo.complete",
+        ))
         .load_by(|input: &CompleteInput| input.id.clone())
         .invoke(|aggregate, input, _owner| {
             aggregate.record(input.id.clone())?;

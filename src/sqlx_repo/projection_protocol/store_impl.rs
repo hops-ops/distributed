@@ -13,6 +13,22 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
+    #[cfg(feature = "graphql")]
+    async fn projection_rebuild_records(
+        &self,
+        context: &crate::projection::rebuild::RebuildContext,
+    ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
+        self.snapshot_rebuild_records(context).await
+    }
+
+    #[cfg(feature = "graphql")]
+    async fn commit_projection_rebuild(
+        &self,
+        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> Result<usize, ProjectionProtocolError> {
+        self.apply_snapshot_rebuild(plan).await
+    }
+
     fn register_projection_models<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
@@ -410,6 +426,11 @@ where
                     &mutation.expectation,
                     mutation.kind,
                     current.as_ref(),
+                    mutation.source_snapshot.is_some(),
+                )?;
+                crate::projection_protocol::validate_snapshot_write(
+                    current.as_ref().map(|record| &record.metadata),
+                    mutation.source_snapshot.as_ref(),
                 )?;
                 let change = allocate_change(
                     &mut state,
@@ -426,6 +447,7 @@ where
                     revision,
                     tombstone,
                     change: change.cursor.clone(),
+                    source_snapshot: mutation.source_snapshot.clone(),
                 };
                 records_by_scope.insert(mutation.scope.clone(), metadata.clone());
                 records.push(metadata);
@@ -469,7 +491,7 @@ where
                                 actual_revision: metadata.revision.revision(),
                             });
                         }
-                        if metadata.tombstone {
+                        if metadata.tombstone && metadata.source_snapshot.is_none() {
                             return Err(ProjectionProtocolError::RecordTombstoned {
                                 model: expected.scope().model().to_string(),
                             });

@@ -51,14 +51,15 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
         assert_eq!(
             descriptions,
             vec![
                 "initial",
                 "command ledger",
                 "projection protocol",
-                "command ledger atomic state"
+                "command ledger atomic state",
+                "projection source snapshots"
             ]
         );
         assert_eq!(
@@ -80,6 +81,10 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/sqlite/0004_command_ledger_atomic_state.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0005_projection_source_snapshots.sql"
+                )),
             ]
         );
     }
@@ -99,14 +104,15 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5]);
         assert_eq!(
             descriptions,
             vec![
                 "initial",
                 "command ledger",
                 "projection protocol",
-                "command ledger atomic state"
+                "command ledger atomic state",
+                "projection source snapshots"
             ]
         );
         assert_eq!(
@@ -127,6 +133,10 @@ mod tests {
                 include_str!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/postgres/0004_command_ledger_atomic_state.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0005_projection_source_snapshots.sql"
                 )),
             ]
         );

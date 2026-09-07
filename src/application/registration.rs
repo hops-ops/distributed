@@ -4,7 +4,9 @@ use super::error::ApplicationResult;
 use super::manifest::{ApplicationExtension, ApplicationManifest, ManifestProvenance};
 use super::module::{Module, SurfaceSpec};
 use crate::graphql::surface::Surface;
-use crate::graphql::{ClientManifestError, DistributedClientManifest, DistributedClientSurfaceExport};
+use crate::graphql::{
+    ClientManifestError, DistributedClientManifest, DistributedClientSurfaceExport,
+};
 
 /// Explicit application registration. No linker inventory or source scan is
 /// consulted; only the values supplied to this constructor participate.
@@ -217,7 +219,9 @@ impl ContractCompiler {
                     "ContractCompiler already has a different authoritative Surface contract"
                 ));
             }
-            return Err("ContractCompiler accepts exactly one authoritative Surface contract".into());
+            return Err(
+                "ContractCompiler accepts exactly one authoritative Surface contract".into(),
+            );
         }
         self.surface = Some(surface);
         self.surface_spec = Some(spec);

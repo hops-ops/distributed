@@ -70,10 +70,10 @@ pub(super) fn expand_relational_read_model(
         let ty = &field.ty;
         let marker = format_ident!("__Distributed{}EffectModelField_{}", name, ident);
         effect_key_fields.push(quote! {
-            pub #ident: distributed::graphql::TypedEffectExpression<#ty>
+            pub #ident: distributed::command::TypedEffectExpression<#ty>
         });
         effect_key_values.push(quote! {
-            distributed::graphql::__effect_key_field::<#marker>(value.#ident)
+            distributed::command::__effect_key_field::<#marker>(value.#ident)
         });
     }
 
@@ -123,7 +123,7 @@ pub(super) fn expand_relational_read_model(
                 #[allow(non_camel_case_types)]
                 #visibility struct #marker;
 
-                impl distributed::graphql::EffectRelationshipMarker for #marker {
+                impl distributed::command::EffectRelationshipMarker for #marker {
                     type Source = #name;
                     type Target = #target_ty;
                     const FIELD: &'static str = #field_name;
@@ -153,7 +153,7 @@ pub(super) fn expand_relational_read_model(
             #[allow(non_camel_case_types)]
             #visibility struct #effect_marker;
 
-            impl distributed::graphql::EffectModelFieldMarker for #effect_marker {
+            impl distributed::command::EffectModelFieldMarker for #effect_marker {
                 type Model = #name;
                 type Value = #field_ty;
                 type Wire = #effect_wire;
@@ -311,10 +311,10 @@ pub(super) fn expand_relational_read_model(
         }
 
         impl ::core::convert::From<#effect_key_name>
-            for distributed::graphql::TypedEffectKey<#name>
+            for distributed::command::TypedEffectKey<#name>
         {
             fn from(value: #effect_key_name) -> Self {
-                distributed::graphql::__effect_key::<#name>(vec![#(#effect_key_values),*])
+                distributed::command::__effect_key::<#name>(vec![#(#effect_key_values),*])
             }
         }
 

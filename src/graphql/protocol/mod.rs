@@ -12,8 +12,8 @@ mod tests;
 mod token;
 mod types;
 
-pub use accumulator::ProtocolResponseAccumulator;
 pub(crate) use accumulator::issue_projection_obligation_token;
+pub use accumulator::ProtocolResponseAccumulator;
 pub(crate) use projection_metadata::{
     CommandProjectionLifecycleProofV1, CommandProjectionMetadataError, CommandProjectionMetadataV1,
     CommandProjectionObligationV1, MAX_COMMAND_PROJECTION_OBLIGATIONS,

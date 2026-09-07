@@ -124,7 +124,7 @@ export function validateDistributedReloadLocation(location: URL): string {
 /** Register one generated client with the shared browser reload transaction. */
 export function registerDistributedReloadClient(
 	replica: DistributedReplica,
-	runtime: Readonly<{ pendingCommandIds?(): readonly string[] }> | undefined,
+	runtime: Readonly<{ pendingCommandIds?(): readonly string[]; preload?(): Promise<void> }> | undefined,
 	options: DistributedReloadOptions
 ): () => void {
 	const state = new Map(
@@ -177,8 +177,9 @@ export function registerDistributedReloadClient(
 					await declaration.restore(candidate.value);
 				}
 			}
-			if (saved.pendingCommandIds.length > 0) {
-				await options.recoverPendingCommands?.(saved.pendingCommandIds);
+			if (saved.pendingCommandIds.length > 0 && options.recoverPendingCommands !== undefined) {
+				await runtime?.preload?.();
+				await options.recoverPendingCommands(saved.pendingCommandIds);
 			}
 			window.dispatchEvent(
 				new CustomEvent('distributed:reload-restored', {

@@ -3,9 +3,7 @@
 
 use async_graphql::Request;
 use distributed::graphql::{claim, col, read, GraphqlEngine, ModelPermissions};
-use distributed::{
-    ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-};
+use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
 
 use super::common::{
     engine_all_columns, error_messages, exec_json, seed_orders, session, ChildView, OrderView,

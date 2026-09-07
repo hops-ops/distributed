@@ -123,6 +123,7 @@ fn direct_projection_evidence(marker: &str) -> SameTransactionProjectionEvidence
     let revision = RecordRevision::new(scope.clone(), 1, 1).unwrap();
     let cursor = ProjectionChangeCursor::new(topology, partition, epoch, 1).unwrap();
     let record = ProjectionRecordMetadata {
+        source_snapshot: None,
         revision: revision.clone(),
         tombstone: false,
         change: cursor.clone(),

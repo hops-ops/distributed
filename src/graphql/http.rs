@@ -283,7 +283,10 @@ async fn graphql_handler(
 ) -> Response {
     let request = req.into_inner();
     if !crate::microsvc::lifecycle_mutations_open()
-        && matches!(websocket_operation_type(&request), Ok(OperationType::Mutation))
+        && matches!(
+            websocket_operation_type(&request),
+            Ok(OperationType::Mutation)
+        )
     {
         return lifecycle_reloading_response();
     }
@@ -312,7 +315,10 @@ async fn graphql_handler_with_service(
 ) -> Response {
     let request = req.into_inner();
     if !crate::microsvc::lifecycle_mutations_open()
-        && matches!(websocket_operation_type(&request), Ok(OperationType::Mutation))
+        && matches!(
+            websocket_operation_type(&request),
+            Ok(OperationType::Mutation)
+        )
     {
         return lifecycle_reloading_response();
     }
@@ -343,7 +349,10 @@ pub async fn microsvc_graphql_handler(
 ) -> Response {
     let request = req.into_inner();
     if !crate::microsvc::lifecycle_mutations_open()
-        && matches!(websocket_operation_type(&request), Ok(OperationType::Mutation))
+        && matches!(
+            websocket_operation_type(&request),
+            Ok(OperationType::Mutation)
+        )
     {
         return lifecycle_reloading_response();
     }

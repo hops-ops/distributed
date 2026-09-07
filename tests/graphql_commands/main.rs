@@ -2,14 +2,14 @@
 
 #![cfg(feature = "graphql")]
 
-use distributed::graphql::{GraphqlTypeDef, GraphqlTypeField};
+use distributed::command::{CommandTypeDef, CommandTypeField};
 
 #[test]
 fn graphql_type_def_mapping_golden() {
-    let input = GraphqlTypeDef::new(
+    let input = CommandTypeDef::new(
         "CreateItemInput",
         vec![
-            GraphqlTypeField {
+            CommandTypeField {
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -17,7 +17,7 @@ fn graphql_type_def_mapping_golden() {
                 item_nullable: false,
                 nested: None,
             },
-            GraphqlTypeField {
+            CommandTypeField {
                 name: "tags".into(),
                 type_name: "String".into(),
                 nullable: true,
@@ -33,7 +33,7 @@ fn graphql_type_def_mapping_golden() {
     assert!(input.fields[1].list);
 }
 
-#[derive(distributed::GraphqlInput)]
+#[derive(distributed::CommandInput)]
 #[allow(dead_code)]
 struct DerivedInput {
     id: String,
@@ -41,14 +41,14 @@ struct DerivedInput {
     tags: Option<Vec<String>>,
 }
 
-#[derive(distributed::GraphqlOutput)]
+#[derive(distributed::CommandOutput)]
 #[allow(dead_code)]
 struct DerivedOutput {
     ok: bool,
     id: String,
 }
 
-#[derive(distributed::GraphqlInput, serde::Deserialize)]
+#[derive(distributed::CommandInput, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct ScalarMatrixInput {
@@ -61,7 +61,7 @@ struct ScalarMatrixInput {
     optional_nullable_items: Option<Vec<Option<String>>>,
 }
 
-#[derive(distributed::GraphqlOutput, serde::Serialize)]
+#[derive(distributed::CommandOutput, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct ScalarMatrixOutput {
@@ -74,7 +74,7 @@ struct ScalarMatrixOutput {
     optional_nullable_items: Option<Vec<Option<String>>>,
 }
 
-#[derive(distributed::GraphqlInput)]
+#[derive(distributed::CommandInput)]
 #[serde(rename_all(deserialize = "camelCase", serialize = "SCREAMING_SNAKE_CASE"))]
 #[allow(dead_code)]
 struct DirectionalInputNames {
@@ -83,7 +83,7 @@ struct DirectionalInputNames {
     custom_id: String,
 }
 
-#[derive(distributed::GraphqlOutput)]
+#[derive(distributed::CommandOutput)]
 #[serde(rename_all(deserialize = "camelCase", serialize = "SCREAMING_SNAKE_CASE"))]
 #[allow(dead_code)]
 struct DirectionalOutputNames {
@@ -94,9 +94,9 @@ struct DirectionalOutputNames {
 
 #[test]
 fn derive_mapping_golden() {
-    use distributed::graphql::{GraphqlInputType, GraphqlOutputType};
+    use distributed::command::{CommandInputType, CommandOutputType};
 
-    let input = DerivedInput::graphql_type();
+    let input = DerivedInput::command_type();
     assert_eq!(input.name, "DerivedInput");
     assert_eq!(input.fields.len(), 3);
     assert_eq!(input.fields[0].type_name, "String");
@@ -105,7 +105,7 @@ fn derive_mapping_golden() {
     assert!(input.fields[2].list);
     assert!(input.fields[2].nullable);
 
-    let output = DerivedOutput::graphql_type();
+    let output = DerivedOutput::command_type();
     assert_eq!(output.name, "DerivedOutput");
     assert_eq!(output.fields[0].type_name, "Boolean");
     assert_eq!(output.fields[1].type_name, "String");
@@ -113,7 +113,7 @@ fn derive_mapping_golden() {
 
 #[test]
 fn derive_preserves_outer_and_item_nullability_and_serde_names() {
-    use distributed::graphql::{GraphqlInputType, GraphqlOutputType};
+    use distributed::command::{CommandInputType, CommandOutputType};
 
     let expected = [
         ("wireRequired", false, false, false),
@@ -124,8 +124,8 @@ fn derive_preserves_outer_and_item_nullability_and_serde_names() {
         ("optionalNullableItems", true, true, true),
     ];
     for definition in [
-        ScalarMatrixInput::graphql_type(),
-        ScalarMatrixOutput::graphql_type(),
+        ScalarMatrixInput::command_type(),
+        ScalarMatrixOutput::command_type(),
     ] {
         for (name, nullable, list, item_nullable) in expected {
             let field = definition
@@ -140,14 +140,14 @@ fn derive_preserves_outer_and_item_nullability_and_serde_names() {
         }
     }
 
-    let input_names: Vec<_> = DirectionalInputNames::graphql_type()
+    let input_names: Vec<_> = DirectionalInputNames::command_type()
         .fields
         .into_iter()
         .map(|field| field.name)
         .collect();
     assert_eq!(input_names, ["regularField", "inputID"]);
 
-    let output_names: Vec<_> = DirectionalOutputNames::graphql_type()
+    let output_names: Vec<_> = DirectionalOutputNames::command_type()
         .fields
         .into_iter()
         .map(|field| field.name)

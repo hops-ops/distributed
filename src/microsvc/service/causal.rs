@@ -5,6 +5,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 #[cfg(feature = "graphql")]
+use crate::command::{CommandConsistency, TypedCommandContract};
+#[cfg(feature = "graphql")]
 use crate::command_ledger::CausalTransactionalCommit;
 #[cfg(feature = "graphql")]
 use crate::command_ledger::{
@@ -12,8 +14,6 @@ use crate::command_ledger::{
     CommandLedgerState, CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReplay,
     TerminalCommandState,
 };
-#[cfg(feature = "graphql")]
-use crate::graphql::command_contract::{CommandConsistency, TypedCommandContract};
 #[cfg(feature = "graphql")]
 use crate::microsvc::error::HandlerError;
 #[cfg(feature = "graphql")]
@@ -445,7 +445,7 @@ impl CausalDispatchResult {
                 command_id: wire.receipt.command_id,
                 command_name: String::new(),
                 causation_id: wire.receipt.causation_id,
-                consistency: crate::graphql::CommandConsistency::Succeeded,
+                consistency: crate::command::CommandConsistency::Succeeded,
                 state,
                 outcome: Value::Null,
                 obligations: Vec::new(),

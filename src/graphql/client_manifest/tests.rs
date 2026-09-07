@@ -1,9 +1,9 @@
 use super::*;
+use crate::command::{typed_command, Eventual, PreparedCommand, Succeeded};
+use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
 use crate::graphql::{
-    build_surface, claim, col, rel, surface_for_application, surface_for_role, typed_command,
-    Eventual, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField,
-    PreparedCommand, RoleGrant, Succeeded, SurfaceCommand, SurfaceOptions, SurfaceProjector,
-    SurfaceTypeField,
+    build_surface, claim, col, rel, surface_for_application, surface_for_role, RoleGrant,
+    SurfaceCommand, SurfaceOptions, SurfaceProjector, SurfaceTypeField,
 };
 use crate::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
 use crate::table::{
@@ -184,11 +184,11 @@ fn team_members() -> TableSchema {
 
 #[derive(Deserialize)]
 struct CompleteInput;
-impl GraphqlInputType for CompleteInput {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandInputType for CompleteInput {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CompleteTodoInput",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "todo_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -203,11 +203,11 @@ impl GraphqlInputType for CompleteInput {
 
 #[derive(Serialize)]
 struct CompletePayload;
-impl GraphqlOutputType for CompletePayload {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandOutputType for CompletePayload {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CompleteTodoPayload",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "todo_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -479,7 +479,7 @@ fn modeled_surface_with_base(
 }
 
 fn projected_surface() -> Surface {
-    use super::super::command_contract::{CommandEffects, CommandProjectedModel, EffectExpression};
+    use crate::command::{CommandEffects, CommandProjectedModel, EffectExpression};
 
     let todo_schema: &'static TableSchema = Box::leak(Box::new(todos()));
     let mut surface = build_surface(&[todo_schema.clone(), users()], &SurfaceOptions::sqlite())
@@ -601,7 +601,7 @@ fn projected_command_exports_opaque_role_safe_direct_target() {
 
 #[test]
 fn legacy_effect_presets_are_not_v2_client_authority() {
-    use super::super::command_contract::{
+    use crate::command::{
         CommandEffect, CommandEffects, EffectExpression, EffectFieldValue, EffectKey,
     };
 
@@ -897,18 +897,25 @@ fn role_and_application_partition_manifests_hide_raw_paths_and_denied_values() {
         .unwrap()
         .projections
         .add_preview(
-            crate::graphql::CommandProjectionPreview::new()
+            crate::command::CommandProjectionPreview::new()
                 .events(crate::events![ManifestTodoProjected])
                 .field(
                     ["private_partition_path"],
-                    crate::graphql::CommandProjectionPreviewSource::constant(
+                    crate::command::CommandProjectionPreviewSource::constant(
                         crate::ProjectionValue::string("denied-partition-value"),
                     ),
                 ),
         );
     let all_grants = grants();
     let role = surface_for_role(&full, "user", &all_grants["user"]).unwrap();
-    let application = surface_for_application(&full, "web", &["user".into()], &["user".into()], &all_grants).unwrap();
+    let application = surface_for_application(
+        &full,
+        "web",
+        &["user".into()],
+        &["user".into()],
+        &all_grants,
+    )
+    .unwrap();
 
     for (identity, selected) in [
         (ClientSurfaceIdentity::role("user"), role),
@@ -1406,7 +1413,7 @@ fn denied_modeled_projection_exports_no_program_event_slot_or_preset_identity() 
         .find(|command| command.command_name == "todo.complete")
         .unwrap();
     command.projections.previews[0].preview.fields[0].source =
-        crate::graphql::CommandProjectionPreviewSource::trusted("denied-owner-secret", "string");
+        crate::command::CommandProjectionPreviewSource::trusted("denied-owner-secret", "string");
     let selected = surface_for_role(
         &full,
         "user",
@@ -1832,15 +1839,14 @@ fn bigint_keys_embed_until_decimal_string_identity_is_available() {
 fn application_surface_is_common_contract_with_safe_role_limit_semantics() {
     let full = full_surface();
     let all_grants = grants();
-    let selected =
-        surface_for_application(
-            &full,
-            "web",
-            &["user".into(), "admin".into()],
-            &["user".into(), "admin".into()],
-            &all_grants,
-        )
-            .unwrap();
+    let selected = surface_for_application(
+        &full,
+        "web",
+        &["user".into(), "admin".into()],
+        &["user".into(), "admin".into()],
+        &all_grants,
+    )
+    .unwrap();
     let manifest = client_manifest_from_surface(
         "todos-service",
         ClientSurfaceIdentity::application("web", ["admin", "user"], ["admin", "user"]),
@@ -2315,15 +2321,14 @@ fn relational_row_policy_is_server_only_when_relationship_key_is_hidden() {
 #[test]
 fn application_role_sets_are_canonical_before_fingerprinting() {
     let full = full_surface();
-    let selected =
-        surface_for_application(
-            &full,
-            "web",
-            &["admin".into(), "user".into()],
-            &["admin".into(), "user".into()],
-            &grants(),
-        )
-        .unwrap();
+    let selected = surface_for_application(
+        &full,
+        "web",
+        &["admin".into(), "user".into()],
+        &["admin".into(), "user".into()],
+        &grants(),
+    )
+    .unwrap();
     let first = client_manifest_from_surface(
         "todos-service",
         ClientSurfaceIdentity::Application {

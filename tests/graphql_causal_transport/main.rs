@@ -4,12 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use distributed::graphql::{
-    typed_command, GraphqlEngine, IdentityConfig, OidcConfig, PreparedCommand, Succeeded,
-};
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::graphql::{GraphqlEngine, IdentityConfig, OidcConfig};
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
 use distributed::{
-    Aggregate, AggregateRepository, Entity, EventRecord, GraphqlInput, GraphqlOutput,
+    Aggregate, AggregateRepository, CommandInput, CommandOutput, Entity, EventRecord,
     InMemoryRepository,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -76,12 +75,12 @@ impl Aggregate for TransportAggregate {
     }
 }
 
-#[derive(Deserialize, GraphqlInput)]
+#[derive(Deserialize, CommandInput)]
 struct TransportCommandInput {
     id: String,
 }
 
-#[derive(Serialize, GraphqlOutput)]
+#[derive(Serialize, CommandOutput)]
 struct TransportCommandOutput {
     id: String,
 }

@@ -3,10 +3,13 @@
 
 use std::any::TypeId;
 
+use distributed::command::{
+    typed_command, Atomic, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
+    PreparedCommand,
+};
 use distributed::graphql::{
-    build_surface, surface_for_role, typed_command, DistributedClientSurfaceExport,
-    Atomic, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField, PreparedCommand,
-    RoleGrant, SurfaceOptions, SurfaceProjector,
+    build_surface, surface_for_role, DistributedClientSurfaceExport, RoleGrant, SurfaceOptions,
+    SurfaceProjector,
 };
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
 use distributed::{
@@ -23,12 +26,12 @@ pub struct OrderView {
     pub status: String,
 }
 
-impl GraphqlOutputType for OrderView {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandOutputType for OrderView {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "OrderView",
             vec![
-                GraphqlTypeField {
+                CommandTypeField {
                     name: "order_id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -36,7 +39,7 @@ impl GraphqlOutputType for OrderView {
                     item_nullable: false,
                     nested: None,
                 },
-                GraphqlTypeField {
+                CommandTypeField {
                     name: "status".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -55,11 +58,11 @@ struct ProjectOrderInput {
     order_id: String,
 }
 
-impl GraphqlInputType for ProjectOrderInput {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandInputType for ProjectOrderInput {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "ProjectOrderInput",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,

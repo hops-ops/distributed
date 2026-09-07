@@ -100,6 +100,7 @@ export type SveltekitCommandRuntimeLike<TCommands> = Pick<
 > &
 	Readonly<{
 		commands: TCommands;
+		preload?(): Promise<void>;
 	}>;
 
 export type SveltekitCommandRuntimeFactory<TCommands> = (
@@ -249,6 +250,8 @@ export type DistributedSvelteKitClient<TCommands> = Readonly<{
 		artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>,
 		variables: GraphqlVariables
 	): Promise<void>;
+	/** Load deferred command code without dispatching a command. */
+	preloadCommands(): Promise<void>;
 	invalidateAuthorization(): void;
 	destroy(): void;
 }>;
@@ -498,6 +501,10 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 		hydrate,
 		prefetch(artifact, variables) {
 			return prefetchReplicaOperation(replica!, artifact, variables);
+		},
+		preloadCommands(): Promise<void> {
+			if (destroyed) return Promise.reject(new Error('Distributed SvelteKit client is destroyed'));
+			return commandRuntime?.preload?.() ?? Promise.resolve();
 		},
 		invalidateAuthorization(): void {
 			if (!destroyed) {

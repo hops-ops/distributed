@@ -369,6 +369,8 @@ pub struct ResolvedProjectionPlan {
     arm_id: String,
     partition: ResolvedProjectionPartition,
     mutations: Vec<ResolvedProjectionMutation>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    source_snapshots: bool,
 }
 
 impl ResolvedProjectionPlan {
@@ -429,7 +431,13 @@ impl ResolvedProjectionPlan {
             arm_id: arm.arm_id().to_owned(),
             partition,
             mutations,
+            source_snapshots: program.source_snapshots(),
         })
+    }
+
+    /// Whether full-state writes require authoritative source-version fencing.
+    pub fn source_snapshots(&self) -> bool {
+        self.source_snapshots
     }
 
     /// Return the canonical program identity.

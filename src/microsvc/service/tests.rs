@@ -6,6 +6,12 @@ use crate::aggregate::Aggregate;
 #[cfg(feature = "graphql")]
 use crate::bus::RunOptions;
 use crate::bus::{Message, MessageKind, SubscriptionPlan};
+#[cfg(all(feature = "graphql", feature = "sqlite"))]
+use crate::command::Eventual;
+use crate::command::{typed_command, PreparedCommand, Succeeded};
+#[cfg(feature = "graphql")]
+use crate::command::{Atomic, CommandConsistency};
+use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
 #[cfg(feature = "graphql")]
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
@@ -13,17 +19,9 @@ use crate::command_ledger::{
     CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation, ReservationOutcome,
 };
 #[cfg(feature = "graphql")]
-use crate::graphql::command_contract::CommandConsistency;
-#[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
-#[cfg(all(feature = "graphql", feature = "sqlite"))]
-use crate::graphql::Eventual;
-use crate::graphql::{
-    typed_command, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField,
-    PreparedCommand, Succeeded,
-};
 #[cfg(feature = "graphql")]
-use crate::graphql::{Atomic, SurfaceDirectProjection, SurfaceProjector};
+use crate::graphql::{SurfaceDirectProjection, SurfaceProjector};
 #[cfg(feature = "graphql")]
 use crate::microsvc::HasOutboxStore;
 use crate::microsvc::{
@@ -75,10 +73,10 @@ struct TypedOutput {
     id: String,
 }
 
-fn one_string_field(name: &str, field: &str) -> GraphqlTypeDef {
-    GraphqlTypeDef::new(
+fn one_string_field(name: &str, field: &str) -> CommandTypeDef {
+    CommandTypeDef::new(
         name,
-        vec![GraphqlTypeField {
+        vec![CommandTypeField {
             name: field.into(),
             type_name: "String".into(),
             nullable: false,
@@ -89,14 +87,14 @@ fn one_string_field(name: &str, field: &str) -> GraphqlTypeDef {
     )
 }
 
-impl GraphqlInputType for TypedInput {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandInputType for TypedInput {
+    fn command_type() -> CommandTypeDef {
         one_string_field("TypedInput", "id").with_type_id(std::any::TypeId::of::<Self>())
     }
 }
 
-impl GraphqlOutputType for TypedOutput {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandOutputType for TypedOutput {
+    fn command_type() -> CommandTypeDef {
         one_string_field("TypedOutput", "id").with_type_id(std::any::TypeId::of::<Self>())
     }
 }
@@ -109,12 +107,12 @@ struct CausalTestInput {
 }
 
 #[cfg(feature = "graphql")]
-impl GraphqlInputType for CausalTestInput {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandInputType for CausalTestInput {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CausalTestInput",
             vec![
-                GraphqlTypeField {
+                CommandTypeField {
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -122,7 +120,7 @@ impl GraphqlInputType for CausalTestInput {
                     item_nullable: false,
                     nested: None,
                 },
-                GraphqlTypeField {
+                CommandTypeField {
                     name: "label".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -137,7 +135,7 @@ impl GraphqlInputType for CausalTestInput {
 }
 
 #[cfg(feature = "graphql")]
-#[derive(Clone, Deserialize, crate::GraphqlInput)]
+#[derive(Clone, Deserialize, crate::CommandInput)]
 struct CausalProjectionInput {
     #[serde(rename = "todoId")]
     id: String,
@@ -589,28 +587,28 @@ fn modeled_lifecycle_projector(
 }
 
 #[cfg(feature = "graphql")]
-impl GraphqlOutputType for CausalProjectionObligationView {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandOutputType for CausalProjectionObligationView {
+    fn command_type() -> CommandTypeDef {
         one_string_field("CausalProjectionObligationView", "id")
             .with_type_id(std::any::TypeId::of::<Self>())
     }
 }
 
 #[cfg(feature = "graphql")]
-impl GraphqlOutputType for CausalProjectionSiblingView {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandOutputType for CausalProjectionSiblingView {
+    fn command_type() -> CommandTypeDef {
         one_string_field("CausalProjectionSiblingView", "id")
             .with_type_id(std::any::TypeId::of::<Self>())
     }
 }
 
 #[cfg(feature = "graphql")]
-impl GraphqlOutputType for CausalLifecycleView {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandOutputType for CausalLifecycleView {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CausalLifecycleView",
             vec![
-                GraphqlTypeField {
+                CommandTypeField {
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -618,7 +616,7 @@ impl GraphqlOutputType for CausalLifecycleView {
                     item_nullable: false,
                     nested: None,
                 },
-                GraphqlTypeField {
+                CommandTypeField {
                     name: "label".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -1085,6 +1083,67 @@ fn named_service_preserves_identity_with_route_bundles() {
     );
 }
 
+#[cfg(feature = "graphql")]
+#[test]
+fn service_compiles_exact_application_modules_from_command_namespaces() {
+    let repository = InMemoryRepository::new();
+    let service = Service::new().named("catalog").routes(
+        Routes::new()
+            .with_repo(repository.queued().aggregate::<RouteComboAggregate>())
+            .typed_command(
+                typed_command::<TypedInput, Succeeded<TypedOutput>>("access.grant").roles(["user"]),
+            )
+            .handle(typed_handler)
+            .typed_command(
+                typed_command::<TypedInput, Succeeded<TypedOutput>>("repository.create")
+                    .roles(["user"]),
+            )
+            .handle(typed_handler),
+    );
+    let surface = crate::graphql::build_surface(&[], &crate::graphql::SurfaceOptions::sqlite())
+        .expect("empty read-model Surface should build")
+        .with_service(&service)
+        .expect("typed Service should bind to the Surface");
+    let surface = crate::application::SurfaceSpec::from_surface("catalog", &surface)
+        .expect("Surface should become a portable application contract");
+
+    let application = service
+        .application("catalog", surface.clone())
+        .expect("Service and Surface should compile into one application");
+
+    assert_eq!(
+        application
+            .modules()
+            .iter()
+            .map(crate::application::Module::id)
+            .collect::<Vec<_>>(),
+        ["access", "repository"]
+    );
+    assert_eq!(
+        application
+            .manifest()
+            .commands
+            .iter()
+            .map(|command| command.id.as_str())
+            .collect::<Vec<_>>(),
+        ["access.grant", "repository.create"]
+    );
+
+    let mut missing = surface.clone();
+    missing
+        .commands
+        .retain(|command| command.id != "access.grant");
+    assert!(matches!(
+        service.application("catalog", missing),
+        Err(crate::ApplicationError::Missing { kind: "surface command", identity })
+            if identity == "access.grant"
+    ));
+    assert!(
+        Service::new().application("catalog", surface).is_err(),
+        "a Surface cannot expose commands absent from the owning Service"
+    );
+}
+
 #[tokio::test]
 async fn typed_direct_dispatch_fails_before_invoking_handler() {
     TYPED_HANDLER_INVOKED.store(false, Ordering::SeqCst);
@@ -1154,7 +1213,7 @@ async fn thin_complete_registers_without_a_handler_context_body() {
     let routes = Routes::new()
         .with_repo(repository.aggregate::<CausalDispatcherAggregate>())
         .typed_command(
-            typed_command::<CausalTestInput, crate::graphql::Succeeded<TypedOutput>>("todo.create")
+            typed_command::<CausalTestInput, crate::command::Succeeded<TypedOutput>>("todo.create")
                 .roles(["user"]),
         )
         .create()
@@ -1166,7 +1225,7 @@ async fn thin_complete_registers_without_a_handler_context_body() {
             id: aggregate.entity().id().to_string(),
         })
         .typed_command(
-            typed_command::<CausalTestInput, crate::graphql::Succeeded<TypedOutput>>(
+            typed_command::<CausalTestInput, crate::command::Succeeded<TypedOutput>>(
                 "todo.complete",
             )
             .roles(["user"]),

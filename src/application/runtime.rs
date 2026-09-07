@@ -2,7 +2,7 @@
 
 use super::error::{ApplicationError, ApplicationResult};
 use super::module::Module;
-use crate::graphql::CommandConsistency;
+use crate::command::CommandConsistency;
 use std::collections::BTreeMap;
 
 /// Persistence dialect selected from a database URL.

@@ -25,10 +25,7 @@ impl Routes<()> {
         locks: L,
         read_models: S,
     ) -> Routes<
-        RepoReadModelDependencies<
-            crate::AggregateRepository<crate::QueuedRepository<R, L>, A>,
-            S,
-        >,
+        RepoReadModelDependencies<crate::AggregateRepository<crate::QueuedRepository<R, L>, A>, S>,
     >
     where
         R: crate::GetStream + crate::TransactionalCommit + Clone + Send + Sync + 'static,

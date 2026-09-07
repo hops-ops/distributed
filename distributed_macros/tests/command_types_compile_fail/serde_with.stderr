@@ -1,0 +1,5 @@
+error: #[serde(with)] is not supported by CommandOutput because it changes the declared command field shape; define a separate wire type
+ --> tests/command_types_compile_fail/serde_with.rs:5:13
+  |
+5 |     #[serde(with = "wire_value")]
+  |             ^^^^^^^^^^^^^^^^^^^

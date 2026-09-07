@@ -18,7 +18,7 @@ use distributed::microsvc::{
     CausalProjectorContext, HandlerError, Routes, Service, Session, ROLE_KEY,
 };
 use distributed::projection_protocol::ProjectionChangeRetention;
-use distributed::{ReadModelCatalog, PostgresRepository, ReadModel};
+use distributed::{PostgresRepository, ReadModel, ReadModelCatalog};
 use futures_util::{stream::BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

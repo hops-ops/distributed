@@ -1,6 +1,22 @@
 use super::*;
 
 impl ProjectionProtocolStore for InMemoryRepository {
+    #[cfg(feature = "graphql")]
+    async fn projection_rebuild_records(
+        &self,
+        context: &crate::projection::rebuild::RebuildContext,
+    ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
+        self.snapshot_rebuild_records(context).await
+    }
+
+    #[cfg(feature = "graphql")]
+    async fn commit_projection_rebuild(
+        &self,
+        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> Result<usize, ProjectionProtocolError> {
+        self.apply_snapshot_rebuild(plan).await
+    }
+
     fn register_projection_models<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
@@ -179,6 +195,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     &mutation.scope,
                     &mutation.expectation,
                     mutation.kind,
+                    mutation.source_snapshot.is_some(),
+                )?;
+                crate::projection_protocol::validate_snapshot_write(
+                    staged_protocol.records.get(&mutation.scope),
+                    mutation.source_snapshot.as_ref(),
                 )?;
                 staged_protocol.validate_physical_record(
                     &mutation.scope,
@@ -201,6 +222,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     revision,
                     tombstone,
                     change: change.cursor.clone(),
+                    source_snapshot: mutation.source_snapshot.clone(),
                 };
                 staged_protocol.ensure_live_record_identity_available(&metadata)?;
                 staged_protocol

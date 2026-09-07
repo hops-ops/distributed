@@ -3,7 +3,9 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientSurfaceIdentity {
-    Role { name: String },
+    Role {
+        name: String,
+    },
     /// `eligible_roles` is the canonical wire identity for principals who may
     /// open the application surface. `schema_roles` is the distinct role set
     /// used to derive the shared schema/command contract.

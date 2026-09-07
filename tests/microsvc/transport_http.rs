@@ -12,12 +12,16 @@ use crate::handlers;
 use crate::models::counter::Counter;
 
 fn counter_service() -> Arc<Service> {
-    Arc::new(Service::new().with_http_command_routes().routes(distributed::routes!(
-        Routes::new().with_repo(InMemoryRepository::new().queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-        command handlers::counter_increment,
-        command handlers::whoami,
-    )))
+    Arc::new(
+        Service::new()
+            .with_http_command_routes()
+            .routes(distributed::routes!(
+                Routes::new().with_repo(InMemoryRepository::new().queued().aggregate::<Counter>()),
+                command handlers::counter_create,
+                command handlers::counter_increment,
+                command handlers::whoami,
+            )),
+    )
 }
 
 /// Bind to port 0 and return the actual address.

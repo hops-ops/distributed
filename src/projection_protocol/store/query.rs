@@ -6,6 +6,8 @@ pub struct ProjectionRecordMetadata {
     pub revision: RecordRevision,
     pub tombstone: bool,
     pub change: ProjectionChangeCursor,
+    /// Authoritative source fence for explicitly declared snapshot projections.
+    pub source_snapshot: Option<super::super::SourceSnapshotVersion>,
 }
 
 /// One exact input-source checkpoint requested alongside a physical query row.

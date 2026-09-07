@@ -2,7 +2,8 @@ use super::*;
 
 impl GraphqlEngine {
     pub async fn execute(&self, session: &Session, mut request: Request) -> Response {
-        if selected_operation_type(&mut request) == Some(async_graphql::parser::types::OperationType::Mutation)
+        if selected_operation_type(&mut request)
+            == Some(async_graphql::parser::types::OperationType::Mutation)
             && !crate::microsvc::lifecycle_mutations_open()
         {
             return lifecycle_mutation_rejected();
@@ -70,7 +71,8 @@ impl GraphqlEngine {
         session: &Session,
         mut request: Request,
     ) -> BoxStream<'static, async_graphql::Response> {
-        if selected_operation_type(&mut request) == Some(async_graphql::parser::types::OperationType::Mutation)
+        if selected_operation_type(&mut request)
+            == Some(async_graphql::parser::types::OperationType::Mutation)
             && !crate::microsvc::lifecycle_mutations_open()
         {
             return stream::once(async { lifecycle_mutation_rejected() }).boxed();
@@ -313,17 +315,19 @@ mod lifecycle_request_tests {
     #[test]
     fn selected_operation_type_fails_closed_for_ambiguous_documents() {
         let mut mutation = Request::new("mutation Write { __typename }");
-        assert_eq!(selected_operation_type(&mut mutation), Some(OperationType::Mutation));
-
-        let mut selected = Request::new(
-            "query Read { __typename } mutation Write { __typename }",
-        )
-        .operation_name("Write");
-        assert_eq!(selected_operation_type(&mut selected), Some(OperationType::Mutation));
-
-        let mut ambiguous = Request::new(
-            "query Read { __typename } mutation Write { __typename }",
+        assert_eq!(
+            selected_operation_type(&mut mutation),
+            Some(OperationType::Mutation)
         );
+
+        let mut selected = Request::new("query Read { __typename } mutation Write { __typename }")
+            .operation_name("Write");
+        assert_eq!(
+            selected_operation_type(&mut selected),
+            Some(OperationType::Mutation)
+        );
+
+        let mut ambiguous = Request::new("query Read { __typename } mutation Write { __typename }");
         assert_eq!(selected_operation_type(&mut ambiguous), None);
     }
 }

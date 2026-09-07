@@ -11,8 +11,8 @@ note: expected this to be `std::string::String`
    |          ^^^^^^^^^^^
    = note: expected struct `std::string::String`
               found struct `Vec<std::string::String>`
-note: required by a bound in `distributed::graphql::__input_default_ulid`
-  --> $WORKSPACE/src/graphql/command_contract/effect_wire.rs
+note: required by a bound in `distributed::command::__input_default_ulid`
+  --> $WORKSPACE/src/command/effect_wire.rs
    |
    | pub fn __input_default_ulid<I, F>() -> CompiledInputDefault<I>
    |        -------------------- required by a bound in this function

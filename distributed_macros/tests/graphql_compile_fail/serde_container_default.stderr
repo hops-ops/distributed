@@ -1,5 +1,0 @@
-error: #[serde(default)] is not supported by GraphqlInput because it changes the declared GraphQL object shape; define a separate wire type
- --> tests/graphql_compile_fail/serde_container_default.rs:4:9
-  |
-4 | #[serde(default = "default_input")]
-  |         ^^^^^^^^^^^^^^^^^^^^^^^^^

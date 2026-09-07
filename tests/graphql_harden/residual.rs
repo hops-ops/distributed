@@ -2,9 +2,7 @@
 
 use async_graphql::Request;
 use distributed::graphql::{claim, col, read, GraphqlEngine, ModelPermissions};
-use distributed::{
-    ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-};
+use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
 
 use super::common::{
     assert_no_sql_leak, engine_all_columns, error_messages, extension_code, seed_orders, session,

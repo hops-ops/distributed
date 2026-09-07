@@ -88,16 +88,7 @@ pub fn max_fields_type_name(schema: &TableSchema) -> String {
 
 /// Map a column type to its GraphQL scalar type name (without nullability).
 pub fn scalar_type_name(column_type: &ColumnType) -> Option<&'static str> {
-    match column_type {
-        ColumnType::Text => Some("String"),
-        ColumnType::Boolean => Some("Boolean"),
-        ColumnType::Integer | ColumnType::UnsignedInteger => Some("BigInt"),
-        ColumnType::Float => Some("Float"),
-        ColumnType::Json => Some("JSON"),
-        ColumnType::Timestamp => Some("Timestamptz"),
-        ColumnType::Bytes => Some("Bytea"),
-        ColumnType::Unsupported(_) => None,
-    }
+    crate::command::scalar_type_name(column_type)
 }
 
 pub fn comparison_exp_name(scalar: &str) -> String {

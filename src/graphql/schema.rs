@@ -1139,8 +1139,8 @@ mod causal_command_schema_tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::command::{CommandConsistency, CommandEffects};
     use crate::command_dispatch::{LocalCommandHost, SharedCommandHost};
-    use crate::graphql::command_contract::{CommandConsistency, CommandEffects};
     use crate::graphql::protocol::{
         DistributedEnvelopeV1, ProtocolResponseAccumulator, ProtocolTokenCodec,
         ProtocolTokenPurpose,

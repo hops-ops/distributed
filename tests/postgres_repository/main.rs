@@ -234,7 +234,7 @@ async fn projected_command_ledger_rows_upgrade_to_atomic_and_preserve_checks() {
         .fetch_one(repo.pool())
         .await
         .unwrap();
-    assert_eq!(latest_version, 4);
+    assert_eq!(latest_version, 5);
 
     let invalid_service = sqlx::query(
         r#"

@@ -31,6 +31,10 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
     protocol.register_same_transaction_ownership(&partition_key, batch)?;
 
     let mutation = &batch.mutations[0];
+    crate::projection_protocol::validate_snapshot_write(
+        protocol.records.get(&mutation.scope),
+        None,
+    )?;
     let lock_key = mutation.mutation.lock_key();
     let row_exists = staged_rows.contains_key(&lock_key);
     let revision = match protocol.records.get(&mutation.scope) {
@@ -69,6 +73,7 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
         },
     )?;
     let metadata = ProjectionRecordMetadata {
+        source_snapshot: None,
         revision: revision.clone(),
         tombstone: false,
         change: change.cursor.clone(),

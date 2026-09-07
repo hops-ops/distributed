@@ -317,11 +317,21 @@ impl ProjectionWorkspace {
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
         kind: ProjectionMutationKind,
+        source: Option<super::SourceSnapshotVersion>,
     ) -> Result<&mut Self, ProjectionProtocolError> {
         validate_execution_mutation_shape(&mutation, &expectation, kind)?;
         let (schema, key) = mutation_schema_key(&mutation);
         let scope = self.record_scope(schema, key)?;
-        self.stage(schema, scope, mutation, expectation, kind)
+        self.push_staged(
+            schema,
+            ProjectionRecordMutation::with_source_snapshot(
+                scope,
+                mutation,
+                expectation,
+                kind,
+                source,
+            )?,
+        )
     }
 
     #[allow(dead_code)]
@@ -434,6 +444,18 @@ impl ProjectionWorkspace {
         expectation: ProjectionRecordExpectation,
         kind: ProjectionMutationKind,
     ) -> Result<&mut Self, ProjectionProtocolError> {
+        self.push_staged(
+            schema,
+            ProjectionRecordMutation::new(scope, mutation, expectation, kind)?,
+        )
+    }
+
+    fn push_staged(
+        &mut self,
+        schema: &'static TableSchema,
+        mutation: ProjectionRecordMutation,
+    ) -> Result<&mut Self, ProjectionProtocolError> {
+        let scope = mutation.scope.clone();
         if !self.staged_scopes.insert(scope.clone()) {
             return Err(ProjectionProtocolError::InvalidBatch(format!(
                 "projection workspace repeats model `{}` record scope",
@@ -441,12 +463,7 @@ impl ProjectionWorkspace {
             )));
         }
         self.register_ownership(schema)?;
-        self.mutations.push(ProjectionRecordMutation::new(
-            scope.clone(),
-            mutation,
-            expectation,
-            kind,
-        )?);
+        self.mutations.push(mutation);
         self.observations.push(ProjectionObservationRequest {
             kind: ProjectionObservationKind::Record,
             target: ProjectionObservationTarget::StagedRecord(scope),
@@ -486,7 +503,7 @@ fn validate_execution_mutation_shape(
         ) => row.mode == PatchMode::UpdateExisting && row.expected_version == ExpectedVersion::Any,
         (
             TableMutation::DeleteRow(row),
-            ProjectionRecordExpectation::Exact(_),
+            ProjectionRecordExpectation::Exact(_) | ProjectionRecordExpectation::Missing,
             ProjectionMutationKind::Delete,
         ) => row.expected_version == ExpectedVersion::Any,
         (

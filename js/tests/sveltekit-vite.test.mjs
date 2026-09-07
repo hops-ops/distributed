@@ -1143,8 +1143,14 @@ test('supervised Vite defers generated-client compilation to the lifecycle', asy
 			process.env.DISTRIBUTED_LIFECYCLE_PROJECT_ROOT = previousProjectRoot;
 		}
 	});
+	const frameworkDist = join(root, 'node_modules/@hops-ops/distributed/dist');
+	await mkdir(join(frameworkDist, 'replica'), { recursive: true });
 	const plugin = distributedSvelteKit(pluginOptions(root, script));
 	await plugin.configResolved({ root });
+	const lazyEntry = join(await realpath(frameworkDist), 'replica/lazy.js');
+	assert.equal(plugin.resolveId('@hops-ops/distributed/replica/lazy'), lazyEntry);
+	const aliases = distributedSvelteKitAliases({ cwd: root, clients: [clients()[0]] });
+	assert.equal(aliases['@hops-ops/distributed/replica/lazy'], lazyEntry);
 	await writeFile(activePointer, 'not-json');
 	assert.equal(
 		plugin.resolveId('./ordinary-relative-import.js', join(root, 'src/app.ts')),

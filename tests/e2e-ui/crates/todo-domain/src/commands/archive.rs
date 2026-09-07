@@ -1,11 +1,11 @@
-use distributed::graphql::Eventual;
+use distributed::command::Eventual;
 use distributed::portable_command;
 use serde::Deserialize;
 
 use super::TodoStatusPayload;
 use crate::{domain_commands, Todo};
 
-#[derive(Debug, Deserialize, distributed::GraphqlInput)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct TodoArchiveInput {
     pub todo_id: String,
 }

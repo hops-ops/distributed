@@ -44,3 +44,12 @@ jobs:
           cargo test --test postgres_transport --no-default-features --features postgres --verbose
           cargo test --test distributed_read_model --no-default-features --features postgres --verbose
           cargo test --test sql_lock_manager --no-default-features --features postgres --verbose
+      - name: Verify source fencing and snapshot rebuild against PostgreSQL
+        env:
+          DISTRIBUTED_SNAPSHOT_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/distributed_snapshots
+          DISTRIBUTED_REBUILD_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/distributed_rebuild
+        run: |
+          docker exec ${{ job.services.postgres.id }} createdb -U postgres distributed_snapshots
+          docker exec ${{ job.services.postgres.id }} createdb -U postgres distributed_rebuild
+          cargo test --lib --no-default-features --features graphql,postgres projection::source_snapshot_tests::source_snapshots_postgres_reordering_and_restart -- --exact
+          cargo test --lib --no-default-features --features graphql,postgres projection::source_snapshot_tests::snapshot_rebuild_postgres -- --exact

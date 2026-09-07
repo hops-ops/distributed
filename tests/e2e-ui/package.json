@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test:browser": "playwright test",
-    "test:lifecycle-reload": "node scripts/lifecycle-reload.mjs",
+    "test:lifecycle-reload": "node --test scripts/lifecycle-command-proof.test.mjs && node scripts/lifecycle-reload.mjs",
     "test:browser:ui": "playwright test --ui",
     "test:browser:headed": "playwright test --headed",
     "test:browser:report": "playwright show-report"

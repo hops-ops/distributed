@@ -1,9 +1,10 @@
 use std::any::TypeId;
 
 use super::*;
-use crate::graphql::command_contract::{CommandEffects, TypedCommandContract};
+use crate::command::{CommandEffects, TypedCommandContract};
 use crate::graphql::commands::TypedCommandInventory;
-use crate::graphql::{GraphqlTypeDef, GraphqlTypeField};
+
+use crate::command::{CommandTypeDef, CommandTypeField};
 use crate::table::{
     ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
 };
@@ -224,7 +225,7 @@ fn modeled_direct_projection(
 fn test_command(
     command_name: &str,
     field_name: &str,
-    output: GraphqlTypeDef,
+    output: CommandTypeDef,
 ) -> TypedCommandContract {
     let input_type_id = TypeId::of::<String>();
     let output_type_id = TypeId::of::<()>();
@@ -232,9 +233,9 @@ fn test_command(
         name: command_name.into(),
         field_name: field_name.into(),
         roles: Vec::new(),
-        input: GraphqlTypeDef::new(
+        input: CommandTypeDef::new(
             "TestCommandInput",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -266,9 +267,9 @@ fn test_inventory(
 #[test]
 fn causal_surface_commands_accept_modeled_event_selectors_but_not_empty_authority() {
     let output = || {
-        GraphqlTypeDef::new(
+        CommandTypeDef::new(
             "CausalPayload",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -779,8 +780,14 @@ fn selected_surfaces_reject_command_and_projector_reattachment() {
         .contains("before authorization selection"));
 
     let grants_by_role = BTreeMap::from([("user".into(), grants)]);
-    let application =
-        surface_for_application(&full, "web", &["user".into()], &["user".into()], &grants_by_role).unwrap();
+    let application = surface_for_application(
+        &full,
+        "web",
+        &["user".into()],
+        &["user".into()],
+        &grants_by_role,
+    )
+    .unwrap();
     assert!(application
         .clone()
         .with_typed_commands(&TypedCommandInventory::empty())
@@ -825,9 +832,9 @@ fn role_policy_rejects_non_finite_and_hides_js_unsafe_integers() {
 
 #[test]
 fn command_surface_rejects_duplicate_mutation_field_ids() {
-    let output = GraphqlTypeDef::new(
+    let output = CommandTypeDef::new(
         "TestCommandPayload",
-        vec![GraphqlTypeField {
+        vec![CommandTypeField {
             name: "id".into(),
             type_name: "String".into(),
             nullable: false,
@@ -852,7 +859,7 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
     let empty = test_inventory([test_command(
         "order.empty",
         "order_empty",
-        GraphqlTypeDef::new("EmptyPayload", Vec::new()),
+        CommandTypeDef::new("EmptyPayload", Vec::new()),
     )]);
     let error = build_surface(&[orders()], &SurfaceOptions::sqlite())
         .unwrap()
@@ -863,15 +870,15 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
     let nested = test_inventory([test_command(
         "order.nested_empty",
         "order_nested_empty",
-        GraphqlTypeDef::new(
+        CommandTypeDef::new(
             "OuterPayload",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "inner".into(),
                 type_name: "InnerPayload".into(),
                 nullable: false,
                 list: false,
                 item_nullable: false,
-                nested: Some(Box::new(GraphqlTypeDef::new("InnerPayload", Vec::new()))),
+                nested: Some(Box::new(CommandTypeDef::new("InnerPayload", Vec::new()))),
             }],
         ),
     )]);
@@ -884,9 +891,9 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
     let collision = test_inventory([test_command(
         "order.collision",
         "order_collision",
-        GraphqlTypeDef::new(
+        CommandTypeDef::new(
             "OrderView",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,

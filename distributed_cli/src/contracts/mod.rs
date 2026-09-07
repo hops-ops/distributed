@@ -8,8 +8,8 @@
 mod artifact;
 mod catalog;
 mod chain;
-mod closeout;
 mod classification;
+mod closeout;
 mod diagnostic;
 mod migrations;
 mod program;
@@ -31,10 +31,10 @@ pub use catalog::{
     MAX_CATALOG_GLOB_MATCHES, MAX_CATALOG_JSON_DEPTH,
 };
 pub use chain::{check_predecessor_chain, ObservedPredecessor};
-pub use closeout::{classify_release_programs, close_local_contract_chain};
 pub use classification::{
     classify_snapshot_diff, decisions_are_distinct, ClassifiedChange, LifecycleDecision,
 };
+pub use closeout::{classify_release_programs, close_local_contract_chain};
 pub use diagnostic::{
     ContractCheckResult, ContractDiagnostic, ContractDiagnosticCode, SafeDiagnosticValue,
 };

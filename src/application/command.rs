@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{ApplicationError, ApplicationResult};
 use super::identity::{canonical_json, sha256_fingerprint, LogicalId};
-use crate::graphql::command_contract::{
-    CommandConsistency, CommandOutcome, TypedCommand, TypedCommandContract,
+use crate::command::{
+    CommandConsistency, CommandInputType, CommandOutcome, CommandTypeDef, TypedCommand,
+    TypedCommandContract,
 };
-use crate::graphql::{GraphqlInputType, GraphqlTypeDef};
 
-/// Serializable GraphQL type field used by a portable command contract.
+/// Serializable command type field used by a portable command contract.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandTypeField {
@@ -25,7 +25,7 @@ pub struct CommandTypeField {
     pub nested: Option<Box<CommandTypeSpec>>,
 }
 
-/// Serializable GraphQL input/output type used by a portable command contract.
+/// Serializable command input/output type used by a portable command contract.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandTypeSpec {
@@ -35,8 +35,8 @@ pub struct CommandTypeSpec {
 
 pub type TypeSpec = CommandTypeSpec;
 
-impl From<&GraphqlTypeDef> for CommandTypeSpec {
-    fn from(definition: &GraphqlTypeDef) -> Self {
+impl From<&CommandTypeDef> for CommandTypeSpec {
+    fn from(definition: &CommandTypeDef) -> Self {
         Self {
             name: definition.name.clone(),
             fields: definition
@@ -113,9 +113,7 @@ pub fn admit_command_session(
     user_id: Option<&str>,
     session_roles: &[&str],
 ) -> Result<(), &'static str> {
-    if command_roles_require_principal(roles)
-        && user_id.map(str::trim).unwrap_or("").is_empty()
-    {
+    if command_roles_require_principal(roles) && user_id.map(str::trim).unwrap_or("").is_empty() {
         return Err("unauthenticated");
     }
     if roles.is_empty() {
@@ -201,7 +199,7 @@ impl CommandDefinition {
         mount: Option<CommandMount>,
     ) -> ApplicationResult<Self>
     where
-        I: GraphqlInputType + serde::de::DeserializeOwned + Send + 'static,
+        I: CommandInputType + serde::de::DeserializeOwned + Send + 'static,
         K: CommandOutcome,
     {
         let (_, typed_contract) = command.into_parts();
@@ -234,8 +232,7 @@ fn validate_mount_spec(spec: &CommandSpec, mount: &CommandMount) -> ApplicationR
         return Err(ApplicationError::Collision {
             kind: "command",
             identity: spec.id.clone(),
-            reason: "command definition and executable mount do not share one spec identity"
-                .into(),
+            reason: "command definition and executable mount do not share one spec identity".into(),
         });
     }
     Ok(())
@@ -291,7 +288,8 @@ impl CommandSpec {
         proof: serde_json::Value,
     ) -> ApplicationResult<Self> {
         self.consistency = CommandConsistency::Atomic;
-        self.projected_model = Some(LogicalId::try_new("projected model", projected_model)?.into_string());
+        self.projected_model =
+            Some(LogicalId::try_new("projected model", projected_model)?.into_string());
         self.direct_projection = Some(proof);
         self.refresh_fingerprint()?;
         self.validate()?;
@@ -360,7 +358,7 @@ impl CommandSpec {
     /// Build a portable spec from the framework's existing typed declaration.
     pub fn from_typed_command<I, K>(command: &TypedCommand<I, K>) -> ApplicationResult<Self>
     where
-        I: GraphqlInputType + serde::de::DeserializeOwned + Send + 'static,
+        I: CommandInputType + serde::de::DeserializeOwned + Send + 'static,
         K: CommandOutcome,
     {
         let (_, contract) = command.clone().into_parts();
@@ -368,19 +366,19 @@ impl CommandSpec {
     }
 
     pub(crate) fn from_contract(
-        contract: &crate::graphql::command_contract::TypedCommandContract,
+        contract: &crate::command::TypedCommandContract,
     ) -> ApplicationResult<Self> {
         let projection_contract = serde_json::to_value(&contract.projections)?;
         let applies = serde_json::to_value(&contract.projections.previews)?;
         let confirmations = contract
             .confirmations
             .iter()
-            .map(crate::graphql::command_contract::CommandProjectionConfirmation::canonical_value)
+            .map(crate::command::CommandProjectionConfirmation::canonical_value)
             .collect();
         let direct_projection = contract
             .direct_projection
             .as_ref()
-            .map(crate::graphql::command_contract::CommandDirectProjectionTarget::canonical_value);
+            .map(crate::command::CommandDirectProjectionTarget::canonical_value);
         let mut emits: Vec<EventSpec> = contract
             .projections
             .selectors
@@ -397,11 +395,16 @@ impl CommandSpec {
             })
             .collect();
         emits.sort_by(|left, right| {
-            (left.name.as_str(), left.version, left.body_fingerprint.as_str()).cmp(&(
-                right.name.as_str(),
-                right.version,
-                right.body_fingerprint.as_str(),
-            ))
+            (
+                left.name.as_str(),
+                left.version,
+                left.body_fingerprint.as_str(),
+            )
+                .cmp(&(
+                    right.name.as_str(),
+                    right.version,
+                    right.body_fingerprint.as_str(),
+                ))
         });
         let mut roles = contract.roles.clone();
         roles.sort();
@@ -597,11 +600,7 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
             super::manifest::MAX_MANIFEST_JSON_BYTES
         )));
     }
-    fn walk(
-        kind: &'static str,
-        value: &serde_json::Value,
-        depth: usize,
-    ) -> ApplicationResult<()> {
+    fn walk(kind: &'static str, value: &serde_json::Value, depth: usize) -> ApplicationResult<()> {
         if depth > super::manifest::MAX_MANIFEST_JSON_DEPTH {
             return Err(ApplicationError::InvalidSpec(format!(
                 "{kind} exceeds JSON depth {}",
@@ -610,7 +609,8 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
         }
         match value {
             serde_json::Value::String(value) => {
-                if value.len() > super::manifest::MAX_MANIFEST_STRING_BYTES || value.contains('\0') {
+                if value.len() > super::manifest::MAX_MANIFEST_STRING_BYTES || value.contains('\0')
+                {
                     return Err(ApplicationError::InvalidSpec(format!(
                         "{kind} contains oversized or NUL string material"
                     )));
@@ -633,8 +633,7 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
                     )));
                 }
                 for (key, value) in fields {
-                    if key.len() > super::manifest::MAX_MANIFEST_STRING_BYTES
-                        || key.contains('\0')
+                    if key.len() > super::manifest::MAX_MANIFEST_STRING_BYTES || key.contains('\0')
                     {
                         return Err(ApplicationError::InvalidSpec(format!(
                             "{kind} contains oversized or NUL object-key material"
@@ -643,7 +642,8 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
                     walk(kind, value, depth + 1)?;
                 }
             }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
         }
         Ok(())
     }
@@ -656,9 +656,11 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
 /// `Any` value: a runtime can invoke it without knowing the concrete function
 /// item type or attempting a downcast.
 pub type CommandMountFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<crate::microsvc::CommandResponse, crate::microsvc::HandlerError>>
-        + Send
-        + 'a>,
+    Box<
+        dyn Future<Output = Result<crate::microsvc::CommandResponse, crate::microsvc::HandlerError>>
+            + Send
+            + 'a,
+    >,
 >;
 
 pub trait CommandMountHandler: Send + Sync {
@@ -669,7 +671,10 @@ pub trait CommandMountHandler: Send + Sync {
 /// not executable merely because it contains a value; an adapter must accept
 /// it into its registry before it can be dispatched.
 pub trait CommandMountRegistrar {
-    fn register_command_mount(&mut self, mount: CommandMount) -> Result<(), crate::microsvc::HandlerError>;
+    fn register_command_mount(
+        &mut self,
+        mount: CommandMount,
+    ) -> Result<(), crate::microsvc::HandlerError>;
 }
 
 /// Invocation context for the heterogeneous runtime boundary. The ordinary
@@ -728,9 +733,8 @@ pub(crate) enum CommandMountExecutionError {
 #[allow(dead_code)]
 pub(crate) type CommandMountExecutionFuture<'a> = Pin<
     Box<
-        dyn Future<
-                Output = Result<CommandMountExecutionResult, CommandMountExecutionError>,
-            > + Send
+        dyn Future<Output = Result<CommandMountExecutionResult, CommandMountExecutionError>>
+            + Send
             + 'a,
     >,
 >;
@@ -819,9 +823,8 @@ impl CommandMount {
     pub fn from_request_handler<H, F>(spec: CommandSpec, handler: H) -> Self
     where
         H: Fn(crate::microsvc::CommandRequest) -> F + Send + Sync + 'static,
-        F: Future<
-                Output = Result<crate::microsvc::CommandResponse, crate::microsvc::HandlerError>,
-            > + Send
+        F: Future<Output = Result<crate::microsvc::CommandResponse, crate::microsvc::HandlerError>>
+            + Send
             + 'static,
     {
         Self::from_handler(spec, RequestCommandMountHandler(handler))
@@ -886,7 +889,7 @@ impl CommandMount {
 
 impl<I, K> TypedCommand<I, K>
 where
-    I: GraphqlInputType + serde::de::DeserializeOwned + Send + 'static,
+    I: CommandInputType + serde::de::DeserializeOwned + Send + 'static,
     K: CommandOutcome,
 {
     /// Compile the exact declaration into its portable, serializable spec.

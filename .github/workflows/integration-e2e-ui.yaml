@@ -155,9 +155,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-ui-playwright-report
+          # Only the explicit paths below; never include e2e/.auth or env files.
+          include-hidden-files: true
           path: |
             tests/e2e-ui/playwright-report
             tests/e2e-ui/test-results
+            tests/e2e-ui/.distributed-dev.log
           if-no-files-found: ignore
           retention-days: 7
 

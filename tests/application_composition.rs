@@ -6,18 +6,21 @@ use distributed::application::{
     CommandDefinition, CommandMount, CommandSpec, CommandTypeField, CommandTypeSpec,
     ContractCompiler, Module, ProjectionSpec, Runtime, RuntimeDialect, SurfaceSpec,
 };
+use distributed::command::{typed_command, CommandConsistency, Succeeded};
 use distributed::graphql::{
     build_surface, col, prune_client_manifest, surface_for_application_contract, surface_for_role,
-    typed_command, ClientCommandPureReduce, ClientProjectionArm, ClientProjectionEventRef,
+    ClientCommandPureReduce, ClientProjectionArm, ClientProjectionEventRef,
     ClientProjectionFallback, ClientProjectionMutationKind, ClientProjectionOperation,
-    ClientProjectionPartition, ClientProjectionProgram, ClientSurfaceIdentity, CommandConsistency,
+    ClientProjectionPartition, ClientProjectionProgram, ClientSurfaceIdentity,
     CommandProjectionArmRef, CommandProjectionExtension, CommandProjectionPreviewOccurrence,
-    DistributedClientSurfaceExport, RoleGrant, Succeeded, Surface, SurfaceOptions,
+    DistributedClientSurfaceExport, RoleGrant, Surface, SurfaceOptions,
 };
 use distributed::projection::{
     PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
 };
-use distributed::{ApplicationManifest, GraphqlInput, GraphqlOutput, ReadModel, RelationalReadModel};
+use distributed::{
+    ApplicationManifest, CommandInput, CommandOutput, ReadModel, RelationalReadModel,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize, ReadModel, Serialize)]
@@ -38,22 +41,19 @@ struct ChatView {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Deserialize, GraphqlInput)]
+#[derive(Clone, Deserialize, CommandInput)]
 struct ContractCommandInput {
     title: String,
 }
 
-#[derive(Clone, Serialize, GraphqlOutput)]
+#[derive(Clone, Serialize, CommandOutput)]
 struct ContractCommandOutput {
     id: String,
 }
 
 fn typed_definition(id: &'static str, roles: &[&str]) -> CommandDefinition {
-    let command = typed_command::<
-        ContractCommandInput,
-        Succeeded<ContractCommandOutput>,
-    >(id)
-    .roles(roles.iter().copied());
+    let command = typed_command::<ContractCommandInput, Succeeded<ContractCommandOutput>>(id)
+        .roles(roles.iter().copied());
     CommandDefinition::from_typed_command(command, None)
         .expect("typed contract should compile without an executable mount")
 }
@@ -152,14 +152,8 @@ fn selected_surface() -> Surface {
                 .rows(col("status").eq("open")),
         )]),
     )]);
-    surface_for_application_contract(
-        &full,
-        "web",
-        &["user".into()],
-        &["user".into()],
-        &grants,
-    )
-    .expect("role/application-selected Surface should compile")
+    surface_for_application_contract(&full, "web", &["user".into()], &["user".into()], &grants)
+        .expect("role/application-selected Surface should compile")
 }
 
 #[test]
@@ -229,19 +223,19 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
     let mut missing = valid.clone();
     missing.commands.clear();
     missing.contract["commands"] = serde_json::json!([]);
-    missing.fingerprint = distributed::application::sha256_fingerprint(
-        &missing.canonical_bytes().unwrap(),
-    );
+    missing.fingerprint =
+        distributed::application::sha256_fingerprint(&missing.canonical_bytes().unwrap());
     let error = Application::try_new("missing-command", [module.clone()], [missing])
         .expect_err("missing selected command must fail closed");
-    assert!(error.to_string().contains("exact authorized command closure"));
+    assert!(error
+        .to_string()
+        .contains("exact authorized command closure"));
 
     let mut tampered = valid.clone();
     tampered.commands[0].roles = vec!["admin".into()];
     tampered.contract["commands"][0]["roles"] = serde_json::json!(["admin"]);
-    tampered.fingerprint = distributed::application::sha256_fingerprint(
-        &tampered.canonical_bytes().unwrap(),
-    );
+    tampered.fingerprint =
+        distributed::application::sha256_fingerprint(&tampered.canonical_bytes().unwrap());
     let error = Application::try_new("tampered-command", [module.clone()], [tampered])
         .expect_err("tampered selected command must fail closed");
     assert!(error.to_string().contains("not compatible"));
@@ -259,18 +253,20 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
     let forbidden_contract = admin_spec.contract["commands"][0].clone();
     let mut unauthorized = valid;
     unauthorized.commands.push(forbidden_command.clone());
-    unauthorized.commands.sort_by(|left, right| left.id.cmp(&right.id));
     unauthorized
-        .contract["commands"]
+        .commands
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    unauthorized.contract["commands"]
         .as_array_mut()
         .expect("surface command contract array")
         .push(forbidden_contract.clone());
-    unauthorized.fingerprint = distributed::application::sha256_fingerprint(
-        &unauthorized.canonical_bytes().unwrap(),
-    );
+    unauthorized.fingerprint =
+        distributed::application::sha256_fingerprint(&unauthorized.canonical_bytes().unwrap());
     let error = Application::try_new("unauthorized-command", [module], [unauthorized])
         .expect_err("unauthorized selected command must fail closed");
-    assert!(error.to_string().contains("exact authorized command closure"));
+    assert!(error
+        .to_string()
+        .contains("exact authorized command closure"));
 
     let role_surface = surface_for_role(&catalog, "user", &user_grants).unwrap();
     let role_valid = SurfaceSpec::from_surface("user", &role_surface).unwrap();
@@ -280,28 +276,27 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
     role_unauthorized
         .commands
         .sort_by(|left, right| left.id.cmp(&right.id));
-    role_unauthorized
-        .contract["commands"]
+    role_unauthorized.contract["commands"]
         .as_array_mut()
         .expect("surface command contract array")
         .push(forbidden_contract);
-    role_unauthorized.fingerprint = distributed::application::sha256_fingerprint(
-        &role_unauthorized.canonical_bytes().unwrap(),
-    );
+    role_unauthorized.fingerprint =
+        distributed::application::sha256_fingerprint(&role_unauthorized.canonical_bytes().unwrap());
     let error = Application::try_new(
         "unauthorized-role-command",
         [command_module()],
         [role_unauthorized],
     )
     .expect_err("unauthorized role command must fail closed");
-    assert!(error.to_string().contains("exact authorized command closure"));
+    assert!(error
+        .to_string()
+        .contains("exact authorized command closure"));
 
     let mut role_tampered = role_valid.clone();
     role_tampered.commands[0].roles = vec!["admin".into()];
     role_tampered.contract["commands"][0]["roles"] = serde_json::json!(["admin"]);
-    role_tampered.fingerprint = distributed::application::sha256_fingerprint(
-        &role_tampered.canonical_bytes().unwrap(),
-    );
+    role_tampered.fingerprint =
+        distributed::application::sha256_fingerprint(&role_tampered.canonical_bytes().unwrap());
     let error = Application::try_new("tampered-role-command", [command_module()], [role_tampered])
         .expect_err("tampered role command must fail closed");
     assert!(error.to_string().contains("not compatible"));
@@ -309,12 +304,13 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
     let mut role_missing = role_valid;
     role_missing.commands.clear();
     role_missing.contract["commands"] = serde_json::json!([]);
-    role_missing.fingerprint = distributed::application::sha256_fingerprint(
-        &role_missing.canonical_bytes().unwrap(),
-    );
+    role_missing.fingerprint =
+        distributed::application::sha256_fingerprint(&role_missing.canonical_bytes().unwrap());
     let error = Application::try_new("missing-role-command", [command_module()], [role_missing])
         .expect_err("role command closure must fail closed");
-    assert!(error.to_string().contains("exact authorized command closure"));
+    assert!(error
+        .to_string()
+        .contains("exact authorized command closure"));
 }
 
 #[test]
@@ -383,14 +379,19 @@ fn application_manifest_is_byte_deterministic_and_contains_no_executable_data() 
         .unwrap();
     assert_eq!(ui["value"]["literal_url"], "https://domain.example/view");
     assert_eq!(ui["value"]["literal_path"], "orders/today");
-    assert!(!String::from_utf8(first.clone()).unwrap().contains("handler"));
+    assert!(!String::from_utf8(first.clone())
+        .unwrap()
+        .contains("handler"));
     assert!(!String::from_utf8(first.clone())
         .unwrap()
         .contains("application_composition"));
     assert!(ApplicationManifest::from_canonical_bytes(&first).is_ok());
 
     let mut missing_version = value.clone();
-    missing_version.as_object_mut().unwrap().remove("schema_version");
+    missing_version
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
     let missing_version = serde_json::to_vec(&missing_version).unwrap();
     assert!(ApplicationManifest::from_canonical_bytes(&missing_version).is_err());
 
@@ -417,7 +418,13 @@ fn application_manifest_is_byte_deterministic_and_contains_no_executable_data() 
         .to_string()
         .contains("does not match compiling framework"));
 
-    for field in ["tables", "services", "endpoints", "transport", "observability"] {
+    for field in [
+        "tables",
+        "services",
+        "endpoints",
+        "transport",
+        "observability",
+    ] {
         let mut legacy_owner = value.clone();
         legacy_owner[field] = serde_json::json!([]);
         let legacy_owner = serde_json::to_vec(&legacy_owner).unwrap();
@@ -447,23 +454,20 @@ fn manifest_provenance_separates_logical_and_artifact_identity() {
     assert_ne!(first.fingerprint().unwrap(), second.fingerprint().unwrap());
     let decoded =
         ApplicationManifest::from_canonical_bytes(&first.canonical_bytes().unwrap()).unwrap();
-    assert_eq!(decoded.provenance.source_revision.as_deref(), Some("git:one"));
-    assert!(
-        String::from_utf8(first.canonical_bytes().unwrap())
-            .unwrap()
-            .contains("git:one")
+    assert_eq!(
+        decoded.provenance.source_revision.as_deref(),
+        Some("git:one")
     );
+    assert!(String::from_utf8(first.canonical_bytes().unwrap())
+        .unwrap()
+        .contains("git:one"));
 }
 
 #[test]
 fn contract_compiler_pins_manifest_sdl_and_client_to_one_surface() {
     let selected = selected_surface();
-    let compiler = ContractCompiler::from_surface(
-        "contract-only",
-        "web",
-        Arc::new(selected.clone()),
-    )
-    .unwrap();
+    let compiler =
+        ContractCompiler::from_surface("contract-only", "web", Arc::new(selected.clone())).unwrap();
     let manifest = compiler.manifest().unwrap();
     let sdl = compiler.graphql_sdl().unwrap();
     let client = compiler.client_manifest().unwrap();
@@ -471,7 +475,10 @@ fn contract_compiler_pins_manifest_sdl_and_client_to_one_surface() {
     assert!(sdl.contains("TodoView"));
     assert_eq!(manifest.surfaces.len(), 1);
     assert_eq!(manifest.surfaces[0].selection, "application:web");
-    assert!(client.models.iter().any(|model| model.typename == "TodoView"));
+    assert!(client
+        .models
+        .iter()
+        .any(|model| model.typename == "TodoView"));
     assert!(ContractCompiler::new("contract-only")
         .with_surface("web", Arc::new(selected))
         .unwrap()
@@ -506,7 +513,9 @@ fn explicit_definition_mount_identity_and_missing_pairing_fail_closed() {
     let other = command("todo.other");
     let mount = CommandMount::contract(other);
     let error = CommandDefinition::with_mount(spec, mount).unwrap_err();
-    assert!(error.to_string().contains("definition and executable mount"));
+    assert!(error
+        .to_string()
+        .contains("definition and executable mount"));
 
     let duplicate = Module::new("todo")
         .command_definitions([definition("todo.create"), definition("todo.create")])
@@ -535,17 +544,12 @@ fn nested_fingerprints_and_projection_references_are_fail_closed() {
     )
     .is_err());
 
-    let mut projection = ProjectionSpec::try_new(
-        "todo.list",
-        std::iter::empty::<String>(),
-        ["TodoView"],
-    )
-    .unwrap();
+    let mut projection =
+        ProjectionSpec::try_new("todo.list", std::iter::empty::<String>(), ["TodoView"]).unwrap();
     projection.dependencies.push("projection:missing".into());
     projection.dependencies.sort();
-    projection.fingerprint = distributed::application::sha256_fingerprint(
-        &projection.canonical_bytes().unwrap(),
-    );
+    projection.fingerprint =
+        distributed::application::sha256_fingerprint(&projection.canonical_bytes().unwrap());
     let module = Module::new("todo")
         .surface(
             distributed::application::SurfaceSpec::from_surface("web", &selected_surface())
@@ -561,7 +565,8 @@ fn nested_fingerprints_and_projection_references_are_fail_closed() {
 
 #[test]
 fn module_commands_only_keeps_command_identity() {
-    let projection = ProjectionSpec::try_new("project_todos", ["todo.created"], ["TodoView"]).unwrap();
+    let projection =
+        ProjectionSpec::try_new("project_todos", ["todo.created"], ["TodoView"]).unwrap();
     let module = Module::new("todo")
         .command_definitions([definition("todo.create")])
         .projection(projection)
@@ -641,8 +646,8 @@ fn runtime_rejects_atomic_with_unrelated_direct_projection() {
 
 #[test]
 fn runtime_from_database_url_rejects_unsupported_schemes() {
-    let error = Runtime::from_database_url("mysql://localhost/app")
-        .expect_err("unsupported scheme");
+    let error =
+        Runtime::from_database_url("mysql://localhost/app").expect_err("unsupported scheme");
     assert!(error.to_string().contains("unsupported"), "{error}");
 }
 
@@ -700,14 +705,9 @@ fn contract_export_prunes_unselected_read_models() {
             ("ChatView".to_string(), RoleGrant::all_columns()),
         ]),
     )]);
-    let selected = surface_for_application_contract(
-        &full,
-        "web",
-        &["user".into()],
-        &["user".into()],
-        &grants,
-    )
-    .unwrap();
+    let selected =
+        surface_for_application_contract(&full, "web", &["user".into()], &["user".into()], &grants)
+            .unwrap();
     let export = DistributedClientSurfaceExport::from_contract("todo-app", selected).unwrap();
     let todos_only = prune_client_manifest(export.manifest().unwrap(), ["TodoView"]).unwrap();
     assert!(todos_only
@@ -754,7 +754,10 @@ fn prune_drops_unselected_command_optimism_and_causal_slots() {
     attach_todo_and_chat_command_optimism(&mut manifest);
 
     let before = serde_json::to_string(&manifest).unwrap();
-    assert!(before.contains("ChatView"), "setup must include ChatView optimism");
+    assert!(
+        before.contains("ChatView"),
+        "setup must include ChatView optimism"
+    );
     assert!(before.contains("TodoView"));
 
     let todos_only = prune_client_manifest(manifest, ["TodoView"]).unwrap();
@@ -798,7 +801,9 @@ fn prune_drops_unselected_command_optimism_and_causal_slots() {
     }
 }
 
-fn attach_todo_and_chat_command_optimism(manifest: &mut distributed::graphql::DistributedClientManifest) {
+fn attach_todo_and_chat_command_optimism(
+    manifest: &mut distributed::graphql::DistributedClientManifest,
+) {
     let todo_event = ClientProjectionEventRef {
         id: "todo.completed".into(),
         name: "todo.completed".into(),
@@ -809,14 +814,16 @@ fn attach_todo_and_chat_command_optimism(manifest: &mut distributed::graphql::Di
         name: "chat.posted".into(),
         version: 1,
     };
-    manifest.projectors.push(distributed::graphql::ClientProjector {
-        version: 1,
-        name: "project_mixed".into(),
-        facts: vec!["todo.completed".into(), "chat.posted".into()],
-        models: vec!["TodoView".into(), "ChatView".into()],
-        dependencies: Vec::new(),
-        causal_confirmation: false,
-    });
+    manifest
+        .projectors
+        .push(distributed::graphql::ClientProjector {
+            version: 1,
+            name: "project_mixed".into(),
+            facts: vec!["todo.completed".into(), "chat.posted".into()],
+            models: vec!["TodoView".into(), "ChatView".into()],
+            dependencies: Vec::new(),
+            causal_confirmation: false,
+        });
     manifest.projection_programs.push(ClientProjectionProgram {
         version: 2,
         program_id: "project_todos".into(),
@@ -928,10 +935,7 @@ fn explicit_dispatch_route_map() {
         .unwrap()
         .graphql()
         .dispatch_route("todo.*", "http://commands");
-    assert_eq!(
-        runtime.route_for("todo.create"),
-        Some("http://commands")
-    );
+    assert_eq!(runtime.route_for("todo.create"), Some("http://commands"));
     assert!(runtime.starts_graphql());
     assert!(!runtime.starts_outbox());
 }
@@ -942,9 +946,8 @@ fn application_surface_must_expose_a_schema_role() {
         distributed::application::SurfaceSpec::from_surface("web", &selected_surface()).unwrap();
     surface.schema_roles.clear();
     surface.contract["selection"]["schema_roles"] = serde_json::json!([]);
-    surface.fingerprint = distributed::application::sha256_fingerprint(
-        &surface.canonical_bytes().unwrap(),
-    );
+    surface.fingerprint =
+        distributed::application::sha256_fingerprint(&surface.canonical_bytes().unwrap());
     let error = Application::try_new("role-owner", [], [surface])
         .expect_err("application surfaces without schema roles must fail closed");
     assert!(error.to_string().contains("schema role"));

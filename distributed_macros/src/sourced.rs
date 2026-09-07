@@ -1242,16 +1242,16 @@ fn expand_domain_commands_module(
                 let field = value.field.to_string();
                 let source = match &value.source {
                     KnownStateValueSource::Constant(expression) => quote! {
-                        distributed::graphql::__command_projection_preview_constant(#expression)
+                        distributed::command::__command_projection_preview_constant(#expression)
                     },
                     KnownStateValueSource::Null => quote! {
-                        distributed::graphql::CommandProjectionPreviewSource::Null
+                        distributed::command::CommandProjectionPreviewSource::Null
                     },
                 };
                 quote! { (#field, #source) }
             });
             Some(quote! {
-                distributed::graphql::__command_projection_state_known_values::<
+                distributed::command::__command_projection_state_known_values::<
                     super::#event_type,
                     #state,
                 >(vec![#(#fields),*])
@@ -1264,7 +1264,7 @@ fn expand_domain_commands_module(
         let known_values_method = has_known_values.then(|| {
             quote! {
                 fn command_event_known_values(
-                ) -> Vec<distributed::graphql::CommandProjectionPreview> {
+                ) -> Vec<distributed::command::CommandProjectionPreview> {
                     #[allow(unused_imports)]
                     use super::*;
                     vec![#(#known_value_items),*]
@@ -1275,17 +1275,17 @@ fn expand_domain_commands_module(
             "Outward domain-event set for `{aggregate_name}::{method_name}`.\n\n\
              Derived from direct `self.<recorder>()` calls to `#[event(..., domain)]` \
              methods in this `#[sourced]` impl. Use with \
-             [`distributed::graphql::TypedCommand::emits_events`]."
+             [`distributed::command::TypedCommand::emits_events`]."
         );
         quote! {
             #[doc = #doc]
             pub enum #type_name {}
 
-            impl distributed::graphql::CommandEventSet for #type_name {
-                fn command_event_set() -> distributed::graphql::CommandProjectionEventSet {
-                    distributed::graphql::__command_projection_events([
+            impl distributed::command::CommandEventSet for #type_name {
+                fn command_event_set() -> distributed::command::CommandProjectionEventSet {
+                    distributed::command::__command_projection_events([
                         #(
-                            distributed::graphql::__command_projection_event_descriptor::<
+                            distributed::command::__command_projection_event_descriptor::<
                                 super::#event_types,
                             >()
                         ),*

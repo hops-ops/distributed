@@ -588,7 +588,7 @@ pub fn graphql_sdl_from_schemas(
 #[cfg(test)]
 mod causal_command_sdl_tests {
     use super::*;
-    use crate::graphql::command_contract::{CommandConsistency, CommandEffects};
+    use crate::command::{CommandConsistency, CommandEffects};
     use crate::graphql::surface::{SurfaceCommandShape, SurfaceTypeDef};
 
     fn command_surface() -> crate::graphql::surface::Surface {

@@ -58,9 +58,10 @@
 mod causal;
 pub mod cell_host;
 mod context;
-mod descriptor;
 mod dependencies;
+mod descriptor;
 mod error;
+pub(crate) mod lifecycle;
 mod message_router;
 mod projector;
 mod runtime;
@@ -87,12 +88,12 @@ pub use dependencies::{
     CausalRouteDependencies, ConfigurableOutboxPublisher, HasOutboxStore, HasReadModelStore,
     HasRepo, ReadModelStoreDependencies, RepoDependencies, RepoReadModelDependencies,
 };
-pub use error::HandlerError;
 pub use descriptor::{
     MessageEndpointDescriptor, MetricsEndpointDescriptor, ServiceDescriptor,
     ServiceObservabilityDescriptor, TraceExportMode, TracePropagationMode, TracingDescriptor,
     TransportDescriptor,
 };
+pub use error::HandlerError;
 pub use projector::{
     CausalProjectorContext, CausalProjectorRouteBuilder, LoadedProjection, ProjectionRepairHandle,
     ProjectionRepairHandleParseError,
@@ -104,6 +105,20 @@ pub use runtime::{DEFAULT_MAX_PUBLISH_ATTEMPTS, DEFAULT_PUBLISH_LEASE};
 pub(crate) use service::CausalCommandProjectionEvidence;
 #[cfg(feature = "graphql")]
 pub use service::GraphqlServiceBindError;
+pub use service::{
+    direct_read_model, invoke_transition, require_loaded, CausalCommandContext,
+    CausalCommitBuilder, CausalRepository, CommandRequest, CommandResponse, DeliveryKind,
+    DirectReadModelProjection, HandlerNames, HandlerSpec, PortableCommand, PreparedCausalCommit,
+    PreparedCommandHandler, RouteBuilder, Routes, Service, ThinCommandBuilder, ThinCommandInvoked,
+    ThinCommandLoaded, TypedRouteBuilder,
+};
+#[cfg(feature = "graphql")]
+pub(crate) use service::{
+    CausalCommandProjectionObligation, CausalCommandPublicState, CausalCommandReceiptSource,
+    CausalProjectionEvidenceState,
+};
+#[cfg(feature = "graphql")]
+pub use service::{CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult};
 #[cfg(any(
     feature = "http",
     feature = "grpc",
@@ -113,23 +128,7 @@ pub use service::GraphqlServiceBindError;
     feature = "rabbitmq",
     feature = "kafka",
 ))]
-pub use workers::{
-    spawn_outbox_publish_loop, spawn_service_consumer_loop, CONSUMER_IDLE_POLL,
-};
-pub use service::{
-    direct_read_model, invoke_transition, require_loaded, CausalCommandContext, CausalCommitBuilder,
-    CausalRepository, CommandRequest, CommandResponse, DeliveryKind, DirectReadModelProjection,
-    HandlerNames, HandlerSpec, PortableCommand, PreparedCausalCommit, PreparedCommandHandler,
-    RouteBuilder, Routes, Service, ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded,
-    TypedRouteBuilder,
-};
-#[cfg(feature = "graphql")]
-pub use service::{CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult};
-#[cfg(feature = "graphql")]
-pub(crate) use service::{
-    CausalCommandProjectionObligation, CausalCommandPublicState, CausalCommandReceiptSource,
-    CausalProjectionEvidenceState,
-};
+pub use workers::{spawn_outbox_publish_loop, spawn_service_consumer_loop, CONSUMER_IDLE_POLL};
 #[cfg(feature = "graphql")]
 pub(crate) mod wait_path;
 pub use session::{Session, ROLE_KEY, USER_ID_KEY};
@@ -145,64 +144,14 @@ pub use session::{Session, ROLE_KEY, USER_ID_KEY};
 #[cfg(feature = "http")]
 pub const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 
-/// Fail closed for writes while a `distributed dev` process is not the active
-/// application generation. Outside the dev supervisor there is no lifecycle
+/// Fail closed for writes unless the supervisor admits this process instance
+/// to the active application generation. Outside dev there is no lifecycle
 /// directory, so ordinary production/runtime embedding remains unchanged.
 pub(crate) fn lifecycle_mutations_open() -> bool {
-    let Some(root) = std::env::var_os("DISTRIBUTED_LIFECYCLE_DIR") else {
+    if std::env::var_os("DISTRIBUTED_LIFECYCLE_DIR").is_none() {
         return true;
-    };
-    let Some(generation) = std::env::var_os("DISTRIBUTED_GENERATION_ID") else {
-        return false;
-    };
-    let root = std::path::PathBuf::from(root);
-    let Some(generation) = generation.to_str() else {
-        return false;
-    };
-    if !root.is_absolute() {
-        return false;
     }
-    let state = root.join("dev.json");
-    let Ok(metadata) = std::fs::symlink_metadata(&state) else {
-        return false;
-    };
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > 1024 * 1024
-    {
-        return false;
-    }
-    std::fs::read(&state)
-        .ok()
-        .is_some_and(|source| lifecycle_state_allows_mutations(&source, generation))
-}
-
-fn lifecycle_state_allows_mutations(source: &[u8], generation: &str) -> bool {
-    let Ok(state) = serde_json::from_slice::<serde_json::Value>(source) else {
-        return false;
-    };
-    state.get("phase").and_then(serde_json::Value::as_str) == Some("active")
-        && state
-            .get("active")
-            .and_then(|active| active.get("generationId"))
-            .and_then(serde_json::Value::as_str)
-            == Some(generation)
-}
-
-#[cfg(test)]
-mod lifecycle_gate_tests {
-    use super::lifecycle_state_allows_mutations;
-
-    #[test]
-    fn mutations_open_only_for_the_exact_active_generation() {
-        let active = br#"{"phase":"active","active":{"generationId":"sha256:one"}}"#;
-        let preparing =
-            br#"{"phase":"preparing","active":{"generationId":"sha256:one"}}"#;
-        assert!(lifecycle_state_allows_mutations(active, "sha256:one"));
-        assert!(!lifecycle_state_allows_mutations(active, "sha256:two"));
-        assert!(!lifecycle_state_allows_mutations(preparing, "sha256:one"));
-        assert!(!lifecycle_state_allows_mutations(b"not-json", "sha256:one"));
-    }
+    lifecycle::membership_from_environment().is_some_and(|member| member.mutations_open)
 }
 
 // HTTP transport (requires "http" feature)

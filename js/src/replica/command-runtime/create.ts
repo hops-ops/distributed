@@ -1289,6 +1289,17 @@ export function createReplicaCommandRuntime<
 			);
 		}
 
+		// The HTTP lifecycle gate rejects before dispatch and before a receipt
+		// exists. Classify only its exact failure shape, never a success/receipt.
+		if (result.status === 503 && result.data == null && result.extensions === undefined &&
+			result.errors?.length === 1 && result.errors[0].extensions?.code === 'APPLICATION_RELOADING') {
+			rejectUnmanagedLayer(prepared.commandId);
+			revalidateInBackground(prepared, authority);
+			throw new ReplicaCommandRuntimeError('REPLICA_COMMAND_RELOADING', {
+				commandId: prepared.commandId
+			});
+		}
+
 		const rejection = graphqlCommandRejection(result);
 		if (rejection !== undefined) {
 			try {

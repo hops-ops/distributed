@@ -200,6 +200,10 @@ where
     }
 
     let current = record_in_tx(tx, &staged.scope, &state.change_epoch).await?;
+    crate::projection_protocol::validate_snapshot_write(
+        current.as_ref().map(|record| &record.metadata),
+        None,
+    )?;
     let physical_exists = physical_row_exists_in_tx(tx, &staged.mutation).await?;
     match current.as_ref().map(|record| &record.metadata) {
         None if physical_exists => {
@@ -228,6 +232,7 @@ where
         &expectation,
         ProjectionMutationKind::Upsert,
         current.as_ref(),
+        false,
     )?;
     debug_assert!(!tombstone);
     let change = allocate_change(
@@ -242,6 +247,7 @@ where
         None,
     )?;
     let metadata = ProjectionRecordMetadata {
+        source_snapshot: None,
         revision: revision.clone(),
         tombstone,
         change: change.cursor.clone(),
@@ -358,6 +364,7 @@ where
          record.tombstone AS ps_record_tombstone, \
          record.change_epoch AS ps_record_change_epoch, \
          record.change_position AS ps_record_change_position, \
+         record.source_snapshot AS ps_source_snapshot, \
          checkpoint.source_bytes AS ps_cursor_source_bytes, \
          checkpoint.source_hash AS ps_cursor_source_hash, \
          checkpoint.source_partition_bytes AS ps_cursor_partition_bytes, \
@@ -671,6 +678,11 @@ where
                     )?,
                 )?,
                 tombstone,
+                source_snapshot: decode_source_snapshot(
+                    first.try_get("ps_source_snapshot").map_err(|error| {
+                        protocol_storage_error::<DB>("decode source snapshot", error)
+                    })?,
+                )?,
                 change: ProjectionChangeCursor::new(
                     request.scope.topology().clone(),
                     request.scope.projection_partition().clone(),
@@ -1845,7 +1857,7 @@ where
         "SELECT record.topology_hash AS live_topology_hash, record.partition_hash AS \
          live_partition_hash, record.model_name AS live_model_name, \
          record.canonical_key_bytes, record.canonical_key_hash, record.incarnation, \
-         record.revision, record.tombstone, record.change_epoch, record.change_position, \
+         record.revision, record.tombstone, record.change_epoch, record.change_position, record.source_snapshot, \
          partition.topology_bytes AS live_topology_bytes, \
          partition.partition_bytes AS live_partition_bytes, \
          partition.change_epoch AS live_partition_epoch, \
@@ -1998,16 +2010,20 @@ where
                 "projection live-record change exceeds its partition head",
             ));
         }
-        let metadata = ProjectionRecordMetadata {
-            revision: RecordRevision::new(scope.clone(), incarnation, revision)?,
-            tombstone: false,
-            change: ProjectionChangeCursor::new(
-                scope.topology().clone(),
-                scope.projection_partition().clone(),
-                change_epoch,
-                change_position,
-            )?,
-        };
+        let metadata =
+            ProjectionRecordMetadata {
+                source_snapshot: decode_source_snapshot(row.try_get("source_snapshot").map_err(
+                    |error| protocol_storage_error::<DB>("decode source snapshot", error),
+                )?)?,
+                revision: RecordRevision::new(scope.clone(), incarnation, revision)?,
+                tombstone: false,
+                change: ProjectionChangeCursor::new(
+                    scope.topology().clone(),
+                    scope.projection_partition().clone(),
+                    change_epoch,
+                    change_position,
+                )?,
+            };
         if records[*index].replace(metadata).is_some() {
             return Err(corrupt_storage(format!(
                 "projection live-record identity for model `{}` is ambiguous across partitions",

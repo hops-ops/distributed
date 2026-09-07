@@ -267,6 +267,105 @@ mutation SaveTodo {
 }
 ```
 
+#### Full-state projections and out-of-order events
+
+Broker delivery order is not necessarily aggregate commit order. For a read
+model whose rows are complete snapshots owned by one aggregate stream, opt in
+to source-version fencing:
+
+```rust,ignore
+distributed::projection! {
+    pub const TODOS: ProjectionDescriptor<EventualOnly> = {
+        name: "project_todos",
+        version: 2,
+        epoch: "todos-source-snapshots-v1",
+        model: Todos,
+        source: aggregate_snapshot,
+        on {
+            events: [TodoCreatedDomainEvent, TodoCompletedDomainEvent],
+            mutation: SaveTodo,
+            input: { todo: body },
+        },
+        on {
+            events: [TodoPurgedDomainEvent],
+            mutation: DeleteTodo,
+            input: { todo_id: aggregate_id },
+        },
+    };
+}
+```
+
+The framework compares canonical `(aggregate_sequence, publication_ordinal)`
+within the owning `(aggregate_type, aggregate_id)` stream. A late snapshot
+cannot overwrite a newer row or resurrect a deleted one. Even deletion before
+creation leaves a durable tombstone. A newer snapshot can recreate the row.
+Source fences, physical rows, row revisions, broker checkpoints and causal
+observations commit atomically in the memory, SQLite and PostgreSQL adapters.
+A stale input confirms the current row revision without generating a fake row
+update; a concurrent change makes that confirmation retry through the normal
+projection conflict path.
+
+Use this only for complete replacement snapshots with stable row keys. Every
+affected key must be owned by one aggregate stream; joins, counters, partial
+patches and relationship side effects need their own ordering/fold semantics.
+This mode rejects delta operations, expression partitions and direct placement.
+Different aggregate streams cannot take over an existing fenced key. Matching
+source versions with conflicting occurrence content fail closed.
+
+Migration `0005_projection_source_snapshots` persists the fence alongside each
+record, including tombstones; compaction does not remove it. Enabling this on
+an existing unversioned projection requires an explicit read-model rebuild
+from retained canonical events. Merely changing the projection version or epoch
+does not infer a source version for existing rows. The normal ordered-delivery
+contract and transport identity checks still apply; this is not a replacement
+for reliable broker delivery or an incremental-event reorder buffer.
+
+Custom program factories can use `ProjectionProgram::with_source_snapshots()`;
+the policy is part of the canonical program identity. Browser optimism continues
+to use the same mutation program, and authoritative confirmation uses committed
+row revisions rather than comparing browser timestamps.
+
+#### Rebuilding existing snapshot projections
+
+Use explicit maintenance, not a startup fallback or republishing loop:
+
+```rust,ignore
+use distributed::projection::rebuild::SnapshotProjectionRebuild;
+
+// Stop producers, drain outboxes, stop consumers, and back up the read model.
+// Reuse the same generated SurfaceProjector mounted by the application.
+let rebuild = SnapshotProjectionRebuild::begin(&repository, &projector).await?;
+// Read history AFTER capturing the target inventory. Another authoritative
+// archive can supply these canonical occurrences; rebuilding is bus-neutral.
+let events = nats_bus.retained_domain_events().await?;
+let plan = rebuild.from_complete_history(&events)?;
+println!("{} records to rebuild", plan.record_count());
+plan.apply(&repository).await?;
+```
+
+Memory, SQLite and PostgreSQL commit complete rows/tombstones, source fences,
+new record revisions and live-query changes atomically. A concurrent update,
+insertion or deletion invalidates the captured inventory. Failure rolls back the
+whole projection. Broker checkpoints, inbox receipts, command ledgers and prior
+causal observations are preserved; maintenance does not claim a domain command
+occurred. No domain handlers, external effects or queue sends run.
+
+The archive must cover every existing record and retain its stored source
+occurrence, where present. Conflicting duplicate occurrences, missing aggregate
+sequence prefixes and stale source heads fail closed. The caller must establish
+history completeness: even a broker stream starting at sequence one may have
+been created after its aggregates. The NATS reader verifies a stable, gap-free
+retained stream without creating consumers or acknowledging messages, but cannot
+prove that unpublished events or earlier deleted streams never existed.
+
+This first API is bounded offline maintenance for one active local,
+unit-partition snapshot binding: at most 10,000 records and 100,000 occurrences /
+64 MiB of canonical history. It intentionally rejects delta folds and histories
+whose publication sequences have gaps. It does not migrate schemas/topologies,
+perform online shadow swaps, or make several independent projections one
+transaction. Keep services stopped if a multi-projection maintenance run fails;
+capture fresh inventories and rerun before resuming them.
+
 Handlers stay thin: most Todo commands are `portable_command!` — shard,
 invoke one domain method, commit Eventual. `todo.create` keeps a `handle:`
 escape hatch when the body needs extra checks.
@@ -1297,6 +1396,46 @@ use distributed::bus::{run_source, RunOptions};
 run_source(service, source, RunOptions::idempotent()).await?;
 ```
 
+## Command contracts
+
+Command semantics live in `distributed::command`, independently of the query
+transport. Use `CommandInput` and `CommandOutput` to describe Serde input/output
+shapes, and `command::{typed_command, Succeeded, Eventual, Atomic, PreparedCommand}`
+to declare and prepare commands. The GraphQL adapter derives its surface from
+those contracts; GraphQL naming restrictions are checked when exposing them.
+
+```rust
+# use distributed::command;
+use distributed::{CommandInput, CommandOutput};
+use distributed::command::{typed_command, Succeeded};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, CommandInput)]
+struct RenameInput { id: String, title: String }
+
+#[derive(Serialize, CommandOutput)]
+struct RenameOutput { id: String }
+
+# fn main() {
+let declaration = typed_command::<RenameInput, Succeeded<RenameOutput>>("todo.rename");
+# }
+```
+
+This is a breaking Rust API change. Replace `GraphqlInput`/`GraphqlOutput`
+with `CommandInput`/`CommandOutput` throughout the DTO's nested types and
+move command imports from `distributed::graphql` to `distributed::command`.
+Manual metadata implementations now use `CommandInputType`/`CommandOutputType`,
+`command_type()`, and `CommandTypeDef`/`CommandTypeField`. The old GraphQL
+command re-exports, metadata types, and derives have been removed.
+
+GraphQL remains the application's UI gateway: it exposes the command contract
+alongside queries and subscriptions. Command handlers describe their data and
+consistency through the core API, independently of where that gateway runs.
+
+`Atomic<M>` continues to obtain its response shape from the relational read
+model and requires the existing transaction proof. Moving command ownership
+does not change Eventual projection confirmation or Atomic response sealing.
+
 ## Microservice Framework (`microsvc`)
 
 The `microsvc` module provides a convention-based async command/event handler framework. Register handlers on typed `Routes<D>` bundles, collect them into a non-generic `Service`, then expose that service over HTTP, gRPC, the bus, or direct dispatch.
@@ -1689,9 +1828,8 @@ distributed = { version = "0.1", features = ["graphql", "postgres"] }
 ### Mount on a service
 
 ```rust,ignore
-use distributed::graphql::{
-    claim, col, read, typed_command, Eventual, GraphqlEngine,
-};
+use distributed::command::{typed_command, Eventual};
+use distributed::graphql::{claim, col, read, GraphqlEngine};
 use distributed::microsvc::{Routes, Service};
 
 let routes = Routes::new()
@@ -2091,6 +2229,34 @@ directly onto Distributed conventions, so an AI assistant can generate or revise
 a smaller target: model fields, event methods, handler bodies, and projection
 shapes. Boilerplate service setup, manifest discovery, schema output, and GitOps
 artifacts stay deterministic.
+
+For an existing typed `Service`, derive the logical application from its command
+inventory and the same full GraphQL `Surface` used by the runtime:
+
+```rust,ignore
+let surface = distributed::SurfaceSpec::from_surface("catalog", &full_surface)?;
+let application = service.application("catalog", surface)?;
+let manifest = application.manifest();
+```
+
+Command namespaces such as `orders.submit` supply module names; there is no
+second module list to maintain. Assembly rejects commands missing from the
+Surface or exposed by the Surface without a Service owner. Role-selected client
+exports remain authorization views of that full contract. Complete application
+manifests are bounded at 4 MiB; each opaque JSON contract remains bounded at
+1 MiB, with the existing collection, string and nesting limits still enforced.
+
+An event-driven policy that emits through another aggregate can explicitly carry
+the incoming command's causal identity before recording its events:
+
+```rust,ignore
+ctx.inherit_causation(&mut downstream)?;
+downstream.record(observation)?;
+```
+
+This requires an incoming causation ID and does not manufacture one for external
+events. NATS preserves the message's payload content type and keeps reserved
+transport headers out of user metadata across delivery.
 
 ```bash
 cargo install distributed_cli            # installs `distributed`

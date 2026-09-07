@@ -2,9 +2,7 @@ use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 
 use super::manifest::{refresh_schema_fingerprint, ClientManifest};
-use super::{
-    compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector,
-};
+use super::{compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector};
 
 fn fingerprint(label: &str) -> String {
     let digest = Sha256::digest(label.as_bytes());
@@ -1183,22 +1181,20 @@ fn component_load_compiles_to_a_framework_neutral_island_inventory() {
 
 #[test]
 fn multiple_load_islands_may_share_one_future_boundary() {
-    let project = compile_client(
-        ClientCompileInput::new(
-            manifest(),
-            ClientSurfaceSelector::role("user"),
-            vec![
-                ClientDocument::new(
-                    "src/lib/todos/TodoCount.graphql",
-                    "query TodoCount @load { todos { id } }",
-                ),
-                ClientDocument::new(
-                    "src/lib/todos/TodoTitles.graphql",
-                    "query TodoTitles @load { todos { title } }",
-                ),
-            ],
-        ),
-    )
+    let project = compile_client(ClientCompileInput::new(
+        manifest(),
+        ClientSurfaceSelector::role("user"),
+        vec![
+            ClientDocument::new(
+                "src/lib/todos/TodoCount.graphql",
+                "query TodoCount @load { todos { id } }",
+            ),
+            ClientDocument::new(
+                "src/lib/todos/TodoTitles.graphql",
+                "query TodoTitles @load { todos { title } }",
+            ),
+        ],
+    ))
     .expect("route ownership is no longer one-operation-per-route");
 
     assert_eq!(project.islands.len(), 2);
@@ -4078,4 +4074,30 @@ fn source_paths_fail_closed_before_they_can_inject_generated_typescript() {
     .expect_err("reject adversarial source path");
     assert_eq!(error.code, "client.documents.invalid_path");
     assert!(!error.message.contains("export const compromised"));
+}
+
+#[test]
+fn generated_lazy_commands_defer_definitions_and_preserve_command_signatures() {
+    let project = compile_client(ClientCompileInput::new(
+        generated_command_types_manifest(),
+        ClientSurfaceSelector::role("user"),
+        vec![ClientDocument::new(
+            "todos.graphql",
+            "query Todos { todos { id } }",
+        )],
+    ))
+    .expect("compile lazy commands");
+    let lazy = file(&project, "lazy-commands.ts");
+    assert!(lazy.contains("import type { COMMANDS, GeneratedCommandRuntimeOptions }"));
+    assert!(lazy.contains("import('./commands.js')"));
+    assert!(lazy.contains("\"hasInput\": false"));
+    assert!(lazy.contains("\"hasInput\": true"));
+    let wrapper = file(&project, "sveltekit.ts");
+    assert!(wrapper.contains("export function provideDistributedLazy("));
+    assert!(wrapper.contains("createCommands: createLazyCommands"));
+    assert!(wrapper.contains("createCommands: createGeneratedCommands"));
+    assert_eq!(
+        lazy.replace("'./commands.js'", "'./generated-commands.js'"),
+        include_str!("../../tests/fixtures/generated-lazy-commands.ts")
+    );
 }

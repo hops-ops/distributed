@@ -537,11 +537,15 @@ impl InMemoryProjectionProtocolState {
         scope: &ProjectionRecordScope,
         expectation: &ProjectionRecordExpectation,
         kind: ProjectionMutationKind,
+        source_snapshot: bool,
     ) -> Result<(RecordRevision, bool), ProjectionProtocolError> {
         let current = self.records.get(scope);
         match (expectation, current, kind) {
             (ProjectionRecordExpectation::Missing, None, ProjectionMutationKind::Upsert) => {
                 Ok((RecordRevision::new(scope.clone(), 1, 1)?, false))
+            }
+            (ProjectionRecordExpectation::Missing, None, ProjectionMutationKind::Delete) => {
+                Ok((RecordRevision::new(scope.clone(), 1, 1)?, true))
             }
             (ProjectionRecordExpectation::Missing, Some(metadata), _) if metadata.tombstone => {
                 Err(ProjectionProtocolError::RecordTombstoned {
@@ -582,7 +586,7 @@ impl InMemoryProjectionProtocolState {
                         )?,
                         false,
                     )),
-                    ProjectionMutationKind::Delete if metadata.tombstone => {
+                    ProjectionMutationKind::Delete if metadata.tombstone && !source_snapshot => {
                         Err(ProjectionProtocolError::RecordTombstoned {
                             model: scope.model().to_string(),
                         })
@@ -610,11 +614,9 @@ impl InMemoryProjectionProtocolState {
                     )),
                 }
             }
-            (_, _, ProjectionMutationKind::Delete | ProjectionMutationKind::Recreate) => {
-                Err(ProjectionProtocolError::InvalidBatch(
-                    "delete/recreate requires an exact record expectation".into(),
-                ))
-            }
+            (_, _, ProjectionMutationKind::Recreate) => Err(ProjectionProtocolError::InvalidBatch(
+                "delete/recreate requires an exact record expectation".into(),
+            )),
         }
     }
 
@@ -626,12 +628,16 @@ impl InMemoryProjectionProtocolState {
         row_exists: bool,
     ) -> Result<(), ProjectionProtocolError> {
         let should_exist = match (expectation, kind) {
-            (ProjectionRecordExpectation::Missing, ProjectionMutationKind::Upsert) => false,
-            (ProjectionRecordExpectation::Exact(_), ProjectionMutationKind::Recreate) => false,
             (
-                ProjectionRecordExpectation::Exact(_),
+                ProjectionRecordExpectation::Missing,
                 ProjectionMutationKind::Upsert | ProjectionMutationKind::Delete,
-            ) => true,
+            ) => false,
+            (ProjectionRecordExpectation::Exact(_), ProjectionMutationKind::Recreate) => false,
+            (ProjectionRecordExpectation::Exact(_), ProjectionMutationKind::Delete) => !self
+                .records
+                .get(scope)
+                .is_some_and(|record| record.tombstone),
+            (ProjectionRecordExpectation::Exact(_), ProjectionMutationKind::Upsert) => true,
             _ => {
                 return Err(ProjectionProtocolError::InvalidBatch(
                     "projection mutation has no valid physical-row expectation".into(),

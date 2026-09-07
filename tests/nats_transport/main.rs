@@ -105,6 +105,8 @@ async fn message_id_and_metadata_survive_the_round_trip() {
             TRACEPARENT,
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
         );
+    let mut message = message;
+    message.content_type = "application/vnd.example+binary".into();
     publisher.publish(message).await.expect("publish");
 
     let observed = Arc::new(Mutex::new(None));
@@ -121,6 +123,7 @@ async fn message_id_and_metadata_survive_the_round_trip() {
                         m.correlation_id().map(str::to_string),
                         m.traceparent().map(str::to_string),
                         m.payload().to_vec(),
+                        m.content_type.clone(),
                     ));
                     *o.lock().unwrap() = recorded;
                     async move { Ok(json!({})) }
@@ -139,6 +142,7 @@ async fn message_id_and_metadata_survive_the_round_trip() {
         Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
     );
     assert_eq!(got.3, br#"{"k":"v"}"#.to_vec());
+    assert_eq!(got.4, "application/vnd.example+binary");
 }
 
 /// Build a namespaced `NatsBus` for `group` (empty `group` = no group), with

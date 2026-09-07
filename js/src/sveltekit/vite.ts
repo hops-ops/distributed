@@ -448,6 +448,9 @@ export function distributedSvelteKit(
 		},
 		resolveId(source, importer): string | undefined {
 			if (lifecycleOwnsCompile && frameworkDist !== undefined) {
+				if (source === '@hops-ops/distributed/replica/lazy') {
+					return join(frameworkDist, 'replica', 'lazy.js');
+				}
 				if (source === '@hops-ops/distributed/replica') {
 					return join(frameworkDist, 'replica', 'index.js');
 				}
@@ -868,6 +871,7 @@ export function distributedSvelteKitAliases(
 		]);
 	if (frameworkDist !== undefined) {
 		aliases.push(
+			['@hops-ops/distributed/replica/lazy', join(frameworkDist, 'replica', 'lazy.js')],
 			['@hops-ops/distributed/replica', join(frameworkDist, 'replica')],
 			['@hops-ops/distributed/sveltekit', join(frameworkDist, 'sveltekit')]
 		);

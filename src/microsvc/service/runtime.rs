@@ -18,13 +18,16 @@ use super::helpers::{
 use super::helpers::{microsvc_dispatch_span, microsvc_handler_span};
 use super::request::{CommandRequest, CommandResponse};
 use super::routes::{CausalCommandPolicy, DynBusPublisher, ErasedRoutes, HandlerSpec, Routes};
-use crate::application::{CommandMount, CommandMountRegistrar, CommandSpec};
+use crate::application::{
+    Application, ApplicationError, ApplicationResult, CommandDefinition, CommandMount,
+    CommandMountRegistrar, CommandSpec, Module, SurfaceSpec,
+};
 use crate::bus::{
     Message, MessageKind, OrderedDelivery, RunOptions, SubscriptionPlan, TransportError,
 };
+use crate::command::{TypedCommandContract, TypedServiceCommandBinding};
 #[cfg(feature = "graphql")]
 use crate::command_ledger::{CommandId, CommandLookup, PrincipalPartitionId};
-use crate::graphql::command_contract::{TypedCommandContract, TypedServiceCommandBinding};
 #[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
 use crate::microsvc::error::HandlerError;
@@ -322,10 +325,7 @@ impl Service {
     /// Register one explicit command mount against the already-installed
     /// typed route inventory. The route's canonical command spec is the only
     /// authority; a stale or lookalike mount is rejected before dispatch.
-    pub fn register_command_mount(
-        &mut self,
-        mount: CommandMount,
-    ) -> Result<(), HandlerError> {
+    pub fn register_command_mount(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         self.register_command_mount_inner(mount)
     }
 
@@ -359,12 +359,10 @@ impl Service {
                 mount.spec().id
             )));
         }
-        if !self
-            .registered_command_mounts
-            .iter()
-            .any(|registered| registered.spec().id == mount.spec().id
-                && registered.spec().fingerprint == mount.spec().fingerprint)
-        {
+        if !self.registered_command_mounts.iter().any(|registered| {
+            registered.spec().id == mount.spec().id
+                && registered.spec().fingerprint == mount.spec().fingerprint
+        }) {
             return Err(HandlerError::Rejected(
                 "command mount was not registered against this service".into(),
             ));
@@ -404,10 +402,7 @@ impl Service {
         .await
     }
 
-    fn register_command_mount_inner(
-        &mut self,
-        mount: CommandMount,
-    ) -> Result<(), HandlerError> {
+    fn register_command_mount_inner(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         let Some(indices) = self
             .index
             .get(&MessageKind::Command)
@@ -449,9 +444,11 @@ impl Service {
                 mount.spec().id
             )));
         }
-        if self.registered_command_mounts.iter().any(|registered| {
-            registered.spec().id == mount.spec().id
-        }) {
+        if self
+            .registered_command_mounts
+            .iter()
+            .any(|registered| registered.spec().id == mount.spec().id)
+        {
             return Err(HandlerError::Rejected(format!(
                 "command mount `{}` is registered more than once",
                 mount.spec().id
@@ -590,6 +587,60 @@ impl Service {
             .collect::<crate::application::ApplicationResult<Vec<_>>>()?;
         specs.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(specs)
+    }
+
+    /// Compile this Service's typed command inventory and an authorized Surface
+    /// into one logical application.
+    ///
+    /// Command namespaces (the segment before the first `.`) become modules.
+    /// Every Service command must exist in the Surface so its authorization and
+    /// projection contract can be bound, and application validation rejects any
+    /// Surface command that is not owned by the Service.
+    pub fn application(
+        &self,
+        name: impl Into<String>,
+        surface: SurfaceSpec,
+    ) -> ApplicationResult<Application> {
+        let mut modules = BTreeMap::<String, Vec<CommandDefinition>>::new();
+        for command in self.command_specs()? {
+            let namespace = command
+                .id
+                .split_once('.')
+                .map(|(namespace, _)| namespace)
+                .filter(|namespace| !namespace.is_empty())
+                .ok_or_else(|| {
+                    ApplicationError::InvalidSpec(format!(
+                        "typed command `{}` has no module namespace; expected `<module>.<action>`",
+                        command.id
+                    ))
+                })?
+                .to_string();
+            let exposed = surface
+                .commands
+                .iter()
+                .find(|exposed| exposed.id == command.id)
+                .ok_or_else(|| ApplicationError::Missing {
+                    kind: "surface command",
+                    identity: command.id.clone(),
+                })?;
+            let command = command.with_surface_binding(exposed)?;
+            modules
+                .entry(namespace)
+                .or_default()
+                .push(CommandDefinition::contract(command));
+        }
+
+        let modules = modules
+            .into_iter()
+            .map(|(namespace, commands)| {
+                Module::new(namespace).command_definitions(commands).build()
+            })
+            .collect::<ApplicationResult<Vec<_>>>()?;
+
+        Application::new(name)
+            .modules(modules)
+            .surface(surface)
+            .build()
     }
 
     /// Attach Eventual projection metadata to a cell wait-path result using this
@@ -1192,10 +1243,7 @@ impl Service {
 }
 
 impl CommandMountRegistrar for Service {
-    fn register_command_mount(
-        &mut self,
-        mount: CommandMount,
-    ) -> Result<(), HandlerError> {
+    fn register_command_mount(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         self.register_command_mount_inner(mount)
     }
 }

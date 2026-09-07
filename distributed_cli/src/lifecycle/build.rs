@@ -424,9 +424,7 @@ pub fn run_lifecycle_project_build(
     let drift = if request.check {
         match request.check_baseline {
             LifecycleCheckBaseline::Workspace => compare_workspace_outputs(&root, &generation)?,
-            LifecycleCheckBaseline::ActiveGeneration => {
-                compare_active_outputs(&out, &generation)?
-            }
+            LifecycleCheckBaseline::ActiveGeneration => compare_active_outputs(&out, &generation)?,
         }
     } else {
         if request
@@ -487,7 +485,9 @@ fn compare_active_outputs(
     generation: &GenerationManifest,
 ) -> Result<Vec<BuildDrift>, LifecycleError> {
     let active = read_active_generation(out)?;
-    let active_root = active.as_ref().map(|identity| out.join("generations").join(identity));
+    let active_root = active
+        .as_ref()
+        .map(|identity| out.join("generations").join(identity));
     let mut drift = Vec::new();
     for receipt in generation.receipts.values() {
         for (output, built_identity) in &receipt.output_identities {
@@ -675,10 +675,7 @@ fn execute_node(
         .env("DISTRIBUTED_LIFECYCLE_ROOT", root)
         .env("DISTRIBUTED_LIFECYCLE_STAGE", stage)
         .env("DISTRIBUTED_LIFECYCLE_NODE", node_id)
-        .env(
-            "DISTRIBUTED_LIFECYCLE_CHECK",
-            if check { "1" } else { "0" },
-        )
+        .env("DISTRIBUTED_LIFECYCLE_CHECK", if check { "1" } else { "0" })
         .stdout(stdout)
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {

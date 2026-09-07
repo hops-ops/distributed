@@ -63,7 +63,7 @@ impl GraphqlEngine {
 
     pub(crate) fn typed_command_contracts_for_service(
         &self,
-    ) -> Result<Vec<crate::graphql::command_contract::TypedCommandContract>, String> {
+    ) -> Result<Vec<crate::command::TypedCommandContract>, String> {
         Ok(self.inner.typed_commands.contracts_for_binding())
     }
 

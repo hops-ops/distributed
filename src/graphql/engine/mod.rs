@@ -24,7 +24,6 @@ use super::client_manifest::{
     trusted_preset_descriptors, ClientExecutionLimits, ClientManifestError, ClientSurfaceIdentity,
     ClientTrustedPresetDescriptor, DistributedClientManifest, DistributedClientSurfaceExport,
 };
-use super::command_contract::TypedServiceCommandBinding;
 use super::commands::TypedCommandInventory;
 use super::compile::{SqlDialect, SqlPlan};
 use super::execute;
@@ -48,6 +47,7 @@ use super::surface::{
     build_surface, surface_for_application_contract, surface_for_role, Surface, SurfaceDialect,
     SurfaceOptions, SurfaceProjectionOwner, SurfaceProjector, SurfaceSelection,
 };
+use crate::command::TypedServiceCommandBinding;
 
 const GRAPHIQL_INTROSPECTION_MAX_DEPTH_FLOOR: usize = 15;
 const GRAPHIQL_INTROSPECTION_MAX_COMPLEXITY_FLOOR: usize = 10_000;

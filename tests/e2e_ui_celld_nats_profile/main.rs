@@ -77,11 +77,12 @@ mod live {
         CelldCommandHost, CelldRoute, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,
         CELL_INTERNAL_SECRET_HEADER,
     };
-    use distributed::command_dispatch::SharedCommandHost;
-    use distributed::graphql::{
-        read, typed_command, GraphqlEngine, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef,
-        GraphqlTypeField, ModelPermissions, Succeeded, VerifiedPrincipal,
+    use distributed::command::{
+        typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
+        Succeeded,
     };
+    use distributed::command_dispatch::SharedCommandHost;
+    use distributed::graphql::{read, GraphqlEngine, ModelPermissions, VerifiedPrincipal};
     use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
     use distributed::{
         Aggregate, AggregateBuilder, Entity, InMemoryRepository, ReadModel, Snapshot,
@@ -156,12 +157,12 @@ mod live {
         title: String,
     }
 
-    impl GraphqlInputType for CreateInput {
-        fn graphql_type() -> GraphqlTypeDef {
-            GraphqlTypeDef::new(
+    impl CommandInputType for CreateInput {
+        fn command_type() -> CommandTypeDef {
+            CommandTypeDef::new(
                 "CreateInput",
                 vec![
-                    GraphqlTypeField {
+                    CommandTypeField {
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -169,7 +170,7 @@ mod live {
                         item_nullable: false,
                         nested: None,
                     },
-                    GraphqlTypeField {
+                    CommandTypeField {
                         name: "title".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -188,11 +189,11 @@ mod live {
         id: String,
     }
 
-    impl GraphqlOutputType for IdPayload {
-        fn graphql_type() -> GraphqlTypeDef {
-            GraphqlTypeDef::new(
+    impl CommandOutputType for IdPayload {
+        fn command_type() -> CommandTypeDef {
+            CommandTypeDef::new(
                 "IdPayload",
-                vec![GraphqlTypeField {
+                vec![CommandTypeField {
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,

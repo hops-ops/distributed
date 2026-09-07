@@ -304,6 +304,36 @@ await client.prefetchLocation(target.pathname, {
 });
 ```
 
+### Optional lazy command loading
+
+For read-heavy applications, switch the root layout's generated provider import:
+
+```ts
+import { provideDistributedLazy as provideDistributed } from '$distributed';
+```
+
+Use the same provider options and `useCommands()` methods. The lazy provider
+registers the generated surface authority immediately after hydration, and imports
+one shared command runtime and its definitions on the first command. Queries,
+SSR, hydration, and route prefetch keep their existing behavior. The default
+`provideDistributed` and framework-neutral `createCommands` remain eager.
+
+To load command code before an interaction, call `await client.preloadCommands()`
+when opening an editor or focusing an editing control. This imports code without
+sending a command. The first cold command waits for this import before optimistic
+feedback can appear; failed imports reject and can be retried. Imports never
+replay commands. Pending receipts and status recovery remain owned by the shared
+client across route changes. On controlled reload, an existing
+`reload.recoverPendingCommands` callback runs after lazy command code is ready;
+applications still own that callback's recovery policy.
+
+Regenerate the client with the matching CLI/runtime release to obtain
+`provideDistributedLazy` and `createLazyCommands`. Framework-neutral consumers
+can use `createLazyCommands` from the generated `lazy-commands.js` module and
+call its `preload()` method. Directly importing `COMMANDS`, command artifacts,
+`createCommands`, or command-dependent pure functions elsewhere in the browser
+can keep those definitions eager. Verify the production bundle for your app.
+
 Route components import only their generated surface. Static operation wrappers
 resolve the nearest tree-local client when used:
 

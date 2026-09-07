@@ -57,6 +57,8 @@ mod identity;
 mod locks;
 mod partitions;
 mod reads;
+#[cfg(feature = "graphql")]
+mod rebuild;
 mod store_impl;
 mod types;
 mod writes;

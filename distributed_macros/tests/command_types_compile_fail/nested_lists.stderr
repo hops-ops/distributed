@@ -1,0 +1,5 @@
+error: nested lists are not supported for CommandInput/CommandOutput fields
+ --> tests/command_types_compile_fail/nested_lists.rs:5:13
+  |
+5 |     values: Option<Vec<Option<Vec<String>>>>,
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

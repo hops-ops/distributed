@@ -42,6 +42,7 @@ fn same_transaction_evidence() -> SameTransactionProjectionEvidence {
     .unwrap();
     SameTransactionProjectionEvidence {
         records: vec![ProjectionRecordMetadata {
+            source_snapshot: None,
             revision: revision.clone(),
             tombstone: false,
             change: change.clone(),

@@ -1,4 +1,4 @@
-use distributed::graphql::{Atomic, PreparedCommand};
+use distributed::command::{Atomic, PreparedCommand};
 use distributed::microsvc::{CausalCommandContext, HandlerError};
 use distributed::portable_command;
 use e2e_readmodels::BlobGames;
@@ -7,7 +7,7 @@ use serde::Deserialize;
 use super::support::{authenticated_user, principal, rejected, sealed_row};
 use crate::{domain_commands, BlobGame};
 
-#[derive(Debug, Deserialize, distributed::GraphqlInput)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct BlobStartInput {
     pub game_id: String,
 }

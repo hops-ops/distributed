@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {createLazyReplicaCommandRuntime} from '../dist/replica/command-runtime/lazy.js';
 import test from 'node:test';
 
 import {
@@ -479,4 +480,30 @@ test('one browser replica refuses to mix user and elevated generated surfaces', 
 		/active replica binding/
 	);
 	client.destroy();
+});
+
+
+test('lazy command authority preserves isolated SSR hydration and query prefetch without importing commands', async () => {
+ const harness = serverHarness();
+ const [alice, bob] = await Promise.all([harness.server.load(harness.event('alice')), harness.server.load(harness.event('bob'))]);
+ const hash = `sha256:${'d'.repeat(64)}`;
+ const status = {name:'Status',document:'query Status { commandStatus { state } }', operationHash:hash, protocol:{...TodosArtifact.protocol, protocolHash:`sha256:${'c'.repeat(64)}`, operation:hash}};
+ let imports=0;let fetches=0;
+ const clients=[alice,bob].map((data,i)=>createDistributedSvelteKit({
+  browser:false, boundaries:[todosBoundary], session:{getAuth:()=>({accessToken:i===0?'alice':'bob'})},
+  hydration:data.distributed, authority:data.distributedAuthority,
+  fetch:async()=>{fetches++;throw Error('hydrated selection must not refetch')},
+  createCommands:(replica,transport)=>createLazyReplicaCommandRuntime(replica,transport,
+   {commands:{'todo.ping':{operationHash:hash,hasInput:false}},status},async()=>{imports++;throw Error('commands must stay deferred')})
+ }));
+ for(const [i,client] of clients.entries()){
+  const store=client.operation(TodosArtifact).use();
+  const release=store.subscribe(()=>{});
+  assert.equal(store.get().data.todos[0].id,i===0?'todo-alice':'todo-bob');
+  await client.prefetchLocation('/todos',{search:new URLSearchParams(),session:{},props:{}});
+  release();
+ }
+ assert.equal(imports,0);assert.equal(fetches,0);
+ clients.forEach(client=>client.destroy());
+ await assert.rejects(clients[0].preloadCommands(),/destroyed/);
 });

@@ -540,8 +540,7 @@ async fn belongs_to_joins_source_fk_to_target_primary_key() {
 #[tokio::test]
 async fn permissions_filter_by_claim() {
     let schema = orders_schema();
-    let manifest =
-        distributed::ReadModelCatalog::new("orders").table_schema(schema.clone());
+    let manifest = distributed::ReadModelCatalog::new("orders").table_schema(schema.clone());
     let pool = setup_pool().await;
 
     // Value-based path: grant_all then we need typed permission — use builder

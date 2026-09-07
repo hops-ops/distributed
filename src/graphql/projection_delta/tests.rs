@@ -17,6 +17,7 @@ use super::types::{
     ProjectionMutationSource,
 };
 use super::*;
+
 use crate::graphql::{
     build_surface, surface_for_role, DistributedClientSurfaceExport, RoleGrant,
     SurfaceDirectProjection, SurfaceOptions, SurfaceProjector,
@@ -50,12 +51,12 @@ const FOREIGN_CAUSATION_ID: &str = "0190a000-0000-7000-8000-000000000018";
 const TEST_COMMAND_NAME: &str = "todo.modeled";
 
 #[allow(dead_code)]
-#[derive(Deserialize, crate::GraphqlInput)]
+#[derive(Deserialize, crate::CommandInput)]
 struct ModeledCommandInput {
     todo_id: String,
 }
 
-#[derive(Serialize, crate::GraphqlOutput)]
+#[derive(Serialize, crate::CommandOutput)]
 struct ModeledCommandOutput {
     accepted: bool,
 }
@@ -687,7 +688,7 @@ fn zero_obligation_modeled_metadata_is_revalidated_on_every_receipt_emission() {
             command_id: "0190a000-0000-7000-8000-000000000011".into(),
             command_name: Some(TEST_COMMAND_NAME.into()),
             causation_id: Some(TEST_CAUSATION_ID.into()),
-            consistency: Some(crate::graphql::command_contract::CommandConsistency::Eventual),
+            consistency: Some(crate::command::CommandConsistency::Eventual),
             outcome: None,
             obligations: Vec::new(),
             projection_metadata: Some(metadata),
@@ -702,7 +703,7 @@ fn zero_obligation_modeled_metadata_is_revalidated_on_every_receipt_emission() {
             command_id: "modeled-status-command".into(),
             command_name: TEST_COMMAND_NAME.into(),
             causation_id: TEST_CAUSATION_ID.into(),
-            consistency: crate::graphql::command_contract::CommandConsistency::Eventual,
+            consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::SucceededPendingProjection,
             outcome: serde_json::json!({"ok": true}),
             obligations: Vec::new(),
@@ -880,7 +881,7 @@ fn zero_occurrence_metadata_is_classified_from_the_current_causal_command_contra
             command_id: "0190a000-0000-7000-8000-000000000012".into(),
             command_name: TEST_COMMAND_NAME.into(),
             causation_id: TEST_CAUSATION_ID.into(),
-            consistency: crate::graphql::command_contract::CommandConsistency::Eventual,
+            consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::Succeeded,
             outcome: serde_json::json!({"accepted": true}),
             obligations: Vec::new(),
@@ -1424,7 +1425,7 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
             command_id: "0190a000-0000-7000-8000-000000000018".into(),
             command_name: TEST_COMMAND_NAME.into(),
             causation_id: TEST_CAUSATION_ID.into(),
-            consistency: crate::graphql::command_contract::CommandConsistency::Eventual,
+            consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::Atomic,
             outcome: serde_json::json!({"id": "todo-draining-status"}),
             obligations: Vec::new(),
@@ -1485,7 +1486,7 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
             command_id: "0190a000-0000-7000-8000-000000000019".into(),
             command_name: Some(TEST_COMMAND_NAME.into()),
             causation_id: Some(TEST_CAUSATION_ID.into()),
-            consistency: Some(crate::graphql::command_contract::CommandConsistency::Eventual),
+            consistency: Some(crate::command::CommandConsistency::Eventual),
             outcome: None,
             obligations: Vec::new(),
             projection_metadata: Some(metadata.clone()),
@@ -1523,7 +1524,7 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
             command_id: "0190a000-0000-7000-8000-000000000019".into(),
             command_name: TEST_COMMAND_NAME.into(),
             causation_id: TEST_CAUSATION_ID.into(),
-            consistency: crate::graphql::command_contract::CommandConsistency::Eventual,
+            consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::SucceededPendingProjection,
             outcome: serde_json::json!({"id": "todo-draining-status"}),
             obligations: Vec::new(),
@@ -1591,7 +1592,7 @@ fn lifecycle_status_rejects_changed_deployment_identity_and_mixed_fanout_tamperi
                 command_id: "0190a000-0000-7000-8000-000000000020".into(),
                 command_name: TEST_COMMAND_NAME.into(),
                 causation_id: TEST_CAUSATION_ID.into(),
-                consistency: crate::graphql::command_contract::CommandConsistency::Eventual,
+                consistency: crate::command::CommandConsistency::Eventual,
                 state: crate::command_ledger::CommandLedgerState::SucceededPendingProjection,
                 outcome: serde_json::json!({"id": "todo-lifecycle-hostile"}),
                 obligations: Vec::new(),
@@ -3527,16 +3528,16 @@ fn selected_export_join(surface: &crate::graphql::Surface) -> DistributedClientS
 }
 
 fn surface_with_modeled_command(surface: &crate::graphql::Surface) -> crate::graphql::Surface {
-    let contract = crate::graphql::typed_command::<
+    let contract = crate::command::typed_command::<
         ModeledCommandInput,
-        crate::graphql::Eventual<ModeledCommandOutput>,
+        crate::command::Eventual<ModeledCommandOutput>,
     >(TEST_COMMAND_NAME)
     .roles(["delta-user"])
-    .emits(crate::graphql::__command_projection_events([Ok(
+    .emits(crate::command::__command_projection_events([Ok(
         event_descriptor(),
     )]))
     .into_contract();
-    let binding = crate::graphql::command_contract::TypedServiceCommandBinding::from_contracts(
+    let binding = crate::command::TypedServiceCommandBinding::from_contracts(
         "delta-service",
         std::slice::from_ref(&contract),
     )

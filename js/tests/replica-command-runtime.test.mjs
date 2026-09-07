@@ -1,3 +1,4 @@
+import { createLazyReplicaCommandRuntime } from '../dist/replica/command-runtime/lazy.js';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
@@ -710,6 +711,23 @@ test('coherent reload gate rejects before optimism or transport dispatch', async
 	assert.equal(replica.layer(COMMAND_A), undefined);
 	blocked = false;
 	runtime.dispose();
+});
+
+test('HTTP reload gate rolls back optimism and reports a reload, not an invalid receipt', async () => {
+	for (const status of [503, 200]) {
+		const replica = new TestReplica();
+		const runtime = createReplicaCommandRuntime(replica, {
+			dispatch() {
+				assert.ok(replica.layer(COMMAND_A), 'optimism exists before the response');
+				return { status, errors: [{message: 'application generation is reloading',
+					extensions: {code: 'APPLICATION_RELOADING'}}] };
+			}
+		}, {change: artifact()});
+		await assert.rejects(runtime.commands.change({id: 'todo-1', title: 'blocked'}, {commandId: COMMAND_A}),
+			{code: status === 503 ? 'REPLICA_COMMAND_RELOADING' : 'REPLICA_COMMAND_PROTOCOL_INVALID'});
+		assert.equal(replica.layer(COMMAND_A), undefined);
+		runtime.dispose();
+	}
 });
 
 test('actual delta rebases later optimism while same-record dispatch retains invocation order', async () => {
@@ -2797,3 +2815,166 @@ async function directProjectionRuntime() {
 	);
 	return { replica, runtime };
 }
+
+function lazyRuntime(replica, transport, load, options) {
+	return createLazyReplicaCommandRuntime(replica, transport,
+		{ commands: { 'todo.upsert': { operationHash: HASH_A, hasInput: true } }, status: STATUS },
+		load ?? (async () => ({ entries: { 'todo.upsert': artifact() } })), options);
+}
+
+test('lazy commands register authority before loading, share imports, and snapshot invocation inputs', async () => {
+	const replica = new TestReplica();
+	let registrations = 0;
+	const register = replica[replicaCommandAuthority].bind(replica);
+	replica[replicaCommandAuthority] = (contract) => { registrations++; return register(contract); };
+	const gate = deferred();
+	let loads = 0;
+	const requests = [];
+	const runtime = lazyRuntime(replica, {
+		dispatch: async request => { requests.push(request); return envelope(request); },
+		status: async () => { throw new Error('not requested'); }
+	}, () => { loads++; return gate.promise; });
+	assert.equal(registrations, 1);
+	assert.equal(loads, 0);
+	assert.deepEqual(runtime.pendingCommandIds(), []);
+	const input = { id: 'todo-1', title: 'original' };
+	const first = runtime.commands.todo.upsert(input, { commandId: COMMAND_A });
+	input.title = 'edited while loading';
+	const second = runtime.commands.todo.upsert({ id: 'todo-2', title: 'second' }, { commandId: COMMAND_B });
+	await tick();
+	assert.equal(loads, 1);
+	assert.equal(requests.length, 0);
+	gate.resolve({ entries: { 'todo.upsert': artifact() } });
+	const receipts = await Promise.all([first, second]);
+	assert.deepEqual(receipts.map(r => r.commandId), [COMMAND_A, COMMAND_B]);
+	assert.equal(requests[0].variables.input.title, 'original');
+	assert.equal(replica.record('todo-1').fields.title, 'original');
+	await runtime.preload();
+	assert.equal(loads, 1);
+	runtime.dispose();
+});
+
+for (const failure of ['scope', 'dispose', 'abort']) {
+	test(`lazy commands reject ${failure} while the chunk is still loading without dispatch`, async () => {
+		const replica = new TestReplica();
+		const gate = deferred();
+		const abort = new AbortController();
+		let dispatches = 0;
+		const runtime = lazyRuntime(replica, {
+			dispatch: async request => { dispatches++; return envelope(request); }, status: async () => {}
+		}, () => gate.promise);
+		const pending = runtime.commands.todo.upsert({ id: 'todo-1', title: 'stale' }, { commandId: COMMAND_A, signal: abort.signal });
+		if (failure === 'scope') replica.invalidate();
+		if (failure === 'dispose') runtime.dispose();
+		if (failure === 'abort') abort.abort();
+		await assert.rejects(pending, { code: failure === 'scope' ? 'REPLICA_COMMAND_SCOPE_INVALIDATED' : failure === 'dispose' ? 'REPLICA_COMMAND_DISPOSED' : 'REPLICA_COMMAND_ABORTED' });
+		assert.equal(dispatches, 0);
+		gate.resolve({ entries: { 'todo.upsert': artifact() } });
+		await tick();
+		assert.equal(dispatches, 0);
+		assert.equal(replica.record('todo-1'), undefined);
+		runtime.dispose();
+	});
+}
+
+test('lazy chunk failures retry without dispatch and reject mismatched inventory', async () => {
+	const replica = new TestReplica();
+	let loads = 0;
+	let dispatches = 0;
+	const runtime = lazyRuntime(replica, {
+		dispatch: async request => { dispatches++; return envelope(request); }, status: async () => {}
+	}, async () => {
+		if (++loads === 1) throw new Error('chunk unavailable');
+		return { entries: { 'todo.upsert': artifact() } };
+	});
+	await assert.rejects(runtime.preload(), /chunk unavailable/);
+	await runtime.preload();
+	assert.equal(loads, 2);
+	assert.equal(dispatches, 0);
+	runtime.dispose();
+	const mismatch = lazyRuntime(replica, { status: async () => {} }, async () => ({ entries: { 'todo.upsert': { ...artifact(), operationHash: HASH_D } } }));
+	await assert.rejects(mismatch.preload(), /does not match its catalog/);
+	mismatch.dispose();
+});
+
+test('lazy commands preserve transport retry identity, status recovery and pending IDs', async () => {
+	const replica = new TestReplica();
+	const requests = [];
+	const runtime = lazyRuntime(replica, {
+		dispatch(request) { requests.push(request); return Promise.reject(new Error('ambiguous')); },
+		status(request) {
+			return Promise.resolve(statusEnvelope(request, commandMetadata(requests[0], { state: 'rejected', projection: false })));
+		}
+	});
+	let recovery;
+	await assert.rejects(runtime.commands.todo.upsert({ id: 'todo-1', title: 'preview' }, { commandId: COMMAND_A, transportRetries: 1 }), error => {
+		recovery = error.recovery;
+		return error.code === 'REPLICA_COMMAND_TRANSPORT_AMBIGUOUS';
+	});
+	assert.equal(requests.length, 2);
+	assert.equal(requests[0].variables, requests[1].variables);
+	assert.deepEqual(runtime.pendingCommandIds(), [COMMAND_A]);
+	assert.equal(replica.layer(COMMAND_A), 'optimistic');
+	await runtime.preload();
+	assert.equal((await recovery.status()).state, 'rejected');
+	assert.equal(replica.record('todo-1'), undefined);
+	assert.deepEqual(runtime.pendingCommandIds(), []);
+	runtime.dispose();
+});
+
+test('lazy commands recheck the reload dispatch gate after import', async () => {
+	const replica = new TestReplica();
+	const gate = deferred();
+	let reloading = false;
+	let dispatches = 0;
+	const runtime = lazyRuntime(replica, { dispatch: async () => { dispatches++; }, status: async () => {} }, () => gate.promise,
+		{ lifecycle: { assertDispatchOpen() { if (reloading) throw new Error('reload'); } } });
+	const pending = runtime.commands.todo.upsert({ id: 'todo-1', title: 'preview' }, { commandId: COMMAND_A });
+	reloading = true;
+	gate.resolve({ entries: { 'todo.upsert': artifact() } });
+	await assert.rejects(pending, { code: 'REPLICA_COMMAND_RELOADING' });
+	assert.equal(dispatches, 0);
+	assert.equal(replica.record('todo-1'), undefined);
+	runtime.dispose();
+});
+
+test('lazy no-input commands keep options, cancellation, command ID and callbacks in the first argument', async () => {
+	const replica = new TestReplica();
+	const gate = deferred();
+	const noInput = { ...artifact({ modeled: false, revalidate: true }), name: 'todo.ping', input: { kind: 'none' } };
+	let calls = 0;
+	let succeeded = 0;
+	const runtime = createLazyReplicaCommandRuntime(replica, {
+		dispatch: async request => { calls++; assert.equal(request.commandId, COMMAND_A); return envelope(request, { command: commandReceipt({ commandId: request.commandId, causationId: `cause:${request.commandId}`, state: 'succeeded', consistency: 'eventual', expects: [], observations: [], records: [] }) }); },
+		status: async () => {}
+	}, { commands: { 'todo.ping': { operationHash: HASH_A, hasInput: false } }, status: STATUS }, () => gate.promise);
+	const abort = new AbortController();
+	const cancelled = runtime.commands.todo.ping({ signal: abort.signal, commandId: COMMAND_B });
+	abort.abort();
+	await assert.rejects(cancelled, { code: 'REPLICA_COMMAND_ABORTED' });
+	gate.resolve({ entries: { 'todo.ping': noInput } });
+	await runtime.preload();
+	const receipt = await runtime.commands.todo.ping({ commandId: COMMAND_A, onSucceeded() { succeeded++; } });
+	assert.equal(receipt.commandId, COMMAND_A);
+	assert.equal(calls, 1);
+	assert.equal(succeeded, 1);
+	runtime.dispose();
+});
+
+test('calls made after preload cannot overtake earlier commands waiting for the same import', async () => {
+	const replica = new TestReplica();
+	const gate = deferred();
+	const requests = [];
+	const runtime = lazyRuntime(replica, {
+		dispatch: async request => { requests.push(request.commandId); return envelope(request); }, status: async () => {}
+	}, () => gate.promise);
+	const preload = runtime.preload();
+	// This continuation runs before the cold callers' import continuations.
+	const warm = preload.then(() => runtime.commands.todo.upsert({ id: 'todo-3', title: 'third' }, { commandId: COMMAND_C }));
+	const first = runtime.commands.todo.upsert({ id: 'todo-1', title: 'first' }, { commandId: COMMAND_A });
+	const second = runtime.commands.todo.upsert({ id: 'todo-2', title: 'second' }, { commandId: COMMAND_B });
+	gate.resolve({ entries: { 'todo.upsert': artifact() } });
+	await Promise.all([first, second, warm]);
+	assert.deepEqual(requests, [COMMAND_A, COMMAND_B, COMMAND_C]);
+	runtime.dispose();
+});

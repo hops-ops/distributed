@@ -249,9 +249,7 @@ async fn d7_concurrent_with_timeout_bound_terminates() {
 async fn d8_nested_has_many_exceeds_complexity_budget() {
     use distributed::graphql::{read, GraphqlEngine};
     use distributed::ReadModel;
-    use distributed::{
-        ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-    };
+    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -366,9 +364,7 @@ async fn d8_nested_has_many_exceeds_complexity_budget() {
 async fn d8_shallow_nested_has_many_within_budget() {
     use distributed::graphql::{read, GraphqlEngine};
     use distributed::ReadModel;
-    use distributed::{
-        ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-    };
+    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -443,9 +439,7 @@ async fn d8_shallow_nested_has_many_within_budget() {
 async fn d8_low_max_complexity_rejects_single_nest() {
     use distributed::graphql::{read, GraphqlEngine};
     use distributed::ReadModel;
-    use distributed::{
-        ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-    };
+    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]

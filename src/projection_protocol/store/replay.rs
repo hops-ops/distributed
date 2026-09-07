@@ -280,6 +280,7 @@ impl ReplayCursor {
 impl ReplayRecord {
     fn into_record(self) -> Result<ProjectionRecordMetadata, String> {
         Ok(ProjectionRecordMetadata {
+            source_snapshot: None,
             revision: self.revision.into_revision()?,
             tombstone: self.tombstone,
             change: self.change.into_cursor()?,

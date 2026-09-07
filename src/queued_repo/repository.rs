@@ -301,6 +301,23 @@ where
     R: ProjectionProtocolStore,
     L: LockManager,
 {
+    #[cfg(feature = "graphql")]
+    async fn projection_rebuild_records(
+        &self,
+        context: &crate::projection::rebuild::RebuildContext,
+    ) -> Result<Vec<crate::projection_protocol::ProjectionRecordMetadata>, ProjectionProtocolError>
+    {
+        self.inner.projection_rebuild_records(context).await
+    }
+
+    #[cfg(feature = "graphql")]
+    async fn commit_projection_rebuild(
+        &self,
+        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> Result<usize, ProjectionProtocolError> {
+        self.inner.commit_projection_rebuild(plan).await
+    }
+
     fn register_projection_models<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,

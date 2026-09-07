@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use distributed::bus::{Bus, BusConsumer, InMemoryBus, TransportError};
 use distributed::cell_host::InternalHttpSecret;
+use distributed::command::{
+    typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField, Succeeded,
+};
 use distributed::command_dispatch::{CommandHost, HttpCommandHost, SharedCommandHost};
 use distributed::graphql::VerifiedPrincipal;
-use distributed::graphql::{
-    typed_command, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField, Succeeded,
-};
 use distributed::microsvc::{router, Routes, Service, ROLE_KEY, USER_ID_KEY};
 use distributed::{Aggregate, AggregateBuilder, Entity, InMemoryRepository, Snapshot};
 use serde::{Deserialize, Serialize};
@@ -52,11 +52,11 @@ struct IdInput {
     id: String,
 }
 
-impl GraphqlInputType for IdInput {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandInputType for IdInput {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "IdInput",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -74,11 +74,11 @@ struct IdPayload {
     id: String,
 }
 
-impl GraphqlOutputType for IdPayload {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandOutputType for IdPayload {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "IdPayload",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,

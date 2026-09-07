@@ -26,12 +26,12 @@ impl Aggregate for RenamedAggregate {
     }
 }
 
-#[derive(Clone, serde::Deserialize, framework::GraphqlInput)]
+#[derive(Clone, serde::Deserialize, framework::CommandInput)]
 struct RenamedInput {
     id: String,
 }
 
-#[derive(Clone, serde::Serialize, framework::GraphqlOutput)]
+#[derive(Clone, serde::Serialize, framework::CommandOutput)]
 struct RenamedOutput {
     id: String,
 }
@@ -47,13 +47,13 @@ struct RenamedCreated {
     roles(user),
     emits(RenamedCreated),
     input = RenamedInput,
-    outcome = framework::graphql::Succeeded<RenamedOutput>
+    outcome = framework::command::Succeeded<RenamedOutput>
 )]
 async fn renamed_handler(
     _context: &framework::microsvc::CausalCommandContext<'_, RenamedAggregate>,
     _input: RenamedInput,
 ) -> Result<
-    framework::graphql::PreparedCommand<framework::graphql::Succeeded<RenamedOutput>>,
+    framework::command::PreparedCommand<framework::command::Succeeded<RenamedOutput>>,
     framework::microsvc::HandlerError,
 > {
     unreachable!()

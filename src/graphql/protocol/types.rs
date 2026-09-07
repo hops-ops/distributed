@@ -259,6 +259,17 @@ pub(crate) struct DistributedGenerationEnvelope {
 
 impl DistributedGenerationEnvelope {
     fn from_environment() -> Option<Self> {
+        if let Some(member) = crate::microsvc::lifecycle::membership_from_environment() {
+            let active = member.generation;
+            return Some(Self {
+                version: 1,
+                generation_id: active.generation_id,
+                release_id: active.release_id,
+                topology_id: Some(active.topology_id),
+                compatibility_id: Some(active.compatibility_id),
+                member_id: optional_environment_identity("DISTRIBUTED_MEMBER_ID"),
+            });
+        }
         let generation_id = std::env::var("DISTRIBUTED_GENERATION_ID").ok()?;
         let release_id = std::env::var("DISTRIBUTED_RELEASE_ID").ok()?;
         if !bounded_identity(&generation_id) || !bounded_identity(&release_id) {
