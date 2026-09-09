@@ -65,7 +65,8 @@ export function emitWatchState(host: FetchLiveHost, key: string, allowFetch: boo
 export function closeActiveTransports(host: FetchLiveHost): void {
 	for (const controller of host.inFlightAborts.values()) controller.abort();
 	host.inFlightAborts.clear();
-	for (const entry of host.lives.values()) {
+	for (const [key, entry] of host.lives) {
+		retireLiveProtocol(host, key);
 		entry.active = false;
 		try {
 			entry.unsubscribe();
@@ -232,6 +233,7 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 		existing.count += 1;
 		return;
 	}
+	clearRetiredLiveProtocol(host, watch.key);
 	const state = host.queryState(watch.key);
 	state.live = 'connecting';
 	const entry: LiveEntry = {
@@ -328,6 +330,7 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 				},
 				error: (error) => {
 					if (!entry.active || host.lives.get(watch.key) !== entry) return;
+					retireLiveProtocol(host, watch.key);
 					entry.active = false;
 					host.lives.delete(watch.key);
 					const unsub = entry.unsubscribe;
@@ -359,6 +362,7 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 		}
 		state.live = 'active';
 	} catch (error) {
+		retireLiveProtocol(host, watch.key);
 		entry.active = false;
 		host.lives.delete(watch.key);
 		state.live = 'error';
@@ -376,6 +380,7 @@ export function fallbackFromLive<TData, TVariables extends GraphqlVariables>(
 		void fetchWatch(host, watch, true);
 		return;
 	}
+	retireLiveProtocol(host, watch.key);
 	const protocol = host.operationProtocols.get(watch.key);
 	if (protocol?.active === 'live') protocol.active = undefined;
 	entry.active = false;
@@ -426,6 +431,7 @@ export function restartLive(host: FetchLiveHost, key: string): void {
 	const previous = host.lives.get(key);
 	if (previous === undefined) return;
 	const count = previous.count;
+	retireLiveProtocol(host, key);
 	previous.active = false;
 	host.lives.delete(key);
 	try {
@@ -465,11 +471,29 @@ export function releaseLive(host: FetchLiveHost, key: string): void {
 	if (!entry) return;
 	entry.count -= 1;
 	if (entry.count > 0) return;
+	retireLiveProtocol(host, key);
 	entry.active = false;
 	host.lives.delete(key);
 	entry.unsubscribe();
 	host.queryState(key).live = 'off';
 	host.emitState(key, false);
+}
+
+/**
+ * Mark protocol state as no longer backed by a live transport. The state is
+ * retained for cache and hydration bookkeeping, but a later live stream may
+ * replace its incomparable membership only when that stream started after
+ * this boundary.
+ */
+function retireLiveProtocol(host: FetchLiveHost, key: string): void {
+	const state = host.operationProtocols.get(key)?.live;
+	if (state === undefined) return;
+	state.retiredAtRevision = host.allocateIndexRevision();
+}
+
+function clearRetiredLiveProtocol(host: FetchLiveHost, key: string): void {
+	const state = host.operationProtocols.get(key)?.live;
+	if (state !== undefined) state.retiredAtRevision = undefined;
 }
 
 function requestExtensions(

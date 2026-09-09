@@ -55,6 +55,8 @@ export type SerializedOperationProtocolState = {
 		Readonly<{ scopeToken: string; position: string }>
 	])[];
 	readonly indexRevision?: string;
+	/** Local boundary after which a disposed live owner may be handed off. */
+	readonly retiredAtRevision?: string;
 	readonly indexKeys: readonly string[];
 	readonly pathRecords: readonly (readonly [string, string])[];
 	readonly cursors: readonly DistributedLiveCursor[];
@@ -140,6 +142,8 @@ export type OperationProtocolState = {
 	snapshotScope?: DistributedOpaqueString;
 	indexClocks: Map<string, IndexProtocolClock>;
 	indexRevision?: string;
+	/** Local boundary after which a disposed live owner may be handed off. */
+	retiredAtRevision?: string;
 	indexKeys: Set<string>;
 	pathRecords: Map<string, string>;
 	cursors: readonly DistributedLiveCursor[];

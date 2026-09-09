@@ -30,6 +30,16 @@ empty result acquire rows without waiting for another page load. It does not
 override an independently active live stream or query ownership acquired after
 the subscription started; those results have no safe cross-stream ordering.
 
+When the last watch for a live operation is disposed, its local ownership is
+retired at a monotonically increasing local boundary. A later live subscription
+may take over an incomparable shared index only when that subscription started
+after the retirement boundary. A subscription that started while the previous
+stream was still active remains fenced against late frames from that stream.
+Reopening the retired operation clears its retirement marker before transport
+callbacks can arrive, so the reopened stream becomes an active owner again.
+Retirement is local replica metadata; it does not claim that the server's
+projection stopped or provide a server ordering signal.
+
 This is a breaking v5 protocol change: `mode` replaces the ambiguous `supported`
 boolean. Upgrade server and generated-client runtime together. Old or unknown
 wire forms fail closed; applications do not need a polling or reload workaround.

@@ -1975,6 +1975,356 @@ test('snapshot live replaces SSR membership, updates and removes rows, and fence
 	assert.deepEqual(replica.read(Todos, {}).data.todos, []);
 });
 
+test('snapshot live takes over a nested graph from a disposed page subscription', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner', document: 'subscription FeaturedOwner { featuredGames { id owner { id name } } }' }
+	};
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) { observers.push(observer); return () => {}; }
+	} });
+	const oldFrame = (position, ownerName = 'Owner') => gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames',
+		operation: previousPage.live.id, position,
+		ownerId: 'user-1', ownerName, indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	replica.writeResult(previousPage, {}, gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	}), 'ssr');
+	const oldWatch = replica.watch(previousPage, {}, { live: true });
+	observers[0].next(oldFrame('2'));
+	oldWatch.destroy();
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const current = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '3',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(current.get().errors, []);
+	assert.equal(current.get().complete, true);
+	assert.equal(current.get().data.games.length, 1, 'disposed page must not permanently own the shared relationship');
+	observers[0].next(oldFrame('4', 'Late disposed callback'));
+	assert.equal(current.get().data.games[0].owner.name, 'Owner');
+	current.destroy();
+});
+
+test('snapshot live keeps a stream started before disposal behind the retired owner', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner-before-disposal', document: 'subscription FeaturedOwnerBeforeDisposal { featuredGames { id owner { id name } } }' }
+	};
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) { observers.push(observer); return () => {}; }
+	} });
+	const oldFrame = (ownerName) => gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames', operation: previousPage.live.id,
+		position: '2', ownerId: 'user-1', ownerName, indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	const oldWatch = replica.watch(previousPage, {}, { live: true });
+	observers[0].next(oldFrame('active owner'));
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const current = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '3',
+		ownerId: 'user-1', ownerName: 'started before disposal', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(current.get().data.games, []);
+	oldWatch.destroy();
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '4',
+		ownerId: 'user-1', ownerName: 'still started before disposal', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(current.get().data.games, []);
+	current.destroy();
+});
+
+test('reopening a retired live owner restores its ownership fence', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner-reopened', document: 'subscription FeaturedOwnerReopened { featuredGames { id owner { id name } } }' }
+	};
+	const frame = (artifact, responseKey, operation, position, ownerName) => gamesFrame({
+		artifact, responseKey, operation, position, ownerId: 'user-1', ownerName,
+		indexesComparable: false, live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) {
+		observers.push(observer);
+		if (observers.length === 2) {
+			observer.next(frame(previousPage, 'featuredGames', previousPage.live.id, '3', 'reopened owner'));
+		}
+		return () => {};
+	} } });
+	const first = replica.watch(previousPage, {}, { live: true });
+	observers[0].next(frame(previousPage, 'featuredGames', previousPage.live.id, '2', 'first owner'));
+	first.destroy();
+	const reopened = replica.watch(previousPage, {}, { live: true });
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const current = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	observers[2].next(frame(
+		GamesWithOwnerLiveOperation,
+		'games',
+		GamesWithOwnerLiveOperation.live.id,
+		'4',
+		'current contender'
+	));
+	assert.deepEqual(current.get().data.games, []);
+	reopened.destroy();
+	current.destroy();
+});
+
+test('reopening a retired live owner clears the marker before its first frame', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner-reopened-empty', document: 'subscription FeaturedOwnerReopenedEmpty { featuredGames { id owner { id name } } }' }
+	};
+	const frame = (artifact, responseKey, operation, position, ownerName) => gamesFrame({
+		artifact, responseKey, operation, position, ownerId: 'user-1', ownerName,
+		indexesComparable: false, live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) { observers.push(observer); return () => {}; }
+	} });
+	const first = replica.watch(previousPage, {}, { live: true });
+	observers[0].next(frame(previousPage, 'featuredGames', previousPage.live.id, '2', 'first owner'));
+	first.destroy();
+	// Reopen the operation, but do not deliver a frame yet. The replacement
+	// stream must still be treated as an active owner immediately.
+	const reopened = replica.watch(previousPage, {}, { live: true });
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const contender = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	observers[1].next(frame(
+		GamesWithOwnerLiveOperation,
+		'games',
+		GamesWithOwnerLiveOperation.live.id,
+		'3',
+		'contender before reopened frame'
+	));
+	assert.deepEqual(contender.get().data.games, []);
+	reopened.destroy();
+	contender.destroy();
+});
+
+test('two watches retire shared live ownership only after final disposal', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner-refcount', document: 'subscription FeaturedOwnerRefcount { featuredGames { id owner { id name } } }' }
+	};
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) { observers.push(observer); return () => {}; }
+	} });
+	const oldFrame = (ownerName) => gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames', operation: previousPage.live.id,
+		position: '2', ownerId: 'user-1', ownerName, indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	const first = replica.watch(previousPage, {}, { live: true });
+	const second = replica.watch(previousPage, {}, { live: true });
+	assert.equal(observers.length, 1, 'same operation shares one live transport');
+	observers[0].next(oldFrame('active owner'));
+	first.destroy();
+
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const startedBeforeFinalRelease = replica.watch(
+		GamesWithOwnerLiveOperation,
+		{},
+		{ live: true }
+	);
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '3',
+		ownerId: 'user-1', ownerName: 'before final release', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(startedBeforeFinalRelease.get().data.games, []);
+	second.destroy();
+	observers[0].next(oldFrame('late disposed callback'));
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '4',
+		ownerId: 'user-1', ownerName: 'still before final release', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(startedBeforeFinalRelease.get().data.games, []);
+	startedBeforeFinalRelease.destroy();
+
+	const afterFinalRelease = replica.watch(
+		GamesWithOwnerLiveOperation,
+		{},
+		{ live: true }
+	);
+	observers[2].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '5',
+		ownerId: 'user-1', ownerName: 'after final release', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.equal(afterFinalRelease.get().data.games[0].owner.name, 'after final release');
+	afterFinalRelease.destroy();
+});
+
+test('terminal live retirement permits a later snapshot handoff', () => {
+	for (const terminal of ['error', 'complete']) {
+		const observers = [];
+		const previousPage = {
+			...FeaturedGamesWithOwner,
+			live: { id: `live:featured-owner-${terminal}`, document: `subscription FeaturedOwner${terminal} { featuredGames { id owner { id name } } }` }
+		};
+		const replica = createDistributedReplica({ transport: {
+			fetch() { throw new Error('terminal stream test does not need HTTP fallback'); },
+			subscribe(_request, observer) { observers.push(observer); return () => {}; }
+		} });
+		const oldFrame = gamesFrame({
+			artifact: previousPage, responseKey: 'featuredGames', operation: previousPage.live.id,
+			position: '2', ownerId: 'user-1', ownerName: `${terminal} owner`, indexesComparable: false,
+			live: { mode: 'snapshot', reset: true, cursors: [] }
+		});
+		replica.writeResult(previousPage, {}, gamesFrame({
+			artifact: previousPage, responseKey: 'featuredGames', position: '1',
+			ownerId: 'user-1', ownerName: `${terminal} owner`, indexesComparable: false
+		}), 'ssr');
+		const oldWatch = replica.watch(previousPage, {}, { live: true });
+		observers[0].next(oldFrame);
+		if (terminal === 'error') observers[0].error(new Error('terminal test error'));
+		else observers[0].complete();
+		// A terminal transport is no longer the page's live request. Dispose the
+		// watcher before another page seeds the same shared index; an error may
+		// otherwise be intentionally resumed by the replica on the next write.
+		oldWatch.destroy();
+
+		const empty = gamesFrame({
+			artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+			ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+		});
+		empty.data.games = [];
+		empty.extensions.distributed.snapshot.records = [];
+		replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+		const current = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+		observers[1].next(gamesFrame({
+			artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+			operation: GamesWithOwnerLiveOperation.live.id, position: '3',
+			ownerId: 'user-1', ownerName: `${terminal} handoff`, indexesComparable: false,
+			live: { mode: 'snapshot', reset: true, cursors: [] }
+		}));
+		assert.equal(current.get().data.games.length, 1, `${terminal} handoff should replace the retired owner`);
+		assert.equal(current.get().data.games[0].owner.name, `${terminal} handoff`);
+		observers[0].next(oldFrame);
+		assert.equal(current.get().data.games[0].owner.name, `${terminal} handoff`);
+		current.destroy();
+	}
+});
+
+test('retired live ownership survives dehydration before a later handoff', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner-hydrated', document: 'subscription FeaturedOwnerHydrated { featuredGames { id owner { id name } } }' }
+	};
+	const transport = {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) { observers.push(observer); return () => {}; }
+	};
+	const replica = createDistributedReplica({ transport });
+	const oldFrame = gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames',
+		operation: previousPage.live.id, position: '2', ownerId: 'user-1',
+		ownerName: 'retired owner', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	replica.writeResult(previousPage, {}, gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames', position: '1',
+		ownerId: 'user-1', ownerName: 'retired owner', indexesComparable: false
+	}), 'ssr');
+	replica.read(previousPage, {});
+	const oldWatch = replica.watch(previousPage, {}, { live: true });
+	observers[0].next(oldFrame);
+	oldWatch.destroy();
+	const dehydrated = replica.dehydrate();
+	const oldProtocol = dehydrated.payload.operations.find((entry) =>
+		entry.live?.retiredAtRevision !== undefined
+	);
+	assert.ok(oldProtocol?.live?.retiredAtRevision !== undefined);
+
+	const restoredObservers = [];
+	const restored = createDistributedReplica({
+		transport: {
+			fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+			subscribe(_request, observer) { restoredObservers.push(observer); return () => {}; }
+		}
+	});
+	assert.equal(restored.hydrate(dehydrated, dehydrated.scope), true);
+	const current = restored.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	restoredObservers[0].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '3',
+		ownerId: 'user-1', ownerName: 'hydrated handoff', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.equal(current.get().data.games.length, 1);
+	assert.equal(restored.hydrate(dehydrated, dehydrated.scope), true);
+	assert.equal(restoredObservers.length, 2);
+	restoredObservers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '4',
+		ownerId: 'user-1', ownerName: 'active receiver after hydrate', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	const contender = restored.watch(previousPage, {}, { live: true });
+	restoredObservers[2].next(oldFrame);
+	assert.equal(current.get().data.games[0].owner.name, 'active receiver after hydrate');
+	contender.destroy();
+	current.destroy();
+});
+
 test('snapshot live adds a row with an unchanged SSR-owned nested relationship', () => {
 	let observer;
 	const replica = createDistributedReplica({ transport: {
