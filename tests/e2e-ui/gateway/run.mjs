@@ -55,7 +55,9 @@ try{
       const ack=await fetch(publicOrigin+'/__distributed/lifecycle',{method:'POST',headers:{origin:publicOrigin,'content-type':'application/json'},body:JSON.stringify({participantId:participant,transitionId:'gateway_ci_no_transition',ok:true})});
       assert.equal(ack.status,409,'same-origin acknowledgement reaches lifecycle state validation');
     }
-    browser=await chromium.launch();const context=await browser.newContext();const page=await context.newPage();
+    browser=await chromium.launch();const context=await browser.newContext();
+    await context.addInitScript(()=>{globalThis.__captureReplicaDiagnostics=true;});
+    const page=await context.newPage();
     const errors=[];page.on('pageerror',error=>errors.push(error.message));
     await page.goto(publicOrigin);await page.getByRole('link',{name:/log in|sign in/i}).first().click();
     await page.getByRole('button',{name:'Continue as Alice'}).click();
