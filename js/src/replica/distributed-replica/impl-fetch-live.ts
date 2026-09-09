@@ -238,7 +238,8 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 		count: 1,
 		unsubscribe: () => undefined,
 		active: true,
-		protocolGeneration: host.protocolGenerationSequence()
+		protocolGeneration: host.protocolGenerationSequence(),
+		startRevision: host.allocateIndexRevision()
 	};
 	host.lives.set(watch.key, entry);
 	const resume = host.resumeCursors(watch.key);
