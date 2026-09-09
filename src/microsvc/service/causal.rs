@@ -311,30 +311,12 @@ impl CausalDispatchResult {
             .map_err(|error| {
                 CausalDispatchError::Internal(format!("wait-path projection metadata: {error}"))
             })?;
-        // Cell wait-path has no GraphQL command-ledger observations. Keep the
-        // modeled delta so the replica can apply it, but drop expects so
-        // `projected` does not wait on live/status observations this process
-        // cannot emit. Preserve the delta's own recovery disposition: a fully
-        // resolved actual delta is sufficient local authority and must not turn
-        // every successful cell command into a full-query revalidation.
-        let metadata = if metadata.obligations.is_empty() {
-            metadata
-        } else {
-            let revalidate = metadata.revalidate;
-            crate::graphql::protocol::CommandProjectionMetadataV1::try_new(
-                metadata.issued_at_unix_ms,
-                metadata.expires_at_unix_ms,
-                metadata.delta,
-                metadata.lifecycle_proofs,
-                Vec::new(),
-                revalidate,
-            )
-            .map_err(|error| {
-                CausalDispatchError::Internal(format!(
-                    "wait-path projection metadata without ledger observations: {error}"
-                ))
-            })?
-        };
+        // The cell has durably committed the domain event, but the modeled
+        // read-model projector is still asynchronous. Preserve the exact
+        // event-derived obligations so the client can retire its accepted
+        // optimistic layer only after a matching live/read observation. The
+        // wait-path has no command-ledger observation rows of its own; that
+        // affects status evidence below, not the modeled obligation contract.
         self.receipt.state = CommandLedgerState::Succeeded;
         self.receipt.projection_metadata = Some(metadata);
         Ok(self)
@@ -356,24 +338,10 @@ impl CausalDispatchResult {
             CommandLedgerState::ProjectionFailed => CausalCommandPublicState::ProjectionFailed,
             CommandLedgerState::Expired => CausalCommandPublicState::Expired,
         };
-        let evidence = self
-            .receipt
-            .projection_metadata
-            .as_ref()
-            .map(|metadata| {
-                metadata
-                    .obligations
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _)| CausalCommandProjectionEvidence {
-                        obligation_index: index,
-                        state: CausalProjectionEvidenceState::Observed,
-                        incarnation: None,
-                        revision: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        // A wait-path receipt proves the cell command commit, not asynchronous
+        // projector application. Keep modeled obligations in the metadata, but
+        // never claim them observed without a read/live proof.
+        let evidence = Vec::new();
         CausalCommandPublicStatus {
             state,
             command_id: self.receipt.command_id.clone(),

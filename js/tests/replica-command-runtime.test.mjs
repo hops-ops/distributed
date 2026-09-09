@@ -12,6 +12,7 @@ import {
 	ReplicaCommandRuntimeError
 } from '../dist/replica/command-runtime.js';
 import {
+	createDistributedReplica,
 	prepareReplicaCommand,
 	replicaRecordKey,
 	ReplicaCommandContractError
@@ -21,6 +22,11 @@ import {
 	COMMAND_STATE,
 	commandReceipt
 } from './fixtures/command-protocol.mjs';
+import {
+	TodosArtifact,
+	TodoModel,
+	todoFrame
+} from './fixtures/adapter-conformance.mjs';
 
 const HASH_A = `sha256:${'a'.repeat(64)}`;
 const HASH_B = `sha256:${'b'.repeat(64)}`;
@@ -45,6 +51,24 @@ const CACHE_SCOPE = token('cache-scope', 1);
 const Todo = Object.freeze({
 	id: 'Todos',
 	identityFields: Object.freeze(['id'])
+});
+
+// Reuse the generated query/live selection while matching the command
+// runtime's authoritative protocol scope. This keeps the regression on the
+// public replica and generated-command paths rather than a hand-built cache.
+const CommandTodos = Object.freeze({
+	...TodosArtifact,
+	id: 'query:command-runtime-todos',
+	protocol: Object.freeze({
+		...TodosArtifact.protocol,
+		schemaHash: HASH_B,
+		surface: SURFACE,
+		operation: 'query:command-runtime-todos'
+	}),
+	live: Object.freeze({
+		...TodosArtifact.live,
+		id: 'live:command-runtime-todos'
+	})
 });
 const Audit = Object.freeze({
 	id: 'Audits',
@@ -88,14 +112,15 @@ function scope(value, model = Todo.id) {
 	});
 }
 
-function projection(operation = 'upsert') {
+function projection(operation = 'upsert', model = Todo) {
 	const event = Object.freeze({ id: 'event-1', name: 'todo.changed', version: 1 });
-	const previewScope = scope(input(['id']));
+	const previewScope = scope(input(['id']), model.id);
 	const targetScope = scope(
 		Object.freeze({
 			kind: 'constant',
 			value: Object.freeze({ type: 'string', value: 'target' })
-		})
+		}),
+		model.id
 	);
 	let mutation;
 	if (operation === 'upsert') {
@@ -130,7 +155,7 @@ function projection(operation = 'upsert') {
 		mutation = Object.freeze({
 			op: 'invalidate_model',
 			partition: unit,
-			model: Todo.id
+			model: model.id
 		});
 	} else {
 		mutation = Object.freeze({
@@ -144,40 +169,40 @@ function projection(operation = 'upsert') {
 			? Object.freeze({
 					kind: 'relationship',
 					relationship: 'related',
-					source_model: Todo.id,
+					source_model: model.id,
 					source_key: Object.freeze(['id']),
-					target_model: Todo.id,
+					target_model: model.id,
 					target_key: Object.freeze(['id']),
 					link: operation === 'link',
 					unlink: operation === 'unlink'
 				})
-			: operation === 'invalidate_model'
-				? Object.freeze({ kind: 'model', model: Todo.id })
-				: operation === 'invalidate_relationship'
-					? Object.freeze({
-							kind: 'relationship',
-							relationship: 'related',
-							source_model: Todo.id,
-							source_key: Object.freeze(['id']),
-							target_model: Todo.id,
-							target_key: Object.freeze(['id']),
-							link: false,
-							unlink: false
-						})
-					: Object.freeze({
-							kind: 'record',
-							model: Todo.id,
-							key: Object.freeze(['id']),
-							fields: Object.freeze(
-								operation === 'delete' ? [] : ['title']
-							),
-							replace: Object.freeze(
-								operation === 'upsert' ? ['title'] : []
-							),
-							upsert: operation === 'upsert',
-							patch: operation === 'patch',
-							delete: operation === 'delete'
-						});
+				: operation === 'invalidate_model'
+					? Object.freeze({ kind: 'model', model: model.id })
+					: operation === 'invalidate_relationship'
+						? Object.freeze({
+								kind: 'relationship',
+								relationship: 'related',
+								source_model: model.id,
+								source_key: Object.freeze(['id']),
+								target_model: model.id,
+								target_key: Object.freeze(['id']),
+								link: false,
+								unlink: false
+							})
+						: Object.freeze({
+								kind: 'record',
+								model: model.id,
+								key: Object.freeze(['id']),
+								fields: Object.freeze(
+									operation === 'delete' ? [] : ['title']
+								),
+								replace: Object.freeze(
+									operation === 'upsert' ? ['title'] : []
+								),
+								upsert: operation === 'upsert',
+								patch: operation === 'patch',
+								delete: operation === 'delete'
+							});
 	return Object.freeze({
 		version: 2,
 		deltaWireVersion: 1,
@@ -225,6 +250,7 @@ function projection(operation = 'upsert') {
 
 function artifact(options = {}) {
 	const operation = options.operation ?? 'upsert';
+	const model = options.model ?? Todo;
 	return Object.freeze({
 		version: 2,
 		name: options.name ?? `todo.${operation}`,
@@ -243,7 +269,9 @@ function artifact(options = {}) {
 		input: Object.freeze({ kind: 'object', definition: TodoInput }),
 		output: Object.freeze({ kind: 'object', definition: ResultOutput }),
 		consistency: options.consistency ?? COMMAND_CONSISTENCY.EVENTUAL,
-		...(options.modeled === false ? {} : { projection: projection(operation) }),
+		...(options.modeled === false
+			? {}
+			: { projection: projection(operation, model) }),
 		...(options.directProjection === undefined
 			? {}
 			: { directProjection: options.directProjection }),
@@ -251,16 +279,16 @@ function artifact(options = {}) {
 			version: 1,
 			required: options.revalidate ?? false,
 			dependencies: Object.freeze(['todos']),
-			models: Object.freeze([Todo.id]),
+			models: Object.freeze([model.id]),
 			relationships: Object.freeze(
 				operation === 'link' ||
 					operation === 'unlink' ||
 					operation === 'invalidate_relationship'
 					? [
 							Object.freeze({
-								sourceModel: Todo.id,
+								sourceModel: model.id,
 								field: 'related',
-								targetModel: Todo.id
+								targetModel: model.id
 							})
 						]
 					: []
@@ -323,10 +351,11 @@ function modeledArtifactWithAuditArm() {
 
 function deltaMutation(request, options = {}) {
 	const operation = options.operation ?? 'upsert';
+	const model = options.model ?? Todo;
 	const actualScope = scope({
 		type: 'string',
 		value: request.variables.input.id
-	});
+	}, model.id);
 	if (operation === 'upsert') {
 		return {
 			op: 'upsert',
@@ -366,11 +395,11 @@ function deltaMutation(request, options = {}) {
 			op: operation,
 			relationship: 'related',
 			source: actualScope,
-			target: scope({ type: 'string', value: 'target' })
+			target: scope({ type: 'string', value: 'target' }, model.id)
 		};
 	}
 	if (operation === 'invalidate_model') {
-		return { op: 'invalidate_model', partition: unit, model: Todo.id };
+		return { op: 'invalidate_model', partition: unit, model: model.id };
 	}
 	return {
 		op: 'invalidate_relationship',
@@ -397,7 +426,7 @@ function commandMetadata(request, options = {}) {
 		{ length: options.obligations ?? 1 },
 		(_, index) => ({
 			projectionRef: 0,
-			model: options.obligationModel ?? Todo.id,
+			model: options.obligationModel ?? options.model?.id ?? Todo.id,
 			scopeToken: token('projection-obligation', index + 3)
 		})
 	);
@@ -658,6 +687,214 @@ function token(purpose, byte) {
 function tick() {
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
+
+function commandFrame(artifactValue, rows, options = {}) {
+	const frame = todoFrame(artifactValue, rows, {
+		cacheScope: CACHE_SCOPE,
+		authorizationGeneration: 'auth-1',
+		position: options.position ?? '1',
+		source: options.source ?? 'query',
+		mode: options.mode ?? 'resumable',
+		reset: options.reset ?? false,
+		errors: options.errors
+	});
+	const snapshot = frame.extensions.distributed.snapshot;
+	snapshot.observations = options.observations ?? [];
+	if (options.recordRevision !== undefined || options.incarnation !== undefined) {
+		snapshot.records = snapshot.records.map((record) => ({
+			...record,
+			...(options.recordRevision === undefined
+				? {}
+				: { revision: options.recordRevision }),
+			...(options.incarnation === undefined
+				? {}
+				: { incarnation: options.incarnation })
+		}));
+	}
+	return frame;
+}
+
+function obligationObservation(receipt, overrides = {}) {
+	const expectation = receipt.metadata.expects[0];
+	assert.ok(expectation);
+	return {
+		causationId: receipt.metadata.causationId,
+		projection: expectation.projection,
+		model: expectation.model,
+		scopeToken: expectation.scopeToken,
+		...overrides
+	};
+}
+
+test('generated command runtime retains an accepted projection until a matching live observation', async () => {
+	let liveObserver;
+	const replica = createDistributedReplica({
+		transport: {
+			fetch() {
+				return Promise.reject(new Error('unexpected query fetch'));
+			},
+			subscribe(_request, observer) {
+				liveObserver = observer;
+				return () => undefined;
+			}
+		}
+	});
+	replica.writeResult(
+		CommandTodos,
+		{},
+		commandFrame(CommandTodos, [
+			{ id: 'todo-1', title: 'base', status: 'open' }
+		]),
+		'network'
+	);
+	const watch = replica.watch(CommandTodos, {}, { live: true });
+	assert.ok(liveObserver);
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{
+			dispatch(request) {
+				return Promise.resolve(
+					envelope(request, {
+						model: TodoModel,
+						actualTitle: 'server projection'
+					})
+				);
+			}
+		},
+		{ change: artifact({ model: TodoModel }) }
+	);
+	const receipt = await runtime.commands.change(
+		{ id: 'todo-1', title: 'optimistic' },
+		{ commandId: COMMAND_A }
+	);
+	assert.equal(receipt.metadata.expects[0].model, TodoModel.id);
+	assert.equal(watch.get().data.todos[0].title, 'server projection');
+	const assertOverlayRetained = () => {
+		assert.equal(watch.get().data.todos[0].title, 'server projection');
+		assert.throws(() => replica.createOptimisticLayer(COMMAND_A, () => undefined));
+	};
+
+	// A complete base frame without causal evidence must not retire the layer;
+	// the accepted projection remains the visible overlay.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'base update', status: 'open' }],
+			{ source: 'live', position: '2' }
+		)
+	);
+	assertOverlayRetained();
+
+	// Wrong-scope evidence is ignored even though the frame is otherwise fresh.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'wrong observation', status: 'open' }],
+			{
+				source: 'live',
+				position: '3',
+				observations: [
+					obligationObservation(receipt, {
+						scopeToken: token('projection-obligation', 99)
+					})
+				]
+			}
+		)
+	);
+	assertOverlayRetained();
+
+	// Causation identity is part of the proof; a different command cannot
+	// retire this command's accepted projection.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'wrong causation', status: 'open' }],
+			{
+				source: 'live',
+				position: '4',
+				observations: [
+					obligationObservation(receipt, {
+						causationId: 'cause:other-command'
+					})
+				]
+			}
+		)
+	);
+	assertOverlayRetained();
+
+	// Projection identity is equally strict; evidence from another projector
+	// is not an observation of this obligation.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'wrong projection', status: 'open' }],
+			{
+				source: 'live',
+				position: '5',
+				observations: [
+					obligationObservation(receipt, {
+						projection: 'other-projector'
+					})
+				]
+			}
+		)
+	);
+	assertOverlayRetained();
+
+	// A frame with a lower record revision but no causal observation remains
+	// unable to retire the layer. This intentionally tests only missing proof;
+	// it does not establish whether a matching observation is subject to record
+	// revision gating.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'insufficient revision', status: 'open' }],
+			{
+				source: 'live',
+				position: '4',
+				recordRevision: '1'
+			}
+		)
+	);
+	assertOverlayRetained();
+
+	// Likewise, an incarnation marker without a causal observation is not proof.
+	// This does not assert a revision or incarnation fence on a matching proof.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'stale incarnation', status: 'open' }],
+			{
+				source: 'live',
+				position: '5',
+				recordRevision: '5',
+				incarnation: '0'
+			}
+		)
+	);
+	assertOverlayRetained();
+
+	// Exact causal observation from the active comparable live frame retires the
+	// accepted layer. Its proof is the protocol identity tuple; record-clock
+	// reconciliation is a separate cache concern.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'confirmed', status: 'open' }],
+			{
+				source: 'live',
+				position: '6',
+				recordRevision: '6',
+				observations: [obligationObservation(receipt)]
+			}
+		)
+	);
+	assert.equal(watch.get().data.todos[0].title, 'confirmed');
+	assert.equal(replica.inspectRecord(TodoModel, 'todo-1').revision, '6');
+	assert.equal((await receipt.projected).state, 'atomic');
+	runtime.dispose();
+	watch.destroy();
+});
 
 test('artifact v1 is rejected at the public boundary', () => {
 	assert.throws(

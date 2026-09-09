@@ -1030,6 +1030,175 @@ fn zero_occurrence_metadata_is_classified_from_the_current_causal_command_contra
     assert_eq!(draining_command["expects"], serde_json::json!([]));
 }
 
+#[cfg(feature = "graphql")]
+fn wait_path_fixture() -> (
+    crate::graphql::protocol::ProtocolResponseAccumulator,
+    crate::command::TypedCommandContract,
+    crate::OutboxMessage,
+) {
+    use std::sync::Arc;
+
+    use super::runtime::{ProtocolProjectionProgramRegistry, ProtocolProjectionRequestSeed};
+    use crate::graphql::protocol::{
+        DistributedEnvelopeV1, ProtocolResponseAccumulator, ProtocolTokenCodec,
+        ProtocolTokenPurpose,
+    };
+
+    let fixture = modeled_fixture(
+        ProjectionBindingState::Active,
+        ProjectionExecutionClass::Causal,
+    );
+    let registry =
+        Arc::new(ProtocolProjectionProgramRegistry::try_from_surface(&fixture.surface).unwrap());
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let seed = ProtocolProjectionRequestSeed::new(
+        selected_export(&fixture.surface),
+        registry,
+        crate::command_ledger::PrincipalPartitionId::new("wait-path-principal").unwrap(),
+        "wait-path-generation",
+        Vec::new(),
+        now_unix_ms,
+    )
+    .unwrap();
+    let codec = ProtocolTokenCodec::new([0x70; 32]);
+    let cache_scope = codec
+        .issue(ProtocolTokenPurpose::CacheScope, &("wait-path", "cache"))
+        .unwrap();
+    let accumulator = ProtocolResponseAccumulator::new(
+        DistributedEnvelopeV1::new("sha256:wait-path", "wait-path-auth", cache_scope, None),
+        codec,
+    );
+    accumulator.bind_projection_request(seed).unwrap();
+    let occurrence = state_occurrence(13, "todo-wait-path", "wait-path");
+    let event = crate::OutboxMessage::from_domain_event_occurrence(&occurrence).unwrap();
+    let contract = crate::command::typed_command::<
+        ModeledCommandInput,
+        crate::command::Eventual<ModeledCommandOutput>,
+    >(TEST_COMMAND_NAME)
+    .roles(["delta-user"])
+    .emits(crate::command::__command_projection_events([Ok(
+        event_descriptor(),
+    )]))
+    .into_contract();
+    (accumulator, contract, event)
+}
+
+#[test]
+#[cfg(feature = "graphql")]
+fn wait_path_sealing_retains_event_obligations_and_status_stays_pending_without_observation() {
+    use crate::command::CommandConsistency;
+    use crate::command_ledger::CommandLedgerState;
+    use crate::microsvc::{
+        CausalCommandPublicState, CausalCommandReceiptSource, CausalDispatchResult,
+    };
+
+    let (protocol, contract, event) = wait_path_fixture();
+    let result = CausalDispatchResult {
+        payload: json!({"accepted": true}),
+        receipt: CausalCommandReceiptSource {
+            command_id: "wait-path-command".into(),
+            command_name: String::new(),
+            causation_id: String::new(),
+            consistency: CommandConsistency::Eventual,
+            state: CommandLedgerState::Succeeded,
+            outcome: json!({"accepted": true}),
+            obligations: Vec::new(),
+            projection_metadata: None,
+            direct_projection: None,
+        },
+        projection_events: vec![event],
+    };
+
+    let result = result
+        .seal_wait_path_protocol(&protocol, &contract, Duration::from_secs(60))
+        .unwrap();
+    let metadata = result
+        .receipt
+        .projection_metadata
+        .as_ref()
+        .expect("an emitted modeled event must retain its exact metadata");
+    assert_eq!(metadata.obligations.len(), 1);
+    assert_eq!(metadata.obligations[0].projection_ref, 0);
+    assert_eq!(metadata.obligations[0].model, "TodoView");
+    assert!(metadata.obligations[0]
+        .scope_token
+        .as_str()
+        .starts_with("v1.projection-obligation."));
+    assert_eq!(result.receipt.state, CommandLedgerState::Succeeded);
+
+    let status = result.public_status();
+    assert_eq!(status.state, CausalCommandPublicState::Succeeded);
+    assert!(status.evidence.is_empty());
+    assert_eq!(
+        status
+            .projection_metadata
+            .as_ref()
+            .expect("status must carry modeled metadata")
+            .obligations
+            .len(),
+        1
+    );
+
+    protocol.record_status(&status).unwrap();
+    let command = serde_json::to_value(protocol.snapshot().unwrap()).unwrap()["command"].clone();
+    assert_eq!(command["state"], "succeeded");
+    assert_eq!(command["expects"].as_array().unwrap().len(), 1);
+    assert!(command.get("observations").is_none());
+}
+
+#[test]
+#[cfg(feature = "graphql")]
+fn wait_path_sealing_keeps_atomic_and_unselected_commands_without_metadata() {
+    use crate::command::CommandConsistency;
+    use crate::command_ledger::CommandLedgerState;
+    use crate::microsvc::{CausalCommandReceiptSource, CausalDispatchResult};
+
+    let (protocol, contract, event) = wait_path_fixture();
+    let result_for = |contract: crate::command::TypedCommandContract,
+                      events: Vec<crate::OutboxMessage>|
+     -> CausalDispatchResult {
+        CausalDispatchResult {
+            payload: json!({"accepted": true}),
+            receipt: CausalCommandReceiptSource {
+                command_id: "wait-path-bypass".into(),
+                command_name: String::new(),
+                causation_id: String::new(),
+                consistency: CommandConsistency::Eventual,
+                state: CommandLedgerState::Succeeded,
+                outcome: json!({"accepted": true}),
+                obligations: Vec::new(),
+                projection_metadata: None,
+                direct_projection: None,
+            },
+            projection_events: events,
+        }
+        .seal_wait_path_protocol(&protocol, &contract, Duration::from_secs(60))
+        .unwrap()
+    };
+
+    let mut atomic_contract = contract.clone();
+    atomic_contract.consistency = CommandConsistency::Atomic;
+    let atomic = result_for(atomic_contract, vec![event.clone()]);
+    assert_eq!(atomic.receipt.consistency, CommandConsistency::Atomic);
+    assert!(atomic.receipt.projection_metadata.is_none());
+    assert_eq!(atomic.receipt.state, CommandLedgerState::Succeeded);
+
+    let mut unselected_contract = contract.clone();
+    unselected_contract.projections.selectors.clear();
+    let unselected = result_for(unselected_contract, vec![event.clone()]);
+    assert_eq!(unselected.receipt.consistency, CommandConsistency::Eventual);
+    assert!(unselected.receipt.projection_metadata.is_none());
+    assert_eq!(unselected.receipt.state, CommandLedgerState::Succeeded);
+
+    let no_events = result_for(contract, Vec::new());
+    assert_eq!(no_events.receipt.consistency, CommandConsistency::Eventual);
+    assert!(no_events.receipt.projection_metadata.is_none());
+    assert_eq!(no_events.receipt.state, CommandLedgerState::Succeeded);
+}
+
 #[test]
 #[cfg(feature = "graphql")]
 fn opaque_fallback_hint_does_not_hide_empty_draining_modeled_work() {
