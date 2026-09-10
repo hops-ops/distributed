@@ -683,6 +683,7 @@ impl InMemoryProjectionProtocolState {
             scope: pending.scope,
             revision: pending.revision,
             failure_id: pending.failure_id,
+            program_id: pending.program_id,
         };
         partition.change_head = position;
         partition.changes.insert(position, change.clone());

@@ -136,6 +136,7 @@ fn direct_projection_evidence(marker: &str) -> SameTransactionProjectionEvidence
         scope: Some(scope.clone()),
         revision: Some(revision.clone()),
         failure_id: None,
+        program_id: None,
     };
     let observation = ProjectionObservation {
         causation_id: format!("cause:{marker}"),
@@ -143,6 +144,7 @@ fn direct_projection_evidence(marker: &str) -> SameTransactionProjectionEvidence
         revision: Some(revision),
         scope,
         change: cursor,
+        program_id: None,
     };
     SameTransactionProjectionEvidence {
         records: vec![record],

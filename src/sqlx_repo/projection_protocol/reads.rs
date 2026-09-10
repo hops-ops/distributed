@@ -176,6 +176,10 @@ where
     let failure_id: Option<String> = row
         .try_get("failure_id")
         .map_err(|error| protocol_storage_error::<DB>("decode change failure ID", error))?;
+    let program_id =
+        decode_program_id(row.try_get("program_id").map_err(|error| {
+            protocol_storage_error::<DB>("decode change program identity", error)
+        })?)?;
 
     let scope = match (model_name, key_bytes, key_hash) {
         (Some(model), Some(bytes), Some(hash)) => {
@@ -253,6 +257,7 @@ where
         scope,
         revision,
         failure_id,
+        program_id,
     })
 }
 
@@ -365,6 +370,11 @@ where
         Some(staged.scope.clone()),
         Some(revision.clone()),
         None,
+        batch
+            .ownership
+            .iter()
+            .find(|ownership| ownership.model == staged.scope.model())
+            .and_then(|ownership| ownership.program_id),
     )?;
     let metadata = ProjectionRecordMetadata {
         source_snapshot: None,
@@ -398,6 +408,11 @@ where
         scope: staged.scope.clone(),
         revision: Some(revision),
         change: change.cursor.clone(),
+        program_id: batch
+            .ownership
+            .iter()
+            .find(|ownership| ownership.model == staged.scope.model())
+            .and_then(|ownership| ownership.program_id),
     };
 
     apply_read_model_write_plan_in_tx(tx, write_plan).await?;
@@ -1317,7 +1332,8 @@ where
          observation.scope_kind AS evidence_scope_kind, \
          observation.canonical_key_bytes, observation.canonical_key_hash, \
          observation.incarnation, observation.revision, observation.change_epoch, \
-         observation.change_position, partition.topology_bytes AS evidence_topology_bytes, \
+         observation.change_position, observation.program_id, \
+         partition.topology_bytes AS evidence_topology_bytes, \
          partition.partition_bytes AS evidence_partition_bytes, \
          partition.change_epoch AS evidence_partition_epoch, \
          partition.change_head AS evidence_partition_head \
@@ -1624,7 +1640,7 @@ where
          observation.causation_id, observation.model_name, observation.scope_kind, \
          observation.canonical_key_bytes, observation.canonical_key_hash, \
          observation.incarnation, observation.revision, observation.change_epoch, \
-         observation.change_position, partition.topology_bytes, \
+         observation.change_position, observation.program_id, partition.topology_bytes, \
          partition.partition_bytes, partition.change_epoch AS partition_change_epoch, \
          partition.change_head AS partition_change_head \
          FROM projection_observations observation \
@@ -2258,7 +2274,7 @@ where
     let mut builder = QueryBuilder::<DB>::new(
         "SELECT change_epoch, change_position, change_kind, causation_id, model_name, \
          scope_kind, canonical_key_bytes, canonical_key_hash, incarnation, revision, \
-         failure_id FROM projection_changes WHERE topology_hash = ",
+         failure_id, program_id FROM projection_changes WHERE topology_hash = ",
     );
     builder.push_bind(topology_hash.as_slice());
     builder.push(" AND partition_hash = ");

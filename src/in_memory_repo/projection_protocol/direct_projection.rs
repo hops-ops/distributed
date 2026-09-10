@@ -70,6 +70,11 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
             scope: Some(mutation.scope.clone()),
             revision: Some(revision.clone()),
             failure_id: None,
+            program_id: batch
+                .ownership
+                .iter()
+                .find(|ownership| ownership.model == mutation.scope.model())
+                .and_then(|ownership| ownership.program_id),
         },
     )?;
     let metadata = ProjectionRecordMetadata {
@@ -111,6 +116,7 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
         revision: Some(revision),
         scope: mutation.scope.clone(),
         change: change.cursor.clone(),
+        program_id: change.program_id,
     };
     protocol
         .observations

@@ -392,6 +392,10 @@ impl ResolvedDirectProjectionTarget {
             )
             .map_err(|error| ProjectionProtocolError::InvalidBatch(error.to_string()))?;
         let ownership = ProjectionModelOwnership::new(self.model, self.table)?;
+        let ownership = self
+            .modeled_program_id
+            .map(|program_id| ownership.clone().with_program_id(program_id))
+            .unwrap_or(ownership);
         SameTransactionProjectionBatch::single_upsert(
             self.codec.topology().clone(),
             self.partition,

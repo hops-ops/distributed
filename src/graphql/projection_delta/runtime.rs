@@ -259,6 +259,14 @@ impl ProtocolProjectionRequestSeed {
                 if candidate.causation_id != causation_id
                     || candidate.scope.topology() != entry.codec.topology()
                     || candidate.scope.model() != obligation.model
+                    // A modeled observation is proof for the exact semantic
+                    // program that authored it. Physical projector names are
+                    // shared across deployments and cannot establish this
+                    // identity after an upgrade or cold restart. Legacy
+                    // observations have no program ID and remain readable,
+                    // but cannot satisfy a modeled obligation.
+                    || candidate.program_id.map(|id| id.to_string())
+                        != Some(identity.program_id.clone())
                     || !entry
                         .binding
                         .outputs()

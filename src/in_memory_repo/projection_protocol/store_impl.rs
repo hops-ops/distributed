@@ -216,6 +216,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         scope: Some(mutation.scope.clone()),
                         revision: Some(revision.clone()),
                         failure_id: None,
+                        program_id: batch
+                            .ownership
+                            .iter()
+                            .find(|ownership| ownership.model == mutation.scope.model())
+                            .and_then(|ownership| ownership.program_id),
                     },
                 )?;
                 let metadata = ProjectionRecordMetadata {
@@ -298,6 +303,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 if staged_protocol.observations.contains_key(&observation_key) {
                     continue;
                 }
+                let program_id = batch
+                    .ownership
+                    .iter()
+                    .find(|ownership| ownership.model == scope.model())
+                    .and_then(|ownership| ownership.program_id);
                 let change_cursor = match staged_change {
                     Some(cursor) => cursor,
                     None => {
@@ -310,6 +320,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                                 scope: Some(scope.clone()),
                                 revision: revision.clone(),
                                 failure_id: None,
+                                program_id,
                             },
                         )?;
                         let cursor = change.cursor.clone();
@@ -323,6 +334,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     revision,
                     scope,
                     change: change_cursor,
+                    program_id,
                 };
                 staged_protocol
                     .observations
@@ -339,6 +351,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         scope: None,
                         revision: None,
                         failure_id: None,
+                        program_id: None,
                     },
                 )?);
             }
@@ -514,6 +527,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     scope: None,
                     revision: None,
                     failure_id: Some(batch.failure_id.clone()),
+                    program_id: None,
                 },
             )?;
             let failure = ProjectionFailure {

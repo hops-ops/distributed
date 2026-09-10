@@ -51,6 +51,7 @@ use crate::table::{
     validate_row_values, RowKey, RowValues, TableMutation, TableSchema, TableStoreError,
     TableWritePlan,
 };
+use crate::ProjectionProgramId;
 
 mod helpers;
 mod identity;

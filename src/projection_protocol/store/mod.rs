@@ -31,6 +31,7 @@ use crate::repository::{InboxReceipt, RepositoryError};
 use crate::table::{
     RowKey, RowValues, TableMutation, TableSchema, TableStoreError, TableWritePlan,
 };
+use crate::ProjectionProgramId;
 
 mod backend_helpers;
 mod commit;

@@ -191,6 +191,13 @@ pub(crate) enum ProjectionInputDisposition {
 pub(crate) struct ProjectionModelOwnership {
     pub(crate) model: String,
     pub(crate) table: String,
+    /// Semantic author identity for a commit carrying this ownership.
+    ///
+    /// Bootstrap declarations leave this unset. A modeled projector attaches
+    /// its immutable program identity when sealing a commit; the adapter
+    /// persists that identity on each change/observation rather than changing
+    /// an existing ownership row retroactively.
+    pub(crate) program_id: Option<ProjectionProgramId>,
 }
 
 impl ProjectionModelOwnership {
@@ -201,7 +208,13 @@ impl ProjectionModelOwnership {
         Ok(Self {
             model: bounded_name("projection model", model, 255)?,
             table: bounded_name("projection table", table, 255)?,
+            program_id: None,
         })
+    }
+
+    pub(crate) fn with_program_id(mut self, program_id: ProjectionProgramId) -> Self {
+        self.program_id = Some(program_id);
+        self
     }
 }
 

@@ -686,6 +686,10 @@ pub struct ProjectionObservation {
     /// Canonical dependency scope when no record revision exists.
     pub scope: ProjectionRecordScope,
     pub change: ProjectionChangeCursor,
+    /// Semantic program identity recorded by the projector that authored this
+    /// observation. `None` is legacy/unversioned evidence and cannot satisfy a
+    /// modeled causal obligation.
+    pub program_id: Option<crate::ProjectionProgramId>,
 }
 
 /// Durable terminal failure for one exact input and repair generation.
@@ -753,6 +757,9 @@ pub struct ProjectionChange {
     pub scope: Option<ProjectionRecordScope>,
     pub revision: Option<RecordRevision>,
     pub failure_id: Option<String>,
+    /// Semantic program identity recorded at commit time. It is deliberately
+    /// independent from the currently active projector binding.
+    pub program_id: Option<crate::ProjectionProgramId>,
 }
 
 /// Result and exact evidence produced by an asynchronous projection commit.

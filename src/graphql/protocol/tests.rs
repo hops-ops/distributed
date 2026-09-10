@@ -159,6 +159,7 @@ fn direct_projected_receipt() -> CausalCommandReceiptSource {
             scope: Some(scope.clone()),
             revision: Some(revision.clone()),
             failure_id: None,
+            program_id: None,
         }],
         observations: vec![ProjectionObservation {
             causation_id: receipt.causation_id.clone(),
@@ -166,6 +167,7 @@ fn direct_projected_receipt() -> CausalCommandReceiptSource {
             revision: Some(revision),
             scope,
             change,
+            program_id: None,
         }],
     });
     receipt

@@ -1794,6 +1794,7 @@ async fn lengthening_retention_never_restores_a_compacted_prefix() {
                 scope: None,
                 revision: None,
                 failure_id: None,
+                program_id: None,
             }],
         }
     );

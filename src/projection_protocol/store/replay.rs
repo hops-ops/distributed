@@ -162,6 +162,8 @@ struct ReplayChange {
     scope: Option<ReplayScope>,
     revision: Option<ReplayRevision>,
     failure_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    program_id: Option<String>,
 }
 
 impl From<&ProjectionChange> for ReplayChange {
@@ -176,6 +178,7 @@ impl From<&ProjectionChange> for ReplayChange {
             scope: change.scope.as_ref().map(ReplayScope::from),
             revision: change.revision.as_ref().map(ReplayRevision::from),
             failure_id: change.failure_id.clone(),
+            program_id: change.program_id.map(|program_id| program_id.to_string()),
         }
     }
 }
@@ -188,6 +191,8 @@ struct ReplayObservation {
     revision: Option<ReplayRevision>,
     scope: ReplayScope,
     change: ReplayCursor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    program_id: Option<String>,
 }
 
 impl From<&ProjectionObservation> for ReplayObservation {
@@ -198,6 +203,9 @@ impl From<&ProjectionObservation> for ReplayObservation {
             revision: observation.revision.as_ref().map(ReplayRevision::from),
             scope: ReplayScope::from(&observation.scope),
             change: ReplayCursor::from(&observation.change),
+            program_id: observation
+                .program_id
+                .map(|program_id| program_id.to_string()),
         }
     }
 }
@@ -316,6 +324,12 @@ impl ReplayChange {
                         .map_err(|error| replay_validation_error("change failure ID", error))
                 })
                 .transpose()?,
+            program_id: self
+                .program_id
+                .as_deref()
+                .map(ProjectionProgramId::parse)
+                .transpose()
+                .map_err(|error| replay_validation_error("change program ID", error))?,
         })
     }
 }
@@ -336,6 +350,12 @@ impl ReplayObservation {
                 .transpose()?,
             scope: self.scope.into_scope()?,
             change: self.change.into_cursor()?,
+            program_id: self
+                .program_id
+                .as_deref()
+                .map(ProjectionProgramId::parse)
+                .transpose()
+                .map_err(|error| replay_validation_error("observation program ID", error))?,
         })
     }
 }
@@ -466,6 +486,12 @@ fn validate_same_transaction_replay_evidence(
     if observation.change != change.cursor || observation.causation_id != change.causation_id {
         return Err(
             "direct projection evidence observation does not match its record change".into(),
+        );
+    }
+    if observation.program_id != change.program_id {
+        return Err(
+            "direct projection evidence observation and change program identities do not match"
+                .into(),
         );
     }
     Ok(())

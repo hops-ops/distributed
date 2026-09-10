@@ -21,6 +21,7 @@ use crate::table::{
     DeleteTableRowMutation, ExpectedVersion, PatchMode, PatchTableRowMutation, RowKey, RowPatch,
     RowWriteMode, TableMutation, TableRowMutation, TableSchema,
 };
+use crate::ProjectionProgramId;
 
 /// Typed, commit-less workspace passed to a causal projector handler.
 ///
@@ -33,6 +34,7 @@ pub struct ProjectionWorkspace {
     partition_value: Option<serde_json::Value>,
     input: TrustedProjectionInput,
     change_epoch: ProjectionEpoch,
+    program_id: Option<ProjectionProgramId>,
     ownership: BTreeMap<String, String>,
     mutations: Vec<ProjectionRecordMutation>,
     observations: Vec<ProjectionObservationRequest>,
@@ -45,6 +47,16 @@ impl ProjectionWorkspace {
         partition_value: Option<serde_json::Value>,
         input: TrustedProjectionInput,
         change_epoch: ProjectionEpoch,
+    ) -> Result<Self, ProjectionProtocolError> {
+        Self::new_with_program_id(codec, partition_value, input, change_epoch, None)
+    }
+
+    pub(crate) fn new_with_program_id(
+        codec: Arc<ProjectionScopeCodec>,
+        partition_value: Option<serde_json::Value>,
+        input: TrustedProjectionInput,
+        change_epoch: ProjectionEpoch,
+        program_id: Option<ProjectionProgramId>,
     ) -> Result<Self, ProjectionProtocolError> {
         if codec.topology() != input.cursor.topology() {
             return Err(ProjectionProtocolError::ScopeMismatch {
@@ -64,6 +76,7 @@ impl ProjectionWorkspace {
             partition_value,
             input,
             change_epoch,
+            program_id,
             ownership: BTreeMap::new(),
             mutations: Vec::new(),
             observations: Vec::new(),
@@ -367,7 +380,13 @@ impl ProjectionWorkspace {
     ) -> Result<Vec<ProjectionModelOwnership>, ProjectionProtocolError> {
         self.ownership
             .iter()
-            .map(|(model, table)| ProjectionModelOwnership::new(model.clone(), table.clone()))
+            .map(|(model, table)| {
+                let ownership = ProjectionModelOwnership::new(model.clone(), table.clone())?;
+                Ok(self
+                    .program_id
+                    .map(|program_id| ownership.clone().with_program_id(program_id))
+                    .unwrap_or(ownership))
+            })
             .collect()
     }
 
