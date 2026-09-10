@@ -68,16 +68,7 @@
 	});
 
 	function applyPageData(next: SveltekitDistributedPageData) {
-		const diagnostics = globalThis as typeof globalThis & Record<string, unknown>;
-		const previousSourceOrigin = diagnostics.__distributedSessionSourceOrigin;
-		if (diagnostics.__captureReplicaDiagnostics === true) {
-			diagnostics.__distributedSessionSourceOrigin = 'sveltekit-data';
-		}
-		try {
-			pageData.set(next);
-		} finally {
-			diagnostics.__distributedSessionSourceOrigin = previousSourceOrigin;
-		}
+		pageData.set(next);
 		if (
 			next.distributed === undefined ||
 			next.distributedAuthority === undefined ||

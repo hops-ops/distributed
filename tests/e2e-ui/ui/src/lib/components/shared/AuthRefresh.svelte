@@ -13,48 +13,6 @@
 	let refreshTimer: number | undefined;
 	let retryTimer: number | undefined;
 
-	function traceRefresh(event: Readonly<Record<string, unknown>>) {
-		const maxEvents = 64;
-		const diagnostics = globalThis as typeof globalThis & {
-			__captureReplicaDiagnostics?: unknown;
-			__distributedRefreshTrace?: unknown;
-		};
-		if (diagnostics.__captureReplicaDiagnostics !== true) return;
-		if (!Array.isArray(diagnostics.__distributedRefreshTrace)) {
-			diagnostics.__distributedRefreshTrace = [];
-		}
-		const trace = diagnostics.__distributedRefreshTrace as unknown[];
-		trace.push({
-			time: performance.now(),
-			...event
-		});
-		if (trace.length > maxEvents) trace.splice(0, trace.length - maxEvents);
-	}
-
-	function withSessionSource<T>(origin: string, action: () => T): T {
-		const diagnostics = globalThis as typeof globalThis & {
-			__captureReplicaDiagnostics?: unknown;
-			__distributedSessionSourceOrigin?: unknown;
-		};
-		if (diagnostics.__captureReplicaDiagnostics !== true) return action();
-		const previous = diagnostics.__distributedSessionSourceOrigin;
-		diagnostics.__distributedSessionSourceOrigin = origin;
-		try {
-			return action();
-		} finally {
-			diagnostics.__distributedSessionSourceOrigin = previous;
-		}
-	}
-
-	function credentialOrdinal(value: unknown): number | undefined {
-		const diagnostics = globalThis as typeof globalThis & {
-			__distributedSessionCredentialOrdinal?: unknown;
-		};
-		return typeof diagnostics.__distributedSessionCredentialOrdinal === 'function'
-			? (diagnostics.__distributedSessionCredentialOrdinal as (value: unknown) => number | undefined)(value)
-			: undefined;
-	}
-
 	function clearTimers() {
 		if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
 		if (retryTimer !== undefined) window.clearTimeout(retryTimer);
@@ -64,7 +22,6 @@
 
 	async function refreshSession() {
 		try {
-			traceRefresh({ kind: 'refresh-start' });
 			const response = await fetch('/api/auth/refresh', {
 				method: 'POST',
 				credentials: 'same-origin',
@@ -81,24 +38,11 @@
 
 			if (response.ok) {
 				const result = await response.json();
-				traceRefresh({
-					kind: 'refresh-response',
-					status: response.status,
-					hasPageData: Boolean(result.pageData),
-					hasDistributed: result.pageData?.distributed !== undefined,
-					hasAuthority: result.pageData?.distributedAuthority !== undefined,
-					credentialOrdinal: credentialOrdinal(result.pageData)
-				});
-				if (result.pageData) {
-					withSessionSource('refresh-response', () => onRefresh(result.pageData));
-				}
-				if (result.pageData) traceRefresh({ kind: 'refresh-seed-applied' });
+				if (result.pageData) onRefresh(result.pageData);
 			}
 
 			if (response.ok || response.status === 401) {
-				traceRefresh({ kind: 'invalidate-all-start', status: response.status });
 				await invalidateAll();
-				traceRefresh({ kind: 'invalidate-all-complete', status: response.status });
 				return;
 			}
 		} catch (error) {

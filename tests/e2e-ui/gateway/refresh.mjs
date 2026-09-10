@@ -59,10 +59,6 @@ export async function verifySessionRefreshContinuity(page, origin) {
       const lost = await page.evaluate(()=>globalThis.__refreshContinuity.lost);
       if (lost) {
         console.error('Redacted refresh replica diagnostics:', JSON.stringify(await page.evaluate(()=>globalThis.__replicaDiagnosticSnapshot?.())));
-        console.error('Redacted refresh lifecycle trace:', JSON.stringify(await page.evaluate(() => ({
-          refresh: globalThis.__distributedRefreshTrace ?? [],
-          session: globalThis.__distributedSessionTrace ?? []
-        }))));
       }
       assert.equal(lost,false,route+' rows were removed during token refresh: '+JSON.stringify(await page.evaluate(()=>globalThis.__refreshContinuity.events)));
     } finally {
