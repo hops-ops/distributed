@@ -920,6 +920,107 @@ test('lifecycle generation writes only to the immutable candidate stage', async 
 	);
 });
 
+test('lifecycle compiler uses the initiating absolute CLI over an older PATH binary', async (t) => {
+	const { root, script, log } = await fixture(t);
+	const pathRoot = join(root, 'cli with spaces');
+	const cli = join(pathRoot, 'distributed');
+	const oldPathLog = join(root, 'old-path.log');
+	await mkdir(pathRoot, { recursive: true });
+	await symlink(process.execPath, cli);
+	const oldPath = join(root, 'older-path-bin');
+	await mkdir(oldPath, { recursive: true });
+	const oldDistributed = join(oldPath, 'distributed');
+	await writeFile(
+		oldDistributed,
+		`#!/bin/sh\nprintf '%s\\n' "$*" >> "${oldPathLog}"\nprintf '%s\\n' 'older distributed executable selected' >&2\nexit 91\n`,
+		{ encoding: 'utf8', mode: 0o755 }
+	);
+	const previousPath = process.env.PATH;
+	const previousCli = process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE;
+	const previousLifecycleRoot = process.env.DISTRIBUTED_LIFECYCLE_ROOT;
+	const previousLifecycleStage = process.env.DISTRIBUTED_LIFECYCLE_STAGE;
+	process.env.PATH = `${oldPath}${process.platform === 'win32' ? ';' : ':'}${previousPath ?? ''}`;
+	process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE = cli;
+	process.env.DISTRIBUTED_LIFECYCLE_ROOT = root;
+	process.env.DISTRIBUTED_LIFECYCLE_STAGE = join(root, '.distributed/lifecycle-stage');
+	await mkdir(join(root, '.distributed/lifecycle-stage'), { recursive: true });
+	t.after(() => {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		if (previousCli === undefined) delete process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE;
+		else process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE = previousCli;
+		if (previousLifecycleRoot === undefined) delete process.env.DISTRIBUTED_LIFECYCLE_ROOT;
+		else process.env.DISTRIBUTED_LIFECYCLE_ROOT = previousLifecycleRoot;
+		if (previousLifecycleStage === undefined) delete process.env.DISTRIBUTED_LIFECYCLE_STAGE;
+		else process.env.DISTRIBUTED_LIFECYCLE_STAGE = previousLifecycleStage;
+	});
+
+	await generateDistributedSvelteKitLifecycle(
+		{
+			cwd: root,
+			command: oldDistributed,
+			commandArgs: [script],
+			clients: clients()
+		},
+		{ projectRoot: root, stage: join(root, '.distributed/lifecycle-stage') }
+	);
+
+	assert.deepEqual(
+		(await commandLog(log)).map((args) => args[0]),
+		['client-manifest', 'client', 'client-manifest', 'client']
+	);
+	await assert.rejects(readFile(oldPathLog), (error) => error?.code === 'ENOENT');
+});
+
+test('lifecycle compiler fails closed when its initiating CLI identity is missing or relative', async (t) => {
+	const { root, script } = await fixture(t);
+	const stage = join(root, '.distributed/lifecycle-stage');
+	await mkdir(stage, { recursive: true });
+	const previousCli = process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE;
+	const previousClientOwnership = process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE;
+	const previousLifecycleRoot = process.env.DISTRIBUTED_LIFECYCLE_ROOT;
+	const previousLifecycleStage = process.env.DISTRIBUTED_LIFECYCLE_STAGE;
+	process.env.DISTRIBUTED_LIFECYCLE_ROOT = root;
+	process.env.DISTRIBUTED_LIFECYCLE_STAGE = stage;
+	t.after(() => {
+		if (previousCli === undefined) delete process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE;
+		else process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE = previousCli;
+		if (previousLifecycleRoot === undefined) delete process.env.DISTRIBUTED_LIFECYCLE_ROOT;
+		else process.env.DISTRIBUTED_LIFECYCLE_ROOT = previousLifecycleRoot;
+		if (previousLifecycleStage === undefined) delete process.env.DISTRIBUTED_LIFECYCLE_STAGE;
+		else process.env.DISTRIBUTED_LIFECYCLE_STAGE = previousLifecycleStage;
+		if (previousClientOwnership === undefined) delete process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE;
+		else process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE = previousClientOwnership;
+	});
+	process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE = '1';
+	delete process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE;
+	await assert.rejects(
+		generateDistributedSvelteKitLifecycle(
+			{ cwd: root, command: process.execPath, commandArgs: [script], clients: clients() },
+			{ projectRoot: root, stage }
+		),
+		/requires an absolute initiating executable identity/
+	);
+	delete process.env.DISTRIBUTED_LIFECYCLE_ROOT;
+	delete process.env.DISTRIBUTED_LIFECYCLE_STAGE;
+	await assert.rejects(
+		generateDistributedSvelteKit(
+			{ cwd: root, command: process.execPath, commandArgs: [script], clients: clients() }
+		),
+		/requires an absolute initiating executable identity/
+	);
+	process.env.DISTRIBUTED_LIFECYCLE_ROOT = root;
+	process.env.DISTRIBUTED_LIFECYCLE_STAGE = stage;
+	process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE = 'relative/distributed';
+	await assert.rejects(
+		generateDistributedSvelteKitLifecycle(
+			{ cwd: root, command: process.execPath, commandArgs: [script], clients: clients() },
+			{ projectRoot: root, stage }
+		),
+		/requires an absolute initiating executable identity/
+	);
+});
+
 test('Vite compiles and resolves isolated user/admin physical entrypoints', async (t) => {
 	const { root, script, log } = await fixture(t);
 	const options = pluginOptions(root, script);
@@ -1109,6 +1210,7 @@ test('supervised Vite defers generated-client compilation to the lifecycle', asy
 	t.after(() => rm(lifecycleRoot, { recursive: true, force: true }));
 	const previousLifecycle = process.env.DISTRIBUTED_LIFECYCLE_DIR;
 	const previousClientOwnership = process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE;
+	const previousCliExecutable = process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE;
 	const previousProjectRoot = process.env.DISTRIBUTED_LIFECYCLE_PROJECT_ROOT;
 	const generation = `sha256:${'a'.repeat(64)}`;
 	const activePointer = join(lifecycleRoot, 'active.json');
@@ -1125,6 +1227,7 @@ test('supervised Vite defers generated-client compilation to the lifecycle', asy
 	);
 	process.env.DISTRIBUTED_LIFECYCLE_DIR = lifecycleRoot;
 	process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE = '1';
+	process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE = process.execPath;
 	process.env.DISTRIBUTED_LIFECYCLE_PROJECT_ROOT = root;
 	t.after(() => {
 		if (previousLifecycle === undefined) {
@@ -1136,6 +1239,11 @@ test('supervised Vite defers generated-client compilation to the lifecycle', asy
 			delete process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE;
 		} else {
 			process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE = previousClientOwnership;
+		}
+		if (previousCliExecutable === undefined) {
+			delete process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE;
+		} else {
+			process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE = previousCliExecutable;
 		}
 		if (previousProjectRoot === undefined) {
 			delete process.env.DISTRIBUTED_LIFECYCLE_PROJECT_ROOT;

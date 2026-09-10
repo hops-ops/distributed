@@ -1074,7 +1074,7 @@ fn run_project_ui_script(
     if if_present {
         command.arg("--if-present");
     }
-    let status = command
+    command
         .current_dir(ui_root)
         .env("DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE", "1")
         .env("DISTRIBUTED_LIFECYCLE_PROJECT_ROOT", &project.plan.root)
@@ -1082,8 +1082,11 @@ fn run_project_ui_script(
         .env(
             "DISTRIBUTED_LIFECYCLE_GENERATION_ID",
             &generation.generation_id,
-        )
-        .status()?;
+        );
+    if let Some(executable) = project.plan.cli_executable.as_deref() {
+        command.env(crate::lifecycle::LIFECYCLE_CLI_EXECUTABLE_ENV, executable);
+    }
+    let status = command.status()?;
     if !status.success() {
         return Err(format!("SvelteKit UI `{script}` failed with {status}").into());
     }

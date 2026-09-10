@@ -61,6 +61,7 @@ const MODULE_NAME = /^\$distributed(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/;
 const COMPILER_LOCK = join('.svelte-kit', 'distributed', 'compiler.lock');
 const GENERATION_META = 'distributed-generation';
 const MAX_LIFECYCLE_STATE_BYTES = 1024 * 1024;
+const LIFECYCLE_CLI_EXECUTABLE_ENV = 'DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE';
 const COMPILER_COORDINATORS = Symbol.for(
 	'@hops-ops/distributed/sveltekit/compiler-coordinators/v1'
 );
@@ -951,7 +952,39 @@ function resolveIntegration(
 		throw new TypeError('distributedSvelteKit requires configuration');
 	}
 	const cwd = resolve(options.cwd ?? fallbackCwd);
-	const command = (options.command ?? 'distributed').trim();
+	const lifecycleExecutable = process.env[LIFECYCLE_CLI_EXECUTABLE_ENV];
+	const lifecycleRoot = process.env.DISTRIBUTED_LIFECYCLE_ROOT;
+	const lifecycleStage = process.env.DISTRIBUTED_LIFECYCLE_STAGE;
+	const hasLifecycleStage = lifecycleRoot !== undefined || lifecycleStage !== undefined;
+	const hasLifecycleOwnership =
+		process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE === '1';
+	const lifecycleContext = hasLifecycleStage || hasLifecycleOwnership;
+	const validLifecyclePath = (value: string | undefined): value is string =>
+		value !== undefined &&
+		value.length > 0 &&
+		value === value.trim() &&
+		isAbsolute(value) &&
+		!/[\u0000-\u001f\u007f]/.test(value);
+	let command: string;
+	if (lifecycleContext) {
+		if (!validLifecyclePath(lifecycleExecutable)) {
+			throw new TypeError(
+				'Distributed lifecycle requires an absolute initiating executable identity'
+			);
+		}
+		if (
+			hasLifecycleStage &&
+			(!validLifecyclePath(lifecycleRoot) || !validLifecyclePath(lifecycleStage))
+		) {
+			throw new TypeError(
+				'Distributed lifecycle requires absolute root and stage identities'
+			);
+		}
+		command = lifecycleExecutable;
+	} else {
+		command = options.command ?? 'distributed';
+	}
+	command = command.trim();
 	if (command.length === 0) {
 		throw new TypeError('Distributed SvelteKit command must not be empty');
 	}
