@@ -2682,6 +2682,243 @@ async fn graphql_terminal_replay_revalidates_after_active_projection_starts_drai
 
 #[cfg(all(feature = "graphql", feature = "sqlite"))]
 #[tokio::test]
+async fn graphql_succeeded_status_evaluates_retained_projection_evidence() {
+    let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("framework migrations should apply");
+    let mut table_registry = crate::table::TableSchemaRegistry::new();
+    table_registry
+        .register_schema(
+            <CausalLifecycleView as crate::read_model::RelationalReadModel>::schema().clone(),
+        )
+        .unwrap();
+    repository
+        .bootstrap_table_schema_for_dev(&table_registry)
+        .await
+        .unwrap();
+    let projector = modeled_lifecycle_projector(
+        crate::projection::placement::ProjectionBindingState::Active,
+        "causal-succeeded-status",
+        "causal-succeeded-status-topology",
+        0x7a,
+    );
+    let service = Service::new().named("causal-succeeded-status").routes(
+        Routes::new()
+            .with_repo(repository.clone().aggregate::<CausalDispatcherAggregate>())
+            .with_read_model_store(repository.clone())
+            .typed_command(
+                typed_command::<CausalTestInput, Eventual<TypedOutput>>("causal.lifecycle")
+                    .roles(["user"])
+                    .emits(crate::events![CausalLifecycleRecorded]),
+            )
+            .handle(
+                |context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                 input: CausalTestInput| {
+                    let result = (|| {
+                        let mut checkout = context.create();
+                        checkout.record_lifecycle(input.id.clone(), input.label)?;
+                        context
+                            .publish_events()
+                            .commit(checkout)?
+                            .eventual(TypedOutput { id: input.id })
+                    })();
+                    async move { result }
+                },
+            )
+            .consume_projection(projector.clone()),
+    );
+    let engine = crate::graphql::GraphqlEngine::builder(&repository)
+        .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
+        .model::<CausalLifecycleView>(
+            crate::graphql::ModelPermissions::new()
+                .grant("user", crate::graphql::read().all_columns()),
+        )
+        .service(&service)
+        .client_projectors([projector])
+        .build()
+        .expect("active modeled projection should compile");
+    let service = Arc::new(
+        service
+            .try_with_graphql(engine)
+            .expect("compiled service should bind"),
+    );
+    let command_id = causal_test_command_id();
+    let mutation = format!(
+        "mutation {{ causal_lifecycle(commandId: \"{command_id}\", input: {{ id: \"todo-succeeded-status\", label: \"active\" }}) {{ id }} }}"
+    );
+    let session = session_with_role("user");
+    let principal = causal_test_principal();
+    let response = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&mutation)
+                .data(command_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(response.errors.is_empty(), "{response:?}");
+    let envelope = serde_json::to_value(
+        response
+            .extensions
+            .get("distributed")
+            .expect("modeled command should carry the protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(envelope["command"]["state"], "succeeded_pending_projection");
+    assert_eq!(envelope["command"]["expects"].as_array().unwrap().len(), 1);
+    let causation_id = envelope["command"]["causationId"]
+        .as_str()
+        .expect("command envelope should carry its causation")
+        .to_string();
+
+    // The wait-path cell commits a terminal succeeded receipt while retaining
+    // modeled obligations. Before the projector writes proof, status remains
+    // publicly succeeded but cannot claim an observation.
+    let changed = sqlx::query(
+        "UPDATE command_ledger SET state = 'succeeded' \
+         WHERE service_id = ? AND command_id = ?",
+    )
+    .bind("causal-succeeded-status")
+    .bind(&command_id)
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+
+    let status_query =
+        format!("query {{ commandStatus(commandId: \"{command_id}\") {{ state }} }}");
+    let before_projection = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(command_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(before_projection.errors.is_empty(), "{before_projection:?}");
+    assert_eq!(
+        before_projection.data.into_json().unwrap(),
+        json!({"commandStatus": {"state": "succeeded"}})
+    );
+    let before_envelope = serde_json::to_value(
+        before_projection
+            .extensions
+            .get("distributed")
+            .expect("status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(before_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        before_envelope["command"]["expects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(before_envelope["command"].get("observations").is_none());
+
+    let pending = repository
+        .outbox_store()
+        .pending(10)
+        .await
+        .expect("the committed domain event should be pending");
+    assert_eq!(pending.len(), 1);
+    let ordered = crate::bus::OrderedDelivery::new(
+        crate::projection_protocol::ProjectionSource::new(
+            "test-ordered-events",
+            b"causal-succeeded-status".to_vec(),
+        )
+        .unwrap(),
+        crate::projection_protocol::ProjectionEpoch::new("test-ordered-events-v1").unwrap(),
+        1,
+        true,
+    )
+    .unwrap();
+    service
+        .dispatch_ordered_message(&Message::from(pending[0].clone()), Some(&ordered))
+        .await
+        .expect("the real modeled projector should commit its evidence");
+
+    let after_projection = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(command_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(after_projection.errors.is_empty(), "{after_projection:?}");
+    let after_envelope = serde_json::to_value(
+        after_projection
+            .extensions
+            .get("distributed")
+            .expect("status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(after_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        after_envelope["command"]["observations"]
+            .as_array()
+            .expect("matching durable proof should be exposed")
+            .len(),
+        1
+    );
+    assert_eq!(
+        after_envelope["command"]["observations"][0]["causationId"],
+        causation_id
+    );
+
+    // A proof authored by a different semantic program is not an observation
+    // for this command, even when its physical topology and scope are equal.
+    let wrong_program =
+        "pp1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let changed =
+        sqlx::query("UPDATE projection_observations SET program_id = ? WHERE causation_id = ?")
+            .bind(wrong_program)
+            .bind(&causation_id)
+            .execute(repository.pool())
+            .await
+            .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+
+    let wrong_projection = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(command_host(&service))
+                .data(principal),
+        )
+        .await;
+    assert!(wrong_projection.errors.is_empty(), "{wrong_projection:?}");
+    let wrong_envelope = serde_json::to_value(
+        wrong_projection
+            .extensions
+            .get("distributed")
+            .expect("status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(wrong_envelope["command"]["state"], "succeeded");
+    assert!(wrong_envelope["command"].get("observations").is_none());
+    assert_eq!(
+        wrong_envelope["command"]["expects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "mismatched proof must leave the exact obligation pending"
+    );
+}
+
+#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[tokio::test]
 async fn engine_rejects_incompatible_direct_owner_before_typed_command_binding() {
     let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
         .await

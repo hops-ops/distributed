@@ -846,6 +846,26 @@ where
                     == crate::graphql::projection_delta::runtime::ModeledProjectionStatusDisposition::Revalidate
             });
             let (state, evidence) = match receipt.state {
+                CommandLedgerState::Succeeded
+                    if receipt
+                        .projection_metadata
+                        .as_ref()
+                        .is_some_and(|metadata| !metadata.obligations.is_empty())
+                        || !receipt.obligations.is_empty() =>
+                {
+                    let (_, evidence) = evaluate_pending_projection_evidence(
+                        repository,
+                        &receipt,
+                        protocol,
+                        modeled_plan.as_ref(),
+                    )
+                    .await?;
+                    // A succeeded ledger receipt proves the command commit.
+                    // Retained projection obligations are only evidence detail;
+                    // their asynchronous proof must not rewrite that public
+                    // command state.
+                    (CausalCommandPublicState::Succeeded, evidence)
+                }
                 CommandLedgerState::Succeeded => (CausalCommandPublicState::Succeeded, Vec::new()),
                 CommandLedgerState::Atomic => (
                     CausalCommandPublicState::Atomic,
