@@ -11,10 +11,10 @@ use syn::{
 ///
 /// Both entry points produce a byte-identical impl: same associated
 /// `ReplayError = String`, same `entity`/`entity_mut`/`replay_event` bodies, and
-/// the same optional `aggregate_type` and upcasters methods. Only the replay
-/// match arms differ in how they are built upstream, so this helper takes them
-/// (already rendered) along with the type name and entity field. Keeping one
-/// emitter prevents the replay semantics of the two macros from drifting.
+/// the same optional `aggregate_type` and upcasters methods. The version and
+/// replay match arms are built upstream, so this helper takes them (already
+/// rendered) along with the type name and entity field. Keeping the version
+/// fence here prevents the replay semantics of the two macros from drifting.
 ///
 /// It emits only the `impl` block; callers still place `#upcaster_wrappers`
 /// (the free upcaster fns) where they already do.
@@ -22,6 +22,7 @@ pub(crate) fn aggregate_impl_tokens(
     type_name: &Ident,
     entity_field: &Ident,
     aggregate_type_method: &Option<TokenStream2>,
+    version_arms: &[TokenStream2],
     replay_arms: &[TokenStream2],
     upcasters_method: &TokenStream2,
 ) -> TokenStream2 {
@@ -43,6 +44,18 @@ pub(crate) fn aggregate_impl_tokens(
                 &mut self,
                 event: &distributed::EventRecord,
             ) -> Result<(), Self::ReplayError> {
+                // Hydration runs upcasters first. Payload compatibility alone
+                // cannot establish that an event has the handler's semantics.
+                let expected_version: u64 = match event.event_name.as_str() {
+                    #(#version_arms)*
+                    _ => return Err(format!("Unknown event: {}", event.event_name)),
+                };
+                if event.event_version != expected_version {
+                    return Err(format!(
+                        "Unsupported event version for {}: expected {}, got {}",
+                        event.event_name, expected_version, event.event_version,
+                    ));
+                }
                 match event.event_name.as_str() {
                     #(#replay_arms)*
                     _ => return Err(format!("Unknown event: {}", event.event_name)),
@@ -178,6 +191,15 @@ pub(crate) fn expand_aggregate(input: TokenStream2) -> syn::Result<TokenStream2>
 
     let agg_name = &input.agg_name;
     let entity_field = &input.entity_field;
+    let version_arms: Vec<_> = input
+        .events
+        .iter()
+        .map(|event| {
+            let name = &event.event_name;
+            let version = &event.version;
+            quote! { #name => #version, }
+        })
+        .collect();
 
     // Generate replay match arms - deserialize and call method directly
     let replay_arms: Vec<_> = input
@@ -249,6 +271,7 @@ pub(crate) fn expand_aggregate(input: TokenStream2) -> syn::Result<TokenStream2>
         agg_name,
         entity_field,
         &aggregate_type_method,
+        &version_arms,
         &replay_arms,
         &upcasters_method,
     );
@@ -327,6 +350,7 @@ struct AggregateInput {
 
 struct EventDef {
     event_name: LitStr,
+    version: syn::LitInt,
     args: Vec<Ident>,
     method_name: Ident,
     method_args: Option<Vec<Ident>>, // None = use event args, Some([]) = no args, Some([x,y]) = specific args
@@ -382,6 +406,19 @@ impl Parse for AggregateInput {
                 args_content.parse_terminated(Ident::parse, Token![,])?;
             let args: Vec<Ident> = args.into_iter().collect();
 
+            // `"renamed"(name), version = 2 => rename`; omitted versions
+            // have the same v1 default as #[digest] and #[event].
+            let version = if content.peek(Token![,]) {
+                content.parse::<Token![,]>()?;
+                let keyword: Ident = content.parse()?;
+                if keyword != "version" {
+                    return Err(syn::Error::new(keyword.span(), "expected `version`"));
+                }
+                content.parse::<Token![=]>()?;
+                content.parse::<syn::LitInt>()?
+            } else {
+                syn::LitInt::new("1", event_name.span())
+            };
             content.parse::<Token![=>]>()?;
             let method_name: Ident = content.parse()?;
 
@@ -398,6 +435,7 @@ impl Parse for AggregateInput {
 
             events.push(EventDef {
                 event_name,
+                version,
                 args,
                 method_name,
                 method_args,
