@@ -959,6 +959,7 @@ function resolveIntegration(
 	const hasLifecycleOwnership =
 		process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE === '1';
 	const lifecycleContext = hasLifecycleStage || hasLifecycleOwnership;
+	const configuredCommand = options.command ?? 'distributed';
 	const validLifecyclePath = (value: string | undefined): value is string =>
 		value !== undefined &&
 		value.length > 0 &&
@@ -982,7 +983,7 @@ function resolveIntegration(
 		}
 		command = lifecycleExecutable;
 	} else {
-		command = options.command ?? 'distributed';
+		command = configuredCommand;
 	}
 	command = command.trim();
 	if (command.length === 0) {
@@ -1124,7 +1125,7 @@ function resolveIntegration(
 		command,
 		commandArgs: Object.freeze(
 			lifecycleContext
-				? lifecycleCommandArgs(commandArgs)
+				? lifecycleCommandArgs(configuredCommand, commandArgs)
 				: commandArgs
 		),
 		routesDir,
@@ -1141,10 +1142,24 @@ function resolveIntegration(
  * separator belong to the executable. Direct executable arguments remain
  * unchanged; this keeps non-Cargo lifecycle integrations explicit.
  */
-function lifecycleCommandArgs(args: readonly string[]): readonly string[] {
-	if (args[0] !== 'run') return args;
+function lifecycleCommandArgs(
+	configuredCommand: string,
+	args: readonly string[]
+): readonly string[] {
+	const launcher = basename(configuredCommand).replace(/\.exe$/i, '');
+	if (launcher !== 'cargo') return args;
+	if (args[0] !== 'run') {
+		throw new TypeError(
+			'Distributed lifecycle Cargo launcher arguments must begin with `run`'
+		);
+	}
 	const separator = args.indexOf('--');
-	return separator === -1 ? args : args.slice(separator + 1);
+	if (separator === -1) {
+		throw new TypeError(
+			'Distributed lifecycle Cargo launcher arguments must contain `--`'
+		);
+	}
+	return args.slice(separator + 1);
 }
 
 function relocateLifecycleOutputs(

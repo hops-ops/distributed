@@ -958,8 +958,43 @@ test('lifecycle compiler uses the initiating absolute CLI over an older PATH bin
 	await generateDistributedSvelteKitLifecycle(
 		{
 			cwd: root,
-			// The app's standalone config uses Cargo as its launcher. Lifecycle
-			// ownership must replace Cargo and retain only the suffix after `--`.
+			command: oldDistributed,
+			commandArgs: [script],
+			clients: clients()
+		},
+		{ projectRoot: root, stage: join(root, '.distributed/lifecycle-stage') }
+	);
+
+	assert.deepEqual(
+		(await commandLog(log)).map((args) => args[0]),
+		['client-manifest', 'client', 'client-manifest', 'client']
+	);
+	await assert.rejects(readFile(oldPathLog), (error) => error?.code === 'ENOENT');
+});
+
+test('lifecycle compiler replaces an explicit Cargo launcher with the initiating CLI', async (t) => {
+	const { root, script, log } = await fixture(t);
+	const cli = join(root, 'distributed');
+	await symlink(process.execPath, cli);
+	const previousCli = process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE;
+	const previousLifecycleRoot = process.env.DISTRIBUTED_LIFECYCLE_ROOT;
+	const previousLifecycleStage = process.env.DISTRIBUTED_LIFECYCLE_STAGE;
+	process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE = cli;
+	process.env.DISTRIBUTED_LIFECYCLE_ROOT = root;
+	process.env.DISTRIBUTED_LIFECYCLE_STAGE = join(root, '.distributed/lifecycle-stage');
+	await mkdir(join(root, '.distributed/lifecycle-stage'), { recursive: true });
+	t.after(() => {
+		if (previousCli === undefined) delete process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE;
+		else process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE = previousCli;
+		if (previousLifecycleRoot === undefined) delete process.env.DISTRIBUTED_LIFECYCLE_ROOT;
+		else process.env.DISTRIBUTED_LIFECYCLE_ROOT = previousLifecycleRoot;
+		if (previousLifecycleStage === undefined) delete process.env.DISTRIBUTED_LIFECYCLE_STAGE;
+		else process.env.DISTRIBUTED_LIFECYCLE_STAGE = previousLifecycleStage;
+	});
+
+	await generateDistributedSvelteKitLifecycle(
+		{
+			cwd: root,
 			command: 'cargo',
 			commandArgs: [
 				'run',
@@ -982,7 +1017,19 @@ test('lifecycle compiler uses the initiating absolute CLI over an older PATH bin
 		(await commandLog(log)).map((args) => args[0]),
 		['client-manifest', 'client', 'client-manifest', 'client']
 	);
-	await assert.rejects(readFile(oldPathLog), (error) => error?.code === 'ENOENT');
+
+	await assert.rejects(
+		generateDistributedSvelteKitLifecycle(
+			{
+				cwd: root,
+				command: 'cargo',
+				commandArgs: ['run', '--quiet', script],
+				clients: clients()
+			},
+			{ projectRoot: root, stage: join(root, '.distributed/lifecycle-stage') }
+		),
+		/Cargo launcher arguments must contain `--`/
+	);
 });
 
 test('lifecycle compiler fails closed when its initiating CLI identity is missing or relative', async (t) => {
