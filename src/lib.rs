@@ -85,7 +85,10 @@ pub use command_dispatch::{
     SharedCommandDispatcher, APPROVED_REMOTE_DISPATCH_PROFILE, COMMAND_DISPATCH_ENVELOPE_VERSION,
 };
 #[cfg(feature = "graphql")]
-pub use command_dispatch::{CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost};
+pub use command_dispatch::{
+    CellRequestContext, CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost,
+    TrustedRequestMetadata,
+};
 
 // Domain events: typed outward contracts distinct from replay events/snapshots.
 pub use domain_event::{
