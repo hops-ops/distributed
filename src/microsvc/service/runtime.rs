@@ -9,7 +9,7 @@ use serde_json::Value;
 #[cfg(feature = "graphql")]
 use super::causal::{
     internal_ledger_error, CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult,
-    GraphqlServiceBindError,
+    ExternalCausalAttempt, ExternalCausalReservation, GraphqlServiceBindError,
 };
 use super::helpers::{
     is_json_content_type, message_to_json_input, message_to_session, names_by_kind,
@@ -28,6 +28,8 @@ use crate::bus::{
 use crate::command::{TypedCommandContract, TypedServiceCommandBinding};
 #[cfg(feature = "graphql")]
 use crate::command_ledger::{CommandId, CommandLookup, PrincipalPartitionId};
+#[cfg(feature = "graphql")]
+use crate::command_ledger::ExternalDispatchBinding;
 #[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
 use crate::microsvc::error::HandlerError;
@@ -666,6 +668,85 @@ impl Service {
             &contract,
             self.causal_command_policy.replay_retention,
         )
+    }
+
+    /// Reserve the gateway ledger row for a command that will be committed by
+    /// an aggregate cell. The route performs canonical input and grant checks
+    /// before any remote request is made.
+    #[cfg(feature = "graphql")]
+    pub(crate) async fn reserve_external_causal(
+        &self,
+        command: &str,
+        command_id: &str,
+        input: Value,
+        session: Session,
+        principal: VerifiedPrincipal,
+        binding: ExternalDispatchBinding,
+    ) -> Result<ExternalCausalReservation, CausalDispatchError> {
+        ensure_lifecycle_mutations_open().map_err(CausalDispatchError::Handler)?;
+        let service_id = self.name().ok_or_else(|| {
+            CausalDispatchError::Internal(
+                "external typed causal dispatch requires Service::named identity".into(),
+            )
+        })?;
+        let route_index = self
+            .index
+            .get(&MessageKind::Command)
+            .and_then(|commands| commands.get(command))
+            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
+            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
+        self.routes[route_index]
+            .reserve_external(
+                command,
+                service_id,
+                command_id,
+                input,
+                session,
+                principal,
+                self.causal_command_policy,
+                binding,
+            )
+            .await
+    }
+
+    /// Persist a sealed terminal receipt for a command committed by a cell.
+    /// This path only updates the gateway ledger and never invokes a local
+    /// handler or appends a local event batch.
+    #[cfg(feature = "graphql")]
+    pub(crate) async fn complete_external_causal(
+        &self,
+        command: &str,
+        attempt: ExternalCausalAttempt,
+        result: &CausalDispatchResult,
+    ) -> Result<(), CausalDispatchError> {
+        let route_index = self
+            .index
+            .get(&MessageKind::Command)
+            .and_then(|commands| commands.get(command))
+            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
+            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
+        self.routes[route_index]
+            .complete_external(command, attempt, result)
+            .await
+    }
+
+    /// Mark a remote attempt retryable after a transport/protocol failure.
+    /// The durable fence remains the authority for later replay or reclaim.
+    #[cfg(feature = "graphql")]
+    pub(crate) async fn abandon_external_causal(
+        &self,
+        command: &str,
+        attempt: ExternalCausalAttempt,
+    ) -> Result<(), CausalDispatchError> {
+        let route_index = self
+            .index
+            .get(&MessageKind::Command)
+            .and_then(|commands| commands.get(command))
+            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
+            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
+        self.routes[route_index]
+            .abandon_external(command, attempt)
+            .await
     }
 
     pub(crate) fn typed_command_binding(&self) -> Result<TypedServiceCommandBinding, String> {

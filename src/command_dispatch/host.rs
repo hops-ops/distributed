@@ -9,8 +9,8 @@ use std::time::Duration;
 use crate::graphql::identity::VerifiedPrincipal;
 use crate::graphql::protocol::ProtocolResponseAccumulator;
 use crate::microsvc::cell_host::{
-    InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
-    CELL_SERVICE_ID_HEADER,
+    InternalHttpSecret, CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_HEADER,
+    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 use crate::microsvc::{
     CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult, Service, Session,
@@ -340,7 +340,7 @@ impl HttpCommandHost {
         input: Value,
         session: &Session,
     ) -> Result<(u16, Value), CausalDispatchError> {
-        self.post_wait_path_inner(command, command_id, input, session, None)
+        self.post_wait_path_inner(command, command_id, input, session, None, None)
             .await
     }
 
@@ -356,6 +356,30 @@ impl HttpCommandHost {
         service_id: &str,
         principal_partition: &str,
     ) -> Result<(u16, Value), CausalDispatchError> {
+        self.post_cell_wait_path_with_causation(
+            command,
+            command_id,
+            input,
+            session,
+            service_id,
+            principal_partition,
+            None,
+        )
+        .await
+    }
+
+    /// POST a cell wait-path command while carrying the gateway's durable
+    /// causation through the authenticated internal boundary.
+    pub async fn post_cell_wait_path_with_causation(
+        &self,
+        command: &str,
+        command_id: &str,
+        input: Value,
+        session: &Session,
+        service_id: &str,
+        principal_partition: &str,
+        causation_id: Option<&str>,
+    ) -> Result<(u16, Value), CausalDispatchError> {
         let first = self
             .post_wait_path_inner(
                 command,
@@ -363,6 +387,7 @@ impl HttpCommandHost {
                 input.clone(),
                 session,
                 Some((service_id, principal_partition)),
+                causation_id,
             )
             .await;
         if !matches!(&first, Ok((status, _)) if *status >= 500) {
@@ -380,6 +405,7 @@ impl HttpCommandHost {
             input,
             session,
             Some((service_id, principal_partition)),
+            causation_id,
         )
         .await
     }
@@ -391,6 +417,7 @@ impl HttpCommandHost {
         input: Value,
         session: &Session,
         cell_identity: Option<(&str, &str)>,
+        causation_id: Option<&str>,
     ) -> Result<(u16, Value), CausalDispatchError> {
         let mut request = self.request_json(
             command,
@@ -414,6 +441,9 @@ impl HttpCommandHost {
             request = request
                 .header(CELL_SERVICE_ID_HEADER, service_id)
                 .header(CELL_PRINCIPAL_PARTITION_HEADER, principal_partition);
+            if let Some(causation_id) = causation_id {
+                request = request.header(CELL_CAUSATION_ID_HEADER, causation_id);
+            }
         }
         let response = request.send().await.map_err(|err| {
             CausalDispatchError::Internal(format!("wait-path HTTP failed: {err}"))

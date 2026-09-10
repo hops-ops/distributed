@@ -4,7 +4,9 @@
 use std::sync::Arc;
 
 use distributed::bus::{Bus, BusConsumer, InMemoryBus, TransportError};
-use distributed::cell_host::InternalHttpSecret;
+use distributed::cell_host::{
+    CelldCommandHost, CelldRoute, InternalHttpSecret, CELL_CAUSATION_ID_HEADER,
+};
 use distributed::command::{
     typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField, Succeeded,
 };
@@ -12,8 +14,11 @@ use distributed::command_dispatch::{CommandHost, HttpCommandHost, SharedCommandH
 use distributed::graphql::VerifiedPrincipal;
 use distributed::microsvc::{router, Routes, Service, ROLE_KEY, USER_ID_KEY};
 use distributed::{Aggregate, AggregateBuilder, Entity, InMemoryRepository, Snapshot};
+#[cfg(feature = "sqlite")]
+use distributed::{AggregateRepository, SqliteRepository};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use serde_json::Value;
 
 #[derive(Default, Snapshot)]
 struct WaitAgg {
@@ -91,9 +96,9 @@ impl CommandOutputType for IdPayload {
     }
 }
 
-fn wait_service() -> Arc<Service> {
+fn wait_service_with_repo(repo: distributed::InMemoryRepository) -> Arc<Service> {
     let causal = Routes::new()
-        .with_repo(InMemoryRepository::new().aggregate::<WaitAgg>())
+        .with_repo(repo.aggregate::<WaitAgg>())
         .typed_command(
             typed_command::<IdInput, Succeeded<IdPayload>>("todo.create").roles(["user"]),
         )
@@ -125,6 +130,33 @@ fn wait_service() -> Arc<Service> {
             .with_http_command_routes()
             .routes(causal)
             .routes(ping),
+    )
+}
+
+fn wait_service() -> Arc<Service> {
+    wait_service_with_repo(InMemoryRepository::new())
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_wait_service(repository: SqliteRepository) -> Arc<Service> {
+    let causal = Routes::new()
+        .with_repo(AggregateRepository::<_, WaitAgg>::new(repository))
+        .typed_command(
+            typed_command::<IdInput, Succeeded<IdPayload>>("todo.create").roles(["user"]),
+        )
+        .create()
+        .invoke(|aggregate, input, _owner| {
+            aggregate.record(input.id.clone())?;
+            Ok::<_, distributed::EventRecordError>(())
+        })
+        .succeeded(|aggregate| IdPayload {
+            id: aggregate.entity().id().to_string(),
+        });
+    Arc::new(
+        Service::new()
+            .named("causal-wait-path")
+            .with_http_command_routes()
+            .routes(causal),
     )
 }
 
@@ -201,6 +233,379 @@ async fn cell_wait_path_replays_once_after_internal_failure() {
     assert_eq!(body["receipt"]["commandId"], command_id);
     assert_eq!(body["receipt"]["replayed"], true);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn celld_host_completes_remote_commit_once_and_rejects_changed_shard() {
+    use axum::{extract::State, http::HeaderMap, http::StatusCode, routing::post, Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn command(
+        State(calls): State<Arc<AtomicUsize>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        calls.fetch_add(1, Ordering::SeqCst);
+        let causation_id = headers
+            .get(CELL_CAUSATION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("gateway must bind the cell request to its reserved causation")
+            .to_string();
+        (
+            StatusCode::CREATED,
+            Json(json!({
+                "payload": { "id": body["input"]["id"] },
+                "receipt": {
+                    "commandId": body["commandId"],
+                    "causationId": causation_id,
+                    "state": "succeeded",
+                    "replayed": false
+                },
+                "events": []
+            })),
+        )
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(post(command))
+        .with_state(Arc::clone(&calls));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let repo = InMemoryRepository::new();
+    let service = wait_service_with_repo(repo.clone());
+    let host = CelldCommandHost::new(
+        format!("http://{addr}"),
+        Arc::clone(&service),
+        InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
+    )
+    .unwrap()
+    .route(CelldRoute::new(
+        &["todo.create"],
+        "todo",
+        |input| input.get("id").and_then(Value::as_str).map(str::to_owned),
+        |_command, _input, remote, _session| remote.clone(),
+    ));
+    let mut session = distributed::microsvc::Session::new();
+    session.set(USER_ID_KEY, "alice");
+    session.set(ROLE_KEY, "user");
+    let principal = VerifiedPrincipal::from_trusted_transport("alice");
+    let command_id = "0190a000-0000-7000-8000-000000000109";
+
+    let first = host
+        .invoke(
+            "todo.create",
+            command_id,
+            json!({ "id": "todo-cell-once" }),
+            session.clone(),
+            principal.clone(),
+            None,
+        )
+        .await
+        .expect("remote cell commit should complete the gateway ledger");
+    assert_eq!(first.payload(), &json!({ "id": "todo-cell-once" }));
+    assert_eq!(first.state(), "succeeded");
+
+    drop(host);
+    drop(service);
+    let restarted_service = wait_service_with_repo(repo);
+    let restarted_host = CelldCommandHost::new(
+        format!("http://{addr}"),
+        Arc::clone(&restarted_service),
+        InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
+    )
+    .unwrap()
+    .route(CelldRoute::new(
+        &["todo.create"],
+        "todo",
+        |input| input.get("id").and_then(Value::as_str).map(str::to_owned),
+        |_command, _input, remote, _session| remote.clone(),
+    ));
+    let replay = restarted_host
+        .invoke(
+            "todo.create",
+            command_id,
+            json!({ "id": "todo-cell-once" }),
+            session.clone(),
+            principal.clone(),
+            None,
+        )
+        .await
+        .expect("completed external receipt should replay durably");
+    assert_eq!(replay.state(), "succeeded");
+    assert_eq!(replay.payload(), first.payload());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let conflict = restarted_host
+        .invoke(
+            "todo.create",
+            command_id,
+            json!({ "id": "todo-other-cell" }),
+            session,
+            principal,
+            None,
+        )
+        .await
+        .expect_err("same command ID cannot move to another cell or input");
+    assert!(matches!(
+        conflict,
+        distributed::microsvc::CausalDispatchError::CommandIdReuse
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let different_binding_host = CelldCommandHost::new(
+        format!("http://{addr}"),
+        Arc::clone(&restarted_service),
+        InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
+    )
+    .unwrap()
+    .route(CelldRoute::new(
+        &["todo.create"],
+        "todo",
+        |_input| Some("todo-different-cell".into()),
+        |_command, _input, remote, _session| remote.clone(),
+    ));
+    let mut binding_session = distributed::microsvc::Session::new();
+    binding_session.set(USER_ID_KEY, "alice");
+    binding_session.set(ROLE_KEY, "user");
+    let binding_conflict = different_binding_host
+        .invoke(
+            "todo.create",
+            command_id,
+            json!({ "id": "todo-cell-once" }),
+            binding_session,
+            VerifiedPrincipal::from_trusted_transport("alice"),
+            None,
+        )
+        .await
+        .expect_err("the immutable route binding must fence a changed shard");
+    assert!(matches!(
+        binding_conflict,
+        distributed::microsvc::CausalDispatchError::CommandIdReuse
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn celld_host_reclaims_an_ambiguous_receipt_with_the_same_causation() {
+    use axum::{extract::State, http::HeaderMap, http::StatusCode, routing::post, Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    async fn command(
+        State(state): State<Arc<(AtomicUsize, Mutex<Option<String>>) >>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        let causation_id = headers
+            .get(CELL_CAUSATION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("gateway must bind the cell request to its reserved causation")
+            .to_string();
+        let call = state.0.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            *state.1.lock().unwrap() = Some(causation_id);
+            return (StatusCode::OK, Json(json!({ "not": "a receipt" })));
+        }
+        assert_eq!(
+            state.1.lock().unwrap().as_deref(),
+            Some(causation_id.as_str()),
+            "reclaim must reuse the cell's original causation identity"
+        );
+        (
+            StatusCode::CREATED,
+            Json(json!({
+                "payload": { "id": body["input"]["id"] },
+                "receipt": {
+                    "commandId": body["commandId"],
+                    "causationId": causation_id,
+                    "state": "succeeded",
+                    "replayed": true
+                },
+                "events": []
+            })),
+        )
+    }
+
+    let state = Arc::new((AtomicUsize::new(0), Mutex::new(None)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(post(command))
+        .with_state(Arc::clone(&state));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let service = wait_service();
+    let host = CelldCommandHost::new(
+        format!("http://{addr}"),
+        service,
+        InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
+    )
+    .unwrap()
+    .route(CelldRoute::new(
+        &["todo.create"],
+        "todo",
+        |input| input.get("id").and_then(Value::as_str).map(str::to_owned),
+        |_command, _input, remote, _session| remote.clone(),
+    ));
+    let mut session = distributed::microsvc::Session::new();
+    session.set(USER_ID_KEY, "alice");
+    session.set(ROLE_KEY, "user");
+    let principal = VerifiedPrincipal::from_trusted_transport("alice");
+    let command_id = "0190a000-0000-7000-8000-000000000110";
+
+    let first = host
+        .invoke(
+            "todo.create",
+            command_id,
+            json!({ "id": "todo-ambiguous" }),
+            session.clone(),
+            principal.clone(),
+            None,
+        )
+        .await
+        .expect_err("an undecodable remote response must remain retryable");
+    assert!(matches!(
+        first,
+        distributed::microsvc::CausalDispatchError::Internal(_)
+    ));
+
+    let retry = host
+        .invoke(
+            "todo.create",
+            command_id,
+            json!({ "id": "todo-ambiguous" }),
+            session,
+            principal,
+            None,
+        )
+        .await
+        .expect("retry should reclaim the durable reservation");
+    assert_eq!(retry.state(), "succeeded");
+    assert_eq!(state.0.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn celld_host_replays_external_completion_after_sqlite_reopen() {
+    use axum::{extract::State, http::HeaderMap, http::StatusCode, routing::post, Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn command(
+        State(calls): State<Arc<AtomicUsize>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        calls.fetch_add(1, Ordering::SeqCst);
+        let causation_id = headers
+            .get(CELL_CAUSATION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("gateway must bind the cell request to its reserved causation");
+        (
+            StatusCode::CREATED,
+            Json(json!({
+                "payload": { "id": body["input"]["id"] },
+                "receipt": {
+                    "commandId": body["commandId"],
+                    "causationId": causation_id,
+                    "state": "succeeded",
+                    "replayed": false
+                },
+                "events": []
+            })),
+        )
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(post(command))
+        .with_state(Arc::clone(&calls));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let database_path = std::env::temp_dir().join(format!(
+        "distributed-celld-host-{}.sqlite",
+        uuid::Uuid::now_v7()
+    ));
+    let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+    let repository = SqliteRepository::connect_and_migrate(&database_url)
+        .await
+        .expect("initial gateway ledger migration");
+    let service = sqlite_wait_service(repository.clone());
+    let host = CelldCommandHost::new(
+        format!("http://{addr}"),
+        Arc::clone(&service),
+        InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
+    )
+    .unwrap()
+    .route(CelldRoute::new(
+        &["todo.create"],
+        "todo",
+        |input| input.get("id").and_then(Value::as_str).map(str::to_owned),
+        |_command, _input, remote, _session| remote.clone(),
+    ));
+    let mut session = distributed::microsvc::Session::new();
+    session.set(USER_ID_KEY, "alice");
+    session.set(ROLE_KEY, "user");
+    let principal = VerifiedPrincipal::from_trusted_transport("alice");
+    let command_id = "0190a000-0000-7000-8000-000000000111";
+    let input = json!({ "id": "todo-sqlite-reopen" });
+
+    host.invoke(
+        "todo.create",
+        command_id,
+        input.clone(),
+        session.clone(),
+        principal.clone(),
+        None,
+    )
+    .await
+    .expect("cell completion should be durable before response");
+    drop(host);
+    drop(service);
+    drop(repository);
+
+    let reopened_repository = SqliteRepository::connect_and_migrate(&database_url)
+        .await
+        .expect("reopen gateway ledger");
+    let reopened_service = sqlite_wait_service(reopened_repository);
+    let reopened_host = CelldCommandHost::new(
+        format!("http://{addr}"),
+        Arc::clone(&reopened_service),
+        InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
+    )
+    .unwrap()
+    .route(CelldRoute::new(
+        &["todo.create"],
+        "todo",
+        |input| input.get("id").and_then(Value::as_str).map(str::to_owned),
+        |_command, _input, remote, _session| remote.clone(),
+    ));
+    let replay = reopened_host
+        .invoke(
+            "todo.create",
+            command_id,
+            input,
+            session,
+            principal,
+            None,
+        )
+        .await
+        .expect("reopened gateway should replay the durable cell receipt");
+    assert_eq!(replay.state(), "succeeded");
+    assert_eq!(replay.payload(), &json!({ "id": "todo-sqlite-reopen" }));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let _ = std::fs::remove_file(database_path);
 }
 
 #[tokio::test]

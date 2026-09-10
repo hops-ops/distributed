@@ -9,7 +9,7 @@ use chat_domain::{post, ChatMessage, ChatMessageState};
 use distributed::cell_host::{
     AggregateCell, CellCommandIdentity, CellDispatchError, CellDispatchResult, CellWaitPathRequest,
     CelldOutbox, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
-    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
+    CELL_CAUSATION_ID_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use serde::de::DeserializeOwned;
@@ -372,7 +372,11 @@ fn request_cell_identity(
 ) -> std::result::Result<CellCommandIdentity, CellDispatchError> {
     let service_id = required_internal_header(req, CELL_SERVICE_ID_HEADER)?;
     let principal_partition = required_internal_header(req, CELL_PRINCIPAL_PARTITION_HEADER)?;
-    CellCommandIdentity::new(service_id, principal_partition, command_id)
+    let identity = CellCommandIdentity::new(service_id, principal_partition, command_id)?;
+    match optional_internal_header(req, CELL_CAUSATION_ID_HEADER)? {
+        Some(causation_id) => identity.with_causation_id(causation_id),
+        None => Ok(identity),
+    }
 }
 
 fn required_internal_header(
@@ -387,6 +391,18 @@ fn required_internal_header(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .ok_or(CellDispatchError::Unauthorized)
+}
+
+fn optional_internal_header(
+    req: &Request,
+    name: &str,
+) -> std::result::Result<Option<String>, CellDispatchError> {
+    req.headers()
+        .get(name)
+        .map_err(|error| {
+            CellDispatchError::Internal(format!("could not read internal cell header: {error}"))
+        })
+        .map(|value| value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()))
 }
 
 fn wait_path_ok(

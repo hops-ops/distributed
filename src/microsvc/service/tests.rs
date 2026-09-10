@@ -20,11 +20,15 @@ use crate::command_ledger::{
     ExternalCommandCompletion, ReservationOutcome,
 };
 #[cfg(feature = "graphql")]
+use crate::command_dispatch::SharedCommandHost;
+#[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
 #[cfg(feature = "graphql")]
 use crate::graphql::{SurfaceDirectProjection, SurfaceProjector};
 #[cfg(feature = "graphql")]
 use crate::microsvc::HasOutboxStore;
+#[cfg(feature = "graphql")]
+use crate::microsvc::cell_host::{CelldCommandHost, InternalHttpSecret};
 use crate::microsvc::{
     CommandRequest, Context, HandlerError, RepoReadModelDependencies, Routes, Service, Session,
 };
@@ -772,6 +776,19 @@ fn command_host(service: &Arc<Service>) -> crate::command_dispatch::SharedComman
     Arc::new(crate::command_dispatch::LocalCommandHost::new(Arc::clone(
         service,
     )))
+}
+
+#[cfg(feature = "graphql")]
+fn celld_status_host(service: &Arc<Service>) -> SharedCommandHost {
+    Arc::new(
+        CelldCommandHost::new(
+            "http://127.0.0.1:1",
+            Arc::clone(service),
+            InternalHttpSecret::new("test-only-internal-secret-32-bytes")
+                .expect("test internal secret should be valid"),
+        )
+        .expect("status-only celld host should accept a local URL"),
+    )
 }
 
 #[cfg(feature = "graphql")]
@@ -2829,6 +2846,37 @@ async fn graphql_succeeded_status_evaluates_retained_projection_evidence() {
     );
     assert!(before_envelope["command"].get("observations").is_none());
 
+    // The celld host must use the same durable status evaluator. In
+    // particular, a terminal cell receipt cannot make the gateway claim a
+    // projection observation before the modeled projector has supplied proof.
+    let before_celld = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(celld_status_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(before_celld.errors.is_empty(), "{before_celld:?}");
+    let before_celld_envelope = serde_json::to_value(
+        before_celld
+            .extensions
+            .get("distributed")
+            .expect("celld status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(before_celld_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        before_celld_envelope["command"]["expects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(before_celld_envelope["command"].get("observations").is_none());
+
     let pending = repository
         .outbox_store()
         .pending(10)
@@ -2880,6 +2928,33 @@ async fn graphql_succeeded_status_evaluates_retained_projection_evidence() {
     assert_eq!(
         after_envelope["command"]["observations"][0]["causationId"],
         causation_id
+    );
+
+    let after_celld = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(celld_status_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(after_celld.errors.is_empty(), "{after_celld:?}");
+    let after_celld_envelope = serde_json::to_value(
+        after_celld
+            .extensions
+            .get("distributed")
+            .expect("celld status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(after_celld_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        after_celld_envelope["command"]["observations"]
+            .as_array()
+            .expect("celld status should expose matching durable proof")
+            .len(),
+        1
     );
 
     // A proof authored by a different semantic program is not an observation

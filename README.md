@@ -752,6 +752,17 @@ without a gateway binding remain explicit unknowns until a matching gateway
 reservation and trusted completion protocol can be established; they are never
 retrofitted into a different route or silently replayed.
 
+The celld command host reserves that gateway intent before making the cell
+request. The reservation's causation ID and logical route binding must be
+echoed by the trusted cell receipt; a changed command ID, input, causation, or
+route is rejected before it can complete the gateway row. A terminal cell
+receipt is durably recorded in the gateway ledger before the response is
+returned. Status checks current authorization and re-evaluates the durable
+receipt's projection evidence, so an in-memory completed-status cache is never
+the source of truth. An ambiguous transport result remains retryable against
+the same reservation and cell; it does not invoke the local domain handler or
+re-publish the cell's events and outbox.
+
 In v5, `OutboxStore::complete` and `complete_many` remove delivered rows instead
 of retaining `Published` records. Repeating settlement of a removed row returns
 `NotFound`; stale claims on existing rows still return `InvalidState`.

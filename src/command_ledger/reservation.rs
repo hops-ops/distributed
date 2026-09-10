@@ -165,6 +165,14 @@ impl CommandReservation {
         self
     }
 
+    /// Reuse the causation allocated by a trusted external gateway. The
+    /// command ID and canonical input still fence the cell row; this field
+    /// makes the remote receipt prove the same logical command attempt.
+    pub(crate) fn with_causation_id(mut self, causation_id: CausationId) -> Self {
+        self.candidate_causation = causation_id;
+        self
+    }
+
     pub(crate) fn key(&self) -> &CommandLedgerKey {
         &self.key
     }

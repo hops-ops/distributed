@@ -106,6 +106,8 @@ pub use runtime::{DEFAULT_MAX_PUBLISH_ATTEMPTS, DEFAULT_PUBLISH_LEASE};
 pub(crate) use service::CausalCommandProjectionEvidence;
 #[cfg(feature = "graphql")]
 pub use service::GraphqlServiceBindError;
+#[cfg(feature = "graphql")]
+pub(crate) use service::ExternalCausalReservation;
 pub use service::{
     direct_read_model, invoke_transition, require_loaded, CausalCommandContext,
     CausalCommitBuilder, CausalRepository, CommandRequest, CommandResponse, DeliveryKind,

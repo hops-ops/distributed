@@ -221,6 +221,121 @@ pub struct CausalDispatchResult {
     pub(crate) projection_events: Vec<crate::OutboxMessage>,
 }
 
+/// Gateway-side capability for one externally dispatched command. The attempt
+/// owns the durable reservation and is consumed only by terminal completion or
+/// retryable-unknown recovery; it is never reconstructed from the wire.
+#[cfg(feature = "graphql")]
+pub(crate) struct ExternalCausalAttempt {
+    pub(crate) command_name: String,
+    pub(crate) attempt: CommandAttempt,
+    pub(crate) retention: Duration,
+}
+
+#[cfg(feature = "graphql")]
+pub(crate) enum ExternalCausalReservation {
+    Acquired(ExternalCausalAttempt),
+    Replay(CausalDispatchResult),
+}
+
+#[cfg(feature = "graphql")]
+impl ExternalCausalAttempt {
+    pub(crate) fn command_id(&self) -> &str {
+        self.attempt.key().command_id()
+    }
+
+    pub(crate) fn causation_id(&self) -> &str {
+        self.attempt.causation_id().as_str()
+    }
+
+    pub(crate) fn fence(&self) -> AttemptFence {
+        self.attempt.fence()
+    }
+
+    pub(crate) fn validate_remote(
+        &self,
+        result: &CausalDispatchResult,
+    ) -> Result<(), CausalDispatchError> {
+        if result.command_id() != self.command_id() {
+            return Err(CausalDispatchError::Internal(
+                "cell wait-path returned a different command ID".into(),
+            ));
+        }
+        if result.causation_id() != self.causation_id() {
+            return Err(CausalDispatchError::Internal(
+                "cell wait-path returned a different causation ID".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn into_external_completion(
+        self,
+        result: &CausalDispatchResult,
+    ) -> Result<crate::command_ledger::ExternalCommandCompletion, CausalDispatchError> {
+        self.validate_remote(result)?;
+        let state = match result.receipt.state {
+            CommandLedgerState::Succeeded => TerminalCommandState::Succeeded,
+            CommandLedgerState::SucceededPendingProjection => {
+                TerminalCommandState::SucceededPendingProjection
+            }
+            CommandLedgerState::Atomic => {
+                return Err(CausalDispatchError::BadRequest(
+                    "atomic commands cannot be dispatched to an aggregate cell".into(),
+                ));
+            }
+            other => {
+                return Err(CausalDispatchError::Internal(format!(
+                    "cell wait-path returned non-terminal state `{}`",
+                    other.as_str()
+                )));
+            }
+        };
+        if !result.receipt.obligations.is_empty() && result.receipt.projection_metadata.is_none() {
+            return Err(CausalDispatchError::Internal(
+                "cell wait-path returned legacy projection obligations without their canonical key identity"
+                    .into(),
+            ));
+        }
+        let binding = self.attempt.external_binding().cloned().ok_or_else(|| {
+            CausalDispatchError::Internal(
+                "external command attempt lost its immutable route binding".into(),
+            )
+        })?;
+        if let Some(metadata) = result.receipt.projection_metadata.as_ref() {
+            let bytes = metadata.canonical_bytes().map_err(|error| {
+                CausalDispatchError::Internal(format!(
+                    "cell projection metadata could not be canonicalized: {error}"
+                ))
+            })?;
+            let expires_at = metadata.expires_at().map_err(|error| {
+                CausalDispatchError::Internal(format!(
+                    "cell projection metadata retention deadline is invalid: {error}"
+                ))
+            })?;
+            self.attempt
+                .complete_external_with_projection_metadata_until(
+                    binding,
+                    state,
+                    result.payload().clone(),
+                    bytes,
+                    self.retention,
+                    expires_at,
+                )
+                .map_err(internal_ledger_error)
+        } else {
+            self.attempt
+                .complete_external(
+                    binding,
+                    state,
+                    result.payload().clone(),
+                    Vec::new(),
+                    self.retention,
+                )
+                .map_err(internal_ledger_error)
+        }
+    }
+}
+
 #[cfg(feature = "graphql")]
 impl CausalDispatchResult {
     /// Handler payload returned to the wait-path caller.
@@ -574,6 +689,40 @@ pub(super) fn causal_handler_error_code(error: &HandlerError) -> &'static str {
 #[cfg(feature = "graphql")]
 pub(super) fn internal_ledger_error(error: CommandLedgerError) -> CausalDispatchError {
     CausalDispatchError::Internal(error.to_string())
+}
+
+#[cfg(feature = "graphql")]
+pub(super) async fn abandon_external_attempt<R>(
+    repository: &R,
+    attempt: ExternalCausalAttempt,
+    detail: String,
+) -> Result<(), CausalDispatchError>
+where
+    R: CommandLedgerStore + Send + Sync,
+{
+    let fence = attempt.fence();
+    match repository.mark_retryable_unknown(fence.clone()).await {
+        Ok(()) => Err(CausalDispatchError::Internal(detail)),
+        Err(CommandLedgerError::AttemptFenced { .. }) => match repository
+            .lookup_command(fence.key(), CommandLookupScope::Attempt(&fence))
+            .await
+        {
+            Ok(CommandLookup::Replay(_)) => Ok(()),
+            Ok(CommandLookup::Expired) => Err(CausalDispatchError::Expired),
+            Ok(CommandLookup::RetryableUnknown { .. }) => {
+                Err(CausalDispatchError::Internal(detail))
+            }
+            Ok(CommandLookup::InProgress { .. }) | Ok(CommandLookup::Unknown) => {
+                Err(CausalDispatchError::Internal(detail))
+            }
+            Err(error) => Err(CausalDispatchError::Internal(format!(
+                "{detail}; external command recovery failed: {error}"
+            ))),
+        },
+        Err(error) => Err(CausalDispatchError::Internal(format!(
+            "{detail}; failed to mark external command retryable: {error}"
+        ))),
+    }
 }
 
 #[cfg(feature = "graphql")]
