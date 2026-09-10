@@ -675,7 +675,7 @@ async fn trusted_native_metadata_reaches_a_real_aggregate_cell() {
 }
 
 #[tokio::test]
-async fn authenticated_transport_recovery_requires_exact_no_effects_then_replays() {
+async fn authenticated_transport_recovery_preserves_no_effects_then_replays() {
     use axum::{routing::post, Router};
 
     let secret = InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap();
@@ -703,8 +703,9 @@ async fn authenticated_transport_recovery_requires_exact_no_effects_then_replays
     session.set(ROLE_KEY, "system");
 
     // The original command is authenticated at the HTTP boundary but lacks
-    // the producer claim required by the destination cell. This exact 401 is
-    // the only recoverable failure: the cell must have no receipt or event.
+    // the producer claim required by the destination cell. This fixture only
+    // proves that the rejected request produced no aggregate event; a caller
+    // must inspect its durable receipt/error classification before recovery.
     let (status, body) = host
         .post_cell_wait_path_with_causation(
             "generic.grant",
