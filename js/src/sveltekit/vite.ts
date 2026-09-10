@@ -1110,25 +1110,41 @@ function resolveIntegration(
 			manifestWatchRoots: Object.freeze(manifestWatchRoots(cwd, client.manifest))
 		});
 	});
+	const commandArgs = (options.commandArgs ?? []).map((argument, index) => {
+		if (typeof argument !== 'string') {
+			throw new TypeError(
+				`Distributed commandArgs[${index}] must be a string`
+			);
+		}
+		return argument;
+	});
 	return Object.freeze({
 		cwd,
 		outputRoot: cwd,
 		command,
 		commandArgs: Object.freeze(
-			(options.commandArgs ?? []).map((argument, index) => {
-				if (typeof argument !== 'string') {
-					throw new TypeError(
-						`Distributed commandArgs[${index}] must be a string`
-					);
-				}
-				return argument;
-			})
+			lifecycleContext
+				? lifecycleCommandArgs(commandArgs)
+				: commandArgs
 		),
 		routesDir,
 		libDir,
 		aliases,
 		clients: Object.freeze(clients)
 	});
+}
+
+/**
+ * A lifecycle-owned UI may inherit a Cargo launcher prefix from the app's
+ * standalone Vite configuration (`cargo run ... --`). Once the trusted
+ * initiating executable replaces Cargo, only the arguments after that
+ * separator belong to the executable. Direct executable arguments remain
+ * unchanged; this keeps non-Cargo lifecycle integrations explicit.
+ */
+function lifecycleCommandArgs(args: readonly string[]): readonly string[] {
+	if (args[0] !== 'run') return args;
+	const separator = args.indexOf('--');
+	return separator === -1 ? args : args.slice(separator + 1);
 }
 
 function relocateLifecycleOutputs(

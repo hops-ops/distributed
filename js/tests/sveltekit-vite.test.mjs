@@ -958,8 +958,21 @@ test('lifecycle compiler uses the initiating absolute CLI over an older PATH bin
 	await generateDistributedSvelteKitLifecycle(
 		{
 			cwd: root,
-			command: oldDistributed,
-			commandArgs: [script],
+			// The app's standalone config uses Cargo as its launcher. Lifecycle
+			// ownership must replace Cargo and retain only the suffix after `--`.
+			command: 'cargo',
+			commandArgs: [
+				'run',
+				'--quiet',
+				'--manifest-path',
+				join(root, 'Cargo.toml'),
+				'-p',
+				'distributed_cli',
+				'--bin',
+				'distributed',
+				'--',
+				script
+			],
 			clients: clients()
 		},
 		{ projectRoot: root, stage: join(root, '.distributed/lifecycle-stage') }
