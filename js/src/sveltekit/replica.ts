@@ -80,6 +80,81 @@ export type SveltekitPageDataSessionSource<TData extends PageGraphqlData> =
 		set(next: TData): void;
 	}>;
 
+function recordSessionDiagnostic(event: Readonly<Record<string, unknown>>): void {
+	const maxEvents = 128;
+	if (typeof globalThis === 'undefined') return;
+	const diagnostics = globalThis as typeof globalThis & {
+		__captureReplicaDiagnostics?: unknown;
+		__distributedSessionTrace?: unknown;
+	};
+	if (diagnostics.__captureReplicaDiagnostics !== true) return;
+	if (!Array.isArray(diagnostics.__distributedSessionTrace)) {
+		diagnostics.__distributedSessionTrace = [];
+	}
+	const trace = diagnostics.__distributedSessionTrace as unknown[];
+	trace.push(Object.freeze({ time: Date.now(), ...event }));
+	if (trace.length > maxEvents) trace.splice(0, trace.length - maxEvents);
+}
+
+const sessionDiagnosticCredentialOrdinals = new Map<string, number>();
+let nextSessionDiagnosticCredentialOrdinal = 1;
+const maxSessionDiagnosticCredentials = 32;
+
+function sessionDiagnosticCredentialOrdinal(
+	value: Readonly<{ accessToken?: unknown }> | null | undefined
+): number | undefined {
+	if (typeof globalThis === 'undefined') return undefined;
+	const diagnostics = globalThis as typeof globalThis & {
+		__captureReplicaDiagnostics?: unknown;
+	};
+	if (diagnostics.__captureReplicaDiagnostics !== true) return undefined;
+	if (typeof value?.accessToken !== 'string' || value.accessToken.length === 0) {
+		return undefined;
+	}
+	let ordinal = sessionDiagnosticCredentialOrdinals.get(value.accessToken);
+	if (ordinal === undefined) {
+		if (sessionDiagnosticCredentialOrdinals.size >= maxSessionDiagnosticCredentials) {
+			const oldest = sessionDiagnosticCredentialOrdinals.keys().next().value;
+			if (typeof oldest === 'string') sessionDiagnosticCredentialOrdinals.delete(oldest);
+		}
+		ordinal = nextSessionDiagnosticCredentialOrdinal++;
+		sessionDiagnosticCredentialOrdinals.set(value.accessToken, ordinal);
+	}
+	return ordinal;
+}
+
+function sessionDiagnosticSourceOrigin(): string {
+	if (typeof globalThis === 'undefined') return 'unattributed';
+	const diagnostics = globalThis as typeof globalThis & {
+		__distributedSessionSourceOrigin?: unknown;
+	};
+	return typeof diagnostics.__distributedSessionSourceOrigin === 'string'
+		? diagnostics.__distributedSessionSourceOrigin
+		: 'unattributed';
+}
+
+function installSessionDiagnosticOrdinalBridge(): void {
+	if (typeof globalThis === 'undefined') return;
+	const diagnostics = globalThis as typeof globalThis & {
+		__captureReplicaDiagnostics?: unknown;
+		__distributedSessionCredentialOrdinal?: unknown;
+	};
+	if (diagnostics.__captureReplicaDiagnostics !== true) return;
+	diagnostics.__distributedSessionCredentialOrdinal = (value: unknown): number | undefined => {
+		if (value === null || typeof value !== 'object') return undefined;
+		const pageData = value as {
+			accessToken?: unknown;
+		session?: { accessToken?: unknown } | null;
+		};
+		return sessionDiagnosticCredentialOrdinal({
+			accessToken:
+				typeof pageData.accessToken === 'string'
+					? pageData.accessToken
+					: pageData.session?.accessToken
+		});
+	};
+}
+
 export type SveltekitReplicaHydration = Readonly<{
 	version: 1;
 	state: import('../replica/index.js').ReplicaDehydratedState;
@@ -611,6 +686,7 @@ export function sessionSourceFromPageData<TData extends PageGraphqlData>(
 export function createPageDataSessionSource<TData extends PageGraphqlData>(
 	initial: TData
 ): SveltekitPageDataSessionSource<TData> {
+	installSessionDiagnosticOrdinalBridge();
 	let current = initial;
 	const listeners = new Set<() => void>();
 	const source = Object.freeze({
@@ -626,6 +702,17 @@ export function createPageDataSessionSource<TData extends PageGraphqlData>(
 		session: sessionSourceFromPageData(source),
 		get: source.get,
 		set(next: TData): void {
+			const pageData = next as SveltekitDistributedPageData;
+			const auth = authFromPageData(next);
+			recordSessionDiagnostic({
+				kind: 'page-data-set',
+				origin: sessionDiagnosticSourceOrigin(),
+				credentialOrdinal: sessionDiagnosticCredentialOrdinal(auth),
+				hasHydration: pageData.distributed !== undefined,
+				hasAuthority: pageData.distributedAuthority !== undefined,
+				hasSession: next.session !== null && next.session !== undefined,
+				hasAccessToken: typeof pageData.accessToken === 'string'
+			});
 			current = next;
 			for (const listener of [...listeners]) listener();
 		}
@@ -1038,16 +1125,17 @@ function createAuthorizationFence(
 	let queue = Promise.resolve();
 	let disposed = false;
 	const read = (): Promise<GqlAuth> => {
+		const sourceOrigin = sessionDiagnosticSourceOrigin();
 		const candidate = Promise.resolve().then(() => {
 			// Capture the credential and its independent server transfer together,
 			// before another source notification can replace either value.
 			const credential = source.getAuth();
 			const transfer = source.getHydration?.();
-			return Promise.resolve(credential).then((auth) => ({ auth, transfer }));
+		return Promise.resolve(credential).then((auth) => ({ auth, transfer, sourceOrigin }));
 		});
 		const transition = queue.then(async () => {
 			try {
-				const { auth, transfer } = await candidate;
+				const { auth, transfer, sourceOrigin } = await candidate;
 				const next = snapshotAuthCredential(auth);
 				if (
 					current !== undefined &&
@@ -1056,7 +1144,24 @@ function createAuthorizationFence(
 					const freshTransfer = transfer !== undefined &&
 						!seenHydrations.has(transfer.hydration) &&
 						!seenAuthorities.has(transfer.authority);
-					if (!freshTransfer || !refresh(transfer)) invalidate();
+					const retained = freshTransfer && refresh(transfer);
+					recordSessionDiagnostic({
+						kind: 'auth-credential-change',
+						sourceOrigin,
+						previousCredentialOrdinal: sessionDiagnosticCredentialOrdinal(current),
+						nextCredentialOrdinal: sessionDiagnosticCredentialOrdinal(next),
+						hasTransfer: transfer !== undefined,
+						freshTransfer,
+						retained,
+						reason: retained
+							? 'fresh-transfer-retained'
+							: transfer === undefined
+								? 'missing-transfer'
+								: !freshTransfer
+									? 'replayed-transfer'
+									: 'refresh-rejected'
+					});
+					if (!retained) invalidate();
 				}
 				current = next;
 				if (transfer !== undefined) {
