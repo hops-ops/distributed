@@ -9,7 +9,8 @@ use std::sync::Arc;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalStorageIdentity, CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey,
-    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation, ReservationOutcome,
+    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
+    ExternalCommandCompletion, ReservationOutcome,
 };
 use crate::entity::Entity;
 use crate::lock::{InMemoryLockManager, Lock, LockManager};
@@ -241,6 +242,13 @@ where
         attempt: AttemptFence,
     ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
         self.inner.mark_retryable_unknown(attempt)
+    }
+
+    fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
+        self.inner.complete_external_command(completion)
     }
 
     fn compact_expired_commands(

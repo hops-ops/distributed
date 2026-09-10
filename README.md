@@ -739,6 +739,19 @@ can deliver the same event ID again; consumers must remain idempotent. Event
 history belongs in the event store, and command retry results belong in command
 receipts. Neither depends on retaining delivered outbox rows.
 
+Commands dispatched to another aggregate cell use the same command ledger, but
+with an explicit external dispatch binding. The binding records the logical
+route kind and shard alongside the command identity; it is immutable for that
+reservation and survives lease reclaim and terminal replay. External completion
+updates only the ledger after the returned attempt fence and binding match. It
+does not append local events, write the outbox, or treat the cell's commit as
+proof that an asynchronous read-model projection has completed. A local causal
+commit cannot complete an externally bound reservation, and an external
+completion cannot complete a local reservation. Retained cell-only receipts
+without a gateway binding remain explicit unknowns until a matching gateway
+reservation and trusted completion protocol can be established; they are never
+retrofitted into a different route or silently replayed.
+
 In v5, `OutboxStore::complete` and `complete_many` remove delivered rows instead
 of retaining `Published` records. Repeating settlement of a removed row returns
 `NotFound`; stale claims on existing rows still return `InvalidState`.

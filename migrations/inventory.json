@@ -84,6 +84,18 @@
         "path": "migrations/postgres/0007_projection_program_identity.sql",
         "sha256": "ad7da74a11637a522279a6bc061d2c79db1f807f869368cf31735a089dfe0204"
       }
+    },
+    {
+      "version": 8,
+      "description": "external command binding",
+      "sqlite": {
+        "path": "migrations/sqlite/0008_external_command_binding.sql",
+        "sha256": "4be4e5583d7f37a4f2820bf7777a750246ff574d43f4b9fbd15324d6712a6240"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0008_external_command_binding.sql",
+        "sha256": "2f93c5685cde1d5cafd444d3a28dbcbf01f16cd44a566c7af61a7bd2a793a163"
+      }
     }
   ]
 }

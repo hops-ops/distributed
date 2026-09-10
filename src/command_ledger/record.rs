@@ -11,7 +11,8 @@ use super::{
     ids::COMMAND_REPLAY_VERSION, state::validate_projection_obligation_semantics, AttemptFence,
     AttemptToken, CanonicalInputHash, CausationId, CommandAttempt, CommandCompletion,
     CommandContractFingerprint, CommandLedgerError, CommandLedgerKey, CommandLedgerState,
-    CommandLookup, CommandLookupScope, CommandReplay, CommandReservation, ReservationOutcome,
+    CommandLookup, CommandLookupScope, CommandReplay, CommandReservation,
+    ExternalCommandCompletion, ExternalDispatchBinding, ReservationOutcome,
 };
 
 /// Storage-neutral row representation shared by built-in adapters.
@@ -25,6 +26,7 @@ pub(crate) struct CommandLedgerRecord {
     pub(crate) causation_id: CausationId,
     pub(crate) attempt_token: Option<AttemptToken>,
     pub(crate) attempt_number: u64,
+    pub(crate) external_binding: Option<ExternalDispatchBinding>,
     pub(crate) lease_expires_at: Option<SystemTime>,
     pub(crate) outcome_json: Option<String>,
     #[allow(dead_code)]
@@ -49,6 +51,7 @@ impl CommandLedgerRecord {
             causation_id: reservation.candidate_causation.clone(),
             attempt_token: Some(reservation.candidate_attempt.clone()),
             attempt_number: 1,
+            external_binding: reservation.external_binding.clone(),
             lease_expires_at: Some(checked_deadline(now, reservation.lease, "attempt lease")?),
             outcome_json: None,
             created_at: now,
@@ -84,6 +87,11 @@ impl CommandLedgerRecord {
             principal_partition: self.key.principal_partition().to_string(),
             command_id: self.key.command_id().to_string(),
             command_name: self.command_name.clone(),
+            external_binding: self
+                .external_binding
+                .as_ref()
+                .map(ExternalDispatchBinding::to_storage)
+                .transpose()?,
             contract_fingerprint: self.contract_fingerprint.as_bytes().to_vec(),
             input_hash: self.input_hash.as_bytes().to_vec(),
             state: self.state.as_str().to_string(),
@@ -135,6 +143,11 @@ impl CommandLedgerRecord {
         let record = Self {
             key,
             command_name: wire.command_name,
+            external_binding: wire
+                .external_binding
+                .as_deref()
+                .map(ExternalDispatchBinding::from_storage)
+                .transpose()?,
             contract_fingerprint: CommandContractFingerprint::try_from_slice(
                 &wire.contract_fingerprint,
             )?,
@@ -184,6 +197,7 @@ impl CommandLedgerRecord {
             causation_id: self.causation_id.clone(),
             attempt_token: token.clone(),
             attempt_number: self.attempt_number,
+            external_binding: self.external_binding.clone(),
         })
     }
 
@@ -198,6 +212,7 @@ impl CommandLedgerRecord {
         if self.command_name != reservation.command_name
             || self.contract_fingerprint != reservation.contract_fingerprint
             || self.input_hash != reservation.input_hash
+            || self.external_binding != reservation.external_binding
         {
             return Ok(ReservationDecision::Conflict);
         }
@@ -385,6 +400,11 @@ impl CommandLedgerRecord {
         completion: &CommandCompletion,
         now: SystemTime,
     ) -> Result<(), CommandLedgerError> {
+        if self.external_binding.is_some() {
+            return Err(CommandLedgerError::Invalid(
+                "local causal completion cannot complete an externally bound reservation".into(),
+            ));
+        }
         completion.validate_direct_projection()?;
         self.validate_live_attempt(&completion.attempt.fence(), now)?;
         let retention_expires_at = match completion.retention_expires_at() {
@@ -400,6 +420,44 @@ impl CommandLedgerRecord {
         self.attempt_token = None;
         self.lease_expires_at = None;
         self.outcome_json = Some(completion.replay.clone());
+        self.updated_at = now;
+        self.completed_at = Some(now);
+        self.retention_expires_at = retention_expires_at;
+        Ok(())
+    }
+
+    pub(crate) fn complete_external(
+        &mut self,
+        completion: &ExternalCommandCompletion,
+        now: SystemTime,
+    ) -> Result<(), CommandLedgerError> {
+        if self.external_binding.as_ref() != Some(completion.binding()) {
+            return Err(CommandLedgerError::Invalid(
+                "external completion binding does not match the reserved route".into(),
+            ));
+        }
+        if completion.attempt().external_binding() != Some(completion.binding()) {
+            return Err(CommandLedgerError::Invalid(
+                "external completion attempt does not carry the reserved route".into(),
+            ));
+        }
+        // Check the complete attempt fence before any other mutable-row
+        // invariant. A late completion must report the generation race even
+        // when its retention deadline has also elapsed.
+        self.validate_live_attempt(&completion.attempt_fence(), now)?;
+        let retention_expires_at = match completion.retention_expires_at() {
+            Some(deadline) if deadline > now => deadline,
+            Some(_) => {
+                return Err(CommandLedgerError::Invalid(
+                    "command retention deadline must remain live at commit".into(),
+                ));
+            }
+            None => checked_deadline(now, completion.retention(), "command retention")?,
+        };
+        self.state = completion.state().into();
+        self.attempt_token = None;
+        self.lease_expires_at = None;
+        self.outcome_json = Some(completion.replay_json().to_string());
         self.updated_at = now;
         self.completed_at = Some(now);
         self.retention_expires_at = retention_expires_at;
@@ -615,6 +673,8 @@ struct DurableCellCommandRecordV1 {
     principal_partition: String,
     command_id: String,
     command_name: String,
+    #[serde(default)]
+    external_binding: Option<String>,
     contract_fingerprint: Vec<u8>,
     input_hash: Vec<u8>,
     state: String,

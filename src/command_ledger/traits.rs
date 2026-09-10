@@ -5,7 +5,8 @@ use crate::repository::{RepositoryError, StreamIdentity};
 
 use super::{
     AttemptFence, CausalCommitBatch, CausalStorageIdentity, CommandLedgerError, CommandLedgerKey,
-    CommandLookup, CommandLookupScope, CommandReservation, ReservationOutcome,
+    CommandLookup, CommandLookupScope, CommandReservation, ExternalCommandCompletion,
+    ReservationOutcome,
 };
 
 /// Read capability used by the causal workspace. Unlike ordinary
@@ -49,6 +50,14 @@ pub(crate) trait CommandLedgerStore: Send + Sync {
     fn mark_retryable_unknown(
         &self,
         attempt: AttemptFence,
+    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_;
+
+    /// Record a terminal receipt for a remote aggregate-cell command. This
+    /// updates only the ledger row and is never a substitute for a local
+    /// domain commit.
+    fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
     ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_;
 
     #[allow(dead_code)]

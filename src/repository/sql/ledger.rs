@@ -5,7 +5,8 @@ use crate::command_ledger::{
     AttemptFence, AttemptToken, CanonicalInputHash, CausationId, CommandCompletion,
     CommandContractFingerprint, CommandId, CommandLedgerError, CommandLedgerKey,
     CommandLedgerRecord, CommandLedgerState, CommandLookup, CommandLookupScope, CommandReservation,
-    PrincipalPartitionId, ReservationDecision, ReservationOutcome,
+    ExternalCommandCompletion, ExternalDispatchBinding, PrincipalPartitionId, ReservationDecision,
+    ReservationOutcome,
 };
 use std::time::SystemTime;
 
@@ -29,6 +30,11 @@ fn record_from_row(
     let record = CommandLedgerRecord {
         key,
         command_name: row.text("command_name")?,
+        external_binding: row
+            .optional_text("external_binding")?
+            .as_deref()
+            .map(ExternalDispatchBinding::from_storage)
+            .transpose()?,
         contract_fingerprint: CommandContractFingerprint::try_from_slice(
             &row.bytes("command_contract_hash")?,
         )
@@ -126,6 +132,11 @@ pub(crate) async fn preflight<E: SqlExecutor>(
             command_id: fence.key().command_id().to_string(),
         }
     })?;
+    if completion.attempt().external_binding().is_some() {
+        return Err(CommandLedgerError::Invalid(
+            "local causal completion cannot complete an externally bound reservation".into(),
+        ));
+    }
     let now = now(executor).await?;
     record.validate_live_attempt(&fence, now)
 }
@@ -137,7 +148,7 @@ pub(crate) async fn insert_reservation<E: SqlExecutor>(
     let mut builder = Statement::new(
         "INSERT INTO command_ledger (service_id, principal_partition, command_id, \
          command_name, command_contract_hash, input_hash, state, causation_id, attempt_token, \
-         attempt_number, lease_expires_at, outcome, created_at, updated_at, completed_at, \
+         attempt_number, external_binding, lease_expires_at, outcome, created_at, updated_at, completed_at, \
          retention_expires_at, compacted_at) VALUES (",
     );
     builder.push_bind(reservation.key().service_id());
@@ -159,6 +170,15 @@ pub(crate) async fn insert_reservation<E: SqlExecutor>(
     builder.push_bind(reservation.candidate_attempt().as_str());
     builder.push(", ");
     builder.push_bind(1_i64);
+    builder.push(", ");
+    let external_binding = reservation
+        .external_binding()
+        .map(ExternalDispatchBinding::to_storage)
+        .transpose()?;
+    match external_binding.as_deref() {
+        Some(binding) => builder.push_bind(binding),
+        None => builder.push("NULL"),
+    }
     builder.push(", ");
     builder.part(SqlPart::LedgerDeadline(reservation.lease()));
     builder.push(", NULL, ");
@@ -265,6 +285,7 @@ pub(crate) async fn complete<E: SqlExecutor>(
     builder.push_bind(fence.contract_fingerprint_bytes().as_slice());
     builder.push(" AND input_hash = ");
     builder.push_bind(fence.input_hash_bytes().as_slice());
+    builder.push(" AND external_binding IS NULL");
     builder.push(" AND state = 'in_progress' AND causation_id = ");
     builder.push_bind(fence.causation_id().as_str());
     builder.push(" AND attempt_token = ");
@@ -279,6 +300,60 @@ pub(crate) async fn complete<E: SqlExecutor>(
     }
     let result = executor.execute(builder).await?;
     if result != 1 {
+        return Err(CommandLedgerError::AttemptFenced {
+            command_id: fence.key().command_id().to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) async fn complete_external<E: SqlExecutor>(
+    executor: &mut E,
+    completion: &ExternalCommandCompletion,
+) -> Result<(), CommandLedgerError> {
+    let fence = completion.attempt_fence();
+    let attempt_number = signed(fence.attempt_number(), "command ledger attempt number")?;
+    let terminal_state = CommandLedgerState::from(completion.state()).as_str();
+    let retention_expires_at = completion.retention_expires_at();
+    let binding = completion.binding().to_storage()?;
+    let mut builder = Statement::new("UPDATE command_ledger SET state = ");
+    builder.push_bind(terminal_state);
+    builder.push(", attempt_token = NULL, lease_expires_at = NULL, outcome = ");
+    builder.part(SqlPart::LedgerJson(completion.replay_json().into()));
+    builder.push(", updated_at = ");
+    builder.part(SqlPart::LedgerNow);
+    builder.push(", completed_at = ");
+    builder.part(SqlPart::LedgerNow);
+    builder.push(", retention_expires_at = ");
+    match retention_expires_at.as_ref() {
+        Some(deadline) => builder.push_bind(SqlBind::Timestamp(*deadline)),
+        None => builder.part(SqlPart::LedgerDeadline(completion.retention())),
+    }
+    builder.push(", compacted_at = NULL WHERE service_id = ");
+    builder.push_bind(fence.key().service_id());
+    builder.push(" AND principal_partition = ");
+    builder.push_bind(fence.key().principal_partition());
+    builder.push(" AND command_id = ");
+    builder.push_bind(fence.key().command_id());
+    builder.push(" AND command_contract_hash = ");
+    builder.push_bind(fence.contract_fingerprint_bytes().as_slice());
+    builder.push(" AND input_hash = ");
+    builder.push_bind(fence.input_hash_bytes().as_slice());
+    builder.push(" AND external_binding = ");
+    builder.push_bind(binding.as_str());
+    builder.push(" AND state = 'in_progress' AND causation_id = ");
+    builder.push_bind(fence.causation_id().as_str());
+    builder.push(" AND attempt_token = ");
+    builder.push_bind(fence.attempt_token().as_str());
+    builder.push(" AND attempt_number = ");
+    builder.push_bind(attempt_number);
+    builder.push(" AND lease_expires_at > ");
+    builder.part(SqlPart::LedgerNow);
+    if let Some(deadline) = retention_expires_at.as_ref() {
+        builder.push(" AND ");
+        builder.part(SqlPart::LedgerDeadlineIsLive(*deadline));
+    }
+    if executor.execute(builder).await? != 1 {
         return Err(CommandLedgerError::AttemptFenced {
             command_id: fence.key().command_id().to_string(),
         });

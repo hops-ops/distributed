@@ -57,7 +57,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
     const CONFLICT_REREAD_IN_TX: bool = false;
     const NOW: &'static str = "now()";
     const COMMAND_LEDGER_SELECT: &'static str = "command_name, command_contract_hash, \
-         input_hash, state, causation_id, attempt_token, attempt_number, \
+         input_hash, state, causation_id, attempt_token, attempt_number, external_binding, \
          EXTRACT(EPOCH FROM lease_expires_at)::double precision AS lease_expires_at, \
          outcome::text AS outcome, \
          EXTRACT(EPOCH FROM created_at)::double precision AS created_at, \

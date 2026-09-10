@@ -318,6 +318,24 @@ where
         .await
     }
 
+    async fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> Result<(), CommandLedgerError> {
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            repository_storage_error::<DB>("begin external command completion", error)
+        })?;
+        crate::repository::sql::ledger::complete_external(
+            &mut executor::ConnectionExecutor::<DB>(&mut *tx),
+            &completion,
+        )
+        .await?;
+        tx.commit().await.map_err(|error| {
+            repository_storage_error::<DB>("commit external command completion", error)
+        })?;
+        Ok(())
+    }
+
     async fn compact_expired_commands(&self, limit: usize) -> Result<u64, CommandLedgerError> {
         if limit == 0 {
             return Ok(0);

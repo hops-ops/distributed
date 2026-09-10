@@ -16,7 +16,8 @@ use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, Comman
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey, CommandLedgerState,
-    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation, ReservationOutcome,
+    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
+    ExternalCommandCompletion, ReservationOutcome,
 };
 #[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
@@ -1015,6 +1016,13 @@ impl CommandLedgerStore for AmbiguousCommitRepository {
         attempt: AttemptFence,
     ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
         CommandLedgerStore::mark_retryable_unknown(&self.inner, attempt)
+    }
+
+    fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
+        CommandLedgerStore::complete_external_command(&self.inner, completion)
     }
 
     fn compact_expired_commands(
