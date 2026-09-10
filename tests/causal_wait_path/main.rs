@@ -593,6 +593,28 @@ async fn trusted_native_metadata_reaches_a_real_aggregate_cell() {
         "replay must not append another aggregate event"
     );
 
+    let (status, body) = host
+        .post_cell_wait_path_with_context(
+            "generic.grant",
+            "0190a000-0000-7000-8000-000000000122",
+            json!({ "id": "different-input" }),
+            &session,
+            &context,
+        )
+        .await
+        .expect("changed input should return a durable command-id conflict");
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["code"], "COMMAND_ID_REUSE");
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1,
+        "a reused identity with a changed body must not append an event"
+    );
+
     let client = reqwest::Client::new();
     let missing_secret = client
         .post(format!("{base}/generic.grant"))
