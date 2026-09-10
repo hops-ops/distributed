@@ -1769,6 +1769,176 @@ test('terminal exact projection status settles without command-triggered revalid
 	runtime.dispose();
 });
 
+test('terminal succeeded status with exact observations settles delivery without retiring the layer', async () => {
+	const replica = new TestReplica();
+	let pendingMetadata;
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{
+			dispatch(request) {
+				pendingMetadata = commandMetadata(request, {
+					actualTitle: 'accepted',
+					state: 'succeeded'
+				});
+				return Promise.resolve(
+					envelope(request, { command: pendingMetadata })
+				);
+			},
+			status(request) {
+				const terminalMetadata = Object.freeze({
+					...pendingMetadata,
+					state: 'succeeded',
+					observations: Object.freeze(
+						pendingMetadata.expects.map((expectation) =>
+							Object.freeze({
+								...expectation,
+								causationId: pendingMetadata.causationId
+							})
+						)
+					)
+				});
+				return Promise.resolve(
+					statusEnvelope(request, terminalMetadata)
+				);
+			}
+		},
+		{ change: artifact() },
+		{ status: STATUS }
+	);
+	const receipt = await runtime.commands.change(
+		{ id: 'todo-1', title: 'preview' },
+		{ commandId: COMMAND_A }
+	);
+
+	const projectedState = receipt.projected.then(
+		(outcome) => outcome.state,
+		() => 'rejected'
+	);
+	try {
+		assert.equal((await receipt.status()).state, 'succeeded');
+		const state = await Promise.race([
+			projectedState,
+			new Promise((resolve) =>
+				setTimeout(() => resolve('timed_out'), 100)
+			)
+		]);
+		assert.equal(state, 'atomic');
+		assert.deepEqual(replica.revalidations, []);
+		assert.equal(replica.layer(COMMAND_A), 'accepted');
+		assert.equal(replica.record('todo-1').fields.title, 'accepted');
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test('terminal succeeded status ignores incomplete or mismatched observations', async () => {
+	const cases = [
+		{
+			name: 'missing',
+			transform: () => []
+		},
+		{
+			name: 'causation',
+			transform: (observations) =>
+				observations.map((observation) => ({
+					...observation,
+					causationId: 'cause:other'
+				})),
+			protocolFailure: true
+		},
+		{
+			name: 'projection',
+			transform: (observations) =>
+				observations.map((observation) => ({
+					...observation,
+					projection: 'program:other'
+				})),
+			protocolFailure: true
+		},
+		{
+			name: 'scope',
+			transform: (observations) =>
+				observations.map((observation) => ({
+					...observation,
+					scopeToken: 'scope:other'
+				})),
+			protocolFailure: true
+		}
+	];
+
+	for (const { name, transform, protocolFailure = false } of cases) {
+		const replica = new TestReplica();
+		let pendingMetadata;
+		const runtime = createReplicaCommandRuntime(
+			replica,
+			{
+				dispatch(request) {
+					pendingMetadata = commandMetadata(request, {
+						actualTitle: 'accepted',
+						state: 'succeeded'
+					});
+					return Promise.resolve(
+						envelope(request, { command: pendingMetadata })
+					);
+				},
+				status(request) {
+					const observations = pendingMetadata.expects.map(
+						(expectation) => ({
+							...expectation,
+							causationId: pendingMetadata.causationId
+						})
+					);
+					return Promise.resolve(
+						statusEnvelope(request, {
+							...pendingMetadata,
+							state: 'succeeded',
+							observations: transform(observations)
+						})
+					);
+				}
+			},
+			{ change: artifact() },
+			{ status: STATUS }
+		);
+		const receipt = await runtime.commands.change(
+			{ id: 'todo-1', title: 'preview' },
+			{ commandId: COMMAND_A }
+		);
+		const projectedState = receipt.projected.then(
+			(outcome) => outcome.state,
+			() => 'rejected'
+		);
+		try {
+			if (protocolFailure) {
+				await assert.rejects(
+					receipt.status(),
+					{ code: 'REPLICA_COMMAND_PROTOCOL_INVALID' },
+					name
+				);
+				await assert.rejects(
+					receipt.projected,
+					{ code: 'REPLICA_COMMAND_PROTOCOL_INVALID' },
+					name
+				);
+				assert.equal(replica.layer(COMMAND_A), undefined, name);
+				continue;
+			}
+			assert.equal((await receipt.status()).state, 'succeeded', name);
+			const state = await Promise.race([
+				projectedState,
+				new Promise((resolve) =>
+					setTimeout(() => resolve('timed_out'), 50)
+				)
+			]);
+			assert.equal(state, 'timed_out', name);
+			assert.deepEqual(replica.revalidations, [], name);
+			assert.equal(replica.layer(COMMAND_A), 'accepted', name);
+		} finally {
+			runtime.dispose();
+		}
+	}
+});
+
 test('invalid live progression cannot poison a later valid status transition', async () => {
 	const replica = new TestReplica();
 	let request;

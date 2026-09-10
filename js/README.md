@@ -442,6 +442,14 @@ same replica and GraphQL transport. A command call:
      (`confirmDirectProjection`) before the call settles. The server waited in
      the command handler because it could; an event handler cannot.
 
+An Eventual command may be terminal `succeeded` at a cell boundary while its
+status envelope already carries every exact projection observation. Those
+observations settle `receipt.projected` because they prove delivery of the
+projection obligation; they do not retire the accepted optimistic layer. The
+layer is retired only by a matching canonical query or live frame, so an
+`@load` operation does not need to become `@live` merely to complete a causal
+wait. A later query or navigation can still supply that canonical frame.
+
 Applications do not provide list targets, merge functions, mutation update
 callbacks, board simulators, or invalidation maps. If the compiler cannot prove
 safe maintenance, the generated plan marks the affected projection stale and
