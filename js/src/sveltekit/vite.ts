@@ -127,7 +127,11 @@ export type DistributedSvelteKitViteOptions = Readonly<{
 	cwd?: string;
 	/** Executable invoked without a shell. Defaults to `distributed`. */
 	command?: string;
-	/** Prefix argv, e.g. `cargo run ... --`; never interpreted by a shell. */
+	/**
+	 * Prefix argv for standalone command execution, e.g. `cargo run ... --`;
+	 * never interpreted by a shell. Lifecycle-owned compilation invokes the
+	 * trusted initiating executable directly and ignores this launcher prefix.
+	 */
 	commandArgs?: readonly string[];
 	/** SvelteKit route source root. Defaults to `src/routes`. */
 	routesDir?: string;
@@ -1123,43 +1127,17 @@ function resolveIntegration(
 		cwd,
 		outputRoot: cwd,
 		command,
-		commandArgs: Object.freeze(
-			lifecycleContext
-				? lifecycleCommandArgs(configuredCommand, commandArgs)
-				: commandArgs
-		),
+		// A lifecycle-owned compile must be an invocation of the trusted
+		// initiating executable itself. A configured standalone prefix (most
+		// commonly `cargo run ... --`) belongs to the app's direct Vite mode;
+		// carrying it across would make the initiating binary parse launcher
+		// arguments as its own command and can select a different binary.
+		commandArgs: Object.freeze(lifecycleContext ? [] : commandArgs),
 		routesDir,
 		libDir,
 		aliases,
 		clients: Object.freeze(clients)
 	});
-}
-
-/**
- * A lifecycle-owned UI may inherit a Cargo launcher prefix from the app's
- * standalone Vite configuration (`cargo run ... --`). Once the trusted
- * initiating executable replaces Cargo, only the arguments after that
- * separator belong to the executable. Direct executable arguments remain
- * unchanged; this keeps non-Cargo lifecycle integrations explicit.
- */
-function lifecycleCommandArgs(
-	configuredCommand: string,
-	args: readonly string[]
-): readonly string[] {
-	const launcher = basename(configuredCommand).replace(/\.exe$/i, '');
-	if (launcher !== 'cargo') return args;
-	if (args[0] !== 'run') {
-		throw new TypeError(
-			'Distributed lifecycle Cargo launcher arguments must begin with `run`'
-		);
-	}
-	const separator = args.indexOf('--');
-	if (separator === -1) {
-		throw new TypeError(
-			'Distributed lifecycle Cargo launcher arguments must contain `--`'
-		);
-	}
-	return args.slice(separator + 1);
 }
 
 function relocateLifecycleOutputs(

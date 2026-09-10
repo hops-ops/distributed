@@ -138,8 +138,14 @@ process.stdout.write('generated fake client\n');
 async function fixture(t) {
 	const root = await mkdtemp(join(tmpdir(), 'distributed-vite-test-'));
 	const script = join(root, 'fake-distributed.mjs');
+	const executable = join(root, 'fake-distributed');
 	const log = join(root, 'commands.log');
 	await writeFile(script, fakeDistributedSource, 'utf8');
+	await writeFile(
+		executable,
+		`#!/usr/bin/env node\nawait import(${JSON.stringify(pathToFileURL(script).href)});\n`,
+		{ encoding: 'utf8', mode: 0o755 }
+	);
 	await writeFile(log, '', 'utf8');
 	await mkdir(join(root, 'src/routes/todos'), { recursive: true });
 	await mkdir(join(root, 'src/routes/admin'), { recursive: true });
@@ -174,7 +180,7 @@ async function fixture(t) {
 		}
 		await rm(root, { recursive: true, force: true });
 	});
-	return { root, script, log };
+	return { root, script, executable, log };
 }
 
 function clients() {
@@ -921,12 +927,12 @@ test('lifecycle generation writes only to the immutable candidate stage', async 
 });
 
 test('lifecycle compiler uses the initiating absolute CLI over an older PATH binary', async (t) => {
-	const { root, script, log } = await fixture(t);
+	const { root, script, executable, log } = await fixture(t);
 	const pathRoot = join(root, 'cli with spaces');
 	const cli = join(pathRoot, 'distributed');
 	const oldPathLog = join(root, 'old-path.log');
 	await mkdir(pathRoot, { recursive: true });
-	await symlink(process.execPath, cli);
+	await symlink(executable, cli);
 	const oldPath = join(root, 'older-path-bin');
 	await mkdir(oldPath, { recursive: true });
 	const oldDistributed = join(oldPath, 'distributed');
@@ -972,10 +978,9 @@ test('lifecycle compiler uses the initiating absolute CLI over an older PATH bin
 	await assert.rejects(readFile(oldPathLog), (error) => error?.code === 'ENOENT');
 });
 
-test('lifecycle compiler replaces an explicit Cargo launcher with the initiating CLI', async (t) => {
-	const { root, script, log } = await fixture(t);
-	const cli = join(root, 'distributed');
-	await symlink(process.execPath, cli);
+test('lifecycle compiler invokes the initiating CLI without a configured launcher prefix', async (t) => {
+	const { root, script, executable, log } = await fixture(t);
+	const cli = executable;
 	const previousCli = process.env.DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE;
 	const previousLifecycleRoot = process.env.DISTRIBUTED_LIFECYCLE_ROOT;
 	const previousLifecycleStage = process.env.DISTRIBUTED_LIFECYCLE_STAGE;
@@ -1016,19 +1021,6 @@ test('lifecycle compiler replaces an explicit Cargo launcher with the initiating
 	assert.deepEqual(
 		(await commandLog(log)).map((args) => args[0]),
 		['client-manifest', 'client', 'client-manifest', 'client']
-	);
-
-	await assert.rejects(
-		generateDistributedSvelteKitLifecycle(
-			{
-				cwd: root,
-				command: 'cargo',
-				commandArgs: ['run', '--quiet', script],
-				clients: clients()
-			},
-			{ projectRoot: root, stage: join(root, '.distributed/lifecycle-stage') }
-		),
-		/Cargo launcher arguments must contain `--`/
 	);
 });
 
