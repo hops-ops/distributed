@@ -191,6 +191,7 @@ impl CommandInputType for CompleteInput {
         CommandTypeDef::new(
             "CompleteTodoInput",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "todo_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -210,6 +211,7 @@ impl CommandOutputType for CompletePayload {
         CommandTypeDef::new(
             "CompleteTodoPayload",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "todo_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -491,6 +493,7 @@ fn projected_surface() -> Surface {
         .columns
         .iter()
         .map(|column| SurfaceTypeField {
+            unsigned_integer: None,
             name: column.name.clone(),
             type_name: column.scalar.clone(),
             nullable: column.nullable,
@@ -507,6 +510,7 @@ fn projected_surface() -> Surface {
         input: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "ProjectTodoInput".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "todo_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -767,7 +771,7 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
     );
     assert_eq!(
         first.protocol_fingerprint,
-        "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782"
+        "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b"
     );
 
     let user = first
@@ -876,6 +880,33 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
         json.contains("x-user-id"),
         "portable row policies expose only the static claim name, never its value"
     );
+}
+
+#[test]
+fn unsigned_command_fields_export_refined_codecs_and_change_fingerprints() {
+    use crate::command::CommandUnsignedInteger;
+    let mut full = full_surface();
+    let command = &mut full.commands[0];
+    let SurfaceCommandShape::Typed(definition) = &mut command.input else {
+        unreachable!()
+    };
+    definition.fields[0].type_name = "BigInt".into();
+    let signed = manifest_for_all_models("todos-service", "user", &full);
+    let SurfaceCommandShape::Typed(definition) = &mut full.commands[0].input else {
+        unreachable!()
+    };
+    definition.fields[0].unsigned_integer = Some(CommandUnsignedInteger::U64);
+    let unsigned = manifest_for_all_models("todos-service", "user", &full);
+    let wire = serde_json::to_value(&unsigned).unwrap();
+    assert_eq!(
+        wire["commands"][0]["input"]["definition"]["fields"][0]["type_name"],
+        "BigInt"
+    );
+    assert_eq!(
+        wire["commands"][0]["input"]["definition"]["fields"][0]["codec"],
+        "uint64_safe_integer"
+    );
+    assert_ne!(signed.schema_fingerprint, unsigned.schema_fingerprint);
 }
 
 #[test]

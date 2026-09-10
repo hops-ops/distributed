@@ -14,6 +14,7 @@ fn portable_command(id: &str, consistency: CommandConsistency) -> CommandSpec {
         CommandTypeSpec {
             name: format!("{id}Input"),
             fields: vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "title".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -25,6 +26,7 @@ fn portable_command(id: &str, consistency: CommandConsistency) -> CommandSpec {
         CommandTypeSpec {
             name: format!("{id}Output"),
             fields: vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,

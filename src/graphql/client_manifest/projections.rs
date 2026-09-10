@@ -1189,9 +1189,10 @@ fn input_field_compatible(
 ) -> bool {
     match expected {
         ProjectionValueType::Boolean => field.type_name == "Boolean",
-        ProjectionValueType::I64 | ProjectionValueType::U64 => {
-            matches!(field.type_name.as_str(), "BigInt" | "Int")
+        ProjectionValueType::I64 => {
+            matches!(field.type_name.as_str(), "BigInt" | "Int") && field.unsigned_integer.is_none()
         }
+        ProjectionValueType::U64 => field.type_name == "BigInt" && field.unsigned_integer.is_some(),
         ProjectionValueType::F64 => field.type_name == "Float",
         ProjectionValueType::String => {
             matches!(field.type_name.as_str(), "ID" | "String" | "Timestamptz")
@@ -1211,8 +1212,11 @@ fn input_field_compatible(
 fn codec_compatible(codec: &str, expected: &ProjectionValueType) -> bool {
     match expected {
         ProjectionValueType::Boolean => codec == "boolean",
-        ProjectionValueType::I64 | ProjectionValueType::U64 => {
-            codec == "json_number_precision_limited"
+        ProjectionValueType::I64 => {
+            matches!(codec, "int32" | "json_number_precision_limited")
+        }
+        ProjectionValueType::U64 => {
+            crate::command::CommandUnsignedInteger::from_client_codec(codec).is_some()
         }
         ProjectionValueType::F64 => codec == "float64",
         ProjectionValueType::String | ProjectionValueType::Enum(_) => codec == "string",
@@ -1416,6 +1420,7 @@ mod tests {
             input: SurfaceCommandShape::Typed(SurfaceTypeDef {
                 name: "TodoPreviewInput".into(),
                 fields: vec![SurfaceTypeField {
+                    unsigned_integer: None,
                     name: "value".into(),
                     type_name: input_type.into(),
                     nullable: false,
@@ -1730,6 +1735,7 @@ mod tests {
                 name: "TodoCreateInput".into(),
                 fields: vec![
                     SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "todo_id".into(),
                         type_name: "ID".into(),
                         nullable: false,
@@ -1738,6 +1744,7 @@ mod tests {
                         nested: None,
                     },
                     SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "title".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -2302,6 +2309,43 @@ mod tests {
     fn preview_sources_require_exact_typed_and_presence_proof() {
         let string_command = command("String");
         let input = CommandProjectionPreviewSource::input(["value"]);
+
+        let mut unsigned_command = command("BigInt");
+        let signed_command = unsigned_command.clone();
+        let SurfaceCommandShape::Typed(definition) = &mut unsigned_command.input else {
+            unreachable!()
+        };
+        definition.fields[0].unsigned_integer = Some(crate::command::CommandUnsignedInteger::U64);
+        for (command, allowed) in [(&unsigned_command, true), (&signed_command, false)] {
+            let source = client_preview_source(
+                &input,
+                true,
+                None,
+                Some(ProjectionPortableType::U64),
+                Some("u64"),
+                Some(false),
+                Some(true),
+                &ProjectionValueType::U64,
+                command,
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(source, ClientProjectionPreviewSource::Input { .. }),
+                allowed
+            );
+        }
+        assert!(codec_compatible(
+            "uint64_safe_integer",
+            &ProjectionValueType::U64
+        ));
+        assert!(!codec_compatible(
+            "json_number_precision_limited",
+            &ProjectionValueType::U64
+        ));
+        assert!(codec_compatible(
+            "json_number_precision_limited",
+            &ProjectionValueType::I64
+        ));
 
         assert_eq!(
             client_preview_source(

@@ -255,6 +255,7 @@ fn test_command(
         input: CommandTypeDef::new(
             "TestCommandInput",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -289,6 +290,7 @@ fn causal_surface_commands_accept_modeled_event_selectors_but_not_empty_authorit
         CommandTypeDef::new(
             "CausalPayload",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -896,6 +898,7 @@ fn command_surface_rejects_duplicate_mutation_field_ids() {
     let output = CommandTypeDef::new(
         "TestCommandPayload",
         vec![CommandTypeField {
+            unsigned_integer: None,
             name: "id".into(),
             type_name: "String".into(),
             nullable: false,
@@ -934,6 +937,7 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
         CommandTypeDef::new(
             "OuterPayload",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "inner".into(),
                 type_name: "InnerPayload".into(),
                 nullable: false,
@@ -955,6 +959,7 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
         CommandTypeDef::new(
             "OrderView",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -999,6 +1004,7 @@ fn projected_output_reuse_and_sdl_emission_use_the_same_exact_predicate() {
     let one_string_field = |name: &str| SurfaceTypeDef {
         name: name.into(),
         fields: vec![SurfaceTypeField {
+            unsigned_integer: None,
             name: "order_id".into(),
             type_name: "String".into(),
             nullable: false,
@@ -1065,6 +1071,7 @@ fn role_surface_legacy_effects_never_become_v2_client_authority() {
         name: "UpdateOrderInput".into(),
         fields: vec![
             SurfaceTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -1073,6 +1080,7 @@ fn role_surface_legacy_effects_never_become_v2_client_authority() {
                 nested: None,
             },
             SurfaceTypeField {
+                unsigned_integer: None,
                 name: "customer_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -1098,6 +1106,7 @@ fn role_surface_legacy_effects_never_become_v2_client_authority() {
         output: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "AssignCustomerPayload".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -1132,6 +1141,7 @@ fn role_surface_legacy_effects_never_become_v2_client_authority() {
         output: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "ApplyPresetPayload".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -1938,6 +1948,7 @@ fn constant_validation_uses_exact_wire_scalar_domains() {
         output: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "ConstantPayload".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "ok".into(),
                 type_name: "Boolean".into(),
                 nullable: false,
@@ -2000,6 +2011,7 @@ fn missing_surface_primary_key_column_is_a_configuration_error_not_a_panic() {
         output: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "PatchOrderPayload".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,

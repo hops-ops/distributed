@@ -142,6 +142,7 @@ impl CommandOutputType for PlanView {
             "PlanView",
             vec![
                 CommandTypeField {
+                    unsigned_integer: None,
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -150,6 +151,7 @@ impl CommandOutputType for PlanView {
                     nested: None,
                 },
                 CommandTypeField {
+                    unsigned_integer: None,
                     name: "title".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -158,6 +160,7 @@ impl CommandOutputType for PlanView {
                     nested: None,
                 },
                 CommandTypeField {
+                    unsigned_integer: None,
                     name: "count".into(),
                     type_name: "BigInt".into(),
                     nullable: false,
@@ -166,6 +169,7 @@ impl CommandOutputType for PlanView {
                     nested: None,
                 },
                 CommandTypeField {
+                    unsigned_integer: None,
                     name: "status".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -1013,6 +1017,7 @@ fn object_type<T: 'static>(name: &str) -> CommandTypeDef {
     CommandTypeDef::new(
         name,
         vec![CommandTypeField {
+            unsigned_integer: None,
             name: "id".into(),
             type_name: "String".into(),
             nullable: false,

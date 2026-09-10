@@ -1221,6 +1221,7 @@ mod causal_command_schema_tests {
                 input: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoInput".into(),
                     fields: vec![SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -1232,6 +1233,7 @@ mod causal_command_schema_tests {
                 output: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoPayload".into(),
                     fields: vec![SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,

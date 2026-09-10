@@ -10,6 +10,7 @@ fn graphql_type_def_mapping_golden() {
         "CreateItemInput",
         vec![
             CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -18,6 +19,7 @@ fn graphql_type_def_mapping_golden() {
                 nested: None,
             },
             CommandTypeField {
+                unsigned_integer: None,
                 name: "tags".into(),
                 type_name: "String".into(),
                 nullable: true,
@@ -46,6 +48,45 @@ struct DerivedInput {
 struct DerivedOutput {
     ok: bool,
     id: String,
+}
+
+#[derive(distributed::CommandInput)]
+#[allow(dead_code)]
+struct UnsignedInput {
+    tiny: u8,
+    short: Option<u16>,
+    revisions: Vec<Option<u32>>,
+    revision: u64,
+    signed: i64,
+}
+
+#[test]
+fn unsigned_command_derive_preserves_range_and_portable_contract() {
+    use distributed::command::{CommandInputType, CommandUnsignedInteger as Unsigned};
+    let definition = UnsignedInput::command_type();
+    assert_eq!(
+        definition
+            .fields
+            .iter()
+            .map(|field| field.unsigned_integer)
+            .collect::<Vec<_>>(),
+        vec![
+            Some(Unsigned::U8),
+            Some(Unsigned::U16),
+            Some(Unsigned::U32),
+            Some(Unsigned::U64),
+            None
+        ]
+    );
+    assert!(definition
+        .fields
+        .iter()
+        .all(|field| field.type_name == "BigInt"));
+    assert!(definition.fields[2].list && definition.fields[2].item_nullable);
+    let portable = distributed::application::CommandTypeSpec::from(&definition);
+    let encoded = serde_json::to_value(&portable).unwrap();
+    assert_eq!(encoded["fields"][3]["unsigned_integer"], "u64");
+    assert!(encoded["fields"][4].get("unsigned_integer").is_none());
 }
 
 #[derive(distributed::CommandInput, serde::Deserialize)]

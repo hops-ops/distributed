@@ -12,6 +12,9 @@ Write the domain once, compose it into one `Service` or several, then
 generate the client. Each stage below uses real code from
 [`tests/e2e-ui`](tests/e2e-ui).
 
+Unsigned command fields preserve their Rust range in generated client validation
+and optimistic projections; see [unsigned command inputs](docs/unsigned-command-inputs.md).
+
 ```mermaid
 sequenceDiagram
     actor Author

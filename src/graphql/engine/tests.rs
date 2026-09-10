@@ -943,6 +943,51 @@ mod client_surface_parity_tests {
         assert!(!response.extensions.contains_key("distributed"));
     }
 
+    #[test]
+    fn unsigned_presets_from_session_enforce_canonical_safe_ranges() {
+        for (codec, maximum) in [
+            ("uint8", 255_u64),
+            ("uint16", 65_535),
+            ("uint32", 4_294_967_295),
+            ("uint64_safe_integer", 9_007_199_254_740_991),
+        ] {
+            let descriptor = ClientTrustedPresetDescriptor {
+                name: "x-revision".into(),
+                codec: codec.into(),
+            };
+            let mut session = Session::new();
+            for raw in ["0".to_string(), maximum.to_string()] {
+                session.set("x-revision", &raw);
+                assert_eq!(
+                    crate::graphql::engine::protocol::resolve_protocol_preset(
+                        &session,
+                        &descriptor
+                    )
+                    .unwrap()
+                    .value,
+                    serde_json::json!(raw.parse::<u64>().unwrap())
+                );
+            }
+            for raw in [
+                "-1".to_string(),
+                "-0".into(),
+                "1.5".into(),
+                "1.0".into(),
+                "+1".into(),
+                "01".into(),
+                "NaN".into(),
+                (maximum + 1).to_string(),
+            ] {
+                session.set("x-revision", &raw);
+                assert!(crate::graphql::engine::protocol::resolve_protocol_preset(
+                    &session,
+                    &descriptor
+                )
+                .is_none());
+            }
+        }
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn row_policy_presets_follow_sql_claim_case_normalization() {
@@ -1472,6 +1517,7 @@ mod client_surface_parity_tests {
         nested: Option<CommandTypeDef>,
     ) -> CommandTypeField {
         CommandTypeField {
+            unsigned_integer: None,
             name: name.into(),
             type_name: type_name.into(),
             nullable,
@@ -1885,28 +1931,28 @@ mod client_surface_parity_tests {
 
     #[cfg(feature = "sqlite")]
     const SQLITE_RESTRICTED_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:c1c3dd3f242f82225b486542b1737976f791e019f50e015f8755f48d70685f9a",
+        manifest: "sha256:7c8a181165a416610142c06f6b0ddca34358d884b738af10e11bf9b928817bed",
         static_sdl: "sha256:03252ba251b1ddac611fe567d816f780f0876f9f6ce263be95a3480f88fc2283",
         runtime_sdl: "sha256:3d099b8c0b27f0dcbdd677199f767fcc5993071e06b2c0a7d4aa02caf4e5f4ac",
     };
 
     #[cfg(feature = "sqlite")]
     const SQLITE_ADMIN_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:94345b9e29bccaa77aa5083eb73014a1a102db7ce1f03f022a2f0e242b5c84d2",
+        manifest: "sha256:827e381234e72fa315daffa7a018f2c92f964d75ef70fbc86983b3aa704e52d9",
         static_sdl: "sha256:128b85bcd6485d14de62b0976e9f12e8b35ad9e7d96a5627d1edcfcabdb591b3",
         runtime_sdl: "sha256:c0b6d600d353357ab4f393897fb6b7ee51f69546f7a4cc4b6786e42abe621f5c",
     };
 
     #[cfg(feature = "postgres")]
     const POSTGRES_RESTRICTED_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:c1c3dd3f242f82225b486542b1737976f791e019f50e015f8755f48d70685f9a",
+        manifest: "sha256:7c8a181165a416610142c06f6b0ddca34358d884b738af10e11bf9b928817bed",
         static_sdl: "sha256:03252ba251b1ddac611fe567d816f780f0876f9f6ce263be95a3480f88fc2283",
         runtime_sdl: "sha256:3d099b8c0b27f0dcbdd677199f767fcc5993071e06b2c0a7d4aa02caf4e5f4ac",
     };
 
     #[cfg(feature = "postgres")]
     const POSTGRES_ADMIN_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:8ff2691f33789c8267b1338603b2ee3544841f8b17cc5b90ea2e851381dd36de",
+        manifest: "sha256:8e123332eb9ae3364290429e30feeee8a1da3cbad4004224382b8e6128c918a2",
         static_sdl: "sha256:afe92660c1700845ed5f3e0ddaacc4b481799c39f86b8eacecb46d1b8f99d421",
         runtime_sdl: "sha256:de4885736fdf22a57ccc55160d63b6d1a7fdb33728dec399e8a81d54ce7e8c09",
     };

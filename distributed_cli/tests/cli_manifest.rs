@@ -78,7 +78,7 @@ fn client_manifest_uses_service_surface_export() {
     );
     assert_eq!(
         manifest["protocol_fingerprint"],
-        "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782"
+        "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b"
     );
     assert_eq!(manifest["models"][0]["id"], "OrderView");
     assert_eq!(manifest["models"][0]["record_revisions"], true);

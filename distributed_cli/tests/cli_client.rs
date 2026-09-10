@@ -17,7 +17,7 @@ const ROLE_MANIFEST: &str = r#"{
     "name": "user"
   },
   "schema_fingerprint": "sha256:758a97e4f7e1e538e8be86d24abd3d50a8da2d5813d29abd7a04bfa092d05189",
-  "protocol_fingerprint": "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782",
+  "protocol_fingerprint": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
   "execution": {
     "max_depth": 8,
     "max_complexity": 500,

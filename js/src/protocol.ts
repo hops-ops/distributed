@@ -14,6 +14,7 @@ import {
 	parseDistributedGenerationEnvelope,
 	type DistributedGenerationEnvelope
 } from './generation.js';
+import { isUnsignedInteger, unsignedIntegerMaximum, type UnsignedIntegerCodec } from './unsigned-integer.js';
 
 /** The only Distributed GraphQL protocol version understood by this package. */
 export const DISTRIBUTED_PROTOCOL_VERSION = 1 as const;
@@ -51,6 +52,7 @@ export type DistributedProjectionDisposition = 'revalidate';
 
 /** Closed wire codecs for server-derived, client-visible trusted presets. */
 export type DistributedTrustedPresetCodec =
+	| UnsignedIntegerCodec
 	| 'string'
 	| 'string_unvalidated_timestamp'
 	| 'base64'
@@ -828,6 +830,7 @@ export function isDistributedTrustedPresetCodec(
 		value === 'int32' ||
 		value === 'float64' ||
 		value === 'json_number_precision_limited' ||
+		(typeof value === 'string' && unsignedIntegerMaximum(value) !== undefined) ||
 		value === 'json'
 	);
 }
@@ -845,6 +848,11 @@ function parseTrustedPresetValue(
 	codec: DistributedTrustedPresetCodec,
 	path: string
 ): DistributedProtocolValue {
+	const unsignedMaximum = unsignedIntegerMaximum(codec);
+	if (unsignedMaximum !== undefined) {
+		if (!isUnsignedInteger(value, unsignedMaximum)) invalid(path);
+		return value;
+	}
 	switch (codec) {
 		case 'string':
 		case 'string_unvalidated_timestamp':
@@ -887,6 +895,8 @@ function parseTrustedPresetValue(
 			return Object.is(value, -0) ? 0 : value;
 		case 'json':
 			return cloneProtocolValue(value, path);
+		default:
+			return invalid(path);
 	}
 }
 

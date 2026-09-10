@@ -31,6 +31,7 @@ fn surface_type(definition: &CommandTypeDef) -> SurfaceTypeDef {
             .fields
             .iter()
             .map(|field| SurfaceTypeField {
+                unsigned_integer: field.unsigned_integer,
                 name: field.name.clone(),
                 type_name: field.type_name.clone(),
                 nullable: field.nullable,

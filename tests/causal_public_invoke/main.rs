@@ -56,6 +56,7 @@ impl CommandInputType for CompleteInput {
         CommandTypeDef::new(
             "CompleteInput",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -78,6 +79,7 @@ impl CommandOutputType for CompletePayload {
         CommandTypeDef::new(
             "CompletePayload",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,

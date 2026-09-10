@@ -22,6 +22,18 @@ fn command_ledger_fingerprint_preserves_the_v1_canonical_contract() {
     );
 }
 
+#[test]
+fn unsigned_range_is_part_of_command_retry_identity() {
+    let mut signed = typed_command::<Input, Succeeded<Payload>>("revision.update").into_contract();
+    signed.input.fields[0].type_name = "BigInt".into();
+    let mut unsigned = signed.clone();
+    unsigned.input.fields[0].unsigned_integer = Some(CommandUnsignedInteger::U64);
+    assert_ne!(signed.fingerprint_bytes(), unsigned.fingerprint_bytes());
+    let mut narrower = unsigned.clone();
+    narrower.input.fields[0].unsigned_integer = Some(CommandUnsignedInteger::U32);
+    assert_ne!(unsigned.fingerprint_bytes(), narrower.fingerprint_bytes());
+}
+
 #[allow(dead_code)]
 #[derive(Deserialize)]
 struct Input {
@@ -33,6 +45,7 @@ impl CommandInputType for Input {
         CommandTypeDef::new(
             "Input",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -141,6 +154,7 @@ impl CommandOutputType for Payload {
         CommandTypeDef::new(
             "Payload",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -873,6 +887,7 @@ fn binding_canonicalizes_fields_and_roles_but_preserves_effect_order() {
         .roles(["writer", "admin"])
         .into_contract();
     first.input.fields.push(CommandTypeField {
+        unsigned_integer: None,
         name: "z_extra".into(),
         type_name: "String".into(),
         nullable: true,
@@ -900,6 +915,7 @@ fn binding_canonicalizes_fields_and_roles_but_preserves_effect_order() {
         .roles(["writer", "admin"])
         .into_contract();
     reordered.input.fields.push(CommandTypeField {
+        unsigned_integer: None,
         name: "z_extra".into(),
         type_name: "String".into(),
         nullable: true,

@@ -13,6 +13,14 @@
           "typeName": "ID"
         },
         {
+          "codec": "uint64_safe_integer",
+          "itemNullable": false,
+          "list": false,
+          "name": "priority",
+          "nullable": false,
+          "typeName": "BigInt"
+        },
+        {
           "codec": "string",
           "itemNullable": false,
           "list": false,
@@ -130,30 +138,88 @@
           "ordinal": 0
         }
       ],
-      "operations": [],
-      "recoveries": [
+      "operations": [
         {
-          "condition": "always",
+          "mutation": {
+            "fields": [
+              {
+                "field": "completed",
+                "value": {
+                  "kind": "constant",
+                  "value": {
+                    "type": "boolean",
+                    "value": false
+                  }
+                }
+              },
+              {
+                "field": "priority",
+                "value": {
+                  "kind": "input",
+                  "path": [
+                    "priority"
+                  ]
+                }
+              },
+              {
+                "field": "title",
+                "value": {
+                  "kind": "input",
+                  "path": [
+                    "title"
+                  ]
+                }
+              }
+            ],
+            "op": "upsert",
+            "replace": [
+              "completed",
+              "priority",
+              "title"
+            ],
+            "scope": {
+              "key": [
+                {
+                  "field": "tenantId",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "input",
+                    "path": [
+                      "tenantId"
+                    ]
+                  }
+                },
+                {
+                  "field": "id",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "generated_default",
+                    "path": [
+                      "id"
+                    ]
+                  }
+                }
+              ],
+              "model": "Todo",
+              "partition": {
+                "expression": {
+                  "kind": "input",
+                  "path": [
+                    "tenantId"
+                  ]
+                },
+                "kind": "expression",
+                "requires": "current_cache_partition"
+              }
+            }
+          },
           "occurrence_ordinal": 0,
           "projection_refs": [
             0
-          ],
-          "target": {
-            "kind": "model",
-            "model": "Todo",
-            "partition": {
-              "expression": {
-                "kind": "input",
-                "path": [
-                  "tenantId"
-                ]
-              },
-              "kind": "expression",
-              "requires": "current_cache_partition"
-            }
-          }
+          ]
         }
       ],
+      "recoveries": [],
       "version": 1
     },
     "projectionProgramVersion": 2,
@@ -171,17 +237,12 @@
   "protocol": {
     "operation": "sha256:9b2ba78faeaad3b384d74519aff78252c2f7f0305db1ac0dda9833ba25af58e5",
     "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
-    "schemaHash": "sha256:574ba7862d1814821cb9de30c2494f298031dd1d25ea615317aac1062af08b60",
+    "schemaHash": "sha256:1d9aecd4ea0b8524e2dd299ba8299b5520dd9351621780a49ac55248f8df251c",
     "surface": {
       "kind": "role",
       "name": "user"
     },
-    "trustedPresets": [
-      {
-        "codec": "int32",
-        "name": "priority"
-      }
-    ],
+    "trustedPresets": [],
     "version": 1
   },
   "revalidation": {
@@ -192,7 +253,7 @@
       "Todo"
     ],
     "relationships": [],
-    "required": true,
+    "required": false,
     "version": 1
   },
   "version": 2

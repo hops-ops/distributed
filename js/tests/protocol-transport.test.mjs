@@ -103,6 +103,22 @@ function responseExtensions() {
 	};
 }
 
+test('unsigned trusted presets accept only exact bounded integers', () => {
+	for (const [codec, maximum] of [['uint8', 255], ['uint16', 65_535],
+		['uint32', 4_294_967_295], ['uint64_safe_integer', Number.MAX_SAFE_INTEGER]]) {
+		for (const value of [0, 1, maximum]) {
+			const envelope = distributedEnvelope();
+			envelope.trustedPresets = [{ name: 'revision', codec, value }];
+			assert.equal(parseDistributedProtocolEnvelope(envelope).trustedPresets[0].value, value);
+		}
+		for (const value of [-1, -0, 1.5, NaN, Infinity, maximum + 1, '1', 1n]) {
+			const envelope = distributedEnvelope();
+			envelope.trustedPresets = [{ name: 'revision', codec, value }];
+			assert.throws(() => parseDistributedProtocolEnvelope(envelope), DistributedProtocolError);
+		}
+	}
+});
+
 test('protocol parser validates receipts while retaining future metadata opaquely', () => {
 	assert.deepEqual(COMMAND_CONSISTENCY, {
 		SUCCEEDED: 'succeeded',

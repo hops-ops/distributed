@@ -163,6 +163,7 @@ mod live {
                 "CreateInput",
                 vec![
                     CommandTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -171,6 +172,7 @@ mod live {
                         nested: None,
                     },
                     CommandTypeField {
+                        unsigned_integer: None,
                         name: "title".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -194,6 +196,7 @@ mod live {
             CommandTypeDef::new(
                 "IdPayload",
                 vec![CommandTypeField {
+                    unsigned_integer: None,
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,

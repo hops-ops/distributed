@@ -221,6 +221,23 @@ fn canonicalize_leaf(
     value: Value,
     path: &str,
 ) -> Result<Value, CommandInputError> {
+    if let Some(unsigned) = field.unsigned_integer {
+        if field.type_name != "BigInt" || field.nested.is_some() {
+            return Err(CommandInputError::at(
+                path,
+                "unsigned refinement requires BigInt",
+            ));
+        }
+        return match value {
+            Value::Number(value) if value.as_u64().is_some_and(|n| n <= unsigned.max_value()) => {
+                Ok(Value::Number(value))
+            }
+            _ => Err(CommandInputError::at(
+                path,
+                "must be an unsigned integer in range",
+            )),
+        };
+    }
     if let Some(nested) = field.nested.as_deref() {
         return canonicalize_object(nested, value, path);
     }
@@ -401,6 +418,7 @@ mod tests {
         nested: Option<CommandTypeDef>,
     ) -> CommandTypeField {
         CommandTypeField {
+            unsigned_integer: None,
             name: name.into(),
             type_name: type_name.into(),
             nullable,
@@ -431,6 +449,44 @@ mod tests {
                 field("document", "JSON", true, false, false, None),
             ],
         )
+    }
+
+    #[test]
+    fn unsigned_inputs_preserve_full_rust_range_and_reject_invalid_values() {
+        use crate::command::CommandUnsignedInteger;
+        for unsigned in [
+            CommandUnsignedInteger::U8,
+            CommandUnsignedInteger::U16,
+            CommandUnsignedInteger::U32,
+            CommandUnsignedInteger::U64,
+        ] {
+            let mut value_field = field("revision", "BigInt", false, false, false, None);
+            value_field.unsigned_integer = Some(unsigned);
+            let definition = CommandTypeDef::new("RevisionInput", vec![value_field]);
+            for value in [0, 1, unsigned.max_value()] {
+                assert_eq!(
+                    canonicalize_command_input(&definition, json!({"revision": value}))
+                        .unwrap()
+                        .wire()["revision"],
+                    json!(value)
+                );
+            }
+            let mut invalid = vec![
+                json!(-1),
+                json!(-0.0),
+                json!(1.5),
+                json!("1"),
+                serde_json::from_str("18446744073709551616").unwrap(),
+            ];
+            if let Some(overflow) = unsigned.max_value().checked_add(1) {
+                invalid.push(json!(overflow));
+            }
+            for value in invalid {
+                assert!(
+                    canonicalize_command_input(&definition, json!({"revision": value})).is_err()
+                );
+            }
+        }
     }
 
     #[test]

@@ -12,7 +12,9 @@ pub(crate) mod input;
 mod types;
 
 pub(crate) use types::scalar_type_name;
-pub use types::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
+pub use types::{
+    CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField, CommandUnsignedInteger,
+};
 
 mod direct_projection;
 mod effect_wire;
