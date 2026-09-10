@@ -675,6 +675,134 @@ async fn trusted_native_metadata_reaches_a_real_aggregate_cell() {
 }
 
 #[tokio::test]
+async fn authenticated_transport_recovery_requires_exact_no_effects_then_replays() {
+    use axum::{routing::post, Router};
+
+    let secret = InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap();
+    let cell = Arc::new(
+        AggregateCell::<WaitAgg>::new("recovery-cell")
+            .unwrap()
+            .mount(TrustedCreate),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(post(typed_cell_bridge))
+        .with_state(TypedCellBridgeState {
+            cell: Arc::clone(&cell),
+            secret: secret.clone(),
+        });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let base = format!("http://{addr}");
+    let host = HttpCommandHost::new_internal(base, secret).unwrap();
+    let mut session = distributed::microsvc::Session::new();
+    session.set(USER_ID_KEY, "native-user");
+    session.set(ROLE_KEY, "system");
+
+    // The original command is authenticated at the HTTP boundary but lacks
+    // the producer claim required by the destination cell. This exact 401 is
+    // the only recoverable failure: the cell must have no receipt or event.
+    let (status, body) = host
+        .post_cell_wait_path_with_causation(
+            "generic.grant",
+            "0190a000-0000-7000-8000-000000000220",
+            json!({ "id": "recovery-cell" }),
+            &session,
+            "generic-writer",
+            "generic-partition",
+            Some(TRUSTED_CAUSATION_ID),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::UNAUTHORIZED.as_u16(), "{body}");
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("trusted producer metadata")));
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        0
+    );
+
+    let metadata =
+        TrustedRequestMetadata::try_from_pairs([("x-producer", "canonical-fact")]).unwrap();
+    let context = CellRequestContext::new("generic-writer", "generic-partition")
+        .with_causation_id(TRUSTED_CAUSATION_ID)
+        .with_trusted_metadata(metadata);
+    let recovery_command_id = "0190a000-0000-7000-8000-000000000221";
+
+    let (status, body) = host
+        .post_cell_wait_path_with_context(
+            "generic.grant",
+            recovery_command_id,
+            json!({ "id": "recovery-cell" }),
+            &session,
+            &context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+    assert_eq!(body["receipt"]["replayed"], false);
+    assert_eq!(body["receipt"]["causationId"], TRUSTED_CAUSATION_ID);
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1
+    );
+
+    let (status, body) = host
+        .post_cell_wait_path_with_context(
+            "generic.grant",
+            recovery_command_id,
+            json!({ "id": "recovery-cell" }),
+            &session,
+            &context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+    assert_eq!(body["receipt"]["replayed"], true);
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1
+    );
+
+    let (status, body) = host
+        .post_cell_wait_path_with_context(
+            "generic.grant",
+            recovery_command_id,
+            json!({ "id": "changed-recovery-body" }),
+            &session,
+            &context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::CONFLICT.as_u16(), "{body}");
+    assert_eq!(body["code"], "COMMAND_ID_REUSE");
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn celld_host_completes_remote_commit_once_and_rejects_changed_shard() {
     use axum::{extract::State, http::HeaderMap, http::StatusCode, routing::post, Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
