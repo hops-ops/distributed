@@ -879,6 +879,11 @@ fn validate_projection(
         let fields = modeled.as_object().ok_or_else(|| {
             ApplicationError::InvalidSpec("modeled projection must be an object".into())
         })?;
+        if let Some(program) = fields.get("program") {
+            // Validate each shared value independently without retaining the
+            // expanded copies in the manifest or increasing the wire budget.
+            super::expand_projection_program_contract(program)?;
+        }
         let program_id = fields
             .get("program_id")
             .and_then(serde_json::Value::as_str)
