@@ -143,6 +143,164 @@ fn full_surface() -> Surface {
         .expect("non-empty Surface should compile")
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Deserialize, CommandInput)]
+struct UnsignedContractInput {
+    small: u8,
+    optional: Option<u16>,
+    items: Vec<Option<u32>>,
+    revision: u64,
+    signed: i64,
+    title: String,
+}
+
+#[derive(Clone, Serialize, CommandOutput)]
+struct UnsignedContractOutput {
+    small: u8,
+    optional: Option<u16>,
+    items: Vec<Option<u32>>,
+    revision: u64,
+    signed: i64,
+    title: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Deserialize, CommandInput)]
+struct UnsignedContractInputEnvelope {
+    nested: UnsignedContractInput,
+}
+
+#[derive(Clone, Serialize, CommandOutput)]
+struct UnsignedContractOutputEnvelope {
+    nested: UnsignedContractOutput,
+}
+
+#[derive(Default)]
+struct UnsignedContractAggregate {
+    entity: distributed::Entity,
+}
+
+impl distributed::Aggregate for UnsignedContractAggregate {
+    type ReplayError = String;
+
+    fn aggregate_type() -> &'static str {
+        "unsigned-contract"
+    }
+    fn entity(&self) -> &distributed::Entity {
+        &self.entity
+    }
+    fn entity_mut(&mut self) -> &mut distributed::Entity {
+        &mut self.entity
+    }
+    fn replay_event(&mut self, _: &distributed::EventRecord) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn unsigned_surface_command_contract_round_trips() {
+    use distributed::microsvc::{CausalCommandContext, Routes, Service};
+    use distributed::{AggregateRepository, InMemoryRepository};
+
+    let routes = Routes::new().with_repo(AggregateRepository::<_, UnsignedContractAggregate>::new(
+        InMemoryRepository::new(),
+    ));
+    let service = Service::new().named("unsigned-app").routes(
+        routes
+            .typed_command(typed_command::<
+                UnsignedContractInput,
+                Succeeded<UnsignedContractOutput>,
+            >("unsigned.flat"))
+            .handle(
+                |_: &CausalCommandContext<'_, UnsignedContractAggregate>,
+                 _: UnsignedContractInput| async {
+                    unreachable!("manifest compilation must not execute handlers")
+                },
+            )
+            .typed_command(typed_command::<
+                UnsignedContractInputEnvelope,
+                Succeeded<UnsignedContractOutputEnvelope>,
+            >("unsigned.nested"))
+            .handle(
+                |_: &CausalCommandContext<'_, UnsignedContractAggregate>,
+                 _: UnsignedContractInputEnvelope| async {
+                    unreachable!("manifest compilation must not execute handlers")
+                },
+            ),
+    );
+    let surface = full_surface().with_service(&service).unwrap();
+    let spec = SurfaceSpec::from_surface("web", &surface).unwrap();
+    for command in spec.contract["commands"].as_array().unwrap() {
+        for direction in ["input", "output"] {
+            let mut fields = command[direction]["fields"].as_array().unwrap();
+            if fields[0]["name"] == "nested" {
+                assert!(fields[0].get("unsigned_integer").is_none());
+                fields = fields[0]["nested"]["fields"].as_array().unwrap();
+            }
+            for (name, width) in [
+                ("small", "u8"),
+                ("optional", "u16"),
+                ("items", "u32"),
+                ("revision", "u64"),
+            ] {
+                let field = fields.iter().find(|field| field["name"] == name).unwrap();
+                assert_eq!(field["unsigned_integer"], width);
+                assert_eq!(field["type_name"], "BigInt");
+            }
+            for name in ["signed", "title"] {
+                let field = fields.iter().find(|field| field["name"] == name).unwrap();
+                assert!(field.get("unsigned_integer").is_none());
+            }
+        }
+    }
+    let application = service.application("unsigned-app", spec).unwrap();
+    let manifest = application.manifest();
+    let bytes = manifest.canonical_bytes().unwrap();
+    let decoded = ApplicationManifest::from_canonical_bytes(&bytes).unwrap();
+    assert_eq!(&decoded, manifest);
+    assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
+
+    let mut tampered = manifest.clone();
+    tampered.surfaces[0].contract["commands"][0]["input"]["fields"][0]["unsigned_integer"] =
+        serde_json::json!("u64");
+    tampered.surfaces[0].fingerprint = distributed::application::sha256_fingerprint(
+        &tampered.surfaces[0].canonical_bytes().unwrap(),
+    );
+    assert!(tampered
+        .refresh_fingerprints()
+        .unwrap_err()
+        .to_string()
+        .contains("surface contract material"));
+}
+
+#[test]
+fn ordinary_surface_command_contract_keeps_unrefined_field_shape() {
+    let module = command_module();
+    let surface = full_surface().with_module(&module).unwrap();
+    let spec = SurfaceSpec::from_surface("web", &surface).unwrap();
+    for command in spec.contract["commands"].as_array().unwrap() {
+        for (direction, name) in [("input", "title"), ("output", "id")] {
+            assert_eq!(
+                command[direction]["fields"],
+                serde_json::json!([{
+                    "name": name, "type_name": "String", "nullable": false,
+                    "list": false, "item_nullable": false, "nested": null,
+                }])
+            );
+        }
+    }
+    let application = Application::new("ordinary-app")
+        .module(module)
+        .surface(spec)
+        .build()
+        .unwrap();
+    let bytes = application.manifest().canonical_bytes().unwrap();
+    assert_eq!(
+        ApplicationManifest::from_canonical_bytes(&bytes).unwrap(),
+        *application.manifest()
+    );
+}
+
 #[test]
 fn generated_surface_above_opaque_json_budget_round_trips() {
     let tables = (0..500)

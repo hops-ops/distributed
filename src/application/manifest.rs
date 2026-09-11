@@ -1852,14 +1852,18 @@ fn surface_command_type_value(
     serde_json::json!({
         "name": definition.name,
         "fields": definition.fields.iter().map(|field| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "name": field.name,
                 "type_name": field.type_name,
                 "nullable": field.nullable,
                 "list": field.list,
                 "item_nullable": field.item_nullable,
                 "nested": field.nested.as_deref().map(|nested| surface_command_type_value(Some(nested))),
-            })
+            });
+            if let Some(unsigned) = field.unsigned_integer {
+                value["unsigned_integer"] = serde_json::json!(unsigned);
+            }
+            value
         }).collect::<Vec<_>>(),
     })
 }
