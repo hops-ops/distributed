@@ -651,20 +651,18 @@ where
         self
     }
 
-    /// Declare that one emitted state field is the authenticated `x-user-id`.
+    /// Declare that one emitted state or flat event-body field is the
+    /// authenticated `x-user-id`. `B` is the exact serialized body type.
     ///
     /// This is preview provenance only; command admission and handler-side
     /// principal binding remain mandatory.
     #[must_use]
-    pub fn authenticated_user_field<E, S>(mut self, rust_field: &'static str) -> Self
+    pub fn authenticated_user_field<E, B>(mut self, rust_field: &'static str) -> Self
     where
-        E: crate::domain_event::DomainEventBodyContract<S>,
-        S: crate::DomainState + crate::projection::lower::ProjectionBodyMetadata,
+        E: crate::domain_event::DomainEventBodyContract<B>,
+        B: crate::command::CommandProjectionBody,
     {
-        let values = crate::command::__command_projection_state_known_values::<E, S>(vec![(
-            rust_field,
-            crate::command::CommandProjectionPreviewSource::trusted("x-user-id", "string"),
-        )]);
+        let values = crate::command::authenticated_user_field_preview::<E, B>(rust_field);
         self.contract
             .projections
             .add_authenticated_user_field(rust_field, values);

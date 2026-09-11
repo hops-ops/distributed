@@ -458,6 +458,15 @@ fn expand_domain_capture(
 
                 impl distributed::domain_event::DomainEventBodyContract<Self> for #body_type {}
 
+                impl distributed::command::CommandProjectionBody for #body_type {
+                    fn command_projection_descriptor(
+                        _: &'static str,
+                        _: u64,
+                    ) -> distributed::DomainEventDescriptor {
+                        <Self as distributed::DomainEvent>::DESCRIPTOR.clone()
+                    }
+                }
+
                 impl distributed::projection::lower::ProjectionBodyMetadata for #body_type {
                     #projection_metadata
                 }
@@ -1164,15 +1173,24 @@ fn discover_domain_command_transitions(
         return Vec::new();
     }
 
+    // Only decision methods belong in the helper graph. A recorder's rewritten
+    // implementation includes replay/capture plumbing, not another decision.
+    let methods = impl_block
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::ImplItem::Fn(method)
+                if !event_methods
+                    .iter()
+                    .any(|event| event.method_name == method.sig.ident) =>
+            {
+                Some((method.sig.ident.to_string(), method))
+            }
+            _ => None,
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut transitions = Vec::new();
-    for item in &impl_block.items {
-        let syn::ImplItem::Fn(method) = item else {
-            continue;
-        };
-        // Domain recorders themselves are not command transitions.
-        if recorders.contains_key(&method.sig.ident.to_string()) {
-            continue;
-        }
+    for (name, method) in &methods {
         if !matches!(method.vis, syn::Visibility::Public(_)) {
             continue;
         }
@@ -1180,8 +1198,20 @@ fn discover_domain_command_transitions(
         let mut finder = DomainEventCallFinder {
             recorders: &recorders,
             found: std::collections::BTreeMap::new(),
+            calls: std::collections::BTreeSet::new(),
         };
-        finder.visit_block(&method.block);
+        let mut pending = vec![name.clone()];
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(name) = pending.pop() {
+            if !visited.insert(name.clone()) {
+                continue;
+            }
+            let Some(callee) = methods.get(&name) else {
+                continue;
+            };
+            finder.visit_block(&callee.block);
+            pending.extend(std::mem::take(&mut finder.calls));
+        }
         if finder.found.is_empty() {
             continue;
         }
@@ -1196,9 +1226,14 @@ fn discover_domain_command_transitions(
 struct DomainEventCallFinder<'a> {
     recorders: &'a std::collections::BTreeMap<String, DomainCommandEvent>,
     found: std::collections::BTreeMap<String, DomainCommandEvent>,
+    calls: std::collections::BTreeSet<String>,
 }
 
 impl<'ast> Visit<'ast> for DomainEventCallFinder<'_> {
+    // A nested function/impl has its own receiver scope. Its `self` must not
+    // be confused with the aggregate, even when a method name happens to match.
+    fn visit_item(&mut self, _: &'ast syn::Item) {}
+
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if is_self_receiver(&node.receiver) {
             if let Some(command_event) = self.recorders.get(&node.method.to_string()) {
@@ -1227,6 +1262,8 @@ impl<'ast> Visit<'ast> for DomainEventCallFinder<'_> {
                         });
                     })
                     .or_insert(candidate);
+            } else {
+                self.calls.insert(node.method.to_string());
             }
         }
         syn::visit::visit_expr_method_call(self, node);
@@ -1436,8 +1473,8 @@ fn expand_domain_commands_module(
         });
         let doc = format!(
             "Outward domain-event set for `{aggregate_name}::{method_name}`.\n\n\
-             Derived from direct `self.<recorder>()` calls to `#[event(..., domain)]` \
-             methods in this `#[sourced]` impl. Use with \
+             Derived from `self.<recorder>()` calls to `#[event(..., domain)]` \
+             methods, including through decision helpers in this `#[sourced]` impl. Use with \
              [`distributed::command::TypedCommand::emits_events`]."
         );
         quote! {

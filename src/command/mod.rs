@@ -60,14 +60,14 @@ pub(crate) use projection_obligations::InputDefaultGenerator;
 pub(crate) use projection_obligations::{
     validate_projection_confirmation_count, CommandInputDefault, CommandProjectionConfirmation,
 };
-pub(crate) use projections::CommandProjectionEvents;
 pub use projections::{
     __command_projection_event_descriptor, __command_projection_event_preview,
     __command_projection_events, __command_projection_preview_constant,
     __command_projection_state_known_values, __command_projection_state_preview, CommandEventSet,
-    CommandProjectionEventSet, CommandProjectionPreview, CommandProjectionPreviewSource,
-    CommandProjectionPureArg, CommandProjectionPureReduce,
+    CommandProjectionBody, CommandProjectionEventSet, CommandProjectionPreview,
+    CommandProjectionPreviewSource, CommandProjectionPureArg, CommandProjectionPureReduce,
 };
+pub(crate) use projections::{authenticated_user_field_preview, CommandProjectionEvents};
 // Re-exported for unit tests that resolve obligations through this module path.
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use projection_obligations::{

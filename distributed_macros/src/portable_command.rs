@@ -10,7 +10,7 @@ use syn::{parenthesized, Expr, Ident, LitStr, Token, Type};
 
 struct AuthenticatedUserField {
     event: Type,
-    state: Type,
+    body: Type,
     field: LitStr,
 }
 
@@ -20,18 +20,14 @@ impl Parse for AuthenticatedUserField {
         parenthesized!(values in input);
         let event = values.parse()?;
         values.parse::<Token![,]>()?;
-        let state = values.parse()?;
+        let body = values.parse()?;
         values.parse::<Token![,]>()?;
         let field = values.parse()?;
         if !values.is_empty() {
             return Err(values
-                .error("authenticated_user_field expects (EventType, StateType, \"field_name\")"));
+                .error("authenticated_user_field expects (EventType, BodyType, \"field_name\")"));
         }
-        Ok(Self {
-            event,
-            state,
-            field,
-        })
+        Ok(Self { event, body, field })
     }
 }
 
@@ -217,9 +213,9 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     });
     let authenticated_user_field = args.authenticated_user_field.as_ref().map(|value| {
         let event = &value.event;
-        let state = &value.state;
+        let body = &value.body;
         let field = &value.field;
-        quote! { .authenticated_user_field::<#event, #state>(#field) }
+        quote! { .authenticated_user_field::<#event, #body>(#field) }
     });
     let preview_reduce_known_record = args.preview_reduce_known_record.as_ref().map(|preview| {
         quote! {

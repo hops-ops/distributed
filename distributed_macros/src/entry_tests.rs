@@ -258,6 +258,30 @@ mod tests {
     }
 
     #[test]
+    fn sourced_helpers_ignore_other_receivers_and_nested_item_self() {
+        let output = sourced::expand_sourced(
+            quote! { entity, aggregate_type = "todo" },
+            quote! {
+                impl Todo {
+                    pub fn unrelated(&mut self, other: &mut Todo) {
+                        other.record_completed().unwrap();
+                        struct Other;
+                        impl Other {
+                            fn action(&mut self) { self.record_completed(); }
+                        }
+                    }
+                    #[event("todo.completed", domain = event)]
+                    fn record_completed(&mut self) {}
+                }
+            },
+        )
+        .unwrap()
+        .to_string();
+        assert!(!output.contains("pub enum Unrelated"), "{output}");
+        assert!(!output.contains("pub mod domain_commands"), "{output}");
+    }
+
+    #[test]
     fn expand_sourced_identity_mode_generates_independent_public_descriptor() {
         let attr = quote! {
             entity,
