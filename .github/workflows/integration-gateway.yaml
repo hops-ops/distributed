@@ -26,12 +26,17 @@ on:
       - 'tests/gateway*/**'
       - '.github/workflows/integration-gateway.yaml'
   workflow_dispatch:
+    inputs:
+      application_only:
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   contracts:
+    if: ${{ !inputs.application_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -60,6 +65,7 @@ jobs:
         run: python3 tests/gateway-portable/check_dependencies.py
 
   auth:
+    if: ${{ !inputs.application_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -85,6 +91,7 @@ jobs:
         run: npm test
 
   native:
+    if: ${{ !inputs.application_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -103,6 +110,7 @@ jobs:
         run: python3 tests/gateway-native/check_dependencies.py
 
   graphql:
+    if: ${{ !inputs.application_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -125,6 +133,7 @@ jobs:
           cargo test -p distributed --no-default-features --features gateway-graphql-native,gateway-delivery,sqlite --lib sqlite_direct_projection_and_ledger_replay_commit_atomically
 
   freshness:
+    if: ${{ !inputs.application_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -148,6 +157,7 @@ jobs:
         run: cargo test -p distributed_cli client_compiler
 
   worker:
+    if: ${{ !inputs.application_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
