@@ -255,6 +255,7 @@ pub fn run_lifecycle_dev(
             catalog,
             config,
             out: options.build.out.clone(),
+            cli_executable: None,
         },
         build: LifecycleBuildRequest::from(&options.build),
         stop: Arc::clone(&options.stop),

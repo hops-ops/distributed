@@ -69,6 +69,13 @@ after an upgrade so every member receives the matching lifecycle contract.
 Rust binaries remain in Cargo's target directory and SvelteKit output remains
 in its adapter-selected output directory.
 
+The discovered lifecycle also carries the absolute executable that initiated the
+CLI through its trusted compiler and UI child processes. Generated client
+commands therefore use that exact binary even when another `distributed`
+executable appears earlier on `PATH`, regardless of a project-local command
+override. Standalone Vite integrations retain their documented command setting
+and fallback behavior.
+
 Use `--output json` for a machine-readable lifecycle report. The compatibility
 flags `--root`, `--catalog`, and `--config` exist for older low-level lifecycle
 fixtures; normal application builds do not use them.

@@ -20,7 +20,7 @@ use crate::js_framework::{
 use super::{
     digest_bytes, DistributedSourceIdentity, LifecycleBuildConfig, LifecycleDevConfig,
     LifecycleDevProbe, LifecycleDevProcess, LifecycleError, LifecycleExecutor,
-    LifecycleProjectPlan, LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION,
+    LifecycleProjectPlan, LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION, LIFECYCLE_CLI_EXECUTABLE_ENV,
 };
 
 const APPLICATION_NODE: &str = "application";
@@ -409,6 +409,7 @@ pub fn discover_lifecycle_project(
             catalog,
             config,
             out: root.join(out.unwrap_or_else(|| Path::new(".distributed/lifecycle"))),
+            cli_executable: Some(executable.clone()),
         },
     })
 }
@@ -1069,6 +1070,10 @@ fn lifecycle_dev(
             ),
             ("AUTH_URL".to_string(), ui_url.clone()),
             ("AUTH_USE_SECURE_COOKIES".to_string(), "false".to_string()),
+            (
+                LIFECYCLE_CLI_EXECUTABLE_ENV.to_string(),
+                executable.to_string_lossy().into_owned(),
+            ),
         ]);
         if lifecycle_owns_client_compile {
             ui_env.insert(
@@ -1134,7 +1139,10 @@ fn lifecycle_dev(
                 args,
                 cwd: None,
                 external_cwd: false,
-                env: BTreeMap::new(),
+                env: BTreeMap::from([(
+                    LIFECYCLE_CLI_EXECUTABLE_ENV.to_string(),
+                    executable.to_string_lossy().into_owned(),
+                )]),
                 url: None,
                 restart_on: BTreeSet::new(),
                 ready_after_ms: 100,
@@ -1360,6 +1368,13 @@ mod tests {
             .find(|args| args[0] == "--project-root")
             .map(|args| args[1].as_str());
         assert_eq!(project_root, application.to_str());
+        assert_eq!(
+            framework
+                .env
+                .get(LIFECYCLE_CLI_EXECUTABLE_ENV)
+                .map(String::as_str),
+            executable.to_str()
+        );
     }
 
     #[test]
@@ -1471,6 +1486,13 @@ mod tests {
                 .get("DISTRIBUTED_LIFECYCLE_PROJECT_ROOT")
                 .map(String::as_str),
             project.path().to_str()
+        );
+        assert_eq!(
+            process
+                .env
+                .get(LIFECYCLE_CLI_EXECUTABLE_ENV)
+                .map(String::as_str),
+            executable.to_str()
         );
         assert!(process.restart_on.is_empty());
     }
