@@ -2344,6 +2344,21 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					}
 				}
 				if (!ownsIncomingIndex) continue;
+				if (
+					!snapshot.indexesComparable &&
+					state === group.live &&
+					state.retiredAtRevision !== undefined &&
+					liveStart !== undefined &&
+					compareCanonicalDecimalStrings(
+						liveStart,
+						state.retiredAtRevision
+					) > 0
+				) {
+					// A disposed stream is no longer an owner. Its boundary is
+					// still retained so a stream that started before disposal
+					// cannot win merely because the old transport later closed.
+					continue;
+				}
 				latestOwnerRevision =
 					latestOwnerRevision === undefined ||
 					compareCanonicalDecimalStrings(
