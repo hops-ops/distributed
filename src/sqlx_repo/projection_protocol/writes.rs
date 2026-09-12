@@ -1,5 +1,15 @@
 use super::*;
 
+pub(super) fn program_id_for_model(
+    ownership: &[ProjectionModelOwnership],
+    model: &str,
+) -> Option<ProjectionProgramId> {
+    ownership
+        .iter()
+        .find(|declaration| declaration.model == model)
+        .and_then(|declaration| declaration.program_id)
+}
+
 pub(super) async fn ensure_partition_ownership_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
@@ -387,6 +397,7 @@ pub(super) fn allocate_change(
     scope: Option<ProjectionRecordScope>,
     revision: Option<RecordRevision>,
     failure_id: Option<String>,
+    program_id: Option<ProjectionProgramId>,
 ) -> Result<ProjectionChange, ProjectionProtocolError> {
     state.change_head = checked_next(state.change_head, "projection change")?;
     Ok(ProjectionChange {
@@ -402,6 +413,7 @@ pub(super) fn allocate_change(
         scope,
         revision,
         failure_id,
+        program_id,
     })
 }
 
@@ -425,7 +437,7 @@ where
         "INSERT INTO projection_changes \
          (topology_hash, partition_hash, change_epoch, change_position, change_kind, \
          causation_id, model_name, scope_kind, canonical_key_bytes, canonical_key_hash, \
-         incarnation, revision, failure_id) VALUES (",
+         incarnation, revision, failure_id, program_id) VALUES (",
     );
     builder.push_bind(topology_hash.as_slice());
     builder.push(", ");
@@ -484,6 +496,13 @@ where
     builder.push(", ");
     if let Some(failure_id) = &change.failure_id {
         builder.push_bind(failure_id.as_str());
+    } else {
+        builder.push("NULL");
+    }
+    builder.push(", ");
+    let program_id_value = change.program_id.map(|program_id| program_id.to_string());
+    if let Some(program_id) = program_id_value.as_deref() {
+        builder.push_bind(program_id);
     } else {
         builder.push("NULL");
     }
@@ -659,6 +678,9 @@ where
         })?,
         "observation change position",
     )?;
+    let program_id = decode_program_id(row.try_get("program_id").map_err(|error| {
+        protocol_storage_error::<DB>("decode observation program identity", error)
+    })?)?;
     Ok(ProjectionObservation {
         causation_id: causation_id.to_string(),
         kind,
@@ -670,6 +692,7 @@ where
             change_epoch,
             change_position,
         )?,
+        program_id,
     })
 }
 
@@ -696,7 +719,7 @@ where
     let key_hash = scope.key_digest();
     let mut builder = QueryBuilder::<DB>::new(
         "SELECT canonical_key_bytes, canonical_key_hash, incarnation, revision, \
-         change_epoch, change_position FROM projection_observations WHERE topology_hash = ",
+         change_epoch, change_position, program_id FROM projection_observations WHERE topology_hash = ",
     );
     builder.push_bind(topology_hash.as_slice());
     builder.push(" AND partition_hash = ");
@@ -740,7 +763,7 @@ where
         "INSERT INTO projection_observations \
          (topology_hash, partition_hash, causation_id, model_name, scope_kind, \
          canonical_key_bytes, canonical_key_hash, incarnation, revision, \
-         change_epoch, change_position) VALUES (",
+         change_epoch, change_position, program_id) VALUES (",
     );
     builder.push_bind(topology_hash.as_slice());
     builder.push(", ");
@@ -780,6 +803,15 @@ where
         observation.change.position(),
         "observation change position",
     )?);
+    builder.push(", ");
+    let program_id_value = observation
+        .program_id
+        .map(|program_id| program_id.to_string());
+    if let Some(program_id) = program_id_value.as_deref() {
+        builder.push_bind(program_id);
+    } else {
+        builder.push("NULL");
+    }
     builder.push(")");
     builder
         .build()

@@ -4,9 +4,7 @@
 //! aggregate Worker owns outbox delivery through celld Queue; this host only
 //! invokes commands and seals the returned projection evidence.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -19,57 +17,10 @@ use crate::command_dispatch::{
 use crate::graphql::identity::VerifiedPrincipal;
 use crate::graphql::protocol::ProtocolResponseAccumulator;
 use crate::microsvc::{
-    CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult, Service, Session,
+    CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult, ExternalCausalReservation,
+    Service, Session,
 };
-
-const COMPLETED_STATUS_CACHE_LIMIT: usize = 4_096;
-const COMPLETED_STATUS_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
-
-type CompletedStatusKey = (String, String);
-
-#[derive(Default)]
-struct CompletedStatusCache {
-    entries: HashMap<CompletedStatusKey, (Instant, CausalCommandPublicStatus)>,
-    order: VecDeque<CompletedStatusKey>,
-}
-
-impl CompletedStatusCache {
-    fn insert(&mut self, key: CompletedStatusKey, status: CausalCommandPublicStatus) {
-        self.purge_expired();
-        if self.entries.contains_key(&key) {
-            self.order.retain(|existing| existing != &key);
-            self.order.push_back(key.clone());
-            self.entries.insert(key, (Instant::now(), status));
-            return;
-        }
-        while self.entries.len() >= COMPLETED_STATUS_CACHE_LIMIT {
-            let Some(evicted) = self.order.pop_front() else {
-                break;
-            };
-            self.entries.remove(&evicted);
-        }
-        self.order.push_back(key.clone());
-        self.entries.insert(key, (Instant::now(), status));
-    }
-
-    fn get(&mut self, key: &CompletedStatusKey) -> Option<CausalCommandPublicStatus> {
-        self.purge_expired();
-        self.entries.get(key).map(|(_, status)| status.clone())
-    }
-
-    fn purge_expired(&mut self) {
-        let now = Instant::now();
-        while self.order.front().is_some_and(|key| {
-            self.entries.get(key).is_none_or(|(inserted, _)| {
-                now.duration_since(*inserted) >= COMPLETED_STATUS_CACHE_TTL
-            })
-        }) {
-            if let Some(expired) = self.order.pop_front() {
-                self.entries.remove(&expired);
-            }
-        }
-    }
-}
+use crate::command_ledger::ExternalDispatchBinding;
 
 /// One aggregate's cell wait-path: command names, URL kind, shard id, payload.
 #[derive(Clone, Copy)]
@@ -102,7 +53,6 @@ pub struct CelldCommandHost {
     http: HttpCommandHost,
     local: LocalCommandHost,
     routes: Vec<CelldRoute>,
-    completed: Arc<Mutex<CompletedStatusCache>>,
 }
 
 impl CelldCommandHost {
@@ -117,7 +67,6 @@ impl CelldCommandHost {
             http,
             local: LocalCommandHost::new(service),
             routes: Vec::new(),
-            completed: Arc::new(Mutex::new(CompletedStatusCache::default())),
         })
     }
 
@@ -140,12 +89,6 @@ impl CelldCommandHost {
         })
     }
 
-    fn remember_completed(&self, key: (String, String), status: CausalCommandPublicStatus) {
-        let Ok(mut completed) = self.completed.lock() else {
-            return;
-        };
-        completed.insert(key, status);
-    }
 }
 
 fn remote_dispatch_error(status: u16, body: &Value) -> CausalDispatchError {
@@ -209,34 +152,110 @@ impl CommandHost for CelldCommandHost {
             })?;
         let service_id = self.service_id()?.to_string();
         let principal_partition = principal.partition_for_service(&service_id);
-        let http = self.http.retarget_segments(&[route.kind, &shard])?;
-        let (status, body) = http
-            .post_cell_wait_path(
+        let binding = ExternalDispatchBinding::new(route.kind, &shard)
+            .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
+        let reservation = self
+            .local
+            .service()
+            .reserve_external_causal(
+                command,
+                command_id,
+                input.clone(),
+                session.clone(),
+                principal,
+                binding,
+            )
+            .await?;
+        let attempt = match reservation {
+            ExternalCausalReservation::Acquired(attempt) => attempt,
+            ExternalCausalReservation::Replay(replay) => return Ok(replay),
+        };
+        let http = match self.http.retarget_segments(&[route.kind, &shard]) {
+            Ok(http) => http,
+            Err(error) => {
+                let _ = self
+                    .local
+                    .service()
+                    .abandon_external_causal(command, attempt)
+                    .await;
+                return Err(error);
+            }
+        };
+        let (status, body) = match http
+            .post_cell_wait_path_with_causation(
                 command,
                 command_id,
                 input.clone(),
                 &session,
                 &service_id,
                 &principal_partition,
+                Some(attempt.causation_id()),
             )
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self
+                    .local
+                    .service()
+                    .abandon_external_causal(command, attempt)
+                    .await;
+                return Err(error);
+            }
+        };
         if status >= 400 {
-            return Err(remote_dispatch_error(status, &body));
+            let error = remote_dispatch_error(status, &body);
+            let _ = self
+                .local
+                .service()
+                .abandon_external_causal(command, attempt)
+                .await;
+            return Err(error);
         }
-        let remote = CausalDispatchResult::from_wait_path_wire(body)
-            .map_err(|error| CausalDispatchError::Internal(format!("wait-path decode: {error}")))?;
+        let remote = match CausalDispatchResult::from_wait_path_wire(body) {
+            Ok(remote) => remote,
+            Err(error) => {
+                let _ = self
+                    .local
+                    .service()
+                    .abandon_external_causal(command, attempt)
+                    .await;
+                return Err(CausalDispatchError::Internal(format!(
+                    "wait-path decode: {error}"
+                )));
+            }
+        };
+        if let Err(error) = attempt.validate_remote(&remote) {
+            let _ = self
+                .local
+                .service()
+                .abandon_external_causal(command, attempt)
+                .await;
+            return Err(error);
+        }
         let payload = (route.payload)(command, &input, remote.payload(), &session);
         let mut remote = remote.with_payload(payload);
         if let Some(protocol) = protocol {
-            remote = self
+            remote = match self
                 .local
                 .service()
-                .seal_wait_path_dispatch(command, &protocol, remote)?;
+                .seal_wait_path_dispatch(command, &protocol, remote)
+            {
+                Ok(remote) => remote,
+                Err(error) => {
+                    let _ = self
+                        .local
+                        .service()
+                        .abandon_external_causal(command, attempt)
+                        .await;
+                    return Err(error);
+                }
+            };
         }
-        self.remember_completed(
-            (principal_partition, command_id.to_string()),
-            remote.public_status(),
-        );
+        self.local
+            .service()
+            .complete_external_causal(command, attempt, &remote)
+            .await?;
         Ok(remote)
     }
 
@@ -248,17 +267,6 @@ impl CommandHost for CelldCommandHost {
         protocol: Option<ProtocolResponseAccumulator>,
     ) -> Result<CausalCommandPublicStatus, CausalDispatchError> {
         validate_principal_session_if_present(session, &principal)?;
-        let service_id = self.service_id()?;
-        let principal_partition = principal.partition_for_service(service_id);
-        let key = (principal_partition, command_id.to_string());
-        if let Some(status) = self
-            .completed
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.get(&key))
-        {
-            return Ok(status);
-        }
         self.local
             .status(command_id, session, principal, protocol)
             .await

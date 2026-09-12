@@ -74,4 +74,4 @@ mod tests {
         assert!(encode(UNIX_EPOCH - Duration::from_secs(1)).is_err());
     }
 }
-pub(crate) const COMMAND_LEDGER_SELECT: &str = "command_name, command_contract_hash, input_hash, state, causation_id, attempt_token, attempt_number, lease_expires_at, outcome, created_at, updated_at, completed_at, retention_expires_at, compacted_at";
+pub(crate) const COMMAND_LEDGER_SELECT: &str = "command_name, command_contract_hash, input_hash, state, causation_id, attempt_token, attempt_number, external_binding, lease_expires_at, outcome, created_at, updated_at, completed_at, retention_expires_at, compacted_at";

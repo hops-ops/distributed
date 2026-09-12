@@ -55,6 +55,7 @@ fn same_transaction_evidence() -> SameTransactionProjectionEvidence {
             scope: Some(scope.clone()),
             revision: Some(revision.clone()),
             failure_id: None,
+            program_id: None,
         }],
         observations: vec![ProjectionObservation {
             causation_id: "cause-1".into(),
@@ -62,6 +63,7 @@ fn same_transaction_evidence() -> SameTransactionProjectionEvidence {
             revision: Some(revision),
             scope,
             change,
+            program_id: None,
         }],
     }
 }

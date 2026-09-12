@@ -110,6 +110,16 @@ fn modeled_direct_projection(
     schema: TableSchema,
     options: DirectModeledBinding<'_>,
 ) -> SurfaceModeledProjection {
+    modeled_projection_with_outputs(owner, program_name, epoch, vec![schema], options)
+}
+
+fn modeled_projection_with_outputs(
+    owner: &str,
+    program_name: &str,
+    epoch: &str,
+    schemas: Vec<TableSchema>,
+    options: DirectModeledBinding<'_>,
+) -> SurfaceModeledProjection {
     use crate::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
     use crate::projection::placement::{
         DirectProjectionPlacement, ProjectionBinding, ProjectionExecutionClass,
@@ -126,8 +136,6 @@ fn modeled_direct_projection(
         DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
     };
 
-    let model_name = schema.model_name.clone();
-    let table_name = schema.table_name.clone();
     let selector = ProjectionEventSelector::try_new(
         1,
         format!("{program_name}.changed"),
@@ -141,18 +149,26 @@ fn modeled_direct_projection(
         DOMAIN_EVENT_BODY_CODEC_VERSION,
     )
     .unwrap();
-    let value = ProjectionExpression::constant(ProjectionValue::string("row-1"));
-    let operation = ProjectionOperation::try_new(
-        format!("{program_name}-upsert"),
-        0,
-        ProjectionMutationKind::Upsert,
-        ProjectionTarget::try_new(&model_name, &table_name).unwrap(),
-        vec![ProjectionKeyField::try_new(0, "id", value.clone()).unwrap()],
-        vec![ProjectionField::try_new(0, "id", ProjectionAssignment::Set(value)).unwrap()],
-        Vec::new(),
-        Vec::new(),
-    )
-    .unwrap();
+    assert!(!schemas.is_empty(), "modeled projection requires an output");
+    let operations = schemas
+        .iter()
+        .enumerate()
+        .map(|(index, schema)| {
+            let value =
+                ProjectionExpression::constant(ProjectionValue::string(format!("row-{index}")));
+            ProjectionOperation::try_new(
+                format!("{program_name}-upsert-{index}"),
+                index.try_into().unwrap(),
+                ProjectionMutationKind::Upsert,
+                ProjectionTarget::try_new(&schema.model_name, &schema.table_name).unwrap(),
+                vec![ProjectionKeyField::try_new(0, "id", value.clone()).unwrap()],
+                vec![ProjectionField::try_new(0, "id", ProjectionAssignment::Set(value)).unwrap()],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
     let partition = if options.dynamic_partition {
         ProjectionPartition::Expression(ProjectionExpression::constant(ProjectionValue::string(
             "tenant-1",
@@ -164,10 +180,7 @@ fn modeled_direct_projection(
         program_name,
         1,
         partition,
-        vec![
-            ProjectionArm::try_new(format!("{program_name}-arm"), selector, vec![operation])
-                .unwrap(),
-        ],
+        vec![ProjectionArm::try_new(format!("{program_name}-arm"), selector, operations).unwrap()],
     )
     .unwrap();
     let descriptor = TestProjectionDescriptor(program.clone());
@@ -180,7 +193,13 @@ fn modeled_direct_projection(
     let source =
         ProjectionSourceBinding::try_new("test-domain", "ordered-domain-events", 1).unwrap();
     let owner = ProjectionOwner::try_new(owner).unwrap();
-    let outputs = vec![ProjectionOutput::try_new(model_name, table_name, schema).unwrap()];
+    let outputs = schemas
+        .into_iter()
+        .map(|schema| {
+            ProjectionOutput::try_new(schema.model_name.clone(), schema.table_name.clone(), schema)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     let binding = if options.eventual {
         ProjectionBinding::from_eventual_program(
             &program,
@@ -636,6 +655,7 @@ fn query_protocol_uses_exact_modeled_physical_topology() {
             ..DirectModeledBinding::active("exact-physical-topology")
         },
     );
+    let semantic_program_id = modeled.program_id().to_string();
     let surface = build_surface(&[model], &SurfaceOptions::sqlite())
         .unwrap()
         .with_projection_owners([SurfaceDirectProjection::new("exact-modeled-owner")
@@ -652,6 +672,11 @@ fn query_protocol_uses_exact_modeled_physical_topology() {
     assert_eq!(
         runtime.model_has_static_partition("ExactTopology"),
         Some(true)
+    );
+    assert_eq!(
+        runtime.public_projection_for_model("ExactTopology"),
+        Some(semantic_program_id.as_str()),
+        "causal observations use the active semantic program identity"
     );
 }
 
@@ -762,6 +787,42 @@ fn query_protocol_merges_compatible_active_models_without_inventing_static_parti
         );
         assert_eq!(runtime.model_has_static_partition(model), Some(false));
     }
+}
+
+#[cfg(feature = "graphql")]
+#[test]
+fn query_protocol_preserves_one_semantic_identity_for_each_fanout_model() {
+    let first = direct_model("FirstFanout", "first_fanout");
+    let second = direct_model("SecondFanout", "second_fanout");
+    let modeled = modeled_projection_with_outputs(
+        "fanout-owner",
+        "fanout-program",
+        "fanout-v1",
+        vec![first.clone(), second.clone()],
+        DirectModeledBinding {
+            eventual: true,
+            ..DirectModeledBinding::active("fanout-physical-owner")
+        },
+    );
+    let semantic_program_id = modeled.program_id().to_string();
+    let surface = build_surface(&[first, second], &SurfaceOptions::sqlite())
+        .unwrap()
+        .with_projectors([SurfaceProjector::new("fanout-owner").modeled(modeled)])
+        .unwrap();
+
+    let runtime = crate::graphql::query_protocol::QueryProtocolRuntime::compile(&surface).unwrap();
+    for model in ["FirstFanout", "SecondFanout"] {
+        assert_eq!(
+            runtime.public_projection_for_model(model),
+            Some(semantic_program_id.as_str()),
+            "each fan-out model must retain the program identity that authored it"
+        );
+    }
+    assert_eq!(
+        runtime.public_projection_for_model("UnknownModel"),
+        None,
+        "unknown models cannot mint a causal proof identity"
+    );
 }
 
 #[test]

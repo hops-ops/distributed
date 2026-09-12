@@ -9,7 +9,7 @@ use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalStorageIdentity, CausalTransactionalCommit, CommandCompletion, CommandLedgerError,
     CommandLedgerKey, CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
-    ReservationOutcome,
+    ExternalCommandCompletion, ReservationOutcome,
 };
 use crate::entity::Entity;
 use crate::microsvc::HasOutboxStore;
@@ -234,6 +234,14 @@ impl CommandLedgerStore for CellSqlRepository {
     ) -> Result<(), CommandLedgerError> {
         self.connection
             .transaction(|executor| finish_sql(ledger::mark_retryable(executor, &attempt)))
+    }
+
+    async fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> Result<(), CommandLedgerError> {
+        self.connection
+            .transaction(|executor| finish_sql(ledger::complete_external(executor, &completion)))
     }
     async fn compact_expired_commands(&self, limit: usize) -> Result<u64, CommandLedgerError> {
         self.connection

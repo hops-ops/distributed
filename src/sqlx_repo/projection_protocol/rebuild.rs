@@ -135,6 +135,7 @@ where
                 Some(row.scope.clone()),
                 Some(revision.clone()),
                 None,
+                None,
             )?;
             let record = ProjectionRecordMetadata {
                 revision,

@@ -442,6 +442,7 @@ where
                     Some(mutation.scope.clone()),
                     Some(revision.clone()),
                     None,
+                    program_id_for_model(&batch.ownership, mutation.scope.model()),
                 )?;
                 let metadata = ProjectionRecordMetadata {
                     revision,
@@ -530,17 +531,20 @@ where
                         Some(scope.clone()),
                         revision.clone(),
                         None,
+                        program_id_for_model(&batch.ownership, scope.model()),
                     )?;
                     let cursor = change.cursor.clone();
                     changes.push(change);
                     cursor
                 };
+                let program_id = program_id_for_model(&batch.ownership, scope.model());
                 observations.push(ProjectionObservation {
                     causation_id: batch.input.causation_id.clone(),
                     kind: request.kind,
                     revision,
                     scope,
                     change: change_cursor,
+                    program_id,
                 });
             }
 
@@ -551,6 +555,7 @@ where
                     &partition,
                     ProjectionChangeKind::Checkpoint,
                     batch.input.causation_id.clone(),
+                    None,
                     None,
                     None,
                     None,
@@ -722,6 +727,7 @@ where
                 None,
                 None,
                 Some(batch.failure_id.clone()),
+                None,
             )?;
             insert_change_in_tx(&mut tx, &change).await?;
             insert_failure_in_tx(&mut tx, &batch, &change.cursor).await?;

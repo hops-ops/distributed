@@ -46,11 +46,24 @@ pub(crate) struct QueryProjectorRuntime {
     pub(crate) change_epoch: Option<ProjectionEpoch>,
     models: BTreeSet<String>,
     dependencies: BTreeSet<String>,
+    /// Public causal-observation identity for each output model. Modeled
+    /// projections use their versioned program ID; legacy projections retain
+    /// the physical owner name as their public identity.
+    public_projection_by_model: BTreeMap<String, String>,
+    /// Modeled changes must carry their authoring identity on the durable
+    /// change row. Legacy rows may derive the historical physical identity.
+    requires_semantic_identity: bool,
 }
 
 impl QueryProjectorRuntime {
     pub(crate) fn supports_resume(&self) -> bool {
         self.static_partition.is_some() && self.change_epoch.is_some()
+    }
+
+    pub(crate) fn public_projection_for_model(&self, model: &str) -> Option<&str> {
+        self.public_projection_by_model
+            .get(model)
+            .map(String::as_str)
     }
 
     /// A partition-wide change cursor is safe to expose only when every model
@@ -247,6 +260,13 @@ impl QueryProtocolRuntime {
             .get(model)
             .map(|owner| owner.static_partition.is_some())
     }
+
+    #[cfg(test)]
+    pub(crate) fn public_projection_for_model(&self, model: &str) -> Option<&str> {
+        self.model_owners
+            .get(model)
+            .and_then(|owner| owner.public_projection_for_model(model))
+    }
 }
 
 fn compile_legacy_query_projector(
@@ -324,6 +344,12 @@ fn compile_legacy_query_projector(
         change_epoch,
         models: projector.models.iter().cloned().collect(),
         dependencies: projector.dependencies.iter().cloned().collect(),
+        public_projection_by_model: projector
+            .models
+            .iter()
+            .map(|model| (model.clone(), projector.name.clone()))
+            .collect(),
+        requires_semantic_identity: false,
     }))
 }
 
@@ -368,6 +394,7 @@ fn compile_modeled_query_projector(
     validate_modeled_partition_binding(projector, first_program, first_binding)?;
 
     let mut models = BTreeSet::new();
+    let mut public_projection_by_model = BTreeMap::new();
     for modeled in &active {
         let (program, binding) = modeled.raw().ok_or_else(|| {
             format!(
@@ -405,7 +432,18 @@ fn compile_modeled_query_projector(
                 projector.name
             ));
         }
-        models.extend(modeled.output_models().iter().cloned());
+        for model in modeled.output_models() {
+            models.insert(model.clone());
+            if public_projection_by_model
+                .insert(model.clone(), modeled.program_id().to_string())
+                .is_some()
+            {
+                return Err(format!(
+                    "query protocol modeled owner `{}` has ambiguous active program identity for model `{model}`",
+                    projector.name
+                ));
+            }
+        }
     }
     if models.is_empty() {
         return Err(format!(
@@ -475,6 +513,8 @@ fn compile_modeled_query_projector(
         change_epoch: Some(change_epoch),
         models,
         dependencies,
+        public_projection_by_model,
+        requires_semantic_identity: true,
     })))
 }
 
@@ -519,7 +559,10 @@ struct PreparedQueryEvidence {
 const MAX_PROTOCOL_EVIDENCE_ITEMS: usize = 4_096;
 
 struct PreparedLiveChange {
+    /// Physical owner used for change-log routing and opaque scope tokens.
     projection: String,
+    /// Versioned semantic identity used in public causal observations.
+    public_projection: Option<String>,
     change: crate::projection_protocol::ProjectionChange,
 }
 
@@ -1084,8 +1127,28 @@ where
                             break;
                         }
                         replayed_changes.extend(changes.into_iter().map(|change| {
+                            // Modeled identity is part of the persisted change
+                            // evidence. Never relabel an old/null row from the
+                            // currently active program after a cold restart.
+                            let public_projection = change
+                                .program_id
+                                .map(|program_id| program_id.to_string())
+                                .or_else(|| {
+                                    if projector.requires_semantic_identity {
+                                        None
+                                    } else {
+                                        change
+                                            .scope
+                                            .as_ref()
+                                            .and_then(|scope| {
+                                                projector.public_projection_for_model(scope.model())
+                                            })
+                                            .map(str::to_owned)
+                                    }
+                                });
                             PreparedLiveChange {
                                 projection: projector.name.clone(),
+                                public_projection,
                                 change,
                             }
                         }));
@@ -1269,24 +1332,33 @@ fn wire_query_snapshot(
                         live_record_fences.insert(scope_key, (clock, wire_record));
                     }
                 }
-                let observation = super::protocol::DistributedProjectionObservation {
-                    causation_id: change.causation_id.clone(),
-                    projection: live.projection.clone(),
-                    model: scope.model().to_string(),
-                    scope_token: accumulator
-                        .issue_projection_obligation_scope(
-                            &change.causation_id,
-                            &live.projection,
-                            scope.model(),
-                            crate::projection_protocol::ProjectionObservationKind::Record,
-                            scope,
-                        )
-                        .map_err(|error| {
-                            ProjectionProtocolError::InvalidBatch(error.to_string())
-                        })?,
-                };
-                if observation_tokens.insert(observation.scope_token.as_str().to_string()) {
-                    observations.push(observation);
+                // A retained pre-identity change still contributes its
+                // authoritative row/revision. It cannot, however, mint a
+                // modeled causal observation because its authoring program is
+                // unknown. Keep the readable data and omit only that proof.
+                if let Some(projection) = live.public_projection.clone() {
+                    let observation = super::protocol::DistributedProjectionObservation {
+                        causation_id: change.causation_id.clone(),
+                        projection,
+                        model: scope.model().to_string(),
+                        scope_token: accumulator
+                            .issue_projection_obligation_scope(
+                                &change.causation_id,
+                                &live.projection,
+                                scope.model(),
+                                crate::projection_protocol::ProjectionObservationKind::Record,
+                                scope,
+                            )
+                            .map_err(|error| {
+                                ProjectionProtocolError::InvalidBatch(error.to_string())
+                            })?,
+                    };
+                    if observation_tokens.insert((
+                        observation.projection.clone(),
+                        observation.scope_token.as_str().to_string(),
+                    )) {
+                        observations.push(observation);
+                    }
                 }
             }
             crate::projection_protocol::ProjectionChangeKind::Observation => {
@@ -1300,24 +1372,31 @@ fn wire_query_snapshot(
                         "live projection observation omitted its kind".into(),
                     )
                 })?;
-                let observation = super::protocol::DistributedProjectionObservation {
-                    causation_id: change.causation_id.clone(),
-                    projection: live.projection.clone(),
-                    model: scope.model().to_string(),
-                    scope_token: accumulator
-                        .issue_projection_obligation_scope(
-                            &change.causation_id,
-                            &live.projection,
-                            scope.model(),
-                            kind,
-                            scope,
-                        )
-                        .map_err(|error| {
-                            ProjectionProtocolError::InvalidBatch(error.to_string())
-                        })?,
-                };
-                if observation_tokens.insert(observation.scope_token.as_str().to_string()) {
-                    observations.push(observation);
+                // As with record changes, legacy/unversioned modeled history
+                // remains queryable but cannot be advertised as causal proof.
+                if let Some(projection) = live.public_projection.clone() {
+                    let observation = super::protocol::DistributedProjectionObservation {
+                        causation_id: change.causation_id.clone(),
+                        projection,
+                        model: scope.model().to_string(),
+                        scope_token: accumulator
+                            .issue_projection_obligation_scope(
+                                &change.causation_id,
+                                &live.projection,
+                                scope.model(),
+                                kind,
+                                scope,
+                            )
+                            .map_err(|error| {
+                                ProjectionProtocolError::InvalidBatch(error.to_string())
+                            })?,
+                    };
+                    if observation_tokens.insert((
+                        observation.projection.clone(),
+                        observation.scope_token.as_str().to_string(),
+                    )) {
+                        observations.push(observation);
+                    }
                 }
             }
             crate::projection_protocol::ProjectionChangeKind::Checkpoint
@@ -1374,5 +1453,329 @@ mod tests {
     fn query_index_budget_accepts_4096_and_rejects_4097() {
         assert!(query_index_budget_allows(MAX_PROTOCOL_EVIDENCE_ITEMS));
         assert!(!query_index_budget_allows(MAX_PROTOCOL_EVIDENCE_ITEMS + 1));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn wire_snapshot_preserves_persisted_modeled_identity_and_receipt_scope() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use crate::graphql::protocol::{ProtocolTokenCodec, ProtocolTokenPurpose};
+        use crate::projection_protocol::{
+            ProjectionChangeRead, ProjectionCommitBatch, ProjectionEpoch, ProjectionInputCursor,
+            ProjectionInputFingerprint, ProjectionModelOwnership, ProjectionMutationKind,
+            ProjectionObservationKind, ProjectionObservationRequest, ProjectionObservationTarget,
+            ProjectionProtocolStore, ProjectionRecordExpectation, ProjectionRecordMutation,
+            ProjectionSource, TrustedProjectionInput,
+        };
+        use crate::sqlite_repo::SqliteRepository;
+        use crate::table::{
+            ColumnType, ExpectedVersion, PrimaryKey, RowKey, RowValue, RowValues, RowWriteMode,
+            TableColumn, TableKind, TableMutation, TableRowMutation, TableSchema,
+            TableSchemaRegistry,
+        };
+
+        let topology = ProjectorTopologyId::new(1, "query-wire-modeled", [0x4a; 32]).unwrap();
+        static SCHEMA: std::sync::LazyLock<TableSchema> =
+            std::sync::LazyLock::new(|| TableSchema {
+                model_name: "WireView".into(),
+                table_name: "wire_views".into(),
+                columns: vec![
+                    TableColumn {
+                        primary_key: true,
+                        ..TableColumn::new("id", "id", ColumnType::Text)
+                    },
+                    TableColumn::new("title", "title", ColumnType::Text),
+                ],
+                primary_key: PrimaryKey::new(["id"]),
+                version_column: Some(crate::table::DEFAULT_TABLE_VERSION_COLUMN.into()),
+                foreign_keys: Vec::new(),
+                indexes: Vec::new(),
+                relationships: Vec::new(),
+                kind: TableKind::ReadModel,
+            });
+        let schema = &*SCHEMA;
+        let mut table_registry = TableSchemaRegistry::new();
+        table_registry.register_schema(schema.clone()).unwrap();
+        let repository = SqliteRepository::connect_and_migrate("sqlite::memory:")
+            .await
+            .unwrap();
+        repository
+            .bootstrap_table_schema_for_dev(&table_registry)
+            .await
+            .unwrap();
+        let program_id =
+            crate::ProjectionProgramId::parse(&format!("pp1:sha256:{}", "4".repeat(64))).unwrap();
+        let ownership = ProjectionModelOwnership::new("WireView", "wire_views")
+            .unwrap()
+            .with_program_id(program_id);
+        repository
+            .register_projection_models(&topology, std::slice::from_ref(&ownership))
+            .await
+            .unwrap();
+
+        let codec = Arc::new(
+            ProjectionScopeCodec::with_models(topology.clone(), [("WireView", schema)]).unwrap(),
+        );
+        let partition = codec.encode_partition(None).unwrap();
+        let key = RowKey::new([("id", RowValue::String("wire-1".into()))]);
+        let scope = codec
+            .encode_row_scope_in_partition("WireView", partition.clone(), &key)
+            .unwrap();
+        let mut values = RowValues::new();
+        values.insert("id", RowValue::String("wire-1".into()));
+        values.insert("title", RowValue::String("persisted".into()));
+        let mutation = TableMutation::UpsertRow(TableRowMutation {
+            schema: &schema,
+            key: key.clone(),
+            values,
+            expected_version: ExpectedVersion::Any,
+            mode: RowWriteMode::Upsert,
+        });
+        let change_epoch = ProjectionEpoch::new("query-wire-modeled-v1").unwrap();
+        let input = TrustedProjectionInput::mint(
+            ProjectionInputCursor::new(
+                topology.clone(),
+                partition.clone(),
+                ProjectionSource::new("wire-source", b"wire-partition".to_vec()).unwrap(),
+                ProjectionEpoch::new("wire-source-v1").unwrap(),
+                1,
+            )
+            .unwrap(),
+            ProjectionInputFingerprint::from_canonical_bytes(b"wire-input"),
+            "wire-message-1",
+            "wire-cause-1",
+            crate::projection_protocol::ProjectionGeneration::initial(),
+            true,
+        )
+        .unwrap();
+        let commit = repository
+            .commit_projection(ProjectionCommitBatch {
+                input,
+                change_epoch: change_epoch.clone(),
+                ownership: vec![ownership],
+                mutations: vec![ProjectionRecordMutation::new(
+                    scope.clone(),
+                    mutation,
+                    ProjectionRecordExpectation::Missing,
+                    ProjectionMutationKind::Upsert,
+                )
+                .unwrap()],
+                observations: vec![ProjectionObservationRequest {
+                    kind: ProjectionObservationKind::Record,
+                    target: ProjectionObservationTarget::StagedRecord(scope.clone()),
+                }],
+            })
+            .await
+            .unwrap();
+        let stored_change = match repository
+            .projection_changes(&topology, &partition, None, 16)
+            .await
+            .unwrap()
+        {
+            ProjectionChangeRead::Changes { changes, .. } => changes
+                .into_iter()
+                .find(|change| {
+                    change.kind == crate::projection_protocol::ProjectionChangeKind::RecordUpsert
+                })
+                .expect("stored record change"),
+            other => panic!("unexpected projection change read: {other:?}"),
+        };
+        assert_eq!(stored_change.program_id, Some(program_id));
+        assert!(commit
+            .changes
+            .iter()
+            .any(|change| change.program_id == Some(program_id)));
+
+        let cache_scope = ProtocolTokenCodec::new([0x4b; 32])
+            .issue(ProtocolTokenPurpose::CacheScope, &("wire", "cache"))
+            .unwrap();
+        let token_codec = ProtocolTokenCodec::new([0x4b; 32]);
+        let accumulator = ProtocolResponseAccumulator::new(
+            super::super::protocol::DistributedEnvelopeV1::new(
+                "sha256:wire-schema",
+                "wire-auth",
+                cache_scope,
+                None,
+            ),
+            token_codec,
+        );
+        accumulator
+            .bind_query_snapshot_scope(&serde_json::json!({
+                "sql": "SELECT wire_views",
+                "tables": ["wire_views"]
+            }))
+            .unwrap();
+
+        let runtime = Arc::new(QueryProjectorRuntime {
+            name: "wire-physical-projector".into(),
+            codec: Arc::clone(&codec),
+            static_partition: Some(partition.clone()),
+            change_epoch: Some(change_epoch.clone()),
+            models: BTreeSet::from(["WireView".into()]),
+            dependencies: BTreeSet::from(["wire_views".into()]),
+            public_projection_by_model: BTreeMap::from([(
+                "WireView".into(),
+                program_id.to_string(),
+            )]),
+            requires_semantic_identity: true,
+        });
+        let snapshot_scope = accumulator.query_snapshot_scope().unwrap();
+        let initial_cursor = accumulator
+            .issue_live_resume_position(
+                &runtime.name,
+                &snapshot_scope,
+                runtime.codec.topology(),
+                &partition,
+                &change_epoch,
+                0,
+            )
+            .unwrap();
+        let partition_snapshot = ProjectionPartitionSnapshot {
+            head: Some(stored_change.cursor.clone()),
+            compacted_through: 0,
+        };
+        let prepared_live = PreparedQueryEvidence {
+            records_complete: true,
+            records: Vec::new(),
+            indexes: QueryIndexPlan {
+                comparable: true,
+                projectors: vec![Arc::clone(&runtime)],
+            },
+        };
+        let mut connection = repository.pool().acquire().await.unwrap();
+        let live_metadata = wire_live_metadata::<sqlx::Sqlite>(
+            &mut *connection,
+            &accumulator,
+            &prepared_live,
+            std::slice::from_ref(&partition_snapshot),
+            RequestedLiveResume::Cursors(vec![initial_cursor.clone()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(live_metadata.metadata.mode, DistributedLiveMode::Resumable);
+        assert!(!live_metadata.metadata.reset);
+        assert_eq!(live_metadata.changes.len(), 1);
+        assert_eq!(
+            live_metadata.changes[0].public_projection.as_deref(),
+            Some(program_id.to_string().as_str())
+        );
+        let live_changes = live_metadata.changes;
+        drop(connection);
+        let record = repository
+            .projection_record(&scope)
+            .await
+            .unwrap()
+            .expect("stored record metadata");
+        let prepared = PreparedQueryEvidence {
+            records_complete: true,
+            records: vec![PreparedRecordProbe {
+                request: ProjectionLiveRecordRequest::new(&codec, "WireView", key).unwrap(),
+                paths: vec![vec!["wire_views".into(), "0".into()]],
+            }],
+            indexes: QueryIndexPlan {
+                comparable: true,
+                projectors: vec![Arc::clone(&runtime)],
+            },
+        };
+        let snapshot = wire_query_snapshot(
+            &accumulator,
+            prepared,
+            vec![Some(record)],
+            vec![partition_snapshot.clone()],
+            live_changes,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.observations.len(),
+            1,
+            "modeled proof is on the wire"
+        );
+        let observation = &snapshot.observations[0];
+        assert_eq!(observation.causation_id, "wire-cause-1");
+        assert_eq!(observation.projection, program_id.to_string());
+        assert_eq!(observation.model, "WireView");
+
+        // A sealed command receipt uses the same physical scope material and
+        // semantic public label. The opaque token must be byte-for-byte equal
+        // to the live observation, while the physical owner stays private.
+        let receipt_scope = accumulator
+            .issue_projection_obligation_scope(
+                "wire-cause-1",
+                &runtime.name,
+                "WireView",
+                ProjectionObservationKind::Record,
+                &scope,
+            )
+            .unwrap();
+        assert_eq!(observation.scope_token, receipt_scope);
+
+        // Nulling the durable identity models pre-migration history: the row
+        // and record fence remain readable, but the wire must not relabel it
+        // as the currently active semantic program.
+        sqlx::query("UPDATE projection_changes SET program_id = NULL WHERE change_position = ?")
+            .bind(stored_change.cursor.position() as i64)
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        let legacy_change = match repository
+            .projection_changes(&topology, &partition, None, 16)
+            .await
+            .unwrap()
+        {
+            ProjectionChangeRead::Changes { changes, .. } => changes
+                .into_iter()
+                .find(|change| {
+                    change.kind == crate::projection_protocol::ProjectionChangeKind::RecordUpsert
+                })
+                .expect("stored legacy record change"),
+            other => panic!("unexpected legacy projection change read: {other:?}"),
+        };
+        assert!(legacy_change.program_id.is_none());
+        let mut connection = repository.pool().acquire().await.unwrap();
+        let legacy_live = wire_live_metadata::<sqlx::Sqlite>(
+            &mut *connection,
+            &accumulator,
+            &prepared_live,
+            std::slice::from_ref(&partition_snapshot),
+            RequestedLiveResume::Cursors(vec![initial_cursor]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(legacy_live.changes.len(), 1);
+        assert!(legacy_live.changes[0].public_projection.is_none());
+        let legacy_changes = legacy_live.changes;
+        drop(connection);
+        let legacy_snapshot = wire_query_snapshot(
+            &accumulator,
+            PreparedQueryEvidence {
+                records_complete: true,
+                records: vec![PreparedRecordProbe {
+                    request: ProjectionLiveRecordRequest::new(
+                        &codec,
+                        "WireView",
+                        RowKey::new([("id", RowValue::String("wire-1".into()))]),
+                    )
+                    .unwrap(),
+                    paths: vec![vec!["wire_views".into(), "0".into()]],
+                }],
+                indexes: QueryIndexPlan {
+                    comparable: true,
+                    projectors: vec![runtime],
+                },
+            },
+            vec![Some(
+                repository
+                    .projection_record(&scope)
+                    .await
+                    .unwrap()
+                    .expect("legacy row metadata remains readable"),
+            )],
+            vec![partition_snapshot],
+            legacy_changes,
+        )
+        .unwrap();
+        assert_eq!(legacy_snapshot.observations, Vec::new());
+        assert_eq!(legacy_snapshot.records.len(), 1);
     }
 }

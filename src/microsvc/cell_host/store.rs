@@ -14,7 +14,8 @@ use super::sql_store::CellSqlRepository;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalStorageIdentity, CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey,
-    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation, ReservationOutcome,
+    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
+    ExternalCommandCompletion, ReservationOutcome,
 };
 use crate::entity::Entity;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
@@ -540,6 +541,13 @@ impl CommandLedgerStore for CellStreamStore {
         attempt: AttemptFence,
     ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
         CommandLedgerStore::mark_retryable_unknown(&self.inner, attempt)
+    }
+
+    fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
+        CommandLedgerStore::complete_external_command(&self.inner, completion)
     }
 
     fn compact_expired_commands(

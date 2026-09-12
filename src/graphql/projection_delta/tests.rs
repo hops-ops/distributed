@@ -1030,6 +1030,462 @@ fn zero_occurrence_metadata_is_classified_from_the_current_causal_command_contra
     assert_eq!(draining_command["expects"], serde_json::json!([]));
 }
 
+#[cfg(feature = "graphql")]
+fn wait_path_fixture() -> (
+    crate::graphql::protocol::ProtocolResponseAccumulator,
+    crate::command::TypedCommandContract,
+    crate::OutboxMessage,
+) {
+    use std::sync::Arc;
+
+    use super::runtime::{ProtocolProjectionProgramRegistry, ProtocolProjectionRequestSeed};
+    use crate::graphql::protocol::{
+        DistributedEnvelopeV1, ProtocolResponseAccumulator, ProtocolTokenCodec,
+        ProtocolTokenPurpose,
+    };
+
+    let fixture = modeled_fixture(
+        ProjectionBindingState::Active,
+        ProjectionExecutionClass::Causal,
+    );
+    let registry =
+        Arc::new(ProtocolProjectionProgramRegistry::try_from_surface(&fixture.surface).unwrap());
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let seed = ProtocolProjectionRequestSeed::new(
+        selected_export(&fixture.surface),
+        registry,
+        crate::command_ledger::PrincipalPartitionId::new("wait-path-principal").unwrap(),
+        "wait-path-generation",
+        Vec::new(),
+        now_unix_ms,
+    )
+    .unwrap();
+    let codec = ProtocolTokenCodec::new([0x70; 32]);
+    let cache_scope = codec
+        .issue(ProtocolTokenPurpose::CacheScope, &("wait-path", "cache"))
+        .unwrap();
+    let accumulator = ProtocolResponseAccumulator::new(
+        DistributedEnvelopeV1::new("sha256:wait-path", "wait-path-auth", cache_scope, None),
+        codec,
+    );
+    accumulator.bind_projection_request(seed).unwrap();
+    let occurrence = state_occurrence(13, "todo-wait-path", "wait-path");
+    let event = crate::OutboxMessage::from_domain_event_occurrence(&occurrence).unwrap();
+    let contract = crate::command::typed_command::<
+        ModeledCommandInput,
+        crate::command::Eventual<ModeledCommandOutput>,
+    >(TEST_COMMAND_NAME)
+    .roles(["delta-user"])
+    .emits(crate::command::__command_projection_events([Ok(
+        event_descriptor(),
+    )]))
+    .into_contract();
+    (accumulator, contract, event)
+}
+
+#[test]
+#[cfg(feature = "graphql")]
+fn wait_path_sealing_retains_event_obligations_and_status_stays_pending_without_observation() {
+    use crate::command::CommandConsistency;
+    use crate::command_ledger::CommandLedgerState;
+    use crate::microsvc::{
+        CausalCommandPublicState, CausalCommandReceiptSource, CausalDispatchResult,
+    };
+
+    let (protocol, contract, event) = wait_path_fixture();
+    let result = CausalDispatchResult {
+        payload: json!({"accepted": true}),
+        receipt: CausalCommandReceiptSource {
+            command_id: "wait-path-command".into(),
+            command_name: String::new(),
+            causation_id: String::new(),
+            consistency: CommandConsistency::Eventual,
+            state: CommandLedgerState::Succeeded,
+            outcome: json!({"accepted": true}),
+            obligations: Vec::new(),
+            projection_metadata: None,
+            direct_projection: None,
+        },
+        projection_events: vec![event],
+    };
+
+    let result = result
+        .seal_wait_path_protocol(&protocol, &contract, Duration::from_secs(60))
+        .unwrap();
+    let metadata = result
+        .receipt
+        .projection_metadata
+        .as_ref()
+        .expect("an emitted modeled event must retain its exact metadata");
+    assert_eq!(metadata.obligations.len(), 1);
+    assert_eq!(metadata.obligations[0].projection_ref, 0);
+    assert_eq!(metadata.obligations[0].model, "TodoView");
+    assert!(metadata.obligations[0]
+        .scope_token
+        .as_str()
+        .starts_with("v1.projection-obligation."));
+    assert_eq!(result.receipt.state, CommandLedgerState::Succeeded);
+
+    let status = result.public_status();
+    assert_eq!(status.state, CausalCommandPublicState::Succeeded);
+    assert!(status.evidence.is_empty());
+    assert_eq!(
+        status
+            .projection_metadata
+            .as_ref()
+            .expect("status must carry modeled metadata")
+            .obligations
+            .len(),
+        1
+    );
+
+    protocol.record_status(&status).unwrap();
+    let command = serde_json::to_value(protocol.snapshot().unwrap()).unwrap()["command"].clone();
+    assert_eq!(command["state"], "succeeded");
+    assert_eq!(command["expects"].as_array().unwrap().len(), 1);
+    assert!(command.get("observations").is_none());
+}
+
+#[test]
+#[cfg(feature = "graphql")]
+fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity() {
+    use std::sync::Arc;
+
+    use crate::command::CommandConsistency;
+    use crate::command_ledger::CommandLedgerState;
+    use crate::graphql::protocol::{ProtocolTokenCodec, ProtocolTokenPurpose};
+    use crate::microsvc::{
+        CausalCommandProjectionEvidence, CausalCommandPublicState, CausalCommandPublicStatus,
+        CausalCommandReceiptSource, CausalDispatchResult, CausalProjectionEvidenceState,
+    };
+    use crate::projection_protocol::{
+        ProjectionCausationEvidenceBatch, ProjectionChangeCursor, ProjectionEpoch,
+        ProjectionObservation, ProjectionObservationKind, ProjectionScopeCodec,
+        ProjectorTopologyId, RecordRevision,
+    };
+    use crate::ProjectionProgramId;
+
+    let (protocol, contract, event) = wait_path_fixture();
+    let result = CausalDispatchResult {
+        payload: json!({"accepted": true}),
+        receipt: CausalCommandReceiptSource {
+            command_id: "wait-path-identity-command".into(),
+            command_name: String::new(),
+            causation_id: String::new(),
+            consistency: CommandConsistency::Eventual,
+            state: CommandLedgerState::Succeeded,
+            outcome: json!({"accepted": true}),
+            obligations: Vec::new(),
+            projection_metadata: None,
+            direct_projection: None,
+        },
+        projection_events: vec![event],
+    }
+    .seal_wait_path_protocol(&protocol, &contract, Duration::from_secs(60))
+    .unwrap();
+    let metadata = result
+        .receipt
+        .projection_metadata
+        .clone()
+        .expect("the real wait-path event produces modeled metadata");
+    let semantic_program = ProjectionProgramId::parse(&metadata.delta.projections[0].program_id)
+        .expect("metadata carries the canonical semantic program identity");
+    let wrong_program = ProjectionProgramId::parse(
+        "pp1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
+    let topology = ProjectorTopologyId::new(1, "projection-delta-test", [0x44; 32]).unwrap();
+    let todo_schema = todos();
+    let user_schema = users();
+    let observation_codec = ProjectionScopeCodec::with_models(
+        topology.clone(),
+        [("TodoView", &todo_schema), ("UserView", &user_schema)],
+    )
+    .unwrap();
+    let scope = observation_codec
+        .encode_row_scope(
+            "projection-delta-test",
+            "TodoView",
+            Some(&json!("tenant-a")),
+            &crate::table::RowKey::new([(
+                "todo_id",
+                crate::table::RowValue::String("todo-wait-path".into()),
+            )]),
+        )
+        .unwrap();
+    let revision = RecordRevision::new(scope.clone(), 1, 1).unwrap();
+    let change = ProjectionChangeCursor::new(
+        topology,
+        scope.projection_partition().clone(),
+        ProjectionEpoch::new("projection-delta-v1").unwrap(),
+        1,
+    )
+    .unwrap();
+    let candidate = ProjectionObservation {
+        causation_id: result.causation_id().into(),
+        kind: ProjectionObservationKind::Record,
+        revision: Some(revision),
+        scope: scope.clone(),
+        change,
+        program_id: Some(semantic_program),
+    };
+    let disposition = protocol
+        .modeled_projection_evidence_topologies(TEST_COMMAND_NAME, result.causation_id(), &metadata)
+        .unwrap()
+        .disposition;
+    let evidence = protocol
+        .modeled_projection_evidence(
+            TEST_COMMAND_NAME,
+            result.causation_id(),
+            &metadata,
+            &ProjectionCausationEvidenceBatch {
+                observations: vec![candidate.clone()],
+                terminal_failure_topologies: Vec::new(),
+            },
+            disposition,
+        )
+        .unwrap();
+    assert!(matches!(
+        evidence.as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Observed(observation)]
+            if observation.program_id == Some(semantic_program)
+    ));
+    assert_ne!(
+        candidate.scope.topology().name(),
+        semantic_program.to_string(),
+        "the physical projector name and semantic author identity are distinct"
+    );
+
+    let mut mismatched_program = candidate.clone();
+    mismatched_program.program_id = Some(wrong_program);
+    let pending_for = |observation: ProjectionObservation| {
+        protocol
+            .modeled_projection_evidence(
+                TEST_COMMAND_NAME,
+                result.causation_id(),
+                &metadata,
+                &ProjectionCausationEvidenceBatch {
+                    observations: vec![observation],
+                    terminal_failure_topologies: Vec::new(),
+                },
+                disposition,
+            )
+            .unwrap()
+    };
+    assert!(matches!(
+        pending_for(mismatched_program).as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Pending]
+    ));
+    let mut unversioned = candidate.clone();
+    unversioned.program_id = None;
+    assert!(matches!(
+        pending_for(unversioned).as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Pending]
+    ));
+    let mut wrong_causation = candidate.clone();
+    wrong_causation.causation_id = FOREIGN_CAUSATION_ID.into();
+    assert!(matches!(
+        pending_for(wrong_causation).as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Pending]
+    ));
+    let wrong_scope = observation_codec
+        .encode_row_scope(
+            "projection-delta-test",
+            "UserView",
+            Some(&json!("tenant-a")),
+            &crate::table::RowKey::new([(
+                "user_id",
+                crate::table::RowValue::String("owner-secret".into()),
+            )]),
+        )
+        .unwrap();
+    let mut wrong_model = candidate.clone();
+    wrong_model.scope = wrong_scope;
+    wrong_model.revision = None;
+    assert!(matches!(
+        pending_for(wrong_model).as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Pending]
+    ));
+
+    // A cold restart with the same mounted program can still prove the
+    // persisted observation. Replacing only the program behavior while keeping
+    // the physical projector name/topology does not: the semantic ID is the
+    // durable authoring boundary, not a current-name lookup.
+    let restarted_fixture = modeled_fixture_deployment(
+        ProjectionBindingState::Active,
+        ProjectionExecutionClass::Causal,
+        ProjectionMutationKind::Upsert,
+        false,
+        "delta-service",
+        "projection-delta-test",
+        [0x44; 32],
+    );
+    let restart_codec = ProtocolTokenCodec::new([0x70; 32]);
+    let restart_cache = restart_codec
+        .issue(ProtocolTokenPurpose::CacheScope, &("wait-path", "cache"))
+        .unwrap();
+    let restart_seed = super::runtime::ProtocolProjectionRequestSeed::new(
+        selected_export(&restarted_fixture.surface),
+        Arc::new(
+            super::runtime::ProtocolProjectionProgramRegistry::try_from_surface(
+                &restarted_fixture.surface,
+            )
+            .unwrap(),
+        ),
+        crate::command_ledger::PrincipalPartitionId::new("wait-path-principal").unwrap(),
+        "wait-path-generation",
+        Vec::new(),
+        1,
+    )
+    .unwrap();
+    let restart_disposition = restart_seed
+        .modeled_evidence_topologies(
+            &restart_codec,
+            &restart_cache,
+            TEST_COMMAND_NAME,
+            result.causation_id(),
+            &metadata,
+        )
+        .unwrap()
+        .disposition;
+    assert!(matches!(
+        restart_seed
+            .modeled_evidence(
+                &restart_codec,
+                &restart_cache,
+                TEST_COMMAND_NAME,
+                result.causation_id(),
+                &metadata,
+                &ProjectionCausationEvidenceBatch {
+                    observations: vec![candidate.clone()],
+                    terminal_failure_topologies: Vec::new(),
+                },
+                restart_disposition,
+            )
+            .unwrap()
+            .as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Observed(_)]
+    ));
+    let changed_fixture = modeled_fixture_deployment(
+        ProjectionBindingState::Active,
+        ProjectionExecutionClass::Causal,
+        ProjectionMutationKind::Patch,
+        false,
+        "delta-service",
+        "projection-delta-test",
+        [0x44; 32],
+    );
+    assert_ne!(
+        restarted_fixture.program.id().unwrap(),
+        changed_fixture.program.id().unwrap(),
+        "the cold-restarted replacement must have a distinct semantic identity"
+    );
+    let changed_seed = super::runtime::ProtocolProjectionRequestSeed::new(
+        selected_export(&changed_fixture.surface),
+        Arc::new(
+            super::runtime::ProtocolProjectionProgramRegistry::try_from_surface(
+                &changed_fixture.surface,
+            )
+            .unwrap(),
+        ),
+        crate::command_ledger::PrincipalPartitionId::new("wait-path-principal").unwrap(),
+        "wait-path-generation",
+        Vec::new(),
+        1,
+    )
+    .unwrap();
+    let changed_result = changed_seed.modeled_evidence_topologies(
+        &restart_codec,
+        &restart_cache,
+        TEST_COMMAND_NAME,
+        result.causation_id(),
+        &metadata,
+    );
+    assert!(
+        changed_result.is_err(),
+        "changed program identity cannot reuse old metadata"
+    );
+
+    let status = CausalCommandPublicStatus {
+        state: CausalCommandPublicState::Succeeded,
+        command_id: result.command_id().into(),
+        command_name: Some(TEST_COMMAND_NAME.into()),
+        causation_id: Some(result.causation_id().into()),
+        consistency: Some(CommandConsistency::Eventual),
+        outcome: Some(json!({"accepted": true})),
+        obligations: Vec::new(),
+        projection_metadata: Some(metadata),
+        projection_revalidate: false,
+        evidence: vec![CausalCommandProjectionEvidence {
+            obligation_index: 0,
+            state: CausalProjectionEvidenceState::Observed,
+            incarnation: Some(1),
+            revision: Some(1),
+        }],
+        direct_projection: None,
+    };
+    protocol.record_status(&status).unwrap();
+    let command = serde_json::to_value(protocol.snapshot().unwrap()).unwrap()["command"].clone();
+    assert_eq!(command["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        command["observations"][0]["causationId"],
+        result.causation_id()
+    );
+}
+
+#[test]
+#[cfg(feature = "graphql")]
+fn wait_path_sealing_keeps_atomic_and_unselected_commands_without_metadata() {
+    use crate::command::CommandConsistency;
+    use crate::command_ledger::CommandLedgerState;
+    use crate::microsvc::{CausalCommandReceiptSource, CausalDispatchResult};
+
+    let (protocol, contract, event) = wait_path_fixture();
+    let result_for = |contract: crate::command::TypedCommandContract,
+                      events: Vec<crate::OutboxMessage>|
+     -> CausalDispatchResult {
+        CausalDispatchResult {
+            payload: json!({"accepted": true}),
+            receipt: CausalCommandReceiptSource {
+                command_id: "wait-path-bypass".into(),
+                command_name: String::new(),
+                causation_id: String::new(),
+                consistency: CommandConsistency::Eventual,
+                state: CommandLedgerState::Succeeded,
+                outcome: json!({"accepted": true}),
+                obligations: Vec::new(),
+                projection_metadata: None,
+                direct_projection: None,
+            },
+            projection_events: events,
+        }
+        .seal_wait_path_protocol(&protocol, &contract, Duration::from_secs(60))
+        .unwrap()
+    };
+
+    let mut atomic_contract = contract.clone();
+    atomic_contract.consistency = CommandConsistency::Atomic;
+    let atomic = result_for(atomic_contract, vec![event.clone()]);
+    assert_eq!(atomic.receipt.consistency, CommandConsistency::Atomic);
+    assert!(atomic.receipt.projection_metadata.is_none());
+    assert_eq!(atomic.receipt.state, CommandLedgerState::Succeeded);
+
+    let mut unselected_contract = contract.clone();
+    unselected_contract.projections.selectors.clear();
+    let unselected = result_for(unselected_contract, vec![event.clone()]);
+    assert_eq!(unselected.receipt.consistency, CommandConsistency::Eventual);
+    assert!(unselected.receipt.projection_metadata.is_none());
+    assert_eq!(unselected.receipt.state, CommandLedgerState::Succeeded);
+
+    let no_events = result_for(contract, Vec::new());
+    assert_eq!(no_events.receipt.consistency, CommandConsistency::Eventual);
+    assert!(no_events.receipt.projection_metadata.is_none());
+    assert_eq!(no_events.receipt.state, CommandLedgerState::Succeeded);
+}
+
 #[test]
 #[cfg(feature = "graphql")]
 fn opaque_fallback_hint_does_not_hide_empty_draining_modeled_work() {

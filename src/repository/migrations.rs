@@ -16,5 +16,5 @@ include!(concat!(env!("OUT_DIR"), "/migration_inventory.rs"));
 pub(crate) fn cell_migrations() -> impl Iterator<Item = &'static EmbeddedMigration> {
     SQLITE_MIGRATIONS
         .iter()
-        .filter(|migration| matches!(migration.version, 1 | 2 | 4))
+        .filter(|migration| matches!(migration.version, 1 | 2 | 4 | 8))
 }

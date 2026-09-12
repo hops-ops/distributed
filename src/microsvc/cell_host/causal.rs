@@ -40,6 +40,11 @@ pub const CELL_SERVICE_ID_HEADER: &str = "x-distributed-service-id";
 /// This is an opaque server-derived value, never a public command argument.
 pub const CELL_PRINCIPAL_PARTITION_HEADER: &str = "x-distributed-principal-partition";
 
+/// Internal wait-path header carrying the gateway's durable causation ID.
+/// The shared internal secret authenticates this value; public clients cannot
+/// select it.
+pub const CELL_CAUSATION_ID_HEADER: &str = "x-distributed-causation-id";
+
 /// Trusted command-ledger identity supplied by the cell's authenticated host.
 ///
 /// `principal_partition` is the opaque, server-derived partition produced by
@@ -47,6 +52,7 @@ pub const CELL_PRINCIPAL_PARTITION_HEADER: &str = "x-distributed-principal-parti
 #[derive(Clone, Debug)]
 pub struct CellCommandIdentity {
     key: CommandLedgerKey,
+    causation_id: Option<crate::command_ledger::CausationId>,
 }
 
 impl CellCommandIdentity {
@@ -60,7 +66,10 @@ impl CellCommandIdentity {
             PrincipalPartitionId::new(principal_partition).map_err(internal_ledger_error)?;
         let key = CommandLedgerKey::new(service_id, principal_partition, command_id)
             .map_err(internal_ledger_error)?;
-        Ok(Self { key })
+        Ok(Self {
+            key,
+            causation_id: None,
+        })
     }
 
     pub fn service_id(&self) -> &str {
@@ -69,6 +78,25 @@ impl CellCommandIdentity {
 
     pub fn command_id(&self) -> &str {
         self.key.command_id()
+    }
+
+    /// Bind a trusted gateway causation ID to the cell reservation. This is
+    /// used only across the authenticated internal wait-path boundary; a cell
+    /// identity without it retains the standalone cell-command behavior.
+    pub fn with_causation_id(
+        mut self,
+        causation_id: impl AsRef<str>,
+    ) -> Result<Self, CellDispatchError> {
+        let causation_id = crate::command_ledger::CausationId::parse_stored(
+            causation_id.as_ref().to_string(),
+        )
+        .map_err(internal_ledger_error)?;
+        self.causation_id = Some(causation_id);
+        Ok(self)
+    }
+
+    pub(crate) fn causation_id(&self) -> Option<&crate::command_ledger::CausationId> {
+        self.causation_id.as_ref()
     }
 
     pub(crate) fn key(&self) -> &CommandLedgerKey {

@@ -91,6 +91,7 @@ impl InMemoryRepository {
                     scope: Some(row.scope.clone()),
                     revision: Some(revision.clone()),
                     failure_id: None,
+                    program_id: None,
                 },
             )?;
             let record = ProjectionRecordMetadata {

@@ -47,7 +47,7 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(
             descriptions,
             vec![
@@ -56,7 +56,9 @@ mod tests {
                 "projection protocol",
                 "command ledger atomic state",
                 "projection source snapshots",
-                "gateway dependency versions"
+                "gateway dependency versions",
+                "projection program identity",
+                "external command binding"
             ]
         );
         assert_eq!(
@@ -86,6 +88,14 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/sqlite/0006_gateway_dependency_versions.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0007_projection_program_identity.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0008_external_command_binding.sql"
+                )),
             ]
         );
     }
@@ -105,7 +115,7 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(
             descriptions,
             vec![
@@ -114,7 +124,9 @@ mod tests {
                 "projection protocol",
                 "command ledger atomic state",
                 "projection source snapshots",
-                "gateway dependency versions"
+                "gateway dependency versions",
+                "projection program identity",
+                "external command binding"
             ]
         );
         assert_eq!(
@@ -143,6 +155,14 @@ mod tests {
                 include_str!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/postgres/0006_gateway_dependency_versions.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0007_projection_program_identity.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0008_external_command_binding.sql"
                 )),
             ]
         );

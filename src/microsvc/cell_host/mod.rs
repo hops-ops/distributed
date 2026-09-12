@@ -28,8 +28,8 @@ mod store;
 mod wire;
 
 pub use causal::{
-    CellCommandIdentity, CellDispatchError, CellDispatchResult, CELL_PRINCIPAL_PARTITION_HEADER,
-    CELL_SERVICE_ID_HEADER,
+    CellCommandIdentity, CellDispatchError, CellDispatchResult, CELL_CAUSATION_ID_HEADER,
+    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 pub use cell::{instance_name, parent_cell_name, AggregateCell, CellNamespace};
 #[cfg(feature = "workers-rs")]

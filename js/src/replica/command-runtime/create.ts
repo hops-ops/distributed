@@ -1,5 +1,6 @@
 import {
 	parseGraphqlResponseExtensions,
+	type DistributedCommandMetadata,
 	type DistributedProtocolEnvelope
 } from '../../protocol.js';
 import {
@@ -34,6 +35,7 @@ import {
 	pendingProjection,
 	preparedDispatchKeys,
 	preparedSemanticChanges,
+	projectionExpectationFingerprint,
 	requireCommandEnvelope,
 	requireCommandRejectionEnvelope,
 	requireStatusEnvelope,
@@ -84,6 +86,22 @@ import {
 	type PreparedProjectionOperation,
 	type ReplicaCommandProjection
 } from '../projection-delta/index.js';
+
+function hasCompleteProjectionObservations(
+	metadata: DistributedCommandMetadata
+): boolean {
+	if (metadata.expects.length === 0 || metadata.observations.length === 0) {
+		return false;
+	}
+	const observed = new Set(
+		metadata.observations
+			.filter((observation) => observation.causationId === metadata.causationId)
+			.map(projectionExpectationFingerprint)
+	);
+	return metadata.expects.every((expectation) =>
+		observed.has(projectionExpectationFingerprint(expectation))
+	);
+}
 
 function assertActualProjectionCapabilities(
 	contract: ReplicaCommandProjection,
@@ -1038,6 +1056,20 @@ export function createReplicaCommandRuntime<
 						if (tracker.pending !== undefined) {
 							settleTrackedProjection(tracker, pending);
 						}
+					} else if (
+						metadata.state === 'succeeded' &&
+						!prepared.revalidation.required &&
+						!statusRequiresRevalidation &&
+						hasCompleteProjectionObservations(metadata)
+					) {
+						/*
+						 * A cell may keep a committed external receipt in the public
+						 * `succeeded` state after its exact modeled observation is durable.
+						 * That proof settles the projected delivery wait, but it does not
+						 * retire the accepted layer: no canonical query/live frame has
+						 * confirmed read-model membership yet.
+						 */
+						settleTrackedProjection(tracker, pending);
 					} else if (
 						metadata.state === 'atomic' &&
 						!prepared.revalidation.required &&

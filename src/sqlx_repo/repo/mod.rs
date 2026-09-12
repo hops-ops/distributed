@@ -30,7 +30,7 @@ use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalStorageIdentity, CausalTransactionalCommit, CommandCompletion, CommandLedgerError,
     CommandLedgerKey, CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
-    ReservationOutcome,
+    ExternalCommandCompletion, ReservationOutcome,
 };
 use crate::entity::{Entity, EventRecord};
 use crate::outbox::{OutboxMessage, OutboxMessageStatus};
