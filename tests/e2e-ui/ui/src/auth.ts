@@ -489,6 +489,18 @@ export const handle: Handle = ({ event, resolve }) => {
 		}
 		return setCookie(name, value, options);
 	};
-	return authHandle({ event, resolve });
+	return authHandle({ event, resolve: (event) => {
+		const auth = event.locals.auth;
+		let calls = 0;
+		let previous: string | undefined;
+		event.locals.auth = async () => {
+			const call = ++calls;
+			const session = await auth();
+			console.debug('auth-audit: locals.auth', event.url.pathname, call, previous !== undefined && previous !== session?.accessToken, session?.expiresAt);
+			previous = session?.accessToken;
+			return session;
+		};
+		return resolve(event);
+	} });
 };
 export { signIn, signOut };
