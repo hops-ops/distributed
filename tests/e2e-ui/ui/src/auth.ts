@@ -489,6 +489,18 @@ export const handle: Handle = ({ event, resolve }) => {
 		}
 		return setCookie(name, value, options);
 	};
-	return authHandle({ event, resolve });
+	return authHandle({
+		event,
+		resolve: (event) => {
+			const auth = event.locals.auth;
+			// Auth.js reads the original request cookie each time. Share the promise
+			// so hooks and loaders cannot refresh it into different credentials.
+			// Keep null sessions and failures cached for this request as well.
+			let session: ReturnType<typeof auth> | undefined;
+			event.locals.auth = () => (session ??= Promise.resolve().then(() => auth()));
+			event.locals.getSession = event.locals.auth;
+			return resolve(event);
+		}
+	});
 };
 export { signIn, signOut };

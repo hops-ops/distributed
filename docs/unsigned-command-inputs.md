@@ -53,3 +53,8 @@ Code that manually constructs `CommandTypeField` or `SurfaceTypeField` must
 set `unsigned_integer` to the matching `CommandUnsignedInteger` variant, or
 `None` for unrefined fields. Prefer derives so this metadata follows the Rust
 type. A refinement on a non-`BigInt` field is rejected.
+
+Typed application manifests preserve `unsigned_integer` in canonical Surface
+command input and output contracts, including nested types. Decoding and
+re-encoding retains the same contract bytes and fingerprints. Unrefined fields
+omit this metadata, preserving their existing canonical representation.

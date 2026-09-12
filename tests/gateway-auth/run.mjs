@@ -52,6 +52,14 @@ export async function exerciseAuth(fixture) {
     const context = await browser.newContext();
     const page = await context.newPage();
     assert.equal((await context.request.get(`${publicOrigin}/private`)).status(), 401);
+    const readSessions = async () => {
+      const response = await context.request.get(`${publicOrigin}/api/auth/session-reads`);
+      assert.equal(response.status(), 200);
+      const result = await response.json();
+      assert.equal(result.sameSession, true, 'all request consumers must share one session');
+      return result;
+    };
+    assert.deepEqual(await readSessions(), { sameSession: true, authenticated: false, error: null, tokenDigest: null });
     await page.goto(publicOrigin);
     await page.getByRole('link', { name: 'Log in' }).click();
     await page.getByRole('button', { name: 'Continue as Alice' }).click();
@@ -66,6 +74,24 @@ export async function exerciseAuth(fixture) {
     // The real provider issues a 61-second access token. Cross the app's existing
     // 60-second refresh skew; no fake auth clock or forged session is involved.
     await new Promise(resolve => setTimeout(resolve, 2200));
+    const refreshesBeforeReads = idp.refreshes();
+    const firstReads = await readSessions();
+    assert.equal(firstReads.authenticated, true);
+    assert.equal(idp.refreshes(), refreshesBeforeReads + 1, 'concurrent and sequential reads must refresh only once');
+    // A later request must use its renewed cookie; after expiry it must refresh
+    // again. This also rejects a cache accidentally shared across requests.
+    await new Promise(resolve => setTimeout(resolve, 2200));
+    const laterReads = await readSessions();
+    assert.equal(laterReads.authenticated, true);
+    assert.notEqual(laterReads.tokenDigest, firstReads.tokenDigest);
+    assert.equal(idp.refreshes(), refreshesBeforeReads + 2);
+    const anonymous = await browser.newContext();
+    try {
+      const response = await anonymous.request.get(`${publicOrigin}/api/auth/session-reads`);
+      assert.equal((await response.json()).authenticated, false, 'another browser must not inherit the session');
+    } finally { await anonymous.close(); }
+    console.log('PASS request-local session reads share one refresh and later requests remain independent');
+    await new Promise(resolve => setTimeout(resolve, 2200));
     const refreshed = await context.request.post(`${publicOrigin}/api/auth/refresh`, { headers: { origin: publicOrigin } });
     assert.equal(refreshed.status(), 200, JSON.stringify({ url: refreshed.url(), body: await refreshed.text(), cookies: (await context.cookies()).map(({name, expires, path}) => ({name, expires, path})), privateStatus: (await context.request.get(`${publicOrigin}/private`)).status() }));
     const refreshBody = await refreshed.json();
@@ -79,6 +105,9 @@ export async function exerciseAuth(fixture) {
     assert.equal((await context.request.get(`${publicOrigin}/private`)).status(), 200);
     idp.failRefresh();
     await new Promise(resolve => setTimeout(resolve, 2200));
+    const failedReads = await readSessions();
+    assert.equal(failedReads.authenticated, false);
+    assert.equal(failedReads.error, 'RefreshAccessTokenError');
     const failedRefresh = await context.request.post(`${publicOrigin}/api/auth/refresh`, { headers: { origin: publicOrigin } });
     assert.equal(failedRefresh.status(), 401);
     assert.equal((await failedRefresh.json()).error, 'RefreshAccessTokenError');

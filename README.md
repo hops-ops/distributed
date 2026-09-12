@@ -2504,6 +2504,10 @@ inventories and validates their ownership; its convenience fields are unchanged.
 Portable artifacts remain bounded to 4 MiB. Version 1 artifacts must be
 regenerated with the matching CLI; they are not accepted as version 2.
 
+Modeled projection contracts [share repeated operations and selector schemas](docs/compact-projection-contracts.md)
+when smaller, preserving every current and retained event selector within the
+same manifest budget. Runtime program identities and execution are unchanged.
+
 For a full application, run `distributed build` or `distributed dev` from its
 Cargo workspace root. The CLI discovers the typed application, runtime binary,
 conventional `ui/` SvelteKit app, and `@hops-ops/distributed` dependency. A
