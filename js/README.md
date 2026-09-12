@@ -51,6 +51,12 @@ to validate that committed artifacts are current without rewriting them.
 
 A co-located route document can opt into SSR and live continuation:
 
+Row-filtered `@live` queries remain subscribed using authorized replacement
+snapshots; cursor-capable queries retain resumable delivery. Neither requires
+application polling. The v5 wire protocol uses `live.mode` (`snapshot` or
+`resumable`), replacing `live.supported`; upgrade client and server together.
+See [live query delivery](../docs/live-query-delivery.md).
+
 ```graphql
 query Todos @load @live {
   todos(order_by: [{ status: asc }, { todo_id: asc }]) {

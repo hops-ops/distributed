@@ -1,7 +1,5 @@
-import { CacheRevisionConflictError } from '../../internal/cache-engine.js';
 import type { GraphqlVariables } from '../../types.js';
 import {
-	parseGraphqlResponseExtensions,
 	type DistributedLiveCursor,
 	type DistributedProtocolEnvelope
 } from '../../protocol.js';
@@ -309,13 +307,8 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 						}
 						return;
 					}
-					let unsupportedLive = false;
 					try {
-						unsupportedLive =
-							parseGraphqlResponseExtensions(result.extensions)
-								?.distributed?.live?.supported === false;
-						if (unsupportedLive) state.live = 'off';
-						const distributed = host.writeCanonicalResult(
+						host.writeCanonicalResult(
 							watch.artifact,
 							watch.variables,
 							result,
@@ -323,26 +316,10 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 							undefined,
 							projectionGeneration
 						);
-						if (distributed.live?.supported === false) {
-							fallbackFromLive(host, watch, entry);
-							return;
-						}
 						state.live = 'active';
 						entry.operationGeneration =
 							host.operationGeneration(watch.key);
 					} catch (error) {
-						if (
-							unsupportedLive &&
-							error instanceof CacheRevisionConflictError
-						) {
-							/*
-							 * Revision zero is shared by provisional fallbacks.
-							 * Another operation may already have filled the same
-							 * semantic index differently; HTTP remains authoritative.
-							 */
-							fallbackFromLive(host, watch, entry);
-							return;
-						}
 						state.live = 'error';
 						state.errors = stableErrors(state.errors, [graphqlError(error)]);
 						host.emitState(watch.key, false);
@@ -429,14 +406,13 @@ export function fallbackFromLive<TData, TVariables extends GraphqlVariables>(
 	/*
 	 * Keep the inactive entry as an authorization-generation-scoped
 	 * sentinel. Query ingestion calls resumeLiveWatches(); deleting this
-	 * entry would otherwise reopen an unsupported or completed stream
+	 * entry would otherwise reopen a completed stream
 	 * immediately. Authorization invalidation clears it and may retry.
 	 *
-	 * A supported live frame advances the operation generation. Any HTTP
+	 * An accepted live frame advances the operation generation. Any HTTP
 	 * request that was already running is therefore doomed by its response
-	 * fence; drain it before starting the authoritative fallback. A first
-	 * unsupported frame never advances the generation, so its overlapping
-	 * HTTP request remains valid and can be reused directly.
+	 * fence; drain it before starting the authoritative fallback. A stream
+	 * that completed before its first frame can reuse the in-flight query.
 	 */
 	if (supersededFlight === undefined) {
 		refresh();

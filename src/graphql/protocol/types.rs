@@ -170,11 +170,19 @@ impl DistributedQuerySnapshot {
     }
 }
 
-/// Per-frame resumability decision for a live operation.
+/// Authorized snapshot delivery does not imply partition-wide resumability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DistributedLiveMode {
+    Snapshot,
+    Resumable,
+}
+
+/// Per-frame delivery mode for a live operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DistributedLiveMetadata {
-    pub(crate) supported: bool,
+    pub(crate) mode: DistributedLiveMode,
     pub(crate) reset: bool,
     pub(crate) cursors: Vec<DistributedLiveCursor>,
 }

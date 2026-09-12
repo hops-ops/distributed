@@ -113,7 +113,7 @@ const forwardedTodosBoundary = defineDistributedBoundaryOperation(
 	})
 );
 
-function serverHarness() {
+function serverHarness(mode = 'resumable') {
 	const calls = [];
 	const server = createDistributedSvelteKitServer({
 		boundaries: [todosBoundary],
@@ -150,6 +150,7 @@ function serverHarness() {
 					],
 					{
 						cacheScope: `cache:${token}`,
+						mode,
 						position
 					}
 				)
@@ -163,8 +164,9 @@ function serverHarness() {
 	};
 }
 
-test('static @load SSR is request-isolated and hydration avoids a duplicate first fetch', async () => {
-	const harness = serverHarness();
+for (const mode of ['resumable', 'snapshot']) {
+test(`static @load SSR is isolated and hydration avoids a duplicate fetch (${mode})`, async () => {
+	const harness = serverHarness(mode);
 	const [alice, bob] = await Promise.all([
 		harness.server.load(harness.event('alice')),
 		harness.server.load(harness.event('bob'))
@@ -212,7 +214,7 @@ test('static @load SSR is request-isolated and hydration avoids a duplicate firs
 		payload: todoFrame(
 			TodosArtifact,
 			[{ id: 'todo-alice', title: 'alice:live', status: 'open' }],
-			{ cacheScope: 'cache:alice', position: '2', source: 'live' }
+			{ cacheScope: 'cache:alice', position: '2', source: 'live', mode }
 		)
 	});
 	await flushMicrotasks();
@@ -230,6 +232,7 @@ test('static @load SSR is request-isolated and hydration avoids a duplicate firs
 	assert.equal(socket.closed, true);
 	client.destroy();
 });
+}
 
 test('SSR only awaits parent data for forwarded-prop bindings', async () => {
 	const harness = serverHarness();

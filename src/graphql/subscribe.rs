@@ -290,7 +290,7 @@ async fn execute_list(
     let next_live_resume = executed
         .live
         .as_ref()
-        .filter(|live| live.supported)
+        .filter(|live| live.mode == super::protocol::DistributedLiveMode::Resumable)
         .map(|live| RequestedLiveResume::Cursors(live.cursors.clone()))
         .unwrap_or(RequestedLiveResume::Absent);
     Ok(ExecutedLiveQuery {

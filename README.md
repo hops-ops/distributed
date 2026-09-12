@@ -4,6 +4,10 @@
 
 ## How it works
 
+Live queries stream authorized results even when row-level permissions prevent
+safe resume cursors. [Snapshot and resumable delivery](docs/live-query-delivery.md)
+describe the two modes and their consistency guarantees.
+
 Write the domain once, compose it into one `Service` or several, then
 generate the client. Each stage below uses real code from
 [`tests/e2e-ui`](tests/e2e-ui).

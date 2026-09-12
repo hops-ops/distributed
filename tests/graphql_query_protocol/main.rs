@@ -206,12 +206,21 @@ async fn project_item_with_id(
 }
 
 async fn delete_item(repository: &SqliteRepository, bus: &InMemoryBus, sequence: u64) {
+    delete_item_with_id(repository, bus, sequence, ROW_ID).await;
+}
+
+async fn delete_item_with_id(
+    repository: &SqliteRepository,
+    bus: &InMemoryBus,
+    sequence: u64,
+    id: &str,
+) {
     bus.publish_message(
         Message::new(
             FACT_NAME,
             MessageKind::Event,
             serde_json::to_vec(&json!({
-                "id": ROW_ID,
+                "id": id,
                 "title": "deleted row",
                 "delete": true
             }))
@@ -404,7 +413,7 @@ fn assert_live_frame(
     assert_eq!(snapshot["indexes"][0]["position"], expected_position);
 
     let live = &distributed["live"];
-    assert_eq!(live["supported"], true, "{response}");
+    assert_eq!(live["mode"], "resumable", "{response}");
     assert_eq!(live["reset"], expected_reset, "{response}");
     assert_eq!(live["cursors"].as_array().map(Vec::len), Some(1));
     assert_eq!(live["cursors"][0]["projection"], PROJECTOR_NAME);
@@ -957,7 +966,7 @@ async fn live_subscription_replays_delete_tombstone_and_observation() {
         "{deleted}"
     );
     let distributed = distributed_envelope(&deleted);
-    assert_eq!(distributed["live"]["supported"], true);
+    assert_eq!(distributed["live"]["mode"], "resumable");
     assert_eq!(distributed["live"]["reset"], false);
     assert_eq!(distributed["live"]["cursors"][0]["position"], "2");
     assert_eq!(distributed["snapshot"]["indexes"][0]["position"], "2");
@@ -1124,7 +1133,7 @@ async fn row_filtered_surface_never_exposes_partition_wide_live_activity() {
     assert_eq!(records[0]["model"], "CausalQueryView");
     assert_eq!(records[0]["tombstone"], false);
     assert_opaque_token(&records[0]["scopeToken"], "record-revision");
-    assert_eq!(envelope["live"]["supported"], false, "{initial}");
+    assert_eq!(envelope["live"]["mode"], "snapshot", "{initial}");
     assert_eq!(envelope["live"]["reset"], true, "{initial}");
     assert_eq!(envelope["live"]["cursors"], json!([]), "{initial}");
 
@@ -1142,6 +1151,50 @@ async fn row_filtered_surface_never_exposes_partition_wide_live_activity() {
             .is_err(),
         "a denied-row commit must not leak a cursor, causation, tombstone, or activity frame"
     );
+
+    delete_item_with_id(
+        &fixture.repository,
+        &fixture.bus,
+        3,
+        "other-principal-private-row",
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(350), stream.next())
+            .await
+            .is_err(),
+        "a denied-row deletion must not leak activity or a tombstone"
+    );
+    project_item(&fixture.repository, &fixture.bus, 4, "visible change").await;
+    let changed = next_wire_frame(&mut stream).await;
+    assert_eq!(
+        changed["data"]["causal_query_views"],
+        json!([{ "title": "visible change" }])
+    );
+    let metadata = distributed_envelope(&changed);
+    assert_eq!(
+        metadata["live"],
+        json!({"mode":"snapshot","reset":true,"cursors":[]})
+    );
+    assert_eq!(metadata["snapshot"]["indexes"], json!([]));
+    assert_eq!(metadata["snapshot"]["observations"], json!([]));
+
+    drop(stream);
+    let mut stream = engine.execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
+    let reconnected = next_wire_frame(&mut stream).await;
+    assert_eq!(reconnected["data"], changed["data"]);
+    assert_eq!(distributed_envelope(&reconnected)["live"], metadata["live"]);
+
+    delete_item(&fixture.repository, &fixture.bus, 5).await;
+    let deleted = next_wire_frame(&mut stream).await;
+    assert_eq!(deleted["data"]["causal_query_views"], json!([]));
+    let metadata = distributed_envelope(&deleted);
+    assert_eq!(
+        metadata["live"],
+        json!({"mode":"snapshot","reset":true,"cursors":[]})
+    );
+    assert_eq!(metadata["snapshot"]["records"], json!([]));
+    assert_eq!(metadata["snapshot"]["observations"], json!([]));
 }
 
 async fn query_over_http_and_graphql_ws(

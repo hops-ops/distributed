@@ -499,7 +499,7 @@ mod tests {
         serde_json::json!({"data":{"rows":[{"title":"unchanged"}]},"extensions":{"distributed":{
             "protocolVersion":1,"schemaHash":"schema","authorizationGeneration":"policy","cacheScope":"alice","operation":"operation",
             "snapshot":{"recordsComplete":true,"indexesComparable":true,"records":[],"indexes":[{"projection":"rows","scopeToken":"scope","position":position.to_string()}],"observations":[proof]},
-            "live":{"supported":true,"reset":false,"cursors":[{"projection":"rows","position":position.to_string(),"token":format!("token-{position}")}]}
+            "live":{"mode":"resumable","reset":false,"cursors":[{"projection":"rows","position":position.to_string(),"token":format!("token-{position}")}]}
         }}})
     }
     struct DropCount(Arc<AtomicUsize>);

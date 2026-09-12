@@ -416,11 +416,11 @@ function wireFrame(options = {}) {
 		options.live === undefined
 			? undefined
 			: {
-					supported: options.live.supported ?? true,
+					mode: options.live.mode ?? 'resumable',
 					reset: options.live.reset ?? false,
 					cursors:
 						options.live.cursors ??
-						(options.live.supported === false ? [] : [resume])
+						(options.live.mode === 'snapshot' ? [] : [resume])
 				};
 	return {
 		data: { todos: rows },
@@ -725,7 +725,7 @@ test('comparable live snapshot cannot drop an Eventual list row after confirmati
 			position: '2',
 			operation: Todos.live.id,
 			rows: [{ id: 'todo-1', title: 'first' }],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live'
 	);
@@ -750,7 +750,7 @@ test('comparable live snapshot cannot drop an Eventual list row after confirmati
 				{ id: 'todo-1', title: 'first' },
 				{ id: 'todo-2', title: 'posted' }
 			],
-			live: { supported: true },
+			live: { mode: "resumable" },
 			records: [
 				{
 					path: ['todos', '0'],
@@ -832,7 +832,7 @@ test('Eventual membership fences are independent per index', () => {
 				{ id: 'todo-1', title: 'first' },
 				{ id: 'todo-2', title: 'posted' }
 			],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live'
 	);
@@ -845,7 +845,7 @@ test('Eventual membership fences are independent per index', () => {
 			indexScope: 'index:todos-open',
 			snapshotScope: 'snapshot:todos-open',
 			rows: [{ id: 'todo-1', title: 'first' }],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live',
 		TodosOpen
@@ -867,7 +867,7 @@ test('Eventual membership fences are independent per index', () => {
 				{ id: 'todo-1', title: 'first' },
 				{ id: 'todo-2', title: 'posted' }
 			],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live',
 		TodosOpen
@@ -915,7 +915,7 @@ test('overlapping Eventual commands retain every membership-fence owner', () => 
 			position: '2',
 			operation: Todos.live.id,
 			rows: [{ id: 'todo-1', title: 'first' }],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live'
 	);
@@ -1438,7 +1438,7 @@ test('a comparable shared root cannot promote an incomparable nested sibling', a
 			ownerName: 'unfenced live frame',
 			operation: GamesWithOwnerLiveOperation.live.id,
 			live: {
-				supported: true,
+				mode: "resumable",
 				reset: false,
 				cursors: [
 					{
@@ -1469,7 +1469,7 @@ test('an older operation reset cannot erase a shared index owned by a newer arti
 			operation: Todos.live.id,
 			position: '5',
 			rows: [{ id: 'todo-live', title: 'old live owner' }],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live'
 	);
@@ -1490,7 +1490,7 @@ test('an older operation reset cannot erase a shared index owned by a newer arti
 			operation: Todos.live.id,
 			position: '8',
 			rows: [{ id: 'todo-reset', title: 'older reset' }],
-			live: { supported: true, reset: true }
+			live: { mode: "resumable", reset: true }
 		},
 		'live'
 	);
@@ -1508,7 +1508,7 @@ test('reset preserves an equal-vector index with another operation co-owner', ()
 			operation: Todos.live.id,
 			position: '5',
 			rows: [{ id: 'todo-shared', title: 'shared snapshot' }],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live'
 	);
@@ -1529,7 +1529,7 @@ test('reset preserves an equal-vector index with another operation co-owner', ()
 			operation: Todos.live.id,
 			position: '4',
 			rows: [{ id: 'todo-reset', title: 'older reset' }],
-			live: { supported: true, reset: true }
+			live: { mode: "resumable", reset: true }
 		},
 		'live'
 	);
@@ -1785,7 +1785,7 @@ test('a live handoff fences an HTTP response launched in the prior generation', 
 	watch.destroy();
 });
 
-test('unsupported live fallback cannot fence HTTP membership or later revalidation', async () => {
+test('snapshot live stays attached and fences overlapping HTTP membership', async () => {
 	const fetches = [];
 	const subscriptions = [];
 	let unsubscribeCount = 0;
@@ -1819,14 +1819,14 @@ test('unsupported live fallback cannot fence HTTP membership or later revalidati
 			rows: [{ id: 'todo-live', title: 'provisional live fallback' }],
 			recordScope: 'record:live',
 			indexesComparable: false,
-			live: { supported: false, reset: true }
+			live: { mode: "snapshot", reset: true }
 		})
 	);
 	assert.deepEqual(replica.read(Todos, {}).data.todos, [
 		{ id: 'todo-live', title: 'provisional live fallback' }
 	]);
-	assert.equal(watch.get().live, 'off');
-	assert.equal(unsubscribeCount, 1);
+	assert.equal(watch.get().live, 'active');
+	assert.equal(unsubscribeCount, 0);
 
 	await Promise.resolve();
 	fetches[0].resolve(
@@ -1839,12 +1839,12 @@ test('unsupported live fallback cannot fence HTTP membership or later revalidati
 	);
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(replica.read(Todos, {}).data.todos, [
-		{ id: 'todo-http', title: 'newer HTTP membership' }
+		{ id: 'todo-live', title: 'provisional live fallback' }
 	]);
 	assert.equal(
 		subscriptions.length,
 		1,
-		'query fallback must not immediately reopen an unsupported stream'
+		'snapshot delivery must keep the original subscription attached'
 	);
 
 	const revalidation = replica.revalidate({
@@ -1866,13 +1866,19 @@ test('unsupported live fallback cannot fence HTTP membership or later revalidati
 	assert.deepEqual(replica.read(Todos, {}).data.todos, [
 		{ id: 'todo-revalidated', title: 'revalidated membership' }
 	]);
-	assert.equal(subscriptions.length, 1);
+	assert.equal(subscriptions.length, 2, 'refresh restarts the snapshot stream');
+	assert.equal(subscriptions[1].request.resume, undefined);
+	subscriptions[0].observer.next(wireFrame({
+		operation: 'live:todos', rows: [], indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }
+	}));
+	assert.equal(replica.read(Todos, {}).data.todos[0].id, 'todo-revalidated');
 
 	watch.destroy();
-	assert.equal(unsubscribeCount, 1);
+	assert.equal(unsubscribeCount, 2);
 });
 
-test('conflicting provisional live fallbacks still close and yield to HTTP', async () => {
+test('snapshot live cannot supersede an incomparable sibling index owner', async () => {
 	const fetches = [];
 	let liveObserver;
 	let unsubscribeCount = 0;
@@ -1902,7 +1908,7 @@ test('conflicting provisional live fallbacks still close and yield to HTTP', asy
 			rows: [{ id: 'todo-other', title: 'other provisional membership' }],
 			recordScope: 'record:other',
 			indexesComparable: false,
-			live: { supported: false, reset: true }
+			live: { mode: "snapshot", reset: true }
 		}),
 		'live'
 	);
@@ -1915,30 +1921,103 @@ test('conflicting provisional live fallbacks still close and yield to HTTP', asy
 			rows: [{ id: 'todo-live', title: 'conflicting provisional membership' }],
 			recordScope: 'record:live',
 			indexesComparable: false,
-			live: { supported: false, reset: true }
+			live: { mode: "snapshot", reset: true }
 		})
 	);
-	assert.equal(watch.get().live, 'off');
-	assert.equal(unsubscribeCount, 1);
+	assert.equal(watch.get().live, 'active');
+	assert.equal(unsubscribeCount, 0);
 
-	await Promise.resolve();
-	fetches[0].resolve(
-		wireFrame({
-			rows: [{ id: 'todo-http', title: 'authoritative HTTP membership' }],
-			recordScope: 'record:http',
-			indexesComparable: false
-		})
-	);
-	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(fetches.length, 0, 'a complete live result needs no HTTP fallback');
 	assert.deepEqual(replica.read(Todos, {}).data.todos, [
-		{ id: 'todo-http', title: 'authoritative HTTP membership' }
+		{ id: 'todo-other', title: 'other provisional membership' }
 	]);
+	liveObserver.next(wireFrame({
+		operation: 'live:todos', rows: [], indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }
+	}));
+	assert.deepEqual(replica.read(Todos, {}).data.todos, [
+		{ id: 'todo-other', title: 'other provisional membership' }
+	]);
+	assert.equal(watch.get().live, 'active');
+	assert.equal(unsubscribeCount, 0);
 
 	watch.destroy();
 	assert.equal(unsubscribeCount, 1);
 });
 
-test('completed supported live streams relinquish ownership and fall back to HTTP', async () => {
+test('snapshot live replaces SSR membership, updates and removes rows, and fences disposal', () => {
+	let observer;
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, next) { observer = next; return () => {}; }
+	} });
+	replica.writeResult(Todos, {}, wireFrame({
+		rows: [{ id: 'todo-1', title: 'SSR title' }], indexesComparable: false
+	}), 'ssr');
+	const watch = replica.watch(Todos, {}, { live: true });
+	observer.next(wireFrame({
+		operation: 'live:todos', rows: [{ id: 'todo-1', title: 'updated title' }],
+		revision: '2', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }
+	}));
+	assert.equal(replica.read(Todos, {}).data.todos[0].title, 'updated title');
+	observer.next(wireFrame({
+		operation: 'live:todos', rows: [], indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }
+	}));
+	assert.deepEqual(replica.read(Todos, {}).data.todos, []);
+	assert.equal(watch.get().live, 'active');
+	watch.destroy();
+	observer.next(wireFrame({
+		operation: 'live:todos', rows: [{ id: 'late', title: 'disposed callback' }],
+		indexesComparable: false, live: { mode: 'snapshot', reset: true }
+	}));
+	assert.deepEqual(replica.read(Todos, {}).data.todos, []);
+});
+
+test('snapshot authorization changes discard the old stream and reconnect without cursors', async () => {
+	const subscriptions = [];
+	const requests = [];
+	const replica = createDistributedReplica({ transport: {
+		fetch(request) {
+			return new Promise((resolve) => requests.push({ request, resolve }));
+		},
+		subscribe(request, observer) {
+			subscriptions.push({ request, observer });
+			return () => {};
+		}
+	} });
+	write(replica, { rows: [{ id: 'alice', title: 'private alice' }], indexesComparable: false }, 'ssr');
+	const watch = replica.watch(Todos, {}, { live: true });
+	subscriptions[0].observer.next(wireFrame({
+		operation: 'live:todos', rows: [{ id: 'alice', title: 'private alice' }],
+		indexesComparable: false, live: { mode: 'snapshot', reset: true }
+	}));
+	replica.invalidateAuthorization();
+	await Promise.resolve();
+	assert.equal(requests.length, 1);
+	subscriptions[0].observer.next(wireFrame({
+		operation: 'live:todos', rows: [{ id: 'alice', title: 'late private alice' }],
+		indexesComparable: false, live: { mode: 'snapshot', reset: true }
+	}));
+	assert.equal(watch.get().complete, false);
+	requests[0].resolve(wireFrame({
+		cacheScope: 'cache:b', rows: [{ id: 'bob', title: 'private bob' }],
+		recordScope: 'record:b', indexesComparable: false
+	}));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(subscriptions.length, 2);
+	assert.equal(subscriptions[1].request.resume, undefined);
+	assert.equal(watch.get().data.todos[0].id, 'bob');
+	subscriptions[1].observer.next(wireFrame({
+		operation: 'live:todos', cacheScope: 'cache:b', rows: [],
+		indexesComparable: false, live: { mode: 'snapshot', reset: true }
+	}));
+	assert.deepEqual(watch.get().data.todos, []);
+	watch.destroy();
+});
+
+test('completed resumable live streams relinquish ownership and fall back to HTTP', async () => {
 	const fetches = [];
 	const subscriptions = [];
 	let unsubscribeCount = 0;
@@ -1971,7 +2050,7 @@ test('completed supported live streams relinquish ownership and fall back to HTT
 			position: '2',
 			rows: [{ id: 'todo-live', title: 'supported live membership' }],
 			recordScope: 'record:live',
-			live: { supported: true, reset: true }
+			live: { mode: "resumable", reset: true }
 		})
 	);
 	assert.deepEqual(replica.read(Todos, {}).data.todos, [

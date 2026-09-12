@@ -1184,21 +1184,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		}
 
 		this.#validateLiveSnapshot(snapshot, live);
-		const unsupportedLive =
-			source === 'live' && live?.supported === false;
+		const snapshotLive = source === 'live' && live?.mode === 'snapshot';
 		const reset = live?.reset === true;
 		const group = this.#operationProtocols.get(key)!;
-		/*
-		 * An unsupported subscription response is an authorized fallback
-		 * snapshot, not a live source. In particular, a row-filtered snapshot
-		 * has no comparable index vector, so retaining live ownership here
-		 * would reject every later query handoff. Relinquish any prior live
-		 * ownership without advancing the generation; the forced HTTP fallback
-		 * starts against the generation that remains after this frame.
-		 */
-		if (unsupportedLive && group.active === 'live') {
-			group.active = undefined;
-		}
 		const previousActiveSource = group.active;
 		const handoff =
 			previousActiveSource !== undefined &&
@@ -1226,8 +1214,22 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			requestRevision,
 			source
 		);
+		// A non-resumable stream has no causal vector to compare. An HTTP
+		// refresh may replace it only if the request began after its last
+		// accepted membership. fetchWatch also fences intervening live frames.
+		// Taking query ownership restarts the stream, fencing queued callbacks.
+		const snapshotRefresh =
+			source === 'network' &&
+			previousActiveSource === 'live' &&
+			!snapshot.indexesComparable &&
+			activeState?.snapshotScope === undefined &&
+			activeState?.indexRevision !== undefined &&
+			requestRevision !== undefined &&
+			compareCanonicalDecimalStrings(requestRevision, activeState.indexRevision) > 0;
 		const handoffBlocked =
 			handoff &&
+			!snapshotLive &&
+			!snapshotRefresh &&
 			(
 				!snapshot.indexesComparable ||
 				!isComparableHandoffDisposition(ownDisposition) ||
@@ -1251,7 +1253,6 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					: sharedDisposition.disposition ?? disposition;
 		}
 		const sourceSwitched =
-			!unsupportedLive &&
 			!handoffBlocked &&
 			isComparableHandoffDisposition(disposition) &&
 			this.#activateOperationSource(
@@ -1316,24 +1317,16 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			!rejectedHandoff &&
 			disposition !== 'lower' &&
 			disposition !== 'incomparable';
-		/*
-		 * Revision zero is the cache engine's lowest legal checkpoint. It lets
-		 * an unsupported live response fill an empty cache immediately while
-		 * guaranteeing that any HTTP request revision can replace it.
-		 */
+		// Snapshot frames receive local membership revisions, not fabricated
+		// projection clocks. Live ownership fences older overlapping HTTP work.
 		const indexRevision =
-			unsupportedLive
-				? '0'
+			writeIndexes &&
+			(sourceSwitched || sharedDisposition.disposition === 'higher')
+				? this.#allocateIndexRevision()
 				: writeIndexes &&
-					  (
-							sourceSwitched ||
-							sharedDisposition.disposition === 'higher'
-						)
-					? this.#allocateIndexRevision()
-					: writeIndexes &&
-						  sharedDisposition.disposition === 'equal' &&
-						  sharedDisposition.indexRevision !== undefined
-						? sharedDisposition.indexRevision
+					  sharedDisposition.disposition === 'equal' &&
+					  sharedDisposition.indexRevision !== undefined
+					? sharedDisposition.indexRevision
 				: snapshot.indexesComparable &&
 					  disposition === 'equal' &&
 					  operationState.indexRevision !== undefined
@@ -1615,7 +1608,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		} else if (live?.reset === true || !snapshot.indexesComparable) {
 			operationState.cursors = Object.freeze([]);
 		}
-		if (source === 'live' && !unsupportedLive) {
+		if (source === 'live') {
 			this.#advanceOperationGeneration(key);
 		}
 			if (source !== 'live' && sourceSwitched) {
@@ -2838,7 +2831,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		snapshot: DistributedQuerySnapshot,
 		live: DistributedProtocolEnvelope['live']
 	): void {
-		if (live === undefined || !live.supported) return;
+		if (live === undefined || live.mode === 'snapshot') return;
 		if (!snapshot.indexesComparable) {
 			protocolInvalid(
 				'extensions.distributed.snapshot.indexesComparable'

@@ -26,7 +26,7 @@ export function frame(position, targetId, targetTitle) {
 		protocolVersion: artifact.protocol.version, schemaHash: artifact.protocol.schemaHash,
 		authorizationGeneration: 'auth-1', cacheScope: 'unique-key-cache',
 		operation: position === '1' ? artifact.id : artifact.live.id,
-		...(position === '1' ? {} : { live: { supported: true, reset: false, cursors: [
+		...(position === '1' ? {} : { live: { mode: "resumable", reset: false, cursors: [
 			{ projection: 'unique-key-projector', position, token: `resume:${position}` }
 		] } }),
 		snapshot: { scopeToken: 'unique-key-snapshot', recordsComplete: true, indexesComparable: true,

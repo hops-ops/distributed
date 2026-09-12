@@ -18,9 +18,9 @@ use super::engine::GraphqlPool;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use super::execute;
 use super::protocol::{
-    DistributedIndexRevision, DistributedLiveMetadata, DistributedQuerySnapshot,
-    DistributedRecordRevision, ProtocolResponseAccumulator, RequestedLiveResume,
-    MAX_LIVE_RESUME_CURSORS,
+    DistributedIndexRevision, DistributedLiveMetadata, DistributedLiveMode,
+    DistributedQuerySnapshot, DistributedRecordRevision, ProtocolResponseAccumulator,
+    RequestedLiveResume, MAX_LIVE_RESUME_CURSORS,
 };
 use super::surface::{Surface, SurfaceProjectionOwner, SurfaceRowPolicy};
 use crate::projection::placement::ProjectionBindingState;
@@ -167,7 +167,7 @@ impl QueryProtocolRuntime {
     /// the plan. Join targets such as `auth_users` are often populated by
     /// integration handlers without a unit-resume owner; they still participate
     /// in dirty matching via `tables_touched`, but must not force
-    /// `live.supported = false` for an otherwise resumable root model (e.g.
+    /// snapshot-only live delivery for an otherwise resumable root model (e.g.
     /// `chat_messages` with a nested `author` selection).
     pub(crate) fn index_plan(&self, role_surface: &Surface, tables: &[String]) -> QueryIndexPlan {
         if tables.is_empty() {
@@ -787,13 +787,23 @@ where
         }
         None => (None, Vec::new()),
     };
-    let snapshot = wire_query_snapshot(
+    let mut snapshot = wire_query_snapshot(
         accumulator,
         prepared,
         record_metadata,
         partitions,
         live_changes,
     )?;
+    if live
+        .as_ref()
+        .is_some_and(|metadata| metadata.mode == DistributedLiveMode::Snapshot)
+    {
+        // A safe query vector can still exceed the live cursor budget. Snapshot
+        // delivery has one contract regardless of why resumability is unavailable.
+        snapshot.indexes_comparable = false;
+        snapshot.indexes.clear();
+        snapshot.observations.clear();
+    }
     Ok(ProtocolQueryExecution {
         value: executed.value,
         snapshot,
@@ -894,7 +904,7 @@ where
     {
         return Ok(PreparedLiveMetadata {
             metadata: DistributedLiveMetadata {
-                supported: false,
+                mode: DistributedLiveMode::Snapshot,
                 reset: true,
                 cursors: Vec::new(),
             },
@@ -1094,7 +1104,7 @@ where
 
     Ok(PreparedLiveMetadata {
         metadata: DistributedLiveMetadata {
-            supported: true,
+            mode: DistributedLiveMode::Resumable,
             reset,
             cursors: current,
         },

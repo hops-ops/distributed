@@ -519,7 +519,7 @@ fn stream_frames_are_immutable_fifo_and_do_not_bleed_forward() {
         .record_query_metadata(
             first.clone(),
             Some(DistributedLiveMetadata {
-                supported: true,
+                mode: DistributedLiveMode::Resumable,
                 reset: true,
                 cursors: vec![first.indexes[0].resume.clone().unwrap()],
             }),
@@ -529,7 +529,7 @@ fn stream_frames_are_immutable_fifo_and_do_not_bleed_forward() {
         .record_query_metadata(
             second.clone(),
             Some(DistributedLiveMetadata {
-                supported: true,
+                mode: DistributedLiveMode::Resumable,
                 reset: false,
                 cursors: vec![second.indexes[0].resume.clone().unwrap()],
             }),

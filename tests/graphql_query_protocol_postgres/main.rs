@@ -236,7 +236,7 @@ async fn postgres_emits_exact_revisions_and_accepts_an_exact_live_resume() {
         engine.execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
     let initial = next_wire_frame(&mut initial_stream).await;
     let initial_live = &distributed_envelope(&initial)["live"];
-    assert_eq!(initial_live["supported"], true, "{initial}");
+    assert_eq!(initial_live["mode"], "resumable", "{initial}");
     assert_eq!(initial_live["reset"], false, "{initial}");
     let cursors = initial_live["cursors"].clone();
     assert_eq!(cursors[0]["projection"], PROJECTOR_NAME);
@@ -247,7 +247,7 @@ async fn postgres_emits_exact_revisions_and_accepts_an_exact_live_resume() {
     let mut resumed_stream = engine.execute_stream(&user_session(), request_with_resume(cursors));
     let resumed = next_wire_frame(&mut resumed_stream).await;
     let resumed_live = &distributed_envelope(&resumed)["live"];
-    assert_eq!(resumed_live["supported"], true, "{resumed}");
+    assert_eq!(resumed_live["mode"], "resumable", "{resumed}");
     assert_eq!(resumed_live["reset"], false, "{resumed}");
     assert_eq!(resumed_live["cursors"][0]["position"], "1");
 }

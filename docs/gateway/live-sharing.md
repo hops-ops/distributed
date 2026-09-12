@@ -19,11 +19,15 @@ upstream subscription and producer. HTTP control requests do not execute result 
 Groups bind the exact document, variables, origin subject/cache scope, policy,
 schema and protocol. Each consumer keeps its own transport ID, expiry, queue and
 freshness requirements. Different resume cursors start independent replay. Handoff
-requires the same operation plus an exact supported, comparable cursor vector and
+requires the same operation plus an exact resumable, comparable cursor vector and
 matching data; the consumer's replay frames remain queued before future shared
 frames. Unknown cursors keep independent streams. Equal data alone never proves
 cursor equality. Duplicate suppression hashes the whole data and protocol envelope,
 so new confirmation evidence is delivered even when values are unchanged.
+
+Cursorless `live.mode = "snapshot"` responses cannot prove shared replay handoff;
+they retain independent authorized subscriptions and reconnect with fresh queries.
+See [live query delivery](../live-query-delivery.md) for the wire contract.
 
 Defaults bound a coordinator to 256 groups, 1,024 consumers per group, 16 pending
 frames per consumer, 1 MiB per full frame, eight retained history frames and a

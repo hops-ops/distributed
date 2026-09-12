@@ -388,7 +388,7 @@ fn live_scope_replay_and_proof_sensitive_frames() {
     )
     .is_err());
     let mut payload: serde_json::Value = serde_json::from_slice(&snapshot(&admitted).body).unwrap();
-    payload["extensions"]["distributed"]["live"] = json!({"supported":true,"cursors":[{"projection":"todos","position":"2","token":"cursor"}]});
+    payload["extensions"]["distributed"]["live"] = json!({"mode":"resumable","cursors":[{"projection":"todos","position":"2","token":"cursor"}]});
     let first = LiveFrame::from_origin(&admitted, payload.clone(), None, 4096).unwrap();
     assert!(
         first.same_frame(&LiveFrame::from_origin(&admitted, payload.clone(), None, 4096).unwrap())
@@ -406,7 +406,7 @@ fn live_scope_replay_and_proof_sensitive_frames() {
         !first.same_cursor(&changed),
         "same projector cursor does not cover external writes"
     );
-    payload["extensions"]["distributed"]["live"]["supported"] = false.into();
+    payload["extensions"]["distributed"]["live"]["mode"] = "snapshot".into();
     let unsupported = LiveFrame::from_origin(&admitted, payload, None, 4096).unwrap();
     assert!(!unsupported.same_cursor(&unsupported));
     let mut stronger = context();

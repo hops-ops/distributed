@@ -181,7 +181,7 @@ impl LiveFrame {
         let canonical = canonical_json(&payload).unwrap_or(bytes);
         let protocol = &payload["extensions"]["distributed"];
         let cursors = &protocol["live"]["cursors"];
-        let cursor = if protocol["live"]["supported"] == true
+        let cursor = if protocol["live"]["mode"] == "resumable"
             && protocol["snapshot"]["indexesComparable"] == true
             && cursors.as_array().is_some_and(|cursors| {
                 !cursors.is_empty()
