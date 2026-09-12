@@ -1701,6 +1701,42 @@ curl http://localhost:3000/health
 claim names; handlers read them with `session.get("…")` or map claims to the
 convenience keys at the edge.
 
+### Authenticated cell wait-path metadata
+
+An internal command host can carry a small, explicit set of already-authenticated
+facts across the private cell HTTP boundary. Do not put producer or operation
+claims in `Session`: ordinary cell calls forward only the authenticated user and
+role keys. `CellRequestContext` requires an internal HTTP secret and reserves
+framework identity and transport-control headers from application metadata.
+
+```rust,ignore
+use distributed::command_dispatch::{
+    CellRequestContext, HttpCommandHost, TrustedRequestMetadata,
+};
+
+let metadata = TrustedRequestMetadata::try_from_pairs([
+    ("x-source-kind", "canonical-fact"),
+])?;
+let context = CellRequestContext::new("writer-service", "principal-partition")
+    .with_causation_id("0190a000-0000-7000-8000-000000000001")
+    .with_trusted_metadata(metadata);
+let host = HttpCommandHost::new_internal("http://cell.internal", secret)?;
+let (_status, body) = host
+    .post_cell_wait_path_with_context(
+        "order.submit",
+        "0190a000-0000-7000-8000-000000000002",
+        serde_json::json!({ "order_id": "order-1" }),
+        &session,
+        &context,
+    )
+    .await?;
+```
+
+Metadata names must be canonical lowercase and values are bounded visible HTTP
+text. Public callers cannot authenticate this path by supplying the reserved
+headers themselves; the cell must validate the shared internal secret before
+constructing its typed command identity.
+
 ### gRPC Transport (requires `grpc` feature)
 
 The `grpc` feature adds a tonic-based gRPC transport using standard protobuf wire format (no `.proto` file needed):

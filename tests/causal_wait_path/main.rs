@@ -3,22 +3,33 @@
 
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use distributed::bus::{Bus, BusConsumer, InMemoryBus, TransportError};
 use distributed::cell_host::{
-    CelldCommandHost, CelldRoute, InternalHttpSecret, CELL_CAUSATION_ID_HEADER,
+    AggregateCell, CellCommandIdentity, CelldCommandHost, CelldRoute, InternalHttpSecret,
+    CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
+    CELL_SERVICE_ID_HEADER,
 };
 use distributed::command::{
-    typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField, Succeeded,
+    typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
+    PreparedCommand, Succeeded,
 };
-use distributed::command_dispatch::{CommandHost, HttpCommandHost, SharedCommandHost};
+use distributed::command_dispatch::{
+    CellRequestContext, CommandHost, HttpCommandHost, SharedCommandHost, TrustedRequestMetadata,
+};
 use distributed::graphql::VerifiedPrincipal;
-use distributed::microsvc::{router, Routes, Service, ROLE_KEY, USER_ID_KEY};
+use distributed::microsvc::{
+    router, CausalCommandContext, HandlerError, PortableCommand, Routes, Service, Session,
+    ROLE_KEY, USER_ID_KEY,
+};
 use distributed::{Aggregate, AggregateBuilder, Entity, InMemoryRepository, Snapshot};
 #[cfg(feature = "sqlite")]
 use distributed::{AggregateRepository, SqliteRepository};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
+
+const TRUSTED_CAUSATION_ID: &str = "0190a000-0000-7000-8000-000000000999";
 
 #[derive(Default, Snapshot)]
 struct WaitAgg {
@@ -137,6 +148,54 @@ fn wait_service() -> Arc<Service> {
     wait_service_with_repo(InMemoryRepository::new())
 }
 
+async fn handle_trusted_create(
+    ctx: &CausalCommandContext<'_, WaitAgg>,
+    input: IdInput,
+) -> Result<PreparedCommand<Succeeded<IdPayload>>, HandlerError> {
+    let trusted = [
+        ("x-producer", "canonical-fact"),
+        (CELL_SERVICE_ID_HEADER, "generic-writer"),
+        (CELL_PRINCIPAL_PARTITION_HEADER, "generic-partition"),
+        (CELL_CAUSATION_ID_HEADER, TRUSTED_CAUSATION_ID),
+    ]
+    .into_iter()
+    .all(|(key, expected)| ctx.claim(key) == Some(expected));
+    if !trusted {
+        return Err(HandlerError::Unauthorized(
+            "trusted producer metadata missing".into(),
+        ));
+    }
+    let repo = ctx.repo();
+    if repo.get(&input.id).await?.is_some() {
+        return Err(HandlerError::Rejected(format!(
+            "cell item {} already exists",
+            input.id
+        )));
+    }
+    let mut item = repo.create();
+    item.record(input.id.clone())
+        .map_err(|error| HandlerError::Rejected(error.to_string()))?;
+    repo.commit(item)?.succeeded(IdPayload { id: input.id })
+}
+
+struct TrustedCreate;
+
+impl<D> PortableCommand<D> for TrustedCreate
+where
+    D: distributed::microsvc::CausalRouteDependencies<Aggregate = WaitAgg> + Send + Sync + 'static,
+{
+    fn install(self, routes: Routes<D>) -> Routes<D> {
+        routes
+            .typed_command(typed_command::<IdInput, Succeeded<IdPayload>>(
+                "generic.grant",
+            ))
+            .guarded(
+                |_ctx: &CausalCommandContext<'_, WaitAgg>| true,
+                handle_trusted_create,
+            )
+    }
+}
+
 #[cfg(feature = "sqlite")]
 fn sqlite_wait_service(repository: SqliteRepository) -> Arc<Service> {
     let causal = Routes::new()
@@ -168,6 +227,133 @@ async fn start_http(service: Arc<Service>) -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+#[derive(Clone)]
+struct TypedCellBridgeState {
+    cell: Arc<AggregateCell<WaitAgg>>,
+    secret: InternalHttpSecret,
+}
+
+fn typed_cell_bridge_error(
+    status: StatusCode,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> (StatusCode, axum::Json<Value>) {
+    (
+        status,
+        axum::Json(json!({
+            "code": code.into(),
+            "error": message.into(),
+        })),
+    )
+}
+
+async fn typed_cell_bridge(
+    axum::extract::State(state): axum::extract::State<TypedCellBridgeState>,
+    headers: axum::http::HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> (StatusCode, axum::Json<Value>) {
+    let Some(secret) = headers
+        .get(CELL_INTERNAL_SECRET_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return typed_cell_bridge_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "missing internal cell secret",
+        );
+    };
+    if !state.secret.matches(secret) {
+        return typed_cell_bridge_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "invalid internal cell secret",
+        );
+    }
+
+    let required_header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let Some(service_id) = required_header(CELL_SERVICE_ID_HEADER) else {
+        return typed_cell_bridge_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "missing cell service identity",
+        );
+    };
+    let Some(principal_partition) = required_header(CELL_PRINCIPAL_PARTITION_HEADER) else {
+        return typed_cell_bridge_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "missing cell principal partition",
+        );
+    };
+    let Some(causation_id) = required_header(CELL_CAUSATION_ID_HEADER) else {
+        return typed_cell_bridge_error(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "missing cell causation identity",
+        );
+    };
+    let Some(command_id) = body.get("commandId").and_then(Value::as_str) else {
+        return typed_cell_bridge_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "missing commandId",
+        );
+    };
+    let input = body.get("input").cloned().unwrap_or(Value::Null);
+    let identity = match CellCommandIdentity::new(service_id, principal_partition, command_id)
+        .and_then(|identity| identity.with_causation_id(causation_id))
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            return typed_cell_bridge_error(
+                StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::BAD_REQUEST),
+                error.code(),
+                error.client_message(),
+            )
+        }
+    };
+
+    // The bridge only constructs a Session after authenticating the internal
+    // host boundary. Public callers cannot turn arbitrary request headers into
+    // trusted producer claims because they cannot pass the secret check.
+    let mut session = Session::new();
+    for (name, value) in &headers {
+        if let Ok(value) = value.to_str() {
+            session.set(name.as_str(), value);
+        }
+    }
+
+    match state
+        .cell
+        .dispatch_idempotent("generic.grant", &identity, input, session)
+        .await
+    {
+        Ok(result) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "payload": result.payload(),
+                "receipt": {
+                    "commandId": result.command_id(),
+                    "causationId": result.causation_id(),
+                    "state": result.state(),
+                    "replayed": result.replayed(),
+                },
+                "events": result.projection_events(),
+            })),
+        ),
+        Err(error) => typed_cell_bridge_error(
+            StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            error.code(),
+            error.client_message(),
+        ),
+    }
 }
 
 #[tokio::test]
@@ -233,6 +419,388 @@ async fn cell_wait_path_replays_once_after_internal_failure() {
     assert_eq!(body["receipt"]["commandId"], command_id);
     assert_eq!(body["receipt"]["replayed"], true);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn trusted_native_metadata_reaches_cell_without_forwarding_session_headers() {
+    use axum::{
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        routing::post,
+        Json, Router,
+    };
+    use std::sync::Mutex;
+
+    async fn command(
+        State(seen): State<Arc<Mutex<Vec<Option<String>>>>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        seen.lock().unwrap().push(
+            headers
+                .get("x-producer")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+        );
+        (
+            StatusCode::CREATED,
+            Json(json!({
+                "payload": { "id": body["input"]["id"] },
+                "receipt": {
+                    "commandId": body["commandId"],
+                    "causationId": "cause-trusted",
+                    "state": "succeeded",
+                    "replayed": false
+                },
+                "events": []
+            })),
+        )
+    }
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(post(command))
+        .with_state(Arc::clone(&seen));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let host = HttpCommandHost::new_internal(
+        format!("http://{addr}"),
+        InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
+    )
+    .unwrap();
+    let mut session = distributed::microsvc::Session::new();
+    session.set(USER_ID_KEY, "native-user");
+    session.set(ROLE_KEY, "system");
+    session.set("x-producer", "forged-public-header");
+    let metadata =
+        TrustedRequestMetadata::try_from_pairs([("x-producer", "canonical-fact")]).unwrap();
+    let context = CellRequestContext::new("generic-writer", "generic-partition")
+        .with_causation_id("canonical-causation")
+        .with_trusted_metadata(metadata);
+
+    host.post_cell_wait_path_with_context(
+        "generic.grant",
+        "0190a000-0000-7000-8000-000000000120",
+        json!({ "id": "generic-grant-1" }),
+        &session,
+        &context,
+    )
+    .await
+    .unwrap();
+    host.post_cell_wait_path(
+        "generic.grant",
+        "0190a000-0000-7000-8000-000000000121",
+        json!({ "id": "generic-grant-2" }),
+        &session,
+        "generic-writer",
+        "generic-partition",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![Some("canonical-fact".into()), None],
+        "only the explicit trusted context may carry custom producer metadata"
+    );
+}
+
+#[tokio::test]
+async fn trusted_native_metadata_reaches_a_real_aggregate_cell() {
+    use axum::{routing::post, Router};
+
+    let secret = InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap();
+    let cell = Arc::new(
+        AggregateCell::<WaitAgg>::new("typed-cell-grant")
+            .unwrap()
+            .mount(TrustedCreate),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(post(typed_cell_bridge))
+        .with_state(TypedCellBridgeState {
+            cell: Arc::clone(&cell),
+            secret: secret.clone(),
+        });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let base = format!("http://{addr}");
+    let host = HttpCommandHost::new_internal(base.clone(), secret.clone()).unwrap();
+    let mut session = distributed::microsvc::Session::new();
+    session.set(USER_ID_KEY, "native-user");
+    session.set(ROLE_KEY, "system");
+    // This value models a public request header. The explicit native context
+    // below is the only trusted producer source for the cell command.
+    session.set("x-producer", "forged-public-header");
+    let metadata =
+        TrustedRequestMetadata::try_from_pairs([("x-producer", "canonical-fact")]).unwrap();
+    let context = CellRequestContext::new("generic-writer", "generic-partition")
+        .with_causation_id(TRUSTED_CAUSATION_ID)
+        .with_trusted_metadata(metadata);
+
+    let (status, body) = host
+        .post_cell_wait_path_with_context(
+            "generic.grant",
+            "0190a000-0000-7000-8000-000000000122",
+            json!({ "id": "typed-cell-grant" }),
+            &session,
+            &context,
+        )
+        .await
+        .expect("typed cell command should receive the trusted context");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["payload"], json!({ "id": "typed-cell-grant" }));
+    assert_eq!(body["receipt"]["state"], "succeeded");
+    assert_eq!(body["receipt"]["causationId"], TRUSTED_CAUSATION_ID);
+    assert_eq!(body["receipt"]["replayed"], false);
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1,
+        "valid trusted cell dispatch must commit one aggregate event"
+    );
+
+    let (status, body) = host
+        .post_cell_wait_path_with_context(
+            "generic.grant",
+            "0190a000-0000-7000-8000-000000000122",
+            json!({ "id": "typed-cell-grant" }),
+            &session,
+            &context,
+        )
+        .await
+        .expect("same cell command identity should replay its durable result");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["receipt"]["replayed"], true);
+    assert_eq!(body["receipt"]["causationId"], TRUSTED_CAUSATION_ID);
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1,
+        "replay must not append another aggregate event"
+    );
+
+    let (status, body) = host
+        .post_cell_wait_path_with_context(
+            "generic.grant",
+            "0190a000-0000-7000-8000-000000000122",
+            json!({ "id": "different-input" }),
+            &session,
+            &context,
+        )
+        .await
+        .expect("changed input should return a durable command-id conflict");
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["code"], "COMMAND_ID_REUSE");
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1,
+        "a reused identity with a changed body must not append an event"
+    );
+
+    let client = reqwest::Client::new();
+    let missing_secret = client
+        .post(format!("{base}/generic.grant"))
+        .header(CELL_SERVICE_ID_HEADER, "generic-writer")
+        .header(CELL_PRINCIPAL_PARTITION_HEADER, "generic-partition")
+        .header(CELL_CAUSATION_ID_HEADER, TRUSTED_CAUSATION_ID)
+        .header("x-producer", "canonical-fact")
+        .json(&json!({
+            "commandId": "0190a000-0000-7000-8000-000000000124",
+            "input": { "id": "missing-secret" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_secret.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_secret = client
+        .post(format!("{base}/generic.grant"))
+        .header(CELL_INTERNAL_SECRET_HEADER, "wrong-test-only-secret")
+        .header(CELL_SERVICE_ID_HEADER, "generic-writer")
+        .header(CELL_PRINCIPAL_PARTITION_HEADER, "generic-partition")
+        .header(CELL_CAUSATION_ID_HEADER, TRUSTED_CAUSATION_ID)
+        .header("x-producer", "canonical-fact")
+        .json(&json!({
+            "commandId": "0190a000-0000-7000-8000-000000000125",
+            "input": { "id": "wrong-secret" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_secret.status(), StatusCode::UNAUTHORIZED);
+
+    let (status, body) = host
+        .post_cell_wait_path_with_causation(
+            "generic.grant",
+            "0190a000-0000-7000-8000-000000000126",
+            json!({ "id": "missing-producer" }),
+            &session,
+            "generic-writer",
+            "generic-partition",
+            Some(TRUSTED_CAUSATION_ID),
+        )
+        .await
+        .expect("typed guard rejection should be returned by the cell bridge");
+    assert_eq!(status, StatusCode::UNAUTHORIZED.as_u16(), "{body}");
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("trusted producer metadata")));
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1,
+        "unauthenticated provenance must not append an aggregate event"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_transport_recovery_preserves_no_effects_then_replays() {
+    use axum::{routing::post, Router};
+
+    let secret = InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap();
+    let cell = Arc::new(
+        AggregateCell::<WaitAgg>::new("recovery-cell")
+            .unwrap()
+            .mount(TrustedCreate),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(post(typed_cell_bridge))
+        .with_state(TypedCellBridgeState {
+            cell: Arc::clone(&cell),
+            secret: secret.clone(),
+        });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let base = format!("http://{addr}");
+    let host = HttpCommandHost::new_internal(base, secret).unwrap();
+    let mut session = distributed::microsvc::Session::new();
+    session.set(USER_ID_KEY, "native-user");
+    session.set(ROLE_KEY, "system");
+
+    // The original command is authenticated at the HTTP boundary but lacks
+    // the producer claim required by the destination cell. This fixture only
+    // proves that the rejected request produced no aggregate event; a caller
+    // must inspect its durable receipt/error classification before recovery.
+    let (status, body) = host
+        .post_cell_wait_path_with_causation(
+            "generic.grant",
+            "0190a000-0000-7000-8000-000000000220",
+            json!({ "id": "recovery-cell" }),
+            &session,
+            "generic-writer",
+            "generic-partition",
+            Some(TRUSTED_CAUSATION_ID),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::UNAUTHORIZED.as_u16(), "{body}");
+    assert!(body["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("trusted producer metadata")));
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        0
+    );
+
+    let metadata =
+        TrustedRequestMetadata::try_from_pairs([("x-producer", "canonical-fact")]).unwrap();
+    let context = CellRequestContext::new("generic-writer", "generic-partition")
+        .with_causation_id(TRUSTED_CAUSATION_ID)
+        .with_trusted_metadata(metadata);
+    let recovery_command_id = "0190a000-0000-7000-8000-000000000221";
+
+    let (status, body) = host
+        .post_cell_wait_path_with_context(
+            "generic.grant",
+            recovery_command_id,
+            json!({ "id": "recovery-cell" }),
+            &session,
+            &context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+    assert_eq!(body["receipt"]["replayed"], false);
+    assert_eq!(body["receipt"]["causationId"], TRUSTED_CAUSATION_ID);
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1
+    );
+
+    let (status, body) = host
+        .post_cell_wait_path_with_context(
+            "generic.grant",
+            recovery_command_id,
+            json!({ "id": "recovery-cell" }),
+            &session,
+            &context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK.as_u16(), "{body}");
+    assert_eq!(body["receipt"]["replayed"], true);
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1
+    );
+
+    let (status, body) = host
+        .post_cell_wait_path_with_context(
+            "generic.grant",
+            recovery_command_id,
+            json!({ "id": "changed-recovery-body" }),
+            &session,
+            &context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::CONFLICT.as_u16(), "{body}");
+    assert_eq!(body["code"], "COMMAND_ID_REUSE");
+    assert_eq!(
+        cell.durable_events()
+            .unwrap()
+            .iter()
+            .map(|stream| stream.events.len())
+            .sum::<usize>(),
+        1
+    );
 }
 
 #[tokio::test]
