@@ -17,7 +17,7 @@ runtime = ["application-runtime"]
 proc-macro-crate = "3.5"
 proc-macro2 = "1.0"
 quote = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 syn = { version = "2.0", features = ["full", "visit"] }
 
 [dev-dependencies]
