@@ -763,7 +763,7 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
     assert_eq!(first.schema_fingerprint, second.schema_fingerprint);
     assert_eq!(
         first.schema_fingerprint,
-        "sha256:d170cb2de47ed71c0127206a5a42970abff278cec2bcb494551da554053f3a83"
+        "sha256:d0e8509749ca7a9a4a1b48a785e448bb5e798e6376f920bc15ec9c07ac314d7c"
     );
     assert_eq!(
         first.protocol_fingerprint,

@@ -1304,7 +1304,7 @@ mod client_surface_parity_tests {
         }
         assert_eq!(
             manifest.schema_fingerprint,
-            "sha256:7a456dac4fce3e4ccba7255baccad3e70e891f71ea476c1560631c9b2e5cf1da"
+            "sha256:cce38712ab7d84a934fa10bf1272d292d20f746aea5bf2e485fe15b2527517c0"
         );
     }
 
@@ -1439,7 +1439,7 @@ mod client_surface_parity_tests {
         assert_eq!(manifest.service_id, "orders-service");
         assert_eq!(
             manifest.schema_fingerprint,
-            "sha256:7a599939c85d2f444428431675655d371929234965bdcfb6c81eba244694e6d0"
+            "sha256:9c0150e725493dc1e5ddbb3fdfc8b651cad399f099908cbcac326e514389c48a"
         );
     }
 
@@ -1845,10 +1845,13 @@ mod client_surface_parity_tests {
         let actual_manifest = sha256(&manifest_json);
         let actual_static_sdl = sha256(static_sdl.as_bytes());
         let actual_runtime_sdl = sha256(runtime_sdl.as_bytes());
-        assert_eq!(actual_manifest, expected.manifest, "{dialect:?}/{role}");
-        assert_eq!(actual_static_sdl, expected.static_sdl, "{dialect:?}/{role}");
         assert_eq!(
-            actual_runtime_sdl, expected.runtime_sdl,
+            (
+                actual_manifest.as_str(),
+                actual_static_sdl.as_str(),
+                actual_runtime_sdl.as_str()
+            ),
+            (expected.manifest, expected.static_sdl, expected.runtime_sdl),
             "{dialect:?}/{role}"
         );
     }
@@ -1882,30 +1885,30 @@ mod client_surface_parity_tests {
 
     #[cfg(feature = "sqlite")]
     const SQLITE_RESTRICTED_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:a2b97c4156fd9e6c99c3ad516af5cf2c57781fa4f13757902685989a691b2515",
-        static_sdl: "sha256:6ac07aaa60a726bdde7c1632125a3ab933766931187654dacc2dd4ab19ffece1",
-        runtime_sdl: "sha256:fb41d43fa1b58fec7224d768124abc8bb0b30407e1ee56b44f620ddc8d8c0007",
+        manifest: "sha256:c1c3dd3f242f82225b486542b1737976f791e019f50e015f8755f48d70685f9a",
+        static_sdl: "sha256:03252ba251b1ddac611fe567d816f780f0876f9f6ce263be95a3480f88fc2283",
+        runtime_sdl: "sha256:3d099b8c0b27f0dcbdd677199f767fcc5993071e06b2c0a7d4aa02caf4e5f4ac",
     };
 
     #[cfg(feature = "sqlite")]
     const SQLITE_ADMIN_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:4619fb257bd0b3b0155ebdff5f34a8d15f6c23bc0fc8a99459e7d56aad444932",
-        static_sdl: "sha256:4d7ba7651ff632d32e538a083165ff718e094858c6c5bdb2705d38d9f0665e2f",
-        runtime_sdl: "sha256:be0f13249ec0cb394457572097a1d201649deeec1eba9c980f48b1751a13062b",
+        manifest: "sha256:94345b9e29bccaa77aa5083eb73014a1a102db7ce1f03f022a2f0e242b5c84d2",
+        static_sdl: "sha256:128b85bcd6485d14de62b0976e9f12e8b35ad9e7d96a5627d1edcfcabdb591b3",
+        runtime_sdl: "sha256:c0b6d600d353357ab4f393897fb6b7ee51f69546f7a4cc4b6786e42abe621f5c",
     };
 
     #[cfg(feature = "postgres")]
     const POSTGRES_RESTRICTED_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:a2b97c4156fd9e6c99c3ad516af5cf2c57781fa4f13757902685989a691b2515",
-        static_sdl: "sha256:6ac07aaa60a726bdde7c1632125a3ab933766931187654dacc2dd4ab19ffece1",
-        runtime_sdl: "sha256:fb41d43fa1b58fec7224d768124abc8bb0b30407e1ee56b44f620ddc8d8c0007",
+        manifest: "sha256:c1c3dd3f242f82225b486542b1737976f791e019f50e015f8755f48d70685f9a",
+        static_sdl: "sha256:03252ba251b1ddac611fe567d816f780f0876f9f6ce263be95a3480f88fc2283",
+        runtime_sdl: "sha256:3d099b8c0b27f0dcbdd677199f767fcc5993071e06b2c0a7d4aa02caf4e5f4ac",
     };
 
     #[cfg(feature = "postgres")]
     const POSTGRES_ADMIN_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:66cddbcf76eac385f94de011497fe4752f7fb6102de28c14c24d83c67367788b",
-        static_sdl: "sha256:d128621aea3ffa6c38abc44a9b7f3b2716aada4af4b579b10e7c415040281751",
-        runtime_sdl: "sha256:ae58e2ed718955a6d400197a4cfa2f363d3057c80c6f4e528d10615a3df804cb",
+        manifest: "sha256:8ff2691f33789c8267b1338603b2ee3544841f8b17cc5b90ea2e851381dd36de",
+        static_sdl: "sha256:afe92660c1700845ed5f3e0ddaacc4b481799c39f86b8eacecb46d1b8f99d421",
+        runtime_sdl: "sha256:de4885736fdf22a57ccc55160d63b6d1a7fdb33728dec399e8a81d54ce7e8c09",
     };
 
     #[cfg(feature = "sqlite")]

@@ -456,7 +456,7 @@ fn emit_comparison_exp(out: &mut String, scalar: &str, operators: &[String]) {
         let operand = match operator.as_str() {
             "_in" | "_nin" => format!("[{scalar}!]"),
             "_is_null" => "Boolean".into(),
-            "_like" | "_ilike" | "_has_key" => "String".into(),
+            "_like" | "_ilike" | "_icontains" | "_has_key" => "String".into(),
             _ => scalar.to_string(),
         };
         out.push_str(&format!("  {operator}: {operand}\n"));

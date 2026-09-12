@@ -44,6 +44,7 @@ jobs:
           cargo test --test postgres_transport --no-default-features --features postgres --verbose
           cargo test --test distributed_read_model --no-default-features --features postgres --verbose
           cargo test --test sql_lock_manager --no-default-features --features postgres --verbose
+          cargo test --test graphql_literal_text --no-default-features --features graphql,postgres --verbose
       - name: Verify source fencing and snapshot rebuild against PostgreSQL
         env:
           DISTRIBUTED_SNAPSHOT_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/distributed_snapshots

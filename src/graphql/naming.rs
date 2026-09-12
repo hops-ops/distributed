@@ -104,7 +104,7 @@ pub const PORTABLE_COMPARISON_OPS: &[&str] = &[
 ];
 
 /// String-only comparison operators (portable; SQLite maps `_ilike` → `LIKE`).
-pub const STRING_COMPARISON_OPS: &[&str] = &["_like", "_ilike"];
+pub const STRING_COMPARISON_OPS: &[&str] = &["_like", "_ilike", "_icontains"];
 
 /// Postgres `jsonb` operators — only on `JSON_comparison_exp` when the engine
 /// dialect is Postgres. **Must not** appear on SQLite schema or SDL.
@@ -254,6 +254,8 @@ mod tests {
         let string_ops = comparison_op_fields("String", false);
         assert!(string_ops.contains(&"_like"));
         assert!(string_ops.contains(&"_ilike"));
+        assert!(string_ops.contains(&"_icontains"));
+        assert!(!comparison_op_fields("Int", false).contains(&"_icontains"));
         assert!(!string_ops.contains(&"_contains"));
     }
 

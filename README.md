@@ -1921,6 +1921,31 @@ distributed = { version = "0.1", features = ["graphql", "postgres"] }
 `distributed::graphql::{naming,sdl}` compile without the feature so
 `distributed schema --format graphql` works in tooling crates.
 
+### Literal text search
+
+Use `_icontains` for a case-insensitive substring search on a String column:
+
+```graphql
+query SearchTodos($q: String! = "") @load @live {
+  todos(where: { title: { _icontains: $q } }, limit: 20) {
+    todo_id
+    title
+  }
+}
+```
+
+A colocated binding can pass `q: searchParam('q')` directly. Callers do not
+construct `%patterns%`: `%`, `_`, backslash, quotes and the escape character
+are literal text. The query engine binds an escaped pattern on both PostgreSQL
+and SQLite. An empty string matches every non-null string; use a bounded query
+and show results only after a submitted search when building a search form.
+
+Case matching follows the database: PostgreSQL uses its configured ILIKE
+behavior; SQLite's default LIKE folds ASCII, not arbitrary Unicode. The browser
+replica therefore leaves local match evaluation uncertain and relies on the
+authorized server result. `_ilike` still accepts deliberate wildcard patterns;
+`_contains` remains the PostgreSQL JSON containment operator.
+
 ### Scope
 
 | In | Out |

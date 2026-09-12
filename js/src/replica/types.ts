@@ -217,6 +217,7 @@ export type ReplicaFilterOperator =
 	| '_is_null'
 	| '_like'
 	| '_ilike'
+	| '_icontains'
 	| '_contains'
 	| '_contained_in'
 	| '_has_key';
