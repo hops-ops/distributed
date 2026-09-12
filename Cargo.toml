@@ -1,6 +1,11 @@
 [workspace]
 members = ["distributed_macros", "distributed_cli"]
-exclude = ["tests/e2e-ui", "tests/celld/worker", "tests/celld/relay-worker"]
+exclude = [
+    "tests/e2e-ui",
+    "tests/celld/worker",
+    "tests/celld/relay-worker",
+    "tests/load",
+]
 resolver = "2"
 
 [workspace.package]

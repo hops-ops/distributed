@@ -18,10 +18,14 @@
 //!
 //! Requires the `kafka` feature. Integration-tested in `tests/kafka_transport`.
 
+use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+
+use rdkafka::consumer::StreamConsumer;
+use tokio::sync::Mutex;
 
 use super::kafka::{KafkaPublisher, KafkaSource};
 use super::{
@@ -31,6 +35,13 @@ use super::{
 use super::{Message, MessageKind};
 
 const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+type ConsumerKey = (String, Vec<String>);
+
+fn consumer_key(group_id: String, mut topics: Vec<String>) -> ConsumerKey {
+    topics.sort();
+    topics.dedup();
+    (group_id, topics)
+}
 
 /// Kafka [`Bus`] + [`BusConsumer`]. Cheap to clone.
 #[derive(Clone)]
@@ -39,6 +50,8 @@ pub struct KafkaBus {
     publisher: Arc<KafkaPublisher>,
     topology: BusTopologyConfig,
     fetch_timeout: Duration,
+    fetch_max: usize,
+    consumers: Arc<Mutex<HashMap<ConsumerKey, Arc<StreamConsumer>>>>,
 }
 
 /// Awaitable builder returned by [`KafkaBus::connect`].
@@ -77,6 +90,8 @@ impl KafkaBusConnect {
             publisher: Arc::new(publisher),
             topology,
             fetch_timeout: self.fetch_timeout,
+            fetch_max: 32,
+            consumers: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -175,10 +190,24 @@ impl KafkaBus {
             .topology
             .resolve_consumer_group(router.as_ref(), "kafka")?;
         let group_id = format!("{namespace}.{group}.{suffix}");
+        let consumer_key = consumer_key(group_id.clone(), topics);
+        let topics = &consumer_key.1;
         let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
-        let source = KafkaSource::connect(&self.brokers, &group_id, &topic_refs)
-            .await?
+        let consumer = {
+            let mut cache = self.consumers.lock().await;
+            if let Some(existing) = cache.get(&consumer_key) {
+                Arc::clone(existing)
+            } else {
+                let created = KafkaSource::connect(&self.brokers, &group_id, &topic_refs)
+                    .await?
+                    .consumer;
+                cache.insert(consumer_key, Arc::clone(&created));
+                created
+            }
+        };
+        let source = KafkaSource::new(consumer)
             .with_fetch_timeout(self.fetch_timeout)
+            .with_fetch_max(self.fetch_max)
             .with_strip_prefix(prefix);
         run_source(router, source, options).await
     }
@@ -248,6 +277,8 @@ mod tests {
             publisher: Arc::new(KafkaPublisher::new(producer)),
             topology: BusTopologyConfig::default(),
             fetch_timeout: Duration::from_millis(1),
+            fetch_max: 32,
+            consumers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -265,5 +296,26 @@ mod tests {
         bus.subscribe(router, RunOptions::idempotent())
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn consumer_cache_key_is_independent_of_topic_order_and_duplicates() {
+        assert_eq!(
+            consumer_key(
+                "orders".to_string(),
+                vec![
+                    "orders.cmd.create".to_string(),
+                    "orders.cmd.cancel".to_string()
+                ]
+            ),
+            consumer_key(
+                "orders".to_string(),
+                vec![
+                    "orders.cmd.cancel".to_string(),
+                    "orders.cmd.create".to_string(),
+                    "orders.cmd.create".to_string(),
+                ]
+            )
+        );
     }
 }

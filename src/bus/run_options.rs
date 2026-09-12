@@ -60,6 +60,21 @@ impl<I> Default for ConsumerDeliveryMode<I> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NoInbox {}
 
+/// What [`run_source`](super::run_source) does when `recv` returns `Ok(None)`.
+///
+/// Adapters use `None` both for "queue is idle" and for "source closed".
+/// Drain (the default) keeps the historical test contract: process what is
+/// there and return. Wait is the long-lived consumer: park on
+/// [`MessageSource::wait`](super::MessageSource::wait) and recv again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IdlePolicy {
+    /// Stop the run when `recv` returns `Ok(None)`.
+    #[default]
+    Drain,
+    /// Wait for work and recv again. Cancel by dropping the `listen` future.
+    Wait,
+}
+
 /// Cross-cutting execution policy for a transport run.
 ///
 /// Generic over the inbox hook type `I`, defaulting to [`NoInbox`] for the
@@ -70,6 +85,8 @@ pub struct RunOptions<I = NoInbox> {
     pub delivery_mode: ConsumerDeliveryMode<I>,
     /// What the runner does with a permanent handler/transport failure.
     pub failure_policy: FailurePolicy,
+    /// Whether an empty `recv` ends the run or waits for more work.
+    pub idle: IdlePolicy,
 }
 
 impl<I> Default for RunOptions<I> {
@@ -78,6 +95,7 @@ impl<I> Default for RunOptions<I> {
         Self {
             delivery_mode: ConsumerDeliveryMode::default(),
             failure_policy: FailurePolicy::default(),
+            idle: IdlePolicy::Drain,
         }
     }
 }
@@ -98,12 +116,19 @@ impl<I> RunOptions<I> {
         Self {
             delivery_mode: ConsumerDeliveryMode::Inbox(hook),
             failure_policy: FailurePolicy::default(),
+            idle: IdlePolicy::Drain,
         }
     }
 
     /// Override the failure policy.
     pub fn with_failure_policy(mut self, policy: FailurePolicy) -> Self {
         self.failure_policy = policy;
+        self
+    }
+
+    /// Keep listening when the source is idle instead of ending the run.
+    pub fn wait_when_idle(mut self) -> Self {
+        self.idle = IdlePolicy::Wait;
         self
     }
 
