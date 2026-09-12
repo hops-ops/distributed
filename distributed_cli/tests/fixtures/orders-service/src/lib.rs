@@ -32,6 +32,7 @@ impl CommandOutputType for OrderView {
             "OrderView",
             vec![
                 CommandTypeField {
+                    unsigned_integer: None,
                     name: "order_id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -40,6 +41,7 @@ impl CommandOutputType for OrderView {
                     nested: None,
                 },
                 CommandTypeField {
+                    unsigned_integer: None,
                     name: "status".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -63,6 +65,7 @@ impl CommandInputType for ProjectOrderInput {
         CommandTypeDef::new(
             "ProjectOrderInput",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,

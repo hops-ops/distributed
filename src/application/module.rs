@@ -664,6 +664,7 @@ fn surface_type_spec(definition: &SurfaceTypeDef) -> CommandTypeSpec {
             .fields
             .iter()
             .map(|field| super::command::CommandTypeField {
+                unsigned_integer: field.unsigned_integer,
                 name: field.name.clone(),
                 type_name: field.type_name.clone(),
                 nullable: field.nullable,

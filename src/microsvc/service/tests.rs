@@ -82,6 +82,7 @@ fn one_string_field(name: &str, field: &str) -> CommandTypeDef {
     CommandTypeDef::new(
         name,
         vec![CommandTypeField {
+            unsigned_integer: None,
             name: field.into(),
             type_name: "String".into(),
             nullable: false,
@@ -118,6 +119,7 @@ impl CommandInputType for CausalTestInput {
             "CausalTestInput",
             vec![
                 CommandTypeField {
+                    unsigned_integer: None,
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -126,6 +128,7 @@ impl CommandInputType for CausalTestInput {
                     nested: None,
                 },
                 CommandTypeField {
+                    unsigned_integer: None,
                     name: "label".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -614,6 +617,7 @@ impl CommandOutputType for CausalLifecycleView {
             "CausalLifecycleView",
             vec![
                 CommandTypeField {
+                    unsigned_integer: None,
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -622,6 +626,7 @@ impl CommandOutputType for CausalLifecycleView {
                     nested: None,
                 },
                 CommandTypeField {
+                    unsigned_integer: None,
                     name: "label".into(),
                     type_name: "String".into(),
                     nullable: false,

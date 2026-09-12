@@ -18,7 +18,7 @@ pub(crate) use util::{validate_hash, validate_nonempty};
 const MANIFEST_VERSION: u64 = 2;
 const PROTOCOL_VERSION: u64 = 1;
 const PROTOCOL_FINGERPRINT: &str =
-    "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782";
+    "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b";
 
 pub(crate) const CLIENT_PROJECTION_PROGRAM_VERSION: u32 = 2;
 pub(crate) const CLIENT_PROJECTION_BINDING_VERSION: u32 = 1;

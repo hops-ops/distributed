@@ -96,6 +96,7 @@ fn command(id: &str) -> CommandSpec {
         CommandTypeSpec {
             name: format!("{id}Input"),
             fields: vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "title".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -107,6 +108,7 @@ fn command(id: &str) -> CommandSpec {
         CommandTypeSpec {
             name: format!("{id}Output"),
             fields: vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,

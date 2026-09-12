@@ -318,7 +318,7 @@
   "protocol": {
     "version": 1,
     "schemaHash": "sha256:d43d65b233d9839f28271b4bdee7326f03b660cac3002013d8f058204e188415",
-    "protocolHash": "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782",
+    "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
     "surface": {
       "kind": "role",
       "name": "user"

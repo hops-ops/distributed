@@ -172,6 +172,7 @@ pub struct SurfaceTypeField {
     pub nullable: bool,
     pub list: bool,
     pub item_nullable: bool,
+    pub unsigned_integer: Option<crate::command::CommandUnsignedInteger>,
     pub nested: Option<Box<SurfaceTypeDef>>,
 }
 
@@ -1065,14 +1066,20 @@ fn command_shape_value(shape: &SurfaceCommandShape) -> serde_json::Value {
 fn type_def_value(definition: &SurfaceTypeDef) -> serde_json::Value {
     serde_json::json!({
         "name": definition.name,
-        "fields": definition.fields.iter().map(|field| serde_json::json!({
+        "fields": definition.fields.iter().map(|field| {
+            let mut value = serde_json::json!({
             "name": field.name,
             "type_name": field.type_name,
             "nullable": field.nullable,
             "list": field.list,
             "item_nullable": field.item_nullable,
             "nested": field.nested.as_deref().map(type_def_value),
-        })).collect::<Vec<_>>(),
+            });
+            if let Some(unsigned) = field.unsigned_integer {
+                value["unsigned_integer"] = serde_json::json!(unsigned);
+            }
+            value
+        }).collect::<Vec<_>>(),
     })
 }
 

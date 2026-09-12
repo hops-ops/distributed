@@ -266,7 +266,7 @@ pub(super) fn manifest() -> JsonValue {
         "service_id": "todos-service",
         "surface": {"kind": "role", "name": "user"},
         "schema_fingerprint": fingerprint("schema"),
-        "protocol_fingerprint": "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782",
+        "protocol_fingerprint": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
         "execution": {
             "max_depth": 8,
             "max_complexity": 500,
@@ -3166,6 +3166,58 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     invalid_u64_source["projection_programs"][0]["arms"][0]["operations"][0]["fields"][1]
         ["assignment"]["expression"]["value_type"] = json!({"type": "u64"});
     refresh_schema_fingerprint(&mut invalid_u64_source);
+    for codec in ["uint8", "uint16", "uint32", "uint64_safe_integer"] {
+        let mut unsigned = invalid_u64_source.clone();
+        unsigned["commands"][0]["input"]["definition"]["fields"][1]["type_name"] = json!("BigInt");
+        unsigned["commands"][0]["input"]["definition"]["fields"][1]["codec"] = json!(codec);
+        unsigned["models"][0]["fields"][2]["scalar"] = json!("BigInt");
+        unsigned["models"][0]["fields"][2]["codec"] = json!("json_number_precision_limited");
+        refresh_schema_fingerprint(&mut unsigned);
+        let compiled = compile_client(input_with_manifest(
+            unsigned.clone(),
+            "query Todos { todos { id priority } }",
+        ))
+        .expect("unsigned refined inputs prove U64 slots");
+        let source = file(&compiled, "commands.ts");
+        assert!(source.contains("readonly \"priority\": number;"));
+        let body = source
+            .split("export const Command_createTodo:")
+            .nth(1)
+            .unwrap()
+            .split_once(" = ")
+            .unwrap()
+            .1
+            .split_once("\n};")
+            .unwrap()
+            .0;
+        let artifact: JsonValue = serde_json::from_str(&format!("{body}\n}}")).unwrap();
+        assert_eq!(artifact["input"]["definition"]["fields"][1]["codec"], codec);
+        assert_eq!(
+            artifact["projection"]["preview"]["operations"][0]["mutation"]["fields"][1]["value"]
+                ["kind"],
+            "input"
+        );
+        if codec == "uint64_safe_integer" {
+            let fixture: JsonValue = serde_json::from_str(include_str!(
+                "../../tests/fixtures/generated-unsigned-command.json"
+            ))
+            .unwrap();
+            assert_eq!(
+                artifact, fixture,
+                "unsigned JS bridge must match generated output"
+            );
+        }
+        unsigned["commands"][0]["extensions"]["trusted_presets"] =
+            json!([{"name": "priority", "codec": codec}]);
+        unsigned["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]["values"]
+            [2]["source"] = json!({"kind": "trusted_preset", "name": "priority", "codec": codec});
+        refresh_schema_fingerprint(&mut unsigned);
+        compile_client(input_with_manifest(
+            unsigned,
+            "query Todos { todos { id priority } }",
+        ))
+        .expect("unsigned trusted preset codec proves U64 slot");
+    }
     let mut invalid_constant_source = value.clone();
     invalid_constant_source["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]
         ["values"][2]["source"] =

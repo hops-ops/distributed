@@ -9,6 +9,51 @@ use std::any::TypeId;
 use crate::read_model::RelationalReadModel;
 use crate::table::ColumnType;
 
+/// Rust unsigned integer range retained by command contracts and adapters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandUnsignedInteger {
+    U8,
+    U16,
+    U32,
+    U64,
+}
+
+impl CommandUnsignedInteger {
+    pub fn max_value(self) -> u64 {
+        match self {
+            Self::U8 => u64::from(u8::MAX),
+            Self::U16 => u64::from(u16::MAX),
+            Self::U32 => u64::from(u32::MAX),
+            Self::U64 => u64::MAX,
+        }
+    }
+
+    /// Browser numbers must be exact; U64 therefore stops at 2^53 - 1.
+    pub fn client_codec(self) -> &'static str {
+        match self {
+            Self::U8 => "uint8",
+            Self::U16 => "uint16",
+            Self::U32 => "uint32",
+            Self::U64 => "uint64_safe_integer",
+        }
+    }
+
+    pub fn from_client_codec(codec: &str) -> Option<Self> {
+        match codec {
+            "uint8" => Some(Self::U8),
+            "uint16" => Some(Self::U16),
+            "uint32" => Some(Self::U32),
+            "uint64_safe_integer" => Some(Self::U64),
+            _ => None,
+        }
+    }
+
+    pub fn client_max_value(self) -> u64 {
+        self.max_value().min(9_007_199_254_740_991)
+    }
+}
+
 /// One field on a command input or output object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandTypeField {
@@ -18,6 +63,8 @@ pub struct CommandTypeField {
     pub list: bool,
     /// Whether list elements are nullable. Always `false` for non-list fields.
     pub item_nullable: bool,
+    /// A typed refinement of BigInt, including list elements when `list` is true.
+    pub unsigned_integer: Option<CommandUnsignedInteger>,
     /// Nested object type definition when `type_name` is not a scalar.
     pub nested: Option<Box<CommandTypeDef>>,
 }
@@ -107,6 +154,8 @@ where
                 )
             });
             CommandTypeField {
+                // Relational result codecs follow the read-model wire contract.
+                unsigned_integer: None,
                 name: column.column_name.clone(),
                 type_name: type_name.into(),
                 nullable: column.nullable,

@@ -10,6 +10,7 @@ fn spec() -> CommandSpec {
         CommandTypeSpec {
             name: "DuplicateInput".into(),
             fields: vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,

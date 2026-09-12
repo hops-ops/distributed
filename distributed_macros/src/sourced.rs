@@ -212,6 +212,7 @@ fn find_and_remove_event_attr(
 
 struct EventMethodInfo {
     event_name: LitStr,
+    version: syn::LitInt,
     method_name: Ident,
     params: Vec<(Ident, syn::Type)>,
     /// Present when this recorder has `domain` and therefore a generated
@@ -833,6 +834,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                     };
 
                     event_methods.push(EventMethodInfo {
+                        version: event_version(event_attr.version.as_ref()),
                         event_name: event_attr.event_name,
                         method_name: method.sig.ident.clone(),
                         params,
@@ -977,6 +979,14 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
 
     // Generate impl Aggregate
     let entity_field = &args.entity_field;
+    let version_arms: Vec<_> = event_methods
+        .iter()
+        .map(|event| {
+            let name = &event.event_name;
+            let version = &event.version;
+            quote! { #name => #version, }
+        })
+        .collect();
     let replay_arms: Vec<_> = event_methods
         .iter()
         .map(|e| {
@@ -1023,6 +1033,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
         &struct_name,
         entity_field,
         &aggregate_type_method,
+        &version_arms,
         &replay_arms,
         &upcasters_method,
     );

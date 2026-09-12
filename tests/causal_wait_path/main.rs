@@ -73,6 +73,7 @@ impl CommandInputType for IdInput {
         CommandTypeDef::new(
             "IdInput",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -95,6 +96,7 @@ impl CommandOutputType for IdPayload {
         CommandTypeDef::new(
             "IdPayload",
             vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,

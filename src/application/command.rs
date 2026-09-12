@@ -22,6 +22,8 @@ pub struct CommandTypeField {
     pub list: bool,
     pub item_nullable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsigned_integer: Option<crate::command::CommandUnsignedInteger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nested: Option<Box<CommandTypeSpec>>,
 }
 
@@ -43,6 +45,7 @@ impl From<&CommandTypeDef> for CommandTypeSpec {
                 .fields
                 .iter()
                 .map(|field| CommandTypeField {
+                    unsigned_integer: field.unsigned_integer,
                     name: field.name.clone(),
                     type_name: field.type_name.clone(),
                     nullable: field.nullable,

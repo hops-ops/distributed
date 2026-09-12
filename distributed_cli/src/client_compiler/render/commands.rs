@@ -428,7 +428,15 @@ fn render_command_field_type(
     }
     match field.codec.as_deref() {
         Some("boolean") => Ok("boolean".into()),
-        Some("float64" | "int32" | "json_number_precision_limited") => Ok("number".into()),
+        Some(
+            "float64"
+            | "int32"
+            | "json_number_precision_limited"
+            | "uint8"
+            | "uint16"
+            | "uint32"
+            | "uint64_safe_integer",
+        ) => Ok("number".into()),
         Some("string" | "base64" | "string_unvalidated_timestamp") => Ok("string".into()),
         Some("json") => Ok("ReplicaValue".into()),
         Some(codec) => Err(ClientCompileError::manifest(

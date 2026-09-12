@@ -347,14 +347,20 @@ fn canonical_command_type(definition: &CommandTypeDef) -> serde_json::Value {
     fields.sort_by(|left, right| left.name.cmp(&right.name));
     serde_json::json!({
         "name": definition.name,
-        "fields": fields.into_iter().map(|field| serde_json::json!({
+        "fields": fields.into_iter().map(|field| {
+            let mut value = serde_json::json!({
             "name": field.name,
             "type_name": field.type_name,
             "nullable": field.nullable,
             "list": field.list,
             "item_nullable": field.item_nullable,
             "nested": field.nested.as_deref().map(canonical_command_type),
-        })).collect::<Vec<_>>(),
+            });
+            if let Some(unsigned) = field.unsigned_integer {
+                value["unsigned_integer"] = serde_json::json!(unsigned);
+            }
+            value
+        }).collect::<Vec<_>>(),
     })
 }
 

@@ -12,6 +12,9 @@ Write the domain once, compose it into one `Service` or several, then
 generate the client. Each stage below uses real code from
 [`tests/e2e-ui`](tests/e2e-ui).
 
+Unsigned command fields preserve their Rust range in generated client validation
+and optimistic projections; see [unsigned command inputs](docs/unsigned-command-inputs.md).
+
 ```mermaid
 sequenceDiagram
     actor Author
@@ -1054,12 +1057,26 @@ fn upcast_initialized_v1_v2((id, task): InitV1) -> InitV2 {
 }
 
 aggregate!(Todo, entity {
-    "initialized"(id, task, priority) => initialize,
+    "initialized"(id, task, priority), version = 2 => initialize,
     "completed"() => complete(),
 } upcasters [
     ("initialized", 1 => 2, InitV1 => InitV2, upcast_initialized_v1_v2),
 ]);
 ```
+
+Replay requires each event's schema version to match its registered handler
+after upcasting. `#[sourced]` reads this version from `#[event(..., version = N)]`;
+`aggregate!` declares it on the registration as above and must match the
+corresponding `#[digest(..., version = N)]`. Omitted versions default to 1.
+Older events need an explicit upcaster chain to the registered version; future
+versions are rejected. Matching payload layouts do not bypass this check.
+The check runs before payload decoding or handler invocation, including when
+loading only the event tail after a snapshot in a native repository or cell.
+
+**Breaking change:** an `aggregate!` registration for a versioned handler must
+now declare its current version. Histories with unsupported versions fail replay
+instead of being interpreted using the current payload shape. Stored events are
+unchanged; add the appropriate upcasters to read supported older versions.
 
 ## Event Metadata
 

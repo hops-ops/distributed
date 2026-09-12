@@ -167,6 +167,7 @@ fn expand(
             });
         let (type_name, nullable, list, item_nullable, nested) =
             map_type(&field.ty, field, &nested_trait, &method)?;
+        let unsigned_integer = unsigned_integer_tokens(&field.ty, &framework);
         let effect_path_kind = if !list && nested.is_some() {
             quote! { #framework::command::EffectInputObjectKind }
         } else {
@@ -184,6 +185,7 @@ fn expand(
                 nullable: #nullable,
                 list: #list,
                 item_nullable: #item_nullable,
+                unsigned_integer: #unsigned_integer,
                 nested: #nested_tokens,
             }
         });
@@ -340,6 +342,38 @@ fn map_type(
 
     let nested = quote! { <#current as #nested_trait>::#method() };
     Ok((ident, nullable, list, item_nullable, Some(nested)))
+}
+
+fn unsigned_integer_tokens(ty: &Type, framework: &TokenStream) -> TokenStream {
+    let mut current = ty;
+    while let Some(inner) =
+        extract_path_arg(current, "Option").or_else(|| extract_path_arg(current, "Vec"))
+    {
+        current = inner;
+    }
+    let Type::Path(path) = current else {
+        return quote! { None };
+    };
+    match path
+        .path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+        .as_deref()
+    {
+        Some("u8") => quote! { Some(#framework::command::CommandUnsignedInteger::U8) },
+        Some("u16") => quote! { Some(#framework::command::CommandUnsignedInteger::U16) },
+        Some("u32") => quote! { Some(#framework::command::CommandUnsignedInteger::U32) },
+        Some("u64") => quote! { Some(#framework::command::CommandUnsignedInteger::U64) },
+        Some("usize") => quote! {
+            Some(match usize::BITS {
+                16 => #framework::command::CommandUnsignedInteger::U16,
+                32 => #framework::command::CommandUnsignedInteger::U32,
+                _ => #framework::command::CommandUnsignedInteger::U64,
+            })
+        },
+        _ => quote! { None },
+    }
 }
 
 fn extract_path_arg<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type> {
