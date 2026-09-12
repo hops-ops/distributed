@@ -84,6 +84,7 @@ export type HydrationHost = {
 	closeActiveTransports(): void;
 	closeAuthorizationGeneration(): void;
 	resumeLiveWatches(): void;
+	refreshWatches(): void;
 	syncDiagnostics(): void;
 	diagnosticEvent(event: ReplicaDiagnosticEventInput): void;
 	refreshIndexMaintenance(): void;
@@ -315,7 +316,8 @@ export function dehydrateReplica(host: HydrationHost): ReplicaDehydratedState {
 export function hydrateReplica(
 	host: HydrationHost,
 	state: ReplicaDehydratedState,
-	authoritativeScope: ReplicaAuthoritativeScope
+	authoritativeScope: ReplicaAuthoritativeScope,
+	mode: 'merge' | 'reauthorize' = 'merge'
 ): boolean {
 	const rejected = (
 		reason:
@@ -366,6 +368,9 @@ export function hydrateReplica(
 	) {
 		return rejected('active-scope-mismatch');
 	}
+	if (mode === 'reauthorize' && current === undefined) {
+		return rejected('active-scope-mismatch');
+	}
 	const preserveLocalCommandState = current !== undefined;
 
 	// Validate the private engine payload before closing transports or changing
@@ -396,6 +401,18 @@ export function hydrateReplica(
 	}
 	if (!hydrationMetadataConsistent(parsed)) {
 		return rejected('metadata-mismatch');
+	}
+
+	if (mode === 'reauthorize') {
+		// The independent scope authorizes continued use of the current replica.
+		// The accompanying snapshot may predate an intervening command: do not
+		// merge its records, clocks, indexes, or freshness evidence into that state.
+		host.closeActiveTransports();
+		host.queryStates.clear();
+		host.resumeLiveWatches();
+		host.refreshWatches();
+		host.syncDiagnostics();
+		return true;
 	}
 
 	if (preserveLocalCommandState) {

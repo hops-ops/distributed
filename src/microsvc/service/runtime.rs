@@ -9,7 +9,7 @@ use serde_json::Value;
 #[cfg(feature = "graphql")]
 use super::causal::{
     internal_ledger_error, CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult,
-    GraphqlServiceBindError,
+    ExternalCausalAttempt, ExternalCausalReservation, GraphqlServiceBindError,
 };
 use super::helpers::{
     is_json_content_type, message_to_json_input, message_to_session, names_by_kind,
@@ -18,13 +18,18 @@ use super::helpers::{
 use super::helpers::{microsvc_dispatch_span, microsvc_handler_span};
 use super::request::{CommandRequest, CommandResponse};
 use super::routes::{CausalCommandPolicy, DynBusPublisher, ErasedRoutes, HandlerSpec, Routes};
-use crate::application::{CommandMount, CommandMountRegistrar, CommandSpec};
+use crate::application::{
+    Application, ApplicationError, ApplicationResult, CommandDefinition, CommandMount,
+    CommandMountRegistrar, CommandSpec, Module, SurfaceSpec,
+};
 use crate::bus::{
     Message, MessageKind, OrderedDelivery, RunOptions, SubscriptionPlan, TransportError,
 };
+use crate::command::{TypedCommandContract, TypedServiceCommandBinding};
 #[cfg(feature = "graphql")]
 use crate::command_ledger::{CommandId, CommandLookup, PrincipalPartitionId};
-use crate::graphql::command_contract::{TypedCommandContract, TypedServiceCommandBinding};
+#[cfg(feature = "graphql")]
+use crate::command_ledger::ExternalDispatchBinding;
 #[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
 use crate::microsvc::error::HandlerError;
@@ -322,10 +327,7 @@ impl Service {
     /// Register one explicit command mount against the already-installed
     /// typed route inventory. The route's canonical command spec is the only
     /// authority; a stale or lookalike mount is rejected before dispatch.
-    pub fn register_command_mount(
-        &mut self,
-        mount: CommandMount,
-    ) -> Result<(), HandlerError> {
+    pub fn register_command_mount(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         self.register_command_mount_inner(mount)
     }
 
@@ -359,12 +361,10 @@ impl Service {
                 mount.spec().id
             )));
         }
-        if !self
-            .registered_command_mounts
-            .iter()
-            .any(|registered| registered.spec().id == mount.spec().id
-                && registered.spec().fingerprint == mount.spec().fingerprint)
-        {
+        if !self.registered_command_mounts.iter().any(|registered| {
+            registered.spec().id == mount.spec().id
+                && registered.spec().fingerprint == mount.spec().fingerprint
+        }) {
             return Err(HandlerError::Rejected(
                 "command mount was not registered against this service".into(),
             ));
@@ -404,10 +404,7 @@ impl Service {
         .await
     }
 
-    fn register_command_mount_inner(
-        &mut self,
-        mount: CommandMount,
-    ) -> Result<(), HandlerError> {
+    fn register_command_mount_inner(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         let Some(indices) = self
             .index
             .get(&MessageKind::Command)
@@ -449,9 +446,11 @@ impl Service {
                 mount.spec().id
             )));
         }
-        if self.registered_command_mounts.iter().any(|registered| {
-            registered.spec().id == mount.spec().id
-        }) {
+        if self
+            .registered_command_mounts
+            .iter()
+            .any(|registered| registered.spec().id == mount.spec().id)
+        {
             return Err(HandlerError::Rejected(format!(
                 "command mount `{}` is registered more than once",
                 mount.spec().id
@@ -592,6 +591,60 @@ impl Service {
         Ok(specs)
     }
 
+    /// Compile this Service's typed command inventory and an authorized Surface
+    /// into one logical application.
+    ///
+    /// Command namespaces (the segment before the first `.`) become modules.
+    /// Every Service command must exist in the Surface so its authorization and
+    /// projection contract can be bound, and application validation rejects any
+    /// Surface command that is not owned by the Service.
+    pub fn application(
+        &self,
+        name: impl Into<String>,
+        surface: SurfaceSpec,
+    ) -> ApplicationResult<Application> {
+        let mut modules = BTreeMap::<String, Vec<CommandDefinition>>::new();
+        for command in self.command_specs()? {
+            let namespace = command
+                .id
+                .split_once('.')
+                .map(|(namespace, _)| namespace)
+                .filter(|namespace| !namespace.is_empty())
+                .ok_or_else(|| {
+                    ApplicationError::InvalidSpec(format!(
+                        "typed command `{}` has no module namespace; expected `<module>.<action>`",
+                        command.id
+                    ))
+                })?
+                .to_string();
+            let exposed = surface
+                .commands
+                .iter()
+                .find(|exposed| exposed.id == command.id)
+                .ok_or_else(|| ApplicationError::Missing {
+                    kind: "surface command",
+                    identity: command.id.clone(),
+                })?;
+            let command = command.with_surface_binding(exposed)?;
+            modules
+                .entry(namespace)
+                .or_default()
+                .push(CommandDefinition::contract(command));
+        }
+
+        let modules = modules
+            .into_iter()
+            .map(|(namespace, commands)| {
+                Module::new(namespace).command_definitions(commands).build()
+            })
+            .collect::<ApplicationResult<Vec<_>>>()?;
+
+        Application::new(name)
+            .modules(modules)
+            .surface(surface)
+            .build()
+    }
+
     /// Attach Eventual projection metadata to a cell wait-path result using this
     /// process's command contract (no second aggregate write).
     #[cfg(feature = "graphql")]
@@ -615,6 +668,85 @@ impl Service {
             &contract,
             self.causal_command_policy.replay_retention,
         )
+    }
+
+    /// Reserve the gateway ledger row for a command that will be committed by
+    /// an aggregate cell. The route performs canonical input and grant checks
+    /// before any remote request is made.
+    #[cfg(feature = "graphql")]
+    pub(crate) async fn reserve_external_causal(
+        &self,
+        command: &str,
+        command_id: &str,
+        input: Value,
+        session: Session,
+        principal: VerifiedPrincipal,
+        binding: ExternalDispatchBinding,
+    ) -> Result<ExternalCausalReservation, CausalDispatchError> {
+        ensure_lifecycle_mutations_open().map_err(CausalDispatchError::Handler)?;
+        let service_id = self.name().ok_or_else(|| {
+            CausalDispatchError::Internal(
+                "external typed causal dispatch requires Service::named identity".into(),
+            )
+        })?;
+        let route_index = self
+            .index
+            .get(&MessageKind::Command)
+            .and_then(|commands| commands.get(command))
+            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
+            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
+        self.routes[route_index]
+            .reserve_external(
+                command,
+                service_id,
+                command_id,
+                input,
+                session,
+                principal,
+                self.causal_command_policy,
+                binding,
+            )
+            .await
+    }
+
+    /// Persist a sealed terminal receipt for a command committed by a cell.
+    /// This path only updates the gateway ledger and never invokes a local
+    /// handler or appends a local event batch.
+    #[cfg(feature = "graphql")]
+    pub(crate) async fn complete_external_causal(
+        &self,
+        command: &str,
+        attempt: ExternalCausalAttempt,
+        result: &CausalDispatchResult,
+    ) -> Result<(), CausalDispatchError> {
+        let route_index = self
+            .index
+            .get(&MessageKind::Command)
+            .and_then(|commands| commands.get(command))
+            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
+            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
+        self.routes[route_index]
+            .complete_external(command, attempt, result)
+            .await
+    }
+
+    /// Mark a remote attempt retryable after a transport/protocol failure.
+    /// The durable fence remains the authority for later replay or reclaim.
+    #[cfg(feature = "graphql")]
+    pub(crate) async fn abandon_external_causal(
+        &self,
+        command: &str,
+        attempt: ExternalCausalAttempt,
+    ) -> Result<(), CausalDispatchError> {
+        let route_index = self
+            .index
+            .get(&MessageKind::Command)
+            .and_then(|commands| commands.get(command))
+            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
+            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
+        self.routes[route_index]
+            .abandon_external(command, attempt)
+            .await
     }
 
     pub(crate) fn typed_command_binding(&self) -> Result<TypedServiceCommandBinding, String> {
@@ -1192,10 +1324,7 @@ impl Service {
 }
 
 impl CommandMountRegistrar for Service {
-    fn register_command_mount(
-        &mut self,
-        mount: CommandMount,
-    ) -> Result<(), HandlerError> {
+    fn register_command_mount(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         self.register_command_mount_inner(mount)
     }
 }

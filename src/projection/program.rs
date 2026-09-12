@@ -643,6 +643,8 @@ pub struct ProjectionProgram {
     version: u64,
     partition: ProjectionPartition,
     arms: Vec<ProjectionArm>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    source_snapshots: bool,
 }
 
 impl ProjectionProgram {
@@ -691,7 +693,37 @@ impl ProjectionProgram {
             version,
             partition,
             arms,
+            source_snapshots: false,
         })
+    }
+
+    /// Fence complete row snapshots by their canonical aggregate occurrence.
+    ///
+    /// This is not appropriate for delta folds: dropping an older increment
+    /// would lose work. Snapshot programs must use a unit partition and only
+    /// full-row upserts or deletes, without relationship side effects.
+    pub fn with_source_snapshots(mut self) -> Result<Self, ProjectionProgramError> {
+        if !matches!(self.partition, ProjectionPartition::Unit)
+            || self.arms.iter().flat_map(|arm| arm.operations()).any(|op| {
+                !matches!(
+                    op.kind(),
+                    ProjectionMutationKind::Upsert | ProjectionMutationKind::Delete
+                ) || !op.relationship_effects().is_empty()
+                    || !op.invalidations().is_empty()
+            })
+        {
+            return Err(ProjectionProgramError::InvalidOperation {
+                operation: self.name.clone(),
+                reason: "source snapshots require unit-partition full-row upserts/deletes without relationship effects".into(),
+            });
+        }
+        self.source_snapshots = true;
+        Ok(self)
+    }
+
+    /// Whether authoritative row snapshots are fenced by aggregate version.
+    pub fn source_snapshots(&self) -> bool {
+        self.source_snapshots
     }
 
     /// Return the stable program name.

@@ -123,6 +123,7 @@ fn direct_projection_evidence(marker: &str) -> SameTransactionProjectionEvidence
     let revision = RecordRevision::new(scope.clone(), 1, 1).unwrap();
     let cursor = ProjectionChangeCursor::new(topology, partition, epoch, 1).unwrap();
     let record = ProjectionRecordMetadata {
+        source_snapshot: None,
         revision: revision.clone(),
         tombstone: false,
         change: cursor.clone(),
@@ -135,6 +136,7 @@ fn direct_projection_evidence(marker: &str) -> SameTransactionProjectionEvidence
         scope: Some(scope.clone()),
         revision: Some(revision.clone()),
         failure_id: None,
+        program_id: None,
     };
     let observation = ProjectionObservation {
         causation_id: format!("cause:{marker}"),
@@ -142,6 +144,7 @@ fn direct_projection_evidence(marker: &str) -> SameTransactionProjectionEvidence
         revision: Some(revision),
         scope,
         change: cursor,
+        program_id: None,
     };
     SameTransactionProjectionEvidence {
         records: vec![record],
@@ -246,6 +249,39 @@ fn reservation(
     )
 }
 
+fn external_binding(shard: &str) -> ExternalDispatchBinding {
+    ExternalDispatchBinding::new("aggregate-cell", shard).unwrap()
+}
+
+fn external_reservation(
+    command_id: &str,
+    contract: u8,
+    input: u8,
+    shard: &str,
+) -> Result<CommandReservation, CommandLedgerError> {
+    Ok(reservation(command_id, contract, input)?.with_external_binding(external_binding(shard)))
+}
+
+fn external_reservation_with_policy(
+    command_id: &str,
+    contract: u8,
+    input: u8,
+    shard: &str,
+    lease: Duration,
+    retention: Duration,
+) -> Result<CommandReservation, CommandLedgerError> {
+    Ok(reservation_for_partition_with_policy(
+        command_id,
+        "v1:sha256:principal",
+        "order.create",
+        contract,
+        input,
+        lease,
+        retention,
+    )?
+    .with_external_binding(external_binding(shard)))
+}
+
 trait CommandLedgerAdapterConformance:
     CommandLedgerStore
     + CausalTransactionalCommit
@@ -276,6 +312,277 @@ where
         ReservationOutcome::Acquired(attempt) => attempt,
         other => panic!("expected acquired command attempt, got {other:?}"),
     }
+}
+
+async fn external_completion_is_ledger_only_and_replayable<R>(repo: &R)
+where
+    R: CommandLedgerAdapterConformance,
+{
+    let id = Uuid::now_v7().to_string();
+    let binding = external_binding("orders-1");
+    let request = external_reservation(&id, 101, 102, "orders-1").unwrap();
+    let key = request.key().clone();
+    let attempt = acquire(repo, request).await;
+    let completion = attempt
+        .complete_external(
+            binding,
+            TerminalCommandState::Succeeded,
+            serde_json::json!({"remote": true}),
+            Vec::new(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+    repo.complete_external_command(completion).await.unwrap();
+
+    let replay = match repo
+        .lookup_command(&key, CommandLookupScope::CommandName("order.create"))
+        .await
+        .unwrap()
+    {
+        CommandLookup::Replay(replay) => replay,
+        other => panic!("external completion should be replayable, got {other:?}"),
+    };
+    assert_eq!(replay.state, CommandLedgerState::Succeeded);
+    assert_eq!(replay.outcome, serde_json::json!({"remote": true}));
+    assert!(repo
+        .get_stream(&StreamIdentity::new("remote-order", &id).unwrap())
+        .await
+        .unwrap()
+        .is_none());
+    let outbox = repo
+        .outbox_store()
+        .messages_by_status(OutboxMessageStatus::Pending, 1_000)
+        .await
+        .unwrap();
+    assert!(outbox.iter().all(|message| message.id() != id));
+
+    assert!(matches!(
+        repo.reserve_command(external_reservation(&id, 101, 102, "orders-1").unwrap())
+            .await
+            .unwrap(),
+        ReservationOutcome::Replay(_)
+    ));
+}
+
+#[cfg(feature = "graphql")]
+async fn external_completion_retains_the_sealed_projection_metadata<R>(repo: &R)
+where
+    R: CommandLedgerAdapterConformance,
+{
+    use std::time::UNIX_EPOCH;
+
+    let fixture = include_bytes!("../../tests/fixtures/command-projection-metadata-v1.json");
+    let fixture = fixture.strip_suffix(b"\n").unwrap_or(fixture);
+    let mut metadata =
+        crate::graphql::protocol::CommandProjectionMetadataV1::from_json(fixture).unwrap();
+    let issued_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    metadata.issued_at_unix_ms = issued_at_unix_ms;
+    metadata.expires_at_unix_ms = issued_at_unix_ms + 600_000;
+    let metadata_bytes = metadata.canonical_bytes().unwrap();
+    let retention_expires_at = UNIX_EPOCH
+        .checked_add(Duration::from_millis(metadata.expires_at_unix_ms))
+        .unwrap();
+
+    let id = Uuid::now_v7().to_string();
+    let binding = external_binding("orders-sealed-metadata");
+    let request = external_reservation(&id, 103, 104, "orders-sealed-metadata").unwrap();
+    let key = request.key().clone();
+    let attempt = acquire(repo, request).await;
+    let completion = attempt
+        .complete_external_with_projection_metadata_until(
+            binding,
+            TerminalCommandState::SucceededPendingProjection,
+            serde_json::json!({"remote": "sealed"}),
+            metadata_bytes.clone(),
+            Duration::from_secs(300),
+            retention_expires_at,
+        )
+        .unwrap();
+    repo.complete_external_command(completion).await.unwrap();
+
+    let replay = match repo
+        .lookup_command(&key, CommandLookupScope::CommandName("order.create"))
+        .await
+        .unwrap()
+    {
+        CommandLookup::Replay(replay) => replay,
+        other => panic!("sealed external completion should replay, got {other:?}"),
+    };
+    assert_eq!(replay.state, CommandLedgerState::SucceededPendingProjection);
+    assert_eq!(replay.projection_obligations, Vec::new());
+    assert_eq!(
+        replay.projection_metadata.as_deref(),
+        Some(metadata_bytes.as_slice())
+    );
+    assert_eq!(
+        crate::graphql::protocol::CommandProjectionMetadataV1::from_json(
+            replay.projection_metadata.as_deref().unwrap(),
+        )
+        .unwrap(),
+        metadata
+    );
+}
+
+async fn external_binding_and_attempt_fences_are_strict<R>(repo: &R)
+where
+    R: CommandLedgerAdapterConformance,
+{
+    let id = Uuid::now_v7().to_string();
+    let attempt = acquire(
+        repo,
+        external_reservation(&id, 111, 112, "orders-2").unwrap(),
+    )
+    .await;
+    let wrong_binding = attempt.complete_external(
+        external_binding("orders-3"),
+        TerminalCommandState::Succeeded,
+        serde_json::json!({"wrong": true}),
+        Vec::new(),
+        Duration::from_secs(300),
+    );
+    assert!(matches!(wrong_binding, Err(CommandLedgerError::Invalid(_))));
+    assert!(matches!(
+        repo.reserve_command(external_reservation(&id, 111, 112, "orders-3").unwrap())
+            .await
+            .unwrap(),
+        ReservationOutcome::Conflict
+    ));
+
+    let first = acquire(
+        repo,
+        external_reservation(&Uuid::now_v7().to_string(), 113, 114, "orders-4").unwrap(),
+    )
+    .await;
+    let first_fence = first.fence();
+    let key = first.key().clone();
+    repo.mark_retryable_unknown(first_fence).await.unwrap();
+    let second = acquire(
+        repo,
+        external_reservation(key.command_id(), 113, 114, "orders-4").unwrap(),
+    )
+    .await;
+    let stale = first
+        .complete_external(
+            external_binding("orders-4"),
+            TerminalCommandState::Succeeded,
+            serde_json::json!({"winner": false}),
+            Vec::new(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+    assert!(matches!(
+        repo.complete_external_command(stale).await,
+        Err(CommandLedgerError::AttemptFenced { .. })
+    ));
+    let live = second
+        .complete_external(
+            external_binding("orders-4"),
+            TerminalCommandState::Succeeded,
+            serde_json::json!({"winner": true}),
+            Vec::new(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+    repo.complete_external_command(live).await.unwrap();
+}
+
+async fn external_and_local_reservations_cannot_mix<R>(repo: &R)
+where
+    R: CommandLedgerAdapterConformance,
+{
+    let external_id = Uuid::now_v7().to_string();
+    let external_attempt = acquire(
+        repo,
+        external_reservation(&external_id, 121, 122, "orders-5").unwrap(),
+    )
+    .await;
+    let local_completion = external_attempt
+        .complete(
+            TerminalCommandState::Succeeded,
+            serde_json::json!({"local": true}),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+    let local_result = repo
+        .commit_causal_batch(CausalCommitBatch::new(
+            CommitBatch::empty(),
+            local_completion,
+        ))
+        .await;
+    assert!(matches!(local_result, Err(CommandLedgerError::Invalid(_))));
+
+    let local_id = Uuid::now_v7().to_string();
+    let local_attempt = acquire(repo, reservation(&local_id, 123, 124).unwrap()).await;
+    let external_result = local_attempt.complete_external(
+        external_binding("orders-5"),
+        TerminalCommandState::Succeeded,
+        serde_json::json!({"external": true}),
+        Vec::new(),
+        Duration::from_secs(300),
+    );
+    assert!(matches!(
+        external_result,
+        Err(CommandLedgerError::Invalid(_))
+    ));
+
+    assert!(matches!(
+        repo.reserve_command(reservation(&external_id, 121, 122).unwrap())
+            .await
+            .unwrap(),
+        ReservationOutcome::Conflict
+    ));
+}
+
+async fn external_reclaims_keep_causation_and_binding<R>(repo: &R)
+where
+    R: CommandLedgerAdapterConformance,
+{
+    let id = Uuid::now_v7().to_string();
+    let first = acquire(
+        repo,
+        external_reservation_with_policy(
+            &id,
+            131,
+            132,
+            "orders-6",
+            Duration::from_millis(100),
+            Duration::from_secs(300),
+        )
+        .unwrap(),
+    )
+    .await;
+    let causation = first.causation_id().clone();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second = acquire(
+        repo,
+        external_reservation_with_policy(
+            &id,
+            131,
+            132,
+            "orders-6",
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        )
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(second.causation_id(), &causation);
+    assert_eq!(second.attempt_number(), 2);
+    let expected_binding = external_binding("orders-6");
+    assert_eq!(second.external_binding(), Some(&expected_binding));
+    let completion = second
+        .complete_external(
+            external_binding("orders-6"),
+            TerminalCommandState::Succeeded,
+            serde_json::json!({"reclaimed": true}),
+            Vec::new(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+    repo.complete_external_command(completion).await.unwrap();
 }
 
 async fn same_input_retries_and_identity_conflicts_conform<R>(repo: &R)
@@ -942,6 +1249,12 @@ where
     stale_fence_rolls_back_every_commit_participant(repo).await;
     compacted_expiry_is_a_permanent_tombstone(repo).await;
     expired_modeled_metadata_deadline_cannot_commit(repo).await;
+    external_completion_is_ledger_only_and_replayable(repo).await;
+    #[cfg(feature = "graphql")]
+    external_completion_retains_the_sealed_projection_metadata(repo).await;
+    external_binding_and_attempt_fences_are_strict(repo).await;
+    external_and_local_reservations_cannot_mix(repo).await;
+    external_reclaims_keep_causation_and_binding(repo).await;
 }
 
 #[test]
@@ -1352,6 +1665,88 @@ fn modeled_projection_metadata_bounds_fail_before_completion() {
 }
 
 #[test]
+fn cell_ledger_external_binding_round_trips_and_legacy_rows_stay_unbound() {
+    let id = Uuid::now_v7().to_string();
+    let request = external_reservation(&id, 141, 142, "orders-cell").unwrap();
+    let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+    let row = CommandLedgerRecord::initial(&request, started).unwrap();
+    let encoded = row.durable_cell_json().unwrap();
+    let restored = CommandLedgerRecord::from_durable_cell_json(&encoded).unwrap();
+    assert_eq!(restored.external_binding, row.external_binding);
+    assert_eq!(restored.durable_cell_key(), row.durable_cell_key());
+
+    // Cell rows written before external dispatch existed omit the optional
+    // field. They remain readable, but cannot be treated as externally bound
+    // evidence after a process restart.
+    let mut legacy: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+    legacy.as_object_mut().unwrap().remove("external_binding");
+    let legacy = serde_json::to_string(&legacy).unwrap();
+    let restored_legacy = CommandLedgerRecord::from_durable_cell_json(&legacy).unwrap();
+    assert!(restored_legacy.external_binding.is_none());
+
+    let completed_id = Uuid::now_v7().to_string();
+    let completed_request =
+        external_reservation(&completed_id, 143, 144, "orders-cell-completed").unwrap();
+    let mut completed = CommandLedgerRecord::initial(&completed_request, started).unwrap();
+    let metadata = br#"{"sealed":"projection"}"#.to_vec();
+    let completion = completed
+        .acquired_attempt()
+        .unwrap()
+        .complete_external_with_projection_metadata_until(
+            external_binding("orders-cell-completed"),
+            TerminalCommandState::SucceededPendingProjection,
+            serde_json::json!({"remote": true}),
+            metadata.clone(),
+            Duration::from_secs(300),
+            started + Duration::from_secs(301),
+        )
+        .unwrap();
+    completed
+        .complete_external(&completion, started + Duration::from_secs(1))
+        .unwrap();
+    let restored_completed =
+        CommandLedgerRecord::from_durable_cell_json(&completed.durable_cell_json().unwrap())
+            .unwrap();
+    let replay = restored_completed.replay().unwrap();
+    assert_eq!(replay.projection_metadata, Some(metadata));
+    assert_eq!(replay.outcome, serde_json::json!({"remote": true}));
+}
+
+#[test]
+fn external_dispatch_binding_storage_is_versioned_and_canonical() {
+    let binding = ExternalDispatchBinding::new("aggregate-cell", "orders-1").unwrap();
+    let encoded = binding.to_storage().unwrap();
+    assert_eq!(
+        ExternalDispatchBinding::from_storage(&encoded).unwrap(),
+        binding
+    );
+    assert!(matches!(
+        ExternalDispatchBinding::from_storage(
+            r#"{"version":1,"route_kind":"aggregate-cell","shard":"orders-1","extra":true}"#,
+        ),
+        Err(CommandLedgerError::Corrupt(_))
+    ));
+    assert!(matches!(
+        ExternalDispatchBinding::from_storage(
+            r#"{"version":2,"route_kind":"aggregate-cell","shard":"orders-1"}"#,
+        ),
+        Err(CommandLedgerError::Corrupt(_))
+    ));
+    assert!(matches!(
+        ExternalDispatchBinding::new("", "orders-1"),
+        Err(CommandLedgerError::Invalid(_))
+    ));
+    assert!(matches!(
+        ExternalDispatchBinding::new("aggregate-cell", "orders\n1"),
+        Err(CommandLedgerError::Invalid(_))
+    ));
+    assert!(matches!(
+        ExternalDispatchBinding::new("é".repeat(129), "orders-1"),
+        Err(CommandLedgerError::Invalid(_))
+    ));
+}
+
+#[test]
 fn causal_batch_applies_the_authoritative_stamp_at_the_final_boundary() {
     use crate::outbox::OutboxMessage;
     use crate::repository::StreamWrite;
@@ -1500,6 +1895,30 @@ async fn sqlite_terminal_replay_survives_pool_drop_and_reopen() {
         .await
         .unwrap();
 
+    let external_id = Uuid::now_v7().to_string();
+    let external_request =
+        external_reservation(&external_id, 83, 84, "orders-restart-external").unwrap();
+    let external_key = external_request.key().clone();
+    let external_binding = external_binding("orders-restart-external");
+    let external_attempt = acquire(&repo, external_request).await;
+    let external_completion = external_attempt
+        .complete_external(
+            external_binding,
+            TerminalCommandState::Succeeded,
+            serde_json::json!({"remote": "restart"}),
+            Vec::new(),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+    repo.complete_external_command(external_completion)
+        .await
+        .unwrap();
+    assert!(repo
+        .get_stream(&StreamIdentity::new("remote-order", &external_id).unwrap())
+        .await
+        .unwrap()
+        .is_none());
+
     repo.pool().close().await;
     drop(repo);
 
@@ -1541,6 +1960,30 @@ async fn sqlite_terminal_replay_survives_pool_drop_and_reopen() {
         stored_outbox.causation_id(),
         Some(expected_causation.as_str())
     );
+
+    let external_replay = match reopened
+        .lookup_command(
+            &external_key,
+            CommandLookupScope::CommandName("order.create"),
+        )
+        .await
+        .unwrap()
+    {
+        CommandLookup::Replay(replay) => replay,
+        other => panic!("reopened external ledger row should replay, got {other:?}"),
+    };
+    assert_eq!(external_replay.state, CommandLedgerState::Succeeded);
+    assert_eq!(
+        external_replay.outcome,
+        serde_json::json!({"remote": "restart"})
+    );
+    assert!(matches!(
+        reopened
+            .reserve_command(reservation(&external_id, 83, 84).unwrap())
+            .await
+            .unwrap(),
+        ReservationOutcome::Conflict
+    ));
 
     reopened.pool().close().await;
     drop(reopened);

@@ -45,7 +45,6 @@ mod store;
 pub(crate) mod testing;
 
 // Repository helpers
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) use store::ensure_active_claim;
 pub use store::{
     ClaimOutboxMessages, OutboxBacklogStats, OutboxClaimRef, OutboxPublishFailureAction,

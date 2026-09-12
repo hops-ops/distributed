@@ -12,9 +12,9 @@ use distributed::microsvc::{CausalCommandContext, HandlerError};
 use distributed::table::{
     ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema, DEFAULT_TABLE_VERSION_COLUMN,
 };
-use distributed::{Aggregate, Entity, EventRecord, GraphqlInput, GraphqlOutput};
 #[cfg(feature = "application-runtime")]
 use distributed::AggregateBuilder;
+use distributed::{Aggregate, CommandInput, CommandOutput, Entity, EventRecord};
 use serde::{Deserialize, Serialize};
 
 #[derive(Default)]
@@ -42,13 +42,13 @@ impl Aggregate for ContractAggregate {
     }
 }
 
-#[derive(Clone, Deserialize, GraphqlInput)]
+#[derive(Clone, Deserialize, CommandInput)]
 pub struct CreateTodoInput {
     pub id: String,
     pub title: String,
 }
 
-#[derive(Clone, Serialize, GraphqlOutput)]
+#[derive(Clone, Serialize, CommandOutput)]
 pub struct CreateTodoOutput {
     pub id: String,
 }
@@ -61,17 +61,19 @@ pub struct CreateTodoOutput {
     roles(user, admin),
     default(title = uuid_v7),
     input = CreateTodoInput,
-    outcome = distributed::graphql::Succeeded<CreateTodoOutput>
+    outcome = distributed::command::Succeeded<CreateTodoOutput>
 )]
 pub async fn create_todo(
     _context: &CausalCommandContext<'_, ContractAggregate>,
     input: CreateTodoInput,
 ) -> Result<
-    distributed::graphql::PreparedCommand<distributed::graphql::Succeeded<CreateTodoOutput>>,
+    distributed::command::PreparedCommand<distributed::command::Succeeded<CreateTodoOutput>>,
     HandlerError,
 > {
-    Ok(distributed::graphql::PreparedCommand::prepare(CreateTodoOutput { id: input.id })
-        .expect("generated output is valid"))
+    Ok(
+        distributed::command::PreparedCommand::prepare(CreateTodoOutput { id: input.id })
+            .expect("generated output is valid"),
+    )
 }
 
 distributed::module! {
@@ -113,14 +115,8 @@ fn todo_surface() -> Surface {
                 .rows(col("status").eq("open")),
         )]),
     )]);
-    surface_for_application_contract(
-        &catalog,
-        "web",
-        &["user".into()],
-        &["user".into()],
-        &grants,
-    )
-    .expect("contract fixture role surface should compile")
+    surface_for_application_contract(&catalog, "web", &["user".into()], &["user".into()], &grants)
+        .expect("contract fixture role surface should compile")
 }
 
 static WEB_SURFACE: LazyLock<SurfaceSpec> = LazyLock::new(|| {
@@ -176,8 +172,12 @@ pub fn surface_sdl() -> String {
 }
 
 pub fn client_manifest_bytes() -> Vec<u8> {
-    serde_json::to_vec(&compiler().client_manifest().expect("client artifact should compile"))
-        .expect("client artifact should serialize")
+    serde_json::to_vec(
+        &compiler()
+            .client_manifest()
+            .expect("client artifact should compile"),
+    )
+    .expect("client artifact should serialize")
 }
 
 pub fn selected_surface_fingerprint() -> String {
@@ -196,8 +196,7 @@ pub fn runtime_service() -> distributed::microsvc::Service {
     let _catalog = ReadModelCatalog::new("todo-contract-only");
     let repository = InMemoryRepository::new();
     let routes = create_todo_register(
-        distributed::microsvc::Routes::new()
-            .with_repo(repository.aggregate::<ContractAggregate>()),
+        distributed::microsvc::Routes::new().with_repo(repository.aggregate::<ContractAggregate>()),
     );
     distributed::microsvc::Service::new()
         .named("todo-contract-only")
@@ -261,6 +260,9 @@ mod tests {
     #[test]
     fn no_default_contract_definition_has_no_executable_mount() {
         assert_eq!(TODO_MODULE.mounts().len(), 0);
-        assert!(TODO_MODULE.definitions().iter().all(|definition| definition.mount().is_none()));
+        assert!(TODO_MODULE
+            .definitions()
+            .iter()
+            .all(|definition| definition.mount().is_none()));
     }
 }

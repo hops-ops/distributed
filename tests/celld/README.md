@@ -8,41 +8,66 @@ command -> AggregateCell -> domain event -> same-cell outbox
 ```
 
 The aggregate Worker owns one SQLite Durable Object per Todo or Chat shard.
-`AggregateCell::durable_state` assembles the event log, command ledger,
-snapshot/sealed state, and outbox into one versioned envelope. The Worker saves
-that envelope with one SQLite upsert, so the aggregate mutation and its outbox
-are one cell commit. The host attaches `CelldOutbox::from_env(&env, "OUTBOX")`
-to the `AggregateCell`, then `persist_and_drain_outbox` owns the complete
-persist, watchdog, Queue dispatch, settlement persistence, and alarm-rearming
-lifecycle. celld's output gate holds Queue egress until the cell write is
-durable. If settlement persistence is interrupted, the same stable event id may
-be delivered again; consumers must deduplicate by that id.
+The same SQL operations used by native repositories append event rows, maintain
+snapshots, fence command receipts and enqueue pending delivery rows. Each
+command commits those participants inside one `storage.transactionSync`.
+There is no whole-cell JSON value, authoritative in-memory shadow, or host
+persistence callback.
 
 ```rust,ignore
-let cell = AggregateCell::<Todo>::new_with_snapshots(shard, 1)?
+let cell = AggregateCell::<Todo>::from_state_with_snapshots(state, 100)?
     .mount(create())
     .mount(complete())
     .with_celld_outbox(CelldOutbox::from_env(&env, "OUTBOX")?);
 
-let drain = cell.persist_and_drain_outbox(&env, &storage, |state| {
-    persist_cell_state(&sql, state)
-})
-.await?;
-for error in drain.deferred {
-    worker::console_error!("outbox drain deferred: {error}");
+// Dispatch arms the durable watchdog before invoking the command.
+let result = cell.dispatch_idempotent(command, &identity, input, session).await?;
+
+// Optional immediate delivery after commit. A drain error is diagnostic here:
+// it cannot turn an already committed command into a rejection.
+match cell.drain_outbox(&env).await {
+    Ok(drain) => {
+        for error in drain.deferred {
+            worker::console_error!("outbox drain deferred: {error}");
+        }
+    }
+    Err(error) => worker::console_error!("outbox drain deferred: {error}"),
 }
+
+// The Durable Object alarm handler also calls drain_outbox(&env).
 ```
 
-The same `persist_and_drain_outbox` call runs after a command and from the
-Durable Object alarm. It persists the full state before Queue egress, arms the
-watchdog before publishing, persists any settlements even when a later store
-operation errors, and clears the alarm only when no retryable rows remain.
-Failure to persist that first state or arm its watchdog rejects the request.
-After both are established, the command is durably accepted: Queue, settlement,
-or later alarm-operation failures are returned in
-`CelldOutboxDrainOutcome::deferred` for diagnostics while the already-armed
-watchdog owns retry. Released Queue outcomes likewise stay pending. Neither can
-turn an already committed command into an HTTP error.
+The Queue lives in another cell: its acceptance is **not** part of the
+aggregate's SQLite transaction. celld's output gate orders Queue egress after
+the aggregate write becomes durable. The prearmed alarm covers the gap between
+that commit and Queue acceptance, including process loss without another request.
+
+A drain claims rows, sends them, and deletes each matching lease-fenced row
+after acceptance. A crash after acceptance but before deletion can deliver the
+same stable event ID again; consumers must deduplicate. Queue publication or
+settlement failures retain pending/in-flight work for the watchdog. An alarm
+keeps a wake scheduled while commands are running, including suspended commands.
+An empty drain never deletes another command's alarm; the last scheduled wake
+simply finds no work and stops.
+
+Snapshots use the ordinary repository cache validation, upcasting and tail
+loader on both native and cell command paths. A valid snapshot avoids loading
+old event payloads; an unusable cache rebuilds from the authoritative events.
+
+### Breaking storage and host API change
+
+Workers now open cells with `AggregateCell::from_state` or
+`from_state_with_snapshots`, and use `drain_outbox` from their alarm handler.
+The whole-state export/restore and `persist_and_drain_outbox` APIs are not
+available on the Worker host. Native in-process conformance fixtures are not a
+production persistence adapter.
+
+Existing `cell_state` databases are rejected with an explicit migration-required
+error. They are not silently reset or opened through a legacy adapter. Back up
+retained development data and migrate it explicitly before changing an existing
+fleet; creating a fresh test namespace is appropriate only for disposable data.
+The SQL migration inventory and checksums also reject incompatible or newer
+schemas.
 
 Queue is intentionally not modeled as a full Distributed `Bus`: it has one
 consumer and no fanout. `CelldQueueRelay` is generic over `MessagePublisher`,
@@ -51,6 +76,19 @@ consumer POSTs the canonical envelope to the authenticated native relay route.
 The e2e-celld host wires that one route to `BusPublisher<NatsBus>`. Kafka,
 RabbitMQ, and Knative use the same Queue consumer and relay contract; only the
 native `BusPublisher<B>` changes.
+
+## Command retry receipts
+
+The wait-path response gets its projection inputs from
+`CellDispatchResult::projection_events()`, stored atomically with the command's
+terminal retry receipt. It does not scan the outbox. A retry therefore returns
+the same result and projection inputs even when delivery has removed the outbox
+rows. Receipt evidence follows the existing command replay retention; event
+history belongs in the event store, not in delivery records.
+
+This changes the internal successful cell replay payload. Previously persisted
+successful receipts are not silently accepted as the new format. The public
+HTTP response shape is unchanged.
 
 ## Queue naming and sharding
 
@@ -119,6 +157,27 @@ and consumer deployments as separate scripts without changing the relay code.
 
 Without `CELLD_URL`, `cargo test --test celld` checks the fixtures and skips the
 live HTTP round trips.
+
+The independent storage proof owns a temporary celld fleet and deliberately
+kills only the processes it starts:
+
+```sh
+(cd tests/celld/worker && worker-build --release --features storage-conformance)
+node tests/celld/storage-conformance.mjs
+```
+
+It requires Node.js, sqlite3, esbuild and celld in addition to the Worker
+toolchain. It tests final-write rollback across multi-chunk event/outbox inserts
+(the Worker uses at most 100 bound parameters per SQL statement), lease fencing during commit,
+Queue-acceptance/delete crash redelivery with stable IDs, prearmed-alarm
+recovery without another cell request, and receipt replay after delivery. It
+also retains 1,101 unsent messages and more than 8 MiB of event payload in one
+snapshot-backed cell, restarts it, and verifies that alarms drain the backlog
+without another aggregate request. Events and receipts remain; delivered
+outbox rows do not.
+It prints and retains its temporary artifact directory. Fault probes are
+feature-gated out of ordinary Worker builds. CI runs this proof separately
+from the full Queue/NATS/browser profile.
 
 Every non-health aggregate route requires `DISTRIBUTED_INTERNAL_SECRET`. The
 checked-in value is loopback test data only; production requires a separately

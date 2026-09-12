@@ -9,13 +9,14 @@ mod client_surface_parity_tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::graphql::command_contract::{CommandEffects, TypedCommandContract};
+    use crate::command::CommandConsistency;
+    use crate::command::{CommandEffects, TypedCommandContract};
+    use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
     use crate::graphql::commands::TypedCommandInventory;
     #[cfg(feature = "sqlite")]
     use crate::graphql::ModelNormalization;
     use crate::graphql::{
-        claim, col, ClientRootOperation, CommandConsistency, DistributedClientSurfaceExport,
-        GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField, RoleGrant,
+        claim, col, ClientRootOperation, DistributedClientSurfaceExport, RoleGrant,
     };
     use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
     #[cfg(feature = "sqlite")]
@@ -64,15 +65,15 @@ mod client_surface_parity_tests {
         roles: &[&str],
     ) -> TypedCommandContract
     where
-        I: GraphqlInputType + 'static,
-        O: GraphqlOutputType + 'static,
+        I: CommandInputType + 'static,
+        O: CommandOutputType + 'static,
     {
         TypedCommandContract {
             name: command_name.into(),
             field_name: field_name.into(),
             roles: roles.iter().map(|role| (*role).into()).collect(),
-            input: I::graphql_type().with_type_id(TypeId::of::<I>()),
-            output: O::graphql_type().with_type_id(TypeId::of::<O>()),
+            input: I::command_type().with_type_id(TypeId::of::<I>()),
+            output: O::command_type().with_type_id(TypeId::of::<O>()),
             input_type_id: TypeId::of::<I>(),
             output_type_id: TypeId::of::<O>(),
             consistency: CommandConsistency::Succeeded,
@@ -942,6 +943,51 @@ mod client_surface_parity_tests {
         assert!(!response.extensions.contains_key("distributed"));
     }
 
+    #[test]
+    fn unsigned_presets_from_session_enforce_canonical_safe_ranges() {
+        for (codec, maximum) in [
+            ("uint8", 255_u64),
+            ("uint16", 65_535),
+            ("uint32", 4_294_967_295),
+            ("uint64_safe_integer", 9_007_199_254_740_991),
+        ] {
+            let descriptor = ClientTrustedPresetDescriptor {
+                name: "x-revision".into(),
+                codec: codec.into(),
+            };
+            let mut session = Session::new();
+            for raw in ["0".to_string(), maximum.to_string()] {
+                session.set("x-revision", &raw);
+                assert_eq!(
+                    crate::graphql::engine::protocol::resolve_protocol_preset(
+                        &session,
+                        &descriptor
+                    )
+                    .unwrap()
+                    .value,
+                    serde_json::json!(raw.parse::<u64>().unwrap())
+                );
+            }
+            for raw in [
+                "-1".to_string(),
+                "-0".into(),
+                "1.5".into(),
+                "1.0".into(),
+                "+1".into(),
+                "01".into(),
+                "NaN".into(),
+                (maximum + 1).to_string(),
+            ] {
+                session.set("x-revision", &raw);
+                assert!(crate::graphql::engine::protocol::resolve_protocol_preset(
+                    &session,
+                    &descriptor
+                )
+                .is_none());
+            }
+        }
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn row_policy_presets_follow_sql_claim_case_normalization() {
@@ -971,6 +1017,70 @@ mod client_surface_parity_tests {
             serde_json::json!([
                 {"name": "X-Tenant", "codec": "string", "value": "tenant-1"}
             ])
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn required_presets_reject_query_and_stream_without_internal_errors() {
+        let mut engine = preset_protocol_engine();
+        Arc::get_mut(&mut engine.inner)
+            .unwrap()
+            .protocol
+            .as_mut()
+            .unwrap()
+            .roles
+            .get_mut("user")
+            .unwrap()
+            .surface
+            .trusted_presets = vec![ClientTrustedPresetDescriptor {
+            name: "x-required-number".into(),
+            codec: "int32".into(),
+        }];
+        for value in [None, Some("not-a-number"), Some("01"), Some("2147483648")] {
+            let mut session = Session::new();
+            session.set("x-roles", "user");
+            if let Some(value) = value {
+                session.set("x-required-number", value);
+            }
+            let query = engine
+                .execute(&session, Request::new("{ __typename }"))
+                .await;
+            let streamed = engine
+                .execute_stream(&session, Request::new("{ __typename }"))
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(streamed.len(), 1);
+            for response in std::iter::once(query).chain(streamed) {
+                assert_eq!(response.errors.len(), 1);
+                let error = serde_json::to_value(&response.errors[0]).unwrap();
+                assert_eq!(error["extensions"]["code"], "BAD_REQUEST", "{error}");
+                assert_eq!(
+                    error["message"],
+                    "required session input is missing or invalid"
+                );
+                assert_eq!(response.data, Value::Null);
+                assert!(!response.extensions.contains_key("distributed"));
+            }
+        }
+        let mut valid = Session::new();
+        valid.set("x-roles", "user");
+        valid.set("x-required-number", "42");
+        let response = engine.execute(&valid, Request::new("{ __typename }")).await;
+        assert!(!response.is_err(), "{:?}", response.errors);
+        assert_eq!(
+            distributed_extension(&response)["trustedPresets"][0]["value"],
+            42
+        );
+        let responses = engine
+            .execute_stream(&valid, Request::new("{ __typename }"))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(responses.len(), 1);
+        assert!(!responses[0].is_err());
+        assert_eq!(
+            distributed_extension(&responses[0])["trustedPresets"][0]["value"],
+            42
         );
     }
 
@@ -1239,7 +1349,7 @@ mod client_surface_parity_tests {
         }
         assert_eq!(
             manifest.schema_fingerprint,
-            "sha256:7a456dac4fce3e4ccba7255baccad3e70e891f71ea476c1560631c9b2e5cf1da"
+            "sha256:cce38712ab7d84a934fa10bf1272d292d20f746aea5bf2e485fe15b2527517c0"
         );
     }
 
@@ -1374,7 +1484,7 @@ mod client_surface_parity_tests {
         assert_eq!(manifest.service_id, "orders-service");
         assert_eq!(
             manifest.schema_fingerprint,
-            "sha256:7a599939c85d2f444428431675655d371929234965bdcfb6c81eba244694e6d0"
+            "sha256:9c0150e725493dc1e5ddbb3fdfc8b651cad399f099908cbcac326e514389c48a"
         );
     }
 
@@ -1404,9 +1514,10 @@ mod client_surface_parity_tests {
         type_name: &str,
         nullable: bool,
         list: bool,
-        nested: Option<GraphqlTypeDef>,
-    ) -> GraphqlTypeField {
-        GraphqlTypeField {
+        nested: Option<CommandTypeDef>,
+    ) -> CommandTypeField {
+        CommandTypeField {
+            unsigned_integer: None,
             name: name.into(),
             type_name: type_name.into(),
             nullable,
@@ -1418,16 +1529,16 @@ mod client_surface_parity_tests {
 
     struct ChangeOrderInput;
 
-    impl GraphqlInputType for ChangeOrderInput {
-        fn graphql_type() -> GraphqlTypeDef {
-            let patch = GraphqlTypeDef::new(
+    impl CommandInputType for ChangeOrderInput {
+        fn command_type() -> CommandTypeDef {
+            let patch = CommandTypeDef::new(
                 "OrderPatchInput",
                 vec![
                     type_field("status", "String", false, false, None),
                     type_field("metadata", "JSON", true, false, None),
                 ],
             );
-            GraphqlTypeDef::new(
+            CommandTypeDef::new(
                 "ChangeOrderInput",
                 vec![
                     type_field("patch", "OrderPatchInput", false, false, Some(patch)),
@@ -1439,16 +1550,16 @@ mod client_surface_parity_tests {
 
     struct ChangeOrderPayload;
 
-    impl GraphqlOutputType for ChangeOrderPayload {
-        fn graphql_type() -> GraphqlTypeDef {
-            let changed_order = GraphqlTypeDef::new(
+    impl CommandOutputType for ChangeOrderPayload {
+        fn command_type() -> CommandTypeDef {
+            let changed_order = CommandTypeDef::new(
                 "ChangedOrder",
                 vec![
                     type_field("status", "String", false, false, None),
                     type_field("order_id", "String", false, false, None),
                 ],
             );
-            GraphqlTypeDef::new(
+            CommandTypeDef::new(
                 "ChangeOrderPayload",
                 vec![
                     type_field("warnings", "String", true, true, None),
@@ -1780,10 +1891,13 @@ mod client_surface_parity_tests {
         let actual_manifest = sha256(&manifest_json);
         let actual_static_sdl = sha256(static_sdl.as_bytes());
         let actual_runtime_sdl = sha256(runtime_sdl.as_bytes());
-        assert_eq!(actual_manifest, expected.manifest, "{dialect:?}/{role}");
-        assert_eq!(actual_static_sdl, expected.static_sdl, "{dialect:?}/{role}");
         assert_eq!(
-            actual_runtime_sdl, expected.runtime_sdl,
+            (
+                actual_manifest.as_str(),
+                actual_static_sdl.as_str(),
+                actual_runtime_sdl.as_str()
+            ),
+            (expected.manifest, expected.static_sdl, expected.runtime_sdl),
             "{dialect:?}/{role}"
         );
     }
@@ -1817,30 +1931,30 @@ mod client_surface_parity_tests {
 
     #[cfg(feature = "sqlite")]
     const SQLITE_RESTRICTED_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:a2b97c4156fd9e6c99c3ad516af5cf2c57781fa4f13757902685989a691b2515",
-        static_sdl: "sha256:6ac07aaa60a726bdde7c1632125a3ab933766931187654dacc2dd4ab19ffece1",
-        runtime_sdl: "sha256:fb41d43fa1b58fec7224d768124abc8bb0b30407e1ee56b44f620ddc8d8c0007",
+        manifest: "sha256:7c8a181165a416610142c06f6b0ddca34358d884b738af10e11bf9b928817bed",
+        static_sdl: "sha256:03252ba251b1ddac611fe567d816f780f0876f9f6ce263be95a3480f88fc2283",
+        runtime_sdl: "sha256:3d099b8c0b27f0dcbdd677199f767fcc5993071e06b2c0a7d4aa02caf4e5f4ac",
     };
 
     #[cfg(feature = "sqlite")]
     const SQLITE_ADMIN_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:4619fb257bd0b3b0155ebdff5f34a8d15f6c23bc0fc8a99459e7d56aad444932",
-        static_sdl: "sha256:4d7ba7651ff632d32e538a083165ff718e094858c6c5bdb2705d38d9f0665e2f",
-        runtime_sdl: "sha256:be0f13249ec0cb394457572097a1d201649deeec1eba9c980f48b1751a13062b",
+        manifest: "sha256:827e381234e72fa315daffa7a018f2c92f964d75ef70fbc86983b3aa704e52d9",
+        static_sdl: "sha256:128b85bcd6485d14de62b0976e9f12e8b35ad9e7d96a5627d1edcfcabdb591b3",
+        runtime_sdl: "sha256:c0b6d600d353357ab4f393897fb6b7ee51f69546f7a4cc4b6786e42abe621f5c",
     };
 
     #[cfg(feature = "postgres")]
     const POSTGRES_RESTRICTED_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:a2b97c4156fd9e6c99c3ad516af5cf2c57781fa4f13757902685989a691b2515",
-        static_sdl: "sha256:6ac07aaa60a726bdde7c1632125a3ab933766931187654dacc2dd4ab19ffece1",
-        runtime_sdl: "sha256:fb41d43fa1b58fec7224d768124abc8bb0b30407e1ee56b44f620ddc8d8c0007",
+        manifest: "sha256:7c8a181165a416610142c06f6b0ddca34358d884b738af10e11bf9b928817bed",
+        static_sdl: "sha256:03252ba251b1ddac611fe567d816f780f0876f9f6ce263be95a3480f88fc2283",
+        runtime_sdl: "sha256:3d099b8c0b27f0dcbdd677199f767fcc5993071e06b2c0a7d4aa02caf4e5f4ac",
     };
 
     #[cfg(feature = "postgres")]
     const POSTGRES_ADMIN_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:66cddbcf76eac385f94de011497fe4752f7fb6102de28c14c24d83c67367788b",
-        static_sdl: "sha256:d128621aea3ffa6c38abc44a9b7f3b2716aada4af4b579b10e7c415040281751",
-        runtime_sdl: "sha256:ae58e2ed718955a6d400197a4cfa2f363d3057c80c6f4e528d10615a3df804cb",
+        manifest: "sha256:8e123332eb9ae3364290429e30feeee8a1da3cbad4004224382b8e6128c918a2",
+        static_sdl: "sha256:afe92660c1700845ed5f3e0ddaacc4b481799c39f86b8eacecb46d1b8f99d421",
+        runtime_sdl: "sha256:de4885736fdf22a57ccc55160d63b6d1a7fdb33728dec399e8a81d54ce7e8c09",
     };
 
     #[cfg(feature = "sqlite")]
@@ -2081,6 +2195,7 @@ mod client_surface_parity_tests {
             foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: vec![RelationshipDef {
+                references: None,
                 field_name: "children".into(),
                 kind: RelationshipKind::HasMany,
                 target_model: "PolicyChildView".into(),

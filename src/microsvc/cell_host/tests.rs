@@ -3,8 +3,8 @@ use super::{
     CellNamespace, CellStreamStore, DURABLE_AGGREGATE_CELL_STATE_VERSION,
 };
 use crate::aggregate::{Aggregate, AggregateRepository};
+use crate::command::{typed_command, PreparedCommand, Succeeded};
 use crate::entity::Entity;
-use crate::graphql::{typed_command, PreparedCommand, Succeeded};
 use crate::microsvc::service::{CausalCommandContext, PortableCommand, Routes};
 use crate::microsvc::session::{Session, USER_ID_KEY};
 use crate::microsvc::HandlerError;
@@ -24,7 +24,7 @@ struct CellItem {
     done: bool,
 }
 
-#[sourced(entity, aggregate_type = "CellItem")]
+#[sourced(entity, aggregate_type = "CellItem", events = "CellItemEvent")]
 impl CellItem {
     #[event("cell_item.created", version = 1)]
     fn create(&mut self, id: String, title: String) {
@@ -37,25 +37,31 @@ impl CellItem {
     fn complete(&mut self) {
         self.done = true;
     }
+
+    #[event("cell_item.published", version = 1, domain = event)]
+    fn publish(&mut self, id: String, title: String) {
+        self.entity.set_id(id);
+        self.title = title;
+    }
 }
 
-#[derive(Debug, Deserialize, crate::GraphqlInput)]
+#[derive(Debug, Deserialize, crate::CommandInput)]
 struct CreateInput {
     id: String,
     title: String,
 }
 
-#[derive(Debug, Serialize, crate::GraphqlOutput)]
+#[derive(Debug, Serialize, crate::CommandOutput)]
 struct CreatePayload {
     id: String,
 }
 
-#[derive(Debug, Deserialize, crate::GraphqlInput)]
+#[derive(Debug, Deserialize, crate::CommandInput)]
 struct CompleteInput {
     id: String,
 }
 
-#[derive(Debug, Serialize, crate::GraphqlOutput)]
+#[derive(Debug, Serialize, crate::CommandOutput)]
 struct CompletePayload {
     id: String,
     done: bool,
@@ -132,6 +138,91 @@ fn owner_session() -> Session {
     let mut session = Session::new();
     session.set(USER_ID_KEY, "user-1");
     session
+}
+
+struct Publish;
+
+impl<D> PortableCommand<D> for Publish
+where
+    D: crate::microsvc::CausalRouteDependencies<Aggregate = CellItem> + Send + Sync + 'static,
+{
+    fn install(self, routes: Routes<D>) -> Routes<D> {
+        routes
+            .typed_command(typed_command::<CreateInput, Succeeded<CreatePayload>>(
+                "cell_item.publish",
+            ))
+            .guarded(
+                |ctx: &CausalCommandContext<'_, CellItem>| ctx.session().user_id().is_some(),
+                handle_publish,
+            )
+    }
+}
+
+async fn handle_publish(
+    ctx: &CausalCommandContext<'_, CellItem>,
+    input: CreateInput,
+) -> Result<PreparedCommand<Succeeded<CreatePayload>>, HandlerError> {
+    let repo = ctx.repo();
+    let mut item = repo.create();
+    item.publish(input.id.clone(), input.title)
+        .map_err(|error| HandlerError::Rejected(error.to_string()))?;
+    repo.publish_events()
+        .commit(item)?
+        .succeeded(CreatePayload { id: input.id })
+}
+
+#[tokio::test]
+async fn command_replay_retains_confirmation_evidence_without_outbox_history() {
+    let cell = AggregateCell::<CellItem>::new("published-item")
+        .unwrap()
+        .mount(Publish);
+    let identity = CellCommandIdentity::new(
+        "cell-test-service",
+        "principal-alice",
+        "0190a000-0000-7000-8000-000000000405",
+    )
+    .unwrap();
+    let input = json!({ "id": "published-item", "title": "once" });
+    let first = cell
+        .dispatch_idempotent(
+            "cell_item.publish",
+            &identity,
+            input.clone(),
+            owner_session(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.projection_events().len(), 1);
+    assert_eq!(
+        first.projection_events()[0].event_type,
+        "cell_item.published"
+    );
+    assert_eq!(cell.durable_outbox().unwrap().len(), 1);
+
+    // Restore only domain history and the receipt, as after a completed drain.
+    // The retry must not require a single delivery record to be retained.
+    let reopened = AggregateCell::<CellItem>::new("published-item")
+        .unwrap()
+        .mount(Publish);
+    reopened
+        .restore_durable_events(cell.durable_events().unwrap())
+        .unwrap();
+    reopened
+        .restore_durable_commands(cell.durable_commands().unwrap())
+        .unwrap();
+    assert!(reopened.durable_outbox().unwrap().is_empty());
+    let replay = reopened
+        .dispatch_idempotent("cell_item.publish", &identity, input, owner_session())
+        .await
+        .unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.payload(), first.payload());
+    assert_eq!(replay.projection_events(), first.projection_events());
+    assert!(
+        reopened.durable_outbox().unwrap().is_empty(),
+        "replay must not republish"
+    );
+    assert_eq!(reopened.durable_events().unwrap()[0].events.len(), 1);
 }
 
 fn fn_send_sync<T: Send + Sync>(_: &T) {}
@@ -304,6 +395,7 @@ async fn cell_wait_path_replays_the_same_command_without_new_domain_effects() {
     assert!(replay.replayed());
     assert_eq!(replay.payload(), first.payload());
     assert_eq!(replay.causation_id(), first.causation_id());
+    assert_eq!(replay.projection_events(), first.projection_events());
     let events = cell.durable_events().unwrap();
     assert_eq!(
         events
@@ -341,6 +433,12 @@ async fn cell_wait_path_replays_the_same_command_without_new_domain_effects() {
         .expect("durable replay after restart");
     assert!(replay_after_restart.replayed());
     assert_eq!(replay_after_restart.causation_id(), first.causation_id());
+    assert!(restored.durable_outbox().unwrap().is_empty());
+    assert_eq!(
+        replay_after_restart.projection_events(),
+        first.projection_events(),
+        "confirmation evidence must survive restart with no outbox history"
+    );
     assert_eq!(
         restored
             .durable_events()

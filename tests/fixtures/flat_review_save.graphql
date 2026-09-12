@@ -1,0 +1,3 @@
+mutation SaveFlatReview {
+  upsert_flat_reviews(object: $input.review)
+}

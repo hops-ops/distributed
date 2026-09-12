@@ -7,7 +7,19 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use super::CellProjectionEventWireItem;
+
+/// Bounded retry material, owned by the command ledger and expired with its
+/// replay retention. It is not an outbox record or an event history archive.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CellCommandReplay {
+    pub payload: Value,
+    pub events: Vec<CellProjectionEventWireItem>,
+}
 
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalTransactionalCommit, CommandAttempt, CommandId,
@@ -28,6 +40,11 @@ pub const CELL_SERVICE_ID_HEADER: &str = "x-distributed-service-id";
 /// This is an opaque server-derived value, never a public command argument.
 pub const CELL_PRINCIPAL_PARTITION_HEADER: &str = "x-distributed-principal-partition";
 
+/// Internal wait-path header carrying the gateway's durable causation ID.
+/// The shared internal secret authenticates this value; public clients cannot
+/// select it.
+pub const CELL_CAUSATION_ID_HEADER: &str = "x-distributed-causation-id";
+
 /// Trusted command-ledger identity supplied by the cell's authenticated host.
 ///
 /// `principal_partition` is the opaque, server-derived partition produced by
@@ -35,6 +52,7 @@ pub const CELL_PRINCIPAL_PARTITION_HEADER: &str = "x-distributed-principal-parti
 #[derive(Clone, Debug)]
 pub struct CellCommandIdentity {
     key: CommandLedgerKey,
+    causation_id: Option<crate::command_ledger::CausationId>,
 }
 
 impl CellCommandIdentity {
@@ -48,7 +66,10 @@ impl CellCommandIdentity {
             PrincipalPartitionId::new(principal_partition).map_err(internal_ledger_error)?;
         let key = CommandLedgerKey::new(service_id, principal_partition, command_id)
             .map_err(internal_ledger_error)?;
-        Ok(Self { key })
+        Ok(Self {
+            key,
+            causation_id: None,
+        })
     }
 
     pub fn service_id(&self) -> &str {
@@ -57,6 +78,25 @@ impl CellCommandIdentity {
 
     pub fn command_id(&self) -> &str {
         self.key.command_id()
+    }
+
+    /// Bind a trusted gateway causation ID to the cell reservation. This is
+    /// used only across the authenticated internal wait-path boundary; a cell
+    /// identity without it retains the standalone cell-command behavior.
+    pub fn with_causation_id(
+        mut self,
+        causation_id: impl AsRef<str>,
+    ) -> Result<Self, CellDispatchError> {
+        let causation_id = crate::command_ledger::CausationId::parse_stored(
+            causation_id.as_ref().to_string(),
+        )
+        .map_err(internal_ledger_error)?;
+        self.causation_id = Some(causation_id);
+        Ok(self)
+    }
+
+    pub(crate) fn causation_id(&self) -> Option<&crate::command_ledger::CausationId> {
+        self.causation_id.as_ref()
     }
 
     pub(crate) fn key(&self) -> &CommandLedgerKey {
@@ -68,6 +108,7 @@ impl CellCommandIdentity {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CellDispatchResult {
     payload: Value,
+    events: Vec<CellProjectionEventWireItem>,
     command_id: String,
     causation_id: String,
     state: String,
@@ -75,6 +116,11 @@ pub struct CellDispatchResult {
 }
 
 impl CellDispatchResult {
+    /// Exact confirmation evidence retained with this command's retry receipt.
+    /// Delivery may have already removed all of the command's outbox rows.
+    pub fn projection_events(&self) -> &[CellProjectionEventWireItem] {
+        &self.events
+    }
     pub fn payload(&self) -> &Value {
         &self.payload
     }
@@ -189,13 +235,23 @@ pub(crate) fn replay_result(
         CommandLedgerState::Succeeded
         | CommandLedgerState::SucceededPendingProjection
         | CommandLedgerState::Atomic
-        | CommandLedgerState::ProjectionFailed => Ok(CellDispatchResult {
-            payload: replay.outcome,
-            command_id: replay.command_id.as_str().to_string(),
-            causation_id: replay.causation_id.as_str().to_string(),
-            state: replay.state.as_str().to_string(),
-            replayed,
-        }),
+        | CommandLedgerState::ProjectionFailed => {
+            let receipt: CellCommandReplay =
+                serde_json::from_value(replay.outcome).map_err(|error| {
+                    CellDispatchError::Internal(format!("invalid cell command replay: {error}"))
+                })?;
+            // Validate persisted data just as strictly as the initial response.
+            super::parse_cell_projection_events(&serde_json::json!({ "events": receipt.events }))
+                .map_err(CellDispatchError::Internal)?;
+            Ok(CellDispatchResult {
+                payload: receipt.payload,
+                events: receipt.events,
+                command_id: replay.command_id.as_str().to_string(),
+                causation_id: replay.causation_id.as_str().to_string(),
+                state: replay.state.as_str().to_string(),
+                replayed,
+            })
+        }
         CommandLedgerState::Rejected => replay_rejection(replay.outcome),
         CommandLedgerState::InProgress
         | CommandLedgerState::RetryableUnknown

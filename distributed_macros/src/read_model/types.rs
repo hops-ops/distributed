@@ -54,27 +54,27 @@ pub(super) fn effect_model_wire_tokens(
     text: bool,
 ) -> proc_macro2::TokenStream {
     if jsonb {
-        return quote! { distributed::graphql::EffectWireJson };
+        return quote! { distributed::command::EffectWireJson };
     }
     if text {
-        return quote! { distributed::graphql::EffectWireString };
+        return quote! { distributed::command::EffectWireString };
     }
     let ty = option_inner_type(ty).unwrap_or(ty);
     let Some(last) = last_type_segment(ty) else {
-        return quote! { distributed::graphql::EffectWireUnsupported };
+        return quote! { distributed::command::EffectWireUnsupported };
     };
     match last.ident.to_string().as_str() {
-        "String" | "str" => quote! { distributed::graphql::EffectWireString },
-        "bool" => quote! { distributed::graphql::EffectWireBoolean },
+        "String" | "str" => quote! { distributed::command::EffectWireString },
+        "bool" => quote! { distributed::command::EffectWireBoolean },
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
-            quote! { distributed::graphql::EffectWireBigInt }
+            quote! { distributed::command::EffectWireBigInt }
         }
-        "f32" | "f64" => quote! { distributed::graphql::EffectWireFloat },
-        "Vec" if vec_inner_is_u8(last) => quote! { distributed::graphql::EffectWireBytea },
+        "f32" | "f64" => quote! { distributed::command::EffectWireFloat },
+        "Vec" if vec_inner_is_u8(last) => quote! { distributed::command::EffectWireBytea },
         "Vec" | "HashMap" | "BTreeMap" | "Value" => {
-            quote! { distributed::graphql::EffectWireJson }
+            quote! { distributed::command::EffectWireJson }
         }
-        _ => quote! { distributed::graphql::EffectWireUnsupported },
+        _ => quote! { distributed::command::EffectWireUnsupported },
     }
 }
 
@@ -129,6 +129,24 @@ pub(super) fn vec_inner_type(ty: &Type) -> Option<&Type> {
         GenericArgument::Type(ty) => Some(ty),
         _ => None,
     })
+}
+
+/// One allocation wrapper for a singular relationship, not a model or column.
+pub(super) fn box_inner_type(ty: &Type) -> Option<&Type> {
+    let segment = last_type_segment(ty)?;
+    if segment.ident != "Box" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    match args.args.first()? {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    }
 }
 
 pub(super) fn validate_relationship_target_type(

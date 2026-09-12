@@ -22,6 +22,8 @@ pub mod executor;
 pub mod local_mounts;
 pub mod lower;
 pub mod placement;
+#[cfg(feature = "graphql")]
+pub mod rebuild;
 
 pub use local_mounts::{
     LocalDirectMount, LocalEventualMount, LocalProjectionMounts, LocalProjectionMountsBuilder,
@@ -54,3 +56,6 @@ pub use provenance::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "graphql"))]
+mod source_snapshot_tests;

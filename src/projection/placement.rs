@@ -1358,6 +1358,12 @@ fn validate_direct_eligibility(
     program: &ProjectionProgram,
     outputs: &[ProjectionOutput],
 ) -> Result<(), ProjectionTopologyError> {
+    if program.source_snapshots() {
+        return Err(ProjectionTopologyError::DirectIneligible {
+            reason: "source snapshots require canonical occurrences at the eventual projector"
+                .into(),
+        });
+    }
     let [output] = outputs else {
         return Err(ProjectionTopologyError::DirectIneligible {
             reason: "direct evidence requires exactly one registered output schema".to_owned(),

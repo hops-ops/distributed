@@ -68,7 +68,7 @@ fn dispatcher(
     )
 }
 
-async fn load_outbox_message(repo: &InMemoryRepository, id: &str) -> OutboxMessage {
+async fn load_outbox_message(repo: &InMemoryRepository, id: &str) -> Option<OutboxMessage> {
     let store = repo.outbox_store();
     for status in [
         OutboxMessageStatus::Pending,
@@ -83,10 +83,10 @@ async fn load_outbox_message(repo: &InMemoryRepository, id: &str) -> OutboxMessa
             .into_iter()
             .find(|message| message.id() == id)
         {
-            return message;
+            return Some(message);
         }
     }
-    panic!("outbox message `{id}` should exist")
+    None
 }
 
 #[tokio::test]
@@ -263,9 +263,8 @@ async fn outbox_dispatch_publishes_and_completes_committed_row() {
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].name(), "todo.initialized");
 
-    // Check record is marked as published
-    let published = load_outbox_message(&repo, &message_id).await;
-    assert!(published.is_published());
+    // Delivered work is removed; publication evidence belongs to the bus.
+    assert!(load_outbox_message(&repo, &message_id).await.is_none());
 }
 
 #[tokio::test]
@@ -519,8 +518,7 @@ async fn outbox_dispatch_drains_one_row_at_a_time() {
 
     assert_eq!(processed, 3);
     for id in &message_ids {
-        let message = load_outbox_message(&repo, id).await;
-        assert!(message.is_published());
+        assert!(load_outbox_message(&repo, id).await.is_none());
     }
     assert_eq!(
         repo.outbox_store().pending(usize::MAX).await.unwrap().len(),

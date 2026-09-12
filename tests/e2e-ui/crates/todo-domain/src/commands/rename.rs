@@ -1,16 +1,16 @@
-use distributed::graphql::Eventual;
+use distributed::command::Eventual;
 use distributed::portable_command;
 use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, Todo, TodoState};
 
-#[derive(Debug, Deserialize, distributed::GraphqlInput)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct TodoRenameInput {
     pub todo_id: String,
     pub title: String,
 }
 
-#[derive(Debug, Serialize, distributed::GraphqlOutput)]
+#[derive(Debug, Serialize, distributed::CommandOutput)]
 pub struct TodoRenamePayload {
     pub todo_id: String,
     pub title: String,

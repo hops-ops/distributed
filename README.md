@@ -4,9 +4,16 @@
 
 ## How it works
 
+Live queries stream authorized results even when row-level permissions prevent
+safe resume cursors. [Snapshot and resumable delivery](docs/live-query-delivery.md)
+describe the two modes and their consistency guarantees.
+
 Write the domain once, compose it into one `Service` or several, then
 generate the client. Each stage below uses real code from
 [`tests/e2e-ui`](tests/e2e-ui).
+
+Unsigned command fields preserve their Rust range in generated client validation
+and optimistic projections; see [unsigned command inputs](docs/unsigned-command-inputs.md).
 
 ```mermaid
 sequenceDiagram
@@ -266,6 +273,105 @@ mutation SaveTodo {
   upsert_todos(object: $input.todo)
 }
 ```
+
+#### Full-state projections and out-of-order events
+
+Broker delivery order is not necessarily aggregate commit order. For a read
+model whose rows are complete snapshots owned by one aggregate stream, opt in
+to source-version fencing:
+
+```rust,ignore
+distributed::projection! {
+    pub const TODOS: ProjectionDescriptor<EventualOnly> = {
+        name: "project_todos",
+        version: 2,
+        epoch: "todos-source-snapshots-v1",
+        model: Todos,
+        source: aggregate_snapshot,
+        on {
+            events: [TodoCreatedDomainEvent, TodoCompletedDomainEvent],
+            mutation: SaveTodo,
+            input: { todo: body },
+        },
+        on {
+            events: [TodoPurgedDomainEvent],
+            mutation: DeleteTodo,
+            input: { todo_id: aggregate_id },
+        },
+    };
+}
+```
+
+The framework compares canonical `(aggregate_sequence, publication_ordinal)`
+within the owning `(aggregate_type, aggregate_id)` stream. A late snapshot
+cannot overwrite a newer row or resurrect a deleted one. Even deletion before
+creation leaves a durable tombstone. A newer snapshot can recreate the row.
+Source fences, physical rows, row revisions, broker checkpoints and causal
+observations commit atomically in the memory, SQLite and PostgreSQL adapters.
+A stale input confirms the current row revision without generating a fake row
+update; a concurrent change makes that confirmation retry through the normal
+projection conflict path.
+
+Use this only for complete replacement snapshots with stable row keys. Every
+affected key must be owned by one aggregate stream; joins, counters, partial
+patches and relationship side effects need their own ordering/fold semantics.
+This mode rejects delta operations, expression partitions and direct placement.
+Different aggregate streams cannot take over an existing fenced key. Matching
+source versions with conflicting occurrence content fail closed.
+
+Migration `0005_projection_source_snapshots` persists the fence alongside each
+record, including tombstones; compaction does not remove it. Enabling this on
+an existing unversioned projection requires an explicit read-model rebuild
+from retained canonical events. Merely changing the projection version or epoch
+does not infer a source version for existing rows. The normal ordered-delivery
+contract and transport identity checks still apply; this is not a replacement
+for reliable broker delivery or an incremental-event reorder buffer.
+
+Custom program factories can use `ProjectionProgram::with_source_snapshots()`;
+the policy is part of the canonical program identity. Browser optimism continues
+to use the same mutation program, and authoritative confirmation uses committed
+row revisions rather than comparing browser timestamps.
+
+#### Rebuilding existing snapshot projections
+
+Use explicit maintenance, not a startup fallback or republishing loop:
+
+```rust,ignore
+use distributed::projection::rebuild::SnapshotProjectionRebuild;
+
+// Stop producers, drain outboxes, stop consumers, and back up the read model.
+// Reuse the same generated SurfaceProjector mounted by the application.
+let rebuild = SnapshotProjectionRebuild::begin(&repository, &projector).await?;
+// Read history AFTER capturing the target inventory. Another authoritative
+// archive can supply these canonical occurrences; rebuilding is bus-neutral.
+let events = nats_bus.retained_domain_events().await?;
+let plan = rebuild.from_complete_history(&events)?;
+println!("{} records to rebuild", plan.record_count());
+plan.apply(&repository).await?;
+```
+
+Memory, SQLite and PostgreSQL commit complete rows/tombstones, source fences,
+new record revisions and live-query changes atomically. A concurrent update,
+insertion or deletion invalidates the captured inventory. Failure rolls back the
+whole projection. Broker checkpoints, inbox receipts, command ledgers and prior
+causal observations are preserved; maintenance does not claim a domain command
+occurred. No domain handlers, external effects or queue sends run.
+
+The archive must cover every existing record and retain its stored source
+occurrence, where present. Conflicting duplicate occurrences, missing aggregate
+sequence prefixes and stale source heads fail closed. The caller must establish
+history completeness: even a broker stream starting at sequence one may have
+been created after its aggregates. The NATS reader verifies a stable, gap-free
+retained stream without creating consumers or acknowledging messages, but cannot
+prove that unpublished events or earlier deleted streams never existed.
+
+This first API is bounded offline maintenance for one active local,
+unit-partition snapshot binding: at most 10,000 records and 100,000 occurrences /
+64 MiB of canonical history. It intentionally rejects delta folds and histories
+whose publication sequences have gaps. It does not migrate schemas/topologies,
+perform online shadow swaps, or make several independent projections one
+transaction. Keep services stopped if a multi-projection maintenance run fails;
+capture fresh inventories and rerun before resuming them.
 
 Handlers stay thin: most Todo commands are `portable_command!` — shard,
 invoke one domain method, commit Eventual. `todo.create` keeps a `handle:`
@@ -629,6 +735,41 @@ CQRS is the architectural split between write-side aggregates and query-side rea
 
 Published messages are a separate boundary. An aggregate event record is not automatically a domain event. When other services, projections, or transports need a fact or command, create an `OutboxMessage` and commit it with the aggregate. The outbox payload can represent a domain event, integration event, command, or any other transport message.
 
+The outbox stores delivery work, not publication history. Successful delivery
+deletes the row under its active lease. Failed or ambiguous sends retain the row
+for retry or inspection. A crash after transport acceptance but before deletion
+can deliver the same event ID again; consumers must remain idempotent. Event
+history belongs in the event store, and command retry results belong in command
+receipts. Neither depends on retaining delivered outbox rows.
+
+Commands dispatched to another aggregate cell use the same command ledger, but
+with an explicit external dispatch binding. The binding records the logical
+route kind and shard alongside the command identity; it is immutable for that
+reservation and survives lease reclaim and terminal replay. External completion
+updates only the ledger after the returned attempt fence and binding match. It
+does not append local events, write the outbox, or treat the cell's commit as
+proof that an asynchronous read-model projection has completed. A local causal
+commit cannot complete an externally bound reservation, and an external
+completion cannot complete a local reservation. Retained cell-only receipts
+without a gateway binding remain explicit unknowns until a matching gateway
+reservation and trusted completion protocol can be established; they are never
+retrofitted into a different route or silently replayed.
+
+The celld command host reserves that gateway intent before making the cell
+request. The reservation's causation ID and logical route binding must be
+echoed by the trusted cell receipt; a changed command ID, input, causation, or
+route is rejected before it can complete the gateway row. A terminal cell
+receipt is durably recorded in the gateway ledger before the response is
+returned. Status checks current authorization and re-evaluates the durable
+receipt's projection evidence, so an in-memory completed-status cache is never
+the source of truth. An ambiguous transport result remains retryable against
+the same reservation and cell; it does not invoke the local domain handler or
+re-publish the cell's events and outbox.
+
+In v5, `OutboxStore::complete` and `complete_many` remove delivered rows instead
+of retaining `Published` records. Repeating settlement of a removed row returns
+`NotFound`; stale claims on existing rows still return `InvalidState`.
+
 The existing names and serialized fields such as `EventRecord::event_name` remain part of the compatibility contract. Terminology cleanup should clarify usage without renaming stored event records unless a migration path is explicitly designed.
 
 ## Pluggable by Default
@@ -701,6 +842,46 @@ impl TryFrom<&EventRecord> for TodoEvent { /* ... */ }
 // Full Aggregate trait impl (entity accessors + replay logic)
 impl Aggregate for Todo { /* ... */ }
 ```
+
+### Flat events and optimistic updates
+
+With `domain = event`, recorder parameters are the flat outward event body.
+Literal arguments in public transitions also inform generated optimistic
+projections—there is no second status mapping to maintain:
+
+```rust,ignore
+#[sourced(entity, aggregate_type = "review")]
+impl Review {
+    pub fn approve(&mut self, id: String) -> distributed::SourcedResult {
+        // Validate the decision here, before recording it.
+        self.record_status(id, "approved".into())?;
+        Ok(())
+    }
+
+    #[event("review.status_recorded", version = 1, domain = event)]
+    fn record_status(&mut self, id: String, status: String) {
+        self.entity.set_id(id);
+        self.status = status;
+    }
+}
+```
+
+A portable command selecting `domain_commands::Approve` carries the known
+`status = "approved"` into its projection preview. The projection still defines
+which read-model fields it updates; permissions and confirmed events still
+decide what the client can ultimately retain.
+
+Inference recognizes scalar literals, literal string ownership conversions,
+and optional literals using fully qualified standard constructors (for example,
+`::core::option::Option::Some(true)`). Bare `Some`/`None` remain unknown because
+they can be shadowed. Inference preserves numeric types. Computed IDs, clocks,
+variables, arbitrary calls, and unsupported expressions stay unknown. When
+calls to the same recorder disagree, only their shared constants are retained.
+This does not predict authorization or guarantee an event will occur. Snapshot
+events continue to infer known values from recorder state assignments.
+
+See [the executable contract tests](tests/sourced/flat_preview.rs), including
+the generated GraphQL client manifest and conflicting/dynamic-value cases.
 
 ### Durable Stream Identity
 
@@ -876,12 +1057,26 @@ fn upcast_initialized_v1_v2((id, task): InitV1) -> InitV2 {
 }
 
 aggregate!(Todo, entity {
-    "initialized"(id, task, priority) => initialize,
+    "initialized"(id, task, priority), version = 2 => initialize,
     "completed"() => complete(),
 } upcasters [
     ("initialized", 1 => 2, InitV1 => InitV2, upcast_initialized_v1_v2),
 ]);
 ```
+
+Replay requires each event's schema version to match its registered handler
+after upcasting. `#[sourced]` reads this version from `#[event(..., version = N)]`;
+`aggregate!` declares it on the registration as above and must match the
+corresponding `#[digest(..., version = N)]`. Omitted versions default to 1.
+Older events need an explicit upcaster chain to the registered version; future
+versions are rejected. Matching payload layouts do not bypass this check.
+The check runs before payload decoding or handler invocation, including when
+loading only the event tail after a snapshot in a native repository or cell.
+
+**Breaking change:** an `aggregate!` registration for a versioned handler must
+now declare its current version. Histories with unsupported versions fail replay
+instead of being interpreted using the current payload shape. Stored events are
+unchanged; add the appropriate upcasters to read supported older versions.
 
 ## Event Metadata
 
@@ -1133,6 +1328,43 @@ let message = OutboxMessage::encode_for_entity(
 )?;
 ```
 
+### Facts derived by event handlers
+
+An event handler may verify an external result without making another aggregate
+decision—for example, extracting document metadata after an upload. Derive a
+typed fact from the incoming canonical occurrence:
+
+```rust,ignore
+#[derive(serde::Serialize, distributed::DomainEvent)]
+#[domain_event(name = "document.indexed", version = 1)]
+struct DocumentIndexed {
+    document_id: String,
+    word_count: u64,
+}
+
+let indexed = source.derive(
+    "document-indexer",
+    "metadata-v1",
+    &DocumentIndexed { document_id, word_count },
+)?;
+```
+
+The same source, producer, output key and body produce identical canonical bytes
+and an identical event ID. Different outputs or changed bodies have different
+IDs. `indexed.derivation()` identifies the immediate source and producer; the
+aggregate fields retain the original transition's provenance, not an invented
+commit. Timestamp, causation, correlation and trace metadata come from the source.
+Ordinary typed projections can consume the derived fact. Aggregate-snapshot
+projections reject it because it does not establish a new aggregate version.
+
+Publish the canonical bytes using the existing bus API and `indexed.id()` as
+the message ID. Propagate its causal metadata. Acknowledge the incoming delivery
+only after every output publish succeeds; a failure retries the source and may
+republish an accepted prefix with the same IDs. This is at-least-once delivery,
+not an atomic external effect plus publish. Aggregate decisions still use a
+transactional outbox. Bound external reads and make effects idempotent before
+using this pattern.
+
 ### Publishing the Outbox
 
 How a committed row reaches the bus depends on whether a bus is attached to the
@@ -1285,7 +1517,7 @@ in `bus` (no concrete broker dependency).
 
 **Two confirmation thresholds** (do not collapse them):
 
-1. **Producer publish** — when an outbox row may be marked published (SQL commit,
+1. **Producer publish** — when an outbox row may be deleted (SQL commit,
    broker confirm/ack, Knative 2xx, in-memory accept). Unknown outcomes stay retryable.
 2. **Consumer ack** — only after the handler (and optional inbox receipt) committed.
    Never silently ack a handler error.
@@ -1296,6 +1528,46 @@ use distributed::bus::{run_source, RunOptions};
 // Low-level receive loop (facade buses wrap this)
 run_source(service, source, RunOptions::idempotent()).await?;
 ```
+
+## Command contracts
+
+Command semantics live in `distributed::command`, independently of the query
+transport. Use `CommandInput` and `CommandOutput` to describe Serde input/output
+shapes, and `command::{typed_command, Succeeded, Eventual, Atomic, PreparedCommand}`
+to declare and prepare commands. The GraphQL adapter derives its surface from
+those contracts; GraphQL naming restrictions are checked when exposing them.
+
+```rust
+# use distributed::command;
+use distributed::{CommandInput, CommandOutput};
+use distributed::command::{typed_command, Succeeded};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, CommandInput)]
+struct RenameInput { id: String, title: String }
+
+#[derive(Serialize, CommandOutput)]
+struct RenameOutput { id: String }
+
+# fn main() {
+let declaration = typed_command::<RenameInput, Succeeded<RenameOutput>>("todo.rename");
+# }
+```
+
+This is a breaking Rust API change. Replace `GraphqlInput`/`GraphqlOutput`
+with `CommandInput`/`CommandOutput` throughout the DTO's nested types and
+move command imports from `distributed::graphql` to `distributed::command`.
+Manual metadata implementations now use `CommandInputType`/`CommandOutputType`,
+`command_type()`, and `CommandTypeDef`/`CommandTypeField`. The old GraphQL
+command re-exports, metadata types, and derives have been removed.
+
+GraphQL remains the application's UI gateway: it exposes the command contract
+alongside queries and subscriptions. Command handlers describe their data and
+consistency through the core API, independently of where that gateway runs.
+
+`Atomic<M>` continues to obtain its response shape from the relational read
+model and requires the existing transaction proof. Moving command ownership
+does not change Eventual projection confirmation or Atomic response sealing.
 
 ## Microservice Framework (`microsvc`)
 
@@ -1445,6 +1717,42 @@ curl http://localhost:3000/health
 `Session::roles()` only — not a required protocol. Your gateway can inject any
 claim names; handlers read them with `session.get("…")` or map claims to the
 convenience keys at the edge.
+
+### Authenticated cell wait-path metadata
+
+An internal command host can carry a small, explicit set of already-authenticated
+facts across the private cell HTTP boundary. Do not put producer or operation
+claims in `Session`: ordinary cell calls forward only the authenticated user and
+role keys. `CellRequestContext` requires an internal HTTP secret and reserves
+framework identity and transport-control headers from application metadata.
+
+```rust,ignore
+use distributed::command_dispatch::{
+    CellRequestContext, HttpCommandHost, TrustedRequestMetadata,
+};
+
+let metadata = TrustedRequestMetadata::try_from_pairs([
+    ("x-source-kind", "canonical-fact"),
+])?;
+let context = CellRequestContext::new("writer-service", "principal-partition")
+    .with_causation_id("0190a000-0000-7000-8000-000000000001")
+    .with_trusted_metadata(metadata);
+let host = HttpCommandHost::new_internal("http://cell.internal", secret)?;
+let (_status, body) = host
+    .post_cell_wait_path_with_context(
+        "order.submit",
+        "0190a000-0000-7000-8000-000000000002",
+        serde_json::json!({ "order_id": "order-1" }),
+        &session,
+        &context,
+    )
+    .await?;
+```
+
+Metadata names must be canonical lowercase and values are bounded visible HTTP
+text. Public callers cannot authenticate this path by supplying the reserved
+headers themselves; the cell must validate the shared internal secret before
+constructing its typed command identity.
 
 ### gRPC Transport (requires `grpc` feature)
 
@@ -1614,6 +1922,22 @@ let loaded = repo
   PK (same-named columns, or `foreign_key` / `target_foreign_key` in PK order).
   A one-column `foreign_key` on a composite PK is an error, not a silent
   `.first()`.
+- **Unique-key joins:** direct relationships can set
+  `references = "namespace,revision"` alongside
+  `foreign_key = "object_namespace,object_revision"`. The referenced columns
+  must be a complete declared unique key, such as
+  `#[unique(columns = ["namespace", "revision"])]`, on the target of
+  `belongs_to` or the source of `has_many`. Foreign-key columns pair in the
+  declared reference order. This lets a model retain a surrogate primary key
+  for row identity while relating by a domain key. Missing/null foreign keys
+  produce no match; nested target permissions still apply. Omitting `references`
+  selects the primary key. `references` is not supported on `many_to_many`.
+- **Cyclic singular relationships:** use `Option<Box<T>>` for a `belongs_to`
+  field when two models refer to each other. For example,
+  `#[readmodel(belongs_to = "Profile", foreign_key = "id")]`
+  `profile: Option<Box<Profile>>`. The box only gives Rust a finite-sized type;
+  GraphQL still exposes one nullable `Profile`, not a list or embedded JSON
+  column. Ordinary `Option<T>` remains the same singular relationship.
 - **Writes:** `ReadModelWritePlan` / workspace `upsert` + `commit` (same transaction
   as events when staged on `CommitBatch`).
 - **Internal loads:** PK-anchored includes —
@@ -1674,6 +1998,31 @@ distributed = { version = "0.1", features = ["graphql", "postgres"] }
 `distributed::graphql::{naming,sdl}` compile without the feature so
 `distributed schema --format graphql` works in tooling crates.
 
+### Literal text search
+
+Use `_icontains` for a case-insensitive substring search on a String column:
+
+```graphql
+query SearchTodos($q: String! = "") @load @live {
+  todos(where: { title: { _icontains: $q } }, limit: 20) {
+    todo_id
+    title
+  }
+}
+```
+
+A colocated binding can pass `q: searchParam('q')` directly. Callers do not
+construct `%patterns%`: `%`, `_`, backslash, quotes and the escape character
+are literal text. The query engine binds an escaped pattern on both PostgreSQL
+and SQLite. An empty string matches every non-null string; use a bounded query
+and show results only after a submitted search when building a search form.
+
+Case matching follows the database: PostgreSQL uses its configured ILIKE
+behavior; SQLite's default LIKE folds ASCII, not arbitrary Unicode. The browser
+replica therefore leaves local match evaluation uncertain and relies on the
+authorized server result. `_ilike` still accepts deliberate wildcard patterns;
+`_contains` remains the PostgreSQL JSON containment operator.
+
 ### Scope
 
 | In | Out |
@@ -1689,9 +2038,8 @@ distributed = { version = "0.1", features = ["graphql", "postgres"] }
 ### Mount on a service
 
 ```rust,ignore
-use distributed::graphql::{
-    claim, col, read, typed_command, Eventual, GraphqlEngine,
-};
+use distributed::command::{typed_command, Eventual};
+use distributed::graphql::{claim, col, read, GraphqlEngine};
 use distributed::microsvc::{Routes, Service};
 
 let routes = Routes::new()
@@ -1761,6 +2109,12 @@ ModelPermissions::new()
 
 Row predicates can bind session claims (`claim("x-user-id")`, …) so multi-tenant
 RLS lives in the engine, not ad-hoc handler SQL.
+
+With the causal protocol enabled, required session presets must be present and
+valid for their declared codecs before execution. Missing or malformed values
+return `BAD_REQUEST` for both ordinary and streaming requests, without running
+resolvers or issuing a partial protocol envelope. The error does not disclose
+claim names or values; configure the identity mapping to supply those inputs.
 
 ### Identity (first-class OIDC)
 
@@ -2092,6 +2446,37 @@ a smaller target: model fields, event methods, handler bodies, and projection
 shapes. Boilerplate service setup, manifest discovery, schema output, and GitOps
 artifacts stay deterministic.
 
+For an existing typed `Service`, derive the logical application from its command
+inventory and the same full GraphQL `Surface` used by the runtime:
+
+```rust,ignore
+let surface = distributed::SurfaceSpec::from_surface("catalog", &full_surface)?;
+let application = service.application("catalog", surface)?;
+let manifest = application.manifest();
+```
+
+Command namespaces such as `orders.submit` supply module names; there is no
+second module list to maintain. Assembly rejects commands missing from the
+Surface or exposed by the Surface without a Service owner. Role-selected client
+exports remain authorization views of that full contract. Complete application
+manifests are bounded at 4 MiB; each opaque JSON contract remains bounded at
+1 MiB. A generated Surface contract uses the complete-manifest budget rather
+than the opaque-value cap; its typed contents and the existing collection,
+string and nesting limits are still validated. The complete artifact, including
+all surfaces and module inventories, must fit within 4 MiB.
+
+An event-driven policy that emits through another aggregate can explicitly carry
+the incoming command's causal identity before recording its events:
+
+```rust,ignore
+ctx.inherit_causation(&mut downstream)?;
+downstream.record(observation)?;
+```
+
+This requires an incoming causation ID and does not manufacture one for external
+events. NATS preserves the message's payload content type and keeps reserved
+transport headers out of user metadata across delivery.
+
 ```bash
 cargo install distributed_cli            # installs `distributed`
 
@@ -2111,6 +2496,17 @@ cargo test
 distributed describe                  # print the ApplicationManifest as JSON
 distributed schema --dialect postgres # render migration SQL from read models
 ```
+
+Application manifest wire version 2 stores module declarations and selected
+Surface contracts without repeating top-level `commands`, `events`, `models`,
+or `projections`. The Rust `ApplicationManifest` decoder reconstructs those
+inventories and validates their ownership; its convenience fields are unchanged.
+Portable artifacts remain bounded to 4 MiB. Version 1 artifacts must be
+regenerated with the matching CLI; they are not accepted as version 2.
+
+Modeled projection contracts [share repeated operations and selector schemas](docs/compact-projection-contracts.md)
+when smaller, preserving every current and retained event selector within the
+same manifest budget. Runtime program identities and execution are unchanged.
 
 For a full application, run `distributed build` or `distributed dev` from its
 Cargo workspace root. The CLI discovers the typed application, runtime binary,

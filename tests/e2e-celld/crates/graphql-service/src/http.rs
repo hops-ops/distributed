@@ -16,7 +16,8 @@ use axum::{Json, Router};
 use distributed::bus::{CelldQueueEnvelope, CelldQueueRelayHandler, CELLD_QUEUE_RELAY_PATH};
 use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
 use distributed::command_dispatch::SharedCommandHost;
-use distributed::graphql::graphql_router_with_host;
+use distributed::gateway::{native::*, *};
+use distributed::graphql::identity::OidcGatewayProvider;
 use distributed::microsvc::{HandlerError, Service, Session};
 use serde_json::{json, Value};
 
@@ -91,6 +92,8 @@ pub async fn serve(
     service: Arc<Service>,
     host: SharedCommandHost,
     addr: &str,
+    public_origin: &str,
+    ui_origin: &str,
     queue_relay: CelldQueueRelayHandler,
     internal_secret: InternalHttpSecret,
 ) -> Result<(), std::io::Error> {
@@ -110,15 +113,13 @@ pub async fn serve(
         "graphql": true,
         "commands": commands,
     });
-    let mut app = Router::new()
-        .route(
-            "/health",
-            get(move || {
-                let body = health_body.clone();
-                async move { Json(body) }
-            }),
-        )
-        .merge(graphql_router_with_host(engine, host));
+    let mut app = Router::new().route(
+        "/health",
+        get(move || {
+            let body = health_body.clone();
+            async move { Json(body) }
+        }),
+    );
     let mut internal = Router::new()
         .route(
             "/zitadel.ingress.v1",
@@ -158,6 +159,91 @@ pub async fn serve(
         require_internal,
     )));
 
+    let capabilities = GraphqlCapabilities {
+        queries: true,
+        commands: true,
+        live: true,
+    };
+    let mut routes = vec![
+        Route::new("graphql", RoutePath::prefix("/graphql"), "graphql"),
+        Route::new("ui", RoutePath::prefix("/"), "ui"),
+    ];
+    for path in [
+        "/health",
+        "/zitadel.ingress.v1",
+        "/zitadel.scrape.v1",
+        CELLD_QUEUE_RELAY_PATH,
+    ] {
+        routes.push(Route::new(
+            format!("service-{}", routes.len()),
+            RoutePath::exact(path),
+            "service",
+        ));
+    }
+    for command in service.command_names() {
+        let path = RoutePath::exact(format!("/{command}"));
+        if !routes.iter().any(|route| route.path == path) {
+            routes.push(Route::new(
+                format!("closed-{}", routes.len()),
+                path,
+                "closed",
+            ));
+        }
+    }
+    let gateway = GatewayConfig {
+        bindings: vec![
+            Binding::new(
+                "graphql",
+                BindingKind::Graphql {
+                    executor: GraphqlExecutor::Embedded,
+                    capabilities,
+                    delivery: DeliveryCapabilities::default(),
+                    schema_extensions: vec![],
+                },
+            ),
+            Binding::new(
+                "ui",
+                BindingKind::UiProxy {
+                    origin: ui_origin.into(),
+                },
+            ),
+            Binding::new("service", BindingKind::Handler),
+            Binding::new("closed", BindingKind::Handler),
+        ],
+        routes,
+    }
+    .build()
+    .map_err(std::io::Error::other)?;
+    let auth = if let Some(config) = engine.identity_config().oidc.clone() {
+        let provider = Arc::new(OidcGatewayProvider::new(config, "e2e-celld-oidc-v1"));
+        NativeAuth::new(move |credentials| {
+            let provider = provider.clone();
+            async move { provider.authenticate(&credentials).await }
+        })
+    } else {
+        NativeAuth::anonymous()
+    };
+    // The remote command host and secret-protected Queue relay keep their
+    // existing owners. UI, auth, HMR and lifecycle requests use this public edge.
+    let app = NativeGateway::new(
+        gateway,
+        NativeOptions::new(public_origin),
+        [
+            (
+                "graphql".into(),
+                NativeBinding::Graphql(GraphqlBinding::Embedded(
+                    EmbeddedGraphql::new(engine, Some(host), capabilities)
+                        .map_err(std::io::Error::other)?,
+                )),
+            ),
+            ("ui".into(), NativeBinding::UiProxy { websocket: true }),
+            ("service".into(), NativeBinding::Handler(app)),
+            ("closed".into(), NativeBinding::Handler(Router::new())),
+        ],
+        auth,
+    )
+    .map_err(std::io::Error::other)?
+    .router();
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await
 }

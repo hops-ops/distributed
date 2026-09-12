@@ -985,9 +985,7 @@ fn input_codec_compatible(
             (type_name, codec),
             ("Int", "int32") | ("BigInt", "json_number_precision_limited")
         ),
-        // Both numeric command codecs admit negative values. Without a
-        // non-negative refinement in the frozen manifest, neither proves U64.
-        ManifestProjectionValueType::U64 => false,
+        ManifestProjectionValueType::U64 => type_name == "BigInt" && unsigned_codec(codec),
         ManifestProjectionValueType::F64 => type_name == "Float" && codec == "float64",
         ManifestProjectionValueType::String => matches!(
             (type_name, codec),
@@ -1004,13 +1002,17 @@ fn codec_compatible(codec: &str, expected: &ManifestProjectionValueType) -> bool
         ManifestProjectionValueType::I64 => {
             matches!(codec, "int32" | "json_number_precision_limited")
         }
-        ManifestProjectionValueType::U64 => false,
+        ManifestProjectionValueType::U64 => unsigned_codec(codec),
         ManifestProjectionValueType::F64 => codec == "float64",
         ManifestProjectionValueType::String | ManifestProjectionValueType::Enum(_) => {
             codec == "string"
         }
         ManifestProjectionValueType::Json => codec == "json",
     }
+}
+
+fn unsigned_codec(codec: &str) -> bool {
+    matches!(codec, "uint8" | "uint16" | "uint32" | "uint64_safe_integer")
 }
 
 fn constant_compatible(

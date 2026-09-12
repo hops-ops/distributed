@@ -32,3 +32,9 @@ export type {
 export { ReplicaCommandRuntimeError } from './errors.js';
 export { replicaCommandProjectedLifecycleOf } from './lifecycle.js';
 export { createReplicaCommandRuntime } from './create.js';
+
+export type {
+	ReplicaLazyCommandCatalog,
+	ReplicaLazyCommandModule,
+	ReplicaLazyCommandRuntime
+} from './lazy.js';

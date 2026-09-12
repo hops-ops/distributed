@@ -191,7 +191,10 @@ export function subscribe<
 				handlers.onComplete?.();
 				break;
 			case 'ping':
-				socket.send(JSON.stringify({ type: 'pong' }));
+				socket.send(JSON.stringify({
+					type: 'pong',
+					...(message.payload === undefined ? {} : { payload: message.payload })
+				}));
 				break;
 			case 'connection_error':
 				handlers.onError?.(message.payload ?? 'connection error');

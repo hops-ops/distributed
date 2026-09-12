@@ -1,9 +1,10 @@
 use std::any::TypeId;
 
 use super::*;
-use crate::graphql::command_contract::{CommandEffects, TypedCommandContract};
+use crate::command::{CommandEffects, TypedCommandContract};
 use crate::graphql::commands::TypedCommandInventory;
-use crate::graphql::{GraphqlTypeDef, GraphqlTypeField};
+
+use crate::command::{CommandTypeDef, CommandTypeField};
 use crate::table::{
     ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
 };
@@ -109,6 +110,16 @@ fn modeled_direct_projection(
     schema: TableSchema,
     options: DirectModeledBinding<'_>,
 ) -> SurfaceModeledProjection {
+    modeled_projection_with_outputs(owner, program_name, epoch, vec![schema], options)
+}
+
+fn modeled_projection_with_outputs(
+    owner: &str,
+    program_name: &str,
+    epoch: &str,
+    schemas: Vec<TableSchema>,
+    options: DirectModeledBinding<'_>,
+) -> SurfaceModeledProjection {
     use crate::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
     use crate::projection::placement::{
         DirectProjectionPlacement, ProjectionBinding, ProjectionExecutionClass,
@@ -125,8 +136,6 @@ fn modeled_direct_projection(
         DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
     };
 
-    let model_name = schema.model_name.clone();
-    let table_name = schema.table_name.clone();
     let selector = ProjectionEventSelector::try_new(
         1,
         format!("{program_name}.changed"),
@@ -140,18 +149,26 @@ fn modeled_direct_projection(
         DOMAIN_EVENT_BODY_CODEC_VERSION,
     )
     .unwrap();
-    let value = ProjectionExpression::constant(ProjectionValue::string("row-1"));
-    let operation = ProjectionOperation::try_new(
-        format!("{program_name}-upsert"),
-        0,
-        ProjectionMutationKind::Upsert,
-        ProjectionTarget::try_new(&model_name, &table_name).unwrap(),
-        vec![ProjectionKeyField::try_new(0, "id", value.clone()).unwrap()],
-        vec![ProjectionField::try_new(0, "id", ProjectionAssignment::Set(value)).unwrap()],
-        Vec::new(),
-        Vec::new(),
-    )
-    .unwrap();
+    assert!(!schemas.is_empty(), "modeled projection requires an output");
+    let operations = schemas
+        .iter()
+        .enumerate()
+        .map(|(index, schema)| {
+            let value =
+                ProjectionExpression::constant(ProjectionValue::string(format!("row-{index}")));
+            ProjectionOperation::try_new(
+                format!("{program_name}-upsert-{index}"),
+                index.try_into().unwrap(),
+                ProjectionMutationKind::Upsert,
+                ProjectionTarget::try_new(&schema.model_name, &schema.table_name).unwrap(),
+                vec![ProjectionKeyField::try_new(0, "id", value.clone()).unwrap()],
+                vec![ProjectionField::try_new(0, "id", ProjectionAssignment::Set(value)).unwrap()],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
     let partition = if options.dynamic_partition {
         ProjectionPartition::Expression(ProjectionExpression::constant(ProjectionValue::string(
             "tenant-1",
@@ -163,10 +180,7 @@ fn modeled_direct_projection(
         program_name,
         1,
         partition,
-        vec![
-            ProjectionArm::try_new(format!("{program_name}-arm"), selector, vec![operation])
-                .unwrap(),
-        ],
+        vec![ProjectionArm::try_new(format!("{program_name}-arm"), selector, operations).unwrap()],
     )
     .unwrap();
     let descriptor = TestProjectionDescriptor(program.clone());
@@ -179,7 +193,13 @@ fn modeled_direct_projection(
     let source =
         ProjectionSourceBinding::try_new("test-domain", "ordered-domain-events", 1).unwrap();
     let owner = ProjectionOwner::try_new(owner).unwrap();
-    let outputs = vec![ProjectionOutput::try_new(model_name, table_name, schema).unwrap()];
+    let outputs = schemas
+        .into_iter()
+        .map(|schema| {
+            ProjectionOutput::try_new(schema.model_name.clone(), schema.table_name.clone(), schema)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     let binding = if options.eventual {
         ProjectionBinding::from_eventual_program(
             &program,
@@ -224,7 +244,7 @@ fn modeled_direct_projection(
 fn test_command(
     command_name: &str,
     field_name: &str,
-    output: GraphqlTypeDef,
+    output: CommandTypeDef,
 ) -> TypedCommandContract {
     let input_type_id = TypeId::of::<String>();
     let output_type_id = TypeId::of::<()>();
@@ -232,9 +252,10 @@ fn test_command(
         name: command_name.into(),
         field_name: field_name.into(),
         roles: Vec::new(),
-        input: GraphqlTypeDef::new(
+        input: CommandTypeDef::new(
             "TestCommandInput",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -266,9 +287,10 @@ fn test_inventory(
 #[test]
 fn causal_surface_commands_accept_modeled_event_selectors_but_not_empty_authority() {
     let output = || {
-        GraphqlTypeDef::new(
+        CommandTypeDef::new(
             "CausalPayload",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -635,6 +657,7 @@ fn query_protocol_uses_exact_modeled_physical_topology() {
             ..DirectModeledBinding::active("exact-physical-topology")
         },
     );
+    let semantic_program_id = modeled.program_id().to_string();
     let surface = build_surface(&[model], &SurfaceOptions::sqlite())
         .unwrap()
         .with_projection_owners([SurfaceDirectProjection::new("exact-modeled-owner")
@@ -651,6 +674,11 @@ fn query_protocol_uses_exact_modeled_physical_topology() {
     assert_eq!(
         runtime.model_has_static_partition("ExactTopology"),
         Some(true)
+    );
+    assert_eq!(
+        runtime.public_projection_for_model("ExactTopology"),
+        Some(semantic_program_id.as_str()),
+        "causal observations use the active semantic program identity"
     );
 }
 
@@ -763,6 +791,42 @@ fn query_protocol_merges_compatible_active_models_without_inventing_static_parti
     }
 }
 
+#[cfg(feature = "graphql")]
+#[test]
+fn query_protocol_preserves_one_semantic_identity_for_each_fanout_model() {
+    let first = direct_model("FirstFanout", "first_fanout");
+    let second = direct_model("SecondFanout", "second_fanout");
+    let modeled = modeled_projection_with_outputs(
+        "fanout-owner",
+        "fanout-program",
+        "fanout-v1",
+        vec![first.clone(), second.clone()],
+        DirectModeledBinding {
+            eventual: true,
+            ..DirectModeledBinding::active("fanout-physical-owner")
+        },
+    );
+    let semantic_program_id = modeled.program_id().to_string();
+    let surface = build_surface(&[first, second], &SurfaceOptions::sqlite())
+        .unwrap()
+        .with_projectors([SurfaceProjector::new("fanout-owner").modeled(modeled)])
+        .unwrap();
+
+    let runtime = crate::graphql::query_protocol::QueryProtocolRuntime::compile(&surface).unwrap();
+    for model in ["FirstFanout", "SecondFanout"] {
+        assert_eq!(
+            runtime.public_projection_for_model(model),
+            Some(semantic_program_id.as_str()),
+            "each fan-out model must retain the program identity that authored it"
+        );
+    }
+    assert_eq!(
+        runtime.public_projection_for_model("UnknownModel"),
+        None,
+        "unknown models cannot mint a causal proof identity"
+    );
+}
+
 #[test]
 fn selected_surfaces_reject_command_and_projector_reattachment() {
     let full = build_surface(&[orders()], &SurfaceOptions::sqlite()).unwrap();
@@ -779,8 +843,14 @@ fn selected_surfaces_reject_command_and_projector_reattachment() {
         .contains("before authorization selection"));
 
     let grants_by_role = BTreeMap::from([("user".into(), grants)]);
-    let application =
-        surface_for_application(&full, "web", &["user".into()], &["user".into()], &grants_by_role).unwrap();
+    let application = surface_for_application(
+        &full,
+        "web",
+        &["user".into()],
+        &["user".into()],
+        &grants_by_role,
+    )
+    .unwrap();
     assert!(application
         .clone()
         .with_typed_commands(&TypedCommandInventory::empty())
@@ -825,9 +895,10 @@ fn role_policy_rejects_non_finite_and_hides_js_unsafe_integers() {
 
 #[test]
 fn command_surface_rejects_duplicate_mutation_field_ids() {
-    let output = GraphqlTypeDef::new(
+    let output = CommandTypeDef::new(
         "TestCommandPayload",
-        vec![GraphqlTypeField {
+        vec![CommandTypeField {
+            unsigned_integer: None,
             name: "id".into(),
             type_name: "String".into(),
             nullable: false,
@@ -852,7 +923,7 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
     let empty = test_inventory([test_command(
         "order.empty",
         "order_empty",
-        GraphqlTypeDef::new("EmptyPayload", Vec::new()),
+        CommandTypeDef::new("EmptyPayload", Vec::new()),
     )]);
     let error = build_surface(&[orders()], &SurfaceOptions::sqlite())
         .unwrap()
@@ -863,15 +934,16 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
     let nested = test_inventory([test_command(
         "order.nested_empty",
         "order_nested_empty",
-        GraphqlTypeDef::new(
+        CommandTypeDef::new(
             "OuterPayload",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "inner".into(),
                 type_name: "InnerPayload".into(),
                 nullable: false,
                 list: false,
                 item_nullable: false,
-                nested: Some(Box::new(GraphqlTypeDef::new("InnerPayload", Vec::new()))),
+                nested: Some(Box::new(CommandTypeDef::new("InnerPayload", Vec::new()))),
             }],
         ),
     )]);
@@ -884,9 +956,10 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
     let collision = test_inventory([test_command(
         "order.collision",
         "order_collision",
-        GraphqlTypeDef::new(
+        CommandTypeDef::new(
             "OrderView",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -931,6 +1004,7 @@ fn projected_output_reuse_and_sdl_emission_use_the_same_exact_predicate() {
     let one_string_field = |name: &str| SurfaceTypeDef {
         name: name.into(),
         fields: vec![SurfaceTypeField {
+            unsigned_integer: None,
             name: "order_id".into(),
             type_name: "String".into(),
             nullable: false,
@@ -997,6 +1071,7 @@ fn role_surface_legacy_effects_never_become_v2_client_authority() {
         name: "UpdateOrderInput".into(),
         fields: vec![
             SurfaceTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -1005,6 +1080,7 @@ fn role_surface_legacy_effects_never_become_v2_client_authority() {
                 nested: None,
             },
             SurfaceTypeField {
+                unsigned_integer: None,
                 name: "customer_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -1030,6 +1106,7 @@ fn role_surface_legacy_effects_never_become_v2_client_authority() {
         output: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "AssignCustomerPayload".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -1064,6 +1141,7 @@ fn role_surface_legacy_effects_never_become_v2_client_authority() {
         output: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "ApplyPresetPayload".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -1303,6 +1381,7 @@ fn relationship_only_when_target_on_surface() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "children".into(),
             kind: RelationshipKind::HasMany,
             target_model: "ChildView".into(),
@@ -1381,6 +1460,7 @@ fn surface_rejects_relationship_and_generated_aggregate_field_collisions() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "children".into(),
             kind: RelationshipKind::HasMany,
             target_model: "CollisionChild".into(),
@@ -1425,6 +1505,7 @@ fn relationship_keys_canonicalize_rust_field_names_to_graphql_columns() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "account".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "AccountView".into(),
@@ -1482,6 +1563,7 @@ fn pool_free_surface_rejects_a_partial_composite_belongs_to_key() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "composite".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "CompositeView".into(),
@@ -1518,6 +1600,7 @@ fn row_policy_rejects_a_partial_composite_m2m_mapping() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "labels".into(),
             kind: RelationshipKind::ManyToMany,
             target_model: "OperationalLabel".into(),
@@ -1622,6 +1705,7 @@ fn belongs_to_onto_composite_identity_is_selected_when_keys_are_paired() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "composite".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "CompositeView".into(),
@@ -1673,6 +1757,7 @@ fn has_many_onto_composite_child_is_selected_on_the_parent() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "projects".into(),
             kind: RelationshipKind::HasMany,
             target_model: "ProjectView".into(),
@@ -1748,6 +1833,7 @@ fn has_many_from_composite_parent_is_selected() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "files".into(),
             kind: RelationshipKind::HasMany,
             target_model: "ProjectFileView".into(),
@@ -1862,6 +1948,7 @@ fn constant_validation_uses_exact_wire_scalar_domains() {
         output: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "ConstantPayload".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "ok".into(),
                 type_name: "Boolean".into(),
                 nullable: false,
@@ -1924,6 +2011,7 @@ fn missing_surface_primary_key_column_is_a_configuration_error_not_a_panic() {
         output: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "PatchOrderPayload".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,

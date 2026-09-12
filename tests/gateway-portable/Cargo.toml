@@ -1,0 +1,43 @@
+[package]
+name = "gateway-portable-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+default = ["gateway"]
+gateway = ["distributed/gateway"]
+gateway-graphql = ["gateway", "distributed/gateway-graphql"]
+gateway-delivery = ["gateway-graphql", "distributed/gateway-delivery"]
+
+[dependencies]
+distributed = { path = "../..", default-features = false }
+
+[dev-dependencies]
+serde_json = "1"
+
+[[test]]
+name = "gateway_routing"
+path = "../gateway_routing.rs"
+
+[[test]]
+name = "gateway_extensions"
+path = "../gateway_extensions.rs"
+
+[[test]]
+name = "gateway_auth"
+path = "../gateway_auth.rs"
+
+[[test]]
+name = "gateway_graphql_operation"
+path = "../gateway_graphql_operation.rs"
+
+[[test]]
+name = "edge_query_delivery"
+path = "../edge_query_delivery.rs"
+
+[[test]]
+name = "gateway_mounts"
+path = "../gateway_mounts.rs"

@@ -28,6 +28,8 @@ use super::{retryable, MessagePublisher, TransportError};
 const MESSAGE_ID_HEADER: &str = "Nats-Msg-Id";
 /// Header carrying the canonical message kind.
 const MESSAGE_KIND_HEADER: &str = "X-Sourced-Kind";
+/// Header carrying the canonical payload media type.
+const CONTENT_TYPE_HEADER: &str = "Content-Type";
 
 /// Publishes canonical messages to a NATS JetStream subject.
 ///
@@ -75,13 +77,20 @@ impl MessagePublisher for NatsPublisher {
     async fn publish(&self, mut message: Message) -> Result<(), TransportError> {
         let subject = self.subject(&message);
         let mut headers = async_nats::HeaderMap::new();
+        for (key, value) in &message.metadata {
+            if [MESSAGE_ID_HEADER, MESSAGE_KIND_HEADER, CONTENT_TYPE_HEADER]
+                .iter()
+                .any(|reserved| key.eq_ignore_ascii_case(reserved))
+            {
+                continue;
+            }
+            headers.insert(key.as_str(), value.as_str());
+        }
         if let Some(id) = message.id() {
             headers.insert(MESSAGE_ID_HEADER, id);
         }
         headers.insert(MESSAGE_KIND_HEADER, message.kind.as_str());
-        for (key, value) in &message.metadata {
-            headers.insert(key.as_str(), value.as_str());
-        }
+        headers.insert(CONTENT_TYPE_HEADER, message.content_type.as_str());
 
         // `message` is owned and dropped here, so move its payload out instead of
         // cloning. `Bytes::from(Vec<u8>)` takes ownership of the buffer (no copy).
@@ -243,13 +252,14 @@ impl NatsReceived {
                     .map(|value| (key.to_string(), value.to_string()))
             })
             .collect();
-        let message = message_from_wire(
+        let mut message = message_from_wire(
             name,
             payload,
             Some(MESSAGE_ID_HEADER),
             MESSAGE_KIND_HEADER,
             headers,
         );
+        take_content_type(&mut message);
         let ordered = jetstream_ordered(&raw);
         Self {
             raw,
@@ -271,6 +281,25 @@ impl NatsReceived {
                 .await
                 .map_err(|err| retryable("nats ack_with", err)),
         }
+    }
+}
+
+/// Select the first inbound content type and remove every reserved spelling
+/// from user-visible metadata.
+fn take_content_type(message: &mut Message) {
+    let mut content_type = None;
+    message.metadata.retain(|(key, value)| {
+        if key.eq_ignore_ascii_case(CONTENT_TYPE_HEADER) {
+            if content_type.is_none() {
+                content_type = Some(value.clone());
+            }
+            false
+        } else {
+            true
+        }
+    });
+    if let Some(content_type) = content_type {
+        message.content_type = content_type;
     }
 }
 
@@ -307,5 +336,27 @@ impl ReceivedMessage for NatsReceived {
 
     async fn park(self, _reason: &str) -> Result<(), TransportError> {
         self.settle(AckKind::Term).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::MessageKind;
+
+    #[test]
+    fn content_type_selection_removes_every_case_variant() {
+        let mut message = Message::new("example.recorded", MessageKind::Event, Vec::new())
+            .with_metadata("Content-Type", "application/vnd.example+binary")
+            .with_metadata("x-correlation-id", "corr-1")
+            .with_metadata("content-type", "application/json");
+
+        take_content_type(&mut message);
+
+        assert_eq!(message.content_type, "application/vnd.example+binary");
+        assert_eq!(
+            message.metadata,
+            vec![("x-correlation-id".into(), "corr-1".into())]
+        );
     }
 }

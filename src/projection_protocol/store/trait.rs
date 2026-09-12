@@ -15,6 +15,31 @@ pub enum ProjectionChangeRead {
 
 /// Adapter contract for atomic causal projection persistence.
 pub(crate) trait ProjectionProtocolStore: Send + Sync {
+    #[cfg(feature = "graphql")]
+    fn projection_rebuild_records<'a>(
+        &'a self,
+        _context: &'a crate::projection::rebuild::RebuildContext,
+    ) -> impl Future<Output = Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError>> + Send + 'a
+    {
+        async {
+            Err(ProjectionProtocolError::InvalidBatch(
+                "this store does not support snapshot projection rebuilds".into(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "graphql")]
+    fn commit_projection_rebuild(
+        &self,
+        _plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> impl Future<Output = Result<usize, ProjectionProtocolError>> + Send + '_ {
+        async {
+            Err(ProjectionProtocolError::InvalidBatch(
+                "this store does not support snapshot projection rebuilds".into(),
+            ))
+        }
+    }
+
     /// Install model-wide causal ownership before projector traffic begins.
     /// This bootstrap marker closes the absent-row race with legacy/raw write
     /// plans; per-partition ownership is still verified inside each commit.

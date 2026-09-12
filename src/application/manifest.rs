@@ -8,13 +8,18 @@ use super::identity::{canonical_json, sha256_fingerprint, LogicalId};
 use super::module::{ModelSpec, Module, ModuleManifest, ProjectionSpec, SurfaceSpec};
 
 /// Wire/schema version for the complete logical application manifest.
-pub const APPLICATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const APPLICATION_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// Bounds applied before a portable application artifact is accepted.
-pub const MAX_APPLICATION_MANIFEST_BYTES: usize = 1024 * 1024;
+///
+/// A complete manifest carries authoritative module declarations and selected
+/// Surface contracts. Flattened inventories are reconstructed, not serialized.
+pub const MAX_APPLICATION_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_MANIFEST_COLLECTION_ITEMS: usize = 4096;
 pub const MAX_MANIFEST_STRING_BYTES: usize = 4096;
-pub const MAX_MANIFEST_JSON_BYTES: usize = 256 * 1024;
+/// Per-value JSON bound. Several independently bounded contracts may comprise
+/// one application manifest, but no opaque value receives the whole budget.
+pub const MAX_MANIFEST_JSON_BYTES: usize = 1024 * 1024;
 pub const MAX_MANIFEST_JSON_DEPTH: usize = 32;
 /// Reserved manifest extension carrying the framework release that compiled it.
 pub const FRAMEWORK_COMPATIBILITY_EXTENSION_ID: &str = "distributed.framework";
@@ -101,8 +106,7 @@ impl ApplicationExtension {
 /// executable handlers are intentionally absent. Those belong to named
 /// schema/deployment/runtime layers and cannot become portable application
 /// identity by accident.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ApplicationManifest {
     /// This field is required during decoding: canonical input may not omit
     /// the explicit schema version and receive a legacy default.
@@ -110,13 +114,13 @@ pub struct ApplicationManifest {
     pub name: String,
     #[serde(default)]
     pub modules: Vec<ModuleManifest>,
-    #[serde(default)]
+    #[serde(skip_serializing)]
     pub commands: Vec<CommandSpec>,
-    #[serde(default)]
+    #[serde(skip_serializing)]
     pub events: Vec<super::command::EventSpec>,
-    #[serde(default)]
+    #[serde(skip_serializing)]
     pub projections: Vec<ProjectionSpec>,
-    #[serde(default)]
+    #[serde(skip_serializing)]
     pub models: Vec<ModelSpec>,
     #[serde(default)]
     pub surfaces: Vec<SurfaceSpec>,
@@ -130,7 +134,123 @@ pub struct ApplicationManifest {
     pub provenance: ManifestProvenance,
 }
 
+/// Versioned portable authority. Derived inventories are deliberately absent:
+/// accepting them would introduce a second, potentially conflicting authority.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestWire {
+    schema_version: u32,
+    name: String,
+    #[serde(default)]
+    modules: Vec<ModuleManifest>,
+    #[serde(default)]
+    surfaces: Vec<SurfaceSpec>,
+    #[serde(default)]
+    required_capabilities: Vec<String>,
+    #[serde(default)]
+    extensions: Vec<ApplicationExtension>,
+    #[serde(default)]
+    fingerprints: ManifestFingerprint,
+    #[serde(default)]
+    provenance: ManifestProvenance,
+}
+
+impl<'de> Deserialize<'de> for ApplicationManifest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ManifestWire::deserialize(deserializer)?;
+        let mut manifest = Self {
+            schema_version: wire.schema_version,
+            name: wire.name,
+            modules: wire.modules,
+            surfaces: wire.surfaces,
+            required_capabilities: wire.required_capabilities,
+            extensions: wire.extensions,
+            fingerprints: wire.fingerprints,
+            provenance: wire.provenance,
+            commands: Vec::new(),
+            events: Vec::new(),
+            projections: Vec::new(),
+            models: Vec::new(),
+        };
+        manifest
+            .reconstruct_inventories()
+            .map_err(serde::de::Error::custom)?;
+        Ok(manifest)
+    }
+}
+
 impl ApplicationManifest {
+    fn validate_inventory_expansion(&self) -> ApplicationResult<()> {
+        // Check expansion before cloning any nested declarations. Duplicate
+        // declarations still consume the reconstruction budget.
+        validate_collection_len("modules", self.modules.len())?;
+        validate_collection_len("surfaces", self.surfaces.len())?;
+        for (kind, count) in [
+            (
+                "derived commands",
+                self.modules.iter().map(|m| m.commands.len()).sum(),
+            ),
+            (
+                "derived events",
+                self.modules.iter().map(|m| m.events.len()).sum(),
+            ),
+            (
+                "derived projections",
+                self.modules
+                    .iter()
+                    .map(|m| m.projections.len())
+                    .chain(self.surfaces.iter().map(|s| s.projections.len()))
+                    .sum(),
+            ),
+            (
+                "derived models",
+                self.modules
+                    .iter()
+                    .map(|m| m.models.len())
+                    .chain(self.surfaces.iter().map(|s| s.models.len()))
+                    .sum(),
+            ),
+        ] {
+            validate_collection_len(kind, count)?;
+        }
+        Ok(())
+    }
+
+    fn reconstruct_inventories(&mut self) -> ApplicationResult<()> {
+        self.validate_inventory_expansion()?;
+        self.commands = dedup_commands(
+            self.modules
+                .iter()
+                .flat_map(|m| m.commands.iter().cloned())
+                .collect(),
+        )?;
+        self.events = dedup_events(
+            self.modules
+                .iter()
+                .flat_map(|m| m.events.iter().cloned())
+                .collect(),
+        )?;
+        self.projections = dedup_projections(
+            self.modules
+                .iter()
+                .flat_map(|m| m.projections.iter().cloned())
+                .chain(
+                    self.surfaces
+                        .iter()
+                        .flat_map(|s| s.projections.iter().cloned()),
+                )
+                .collect(),
+        )?;
+        self.models = dedup_models(
+            self.modules
+                .iter()
+                .flat_map(|m| m.models.iter().cloned())
+                .chain(self.surfaces.iter().flat_map(|s| s.models.iter().cloned()))
+                .collect(),
+        )?;
+        Ok(())
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             schema_version: APPLICATION_MANIFEST_SCHEMA_VERSION,
@@ -256,7 +376,10 @@ impl ApplicationManifest {
     }
 
     pub fn module_ids(&self) -> Vec<&str> {
-        self.modules.iter().map(|module| module.id.as_str()).collect()
+        self.modules
+            .iter()
+            .map(|module| module.id.as_str())
+            .collect()
     }
 
     /// Return exact deterministic manifest bytes, including the explicit
@@ -356,6 +479,7 @@ impl ApplicationManifest {
             });
         }
         LogicalId::try_new("application", self.name.clone())?;
+        self.validate_inventory_expansion()?;
         validate_collection_len("modules", self.modules.len())?;
         validate_collection_len("commands", self.commands.len())?;
         validate_collection_len("events", self.events.len())?;
@@ -363,15 +487,26 @@ impl ApplicationManifest {
         validate_collection_len("models", self.models.len())?;
         validate_collection_len("surfaces", self.surfaces.len())?;
         validate_collection_len("extensions", self.extensions.len())?;
-        validate_unique_ids("module", self.modules.iter().map(|module| module.id.clone()))?;
-        validate_unique_ids("command", self.commands.iter().map(|command| command.id.clone()))?;
+        validate_unique_ids(
+            "module",
+            self.modules.iter().map(|module| module.id.clone()),
+        )?;
+        validate_unique_ids(
+            "command",
+            self.commands.iter().map(|command| command.id.clone()),
+        )?;
         validate_unique_ids("event", self.events.iter().map(|event| event.name.clone()))?;
         validate_unique_ids(
             "projection",
-            self.projections.iter().map(|projection| projection.id.clone()),
+            self.projections
+                .iter()
+                .map(|projection| projection.id.clone()),
         )?;
         validate_unique_ids("model", self.models.iter().map(|model| model.id.clone()))?;
-        validate_unique_ids("surface", self.surfaces.iter().map(|surface| surface.id.clone()))?;
+        validate_unique_ids(
+            "surface",
+            self.surfaces.iter().map(|surface| surface.id.clone()),
+        )?;
 
         let model_ids = self
             .models
@@ -480,13 +615,19 @@ impl ApplicationManifest {
         self.modules.sort_by(|left, right| left.id.cmp(&right.id));
         self.commands.sort_by(|left, right| left.id.cmp(&right.id));
         self.events.sort_by(|left, right| {
-            (left.name.as_str(), left.version, left.body_fingerprint.as_str()).cmp(&(
-                right.name.as_str(),
-                right.version,
-                right.body_fingerprint.as_str(),
-            ))
+            (
+                left.name.as_str(),
+                left.version,
+                left.body_fingerprint.as_str(),
+            )
+                .cmp(&(
+                    right.name.as_str(),
+                    right.version,
+                    right.body_fingerprint.as_str(),
+                ))
         });
-        self.projections.sort_by(|left, right| left.id.cmp(&right.id));
+        self.projections
+            .sort_by(|left, right| left.id.cmp(&right.id));
         self.models.sort_by(|left, right| left.id.cmp(&right.id));
         self.surfaces.sort_by(|left, right| left.id.cmp(&right.id));
         self.required_capabilities.sort();
@@ -550,21 +691,41 @@ fn validate_module(
         module,
         require_nested_fingerprints,
     )?;
-    validate_unique_ids("module command", module.commands.iter().map(|item| item.id.clone()))?;
+    validate_unique_ids(
+        "module command",
+        module.commands.iter().map(|item| item.id.clone()),
+    )?;
     validate_unique_ids(
         "module projection",
         module.projections.iter().map(|item| item.id.clone()),
     )?;
-    validate_unique_ids("module event", module.events.iter().map(|item| item.name.clone()))?;
-    validate_unique_ids("module model", module.models.iter().map(|item| item.id.clone()))?;
-    validate_unique_ids("module surface", module.surfaces.iter().map(|item| item.id.clone()))?;
+    validate_unique_ids(
+        "module event",
+        module.events.iter().map(|item| item.name.clone()),
+    )?;
+    validate_unique_ids(
+        "module model",
+        module.models.iter().map(|item| item.id.clone()),
+    )?;
+    validate_unique_ids(
+        "module surface",
+        module.surfaces.iter().map(|item| item.id.clone()),
+    )?;
     validate_sorted_unique(
         "module commands",
-        &module.commands.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+        &module
+            .commands
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>(),
     )?;
     validate_sorted_unique(
         "module events",
-        &module.events.iter().map(|item| item.name.clone()).collect::<Vec<_>>(),
+        &module
+            .events
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>(),
     )?;
     validate_sorted_unique(
         "module projections",
@@ -576,26 +737,40 @@ fn validate_module(
     )?;
     validate_sorted_unique(
         "module models",
-        &module.models.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+        &module
+            .models
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>(),
     )?;
     validate_sorted_unique(
         "module surfaces",
-        &module.surfaces.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+        &module
+            .surfaces
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>(),
     )?;
     let module_model_ids = module
         .models
         .iter()
         .map(|model| model.id.as_str())
-        .chain(module.surfaces.iter().flat_map(|surface| {
-            surface.models.iter().map(|model| model.id.as_str())
-        }))
+        .chain(
+            module
+                .surfaces
+                .iter()
+                .flat_map(|surface| surface.models.iter().map(|model| model.id.as_str())),
+        )
         .collect::<HashSet<_>>();
     let module_projection_ids = module
         .projections
         .iter()
         .map(|projection| projection.id.as_str())
         .chain(module.surfaces.iter().flat_map(|surface| {
-            surface.projections.iter().map(|projection| projection.id.as_str())
+            surface
+                .projections
+                .iter()
+                .map(|projection| projection.id.as_str())
         }))
         .collect::<HashSet<_>>();
     for command in &module.commands {
@@ -686,7 +861,10 @@ fn validate_projection(
     validate_sorted_unique("projection facts", &projection.facts)?;
     validate_sorted_unique("projection models", &projection.models)?;
     validate_sorted_unique("projection dependencies", &projection.dependencies)?;
-    validate_sorted_unique("modeled projection program IDs", &projection.modeled_programs)?;
+    validate_sorted_unique(
+        "modeled projection program IDs",
+        &projection.modeled_programs,
+    )?;
     for fact in &projection.facts {
         validate_portable_text("projection fact", fact)?;
     }
@@ -701,6 +879,11 @@ fn validate_projection(
         let fields = modeled.as_object().ok_or_else(|| {
             ApplicationError::InvalidSpec("modeled projection must be an object".into())
         })?;
+        if let Some(program) = fields.get("program") {
+            // Validate each shared value independently without retaining the
+            // expanded copies in the manifest or increasing the wire budget.
+            super::expand_projection_program_contract(program)?;
+        }
         let program_id = fields
             .get("program_id")
             .and_then(serde_json::Value::as_str)
@@ -793,7 +976,10 @@ fn validate_model(
         )));
     }
     validate_sorted_unique("model primary key", &model.primary_key)?;
-    let field_names = field_names.iter().map(String::as_str).collect::<HashSet<_>>();
+    let field_names = field_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     for field in &model.fields {
         validate_portable_text("model field", &field.name)?;
         validate_portable_text("model field scalar", &field.scalar)?;
@@ -913,7 +1099,14 @@ fn validate_surface(
             .map(|projection| projection.id.clone())
             .collect::<Vec<_>>(),
     )?;
-    validate_json_contract("surface canonical contract", &surface.contract)?;
+    // This is the structured catalog of an entire Surface, not an opaque
+    // extension value. Its contents are checked below against the typed spec;
+    // the complete serialized application still owns the aggregate byte budget.
+    validate_json_contract_with_budget(
+        "surface canonical contract",
+        &surface.contract,
+        MAX_APPLICATION_MANIFEST_BYTES,
+    )?;
     validate_surface_selection(surface)?;
     validate_portable_text("surface dialect", &surface.dialect)?;
     if surface.max_limit == 0 || surface.default_limit > surface.max_limit {
@@ -988,7 +1181,10 @@ fn validate_surface(
         validate_json_contract("surface command defaults", &command.defaults)?;
         validate_json_contract("surface command effects", &command.effects)?;
         validate_json_contract("surface command confirmations", &command.confirmations)?;
-        validate_json_contract("surface command projection contract", &command.projection_contract)?;
+        validate_json_contract(
+            "surface command projection contract",
+            &command.projection_contract,
+        )?;
         validate_json_contract("surface command applies", &command.applies)?;
         if let Some(model) = &command.projected_model {
             require_reference("model", model, model_scope)?;
@@ -1030,7 +1226,11 @@ fn validate_surface_selection(surface: &SurfaceSpec) -> ApplicationResult<()> {
                 )));
             }
         }
-        value if value.strip_prefix("application:").is_some_and(|name| !name.is_empty()) => {
+        value
+            if value
+                .strip_prefix("application:")
+                .is_some_and(|name| !name.is_empty()) =>
+        {
             let name = value.strip_prefix("application:").expect("matched above");
             LogicalId::try_new("surface application", name.to_owned())?;
             if surface.eligible_roles.is_empty() {
@@ -1045,11 +1245,12 @@ fn validate_surface_selection(surface: &SurfaceSpec) -> ApplicationResult<()> {
                     surface.id
                 )));
             }
-            if surface
-                .schema_roles
-                .iter()
-                .any(|role| !surface.eligible_roles.iter().any(|eligible| eligible == role))
-            {
+            if surface.schema_roles.iter().any(|role| {
+                !surface
+                    .eligible_roles
+                    .iter()
+                    .any(|eligible| eligible == role)
+            }) {
                 return Err(ApplicationError::InvalidSpec(format!(
                     "application surface `{}` schema roles must be a subset of eligible roles",
                     surface.id
@@ -1079,7 +1280,9 @@ fn validate_roles(kind: &'static str, roles: &[String]) -> ApplicationResult<()>
     Ok(())
 }
 
-fn validate_surface_argument(argument: &super::module::SurfaceArgumentSpec) -> ApplicationResult<()> {
+fn validate_surface_argument(
+    argument: &super::module::SurfaceArgumentSpec,
+) -> ApplicationResult<()> {
     validate_portable_text("surface argument", &argument.name)?;
     validate_portable_text("surface argument kind", &argument.kind)?;
     validate_portable_text("surface argument type", &argument.type_name)?;
@@ -1149,11 +1352,15 @@ fn validate_relationship_keys(value: &serde_json::Value) -> ApplicationResult<()
     let local = fields
         .get("local")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| ApplicationError::InvalidSpec("relationship keys need local columns".into()))?;
+        .ok_or_else(|| {
+            ApplicationError::InvalidSpec("relationship keys need local columns".into())
+        })?;
     let remote = fields
         .get("remote")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| ApplicationError::InvalidSpec("relationship keys need remote columns".into()))?;
+        .ok_or_else(|| {
+            ApplicationError::InvalidSpec("relationship keys need remote columns".into())
+        })?;
     if local.is_empty() || local.len() != remote.len() {
         return Err(ApplicationError::InvalidSpec(
             "relationship key columns must be non-empty and paired".into(),
@@ -1278,9 +1485,7 @@ fn validate_command_type_spec_at_depth(
 fn validate_surface_contract(surface: &SurfaceSpec) -> ApplicationResult<()> {
     let expected = surface_contract_from_spec(surface)?;
     if canonical_json(&surface.contract) != expected {
-        return Err(ApplicationError::NonCanonical(
-            "surface contract material",
-        ));
+        return Err(ApplicationError::NonCanonical("surface contract material"));
     }
     Ok(())
 }
@@ -1297,8 +1502,7 @@ fn validate_manifest_ownership(manifest: &ApplicationManifest) -> ApplicationRes
         return Err(ApplicationError::Collision {
             kind: "command",
             identity: manifest.name.clone(),
-            reason: "application command inventory does not equal explicit module ownership"
-                .into(),
+            reason: "application command inventory does not equal explicit module ownership".into(),
         });
     }
 
@@ -1312,8 +1516,7 @@ fn validate_manifest_ownership(manifest: &ApplicationManifest) -> ApplicationRes
         return Err(ApplicationError::Collision {
             kind: "event",
             identity: manifest.name.clone(),
-            reason: "application event inventory does not equal explicit module ownership"
-                .into(),
+            reason: "application event inventory does not equal explicit module ownership".into(),
         });
     }
 
@@ -1360,7 +1563,10 @@ fn validate_manifest_ownership(manifest: &ApplicationManifest) -> ApplicationRes
 
     for module in &manifest.modules {
         for owned_surface in &module.surfaces {
-            let Some(surface) = manifest.surfaces.iter().find(|surface| surface.id == owned_surface.id)
+            let Some(surface) = manifest
+                .surfaces
+                .iter()
+                .find(|surface| surface.id == owned_surface.id)
             else {
                 return Err(ApplicationError::Missing {
                     kind: "surface",
@@ -1419,8 +1625,9 @@ fn validate_manifest_ownership(manifest: &ApplicationManifest) -> ApplicationRes
                 return Err(ApplicationError::Collision {
                     kind: "projection",
                     identity: exposed.id.clone(),
-                    reason: "surface projection differs from the application projection declaration"
-                        .into(),
+                    reason:
+                        "surface projection differs from the application projection declaration"
+                            .into(),
                 });
             }
         }
@@ -1503,17 +1710,15 @@ fn surface_command_closure(
         .iter()
         .filter(|command| match surface.selection.as_str() {
             "catalog" => true,
-            "role" => surface
-                .eligible_roles
-                .first()
-                .is_some_and(|role| {
-                    command.roles.is_empty() || command.roles.iter().any(|allowed| allowed == role)
-                }),
+            "role" => surface.eligible_roles.first().is_some_and(|role| {
+                command.roles.is_empty() || command.roles.iter().any(|allowed| allowed == role)
+            }),
             value if value.starts_with("application:") => {
                 command.roles.is_empty()
-                    || surface.schema_roles.iter().all(|role| {
-                        command.roles.iter().any(|allowed| allowed == role)
-                    })
+                    || surface
+                        .schema_roles
+                        .iter()
+                        .all(|role| command.roles.iter().any(|allowed| allowed == role))
             }
             _ => false,
         })
@@ -1652,14 +1857,18 @@ fn surface_command_type_value(
     serde_json::json!({
         "name": definition.name,
         "fields": definition.fields.iter().map(|field| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "name": field.name,
                 "type_name": field.type_name,
                 "nullable": field.nullable,
                 "list": field.list,
                 "item_nullable": field.item_nullable,
                 "nested": field.nested.as_deref().map(|nested| surface_command_type_value(Some(nested))),
-            })
+            });
+            if let Some(unsigned) = field.unsigned_integer {
+                value["unsigned_integer"] = serde_json::json!(unsigned);
+            }
+            value
         }).collect::<Vec<_>>(),
     })
 }
@@ -1686,7 +1895,10 @@ fn validate_fingerprint<T: Serialize>(
     }
     let mut value = serde_json::to_value(value)?;
     if let serde_json::Value::Object(fields) = &mut value {
-        fields.insert("fingerprint".into(), serde_json::Value::String(String::new()));
+        fields.insert(
+            "fingerprint".into(),
+            serde_json::Value::String(String::new()),
+        );
     }
     let expected = sha256_fingerprint(&serde_json::to_vec(&canonical_json(&value))?);
     if expected != fingerprint {
@@ -1774,17 +1986,21 @@ fn validate_sha256_text(kind: &'static str, value: &str) -> ApplicationResult<()
 }
 
 fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> ApplicationResult<()> {
+    validate_json_contract_with_budget(kind, value, MAX_MANIFEST_JSON_BYTES)
+}
+
+fn validate_json_contract_with_budget(
+    kind: &'static str,
+    value: &serde_json::Value,
+    max_bytes: usize,
+) -> ApplicationResult<()> {
     let bytes = serde_json::to_vec(value)?;
-    if bytes.len() > MAX_MANIFEST_JSON_BYTES {
+    if bytes.len() > max_bytes {
         return Err(ApplicationError::InvalidSpec(format!(
-            "{kind} exceeds {MAX_MANIFEST_JSON_BYTES} JSON bytes"
+            "{kind} exceeds {max_bytes} JSON bytes"
         )));
     }
-    fn walk(
-        kind: &'static str,
-        value: &serde_json::Value,
-        depth: usize,
-    ) -> ApplicationResult<()> {
+    fn walk(kind: &'static str, value: &serde_json::Value, depth: usize) -> ApplicationResult<()> {
         if depth > MAX_MANIFEST_JSON_DEPTH {
             return Err(ApplicationError::InvalidSpec(format!(
                 "{kind} exceeds JSON depth {MAX_MANIFEST_JSON_DEPTH}"
@@ -1815,7 +2031,8 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
                     walk(kind, value, depth + 1)?;
                 }
             }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
         }
         Ok(())
     }
@@ -1832,17 +2049,23 @@ fn dedup_events(
     mut values: Vec<super::command::EventSpec>,
 ) -> ApplicationResult<Vec<super::command::EventSpec>> {
     values.sort_by(|left, right| {
-        (left.name.as_str(), left.version, left.body_fingerprint.as_str()).cmp(&(
-            right.name.as_str(),
-            right.version,
-            right.body_fingerprint.as_str(),
-        ))
+        (
+            left.name.as_str(),
+            left.version,
+            left.body_fingerprint.as_str(),
+        )
+            .cmp(&(
+                right.name.as_str(),
+                right.version,
+                right.body_fingerprint.as_str(),
+            ))
     });
     let mut out = Vec::new();
     for value in values {
-        if let Some(existing) = out.iter().find(|existing: &&super::command::EventSpec| {
-            existing.name == value.name
-        }) {
+        if let Some(existing) = out
+            .iter()
+            .find(|existing: &&super::command::EventSpec| existing.name == value.name)
+        {
             if *existing != value {
                 return Err(ApplicationError::Collision {
                     kind: "event",
@@ -1867,7 +2090,10 @@ fn dedup_models(mut values: Vec<ModelSpec>) -> ApplicationResult<Vec<ModelSpec>>
     values.sort_by(|left, right| left.id.cmp(&right.id));
     let mut out = Vec::new();
     for value in values {
-        if let Some(existing) = out.iter().find(|existing: &&ModelSpec| existing.id == value.id) {
+        if let Some(existing) = out
+            .iter()
+            .find(|existing: &&ModelSpec| existing.id == value.id)
+        {
             if *existing != value {
                 return Err(ApplicationError::Collision {
                     kind: "model",
@@ -1920,4 +2146,89 @@ fn validate_sorted_unique(kind: &'static str, identities: &[String]) -> Applicat
         return Err(ApplicationError::NonCanonical(kind));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod size_limit_tests {
+    use super::*;
+
+    #[test]
+    fn structured_surface_budget_preserves_nested_validation() {
+        let validate = |value: &serde_json::Value| {
+            validate_json_contract_with_budget(
+                "surface canonical contract",
+                value,
+                MAX_APPLICATION_MANIFEST_BYTES,
+            )
+        };
+        assert!(validate(&serde_json::json!({"bad": "nul\u{0}value"})).is_err());
+        assert!(
+            validate(&serde_json::json!({"bad": "x".repeat(MAX_MANIFEST_STRING_BYTES + 1)}))
+                .is_err()
+        );
+        assert!(validate(&serde_json::json!(vec![
+            0;
+            MAX_MANIFEST_COLLECTION_ITEMS + 1
+        ]))
+        .is_err());
+        let mut deep = serde_json::Value::Null;
+        for _ in 0..=MAX_MANIFEST_JSON_DEPTH {
+            deep = serde_json::json!([deep]);
+        }
+        assert!(validate(&deep).is_err());
+        let oversized = serde_json::json!(vec!["x".repeat(MAX_MANIFEST_STRING_BYTES); 1024]);
+        assert!(validate(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds 4194304 JSON bytes"));
+    }
+
+    #[test]
+    fn json_contract_can_exceed_the_old_256_kib_limit() {
+        let chunk = "x".repeat(MAX_MANIFEST_STRING_BYTES);
+        let within_budget = serde_json::json!(vec![chunk.clone(); 96]);
+        assert!(serde_json::to_vec(&within_budget).unwrap().len() > 256 * 1024);
+        validate_json_contract("surface canonical contract", &within_budget).unwrap();
+
+        let over_budget = serde_json::json!(vec![chunk; 257]);
+        assert!(serde_json::to_vec(&over_budget).unwrap().len() > MAX_MANIFEST_JSON_BYTES);
+        assert!(validate_json_contract("surface canonical contract", &over_budget).is_err());
+    }
+
+    #[test]
+    fn manifest_accepts_multiple_bounded_contracts_beyond_one_mib() {
+        let value = serde_json::json!(vec!["x".repeat(MAX_MANIFEST_STRING_BYTES); 200]);
+        assert!(serde_json::to_vec(&value).unwrap().len() < MAX_MANIFEST_JSON_BYTES);
+        let mut manifest = ApplicationManifest::new("large-app");
+        for index in 0..2 {
+            manifest.extensions.push(
+                ApplicationExtension::try_new(format!("large.contract.{index}"), 1, value.clone())
+                    .unwrap(),
+            );
+        }
+
+        let bytes = manifest.canonical_bytes().unwrap();
+        assert!(bytes.len() > 1024 * 1024);
+        assert!(bytes.len() < MAX_APPLICATION_MANIFEST_BYTES);
+        ApplicationManifest::from_canonical_bytes(&bytes).unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_multiple_contracts_beyond_four_mib() {
+        let value = serde_json::json!(vec!["x".repeat(MAX_MANIFEST_STRING_BYTES); 230]);
+        assert!(serde_json::to_vec(&value).unwrap().len() < MAX_MANIFEST_JSON_BYTES);
+        let mut manifest = ApplicationManifest::new("oversized-app");
+        for index in 0..5 {
+            manifest.extensions.push(
+                ApplicationExtension::try_new(format!("large.contract.{index}"), 1, value.clone())
+                    .unwrap(),
+            );
+        }
+
+        let error = manifest.canonical_bytes().unwrap_err().to_string();
+        assert!(error.contains("application manifest exceeds 4194304 bytes"));
+        let oversized_bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(oversized_bytes.len() > MAX_APPLICATION_MANIFEST_BYTES);
+        assert!(ApplicationManifest::from_canonical_bytes(&oversized_bytes).is_err());
+    }
 }

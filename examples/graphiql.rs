@@ -18,9 +18,7 @@ use std::sync::Arc;
 
 use distributed::graphql::GraphqlEngine;
 use distributed::microsvc::{serve, Service};
-use distributed::{
-    ColumnType, ReadModelCatalog, PrimaryKey, TableColumn, TableKind, TableSchema,
-};
+use distributed::{ColumnType, PrimaryKey, ReadModelCatalog, TableColumn, TableKind, TableSchema};
 use sqlx::sqlite::SqlitePoolOptions;
 
 fn orders_schema() -> TableSchema {

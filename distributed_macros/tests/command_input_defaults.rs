@@ -1,17 +1,17 @@
 //! Compile-pass checks for command_input_defaults!.
 
-use distributed::graphql::{typed_command, Succeeded};
-use distributed::{command_input_defaults, GraphqlInput};
+use distributed::command::{typed_command, Succeeded};
+use distributed::{command_input_defaults, CommandInput};
 use serde::Deserialize;
 
-#[derive(Clone, Deserialize, GraphqlInput)]
+#[derive(Clone, Deserialize, CommandInput)]
 #[allow(dead_code)]
 struct PlanInput {
     id: String,
     title: String,
 }
 
-#[derive(Clone, serde::Serialize, distributed::GraphqlOutput)]
+#[derive(Clone, serde::Serialize, distributed::CommandOutput)]
 struct PlanOutput {
     id: String,
 }

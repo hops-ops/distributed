@@ -106,7 +106,8 @@ jobs:
       - name: Start application with Distributed dev
         run: |
           set -euo pipefail
-          export AUTH_URL="${E2E_UI_ORIGIN:-http://localhost:5180}"
+          export PUBLIC_ORIGIN="${E2E_UI_ORIGIN:-http://localhost:8791}"
+          export AUTH_URL="$PUBLIC_ORIGIN"
           export AUTH_USE_SECURE_COOKIES=false
           export AUTH_TRUST_HOST=true
 
@@ -114,7 +115,8 @@ jobs:
           echo $! > .distributed-dev.pid
 
           ok=0
-          for i in $(seq 1 240); do
+          # Match the CLI's bounded cold-runtime + UI readiness budget.
+          for i in $(seq 1 720); do
             if grep -Fq 'lifecycle dev: ready generation=' .distributed-dev.log; then
               ok=1
               break
@@ -122,6 +124,7 @@ jobs:
             if ! kill -0 "$(cat .distributed-dev.pid)" 2>/dev/null; then
               echo "distributed dev exited before readiness"
               tail -200 .distributed-dev.log
+              ps -eo pid,ppid,etime,stat,comm
               exit 1
             fi
             sleep 0.5
@@ -129,11 +132,14 @@ jobs:
           if [ "$ok" != "1" ]; then
             echo "distributed dev failed to become ready"
             tail -200 .distributed-dev.log
+            # Executable names identify quiet build children without exposing
+            # credentials from process arguments or environment variables.
+            ps -eo pid,ppid,etime,stat,comm
             exit 1
           fi
 
           grep -F 'lifecycle dev: process api ready http://127.0.0.1:8791' .distributed-dev.log
-          grep -F 'lifecycle dev: process ui ready http://localhost:5180' .distributed-dev.log
+          grep -F 'lifecycle dev: process ui ready http://localhost:8791' .distributed-dev.log
           tail -40 .distributed-dev.log
 
       - name: Install Playwright + Chromium
@@ -141,12 +147,15 @@ jobs:
           npm install
           npx playwright install chromium --with-deps
 
+      - name: Verify candidate-key SSR and live delivery end to end
+        run: cargo test --manifest-path ../../Cargo.toml --features graphql,sqlite --test graphql_unique_key_live projected_candidate_keys_reach_chromium_over_http_and_websocket -- --ignored --exact --nocapture
+
       - name: Run browser e2e
         run: |
           npm run test:browser
           npm run test:lifecycle-reload
         env:
-          E2E_UI_ORIGIN: http://localhost:5180
+          E2E_UI_ORIGIN: http://localhost:8791
           E2E_API_ORIGIN: http://127.0.0.1:8791
           CI: true
 
@@ -155,9 +164,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-ui-playwright-report
+          # Only the explicit paths below; never include e2e/.auth or env files.
+          include-hidden-files: true
           path: |
             tests/e2e-ui/playwright-report
             tests/e2e-ui/test-results
+            tests/e2e-ui/.distributed-dev.log
           if-no-files-found: ignore
           retention-days: 7
 

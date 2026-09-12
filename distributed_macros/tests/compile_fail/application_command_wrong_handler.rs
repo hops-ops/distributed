@@ -5,7 +5,7 @@ struct WrongInput;
     id = "todo.create",
     roles(user),
     input = WrongInput,
-    outcome = distributed::graphql::Succeeded<WrongInput>
+    outcome = distributed::command::Succeeded<WrongInput>
 )]
 async fn wrong_handler(
     _context: &distributed::microsvc::CausalCommandContext<'_, WrongAggregate>,

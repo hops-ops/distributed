@@ -456,7 +456,7 @@ fn emit_comparison_exp(out: &mut String, scalar: &str, operators: &[String]) {
         let operand = match operator.as_str() {
             "_in" | "_nin" => format!("[{scalar}!]"),
             "_is_null" => "Boolean".into(),
-            "_like" | "_ilike" | "_has_key" => "String".into(),
+            "_like" | "_ilike" | "_icontains" | "_has_key" => "String".into(),
             _ => scalar.to_string(),
         };
         out.push_str(&format!("  {operator}: {operand}\n"));
@@ -588,7 +588,7 @@ pub fn graphql_sdl_from_schemas(
 #[cfg(test)]
 mod causal_command_sdl_tests {
     use super::*;
-    use crate::graphql::command_contract::{CommandConsistency, CommandEffects};
+    use crate::command::{CommandConsistency, CommandEffects};
     use crate::graphql::surface::{SurfaceCommandShape, SurfaceTypeDef};
 
     fn command_surface() -> crate::graphql::surface::Surface {
@@ -615,6 +615,7 @@ mod causal_command_sdl_tests {
                 input: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoInput".into(),
                     fields: vec![crate::graphql::surface::SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -626,6 +627,7 @@ mod causal_command_sdl_tests {
                 output: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoPayload".into(),
                     fields: vec![crate::graphql::surface::SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,

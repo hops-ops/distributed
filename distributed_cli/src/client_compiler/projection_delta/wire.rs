@@ -210,7 +210,9 @@ impl ProjectionDeltaIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ProjectionSurfaceIdentity {
-    Role { name: String },
+    Role {
+        name: String,
+    },
     Application {
         name: String,
         eligible_roles: Vec<String>,

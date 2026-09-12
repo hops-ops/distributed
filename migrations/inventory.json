@@ -48,6 +48,54 @@
         "path": "migrations/postgres/0004_command_ledger_atomic_state.sql",
         "sha256": "bc49ca9c58a294b7c5876c9fcde8a14a8b6110594a06c48b37720d320a22d97e"
       }
+    },
+    {
+      "version": 5,
+      "description": "projection source snapshots",
+      "sqlite": {
+        "path": "migrations/sqlite/0005_projection_source_snapshots.sql",
+        "sha256": "2cb605be4ec190d9b3f156bdbbeb83a76e5f1f37287a8a7f3c2653dafbede442"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0005_projection_source_snapshots.sql",
+        "sha256": "2cb605be4ec190d9b3f156bdbbeb83a76e5f1f37287a8a7f3c2653dafbede442"
+      }
+    },
+    {
+      "version": 6,
+      "description": "gateway dependency versions",
+      "sqlite": {
+        "path": "migrations/sqlite/0006_gateway_dependency_versions.sql",
+        "sha256": "c156bc51dddecd49b1beef7bb4069557b024c19cb1271f0ec9cc0efe71939471"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0006_gateway_dependency_versions.sql",
+        "sha256": "c156bc51dddecd49b1beef7bb4069557b024c19cb1271f0ec9cc0efe71939471"
+      }
+    },
+    {
+      "version": 7,
+      "description": "projection program identity",
+      "sqlite": {
+        "path": "migrations/sqlite/0007_projection_program_identity.sql",
+        "sha256": "cb247b632ce6b1dbab2bf3d15a25532334432ef58d20755c5491b009bd31a320"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0007_projection_program_identity.sql",
+        "sha256": "ad7da74a11637a522279a6bc061d2c79db1f807f869368cf31735a089dfe0204"
+      }
+    },
+    {
+      "version": 8,
+      "description": "external command binding",
+      "sqlite": {
+        "path": "migrations/sqlite/0008_external_command_binding.sql",
+        "sha256": "4be4e5583d7f37a4f2820bf7777a750246ff574d43f4b9fbd15324d6712a6240"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0008_external_command_binding.sql",
+        "sha256": "2f93c5685cde1d5cafd444d3a28dbcbf01f16cd44a566c7af61a7bd2a793a163"
+      }
     }
   ]
 }

@@ -1,6 +1,6 @@
-use distributed::{command_input_defaults, GraphqlInput};
+use distributed::{command_input_defaults, CommandInput};
 
-#[derive(GraphqlInput)]
+#[derive(CommandInput)]
 struct Input {
     ids: Vec<String>,
 }

@@ -471,7 +471,7 @@ async fn complete_many_completes_the_whole_batch() {
     store.complete_many(&claims).await.unwrap();
 
     for id in ["msg-1", "msg-2", "msg-3"] {
-        assert!(load_message(&repo, id).is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key(id));
     }
 }
 
@@ -496,9 +496,9 @@ async fn complete_many_rejects_stale_and_missing_claims() {
     let claims = vec![OutboxClaimRef::from_message(&claimed[0]).unwrap()];
 
     store.complete_many(&claims).await.unwrap();
-    // Re-settling the now-published row is a stale claim, same as `complete`.
+    // Re-settling a deleted delivery row is NotFound, same as `complete`.
     let err = store.complete_many(&claims).await.unwrap_err();
-    assert!(matches!(err, RepositoryError::InvalidState { .. }));
+    assert!(matches!(err, RepositoryError::NotFound { .. }));
 
     let missing = vec![OutboxClaimRef {
         message_id: "missing".into(),
@@ -529,5 +529,5 @@ async fn already_published_message_is_not_completed_again() {
     store.complete(&claim).await.unwrap();
 
     let err = store.complete(&claim).await.unwrap_err();
-    assert!(matches!(err, RepositoryError::InvalidState { .. }));
+    assert!(matches!(err, RepositoryError::NotFound { .. }));
 }

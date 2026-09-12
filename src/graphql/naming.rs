@@ -88,16 +88,7 @@ pub fn max_fields_type_name(schema: &TableSchema) -> String {
 
 /// Map a column type to its GraphQL scalar type name (without nullability).
 pub fn scalar_type_name(column_type: &ColumnType) -> Option<&'static str> {
-    match column_type {
-        ColumnType::Text => Some("String"),
-        ColumnType::Boolean => Some("Boolean"),
-        ColumnType::Integer | ColumnType::UnsignedInteger => Some("BigInt"),
-        ColumnType::Float => Some("Float"),
-        ColumnType::Json => Some("JSON"),
-        ColumnType::Timestamp => Some("Timestamptz"),
-        ColumnType::Bytes => Some("Bytea"),
-        ColumnType::Unsupported(_) => None,
-    }
+    crate::command::scalar_type_name(column_type)
 }
 
 pub fn comparison_exp_name(scalar: &str) -> String {
@@ -113,7 +104,7 @@ pub const PORTABLE_COMPARISON_OPS: &[&str] = &[
 ];
 
 /// String-only comparison operators (portable; SQLite maps `_ilike` → `LIKE`).
-pub const STRING_COMPARISON_OPS: &[&str] = &["_like", "_ilike"];
+pub const STRING_COMPARISON_OPS: &[&str] = &["_like", "_ilike", "_icontains"];
 
 /// Postgres `jsonb` operators — only on `JSON_comparison_exp` when the engine
 /// dialect is Postgres. **Must not** appear on SQLite schema or SDL.
@@ -263,6 +254,8 @@ mod tests {
         let string_ops = comparison_op_fields("String", false);
         assert!(string_ops.contains(&"_like"));
         assert!(string_ops.contains(&"_ilike"));
+        assert!(string_ops.contains(&"_icontains"));
+        assert!(!comparison_op_fields("Int", false).contains(&"_icontains"));
         assert!(!string_ops.contains(&"_contains"));
     }
 

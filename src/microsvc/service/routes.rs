@@ -6,14 +6,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(feature = "graphql")]
-use std::time::SystemTime;
-
-#[cfg(feature = "graphql")]
 use super::causal::{
     abandon_causal_attempt, causal_handler_error_code, commit_causal_rejection,
     ensure_causal_grant, evaluate_causal_command_status, internal_ledger_error,
     load_committed_dispatch_result, recover_causal_commit_error, replay_result,
     CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult,
+    ExternalCausalAttempt, ExternalCausalReservation,
 };
 use super::handlers::{
     boxed_causal_guard, boxed_handler, boxed_prepared_handler, CausalCommandContext, CausalGuardFn,
@@ -23,6 +21,11 @@ use super::handlers::{
 use crate::aggregate::Aggregate;
 use crate::application::{CommandMount, CommandMountRegistrar, CommandSpec};
 use crate::bus::{Bus, Message, MessageKind, MessagePublisher, OrderedDelivery, TransportError};
+use crate::command::input::canonicalize_command_input;
+use crate::command::{
+    command_transition, CommandConsistency, CommandEventSet, CommandInputType, CommandOutcome,
+    CompiledInputDefaults, TypedCommand, TypedCommandContract,
+};
 use crate::command_ledger::{
     CanonicalInputHash, CausalCommitBatch, CausalTransactionalCommit, CommandContractFingerprint,
     CommandLedgerStore, CommandReservation, ReservationOutcome, TerminalCommandState,
@@ -30,19 +33,16 @@ use crate::command_ledger::{
 #[cfg(feature = "graphql")]
 use crate::command_ledger::{
     CausalRepositoryIdentity, CommandId, CommandLedgerKey, CommandLookup, CommandLookupScope,
-    PrincipalPartitionId,
+    ExternalDispatchBinding, PrincipalPartitionId,
 };
-use crate::graphql::command_contract::CommandConsistency;
-use crate::graphql::command_contract::{
-    CommandEventSet, CommandOutcome, CompiledInputDefaults, TypedCommandContract,
-};
-use crate::graphql::command_input::canonicalize_command_input;
 #[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
-use crate::graphql::{command_transition, GraphqlInputType, SurfaceProjector, TypedCommand};
+use crate::graphql::SurfaceProjector;
 use crate::microsvc::causal::CausalWorkspace;
 use crate::microsvc::cell_host::{CellCommandIdentity, CellDispatchError, CellDispatchResult};
 use crate::microsvc::context::Context;
+#[cfg(feature = "graphql")]
+use crate::microsvc::dependencies::CausalHostProjections;
 use crate::microsvc::dependencies::{
     CausalProjectionRouteDependencies, CausalRouteDependencies, ConfigurableOutboxPublisher,
     HasOutboxStore, HasReadModelStore, HasRepo,
@@ -71,8 +71,6 @@ use crate::outbox_worker::{
     OutboxDispatcher, OutboxDrainRunner, OutboxPublishMailbox, DEFAULT_DRAIN_LEASE,
     DEFAULT_OUTBOX_HINT_CAPACITY,
 };
-#[cfg(feature = "graphql")]
-use crate::projection_protocol::ProjectionProtocolStore;
 #[cfg(feature = "graphql")]
 use crate::projection_protocol::{CompiledProjectionTopology, ProjectorTopologyId};
 use crate::repository::{StreamIdentity, TransactionalCommit};
@@ -189,6 +187,16 @@ pub(super) type CausalHandlerFuture<'a> =
 pub(super) type CausalStatusFuture<'a> = Pin<
     Box<dyn Future<Output = Result<CausalCommandPublicStatus, CausalDispatchError>> + Send + 'a>,
 >;
+#[cfg(feature = "graphql")]
+pub(super) type ExternalReservationFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<ExternalCausalReservation, CausalDispatchError>> + Send + 'a>,
+>;
+#[cfg(feature = "graphql")]
+pub(super) type ExternalCompletionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), CausalDispatchError>> + Send + 'a>>;
+#[cfg(feature = "graphql")]
+pub(super) type ExternalAbandonFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), CausalDispatchError>> + Send + 'a>>;
 pub(super) type CellCausalHandlerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CellDispatchResult, CellDispatchError>> + Send + 'a>>;
 
@@ -245,6 +253,34 @@ pub(super) trait ErasedCausalHandler<D>: Send + Sync {
         session: &'a Session,
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a>;
+
+    #[cfg(feature = "graphql")]
+    fn reserve_external<'a>(
+        &'a self,
+        dependencies: &'a D,
+        service_id: &'a str,
+        command_id: &'a str,
+        input: Value,
+        session: Session,
+        principal: VerifiedPrincipal,
+        policy: CausalCommandPolicy,
+        binding: ExternalDispatchBinding,
+    ) -> ExternalReservationFuture<'a>;
+
+    #[cfg(feature = "graphql")]
+    fn complete_external<'a>(
+        &'a self,
+        dependencies: &'a D,
+        attempt: ExternalCausalAttempt,
+        result: &'a CausalDispatchResult,
+    ) -> ExternalCompletionFuture<'a>;
+
+    #[cfg(feature = "graphql")]
+    fn abandon_external<'a>(
+        &'a self,
+        dependencies: &'a D,
+        attempt: ExternalCausalAttempt,
+    ) -> ExternalAbandonFuture<'a>;
 
     /// Run the same typed `handle` inside one cell, without GraphQL receipts.
     fn invoke_cell<'a>(
@@ -367,6 +403,34 @@ pub(super) trait ErasedRoutes: Send + Sync {
         session: &'a Session,
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a>;
+
+    #[cfg(feature = "graphql")]
+    fn reserve_external<'a>(
+        &'a self,
+        command: &'a str,
+        service_id: &'a str,
+        command_id: &'a str,
+        input: Value,
+        session: Session,
+        principal: VerifiedPrincipal,
+        policy: CausalCommandPolicy,
+        binding: ExternalDispatchBinding,
+    ) -> ExternalReservationFuture<'a>;
+
+    #[cfg(feature = "graphql")]
+    fn complete_external<'a>(
+        &'a self,
+        command: &'a str,
+        attempt: ExternalCausalAttempt,
+        result: &'a CausalDispatchResult,
+    ) -> ExternalCompletionFuture<'a>;
+
+    #[cfg(feature = "graphql")]
+    fn abandon_external<'a>(
+        &'a self,
+        command: &'a str,
+        attempt: ExternalCausalAttempt,
+    ) -> ExternalAbandonFuture<'a>;
 
     #[cfg(feature = "graphql")]
     fn projected_storage_identities(&self) -> Vec<crate::command_ledger::CausalStorageIdentity>;
@@ -597,9 +661,9 @@ where
         E: crate::domain_event::DomainEventBodyContract<S>,
         S: crate::DomainState + crate::projection::lower::ProjectionBodyMetadata,
     {
-        let values = crate::graphql::__command_projection_state_known_values::<E, S>(vec![(
+        let values = crate::command::__command_projection_state_known_values::<E, S>(vec![(
             rust_field,
-            crate::graphql::CommandProjectionPreviewSource::trusted("x-user-id", "string"),
+            crate::command::CommandProjectionPreviewSource::trusted("x-user-id", "string"),
         )]);
         self.contract
             .projections
@@ -611,7 +675,7 @@ where
     #[must_use]
     pub fn preview_reduce_known_record(
         mut self,
-        reduce: crate::graphql::CommandProjectionPureReduce,
+        reduce: crate::command::CommandProjectionPureReduce,
     ) -> Self {
         self.contract.projections.add_pure_reduce(reduce);
         self
@@ -750,12 +814,12 @@ where
     }
 }
 
-impl<D, I, T> ThinCommandBuilder<D, I, crate::graphql::Eventual<T>, ThinCommandInvoked>
+impl<D, I, T> ThinCommandBuilder<D, I, crate::command::Eventual<T>, ThinCommandInvoked>
 where
     D: CausalRouteDependencies + Send + Sync + 'static,
     D::Aggregate: Aggregate + Send + Sync + 'static,
     I: serde::de::DeserializeOwned + Send + Sync + 'static,
-    T: crate::graphql::GraphqlOutputType + serde::Serialize + Send + Sync + 'static,
+    T: crate::command::CommandOutputType + serde::Serialize + Send + Sync + 'static,
 {
     /// Publish captured events, commit, and return an Eventual payload.
     ///
@@ -782,12 +846,12 @@ where
     }
 }
 
-impl<D, I, T> ThinCommandBuilder<D, I, crate::graphql::Succeeded<T>, ThinCommandInvoked>
+impl<D, I, T> ThinCommandBuilder<D, I, crate::command::Succeeded<T>, ThinCommandInvoked>
 where
     D: CausalRouteDependencies + Send + Sync + 'static,
     D::Aggregate: Aggregate + Send + Sync + 'static,
     I: serde::de::DeserializeOwned + Send + Sync + 'static,
-    T: crate::graphql::GraphqlOutputType + serde::Serialize + Send + Sync + 'static,
+    T: crate::command::CommandOutputType + serde::Serialize + Send + Sync + 'static,
 {
     /// Commit and return a Succeeded payload. Used when the command is not Eventual.
     pub fn succeeded<F>(self, payload: F) -> Routes<D>
@@ -826,18 +890,18 @@ where
     roles: Vec<String>,
 }
 
-impl<'a, A, I, T> PreparedCommandHandler<'a, A, I, crate::graphql::Eventual<T>>
+impl<'a, A, I, T> PreparedCommandHandler<'a, A, I, crate::command::Eventual<T>>
     for ThinEventualHandler<A, I, T>
 where
     A: Aggregate + Send + Sync + 'static,
     I: serde::de::DeserializeOwned + Send + Sync + 'static,
-    T: crate::graphql::GraphqlOutputType + serde::Serialize + Send + Sync + 'static,
+    T: crate::command::CommandOutputType + serde::Serialize + Send + Sync + 'static,
 {
     type Future = Pin<
         Box<
             dyn Future<
                     Output = Result<
-                        crate::graphql::PreparedCommand<crate::graphql::Eventual<T>>,
+                        crate::command::PreparedCommand<crate::command::Eventual<T>>,
                         HandlerError,
                     >,
                 > + Send
@@ -887,18 +951,18 @@ where
     roles: Vec<String>,
 }
 
-impl<'a, A, I, T> PreparedCommandHandler<'a, A, I, crate::graphql::Succeeded<T>>
+impl<'a, A, I, T> PreparedCommandHandler<'a, A, I, crate::command::Succeeded<T>>
     for ThinSucceededHandler<A, I, T>
 where
     A: Aggregate + Send + Sync + 'static,
     I: serde::de::DeserializeOwned + Send + Sync + 'static,
-    T: crate::graphql::GraphqlOutputType + serde::Serialize + Send + Sync + 'static,
+    T: crate::command::CommandOutputType + serde::Serialize + Send + Sync + 'static,
 {
     type Future = Pin<
         Box<
             dyn Future<
                     Output = Result<
-                        crate::graphql::PreparedCommand<crate::graphql::Succeeded<T>>,
+                        crate::command::PreparedCommand<crate::command::Succeeded<T>>,
                         HandlerError,
                     >,
                 > + Send
@@ -1097,7 +1161,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
     pub fn command_transition<S, I, K>(self, name: &'static str) -> TypedRouteBuilder<D, I, K>
     where
         S: CommandEventSet,
-        I: GraphqlInputType + serde::de::DeserializeOwned + Send + 'static,
+        I: CommandInputType + serde::de::DeserializeOwned + Send + 'static,
         K: CommandOutcome,
     {
         self.typed_command(command_transition::<S, I, K>(name))
@@ -1575,6 +1639,10 @@ where
                 policy.replay_retention,
             )
             .map_err(crate::microsvc::cell_host::causal::internal_ledger_error)?;
+            let reservation = match identity.causation_id() {
+                Some(causation_id) => reservation.with_causation_id(causation_id.clone()),
+                None => reservation,
+            };
 
             let aggregate_repository = dependencies.__causal_aggregate_repository();
             let repository = aggregate_repository.repo();
@@ -1722,10 +1790,23 @@ where
             }
 
             let fence = attempt.fence();
+            let replay = crate::microsvc::cell_host::causal::CellCommandReplay {
+                payload: replay_payload.clone(),
+                events: batch
+                    .outbox_messages
+                    .iter()
+                    .map(crate::microsvc::cell_host::CellProjectionEventWireItem::from_message)
+                    .collect(),
+            };
+            let replay = serde_json::to_value(replay).map_err(|error| {
+                CellDispatchError::Internal(format!(
+                    "cell command replay could not be encoded: {error}"
+                ))
+            })?;
             let completion = attempt
                 .complete(
                     TerminalCommandState::Succeeded,
-                    replay_payload.clone(),
+                    replay,
                     policy.replay_retention,
                 )
                 .map_err(crate::microsvc::cell_host::causal::internal_ledger_error)?;
@@ -1829,7 +1910,7 @@ where
                 self.direct_projection_bootstrap
                     .get_or_try_init(|| async {
                         repository
-                            .register_projection_models(topology, ownership)
+                            .__register_direct_projection_models(topology, ownership)
                             .await
                             .map_err(|error| {
                                 CausalDispatchError::Internal(format!(
@@ -2250,6 +2331,132 @@ where
         })
     }
 
+    #[cfg(feature = "graphql")]
+    fn reserve_external<'a>(
+        &'a self,
+        dependencies: &'a D,
+        service_id: &'a str,
+        command_id: &'a str,
+        input: Value,
+        session: Session,
+        principal: VerifiedPrincipal,
+        policy: CausalCommandPolicy,
+        binding: ExternalDispatchBinding,
+    ) -> ExternalReservationFuture<'a> {
+        Box::pin(async move {
+            ensure_causal_grant(&self.contract, &session)?;
+            if self.contract.consistency == CommandConsistency::Atomic {
+                return Err(CausalDispatchError::BadRequest(
+                    "atomic typed commands cannot be dispatched to an aggregate cell".into(),
+                ));
+            }
+            let canonical = canonicalize_command_input(&self.contract.input, input)
+                .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
+            let typed = canonical
+                .decode::<I>()
+                .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
+            let (_, _, input_digest) = typed.into_parts();
+            let command_id = CommandId::parse(command_id)
+                .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
+            let partition = PrincipalPartitionId::new(principal.partition_for_service(service_id))
+                .map_err(internal_ledger_error)?;
+            let key = CommandLedgerKey::new(service_id, partition, command_id)
+                .map_err(internal_ledger_error)?;
+            let reservation = CommandReservation::new(
+                key,
+                self.contract.name.clone(),
+                CommandContractFingerprint::new(self.contract.fingerprint_bytes()),
+                CanonicalInputHash::new(input_digest),
+                policy.attempt_lease,
+                policy.replay_retention,
+            )
+            .map_err(internal_ledger_error)?
+            .with_external_binding(binding);
+            let repository = dependencies.__causal_aggregate_repository().repo();
+            match repository
+                .reserve_command(reservation)
+                .await
+                .map_err(internal_ledger_error)?
+            {
+                ReservationOutcome::Acquired(attempt) => {
+                    Ok(ExternalCausalReservation::Acquired(ExternalCausalAttempt {
+                        command_name: self.contract.name.clone(),
+                        attempt,
+                        retention: policy.replay_retention,
+                    }))
+                }
+                ReservationOutcome::Replay(replay) => Ok(ExternalCausalReservation::Replay(
+                    replay_result(self.contract.consistency, replay)?,
+                )),
+                ReservationOutcome::InProgress { .. } => Err(CausalDispatchError::InProgress),
+                ReservationOutcome::Conflict => Err(CausalDispatchError::CommandIdReuse),
+                ReservationOutcome::Expired => Err(CausalDispatchError::Expired),
+            }
+        })
+    }
+
+    #[cfg(feature = "graphql")]
+    fn complete_external<'a>(
+        &'a self,
+        dependencies: &'a D,
+        attempt: ExternalCausalAttempt,
+        result: &'a CausalDispatchResult,
+    ) -> ExternalCompletionFuture<'a> {
+        Box::pin(async move {
+            if attempt.command_name != self.contract.name {
+                return Err(CausalDispatchError::Internal(
+                    "external command completion route does not match its reservation".into(),
+                ));
+            }
+            let fence = attempt.fence();
+            let completion = attempt.into_external_completion(result)?;
+            let repository = dependencies.__causal_aggregate_repository().repo();
+            match repository.complete_external_command(completion).await {
+                Ok(()) => Ok(()),
+                Err(error) => match repository
+                    .lookup_command(&fence.key(), CommandLookupScope::Attempt(&fence))
+                    .await
+                {
+                    Ok(CommandLookup::Replay(_)) => Ok(()),
+                    Ok(CommandLookup::InProgress { .. }) => {
+                        match repository.mark_retryable_unknown(fence).await {
+                            Ok(()) => Err(CausalDispatchError::Internal(error.to_string())),
+                            Err(recovery) => Err(CausalDispatchError::Internal(format!(
+                                "{error}; external completion recovery failed: {recovery}"
+                            ))),
+                        }
+                    }
+                    Ok(CommandLookup::RetryableUnknown { .. }) => {
+                        Err(CausalDispatchError::Internal(error.to_string()))
+                    }
+                    Ok(CommandLookup::Expired) => Err(CausalDispatchError::Expired),
+                    Ok(CommandLookup::Unknown) => Err(CausalDispatchError::Internal(format!(
+                        "{error}; external command ledger row disappeared"
+                    ))),
+                    Err(recovery) => Err(CausalDispatchError::Internal(format!(
+                        "{error}; external completion lookup failed: {recovery}"
+                    ))),
+                },
+            }
+        })
+    }
+
+    #[cfg(feature = "graphql")]
+    fn abandon_external<'a>(
+        &'a self,
+        dependencies: &'a D,
+        attempt: ExternalCausalAttempt,
+    ) -> ExternalAbandonFuture<'a> {
+        Box::pin(async move {
+            crate::microsvc::service::causal::abandon_external_attempt(
+                dependencies.__causal_aggregate_repository().repo(),
+                attempt,
+                "external cell dispatch did not produce a durable terminal receipt".into(),
+            )
+            .await
+        })
+    }
+
     fn invoke_cell<'a>(
         &'a self,
         dependencies: &'a D,
@@ -2570,6 +2777,92 @@ where
             }
             Ok(CausalCommandPublicStatus::unknown(command_id.as_str()))
         })
+    }
+
+    #[cfg(feature = "graphql")]
+    fn reserve_external<'a>(
+        &'a self,
+        command: &'a str,
+        service_id: &'a str,
+        command_id: &'a str,
+        input: Value,
+        session: Session,
+        principal: VerifiedPrincipal,
+        policy: CausalCommandPolicy,
+        binding: ExternalDispatchBinding,
+    ) -> ExternalReservationFuture<'a> {
+        let handler = self
+            .handlers
+            .get(&MessageKind::Command)
+            .and_then(|handlers| handlers.get(command));
+        match handler {
+            Some(RegisteredHandler::Causal(handler)) => handler.reserve_external(
+                &self.dependencies,
+                service_id,
+                command_id,
+                input,
+                session,
+                principal,
+                policy,
+                binding,
+            ),
+            Some(RegisteredHandler::Legacy { .. })
+            | Some(RegisteredHandler::Projector(_))
+            | None => Box::pin(async move {
+                Err(CausalDispatchError::BadRequest(format!(
+                    "`{command}` is not a typed causal command"
+                )))
+            }),
+        }
+    }
+
+    #[cfg(feature = "graphql")]
+    fn complete_external<'a>(
+        &'a self,
+        command: &'a str,
+        attempt: ExternalCausalAttempt,
+        result: &'a CausalDispatchResult,
+    ) -> ExternalCompletionFuture<'a> {
+        let handler = self
+            .handlers
+            .get(&MessageKind::Command)
+            .and_then(|handlers| handlers.get(command));
+        match handler {
+            Some(RegisteredHandler::Causal(handler)) => {
+                handler.complete_external(&self.dependencies, attempt, result)
+            }
+            Some(RegisteredHandler::Legacy { .. })
+            | Some(RegisteredHandler::Projector(_))
+            | None => Box::pin(async move {
+                Err(CausalDispatchError::BadRequest(format!(
+                    "`{command}` is not a typed causal command"
+                )))
+            }),
+        }
+    }
+
+    #[cfg(feature = "graphql")]
+    fn abandon_external<'a>(
+        &'a self,
+        command: &'a str,
+        attempt: ExternalCausalAttempt,
+    ) -> ExternalAbandonFuture<'a> {
+        let handler = self
+            .handlers
+            .get(&MessageKind::Command)
+            .and_then(|handlers| handlers.get(command));
+        match handler {
+            Some(RegisteredHandler::Causal(handler)) => {
+                handler.abandon_external(&self.dependencies, attempt)
+            }
+            Some(RegisteredHandler::Legacy { .. })
+            | Some(RegisteredHandler::Projector(_))
+            | None => Box::pin(async move {
+                Err(CausalDispatchError::BadRequest(format!(
+                    "`{command}` is not a typed causal command"
+                )))
+            }),
+        }
     }
 
     #[cfg(feature = "graphql")]

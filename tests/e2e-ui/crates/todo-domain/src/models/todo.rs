@@ -255,8 +255,8 @@ mod tests {
 
     #[test]
     fn domain_commands_create_matches_created_event_contract() {
+        use distributed::command::CommandEventSet;
         use distributed::domain_event::DomainEventContract;
-        use distributed::graphql::CommandEventSet;
 
         let from_transition = domain_commands::Create::command_event_set();
         let from_event = distributed::events![TodoCreatedDomainEvent];

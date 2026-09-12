@@ -3,9 +3,7 @@
 
 use async_graphql::Request;
 use distributed::graphql::{claim, col, read, GraphqlEngine, ModelPermissions};
-use distributed::{
-    ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-};
+use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
 
 use super::common::{
     engine_all_columns, error_messages, exec_json, seed_orders, session, ChildView, OrderView,
@@ -189,6 +187,7 @@ async fn a5_nested_relationship_column_allowlist_denies() {
 
     let mut parent = ParentView::schema().clone();
     parent.relationships = vec![RelationshipDef {
+        references: None,
         field_name: "children".into(),
         kind: RelationshipKind::HasMany,
         target_model: "ChildView".into(),
@@ -244,6 +243,7 @@ async fn a5_nested_relationship_column_allowlist_denies() {
 fn parent_child_engine(pool: sqlx::SqlitePool) -> GraphqlEngine {
     let mut parent = ParentView::schema().clone();
     parent.relationships = vec![RelationshipDef {
+        references: None,
         field_name: "children".into(),
         kind: RelationshipKind::HasMany,
         target_model: "ChildView".into(),

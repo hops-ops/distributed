@@ -1,16 +1,16 @@
-use distributed::graphql::Eventual;
+use distributed::command::Eventual;
 use distributed::portable_command;
 use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, Todo, TodoState};
 
-#[derive(Debug, Deserialize, distributed::GraphqlInput)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct TodoCompleteInput {
     pub todo_id: String,
 }
 
 /// Shared complete / archive / reopen payload.
-#[derive(Debug, Serialize, distributed::GraphqlOutput)]
+#[derive(Debug, Serialize, distributed::CommandOutput)]
 pub struct TodoStatusPayload {
     pub todo_id: String,
     pub status: String,

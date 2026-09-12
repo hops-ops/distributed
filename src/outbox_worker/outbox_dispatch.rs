@@ -596,7 +596,7 @@ mod tests {
         );
         // The publisher saw the message id, and the row is completed only after.
         assert_eq!(dispatcher.publisher.ids(), vec!["evt-1".to_string()]);
-        assert!(load(&repo, &id).is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key(&id));
     }
 
     #[test]
@@ -640,7 +640,7 @@ mod tests {
 
         assert_eq!(outcome.claimed, 1);
         assert_eq!(outcome.published, 1);
-        assert!(load(&repo, &wanted).is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key(&wanted));
         // The unrequested row is untouched.
         assert!(load(&repo, &other).is_pending());
     }
@@ -723,8 +723,8 @@ mod tests {
         assert_eq!(outcome.claimed, 3);
         assert_eq!(outcome.published, 2);
         assert_eq!(outcome.released, 1);
-        assert!(load(&repo, "evt-1").is_published());
-        assert!(load(&repo, "evt-3").is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key("evt-1"));
+        assert!(!repo.outbox_storage().read().unwrap().contains_key("evt-3"));
         // The failed row is released for retry, untouched by the batched complete.
         let failed = load(&repo, "evt-2");
         assert!(failed.is_pending());
@@ -745,7 +745,7 @@ mod tests {
         assert_eq!(outcome.claimed, 3);
         assert_eq!(outcome.published, 3);
         for id in ["evt-1", "evt-2", "evt-3"] {
-            assert!(load(&repo, id).is_published());
+            assert!(!repo.outbox_storage().read().unwrap().contains_key(id));
         }
         assert_eq!(dispatcher.publisher.ids().len(), 3);
     }

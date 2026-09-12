@@ -46,9 +46,20 @@ import {
 
 type UnknownCommandEntries = Readonly<Record<string, never>>;
 
+type SessionHydration = Readonly<{
+	hydration: SveltekitReplicaHydration;
+	authority: SveltekitReplicaAuthority;
+}>;
+
 export type SveltekitSessionSource = Readonly<{
 	/** Current credential. HTTP, WS, and commands all call this exact source. */
 	getAuth(): GqlAuth | Promise<GqlAuth>;
+	/**
+	 * Fresh server page data received together with the current credential.
+	 * Only independently authorized, same-scope hydration permits reuse during
+	 * credential rotation. Never synthesize this from a token or cached state.
+	 */
+	getHydration?(): SessionHydration | undefined;
 	/**
 	 * Notify on token, logout, role, tenant, or session changes.
 	 *
@@ -100,6 +111,7 @@ export type SveltekitCommandRuntimeLike<TCommands> = Pick<
 > &
 	Readonly<{
 		commands: TCommands;
+		preload?(): Promise<void>;
 	}>;
 
 export type SveltekitCommandRuntimeFactory<TCommands> = (
@@ -249,6 +261,8 @@ export type DistributedSvelteKitClient<TCommands> = Readonly<{
 		artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>,
 		variables: GraphqlVariables
 	): Promise<void>;
+	/** Load deferred command code without dispatching a command. */
+	preloadCommands(): Promise<void>;
 	invalidateAuthorization(): void;
 	destroy(): void;
 }>;
@@ -314,7 +328,21 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 			boundaryController?.disposeScope();
 			replica?.invalidateAuthorization();
 		},
-		options.onAuthError
+		options.onAuthError,
+		(transfer) => {
+			const active = replica?.scope;
+			if (
+				active === undefined ||
+				!sameReplicaScope(active, validatedHydrationAuthority(transfer.authority))
+			) return false;
+			if ((transfer.hydration.bindings ?? []).some(value => !boundaryIds.includes(value))) {
+				return false;
+			}
+			return transfer.hydration.version === 1 && replica!.reauthorize(
+				transfer.hydration.state,
+				validatedHydrationAuthority(transfer.authority)
+			);
+		}
 	);
 	const configuredUrl = options.url;
 	const transport = createReplicaGraphqlTransport({
@@ -499,6 +527,10 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 		prefetch(artifact, variables) {
 			return prefetchReplicaOperation(replica!, artifact, variables);
 		},
+		preloadCommands(): Promise<void> {
+			if (destroyed) return Promise.reject(new Error('Distributed SvelteKit client is destroyed'));
+			return commandRuntime?.preload?.() ?? Promise.resolve();
+		},
 		invalidateAuthorization(): void {
 			if (!destroyed) {
 				boundaryController!.disposeScope();
@@ -558,6 +590,12 @@ export function sessionSourceFromPageData<TData extends PageGraphqlData>(
 	}
 	return Object.freeze({
 		getAuth: () => authFromPageData(source.get()),
+		getHydration: () => {
+			const data: SveltekitDistributedPageData = source.get();
+			return data.distributed === undefined || data.distributedAuthority === undefined
+				? undefined
+				: { hydration: data.distributed, authority: data.distributedAuthority };
+		},
 		...(source.subscribe === undefined
 			? {}
 			: { subscribe: source.subscribe.bind(source) })
@@ -991,23 +1029,41 @@ function sameQuerySnapshot<TData>(
 function createAuthorizationFence(
 	source: SveltekitSessionSource,
 	invalidate: () => void,
-	onError: ((error: unknown) => void) | undefined
+	onError: ((error: unknown) => void) | undefined,
+	refresh: (transfer: SessionHydration) => boolean
 ): Readonly<{ read(): Promise<GqlAuth>; dispose(): void }> {
 	let current: Readonly<GqlAuth> | undefined;
+	const seenHydrations = new WeakSet<SveltekitReplicaHydration>();
+	const seenAuthorities = new WeakSet<SveltekitReplicaAuthority>();
 	let queue = Promise.resolve();
 	let disposed = false;
 	const read = (): Promise<GqlAuth> => {
-		const candidate = Promise.resolve().then(() => source.getAuth());
+		const candidate = (async () => {
+			// Capture the credential and its independent server transfer together,
+			// synchronously at notification time. A queued read would observe a
+			// later seedless page update and lose the refresh's scope evidence.
+			const credential = source.getAuth();
+			const transfer = source.getHydration?.();
+			return { auth: await credential, transfer };
+		})();
 		const transition = queue.then(async () => {
 			try {
-				const next = snapshotAuthCredential(await candidate);
+				const { auth, transfer } = await candidate;
+				const next = snapshotAuthCredential(auth);
 				if (
 					current !== undefined &&
 					!sameAuthCredential(current, next)
 				) {
-					invalidate();
+					const freshTransfer = transfer !== undefined &&
+						!seenHydrations.has(transfer.hydration) &&
+						!seenAuthorities.has(transfer.authority);
+					if (!freshTransfer || !refresh(transfer)) invalidate();
 				}
 				current = next;
+				if (transfer !== undefined) {
+					seenHydrations.add(transfer.hydration);
+					seenAuthorities.add(transfer.authority);
+				}
 				return next;
 			} catch (error) {
 				current = undefined;

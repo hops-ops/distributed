@@ -1,15 +1,16 @@
 //! Chat: mutation + projection.
 //!
 //! Unit partition so the lobby `@live` subscription can advertise resumable
-//! index evidence (`live.supported = true`). Room isolation stays on the
+//! index evidence (`live.mode = "resumable"`). Room isolation stays on the
 //! GraphQL document (`where: { room_id: { _eq: "lobby" } }`). Expression
 //! partitions are correct for multi-room worker sharding, but they make live
-//! indexes incomparable and the client falls back to Idle.
+//! indexes incomparable, so live delivery uses authorized snapshots without
+//! partition-wide resume cursors.
 
+use chat_domain::ChatMessagePostedDomainEvent;
 use distributed::mutation_file;
 use distributed::projection::lower::{DirectCandidate, ProjectionDescriptor};
 use distributed::Mutation;
-use chat_domain::ChatMessagePostedDomainEvent;
 use e2e_readmodels::ChatMessages;
 
 /// Mutation: complete-row upsert for chat messages.
@@ -53,11 +54,18 @@ mod tests {
             occurrence.descriptor(),
             &ChatMessagePostedDomainEvent::descriptor()
         );
-        let lowered = CHAT_MESSAGES.server_executor().unwrap().plan(occurrence).unwrap();
+        let lowered = CHAT_MESSAGES
+            .server_executor()
+            .unwrap()
+            .plan(occurrence)
+            .unwrap();
         let TableMutation::UpsertRow(row) = &lowered.write_plan.mutations[0] else {
             panic!("expected upsert");
         };
-        assert_eq!(row.values.get("body"), Some(&RowValue::String("hello".into())));
+        assert_eq!(
+            row.values.get("body"),
+            Some(&RowValue::String("hello".into()))
+        );
         assert_eq!(
             SaveChatMessage().program().operations()[0].kind(),
             MutationKind::Upsert

@@ -23,8 +23,9 @@ mod time;
 
 pub mod aggregate;
 pub mod application;
-pub mod command_dispatch;
 pub mod bus;
+pub mod command;
+pub mod command_dispatch;
 pub mod domain_event;
 pub mod entity;
 pub mod repository;
@@ -33,6 +34,8 @@ pub(crate) mod command_ledger;
 mod commit_builder;
 #[cfg(feature = "emitter")]
 pub mod emitter;
+#[cfg(feature = "gateway")]
+pub mod gateway;
 pub mod graphql;
 mod in_memory_repo;
 pub mod lock;
@@ -82,7 +85,10 @@ pub use command_dispatch::{
     SharedCommandDispatcher, APPROVED_REMOTE_DISPATCH_PROFILE, COMMAND_DISPATCH_ENVELOPE_VERSION,
 };
 #[cfg(feature = "graphql")]
-pub use command_dispatch::{CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost};
+pub use command_dispatch::{
+    CellRequestContext, CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost,
+    TrustedRequestMetadata,
+};
 
 // Domain events: typed outward contracts distinct from replay events/snapshots.
 pub use domain_event::{
@@ -96,13 +102,13 @@ pub use domain_event::{
 
 // Logical projection contracts. Physical read-model lowering deliberately lives
 // behind adapters and is not part of this semantic surface.
-pub use projection::{LocalProjectionMounts, LocalProjectionMountsBuilder, 
-    ProjectionArm, ProjectionAssignment, ProjectionEnvelopeField, ProjectionEventSelector,
-    ProjectionEventSet, ProjectionExpression, ProjectionField, ProjectionInvalidation,
-    ProjectionKeyField, ProjectionMutationKind, ProjectionMutationProvenance,
-    ProjectionObjectValueField, ProjectionOccurrenceProvenance, ProjectionOperation,
-    ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram, ProjectionProgramError,
-    ProjectionProgramId, ProjectionProgramLimits, ProjectionRelationship,
+pub use projection::{
+    LocalProjectionMounts, LocalProjectionMountsBuilder, ProjectionArm, ProjectionAssignment,
+    ProjectionEnvelopeField, ProjectionEventSelector, ProjectionEventSet, ProjectionExpression,
+    ProjectionField, ProjectionInvalidation, ProjectionKeyField, ProjectionMutationKind,
+    ProjectionMutationProvenance, ProjectionObjectValueField, ProjectionOccurrenceProvenance,
+    ProjectionOperation, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
+    ProjectionProgramError, ProjectionProgramId, ProjectionProgramLimits, ProjectionRelationship,
     ProjectionRelationshipEffect, ProjectionRelationshipEffectKind, ProjectionScalarTransform,
     ProjectionTarget, ProjectionValue, ProjectionValueRef, ProjectionValueType,
     ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionMutationScope,
@@ -169,6 +175,7 @@ macro_rules! projection {
             version: $version:expr,
             epoch: $epoch:literal,
             model: $model:ty,
+            $(source: $source:ident,)?
             $(
                 on {
                     events: [ $($event_ty:ty),+ $(,)? ],
@@ -206,12 +213,14 @@ macro_rules! projection {
                         )+
                     }
                 )+
-                $crate::compile_projection(
+                let program = $crate::compile_projection(
                     $name,
                     $version,
                     $crate::ProjectionPartition::Unit,
                     handlers,
-                )
+                )?;
+                $(let program = $crate::__projection_source_policy!(program, $source)?;)?
+                Ok(program)
             }
             fn __resolve(
                 occurrence: &$crate::DomainEventOccurrence,
@@ -300,6 +309,15 @@ macro_rules! projection {
     };
 }
 
+/// Declaration helper for the closed source-ordering policy.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __projection_source_policy {
+    ($program:expr, aggregate_snapshot) => {
+        $program.with_source_snapshots()
+    };
+}
+
 /// Map `input: { key: body | aggregate_id }` keywords for [`projection!`].
 #[macro_export]
 #[doc(hidden)]
@@ -356,10 +374,6 @@ pub use outbox::{
 // `DEFAULT_OUTBOX_SOURCE_BATCH`, `DEFAULT_OUTBOX_SOURCE_LEASE`) stay reachable
 // under `distributed::outbox_worker::*` and are intentionally NOT re-exported
 // at the crate root.
-pub use outbox_worker::{
-    BusOutboxPublishHook, BusPublisher, ClaimOutboxMessages, OutboxClaimRef, OutboxDispatchOutcome,
-    OutboxDispatcher, OutboxPublishFailureAction, OutboxSource, OutboxStore, ReceivedOutboxMessage,
-};
 #[cfg(any(
     feature = "http",
     feature = "grpc",
@@ -373,6 +387,10 @@ pub use outbox_worker::{
 pub use outbox_worker::{
     drain_worker_id, OutboxDrainHandle, OutboxDrainRunner, OutboxPublishMailbox,
     DEFAULT_OUTBOX_HINT_CAPACITY,
+};
+pub use outbox_worker::{
+    BusOutboxPublishHook, BusPublisher, ClaimOutboxMessages, OutboxClaimRef, OutboxDispatchOutcome,
+    OutboxDispatcher, OutboxPublishFailureAction, OutboxSource, OutboxStore, ReceivedOutboxMessage,
 };
 
 pub use queued_repo::{
@@ -406,12 +424,12 @@ pub use read_model::{
 // `distributed::table::*`.
 pub use table::{
     ColumnType, DeleteTableRowMutation, ExpectedVersion, ForeignKey, PatchMode,
-    PatchTableRowMutation, PrimaryKey, RelationshipDef, RelationshipKind, RowKey, RowPatch,
-    RowValue, RowValues, RowWriteMode, TableAdapterCapabilities, TableColumn, TableCommitOutcome,
-    TableIndex, TableKind, TableMigrationArtifact, TableModel, TableMutation, TableRowMutation,
-    TableSchema, TableSchemaAdapter, TableSchemaAdapterCapabilities, TableSchemaBootstrap,
-    TableSchemaIssue, TableSchemaIssueKind, TableSchemaRegistry, TableSchemaRegistryExt,
-    ReadModelCatalog, TableSchemaVerification, TableStoreError, TableWritePlan,
+    PatchTableRowMutation, PrimaryKey, ReadModelCatalog, RelationshipDef, RelationshipKind, RowKey,
+    RowPatch, RowValue, RowValues, RowWriteMode, TableAdapterCapabilities, TableColumn,
+    TableCommitOutcome, TableIndex, TableKind, TableMigrationArtifact, TableModel, TableMutation,
+    TableRowMutation, TableSchema, TableSchemaAdapter, TableSchemaAdapterCapabilities,
+    TableSchemaBootstrap, TableSchemaIssue, TableSchemaIssueKind, TableSchemaRegistry,
+    TableSchemaRegistryExt, TableSchemaVerification, TableStoreError, TableWritePlan,
     DEFAULT_TABLE_VERSION_COLUMN,
 };
 pub use trace_context::{
@@ -445,9 +463,9 @@ macro_rules! graphql_models {
 
 // Session convenience re-exports used by GraphQL permission filters.
 pub use microsvc::{
-    MessageEndpointDescriptor, MetricsEndpointDescriptor, ROLE_KEY, ServiceDescriptor,
+    MessageEndpointDescriptor, MetricsEndpointDescriptor, ServiceDescriptor,
     ServiceObservabilityDescriptor, TraceExportMode, TracePropagationMode, TracingDescriptor,
-    TransportDescriptor, USER_ID_KEY,
+    TransportDescriptor, ROLE_KEY, USER_ID_KEY,
 };
 
 // Re-export proc macros. The old event-owning projection proc-macro and
@@ -456,8 +474,8 @@ pub use microsvc::{
 // mount); commands predict events via `.emits`/`.preview`.
 pub use distributed_macros::{
     aggregate, application, command, command_input_defaults, digest, module, mutation,
-    mutation_file, portable_command, sourced, DomainEvent, DomainState, GraphqlInput,
-    GraphqlOutput, ReadModel, Snapshot,
+    mutation_file, portable_command, sourced, CommandInput, CommandOutput, DomainEvent,
+    DomainState, ReadModel, Snapshot,
 };
 
 // Re-export enqueue macro (requires "emitter" feature)

@@ -12,6 +12,71 @@ use distributed::{
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::SqlitePoolOptions;
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
+#[table("boxed_accounts")]
+struct BoxedAccount {
+    id: String,
+    #[readmodel(belongs_to = "BoxedProfile", foreign_key = "id")]
+    profile: Option<Box<BoxedProfile>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
+#[table("boxed_profiles")]
+struct BoxedProfile {
+    id: String,
+    owner_id: String,
+    #[readmodel(belongs_to = "BoxedAccount", foreign_key = "id")]
+    account: Option<BoxedAccount>,
+}
+
+#[tokio::test]
+async fn boxed_singular_cycles_preserve_nested_graphql_permissions() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for sql in [
+        "CREATE TABLE boxed_accounts (id TEXT PRIMARY KEY)",
+        "CREATE TABLE boxed_profiles (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL)",
+        "INSERT INTO boxed_accounts VALUES ('a'), ('b')",
+        "INSERT INTO boxed_profiles VALUES ('a', 'alice'), ('b', 'bob')",
+    ] {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
+    let engine = GraphqlEngine::builder(pool)
+        .model::<BoxedAccount>(ModelPermissions::new().grant("user", read().all_columns()))
+        .model::<BoxedProfile>(
+            ModelPermissions::new().grant(
+                "user",
+                read()
+                    .all_columns()
+                    .rows(col("owner_id").eq(distributed::graphql::claim("x-user-id"))),
+            ),
+        )
+        .roles(&["user"])
+        .build()
+        .unwrap();
+    let response = engine
+        .execute(
+            &session_role("user", "alice"),
+            Request::new(
+                "{ boxed_accounts(order_by: [{ id: asc }]) { id profile { id account { id } } } }",
+            ),
+        )
+        .await;
+    assert!(!response.is_err(), "{:?}", response.errors);
+    assert_eq!(
+        serde_json::to_value(response.data).unwrap(),
+        serde_json::json!({
+            "boxed_accounts": [
+                {"id": "a", "profile": {"id": "a", "account": {"id": "a"}}},
+                {"id": "b", "profile": null}
+            ]
+        })
+    );
+}
+
 fn orders_schema() -> TableSchema {
     TableSchema {
         model_name: "OrderView".into(),
@@ -260,6 +325,7 @@ fn parent_schema() -> TableSchema {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "children".into(),
             kind: RelationshipKind::HasMany,
             target_model: "ChildView".into(),
@@ -488,6 +554,7 @@ fn post_schema() -> TableSchema {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "author".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "AuthorView".into(),
@@ -540,8 +607,7 @@ async fn belongs_to_joins_source_fk_to_target_primary_key() {
 #[tokio::test]
 async fn permissions_filter_by_claim() {
     let schema = orders_schema();
-    let manifest =
-        distributed::ReadModelCatalog::new("orders").table_schema(schema.clone());
+    let manifest = distributed::ReadModelCatalog::new("orders").table_schema(schema.clone());
     let pool = setup_pool().await;
 
     // Value-based path: grant_all then we need typed permission — use builder
@@ -638,4 +704,93 @@ async fn domain_service_shaped_fixture() {
     assert_eq!(data["namespaces"][0]["name"], "acme");
     assert_eq!(data["users"][0]["name"], "ada");
     assert_eq!(data["orders"][0]["name"], "widget");
+}
+
+#[cfg(feature = "gateway-delivery")]
+#[tokio::test]
+async fn gateway_dependency_inventory_includes_empty_relationship_filters() {
+    use distributed::graphql::{delivery::GatewayVersionStore, GraphqlPool};
+    use serde_json::{json, Value};
+    let pool = SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for sql in [
+        "CREATE TABLE m2m_players (player_id TEXT PRIMARY KEY, name TEXT NOT NULL)",
+        "CREATE TABLE m2m_weapons (weapon_id TEXT PRIMARY KEY, name TEXT NOT NULL)",
+        "CREATE TABLE m2m_player_weapon_links (player_ref TEXT NOT NULL, weapon_ref TEXT NOT NULL)",
+        "INSERT INTO m2m_players VALUES ('p1', 'Ada')",
+        "INSERT INTO m2m_weapons VALUES ('w1', 'Compiler')",
+    ] {
+        sqlx::query(sql).execute(&pool).await.unwrap();
+    }
+    let store = GatewayVersionStore::install(
+        &GraphqlPool::Sqlite(pool.clone()),
+        "relationship-test",
+        [
+            "m2m_players".into(),
+            "m2m_weapons".into(),
+            "m2m_player_weapon_links".into(),
+        ],
+    )
+    .await
+    .unwrap();
+    let engine = GraphqlEngine::builder(pool.clone())
+        .service_id("relationship-test")
+        .protocol_token_key([17; 32])
+        .table_schema(m2m_link_schema())
+        .model::<M2mPlayer>(ModelPermissions::new().grant("user", read().all_columns()))
+        .model::<M2mWeapon>(ModelPermissions::new().grant("user", read().all_columns()))
+        .roles(&["user"])
+        .gateway_versions(store)
+        .build()
+        .unwrap();
+    let document = r#"{ m2m_players(where: { weapons: { name: { _eq: "Compiler" } } }) { name } }"#;
+    let validate = || async {
+        let mut request = Request::new(document);
+        request.extensions.insert(
+            "gatewayDelivery".into(),
+            async_graphql::Value::from_json(json!({"action":"validate"})).unwrap(),
+        );
+        let response: Value =
+            serde_json::to_value(engine.execute(&session_role("user", "u1"), request).await)
+                .unwrap();
+        assert_eq!(
+            response["extensions"]["gatewayDelivery"]["eligible"], true,
+            "{response}"
+        );
+        response["extensions"]["gatewayDelivery"]["admission"]["validator"].clone()
+    };
+    let empty = validate().await;
+    sqlx::query("INSERT INTO m2m_player_weapon_links VALUES ('p1','w1')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let linked = validate().await;
+    assert_ne!(linked, empty);
+    let rows = engine
+        .execute(&session_role("user", "u1"), Request::new(document))
+        .await;
+    assert_eq!(
+        serde_json::to_value(rows.data).unwrap()["m2m_players"],
+        json!([{"name":"Ada"}])
+    );
+    sqlx::query("UPDATE m2m_weapons SET name='Debugger'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let changed_target = validate().await;
+    assert_ne!(changed_target, linked);
+    sqlx::query("DELETE FROM m2m_player_weapon_links")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_ne!(validate().await, changed_target);
+    let response = engine
+        .execute(&session_role("user", "u1"), Request::new(document))
+        .await;
+    assert_eq!(
+        serde_json::to_value(response.data).unwrap()["m2m_players"],
+        json!([])
+    );
 }

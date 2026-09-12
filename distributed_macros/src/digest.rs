@@ -3,8 +3,8 @@ use quote::{format_ident, quote};
 use syn::{parse::Parser, Expr, Ident, ItemFn, LitStr, Token};
 
 use crate::shared::{
-    ensure_sourced_result_signature, extract_params_with_types, generate_digest_call,
-    framework_path, wrap_result_body_with_guard,
+    ensure_sourced_result_signature, extract_params_with_types, framework_path,
+    generate_digest_call, wrap_result_body_with_guard,
 };
 
 pub(crate) fn expand_digest(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {

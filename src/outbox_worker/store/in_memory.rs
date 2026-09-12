@@ -127,13 +127,7 @@ impl OutboxStore for InMemoryOutboxStore {
         &'a self,
         claim: &'a OutboxClaimRef,
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
-        async move {
-            self.update_outbox_message(&claim.message_id, |message| {
-                ensure_active_claim(message, Some(claim), crate::time::now())?;
-                message.complete()?;
-                Ok(())
-            })
-        }
+        async move { self.complete_many(std::slice::from_ref(claim)).await }
     }
 
     /// Batched complete under a single write lock instead of one lock
@@ -161,7 +155,7 @@ impl OutboxStore for InMemoryOutboxStore {
                     }
                 })?;
                 ensure_active_claim(message, Some(claim), now)?;
-                message.complete()?;
+                storage.remove(&claim.message_id);
             }
             Ok(())
         }

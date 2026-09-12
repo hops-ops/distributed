@@ -51,6 +51,12 @@ to validate that committed artifacts are current without rewriting them.
 
 A co-located route document can opt into SSR and live continuation:
 
+Row-filtered `@live` queries remain subscribed using authorized replacement
+snapshots; cursor-capable queries retain resumable delivery. Neither requires
+application polling. The v5 wire protocol uses `live.mode` (`snapshot` or
+`resumable`), replacing `live.supported`; upgrade client and server together.
+See [live query delivery](../docs/live-query-delivery.md).
+
 ```graphql
 query Todos @load @live {
   todos(order_by: [{ status: asc }, { todo_id: asc }]) {
@@ -304,6 +310,36 @@ await client.prefetchLocation(target.pathname, {
 });
 ```
 
+### Optional lazy command loading
+
+For read-heavy applications, switch the root layout's generated provider import:
+
+```ts
+import { provideDistributedLazy as provideDistributed } from '$distributed';
+```
+
+Use the same provider options and `useCommands()` methods. The lazy provider
+registers the generated surface authority immediately after hydration, and imports
+one shared command runtime and its definitions on the first command. Queries,
+SSR, hydration, and route prefetch keep their existing behavior. The default
+`provideDistributed` and framework-neutral `createCommands` remain eager.
+
+To load command code before an interaction, call `await client.preloadCommands()`
+when opening an editor or focusing an editing control. This imports code without
+sending a command. The first cold command waits for this import before optimistic
+feedback can appear; failed imports reject and can be retried. Imports never
+replay commands. Pending receipts and status recovery remain owned by the shared
+client across route changes. On controlled reload, an existing
+`reload.recoverPendingCommands` callback runs after lazy command code is ready;
+applications still own that callback's recovery policy.
+
+Regenerate the client with the matching CLI/runtime release to obtain
+`provideDistributedLazy` and `createLazyCommands`. Framework-neutral consumers
+can use `createLazyCommands` from the generated `lazy-commands.js` module and
+call its `preload()` method. Directly importing `COMMANDS`, command artifacts,
+`createCommands`, or command-dependent pure functions elsewhere in the browser
+can keep those definitions eager. Verify the production bundle for your app.
+
 Route components import only their generated surface. Static operation wrappers
 resolve the nearest tree-local client when used:
 
@@ -325,8 +361,20 @@ once. Components do not generate IDs or maintain optimistic/cache recipes.
 `@load` results are normalized on the server, dehydrated, and restored in the
 browser without a duplicate first request. Hydration cannot authorize itself:
 the server sends a separate authority value, and the adapter requires both
-values to match. Session, token, tenant, or role changes abort HTTP and live
-work, discard the old generation, and reconnect under server-issued scope.
+values to match. Credential changes abort old HTTP and live work. Without fresh
+server evidence, they also discard the old generation. A refreshed credential
+received together with a new authorized seed for the exact active scope can
+keep the warm replica and pending optimism. The seed proves authorization;
+its data does not overwrite newer local command results or freshness floors.
+`createPageDataSessionSource`
+provides that transfer automatically; custom session sources can supply
+`getHydration()` alongside `getAuth()`. Never derive this authority from a JWT
+or reuse an old transfer. Logout, changed scopes, and invalid hydration still
+purge the generation.
+
+The sample auth refresh endpoint returns an authorized seed for the current
+route before invalidating SvelteKit page data. Ordinary SPA navigation still
+skips server GraphQL work.
 
 Confirmed records and indexes under an active scope stay until auth/scope
 change, stale+revalidate, or a newer authoritative write. Same-scope soft
@@ -393,6 +441,14 @@ same replica and GraphQL transport. A command call:
    - **Atomic / Direct** — normalize the **returned** row
      (`confirmDirectProjection`) before the call settles. The server waited in
      the command handler because it could; an event handler cannot.
+
+An Eventual command may be terminal `succeeded` at a cell boundary while its
+status envelope already carries every exact projection observation. Those
+observations settle `receipt.projected` because they prove delivery of the
+projection obligation; they do not retire the accepted optimistic layer. The
+layer is retired only by a matching canonical query or live frame, so an
+`@load` operation does not need to become `@live` merely to complete a causal
+wait. A later query or navigation can still supply that canonical frame.
 
 Applications do not provide list targets, merge functions, mutation update
 callbacks, board simulators, or invalidation maps. If the compiler cannot prove

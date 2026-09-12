@@ -12,6 +12,10 @@ description = "workers-rs Todo and Chat cells: AggregateCell + domain handles"
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Only the isolated crash/rollback harness builds these authenticated probes.
+storage-conformance = []
+
 [dependencies]
 console_error_panic_hook = "0.1"
 distributed = { path = "../../..", default-features = false, features = ["workers-rs"] }

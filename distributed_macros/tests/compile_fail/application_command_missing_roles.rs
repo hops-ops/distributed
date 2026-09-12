@@ -4,13 +4,13 @@ struct Input;
 #[distributed::command(
     id = "todo.create",
     input = Input,
-    outcome = distributed::graphql::Succeeded<Input>
+    outcome = distributed::command::Succeeded<Input>
 )]
 async fn missing_roles(
     _context: &distributed::microsvc::CausalCommandContext<'_, Aggregate>,
     _input: Input,
 ) -> Result<
-    distributed::graphql::PreparedCommand<distributed::graphql::Succeeded<Input>>,
+    distributed::command::PreparedCommand<distributed::command::Succeeded<Input>>,
     distributed::microsvc::HandlerError,
 > {
     unreachable!()

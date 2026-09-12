@@ -111,10 +111,11 @@ pub fn decisions_are_distinct(changes: &[ClassifiedChange]) -> bool {
     // Distinctness is only meaningful when both families appear.
     let has_wire = seen.contains(&LifecycleDecision::AcceptManifestWire);
     let has_protocol = seen.contains(&LifecycleDecision::AcceptProtocolSemantic);
-    !(has_wire && has_protocol && changes.iter().any(|c| {
-        c.decision == LifecycleDecision::AcceptManifestWire
-            && c.path.contains("protocol")
-    }))
+    !(has_wire
+        && has_protocol
+        && changes.iter().any(|c| {
+            c.decision == LifecycleDecision::AcceptManifestWire && c.path.contains("protocol")
+        }))
 }
 
 #[cfg(test)]

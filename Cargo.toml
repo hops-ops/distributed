@@ -35,6 +35,17 @@ required-features = ["graphql", "sqlite"]
 [features]
 default = []
 application-runtime = []
+# Portable gateway declarations and dispatch only; runtime adapters are separate.
+gateway = ["dep:url"]
+# Native HTTP adapter remains independent of GraphQL and SQL.
+gateway-native = ["gateway", "http", "reqwest/stream", "dep:hyper", "dep:hyper-util", "dep:tower", "tokio/io-util"]
+# Whole-operation selection is portable; execution adapters are separately gated.
+gateway-graphql = ["gateway", "dep:async-graphql-parser"]
+# Shared portable identity, freshness and delivery contracts.
+gateway-delivery = ["gateway-graphql"]
+# workers-rs ingress and delivery contracts, without native executors.
+gateway-worker = ["gateway-delivery", "dep:worker", "dep:futures-channel"]
+gateway-graphql-native = ["gateway-native", "gateway-graphql", "graphql", "dep:tokio-tungstenite"]
 runtime = ["application-runtime"]
 emitter = ["dep:event-emitter-rs"]
 metrics = []
@@ -53,8 +64,13 @@ graphql = ["dep:async-graphql", "dep:async-graphql-axum", "dep:hmac", "dep:jsonw
 async-nats = { version = "0.50", optional = true }
 async-trait = "0.1"
 async-graphql = { version = "7", optional = true }
+async-graphql-parser = { version = "7", optional = true }
+tokio-tungstenite = { version = "0.30", optional = true }
 async-graphql-axum = { version = "7", optional = true }
 axum = { version = "0.8", optional = true }
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
 base64 = "0.23.0"
 futures = { version = "0.3", optional = true }
 lapin = { version = "4", optional = true }
@@ -63,6 +79,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 jsonwebtoken = { version = "9", optional = true }
 bitcode = { version = "0.6.9", features = ["serde"] }
 event-emitter-rs = { version = "0.1.4", optional = true }
+futures-channel = { version = "0.3", features = ["sink"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hmac = { version = "0.12", optional = true }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"], optional = true }
@@ -79,6 +96,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time",
 tracing = { version = "0.1", optional = true }
 tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
 uuid = { version = "1", features = ["v7"] }
+url = { version = "2", optional = true }
 worker = { version = "0.8", features = ["queue"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
@@ -92,7 +110,7 @@ sha2 = "0.10"
 tonic-build = { version = "0.14", default-features = false, features = ["transport"] }
 
 [dev-dependencies]
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 distributed_cli = { path = "distributed_cli" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

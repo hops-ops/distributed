@@ -22,6 +22,20 @@ use super::{
 /// Version of the canonical [`DomainEventOccurrence`] envelope.
 pub const DOMAIN_EVENT_OCCURRENCE_VERSION: u16 = 1;
 
+/// Provenance of a typed fact produced while handling an earlier occurrence.
+/// The envelope's aggregate fields still describe the originating transition,
+/// not a new aggregate commit by this producer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DomainEventDerivation {
+    /// Immediate parent occurrence (which may itself be derived).
+    pub source_occurrence_id: String,
+    /// Stable effect-handler identity.
+    pub producer: String,
+    /// Stable output identity within this handler/source pair.
+    pub output_key: String,
+}
+
 /// Immutable framework metadata captured with one outward event transition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DomainEventEnvelope {
@@ -42,6 +56,8 @@ pub struct DomainEventEnvelope {
 /// One exact typed outward event captured at aggregate transition time.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct DomainEventOccurrence {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    derivation: Option<DomainEventDerivation>,
     /// Canonical occurrence envelope version.
     occurrence_version: u16,
     /// Retry-stable occurrence identity.
@@ -113,6 +129,7 @@ impl DomainEventOccurrence {
         validate_stable_message_id(Some(&id)).map_err(DomainEventCaptureError::OccurrenceId)?;
 
         let occurrence = Self {
+            derivation: None,
             occurrence_version: DOMAIN_EVENT_OCCURRENCE_VERSION,
             id,
             descriptor,
@@ -131,6 +148,80 @@ impl DomainEventOccurrence {
     /// Return the immutable canonical body bytes.
     pub fn body_bytes(&self) -> &[u8] {
         &self.body
+    }
+
+    /// Derive a typed fact without inventing another aggregate transition.
+    ///
+    /// Repeat with the same source, producer, output key and body for identical
+    /// canonical bytes. Changed bodies have distinct identities. Publishing is
+    /// still at-least-once: acknowledge the source only after all outputs have
+    /// been accepted by the bus, and retry accepted prefixes with these IDs.
+    pub fn derive<T: super::DomainEvent + Serialize>(
+        &self,
+        producer: &str,
+        output_key: &str,
+        body: &T,
+    ) -> Result<Self, DomainEventCaptureError> {
+        self.validate()?;
+        let mut result = self.clone();
+        result.descriptor = T::DESCRIPTOR.clone();
+        if result.descriptor.body.kind != DomainEventBodyKind::Event {
+            return Err(DomainEventCaptureError::BodyKindMismatch {
+                expected: DomainEventBodyKind::Event,
+                actual: result.descriptor.body.kind,
+            });
+        }
+        result.derivation = Some(DomainEventDerivation {
+            source_occurrence_id: self.id.clone(),
+            producer: producer.into(),
+            output_key: output_key.into(),
+        });
+        result.body = canonical_json_bytes(body)?;
+        result.id = result.derived_identity()?;
+        result.canonical_bytes()?;
+        Ok(result)
+    }
+
+    /// None for an aggregate's own captured transition facts.
+    pub fn derivation(&self) -> Option<&DomainEventDerivation> {
+        self.derivation.as_ref()
+    }
+
+    fn derived_identity(&self) -> Result<String, DomainEventCaptureError> {
+        let derivation = self
+            .derivation
+            .as_ref()
+            .ok_or(DomainEventCaptureError::InvalidDerivation)?;
+        validate_message_name(&derivation.producer)
+            .map_err(|_| DomainEventCaptureError::InvalidDerivation)?;
+        validate_stable_message_id(Some(&derivation.source_occurrence_id))
+            .map_err(|_| DomainEventCaptureError::InvalidDerivation)?;
+        if derivation.output_key.trim().is_empty()
+            || derivation.output_key.len() > 1024
+            || derivation.output_key.chars().any(char::is_control)
+        {
+            return Err(DomainEventCaptureError::InvalidDerivation);
+        }
+        if self.descriptor.body.kind != DomainEventBodyKind::Event {
+            return Err(DomainEventCaptureError::InvalidDerivation);
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"distributed.domain-event.derived/v1\0");
+        for value in [
+            &derivation.source_occurrence_id,
+            &derivation.producer,
+            &derivation.output_key,
+            &self.aggregate_type,
+            &self.aggregate_id,
+        ] {
+            hash_component(&mut hash, value.as_bytes());
+        }
+        hash.update(self.aggregate_sequence.to_be_bytes());
+        hash.update(self.publication_ordinal.to_be_bytes());
+        hash.update(self.occurred_at_unix_ms.to_be_bytes());
+        hash_component(&mut hash, &canonical_json_bytes(&self.descriptor)?);
+        hash_component(&mut hash, &self.body);
+        Ok(format!("dd1:sha256:{:x}", hash.finalize()))
     }
 
     /// Return the canonical occurrence envelope version.
@@ -241,6 +332,7 @@ impl DomainEventOccurrence {
         let wire: DomainEventOccurrenceWire = serde_json::from_slice(bytes)
             .map_err(|error| DomainEventCaptureError::OccurrenceDecoding(error.to_string()))?;
         let occurrence = Self {
+            derivation: wire.derivation,
             occurrence_version: wire.occurrence_version,
             id: wire.id,
             descriptor: wire.descriptor,
@@ -294,7 +386,12 @@ impl DomainEventOccurrence {
             occurred_at: UNIX_EPOCH,
             metadata: BTreeMap::new(),
         };
-        if occurrence_id(&self.descriptor, &envelope) != self.id {
+        let expected_id = if self.derivation.is_some() {
+            self.derived_identity()?
+        } else {
+            occurrence_id(&self.descriptor, &envelope)
+        };
+        if expected_id != self.id {
             return Err(DomainEventCaptureError::OccurrenceIdentityMismatch);
         }
         Ok(())
@@ -310,6 +407,8 @@ impl DomainEventOccurrence {
 
 #[derive(Deserialize)]
 struct DomainEventOccurrenceWire {
+    #[serde(default)]
+    derivation: Option<DomainEventDerivation>,
     occurrence_version: u16,
     id: String,
     descriptor: DomainEventDescriptor,
@@ -390,6 +489,8 @@ fn validate_fingerprint(fingerprint: &str) -> Result<(), DomainEventCaptureError
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DomainEventCaptureError {
+    /// Derived provenance has an invalid producer, output key or source identity.
+    InvalidDerivation,
     /// Semantic event name violated transport naming rules.
     EventName(MessageNameError),
     /// Aggregate type violated transport naming rules.
@@ -468,6 +569,7 @@ pub enum DomainEventCaptureError {
 impl fmt::Display for DomainEventCaptureError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidDerivation => formatter.write_str("invalid domain-event derivation"),
             Self::EventName(error) => write!(formatter, "invalid domain-event name: {error}"),
             Self::AggregateType(error) => write!(formatter, "invalid aggregate type: {error}"),
             Self::AggregateId(error) => write!(formatter, "invalid aggregate id: {error}"),

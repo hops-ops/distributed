@@ -256,7 +256,7 @@ mod tests {
         let mut src = source(&repo);
         let received = block_on(src.recv()).unwrap().unwrap();
         block_on(received.ack()).unwrap();
-        assert_eq!(status(&repo, "m1"), Some(OutboxMessageStatus::Published));
+        assert_eq!(status(&repo, "m1"), None);
     }
 
     #[test]
@@ -308,8 +308,8 @@ mod tests {
         let mut ids = handled.lock().unwrap().clone();
         ids.sort();
         assert_eq!(ids, vec!["m1".to_string(), "m2".to_string()]);
-        assert_eq!(status(&repo, "m1"), Some(OutboxMessageStatus::Published));
-        assert_eq!(status(&repo, "m2"), Some(OutboxMessageStatus::Published));
+        assert_eq!(status(&repo, "m1"), None);
+        assert_eq!(status(&repo, "m2"), None);
     }
 
     #[test]
@@ -327,6 +327,6 @@ mod tests {
             ),
         );
         block_on(run_source(service, source(&repo), RunOptions::idempotent())).unwrap();
-        assert_eq!(status(&repo, "m1"), Some(OutboxMessageStatus::Published));
+        assert_eq!(status(&repo, "m1"), None);
     }
 }

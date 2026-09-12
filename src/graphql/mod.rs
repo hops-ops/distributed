@@ -1,4 +1,4 @@
-//! Auto-generated read-only GraphQL over relational read models.
+//! GraphQL gateway for read-model queries, subscriptions, and core commands.
 //!
 //! `naming` and `sdl` always compile (zero deps beyond the rest of the crate)
 //! so `distributed schema --format graphql` works without enabling the `graphql`
@@ -6,7 +6,6 @@
 //! `feature = "graphql"`.
 
 pub mod client_manifest;
-pub(crate) mod command_contract;
 pub mod naming;
 pub mod projection_delta;
 pub mod sdl;
@@ -19,31 +18,8 @@ mod commands;
 mod complexity_contract;
 mod filter;
 mod permissions;
-mod types;
 
 pub use client_manifest::*;
-#[doc(hidden)]
-pub use command_contract::{
-    __command_input_defaults, __effect_key, __effect_key_assignment, __effect_key_field,
-    __effect_relationship, __input_default_ulid, __input_default_uuid_v7, CombineEffectNullability,
-    CompiledEffectKeyField, CompiledInputDefault, EffectInputDescendableKind,
-    EffectInputFieldMarker, EffectInputObjectKind, EffectInputPath, EffectInputPathKind,
-    EffectInputTerminalKind, EffectModelFieldMarker, EffectNullable, EffectPathNullability,
-    EffectRelationshipMarker, EffectRequired, EffectWireBigInt, EffectWireBoolean, EffectWireBytea,
-    EffectWireChecked, EffectWireCompatible, EffectWireFloat, EffectWireJson, EffectWireList,
-    EffectWireLiteral, EffectWireObject, EffectWireString, EffectWireTimestamp,
-    EffectWireUnsupported,
-};
-pub use command_contract::{
-    __command_projection_event_descriptor, __command_projection_event_preview,
-    __command_projection_events, __command_projection_preview_constant,
-    __command_projection_state_known_values, __command_projection_state_preview,
-    command_transition, typed_command, Atomic, CommandConsistency, CommandEventSet, CommandOutcome,
-    CommandProjectionEventSet, CommandProjectionPreview, CommandProjectionPreviewSource,
-    CommandProjectionPureArg, CommandProjectionPureReduce, CompiledDirectProjectionTarget,
-    CompiledInputDefaults, Eventual, PrepareCommandError, PreparedCommand, Succeeded, TypedCommand,
-    TypedEffectExpression, TypedEffectKey, TypedEffectRelationship,
-};
 pub use naming::{
     aggregate_field, by_pk_field, comparison_op_fields, include_postgres_json_comparison_ops,
     is_valid_graphql_name, mutation_delete_by_pk_field, mutation_insert_one_field,
@@ -68,9 +44,7 @@ pub use permissions::{
     read, role_grant_from_read_permission, role_grants_from_model_role_perms, ModelPermissions,
     ReadPermission,
 };
-pub use types::{GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField};
 
-pub(crate) mod command_input;
 #[cfg(feature = "graphql")]
 mod compile;
 #[cfg(feature = "graphql")]
@@ -100,8 +74,8 @@ pub use engine::{
 };
 #[cfg(feature = "graphql")]
 pub use http::{
-    graphiql_page, graphql_router, graphql_router_with_dispatcher, graphql_router_with_host,
-    graphql_router_with_service,
+    graphiql_page, graphql_router, graphql_router_composed, graphql_router_with_dispatcher,
+    graphql_router_with_host, graphql_router_with_service, GraphqlOperationFilter,
 };
 #[cfg(feature = "graphql")]
 pub use identity::{
@@ -115,3 +89,9 @@ pub use identity::{
 pub use read_store::{CellByKeyGetter, HttpCellByKey, MapCellByKey, ReadStore};
 #[cfg(feature = "graphql")]
 pub use subscribe::ChangeHub;
+
+#[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+pub use engine::ReadRouting;
+
+#[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+pub mod delivery;

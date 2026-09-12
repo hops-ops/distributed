@@ -86,9 +86,8 @@ pub(crate) fn build_declared_wasm_pures(
         return Ok(0);
     };
     let ui_lib = ui_root.join("src/lib");
-    let wasm_pack_launcher = wasm_pack_launcher.ok_or(
-        "browser WASM pures require @hops-ops/distributed in the application UI",
-    )?;
+    let wasm_pack_launcher = wasm_pack_launcher
+        .ok_or("browser WASM pures require @hops-ops/distributed in the application UI")?;
     let compiler_identity = compiler_identity(wasm_pack_launcher)?;
     let mut outputs = BTreeMap::<PathBuf, &WasmPure>::new();
     for pure in &pures {
@@ -437,7 +436,11 @@ fn compiler_identity(launcher: &Path) -> Result<String, Box<dyn Error>> {
             )
             .into());
         }
-        hash.update(file.strip_prefix(package_root)?.to_string_lossy().as_bytes());
+        hash.update(
+            file.strip_prefix(package_root)?
+                .to_string_lossy()
+                .as_bytes(),
+        );
         hash.update([0]);
         hash.update(&content);
         hash.update([0]);
@@ -927,5 +930,4 @@ mod tests {
             .to_string()
             .contains("more than one local Cargo package"));
     }
-
 }

@@ -7,9 +7,10 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::causal::{CellCommandIdentity, CellDispatchError, CellDispatchResult};
+use super::store::CellStreamStore;
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 use super::store::{
-    CellStreamStore, DurableAggregateCellState, DurableCellCommand, DurableCellEvents,
-    DurableCellSnapshot,
+    DurableAggregateCellState, DurableCellCommand, DurableCellEvents, DurableCellSnapshot,
 };
 use crate::aggregate::{Aggregate, AggregateRepository};
 use crate::microsvc::error::HandlerError;
@@ -18,7 +19,7 @@ use crate::microsvc::session::Session;
 use crate::microsvc::HasOutboxStore;
 use crate::repository::{RepositoryError, SnapshotStore, StreamIdentity};
 use crate::snapshot::{SnapshotRecord, Snapshottable};
-use crate::{InMemoryOutboxStore, OutboxDispatcher};
+use crate::OutboxDispatcher;
 
 /// Cell class for aggregate `A`. Equivalent to
 /// `#[distributed::cell(aggregate = A)]`: mount the same domain
@@ -52,6 +53,10 @@ where
     routes: Routes<AggregateRepository<CellStreamStore, A>>,
     #[cfg(feature = "workers-rs")]
     celld_outbox: Option<super::celld_outbox::CelldOutbox>,
+    #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+    activity: super::celld_outbox::CommandActivity,
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    storage: worker::send::SendWrapper<worker::Storage>,
 }
 
 impl<A> AggregateCell<A>
@@ -59,6 +64,7 @@ where
     A: Aggregate + Send + Sync + 'static,
 {
     /// Open a cell instance addressed as `{aggregate_type}:{shard_id}`.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn new(shard_id: impl Into<String>) -> Result<Self, RepositoryError> {
         let shard = StreamIdentity::new(A::aggregate_type(), shard_id.into())?;
         let store = CellStreamStore::for_identity(shard.clone());
@@ -67,6 +73,27 @@ where
             routes: Routes::from_dependencies(AggregateRepository::new(store)),
             #[cfg(feature = "workers-rs")]
             celld_outbox: None,
+            #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+            activity: Default::default(),
+        })
+    }
+
+    /// Open the named runtime-owned SQLite cell. Mount commands and configure
+    /// its Queue binding before dispatch; no in-memory persistence path exists.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    pub fn from_state(state: worker::State) -> Result<Self, RepositoryError> {
+        let name = state.id().name().ok_or_else(|| {
+            RepositoryError::Model("aggregate cells require a named Durable Object".into())
+        })?;
+        let shard = StreamIdentity::new(A::aggregate_type(), name)?;
+        let storage = worker::send::SendWrapper::new(state.storage());
+        let store = CellStreamStore::from_state(state, shard.clone())?;
+        Ok(Self {
+            shard,
+            routes: Routes::from_dependencies(AggregateRepository::new(store)),
+            celld_outbox: None,
+            activity: Default::default(),
+            storage,
         })
     }
 
@@ -111,6 +138,11 @@ where
         input: Value,
         session: Session,
     ) -> Result<Value, HandlerError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        let _command = self
+            .begin_command()
+            .await
+            .map_err(|error| HandlerError::Other(Box::new(error)))?;
         self.routes
             .dispatch_cell_command(command, input, session, &self.shard)
             .await
@@ -128,6 +160,11 @@ where
         input: Value,
         session: Session,
     ) -> Result<CellDispatchResult, CellDispatchError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        let _command = self
+            .begin_command()
+            .await
+            .map_err(|error| CellDispatchError::Internal(error.to_string()))?;
         self.routes
             .dispatch_cell_causal(command, identity, input, session, &self.shard)
             .await
@@ -142,11 +179,13 @@ where
     }
 
     /// Event log for Durable Object SQLite persistence.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_events(&self) -> Result<Vec<DurableCellEvents>, RepositoryError> {
         self.routes.repo().repo().durable_events()
     }
 
     /// Restore the working event log from Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_events(
         &self,
         events: Vec<DurableCellEvents>,
@@ -155,6 +194,7 @@ where
     }
 
     /// Outbox rows committed with the aggregate (same cell SQLite).
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_outbox(&self) -> Result<Vec<crate::OutboxMessage>, RepositoryError> {
         self.routes.repo().repo().durable_outbox()
     }
@@ -169,7 +209,7 @@ where
         worker_id: impl Into<String>,
         lease: Duration,
         max_attempts: u32,
-    ) -> OutboxDispatcher<InMemoryOutboxStore, P>
+    ) -> OutboxDispatcher<<CellStreamStore as HasOutboxStore>::OutboxStore, P>
     where
         P: crate::bus::MessagePublisher,
     {
@@ -189,31 +229,52 @@ where
         self
     }
 
-    /// Persist this cell's complete state, durably arm its Queue watchdog,
-    /// dispatch pending outbox rows, persist settlements, and rearm or clear
-    /// the watchdog according to the remaining backlog. Once the initial state
-    /// and watchdog are durable, later failures are returned as deferred drain
-    /// diagnostics rather than as a rejection of the committed command.
-    #[cfg(feature = "workers-rs")]
-    pub async fn persist_and_drain_outbox<F, E>(
+    /// Drain committed rows to the configured Queue. Call from the alarm handler
+    /// and optionally after dispatch for low latency. No persistence callback is
+    /// needed. A post-commit drain error must not reject an accepted command.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    pub async fn drain_outbox(
         &self,
         env: &worker::Env,
-        storage: &worker::Storage,
-        persist: F,
-    ) -> Result<super::celld_outbox::CelldOutboxDrainOutcome, crate::bus::TransportError>
-    where
-        F: Fn(&DurableAggregateCellState) -> Result<(), E>,
-        E: std::fmt::Display,
-    {
-        let outbox = self.celld_outbox.as_ref().ok_or_else(|| {
+    ) -> Result<super::celld_outbox::CelldOutboxDrainOutcome, crate::bus::TransportError> {
+        self.outbox_config()?.drain(self, env, &self.storage).await
+    }
+
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    fn outbox_config(
+        &self,
+    ) -> Result<&super::celld_outbox::CelldOutbox, crate::bus::TransportError> {
+        self.celld_outbox.as_ref().ok_or_else(|| {
             crate::bus::TransportError::permanent(
                 "aggregate cell has no celld outbox binding configured",
             )
-        })?;
-        outbox.persist_and_drain(self, env, storage, persist).await
+        })
+    }
+
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    async fn begin_command(
+        &self,
+    ) -> Result<super::celld_outbox::CommandGuard, crate::bus::TransportError> {
+        self.outbox_config()?
+            .begin_command(
+                &self.activity,
+                &super::celld_outbox::WorkerAlarm(&self.storage),
+            )
+            .await
+    }
+
+    #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+    pub(super) fn command_activity(&self) -> &super::celld_outbox::CommandActivity {
+        &self.activity
+    }
+
+    #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+    pub(super) fn outbox_store(&self) -> <CellStreamStore as HasOutboxStore>::OutboxStore {
+        self.routes.repo().repo().outbox_store()
     }
 
     /// Restore outbox rows from Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_outbox(
         &self,
         messages: Vec<crate::OutboxMessage>,
@@ -222,11 +283,13 @@ where
     }
 
     /// Snapshot cache for Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_snapshots(&self) -> Result<Vec<DurableCellSnapshot>, RepositoryError> {
         self.routes.repo().repo().durable_snapshots()
     }
 
     /// Restore the working snapshot cache from Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_snapshots(
         &self,
         snapshots: Vec<DurableCellSnapshot>,
@@ -238,11 +301,13 @@ where
     }
 
     /// Command-ledger rows for Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_commands(&self) -> Result<Vec<DurableCellCommand>, RepositoryError> {
         self.routes.repo().repo().durable_commands()
     }
 
     /// Restore command-ledger rows before accepting another wait-path request.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_commands(
         &self,
         commands: Vec<DurableCellCommand>,
@@ -252,11 +317,13 @@ where
 
     /// Export events, snapshots, command ledger, outbox, and sealed row as one
     /// versioned value suitable for a single durable storage write.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_state(&self) -> Result<DurableAggregateCellState, RepositoryError> {
         self.routes.repo().repo().durable_state()
     }
 
     /// Restore the complete working copy from one durable storage value.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_state(
         &self,
         state: DurableAggregateCellState,
@@ -270,11 +337,13 @@ where
     }
 
     /// Sealed read-model JSON for GET on this instance.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn sealed_row(&self) -> Result<Option<Value>, RepositoryError> {
         self.routes.repo().repo().sealed_row()
     }
 
     /// Persist the sealed read-model row next to events/snapshots.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn replace_sealed_row(&self, row: Value) -> Result<(), RepositoryError> {
         self.routes.repo().repo().replace_sealed_row(row)
     }
@@ -284,7 +353,31 @@ impl<A> AggregateCell<A>
 where
     A: Aggregate + Snapshottable + Send + Sync + 'static,
 {
+    /// Open a SQL cell with the ordinary repository snapshot policy.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    pub fn from_state_with_snapshots(
+        state: worker::State,
+        frequency: u64,
+    ) -> Result<Self, RepositoryError> {
+        let name = state.id().name().ok_or_else(|| {
+            RepositoryError::Model("aggregate cells require a named Durable Object".into())
+        })?;
+        let shard = StreamIdentity::new(A::aggregate_type(), name)?;
+        let storage = worker::send::SendWrapper::new(state.storage());
+        let store = CellStreamStore::from_state(state, shard.clone())?;
+        Ok(Self {
+            shard,
+            routes: Routes::from_dependencies(
+                AggregateRepository::new(store).with_snapshots(frequency),
+            ),
+            celld_outbox: None,
+            activity: Default::default(),
+            storage,
+        })
+    }
+
     /// Open a cell with repository snapshot caching (`with_snapshots`).
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn new_with_snapshots(
         shard_id: impl Into<String>,
         frequency: u64,
@@ -298,6 +391,8 @@ where
             ),
             #[cfg(feature = "workers-rs")]
             celld_outbox: None,
+            #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+            activity: Default::default(),
         })
     }
 }
@@ -345,6 +440,7 @@ where
     }
 
     /// Create or return the cell for `shard_id`.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn get_or_create(
         &mut self,
         shard_id: &str,

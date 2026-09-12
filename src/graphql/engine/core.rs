@@ -231,6 +231,10 @@ pub(crate) struct EngineInner {
     pub command_binding: Option<TypedServiceCommandBinding>,
     pub causal_storage_identity: Option<crate::command_ledger::CausalStorageIdentity>,
     pub pool: GraphqlPool,
+    #[cfg(feature = "gateway-delivery")]
+    pub read_routing: Option<super::ReadRouting>,
+    #[cfg(feature = "gateway-delivery")]
+    pub gateway_versions: Option<crate::graphql::delivery::GatewayVersionStore>,
     pub catalog: BTreeMap<String, CatalogEntry>,
     pub by_table: BTreeMap<String, String>,
     pub permissions: BTreeMap<(String, String), RoleModelPerm>,
@@ -294,6 +298,10 @@ pub struct GraphqlEngineBuilder {
     pub(crate) command_binding: Option<TypedServiceCommandBinding>,
     pub(crate) causal_storage_identity: Option<crate::command_ledger::CausalStorageIdentity>,
     pub(crate) pool: GraphqlPool,
+    #[cfg(feature = "gateway-delivery")]
+    pub(crate) read_routing: Option<super::ReadRouting>,
+    #[cfg(feature = "gateway-delivery")]
+    pub(crate) gateway_versions: Option<crate::graphql::delivery::GatewayVersionStore>,
     pub(crate) catalog: BTreeMap<String, CatalogEntry>,
     pub(crate) by_table: BTreeMap<String, String>,
     pub(crate) permissions: BTreeMap<(String, String), RoleModelPerm>,
@@ -309,6 +317,7 @@ pub struct GraphqlEngineBuilder {
     pub(crate) introspection_for_anonymous: bool,
     pub(crate) statement_timeout: Duration,
     pub(crate) graphiql: bool,
+    pub(crate) subscriptions: bool,
     pub(crate) typed_commands: TypedCommandInventory,
     pub(crate) projectors: Vec<SurfaceProjectionOwner>,
     pub(crate) change_rx: Option<tokio::sync::broadcast::Receiver<ReadModelChange>>,

@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::aggregate::{hydrate, AggregateRepository, SnapshotPolicy};
+use crate::aggregate::{hydrate, AggregateRepository, SnapshotPolicy, StreamReads};
 use crate::entity::{upcast_events_for_replay, Entity, EventRecord};
 use crate::repository::{GetStream, RepositoryError, SnapshotStore, StreamIdentity};
 
@@ -319,6 +319,7 @@ where
 fn load_from_store<'a, R, A>(
     repo: &'a R,
     identity: &'a StreamIdentity,
+    reads: StreamReads<R>,
 ) -> Pin<Box<dyn Future<Output = Result<Option<A>, RepositoryError>> + Send + 'a>>
 where
     R: SnapshotStore + GetStream + Sync,
@@ -327,8 +328,7 @@ where
     Box::pin(async move {
         let Some(snapshot) = repo.get_snapshot(identity).await? else {
             // No snapshot: a plain full load (same as a snapshotless repo).
-            return repo
-                .get_stream(identity)
+            return (reads.full)(repo, identity)
                 .await?
                 .map(hydrate::<A>)
                 .transpose();
@@ -336,7 +336,7 @@ where
 
         // Fetch only events after the snapshot. The returned entity records the
         // true stream version even though it holds only the tail.
-        let Some(entity) = repo.get_stream_tail(identity, snapshot.version).await? else {
+        let Some(entity) = (reads.tail)(repo, identity, snapshot.version).await? else {
             // The stream is gone but a snapshot lingers; nothing to hydrate.
             return Ok(None);
         };
@@ -354,8 +354,7 @@ where
             // rebuild the aggregate, so fall back to a full stream load. This is
             // the I/O we hoped to avoid, but it only happens when the snapshot is
             // unusable — the correct, safe outcome.
-            Err(SnapshotHydrationError::Cache(_)) => Ok(repo
-                .get_stream(identity)
+            Err(SnapshotHydrationError::Cache(_)) => Ok((reads.full)(repo, identity)
                 .await?
                 .map(hydrate::<A>)
                 .transpose()?),
@@ -402,6 +401,113 @@ mod tests {
     #[derive(Default)]
     struct FailingSnapshotRepo {
         saw_snapshot: std::sync::atomic::AtomicBool,
+    }
+
+    struct CausalReadProbe {
+        inner: crate::InMemoryRepository,
+        reads: std::sync::Mutex<Vec<Option<u64>>>,
+    }
+    impl GetStream for CausalReadProbe {
+        async fn get_stream(&self, _: &StreamIdentity) -> Result<Option<Entity>, RepositoryError> {
+            panic!("causal snapshot loading must not use ordinary locking reads")
+        }
+    }
+    impl crate::command_ledger::CausalGetStream for CausalReadProbe {
+        async fn get_causal_stream(
+            &self,
+            identity: &StreamIdentity,
+        ) -> Result<Option<Entity>, RepositoryError> {
+            self.reads.lock().unwrap().push(None);
+            self.inner.get_stream(identity).await
+        }
+        async fn get_causal_stream_tail(
+            &self,
+            identity: &StreamIdentity,
+            after: u64,
+        ) -> Result<Option<Entity>, RepositoryError> {
+            self.reads.lock().unwrap().push(Some(after));
+            self.inner.get_stream_tail(identity, after).await
+        }
+    }
+    impl SnapshotStore for CausalReadProbe {
+        async fn get_snapshot(
+            &self,
+            identity: &StreamIdentity,
+        ) -> Result<Option<SnapshotRecord>, RepositoryError> {
+            self.inner.get_snapshot(identity).await
+        }
+        async fn save_snapshot(
+            &self,
+            identity: &StreamIdentity,
+            record: SnapshotRecord,
+        ) -> Result<(), RepositoryError> {
+            self.inner.save_snapshot(identity, record).await
+        }
+        async fn delete_snapshot(
+            &self,
+            identity: &StreamIdentity,
+        ) -> Result<bool, RepositoryError> {
+            self.inner.delete_snapshot(identity).await
+        }
+    }
+
+    #[tokio::test]
+    async fn causal_snapshots_use_only_tail_through_queued_wrappers() {
+        let inner = crate::InMemoryRepository::new();
+        let writer = AggregateRepository::new(inner.clone()).with_snapshots(2);
+        let mut aggregate = TestAggregate::default();
+        for _ in 0..3 {
+            aggregate.touch().unwrap();
+            writer.commit(&mut aggregate).await.unwrap();
+        }
+        let identity = StreamIdentity::new(TestAggregate::aggregate_type(), "snap-1").unwrap();
+        let reader = AggregateRepository::<_, TestAggregate>::new(crate::QueuedRepository::new(
+            CausalReadProbe {
+                inner,
+                reads: Default::default(),
+            },
+        ))
+        .with_snapshots(2);
+        // Repeated loads prove no queue lock leaks across a handler await.
+        for _ in 0..2 {
+            let loaded = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                reader.get_causal(&identity),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(loaded.value, 3);
+            assert_eq!(loaded.entity.version(), 3);
+            assert_eq!(loaded.entity.snapshot_version(), 2);
+            assert_eq!(loaded.entity.events().len(), 1);
+        }
+        assert_eq!(
+            *reader.repo().inner().reads.lock().unwrap(),
+            [Some(2), Some(2)]
+        );
+
+        // Invalid cache bytes retain the ordinary safe full-replay behavior,
+        // while still bypassing locking reads on that recovery path.
+        let mut snapshot = reader
+            .repo()
+            .get_snapshot(&identity)
+            .await
+            .unwrap()
+            .unwrap();
+        snapshot.payload = vec![255; 9];
+        reader
+            .repo()
+            .save_snapshot(&identity, snapshot)
+            .await
+            .unwrap();
+        let loaded = reader.get_causal(&identity).await.unwrap().unwrap();
+        assert_eq!(loaded.value, 3);
+        assert_eq!(
+            *reader.repo().inner().reads.lock().unwrap(),
+            [Some(2), Some(2), Some(2), None]
+        );
     }
 
     impl TransactionalCommit for FailingSnapshotRepo {

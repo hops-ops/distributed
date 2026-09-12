@@ -116,6 +116,16 @@ struct CompiledPureArg {
 }
 
 impl CompiledCommandProjection {
+    /// Only emitted mutations consume command presets. Authored occurrences
+    /// can lower to recovery without retaining any of their input expressions.
+    pub(crate) fn trusted_preset_names(&self) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for operation in &self.preview.operations {
+            operation.mutation.collect_trusted_presets(&mut names);
+        }
+        names
+    }
+
     pub(crate) fn affected_models(&self) -> BTreeSet<String> {
         let mut models = BTreeSet::new();
         for operation in &self.preview.operations {
@@ -333,6 +343,31 @@ enum PreviewMutation {
 }
 
 impl PreviewMutation {
+    fn collect_trusted_presets(&self, names: &mut BTreeSet<String>) {
+        match self {
+            Self::Upsert { scope, fields, .. }
+            | Self::Patch {
+                scope, set: fields, ..
+            } => {
+                scope.collect_trusted_presets(names);
+                for field in fields {
+                    field.value.collect_trusted_presets(names);
+                }
+            }
+            Self::Delete { scope } => scope.collect_trusted_presets(names),
+            Self::Link { source, target, .. } | Self::Unlink { source, target, .. } => {
+                source.collect_trusted_presets(names);
+                target.collect_trusted_presets(names);
+            }
+            Self::InvalidateRelationship { source, .. } => source.collect_trusted_presets(names),
+            Self::InvalidateModel { partition, .. } => {
+                if let Some(partition) = partition {
+                    partition.collect_trusted_presets(names);
+                }
+            }
+        }
+    }
+
     fn canonical_scope(&self) -> Result<PreviewOperationScope, ClientCompileError> {
         let scope_json = |scope: &PreviewScope| {
             serde_json::to_string(scope).map_err(|error| {
@@ -426,6 +461,50 @@ impl PreviewMutation {
                 relationships.insert((source.model.clone(), relationship.clone(), String::new()));
             }
             _ => {}
+        }
+    }
+}
+
+impl PreviewScope {
+    fn collect_trusted_presets(&self, names: &mut BTreeSet<String>) {
+        self.partition.collect_trusted_presets(names);
+        for field in &self.key {
+            field.value.collect_trusted_presets(names);
+        }
+    }
+}
+
+impl PreviewPartition {
+    fn collect_trusted_presets(&self, names: &mut BTreeSet<String>) {
+        if let Self::Expression { expression, .. } = self {
+            expression.collect_trusted_presets(names);
+        }
+    }
+}
+
+impl PreviewExpression {
+    fn collect_trusted_presets(&self, names: &mut BTreeSet<String>) {
+        match self {
+            Self::TrustedPreset { name, .. } => {
+                names.insert(name.clone());
+            }
+            Self::List { values }
+            | Self::Transform {
+                arguments: values, ..
+            } => {
+                for value in values {
+                    value.collect_trusted_presets(names);
+                }
+            }
+            Self::Object { fields } => {
+                for field in fields {
+                    field.value.collect_trusted_presets(names);
+                }
+            }
+            Self::Input { .. }
+            | Self::GeneratedDefault { .. }
+            | Self::Constant { .. }
+            | Self::Null => {}
         }
     }
 }
@@ -1956,6 +2035,60 @@ fn model_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emitted_mutation_presets_include_nested_values_keys_and_partitions_only() {
+        let preset = |name: &str| PreviewExpression::TrustedPreset {
+            name: name.into(),
+            codec: "string".into(),
+        };
+        let scope = PreviewScope {
+            model: "Todo".into(),
+            partition: PreviewPartition::Expression {
+                expression: preset("tenant"),
+                requires: PreviewPartitionRequirement::CurrentCachePartition,
+            },
+            key: vec![PreviewKeyField {
+                ordinal: 0,
+                field: "id".into(),
+                value: preset("actor"),
+            }],
+        };
+        let mutation = PreviewMutation::Upsert {
+            scope: scope.clone(),
+            fields: vec![PreviewField {
+                field: "title".into(),
+                value: PreviewExpression::Object {
+                    fields: vec![PreviewObjectField {
+                        name: "nested".into(),
+                        value: PreviewExpression::List {
+                            values: vec![
+                                preset("label"),
+                                preset("actor"),
+                                PreviewExpression::Constant {
+                                    value: ManifestProjectionValue::String("trusted_preset".into()),
+                                },
+                            ],
+                        },
+                    }],
+                },
+            }],
+            replace: vec![],
+        };
+        let mut names = BTreeSet::new();
+        mutation.collect_trusted_presets(&mut names);
+        assert_eq!(names, ["actor", "label", "tenant"].map(String::from).into());
+        names.clear();
+        PreviewMutation::Delete { scope }.collect_trusted_presets(&mut names);
+        assert_eq!(names, ["actor", "tenant"].map(String::from).into());
+        names.clear();
+        PreviewMutation::InvalidateModel {
+            model: "Todo".into(),
+            partition: Some(PreviewPartition::Unit),
+        }
+        .collect_trusted_presets(&mut names);
+        assert!(names.is_empty());
+    }
 
     fn event() -> ManifestProjectionEventRef {
         ManifestProjectionEventRef {

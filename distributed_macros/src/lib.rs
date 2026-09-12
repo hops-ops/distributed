@@ -2,14 +2,14 @@ mod aggregate;
 mod application;
 mod command;
 mod command_input_defaults;
-mod portable_command;
+mod command_types;
 mod digest;
 mod domain_event;
 mod domain_state;
 mod enqueue;
-mod graphql_types;
 mod module;
 mod mutation;
+mod portable_command;
 // Event-owning `projection!` authoring removed (mutation projectors cutover).
 mod read_model;
 mod shared;
@@ -182,21 +182,21 @@ pub fn mutation_file(input: TokenStream) -> TokenStream {
     mutation::expand_file(input)
 }
 
-/// Derive `GraphqlInputType` for command mutation input structs.
-#[proc_macro_derive(GraphqlInput, attributes(serde))]
-pub fn derive_graphql_input(input: TokenStream) -> TokenStream {
+/// Derive transport-neutral command input metadata from Serde field shapes.
+#[proc_macro_derive(CommandInput, attributes(serde))]
+pub fn derive_command_input(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
-    match graphql_types::expand_graphql_input(input) {
+    match command_types::expand_command_input(input) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
 }
 
-/// Derive `GraphqlOutputType` for command mutation output structs.
-#[proc_macro_derive(GraphqlOutput, attributes(serde))]
-pub fn derive_graphql_output(input: TokenStream) -> TokenStream {
+/// Derive transport-neutral command output metadata from Serde field shapes.
+#[proc_macro_derive(CommandOutput, attributes(serde))]
+pub fn derive_command_output(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
-    match graphql_types::expand_graphql_output(input) {
+    match command_types::expand_command_output(input) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }

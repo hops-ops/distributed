@@ -26,6 +26,7 @@ import type {
 import type { ReplicaPureFunction } from '../projection-delta/index.js';
 import {
 	replicaCommandAuthority,
+	replicaCommandFreshness,
 	replicaCommandDirectProjection,
 	replicaCommandProjectionDelta,
 	replicaCommandProjectedLifecycle,
@@ -66,6 +67,7 @@ export type ReplicaCommandDirectProjection = Readonly<{
 }>;
 
 export type ReplicaCommandAuthorityHost = DistributedReplica & {
+	readonly [replicaCommandFreshness]?: (commandId: string, plan: import('../types.js').ReplicaRevalidationPlan) => void;
 	readonly [replicaCommandAuthority]?: (
 		contract: ReplicaCommandSurfaceContract
 	) => ReplicaCommandAuthorityRegistration;

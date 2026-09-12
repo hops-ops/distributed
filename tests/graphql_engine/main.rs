@@ -44,6 +44,7 @@ fn bidirectional_parent_schema() -> TableSchema {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "children".into(),
             kind: RelationshipKind::HasMany,
             target_model: "Child".into(),
@@ -72,6 +73,7 @@ fn bidirectional_child_schema() -> TableSchema {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "parent".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "Parent".into(),

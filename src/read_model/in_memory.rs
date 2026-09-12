@@ -13,9 +13,7 @@ use super::{
     RelationalReadModel, Versioned,
 };
 use crate::repository::{ReadModelWritePlanStore, RelationalReadModelQueryStore};
-use crate::table::{
-    column_name_for, has_many_join_columns, key_fingerprint, validate_key, validate_row_values,
-};
+use crate::table::{has_many_join_columns, key_fingerprint, validate_key, validate_row_values};
 use crate::table::{
     ExpectedVersion, PatchMode, RelationshipDef, RelationshipKind, RowKey, RowValue, RowValues,
     RowWriteMode, TableAdapterCapabilities, TableCommitOutcome, TableMutation, TableSchema,
@@ -493,50 +491,23 @@ fn load_belongs_to_rows(
     root_row: &RowValues,
     spec: &IncludeSpec,
 ) -> Result<Vec<Versioned<RowValues>>, TableStoreError> {
-    let foreign_key = spec.relationship.foreign_key.as_deref().ok_or_else(|| {
-        TableStoreError::Metadata(format!(
-            "relationship `{}` must declare a foreign key",
-            spec.relationship.field_name
-        ))
-    })?;
-    let source_column = column_name_for(root_schema, foreign_key).ok_or_else(|| {
-        TableStoreError::Metadata(format!(
-            "relationship `{}` foreign key `{}` is not a source column",
-            spec.relationship.field_name, foreign_key
-        ))
-    })?;
-    let target_column = belongs_to_target_column(&spec.target_schema, &source_column)?;
+    let (source_column, target_column) = crate::table::belongs_to_join_columns(
+        root_schema,
+        &spec.relationship,
+        &spec.target_schema,
+    )?;
     let source_value = root_row.get(&source_column).ok_or_else(|| {
         TableStoreError::Metadata(format!(
             "read model `{}` root row is missing relationship key `{}`",
             root_schema.model_name, source_column
         ))
     })?;
-    let key = RowKey::new([(target_column, source_value.clone())]);
-    let storage_key = relational_storage_key(&spec.target_schema.table_name, &key);
-    Ok(rows
-        .get(&storage_key)
-        .map(|row| {
-            vec![Versioned {
-                data: row.values.clone(),
-                version: row.version,
-            }]
-        })
-        .unwrap_or_default())
-}
-
-fn belongs_to_target_column(
-    target_schema: &TableSchema,
-    source_column: &str,
-) -> Result<String, TableStoreError> {
-    if target_schema.primary_key.columns.len() != 1 {
-        return Err(TableStoreError::Metadata(format!(
-            "belongs_to target `{}` must have a single-column primary key to load from `{}`",
-            target_schema.model_name, source_column
-        )));
-    }
-
-    Ok(target_schema.primary_key.columns[0].clone())
+    Ok(rows_matching_column(
+        rows,
+        &spec.target_schema.table_name,
+        &target_column,
+        source_value,
+    ))
 }
 
 fn rows_matching_column(
@@ -545,6 +516,9 @@ fn rows_matching_column(
     column: &str,
     value: &RowValue,
 ) -> Vec<Versioned<RowValues>> {
+    if matches!(value, RowValue::Null) {
+        return Vec::new();
+    }
     let prefix = format!("{table_name}:");
     let mut matches = rows
         .iter()
@@ -621,6 +595,69 @@ mod tests {
             row.values.get("id"),
             Some(&RowValue::String("row-1".into()))
         );
+    }
+
+    #[test]
+    fn belongs_to_unique_key_matches_values_not_primary_key_and_never_nulls() {
+        let mut target = test_row_schema().clone();
+        target.columns.push(TableColumn {
+            nullable: true,
+            ..TableColumn::new("slug", "slug", ColumnType::Text)
+        });
+        target.indexes.push(crate::TableIndex {
+            name: None,
+            columns: vec!["slug".into()],
+            unique: true,
+        });
+        let mut source = test_row_schema().clone();
+        source.columns.push(TableColumn {
+            nullable: true,
+            ..TableColumn::new("target_slug", "target_slug", ColumnType::Text)
+        });
+        let spec = IncludeSpec {
+            name: "target".into(),
+            target_schema: target.clone(),
+            relationship: RelationshipDef {
+                field_name: "target".into(),
+                kind: RelationshipKind::BelongsTo,
+                target_model: target.model_name.clone(),
+                foreign_key: Some("target_slug".into()),
+                references: Some("slug".into()),
+                through: None,
+                target_foreign_key: None,
+            },
+        };
+        let mut rows = HashMap::new();
+        for (id, slug) in [
+            ("opaque", RowValue::String("chosen".into())),
+            ("chosen", RowValue::String("other".into())),
+            ("null-target", RowValue::Null),
+        ] {
+            let key = RowKey::new([("id", RowValue::String(id.into()))]);
+            let mut values = RowValues::new();
+            values.insert("id", RowValue::String(id.into()));
+            values.insert("slug", slug);
+            rows.insert(
+                relational_storage_key(&target.table_name, &key),
+                StoredRow { values, version: 1 },
+            );
+        }
+        let mut root = RowValues::new();
+        root.insert("target_slug", RowValue::String("chosen".into()));
+        let found = load_belongs_to_rows(&rows, &source, &root, &spec).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].data.get("id"),
+            Some(&RowValue::String("opaque".into()))
+        );
+        root.insert("target_slug", RowValue::Null);
+        assert!(load_belongs_to_rows(&rows, &source, &root, &spec)
+            .unwrap()
+            .is_empty());
+        root.insert("target_slug", RowValue::String("missing".into()));
+        assert!(load_belongs_to_rows(&rows, &source, &root, &spec)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

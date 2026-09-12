@@ -30,3 +30,7 @@ jobs:
           done
       - name: Run NATS transport integration tests
         run: cargo test --test nats_transport --features nats --verbose
+      - name: Verify retained history and durable filter reconciliation
+        env:
+          DISTRIBUTED_ARCHIVE_TEST_NATS_URL: nats://localhost:4222
+        run: cargo test --lib --features nats bus::nats_bus::archive_tests -- --include-ignored
