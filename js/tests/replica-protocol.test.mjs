@@ -1975,6 +1975,86 @@ test('snapshot live replaces SSR membership, updates and removes rows, and fence
 	assert.deepEqual(replica.read(Todos, {}).data.todos, []);
 });
 
+test('snapshot live adds a row with an unchanged SSR-owned nested relationship', () => {
+	let observer;
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, next) { observer = next; return () => {}; }
+	} });
+	replica.writeResult(FeaturedGamesWithOwner, {}, gamesFrame({
+		artifact: FeaturedGamesWithOwner, responseKey: 'featuredGames',
+		position: '1', ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	}), 'ssr');
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		position: '1', ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const watch = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	observer.next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id,
+		position: '2', ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(watch.get().errors, []);
+	assert.equal(watch.get().complete, true);
+	assert.equal(watch.get().data.games.length, 1, 'unchanged sibling relationship must not freeze an empty root');
+	assert.equal(watch.get().data.games[0].owner.name, 'Owner');
+	assert.equal(replica.read(FeaturedGamesWithOwner, {}).data.featuredGames[0].owner.name, 'Owner');
+	observer.next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id,
+		position: '3', ownerId: 'user-2', ownerName: 'Changed', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.equal(watch.get().data.games[0].owner.name, 'Changed');
+	const removed = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id,
+		position: '4', ownerId: 'user-2', ownerName: 'Changed', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	removed.data.games = [];
+	removed.extensions.distributed.snapshot.records = [];
+	observer.next(removed);
+	assert.deepEqual(watch.get().data.games, []);
+	assert.equal(watch.get().live, 'active');
+	watch.destroy();
+});
+
+test('snapshot live cannot take over query ownership acquired after stream start', () => {
+	let observer;
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, next) { observer = next; return () => {}; }
+	} });
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		position: '1', ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const watch = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	replica.writeResult(FeaturedGamesWithOwner, {}, gamesFrame({
+		artifact: FeaturedGamesWithOwner, responseKey: 'featuredGames',
+		position: '2', ownerId: 'user-2', ownerName: 'New query', indexesComparable: false
+	}), 'network');
+	observer.next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id,
+		position: '1', ownerId: 'user-1', ownerName: 'Old stream', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(watch.get().errors, []);
+	assert.deepEqual(watch.get().data.games, []);
+	assert.equal(replica.read(FeaturedGamesWithOwner, {}).data.featuredGames[0].owner.name, 'New query');
+	watch.destroy();
+});
+
 test('snapshot authorization changes discard the old stream and reconnect without cursors', async () => {
 	const subscriptions = [];
 	const requests = [];

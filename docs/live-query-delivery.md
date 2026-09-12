@@ -23,6 +23,13 @@ from disposed subscriptions and previous authorization generations. Local cache
 membership revisions are not server projection positions and cannot confirm
 optimistic commands.
 
+A subscription also records its local start order. Snapshot delivery can take
+over shared relationships owned by queries that preceded that subscription,
+including SSR seeds from a layout or another island. This lets an initially
+empty result acquire rows without waiting for another page load. It does not
+override an independently active live stream or query ownership acquired after
+the subscription started; those results have no safe cross-stream ordering.
+
 This is a breaking v5 protocol change: `mode` replaces the ambiguous `supported`
 boolean. Upgrade server and generated-client runtime together. Old or unknown
 wire forms fail closed; applications do not need a polling or reload workaround.

@@ -30,6 +30,8 @@ export type LiveEntry = {
 	unsubscribe: () => void;
 	active: boolean;
 	protocolGeneration: number;
+	/** Local fence for taking over query snapshots that preceded this stream. */
+	startRevision: string;
 	operationGeneration?: number;
 };
 

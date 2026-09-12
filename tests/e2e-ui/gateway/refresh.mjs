@@ -56,7 +56,11 @@ export async function verifySessionRefreshContinuity(page, origin) {
         await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
       }
       assert.deepEqual(navigations,[],'session refresh must not navigate the document');
-      assert.equal(await page.evaluate(()=>globalThis.__refreshContinuity.lost),false,route+' rows were removed during token refresh: '+JSON.stringify(await page.evaluate(()=>globalThis.__refreshContinuity.events)));
+      const lost = await page.evaluate(()=>globalThis.__refreshContinuity.lost);
+      if (lost) {
+        console.error('Redacted refresh replica diagnostics:', JSON.stringify(await page.evaluate(()=>globalThis.__replicaDiagnosticSnapshot?.())));
+      }
+      assert.equal(lost,false,route+' rows were removed during token refresh: '+JSON.stringify(await page.evaluate(()=>globalThis.__refreshContinuity.events)));
     } finally {
       releaseRefresh();
       await page.unroute('**/api/auth/refresh',refreshRoute);

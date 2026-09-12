@@ -2,6 +2,7 @@
 	import '../app.css';
 	import '$lib/styles/chrome.css';
 	import { browser } from '$app/environment';
+	import { createReplicaDiagnostics } from '@hops-ops/distributed/replica';
 	import { page } from '$app/state';
 	import { onDestroy, untrack } from 'svelte';
 	import type { Snippet } from 'svelte';
@@ -35,7 +36,13 @@
 		diagnostics.__distributedReloadState = lifecycleDemoState;
 	}
 
+	const replicaDiagnostics = browser && (globalThis as typeof globalThis & Record<string, unknown>).__captureReplicaDiagnostics === true
+		? createReplicaDiagnostics() : undefined;
+	if (replicaDiagnostics) {
+		(globalThis as typeof globalThis & Record<string, unknown>).__replicaDiagnosticSnapshot = () => replicaDiagnostics.snapshot();
+	}
 	const client = provideDistributed({
+		...(replicaDiagnostics ? { replica: { diagnostics: replicaDiagnostics } } : {}),
 		boundaries: DISTRIBUTED_BOUNDARY_OPERATIONS,
 		session: pageData.session,
 		browser,

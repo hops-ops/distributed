@@ -2320,6 +2320,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		if (incomingIndexKeys.size === 0) return { compared: false };
 		const confirmedRevisions =
 			this.#confirmedIndexFences(incomingIndexKeys);
+		const liveStart = source === 'live' && !snapshot.indexesComparable
+			? this.#lives.get(currentKey)?.startRevision
+			: undefined;
 		let compared = false;
 		let lower = false;
 		let higher = false;
@@ -2370,6 +2373,13 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					disposition === 'fresh' ||
 					disposition === 'incomparable'
 				) {
+					// A registered stream starts after the query seeds already in
+					// this replica. It can take over those seeds, but not another
+					// live stream or query ownership acquired after it started.
+					if (
+						liveStart !== undefined && state === group.query &&
+						compareCanonicalDecimalStrings(liveStart, state.indexRevision) > 0
+					) continue;
 					incomparable = true;
 					continue;
 				}
