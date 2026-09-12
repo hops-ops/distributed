@@ -557,6 +557,45 @@ test('fresh same-scope SSR authority rotates credentials without emptying the vi
 	unsubscribe(); client.destroy();
 });
 
+test('queued page-data updates retain the fresh authority before seedless invalidation', async () => {
+	const harness = serverHarness();
+	const first = await harness.server.load(harness.event('alice', '1'));
+	const second = await harness.server.load(harness.event('alice', '2'));
+	const pageData = createPageDataSessionSource(first);
+	SsrWebSocket.instances.length = 0;
+	let fetches = 0;
+	const client = createDistributedSvelteKit({
+		boundaries: [todosBoundary], session: pageData.session,
+		hydration: first.distributed, authority: first.distributedAuthority,
+		fetch: () => { fetches += 1; return new Promise(() => {}); },
+		webSocket: SsrWebSocket
+	});
+	const todos = client.operation(TodosArtifact).use();
+	const values = [];
+	const unsubscribe = todos.subscribe(snapshot => values.push(snapshot.data.todos?.[0]?.title));
+	await flushMicrotasks();
+	const oldSocket = SsrWebSocket.instances[0];
+	// A refresh supplies independent authority; invalidateAll then replaces it
+	// with normal data-request output, which intentionally contains no seed.
+	pageData.set({...second, accessToken: 'rotated-alice'});
+	pageData.set({...second, accessToken: 'rotated-alice', distributed: undefined, distributedAuthority: undefined});
+	await flushMicrotasks();
+	assert.ok(values.every(value => value === 'alice:1'), JSON.stringify(values));
+	assert.equal(fetches, 0);
+	assert.equal(oldSocket.closed, true);
+	const nextSocket = SsrWebSocket.instances.at(-1);
+	assert.notEqual(nextSocket, oldSocket);
+	nextSocket.open();
+	await flushMicrotasks();
+	assert.equal(nextSocket.sent[0].payload.authorization, 'Bearer rotated-alice');
+	// A later, different credential cannot borrow the consumed transfer.
+	pageData.set({accessToken: 'unproven-rotation'});
+	await flushMicrotasks();
+	assert.equal(client.replica.scope, undefined);
+	assert.deepEqual(todos.get().data, {});
+	unsubscribe(); client.destroy();
+});
+
 for (const kind of ['missing', 'replayed', 'historical', 'tampered', 'different-scope', 'logout']) {
 	test(`credential change with ${kind} hydration still purges the old replica`, async () => {
 		const harness = serverHarness();

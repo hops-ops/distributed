@@ -1038,13 +1038,14 @@ function createAuthorizationFence(
 	let queue = Promise.resolve();
 	let disposed = false;
 	const read = (): Promise<GqlAuth> => {
-		const candidate = Promise.resolve().then(() => {
+		const candidate = (async () => {
 			// Capture the credential and its independent server transfer together,
-			// before another source notification can replace either value.
+			// synchronously at notification time. A queued read would observe a
+			// later seedless page update and lose the refresh's scope evidence.
 			const credential = source.getAuth();
 			const transfer = source.getHydration?.();
-			return Promise.resolve(credential).then((auth) => ({ auth, transfer }));
-		});
+			return { auth: await credential, transfer };
+		})();
 		const transition = queue.then(async () => {
 			try {
 				const { auth, transfer } = await candidate;
