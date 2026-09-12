@@ -20,6 +20,8 @@ on:
       - 'tests/edge_query_delivery*'
       - 'js/src/replica/**'
       - 'js/tests/replica*'
+      - 'js/src/sveltekit/**'
+      - 'js/tests/sveltekit*'
       - 'tests/gateway*'
       - 'tests/gateway*/**'
       - '.github/workflows/integration-gateway.yaml'
