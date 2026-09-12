@@ -327,6 +327,7 @@ export function hydrateReplica(
 			| 'active-scope-mismatch'
 			| 'metadata-mismatch'
 	): false => {
+		console.debug('auth-audit: rejected hydration', reason);
 		if (host.diagnostics.enabled) {
 			host.diagnosticEvent(
 				Object.freeze({ kind: 'hydration', action: 'rejected', reason })

@@ -58,6 +58,7 @@ try{
     browser=await chromium.launch();const context=await browser.newContext();
     await context.addInitScript(()=>{globalThis.__captureReplicaDiagnostics=true;});
     const page=await context.newPage();
+    page.on('console', message=>{if(message.text().startsWith('auth-audit:'))console.log(message.text());});
     const errors=[];page.on('pageerror',error=>errors.push(error.message));
     await page.goto(publicOrigin);await page.getByRole('link',{name:/log in|sign in/i}).first().click();
     await page.getByRole('button',{name:'Continue as Alice'}).click();

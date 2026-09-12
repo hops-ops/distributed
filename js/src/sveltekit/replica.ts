@@ -331,6 +331,7 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 		options.onAuthError,
 		(transfer) => {
 			const active = replica?.scope;
+			console.debug('auth-audit: scope', active !== undefined, active !== undefined && sameReplicaScope(active, validatedHydrationAuthority(transfer.authority)), transfer.hydration.bindings?.every(value => boundaryIds.includes(value)));
 			if (
 				active === undefined ||
 				!sameReplicaScope(active, validatedHydrationAuthority(transfer.authority))
@@ -338,10 +339,12 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 			if ((transfer.hydration.bindings ?? []).some(value => !boundaryIds.includes(value))) {
 				return false;
 			}
-			return transfer.hydration.version === 1 && replica!.reauthorize(
+			const accepted = transfer.hydration.version === 1 && replica!.reauthorize(
 				transfer.hydration.state,
 				validatedHydrationAuthority(transfer.authority)
 			);
+			console.debug('auth-audit: reauthorize', accepted);
+			return accepted;
 		}
 	);
 	const configuredUrl = options.url;
@@ -1057,6 +1060,7 @@ function createAuthorizationFence(
 					const freshTransfer = transfer !== undefined &&
 						!seenHydrations.has(transfer.hydration) &&
 						!seenAuthorities.has(transfer.authority);
+					console.debug('auth-audit: credential change', transfer !== undefined, transfer !== undefined && seenHydrations.has(transfer.hydration), transfer !== undefined && seenAuthorities.has(transfer.authority));
 					if (!freshTransfer || !refresh(transfer)) invalidate();
 				}
 				current = next;
