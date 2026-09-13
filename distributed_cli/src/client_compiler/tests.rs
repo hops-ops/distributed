@@ -758,6 +758,175 @@ fn generated_command_types_manifest() -> JsonValue {
     value
 }
 
+fn key_only_projection_manifest(composite: bool) -> JsonValue {
+    let mut value = generated_command_types_manifest();
+    value["capabilities"]["live_queries"] = json!(false);
+    value["capabilities"]["live_resume"] = json!(false);
+    value["commands"][0]["extensions"]["consistency"]["kind"] = json!("eventual");
+    value["commands"][0]["extensions"]
+        .as_object_mut()
+        .unwrap()
+        .remove("direct_projection");
+    value["commands"][0]["output"]["definition"]["name"] = json!("ProjectTodoPayload");
+    let key_names = if composite {
+        vec!["tenantId", "id"]
+    } else {
+        vec!["id"]
+    };
+    value["models"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    value["models"][0]["normalization"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    value["models"][0]["filter_input"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    value["roots"] = json!([by_pk_root()]);
+    value["roots"][0]["arguments"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    let arm = &mut value["projection_programs"][0]["arms"][0];
+    arm["partition"] = json!({"kind": "unit"});
+    arm["operations"][0]["fields"] = json!([]);
+    let key = arm["operations"][0]["key"].as_array_mut().unwrap();
+    key.retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    for (ordinal, field) in key.iter_mut().enumerate() {
+        field["ordinal"] = json!(ordinal);
+    }
+    value["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]["values"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|slot| {
+            key_names
+                .iter()
+                .any(|name| slot["slot"] == format!("state.{name}"))
+        });
+    refresh_schema_fingerprint(&mut value);
+    value
+}
+
+#[test]
+fn key_only_complete_projections_compile_identity_only_upserts() {
+    for composite in [false, true] {
+        for kind in [
+            "insert",
+            "upsert",
+            "recreate",
+            "insert_related",
+            "upsert_related",
+        ] {
+            let mut value = key_only_projection_manifest(composite);
+            value["projection_programs"][0]["arms"][0]["operations"][0]["kind"] = json!(kind);
+            refresh_schema_fingerprint(&mut value);
+            let manifest =
+                ClientManifest::parse(value.clone(), &ClientSurfaceSelector::role("user"))
+                    .unwrap_or_else(|error| panic!("{kind}, composite={composite}: {error}"));
+            let command = manifest
+                .commands
+                .iter()
+                .find(|command| command.extensions.projection.is_some())
+                .expect("modeled command");
+            let preview = super::projection_delta::compile_command_preview(command, &manifest)
+                .expect("compile identity-only preview")
+                .expect("projection preview");
+            let preview = serde_json::to_value(preview).unwrap();
+            assert_eq!(
+                preview["preview"]["operations"].as_array().unwrap().len(),
+                1
+            );
+            let mutation = &preview["preview"]["operations"][0]["mutation"];
+            assert_eq!(mutation["op"], "upsert");
+            assert_eq!(mutation["fields"], json!([]));
+            assert_eq!(mutation["replace"], json!([]));
+            assert_eq!(
+                mutation["scope"]["key"].as_array().unwrap().len(),
+                if composite { 2 } else { 1 }
+            );
+            assert_eq!(preview["preview"]["recoveries"], json!([]));
+            let query = if composite {
+                "query Todo { todo(id: \"1\", tenantId: \"tenant\") { id tenantId } }"
+            } else {
+                "query Todo { todo(id: \"1\") { id } }"
+            };
+            let project = compile_client(ClientCompileInput::new(
+                value,
+                ClientSurfaceSelector::role("user"),
+                vec![ClientDocument::new("src/routes/todos/+page.graphql", query)],
+            ))
+            .expect("generate identity-only client");
+            let commands = file(&project, "commands.ts");
+            assert!(commands.contains("\"op\": \"upsert\""));
+            assert!(commands.contains("\"fields\": []"));
+            assert!(commands.contains("\"replace\": []"));
+        }
+    }
+}
+
+#[test]
+fn key_only_projection_exception_preserves_field_mask_validation() {
+    for kind in [
+        "insert",
+        "upsert",
+        "recreate",
+        "insert_related",
+        "upsert_related",
+        "patch",
+        "upsert_patch",
+    ] {
+        let mut value = generated_command_types_manifest();
+        let operation = &mut value["projection_programs"][0]["arms"][0]["operations"][0];
+        operation["kind"] = json!(kind);
+        operation["fields"] = json!([]);
+        refresh_schema_fingerprint(&mut value);
+        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+            .expect_err("non-key fields still require a field mask");
+        assert_eq!(
+            error.code, "client.manifest.projection_field_mask",
+            "{kind}"
+        );
+    }
+    for kind in ["patch", "upsert_patch"] {
+        let mut value = key_only_projection_manifest(true);
+        value["projection_programs"][0]["arms"][0]["operations"][0]["kind"] = json!(kind);
+        refresh_schema_fingerprint(&mut value);
+        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+            .expect_err("key-only models do not allow empty patches");
+        assert_eq!(error.code, "client.manifest.projection_field_mask");
+    }
+    let mut value = key_only_projection_manifest(true);
+    value["projection_programs"][0]["arms"][0]["operations"][0]["fields"] = json!([{
+        "ordinal": 0, "name": "id", "assignment": {"kind": "set", "expression": {
+            "kind": "slot", "slot": "state.id", "value_type": {"type": "string"}
+        }}
+    }]);
+    refresh_schema_fingerprint(&mut value);
+    let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+        .expect_err("identity must remain outside the field mask");
+    assert_eq!(error.code, "client.manifest.projection_field_mask");
+}
+
+#[test]
+fn key_only_projection_still_requires_the_exact_identity() {
+    for key in [
+        json!([]),
+        json!([{"ordinal": 0, "name": "id", "expression": {
+            "kind": "slot", "slot": "state.id", "value_type": {"type": "string"}
+        }}]),
+    ] {
+        let mut value = key_only_projection_manifest(true);
+        value["projection_programs"][0]["arms"][0]["operations"][0]["key"] = key;
+        refresh_schema_fingerprint(&mut value);
+        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+            .expect_err("missing composite identity fields must reject");
+        assert_eq!(error.code, "client.manifest.projection_key");
+    }
+}
+
 fn embedded_model_invalidation_manifest() -> JsonValue {
     let mut value = generated_command_types_manifest();
     let command = &mut value["commands"][0];

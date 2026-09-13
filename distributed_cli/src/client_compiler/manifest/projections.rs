@@ -497,7 +497,15 @@ fn validate_operation(
         | ManifestProjectionMutationKind::Recreate
         | ManifestProjectionMutationKind::InsertRelated
         | ManifestProjectionMutationKind::UpsertRelated => {
-            if operation.fields.is_empty() {
+            // Identity assignments live in `key`, so a key-only normalized
+            // model has a complete row even with an empty non-key field mask.
+            if operation.fields.is_empty()
+                && model.fields.iter().any(|field| {
+                    !identity
+                        .iter()
+                        .any(|key_field| key_field.name == field.name)
+                })
+            {
                 return Err(projection_error(
                     "client.manifest.projection_field_mask",
                     format!(
