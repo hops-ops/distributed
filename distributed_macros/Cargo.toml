@@ -22,7 +22,7 @@ syn = { version = "2.0", features = ["full", "visit"] }
 
 [dev-dependencies]
 # Compile-fail snapshots depend on trybuild's compiler-diagnostic normalization.
-trybuild = "=1.0.120"
+trybuild = "=1.0.121"
 # Dev-only cycle: `distributed` depends on this crate, but trybuild fixtures
 # need the runtime crate to type-check generated `distributed::...` code.
 # Cargo permits dev-dependency cycles.
