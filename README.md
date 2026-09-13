@@ -888,7 +888,9 @@ the outward events reachable through those helpers. Discovery follows static
 `self.method(...)` calls, deduplicates events, and terminates on recursive helper
 graphs. It does not follow foreign receivers or helpers outside the impl, and
 does not propagate argument values through helpers. Literal arguments at the
-recorder call still participate in the same conservative inference.
+recorder call still participate in the same conservative inference. Custom
+`domain = with(Body, adapter)` events use the declared body contract, including
+qualified or relative type paths; adapter output is not inferred as constants.
 
 For an event whose body contains the authenticated principal, bind that one
 field using the existing command API:

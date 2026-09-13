@@ -215,14 +215,14 @@ struct EventMethodInfo {
     version: syn::LitInt,
     method_name: Ident,
     params: Vec<(Ident, syn::Type)>,
-    /// Present when this recorder has `domain` and therefore a generated
-    /// outward domain-event marker type.
+    /// Present when this recorder has `domain` and therefore an exact outward
+    /// event contract (a generated marker or the explicitly declared body).
     command_event: Option<DomainCommandEvent>,
 }
 
 #[derive(Clone)]
 struct DomainCommandEvent {
-    domain_event_type: Ident,
+    domain_event_type: Type,
     domain_state: Option<Type>,
     known_state_values: Vec<KnownStateValue>,
     body_params: Vec<(Ident, Type)>,
@@ -823,12 +823,19 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                     );
                     method.block = new_body;
 
-                    let command_event = if event_attr.domain.is_some() {
+                    let command_event = if let Some(mode) = event_attr.domain.as_ref() {
+                        let domain_event_type = match mode {
+                            DomainMode::With { output, .. } => (**output).clone(),
+                            _ => {
+                                let marker = identity_domain_event_type(
+                                    &struct_name,
+                                    &event_attr.event_name,
+                                )?;
+                                syn::parse_quote!(#marker)
+                            }
+                        };
                         Some(DomainCommandEvent {
-                            domain_event_type: identity_domain_event_type(
-                                &struct_name,
-                                &event_attr.event_name,
-                            )?,
+                            domain_event_type,
                             domain_state: state_domain.then(|| args.domain_state.clone()).flatten(),
                             known_state_values,
                             body_params: if matches!(event_attr.domain, Some(DomainMode::Event)) {
@@ -1249,8 +1256,9 @@ impl<'ast> Visit<'ast> for DomainEventCallFinder<'_> {
                         })
                     })
                     .collect();
+                let event_type = &command_event.domain_event_type;
                 self.found
-                    .entry(command_event.domain_event_type.to_string())
+                    .entry(quote!(#event_type).to_string())
                     .and_modify(|existing| {
                         // A single event type can occur more than once, including
                         // through branches. Only values shared by every call are known.
@@ -1421,7 +1429,9 @@ fn expand_domain_commands_module(
         return TokenStream2::new();
     }
 
-    let transition_items = transitions.iter().map(|transition| {
+    let mut transition_items = Vec::new();
+    let mut transition_impls = Vec::new();
+    for transition in transitions {
         let type_name = method_name_to_type_ident(&transition.method_name);
         let method_name = transition.method_name.to_string();
         let aggregate_name = aggregate.to_string();
@@ -1437,9 +1447,9 @@ fn expand_domain_commands_module(
             }
             let event_type = &event.domain_event_type;
             let helper = if let Some(state) = &event.domain_state {
-                quote!(distributed::command::__command_projection_state_known_values::<super::#event_type, #state>)
+                quote!(distributed::command::__command_projection_state_known_values::<#event_type, #state>)
             } else {
-                quote!(distributed::command::__command_projection_event_preview::<super::#event_type, super::#event_type>)
+                quote!(distributed::command::__command_projection_event_preview::<#event_type, #event_type>)
             };
             let fields = values.iter().map(|value| {
                 let field = value.field.to_string();
@@ -1457,16 +1467,13 @@ fn expand_domain_commands_module(
                 #helper(vec![#(#fields),*])
             })
         });
-        let has_known_values = transition
-            .events
-            .iter()
-            .any(|event| !event.known_state_values.is_empty() || !event.known_body_values.is_empty());
+        let has_known_values = transition.events.iter().any(|event| {
+            !event.known_state_values.is_empty() || !event.known_body_values.is_empty()
+        });
         let known_values_method = has_known_values.then(|| {
             quote! {
                 fn command_event_known_values(
                 ) -> Vec<distributed::command::CommandProjectionPreview> {
-                    #[allow(unused_imports)]
-                    use super::*;
                     vec![#(#known_value_items),*]
                 }
             }
@@ -1477,16 +1484,21 @@ fn expand_domain_commands_module(
              methods, including through decision helpers in this `#[sourced]` impl. Use with \
              [`distributed::command::TypedCommand::emits_events`]."
         );
-        quote! {
+        transition_items.push(quote! {
             #[doc = #doc]
             pub enum #type_name {}
-
-            impl distributed::command::CommandEventSet for #type_name {
+        });
+        // Keep authored types in the aggregate's lexical scope. Moving an
+        // explicit `with(super::facts::Body, ...)` path inside domain_commands
+        // would silently change its meaning (and generated aliases do not exist
+        // for custom bodies). The public witness still lives in that module.
+        transition_impls.push(quote! {
+            impl distributed::command::CommandEventSet for domain_commands::#type_name {
                 fn command_event_set() -> distributed::command::CommandProjectionEventSet {
                     distributed::command::__command_projection_events([
                         #(
                             distributed::command::__command_projection_event_descriptor::<
-                                super::#event_types,
+                                #event_types,
                             >()
                         ),*
                     ])
@@ -1494,8 +1506,8 @@ fn expand_domain_commands_module(
 
                 #known_values_method
             }
-        }
-    });
+        });
+    }
 
     let aggregate_name = aggregate.to_string();
     let module_doc = format!(
@@ -1512,6 +1524,7 @@ fn expand_domain_commands_module(
         pub mod domain_commands {
             #(#transition_items)*
         }
+        #(#transition_impls)*
     }
 }
 
