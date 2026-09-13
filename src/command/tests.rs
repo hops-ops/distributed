@@ -284,6 +284,83 @@ fn authenticated_user_field_reuses_generated_event_schema_metadata() {
     );
     assert_eq!(field.body_nullable, Some(false));
     assert_eq!(field.body_always_present, Some(true));
+    let previous = __command_projection_state_known_values::<TodoStateChanged, TodoState>(vec![(
+        "status",
+        CommandProjectionPreviewSource::trusted("x-user-id", "string"),
+    )]);
+    assert_eq!(contract.projections.inferred_values[0].preview, previous);
+}
+
+#[derive(Serialize, crate::DomainEvent)]
+#[domain_event(name = "membership.removed", version = 1)]
+struct MembershipRemoved {
+    #[serde(rename = "memberId")]
+    user_id: String,
+    revision: u64,
+    #[serde(skip)]
+    internal: String,
+}
+
+impl crate::domain_event::DomainEventBodyContract<MembershipRemoved> for TodoCompleted {}
+
+#[test]
+fn authenticated_flat_event_field_preserves_wire_name_and_rejects_invalid_bindings() {
+    let body = MembershipRemoved {
+        user_id: "member-1".into(),
+        revision: 1,
+        internal: "not serialized".into(),
+    };
+    assert_eq!(body.internal, "not serialized");
+    assert!(serde_json::to_value(&body)
+        .unwrap()
+        .get("internal")
+        .is_none());
+    let command = |field| {
+        super::command_transition::<MembershipRemoved, Input, Succeeded<Payload>>("member.leave")
+            .authenticated_user_field::<MembershipRemoved, MembershipRemoved>(field)
+            .into_contract()
+    };
+    let valid = command("user_id");
+    TypedServiceCommandBinding::from_contracts("members", std::slice::from_ref(&valid)).unwrap();
+    let field = &valid.projections.inferred_values[0].preview.fields[0];
+    assert_eq!(field.body_path, ["memberId"]);
+    assert_eq!(
+        field.source,
+        CommandProjectionPreviewSource::trusted("x-user-id", "string")
+    );
+
+    for name in ["missing", "internal", "memberId", "revision"] {
+        assert!(
+            TypedServiceCommandBinding::from_contracts("members", &[command(name)]).is_err(),
+            "{name}"
+        );
+    }
+    let mismatched = typed_command::<Input, Succeeded<Payload>>("todo.bad-body")
+        .emits(crate::events![DishonestStateContract])
+        .authenticated_user_field::<DishonestStateContract, TodoState>("status")
+        .into_contract();
+    assert!(
+        TypedServiceCommandBinding::from_contracts("members", &[mismatched])
+            .unwrap_err()
+            .contains("differs from its exact typed body descriptor")
+    );
+    let mismatched_flat = typed_command::<Input, Succeeded<Payload>>("todo.bad-flat-body")
+        .emits(crate::events![TodoCompleted])
+        .authenticated_user_field::<TodoCompleted, MembershipRemoved>("user_id")
+        .into_contract();
+    assert!(
+        TypedServiceCommandBinding::from_contracts("members", &[mismatched_flat])
+            .unwrap_err()
+            .contains("differs from its exact typed body descriptor")
+    );
+    let undeclared = typed_command::<Input, Succeeded<Payload>>("member.undeclared")
+        .authenticated_user_field::<MembershipRemoved, MembershipRemoved>("user_id")
+        .into_contract();
+    assert!(
+        TypedServiceCommandBinding::from_contracts("members", &[undeclared])
+            .unwrap_err()
+            .contains("outside its exact emitted event set")
+    );
 }
 
 #[test]

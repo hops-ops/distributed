@@ -382,6 +382,12 @@ impl CommandProjectionEvents {
             );
             return;
         }
+        if values.fields[0].body_type != Some(ProjectionPortableType::String) {
+            self.declaration_errors.push(format!(
+                "authenticated-user inference field `{rust_field}` must be a string body field"
+            ));
+            return;
+        }
         self.add_inferred_values(values);
     }
 
@@ -625,6 +631,55 @@ pub fn __command_projection_event_descriptor<E: DomainEventContract>(
         ));
     }
     Ok(descriptor)
+}
+
+/// Exact body descriptor used for authenticated command preview fields.
+///
+/// State bodies receive this implementation automatically through `DomainState`.
+/// `DomainEvent` derives and sourced flat event bodies implement it directly.
+#[doc(hidden)]
+pub trait CommandProjectionBody: Serialize + ProjectionBodyMetadata {
+    fn command_projection_descriptor(
+        event_name: &'static str,
+        event_version: u64,
+    ) -> DomainEventDescriptor;
+}
+
+impl<S: DomainState + ProjectionBodyMetadata> CommandProjectionBody for S {
+    fn command_projection_descriptor(
+        event_name: &'static str,
+        event_version: u64,
+    ) -> DomainEventDescriptor {
+        DomainEventDescriptor::state::<S>(event_name, event_version)
+    }
+}
+
+pub(crate) fn authenticated_user_field_preview<E, B>(
+    rust_field: &'static str,
+) -> CommandProjectionPreview
+where
+    E: DomainEventBodyContract<B>,
+    B: CommandProjectionBody,
+{
+    let descriptor = __command_projection_event_descriptor::<E>().and_then(|descriptor| {
+        let expected = B::command_projection_descriptor(E::EVENT_NAME, E::EVENT_VERSION);
+        if descriptor != expected
+            || !matches!(descriptor.body.kind, DomainEventBodyKind::State | DomainEventBodyKind::Event)
+        {
+            return Err(format!(
+                "authenticated-user event contract `{}` differs from its exact typed body descriptor",
+                E::EVENT_NAME
+            ));
+        }
+        Ok(descriptor)
+    });
+    structured_preview::<B>(
+        __command_projection_events([descriptor]),
+        vec![(
+            rust_field,
+            CommandProjectionPreviewSource::trusted("x-user-id", "string"),
+        )],
+    )
 }
 
 /// Build a structured state preview from generated body metadata.

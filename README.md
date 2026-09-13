@@ -880,8 +880,47 @@ calls to the same recorder disagree, only their shared constants are retained.
 This does not predict authorization or guarantee an event will occur. Snapshot
 events continue to infer known values from recorder state assignments.
 
+Public transitions can delegate to shared decision helpers in the same
+`#[sourced]` impl. For example, `leave` and an owner-authorized `remove_member`
+can both call a private `self.remove_member_decision(...)`. Each gets its own
+`domain_commands::Leave` / `domain_commands::RemoveMember` witness containing
+the outward events reachable through those helpers. Discovery follows static
+`self.method(...)` calls, deduplicates events, and terminates on recursive helper
+graphs. It does not follow foreign receivers or helpers outside the impl, and
+does not propagate argument values through helpers. Literal arguments at the
+recorder call still participate in the same conservative inference.
+
+For an event whose body contains the authenticated principal, bind that one
+field using the existing command API:
+
+```rust,ignore
+command_transition::<domain_commands::Leave, LeaveInput, Eventual<LeaveOutput>>("group.leave")
+    .authenticated_user_field::<GroupMemberRemovedDomainEvent, GroupMemberRemovedDomainEvent>(
+        "user_id",
+    )
+```
+
+The second type is the exact serialized body. Use the flat event itself for
+`domain = event` or `#[derive(DomainEvent)]`; state-capture events continue to
+use their `DomainState` type. The equivalent `portable_command!` entry is:
+
+```rust,ignore
+authenticated_user_field: (
+    GroupMemberRemovedDomainEvent,
+    GroupMemberRemovedDomainEvent,
+    "user_id"
+),
+```
+
+This gives a membership-delete projection the trusted `x-user-id` key without
+adding a caller-controlled user ID to the command input. The framework checks
+the exact event/body descriptor and serialized string field, including Serde
+renames. The handler must still obtain the principal from its authenticated
+session and enforce membership rules; this declaration only supplies the
+generated preview's provenance.
+
 See [the executable contract tests](tests/sourced/flat_preview.rs), including
-the generated GraphQL client manifest and conflicting/dynamic-value cases.
+the generated delete-projection client, helper replay and conflicting/dynamic-value cases.
 
 ### Durable Stream Identity
 

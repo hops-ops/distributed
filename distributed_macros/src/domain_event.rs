@@ -85,6 +85,15 @@ pub(crate) fn expand_domain_event(input: DeriveInput) -> syn::Result<proc_macro2
 
         impl #framework::domain_event::DomainEventBodyContract<Self> for #name {}
 
+        impl #framework::command::CommandProjectionBody for #name {
+            fn command_projection_descriptor(
+                _: &'static str,
+                _: u64,
+            ) -> #framework::DomainEventDescriptor {
+                <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
+            }
+        }
+
         impl #framework::projection::lower::ProjectionBodyMetadata for #name {
             #projection_metadata
         }
