@@ -330,6 +330,28 @@ struct IncludeSpec {
 }
 
 impl RelationalReadModelQueryStore for InMemoryReadModelStore {
+    fn scan_read_model(&self, request: super::ReadModelScanRequest)
+        -> impl Future<Output = Result<super::ReadModelScanPage, TableStoreError>> + Send + '_ {
+        async move {
+            request.validate()?;
+            let registry = self.schema_registry.read().map_err(|_| TableStoreError::Storage("schema registry lock poisoned".into()))?;
+            if registry.schema_for_model(&request.schema.model_name).is_some_and(|s| s != &request.schema) {
+                return Err(TableStoreError::Metadata("scan schema differs from registered model".into()));
+            }
+            let rows = self.relational_rows.read().map_err(|_| TableStoreError::Storage("row lock poisoned".into()))?;
+            let prefix = format!("{}:", request.schema.table_name);
+            let mut selected = BTreeMap::new();
+            for (storage_key, row) in rows.iter() {
+                if !storage_key.starts_with(&prefix) || !request.matches(&row.values) { continue; }
+                let Some(RowValue::String(key)) = row.values.get(request.key_column()) else { return Err(TableStoreError::Metadata("invalid scan row key".into())); };
+                if request.after().is_some_and(|after| key.as_str() <= after) { continue; }
+                selected.insert(key, row);
+                if selected.len() > usize::from(request.limit) + 1 { selected.pop_last(); }
+            }
+            request.finish(selected.into_values().map(|row| Versioned { data: row.values.clone(), version: row.version }).collect())
+        }
+    }
+
     fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities {
         ReadModelQueryCapabilities::relationship_includes()
     }

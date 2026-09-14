@@ -847,6 +847,11 @@ impl ReadModelWritePlanStore for InMemoryRepository {
 }
 
 impl RelationalReadModelQueryStore for InMemoryRepository {
+    fn scan_read_model(&self, request: crate::read_model::ReadModelScanRequest)
+        -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_ {
+        self.model_store.scan_read_model(request)
+    }
+
     fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities {
         self.model_store.read_model_query_capabilities()
     }

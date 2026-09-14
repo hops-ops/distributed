@@ -15,6 +15,8 @@
 mod backend;
 mod load;
 mod query;
+mod scan;
+pub(crate) use scan::scan_read_model;
 mod schema_registry;
 mod validation;
 mod write_plan;

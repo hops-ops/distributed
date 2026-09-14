@@ -603,6 +603,11 @@ where
     R: RelationalReadModelQueryStore,
     L: LockManager,
 {
+    fn scan_read_model(&self, request: crate::read_model::ReadModelScanRequest)
+        -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_ {
+        self.inner.scan_read_model(request)
+    }
+
     fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities {
         self.inner.read_model_query_capabilities()
     }
