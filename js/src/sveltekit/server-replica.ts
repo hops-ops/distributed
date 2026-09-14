@@ -9,6 +9,7 @@ import type { FetchLike } from '../request.js';
 import type { GqlAuth, GraphqlVariables } from '../types.js';
 import { authFromPageData, type PageGraphqlData } from './auth.js';
 import {
+	DISTRIBUTED_BOUNDARY_BINDING_VERSION,
 	resolveDistributedBoundaryVariables,
 	type DistributedBoundaryOperation,
 	type DistributedBoundaryVariableContext
@@ -293,7 +294,7 @@ function validateBoundaryOperations<TSession>(
 			if (
 				operation === null ||
 				typeof operation !== 'object' ||
-				operation.binding?.version !== 1 ||
+				operation.binding?.version !== DISTRIBUTED_BOUNDARY_BINDING_VERSION ||
 				operation.binding.artifactId !== operation.artifact?.id
 			) {
 				throw new TypeError(`invalid Distributed boundary operation at index ${index}`);

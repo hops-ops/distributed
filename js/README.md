@@ -173,7 +173,8 @@ import {
 } from '@hops-ops/distributed/sveltekit';
 
 export default defineGraphqlIslandBindings({
-  query: searchParam('q'),
+  query: searchParam('q', 'String'),
+  offset: searchParam('offset', 'Int'),
   viewerId: sessionClaim('user', 'id'),
   filters: forwardedProp('filters')
 });
@@ -186,6 +187,31 @@ then sidecar/route sources, then GraphQL defaults. A non-null variable without
 any of those sources fails generation before transport. Central `boundaries`
 registrations remain an explicit-placement escape hatch and cannot be combined
 with a sidecar for the same operation.
+
+Search bindings require an explicit built-in GraphQL scalar: `String`, `ID`,
+`Int`, `Float`, or `Boolean`. Generation and runtime registration reject a
+scalar or list shape that differs from the operation variable. For example,
+`$offset: Int! = 0` with `searchParam('offset', 'Int')` resolves `?offset=20`
+to the number `20`; an absent parameter retains the GraphQL default `0`.
+`searchParam('id', 'ID', 'all')` binds repeated parameters to an `[ID!]` list
+in URL order. Default `first` mode selects the first repeated value. Absent
+parameters are omitted in both modes; nullable omission and required-variable
+errors follow the operation codec. An empty string is a present value.
+
+Int and Float use strict decimal syntax, with no trimming, partial parsing,
+hexadecimal, or leading plus/zeroes. Float additionally accepts a fraction
+and/or exponent. Boolean accepts only `true` and `false`; String and ID retain
+decoded URL text. Invalid values fail before transport, and errors omit their
+contents. The operation codec still enforces Int's signed 32-bit range, list
+limits, defaults, and canonical identity. JSON, enum and custom-scalar decoding
+are not inferred from URL text.
+
+This is a breaking binding/adapter-plan v2 change: migrate `searchParam('q')`
+to `searchParam('q', 'String')`, and the old second `all` argument to the third
+argument after the scalar. Raw `search_param` sources must also include
+`scalar`. Regenerate all boundary plans together with the runtime; v1 plans
+and hydration fingerprints cannot be reused. Missing multi-value parameters
+now preserve GraphQL defaults instead of producing an empty list.
 
 The application lifecycle runs the client compiler before Vite starts and after
 declared GraphQL, binding, or Svelte ownership inputs change. Vite consumes the

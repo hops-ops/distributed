@@ -2052,7 +2052,7 @@ query SearchTodos($q: String! = "") @load @live {
 }
 ```
 
-A colocated binding can pass `q: searchParam('q')` directly. Callers do not
+A colocated binding can pass `q: searchParam('q', 'String')` directly. Callers do not
 construct `%patterns%`: `%`, `_`, backslash, quotes and the escape character
 are literal text. The query engine binds an escaped pattern on both PostgreSQL
 and SQLite. An empty string matches every non-null string; use a bounded query

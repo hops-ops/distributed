@@ -13,6 +13,8 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import test from 'node:test';
+import { defineDistributedBoundaryBinding } from '../dist/sveltekit/index.js';
+import { TodosArtifact } from './fixtures/adapter-conformance.mjs';
 
 import {
 	analyzeDistributedSvelteKitBoundaries,
@@ -339,15 +341,31 @@ test('boundary plans generate route-variable bindings and fail unprovable requir
 	await writeFile(
 		sidecar,
 		`import { defineGraphqlIslandBindings, searchParam } from ${JSON.stringify(helper)};\n` +
-			`export default defineGraphqlIslandBindings({ limit: searchParam('pageSize') });\n`
+			`export default defineGraphqlIslandBindings({ limit: searchParam('pageSize', 'Int') });\n`
 	);
 	const colocated = await analyzeDistributedSvelteKitBoundaries({
 		cwd: root,
 		clients: [{ module: '$distributed', inventory: required }]
 	});
 	assert.deepEqual(colocated[0].boundaries[0].islands[0].binding.sources, {
-		limit: { kind: 'search_param', name: 'pageSize', mode: 'first' }
+		limit: { kind: 'search_param', name: 'pageSize', scalar: 'Int', mode: 'first' }
 	});
+	const plannedBinding = colocated[0].boundaries[0].islands[0].binding;
+	const executable = defineDistributedBoundaryBinding({
+		...TodosArtifact,
+		id: required.islands[0].operationHash,
+		protocol: { ...TodosArtifact.protocol, operation: required.islands[0].operationHash },
+		variableCodec: {
+			version: 2,
+			limits: { maxDepth: 64, maxBoolWidth: 256, maxInList: 1000 },
+			variables: { limit: { kind: 'scalar', scalar: 'Int', codec: 'int32', nullable: false } },
+			defaults: {}, inputs: {}
+		}
+	}, plannedBinding.sources);
+	assert.equal(plannedBinding.version, 2);
+	assert.equal(plannedBinding.id, executable.id, 'generator and runtime share the exact v2 fingerprint');
+	assert.deepEqual(executable.resolve({ params: {}, search: new URLSearchParams('pageSize=20'), session: null, props: {} }), { limit: 20 });
+	assert.throws(() => validateDistributedSvelteKitBoundaryPlan({ ...colocated[0], version: 1 }), /boundary_plan_invalid/);
 	await assert.rejects(
 		analyzeDistributedSvelteKitBoundaries({
 			cwd: root,
@@ -370,6 +388,10 @@ test('boundary plans generate route-variable bindings and fail unprovable requir
 	);
 	await rm(sidecar);
 	for (const hostile of [
+		{ kind: 'search_param', name: 'pageSize' },
+		{ kind: 'search_param', name: 'pageSize', scalar: 'String' },
+		{ kind: 'search_param', name: 'pageSize', scalar: 'Int', mode: 'all' },
+		{ kind: 'search_param', name: 'pageSize', scalar: 'Int', fallback: 20 },
 		{ kind: 'trusted_session', path: ['__proto__'] },
 		{ kind: 'query_result', path: ['items', 'limit'] }
 	]) {
@@ -863,7 +885,7 @@ test('boundary diagnostics reject cycles, stale plans, and unbounded layout live
 	);
 	assert.throws(
 		() => validateDistributedSvelteKitBoundaryPlan(
-			{ version: 2, module: '$distributed', boundaries: [], unplaced: [] },
+			{ version: 1, module: '$distributed', boundaries: [], unplaced: [] },
 			'$distributed'
 		),
 		/\[distributed\.island\.boundary_plan_invalid\]/
