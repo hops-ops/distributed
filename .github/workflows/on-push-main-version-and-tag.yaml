@@ -57,7 +57,7 @@ jobs:
   version-and-tag:
     name: Version and Tag
     needs: [quality, all-features, postgres, nats, rabbitmq, kafka, distributed-cli, observability, graphql, e2e-ui, js-client, celld]
-    uses: unbounded-tech/workflow-vnext-tag/.github/workflows/workflow.yaml@v1.22.2
+    uses: unbounded-tech/workflow-vnext-tag/.github/workflows/workflow.yaml@v1.22.3
     secrets:
       DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
     with:
