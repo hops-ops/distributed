@@ -28,9 +28,17 @@ either representation. Expansion returns exactly the original program JSON.
 Unsupported encodings, invalid references, inline/reference ambiguity, duplicate
 or unused table entries, and noncanonical table order fail validation.
 
-The complete encoded application manifest remains bounded at 4 MiB. Each opaque
+The complete encoded application manifest is bounded at 16 MiB, matching CLI
+manifest ingress. This aggregate budget accommodates complete current and
+retained-selector catalogs composed from many independently bounded contracts.
+Older framework readers capped at 4 MiB reject larger artifacts; rebuild tooling
+and applications together. Existing bytes, fingerprints and encoding versions
+are unchanged for manifests that already fit.
+
+Each opaque
 modeled value remains bounded at 1 MiB; an expanded program also must fit the
 existing 1 MiB budget. The decoder checks repeated byte costs before copying
 shared values and validates programs individually, without retaining an expanded
-copy of the whole application. Sharing is storage normalization, not an increase
-in wire limits or a replacement for retained-history replay.
+copy of the whole application. Collection, string and depth limits remain
+unchanged. Sharing is storage normalization, not a replacement for
+retained-history replay.

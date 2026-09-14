@@ -285,16 +285,21 @@ mod tests {
         let expanded_modules = (0..32)
             .map(|index| module(index, &original))
             .collect::<Vec<_>>();
-        let error = Application::try_new("history-app", expanded_modules, []).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("application manifest exceeds 4194304 bytes"));
+        let expanded_application =
+            Application::try_new("history-app", expanded_modules, []).unwrap();
+        let expanded_bytes = expanded_application.manifest().canonical_bytes().unwrap();
+        assert!(expanded_bytes.len() > 4 * 1024 * 1024);
+        assert_eq!(
+            ApplicationManifest::from_canonical_bytes(&expanded_bytes).unwrap(),
+            *expanded_application.manifest()
+        );
         let modules = (0..32)
             .map(|index| module(index, &compact))
             .collect::<Vec<_>>();
         let application = Application::try_new("history-app", modules.clone(), []).unwrap();
         let bytes = application.manifest().canonical_bytes().unwrap();
         assert!(bytes.len() < crate::application::MAX_APPLICATION_MANIFEST_BYTES);
+        assert!(bytes.len() < expanded_bytes.len());
         assert_eq!(
             ApplicationManifest::from_canonical_bytes(&bytes).unwrap(),
             *application.manifest()

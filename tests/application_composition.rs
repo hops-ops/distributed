@@ -534,8 +534,12 @@ fn normalized_manifest_fits_without_serializing_duplicate_model_inventory() {
     let mut redundant = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
     redundant["models"] = serde_json::to_value(&manifest.models).unwrap();
     let redundant_bytes = serde_json::to_vec(&redundant).unwrap();
-    assert!(redundant_bytes.len() > MAX_APPLICATION_MANIFEST_BYTES);
-    assert!(ApplicationManifest::from_canonical_bytes(&redundant_bytes).is_err());
+    assert!(redundant_bytes.len() > 4 * 1024 * 1024);
+    assert!(redundant_bytes.len() < MAX_APPLICATION_MANIFEST_BYTES);
+    let error = ApplicationManifest::from_canonical_bytes(&redundant_bytes)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown field `models`"), "{error}");
     assert_eq!(
         ApplicationManifest::from_canonical_bytes(&bytes).unwrap(),
         manifest

@@ -14,7 +14,9 @@ pub const APPLICATION_MANIFEST_SCHEMA_VERSION: u32 = 2;
 ///
 /// A complete manifest carries authoritative module declarations and selected
 /// Surface contracts. Flattened inventories are reconstructed, not serialized.
-pub const MAX_APPLICATION_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+/// Match the CLI manifest ingress budget so complete retained-selector catalogs
+/// can compose many independently bounded contracts without dropping history.
+pub const MAX_APPLICATION_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_MANIFEST_COLLECTION_ITEMS: usize = 4096;
 pub const MAX_MANIFEST_STRING_BYTES: usize = 4096;
 /// Per-value JSON bound. Several independently bounded contracts may comprise
@@ -2176,11 +2178,16 @@ mod size_limit_tests {
             deep = serde_json::json!([deep]);
         }
         assert!(validate(&deep).is_err());
-        let oversized = serde_json::json!(vec!["x".repeat(MAX_MANIFEST_STRING_BYTES); 1024]);
+        let oversized = serde_json::json!(vec![
+            "x".repeat(MAX_MANIFEST_STRING_BYTES);
+            MAX_MANIFEST_COLLECTION_ITEMS
+        ]);
         assert!(validate(&oversized)
             .unwrap_err()
             .to_string()
-            .contains("exceeds 4194304 JSON bytes"));
+            .contains(&format!(
+                "exceeds {MAX_APPLICATION_MANIFEST_BYTES} JSON bytes"
+            )));
     }
 
     #[test]
@@ -2196,11 +2203,11 @@ mod size_limit_tests {
     }
 
     #[test]
-    fn manifest_accepts_multiple_bounded_contracts_beyond_one_mib() {
+    fn manifest_accepts_multiple_bounded_contracts_beyond_four_mib() {
         let value = serde_json::json!(vec!["x".repeat(MAX_MANIFEST_STRING_BYTES); 200]);
         assert!(serde_json::to_vec(&value).unwrap().len() < MAX_MANIFEST_JSON_BYTES);
         let mut manifest = ApplicationManifest::new("large-app");
-        for index in 0..2 {
+        for index in 0..6 {
             manifest.extensions.push(
                 ApplicationExtension::try_new(format!("large.contract.{index}"), 1, value.clone())
                     .unwrap(),
@@ -2208,17 +2215,30 @@ mod size_limit_tests {
         }
 
         let bytes = manifest.canonical_bytes().unwrap();
-        assert!(bytes.len() > 1024 * 1024);
+        assert!(bytes.len() > 4 * 1024 * 1024);
         assert!(bytes.len() < MAX_APPLICATION_MANIFEST_BYTES);
-        ApplicationManifest::from_canonical_bytes(&bytes).unwrap();
+        let decoded = ApplicationManifest::from_canonical_bytes(&bytes).unwrap();
+        assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
+        for index in 0..6 {
+            assert_eq!(
+                decoded
+                    .extensions
+                    .iter()
+                    .find(|extension| extension.id == format!("large.contract.{index}"))
+                    .unwrap()
+                    .value,
+                value,
+            );
+        }
     }
 
     #[test]
-    fn manifest_rejects_multiple_contracts_beyond_four_mib() {
+    fn manifest_rejects_multiple_contracts_beyond_aggregate_budget() {
         let value = serde_json::json!(vec!["x".repeat(MAX_MANIFEST_STRING_BYTES); 230]);
         assert!(serde_json::to_vec(&value).unwrap().len() < MAX_MANIFEST_JSON_BYTES);
         let mut manifest = ApplicationManifest::new("oversized-app");
-        for index in 0..5 {
+        let contract_bytes = serde_json::to_vec(&value).unwrap().len();
+        for index in 0..=MAX_APPLICATION_MANIFEST_BYTES / contract_bytes {
             manifest.extensions.push(
                 ApplicationExtension::try_new(format!("large.contract.{index}"), 1, value.clone())
                     .unwrap(),
@@ -2226,9 +2246,16 @@ mod size_limit_tests {
         }
 
         let error = manifest.canonical_bytes().unwrap_err().to_string();
-        assert!(error.contains("application manifest exceeds 4194304 bytes"));
+        assert!(error.contains(&format!(
+            "application manifest exceeds {MAX_APPLICATION_MANIFEST_BYTES} bytes"
+        )));
         let oversized_bytes = serde_json::to_vec(&manifest).unwrap();
         assert!(oversized_bytes.len() > MAX_APPLICATION_MANIFEST_BYTES);
-        assert!(ApplicationManifest::from_canonical_bytes(&oversized_bytes).is_err());
+        let error = ApplicationManifest::from_canonical_bytes(&oversized_bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!(
+            "application manifest bytes must be between 1 and {MAX_APPLICATION_MANIFEST_BYTES}"
+        )));
     }
 }

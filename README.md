@@ -2500,11 +2500,14 @@ Command namespaces such as `orders.submit` supply module names; there is no
 second module list to maintain. Assembly rejects commands missing from the
 Surface or exposed by the Surface without a Service owner. Role-selected client
 exports remain authorization views of that full contract. Complete application
-manifests are bounded at 4 MiB; each opaque JSON contract remains bounded at
+manifests are bounded at 16 MiB; each opaque JSON contract remains bounded at
 1 MiB. A generated Surface contract uses the complete-manifest budget rather
 than the opaque-value cap; its typed contents and the existing collection,
 string and nesting limits are still validated. The complete artifact, including
-all surfaces and module inventories, must fit within 4 MiB.
+all surfaces and module inventories, must fit within 16 MiB, matching the CLI
+manifest ingress budget. Older tooling capped at 4 MiB must be rebuilt before
+consuming larger artifacts; encoding versions and existing fingerprints do not
+change.
 
 An event-driven policy that emits through another aggregate can explicitly carry
 the incoming command's causal identity before recording its events:
@@ -2542,7 +2545,7 @@ Application manifest wire version 2 stores module declarations and selected
 Surface contracts without repeating top-level `commands`, `events`, `models`,
 or `projections`. The Rust `ApplicationManifest` decoder reconstructs those
 inventories and validates their ownership; its convenience fields are unchanged.
-Portable artifacts remain bounded to 4 MiB. Version 1 artifacts must be
+Portable application artifacts remain bounded to 16 MiB. Version 1 artifacts must be
 regenerated with the matching CLI; they are not accepted as version 2.
 
 Modeled projection contracts [share repeated operations and selector schemas](docs/compact-projection-contracts.md)
