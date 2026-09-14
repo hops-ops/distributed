@@ -758,6 +758,110 @@ fn generated_command_types_manifest() -> JsonValue {
     value
 }
 
+fn retained_projection_catalog(arm_count: usize) -> JsonValue {
+    let mut value = generated_command_types_manifest();
+    let arms = value["projection_programs"][0]["arms"]
+        .as_array_mut()
+        .unwrap();
+    let template = arms[0].clone();
+    for index in 1..arm_count {
+        let mut arm = template.clone();
+        arm["arm"] = json!(format!("retained-{index:03}"));
+        arm["event"] = json!({
+            "id": format!("event:todo.retained:v{index:03}"),
+            "name": "todo.retained",
+            "version": index
+        });
+        arm["operations"][0]["operation"] = json!(format!("retained-upsert-{index:03}"));
+        arms.push(arm);
+    }
+    refresh_schema_fingerprint(&mut value);
+    value
+}
+
+#[test]
+fn retained_projection_catalog_compiles_134_and_256_arms_with_one_selected_capability() {
+    let selected_preview = |manifest: &ClientManifest| {
+        let command = manifest
+            .commands
+            .iter()
+            .find(|command| command.extensions.projection.is_some())
+            .unwrap();
+        serde_json::to_value(
+            super::projection_delta::compile_command_preview(command, manifest)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let baseline = ClientManifest::parse(
+        generated_command_types_manifest(),
+        &ClientSurfaceSelector::role("user"),
+    )
+    .unwrap();
+    let expected = selected_preview(&baseline);
+    assert_eq!(
+        expected["capabilities"]["arms"].as_array().unwrap().len(),
+        1
+    );
+    for count in [128, 134, 256] {
+        let value = retained_projection_catalog(count);
+        let manifest = ClientManifest::parse(value.clone(), &ClientSurfaceSelector::role("user"))
+            .unwrap_or_else(|error| panic!("{count} retained arms: {error}"));
+        assert_eq!(manifest.projection_programs[0].arms.len(), count);
+        assert_eq!(selected_preview(&manifest), expected);
+        compile_client(ClientCompileInput::new(
+            value,
+            ClientSurfaceSelector::role("user"),
+            vec![ClientDocument::new(
+                "src/routes/todos/+page.graphql",
+                "query Todo { todo(id: \"1\", tenantId: \"tenant\") { id tenantId } }",
+            )],
+        ))
+        .unwrap_or_else(|error| panic!("compile {count} retained arms: {error}"));
+    }
+}
+
+#[test]
+fn retained_projection_catalog_rejects_257_arms_and_preserves_nested_limits() {
+    let error = ClientManifest::parse(
+        retained_projection_catalog(257),
+        &ClientSurfaceSelector::role("user"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "client.manifest.projection_program_arms");
+    for (mutation, expected) in [
+        (0, "client.manifest.projection_arm_id"),
+        (1, "client.manifest.projection_arm_order"),
+        (2, "client.manifest.projection_operation_id"),
+        (3, "client.manifest.projection_operations"),
+        (4, "client.manifest.command_projection_inventory"),
+    ] {
+        let mut value = retained_projection_catalog(134);
+        let arms = value["projection_programs"][0]["arms"]
+            .as_array_mut()
+            .unwrap();
+        match mutation {
+            0 => arms[1]["arm"] = arms[0]["arm"].clone(),
+            1 => arms.swap(0, 1),
+            2 => {
+                arms[1]["operations"][0]["operation"] =
+                    arms[0]["operations"][0]["operation"].clone()
+            }
+            3 => arms[1]["operations"] = json!(vec![arms[1]["operations"][0].clone(); 129]),
+            4 => {
+                let projection = &mut value["commands"][0]["extensions"]["projection"];
+                projection["program_arms"] =
+                    json!(vec![projection["program_arms"][0].clone(); 129]);
+            }
+            _ => unreachable!(),
+        }
+        refresh_schema_fingerprint(&mut value);
+        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user")).unwrap_err();
+        assert_eq!(error.code, expected, "mutation {mutation}");
+    }
+}
+
 fn key_only_projection_manifest(composite: bool) -> JsonValue {
     let mut value = generated_command_types_manifest();
     value["capabilities"]["live_queries"] = json!(false);

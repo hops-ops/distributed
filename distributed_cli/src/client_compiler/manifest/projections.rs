@@ -3,6 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::*;
 
 const MAX_PROJECTION_ITEMS: usize = 128;
+// Retained event versions grow the catalog without expanding a command's
+// selected capabilities or an occurrence's executable operation budget.
+const MAX_PROJECTION_PROGRAM_ARMS: usize = 256;
 // Frozen with `distributed::MAX_PROJECTION_EXPRESSION_DEPTH`. The CLI crate is
 // intentionally dependency-free from the runtime crate, so keep a boundary
 // test below to prevent this executable-contract limit from drifting.
@@ -348,11 +351,11 @@ fn validate_program(
     }
     validate_program_id(&program.program_id)?;
     validate_nonempty(&program.name, "projection program name")?;
-    if program.arms.is_empty() || program.arms.len() > MAX_PROJECTION_ITEMS {
+    if program.arms.is_empty() || program.arms.len() > MAX_PROJECTION_PROGRAM_ARMS {
         return Err(projection_error(
             "client.manifest.projection_program_arms",
             format!(
-                "projection program `{}` must contain 1..={MAX_PROJECTION_ITEMS} arms",
+                "projection program `{}` must contain 1..={MAX_PROJECTION_PROGRAM_ARMS} arms",
                 program.program_id
             ),
         ));
