@@ -277,7 +277,7 @@ test('SSR abort settles while forwarded parent data remains pending', async () =
 	assert.equal(parentCalls, 1);
 });
 
-test('client-side data requests skip GraphQL so navigation stays SPA', async () => {
+test('client-side data requests carry their own authorized route seed', async () => {
 	const harness = serverHarness();
 	const document = await harness.server.load(harness.event('alice'));
 	assert.equal(harness.calls.length, 1);
@@ -287,8 +287,10 @@ test('client-side data requests skip GraphQL so navigation stays SPA', async () 
 		...harness.event('alice'),
 		isDataRequest: true
 	});
-	assert.equal(harness.calls.length, 1, 'SPA data request must not seed a new replica');
-	assert.equal(dataNav.distributed, undefined);
+	assert.equal(harness.calls.length, 2, 'one authorized selection per document or data load');
+	assert.ok(dataNav.distributed);
+	assert.ok(dataNav.distributedAuthority);
+	assert.notEqual(dataNav.distributed, document.distributed);
 	assert.equal(dataNav.gqlError, null);
 	assert.equal(dataNav.accessToken, 'alice');
 });
@@ -593,6 +595,38 @@ test('queued page-data updates retain the fresh authority before seedless invali
 	await flushMicrotasks();
 	assert.equal(client.replica.scope, undefined);
 	assert.deepEqual(todos.get().data, {});
+	unsubscribe(); client.destroy();
+});
+
+test('a credential rotated by follow-up data loading carries independent authority', async () => {
+	const harness = serverHarness();
+	const first = await harness.server.load(harness.event('alice'));
+	const refresh = await harness.server.load(harness.event('alice', '2'));
+	const pageData = createPageDataSessionSource(first);
+	const client = createDistributedSvelteKit({
+		boundaries: [todosBoundary], session: pageData.session,
+		hydration: first.distributed, authority: first.distributedAuthority,
+		fetch: () => new Promise(() => {}), webSocket: SsrWebSocket
+	});
+	const todos = client.operation(TodosArtifact).use({}, {live:false});
+	const values = [];
+	const unsubscribe = todos.subscribe(snapshot => values.push(snapshot.data.todos?.[0]?.title));
+	await flushMicrotasks();
+	pageData.set({...refresh, accessToken:'refresh-credential'});
+	await flushMicrotasks();
+	// The follow-up request can legitimately rotate again (elapsed refresh skew
+	// or another request renewing the cookie). Its authority must be independent
+	// of the already-consumed refresh transfer, not inferred from the token.
+	const event = harness.event('alice', '3');
+	const fetch = event.fetch;
+	event.locals.session.accessToken = 'follow-up-credential';
+	event.fetch = (url, init) => fetch(url, {...init, headers:{...init.headers, authorization:'Bearer alice'}});
+	const navigation = await harness.server.load({...event, isDataRequest:true});
+	pageData.set(navigation);
+	await flushMicrotasks();
+	assert.ok(navigation.distributedAuthority, 'changed data-request credential needs fresh server authority');
+	assert.ok(values.every(value => value === 'alice:1'), JSON.stringify(values));
+	assert.equal(client.replica.scope.cacheScope, 'cache:alice');
 	unsubscribe(); client.destroy();
 });
 

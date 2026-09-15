@@ -18,3 +18,6 @@ refetch, an old HTTP/cache response arriving after another move, and a real old
 live frame replayed after a confirmed Chat command. Mutation observers detect
 transient regressions as well as the final state. Logs omit session payloads and
 are saved under ignored `artifacts/`.
+The first follow-up Todo data request is held across the fixture's refresh skew,
+forcing another real credential rotation after the refresh proof was consumed.
+The unchanged Todo/Chat continuity assertion must pass through this interleaving.

@@ -399,8 +399,11 @@ or reuse an old transfer. Logout, changed scopes, and invalid hydration still
 purge the generation.
 
 The sample auth refresh endpoint returns an authorized seed for the current
-route before invalidating SvelteKit page data. Ordinary SPA navigation still
-skips server GraphQL work.
+route before invalidating SvelteKit page data. Follow-up data loads and ordinary
+SPA navigation execute their bounded server selections too: those requests can
+rotate credentials independently and need their own fresh authority. Routes
+without selections still do no GraphQL work. See
+[session refresh continuity](../docs/session-refresh-continuity.md).
 
 Confirmed records and indexes under an active scope stay until auth/scope
 change, stale+revalidate, or a newer authoritative write. Same-scope soft

@@ -81,7 +81,18 @@ try{
     await page.goto(publicOrigin+'/blob');await expect(page.getByTestId('blob-start-game')).toBeEnabled();await page.getByTestId('blob-start-game').click();await expect(page.locator('.blob-board')).toBeVisible({timeout:20000});
     await verifyBlobRace(page);
     await verifyLiveRace(page,publicOrigin);
-    await verifySessionRefreshContinuity(page,publicOrigin);
+    // Force the follow-up data loader across the fixture's five-second refresh
+    // skew. The independent refresh proof has already been consumed, so a
+    // second rotated credential must arrive with its own server authority.
+    let delayedRefreshData=false;
+    const delayRefreshData=async route=>{
+      if(!delayedRefreshData){delayedRefreshData=true;await new Promise(resolve=>setTimeout(resolve,6000));}
+      await route.continue();
+    };
+    await page.route('**/todos/__data.json*',delayRefreshData);
+    try{await verifySessionRefreshContinuity(page,publicOrigin);}
+    finally{await page.unroute('**/todos/__data.json*',delayRefreshData);}
+    assert.ok(delayedRefreshData,'continuity proof must exercise follow-up credential rotation');
     if(process.env.GATEWAY_LIFECYCLE==='1'){
       assert.ok(devMode,'full reload proof requires the CLI dev host');
       const storage=path.join(temporary,'reload-auth.json');await context.storageState({path:storage});

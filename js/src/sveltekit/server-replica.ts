@@ -89,12 +89,11 @@ export function createDistributedSvelteKitServer<
 				accessToken,
 				engineRole
 			};
-			if (event.isDataRequest === true) {
-				return {
-					...pageData,
-					gqlError: null
-				};
-			}
+			// Data requests may rotate the cookie again after an auth refresh, or
+			// observe a credential renewed by a concurrent request. A credential
+			// without fresh server authority cannot preserve the browser's scope.
+			// Resolve the same bounded route selections for document and data loads;
+			// warm same-scope hydration merges without replacing newer command state.
 			const auth =
 				options.getAuth?.(pageData, event) ?? authFromPageData(pageData);
 			const routeId = routeIdentity(event);
