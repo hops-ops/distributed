@@ -38,7 +38,7 @@ jobs:
             tests/e2e-ui -> target
           shared-key: e2e-ui-offline
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -77,7 +77,7 @@ jobs:
             tests/e2e-ui -> target
           shared-key: e2e-ui-browser
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -152,7 +152,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-ui-playwright-report
           path: |
@@ -218,7 +218,7 @@ jobs:
             tests/e2e-ui -> target
           shared-key: e2e-ui-local-gitops
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
@@ -780,7 +780,7 @@ jobs:
 
       - name: Upload Kubernetes Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-ui-k8s-playwright-report
           path: |
@@ -813,7 +813,7 @@ jobs:
 
       - name: Upload Kubernetes diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-ui-k8s-diagnostics
           path: |
