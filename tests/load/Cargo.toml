@@ -1,0 +1,40 @@
+[package]
+name = "distributed_load"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Opt-in aggregate-command load host and client. Not part of the default workspace test suite."
+
+[[bin]]
+name = "load-host"
+path = "src/bin/load-host.rs"
+
+[[bin]]
+name = "load-client"
+path = "src/bin/load-client.rs"
+
+[[bin]]
+name = "load-suite"
+path = "src/bin/load-suite.rs"
+
+[features]
+default = []
+kafka = ["distributed/kafka"]
+rabbitmq = ["distributed/rabbitmq"]
+
+[dependencies]
+axum = "0.8"
+distributed = { path = "../..", features = ["http", "grpc", "sqlite", "postgres", "nats"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tokio-stream = "0.1"
+tonic = { version = "0.14", default-features = false, features = ["transport"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"] }
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

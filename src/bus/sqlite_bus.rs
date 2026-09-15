@@ -605,6 +605,22 @@ impl SqlBusDialect for SqliteBusDialect {
             .collect()
     }
 
+    async fn has_claimable(&self, names: &[String]) -> Result<bool, TransportError> {
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT 1 FROM bus_queue WHERE ");
+        push_name_filter(&mut query, names);
+        query.push(
+            " AND available_at <= unixepoch('now','subsec') \
+             AND (locked_until IS NULL OR locked_until <= unixepoch('now','subsec')) \
+             LIMIT 1",
+        );
+        let row = query
+            .build()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|err| db_err("peek claimable", err))?;
+        Ok(row.is_some())
+    }
+
     async fn log_read(
         &self,
         names: &[String],
