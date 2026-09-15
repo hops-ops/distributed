@@ -24,7 +24,11 @@ import type {
 	ReplicaAuthoritativeScope,
 	ReplicaDehydratedState
 } from '../types.js';
-import { freezeRecordClock } from './clocks.js';
+import {
+	compareIndexVector,
+	compareRecordClock,
+	freezeRecordClock
+} from './clocks.js';
 import { trustedPresetInventoryFingerprint } from './helpers.js';
 import {
 	hydrationMetadataConsistent,
@@ -419,21 +423,71 @@ export function hydrateReplica(
 		// Warm same-scope re-hydrate (soft nav / second SSR seed): keep confirmed
 		// records and indexes the route seed omitted. Seed keys upsert; purge only
 		// happens on auth/scope change (closeAuthorizationGeneration path).
-		host.closeActiveTransports();
-		host.queryStates.clear();
+		// A route seed is not a transport handoff. In particular its query-only
+		// protocol must not replace a retained layout's live cursor or generation.
+		const retainedIndexes = new Set<string>();
+		for (const group of host.operationProtocols.values()) {
+			if (group.live !== undefined && group.live.retiredAtRevision === undefined) {
+				for (const key of group.live.indexKeys) retainedIndexes.add(key);
+			}
+		}
 		for (const [key, group] of parsed.operationProtocols) {
-			host.operationProtocols.set(key, group);
+			const previous = host.operationProtocols.get(key);
+			if (previous?.live !== undefined && previous.live.retiredAtRevision === undefined) continue;
+			const before = previous?.query;
+			const incoming = group.query;
+			if (
+				incoming !== undefined &&
+				[...incoming.indexKeys].some((index) => retainedIndexes.has(index))
+			) continue;
+			if (before !== undefined && incoming !== undefined) {
+				const disposition = before.snapshotScope === incoming.snapshotScope
+					? compareIndexVector(
+						before.indexClocks,
+						[...incoming.indexClocks].map(
+							([projection, clock]) => ({ projection, ...clock })
+						)
+					)
+					: 'incomparable';
+				if (disposition === 'lower' || disposition === 'incomparable') {
+					for (const index of incoming.indexKeys) retainedIndexes.add(index);
+					continue;
+				}
+			}
+			host.operationProtocols.set(key, {
+				...group,
+				...(previous?.live === undefined ? {} : { live: previous.live })
+			});
 		}
 		for (const [key, generation] of parsed.operationGenerations) {
-			host.operationGenerations.set(key, generation);
+			// These are replica-local callback fences, not comparable server clocks.
+			if (!host.operationGenerations.has(key)) {
+				host.operationGenerations.set(key, generation);
+			}
 		}
+		const retainedRecords = new Set<string>();
 		for (const [key, clock] of parsed.recordClocks) {
+			const previous = host.recordClocks.get(key);
+			if (
+				previous !== undefined && (
+					previous.scopeToken !== clock.scopeToken ||
+					compareRecordClock(previous, clock) > 0
+				)
+			) {
+				retainedRecords.add(key);
+				continue;
+			}
 			host.recordClocks.set(key, clock);
 		}
 		for (const [scopeToken, key] of parsed.recordKeysByScope) {
-			host.recordKeysByScope.set(scopeToken, key);
+			if (!retainedRecords.has(key)) host.recordKeysByScope.set(scopeToken, key);
 		}
 		for (const [scopeToken, clock] of parsed.anonymousRecordClocks) {
+			const previous = host.anonymousRecordClocks.get(scopeToken);
+			if (
+				previous !== undefined &&
+				compareRecordClock(previous.clock, clock.clock) > 0
+			) continue;
 			host.anonymousRecordClocks.set(scopeToken, clock);
 		}
 		host.setTrustedPresets(parsed.trustedPresets);
@@ -458,7 +512,15 @@ export function hydrateReplica(
 					: {})
 			})
 		);
-		host.engine.mergeConfirmed(parsed.cache);
+		host.engine.mergeConfirmed({
+			...parsed.cache,
+			records: parsed.cache.records.filter(
+				(record) => !retainedRecords.has(record.key)
+			),
+			indexes: parsed.cache.indexes.filter(
+				(index) => !retainedIndexes.has(index.key)
+			)
+		});
 	} else {
 		host.closeAuthorizationGeneration();
 		host.queryStates.clear();

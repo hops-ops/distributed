@@ -63,6 +63,14 @@ try{
     await page.getByRole('button',{name:'Continue as Alice'}).click();
     await page.waitForURL(url=>url.origin===publicOrigin&&!url.pathname.startsWith('/auth')&&!url.pathname.startsWith('/login'));
     const session=await(await context.request.get(publicOrigin+'/auth/session')).json();assert.equal(session.user.id,'alice');
+    if(process.env.GATEWAY_LAYOUT_TESTS==='1'){
+      const storage=path.join(temporary,'layout-auth.json');await context.storageState({path:storage});
+      const layout=launch(process.execPath,['node_modules/@playwright/test/cli.js','test','e2e/chat.user.spec.ts','e2e/unauth.anon.spec.ts','--no-deps','--project=chromium-user','--project=chromium-anon','--grep','layout island survives'],{env:{...environment,PUBLIC_ORIGIN:publicOrigin,E2E_USER_STORAGE_STATE:storage}});
+      layout.child.stdout.on('data',chunk=>process.stdout.write(chunk));
+      const [code]=await once(layout.child,'exit');
+      await writeFile(path.join(artifacts,'layout-'+delivery+'.log'),layout.logs());
+      assert.equal(code,0,layout.logs());
+    }
     await page.goto(publicOrigin+'/todos');await expect(page.getByRole('heading',{name:/todos/i})).toBeVisible();
     const unauthenticated=await fetch(publicOrigin+'/graphql',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({query:'query { todos { todo_id } }'})});
     assert.match(unauthenticated.headers.get('content-type'),/json/);

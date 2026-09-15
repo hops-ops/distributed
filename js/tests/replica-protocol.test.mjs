@@ -2311,15 +2311,16 @@ test('retired live ownership survives dehydration before a later handoff', () =>
 	}));
 	assert.equal(current.get().data.games.length, 1);
 	assert.equal(restored.hydrate(dehydrated, dehydrated.scope), true);
-	assert.equal(restoredObservers.length, 2);
-	restoredObservers[1].next(gamesFrame({
+	assert.equal(current.get().data.games[0].owner.name, 'hydrated handoff');
+	assert.equal(restoredObservers.length, 1, 'same-scope hydration retains the active receiver');
+	restoredObservers[0].next(gamesFrame({
 		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
 		operation: GamesWithOwnerLiveOperation.live.id, position: '4',
 		ownerId: 'user-1', ownerName: 'active receiver after hydrate', indexesComparable: false,
 		live: { mode: 'snapshot', reset: true, cursors: [] }
 	}));
 	const contender = restored.watch(previousPage, {}, { live: true });
-	restoredObservers[2].next(oldFrame);
+	restoredObservers[1].next(oldFrame);
 	assert.equal(current.get().data.games[0].owner.name, 'active receiver after hydrate');
 	contender.destroy();
 	current.destroy();

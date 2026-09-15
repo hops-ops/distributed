@@ -21,3 +21,10 @@ are saved under ignored `artifacts/`.
 The first follow-up Todo data request is held across the fixture's refresh skew,
 forcing another real credential rotation after the refresh proof was consumed.
 The unchanged Todo/Chat continuity assertion must pass through this interleaving.
+
+With `npm ci --prefix tests/e2e-ui`, set `GATEWAY_LAYOUT_TESTS=1` to additionally
+run the existing authenticated and anonymous Chat layout Playwright tests against
+this isolated gateway. The runner passes its temporary authenticated storage via
+`E2E_USER_STORAGE_STATE`; the original test assertions remain unchanged. They
+require the same subscription ID throughout child navigation and completion only
+on layout exit, without browser GraphQL mount fetches.

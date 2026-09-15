@@ -18,3 +18,12 @@ tampered or different-scope authority still purges. SSR request isolation and
 Auth.js request-local session memoization remain required. The gateway's original
 Todo/Chat MutationObserver assertion is unchanged and detects transient removals,
 not merely eventual recovery.
+
+## Retained layout navigation
+
+An authorized data seed for an unchanged credential and scope is a cache merge,
+not a transport reauthorization. Child navigation must retain the layout's exact
+live subscription and local operation fences until its last owner releases it.
+Seed merging must not regress confirmed record clocks, live cursors or membership.
+Credential changes still require independent authority and transport rotation;
+missing authority and changed scope still invalidate the prior replica.

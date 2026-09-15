@@ -411,6 +411,22 @@ test('same-scope re-hydrate retains confirmed indexes omitted from a later route
 	);
 });
 
+test('older same-scope route seed cannot regress confirmed query membership or record clocks', () => {
+	const old = createDistributedReplica();
+	write(old, Todos, [{ id: 'todo-1', title: 'old' }], { position: '1' });
+	old.read(Todos, {});
+	const seed = old.dehydrate();
+	const warm = createDistributedReplica();
+	write(warm, Todos, [{ id: 'todo-1', title: 'current' }, { id: 'todo-2', title: 'new member' }], { position: '3' });
+	warm.read(Todos, {});
+	const before = warm.dehydrate();
+	assert.equal(warm.hydrate(seed, seed.scope), true);
+	assert.deepEqual(warm.read(Todos, {}).data.todos, [{ id: 'todo-1', title: 'current' }, { id: 'todo-2', title: 'new member' }]);
+	const after = warm.dehydrate();
+	assert.deepEqual(after.payload.operations, before.payload.operations);
+	assert.deepEqual(after.payload.recordClocks, before.payload.recordClocks);
+});
+
 test('hydration rejects malformed, cross-scope, and elevated-schema state atomically', () => {
 	const current = createDistributedReplica();
 	write(current, Todos, [{ id: 'todo-1', title: 'current' }]);

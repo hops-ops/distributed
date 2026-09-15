@@ -70,7 +70,7 @@ export default defineConfig({
 			testMatch: /.*\.user\.spec\.ts/,
 			use: {
 				...devices['Desktop Chrome'],
-				storageState: path.join(root, 'e2e/.auth/alice.json')
+				storageState: process.env.E2E_USER_STORAGE_STATE || path.join(root, 'e2e/.auth/alice.json')
 			}
 		},
 		{

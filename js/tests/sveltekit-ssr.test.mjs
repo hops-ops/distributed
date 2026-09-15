@@ -406,6 +406,64 @@ test('route misses do no GraphQL work and same-scope soft-nav merges overlapping
 	client.destroy();
 });
 
+for (const mode of ['resumable', 'snapshot']) {
+test(`same-scope data hydration retains the ${mode} live subscription until its owner releases`, async () => {
+	const harness = serverHarness();
+	const first = await harness.server.load(harness.event('alice', '1'));
+	const second = await harness.server.load({ ...harness.event('alice', '2'), isDataRequest: true });
+	SsrWebSocket.instances.length = 0;
+	const client = createDistributedSvelteKit({
+		boundaries: [todosBoundary],
+		session: { getAuth: () => ({ accessToken: 'alice' }) },
+		hydration: first.distributed,
+		authority: first.distributedAuthority,
+		fetch: async () => { throw new Error('hydrated navigation must not fetch'); },
+		webSocket: SsrWebSocket
+	});
+	const todos = client.operation(TodosArtifact).use();
+	const release = todos.subscribe(() => undefined);
+	await flushMicrotasks();
+	const socket = SsrWebSocket.instances[0];
+	socket.open();
+	socket.receive({ type: 'connection_ack' });
+	await flushMicrotasks();
+	const subscription = socket.sent.find((frame) => frame.type === 'subscribe');
+	assert.ok(subscription);
+	assert.equal(client.hydrate(second.distributed, second.distributedAuthority), true);
+	await flushMicrotasks();
+	assert.equal(socket.closed, false);
+	assert.equal(socket.sent.some((frame) => frame.type === 'complete'), false);
+	assert.equal(SsrWebSocket.instances.length, 1);
+	const receive = (position, rows) => socket.receive({
+		type: 'next', id: subscription.id,
+		payload: todoFrame(TodosArtifact, rows, { cacheScope: 'cache:alice', position, source: 'live', mode })
+	});
+	const rows = [
+		{ id: 'todo-alice', title: 'newer live row', status: 'open' },
+		{ id: 'live-only', title: 'newer live member', status: 'open' }
+	];
+	receive('3', rows);
+	await flushMicrotasks();
+	assert.deepEqual(todos.get().data.todos, rows);
+	const before = client.replica.dehydrate().payload.operations;
+	assert.equal(client.hydrate(second.distributed, second.distributedAuthority), true);
+	assert.deepEqual(todos.get().data.todos, rows, 'stale route seed must not regress live records or membership');
+	assert.deepEqual(client.replica.dehydrate().payload.operations, before, 'live cursor and local operation generation must survive query-only seed');
+	receive('4', [{ ...rows[0], title: 'continued live stream' }]);
+	await flushMicrotasks();
+	assert.equal(todos.get().data.todos[0].title, 'continued live stream');
+	assert.equal(todos.get().data.todos.length, 1);
+	assert.equal(socket.closed, false);
+	assert.equal(socket.sent.some((frame) => frame.type === 'complete'), false);
+	release();
+	assert.equal(socket.sent.filter((frame) => frame.type === 'complete' && frame.id === subscription.id).length, 1);
+	const later = await harness.server.load({ ...harness.event('alice', '5'), isDataRequest: true });
+	assert.equal(client.hydrate(later.distributed, later.distributedAuthority), true);
+	assert.equal(todos.get().data.todos[0].title, 'alice:5', 'a released live owner must not block a later route seed');
+	client.destroy();
+});
+}
+
 test('auth changes purge old data, abort live work, and reject cross-scope hydration', async () => {
 	const harness = serverHarness();
 	const [alice, bob] = await Promise.all([
