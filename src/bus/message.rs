@@ -218,9 +218,9 @@ pub(crate) fn message_from_wire(
     let mut kind = MessageKind::Event;
     let mut metadata = Vec::new();
     for (key, value) in headers {
-        if id_key == Some(key.as_str()) {
+        if id_key.is_some_and(|id_key| key.eq_ignore_ascii_case(id_key)) {
             id = Some(value);
-        } else if key == kind_key {
+        } else if key.eq_ignore_ascii_case(kind_key) {
             kind = MessageKind::from_str_lossy(&value);
         } else {
             metadata.push((key, value));
@@ -291,5 +291,24 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
+    #[test]
+    fn wire_reserved_headers_are_case_insensitive() {
+        let message = message_from_wire(
+            "checkout.started".into(),
+            Vec::new(),
+            Some("Nats-Msg-Id"),
+            "X-Sourced-Kind",
+            [
+                ("nats-msg-id".into(), "event-1".into()),
+                ("x-sourced-kind".into(), "command".into()),
+            ],
+        );
+
+        assert_eq!(message.id(), Some("event-1"));
+        assert_eq!(message.kind, MessageKind::Command);
+        assert!(message.metadata.is_empty());
     }
 }

@@ -223,10 +223,9 @@ where
         .complete(&claim)
         .await
         .expect("owning worker should complete the claim");
-    let published = find_outbox_by_id(&outbox, &complete_message_id)
+    assert!(find_outbox_by_id(&outbox, &complete_message_id)
         .await
-        .expect("completed message should still be queryable");
-    assert_eq!(published.status, OutboxMessageStatus::Published);
+        .is_none());
 
     let retry_message_id = unique_id("retry-outbox");
     commit_outbox_for_seat(
@@ -375,20 +374,15 @@ where
         .await
         .expect("batched complete should settle every active claim");
     for message_id in &message_ids {
-        let published = find_outbox_by_id(&outbox, message_id)
-            .await
-            .expect("completed message should still be queryable");
-        assert_eq!(published.status, OutboxMessageStatus::Published);
-        assert_eq!(published.worker_id, None);
+        assert!(find_outbox_by_id(&outbox, message_id).await.is_none());
     }
 
-    // Re-settling the now-published rows is a stale batch: same
-    // InvalidState surface as a serial `complete` of a settled row.
+    // Re-settling deleted delivery rows is NotFound, as with serial completion.
     let stale_err = outbox
         .complete_many(&claims)
         .await
         .expect_err("stale batch should not complete again");
-    assert!(matches!(stale_err, RepositoryError::InvalidState { .. }));
+    assert!(matches!(stale_err, RepositoryError::NotFound { .. }));
 
     // An empty batch is a no-op, not an error.
     outbox
@@ -461,14 +455,7 @@ where
         .complete(&claim_b)
         .await
         .expect("the reclaiming worker should complete the row");
-    let published = find_outbox_by_id(&outbox, &message_id)
-        .await
-        .expect("reclaimed message should still be queryable");
-    assert_eq!(
-        published.status,
-        OutboxMessageStatus::Published,
-        "row is published by the worker that reclaimed it, not by the crashed one"
-    );
+    assert!(find_outbox_by_id(&outbox, &message_id).await.is_none());
 }
 
 pub async fn publish_failure_after_commit_retains_outbox_row_until_delivered<R, S>(
@@ -526,14 +513,7 @@ pub async fn publish_failure_after_commit_retains_outbox_row_until_delivered<R, 
     assert_eq!(pass3.published, 1);
     assert_eq!(pass3.released, 0);
     assert_eq!(pass3.failed, 0);
-    let published = find_outbox_by_id(&outbox, &message_id)
-        .await
-        .expect("row is still queryable after publish");
-    assert_eq!(
-        published.status,
-        OutboxMessageStatus::Published,
-        "the row is Published only after a successful delivery"
-    );
+    assert!(find_outbox_by_id(&outbox, &message_id).await.is_none());
 
     assert_eq!(
         dispatcher.publisher().attempts(),

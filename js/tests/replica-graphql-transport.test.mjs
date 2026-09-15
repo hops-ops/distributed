@@ -197,6 +197,11 @@ test('replica GraphQL live work merges surface binding with resume and closes on
 			}
 		}
 	});
+	const credit = { gatewayOperation: '1', gatewayDeliveryAck: 'opaque-credit' };
+	socket.message({ type: 'ping', payload: credit });
+	assert.deepEqual(socket.sent.at(-1), { type: 'pong', payload: credit });
+	socket.message({ type: 'ping' });
+	assert.deepEqual(socket.sent.at(-1), { type: 'pong' });
 	socket.message({ type: 'next', payload: { data: { todos: [{ id: '1' }] } } });
 	assert.deepEqual(next, [{ data: { todos: [{ id: '1' }] } }]);
 	assert.deepEqual(errors, []);

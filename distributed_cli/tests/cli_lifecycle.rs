@@ -186,6 +186,7 @@ else
 fi
 printf '%s:%s:%s\n' "$name" "$barrier" "$DISTRIBUTED_GENERATION_ID" >> "$root/dev-process.log"
 printf '%s:%s:%s\n' "$name" "$DEV_FIXTURE_NAME" "$PWD" >> "$root/dev-environment.log"
+printf '%s:%s\n' "$name" "$DISTRIBUTED_PROCESS_INSTANCE_ID" >> "$root/dev-instances.log"
 trap 'exit 0' TERM
 /bin/sh -c 'trap "" TERM; while :; do sleep 1; done' &
 descendant=$!
@@ -586,12 +587,54 @@ fn dev_waits_for_initial_generation_and_restarts_only_invalidated_processes() {
         &root.join("dist/distributed/active.json"),
         Duration::from_secs(5),
     );
+    wait_until(Duration::from_secs(5), || {
+        dev_state(&root)["members"]["api"].is_object()
+    });
+    let initial_state = dev_state(&root);
+    let instances = fs::read_to_string(root.join("dev-instances.log")).unwrap();
+    for name in ["api", "ui"] {
+        assert!(instances.lines().any(|line| line
+            == format!(
+                "{name}:{}",
+                initial_state["members"][name]["instanceId"]
+                    .as_str()
+                    .unwrap()
+            )));
+    }
+    let mut previous_generation = initial_state["active"]["generationId"].clone();
+    // Changes outside either process's restart inventory retain both instances
+    // while their authorized application generation advances repeatedly.
+    for input in ["client-one", "client-two"] {
+        fs::write(root.join("plan/input.txt"), input).unwrap();
+        wait_until(Duration::from_secs(5), || {
+            let state = dev_state(&root);
+            state["phase"] == "active" && state["active"]["generationId"] != previous_generation
+        });
+        let state = dev_state(&root);
+        assert_eq!(state["members"], initial_state["members"]);
+        previous_generation = state["active"]["generationId"].clone();
+    }
     fs::write(root.join("src/input.txt"), "second\n").unwrap();
     wait_until(Duration::from_secs(5), || {
         fs::read_to_string(root.join("dev-process.log")).is_ok_and(|log| log.lines().count() == 3)
     });
+    wait_until(Duration::from_secs(5), || {
+        let state = dev_state(&root);
+        state["phase"] == "active" && state["active"]["generationId"] != previous_generation
+    });
+    let replaced = dev_state(&root);
+    assert_ne!(
+        replaced["members"]["api"]["instanceId"],
+        initial_state["members"]["api"]["instanceId"]
+    );
+    assert_eq!(
+        replaced["members"]["api"]["generationId"],
+        replaced["active"]["generationId"]
+    );
+    assert_eq!(replaced["members"]["ui"], initial_state["members"]["ui"]);
     let report = supervisor.stop_and_join();
-    assert_eq!(report.rebuilds, 1);
+    assert_eq!(report.rebuilds, 3);
+    assert!(!root.join("dist/distributed/dev.json").exists());
     assert_eq!(report.restarts["api"], 1);
     assert_eq!(report.restarts["ui"], 0);
     let log = fs::read_to_string(root.join("dev-process.log")).unwrap();
@@ -617,6 +660,13 @@ fn dev_waits_for_initial_generation_and_restarts_only_invalidated_processes() {
     }
 }
 
+fn dev_state(root: &Path) -> Value {
+    fs::read(root.join("dist/distributed/dev.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null)
+}
+
 #[test]
 fn dev_readiness_failure_restores_processes_and_preserves_active_pointer() {
     let fixture = temporary_root("dev-rollback");
@@ -632,6 +682,10 @@ fn dev_readiness_failure_restores_processes_and_preserves_active_pointer() {
         &root.join("dist/distributed/active.json"),
         Duration::from_secs(5),
     );
+    wait_until(Duration::from_secs(5), || {
+        dev_state(&root)["members"]["api"].is_object()
+    });
+    let initial_members = dev_state(&root)["members"].clone();
 
     fs::write(root.join("src/input.txt"), "replacement\n").unwrap();
     wait_until(Duration::from_secs(5), || {
@@ -642,6 +696,17 @@ fn dev_readiness_failure_restores_processes_and_preserves_active_pointer() {
         fs::read_to_string(root.join("accepted-readiness.log"))
             .is_ok_and(|log| log.lines().count() == 2)
     });
+    wait_until(Duration::from_secs(5), || {
+        let state = dev_state(&root);
+        state["phase"] == "active"
+            && state["members"]["api"]["instanceId"] != initial_members["api"]["instanceId"]
+    });
+    let rollback = dev_state(&root);
+    assert_eq!(
+        rollback["members"]["api"]["generationId"],
+        initial_members["api"]["generationId"]
+    );
+    assert_eq!(rollback["members"]["ui"], initial_members["ui"]);
     let report = supervisor.stop_and_join();
     assert_eq!(report.initial_generation, report.final_generation);
     assert_eq!(
@@ -706,6 +771,53 @@ fn dev_browser_prepare_timeout_preserves_active_pointer_and_processes() {
     assert_eq!(
         log.lines().filter(|line| line.starts_with("ui:")).count(),
         1
+    );
+}
+
+#[test]
+fn dev_rebuilds_source_edited_while_initial_process_readiness_is_held() {
+    let fixture = temporary_root("dev-startup-edit");
+    let root = fixture.path().to_path_buf();
+    write_fixture(&root);
+    enable_dev(&root);
+    let path = root.join("distributed.lifecycle.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["dev"]["processes"]["api"]["ready"] = serde_json::json!({
+        "program": "/bin/test",
+        "args": ["-f", "{root}/release-readiness"],
+        "interval_ms": 10,
+        "timeout_ms": 5000
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let supervisor = DevSupervisor::start(root.clone());
+    wait_until(Duration::from_secs(5), || {
+        root.join("dev-process.log").exists()
+    });
+    let before = wait_for_stable_file(
+        &root.join("dist/distributed/active.json"),
+        Duration::from_secs(5),
+    );
+    // The initial build is complete but the supervisor cannot finish startup.
+    fs::write(root.join("src/input.txt"), "edited-during-startup\n").unwrap();
+    fs::write(root.join("release-readiness"), "release\n").unwrap();
+    wait_until(Duration::from_secs(5), || {
+        fs::read(root.join("dist/distributed/active.json")).is_ok_and(|active| active != before)
+    });
+    let report = supervisor.stop_and_join();
+    assert_ne!(report.initial_generation, report.final_generation);
+    assert_eq!(report.rebuilds, 1);
+    assert_eq!(report.restarts["api"], 1);
+    assert_eq!(report.restarts["ui"], 0);
+    let active: Value =
+        serde_json::from_slice(&fs::read(root.join("dist/distributed/active.json")).unwrap())
+            .unwrap();
+    let artifact = root
+        .join("dist/distributed")
+        .join(active["path"].as_str().unwrap())
+        .join("generated/application.json");
+    assert_eq!(
+        fs::read_to_string(artifact).unwrap(),
+        "application:edited-during-startup\n"
     );
 }
 

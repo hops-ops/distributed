@@ -20,7 +20,7 @@ use sqlx::{Encode, Executor, IntoArguments, Pool, QueryBuilder, Row, Transaction
 
 use crate::projection_protocol::{
     change_kind_for_mutation, checked_next, checked_projection_graph_materialization,
-    projection_has_many_columns, table_model_name, validate_projection_graph_snapshot_request,
+    projection_relationship_values, table_model_name, validate_projection_graph_snapshot_request,
     ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest, ProjectionChange,
     ProjectionChangeCursor, ProjectionChangeKind, ProjectionChangeRead, ProjectionChangeRetention,
     ProjectionCheckpoint, ProjectionCommitBatch, ProjectionCommitOutcome, ProjectionCommitResult,
@@ -48,15 +48,18 @@ use crate::sqlx_repo::read_model::{
 };
 use crate::sqlx_repo::repo::{repository_storage_error, SqlxRepoBackend, SqlxRepository};
 use crate::table::{
-    column_name_for, validate_row_values, RelationshipKind, RowKey, RowValue, RowValues,
-    TableMutation, TableSchema, TableStoreError, TableWritePlan,
+    validate_row_values, RowKey, RowValues, TableMutation, TableSchema, TableStoreError,
+    TableWritePlan,
 };
+use crate::ProjectionProgramId;
 
 mod helpers;
 mod identity;
 mod locks;
 mod partitions;
 mod reads;
+#[cfg(feature = "graphql")]
+mod rebuild;
 mod store_impl;
 mod types;
 mod writes;

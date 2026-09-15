@@ -16,14 +16,14 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
-use crate::aggregate::{hydrate, Aggregate, AggregateRepository};
+use crate::aggregate::{Aggregate, AggregateRepository};
+use crate::command::{
+    validate_resolved_direct_plan, Atomic, CommandCommitProofError, CommandOutcome,
+    PrepareCommandError, PreparedCommand, ProjectionCommitProof, ResolvedDirectProjectionTarget,
+    TypedCommandContract,
+};
 use crate::command_ledger::CausalGetStream;
 use crate::domain_event::{DomainEventCaptureError, DomainEventCommitGuardError};
-use crate::graphql::command_contract::{
-    validate_resolved_direct_plan, CommandCommitProofError, CommandOutcome, ProjectionCommitProof,
-    ResolvedDirectProjectionTarget, TypedCommandContract,
-};
-use crate::graphql::{Atomic, PrepareCommandError, PreparedCommand};
 use crate::outbox::{OutboxMessage, PreparedDomainEvent};
 use crate::projection::lower::{
     DirectCandidate, LoweredProjectionPlan, ProjectionDescriptor,
@@ -58,12 +58,7 @@ where
     A: Aggregate + Send + Sync + 'static,
 {
     fn load<'a>(&'a self, identity: &'a StreamIdentity) -> LoadAggregateFuture<'a, A> {
-        Box::pin(async move {
-            let Some(entity) = self.repository.repo().get_causal_stream(identity).await? else {
-                return Ok(None);
-            };
-            hydrate::<A>(entity).map(Some)
-        })
+        Box::pin(async move { self.repository.get_causal(identity).await })
     }
 
     fn snapshot_writes(
@@ -816,8 +811,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::command::CommandTypeDef;
     use crate::entity::{Entity, EventRecord};
-    use crate::graphql::GraphqlTypeDef;
     use crate::table::{
         ColumnType, PrimaryKey, RowKey, RowValue, RowValues, TableColumn, TableKind, TableMutation,
         TableSchema,
@@ -1005,6 +1000,13 @@ mod tests {
     }
 
     impl CausalGetStream for TestRepo {
+        async fn get_causal_stream_tail(
+            &self,
+            _identity: &StreamIdentity,
+            _after_version: u64,
+        ) -> Result<Option<Entity>, RepositoryError> {
+            panic!("this fixture does not configure snapshots")
+        }
         async fn get_causal_stream<'a>(
             &'a self,
             identity: &'a StreamIdentity,
@@ -1067,9 +1069,9 @@ mod tests {
     #[derive(serde::Deserialize)]
     struct TestInput {}
 
-    impl crate::graphql::GraphqlInputType for TestInput {
-        fn graphql_type() -> GraphqlTypeDef {
-            GraphqlTypeDef::new("TestInput", Vec::new())
+    impl crate::command::CommandInputType for TestInput {
+        fn command_type() -> CommandTypeDef {
+            CommandTypeDef::new("TestInput", Vec::new())
                 .with_type_id(std::any::TypeId::of::<Self>())
         }
     }
@@ -1292,7 +1294,7 @@ mod tests {
         workspace.stage(aggregate).unwrap();
         let mut parts = workspace.into_parts().unwrap();
 
-        let contract = crate::graphql::typed_command::<TestInput, Atomic<TestView>>("test.project")
+        let contract = crate::command::typed_command::<TestInput, Atomic<TestView>>("test.project")
             .into_contract();
         parts.validate_prepared(&contract, &mut prepared).unwrap();
     }
@@ -1308,7 +1310,7 @@ mod tests {
             })
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
-        let contract = crate::graphql::typed_command::<TestInput, Atomic<TestView>>("test.project")
+        let contract = crate::command::typed_command::<TestInput, Atomic<TestView>>("test.project")
             .into_contract();
 
         assert!(matches!(
@@ -1339,7 +1341,7 @@ mod tests {
             .unwrap();
         workspace.stage_read_models(conflicting).unwrap();
         let mut parts = workspace.into_parts().unwrap();
-        let contract = crate::graphql::typed_command::<TestInput, Atomic<TestView>>("test.project")
+        let contract = crate::command::typed_command::<TestInput, Atomic<TestView>>("test.project")
             .into_contract();
 
         assert!(matches!(
@@ -1368,7 +1370,7 @@ mod tests {
         mutation
             .values
             .insert("title", RowValue::String("different".into()));
-        let contract = crate::graphql::typed_command::<TestInput, Atomic<TestView>>("test.project")
+        let contract = crate::command::typed_command::<TestInput, Atomic<TestView>>("test.project")
             .into_contract();
 
         assert!(matches!(
@@ -1384,7 +1386,7 @@ mod tests {
     }
 
     fn modeled_direct_contract() -> TypedCommandContract {
-        crate::graphql::typed_command::<TestInput, Atomic<ModeledDirectView>>("test.modeled-direct")
+        crate::command::typed_command::<TestInput, Atomic<ModeledDirectView>>("test.modeled-direct")
             .into_contract()
     }
 

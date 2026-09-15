@@ -31,6 +31,7 @@ use crate::repository::{InboxReceipt, RepositoryError};
 use crate::table::{
     RowKey, RowValues, TableMutation, TableSchema, TableStoreError, TableWritePlan,
 };
+use crate::ProjectionProgramId;
 
 mod backend_helpers;
 mod commit;
@@ -56,7 +57,7 @@ use identity::{
 
 pub(crate) use backend_helpers::{
     change_kind_for_mutation, checked_next, checked_projection_graph_materialization,
-    failure_matches_batch, projection_has_many_columns, table_model_name,
+    failure_matches_batch, projection_relationship_values, table_model_name,
     validate_projection_graph_snapshot_request,
 };
 pub(crate) use commit::{

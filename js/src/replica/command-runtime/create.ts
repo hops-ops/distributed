@@ -1,5 +1,6 @@
 import {
 	parseGraphqlResponseExtensions,
+	type DistributedCommandMetadata,
 	type DistributedProtocolEnvelope
 } from '../../protocol.js';
 import {
@@ -34,6 +35,7 @@ import {
 	pendingProjection,
 	preparedDispatchKeys,
 	preparedSemanticChanges,
+	projectionExpectationFingerprint,
 	requireCommandEnvelope,
 	requireCommandRejectionEnvelope,
 	requireStatusEnvelope,
@@ -47,6 +49,7 @@ import {
 import { ReplicaCommandRuntimeError } from './errors.js';
 import {
 	replicaCommandAuthority,
+	replicaCommandFreshness,
 	replicaCommandProjectionDelta,
 	replicaCommandProjectedLifecycle,
 	replicaCommandReadRecord,
@@ -83,6 +86,22 @@ import {
 	type PreparedProjectionOperation,
 	type ReplicaCommandProjection
 } from '../projection-delta/index.js';
+
+function hasCompleteProjectionObservations(
+	metadata: DistributedCommandMetadata
+): boolean {
+	if (metadata.expects.length === 0 || metadata.observations.length === 0) {
+		return false;
+	}
+	const observed = new Set(
+		metadata.observations
+			.filter((observation) => observation.causationId === metadata.causationId)
+			.map(projectionExpectationFingerprint)
+	);
+	return metadata.expects.every((expectation) =>
+		observed.has(projectionExpectationFingerprint(expectation))
+	);
+}
 
 function assertActualProjectionCapabilities(
 	contract: ReplicaCommandProjection,
@@ -601,6 +620,7 @@ export function createReplicaCommandRuntime<
 			return validated.requiresRevalidation;
 		}
 		const seam = replica[replicaCommandProjectionDelta]!;
+		if (validated.revalidation !== undefined) replica[replicaCommandFreshness]?.(prepared.commandId, validated.revalidation);
 		const actualPrepared = Object.freeze({
 			...prepared,
 			optimistic: Object.freeze({
@@ -1037,6 +1057,20 @@ export function createReplicaCommandRuntime<
 							settleTrackedProjection(tracker, pending);
 						}
 					} else if (
+						metadata.state === 'succeeded' &&
+						!prepared.revalidation.required &&
+						!statusRequiresRevalidation &&
+						hasCompleteProjectionObservations(metadata)
+					) {
+						/*
+						 * A cell may keep a committed external receipt in the public
+						 * `succeeded` state after its exact modeled observation is durable.
+						 * That proof settles the projected delivery wait, but it does not
+						 * retire the accepted layer: no canonical query/live frame has
+						 * confirmed read-model membership yet.
+						 */
+						settleTrackedProjection(tracker, pending);
+					} else if (
 						metadata.state === 'atomic' &&
 						!prepared.revalidation.required &&
 						!statusRequiresRevalidation
@@ -1188,6 +1222,7 @@ export function createReplicaCommandRuntime<
 				readRecord: replica[replicaCommandReadRecord]?.bind(replica),
 				pureFunctions: options.pureFunctions
 			};
+			replica[replicaCommandFreshness]?.(prepared.commandId, prepared.revalidation);
 			(replica as SemanticReplica).createOptimisticLayer(
 				prepared.commandId,
 				(writer) =>
@@ -1287,6 +1322,17 @@ export function createReplicaCommandRuntime<
 				'REPLICA_COMMAND_SCOPE_INVALIDATED',
 				{ commandId: prepared.commandId }
 			);
+		}
+
+		// The HTTP lifecycle gate rejects before dispatch and before a receipt
+		// exists. Classify only its exact failure shape, never a success/receipt.
+		if (result.status === 503 && result.data == null && result.extensions === undefined &&
+			result.errors?.length === 1 && result.errors[0].extensions?.code === 'APPLICATION_RELOADING') {
+			rejectUnmanagedLayer(prepared.commandId);
+			revalidateInBackground(prepared, authority);
+			throw new ReplicaCommandRuntimeError('REPLICA_COMMAND_RELOADING', {
+				commandId: prepared.commandId
+			});
 		}
 
 		const rejection = graphqlCommandRejection(result);

@@ -122,7 +122,7 @@ export function latestCursors(
 	live: DistributedProtocolEnvelope['live']
 ): readonly DistributedLiveCursor[] {
 	if (live !== undefined) {
-		return live.supported ? live.cursors : Object.freeze([]);
+		return live.mode === 'resumable' ? live.cursors : Object.freeze([]);
 	}
 	return Object.freeze(
 		snapshot.indexes.flatMap((index) =>

@@ -156,6 +156,8 @@ pub trait OutboxStore: Send + Sync {
         request: ClaimOutboxMessages,
     ) -> impl Future<Output = Result<Vec<OutboxMessage>, RepositoryError>> + Send + 'a;
 
+    /// Delete a delivered row while holding its active claim. The outbox is
+    /// pending delivery work, not a publication-history or replay store.
     fn complete<'a>(
         &'a self,
         claim: &'a OutboxClaimRef,

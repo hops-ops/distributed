@@ -1,0 +1,260 @@
+{
+  "consistency": "eventual",
+  "document": "mutation Client_createTodo($commandId: ID!, $input: CreateTodoInput!) { createTodo(commandId: $commandId, input: $input) { id } }",
+  "input": {
+    "definition": {
+      "fields": [
+        {
+          "codec": "string",
+          "itemNullable": false,
+          "list": false,
+          "name": "id",
+          "nullable": false,
+          "typeName": "ID"
+        },
+        {
+          "codec": "uint64_safe_integer",
+          "itemNullable": false,
+          "list": false,
+          "name": "priority",
+          "nullable": false,
+          "typeName": "BigInt"
+        },
+        {
+          "codec": "string",
+          "itemNullable": false,
+          "list": false,
+          "name": "tenantId",
+          "nullable": false,
+          "typeName": "ID"
+        },
+        {
+          "codec": "string",
+          "itemNullable": false,
+          "list": false,
+          "name": "title",
+          "nullable": false,
+          "typeName": "String"
+        }
+      ],
+      "name": "CreateTodoInput"
+    },
+    "kind": "object"
+  },
+  "inputDefaults": {
+    "defaults": [
+      {
+        "generator": "uuid_v7",
+        "path": [
+          "id"
+        ]
+      }
+    ],
+    "version": 1
+  },
+  "mutationField": "createTodo",
+  "name": "todo.create",
+  "operationHash": "sha256:9b2ba78faeaad3b384d74519aff78252c2f7f0305db1ac0dda9833ba25af58e5",
+  "output": {
+    "definition": {
+      "fields": [
+        {
+          "codec": "string",
+          "itemNullable": false,
+          "list": false,
+          "name": "id",
+          "nullable": false,
+          "typeName": "ID"
+        }
+      ],
+      "name": "CreateTodoPayload"
+    },
+    "kind": "object"
+  },
+  "projection": {
+    "capabilities": {
+      "arms": [
+        {
+          "arm": "todo-created",
+          "event": {
+            "id": "event:todo.created:v1",
+            "name": "todo.created",
+            "version": 1
+          },
+          "mutations": [
+            {
+              "delete": false,
+              "fields": [
+                "completed",
+                "priority",
+                "title"
+              ],
+              "key": [
+                "tenantId",
+                "id"
+              ],
+              "kind": "record",
+              "model": "Todo",
+              "patch": true,
+              "replace": [
+                "completed",
+                "priority",
+                "title"
+              ],
+              "upsert": true
+            },
+            {
+              "kind": "model",
+              "model": "Todo"
+            }
+          ],
+          "partition": {
+            "expression_fingerprint": "sha256:129a821dac4ec2bb0a8a1dccacdcb62a87ad8cac25fc9933f341b0fc7a6169f3",
+            "kind": "opaque"
+          },
+          "projection_ref": 0
+        }
+      ],
+      "version": 1
+    },
+    "deltaWireVersion": 1,
+    "eventSet": [
+      {
+        "id": "event:todo.created:v1",
+        "name": "todo.created",
+        "version": 1
+      }
+    ],
+    "fallback": "revalidate",
+    "operationSemanticsVersion": 1,
+    "preview": {
+      "occurrences": [
+        {
+          "event": {
+            "id": "event:todo.created:v1",
+            "name": "todo.created",
+            "version": 1
+          },
+          "ordinal": 0
+        }
+      ],
+      "operations": [
+        {
+          "mutation": {
+            "fields": [
+              {
+                "field": "completed",
+                "value": {
+                  "kind": "constant",
+                  "value": {
+                    "type": "boolean",
+                    "value": false
+                  }
+                }
+              },
+              {
+                "field": "priority",
+                "value": {
+                  "kind": "input",
+                  "path": [
+                    "priority"
+                  ]
+                }
+              },
+              {
+                "field": "title",
+                "value": {
+                  "kind": "input",
+                  "path": [
+                    "title"
+                  ]
+                }
+              }
+            ],
+            "op": "upsert",
+            "replace": [
+              "completed",
+              "priority",
+              "title"
+            ],
+            "scope": {
+              "key": [
+                {
+                  "field": "tenantId",
+                  "ordinal": 0,
+                  "value": {
+                    "kind": "input",
+                    "path": [
+                      "tenantId"
+                    ]
+                  }
+                },
+                {
+                  "field": "id",
+                  "ordinal": 1,
+                  "value": {
+                    "kind": "generated_default",
+                    "path": [
+                      "id"
+                    ]
+                  }
+                }
+              ],
+              "model": "Todo",
+              "partition": {
+                "expression": {
+                  "kind": "input",
+                  "path": [
+                    "tenantId"
+                  ]
+                },
+                "kind": "expression",
+                "requires": "current_cache_partition"
+              }
+            }
+          },
+          "occurrence_ordinal": 0,
+          "projection_refs": [
+            0
+          ]
+        }
+      ],
+      "recoveries": [],
+      "version": 1
+    },
+    "projectionProgramVersion": 2,
+    "projections": [
+      {
+        "bindingId": "pb1:sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "epoch": "todos-projection-v2",
+        "operationSemanticsVersion": 1,
+        "programId": "pp1:sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "programIrVersion": 1
+      }
+    ],
+    "version": 2
+  },
+  "protocol": {
+    "operation": "sha256:9b2ba78faeaad3b384d74519aff78252c2f7f0305db1ac0dda9833ba25af58e5",
+    "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
+    "schemaHash": "sha256:1d9aecd4ea0b8524e2dd299ba8299b5520dd9351621780a49ac55248f8df251c",
+    "surface": {
+      "kind": "role",
+      "name": "user"
+    },
+    "trustedPresets": [],
+    "version": 1
+  },
+  "revalidation": {
+    "dependencies": [
+      "todo_rows"
+    ],
+    "models": [
+      "Todo"
+    ],
+    "relationships": [],
+    "required": false,
+    "version": 1
+  },
+  "version": 2
+}

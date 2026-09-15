@@ -7,7 +7,7 @@ name: celld (live + e2e-celld)
 #   make -C tests/e2e-celld test
 #   make -C tests/e2e-ui up && make -C tests/e2e-ui up-celld-nats
 #   WATCH=0 WATCH_WORKER=0 make -C tests/e2e-celld run
-#   E2E_UI_ORIGIN=http://localhost:5180 npx --prefix tests/e2e-ui playwright test \
+#   E2E_UI_ORIGIN=http://localhost:8791 npx --prefix tests/e2e-ui playwright test \
 #     todos.user.spec.ts chat.user.spec.ts --project chromium-user
 #
 # Default `cargo test` (quality) still runs fixture-only celld checks and
@@ -25,6 +25,47 @@ env:
   DISTRIBUTED_INTERNAL_SECRET: test-only-internal-secret-change-me-2026
 
 jobs:
+  storage:
+    name: celld SQL transactions and crash recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/celld/worker -> tests/celld/worker/target
+          shared-key: celld-storage
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install test runtimes
+        run: |
+          sudo apt-get update && sudo apt-get install -y sqlite3
+          npm install -g esbuild
+          cargo install worker-build --locked
+          curl -fsSL https://celld.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build isolated fault-probe Worker
+        working-directory: tests/celld/worker
+        run: worker-build --release --features storage-conformance
+      - name: Prove SQL atomicity, fencing, autonomous recovery and growth
+        run: node tests/celld/storage-conformance.mjs
+      - name: Retain storage proof results and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: celld-storage-proof
+          path: |
+            /tmp/distributed-cell-storage-*/results.json
+            /tmp/distributed-cell-storage-*/celld-*.log
+          if-no-files-found: ignore
+
   e2e-celld:
     name: e2e-celld workspace tests
     runs-on: ubuntu-latest
@@ -133,12 +174,13 @@ jobs:
           export BIND=127.0.0.1:8791
           export CELLD_URL=http://127.0.0.1:18880
           export NATS_URL=nats://127.0.0.1:14222
-          export AUTH_URL=http://localhost:5180
+          export PUBLIC_ORIGIN=http://localhost:8791
+          export AUTH_URL="$PUBLIC_ORIGIN"
           export AUTH_USE_SECURE_COOKIES=false
           export AUTH_TRUST_HOST=true
           export PUBLIC_E2E_PROFILE=celld-nats
           export UI_BIND=localhost
-          export UI_URL=http://localhost:5180
+          export UI_URL=http://localhost:8791
 
           target/debug/distributed dev tests/e2e-celld \
             > tests/e2e-celld/.ci-distributed-dev.log 2>&1 &
@@ -165,13 +207,13 @@ jobs:
           fi
           grep -F 'lifecycle dev: process api ready http://127.0.0.1:8791' \
             tests/e2e-celld/.ci-distributed-dev.log
-          grep -F 'lifecycle dev: process ui ready http://localhost:5180' \
+          grep -F 'lifecycle dev: process ui ready http://localhost:8791' \
             tests/e2e-celld/.ci-distributed-dev.log
 
           ok=0
           for i in $(seq 1 60); do
             code=$(curl -s -o /dev/null -w '%{http_code}' \
-              "http://localhost:5180/" 2>/dev/null || echo 000)
+              "http://localhost:8791/" 2>/dev/null || echo 000)
             if [ "$code" = "200" ] || [ "$code" = "302" ] || [ "$code" = "303" ]; then
               ok=1
               break
@@ -230,7 +272,7 @@ jobs:
           npx playwright test todos.user.spec.ts chat.user.spec.ts
           --project chromium-user
         env:
-          E2E_UI_ORIGIN: http://localhost:5180
+          E2E_UI_ORIGIN: http://localhost:8791
           E2E_API_ORIGIN: http://127.0.0.1:8791
           CI: true
 

@@ -258,6 +258,66 @@ mod tests {
     }
 
     #[test]
+    fn sourced_helpers_ignore_other_receivers_and_nested_item_self() {
+        let output = sourced::expand_sourced(
+            quote! { entity, aggregate_type = "todo" },
+            quote! {
+                impl Todo {
+                    pub fn unrelated(&mut self, other: &mut Todo) {
+                        other.record_completed().unwrap();
+                        struct Other;
+                        impl Other {
+                            fn action(&mut self) { self.record_completed(); }
+                        }
+                    }
+                    #[event("todo.completed", domain = event)]
+                    fn record_completed(&mut self) {}
+                }
+            },
+        )
+        .unwrap()
+        .to_string();
+        assert!(!output.contains("pub enum Unrelated"), "{output}");
+        assert!(!output.contains("pub mod domain_commands"), "{output}");
+    }
+
+    #[test]
+    fn sourced_helper_custom_body_uses_declared_type_contract() {
+        for output_type in [
+            quote!(crate::facts::BranchCreated),
+            quote!(super::facts::BranchCreated),
+            quote!(BranchCreated),
+        ] {
+            let output = sourced::expand_sourced(
+                quote! { entity, aggregate_type = "repository" },
+                quote! {
+                    impl Repository {
+                        pub fn create(&mut self) { self.create_refs().unwrap(); }
+                        fn create_refs(&mut self) { self.record_branch().unwrap(); }
+                        #[event(
+                            "repository.branch_created",
+                            domain = with(#output_type, branch_created)
+                        )]
+                        fn record_branch(&mut self) {}
+                    }
+                },
+            )
+            .unwrap()
+            .to_string();
+            let descriptor = quote! {
+                distributed::command::__command_projection_event_descriptor::<#output_type,>()
+            }
+            .to_string();
+            assert!(output.contains(&descriptor), "{output}");
+            assert!(output.contains("for domain_commands :: Create"), "{output}");
+            assert!(
+                !output.contains("RepositoryBranchCreatedDomainEvent"),
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
     fn expand_sourced_identity_mode_generates_independent_public_descriptor() {
         let attr = quote! {
             entity,

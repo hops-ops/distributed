@@ -756,7 +756,7 @@ export function canonicalizeFilterComparison(
 				canonical.push([operator, operand]);
 				continue;
 			}
-			if (operator === '_like' || operator === '_ilike' || operator === '_has_key') {
+			if (operator === '_like' || operator === '_ilike' || operator === '_icontains' || operator === '_has_key') {
 				if (typeof operand !== 'string') {
 					variableValueInvalid(operatorPath, 'expected string or null');
 				}
@@ -972,7 +972,7 @@ export function validateFilterOperatorContract(
 	path: string
 ): void {
 	if (
-		(operator === '_like' || operator === '_ilike') &&
+		(operator === '_like' || operator === '_ilike' || operator === '_icontains') &&
 		scalar !== 'String'
 	) {
 		variableCodecInvalid(path);

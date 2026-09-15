@@ -4,7 +4,9 @@ use super::error::ApplicationResult;
 use super::manifest::{ApplicationExtension, ApplicationManifest, ManifestProvenance};
 use super::module::{Module, SurfaceSpec};
 use crate::graphql::surface::Surface;
-use crate::graphql::{ClientManifestError, DistributedClientManifest, DistributedClientSurfaceExport};
+use crate::graphql::{
+    ClientManifestError, DistributedClientManifest, DistributedClientSurfaceExport,
+};
 
 /// Explicit application registration. No linker inventory or source scan is
 /// consulted; only the values supplied to this constructor participate.
@@ -60,6 +62,21 @@ impl Application {
             surfaces,
             manifest,
         })
+    }
+
+    /// Declare a gateway's logical capabilities beside the typed Service surface.
+    /// Origins, routes, credentials and adapter resources remain host bindings.
+    #[cfg(feature = "gateway")]
+    pub fn with_gateway(
+        mut self,
+        id: impl Into<String>,
+        gateway: &crate::gateway::Gateway,
+    ) -> ApplicationResult<Self> {
+        self.manifest
+            .extensions
+            .push(gateway.application_extension(id)?);
+        self.manifest.refresh_fingerprints()?;
+        Ok(self)
     }
 
     pub fn name(&self) -> &str {
@@ -217,7 +234,9 @@ impl ContractCompiler {
                     "ContractCompiler already has a different authoritative Surface contract"
                 ));
             }
-            return Err("ContractCompiler accepts exactly one authoritative Surface contract".into());
+            return Err(
+                "ContractCompiler accepts exactly one authoritative Surface contract".into(),
+            );
         }
         self.surface = Some(surface);
         self.surface_spec = Some(spec);

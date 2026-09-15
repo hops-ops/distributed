@@ -92,6 +92,8 @@ type ReloadCapsule = Readonly<{
 }>;
 
 export interface DistributedReloadLifecycle {
+	/** Let a prepared coherent transition own reload after a dev socket reconnect. */
+	deferDevTransportReload(): Promise<void>;
 	assertDispatchOpen(): void;
 	register(participant: ReloadParticipant): () => void;
 	destroy(): void;
@@ -124,7 +126,7 @@ export function validateDistributedReloadLocation(location: URL): string {
 /** Register one generated client with the shared browser reload transaction. */
 export function registerDistributedReloadClient(
 	replica: DistributedReplica,
-	runtime: Readonly<{ pendingCommandIds?(): readonly string[] }> | undefined,
+	runtime: Readonly<{ pendingCommandIds?(): readonly string[]; preload?(): Promise<void> }> | undefined,
 	options: DistributedReloadOptions
 ): () => void {
 	const state = new Map(
@@ -177,8 +179,9 @@ export function registerDistributedReloadClient(
 					await declaration.restore(candidate.value);
 				}
 			}
-			if (saved.pendingCommandIds.length > 0) {
-				await options.recoverPendingCommands?.(saved.pendingCommandIds);
+			if (saved.pendingCommandIds.length > 0 && options.recoverPendingCommands !== undefined) {
+				await runtime?.preload?.();
+				await options.recoverPendingCommands(saved.pendingCommandIds);
 			}
 			window.dispatchEvent(
 				new CustomEvent('distributed:reload-restored', {
@@ -223,6 +226,8 @@ function createDistributedReloadLifecycle(): DistributedReloadLifecycle {
 	let destroyed = false;
 	let preparing: string | undefined;
 	let reloadRequested = false;
+	let devTransportDisconnected = false;
+	const deferredTransports = new Set<() => void>();
 	let loadedGenerationId = documentGenerationId();
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let restoration = Promise.resolve();
@@ -271,11 +276,18 @@ function createDistributedReloadLifecycle(): DistributedReloadLifecycle {
 				}
 				return;
 			}
-			if (state.active.generationId !== loadedGenerationId) {
+			if (
+				state.active.generationId !== loadedGenerationId ||
+				(preparing !== undefined && devTransportDisconnected)
+			) {
 				blocked = true;
 				if (!reloadRequested) {
 					reloadRequested = true;
-					markCapsuleRestoring();
+					// A rejected replacement can restart the previous API too. Restore
+					// the prepared state into that verified rollback generation.
+					markCapsuleRestoring(
+						state.active.generationId === loadedGenerationId ? state.active : undefined
+					);
 					window.location.reload();
 				}
 				return;
@@ -294,6 +306,14 @@ function createDistributedReloadLifecycle(): DistributedReloadLifecycle {
 
 	void poll();
 	return Object.freeze({
+		deferDevTransportReload(): Promise<void> {
+			if (preparing === undefined && !reloadRequested) return Promise.resolve();
+			devTransportDisconnected = true;
+			// Vite awaits its disconnect listeners before its automatic reload.
+			// The lifecycle poll keeps running and owns the one navigation after
+			// activation (or verified rollback); page teardown releases this wait.
+			return new Promise((resolve) => deferredTransports.add(resolve));
+		},
 		assertDispatchOpen(): void {
 			if (blocked) throw new Error('coherent application reload is in progress');
 		},
@@ -310,6 +330,8 @@ function createDistributedReloadLifecycle(): DistributedReloadLifecycle {
 			destroyed = true;
 			if (timer !== undefined) clearTimeout(timer);
 			participants.clear();
+			for (const resolve of deferredTransports) resolve();
+			deferredTransports.clear();
 		}
 	});
 }
@@ -445,9 +467,9 @@ function readCapsule(): ReloadCapsule | undefined {
 	}
 }
 
-function markCapsuleRestoring(): void {
+function markCapsuleRestoring(rollback?: LifecycleGeneration): void {
 	const capsule = readCapsule();
-	if (capsule !== undefined) storeCapsule(Object.freeze({ ...capsule, phase: 'restoring' }));
+	if (capsule !== undefined) storeCapsule(Object.freeze({ ...capsule, to: rollback ?? capsule.to, phase: 'restoring' }));
 }
 
 function parseLifecycleState(value: unknown): LifecycleDevState {
@@ -520,6 +542,7 @@ function documentGenerationId(): string | undefined {
 
 function inertLifecycle(): DistributedReloadLifecycle {
 	return Object.freeze({
+		async deferDevTransportReload(): Promise<void> {},
 		assertDispatchOpen(): void {},
 		register(): () => void {
 			return () => undefined;

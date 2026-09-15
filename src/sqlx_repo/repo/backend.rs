@@ -1,14 +1,10 @@
 use super::*;
 
-/// One migration registration emitted by the root build script.
-#[derive(Clone, Copy)]
-pub(crate) struct EmbeddedMigration {
-    pub(crate) version: i64,
-    pub(crate) description: &'static str,
-    pub(crate) sql: &'static str,
-}
-
-include!(concat!(env!("OUT_DIR"), "/migration_inventory.rs"));
+pub(crate) use crate::repository::migrations::EmbeddedMigration;
+#[cfg(feature = "postgres")]
+pub(crate) use crate::repository::migrations::POSTGRES_MIGRATIONS;
+#[cfg(feature = "sqlite")]
+pub(crate) use crate::repository::migrations::SQLITE_MIGRATIONS;
 
 /// Build an embedded migrator from the validated, generated migration inventory.
 pub(crate) fn embedded_migrator(files: &[EmbeddedMigration]) -> Migrator {
@@ -51,14 +47,18 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(
             descriptions,
             vec![
                 "initial",
                 "command ledger",
                 "projection protocol",
-                "command ledger atomic state"
+                "command ledger atomic state",
+                "projection source snapshots",
+                "gateway dependency versions",
+                "projection program identity",
+                "external command binding"
             ]
         );
         assert_eq!(
@@ -80,6 +80,22 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/sqlite/0004_command_ledger_atomic_state.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0005_projection_source_snapshots.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0006_gateway_dependency_versions.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0007_projection_program_identity.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0008_external_command_binding.sql"
+                )),
             ]
         );
     }
@@ -99,14 +115,18 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(
             descriptions,
             vec![
                 "initial",
                 "command ledger",
                 "projection protocol",
-                "command ledger atomic state"
+                "command ledger atomic state",
+                "projection source snapshots",
+                "gateway dependency versions",
+                "projection program identity",
+                "external command binding"
             ]
         );
         assert_eq!(
@@ -128,6 +148,22 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/postgres/0004_command_ledger_atomic_state.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0005_projection_source_snapshots.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0006_gateway_dependency_versions.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0007_projection_program_identity.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0008_external_command_binding.sql"
+                )),
             ]
         );
     }
@@ -147,12 +183,6 @@ pub(super) fn ids_by_type(identities: &[StreamIdentity]) -> BTreeMap<&str, Vec<&
     }
     groups
 }
-
-/// Bound parameters per `aggregate_events` row.
-pub(super) const EVENT_BIND_COLUMNS: usize = 10;
-
-/// Bound parameters per `outbox_messages` row.
-pub(super) const OUTBOX_BIND_COLUMNS: usize = 19;
 
 /// Dialect surface for the shared repository path (event store, snapshots,
 /// outbox lifecycle, consumer inbox, schema bootstrap).

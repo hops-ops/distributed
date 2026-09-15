@@ -61,6 +61,7 @@ const MODULE_NAME = /^\$distributed(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/;
 const COMPILER_LOCK = join('.svelte-kit', 'distributed', 'compiler.lock');
 const GENERATION_META = 'distributed-generation';
 const MAX_LIFECYCLE_STATE_BYTES = 1024 * 1024;
+const LIFECYCLE_CLI_EXECUTABLE_ENV = 'DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE';
 const COMPILER_COORDINATORS = Symbol.for(
 	'@hops-ops/distributed/sveltekit/compiler-coordinators/v1'
 );
@@ -126,7 +127,11 @@ export type DistributedSvelteKitViteOptions = Readonly<{
 	cwd?: string;
 	/** Executable invoked without a shell. Defaults to `distributed`. */
 	command?: string;
-	/** Prefix argv, e.g. `cargo run ... --`; never interpreted by a shell. */
+	/**
+	 * Prefix argv for standalone command execution, e.g. `cargo run ... --`;
+	 * never interpreted by a shell. Lifecycle-owned compilation invokes the
+	 * trusted initiating executable directly and ignores this launcher prefix.
+	 */
 	commandArgs?: readonly string[];
 	/** SvelteKit route source root. Defaults to `src/routes`. */
 	routesDir?: string;
@@ -235,6 +240,7 @@ export type DistributedSvelteKitVitePlugin = Readonly<{
 	buildStart(this: RollupWatchContextLike): void;
 	resolveId(source: string, importer?: string): string | undefined;
 	load(id: string): string | undefined;
+	transform(code: string, id: string, options?: Readonly<{ ssr?: boolean }>): string | undefined;
 	transformIndexHtml(): LifecycleHtmlTag[];
 	handleHotUpdate(context: ViteHotContextLike): Promise<never[] | undefined>;
 	watchChange(id: string): Promise<void>;
@@ -448,6 +454,9 @@ export function distributedSvelteKit(
 		},
 		resolveId(source, importer): string | undefined {
 			if (lifecycleOwnsCompile && frameworkDist !== undefined) {
+				if (source === '@hops-ops/distributed/replica/lazy') {
+					return join(frameworkDist, 'replica', 'lazy.js');
+				}
 				if (source === '@hops-ops/distributed/replica') {
 					return join(frameworkDist, 'replica', 'index.js');
 				}
@@ -496,6 +505,13 @@ export function distributedSvelteKit(
 				? activeLifecycleClientEntry(client)
 				: client.entry;
 			return `export * from ${JSON.stringify(portablePath(entry))};\n`;
+		},
+		transform(code, id, options): string | undefined {
+			if (!lifecycleOwnsCompile || options?.ssr || frameworkDist === undefined) return;
+			if (id.split('?', 1)[0] !== join(frameworkDist, 'sveltekit', 'lifecycle.js')) return;
+			// SvelteKit aliases can resolve generated clients before the virtual
+			// module hook. Attach once to the actual shared browser lifecycle.
+			return code + `\nif (import.meta.hot) import.meta.hot.on('vite:ws:disconnect', () => distributedReloadLifecycle().deferDevTransportReload());\n`;
 		},
 		transformIndexHtml: lifecycleGenerationMeta,
 		async handleHotUpdate(context): Promise<never[] | undefined> {
@@ -868,6 +884,7 @@ export function distributedSvelteKitAliases(
 		]);
 	if (frameworkDist !== undefined) {
 		aliases.push(
+			['@hops-ops/distributed/replica/lazy', join(frameworkDist, 'replica', 'lazy.js')],
 			['@hops-ops/distributed/replica', join(frameworkDist, 'replica')],
 			['@hops-ops/distributed/sveltekit', join(frameworkDist, 'sveltekit')]
 		);
@@ -939,7 +956,40 @@ function resolveIntegration(
 		throw new TypeError('distributedSvelteKit requires configuration');
 	}
 	const cwd = resolve(options.cwd ?? fallbackCwd);
-	const command = (options.command ?? 'distributed').trim();
+	const lifecycleExecutable = process.env[LIFECYCLE_CLI_EXECUTABLE_ENV];
+	const lifecycleRoot = process.env.DISTRIBUTED_LIFECYCLE_ROOT;
+	const lifecycleStage = process.env.DISTRIBUTED_LIFECYCLE_STAGE;
+	const hasLifecycleStage = lifecycleRoot !== undefined || lifecycleStage !== undefined;
+	const hasLifecycleOwnership =
+		process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE === '1';
+	const lifecycleContext = hasLifecycleStage || hasLifecycleOwnership;
+	const configuredCommand = options.command ?? 'distributed';
+	const validLifecyclePath = (value: string | undefined): value is string =>
+		value !== undefined &&
+		value.length > 0 &&
+		value === value.trim() &&
+		isAbsolute(value) &&
+		!/[\u0000-\u001f\u007f]/.test(value);
+	let command: string;
+	if (lifecycleContext) {
+		if (!validLifecyclePath(lifecycleExecutable)) {
+			throw new TypeError(
+				'Distributed lifecycle requires an absolute initiating executable identity'
+			);
+		}
+		if (
+			hasLifecycleStage &&
+			(!validLifecyclePath(lifecycleRoot) || !validLifecyclePath(lifecycleStage))
+		) {
+			throw new TypeError(
+				'Distributed lifecycle requires absolute root and stage identities'
+			);
+		}
+		command = lifecycleExecutable;
+	} else {
+		command = configuredCommand;
+	}
+	command = command.trim();
 	if (command.length === 0) {
 		throw new TypeError('Distributed SvelteKit command must not be empty');
 	}
@@ -1065,20 +1115,24 @@ function resolveIntegration(
 			manifestWatchRoots: Object.freeze(manifestWatchRoots(cwd, client.manifest))
 		});
 	});
+	const commandArgs = (options.commandArgs ?? []).map((argument, index) => {
+		if (typeof argument !== 'string') {
+			throw new TypeError(
+				`Distributed commandArgs[${index}] must be a string`
+			);
+		}
+		return argument;
+	});
 	return Object.freeze({
 		cwd,
 		outputRoot: cwd,
 		command,
-		commandArgs: Object.freeze(
-			(options.commandArgs ?? []).map((argument, index) => {
-				if (typeof argument !== 'string') {
-					throw new TypeError(
-						`Distributed commandArgs[${index}] must be a string`
-					);
-				}
-				return argument;
-			})
-		),
+		// A lifecycle-owned compile must be an invocation of the trusted
+		// initiating executable itself. A configured standalone prefix (most
+		// commonly `cargo run ... --`) belongs to the app's direct Vite mode;
+		// carrying it across would make the initiating binary parse launcher
+		// arguments as its own command and can select a different binary.
+		commandArgs: Object.freeze(lifecycleContext ? [] : commandArgs),
 		routesDir,
 		libDir,
 		aliases,

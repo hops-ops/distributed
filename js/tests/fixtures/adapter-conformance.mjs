@@ -302,6 +302,7 @@ export function todoFrame(
 		authorizationGeneration = 'auth-1',
 		position = '1',
 		source = 'query',
+		mode = 'resumable',
 		reset = false,
 		errors
 	} = {}
@@ -343,9 +344,9 @@ export function todoFrame(
 				snapshot: {
 					scopeToken: `snapshot:${root.field}`,
 					recordsComplete: true,
-					indexesComparable: true,
+					indexesComparable: mode === 'resumable',
 					records,
-					indexes: [
+					indexes: mode === 'snapshot' ? [] : [
 						{
 							projection: 'todos-projector',
 							scopeToken: `index:${root.field}`,
@@ -358,9 +359,9 @@ export function todoFrame(
 				...(source === 'live'
 					? {
 							live: {
-								supported: true,
-								reset,
-								cursors: [resume]
+								mode,
+								reset: mode === 'snapshot' || reset,
+								cursors: mode === 'snapshot' ? [] : [resume]
 							}
 						}
 					: {})

@@ -1,5 +1,0 @@
-error: #[serde(transparent)] is not supported by GraphqlInput because it changes the declared GraphQL object shape; define a separate wire type
- --> tests/graphql_compile_fail/serde_transparent.rs:4:9
-  |
-4 | #[serde(transparent)]
-  |         ^^^^^^^^^^^

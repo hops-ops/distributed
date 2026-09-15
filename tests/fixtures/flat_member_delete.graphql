@@ -1,0 +1,3 @@
+mutation DeleteFlatMember {
+  delete_flat_members_by_pk(id: $input.member.id, user_id: $input.member.user_id)
+}

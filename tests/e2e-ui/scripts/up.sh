@@ -10,7 +10,7 @@ ZITADEL_HOST="${ZITADEL_HOST:-http://localhost:18080}"
 OUT="${E2E_UI_ENV:-$ROOT/e2e-ui.env}"
 # Prefer localhost (not 127.0.0.1): SvelteKit only skips Secure cookies for
 # hostname === "localhost" over http. 127.0.0.1 forces Secure and breaks OIDC.
-UI_ORIGIN="${E2E_UI_ORIGIN:-http://localhost:5180}"
+UI_ORIGIN="${PUBLIC_ORIGIN:-${E2E_UI_ORIGIN:-http://localhost:8791}}"
 API_ORIGIN="${E2E_API_ORIGIN:-http://127.0.0.1:8791}"
 PROJECT_NAME="${E2E_OIDC_PROJECT:-e2e-ui}"
 APP_NAME="${E2E_OIDC_APP:-e2e-ui-web}"
@@ -298,8 +298,8 @@ if [[ -z "$APP_ID" ]]; then
       redirectUris: [
         ($ui + "/auth/callback/oidc"),
         ($ui + "/auth/callback"),
-        "http://127.0.0.1:5180/auth/callback/oidc",
-        "http://localhost:5180/auth/callback/oidc"
+        "http://127.0.0.1:8791/auth/callback/oidc",
+        "http://localhost:8791/auth/callback/oidc"
       ],
       responseTypes: ["OIDC_RESPONSE_TYPE_CODE"],
       grantTypes: [
@@ -311,10 +311,10 @@ if [[ -z "$APP_ID" ]]; then
       postLogoutRedirectUris: [
         ($ui + "/"),
         $ui,
-        "http://127.0.0.1:5180/",
-        "http://127.0.0.1:5180",
-        "http://localhost:5180/",
-        "http://localhost:5180"
+        "http://127.0.0.1:8791/",
+        "http://127.0.0.1:8791",
+        "http://localhost:8791/",
+        "http://localhost:8791"
       ],
       version: "OIDC_VERSION_1_0",
       devMode: true,
@@ -341,8 +341,8 @@ else
         redirectUris: [
           ($ui + "/auth/callback/oidc"),
           ($ui + "/auth/callback"),
-          "http://127.0.0.1:5180/auth/callback/oidc",
-          "http://localhost:5180/auth/callback/oidc"
+          "http://127.0.0.1:8791/auth/callback/oidc",
+          "http://localhost:8791/auth/callback/oidc"
         ],
         responseTypes: ["OIDC_RESPONSE_TYPE_CODE"],
         grantTypes: [
@@ -354,10 +354,10 @@ else
         postLogoutRedirectUris: [
           ($ui + "/"),
           $ui,
-          "http://127.0.0.1:5180/",
-          "http://127.0.0.1:5180",
-          "http://localhost:5180/",
-          "http://localhost:5180"
+          "http://127.0.0.1:8791/",
+          "http://127.0.0.1:8791",
+          "http://localhost:8791/",
+          "http://localhost:8791"
         ],
         devMode: true,
         accessTokenType: "OIDC_TOKEN_TYPE_JWT",
@@ -602,6 +602,8 @@ ZITADEL_PROJECT_ID="$(_dq "$PROJECT_ID")"
 # Server-only: custom /login uses Session API + CreateCallback (never expose to browser).
 ZITADEL_SERVICE_USER_TOKEN="$(_dq "$LOGIN_PAT")"
 LOGIN_V2_BASE_URI="$(_dq "$LOGIN_V2_BASE_URI")"
+PUBLIC_ORIGIN="$(_dq "$UI_ORIGIN")"
+UI_INTERNAL_ORIGIN="http://localhost:5180"
 E2E_UI_ORIGIN="$(_dq "$UI_ORIGIN")"
 E2E_API_ORIGIN="$(_dq "$API_ORIGIN")"
 E2E_MACHINE_USER_KEY="$(_dq "$USER_M_KEY")"

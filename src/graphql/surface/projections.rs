@@ -124,6 +124,8 @@ impl SurfaceModeledProjection {
         } else {
             return Err("modeled projection has no canonical program material".to_owned());
         };
+        let program = crate::application::compact_projection_program_contract(program)
+            .map_err(|error| error.to_string())?;
         let binding = self.raw_binding.as_ref().map(|binding| {
             serde_json::json!({
                 "identity_version": binding.identity_version(),
@@ -1075,6 +1077,7 @@ mod tests {
             "todos",
             &["todo_id", "owner_id", "title"],
             vec![RelationshipDef {
+                references: None,
                 field_name: "owner".into(),
                 kind: RelationshipKind::BelongsTo,
                 target_model: "UserView".into(),

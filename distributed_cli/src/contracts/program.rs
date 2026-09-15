@@ -118,7 +118,9 @@ impl ClientProgramDescriptor {
             return Err("program must declare at least one surface".into());
         }
         if self.assets.len() > MAX_PROGRAM_ASSETS {
-            return Err(format!("program exceeds max asset count {MAX_PROGRAM_ASSETS}"));
+            return Err(format!(
+                "program exceeds max asset count {MAX_PROGRAM_ASSETS}"
+            ));
         }
         let mut paths = BTreeSet::new();
         for asset in &self.assets {
@@ -291,7 +293,10 @@ fn contract_set_id(
         );
     }
     for artifact in artifacts {
-        material.insert(format!("artifact:{}", artifact.path), artifact.digest.clone());
+        material.insert(
+            format!("artifact:{}", artifact.path),
+            artifact.digest.clone(),
+        );
     }
     let bytes = serde_json::to_vec(&material).unwrap_or_default();
     identity_digest("distributed.client-program.contract-set.v1", &bytes)
@@ -319,7 +324,10 @@ fn program_id(
 
 fn collect_assets(root: &Path) -> Result<Vec<ClientProgramAsset>, String> {
     if !root.is_dir() {
-        return Err(format!("asset root `{}` is not a directory", root.display()));
+        return Err(format!(
+            "asset root `{}` is not a directory",
+            root.display()
+        ));
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let mut assets = Vec::new();
@@ -439,7 +447,10 @@ mod tests {
         fs::write(root.join("app.js"), b"console.log(1)").unwrap();
         let first = base_builder(&root).build().unwrap();
         let second = base_builder(&root).build().unwrap();
-        assert_eq!(first.canonical_bytes().unwrap(), second.canonical_bytes().unwrap());
+        assert_eq!(
+            first.canonical_bytes().unwrap(),
+            second.canonical_bytes().unwrap()
+        );
         assert_eq!(
             first.classify_against(&second).unwrap(),
             ProgramCompatibility::Current

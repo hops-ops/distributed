@@ -1,12 +1,12 @@
 error[E0080]: evaluation panicked: duplicate command identity in module declaration
-  --> tests/compile_fail/application_command_duplicate_id.rs:38:1
+  --> tests/compile_fail/application_command_duplicate_id.rs:39:1
    |
-38 | / distributed::module! {
-39 | |     pub DUPLICATE_MODULE {
-40 | |         id: "duplicates",
-41 | |         commands: [FIRST_DEFINITION, SECOND_DEFINITION],
-42 | |     }
-43 | | }
+39 | / distributed::module! {
+40 | |     pub DUPLICATE_MODULE {
+41 | |         id: "duplicates",
+42 | |         commands: [FIRST_DEFINITION, SECOND_DEFINITION],
+43 | |     }
+44 | | }
    | |_^ evaluation of `_` failed inside this call
    |
 note: inside `assert_unique_command_ids`

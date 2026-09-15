@@ -100,7 +100,15 @@ fn scaffolded_http_tracing_service_compiles() {
 fn scaffolded_query_api_service_compiles() {
     let out_dir = scaffold(
         "compile-query-api-sqlite",
-        &["--query-api", "--store", "sqlite", "--model", "order"],
+        &[
+            "--query-api",
+            "--store",
+            "sqlite",
+            "--model",
+            "order",
+            "--command",
+            "orders.place",
+        ],
     );
     cargo_check(&out_dir);
 }

@@ -14,6 +14,7 @@ mod manifest;
 mod module;
 mod mount;
 mod plan;
+mod projection_contract;
 mod registration;
 mod runtime;
 mod runtime_host;
@@ -50,6 +51,8 @@ pub use plan::{
     compile_deployment_plan, DeploymentPlan, PlanFingerprint, ProcessIntent, ProcessPlan,
     DEPLOYMENT_PLAN_SCHEMA_VERSION, MAX_DEPLOYMENT_PLAN_BYTES,
 };
+pub(crate) use projection_contract::compact_projection_program_contract;
+pub use projection_contract::expand_projection_program_contract;
 pub use registration::{Application, ApplicationBuilder, ContractCompiler};
 pub use runtime::{Runtime, RuntimeDialect};
 pub use runtime_host::{bind_single_process, CapabilityProviders, RuntimeHost};

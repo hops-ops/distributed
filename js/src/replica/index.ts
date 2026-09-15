@@ -252,3 +252,9 @@ export type {
 	MutationProgram,
 	MutationTarget,
 } from './mutation-cache.js';
+
+export type {
+	ReplicaLazyCommandCatalog,
+	ReplicaLazyCommandModule,
+	ReplicaLazyCommandRuntime
+} from './command-runtime/lazy.js';

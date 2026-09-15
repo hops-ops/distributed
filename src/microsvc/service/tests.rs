@@ -6,26 +6,29 @@ use crate::aggregate::Aggregate;
 #[cfg(feature = "graphql")]
 use crate::bus::RunOptions;
 use crate::bus::{Message, MessageKind, SubscriptionPlan};
+#[cfg(all(feature = "graphql", feature = "sqlite"))]
+use crate::command::Eventual;
+use crate::command::{typed_command, PreparedCommand, Succeeded};
+#[cfg(feature = "graphql")]
+use crate::command::{Atomic, CommandConsistency};
+use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
 #[cfg(feature = "graphql")]
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey, CommandLedgerState,
-    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation, ReservationOutcome,
+    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
+    ExternalCommandCompletion, ReservationOutcome,
 };
 #[cfg(feature = "graphql")]
-use crate::graphql::command_contract::CommandConsistency;
+use crate::command_dispatch::SharedCommandHost;
 #[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
-#[cfg(all(feature = "graphql", feature = "sqlite"))]
-use crate::graphql::Eventual;
-use crate::graphql::{
-    typed_command, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField,
-    PreparedCommand, Succeeded,
-};
 #[cfg(feature = "graphql")]
-use crate::graphql::{Atomic, SurfaceDirectProjection, SurfaceProjector};
+use crate::graphql::{SurfaceDirectProjection, SurfaceProjector};
 #[cfg(feature = "graphql")]
 use crate::microsvc::HasOutboxStore;
+#[cfg(feature = "graphql")]
+use crate::microsvc::cell_host::{CelldCommandHost, InternalHttpSecret};
 use crate::microsvc::{
     CommandRequest, Context, HandlerError, RepoReadModelDependencies, Routes, Service, Session,
 };
@@ -75,10 +78,11 @@ struct TypedOutput {
     id: String,
 }
 
-fn one_string_field(name: &str, field: &str) -> GraphqlTypeDef {
-    GraphqlTypeDef::new(
+fn one_string_field(name: &str, field: &str) -> CommandTypeDef {
+    CommandTypeDef::new(
         name,
-        vec![GraphqlTypeField {
+        vec![CommandTypeField {
+            unsigned_integer: None,
             name: field.into(),
             type_name: "String".into(),
             nullable: false,
@@ -89,14 +93,14 @@ fn one_string_field(name: &str, field: &str) -> GraphqlTypeDef {
     )
 }
 
-impl GraphqlInputType for TypedInput {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandInputType for TypedInput {
+    fn command_type() -> CommandTypeDef {
         one_string_field("TypedInput", "id").with_type_id(std::any::TypeId::of::<Self>())
     }
 }
 
-impl GraphqlOutputType for TypedOutput {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandOutputType for TypedOutput {
+    fn command_type() -> CommandTypeDef {
         one_string_field("TypedOutput", "id").with_type_id(std::any::TypeId::of::<Self>())
     }
 }
@@ -109,12 +113,13 @@ struct CausalTestInput {
 }
 
 #[cfg(feature = "graphql")]
-impl GraphqlInputType for CausalTestInput {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandInputType for CausalTestInput {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CausalTestInput",
             vec![
-                GraphqlTypeField {
+                CommandTypeField {
+                    unsigned_integer: None,
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -122,7 +127,8 @@ impl GraphqlInputType for CausalTestInput {
                     item_nullable: false,
                     nested: None,
                 },
-                GraphqlTypeField {
+                CommandTypeField {
+                    unsigned_integer: None,
                     name: "label".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -137,7 +143,7 @@ impl GraphqlInputType for CausalTestInput {
 }
 
 #[cfg(feature = "graphql")]
-#[derive(Clone, Deserialize, crate::GraphqlInput)]
+#[derive(Clone, Deserialize, crate::CommandInput)]
 struct CausalProjectionInput {
     #[serde(rename = "todoId")]
     id: String,
@@ -589,28 +595,29 @@ fn modeled_lifecycle_projector(
 }
 
 #[cfg(feature = "graphql")]
-impl GraphqlOutputType for CausalProjectionObligationView {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandOutputType for CausalProjectionObligationView {
+    fn command_type() -> CommandTypeDef {
         one_string_field("CausalProjectionObligationView", "id")
             .with_type_id(std::any::TypeId::of::<Self>())
     }
 }
 
 #[cfg(feature = "graphql")]
-impl GraphqlOutputType for CausalProjectionSiblingView {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandOutputType for CausalProjectionSiblingView {
+    fn command_type() -> CommandTypeDef {
         one_string_field("CausalProjectionSiblingView", "id")
             .with_type_id(std::any::TypeId::of::<Self>())
     }
 }
 
 #[cfg(feature = "graphql")]
-impl GraphqlOutputType for CausalLifecycleView {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandOutputType for CausalLifecycleView {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CausalLifecycleView",
             vec![
-                GraphqlTypeField {
+                CommandTypeField {
+                    unsigned_integer: None,
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -618,7 +625,8 @@ impl GraphqlOutputType for CausalLifecycleView {
                     item_nullable: false,
                     nested: None,
                 },
-                GraphqlTypeField {
+                CommandTypeField {
+                    unsigned_integer: None,
                     name: "label".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -776,6 +784,19 @@ fn command_host(service: &Arc<Service>) -> crate::command_dispatch::SharedComman
 }
 
 #[cfg(feature = "graphql")]
+fn celld_status_host(service: &Arc<Service>) -> SharedCommandHost {
+    Arc::new(
+        CelldCommandHost::new(
+            "http://127.0.0.1:1",
+            Arc::clone(service),
+            InternalHttpSecret::new("test-only-internal-secret-32-bytes")
+                .expect("test internal secret should be valid"),
+        )
+        .expect("status-only celld host should accept a local URL"),
+    )
+}
+
+#[cfg(feature = "graphql")]
 #[derive(Clone, Copy)]
 enum InjectedCommitBehavior {
     CommitThenErrorOnce,
@@ -812,6 +833,13 @@ impl AmbiguousCommitRepository {
 
 #[cfg(feature = "graphql")]
 impl CausalGetStream for AmbiguousCommitRepository {
+    fn get_causal_stream_tail<'a>(
+        &'a self,
+        identity: &'a crate::StreamIdentity,
+        after_version: u64,
+    ) -> impl Future<Output = Result<Option<Entity>, crate::RepositoryError>> + Send + 'a {
+        self.inner.get_causal_stream_tail(identity, after_version)
+    }
     fn get_causal_stream<'a>(
         &'a self,
         identity: &'a crate::StreamIdentity,
@@ -825,6 +853,11 @@ impl CausalRepositoryIdentity for AmbiguousCommitRepository {
     fn causal_storage_identity(&self) -> crate::command_ledger::CausalStorageIdentity {
         CausalRepositoryIdentity::causal_storage_identity(&self.inner)
     }
+}
+
+#[cfg(feature = "graphql")]
+impl crate::microsvc::dependencies::CausalHostProjections for AmbiguousCommitRepository {
+    crate::microsvc::dependencies::direct_causal_projection_methods!();
 }
 
 #[cfg(feature = "graphql")]
@@ -1007,6 +1040,13 @@ impl CommandLedgerStore for AmbiguousCommitRepository {
         CommandLedgerStore::mark_retryable_unknown(&self.inner, attempt)
     }
 
+    fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
+        CommandLedgerStore::complete_external_command(&self.inner, completion)
+    }
+
     fn compact_expired_commands(
         &self,
         limit: usize,
@@ -1085,6 +1125,67 @@ fn named_service_preserves_identity_with_route_bundles() {
     );
 }
 
+#[cfg(feature = "graphql")]
+#[test]
+fn service_compiles_exact_application_modules_from_command_namespaces() {
+    let repository = InMemoryRepository::new();
+    let service = Service::new().named("catalog").routes(
+        Routes::new()
+            .with_repo(repository.queued().aggregate::<RouteComboAggregate>())
+            .typed_command(
+                typed_command::<TypedInput, Succeeded<TypedOutput>>("access.grant").roles(["user"]),
+            )
+            .handle(typed_handler)
+            .typed_command(
+                typed_command::<TypedInput, Succeeded<TypedOutput>>("repository.create")
+                    .roles(["user"]),
+            )
+            .handle(typed_handler),
+    );
+    let surface = crate::graphql::build_surface(&[], &crate::graphql::SurfaceOptions::sqlite())
+        .expect("empty read-model Surface should build")
+        .with_service(&service)
+        .expect("typed Service should bind to the Surface");
+    let surface = crate::application::SurfaceSpec::from_surface("catalog", &surface)
+        .expect("Surface should become a portable application contract");
+
+    let application = service
+        .application("catalog", surface.clone())
+        .expect("Service and Surface should compile into one application");
+
+    assert_eq!(
+        application
+            .modules()
+            .iter()
+            .map(crate::application::Module::id)
+            .collect::<Vec<_>>(),
+        ["access", "repository"]
+    );
+    assert_eq!(
+        application
+            .manifest()
+            .commands
+            .iter()
+            .map(|command| command.id.as_str())
+            .collect::<Vec<_>>(),
+        ["access.grant", "repository.create"]
+    );
+
+    let mut missing = surface.clone();
+    missing
+        .commands
+        .retain(|command| command.id != "access.grant");
+    assert!(matches!(
+        service.application("catalog", missing),
+        Err(crate::ApplicationError::Missing { kind: "surface command", identity })
+            if identity == "access.grant"
+    ));
+    assert!(
+        Service::new().application("catalog", surface).is_err(),
+        "a Surface cannot expose commands absent from the owning Service"
+    );
+}
+
 #[tokio::test]
 async fn typed_direct_dispatch_fails_before_invoking_handler() {
     TYPED_HANDLER_INVOKED.store(false, Ordering::SeqCst);
@@ -1154,7 +1255,7 @@ async fn thin_complete_registers_without_a_handler_context_body() {
     let routes = Routes::new()
         .with_repo(repository.aggregate::<CausalDispatcherAggregate>())
         .typed_command(
-            typed_command::<CausalTestInput, crate::graphql::Succeeded<TypedOutput>>("todo.create")
+            typed_command::<CausalTestInput, crate::command::Succeeded<TypedOutput>>("todo.create")
                 .roles(["user"]),
         )
         .create()
@@ -1166,7 +1267,7 @@ async fn thin_complete_registers_without_a_handler_context_body() {
             id: aggregate.entity().id().to_string(),
         })
         .typed_command(
-            typed_command::<CausalTestInput, crate::graphql::Succeeded<TypedOutput>>(
+            typed_command::<CausalTestInput, crate::command::Succeeded<TypedOutput>>(
                 "todo.complete",
             )
             .roles(["user"]),
@@ -1947,8 +2048,9 @@ async fn causal_dispatch_overwrites_event_and_outbox_causation_with_ledger_ident
 #[tokio::test]
 async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
     let repository = InMemoryRepository::new();
-    let observed_broker_metadata = Arc::new(Mutex::new(None::<[String; 4]>));
+    let observed_broker_metadata = Arc::new(Mutex::new(None::<[String; 6]>));
     let route_observed_broker_metadata = Arc::clone(&observed_broker_metadata);
+    let bus = crate::bus::InMemoryBus::new();
     let service = Service::new()
         .named("causal-tests")
         .routes(
@@ -1986,6 +2088,8 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
                     >| {
                         let message = context.message();
                         let metadata = [
+                            message.id().expect("published message ID").to_string(),
+                            message.name().to_string(),
                             message.causation_id().unwrap_or_default().to_string(),
                             message
                                 .metadata("x-sourced-source-aggregate-type")
@@ -2008,7 +2112,7 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
                     },
                 ),
         )
-        .with_bus(crate::bus::InMemoryBus::new());
+        .with_bus(bus.clone());
 
     service
         .dispatch_causal(
@@ -2028,11 +2132,14 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
                 tokio::task::yield_now().await;
                 continue;
             }
-            if !outbox
-                .messages_by_status(crate::outbox::OutboxMessageStatus::Published, usize::MAX)
+            if outbox
+                .messages_by_status(crate::outbox::OutboxMessageStatus::InFlight, usize::MAX)
                 .await
                 .unwrap()
                 .is_empty()
+                && bus
+                    .published_ids()
+                    .contains(&"todo-immediate:immediate-fact".to_string())
             {
                 break;
             }
@@ -2046,22 +2153,25 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
         .messages_by_status(crate::outbox::OutboxMessageStatus::Published, usize::MAX)
         .await
         .unwrap();
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].id(), "todo-immediate:immediate-fact");
-    assert_eq!(published[0].event_type, "causal.immediate_fact");
-    let causation = published[0]
+    assert!(
+        published.is_empty(),
+        "delivered messages are deleted, not retained as evidence"
+    );
+    let stream = repository
+        .get_stream(
+            &crate::StreamIdentity::new(
+                CausalDispatcherAggregate::aggregate_type(),
+                "todo-immediate",
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let causation = stream.events()[0]
         .causation_id()
-        .expect("persisted outbox row should retain ledger causation")
+        .expect("committed event carries ledger causation")
         .to_string();
-    assert_eq!(
-        published[0].source_aggregate_type.as_deref(),
-        Some(CausalDispatcherAggregate::aggregate_type())
-    );
-    assert_eq!(
-        published[0].source_aggregate_id.as_deref(),
-        Some("todo-immediate")
-    );
-    assert_eq!(published[0].source_sequence, Some(1));
 
     service
         .run(RunOptions::idempotent())
@@ -2070,6 +2180,8 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
     assert_eq!(
         observed_broker_metadata.lock().unwrap().as_ref(),
         Some(&[
+            "todo-immediate:immediate-fact".to_string(),
+            "causal.immediate_fact".to_string(),
             causation,
             CausalDispatcherAggregate::aggregate_type().to_string(),
             "todo-immediate".to_string(),
@@ -2596,6 +2708,301 @@ async fn graphql_terminal_replay_revalidates_after_active_projection_starts_drai
     assert_eq!(status_envelope["command"]["expects"], json!([]));
     assert!(status_envelope["command"].get("projection").is_none());
     assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[tokio::test]
+async fn graphql_succeeded_status_evaluates_retained_projection_evidence() {
+    let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("framework migrations should apply");
+    let mut table_registry = crate::table::TableSchemaRegistry::new();
+    table_registry
+        .register_schema(
+            <CausalLifecycleView as crate::read_model::RelationalReadModel>::schema().clone(),
+        )
+        .unwrap();
+    repository
+        .bootstrap_table_schema_for_dev(&table_registry)
+        .await
+        .unwrap();
+    let projector = modeled_lifecycle_projector(
+        crate::projection::placement::ProjectionBindingState::Active,
+        "causal-succeeded-status",
+        "causal-succeeded-status-topology",
+        0x7a,
+    );
+    let service = Service::new().named("causal-succeeded-status").routes(
+        Routes::new()
+            .with_repo(repository.clone().aggregate::<CausalDispatcherAggregate>())
+            .with_read_model_store(repository.clone())
+            .typed_command(
+                typed_command::<CausalTestInput, Eventual<TypedOutput>>("causal.lifecycle")
+                    .roles(["user"])
+                    .emits(crate::events![CausalLifecycleRecorded]),
+            )
+            .handle(
+                |context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                 input: CausalTestInput| {
+                    let result = (|| {
+                        let mut checkout = context.create();
+                        checkout.record_lifecycle(input.id.clone(), input.label)?;
+                        context
+                            .publish_events()
+                            .commit(checkout)?
+                            .eventual(TypedOutput { id: input.id })
+                    })();
+                    async move { result }
+                },
+            )
+            .consume_projection(projector.clone()),
+    );
+    let engine = crate::graphql::GraphqlEngine::builder(&repository)
+        .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
+        .model::<CausalLifecycleView>(
+            crate::graphql::ModelPermissions::new()
+                .grant("user", crate::graphql::read().all_columns()),
+        )
+        .service(&service)
+        .client_projectors([projector])
+        .build()
+        .expect("active modeled projection should compile");
+    let service = Arc::new(
+        service
+            .try_with_graphql(engine)
+            .expect("compiled service should bind"),
+    );
+    let command_id = causal_test_command_id();
+    let mutation = format!(
+        "mutation {{ causal_lifecycle(commandId: \"{command_id}\", input: {{ id: \"todo-succeeded-status\", label: \"active\" }}) {{ id }} }}"
+    );
+    let session = session_with_role("user");
+    let principal = causal_test_principal();
+    let response = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&mutation)
+                .data(command_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(response.errors.is_empty(), "{response:?}");
+    let envelope = serde_json::to_value(
+        response
+            .extensions
+            .get("distributed")
+            .expect("modeled command should carry the protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(envelope["command"]["state"], "succeeded_pending_projection");
+    assert_eq!(envelope["command"]["expects"].as_array().unwrap().len(), 1);
+    let causation_id = envelope["command"]["causationId"]
+        .as_str()
+        .expect("command envelope should carry its causation")
+        .to_string();
+
+    // The wait-path cell commits a terminal succeeded receipt while retaining
+    // modeled obligations. Before the projector writes proof, status remains
+    // publicly succeeded but cannot claim an observation.
+    let changed = sqlx::query(
+        "UPDATE command_ledger SET state = 'succeeded' \
+         WHERE service_id = ? AND command_id = ?",
+    )
+    .bind("causal-succeeded-status")
+    .bind(&command_id)
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+
+    let status_query =
+        format!("query {{ commandStatus(commandId: \"{command_id}\") {{ state }} }}");
+    let before_projection = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(command_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(before_projection.errors.is_empty(), "{before_projection:?}");
+    assert_eq!(
+        before_projection.data.into_json().unwrap(),
+        json!({"commandStatus": {"state": "succeeded"}})
+    );
+    let before_envelope = serde_json::to_value(
+        before_projection
+            .extensions
+            .get("distributed")
+            .expect("status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(before_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        before_envelope["command"]["expects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(before_envelope["command"].get("observations").is_none());
+
+    // The celld host must use the same durable status evaluator. In
+    // particular, a terminal cell receipt cannot make the gateway claim a
+    // projection observation before the modeled projector has supplied proof.
+    let before_celld = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(celld_status_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(before_celld.errors.is_empty(), "{before_celld:?}");
+    let before_celld_envelope = serde_json::to_value(
+        before_celld
+            .extensions
+            .get("distributed")
+            .expect("celld status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(before_celld_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        before_celld_envelope["command"]["expects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(before_celld_envelope["command"].get("observations").is_none());
+
+    let pending = repository
+        .outbox_store()
+        .pending(10)
+        .await
+        .expect("the committed domain event should be pending");
+    assert_eq!(pending.len(), 1);
+    let ordered = crate::bus::OrderedDelivery::new(
+        crate::projection_protocol::ProjectionSource::new(
+            "test-ordered-events",
+            b"causal-succeeded-status".to_vec(),
+        )
+        .unwrap(),
+        crate::projection_protocol::ProjectionEpoch::new("test-ordered-events-v1").unwrap(),
+        1,
+        true,
+    )
+    .unwrap();
+    service
+        .dispatch_ordered_message(&Message::from(pending[0].clone()), Some(&ordered))
+        .await
+        .expect("the real modeled projector should commit its evidence");
+
+    let after_projection = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(command_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(after_projection.errors.is_empty(), "{after_projection:?}");
+    let after_envelope = serde_json::to_value(
+        after_projection
+            .extensions
+            .get("distributed")
+            .expect("status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(after_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        after_envelope["command"]["observations"]
+            .as_array()
+            .expect("matching durable proof should be exposed")
+            .len(),
+        1
+    );
+    assert_eq!(
+        after_envelope["command"]["observations"][0]["causationId"],
+        causation_id
+    );
+
+    let after_celld = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(celld_status_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(after_celld.errors.is_empty(), "{after_celld:?}");
+    let after_celld_envelope = serde_json::to_value(
+        after_celld
+            .extensions
+            .get("distributed")
+            .expect("celld status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(after_celld_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        after_celld_envelope["command"]["observations"]
+            .as_array()
+            .expect("celld status should expose matching durable proof")
+            .len(),
+        1
+    );
+
+    // A proof authored by a different semantic program is not an observation
+    // for this command, even when its physical topology and scope are equal.
+    let wrong_program =
+        "pp1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let changed =
+        sqlx::query("UPDATE projection_observations SET program_id = ? WHERE causation_id = ?")
+            .bind(wrong_program)
+            .bind(&causation_id)
+            .execute(repository.pool())
+            .await
+            .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+
+    let wrong_projection = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(command_host(&service))
+                .data(principal),
+        )
+        .await;
+    assert!(wrong_projection.errors.is_empty(), "{wrong_projection:?}");
+    let wrong_envelope = serde_json::to_value(
+        wrong_projection
+            .extensions
+            .get("distributed")
+            .expect("status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(wrong_envelope["command"]["state"], "succeeded");
+    assert!(wrong_envelope["command"].get("observations").is_none());
+    assert_eq!(
+        wrong_envelope["command"]["expects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "mismatched proof must leave the exact obligation pending"
+    );
 }
 
 #[cfg(all(feature = "graphql", feature = "sqlite"))]

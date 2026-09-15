@@ -89,14 +89,8 @@ async fn outbox_source_run_drains_and_completes() {
     let mut ids = handled.lock().unwrap().clone();
     ids.sort();
     assert_eq!(ids, vec!["m1".to_string(), "m2".to_string()]);
-    assert_eq!(
-        status(&store, "m1").await,
-        Some(OutboxMessageStatus::Published)
-    );
-    assert_eq!(
-        status(&store, "m2").await,
-        Some(OutboxMessageStatus::Published)
-    );
+    assert_eq!(status(&store, "m1").await, None);
+    assert_eq!(status(&store, "m2").await, None);
 }
 
 #[tokio::test]
@@ -161,10 +155,7 @@ async fn nack_releases_then_a_later_claim_completes() {
     let mut source2 = OutboxSource::new(store.clone(), "pg-retry-2", 5);
     let received2 = source2.recv().await.unwrap().expect("a re-claimable row");
     received2.ack().await.unwrap();
-    assert_eq!(
-        status(&store, "m1").await,
-        Some(OutboxMessageStatus::Published)
-    );
+    assert_eq!(status(&store, "m1").await, None);
 }
 
 #[tokio::test]

@@ -1,8 +1,40 @@
 use super::*;
 
+pub(super) enum ProtocolPreparationError {
+    RequiredPreset,
+    Internal,
+}
+
+impl From<()> for ProtocolPreparationError {
+    fn from(_: ()) -> Self {
+        Self::Internal
+    }
+}
+
+impl ProtocolPreparationError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::RequiredPreset => {
+                let mut error =
+                    ServerError::new("required session input is missing or invalid", None);
+                let mut extensions = async_graphql::ErrorExtensionValues::default();
+                extensions.set("code", "BAD_REQUEST");
+                error.extensions = Some(extensions);
+                Response::from_errors(vec![error])
+            }
+            Self::Internal => protocol_internal_error_response(),
+        }
+    }
+}
+
 impl GraphqlEngine {
     pub async fn execute(&self, session: &Session, mut request: Request) -> Response {
-        if selected_operation_type(&mut request) == Some(async_graphql::parser::types::OperationType::Mutation)
+        #[cfg(feature = "gateway-delivery")]
+        if delivery::action(&request).as_deref() == Some("validate") {
+            return self.validate_delivery(session, request).await;
+        }
+        if selected_operation_type(&mut request)
+            == Some(async_graphql::parser::types::OperationType::Mutation)
             && !crate::microsvc::lifecycle_mutations_open()
         {
             return lifecycle_mutation_rejected();
@@ -38,13 +70,29 @@ impl GraphqlEngine {
 
         let accumulator = match self.protocol_accumulator(&authority, session, &request) {
             Ok(accumulator) => accumulator,
-            Err(()) => return protocol_internal_error_response(),
+            Err(error) => return error.into_response(),
         };
+        #[cfg(feature = "gateway-delivery")]
+        if let Some(accumulator) = &accumulator {
+            if self
+                .enable_delivery_capture(session, &request, accumulator)
+                .is_err()
+            {
+                return protocol_internal_error_response();
+            }
+        }
         if introspection {
             // The relaxed schema is defense-in-depth restricted even if a
             // future classifier or request extension behaves unexpectedly.
             request = request.only_introspection();
         }
+        #[cfg(feature = "gateway-delivery")]
+        let read = match self.prepare_read(session, &request) {
+            Ok(read) => read,
+            Err(error) => return read_routing::delivery_error(error),
+        };
+        #[cfg(feature = "gateway-delivery")]
+        let request = request.data(read.clone());
         let mut request = request
             .data(session.clone())
             .data(authority)
@@ -55,6 +103,8 @@ impl GraphqlEngine {
         let start = std::time::Instant::now();
         let response =
             attach_protocol_response(schema.execute(request).await, accumulator.as_ref());
+        #[cfg(feature = "gateway-delivery")]
+        let response = read_routing::enforce_minimum(response, &read);
         let status = metrics_status_for_response(&response);
         let root_field = match &response.data {
             Value::Object(map) => map.keys().next().map(|s| s.as_str()).unwrap_or("_"),
@@ -70,7 +120,8 @@ impl GraphqlEngine {
         session: &Session,
         mut request: Request,
     ) -> BoxStream<'static, async_graphql::Response> {
-        if selected_operation_type(&mut request) == Some(async_graphql::parser::types::OperationType::Mutation)
+        if selected_operation_type(&mut request)
+            == Some(async_graphql::parser::types::OperationType::Mutation)
             && !crate::microsvc::lifecycle_mutations_open()
         {
             return stream::once(async { lifecycle_mutation_rejected() }).boxed();
@@ -111,8 +162,8 @@ impl GraphqlEngine {
         }
         let accumulator = match self.protocol_accumulator(&authority, session, &request) {
             Ok(accumulator) => accumulator,
-            Err(()) => {
-                return stream::once(async { protocol_internal_error_response() }).boxed();
+            Err(error) => {
+                return stream::once(async move { error.into_response() }).boxed();
             }
         };
         if accumulator
@@ -124,6 +175,15 @@ impl GraphqlEngine {
         if introspection {
             request = request.only_introspection();
         }
+        #[cfg(feature = "gateway-delivery")]
+        let read = match self.prepare_read(session, &request) {
+            Ok(read) => read,
+            Err(error) => {
+                return stream::once(async move { read_routing::delivery_error(error) }).boxed()
+            }
+        };
+        #[cfg(feature = "gateway-delivery")]
+        let request = request.data(read.clone());
         let mut request = request
             .data(session.clone())
             .data(authority)
@@ -133,16 +193,21 @@ impl GraphqlEngine {
         }
         schema
             .execute_stream(request)
-            .map(move |response| attach_protocol_response(response, accumulator.as_ref()))
+            .map(move |response| {
+                let response = attach_protocol_response(response, accumulator.as_ref());
+                #[cfg(feature = "gateway-delivery")]
+                let response = read_routing::enforce_minimum(response, &read);
+                response
+            })
             .boxed()
     }
 
-    fn protocol_accumulator(
+    pub(super) fn protocol_accumulator(
         &self,
         authority: &ExecutionAuthority,
         session: &Session,
         request: &Request,
-    ) -> Result<Option<ProtocolResponseAccumulator>, ()> {
+    ) -> Result<Option<ProtocolResponseAccumulator>, ProtocolPreparationError> {
         let Some(runtime) = &self.inner.protocol else {
             return Ok(None);
         };
@@ -151,7 +216,10 @@ impl GraphqlEngine {
         let trusted_presets = surface_info
             .trusted_presets
             .iter()
-            .map(|descriptor| resolve_protocol_preset(session, descriptor).ok_or(()))
+            .map(|descriptor| {
+                resolve_protocol_preset(session, descriptor)
+                    .ok_or(ProtocolPreparationError::RequiredPreset)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let principal = request
             .data
@@ -311,19 +379,31 @@ mod lifecycle_request_tests {
     use async_graphql::Request;
 
     #[test]
+    fn internal_protocol_preparation_errors_are_not_request_errors() {
+        let response = super::ProtocolPreparationError::from(()).into_response();
+        let expected = super::protocol_internal_error_response();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[test]
     fn selected_operation_type_fails_closed_for_ambiguous_documents() {
         let mut mutation = Request::new("mutation Write { __typename }");
-        assert_eq!(selected_operation_type(&mut mutation), Some(OperationType::Mutation));
-
-        let mut selected = Request::new(
-            "query Read { __typename } mutation Write { __typename }",
-        )
-        .operation_name("Write");
-        assert_eq!(selected_operation_type(&mut selected), Some(OperationType::Mutation));
-
-        let mut ambiguous = Request::new(
-            "query Read { __typename } mutation Write { __typename }",
+        assert_eq!(
+            selected_operation_type(&mut mutation),
+            Some(OperationType::Mutation)
         );
+
+        let mut selected = Request::new("query Read { __typename } mutation Write { __typename }")
+            .operation_name("Write");
+        assert_eq!(
+            selected_operation_type(&mut selected),
+            Some(OperationType::Mutation)
+        );
+
+        let mut ambiguous = Request::new("query Read { __typename } mutation Write { __typename }");
         assert_eq!(selected_operation_type(&mut ambiguous), None);
     }
 }

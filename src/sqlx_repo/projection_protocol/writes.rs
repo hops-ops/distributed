@@ -1,5 +1,15 @@
 use super::*;
 
+pub(super) fn program_id_for_model(
+    ownership: &[ProjectionModelOwnership],
+    model: &str,
+) -> Option<ProjectionProgramId> {
+    ownership
+        .iter()
+        .find(|declaration| declaration.model == model)
+        .and_then(|declaration| declaration.program_id)
+}
+
 pub(super) async fn ensure_partition_ownership_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
@@ -196,7 +206,7 @@ where
     let key_hash = scope.key_digest();
     let mut builder = QueryBuilder::<DB>::new(
         "SELECT canonical_key_bytes, canonical_key_hash, incarnation, revision, tombstone, \
-         change_epoch, change_position FROM projection_records WHERE topology_hash = ",
+         change_epoch, change_position, source_snapshot FROM projection_records WHERE topology_hash = ",
     );
     builder.push_bind(topology_hash.as_slice());
     builder.push(" AND partition_hash = ");
@@ -268,6 +278,11 @@ where
     )?;
     Ok(Some(StoredRecord {
         metadata: ProjectionRecordMetadata {
+            source_snapshot: decode_source_snapshot(
+                row.try_get("source_snapshot").map_err(|error| {
+                    protocol_storage_error::<DB>("decode source snapshot", error)
+                })?,
+            )?,
             revision: RecordRevision::new(scope.clone(), incarnation, revision)?,
             tombstone,
             change: ProjectionChangeCursor::new(
@@ -285,11 +300,15 @@ pub(super) fn next_record(
     expectation: &ProjectionRecordExpectation,
     kind: ProjectionMutationKind,
     current: Option<&StoredRecord>,
+    source_snapshot: bool,
 ) -> Result<(RecordRevision, bool), ProjectionProtocolError> {
     let current = current.map(|record| &record.metadata);
     match (expectation, current, kind) {
         (ProjectionRecordExpectation::Missing, None, ProjectionMutationKind::Upsert) => {
             Ok((RecordRevision::new(scope.clone(), 1, 1)?, false))
+        }
+        (ProjectionRecordExpectation::Missing, None, ProjectionMutationKind::Delete) => {
+            Ok((RecordRevision::new(scope.clone(), 1, 1)?, true))
         }
         (ProjectionRecordExpectation::Missing, Some(metadata), _) if metadata.tombstone => {
             Err(ProjectionProtocolError::RecordTombstoned {
@@ -330,7 +349,7 @@ pub(super) fn next_record(
                     )?,
                     false,
                 )),
-                ProjectionMutationKind::Delete if metadata.tombstone => {
+                ProjectionMutationKind::Delete if metadata.tombstone && !source_snapshot => {
                     Err(ProjectionProtocolError::RecordTombstoned {
                         model: scope.model().to_string(),
                     })
@@ -358,11 +377,9 @@ pub(super) fn next_record(
                 )),
             }
         }
-        (_, _, ProjectionMutationKind::Delete | ProjectionMutationKind::Recreate) => {
-            Err(ProjectionProtocolError::InvalidBatch(
-                "delete/recreate requires an exact record expectation".into(),
-            ))
-        }
+        (_, _, ProjectionMutationKind::Recreate) => Err(ProjectionProtocolError::InvalidBatch(
+            "delete/recreate requires an exact record expectation".into(),
+        )),
     }
 }
 
@@ -380,6 +397,7 @@ pub(super) fn allocate_change(
     scope: Option<ProjectionRecordScope>,
     revision: Option<RecordRevision>,
     failure_id: Option<String>,
+    program_id: Option<ProjectionProgramId>,
 ) -> Result<ProjectionChange, ProjectionProtocolError> {
     state.change_head = checked_next(state.change_head, "projection change")?;
     Ok(ProjectionChange {
@@ -395,6 +413,7 @@ pub(super) fn allocate_change(
         scope,
         revision,
         failure_id,
+        program_id,
     })
 }
 
@@ -418,7 +437,7 @@ where
         "INSERT INTO projection_changes \
          (topology_hash, partition_hash, change_epoch, change_position, change_kind, \
          causation_id, model_name, scope_kind, canonical_key_bytes, canonical_key_hash, \
-         incarnation, revision, failure_id) VALUES (",
+         incarnation, revision, failure_id, program_id) VALUES (",
     );
     builder.push_bind(topology_hash.as_slice());
     builder.push(", ");
@@ -480,6 +499,13 @@ where
     } else {
         builder.push("NULL");
     }
+    builder.push(", ");
+    let program_id_value = change.program_id.map(|program_id| program_id.to_string());
+    if let Some(program_id) = program_id_value.as_deref() {
+        builder.push_bind(program_id);
+    } else {
+        builder.push("NULL");
+    }
     builder.push(")");
     builder
         .build()
@@ -508,7 +534,7 @@ where
     let mut builder = QueryBuilder::<DB>::new(
         "INSERT INTO projection_records \
          (topology_hash, partition_hash, model_name, canonical_key_bytes, canonical_key_hash, \
-         incarnation, revision, tombstone, change_epoch, change_position) VALUES (",
+         incarnation, revision, tombstone, change_epoch, change_position, source_snapshot) VALUES (",
     );
     builder.push_bind(topology_hash.as_slice());
     builder.push(", ");
@@ -538,12 +564,24 @@ where
         metadata.change.position(),
         "projection record change position",
     )?);
+    builder.push(", ");
+    let source_json = metadata
+        .source_snapshot
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| corrupt_storage(format!("encode source snapshot: {error}")))?;
+    if let Some(value) = &source_json {
+        builder.push_bind(value.as_str());
+    } else {
+        builder.push("NULL");
+    }
     builder.push(
         ") ON CONFLICT (topology_hash, partition_hash, model_name, canonical_key_hash) \
          DO UPDATE SET canonical_key_bytes = excluded.canonical_key_bytes, \
          incarnation = excluded.incarnation, revision = excluded.revision, \
          tombstone = excluded.tombstone, change_epoch = excluded.change_epoch, \
-         change_position = excluded.change_position",
+         change_position = excluded.change_position, source_snapshot = excluded.source_snapshot",
     );
     builder
         .build()
@@ -551,6 +589,27 @@ where
         .await
         .map_err(|error| protocol_storage_error::<DB>("store projection record", error))?;
     Ok(())
+}
+
+pub(super) fn decode_source_snapshot(
+    value: Option<String>,
+) -> Result<Option<crate::projection_protocol::SourceSnapshotVersion>, ProjectionProtocolError> {
+    value
+        .map(|value| {
+            if value.len() > 16384 {
+                return Err(corrupt_storage(
+                    "source snapshot exceeds bounded metadata size",
+                ));
+            }
+            let snapshot: crate::projection_protocol::SourceSnapshotVersion =
+                serde_json::from_str(&value)
+                    .map_err(|error| corrupt_storage(format!("decode source snapshot: {error}")))?;
+            snapshot
+                .validate_stored()
+                .map_err(|error| corrupt_storage(error.to_string()))?;
+            Ok(snapshot)
+        })
+        .transpose()
 }
 
 pub(super) fn decode_observation_row<DB>(
@@ -619,6 +678,9 @@ where
         })?,
         "observation change position",
     )?;
+    let program_id = decode_program_id(row.try_get("program_id").map_err(|error| {
+        protocol_storage_error::<DB>("decode observation program identity", error)
+    })?)?;
     Ok(ProjectionObservation {
         causation_id: causation_id.to_string(),
         kind,
@@ -630,6 +692,7 @@ where
             change_epoch,
             change_position,
         )?,
+        program_id,
     })
 }
 
@@ -656,7 +719,7 @@ where
     let key_hash = scope.key_digest();
     let mut builder = QueryBuilder::<DB>::new(
         "SELECT canonical_key_bytes, canonical_key_hash, incarnation, revision, \
-         change_epoch, change_position FROM projection_observations WHERE topology_hash = ",
+         change_epoch, change_position, program_id FROM projection_observations WHERE topology_hash = ",
     );
     builder.push_bind(topology_hash.as_slice());
     builder.push(" AND partition_hash = ");
@@ -700,7 +763,7 @@ where
         "INSERT INTO projection_observations \
          (topology_hash, partition_hash, causation_id, model_name, scope_kind, \
          canonical_key_bytes, canonical_key_hash, incarnation, revision, \
-         change_epoch, change_position) VALUES (",
+         change_epoch, change_position, program_id) VALUES (",
     );
     builder.push_bind(topology_hash.as_slice());
     builder.push(", ");
@@ -740,6 +803,15 @@ where
         observation.change.position(),
         "observation change position",
     )?);
+    builder.push(", ");
+    let program_id_value = observation
+        .program_id
+        .map(|program_id| program_id.to_string());
+    if let Some(program_id) = program_id_value.as_deref() {
+        builder.push_bind(program_id);
+    } else {
+        builder.push("NULL");
+    }
     builder.push(")");
     builder
         .build()

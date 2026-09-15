@@ -8,8 +8,8 @@ use crate::shared::{
 
 use super::attrs::{foreign_key_tokens, FieldAttrs, RelationshipKindAttr, StructAttrs};
 use super::types::{
-    bytes_row_value_tokens, column_type_tokens, default_storage_name, effect_model_wire_tokens,
-    option_inner_type, option_string_tokens, vec_inner_type,
+    box_inner_type, bytes_row_value_tokens, column_type_tokens, default_storage_name,
+    effect_model_wire_tokens, option_inner_type, option_string_tokens, vec_inner_type,
 };
 
 pub(super) fn expand_relational_read_model(
@@ -70,10 +70,10 @@ pub(super) fn expand_relational_read_model(
         let ty = &field.ty;
         let marker = format_ident!("__Distributed{}EffectModelField_{}", name, ident);
         effect_key_fields.push(quote! {
-            pub #ident: distributed::graphql::TypedEffectExpression<#ty>
+            pub #ident: distributed::command::TypedEffectExpression<#ty>
         });
         effect_key_values.push(quote! {
-            distributed::graphql::__effect_key_field::<#marker>(value.#ident)
+            distributed::command::__effect_key_field::<#marker>(value.#ident)
         });
     }
 
@@ -114,7 +114,9 @@ pub(super) fn expand_relational_read_model(
                     vec_inner_type(&field.ty).expect("relationship shape was validated")
                 }
                 RelationshipKindAttr::BelongsTo => {
-                    option_inner_type(&field.ty).expect("relationship shape was validated")
+                    let inner =
+                        option_inner_type(&field.ty).expect("relationship shape was validated");
+                    box_inner_type(inner).unwrap_or(inner)
                 }
             };
             let marker = format_ident!("__Distributed{}EffectRelationship_{}", name, ident);
@@ -123,7 +125,7 @@ pub(super) fn expand_relational_read_model(
                 #[allow(non_camel_case_types)]
                 #visibility struct #marker;
 
-                impl distributed::graphql::EffectRelationshipMarker for #marker {
+                impl distributed::command::EffectRelationshipMarker for #marker {
                     type Source = #name;
                     type Target = #target_ty;
                     const FIELD: &'static str = #field_name;
@@ -153,7 +155,7 @@ pub(super) fn expand_relational_read_model(
             #[allow(non_camel_case_types)]
             #visibility struct #effect_marker;
 
-            impl distributed::graphql::EffectModelFieldMarker for #effect_marker {
+            impl distributed::command::EffectModelFieldMarker for #effect_marker {
                 type Model = #name;
                 type Value = #field_ty;
                 type Wire = #effect_wire;
@@ -311,10 +313,10 @@ pub(super) fn expand_relational_read_model(
         }
 
         impl ::core::convert::From<#effect_key_name>
-            for distributed::graphql::TypedEffectKey<#name>
+            for distributed::command::TypedEffectKey<#name>
         {
             fn from(value: #effect_key_name) -> Self {
-                distributed::graphql::__effect_key::<#name>(vec![#(#effect_key_values),*])
+                distributed::command::__effect_key::<#name>(vec![#(#effect_key_values),*])
             }
         }
 

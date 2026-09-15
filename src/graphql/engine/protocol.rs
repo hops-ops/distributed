@@ -236,6 +236,14 @@ pub(crate) fn resolve_protocol_preset(
             }
             serde_json::Value::Number(parsed.into())
         }
+        codec if crate::command::CommandUnsignedInteger::from_client_codec(codec).is_some() => {
+            let unsigned = crate::command::CommandUnsignedInteger::from_client_codec(codec)?;
+            let parsed = raw.parse::<u64>().ok()?;
+            if parsed > unsigned.client_max_value() || parsed.to_string() != raw {
+                return None;
+            }
+            serde_json::Value::Number(parsed.into())
+        }
         "float64" => {
             let parsed = raw.parse::<f64>().ok()?;
             if !parsed.is_finite() {

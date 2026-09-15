@@ -87,6 +87,7 @@ mod postgres_tests {
             indexes: Vec::new(),
             relationships: vec![
                 RelationshipDef {
+                    references: None,
                     field_name: "children".into(),
                     kind: RelationshipKind::HasMany,
                     target_model: "PostgresGraphChildView".into(),
@@ -95,6 +96,7 @@ mod postgres_tests {
                     target_foreign_key: None,
                 },
                 RelationshipDef {
+                    references: None,
                     field_name: "featured_children".into(),
                     kind: RelationshipKind::HasMany,
                     target_model: "PostgresGraphChildView".into(),

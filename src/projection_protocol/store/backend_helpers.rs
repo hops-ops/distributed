@@ -5,7 +5,8 @@ use super::{
 };
 use crate::projection_protocol::MAX_PROJECTION_POSITION;
 use crate::table::{
-    has_many_join_columns, RelationshipDef, TableMutation, TableSchema, TableStoreError,
+    resolve_direct_join_keys, RelationshipDef, RelationshipKind, RowValue, RowValues,
+    TableMutation, TableSchema, TableStoreError,
 };
 
 pub(crate) fn checked_next(
@@ -101,15 +102,40 @@ pub(crate) fn validate_projection_graph_snapshot_request(
     Ok(())
 }
 
-pub(crate) fn projection_has_many_columns(
+pub(crate) fn projection_relationship_values(
     root_schema: &TableSchema,
+    root_row: &RowValues,
     relationship: &RelationshipDef,
     target_schema: &TableSchema,
-) -> Result<(String, String), ProjectionProtocolError> {
-    has_many_join_columns(root_schema, relationship, target_schema).map_err(|error| match error {
-        TableStoreError::Metadata(message) => ProjectionProtocolError::InvalidBatch(message),
-        other => ProjectionProtocolError::Table(other),
-    })
+) -> Result<Vec<(String, RowValue)>, ProjectionProtocolError> {
+    let pairs =
+        resolve_direct_join_keys(root_schema, relationship, target_schema).map_err(|error| {
+            match error {
+                TableStoreError::Metadata(message) => {
+                    ProjectionProtocolError::InvalidBatch(message)
+                }
+                other => ProjectionProtocolError::Table(other),
+            }
+        })?;
+    pairs
+        .into_iter()
+        .map(|pair| {
+            let (source, target) = match relationship.kind {
+                RelationshipKind::HasMany => (pair.primary_key_column, pair.foreign_key_column),
+                RelationshipKind::BelongsTo => (pair.foreign_key_column, pair.primary_key_column),
+                RelationshipKind::ManyToMany => {
+                    unreachable!("direct resolver rejects many-to-many")
+                }
+            };
+            let value = root_row.get(&source).cloned().ok_or_else(|| {
+                ProjectionProtocolError::InvalidBatch(format!(
+                    "projection graph root `{}` is missing relationship key `{source}`",
+                    root_schema.model_name
+                ))
+            })?;
+            Ok((target, value))
+        })
+        .collect()
 }
 
 pub(crate) fn checked_projection_graph_materialization(
