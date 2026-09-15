@@ -64,7 +64,7 @@ jsonwebtoken = { version = "9", optional = true }
 bitcode = { version = "0.6.9", features = ["serde"] }
 event-emitter-rs = { version = "0.1.4", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
-hmac = { version = "0.12", optional = true }
+hmac = { version = "0.13", optional = true }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"], optional = true }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"], optional = true }
 serde = { version = "1.0.210", features = ["derive"] }
