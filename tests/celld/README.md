@@ -175,6 +175,12 @@ also retains 1,101 unsent messages and more than 8 MiB of event payload in one
 snapshot-backed cell, restarts it, and verifies that alarms drain the backlog
 without another aggregate request. Events and receipts remain; delivered
 outbox rows do not.
+Queue row visibility is not a local settlement barrier: publication and deletion
+are separate awaited operations, and a competing replay drain may find every row
+already claimed by an alarm. The crash proof uses bounded read-only probes to
+observe zero local outbox rows before replay or another command. Exact zero-row,
+stable-envelope and event-count assertions remain; no sleep substitutes for
+observing settlement.
 It prints and retains its temporary artifact directory. Fault probes are
 feature-gated out of ordinary Worker builds. CI runs this proof separately
 from the full Queue/NATS/browser profile.

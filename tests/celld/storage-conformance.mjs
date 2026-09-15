@@ -99,6 +99,16 @@ async function probe(id, operation) {
   assert.equal(response.status, 200, `${operation}: ${await response.clone().text()}`);
   return operation === "inspect" ? response.json() : response.text();
 }
+async function settledCounts(id, expectedEvents) {
+  // Queue acceptance precedes the alarm's local DELETE. A competing command
+  // drain cannot join that in-flight claim; observe completion without nudging
+  // the cell with another command. The probe is read-only and errors still fail.
+  return until(`local outbox settlement for ${id}`, async () => {
+    const { counts } = await probe(id, "inspect");
+    assert.equal(counts.events, expectedEvents);
+    return counts.outbox === 0 && counts;
+  });
+}
 async function command(id, name, input, command = commandId(), extraHeaders = {}) {
   const response = await post(id, name, { commandId: command, input }, extraHeaders);
   const body = await response.json();
@@ -204,6 +214,7 @@ try {
     return rows.length >= before + 2 && rows;
   });
   assert.equal(retried[before].body, retried[before + 1].body, "stable delivery envelope survives restart");
+  await settledCounts("settlement-crash", 1);
   const replay = await command("settlement-crash", "todo.create", { title: "delivery proof" }, cid);
   assert.equal(replay.receipt.replayed, true);
   assert.deepEqual(replay.payload, original.payload);
@@ -221,7 +232,9 @@ try {
   await start();
   await until("prearmed alarm publishes a committed row without another cell request", async () =>
     (await queueRows()).length > beforeDeferred);
-  await record("committed-before-send restart", (await probe("commit-crash", "inspect")).counts);
+  const committedSettlement = await settledCounts("commit-crash", 1);
+  assert.equal(committedSettlement.outbox, 0);
+  await record("committed-before-send restart", committedSettlement);
 
   // Grow event history AND an unsent outbox beyond the former single-value
   // ceiling. Claim failures cannot reject an already committed command.
@@ -246,6 +259,7 @@ try {
   await start();
   await until("large pending outbox drains from alarms without a cell request", async () =>
     (await queueRows(true))[0]?.count >= beforeGrowth + 1101, 120_000);
+  await settledCounts("growth", 1101);
   const oldRetry = await command("growth", "todo.create", { title: "0 " + payload }, firstId);
   assert.equal(oldRetry.receipt.replayed, true);
   assert.deepEqual(oldRetry.events, first.events);
