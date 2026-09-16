@@ -242,7 +242,7 @@ jobs:
 
       - uses: azure/setup-helm@v4
         with:
-          version: v3.17.3
+          version: v3.22.0
 
       - name: Verify coherent local GitOps chart contracts
         run: ./scripts/helm-contract-test.sh
