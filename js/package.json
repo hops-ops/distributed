@@ -68,7 +68,7 @@
   },
   "devDependencies": {
     "@apollo/client": "^4.2.7",
-    "@types/node": "^20.0.0",
+    "@types/node": "^22.0.0",
     "@types/react": "19.3.0",
     "esbuild": "^0.28.0",
     "publint": "^0.3.22",
