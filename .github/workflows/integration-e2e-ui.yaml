@@ -236,11 +236,11 @@ jobs:
           # external domain advertised in the OIDC authorize redirect.
           sudo apt-get install -y jq openssl curl nginx ripgrep
 
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@v5
         with:
           version: v1.37.0
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: v4.3.0
 
