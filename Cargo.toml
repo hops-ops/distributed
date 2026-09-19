@@ -60,7 +60,7 @@ futures = { version = "0.3", optional = true }
 lapin = { version = "4", optional = true }
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
-jsonwebtoken = { version = "9", optional = true }
+jsonwebtoken = { version = "11", optional = true }
 bitcode = { version = "0.6.9", features = ["serde"] }
 event-emitter-rs = { version = "0.1.4", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
