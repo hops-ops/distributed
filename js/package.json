@@ -75,7 +75,7 @@
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "react-test-renderer": "19.3.0",
-    "svelte": "5.57.0",
+    "svelte": "5.57.1",
     "typescript": "5.9.3"
   },
   "engines": {
