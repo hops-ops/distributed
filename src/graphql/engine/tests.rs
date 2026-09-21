@@ -143,6 +143,70 @@ mod client_surface_parity_tests {
     }
 
     #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn protocol_surface_export_cache_is_engine_scoped_and_shared_by_engine_clones() {
+        let engine = Arc::new(protocol_engine("first-engine"));
+        let cloned = engine.clone();
+        let another = protocol_engine("second-engine");
+        let export = &engine.inner.protocol.as_ref().unwrap().roles["user"]
+            .surface
+            .export;
+        let cloned_export = &cloned.inner.protocol.as_ref().unwrap().roles["user"]
+            .surface
+            .export;
+        let other_export = &another.inner.protocol.as_ref().unwrap().roles["user"]
+            .surface
+            .export;
+        assert!(std::ptr::eq(
+            export.manifest_ref().unwrap(),
+            cloned_export.manifest_ref().unwrap()
+        ));
+        assert!(!std::ptr::eq(
+            export.manifest_ref().unwrap(),
+            other_export.manifest_ref().unwrap()
+        ));
+        let fresh = engine
+            .client_surface_for_role("user")
+            .unwrap()
+            .manifest()
+            .unwrap();
+        assert_eq!(export.manifest_ref().unwrap(), &fresh);
+        assert_eq!(other_export.manifest_ref().unwrap(), &fresh);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn repeated_protocol_accumulators_reuse_metadata_but_release_request_authority() {
+        use crate::graphql::identity::VerifiedPrincipal;
+        let engine = protocol_engine("request-cache-test");
+        let export = &engine.inner.protocol.as_ref().unwrap().roles["user"]
+            .surface
+            .export;
+        let owners = export.manifest_cache_owners();
+        let mut session = Session::new();
+        session.set("x-roles", "user");
+        let request = Request::new("{ __typename }").data(VerifiedPrincipal::test_oidc(
+            "https://issuer.example",
+            "principal-a",
+            &["orders-service"],
+        ));
+        let authority = resolve_execution_authority(&engine.inner, &session, &request).unwrap();
+        let first = engine
+            .protocol_accumulator(&authority, &session, &request)
+            .unwrap_or_else(|_| panic!("first request authority"))
+            .unwrap();
+        assert_eq!(export.manifest_cache_owners(), owners + 1);
+        let second = engine
+            .protocol_accumulator(&authority, &session, &request)
+            .unwrap_or_else(|_| panic!("second request authority"))
+            .unwrap();
+        assert_eq!(export.manifest_cache_owners(), owners + 2);
+        drop(first);
+        drop(second);
+        assert_eq!(export.manifest_cache_owners(), owners);
+    }
+
+    #[cfg(feature = "sqlite")]
     fn policy_protocol_engine(namespace: &str, claim_key: &str) -> GraphqlEngine {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect_lazy("sqlite::memory:")

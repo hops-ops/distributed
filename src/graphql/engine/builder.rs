@@ -836,7 +836,7 @@ impl GraphqlEngineBuilder {
                     .expect("protocol configuration validated a service ID");
                 let (authorization_fingerprint, claim_keys) =
                     role_authorization_info(role, &self.permissions)?;
-                let manifest = DistributedClientSurfaceExport::from_selected_with_execution(
+                let export = DistributedClientSurfaceExport::from_selected_with_execution(
                     service_id,
                     Arc::clone(&role_surface),
                     ClientExecutionLimits::from_runtime(
@@ -847,8 +847,12 @@ impl GraphqlEngineBuilder {
                     )
                     .map_err(|error| GraphqlBuildError(error.to_string()))?,
                 )
-                .and_then(|export| export.manifest())
                 .map_err(|error| {
+                    GraphqlBuildError(format!(
+                        "failed to derive GraphQL protocol surface for role `{role}`: {error}"
+                    ))
+                })?;
+                let manifest = export.manifest().map_err(|error| {
                     GraphqlBuildError(format!(
                         "failed to derive GraphQL protocol surface for role `{role}`: {error}"
                     ))
@@ -858,6 +862,7 @@ impl GraphqlEngineBuilder {
                     role.clone(),
                     ProtocolRoleInfo {
                         surface: ProtocolSurfaceInfo {
+                            export,
                             schema_fingerprint: manifest.schema_fingerprint,
                             protocol_fingerprint: manifest.protocol_fingerprint,
                             trusted_presets,
@@ -915,7 +920,7 @@ impl GraphqlEngineBuilder {
                     .service_id
                     .as_deref()
                     .expect("protocol configuration validated a service ID");
-                let manifest = DistributedClientSurfaceExport::from_selected_with_execution(
+                let export = DistributedClientSurfaceExport::from_selected_with_execution(
                     service_id,
                     Arc::clone(&application_surface),
                     ClientExecutionLimits::from_runtime(
@@ -926,7 +931,10 @@ impl GraphqlEngineBuilder {
                     )
                     .map_err(|error| GraphqlBuildError(error.to_string()))?,
                 )
-                .and_then(|export| export.manifest())
+                .map_err(|error| GraphqlBuildError(format!(
+                    "failed to derive GraphQL protocol surface for application `{application}`: {error}"
+                )))?;
+                let manifest = export.manifest()
                 .map_err(|error| {
                     GraphqlBuildError(format!(
                         "failed to derive GraphQL protocol surface for application `{application}`: {error}"
@@ -990,6 +998,7 @@ impl GraphqlEngineBuilder {
                         schema_roles: registration.schema_roles.clone(),
                         privilege_key,
                         surface: ProtocolSurfaceInfo {
+                            export,
                             schema_fingerprint: manifest.schema_fingerprint,
                             protocol_fingerprint: manifest.protocol_fingerprint,
                             trusted_presets,

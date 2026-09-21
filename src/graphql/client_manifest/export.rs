@@ -6,6 +6,9 @@ pub struct DistributedClientSurfaceExport {
     identity: ClientSurfaceIdentity,
     surface: Arc<Surface>,
     execution: ClientExecutionLimits,
+    // All inputs are immutable and private. Clones share only compiled metadata,
+    // never request authority, preset values, tokens or read results.
+    manifest: Arc<std::sync::OnceLock<Result<DistributedClientManifest, ClientManifestError>>>,
 }
 
 /// Do not transitively format the selected Surface: it retains a private full
@@ -32,6 +35,7 @@ impl DistributedClientSurfaceExport {
             identity,
             surface: surface.into(),
             execution,
+            manifest: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -116,16 +120,30 @@ impl DistributedClientSurfaceExport {
     }
 
     pub fn manifest(&self) -> Result<DistributedClientManifest, ClientManifestError> {
-        client_manifest_from_surface_with_execution(
-            &self.service_id,
-            self.identity.clone(),
-            &self.surface,
-            self.execution.clone(),
-        )
+        self.manifest_ref().cloned()
+    }
+
+    pub(crate) fn manifest_ref(&self) -> Result<&DistributedClientManifest, ClientManifestError> {
+        self.manifest
+            .get_or_init(|| {
+                client_manifest_from_surface_with_execution(
+                    &self.service_id,
+                    self.identity.clone(),
+                    &self.surface,
+                    self.execution.clone(),
+                )
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     pub fn service_id(&self) -> &str {
         &self.service_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manifest_cache_owners(&self) -> usize {
+        Arc::strong_count(&self.manifest)
     }
 
     pub fn identity(&self) -> &ClientSurfaceIdentity {

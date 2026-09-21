@@ -298,26 +298,9 @@ impl GraphqlEngine {
                 .get(&authority.privilege_role)
                 .cloned()
                 .ok_or(())?;
-            let selected_surface = match &surface_identity {
-                ClientSurfaceIdentity::Role { name } => self.inner.role_surfaces.get(name),
-                ClientSurfaceIdentity::Application { name, .. } => {
-                    self.inner.application_surfaces.get(name)
-                }
-            }
-            .cloned()
-            .ok_or(())?;
-            let export = DistributedClientSurfaceExport::from_selected_with_execution(
-                &runtime.service_id,
-                selected_surface,
-                ClientExecutionLimits::from_runtime(
-                    self.inner.max_depth,
-                    self.inner.max_complexity,
-                    self.inner.max_bool_width,
-                    self.inner.max_in_list,
-                )
-                .map_err(|_| ())?,
-            )
-            .map_err(|_| ())?;
+            // Selected by the verified authority above; this exact immutable
+            // export was validated when the engine's protocol surface was built.
+            let export = surface_info.export.clone();
             let issued_at_unix_ms = crate::time::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| ())?
