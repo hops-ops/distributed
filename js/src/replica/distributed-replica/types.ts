@@ -169,6 +169,7 @@ export type SharedIndexDisposition = {
 	readonly compared: boolean;
 	readonly disposition?: 'equal' | 'higher' | 'lower';
 	readonly indexRevision?: string;
+	readonly restartAfterRetirement?: boolean;
 };
 
 export type CapturedReplicaOptimisticOperation =
