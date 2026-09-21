@@ -2022,13 +2022,14 @@ test('snapshot live takes over a nested graph from a disposed page subscription'
 
 test('snapshot live keeps a stream started before disposal behind the retired owner', () => {
 	const observers = [];
+	const closed = [];
 	const previousPage = {
 		...FeaturedGamesWithOwner,
 		live: { id: 'live:featured-owner-before-disposal', document: 'subscription FeaturedOwnerBeforeDisposal { featuredGames { id owner { id name } } }' }
 	};
 	const replica = createDistributedReplica({ transport: {
 		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
-		subscribe(_request, observer) { observers.push(observer); return () => {}; }
+		subscribe(_request, observer) { observers.push(observer); return () => { closed.push(observer); }; }
 	} });
 	const oldFrame = (ownerName) => gamesFrame({
 		artifact: previousPage, responseKey: 'featuredGames', operation: previousPage.live.id,
@@ -2052,6 +2053,9 @@ test('snapshot live keeps a stream started before disposal behind the retired ow
 		live: { mode: 'snapshot', reset: true, cursors: [] }
 	}));
 	assert.deepEqual(current.get().data.games, []);
+	const layout = replica.watch(Todos, {}, { live: true });
+	observers[2].next(wireFrame({ operation: Todos.live.id, indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }, rows: [{ id: 'retained', title: 'layout' }] }));
 	oldWatch.destroy();
 	observers[1].next(gamesFrame({
 		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
@@ -2060,7 +2064,30 @@ test('snapshot live keeps a stream started before disposal behind the retired ow
 		live: { mode: 'snapshot', reset: true, cursors: [] }
 	}));
 	assert.deepEqual(current.get().data.games, []);
+	assert.equal(observers.length, 4, 'retired ownership must reopen only the contender after the disposal fence');
+	assert.deepEqual(closed, [observers[0], observers[1]]);
+	assert.equal(layout.get().live, 'active');
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '5',
+		ownerId: 'user-1', ownerName: 'queued old receiver', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(current.get().data.games, [], 'old receiver stays fenced after reopening');
+	observers[3].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '6',
+		ownerId: 'user-1', ownerName: 'fresh authoritative receiver', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.equal(current.get().data.games[0].owner.name, 'fresh authoritative receiver');
+	assert.equal(observers.length, 4, 'the same retirement boundary cannot reopen repeatedly');
+	observers[2].next(wireFrame({ operation: Todos.live.id, indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }, revision: '2', rows: [{ id: 'retained', title: 'continued layout' }] }));
+	assert.equal(layout.get().data.todos[0].title, 'continued layout');
 	current.destroy();
+	layout.destroy();
+	assert.deepEqual(closed, [observers[0], observers[1], observers[3], observers[2]]);
 });
 
 test('reopening a retired live owner restores its ownership fence', () => {
@@ -2195,6 +2222,7 @@ test('two watches retire shared live ownership only after final disposal', () =>
 		live: { mode: 'snapshot', reset: true, cursors: [] }
 	}));
 	assert.deepEqual(startedBeforeFinalRelease.get().data.games, []);
+	assert.equal(observers.length, 3, 'the final release enables one fresh contender receiver');
 	startedBeforeFinalRelease.destroy();
 
 	const afterFinalRelease = replica.watch(
@@ -2202,7 +2230,8 @@ test('two watches retire shared live ownership only after final disposal', () =>
 		{},
 		{ live: true }
 	);
-	observers[2].next(gamesFrame({
+	assert.equal(observers.length, 4, 'reopening after disposal creates another receiver');
+	observers[3].next(gamesFrame({
 		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
 		operation: GamesWithOwnerLiveOperation.live.id, position: '5',
 		ownerId: 'user-1', ownerName: 'after final release', indexesComparable: false,

@@ -1614,6 +1614,12 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			if (source !== 'live' && sourceSwitched) {
 				this.#restartLive(key);
 			}
+		if (source === 'live' && sharedDisposition.restartAfterRetirement) {
+			// This receiver began before a shared owner retired. Its buffered
+			// frame stays fenced, but a fresh receiver starts after that boundary
+			// and can obtain an authoritative replacement without polling.
+			this.#restartLive(key);
+		}
 			this.#trustedPresets = nextTrustedPresets;
 			this.#protocolGeneration = nextProtocolGeneration;
 		this.#resumeLiveWatches();
@@ -2327,6 +2333,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		let lower = false;
 		let higher = false;
 		let incomparable = false;
+		let restartAfterRetirement = false;
 		let equalRevision: string | undefined;
 		let latestOwnerRevision: string | undefined;
 		for (const [key, group] of this.#operationProtocols) {
@@ -2348,16 +2355,18 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					!snapshot.indexesComparable &&
 					state === group.live &&
 					state.retiredAtRevision !== undefined &&
-					liveStart !== undefined &&
-					compareCanonicalDecimalStrings(
-						liveStart,
-						state.retiredAtRevision
-					) > 0
+					liveStart !== undefined
 				) {
 					// A disposed stream is no longer an owner. Its boundary is
 					// still retained so a stream that started before disposal
 					// cannot win merely because the old transport later closed.
-					continue;
+					if (compareCanonicalDecimalStrings(liveStart, state.retiredAtRevision) > 0) {
+						continue;
+					}
+					// Reopen at most once per observed retirement boundary: the
+					// replacement's allocated start is strictly newer. Active
+					// siblings never trigger this recovery and remain fenced.
+					restartAfterRetirement = true;
 				}
 				latestOwnerRevision =
 					latestOwnerRevision === undefined ||
@@ -2429,7 +2438,11 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			 * explicit synchronous ingress retains its caller-defined order.
 			 */
 			if (requestRevision === undefined && source === 'live') {
-				return { compared: true, disposition: 'lower' };
+				return {
+					compared: true,
+					disposition: 'lower',
+					...(restartAfterRetirement ? { restartAfterRetirement: true } : {})
+				};
 			}
 			if (requestRevision === undefined) return { compared: false };
 			return latestOwnerRevision !== undefined &&
