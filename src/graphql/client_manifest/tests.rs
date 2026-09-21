@@ -755,6 +755,75 @@ fn manifest_for_all_models(
 }
 
 #[test]
+fn selected_export_cache_is_shared_concurrently_but_returned_manifests_are_independent() {
+    let full = full_surface();
+    let selected = surface_for_role(&full, "user", &grants()["user"]).unwrap();
+    let fresh = client_manifest_from_surface(
+        "todos-service",
+        ClientSurfaceIdentity::role("user"),
+        &selected,
+    )
+    .unwrap();
+    let export = DistributedClientSurfaceExport::from_selected("todos-service", selected).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let export = export.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let manifest = export.manifest_ref().unwrap();
+                (
+                    manifest as *const DistributedClientManifest as usize,
+                    manifest.clone(),
+                )
+            })
+        })
+        .collect();
+    let expected_address =
+        export.manifest_ref().unwrap() as *const DistributedClientManifest as usize;
+    for thread in threads {
+        let (address, manifest) = thread.join().unwrap();
+        assert_eq!(address, expected_address);
+        assert_eq!(manifest, fresh);
+    }
+    let mut detached = export.manifest().unwrap();
+    detached.models.clear();
+    detached.projection_programs.clear();
+    detached.schema_fingerprint.clear();
+    assert_eq!(export.manifest_ref().unwrap(), &fresh);
+    assert_eq!(export.clone().manifest().unwrap(), fresh);
+}
+
+#[test]
+fn selected_export_caches_do_not_alias_role_application_or_execution_limits() {
+    let full = full_surface();
+    let grants = grants();
+    let user = surface_for_role(&full, "user", &grants["user"]).unwrap();
+    let admin = surface_for_role(&full, "admin", &grants["admin"]).unwrap();
+    let application =
+        surface_for_application(&full, "web", &["user".into()], &["user".into()], &grants).unwrap();
+    let user_export =
+        DistributedClientSurfaceExport::from_selected("todos-service", user.clone()).unwrap();
+    let admin_export =
+        DistributedClientSurfaceExport::from_selected("todos-service", admin).unwrap();
+    let app_export =
+        DistributedClientSurfaceExport::from_selected("todos-service", application).unwrap();
+    let mut limits = ClientExecutionLimits::default();
+    limits.max_bool_width += 1;
+    let limited =
+        DistributedClientSurfaceExport::from_selected_with_execution("todos-service", user, limits)
+            .unwrap();
+    let baseline = user_export.manifest_ref().unwrap();
+    for other in [&admin_export, &app_export, &limited] {
+        let manifest = other.manifest_ref().unwrap();
+        assert!(!std::ptr::eq(baseline, manifest));
+        assert_ne!(baseline.schema_fingerprint, manifest.schema_fingerprint);
+    }
+    assert_ne!(user_export.identity(), app_export.identity());
+}
+
+#[test]
 fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
     let full = full_surface();
     let selected = surface_for_role(&full, "user", &grants()["user"]).unwrap();

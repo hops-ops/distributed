@@ -105,9 +105,9 @@ impl ProtocolProjectionRequestSeed {
             return Err(ProjectionRuntimeAuthorityError::InvalidAuthority);
         }
         let manifest = export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
-        let expected = crate::graphql::client_manifest::trusted_preset_descriptors(&manifest)
+        let expected = crate::graphql::client_manifest::trusted_preset_descriptors(manifest)
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         let mut preset_names = BTreeSet::new();
         if trusted_presets.len() != expected.len()
