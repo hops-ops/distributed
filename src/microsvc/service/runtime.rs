@@ -40,9 +40,7 @@ fn ensure_lifecycle_mutations_open() -> Result<(), HandlerError> {
     if crate::microsvc::lifecycle_mutations_open() {
         Ok(())
     } else {
-        Err(HandlerError::Rejected(
-            "application generation is reloading".into(),
-        ))
+        Err(HandlerError::ApplicationReloading)
     }
 }
 
@@ -1064,11 +1062,7 @@ impl Service {
         message: &Message,
         ordered: Option<&OrderedDelivery>,
     ) -> Result<Value, HandlerError> {
-        if !crate::microsvc::lifecycle_mutations_open() {
-            return Err(HandlerError::Rejected(
-                "application generation is reloading".into(),
-            ));
-        }
+        ensure_lifecycle_mutations_open()?;
         if !self.handles_message(message.kind, &message.name) {
             return Err(HandlerError::UnknownCommand(message.name.clone()));
         }
