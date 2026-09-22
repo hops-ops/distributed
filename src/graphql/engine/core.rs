@@ -170,6 +170,7 @@ pub(crate) struct RoleModelPerm {
 
 #[derive(Clone)]
 pub(crate) struct ProtocolSurfaceInfo {
+    pub(crate) export: DistributedClientSurfaceExport,
     pub(crate) schema_fingerprint: String,
     pub(crate) protocol_fingerprint: String,
     pub(crate) trusted_presets: Vec<ClientTrustedPresetDescriptor>,
