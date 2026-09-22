@@ -197,6 +197,7 @@ async fn command_handler(
 
 fn status_for_error(error: &HandlerError) -> StatusCode {
     match error {
+        HandlerError::ApplicationReloading => StatusCode::SERVICE_UNAVAILABLE,
         HandlerError::UnknownCommand(_) | HandlerError::NotFound(_) => StatusCode::NOT_FOUND,
         HandlerError::DecodeFailed(_) | HandlerError::GuardRejected(_) => StatusCode::BAD_REQUEST,
         HandlerError::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,

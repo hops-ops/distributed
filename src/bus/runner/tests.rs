@@ -208,6 +208,54 @@ fn run_with<I: Send>(
 
 // --- tests --------------------------------------------------------------
 #[test]
+fn application_reload_retains_exact_delivery_then_succeeds_after_activation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let recorder = Recorder::new();
+    let open = Arc::new(AtomicBool::new(false));
+    let gate = open.clone();
+    let effects = recorder.clone();
+    let router = Arc::new(
+        Handlers::new().on_event("reload", move |message: &Message| {
+            let admitted = gate.load(Ordering::SeqCst);
+            let effects = effects.clone();
+            let id = message.id().unwrap().to_owned();
+            async move {
+                if !admitted {
+                    return Err(crate::microsvc::HandlerError::ApplicationReloading.into());
+                }
+                effects.push(Event::Handled(id));
+                Ok(())
+            }
+        }),
+    );
+    let message = event_message("reload", Some("retained-event"));
+    let source = || FakeSource {
+        queue: vec![message.clone()].into_iter().collect(),
+        recorder: recorder.clone(),
+        settle_ok: true,
+        recv_error: false,
+        decode_error: false,
+    };
+    let error = block_on(run_source(
+        router.clone(),
+        source(),
+        RunOptions::idempotent(),
+    ))
+    .unwrap_err();
+    assert!(error.is_retryable());
+    assert!(error.should_retain_and_stop());
+    assert!(
+        matches!(recorder.events().as_slice(), [Event::Nack(reason)] if reason.contains("reloading"))
+    );
+    open.store(true, Ordering::SeqCst);
+    block_on(run_source(router, source(), RunOptions::idempotent())).unwrap();
+    assert_eq!(
+        &recorder.events()[1..],
+        &[Event::Handled("retained-event".into()), Event::Ack]
+    );
+}
+
+#[test]
 fn success_dispatches_then_acks_in_order() {
     let result = run(vec![event_message("ok", None)], RunOptions::idempotent());
     assert!(result.outcome.is_ok());
