@@ -47,3 +47,6 @@ export const replicaCommandProjectedLifecycle = Symbol(
 export const replicaCommandReadRecord = Symbol(
 	'distributed.replica.command-read-record'
 );
+
+/** @internal Generated dependency registration before dispatch/optimism. */
+export const replicaCommandFreshness = Symbol('distributed.replica.command-freshness');

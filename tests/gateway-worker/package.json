@@ -1,0 +1,1 @@
+{"name":"application-gateway-worker-fixture","private":true,"type":"module","scripts":{"build":"worker-build --dev","dev":"wrangler dev --local","test":"node run.mjs"},"devDependencies":{"wrangler":"4.129.0","ws":"8.21.3","miniflare":"5.20260903.0-alpha"}}

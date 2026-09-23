@@ -146,6 +146,7 @@ mod tests {
             foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: vec![RelationshipDef {
+                references: None,
                 field_name: "children".into(),
                 kind: RelationshipKind::HasMany,
                 target_model: "Child".into(),
@@ -175,6 +176,7 @@ mod tests {
             foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: vec![RelationshipDef {
+                references: None,
                 field_name: "grandchildren".into(),
                 kind: RelationshipKind::HasMany,
                 target_model: "Grandchild".into(),

@@ -13,6 +13,22 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
+    #[cfg(feature = "graphql")]
+    async fn projection_rebuild_records(
+        &self,
+        context: &crate::projection::rebuild::RebuildContext,
+    ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
+        self.snapshot_rebuild_records(context).await
+    }
+
+    #[cfg(feature = "graphql")]
+    async fn commit_projection_rebuild(
+        &self,
+        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> Result<usize, ProjectionProtocolError> {
+        self.apply_snapshot_rebuild(plan).await
+    }
+
     fn register_projection_models<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
@@ -410,6 +426,11 @@ where
                     &mutation.expectation,
                     mutation.kind,
                     current.as_ref(),
+                    mutation.source_snapshot.is_some(),
+                )?;
+                crate::projection_protocol::validate_snapshot_write(
+                    current.as_ref().map(|record| &record.metadata),
+                    mutation.source_snapshot.as_ref(),
                 )?;
                 let change = allocate_change(
                     &mut state,
@@ -421,11 +442,13 @@ where
                     Some(mutation.scope.clone()),
                     Some(revision.clone()),
                     None,
+                    program_id_for_model(&batch.ownership, mutation.scope.model()),
                 )?;
                 let metadata = ProjectionRecordMetadata {
                     revision,
                     tombstone,
                     change: change.cursor.clone(),
+                    source_snapshot: mutation.source_snapshot.clone(),
                 };
                 records_by_scope.insert(mutation.scope.clone(), metadata.clone());
                 records.push(metadata);
@@ -469,7 +492,7 @@ where
                                 actual_revision: metadata.revision.revision(),
                             });
                         }
-                        if metadata.tombstone {
+                        if metadata.tombstone && metadata.source_snapshot.is_none() {
                             return Err(ProjectionProtocolError::RecordTombstoned {
                                 model: expected.scope().model().to_string(),
                             });
@@ -508,17 +531,20 @@ where
                         Some(scope.clone()),
                         revision.clone(),
                         None,
+                        program_id_for_model(&batch.ownership, scope.model()),
                     )?;
                     let cursor = change.cursor.clone();
                     changes.push(change);
                     cursor
                 };
+                let program_id = program_id_for_model(&batch.ownership, scope.model());
                 observations.push(ProjectionObservation {
                     causation_id: batch.input.causation_id.clone(),
                     kind: request.kind,
                     revision,
                     scope,
                     change: change_cursor,
+                    program_id,
                 });
             }
 
@@ -529,6 +555,7 @@ where
                     &partition,
                     ProjectionChangeKind::Checkpoint,
                     batch.input.causation_id.clone(),
+                    None,
                     None,
                     None,
                     None,
@@ -700,6 +727,7 @@ where
                 None,
                 None,
                 Some(batch.failure_id.clone()),
+                None,
             )?;
             insert_change_in_tx(&mut tx, &change).await?;
             insert_failure_in_tx(&mut tx, &batch, &change.cursor).await?;

@@ -1,6 +1,22 @@
 use super::*;
 
 impl ProjectionProtocolStore for InMemoryRepository {
+    #[cfg(feature = "graphql")]
+    async fn projection_rebuild_records(
+        &self,
+        context: &crate::projection::rebuild::RebuildContext,
+    ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
+        self.snapshot_rebuild_records(context).await
+    }
+
+    #[cfg(feature = "graphql")]
+    async fn commit_projection_rebuild(
+        &self,
+        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> Result<usize, ProjectionProtocolError> {
+        self.apply_snapshot_rebuild(plan).await
+    }
+
     fn register_projection_models<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
@@ -179,6 +195,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     &mutation.scope,
                     &mutation.expectation,
                     mutation.kind,
+                    mutation.source_snapshot.is_some(),
+                )?;
+                crate::projection_protocol::validate_snapshot_write(
+                    staged_protocol.records.get(&mutation.scope),
+                    mutation.source_snapshot.as_ref(),
                 )?;
                 staged_protocol.validate_physical_record(
                     &mutation.scope,
@@ -195,12 +216,18 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         scope: Some(mutation.scope.clone()),
                         revision: Some(revision.clone()),
                         failure_id: None,
+                        program_id: batch
+                            .ownership
+                            .iter()
+                            .find(|ownership| ownership.model == mutation.scope.model())
+                            .and_then(|ownership| ownership.program_id),
                     },
                 )?;
                 let metadata = ProjectionRecordMetadata {
                     revision,
                     tombstone,
                     change: change.cursor.clone(),
+                    source_snapshot: mutation.source_snapshot.clone(),
                 };
                 staged_protocol.ensure_live_record_identity_available(&metadata)?;
                 staged_protocol
@@ -276,6 +303,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 if staged_protocol.observations.contains_key(&observation_key) {
                     continue;
                 }
+                let program_id = batch
+                    .ownership
+                    .iter()
+                    .find(|ownership| ownership.model == scope.model())
+                    .and_then(|ownership| ownership.program_id);
                 let change_cursor = match staged_change {
                     Some(cursor) => cursor,
                     None => {
@@ -288,6 +320,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                                 scope: Some(scope.clone()),
                                 revision: revision.clone(),
                                 failure_id: None,
+                                program_id,
                             },
                         )?;
                         let cursor = change.cursor.clone();
@@ -301,6 +334,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     revision,
                     scope,
                     change: change_cursor,
+                    program_id,
                 };
                 staged_protocol
                     .observations
@@ -317,6 +351,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         scope: None,
                         revision: None,
                         failure_id: None,
+                        program_id: None,
                     },
                 )?);
             }
@@ -492,6 +527,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     scope: None,
                     revision: None,
                     failure_id: Some(batch.failure_id.clone()),
+                    program_id: None,
                 },
             )?;
             let failure = ProjectionFailure {

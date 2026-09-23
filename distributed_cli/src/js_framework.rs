@@ -182,9 +182,7 @@ impl JavascriptFrameworkPackage {
 
     pub(crate) fn wasm_pack_launcher(&self, ui_root: &Path) -> PathBuf {
         match &self.source {
-            JavascriptPackageSource::Local { root } => {
-                root.join("node_modules/wasm-pack/run.js")
-            }
+            JavascriptPackageSource::Local { root } => root.join("node_modules/wasm-pack/run.js"),
             JavascriptPackageSource::Registry => ui_root.join("node_modules/wasm-pack/run.js"),
         }
     }

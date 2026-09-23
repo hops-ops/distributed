@@ -184,7 +184,17 @@ fn client_type(definition: &SurfaceTypeDef) -> Result<ClientTypeDef, ClientManif
             .map(client_type)
             .transpose()?
             .map(Box::new);
-        let codec = scalar_codec(&field.type_name).map(str::to_string);
+        if field.unsigned_integer.is_some() && (field.type_name != "BigInt" || nested.is_some()) {
+            return Err(ClientManifestError(format!(
+                "command type `{}` field `{}` has an invalid unsigned refinement",
+                definition.name, field.name
+            )));
+        }
+        let codec = field
+            .unsigned_integer
+            .map(|unsigned| unsigned.client_codec())
+            .or_else(|| scalar_codec(&field.type_name))
+            .map(str::to_string);
         if codec.is_none() && nested.is_none() {
             return Err(ClientManifestError(format!(
                 "command type `{}` field `{}` uses unknown scalar/object `{}`",
@@ -259,6 +269,7 @@ pub(super) fn protocol_fingerprint() -> Result<String, ClientManifestError> {
         projection_binding_version: u32,
         projection_operation_semantics_version: u32,
         command_projection_extension_version: u32,
+        unsigned_command_codecs_version: u32,
         scalar_codecs: Vec<ScalarCodec>,
     }
     hash_json(&ProtocolMaterial {
@@ -275,6 +286,7 @@ pub(super) fn protocol_fingerprint() -> Result<String, ClientManifestError> {
             super::projections::CLIENT_PROJECTION_OPERATION_SEMANTICS_VERSION,
         command_projection_extension_version:
             super::projections::COMMAND_PROJECTION_EXTENSION_VERSION,
+        unsigned_command_codecs_version: 1,
         scalar_codecs: supported_scalar_codecs(),
     })
 }

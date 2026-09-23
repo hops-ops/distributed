@@ -5,11 +5,15 @@ use distributed::microsvc::{Routes, Service};
 use super::{handlers, CheckoutRepo};
 
 pub fn service(repo: CheckoutRepo) -> Arc<Service> {
-    Arc::new(Service::new().with_http_command_routes().routes(distributed::routes!(
-        Routes::new().with_repo(repo),
-        command handlers::start,
-        event handlers::record_seat_reserved,
-    )))
+    Arc::new(
+        Service::new()
+            .with_http_command_routes()
+            .routes(distributed::routes!(
+                Routes::new().with_repo(repo),
+                command handlers::start,
+                event handlers::record_seat_reserved,
+            )),
+    )
 }
 
 #[cfg(feature = "http")]

@@ -8,12 +8,13 @@
 
 use serde_json::{json, Value};
 
-use distributed::bus::{Bus, InMemoryBus, RunOptions};
+use distributed::bus::{Bus, BusConsumer, Handlers, InMemoryBus, Message, RunOptions};
 use distributed::microsvc::{Context, HandlerError, HasOutboxStore, Routes, Service, Session};
 use distributed::{
     sourced, AggregateBuilder, AggregateRepository, Entity, OutboxMessage, OutboxMessageStatus,
     OutboxStore, Queueable, QueuedRepository, SqliteRepository,
 };
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct Counter {
@@ -49,16 +50,19 @@ async fn service() -> Repo {
         .aggregate::<Counter>()
 }
 
-async fn wait_until_published(store: &impl OutboxStore, count: usize) {
+async fn assert_published_and_drained(store: &impl OutboxStore, bus: &InMemoryBus) {
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            if store
-                .messages_by_status(OutboxMessageStatus::Published, usize::MAX)
-                .await
-                .unwrap()
-                .len()
-                >= count
-            {
+            let mut remaining = 0;
+            for status in [
+                OutboxMessageStatus::Pending,
+                OutboxMessageStatus::InFlight,
+                OutboxMessageStatus::Failed,
+                OutboxMessageStatus::Published,
+            ] {
+                remaining += store.messages_by_status(status, 8).await.unwrap().len();
+            }
+            if remaining == 0 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -66,10 +70,24 @@ async fn wait_until_published(store: &impl OutboxStore, count: usize) {
     })
     .await
     .expect("immediate publish should settle outbox rows");
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let record = delivered.clone();
+    let handlers = Handlers::new().on_event("counter.touched", move |message: &Message| {
+        record
+            .lock()
+            .unwrap()
+            .push(message.id().unwrap().to_string());
+        async { Ok(()) }
+    });
+    bus.subscribe(Arc::new(handlers), RunOptions::idempotent())
+        .await
+        .unwrap();
+    assert_eq!(*delivered.lock().unwrap(), vec!["evt-c1".to_string()]);
 }
 
 #[tokio::test]
 async fn commit_publishes_immediately_over_sqlite() {
+    let bus = InMemoryBus::new();
     let repo = service().await;
     let store = repo.outbox_store();
     let service = Service::new()
@@ -79,7 +97,7 @@ async fn commit_publishes_immediately_over_sqlite() {
                 .command("counter.touch")
                 .handle(handle_touch),
         )
-        .with_bus(InMemoryBus::new());
+        .with_bus(bus.clone());
 
     // Command completion returns at durable commit; the bounded worker
     // claims the pending row and publishes it.
@@ -88,13 +106,7 @@ async fn commit_publishes_immediately_over_sqlite() {
         .await
         .unwrap();
 
-    wait_until_published(&store, 1).await;
-    let published = store
-        .messages_by_status(OutboxMessageStatus::Published, usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(published.len(), 1, "row should be published immediately");
-    assert_eq!(published[0].id(), "evt-c1");
+    assert_published_and_drained(&store, &bus).await;
     assert!(
         store.pending(usize::MAX).await.unwrap().is_empty(),
         "nothing should be left for the poller"
@@ -120,11 +132,5 @@ async fn run_consumes_command_and_publishes_over_sqlite() {
     bus.send("counter.touch", b"{}".to_vec()).await.unwrap();
     service.run(RunOptions::idempotent()).await.unwrap();
 
-    wait_until_published(&store, 1).await;
-    let published = store
-        .messages_by_status(OutboxMessageStatus::Published, usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].id(), "evt-c1");
+    assert_published_and_drained(&store, &bus).await;
 }

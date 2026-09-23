@@ -1,0 +1,83 @@
+{
+  "sdl": "scalar BigInt\nscalar Bytea\nscalar JSON\nscalar Timestamptz\n\nenum order_by {\n  asc\n  asc_nulls_first\n  asc_nulls_last\n  desc\n  desc_nulls_first\n  desc_nulls_last\n}\n\ninput ContractInput {\n  count: BigInt!\n  nested: [NestedInput]\n  recordId: String!\n}\n\ninput NestedInput {\n  enabled: Boolean!\n}\n\ntype ContractOutput {\n  record_id: String!\n  value: Float!\n}\n\nenum DistributedCommandState {\n  in_progress\n  succeeded\n  succeeded_pending_projection\n  atomic\n  rejected\n  projection_failed\n  expired\n  unknown\n}\n\ntype DistributedCommandStatus {\n  state: DistributedCommandState!\n}\n\ntype Query {\n  commandStatus(commandId: ID!): DistributedCommandStatus!\n}\n\ntype Mutation {\n  run_contract(commandId: ID!, input: ContractInput!): ContractOutput!\n}\n",
+  "spec": {
+    "applies": [],
+    "confirmations": [],
+    "consistency": "succeeded",
+    "defaults": [],
+    "effects": {
+      "fallback": "revalidate",
+      "operations": []
+    },
+    "emits": [],
+    "field_name": "run_contract",
+    "fingerprint": "sha256:ed43f086c62a1878472679415e0155e78a707921aa248a67416a49d5c97a39eb",
+    "id": "contract.test",
+    "input": {
+      "fields": [
+        {
+          "item_nullable": false,
+          "list": false,
+          "name": "recordId",
+          "nullable": false,
+          "type_name": "String"
+        },
+        {
+          "item_nullable": false,
+          "list": false,
+          "name": "count",
+          "nullable": false,
+          "type_name": "BigInt"
+        },
+        {
+          "item_nullable": true,
+          "list": true,
+          "name": "nested",
+          "nested": {
+            "fields": [
+              {
+                "item_nullable": false,
+                "list": false,
+                "name": "enabled",
+                "nullable": false,
+                "type_name": "Boolean"
+              }
+            ],
+            "name": "NestedInput"
+          },
+          "nullable": true,
+          "type_name": "NestedInput"
+        }
+      ],
+      "name": "ContractInput"
+    },
+    "output": {
+      "fields": [
+        {
+          "item_nullable": false,
+          "list": false,
+          "name": "record_id",
+          "nullable": false,
+          "type_name": "String"
+        },
+        {
+          "item_nullable": false,
+          "list": false,
+          "name": "value",
+          "nullable": false,
+          "type_name": "Float"
+        }
+      ],
+      "name": "ContractOutput"
+    },
+    "projection_contract": {
+      "declaration_errors": [],
+      "previews": [],
+      "pure_reduces": [],
+      "selectors": []
+    },
+    "roles": [
+      "user"
+    ]
+  }
+}

@@ -50,6 +50,34 @@ pub(crate) fn build_graphql_engine_with_graphiql(
     change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
     graphiql: bool,
 ) -> Result<GraphqlEngine, String> {
+    build_engine(pool, service, identity, change_rx, graphiql, None)
+}
+
+pub(crate) fn build_graphql_engine_with_delivery(
+    pool: impl Into<GraphqlPoolSource>,
+    service: &Service,
+    identity: IdentityConfig,
+    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
+    versions: Option<distributed::graphql::delivery::GatewayVersionStore>,
+) -> Result<GraphqlEngine, String> {
+    build_engine(
+        pool,
+        service,
+        identity,
+        change_rx,
+        graphiql_enabled(),
+        versions,
+    )
+}
+
+fn build_engine(
+    pool: impl Into<GraphqlPoolSource>,
+    service: &Service,
+    identity: IdentityConfig,
+    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
+    graphiql: bool,
+    versions: Option<distributed::graphql::delivery::GatewayVersionStore>,
+) -> Result<GraphqlEngine, String> {
     let projections = projections::projection_owners();
     let mut b = GraphqlEngine::builder(pool)
         .protocol_token_key(E2E_PROTOCOL_TOKEN_KEY)
@@ -79,6 +107,9 @@ pub(crate) fn build_graphql_engine_with_graphiql(
         .graphiql(graphiql);
     if let Some(rx) = change_rx {
         b = b.change_stream(rx);
+    }
+    if let Some(versions) = versions {
+        b = b.gateway_versions(versions);
     }
     b.build().map_err(|e| e.to_string())
 }

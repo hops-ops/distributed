@@ -688,8 +688,9 @@ impl<B: SqlBusDialect> MessageSource for SqlLogSource<B> {
                     ),
                 )
             })?;
-            let source = ProjectionSource::new(format!("{}.bus_log", B::BACKEND), b"global".to_vec())
-                .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
+            let source =
+                ProjectionSource::new(format!("{}.bus_log", B::BACKEND), b"global".to_vec())
+                    .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
             let ordered = OrderedDelivery::new(source, self.source_epoch.clone(), position, false)
                 .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
             self.last_delivered = Some(row.seq);

@@ -45,12 +45,15 @@ impl MessagePublisher for SelectivePublisher {
 
 async fn spawn_http_service(name: &str) -> String {
     let service = Arc::new(
-        Service::new().named(name).with_http_command_routes().routes(
-            Routes::new()
-                .with_dependencies(())
-                .command("orders.create")
-                .handle(|_ctx: &Context<()>| async move { Ok(json!({"ok": true})) }),
-        ),
+        Service::new()
+            .named(name)
+            .with_http_command_routes()
+            .routes(
+                Routes::new()
+                    .with_dependencies(())
+                    .command("orders.create")
+                    .handle(|_ctx: &Context<()>| async move { Ok(json!({"ok": true})) }),
+            ),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -19,7 +19,9 @@ API_PORT     ?= 8791
 BASE_URL     ?= http://127.0.0.1:8791
 UI_PORT      ?= 5180
 # localhost required for Auth.js cookies over HTTP (SvelteKit Secure default)
-UI_URL       ?= http://localhost:5180
+PUBLIC_ORIGIN ?= http://localhost:8791
+UI_INTERNAL_ORIGIN ?= http://localhost:$(UI_PORT)
+UI_URL       ?= $(PUBLIC_ORIGIN)
 UI_HOST      ?= localhost
 ENV_FILE     ?= e2e-ui.env
 NPM          ?= npm
@@ -56,7 +58,8 @@ down:
 ## Coherent application build + actual API/UI supervision.
 ## Vite still owns Svelte, CSS, and GraphQL hot updates.
 run:
-	cargo run --quiet --manifest-path ../../Cargo.toml -p distributed_cli --bin distributed -- dev .
+	@if [ -f $(ENV_FILE) ]; then set -a; . ./$(ENV_FILE); set +a; fi; \
+	PUBLIC_ORIGIN="$${PUBLIC_ORIGIN:-$(PUBLIC_ORIGIN)}" UI_URL="$${PUBLIC_ORIGIN:-$(PUBLIC_ORIGIN)}" UI_INTERNAL_ORIGIN="$${UI_INTERNAL_ORIGIN:-$(UI_INTERNAL_ORIGIN)}" cargo run --quiet --manifest-path ../../Cargo.toml -p distributed_cli --bin distributed -- dev .
 
 run-api:
 	@if [ -f $(ENV_FILE) ]; then set -a; . ./$(ENV_FILE); set +a; fi; \

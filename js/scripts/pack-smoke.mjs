@@ -82,6 +82,7 @@ function inspectPackageContract(packageJson) {
 		'./package.json',
 		'./react',
 		'./replica',
+		'./replica/lazy',
 		'./sveltekit',
 		'./sveltekit/vite'
 	]);
@@ -275,6 +276,8 @@ void [
 const consumerRuntimeSource = `
 import assert from 'node:assert/strict';
 import * as rootSurface from '@hops-ops/distributed';
+import * as lazySurface from '@hops-ops/distributed/replica/lazy';
+assert.deepEqual(Object.keys(lazySurface), ['createLazyReplicaCommandRuntime']);
 import * as replicaSurface from '@hops-ops/distributed/replica';
 import * as diagnosticsSurface from '@hops-ops/distributed/diagnostics';
 import {

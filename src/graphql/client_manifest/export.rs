@@ -63,13 +63,11 @@ impl DistributedClientSurfaceExport {
                 name,
                 eligible_roles,
                 schema_roles,
-            } => {
-                ClientSurfaceIdentity::application_with_schema_roles(
-                    name,
-                    eligible_roles.clone(),
-                    schema_roles.clone(),
-                )
-            }
+            } => ClientSurfaceIdentity::application_with_schema_roles(
+                name,
+                eligible_roles.clone(),
+                schema_roles.clone(),
+            ),
         };
         validate_service_provenance(&service_id, &surface)?;
         Ok(Self::new(service_id, identity, surface, execution))
@@ -98,13 +96,11 @@ impl DistributedClientSurfaceExport {
                 name,
                 eligible_roles,
                 schema_roles,
-            } => {
-                ClientSurfaceIdentity::application_with_schema_roles(
-                    name,
-                    eligible_roles.clone(),
-                    schema_roles.clone(),
-                )
-            }
+            } => ClientSurfaceIdentity::application_with_schema_roles(
+                name,
+                eligible_roles.clone(),
+                schema_roles.clone(),
+            ),
         };
         if surface.service_binding.is_some() {
             return Err(ClientManifestError(
@@ -175,17 +171,15 @@ pub fn prune_client_manifest(
             )));
         }
     }
-    manifest.models.retain(|model| {
-        allowed.contains(&model.id) || allowed.contains(&model.typename)
-    });
+    manifest
+        .models
+        .retain(|model| allowed.contains(&model.id) || allowed.contains(&model.typename));
     let kept: BTreeSet<String> = manifest
         .models
         .iter()
         .flat_map(|model| [model.id.clone(), model.typename.clone()])
         .collect();
-    manifest
-        .roots
-        .retain(|root| kept.contains(&root.model));
+    manifest.roots.retain(|root| kept.contains(&root.model));
     for projector in &mut manifest.projectors {
         projector.models.retain(|model| kept.contains(model));
     }
@@ -194,19 +188,22 @@ pub fn prune_client_manifest(
         .retain(|projector| !projector.models.is_empty());
     for program in &mut manifest.projection_programs {
         for arm in &mut program.arms {
-            arm.operations.retain(|operation| kept.contains(&operation.model));
+            arm.operations
+                .retain(|operation| kept.contains(&operation.model));
             for operation in &mut arm.operations {
                 operation.relationships.retain(|rel| {
                     kept.contains(&rel.source_model) && kept.contains(&rel.target_model)
                 });
-                operation.invalidations.retain(|invalidation| match invalidation {
-                    ClientProjectionInvalidation::Model { model } => kept.contains(model),
-                    ClientProjectionInvalidation::Relationship {
-                        source_model,
-                        target_model,
-                        ..
-                    } => kept.contains(source_model) && kept.contains(target_model),
-                });
+                operation
+                    .invalidations
+                    .retain(|invalidation| match invalidation {
+                        ClientProjectionInvalidation::Model { model } => kept.contains(model),
+                        ClientProjectionInvalidation::Relationship {
+                            source_model,
+                            target_model,
+                            ..
+                        } => kept.contains(source_model) && kept.contains(target_model),
+                    });
             }
         }
         program.arms.retain(|arm| !arm.operations.is_empty());

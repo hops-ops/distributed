@@ -29,6 +29,103 @@ fn nats_url() -> Option<String> {
 }
 
 #[tokio::test]
+async fn derived_facts_round_trip_after_interrupted_publish_prefix() {
+    let Some(url) = nats_url() else { return };
+    #[derive(serde::Serialize, distributed::DomainEvent)]
+    #[domain_event(name = "document.indexed", version = 1)]
+    struct Indexed {
+        document_id: String,
+        words: u64,
+    }
+    let mut entity = distributed::Entity::with_id("document-1");
+    entity.set_causation_id("0190a000-0000-7000-8000-000000000094");
+    entity.digest("document.uploaded", &()).unwrap();
+    entity
+        .capture_domain_event(
+            "document",
+            &Indexed {
+                document_id: "one".into(),
+                words: 0,
+            },
+        )
+        .unwrap();
+    let parent = entity.pending_domain_events()[0].clone();
+    let outputs = || {
+        ["one", "two"].map(|key| {
+            parent
+                .derive(
+                    "indexer",
+                    key,
+                    &Indexed {
+                        document_id: key.into(),
+                        words: 10,
+                    },
+                )
+                .unwrap()
+        })
+    };
+    let initial = outputs();
+    let retry = outputs();
+    assert_eq!(initial, retry);
+    let subject = unique("derived.document.indexed");
+    let source = NatsJetStreamSource::connect(
+        &url,
+        &unique("STREAM"),
+        vec![subject.clone()],
+        &unique("consumer"),
+    )
+    .await
+    .unwrap()
+    .with_fetch_timeout(Duration::from_millis(800));
+    let publisher = NatsPublisher::connect(&url).await.unwrap();
+    // Simulate stopping after one accepted output. A new attempt regenerates
+    // both facts; JetStream receives the repeated stable message ID.
+    for output in [&initial[0], &retry[0], &retry[1]] {
+        publisher
+            .publish(
+                Message::new(
+                    &subject,
+                    MessageKind::Event,
+                    output.canonical_bytes().unwrap(),
+                )
+                .with_id(output.id())
+                .with_metadata(
+                    distributed::trace_context::CAUSATION_ID,
+                    output.causation_id().unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let service = Arc::new(
+        Service::new().routes(
+            Routes::new()
+                .with_dependencies(())
+                .event(Box::leak(subject.into_boxed_str()))
+                .handle(move |ctx: &Context<()>| {
+                    let decoded = distributed::DomainEventOccurrence::from_canonical_bytes(
+                        ctx.message().payload(),
+                    )
+                    .unwrap();
+                    assert_eq!(ctx.message().id(), Some(decoded.id()));
+                    assert_eq!(ctx.message().causation_id(), decoded.causation_id());
+                    captured.lock().unwrap().push(decoded);
+                    async { Ok(json!({})) }
+                }),
+        ),
+    );
+    run_source(service, source, RunOptions::idempotent())
+        .await
+        .unwrap();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "broker deduplicates the accepted prefix");
+    assert_eq!(seen[0], initial[0]);
+    assert_eq!(seen[1], initial[1]);
+}
+
+#[tokio::test]
 async fn publish_then_consume_round_trips_through_jetstream() {
     let Some(url) = nats_url() else { return };
     let subject = unique("order.initialized");
@@ -105,6 +202,8 @@ async fn message_id_and_metadata_survive_the_round_trip() {
             TRACEPARENT,
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
         );
+    let mut message = message;
+    message.content_type = "application/vnd.example+binary".into();
     publisher.publish(message).await.expect("publish");
 
     let observed = Arc::new(Mutex::new(None));
@@ -121,6 +220,7 @@ async fn message_id_and_metadata_survive_the_round_trip() {
                         m.correlation_id().map(str::to_string),
                         m.traceparent().map(str::to_string),
                         m.payload().to_vec(),
+                        m.content_type.clone(),
                     ));
                     *o.lock().unwrap() = recorded;
                     async move { Ok(json!({})) }
@@ -139,6 +239,7 @@ async fn message_id_and_metadata_survive_the_round_trip() {
         Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
     );
     assert_eq!(got.3, br#"{"k":"v"}"#.to_vec());
+    assert_eq!(got.4, "application/vnd.example+binary");
 }
 
 /// Build a namespaced `NatsBus` for `group` (empty `group` = no group), with

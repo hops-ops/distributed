@@ -68,6 +68,37 @@ struct DirectTableView {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+struct DirectTableReference {
+    #[id]
+    reference_id: String,
+    target_tenant: String,
+    target_slug: Option<String>,
+    #[readmodel(
+        belongs_to = "DirectTableView",
+        foreign_key = "target_tenant,target_slug",
+        references = "tenant_id,slug"
+    )]
+    target: Option<DirectTableView>,
+}
+
+#[test]
+fn authored_candidate_key_relationship_preserves_surrogate_identity() {
+    let source = DirectTableReference::schema();
+    let target = DirectTableView::schema();
+    let relation = &source.relationships[0];
+    assert_eq!(relation.references.as_deref(), Some("tenant_id,slug"));
+    assert_eq!(target.primary_key.columns, ["direct_id"]);
+    let pairs = distributed::table::resolve_direct_join_keys(source, relation, target).unwrap();
+    assert_eq!(
+        pairs,
+        vec![
+            distributed::table::DirectJoinPair::new("target_tenant", "tenant_id"),
+            distributed::table::DirectJoinPair::new("target_slug", "slug"),
+        ]
+    );
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("binary_assets")]
 struct BinaryAsset {
     #[id("asset_id")]

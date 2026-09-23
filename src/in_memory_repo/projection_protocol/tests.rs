@@ -116,6 +116,7 @@ fn graph_parent_schema() -> &'static TableSchema {
         indexes: Vec::new(),
         relationships: vec![
             RelationshipDef {
+                references: None,
                 field_name: "children".into(),
                 kind: RelationshipKind::HasMany,
                 target_model: "GraphChildView".into(),
@@ -124,6 +125,7 @@ fn graph_parent_schema() -> &'static TableSchema {
                 target_foreign_key: None,
             },
             RelationshipDef {
+                references: None,
                 field_name: "featured_children".into(),
                 kind: RelationshipKind::HasMany,
                 target_model: "GraphChildView".into(),
@@ -253,6 +255,146 @@ fn graph_snapshot_request(max_unique: usize) -> ProjectionGraphSnapshotRequest {
         max_unique,
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn graph_snapshots_follow_composite_candidate_keys_and_keep_pk_scopes() {
+    let mut parent = graph_parent_schema().clone();
+    parent.relationships.truncate(1);
+    parent.relationships[0].foreign_key = Some("tenant,key".into());
+    parent.relationships[0].references = Some("tenant,key".into());
+    let mut child = graph_child_schema().clone();
+    child.relationships.push(RelationshipDef {
+        field_name: "parent".into(),
+        kind: RelationshipKind::BelongsTo,
+        target_model: parent.model_name.clone(),
+        foreign_key: Some("tenant,key".into()),
+        references: Some("tenant,key".into()),
+        through: None,
+        target_foreign_key: None,
+    });
+    for schema in [&mut parent, &mut child] {
+        schema
+            .columns
+            .push(TableColumn::new("tenant", "tenant", ColumnType::Text));
+        schema.columns.push(TableColumn {
+            nullable: true,
+            ..TableColumn::new("key", "key", ColumnType::Text)
+        });
+    }
+    parent.indexes.push(crate::table::TableIndex {
+        name: None,
+        columns: vec!["tenant".into(), "key".into()],
+        unique: true,
+    });
+    let parent: &'static TableSchema = Box::leak(Box::new(parent));
+    let child: &'static TableSchema = Box::leak(Box::new(child));
+    let codec = ProjectionScopeCodec::with_models(
+        topology(),
+        [
+            (parent.model_name.as_str(), parent),
+            (child.model_name.as_str(), child),
+        ],
+    )
+    .unwrap();
+    let key = |id: &str| RowKey::new([("id", RowValue::String(id.into()))]);
+    let mutation =
+        |schema: &'static TableSchema, id: &str, tenant: &str, candidate: Option<&str>| {
+            let row_key = key(id);
+            let mut values = RowValues::new();
+            values.insert("id", RowValue::String(id.into()));
+            values.insert("parent_id", RowValue::String("unused".into()));
+            values.insert("tenant", RowValue::String(tenant.into()));
+            values.insert(
+                "key",
+                candidate
+                    .map(|v| RowValue::String(v.into()))
+                    .unwrap_or(RowValue::Null),
+            );
+            ProjectionRecordMutation::new(
+                codec
+                    .encode_row_scope_in_partition(&schema.model_name, partition(), &row_key)
+                    .unwrap(),
+                TableMutation::UpsertRow(TableRowMutation {
+                    schema,
+                    key: row_key,
+                    values,
+                    expected_version: ExpectedVersion::Any,
+                    mode: RowWriteMode::Upsert,
+                }),
+                ProjectionRecordExpectation::Missing,
+                ProjectionMutationKind::Upsert,
+            )
+            .unwrap()
+        };
+    let repository = InMemoryRepository::new();
+    repository
+        .register_projection_models(&topology(), &graph_ownership())
+        .await
+        .unwrap();
+    repository
+        .commit_projection(ProjectionCommitBatch {
+            input: input(
+                1,
+                b"candidate-graph",
+                "candidate-message",
+                "candidate-cause",
+                ProjectionGeneration::initial(),
+            ),
+            change_epoch: change_epoch(),
+            ownership: graph_ownership(),
+            observations: vec![],
+            mutations: vec![
+                mutation(parent, "opaque-a", "a", Some("same")),
+                mutation(parent, "opaque-b", "b", Some("same")),
+                mutation(parent, "null-target", "a", None),
+                mutation(child, "source", "a", Some("same")),
+                mutation(child, "null-source", "a", None),
+            ],
+        })
+        .await
+        .unwrap();
+    for (schema, id, field, target, expected) in [
+        (child, "source", "parent", parent, Some("opaque-a")),
+        (parent, "opaque-a", "children", child, Some("source")),
+        (parent, "opaque-b", "children", child, None),
+        (child, "null-source", "parent", parent, None),
+        (parent, "null-target", "children", child, None),
+    ] {
+        let root = ProjectionQuerySnapshotRequest::new(
+            &codec,
+            Some(&serde_json::json!("tenant-a")),
+            &schema.model_name,
+            key(id),
+            vec![],
+        )
+        .unwrap();
+        let request = ProjectionGraphSnapshotRequest::new(
+            root,
+            [(field.into(), Arc::new(target.clone()))],
+            2,
+        )
+        .unwrap();
+        let snapshot = repository
+            .projection_graph_snapshot(&request)
+            .await
+            .unwrap();
+        let rows = &snapshot.includes[field].rows;
+        assert_eq!(rows.len(), usize::from(expected.is_some()), "{id}/{field}");
+        if let Some(expected) = expected {
+            assert_eq!(
+                rows[0].row.as_ref().unwrap().get("id"),
+                Some(&RowValue::String(expected.into()))
+            );
+            assert_eq!(
+                rows[0].scope,
+                codec
+                    .encode_row_scope_in_partition(&target.model_name, partition(), &key(expected))
+                    .unwrap()
+            );
+            assert!(rows[0].record.is_some());
+        }
+    }
 }
 
 fn fanout_schemas() -> &'static [TableSchema] {
@@ -1652,6 +1794,7 @@ async fn lengthening_retention_never_restores_a_compacted_prefix() {
                 scope: None,
                 revision: None,
                 failure_id: None,
+                program_id: None,
             }],
         }
     );

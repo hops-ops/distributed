@@ -46,8 +46,13 @@ make up            # once: writes e2e-ui.env
 distributed dev
 ```
 
-The UI is at `http://localhost:5180`; GraphQL is at
-`http://127.0.0.1:8791/graphql`. The CLI loads `e2e-ui.env` when it exists.
+The public UI is at `http://localhost:8791`; GraphQL is at
+`http://localhost:8791/graphql`. The backend hosts the application gateway and
+proxies UI/auth requests to internal SvelteKit on port 5180. `PUBLIC_ORIGIN`
+selects the public URL and `UI_INTERNAL_ORIGIN` selects the UI upstream. Vite
+does not proxy API requests back to the gateway. Set `GATEWAY_DELIVERY=all` to
+opt into bounded query snapshots, coalescing and shared live delivery; the
+default `none` allocates none of those coordinators. The CLI loads `e2e-ui.env` when it exists.
 Demo users are `alice`, `bob`, and `admin` with password `Password1!`.
 
 `make run` is a convenience alias for the same zero-config command. Before
@@ -79,6 +84,15 @@ an incompatible command-contract edit, including one document reload per
 transition, browser rejection before GraphQL dispatch, direct API rejection
 while generations disagree, URL/app-state retention, compatible replica
 restoration, and incompatible replica revalidation.
+
+The same proof covers two consecutive UI-only edits retaining the API process.
+After each transition it submits a real Todo command, checks the command receipt
+and active generation, waits for the exact persisted row through GraphQL, then
+reloads the page and checks its rendered data independently of browser optimism.
+Todo creation is Eventual: its receipt is not a projection-completion barrier.
+Because the Todos query is `@load`, not `@live`, an immediate reload can capture
+pre-projection data that will not update by itself. The test therefore waits on
+authoritative data, not a fixed sleep or a longer DOM timeout.
 
 This is the **default one-process playground**. Optional celld:
 

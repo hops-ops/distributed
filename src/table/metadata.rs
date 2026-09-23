@@ -152,6 +152,10 @@ pub enum RelationshipKind {
 /// Relationship metadata for a relational table model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationshipDef {
+    /// Ordered columns of the referenced primary or declared unique key.
+    /// Omission selects the primary key; row identity is never changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<String>,
     pub field_name: String,
     pub kind: RelationshipKind,
     pub target_model: String,
@@ -609,6 +613,7 @@ mod tests {
         let schema = valid_schema();
         let mut with_relationship = schema.clone();
         with_relationship.relationships.push(RelationshipDef {
+            references: None,
             field_name: "player".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "Player".into(),
@@ -667,6 +672,7 @@ mod tests {
     fn validate_rejects_relationships_without_foreign_keys() {
         let mut schema = valid_schema();
         schema.relationships.push(RelationshipDef {
+            references: None,
             field_name: "weapons".into(),
             kind: RelationshipKind::HasMany,
             target_model: "PlayerWeapon".into(),

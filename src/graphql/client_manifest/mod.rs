@@ -27,7 +27,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::command_contract::{CommandConsistency, EffectExpression};
 use super::complexity_contract::{default_weights, DEFAULT_MAX_COMPLEXITY, DEFAULT_MAX_DEPTH};
 use super::filter::{FilterExpr, Operand};
 use super::naming::{aggregate_fields_type_name, aggregate_type_name};
@@ -36,6 +35,7 @@ use super::surface::{
     SurfaceCommand, SurfaceCommandShape, SurfaceRelationshipKeys, SurfaceRowPolicy,
     SurfaceSelection, SurfaceTypeDef,
 };
+use crate::command::{CommandConsistency, EffectExpression};
 use crate::table::RelationshipKind;
 
 use build::client_manifest_from_surface_with_execution;
@@ -57,9 +57,10 @@ pub use identity::ClientSurfaceIdentity;
 pub use limits::{ClientComplexityWeights, ClientExecutionLimits};
 pub use types::{
     ClientAggregateSemantics, ClientArgument, ClientArgumentKind, ClientCapabilities,
-    ClientCommand, ClientCommandExtensionSlots, ClientCommandShape, ClientField, ClientFilterField,
-    ClientFilterInput, ClientFilterInputRelationship, ClientFilterSemantics, ClientKeyField,
-    ClientModel, ClientOrderSemantics, ClientPaginationSemantics, ClientProjectionArm,
+    ClientCommand, ClientCommandExtensionSlots, ClientCommandPureArg, ClientCommandPureReduce,
+    ClientCommandShape, ClientField, ClientFilterField, ClientFilterInput,
+    ClientFilterInputRelationship, ClientFilterSemantics, ClientKeyField, ClientModel,
+    ClientOrderSemantics, ClientPaginationSemantics, ClientProjectionArm,
     ClientProjectionAssignment, ClientProjectionBinding, ClientProjectionBindingState,
     ClientProjectionEnvelopeField, ClientProjectionEventRef, ClientProjectionExecutionClass,
     ClientProjectionExpression, ClientProjectionFallback, ClientProjectionField,
@@ -74,9 +75,8 @@ pub use types::{
     ClientRootKind, ClientRootOperation, ClientRowPolicy, ClientTrustedPresetDescriptor,
     ClientTypeDef, ClientTypeField, CommandConfirmationsExtension, CommandConsistencyExtension,
     CommandDirectProjectionExtension, CommandEffectsExtension, CommandInputDefaultsExtension,
-    ClientCommandPureArg, ClientCommandPureReduce, CommandProjectionArmRef,
-    CommandProjectionExtension, CommandProjectionPreviewOccurrence, CommandProjectionPreviewValue,
-    DistributedClientManifest, ModelNormalization,
+    CommandProjectionArmRef, CommandProjectionExtension, CommandProjectionPreviewOccurrence,
+    CommandProjectionPreviewValue, DistributedClientManifest, ModelNormalization,
     RelationshipKeyMapping, ScalarCodec,
 };
 pub(crate) use validation::trusted_preset_descriptors;

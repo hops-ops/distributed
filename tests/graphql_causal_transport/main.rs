@@ -4,12 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use distributed::graphql::{
-    typed_command, GraphqlEngine, IdentityConfig, OidcConfig, PreparedCommand, Succeeded,
-};
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::graphql::{GraphqlEngine, IdentityConfig, OidcConfig};
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
 use distributed::{
-    Aggregate, AggregateRepository, Entity, EventRecord, GraphqlInput, GraphqlOutput,
+    Aggregate, AggregateRepository, CommandInput, CommandOutput, Entity, EventRecord,
     InMemoryRepository,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -76,12 +75,12 @@ impl Aggregate for TransportAggregate {
     }
 }
 
-#[derive(Deserialize, GraphqlInput)]
+#[derive(Deserialize, CommandInput)]
 struct TransportCommandInput {
     id: String,
 }
 
-#[derive(Serialize, GraphqlOutput)]
+#[derive(Serialize, CommandOutput)]
 struct TransportCommandOutput {
     id: String,
 }
@@ -186,20 +185,108 @@ struct TestServer {
     http_url: String,
     ws_url: String,
     task: JoinHandle<()>,
+    upstream: Option<JoinHandle<()>>,
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some(upstream) = &self.upstream {
+            upstream.abort();
+        }
     }
 }
 
+enum GatewayMode {
+    Direct,
+    #[cfg(feature = "gateway-graphql-native")]
+    Embedded,
+    #[cfg(feature = "gateway-graphql-native")]
+    Remote,
+}
+
 async fn spawn_server(service: Arc<Service>) -> TestServer {
+    spawn_server_mode(service, GatewayMode::Direct).await
+}
+
+async fn spawn_server_mode(service: Arc<Service>, mode: GatewayMode) -> TestServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test server");
     let address = listener.local_addr().expect("test server address");
-    let app = distributed::microsvc::router(service);
+    let mut upstream = None;
+    let app = match mode {
+        GatewayMode::Direct => distributed::microsvc::router(service),
+        #[cfg(feature = "gateway-graphql-native")]
+        mode => {
+            use distributed::gateway::{native::*, *};
+            let engine = service.graphql_engine().unwrap();
+            let provider = Arc::new(distributed::graphql::identity::OidcGatewayProvider::new(
+                engine.identity_config().oidc.clone().unwrap(),
+                "causal-fixture-v1",
+            ));
+            let auth = NativeAuth::new(move |credentials| {
+                let provider = provider.clone();
+                async move { provider.authenticate(&credentials).await }
+            });
+            let caps = GraphqlCapabilities {
+                commands: true,
+                queries: true,
+                live: true,
+            };
+            let (executor, binding) = match mode {
+                GatewayMode::Embedded => (
+                    GraphqlExecutor::Embedded,
+                    GraphqlBinding::Embedded(
+                        EmbeddedGraphql::new(
+                            engine,
+                            Some(Arc::new(
+                                distributed::command_dispatch::LocalCommandHost::new(service),
+                            )),
+                            caps,
+                        )
+                        .unwrap(),
+                    ),
+                ),
+                GatewayMode::Remote => {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let origin = format!("http://{}", listener.local_addr().unwrap());
+                    upstream = Some(tokio::spawn(async move {
+                        axum::serve(listener, distributed::microsvc::router(service))
+                            .await
+                            .unwrap()
+                    }));
+                    (
+                        GraphqlExecutor::Remote { origin },
+                        GraphqlBinding::Remote(RemoteGraphql::default()),
+                    )
+                }
+                GatewayMode::Direct => unreachable!(),
+            };
+            let gateway = GatewayConfig {
+                bindings: vec![Binding::new(
+                    "graphql",
+                    BindingKind::Graphql {
+                        executor,
+                        capabilities: caps,
+                        delivery: DeliveryCapabilities::default(),
+                        schema_extensions: vec![],
+                    },
+                )],
+                routes: vec![Route::new("api", RoutePath::prefix("/graphql"), "graphql")],
+            }
+            .build()
+            .unwrap();
+            NativeGateway::new(
+                gateway,
+                NativeOptions::new(format!("http://{address}")),
+                [("graphql".into(), NativeBinding::Graphql(binding))],
+                auth,
+            )
+            .unwrap()
+            .router()
+        }
+    };
     let task = tokio::spawn(async move {
         axum::serve(listener, app)
             .await
@@ -209,6 +296,7 @@ async fn spawn_server(service: Arc<Service>) -> TestServer {
         http_url: format!("http://{address}/graphql"),
         ws_url: format!("ws://{address}/graphql/ws"),
         task,
+        upstream,
     }
 }
 
@@ -373,6 +461,22 @@ async fn assert_http_ws_status_pair(
 
 #[tokio::test]
 async fn causal_receipt_status_replay_and_nonenumeration_match_http_and_ws() {
+    exercise_causal_transport(GatewayMode::Direct).await;
+}
+
+#[cfg(feature = "gateway-graphql-native")]
+#[tokio::test]
+async fn gateway_embedded_causal_receipt_status_parity() {
+    exercise_causal_transport(GatewayMode::Embedded).await;
+}
+
+#[cfg(feature = "gateway-graphql-native")]
+#[tokio::test]
+async fn gateway_remote_causal_receipt_status_parity() {
+    exercise_causal_transport(GatewayMode::Remote).await;
+}
+
+async fn exercise_causal_transport(mode: GatewayMode) {
     let keys = TestKeys::new();
     let mut oidc = OidcConfig::new(ISSUER, AUDIENCE)
         .with_static_jwks(keys.jwks.clone())
@@ -396,7 +500,7 @@ async fn causal_receipt_status_replay_and_nonenumeration_match_http_and_ws() {
             .try_with_graphql(engine)
             .expect("causal transport GraphQL attachment"),
     );
-    let server = spawn_server(service).await;
+    let server = spawn_server_mode(service, mode).await;
 
     let writer_a = keys.token("subject-a", "writer");
     let writer_b = keys.token("subject-b", "writer");

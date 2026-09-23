@@ -10,6 +10,65 @@ use distributed::{
 };
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
+struct Account {
+    id: String,
+    #[readmodel(belongs_to = "Profile", foreign_key = "id")]
+    profile: Option<Box<Profile>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
+struct Profile {
+    id: String,
+    #[readmodel(belongs_to = "Account", foreign_key = "id")]
+    account: Option<Account>,
+}
+
+#[test]
+fn cyclic_singular_relationships_hydrate_and_serialize_without_box_metadata() {
+    use distributed::{RelationalReadModel, RelationalReadModelIncludes};
+    let mut account = Account {
+        id: "a".into(),
+        profile: None,
+    };
+    let profile = Profile {
+        id: "a".into(),
+        account: None,
+    };
+    let row = profile.to_row().unwrap();
+    account
+        .hydrate_include("profile", vec![row.clone()])
+        .unwrap();
+    assert_eq!(account.profile.as_deref(), Some(&profile));
+    assert_eq!(account.include_rows("profile").unwrap(), vec![row.clone()]);
+    assert_eq!(
+        Account::include_target_schema("profile").unwrap(),
+        Profile::schema()
+    );
+    assert!(!Account::schema()
+        .columns
+        .iter()
+        .any(|column| column.field_name == "profile"));
+    account.hydrate_include("profile", vec![]).unwrap();
+    assert_eq!(account.profile, None);
+    assert!(account
+        .hydrate_include("profile", vec![row.clone(), row])
+        .is_err());
+    let mut profile = profile;
+    profile
+        .hydrate_include(
+            "account",
+            vec![Account {
+                id: "a".into(),
+                profile: None,
+            }
+            .to_row()
+            .unwrap()],
+        )
+        .unwrap();
+    assert_eq!(profile.account.as_ref().unwrap().id, "a");
+}
+
 fn block_on<F: Future>(future: F) -> F::Output {
     use std::ptr;
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};

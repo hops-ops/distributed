@@ -122,60 +122,23 @@ fn relationship_keys_from_state(
     target_schema: &TableSchema,
     max_unique: usize,
 ) -> Result<Vec<RowKey>, ProjectionProtocolError> {
-    let foreign_key = relationship.foreign_key.as_deref().ok_or_else(|| {
-        ProjectionProtocolError::InvalidBatch(format!(
-            "projection graph relationship `{}` has no foreign key",
-            relationship.field_name
-        ))
-    })?;
-    let (target_column, value) = match relationship.kind {
-        RelationshipKind::HasMany => {
-            let (target_column, root_column) =
-                projection_has_many_columns(root_schema, relationship, target_schema)?;
-            let value = root_row.get(&root_column).cloned().ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph root `{}` is missing relationship key `{root_column}`",
-                    root_schema.model_name
-                ))
-            })?;
-            (target_column, value)
-        }
-        RelationshipKind::BelongsTo => {
-            let source_column = column_name_for(root_schema, foreign_key).ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph relationship `{}` foreign key `{foreign_key}` is not a source column",
-                    relationship.field_name
-                ))
-            })?;
-            let [target_column] = target_schema.primary_key.columns.as_slice() else {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph belongs-to target `{}` must have one primary-key column",
-                    target_schema.model_name
-                )));
-            };
-            let value = root_row.get(&source_column).cloned().ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph root `{}` is missing relationship key `{source_column}`",
-                    root_schema.model_name
-                ))
-            })?;
-            (target_column.clone(), value)
-        }
-        RelationshipKind::ManyToMany => {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection graph relationship `{}` is many-to-many; project an explicit join read model instead",
-                relationship.field_name
-            )));
-        }
-    };
-    if value == crate::table::RowValue::Null {
+    let values =
+        projection_relationship_values(root_schema, root_row, relationship, target_schema)?;
+    if values
+        .iter()
+        .any(|(_, value)| *value == crate::table::RowValue::Null)
+    {
         return Ok(Vec::new());
     }
 
     let prefix = format!("{}:", target_schema.table_name);
     let mut keys = Vec::new();
     for (storage_key, stored) in rows {
-        if storage_key.starts_with(&prefix) && stored.values.get(&target_column) == Some(&value) {
+        if storage_key.starts_with(&prefix)
+            && values
+                .iter()
+                .all(|(column, value)| stored.values.get(column) == Some(value))
+        {
             if keys.len() == max_unique {
                 return Err(graph_budget_error_from_parts(
                     root_schema,

@@ -18,7 +18,7 @@ const MAX_METADATA_VALUE_BYTES: usize = 1024;
 ///
 /// This is not a delivery record. Delivery status, leases, attempts, and
 /// settlement belong exclusively to the cell's durable outbox and Queue.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CellProjectionEventWireItem {
     pub id: String,
@@ -149,8 +149,8 @@ pub fn parse_cell_projection_events(
 }
 
 /// Select the exact events committed by one causal command and encode them as
-/// delivery-neutral projection evidence. Published rows remain valid evidence;
-/// Queue settlement must not erase the data needed by optimistic replicas.
+/// delivery-neutral projection evidence before commit. Store the result with
+/// the command receipt; never recover it by retaining delivered outbox rows.
 pub fn cell_projection_event_evidence(
     messages: &[OutboxMessage],
     causation_id: &str,

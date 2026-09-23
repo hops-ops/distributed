@@ -1,7 +1,5 @@
-import { CacheRevisionConflictError } from '../../internal/cache-engine.js';
 import type { GraphqlVariables } from '../../types.js';
 import {
-	parseGraphqlResponseExtensions,
 	type DistributedLiveCursor,
 	type DistributedProtocolEnvelope
 } from '../../protocol.js';
@@ -57,6 +55,7 @@ export type FetchLiveHost = {
 	): DistributedProtocolEnvelope;
 	diagnosticEvent(event: ReplicaDiagnosticEventInput): void;
 	resumeCursors(key: string): readonly DistributedLiveCursor[];
+	freshness(artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>, key: string): Readonly<Record<string, unknown>> | undefined;
 };
 
 export function emitWatchState(host: FetchLiveHost, key: string, allowFetch: boolean): void {
@@ -66,7 +65,8 @@ export function emitWatchState(host: FetchLiveHost, key: string, allowFetch: boo
 export function closeActiveTransports(host: FetchLiveHost): void {
 	for (const controller of host.inFlightAborts.values()) controller.abort();
 	host.inFlightAborts.clear();
-	for (const entry of host.lives.values()) {
+	for (const [key, entry] of host.lives) {
+		retireLiveProtocol(host, key);
 		entry.active = false;
 		try {
 			entry.unsubscribe();
@@ -151,7 +151,7 @@ export function fetchWatch<TData, TVariables extends GraphqlVariables>(
 		document: watch.artifact.document,
 		variables: watch.variables,
 		artifact: watch.artifact,
-		...replicaClientRequestExtensions(watch.artifact),
+		extensions: requestExtensions(host, watch.artifact, watch.key),
 		signal: controller.signal
 	});
 	let flight: Promise<void>;
@@ -233,13 +233,15 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 		existing.count += 1;
 		return;
 	}
+	clearRetiredLiveProtocol(host, watch.key);
 	const state = host.queryState(watch.key);
 	state.live = 'connecting';
 	const entry: LiveEntry = {
 		count: 1,
 		unsubscribe: () => undefined,
 		active: true,
-		protocolGeneration: host.protocolGenerationSequence()
+		protocolGeneration: host.protocolGenerationSequence(),
+		startRevision: host.allocateIndexRevision()
 	};
 	host.lives.set(watch.key, entry);
 	const resume = host.resumeCursors(watch.key);
@@ -251,7 +253,7 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 				document: watch.artifact.live.document,
 				variables: watch.variables,
 				artifact: watch.artifact,
-				...replicaClientRequestExtensions(watch.artifact),
+				extensions: requestExtensions(host, watch.artifact, watch.key),
 				...(resume === undefined || resume.length === 0
 					? {}
 					: { resume })
@@ -308,13 +310,8 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 						}
 						return;
 					}
-					let unsupportedLive = false;
 					try {
-						unsupportedLive =
-							parseGraphqlResponseExtensions(result.extensions)
-								?.distributed?.live?.supported === false;
-						if (unsupportedLive) state.live = 'off';
-						const distributed = host.writeCanonicalResult(
+						host.writeCanonicalResult(
 							watch.artifact,
 							watch.variables,
 							result,
@@ -322,26 +319,10 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 							undefined,
 							projectionGeneration
 						);
-						if (distributed.live?.supported === false) {
-							fallbackFromLive(host, watch, entry);
-							return;
-						}
 						state.live = 'active';
 						entry.operationGeneration =
 							host.operationGeneration(watch.key);
 					} catch (error) {
-						if (
-							unsupportedLive &&
-							error instanceof CacheRevisionConflictError
-						) {
-							/*
-							 * Revision zero is shared by provisional fallbacks.
-							 * Another operation may already have filled the same
-							 * semantic index differently; HTTP remains authoritative.
-							 */
-							fallbackFromLive(host, watch, entry);
-							return;
-						}
 						state.live = 'error';
 						state.errors = stableErrors(state.errors, [graphqlError(error)]);
 						host.emitState(watch.key, false);
@@ -349,6 +330,7 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 				},
 				error: (error) => {
 					if (!entry.active || host.lives.get(watch.key) !== entry) return;
+					retireLiveProtocol(host, watch.key);
 					entry.active = false;
 					host.lives.delete(watch.key);
 					const unsub = entry.unsubscribe;
@@ -380,6 +362,7 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 		}
 		state.live = 'active';
 	} catch (error) {
+		retireLiveProtocol(host, watch.key);
 		entry.active = false;
 		host.lives.delete(watch.key);
 		state.live = 'error';
@@ -397,6 +380,7 @@ export function fallbackFromLive<TData, TVariables extends GraphqlVariables>(
 		void fetchWatch(host, watch, true);
 		return;
 	}
+	retireLiveProtocol(host, watch.key);
 	const protocol = host.operationProtocols.get(watch.key);
 	if (protocol?.active === 'live') protocol.active = undefined;
 	entry.active = false;
@@ -428,14 +412,13 @@ export function fallbackFromLive<TData, TVariables extends GraphqlVariables>(
 	/*
 	 * Keep the inactive entry as an authorization-generation-scoped
 	 * sentinel. Query ingestion calls resumeLiveWatches(); deleting this
-	 * entry would otherwise reopen an unsupported or completed stream
+	 * entry would otherwise reopen a completed stream
 	 * immediately. Authorization invalidation clears it and may retry.
 	 *
-	 * A supported live frame advances the operation generation. Any HTTP
+	 * An accepted live frame advances the operation generation. Any HTTP
 	 * request that was already running is therefore doomed by its response
-	 * fence; drain it before starting the authoritative fallback. A first
-	 * unsupported frame never advances the generation, so its overlapping
-	 * HTTP request remains valid and can be reused directly.
+	 * fence; drain it before starting the authoritative fallback. A stream
+	 * that completed before its first frame can reuse the in-flight query.
 	 */
 	if (supersededFlight === undefined) {
 		refresh();
@@ -448,6 +431,7 @@ export function restartLive(host: FetchLiveHost, key: string): void {
 	const previous = host.lives.get(key);
 	if (previous === undefined) return;
 	const count = previous.count;
+	retireLiveProtocol(host, key);
 	previous.active = false;
 	host.lives.delete(key);
 	try {
@@ -487,9 +471,39 @@ export function releaseLive(host: FetchLiveHost, key: string): void {
 	if (!entry) return;
 	entry.count -= 1;
 	if (entry.count > 0) return;
+	retireLiveProtocol(host, key);
 	entry.active = false;
 	host.lives.delete(key);
 	entry.unsubscribe();
 	host.queryState(key).live = 'off';
 	host.emitState(key, false);
+}
+
+/**
+ * Mark protocol state as no longer backed by a live transport. The state is
+ * retained for cache and hydration bookkeeping, but a later live stream may
+ * replace its incomparable membership only when that stream started after
+ * this boundary.
+ */
+function retireLiveProtocol(host: FetchLiveHost, key: string): void {
+	const state = host.operationProtocols.get(key)?.live;
+	if (state === undefined) return;
+	state.retiredAtRevision = host.allocateIndexRevision();
+}
+
+function clearRetiredLiveProtocol(host: FetchLiveHost, key: string): void {
+	const state = host.operationProtocols.get(key)?.live;
+	if (state !== undefined) state.retiredAtRevision = undefined;
+}
+
+function requestExtensions(
+	host: FetchLiveHost,
+	artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>,
+	key: string
+): Readonly<Record<string, unknown>> {
+	const freshness = host.freshness(artifact, key);
+	return Object.freeze({
+		...replicaClientRequestExtensions(artifact).extensions,
+		...(freshness === undefined ? {} : { gatewayFreshness: freshness })
+	});
 }

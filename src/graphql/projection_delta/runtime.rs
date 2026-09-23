@@ -259,6 +259,14 @@ impl ProtocolProjectionRequestSeed {
                 if candidate.causation_id != causation_id
                     || candidate.scope.topology() != entry.codec.topology()
                     || candidate.scope.model() != obligation.model
+                    // A modeled observation is proof for the exact semantic
+                    // program that authored it. Physical projector names are
+                    // shared across deployments and cannot establish this
+                    // identity after an upgrade or cold restart. Legacy
+                    // observations have no program ID and remain readable,
+                    // but cannot satisfy a modeled obligation.
+                    || candidate.program_id.map(|id| id.to_string())
+                        != Some(identity.program_id.clone())
                     || !entry
                         .binding
                         .outputs()
@@ -802,6 +810,15 @@ fn trusted_preset_value_matches(codec: &str, value: &serde_json::Value) -> bool 
         "json_number_precision_limited" => value
             .as_i64()
             .is_some_and(|value| (-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&value)),
+        codec if crate::command::CommandUnsignedInteger::from_client_codec(codec).is_some() => {
+            crate::command::CommandUnsignedInteger::from_client_codec(codec).is_some_and(
+                |unsigned| {
+                    value
+                        .as_u64()
+                        .is_some_and(|value| value <= unsigned.client_max_value())
+                },
+            )
+        }
         "float64" => value.as_f64().is_some_and(f64::is_finite),
         "json" => true,
         _ => false,
@@ -811,6 +828,27 @@ fn trusted_preset_value_matches(codec: &str, value: &serde_json::Value) -> bool 
 #[cfg(test)]
 mod trusted_preset_tests {
     use super::trusted_preset_value_matches;
+
+    #[test]
+    fn unsigned_presets_require_exact_bounded_integers() {
+        for (codec, max) in [
+            ("uint8", 255_u64),
+            ("uint16", 65_535),
+            ("uint32", 4_294_967_295),
+            ("uint64_safe_integer", 9_007_199_254_740_991),
+        ] {
+            assert!(trusted_preset_value_matches(codec, &serde_json::json!(0)));
+            assert!(trusted_preset_value_matches(codec, &serde_json::json!(max)));
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!(max + 1),
+                serde_json::json!("1"),
+            ] {
+                assert!(!trusted_preset_value_matches(codec, &invalid));
+            }
+        }
+    }
 
     #[test]
     fn base64_preset_inventory_requires_canonical_standard_encoding() {

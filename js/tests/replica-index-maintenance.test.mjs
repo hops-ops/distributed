@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createCacheEngine } from '../dist/internal/cache-engine.js';
+import { relationshipMembership } from '../dist/replica/index-maintenance/engine.js';
 import { replaceOptimisticLayerOn } from '../dist/replica/distributed-replica/impl-optimistic.js';
 import {
 	createReplicaIndexMaintenanceRegistry,
@@ -13,6 +14,31 @@ import {
 const Todo = Object.freeze({ id: 'Todo', identityFields: Object.freeze(['id']) });
 const Board = Object.freeze({ id: 'Board', identityFields: Object.freeze(['id']) });
 const Card = Object.freeze({ id: 'Card', identityFields: Object.freeze(['id']) });
+
+test('direct candidate-key membership preserves row identity and SQL null semantics', () => {
+	const plan = { path: ['object'], relationship: {
+		keyMapping: { kind: 'direct', local: ['namespace', 'revision'], remote: ['scope', 'version'] }
+	} };
+	const parent = { fields: { id: 'parent-id', namespace: 'team-a', revision: 'v1' } };
+	const records = new Map([['parent-key', parent]]);
+	const branch = { metadata: { parent: 'parent-key' } };
+	const target = { fields: { id: 'opaque-object-id', scope: 'team-a', version: 'v1' } };
+	const membership = () => relationshipMembership(plan, branch, target, records);
+	assert.deepEqual(membership(), { related: true });
+	target.fields.scope = 'team-b';
+	assert.deepEqual(membership(), { related: false });
+	target.fields.scope = 'team-a';
+	parent.fields.revision = 'v2';
+	assert.deepEqual(membership(), { related: false });
+	target.fields.version = 'v2';
+	assert.deepEqual(membership(), { related: true });
+	assert.equal(target.fields.id, 'opaque-object-id');
+	parent.fields.revision = null;
+	target.fields.version = null;
+	assert.deepEqual(membership(), { related: false });
+	delete target.fields.version;
+	assert.equal(membership().reason.code, 'missing_field');
+});
 
 const COMPLETE = Object.freeze({ kind: 'complete' });
 const COMPLETE_PAGINATION = Object.freeze({

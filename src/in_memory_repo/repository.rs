@@ -14,7 +14,7 @@ use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalStorageIdentity, CausalTransactionalCommit, CommandCompletion, CommandLedgerError,
     CommandLedgerKey, CommandLedgerRecord, CommandLedgerStore, CommandLookup, CommandLookupScope,
-    CommandReservation, ReservationDecision, ReservationOutcome,
+    CommandReservation, ExternalCommandCompletion, ReservationDecision, ReservationOutcome,
 };
 use crate::entity::{Entity, EventRecord};
 use crate::outbox::OutboxMessage;
@@ -384,6 +384,13 @@ impl InMemoryRepository {
                 .ok_or_else(|| CommandLedgerError::AttemptFenced {
                     command_id: completion.attempt().key().command_id().to_string(),
                 })?;
+            if completion.attempt().external_binding().is_some() {
+                return Err(CommandLedgerError::Invalid(
+                    "local causal completion cannot complete an externally bound reservation"
+                        .into(),
+                )
+                .into());
+            }
             record.validate_live_attempt(&completion.attempt_fence(), crate::time::now())?;
         }
 
@@ -588,6 +595,14 @@ impl GetStream for InMemoryRepository {
 }
 
 impl CausalGetStream for InMemoryRepository {
+    fn get_causal_stream_tail<'a>(
+        &'a self,
+        identity: &'a StreamIdentity,
+        after_version: u64,
+    ) -> impl std::future::Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a
+    {
+        GetStream::get_stream_tail(self, identity, after_version)
+    }
     fn get_causal_stream<'a>(
         &'a self,
         identity: &'a StreamIdentity,
@@ -681,6 +696,24 @@ impl CommandLedgerStore for InMemoryRepository {
                         command_id: attempt.key().command_id().to_string(),
                     })?;
             record.mark_retryable_unknown(&attempt, crate::time::now())
+        }
+    }
+
+    fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
+        async move {
+            let mut ledger = self
+                .command_ledger
+                .write()
+                .map_err(|_| RepositoryError::LockPoisoned("external command completion"))?;
+            let record = ledger.get_mut(completion.attempt().key()).ok_or_else(|| {
+                CommandLedgerError::AttemptFenced {
+                    command_id: completion.attempt().key().command_id().to_string(),
+                }
+            })?;
+            record.complete_external(&completion, crate::time::now())
         }
     }
 
@@ -814,6 +847,11 @@ impl ReadModelWritePlanStore for InMemoryRepository {
 }
 
 impl RelationalReadModelQueryStore for InMemoryRepository {
+    fn scan_read_model(&self, request: crate::read_model::ReadModelScanRequest)
+        -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_ {
+        self.model_store.scan_read_model(request)
+    }
+
     fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities {
         self.model_store.read_model_query_capabilities()
     }

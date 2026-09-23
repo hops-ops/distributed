@@ -596,7 +596,7 @@ mod tests {
         );
         // The publisher saw the message id, and the row is completed only after.
         assert_eq!(dispatcher.publisher.ids(), vec!["evt-1".to_string()]);
-        assert!(load(&repo, &id).is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key(&id));
     }
 
     #[test]
@@ -640,7 +640,7 @@ mod tests {
 
         assert_eq!(outcome.claimed, 1);
         assert_eq!(outcome.published, 1);
-        assert!(load(&repo, &wanted).is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key(&wanted));
         // The unrequested row is untouched.
         assert!(load(&repo, &other).is_pending());
     }
@@ -680,6 +680,60 @@ mod tests {
         assert_eq!(drained.claimed, 1, "only evt-2 remains claimable");
         assert_eq!(drained.published, 1);
         assert_eq!(dispatcher.publisher.ids().len(), 2);
+    }
+
+    #[test]
+    fn queue_acceptance_and_competing_drain_do_not_imply_claim_settlement() {
+        use std::future::{poll_fn, Future};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+
+        struct HeldAcknowledgement {
+            accepted: AtomicBool,
+            release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        }
+
+        impl MessagePublisher for HeldAcknowledgement {
+            async fn publish(&self, _message: Message) -> Result<(), TransportError> {
+                // The queue row is externally visible before the publisher's
+                // response reaches the alarm that owns the local claim.
+                self.accepted.store(true, Ordering::SeqCst);
+                let release = self.release.lock().unwrap().take().unwrap();
+                release.await.unwrap();
+                Ok(())
+            }
+        }
+
+        block_on(async {
+            let repo = InMemoryRepository::new();
+            let id = store_message(&repo, outbox("accepted-before-settlement"));
+            let (release, response) = tokio::sync::oneshot::channel();
+            let alarm = OutboxDispatcher::new(
+                repo.outbox_store(),
+                HeldAcknowledgement {
+                    accepted: AtomicBool::new(false),
+                    release: Mutex::new(Some(response)),
+                },
+                "alarm:test",
+                Duration::from_secs(60),
+                3,
+            );
+            let mut pending = Box::pin(alarm.dispatch_batch(1));
+            assert!(poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx)))
+                .await
+                .is_pending());
+            assert!(alarm.publisher.accepted.load(Ordering::SeqCst));
+            assert_eq!(repo.outbox_storage().read().unwrap().len(), 1);
+
+            let replay_drain = dispatcher(&repo, false, 3).dispatch_batch(1).await.unwrap();
+            assert_eq!(replay_drain.claimed, 0);
+            assert_eq!(replay_drain.published, 0);
+            assert_eq!(repo.outbox_storage().read().unwrap().len(), 1);
+
+            release.send(()).unwrap();
+            assert_eq!(pending.await.unwrap().published, 1);
+            assert!(!repo.outbox_storage().read().unwrap().contains_key(&id));
+        });
     }
 
     /// Publisher that fails one specific message id and records the rest.
@@ -723,8 +777,8 @@ mod tests {
         assert_eq!(outcome.claimed, 3);
         assert_eq!(outcome.published, 2);
         assert_eq!(outcome.released, 1);
-        assert!(load(&repo, "evt-1").is_published());
-        assert!(load(&repo, "evt-3").is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key("evt-1"));
+        assert!(!repo.outbox_storage().read().unwrap().contains_key("evt-3"));
         // The failed row is released for retry, untouched by the batched complete.
         let failed = load(&repo, "evt-2");
         assert!(failed.is_pending());
@@ -745,7 +799,7 @@ mod tests {
         assert_eq!(outcome.claimed, 3);
         assert_eq!(outcome.published, 3);
         for id in ["evt-1", "evt-2", "evt-3"] {
-            assert!(load(&repo, id).is_published());
+            assert!(!repo.outbox_storage().read().unwrap().contains_key(id));
         }
         assert_eq!(dispatcher.publisher.ids().len(), 3);
     }

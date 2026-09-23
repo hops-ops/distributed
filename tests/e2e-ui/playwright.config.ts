@@ -27,7 +27,7 @@ function loadEnvFile(file: string) {
 
 loadEnvFile(path.join(root, 'e2e-ui.env'));
 
-const baseURL = process.env.E2E_UI_ORIGIN || process.env.UI_URL || 'http://localhost:5180';
+const baseURL = process.env.PUBLIC_ORIGIN || process.env.E2E_UI_ORIGIN || process.env.UI_URL || 'http://localhost:8791';
 
 /**
  * Browser tests for e2e-ui.
@@ -70,7 +70,7 @@ export default defineConfig({
 			testMatch: /.*\.user\.spec\.ts/,
 			use: {
 				...devices['Desktop Chrome'],
-				storageState: path.join(root, 'e2e/.auth/alice.json')
+				storageState: process.env.E2E_USER_STORAGE_STATE || path.join(root, 'e2e/.auth/alice.json')
 			}
 		},
 		{

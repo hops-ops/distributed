@@ -47,6 +47,20 @@ where
     for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
+    fn scan_read_model(&self, request: crate::read_model::ReadModelScanRequest)
+        -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_ {
+        async move {
+            request.validate()?;
+            {
+                let registry = self.read_model_schemas.read().map_err(|_| TableStoreError::Storage("schema registry lock poisoned".into()))?;
+                if registry.schema_for_model(&request.schema.model_name).is_some_and(|s| s != &request.schema) {
+                    return Err(TableStoreError::Metadata("scan schema differs from registered model".into()));
+                }
+            }
+            crate::sqlx_repo::read_model::scan_read_model(&self.pool, request).await
+        }
+    }
+
     fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities {
         ReadModelQueryCapabilities::relationship_includes()
     }

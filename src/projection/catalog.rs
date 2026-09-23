@@ -1809,6 +1809,93 @@ mod tests {
     }
 
     #[test]
+    fn semantic_program_replacement_requires_epoch_rotation_before_replay() {
+        let previous_program = program_with_kind_and_partition(
+            "project_todos",
+            FINGERPRINT_A,
+            "Todos",
+            "todos",
+            ProjectionMutationKind::Upsert,
+            ProjectionPartition::Unit,
+        );
+        let replacement_program = program_with_kind_and_partition(
+            "project_todos",
+            FINGERPRINT_A,
+            "Todos",
+            "todos",
+            ProjectionMutationKind::Patch,
+            ProjectionPartition::Unit,
+        );
+        assert_ne!(
+            previous_program.id().unwrap(),
+            replacement_program.id().unwrap(),
+            "different projection behavior must have different semantic identities"
+        );
+        let previous_binding = eventual(
+            &previous_program,
+            "todo-reads-v1",
+            ProjectionExecutionClass::Causal,
+        );
+        let replacement_binding = eventual(
+            &replacement_program,
+            "todo-reads-v2",
+            ProjectionExecutionClass::Causal,
+        );
+        assert_eq!(
+            previous_binding.physical_topology(),
+            replacement_binding.physical_topology(),
+            "the physical owner may remain stable while the program changes"
+        );
+
+        let previous_catalog = ProjectionCatalog::try_new(vec![previous_binding.clone()]).unwrap();
+        let previous_active = previous_catalog
+            .activate(
+                vec![activation(
+                    &previous_binding,
+                    "todos-rebuild-1",
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::remote("projector-v1").unwrap()),
+                )],
+                None,
+            )
+            .unwrap();
+        let replacement_catalog =
+            ProjectionCatalog::try_new(vec![replacement_binding.clone()]).unwrap();
+        let same_epoch = replacement_catalog
+            .activate(
+                vec![activation(
+                    &replacement_binding,
+                    "todos-rebuild-1",
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
+                )],
+                Some((&previous_catalog, &previous_active)),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            same_epoch,
+            ProjectionCatalogError::SameEpochTakeover { .. }
+        ));
+
+        let rotated = replacement_catalog
+            .activate(
+                vec![activation(
+                    &replacement_binding,
+                    "todos-rebuild-2",
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
+                )],
+                Some((&previous_catalog, &previous_active)),
+            )
+            .unwrap();
+        assert_eq!(
+            rotated.bindings()[0].program_id(),
+            replacement_program.id().unwrap()
+        );
+        assert_eq!(rotated.bindings()[0].epoch().as_str(), "todos-rebuild-2");
+    }
+
+    #[test]
     fn new_epoch_allows_rollout_then_draining_stops_new_obligations() {
         let program = program("project_todos", FINGERPRINT_A);
         let previous_binding =
@@ -2024,6 +2111,7 @@ mod tests {
     fn relationship_kind_is_part_of_the_output_schema_identity() {
         let mut schema = todo_schema("todos");
         schema.relationships.push(RelationshipDef {
+            references: None,
             field_name: "owner".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "Owners".into(),

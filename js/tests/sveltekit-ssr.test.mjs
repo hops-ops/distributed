@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import {createLazyReplicaCommandRuntime} from '../dist/replica/command-runtime/lazy.js';
 import test from 'node:test';
 
 import {
 	createDistributedSvelteKit,
+	createPageDataSessionSource,
 	createDistributedSvelteKitServer,
 	defineDistributedBoundaryBinding,
 	defineDistributedBoundaryOperation
@@ -10,6 +12,7 @@ import {
 import {
 	REACT_FIXTURE_SCHEMA,
 	TodosArtifact,
+	TodoModel,
 	todoFrame
 } from './fixtures/adapter-conformance.mjs';
 
@@ -110,7 +113,7 @@ const forwardedTodosBoundary = defineDistributedBoundaryOperation(
 	})
 );
 
-function serverHarness() {
+function serverHarness(mode = 'resumable') {
 	const calls = [];
 	const server = createDistributedSvelteKitServer({
 		boundaries: [todosBoundary],
@@ -147,6 +150,7 @@ function serverHarness() {
 					],
 					{
 						cacheScope: `cache:${token}`,
+						mode,
 						position
 					}
 				)
@@ -160,8 +164,9 @@ function serverHarness() {
 	};
 }
 
-test('static @load SSR is request-isolated and hydration avoids a duplicate first fetch', async () => {
-	const harness = serverHarness();
+for (const mode of ['resumable', 'snapshot']) {
+test(`static @load SSR is isolated and hydration avoids a duplicate fetch (${mode})`, async () => {
+	const harness = serverHarness(mode);
 	const [alice, bob] = await Promise.all([
 		harness.server.load(harness.event('alice')),
 		harness.server.load(harness.event('bob'))
@@ -209,7 +214,7 @@ test('static @load SSR is request-isolated and hydration avoids a duplicate firs
 		payload: todoFrame(
 			TodosArtifact,
 			[{ id: 'todo-alice', title: 'alice:live', status: 'open' }],
-			{ cacheScope: 'cache:alice', position: '2', source: 'live' }
+			{ cacheScope: 'cache:alice', position: '2', source: 'live', mode }
 		)
 	});
 	await flushMicrotasks();
@@ -227,6 +232,7 @@ test('static @load SSR is request-isolated and hydration avoids a duplicate firs
 	assert.equal(socket.closed, true);
 	client.destroy();
 });
+}
 
 test('SSR only awaits parent data for forwarded-prop bindings', async () => {
 	const harness = serverHarness();
@@ -271,7 +277,7 @@ test('SSR abort settles while forwarded parent data remains pending', async () =
 	assert.equal(parentCalls, 1);
 });
 
-test('client-side data requests skip GraphQL so navigation stays SPA', async () => {
+test('client-side data requests carry their own authorized route seed', async () => {
 	const harness = serverHarness();
 	const document = await harness.server.load(harness.event('alice'));
 	assert.equal(harness.calls.length, 1);
@@ -281,8 +287,10 @@ test('client-side data requests skip GraphQL so navigation stays SPA', async () 
 		...harness.event('alice'),
 		isDataRequest: true
 	});
-	assert.equal(harness.calls.length, 1, 'SPA data request must not seed a new replica');
-	assert.equal(dataNav.distributed, undefined);
+	assert.equal(harness.calls.length, 2, 'one authorized selection per document or data load');
+	assert.ok(dataNav.distributed);
+	assert.ok(dataNav.distributedAuthority);
+	assert.notEqual(dataNav.distributed, document.distributed);
 	assert.equal(dataNav.gqlError, null);
 	assert.equal(dataNav.accessToken, 'alice');
 });
@@ -398,6 +406,64 @@ test('route misses do no GraphQL work and same-scope soft-nav merges overlapping
 	client.destroy();
 });
 
+for (const mode of ['resumable', 'snapshot']) {
+test(`same-scope data hydration retains the ${mode} live subscription until its owner releases`, async () => {
+	const harness = serverHarness();
+	const first = await harness.server.load(harness.event('alice', '1'));
+	const second = await harness.server.load({ ...harness.event('alice', '2'), isDataRequest: true });
+	SsrWebSocket.instances.length = 0;
+	const client = createDistributedSvelteKit({
+		boundaries: [todosBoundary],
+		session: { getAuth: () => ({ accessToken: 'alice' }) },
+		hydration: first.distributed,
+		authority: first.distributedAuthority,
+		fetch: async () => { throw new Error('hydrated navigation must not fetch'); },
+		webSocket: SsrWebSocket
+	});
+	const todos = client.operation(TodosArtifact).use();
+	const release = todos.subscribe(() => undefined);
+	await flushMicrotasks();
+	const socket = SsrWebSocket.instances[0];
+	socket.open();
+	socket.receive({ type: 'connection_ack' });
+	await flushMicrotasks();
+	const subscription = socket.sent.find((frame) => frame.type === 'subscribe');
+	assert.ok(subscription);
+	assert.equal(client.hydrate(second.distributed, second.distributedAuthority), true);
+	await flushMicrotasks();
+	assert.equal(socket.closed, false);
+	assert.equal(socket.sent.some((frame) => frame.type === 'complete'), false);
+	assert.equal(SsrWebSocket.instances.length, 1);
+	const receive = (position, rows) => socket.receive({
+		type: 'next', id: subscription.id,
+		payload: todoFrame(TodosArtifact, rows, { cacheScope: 'cache:alice', position, source: 'live', mode })
+	});
+	const rows = [
+		{ id: 'todo-alice', title: 'newer live row', status: 'open' },
+		{ id: 'live-only', title: 'newer live member', status: 'open' }
+	];
+	receive('3', rows);
+	await flushMicrotasks();
+	assert.deepEqual(todos.get().data.todos, rows);
+	const before = client.replica.dehydrate().payload.operations;
+	assert.equal(client.hydrate(second.distributed, second.distributedAuthority), true);
+	assert.deepEqual(todos.get().data.todos, rows, 'stale route seed must not regress live records or membership');
+	assert.deepEqual(client.replica.dehydrate().payload.operations, before, 'live cursor and local operation generation must survive query-only seed');
+	receive('4', [{ ...rows[0], title: 'continued live stream' }]);
+	await flushMicrotasks();
+	assert.equal(todos.get().data.todos[0].title, 'continued live stream');
+	assert.equal(todos.get().data.todos.length, 1);
+	assert.equal(socket.closed, false);
+	assert.equal(socket.sent.some((frame) => frame.type === 'complete'), false);
+	release();
+	assert.equal(socket.sent.filter((frame) => frame.type === 'complete' && frame.id === subscription.id).length, 1);
+	const later = await harness.server.load({ ...harness.event('alice', '5'), isDataRequest: true });
+	assert.equal(client.hydrate(later.distributed, later.distributedAuthority), true);
+	assert.equal(todos.get().data.todos[0].title, 'alice:5', 'a released live owner must not block a later route seed');
+	client.destroy();
+});
+}
+
 test('auth changes purge old data, abort live work, and reject cross-scope hydration', async () => {
 	const harness = serverHarness();
 	const [alice, bob] = await Promise.all([
@@ -480,3 +546,173 @@ test('one browser replica refuses to mix user and elevated generated surfaces', 
 	);
 	client.destroy();
 });
+
+
+test('lazy command authority preserves isolated SSR hydration and query prefetch without importing commands', async () => {
+ const harness = serverHarness();
+ const [alice, bob] = await Promise.all([harness.server.load(harness.event('alice')), harness.server.load(harness.event('bob'))]);
+ const hash = `sha256:${'d'.repeat(64)}`;
+ const status = {name:'Status',document:'query Status { commandStatus { state } }', operationHash:hash, protocol:{...TodosArtifact.protocol, protocolHash:`sha256:${'c'.repeat(64)}`, operation:hash}};
+ let imports=0;let fetches=0;
+ const clients=[alice,bob].map((data,i)=>createDistributedSvelteKit({
+  browser:false, boundaries:[todosBoundary], session:{getAuth:()=>({accessToken:i===0?'alice':'bob'})},
+  hydration:data.distributed, authority:data.distributedAuthority,
+  fetch:async()=>{fetches++;throw Error('hydrated selection must not refetch')},
+  createCommands:(replica,transport)=>createLazyReplicaCommandRuntime(replica,transport,
+   {commands:{'todo.ping':{operationHash:hash,hasInput:false}},status},async()=>{imports++;throw Error('commands must stay deferred')})
+ }));
+ for(const [i,client] of clients.entries()){
+  const store=client.operation(TodosArtifact).use();
+  const release=store.subscribe(()=>{});
+  assert.equal(store.get().data.todos[0].id,i===0?'todo-alice':'todo-bob');
+  await client.prefetchLocation('/todos',{search:new URLSearchParams(),session:{},props:{}});
+  release();
+ }
+ assert.equal(imports,0);assert.equal(fetches,0);
+ clients.forEach(client=>client.destroy());
+ await assert.rejects(clients[0].preloadCommands(),/destroyed/);
+});
+
+
+test('fresh same-scope SSR authority rotates credentials without emptying the visible replica', async () => {
+	const harness = serverHarness();
+	const first = await harness.server.load(harness.event('alice', '1'));
+	const second = await harness.server.load(harness.event('alice', '2'));
+	const pageData = createPageDataSessionSource(first);
+	const requests = [];
+	SsrWebSocket.instances.length = 0;
+	const client = createDistributedSvelteKit({
+		boundaries: [todosBoundary], session: pageData.session,
+		hydration: first.distributed, authority: first.distributedAuthority,
+		fetch: (url, init) => new Promise(resolve => requests.push({init, resolve})),
+		webSocket: SsrWebSocket
+	});
+	const todos = client.operation(TodosArtifact).use();
+	const values = [];
+	const unsubscribe = todos.subscribe(snapshot => values.push(snapshot.data.todos?.[0]?.title));
+	await flushMicrotasks();
+	const oldSocket = SsrWebSocket.instances[0];
+	const oldRequest = todos.refetch();
+	await flushMicrotasks();
+	assert.equal(requests.length, 1);
+	client.replica.writeResult(TodosArtifact, {}, todoFrame(TodosArtifact, [{id:'todo-alice', title:'confirmed ahead', status:'open'}], {cacheScope:'cache:alice', position:'3'}), 'network');
+	client.replica.createOptimisticLayer('pending-edit', writer => writer.writeRecord(TodoModel, 'todo-alice', {fields:{title:'optimistic edit'}}));
+	pageData.set({...second, accessToken: 'rotated-alice'});
+	await flushMicrotasks();
+	assert.ok(values.every(value => value === 'alice:1' || value === 'confirmed ahead' || value === 'optimistic edit'), JSON.stringify(values));
+	assert.equal(todos.get().data.todos[0].title, 'optimistic edit');
+	assert.equal(requests[0].init.signal.aborted, true);
+	assert.equal(oldSocket.closed, true);
+	assert.equal(requests.length, 1, 'fresh SSR data needs no replacement browser query');
+	const nextSocket = SsrWebSocket.instances.at(-1);
+	assert.notEqual(nextSocket, oldSocket);
+	nextSocket.open();
+	await flushMicrotasks();
+	assert.equal(nextSocket.sent[0].payload.authorization, 'Bearer rotated-alice');
+	requests[0].resolve(jsonResponse(todoFrame(TodosArtifact, [{id:'todo-alice',title:'late old credential',status:'open'}], {cacheScope:'cache:alice',position:'3'})));
+	await oldRequest;
+	assert.equal(todos.get().data.todos[0].title, 'optimistic edit', 'closed credential work cannot overwrite the new seed');
+	client.replica.rejectOptimisticLayer('pending-edit');
+	assert.equal(todos.get().data.todos[0].title, 'confirmed ahead', 'the refresh seed cannot overwrite a newer confirmed command result');
+	unsubscribe(); client.destroy();
+});
+
+test('queued page-data updates retain the fresh authority before seedless invalidation', async () => {
+	const harness = serverHarness();
+	const first = await harness.server.load(harness.event('alice', '1'));
+	const second = await harness.server.load(harness.event('alice', '2'));
+	const pageData = createPageDataSessionSource(first);
+	SsrWebSocket.instances.length = 0;
+	let fetches = 0;
+	const client = createDistributedSvelteKit({
+		boundaries: [todosBoundary], session: pageData.session,
+		hydration: first.distributed, authority: first.distributedAuthority,
+		fetch: () => { fetches += 1; return new Promise(() => {}); },
+		webSocket: SsrWebSocket
+	});
+	const todos = client.operation(TodosArtifact).use();
+	const values = [];
+	const unsubscribe = todos.subscribe(snapshot => values.push(snapshot.data.todos?.[0]?.title));
+	await flushMicrotasks();
+	const oldSocket = SsrWebSocket.instances[0];
+	// A refresh supplies independent authority; invalidateAll then replaces it
+	// with normal data-request output, which intentionally contains no seed.
+	pageData.set({...second, accessToken: 'rotated-alice'});
+	pageData.set({...second, accessToken: 'rotated-alice', distributed: undefined, distributedAuthority: undefined});
+	await flushMicrotasks();
+	assert.ok(values.every(value => value === 'alice:1'), JSON.stringify(values));
+	assert.equal(fetches, 0);
+	assert.equal(oldSocket.closed, true);
+	const nextSocket = SsrWebSocket.instances.at(-1);
+	assert.notEqual(nextSocket, oldSocket);
+	nextSocket.open();
+	await flushMicrotasks();
+	assert.equal(nextSocket.sent[0].payload.authorization, 'Bearer rotated-alice');
+	// A later, different credential cannot borrow the consumed transfer.
+	pageData.set({accessToken: 'unproven-rotation'});
+	await flushMicrotasks();
+	assert.equal(client.replica.scope, undefined);
+	assert.deepEqual(todos.get().data, {});
+	unsubscribe(); client.destroy();
+});
+
+test('a credential rotated by follow-up data loading carries independent authority', async () => {
+	const harness = serverHarness();
+	const first = await harness.server.load(harness.event('alice'));
+	const refresh = await harness.server.load(harness.event('alice', '2'));
+	const pageData = createPageDataSessionSource(first);
+	const client = createDistributedSvelteKit({
+		boundaries: [todosBoundary], session: pageData.session,
+		hydration: first.distributed, authority: first.distributedAuthority,
+		fetch: () => new Promise(() => {}), webSocket: SsrWebSocket
+	});
+	const todos = client.operation(TodosArtifact).use({}, {live:false});
+	const values = [];
+	const unsubscribe = todos.subscribe(snapshot => values.push(snapshot.data.todos?.[0]?.title));
+	await flushMicrotasks();
+	pageData.set({...refresh, accessToken:'refresh-credential'});
+	await flushMicrotasks();
+	// The follow-up request can legitimately rotate again (elapsed refresh skew
+	// or another request renewing the cookie). Its authority must be independent
+	// of the already-consumed refresh transfer, not inferred from the token.
+	const event = harness.event('alice', '3');
+	const fetch = event.fetch;
+	event.locals.session.accessToken = 'follow-up-credential';
+	event.fetch = (url, init) => fetch(url, {...init, headers:{...init.headers, authorization:'Bearer alice'}});
+	const navigation = await harness.server.load({...event, isDataRequest:true});
+	pageData.set(navigation);
+	await flushMicrotasks();
+	assert.ok(navigation.distributedAuthority, 'changed data-request credential needs fresh server authority');
+	assert.ok(values.every(value => value === 'alice:1'), JSON.stringify(values));
+	assert.equal(client.replica.scope.cacheScope, 'cache:alice');
+	unsubscribe(); client.destroy();
+});
+
+for (const kind of ['missing', 'replayed', 'historical', 'tampered', 'different-scope', 'logout']) {
+	test(`credential change with ${kind} hydration still purges the old replica`, async () => {
+		const harness = serverHarness();
+		const first = await harness.server.load(harness.event('alice'));
+		const second = await harness.server.load(harness.event(kind === 'different-scope' ? 'bob' : 'alice', '2'));
+		const pageData = createPageDataSessionSource(first);
+		const client = createDistributedSvelteKit({
+			boundaries: [todosBoundary], session: pageData.session,
+			hydration: first.distributed, authority: first.distributedAuthority,
+			fetch: () => new Promise(() => {}), webSocket: SsrWebSocket
+		});
+		const todos = client.operation(TodosArtifact).use({}, {live:false});
+		const unsubscribe = todos.subscribe(() => {});
+		await flushMicrotasks();
+		let next = {...second, accessToken:'new-credential'};
+		if(kind === 'missing') {delete next.distributed;delete next.distributedAuthority;}
+		if(kind === 'historical') {pageData.set({...first, distributed:undefined, distributedAuthority:undefined});await flushMicrotasks();}
+		if(kind === 'replayed' || kind === 'historical') next = {...first, accessToken:'new-credential'};
+		if(kind === 'tampered') {next.distributed = structuredClone(next.distributed);next.distributed.state.scope.cacheScope = 'cache:forged';}
+		if(kind === 'logout') next = {session:null};
+		pageData.set(next);
+		await flushMicrotasks();
+		assert.equal(todos.get().complete, false);
+		assert.deepEqual(todos.get().data, {});
+		assert.equal(client.replica.scope, undefined);
+		unsubscribe(); client.destroy();
+	});
+}

@@ -358,15 +358,6 @@ mod tests {
         crate::outbox_worker::testing::block_on(future)
     }
 
-    fn load(repo: &InMemoryRepository, id: &str) -> OutboxMessage {
-        repo.outbox_storage()
-            .read()
-            .unwrap()
-            .get(id)
-            .unwrap()
-            .clone()
-    }
-
     #[tokio::test]
     async fn immediate_publish_leaves_nothing_for_the_drainer() {
         let repo = InMemoryRepository::new();
@@ -384,7 +375,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.published, 1);
-        assert_eq!(load(&repo, &id).status, OutboxMessageStatus::Published);
+        assert!(!repo.outbox_storage().read().unwrap().contains_key(&id));
 
         let drain = OutboxDrainRunner::new(OutboxDispatcher::new(
             repo.outbox_store(),
@@ -423,10 +414,11 @@ mod tests {
         .await
         .expect("drain should publish the unclaimed row");
         handle.stop().await.unwrap();
-        assert_eq!(
-            load(&repo, "evt-crash").status,
-            OutboxMessageStatus::Published
-        );
+        assert!(!repo
+            .outbox_storage()
+            .read()
+            .unwrap()
+            .contains_key("evt-crash"));
     }
 
     #[tokio::test]

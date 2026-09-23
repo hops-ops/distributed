@@ -219,6 +219,12 @@ fn validate_codec(
 ) -> Result<(), ClientCompileError> {
     match scalar_codecs.get(scalar) {
         Some(expected) if expected == codec => Ok(()),
+        Some(_)
+            if scalar == "BigInt"
+                && matches!(codec, "uint8" | "uint16" | "uint32" | "uint64_safe_integer") =>
+        {
+            Ok(())
+        }
         Some(expected) => Err(invalid(
             "client.manifest.command_type_codec",
             format!("{label} codec `{codec}` does not match `{scalar}` codec `{expected}`"),

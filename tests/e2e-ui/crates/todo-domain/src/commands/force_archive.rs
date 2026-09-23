@@ -1,4 +1,4 @@
-use distributed::graphql::{Eventual, PreparedCommand};
+use distributed::command::{Eventual, PreparedCommand};
 use distributed::microsvc::{CausalCommandContext, HandlerError};
 use distributed::portable_command;
 use serde::{Deserialize, Serialize};
@@ -6,12 +6,12 @@ use serde::{Deserialize, Serialize};
 use super::support::{admin_user, principal, rejected};
 use crate::{domain_commands, Todo, TodoState};
 
-#[derive(Debug, Deserialize, distributed::GraphqlInput)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct TodoForceArchiveInput {
     pub todo_id: String,
 }
 
-#[derive(Debug, Serialize, distributed::GraphqlOutput)]
+#[derive(Debug, Serialize, distributed::CommandOutput)]
 pub struct TodoForceArchivePayload {
     pub todo_id: String,
     pub owner_id: String,
