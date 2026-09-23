@@ -113,9 +113,7 @@ pub use service::GraphqlServiceBindError;
     feature = "rabbitmq",
     feature = "kafka",
 ))]
-pub use workers::{
-    spawn_outbox_publish_loop, spawn_service_consumer_loop, CONSUMER_IDLE_POLL,
-};
+pub use workers::{spawn_outbox_publish_loop, spawn_service_consumer_loop};
 pub use service::{
     direct_read_model, invoke_transition, require_loaded, CausalCommandContext, CausalCommitBuilder,
     CausalRepository, CommandRequest, CommandResponse, DeliveryKind, DirectReadModelProjection,
