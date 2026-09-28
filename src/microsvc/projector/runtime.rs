@@ -292,6 +292,18 @@ where
             )?;
             match store.projection_input_disposition(&trusted).await? {
                 ProjectionInputDisposition::Pending => {}
+                ProjectionInputDisposition::Redelivery => {
+                    store
+                        .commit_projection(crate::projection_protocol::ProjectionCommitBatch {
+                            input: trusted,
+                            change_epoch: self.change_epoch.clone(),
+                            ownership: self.compiled.ownership().to_vec(),
+                            mutations: Vec::new(),
+                            observations: Vec::new(),
+                        })
+                        .await?;
+                    return Ok(());
+                }
                 ProjectionInputDisposition::Duplicate(_) | ProjectionInputDisposition::Stale(_) => {
                     return Ok(())
                 }
@@ -568,6 +580,18 @@ where
             )?;
             match store.projection_input_disposition(&trusted).await? {
                 ProjectionInputDisposition::Pending => {}
+                ProjectionInputDisposition::Redelivery => {
+                    store
+                        .commit_projection(crate::projection_protocol::ProjectionCommitBatch {
+                            input: trusted,
+                            change_epoch: self.change_epoch.clone(),
+                            ownership: self.compiled.ownership().to_vec(),
+                            mutations: Vec::new(),
+                            observations: Vec::new(),
+                        })
+                        .await?;
+                    return Ok(());
+                }
                 ProjectionInputDisposition::Duplicate(_) | ProjectionInputDisposition::Stale(_) => {
                     return Ok(())
                 }

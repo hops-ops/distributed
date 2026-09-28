@@ -297,9 +297,11 @@ impl OutboxMessage {
                 ),
             )
             .map_err(|error| DomainEventCaptureError::BodyEncoding(error.to_string()))?;
-        message.source_aggregate_type = Some(occurrence.aggregate_type().to_string());
-        message.source_aggregate_id = Some(occurrence.aggregate_id().to_string());
-        message.source_sequence = Some(occurrence.aggregate_sequence());
+        if occurrence.external_source().is_none() {
+            message.source_aggregate_type = Some(occurrence.aggregate_type().to_string());
+            message.source_aggregate_id = Some(occurrence.aggregate_id().to_string());
+            message.source_sequence = Some(occurrence.aggregate_sequence());
+        }
         Ok(message)
     }
 

@@ -236,6 +236,21 @@ impl InMemoryProjectionProtocolState {
             gap_free,
         };
         self.validate_input_identity(&candidate)?;
+        let repeated_effect = self
+            .messages
+            .get(&MessageKey {
+                topology: cursor.topology().clone(),
+                message_id: message_id.to_string(),
+            })
+            .is_some_and(|identity| {
+                self.applied_receipts
+                    .contains_key(&CursorReceiptKey::new(&identity.cursor, generation))
+                    || self.applied_receipts.iter().any(|(key, receipt)| {
+                        key.generation == generation
+                            && key.partition == PartitionKey::from_input(cursor)
+                            && receipt.message_id == message_id
+                    })
+            });
         if let Some(receipt) = self
             .applied_receipts
             .get(&CursorReceiptKey::new(cursor, generation))
@@ -252,7 +267,11 @@ impl InMemoryProjectionProtocolState {
         let input_key = InputKey::new(cursor, generation);
         let Some(previous) = self.inputs.get(&input_key) else {
             self.reject_reused_message(cursor, fingerprint, message_id, causation_id, gap_free)?;
-            return Ok(InputDisposition::New);
+            return Ok(if repeated_effect {
+                InputDisposition::Redelivery
+            } else {
+                InputDisposition::New
+            });
         };
 
         match cursor.compare_position(&previous.cursor) {
@@ -292,7 +311,11 @@ impl InMemoryProjectionProtocolState {
                 {
                     return Err(ProjectionProtocolError::IncomparableInput);
                 }
-                Ok(InputDisposition::New)
+                Ok(if repeated_effect {
+                    InputDisposition::Redelivery
+                } else {
+                    InputDisposition::New
+                })
             }
         }
     }
@@ -310,7 +333,7 @@ impl InMemoryProjectionProtocolState {
             message_id: message_id.to_string(),
         };
         if let Some(previous) = self.messages.get(&key) {
-            if previous.cursor != *cursor
+            if previous.cursor.compare_position(cursor) == RevisionComparison::Incomparable
                 || previous.fingerprint != fingerprint
                 || previous.causation_id != causation_id
                 || previous.gap_free != gap_free

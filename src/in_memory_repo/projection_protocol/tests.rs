@@ -2315,6 +2315,11 @@ async fn input_disposition_is_read_only_exact_and_repair_fenced() {
 }
 
 #[tokio::test]
+async fn identical_redelivery_advances_only_broker_checkpoint() {
+    crate::projection_protocol::scenario_tests::identical_redelivery_advances_only_broker_checkpoint(ProjectionScenario).await;
+}
+
+#[tokio::test]
 async fn repair_generation_retries_only_the_exact_failed_input() {
     let repository = repository().await;
     repository

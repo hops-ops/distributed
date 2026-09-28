@@ -589,7 +589,11 @@ async fn rebuild_matrix(store: &impl ProjectionProtocolStore) {
         h.apply(store, &first, 1).await.unwrap().outcome,
         ProjectionCommitOutcome::Duplicate
     );
-    h.apply(store, &first, 2).await.unwrap_err(); // same message, different position is still rejected
+    let replayed = h.apply(store, &first, 2).await.unwrap();
+    assert_eq!(replayed.outcome, ProjectionCommitOutcome::Duplicate);
+    assert_eq!(replayed.checkpoint.unwrap().input().position(), 2);
+    assert_eq!(replayed.changes.len(), 1);
+    assert_eq!(replayed.changes[0].kind, ProjectionChangeKind::Checkpoint);
     h.apply(store, &removed, 3).await.unwrap();
 
     // Exact inventory CAS rejects modifications made after begin, including inserts.

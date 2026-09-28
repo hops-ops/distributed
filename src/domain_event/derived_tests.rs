@@ -24,6 +24,111 @@ crate::projection! {
         on { events: [Indexed], mutation: SaveDerived, input: { row: body }, },
     };
 }
+crate::projection! {
+    const EXTERNAL_ROWS: ProjectionDescriptor<EventualOnly> = {
+        name: "external-source-rows", version: 1, epoch: "external-v1", model: DerivedRows,
+        source: external_snapshot,
+        on { events: [Indexed], mutation: SaveDerived, input: { row: body }, },
+    };
+}
+
+fn external(position: u64, bytes: u64) -> DomainEventOccurrence {
+    DomainEventOccurrence::capture_external(
+        ExternalEventSource {
+            producer: "external.ledger".into(),
+            stream: "source:account".into(),
+            position,
+            key: "balance".into(),
+        },
+        std::time::UNIX_EPOCH,
+        Default::default(),
+        &Indexed { bytes },
+    )
+    .unwrap()
+}
+
+#[test]
+fn external_occurrence_has_no_aggregate_and_stable_content_independent_identity() {
+    let first = external(7, 10);
+    let retry = external(7, 10);
+    let conflict = external(7, 11);
+    assert_eq!(first, retry);
+    assert_eq!(first.id(), conflict.id());
+    assert_ne!(
+        first.canonical_bytes().unwrap(),
+        conflict.canonical_bytes().unwrap()
+    );
+    assert_ne!(first.id(), external(8, 10).id());
+    let wire = serde_json::to_value(&first).unwrap();
+    assert!(wire.get("aggregate_type").is_none());
+    assert!(wire.get("aggregate_id").is_none());
+    assert!(wire.get("aggregate_sequence").is_none());
+    assert_eq!(
+        DomainEventOccurrence::from_canonical_bytes(&first.canonical_bytes().unwrap()).unwrap(),
+        first
+    );
+    let outbox = crate::OutboxMessage::from_domain_event_occurrence(&first).unwrap();
+    assert_eq!(outbox.domain_event_occurrence().unwrap(), first);
+    let derived = first
+        .derive("indexer", "summary", &Indexed { bytes: 12 })
+        .unwrap();
+    assert_eq!(derived.external_source(), first.external_source());
+    assert_eq!(
+        DomainEventOccurrence::from_canonical_bytes(&derived.canonical_bytes().unwrap()).unwrap(),
+        derived
+    );
+}
+
+#[test]
+fn external_source_snapshots_fence_positions_conflicts_and_origin() {
+    use crate::projection_protocol::SourceSnapshotVersion as Version;
+    let first = external(7, 10);
+    let fence = Version::from_occurrence(&first).unwrap();
+    assert!(!Version::from_occurrence(&external(6, 9))
+        .unwrap()
+        .advances(&fence)
+        .unwrap());
+    assert!(!Version::from_occurrence(&first)
+        .unwrap()
+        .advances(&fence)
+        .unwrap());
+    assert!(Version::from_occurrence(&external(8, 11))
+        .unwrap()
+        .advances(&fence)
+        .unwrap());
+    assert!(Version::from_occurrence(&external(7, 11))
+        .unwrap()
+        .advances(&fence)
+        .is_err());
+    assert!(Version::from_occurrence(&source())
+        .unwrap()
+        .advances(&fence)
+        .is_err());
+    assert!(EXTERNAL_ROWS
+        .server_executor()
+        .unwrap()
+        .plan(&first)
+        .is_ok());
+    assert!(EXTERNAL_ROWS
+        .server_executor()
+        .unwrap()
+        .plan(&source())
+        .is_err());
+    assert!(SNAPSHOT_ROWS
+        .server_executor()
+        .unwrap()
+        .plan(&first)
+        .is_err());
+    assert!(DERIVED_ROWS.server_executor().unwrap().plan(&first).is_ok());
+    let derived = first
+        .derive("indexer", "summary", &Indexed { bytes: 12 })
+        .unwrap();
+    assert!(EXTERNAL_ROWS
+        .server_executor()
+        .unwrap()
+        .plan(&derived)
+        .is_err());
+}
 
 #[derive(Serialize)]
 struct Indexed {

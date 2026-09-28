@@ -96,6 +96,18 @@
         "path": "migrations/postgres/0008_external_command_binding.sql",
         "sha256": "2f93c5685cde1d5cafd444d3a28dbcbf01f16cd44a566c7af61a7bd2a793a163"
       }
+    },
+    {
+      "version": 9,
+      "description": "projection delivery aliases",
+      "sqlite": {
+        "path": "migrations/sqlite/0009_projection_delivery_aliases.sql",
+        "sha256": "b7fafebbe898fe7d05b6fb385eb6db4fd850fc9d314357bb91582fa5c00f38a4"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0009_projection_delivery_aliases.sql",
+        "sha256": "19845d4bfcb30d1bf43cb485a6bb9f765a6c1db7abf74fb004046457af83a2b9"
+      }
     }
   ]
 }

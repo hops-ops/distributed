@@ -79,15 +79,15 @@ pub use application::{
     MountSelector, ProcessIntent, ProcessPreset, ProjectionSpec, Runtime, RuntimeDialect,
     SurfaceSpec, APPLICATION_MANIFEST_SCHEMA_VERSION, DEPLOYMENT_PLAN_SCHEMA_VERSION,
 };
-pub use command_dispatch::{
-    CommandDispatchEnvelope, CommandDispatchError, CommandDispatchReceipt, CommandDispatcher,
-    LocalCommandDispatcher, RemoteCommandDispatcher, RemoteDispatchConfig, RemoteTrustMode,
-    SharedCommandDispatcher, APPROVED_REMOTE_DISPATCH_PROFILE, COMMAND_DISPATCH_ENVELOPE_VERSION,
-};
 #[cfg(feature = "graphql")]
 pub use command_dispatch::{
     CellRequestContext, CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost,
     TrustedRequestMetadata,
+};
+pub use command_dispatch::{
+    CommandDispatchEnvelope, CommandDispatchError, CommandDispatchReceipt, CommandDispatcher,
+    LocalCommandDispatcher, RemoteCommandDispatcher, RemoteDispatchConfig, RemoteTrustMode,
+    SharedCommandDispatcher, APPROVED_REMOTE_DISPATCH_PROFILE, COMMAND_DISPATCH_ENVELOPE_VERSION,
 };
 
 // Domain events: typed outward contracts distinct from replay events/snapshots.
@@ -96,8 +96,9 @@ pub use domain_event::{
     DomainEventBodyKind, DomainEventCaptureError, DomainEventCaptureOutcome,
     DomainEventCapturePoison, DomainEventCommitGuardError, DomainEventDescriptor,
     DomainEventEnvelope, DomainEventOccurrence, DomainState, DomainStateDescriptor,
-    DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION, DOMAIN_EVENT_OCCURRENCE_VERSION,
-    MAX_DOMAIN_EVENT_BODY_BYTES, MAX_DOMAIN_EVENT_OCCURRENCE_WIRE_BYTES,
+    ExternalEventSource, DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
+    DOMAIN_EVENT_OCCURRENCE_VERSION, MAX_DOMAIN_EVENT_BODY_BYTES,
+    MAX_DOMAIN_EVENT_OCCURRENCE_WIRE_BYTES,
 };
 
 // Logical projection contracts. Physical read-model lowering deliberately lives
@@ -315,6 +316,9 @@ macro_rules! projection {
 macro_rules! __projection_source_policy {
     ($program:expr, aggregate_snapshot) => {
         $program.with_source_snapshots()
+    };
+    ($program:expr, external_snapshot) => {
+        $program.with_external_source_snapshots()
     };
 }
 

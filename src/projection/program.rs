@@ -645,6 +645,8 @@ pub struct ProjectionProgram {
     arms: Vec<ProjectionArm>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     source_snapshots: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    external_source_snapshots: bool,
 }
 
 impl ProjectionProgram {
@@ -694,6 +696,7 @@ impl ProjectionProgram {
             partition,
             arms,
             source_snapshots: false,
+            external_source_snapshots: false,
         })
     }
 
@@ -724,6 +727,19 @@ impl ProjectionProgram {
     /// Whether authoritative row snapshots are fenced by aggregate version.
     pub fn source_snapshots(&self) -> bool {
         self.source_snapshots
+    }
+
+    /// Fence complete external snapshots by the authenticated source position.
+    /// Aggregate and external snapshot programs reject each other's origins.
+    pub fn with_external_source_snapshots(self) -> Result<Self, ProjectionProgramError> {
+        let mut program = self.with_source_snapshots()?;
+        program.external_source_snapshots = true;
+        Ok(program)
+    }
+
+    /// Whether snapshots require external source provenance rather than an aggregate.
+    pub fn external_source_snapshots(&self) -> bool {
+        self.external_source_snapshots
     }
 
     /// Return the stable program name.

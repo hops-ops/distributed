@@ -22,7 +22,7 @@ pub use descriptor::{
 pub use occurrence::{
     DomainEventCaptureError, DomainEventCaptureOutcome, DomainEventCapturePoison,
     DomainEventCommitGuardError, DomainEventDerivation, DomainEventEnvelope, DomainEventOccurrence,
-    DOMAIN_EVENT_OCCURRENCE_VERSION,
+    ExternalEventSource, DOMAIN_EVENT_OCCURRENCE_VERSION,
 };
 
 pub(crate) use canonical::canonical_json_bytes;

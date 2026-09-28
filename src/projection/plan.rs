@@ -390,6 +390,14 @@ impl ResolvedProjectionPlan {
         if program.source_snapshots() && occurrence.derivation().is_some() {
             return Err(ProjectionProgramError::DerivedSourceSnapshot);
         }
+        if program.source_snapshots()
+            && program.external_source_snapshots() != occurrence.external_source().is_some()
+        {
+            return Err(ProjectionProgramError::InvalidOperation {
+                operation: program.name().into(),
+                reason: "snapshot origin does not match the declared source policy".into(),
+            });
+        }
         let matches = program
             .arms()
             .iter()
