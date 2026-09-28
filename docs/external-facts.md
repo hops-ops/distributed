@@ -43,3 +43,15 @@ An ingress that acknowledges an external cursor must first establish its own
 required durable qualification (for example, a history projection atomically
 committed with the protocol fingerprint), and retain source replay until then.
 Publishing is not approval, and waiting for all UI consumers is unnecessary.
+
+Offline snapshot rebuild preserves these same identities. It distinguishes
+original aggregate positions, original external stream/position/member keys,
+and derived occurrence IDs; unrelated external facts cannot collide at empty
+aggregate fields. Duplicate logical IDs must retain identical canonical bytes.
+Aggregate projections still require a complete original aggregate sequence
+prefix. External positions may be sparse or shared by different members, so
+the source adapter must certify the complete retained source range instead of
+inventing a contiguous aggregate history. Rebuild still rejects omitted stored
+source versions, changed content at one source position, a different source
+claiming an existing row, and derived facts used as snapshot authority. It does
+not run business handlers, republish events, or reset delivery cursors.
