@@ -303,14 +303,14 @@ impl SnapshotProjectionRebuild {
         }
         for stream in relevant {
             let sequence = &sequences[&stream];
-            if sequence
-                .iter()
-                .copied()
-                .ne(1..=sequence.last().copied().unwrap_or(0))
+            if let Some((expected, found)) = (1..)
+                .zip(sequence.iter().copied())
+                .find(|(expected, found)| expected != found)
             {
-                return Err(invalid(
-                    "snapshot rebuild requires a complete aggregate sequence prefix",
-                ));
+                return Err(invalid(format!(
+                    "snapshot rebuild requires a complete aggregate sequence prefix for {}/{}: expected {}, found {}",
+                    stream.0, stream.1, expected, found,
+                )));
             }
         }
         for current in &self.expected {
