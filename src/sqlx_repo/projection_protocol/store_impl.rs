@@ -332,12 +332,12 @@ where
 
     fn commit_projection(
         &self,
-        batch: ProjectionCommitBatch,
+        mut batch: ProjectionCommitBatch,
     ) -> impl Future<Output = Result<ProjectionCommitResult, ProjectionProtocolError>> + Send + '_
     {
         async move {
             batch.validate()?;
-            let write_plan = TableWritePlan::new(
+            let mut write_plan = TableWritePlan::new(
                 batch
                     .mutations
                     .iter()
@@ -357,24 +357,35 @@ where
                 lock_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch).await?;
             validate_input_identity_in_tx(&mut tx, &batch.input).await?;
             ensure_active_input(&state, &batch.input)?;
-            match classify_validated_input_in_tx(&mut tx, &batch.input, &state).await? {
-                InputDisposition::Duplicate(checkpoint) => {
-                    return Ok(ProjectionCommitResult::not_applied(
-                        ProjectionCommitOutcome::Duplicate,
-                        Some(checkpoint),
-                    ));
-                }
-                InputDisposition::Stale(checkpoint) => {
-                    return Ok(ProjectionCommitResult::not_applied(
-                        ProjectionCommitOutcome::StaleInput,
-                        Some(checkpoint),
-                    ));
-                }
-                InputDisposition::New => {
-                    ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
-                }
+            let redelivery =
+                match classify_validated_input_in_tx(&mut tx, &batch.input, &state).await? {
+                    InputDisposition::Duplicate(checkpoint) => {
+                        return Ok(ProjectionCommitResult::not_applied(
+                            ProjectionCommitOutcome::Duplicate,
+                            Some(checkpoint),
+                        ));
+                    }
+                    InputDisposition::Stale(checkpoint) => {
+                        return Ok(ProjectionCommitResult::not_applied(
+                            ProjectionCommitOutcome::StaleInput,
+                            Some(checkpoint),
+                        ));
+                    }
+                    InputDisposition::New => {
+                        ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
+                        false
+                    }
+                    InputDisposition::Redelivery => {
+                        ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
+                        batch.mutations.clear();
+                        batch.observations.clear();
+                        write_plan = TableWritePlan::new(Vec::new());
+                        true
+                    }
+                };
+            if !redelivery {
+                ensure_inbox_available_in_tx(&mut tx, &batch.input).await?;
             }
-            ensure_inbox_available_in_tx(&mut tx, &batch.input).await?;
             ensure_partition_ownership_in_tx(&mut tx, &topology, &partition, &batch.ownership)
                 .await?;
 
@@ -585,9 +596,11 @@ where
             }
             store_input_cursor_in_tx(&mut tx, &batch.input, &final_change).await?;
             insert_input_identity_in_tx(&mut tx, &batch.input).await?;
-            insert_input_receipt_in_tx(&mut tx, &batch.input, "applied", None, &final_change)
-                .await?;
-            insert_inbox_in_tx(&mut tx, &batch.input).await?;
+            if !redelivery {
+                insert_input_receipt_in_tx(&mut tx, &batch.input, "applied", None, &final_change)
+                    .await?;
+                insert_inbox_in_tx(&mut tx, &batch.input).await?;
+            }
             update_partition_head_in_tx(
                 &mut tx,
                 &topology,
@@ -621,7 +634,11 @@ where
                 tables: changed_tables,
             });
             Ok(ProjectionCommitResult {
-                outcome: ProjectionCommitOutcome::Applied,
+                outcome: if redelivery {
+                    ProjectionCommitOutcome::Duplicate
+                } else {
+                    ProjectionCommitOutcome::Applied
+                },
                 checkpoint: Some(checkpoint),
                 records,
                 changes,
@@ -710,7 +727,9 @@ where
                 InputDisposition::New => {
                     ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
                 }
-                InputDisposition::Duplicate(_) | InputDisposition::Stale(_) => {
+                InputDisposition::Duplicate(_)
+                | InputDisposition::Stale(_)
+                | InputDisposition::Redelivery => {
                     return Err(ProjectionProtocolError::InvalidBatch(
                         "cannot record terminal failure for an already processed input".into(),
                     ));
@@ -906,6 +925,10 @@ where
                     InputDisposition::New => {
                         ensure_pending_retry_input_in_tx(&mut tx, &state, input).await?;
                         Ok(ProjectionInputDisposition::Pending)
+                    }
+                    InputDisposition::Redelivery => {
+                        ensure_pending_retry_input_in_tx(&mut tx, &state, input).await?;
+                        Ok(ProjectionInputDisposition::Redelivery)
                     }
                     InputDisposition::Duplicate(checkpoint) => {
                         Ok(ProjectionInputDisposition::Duplicate(checkpoint))

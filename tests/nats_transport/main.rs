@@ -28,6 +28,217 @@ fn nats_url() -> Option<String> {
     env_support::broker_env("NATS_URL", "nats transport test")
 }
 
+#[derive(serde::Serialize, distributed::DomainEvent)]
+#[domain_event(name = "ledger.external_balance", version = 1)]
+struct ExternalBalance {
+    value: u64,
+}
+
+fn external_balance(position: u64, value: u64) -> distributed::DomainEventOccurrence {
+    distributed::DomainEventOccurrence::capture_external(
+        distributed::ExternalEventSource {
+            producer: "ledger-webhook".into(),
+            stream: "account-one".into(),
+            position,
+            key: "balance".into(),
+        },
+        std::time::UNIX_EPOCH,
+        Default::default(),
+        &ExternalBalance { value },
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn external_identity_content_conflicts_and_retained_archive_survive_broker_dedup() {
+    use distributed::bus::{Bus, MessageSource, ReceivedMessage};
+    let Some(url) = nats_url() else { return };
+    let namespace = unique("external_archive");
+    let bus = NatsBus::connect(&url).namespace(&namespace).await.unwrap();
+    let stream = bus.ensure_stream().await.unwrap();
+    let stream_name = stream.cached_info().config.name.clone();
+    let mut source = NatsJetStreamSource::connect(
+        &url,
+        &stream_name,
+        vec![format!("{namespace}.>")],
+        &unique("external_consumer"),
+    )
+    .await
+    .unwrap()
+    .with_strip_prefix(format!("{namespace}.evt."));
+    let first = external_balance(1, 10);
+    let altered = external_balance(1, 11);
+    let next = external_balance(2, 10);
+    assert_eq!(first.id(), altered.id());
+    for event in [&first, &first, &altered, &next] {
+        bus.publish_message(
+            distributed::OutboxMessage::from_domain_event_occurrence(event)
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    }
+    // Identical retry deduplicates, altered bytes with the same logical source
+    // identity must remain visible to the permanent projection conflict fence.
+    for expected in [&first, &altered, &next] {
+        let received = source.recv().await.unwrap().unwrap();
+        assert_eq!(received.message().id(), Some(expected.id()));
+        assert_eq!(
+            received.message().payload(),
+            expected.canonical_bytes().unwrap()
+        );
+        received.ack().await.unwrap();
+    }
+    assert!(source.recv().await.unwrap().is_none());
+    let archive = bus.retained_domain_events().await.unwrap();
+    assert_eq!(archive.len(), 3);
+    assert_eq!(bus.retained_domain_events().await.unwrap(), archive);
+    let js = async_nats::jetstream::new(async_nats::connect(&url).await.unwrap());
+    js.delete_stream(&stream_name).await.unwrap();
+}
+
+#[tokio::test]
+async fn archive_and_live_decode_reject_the_same_poisoned_identity_and_kind_headers() {
+    use distributed::bus::MessageSource;
+    use sha2::{Digest, Sha256};
+    let Some(url) = nats_url() else { return };
+    let js = async_nats::jetstream::new(async_nats::connect(&url).await.unwrap());
+    for case in [
+        "duplicate",
+        "wrong-kind",
+        "missing-kind",
+        "lowercase-aggregate",
+    ] {
+        let namespace = unique("archive_poison");
+        let bus = NatsBus::connect(&url).namespace(&namespace).await.unwrap();
+        let stream = bus.ensure_stream().await.unwrap();
+        let stream_name = stream.cached_info().config.name.clone();
+        let mut source = NatsJetStreamSource::connect(
+            &url,
+            &stream_name,
+            vec![format!("{namespace}.>")],
+            &unique("consumer"),
+        )
+        .await
+        .unwrap()
+        .with_strip_prefix(format!("{namespace}.evt."));
+        let mut event = external_balance(1, 10);
+        if case == "lowercase-aggregate" {
+            let mut entity = distributed::Entity::with_id("account");
+            entity.digest("fixture", &()).unwrap();
+            entity
+                .capture_domain_event("ledger", &ExternalBalance { value: 10 })
+                .unwrap();
+            event = entity.pending_domain_events()[0].clone();
+        }
+        let bytes = event.canonical_bytes().unwrap();
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(
+            "x-sourced-payload-codec",
+            "distributed.domain-event-occurrence+json",
+        );
+        if case != "missing-kind" {
+            headers.insert(
+                "X-Sourced-Kind",
+                if case == "wrong-kind" {
+                    "command"
+                } else {
+                    "event"
+                },
+            );
+        }
+        if event.external_source().is_some() {
+            let mut hash = Sha256::new();
+            hash.update(b"distributed.nats.external-occurrence.v1\0");
+            hash.update(&bytes);
+            headers.insert(
+                "Nats-Msg-Id",
+                format!("external:sha256:{:x}", hash.finalize()),
+            );
+            headers.insert("X-Distributed-Occurrence-Id", event.id());
+            if case == "duplicate" {
+                headers.append("x-distributed-occurrence-id", "forged-extra");
+            }
+        } else {
+            headers.insert("Nats-Msg-Id", event.id());
+            headers.insert("x-distributed-occurrence-id", "forged-logical");
+        }
+        js.publish_with_headers(
+            format!("{namespace}.evt.{}", event.descriptor().name),
+            headers,
+            bytes.into(),
+        )
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+        assert!(
+            bus.retained_domain_events().await.is_err(),
+            "archive accepted {case}"
+        );
+        assert!(source.recv().await.is_err(), "live accepted {case}");
+        js.delete_stream(&stream_name).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn malformed_external_headers_fail_closed_without_ack_or_false_progress() {
+    use distributed::bus::MessageSource;
+    let Some(url) = nats_url() else { return };
+    let prefix = unique("external_poison");
+    let subject = format!("{prefix}.ledger.external_balance");
+    let stream_name = unique("EXTERNAL_POISON");
+    let durable = unique("poison_consumer");
+    let mut source =
+        NatsJetStreamSource::connect(&url, &stream_name, vec![subject.clone()], &durable)
+            .await
+            .unwrap()
+            .with_strip_prefix(format!("{prefix}."));
+    let js = async_nats::jetstream::new(async_nats::connect(&url).await.unwrap());
+    let event = external_balance(1, 10);
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert("Nats-Msg-Id", "forged");
+    headers.insert("X-Sourced-Kind", "event");
+    headers.append("X-Distributed-Occurrence-Id", event.id());
+    headers.append("X-Distributed-Occurrence-Id", event.id());
+    js.publish_with_headers(subject, headers, event.canonical_bytes().unwrap().into())
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    let publisher = NatsPublisher::connect(&url)
+        .await
+        .unwrap()
+        .with_subject_prefix(&prefix);
+    publisher
+        .publish(
+            distributed::OutboxMessage::from_domain_event_occurrence(&external_balance(2, 20))
+                .unwrap()
+                .into(),
+        )
+        .await
+        .unwrap();
+    let error = match source.recv().await {
+        Err(error) => error,
+        _ => panic!("poison must fail closed"),
+    };
+    assert!(error.is_permanent());
+    let mut stream = js.get_stream(&stream_name).await.unwrap();
+    let mut consumer: async_nats::jetstream::consumer::Consumer<
+        async_nats::jetstream::consumer::pull::Config,
+    > = stream.get_consumer(&durable).await.unwrap();
+    let info = consumer.info().await.unwrap();
+    assert_eq!(info.ack_floor.stream_sequence, 0);
+    assert_eq!(info.num_ack_pending, 1);
+    assert_eq!(
+        info.num_pending, 1,
+        "later input was not dispatched past poison"
+    );
+    assert_eq!(stream.info().await.unwrap().state.messages, 2);
+    js.delete_stream(&stream_name).await.unwrap();
+}
+
 #[tokio::test]
 async fn derived_facts_round_trip_after_interrupted_publish_prefix() {
     let Some(url) = nats_url() else { return };

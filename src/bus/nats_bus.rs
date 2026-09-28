@@ -290,7 +290,11 @@ impl NatsBus {
                     TransportError::permanent(format!("invalid archived occurrence: {e}"))
                 })?;
             if event.descriptor().name != name
-                || message.headers.get("Nats-Msg-Id").map(|v| v.as_str()) != Some(event.id())
+                || !super::nats::archived_identity_matches(
+                    &event,
+                    &message.payload,
+                    &message.headers,
+                )
             {
                 return Err(TransportError::permanent(
                     "archived occurrence differs from its transport identity",

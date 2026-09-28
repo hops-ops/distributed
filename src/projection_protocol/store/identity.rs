@@ -182,6 +182,8 @@ impl TrustedProjectionInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProjectionInputDisposition {
     Pending,
+    /// Identical logical input at a new adapter-authenticated broker position.
+    Redelivery,
     Duplicate(ProjectionCheckpoint),
     Stale(ProjectionCheckpoint),
 }

@@ -104,7 +104,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
 
     fn commit_projection(
         &self,
-        batch: ProjectionCommitBatch,
+        mut batch: ProjectionCommitBatch,
     ) -> impl Future<Output = Result<ProjectionCommitResult, ProjectionProtocolError>> + Send + '_
     {
         async move {
@@ -129,7 +129,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .map_err(|_| RepositoryError::LockPoisoned("projection inbox write"))?;
 
             protocol.validate_partition(&partition_key, &batch.input, &batch.change_epoch)?;
-            match protocol.classify_input(
+            let redelivery = match protocol.classify_input(
                 &batch.input.cursor,
                 batch.input.fingerprint,
                 &batch.input.message_id,
@@ -151,12 +151,21 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 }
                 InputDisposition::New => {
                     protocol.validate_pending_retry(&partition_key, &batch.input)?;
+                    false
                 }
-            }
+                InputDisposition::Redelivery => {
+                    protocol.validate_pending_retry(&partition_key, &batch.input)?;
+                    batch.mutations.clear();
+                    batch.observations.clear();
+                    true
+                }
+            };
 
             let receipt = batch.input.inbox_receipt();
             receipt.validate()?;
-            if inbox.contains(&(receipt.consumer.clone(), receipt.message_id.clone())) {
+            if !redelivery
+                && inbox.contains(&(receipt.consumer.clone(), receipt.message_id.clone()))
+            {
                 return Err(ProjectionProtocolError::MessageIdReuse {
                     message_id: batch.input.message_id.clone(),
                 });
@@ -413,7 +422,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
             *inbox = staged_inbox;
 
             Ok(ProjectionCommitResult {
-                outcome: ProjectionCommitOutcome::Applied,
+                outcome: if redelivery {
+                    ProjectionCommitOutcome::Duplicate
+                } else {
+                    ProjectionCommitOutcome::Applied
+                },
                 checkpoint: Some(checkpoint),
                 records,
                 changes,
@@ -495,6 +508,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
             )? {
                 InputDisposition::New => {
                     protocol.validate_pending_retry(&partition_key, &batch.input)?;
+                }
+                InputDisposition::Redelivery => {
+                    return Err(ProjectionProtocolError::InvalidBatch(
+                        "an already applied message cannot record a new failure".into(),
+                    ))
                 }
                 InputDisposition::Duplicate(_) | InputDisposition::Stale(_) => {
                     return Err(ProjectionProtocolError::InvalidBatch(
@@ -676,6 +694,10 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 InputDisposition::New => {
                     protocol.validate_pending_retry(&partition_key, input)?;
                     Ok(ProjectionInputDisposition::Pending)
+                }
+                InputDisposition::Redelivery => {
+                    protocol.validate_pending_retry(&partition_key, input)?;
+                    Ok(ProjectionInputDisposition::Redelivery)
                 }
             }
         }

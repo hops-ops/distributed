@@ -975,9 +975,36 @@ where
         return Err(ProjectionProtocolError::InputCorruption);
     }
     if input_identity_by_message_in_tx(tx, input).await?.is_some() {
-        return Err(ProjectionProtocolError::MessageIdReuse {
-            message_id: input.message_id.clone(),
-        });
+        // The canonical unique binding wins races across projection partitions.
+        // Revalidate against it before retaining a distinct broker delivery.
+        validate_input_identity_in_tx(tx, input).await?;
+        let mut alias = QueryBuilder::<DB>::new(
+            "INSERT INTO projection_input_delivery_aliases \
+             (topology_hash, partition_hash, source_hash, source_partition_hash, \
+             source_epoch, source_position, message_id) VALUES (",
+        );
+        alias.push_bind(topology_hash.as_slice());
+        alias.push(", ").push_bind(partition_hash.as_slice());
+        alias.push(", ").push_bind(source_hash.as_slice());
+        alias.push(", ").push_bind(source_partition_hash.as_slice());
+        alias.push(", ").push_bind(cursor.epoch().as_str());
+        alias.push(", ").push_bind(to_i64::<DB>(
+            cursor.position(),
+            "projection alias position",
+        )?);
+        alias.push(", ").push_bind(input.message_id.as_str());
+        alias.push(") ON CONFLICT DO NOTHING");
+        alias.build().execute(&mut **tx).await.map_err(|error| {
+            protocol_storage_error::<DB>("insert projection delivery alias", error)
+        })?;
+        let stored = input_identity_by_cursor_in_tx(tx, input)
+            .await?
+            .ok_or_else(|| corrupt_storage("projection alias insert has no readable identity"))?;
+        return if input_identity_matches(&stored, input) {
+            Ok(())
+        } else {
+            Err(ProjectionProtocolError::InputCorruption)
+        };
     }
     Err(corrupt_storage(
         "projection input identity collided without a readable conflicting row",

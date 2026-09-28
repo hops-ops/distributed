@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceSnapshotVersion {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    external: bool,
     aggregate_type: String,
     aggregate_id: String,
     sequence: u64,
@@ -46,7 +48,25 @@ impl SourceSnapshotVersion {
         let canonical = event
             .canonical_bytes()
             .map_err(|error| ProjectionProtocolError::InvalidBatch(error.to_string()))?;
+        if let Some(source) = event.external_source() {
+            let mut stream = Sha256::new();
+            stream.update(b"distributed.external-source-snapshot.v1\0");
+            for part in [&source.stream, &source.key] {
+                stream.update((part.len() as u64).to_be_bytes());
+                stream.update(part.as_bytes());
+            }
+            return Ok(Self {
+                external: true,
+                aggregate_type: source.producer.clone(),
+                aggregate_id: format!("external:{:x}", stream.finalize()),
+                sequence: source.position,
+                publication_ordinal: 0,
+                occurrence_id: event.id().into(),
+                occurrence_fingerprint: Sha256::digest(canonical).into(),
+            });
+        }
         Ok(Self {
+            external: false,
             aggregate_type: event.aggregate_type().into(),
             aggregate_id: event.aggregate_id().into(),
             sequence: event.aggregate_sequence(),
@@ -58,7 +78,8 @@ impl SourceSnapshotVersion {
 
     /// True only when this occurrence advances the same authoritative stream.
     pub(crate) fn advances(&self, current: &Self) -> Result<bool, ProjectionProtocolError> {
-        if self.aggregate_type != current.aggregate_type
+        if self.external != current.external
+            || self.aggregate_type != current.aggregate_type
             || self.aggregate_id != current.aggregate_id
         {
             return Err(ProjectionProtocolError::InvalidBatch(

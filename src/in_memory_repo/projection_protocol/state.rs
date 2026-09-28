@@ -289,6 +289,7 @@ pub(in crate::in_memory_repo) fn reject_causal_owned_plans(
 
 pub(super) enum InputDisposition {
     New,
+    Redelivery,
     Duplicate(ProjectionCheckpoint),
     Stale(ProjectionCheckpoint),
 }

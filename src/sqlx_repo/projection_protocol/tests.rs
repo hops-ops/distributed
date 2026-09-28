@@ -16,15 +16,14 @@ mod tests {
     };
     use crate::projection_protocol::{
         ProjectionCheckpointProbe, ProjectionExecutionSnapshotBatchRequest,
-        ProjectionGraphSnapshotRequest, ProjectionObservationRequest,
-        ProjectionLiveRecordRequest, ProjectionQuerySnapshotRequest, ProjectionRecordMutation,
-        ProjectionScopeCodec,
+        ProjectionGraphSnapshotRequest, ProjectionLiveRecordRequest, ProjectionObservationRequest,
+        ProjectionQuerySnapshotRequest, ProjectionRecordMutation, ProjectionScopeCodec,
     };
     use crate::repository::{CommitBatch, ReadModelWritePlanStore, TransactionalCommit};
     use crate::table::{
         ColumnType, DeleteTableRowMutation, ExpectedVersion, ForeignKey, PrimaryKey,
-        RelationshipDef, RelationshipKind, RowKey, RowValue, RowValues, RowWriteMode,
-        TableColumn, TableKind, TableRowMutation, TableSchema, TableSchemaRegistry,
+        RelationshipDef, RelationshipKind, RowKey, RowValue, RowValues, RowWriteMode, TableColumn,
+        TableKind, TableRowMutation, TableSchema, TableSchemaRegistry,
     };
 
     fn topology() -> ProjectorTopologyId {
@@ -231,12 +230,14 @@ mod tests {
     fn graph_key(model: &str) -> RowKey {
         RowKey::new([(
             "id",
-            RowValue::String(match model {
-                "SqlGraphParentView" => "parent-1",
-                "SqlGraphChildView" => "child-1",
-                other => panic!("unknown SQL graph model {other}"),
-            }
-            .into()),
+            RowValue::String(
+                match model {
+                    "SqlGraphParentView" => "parent-1",
+                    "SqlGraphChildView" => "child-1",
+                    other => panic!("unknown SQL graph model {other}"),
+                }
+                .into(),
+            ),
         )])
     }
 
@@ -289,10 +290,7 @@ mod tests {
         ProjectionGraphSnapshotRequest::new(
             root,
             [
-                (
-                    "children".into(),
-                    Arc::new(graph_child_schema().clone()),
-                ),
+                ("children".into(), Arc::new(graph_child_schema().clone())),
                 (
                     "featured_children".into(),
                     Arc::new(graph_child_schema().clone()),
@@ -752,6 +750,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_identical_redelivery_advances_only_broker_checkpoint() {
+        crate::projection_protocol::scenario_tests::identical_redelivery_advances_only_broker_checkpoint(ProjectionScenario).await;
+    }
+
+    #[tokio::test]
     async fn sqlite_obligation_and_unpartitioned_live_evidence_are_exact_and_durable() {
         let evidence_repository = repository().await;
         let scope = record_scope();
@@ -1052,8 +1055,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_modeled_projection_identity_is_durable_across_restart_and_null_history_stays_readable()
-    {
+    async fn sqlite_modeled_projection_identity_is_durable_across_restart_and_null_history_stays_readable(
+    ) {
         let (repository, database_path) = wal_repository_with_retention(16).await;
         let program_a = semantic_program_id('a');
         let scope = record_scope();
@@ -1104,7 +1107,11 @@ mod tests {
             ProjectionChangeRead::Changes { changes, .. } => changes,
             other => panic!("restarted repository must retain projection changes: {other:?}"),
         };
-        assert_eq!(changes.len(), 1, "the staged observation shares the record change");
+        assert_eq!(
+            changes.len(),
+            1,
+            "the staged observation shares the record change"
+        );
         assert!(changes
             .iter()
             .all(|change| change.program_id == Some(program_a)));
@@ -1117,20 +1124,16 @@ mod tests {
 
         // Rows written before semantic identities existed remain useful after
         // migration, but their null identity cannot mint modeled proof.
-        sqlx::query(
-            "UPDATE projection_changes SET program_id = NULL WHERE causation_id = ?",
-        )
-        .bind("semantic-identity-cause-a")
-        .execute(reopened.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE projection_observations SET program_id = NULL WHERE causation_id = ?",
-        )
-        .bind("semantic-identity-cause-a")
-        .execute(reopened.pool())
-        .await
-        .unwrap();
+        sqlx::query("UPDATE projection_changes SET program_id = NULL WHERE causation_id = ?")
+            .bind("semantic-identity-cause-a")
+            .execute(reopened.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE projection_observations SET program_id = NULL WHERE causation_id = ?")
+            .bind("semantic-identity-cause-a")
+            .execute(reopened.pool())
+            .await
+            .unwrap();
         let null_history = reopened
             .projection_causation_evidence(&selected)
             .await
@@ -1139,16 +1142,24 @@ mod tests {
         assert_eq!(null_history.observations[0].program_id, None);
         let readable = reopened
             .projection_live_record_batch(
-                &ProjectionLiveRecordBatchRequest::new(vec![
-                    ProjectionLiveRecordRequest::new(&scope_codec(), "SqlTodoView", record_key())
-                        .unwrap(),
-                ])
+                &ProjectionLiveRecordBatchRequest::new(vec![ProjectionLiveRecordRequest::new(
+                    &scope_codec(),
+                    "SqlTodoView",
+                    record_key(),
+                )
+                .unwrap()])
                 .unwrap(),
             )
             .await
             .unwrap();
-        assert!(readable.records[0].is_some(), "unversioned rows remain readable");
-        assert_eq!(readable.records[0].as_ref().unwrap().revision.scope(), &scope);
+        assert!(
+            readable.records[0].is_some(),
+            "unversioned rows remain readable"
+        );
+        assert_eq!(
+            readable.records[0].as_ref().unwrap().revision.scope(),
+            &scope
+        );
 
         remove_wal_database(reopened, &database_path).await;
     }
@@ -2259,9 +2270,9 @@ mod tests {
             assert!(
                 matches!(
                     repository.commit_projection(failed_batch()).await,
-                    Err(ProjectionProtocolError::Table(TableStoreError::BackendStorage {
-                        ..
-                    }))
+                    Err(ProjectionProtocolError::Table(
+                        TableStoreError::BackendStorage { .. }
+                    ))
                 ),
                 "failure position {fail_at}"
             );
@@ -2286,7 +2297,10 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-            assert_eq!(physical_after, physical_before, "failure position {fail_at}");
+            assert_eq!(
+                physical_after, physical_before,
+                "failure position {fail_at}"
+            );
             for (index, expected) in snapshots_before.iter().enumerate() {
                 assert_eq!(
                     &repository
@@ -2955,8 +2969,15 @@ mod tests {
         let (cache_store, cache_pool, cache_tables, cache_before) = {
             let pool = crate::graphql::GraphqlPool::Sqlite(repository.pool().clone());
             let tables = vec!["sql_todo_views".to_owned()];
-            let store = crate::graphql::delivery::GatewayVersionStore::install(&pool, "atomic-cache-test", tables.clone()).await.unwrap();
-            let before = serde_json::to_value(store.current(&pool, &tables).await.unwrap()).unwrap();
+            let store = crate::graphql::delivery::GatewayVersionStore::install(
+                &pool,
+                "atomic-cache-test",
+                tables.clone(),
+            )
+            .await
+            .unwrap();
+            let before =
+                serde_json::to_value(store.current(&pool, &tables).await.unwrap()).unwrap();
             (store, pool, tables, before)
         };
         let command_id = uuid::Uuid::now_v7().hyphenated().to_string();
@@ -3010,8 +3031,17 @@ mod tests {
 
         #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
         let cache_committed = {
-            let committed = serde_json::to_value(cache_store.current(&cache_pool, &cache_tables).await.unwrap()).unwrap();
-            assert_ne!(committed, cache_before, "Atomic result and cache dependency versions commit together");
+            let committed = serde_json::to_value(
+                cache_store
+                    .current(&cache_pool, &cache_tables)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_ne!(
+                committed, cache_before,
+                "Atomic result and cache dependency versions commit together"
+            );
             committed
         };
         let metadata = repository
@@ -3109,8 +3139,17 @@ mod tests {
             CommandLookup::InProgress { .. }
         ));
         #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
-        assert_eq!(serde_json::to_value(cache_store.current(&cache_pool, &cache_tables).await.unwrap()).unwrap(), cache_committed,
-            "failed Atomic ledger completion must roll back cache versions too");
+        assert_eq!(
+            serde_json::to_value(
+                cache_store
+                    .current(&cache_pool, &cache_tables)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            cache_committed,
+            "failed Atomic ledger completion must roll back cache versions too"
+        );
         sqlx::query("DROP TRIGGER fail_direct_ledger_completion")
             .execute(repository.pool())
             .await
