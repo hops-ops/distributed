@@ -55,3 +55,24 @@ inventing a contiguous aggregate history. Rebuild still rejects omitted stored
 source versions, changed content at one source position, a different source
 claiming an existing row, and derived facts used as snapshot authority. It does
 not run business handlers, republish events, or reset delivery cursors.
+
+Some original aggregate records are intentionally private and therefore absent
+from the public archive. Public-archive-only rebuild remains fail-closed at such
+a gap. An offline adapter can instead supply `AggregateRebuildCoverage`, built
+from a complete original quiescent event-store stream, its independently read
+head, an explicit authored private-contract inventory, and the retained public
+occurrences. Missing or reordered records, unknown private contracts, missing
+publications, changed public identities, and cross-stream substitution fail.
+Every witnessed public occurrence must remain byte-identical in the rebuild
+history. No private record is fabricated as a public event.
+This constructor deliberately supports only authored single-publication streams
+(one ordinal-zero occurrence per non-private record). The adapter must establish
+that emitter contract; arbitrary one-to-many publication completeness cannot be
+inferred from archive absence and is not covered by this API.
+
+This is an operator trust boundary, not cryptographic authentication of an
+arbitrary export: retain the original source provenance and review the artifact
+digest. The digest prevents substitution of the reviewed artifact. It does not
+prove arbitrary private payloads reconstruct a public JSON state. Authored
+event-to-public contract mappings and typed projection body validation remain
+required; an absent broker message never makes a source record private.

@@ -6,6 +6,8 @@ use crate::projection::lower::ProjectionServerExecutorDescriptor;
 use crate::projection_protocol::*;
 use crate::table::{TableMutation, TableWritePlan};
 use crate::DomainEventOccurrence;
+use crate::{repository::StreamIdentity, EventRecord};
+use sha2::{Digest, Sha256};
 
 pub(crate) const MAX_REBUILD_RECORDS: usize = 10_000;
 const MAX_HISTORY_EVENTS: usize = 100_000;
@@ -35,6 +37,158 @@ fn history_identity(event: &DomainEventOccurrence) -> HistoryIdentity {
             event.aggregate_sequence(),
             event.publication_ordinal(),
         )
+    }
+}
+
+/// Offline evidence from one original, quiescent aggregate event store.
+///
+/// This does not authenticate arbitrary supplied data. The operator/source
+/// adapter must retain and review the original store export and its digest.
+/// Private event records are never converted into public occurrences. Explicit
+/// private contracts must come from the authored aggregate, not archive absence.
+/// Public JSON bodies remain authenticated retained publications, not a claimed
+/// reconstruction from private payload bytes.
+#[derive(Clone)]
+pub struct AggregateRebuildCoverage {
+    stream: (String, String),
+    head: u64,
+    public: BTreeMap<String, [u8; 32]>,
+    source_digest: [u8; 32],
+}
+
+impl AggregateRebuildCoverage {
+    /// Validate a complete original stream against its independently captured
+    /// head and retained public publications. The trusted offline adapter must
+    /// bind `identity`, `head` and `records` to the same quiescent source store.
+    /// `private_contracts` is an explicit authored contract inventory, never a
+    /// list inferred from missing broker messages.
+    /// This bounded adapter supports only authored streams that emit exactly
+    /// one public occurrence (ordinal zero) per non-private source record. The
+    /// caller must verify that contract; arbitrary one-to-many emitters require
+    /// an independently complete publication manifest and are not supported.
+    pub fn from_retained_stream(
+        identity: &StreamIdentity,
+        head: u64,
+        records: &[EventRecord],
+        private_contracts: &[(&str, u64)],
+        public_history: &[DomainEventOccurrence],
+    ) -> Result<Self, ProjectionProtocolError> {
+        if records.is_empty()
+            || head != records.len() as u64
+            || records.len() > MAX_HISTORY_EVENTS
+            || public_history.len() > MAX_HISTORY_EVENTS
+        {
+            return Err(invalid(
+                "aggregate coverage requires a bounded nonempty original stream",
+            ));
+        }
+        let stream = (
+            identity.aggregate_type().to_owned(),
+            identity.aggregate_id().to_owned(),
+        );
+        let mut public = BTreeMap::new();
+        let mut public_bytes = 0usize;
+        let mut private = BTreeSet::new();
+        for contract in private_contracts {
+            if contract.0.is_empty() || contract.1 == 0 || !private.insert(*contract) {
+                return Err(invalid("invalid or duplicate private contract inventory"));
+            }
+        }
+        let mut positions: BTreeMap<u64, Vec<&DomainEventOccurrence>> = BTreeMap::new();
+        for event in public_history.iter().filter(|event| {
+            event.external_source().is_none()
+                && event.derivation().is_none()
+                && event.aggregate_type() == stream.0
+                && event.aggregate_id() == stream.1
+        }) {
+            let bytes = event.canonical_bytes().map_err(invalid)?;
+            public_bytes = public_bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| invalid("coverage public size overflow"))?;
+            if public_bytes > MAX_HISTORY_BYTES {
+                return Err(invalid("aggregate coverage public history exceeds 64 MiB"));
+            }
+            let fingerprint: [u8; 32] = Sha256::digest(bytes).into();
+            if let Some(previous) = public.insert(event.id().into(), fingerprint) {
+                if previous != fingerprint {
+                    return Err(invalid("aggregate coverage public identity conflict"));
+                }
+                continue;
+            }
+            positions
+                .entry(event.aggregate_sequence())
+                .or_default()
+                .push(event);
+        }
+        let mut digest = Sha256::new();
+        let mut total = 0usize;
+        for (offset, record) in records.iter().enumerate() {
+            if record.sequence != offset as u64 + 1
+                || record.event_version == 0
+                || record.event_name.is_empty()
+                || record.payload_codec.is_empty()
+                || record.payload_codec_version == 0
+            {
+                return Err(invalid(
+                    "aggregate coverage has a missing, reordered or invalid original record",
+                ));
+            }
+            let bytes = crate::domain_event::canonical_json_bytes(record).map_err(invalid)?;
+            total = total
+                .checked_add(bytes.len())
+                .ok_or_else(|| invalid("coverage size overflow"))?;
+            if total > MAX_HISTORY_BYTES {
+                return Err(invalid("aggregate coverage exceeds 64 MiB"));
+            }
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+            let declared_private =
+                private.contains(&(record.event_name.as_str(), record.event_version));
+            let occurrences = positions.remove(&record.sequence).unwrap_or_default();
+            if declared_private {
+                if !occurrences.is_empty() {
+                    return Err(invalid(
+                        "private source contract conflicts with a public occurrence",
+                    ));
+                }
+            } else {
+                if occurrences.is_empty() {
+                    return Err(invalid(
+                        "aggregate coverage omits a required public occurrence",
+                    ));
+                }
+                if occurrences.len() != 1 || occurrences[0].publication_ordinal() != 0 {
+                    return Err(invalid(
+                        "aggregate coverage requires an authored single-publication stream",
+                    ));
+                }
+                for occurrence in occurrences {
+                    if occurrence.descriptor().name != record.event_name
+                        || occurrence.descriptor().version != record.event_version
+                        || record.metadata.get("causation_id").map(String::as_str)
+                            != occurrence.causation_id()
+                    {
+                        return Err(invalid("aggregate coverage public occurrence differs from its original source record"));
+                    }
+                }
+            }
+        }
+        if !positions.is_empty() {
+            return Err(invalid(
+                "aggregate coverage ends before a public occurrence",
+            ));
+        }
+        Ok(Self {
+            stream,
+            head,
+            public,
+            source_digest: digest.finalize().into(),
+        })
+    }
+
+    /// Content identity of the validated original private record sequence.
+    pub fn source_digest(&self) -> [u8; 32] {
+        self.source_digest
     }
 }
 
@@ -191,10 +345,25 @@ impl SnapshotProjectionRebuild {
         self,
         history: &[DomainEventOccurrence],
     ) -> Result<SnapshotProjectionRebuildPlan, ProjectionProtocolError> {
+        self.from_complete_history_with_coverage(history, &[])
+    }
+
+    /// Rebuild with independently retained original aggregate-log evidence.
+    /// The original public-archive-only method remains strict when no witness
+    /// is supplied. Every public identity captured by a witness must be present
+    /// with the same canonical bytes in this history.
+    pub fn from_complete_history_with_coverage(
+        self,
+        history: &[DomainEventOccurrence],
+        coverage: &[AggregateRebuildCoverage],
+    ) -> Result<SnapshotProjectionRebuildPlan, ProjectionProtocolError> {
         if history.len() > MAX_HISTORY_EVENTS {
             return Err(invalid(
                 "snapshot rebuild history exceeds 100000 occurrences",
             ));
+        }
+        if coverage.len() > MAX_REBUILD_RECORDS {
+            return Err(invalid("aggregate coverage exceeds 10000 streams"));
         }
         let mut bytes = 0usize;
         let mut identities = BTreeMap::new();
@@ -204,6 +373,12 @@ impl SnapshotProjectionRebuild {
         let mut relevant = BTreeSet::new();
         let mut versions: HashMap<ProjectionRecordScope, Vec<SourceSnapshotVersion>> =
             HashMap::new();
+        let mut covered = BTreeMap::new();
+        for witness in coverage {
+            if covered.insert(witness.stream.clone(), witness).is_some() {
+                return Err(invalid("duplicate aggregate coverage stream"));
+            }
+        }
         for event in history {
             let canonical = event.canonical_bytes().map_err(invalid)?;
             bytes = bytes
@@ -301,8 +476,41 @@ impl SnapshotProjectionRebuild {
                 }
             }
         }
+        for witness in covered.values() {
+            for (id, expected) in &witness.public {
+                let bytes = logical_ids
+                    .get(id.as_str())
+                    .ok_or_else(|| invalid("rebuild history omits witnessed public occurrence"))?;
+                if <[u8; 32]>::from(Sha256::digest(bytes)) != *expected {
+                    return Err(invalid(
+                        "rebuild history differs from witnessed public content",
+                    ));
+                }
+            }
+        }
         for stream in relevant {
             let sequence = &sequences[&stream];
+            if let Some(witness) = covered.get(&stream) {
+                if sequence.last().is_some_and(|last| *last > witness.head) {
+                    return Err(invalid(
+                        "public history exceeds its original source coverage",
+                    ));
+                }
+                // Every public occurrence for a covered stream must be in the
+                // exact reviewed inventory, including ones irrelevant to this
+                // particular projection.
+                for event in history.iter().filter(|event| {
+                    event.external_source().is_none()
+                        && event.derivation().is_none()
+                        && event.aggregate_type() == stream.0
+                        && event.aggregate_id() == stream.1
+                }) {
+                    if !witness.public.contains_key(event.id()) {
+                        return Err(invalid("unwitnessed public occurrence in covered stream"));
+                    }
+                }
+                continue;
+            }
             if let Some((expected, found)) = (1..)
                 .zip(sequence.iter().copied())
                 .find(|(expected, found)| expected != found)
