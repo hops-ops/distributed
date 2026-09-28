@@ -21,6 +21,56 @@ struct SnapshotRow {
 }
 type SourceSnapshotRows = SnapshotRow;
 
+#[derive(serde::Serialize)]
+struct ExternalRow {
+    id: String,
+    title: String,
+}
+impl crate::DomainEvent for ExternalRow {
+    const DESCRIPTOR: DomainEventDescriptor = DomainEventDescriptor {
+        name: std::borrow::Cow::Borrowed("external.ledger.changed"),
+        version: 1,
+        body: crate::domain_event::DomainEventBodyDescriptor::distributed_json(
+            crate::domain_event::DomainEventBodyKind::Event,
+            "ExternalRow",
+            1,
+            "external-row-v1",
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        ),
+    };
+}
+impl DomainEventContract for ExternalRow {
+    const EVENT_NAME: &'static str = "external.ledger.changed";
+    const EVENT_VERSION: u64 = 1;
+    fn descriptor() -> DomainEventDescriptor {
+        <Self as crate::DomainEvent>::DESCRIPTOR.clone()
+    }
+}
+crate::projection! {
+    const EXTERNAL_SNAPSHOTS: ProjectionDescriptor<EventualOnly> = {
+        name: "external-rebuild-test", version: 1, epoch: "external-rebuild-v1", model: SnapshotRow,
+        source: external_snapshot,
+        on { events: [ExternalRow], mutation: SaveSnapshot, input: { row: body }, },
+    };
+}
+fn external_row(stream: &str, key: &str, position: u64, title: &str) -> DomainEventOccurrence {
+    DomainEventOccurrence::capture_external(
+        crate::domain_event::ExternalEventSource {
+            producer: "external.ledger".into(),
+            stream: stream.into(),
+            position,
+            key: key.into(),
+        },
+        std::time::UNIX_EPOCH,
+        Default::default(),
+        &ExternalRow {
+            id: key.into(),
+            title: title.into(),
+        },
+    )
+    .unwrap()
+}
+
 struct Changed;
 impl DomainEventContract for Changed {
     const EVENT_NAME: &'static str = "snapshot.changed";
@@ -668,6 +718,122 @@ async fn rebuild_rollback(store: &impl ProjectionProtocolStore) {
 #[tokio::test]
 async fn snapshot_rebuild_memory() {
     rebuild_matrix(&crate::InMemoryRepository::new()).await;
+}
+
+#[tokio::test]
+async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
+    use crate::projection::rebuild::SnapshotProjectionRebuild;
+    let store = crate::InMemoryRepository::new();
+    let mounts = crate::LocalProjectionMountsBuilder::new("external-test", "events")
+        .unwrap()
+        .eventual_model::<SnapshotRow, _>(
+            "external-rebuild",
+            EXTERNAL_SNAPSHOTS,
+            "external-rebuild-v1",
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+    let projector = mounts.projector("external-rebuild").unwrap();
+    async fn bootstrap(
+        store: &crate::InMemoryRepository,
+        projector: &crate::graphql::SurfaceProjector,
+    ) {
+        let (_, binding) = projector.modeled[0].raw().unwrap();
+        let physical = binding.physical_topology().unwrap();
+        let compiled = CompiledProjectionTopology::from_modeled_binding(
+            ProjectorTopologyId::new(physical.version(), physical.name(), physical.digest())
+                .unwrap(),
+            binding
+                .outputs()
+                .iter()
+                .map(|output| (output.model(), output.storage(), output.schema())),
+        )
+        .unwrap();
+        store
+            .register_projection_models(compiled.topology(), compiled.ownership())
+            .await
+            .unwrap();
+    }
+    bootstrap(&store, &projector).await;
+    let capture = SnapshotProjectionRebuild::begin(&store, &projector)
+        .await
+        .unwrap();
+    let a = external_row("ledger-a", "a", 7, "old");
+    let b = external_row("ledger-a", "b", 7, "same transaction, different member");
+    let newer = external_row("ledger-a", "a", 42, "new");
+    let aggregate = event("aggregate", 1, "unrelated", false);
+    let derived = aggregate
+        .derive(
+            "ledger-indexer",
+            "summary",
+            &ExternalRow {
+                id: "derived".into(),
+                title: "not a snapshot".into(),
+            },
+        )
+        .unwrap();
+    // Derived facts which match a snapshot arm remain invalid, not silently
+    // converted into source versions.
+    assert!(SnapshotProjectionRebuild::begin(&store, &projector)
+        .await
+        .unwrap()
+        .from_complete_history(&[a.clone(), derived.clone()])
+        .is_err());
+    let history = [
+        newer.clone(),
+        b.clone(),
+        a.clone(),
+        aggregate.clone(),
+        a.clone(),
+    ];
+    let plan = capture.from_complete_history(&history).unwrap();
+    assert_eq!(plan.record_count(), 2);
+    assert_eq!(plan.apply(&store).await.unwrap(), 2);
+    let read = SnapshotProjectionRebuild::begin(&store, &projector)
+        .await
+        .unwrap();
+    assert!(
+        read.from_complete_history(&[a.clone(), b.clone()]).is_err(),
+        "stored newer source evidence cannot disappear"
+    );
+    for conflict in [
+        external_row("ledger-a", "a", 42, "altered"),
+        external_row("other-ledger", "a", 43, "new"),
+    ] {
+        let mut changed = history.to_vec();
+        changed.push(conflict);
+        assert!(SnapshotProjectionRebuild::begin(&store, &projector)
+            .await
+            .unwrap()
+            .from_complete_history(&changed)
+            .is_err());
+    }
+    // An aggregate projector ignores unrelated external facts and derived
+    // events, but still requires its own complete aggregate prefix.
+    let aggregate_store = crate::InMemoryRepository::new();
+    let aggregate_projector = rebuild_projector();
+    bootstrap(&aggregate_store, &aggregate_projector).await;
+    let mixed = [aggregate.clone(), a, b, newer, derived];
+    assert_eq!(
+        SnapshotProjectionRebuild::begin(&aggregate_store, &aggregate_projector)
+            .await
+            .unwrap()
+            .from_complete_history(&mixed)
+            .unwrap()
+            .record_count(),
+        1
+    );
+    assert!(
+        SnapshotProjectionRebuild::begin(&aggregate_store, &aggregate_projector)
+            .await
+            .unwrap()
+            .from_complete_history(&[
+                event("aggregate", 2, "missing prefix", false),
+                external_row("ledger", "c", 100, "unrelated")
+            ])
+            .is_err()
+    );
 }
 
 #[cfg(feature = "sqlite")]

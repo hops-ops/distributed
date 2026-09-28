@@ -11,6 +11,33 @@ pub(crate) const MAX_REBUILD_RECORDS: usize = 10_000;
 const MAX_HISTORY_EVENTS: usize = 100_000;
 const MAX_HISTORY_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum HistoryIdentity {
+    Aggregate(String, String, u64, u32),
+    External(String, String, u64, String),
+    Derived(String),
+}
+
+fn history_identity(event: &DomainEventOccurrence) -> HistoryIdentity {
+    if event.derivation().is_some() {
+        HistoryIdentity::Derived(event.id().to_owned())
+    } else if let Some(source) = event.external_source() {
+        HistoryIdentity::External(
+            source.producer.clone(),
+            source.stream.clone(),
+            source.position,
+            source.key.clone(),
+        )
+    } else {
+        HistoryIdentity::Aggregate(
+            event.aggregate_type().into(),
+            event.aggregate_id().into(),
+            event.aggregate_sequence(),
+            event.publication_ordinal(),
+        )
+    }
+}
+
 pub(crate) fn invalid(detail: impl ToString) -> ProjectionProtocolError {
     ProjectionProtocolError::InvalidBatch(detail.to_string())
 }
@@ -154,8 +181,12 @@ impl SnapshotProjectionRebuild {
     ///
     /// The caller must supply the entire publication history through the
     /// quiescent source head, not a filtered consumer window. This method checks
-    /// covered record identities, sequence prefixes and conflicting duplicates;
+    /// covered record identities, aggregate sequence prefixes and conflicting duplicates;
     /// it cannot discover unpublished or externally deleted source history.
+    /// External source positions can legitimately be sparse (including between
+    /// members of one source transaction). Their completeness must be certified
+    /// by the source adapter/archive; no aggregate prefix is invented for them.
+    /// Stored external row versions must still occur in the supplied history.
     pub fn from_complete_history(
         self,
         history: &[DomainEventOccurrence],
@@ -167,6 +198,7 @@ impl SnapshotProjectionRebuild {
         }
         let mut bytes = 0usize;
         let mut identities = BTreeMap::new();
+        let mut logical_ids = BTreeMap::new();
         let mut sequences: BTreeMap<(String, String), BTreeSet<u64>> = BTreeMap::new();
         let mut rows: HashMap<ProjectionRecordScope, RebuildRow> = HashMap::new();
         let mut relevant = BTreeSet::new();
@@ -184,15 +216,20 @@ impl SnapshotProjectionRebuild {
                 event.aggregate_type().to_owned(),
                 event.aggregate_id().to_owned(),
             );
-            sequences
-                .entry(stream.clone())
-                .or_default()
-                .insert(event.aggregate_sequence());
-            let identity = (
-                stream.clone(),
-                event.aggregate_sequence(),
-                event.publication_ordinal(),
-            );
+            if event.external_source().is_none() && event.derivation().is_none() {
+                sequences
+                    .entry(stream.clone())
+                    .or_default()
+                    .insert(event.aggregate_sequence());
+            }
+            if let Some(previous) = logical_ids.insert(event.id(), canonical.clone()) {
+                if previous != canonical {
+                    return Err(invalid(
+                        "snapshot rebuild history contains conflicting logical identities",
+                    ));
+                }
+            }
+            let identity = history_identity(event);
             if let Some(previous) = identities.insert(identity, canonical.clone()) {
                 if previous != canonical {
                     return Err(invalid(
@@ -204,7 +241,9 @@ impl SnapshotProjectionRebuild {
             if !self.executor.matches(event) {
                 continue;
             }
-            relevant.insert(stream);
+            if event.external_source().is_none() && event.derivation().is_none() {
+                relevant.insert(stream);
+            }
             let lowered = self.executor.plan(event).map_err(invalid)?;
             if !lowered.resolved.source_snapshots() {
                 return Err(invalid("snapshot rebuild resolved a non-snapshot program"));
