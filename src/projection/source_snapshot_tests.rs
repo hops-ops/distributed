@@ -721,6 +721,157 @@ async fn snapshot_rebuild_memory() {
 }
 
 #[tokio::test]
+async fn snapshot_rebuild_original_private_log_coverage() {
+    use crate::projection::rebuild::{AggregateRebuildCoverage, SnapshotProjectionRebuild};
+    let identity = crate::repository::StreamIdentity::new("snapshot-item", "a").unwrap();
+    let first = event("a", 1, "old", false);
+    let third = event("a", 3, "current", false);
+    let history = [first.clone(), third.clone()];
+    let mut records = Vec::new();
+    for (sequence, name) in [
+        (1, "snapshot.changed"),
+        (2, "snapshot.private"),
+        (3, "snapshot.changed"),
+    ] {
+        let mut record = crate::EventRecord::new(name, vec![sequence as u8], sequence);
+        record
+            .metadata
+            .insert("causation_id".into(), format!("cause-a-{sequence}"));
+        records.push(record);
+    }
+    let private = [("snapshot.private", 1)];
+    let witness =
+        AggregateRebuildCoverage::from_retained_stream(&identity, 3, &records, &private, &history)
+            .unwrap();
+    assert_eq!(
+        witness.source_digest(),
+        AggregateRebuildCoverage::from_retained_stream(&identity, 3, &records, &private, &history)
+            .unwrap()
+            .source_digest()
+    );
+    let store = crate::InMemoryRepository::new();
+    // This also exercises the original complete-prefix path and registers the
+    // physical owner; retain its existing rows/tombstone source versions.
+    rebuild_matrix(&store).await;
+    let projector = rebuild_projector();
+    let fresh_store = crate::InMemoryRepository::new();
+    let (_, binding) = projector.modeled[0].raw().unwrap();
+    let physical = binding.physical_topology().unwrap();
+    let compiled = CompiledProjectionTopology::from_modeled_binding(
+        ProjectorTopologyId::new(physical.version(), physical.name(), physical.digest()).unwrap(),
+        binding
+            .outputs()
+            .iter()
+            .map(|output| (output.model(), output.storage(), output.schema())),
+    )
+    .unwrap();
+    fresh_store
+        .register_projection_models(compiled.topology(), compiled.ownership())
+        .await
+        .unwrap();
+    assert!(SnapshotProjectionRebuild::begin(&fresh_store, &projector)
+        .await
+        .unwrap()
+        .from_complete_history(&history)
+        .is_err());
+    let plan = SnapshotProjectionRebuild::begin(&fresh_store, &projector)
+        .await
+        .unwrap()
+        .from_complete_history_with_coverage(&history, &[witness.clone()])
+        .unwrap();
+    assert_eq!(plan.apply(&fresh_store).await.unwrap(), 1);
+    let read = SnapshotProjectionRebuild::begin(&fresh_store, &projector)
+        .await
+        .unwrap();
+    let harness = Harness {
+        codec: read.context.compiled.codec(),
+    };
+    assert_eq!(
+        harness
+            .read(&fresh_store, "a")
+            .await
+            .row
+            .unwrap()
+            .get("title"),
+        Some(&RowValue::String("current".into()))
+    );
+
+    for altered in [
+        vec![first.clone()],
+        vec![first.clone(), event("a", 3, "altered", false)],
+        vec![
+            first.clone(),
+            third.clone(),
+            event("a", 4, "unwitnessed", false),
+        ],
+    ] {
+        assert!(SnapshotProjectionRebuild::begin(&fresh_store, &projector)
+            .await
+            .unwrap()
+            .from_complete_history_with_coverage(&altered, &[witness.clone()])
+            .is_err());
+    }
+    // A witness for this stream cannot cover a missing prefix in another.
+    let mut mixed = history.to_vec();
+    mixed.push(event("other", 2, "missing prefix", false));
+    mixed.push(external_row("ledger", "external", 901, "sparse"));
+    assert!(SnapshotProjectionRebuild::begin(&fresh_store, &projector)
+        .await
+        .unwrap()
+        .from_complete_history_with_coverage(&mixed, &[witness])
+        .is_err());
+    let bad = |head,
+               records: &[crate::EventRecord],
+               private: &[(&str, u64)],
+               history: &[DomainEventOccurrence]| {
+        assert!(AggregateRebuildCoverage::from_retained_stream(
+            &identity, head, records, private, history
+        )
+        .is_err());
+    };
+    bad(4, &records, &private, &history); // independently captured head, truncated export
+    bad(3, &records[..2], &private, &history);
+    bad(3, &records, &[], &history); // absence never declares a record private
+    bad(3, &records, &[("snapshot.private", 2)], &history);
+    bad(3, &records, &private, &[third]); // missing required publication
+    let mut multiple = history.to_vec();
+    multiple.push(occurrence("a", 3, 1, "a", "second publication", false));
+    bad(3, &records, &private, &multiple);
+    let duplicate = [history[0].clone(), history[0].clone(), history[1].clone()];
+    assert!(AggregateRebuildCoverage::from_retained_stream(
+        &identity, 3, &records, &private, &duplicate
+    )
+    .is_ok());
+    bad(
+        3,
+        &records,
+        &[("snapshot.changed", 1), ("snapshot.private", 1)],
+        &history,
+    );
+    for index in [0, 2] {
+        let mut changed = records.clone();
+        changed[index].event_name = "different.public.contract".into();
+        bad(3, &changed, &private, &history);
+        changed = records.clone();
+        changed[index].event_version += 1;
+        bad(3, &changed, &private, &history);
+        changed = records.clone();
+        changed[index]
+            .metadata
+            .insert("causation_id".into(), "different-command".into());
+        bad(3, &changed, &private, &history);
+    }
+    let other = crate::repository::StreamIdentity::new("snapshot-item", "wrong").unwrap();
+    assert!(AggregateRebuildCoverage::from_retained_stream(
+        &other, 3, &records, &private, &history
+    )
+    .is_err());
+    let mut reordered = records.clone();
+    reordered.swap(0, 1);
+    bad(3, &reordered, &private, &history);
+}
+
+#[tokio::test]
 async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
     use crate::projection::rebuild::SnapshotProjectionRebuild;
     let store = crate::InMemoryRepository::new();

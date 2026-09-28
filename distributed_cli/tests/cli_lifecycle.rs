@@ -286,6 +286,7 @@ exit 1
     fs::write(path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 }
 
+#[track_caller]
 fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) {
     let started = std::time::Instant::now();
     while !predicate() {
