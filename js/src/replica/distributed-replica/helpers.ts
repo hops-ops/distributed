@@ -736,6 +736,30 @@ export function stableErrors(
 	return deepEqual(current, next) ? current : freezeErrors(next);
 }
 
+/**
+ * GraphQL payload of a live failure frame (`docs/live-query-delivery.md`): no
+ * result data and a nonempty list of errors that each carry a string message.
+ * Callers also require absent snapshot, live and command metadata. Partial
+ * data with errors is never a failure payload.
+ */
+export function isGraphqlFailurePayload(envelope: {
+	readonly data?: unknown;
+	readonly errors?: unknown;
+}): envelope is { readonly data?: null; readonly errors: readonly GqlError[] } {
+	return (
+		(envelope.data === undefined || envelope.data === null) &&
+		Array.isArray(envelope.errors) &&
+		envelope.errors.length > 0 &&
+		envelope.errors.every(
+			(error: unknown) =>
+				error !== null &&
+				typeof error === 'object' &&
+				!Array.isArray(error) &&
+				typeof (error as { message?: unknown }).message === 'string'
+		)
+	);
+}
+
 export function graphqlError(error: unknown): GqlError {
 	return Object.freeze({
 		message: error instanceof Error ? error.message : String(error),

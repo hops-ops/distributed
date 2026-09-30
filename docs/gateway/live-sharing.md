@@ -37,6 +37,8 @@ If a slow consumer cannot preserve all evidence within its queue, it receives
 `LIVE_RESET_REQUIRED`; a blocked socket is closed so it must reconnect. No
 latest-value replacement silently discards confirmation proof. Group deadline,
 upstream loss and incomplete/invalid origin envelopes also require recovery.
+An origin failure frame (an error-only live execution result) carries no evidence
+and is not fanned out; the group's consumers receive `LIVE_RESET_REQUIRED`.
 
 Dropping a consumer releases only its lease. Last leave aborts the actual upstream
 stream, socket and origin change-feed receiver, including a pending origin SQL

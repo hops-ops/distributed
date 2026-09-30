@@ -33,6 +33,10 @@ export type LiveEntry = {
 	/** Local fence for taking over query snapshots that preceded this stream. */
 	startRevision: string;
 	operationGeneration?: number;
+	/** Consecutive failed live executions; drives the reopen backoff. */
+	failures?: number;
+	/** Pending reopen of this inactive entry after a live failure frame. */
+	retry?: ReturnType<typeof setTimeout>;
 };
 
 export type ProtocolGeneration = {
