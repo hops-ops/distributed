@@ -1945,6 +1945,209 @@ test('snapshot live cannot supersede an incomparable sibling index owner', async
 	assert.equal(unsubscribeCount, 1);
 });
 
+// A layout and a page commonly open independent snapshot streams over the same
+// root row and select different relationships below it.
+const GamesRootLive = Object.freeze({
+	...GamesWithOwner,
+	id: 'query:games-root-live',
+	document: 'query GamesRoot { games { id owner_id } }',
+	protocol: Object.freeze({
+		...GamesWithOwner.protocol,
+		operation: 'query:games-root-live'
+	}),
+	live: Object.freeze({
+		id: 'live:games-root',
+		document: 'subscription GamesRootLive { games { id owner_id } }'
+	}),
+	roots: Object.freeze([
+		Object.freeze({
+			...GamesWithOwner.roots[0],
+			selection: Object.freeze({
+				...GamesWithOwner.roots[0].selection,
+				members: Object.freeze(
+					GamesWithOwner.roots[0].selection.members.filter(
+						(member) => member.kind === 'scalar'
+					)
+				)
+			})
+		})
+	])
+});
+
+function sharedGamesFrame({ artifact, games, revision = '1', withOwner }) {
+	const records = games.flatMap((game, index) => [
+		{
+			path: ['games', String(index)],
+			model: 'GameView',
+			scopeToken: `record:${game.id}`,
+			incarnation: '1',
+			revision,
+			tombstone: false
+		},
+		...(withOwner
+			? [{
+					path: ['games', String(index), 'owner'],
+					model: 'UserView',
+					scopeToken: `record:${game.owner_id}`,
+					incarnation: '1',
+					revision,
+					tombstone: false
+				}]
+			: [])
+	]);
+	return {
+		data: {
+			games: games.map((game) => withOwner
+				? { id: game.id, owner_id: game.owner_id, owner: { id: game.owner_id, name: game.name } }
+				: { id: game.id, owner_id: game.owner_id })
+		},
+		extensions: {
+			distributed: {
+				protocolVersion: DISTRIBUTED_PROTOCOL_VERSION,
+				schemaHash: 'schema-a',
+				authorizationGeneration: 'auth-1',
+				cacheScope: 'cache:a',
+				operation: artifact.live.id,
+				snapshot: {
+					scopeToken: `snapshot:${artifact.id}`,
+					recordsComplete: true,
+					indexesComparable: false,
+					records,
+					indexes: [],
+					observations: []
+				},
+				live: { mode: 'snapshot', reset: true, cursors: [] }
+			}
+		}
+	};
+}
+
+function sharedGamesHarness() {
+	const subscriptions = [];
+	const replica = createDistributedReplica({
+		transport: {
+			fetch() {
+				return new Promise(() => {});
+			},
+			subscribe(request, observer) {
+				const subscription = { operation: request.operationId, observer, closed: false };
+				subscriptions.push(subscription);
+				return () => {
+					subscription.closed = true;
+				};
+			}
+		}
+	});
+	const latest = (operation) =>
+		subscriptions.filter((entry) => entry.operation === operation).at(-1);
+	return { replica, subscriptions, latest };
+}
+
+test('snapshot live admits a frame whose shared membership matches an independent owner', () => {
+	const { replica, latest } = sharedGamesHarness();
+	const layout = replica.watch(GamesRootLive, {}, { live: true });
+	latest('live:games-root').observer.next(sharedGamesFrame({
+		artifact: GamesRootLive, games: [{ id: 'game-1', owner_id: 'user-1' }]
+	}));
+	const page = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	const pageStream = latest('live:games-with-owner');
+	pageStream.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true,
+		games: [{ id: 'game-1', owner_id: 'user-1', name: 'Owner' }]
+	}));
+	assert.deepEqual(replica.read(GamesWithOwnerLiveOperation, {}).data.games, [
+		{ id: 'game-1', owner_id: 'user-1', owner: { id: 'user-1', name: 'Owner' } }
+	], 'the first page frame renders although the layout owns the shared root');
+
+	// A later page frame changes only its own relationship below the shared row.
+	pageStream.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true, revision: '2',
+		games: [{ id: 'game-1', owner_id: 'user-2', name: 'Second' }]
+	}));
+	assert.deepEqual(replica.read(GamesWithOwnerLiveOperation, {}).data.games, [
+		{ id: 'game-1', owner_id: 'user-2', owner: { id: 'user-2', name: 'Second' } }
+	], 'a live update to a relationship-joined row is delivered');
+
+	// The admitted page stream did not take the shared root from the layout.
+	latest('live:games-root').observer.next(sharedGamesFrame({
+		artifact: GamesRootLive, revision: '3',
+		games: [{ id: 'game-1', owner_id: 'user-2' }, { id: 'game-3', owner_id: 'user-3' }]
+	}));
+	assert.deepEqual(
+		replica.read(GamesRootLive, {}).data.games.map((game) => game.id),
+		['game-1', 'game-3']
+	);
+	pageStream.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true, revision: '3',
+		games: [
+			{ id: 'game-1', owner_id: 'user-2', name: 'Second' },
+			{ id: 'game-3', owner_id: 'user-3', name: 'Third' }
+		]
+	}));
+	assert.deepEqual(
+		replica.read(GamesWithOwnerLiveOperation, {}).data.games.map((game) => game.owner.name),
+		['Second', 'Third']
+	);
+	assert.equal(page.get().live, 'active');
+	assert.equal(pageStream.closed, false, 'agreeing frames never reopen the stream');
+	page.destroy();
+	layout.destroy();
+});
+
+test('snapshot live keeps a disagreeing frame fenced and reopens after the owner catches up', () => {
+	const { replica, subscriptions, latest } = sharedGamesHarness();
+	const layout = replica.watch(GamesRootLive, {}, { live: true });
+	latest('live:games-root').observer.next(sharedGamesFrame({
+		artifact: GamesRootLive, games: [{ id: 'game-1', owner_id: 'user-1' }]
+	}));
+	const page = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	const firstPageStream = latest('live:games-with-owner');
+	// The page stream observed a newer membership than the layout owner.
+	firstPageStream.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true, revision: '2',
+		games: [
+			{ id: 'game-1', owner_id: 'user-1', name: 'Owner' },
+			{ id: 'game-2', owner_id: 'user-2', name: 'Second' }
+		]
+	}));
+	assert.deepEqual(
+		replica.read(GamesRootLive, {}).data.games.map((game) => game.id),
+		['game-1'],
+		'a disagreeing frame cannot replace the independent owner membership'
+	);
+	assert.equal(firstPageStream.closed, false);
+	const subscriptionCount = subscriptions.length;
+
+	latest('live:games-root').observer.next(sharedGamesFrame({
+		artifact: GamesRootLive, revision: '2',
+		games: [{ id: 'game-1', owner_id: 'user-1' }, { id: 'game-2', owner_id: 'user-2' }]
+	}));
+	assert.equal(firstPageStream.closed, true, 'the owner rewrite reopens the fenced stream');
+	assert.equal(subscriptions.length, subscriptionCount + 1);
+	const reopened = latest('live:games-with-owner');
+	assert.notEqual(reopened, firstPageStream);
+
+	// A late frame from the closed stream stays fenced.
+	firstPageStream.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true, revision: '2',
+		games: [{ id: 'game-1', owner_id: 'user-1', name: 'Late' }]
+	}));
+	reopened.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true, revision: '2',
+		games: [
+			{ id: 'game-1', owner_id: 'user-1', name: 'Owner' },
+			{ id: 'game-2', owner_id: 'user-2', name: 'Second' }
+		]
+	}));
+	assert.deepEqual(
+		replica.read(GamesWithOwnerLiveOperation, {}).data.games.map((game) => game.owner.name),
+		['Owner', 'Second']
+	);
+	assert.equal(page.get().live, 'active');
+	page.destroy();
+	layout.destroy();
+});
+
 test('snapshot live replaces SSR membership, updates and removes rows, and fences disposal', () => {
 	let observer;
 	const replica = createDistributedReplica({ transport: {
@@ -2046,10 +2249,12 @@ test('snapshot live keeps a stream started before disposal behind the retired ow
 	empty.extensions.distributed.snapshot.records = [];
 	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
 	const current = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	// The contender disagrees with the active owner's shared owner membership;
+	// agreeing frames are admitted (docs/live-query-delivery.md).
 	observers[1].next(gamesFrame({
 		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
 		operation: GamesWithOwnerLiveOperation.live.id, position: '3',
-		ownerId: 'user-1', ownerName: 'started before disposal', indexesComparable: false,
+		ownerId: 'user-2', ownerName: 'started before disposal', indexesComparable: false,
 		live: { mode: 'snapshot', reset: true, cursors: [] }
 	}));
 	assert.deepEqual(current.get().data.games, []);
@@ -2060,7 +2265,7 @@ test('snapshot live keeps a stream started before disposal behind the retired ow
 	observers[1].next(gamesFrame({
 		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
 		operation: GamesWithOwnerLiveOperation.live.id, position: '4',
-		ownerId: 'user-1', ownerName: 'still started before disposal', indexesComparable: false,
+		ownerId: 'user-2', ownerName: 'still started before disposal', indexesComparable: false,
 		live: { mode: 'snapshot', reset: true, cursors: [] }
 	}));
 	assert.deepEqual(current.get().data.games, []);
@@ -2070,7 +2275,7 @@ test('snapshot live keeps a stream started before disposal behind the retired ow
 	observers[1].next(gamesFrame({
 		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
 		operation: GamesWithOwnerLiveOperation.live.id, position: '5',
-		ownerId: 'user-1', ownerName: 'queued old receiver', indexesComparable: false,
+		ownerId: 'user-2', ownerName: 'queued old receiver', indexesComparable: false,
 		live: { mode: 'snapshot', reset: true, cursors: [] }
 	}));
 	assert.deepEqual(current.get().data.games, [], 'old receiver stays fenced after reopening');
@@ -2096,8 +2301,8 @@ test('reopening a retired live owner restores its ownership fence', () => {
 		...FeaturedGamesWithOwner,
 		live: { id: 'live:featured-owner-reopened', document: 'subscription FeaturedOwnerReopened { featuredGames { id owner { id name } } }' }
 	};
-	const frame = (artifact, responseKey, operation, position, ownerName) => gamesFrame({
-		artifact, responseKey, operation, position, ownerId: 'user-1', ownerName,
+	const frame = (artifact, responseKey, operation, position, ownerName, ownerId = 'user-1') => gamesFrame({
+		artifact, responseKey, operation, position, ownerId, ownerName,
 		indexesComparable: false, live: { mode: 'snapshot', reset: true, cursors: [] }
 	});
 	const replica = createDistributedReplica({ transport: {
@@ -2126,7 +2331,9 @@ test('reopening a retired live owner restores its ownership fence', () => {
 		'games',
 		GamesWithOwnerLiveOperation.live.id,
 		'4',
-		'current contender'
+		'current contender',
+		// Disagrees with the reopened owner; an agreeing frame is admitted.
+		'user-2'
 	));
 	assert.deepEqual(current.get().data.games, []);
 	reopened.destroy();
@@ -2209,7 +2416,8 @@ test('two watches retire shared live ownership only after final disposal', () =>
 	observers[1].next(gamesFrame({
 		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
 		operation: GamesWithOwnerLiveOperation.live.id, position: '3',
-		ownerId: 'user-1', ownerName: 'before final release', indexesComparable: false,
+		// Disagrees with the owner; an agreeing frame is admitted.
+		ownerId: 'user-2', ownerName: 'before final release', indexesComparable: false,
 		live: { mode: 'snapshot', reset: true, cursors: [] }
 	}));
 	assert.deepEqual(startedBeforeFinalRelease.get().data.games, []);
@@ -2218,7 +2426,7 @@ test('two watches retire shared live ownership only after final disposal', () =>
 	observers[1].next(gamesFrame({
 		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
 		operation: GamesWithOwnerLiveOperation.live.id, position: '4',
-		ownerId: 'user-1', ownerName: 'still before final release', indexesComparable: false,
+		ownerId: 'user-2', ownerName: 'still before final release', indexesComparable: false,
 		live: { mode: 'snapshot', reset: true, cursors: [] }
 	}));
 	assert.deepEqual(startedBeforeFinalRelease.get().data.games, []);
