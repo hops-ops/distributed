@@ -140,6 +140,7 @@ import {
 	indexKeyFromTarget,
 	indexMaintenanceSnapshot,
 	indexSemanticLayer,
+	isGraphqlFailurePayload,
 	operationKey,
 	prepareRecordEvidence,
 	protocolOperationSource,
@@ -1153,8 +1154,20 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		if (live !== undefined && snapshot === undefined) {
 			protocolInvalid('extensions.distributed.snapshot');
 		}
+		// A failed live execution has no result: an error-only frame with only
+		// the base envelope. It is receipt-only, like an HTTP error response,
+		// and must not carry a command receipt or create stream state.
+		const liveFailure =
+			source === 'live' &&
+			snapshot === undefined &&
+			live === undefined &&
+			isGraphqlFailurePayload(envelope);
+		if (liveFailure && distributed.command !== undefined) {
+			protocolInvalid('extensions.distributed.command');
+		}
 		if (
 			source === 'live' &&
+			!liveFailure &&
 			(envelope.data !== undefined || envelope.errors !== undefined) &&
 			(snapshot === undefined || live === undefined)
 		) {
@@ -1167,7 +1180,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		}
 		const operationSource = protocolOperationSource(source);
 		const operationState =
-			operation === undefined
+			operation === undefined || liveFailure
 				? undefined
 				: this.#operationProtocol(key, operation, operationSource);
 			if (snapshot === undefined || operationState === undefined) {

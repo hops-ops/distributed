@@ -1,4 +1,4 @@
-import type { GraphqlVariables } from '../../types.js';
+import type { GqlError, GraphqlVariables } from '../../types.js';
 import {
 	type DistributedLiveCursor,
 	type DistributedProtocolEnvelope
@@ -11,7 +11,12 @@ import type {
 	ReplicaWriteSource
 } from '../types.js';
 import {
+	LIVE_FAILURE_RETRY_BASE_MS,
+	LIVE_FAILURE_RETRY_MAX_MS
+} from './constants.js';
+import {
 	graphqlError,
+	isGraphqlFailurePayload,
 	replicaClientRequestExtensions,
 	stableErrors
 } from './helpers.js';
@@ -68,6 +73,7 @@ export function closeActiveTransports(host: FetchLiveHost): void {
 	for (const [key, entry] of host.lives) {
 		retireLiveProtocol(host, key);
 		entry.active = false;
+		cancelLiveRetry(entry);
 		try {
 			entry.unsubscribe();
 		} catch {
@@ -311,7 +317,7 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 						return;
 					}
 					try {
-						host.writeCanonicalResult(
+						const distributed = host.writeCanonicalResult(
 							watch.artifact,
 							watch.variables,
 							result,
@@ -319,9 +325,19 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 							undefined,
 							projectionGeneration
 						);
+						// Accepted without a snapshot, an error-only frame is the
+						// receipt-only failure frame: it admitted nothing.
+						if (
+							distributed.snapshot === undefined &&
+							isGraphqlFailurePayload(result)
+						) {
+							failLive(host, watch, entry, result.errors);
+							return;
+						}
 						state.live = 'active';
 						entry.operationGeneration =
 							host.operationGeneration(watch.key);
+						entry.failures = undefined;
 					} catch (error) {
 						state.live = 'error';
 						state.errors = stableErrors(state.errors, [graphqlError(error)]);
@@ -433,6 +449,7 @@ export function restartLive(host: FetchLiveHost, key: string): void {
 	const count = previous.count;
 	retireLiveProtocol(host, key);
 	previous.active = false;
+	cancelLiveRetry(previous);
 	host.lives.delete(key);
 	try {
 		previous.unsubscribe();
@@ -473,10 +490,67 @@ export function releaseLive(host: FetchLiveHost, key: string): void {
 	if (entry.count > 0) return;
 	retireLiveProtocol(host, key);
 	entry.active = false;
+	cancelLiveRetry(entry);
 	host.lives.delete(key);
 	entry.unsubscribe();
 	host.queryState(key).live = 'off';
 	host.emitState(key, false);
+}
+
+/**
+ * Surface a live failure frame and close its terminal stream
+ * (`docs/live-query-delivery.md`). The frame was receipt-only: no data,
+ * cursor, operation generation or ownership changed. The inactive entry stays
+ * registered, as in fallbackFromLive, so ingestion's resumeLiveWatches cannot
+ * bypass the backoff; the timer reopens the operation's current watches.
+ */
+function failLive<TData, TVariables extends GraphqlVariables>(
+	host: FetchLiveHost,
+	watch: ReplicaWatchState<TData, TVariables>,
+	entry: LiveEntry,
+	errors: readonly GqlError[]
+): void {
+	if (!entry.active || host.lives.get(watch.key) !== entry) return;
+	retireLiveProtocol(host, watch.key);
+	entry.active = false;
+	const unsubscribe = entry.unsubscribe;
+	entry.unsubscribe = () => undefined;
+	try {
+		unsubscribe();
+	} catch {
+		// The failed stream is fenced; transport cleanup is best effort.
+	}
+	const failures = (entry.failures ?? 0) + 1;
+	entry.failures = failures;
+	const delay = Math.min(
+		LIVE_FAILURE_RETRY_BASE_MS * 2 ** Math.min(failures - 1, 30),
+		LIVE_FAILURE_RETRY_MAX_MS
+	);
+	entry.retry = setTimeout(() => {
+		entry.retry = undefined;
+		if (
+			host.lives.get(watch.key) !== entry ||
+			entry.active ||
+			entry.protocolGeneration !== host.protocolGenerationSequence()
+		) {
+			return;
+		}
+		restartLive(host, watch.key);
+		const replacement = host.lives.get(watch.key);
+		if (replacement !== undefined && replacement !== entry) {
+			replacement.failures = failures;
+		}
+	}, delay);
+	const state = host.queryState(watch.key);
+	state.live = 'error';
+	state.errors = stableErrors(state.errors, errors);
+	host.emitState(watch.key, false);
+}
+
+function cancelLiveRetry(entry: LiveEntry): void {
+	if (entry.retry === undefined) return;
+	clearTimeout(entry.retry);
+	entry.retry = undefined;
 }
 
 /**

@@ -5,6 +5,13 @@
 //! 2. Listens on [`ChangeHub`] (fed by `change_stream` / repo broadcast).
 //! 3. On dirty tables intersecting the plan footprint, debounces, re-executes,
 //!    and yields only when the response hash changes (hash-gated push).
+//!
+//! A failed execution is terminal (`docs/live-query-delivery.md`): the producer
+//! yields one error and stops. GraphQL ends the subscription on that error, and
+//! the failure frame carries only the base protocol envelope. Protocol frame
+//! metadata is a FIFO consumed by each emitted response, so producing another
+//! frame after an error could let the error response take that later frame's
+//! snapshot/live metadata.
 
 use std::collections::BTreeSet;
 use std::pin::Pin;
@@ -201,14 +208,8 @@ pub(crate) async fn live_query_stream(
                         continue; // hash gate: no push on no-change
                     }
                     if let Err(error) = executed.record_protocol_metadata(protocol.as_ref()) {
-                        if tx
-                            .send(Err(async_graphql::Error::new(error)))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        continue;
+                        let _ = tx.send(Err(async_graphql::Error::new(error))).await;
+                        return;
                     }
                     last_hash = Some(executed.hash);
                     if tx.send(Ok(executed.value)).await.is_err() {
@@ -216,9 +217,8 @@ pub(crate) async fn live_query_stream(
                     }
                 }
                 Err(e) => {
-                    if tx.send(Err(async_graphql::Error::new(e))).await.is_err() {
-                        return;
-                    }
+                    let _ = tx.send(Err(async_graphql::Error::new(e))).await;
+                    return;
                 }
             }
         }

@@ -949,6 +949,132 @@ async fn live_subscription_frames_keep_data_and_metadata_in_fifo_order() {
     );
 }
 
+async fn rename_causal_table(repository: &SqliteRepository, from: &str, to: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER TABLE {from} RENAME TO {to}"
+    )))
+    .execute(repository.pool())
+    .await
+    .expect("rename live read-model table");
+}
+
+/// A failure frame is error-only, carries the valid base envelope, and has no
+/// snapshot, live or command metadata (`docs/live-query-delivery.md`).
+fn assert_live_failure_frame(response: async_graphql::Response) {
+    assert!(response.is_err(), "expected a failed live execution");
+    let response = serde_json::to_value(response).expect("GraphQL wire response");
+    assert!(
+        response.get("data").is_none_or(Value::is_null),
+        "a failure frame carries no result data: {response}"
+    );
+    let errors = response["errors"].as_array().expect("failure errors");
+    assert!(!errors.is_empty(), "{response}");
+    assert!(
+        errors.iter().all(|error| error["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty())),
+        "{response}"
+    );
+    let distributed = distributed_envelope(&response);
+    assert_eq!(distributed["protocolVersion"], 1, "{response}");
+    for field in [
+        "schemaHash",
+        "authorizationGeneration",
+        "cacheScope",
+        "operation",
+    ] {
+        assert!(
+            distributed[field]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "failure frame base envelope requires `{field}`: {response}"
+        );
+    }
+    assert!(
+        distributed
+            .get("trustedPresets")
+            .is_none_or(Value::is_array),
+        "{response}"
+    );
+    for field in ["snapshot", "live", "command"] {
+        assert!(
+            distributed.get(field).is_none(),
+            "failure frame must not carry `{field}`: {response}"
+        );
+    }
+}
+
+async fn assert_stream_ended(stream: &mut BoxStream<'static, async_graphql::Response>) {
+    let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("a failed live subscription must complete");
+    assert!(
+        next.is_none(),
+        "a failure frame is terminal; unexpected frame: {:?}",
+        next.map(serde_json::to_value)
+    );
+}
+
+#[tokio::test]
+async fn live_subscription_initial_failure_is_one_terminal_error_only_frame() {
+    let fixture = protocol_fixture_with_rows().await;
+    rename_causal_table(
+        &fixture.repository,
+        "causal_query_views",
+        "causal_query_views_offline",
+    )
+    .await;
+    let mut stream = fixture
+        .engine
+        .execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
+
+    let failure = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("timeout waiting for failure frame")
+        .expect("a failed live execution still emits one frame");
+    assert_live_failure_frame(failure);
+    assert_stream_ended(&mut stream).await;
+}
+
+#[tokio::test]
+async fn live_subscription_refresh_failure_is_terminal_and_never_takes_later_metadata() {
+    let fixture = protocol_fixture_with_rows().await;
+    let mut stream = fixture
+        .engine
+        .execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
+    let first = next_wire_frame(&mut stream).await;
+    assert_live_frame(&first, "causal_query_views", "causal row", "1", false);
+
+    rename_causal_table(
+        &fixture.repository,
+        "causal_query_views",
+        "causal_query_views_offline",
+    )
+    .await;
+    fixture
+        .repository
+        .publish_read_model_change(distributed::ReadModelChange::new(["causal_query_views"]));
+    // Leave the failure unconsumed while storage recovers and a new projection
+    // commits. A producer that kept running would enqueue that result's
+    // snapshot/live metadata ahead of the failure response's envelope.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    rename_causal_table(
+        &fixture.repository,
+        "causal_query_views_offline",
+        "causal_query_views",
+    )
+    .await;
+    project_item(&fixture.repository, &fixture.bus, 2, "causal row 2").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let failure = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("timeout waiting for failure frame")
+        .expect("the refresh failure is delivered");
+    assert_live_failure_frame(failure);
+    assert_stream_ended(&mut stream).await;
+}
+
 #[tokio::test]
 async fn live_subscription_replays_delete_tombstone_and_observation() {
     let fixture = protocol_fixture_with_rows().await;

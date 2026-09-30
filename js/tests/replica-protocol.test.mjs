@@ -2602,6 +2602,251 @@ test('terminal live errors close their stream and allow a later HTTP retry', asy
 	assert.equal(unsubscribeCount, 2);
 });
 
+/** Error-only live failure frame: base envelope, no snapshot/live/command. */
+function liveFailureFrame(options = {}) {
+	return {
+		...(options.omitData ? {} : { data: null }),
+		...(options.omitErrors
+			? {}
+			: {
+					errors: options.errors ?? [
+						{
+							message: 'statement timeout',
+							path: ['todos'],
+							extensions: { code: 'TIMEOUT' }
+						}
+					]
+				}),
+		...(options.data === undefined ? {} : { data: options.data }),
+		extensions: {
+			distributed: {
+				protocolVersion: DISTRIBUTED_PROTOCOL_VERSION,
+				schemaHash: 'schema-a',
+				authorizationGeneration: 'auth-1',
+				cacheScope: 'cache:a',
+				operation: options.operation ?? 'live:todos',
+				...options.distributed
+			}
+		}
+	};
+}
+
+function liveFailureHarness() {
+	const fetches = [];
+	const subscriptions = [];
+	let unsubscribeCount = 0;
+	const replica = createDistributedReplica({
+		transport: {
+			fetch() {
+				let resolve;
+				const promise = new Promise((done) => {
+					resolve = done;
+				});
+				fetches.push({ resolve });
+				return promise;
+			},
+			subscribe(request, observer) {
+				subscriptions.push({ request, observer });
+				return () => {
+					unsubscribeCount += 1;
+				};
+			}
+		}
+	});
+	return {
+		replica,
+		fetches,
+		subscriptions,
+		unsubscribes: () => unsubscribeCount
+	};
+}
+
+test('live failure frames surface the GraphQL error, admit nothing, and reopen with backoff', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const { replica, fetches, subscriptions, unsubscribes } = liveFailureHarness();
+	const watch = replica.watch(Todos, {}, { live: true });
+	await Promise.resolve();
+	assert.equal(subscriptions.length, 1);
+	subscriptions[0].observer.next(
+		wireFrame({
+			operation: 'live:todos',
+			position: '2',
+			rows: [{ id: 'todo-live', title: 'admitted before failure' }],
+			recordScope: 'record:live',
+			live: { mode: 'resumable', reset: true }
+		})
+	);
+	const admitted = [{ id: 'todo-live', title: 'admitted before failure' }];
+	assert.deepEqual(watch.get().data.todos, admitted);
+	assert.deepEqual(watch.get().errors, []);
+	const fetchesBeforeFailure = fetches.length;
+
+	subscriptions[0].observer.next(liveFailureFrame());
+	assert.equal(watch.get().errors[0].message, 'statement timeout');
+	assert.equal(watch.get().errors[0].extensions.code, 'TIMEOUT');
+	assert.equal(watch.get().live, 'error');
+	assert.deepEqual(watch.get().data.todos, admitted);
+	assert.deepEqual(replica.read(Todos, {}).data.todos, admitted);
+	// The failure is terminal: the stream is closed and the server's trailing
+	// complete neither falls back to HTTP nor reopens outside the backoff.
+	assert.equal(unsubscribes(), 1);
+	subscriptions[0].observer.complete();
+	assert.equal(fetches.length, fetchesBeforeFailure);
+	assert.equal(watch.get().live, 'error');
+	// Receipt-only ingestion (here a failing HTTP read) resumes live watches;
+	// the failed one keeps waiting for its backoff.
+	replica.writeResult(
+		Todos,
+		{},
+		liveFailureFrame({ operation: 'query:todos' }),
+		'network'
+	);
+	assert.equal(subscriptions.length, 1);
+	assert.deepEqual(replica.read(Todos, {}).data.todos, admitted);
+
+	t.mock.timers.tick(999);
+	assert.equal(subscriptions.length, 1);
+	t.mock.timers.tick(1);
+	assert.equal(subscriptions.length, 2);
+	// No cursor or ownership moved: the reopen resumes at the admitted cursor.
+	assert.deepEqual(subscriptions[1].request.resume, [
+		{ projection: 'todos-projector', position: '2', token: 'resume:2' }
+	]);
+	assert.equal(watch.get().errors[0].message, 'statement timeout');
+
+	subscriptions[1].observer.next(liveFailureFrame({ omitData: true }));
+	assert.equal(unsubscribes(), 2);
+	t.mock.timers.tick(1999);
+	assert.equal(subscriptions.length, 2, 'consecutive failures double the backoff');
+	t.mock.timers.tick(1);
+	assert.equal(subscriptions.length, 3);
+
+	subscriptions[2].observer.next(
+		wireFrame({
+			operation: 'live:todos',
+			position: '3',
+			rows: [{ id: 'todo-live', title: 'recovered' }],
+			recordScope: 'record:live',
+			live: { mode: 'resumable' }
+		})
+	);
+	assert.deepEqual(watch.get().errors, []);
+	assert.equal(watch.get().live, 'active');
+	assert.deepEqual(watch.get().data.todos, [
+		{ id: 'todo-live', title: 'recovered' }
+	]);
+
+	subscriptions[2].observer.next(liveFailureFrame());
+	t.mock.timers.tick(1000);
+	assert.equal(subscriptions.length, 4, 'an admitted frame resets the backoff');
+
+	subscriptions[3].observer.next(liveFailureFrame());
+	watch.destroy();
+	t.mock.timers.tick(30_000);
+	assert.equal(subscriptions.length, 4, 'disposing the last watch cancels the reopen');
+});
+
+test('authorization invalidation cancels a pending live failure reopen', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const { replica, subscriptions } = liveFailureHarness();
+	const watch = replica.watch(Todos, {}, { live: true });
+	await Promise.resolve();
+	subscriptions[0].observer.next(liveFailureFrame());
+	assert.equal(watch.get().errors[0].message, 'statement timeout');
+	replica.invalidateAuthorization();
+	t.mock.timers.tick(30_000);
+	assert.equal(subscriptions.length, 1);
+	watch.destroy();
+});
+
+test('live frames that are not error-only failures stay strict and admit nothing', async () => {
+	const cases = [
+		{
+			name: 'partial data with errors and no live metadata',
+			frame: liveFailureFrame({
+				data: { todos: [{ id: 'todo-partial', title: 'partial' }] }
+			}),
+			path: 'extensions.distributed.live'
+		},
+		{
+			name: 'data-bearing snapshot without live metadata',
+			frame: wireFrame({
+				operation: 'live:todos',
+				position: '9',
+				rows: [{ id: 'todo-unscoped', title: 'unscoped' }]
+			}),
+			path: 'extensions.distributed.live'
+		},
+		{
+			name: 'empty errors',
+			frame: liveFailureFrame({ errors: [] }),
+			path: 'extensions.distributed.live'
+		},
+		{
+			name: 'null data without errors',
+			frame: liveFailureFrame({ omitErrors: true }),
+			path: 'extensions.distributed.live'
+		},
+		{
+			name: 'errors without a string message',
+			frame: liveFailureFrame({ errors: [{ message: 42 }] }),
+			path: 'extensions.distributed.live'
+		},
+		{
+			name: 'command receipt on a failure frame',
+			frame: liveFailureFrame({
+				distributed: { command: commandReceipt() }
+			}),
+			path: 'extensions.distributed.command'
+		},
+		{
+			name: 'failure frame for another operation',
+			frame: liveFailureFrame({ operation: 'live:todos-other' }),
+			path: 'extensions.distributed.operation'
+		},
+		{
+			name: 'failure frame without the distributed envelope',
+			frame: {
+				data: null,
+				errors: [{ message: 'statement timeout' }]
+			},
+			path: 'extensions.distributed'
+		}
+	];
+	for (const { name, frame, path } of cases) {
+		const { replica, fetches, subscriptions, unsubscribes } =
+			liveFailureHarness();
+		const watch = replica.watch(Todos, {}, { live: true });
+		await Promise.resolve();
+		subscriptions[0].observer.next(
+			wireFrame({
+				operation: 'live:todos',
+				position: '2',
+				rows: [{ id: 'todo-live', title: 'admitted' }],
+				recordScope: 'record:live',
+				live: { mode: 'resumable', reset: true }
+			})
+		);
+		const fetchCount = fetches.length;
+		subscriptions[0].observer.next(frame);
+		assert.equal(watch.get().live, 'error', name);
+		assert.equal(
+			watch.get().errors[0].message,
+			`Invalid Distributed GraphQL protocol envelope at ${path}`,
+			name
+		);
+		assert.deepEqual(
+			replica.read(Todos, {}).data.todos,
+			[{ id: 'todo-live', title: 'admitted' }],
+			name
+		);
+		assert.equal(unsubscribes(), 0, `${name}: not a terminal failure frame`);
+		assert.equal(fetches.length, fetchCount, name);
+		assert.equal(subscriptions.length, 1, name);
+		watch.destroy();
+	}
+});
+
 test('live advancement fences an overlapping refresh while a later clean refresh succeeds', async () => {
 	const fetches = [];
 	const subscriptions = [];
