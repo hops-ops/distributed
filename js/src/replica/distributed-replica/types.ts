@@ -37,6 +37,11 @@ export type LiveEntry = {
 	failures?: number;
 	/** Pending reopen of this inactive entry after a live failure frame. */
 	retry?: ReturnType<typeof setTimeout>;
+	/**
+	 * Shared indexes whose independent owner disagreed with this stream's last
+	 * frame. Another operation rewriting one of them reopens this stream.
+	 */
+	fencedIndexKeys?: ReadonlySet<string>;
 };
 
 export type ProtocolGeneration = {
@@ -174,6 +179,12 @@ export type SharedIndexDisposition = {
 	readonly disposition?: 'equal' | 'higher' | 'lower';
 	readonly indexRevision?: string;
 	readonly restartAfterRetirement?: boolean;
+	/**
+	 * Incoming indexes owned by an independent live stream or later query
+	 * owner. A snapshot frame may be admitted without writing them when its
+	 * membership for each is identical to the owner's.
+	 */
+	readonly fencedIndexKeys?: ReadonlySet<string>;
 };
 
 export type CapturedReplicaOptimisticOperation =

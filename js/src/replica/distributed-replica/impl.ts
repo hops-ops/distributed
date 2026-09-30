@@ -145,6 +145,7 @@ import {
 	prepareRecordEvidence,
 	protocolOperationSource,
 	replicaResultIndexKeys,
+	type ReplicaIndexMemberships,
 	reportSafely,
 	reportUnhandledObserverError,
 	snapshotFrom,
@@ -1215,18 +1216,35 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			handoff && activeState !== undefined
 				? compareSnapshotToOperationState(activeState, snapshot)
 				: 'fresh';
-		const sharedDisposition = this.#sharedIndexDisposition(
+		const incomingMemberships: ReplicaIndexMemberships = new Map();
+		const fencedSharedDisposition = this.#sharedIndexDisposition(
 			key,
 			replicaResultIndexKeys(
 				artifact,
 				stableVariables,
 				envelope,
-				snapshot
+				snapshot,
+				incomingMemberships
 			),
 			snapshot,
 			requestRevision,
 			source
 		);
+		/*
+		 * A snapshot frame that agrees with an independent owner on every
+		 * index they share is exactly its server result once admitted: the
+		 * owner keeps those indexes and this frame writes only the rest
+		 * (docs/live-query-delivery.md). Disagreement keeps the atomic fence.
+		 */
+		const fencedIndexKeys =
+			snapshotLive ? fencedSharedDisposition.fencedIndexKeys : undefined;
+		const sharedMembershipAdmitted =
+			fencedIndexKeys !== undefined &&
+			(envelope.errors ?? []).length === 0 &&
+			this.#fencedMembershipsMatch(fencedIndexKeys, incomingMemberships);
+		const sharedDisposition: SharedIndexDisposition = sharedMembershipAdmitted
+			? { compared: false }
+			: fencedSharedDisposition;
 		// A non-resumable stream has no causal vector to compare. An HTTP
 		// refresh may replace it only if the request began after its last
 		// accepted membership. fetchWatch also fences intervening live frames.
@@ -1486,7 +1504,10 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		let summary: ReturnType<typeof normalizeReplicaResult>;
 		try {
 			const update = (writer: BaseCacheWriter) => {
-				const guarded = this.#guardIndexWriter(writer);
+				const guarded = this.#guardIndexWriter(
+					writer,
+					sharedMembershipAdmitted ? fencedIndexKeys : undefined
+				);
 				this.#applyTombstoneEvidence(
 					guarded,
 					recordEvidence.tombstones,
@@ -1627,6 +1648,24 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			if (source !== 'live' && sourceSwitched) {
 				this.#restartLive(key);
 			}
+		if (source === 'live') {
+			const liveEntry = this.#lives.get(key);
+			if (liveEntry !== undefined) {
+				liveEntry.fencedIndexKeys =
+					fencedIndexKeys !== undefined && !sharedMembershipAdmitted
+						? fencedIndexKeys
+						: undefined;
+			}
+		}
+		if (writeIndexes) {
+			this.#reopenStreamsFencedBy(
+				key,
+				summary.indexKeys.filter(
+					(indexKey) =>
+						!(sharedMembershipAdmitted && fencedIndexKeys!.has(indexKey))
+				)
+			);
+		}
 		if (source === 'live' && sharedDisposition.restartAfterRetirement) {
 			// This receiver began before a shared owner retired. Its buffered
 			// frame stays fenced, but a fresh receiver starts after that boundary
@@ -1825,7 +1864,12 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		}
 	}
 
-	#guardIndexWriter(writer: BaseCacheWriter): BaseCacheWriter {
+	#guardIndexWriter(
+		writer: BaseCacheWriter,
+		ownedElsewhere?: ReadonlySet<string>
+	): BaseCacheWriter {
+		// Equal shared memberships stay with their independent owner.
+		const skip = (key: string): boolean => ownedElsewhere?.has(key) === true;
 		return {
 			recordClock: (key) => writer.recordClock(key),
 			writeRecord: (write) => writer.writeRecord(write),
@@ -1833,6 +1877,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				writer.tombstoneRecord(key, revision, incarnation),
 			discardRecord: (key) => writer.discardRecord(key),
 			writeIndex: (write) => {
+				if (skip(write.key)) return false;
 				const recordsForIndex = this.#membershipFences.get(write.key);
 				if (write.complete === true && recordsForIndex !== undefined) {
 					const visible =
@@ -1860,9 +1905,57 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				return wrote;
 			},
 			markIndexStale: (key, reason, revision) =>
-				writer.markIndexStale(key, reason, revision),
-			deleteIndex: (key, revision) => writer.deleteIndex(key, revision)
+				!skip(key) && writer.markIndexStale(key, reason, revision),
+			deleteIndex: (key, revision) =>
+				!skip(key) && writer.deleteIndex(key, revision)
 		};
+	}
+
+	#fencedMembershipsMatch(
+		fencedIndexKeys: ReadonlySet<string>,
+		incoming: ReplicaIndexMemberships
+	): boolean {
+		return this.#engine.readConfirmed((reader) => {
+			for (const indexKey of fencedIndexKeys) {
+				const membership = incoming.get(indexKey);
+				const current = reader.index(indexKey);
+				if (
+					membership === undefined ||
+					membership === null ||
+					current === undefined ||
+					!current.complete ||
+					(current.staleRevision !== undefined &&
+						compareCanonicalDecimalStrings(current.staleRevision, current.revision) > 0) ||
+					(current.metadata?.nullValue === true) !== membership.nullValue ||
+					current.records.length !== membership.records.length ||
+					current.records.some(
+						(record, ordinal) => record !== membership.records[ordinal]
+					)
+				) {
+					return false;
+				}
+			}
+			return true;
+		});
+	}
+
+	/**
+	 * Reopen live streams whose last frame was fenced by a shared index that
+	 * another operation has now rewritten, so a fresh authoritative result is
+	 * compared against the new owner membership.
+	 */
+	#reopenStreamsFencedBy(writerKey: string, writtenKeys: readonly string[]): void {
+		if (writtenKeys.length === 0) return;
+		const reopen: string[] = [];
+		for (const [liveKey, entry] of this.#lives) {
+			if (liveKey === writerKey || !entry.active) continue;
+			const fenced = entry.fencedIndexKeys;
+			if (fenced === undefined) continue;
+			if (writtenKeys.some((indexKey) => fenced.has(indexKey))) {
+				reopen.push(liveKey);
+			}
+		}
+		for (const liveKey of reopen) this.#restartLive(liveKey);
 	}
 
 	#flushDeferredMembershipConfirms(): void {
@@ -2347,23 +2440,23 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		let higher = false;
 		let incomparable = false;
 		let restartAfterRetirement = false;
+		const fencedIndexKeys = new Set<string>();
 		let equalRevision: string | undefined;
 		let latestOwnerRevision: string | undefined;
 		for (const [key, group] of this.#operationProtocols) {
 			if (key === currentKey) continue;
 			for (const state of [group.query, group.live]) {
 				if (state?.indexRevision === undefined) continue;
-				let ownsIncomingIndex = false;
+				const ownedIncomingKeys: string[] = [];
 				for (const indexKey of state.indexKeys) {
 					if (
 						incomingIndexKeys.has(indexKey) &&
 						confirmedRevisions.get(indexKey) === state.indexRevision
 					) {
-						ownsIncomingIndex = true;
-						break;
+						ownedIncomingKeys.push(indexKey);
 					}
 				}
-				if (!ownsIncomingIndex) continue;
+				if (ownedIncomingKeys.length === 0) continue;
 				if (
 					!snapshot.indexesComparable &&
 					state === group.live &&
@@ -2418,6 +2511,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 						compareCanonicalDecimalStrings(liveStart, state.indexRevision) > 0
 					) continue;
 					incomparable = true;
+					for (const indexKey of ownedIncomingKeys) fencedIndexKeys.add(indexKey);
 					continue;
 				}
 				compared = true;
@@ -2454,7 +2548,8 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				return {
 					compared: true,
 					disposition: 'lower',
-					...(restartAfterRetirement ? { restartAfterRetirement: true } : {})
+					...(restartAfterRetirement ? { restartAfterRetirement: true } : {}),
+					...(!snapshot.indexesComparable ? { fencedIndexKeys } : {})
 				};
 			}
 			if (requestRevision === undefined) return { compared: false };

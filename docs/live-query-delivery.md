@@ -71,6 +71,24 @@ empty result acquire rows without waiting for another page load. It does not
 override an independently active live stream or query ownership acquired after
 the subscription started; those results have no safe cross-stream ordering.
 
+Independent streams often share an index without disagreeing about it. A
+layout and a page may both select
+`repositories(where: { id: { _eq: $id } }, limit: 1)` and then different
+relationships below that row. A snapshot frame whose shared indexes have the
+same membership as the independent owner's is admitted. Each such index must
+contain the same normalized record keys in the same order and the same null
+value, and the owner's index must be complete and not stale. The owner keeps
+those shared indexes, and the frame writes only its other indexes and its
+records. The resulting graph is exactly the frame's server result, so nothing
+is fabricated and no cross-stream order is assumed.
+
+The whole frame is rejected as before if any shared membership differs or
+cannot be established. That includes GraphQL errors, operation-local embedded
+rows and rows without record evidence. The subscription is then reopened after
+another operation next writes one of those shared indexes. The fresh result is
+checked against the owner's new membership, so a stream whose frame arrived
+before the owner caught up does not wait for its own next server change.
+
 When the last watch for a live operation is disposed, its local ownership is
 retired at a monotonically increasing local boundary. A later live subscription
 may take over an incomparable shared index only when that subscription started
