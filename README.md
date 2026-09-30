@@ -1539,7 +1539,16 @@ bus.listen(
 ```
 
 Retryable failures (e.g. transient `NotFound`) are nacked for redelivery; the runner
-never silently acks a handler error.
+never silently acks a handler error. NATS JetStream NAKs back off by delivery count
+(50 ms doubling to 5 s by default) so a repeatedly failing message cannot monopolize
+a consumer; retries stay unlimited. A deterministic, durably recorded rejection is a
+permanent error, not a retryable one.
+
+A service can place independent route bundles in named delivery lanes
+(`Service::lane(name, routes)`). Each lane keeps broker order and runs
+concurrently with the others, and a delivery is settled only after every lane
+finished it. See [consumer delivery lanes](docs/consumer-delivery-lanes.md) for
+the contract and when a route may leave the default lane.
 
 ### Transport boundaries (producer vs consumer)
 

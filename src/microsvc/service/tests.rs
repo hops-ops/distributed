@@ -4170,3 +4170,99 @@ fn command_request_requires_session_variables_field() {
     let result: Result<CommandRequest, _> = serde_json::from_str(json);
     assert!(result.is_err());
 }
+
+type LaneLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+fn lane_log() -> LaneLog {
+    std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+fn lane_recorder(log: &LaneLog, label: &'static str) -> Routes<()> {
+    let log = log.clone();
+    test_routes()
+        .events(&["fact.recorded", "fact.other"])
+        .handle(move |ctx: &Context<()>| {
+            log.lock()
+                .unwrap()
+                .push(format!("{label}:{}", ctx.message().name()));
+            async move { Ok(json!({})) }
+        })
+}
+
+#[tokio::test]
+async fn named_lanes_partition_routes_and_default_dispatch_runs_all_in_order() {
+    use crate::bus::{LaneSet, MessageRouter};
+    let log = lane_log();
+    let service = Service::new()
+        .routes(lane_recorder(&log, "projection-a"))
+        .lane("process", lane_recorder(&log, "policy"))
+        .routes(lane_recorder(&log, "projection-b"))
+        .lane(
+            "process",
+            test_routes()
+                .event("fact.process_only")
+                .handle(|_: &Context<()>| async move { Ok(json!({})) }),
+        );
+
+    assert_eq!(
+        service.delivery_lane_names(),
+        &[DEFAULT_DELIVERY_LANE, "process"]
+    );
+    assert_eq!(MessageRouter::delivery_lanes(&service), 2);
+    assert_eq!(
+        MessageRouter::lanes_for(&service, MessageKind::Event, "fact.recorded"),
+        LaneSet::single(0).with(1)
+    );
+    assert_eq!(
+        MessageRouter::lanes_for(&service, MessageKind::Event, "fact.process_only"),
+        LaneSet::single(1)
+    );
+    assert!(MessageRouter::lanes_for(&service, MessageKind::Event, "fact.unknown").is_empty());
+
+    let message = Message::new("fact.recorded", MessageKind::Event, b"{}".to_vec()).with_id("e1");
+    MessageRouter::dispatch_lane(&service, &message, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(*log.lock().unwrap(), ["policy:fact.recorded"]);
+    log.lock().unwrap().clear();
+    MessageRouter::dispatch_lane(&service, &message, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["projection-a:fact.recorded", "projection-b:fact.recorded"]
+    );
+    // Without lanes (sequential transports), every route runs in
+    // registration order exactly as before lanes existed.
+    log.lock().unwrap().clear();
+    service.dispatch_message(&message).await.unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "projection-a:fact.recorded",
+            "policy:fact.recorded",
+            "projection-b:fact.recorded"
+        ]
+    );
+    // A lane with no route for the message is an unknown-route error, never a
+    // silent success.
+    let only = Message::new("fact.process_only", MessageKind::Event, b"{}".to_vec());
+    assert!(MessageRouter::dispatch_lane(&service, &only, None, 0)
+        .await
+        .is_err());
+}
+
+#[test]
+fn service_without_named_lanes_reports_one_lane() {
+    use crate::bus::MessageRouter;
+    let log = lane_log();
+    let service = Service::new().routes(lane_recorder(&log, "only"));
+    assert_eq!(MessageRouter::delivery_lanes(&service), 1);
+}
+
+#[test]
+#[should_panic(expected = "named delivery lane")]
+fn default_lane_name_cannot_be_used_as_a_named_lane() {
+    let log = lane_log();
+    let _ = Service::new().lane(DEFAULT_DELIVERY_LANE, lane_recorder(&log, "x"));
+}

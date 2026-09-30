@@ -60,7 +60,7 @@ pub use routes::{
     DeliveryKind, HandlerNames, HandlerSpec, PortableCommand, RouteBuilder, Routes,
     ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded, TypedRouteBuilder,
 };
-pub use runtime::Service;
+pub use runtime::{Service, DEFAULT_DELIVERY_LANE};
 
 #[cfg(test)]
 mod tests;

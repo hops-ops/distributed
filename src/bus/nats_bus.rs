@@ -31,7 +31,7 @@ use async_nats::jetstream;
 use async_nats::jetstream::consumer::pull::Config as PullConfig;
 use async_nats::jetstream::stream::{Config as StreamConfig, Stream};
 
-use super::nats::{NatsJetStreamSource, NatsPublisher};
+use super::nats::{NackBackoff, NatsJetStreamSource, NatsPublisher};
 use super::{
     retryable, run_source, Bus, BusConsumer, BusTopologyConfig, MessagePublisher, MessageRouter,
     RunOptions, TransportError,
@@ -49,6 +49,7 @@ pub struct NatsBus {
     topology: BusTopologyConfig,
     fetch_timeout: Duration,
     idle_poll: Duration,
+    nack_backoff: NackBackoff,
 }
 
 /// Awaitable builder returned by [`NatsBus::connect`].
@@ -113,6 +114,7 @@ impl NatsBus {
             topology: BusTopologyConfig::default(),
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
             idle_poll: Duration::ZERO,
+            nack_backoff: NackBackoff::default(),
         }
     }
 
@@ -172,6 +174,12 @@ impl NatsBus {
     /// Drain-to-idle is for tests; long-running hosts must set this.
     pub fn with_idle_poll(mut self, idle_poll: Duration) -> Self {
         self.idle_poll = idle_poll;
+        self
+    }
+
+    /// Space retryable NAK redeliveries for `listen`/`subscribe` sources.
+    pub fn with_nack_backoff(mut self, backoff: NackBackoff) -> Self {
+        self.nack_backoff = backoff;
         self
     }
 
@@ -365,7 +373,8 @@ impl NatsBus {
         Ok(NatsJetStreamSource::new(consumer)
             .with_fetch_timeout(self.fetch_timeout)
             .with_strip_prefix(strip_prefix)
-            .with_idle_poll(self.idle_poll))
+            .with_idle_poll(self.idle_poll)
+            .with_nack_backoff(self.nack_backoff))
     }
 
     /// Shared consume path for `listen` (commands) and `subscribe` (events):

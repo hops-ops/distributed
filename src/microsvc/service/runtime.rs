@@ -55,11 +55,18 @@ pub(crate) type ServiceRunner = Box<
         + Sync,
 >;
 
+/// Name of the delivery lane that plain [`Service::routes`] registers into.
+pub const DEFAULT_DELIVERY_LANE: &str = "default";
+
 /// A microservice deployment that routes messages to one or more route bundles.
 pub struct Service {
     name: Option<String>,
     pub(super) routes: Vec<Box<dyn ErasedRoutes>>,
     index: HashMap<MessageKind, HashMap<String, Vec<usize>>>,
+    /// Delivery lane of each route bundle (parallel to `routes`); 0 is default.
+    route_lanes: Vec<usize>,
+    /// Lane names by index; index 0 is the unnamed default lane.
+    lane_names: Vec<&'static str>,
     handler_specs: Vec<HandlerSpec>,
     causal_command_policy: CausalCommandPolicy,
     runner: Option<ServiceRunner>,
@@ -78,6 +85,8 @@ impl Service {
             name: None,
             routes: Vec::new(),
             index: HashMap::new(),
+            route_lanes: Vec::new(),
+            lane_names: vec![DEFAULT_DELIVERY_LANE],
             handler_specs: Vec::new(),
             causal_command_policy: CausalCommandPolicy::default(),
             runner: None,
@@ -492,6 +501,60 @@ impl Service {
         self
     }
 
+    /// Add a route bundle to a named delivery lane.
+    ///
+    /// Lanes of one consumer run concurrently when the transport settles each
+    /// delivery independently; each lane keeps delivery order and a delivery is
+    /// settled only after all of its lanes finished. Use a lane only for routes
+    /// that neither depend on nor are depended on by routes of other lanes
+    /// within the same delivery (see `docs/consumer-delivery-lanes.md`).
+    ///
+    /// # Panics
+    /// When `lane` is empty, names the default lane, or exceeds the lane limit.
+    pub fn lane<D>(mut self, lane: &'static str, routes: Routes<D>) -> Self
+    where
+        D: Send + Sync + 'static,
+    {
+        assert!(
+            !lane.trim().is_empty() && lane != DEFAULT_DELIVERY_LANE,
+            "a named delivery lane must be non-empty and not `{DEFAULT_DELIVERY_LANE}`"
+        );
+        let index = match self.lane_names.iter().position(|name| *name == lane) {
+            Some(index) => index,
+            None => {
+                assert!(
+                    self.lane_names.len() < crate::bus::LaneSet::MAX_LANES,
+                    "too many delivery lanes"
+                );
+                self.lane_names.push(lane);
+                self.lane_names.len() - 1
+            }
+        };
+        self.add_routes(routes);
+        *self
+            .route_lanes
+            .last_mut()
+            .expect("add_routes registers one bundle") = index;
+        self
+    }
+
+    /// Delivery lane names by index; index 0 is the default lane.
+    pub fn delivery_lane_names(&self) -> &[&'static str] {
+        &self.lane_names
+    }
+
+    /// Lanes with a route for `(kind, name)`.
+    pub fn lanes_for_message(&self, kind: MessageKind, name: &str) -> crate::bus::LaneSet {
+        self.index
+            .get(&kind)
+            .and_then(|by_name| by_name.get(name))
+            .into_iter()
+            .flatten()
+            .fold(crate::bus::LaneSet::EMPTY, |lanes, route| {
+                lanes.with(self.route_lanes[*route])
+            })
+    }
+
     pub(super) fn add_routes<D>(&mut self, routes: Routes<D>)
     where
         D: Send + Sync + 'static,
@@ -567,6 +630,7 @@ impl Service {
         self.handler_specs.extend_from_slice(routes.handler_specs());
         self.registered_command_mounts.extend(command_mounts);
         self.routes.push(Box::new(routes));
+        self.route_lanes.push(0);
     }
 
     pub(crate) fn typed_command_contracts(&self) -> Vec<TypedCommandContract> {
@@ -1006,7 +1070,8 @@ impl Service {
             metadata,
         };
 
-        self.invoke_with_dispatch_span(&message, input, session, None)
+        let route_indices = self.lane_route_indices(&message, None)?;
+        self.invoke_with_dispatch_span(&message, input, session, None, route_indices)
             .await
     }
 
@@ -1038,9 +1103,20 @@ impl Service {
         message: &Message,
         ordered: Option<&OrderedDelivery>,
     ) -> Result<Value, HandlerError> {
+        self.dispatch_lane_message(message, ordered, None).await
+    }
+
+    /// Dispatch only the routes of one delivery lane (`None` runs every lane
+    /// in registration order).
+    pub(crate) async fn dispatch_lane_message(
+        &self,
+        message: &Message,
+        ordered: Option<&OrderedDelivery>,
+        lane: Option<usize>,
+    ) -> Result<Value, HandlerError> {
         #[cfg(feature = "metrics")]
         let started = Instant::now();
-        let result = self.dispatch_message_inner(message, ordered).await;
+        let result = self.dispatch_message_inner(message, ordered, lane).await;
         #[cfg(feature = "metrics")]
         {
             let error = result.as_ref().err();
@@ -1061,17 +1137,17 @@ impl Service {
         &self,
         message: &Message,
         ordered: Option<&OrderedDelivery>,
+        lane: Option<usize>,
     ) -> Result<Value, HandlerError> {
         ensure_lifecycle_mutations_open()?;
         if !self.handles_message(message.kind, &message.name) {
             return Err(HandlerError::UnknownCommand(message.name.clone()));
         }
 
-        let route_indices = self
-            .index
-            .get(&message.kind)
-            .and_then(|by_name| by_name.get(message.name()))
-            .ok_or_else(|| HandlerError::UnknownCommand(message.name.clone()))?;
+        let route_indices = self.lane_route_indices(message, lane)?;
+        if route_indices.is_empty() {
+            return Err(HandlerError::UnknownCommand(message.name.clone()));
+        }
         let projector_only = route_indices
             .iter()
             .all(|index| self.routes[*index].is_causal_projector(message));
@@ -1093,8 +1169,25 @@ impl Service {
             }
         };
         let session = message_to_session(message);
-        self.invoke_with_dispatch_span(message, input, session, ordered)
+        self.invoke_with_dispatch_span(message, input, session, ordered, route_indices)
             .await
+    }
+
+    fn lane_route_indices(
+        &self,
+        message: &Message,
+        lane: Option<usize>,
+    ) -> Result<Vec<usize>, HandlerError> {
+        let all = self
+            .index
+            .get(&message.kind)
+            .and_then(|by_name| by_name.get(message.name()))
+            .ok_or_else(|| HandlerError::UnknownCommand(message.name.clone()))?;
+        Ok(all
+            .iter()
+            .copied()
+            .filter(|route| lane.is_none_or(|lane| self.route_lanes[*route] == lane))
+            .collect())
     }
 
     async fn invoke_with_dispatch_span(
@@ -1103,6 +1196,7 @@ impl Service {
         input: Value,
         session: Session,
         ordered: Option<&OrderedDelivery>,
+        route_indices: Vec<usize>,
     ) -> Result<Value, HandlerError> {
         #[cfg(feature = "otel")]
         {
@@ -1114,14 +1208,15 @@ impl Service {
                 &message.metadata,
             );
             return self
-                .invoke(message, input, session, ordered)
+                .invoke(message, input, session, ordered, route_indices)
                 .instrument(span)
                 .await;
         }
 
         #[cfg(not(feature = "otel"))]
         {
-            self.invoke(message, input, session, ordered).await
+            self.invoke(message, input, session, ordered, route_indices)
+                .await
         }
     }
 
@@ -1131,13 +1226,8 @@ impl Service {
         input: Value,
         session: Session,
         ordered: Option<&OrderedDelivery>,
+        route_indices: Vec<usize>,
     ) -> Result<Value, HandlerError> {
-        let route_indices = self
-            .index
-            .get(&message.kind)
-            .and_then(|by_name| by_name.get(message.name.as_str()))
-            .cloned()
-            .ok_or_else(|| HandlerError::UnknownCommand(message.name.clone()))?;
         #[cfg(feature = "otel")]
         let handler_span = microsvc_handler_span(message);
         let dispatch = async move {

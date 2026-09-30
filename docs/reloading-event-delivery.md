@@ -9,5 +9,7 @@ ordinary permanent-failure policy. After activation the same delivery can run.
 
 Business validation/authorization failures retain their existing permanent
 classification and configured settlement policy. No gate bypass or implicit
-success is introduced. This does not change general infrastructure NAK delay;
-hosts/brokers still own retry timing for other transport outages.
+success is introduced. The NAK uses the transport's ordinary retry spacing
+(NATS JetStream: delivery-count backoff, see
+[consumer delivery lanes and retry backoff](consumer-delivery-lanes.md)); the
+gate adds no delay of its own.
