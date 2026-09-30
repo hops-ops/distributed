@@ -44,7 +44,6 @@ pub struct NatsBus {
     evt_publisher: Arc<NatsPublisher>,
     topology: BusTopologyConfig,
     fetch_timeout: Duration,
-    idle_poll: Duration,
 }
 
 /// Awaitable builder returned by [`NatsBus::connect`].
@@ -108,7 +107,6 @@ impl NatsBus {
             evt_publisher: Arc::new(evt_publisher),
             topology: BusTopologyConfig::default(),
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
-            idle_poll: Duration::ZERO,
         }
     }
 
@@ -161,13 +159,6 @@ impl NatsBus {
     /// Override how long a `listen`/`subscribe` poll waits before idling.
     pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.fetch_timeout = timeout;
-        self
-    }
-
-    /// Keep `listen`/`subscribe` running after an empty JetStream fetch.
-    /// Drain-to-idle is for tests; long-running hosts must set this.
-    pub fn with_idle_poll(mut self, idle_poll: Duration) -> Self {
-        self.idle_poll = idle_poll;
         self
     }
 
@@ -240,8 +231,7 @@ impl NatsBus {
             .map_err(|err| retryable("nats get_or_create_consumer", err))?;
         Ok(NatsJetStreamSource::new(consumer)
             .with_fetch_timeout(self.fetch_timeout)
-            .with_strip_prefix(strip_prefix)
-            .with_idle_poll(self.idle_poll))
+            .with_strip_prefix(strip_prefix))
     }
 
     /// Shared consume path for `listen` (commands) and `subscribe` (events):

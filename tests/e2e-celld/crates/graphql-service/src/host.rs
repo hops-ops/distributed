@@ -11,9 +11,7 @@ use distributed::bus::NatsBus;
 use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
 use distributed::command_dispatch::SharedCommandHost;
 use distributed::graphql::IdentityConfig;
-use distributed::microsvc::{
-    spawn_outbox_publish_loop, spawn_service_consumer_loop, Service, CONSUMER_IDLE_POLL,
-};
+use distributed::microsvc::{spawn_outbox_publish_loop, spawn_service_consumer_loop, Service};
 use distributed::BusPublisher;
 use distributed::{PostgresLockManager, PostgresRepository};
 
@@ -86,8 +84,7 @@ async fn run_postgres(
         let locks = locks.clone();
         let nats = nats.clone();
         spawn_service_consumer_loop(move || {
-            build_service(repo.clone(), locks.clone(), repo.clone())
-                .with_bus(nats.clone().with_idle_poll(CONSUMER_IDLE_POLL))
+            build_service(repo.clone(), locks.clone(), repo.clone()).with_bus(nats.clone())
         });
     }
     spawn_zitadel_scrape(repo.clone());

@@ -203,6 +203,136 @@ async fn bus_listen_shared_group_consumes_each_command_once() {
     );
 }
 
+/// Subscribe to two command topics, produce only the second. The unused topic
+/// must exist (or be created) before subscribe, or Kafka never assigns it and
+/// the second command times out — the load-suite hot-increment failure mode.
+#[tokio::test]
+async fn listen_receives_later_command_topic_after_first_name_is_idle() {
+    let Some(brokers) = brokers() else { return };
+    let ns = unique("ns");
+    let bus = KafkaBus::connect(&brokers)
+        .group("counters")
+        .namespace(&ns)
+        .with_fetch_timeout(Duration::from_secs(3))
+        .await
+        .expect("connect");
+
+    let handled = Arc::new(Mutex::new(Vec::<String>::new()));
+    let rec = handled.clone();
+    let rec_inc = handled.clone();
+    let service = Arc::new(
+        Service::new().routes(
+            Routes::new()
+                .with_dependencies(())
+                .command("counter.initialize")
+                .handle(move |ctx: &Context<()>| {
+                    rec.lock()
+                        .unwrap()
+                        .push(ctx.message().id().unwrap_or_default().to_string());
+                    async move { Ok(json!({})) }
+                })
+                .command("counter.increment")
+                .handle(move |ctx: &Context<()>| {
+                    rec_inc
+                        .lock()
+                        .unwrap()
+                        .push(ctx.message().id().unwrap_or_default().to_string());
+                    async move { Ok(json!({})) }
+                }),
+        ),
+    );
+
+    let listener = bus.clone();
+    let listen = tokio::spawn(async move {
+        listener
+            .listen(service, RunOptions::idempotent().wait_when_idle())
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    bus.send_message(
+        Message::new("counter.increment", MessageKind::Command, b"{}".to_vec()).with_id("inc-1"),
+    )
+    .await
+    .expect("send increment");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if handled.lock().unwrap().iter().any(|id| id == "inc-1") {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            listen.abort();
+            panic!(
+                "increment command was not consumed; handled={:?}",
+                handled.lock().unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    listen.abort();
+}
+
+#[tokio::test]
+async fn one_bus_keeps_distinct_consumers_for_distinct_subscription_plans() {
+    let Some(brokers) = brokers() else { return };
+    let ns = unique("ns");
+    let bus = KafkaBus::connect(&brokers)
+        .group("workers")
+        .namespace(&ns)
+        .with_fetch_timeout(Duration::from_secs(2))
+        .await
+        .expect("connect");
+    let first_name = unique("first.command");
+    let second_name = unique("second.command");
+
+    for (name, id) in [(&first_name, "first-1"), (&second_name, "second-1")] {
+        bus.send_message(Message::new(name, MessageKind::Command, b"{}".to_vec()).with_id(id))
+            .await
+            .expect("seed command topic");
+    }
+
+    let first = Arc::new(Mutex::new(Vec::new()));
+    let second = Arc::new(Mutex::new(Vec::new()));
+    let first_listener = {
+        let bus = bus.clone();
+        let router = recording_for(&first_name, MessageKind::Command, first.clone());
+        tokio::spawn(async move {
+            bus.listen(router, RunOptions::idempotent().wait_when_idle())
+                .await
+        })
+    };
+    let second_listener = {
+        let bus = bus.clone();
+        let router = recording_for(&second_name, MessageKind::Command, second.clone());
+        tokio::spawn(async move {
+            bus.listen(router, RunOptions::idempotent().wait_when_idle())
+                .await
+        })
+    };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let first_seen = first.lock().unwrap().iter().any(|id| id == "first-1");
+        let second_seen = second.lock().unwrap().iter().any(|id| id == "second-1");
+        if first_seen && second_seen {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            first_listener.abort();
+            second_listener.abort();
+            panic!(
+                "distinct plans did not both consume: first={:?} second={:?}",
+                first.lock().unwrap(),
+                second.lock().unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    first_listener.abort();
+    second_listener.abort();
+}
+
 /// Build a namespaced `KafkaBus` for `group` (empty `group` = no group).
 async fn kafka_bus(brokers: &str, ns: &str, group: &str) -> KafkaBus {
     let builder = KafkaBus::connect(brokers).namespace(ns);

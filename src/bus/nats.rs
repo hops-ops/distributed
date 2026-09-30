@@ -10,6 +10,7 @@
 //! Requires the `nats` feature. Integration-tested in `tests/nats_transport`
 //! against a JetStream-enabled server (see `compose.yaml`).
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use async_nats::jetstream::consumer::pull::Config as PullConfig;
@@ -104,8 +105,9 @@ impl MessagePublisher for NatsPublisher {
 pub struct NatsJetStreamSource {
     consumer: Consumer<PullConfig>,
     fetch_timeout: Duration,
+    fetch_max: usize,
     strip_prefix: Option<String>,
-    idle_poll: Duration,
+    buffer: VecDeque<NatsReceived>,
 }
 
 impl NatsJetStreamSource {
@@ -114,9 +116,16 @@ impl NatsJetStreamSource {
         Self {
             consumer,
             fetch_timeout: Duration::from_millis(500),
+            fetch_max: 32,
             strip_prefix: None,
-            idle_poll: Duration::ZERO,
+            buffer: VecDeque::new(),
         }
+    }
+
+    /// How many messages to pull per fetch.
+    pub fn with_fetch_max(mut self, max: usize) -> Self {
+        self.fetch_max = max.max(1);
+        self
     }
 
     /// How long `recv` waits for a message before returning `Ok(None)`.
@@ -136,10 +145,40 @@ impl NatsJetStreamSource {
         self
     }
 
-    /// Keep `recv` retrying after an empty fetch instead of draining to idle.
-    pub fn with_idle_poll(mut self, idle_poll: Duration) -> Self {
-        self.idle_poll = idle_poll;
-        self
+    async fn fill(&mut self) -> Result<(), TransportError> {
+        // First message waits up to fetch_timeout. Extra records use a short
+        // expire so applied (RPC) cells do not stall waiting for a full batch.
+        self.pull_into(1, self.fetch_timeout).await?;
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let extra = self.fetch_max.saturating_sub(1);
+        if extra > 0 {
+            self.pull_into(extra, Duration::from_millis(10)).await?;
+        }
+        Ok(())
+    }
+
+    async fn pull_into(&mut self, max: usize, expires: Duration) -> Result<(), TransportError> {
+        if max == 0 {
+            return Ok(());
+        }
+        let mut batch = self
+            .consumer
+            .batch()
+            .max_messages(max)
+            .expires(expires)
+            .messages()
+            .await
+            .map_err(|err| retryable("nats fetch", err))?;
+        while let Some(message) = batch.next().await {
+            let message = message.map_err(|err| retryable("nats batch message", err))?;
+            self.buffer.push_back(NatsReceived::from_jetstream(
+                message,
+                self.strip_prefix.as_deref(),
+            ));
+        }
+        Ok(())
     }
 
     /// Connect to a NATS server URL, then create/open the stream + consumer.
@@ -196,28 +235,17 @@ impl MessageSource for NatsJetStreamSource {
     }
 
     async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
-        loop {
-            let mut batch = self
-                .consumer
-                .batch()
-                .max_messages(1)
-                .expires(self.fetch_timeout)
-                .messages()
-                .await
-                .map_err(|err| retryable("nats fetch", err))?;
-
-            match batch.next().await {
-                Some(Ok(message)) => {
-                    return Ok(Some(NatsReceived::from_jetstream(
-                        message,
-                        self.strip_prefix.as_deref(),
-                    )))
-                }
-                Some(Err(err)) => return Err(retryable("nats batch message", err)),
-                None if self.idle_poll.is_zero() => return Ok(None),
-                None => continue,
-            }
+        if self.buffer.is_empty() {
+            self.fill().await?;
         }
+        Ok(self.buffer.pop_front())
+    }
+
+    async fn wait(&mut self) -> Result<(), TransportError> {
+        if self.buffer.is_empty() {
+            self.fill().await?;
+        }
+        Ok(())
     }
 }
 

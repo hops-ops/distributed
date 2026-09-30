@@ -37,6 +37,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
 use sqlx::{ColumnIndex, Decode, Row, Type};
 
 use crate::projection_protocol::{ProjectionEpoch, ProjectionSource};
@@ -304,6 +306,22 @@ pub trait SqlBusDialect: Clone + Send + Sync + 'static {
         limit: i64,
     ) -> impl Future<Output = Result<Vec<ClaimedRow>, TransportError>> + Send;
 
+    /// Cheap read: is there at least one claimable row? Empty must not take a
+    /// writer lock — an idle supervisor must not `UPDATE` the queue file.
+    fn has_claimable(
+        &self,
+        names: &[String],
+    ) -> impl Future<Output = Result<bool, TransportError>> + Send;
+
+    /// Block until another process may have enqueued work. Combined with the
+    /// in-process `Notify` in [`SqlBus`]. The default is a short sleep.
+    fn listen_wakeup(&self) -> impl Future<Output = Result<(), TransportError>> + Send {
+        async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(())
+        }
+    }
+
     /// Read up to `limit` `bus_log` entries past `consumer`'s offset, in `seq`
     /// order, whose `name` matches one of `names` **or is NULL** (surfaced, not
     /// silently skipped, so the failure policy advances the offset past poison
@@ -354,9 +372,7 @@ pub struct SqlBus<B> {
     topology: BusTopologyConfig,
     lease: Duration,
     source_epoch: Option<ProjectionEpoch>,
-    /// When non-zero, empty `listen`/`subscribe` polls instead of draining to
-    /// idle. Long-running hosts need this; tests keep the default (zero).
-    idle_poll: Duration,
+    wake: Arc<Notify>,
 }
 
 impl<B: SqlBusDialect> SqlBus<B> {
@@ -366,7 +382,7 @@ impl<B: SqlBusDialect> SqlBus<B> {
             topology: BusTopologyConfig::default(),
             lease: DEFAULT_LEASE,
             source_epoch: None,
-            idle_poll: Duration::ZERO,
+            wake: Arc::new(Notify::new()),
         }
     }
 
@@ -393,16 +409,6 @@ impl<B: SqlBusDialect> SqlBus<B> {
     /// authorize a reset.
     pub fn with_source_epoch(mut self, epoch: ProjectionEpoch) -> Self {
         self.source_epoch = Some(epoch);
-        self
-    }
-
-    /// Keep `listen`/`subscribe` running when the queue or log is empty.
-    ///
-    /// Drain-to-idle (`Duration::ZERO`, the default) is for tests. A playground
-    /// or worker that rebuilds `Service` after every idle drain pays seconds
-    /// of projector bootstrap on the next Eventual command.
-    pub fn with_idle_poll(mut self, idle_poll: Duration) -> Self {
-        self.idle_poll = idle_poll;
         self
     }
 
@@ -459,14 +465,18 @@ impl<B: SqlBusDialect> SqlBus<B> {
 
 impl<B: SqlBusDialect> Bus for SqlBus<B> {
     async fn send_message(&self, message: Message) -> Result<(), TransportError> {
-        self.dialect.insert_queue(&message).await
+        self.dialect.insert_queue(&message).await?;
+        self.wake.notify_waiters();
+        Ok(())
     }
 
     async fn publish_message(&self, message: Message) -> Result<(), TransportError> {
         let epoch_candidate = self.source_epoch.clone().unwrap_or_else(fresh_log_epoch);
         self.dialect
             .insert_log(&message, &epoch_candidate, self.source_epoch.as_ref())
-            .await
+            .await?;
+        self.wake.notify_waiters();
+        Ok(())
     }
 }
 
@@ -486,7 +496,7 @@ impl<B: SqlBusDialect> BusConsumer for SqlBus<B> {
             names,
             lease_secs: self.lease.as_secs_f64(),
             buffer: VecDeque::new(),
-            idle_poll: self.idle_poll,
+            wake: Arc::clone(&self.wake),
         };
         run_source(router, source, options).await
     }
@@ -517,7 +527,7 @@ impl<B: SqlBusDialect> BusConsumer for SqlBus<B> {
             last_delivered: None,
             settled_seq: Arc::new(AtomicI64::new(0)),
             source_epoch,
-            idle_poll: self.idle_poll,
+            wake: Arc::clone(&self.wake),
         };
         run_source(router, source, options).await
     }
@@ -536,7 +546,7 @@ struct SqlQueueSource<B> {
     names: Vec<String>,
     lease_secs: f64,
     buffer: VecDeque<ClaimedRow>,
-    idle_poll: Duration,
+    wake: Arc<Notify>,
 }
 
 impl<B: SqlBusDialect> MessageSource for SqlQueueSource<B> {
@@ -547,28 +557,44 @@ impl<B: SqlBusDialect> MessageSource for SqlQueueSource<B> {
     }
 
     async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
-        loop {
-            if self.buffer.is_empty() {
-                let mut claimed = self
-                    .dialect
-                    .claim(&self.names, self.lease_secs, SOURCE_BATCH)
-                    .await?;
-                // `UPDATE … RETURNING` row order is unspecified; restore seq order.
-                claimed.sort_by_key(|claim| claim.row.seq);
-                self.buffer.extend(claimed);
-            }
-            if let Some(claimed) = self.buffer.pop_front() {
-                return Ok(Some(SqlQueueReceived {
-                    dialect: self.dialect.clone(),
-                    row: claimed.row,
-                    claim_token: claimed.claim_token,
-                }));
-            }
-            if self.idle_poll.is_zero() {
+        if self.buffer.is_empty() {
+            if !self.dialect.has_claimable(&self.names).await? {
                 return Ok(None);
             }
-            tokio::time::sleep(self.idle_poll).await;
+            let mut claimed = self
+                .dialect
+                .claim(&self.names, self.lease_secs, SOURCE_BATCH)
+                .await?;
+            // `UPDATE … RETURNING` row order is unspecified; restore seq order.
+            claimed.sort_by_key(|claim| claim.row.seq);
+            self.buffer.extend(claimed);
         }
+        Ok(self.buffer.pop_front().map(|claimed| SqlQueueReceived {
+            dialect: self.dialect.clone(),
+            row: claimed.row,
+            claim_token: claimed.claim_token,
+        }))
+    }
+
+    async fn wait(&mut self) -> Result<(), TransportError> {
+        // Register before peeking so a send that races the empty-queue check
+        // still wakes this waiter instead of dropping the notify.
+        let notified = self.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.dialect.has_claimable(&self.names).await? {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = notified => {}
+            result = self.dialect.listen_wakeup() => {
+                if let Err(error) = result {
+                    eprintln!("{} bus wakeup: {error}", B::BACKEND);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -637,7 +663,7 @@ struct SqlLogSource<B> {
     /// Highest `seq` settled forward by this source's handles.
     settled_seq: Arc<AtomicI64>,
     source_epoch: ProjectionEpoch,
-    idle_poll: Duration,
+    wake: Arc<Notify>,
 }
 
 impl<B: SqlBusDialect> MessageSource for SqlLogSource<B> {
@@ -659,48 +685,58 @@ impl<B: SqlBusDialect> MessageSource for SqlLogSource<B> {
                 self.buffer.clear();
             }
         }
-        loop {
-            if self.buffer.is_empty() {
-                let rows = self
-                    .dialect
-                    .log_read(
-                        &self.names,
-                        &self.consumer,
-                        SOURCE_BATCH,
-                        &self.source_epoch,
-                    )
-                    .await?;
-                self.buffer.extend(rows);
-            }
-            let Some(row) = self.buffer.pop_front() else {
-                if self.idle_poll.is_zero() {
-                    return Ok(None);
-                }
-                tokio::time::sleep(self.idle_poll).await;
-                continue;
-            };
-            let position = u64::try_from(row.seq).map_err(|_| {
-                corrupt_row(
-                    B::BACKEND,
-                    format!(
-                        "bus_log seq {} is outside the projection cursor domain",
-                        row.seq
-                    ),
+        if self.buffer.is_empty() {
+            let rows = self
+                .dialect
+                .log_read(
+                    &self.names,
+                    &self.consumer,
+                    SOURCE_BATCH,
+                    &self.source_epoch,
                 )
-            })?;
-            let source = ProjectionSource::new(format!("{}.bus_log", B::BACKEND), b"global".to_vec())
-                .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
-            let ordered = OrderedDelivery::new(source, self.source_epoch.clone(), position, false)
-                .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
-            self.last_delivered = Some(row.seq);
-            return Ok(Some(SqlLogReceived {
-                dialect: self.dialect.clone(),
-                consumer: self.consumer.clone(),
-                settled_seq: self.settled_seq.clone(),
-                row,
-                ordered,
-            }));
+                .await?;
+            self.buffer.extend(rows);
         }
+        let Some(row) = self.buffer.pop_front() else {
+            return Ok(None);
+        };
+        let position = u64::try_from(row.seq).map_err(|_| {
+            corrupt_row(
+                B::BACKEND,
+                format!(
+                    "bus_log seq {} is outside the projection cursor domain",
+                    row.seq
+                ),
+            )
+        })?;
+        let source = ProjectionSource::new(format!("{}.bus_log", B::BACKEND), b"global".to_vec())
+            .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
+        let ordered = OrderedDelivery::new(source, self.source_epoch.clone(), position, false)
+            .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
+        self.last_delivered = Some(row.seq);
+        Ok(Some(SqlLogReceived {
+            dialect: self.dialect.clone(),
+            consumer: self.consumer.clone(),
+            settled_seq: self.settled_seq.clone(),
+            row,
+            ordered,
+        }))
+    }
+
+    async fn wait(&mut self) -> Result<(), TransportError> {
+        let notified = self.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        tokio::select! {
+            _ = notified => {}
+            result = self.dialect.listen_wakeup() => {
+                if let Err(error) = result {
+                    eprintln!("{} bus wakeup: {error}", B::BACKEND);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

@@ -37,6 +37,20 @@ pub trait MessageSource: Send {
     fn recv(
         &mut self,
     ) -> impl Future<Output = Result<Option<Self::Received>, TransportError>> + Send + '_;
+
+    /// Park until `recv` might return work. Used only when
+    /// [`IdlePolicy::Wait`](super::IdlePolicy::Wait) is set.
+    ///
+    /// Sources used with this policy must override the default with a real
+    /// notification, broker long-poll, or bounded timer. Failing explicitly is
+    /// safer than letting an unsupported source spin at executor speed.
+    fn wait(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send + '_ {
+        async {
+            Err(TransportError::permanent(
+                "message source does not support idle waiting",
+            ))
+        }
+    }
 }
 
 /// A message received from a transport, plus the means to settle it.

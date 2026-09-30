@@ -120,6 +120,7 @@ mod sql_bus_common;
 mod sqlite_bus;
 mod stable_id;
 mod topology;
+mod wake;
 
 #[cfg(feature = "kafka")]
 pub use kafka::{KafkaPublisher, KafkaReceived, KafkaSource};
@@ -163,7 +164,7 @@ pub use ordered_delivery::OrderedDelivery;
 pub use postgres_bus::{LogReceived, PostgresBus, QueueReceived};
 pub use publisher::MessagePublisher;
 pub use router::MessageRouter;
-pub use run_options::{ConsumerDeliveryMode, InboxHook, NoInbox, RunOptions};
+pub use run_options::{ConsumerDeliveryMode, IdlePolicy, InboxHook, NoInbox, RunOptions};
 pub use runner::run_source;
 pub use source::{MessageSource, ReceivedMessage};
 #[cfg(feature = "sqlite")]
