@@ -709,3 +709,225 @@ async fn undecodable_payload_dead_letters_without_blocking() {
         "the message behind the garbage is still handled"
     );
 }
+
+// ---- latency: idle delivery, retry backoff, delivery lanes ----
+// See docs/consumer-delivery-lanes.md.
+
+/// A long-lived consumer that has gone through several empty fetches must
+/// still hand a newly published message to its handler immediately; it must
+/// not sleep out an idle interval or a fetch expiry first.
+#[tokio::test]
+async fn message_published_after_empty_fetches_is_delivered_promptly() {
+    let Some(url) = nats_url() else { return };
+    let subject = unique("latency.idle");
+    let source = NatsJetStreamSource::connect(
+        &url,
+        &unique("STREAM"),
+        vec![subject.clone()],
+        &unique("consumer"),
+    )
+    .await
+    .expect("connect source")
+    .with_fetch_timeout(Duration::from_millis(500))
+    .with_idle_poll(Duration::from_millis(25));
+    let handled = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let record = handled.clone();
+    let router = Arc::new(Handlers::new().on_event(&subject, move |_: &Message| {
+        record
+            .lock()
+            .unwrap()
+            .get_or_insert_with(std::time::Instant::now);
+        async { Ok(()) }
+    }));
+    let consumer = tokio::spawn(run_source(router, source, RunOptions::idempotent()));
+    // Several empty 500 ms fetches expire first.
+    tokio::time::sleep(Duration::from_millis(1_300)).await;
+    let publisher = NatsPublisher::connect(&url).await.expect("publisher");
+    let published = std::time::Instant::now();
+    publisher
+        .publish(Message::new(&subject, MessageKind::Event, b"{}".to_vec()).with_id("late"))
+        .await
+        .expect("publish");
+    let latency = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(at) = *handled.lock().unwrap() {
+                return at.duration_since(published);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("idle consumer delivered the message");
+    consumer.abort();
+    assert!(
+        latency < Duration::from_millis(250),
+        "idle delivery took {latency:?}"
+    );
+}
+
+/// A message that keeps failing retryably is redelivered with growing
+/// delays instead of a hot loop, and a newer message is not delayed by it.
+#[tokio::test]
+async fn retryable_nack_backs_off_without_starving_newer_messages() {
+    let Some(url) = nats_url() else { return };
+    let subject = unique("latency.retry");
+    let source = NatsJetStreamSource::connect(
+        &url,
+        &unique("STREAM"),
+        vec![subject.clone()],
+        &unique("consumer"),
+    )
+    .await
+    .expect("connect source")
+    .with_fetch_timeout(Duration::from_millis(500))
+    .with_idle_poll(Duration::from_millis(25));
+    let poison_attempts = Arc::new(AtomicUsize::new(0));
+    let fresh_at = Arc::new(Mutex::new(None::<std::time::Instant>));
+    let (attempts, fresh) = (poison_attempts.clone(), fresh_at.clone());
+    let router = Arc::new(
+        Handlers::new().on_event(&subject, move |message: &Message| {
+            let poison = message.id() == Some("poison");
+            if poison {
+                attempts.fetch_add(1, Ordering::SeqCst);
+            } else {
+                fresh
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(std::time::Instant::now);
+            }
+            async move {
+                if poison {
+                    Err(TransportError::retryable("rejected until repaired"))
+                } else {
+                    Ok(())
+                }
+            }
+        }),
+    );
+    let consumer = tokio::spawn(run_source(router, source, RunOptions::idempotent()));
+    let publisher = NatsPublisher::connect(&url).await.expect("publisher");
+    publisher
+        .publish(Message::new(&subject, MessageKind::Event, b"{}".to_vec()).with_id("poison"))
+        .await
+        .expect("publish poison");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let published = std::time::Instant::now();
+    publisher
+        .publish(Message::new(&subject, MessageKind::Event, b"{}".to_vec()).with_id("fresh"))
+        .await
+        .expect("publish fresh");
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    consumer.abort();
+    let fresh_latency = fresh_at
+        .lock()
+        .unwrap()
+        .expect("fresh message handled")
+        .duration_since(published);
+    let attempts = poison_attempts.load(Ordering::SeqCst);
+    assert!(
+        fresh_latency < Duration::from_millis(250),
+        "fresh message waited {fresh_latency:?}"
+    );
+    // 50 ms doubling over ~1.5 s allows at most ~6 attempts; an immediate
+    // NAK loop redelivers hundreds of times in the same window.
+    assert!(
+        (2..=8).contains(&attempts),
+        "poison retried {attempts} times: retries must continue but back off"
+    );
+}
+
+/// With the process policy in its own lane, a slow projection route for an
+/// earlier message does not delay the policy for a later message, and every
+/// delivery is still acknowledged exactly once after all of its lanes ran.
+#[tokio::test]
+async fn slow_default_lane_does_not_delay_process_lane_over_jetstream() {
+    let Some(url) = nats_url() else { return };
+    let namespace = unique("lanes").to_lowercase();
+    let bus = nats_bus(&url, &namespace, "lanes")
+        .await
+        .with_idle_poll(Duration::from_millis(25));
+    let started = std::time::Instant::now();
+    let projection_done = Arc::new(Mutex::new(Vec::<(String, Duration)>::new()));
+    let policy_done = Arc::new(Mutex::new(Vec::<(String, Duration)>::new()));
+    let (projected, policed) = (projection_done.clone(), policy_done.clone());
+    let service = Service::new()
+        .named("lanes")
+        .routes(
+            Routes::new()
+                .with_dependencies(())
+                .event("fact.recorded")
+                .handle(move |ctx: &Context<()>| {
+                    let id = ctx.message().id().unwrap_or_default().to_owned();
+                    let projected = projected.clone();
+                    async move {
+                        if id == "m1" {
+                            // A slow projection / external effect.
+                            tokio::time::sleep(Duration::from_millis(1_500)).await;
+                        }
+                        projected.lock().unwrap().push((id, started.elapsed()));
+                        Ok(json!({}))
+                    }
+                }),
+        )
+        .lane(
+            "process",
+            Routes::new()
+                .with_dependencies(())
+                .event("fact.recorded")
+                .handle(move |ctx: &Context<()>| {
+                    let id = ctx.message().id().unwrap_or_default().to_owned();
+                    let policed = policed.clone();
+                    async move {
+                        policed.lock().unwrap().push((id, started.elapsed()));
+                        Ok(json!({}))
+                    }
+                }),
+        )
+        .with_bus(bus.clone());
+    let consumer = tokio::spawn(service.run(RunOptions::idempotent()));
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    use distributed::bus::Bus;
+    for id in ["m1", "m2"] {
+        bus.publish_message(
+            Message::new("fact.recorded", MessageKind::Event, b"{}".to_vec()).with_id(id),
+        )
+        .await
+        .expect("publish");
+    }
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    consumer.abort();
+    let policed = policy_done.lock().unwrap().clone();
+    let projected = projection_done.lock().unwrap().clone();
+    assert_eq!(
+        policed
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["m1", "m2"],
+        "process lane keeps delivery order"
+    );
+    assert_eq!(
+        projected
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["m1", "m2"],
+        "default lane keeps delivery order"
+    );
+    let m2_policy = policed[1].1;
+    let m1_projection = projected[0].1;
+    assert!(
+        m2_policy + Duration::from_millis(1_000) < m1_projection,
+        "process lane waited for the slow lane: m2 policy at {m2_policy:?}, m1 projection at {m1_projection:?}"
+    );
+    // Both deliveries were acknowledged: nothing pending or awaiting ack.
+    let stream = bus.ensure_stream().await.expect("stream");
+    let mut durable = stream
+        .get_consumer::<async_nats::jetstream::consumer::pull::Config>("lanes_evt")
+        .await
+        .expect("durable exists");
+    let info = durable.info().await.expect("consumer info");
+    assert_eq!(info.num_ack_pending, 0, "every delivery was settled");
+    assert_eq!(info.num_pending, 0);
+    assert_eq!(info.num_redelivered, 0, "no delivery ran twice");
+}

@@ -130,7 +130,10 @@ pub use knative::knative_triggers;
 #[cfg(feature = "http")]
 pub use knative_bus::KnativeBus;
 #[cfg(feature = "nats")]
-pub use nats::{NatsJetStreamSource, NatsPublisher, NatsReceived};
+pub use nats::{
+    NackBackoff, NatsJetStreamSource, NatsPublisher, NatsReceived, DEFAULT_NACK_BACKOFF_BASE,
+    DEFAULT_NACK_BACKOFF_MAX,
+};
 #[cfg(feature = "nats")]
 pub use nats_bus::{NatsBus, NatsBusConnect};
 #[cfg(feature = "rabbitmq")]
@@ -162,8 +165,8 @@ pub use ordered_delivery::OrderedDelivery;
 #[cfg(feature = "postgres")]
 pub use postgres_bus::{LogReceived, PostgresBus, QueueReceived};
 pub use publisher::MessagePublisher;
-pub use router::MessageRouter;
-pub use run_options::{ConsumerDeliveryMode, InboxHook, NoInbox, RunOptions};
+pub use router::{LaneSet, MessageRouter};
+pub use run_options::{ConsumerDeliveryMode, InboxHook, NoInbox, RunOptions, DEFAULT_LANE_WINDOW};
 pub use runner::run_source;
 pub use source::{MessageSource, ReceivedMessage};
 #[cfg(feature = "sqlite")]
