@@ -228,6 +228,7 @@ pub(super) struct PendingChange {
     pub(super) scope: Option<ProjectionRecordScope>,
     pub(super) revision: Option<RecordRevision>,
     pub(super) failure_id: Option<String>,
+    pub(super) program_id: Option<crate::ProjectionProgramId>,
 }
 
 impl PartitionState {
@@ -288,6 +289,7 @@ pub(in crate::in_memory_repo) fn reject_causal_owned_plans(
 
 pub(super) enum InputDisposition {
     New,
+    Redelivery,
     Duplicate(ProjectionCheckpoint),
     Stale(ProjectionCheckpoint),
 }

@@ -1,7 +1,7 @@
 use super::accumulator::ProtocolAccumulatorError;
 use super::*;
+use crate::command::CommandConsistency;
 use crate::command_ledger::CommandLedgerState;
-use crate::graphql::command_contract::CommandConsistency;
 use crate::microsvc::{
     CausalCommandProjectionObligation, CausalCommandPublicState, CausalCommandPublicStatus,
     CausalCommandReceiptSource, CausalProjectionEvidenceState,
@@ -146,6 +146,7 @@ fn direct_projected_receipt() -> CausalCommandReceiptSource {
     receipt.obligations.clear();
     receipt.direct_projection = Some(SameTransactionProjectionEvidence {
         records: vec![ProjectionRecordMetadata {
+            source_snapshot: None,
             revision: revision.clone(),
             tombstone: false,
             change: change.clone(),
@@ -158,6 +159,7 @@ fn direct_projected_receipt() -> CausalCommandReceiptSource {
             scope: Some(scope.clone()),
             revision: Some(revision.clone()),
             failure_id: None,
+            program_id: None,
         }],
         observations: vec![ProjectionObservation {
             causation_id: receipt.causation_id.clone(),
@@ -165,6 +167,7 @@ fn direct_projected_receipt() -> CausalCommandReceiptSource {
             revision: Some(revision),
             scope,
             change,
+            program_id: None,
         }],
     });
     receipt
@@ -518,7 +521,7 @@ fn stream_frames_are_immutable_fifo_and_do_not_bleed_forward() {
         .record_query_metadata(
             first.clone(),
             Some(DistributedLiveMetadata {
-                supported: true,
+                mode: DistributedLiveMode::Resumable,
                 reset: true,
                 cursors: vec![first.indexes[0].resume.clone().unwrap()],
             }),
@@ -528,7 +531,7 @@ fn stream_frames_are_immutable_fifo_and_do_not_bleed_forward() {
         .record_query_metadata(
             second.clone(),
             Some(DistributedLiveMetadata {
-                supported: true,
+                mode: DistributedLiveMode::Resumable,
                 reset: false,
                 cursors: vec![second.indexes[0].resume.clone().unwrap()],
             }),

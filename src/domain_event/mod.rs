@@ -5,6 +5,8 @@
 //! untouched, and only explicit successful persistence clears them.
 
 mod canonical;
+#[cfg(test)]
+mod derived_tests;
 mod descriptor;
 mod occurrence;
 
@@ -19,8 +21,8 @@ pub use descriptor::{
 };
 pub use occurrence::{
     DomainEventCaptureError, DomainEventCaptureOutcome, DomainEventCapturePoison,
-    DomainEventCommitGuardError, DomainEventEnvelope, DomainEventOccurrence,
-    DOMAIN_EVENT_OCCURRENCE_VERSION,
+    DomainEventCommitGuardError, DomainEventDerivation, DomainEventEnvelope, DomainEventOccurrence,
+    ExternalEventSource, DOMAIN_EVENT_OCCURRENCE_VERSION,
 };
 
 pub(crate) use canonical::canonical_json_bytes;

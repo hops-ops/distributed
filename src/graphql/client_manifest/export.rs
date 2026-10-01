@@ -6,6 +6,9 @@ pub struct DistributedClientSurfaceExport {
     identity: ClientSurfaceIdentity,
     surface: Arc<Surface>,
     execution: ClientExecutionLimits,
+    // All inputs are immutable and private. Clones share only compiled metadata,
+    // never request authority, preset values, tokens or read results.
+    manifest: Arc<std::sync::OnceLock<Result<DistributedClientManifest, ClientManifestError>>>,
 }
 
 /// Do not transitively format the selected Surface: it retains a private full
@@ -32,6 +35,7 @@ impl DistributedClientSurfaceExport {
             identity,
             surface: surface.into(),
             execution,
+            manifest: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -63,13 +67,11 @@ impl DistributedClientSurfaceExport {
                 name,
                 eligible_roles,
                 schema_roles,
-            } => {
-                ClientSurfaceIdentity::application_with_schema_roles(
-                    name,
-                    eligible_roles.clone(),
-                    schema_roles.clone(),
-                )
-            }
+            } => ClientSurfaceIdentity::application_with_schema_roles(
+                name,
+                eligible_roles.clone(),
+                schema_roles.clone(),
+            ),
         };
         validate_service_provenance(&service_id, &surface)?;
         Ok(Self::new(service_id, identity, surface, execution))
@@ -98,13 +100,11 @@ impl DistributedClientSurfaceExport {
                 name,
                 eligible_roles,
                 schema_roles,
-            } => {
-                ClientSurfaceIdentity::application_with_schema_roles(
-                    name,
-                    eligible_roles.clone(),
-                    schema_roles.clone(),
-                )
-            }
+            } => ClientSurfaceIdentity::application_with_schema_roles(
+                name,
+                eligible_roles.clone(),
+                schema_roles.clone(),
+            ),
         };
         if surface.service_binding.is_some() {
             return Err(ClientManifestError(
@@ -120,16 +120,30 @@ impl DistributedClientSurfaceExport {
     }
 
     pub fn manifest(&self) -> Result<DistributedClientManifest, ClientManifestError> {
-        client_manifest_from_surface_with_execution(
-            &self.service_id,
-            self.identity.clone(),
-            &self.surface,
-            self.execution.clone(),
-        )
+        self.manifest_ref().cloned()
+    }
+
+    pub(crate) fn manifest_ref(&self) -> Result<&DistributedClientManifest, ClientManifestError> {
+        self.manifest
+            .get_or_init(|| {
+                client_manifest_from_surface_with_execution(
+                    &self.service_id,
+                    self.identity.clone(),
+                    &self.surface,
+                    self.execution.clone(),
+                )
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     pub fn service_id(&self) -> &str {
         &self.service_id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn manifest_cache_owners(&self) -> usize {
+        Arc::strong_count(&self.manifest)
     }
 
     pub fn identity(&self) -> &ClientSurfaceIdentity {
@@ -175,17 +189,15 @@ pub fn prune_client_manifest(
             )));
         }
     }
-    manifest.models.retain(|model| {
-        allowed.contains(&model.id) || allowed.contains(&model.typename)
-    });
+    manifest
+        .models
+        .retain(|model| allowed.contains(&model.id) || allowed.contains(&model.typename));
     let kept: BTreeSet<String> = manifest
         .models
         .iter()
         .flat_map(|model| [model.id.clone(), model.typename.clone()])
         .collect();
-    manifest
-        .roots
-        .retain(|root| kept.contains(&root.model));
+    manifest.roots.retain(|root| kept.contains(&root.model));
     for projector in &mut manifest.projectors {
         projector.models.retain(|model| kept.contains(model));
     }
@@ -194,19 +206,22 @@ pub fn prune_client_manifest(
         .retain(|projector| !projector.models.is_empty());
     for program in &mut manifest.projection_programs {
         for arm in &mut program.arms {
-            arm.operations.retain(|operation| kept.contains(&operation.model));
+            arm.operations
+                .retain(|operation| kept.contains(&operation.model));
             for operation in &mut arm.operations {
                 operation.relationships.retain(|rel| {
                     kept.contains(&rel.source_model) && kept.contains(&rel.target_model)
                 });
-                operation.invalidations.retain(|invalidation| match invalidation {
-                    ClientProjectionInvalidation::Model { model } => kept.contains(model),
-                    ClientProjectionInvalidation::Relationship {
-                        source_model,
-                        target_model,
-                        ..
-                    } => kept.contains(source_model) && kept.contains(target_model),
-                });
+                operation
+                    .invalidations
+                    .retain(|invalidation| match invalidation {
+                        ClientProjectionInvalidation::Model { model } => kept.contains(model),
+                        ClientProjectionInvalidation::Relationship {
+                            source_model,
+                            target_model,
+                            ..
+                        } => kept.contains(source_model) && kept.contains(target_model),
+                    });
             }
         }
         program.arms.retain(|arm| !arm.operations.is_empty());

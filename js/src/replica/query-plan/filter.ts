@@ -484,6 +484,7 @@ export function evaluateComparison(
 	if (
 		operator === '_like' ||
 		operator === '_ilike' ||
+		operator === '_icontains' ||
 		operator === '_contains' ||
 		operator === '_contained_in' ||
 		operator === '_has_key'
@@ -961,6 +962,7 @@ export function isFilterOperator(value: string): value is ReplicaFilterOperator 
 		value === '_is_null' ||
 		value === '_like' ||
 		value === '_ilike' ||
+		value === '_icontains' ||
 		value === '_contains' ||
 		value === '_contained_in' ||
 		value === '_has_key'
@@ -971,7 +973,7 @@ export function isOperatorScalarCompatible(
 	scalar: string,
 	operator: ReplicaFilterOperator
 ): boolean {
-	if (operator === '_like' || operator === '_ilike') {
+	if (operator === '_like' || operator === '_ilike' || operator === '_icontains') {
 		return scalar === 'String';
 	}
 	if (

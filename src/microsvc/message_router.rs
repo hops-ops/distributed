@@ -5,7 +5,7 @@
 //! retryable/permanent vocabulary happens here, on the microsvc side, so the
 //! bus-core runner only ever sees an already-classified `TransportError`.
 
-use crate::bus::{MessageRouter, OrderedDelivery, TransportError};
+use crate::bus::{LaneSet, MessageRouter, OrderedDelivery, TransportError};
 use crate::microsvc::{Message, MessageKind, Service, SubscriptionPlan};
 
 impl MessageRouter for Service {
@@ -35,6 +35,26 @@ impl MessageRouter for Service {
         ordered: Option<&OrderedDelivery>,
     ) -> Result<(), TransportError> {
         self.dispatch_ordered_message(message, ordered)
+            .await
+            .map(|_| ())
+            .map_err(TransportError::from)
+    }
+
+    fn delivery_lanes(&self) -> usize {
+        self.delivery_lane_names().len()
+    }
+
+    fn lanes_for(&self, kind: MessageKind, name: &str) -> LaneSet {
+        self.lanes_for_message(kind, name)
+    }
+
+    async fn dispatch_lane(
+        &self,
+        message: &Message,
+        ordered: Option<&OrderedDelivery>,
+        lane: usize,
+    ) -> Result<(), TransportError> {
+        self.dispatch_lane_message(message, ordered, Some(lane))
             .await
             .map(|_| ())
             .map_err(TransportError::from)

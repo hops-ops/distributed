@@ -59,8 +59,22 @@ document, boundary binding, or UI build therefore leaves the prior generation
 active.
 Lifecycle receipts, the application manifest, and generated client trees are
 tool-owned state under `.distributed/lifecycle/`.
+During `distributed dev`, each process launch has a supervisor-owned identity.
+Client-only generations can retain an unchanged API process: the active cohort
+explicitly admits that instance, and its GraphQL responses advertise the current
+generation. Preparing, replaced and retired instances cannot dispatch mutations.
+Rollback launches receive new identities; schema compatibility alone never
+authorizes an old process. Upgrade the CLI and runtime together and restart dev
+after an upgrade so every member receives the matching lifecycle contract.
 Rust binaries remain in Cargo's target directory and SvelteKit output remains
 in its adapter-selected output directory.
+
+The discovered lifecycle also carries the absolute executable that initiated the
+CLI through its trusted compiler and UI child processes. Generated client
+commands therefore use that exact binary even when another `distributed`
+executable appears earlier on `PATH`, regardless of a project-local command
+override. Standalone Vite integrations retain their documented command setting
+and fallback behavior.
 
 Use `--output json` for a machine-readable lifecycle report. The compatibility
 flags `--root`, `--catalog`, and `--config` exist for older low-level lifecycle

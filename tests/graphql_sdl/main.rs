@@ -26,6 +26,7 @@ fn players() -> TableSchema {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "weapons".into(),
             kind: RelationshipKind::HasMany,
             target_model: "PlayerWeaponView".into(),
@@ -61,6 +62,7 @@ fn weapons() -> TableSchema {
         foreign_keys: vec![ForeignKey::new("players", "player_id")],
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "player".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "PlayerView".into(),
@@ -150,6 +152,7 @@ fn m2m_requires_through_error() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "tags".into(),
             kind: RelationshipKind::ManyToMany,
             target_model: "Tag".into(),

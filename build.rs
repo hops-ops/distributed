@@ -161,9 +161,10 @@ fn emit_migration_inventory() {
 }
 
 fn emit_dialect(generated: &mut String, name: &str, dialect: Dialect, inventory: &Inventory) {
-    generated.push_str("#[cfg(feature = \"");
-    generated.push_str(dialect.name());
-    generated.push_str("\")]\n");
+    match dialect {
+        Dialect::Sqlite => generated.push_str("#[cfg(any(feature = \"sqlite\", all(feature = \"workers-rs\", target_arch = \"wasm32\")))]\n"),
+        Dialect::Postgres => generated.push_str("#[cfg(feature = \"postgres\")]\n"),
+    }
     generated.push_str("pub(crate) const ");
     generated.push_str(name);
     generated.push_str(": &[EmbeddedMigration] = &[\n");

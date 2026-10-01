@@ -2,9 +2,9 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use distributed::graphql::Succeeded;
+use distributed::command::Succeeded;
 use distributed::microsvc::{CausalCommandContext, HandlerError};
-use distributed::{Aggregate, DomainEvent, Entity, EventRecord, GraphqlInput, GraphqlOutput};
+use distributed::{Aggregate, CommandInput, CommandOutput, DomainEvent, Entity, EventRecord};
 use serde::{Deserialize, Serialize};
 
 #[derive(Default)]
@@ -32,13 +32,13 @@ impl Aggregate for FixtureAggregate {
     }
 }
 
-#[derive(Clone, Deserialize, GraphqlInput)]
+#[derive(Clone, Deserialize, CommandInput)]
 pub struct CreateInput {
     id: String,
     title: String,
 }
 
-#[derive(Clone, Serialize, GraphqlOutput)]
+#[derive(Clone, Serialize, CommandOutput)]
 pub struct CreateOutput {
     id: String,
 }
@@ -66,7 +66,7 @@ pub struct TodoCreated {
 pub async fn handle(
     _context: &CausalCommandContext<'_, FixtureAggregate>,
     _input: CreateInput,
-) -> Result<distributed::graphql::PreparedCommand<Succeeded<CreateOutput>>, HandlerError> {
+) -> Result<distributed::command::PreparedCommand<Succeeded<CreateOutput>>, HandlerError> {
     unimplemented!()
 }
 
@@ -98,8 +98,14 @@ fn command_module_and_application_macros_share_one_portable_spec() {
     assert_eq!(spec.id, "todo.create");
     assert_eq!(spec.roles, ["admin", "user"]);
     assert_eq!(spec.emits[0].name, "todo.created");
-    assert!(spec.applies.as_array().is_some_and(|values| !values.is_empty()));
-    assert!(spec.defaults.as_array().is_some_and(|values| !values.is_empty()));
+    assert!(spec
+        .applies
+        .as_array()
+        .is_some_and(|values| !values.is_empty()));
+    assert!(spec
+        .defaults
+        .as_array()
+        .is_some_and(|values| !values.is_empty()));
     assert!(!spec.effects.is_null());
     assert!(!spec.fingerprint.is_empty());
     assert_eq!(

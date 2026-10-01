@@ -385,10 +385,7 @@ pub async fn dispatcher_completes_only_after_publish_success() {
         dispatcher.publisher().published_ids(),
         vec!["evt-1".to_string()]
     );
-    assert_eq!(
-        outbox_status(&repo, &id).await,
-        Some(OutboxMessageStatus::Published)
-    );
+    assert_eq!(outbox_status(&repo, &id).await, None);
 }
 
 pub async fn dispatcher_unknown_outcome_stays_retryable() {
@@ -421,10 +418,7 @@ pub async fn dispatcher_claims_explicit_ids_before_publish() {
         .unwrap();
     assert_eq!(outcome.claimed, 1);
     assert_eq!(outcome.published, 1);
-    assert_eq!(
-        outbox_status(&repo, &wanted).await,
-        Some(OutboxMessageStatus::Published)
-    );
+    assert_eq!(outbox_status(&repo, &wanted).await, None);
     // The unrequested row is untouched (claimed before publish, by id).
     assert_eq!(
         outbox_status(&repo, &other).await,
@@ -575,7 +569,7 @@ pub async fn publish_then_crash_republishes_and_consumer_inbox_dedupes() {
     assert_eq!(outcome.published, 1, "the reclaimed row is republished");
     assert_eq!(
         outbox_status(&producer, &message_id).await,
-        Some(OutboxMessageStatus::Published),
+        None,
         "the row completes only after the successful pass"
     );
 

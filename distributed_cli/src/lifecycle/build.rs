@@ -17,7 +17,7 @@ use super::{
     digest_bytes, validate_content_identity, validate_portable_path, validate_stable_value,
     ArtifactNodeReceipt, DistributedSourceIdentity, GenerationManifest, LifecycleConfig,
     LifecycleDevConfig, LifecycleError, LifecycleGraph, ReleaseManifest,
-    LIFECYCLE_CONFIG_SCHEMA_VERSION,
+    LIFECYCLE_CLI_EXECUTABLE_ENV, LIFECYCLE_CONFIG_SCHEMA_VERSION,
 };
 
 pub const LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -176,6 +176,9 @@ pub struct LifecycleProjectPlan {
     pub config: LifecycleBuildConfig,
     /// Project-relative or absolute content-addressed lifecycle state directory.
     pub out: PathBuf,
+    /// Canonical executable that initiated discovered lifecycle work. `None`
+    /// is retained for the compatibility file-adapter API.
+    pub(crate) cli_executable: Option<PathBuf>,
 }
 
 /// Per-invocation behavior for an already resolved lifecycle project.
@@ -278,6 +281,7 @@ pub fn run_lifecycle_build(
             catalog,
             config,
             out: options.out.clone(),
+            cli_executable: None,
         },
         &LifecycleBuildRequest::from(options),
     )
@@ -394,6 +398,7 @@ pub fn run_lifecycle_project_build(
             &node.outputs,
             executor,
             request.check,
+            project.cli_executable.as_deref(),
             request.cancel.as_deref(),
         )?;
         let output_identities = collect_node_outputs(stage.path(), node_id, &graph)?;
@@ -424,9 +429,7 @@ pub fn run_lifecycle_project_build(
     let drift = if request.check {
         match request.check_baseline {
             LifecycleCheckBaseline::Workspace => compare_workspace_outputs(&root, &generation)?,
-            LifecycleCheckBaseline::ActiveGeneration => {
-                compare_active_outputs(&out, &generation)?
-            }
+            LifecycleCheckBaseline::ActiveGeneration => compare_active_outputs(&out, &generation)?,
         }
     } else {
         if request
@@ -487,7 +490,9 @@ fn compare_active_outputs(
     generation: &GenerationManifest,
 ) -> Result<Vec<BuildDrift>, LifecycleError> {
     let active = read_active_generation(out)?;
-    let active_root = active.as_ref().map(|identity| out.join("generations").join(identity));
+    let active_root = active
+        .as_ref()
+        .map(|identity| out.join("generations").join(identity));
     let mut drift = Vec::new();
     for receipt in generation.receipts.values() {
         for (output, built_identity) in &receipt.output_identities {
@@ -641,6 +646,7 @@ fn execute_node(
     declared_outputs: &BTreeSet<String>,
     executor: &LifecycleExecutor,
     check: bool,
+    cli_executable: Option<&Path>,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), LifecycleError> {
     let root_value = root.to_string_lossy();
@@ -675,12 +681,11 @@ fn execute_node(
         .env("DISTRIBUTED_LIFECYCLE_ROOT", root)
         .env("DISTRIBUTED_LIFECYCLE_STAGE", stage)
         .env("DISTRIBUTED_LIFECYCLE_NODE", node_id)
-        .env(
-            "DISTRIBUTED_LIFECYCLE_CHECK",
-            if check { "1" } else { "0" },
-        )
-        .stdout(stdout)
-        .stderr(Stdio::piped());
+        .env("DISTRIBUTED_LIFECYCLE_CHECK", if check { "1" } else { "0" });
+    if let Some(executable) = cli_executable {
+        command.env(LIFECYCLE_CLI_EXECUTABLE_ENV, executable);
+    }
+    command.stdout(stdout).stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| {
         LifecycleError::new(format!(
             "lifecycle node `{node_id}` failed to start executor `{}`: {error}",
@@ -1375,6 +1380,49 @@ fn io_error(label: &'static str) -> impl FnOnce(std::io::Error) -> LifecycleErro
 mod tests {
     use super::*;
     use crate::lifecycle::graph::LifecycleErrorReason;
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_executor_receives_exact_cli_path_including_spaces() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().expect("create executor fixture");
+        let stage = fixture.path().join("stage");
+        fs::create_dir_all(&stage).expect("create executor stage");
+        let script = fixture.path().join("print-cli.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s' \"$DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE\"\n",
+        )
+        .expect("write executor script");
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("make executor executable");
+        let cli = fixture.path().join("cli with spaces").join("distributed");
+        let mut outputs = BTreeSet::new();
+        outputs.insert("cli-path.txt".to_string());
+
+        execute_node(
+            fixture.path(),
+            &stage,
+            "clients",
+            &outputs,
+            &LifecycleExecutor {
+                identity: "sha256:executor".to_string(),
+                program: script.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                stdout: Some("cli-path.txt".to_string()),
+            },
+            false,
+            Some(&cli),
+            None,
+        )
+        .expect("executor should receive the initiating CLI identity");
+        assert_eq!(
+            fs::read_to_string(stage.join("cli-path.txt")).unwrap(),
+            cli.to_string_lossy()
+        );
+    }
 
     #[test]
     fn activation_rejects_an_advanced_generation() {

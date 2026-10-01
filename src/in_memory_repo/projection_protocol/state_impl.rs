@@ -236,6 +236,21 @@ impl InMemoryProjectionProtocolState {
             gap_free,
         };
         self.validate_input_identity(&candidate)?;
+        let repeated_effect = self
+            .messages
+            .get(&MessageKey {
+                topology: cursor.topology().clone(),
+                message_id: message_id.to_string(),
+            })
+            .is_some_and(|identity| {
+                self.applied_receipts
+                    .contains_key(&CursorReceiptKey::new(&identity.cursor, generation))
+                    || self.applied_receipts.iter().any(|(key, receipt)| {
+                        key.generation == generation
+                            && key.partition == PartitionKey::from_input(cursor)
+                            && receipt.message_id == message_id
+                    })
+            });
         if let Some(receipt) = self
             .applied_receipts
             .get(&CursorReceiptKey::new(cursor, generation))
@@ -252,7 +267,11 @@ impl InMemoryProjectionProtocolState {
         let input_key = InputKey::new(cursor, generation);
         let Some(previous) = self.inputs.get(&input_key) else {
             self.reject_reused_message(cursor, fingerprint, message_id, causation_id, gap_free)?;
-            return Ok(InputDisposition::New);
+            return Ok(if repeated_effect {
+                InputDisposition::Redelivery
+            } else {
+                InputDisposition::New
+            });
         };
 
         match cursor.compare_position(&previous.cursor) {
@@ -292,7 +311,11 @@ impl InMemoryProjectionProtocolState {
                 {
                     return Err(ProjectionProtocolError::IncomparableInput);
                 }
-                Ok(InputDisposition::New)
+                Ok(if repeated_effect {
+                    InputDisposition::Redelivery
+                } else {
+                    InputDisposition::New
+                })
             }
         }
     }
@@ -310,7 +333,7 @@ impl InMemoryProjectionProtocolState {
             message_id: message_id.to_string(),
         };
         if let Some(previous) = self.messages.get(&key) {
-            if previous.cursor != *cursor
+            if previous.cursor.compare_position(cursor) == RevisionComparison::Incomparable
                 || previous.fingerprint != fingerprint
                 || previous.causation_id != causation_id
                 || previous.gap_free != gap_free
@@ -537,11 +560,15 @@ impl InMemoryProjectionProtocolState {
         scope: &ProjectionRecordScope,
         expectation: &ProjectionRecordExpectation,
         kind: ProjectionMutationKind,
+        source_snapshot: bool,
     ) -> Result<(RecordRevision, bool), ProjectionProtocolError> {
         let current = self.records.get(scope);
         match (expectation, current, kind) {
             (ProjectionRecordExpectation::Missing, None, ProjectionMutationKind::Upsert) => {
                 Ok((RecordRevision::new(scope.clone(), 1, 1)?, false))
+            }
+            (ProjectionRecordExpectation::Missing, None, ProjectionMutationKind::Delete) => {
+                Ok((RecordRevision::new(scope.clone(), 1, 1)?, true))
             }
             (ProjectionRecordExpectation::Missing, Some(metadata), _) if metadata.tombstone => {
                 Err(ProjectionProtocolError::RecordTombstoned {
@@ -582,7 +609,7 @@ impl InMemoryProjectionProtocolState {
                         )?,
                         false,
                     )),
-                    ProjectionMutationKind::Delete if metadata.tombstone => {
+                    ProjectionMutationKind::Delete if metadata.tombstone && !source_snapshot => {
                         Err(ProjectionProtocolError::RecordTombstoned {
                             model: scope.model().to_string(),
                         })
@@ -610,11 +637,9 @@ impl InMemoryProjectionProtocolState {
                     )),
                 }
             }
-            (_, _, ProjectionMutationKind::Delete | ProjectionMutationKind::Recreate) => {
-                Err(ProjectionProtocolError::InvalidBatch(
-                    "delete/recreate requires an exact record expectation".into(),
-                ))
-            }
+            (_, _, ProjectionMutationKind::Recreate) => Err(ProjectionProtocolError::InvalidBatch(
+                "delete/recreate requires an exact record expectation".into(),
+            )),
         }
     }
 
@@ -626,12 +651,16 @@ impl InMemoryProjectionProtocolState {
         row_exists: bool,
     ) -> Result<(), ProjectionProtocolError> {
         let should_exist = match (expectation, kind) {
-            (ProjectionRecordExpectation::Missing, ProjectionMutationKind::Upsert) => false,
-            (ProjectionRecordExpectation::Exact(_), ProjectionMutationKind::Recreate) => false,
             (
-                ProjectionRecordExpectation::Exact(_),
+                ProjectionRecordExpectation::Missing,
                 ProjectionMutationKind::Upsert | ProjectionMutationKind::Delete,
-            ) => true,
+            ) => false,
+            (ProjectionRecordExpectation::Exact(_), ProjectionMutationKind::Recreate) => false,
+            (ProjectionRecordExpectation::Exact(_), ProjectionMutationKind::Delete) => !self
+                .records
+                .get(scope)
+                .is_some_and(|record| record.tombstone),
+            (ProjectionRecordExpectation::Exact(_), ProjectionMutationKind::Upsert) => true,
             _ => {
                 return Err(ProjectionProtocolError::InvalidBatch(
                     "projection mutation has no valid physical-row expectation".into(),
@@ -677,6 +706,7 @@ impl InMemoryProjectionProtocolState {
             scope: pending.scope,
             revision: pending.revision,
             failure_id: pending.failure_id,
+            program_id: pending.program_id,
         };
         partition.change_head = position;
         partition.changes.insert(position, change.clone());

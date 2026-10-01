@@ -3,6 +3,63 @@ use super::*;
 use syn::DeriveInput;
 
 #[test]
+fn direct_relationship_references_are_order_independent_and_emitted() {
+    for attributes in [
+        "references = \"namespace,oid\", belongs_to = \"Object\", foreign_key = \"scope,oid\"",
+        "belongs_to = \"Object\", foreign_key = \"scope,oid\", references = \"namespace,oid\"",
+    ] {
+        let input = syn::parse_str(&format!(
+            "struct Ref {{ id: String, #[readmodel({attributes})] object: Option<Object> }}"
+        ))
+        .unwrap();
+        let expanded = expand_read_model(input).unwrap().to_string();
+        assert!(
+            expanded.contains("references : Some (\"namespace,oid\""),
+            "{expanded}"
+        );
+    }
+    for attributes in [
+        "references = \"id\"",
+        "belongs_to = \"Object\", foreign_key = \"id\", references = \"id\", references = \"id\"",
+        "many_to_many = \"Object\", foreign_key = \"id\", through = \"links\", references = \"id\"",
+    ] {
+        let input = syn::parse_str(&format!(
+            "struct Ref {{ id: String, #[readmodel({attributes})] object: Option<Object> }}"
+        ))
+        .unwrap();
+        assert!(expand_read_model(input).is_err(), "accepted {attributes}");
+    }
+}
+
+#[test]
+fn boxed_belongs_to_preserves_target_markers_and_checks_inner_type() {
+    let input: DeriveInput = syn::parse_quote! {
+        struct Parent {
+            id: String,
+            #[readmodel(belongs_to = "Child", foreign_key = "id")]
+            child: Option<std::boxed::Box<Child>>,
+        }
+    };
+    let expanded = expand_read_model(input).unwrap().to_string();
+    assert!(expanded.contains("type Target = Child"), "{expanded}");
+    assert!(!expanded.contains("type Target = std :: boxed :: Box"));
+    assert!(expanded.contains("Box :: new"));
+    assert!(expanded.contains("value . as_ref ()"));
+    for ty in [
+        "Option<Box<Other>>",
+        "Option<Box<Box<Child>>>",
+        "Option<std::sync::Arc<Child>>",
+        "Box<Child>",
+        "Vec<Box<Child>>",
+    ] {
+        let input: DeriveInput = syn::parse_str(&format!(
+            "struct Parent {{ id: String, #[readmodel(belongs_to = \"Child\", foreign_key = \"id\")] child: {ty} }}"
+        )).unwrap();
+        assert!(expand_read_model(input).is_err(), "accepted {ty}");
+    }
+}
+
+#[test]
 fn expand_read_model_accepts_named_id_field() {
     let input: DeriveInput = syn::parse_quote! {
         struct CounterView {

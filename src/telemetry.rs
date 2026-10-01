@@ -162,7 +162,7 @@ pub(crate) fn handler_error_status(error: &HandlerError) -> &'static str {
         | HandlerError::ProjectionTerminalRecorded { .. }
         | HandlerError::ProjectionDeliveryHalted { .. } => dispatch_status::REPOSITORY_ERROR,
         HandlerError::GuardRejected(_) => dispatch_status::GUARD_REJECTED,
-        HandlerError::Other(_) => dispatch_status::OTHER_ERROR,
+        HandlerError::ApplicationReloading | HandlerError::Other(_) => dispatch_status::OTHER_ERROR,
     }
 }
 

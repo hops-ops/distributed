@@ -1134,6 +1134,7 @@ pub(crate) fn validate_filter_fields(
                     | "_is_null"
                     | "_like"
                     | "_ilike"
+                    | "_icontains"
                     | "_contains"
                     | "_contained_in"
                     | "_has_key"

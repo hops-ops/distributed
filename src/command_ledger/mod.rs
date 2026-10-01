@@ -32,7 +32,8 @@ pub(crate) use ids::{
 pub(crate) use record::{CommandLedgerRecord, ReservationDecision};
 pub(crate) use reservation::{
     AttemptFence, CausalCommitBatch, CommandAttempt, CommandCompletion, CommandLookup,
-    CommandLookupScope, CommandReplay, CommandReservation, ReservationOutcome,
+    CommandLookupScope, CommandReplay, CommandReservation, ExternalCommandCompletion,
+    ExternalDispatchBinding, ReservationOutcome,
 };
 pub(crate) use state::{CommandLedgerState, TerminalCommandState};
 pub(crate) use traits::{

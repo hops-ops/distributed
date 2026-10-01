@@ -33,6 +33,17 @@ pub trait MessageSource: Send {
         "unknown"
     }
 
+    /// Whether each delivery can be settled independently of the others, in
+    /// any order, while later deliveries are still being received.
+    ///
+    /// True only for per-message acknowledgements (for example NATS JetStream
+    /// explicit acks). Positional (offset commit) and lease-based sources keep
+    /// the default `false`, and the runner then processes one delivery at a
+    /// time even when the router has several delivery lanes.
+    fn settles_independently(&self) -> bool {
+        false
+    }
+
     /// Receive the next message, if any.
     fn recv(
         &mut self,

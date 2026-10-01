@@ -481,6 +481,25 @@ fn compile_client_op(
 ) -> Result<String, String> {
     let col_ref = format!("{alias}.\"{column}\"");
     match op {
+        "_icontains" => {
+            let Value::String(text) = rhs else {
+                return Err("_icontains requires a string".into());
+            };
+            // Use an explicit escape character on both dialects. The operand
+            // stays a bind parameter; user text never becomes SQL or a wildcard.
+            let mut pattern = String::from("%");
+            for ch in text.chars() {
+                if matches!(ch, '!' | '%' | '_') {
+                    pattern.push('!');
+                }
+                pattern.push(ch);
+            }
+            pattern.push('%');
+            binds.push(value_to_bind(&Value::String(pattern), column_type)?);
+            let ph = placeholder(inner.dialect, binds.len());
+            let sql_op = inner.dialect.ops().ilike_op;
+            Ok(format!("{col_ref} {sql_op} {ph} ESCAPE '!'"))
+        }
         "_is_null" => {
             let yes = matches!(rhs, Value::Boolean(true));
             Ok(if yes {

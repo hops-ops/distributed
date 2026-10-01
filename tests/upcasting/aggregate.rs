@@ -71,7 +71,7 @@ impl TodoV2 {
 }
 
 distributed::aggregate!(TodoV2, entity, aggregate_type = "Todo" {
-    "initialized"(id, user_id, task, priority) => initialize,
+    "initialized"(id, user_id, task, priority), version = 2 => initialize,
     "completed"() => complete(),
 } upcasters [
     ("initialized", 1 => 2, InitializedV1 => InitializedV2, upcast_initialized_v1_v2),
@@ -120,7 +120,7 @@ impl TodoV3 {
 }
 
 distributed::aggregate!(TodoV3, entity, aggregate_type = "Todo" {
-    "initialized"(id, user_id, task, priority, due_date) => initialize,
+    "initialized"(id, user_id, task, priority, due_date), version = 3 => initialize,
     "completed"() => complete(),
 } upcasters [
     ("initialized", 1 => 2, InitializedV1 => InitializedV2, upcast_initialized_v1_v2),

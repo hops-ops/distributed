@@ -39,6 +39,7 @@ struct ExecutionMutation {
     scope: ProjectionRecordScope,
     intent: LifecycleIntent,
     mutation: TableMutation,
+    source_snapshot: Option<crate::projection_protocol::SourceSnapshotVersion>,
 }
 
 /// Store-free execution preflight produced before any adapter read.
@@ -118,7 +119,7 @@ impl PreparedProjectionExecution {
             ));
         }
 
-        let mut staged = Vec::with_capacity(self.mutations.len());
+        let mut next = workspace.clone();
         for mutation in self.mutations {
             let snapshot = snapshots.get(&mutation.scope).ok_or_else(|| {
                 ProjectionProtocolError::InvalidBatch(format!(
@@ -127,12 +128,32 @@ impl PreparedProjectionExecution {
                 ))
             })?;
             validate_snapshot_scope(snapshot)?;
-            staged.push(stage_for_snapshot(mutation, snapshot)?);
-        }
-
-        let mut next = workspace.clone();
-        for (mutation, expectation, kind) in staged {
-            next.stage_execution_mutation(mutation, expectation, kind)?;
+            let source = mutation.source_snapshot.clone();
+            if let Some(record) = &snapshot.record {
+                match (&source, &record.source_snapshot) {
+                    (Some(incoming), Some(current)) if !incoming.advances(current)? => {
+                        // A stale command still observes the current authoritative
+                        // revision. The commit validates that exact revision, so a
+                        // racing writer cannot turn this into a false confirmation.
+                        let (schema, _) = mutation_schema_key(&mutation.mutation);
+                        next.confirm_existing(schema, record.revision.clone())?;
+                        continue;
+                    }
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(ProjectionProtocolError::InvalidBatch(
+                            "projection source-ordering policy changed; rebuild the read model"
+                                .into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            let (physical, expectation, kind) = if source.is_some() {
+                stage_source_snapshot(mutation, snapshot)?
+            } else {
+                stage_for_snapshot(mutation, snapshot)?
+            };
+            next.stage_execution_mutation(physical, expectation, kind, source)?;
         }
         *workspace = next;
         Ok(())
@@ -164,6 +185,15 @@ pub(crate) fn prepare_portable_projection(
     };
     validate_execution_bounds(lowered.write_plan.mutations.len(), client_visible)?;
     lowered.write_plan.validate()?;
+    let source_snapshot = lowered
+        .resolved
+        .source_snapshots()
+        .then(|| {
+            crate::projection_protocol::SourceSnapshotVersion::from_occurrence(
+                lowered.resolved.occurrence(),
+            )
+        })
+        .transpose()?;
 
     let mut used_logical = vec![false; lowered.resolved.mutations().len()];
     let mut mutations = Vec::with_capacity(lowered.write_plan.mutations.len());
@@ -203,6 +233,7 @@ pub(crate) fn prepare_portable_projection(
             scope,
             intent,
             mutation: physical,
+            source_snapshot: source_snapshot.clone(),
         });
     }
     if used_logical.iter().any(|used| !used) {
@@ -241,6 +272,7 @@ pub(crate) fn prepare_graph_projection(
             scope,
             intent: intent_for_physical(&mutation),
             mutation,
+            source_snapshot: None,
         });
     }
     prepare(workspace, mutations, cached)
@@ -430,6 +462,55 @@ pub(crate) fn validate_snapshot_scope(
             "projection snapshot for model `{}` has inconsistent physical row and protocol metadata",
             snapshot.scope.model()
         ))),
+    }
+}
+
+fn stage_source_snapshot(
+    execution: ExecutionMutation,
+    snapshot: &ProjectionScopedRowSnapshot,
+) -> Result<
+    (
+        TableMutation,
+        ProjectionRecordExpectation,
+        ProjectionMutationKind,
+    ),
+    ProjectionProtocolError,
+> {
+    let expected = snapshot
+        .record
+        .as_ref()
+        .map_or(ProjectionRecordExpectation::Missing, |record| {
+            ProjectionRecordExpectation::Exact(record.revision.clone())
+        });
+    match execution.intent {
+        LifecycleIntent::Upsert => {
+            let tombstone = snapshot
+                .record
+                .as_ref()
+                .is_some_and(|record| record.tombstone);
+            let mutation = if snapshot.row.is_some() {
+                normalize_save(execution.mutation)?
+            } else {
+                normalize_create(execution.mutation)?
+            };
+            Ok((
+                mutation,
+                expected,
+                if tombstone {
+                    ProjectionMutationKind::Recreate
+                } else {
+                    ProjectionMutationKind::Upsert
+                },
+            ))
+        }
+        LifecycleIntent::Delete => Ok((
+            normalize_delete(execution.mutation)?,
+            expected,
+            ProjectionMutationKind::Delete,
+        )),
+        _ => Err(ProjectionProtocolError::InvalidBatch(
+            "source snapshots cannot apply partial/delta mutations".into(),
+        )),
     }
 }
 
@@ -1067,6 +1148,7 @@ mod tests {
             scope: workspace.record_scope(schema, key).unwrap(),
             intent,
             mutation,
+            source_snapshot: None,
         }
     }
 
@@ -1076,6 +1158,7 @@ mod tests {
         revision: u64,
     ) -> ProjectionRecordMetadata {
         ProjectionRecordMetadata {
+            source_snapshot: None,
             revision: RecordRevision::new(scope, 1, revision).unwrap(),
             tombstone,
             change: ProjectionChangeCursor::new(

@@ -377,7 +377,8 @@ pub(crate) fn has_many_join_columns(
             relationship.field_name
         )));
     }
-    let pairs = super::registry::resolve_direct_join_keys(root_schema, relationship, target_schema)?;
+    let pairs =
+        super::registry::resolve_direct_join_keys(root_schema, relationship, target_schema)?;
     match pairs.as_slice() {
         [pair] => Ok((
             pair.foreign_key_column.clone(),
@@ -386,6 +387,32 @@ pub(crate) fn has_many_join_columns(
         _ => Err(TableStoreError::Metadata(format!(
             "relationship `{}` has a composite direct join; single-column has_many helpers cannot load it",
             relationship.field_name
+        ))),
+    }
+}
+
+pub(crate) fn belongs_to_join_columns(
+    source: &TableSchema,
+    relationship: &RelationshipDef,
+    target: &TableSchema,
+) -> Result<(String, String), TableStoreError> {
+    if !matches!(relationship.kind, RelationshipKind::BelongsTo) {
+        return Err(TableStoreError::Metadata(
+            "expected a belongs_to relationship".into(),
+        ));
+    }
+    if relationship.references.is_none() && target.primary_key.columns.len() != 1 {
+        return Err(TableStoreError::Metadata(format!(
+            "belongs_to include `{}` targeting `{}` through `{}` requires a single-column primary key",
+            relationship.field_name, target.model_name, relationship.foreign_key.as_deref().unwrap_or("unspecified foreign key"),
+        )));
+    }
+    let pairs = super::registry::resolve_direct_join_keys(source, relationship, target)?;
+    match pairs.as_slice() {
+        [pair] => Ok((pair.foreign_key_column.clone(), pair.primary_key_column.clone())),
+        _ => Err(TableStoreError::Metadata(format!(
+            "relationship `{}` has a composite direct join; single-column belongs_to helpers cannot load it",
+            relationship.field_name,
         ))),
     }
 }
@@ -490,6 +517,7 @@ mod tests {
             kind: TableKind::ReadModel,
         };
         let relationship = RelationshipDef {
+            references: None,
             field_name: "children".into(),
             kind: RelationshipKind::HasMany,
             target_model: "Child".into(),

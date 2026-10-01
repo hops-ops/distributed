@@ -3,6 +3,10 @@ import type {
 	DistributedBoundaryVariableSource,
 	DistributedBoundaryVariableSources
 } from './boundary-variables.js';
+import type {
+	DistributedSearchParamSource,
+	DistributedSearchScalar
+} from './search-variables.js';
 
 const GRAPHQL_ISLAND_BINDINGS = Symbol.for(
 	'@hops-ops/distributed/graphql-island-bindings'
@@ -60,11 +64,21 @@ export function routeParam(name: string): DistributedBoundaryVariableSource {
 	return Object.freeze({ kind: 'route_param', name });
 }
 
+export function searchParam<TScalar extends DistributedSearchScalar>(
+	name: string,
+	scalar: TScalar
+): DistributedSearchParamSource<TScalar, 'first'> & { mode: 'first' };
+export function searchParam<TScalar extends DistributedSearchScalar, TMode extends 'first' | 'all'>(
+	name: string,
+	scalar: TScalar,
+	mode: TMode
+): DistributedSearchParamSource<TScalar, TMode> & { mode: TMode };
 export function searchParam(
 	name: string,
+	scalar: DistributedSearchScalar,
 	mode: 'first' | 'all' = 'first'
-): DistributedBoundaryVariableSource {
-	return Object.freeze({ kind: 'search_param', name, mode });
+): DistributedSearchParamSource & { mode: 'first' | 'all' } {
+	return Object.freeze({ kind: 'search_param', name, scalar, mode });
 }
 
 export function sessionClaim(...path: string[]): DistributedBoundaryVariableSource {

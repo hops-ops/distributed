@@ -41,6 +41,8 @@ struct ArtifactProtocol<'a> {
     version: u32,
     #[serde(rename = "schemaHash")]
     schema_hash: &'a str,
+    #[serde(rename = "protocolHash")]
+    protocol_hash: &'a str,
     surface: &'a super::super::manifest::ManifestSurface,
     operation: &'a str,
     #[serde(rename = "trustedPresets")]
@@ -256,6 +258,7 @@ pub(super) fn render_operation_artifact_json(
         protocol: ArtifactProtocol {
             version: 1,
             schema_hash: &manifest.schema_fingerprint,
+            protocol_hash: &manifest.protocol_fingerprint,
             surface: &manifest.surface,
             operation: &operation.query_hash,
             trusted_presets: &manifest.trusted_presets,

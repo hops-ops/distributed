@@ -5,6 +5,13 @@
 //! 2. Listens on [`ChangeHub`] (fed by `change_stream` / repo broadcast).
 //! 3. On dirty tables intersecting the plan footprint, debounces, re-executes,
 //!    and yields only when the response hash changes (hash-gated push).
+//!
+//! A failed execution is terminal (`docs/live-query-delivery.md`): the producer
+//! yields one error and stops. GraphQL ends the subscription on that error, and
+//! the failure frame carries only the base protocol envelope. Protocol frame
+//! metadata is a FIFO consumed by each emitted response, so producing another
+//! frame after an error could let the error response take that later frame's
+//! snapshot/live metadata.
 
 use std::collections::BTreeSet;
 use std::pin::Pin;
@@ -33,6 +40,11 @@ impl ChangeHub {
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(256);
         Self { tx }
+    }
+
+    /// Active origin live readers, excluding the external invalidation forwarder.
+    pub fn subscriber_count(&self) -> usize {
+        self.tx.receiver_count()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ReadModelChange> {
@@ -126,15 +138,11 @@ pub(crate) async fn live_query_stream(
 
     tokio::spawn(async move {
         // 1) Initial execution + yield
-        let mut initial = match execute_list(
-            &inner,
-            &role,
-            &plan,
-            protocol.as_ref(),
-            requested_live_resume,
-        )
-        .await
-        {
+        let initial_result = tokio::select! {
+            _ = tx.closed() => return,
+            result = execute_list(&inner, &role, &plan, protocol.as_ref(), requested_live_resume) => result,
+        };
+        let mut initial = match initial_result {
             Ok(executed) => executed,
             Err(e) => {
                 let _ = tx.send(Err(async_graphql::Error::new(e))).await;
@@ -153,7 +161,10 @@ pub(crate) async fn live_query_stream(
 
         // 2) Change loop: dirty → debounce → re-exec → hash-gate → yield
         loop {
-            let change = match change_rx.recv().await {
+            let change = match tokio::select! {
+                _ = tx.closed() => break,
+                change = change_rx.recv() => change,
+            } {
                 Ok(c) => c,
                 Err(broadcast::error::RecvError::Lagged(_)) => ReadModelChange {
                     tables: BTreeSet::new(),
@@ -166,7 +177,10 @@ pub(crate) async fn live_query_stream(
             }
 
             // Debounce / coalesce
-            tokio::time::sleep(debounce).await;
+            tokio::select! {
+                _ = tx.closed() => break,
+                _ = tokio::time::sleep(debounce) => {},
+            }
             loop {
                 match change_rx.try_recv() {
                     Ok(more) => {
@@ -179,15 +193,11 @@ pub(crate) async fn live_query_stream(
                 }
             }
 
-            match execute_list(
-                &inner,
-                &role,
-                &plan,
-                protocol.as_ref(),
-                next_live_resume.clone(),
-            )
-            .await
-            {
+            let refreshed = tokio::select! {
+                _ = tx.closed() => break,
+                result = execute_list(&inner, &role, &plan, protocol.as_ref(), next_live_resume.clone()) => result,
+            };
+            match refreshed {
                 Ok(mut executed) => {
                     // Advance the private replay cursor even when a redundant
                     // execution is hash-gated. Protocol frame metadata is
@@ -198,14 +208,8 @@ pub(crate) async fn live_query_stream(
                         continue; // hash gate: no push on no-change
                     }
                     if let Err(error) = executed.record_protocol_metadata(protocol.as_ref()) {
-                        if tx
-                            .send(Err(async_graphql::Error::new(error)))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        continue;
+                        let _ = tx.send(Err(async_graphql::Error::new(error))).await;
+                        return;
                     }
                     last_hash = Some(executed.hash);
                     if tx.send(Ok(executed.value)).await.is_err() {
@@ -213,9 +217,8 @@ pub(crate) async fn live_query_stream(
                     }
                 }
                 Err(e) => {
-                    if tx.send(Err(async_graphql::Error::new(e))).await.is_err() {
-                        return;
-                    }
+                    let _ = tx.send(Err(async_graphql::Error::new(e))).await;
+                    return;
                 }
             }
         }
@@ -275,6 +278,8 @@ async fn execute_list(
         .ok_or_else(|| "authorized GraphQL role surface is unavailable".to_string())?;
     let executed = super::query_protocol::execute_query_with_protocol(
         inner,
+        &inner.pool,
+        true,
         role_surface,
         protocol.clone(),
         plan,
@@ -285,7 +290,7 @@ async fn execute_list(
     let next_live_resume = executed
         .live
         .as_ref()
-        .filter(|live| live.supported)
+        .filter(|live| live.mode == super::protocol::DistributedLiveMode::Resumable)
         .map(|live| RequestedLiveResume::Cursors(live.cursors.clone()))
         .unwrap_or(RequestedLiveResume::Absent);
     Ok(ExecutedLiveQuery {

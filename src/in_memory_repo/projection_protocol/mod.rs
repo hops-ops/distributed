@@ -10,7 +10,7 @@ use std::sync::Arc;
 use super::InMemoryRepository;
 use crate::projection_protocol::{
     change_kind_for_mutation, checked_next, checked_projection_graph_materialization,
-    failure_matches_batch, projection_has_many_columns, table_model_name,
+    failure_matches_batch, projection_relationship_values, table_model_name,
     validate_projection_graph_snapshot_request, ProjectionCausationEvidenceBatch,
     ProjectionCausationEvidenceRequest, ProjectionChange, ProjectionChangeCursor,
     ProjectionChangeKind, ProjectionChangeRead, ProjectionChangeRetention, ProjectionCheckpoint,
@@ -36,12 +36,13 @@ use crate::read_model::in_memory::{
 };
 use crate::repository::RepositoryError;
 use crate::table::{
-    column_name_for, key_from_row, RelationshipKind, RowKey, RowValues, TableMutation, TableSchema,
-    TableStoreError, TableWritePlan,
+    key_from_row, RowKey, RowValues, TableMutation, TableSchema, TableStoreError, TableWritePlan,
 };
 
 mod direct_projection;
 mod read_helpers;
+#[cfg(feature = "graphql")]
+mod rebuild;
 mod state;
 mod state_impl;
 mod store_impl;

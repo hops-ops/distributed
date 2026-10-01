@@ -54,7 +54,7 @@ make up                 # Zitadel + Postgres (read models + login)
 make up-celld-nats      # celld 0.4 local store + NATS
 
 cd ../e2e-celld
-make run                # GraphQL :8791 + UI :5180 (watches sources)
+make run                # public gateway :8791 + internal UI :5180 (watches sources)
 ```
 
 Eventual projectors and `@live` use **Postgres** from `e2e-ui.env`
@@ -78,7 +78,7 @@ The Cargo workspace declares `../e2e-ui/ui` as its UI component. Both
 `distributed build` and `distributed dev` resolve it within the repository;
 CI and users do not launch a second unmanaged `npm run dev` process.
 
-Open `http://localhost:5180`. The navbar shows a **celld** badge. Sign in
+Open `http://localhost:8791`. The navbar shows a **celld** badge. Sign in
 (`alice` / `Password1!` when Zitadel is up). Todos create/complete and
 lobby posts go to cells; open Chat in two tabs to see `@live` still fire.
 

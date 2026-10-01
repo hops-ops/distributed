@@ -104,7 +104,7 @@ const variableCodec = Object.freeze({
 					scalar: 'String',
 					codec: 'string',
 					nullable: false,
-					operators: Object.freeze(['_eq', '_like', '_ilike'])
+					operators: Object.freeze(['_eq', '_like', '_ilike', '_icontains'])
 				})
 			]),
 			relationships: Object.freeze([
@@ -317,6 +317,21 @@ test('compiler variable codec canonicalizes ID, lists, filters, order, and key o
 	});
 	assertDeepFrozen(singleton);
 	assert.equal(JSON.stringify(singleton), JSON.stringify(expanded));
+});
+
+test('literal text filters preserve operands and reject non-string values', () => {
+	for (const q of ['', '%_!\\\'OR 1=1', 'Älice']) {
+		const variables = { id: '1', where: { title: { _icontains: q } } };
+		assert.deepEqual(canonicalizeOperationVariables(CodecArtifact, variables), variables);
+	}
+	for (const q of [12, true, {}, []]) {
+		assert.throws(() => canonicalizeOperationVariables(CodecArtifact, {
+			id: '1', where: { title: { _icontains: q } }
+		}), /expected string/);
+	}
+	assert.throws(() => canonicalizeOperationVariables(CodecArtifact, {
+		id: '1', where: { priority: { _icontains: '1' } }
+	}));
 });
 
 test('scalar canonicalization is deterministic and preserves omission versus null', () => {

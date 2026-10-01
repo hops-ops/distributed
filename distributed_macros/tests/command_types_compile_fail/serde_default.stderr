@@ -1,0 +1,5 @@
+error: #[serde(default)] is not supported by CommandInput because it changes the declared command field shape; define a separate wire type
+ --> tests/command_types_compile_fail/serde_default.rs:5:13
+  |
+5 |     #[serde(default)]
+  |             ^^^^^^^

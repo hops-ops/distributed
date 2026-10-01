@@ -4,8 +4,8 @@ use quote::quote;
 use syn::{Data, DeriveInput, Fields, LitInt, LitStr};
 
 use crate::shared::{
-    canonical_object_schema, projection_body_metadata_tokens, schema_fingerprint,
-    validate_domain_event_name_literal, framework_path,
+    canonical_object_schema, framework_path, projection_body_metadata_tokens, schema_fingerprint,
+    validate_domain_event_name_literal,
 };
 
 pub(crate) fn derive_domain_event(input: TokenStream) -> TokenStream {
@@ -84,6 +84,15 @@ pub(crate) fn expand_domain_event(input: DeriveInput) -> syn::Result<proc_macro2
         }
 
         impl #framework::domain_event::DomainEventBodyContract<Self> for #name {}
+
+        impl #framework::command::CommandProjectionBody for #name {
+            fn command_projection_descriptor(
+                _: &'static str,
+                _: u64,
+            ) -> #framework::DomainEventDescriptor {
+                <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
+            }
+        }
 
         impl #framework::projection::lower::ProjectionBodyMetadata for #name {
             #projection_metadata

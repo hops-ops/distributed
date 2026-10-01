@@ -64,6 +64,9 @@ export function serializeOperationProtocolState(
 		...(state.indexRevision === undefined
 			? {}
 			: { indexRevision: state.indexRevision }),
+		...(state.retiredAtRevision === undefined
+			? {}
+			: { retiredAtRevision: state.retiredAtRevision }),
 		indexKeys: Object.freeze([...state.indexKeys].sort()),
 		pathRecords: Object.freeze(
 			[...state.pathRecords]
@@ -375,6 +378,15 @@ export function parseReplicaHydration(
 				) {
 					hydrationInvalid('state.payload.nextIndexRevision');
 				}
+				if (
+					operation?.retiredAtRevision !== undefined &&
+					compareDistributedDecimal(
+						operation.retiredAtRevision as DistributedDecimalString,
+						nextIndexRevision
+					) > 0
+				) {
+					hydrationInvalid('state.payload.nextIndexRevision');
+				}
 			}
 		}
 		return {
@@ -405,6 +417,7 @@ export function parseOperationProtocolState(
 			'snapshotScope',
 			'indexClocks',
 			'indexRevision',
+			'retiredAtRevision',
 			'indexKeys',
 			'pathRecords',
 			'cursors'
@@ -500,6 +513,14 @@ export function parseOperationProtocolState(
 					indexRevision: hydrationDecimal(
 						raw.indexRevision,
 						`${path}.indexRevision`
+					)
+				}),
+		...(raw.retiredAtRevision === undefined
+			? {}
+			: {
+					retiredAtRevision: hydrationDecimal(
+						raw.retiredAtRevision,
+						`${path}.retiredAtRevision`
 					)
 				}),
 		indexKeys,

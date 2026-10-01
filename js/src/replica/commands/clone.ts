@@ -1,4 +1,5 @@
 import type { ReplicaClientSurface, ReplicaValue } from '../types.js';
+import { isUnsignedInteger, unsignedIntegerMaximum } from '../../unsigned-integer.js';
 import { createReplicaCommandId } from '../command-id.js';
 import { isPlainRecord } from '../../lib/is-plain-record.js';
 import {
@@ -169,6 +170,11 @@ export function cloneScalar(
 	value: unknown,
 	path: string
 ): ReplicaValue {
+	const unsignedMaximum = unsignedIntegerMaximum(codec);
+	if (unsignedMaximum !== undefined) {
+		if (!isUnsignedInteger(value, unsignedMaximum)) inputInvalid(path);
+		return value;
+	}
 	switch (codec) {
 		case 'string':
 		case 'string_unvalidated_timestamp':

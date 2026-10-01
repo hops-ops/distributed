@@ -24,6 +24,7 @@ export {
 	type DistributedBoundaryVariableSource,
 	type DistributedBoundaryVariableSources
 } from './boundary-variables.js';
+export type { DistributedSearchParamSource, DistributedSearchScalar } from './search-variables.js';
 export {
 	constant,
 	defineGraphqlIslandBindings,

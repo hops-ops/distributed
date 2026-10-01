@@ -54,7 +54,9 @@ impl ClientCompileInput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClientSurfaceSelector {
-    Role { name: String },
+    Role {
+        name: String,
+    },
     Application {
         name: String,
         eligible_roles: Vec<String>,
@@ -72,7 +74,10 @@ impl ClientSurfaceSelector {
         eligible_roles: impl IntoIterator<Item = impl Into<String>>,
         schema_roles: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        let mut eligible_roles = eligible_roles.into_iter().map(Into::into).collect::<Vec<_>>();
+        let mut eligible_roles = eligible_roles
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>();
         let mut schema_roles = schema_roles.into_iter().map(Into::into).collect::<Vec<_>>();
         eligible_roles.sort();
         eligible_roles.dedup();

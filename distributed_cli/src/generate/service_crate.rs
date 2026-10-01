@@ -213,7 +213,7 @@ async fn main() -> Result<(), {error_type}> {{
             .map(|model| format!("        .read_model::<{}>()\n", model.view_ident))
             .collect::<String>();
         format!(
-r#"use distributed::{{
+            r#"use distributed::{{
     Application, ApplicationManifest, ReadModelCatalog, SurfaceSpec,
 }};
 
@@ -519,13 +519,13 @@ impl CommandAggregate {
             };
 
         let command_types = if self.query_api {
-            r#"#[derive(Clone, Debug, Deserialize, distributed::GraphqlInput)]
+            r#"#[derive(Clone, Debug, Deserialize, distributed::CommandInput)]
 pub struct CommandInput {
     pub id: String,
     pub name: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, distributed::GraphqlOutput)]
+#[derive(Clone, Debug, Serialize, distributed::CommandOutput)]
 pub struct CommandOutput {
     pub command: String,
     pub id: String,
@@ -597,7 +597,7 @@ impl {model_struct} {{
                 .map(|model| (model.type_ident.as_str(), model.name.as_str()))
                 .unwrap_or(("CommandAggregate", "CommandAggregate"));
             return format!(
-                r#"use distributed::graphql::{{typed_command, Succeeded, PreparedCommand, TypedCommand}};
+                r#"use distributed::command::{{typed_command, Succeeded, PreparedCommand, TypedCommand}};
 use distributed::microsvc::{{CausalCommandContext, HandlerError}};
 
 use crate::models::{{CommandInput, CommandOutput, {model_type}}};

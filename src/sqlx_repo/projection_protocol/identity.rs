@@ -279,6 +279,14 @@ pub(super) fn input_identity_cursor_matches(
     identity: &StoredInputIdentity,
     input: &TrustedProjectionInput,
 ) -> bool {
+    input_identity_scope_matches(identity, input)
+        && identity.source_position == input.cursor.position()
+}
+
+fn input_identity_scope_matches(
+    identity: &StoredInputIdentity,
+    input: &TrustedProjectionInput,
+) -> bool {
     let source = input.cursor.source();
     identity.partition_bytes == input.cursor.projection_partition().canonical_bytes()
         && identity.partition_hash == digest_bytes(input.cursor.projection_partition().digest())
@@ -287,7 +295,6 @@ pub(super) fn input_identity_cursor_matches(
         && identity.source_partition_bytes == source.canonical_partition_bytes()
         && identity.source_partition_hash == digest_bytes(source.partition_digest())
         && identity.source_epoch == *input.cursor.epoch()
-        && identity.source_position == input.cursor.position()
 }
 
 pub(super) fn input_identity_matches(
@@ -325,7 +332,14 @@ where
          identity.source_hash, identity.source_partition_bytes, identity.source_partition_hash, \
          identity.source_epoch, identity.source_position, identity.input_hash, \
          identity.message_id, identity.causation_id, identity.gap_free \
-         FROM projection_input_identities identity JOIN projection_partitions partition \
+         FROM (SELECT * FROM projection_input_identities UNION ALL \
+         SELECT canonical.topology_hash, alias.partition_hash, canonical.source_bytes, \
+         alias.source_hash, canonical.source_partition_bytes, alias.source_partition_hash, \
+         alias.source_epoch, alias.source_position, canonical.input_hash, canonical.message_id, \
+         canonical.causation_id, canonical.gap_free \
+         FROM projection_input_delivery_aliases alias JOIN projection_input_identities canonical \
+         ON canonical.topology_hash = alias.topology_hash AND canonical.message_id = alias.message_id) identity \
+         JOIN projection_partitions partition \
          ON partition.topology_hash = identity.topology_hash \
          AND partition.partition_hash = identity.partition_hash \
          WHERE identity.topology_hash = ",
@@ -857,15 +871,20 @@ where
         }
     }
     if let Some(identity) = input_identity_by_message_in_tx(tx, input).await? {
-        if !input_identity_cursor_matches(&identity, input) {
+        if !input_identity_scope_matches(&identity, input) {
             return Err(ProjectionProtocolError::MessageIdReuse {
                 message_id: input.message_id.clone(),
             });
         }
-        if !input_identity_matches(&identity, input) {
-            return Err(ProjectionProtocolError::InputCorruption);
+        if identity.input_fingerprint != input.fingerprint
+            || identity.causation_id != input.causation_id
+            || identity.gap_free != input.gap_free
+        {
+            return Err(ProjectionProtocolError::MessageIdReuse {
+                message_id: input.message_id.clone(),
+            });
         }
-        if exact_identity.is_none() {
+        if exact_identity.is_none() && identity.source_position == input.cursor.position() {
             return Err(corrupt_storage(
                 "projection message identity exists without its exact cursor identity",
             ));
@@ -959,9 +978,17 @@ where
         )?));
     }
 
-    if let Some(receipt) = receipt_by_message_in_tx(tx, input).await? {
+    let repeated_effect = if let Some(receipt) = receipt_by_message_in_tx(tx, input).await? {
         verify_stored_change(state, &receipt.change)?;
-        if !receipt_matches_input(&receipt, input) {
+        let mut original_input = input.clone();
+        original_input.cursor = ProjectionInputCursor::new(
+            input.cursor.topology().clone(),
+            input.cursor.projection_partition().clone(),
+            input.cursor.source().clone(),
+            input.cursor.epoch().clone(),
+            receipt.source_position,
+        )?;
+        if !receipt_matches_input(&receipt, &original_input) {
             return Err(ProjectionProtocolError::MessageIdReuse {
                 message_id: input.message_id.clone(),
             });
@@ -971,17 +998,17 @@ where
                 "failed input receipt exists without a stopped partition",
             ));
         }
-        return Ok(InputDisposition::Duplicate(checkpoint_from_stored(
-            &input.cursor,
-            receipt.source_epoch,
-            receipt.source_position,
-            receipt.change,
-            receipt.gap_free,
-        )?));
-    }
+        true
+    } else {
+        false
+    };
 
     let Some(previous) = current_input_cursor_in_tx(tx, input).await? else {
-        return Ok(InputDisposition::New);
+        return Ok(if repeated_effect {
+            InputDisposition::Redelivery
+        } else {
+            InputDisposition::New
+        });
     };
     verify_stored_change(state, &previous.change)?;
     if previous.gap_free != input.gap_free {
@@ -1007,7 +1034,7 @@ where
         {
             return Err(ProjectionProtocolError::InputCorruption);
         }
-        if !verify_inherited_cursor_in_tx(tx, input, &previous).await? {
+        if !repeated_effect && !verify_inherited_cursor_in_tx(tx, input, &previous).await? {
             return Err(corrupt_storage(
                 "projection input cursor has no receipt and was not inherited by repair",
             ));
@@ -1026,5 +1053,9 @@ where
     {
         return Err(ProjectionProtocolError::IncomparableInput);
     }
-    Ok(InputDisposition::New)
+    Ok(if repeated_effect {
+        InputDisposition::Redelivery
+    } else {
+        InputDisposition::New
+    })
 }

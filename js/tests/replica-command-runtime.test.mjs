@@ -1,3 +1,4 @@
+import { createLazyReplicaCommandRuntime } from '../dist/replica/command-runtime/lazy.js';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
@@ -11,6 +12,7 @@ import {
 	ReplicaCommandRuntimeError
 } from '../dist/replica/command-runtime.js';
 import {
+	createDistributedReplica,
 	prepareReplicaCommand,
 	replicaRecordKey,
 	ReplicaCommandContractError
@@ -20,6 +22,11 @@ import {
 	COMMAND_STATE,
 	commandReceipt
 } from './fixtures/command-protocol.mjs';
+import {
+	TodosArtifact,
+	TodoModel,
+	todoFrame
+} from './fixtures/adapter-conformance.mjs';
 
 const HASH_A = `sha256:${'a'.repeat(64)}`;
 const HASH_B = `sha256:${'b'.repeat(64)}`;
@@ -44,6 +51,24 @@ const CACHE_SCOPE = token('cache-scope', 1);
 const Todo = Object.freeze({
 	id: 'Todos',
 	identityFields: Object.freeze(['id'])
+});
+
+// Reuse the generated query/live selection while matching the command
+// runtime's authoritative protocol scope. This keeps the regression on the
+// public replica and generated-command paths rather than a hand-built cache.
+const CommandTodos = Object.freeze({
+	...TodosArtifact,
+	id: 'query:command-runtime-todos',
+	protocol: Object.freeze({
+		...TodosArtifact.protocol,
+		schemaHash: HASH_B,
+		surface: SURFACE,
+		operation: 'query:command-runtime-todos'
+	}),
+	live: Object.freeze({
+		...TodosArtifact.live,
+		id: 'live:command-runtime-todos'
+	})
 });
 const Audit = Object.freeze({
 	id: 'Audits',
@@ -87,14 +112,15 @@ function scope(value, model = Todo.id) {
 	});
 }
 
-function projection(operation = 'upsert') {
+function projection(operation = 'upsert', model = Todo) {
 	const event = Object.freeze({ id: 'event-1', name: 'todo.changed', version: 1 });
-	const previewScope = scope(input(['id']));
+	const previewScope = scope(input(['id']), model.id);
 	const targetScope = scope(
 		Object.freeze({
 			kind: 'constant',
 			value: Object.freeze({ type: 'string', value: 'target' })
-		})
+		}),
+		model.id
 	);
 	let mutation;
 	if (operation === 'upsert') {
@@ -129,7 +155,7 @@ function projection(operation = 'upsert') {
 		mutation = Object.freeze({
 			op: 'invalidate_model',
 			partition: unit,
-			model: Todo.id
+			model: model.id
 		});
 	} else {
 		mutation = Object.freeze({
@@ -143,40 +169,40 @@ function projection(operation = 'upsert') {
 			? Object.freeze({
 					kind: 'relationship',
 					relationship: 'related',
-					source_model: Todo.id,
+					source_model: model.id,
 					source_key: Object.freeze(['id']),
-					target_model: Todo.id,
+					target_model: model.id,
 					target_key: Object.freeze(['id']),
 					link: operation === 'link',
 					unlink: operation === 'unlink'
 				})
-			: operation === 'invalidate_model'
-				? Object.freeze({ kind: 'model', model: Todo.id })
-				: operation === 'invalidate_relationship'
-					? Object.freeze({
-							kind: 'relationship',
-							relationship: 'related',
-							source_model: Todo.id,
-							source_key: Object.freeze(['id']),
-							target_model: Todo.id,
-							target_key: Object.freeze(['id']),
-							link: false,
-							unlink: false
-						})
-					: Object.freeze({
-							kind: 'record',
-							model: Todo.id,
-							key: Object.freeze(['id']),
-							fields: Object.freeze(
-								operation === 'delete' ? [] : ['title']
-							),
-							replace: Object.freeze(
-								operation === 'upsert' ? ['title'] : []
-							),
-							upsert: operation === 'upsert',
-							patch: operation === 'patch',
-							delete: operation === 'delete'
-						});
+				: operation === 'invalidate_model'
+					? Object.freeze({ kind: 'model', model: model.id })
+					: operation === 'invalidate_relationship'
+						? Object.freeze({
+								kind: 'relationship',
+								relationship: 'related',
+								source_model: model.id,
+								source_key: Object.freeze(['id']),
+								target_model: model.id,
+								target_key: Object.freeze(['id']),
+								link: false,
+								unlink: false
+							})
+						: Object.freeze({
+								kind: 'record',
+								model: model.id,
+								key: Object.freeze(['id']),
+								fields: Object.freeze(
+									operation === 'delete' ? [] : ['title']
+								),
+								replace: Object.freeze(
+									operation === 'upsert' ? ['title'] : []
+								),
+								upsert: operation === 'upsert',
+								patch: operation === 'patch',
+								delete: operation === 'delete'
+							});
 	return Object.freeze({
 		version: 2,
 		deltaWireVersion: 1,
@@ -224,6 +250,7 @@ function projection(operation = 'upsert') {
 
 function artifact(options = {}) {
 	const operation = options.operation ?? 'upsert';
+	const model = options.model ?? Todo;
 	return Object.freeze({
 		version: 2,
 		name: options.name ?? `todo.${operation}`,
@@ -242,7 +269,9 @@ function artifact(options = {}) {
 		input: Object.freeze({ kind: 'object', definition: TodoInput }),
 		output: Object.freeze({ kind: 'object', definition: ResultOutput }),
 		consistency: options.consistency ?? COMMAND_CONSISTENCY.EVENTUAL,
-		...(options.modeled === false ? {} : { projection: projection(operation) }),
+		...(options.modeled === false
+			? {}
+			: { projection: projection(operation, model) }),
 		...(options.directProjection === undefined
 			? {}
 			: { directProjection: options.directProjection }),
@@ -250,16 +279,16 @@ function artifact(options = {}) {
 			version: 1,
 			required: options.revalidate ?? false,
 			dependencies: Object.freeze(['todos']),
-			models: Object.freeze([Todo.id]),
+			models: Object.freeze([model.id]),
 			relationships: Object.freeze(
 				operation === 'link' ||
 					operation === 'unlink' ||
 					operation === 'invalidate_relationship'
 					? [
 							Object.freeze({
-								sourceModel: Todo.id,
+								sourceModel: model.id,
 								field: 'related',
-								targetModel: Todo.id
+								targetModel: model.id
 							})
 						]
 					: []
@@ -322,10 +351,11 @@ function modeledArtifactWithAuditArm() {
 
 function deltaMutation(request, options = {}) {
 	const operation = options.operation ?? 'upsert';
+	const model = options.model ?? Todo;
 	const actualScope = scope({
 		type: 'string',
 		value: request.variables.input.id
-	});
+	}, model.id);
 	if (operation === 'upsert') {
 		return {
 			op: 'upsert',
@@ -365,11 +395,11 @@ function deltaMutation(request, options = {}) {
 			op: operation,
 			relationship: 'related',
 			source: actualScope,
-			target: scope({ type: 'string', value: 'target' })
+			target: scope({ type: 'string', value: 'target' }, model.id)
 		};
 	}
 	if (operation === 'invalidate_model') {
-		return { op: 'invalidate_model', partition: unit, model: Todo.id };
+		return { op: 'invalidate_model', partition: unit, model: model.id };
 	}
 	return {
 		op: 'invalidate_relationship',
@@ -396,7 +426,7 @@ function commandMetadata(request, options = {}) {
 		{ length: options.obligations ?? 1 },
 		(_, index) => ({
 			projectionRef: 0,
-			model: options.obligationModel ?? Todo.id,
+			model: options.obligationModel ?? options.model?.id ?? Todo.id,
 			scopeToken: token('projection-obligation', index + 3)
 		})
 	);
@@ -658,6 +688,214 @@ function tick() {
 	return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function commandFrame(artifactValue, rows, options = {}) {
+	const frame = todoFrame(artifactValue, rows, {
+		cacheScope: CACHE_SCOPE,
+		authorizationGeneration: 'auth-1',
+		position: options.position ?? '1',
+		source: options.source ?? 'query',
+		mode: options.mode ?? 'resumable',
+		reset: options.reset ?? false,
+		errors: options.errors
+	});
+	const snapshot = frame.extensions.distributed.snapshot;
+	snapshot.observations = options.observations ?? [];
+	if (options.recordRevision !== undefined || options.incarnation !== undefined) {
+		snapshot.records = snapshot.records.map((record) => ({
+			...record,
+			...(options.recordRevision === undefined
+				? {}
+				: { revision: options.recordRevision }),
+			...(options.incarnation === undefined
+				? {}
+				: { incarnation: options.incarnation })
+		}));
+	}
+	return frame;
+}
+
+function obligationObservation(receipt, overrides = {}) {
+	const expectation = receipt.metadata.expects[0];
+	assert.ok(expectation);
+	return {
+		causationId: receipt.metadata.causationId,
+		projection: expectation.projection,
+		model: expectation.model,
+		scopeToken: expectation.scopeToken,
+		...overrides
+	};
+}
+
+test('generated command runtime retains an accepted projection until a matching live observation', async () => {
+	let liveObserver;
+	const replica = createDistributedReplica({
+		transport: {
+			fetch() {
+				return Promise.reject(new Error('unexpected query fetch'));
+			},
+			subscribe(_request, observer) {
+				liveObserver = observer;
+				return () => undefined;
+			}
+		}
+	});
+	replica.writeResult(
+		CommandTodos,
+		{},
+		commandFrame(CommandTodos, [
+			{ id: 'todo-1', title: 'base', status: 'open' }
+		]),
+		'network'
+	);
+	const watch = replica.watch(CommandTodos, {}, { live: true });
+	assert.ok(liveObserver);
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{
+			dispatch(request) {
+				return Promise.resolve(
+					envelope(request, {
+						model: TodoModel,
+						actualTitle: 'server projection'
+					})
+				);
+			}
+		},
+		{ change: artifact({ model: TodoModel }) }
+	);
+	const receipt = await runtime.commands.change(
+		{ id: 'todo-1', title: 'optimistic' },
+		{ commandId: COMMAND_A }
+	);
+	assert.equal(receipt.metadata.expects[0].model, TodoModel.id);
+	assert.equal(watch.get().data.todos[0].title, 'server projection');
+	const assertOverlayRetained = () => {
+		assert.equal(watch.get().data.todos[0].title, 'server projection');
+		assert.throws(() => replica.createOptimisticLayer(COMMAND_A, () => undefined));
+	};
+
+	// A complete base frame without causal evidence must not retire the layer;
+	// the accepted projection remains the visible overlay.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'base update', status: 'open' }],
+			{ source: 'live', position: '2' }
+		)
+	);
+	assertOverlayRetained();
+
+	// Wrong-scope evidence is ignored even though the frame is otherwise fresh.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'wrong observation', status: 'open' }],
+			{
+				source: 'live',
+				position: '3',
+				observations: [
+					obligationObservation(receipt, {
+						scopeToken: token('projection-obligation', 99)
+					})
+				]
+			}
+		)
+	);
+	assertOverlayRetained();
+
+	// Causation identity is part of the proof; a different command cannot
+	// retire this command's accepted projection.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'wrong causation', status: 'open' }],
+			{
+				source: 'live',
+				position: '4',
+				observations: [
+					obligationObservation(receipt, {
+						causationId: 'cause:other-command'
+					})
+				]
+			}
+		)
+	);
+	assertOverlayRetained();
+
+	// Projection identity is equally strict; evidence from another projector
+	// is not an observation of this obligation.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'wrong projection', status: 'open' }],
+			{
+				source: 'live',
+				position: '5',
+				observations: [
+					obligationObservation(receipt, {
+						projection: 'other-projector'
+					})
+				]
+			}
+		)
+	);
+	assertOverlayRetained();
+
+	// A frame with a lower record revision but no causal observation remains
+	// unable to retire the layer. This intentionally tests only missing proof;
+	// it does not establish whether a matching observation is subject to record
+	// revision gating.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'insufficient revision', status: 'open' }],
+			{
+				source: 'live',
+				position: '4',
+				recordRevision: '1'
+			}
+		)
+	);
+	assertOverlayRetained();
+
+	// Likewise, an incarnation marker without a causal observation is not proof.
+	// This does not assert a revision or incarnation fence on a matching proof.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'stale incarnation', status: 'open' }],
+			{
+				source: 'live',
+				position: '5',
+				recordRevision: '5',
+				incarnation: '0'
+			}
+		)
+	);
+	assertOverlayRetained();
+
+	// Exact causal observation from the active comparable live frame retires the
+	// accepted layer. Its proof is the protocol identity tuple; record-clock
+	// reconciliation is a separate cache concern.
+	liveObserver.next(
+		commandFrame(
+			CommandTodos,
+			[{ id: 'todo-1', title: 'confirmed', status: 'open' }],
+			{
+				source: 'live',
+				position: '6',
+				recordRevision: '6',
+				observations: [obligationObservation(receipt)]
+			}
+		)
+	);
+	assert.equal(watch.get().data.todos[0].title, 'confirmed');
+	assert.equal(replica.inspectRecord(TodoModel, 'todo-1').revision, '6');
+	assert.equal((await receipt.projected).state, 'atomic');
+	runtime.dispose();
+	watch.destroy();
+});
+
 test('artifact v1 is rejected at the public boundary', () => {
 	assert.throws(
 		() =>
@@ -710,6 +948,23 @@ test('coherent reload gate rejects before optimism or transport dispatch', async
 	assert.equal(replica.layer(COMMAND_A), undefined);
 	blocked = false;
 	runtime.dispose();
+});
+
+test('HTTP reload gate rolls back optimism and reports a reload, not an invalid receipt', async () => {
+	for (const status of [503, 200]) {
+		const replica = new TestReplica();
+		const runtime = createReplicaCommandRuntime(replica, {
+			dispatch() {
+				assert.ok(replica.layer(COMMAND_A), 'optimism exists before the response');
+				return { status, errors: [{message: 'application generation is reloading',
+					extensions: {code: 'APPLICATION_RELOADING'}}] };
+			}
+		}, {change: artifact()});
+		await assert.rejects(runtime.commands.change({id: 'todo-1', title: 'blocked'}, {commandId: COMMAND_A}),
+			{code: status === 503 ? 'REPLICA_COMMAND_RELOADING' : 'REPLICA_COMMAND_PROTOCOL_INVALID'});
+		assert.equal(replica.layer(COMMAND_A), undefined);
+		runtime.dispose();
+	}
 });
 
 test('actual delta rebases later optimism while same-record dispatch retains invocation order', async () => {
@@ -1512,6 +1767,176 @@ test('terminal exact projection status settles without command-triggered revalid
 	assert.equal(replica.layer(COMMAND_A), 'accepted');
 	assert.equal(replica.record('todo-1').fields.title, 'accepted');
 	runtime.dispose();
+});
+
+test('terminal succeeded status with exact observations settles delivery without retiring the layer', async () => {
+	const replica = new TestReplica();
+	let pendingMetadata;
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{
+			dispatch(request) {
+				pendingMetadata = commandMetadata(request, {
+					actualTitle: 'accepted',
+					state: 'succeeded'
+				});
+				return Promise.resolve(
+					envelope(request, { command: pendingMetadata })
+				);
+			},
+			status(request) {
+				const terminalMetadata = Object.freeze({
+					...pendingMetadata,
+					state: 'succeeded',
+					observations: Object.freeze(
+						pendingMetadata.expects.map((expectation) =>
+							Object.freeze({
+								...expectation,
+								causationId: pendingMetadata.causationId
+							})
+						)
+					)
+				});
+				return Promise.resolve(
+					statusEnvelope(request, terminalMetadata)
+				);
+			}
+		},
+		{ change: artifact() },
+		{ status: STATUS }
+	);
+	const receipt = await runtime.commands.change(
+		{ id: 'todo-1', title: 'preview' },
+		{ commandId: COMMAND_A }
+	);
+
+	const projectedState = receipt.projected.then(
+		(outcome) => outcome.state,
+		() => 'rejected'
+	);
+	try {
+		assert.equal((await receipt.status()).state, 'succeeded');
+		const state = await Promise.race([
+			projectedState,
+			new Promise((resolve) =>
+				setTimeout(() => resolve('timed_out'), 100)
+			)
+		]);
+		assert.equal(state, 'atomic');
+		assert.deepEqual(replica.revalidations, []);
+		assert.equal(replica.layer(COMMAND_A), 'accepted');
+		assert.equal(replica.record('todo-1').fields.title, 'accepted');
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test('terminal succeeded status ignores incomplete or mismatched observations', async () => {
+	const cases = [
+		{
+			name: 'missing',
+			transform: () => []
+		},
+		{
+			name: 'causation',
+			transform: (observations) =>
+				observations.map((observation) => ({
+					...observation,
+					causationId: 'cause:other'
+				})),
+			protocolFailure: true
+		},
+		{
+			name: 'projection',
+			transform: (observations) =>
+				observations.map((observation) => ({
+					...observation,
+					projection: 'program:other'
+				})),
+			protocolFailure: true
+		},
+		{
+			name: 'scope',
+			transform: (observations) =>
+				observations.map((observation) => ({
+					...observation,
+					scopeToken: 'scope:other'
+				})),
+			protocolFailure: true
+		}
+	];
+
+	for (const { name, transform, protocolFailure = false } of cases) {
+		const replica = new TestReplica();
+		let pendingMetadata;
+		const runtime = createReplicaCommandRuntime(
+			replica,
+			{
+				dispatch(request) {
+					pendingMetadata = commandMetadata(request, {
+						actualTitle: 'accepted',
+						state: 'succeeded'
+					});
+					return Promise.resolve(
+						envelope(request, { command: pendingMetadata })
+					);
+				},
+				status(request) {
+					const observations = pendingMetadata.expects.map(
+						(expectation) => ({
+							...expectation,
+							causationId: pendingMetadata.causationId
+						})
+					);
+					return Promise.resolve(
+						statusEnvelope(request, {
+							...pendingMetadata,
+							state: 'succeeded',
+							observations: transform(observations)
+						})
+					);
+				}
+			},
+			{ change: artifact() },
+			{ status: STATUS }
+		);
+		const receipt = await runtime.commands.change(
+			{ id: 'todo-1', title: 'preview' },
+			{ commandId: COMMAND_A }
+		);
+		const projectedState = receipt.projected.then(
+			(outcome) => outcome.state,
+			() => 'rejected'
+		);
+		try {
+			if (protocolFailure) {
+				await assert.rejects(
+					receipt.status(),
+					{ code: 'REPLICA_COMMAND_PROTOCOL_INVALID' },
+					name
+				);
+				await assert.rejects(
+					receipt.projected,
+					{ code: 'REPLICA_COMMAND_PROTOCOL_INVALID' },
+					name
+				);
+				assert.equal(replica.layer(COMMAND_A), undefined, name);
+				continue;
+			}
+			assert.equal((await receipt.status()).state, 'succeeded', name);
+			const state = await Promise.race([
+				projectedState,
+				new Promise((resolve) =>
+					setTimeout(() => resolve('timed_out'), 50)
+				)
+			]);
+			assert.equal(state, 'timed_out', name);
+			assert.deepEqual(replica.revalidations, [], name);
+			assert.equal(replica.layer(COMMAND_A), 'accepted', name);
+		} finally {
+			runtime.dispose();
+		}
+	}
 });
 
 test('invalid live progression cannot poison a later valid status transition', async () => {
@@ -2797,3 +3222,166 @@ async function directProjectionRuntime() {
 	);
 	return { replica, runtime };
 }
+
+function lazyRuntime(replica, transport, load, options) {
+	return createLazyReplicaCommandRuntime(replica, transport,
+		{ commands: { 'todo.upsert': { operationHash: HASH_A, hasInput: true } }, status: STATUS },
+		load ?? (async () => ({ entries: { 'todo.upsert': artifact() } })), options);
+}
+
+test('lazy commands register authority before loading, share imports, and snapshot invocation inputs', async () => {
+	const replica = new TestReplica();
+	let registrations = 0;
+	const register = replica[replicaCommandAuthority].bind(replica);
+	replica[replicaCommandAuthority] = (contract) => { registrations++; return register(contract); };
+	const gate = deferred();
+	let loads = 0;
+	const requests = [];
+	const runtime = lazyRuntime(replica, {
+		dispatch: async request => { requests.push(request); return envelope(request); },
+		status: async () => { throw new Error('not requested'); }
+	}, () => { loads++; return gate.promise; });
+	assert.equal(registrations, 1);
+	assert.equal(loads, 0);
+	assert.deepEqual(runtime.pendingCommandIds(), []);
+	const input = { id: 'todo-1', title: 'original' };
+	const first = runtime.commands.todo.upsert(input, { commandId: COMMAND_A });
+	input.title = 'edited while loading';
+	const second = runtime.commands.todo.upsert({ id: 'todo-2', title: 'second' }, { commandId: COMMAND_B });
+	await tick();
+	assert.equal(loads, 1);
+	assert.equal(requests.length, 0);
+	gate.resolve({ entries: { 'todo.upsert': artifact() } });
+	const receipts = await Promise.all([first, second]);
+	assert.deepEqual(receipts.map(r => r.commandId), [COMMAND_A, COMMAND_B]);
+	assert.equal(requests[0].variables.input.title, 'original');
+	assert.equal(replica.record('todo-1').fields.title, 'original');
+	await runtime.preload();
+	assert.equal(loads, 1);
+	runtime.dispose();
+});
+
+for (const failure of ['scope', 'dispose', 'abort']) {
+	test(`lazy commands reject ${failure} while the chunk is still loading without dispatch`, async () => {
+		const replica = new TestReplica();
+		const gate = deferred();
+		const abort = new AbortController();
+		let dispatches = 0;
+		const runtime = lazyRuntime(replica, {
+			dispatch: async request => { dispatches++; return envelope(request); }, status: async () => {}
+		}, () => gate.promise);
+		const pending = runtime.commands.todo.upsert({ id: 'todo-1', title: 'stale' }, { commandId: COMMAND_A, signal: abort.signal });
+		if (failure === 'scope') replica.invalidate();
+		if (failure === 'dispose') runtime.dispose();
+		if (failure === 'abort') abort.abort();
+		await assert.rejects(pending, { code: failure === 'scope' ? 'REPLICA_COMMAND_SCOPE_INVALIDATED' : failure === 'dispose' ? 'REPLICA_COMMAND_DISPOSED' : 'REPLICA_COMMAND_ABORTED' });
+		assert.equal(dispatches, 0);
+		gate.resolve({ entries: { 'todo.upsert': artifact() } });
+		await tick();
+		assert.equal(dispatches, 0);
+		assert.equal(replica.record('todo-1'), undefined);
+		runtime.dispose();
+	});
+}
+
+test('lazy chunk failures retry without dispatch and reject mismatched inventory', async () => {
+	const replica = new TestReplica();
+	let loads = 0;
+	let dispatches = 0;
+	const runtime = lazyRuntime(replica, {
+		dispatch: async request => { dispatches++; return envelope(request); }, status: async () => {}
+	}, async () => {
+		if (++loads === 1) throw new Error('chunk unavailable');
+		return { entries: { 'todo.upsert': artifact() } };
+	});
+	await assert.rejects(runtime.preload(), /chunk unavailable/);
+	await runtime.preload();
+	assert.equal(loads, 2);
+	assert.equal(dispatches, 0);
+	runtime.dispose();
+	const mismatch = lazyRuntime(replica, { status: async () => {} }, async () => ({ entries: { 'todo.upsert': { ...artifact(), operationHash: HASH_D } } }));
+	await assert.rejects(mismatch.preload(), /does not match its catalog/);
+	mismatch.dispose();
+});
+
+test('lazy commands preserve transport retry identity, status recovery and pending IDs', async () => {
+	const replica = new TestReplica();
+	const requests = [];
+	const runtime = lazyRuntime(replica, {
+		dispatch(request) { requests.push(request); return Promise.reject(new Error('ambiguous')); },
+		status(request) {
+			return Promise.resolve(statusEnvelope(request, commandMetadata(requests[0], { state: 'rejected', projection: false })));
+		}
+	});
+	let recovery;
+	await assert.rejects(runtime.commands.todo.upsert({ id: 'todo-1', title: 'preview' }, { commandId: COMMAND_A, transportRetries: 1 }), error => {
+		recovery = error.recovery;
+		return error.code === 'REPLICA_COMMAND_TRANSPORT_AMBIGUOUS';
+	});
+	assert.equal(requests.length, 2);
+	assert.equal(requests[0].variables, requests[1].variables);
+	assert.deepEqual(runtime.pendingCommandIds(), [COMMAND_A]);
+	assert.equal(replica.layer(COMMAND_A), 'optimistic');
+	await runtime.preload();
+	assert.equal((await recovery.status()).state, 'rejected');
+	assert.equal(replica.record('todo-1'), undefined);
+	assert.deepEqual(runtime.pendingCommandIds(), []);
+	runtime.dispose();
+});
+
+test('lazy commands recheck the reload dispatch gate after import', async () => {
+	const replica = new TestReplica();
+	const gate = deferred();
+	let reloading = false;
+	let dispatches = 0;
+	const runtime = lazyRuntime(replica, { dispatch: async () => { dispatches++; }, status: async () => {} }, () => gate.promise,
+		{ lifecycle: { assertDispatchOpen() { if (reloading) throw new Error('reload'); } } });
+	const pending = runtime.commands.todo.upsert({ id: 'todo-1', title: 'preview' }, { commandId: COMMAND_A });
+	reloading = true;
+	gate.resolve({ entries: { 'todo.upsert': artifact() } });
+	await assert.rejects(pending, { code: 'REPLICA_COMMAND_RELOADING' });
+	assert.equal(dispatches, 0);
+	assert.equal(replica.record('todo-1'), undefined);
+	runtime.dispose();
+});
+
+test('lazy no-input commands keep options, cancellation, command ID and callbacks in the first argument', async () => {
+	const replica = new TestReplica();
+	const gate = deferred();
+	const noInput = { ...artifact({ modeled: false, revalidate: true }), name: 'todo.ping', input: { kind: 'none' } };
+	let calls = 0;
+	let succeeded = 0;
+	const runtime = createLazyReplicaCommandRuntime(replica, {
+		dispatch: async request => { calls++; assert.equal(request.commandId, COMMAND_A); return envelope(request, { command: commandReceipt({ commandId: request.commandId, causationId: `cause:${request.commandId}`, state: 'succeeded', consistency: 'eventual', expects: [], observations: [], records: [] }) }); },
+		status: async () => {}
+	}, { commands: { 'todo.ping': { operationHash: HASH_A, hasInput: false } }, status: STATUS }, () => gate.promise);
+	const abort = new AbortController();
+	const cancelled = runtime.commands.todo.ping({ signal: abort.signal, commandId: COMMAND_B });
+	abort.abort();
+	await assert.rejects(cancelled, { code: 'REPLICA_COMMAND_ABORTED' });
+	gate.resolve({ entries: { 'todo.ping': noInput } });
+	await runtime.preload();
+	const receipt = await runtime.commands.todo.ping({ commandId: COMMAND_A, onSucceeded() { succeeded++; } });
+	assert.equal(receipt.commandId, COMMAND_A);
+	assert.equal(calls, 1);
+	assert.equal(succeeded, 1);
+	runtime.dispose();
+});
+
+test('calls made after preload cannot overtake earlier commands waiting for the same import', async () => {
+	const replica = new TestReplica();
+	const gate = deferred();
+	const requests = [];
+	const runtime = lazyRuntime(replica, {
+		dispatch: async request => { requests.push(request.commandId); return envelope(request); }, status: async () => {}
+	}, () => gate.promise);
+	const preload = runtime.preload();
+	// This continuation runs before the cold callers' import continuations.
+	const warm = preload.then(() => runtime.commands.todo.upsert({ id: 'todo-3', title: 'third' }, { commandId: COMMAND_C }));
+	const first = runtime.commands.todo.upsert({ id: 'todo-1', title: 'first' }, { commandId: COMMAND_A });
+	const second = runtime.commands.todo.upsert({ id: 'todo-2', title: 'second' }, { commandId: COMMAND_B });
+	gate.resolve({ entries: { 'todo.upsert': artifact() } });
+	await Promise.all([first, second, warm]);
+	assert.deepEqual(requests, [COMMAND_A, COMMAND_B, COMMAND_C]);
+	runtime.dispose();
+});

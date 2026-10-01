@@ -21,6 +21,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         HostOptions {
             bind,
             identity: identity_from_env(),
+            public_origin: env::var("PUBLIC_ORIGIN")
+                .unwrap_or_else(|_| "http://localhost:8791".into()),
+            ui_origin: env::var("UI_INTERNAL_ORIGIN")
+                .unwrap_or_else(|_| "http://localhost:5180".into()),
+            delivery: match env::var("GATEWAY_DELIVERY").as_deref().unwrap_or("none") {
+                "none" => Default::default(),
+                "all" => distributed::gateway::DeliveryCapabilities {
+                    snapshots: true,
+                    coalescing: true,
+                    live_sharing: true,
+                },
+                _ => return Err("GATEWAY_DELIVERY must be none or all".into()),
+            },
         },
     )
     .await

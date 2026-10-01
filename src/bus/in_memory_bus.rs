@@ -83,6 +83,17 @@ impl InMemoryBus {
     }
 
     #[cfg(test)]
+    pub(crate) fn published_ids(&self) -> Vec<String> {
+        self.topics
+            .lock()
+            .expect("test topic lock")
+            .values()
+            .flat_map(|messages| messages.iter())
+            .filter_map(|message| message.id().map(str::to_owned))
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn ordered_topic_evidence(&self, name: &str, position: u64) -> OrderedDelivery {
         OrderedDelivery::new(
             ProjectionSource::new("in_memory.topic", name.as_bytes().to_vec())

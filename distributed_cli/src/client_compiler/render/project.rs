@@ -8,7 +8,7 @@ use super::super::manifest::{canonical_json_value, ClientManifest, ManifestSurfa
 use super::super::{
     ClientCompileError, GeneratedClientFile, GeneratedClientProject, GeneratedOperationSummary,
 };
-use super::commands::render_commands;
+use super::commands::{render_commands, render_lazy_commands};
 use super::common::json_string;
 use super::operation::render_operation_module;
 
@@ -40,6 +40,12 @@ pub(crate) fn render_project(
         path: "commands.ts".into(),
         contents: render_commands(manifest)?,
     });
+    if !manifest.commands.is_empty() {
+        files.push(GeneratedClientFile {
+            path: "lazy-commands.ts".into(),
+            contents: render_lazy_commands(manifest)?,
+        });
+    }
     let pures = super::commands::render_pures(manifest)?;
     let has_pures = pures.is_some();
     if let Some(pures) = pures {
@@ -345,6 +351,8 @@ fn render_sveltekit(
     ]);
     if !manifest.commands.is_empty() {
         value_exports.insert("createCommands".into());
+        value_exports.insert("createLazyCommands".into());
+        value_exports.insert("provideDistributedLazy".into());
     }
     for command in &manifest.commands {
         value_exports.insert(format!("Command_{}", command.mutation_field));
@@ -405,6 +413,8 @@ fn render_sveltekit(
                 "} from './commands.js';",
                 "",
                 "export type { GeneratedCommands } from './commands.js';",
+                "import { createLazyCommands } from './lazy-commands.js';",
+                "export { createLazyCommands } from './lazy-commands.js';",
             ]
             .join("\n"),
         );
@@ -483,6 +493,18 @@ fn render_sveltekit(
         .map(str::to_string),
     );
     sections.push(bindings.join("\n"));
+    if !manifest.commands.is_empty() {
+        sections.push(format!(r#"/** Opt-in deferred commands; query, SSR and boundary loading stay unchanged. */
+export function provideDistributedLazy(
+  options: Omit<CreateDistributedSvelteKitOptions<GeneratedCommands>, 'createCommands' | 'reload'> & {{ reload?: Omit<DistributedReloadOptions, 'key'> }}
+): DistributedSvelteKitClient<GeneratedCommands> {{
+  return provideDistributedSvelteKitClient(createDistributedSvelteKit<GeneratedCommands>({{
+    ...options,
+    createCommands: createLazyCommands,
+    reload: {{ ...options.reload, key: {reload_key} }}
+  }}));
+}}"#));
+    }
 
     Ok(format!("{}\n", sections.join("\n\n")))
 }

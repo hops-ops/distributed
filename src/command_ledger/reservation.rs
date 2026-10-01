@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::projection_protocol::{
@@ -16,6 +17,97 @@ use super::{
     CommandLedgerKey, CommandLedgerState, TerminalCommandState, SHA256_BYTES,
 };
 
+const EXTERNAL_BINDING_VERSION: u16 = 1;
+
+/// Immutable logical route ownership for a command dispatched outside the
+/// repository that owns its ledger row. Transport addresses and retry leases
+/// are intentionally not part of this identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExternalDispatchBinding {
+    version: u16,
+    route_kind: String,
+    shard: String,
+}
+
+impl ExternalDispatchBinding {
+    pub(crate) fn new(
+        route_kind: impl Into<String>,
+        shard: impl Into<String>,
+    ) -> Result<Self, CommandLedgerError> {
+        let route_kind = route_kind.into();
+        let shard = shard.into();
+        validate_binding_part("external route kind", &route_kind)?;
+        validate_binding_part("external shard", &shard)?;
+        Ok(Self {
+            version: EXTERNAL_BINDING_VERSION,
+            route_kind,
+            shard,
+        })
+    }
+
+    pub(crate) fn route_kind(&self) -> &str {
+        &self.route_kind
+    }
+
+    pub(crate) fn shard(&self) -> &str {
+        &self.shard
+    }
+
+    /// Stable storage spelling. Parsing requires this exact canonical form so
+    /// equivalent-looking bindings cannot bypass the immutable row value.
+    pub(crate) fn to_storage(&self) -> Result<String, CommandLedgerError> {
+        serde_json::to_string(self).map_err(|error| {
+            CommandLedgerError::Invalid(format!(
+                "external dispatch binding could not be serialized: {error}"
+            ))
+        })
+    }
+
+    pub(crate) fn from_storage(value: &str) -> Result<Self, CommandLedgerError> {
+        let binding: Self = serde_json::from_str(value).map_err(|error| {
+            CommandLedgerError::Corrupt(format!(
+                "stored external dispatch binding is invalid: {error}"
+            ))
+        })?;
+        if binding.version != EXTERNAL_BINDING_VERSION {
+            return Err(CommandLedgerError::Corrupt(format!(
+                "stored external dispatch binding version `{}` is unsupported",
+                binding.version
+            )));
+        }
+        validate_binding_part("external route kind", &binding.route_kind)
+            .map_err(|error| CommandLedgerError::Corrupt(error.to_string()))?;
+        validate_binding_part("external shard", &binding.shard)
+            .map_err(|error| CommandLedgerError::Corrupt(error.to_string()))?;
+        let canonical = binding.to_storage().map_err(|error| {
+            CommandLedgerError::Corrupt(format!(
+                "stored external dispatch binding cannot be canonicalized: {error}"
+            ))
+        })?;
+        if canonical != value {
+            return Err(CommandLedgerError::Corrupt(
+                "stored external dispatch binding is not canonical JSON".into(),
+            ));
+        }
+        Ok(binding)
+    }
+}
+
+fn validate_binding_part(label: &str, value: &str) -> Result<(), CommandLedgerError> {
+    if value.trim().is_empty() {
+        return Err(CommandLedgerError::Invalid(format!(
+            "{label} must not be empty"
+        )));
+    }
+    if value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(CommandLedgerError::Invalid(format!(
+            "{label} must be at most 256 bytes and contain no control characters"
+        )));
+    }
+    Ok(())
+}
+
 /// One validated reservation request. Fresh candidate IDs lose a race safely:
 /// only the inserted row keeps them; every retry reads the winner's causation.
 pub(crate) struct CommandReservation {
@@ -27,6 +119,7 @@ pub(crate) struct CommandReservation {
     pub(super) retention: Duration,
     pub(super) candidate_causation: CausationId,
     pub(super) candidate_attempt: AttemptToken,
+    pub(super) external_binding: Option<ExternalDispatchBinding>,
 }
 
 impl CommandReservation {
@@ -60,7 +153,24 @@ impl CommandReservation {
             retention,
             candidate_causation: CausationId::new(),
             candidate_attempt: AttemptToken::new(),
+            external_binding: None,
         })
+    }
+
+    /// Mark this reservation as owned by an external logical route. The
+    /// binding is persisted with the reservation and cannot be changed by a
+    /// reclaim or completion.
+    pub(crate) fn with_external_binding(mut self, binding: ExternalDispatchBinding) -> Self {
+        self.external_binding = Some(binding);
+        self
+    }
+
+    /// Reuse the causation allocated by a trusted external gateway. The
+    /// command ID and canonical input still fence the cell row; this field
+    /// makes the remote receipt prove the same logical command attempt.
+    pub(crate) fn with_causation_id(mut self, causation_id: CausationId) -> Self {
+        self.candidate_causation = causation_id;
+        self
     }
 
     pub(crate) fn key(&self) -> &CommandLedgerKey {
@@ -95,6 +205,10 @@ impl CommandReservation {
         &self.candidate_attempt
     }
 
+    pub(crate) fn external_binding(&self) -> Option<&ExternalDispatchBinding> {
+        self.external_binding.as_ref()
+    }
+
     pub(crate) fn acquired_candidate_attempt(&self) -> CommandAttempt {
         CommandAttempt {
             key: self.key.clone(),
@@ -103,6 +217,7 @@ impl CommandReservation {
             causation_id: self.candidate_causation.clone(),
             attempt_token: self.candidate_attempt.clone(),
             attempt_number: 1,
+            external_binding: self.external_binding.clone(),
         }
     }
 }
@@ -126,6 +241,7 @@ pub(crate) struct CommandAttempt {
     pub(super) causation_id: CausationId,
     pub(super) attempt_token: AttemptToken,
     pub(super) attempt_number: u64,
+    pub(super) external_binding: Option<ExternalDispatchBinding>,
 }
 
 impl CommandAttempt {
@@ -135,6 +251,10 @@ impl CommandAttempt {
 
     pub(crate) fn causation_id(&self) -> &CausationId {
         &self.causation_id
+    }
+
+    pub(crate) fn external_binding(&self) -> Option<&ExternalDispatchBinding> {
+        self.external_binding.as_ref()
     }
 
     #[cfg(test)]
@@ -187,6 +307,92 @@ impl CommandAttempt {
             retention,
             None,
         )
+    }
+
+    /// Complete an externally dispatched command without appending local
+    /// events or outbox messages. The reservation binding is checked before a
+    /// replay payload is constructed; the ledger repeats the check at its
+    /// fenced write boundary.
+    pub(crate) fn complete_external(
+        self,
+        binding: ExternalDispatchBinding,
+        state: TerminalCommandState,
+        outcome: Value,
+        projection_obligations: Vec<ResolvedProjectionObligation>,
+        retention: Duration,
+    ) -> Result<ExternalCommandCompletion, CommandLedgerError> {
+        self.complete_external_with_replay_metadata(
+            binding,
+            state,
+            outcome,
+            projection_obligations,
+            None,
+            retention,
+            None,
+        )
+    }
+
+    /// Complete a remote command while retaining the exact sealed projection
+    /// metadata and absolute deadline returned by the remote command host.
+    /// Metadata is validated by the same versioned protocol checks used by a
+    /// local causal completion; it is never inferred from the active projector
+    /// registry.
+    pub(crate) fn complete_external_with_projection_metadata_until(
+        self,
+        binding: ExternalDispatchBinding,
+        state: TerminalCommandState,
+        outcome: Value,
+        projection_metadata: Vec<u8>,
+        retention: Duration,
+        retention_expires_at: SystemTime,
+    ) -> Result<ExternalCommandCompletion, CommandLedgerError> {
+        self.complete_external_with_replay_metadata(
+            binding,
+            state,
+            outcome,
+            Vec::new(),
+            Some(projection_metadata),
+            retention,
+            Some(retention_expires_at),
+        )
+    }
+
+    fn complete_external_with_replay_metadata(
+        self,
+        binding: ExternalDispatchBinding,
+        state: TerminalCommandState,
+        outcome: Value,
+        projection_obligations: Vec<ResolvedProjectionObligation>,
+        projection_metadata: Option<Vec<u8>>,
+        retention: Duration,
+        retention_expires_at: Option<SystemTime>,
+    ) -> Result<ExternalCommandCompletion, CommandLedgerError> {
+        if state == TerminalCommandState::Atomic {
+            return Err(CommandLedgerError::Invalid(
+                "external command completion cannot be atomic".into(),
+            ));
+        }
+        if self.external_binding.as_ref() != Some(&binding) {
+            return Err(CommandLedgerError::Invalid(
+                "external command completion binding does not match its reservation".into(),
+            ));
+        }
+        let completion = self.complete_with_replay_metadata(
+            state,
+            outcome,
+            projection_obligations,
+            projection_metadata,
+            retention,
+            retention_expires_at,
+        )?;
+        Ok(ExternalCommandCompletion {
+            attempt: completion.attempt,
+            binding,
+            state: completion.state,
+            replay: completion.replay,
+            retention: completion.retention,
+            retention_expires_at: completion.retention_expires_at,
+        })
     }
 
     /// Complete a command with exact already-canonical role-safe projection
@@ -449,6 +655,48 @@ pub(crate) struct CommandCompletion {
     direct_projection: Option<Value>,
     pub(super) retention: Duration,
     retention_expires_at: Option<SystemTime>,
+}
+
+/// Terminal receipt for a command whose domain effects were committed by a
+/// different aggregate cell. It intentionally has no local domain batch
+/// companion; storing the receipt never republishes the remote cell's events.
+pub(crate) struct ExternalCommandCompletion {
+    pub(super) attempt: CommandAttempt,
+    pub(super) binding: ExternalDispatchBinding,
+    pub(super) state: TerminalCommandState,
+    pub(super) replay: String,
+    pub(super) retention: Duration,
+    retention_expires_at: Option<SystemTime>,
+}
+
+impl ExternalCommandCompletion {
+    pub(crate) fn attempt(&self) -> &CommandAttempt {
+        &self.attempt
+    }
+
+    pub(crate) fn binding(&self) -> &ExternalDispatchBinding {
+        &self.binding
+    }
+
+    pub(crate) fn state(&self) -> TerminalCommandState {
+        self.state
+    }
+
+    pub(crate) fn replay_json(&self) -> &str {
+        &self.replay
+    }
+
+    pub(crate) fn retention(&self) -> Duration {
+        self.retention
+    }
+
+    pub(crate) fn retention_expires_at(&self) -> Option<SystemTime> {
+        self.retention_expires_at
+    }
+
+    pub(crate) fn attempt_fence(&self) -> AttemptFence {
+        self.attempt.fence()
+    }
 }
 
 impl CommandCompletion {

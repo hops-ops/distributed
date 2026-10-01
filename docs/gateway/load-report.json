@@ -1,0 +1,839 @@
+{
+  "version": 1,
+  "revision": "eaa2d5d2bc6b104b89d6ccee12fd4fca11791a3e",
+  "candidateChanges": false,
+  "node": "v24.20.0",
+  "platform": "darwin",
+  "participants": 100,
+  "repetitions": 1,
+  "payloadCharacters": 4096,
+  "measurement": "actual HTTP bodies and WebSocket application frames; excludes headers/TLS/framing",
+  "limits": {
+    "snapshotEntries": 128,
+    "snapshotBytes": 2097152,
+    "entryBytes": 262144,
+    "flightGroups": 8,
+    "consumers": 128,
+    "flightBytes": 262144,
+    "liveGroups": 4,
+    "liveFrameBytes": 65536
+  },
+  "rows": [
+    {
+      "host": "native",
+      "mode": "none",
+      "query": {
+        "origin": {
+          "producers": 0,
+          "resultExecutions": 100,
+          "validations": 0
+        },
+        "wire": {
+          "httpRequestBytes": 74600,
+          "httpResponseBytes": 519200,
+          "wsRequestBytes": 0,
+          "wsResponseBytes": 0,
+          "wsConnections": 0
+        },
+        "clientResponseBytes": 519200,
+        "latencyMs": {
+          "min": 147.129375,
+          "p50": 198.30575000000002,
+          "p95": 250.39304199999998,
+          "max": 257.099875
+        }
+      },
+      "live": {
+        "logicalSubscriptions": 100,
+        "upstreamProducers": 100,
+        "origin": {
+          "producers": 100,
+          "resultExecutions": 200,
+          "validations": 0
+        },
+        "wire": {
+          "httpRequestBytes": 0,
+          "httpResponseBytes": 0,
+          "wsRequestBytes": 76290,
+          "wsResponseBytes": 1104080,
+          "wsConnections": 100
+        },
+        "clientFrameBytes": 1104080,
+        "initialLatencyMs": {
+          "min": 21.134625000000142,
+          "p50": 23.260374999999954,
+          "p95": 24.767499999999927,
+          "max": 26.905917000000045
+        },
+        "commitFanoutMs": 299.9157919999998
+      },
+      "decisions": [],
+      "subjectControls": "query and live scope differ; separate producer",
+      "invalidation": "new projection returned; old cache envelope rejected"
+    },
+    {
+      "host": "native",
+      "mode": "flights",
+      "query": {
+        "origin": {
+          "producers": 0,
+          "resultExecutions": 1,
+          "validations": 101
+        },
+        "wire": {
+          "httpRequestBytes": 76194,
+          "httpResponseBytes": 90330,
+          "wsRequestBytes": 0,
+          "wsResponseBytes": 0,
+          "wsConnections": 0
+        },
+        "clientResponseBytes": 528800,
+        "latencyMs": {
+          "min": 339.3542910000001,
+          "p50": 340.51858300000004,
+          "p95": 342.00416700000005,
+          "max": 342.293416
+        }
+      },
+      "live": {
+        "logicalSubscriptions": 100,
+        "upstreamProducers": 100,
+        "origin": {
+          "producers": 100,
+          "resultExecutions": 200,
+          "validations": 0
+        },
+        "wire": {
+          "httpRequestBytes": 0,
+          "httpResponseBytes": 0,
+          "wsRequestBytes": 76290,
+          "wsResponseBytes": 1104080,
+          "wsConnections": 100
+        },
+        "clientFrameBytes": 1104080,
+        "initialLatencyMs": {
+          "min": 20.867291999999907,
+          "p50": 23.03570899999977,
+          "p95": 24.76141699999971,
+          "max": 26.264917000000423
+        },
+        "commitFanoutMs": 306.95758300000034
+      },
+      "decisions": [
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            null,
+            1
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "subjectControls": "query and live scope differ; separate producer",
+      "invalidation": "new projection returned; old cache envelope rejected"
+    },
+    {
+      "host": "native",
+      "mode": "snapshots",
+      "query": {
+        "origin": {
+          "producers": 0,
+          "resultExecutions": 0,
+          "validations": 100
+        },
+        "wire": {
+          "httpRequestBytes": 74700,
+          "httpResponseBytes": 84200,
+          "wsRequestBytes": 0,
+          "wsResponseBytes": 0,
+          "wsConnections": 0
+        },
+        "clientResponseBytes": 528800,
+        "latencyMs": {
+          "min": 116.18020800000068,
+          "p50": 200.55029100000047,
+          "p95": 250.50162499999988,
+          "max": 255.24691600000006
+        },
+        "warmup": {
+          "origin": {
+            "producers": 0,
+            "resultExecutions": 1,
+            "validations": 2
+          },
+          "wire": {
+            "httpRequestBytes": 2241,
+            "httpResponseBytes": 6972,
+            "wsRequestBytes": 0,
+            "wsResponseBytes": 0,
+            "wsConnections": 0
+          },
+          "clientBytes": 5288
+        }
+      },
+      "live": {
+        "logicalSubscriptions": 100,
+        "upstreamProducers": 100,
+        "origin": {
+          "producers": 100,
+          "resultExecutions": 200,
+          "validations": 0
+        },
+        "wire": {
+          "httpRequestBytes": 0,
+          "httpResponseBytes": 0,
+          "wsRequestBytes": 76290,
+          "wsResponseBytes": 1104780,
+          "wsConnections": 100
+        },
+        "clientFrameBytes": 1104780,
+        "initialLatencyMs": {
+          "min": 20.942458000000443,
+          "p50": 22.93787499999962,
+          "p95": 24.133708000000297,
+          "max": 25.488624999999956
+        },
+        "commitFanoutMs": 301.81533299999865
+      },
+      "decisions": [
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            {
+              "fillBypasses": 0,
+              "hits": 100,
+              "invalidations": 1,
+              "misses": 3,
+              "staleRejections": 1
+            },
+            1
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "subjectControls": "query and live scope differ; separate producer",
+      "invalidation": "new projection returned; old cache envelope rejected"
+    },
+    {
+      "host": "native",
+      "mode": "live",
+      "recovery": {
+        "origin": {
+          "producers": 0,
+          "resultExecutions": 1,
+          "validations": 1
+        },
+        "wire": {
+          "httpRequestBytes": 928,
+          "httpResponseBytes": 842,
+          "wsRequestBytes": 1610,
+          "wsResponseBytes": 5470,
+          "wsConnections": 2
+        },
+        "clientFrameBytes": 5440,
+        "cursorResets": 1,
+        "slowClientResets": 0
+      },
+      "query": {
+        "origin": {
+          "producers": 0,
+          "resultExecutions": 100,
+          "validations": 0
+        },
+        "wire": {
+          "httpRequestBytes": 74600,
+          "httpResponseBytes": 519600,
+          "wsRequestBytes": 0,
+          "wsResponseBytes": 0,
+          "wsConnections": 0
+        },
+        "clientResponseBytes": 519600,
+        "latencyMs": {
+          "min": 140.48958400000083,
+          "p50": 213.07474999999977,
+          "p95": 254.67654200000106,
+          "max": 262.21537499999977
+        }
+      },
+      "live": {
+        "logicalSubscriptions": 100,
+        "upstreamProducers": 1,
+        "origin": {
+          "producers": 1,
+          "resultExecutions": 2,
+          "validations": 100
+        },
+        "wire": {
+          "httpRequestBytes": 75800,
+          "httpResponseBytes": 84200,
+          "wsRequestBytes": 66385,
+          "wsResponseBytes": 13564,
+          "wsConnections": 101
+        },
+        "clientFrameBytes": 1105180,
+        "initialLatencyMs": {
+          "min": 20.779709000000366,
+          "p50": 22.705541999999696,
+          "p95": 24.23895900000025,
+          "max": 25.080291999998735
+        },
+        "commitFanoutMs": 170.7697500000013
+      },
+      "decisions": [
+        {
+          "live": [
+            0,
+            0,
+            3,
+            0,
+            4,
+            0,
+            0
+          ],
+          "metrics": [
+            null,
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "subjectControls": "query and live scope differ; separate producer",
+      "invalidation": "new projection returned; old cache envelope rejected"
+    },
+    {
+      "host": "workerd",
+      "mode": "none",
+      "query": {
+        "origin": {
+          "producers": 0,
+          "resultExecutions": 100,
+          "validations": 0
+        },
+        "wire": {
+          "httpRequestBytes": 74600,
+          "httpResponseBytes": 519600,
+          "wsRequestBytes": 0,
+          "wsResponseBytes": 0,
+          "wsConnections": 0
+        },
+        "clientResponseBytes": 519600,
+        "latencyMs": {
+          "min": 225.62924999999996,
+          "p50": 400.4289169999993,
+          "p95": 453.3817910000016,
+          "max": 461.52195799999936
+        }
+      },
+      "live": {
+        "logicalSubscriptions": 100,
+        "upstreamProducers": 100,
+        "origin": {
+          "producers": 100,
+          "resultExecutions": 200,
+          "validations": 0
+        },
+        "wire": {
+          "httpRequestBytes": 0,
+          "httpResponseBytes": 0,
+          "wsRequestBytes": 76290,
+          "wsResponseBytes": 1105180,
+          "wsConnections": 100
+        },
+        "clientFrameBytes": 1105180,
+        "initialLatencyMs": {
+          "min": 23.570792000000438,
+          "p50": 25.99616700000115,
+          "p95": 28.189124999997148,
+          "max": 29.651667000001908
+        },
+        "commitFanoutMs": 346.484375
+      },
+      "decisions": [],
+      "subjectControls": "query and live scope differ; separate producer",
+      "invalidation": "new projection returned; old cache envelope rejected"
+    },
+    {
+      "host": "workerd",
+      "mode": "flights",
+      "query": {
+        "origin": {
+          "producers": 0,
+          "resultExecutions": 1,
+          "validations": 101
+        },
+        "wire": {
+          "httpRequestBytes": 76194,
+          "httpResponseBytes": 90334,
+          "wsRequestBytes": 0,
+          "wsResponseBytes": 0,
+          "wsConnections": 0
+        },
+        "clientResponseBytes": 529200,
+        "latencyMs": {
+          "min": 744.4551250000004,
+          "p50": 755.8567079999993,
+          "p95": 767.9520410000005,
+          "max": 769.9147080000002
+        }
+      },
+      "live": {
+        "logicalSubscriptions": 100,
+        "upstreamProducers": 100,
+        "origin": {
+          "producers": 100,
+          "resultExecutions": 200,
+          "validations": 0
+        },
+        "wire": {
+          "httpRequestBytes": 0,
+          "httpResponseBytes": 0,
+          "wsRequestBytes": 144100,
+          "wsResponseBytes": 1108900,
+          "wsConnections": 200
+        },
+        "clientFrameBytes": 1127360,
+        "initialLatencyMs": {
+          "min": 22.836959000000206,
+          "p50": 25.345250000002125,
+          "p95": 28.244916999999987,
+          "max": 38.16112500000236
+        },
+        "commitFanoutMs": 335.93595800000185
+      },
+      "decisions": [
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            null,
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            null,
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            null,
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            null,
+            1
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "subjectControls": "query and live scope differ; separate producer",
+      "invalidation": "new projection returned; old cache envelope rejected"
+    },
+    {
+      "host": "workerd",
+      "mode": "snapshots",
+      "query": {
+        "origin": {
+          "producers": 0,
+          "resultExecutions": 0,
+          "validations": 100
+        },
+        "wire": {
+          "httpRequestBytes": 74700,
+          "httpResponseBytes": 84200,
+          "wsRequestBytes": 0,
+          "wsResponseBytes": 0,
+          "wsConnections": 0
+        },
+        "clientResponseBytes": 529200,
+        "latencyMs": {
+          "min": 40.5157500000023,
+          "p50": 526.3143750000017,
+          "p95": 632.445499999998,
+          "max": 632.5337080000027
+        },
+        "warmup": {
+          "origin": {
+            "producers": 0,
+            "resultExecutions": 1,
+            "validations": 2
+          },
+          "wire": {
+            "httpRequestBytes": 2241,
+            "httpResponseBytes": 6976,
+            "wsRequestBytes": 0,
+            "wsResponseBytes": 0,
+            "wsConnections": 0
+          },
+          "clientBytes": 5292
+        }
+      },
+      "live": {
+        "logicalSubscriptions": 100,
+        "upstreamProducers": 100,
+        "origin": {
+          "producers": 100,
+          "resultExecutions": 200,
+          "validations": 0
+        },
+        "wire": {
+          "httpRequestBytes": 0,
+          "httpResponseBytes": 0,
+          "wsRequestBytes": 144100,
+          "wsResponseBytes": 1108900,
+          "wsConnections": 200
+        },
+        "clientFrameBytes": 1127360,
+        "initialLatencyMs": {
+          "min": 22.649750000000495,
+          "p50": 25.527957999998762,
+          "p95": 28.2020420000008,
+          "max": 40.410916000000725
+        },
+        "commitFanoutMs": 369.64583400000265
+      },
+      "decisions": [
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            {
+              "fillBypasses": 0,
+              "hits": 100,
+              "invalidations": 1,
+              "misses": 3,
+              "staleRejections": 1
+            },
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            {
+              "fillBypasses": 0,
+              "hits": 0,
+              "invalidations": 1,
+              "misses": 0,
+              "staleRejections": 0
+            },
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            {
+              "fillBypasses": 0,
+              "hits": 0,
+              "invalidations": 1,
+              "misses": 0,
+              "staleRejections": 0
+            },
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            {
+              "fillBypasses": 0,
+              "hits": 0,
+              "invalidations": 1,
+              "misses": 0,
+              "staleRejections": 0
+            },
+            1
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "subjectControls": "query and live scope differ; separate producer",
+      "invalidation": "new projection returned; old cache envelope rejected"
+    },
+    {
+      "host": "workerd",
+      "mode": "live",
+      "recovery": {
+        "origin": {
+          "producers": 0,
+          "resultExecutions": 22,
+          "validations": 3
+        },
+        "wire": {
+          "httpRequestBytes": 2444,
+          "httpResponseBytes": 2526,
+          "wsRequestBytes": 3707,
+          "wsResponseBytes": 123326,
+          "wsConnections": 5
+        },
+        "clientFrameBytes": 131320,
+        "cursorResets": 1,
+        "slowClientResets": 1
+      },
+      "query": {
+        "origin": {
+          "producers": 0,
+          "resultExecutions": 100,
+          "validations": 0
+        },
+        "wire": {
+          "httpRequestBytes": 74600,
+          "httpResponseBytes": 519600,
+          "wsRequestBytes": 0,
+          "wsResponseBytes": 0,
+          "wsConnections": 0
+        },
+        "clientResponseBytes": 519600,
+        "latencyMs": {
+          "min": 143.1261669999949,
+          "p50": 374.0097079999978,
+          "p95": 432.9804170000061,
+          "max": 435.25541599999997
+        }
+      },
+      "live": {
+        "logicalSubscriptions": 100,
+        "upstreamProducers": 1,
+        "origin": {
+          "producers": 1,
+          "resultExecutions": 2,
+          "validations": 100
+        },
+        "wire": {
+          "httpRequestBytes": 75800,
+          "httpResponseBytes": 84200,
+          "wsRequestBytes": 66385,
+          "wsResponseBytes": 13564,
+          "wsConnections": 101
+        },
+        "clientFrameBytes": 1120811,
+        "initialLatencyMs": {
+          "min": 22.425999999999476,
+          "p50": 34.62895800000115,
+          "p95": 37.213792000002286,
+          "max": 69.46099999999569
+        },
+        "commitFanoutMs": 241.35470899999927
+      },
+      "decisions": [
+        {
+          "live": [
+            0,
+            0,
+            4,
+            1,
+            25,
+            0,
+            0
+          ],
+          "metrics": [
+            null,
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            null,
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            null,
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "live": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "metrics": [
+            null,
+            0
+          ],
+          "query": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "subjectControls": "query and live scope differ; separate producer",
+      "invalidation": "new projection returned; old cache envelope rejected"
+    }
+  ]
+}

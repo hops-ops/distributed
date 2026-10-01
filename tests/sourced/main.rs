@@ -1,5 +1,7 @@
 mod aggregate;
+mod custom_body_helpers;
 mod domain_events;
+mod flat_preview;
 
 use aggregate::{Todo, TodoEvent};
 use distributed::{

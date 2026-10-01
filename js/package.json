@@ -34,7 +34,11 @@
       "types": "./dist/react/index.d.ts",
       "import": "./dist/react/index.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./replica/lazy": {
+      "types": "./dist/replica/lazy.d.ts",
+      "import": "./dist/replica/lazy.js"
+    }
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",

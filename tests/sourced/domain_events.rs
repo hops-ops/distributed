@@ -64,6 +64,15 @@ impl TodoLabelled {
     domain_state = DomainTodoState,
 )]
 impl DomainTodo {
+    pub fn label_via_helper(&mut self, label: String) -> distributed::SourcedResult {
+        self.label_helper(label)
+    }
+
+    fn label_helper(&mut self, label: String) -> distributed::SourcedResult {
+        self.label(label)?;
+        Ok(())
+    }
+
     #[event("todo.created", version = 1, domain)]
     fn create(&mut self, todo_id: String, title: String) {
         self.entity.set_id(todo_id);
@@ -192,11 +201,17 @@ fn identity_mode_reencodes_typed_fields_instead_of_reusing_replay_bytes() {
 
 #[test]
 fn custom_adapter_observes_the_successful_post_transition_state() {
+    use distributed::command::CommandEventSet;
+
+    assert_eq!(
+        domain_commands::LabelViaHelper::command_event_set(),
+        <TodoLabelled as CommandEventSet>::command_event_set(),
+    );
     let mut todo = DomainTodo::default();
     todo.create("todo-1".into(), "First".into()).unwrap();
     todo.complete().unwrap();
 
-    todo.label("urgent".into()).unwrap();
+    todo.label_via_helper("urgent".into()).unwrap();
 
     let occurrence = todo.entity.pending_domain_events().last().unwrap();
     let labelled = occurrence.decode_body::<TodoLabelled>().unwrap();

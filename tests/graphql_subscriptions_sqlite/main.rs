@@ -62,8 +62,7 @@ async fn setup_fixed() -> (
 
     let change_rx = repo.read_model_changes();
 
-    let manifest =
-        distributed::ReadModelCatalog::new("items").table_schema(items_schema());
+    let manifest = distributed::ReadModelCatalog::new("items").table_schema(items_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool.clone())
         .unwrap()
         .roles(&["user"])

@@ -197,6 +197,14 @@ pub trait ReadModelWritePlanStore: Send + Sync {
 pub trait RelationalReadModelQueryStore: Send + Sync {
     fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities;
 
+    /// Optional bounded normalized-row scan. Unsupported adapters fail closed.
+    fn scan_read_model(
+        &self,
+        _request: crate::read_model::ReadModelScanRequest,
+    ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_ {
+        async { Err(TableStoreError::Metadata("bounded read-model scan is unsupported by this adapter".into())) }
+    }
+
     fn load_graph(
         &self,
         request: ReadModelLoadRequest,

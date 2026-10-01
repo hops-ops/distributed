@@ -3,10 +3,8 @@
 use std::sync::Arc;
 
 use async_graphql::Request;
-use distributed::graphql::{
-    graphiql_enabled_from_env_vars, read, typed_command, GraphqlEngine, ModelPermissions,
-    PreparedCommand, Succeeded,
-};
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::graphql::{graphiql_enabled_from_env_vars, read, GraphqlEngine, ModelPermissions};
 use distributed::microsvc::{router, CausalCommandContext, HandlerError, Routes, Service, Session};
 use distributed::{
     Aggregate, AggregateRepository, Entity, EventRecord, InMemoryRepository, ReadModel,
@@ -42,13 +40,13 @@ impl Aggregate for T4Aggregate {
     }
 }
 
-#[derive(Deserialize, distributed::GraphqlInput)]
+#[derive(Deserialize, distributed::CommandInput)]
 struct T4CommandInput {
     id: String,
     name: String,
 }
 
-#[derive(Serialize, distributed::GraphqlOutput)]
+#[derive(Serialize, distributed::CommandOutput)]
 struct T4CommandOutput {
     id: String,
     name: String,

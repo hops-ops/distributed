@@ -148,28 +148,6 @@ pub(crate) fn validate_values_match_key(
     Ok(())
 }
 
-pub(crate) fn belongs_to_target_column(
-    target_schema: &TableSchema,
-    source_column: &str,
-) -> Result<String, TableStoreError> {
-    if target_schema.primary_key.columns.len() != 1 {
-        return Err(TableStoreError::Metadata(format!(
-            "belongs_to target `{}` must have a single-column primary key to load from `{}`",
-            target_schema.model_name, source_column
-        )));
-    }
-
-    Ok(target_schema.primary_key.columns[0].clone())
-}
-
-pub(crate) fn empty_string_as_none(value: &str) -> Option<&str> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
-}
-
 pub(crate) fn row_write_values<'schema>(
     schema: &'schema TableSchema,
     values: &RowValues,

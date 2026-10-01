@@ -8,9 +8,11 @@ use serde_json::Value;
 
 use crate::aggregate::Aggregate;
 use crate::bus::Message;
+use crate::command::{
+    Atomic, CommandOutcome, CommandOutputType, Eventual, PreparedCommand, Succeeded,
+};
 use crate::domain_event::DomainEvent;
-use crate::graphql::command_contract::CommandOutcome;
-use crate::graphql::{Atomic, Eventual, GraphqlOutputType, PreparedCommand, Succeeded};
+
 use crate::microsvc::causal::{AggregatePublication, CausalWorkspace, CausalWorkspaceError};
 use crate::microsvc::context::Context;
 use crate::microsvc::error::HandlerError;
@@ -431,7 +433,7 @@ where
     /// Prepare a successful command result with no causal visibility promise.
     pub fn succeeded<T>(self, payload: T) -> Result<PreparedCommand<Succeeded<T>>, HandlerError>
     where
-        T: GraphqlOutputType + Serialize + Send + Sync + 'static,
+        T: CommandOutputType + Serialize + Send + Sync + 'static,
     {
         let _ = self.projection;
         PreparedCommand::prepare(payload).map_err(|error| HandlerError::Other(Box::new(error)))
@@ -446,7 +448,7 @@ where
     /// leg; the dispatcher additionally proves actual durable outbox coverage.
     pub fn eventual<T>(self, payload: T) -> Result<PreparedCommand<Eventual<T>>, HandlerError>
     where
-        T: GraphqlOutputType + Serialize + Send + Sync + 'static,
+        T: CommandOutputType + Serialize + Send + Sync + 'static,
     {
         let _ = self.projection;
         PreparedCommand::prepare(payload).map_err(|error| HandlerError::Other(Box::new(error)))

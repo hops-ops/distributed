@@ -10,6 +10,11 @@ mod project;
 mod receipt;
 mod release;
 
+/// Internal process contract carrying the canonical CLI that initiated a
+/// discovered lifecycle. It is deliberately not part of user-authored
+/// lifecycle configuration.
+pub(crate) const LIFECYCLE_CLI_EXECUTABLE_ENV: &str = "DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE";
+
 pub use build::{
     activate_lifecycle_project_generation, run_lifecycle_build, run_lifecycle_project_build,
     BuildDrift, LifecycleActivation, LifecycleBuildConfig, LifecycleBuildOptions,

@@ -49,6 +49,12 @@ impl MountSelector {
         })
     }
 
+    /// Gateway capabilities use the existing explicit extension mount algebra.
+    #[cfg(feature = "gateway")]
+    pub fn gateway(id: impl Into<String>) -> ApplicationResult<Self> {
+        Self::extension(id)
+    }
+
     pub fn kind_label(&self) -> &'static str {
         match self {
             Self::Command { .. } => "command",

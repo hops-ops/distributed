@@ -123,6 +123,7 @@ pub struct VerifiedPrincipal {
     subject: String,
     audiences: Vec<VerifiedAudience>,
     tenant_partitions: Vec<(String, Value)>,
+    expires_at: Option<u64>,
 }
 
 impl VerifiedPrincipal {
@@ -162,6 +163,7 @@ impl VerifiedPrincipal {
                 })
                 .collect(),
             tenant_partitions: Vec::new(),
+            expires_at: None,
         }
     }
 
@@ -173,6 +175,12 @@ impl VerifiedPrincipal {
     #[cfg(test)]
     pub(crate) fn subject(&self) -> &str {
         &self.subject
+    }
+
+    /// Credential expiry used to bound admitted delivery work. Trusted local
+    /// principals without an expiring credential return None.
+    pub fn expires_at(&self) -> Option<u64> {
+        self.expires_at
     }
 
     pub(crate) fn subject_matches(&self, subject: &str) -> bool {
@@ -736,6 +744,7 @@ fn verified_principal(
         subject,
         audiences,
         tenant_partitions,
+        expires_at: claims.get("exp").and_then(Value::as_u64),
     })
 }
 

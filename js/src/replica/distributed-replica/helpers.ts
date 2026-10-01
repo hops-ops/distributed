@@ -105,6 +105,41 @@ export function prepareRecordEvidence(
 	};
 }
 
+/**
+ * Membership a result would write for one index: normalized record keys in
+ * response order. `null` means it cannot be established from the response
+ * alone (blocked by errors, missing, embedded, or without record evidence).
+ */
+export type ReplicaIndexMembership = {
+	readonly records: readonly string[];
+	readonly nullValue: boolean;
+};
+
+export type ReplicaIndexMemberships = Map<string, ReplicaIndexMembership | null>;
+
+function recordMembership(
+	memberships: ReplicaIndexMemberships | undefined,
+	key: string,
+	membership: ReplicaIndexMembership | null
+): void {
+	if (memberships === undefined) return;
+	const previous = memberships.get(key);
+	if (previous === undefined) {
+		memberships.set(key, membership);
+		return;
+	}
+	// One response reaching an index twice must agree with itself.
+	if (
+		previous === null ||
+		membership === null ||
+		previous.nullValue !== membership.nullValue ||
+		previous.records.length !== membership.records.length ||
+		previous.records.some((record, ordinal) => record !== membership.records[ordinal])
+	) {
+		memberships.set(key, null);
+	}
+}
+
 export function replicaResultIndexKeys<
 	TData,
 	TVariables extends GraphqlVariables
@@ -112,7 +147,8 @@ export function replicaResultIndexKeys<
 	artifact: ReplicaOperationArtifact<TData, TVariables>,
 	variables: TVariables,
 	envelope: ReplicaResultEnvelope<TData>,
-	snapshot: DistributedQuerySnapshot
+	snapshot: DistributedQuerySnapshot,
+	memberships?: ReplicaIndexMemberships
 ): ReadonlySet<string> {
 	const keys = new Set<string>();
 	if (
@@ -156,6 +192,7 @@ export function replicaResultIndexKeys<
 				root.responseKey
 			)
 		) {
+			recordMembership(memberships, rootKey, null);
 			continue;
 		}
 		const value = envelope.data[root.responseKey];
@@ -163,6 +200,7 @@ export function replicaResultIndexKeys<
 			value === null &&
 			resultPathHasErrors(errorPaths, rootPath)
 		) {
+			recordMembership(memberships, rootKey, null);
 			continue;
 		}
 		collectResultBranchIndexKeys(
@@ -174,7 +212,8 @@ export function replicaResultIndexKeys<
 			variables,
 			errorPaths,
 			evidencePaths,
-			keys
+			keys,
+			memberships
 		);
 	}
 	return keys;
@@ -189,11 +228,23 @@ export function collectResultBranchIndexKeys(
 	variables: GraphqlVariables,
 	errorPaths: readonly (readonly (string | number)[])[],
 	evidencePaths: ReadonlySet<string>,
-	keys: Set<string>
+	keys: Set<string>,
+	memberships?: ReplicaIndexMemberships
 ): void {
-	if (value === null || value === undefined) return;
+	if (value === null) {
+		recordMembership(
+			memberships,
+			enclosingIndexKey,
+			selection.nullable ? { records: [], nullValue: true } : null
+		);
+		return;
+	}
+	if (value === undefined) {
+		recordMembership(memberships, enclosingIndexKey, null);
+		return;
+	}
 	if (selection.cardinality === 'one') {
-		collectResultObjectIndexKeys(
+		const recordKey = collectResultObjectIndexKeys(
 			artifactId,
 			selection.selection,
 			value,
@@ -203,14 +254,28 @@ export function collectResultBranchIndexKeys(
 			variables,
 			errorPaths,
 			evidencePaths,
-			keys
+			keys,
+			memberships
+		);
+		recordMembership(
+			memberships,
+			enclosingIndexKey,
+			recordKey === undefined ? null : { records: [recordKey], nullValue: false }
 		);
 		return;
 	}
-	if (!Array.isArray(value)) return;
+	if (!Array.isArray(value)) {
+		recordMembership(memberships, enclosingIndexKey, null);
+		return;
+	}
+	const records: string[] = [];
+	let certain = true;
 	for (const [ordinal, entry] of value.entries()) {
-		if (entry === null || entry === undefined) continue;
-		collectResultObjectIndexKeys(
+		if (entry === null || entry === undefined) {
+			certain = false;
+			continue;
+		}
+		const recordKey = collectResultObjectIndexKeys(
 			artifactId,
 			selection.selection,
 			entry,
@@ -220,9 +285,17 @@ export function collectResultBranchIndexKeys(
 			variables,
 			errorPaths,
 			evidencePaths,
-			keys
+			keys,
+			memberships
 		);
+		if (recordKey === undefined) certain = false;
+		else records.push(recordKey);
 	}
+	recordMembership(
+		memberships,
+		enclosingIndexKey,
+		certain ? { records, nullValue: false } : null
+	);
 }
 
 export function collectResultObjectIndexKeys(
@@ -235,10 +308,11 @@ export function collectResultObjectIndexKeys(
 	variables: GraphqlVariables,
 	errorPaths: readonly (readonly (string | number)[])[],
 	evidencePaths: ReadonlySet<string>,
-	keys: Set<string>
-): void {
+	keys: Set<string>,
+	memberships?: ReplicaIndexMemberships
+): string | undefined {
 	if (resultPathBlocked(errorPaths, path) || !isReplicaResultObject(value)) {
-		return;
+		return undefined;
 	}
 	const fields = new Map<string, CacheValue>();
 	for (const member of selection.members) {
@@ -260,6 +334,7 @@ export function collectResultObjectIndexKeys(
 		}
 	}
 	let parentKey: string;
+	let normalized = false;
 	if (
 		selection.storage.kind === 'normalized' &&
 		evidencePaths.has(responsePathKey(path.map(String)))
@@ -268,7 +343,8 @@ export function collectResultObjectIndexKeys(
 			const value = fields.get(field);
 			return value === undefined || value === null ? [] : [value];
 		});
-		if (identity.length !== selection.storage.identityFields.length) return;
+		if (identity.length !== selection.storage.identityFields.length) return undefined;
+		normalized = true;
 		parentKey = replicaRecordKey(
 			{
 				id: selection.storage.model,
@@ -300,6 +376,7 @@ export function collectResultObjectIndexKeys(
 			resultPathBlocked(errorPaths, branchPath) ||
 			!Object.prototype.hasOwnProperty.call(value, member.responseKey)
 		) {
+			recordMembership(memberships, branchKey, null);
 			continue;
 		}
 		const branchValue = value[member.responseKey];
@@ -307,6 +384,7 @@ export function collectResultObjectIndexKeys(
 			branchValue === null &&
 			resultPathHasErrors(errorPaths, branchPath)
 		) {
+			recordMembership(memberships, branchKey, null);
 			continue;
 		}
 		collectResultBranchIndexKeys(
@@ -318,9 +396,12 @@ export function collectResultObjectIndexKeys(
 			variables,
 			errorPaths,
 			evidencePaths,
-			keys
+			keys,
+			memberships
 		);
 	}
+	// Embedded rows are operation-local; they never share an index membership.
+	return normalized ? parentKey : undefined;
 }
 
 export function resultPathBlocked(
@@ -734,6 +815,30 @@ export function stableErrors(
 ): readonly GqlError[] {
 	if (next.length === 0) return EMPTY_ERRORS;
 	return deepEqual(current, next) ? current : freezeErrors(next);
+}
+
+/**
+ * GraphQL payload of a live failure frame (`docs/live-query-delivery.md`): no
+ * result data and a nonempty list of errors that each carry a string message.
+ * Callers also require absent snapshot, live and command metadata. Partial
+ * data with errors is never a failure payload.
+ */
+export function isGraphqlFailurePayload(envelope: {
+	readonly data?: unknown;
+	readonly errors?: unknown;
+}): envelope is { readonly data?: null; readonly errors: readonly GqlError[] } {
+	return (
+		(envelope.data === undefined || envelope.data === null) &&
+		Array.isArray(envelope.errors) &&
+		envelope.errors.length > 0 &&
+		envelope.errors.every(
+			(error: unknown) =>
+				error !== null &&
+				typeof error === 'object' &&
+				!Array.isArray(error) &&
+				typeof (error as { message?: unknown }).message === 'string'
+		)
+	);
 }
 
 export function graphqlError(error: unknown): GqlError {

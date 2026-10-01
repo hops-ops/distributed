@@ -643,6 +643,10 @@ pub struct ProjectionProgram {
     version: u64,
     partition: ProjectionPartition,
     arms: Vec<ProjectionArm>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    source_snapshots: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    external_source_snapshots: bool,
 }
 
 impl ProjectionProgram {
@@ -691,7 +695,51 @@ impl ProjectionProgram {
             version,
             partition,
             arms,
+            source_snapshots: false,
+            external_source_snapshots: false,
         })
+    }
+
+    /// Fence complete row snapshots by their canonical aggregate occurrence.
+    ///
+    /// This is not appropriate for delta folds: dropping an older increment
+    /// would lose work. Snapshot programs must use a unit partition and only
+    /// full-row upserts or deletes, without relationship side effects.
+    pub fn with_source_snapshots(mut self) -> Result<Self, ProjectionProgramError> {
+        if !matches!(self.partition, ProjectionPartition::Unit)
+            || self.arms.iter().flat_map(|arm| arm.operations()).any(|op| {
+                !matches!(
+                    op.kind(),
+                    ProjectionMutationKind::Upsert | ProjectionMutationKind::Delete
+                ) || !op.relationship_effects().is_empty()
+                    || !op.invalidations().is_empty()
+            })
+        {
+            return Err(ProjectionProgramError::InvalidOperation {
+                operation: self.name.clone(),
+                reason: "source snapshots require unit-partition full-row upserts/deletes without relationship effects".into(),
+            });
+        }
+        self.source_snapshots = true;
+        Ok(self)
+    }
+
+    /// Whether authoritative row snapshots are fenced by aggregate version.
+    pub fn source_snapshots(&self) -> bool {
+        self.source_snapshots
+    }
+
+    /// Fence complete external snapshots by the authenticated source position.
+    /// Aggregate and external snapshot programs reject each other's origins.
+    pub fn with_external_source_snapshots(self) -> Result<Self, ProjectionProgramError> {
+        let mut program = self.with_source_snapshots()?;
+        program.external_source_snapshots = true;
+        Ok(program)
+    }
+
+    /// Whether snapshots require external source provenance rather than an aggregate.
+    pub fn external_source_snapshots(&self) -> bool {
+        self.external_source_snapshots
     }
 
     /// Return the stable program name.

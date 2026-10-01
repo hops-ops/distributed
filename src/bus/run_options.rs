@@ -70,7 +70,13 @@ pub struct RunOptions<I = NoInbox> {
     pub delivery_mode: ConsumerDeliveryMode<I>,
     /// What the runner does with a permanent handler/transport failure.
     pub failure_policy: FailurePolicy,
+    /// Maximum received-but-unsettled deliveries when a router runs several
+    /// delivery lanes concurrently. Ignored for single-lane routers.
+    pub lane_window: usize,
 }
+
+/// Default bound on unsettled deliveries for a multi-lane run.
+pub const DEFAULT_LANE_WINDOW: usize = 16;
 
 impl<I> Default for RunOptions<I> {
     /// Idempotent delivery with the default [`FailurePolicy`].
@@ -78,6 +84,7 @@ impl<I> Default for RunOptions<I> {
         Self {
             delivery_mode: ConsumerDeliveryMode::default(),
             failure_policy: FailurePolicy::default(),
+            lane_window: DEFAULT_LANE_WINDOW,
         }
     }
 }
@@ -98,12 +105,20 @@ impl<I> RunOptions<I> {
         Self {
             delivery_mode: ConsumerDeliveryMode::Inbox(hook),
             failure_policy: FailurePolicy::default(),
+            lane_window: DEFAULT_LANE_WINDOW,
         }
     }
 
     /// Override the failure policy.
     pub fn with_failure_policy(mut self, policy: FailurePolicy) -> Self {
         self.failure_policy = policy;
+        self
+    }
+
+    /// Bound the received-but-unsettled deliveries of a multi-lane run.
+    /// Values below 1 are raised to 1.
+    pub fn with_lane_window(mut self, window: usize) -> Self {
+        self.lane_window = window.max(1);
         self
     }
 

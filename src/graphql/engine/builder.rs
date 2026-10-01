@@ -10,6 +10,10 @@ impl GraphqlEngineBuilder {
             command_binding: None,
             causal_storage_identity: source.causal_storage_identity,
             pool: source.pool,
+            #[cfg(feature = "gateway-delivery")]
+            read_routing: None,
+            #[cfg(feature = "gateway-delivery")]
+            gateway_versions: None,
             catalog: BTreeMap::new(),
             by_table: BTreeMap::new(),
             permissions: BTreeMap::new(),
@@ -27,6 +31,7 @@ impl GraphqlEngineBuilder {
             introspection_for_anonymous: true,
             statement_timeout: Duration::from_secs(5),
             graphiql: false,
+            subscriptions: true,
             typed_commands: TypedCommandInventory::empty(),
             projectors: Vec::new(),
             change_rx: None,
@@ -35,6 +40,36 @@ impl GraphqlEngineBuilder {
             identity: IdentityConfig::dev_headers(),
             read_stores: BTreeMap::new(),
         }
+    }
+
+    /// Include live roots in the runtime schema and generated client surface.
+    /// Query-only gateway executors disable this before schema construction.
+    pub fn subscriptions(mut self, enabled: bool) -> Self {
+        self.subscriptions = enabled;
+        self
+    }
+
+    /// Opt in selected exact query documents to a read replica. The engine's
+    /// original repository remains the primary for current reads and evidence.
+    #[cfg(feature = "gateway-delivery")]
+    pub fn read_routing(mut self, routing: ReadRouting) -> Self {
+        if std::mem::discriminant(&self.pool) != std::mem::discriminant(&routing.replica) {
+            self.pending_errors
+                .push("read replica must use the primary SQL dialect".into());
+        }
+        self.read_routing = Some(routing);
+        self
+    }
+
+    /// Enable origin dependency validation after installing version coverage
+    /// in the engine's database. This allocates no gateway cache or coordinator.
+    #[cfg(feature = "gateway-delivery")]
+    pub fn gateway_versions(
+        mut self,
+        store: crate::graphql::delivery::GatewayVersionStore,
+    ) -> Self {
+        self.gateway_versions = Some(store);
+        self
     }
 
     pub fn model<M: RelationalReadModelIncludes>(mut self, perms: ModelPermissions<M>) -> Self {
@@ -725,7 +760,7 @@ impl GraphqlEngineBuilder {
                 SqlDialect::Postgres => SurfaceDialect::Postgres,
             },
             aggregates: true,
-            subscriptions: true,
+            subscriptions: self.subscriptions,
             default_limit: self.default_limit,
             max_limit: self.max_limit,
         };
@@ -801,7 +836,7 @@ impl GraphqlEngineBuilder {
                     .expect("protocol configuration validated a service ID");
                 let (authorization_fingerprint, claim_keys) =
                     role_authorization_info(role, &self.permissions)?;
-                let manifest = DistributedClientSurfaceExport::from_selected_with_execution(
+                let export = DistributedClientSurfaceExport::from_selected_with_execution(
                     service_id,
                     Arc::clone(&role_surface),
                     ClientExecutionLimits::from_runtime(
@@ -812,8 +847,12 @@ impl GraphqlEngineBuilder {
                     )
                     .map_err(|error| GraphqlBuildError(error.to_string()))?,
                 )
-                .and_then(|export| export.manifest())
                 .map_err(|error| {
+                    GraphqlBuildError(format!(
+                        "failed to derive GraphQL protocol surface for role `{role}`: {error}"
+                    ))
+                })?;
+                let manifest = export.manifest().map_err(|error| {
                     GraphqlBuildError(format!(
                         "failed to derive GraphQL protocol surface for role `{role}`: {error}"
                     ))
@@ -823,6 +862,7 @@ impl GraphqlEngineBuilder {
                     role.clone(),
                     ProtocolRoleInfo {
                         surface: ProtocolSurfaceInfo {
+                            export,
                             schema_fingerprint: manifest.schema_fingerprint,
                             protocol_fingerprint: manifest.protocol_fingerprint,
                             trusted_presets,
@@ -880,7 +920,7 @@ impl GraphqlEngineBuilder {
                     .service_id
                     .as_deref()
                     .expect("protocol configuration validated a service ID");
-                let manifest = DistributedClientSurfaceExport::from_selected_with_execution(
+                let export = DistributedClientSurfaceExport::from_selected_with_execution(
                     service_id,
                     Arc::clone(&application_surface),
                     ClientExecutionLimits::from_runtime(
@@ -891,7 +931,10 @@ impl GraphqlEngineBuilder {
                     )
                     .map_err(|error| GraphqlBuildError(error.to_string()))?,
                 )
-                .and_then(|export| export.manifest())
+                .map_err(|error| GraphqlBuildError(format!(
+                    "failed to derive GraphQL protocol surface for application `{application}`: {error}"
+                )))?;
+                let manifest = export.manifest()
                 .map_err(|error| {
                     GraphqlBuildError(format!(
                         "failed to derive GraphQL protocol surface for application `{application}`: {error}"
@@ -955,6 +998,7 @@ impl GraphqlEngineBuilder {
                         schema_roles: registration.schema_roles.clone(),
                         privilege_key,
                         surface: ProtocolSurfaceInfo {
+                            export,
                             schema_fingerprint: manifest.schema_fingerprint,
                             protocol_fingerprint: manifest.protocol_fingerprint,
                             trusted_presets,
@@ -1003,6 +1047,10 @@ impl GraphqlEngineBuilder {
             command_binding: self.command_binding,
             causal_storage_identity: self.causal_storage_identity,
             pool: self.pool,
+            #[cfg(feature = "gateway-delivery")]
+            read_routing: self.read_routing,
+            #[cfg(feature = "gateway-delivery")]
+            gateway_versions: self.gateway_versions,
             catalog: self.catalog,
             by_table: self.by_table,
             permissions: self.permissions,

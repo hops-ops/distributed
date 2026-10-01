@@ -52,7 +52,8 @@ const FILTER_FIELDS = Object.freeze([
 			'_in',
 			'_nin',
 			'_like',
-			'_ilike'
+			'_ilike',
+			'_icontains'
 		])
 	}),
 	Object.freeze({
@@ -387,6 +388,10 @@ test('query-plan artifacts require exact scalar-codec pairs', () => {
 
 test('unsafe operators, codecs, and absent canonical fields explain why evaluation is unknown', () => {
 	const record = { id: 'todo-1', priority: 3, active: true, title: 'one', payload: null };
+	assert.equal(
+		evaluateReplicaFilter(filterArtifact(literal({ title: { _icontains: 'ONE' } })), record).reason.code,
+		'unsupported_operator'
+	);
 	assert.equal(
 		evaluateReplicaFilter(
 			filterArtifact(literal({ title: { _like: 'o%' } })),

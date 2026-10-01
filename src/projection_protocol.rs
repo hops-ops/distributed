@@ -1,8 +1,9 @@
 //! Adapter-neutral identities and ordering vocabulary for durable projections.
 //!
-//! These types deliberately separate three different notions of progress:
+//! These types deliberately separate four different notions of progress:
 //!
 //! - [`ProjectionInputCursor`] orders trusted inputs from one exact source;
+//! - [`SourceSnapshotVersion`] fences snapshots from one aggregate stream;
 //! - [`RecordRevision`] orders versions of one exact projected record; and
 //! - [`ProjectionChangeCursor`] orders durable changes emitted by a projector.
 //!
@@ -16,8 +17,11 @@ use std::num::{NonZeroU32, NonZeroU64};
 use serde::{Deserialize, Serialize};
 
 mod codec;
+mod source_snapshot;
 mod store;
 mod workspace;
+pub(crate) use source_snapshot::validate_snapshot_write;
+pub use source_snapshot::SourceSnapshotVersion;
 
 pub(crate) use codec::{
     canonical_projection_topology_bytes, compile_projection_topology, digest_projection_binding,

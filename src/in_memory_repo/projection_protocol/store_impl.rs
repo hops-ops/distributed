@@ -1,6 +1,22 @@
 use super::*;
 
 impl ProjectionProtocolStore for InMemoryRepository {
+    #[cfg(feature = "graphql")]
+    async fn projection_rebuild_records(
+        &self,
+        context: &crate::projection::rebuild::RebuildContext,
+    ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
+        self.snapshot_rebuild_records(context).await
+    }
+
+    #[cfg(feature = "graphql")]
+    async fn commit_projection_rebuild(
+        &self,
+        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> Result<usize, ProjectionProtocolError> {
+        self.apply_snapshot_rebuild(plan).await
+    }
+
     fn register_projection_models<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
@@ -88,7 +104,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
 
     fn commit_projection(
         &self,
-        batch: ProjectionCommitBatch,
+        mut batch: ProjectionCommitBatch,
     ) -> impl Future<Output = Result<ProjectionCommitResult, ProjectionProtocolError>> + Send + '_
     {
         async move {
@@ -113,7 +129,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .map_err(|_| RepositoryError::LockPoisoned("projection inbox write"))?;
 
             protocol.validate_partition(&partition_key, &batch.input, &batch.change_epoch)?;
-            match protocol.classify_input(
+            let redelivery = match protocol.classify_input(
                 &batch.input.cursor,
                 batch.input.fingerprint,
                 &batch.input.message_id,
@@ -135,12 +151,21 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 }
                 InputDisposition::New => {
                     protocol.validate_pending_retry(&partition_key, &batch.input)?;
+                    false
                 }
-            }
+                InputDisposition::Redelivery => {
+                    protocol.validate_pending_retry(&partition_key, &batch.input)?;
+                    batch.mutations.clear();
+                    batch.observations.clear();
+                    true
+                }
+            };
 
             let receipt = batch.input.inbox_receipt();
             receipt.validate()?;
-            if inbox.contains(&(receipt.consumer.clone(), receipt.message_id.clone())) {
+            if !redelivery
+                && inbox.contains(&(receipt.consumer.clone(), receipt.message_id.clone()))
+            {
                 return Err(ProjectionProtocolError::MessageIdReuse {
                     message_id: batch.input.message_id.clone(),
                 });
@@ -179,6 +204,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     &mutation.scope,
                     &mutation.expectation,
                     mutation.kind,
+                    mutation.source_snapshot.is_some(),
+                )?;
+                crate::projection_protocol::validate_snapshot_write(
+                    staged_protocol.records.get(&mutation.scope),
+                    mutation.source_snapshot.as_ref(),
                 )?;
                 staged_protocol.validate_physical_record(
                     &mutation.scope,
@@ -195,12 +225,18 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         scope: Some(mutation.scope.clone()),
                         revision: Some(revision.clone()),
                         failure_id: None,
+                        program_id: batch
+                            .ownership
+                            .iter()
+                            .find(|ownership| ownership.model == mutation.scope.model())
+                            .and_then(|ownership| ownership.program_id),
                     },
                 )?;
                 let metadata = ProjectionRecordMetadata {
                     revision,
                     tombstone,
                     change: change.cursor.clone(),
+                    source_snapshot: mutation.source_snapshot.clone(),
                 };
                 staged_protocol.ensure_live_record_identity_available(&metadata)?;
                 staged_protocol
@@ -276,6 +312,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 if staged_protocol.observations.contains_key(&observation_key) {
                     continue;
                 }
+                let program_id = batch
+                    .ownership
+                    .iter()
+                    .find(|ownership| ownership.model == scope.model())
+                    .and_then(|ownership| ownership.program_id);
                 let change_cursor = match staged_change {
                     Some(cursor) => cursor,
                     None => {
@@ -288,6 +329,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                                 scope: Some(scope.clone()),
                                 revision: revision.clone(),
                                 failure_id: None,
+                                program_id,
                             },
                         )?;
                         let cursor = change.cursor.clone();
@@ -301,6 +343,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     revision,
                     scope,
                     change: change_cursor,
+                    program_id,
                 };
                 staged_protocol
                     .observations
@@ -317,6 +360,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         scope: None,
                         revision: None,
                         failure_id: None,
+                        program_id: None,
                     },
                 )?);
             }
@@ -378,7 +422,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
             *inbox = staged_inbox;
 
             Ok(ProjectionCommitResult {
-                outcome: ProjectionCommitOutcome::Applied,
+                outcome: if redelivery {
+                    ProjectionCommitOutcome::Duplicate
+                } else {
+                    ProjectionCommitOutcome::Applied
+                },
                 checkpoint: Some(checkpoint),
                 records,
                 changes,
@@ -461,6 +509,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 InputDisposition::New => {
                     protocol.validate_pending_retry(&partition_key, &batch.input)?;
                 }
+                InputDisposition::Redelivery => {
+                    return Err(ProjectionProtocolError::InvalidBatch(
+                        "an already applied message cannot record a new failure".into(),
+                    ))
+                }
                 InputDisposition::Duplicate(_) | InputDisposition::Stale(_) => {
                     return Err(ProjectionProtocolError::InvalidBatch(
                         "cannot record terminal failure for an already processed input".into(),
@@ -492,6 +545,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     scope: None,
                     revision: None,
                     failure_id: Some(batch.failure_id.clone()),
+                    program_id: None,
                 },
             )?;
             let failure = ProjectionFailure {
@@ -640,6 +694,10 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 InputDisposition::New => {
                     protocol.validate_pending_retry(&partition_key, input)?;
                     Ok(ProjectionInputDisposition::Pending)
+                }
+                InputDisposition::Redelivery => {
+                    protocol.validate_pending_retry(&partition_key, input)?;
+                    Ok(ProjectionInputDisposition::Redelivery)
                 }
             }
         }

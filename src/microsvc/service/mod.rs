@@ -30,8 +30,8 @@
 mod causal;
 mod defaults;
 mod handlers;
-mod invoke;
 mod helpers;
+mod invoke;
 mod request;
 mod routes;
 mod runtime;
@@ -41,12 +41,12 @@ pub(crate) use causal::CausalCommandProjectionEvidence;
 #[cfg(feature = "graphql")]
 pub use causal::GraphqlServiceBindError;
 #[cfg(feature = "graphql")]
-pub use causal::{CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult};
-#[cfg(feature = "graphql")]
 pub(crate) use causal::{
     CausalCommandProjectionObligation, CausalCommandPublicState, CausalCommandReceiptSource,
-    CausalProjectionEvidenceState,
+    CausalProjectionEvidenceState, ExternalCausalReservation,
 };
+#[cfg(feature = "graphql")]
+pub use causal::{CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult};
 #[allow(unused_imports)] // public API surface for handler-owned projected commits
 pub use handlers::StagedProjectedRow;
 pub use handlers::{
@@ -60,7 +60,7 @@ pub use routes::{
     DeliveryKind, HandlerNames, HandlerSpec, PortableCommand, RouteBuilder, Routes,
     ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded, TypedRouteBuilder,
 };
-pub use runtime::Service;
+pub use runtime::{Service, DEFAULT_DELIVERY_LANE};
 
 #[cfg(test)]
 mod tests;

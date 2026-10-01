@@ -1,5 +1,0 @@
-error: #[serde(skip_serializing_if)] is not supported by GraphqlOutput because it changes the declared GraphQL field shape; define a separate wire type
- --> tests/graphql_compile_fail/serde_skip.rs:5:13
-  |
-5 |     #[serde(skip_serializing_if = "Option::is_none")]
-  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

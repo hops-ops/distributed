@@ -599,6 +599,14 @@ pub(in crate::graphql::surface) fn canonicalize_type_def(
                 definition.name, field.name
             ));
         }
+        if field.unsigned_integer.is_some()
+            && (field.type_name != "BigInt" || field.nested.is_some())
+        {
+            return Err(format!(
+                "command type `{}` field `{}` has an invalid unsigned refinement",
+                definition.name, field.name
+            ));
+        }
         if let Some(nested) = &mut field.nested {
             canonicalize_type_def(nested)?;
             if field.type_name != nested.name {

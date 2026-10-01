@@ -34,6 +34,14 @@ impl ProjectionCommitBatch {
         let mut scopes = std::collections::HashSet::new();
         for mutation in &self.mutations {
             validate_scope(topology, partition, &mutation.scope)?;
+            if mutation.kind == ProjectionMutationKind::Delete
+                && matches!(mutation.expectation, ProjectionRecordExpectation::Missing)
+                && mutation.source_snapshot.is_none()
+            {
+                return Err(ProjectionProtocolError::InvalidBatch(
+                    "delete of an unseen row requires an authoritative source snapshot".into(),
+                ));
+            }
             let schema = match &mutation.mutation {
                 TableMutation::UpsertRow(mutation) => mutation.schema,
                 TableMutation::PatchRow(mutation) => mutation.schema,

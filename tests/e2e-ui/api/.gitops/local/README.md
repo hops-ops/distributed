@@ -3,8 +3,11 @@
 This cluster-development chart renders one Deployment running
 `distributed dev` for the complete editable application. The lifecycle owns
 the Rust API, SvelteKit UI, generated clients, linked framework JavaScript,
-and generation activation. Two Services expose ports 8791 and 5180 from that
-one lifecycle participant set.
+and generation activation. Both Services enter the backend gateway on 8791:
+the public UI Service retains port 5180 and the API Service uses 8791. The
+gateway forwards UI/auth to same-pod SvelteKit at 127.0.0.1:5180; it never
+uses the public UI Service as its upstream. PUBLIC_ORIGIN and Auth.js use
+the public UI Service URL, so existing OIDC callbacks stay on that origin.
 
 Hops supplies the source mount or sync delivery. A Node init container places
 the pinned Node/npm toolchain beside the Rust toolchain without a custom local

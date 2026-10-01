@@ -193,7 +193,7 @@ pub fn expand(
     })?;
     if !function.sig.asyncness.is_some() {
         return Err(syn::Error::new_spanned(
-            &function.sig.fn_token,
+            function.sig.fn_token,
             "typed command handlers must be async",
         ));
     }
@@ -287,7 +287,7 @@ pub fn expand(
     let defaults = args.defaults;
     let generated_defaults = args.generated_defaults;
     let mut builder = quote! {
-        #framework::graphql::typed_command::<#input, #outcome>(#id)
+        #framework::command::typed_command::<#input, #outcome>(#id)
             .field_name(#field_name)
     };
     builder.extend(quote! { .roles([#(#roles),*]) });
@@ -315,12 +315,12 @@ pub fn expand(
         #[cfg(feature = "application-runtime")]
         #function
 
-        #visibility fn #command_name() -> #framework::graphql::TypedCommand<#input, #outcome> {
+        #visibility fn #command_name() -> #framework::command::TypedCommand<#input, #outcome> {
             #builder
         }
 
         #visibility static #command_static: ::std::sync::LazyLock<
-            #framework::graphql::TypedCommand<#input, #outcome>
+            #framework::command::TypedCommand<#input, #outcome>
         > = ::std::sync::LazyLock::new(#command_name);
 
         #visibility fn #spec_name() -> #framework::application::ApplicationResult<
@@ -368,7 +368,7 @@ pub fn expand(
                 + 'static,
             #aggregate: #framework::Aggregate + Send + Sync + 'static,
             #input: #framework::__private::serde::de::DeserializeOwned + Send + 'static,
-            #outcome: #framework::graphql::CommandOutcome,
+            #outcome: #framework::command::CommandOutcome,
         {
             routes
                 .typed_command((#command_static).clone())

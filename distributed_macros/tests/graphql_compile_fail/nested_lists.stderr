@@ -1,5 +1,0 @@
-error: nested lists are not supported for GraphqlInput/GraphqlOutput fields
- --> tests/graphql_compile_fail/nested_lists.rs:5:13
-  |
-5 |     values: Option<Vec<Option<Vec<String>>>>,
-  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

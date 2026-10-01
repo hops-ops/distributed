@@ -266,6 +266,185 @@ pub(crate) async fn input_disposition_is_read_only_exact_and_repair_fenced(
     );
 }
 
+pub(crate) async fn identical_redelivery_advances_only_broker_checkpoint(
+    scenario: impl ProjectionProtocolScenario,
+) {
+    let store = scenario.repository().await;
+    let first = scenario.input(
+        1,
+        b"immutable-input",
+        "message-repeat",
+        "cause-repeat",
+        ProjectionGeneration::initial(),
+    );
+    let mutation = scenario.mutation(
+        ProjectionRecordExpectation::Missing,
+        ProjectionMutationKind::Upsert,
+    );
+    let scope = mutation.scope.clone();
+    store
+        .commit_projection(scenario.batch(first.clone(), vec![mutation], Vec::new()))
+        .await
+        .unwrap();
+    let original = store.projection_record(&scope).await.unwrap().unwrap();
+    let repeat = scenario.input(
+        2,
+        b"immutable-input",
+        "message-repeat",
+        "cause-repeat",
+        ProjectionGeneration::initial(),
+    );
+    assert_eq!(
+        store.projection_input_disposition(&repeat).await.unwrap(),
+        ProjectionInputDisposition::Redelivery
+    );
+    // Even a caller that supplies effects again cannot repeat them.
+    let repeated = store
+        .commit_projection(scenario.batch(
+            repeat.clone(),
+            vec![scenario.mutation(
+                ProjectionRecordExpectation::Missing,
+                ProjectionMutationKind::Upsert,
+            )],
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(repeated.outcome, ProjectionCommitOutcome::Duplicate);
+    assert_eq!(repeated.checkpoint.unwrap().input().position(), 2);
+    assert_eq!(repeated.changes.len(), 1);
+    assert_eq!(repeated.changes[0].kind, ProjectionChangeKind::Checkpoint);
+    assert_eq!(
+        store.projection_record(&scope).await.unwrap().unwrap(),
+        original
+    );
+    assert!(matches!(
+        store.projection_input_disposition(&repeat).await.unwrap(),
+        ProjectionInputDisposition::Duplicate(_)
+    ));
+    let next = scenario.input(
+        3,
+        b"next-input",
+        "message-next",
+        "cause-next",
+        ProjectionGeneration::initial(),
+    );
+    store
+        .commit_projection(scenario.batch(next, Vec::new(), Vec::new()))
+        .await
+        .unwrap();
+    // Every alias position permanently retains the original bytes and identity.
+    let substitution = scenario.input(
+        2,
+        b"immutable-input",
+        "substituted-message",
+        "cause-repeat",
+        ProjectionGeneration::initial(),
+    );
+    assert!(matches!(
+        store.projection_input_disposition(&substitution).await,
+        Err(ProjectionProtocolError::InputCorruption)
+    ));
+    let altered = scenario.input(
+        4,
+        b"changed-input",
+        "message-repeat",
+        "cause-repeat",
+        ProjectionGeneration::initial(),
+    );
+    assert!(store.projection_input_disposition(&altered).await.is_err());
+    let other_partition = scenario.input_for_partition(
+        ProjectionPartition::new(b"other-partition".to_vec()).unwrap(),
+        1,
+        b"immutable-input",
+        "message-repeat",
+        "cause-repeat",
+    );
+    assert!(matches!(
+        store.projection_input_disposition(&other_partition).await,
+        Err(ProjectionProtocolError::MessageIdReuse { .. })
+    ));
+
+    // A repaired generation owns a fresh execution history. An old-generation
+    // receipt must not suppress that generation's first actual delivery.
+    let failed = scenario.input(
+        4,
+        b"repair-input",
+        "repair-message",
+        "repair-cause",
+        ProjectionGeneration::initial(),
+    );
+    store
+        .record_projection_failure(
+            ProjectionFailureBatch::new(
+                failed,
+                scenario.change_epoch(),
+                "repair-redelivery",
+                "fixture",
+                b"failure".to_vec(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let generation = store
+        .repair_projection(
+            &scenario.topology(),
+            &scenario.partition(),
+            "repair-redelivery",
+        )
+        .await
+        .unwrap();
+    store
+        .commit_projection(scenario.batch(
+            scenario.input(
+                4,
+                b"repair-input",
+                "repair-message",
+                "repair-cause",
+                generation,
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    let replay = scenario.input(
+        5,
+        b"immutable-input",
+        "message-repeat",
+        "cause-repeat",
+        generation,
+    );
+    assert_eq!(
+        store.projection_input_disposition(&replay).await.unwrap(),
+        ProjectionInputDisposition::Pending
+    );
+    let applied = store
+        .commit_projection(scenario.batch(
+            replay,
+            vec![scenario.mutation(
+                ProjectionRecordExpectation::Exact(original.revision),
+                ProjectionMutationKind::Upsert,
+            )],
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(applied.outcome, ProjectionCommitOutcome::Applied);
+    let repeated = scenario.input(
+        6,
+        b"immutable-input",
+        "message-repeat",
+        "cause-repeat",
+        generation,
+    );
+    assert_eq!(
+        store.projection_input_disposition(&repeated).await.unwrap(),
+        ProjectionInputDisposition::Redelivery
+    );
+}
+
 pub(crate) async fn message_identity_is_topology_wide_across_projection_partitions(
     scenario: impl ProjectionProtocolScenario,
 ) {

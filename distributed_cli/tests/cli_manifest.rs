@@ -41,6 +41,15 @@ fn distributed(args: &[&str]) -> String {
 fn describe_emits_manifest_json() {
     let json = distributed(&["describe"]);
     let manifest: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(manifest["schema_version"], 2);
+    for inventory in ["commands", "events", "models", "projections"] {
+        assert!(manifest.get(inventory).is_none(), "redundant {inventory}");
+    }
+    // This read-model-only fixture owns models through its Surface, not modules.
+    assert!(!manifest["surfaces"][0]["models"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert!(json.contains("\"schema_version\""), "json: {json}");
     assert!(json.contains("\"orders\""), "json: {json}");
     let framework = manifest["extensions"]
@@ -65,11 +74,11 @@ fn client_manifest_uses_service_surface_export() {
     assert_eq!(manifest["surface"]["name"], "user");
     assert_eq!(
         manifest["schema_fingerprint"],
-        "sha256:8f91d3fc7b6d916241b959f6bacd6228eeb06586e9681739ba3e986b4092e134"
+        "sha256:64007d9696cdd73fdbd3b12133155c53b709970ef2411631d9f66189c3c8fc90"
     );
     assert_eq!(
         manifest["protocol_fingerprint"],
-        "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782"
+        "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b"
     );
     assert_eq!(manifest["models"][0]["id"], "OrderView");
     assert_eq!(manifest["models"][0]["record_revisions"], true);

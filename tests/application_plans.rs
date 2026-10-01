@@ -5,7 +5,7 @@ use distributed::application::{
     CommandTypeSpec, DeploymentPlan, ModelFieldSpec, ModelSpec, Module, MountSelector,
     ProcessIntent, ProcessPreset, ProjectionSpec,
 };
-use distributed::graphql::CommandConsistency;
+use distributed::command::CommandConsistency;
 
 fn portable_command(id: &str, consistency: CommandConsistency) -> CommandSpec {
     let command = CommandSpec::try_new(
@@ -14,6 +14,7 @@ fn portable_command(id: &str, consistency: CommandConsistency) -> CommandSpec {
         CommandTypeSpec {
             name: format!("{id}Input"),
             fields: vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "title".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -25,6 +26,7 @@ fn portable_command(id: &str, consistency: CommandConsistency) -> CommandSpec {
         CommandTypeSpec {
             name: format!("{id}Output"),
             fields: vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -213,12 +215,10 @@ fn atomic_separation_fails_and_eventual_split_succeeds() {
     let collocated = compile_deployment_plan(
         "atomic-local",
         &manifest,
-        [ProcessIntent::new("writer")
-            .unwrap()
-            .mounts([
-                MountSelector::command("todo.force").unwrap(),
-                MountSelector::projector("project_todos_direct").unwrap(),
-            ])],
+        [ProcessIntent::new("writer").unwrap().mounts([
+            MountSelector::command("todo.force").unwrap(),
+            MountSelector::projector("project_todos_direct").unwrap(),
+        ])],
     );
     assert!(collocated.is_ok(), "{collocated:?}");
 }

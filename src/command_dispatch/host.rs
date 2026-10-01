@@ -1,6 +1,7 @@
 //! Causal wait-path host used by GraphQL. Local in-process or HTTP loopback.
 
 use async_trait::async_trait;
+use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::redirect::Policy;
 use serde_json::Value;
 use std::sync::Arc;
@@ -9,13 +10,181 @@ use std::time::Duration;
 use crate::graphql::identity::VerifiedPrincipal;
 use crate::graphql::protocol::ProtocolResponseAccumulator;
 use crate::microsvc::cell_host::{
-    InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
-    CELL_SERVICE_ID_HEADER,
+    InternalHttpSecret, CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_HEADER,
+    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 use crate::microsvc::{
     CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult, Service, Session,
     ROLE_KEY, USER_ID_KEY,
 };
+
+const MAX_TRUSTED_METADATA_HEADERS: usize = 16;
+const MAX_TRUSTED_METADATA_BYTES: usize = 4096;
+
+/// Explicit metadata a trusted native adapter may carry across a cell HTTP
+/// boundary.
+///
+/// A [`Session`] is request input and may contain arbitrary transport keys.
+/// It is intentionally not used to populate this type. Callers must build the
+/// metadata from already-authenticated, canonical facts and pass it through
+/// [`HttpCommandHost::post_cell_wait_path_with_context`]. The host rejects
+/// framework identity, authorization, transport-control, and hop-by-hop
+/// headers before opening the request.
+#[derive(Clone, Debug, Default)]
+pub struct TrustedRequestMetadata {
+    headers: Vec<(HeaderName, HeaderValue)>,
+    bytes: usize,
+}
+
+impl TrustedRequestMetadata {
+    /// Create empty trusted metadata.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build trusted metadata from an explicit application allowlist.
+    ///
+    /// Header names must already be canonical lowercase. Values are limited to
+    /// visible HTTP header bytes and the total set is bounded to keep a native
+    /// adapter from turning the cell boundary into an unbounded side channel.
+    pub fn try_from_pairs<I, K, V>(pairs: I) -> Result<Self, CausalDispatchError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut metadata = Self::new();
+        for (name, value) in pairs {
+            metadata.try_insert(name.as_ref(), value.as_ref())?;
+        }
+        Ok(metadata)
+    }
+
+    /// Add one explicitly configured metadata header.
+    pub fn try_insert(&mut self, name: &str, value: &str) -> Result<(), CausalDispatchError> {
+        if name.is_empty() || name != name.to_ascii_lowercase() {
+            return Err(CausalDispatchError::BadRequest(
+                "trusted metadata header names must be non-empty lowercase ASCII".into(),
+            ));
+        }
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            CausalDispatchError::BadRequest("trusted metadata header name is invalid".into())
+        })?;
+        if is_reserved_trusted_metadata_header(name.as_str()) {
+            return Err(CausalDispatchError::BadRequest(format!(
+                "trusted metadata cannot override reserved header `{}`",
+                name.as_str()
+            )));
+        }
+        if !value
+            .bytes()
+            .all(|byte| (0x20..=0x7e).contains(&byte) && byte != b'\r' && byte != b'\n')
+        {
+            return Err(CausalDispatchError::BadRequest(
+                "trusted metadata header values must contain visible HTTP bytes".into(),
+            ));
+        }
+        let value = HeaderValue::from_str(value).map_err(|_| {
+            CausalDispatchError::BadRequest("trusted metadata header value is invalid".into())
+        })?;
+        if self.headers.iter().any(|(existing, _)| existing == &name) {
+            return Err(CausalDispatchError::BadRequest(format!(
+                "trusted metadata header `{}` is duplicated",
+                name.as_str()
+            )));
+        }
+        if self.headers.len() >= MAX_TRUSTED_METADATA_HEADERS {
+            return Err(CausalDispatchError::BadRequest(format!(
+                "trusted metadata exceeds {} headers",
+                MAX_TRUSTED_METADATA_HEADERS
+            )));
+        }
+        let bytes = name.as_str().len().saturating_add(value.as_bytes().len());
+        if self.bytes.saturating_add(bytes) > MAX_TRUSTED_METADATA_BYTES {
+            return Err(CausalDispatchError::BadRequest(format!(
+                "trusted metadata exceeds {} bytes",
+                MAX_TRUSTED_METADATA_BYTES
+            )));
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.headers.push((name, value));
+        Ok(())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.headers.is_empty()
+    }
+
+    fn apply_to(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (name, value) in &self.headers {
+            request = request.header(name.clone(), value.clone());
+        }
+        request
+    }
+}
+
+fn is_reserved_trusted_metadata_header(name: &str) -> bool {
+    matches!(
+        name,
+        USER_ID_KEY
+            | ROLE_KEY
+            | CELL_CAUSATION_ID_HEADER
+            | CELL_INTERNAL_SECRET_HEADER
+            | CELL_PRINCIPAL_PARTITION_HEADER
+            | CELL_SERVICE_ID_HEADER
+            | "authorization"
+            | "cookie"
+            | "host"
+            | "content-length"
+            | "content-type"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "forwarded"
+            | "x-real-ip"
+            | "traceparent"
+            | "tracestate"
+    ) || name.starts_with("x-forwarded-")
+        || name.starts_with("x-envoy-")
+        || name.starts_with("x-distributed-")
+        || name.starts_with("x-celld-")
+        || name.starts_with("x-cell-")
+}
+
+/// Identity and explicitly trusted metadata used for one internal cell call.
+#[derive(Clone, Debug)]
+pub struct CellRequestContext {
+    service_id: String,
+    principal_partition: String,
+    causation_id: Option<String>,
+    trusted_metadata: TrustedRequestMetadata,
+}
+
+impl CellRequestContext {
+    pub fn new(service_id: impl Into<String>, principal_partition: impl Into<String>) -> Self {
+        Self {
+            service_id: service_id.into(),
+            principal_partition: principal_partition.into(),
+            causation_id: None,
+            trusted_metadata: TrustedRequestMetadata::new(),
+        }
+    }
+
+    pub fn with_causation_id(mut self, causation_id: impl Into<String>) -> Self {
+        self.causation_id = Some(causation_id.into());
+        self
+    }
+
+    pub fn with_trusted_metadata(mut self, metadata: TrustedRequestMetadata) -> Self {
+        self.trusted_metadata = metadata;
+        self
+    }
+}
 
 /// Wait-path command host. GraphQL mutations call this instead of `Service`.
 #[async_trait]
@@ -356,14 +525,56 @@ impl HttpCommandHost {
         service_id: &str,
         principal_partition: &str,
     ) -> Result<(u16, Value), CausalDispatchError> {
+        self.post_cell_wait_path_with_causation(
+            command,
+            command_id,
+            input,
+            session,
+            service_id,
+            principal_partition,
+            None,
+        )
+        .await
+    }
+
+    /// POST a cell wait-path command while carrying the gateway's durable
+    /// causation through the authenticated internal boundary.
+    pub async fn post_cell_wait_path_with_causation(
+        &self,
+        command: &str,
+        command_id: &str,
+        input: Value,
+        session: &Session,
+        service_id: &str,
+        principal_partition: &str,
+        causation_id: Option<&str>,
+    ) -> Result<(u16, Value), CausalDispatchError> {
+        let mut context = CellRequestContext::new(service_id, principal_partition);
+        if let Some(causation_id) = causation_id {
+            context = context.with_causation_id(causation_id);
+        }
+        self.post_cell_wait_path_with_context(command, command_id, input, session, &context)
+            .await
+    }
+
+    /// POST a cell wait-path command with an explicitly authenticated request
+    /// context. Custom metadata is carried only through this internal cell
+    /// path; ordinary public session forwarding remains identity-only.
+    pub async fn post_cell_wait_path_with_context(
+        &self,
+        command: &str,
+        command_id: &str,
+        input: Value,
+        session: &Session,
+        context: &CellRequestContext,
+    ) -> Result<(u16, Value), CausalDispatchError> {
+        if self.internal_secret.is_none() {
+            return Err(CausalDispatchError::Internal(
+                "trusted cell metadata requires an internal HTTP secret".into(),
+            ));
+        }
         let first = self
-            .post_wait_path_inner(
-                command,
-                command_id,
-                input.clone(),
-                session,
-                Some((service_id, principal_partition)),
-            )
+            .post_wait_path_inner(command, command_id, input.clone(), session, Some(context))
             .await;
         if !matches!(&first, Ok((status, _)) if *status >= 500) {
             return first;
@@ -374,14 +585,8 @@ impl HttpCommandHost {
         // producing the response. One replay closes that ambiguous response
         // window without reapplying the aggregate mutation; persistent
         // failures still surface unchanged.
-        self.post_wait_path_inner(
-            command,
-            command_id,
-            input,
-            session,
-            Some((service_id, principal_partition)),
-        )
-        .await
+        self.post_wait_path_inner(command, command_id, input, session, Some(context))
+            .await
     }
 
     async fn post_wait_path_inner(
@@ -390,7 +595,7 @@ impl HttpCommandHost {
         command_id: &str,
         input: Value,
         session: &Session,
-        cell_identity: Option<(&str, &str)>,
+        context: Option<&CellRequestContext>,
     ) -> Result<(u16, Value), CausalDispatchError> {
         let mut request = self.request_json(
             command,
@@ -405,15 +610,22 @@ impl HttpCommandHost {
         if let Some(roles) = session.get(ROLE_KEY) {
             request = request.header(ROLE_KEY, roles);
         }
-        if let Some((service_id, principal_partition)) = cell_identity {
+        if let Some(context) = context {
             if self.internal_secret.is_none() {
                 return Err(CausalDispatchError::Internal(
                     "cell wait-path requires an internal HTTP secret".into(),
                 ));
             }
             request = request
-                .header(CELL_SERVICE_ID_HEADER, service_id)
-                .header(CELL_PRINCIPAL_PARTITION_HEADER, principal_partition);
+                .header(CELL_SERVICE_ID_HEADER, &context.service_id)
+                .header(
+                    CELL_PRINCIPAL_PARTITION_HEADER,
+                    &context.principal_partition,
+                );
+            if let Some(causation_id) = &context.causation_id {
+                request = request.header(CELL_CAUSATION_ID_HEADER, causation_id);
+            }
+            request = context.trusted_metadata.apply_to(request);
         }
         let response = request.send().await.map_err(|err| {
             CausalDispatchError::Internal(format!("wait-path HTTP failed: {err}"))
@@ -519,5 +731,65 @@ mod tests {
 
         session.set(USER_ID_KEY, "alice");
         assert!(validate_principal_session(&session, &principal).is_ok());
+    }
+
+    #[test]
+    fn trusted_metadata_rejects_reserved_headers_and_noncanonical_names() {
+        for name in [
+            "x-user-id",
+            "X-User-Id",
+            "authorization",
+            "host",
+            "content-length",
+            "connection",
+            "x-forwarded-for",
+            CELL_INTERNAL_SECRET_HEADER,
+        ] {
+            assert!(
+                TrustedRequestMetadata::try_from_pairs([(name, "spoofed")]).is_err(),
+                "reserved or noncanonical header `{name}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_metadata_enforces_values_duplicates_and_bounds() {
+        let mut metadata = TrustedRequestMetadata::new();
+        metadata.try_insert("x-source", "trusted").unwrap();
+        assert!(metadata.try_insert("x-source", "again").is_err());
+        assert!(metadata.try_insert("x-control", "line\nfeed").is_err());
+
+        let too_many = (0..=MAX_TRUSTED_METADATA_HEADERS)
+            .map(|index| (format!("x-header-{index}"), "value".to_string()))
+            .collect::<Vec<_>>();
+        assert!(TrustedRequestMetadata::try_from_pairs(too_many).is_err());
+
+        let too_large = TrustedRequestMetadata::try_from_pairs([(
+            "x-large",
+            "x".repeat(MAX_TRUSTED_METADATA_BYTES),
+        )]);
+        assert!(too_large.is_err());
+    }
+
+    #[tokio::test]
+    async fn trusted_metadata_requires_an_internal_cell_host() {
+        let host = HttpCommandHost::new("http://127.0.0.1:1").unwrap();
+        let metadata = TrustedRequestMetadata::try_from_pairs([("x-source", "trusted")]).unwrap();
+        let context =
+            CellRequestContext::new("writer", "partition").with_trusted_metadata(metadata);
+        let result = host
+            .post_cell_wait_path_with_context(
+                "todo.create",
+                "command-1",
+                serde_json::json!({ "id": "todo" }),
+                &Session::new(),
+                &context,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(CausalDispatchError::Internal(message))
+                if message.contains("internal HTTP secret")
+        ));
     }
 }

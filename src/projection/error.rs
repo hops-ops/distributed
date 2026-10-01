@@ -4,6 +4,8 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProjectionProgramError {
+    /// Derived facts are not new authoritative aggregate snapshots.
+    DerivedSourceSnapshot,
     /// A stable name, identifier, field, or storage name was empty.
     EmptyName(&'static str),
     /// A declared version must be non-zero.
@@ -118,6 +120,9 @@ pub enum ProjectionProgramError {
 impl fmt::Display for ProjectionProgramError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DerivedSourceSnapshot => {
+                formatter.write_str("derived facts cannot establish an aggregate source snapshot")
+            }
             Self::EmptyName(kind) => write!(formatter, "{kind} must not be empty"),
             Self::ZeroVersion(kind) => write!(formatter, "{kind} must be non-zero"),
             Self::InvalidBodyFingerprint => formatter.write_str(

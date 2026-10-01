@@ -2,7 +2,7 @@
 
 use super::error::{ApplicationError, ApplicationResult};
 use super::module::Module;
-use crate::graphql::CommandConsistency;
+use crate::command::CommandConsistency;
 use std::collections::BTreeMap;
 
 /// Persistence dialect selected from a database URL.
@@ -21,6 +21,8 @@ pub struct Runtime {
     mounts: Vec<Module>,
     graphql: bool,
     dispatch_routes: BTreeMap<String, String>,
+    #[cfg(feature = "gateway")]
+    gateways: BTreeMap<super::MountSelector, crate::gateway::Gateway>,
 }
 
 impl Runtime {
@@ -52,6 +54,8 @@ impl Runtime {
             mounts: Vec::new(),
             graphql: false,
             dispatch_routes: BTreeMap::new(),
+            #[cfg(feature = "gateway")]
+            gateways: BTreeMap::new(),
         })
     }
 
@@ -67,6 +71,55 @@ impl Runtime {
     pub fn mount(mut self, module: Module) -> Self {
         self.mounts.push(module);
         self
+    }
+
+    /// Select one declared gateway. This stores portable host configuration only;
+    /// the caller instantiates its native/Worker resources after selecting it.
+    #[cfg(feature = "gateway")]
+    pub fn mount_gateway(
+        mut self,
+        application: &super::Application,
+        selector: super::MountSelector,
+        gateway: crate::gateway::Gateway,
+    ) -> ApplicationResult<Self> {
+        let super::MountSelector::Extension { id } = &selector else {
+            return Err(ApplicationError::InvalidSpec(
+                "gateway requires an extension mount".into(),
+            ));
+        };
+        let expected = gateway.application_extension(id.clone())?;
+        if !application.manifest().extensions.contains(&expected) {
+            return Err(ApplicationError::InvalidSpec(
+                "gateway capabilities do not match the application declaration".into(),
+            ));
+        }
+        if self.gateways.insert(selector, gateway).is_some() {
+            return Err(ApplicationError::InvalidSpec(
+                "duplicate gateway mount".into(),
+            ));
+        }
+        Ok(self)
+    }
+
+    /// Only explicitly selected gateways can be bound to a network adapter.
+    #[cfg(feature = "gateway")]
+    pub fn gateway(&self, selector: &super::MountSelector) -> Option<&crate::gateway::Gateway> {
+        self.gateways.get(selector)
+    }
+
+    /// Invoke an adapter/resource factory only when this gateway was selected.
+    #[cfg(feature = "gateway")]
+    pub fn bind_gateway<T, E>(
+        &self,
+        selector: &super::MountSelector,
+        factory: impl FnOnce(&crate::gateway::Gateway) -> Result<T, E>,
+    ) -> Result<Option<T>, E> {
+        self.gateway(selector).map(factory).transpose()
+    }
+
+    #[cfg(feature = "gateway")]
+    pub fn starts_gateway(&self) -> bool {
+        !self.gateways.is_empty()
     }
 
     pub fn graphql(mut self) -> Self {

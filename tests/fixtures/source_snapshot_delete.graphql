@@ -1,0 +1,3 @@
+mutation DeleteSnapshot {
+  delete_source_snapshot_rows_by_pk(id: $input.id)
+}

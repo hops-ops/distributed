@@ -28,7 +28,7 @@ pub trait CausalRepositoryBackend:
     + CommandLedgerStore
     + CausalTransactionalCommit
     + CausalRepositoryIdentity
-    + ProjectionProtocolStore
+    + CausalHostProjections
     + TransactionalCommit
     + Send
     + Sync
@@ -41,12 +41,120 @@ impl<T> CausalRepositoryBackend for T where
         + CommandLedgerStore
         + CausalTransactionalCommit
         + CausalRepositoryIdentity
-        + ProjectionProtocolStore
+        + CausalHostProjections
         + TransactionalCommit
         + Send
         + Sync
         + 'static
 {
+}
+
+pub(crate) trait CausalHostProjections: Send + Sync {
+    #[cfg(feature = "graphql")]
+    fn command_obligation_evidence<'a>(
+        &'a self,
+        _request: &'a crate::projection_protocol::ProjectionObligationEvidenceBatchRequest,
+    ) -> impl std::future::Future<
+        Output = Result<
+            crate::projection_protocol::ProjectionObligationEvidenceBatch,
+            crate::projection_protocol::ProjectionProtocolError,
+        >,
+    > + Send
+           + 'a {
+        async {
+            Err(
+                crate::projection_protocol::ProjectionProtocolError::InvalidBatch(
+                    "command-only cells do not query projection evidence".into(),
+                ),
+            )
+        }
+    }
+
+    #[cfg(feature = "graphql")]
+    fn command_causation_evidence<'a>(
+        &'a self,
+        _request: &'a crate::projection_protocol::ProjectionCausationEvidenceRequest,
+    ) -> impl std::future::Future<
+        Output = Result<
+            crate::projection_protocol::ProjectionCausationEvidenceBatch,
+            crate::projection_protocol::ProjectionProtocolError,
+        >,
+    > + Send
+           + 'a {
+        async {
+            Err(
+                crate::projection_protocol::ProjectionProtocolError::InvalidBatch(
+                    "command-only cells do not query projection evidence".into(),
+                ),
+            )
+        }
+    }
+    /// Bootstrap direct projections only on hosts that own a projection store.
+    /// Command-only hosts reject this operation without inventing query storage.
+    fn __register_direct_projection_models<'a>(
+        &'a self,
+        topology: &'a crate::projection_protocol::ProjectorTopologyId,
+        ownership: &'a [crate::projection_protocol::ProjectionModelOwnership],
+    ) -> impl std::future::Future<
+        Output = Result<(), crate::projection_protocol::ProjectionProtocolError>,
+    > + Send
+           + 'a;
+}
+
+// Concrete query-owning adapters forward only the causal host operations.
+// A queued command-only adapter forwards this smaller capability independently.
+macro_rules! direct_causal_projection_methods {
+    () => {
+        #[cfg(feature = "graphql")]
+        async fn command_obligation_evidence(
+            &self,
+            request: &crate::projection_protocol::ProjectionObligationEvidenceBatchRequest,
+        ) -> Result<
+            crate::projection_protocol::ProjectionObligationEvidenceBatch,
+            crate::projection_protocol::ProjectionProtocolError,
+        > {
+            crate::projection_protocol::ProjectionProtocolStore::projection_obligation_evidence_batch(
+                self, request,
+            ).await
+        }
+
+        #[cfg(feature = "graphql")]
+        async fn command_causation_evidence(
+            &self,
+            request: &crate::projection_protocol::ProjectionCausationEvidenceRequest,
+        ) -> Result<
+            crate::projection_protocol::ProjectionCausationEvidenceBatch,
+            crate::projection_protocol::ProjectionProtocolError,
+        > {
+            crate::projection_protocol::ProjectionProtocolStore::projection_causation_evidence(
+                self, request,
+            ).await
+        }
+
+        async fn __register_direct_projection_models(
+            &self,
+            topology: &crate::projection_protocol::ProjectorTopologyId,
+            ownership: &[crate::projection_protocol::ProjectionModelOwnership],
+        ) -> Result<(), crate::projection_protocol::ProjectionProtocolError> {
+            crate::projection_protocol::ProjectionProtocolStore::register_projection_models(
+                self, topology, ownership,
+            ).await
+        }
+    };
+}
+#[cfg(all(test, feature = "graphql"))]
+pub(crate) use direct_causal_projection_methods;
+
+impl CausalHostProjections for crate::InMemoryRepository {
+    direct_causal_projection_methods!();
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+impl<DB: sqlx::Database> CausalHostProjections for crate::sqlx_repo::repo::SqlxRepository<DB>
+where
+    Self: ProjectionProtocolStore,
+{
+    direct_causal_projection_methods!();
 }
 
 /// Compile-time extraction of the one aggregate repository owned by a typed
@@ -345,6 +453,21 @@ mod tests {
     use super::*;
 
     fn assert_has_outbox_store<T: HasOutboxStore>() {}
+
+    fn assert_causal_backend<T: CausalRepositoryBackend>() {}
+
+    // Keep this generic: a concrete SQL/memory instantiation would also satisfy
+    // ProjectionProtocolStore and conceal an accidental query-store bound.
+    fn assert_queued_causal_backend<R: CausalRepositoryBackend, L: crate::LockManager + 'static>() {
+        assert_causal_backend::<crate::QueuedRepository<R, L>>();
+    }
+
+    #[test]
+    fn causal_capability_resolves_without_a_projection_store() {
+        assert_queued_causal_backend::<crate::cell_host::CellStreamStore, crate::InMemoryLockManager>(
+        );
+        assert_queued_causal_backend::<crate::InMemoryRepository, crate::InMemoryLockManager>();
+    }
 
     #[test]
     fn has_outbox_store_resolves_through_repo_wrappers() {

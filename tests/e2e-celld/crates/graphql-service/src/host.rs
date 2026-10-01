@@ -27,6 +27,8 @@ const BUS_GROUP: &str = "e2e-celld";
 
 pub struct HostOptions {
     pub bind: String,
+    pub public_origin: String,
+    pub ui_origin: String,
     pub identity: IdentityConfig,
     pub celld_url: String,
     pub nats_url: String,
@@ -100,6 +102,8 @@ async fn run_postgres(
         service,
         host,
         &options.bind,
+        &options.public_origin,
+        &options.ui_origin,
         queue_relay,
         options.internal_secret,
     )

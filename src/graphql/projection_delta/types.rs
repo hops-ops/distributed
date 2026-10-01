@@ -99,7 +99,9 @@ pub struct ProjectionDeltaIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProjectionDeltaSurfaceIdentity {
-    Role { name: String },
+    Role {
+        name: String,
+    },
     Application {
         name: String,
         eligible_roles: Vec<String>,
@@ -461,13 +463,11 @@ impl From<&crate::graphql::client_manifest::ClientSurfaceIdentity>
                 name,
                 eligible_roles,
                 schema_roles,
-            } => {
-                Self::Application {
-                    name: name.clone(),
-                    eligible_roles: eligible_roles.clone(),
-                    schema_roles: schema_roles.clone(),
-                }
-            }
+            } => Self::Application {
+                name: name.clone(),
+                eligible_roles: eligible_roles.clone(),
+                schema_roles: schema_roles.clone(),
+            },
         }
     }
 }
