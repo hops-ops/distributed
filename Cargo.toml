@@ -110,4 +110,4 @@ tokio-stream = "0.1"
 tokio-tungstenite = "0.30"
 tonic = { version = "0.14", default-features = false, features = ["router", "transport", "codegen"] }
 rsa = "0.9"
-rand = "0.8"
+rand = "0.10"
