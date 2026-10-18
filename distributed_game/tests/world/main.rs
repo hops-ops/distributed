@@ -333,6 +333,35 @@ async fn cross_host_handoff_follows_redirect_and_ticket_is_single_use() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redirects_use_the_configured_public_url() {
+    let (_a, b, _dir) = two_hosts(
+        || {
+            base_config().with_redirect_url(|host, zone| {
+                format!("wss://game.example/hosts/{}/zones/{zone}", host.id)
+            })
+        },
+        &[("realm.east", "A")],
+        realm_factory(&[], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut ws = connect(&b.addr.zone_url("realm.east")).await;
+    hello(&mut ws, &ticket("ana", "realm.east", "pub-1"), "", "").await;
+    let mut mirror = ClientMirror::new();
+    match next_control(&mut ws, &mut mirror).await {
+        Some(ServerMessage::Redirect { zone_id, url }) => {
+            assert_eq!(zone_id, "realm.east");
+            assert_eq!(url, "wss://game.example/hosts/A/zones/realm.east");
+        }
+        other => panic!("expected Redirect, got {other:?}"),
+    }
+    // Per-host advertised URL in the directory (no mapping configured).
+    let proxied = HostAddr::new("A", "10.0.0.2:2567").with_ws_url("wss://game.example/a/");
+    assert_eq!(proxied.zone_url("z"), "wss://game.example/a/zones/z");
+    assert_eq!(proxied.admin_url, "http://10.0.0.2:2567");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refused_handoff_returns_to_source_with_carried_state() {
     let (a, b, _dir) = two_hosts(
         base_config,

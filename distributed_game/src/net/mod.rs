@@ -205,6 +205,11 @@ pub struct ServerConfig {
     pub admin_secret: Option<String>,
     /// Peer (host-to-host) request timeout.
     pub peer_timeout: Duration,
+    /// Public URL clients are redirected to for a zone owned by another
+    /// host (`None` = the directory's [`HostAddr::zone_url`]). For
+    /// deployments behind a proxy whose URLs differ from the hosts' raw
+    /// addresses; see [`ServerConfig::with_redirect_url`].
+    pub redirect_url: Option<RedirectUrl>,
     /// Fact commits each zone's worker may run at once (default 1 = strict
     /// emission order). Above 1, facts of one principal stay sequential and
     /// different principals overlap (see [`crate::facts`]). Read by
@@ -212,7 +217,32 @@ pub struct ServerConfig {
     pub max_concurrent_commits: usize,
 }
 
+/// `(owning host, zone id) -> Redirect URL`.
+pub type RedirectUrlFn = dyn Fn(&HostAddr, &str) -> String + Send + Sync;
+
+/// Maps (owning host, zone id) to the URL sent in `Redirect`.
+#[derive(Clone)]
+pub struct RedirectUrl(pub Arc<RedirectUrlFn>);
+
+impl std::fmt::Debug for RedirectUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedirectUrl(..)")
+    }
+}
+
 impl ServerConfig {
+    /// Build `Redirect` URLs with `url(owner, zone_id)`, e.g.
+    /// `|host, zone| format!("wss://game.example/{}/zones/{zone}", host.id)`.
+    /// Alternatively advertise per-host public URLs in the directory with
+    /// [`HostAddr::with_ws_url`].
+    pub fn with_redirect_url(
+        mut self,
+        url: impl Fn(&HostAddr, &str) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.redirect_url = Some(RedirectUrl(Arc::new(url)));
+        self
+    }
+
     /// Admit join tickets with `verifier` instead of `ticket_key`.
     pub fn with_ticket_verifier(mut self, verifier: impl TicketVerifier) -> Self {
         self.ticket_verifier = Some(SharedTicketVerifier::new(verifier));
@@ -241,6 +271,7 @@ impl ServerConfig {
             admin_secret: None,
             peer_timeout: Duration::from_secs(3),
             max_concurrent_commits: 1,
+            redirect_url: None,
         }
     }
 }
@@ -1511,9 +1542,13 @@ where
     let first_route = route_zone(&inner, &zone_id);
     match &first_route {
         ZoneRoute::Remote(host) => {
+            let url = match &inner.config.redirect_url {
+                Some(map) => (map.0)(host, &zone_id),
+                None => host.zone_url(&zone_id),
+            };
             let redirect = ServerMessage::Redirect {
                 zone_id: zone_id.clone(),
-                url: host.zone_url(&zone_id),
+                url,
             }
             .encode(&())
             .expect("redirect encodes");

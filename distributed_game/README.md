@@ -187,7 +187,7 @@ principals commit concurrently; settlements arrive in completion order.
 
 | Piece | Purpose |
 |---|---|
-| `ZoneDirectory` (`StaticDirectory`, `HashRing`) | zone → owning `HostAddr`. `HashRing` uses virtual nodes; adding/removing one of N hosts moves ~1/N of the zones. A Hello for a zone owned elsewhere gets `Redirect(zone, url)`. |
+| `ZoneDirectory` (`StaticDirectory`, `HashRing`) | zone → owning `HostAddr`. `HashRing` uses virtual nodes; adding/removing one of N hosts moves ~1/N of the zones. A Hello for a zone owned elsewhere gets `Redirect(zone, url)`; `url` is the owner's `HostAddr::ws_url` (advertise a proxied public URL with `HostAddr::with_ws_url`) or `ServerConfig::with_redirect_url(\|host, zone\| …)`. |
 | `ZoneOwnership` (`LocalOwnership`, `FencedLeaseOwnership<S: LeaseStore>`) | every activation acquires a fenced claim (`host#activation`) and renews it; a failed renewal disposes the zone **without** saving. Two hosts never run the same zone. |
 | `ZoneStateStore` (`MemoryZoneStateStore`, `SqliteZoneStateStore`) | hibernation snapshots, written under the claim's fencing token (stale writers get `StateError::Stale`, counted in `distributed_game_hibernation_saves_total{outcome="stale"}` and logged to stderr, never silently dropped). `LocalOwnership` seeds its tokens from the Unix time (µs) at creation, so a restarted host still outranks the snapshots its previous run saved. |
 | `ZoneTopology` (`DottedTopology` default: `eldoria.port.docks` → `eldoria.port` → `eldoria`) | parent links for tier-up events. |
