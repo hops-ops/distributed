@@ -9,6 +9,8 @@ guests and lets any page change the network simulation.
 | Demo | Run | Mechanic it demonstrates |
 |---|---|---|
 | **Arena** | `./run.sh arena` | Fixed 30 Hz tick / 20 Hz patches, binary deltas, interest management (view ring, drones pop in/out), client prediction + reconciliation (shared Rust/TS movement step, bit-exact), interpolation of remote entities, live latency/jitter/loss |
+| **Mob Pit** | `./run.sh mobpit` | Authoritative melee combat vs. 12 telegraphing mobs; kills are **non-blocking durable facts** committed exactly once into per-player native SQLite cells (`cell-sqlite`); "slow storage" toggle (tick stays flat, pending facts climb); `kill -9` crash recovery |
+| **Leaderboard** | `./run.sh leaderboard` | Same server as Mob Pit: kills/XP sorted-set boards (in-memory or Redis) fed fire-and-forget with idempotent apply keys, top 10 pushed live, your rank + neighbours, rebuild from the cells' event history |
 
 `./run.sh smoke` runs every demo's smoke tests; `./run.sh list` lists demos.
 
@@ -69,18 +71,136 @@ examples/game/
     src/main.rs              `game-demos <demo>` subcommands
     src/common/              shared: Demo trait, run/spawn, dev routes, guests, JSON events
     src/arena/               Arena zone + movement.rs (twin of client movement.ts)
-    tests/                   arena_smoke.rs (bots, dev routes), movement_fixture.rs
+    src/mobpit/              Mob Pit zone, Crawler cell aggregate, fact sink, leaderboards, dev routes
+    tests/                   arena_smoke.rs (bots, dev routes), movement_fixture.rs,
+                             mobpit_smoke.rs (facts, slow storage, kill -9 recovery, boards)
   client/                    Vite + TypeScript + Babylon.js 9.30 (multi-page)
     index.html, <demo>/index.html
     src/shared/              hud.ts, input.ts, scene.ts, dev-api.ts, events.ts, style.css
     src/arena/               client.ts (headless), main.ts (Babylon), movement.ts
-    tests/                   movement-parity, arena-headless (+ helpers/demo-server.mjs)
+    src/mobpit/              client.ts (headless + /dev/mobpit API), main.ts (Babylon), style.css
+    src/leaderboard/         main.ts (DOM page over the observer connection), style.css
+    tests/                   movement-parity, arena-headless, mobpit-headless,
+                             leaderboard-headless (+ helpers/demo-server.mjs, helpers/mobpit.mjs)
 ```
 
 The server crate is excluded from the root workspace (`Cargo.toml`
 `exclude`), depends on `../../../distributed_game` by path and keeps its own
 `Cargo.lock`; the client depends on the SDK via `file:../../../js` (the built
 `dist`).
+
+## Mob Pit
+
+```sh
+examples/game/run.sh mobpit        # → http://localhost:5173/mobpit/
+examples/game/run.sh leaderboard   # same server → http://localhost:5173/leaderboard/
+```
+
+Controls: WASD / stick move (the Arena's predicted step, same floor and
+pillars), **Space** attack (120° cone, 2.2 m), **E** dash, **L** slow
+storage. Mobs wander near home, aggro within 7 m, chase, stop and show a red
+**telegraph ring** that fills for 0.8 s, then hit everyone inside it. Grunts
+(green, 10 XP), brutes (purple, 25 XP) and the elite (red, 60 XP) respawn 4 s
+after dying. Level `n` starts at `40·(n−1)²` XP.
+
+**One kill, end to end** (`server/src/mobpit/`):
+
+1. `zone.rs`, tick N: the mob's HP reaches 0. The zone calls
+   `ctx.emit_fact_for(killer, Fact::new("kill:{boot}:{zone}:m{id}:{gen}",
+   "crawler.record_kill", {mob, tier, name}))` and broadcasts a `kill` event.
+   `emit_fact_for` only enqueues: the host binds the killer's **verified
+   ticket principal**; the zone never awaits storage. Backpressure (256
+   unsettled facts) parks facts in a backlog retried next tick.
+2. The zone's fact worker (`GameServer::with_fact_sink`) runs
+   `store::CrawlerFactSink`: optional artificial latency, then
+   `CellFactSink::commit` into the killer's own cell
+   (`$MOBPIT_DATA_DIR/Crawler%3A{principal}.sqlite3`, `AggregateCell::from_store`
+   over `CellStreamStore::open_sqlite`). The command id is
+   `sha256(service ‖ fact key)`, so the cell's command ledger turns any repeat
+   of the key into a replay of the stored receipt.
+3. `crawler.rs`: `crawler.record_kill` takes the principal from the trusted
+   session (`x-user-id`) and **decides the XP from the tier**; the input has
+   no identity or XP field and unknown fields are rejected. Event, ledger
+   receipt and snapshot commit in one SQLite transaction (`synchronous=FULL`).
+4. Tick N+k: `Zone::on_fact_settled` sends the killer `saved` (with
+   `waitedMs`) and `profile`; the popup turns from "saving…" to
+   "+XP saved ✓". The sink also hands the kill to the leaderboard
+   (fire-and-forget).
+
+The read path: on join the zone asks a background task to load the player's
+cell and sends `profile` (`source: "cell"`) a few ticks later.
+
+**Slow storage.** The *Slow storage* toggle (`POST /dev/mobpit/storage
+{latencyMs: 1500}`) delays every commit by 1.5 s. Facts commit in order per
+zone, so pending climbs when you kill faster than one per 1.5 s; the top-right
+graph shows pending (orange) rising and settling while the tick interval
+(blue, `pit` entity `tickMs`/`tickMaxMs`) stays at ~33 ms and the HUD's tick
+work stays in microseconds. This is the fix for a world that froze while
+awaiting durable commits: the tick only enqueues.
+
+**Crash recovery** (`kill -9`):
+
+```sh
+examples/game/run.sh mobpit                      # play, get some kills, toggle slow storage, kill more
+kill -9 $(lsof -t -iTCP:2567 -sTCP:LISTEN)       # in another terminal, mid-fight
+examples/game/run.sh mobpit                      # restart (same .data/mobpit), reload the page
+```
+
+The ticket secret is persisted in the data dir (`dev-ticket-secret`), so the
+page's guest token still maps to the same principal, and the profile comes
+back from the cell. What survives:
+
+- **Settled facts** (you saw "saved ✓"): durable. The commit was acknowledged
+  only after the SQLite transaction (event + ledger receipt) was fsynced.
+- **Facts in flight** at the crash: each is either fully committed (the
+  transaction finished; you just never saw the settlement) or not at all
+  (rolled back with the WAL) — never half-applied, never twice. The zone's
+  in-memory state (mob HP, positions, the fact queue) dies with the process,
+  so an uncommitted kill is lost like any other unsaved world state; there is
+  no zone-side outbox (see `distributed_game` README, *Facts on dispose*).
+- **Retries and replays** of the same key (the worker's retry after a
+  timeout, or a re-emitted fact) replay the stored receipt through the
+  ledger: `replayed: true`, nothing credited twice. Fact keys contain a
+  per-process `boot` id because zone ticks and mob generations restart at 0.
+
+`tests/mobpit_smoke.rs` proves it with the real binary: bots fight, storage is
+made slow, the server gets `SIGKILL` with facts in flight, restarts on the
+same directory; then `settled ≤ durable kills ≤ settled + in flight`, the
+board (rebuilt at boot) equals the cells, and re-committing a pre-crash fact
+(same key and input) against the files returns the original receipt with
+`replayed: true` and unchanged kills.
+
+## Leaderboard
+
+`server/src/mobpit/board.rs`. Kills project into two boards,
+`mobpit.kills` (+1) and `mobpit.xp` (+xp), through `LeaderboardProjector`.
+
+- **Store**: `InMemoryLeaderboard` by default; `RedisLeaderboard` when
+  `REDIS_URL` is set (`docker compose up -d redis` at the repo root, then
+  `REDIS_URL=redis://127.0.0.1:6379 examples/game/run.sh leaderboard`).
+- **Fire-and-forget**: after a commit the sink calls
+  `BackgroundLeaderboard::submit`, which never awaits the store; a full queue
+  or a Redis outage drops (and counts) the update.
+- **Idempotent**: each kill becomes a `DomainEventOccurrence`
+  (`capture_external`, source `mobpit.crawler-cell` / `Crawler:{principal}` /
+  event sequence / `mob_killed`). The id is identical whether it comes from
+  the live receipt, a ledger replay of the fact, or the cell's event history,
+  and the store applies `"{id}#{change}"` at most once per board.
+- **Rebuild** (button, `POST /dev/mobpit/leaderboard/rebuild`, and at every
+  server start): read every cell's durable event stream, project it into the
+  staging boards, promote atomically, then compare each cell's kills/XP with
+  its scores (`matchesCells`) and the top 10 with the previous one
+  (`identicalTop`). Dropped live updates are healed here.
+- **Push**: the zone broadcasts the top-10 snapshot (`board` event) whenever
+  it changes; the leaderboard page joins the pit as an **observer** (no
+  avatar) and renders those pushes; on each push it reads your rank and
+  neighbours from `GET /dev/mobpit/leaderboard?member=…` (ranks are public;
+  the page knows its principal from its own ticket).
+
+Dev routes (`--dev` only, none takes an identity or a reward):
+`GET|POST /dev/mobpit/storage`, `GET /dev/mobpit/stats` (sink counters,
+pending, recent commits), `GET /dev/mobpit/crawlers` (every cell on disk),
+`GET /dev/mobpit/leaderboard[?member=]`, `POST /dev/mobpit/leaderboard/rebuild`.
 
 ## Adding a demo
 
@@ -92,6 +212,9 @@ The server crate is excluded from the root workspace (`Cargo.toml`
    - Display names: `guests.name(&ctx.player(p)?.principal)` in `on_join`.
    - Low-rate events: `common::send_json_event` / `broadcast_json_event`.
    - Signed quantities that must rest at zero: `FieldType::quant_centered`.
+   - State shared by the zones and demo-specific dev routes (a durable
+     store, a leaderboard): build both in `common::spawn_with` /
+     `common::run_with` (see `mobpit::spawn` / `mobpit::run`).
 2. **Smoke test** — `server/tests/<demo>_smoke.rs`: `common::spawn::<YourDemo>`
    on `127.0.0.1:0` with `DemoOptions::dev(secret)` and
    `distributed_game::bots::run_bots` (custom `encoder` for your input).

@@ -3,12 +3,15 @@
 #
 #   ./run.sh arena          build what is needed, start the arena server
 #                           (dev routes on) + Vite, print the URL
+#   ./run.sh mobpit         same for Mob Pit; `leaderboard` = same server, board page
 #   ./run.sh smoke          every demo's smoke tests (Rust bots + headless JS)
 #   ./run.sh list           demos this script knows
 #
 # Env: GAME_DEMOS_PORT (server, default 2567), GAME_DEMOS_CLIENT_PORT (Vite,
 # default 5173), DG_NET_LATENCY_MS / DG_NET_JITTER_MS / DG_NET_LOSS (initial
-# server NetSim; the HUD sliders change it live).
+# server NetSim; the HUD sliders change it live), MOBPIT_DATA_DIR (Mob Pit /
+# Leaderboard cells, default examples/game/.data/mobpit), REDIS_URL (Redis
+# leaderboard instead of in-memory).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,7 +19,8 @@ REPO="$(cd "$HERE/../.." && pwd)"
 SERVER="$HERE/server"
 CLIENT="$HERE/client"
 BIN="$SERVER/target/debug/game-demos"
-DEMOS=(arena)
+DEMOS=(arena mobpit leaderboard)
+export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
 
 log() { printf '\033[1;36m[demos]\033[0m %s\n' "$*"; }
 
@@ -92,7 +96,7 @@ smoke() {
 case "${1:-}" in
 	smoke) smoke ;;
 	list) printf '%s\n' "${DEMOS[@]}" ;;
-	"" | -h | --help | help) sed -n '2,13p' "$0" ;;
+	"" | -h | --help | help) sed -n '2,14p' "$0" ;;
 	*)
 		if [[ " ${DEMOS[*]} " == *" $1 "* ]]; then
 			run_demo "$1"
