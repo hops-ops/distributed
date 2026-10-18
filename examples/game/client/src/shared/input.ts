@@ -80,10 +80,53 @@ export class InputSampler {
 	}
 }
 
-function firstGamepad(): Gamepad | undefined {
+/**
+ * The gamepad to read: the first connected pad with the W3C `standard`
+ * layout, else the first connected pad (whose left stick is still axes 0/1
+ * on every layout we know). Slots can be sparse, so scan them all.
+ */
+export function activeGamepad(): Gamepad | undefined {
 	const pads = globalThis.navigator?.getGamepads?.() ?? [];
-	for (const pad of pads) if (pad?.connected) return pad;
-	return undefined;
+	let fallback: Gamepad | undefined;
+	for (const pad of pads) {
+		if (!pad?.connected) continue;
+		if (pad.mapping === 'standard') return pad;
+		fallback ??= pad;
+	}
+	return fallback;
+}
+
+function firstGamepad(): Gamepad | undefined {
+	return activeGamepad();
+}
+
+const neutralSeen = new WeakMap<Gamepad, boolean>();
+
+/**
+ * Right stick (+x right, +y up) of a `standard` pad, with deadzone. Other
+ * layouts return zero: their axes 2/3 may be triggers that rest at -1 and
+ * would read as a stick held hard over. The stick is also ignored until it
+ * has been seen at rest once.
+ */
+export function rightStick(deadzone = DEADZONE): { x: number; y: number } {
+	const pad = activeGamepad();
+	if (pad === undefined || pad.mapping !== 'standard') return { x: 0, y: 0 };
+	const x = pad.axes[2] ?? 0;
+	const y = -(pad.axes[3] ?? 0);
+	if (!neutralSeen.get(pad)) {
+		if (Math.hypot(x, y) > deadzone) return { x: 0, y: 0 };
+		neutralSeen.set(pad, true);
+	}
+	return { x: Math.abs(x) > deadzone ? x : 0, y: Math.abs(y) > deadzone ? y : 0 };
+}
+
+/** One-line description of the active pad for HUD diagnostics. */
+export function describeGamepad(): string {
+	const pad = activeGamepad();
+	if (pad === undefined) return 'none (press a button)';
+	const f = (v: number | undefined) => (v ?? 0).toFixed(2);
+	const name = pad.id.length > 28 ? `${pad.id.slice(0, 28)}…` : pad.id;
+	return `${name} · ${pad.mapping || 'non-standard'} · L ${f(pad.axes[0])},${f(pad.axes[1])} R ${f(pad.axes[2])},${f(pad.axes[3])}`;
 }
 
 function isTyping(e: KeyboardEvent): boolean {

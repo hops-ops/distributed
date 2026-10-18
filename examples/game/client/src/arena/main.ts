@@ -19,7 +19,7 @@ import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
-import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
+import { cameraRelative, describeGamepad, InputSampler, toAxis } from '../shared/input.ts';
 import { Minimap, type MinimapDot } from '../shared/minimap.ts';
 import { createRing, createStage, material, toWorld } from '../shared/scene.ts';
 import { createArenaClient, DEFAULT_ZONE, KIND } from './client.ts';
@@ -233,6 +233,7 @@ stage.onFrame((now, dtMs) => {
 	hud.row('Corrections', `${corrections} (last ${lastCorrection.toFixed(3)} m)`);
 	hud.row('Dash', cd > 0 ? `cooldown ${((cd / DASH_COOLDOWN) * 1.5).toFixed(1)} s` : 'ready');
 	hud.row('Stick', `${lastInput.mx}, ${lastInput.my}`);
+	hud.row('Gamepad', describeGamepad());
 });
 
 declare global {

@@ -22,6 +22,7 @@ import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh';
 import type { LinesMesh } from '@babylonjs/core/Meshes/linesMesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { Scene } from '@babylonjs/core/scene';
+import { rightStick } from './input.ts';
 // Side effect: scene picking (pointer events) needs Ray.
 import '@babylonjs/core/Culling/ray';
 // Side effect: Mesh.prototype.createInstance.
@@ -52,19 +53,6 @@ const LOOK_SPEED = 0.0025;
 /** Gamepad right-stick look rates (rad/s) and deadzone. */
 const STICK_YAW = 2.6;
 const STICK_PITCH = 1.6;
-const STICK_DEADZONE = 0.15;
-
-/** Right stick of the first connected gamepad: +x right, +y up. */
-function rightStick(): { x: number; y: number } {
-	const pads = globalThis.navigator?.getGamepads?.() ?? [];
-	for (const pad of pads) {
-		if (!pad?.connected) continue;
-		const x = pad.axes[2] ?? 0;
-		const y = -(pad.axes[3] ?? 0);
-		return { x: Math.abs(x) > STICK_DEADZONE ? x : 0, y: Math.abs(y) > STICK_DEADZONE ? y : 0 };
-	}
-	return { x: 0, y: 0 };
-}
 
 export type StageOptions = Readonly<{
 	/** Floor half extent (m). */
