@@ -80,6 +80,7 @@ export {
 	type GameCloseReason,
 	type GameConnectionEvents,
 	type GameConnectionOptions,
+	type GameConnectionStats,
 	type GameConnectionState,
 	type GameReconnectOptions,
 	type GameReloadRequest,

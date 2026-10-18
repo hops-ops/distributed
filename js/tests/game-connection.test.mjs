@@ -147,6 +147,12 @@ test('typed events surface Event/Freeze/Resume/Error and inputs are sequenced', 
 	server.send(delta({ creates: [avatar(1, 3)] }));
 	assert.equal(conn.state, 'open', 'post-join errors are advisory');
 	assert.deepEqual(seen, ['Freeze', 'Resume', 'Event', 'Error', 'Delta']);
+	const stats = conn.stats;
+	assert.equal(stats.deltasIn, 1);
+	assert.ok(stats.deltaBytesIn > 0 && stats.deltaBytesIn < stats.bytesIn);
+	assert.equal(stats.messagesIn, 7, 'Welcome, Pong, Freeze, Resume, Event, Error, Delta');
+	assert.equal(stats.messagesOut, 4, 'Hello, Ping and two inputs');
+	assert.ok(stats.bytesOut > 0);
 	assert.deepEqual(
 		server.inputs().map((i) => [i.seq, i.clientTick, [...i.payload]]),
 		[

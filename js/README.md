@@ -612,6 +612,8 @@ back to the source zone, then a fresh ticket. `Kick(RELOAD)` and handshake
 `encodeInput(input, ctx)` receives the interpolation delay and view tick for
 server-side lag compensation (`replica.interpolationDelayMs`,
 `client.inputContext()`).
+`connection.stats` exposes cumulative bytes/messages in and out (Delta bytes
+separately) for bandwidth HUDs.
 
 ## Protocol and security boundaries
 

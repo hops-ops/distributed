@@ -143,6 +143,19 @@ export type GameCloseInfo = Readonly<{
 	message?: string;
 }>;
 
+/** Cumulative transport counters of one connection (all sockets). */
+export type GameConnectionStats = Readonly<{
+	/** Server → client bytes / messages. */
+	bytesIn: number;
+	messagesIn: number;
+	/** Bytes / count of Delta messages (replication traffic). */
+	deltaBytesIn: number;
+	deltasIn: number;
+	/** Client → server bytes / messages. */
+	bytesOut: number;
+	messagesOut: number;
+}>;
+
 export type GameWelcomeInfo = Readonly<{
 	/** True when this Welcome resumed the session with a reconnect token. */
 	resumed: boolean;
@@ -210,6 +223,7 @@ export class GameConnection {
 	#terminal: GameCloseInfo | undefined;
 	#seq = 0;
 	#frozen = false;
+	#stats = { bytesIn: 0, messagesIn: 0, deltaBytesIn: 0, deltasIn: 0, bytesOut: 0, messagesOut: 0 };
 	#connectWaiters: { resolve: (w: WelcomeMessage) => void; reject: (e: unknown) => void }[] = [];
 
 	constructor(options: GameConnectionOptions) {
@@ -280,6 +294,14 @@ export class GameConnection {
 	/** Last input sequence number sent on the current session. */
 	get lastSeq(): number {
 		return this.#seq;
+	}
+
+	/**
+	 * Cumulative byte/message counters (HUDs, bandwidth graphs). Sample it
+	 * periodically and diff for rates.
+	 */
+	get stats(): GameConnectionStats {
+		return { ...this.#stats };
 	}
 
 	get scheduler(): GameScheduler {
@@ -406,7 +428,10 @@ export class GameConnection {
 		const socket = this.#attempt?.socket;
 		if (socket === undefined) return;
 		try {
-			socket.send(encodeClientMessage(message));
+			const bytes = encodeClientMessage(message);
+			socket.send(bytes);
+			this.#stats.bytesOut += bytes.byteLength;
+			this.#stats.messagesOut += 1;
 		} catch {
 			// A failing send surfaces as a close; reconnect logic handles it.
 		}
@@ -467,6 +492,8 @@ export class GameConnection {
 			if (this.#attempt !== attempt) return;
 			const bytes = toBytes(event.data);
 			if (bytes === undefined) return;
+			this.#stats.bytesIn += bytes.byteLength;
+			this.#stats.messagesIn += 1;
 			this.#receive(attempt, bytes);
 		};
 		socket.onerror = () => undefined;
@@ -493,6 +520,8 @@ export class GameConnection {
 				this.#onWelcome(attempt, message);
 				break;
 			case 'Delta':
+				this.#stats.deltaBytesIn += bytes.byteLength;
+				this.#stats.deltasIn += 1;
 				this.#emitter.emit('delta', message);
 				break;
 			case 'Event':
