@@ -34,6 +34,10 @@
       "types": "./dist/react/index.d.ts",
       "import": "./dist/react/index.js"
     },
+    "./game": {
+      "types": "./dist/game/index.d.ts",
+      "import": "./dist/game/index.js"
+    },
     "./package.json": "./package.json",
     "./replica/lazy": {
       "types": "./dist/replica/lazy.d.ts",
