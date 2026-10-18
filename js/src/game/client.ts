@@ -162,9 +162,11 @@ export class GameClient<TInput = unknown> {
 	#authority: Zone | undefined;
 	#controlledOverride: number | undefined;
 	#closed = false;
+	#contentVersion: string;
 
 	constructor(options: GameClientOptions<TInput>) {
 		this.#options = options;
+		this.#contentVersion = options.contentVersion ?? '';
 		this.#scheduler = options.scheduler ?? defaultScheduler;
 		this.#emitter = new Emitter(options.onListenerError);
 		this.#predictor =
@@ -176,6 +178,28 @@ export class GameClient<TInput = unknown> {
 		listener: (...args: GameClientEvents[K]) => void
 	): () => void {
 		return this.#emitter.on(type, listener);
+	}
+
+	/**
+	 * Content version this client runs: `options.contentVersion`, then the
+	 * version the authoritative connection presented after a reload, or the
+	 * one set with `setContentVersion`. Every new connection (handoff
+	 * target, observer, rejoin) presents it in Hello.
+	 */
+	get contentVersion(): string {
+		return this.#contentVersion;
+	}
+
+	/**
+	 * The app patched its content live to `version` (no reload round-trip):
+	 * present it on every new connection and on reconnects of the current
+	 * ones.
+	 */
+	setContentVersion(version: string): void {
+		this.#contentVersion = version;
+		for (const zone of [...this.#zones.values(), ...this.#retired.values(), ...this.#priors]) {
+			zone.connection.setContentVersion(version);
+		}
 	}
 
 	/** The authoritative zone, if any. */
@@ -323,7 +347,7 @@ export class GameClient<TInput = unknown> {
 			role: role === 'authority' ? 'player' : 'observer',
 			ticket: role === 'authority' ? o.ticket : observerTicket,
 			initialTicket,
-			contentVersion: o.contentVersion,
+			contentVersion: this.#contentVersion,
 			capabilities: o.capabilities,
 			socket: o.socket,
 			scheduler: this.#scheduler,
@@ -372,6 +396,11 @@ export class GameClient<TInput = unknown> {
 		const c = zone.connection;
 		zone.offs.push(
 			c.on('welcome', (welcome) => {
+				// A reload (Kick(RELOAD) / VERSION_MISMATCH) changed what this
+				// connection presents: later connections must present it too.
+				if (zone === this.#authority && c.contentVersion !== this.#contentVersion) {
+					this.setContentVersion(c.contentVersion);
+				}
 				zone.replica.reset(welcome.schema, c.serverNow());
 				zone.replica.interpolationDelayMs = this.interpolationDelay(zone);
 				zone.firstDeltaSeen = false;

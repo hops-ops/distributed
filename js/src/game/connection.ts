@@ -402,6 +402,16 @@ export class GameConnection {
 	}
 
 	/**
+	 * Content version presented in the next Hello (reconnects, reloads).
+	 * For clients that patch content live (e.g. after a Resume with a new
+	 * version) without a reload round-trip; the server learns it on the
+	 * next Hello.
+	 */
+	setContentVersion(contentVersion: string): void {
+		this.#contentVersion = contentVersion;
+	}
+
+	/**
 	 * Continue after a content reload (state `reload-required`): sends the
 	 * new `contentVersion` in Hello, with the reconnect token while the grace
 	 * window lasts, else with a fresh ticket.
