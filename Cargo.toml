@@ -57,7 +57,10 @@ nats = ["dep:async-nats", "dep:futures", "dep:tokio"]
 rabbitmq = ["dep:lapin", "dep:futures", "dep:tokio"]
 kafka = ["dep:rdkafka", "dep:tokio"]
 # Redis sorted-set leaderboards and the Redis Streams `MessagePublisher`.
-redis = ["dep:redis", "dep:tokio"]
+redis = ["dep:redis", "dep:tokio", "leaderboard-background"]
+# `leaderboard::BackgroundLeaderboard` (fire-and-forget updates on a Tokio
+# task) without Redis, e.g. over `InMemoryLeaderboard`.
+leaderboard-background = ["dep:tokio"]
 workers-rs = ["dep:worker"]
 # Native durable aggregate cells: one synchronous SQLite file per cell, same
 # SQL store and one-transaction-per-command contract as Durable Object cells.

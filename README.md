@@ -704,7 +704,8 @@ network servers.
 | `nats` | No | `NatsBus` (NATS JetStream source/publisher). |
 | `rabbitmq` | No | `RabbitBus` (RabbitMQ source/publisher). |
 | `kafka` | No | `KafkaBus` (Kafka source/publisher). |
-| `redis` | No | `leaderboard::RedisLeaderboard` (sorted-set leaderboards, `BackgroundLeaderboard`) and `bus::RedisStreamPublisher` (Redis Streams `XADD`, id dedupe). The `leaderboard` module and `InMemoryLeaderboard` are always available. |
+| `redis` | No | `leaderboard::RedisLeaderboard` (sorted-set leaderboards) and `bus::RedisStreamPublisher` (Redis Streams `XADD`, id dedupe); implies `leaderboard-background`. The `leaderboard` module and `InMemoryLeaderboard` are always available. |
+| `leaderboard-background` | No | `leaderboard::BackgroundLeaderboard` (fire-and-forget updates on a Tokio task) over any `LeaderboardStore`, e.g. `InMemoryLeaderboard`, without pulling in Redis. |
 
 > The `InMemoryBus`, `PostgresBus`, and `SqliteBus` need no separate broker
 > feature. SQL-backed bus support comes from the matching `postgres` or `sqlite`

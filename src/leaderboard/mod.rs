@@ -40,9 +40,11 @@
 //!    permanent. Because gameplay commands only commit to the event store and
 //!    outbox, a Redis blip delays the board but never blocks a command.
 //! 2. **In-process (best effort).** Hand committed occurrences to a
-//!    `BackgroundLeaderboard`, which applies them on a background task and
-//!    drops (and counts) updates when its queue is full or Redis stays down.
-//!    Dropped updates are healed by the next rebuild.
+//!    `BackgroundLeaderboard` (feature `leaderboard-background`, implied by
+//!    `redis`; needs Tokio, works over any store, e.g. the in-memory one),
+//!    which applies them on a background task and drops (and counts)
+//!    updates when its queue is full or the store stays down. Dropped
+//!    updates are healed by the next rebuild.
 //!
 //! # Idempotency
 //!
@@ -75,7 +77,7 @@
 mod in_memory;
 mod projector;
 
-#[cfg(feature = "redis")]
+#[cfg(feature = "leaderboard-background")]
 mod background;
 #[cfg(feature = "redis")]
 mod redis;
@@ -90,7 +92,7 @@ pub use projector::{
     ProjectionReport,
 };
 
-#[cfg(feature = "redis")]
+#[cfg(feature = "leaderboard-background")]
 pub use background::{BackgroundLeaderboard, BackgroundLeaderboardOptions, BackgroundStats};
 #[cfg(feature = "redis")]
 pub use redis::{RedisLeaderboard, DEFAULT_REDIS_LEADERBOARD_PREFIX};
