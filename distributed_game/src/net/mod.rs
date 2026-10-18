@@ -78,7 +78,8 @@ use crate::protocol::{error, kick, ClientMessage, Notice, ServerMessage, PROTOCO
 use crate::rng::ZoneRng;
 use crate::world::{
     BarrierMode, ChildEvent, DottedTopology, FreezeState, HostAddr, LocalOwnership, OwnershipError,
-    StoredZoneState, ZoneClaim, ZoneDirectory, ZoneOwnership, ZoneStateStore, ZoneTopology,
+    StateError, StoredZoneState, ZoneClaim, ZoneDirectory, ZoneOwnership, ZoneStateStore,
+    ZoneTopology,
 };
 use crate::zone::{ClientId, TicketClaims, Tier, Zone};
 
@@ -986,6 +987,9 @@ async fn run_zone<Z>(
     };
     let mut host_config = inner.config.host.clone();
     host_config.content_version = world.version.clone();
+    // Fencing tokens grow across activations and restarts: a restart-safe
+    // epoch for fact keys (`Ctx::boot_epoch`).
+    host_config.boot_epoch = claim.token;
     let token_inner = inner.clone();
     let issuer_inner = inner.clone();
     let generation = claim.token;
@@ -1142,8 +1146,21 @@ async fn run_zone<Z>(
                     content_version,
                     state,
                 };
-                // A stale token means a newer owner saved already: drop ours.
-                let _ = tokio::task::spawn_blocking(move || store.save(&id, &stored)).await;
+                // A stale token means a newer owner saved already: ours is
+                // dropped, but never silently (metrics + stderr).
+                let saved = tokio::task::spawn_blocking(move || store.save(&id, &stored)).await;
+                let outcome = match &saved {
+                    Ok(Ok(())) => "saved",
+                    Ok(Err(StateError::Stale { .. })) => "stale",
+                    _ => "error",
+                };
+                inner.metrics.record_hibernation_save(outcome);
+                if outcome != "saved" {
+                    eprintln!(
+                        "distributed_game: hibernation snapshot of zone {zone_id} (token {}) not saved: {saved:?}",
+                        claim.token
+                    );
+                }
             }
             inner.ownership.release(&claim).await;
             drop(host);

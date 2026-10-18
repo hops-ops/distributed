@@ -550,6 +550,84 @@ async fn dormant_zone_hibernates_to_sqlite_and_restores() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
+    let path = std::env::temp_dir().join(format!(
+        "dg-world-restart-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let url_of = |addr: &str| format!("ws://{addr}/zones/realm.keep");
+    let mut epochs = Vec::new();
+    let mut count = 0u32;
+    for run in 1..=2 {
+        // A fresh process: new store handle, new (default) LocalOwnership.
+        let store = Arc::new(SqliteZoneStateStore::open(&path).unwrap());
+        let mut config = base_config();
+        config.host.idle_tick_rate = None;
+        config.host.dormant_after = Duration::from_millis(50);
+        config.hibernate_after = Some(Duration::from_millis(100));
+        let (listener, addr) = listen().await;
+        let factory = realm_factory(&[], &[]);
+        let server =
+            GameServer::<Realm>::new(config, move |z| factory(z)).with_state_store(store.clone());
+        serve(&server, listener);
+        // Two activations per run, so the first run's last token exceeds
+        // the restarted run's first token unless tokens survive restarts.
+        for cycle in 1..=2u64 {
+            let nonce = format!("r{run}-{cycle}");
+            let mut ana = join_url(&url_of(&addr), &ticket("ana", "realm.keep", &nonce), "")
+                .await
+                .unwrap();
+            input(&mut ana, 1, CMD_COUNT).await;
+            count += 1;
+            let expected = count;
+            eventually("count", || {
+                let server = server.clone();
+                async move {
+                    server.inspect("realm.keep", |h| h.zone().counter).await == Some(expected)
+                }
+            })
+            .await;
+            epochs.push(
+                server
+                    .inspect("realm.keep", |h| h.config().boot_epoch)
+                    .await
+                    .unwrap(),
+            );
+            send(&mut ana.ws, ClientMessage::Leave).await;
+            eventually("hibernation", || {
+                let server = server.clone();
+                async move { !server.is_active("realm.keep") }
+            })
+            .await;
+            assert_eq!(server.metrics().hibernation_saves("stale"), 0, "run {run}");
+            assert_eq!(
+                server.metrics().hibernation_saves("saved"),
+                cycle,
+                "run {run}"
+            );
+            let saved = store.load("realm.keep").unwrap().expect("snapshot");
+            assert_eq!(saved.state, count.to_le_bytes(), "run {run} saved");
+        }
+        assert!(server
+            .metrics()
+            .render()
+            .contains("distributed_game_hibernation_saves_total{outcome=\"saved\"} 2"));
+        server.shutdown();
+    }
+    assert!(
+        epochs.windows(2).all(|w| w[1] > w[0]),
+        "epochs grow: {epochs:?}"
+    );
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fenced_lease_keeps_zone_on_one_host_and_loss_stops_it() {
     let clock = distributed::ManualClock::starting_now();
     let leases = InMemoryLeaseStore::with_clock(clock.clone());

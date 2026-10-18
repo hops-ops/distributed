@@ -67,16 +67,44 @@ pub trait ZoneOwnership: Send + Sync + 'static {
 }
 
 /// Process-local ownership without TTLs (single host / tests). Tokens are
-/// monotonic per zone and survive release.
-#[derive(Debug, Default)]
+/// monotonic per zone, survive release and **keep increasing across process
+/// restarts**: the first token of every zone is the instance's epoch (Unix
+/// time in microseconds at creation), so a restarted host's claims outrank
+/// snapshots its previous run saved in a durable
+/// [`ZoneStateStore`](super::ZoneStateStore).
+#[derive(Debug)]
 pub struct LocalOwnership {
+    epoch: u64,
     claims: Mutex<HashMap<String, (Option<String>, u64)>>,
 }
 
+impl Default for LocalOwnership {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalOwnership {
-    /// Empty.
+    /// Empty, epoch = now (Unix microseconds).
     pub fn new() -> Self {
-        Self::default()
+        let micros = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(1, |d| d.as_micros() as u64);
+        Self::with_epoch(micros)
+    }
+
+    /// Empty with an explicit epoch (first token of every zone; must exceed
+    /// every token a previous run used with the same state store).
+    pub fn with_epoch(epoch: u64) -> Self {
+        Self {
+            epoch: epoch.max(1),
+            claims: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// First token handed out for each zone.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 
@@ -97,7 +125,7 @@ impl ZoneOwnership for LocalOwnership {
                 Some(_) => Ok(entry.1),
                 None => {
                     entry.0 = Some(holder.to_string());
-                    entry.1 += 1;
+                    entry.1 = (entry.1 + 1).max(self.epoch);
                     Ok(entry.1)
                 }
             }
@@ -270,5 +298,18 @@ mod tests {
         assert_eq!(block(own.renew(&a, ttl)), Err(OwnershipError::Lost));
         let b = block(own.acquire("z", "h2#1", ttl)).unwrap();
         assert!(b.token > a.token);
+    }
+
+    #[test]
+    fn local_tokens_outrank_a_previous_process() {
+        let ttl = Duration::from_secs(1);
+        let before = LocalOwnership::with_epoch(100);
+        let old = block(before.acquire("z", "h#1", ttl)).unwrap();
+        assert_eq!(old.token, 100);
+        // A restarted process starts from a later epoch.
+        let after = LocalOwnership::new();
+        let new = block(after.acquire("z", "h#1", ttl)).unwrap();
+        assert!(new.token > old.token);
+        assert_eq!(new.token, after.epoch());
     }
 }

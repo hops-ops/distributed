@@ -35,6 +35,27 @@ use crate::stamp::FactStamp;
 /// Boxed `Send` future used by [`FactSink`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Restart-safe idempotency key: `"{prefix}:{zone}:{epoch}:{part}:…"`.
+///
+/// `epoch` must change between activations and grow across restarts
+/// ([`Ctx::boot_epoch`](crate::Ctx::boot_epoch)). Keys derived only from the
+/// tick or an entity generation **collide after a restart** — both counters
+/// start again from zero — and an idempotent sink then treats the new
+/// outcome as a replay of the old one (silently dropping it).
+///
+/// ```
+/// use distributed_game::facts::fact_key;
+/// assert_eq!(fact_key("kill", "pit-1", 7, &[&"mob-3", &42]), "kill:pit-1:7:mob-3:42");
+/// ```
+pub fn fact_key(prefix: &str, zone: &str, epoch: u64, parts: &[&dyn std::fmt::Display]) -> String {
+    use std::fmt::Write as _;
+    let mut key = format!("{prefix}:{zone}:{epoch}");
+    for part in parts {
+        let _ = write!(key, ":{part}");
+    }
+    key
+}
+
 /// A durable outcome to commit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fact {
@@ -46,7 +67,9 @@ pub struct Fact {
 }
 
 impl Fact {
-    /// `key` must be unique per logical outcome (e.g. `"kill:{zone}:{tick}:{enemy}"`);
+    /// `key` must be unique per logical outcome **across restarts**: build it
+    /// with [`Ctx::fact_key`](crate::Ctx::fact_key) / [`fact_key`] (zone +
+    /// boot epoch + your parts), never from the tick alone;
     /// `command` names the durable command; `input` is its payload.
     pub fn new(key: impl Into<String>, command: impl Into<String>, input: Value) -> Self {
         Self {

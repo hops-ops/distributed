@@ -375,7 +375,7 @@ pub struct Recording {
 /// File decode failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingError {
-    /// Not a `DGR1` file.
+    /// Not a `DGR2` file.
     BadMagic,
     /// Malformed content.
     Decode(String),
@@ -551,6 +551,7 @@ fn put_config(w: &mut Writer, c: &HostConfig) {
         StalePolicy::SafeRoom { roam: false } => 1,
         StalePolicy::SafeRoom { roam: true } => 2,
     });
+    put_u64(w, c.boot_epoch);
 }
 
 fn put_claims(w: &mut Writer, claims: &TicketClaims) {
@@ -622,12 +623,13 @@ fn get_config(r: &mut Reader<'_>) -> Result<HostConfig, RecordingError> {
             1 => StalePolicy::SafeRoom { roam: false },
             _ => StalePolicy::SafeRoom { roam: true },
         },
+        boot_epoch: get_u64(r)?,
     })
 }
 
 impl Recording {
     /// Compact binary encoding:
-    /// `"DGR1" ‖ zone_id ‖ config ‖ created_at ‖ fact_capacity? ‖ zone_config ‖
+    /// `"DGR2" ‖ zone_id ‖ config ‖ created_at ‖ fact_capacity? ‖ zone_config ‖
     /// varuint(event count) ‖ events`. Integers are LEB128 varints,
     /// durations are nanosecond varints, clock readings are delta-coded
     /// against the previous event, hashes are 8 raw bytes.
@@ -1003,6 +1005,8 @@ impl<Z: Zone> Recorder<Z> {
                 token
             });
         host.set_tick_hashing(true);
+        // The resolved boot epoch, so replayed fact keys match.
+        let config = host.config().clone();
         Self {
             host,
             clock,

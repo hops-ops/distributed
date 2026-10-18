@@ -36,6 +36,7 @@
 //! | `distributed_game_zone_delta_deferred_total` | counter | zone |
 //! | `distributed_game_zone_facts_pending` | gauge | zone |
 //! | `distributed_game_zone_facts_settled_total` | counter | zone, outcome |
+//! | `distributed_game_hibernation_saves_total` | counter | outcome (`saved`, `stale`, `error`) |
 
 use crate::facts::FactOutcome;
 use crate::host::{AdvanceReport, ZoneHost};
@@ -160,7 +161,12 @@ struct State {
     zones: BTreeMap<String, ZoneSeries>,
     labeled: usize,
     other: Counters,
+    /// Server-wide (zones are forgotten when they hibernate).
+    hibernation_saves: BTreeMap<&'static str, u64>,
 }
+
+/// Hibernation snapshot save outcome label values (fixed set).
+pub const HIBERNATION_OUTCOMES: [&str; 3] = ["saved", "stale", "error"];
 
 impl State {
     fn zone(&mut self, zone: &str, max: usize) -> &mut ZoneSeries {
@@ -277,6 +283,24 @@ impl GameMetrics {
             .inputs
             .entry(label)
             .or_insert(0) += 1;
+    }
+
+    /// Record a hibernation snapshot save: `"saved"`, `"stale"` (rejected by
+    /// the fenced store: a newer owner saved, or tokens went backwards) or
+    /// `"error"` (backend failure). Other labels are ignored.
+    pub fn record_hibernation_save(&self, outcome: &str) {
+        if let Some(label) = HIBERNATION_OUTCOMES.iter().find(|l| **l == outcome) {
+            *self.lock().hibernation_saves.entry(label).or_insert(0) += 1;
+        }
+    }
+
+    /// Hibernation saves recorded with `outcome`.
+    pub fn hibernation_saves(&self, outcome: &str) -> u64 {
+        self.lock()
+            .hibernation_saves
+            .get(outcome)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// A zone stopped: drop its series and free its label slot.
@@ -464,6 +488,19 @@ impl GameMetrics {
                     escape(zone)
                 );
             }
+        }
+        header(
+            &mut out,
+            "hibernation_saves_total",
+            "counter",
+            "Hibernation snapshot saves by outcome (stale = rejected by the fenced store).",
+        );
+        for label in HIBERNATION_OUTCOMES {
+            let v = state.hibernation_saves.get(label).copied().unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "distributed_game_hibernation_saves_total{{outcome=\"{label}\"}} {v}"
+            );
         }
         out
     }

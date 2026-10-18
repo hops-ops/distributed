@@ -77,7 +77,8 @@ impl MobPitWorld {
         }))
     }
 
-    /// Random id of this server process (part of every fact key).
+    /// Random id of this server process (shown by clients to spot restarts;
+    /// fact keys use `Ctx::fact_key` / the boot epoch).
     pub fn boot(&self) -> &str {
         &self.boot
     }

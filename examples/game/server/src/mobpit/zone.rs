@@ -19,10 +19,11 @@
 //! with a new generation.
 //!
 //! A kill emits a fact **without awaiting storage**:
-//! `Fact::new("kill:{boot}:{zone}:{mob}:{generation}", "crawler.record_kill",
+//! `Fact::new(ctx.fact_key("kill", &[mob, generation]), "crawler.record_kill",
 //! {mob, tier, name})` via `ctx.emit_fact_for(killer)` — the host binds the
-//! killer's verified principal. `boot` is random per server process, so keys
-//! never collide with an earlier run's facts (zone ticks restart at 0). The
+//! killer's verified principal. The key is `kill:{zone}:{boot_epoch}:m{mob}:
+//! {generation}`: the boot epoch grows across restarts, so keys never collide
+//! with an earlier run's facts (generations and ticks restart at 0). The
 //! settlement arrives in [`Zone::on_fact_settled`] on a later tick and is
 //! pushed to the killer as [`EVENT_SAVED`] + [`EVENT_PROFILE`].
 
@@ -266,12 +267,7 @@ impl MobPit {
     fn emit_kill(&mut self, ctx: &mut Ctx<'_, Self>, killer: PlayerId, mob: usize) {
         let m = &self.mobs[mob];
         let zone = ctx.zone_id().to_string();
-        let key = format!(
-            "kill:{}:{zone}:m{}:{}",
-            self.world.boot(),
-            m.id,
-            m.generation
-        );
+        let key = ctx.fact_key("kill", &[&format_args!("m{}", m.id), &m.generation]);
         let (x, y, tier, id) = (m.x, m.y, m.tier, m.id);
         let Some(player) = self.players.get(&killer) else {
             return;

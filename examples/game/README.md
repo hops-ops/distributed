@@ -160,7 +160,7 @@ after dying. Level `n` starts at `40·(n−1)²` XP.
 **One kill, end to end** (`server/src/mobpit/`):
 
 1. `zone.rs`, tick N: the mob's HP reaches 0. The zone calls
-   `ctx.emit_fact_for(killer, Fact::new("kill:{boot}:{zone}:m{id}:{gen}",
+   `ctx.emit_fact_for(killer, Fact::new(ctx.fact_key("kill", &[m{id}, gen]),
    "crawler.record_kill", {mob, tier, name}))` and broadcasts a `kill` event.
    `emit_fact_for` only enqueues: the host binds the killer's **verified
    ticket principal**; the zone never awaits storage. Backpressure (256
@@ -214,8 +214,10 @@ back from the cell. What survives:
   no zone-side outbox (see `distributed_game` README, *Facts on dispose*).
 - **Retries and replays** of the same key (the worker's retry after a
   timeout, or a re-emitted fact) replay the stored receipt through the
-  ledger: `replayed: true`, nothing credited twice. Fact keys contain a
-  per-process `boot` id because zone ticks and mob generations restart at 0.
+  ledger: `replayed: true`, nothing credited twice. Fact keys
+  (`kill:{zone}:{boot_epoch}:m{id}:{gen}`) contain the activation's boot
+  epoch (`Ctx::boot_epoch`, grows across restarts) because zone ticks and
+  mob generations restart at 0.
 
 `tests/mobpit_smoke.rs` proves it with the real binary: bots fight, storage is
 made slow, the server gets `SIGKILL` with facts in flight, restarts on the

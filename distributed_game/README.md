@@ -92,8 +92,20 @@ server.serve(tokio::net::TcpListener::bind("0.0.0.0:2567").await?, shutdown_sign
 Zones never await storage. Emit a fact during a tick:
 
 ```rust,ignore
-ctx.emit_fact_for(player, Fact::new(format!("kill:{zone}:{tick}:{enemy}"), "hero.credit_xp", json!({"amount": 25})))?;
+let key = ctx.fact_key("kill", &[&enemy_id, &enemy_generation]); // "kill:{zone}:{boot_epoch}:…"
+ctx.emit_fact_for(player, Fact::new(key, "hero.credit_xp", json!({"amount": 25})))?;
 ```
+
+> **Warning — restart-safe keys.** Ticks, entity ids and generations all
+> restart from zero when a process restarts (or a zone is re-activated from
+> a snapshot). A key derived only from them — `format!("kill:{zone}:{tick}")`
+> — **collides with an earlier run's key**, and an idempotent sink then
+> treats the new outcome as a replay of the old one: the XP is silently
+> never credited. Always include `ctx.boot_epoch()` (unique per activation,
+> increasing across restarts; the `net` server uses the activation's fencing
+> token, a bare `ZoneHost` Unix microseconds, or `HostConfig::boot_epoch`)
+> — `ctx.fact_key(prefix, parts)` / `fact_key(prefix, zone, epoch, parts)`
+> do it for you.
 
 The host binds the principal from the player's **verified ticket** and
 stamps zone/tick/content version. A `FactSink` commits facts on a worker
@@ -169,7 +181,7 @@ double-crediting. A custom sink needs only crate-root imports:
 |---|---|
 | `ZoneDirectory` (`StaticDirectory`, `HashRing`) | zone → owning `HostAddr`. `HashRing` uses virtual nodes; adding/removing one of N hosts moves ~1/N of the zones. A Hello for a zone owned elsewhere gets `Redirect(zone, url)`. |
 | `ZoneOwnership` (`LocalOwnership`, `FencedLeaseOwnership<S: LeaseStore>`) | every activation acquires a fenced claim (`host#activation`) and renews it; a failed renewal disposes the zone **without** saving. Two hosts never run the same zone. |
-| `ZoneStateStore` (`MemoryZoneStateStore`, `SqliteZoneStateStore`) | hibernation snapshots, written under the claim's fencing token (stale writers get `StateError::Stale`). |
+| `ZoneStateStore` (`MemoryZoneStateStore`, `SqliteZoneStateStore`) | hibernation snapshots, written under the claim's fencing token (stale writers get `StateError::Stale`, counted in `distributed_game_hibernation_saves_total{outcome="stale"}` and logged to stderr, never silently dropped). `LocalOwnership` seeds its tokens from the Unix time (µs) at creation, so a restarted host still outranks the snapshots its previous run saved. |
 | `ZoneTopology` (`DottedTopology` default: `eldoria.port.docks` → `eldoria.port` → `eldoria`) | parent links for tier-up events. |
 
 **Activate on demand / hibernate.** `GameServer` creates a zone on first

@@ -56,8 +56,9 @@ pub use clock::{Clock, ManualClock, SystemClock};
 #[cfg(feature = "runtime")]
 pub use facts::spawn_fact_worker;
 pub use facts::{
-    fact_channel, BoxFuture, EmitError, Fact, FactError, FactFeed, FactOutcome, FactQueue,
-    FactReceipt, FactSettlement, FactSink, MemoryFactSink, RetryPolicy, SettlementScript,
+    fact_channel, fact_key, BoxFuture, EmitError, Fact, FactError, FactFeed, FactOutcome,
+    FactQueue, FactReceipt, FactSettlement, FactSink, MemoryFactSink, RetryPolicy,
+    SettlementScript,
 };
 pub use handoff::{HandoffError, HandoffRequest, Transfer};
 pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};

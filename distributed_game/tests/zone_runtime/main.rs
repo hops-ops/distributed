@@ -566,3 +566,31 @@ fn same_principal_replaces_previous_connection() {
     assert!(out.contains(&Outbound::Close { client: a.client }));
     assert_eq!(h.zone().log, vec!["create", "join:alice"]);
 }
+
+#[test]
+fn boot_epoch_defaults_to_wall_clock_and_can_be_pinned() {
+    let clock = ManualClock::new();
+    let default = host(HostConfig::default(), &clock, ArenaConfig::default());
+    assert!(
+        default.config().boot_epoch > 1_600_000_000_000_000,
+        "unix micros"
+    );
+    let pinned = host(
+        HostConfig {
+            boot_epoch: 42,
+            ..HostConfig::default()
+        },
+        &clock,
+        ArenaConfig::default(),
+    );
+    assert_eq!(pinned.config().boot_epoch, 42);
+    assert_eq!(
+        distributed_game::fact_key(
+            "kill",
+            pinned.zone_id(),
+            pinned.config().boot_epoch,
+            &[&7, &"m"]
+        ),
+        "kill:z1:42:7:m"
+    );
+}

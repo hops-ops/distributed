@@ -85,6 +85,12 @@ pub struct HostConfig {
     /// Admission of clients whose content version differs from
     /// `content_version` (see [`StalePolicy`]).
     pub stale_policy: StalePolicy,
+    /// Epoch of this activation of the zone ([`Ctx::boot_epoch`]): must
+    /// differ between activations and grow across restarts so fact keys
+    /// built from it never collide with an earlier run's. `0` (default) =
+    /// Unix time in microseconds when the host is created. The `net` server
+    /// sets it to the activation's fencing token.
+    pub boot_epoch: u64,
 }
 
 impl Default for HostConfig {
@@ -106,6 +112,7 @@ impl Default for HostConfig {
             world_seed: 0,
             rewind: RewindConfig::default(),
             stale_policy: StalePolicy::Strict,
+            boot_epoch: 0,
         }
     }
 }
@@ -320,6 +327,28 @@ impl<Z: Zone> Ctx<'_, Z> {
     /// Content version.
     pub fn content_version(&self) -> &str {
         &self.core.config.content_version
+    }
+
+    /// Epoch of this zone activation ([`HostConfig::boot_epoch`]): unique
+    /// per activation and increasing across restarts and hibernation.
+    /// Tick counts and entity generations restart with the process, so a
+    /// fact key built only from them **collides after a restart** (and the
+    /// sink replays the old commit instead of recording the new outcome);
+    /// include this epoch, e.g. via [`fact_key`](Self::fact_key).
+    pub fn boot_epoch(&self) -> u64 {
+        self.core.config.boot_epoch
+    }
+
+    /// Restart-safe fact idempotency key:
+    /// `"{prefix}:{zone}:{boot_epoch}:{part}:{part}…"` (see
+    /// [`fact_key`](crate::facts::fact_key)).
+    pub fn fact_key(&self, prefix: &str, parts: &[&dyn std::fmt::Display]) -> String {
+        crate::facts::fact_key(
+            prefix,
+            &self.core.zone_id,
+            self.core.config.boot_epoch,
+            parts,
+        )
     }
 
     /// The zone's deterministic RNG.
@@ -589,6 +618,10 @@ impl<Z: Zone> ZoneHost<Z> {
     ) -> Self {
         let zone_id = zone_id.into();
         let now = clock.now();
+        let mut config = config;
+        if config.boot_epoch == 0 {
+            config.boot_epoch = unix_micros();
+        }
         let mut core = Core {
             rng: ZoneRng::for_zone(config.world_seed, &zone_id),
             zone_id,
@@ -1622,6 +1655,13 @@ impl<Z: Zone> ZoneHost<Z> {
         report.tick_hashes.extend(pending.tick_hashes);
         report
     }
+}
+
+fn unix_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_micros() as u64)
+        .max(1)
 }
 
 pub(crate) fn default_token() -> String {
