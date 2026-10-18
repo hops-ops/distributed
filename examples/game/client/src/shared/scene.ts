@@ -1,12 +1,15 @@
 /**
  * Babylon.js stage shared by the demos: engine + scene + light, a gridded
- * floor, a third-person follow camera, DOM name labels and helpers.
+ * floor, a third-person follow camera with an optional first-person view
+ * (click to lock the pointer, mouse to look), DOM name labels and helpers.
  *
  * Coordinates: the server's 2D plane (x, y) maps to Babylon (x, 0, z = y),
  * Y up. Use `toWorld(x, y, height)`.
  */
 // Deep imports keep the bundle small (the package root pulls in everything).
 import { ArcRotateCamera } from '@babylonjs/core/Cameras/arcRotateCamera';
+import type { Camera } from '@babylonjs/core/Cameras/camera';
+import { FreeCamera } from '@babylonjs/core/Cameras/freeCamera';
 import { Engine } from '@babylonjs/core/Engines/engine';
 import { DirectionalLight } from '@babylonjs/core/Lights/directionalLight';
 import { HemisphericLight } from '@babylonjs/core/Lights/hemisphericLight';
@@ -26,13 +29,23 @@ export type Stage = Readonly<{
 	scene: Scene;
 	camera: ArcRotateCamera;
 	labels: LabelLayer;
+	/** Current view: orbiting third person, or first person at the followed position. */
+	view(): CameraView;
+	/** Switch view; first person keeps the current facing direction. */
+	setView(view: CameraView): void;
 	/** Ground-plane direction the camera looks along (game x/y), for camera-relative input. */
 	cameraForward(): { x: number; y: number };
-	/** Ease the camera target toward a game position. */
+	/** Ease the camera target toward a game position (first person: place the eye there). */
 	follow(x: number, y: number, dtMs: number): void;
 	/** Register a per-frame callback (after input, before render). */
 	onFrame(callback: (now: number, dtMs: number) => void): void;
 }>;
+
+export type CameraView = 'third' | 'first';
+
+/** First-person eye height (m) and mouse-look sensitivity (rad per pixel). */
+const EYE_HEIGHT = 1.6;
+const LOOK_SPEED = 0.0025;
 
 export type StageOptions = Readonly<{
 	/** Floor half extent (m). */
@@ -73,9 +86,30 @@ export function createStage(canvas: HTMLCanvasElement, options: StageOptions): S
 	// Arrow keys move the player, not the camera.
 	camera.inputs.removeByType('ArcRotateCameraKeyboardMoveInput');
 
+	// First person: a free camera with no built-in inputs; pointer lock +
+	// mouse movement drive yaw/pitch, the follow target places the eye.
+	const eye = new FreeCamera('eye', new Vector3(0, EYE_HEIGHT, 0), scene);
+	eye.inputs.clear();
+	eye.minZ = 0.05;
+	eye.fov = 1.2;
+	let view: CameraView = 'third';
+	let yaw = 0;
+	let pitch = 0;
+	canvas.addEventListener('click', () => {
+		if (view === 'first' && document.pointerLockElement !== canvas) void canvas.requestPointerLock?.();
+	});
+	document.addEventListener('mousemove', (e) => {
+		if (view !== 'first' || document.pointerLockElement !== canvas) return;
+		yaw += e.movementX * LOOK_SPEED;
+		pitch = Math.max(-1.3, Math.min(1.3, pitch + e.movementY * LOOK_SPEED));
+		eye.rotation.set(pitch, yaw, 0);
+	});
+	const forward = () =>
+		view === 'first' ? { x: Math.sin(yaw), y: Math.cos(yaw) } : { x: -Math.cos(camera.alpha), y: -Math.sin(camera.alpha) };
+
 	createFloor(scene, options.half, options.gridStep ?? 1);
 
-	const labels = new LabelLayer(canvas, scene, camera);
+	const labels = new LabelLayer(canvas, scene);
 	const frameCallbacks: ((now: number, dtMs: number) => void)[] = [];
 	let last = performance.now();
 	engine.runRenderLoop(() => {
@@ -93,10 +127,32 @@ export function createStage(canvas: HTMLCanvasElement, options: StageOptions): S
 		scene,
 		camera,
 		labels,
-		cameraForward() {
-			return { x: -Math.cos(camera.alpha), y: -Math.sin(camera.alpha) };
+		view: () => view,
+		setView(next) {
+			if (next === view) return;
+			const f = forward();
+			view = next;
+			if (next === 'first') {
+				yaw = Math.atan2(f.x, f.y);
+				pitch = 0;
+				eye.rotation.set(pitch, yaw, 0);
+				camera.detachControl();
+				scene.activeCamera = eye;
+			} else {
+				if (document.pointerLockElement === canvas) document.exitPointerLock();
+				camera.alpha = Math.atan2(-f.y, -f.x);
+				camera.attachControl(canvas, true);
+				scene.activeCamera = camera;
+			}
 		},
+		cameraForward: forward,
 		follow(x, y, dtMs) {
+			if (view === 'first') {
+				eye.position.set(x, EYE_HEIGHT, y);
+				// Keep the orbit camera centred so switching back is seamless.
+				camera.setTarget(new Vector3(x, 0, y));
+				return;
+			}
 			const k = 1 - Math.exp(-dtMs / 120);
 			const t = camera.target;
 			camera.setTarget(new Vector3(t.x + (x - t.x) * k, 0, t.z + (y - t.z) * k));
@@ -167,11 +223,9 @@ export class LabelLayer {
 	readonly #root: HTMLDivElement;
 	readonly #labels = new Map<string, { el: HTMLDivElement; mesh: AbstractMesh; offset: number }>();
 	readonly #scene: Scene;
-	readonly #camera: ArcRotateCamera;
 
-	constructor(canvas: HTMLCanvasElement, scene: Scene, camera: ArcRotateCamera) {
+	constructor(canvas: HTMLCanvasElement, scene: Scene) {
 		this.#scene = scene;
-		this.#camera = camera;
 		this.#root = document.createElement('div');
 		this.#root.className = 'labels';
 		canvas.parentElement?.appendChild(this.#root);
@@ -202,7 +256,9 @@ export class LabelLayer {
 		const width = engine.getRenderWidth();
 		const height = engine.getRenderHeight();
 		const scale = engine.getHardwareScalingLevel();
-		const viewport = this.#camera.viewport.toGlobal(width, height);
+		const camera: Camera | null = this.#scene.activeCamera;
+		if (camera === null) return;
+		const viewport = camera.viewport.toGlobal(width, height);
 		const transform = this.#scene.getTransformMatrix();
 		for (const { el, mesh, offset } of this.#labels.values()) {
 			const world = mesh.getAbsolutePosition().add(new Vector3(0, offset, 0));

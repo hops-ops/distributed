@@ -54,12 +54,13 @@ client.on('correction', (c) => {
 
 const hud = new Hud({
 	title: 'Arena',
-	hint: 'WASD / stick to move, Space / A to dash. P: prediction, G: ghost. Drag to orbit.',
+	hint: 'WASD / stick to move, Space / A to dash. P: prediction, G: ghost, V: first person (click to look). Drag to orbit.',
 	client,
 	devApi: api
 });
 hud.toggle('Client prediction', true, (on) => client.setPredictionEnabled(on), 'p');
 hud.toggle('Server ghost', true, (on) => (ghostOn = on), 'g');
+hud.toggle('First-person view', false, (on) => stage.setView(on ? 'first' : 'third'), 'v');
 
 // ---- meshes ----
 const mats = {
@@ -187,11 +188,13 @@ stage.onFrame((now, dtMs) => {
 			const outside = !mine && distance > viewRadius;
 			if (!mine) (visual.mesh as Mesh).material = outside ? mats.otherFar : mats.other;
 			const text = mine ? `${label} (you)` : outside ? `${label} · outside view` : label;
-			stage.labels.set(entity.key, visual.mesh as Mesh, text, 1.4, mine ? 'me' : '');
+			// First person: the camera is the own capsule, so hide it and its label.
+			if (mine && stage.view() === 'first') stage.labels.delete(entity.key);
+			else stage.labels.set(entity.key, visual.mesh as Mesh, text, 1.4, mine ? 'me' : '');
 			if (mine) me = { x, y };
 			dots.push({ x, y, color: mine ? COLORS.me : COLORS.other, size: mine ? 4 : 3.5 });
 		}
-		visual.mesh.setEnabled(!entity.stale || visual.kind === KIND.pillar);
+		visual.mesh.setEnabled((!entity.stale || visual.kind === KIND.pillar) && !(mine && stage.view() === 'first'));
 	}
 	for (const [key, visual] of visuals) {
 		if (seen.has(key)) continue;
@@ -201,8 +204,15 @@ stage.onFrame((now, dtMs) => {
 	}
 
 	const authoritative = client.predictor?.authoritative();
-	ghost.setEnabled(ghostOn && authoritative !== undefined);
-	if (authoritative !== undefined) ghost.position.copyFrom(toWorld(num({ fields: authoritative }, 'x'), num({ fields: authoritative }, 'y'), 0.9));
+	let ghostVisible = ghostOn && authoritative !== undefined;
+	if (authoritative !== undefined) {
+		const gx = num({ fields: authoritative }, 'x');
+		const gy = num({ fields: authoritative }, 'y');
+		ghost.position.copyFrom(toWorld(gx, gy, 0.9));
+		// First person: the eye sits inside the ghost; show it only once it lags visibly.
+		if (stage.view() === 'first' && me !== undefined && Math.hypot(gx - me.x, gy - me.y) < 0.8) ghostVisible = false;
+	}
+	ghost.setEnabled(ghostVisible);
 	if (me !== undefined) {
 		stage.follow(me.x, me.y, dtMs);
 		ring.setEnabled(true);
