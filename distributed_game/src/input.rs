@@ -153,6 +153,75 @@ impl<I> InputBuffer<I> {
     }
 }
 
+/// Server-side input pacing: a player earns one input credit per tick (up
+/// to `max`, the burst it may bank) and spends one per consumed input, so a
+/// client can never simulate faster than real time by sending more inputs,
+/// while jitter bursts (several inputs in one tick after a gap) are still
+/// absorbed. Pair with a client sending one input per tick (the JS SDK's
+/// `InputPacer`). New players start with a full bank.
+///
+/// ```ignore
+/// fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
+///     for player in self.players.keys().copied().collect::<Vec<_>>() {
+///         for input in self.credits.take(ctx, player) { /* step one command frame */ }
+///     }
+/// }
+/// fn on_leave(&mut self, _: &mut Ctx<'_, Self>, player: PlayerId, _: LeaveReason) {
+///     self.credits.remove(player);
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct InputCredits {
+    max: u32,
+    bank: std::collections::BTreeMap<crate::PlayerId, u32>,
+}
+
+impl InputCredits {
+    /// Bank at most `max` (>= 1) credits per player.
+    pub fn new(max: u32) -> Self {
+        Self {
+            max: max.max(1),
+            bank: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Credit ceiling.
+    pub fn max(&self) -> u32 {
+        self.max
+    }
+
+    /// Credits `player` has banked (a new player has `max`).
+    pub fn credits(&self, player: crate::PlayerId) -> u32 {
+        self.bank.get(&player).copied().unwrap_or(self.max)
+    }
+
+    /// Earn this tick's credit, then consume queued inputs oldest first
+    /// while credits last. Call once per player per tick.
+    pub fn take<Z: crate::Zone>(
+        &mut self,
+        ctx: &mut crate::Ctx<'_, Z>,
+        player: crate::PlayerId,
+    ) -> Vec<SequencedInput<Z::Input>> {
+        let max = self.max;
+        let credits = self.bank.entry(player).or_insert(max);
+        *credits = (*credits + 1).min(max);
+        let mut out = Vec::new();
+        while *credits > 0 {
+            let Some(input) = ctx.take_inputs(player, ConsumePolicy::Next).pop() else {
+                break;
+            };
+            out.push(input);
+            *credits -= 1;
+        }
+        out
+    }
+
+    /// Forget a player (on leave).
+    pub fn remove(&mut self, player: crate::PlayerId) {
+        self.bank.remove(&player);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

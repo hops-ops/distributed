@@ -13,11 +13,11 @@ import { Vector3 } from '@babylonjs/core/Maths/math.vector';
 import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import type { Scene } from '@babylonjs/core/scene';
-import type { RenderedEntity } from '@hops-ops/distributed/game';
+import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
-import { cameraRelative, FixedRate, InputSampler, toAxis } from '../shared/input.ts';
+import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
 import { createRing, createStage, material, toWorld } from '../shared/scene.ts';
 import { createArenaClient, DEFAULT_ZONE, KIND } from './client.ts';
 import { BUTTON_DASH, DASH_COOLDOWN, HALF, PLAYER_RADIUS, type MoveInput } from './movement.ts';
@@ -41,7 +41,6 @@ const canvas = document.getElementById('stage') as HTMLCanvasElement;
 const stage = createStage(canvas, { half: HALF });
 const { scene } = stage;
 
-let predictionOn = true;
 let ghostOn = true;
 let corrections = 0;
 let lastCorrection = 0;
@@ -56,7 +55,7 @@ const hud = new Hud({
 	client,
 	devApi: api
 });
-hud.toggle('Client prediction', true, (on) => (predictionOn = on), 'p');
+hud.toggle('Client prediction', true, (on) => client.setPredictionEnabled(on), 'p');
 hud.toggle('Server ghost', true, (on) => (ghostOn = on), 'g');
 
 // ---- meshes ----
@@ -120,7 +119,7 @@ function num(entity: RenderedEntity | { fields: RenderedEntity['fields'] }, fiel
 
 // ---- input: one command frame per 30 Hz tick ----
 const sampler = new InputSampler();
-const commandFrames = new FixedRate(30);
+const commandFrames = new InputPacer({ tickRate: () => client.authority?.connection.welcome?.tickRate });
 let lastInput: MoveInput = { mx: 0, my: 0, buttons: 0 };
 
 function sendCommandFrame(): void {
@@ -132,7 +131,7 @@ function sendCommandFrame(): void {
 
 // ---- frame ----
 stage.onFrame((now, dtMs) => {
-	commandFrames.advance(now, sendCommandFrame);
+	commandFrames.update(now, sendCommandFrame);
 	const hello = arena.hello();
 	const authority = client.authority;
 	const rendered = client.render();
@@ -140,12 +139,9 @@ stage.onFrame((now, dtMs) => {
 	let me: { x: number; y: number } | undefined;
 	for (const entity of rendered) {
 		const mine = authority !== undefined && hello !== undefined && entity.zoneId === authority.zoneId && entity.id === hello.entity;
-		let fields = entity.fields;
-		if (mine && !predictionOn && authority !== undefined) {
-			// Prediction off: show the own capsule like everyone else, interpolated in the past.
-			const renderTime = authority.connection.serverNow() - client.interpolationDelay(authority);
-			fields = authority.replica.sampleEntity(entity.id, renderTime)?.fields ?? fields;
-		}
+		// Prediction off (P): the SDK renders the own capsule like everyone
+		// else's, interpolated in the past.
+		const fields = entity.fields;
 		const visual = visualFor(entity, mine);
 		const x = num({ fields }, 'x');
 		const y = num({ fields }, 'y');

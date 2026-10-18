@@ -138,6 +138,12 @@ principals commit concurrently; settlements arrive in completion order.
   enforces route zone, expiry and single use; `TicketClaims::name` becomes
   `PlayerInfo::name` / `ObserverInfo::name` and travels with handoffs.
   Transfer tickets always use `ticket_key`.
+- **Input pacing**: `InputCredits::new(max)` gives each player one input
+  credit per tick (banking up to `max` for jitter bursts);
+  `credits.take(ctx, player)` consumes queued inputs while credits last, so
+  a client can never simulate faster than real time by flooding inputs.
+  Pair it with the JS SDK's `InputPacer` (one input per server tick from a
+  render loop).
 - **Observers**: `Ctx::observer(id)` / `observers()` / `observers_of(principal)`
   expose each observer's verified principal and name (also during
   `on_unobserve`); `ctx.send_event(observer_id, …)` addresses one observer.

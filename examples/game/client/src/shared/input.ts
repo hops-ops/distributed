@@ -1,11 +1,11 @@
 /**
- * Keyboard + gamepad sampling and a fixed-rate input loop.
+ * Keyboard + gamepad sampling.
  *
  * `InputSampler.sample()` returns a stick in [-1, 1]² (+x right, +y forward,
- * length ≤ 1) and named buttons. `FixedRate` turns render frames into
- * command frames at the server tick rate: each command frame is one input
- * the server simulates for exactly one tick, which is what makes client
- * prediction line up with the authoritative simulation.
+ * length ≤ 1) and named buttons. The SDK's `InputPacer` turns render frames
+ * into command frames at the server tick rate: each command frame is one
+ * input the server simulates for exactly one tick (`InputCredits`), which is
+ * what makes client prediction line up with the authoritative simulation.
  */
 
 export type Sample = Readonly<{
@@ -106,35 +106,4 @@ export function cameraRelative(
 /** Map [-1, 1] to an i8 axis in [-127, 127]. */
 export function toAxis(v: number): number {
 	return Math.round(Math.max(-1, Math.min(1, v)) * 127);
-}
-
-/**
- * Accumulates frame time and fires `step` once per `1000 / hz` ms. Backlog
- * is capped (a hidden tab must not burst dozens of inputs on return).
- */
-export class FixedRate {
-	readonly intervalMs: number;
-	readonly #maxSteps: number;
-	#acc = 0;
-	#last: number | undefined;
-
-	constructor(hz: number, maxStepsPerFrame = 4) {
-		this.intervalMs = 1000 / hz;
-		this.#maxSteps = maxStepsPerFrame;
-	}
-
-	/** Call every frame with a monotonic time; returns steps fired. */
-	advance(now: number, step: () => void): number {
-		if (this.#last === undefined) this.#last = now;
-		this.#acc += now - this.#last;
-		this.#last = now;
-		let steps = 0;
-		while (this.#acc >= this.intervalMs && steps < this.#maxSteps) {
-			this.#acc -= this.intervalMs;
-			step();
-			steps += 1;
-		}
-		if (steps === this.#maxSteps) this.#acc = Math.min(this.#acc, this.intervalMs);
-		return steps;
-	}
 }

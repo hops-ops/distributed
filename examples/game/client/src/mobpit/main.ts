@@ -12,12 +12,12 @@ import type { StandardMaterial } from '@babylonjs/core/Materials/standardMateria
 import { Color3 } from '@babylonjs/core/Maths/math.color';
 import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
-import type { RenderedEntity } from '@hops-ops/distributed/game';
+import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
 import { HALF, PLAYER_RADIUS, type MoveInput } from '../arena/movement.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
-import { cameraRelative, FixedRate, InputSampler, toAxis } from '../shared/input.ts';
+import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
 import { createStage, material, toWorld } from '../shared/scene.ts';
 import {
 	BUTTON_ATTACK,
@@ -278,7 +278,7 @@ function drawGraph(): void {
 
 // ---- input ----
 const sampler = new InputSampler();
-const commandFrames = new FixedRate(30);
+const commandFrames = new InputPacer({ tickRate: () => client.authority?.connection.welcome?.tickRate });
 
 function sendCommandFrame(): void {
 	const s = sampler.sample();
@@ -293,7 +293,7 @@ function sendCommandFrame(): void {
 
 // ---- frame ----
 stage.onFrame((now, dtMs) => {
-	commandFrames.advance(now, sendCommandFrame);
+	commandFrames.update(now, sendCommandFrame);
 	const hello = pit.hello();
 	const authority = client.authority;
 	const rendered = client.render();

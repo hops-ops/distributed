@@ -62,7 +62,7 @@ pub use facts::{
 };
 pub use handoff::{HandoffError, HandoffRequest, Transfer};
 pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};
-pub use input::{ConsumePolicy, InputBuffer, PushOutcome, SequencedInput};
+pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, SequencedInput};
 pub use interest::{InterestConfig, View};
 pub use protocol::{ClientMessage, ClientMirror, Role, ServerMessage, PROTOCOL_VERSION};
 pub use replay::{replay, Recorder, Recording};

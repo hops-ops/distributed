@@ -670,3 +670,58 @@ async fn concurrent_commits_do_not_block_other_principals_and_keep_lane_order() 
     assert!(pos("fast-c1") < pos("slow-a1"), "{order:?}");
     assert!(pos("slow-a1") < pos("fast-a2"), "{order:?}");
 }
+
+/// Consumes inputs through `InputCredits` (bank of 3).
+struct Paced {
+    credits: distributed_game::InputCredits,
+    consumed: Vec<usize>,
+}
+
+impl distributed_game::Zone for Paced {
+    type Config = ();
+    type Input = u8;
+    type Timer = ();
+
+    fn schema() -> distributed_game::EntitySchema {
+        distributed_game::EntitySchema::new()
+    }
+
+    fn on_create(_ctx: &mut distributed_game::Ctx<'_, Self>, _config: ()) -> Self {
+        Self {
+            credits: distributed_game::InputCredits::new(3),
+            consumed: Vec::new(),
+        }
+    }
+
+    fn decode_input(&self, _player: distributed_game::PlayerId, payload: &[u8]) -> Option<u8> {
+        payload.first().copied()
+    }
+
+    fn on_tick(&mut self, ctx: &mut distributed_game::Ctx<'_, Self>) {
+        let players: Vec<_> = ctx.players().map(|p| p.id).collect();
+        let mut n = 0;
+        for player in players {
+            n += self.credits.take(ctx, player).len();
+        }
+        self.consumed.push(n);
+    }
+
+    fn replicate(&self, _out: &mut distributed_game::WorldView) {}
+}
+
+#[test]
+fn input_credits_cap_inputs_per_tick_and_absorb_bursts() {
+    let clock = ManualClock::new();
+    let mut h: ZoneHost<Paced> =
+        ZoneHost::new("z1", HostConfig::default(), Arc::new(clock.clone()), ());
+    let joined = h.join(&claims("ana", "z1"), 0, "").unwrap();
+    for seq in 1..=10 {
+        h.push_input(joined.client, seq, 0, &[1]);
+    }
+    for _ in 0..5 {
+        clock.advance(Duration::from_secs_f64(1.0 / 30.0) + MS(1));
+        h.advance();
+    }
+    // Full bank of 3 spent on the burst, then one input per tick.
+    assert_eq!(h.zone().consumed[..5], [3, 1, 1, 1, 1]);
+}

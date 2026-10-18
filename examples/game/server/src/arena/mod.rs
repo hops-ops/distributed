@@ -17,8 +17,9 @@
 //! Event [`EVENT_HELLO`] (JSON) tells a joining player its entity and the
 //! view radius. Inputs are 3 bytes ([`MoveInput`]); each input is one
 //! command frame. A player earns one frame credit per tick (max
-//! [`MAX_CREDITS`]), so a client cannot move faster than real time by
-//! sending more inputs, but jitter bursts are absorbed.
+//! [`MAX_CREDITS`], `distributed_game::InputCredits`), so a client cannot
+//! move faster than real time by sending more inputs, but jitter bursts are
+//! absorbed.
 
 pub mod movement;
 
@@ -26,7 +27,7 @@ use std::collections::BTreeMap;
 
 use distributed_game::net::{GameServer, ServerConfig};
 use distributed_game::{
-    ConsumePolicy, Ctx, EntitySchema, EntityState, FieldType, FieldValue, KindDef, LeaveReason,
+    Ctx, EntitySchema, EntityState, FieldType, FieldValue, InputCredits, KindDef, LeaveReason,
     PlayerId, View, WorldView, Zone,
 };
 use serde_json::json;
@@ -54,7 +55,6 @@ struct Player {
     entity: u32,
     name: String,
     state: MoveState,
-    credits: u8,
 }
 
 struct Drone {
@@ -77,6 +77,7 @@ pub struct ArenaConfig {
 pub struct Arena {
     guests: Guests,
     players: BTreeMap<PlayerId, Player>,
+    credits: InputCredits,
     drones: Vec<Drone>,
 }
 
@@ -149,6 +150,7 @@ impl Zone for Arena {
         let mut arena = Self {
             guests: config.guests,
             players: BTreeMap::new(),
+            credits: InputCredits::new(u32::from(MAX_CREDITS)),
             drones: Vec::new(),
         };
         for id in 1..=DRONES {
@@ -184,7 +186,6 @@ impl Zone for Arena {
                     y,
                     ..MoveState::default()
                 },
-                credits: MAX_CREDITS,
             },
         );
         ctx.set_view(player, View::new(x, y, VIEW_RADIUS));
@@ -198,6 +199,7 @@ impl Zone for Arena {
 
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId, _reason: LeaveReason) {
         self.players.remove(&player);
+        self.credits.remove(player);
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<MoveInput> {
@@ -206,13 +208,8 @@ impl Zone for Arena {
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
         for (id, player) in &mut self.players {
-            player.credits = (player.credits + 1).min(MAX_CREDITS);
-            while player.credits > 0 {
-                let Some(input) = ctx.take_inputs(*id, ConsumePolicy::Next).pop() else {
-                    break;
-                };
+            for input in self.credits.take(ctx, *id) {
                 player.state = movement::step(player.state, input.input);
-                player.credits -= 1;
             }
             ctx.set_view(*id, View::new(player.state.x, player.state.y, VIEW_RADIUS));
         }

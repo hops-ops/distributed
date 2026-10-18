@@ -39,7 +39,7 @@ use std::time::Duration;
 
 use distributed_game::net::{GameServer, ServerConfig};
 use distributed_game::{
-    ConsumePolicy, Ctx, EntitySchema, EntityState, Fact, FactStamp, FieldType, FieldValue, KindDef,
+    Ctx, EntitySchema, EntityState, Fact, FactStamp, FieldType, FieldValue, InputCredits, KindDef,
     LeaveReason, PlayerId, StalePolicy, View, WorldView, Zone,
 };
 use serde_json::{json, Value};
@@ -118,7 +118,6 @@ struct Player {
     entity: u32,
     name: String,
     state: MoveState,
-    credits: u8,
     /// Just arrived through a portal: ignore portals until it stepped off.
     on_portal: bool,
 }
@@ -143,6 +142,7 @@ pub struct FreezeZone {
     zone_id: String,
     pack: Pack,
     players: BTreeMap<PlayerId, Player>,
+    credits: InputCredits,
     slimes: Vec<Slime>,
     gems: Vec<Gem>,
     collected: u64,
@@ -191,7 +191,6 @@ impl FreezeZone {
                     y: at.1,
                     ..MoveState::default()
                 },
-                credits: crate::arena::MAX_CREDITS,
                 on_portal: false,
             },
         );
@@ -289,6 +288,7 @@ impl Zone for FreezeZone {
             config,
             pack,
             players: BTreeMap::new(),
+            credits: InputCredits::new(u32::from(crate::arena::MAX_CREDITS)),
             slimes,
             gems: (0..kind.gem_spots().len())
                 .map(|spot| Gem {
@@ -332,6 +332,7 @@ impl Zone for FreezeZone {
 
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId, _reason: LeaveReason) {
         self.players.remove(&player);
+        self.credits.remove(player);
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<MoveInput> {
@@ -344,13 +345,8 @@ impl Zone for FreezeZone {
         let ids: Vec<PlayerId> = self.players.keys().copied().collect();
         for id in ids {
             let player = self.players.get_mut(&id).expect("present");
-            player.credits = (player.credits + 1).min(crate::arena::MAX_CREDITS);
-            while player.credits > 0 {
-                let Some(input) = ctx.take_inputs(id, ConsumePolicy::Next).pop() else {
-                    break;
-                };
+            for input in self.credits.take(ctx, id) {
                 player.state = movement::step(player.state, input.input);
-                player.credits -= 1;
             }
             let (x, y) = (player.state.x, player.state.y);
             // Lava burns (ice is safe): back to a spawn point.

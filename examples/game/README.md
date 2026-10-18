@@ -105,8 +105,8 @@ over portals.
 ```
 
 Prediction is exact because (1) every input is one command frame of exactly
-one tick, consumed one per tick with a small credit bank
-(`arena::MAX_CREDITS`), (2) the step uses binary32 arithmetic only
+one tick (sent by the SDK's `InputPacer`), consumed one per tick with a small
+credit bank (`distributed_game::InputCredits`, `arena::MAX_CREDITS`), (2) the step uses binary32 arithmetic only
 (`Math.fround` in TS) without trig, and (3) the server snaps its state to the
 wire quantization after each step, so the client rebases on exactly what the
 server holds. `fixtures/arena-movement.json` (written by Rust) is replayed by

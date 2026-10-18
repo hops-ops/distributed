@@ -1,8 +1,8 @@
 /**
  * Shooting Gallery networking without rendering (Node-testable).
  *
- * - Targets are interpolated like any remote entity, but with an adaptive
- *   delay (`AdaptiveDelay`): the SDK's clock estimates the server's
+ * - Targets are interpolated like any remote entity with the SDK's default
+ *   adaptive delay (`AdaptiveDelay`): the clock estimates the server's
  *   *present*, so a fixed 100 ms delay would ask for states that have not
  *   arrived yet once one-way latency exceeds it; the delay follows
  *   `rtt / 2 + 2 patch intervals + 2 × jitter`, slewed slowly.
@@ -14,7 +14,14 @@
  * - The server answers every shot with a verdict event; `stats` compares
  *   predicted and confirmed hits.
  */
-import { GameClient, type GameSocketFactory, type GameZoneView, type RenderedEntity } from '@hops-ops/distributed/game';
+import {
+	GameClient,
+	type AdaptiveDelay,
+	type AdaptiveDelayOptions,
+	type GameSocketFactory,
+	type GameZoneView,
+	type RenderedEntity
+} from '@hops-ops/distributed/game';
 
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
 import { onJsonEvent } from '../shared/events.ts';
@@ -68,50 +75,6 @@ export type GalleryStats = {
 	lastAgeMs: number;
 };
 
-/** Interpolation delay that follows the measured one-way latency. */
-export class AdaptiveDelay {
-	readonly minMs: number;
-	readonly maxMs: number;
-	/** Largest change per 100 ms of wall time (keeps the timeline smooth). */
-	readonly slewMs: number;
-	#value: number;
-	#at: number | undefined;
-
-	constructor(options: Readonly<{ minMs?: number; maxMs?: number; slewMs?: number }> = {}) {
-		this.minMs = options.minMs ?? 100;
-		this.maxMs = options.maxMs ?? 800;
-		this.slewMs = options.slewMs ?? 25;
-		this.#value = this.minMs;
-	}
-
-	get value(): number {
-		return this.#value;
-	}
-
-	/** Target delay for a zone right now. */
-	target(zone: GameZoneView): number {
-		const clock = zone.connection.clock;
-		const patchMs = 1000 / (zone.connection.welcome?.patchRate || 20);
-		const wanted = clock.synced ? clock.rtt / 2 + 2 * patchMs + 2 * clock.jitter : 2 * patchMs;
-		return Math.min(this.maxMs, Math.max(this.minMs, wanted));
-	}
-
-	/** Current delay, moved toward `target(zone)` by at most `slewMs` / 100 ms. */
-	sample(zone: GameZoneView, now: number): number {
-		const last = this.#at ?? now;
-		this.#at = now;
-		const budget = (this.slewMs * Math.max(0, now - last)) / 100;
-		const delta = this.target(zone) - this.#value;
-		this.#value += Math.max(-budget, Math.min(budget, delta));
-		return this.#value;
-	}
-
-	/** True when within `toleranceMs` of the target. */
-	settled(zone: GameZoneView, toleranceMs = 5): boolean {
-		return Math.abs(this.target(zone) - this.#value) <= toleranceMs;
-	}
-}
-
 export function encodeShot(flags: number, shot: number, delayMs: number, dir: Vec3): Uint8Array {
 	const bytes = new Uint8Array(11);
 	const view = new DataView(bytes.buffer);
@@ -143,7 +106,8 @@ export function targetPosition(entity: Pick<RenderedEntity, 'fields'>): Vec3 {
 
 export type GalleryClient = Readonly<{
 	client: GameClient<never>;
-	delay: AdaptiveDelay;
+	/** The SDK's adaptive interpolation delay of `zone` (default: the authority). */
+	delay(zone?: GameZoneView): AdaptiveDelay;
 	hello(): GalleryHello | undefined;
 	ready: Promise<GalleryHello>;
 	stats: GalleryStats;
@@ -163,18 +127,21 @@ export type GalleryClientOptions = Readonly<{
 	api: DevApi;
 	base?: string;
 	socket?: GameSocketFactory;
-	delay?: AdaptiveDelay;
+	adaptiveDelay?: AdaptiveDelayOptions;
 }>;
 
 export function createGalleryClient(options: GalleryClientOptions): GalleryClient {
-	const delay = options.delay ?? new AdaptiveDelay();
 	const client = new GameClient<never>({
 		url: (zone) => zoneUrl(zone, options.base),
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
 		pingIntervalMs: 250,
-		interpolationDelayMs: (zone) => delay.sample(zone, zone.connection.now())
+		adaptiveDelay: options.adaptiveDelay
 	});
+	const delay = (zone: GameZoneView | undefined = client.authority): AdaptiveDelay => {
+		if (zone === undefined) throw new Error('not joined');
+		return client.adaptiveDelay(zone)!;
+	};
 	let hello: GalleryHello | undefined;
 	let resolveReady: (h: GalleryHello) => void = () => undefined;
 	const ready = new Promise<GalleryHello>((resolve) => (resolveReady = resolve));

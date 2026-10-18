@@ -581,7 +581,7 @@ function, so a fresh single-use ticket is fetched whenever a reconnect token
 can no longer be used — and a pure `predict` for its own entity.
 
 ```ts
-import { GameClient } from '@hops-ops/distributed/game';
+import { GameClient, InputPacer } from '@hops-ops/distributed/game';
 
 const game = new GameClient<{ dx: number; dy: number }>({
   url: (zone) => `wss://game.example/zones/${zone}`,
@@ -595,13 +595,27 @@ const game = new GameClient<{ dx: number; dy: number }>({
 await game.connect('room-1');
 game.on('event', (zone, e) => { /* e.g. announce the controlled entity */ });
 game.setControlledEntity(myEntityId);
-game.sendInput({ dx: 1, dy: 0 });
-requestAnimationFrame(function frame() { draw(game.render()); requestAnimationFrame(frame); });
+// One input per server tick, whatever the display refresh rate.
+const pacer = new InputPacer({ tickRate: () => game.authority?.connection.welcome?.tickRate });
+requestAnimationFrame(function frame(now) {
+  pacer.update(now, (dtMs) => game.sendInput(readStick(), dtMs));
+  draw(game.render());
+  requestAnimationFrame(frame);
+});
 ```
 
 `render()` merges the authoritative zone and observed neighbours (`observe`)
-sampled at `serverNow − interpolationDelay` (two patch intervals by default),
-with the controlled entity at its predicted state. Reconciliation rebases on
+sampled at `serverNow − interpolationDelay`, with the controlled entity at
+its predicted state. The delay is **adaptive** per zone by default
+(`AdaptiveDelay`: `rtt / 2 + 2 patch intervals + 2 × jitter`, clamped to
+`[2 patches, 800 ms]`, slewed ≤ 25 ms per 100 ms; tune with
+`adaptiveDelay: { minMs, maxMs, slewMs, patchIntervals, jitterFactor }`,
+inspect with `client.adaptiveDelay(zone)`): the clock estimates the
+server's *present*, so a fixed delay below the one-way latency would ask
+for states not yet received. A fixed `interpolationDelayMs: 100` (or a
+function of the zone) is still accepted. `client.setPredictionEnabled(false)`
+renders the controlled entity like any other (interpolated, one RTT behind
+the keys) while inputs keep being recorded, so switching back is seamless. Reconciliation rebases on
 every Delta's `ack_seq`; per-field `ease`, `snap` or `replace` resolves the
 divergence. A server Handoff connects to the target zone with the transfer
 ticket (following `Redirect`s) and swaps authority while the previous world
@@ -653,7 +667,8 @@ duplicated as decision documents in this package.
 - `@hops-ops/distributed/game` — binary `distributed_game` zone protocol
   client: codec, `GameConnection` (handshake, reconnect, clock sync),
   interpolating `EntityReplica`, `Predictor` reconciliation and the
-  multi-zone `GameClient` with handoff. See `distributed_game/PROTOCOL.md`.
+  multi-zone `GameClient` with handoff, `AdaptiveDelay` and `InputPacer`.
+  See `distributed_game/PROTOCOL.md`.
 
 All other subpaths are private and blocked by the package export map.
 

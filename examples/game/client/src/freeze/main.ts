@@ -11,12 +11,12 @@ import type { StandardMaterial } from '@babylonjs/core/Materials/standardMateria
 import { Color3 } from '@babylonjs/core/Maths/math.color';
 import type { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
-import type { RenderedEntity } from '@hops-ops/distributed/game';
+import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
 import { BUTTON_DASH, HALF, PILLARS, PLAYER_RADIUS, type MoveInput } from '../arena/movement.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
-import { cameraRelative, FixedRate, InputSampler, toAxis } from '../shared/input.ts';
+import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
 import { createRing, createStage, material, toWorld } from '../shared/scene.ts';
 import { createFreezeClient, DEFAULT_ZONE, FreezeAdmin, KIND, ZONES, type Pack, type WorldStatus } from './client.ts';
 import './freeze.css';
@@ -274,7 +274,7 @@ async function main(): Promise<void> {
 
 	// ---- input ----
 	const sampler = new InputSampler();
-	const frames = new FixedRate(30);
+	const frames = new InputPacer({ tickRate: () => client.authority?.connection.welcome?.tickRate });
 	let lastInput: MoveInput = { mx: 0, my: 0, buttons: 0 };
 	const sendFrame = () => {
 		const s = sampler.sample();
@@ -284,7 +284,7 @@ async function main(): Promise<void> {
 	};
 
 	stage.onFrame((now, dtMs) => {
-		frames.advance(now, sendFrame);
+		frames.update(now, sendFrame);
 		const hello = freeze.hello();
 		const pack = freeze.pack();
 		const authority = client.authority;

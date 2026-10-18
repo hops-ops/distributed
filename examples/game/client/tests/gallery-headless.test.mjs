@@ -62,8 +62,8 @@ test('lag compensation confirms what the shooter saw; off misses; beyond max rew
 		await api.setNetSim({ latencyMs: 100, jitterMs: 0, loss: 0 });
 		const zone = gallery.client.authority;
 		await until(() => zone.connection.clock.rtt > 180, 10_000, 'rtt with latency');
-		await until(() => gallery.targets() && gallery.delay.settled(zone, 10), 15_000, 'adaptive delay');
-		assert.ok(gallery.delay.value > 190, `delay ${gallery.delay.value}`);
+		await until(() => gallery.targets() && gallery.delay(zone).settled(zone, 10), 15_000, 'adaptive delay');
+		assert.ok(gallery.delay().value > 190, `delay ${gallery.delay().value}`);
 
 		const on = await volley(gallery, 20, true);
 		assert.ok(on.hits >= 18, `compensated hits ${on.hits}/20`);
@@ -78,7 +78,7 @@ test('lag compensation confirms what the shooter saw; off misses; beyond max rew
 		// 300 ms one way: the view is ~700 ms old, more than the 600 ms clamp.
 		await api.setNetSim({ latencyMs: 300, jitterMs: 0, loss: 0 });
 		await until(() => zone.connection.clock.rtt > 550, 15_000, 'rtt 600');
-		await until(() => gallery.targets() && gallery.delay.settled(zone, 10), 20_000, 'adaptive delay 2');
+		await until(() => gallery.targets() && gallery.delay(zone).settled(zone, 10), 20_000, 'adaptive delay 2');
 		const far = await volley(gallery, 10, true);
 		t.diagnostic(
 			`comp on ${on.hits}/20 (mean rewind ${meanAge.toFixed(0)} ms) · off ${off.hits}/20 · 300 ms: clamped ${far.clamped}/10, hits ${far.hits}/10`

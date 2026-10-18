@@ -26,6 +26,7 @@ import type {
 	ResumeMessage,
 	WelcomeMessage
 } from './messages.js';
+import { AdaptiveDelay, type AdaptiveDelayOptions } from './pacing.js';
 import { Predictor, type Correction, type PredictorOptions } from './prediction.js';
 import {
 	EntityReplica,
@@ -104,10 +105,17 @@ export type GameClientOptions<TInput> = Readonly<{
 	reconnect?: false | GameReconnectOptions;
 	pingIntervalMs?: number;
 	/**
-	 * Render delay behind the server clock. Default: two patch intervals of
-	 * the zone (100 ms at 20 Hz).
+	 * Render delay behind the server clock: a fixed number of ms, or a
+	 * function of the zone. Default: adaptive per zone (`AdaptiveDelay`,
+	 * `rtt / 2 + 2 patch intervals + 2 × jitter`, slewed slowly, tuned with
+	 * `adaptiveDelay`), because the clock estimates the server's present and
+	 * a fixed delay below the one-way latency renders states not yet received.
 	 */
 	interpolationDelayMs?: number | ((zone: GameZoneView) => number);
+	/** Tuning of the default adaptive interpolation delay. */
+	adaptiveDelay?: AdaptiveDelayOptions;
+	/** Render the controlled entity predicted (default true); see `setPredictionEnabled`. */
+	predictionEnabled?: boolean;
 	interpolation?: InterpolationPolicy;
 	staleGraceMs?: number;
 	historyMs?: number;
@@ -163,6 +171,9 @@ export class GameClient<TInput = unknown> {
 	#controlledOverride: number | undefined;
 	#closed = false;
 	#contentVersion: string;
+	#predictionEnabled: boolean;
+	/** Adaptive delay per zone, keyed by the replica (shared across a zone's connections). */
+	readonly #delays = new WeakMap<EntityReplica, AdaptiveDelay>();
 
 	constructor(options: GameClientOptions<TInput>) {
 		this.#options = options;
@@ -171,6 +182,22 @@ export class GameClient<TInput = unknown> {
 		this.#emitter = new Emitter(options.onListenerError);
 		this.#predictor =
 			options.prediction === undefined ? undefined : new Predictor(options.prediction);
+		this.#predictionEnabled = options.predictionEnabled ?? true;
+	}
+
+	/** Whether `render` shows the controlled entity at its predicted state. */
+	get predictionEnabled(): boolean {
+		return this.#predictionEnabled;
+	}
+
+	/**
+	 * Toggle prediction at runtime. Off, the controlled entity is rendered
+	 * like every other entity (interpolated, one RTT + delay behind the
+	 * keys). Inputs keep being recorded and reconciled either way, so
+	 * switching back on is seamless.
+	 */
+	setPredictionEnabled(enabled: boolean): void {
+		this.#predictionEnabled = enabled;
 	}
 
 	on<K extends keyof GameClientEvents>(
@@ -293,8 +320,22 @@ export class GameClient<TInput = unknown> {
 		const configured = this.#options.interpolationDelayMs;
 		if (typeof configured === 'number') return configured;
 		if (typeof configured === 'function') return configured(zone);
-		const patchRate = zone.connection.welcome?.patchRate || 20;
-		return 2 * (1000 / patchRate);
+		return this.adaptiveDelay(zone)!.sample(zone, this.#scheduler.now());
+	}
+
+	/**
+	 * The adaptive delay controller of a zone (undefined when a fixed
+	 * `interpolationDelayMs` is configured): `value`, `target(zone)`,
+	 * `settled(zone)` for HUDs and tests.
+	 */
+	adaptiveDelay(zone: GameZoneView): AdaptiveDelay | undefined {
+		if (this.#options.interpolationDelayMs !== undefined) return undefined;
+		let delay = this.#delays.get(zone.replica);
+		if (delay === undefined) {
+			delay = new AdaptiveDelay(this.#options.adaptiveDelay);
+			this.#delays.set(zone.replica, delay);
+		}
+		return delay;
 	}
 
 	/**
@@ -307,7 +348,9 @@ export class GameClient<TInput = unknown> {
 		const now = this.#scheduler.now();
 		const predictor = this.#predictor;
 		const controlled =
-			predictor?.active === true && this.#authority !== undefined ? predictor.entityId : undefined;
+			this.#predictionEnabled && predictor?.active === true && this.#authority !== undefined
+				? predictor.entityId
+				: undefined;
 		for (const zone of this.zones()) {
 			const delay = this.interpolationDelay(zone);
 			zone.replica.interpolationDelayMs = delay;

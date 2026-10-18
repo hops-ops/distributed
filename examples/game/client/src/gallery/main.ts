@@ -250,7 +250,7 @@ stage.onFrame((now) => {
 	hud.frame({ entities: rendered.length });
 	const st = gallery.stats;
 	const pct = (n: number, d: number) => (d === 0 ? '—' : `${Math.round((100 * n) / d)}%`);
-	hud.row('Interp delay', authority === undefined ? '—' : `${gallery.delay.value.toFixed(0)} ms (target ${gallery.delay.target(authority).toFixed(0)})`);
+	hud.row('Interp delay', authority === undefined ? '—' : `${gallery.delay(authority).value.toFixed(0)} ms (target ${gallery.delay(authority).target(authority).toFixed(0)})`);
 	hud.row('Compensation', compensation ? `ON (max ${hello?.maxRewindMs ?? '—'} ms)` : 'OFF');
 	hud.row('Shots', String(st.shots));
 	hud.row('Predicted hits', `${st.predictedHits} (${pct(st.predictedHits, st.shots)})`);

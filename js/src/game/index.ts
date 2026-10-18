@@ -5,7 +5,10 @@
  * - `GameConnection`: one zone WebSocket — handshake, reconnect, clock sync.
  * - `EntityReplica`: schema-driven entity store with interpolation buffers.
  * - `Predictor`: client prediction + per-field reconciliation policies.
- * - `GameClient`: authority + observer zones, merged render, handoff.
+ * - `GameClient`: authority + observer zones, merged render, handoff,
+ *   adaptive interpolation delay, runtime prediction toggle.
+ * - `AdaptiveDelay` / `InputPacer`: network-following render delay and
+ *   one-input-per-tick pacing for render loops.
  */
 export {
 	MAX_BLOB_LEN,
@@ -112,6 +115,13 @@ export {
 	type PredictFn,
 	type PredictorOptions
 } from './prediction.js';
+export {
+	AdaptiveDelay,
+	InputPacer,
+	type AdaptiveDelayOptions,
+	type DelaySource,
+	type InputPacerOptions
+} from './pacing.js';
 export {
 	GameClient,
 	type ControlledEntityResolver,
