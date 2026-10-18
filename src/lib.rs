@@ -55,6 +55,7 @@ pub mod projection;
 pub mod projection_protocol;
 pub mod queued_repo;
 pub mod read_model;
+pub mod saga;
 pub mod snapshot;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_repo;
@@ -364,13 +365,17 @@ pub use lock::{PostgresLock, PostgresLockManager};
 #[cfg(feature = "sqlite")]
 pub use lock::{SqliteLock, SqliteLockManager};
 
-// Coordination primitives: injectable clock and fenced leases.
+// Coordination primitives: injectable clock, fenced leases, sagas.
 pub use clock::{Clock, ManualClock, SystemClock};
 #[cfg(feature = "postgres")]
 pub use lease::PostgresLeaseStore;
 #[cfg(feature = "sqlite")]
 pub use lease::SqliteLeaseStore;
 pub use lease::{Fence, FencingToken, InMemoryLeaseStore, Lease, LeaseError, LeaseStore};
+pub use saga::{
+    Saga, SagaCommand, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaReply, SagaRunner,
+    SagaStatus, SagaStep,
+};
 
 // Outbox: commit concerns (aggregate + outbox in one commit).
 //

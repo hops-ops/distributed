@@ -1406,6 +1406,14 @@ not an atomic external effect plus publish. Aggregate decisions still use a
 transactional outbox. Bound external reads and make effects idempotent before
 using this pattern.
 
+### Scheduled messages, sagas and fenced leases
+
+`OutboxMessage::deliver_at(at)` turns an outbox row into a durable timer that
+no claim path delivers before `at`. Cross-cell workflows use the event-sourced
+`Saga<D>` process manager (`distributed::saga`). Single-owner work uses TTL
+leases with monotonic fencing tokens (`distributed::lease`). See
+[coordination primitives](docs/coordination-primitives.md).
+
 ### Publishing the Outbox
 
 How a committed row reaches the bus depends on whether a bus is attached to the
