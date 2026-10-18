@@ -20,7 +20,7 @@ name = "game-demos"
 path = "src/main.rs"
 
 [dependencies]
-distributed_game = { path = "../../../distributed_game", features = ["net", "cell"] }
+distributed_game = { path = "../../../distributed_game", features = ["net", "cell", "sqlite"] }
 # Mob Pit: native durable SQLite cells + sorted-set leaderboards (Redis optional at runtime).
 distributed = { path = "../../..", features = ["cell-sqlite", "redis"] }
 axum = { version = "0.8", default-features = false, features = ["json", "query", "tokio", "http1"] }
@@ -34,3 +34,5 @@ distributed_game = { path = "../../../distributed_game", features = ["net", "cel
 tokio = { version = "1", features = ["process", "io-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

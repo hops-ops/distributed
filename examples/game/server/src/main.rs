@@ -2,10 +2,13 @@
 
 use clap::{Parser, Subcommand};
 use game_demos::arena::ArenaDemo;
+use game_demos::cluster::{run_cluster, ClusterArgs};
 use game_demos::common::{run, DemoArgs};
 use game_demos::freeze::world::FreezeArgs;
 use game_demos::gallery::GalleryDemo;
+use game_demos::grid::GridDemo;
 use game_demos::mobpit::{self, MobPitArgs};
+use game_demos::ripple::RippleDemo;
 
 #[derive(Parser)]
 #[command(
@@ -29,6 +32,10 @@ enum DemoCommand {
     Gallery(DemoArgs),
     /// World-version barrier across two server processes, safe-room reloads.
     Freeze(FreezeArgs),
+    /// Endless Grid: procedural cells as zones, handoff across hosts, hibernation.
+    Grid(ClusterArgs),
+    /// Boss Ripple: realm > city > borough > hood, tier-up events across hosts.
+    Ripple(ClusterArgs),
 }
 
 #[tokio::main]
@@ -38,5 +45,7 @@ async fn main() -> std::io::Result<()> {
         DemoCommand::Mobpit(args) | DemoCommand::Leaderboard(args) => mobpit::run(args).await,
         DemoCommand::Gallery(args) => run::<GalleryDemo>(args).await,
         DemoCommand::Freeze(args) => game_demos::freeze::world::run(args).await,
+        DemoCommand::Grid(args) => run_cluster::<GridDemo>(args).await,
+        DemoCommand::Ripple(args) => run_cluster::<RippleDemo>(args).await,
     }
 }

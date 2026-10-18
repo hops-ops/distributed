@@ -1,0 +1,148 @@
+.ripple-tree {
+	position: fixed;
+	top: 12px;
+	right: 12px;
+	width: 330px;
+	max-height: calc(100% - 24px);
+	overflow: auto;
+	padding: 10px 12px 10px 10px;
+	border-radius: 8px;
+	background: var(--panel);
+	box-sizing: border-box;
+}
+.ripple-edges {
+	position: absolute;
+	left: 0;
+	top: 0;
+	pointer-events: none;
+	overflow: visible;
+}
+.ripple-edges path {
+	fill: none;
+	stroke: #3a4556;
+	stroke-width: 1.5;
+}
+.ripple-edges circle.good {
+	fill: #ffd25e;
+	filter: drop-shadow(0 0 4px #ffd25e);
+}
+.ripple-edges circle.bad {
+	fill: #ff6b6b;
+	filter: drop-shadow(0 0 4px #ff6b6b);
+}
+.ripple-node {
+	position: relative;
+	margin: 0 0 6px;
+	padding: 5px 8px;
+	border-radius: 6px;
+	border: 1px solid #2a3240;
+	background: #141922;
+}
+.ripple-node .title {
+	font-weight: 600;
+}
+.ripple-node .meta {
+	font-weight: 400;
+	color: var(--muted);
+	font-size: 11px;
+}
+.ripple-node .state {
+	color: var(--text);
+	font-size: 12px;
+}
+.ripple-node.tier-city {
+	margin-left: 16px;
+}
+.ripple-node.tier-borough {
+	margin-left: 32px;
+}
+.ripple-node.tier-hood {
+	margin-left: 48px;
+	cursor: pointer;
+}
+.ripple-node.here {
+	border-color: var(--accent);
+}
+.ripple-node.cleared {
+	border-color: #5fd39a;
+}
+.ripple-node.offline {
+	opacity: 0.5;
+}
+.ripple-node.pulse {
+	animation: ripple-pulse 0.9s ease-out;
+}
+@keyframes ripple-pulse {
+	0% {
+		box-shadow: 0 0 0 0 rgba(255, 210, 94, 0.8);
+	}
+	100% {
+		box-shadow: 0 0 0 12px rgba(255, 210, 94, 0);
+	}
+}
+.ripple-node .hp {
+	height: 4px;
+	margin-top: 4px;
+	border-radius: 2px;
+	background: #2a3240;
+	overflow: hidden;
+}
+.ripple-node .hp div {
+	height: 100%;
+	background: #d0453b;
+	transition: width 0.2s;
+}
+.ripple-log {
+	margin: 8px 0 0;
+	padding-left: 18px;
+	color: var(--muted);
+	font-size: 11px;
+}
+.ripple-button {
+	display: block;
+	width: 100%;
+	margin: 8px 0 0;
+	padding: 6px;
+	border: 1px solid #d0453b;
+	border-radius: 6px;
+	background: #2a1414;
+	color: #ffd7d2;
+	font: inherit;
+	cursor: pointer;
+}
+.ripple-banner {
+	position: fixed;
+	top: 18%;
+	left: 50%;
+	transform: translateX(-50%);
+	padding: 12px 22px;
+	border-radius: 10px;
+	background: rgba(16, 20, 27, 0.9);
+	border: 1px solid #ffd25e;
+	color: #ffe9a8;
+	font-size: 20px;
+	opacity: 0;
+	pointer-events: none;
+	max-width: calc(100% - 32px);
+	text-align: center;
+}
+.ripple-banner.show {
+	animation: ripple-banner 4s ease-out;
+}
+@keyframes ripple-banner {
+	0%,
+	80% {
+		opacity: 1;
+	}
+	100% {
+		opacity: 0;
+	}
+}
+@media (max-width: 640px) {
+	.ripple-tree {
+		top: auto;
+		bottom: 12px;
+		width: calc(100% - 24px);
+		max-height: 40%;
+	}
+}
