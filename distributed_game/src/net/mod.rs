@@ -631,9 +631,22 @@ where
         listener: tokio::net::TcpListener,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> std::io::Result<()> {
+        self.serve_with(listener, Router::new(), signal).await
+    }
+
+    /// [`serve`](Self::serve) with additional application routes merged
+    /// into [`router`](Self::router) (lobby, dev or health endpoints), keeping
+    /// the same graceful shutdown: zones kick their clients and every zone
+    /// task finishes before this returns.
+    pub async fn serve_with(
+        self,
+        listener: tokio::net::TcpListener,
+        extra: Router,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> std::io::Result<()> {
         let server = self.clone();
         let mut stopped = self.inner.shutdown.subscribe();
-        axum::serve(listener, self.router())
+        axum::serve(listener, self.router().merge(extra))
             .with_graceful_shutdown(async move {
                 tokio::select! {
                     _ = signal => {}

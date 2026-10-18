@@ -295,3 +295,69 @@ async fn latency_simulation_delays_but_preserves_order() {
     server.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 }
+
+/// Raw HTTP/1.1 GET returning the whole response text.
+async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_with_merges_extra_routes_and_shuts_down_gracefully() {
+    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    config.host.tick_rate = 30;
+    let server = GameServer::<Arena>::new(config, |zone_id| {
+        zone_id.starts_with('z').then(ArenaConfig::default)
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let extra = axum::Router::new().route("/hello", axum::routing::get(|| async { "hi" }));
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(server.clone().serve_with(listener, extra, async move {
+        let _ = stopped.await;
+    }));
+    let hello = http_get(addr, "/hello").await;
+    assert!(
+        hello.starts_with("HTTP/1.1 200") && hello.ends_with("hi"),
+        "{hello}"
+    );
+    assert!(http_get(addr, "/metrics").await.starts_with("HTTP/1.1 200"));
+
+    // A joined player is kicked with SHUTDOWN when the signal fires.
+    let url = format!("ws://{addr}");
+    let mut ws = connect(&url, "z1").await;
+    hello_join(&mut ws, "z1").await;
+    let mut mirror = ClientMirror::new();
+    assert!(matches!(
+        next(&mut ws, &mut mirror).await,
+        Some(ServerMessage::Welcome(_))
+    ));
+    stop.send(()).unwrap();
+    let mut kicked = false;
+    while let Some(msg) = next(&mut ws, &mut mirror).await {
+        if let ServerMessage::Kick { code, .. } = msg {
+            assert_eq!(code, kick::SHUTDOWN);
+            kicked = true;
+        }
+    }
+    assert!(kicked, "shutdown kick delivered");
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("serve_with returns after shutdown")
+        .unwrap()
+        .unwrap();
+}
+
+async fn hello_join(ws: &mut Ws, zone: &str) {
+    hello(
+        ws,
+        ticket("serve-with", zone, "n-serve-with", Role::Player),
+        String::new(),
+    )
+    .await;
+}

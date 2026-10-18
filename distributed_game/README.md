@@ -86,6 +86,8 @@ let server = GameServer::<Room>::new(ServerConfig::new(TicketKey::new(secret)), 
     zone_id.starts_with("room-").then_some(())
 });
 server.serve(tokio::net::TcpListener::bind("0.0.0.0:2567").await?, shutdown_signal).await?;
+// or merge app routes (lobby, health, dev tools) with the same graceful shutdown:
+// server.serve_with(listener, axum::Router::new().route("/healthz", get(ok)), signal).await?;
 ```
 
 ## Durable facts
