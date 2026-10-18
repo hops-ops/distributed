@@ -926,9 +926,16 @@ impl<Z: Zone> ZoneHost<Z> {
                         slot.info.name = claims.name.clone();
                     }
                 }
+                // A ticket (not a reconnect token) means a new client session:
+                // its input sequence restarts, so forget the old one.
+                if let Some(slot) = self.core.players.get_mut(&player) {
+                    slot.inputs.reset_sequence();
+                }
                 self.bind_player(player, client, capabilities);
                 if let Some((from, carried)) = handoff.take() {
                     hook!(self.on_handoff_join(player, from, carried));
+                } else {
+                    hook!(self.on_rejoin(player));
                 }
                 Joined {
                     client,

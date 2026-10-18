@@ -559,12 +559,41 @@ fn same_principal_replaces_previous_connection() {
     let clock = ManualClock::new();
     let mut h = host(HostConfig::default(), &clock, ArenaConfig::default());
     let a = h.join(&claims("alice", "z1"), 0, "").unwrap();
+    for seq in 1..=5 {
+        assert_eq!(
+            h.push_input(a.client, seq, 0, &[1, 0]),
+            PushOutcome::Accepted
+        );
+    }
+    clock.advance(MS(200));
+    h.advance();
+    h.drain_outbound();
+
+    // A fresh ticket (e.g. page reload) replaces the connection and is a new
+    // client session: its inputs number from 1 again and must not be stale,
+    // and the zone sees on_rejoin (default: leave(Rejoined) + join) so it can
+    // resend per-player state.
     let b = h.join(&claims("alice", "z1"), 0, "").unwrap();
     assert_eq!(a.viewer, b.viewer);
     assert_eq!(h.client_count(), 1);
     let out = h.drain_outbound();
     assert!(out.contains(&Outbound::Close { client: a.client }));
-    assert_eq!(h.zone().log, vec!["create", "join:alice"]);
+    assert_eq!(
+        h.zone().log,
+        vec!["create", "join:alice", "leave:Rejoined", "join:alice"]
+    );
+    assert_eq!(h.push_input(b.client, 1, 0, &[0, 1]), PushOutcome::Accepted);
+    clock.advance(MS(100));
+    h.advance();
+    let mut mirror = ClientMirror::new();
+    let later = h.drain_outbound();
+    for frame in frames_for(&out, b.client)
+        .into_iter()
+        .chain(frames_for(&later, b.client))
+    {
+        mirror.apply(&frame).unwrap();
+    }
+    assert_eq!(mirror.ack_seq, 1, "new session acked from its own sequence");
 }
 
 #[test]

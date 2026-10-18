@@ -140,6 +140,9 @@ pub enum LeaveReason {
     Handoff,
     /// Zone disposed.
     Disposed,
+    /// A fresh ticket for the same principal started a new client session in
+    /// this slot (e.g. a page reload); see [`Zone::on_rejoin`].
+    Rejoined,
 }
 
 /// Player as seen by the zone.
@@ -206,6 +209,21 @@ pub trait Zone: Sized + Send + 'static {
 
     /// A player left for `reason` (not called on a disconnect still inside the grace window).
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId, _reason: LeaveReason) {}
+
+    /// A fresh ticket (not a reconnect token) arrived for a principal that
+    /// already holds a player slot here, e.g. the page was reloaded or opened
+    /// in another tab with the same identity. The old connection was
+    /// replaced (`Kick(REPLACED)`) and the new one is a new client session:
+    /// its input sequence starts again and it knows nothing about per-player
+    /// state the zone sent on join (own entity id, hello events…).
+    ///
+    /// Defaults to `on_leave(Rejoined)` then `on_join`, i.e. a fresh join in
+    /// the same [`PlayerId`]. Override to keep in-zone state and only resend
+    /// what the client needs.
+    fn on_rejoin(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        self.on_leave(ctx, player, LeaveReason::Rejoined);
+        self.on_join(ctx, player);
+    }
 
     /// An observer subscribed. Its principal and name are available from
     /// [`Ctx::observer`](crate::Ctx::observer); address it with

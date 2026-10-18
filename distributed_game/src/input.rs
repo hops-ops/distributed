@@ -151,6 +151,13 @@ impl<I> InputBuffer<I> {
     pub fn clear(&mut self) {
         self.queue.clear();
     }
+
+    /// Start a new sequence space (a new client session numbers its inputs
+    /// from 1 again): clears the queue and the last processed sequence.
+    pub fn reset_sequence(&mut self) {
+        self.queue.clear();
+        self.last_processed = 0;
+    }
 }
 
 /// Server-side input pacing: a player earns one input credit per tick (up
