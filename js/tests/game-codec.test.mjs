@@ -365,17 +365,9 @@ test('quantization reproduces the Rust integers and binary32 results exactly', (
 	}
 });
 
-/**
- * Rust fixtures plus the additive v1 messages (Redirect, Kick RELOAD) copied
- * from the world branch until it is merged; the Rust file wins once present.
- */
+/** Rust message fixtures, including the additive v1 Redirect and Kick RELOAD. */
 function allMessages() {
-	const { messages } = fixture('messages.json');
-	const extra = JSON.parse(
-		readFileSync(new URL('./fixtures/game-world-messages.json', import.meta.url), 'utf8')
-	).messages;
-	const names = new Set(messages.map((m) => m.name));
-	return [...messages, ...extra.filter((m) => !names.has(m.name))];
+	return fixture('messages.json').messages;
 }
 
 test('every message fixture encodes and decodes byte-exactly', () => {
