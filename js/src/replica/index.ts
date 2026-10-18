@@ -81,7 +81,15 @@ export type {
 	ReplicaIndexedDbPersistence,
 	ReplicaIndexedDbPersistenceOptions,
 	ReplicaPersistenceModelPolicy,
-	ReplicaPersistencePolicy
+	ReplicaPersistencePolicy,
+	ReplicaCommandOutbox,
+	ReplicaCommandOutboxCommandPolicy,
+	ReplicaCommandOutboxDrainReport,
+	ReplicaCommandOutboxEntrySummary,
+	ReplicaCommandOutboxOptions,
+	ReplicaCommandOutboxOutcome,
+	ReplicaCommandOutboxPolicy,
+	ReplicaCommandOutboxSettlement
 } from './persistence.js';
 export type {
 	PrepareReplicaCommandOptions,

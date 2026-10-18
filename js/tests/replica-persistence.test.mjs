@@ -219,8 +219,9 @@ test('persistence is explicit, IndexedDB-only, and fails closed without model po
 		databaseName: DATABASE
 	});
 
-	assert.equal(REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED, false);
-	assert.equal(persistence.supportsOfflineCommandOutbox, false);
+	// The opt-in command outbox exists, but nothing is durable without policy.
+	assert.equal(REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED, true);
+	assert.equal(persistence.supportsOfflineCommandOutbox, true);
 	assert.equal(await persistence.save(state()), false);
 	assert.equal(factory.entries(DATABASE).size, 0);
 	assert.equal('localStorage' in factory, false);

@@ -79,6 +79,7 @@ function inspectPackageContract(packageJson) {
 	assert.deepEqual(Object.keys(packageJson.exports).sort(), [
 		'.',
 		'./diagnostics',
+		'./game',
 		'./package.json',
 		'./react',
 		'./replica',
