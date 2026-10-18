@@ -16,8 +16,10 @@ default = []
 runtime = ["dep:tokio"]
 # Adapter that commits facts into a `distributed` AggregateCell.
 cell = ["dep:distributed", "dep:sha2"]
-# axum WebSocket zone server with signed-ticket admission.
-net = ["runtime", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros"]
+# Per-zone Prometheus metrics (dependency-free text exposition).
+metrics = []
+# axum WebSocket zone server with signed-ticket admission (+ /metrics).
+net = ["runtime", "metrics", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros"]
 
 [dependencies]
 serde_json = "1"

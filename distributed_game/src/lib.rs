@@ -32,6 +32,8 @@ pub mod facts;
 pub mod host;
 pub mod input;
 pub mod interest;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod protocol;

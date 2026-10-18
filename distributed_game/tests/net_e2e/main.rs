@@ -260,6 +260,7 @@ async fn latency_simulation_delays_but_preserves_order() {
     let sim = NetSim {
         latency: Duration::from_millis(40),
         jitter: Duration::from_millis(20),
+        ..NetSim::default()
     };
     let (url, server, handle) = start(Some(sim)).await;
     let mut ws = connect(&url, "z9").await;
