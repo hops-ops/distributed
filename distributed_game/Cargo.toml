@@ -43,3 +43,8 @@ required-features = ["net"]
 name = "cell_sink"
 path = "tests/cell_sink/main.rs"
 required-features = ["cell", "runtime"]
+
+[[example]]
+name = "echo_arena"
+path = "examples/echo_arena.rs"
+required-features = ["net"]
