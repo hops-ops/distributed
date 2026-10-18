@@ -5,8 +5,10 @@
  *   toggle prediction off (P) to see raw input latency (RTT + interpolation
  *   delay); the ghost (G) shows the latest authoritative server position;
  * - other players and drones: interpolated ~100 ms in the past;
- * - interest ring: entities beyond it are removed by the server (drones pop
- *   in/out at the edge); pillars are global entities.
+ * - interest ring: drones beyond it are removed by the server (they shrink
+ *   away over the last few metres before the edge); players and pillars are
+ *   global, so everyone in the room stays visible (dimmed outside the ring);
+ * - minimap (top right): everyone's position and the view ring.
  */
 import type { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector';
@@ -18,6 +20,7 @@ import type { RenderedEntity } from '@hops-ops/distributed/game';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { cameraRelative, FixedRate, InputSampler, toAxis } from '../shared/input.ts';
+import { Minimap, type MinimapDot } from '../shared/minimap.ts';
 import { createRing, createStage, material, toWorld } from '../shared/scene.ts';
 import { createArenaClient, DEFAULT_ZONE, KIND } from './client.ts';
 import { BUTTON_DASH, DASH_COOLDOWN, HALF, PLAYER_RADIUS, type MoveInput } from './movement.ts';
@@ -63,6 +66,7 @@ hud.toggle('Server ghost', true, (on) => (ghostOn = on), 'g');
 const mats = {
 	me: material(scene, 'me', '#6cc4ff'),
 	other: material(scene, 'other', '#f2a65a'),
+	otherFar: material(scene, 'other-far', '#f2a65a', 0.45),
 	ghost: material(scene, 'ghost', '#ffffff', 0.25),
 	drone: material(scene, 'drone', '#9ad16b'),
 	pillar: material(scene, 'pillar', '#7b8798')
@@ -91,6 +95,18 @@ const visuals = new Map<string, Visual>();
 const ghost = capsule('ghost', mats.ghost);
 const ring = createRing(scene, 14, '#6cc4ff');
 ring.setEnabled(false);
+
+/** Drones shrink away over this many metres inside the view-radius edge. */
+const FADE_BAND = 3;
+const COLORS = { me: '#6cc4ff', other: '#f2a65a', drone: '#9ad16b', pillar: '#7b8798' };
+const minimap = new Minimap({
+	half: HALF,
+	legend: [
+		{ color: COLORS.me, label: 'you' },
+		{ color: COLORS.other, label: 'players (global)' },
+		{ color: COLORS.drone, label: 'drones (in view only)' }
+	]
+});
 
 function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 	let visual = visuals.get(entity.key);
@@ -137,9 +153,15 @@ stage.onFrame((now, dtMs) => {
 	const authority = client.authority;
 	const rendered = client.render();
 	const seen = new Set<string>();
-	let me: { x: number; y: number } | undefined;
+	const isMine = (entity: RenderedEntity) =>
+		authority !== undefined && hello !== undefined && entity.zoneId === authority.zoneId && entity.id === hello.entity;
+	const mineEntity = rendered.find(isMine);
+	let me: { x: number; y: number } | undefined =
+		mineEntity === undefined ? undefined : { x: num(mineEntity, 'x'), y: num(mineEntity, 'y') };
+	const viewRadius = hello?.viewRadius ?? 14;
+	const dots: MinimapDot[] = [];
 	for (const entity of rendered) {
-		const mine = authority !== undefined && hello !== undefined && entity.zoneId === authority.zoneId && entity.id === hello.entity;
+		const mine = isMine(entity);
 		let fields = entity.fields;
 		if (mine && !predictionOn && authority !== undefined) {
 			// Prediction off: show the own capsule like everyone else, interpolated in the past.
@@ -150,18 +172,28 @@ stage.onFrame((now, dtMs) => {
 		const x = num({ fields }, 'x');
 		const y = num({ fields }, 'y');
 		seen.add(entity.key);
+		const distance = me === undefined ? 0 : Math.hypot(x - me.x, y - me.y);
 		if (visual.kind === KIND.drone) {
+			// Shrink toward the edge so culling at the ring reads as "out of view".
+			const s = Math.min(1, Math.max(0.2, (viewRadius - distance) / FADE_BAND));
 			visual.mesh.position.copyFrom(toWorld(x, y, 1.3));
 			visual.mesh.rotation.y = -num(entity, 'yaw');
+			visual.mesh.scaling.setAll(s);
+			dots.push({ x, y, color: COLORS.drone, size: 2 });
 		} else if (visual.kind === KIND.pillar) {
 			visual.mesh.position.copyFrom(toWorld(x, y, 1));
+			dots.push({ x, y, color: COLORS.pillar, size: Math.max(2, num(entity, 'r') * 2), hollow: true });
 		} else {
 			visual.mesh.position.copyFrom(toWorld(x, y, 0.9));
 			const dashing = num({ fields }, 'dash') > 0;
 			visual.mesh.scaling.copyFromFloats(dashing ? 1.25 : 1, 1, dashing ? 1.25 : 1);
 			const label = String(fields.name ?? '');
-			stage.labels.set(entity.key, visual.mesh as Mesh, mine ? `${label} (you)` : label, 1.4, mine ? 'me' : '');
+			const outside = !mine && distance > viewRadius;
+			if (!mine) (visual.mesh as Mesh).material = outside ? mats.otherFar : mats.other;
+			const text = mine ? `${label} (you)` : outside ? `${label} · outside view` : label;
+			stage.labels.set(entity.key, visual.mesh as Mesh, text, 1.4, mine ? 'me' : '');
 			if (mine) me = { x, y };
+			dots.push({ x, y, color: mine ? COLORS.me : COLORS.other, size: mine ? 4 : 3.5 });
 		}
 		visual.mesh.setEnabled(!entity.stale || visual.kind === KIND.pillar);
 	}
@@ -185,6 +217,7 @@ stage.onFrame((now, dtMs) => {
 		}
 	}
 
+	minimap.draw({ me, viewRadius, dots });
 	hud.frame({ entities: rendered.length });
 	const predictor = client.predictor;
 	const cd = authoritative === undefined ? 0 : num({ fields: authoritative }, 'cd');

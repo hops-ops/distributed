@@ -114,3 +114,32 @@ body {
 		max-height: 45%;
 	}
 }
+.minimap {
+	position: fixed;
+	top: 12px;
+	right: 12px;
+	padding: 8px;
+	border-radius: 8px;
+	background: var(--panel);
+	font-size: 11px;
+}
+.minimap canvas {
+	display: block;
+	border-radius: 4px;
+}
+.minimap ul {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 10px;
+	max-width: 180px;
+	margin: 6px 0 0;
+	padding: 0;
+	list-style: none;
+}
+.minimap li span {
+	display: inline-block;
+	width: 8px;
+	height: 8px;
+	margin-right: 4px;
+	border-radius: 50%;
+}
