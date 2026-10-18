@@ -1,0 +1,33 @@
+# Framework game demos: one binary, one subcommand per demo.
+# Own workspace (like tests/gateway-native) so demo-only dependencies never
+# reach the framework's lockfile; excluded from the root workspace.
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "game_demos"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Playable demos of the distributed_game authoritative runtime (dev only)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "game-demos"
+path = "src/main.rs"
+
+[dependencies]
+distributed_game = { path = "../../../distributed_game", features = ["net"] }
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+
+[dev-dependencies]
+distributed_game = { path = "../../../distributed_game", features = ["net", "bots"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
