@@ -8,6 +8,13 @@ import type {
 	ReplicaIndexedDbPersistenceOptions
 } from './types.js';
 import {
+	OUTBOX_STORE_NAME,
+	ReplicaCommandOutboxImpl,
+	type ReplicaCommandOutbox,
+	type ReplicaCommandOutboxOptions,
+	type StoredOutboxEntry
+} from './outbox.js';
+import {
 	DATABASE_VERSION,
 	DEFAULT_DATABASE_NAME,
 	STORE_NAME,
@@ -25,7 +32,7 @@ import {
 export class IndexedDbConfirmedStatePersistence
 	implements ReplicaIndexedDbPersistence
 {
-	readonly supportsOfflineCommandOutbox = false as const;
+	readonly supportsOfflineCommandOutbox = true as const;
 	readonly #factory: ReplicaIndexedDbFactory;
 	readonly #databaseName: string;
 	readonly #policy: NormalizedPolicy;
@@ -116,6 +123,33 @@ export class IndexedDbConfirmedStatePersistence
 		);
 	}
 
+	commandOutbox(options: ReplicaCommandOutboxOptions): ReplicaCommandOutbox {
+		this.#assertOpen();
+		const run = <T>(
+			mode: IDBTransactionMode,
+			operation: (store: IDBObjectStore) => Promise<T>
+		) => this.#transaction(mode, operation, OUTBOX_STORE_NAME);
+		return new ReplicaCommandOutboxImpl(
+			{
+				getAll: () =>
+					run('readonly', (store) => requestResult(store.getAll() as IDBRequest<unknown[]>)),
+				get: (commandId) =>
+					run('readonly', (store) => requestResult(store.get(commandId) as IDBRequest<unknown>)),
+				put: async (entry: StoredOutboxEntry) => {
+					await run('readwrite', async (store) => {
+						await requestResult(store.put(entry));
+					});
+				},
+				delete: async (commandId) => {
+					await run('readwrite', async (store) => {
+						await requestResult(store.delete(commandId));
+					});
+				}
+			},
+			options
+		);
+	}
+
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
@@ -148,14 +182,15 @@ export class IndexedDbConfirmedStatePersistence
 
 	async #transaction<T>(
 		mode: IDBTransactionMode,
-		operation: (store: IDBObjectStore) => Promise<T>
+		operation: (store: IDBObjectStore) => Promise<T>,
+		storeName: string = STORE_NAME
 	): Promise<T> {
 		const database = await this.#database();
 		this.#assertOpen();
-		const transaction = database.transaction(STORE_NAME, mode);
+		const transaction = database.transaction(storeName, mode);
 		const completion = transactionResult(transaction);
 		try {
-			const result = await operation(transaction.objectStore(STORE_NAME));
+			const result = await operation(transaction.objectStore(storeName));
 			await completion;
 			return result;
 		} catch (error) {
@@ -220,6 +255,9 @@ export function openDatabase(
 			const database = request.result;
 			if (!database.objectStoreNames.contains(STORE_NAME)) {
 				database.createObjectStore(STORE_NAME, { keyPath: 'identity' });
+			}
+			if (!database.objectStoreNames.contains(OUTBOX_STORE_NAME)) {
+				database.createObjectStore(OUTBOX_STORE_NAME, { keyPath: 'commandId' });
 			}
 		};
 		request.onsuccess = () => {

@@ -534,6 +534,26 @@ confirmed-state-only, and governed by generated/application model policy.
 Optimistic layers, command inputs, credentials, cache authority, and live
 connections are never persisted as replica data.
 
+The same persistence object offers an opt-in durable command outbox for
+offline use. It decorates the command transport: commands whose policy is
+explicitly `{ durable: true, sensitive: false }` are written to IndexedDB
+before they are sent and drained in order with their original command ids
+(the server's receipts deduplicate resends). Rejections surface to the live
+caller as `REPLICA_COMMAND_REJECTED` and, for commands replayed after a
+reload, through `onSettled`. Only the prepared request is stored — never
+optimistic state — and entries replay only under the same cache scope.
+
+```ts
+const outbox = persistence.commandOutbox({
+  transport,                       // the network command transport
+  scope: () => currentAuthoritativeScope,
+  policy: { commands: { 'todo.create': { durable: true, sensitive: false } } },
+  onSettled: ({ commandId, outcome }) => console.info(commandId, outcome)
+});
+const commands = createCommands(replica, outbox.transport);
+addEventListener('online', () => void outbox.drain());
+```
+
 Diagnostics are also opt-in:
 
 ```ts
@@ -552,6 +572,46 @@ collection. Defaults pseudonymize identities and omit values, arguments,
 credentials, trusted presets, raw command inputs, and cache scope. Revealing
 additional development detail requires an in-process capability plus an
 explicit redactor.
+
+## Game zones
+
+`@hops-ops/distributed/game` speaks the `distributed_game` binary protocol
+(golden-tested against the Rust fixtures). The app supplies tickets — a
+function, so a fresh single-use ticket is fetched whenever a reconnect token
+can no longer be used — and a pure `predict` for its own entity.
+
+```ts
+import { GameClient } from '@hops-ops/distributed/game';
+
+const game = new GameClient<{ dx: number; dy: number }>({
+  url: (zone) => `wss://game.example/zones/${zone}`,
+  ticket: ({ zoneId, role }) => api.mintZoneTicket(zoneId, role),
+  prediction: {
+    encodeInput: ({ dx, dy }) => new Uint8Array([dx & 0xff, dy & 0xff]),
+    predict: (s, i, dt) => ({ x: s.x + i.dx * 10 * dt / 1000, y: s.y + i.dy * 10 * dt / 1000 }),
+    corrections: { avatar: { x: { mode: 'ease', durationMs: 120 }, hp: { mode: 'replace' } } }
+  }
+});
+await game.connect('room-1');
+game.on('event', (zone, e) => { /* e.g. announce the controlled entity */ });
+game.setControlledEntity(myEntityId);
+game.sendInput({ dx: 1, dy: 0 });
+requestAnimationFrame(function frame() { draw(game.render()); requestAnimationFrame(frame); });
+```
+
+`render()` merges the authoritative zone and observed neighbours (`observe`)
+sampled at `serverNow − interpolationDelay` (two patch intervals by default),
+with the controlled entity at its predicted state. Reconciliation rebases on
+every Delta's `ack_seq`; per-field `ease`, `snap` or `replace` resolves the
+divergence. A server Handoff connects to the target zone with the transfer
+ticket (following `Redirect`s) and swaps authority while the previous world
+keeps rendering; if the target refuses or stays silent the same Hello goes
+back to the source zone, then a fresh ticket. `Kick(RELOAD)` and handshake
+`VERSION_MISMATCH` emit `reloadRequired`; supply `reloadContent` (or call
+`connection.resumeAfterReload(version)`) to rejoin with the new content.
+`encodeInput(input, ctx)` receives the interpolation delay and view tick for
+server-side lag compensation (`replica.interpolationDelayMs`,
+`client.inputContext()`).
 
 ## Protocol and security boundaries
 
@@ -585,6 +645,10 @@ duplicated as decision documents in this package.
 - `@hops-ops/distributed/sveltekit/vite` — public Vite plugin, virtual module
   aliases, and GraphQL HTTP/WebSocket proxy helpers.
 - `@hops-ops/distributed/react` — provider and query hook over the same replica.
+- `@hops-ops/distributed/game` — binary `distributed_game` zone protocol
+  client: codec, `GameConnection` (handshake, reconnect, clock sync),
+  interpolating `EntityReplica`, `Predictor` reconciliation and the
+  multi-zone `GameClient` with handoff. See `distributed_game/PROTOCOL.md`.
 
 All other subpaths are private and blocked by the package export map.
 

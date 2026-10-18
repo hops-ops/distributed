@@ -74,3 +74,8 @@ required-features = ["cell", "runtime"]
 name = "world"
 path = "tests/world/main.rs"
 required-features = ["net", "lease", "sqlite"]
+
+[[example]]
+name = "echo_arena"
+path = "examples/echo_arena.rs"
+required-features = ["net"]
