@@ -5,7 +5,7 @@
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 
-const DEMOS = ['arena'];
+const DEMOS = ['arena', 'grid', 'ripple'];
 const server = process.env.GAME_DEMOS_SERVER ?? 'http://127.0.0.1:2567';
 
 export default defineConfig({

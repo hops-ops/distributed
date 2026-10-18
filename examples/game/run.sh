@@ -3,6 +3,8 @@
 #
 #   ./run.sh arena          build what is needed, start the arena server
 #                           (dev routes on) + Vite, print the URL
+#   ./run.sh grid|ripple    same with TWO hosts (A on GAME_DEMOS_PORT, B on
+#                           the next port), one process each
 #   ./run.sh smoke          every demo's smoke tests (Rust bots + headless JS)
 #   ./run.sh list           demos this script knows
 #
@@ -16,7 +18,9 @@ REPO="$(cd "$HERE/../.." && pwd)"
 SERVER="$HERE/server"
 CLIENT="$HERE/client"
 BIN="$SERVER/target/debug/game-demos"
-DEMOS=(arena)
+DEMOS=(arena grid ripple)
+# Multi-host demos: `game-demos <demo> --host-id A|B --peer …`.
+CLUSTER_DEMOS=(grid ripple)
 
 log() { printf '\033[1;36m[demos]\033[0m %s\n' "$*"; }
 
@@ -76,6 +80,51 @@ run_demo() {
 	GAME_DEMOS_SERVER="http://127.0.0.1:$port" GAME_DEMOS_CLIENT_PORT="$client_port" npx vite
 }
 
+wait_listening() {
+	local log_file="$1" pid="$2" what="$3"
+	for _ in $(seq 1 100); do
+		grep -q '^LISTENING' "$log_file" && return 0
+		if ! kill -0 "$pid" 2>/dev/null; then
+			cat "$log_file"
+			echo "$what failed to start" >&2
+			exit 1
+		fi
+		sleep 0.1
+	done
+}
+
+run_cluster() {
+	local demo="$1"
+	local port_a="${GAME_DEMOS_PORT:-2567}"
+	local port_b=$((port_a + 1))
+	local client_port="${GAME_DEMOS_CLIENT_PORT:-5173}"
+	ensure_sdk
+	ensure_client
+	ensure_server
+
+	local dir secret
+	dir="$(mktemp -d "${TMPDIR:-/tmp}/game-demos-$demo.XXXXXX")"
+	# Both hosts must share the ticket secret (and derive the admin secret).
+	secret="${DISTRIBUTED_GAME_SECRET:-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')}"
+	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_a" --host-id A \
+		--peer "B=127.0.0.1:$port_b" --state-dir "$dir" >"$dir/A.log" 2>&1 &
+	local pid_a=$!
+	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_b" --host-id B \
+		--peer "A=127.0.0.1:$port_a" --state-dir "$dir" >"$dir/B.log" 2>&1 &
+	local pid_b=$!
+	trap 'kill "$pid_a" "$pid_b" 2>/dev/null || true; wait "$pid_a" "$pid_b" 2>/dev/null || true; rm -rf "$dir"' EXIT INT TERM
+	wait_listening "$dir/A.log" "$pid_a" "game-demos $demo host A"
+	wait_listening "$dir/B.log" "$pid_b" "game-demos $demo host B"
+	sed -n '2p' "$dir/A.log"
+	sed -n '2p' "$dir/B.log"
+	echo
+	log "open  http://localhost:$client_port/$demo/   (hosts A :$port_a, B :$port_b, dev routes ON — local only)"
+	log "snapshots in $dir (removed on exit)"
+	echo
+	cd "$CLIENT"
+	GAME_DEMOS_SERVER="http://127.0.0.1:$port_a" GAME_DEMOS_CLIENT_PORT="$client_port" npx vite
+}
+
 smoke() {
 	ensure_sdk
 	ensure_client
@@ -92,9 +141,11 @@ smoke() {
 case "${1:-}" in
 	smoke) smoke ;;
 	list) printf '%s\n' "${DEMOS[@]}" ;;
-	"" | -h | --help | help) sed -n '2,13p' "$0" ;;
+	"" | -h | --help | help) sed -n '2,15p' "$0" ;;
 	*)
-		if [[ " ${DEMOS[*]} " == *" $1 "* ]]; then
+		if [[ " ${CLUSTER_DEMOS[*]} " == *" $1 "* ]]; then
+			run_cluster "$1"
+		elif [[ " ${DEMOS[*]} " == *" $1 "* ]]; then
 			run_demo "$1"
 		else
 			echo "unknown demo '$1' (known: ${DEMOS[*]})" >&2
