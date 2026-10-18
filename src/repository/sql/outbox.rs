@@ -51,7 +51,11 @@ pub(crate) fn inserts(
                 )),
                 Some(SqlBind::from(message.status.as_str())),
                 Some(SqlBind::Timestamp(message.created_at)),
-                Some(SqlBind::Timestamp(message.created_at)),
+                // `next_available_at` doubles as the durable timer: a scheduled
+                // message is invisible to every claim query until it is due.
+                Some(SqlBind::Timestamp(
+                    message.deliver_at.unwrap_or(message.created_at),
+                )),
                 message.worker_id.as_deref().map(SqlBind::from),
                 message.leased_until.map(SqlBind::Timestamp),
                 Some(SqlBind::Integer(i64::from(message.attempts))),
@@ -93,6 +97,11 @@ pub(crate) fn from_row(row: impl SqlRow) -> Result<OutboxMessage, RepositoryErro
             metadata.insert(column.into(), value);
         }
     }
+    let created_at = row.timestamp("created_at")?;
+    // A row is "scheduled" only while its availability is later than its
+    // creation; releases bump `next_available_at` to the release time, which is
+    // already past, so the decoded value never delays a claimable row.
+    let deliver_at = Some(row.timestamp("next_available_at")?).filter(|at| *at > created_at);
     Ok(OutboxMessage {
         id: row.text("message_id")?,
         event_type: row.text("event_type")?,
@@ -102,7 +111,7 @@ pub(crate) fn from_row(row: impl SqlRow) -> Result<OutboxMessage, RepositoryErro
             .map_err(|_| RepositoryError::Model("invalid outbox payload codec version".into()))?,
         status,
         metadata,
-        created_at: row.timestamp("created_at")?,
+        created_at,
         worker_id: row.optional_text("claimed_by")?,
         leased_until: row.optional_timestamp("claimed_until")?,
         attempts: u32::try_from(row.integer("attempts")?)
@@ -115,6 +124,7 @@ pub(crate) fn from_row(row: impl SqlRow) -> Result<OutboxMessage, RepositoryErro
             .optional_integer("source_sequence")?
             .map(|value| unsigned(value, "outbox source sequence"))
             .transpose()?,
+        deliver_at,
     })
 }
 

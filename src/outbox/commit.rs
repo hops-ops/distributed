@@ -254,10 +254,14 @@ where
         if let Some(config) = publisher {
             if config.schedule.is_none() {
                 let now = crate::time::now();
+                // Scheduled (not yet due) rows stay pending for the worker
+                // that honours `deliver_at`; only due rows are pre-claimed.
                 for message in &mut self.outbox_messages {
-                    message.claim_at(&config.worker_id, config.lease, now)?;
+                    if message.is_due_at(now) {
+                        message.claim_at(&config.worker_id, config.lease, now)?;
+                        fallback_rows.push(message.clone());
+                    }
                 }
-                fallback_rows = self.outbox_messages.clone();
             }
         }
 
@@ -484,6 +488,62 @@ mod tests {
         })
         .await
         .expect("immediate publish should finish after the gate opens");
+    }
+
+    struct RecordingHook {
+        published: Mutex<Vec<String>>,
+    }
+
+    impl OutboxPublishHook for RecordingHook {
+        fn publish_claimed<'a>(
+            &'a self,
+            claimed: Vec<OutboxMessage>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), RepositoryError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.published
+                    .lock()
+                    .unwrap()
+                    .extend(claimed.iter().map(|m| m.id().to_string()));
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_publish_leaves_scheduled_rows_pending() {
+        let hook = Arc::new(RecordingHook {
+            published: Mutex::new(Vec::new()),
+        });
+        let mut repo = InMemoryRepository::new().aggregate::<Dummy>();
+        repo.set_outbox_publisher(OutboxPublisherConfig::new(
+            Arc::clone(&hook) as Arc<dyn OutboxPublishHook>,
+            "immediate:test",
+            Duration::from_secs(5),
+        ));
+        let mut aggregate = Dummy::default();
+        aggregate.touch().unwrap();
+        let now = crate::time::now();
+        let due = OutboxMessage::create("due", "T", vec![]).unwrap();
+        let timer = OutboxMessage::create("timer", "T", vec![])
+            .unwrap()
+            .deliver_after(now, Duration::from_secs(3600));
+        repo.outbox(due)
+            .outbox(timer)
+            .commit(&mut aggregate)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while hook.published.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*hook.published.lock().unwrap(), vec!["due".to_string()]);
+        let pending = repo.repo().outbox_store().pending(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id(), "timer");
+        assert!(pending[0].deliver_at.is_some());
     }
 
     #[tokio::test]
