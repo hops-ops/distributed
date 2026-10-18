@@ -299,6 +299,35 @@ fn same_seed_and_input_log_reproduce_state() {
     assert_ne!(run_scripted(7).0, first.0, "different seed diverges");
 }
 
+/// A sink written the way a downstream crate would: only crate-root
+/// imports (`distributed_game::{BoxFuture, Fact, FactSink, ...}`).
+mod external_sink {
+    use distributed_game::{BoxFuture, Fact, FactError, FactReceipt, FactSink};
+
+    pub struct CountingSink(pub std::sync::atomic::AtomicUsize);
+
+    impl FactSink for CountingSink {
+        fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+            Box::pin(async move {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(FactReceipt {
+                    payload: serde_json::json!({ "key": fact.key() }),
+                    replayed: false,
+                })
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn facts_sink_implementable_from_crate_root_exports() {
+    let sink = external_sink::CountingSink(Default::default());
+    let fact = Fact::new("k1", "cmd", serde_json::json!({}));
+    let receipt = sink.commit(&fact).await.unwrap();
+    assert_eq!(receipt.payload["key"], "k1");
+    assert_eq!(sink.0.load(Ordering::SeqCst), 1);
+}
+
 /// Sink that takes `delay` per commit (simulated slow storage).
 struct SlowSink {
     delay: Duration,
@@ -309,7 +338,7 @@ impl FactSink for SlowSink {
     fn commit<'a>(
         &'a self,
         fact: &'a Fact,
-    ) -> distributed_game::facts::BoxFuture<'a, Result<FactReceipt, FactError>> {
+    ) -> distributed_game::BoxFuture<'a, Result<FactReceipt, FactError>> {
         Box::pin(async move {
             tokio::time::sleep(self.delay).await;
             self.inner.commit(fact).await
@@ -386,7 +415,7 @@ impl FactSink for FlakySink {
     fn commit<'a>(
         &'a self,
         fact: &'a Fact,
-    ) -> distributed_game::facts::BoxFuture<'a, Result<FactReceipt, FactError>> {
+    ) -> distributed_game::BoxFuture<'a, Result<FactReceipt, FactError>> {
         Box::pin(async move {
             if fact.key() == self.permanent_key {
                 return Err(FactError::Permanent("no such player".into()));

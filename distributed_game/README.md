@@ -100,7 +100,10 @@ stamps zone/tick/content version. A `FactSink` commits facts on a worker
 with bounded retries/backoff; `Zone::on_fact_settled` receives the outcome
 on a later tick. `cell::CellFactSink` dispatches into an `AggregateCell`
 with a deterministic command id per fact key, so retries replay instead of
-double-crediting.
+double-crediting. A custom sink needs only crate-root imports:
+`impl FactSink for MySink { fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> { Box::pin(async move { … }) } }`
+(`BoxFuture` is also re-exported from `world` and `net` for
+`ZoneOwnership` / `BarrierParticipant` impls).
 
 ## Netcode and operations
 

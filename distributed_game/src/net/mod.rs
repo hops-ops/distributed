@@ -60,6 +60,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+pub use crate::facts::BoxFuture;
 pub use ticket::{
     decode_hs256, NonceCache, SharedTicketVerifier, TicketError, TicketKey, TicketVerifier,
     VerifiedTicket,

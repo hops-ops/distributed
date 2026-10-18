@@ -19,6 +19,7 @@ pub mod ownership;
 pub mod state;
 pub mod topology;
 
+pub use crate::facts::BoxFuture;
 pub use barrier::{BarrierMode, FreezeState, StalePolicy};
 pub use directory::{HashRing, HostAddr, StaticDirectory, ZoneDirectory};
 #[cfg(feature = "lease")]
