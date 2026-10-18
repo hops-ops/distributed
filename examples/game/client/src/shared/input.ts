@@ -100,7 +100,12 @@ function firstGamepad(): Gamepad | undefined {
 	return activeGamepad();
 }
 
-const neutralSeen = new WeakMap<Gamepad, boolean>();
+/**
+ * Pads whose right stick has been seen at rest, by `index:id`. Browsers return
+ * a fresh snapshot object from every `getGamepads()` call, so the pad object
+ * itself cannot be the key.
+ */
+const neutralSeen = new Set<string>();
 
 /**
  * Right stick (+x right, +y up) of a `standard` pad, with deadzone. Other
@@ -113,9 +118,10 @@ export function rightStick(deadzone = DEADZONE): { x: number; y: number } {
 	if (pad === undefined || pad.mapping !== 'standard') return { x: 0, y: 0 };
 	const x = pad.axes[2] ?? 0;
 	const y = -(pad.axes[3] ?? 0);
-	if (!neutralSeen.get(pad)) {
+	const key = `${pad.index}:${pad.id}`;
+	if (!neutralSeen.has(key)) {
 		if (Math.hypot(x, y) > deadzone) return { x: 0, y: 0 };
-		neutralSeen.set(pad, true);
+		neutralSeen.add(key);
 	}
 	return { x: Math.abs(x) > deadzone ? x : 0, y: Math.abs(y) > deadzone ? y : 0 };
 }

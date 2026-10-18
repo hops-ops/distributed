@@ -173,12 +173,14 @@ export function createStage(canvas: HTMLCanvasElement, options: StageOptions): S
 			if (view === 'first') {
 				eye.position.set(x, EYE_HEIGHT, y);
 				// Keep the orbit camera centred so switching back is seamless.
-				camera.setTarget(new Vector3(x, 0, y));
+				camera.setTarget(new Vector3(x, 0, y), false, false, true);
 				return;
 			}
 			const k = 1 - Math.exp(-dtMs / 120);
 			const t = camera.target;
-			camera.setTarget(new Vector3(t.x + (x - t.x) * k, 0, t.z + (y - t.z) * k));
+			// cloneAlphaBetaRadius: keep the orbit angles; the default rebuilds
+			// them from the last rendered position, undoing stick look.
+			camera.setTarget(new Vector3(t.x + (x - t.x) * k, 0, t.z + (y - t.z) * k), false, false, true);
 		},
 		onFrame(callback) {
 			frameCallbacks.push(callback);
