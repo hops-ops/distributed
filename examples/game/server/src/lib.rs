@@ -7,7 +7,10 @@
 //! See `examples/game/README.md`.
 
 pub mod arena;
+pub mod cluster;
 pub mod common;
 pub mod freeze;
 pub mod gallery;
+pub mod grid;
 pub mod mobpit;
+pub mod ripple;

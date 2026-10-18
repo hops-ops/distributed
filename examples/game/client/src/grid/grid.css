@@ -1,0 +1,71 @@
+.grid-toasts {
+	position: fixed;
+	top: 14px;
+	left: 50%;
+	transform: translateX(-50%);
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	align-items: center;
+	pointer-events: none;
+	z-index: 5;
+	max-width: calc(100% - 32px);
+}
+.grid-toast {
+	padding: 7px 12px;
+	border-radius: 6px;
+	background: var(--panel);
+	border: 1px solid #2a3240;
+	transition: opacity 0.5s, transform 0.5s;
+}
+.grid-toast.restored {
+	border-color: #8fd3ff;
+	color: #cfeeff;
+}
+.grid-toast.host {
+	border-color: #ffb36b;
+}
+.grid-toast.error {
+	border-color: #ff6b6b;
+}
+.grid-toast.out {
+	opacity: 0;
+	transform: translateY(-6px);
+}
+.grid-map {
+	position: fixed;
+	right: 12px;
+	bottom: 12px;
+	padding: 8px;
+	border-radius: 8px;
+	background: var(--panel);
+}
+.grid-map canvas {
+	display: block;
+	width: 195px;
+	height: 195px;
+	image-rendering: pixelated;
+}
+.grid-legend {
+	margin-top: 6px;
+	font-size: 11px;
+	max-width: 195px;
+}
+.grid-legend .swatch {
+	display: inline-block;
+	width: 9px;
+	height: 9px;
+	margin-right: 5px;
+	border-radius: 2px;
+}
+.grid-legend small {
+	display: block;
+	margin-top: 3px;
+	color: var(--muted);
+}
+@media (max-width: 640px) {
+	.grid-map canvas {
+		width: 130px;
+		height: 130px;
+	}
+}

@@ -1,8 +1,9 @@
 //! **Arena** — the baseline netcode demo.
 //!
 //! Mechanics on display: fixed 30 Hz tick / 20 Hz patches, binary deltas,
-//! interest management (14 m view radius on a 40×40 m floor: far drones pop
-//! in and out at the ring's edge), client prediction + reconciliation of the
+//! interest management (14 m view radius on a 40×40 m floor: far drones are
+//! culled at the ring's edge; players are global so you always see everyone
+//! in the room), client prediction + reconciliation of the
 //! own capsule ([`movement`] is shared with the TypeScript client) and
 //! interpolation of everything else (players, ~30 wandering drones).
 //!
@@ -10,7 +11,7 @@
 //!
 //! | kind | ids | fields | notes |
 //! |---|---|---|---|
-//! | 1 `player` | 1000 + player | x y vx vy dash cd name | full [`MoveState`] so clients can rebase |
+//! | 1 `player` | 1000 + player | x y vx vy dash cd name | global; full [`MoveState`] so clients can rebase |
 //! | 2 `drone`  | 1..=30 | x y yaw | wander between random targets |
 //! | 3 `pillar` | 100 + i | x y r | global (visible everywhere) |
 //!
@@ -236,21 +237,26 @@ impl Zone for Arena {
     fn replicate(&self, out: &mut WorldView) {
         for p in self.players.values() {
             let s = p.state;
-            out.push(EntityState::new(
-                p.entity,
-                KIND_PLAYER,
-                s.x,
-                s.y,
-                vec![
-                    FieldValue::F(s.x),
-                    FieldValue::F(s.y),
-                    FieldValue::F(s.vx),
-                    FieldValue::F(s.vy),
-                    FieldValue::U(s.dash.into()),
-                    FieldValue::U(s.cooldown.into()),
-                    FieldValue::Str(p.name.clone()),
-                ],
-            ));
+            out.push(
+                EntityState::new(
+                    p.entity,
+                    KIND_PLAYER,
+                    s.x,
+                    s.y,
+                    vec![
+                        FieldValue::F(s.x),
+                        FieldValue::F(s.y),
+                        FieldValue::F(s.vx),
+                        FieldValue::F(s.vy),
+                        FieldValue::U(s.dash.into()),
+                        FieldValue::U(s.cooldown.into()),
+                        FieldValue::Str(p.name.clone()),
+                    ],
+                )
+                // Players are global: a small room shows everyone; only drones are
+                // culled by the view radius.
+                .global(),
+            );
         }
         for d in &self.drones {
             out.push(

@@ -519,3 +519,35 @@ async fn custom_verifier_admits_web_bff_tickets_with_replay_protection() {
     server.shutdown();
     handle.await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_config_hook_sets_per_zone_rates() {
+    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    config.host.tick_rate = 30;
+    config.host.content_version = "c1".into();
+    let server = GameServer::<Arena>::new(config, |zone_id| {
+        zone_id.starts_with('z').then(ArenaConfig::default)
+    })
+    .with_host_config(|zone_id, host| {
+        if zone_id == "z-slow" {
+            host.tick_rate = 5;
+            host.patch_rate = 2;
+            host.content_version = "ignored".into();
+        }
+    });
+    assert!(server.activate("z-slow"));
+    assert!(server.activate("z-hot"));
+    let slow = server
+        .inspect("z-slow", |h| {
+            (
+                h.config().tick_rate,
+                h.config().patch_rate,
+                h.config().content_version.clone(),
+            )
+        })
+        .await;
+    assert_eq!(slow, Some((5, 2, "c1".to_string())), "world version wins");
+    let hot = server.inspect("z-hot", |h| h.config().tick_rate).await;
+    assert_eq!(hot, Some(30));
+    server.shutdown();
+}

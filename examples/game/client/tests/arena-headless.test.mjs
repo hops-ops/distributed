@@ -64,9 +64,9 @@ test('headless client joins the arena and moves with exact prediction', { timeou
 		await api.setNetSim({ latencyMs: 0, jitterMs: 0, loss: 0 });
 		assert.deepEqual(await api.getNetSim(), { latencyMs: 0, jitterMs: 0, loss: 0 });
 
-		// A second guest: interest management hides the first one while it is
-		// beyond the view radius; walking toward it makes it appear,
-		// interpolated (not predicted) with its display name.
+		// A second guest: players are global, so it sees the first one at any
+		// distance (interpolated, not predicted, with its display name), while
+		// drones stay culled by the view radius.
 		const other = createArenaClient({
 			api: new DevApi({ base: server.httpUrl, name: () => 'Other', storage: memoryStorage() }),
 			base: server.httpUrl
@@ -77,20 +77,19 @@ test('headless client joins the arena and moves with exact prediction', { timeou
 		await until(() => other.client.predictor.active, 5_000, 'second entity bound');
 		const sees = () =>
 			other.client.render().some((e) => e.id === hello.entity && !e.predicted && e.fields.name === 'Headless');
-		const deadline = Date.now() + 10_000;
-		while (!sees() && Date.now() < deadline) {
-			const at = stateFromFields(other.client.predictor.predicted());
-			const dx = server_.x - at.x;
-			const dy = server_.y - at.y;
-			const d = Math.hypot(dx, dy);
-			if (d > otherHello.viewRadius + 2) {
-				assert.ok(!other.client.authority.replica.has(hello.entity), 'out of view radius: not replicated');
-			}
-			const k = d > 1 ? 127 / d : 0;
-			other.client.sendInput({ mx: Math.round(dx * k), my: Math.round(dy * k), buttons: 0 });
-			await sleep(1000 / 30);
-		}
-		assert.ok(sees(), 'remote player visible once within the view radius');
+		await until(sees, 5_000, 'remote player visible regardless of distance');
+		await until(
+			() => {
+				const at = stateFromFields(other.client.predictor.predicted());
+				const drones = other.client.render().filter((e) => e.kindName === 'drone' && !e.stale);
+				return (
+					drones.length > 0 &&
+					drones.every((d) => Math.hypot(d.fields.x - at.x, d.fields.y - at.y) <= otherHello.viewRadius * 1.25 + 1)
+				);
+			},
+			5_000,
+			'only drones near the view radius are replicated'
+		);
 	} finally {
 		for (const c of clients) c.close();
 		await server.stop();

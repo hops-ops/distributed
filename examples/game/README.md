@@ -13,6 +13,8 @@ guests and lets any page change the network simulation.
 | **Leaderboard** | `./run.sh leaderboard` | Same server as Mob Pit: kills/XP sorted-set boards (in-memory or Redis) fed fire-and-forget with idempotent apply keys, top 10 pushed live, your rank + neighbours, rebuild from the cells' event history |
 | **Shooting Gallery** | `./run.sh gallery` | Lag compensation: hitscan shots resolved with `ctx.rewind().hit_test_shot` at the shooter's view time (`client_tick` + interpolation delay in the payload), `max_rewind` clamp, per-shot compensation on/off, predicted vs confirmed hits |
 | **The Freeze** | `./run.sh freeze` | World-version barrier (`WorldCoordinator::rollout`) across **two server processes** as an in-world "admin update": freeze → apply → resume with change notes, inputs dropped while frozen, Hard reload vs safe-room gating (`StalePolicy::SafeRoom`, `Zone::is_gate`) of old clients, aborted rollout (`freeze_ready` → `NotAcked`), facts/events stamped with the content version |
+| **Endless Grid** | `./run.sh grid` | Seeded procedural world (terrain/biomes/props generated bit-identically in Rust and TS, nothing static replicated), 32 m cells as zones, observer connections to the 8 neighbours, handoff across borders **and hosts** (2 processes, hash ring, Redirect + transfer tickets), hibernation to SQLite and restore |
+| **Boss Ripple** | `./run.sh ripple` | Zone hierarchy realm › city › borough › hood (`DottedTopology`), per-tier tick rates (2/5/10/30 Hz), boss defeats propagating up as tier-up events (each hop on another host), parent broadcasts reaching players through observer connections |
 
 `./run.sh smoke` runs every demo's smoke tests; `./run.sh list` lists demos.
 
@@ -88,6 +90,72 @@ their stamp. Display names live on the primary host: a player joining Ember
 Fields directly (`&zone=freeze-ember`) shows as a guest there, names carry
 over portals.
 
+## Endless Grid
+
+```sh
+examples/game/run.sh grid
+# → http://localhost:5173/grid/   (?zone=grid.4.-2&name=Ana optional)
+```
+
+Two `game-demos grid` processes: host **A** on `GAME_DEMOS_PORT` (Vite
+proxies to it) and **B** on the next port, each listing the other with
+`--peer`, sharing one ticket secret (the admin secret for host-to-host calls
+is derived from it) and keeping hibernation snapshots under one
+`--state-dir` (`grid-A.sqlite3`, `grid-B.sqlite3`).
+
+- **World.** Cell `(x, y)` is zone `grid.<x>.<y>` (canonical integers,
+  |x|,|y| ≤ 10⁶; the server uses `FlatTopology`, the dots are not a
+  hierarchy). Its terrain height, biome and props are a pure function of
+  `(seed, x, y, CONTENT_VERSION)` in `server/src/grid/world.rs` and its twin
+  `client/src/grid/world.ts` (u32 hashing + binary32 value noise; checked
+  bit-for-bit by `fixtures/grid-world.json`). Props sit inside 8 m
+  sub-cells 2 m from their edges, so lines every 8 m are free trails and no
+  prop reaches across a border. Seed: `DG_GRID_SEED`.
+- **Zones.** A cell simulates walkers (predicted with the shared step,
+  colliding with the cell's props) and 2–4 critters. Past a border by
+  0.5 m the walker is handed off with its position in the neighbour's
+  frame (`ctx.handoff`); the SDK follows the Handoff — through a Redirect
+  when the neighbour lives on the other host (`HashRing`, 64 vnodes).
+- **Interest across borders.** The client observes the 8 neighbours and
+  re-syncs on every authority change; entities are drawn at
+  `cell × 32 + local` around a floating origin.
+- **Hibernation.** Nobody inside or observing → Idle → Dormant after 2 s →
+  hibernated after 4 s more (`--hibernate-after-ms`): critters and markers
+  (E) go to SQLite and come back on the next activation; its hello says
+  `restored` and the page toasts. The minimap (`GET /dev/grid/map`, which
+  asks the peer for its cells) shows active / hibernated / cold cells per
+  host; borders are tinted by owning host.
+
+Controls: WASD / stick, Space/Shift sprint, E drops a marker.
+
+## Boss Ripple
+
+```sh
+examples/game/run.sh ripple
+# → http://localhost:5173/ripple/   (?hood=realm.city.borough-2.hood-3 optional)
+```
+
+`realm` › `realm.city` › `realm.city.borough-{1,2}` ›
+`….hood-{1,2,3}`. Placement alternates by depth over the two hosts (hoods
+and the city on A, boroughs and the realm on B), so every hop is a
+`/admin/child-event` call between processes. Tick rates per tier come from
+`GameServer::with_host_config`: realm 2 Hz (keeps an idle background
+clock), city 5, borough 10, hood 30. Upper tiers refuse players; they are
+observed.
+
+1. A hood's boss falls (E near it, or "Smite") → `boss_defeated` to the root.
+2. The borough tallies its hoods; all down → `borough_cleared` (unlocked).
+3. The city's weather follows the remaining bosses (storm → rain →
+   clearing → clear) and is broadcast to its observers — every player
+   observes the city, so the sky over their hood changes; both boroughs
+   cleared → `city_liberated`.
+4. The realm counts everything and broadcasts a banner.
+
+Bosses respawn after 60 s (`boss_respawned` re-locks the borough). Every
+tier's state is its hibernation snapshot. The page shows the tree with
+each tier's host, rate and clock, animates each hop, and lets you click a
+hood to fight there.
+
 ## Architecture
 
 ```
@@ -121,13 +189,17 @@ examples/game/
   server/                    Rust crate `game_demos`, its own cargo workspace
     src/main.rs              `game-demos <demo>` subcommands
     src/common/              shared: Demo trait, run/spawn, dev routes, guests, JSON events
+    src/cluster.rs           multi-host demos: --host-id/--peer, directory, ownership, snapshots
     src/arena/               Arena zone + movement.rs (twin of client movement.ts)
     src/mobpit/              Mob Pit zone, Crawler cell aggregate, fact sink, leaderboards, dev routes
     src/gallery/             Shooting Gallery zone (targets, rewind hit tests)
     src/freeze/              The Freeze zone, content packs, two-host world + admin routes
+    src/grid/                Endless Grid zone, world.rs (twin of world.ts), dev map routes
+    src/ripple/              Boss Ripple tiers and placement
     tests/                   arena_smoke.rs (bots, dev routes), movement_fixture.rs,
                              mobpit_smoke.rs (facts, slow storage, kill -9 recovery, boards),
-                             gallery_smoke.rs, freeze_smoke.rs
+                             gallery_smoke.rs, freeze_smoke.rs, grid_smoke.rs, grid_fixture.rs,
+                             ripple_smoke.rs (+ support/ for two in-process hosts)
   client/                    Vite + TypeScript + Babylon.js 9.30 (multi-page)
     index.html, <demo>/index.html
     src/shared/              hud.ts, input.ts, scene.ts, dev-api.ts, events.ts, style.css
@@ -136,8 +208,11 @@ examples/game/
     src/leaderboard/         main.ts (DOM page over the observer connection), style.css
     src/gallery/             client.ts (shots, adaptive delay), main.ts
     src/freeze/              client.ts (content packs, live patch / reload, admin API), main.ts
+    src/grid/, src/ripple/   client.ts (headless), main.ts (Babylon); grid/world.ts
     tests/                   movement-parity, arena-headless, mobpit-headless, leaderboard-headless,
-                             gallery-headless, freeze-headless (+ helpers/demo-server.mjs, helpers/mobpit.mjs)
+                             gallery-headless, freeze-headless, grid-world-parity, grid-headless,
+                             ripple-headless (+ helpers/demo-server.mjs, helpers/mobpit.mjs,
+                             helpers/cluster.mjs for multi-host demos)
 ```
 
 The server crate is excluded from the root workspace (`Cargo.toml`
@@ -286,6 +361,12 @@ pending, recent commits), `GET /dev/mobpit/crawlers` (every cell on disk),
 4. **Headless test** — `client/tests/<demo>-headless.test.mjs` with
    `startDemo('<demo>')` from `tests/helpers/demo-server.mjs`.
 5. Register the demo in `run.sh` (`DEMOS=(…)`) and in the table above.
+
+A **multi-host** demo also implements `cluster::ClusterDemo` (`directory`
+over the hosts, `cluster_server`, optional dev routes), uses
+`DemoCommand::X(ClusterArgs)` → `run_cluster::<X>`, is listed in
+`CLUSTER_DEMOS` in `run.sh`, and tests with `tests/support` (Rust) /
+`startCluster` (Node).
 
 ## Security notes (why this is dev only)
 

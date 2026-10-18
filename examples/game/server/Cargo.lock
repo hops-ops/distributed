@@ -439,6 +439,7 @@ dependencies = [
  "distributed",
  "futures-util",
  "hmac",
+ "rusqlite",
  "serde_json",
  "sha2",
  "tokio",
@@ -579,10 +580,12 @@ dependencies = [
  "clap",
  "distributed",
  "distributed_game",
+ "futures-util",
  "http-body-util",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tower",
 ]
 

@@ -330,6 +330,7 @@ enum ConnOut {
 
 type ConfigFactory<Z> = dyn Fn(&str) -> Option<<Z as Zone>::Config> + Send + Sync;
 type FactsFactory = dyn Fn(&str) -> Option<(FactQueue, JoinHandle<()>)> + Send + Sync;
+type HostConfigFn = dyn Fn(&str, &mut HostConfig) + Send + Sync;
 
 struct ZoneEntry {
     tx: mpsc::Sender<ZoneCmd>,
@@ -349,6 +350,8 @@ struct Inner<Z: Zone> {
     clock: Arc<dyn Clock>,
     factory: Box<ConfigFactory<Z>>,
     facts: Option<Box<FactsFactory>>,
+    /// Per-zone adjustments of `config.host` (tick rates, capacity …).
+    host_config: Option<Box<HostConfigFn>>,
     nonces: Mutex<NonceCache>,
     zones: Mutex<HashMap<String, ZoneEntry>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
@@ -408,6 +411,7 @@ where
                 clock,
                 factory: Box::new(factory),
                 facts: None,
+                host_config: None,
                 nonces: Mutex::new(NonceCache::default()),
                 zones: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(Vec::new()),
@@ -456,6 +460,17 @@ where
     /// Where hibernated zone snapshots go.
     pub fn with_state_store(self, store: Arc<dyn ZoneStateStore>) -> Self {
         self.configure(|inner| inner.state_store = Some(store))
+    }
+
+    /// Adjust the [`HostConfig`] of each zone at activation, e.g. a slow
+    /// tick rate for a province and a hot one for its neighborhoods. `f`
+    /// receives the zone id and a copy of `config.host`; the world content
+    /// version is applied afterwards and cannot be changed here.
+    pub fn with_host_config(
+        self,
+        f: impl Fn(&str, &mut HostConfig) + Send + Sync + 'static,
+    ) -> Self {
+        self.configure(|inner| inner.host_config = Some(Box::new(f)))
     }
 
     /// Zone hierarchy for tier-up events (default [`DottedTopology`]).
@@ -1027,6 +1042,9 @@ async fn run_zone<Z>(
         None => None,
     };
     let mut host_config = inner.config.host.clone();
+    if let Some(adjust) = &inner.host_config {
+        adjust(&zone_id, &mut host_config);
+    }
     host_config.content_version = world.version.clone();
     // Fencing tokens grow across activations and restarts: a restart-safe
     // epoch for fact keys (`Ctx::boot_epoch`).
