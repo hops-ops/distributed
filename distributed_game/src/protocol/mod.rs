@@ -2,7 +2,7 @@
 //!
 //! One message per WebSocket binary frame; the first byte is the message
 //! type. [`wire`] holds the primitives, [`messages`] the message codecs and
-//! the reference [`ClientMirror`](messages::ClientMirror).
+//! the reference [`ClientMirror`].
 
 pub mod messages;
 pub mod wire;

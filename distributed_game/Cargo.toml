@@ -16,16 +16,28 @@ default = []
 runtime = ["dep:tokio"]
 # Adapter that commits facts into a `distributed` AggregateCell.
 cell = ["dep:distributed", "dep:sha2"]
+# axum WebSocket zone server with signed-ticket admission.
+net = ["runtime", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros"]
 
 [dependencies]
 serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"], optional = true }
 distributed = { path = "..", default-features = false, optional = true }
+axum = { version = "0.8", default-features = false, features = ["ws", "tokio", "http1"], optional = true }
+hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.23", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde = { version = "1", features = ["derive"] }
+
+[[test]]
+name = "net_e2e"
+path = "tests/net_e2e/main.rs"
+required-features = ["net"]
 
 [[test]]
 name = "cell_sink"

@@ -2,7 +2,7 @@
 //!
 //! A zone is one authoritative simulation instance (a dungeon floor, a match,
 //! a town shard). The [`ZoneHost`](crate::ZoneHost) owns it and calls these
-//! hooks; every hook gets a [`Ctx`](crate::Ctx) for timers, RNG, inputs,
+//! hooks; every hook gets a [`Ctx`] for timers, RNG, inputs,
 //! facts, events and views. Hooks are synchronous and must not block: durable
 //! work goes through facts, never through awaited storage.
 //!

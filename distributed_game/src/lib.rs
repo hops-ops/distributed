@@ -11,6 +11,8 @@
 //! - Replication: an [`EntitySchema`] shipped in Welcome, per-client deltas
 //!   against last-sent state, spatial interest and a byte budget with
 //!   priority accumulation. Wire format: [`protocol`] / `PROTOCOL.md`.
+//! - Transport (`net` feature): axum WebSocket server hosting many zones
+//!   with HMAC-signed ticket admission ([`net`]).
 //!
 //! Physics is out of scope: games bring their own and run it in `on_tick`.
 //!
@@ -30,6 +32,8 @@ pub mod facts;
 pub mod host;
 pub mod input;
 pub mod interest;
+#[cfg(feature = "net")]
+pub mod net;
 pub mod protocol;
 pub mod replication;
 pub mod rng;
@@ -60,3 +64,7 @@ pub use zone::{
     Admission, ClientId, JoinRequest, LeaveReason, ObserverId, PlayerId, PlayerInfo, TicketClaims,
     Tier, Viewer, Zone,
 };
+
+#[doc = include_str!("../README.md")]
+#[cfg(doctest)]
+pub struct ReadmeDoctests;

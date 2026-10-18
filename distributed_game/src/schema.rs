@@ -7,7 +7,7 @@
 //!
 //! Quantization is specified bit-exactly in `PROTOCOL.md` §4 and computed in
 //! `f64` so a JavaScript client (whose numbers are `f64`) reproduces the same
-//! integers and decoded `f32` values. Use [`FieldType::quantize`] /
+//! integers and decoded `f32` values. Use [`FieldType::quantize_linear`] /
 //! [`FieldType::canonicalize`] on the server when prediction must match what
 //! clients will see.
 
