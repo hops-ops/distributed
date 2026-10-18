@@ -54,7 +54,7 @@ client.on('correction', (c) => {
 
 const hud = new Hud({
 	title: 'Arena',
-	hint: 'WASD / stick to move, Space / A to dash. P: prediction, G: ghost, V: first person (click to look). Drag to orbit.',
+	hint: 'WASD / stick to move, Space / A to dash. P: prediction, G: ghost, V: first person (click to look). Right stick / drag: camera.',
 	client,
 	devApi: api
 });

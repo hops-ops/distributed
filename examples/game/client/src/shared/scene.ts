@@ -1,7 +1,8 @@
 /**
  * Babylon.js stage shared by the demos: engine + scene + light, a gridded
  * floor, a third-person follow camera with an optional first-person view
- * (click to lock the pointer, mouse to look), DOM name labels and helpers.
+ * (click to lock the pointer, mouse to look), gamepad right-stick look in
+ * both views, DOM name labels and helpers.
  *
  * Coordinates: the server's 2D plane (x, y) maps to Babylon (x, 0, z = y),
  * Y up. Use `toWorld(x, y, height)`.
@@ -21,6 +22,8 @@ import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh';
 import type { LinesMesh } from '@babylonjs/core/Meshes/linesMesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { Scene } from '@babylonjs/core/scene';
+// Side effect: scene picking (pointer events) needs Ray.
+import '@babylonjs/core/Culling/ray';
 // Side effect: Mesh.prototype.createInstance.
 import '@babylonjs/core/Meshes/instancedMesh';
 
@@ -46,6 +49,22 @@ export type CameraView = 'third' | 'first';
 /** First-person eye height (m) and mouse-look sensitivity (rad per pixel). */
 const EYE_HEIGHT = 1.6;
 const LOOK_SPEED = 0.0025;
+/** Gamepad right-stick look rates (rad/s) and deadzone. */
+const STICK_YAW = 2.6;
+const STICK_PITCH = 1.6;
+const STICK_DEADZONE = 0.15;
+
+/** Right stick of the first connected gamepad: +x right, +y up. */
+function rightStick(): { x: number; y: number } {
+	const pads = globalThis.navigator?.getGamepads?.() ?? [];
+	for (const pad of pads) {
+		if (!pad?.connected) continue;
+		const x = pad.axes[2] ?? 0;
+		const y = -(pad.axes[3] ?? 0);
+		return { x: Math.abs(x) > STICK_DEADZONE ? x : 0, y: Math.abs(y) > STICK_DEADZONE ? y : 0 };
+	}
+	return { x: 0, y: 0 };
+}
 
 export type StageOptions = Readonly<{
 	/** Floor half extent (m). */
@@ -96,7 +115,8 @@ export function createStage(canvas: HTMLCanvasElement, options: StageOptions): S
 	let yaw = 0;
 	let pitch = 0;
 	canvas.addEventListener('click', () => {
-		if (view === 'first' && document.pointerLockElement !== canvas) void canvas.requestPointerLock?.();
+		// Pointer lock can be refused (e.g. headless or unfocused); mouse look then waits for the next click.
+		if (view === 'first' && document.pointerLockElement !== canvas) Promise.resolve(canvas.requestPointerLock?.()).catch(() => {});
 	});
 	document.addEventListener('mousemove', (e) => {
 		if (view !== 'first' || document.pointerLockElement !== canvas) return;
@@ -116,6 +136,21 @@ export function createStage(canvas: HTMLCanvasElement, options: StageOptions): S
 		const now = performance.now();
 		const dt = now - last;
 		last = now;
+		// Right stick looks around: turns the eye in first person, orbits in third.
+		const stick = rightStick();
+		if (stick.x !== 0 || stick.y !== 0) {
+			const s = Math.min(dt, 100) / 1000;
+			if (view === 'first') {
+				yaw += stick.x * STICK_YAW * s;
+				pitch = Math.max(-1.3, Math.min(1.3, pitch - stick.y * STICK_PITCH * s));
+				eye.rotation.set(pitch, yaw, 0);
+			} else {
+				camera.alpha -= stick.x * STICK_YAW * s;
+				const lo = camera.lowerBetaLimit ?? 0.01;
+				const hi = camera.upperBetaLimit ?? Math.PI - 0.01;
+				camera.beta = Math.max(lo, Math.min(hi, camera.beta + stick.y * STICK_PITCH * s));
+			}
+		}
 		for (const callback of frameCallbacks) callback(now, dt);
 		scene.render();
 		labels.update();
