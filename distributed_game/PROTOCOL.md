@@ -137,6 +137,12 @@ Worked example (`min=-100, max=100, bits=16`, from `fixtures/quantization.json`)
 `80 80 02`; decodes to `fround(-100 + (32768/65535) * 200) = 0.0015259022`
 (bits `3ac800c8`). `v = 250` clamps to `q = 65535` (`ff ff 03`) → `100.0`.
 
+*Informative:* a symmetric range (`min = -max`) has `2^bits - 1` intervals,
+so `0` is not on the grid (the example above decodes `0.0` as
+`0.0015259022`). Signed quantities that must rest at exactly zero use
+`max = -min · (1 - 2^-(bits-1))` (Rust: `FieldType::quant_centered`), which
+puts `0` at `q = 2^(bits-1)`.
+
 ### 4.2 `angle {bits}`
 
 ```

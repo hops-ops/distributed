@@ -87,6 +87,22 @@ impl FieldValue {
 }
 
 impl FieldType {
+    /// `QuantF32` over `[-range, range - range / 2^(bits-1)]`: the grid step
+    /// is `range / 2^(bits-1)` and **zero is exactly representable**.
+    ///
+    /// A symmetric `[-r, r]` range has an odd number of intervals
+    /// (`2^bits - 1`), so 0 falls between two grid points: a velocity of 0
+    /// decodes as ±half a step and a resting entity creeps. Use this for
+    /// signed quantities (velocities, offsets). `bits` must be 1..=32.
+    pub const fn quant_centered(range: f32, bits: u8) -> Self {
+        let half = (1u64 << (bits - 1)) as f32;
+        Self::QuantF32 {
+            min: -range,
+            max: range - range / half,
+            bits,
+        }
+    }
+
     /// Clamped linear quantization (`PROTOCOL.md` §4.1).
     pub fn quantize_linear(v: f32, min: f32, max: f32, bits: u8) -> u32 {
         let maxq = max_q(bits);
@@ -427,6 +443,37 @@ impl EntitySchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn centered_quantization_represents_zero_exactly() {
+        for (range, bits) in [
+            (16.0, 12),
+            (16.0, 14),
+            (20.0, 18),
+            (8.0, 12),
+            (64.0, 16),
+            (1.0, 2),
+        ] {
+            let ty = FieldType::quant_centered(range, bits);
+            assert_eq!(ty.canonicalize(&FieldValue::F(0.0)), FieldValue::F(0.0));
+            assert_eq!(
+                ty.canonicalize(&FieldValue::F(-range)),
+                FieldValue::F(-range)
+            );
+            let step = range / (1u64 << (bits - 1)) as f32;
+            assert_eq!(ty.canonicalize(&FieldValue::F(step)), FieldValue::F(step));
+        }
+        // The symmetric range cannot: 0 lands half a step off.
+        let symmetric = FieldType::QuantF32 {
+            min: -16.0,
+            max: 16.0,
+            bits: 12,
+        };
+        assert_ne!(
+            symmetric.canonicalize(&FieldValue::F(0.0)),
+            FieldValue::F(0.0)
+        );
+    }
 
     #[test]
     fn linear_quantization_rounds_half_up_and_clamps() {
