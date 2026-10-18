@@ -62,6 +62,34 @@ The whole-state export/restore and `persist_and_drain_outbox` APIs are not
 available on the Worker host. Native in-process conformance fixtures are not a
 production persistence adapter.
 
+### Native durable cells (`cell-sqlite`)
+
+Native hosts get the same store with the `cell-sqlite` Cargo feature: one
+SQLite file per cell, executed through a synchronous rusqlite connection that
+exposes the same `read`/`transaction` surface as `storage.transactionSync`.
+Schema bootstrap, the per-command transaction (events, snapshots, ledger
+receipt, outbox rows) and lease-fenced outbox settlement are the shared
+`sql_store.rs` code, not a copy. Native cells additionally keep the sealed
+read-model row in the same file and, with
+`CellStreamStore::with_sealed_row_reducer`, update it inside the command
+transaction.
+
+```rust,ignore
+let cells = CellSqlitePath::root("var/cells"); // var/cells/Todo%3At1.sqlite3
+let cell = AggregateCell::<Todo>::open_sqlite_with_snapshots(&cells, "t1", 100)?
+    .mount(create());
+let result = cell.dispatch_idempotent(command, &identity, input, session).await?;
+
+// Alarm equivalent: run at startup, after dispatch and periodically, or spawn
+// OutboxDrainRunner::new(cell.outbox_dispatcher(..)) on a tokio runtime.
+let drained = cell.drain_outbox_with(publisher, lease, max_attempts, 100).await?;
+```
+
+Dropping every handle and reopening the file restores the identical cell, and
+an already-applied idempotent command replays its recorded outcome. A file is
+bound to the first cell instance that opens it. Whole-state export/restore
+remains a reference-host (in-memory) API and is rejected for SQLite cells.
+
 Existing `cell_state` databases are rejected with an explicit migration-required
 error. They are not silently reset or opened through a legacy adapter. Back up
 retained development data and migrate it explicitly before changing an existing

@@ -5,8 +5,6 @@
 //! commit cannot yield between its domain and delivery/receipt participants.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::task::{Context, Poll, Waker};
 use std::time::SystemTime;
 
 use worker::js_sys::{Function, Reflect};
@@ -42,8 +40,17 @@ impl CellSqlConnection {
         })
     }
 
-    pub fn executor(&self) -> CellSqlExecutor {
+    fn executor(&self) -> CellSqlExecutor {
         CellSqlExecutor(self.sql.clone())
+    }
+
+    /// Run reads outside an explicit transaction. The Durable Object input
+    /// gate already serializes them with this cell's commits.
+    pub fn read<T, E: From<RepositoryError>>(
+        &self,
+        operation: impl FnOnce(&mut CellSqlExecutor) -> Result<T, E>,
+    ) -> Result<T, E> {
+        operation(&mut self.executor())
     }
 
     pub fn transaction<T, E: From<RepositoryError>>(
@@ -78,25 +85,6 @@ impl CellSqlConnection {
                 Err(RepositoryError::Model("cell transaction callback did not run".into()).into())
             }
         }
-    }
-}
-
-/// Shared SQL operations are async for SQLx, but every call through the cell
-/// executor completes synchronously. Refuse accidental async work; never spin
-/// or let a pending future outlive the transaction callback.
-pub(crate) fn finish_sql<T, E: From<RepositoryError>>(
-    future: impl Future<Output = Result<T, E>>,
-) -> Result<T, E> {
-    let mut future = std::pin::pin!(future);
-    match future
-        .as_mut()
-        .poll(&mut Context::from_waker(Waker::noop()))
-    {
-        Poll::Ready(result) => result,
-        Poll::Pending => Err(RepositoryError::Model(
-            "cell SQL transaction attempted to await asynchronous work".into(),
-        )
-        .into()),
     }
 }
 

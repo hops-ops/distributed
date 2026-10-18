@@ -162,7 +162,7 @@ fn emit_migration_inventory() {
 
 fn emit_dialect(generated: &mut String, name: &str, dialect: Dialect, inventory: &Inventory) {
     match dialect {
-        Dialect::Sqlite => generated.push_str("#[cfg(any(feature = \"sqlite\", all(feature = \"workers-rs\", target_arch = \"wasm32\")))]\n"),
+        Dialect::Sqlite => generated.push_str("#[cfg(any(feature = \"sqlite\", all(feature = \"workers-rs\", target_arch = \"wasm32\"), all(feature = \"cell-sqlite\", not(target_arch = \"wasm32\"))))]\n"),
         Dialect::Postgres => generated.push_str("#[cfg(feature = \"postgres\")]\n"),
     }
     generated.push_str("pub(crate) const ");

@@ -1,5 +1,7 @@
 //! One cell's private command-side repository, with enforced stream ownership.
-//! Workers use runtime-owned SQLite; native tests use the in-process reference host.
+//! Workers use runtime-owned SQLite. Native hosts use the in-process reference
+//! host, or with `cell-sqlite` one SQLite file per cell sharing the Workers
+//! store (`open_sqlite*`). Ownership checks below apply to every backend.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -23,6 +25,8 @@ use crate::entity::EventRecord;
 use crate::microsvc::HasOutboxStore;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 use crate::outbox::OutboxMessage;
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+use crate::repository::{validate_commit_batch, PreparedEventAppend};
 use crate::repository::{
     CommitBatch, GetStream, RepositoryError, SnapshotStore, SnapshotWrite, StreamIdentity,
     TransactionalCommit,
@@ -30,8 +34,13 @@ use crate::repository::{
 use crate::snapshot::SnapshotRecord;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 use crate::InMemoryRepository;
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(any(
+    all(feature = "workers-rs", target_arch = "wasm32"),
+    all(feature = "cell-sqlite", not(target_arch = "wasm32"))
+)))]
 type CellRepository = InMemoryRepository;
+#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+type CellRepository = super::native_sqlite::NativeCellRepository;
 #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
 type CellRepository = CellSqlRepository;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
@@ -79,6 +88,17 @@ pub struct DurableCellCommand {
     pub body: String,
 }
 
+/// Sealed read-model row reducer run in the same transaction as a command's
+/// events (native hosts). Receives the current row and the event appends of
+/// the commit; `Ok(Some(row))` replaces the row, `Ok(None)` keeps it, and an
+/// error rolls the whole command back.
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+pub type SealedRowReducer = Arc<
+    dyn Fn(Option<&Value>, &[PreparedEventAppend<'_>]) -> Result<Option<Value>, RepositoryError>
+        + Send
+        + Sync,
+>;
+
 /// Current native restart-test export version.
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 pub const DURABLE_AGGREGATE_CELL_STATE_VERSION: u16 = 1;
@@ -117,6 +137,8 @@ pub struct CellStreamStore {
     inner: CellRepository,
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     sealed_row: Arc<Mutex<Option<Value>>>,
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    sealed_row_reducer: Option<SealedRowReducer>,
 }
 
 impl CellStreamStore {
@@ -153,11 +175,7 @@ impl CellStreamStore {
     /// Bind a store to one exact stream identity.
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn for_identity(identity: StreamIdentity) -> Self {
-        Self {
-            ownership: CellOwnership::Exclusive(identity),
-            inner: InMemoryRepository::new(),
-            sealed_row: Arc::new(Mutex::new(None)),
-        }
+        Self::native(CellOwnership::Exclusive(identity), memory_repository())
     }
 
     /// Parent-shard cell: `"{parent_type}:{parent_id}"` (bomberman `game:{id}`).
@@ -170,14 +188,118 @@ impl CellStreamStore {
         parent_id: impl Into<String>,
         owns: impl Fn(&StreamIdentity) -> bool + Send + Sync + 'static,
     ) -> Result<Self, RepositoryError> {
-        Ok(Self {
-            ownership: CellOwnership::Parent {
+        Ok(Self::native(
+            CellOwnership::Parent {
                 name: StreamIdentity::new(parent_type, parent_id)?,
                 owns: Arc::new(owns),
             },
-            inner: InMemoryRepository::new(),
+            memory_repository(),
+        ))
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn native(ownership: CellOwnership, inner: CellRepository) -> Self {
+        Self {
+            ownership,
+            inner,
             sealed_row: Arc::new(Mutex::new(None)),
-        })
+            sealed_row_reducer: None,
+        }
+    }
+
+    /// Open a durable exclusive cell backed by its own SQLite file.
+    ///
+    /// The file is `location.resolve("{type}:{id}")`; every command commits
+    /// events, snapshots, ledger receipt, outbox rows and the sealed row (see
+    /// [`Self::with_sealed_row_reducer`]) in one SQLite transaction. Dropping
+    /// every handle and reopening the same file restores the identical cell.
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    pub fn open_sqlite(
+        location: &super::CellSqlitePath,
+        identity: StreamIdentity,
+    ) -> Result<Self, RepositoryError> {
+        let sql = location.open(&identity.to_string())?;
+        Ok(Self::native(
+            CellOwnership::Exclusive(identity),
+            super::native_sqlite::NativeCellRepository::Sql(sql),
+        ))
+    }
+
+    /// Open a durable parent-shard cell (`"{parent_type}:{parent_id}"`) whose
+    /// owned sibling streams share one SQLite file. As on Workers, the
+    /// predicate never grants access to another cell's file.
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    pub fn open_sqlite_parent(
+        location: &super::CellSqlitePath,
+        parent_type: impl Into<String>,
+        parent_id: impl Into<String>,
+        owns: impl Fn(&StreamIdentity) -> bool + Send + Sync + 'static,
+    ) -> Result<Self, RepositoryError> {
+        let name = StreamIdentity::new(parent_type, parent_id)?;
+        let sql = location.open(&name.to_string())?;
+        Ok(Self::native(
+            CellOwnership::Parent {
+                name,
+                owns: Arc::new(owns),
+            },
+            super::native_sqlite::NativeCellRepository::Sql(sql),
+        ))
+    }
+
+    /// Whether this cell persists to a SQLite file (`open_sqlite*`).
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    pub fn is_sqlite(&self) -> bool {
+        self.inner.sql().is_some()
+    }
+
+    /// Maintain the sealed read-model row from each commit's events, inside
+    /// the command's transaction (SQLite cells) or alongside its in-memory
+    /// commit (reference host). A reducer error rejects the command.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub fn with_sealed_row_reducer(
+        mut self,
+        reducer: impl Fn(Option<&Value>, &[PreparedEventAppend<'_>]) -> Result<Option<Value>, RepositoryError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        let reducer: SealedRowReducer = Arc::new(reducer);
+        #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+        if let Some(sql) = self.inner.sql_mut() {
+            sql.set_sealed_row_reducer(Arc::clone(&reducer));
+        }
+        self.sealed_row_reducer = Some(reducer);
+        self
+    }
+
+    /// The in-process reference repository backing whole-state export.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn memory(&self) -> Result<&InMemoryRepository, RepositoryError> {
+        #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+        return self.inner.memory();
+        #[cfg(not(all(feature = "cell-sqlite", not(target_arch = "wasm32"))))]
+        Ok(&self.inner)
+    }
+
+    /// Reference-host sealed-row reduction. SQLite cells reduce inside their
+    /// commit transaction instead, so this returns `None` for them.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn reduce_memory_sealed_row(
+        &self,
+        batch: &CommitBatch<'_>,
+    ) -> Result<Option<Value>, RepositoryError> {
+        let Some(reducer) = &self.sealed_row_reducer else {
+            return Ok(None);
+        };
+        if self.memory().is_err() {
+            return Ok(None);
+        }
+        let prepared = validate_commit_batch(batch)?;
+        if prepared.iter().all(|append| append.events.is_empty()) {
+            return Ok(None);
+        }
+        let current = self.sealed_row()?;
+        reducer(current.as_ref(), &prepared)
     }
 
     /// Named exclusive-cell constructor used by [`super::AggregateCell`].
@@ -225,6 +347,10 @@ impl CellStreamStore {
     /// Sealed read-model row for GET on this cell instance.
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn sealed_row(&self) -> Result<Option<Value>, RepositoryError> {
+        #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+        if let Some(sql) = self.inner.sql() {
+            return sql.sealed_row();
+        }
         self.sealed_row
             .lock()
             .map(|guard| guard.clone())
@@ -234,6 +360,10 @@ impl CellStreamStore {
     /// Replace the sealed read-model row (Atomic board / Todo view).
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn replace_sealed_row(&self, row: Value) -> Result<(), RepositoryError> {
+        #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+        if let Some(sql) = self.inner.sql() {
+            return sql.replace_sealed_row(&row);
+        }
         let mut guard = self
             .sealed_row
             .lock()
@@ -246,7 +376,7 @@ impl CellStreamStore {
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_events(&self) -> Result<Vec<DurableCellEvents>, RepositoryError> {
         Ok(self
-            .inner
+            .memory()?
             .clone_events()?
             .into_iter()
             .map(|(stream, events)| DurableCellEvents { stream, events })
@@ -256,7 +386,7 @@ impl CellStreamStore {
     /// Outbox rows committed with this cell's events (same private SQLite).
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_outbox(&self) -> Result<Vec<OutboxMessage>, RepositoryError> {
-        self.inner.clone_outbox()
+        self.memory()?.clone_outbox()
     }
 
     /// Restore outbox rows from Durable Object SQLite.
@@ -265,7 +395,7 @@ impl CellStreamStore {
         &self,
         messages: Vec<OutboxMessage>,
     ) -> Result<(), RepositoryError> {
-        self.inner.replace_outbox(messages)
+        self.memory()?.replace_outbox(messages)
     }
 
     /// Replace the working event log from Durable Object SQLite.
@@ -274,7 +404,7 @@ impl CellStreamStore {
         &self,
         events: Vec<DurableCellEvents>,
     ) -> Result<(), RepositoryError> {
-        self.inner.replace_events(
+        self.memory()?.replace_events(
             events
                 .into_iter()
                 .map(|row| (row.stream, row.events))
@@ -286,7 +416,7 @@ impl CellStreamStore {
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_snapshots(&self) -> Result<Vec<DurableCellSnapshot>, RepositoryError> {
         Ok(self
-            .inner
+            .memory()?
             .clone_snapshots()?
             .into_iter()
             .map(|(stream, record)| DurableCellSnapshot {
@@ -308,7 +438,7 @@ impl CellStreamStore {
         &self,
         snapshots: Vec<DurableCellSnapshot>,
     ) -> Result<(), RepositoryError> {
-        self.inner.replace_snapshots(
+        self.memory()?.replace_snapshots(
             snapshots
                 .into_iter()
                 .map(|row| {
@@ -334,7 +464,7 @@ impl CellStreamStore {
     /// Fenced command rows committed with this cell's domain effects.
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_commands(&self) -> Result<Vec<DurableCellCommand>, RepositoryError> {
-        self.inner
+        self.memory()?
             .clone_command_ledger()?
             .into_iter()
             .map(|record| {
@@ -365,7 +495,7 @@ impl CellStreamStore {
             }
             records.push(record);
         }
-        self.inner.replace_command_ledger(records)
+        self.memory()?.replace_command_ledger(records)
     }
 
     /// Export every durable concern as one versioned persistence envelope.
@@ -565,7 +695,14 @@ impl TransactionalCommit for CellStreamStore {
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
         async move {
             self.ensure_batch(&batch)?;
-            TransactionalCommit::commit_batch(&self.inner, batch).await
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            let sealed = self.reduce_memory_sealed_row(&batch)?;
+            TransactionalCommit::commit_batch(&self.inner, batch).await?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            if let Some(row) = sealed {
+                self.replace_sealed_row(row)?;
+            }
+            Ok(())
         }
     }
 }
@@ -578,14 +715,29 @@ impl CausalTransactionalCommit for CellStreamStore {
         async move {
             self.ensure_batch(&batch.domain)
                 .map_err(CommandLedgerError::Storage)?;
-            CausalTransactionalCommit::commit_causal_batch(&self.inner, batch).await
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            let sealed = self
+                .reduce_memory_sealed_row(&batch.domain)
+                .map_err(CommandLedgerError::Storage)?;
+            CausalTransactionalCommit::commit_causal_batch(&self.inner, batch).await?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            if let Some(row) = sealed {
+                self.replace_sealed_row(row)
+                    .map_err(CommandLedgerError::Storage)?;
+            }
+            Ok(())
         }
     }
 }
 
 impl HasOutboxStore for CellStreamStore {
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(any(
+        all(feature = "workers-rs", target_arch = "wasm32"),
+        all(feature = "cell-sqlite", not(target_arch = "wasm32"))
+    )))]
     type OutboxStore = crate::InMemoryOutboxStore;
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    type OutboxStore = super::native_sqlite::CellOutboxStore;
     #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
     type OutboxStore = super::sql_store::CellSqlOutboxStore;
 
@@ -607,4 +759,17 @@ impl crate::microsvc::dependencies::CausalHostProjections for CellStreamStore {
             ),
         )
     }
+}
+
+#[cfg(not(any(
+    all(feature = "workers-rs", target_arch = "wasm32"),
+    all(feature = "cell-sqlite", not(target_arch = "wasm32"))
+)))]
+fn memory_repository() -> CellRepository {
+    InMemoryRepository::new()
+}
+
+#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+fn memory_repository() -> CellRepository {
+    super::native_sqlite::NativeCellRepository::Memory(InMemoryRepository::new())
 }
