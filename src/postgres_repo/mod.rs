@@ -101,7 +101,8 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
          source_aggregate_id, \
          source_sequence, \
          correlation_id, \
-         causation_id";
+         causation_id, \
+         EXTRACT(EPOCH FROM next_available_at)::double precision AS next_available_at";
     const ORDER_BY_CREATED_AT: &'static str = "created_at";
     const OUTBOX_OLDEST_CREATED_AT_SELECT: &'static str =
         "EXTRACT(EPOCH FROM MIN(created_at))::double precision AS oldest_created_at";
@@ -287,7 +288,8 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
                           message.source_aggregate_id,
                           message.source_sequence,
                           message.correlation_id,
-                          message.causation_id
+                          message.causation_id,
+                          EXTRACT(EPOCH FROM message.next_available_at)::double precision AS next_available_at
                 "#,
             )
             .bind(OutboxMessageStatus::Pending.as_str())

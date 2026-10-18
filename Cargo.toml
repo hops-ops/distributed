@@ -56,7 +56,13 @@ sqlite = ["dep:sqlx", "dep:tokio", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/s
 nats = ["dep:async-nats", "dep:futures", "dep:tokio"]
 rabbitmq = ["dep:lapin", "dep:futures", "dep:tokio"]
 kafka = ["dep:rdkafka", "dep:tokio"]
+# Redis sorted-set leaderboards and the Redis Streams `MessagePublisher`.
+redis = ["dep:redis", "dep:tokio"]
 workers-rs = ["dep:worker"]
+# Native durable aggregate cells: one synchronous SQLite file per cell, same
+# SQL store and one-transaction-per-command contract as Durable Object cells.
+# Separate from `sqlite` (async SQLx pool + tokio); no-op on wasm32.
+cell-sqlite = ["dep:rusqlite"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing", "dep:tracing-opentelemetry"]
 graphql = ["dep:async-graphql", "dep:async-graphql-axum", "dep:hmac", "dep:jsonwebtoken", "http", "axum?/ws"]
 
@@ -75,6 +81,7 @@ base64 = "0.23.0"
 futures = { version = "0.3", optional = true }
 lapin = { version = "4", optional = true }
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio"], optional = true }
+redis = { version = "1.7.1", default-features = false, features = ["script", "streams", "tokio-comp", "connection-manager"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 jsonwebtoken = { version = "9", optional = true }
 bitcode = { version = "0.6.9", features = ["serde"] }
@@ -98,6 +105,11 @@ tracing-opentelemetry = { version = "0.33", default-features = false, optional =
 uuid = { version = "1", features = ["v7"] }
 url = { version = "2", optional = true }
 worker = { version = "0.8", features = ["queue"], optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# libsqlite3-sys 0.37 stays inside SQLx 0.9's accepted range, so `sqlite` and
+# `cell-sqlite` link one bundled SQLite when enabled together.
+rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 js-sys = "0.3"
