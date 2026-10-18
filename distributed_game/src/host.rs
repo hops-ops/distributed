@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use crate::clock::Clock;
 use crate::facts::{EmitError, Fact, FactQueue};
+use crate::handoff::{HandoffError, HandoffRequest, Transfer, TransferIssuer, MAX_CARRIED_BYTES};
 use crate::input::{ConsumePolicy, InputBuffer, PushOutcome, SequencedInput};
 use crate::interest::{InterestConfig, View};
 use crate::protocol::{error, kick, Notice, Role, ServerMessage, Welcome};
@@ -41,6 +42,7 @@ use crate::schema::EntitySchema;
 use crate::stamp::FactStamp;
 use crate::timers::{TimerId, Timers};
 use crate::timestep::{rate_to_step, FixedTimestep};
+use crate::world::{ChildEvent, FreezeState, StalePolicy};
 use crate::zone::{
     Admission, ClientId, JoinRequest, LeaveReason, ObserverId, PlayerId, PlayerInfo, TicketClaims,
     Tier, Viewer, Zone,
@@ -77,6 +79,9 @@ pub struct HostConfig {
     pub content_version: String,
     /// World seed; the zone RNG derives from it and the zone id.
     pub world_seed: u64,
+    /// Admission of clients whose content version differs from
+    /// `content_version` (see [`StalePolicy`]).
+    pub stale_policy: StalePolicy,
 }
 
 impl Default for HostConfig {
@@ -96,6 +101,7 @@ impl Default for HostConfig {
             interest: InterestConfig::default(),
             content_version: String::new(),
             world_seed: 0,
+            stale_policy: StalePolicy::Strict,
         }
     }
 }
@@ -168,6 +174,7 @@ struct PlayerSlot<I> {
     grace_until: Option<Duration>,
     reconnect_token: String,
     session_id: String,
+    content_version: String,
 }
 
 struct ObserverSlot {
@@ -198,6 +205,11 @@ pub(crate) struct Core<Z: Zone> {
     outbound: Vec<Outbound>,
     facts: Option<FactQueue>,
     pending_kicks: Vec<(PlayerId, String)>,
+    transfer_issuer: Option<Box<TransferIssuer>>,
+    pending_handoffs: Vec<(PlayerId, ServerMessage)>,
+    upward: Vec<ChildEvent>,
+    child_inbox: Vec<ChildEvent>,
+    dropped_frozen: u64,
 }
 
 impl<Z: Zone> Core<Z> {
@@ -396,6 +408,88 @@ impl<Z: Zone> Ctx<'_, Z> {
     pub fn kick(&mut self, player: PlayerId, message: impl Into<String>) {
         self.core.pending_kicks.push((player, message.into()));
     }
+
+    /// Provenance of anything produced now (zone, tick, content version);
+    /// embed it in events so clients and logs can tell which content
+    /// version produced them.
+    pub fn stamp(&self) -> FactStamp {
+        FactStamp {
+            zone_id: self.core.zone_id.clone(),
+            tick: self.core.tick,
+            content_version: self.core.config.content_version.clone(),
+        }
+    }
+
+    /// Move `player` to `target_zone` with `carried` state. A signed
+    /// transfer ticket is issued now; after the current hook returns the
+    /// player is removed (`LeaveReason::Handoff`) and its client is told
+    /// `Handoff(target, ticket)`. The player can never be in both zones: it
+    /// leaves this one before the ticket is usable, and the ticket is
+    /// single-use.
+    pub fn handoff(
+        &mut self,
+        player: PlayerId,
+        target_zone: &str,
+        carried: Vec<u8>,
+    ) -> Result<(), HandoffError> {
+        if target_zone == self.core.zone_id {
+            return Err(HandoffError::SameZone);
+        }
+        if carried.len() > MAX_CARRIED_BYTES {
+            return Err(HandoffError::TooLarge);
+        }
+        let principal = self
+            .core
+            .players
+            .get(&player)
+            .map(|slot| slot.info.principal.clone())
+            .ok_or(HandoffError::UnknownPlayer)?;
+        if self
+            .core
+            .pending_handoffs
+            .iter()
+            .any(|(queued, _)| *queued == player)
+        {
+            return Err(HandoffError::Refused);
+        }
+        let request = HandoffRequest {
+            principal,
+            source_zone: self.core.zone_id.clone(),
+            target_zone: target_zone.to_string(),
+            carried,
+        };
+        let issuer = self
+            .core
+            .transfer_issuer
+            .as_mut()
+            .ok_or(HandoffError::NoIssuer)?;
+        let ticket = issuer(&request).ok_or(HandoffError::Refused)?;
+        self.core.pending_handoffs.push((
+            player,
+            ServerMessage::Handoff {
+                target_zone: request.target_zone,
+                transfer_ticket: ticket,
+            },
+        ));
+        Ok(())
+    }
+
+    /// Send a tier-up event to the parent zone (and, while `levels` remain,
+    /// further up). Delivered asynchronously on a later tick of the parent.
+    pub fn emit_upward(&mut self, kind: impl Into<String>, payload: Vec<u8>, levels: u8) {
+        if levels == 0 {
+            return;
+        }
+        self.core.upward.push(ChildEvent {
+            origin_zone: self.core.zone_id.clone(),
+            from_zone: self.core.zone_id.clone(),
+            kind: kind.into(),
+            payload,
+            origin_tick: self.core.tick,
+            content_version: self.core.config.content_version.clone(),
+            levels,
+        });
+    }
 }
 
 /// Runs one zone. See the module docs.
@@ -410,6 +504,7 @@ pub struct ZoneHost<Z: Zone> {
     next_patch: Duration,
     transitions: Vec<(Tier, Tier)>,
     frozen: bool,
+    freeze_request: Option<Notice>,
     disposed: bool,
     token_source: Box<dyn FnMut() -> String + Send>,
 }
@@ -446,6 +541,11 @@ impl<Z: Zone> ZoneHost<Z> {
             outbound: Vec::new(),
             facts: None,
             pending_kicks: Vec::new(),
+            transfer_issuer: None,
+            pending_handoffs: Vec::new(),
+            upward: Vec::new(),
+            child_inbox: Vec::new(),
+            dropped_frozen: 0,
             config,
         };
         let zone = Z::on_create(&mut Ctx { core: &mut core }, zone_config);
@@ -465,6 +565,7 @@ impl<Z: Zone> ZoneHost<Z> {
             next_patch: now,
             transitions: Vec::new(),
             frozen: false,
+            freeze_request: None,
             disposed: false,
             token_source: Box::new(default_token),
         };
@@ -482,6 +583,27 @@ impl<Z: Zone> ZoneHost<Z> {
     pub fn with_token_source(mut self, source: impl FnMut() -> String + Send + 'static) -> Self {
         self.token_source = Box::new(source);
         self
+    }
+
+    /// Install the transfer-ticket issuer used by [`Ctx::handoff`].
+    pub fn with_transfer_issuer(
+        mut self,
+        issuer: impl FnMut(&HandoffRequest) -> Option<String> + Send + 'static,
+    ) -> Self {
+        self.core.transfer_issuer = Some(Box::new(issuer));
+        self
+    }
+
+    /// Hand a hibernated snapshot to the zone ([`Zone::on_restore`]); call
+    /// right after construction.
+    pub fn restore(&mut self, state: &[u8], saved_version: &str) {
+        hook!(self.on_restore(state, saved_version));
+        self.process_kicks();
+    }
+
+    /// Durable snapshot for hibernation ([`Zone::hibernate`]).
+    pub fn hibernate_state(&self) -> Option<Vec<u8>> {
+        self.zone.hibernate()
     }
 
     /// Zone id.
@@ -566,6 +688,39 @@ impl<Z: Zone> ZoneHost<Z> {
         capabilities: u32,
         content_version: &str,
     ) -> Result<Joined, JoinError> {
+        self.admit(claims, capabilities, content_version, None)
+    }
+
+    /// Admit a player arriving with a verified transfer ticket; the zone
+    /// sees [`Zone::on_handoff_join`] with the carried state (also when the
+    /// principal is still present, e.g. inside its reconnect grace).
+    pub fn join_transfer(
+        &mut self,
+        transfer: &Transfer,
+        capabilities: u32,
+        content_version: &str,
+    ) -> Result<Joined, JoinError> {
+        if transfer.claims.role != Role::Player {
+            return Err(JoinError::new(
+                error::UNAUTHORIZED,
+                "transfers are for players",
+            ));
+        }
+        self.admit(
+            &transfer.claims,
+            capabilities,
+            content_version,
+            Some((transfer.source_zone.as_str(), transfer.carried.clone())),
+        )
+    }
+
+    fn admit(
+        &mut self,
+        claims: &TicketClaims,
+        capabilities: u32,
+        content_version: &str,
+        handoff: Option<(&str, Vec<u8>)>,
+    ) -> Result<Joined, JoinError> {
         if self.disposed {
             return Err(JoinError::new(error::NOT_FOUND, "zone disposed"));
         }
@@ -576,11 +731,22 @@ impl<Z: Zone> ZoneHost<Z> {
             ));
         }
         let expected = &self.core.config.content_version;
+        let mut reload = false;
         if !expected.is_empty() && content_version != expected {
-            return Err(JoinError::new(
-                error::VERSION_MISMATCH,
-                format!("content version {content_version} != {expected}"),
-            ));
+            let allowed = match self.core.config.stale_policy {
+                StalePolicy::Strict => false,
+                StalePolicy::SafeRoom { roam } => {
+                    let gate = self.zone.is_gate();
+                    reload = gate;
+                    handoff.is_some() && claims.role == Role::Player && (gate || roam)
+                }
+            };
+            if !allowed {
+                return Err(JoinError::new(
+                    error::VERSION_MISMATCH,
+                    format!("content version {content_version} != {expected}: reload"),
+                ));
+            }
         }
         let existing = self
             .core
@@ -608,9 +774,13 @@ impl<Z: Zone> ZoneHost<Z> {
         }
         self.wake();
         let client = ClientId(self.core.next_id());
+        let mut handoff = handoff;
         let joined = match (claims.role, existing) {
             (Role::Player, Some(player)) => {
                 self.bind_player(player, client, capabilities);
+                if let Some((from, carried)) = handoff.take() {
+                    hook!(self.on_handoff_join(player, from, carried));
+                }
                 Joined {
                     client,
                     viewer: Viewer::Player(player),
@@ -635,10 +805,14 @@ impl<Z: Zone> ZoneHost<Z> {
                         grace_until: None,
                         reconnect_token: String::new(),
                         session_id: (self.token_source)(),
+                        content_version: content_version.to_string(),
                     },
                 );
                 self.bind_player(player, client, capabilities);
-                hook!(self.on_join(player));
+                match handoff.take() {
+                    Some((from, carried)) => hook!(self.on_handoff_join(player, from, carried)),
+                    None => hook!(self.on_join(player)),
+                }
                 Joined {
                     client,
                     viewer: Viewer::Player(player),
@@ -663,12 +837,43 @@ impl<Z: Zone> ZoneHost<Z> {
                 }
             }
         };
+        if let Viewer::Player(player) = joined.viewer {
+            if let Some(slot) = self.core.players.get_mut(&player) {
+                slot.content_version = content_version.to_string();
+            }
+            if reload {
+                self.reload_player(player);
+            }
+        }
         self.process_kicks();
         Ok(joined)
     }
 
     /// Resume a player's session with the token from its last Welcome.
     pub fn reconnect(&mut self, token: &str, capabilities: u32) -> Result<Joined, JoinError> {
+        self.reconnect_as(token, capabilities, None)
+    }
+
+    /// [`reconnect`](Self::reconnect) presenting the client's (possibly
+    /// reloaded) content version. Under [`StalePolicy::Strict`] a stale
+    /// version is refused; under `SafeRoom` it is admitted to this zone
+    /// (the one the player is in), and told `Kick(RELOAD)` again if this
+    /// zone is a gate.
+    pub fn reconnect_with_version(
+        &mut self,
+        token: &str,
+        capabilities: u32,
+        content_version: &str,
+    ) -> Result<Joined, JoinError> {
+        self.reconnect_as(token, capabilities, Some(content_version))
+    }
+
+    fn reconnect_as(
+        &mut self,
+        token: &str,
+        capabilities: u32,
+        content_version: Option<&str>,
+    ) -> Result<Joined, JoinError> {
         let player = (!token.is_empty() && !self.disposed)
             .then(|| {
                 self.core
@@ -679,13 +884,118 @@ impl<Z: Zone> ZoneHost<Z> {
             })
             .flatten()
             .ok_or_else(|| JoinError::new(error::RECONNECT_FAILED, "unknown or expired token"))?;
+        let expected = self.core.config.content_version.clone();
+        let mut reload = false;
+        if let Some(version) = content_version {
+            if !expected.is_empty() && version != expected {
+                if self.core.config.stale_policy == StalePolicy::Strict {
+                    return Err(JoinError::new(
+                        error::VERSION_MISMATCH,
+                        format!("content version {version} != {expected}: reload"),
+                    ));
+                }
+                reload = self.zone.is_gate();
+            }
+        }
         self.wake();
         let client = ClientId(self.core.next_id());
         self.bind_player(player, client, capabilities);
+        if let Some(version) = content_version {
+            if let Some(slot) = self.core.players.get_mut(&player) {
+                slot.content_version = version.to_string();
+            }
+        }
+        if reload {
+            self.reload_player(player);
+        }
         Ok(Joined {
             client,
             viewer: Viewer::Player(player),
         })
+    }
+
+    /// Tell a connected player to reload its content (`Kick(RELOAD)`) and
+    /// keep it in the reconnect grace window so it can reconnect with its
+    /// last Welcome's token after reloading.
+    pub fn reload_player(&mut self, player: PlayerId) {
+        let now = self.core.clock.now();
+        let grace = self.core.config.reconnect_grace;
+        let message = ServerMessage::Kick {
+            code: kick::RELOAD,
+            message: format!("content {} required", self.core.config.content_version),
+        };
+        let Some(slot) = self.core.players.get_mut(&player) else {
+            return;
+        };
+        let client = slot.client.take();
+        slot.info.connected = false;
+        slot.inputs.clear();
+        slot.grace_until = Some(now + grace);
+        if let Some(client) = client {
+            self.core.clients.remove(&client);
+            self.core.server_message(client, &message);
+            self.core.outbound.push(Outbound::Close { client });
+        }
+    }
+
+    /// [`reload_player`](Self::reload_player) every connected player whose
+    /// content version differs from the zone's (hard rollout). Returns the
+    /// number reloaded.
+    pub fn reload_stale_players(&mut self) -> usize {
+        let expected = self.core.config.content_version.clone();
+        if expected.is_empty() {
+            return 0;
+        }
+        let stale: Vec<_> = self
+            .core
+            .players
+            .values()
+            .filter(|slot| slot.client.is_some() && slot.content_version != expected)
+            .map(|slot| slot.info.id)
+            .collect();
+        for player in &stale {
+            self.reload_player(*player);
+        }
+        stale.len()
+    }
+
+    /// Content version a player's client reported.
+    pub fn player_content_version(&self, player: PlayerId) -> Option<&str> {
+        self.core
+            .players
+            .get(&player)
+            .map(|slot| slot.content_version.as_str())
+    }
+
+    /// Switch the zone to a new content version
+    /// ([`Zone::on_content_version_changed`]); facts and stamps produced
+    /// afterwards carry it.
+    pub fn set_content_version(&mut self, version: impl Into<String>) {
+        let version = version.into();
+        if version == self.core.config.content_version {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.core.config.content_version, version.clone());
+        hook!(self.on_content_version_changed(&previous, &version));
+        self.process_kicks();
+    }
+
+    /// Queue a tier-up event from a child zone; delivered to
+    /// [`Zone::on_child_event`] on a later tick (or the next `advance` when
+    /// the zone is not ticking), never while frozen.
+    pub fn deliver_child_event(&mut self, event: ChildEvent) {
+        self.core.child_inbox.push(event);
+    }
+
+    /// Tier-up events emitted (or forwarded) by this zone since the last
+    /// call; the driver routes them to the parent zone.
+    pub fn drain_upward(&mut self) -> Vec<ChildEvent> {
+        std::mem::take(&mut self.core.upward)
+    }
+
+    /// Inputs dropped because the zone was frozen.
+    pub fn inputs_dropped_frozen(&self) -> u64 {
+        self.core.dropped_frozen
     }
 
     fn attach_client(&mut self, client: ClientId, viewer: Viewer) {
@@ -775,6 +1085,7 @@ impl<Z: Zone> ZoneHost<Z> {
             return PushOutcome::UnknownClient;
         };
         if self.frozen {
+            self.core.dropped_frozen += 1;
             return PushOutcome::Rejected;
         }
         let Some(slot) = self.core.players.get(&player) else {
@@ -815,12 +1126,52 @@ impl<Z: Zone> ZoneHost<Z> {
 
     /// Freeze: ticks stop and inputs are rejected; clients get Freeze.
     pub fn freeze(&mut self, notice: Notice) {
+        self.freeze_request = None;
         self.frozen = true;
         self.broadcast(&ServerMessage::Freeze(notice));
     }
 
+    /// Barrier phase 1: freeze as soon as [`Zone::freeze_ready`] allows (now,
+    /// or at the end of a later `advance`; the zone keeps ticking until
+    /// then). Returns the resulting state.
+    pub fn request_freeze(&mut self, notice: Notice) -> FreezeState {
+        if !self.frozen {
+            self.freeze_request = Some(notice);
+            self.try_freeze();
+        }
+        self.freeze_state()
+    }
+
+    /// Abort a barrier: drop a pending freeze request, and resume with
+    /// `notice` if already frozen.
+    pub fn cancel_freeze(&mut self, notice: Notice) {
+        self.freeze_request = None;
+        if self.frozen {
+            self.resume(notice);
+        }
+    }
+
+    /// Freeze progress.
+    pub fn freeze_state(&self) -> FreezeState {
+        if self.frozen {
+            FreezeState::Frozen
+        } else if self.freeze_request.is_some() {
+            FreezeState::Freezing
+        } else {
+            FreezeState::Running
+        }
+    }
+
+    fn try_freeze(&mut self) {
+        if self.freeze_request.is_some() && !self.disposed && self.zone.freeze_ready() {
+            let notice = self.freeze_request.take().expect("checked");
+            self.freeze(notice);
+        }
+    }
+
     /// Resume after [`freeze`](Self::freeze); the frozen backlog is not simulated.
     pub fn resume(&mut self, notice: Notice) {
+        self.freeze_request = None;
         self.frozen = false;
         self.hot.reset();
         if let Some(idle) = &mut self.idle {
@@ -898,6 +1249,9 @@ impl<Z: Zone> ZoneHost<Z> {
     }
 
     fn process_kicks(&mut self) {
+        while let Some((player, message)) = self.core.pending_handoffs.pop() {
+            self.remove_player(player, LeaveReason::Handoff, Some(message));
+        }
         while let Some((player, message)) = self.core.pending_kicks.pop() {
             let kick = ServerMessage::Kick {
                 code: kick::BY_ZONE,
@@ -963,11 +1317,28 @@ impl<Z: Zone> ZoneHost<Z> {
         self.process_kicks();
     }
 
+    fn deliver_child_events(&mut self) {
+        if self.frozen || self.core.child_inbox.is_empty() {
+            return;
+        }
+        for event in std::mem::take(&mut self.core.child_inbox) {
+            hook!(self.on_child_event(&event));
+            if event.levels > 1 {
+                let mut forward = event;
+                forward.levels -= 1;
+                forward.from_zone = self.core.zone_id.clone();
+                self.core.upward.push(forward);
+            }
+        }
+        self.process_kicks();
+    }
+
     fn tick_once(&mut self, dt: Duration) {
         self.core.tick += 1;
         self.core.sim_time += dt;
         self.core.dt = dt;
         self.deliver_settlements();
+        self.deliver_child_events();
         let due = self.core.timers.due(self.core.sim_time);
         for (id, timer) in due {
             hook!(self.on_timer(id, timer));
@@ -1052,7 +1423,9 @@ impl<Z: Zone> ZoneHost<Z> {
         }
         if report.ticks == 0 {
             self.deliver_settlements();
+            self.deliver_child_events();
         }
+        self.try_freeze();
 
         let patch_interval = rate_to_step(self.core.config.patch_rate);
         if self.core.tier == Tier::Hot && !self.core.clients.is_empty() && now >= self.next_patch {

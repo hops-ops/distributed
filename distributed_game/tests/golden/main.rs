@@ -154,6 +154,9 @@ fn server_json(m: &ServerMessage) -> Value {
         ServerMessage::Error { code, message } => {
             json!({ "type": "Error", "code": code, "message": message })
         }
+        ServerMessage::Redirect { zone_id, url } => {
+            json!({ "type": "Redirect", "zone_id": zone_id, "url": url })
+        }
     }
 }
 
@@ -478,6 +481,20 @@ fn messages() {
             ServerMessage::Error {
                 code: error::UNAUTHORIZED,
                 message: "Expired".into(),
+            },
+        ),
+        (
+            "kick_reload",
+            ServerMessage::Kick {
+                code: kick::RELOAD,
+                message: "content c2 required".into(),
+            },
+        ),
+        (
+            "redirect",
+            ServerMessage::Redirect {
+                zone_id: "realm.west".into(),
+                url: "ws://10.0.0.2:2567/zones/realm.west".into(),
             },
         ),
     ];

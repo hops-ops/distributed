@@ -17,7 +17,11 @@ runtime = ["dep:tokio"]
 # Adapter that commits facts into a `distributed` AggregateCell.
 cell = ["dep:distributed", "dep:sha2"]
 # axum WebSocket zone server with signed-ticket admission.
-net = ["runtime", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros"]
+net = ["runtime", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros", "tokio/io-util"]
+# `world::FencedLeaseOwnership`: zone ownership over `distributed::lease`.
+lease = ["dep:distributed"]
+# `world::SqliteZoneStateStore`: native SQLite hibernation snapshots.
+sqlite = ["dep:rusqlite"]
 
 [dependencies]
 serde_json = "1"
@@ -27,6 +31,7 @@ axum = { version = "0.8", default-features = false, features = ["ws", "tokio", "
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 base64 = { version = "0.23", optional = true }
+rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -43,3 +48,8 @@ required-features = ["net"]
 name = "cell_sink"
 path = "tests/cell_sink/main.rs"
 required-features = ["cell", "runtime"]
+
+[[test]]
+name = "world"
+path = "tests/world/main.rs"
+required-features = ["net", "lease", "sqlite"]

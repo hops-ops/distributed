@@ -16,9 +16,32 @@
 //! - [`NetSim`] adds latency/jitter in both directions for development.
 //! - [`GameServer::serve`] shuts down gracefully: every zone kicks its
 //!   clients with `Kick(SHUTDOWN)`, runs `on_dispose`, and connections close.
+//!
+//! World structure (see [`world`] and `crate::world`):
+//!
+//! - **Placement**: with a [`ZoneDirectory`], a Hello for a zone owned by
+//!   another host gets `Redirect(zone, url)` (ticket not consumed).
+//! - **Ownership**: every activation acquires a fenced claim
+//!   ([`ZoneOwnership`], default [`LocalOwnership`]) and renews it; losing
+//!   it disposes the zone without persisting anything.
+//! - **Activate on demand / hibernate**: zones are created on first use;
+//!   one that stays Dormant for `hibernate_after` is snapshotted
+//!   ([`Zone::hibernate`]) into the [`ZoneStateStore`] under its fencing
+//!   token, disposed, and restored on its next activation.
+//! - **Handoff**: [`Ctx::handoff`](crate::Ctx::handoff) issues a signed
+//!   transfer ticket; the target reserves/confirms it with the issuing host
+//!   (single use), a refused transfer may return to its source.
+//! - **Tier-up events** are routed to the parent zone, locally or through
+//!   the admin endpoint of the host that owns it.
+//! - **Barrier**: [`GameServer::prepare_barrier`] / `commit_barrier` /
+//!   `abort_barrier`, driven by a [`world::WorldCoordinator`].
 
+pub mod peer;
 pub mod ticket;
+pub mod transfer;
+pub mod world;
 
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,20 +51,29 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
+use serde_json::json;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-pub use ticket::{NonceCache, TicketError, TicketKey};
+pub use ticket::{NonceCache, TicketError, TicketKey, VerifiedTicket};
+pub use transfer::{TransferOp, TransferRegistry};
+pub use world::{BarrierParticipant, RemoteHost, RolloutError, RolloutReport, WorldCoordinator};
 
 use crate::clock::{Clock, SystemClock};
 use crate::facts::{fact_channel, spawn_fact_worker, FactQueue, FactSink, RetryPolicy};
+use crate::handoff::{HandoffRequest, Transfer};
 use crate::host::{HostConfig, JoinError, Joined, Outbound, ZoneHost};
-use crate::protocol::{error, kick, ClientMessage, ServerMessage, PROTOCOL_VERSION};
+use crate::protocol::Role;
+use crate::protocol::{error, kick, ClientMessage, Notice, ServerMessage, PROTOCOL_VERSION};
 use crate::rng::ZoneRng;
-use crate::zone::{ClientId, Zone};
+use crate::world::{
+    BarrierMode, ChildEvent, DottedTopology, FreezeState, HostAddr, LocalOwnership, OwnershipError,
+    StoredZoneState, ZoneClaim, ZoneDirectory, ZoneOwnership, ZoneStateStore, ZoneTopology,
+};
+use crate::zone::{ClientId, TicketClaims, Tier, Zone};
 
 /// Development latency/jitter simulation (applied to each direction).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,6 +103,24 @@ pub struct ServerConfig {
     pub max_frame_bytes: usize,
     /// Optional dev latency simulation.
     pub net_sim: Option<NetSim>,
+    /// Hibernate a zone after it has been Dormant this long (None = never).
+    pub hibernate_after: Option<Duration>,
+    /// Zone ownership claim TTL.
+    pub ownership_ttl: Duration,
+    /// Claim renewal period (well below `ownership_ttl`).
+    pub ownership_renew_every: Duration,
+    /// How long an activation waits for a held claim (e.g. the previous
+    /// activation still saving its snapshot) before refusing.
+    pub activation_timeout: Duration,
+    /// Transfer ticket lifetime (and target reservation bound).
+    pub transfer_ttl: Duration,
+    /// After a zone is disposed, how long to wait for its fact worker to
+    /// commit the facts still queued.
+    pub settle_timeout: Duration,
+    /// Shared secret enabling the `/admin/*` routes and peer calls.
+    pub admin_secret: Option<String>,
+    /// Peer (host-to-host) request timeout.
+    pub peer_timeout: Duration,
 }
 
 impl ServerConfig {
@@ -85,13 +135,24 @@ impl ServerConfig {
             outbound_queue: 512,
             max_frame_bytes: 64 * 1024,
             net_sim: None,
+            hibernate_after: None,
+            ownership_ttl: Duration::from_secs(15),
+            ownership_renew_every: Duration::from_secs(5),
+            activation_timeout: Duration::from_secs(5),
+            transfer_ttl: Duration::from_secs(30),
+            settle_timeout: Duration::from_secs(2),
+            admin_secret: None,
+            peer_timeout: Duration::from_secs(3),
         }
     }
 }
 
+type Inspector = Box<dyn FnOnce(&dyn Any) + Send>;
+
 enum ZoneCmd {
     Join {
-        claims: crate::zone::TicketClaims,
+        claims: TicketClaims,
+        transfer: Option<Transfer>,
         capabilities: u32,
         content_version: String,
         out: mpsc::Sender<ConnOut>,
@@ -100,9 +161,24 @@ enum ZoneCmd {
     Reconnect {
         token: String,
         capabilities: u32,
+        content_version: String,
         out: mpsc::Sender<ConnOut>,
         reply: oneshot::Sender<Result<Joined, JoinError>>,
     },
+    ChildEvent(ChildEvent),
+    Freeze {
+        notice: Notice,
+        ack: oneshot::Sender<()>,
+    },
+    Commit {
+        version: String,
+        notes: String,
+        mode: BarrierMode,
+    },
+    Abort {
+        notice: Notice,
+    },
+    Inspect(Inspector),
     Input {
         client: ClientId,
         seq: u32,
@@ -121,7 +197,20 @@ enum ConnOut {
 }
 
 type ConfigFactory<Z> = dyn Fn(&str) -> Option<<Z as Zone>::Config> + Send + Sync;
-type FactsFactory = dyn Fn(&str) -> Option<FactQueue> + Send + Sync;
+type FactsFactory = dyn Fn(&str) -> Option<(FactQueue, JoinHandle<()>)> + Send + Sync;
+
+struct ZoneEntry {
+    tx: mpsc::Sender<ZoneCmd>,
+    activation: u64,
+}
+
+/// World-wide content state of this server.
+#[derive(Debug, Clone, Default)]
+struct WorldState {
+    version: String,
+    /// Barrier in progress: zones activated now start frozen.
+    barrier: Option<(u64, Notice)>,
+}
 
 struct Inner<Z: Zone> {
     config: ServerConfig,
@@ -129,10 +218,19 @@ struct Inner<Z: Zone> {
     factory: Box<ConfigFactory<Z>>,
     facts: Option<Box<FactsFactory>>,
     nonces: Mutex<NonceCache>,
-    zones: Mutex<HashMap<String, mpsc::Sender<ZoneCmd>>>,
+    zones: Mutex<HashMap<String, ZoneEntry>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     shutdown: watch::Sender<bool>,
     token_counter: AtomicU64,
+    host_id: String,
+    directory: Option<Arc<dyn ZoneDirectory>>,
+    ownership: Arc<dyn ZoneOwnership>,
+    state_store: Option<Arc<dyn ZoneStateStore>>,
+    topology: Arc<dyn ZoneTopology>,
+    transfers: Mutex<TransferRegistry>,
+    /// Lock order: `zones` before `world`.
+    world: Mutex<WorldState>,
+    activations: AtomicU64,
 }
 
 /// Multi-zone WebSocket game server.
@@ -168,6 +266,7 @@ where
         factory: impl Fn(&str) -> Option<Z::Config> + Send + Sync + 'static,
     ) -> Self {
         let (shutdown, _) = watch::channel(false);
+        let version = config.host.content_version.clone();
         Self {
             inner: Arc::new(Inner {
                 config,
@@ -179,7 +278,197 @@ where
                 tasks: Mutex::new(Vec::new()),
                 shutdown,
                 token_counter: AtomicU64::new(0),
+                host_id: "local".into(),
+                directory: None,
+                ownership: Arc::new(LocalOwnership::new()),
+                state_store: None,
+                topology: Arc::new(DottedTopology),
+                transfers: Mutex::new(TransferRegistry::default()),
+                world: Mutex::new(WorldState {
+                    version,
+                    barrier: None,
+                }),
+                activations: AtomicU64::new(0),
             }),
+        }
+    }
+
+    fn configure(mut self, f: impl FnOnce(&mut Inner<Z>)) -> Self {
+        f(Arc::get_mut(&mut self.inner).expect("configure before sharing the server"));
+        self
+    }
+
+    /// This host's id (directory entry, ownership holder prefix, transfer
+    /// issuer). Default `"local"`.
+    pub fn with_host_id(self, host_id: impl Into<String>) -> Self {
+        let host_id = host_id.into();
+        self.configure(|inner| inner.host_id = host_id)
+    }
+
+    /// Route zones owned by other hosts (Redirect, peer calls).
+    pub fn with_directory(self, directory: Arc<dyn ZoneDirectory>) -> Self {
+        self.configure(|inner| inner.directory = Some(directory))
+    }
+
+    /// Fenced zone ownership shared by every host of the world.
+    pub fn with_ownership(self, ownership: Arc<dyn ZoneOwnership>) -> Self {
+        self.configure(|inner| inner.ownership = ownership)
+    }
+
+    /// Where hibernated zone snapshots go.
+    pub fn with_state_store(self, store: Arc<dyn ZoneStateStore>) -> Self {
+        self.configure(|inner| inner.state_store = Some(store))
+    }
+
+    /// Zone hierarchy for tier-up events (default [`DottedTopology`]).
+    pub fn with_topology(self, topology: Arc<dyn ZoneTopology>) -> Self {
+        self.configure(|inner| inner.topology = topology)
+    }
+
+    /// Host id.
+    pub fn host_id(&self) -> &str {
+        &self.inner.host_id
+    }
+
+    /// The world content version this server runs.
+    pub fn content_version(&self) -> String {
+        self.inner.world.lock().expect("world").version.clone()
+    }
+
+    /// True when `zone_id` is active on this server.
+    pub fn is_active(&self, zone_id: &str) -> bool {
+        self.inner
+            .zones
+            .lock()
+            .expect("zones")
+            .get(zone_id)
+            .is_some_and(|e| !e.tx.is_closed())
+    }
+
+    /// Run `f` against an **active** zone's host (ops tooling and tests).
+    /// None when the zone is not active here.
+    pub async fn inspect<R: Send + 'static>(
+        &self,
+        zone_id: &str,
+        f: impl FnOnce(&ZoneHost<Z>) -> R + Send + 'static,
+    ) -> Option<R> {
+        let tx = {
+            let zones = self.inner.zones.lock().expect("zones");
+            zones.get(zone_id)?.tx.clone()
+        };
+        let (reply, rx) = oneshot::channel();
+        let inspector: Inspector = Box::new(move |any: &dyn Any| {
+            if let Some(host) = any.downcast_ref::<ZoneHost<Z>>() {
+                let _ = reply.send(f(host));
+            }
+        });
+        tx.send(ZoneCmd::Inspect(inspector)).await.ok()?;
+        rx.await.ok()
+    }
+
+    /// Activate `zone_id` locally (as if a client asked for it).
+    pub fn activate(&self, zone_id: &str) -> bool {
+        activate_local(&self.inner, zone_id).is_some()
+    }
+
+    /// Barrier phase 1 on this server: freeze every active zone (and every
+    /// zone activated until commit/abort) with `notice`, then wait up to
+    /// `timeout` for all to acknowledge. `Err` lists zones that did not.
+    pub async fn prepare_barrier(
+        &self,
+        barrier: u64,
+        notice: Notice,
+        timeout: Duration,
+    ) -> Result<(), Vec<String>> {
+        let targets: Vec<(String, mpsc::Sender<ZoneCmd>)> = {
+            let zones = self.inner.zones.lock().expect("zones");
+            self.inner.world.lock().expect("world").barrier = Some((barrier, notice.clone()));
+            zones
+                .iter()
+                .map(|(id, e)| (id.clone(), e.tx.clone()))
+                .collect()
+        };
+        let deadline = Instant::now() + timeout;
+        let mut waiting = Vec::new();
+        for (zone_id, tx) in targets {
+            let (ack, rx) = oneshot::channel();
+            let cmd = ZoneCmd::Freeze {
+                notice: notice.clone(),
+                ack,
+            };
+            match tokio::time::timeout_at(deadline, tx.send(cmd)).await {
+                Ok(Ok(())) => waiting.push((zone_id, tx, rx)),
+                // Zone task gone (hibernated / stopped): nothing to freeze.
+                Ok(Err(_)) => {}
+                Err(_) => waiting.push((zone_id, tx, oneshot::channel().1)),
+            }
+        }
+        let mut missing = Vec::new();
+        for (zone_id, tx, rx) in waiting {
+            match tokio::time::timeout_at(deadline, rx).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) if tx.is_closed() => {}
+                _ => missing.push(zone_id),
+            }
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            missing.sort();
+            Err(missing)
+        }
+    }
+
+    /// Barrier phase 2: switch every zone to `version` and resume it
+    /// (`Resume{version, notes}`); `BarrierMode::Hard` also reloads stale
+    /// clients.
+    pub async fn commit_barrier(
+        &self,
+        _barrier: u64,
+        version: &str,
+        notes: &str,
+        mode: BarrierMode,
+    ) {
+        let targets: Vec<mpsc::Sender<ZoneCmd>> = {
+            let zones = self.inner.zones.lock().expect("zones");
+            let mut world = self.inner.world.lock().expect("world");
+            world.version = version.to_string();
+            world.barrier = None;
+            zones.values().map(|e| e.tx.clone()).collect()
+        };
+        for tx in targets {
+            let _ = tx
+                .send(ZoneCmd::Commit {
+                    version: version.to_string(),
+                    notes: notes.to_string(),
+                    mode,
+                })
+                .await;
+        }
+    }
+
+    /// Abort a barrier: every zone resumes on the old version.
+    pub async fn abort_barrier(&self, _barrier: u64, notes: &str) {
+        let (targets, version): (Vec<mpsc::Sender<ZoneCmd>>, String) = {
+            let zones = self.inner.zones.lock().expect("zones");
+            let mut world = self.inner.world.lock().expect("world");
+            world.barrier = None;
+            (
+                zones.values().map(|e| e.tx.clone()).collect(),
+                world.version.clone(),
+            )
+        };
+        let notice = Notice {
+            reason: "content_update_aborted".into(),
+            version,
+            notes: notes.to_string(),
+        };
+        for tx in targets {
+            let _ = tx
+                .send(ZoneCmd::Abort {
+                    notice: notice.clone(),
+                })
+                .await;
         }
     }
 
@@ -195,17 +484,23 @@ where
         let inner = Arc::get_mut(&mut self.inner).expect("configure before sharing the server");
         inner.facts = Some(Box::new(move |_zone: &str| {
             let (queue, feed) = fact_channel(capacity, policy);
-            spawn_fact_worker(feed, sink.clone());
-            Some(queue)
+            let worker = spawn_fact_worker(feed, sink.clone());
+            Some((queue, worker))
         }));
         self
     }
 
-    /// axum router exposing `GET /zones/{zone_id}`.
+    /// axum router exposing `GET /zones/{zone_id}` and, when
+    /// `admin_secret` is set, the `/admin/*` peer routes.
     pub fn router(&self) -> Router {
-        Router::new()
-            .route("/zones/{zone_id}", get(upgrade::<Z>))
-            .with_state(self.inner.clone())
+        let mut router = Router::new().route("/zones/{zone_id}", get(upgrade::<Z>));
+        if self.inner.config.admin_secret.is_some() {
+            router = router
+                .route("/admin/transfer", post(world::admin_transfer::<Z>))
+                .route("/admin/child-event", post(world::admin_child_event::<Z>))
+                .route("/admin/barrier/{phase}", post(world::admin_barrier::<Z>));
+        }
+        router.with_state(self.inner.clone())
     }
 
     /// Ids of zones currently hosted.
@@ -215,8 +510,9 @@ where
             .zones
             .lock()
             .expect("zones")
-            .keys()
-            .cloned()
+            .iter()
+            .filter(|(_, e)| !e.tx.is_closed())
+            .map(|(id, _)| id.clone())
             .collect();
         ids.sort();
         ids
@@ -253,7 +549,34 @@ where
     }
 }
 
-fn zone_sender<Z>(inner: &Arc<Inner<Z>>, zone_id: &str) -> Option<mpsc::Sender<ZoneCmd>>
+enum ZoneRoute {
+    Local(mpsc::Sender<ZoneCmd>),
+    Remote(HostAddr),
+    NotFound,
+}
+
+/// Where `zone_id` lives: here (activating it on demand) or on another host.
+fn route_zone<Z>(inner: &Arc<Inner<Z>>, zone_id: &str) -> ZoneRoute
+where
+    Z: Zone,
+    Z::Config: Send,
+{
+    if let Some(host) = inner
+        .directory
+        .as_ref()
+        .and_then(|d| d.locate(zone_id))
+        .filter(|h| h.id != inner.host_id)
+    {
+        return ZoneRoute::Remote(host);
+    }
+    match activate_local(inner, zone_id) {
+        Some(tx) => ZoneRoute::Local(tx),
+        None => ZoneRoute::NotFound,
+    }
+}
+
+/// Sender of the local activation of `zone_id`, creating it on demand.
+fn activate_local<Z>(inner: &Arc<Inner<Z>>, zone_id: &str) -> Option<mpsc::Sender<ZoneCmd>>
 where
     Z: Zone,
     Z::Config: Send,
@@ -262,12 +585,20 @@ where
         return None;
     }
     let mut zones = inner.zones.lock().expect("zones");
-    if let Some(tx) = zones.get(zone_id).filter(|tx| !tx.is_closed()) {
-        return Some(tx.clone());
+    if let Some(entry) = zones.get(zone_id).filter(|e| !e.tx.is_closed()) {
+        return Some(entry.tx.clone());
     }
     let zone_config = (inner.factory)(zone_id)?;
     let (tx, rx) = mpsc::channel(1024);
-    zones.insert(zone_id.to_string(), tx.clone());
+    let activation = inner.activations.fetch_add(1, Ordering::Relaxed) + 1;
+    let world = inner.world.lock().expect("world").clone();
+    zones.insert(
+        zone_id.to_string(),
+        ZoneEntry {
+            tx: tx.clone(),
+            activation,
+        },
+    );
     let facts = inner.facts.as_ref().and_then(|f| f(zone_id));
     let task = tokio::spawn(run_zone::<Z>(
         inner.clone(),
@@ -275,8 +606,12 @@ where
         zone_config,
         facts,
         rx,
+        activation,
+        world,
     ));
-    inner.tasks.lock().expect("tasks").push(task);
+    let mut tasks = inner.tasks.lock().expect("tasks");
+    tasks.retain(|t| !t.is_finished());
+    tasks.push(task);
     Some(tx)
 }
 
@@ -286,46 +621,327 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-async fn run_zone<Z: Zone>(
+fn random_token<Z: Zone>(inner: &Inner<Z>, label: &str) -> String {
+    let n = inner.token_counter.fetch_add(1, Ordering::Relaxed);
+    let seed = format!(
+        "{label}|{}|{n}|{}",
+        inner.host_id,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
+    inner.config.ticket_key.hmac(seed.as_bytes())[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Apply a transfer-record operation at the issuing host (local or peer).
+async fn transfer_op<Z: Zone>(
+    inner: &Arc<Inner<Z>>,
+    issuer: &str,
+    op: TransferOp,
+    nonce: &str,
+) -> Result<(), String> {
+    let reserve_for = inner.config.transfer_ttl.as_secs().max(1);
+    if issuer == inner.host_id {
+        return inner
+            .transfers
+            .lock()
+            .expect("transfers")
+            .apply(op, nonce, unix_now(), reserve_for)
+            .map_err(str::to_string);
+    }
+    let host = inner
+        .directory
+        .as_ref()
+        .and_then(|d| d.host(issuer))
+        .ok_or_else(|| format!("unknown issuing host {issuer}"))?;
+    let secret = inner
+        .config
+        .admin_secret
+        .as_deref()
+        .ok_or("no admin secret for peer calls")?;
+    let body = json!({ "op": op.as_str(), "nonce": nonce });
+    match peer::post_json(
+        &host.admin_url,
+        "/admin/transfer",
+        secret,
+        &body,
+        inner.config.peer_timeout,
+    )
+    .await?
+    {
+        (200, _) => Ok(()),
+        (_, reply) => Err(reply
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("transfer refused")
+            .to_string()),
+    }
+}
+
+/// Route a tier-up event to `parent` (local activation or peer host).
+fn deliver_child<Z>(inner: &Arc<Inner<Z>>, parent: String, event: ChildEvent)
+where
+    Z: Zone,
+    Z::Config: Send,
+{
+    match route_zone(inner, &parent) {
+        ZoneRoute::Local(tx) => {
+            if let Err(mpsc::error::TrySendError::Full(cmd)) =
+                tx.try_send(ZoneCmd::ChildEvent(event))
+            {
+                tokio::spawn(async move {
+                    let _ = tx.send(cmd).await;
+                });
+            }
+        }
+        ZoneRoute::Remote(host) => {
+            let Some(secret) = inner.config.admin_secret.clone() else {
+                return;
+            };
+            let timeout = inner.config.peer_timeout;
+            let body = json!({ "zone": parent, "event": world::child_event_json(&event) });
+            tokio::spawn(async move {
+                let _ = peer::post_json(
+                    &host.admin_url,
+                    "/admin/child-event",
+                    &secret,
+                    &body,
+                    timeout,
+                )
+                .await;
+            });
+        }
+        ZoneRoute::NotFound => {}
+    }
+}
+
+enum Exit {
+    Hibernate(Vec<ZoneCmd>),
+    Shutdown,
+    Lost,
+}
+
+async fn acquire_claim<Z: Zone>(
+    inner: &Arc<Inner<Z>>,
+    zone_id: &str,
+    holder: &str,
+) -> Result<ZoneClaim, String> {
+    let deadline = Instant::now() + inner.config.activation_timeout;
+    loop {
+        let error = match inner
+            .ownership
+            .acquire(zone_id, holder, inner.config.ownership_ttl)
+            .await
+        {
+            Ok(claim) => return Ok(claim),
+            Err(OwnershipError::Held { holder }) => format!("zone is owned by {holder}"),
+            Err(e) => format!("{e:?}"),
+        };
+        if Instant::now() >= deadline {
+            return Err(error);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Activation failed: answer everything queued and unregister.
+fn refuse_activation<Z: Zone>(
+    inner: &Arc<Inner<Z>>,
+    zone_id: &str,
+    activation: u64,
+    mut rx: mpsc::Receiver<ZoneCmd>,
+    message: &str,
+) {
+    {
+        let mut zones = inner.zones.lock().expect("zones");
+        if zones
+            .get(zone_id)
+            .is_some_and(|e| e.activation == activation)
+        {
+            zones.remove(zone_id);
+        }
+        rx.close();
+    }
+    while let Ok(cmd) = rx.try_recv() {
+        match cmd {
+            ZoneCmd::Join { reply, .. } | ZoneCmd::Reconnect { reply, .. } => {
+                let _ = reply.send(Err(JoinError {
+                    code: error::NOT_FOUND,
+                    message: message.to_string(),
+                }));
+            }
+            // Nothing runs here, so nothing to freeze.
+            ZoneCmd::Freeze { ack, .. } => {
+                let _ = ack.send(());
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn renew_claim(
+    ownership: Arc<dyn ZoneOwnership>,
+    current: Arc<Mutex<ZoneClaim>>,
+    every: Duration,
+    ttl: Duration,
+    lost: oneshot::Sender<()>,
+) {
+    loop {
+        tokio::time::sleep(every).await;
+        let claim = current.lock().expect("claim").clone();
+        match ownership.renew(&claim, ttl).await {
+            Ok(renewed) => *current.lock().expect("claim") = renewed,
+            Err(OwnershipError::Backend(_)) => continue,
+            Err(_) => {
+                let _ = lost.send(());
+                return;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_zone<Z>(
     inner: Arc<Inner<Z>>,
     zone_id: String,
     zone_config: Z::Config,
-    facts: Option<FactQueue>,
+    facts: Option<(FactQueue, JoinHandle<()>)>,
     mut rx: mpsc::Receiver<ZoneCmd>,
-) {
-    let key = inner.config.ticket_key.clone();
+    activation: u64,
+    world: WorldState,
+) where
+    Z: Zone,
+    Z::Config: Send,
+{
+    // 1. Fenced ownership.
+    let holder = format!("{}#{activation}", inner.host_id);
+    let claim = match acquire_claim(&inner, &zone_id, &holder).await {
+        Ok(claim) => claim,
+        Err(message) => return refuse_activation(&inner, &zone_id, activation, rx, &message),
+    };
+    // 2. Restore the hibernated snapshot, if any.
+    let saved = match &inner.state_store {
+        Some(store) => {
+            let store = store.clone();
+            let id = zone_id.clone();
+            match tokio::task::spawn_blocking(move || store.load(&id)).await {
+                Ok(Ok(saved)) => saved,
+                _ => {
+                    inner.ownership.release(&claim).await;
+                    return refuse_activation(
+                        &inner,
+                        &zone_id,
+                        activation,
+                        rx,
+                        "zone state unavailable",
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    let mut host_config = inner.config.host.clone();
+    host_config.content_version = world.version.clone();
     let token_inner = inner.clone();
-    let token_zone = zone_id.clone();
+    let issuer_inner = inner.clone();
+    let generation = claim.token;
     let mut host = ZoneHost::<Z>::new(
         zone_id.clone(),
-        inner.config.host.clone(),
+        host_config,
         inner.clock.clone(),
         zone_config,
     )
-    .with_token_source(move || {
-        let n = token_inner.token_counter.fetch_add(1, Ordering::Relaxed);
-        let seed = format!(
-            "token|{token_zone}|{n}|{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        );
-        key.hmac(seed.as_bytes())[..16]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+    .with_token_source(move || random_token(&token_inner, "token"))
+    .with_transfer_issuer(move |request: &HandoffRequest| {
+        let inner = &issuer_inner;
+        let expires_at = unix_now() + inner.config.transfer_ttl.as_secs().max(1);
+        let nonce = random_token(inner, "transfer");
+        inner
+            .transfers
+            .lock()
+            .expect("transfers")
+            .issue(&nonce, expires_at);
+        Some(inner.config.ticket_key.sign_transfer(&Transfer {
+            claims: TicketClaims {
+                principal: request.principal.clone(),
+                zone: request.target_zone.clone(),
+                expires_at,
+                nonce,
+                role: Role::Player,
+            },
+            source_zone: request.source_zone.clone(),
+            issuer: inner.host_id.clone(),
+            generation,
+            carried: request.carried.clone(),
+        }))
     });
-    if let Some(queue) = facts {
-        host = host.with_facts(queue);
+    if let Some(saved) = &saved {
+        host.restore(&saved.state, &saved.content_version);
     }
+    let fact_worker = match facts {
+        Some((queue, worker)) => {
+            host = host.with_facts(queue);
+            Some(worker)
+        }
+        None => None,
+    };
+    if let Some((_, notice)) = world.barrier {
+        host.request_freeze(notice);
+    }
+
+    // 3. Keep the claim alive.
+    let current = Arc::new(Mutex::new(claim));
+    let (lost_tx, mut lost_rx) = oneshot::channel();
+    let renewer = tokio::spawn(renew_claim(
+        inner.ownership.clone(),
+        current.clone(),
+        inner.config.ownership_renew_every,
+        inner.config.ownership_ttl,
+        lost_tx,
+    ));
+
     let mut conns: HashMap<ClientId, mpsc::Sender<ConnOut>> = HashMap::new();
+    let mut freeze_acks: Vec<oneshot::Sender<()>> = Vec::new();
+    let mut dormant_since: Option<Duration> = None;
     let mut shutdown = inner.shutdown.subscribe();
-    loop {
+    let exit = loop {
         let report = host.advance();
         route(&mut host, &mut conns);
-        let sleep_for = report
-            .next_wake
-            .map(|at| at.saturating_sub(inner.clock.now()));
+        forward_upward(&inner, &zone_id, &mut host);
+        if host.is_frozen() {
+            for ack in freeze_acks.drain(..) {
+                let _ = ack.send(());
+            }
+        }
+        let now = inner.clock.now();
+        if host.tier() == Tier::Dormant {
+            dormant_since.get_or_insert(now);
+        } else {
+            dormant_since = None;
+        }
+        let hibernate_at = match (inner.config.hibernate_after, dormant_since) {
+            (Some(after), Some(since))
+                if conns.is_empty()
+                    && host.freeze_state() == FreezeState::Running
+                    && host.facts_in_flight() == 0 =>
+            {
+                Some(since + after)
+            }
+            _ => None,
+        };
+        if hibernate_at.is_some_and(|at| now >= at) {
+            if let Some(leftovers) = begin_hibernation(&inner, &zone_id, activation, &mut rx) {
+                break Exit::Hibernate(leftovers);
+            }
+        }
+        let wake = match (report.next_wake, hibernate_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let sleep_for = wake.map(|at| at.saturating_sub(now));
         tokio::select! {
             biased;
             _ = shutdown.wait_for(|stop| *stop) => {
@@ -338,14 +954,24 @@ async fn run_zone<Z: Zone>(
                 conns.clear();
                 host.dispose();
                 host.drain_outbound();
-                break;
+                break Exit::Shutdown;
+            }
+            _ = &mut lost_rx => {
+                // Someone else owns the zone now: stop without persisting.
+                host.dispose();
+                route(&mut host, &mut conns);
+                break Exit::Lost;
             }
             cmd = rx.recv() => {
-                let Some(cmd) = cmd else { break };
-                handle_cmd(&mut host, &mut conns, cmd);
+                let Some(cmd) = cmd else {
+                    host.dispose();
+                    route(&mut host, &mut conns);
+                    break Exit::Shutdown;
+                };
+                handle_cmd(&mut host, &mut conns, &mut freeze_acks, cmd);
                 // Drain whatever else is queued before ticking again.
                 while let Ok(cmd) = rx.try_recv() {
-                    handle_cmd(&mut host, &mut conns, cmd);
+                    handle_cmd(&mut host, &mut conns, &mut freeze_acks, cmd);
                 }
                 route(&mut host, &mut conns);
             }
@@ -356,24 +982,122 @@ async fn run_zone<Z: Zone>(
                 }
             } => {}
         }
+    };
+    renewer.abort();
+    let claim = current.lock().expect("claim").clone();
+    match exit {
+        Exit::Hibernate(leftovers) => {
+            let snapshot = host.hibernate_state();
+            let content_version = host.config().content_version.clone();
+            host.dispose();
+            host.drain_outbound();
+            forward_upward(&inner, &zone_id, &mut host);
+            if let (Some(state), Some(store)) = (snapshot, inner.state_store.clone()) {
+                let id = zone_id.clone();
+                let stored = StoredZoneState {
+                    token: claim.token,
+                    content_version,
+                    state,
+                };
+                // A stale token means a newer owner saved already: drop ours.
+                let _ = tokio::task::spawn_blocking(move || store.save(&id, &stored)).await;
+            }
+            inner.ownership.release(&claim).await;
+            drop(host);
+            for cmd in leftovers {
+                if matches!(cmd, ZoneCmd::Input { .. } | ZoneCmd::Disconnect { .. }) {
+                    continue;
+                }
+                if let Some(tx) = activate_local(&inner, &zone_id) {
+                    let _ = tx.send(cmd).await;
+                }
+            }
+        }
+        Exit::Shutdown => {
+            inner.ownership.release(&claim).await;
+            drop(host);
+        }
+        Exit::Lost => drop(host),
     }
-    inner.zones.lock().expect("zones").remove(&zone_id);
+    // The fact worker commits everything still queued once the queue is
+    // dropped; give it a bounded moment so nothing is lost on dispose.
+    if let Some(worker) = fact_worker {
+        let _ = tokio::time::timeout(inner.config.settle_timeout, worker).await;
+    }
+    let mut zones = inner.zones.lock().expect("zones");
+    if zones
+        .get(&zone_id)
+        .is_some_and(|e| e.activation == activation)
+    {
+        zones.remove(&zone_id);
+    }
+}
+
+/// Unregister the zone and close its inbox atomically; None when commands
+/// are pending (hibernation is retried later).
+fn begin_hibernation<Z: Zone>(
+    inner: &Arc<Inner<Z>>,
+    zone_id: &str,
+    activation: u64,
+    rx: &mut mpsc::Receiver<ZoneCmd>,
+) -> Option<Vec<ZoneCmd>> {
+    let mut zones = inner.zones.lock().expect("zones");
+    if !rx.is_empty() {
+        return None;
+    }
+    if zones
+        .get(zone_id)
+        .is_some_and(|e| e.activation == activation)
+    {
+        zones.remove(zone_id);
+    }
+    rx.close();
+    drop(zones);
+    // Commands sent between the check and the close are re-routed to the
+    // next activation (which waits for our claim release).
+    let mut leftovers = Vec::new();
+    while let Ok(cmd) = rx.try_recv() {
+        leftovers.push(cmd);
+    }
+    Some(leftovers)
+}
+
+fn forward_upward<Z>(inner: &Arc<Inner<Z>>, zone_id: &str, host: &mut ZoneHost<Z>)
+where
+    Z: Zone,
+    Z::Config: Send,
+{
+    let events = host.drain_upward();
+    if events.is_empty() {
+        return;
+    }
+    let Some(parent) = inner.topology.parent(zone_id) else {
+        return;
+    };
+    for event in events {
+        deliver_child(inner, parent.clone(), event);
+    }
 }
 
 fn handle_cmd<Z: Zone>(
     host: &mut ZoneHost<Z>,
     conns: &mut HashMap<ClientId, mpsc::Sender<ConnOut>>,
+    freeze_acks: &mut Vec<oneshot::Sender<()>>,
     cmd: ZoneCmd,
 ) {
     match cmd {
         ZoneCmd::Join {
             claims,
+            transfer,
             capabilities,
             content_version,
             out,
             reply,
         } => {
-            let result = host.join(&claims, capabilities, &content_version);
+            let result = match &transfer {
+                Some(transfer) => host.join_transfer(transfer, capabilities, &content_version),
+                None => host.join(&claims, capabilities, &content_version),
+            };
             if let Ok(joined) = &result {
                 conns.insert(joined.client, out);
             }
@@ -382,10 +1106,11 @@ fn handle_cmd<Z: Zone>(
         ZoneCmd::Reconnect {
             token,
             capabilities,
+            content_version,
             out,
             reply,
         } => {
-            let result = host.reconnect(&token, capabilities);
+            let result = host.reconnect_with_version(&token, capabilities, &content_version);
             if let Ok(joined) = &result {
                 conns.insert(joined.client, out);
             }
@@ -403,6 +1128,37 @@ fn handle_cmd<Z: Zone>(
             conns.remove(&client);
             host.disconnect(client, graceful);
         }
+        ZoneCmd::ChildEvent(event) => host.deliver_child_event(event),
+        ZoneCmd::Freeze { notice, ack } => {
+            if host.request_freeze(notice) == FreezeState::Frozen {
+                let _ = ack.send(());
+            } else {
+                freeze_acks.push(ack);
+            }
+        }
+        ZoneCmd::Commit {
+            version,
+            notes,
+            mode,
+        } => {
+            host.set_content_version(version.clone());
+            if host.freeze_state() != FreezeState::Running {
+                host.resume(Notice {
+                    reason: "content_update".into(),
+                    version,
+                    notes,
+                });
+            }
+            if mode == BarrierMode::Hard {
+                host.reload_stale_players();
+            }
+            freeze_acks.clear();
+        }
+        ZoneCmd::Abort { notice } => {
+            host.cancel_freeze(notice);
+            freeze_acks.clear();
+        }
+        ZoneCmd::Inspect(f) => f(&*host as &dyn Any),
     }
 }
 
@@ -568,30 +1324,80 @@ where
         )
         .await;
     }
-    let Some(zone) = zone_sender(&inner, &zone_id) else {
-        return reject(socket, error::NOT_FOUND, "unknown zone").await;
-    };
+    // Placement: another host owns this zone -> Redirect (ticket untouched).
+    let first_route = route_zone(&inner, &zone_id);
+    match &first_route {
+        ZoneRoute::Remote(host) => {
+            let redirect = ServerMessage::Redirect {
+                zone_id: zone_id.clone(),
+                url: host.zone_url(&zone_id),
+            }
+            .encode(&())
+            .expect("redirect encodes");
+            let _ = socket.send(Message::Binary(redirect.into())).await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+        ZoneRoute::NotFound => return reject(socket, error::NOT_FOUND, "unknown zone").await,
+        ZoneRoute::Local(_) => {}
+    }
     let (out_tx, mut out_rx) = mpsc::channel(cfg.outbound_queue.max(1));
     let (reply_tx, reply_rx) = oneshot::channel();
+    // Transfer record to settle once the zone answered: (issuer, nonce).
+    let mut reserved: Option<(String, String)> = None;
     let cmd = if hello.reconnect_token.is_empty() {
         let now = unix_now();
-        let claims = match cfg.ticket_key.verify(&hello.ticket, now) {
-            Ok(claims) => claims,
+        let verified = match cfg.ticket_key.verify_ticket(&hello.ticket, now) {
+            Ok(verified) => verified,
             Err(e) => return reject(socket, error::UNAUTHORIZED, format!("{e:?}")).await,
         };
-        if claims.zone != zone_id {
-            return reject(socket, error::UNAUTHORIZED, "ticket is for another zone").await;
-        }
+        let (claims, transfer) = match verified {
+            VerifiedTicket::Join(claims) => {
+                if claims.zone != zone_id {
+                    return reject(socket, error::UNAUTHORIZED, "ticket is for another zone").await;
+                }
+                (claims, None)
+            }
+            VerifiedTicket::Transfer(mut transfer) => {
+                let nonce = transfer.claims.nonce.clone();
+                if transfer.claims.zone == zone_id {
+                    // Arrival at the target: reserve with the issuer first.
+                    if let Err(e) =
+                        transfer_op(&inner, &transfer.issuer, TransferOp::Reserve, &nonce).await
+                    {
+                        return reject(socket, error::UNAUTHORIZED, e).await;
+                    }
+                    reserved = Some((transfer.issuer.clone(), nonce));
+                } else if transfer.source_zone == zone_id {
+                    // Failed handoff returning to its source.
+                    if let Err(e) =
+                        transfer_op(&inner, &transfer.issuer, TransferOp::Return, &nonce).await
+                    {
+                        return reject(socket, error::UNAUTHORIZED, e).await;
+                    }
+                    let never_reached =
+                        std::mem::replace(&mut transfer.claims.zone, zone_id.clone());
+                    transfer.source_zone = never_reached;
+                } else {
+                    return reject(socket, error::UNAUTHORIZED, "ticket is for another zone").await;
+                }
+                (transfer.claims.clone(), Some(transfer))
+            }
+        };
         let replay = inner.nonces.lock().expect("nonces").check_and_insert(
             &claims.nonce,
             claims.expires_at,
             now,
         );
         if let Err(e) = replay {
+            if let Some((issuer, nonce)) = reserved.take() {
+                let _ = transfer_op(&inner, &issuer, TransferOp::Release, &nonce).await;
+            }
             return reject(socket, error::UNAUTHORIZED, format!("{e:?}")).await;
         }
         ZoneCmd::Join {
             claims,
+            transfer,
             capabilities: hello.capabilities,
             content_version: hello.content_version,
             out: out_tx,
@@ -601,14 +1407,52 @@ where
         ZoneCmd::Reconnect {
             token: hello.reconnect_token,
             capabilities: hello.capabilities,
+            content_version: hello.content_version,
             out: out_tx,
             reply: reply_tx,
         }
     };
-    if zone.send(cmd).await.is_err() {
-        return reject(socket, error::NOT_FOUND, "zone stopped").await;
+    // A zone that just hibernated closes its inbox; retry on the next
+    // activation (which restores the snapshot first).
+    let mut zone = match first_route {
+        ZoneRoute::Local(tx) => tx,
+        _ => unreachable!("handled above"),
+    };
+    let mut pending = cmd;
+    let mut attempts = 0;
+    loop {
+        match zone.send(pending).await {
+            Ok(()) => break,
+            Err(mpsc::error::SendError(cmd)) => {
+                attempts += 1;
+                match activate_local(&inner, &zone_id) {
+                    Some(tx) if attempts < 4 => {
+                        zone = tx;
+                        pending = cmd;
+                    }
+                    _ => {
+                        if let Some((issuer, nonce)) = reserved.take() {
+                            let _ = transfer_op(&inner, &issuer, TransferOp::Release, &nonce).await;
+                        }
+                        return reject(socket, error::NOT_FOUND, "zone stopped").await;
+                    }
+                }
+            }
+        }
     }
-    let client = match reply_rx.await {
+    let result = reply_rx.await;
+    if let Some((issuer, nonce)) = reserved.take() {
+        let op = if matches!(result, Ok(Ok(_))) {
+            TransferOp::Confirm
+        } else {
+            TransferOp::Release
+        };
+        let inner = inner.clone();
+        tokio::spawn(async move {
+            let _ = transfer_op(&inner, &issuer, op, &nonce).await;
+        });
+    }
+    let client = match result {
         Ok(Ok(joined)) => joined.client,
         Ok(Err(e)) => return reject(socket, e.code, e.message).await,
         Err(_) => return reject(socket, error::NOT_FOUND, "zone stopped").await,

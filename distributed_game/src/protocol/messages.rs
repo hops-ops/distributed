@@ -36,6 +36,8 @@ pub mod tag {
     pub const KICK: u8 = 0x87;
     /// Server → client Error.
     pub const ERROR: u8 = 0x88;
+    /// Server → client Redirect (zone owned by another host).
+    pub const REDIRECT: u8 = 0x89;
 }
 
 /// Kick reason codes.
@@ -52,6 +54,9 @@ pub mod kick {
     pub const ZONE_DISPOSED: u32 = 5;
     /// Outbound queue overflow (client too slow).
     pub const SLOW_CONSUMER: u32 = 6;
+    /// Client content is stale: reload, then reconnect with the last
+    /// Welcome's reconnect token inside the grace window.
+    pub const RELOAD: u32 = 7;
 }
 
 /// Error codes.
@@ -300,6 +305,14 @@ pub enum ServerMessage {
         /// Text.
         message: String,
     },
+    /// This host does not own `zone_id`: reconnect to `url` and send the
+    /// same Hello again (the ticket was not consumed). Followed by close.
+    Redirect {
+        /// Zone the client asked for.
+        zone_id: String,
+        /// Full WebSocket URL of the owning host's zone endpoint.
+        url: String,
+    },
 }
 
 /// What a Delta decoder/encoder needs to know about the client's view.
@@ -386,6 +399,9 @@ impl ServerMessage {
             Self::Error { code, message } => {
                 w.u8(tag::ERROR).varuint(*code).string(message);
             }
+            Self::Redirect { zone_id, url } => {
+                w.u8(tag::REDIRECT).string(zone_id).string(url);
+            }
         }
         Ok(w.into_bytes())
     }
@@ -442,6 +458,10 @@ impl ServerMessage {
             tag::ERROR => Self::Error {
                 code: r.varuint()?,
                 message: r.string()?,
+            },
+            tag::REDIRECT => Self::Redirect {
+                zone_id: r.string()?,
+                url: r.string()?,
             },
             other => return Err(DecodeError::UnknownMessage(other)),
         };
