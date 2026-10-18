@@ -223,6 +223,11 @@ async fn command_replay_retains_confirmation_evidence_without_outbox_history() {
         "replay must not republish"
     );
     assert_eq!(reopened.durable_events().unwrap()[0].events.len(), 1);
+    // History reads the same log through the store.
+    let history = reopened.history().await.unwrap();
+    assert_eq!(history, cell.durable_events().unwrap()[0].events);
+    let foreign = StreamIdentity::new("CellItem", "someone-else").unwrap();
+    assert!(reopened.stream_events(&foreign).await.is_err());
 }
 
 fn fn_send_sync<T: Send + Sync>(_: &T) {}

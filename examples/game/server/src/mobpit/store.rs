@@ -18,10 +18,9 @@ use std::time::Duration;
 
 use distributed::cell_host::{AggregateCell, CellSqlitePath, CellStreamStore};
 use distributed::entity::EventRecord;
-use distributed::{GetStream, RepositoryError, StreamIdentity};
+use distributed::{RepositoryError, StreamIdentity};
 use distributed_game::cell::CellFactSink;
-use distributed_game::facts::BoxFuture;
-use distributed_game::{Fact, FactError, FactReceipt, FactSink};
+use distributed_game::{BoxFuture, Fact, FactError, FactReceipt, FactSink};
 use serde::Serialize;
 
 use super::board::Leaderboards;
@@ -35,9 +34,7 @@ const FILE_PREFIX: &str = "Crawler%3A";
 
 /// One player's open cell.
 pub struct CrawlerCell {
-    principal: String,
     cell: Arc<AggregateCell<Crawler>>,
-    store: CellStreamStore,
     sink: CellFactSink<Crawler>,
 }
 
@@ -49,11 +46,7 @@ impl CrawlerCell {
 
     /// The full durable event history of this cell, oldest first.
     pub async fn history(&self) -> Result<Vec<EventRecord>, RepositoryError> {
-        let identity = StreamIdentity::new(AGGREGATE_TYPE, self.principal.clone())?;
-        Ok(GetStream::get_stream(&self.store, &identity)
-            .await?
-            .map(|entity| entity.events().to_vec())
-            .unwrap_or_default())
+        self.cell.history().await
     }
 
     /// The cell (tests dispatch into it directly).
@@ -91,12 +84,10 @@ impl CrawlerCells {
         }
         let identity = StreamIdentity::new(AGGREGATE_TYPE, principal.to_string())?;
         let store = CellStreamStore::open_sqlite(&CellSqlitePath::root(&self.root), identity)?;
-        let cell = Arc::new(AggregateCell::from_store(store.clone())?.mount(RecordKill));
+        let cell = Arc::new(AggregateCell::from_store(store)?.mount(RecordKill));
         let entry = Arc::new(CrawlerCell {
-            principal: principal.to_string(),
             sink: CellFactSink::new(cell.clone(), SERVICE_ID, SYSTEM_PRINCIPAL),
             cell,
-            store,
         });
         open.insert(principal.to_string(), entry.clone());
         Ok(entry)

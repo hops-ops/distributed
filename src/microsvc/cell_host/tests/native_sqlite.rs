@@ -208,6 +208,46 @@ async fn sqlite_cell_reopens_identically_and_replays_recorded_outcomes() {
 }
 
 #[tokio::test]
+async fn sqlite_cell_history_reads_every_event_after_reopen() {
+    let root = TempRoot::new();
+    let location = root.location();
+    let cell = sqlite_cell(&location, "item-h");
+    assert!(cell.history().await.unwrap().is_empty());
+    assert!(
+        cell.durable_events().is_err(),
+        "whole-state export stays a reference-host API"
+    );
+    cell.dispatch_idempotent(
+        "cell_item.create",
+        &identity("0190a000-0000-7000-8000-000000000601"),
+        json!({ "id": "item-h", "title": "ship" }),
+        owner_session(),
+    )
+    .await
+    .unwrap();
+    cell.dispatch_idempotent(
+        "cell_item.complete",
+        &identity("0190a000-0000-7000-8000-000000000602"),
+        json!({ "id": "item-h" }),
+        owner_session(),
+    )
+    .await
+    .unwrap();
+    let history = cell.history().await.unwrap();
+    let names: Vec<_> = history.iter().map(|e| e.event_name.as_str()).collect();
+    assert_eq!(names.len(), 2, "{names:?}");
+    drop(cell);
+
+    // A fresh handle (process restart) reads the same history, snapshots
+    // notwithstanding (snapshot every event here).
+    let reopened = sqlite_cell(&location, "item-h");
+    assert_eq!(reopened.history().await.unwrap(), history);
+    let own = StreamIdentity::new("CellItem", "item-h").unwrap();
+    assert_eq!(reopened.stream_events(&own).await.unwrap(), history);
+    assert_eq!(dump(&location, "item-h").await.events, history);
+}
+
+#[tokio::test]
 async fn sealed_row_reducer_failure_rolls_back_the_whole_command() {
     let root = TempRoot::new();
     let location = root.location();

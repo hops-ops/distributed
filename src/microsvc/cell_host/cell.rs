@@ -13,11 +13,12 @@ use super::store::{
     DurableAggregateCellState, DurableCellCommand, DurableCellEvents, DurableCellSnapshot,
 };
 use crate::aggregate::{Aggregate, AggregateRepository};
+use crate::entity::EventRecord;
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::service::{PortableCommand, Routes};
 use crate::microsvc::session::Session;
 use crate::microsvc::HasOutboxStore;
-use crate::repository::{RepositoryError, SnapshotStore, StreamIdentity};
+use crate::repository::{GetStream, RepositoryError, SnapshotStore, StreamIdentity};
 use crate::snapshot::{SnapshotRecord, Snapshottable};
 use crate::OutboxDispatcher;
 
@@ -264,7 +265,33 @@ where
         self.routes.repo().get(self.shard.aggregate_id()).await
     }
 
-    /// Event log for Durable Object SQLite persistence.
+    /// Durable event history of one stream this cell owns, oldest first
+    /// (empty when the stream has no events). Reads the backing store, so it
+    /// works on the in-process reference host **and** on native SQLite
+    /// cells (`cell-sqlite`), unlike the whole-state
+    /// [`durable_events`](Self::durable_events) export. A stream the cell
+    /// does not own is rejected.
+    pub async fn stream_events(
+        &self,
+        identity: &StreamIdentity,
+    ) -> Result<Vec<EventRecord>, RepositoryError> {
+        Ok(GetStream::get_stream(self.routes.repo().repo(), identity)
+            .await?
+            .map(|entity| entity.events().to_vec())
+            .unwrap_or_default())
+    }
+
+    /// Durable event history of this cell's own aggregate stream
+    /// (`{aggregate_type}:{shard}`), oldest first. See
+    /// [`stream_events`](Self::stream_events).
+    pub async fn history(&self) -> Result<Vec<EventRecord>, RepositoryError> {
+        self.stream_events(&self.shard).await
+    }
+
+    /// Event log export of the in-process reference host (restart tests).
+    /// SQLite cells persist rows directly and return an error here; read
+    /// history with [`history`](Self::history) /
+    /// [`stream_events`](Self::stream_events) instead.
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_events(&self) -> Result<Vec<DurableCellEvents>, RepositoryError> {
         self.routes.repo().repo().durable_events()
