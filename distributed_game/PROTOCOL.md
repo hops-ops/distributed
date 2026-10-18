@@ -15,7 +15,12 @@ Key words MUST / MUST NOT / SHOULD / MAY are used as in RFC 2119.
 ### 1.1 WebSocket (normative transport)
 
 - Endpoint: `GET /zones/{zone_id}` upgraded to a WebSocket. The path
-  selects the zone; the zone in the admission ticket MUST equal it.
+  selects the zone; the zone in the admission ticket MUST equal it
+  (transfer tickets: §8.1).
+- A host that does not own the zone answers the Hello with
+  `Redirect(zone_id, url)` and closes; the client MUST reconnect to `url`
+  and send the **same** Hello (the ticket was not consumed). Clients
+  SHOULD follow at most 3 redirects in a row.
 - Every protocol message is exactly **one binary WebSocket message**.
   There is no additional length prefix inside a WebSocket message.
 - Text messages are a protocol violation: the server replies
@@ -192,6 +197,7 @@ replication priorities are not transmitted.
 | `0x86` | S→C | Handoff |
 | `0x87` | S→C | Kick |
 | `0x88` | S→C | Error |
+| `0x89` | S→C | Redirect |
 
 Unknown type bytes and trailing bytes after a complete message are
 decode errors.
@@ -257,6 +263,7 @@ Resume  := 0x85, string reason, string version, string notes
 Handoff := 0x86, string target_zone, string transfer_ticket
 Kick    := 0x87, varuint code, string message
 Error   := 0x88, varuint code, string message
+Redirect := 0x89, string zone_id, string url
 ```
 
 - **Welcome**: `role` `0` = player, `1` = observer. `session_id` is stable
@@ -268,14 +275,31 @@ Error   := 0x88, varuint code, string message
   are queued when emitted and may arrive before the Delta of the tick that
   produced them.
 - **Pong**: echoes `client_time`; `server_time` is the server clock.
-- **Freeze**: the zone stops simulating; inputs are rejected until
-  **Resume**. Used for content rollouts (`version`) and maintenance.
+- **Freeze**: the zone stops simulating; inputs are dropped (and counted)
+  until **Resume**. For a content rollout `reason` is `content_update` and
+  `version` is the **target** content version. Clients SHOULD stop
+  sending inputs and show `notes`.
+- **Resume**: simulation continues. `version` is the content version the
+  zone now runs: the new one after a committed rollout
+  (`reason = content_update`), the old one after an aborted rollout
+  (`reason = content_update_aborted`). Events and facts after Resume are
+  produced by `version`. A client whose own content differs MAY keep
+  playing until told to reload (§8.2).
 - **Handoff**: the player has been removed from this zone; connect to
-  `target_zone` and present `transfer_ticket` as the Hello ticket. The
-  server closes the socket.
+  `/zones/{target_zone}` (on the current host; follow any Redirect) and
+  present `transfer_ticket` as the Hello `ticket` (empty
+  `reconnect_token`). The server closes the socket. See §8.1.
 - **Kick**: the session is over; the server closes the socket.
   Codes: `1` BY_ZONE, `2` REPLACED (same principal connected again),
-  `3` SHUTDOWN, `4` RATE_LIMITED, `5` ZONE_DISPOSED, `6` SLOW_CONSUMER.
+  `3` SHUTDOWN, `4` RATE_LIMITED, `5` ZONE_DISPOSED, `6` SLOW_CONSUMER,
+  `7` RELOAD. **RELOAD** is the exception to "session over": the player
+  is kept for the reconnect grace window; the client MUST reload its
+  content to the zone's current version (`Resume.version` / Welcome
+  `content_version`) and reconnect with the token from its last Welcome
+  and the new `content_version` in Hello.
+- **Redirect**: this host does not own `zone_id`; reconnect to `url` (a
+  full `ws://` / `wss://` URL including `/zones/{zone_id}`) with the same
+  Hello. The server closes the socket.
 - **Error**: codes `1` BAD_MESSAGE, `2` UNAUTHORIZED, `3` REJECTED,
   `4` ZONE_FULL, `5` VERSION_MISMATCH, `6` RATE_LIMITED, `7` NOT_FOUND,
   `8` RECONNECT_FAILED. Errors during the handshake are followed by close;
@@ -311,6 +335,11 @@ schema of `fixtures/messages.json`):
   02 03 6f 72 62 01      kind 2 "orb", 1 field
     01 78 06 00000000 00008042 0c    "x" quant_f32 min 0 max 64 bits 12
 ```
+
+Redirect (`fixtures/messages.json` → `redirect`):
+`89 0a 7265616c6d2e77657374 23 77733a2f2f31302e302e302e323a323536372f7a6f6e65732f7265616c6d2e77657374`
+= zone `"realm.west"`, url `"ws://10.0.0.2:2567/zones/realm.west"`.
+Kick RELOAD (`kick_reload`): `87 07 13 "content c2 required"`.
 
 ## 7. Delta
 
@@ -420,6 +449,55 @@ unpadded base64url). Any HS256 JWT library can mint one.
     inputs.
 - Failures produce `Error(UNAUTHORIZED)` and close.
 
+### 8.1 Transfer tickets and handoff
+
+A zone hands a player to another zone (possibly on another host) with a
+**transfer ticket**: the same HS256 JWT format, minted by the source host,
+with extra claims — `kind: "transfer"`, `src` (source zone), `iss`
+(issuing host id), `gen` (source zone ownership token), `carry`
+(base64url carried game state, <= 16 KiB). Clients treat it as opaque.
+
+Procedure (client side):
+
+1. Receive `Handoff(target_zone, transfer_ticket)`; the socket closes.
+   The player is already removed from the source zone.
+2. Connect to `/zones/{target_zone}`; follow `Redirect` if any; send
+   Hello with `ticket = transfer_ticket`.
+3. Welcome → in the target zone (the zone received the carried state).
+4. If the target refuses (any `Error` before Welcome, or no Welcome
+   within ~10 s): connect to `/zones/{source_zone}` (the zone the client
+   just left) and send the **same** Hello; the source re-admits the player
+   with its carried state. If that also fails, fall back to the lobby for
+   a fresh admission ticket.
+
+Server guarantees: a transfer ticket is single use across hosts — the
+target reserves it with the issuing host before admitting, confirms on
+success and releases on refusal; the source accepts it back only while it
+is neither reserved nor used. In doubt (an unconfirmed reservation that
+lapsed) the ticket counts as used: a player is never in two zones.
+Tickets expire after 30 s by default.
+
+### 8.2 Content versions (barrier and safe rooms)
+
+A world runs one content version. A rollout freezes every zone
+(`Freeze{version: target}`), applies the new content, then resumes every
+zone (`Resume{version: target}`); if any zone fails to freeze in time
+all zones resume on the old version (`Resume{reason:
+content_update_aborted}`). Servers pin a version per policy:
+
+- **Strict** (default): Hello `content_version` MUST equal the server's
+  for joins and reconnects; otherwise `Error(VERSION_MISMATCH)`.
+- **SafeRoom** ("keep playing until a safe room"): after a *rolling*
+  rollout, clients on the old version keep playing in the zone they are
+  in (reconnects allowed). They may only be handed off into *gate* zones
+  (safe rooms) unless the server allows roaming; on entering a gate they
+  get Welcome and then `Kick(RELOAD)`. A fresh join with an old version
+  gets `Error(VERSION_MISMATCH)` (message ends with `reload`).
+- A *hard* rollout sends `Kick(RELOAD)` to every stale client right after
+  Resume.
+
+### 8.3 Reconnect
+
 Reconnect: after an abrupt disconnect the player stays in the zone for
 the reconnect grace window (default 15 s). A Hello with the last Welcome's
 `reconnect_token` rebinds the same player (same `session_id`, new token,
@@ -454,5 +532,13 @@ JSON conventions in `decoded`:
 ## 10. Versioning
 
 `protocol_version` changes on any incompatible wire change. Message type
-bytes `0x05..0x7f` and `0x89..0xff`, and field type tags `10..255`, are
+bytes `0x05..0x7f` and `0x8a..0xff`, and field type tags `10..255`, are
 reserved for future versions.
+
+Additive changes within version 1 (clients SHOULD ignore unknown kick and
+error codes and treat them as "session over" / "request failed"):
+
+- `0x89 Redirect` (server → client).
+- Kick code `7` RELOAD.
+- Transfer tickets (§8.1) and content-version policies (§8.2); `Handoff`
+  and `Freeze`/`Resume` encodings are unchanged.

@@ -5,7 +5,12 @@
 //! (sequence, client tick, payload, outcome), kicks, freeze/resume, dispose,
 //! and each `advance` together with the fact settlements delivered during it
 //! (tagged with the tick they were delivered on) and a state hash after every
-//! tick. Timers, RNG draws and tier changes are *not* logged: they are
+//! tick. World-structure entry points are recorded too: transfer joins,
+//! versioned reconnects, content-version switches, freeze requests/cancels,
+//! stale-client reloads, delivered child events and snapshot restores.
+//! Handoffs issued by the zone replay against a stub issuer that always
+//! signs (the ticket text is output, not state); a recording made with an
+//! issuer that *refused* a handoff will diverge. Timers, RNG draws and tier changes are *not* logged: they are
 //! derived from those inputs and the clock, so replay reproduces them.
 //!
 //! [`replay`] rebuilds a fresh host on a [`ManualClock`], feeds the log back
@@ -32,6 +37,7 @@ use std::time::Duration;
 
 use crate::clock::{Clock, ManualClock};
 use crate::facts::{FactError, FactOutcome, FactQueue, FactReceipt, FactSettlement};
+use crate::handoff::{HandoffRequest, Transfer};
 use crate::host::{AdvanceReport, HostConfig, JoinError, Joined, Outbound, ZoneHost};
 use crate::input::PushOutcome;
 use crate::interest::InterestConfig;
@@ -41,6 +47,7 @@ use crate::replication::WorldView;
 use crate::rewind::RewindConfig;
 use crate::rng::Fnv64;
 use crate::schema::FieldValue;
+use crate::world::{ChildEvent, StalePolicy};
 use crate::zone::{ClientId, PlayerId, TicketClaims, Zone};
 
 const MAGIC: &[u8; 4] = b"DGR1";
@@ -176,6 +183,74 @@ pub enum Event {
         /// `(tick, hash)` after each tick simulated.
         hashes: Vec<(u64, u64)>,
     },
+    /// [`ZoneHost::join_transfer`].
+    JoinTransfer {
+        /// Clock.
+        at: Duration,
+        /// Verified transfer.
+        transfer: Transfer,
+        /// Hello capabilities.
+        capabilities: u32,
+        /// Client content version.
+        content_version: String,
+        /// Outcome.
+        result: JoinResult,
+    },
+    /// [`ZoneHost::reconnect_with_version`].
+    ReconnectVersion {
+        /// Clock.
+        at: Duration,
+        /// Token index (see [`Event::Reconnect`]).
+        token: u32,
+        /// Hello capabilities.
+        capabilities: u32,
+        /// Client content version.
+        content_version: String,
+        /// Outcome.
+        result: JoinResult,
+    },
+    /// [`ZoneHost::set_content_version`].
+    SetContentVersion {
+        /// Clock.
+        at: Duration,
+        /// New version.
+        version: String,
+    },
+    /// [`ZoneHost::request_freeze`].
+    RequestFreeze {
+        /// Clock.
+        at: Duration,
+        /// Notice.
+        notice: Notice,
+    },
+    /// [`ZoneHost::cancel_freeze`].
+    CancelFreeze {
+        /// Clock.
+        at: Duration,
+        /// Notice.
+        notice: Notice,
+    },
+    /// [`ZoneHost::reload_stale_players`].
+    ReloadStale {
+        /// Clock.
+        at: Duration,
+    },
+    /// [`ZoneHost::deliver_child_event`].
+    ChildEvent {
+        /// Clock.
+        at: Duration,
+        /// Event.
+        event: ChildEvent,
+    },
+    /// [`ZoneHost::restore`].
+    Restore {
+        /// Clock.
+        at: Duration,
+        /// Snapshot bytes.
+        state: Vec<u8>,
+        /// Version it was saved under.
+        saved_version: String,
+    },
 }
 
 impl Event {
@@ -190,7 +265,15 @@ impl Event {
             | Self::Freeze { at, .. }
             | Self::Resume { at, .. }
             | Self::Dispose { at }
-            | Self::Advance { at, .. } => *at,
+            | Self::Advance { at, .. }
+            | Self::JoinTransfer { at, .. }
+            | Self::ReconnectVersion { at, .. }
+            | Self::SetContentVersion { at, .. }
+            | Self::RequestFreeze { at, .. }
+            | Self::CancelFreeze { at, .. }
+            | Self::ReloadStale { at }
+            | Self::ChildEvent { at, .. }
+            | Self::Restore { at, .. } => *at,
         }
     }
 }
@@ -233,6 +316,40 @@ impl fmt::Display for Event {
                     _ => "no ticks".into(),
                 };
                 write!(f, "@{ms:.1}ms advance {ticks}, {} settled", settled.len())
+            }
+            Self::JoinTransfer {
+                transfer, result, ..
+            } => write!(
+                f,
+                "@{ms:.1}ms join transfer {} from {} -> {result:?}",
+                transfer.claims.principal, transfer.source_zone
+            ),
+            Self::ReconnectVersion {
+                token,
+                content_version,
+                result,
+                ..
+            } => write!(
+                f,
+                "@{ms:.1}ms reconnect token#{token} version {content_version} -> {result:?}"
+            ),
+            Self::SetContentVersion { version, .. } => {
+                write!(f, "@{ms:.1}ms content version {version}")
+            }
+            Self::RequestFreeze { notice, .. } => {
+                write!(f, "@{ms:.1}ms request freeze {}", notice.reason)
+            }
+            Self::CancelFreeze { notice, .. } => {
+                write!(f, "@{ms:.1}ms cancel freeze {}", notice.reason)
+            }
+            Self::ReloadStale { .. } => write!(f, "@{ms:.1}ms reload stale players"),
+            Self::ChildEvent { event, .. } => write!(
+                f,
+                "@{ms:.1}ms child event {} from {}",
+                event.kind, event.origin_zone
+            ),
+            Self::Restore { state, .. } => {
+                write!(f, "@{ms:.1}ms restore {} bytes", state.len())
             }
         }
     }
@@ -429,6 +546,40 @@ fn put_config(w: &mut Writer, c: &HostConfig) {
     put_u64(w, c.world_seed);
     put_dur(w, c.rewind.max_rewind);
     put_u64(w, c.rewind.max_frames as u64);
+    w.u8(match c.stale_policy {
+        StalePolicy::Strict => 0,
+        StalePolicy::SafeRoom { roam: false } => 1,
+        StalePolicy::SafeRoom { roam: true } => 2,
+    });
+}
+
+fn put_claims(w: &mut Writer, claims: &TicketClaims) {
+    w.string(&claims.principal)
+        .string(&claims.zone)
+        .string(&claims.nonce);
+    put_u64(w, claims.expires_at);
+    w.u8(match claims.role {
+        Role::Player => 0,
+        Role::Observer => 1,
+    });
+}
+
+fn get_claims(r: &mut Reader<'_>) -> Result<TicketClaims, RecordingError> {
+    let principal = r.string()?;
+    let zone = r.string()?;
+    let nonce = r.string()?;
+    let expires_at = get_u64(r)?;
+    let role = match r.u8()? {
+        0 => Role::Player,
+        _ => Role::Observer,
+    };
+    Ok(TicketClaims {
+        principal,
+        zone,
+        expires_at,
+        nonce,
+        role,
+    })
 }
 
 fn get_config(r: &mut Reader<'_>) -> Result<HostConfig, RecordingError> {
@@ -456,6 +607,11 @@ fn get_config(r: &mut Reader<'_>) -> Result<HostConfig, RecordingError> {
         rewind: RewindConfig {
             max_rewind: get_dur(r)?,
             max_frames: get_u64(r)? as usize,
+        },
+        stale_policy: match r.u8()? {
+            0 => StalePolicy::Strict,
+            1 => StalePolicy::SafeRoom { roam: false },
+            _ => StalePolicy::SafeRoom { roam: true },
         },
     })
 }
@@ -571,6 +727,65 @@ impl Recording {
                         w.raw(&hash.to_le_bytes());
                     }
                 }
+                Event::JoinTransfer {
+                    transfer,
+                    capabilities,
+                    content_version,
+                    result,
+                    ..
+                } => {
+                    w.u8(9);
+                    put_claims(&mut w, &transfer.claims);
+                    w.string(&transfer.source_zone).string(&transfer.issuer);
+                    put_u64(&mut w, transfer.generation);
+                    w.bytes(&transfer.carried)
+                        .varuint(*capabilities)
+                        .string(content_version);
+                    put_join_result(&mut w, result);
+                }
+                Event::ReconnectVersion {
+                    token,
+                    capabilities,
+                    content_version,
+                    result,
+                    ..
+                } => {
+                    w.u8(10)
+                        .varuint(*token)
+                        .varuint(*capabilities)
+                        .string(content_version);
+                    put_join_result(&mut w, result);
+                }
+                Event::SetContentVersion { version, .. } => {
+                    w.u8(11).string(version);
+                }
+                Event::RequestFreeze { notice, .. } => {
+                    w.u8(12);
+                    put_notice(&mut w, notice);
+                }
+                Event::CancelFreeze { notice, .. } => {
+                    w.u8(13);
+                    put_notice(&mut w, notice);
+                }
+                Event::ReloadStale { .. } => {
+                    w.u8(14);
+                }
+                Event::ChildEvent { event, .. } => {
+                    w.u8(15)
+                        .string(&event.origin_zone)
+                        .string(&event.from_zone)
+                        .string(&event.kind)
+                        .bytes(&event.payload);
+                    put_u64(&mut w, event.origin_tick);
+                    w.string(&event.content_version).u8(event.levels);
+                }
+                Event::Restore {
+                    state,
+                    saved_version,
+                    ..
+                } => {
+                    w.u8(16).bytes(state).string(saved_version);
+                }
             }
         }
         w.into_bytes()
@@ -675,6 +890,63 @@ impl Recording {
                         hashes,
                     }
                 }
+                9 => {
+                    let claims = get_claims(&mut r)?;
+                    let source_zone = r.string()?;
+                    let issuer = r.string()?;
+                    let generation = get_u64(&mut r)?;
+                    let carried = r.bytes()?.to_vec();
+                    Event::JoinTransfer {
+                        at,
+                        transfer: Transfer {
+                            claims,
+                            source_zone,
+                            issuer,
+                            generation,
+                            carried,
+                        },
+                        capabilities: r.varuint()?,
+                        content_version: r.string()?,
+                        result: get_join_result(&mut r)?,
+                    }
+                }
+                10 => Event::ReconnectVersion {
+                    at,
+                    token: r.varuint()?,
+                    capabilities: r.varuint()?,
+                    content_version: r.string()?,
+                    result: get_join_result(&mut r)?,
+                },
+                11 => Event::SetContentVersion {
+                    at,
+                    version: r.string()?,
+                },
+                12 => Event::RequestFreeze {
+                    at,
+                    notice: get_notice(&mut r)?,
+                },
+                13 => Event::CancelFreeze {
+                    at,
+                    notice: get_notice(&mut r)?,
+                },
+                14 => Event::ReloadStale { at },
+                15 => Event::ChildEvent {
+                    at,
+                    event: ChildEvent {
+                        origin_zone: r.string()?,
+                        from_zone: r.string()?,
+                        kind: r.string()?,
+                        payload: r.bytes()?.to_vec(),
+                        origin_tick: get_u64(&mut r)?,
+                        content_version: r.string()?,
+                        levels: r.u8()?,
+                    },
+                },
+                16 => Event::Restore {
+                    at,
+                    state: r.bytes()?.to_vec(),
+                    saved_version: r.string()?,
+                },
                 _ => return Err(bad("event tag")),
             };
             events.push(event);
@@ -904,6 +1176,128 @@ impl<Z: Zone> Recorder<Z> {
     pub fn drain_outbound(&mut self) -> Vec<Outbound> {
         self.host.drain_outbound()
     }
+
+    /// [`ZoneHost::with_transfer_issuer`] (the issuer itself is not
+    /// recorded; replay uses a stub that always signs).
+    pub fn with_transfer_issuer(
+        mut self,
+        issuer: impl FnMut(&HandoffRequest) -> Option<String> + Send + 'static,
+    ) -> Self {
+        self.host = self.host.with_transfer_issuer(issuer);
+        self
+    }
+
+    fn token_index(&self, token: &str) -> u32 {
+        self.tokens
+            .lock()
+            .expect("tokens")
+            .iter()
+            .position(|t| t == token)
+            .map_or(u32::MAX, |i| i as u32)
+    }
+
+    /// [`ZoneHost::join_transfer`].
+    pub fn join_transfer(
+        &mut self,
+        transfer: &Transfer,
+        capabilities: u32,
+        content_version: &str,
+    ) -> Result<Joined, JoinError> {
+        let at = self.now();
+        let result = self
+            .host
+            .join_transfer(transfer, capabilities, content_version);
+        self.recording.events.push(Event::JoinTransfer {
+            at,
+            transfer: transfer.clone(),
+            capabilities,
+            content_version: content_version.into(),
+            result: (&result).into(),
+        });
+        result
+    }
+
+    /// [`ZoneHost::reconnect_with_version`].
+    pub fn reconnect_with_version(
+        &mut self,
+        token: &str,
+        capabilities: u32,
+        content_version: &str,
+    ) -> Result<Joined, JoinError> {
+        let at = self.now();
+        let index = self.token_index(token);
+        let result = self
+            .host
+            .reconnect_with_version(token, capabilities, content_version);
+        self.recording.events.push(Event::ReconnectVersion {
+            at,
+            token: index,
+            capabilities,
+            content_version: content_version.into(),
+            result: (&result).into(),
+        });
+        result
+    }
+
+    /// [`ZoneHost::set_content_version`].
+    pub fn set_content_version(&mut self, version: &str) {
+        let at = self.now();
+        self.host.set_content_version(version);
+        self.recording.events.push(Event::SetContentVersion {
+            at,
+            version: version.into(),
+        });
+    }
+
+    /// [`ZoneHost::request_freeze`].
+    pub fn request_freeze(&mut self, notice: Notice) -> crate::world::FreezeState {
+        let at = self.now();
+        let state = self.host.request_freeze(notice.clone());
+        self.recording
+            .events
+            .push(Event::RequestFreeze { at, notice });
+        state
+    }
+
+    /// [`ZoneHost::cancel_freeze`].
+    pub fn cancel_freeze(&mut self, notice: Notice) {
+        let at = self.now();
+        self.host.cancel_freeze(notice.clone());
+        self.recording
+            .events
+            .push(Event::CancelFreeze { at, notice });
+    }
+
+    /// [`ZoneHost::reload_stale_players`].
+    pub fn reload_stale_players(&mut self) -> usize {
+        let at = self.now();
+        let n = self.host.reload_stale_players();
+        self.recording.events.push(Event::ReloadStale { at });
+        n
+    }
+
+    /// [`ZoneHost::deliver_child_event`].
+    pub fn deliver_child_event(&mut self, event: ChildEvent) {
+        let at = self.now();
+        self.host.deliver_child_event(event.clone());
+        self.recording.events.push(Event::ChildEvent { at, event });
+    }
+
+    /// [`ZoneHost::restore`].
+    pub fn restore(&mut self, state: &[u8], saved_version: &str) {
+        let at = self.now();
+        self.host.restore(state, saved_version);
+        self.recording.events.push(Event::Restore {
+            at,
+            state: state.to_vec(),
+            saved_version: saved_version.into(),
+        });
+    }
+
+    /// [`ZoneHost::drain_upward`] (output only, not recorded).
+    pub fn drain_upward(&mut self) -> Vec<ChildEvent> {
+        self.host.drain_upward()
+    }
 }
 
 /// What diverged.
@@ -1031,7 +1425,8 @@ pub fn replay_with<Z: Zone>(
         let mut n = source.lock().expect("counter");
         *n += 1;
         format!("replay-token-{}", *n - 1)
-    });
+    })
+    .with_transfer_issuer(|_: &HandoffRequest| Some("replay-transfer".into()));
     host.set_tick_hashing(true);
     let mut script = None;
     if let Some(capacity) = recording.fact_capacity {
@@ -1131,6 +1526,72 @@ pub fn replay_with<Z: Zone>(
             Event::Kick {
                 player, message, ..
             } => host.kick(PlayerId(*player), message.clone()),
+            Event::JoinTransfer {
+                transfer,
+                capabilities,
+                content_version,
+                result,
+                ..
+            } => {
+                let actual =
+                    JoinResult::from(&host.join_transfer(transfer, *capabilities, content_version));
+                if &actual != result {
+                    return Err(diverge(
+                        index,
+                        host.tick(),
+                        DivergenceKind::Join {
+                            expected: result.clone(),
+                            actual,
+                        },
+                        last_good_tick,
+                        &suspects,
+                    ));
+                }
+            }
+            Event::ReconnectVersion {
+                token,
+                capabilities,
+                content_version,
+                result,
+                ..
+            } => {
+                let token = if *token == u32::MAX {
+                    String::new()
+                } else {
+                    format!("replay-token-{token}")
+                };
+                let actual = JoinResult::from(&host.reconnect_with_version(
+                    &token,
+                    *capabilities,
+                    content_version,
+                ));
+                if &actual != result {
+                    return Err(diverge(
+                        index,
+                        host.tick(),
+                        DivergenceKind::Join {
+                            expected: result.clone(),
+                            actual,
+                        },
+                        last_good_tick,
+                        &suspects,
+                    ));
+                }
+            }
+            Event::SetContentVersion { version, .. } => host.set_content_version(version.clone()),
+            Event::RequestFreeze { notice, .. } => {
+                host.request_freeze(notice.clone());
+            }
+            Event::CancelFreeze { notice, .. } => host.cancel_freeze(notice.clone()),
+            Event::ReloadStale { .. } => {
+                host.reload_stale_players();
+            }
+            Event::ChildEvent { event, .. } => host.deliver_child_event(event.clone()),
+            Event::Restore {
+                state,
+                saved_version,
+                ..
+            } => host.restore(state, saved_version),
             Event::Freeze { notice, .. } => host.freeze(notice.clone()),
             Event::Resume { notice, .. } => host.resume(notice.clone()),
             Event::Dispose { .. } => host.dispose(),

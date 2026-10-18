@@ -6,6 +6,12 @@
 //! `{"sub","zone","exp","nonce","role"?}` where `exp` is Unix seconds and
 //! `role` is `"player"` (default) or `"observer"`. Any HS256 JWT library can
 //! mint them. The principal is taken **only** from a verified `sub`.
+//!
+//! **Transfer tickets** (zone handoff) are the same format with
+//! `"kind":"transfer"` plus `src` (source zone), `iss` (issuing host id),
+//! `gen` (source ownership token) and `carry` (base64url carried state).
+//! [`TicketKey::verify`] rejects them ([`TicketError::WrongKind`]); use
+//! [`TicketKey::verify_ticket`] to accept either kind.
 
 use std::collections::HashMap;
 
@@ -15,6 +21,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
 
+use crate::handoff::Transfer;
 use crate::protocol::Role;
 use crate::zone::TicketClaims;
 
@@ -35,6 +42,17 @@ pub enum TicketError {
     Expired,
     /// Nonce already used.
     Replayed,
+    /// A transfer ticket where a join ticket was expected (or vice versa).
+    WrongKind,
+}
+
+/// A verified ticket of either kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedTicket {
+    /// Lobby-issued admission ticket.
+    Join(TicketClaims),
+    /// Server-issued handoff transfer ticket.
+    Transfer(Transfer),
 }
 
 /// Shared HMAC key.
@@ -71,7 +89,6 @@ impl TicketKey {
     /// Mint a ticket (dev tooling and tests; production issuers can use any
     /// HS256 JWT library).
     pub fn sign(&self, claims: &TicketClaims) -> String {
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
         let body = json!({
             "sub": claims.principal,
             "zone": claims.zone,
@@ -79,15 +96,91 @@ impl TicketKey {
             "nonce": claims.nonce,
             "role": match claims.role { Role::Player => "player", Role::Observer => "observer" },
         });
+        self.sign_body(&body)
+    }
+
+    /// Mint a transfer ticket for a handoff.
+    pub fn sign_transfer(&self, transfer: &Transfer) -> String {
+        let claims = &transfer.claims;
+        let body = json!({
+            "sub": claims.principal,
+            "zone": claims.zone,
+            "exp": claims.expires_at,
+            "nonce": claims.nonce,
+            "role": "player",
+            "kind": "transfer",
+            "src": transfer.source_zone,
+            "iss": transfer.issuer,
+            "gen": transfer.generation,
+            "carry": URL_SAFE_NO_PAD.encode(&transfer.carried),
+        });
+        self.sign_body(&body)
+    }
+
+    fn sign_body(&self, body: &Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
         let payload = URL_SAFE_NO_PAD.encode(body.to_string());
         let signing_input = format!("{header}.{payload}");
         let sig = URL_SAFE_NO_PAD.encode(self.hmac(signing_input.as_bytes()));
         format!("{signing_input}.{sig}")
     }
 
-    /// Verify signature and expiry (`now_unix` seconds). Nonce reuse is
-    /// checked separately with a [`NonceCache`].
+    /// Verify a join or transfer ticket (signature, expiry, claims).
+    pub fn verify_ticket(
+        &self,
+        ticket: &str,
+        now_unix: u64,
+    ) -> Result<VerifiedTicket, TicketError> {
+        let (claims, body) = self.verify_inner(ticket, now_unix)?;
+        match body.get("kind").and_then(Value::as_str) {
+            None | Some("join") => Ok(VerifiedTicket::Join(claims)),
+            Some("transfer") => {
+                let text = |name: &'static str| {
+                    body.get(name)
+                        .and_then(Value::as_str)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string)
+                        .ok_or(TicketError::MissingClaim(name))
+                };
+                let carried = URL_SAFE_NO_PAD
+                    .decode(
+                        body.get("carry")
+                            .and_then(Value::as_str)
+                            .ok_or(TicketError::MissingClaim("carry"))?,
+                    )
+                    .map_err(|_| TicketError::MissingClaim("carry"))?;
+                if claims.role != Role::Player {
+                    return Err(TicketError::MissingClaim("role"));
+                }
+                Ok(VerifiedTicket::Transfer(Transfer {
+                    source_zone: text("src")?,
+                    issuer: text("iss")?,
+                    generation: body
+                        .get("gen")
+                        .and_then(Value::as_u64)
+                        .ok_or(TicketError::MissingClaim("gen"))?,
+                    carried,
+                    claims,
+                }))
+            }
+            Some(_) => Err(TicketError::WrongKind),
+        }
+    }
+
+    /// Verify signature and expiry (`now_unix` seconds) of a **join**
+    /// ticket. Nonce reuse is checked separately with a [`NonceCache`].
     pub fn verify(&self, ticket: &str, now_unix: u64) -> Result<TicketClaims, TicketError> {
+        match self.verify_ticket(ticket, now_unix)? {
+            VerifiedTicket::Join(claims) => Ok(claims),
+            VerifiedTicket::Transfer(_) => Err(TicketError::WrongKind),
+        }
+    }
+
+    fn verify_inner(
+        &self,
+        ticket: &str,
+        now_unix: u64,
+    ) -> Result<(TicketClaims, Value), TicketError> {
         let mut parts = ticket.split('.');
         let (Some(h), Some(p), Some(s), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -128,13 +221,16 @@ impl TicketKey {
             Some("observer") => Role::Observer,
             Some(_) => return Err(TicketError::MissingClaim("role")),
         };
-        Ok(TicketClaims {
-            principal: text("sub")?,
-            zone: text("zone")?,
-            expires_at,
-            nonce: text("nonce")?,
-            role,
-        })
+        Ok((
+            TicketClaims {
+                principal: text("sub")?,
+                zone: text("zone")?,
+                expires_at,
+                nonce: text("nonce")?,
+                role,
+            },
+            claims,
+        ))
     }
 }
 
@@ -207,6 +303,29 @@ mod tests {
             URL_SAFE_NO_PAD.encode(r#"{"sub":"mallory","zone":"z1","exp":2000,"nonce":"n1"}"#);
         let forged = format!("{}.{}.{}", parts[0], forged, parts[2]);
         assert_eq!(key.verify(&forged, 1_000), Err(TicketError::BadSignature));
+    }
+
+    #[test]
+    fn transfer_tickets_round_trip_and_are_not_join_tickets() {
+        let key = TicketKey::new("secret");
+        let transfer = Transfer {
+            claims: claims(),
+            source_zone: "z0".into(),
+            issuer: "h1".into(),
+            generation: 9,
+            carried: vec![1, 2, 3],
+        };
+        let ticket = key.sign_transfer(&transfer);
+        assert_eq!(
+            key.verify_ticket(&ticket, 1_000).unwrap(),
+            VerifiedTicket::Transfer(transfer)
+        );
+        assert_eq!(key.verify(&ticket, 1_000), Err(TicketError::WrongKind));
+        let join = key.sign(&claims());
+        assert_eq!(
+            key.verify_ticket(&join, 1_000).unwrap(),
+            VerifiedTicket::Join(claims())
+        );
     }
 
     #[test]

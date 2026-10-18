@@ -17,6 +17,7 @@ use crate::replication::WorldView;
 use crate::rewind::RewindFrame;
 use crate::schema::EntitySchema;
 use crate::timers::TimerId;
+use crate::world::ChildEvent;
 
 /// Stable id of a player within a zone (survives reconnects).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -204,4 +205,54 @@ pub trait Zone: Sized + Send + 'static {
 
     /// The zone is being destroyed; timers are cleared afterwards.
     fn on_dispose(&mut self, _ctx: &mut Ctx<'_, Self>) {}
+
+    // ---- World structure (all optional) ----
+
+    /// Durable snapshot taken when the zone hibernates (Dormant long
+    /// enough); `None` = nothing worth keeping. Stored in a
+    /// [`ZoneStateStore`](crate::world::ZoneStateStore) and handed to
+    /// [`on_restore`](Self::on_restore) on the next activation.
+    fn hibernate(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Restore a snapshot written by [`hibernate`](Self::hibernate) (called
+    /// right after `on_create`). `saved_version` is the content version it
+    /// was written under.
+    fn on_restore(&mut self, _ctx: &mut Ctx<'_, Self>, _state: &[u8], _saved_version: &str) {}
+
+    /// A player arrived through a handoff from `from_zone` with `carried`
+    /// state (instead of `on_join`). Also called when the principal was
+    /// still present (reconnect grace), and for a handoff that failed and
+    /// returned to its source (`from_zone` is then the zone it never
+    /// reached). Defaults to `on_join`.
+    fn on_handoff_join(
+        &mut self,
+        ctx: &mut Ctx<'_, Self>,
+        player: PlayerId,
+        _from_zone: &str,
+        _carried: Vec<u8>,
+    ) {
+        self.on_join(ctx, player);
+    }
+
+    /// A tier-up event from a descendant zone (see
+    /// [`world::topology`](crate::world::topology)).
+    fn on_child_event(&mut self, _ctx: &mut Ctx<'_, Self>, _event: &ChildEvent) {}
+
+    /// True marks a safe-room gate: stale clients are told to reload here
+    /// (see [`StalePolicy`](crate::world::StalePolicy)).
+    fn is_gate(&self) -> bool {
+        false
+    }
+
+    /// Barrier readiness: while false a requested freeze waits (the zone
+    /// keeps ticking), e.g. to finish a boss phase. A world barrier aborts
+    /// if a zone is not ready within its timeout.
+    fn freeze_ready(&self) -> bool {
+        true
+    }
+
+    /// The content version changed (world barrier commit).
+    fn on_content_version_changed(&mut self, _ctx: &mut Ctx<'_, Self>, _from: &str, _to: &str) {}
 }

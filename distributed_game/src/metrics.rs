@@ -56,7 +56,7 @@ const BYTE_BUCKETS: [f64; 10] = [
 ];
 
 /// Input outcome label values (fixed set).
-pub const INPUT_OUTCOMES: [&str; 7] = [
+pub const INPUT_OUTCOMES: [&str; 8] = [
     "accepted",
     "dropped_oldest",
     "duplicate",
@@ -64,6 +64,7 @@ pub const INPUT_OUTCOMES: [&str; 7] = [
     "rejected",
     "unknown_client",
     "rate_limited",
+    "frozen",
 ];
 
 fn input_label(outcome: PushOutcome) -> &'static str {
@@ -261,6 +262,11 @@ impl GameMetrics {
     /// Record an input dropped by the transport's rate limiter.
     pub fn record_rate_limited(&self, zone: &str) {
         self.record_input_label(zone, "rate_limited");
+    }
+
+    /// Record an input dropped because the zone was frozen (world barrier).
+    pub fn record_frozen_input(&self, zone: &str) {
+        self.record_input_label(zone, "frozen");
     }
 
     fn record_input_label(&self, zone: &str, label: &'static str) {

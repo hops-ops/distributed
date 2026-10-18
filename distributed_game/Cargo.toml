@@ -21,7 +21,11 @@ metrics = []
 # Load-test bots (library + `game-bots` binary).
 bots = ["net", "dep:tokio-tungstenite", "dep:futures-util", "tokio/rt-multi-thread"]
 # axum WebSocket zone server with signed-ticket admission (+ /metrics).
-net = ["runtime", "metrics", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros"]
+net = ["runtime", "metrics", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros", "tokio/io-util"]
+# `world::FencedLeaseOwnership`: zone ownership over `distributed::lease`.
+lease = ["dep:distributed"]
+# `world::SqliteZoneStateStore`: native SQLite hibernation snapshots.
+sqlite = ["dep:rusqlite"]
 
 [dependencies]
 serde_json = "1"
@@ -33,6 +37,7 @@ sha2 = { version = "0.10", optional = true }
 base64 = { version = "0.23", optional = true }
 tokio-tungstenite = { version = "0.30", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -64,3 +69,8 @@ required-features = ["net"]
 name = "cell_sink"
 path = "tests/cell_sink/main.rs"
 required-features = ["cell", "runtime"]
+
+[[test]]
+name = "world"
+path = "tests/world/main.rs"
+required-features = ["net", "lease", "sqlite"]
