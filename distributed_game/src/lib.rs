@@ -25,6 +25,8 @@
 
 #![warn(missing_docs)]
 
+#[cfg(feature = "bots")]
+pub mod bots;
 #[cfg(feature = "cell")]
 pub mod cell;
 pub mod clock;

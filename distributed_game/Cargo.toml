@@ -18,6 +18,8 @@ runtime = ["dep:tokio"]
 cell = ["dep:distributed", "dep:sha2"]
 # Per-zone Prometheus metrics (dependency-free text exposition).
 metrics = []
+# Load-test bots (library + `game-bots` binary).
+bots = ["net", "dep:tokio-tungstenite", "dep:futures-util", "tokio/rt-multi-thread"]
 # axum WebSocket zone server with signed-ticket admission (+ /metrics).
 net = ["runtime", "metrics", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros"]
 
@@ -29,6 +31,8 @@ axum = { version = "0.8", default-features = false, features = ["ws", "tokio", "
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
 base64 = { version = "0.23", optional = true }
+tokio-tungstenite = { version = "0.30", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -36,10 +40,20 @@ tokio-tungstenite = "0.30"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 serde = { version = "1", features = ["derive"] }
 
+[[bin]]
+name = "game-bots"
+path = "src/bin/game-bots.rs"
+required-features = ["bots"]
+
 [[test]]
 name = "netcode"
 path = "tests/netcode/main.rs"
 required-features = ["runtime"]
+
+[[test]]
+name = "bots"
+path = "tests/bots/main.rs"
+required-features = ["bots"]
 
 [[test]]
 name = "net_e2e"
