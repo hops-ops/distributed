@@ -603,6 +603,7 @@ mod tests {
             expires_at: u64::MAX,
             nonce: "n".into(),
             role: Role::Player,
+            name: None,
         };
         let joined = h.join(&claims, 0, "").unwrap();
         metrics.record_input("z1", h.push_input(joined.client, 1, 0, &[1]));

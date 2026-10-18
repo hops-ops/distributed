@@ -19,6 +19,7 @@ fn claims(principal: &str, zone: &str) -> TicketClaims {
         expires_at: u64::MAX,
         nonce: format!("n-{principal}"),
         role: Role::Player,
+        name: None,
     }
 }
 

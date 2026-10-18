@@ -54,6 +54,9 @@ impl From<ObserverId> for Viewer {
 
 /// Claims from a **verified** admission ticket. The principal is the only
 /// identity the runtime trusts; nothing in client payloads can change it.
+///
+/// Built by a `net::TicketVerifier` (the default HS256 `net::TicketKey`, or a
+/// game's own verifier for tickets minted by its web backend).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketClaims {
     /// Verified principal (`sub`).
@@ -62,10 +65,46 @@ pub struct TicketClaims {
     pub zone: String,
     /// Expiry, Unix seconds.
     pub expires_at: u64,
-    /// Single-use nonce.
+    /// Single-use replay key (`nonce`, or a JWT `jti`): the server refuses
+    /// a second admission with the same key until `expires_at`.
     pub nonce: String,
     /// Player or observer.
     pub role: Role,
+    /// Optional display name vouched for by the ticket issuer (never
+    /// identity: use `principal` for that). Exposed as
+    /// [`PlayerInfo::name`] / [`ObserverInfo::name`].
+    pub name: Option<String>,
+}
+
+impl TicketClaims {
+    /// Claims without a display name.
+    pub fn new(
+        principal: impl Into<String>,
+        zone: impl Into<String>,
+        expires_at: u64,
+        nonce: impl Into<String>,
+        role: Role,
+    ) -> Self {
+        Self {
+            principal: principal.into(),
+            zone: zone.into(),
+            expires_at,
+            nonce: nonce.into(),
+            role,
+            name: None,
+        }
+    }
+
+    /// Attach a display name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Key the server's replay cache records (the nonce / `jti`).
+    pub fn replay_key(&self) -> &str {
+        &self.nonce
+    }
 }
 
 /// Admission request seen by [`Zone::on_auth`].
@@ -110,10 +149,25 @@ pub struct PlayerInfo {
     pub id: PlayerId,
     /// Verified principal from the ticket.
     pub principal: String,
+    /// Display name from the ticket ([`TicketClaims::name`]), if any.
+    pub name: Option<String>,
     /// Hello capabilities.
     pub capabilities: u32,
     /// False while inside the reconnect grace window.
     pub connected: bool,
+}
+
+/// Observer as seen by the zone ([`Ctx::observer`](crate::Ctx::observer)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserverInfo {
+    /// Observer id (address events with [`Ctx::send_event`](crate::Ctx::send_event)).
+    pub id: ObserverId,
+    /// Verified principal from the observer ticket.
+    pub principal: String,
+    /// Display name from the ticket, if any.
+    pub name: Option<String>,
+    /// Hello capabilities.
+    pub capabilities: u32,
 }
 
 /// Activity tier of a zone.
@@ -153,10 +207,13 @@ pub trait Zone: Sized + Send + 'static {
     /// A player left for `reason` (not called on a disconnect still inside the grace window).
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId, _reason: LeaveReason) {}
 
-    /// An observer subscribed.
+    /// An observer subscribed. Its principal and name are available from
+    /// [`Ctx::observer`](crate::Ctx::observer); address it with
+    /// [`Ctx::send_event`](crate::Ctx::send_event)`(observer, ..)`.
     fn on_observe(&mut self, _ctx: &mut Ctx<'_, Self>, _observer: ObserverId) {}
 
-    /// An observer left.
+    /// An observer left. [`Ctx::observer`](crate::Ctx::observer) still
+    /// returns it during this hook (it can no longer receive events).
     fn on_unobserve(&mut self, _ctx: &mut Ctx<'_, Self>, _observer: ObserverId) {}
 
     /// Decode raw input bytes from the wire; `None` drops the input.

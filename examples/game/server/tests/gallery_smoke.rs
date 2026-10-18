@@ -39,6 +39,7 @@ impl Rig {
                     expires_at: u64::MAX,
                     nonce: "n1".into(),
                     role: Role::Player,
+                    name: None,
                 },
                 0,
                 "",

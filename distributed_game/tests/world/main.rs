@@ -35,6 +35,7 @@ fn ticket(principal: &str, zone: &str, nonce: &str) -> String {
         expires_at: 4_000_000_000,
         nonce: nonce.into(),
         role: Role::Player,
+        name: None,
     })
 }
 
@@ -324,6 +325,7 @@ async fn cross_host_handoff_follows_redirect_and_ticket_is_single_use() {
         expires_at: 4_000_000_000,
         nonce: "x".into(),
         role: Role::Player,
+        name: None,
     });
     assert!(join_url(&b.addr.zone_url("realm.west"), &forged, "")
         .await

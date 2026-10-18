@@ -453,7 +453,17 @@ unpadded base64url). Any HS256 JWT library can mint one.
   - `role` (string, optional) — `"player"` (default) or `"observer"`.
     Observers receive Deltas and Events but own no player and cannot send
     inputs.
+  - `name` (string, optional) — display name vouched for by the issuer
+    (never identity). Carried into transfer tickets.
 - Failures produce `Error(UNAUTHORIZED)` and close.
+
+**Custom ticket formats.** A server MAY admit join tickets in another
+format through a pluggable verifier (`ServerConfig::ticket_verifier`, e.g.
+a web backend's own JWTs with `iss`/`aud`/`jti` and no `zone`/`nonce`).
+The verifier maps the token to the same claims (principal, zone = route
+zone, expiry, replay key, role, name); the server still rejects a zone
+other than the route's, `exp <= now` and a reused replay key. Transfer
+tickets (§8.1) always use the format above.
 
 ### 8.1 Transfer tickets and handoff
 

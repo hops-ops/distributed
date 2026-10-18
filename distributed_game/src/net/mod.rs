@@ -60,7 +60,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-pub use ticket::{NonceCache, TicketError, TicketKey, VerifiedTicket};
+pub use ticket::{
+    decode_hs256, NonceCache, SharedTicketVerifier, TicketError, TicketKey, TicketVerifier,
+    VerifiedTicket,
+};
 pub use transfer::{TransferOp, TransferRegistry};
 pub use world::{BarrierParticipant, RemoteHost, RolloutError, RolloutReport, WorldCoordinator};
 
@@ -160,8 +163,13 @@ impl NetSim {
 pub struct ServerConfig {
     /// Settings for every hosted zone.
     pub host: HostConfig,
-    /// HMAC key for admission tickets.
+    /// HMAC key for transfer tickets and server tokens, and (unless
+    /// `ticket_verifier` is set) for admission tickets.
     pub ticket_key: TicketKey,
+    /// Custom verifier for **join** tickets (e.g. the game's web-BFF JWTs);
+    /// `None` = HS256 tickets signed with `ticket_key`. Expiry, route zone
+    /// and single use are enforced by the server either way.
+    pub ticket_verifier: Option<SharedTicketVerifier>,
     /// Deadline for the first (Hello) frame.
     pub hello_timeout: Duration,
     /// Sustained inputs per second per connection.
@@ -198,11 +206,18 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    /// Admit join tickets with `verifier` instead of `ticket_key`.
+    pub fn with_ticket_verifier(mut self, verifier: impl TicketVerifier) -> Self {
+        self.ticket_verifier = Some(SharedTicketVerifier::new(verifier));
+        self
+    }
+
     /// Defaults with the given ticket key.
     pub fn new(ticket_key: TicketKey) -> Self {
         Self {
             host: HostConfig::default(),
             ticket_key,
+            ticket_verifier: None,
             hello_timeout: Duration::from_secs(5),
             input_rate: 120.0,
             input_burst: 240.0,
@@ -224,6 +239,7 @@ impl ServerConfig {
 
 type Inspector = Box<dyn FnOnce(&dyn Any) + Send>;
 
+#[allow(clippy::large_enum_variant)] // Join is rare; boxing buys nothing.
 enum ZoneCmd {
     Join {
         claims: TicketClaims,
@@ -995,6 +1011,7 @@ async fn run_zone<Z>(
                 expires_at,
                 nonce,
                 role: Role::Player,
+                name: request.name.clone(),
             },
             source_zone: request.source_zone.clone(),
             issuer: inner.host_id.clone(),
@@ -1491,7 +1508,7 @@ where
     let mut returning = false;
     let cmd = if hello.reconnect_token.is_empty() {
         let now = unix_now();
-        let verified = match cfg.ticket_key.verify_ticket(&hello.ticket, now) {
+        let verified = match verify_hello_ticket(cfg, &hello.ticket, &zone_id, now) {
             Ok(verified) => verified,
             Err(e) => return reject(socket, error::UNAUTHORIZED, format!("{e:?}")).await,
         };
@@ -1704,6 +1721,36 @@ where
         let _ = zone.send(ZoneCmd::Disconnect { client, graceful }).await;
     }
     let _ = socket.send(Message::Close(None)).await;
+}
+
+/// Transfer tickets always use the server key; join tickets go through the
+/// configured [`TicketVerifier`] and are then checked for zone, expiry and a
+/// non-empty replay key.
+fn verify_hello_ticket(
+    cfg: &ServerConfig,
+    ticket: &str,
+    zone_id: &str,
+    now: u64,
+) -> Result<VerifiedTicket, TicketError> {
+    let verified = match &cfg.ticket_verifier {
+        None => cfg.ticket_key.verify_ticket(ticket, now)?,
+        Some(custom) => match cfg.ticket_key.verify_ticket(ticket, now) {
+            Ok(VerifiedTicket::Transfer(transfer)) => VerifiedTicket::Transfer(transfer),
+            _ => VerifiedTicket::Join(custom.0.verify(ticket, zone_id, now)?),
+        },
+    };
+    if let VerifiedTicket::Join(claims) = &verified {
+        if claims.principal.is_empty() {
+            return Err(TicketError::MissingClaim("sub"));
+        }
+        if claims.replay_key().is_empty() {
+            return Err(TicketError::MissingClaim("nonce"));
+        }
+        if claims.expires_at <= now {
+            return Err(TicketError::Expired);
+        }
+    }
+    Ok(verified)
 }
 
 /// Ok(false) when the connection should end.

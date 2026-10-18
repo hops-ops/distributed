@@ -361,6 +361,7 @@ async fn drive(
         expires_at: unix + 3600,
         nonce: format!("{principal}-{}-{}", config.seed, unix),
         role: Role::Player,
+        name: None,
     });
     let url = format!("{}/zones/{}", config.url.trim_end_matches('/'), config.zone);
     let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())

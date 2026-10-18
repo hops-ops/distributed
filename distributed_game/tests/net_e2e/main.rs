@@ -29,6 +29,7 @@ fn ticket(principal: &str, zone: &str, nonce: &str, role: Role) -> String {
         expires_at: 4_000_000_000,
         nonce: nonce.into(),
         role,
+        name: None,
     })
 }
 
@@ -219,6 +220,7 @@ async fn client_joins_sends_inputs_receives_deltas_and_reconnects() {
         expires_at: 4_000_000_000,
         nonce: "n4".into(),
         role: Role::Player,
+        name: None,
     });
     expect_error(&url, "z1", forged, error::UNAUTHORIZED).await;
 
@@ -360,4 +362,160 @@ async fn hello_join(ws: &mut Ws, zone: &str) {
         String::new(),
     )
     .await;
+}
+
+// ---- Custom ticket verifier: a web BFF's own HS256 JWTs ----
+
+const BFF_SECRET: &[u8] = b"bff-secret";
+
+/// The downstream game's web-BFF ticket: HS256, `iss`
+/// `dungeon-crawler-web`, `aud` `dungeon-crawler-zone`, `sub`
+/// `human_<hex>`, `principal`, `name`, `jti`, `exp` at most 120 s out,
+/// optional `zoneRoute`; no `zone` / `nonce` claims.
+fn bff_verifier(
+    token: &str,
+    zone: &str,
+    now: u64,
+) -> Result<TicketClaims, distributed_game::net::TicketError> {
+    use distributed_game::net::{decode_hs256, TicketError};
+    let claims = decode_hs256(token, BFF_SECRET)?;
+    let text = |name: &'static str| {
+        claims
+            .get(name)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .ok_or(TicketError::MissingClaim(name))
+    };
+    if text("iss")? != "dungeon-crawler-web" || text("aud")? != "dungeon-crawler-zone" {
+        return Err(TicketError::Invalid("issuer/audience".into()));
+    }
+    let sub = text("sub")?;
+    let hex = sub
+        .strip_prefix("human_")
+        .filter(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or(TicketError::Invalid("sub".into()))?;
+    if text("principal")? != sub {
+        return Err(TicketError::Invalid("principal".into()));
+    }
+    let exp = claims
+        .get("exp")
+        .and_then(|v| v.as_u64())
+        .ok_or(TicketError::MissingClaim("exp"))?;
+    if exp > now + 120 {
+        return Err(TicketError::Invalid("lifetime over 120s".into()));
+    }
+    if let Some(route) = claims.get("zoneRoute").and_then(|v| v.as_str()) {
+        if route != zone {
+            return Err(TicketError::WrongZone);
+        }
+    }
+    let mut verified = TicketClaims::new(
+        format!("human_{hex}"),
+        zone,
+        exp,
+        text("jti")?,
+        Role::Player,
+    );
+    verified.name = claims
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok(verified)
+}
+
+fn bff_ticket(jti: &str, exp_in: u64, zone_route: Option<&str>) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut claims = serde_json::json!({
+        "iss": "dungeon-crawler-web", "aud": "dungeon-crawler-zone",
+        "sub": "human_0a1b2c", "principal": "human_0a1b2c", "name": "Ana",
+        "jti": jti, "exp": now + exp_in,
+    });
+    if let Some(route) = zone_route {
+        claims["zoneRoute"] = route.into();
+    }
+    TicketKey::new(BFF_SECRET).sign_json(&claims)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn custom_verifier_admits_web_bff_tickets_with_replay_protection() {
+    let config = ServerConfig::new(TicketKey::new(SECRET)).with_ticket_verifier(bff_verifier);
+    let server = GameServer::<Arena>::new(config, |zone_id| {
+        zone_id.starts_with('z').then(ArenaConfig::default)
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let serving = server.clone();
+    let handle = tokio::spawn(async move {
+        serving
+            .serve(listener, std::future::pending())
+            .await
+            .unwrap();
+    });
+
+    let mut ws = connect(&url, "z1").await;
+    hello(&mut ws, bff_ticket("jti-1", 60, Some("z1")), String::new()).await;
+    let mut mirror = ClientMirror::new();
+    let Some(ServerMessage::Welcome(welcome)) = next(&mut ws, &mut mirror).await else {
+        panic!("expected Welcome")
+    };
+    assert_eq!(welcome.zone_id, "z1");
+    let players = server
+        .inspect("z1", |host| {
+            host.players()
+                .map(|p| (p.principal.clone(), p.name.clone()))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        players,
+        vec![("human_0a1b2c".to_string(), Some("Ana".to_string()))]
+    );
+
+    // Replay of the same jti, wrong route, overlong lifetime, built-in
+    // tickets (the custom verifier replaces them) and a forged signature.
+    expect_error(
+        &url,
+        "z1",
+        bff_ticket("jti-1", 60, Some("z1")),
+        error::UNAUTHORIZED,
+    )
+    .await;
+    expect_error(
+        &url,
+        "z2",
+        bff_ticket("jti-2", 60, Some("z1")),
+        error::UNAUTHORIZED,
+    )
+    .await;
+    expect_error(
+        &url,
+        "z1",
+        bff_ticket("jti-3", 600, None),
+        error::UNAUTHORIZED,
+    )
+    .await;
+    expect_error(
+        &url,
+        "z1",
+        ticket("bob", "z1", "n-bob", Role::Player),
+        error::UNAUTHORIZED,
+    )
+    .await;
+    let forged = TicketKey::new("nope").sign_json(&serde_json::json!({"sub": "human_ff"}));
+    expect_error(&url, "z1", forged, error::UNAUTHORIZED).await;
+    // No zoneRoute: admitted to the zone the client asked for.
+    let mut ws2 = connect(&url, "z2").await;
+    hello(&mut ws2, bff_ticket("jti-4", 60, None), String::new()).await;
+    let mut mirror2 = ClientMirror::new();
+    assert!(matches!(
+        next(&mut ws2, &mut mirror2).await,
+        Some(ServerMessage::Welcome(_))
+    ));
+
+    server.shutdown();
+    handle.await.unwrap();
 }

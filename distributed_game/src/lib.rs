@@ -74,8 +74,8 @@ pub use timers::TimerId;
 pub use timestep::FixedTimestep;
 pub use world::{BarrierMode, ChildEvent, FreezeState, StalePolicy};
 pub use zone::{
-    Admission, ClientId, JoinRequest, LeaveReason, ObserverId, PlayerId, PlayerInfo, TicketClaims,
-    Tier, Viewer, Zone,
+    Admission, ClientId, JoinRequest, LeaveReason, ObserverId, ObserverInfo, PlayerId, PlayerInfo,
+    TicketClaims, Tier, Viewer, Zone,
 };
 
 #[doc = include_str!("../README.md")]

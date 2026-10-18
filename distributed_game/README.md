@@ -68,10 +68,7 @@ impl Zone for Room {
 
 let clock = ManualClock::new();
 let mut host = ZoneHost::<Room>::new("room-1", HostConfig::default(), Arc::new(clock.clone()), ());
-let claims = TicketClaims {
-    principal: "alice".into(), zone: "room-1".into(),
-    expires_at: u64::MAX, nonce: "n".into(), role: Role::Player,
-};
+let claims = TicketClaims::new("alice", "room-1", u64::MAX, "n", Role::Player);
 let joined = host.join(&claims, 0, "").unwrap();
 host.push_input(joined.client, 1, 0, &[1]);
 clock.advance(Duration::from_millis(100));
@@ -107,6 +104,21 @@ double-crediting.
 
 ## Netcode and operations
 
+- **Admission tickets** (`net`): by default join tickets are HS256 JWTs
+  signed with `ServerConfig::ticket_key` (PROTOCOL.md §8). To admit tickets
+  your web backend already mints, plug in a verifier —
+  `ServerConfig::new(key).with_ticket_verifier(|token: &str, zone: &str, now: u64| { … })`
+  (or implement `net::TicketVerifier`) — that checks your issuer, audience
+  and lifetime (`net::decode_hs256` verifies an HS256 signature and
+  returns the claims) and returns `TicketClaims` with `zone` = the route
+  zone and `nonce` = your replay key (e.g. `jti`). The server still
+  enforces route zone, expiry and single use; `TicketClaims::name` becomes
+  `PlayerInfo::name` / `ObserverInfo::name` and travels with handoffs.
+  Transfer tickets always use `ticket_key`.
+- **Observers**: `Ctx::observer(id)` / `observers()` / `observers_of(principal)`
+  expose each observer's verified principal and name (also during
+  `on_unobserve`); `ctx.send_event(observer_id, …)` addresses one observer.
+
 - **Lag compensation** (`rewind`): implement `Zone::record_rewind` to push
   hit volumes (sphere / vertical capsule + numeric fields) each tick; the
   host keeps a ring buffer sized by `HostConfig::rewind.max_rewind`
@@ -116,7 +128,7 @@ double-crediting.
   stored history. The interpolation delay travels in the game's input
   payload (no wire change).
 - **Record/replay** (`replay`): drive a host through `Recorder` (same
-  methods as `ZoneHost`), save the compact `Recording` (`DGR1`), and
+  methods as `ZoneHost`), save the compact `Recording` (`DGR2`), and
   `replay::<Z>(&recording, config)` re-runs it on a `ManualClock`,
   checking a per-tick state hash (`Zone::state_hash`, or the replicated
   `WorldView`). A mismatch returns a `Divergence` naming the tick and the

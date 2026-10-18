@@ -148,11 +148,24 @@ impl Zone for Arena {
 
     fn on_observe(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {
         ctx.set_view(observer, View::new(50.0, 50.0, 1000.0));
-        self.log.push("observe".into());
+        let info = ctx
+            .observer(observer)
+            .expect("observer known in on_observe");
+        let line = format!(
+            "observe:{}:{}",
+            info.principal,
+            info.name.as_deref().unwrap_or("-")
+        );
+        let mine: Vec<_> = ctx.observers_of(&info.principal.clone()).collect();
+        assert_eq!(mine, vec![observer]);
+        ctx.send_event(observer, 7, line.clone().into_bytes());
+        self.log.push(line);
     }
 
-    fn on_unobserve(&mut self, _ctx: &mut Ctx<'_, Self>, _observer: ObserverId) {
-        self.log.push("unobserve".into());
+    fn on_unobserve(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {
+        let principal = ctx.observer(observer).map(|o| o.principal.clone());
+        self.log
+            .push(format!("unobserve:{}", principal.as_deref().unwrap_or("?")));
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<(i8, i8)> {

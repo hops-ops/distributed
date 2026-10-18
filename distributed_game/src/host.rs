@@ -45,8 +45,8 @@ use crate::timers::{TimerId, Timers};
 use crate::timestep::{rate_to_step, FixedTimestep};
 use crate::world::{ChildEvent, FreezeState, StalePolicy};
 use crate::zone::{
-    Admission, ClientId, JoinRequest, LeaveReason, ObserverId, PlayerId, PlayerInfo, TicketClaims,
-    Tier, Viewer, Zone,
+    Admission, ClientId, JoinRequest, LeaveReason, ObserverId, ObserverInfo, PlayerId, PlayerInfo,
+    TicketClaims, Tier, Viewer, Zone,
 };
 
 /// Host tuning.
@@ -207,6 +207,7 @@ struct PlayerSlot<I> {
 }
 
 struct ObserverSlot {
+    info: ObserverInfo,
     client: ClientId,
     view: View,
 }
@@ -229,6 +230,8 @@ pub(crate) struct Core<Z: Zone> {
     tier: Tier,
     players: BTreeMap<PlayerId, PlayerSlot<Z::Input>>,
     observers: BTreeMap<ObserverId, ObserverSlot>,
+    /// Observer being removed while `on_unobserve` runs.
+    departing: Option<ObserverInfo>,
     clients: BTreeMap<ClientId, ClientSlot>,
     next_id: u32,
     outbound: Vec<Outbound>,
@@ -349,6 +352,29 @@ impl<Z: Zone> Ctx<'_, Z> {
     /// One player.
     pub fn player(&self, id: PlayerId) -> Option<&PlayerInfo> {
         self.core.players.get(&id).map(|slot| &slot.info)
+    }
+
+    /// Observers currently subscribed.
+    pub fn observers(&self) -> impl Iterator<Item = &ObserverInfo> + '_ {
+        self.core.observers.values().map(|slot| &slot.info)
+    }
+
+    /// One observer (verified principal, display name). Also answers for
+    /// the observer leaving during [`Zone::on_unobserve`].
+    pub fn observer(&self, id: ObserverId) -> Option<&ObserverInfo> {
+        self.core.observers.get(&id).map(|slot| &slot.info).or(self
+            .core
+            .departing
+            .as_ref()
+            .filter(|info| info.id == id))
+    }
+
+    /// Observers whose verified principal is `principal` (a principal may
+    /// observe through several connections).
+    pub fn observers_of<'p>(&'p self, principal: &'p str) -> impl Iterator<Item = ObserverId> + 'p {
+        self.observers()
+            .filter(move |info| info.principal == principal)
+            .map(|info| info.id)
     }
 
     /// Consume buffered inputs of `player`; advances its ack.
@@ -473,11 +499,11 @@ impl<Z: Zone> Ctx<'_, Z> {
         if carried.len() > MAX_CARRIED_BYTES {
             return Err(HandoffError::TooLarge);
         }
-        let principal = self
+        let (principal, name) = self
             .core
             .players
             .get(&player)
-            .map(|slot| slot.info.principal.clone())
+            .map(|slot| (slot.info.principal.clone(), slot.info.name.clone()))
             .ok_or(HandoffError::UnknownPlayer)?;
         if self
             .core
@@ -489,6 +515,7 @@ impl<Z: Zone> Ctx<'_, Z> {
         }
         let request = HandoffRequest {
             principal,
+            name,
             source_zone: self.core.zone_id.clone(),
             target_zone: target_zone.to_string(),
             carried,
@@ -573,6 +600,7 @@ impl<Z: Zone> ZoneHost<Z> {
             tier: Tier::Hot,
             players: BTreeMap::new(),
             observers: BTreeMap::new(),
+            departing: None,
             clients: BTreeMap::new(),
             next_id: 0,
             outbound: Vec::new(),
@@ -684,6 +712,16 @@ impl<Z: Zone> ZoneHost<Z> {
     /// Players (including those in the grace window).
     pub fn player_count(&self) -> usize {
         self.core.players.len()
+    }
+
+    /// Players (including those in the grace window).
+    pub fn players(&self) -> impl Iterator<Item = &PlayerInfo> + '_ {
+        self.core.players.values().map(|slot| &slot.info)
+    }
+
+    /// Observers.
+    pub fn observers(&self) -> impl Iterator<Item = &ObserverInfo> + '_ {
+        self.core.observers.values().map(|slot| &slot.info)
     }
 
     /// Live connections.
@@ -850,6 +888,11 @@ impl<Z: Zone> ZoneHost<Z> {
         let mut handoff = handoff;
         let joined = match (claims.role, existing) {
             (Role::Player, Some(player)) => {
+                if let Some(slot) = self.core.players.get_mut(&player) {
+                    if claims.name.is_some() {
+                        slot.info.name = claims.name.clone();
+                    }
+                }
                 self.bind_player(player, client, capabilities);
                 if let Some((from, carried)) = handoff.take() {
                     hook!(self.on_handoff_join(player, from, carried));
@@ -869,6 +912,7 @@ impl<Z: Zone> ZoneHost<Z> {
                         info: PlayerInfo {
                             id: player,
                             principal: claims.principal.clone(),
+                            name: claims.name.clone(),
                             capabilities,
                             connected: true,
                         },
@@ -897,6 +941,12 @@ impl<Z: Zone> ZoneHost<Z> {
                 self.core.observers.insert(
                     observer,
                     ObserverSlot {
+                        info: ObserverInfo {
+                            id: observer,
+                            principal: claims.principal.clone(),
+                            name: claims.name.clone(),
+                            capabilities,
+                        },
                         client,
                         view: View::new(0.0, 0.0, self.core.config.default_view_radius),
                     },
@@ -1138,10 +1188,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     p.grace_until = Some(self.core.clock.now() + self.core.config.reconnect_grace);
                 }
             }
-            Viewer::Observer(observer) => {
-                self.core.observers.remove(&observer);
-                hook!(self.on_unobserve(observer));
-            }
+            Viewer::Observer(observer) => self.remove_observer(observer, None),
         }
         self.process_kicks();
     }
@@ -1280,14 +1327,7 @@ impl<Z: Zone> ZoneHost<Z> {
         }
         let observers: Vec<_> = self.core.observers.keys().copied().collect();
         for observer in observers {
-            if let Some(slot) = self.core.observers.remove(&observer) {
-                self.core.clients.remove(&slot.client);
-                self.core.server_message(slot.client, &bye);
-                self.core.outbound.push(Outbound::Close {
-                    client: slot.client,
-                });
-            }
-            hook!(self.on_unobserve(observer));
+            self.remove_observer(observer, Some(&bye));
         }
         hook!(self.on_dispose());
         self.core.pending_kicks.clear();
@@ -1319,6 +1359,22 @@ impl<Z: Zone> ZoneHost<Z> {
             self.core.outbound.push(Outbound::Close { client });
         }
         hook!(self.on_leave(player, reason));
+    }
+
+    fn remove_observer(&mut self, observer: ObserverId, last: Option<&ServerMessage>) {
+        let Some(slot) = self.core.observers.remove(&observer) else {
+            return;
+        };
+        self.core.clients.remove(&slot.client);
+        if let Some(message) = last {
+            self.core.server_message(slot.client, message);
+            self.core.outbound.push(Outbound::Close {
+                client: slot.client,
+            });
+        }
+        self.core.departing = Some(slot.info);
+        hook!(self.on_unobserve(observer));
+        self.core.departing = None;
     }
 
     fn process_kicks(&mut self) {

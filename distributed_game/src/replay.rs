@@ -50,7 +50,7 @@ use crate::schema::FieldValue;
 use crate::world::{ChildEvent, StalePolicy};
 use crate::zone::{ClientId, PlayerId, TicketClaims, Zone};
 
-const MAGIC: &[u8; 4] = b"DGR1";
+const MAGIC: &[u8; 4] = b"DGR2";
 
 /// FNV digest of a replicated world (entity order, ids, kinds, positions,
 /// priorities and field values).
@@ -562,6 +562,10 @@ fn put_claims(w: &mut Writer, claims: &TicketClaims) {
         Role::Player => 0,
         Role::Observer => 1,
     });
+    match &claims.name {
+        Some(name) => w.u8(1).string(name),
+        None => w.u8(0),
+    };
 }
 
 fn get_claims(r: &mut Reader<'_>) -> Result<TicketClaims, RecordingError> {
@@ -573,12 +577,17 @@ fn get_claims(r: &mut Reader<'_>) -> Result<TicketClaims, RecordingError> {
         0 => Role::Player,
         _ => Role::Observer,
     };
+    let name = match r.u8()? {
+        0 => None,
+        _ => Some(r.string()?),
+    };
     Ok(TicketClaims {
         principal,
         zone,
         expires_at,
         nonce,
         role,
+        name,
     })
 }
 
@@ -652,17 +661,9 @@ impl Recording {
                     result,
                     ..
                 } => {
-                    w.u8(0)
-                        .string(&claims.principal)
-                        .string(&claims.zone)
-                        .string(&claims.nonce);
-                    put_u64(&mut w, claims.expires_at);
-                    w.u8(match claims.role {
-                        Role::Player => 0,
-                        Role::Observer => 1,
-                    })
-                    .varuint(*capabilities)
-                    .string(content_version);
+                    w.u8(0);
+                    put_claims(&mut w, claims);
+                    w.varuint(*capabilities).string(content_version);
                     put_join_result(&mut w, result);
                 }
                 Event::Reconnect {
@@ -813,23 +814,10 @@ impl Recording {
             at += get_dur(&mut r)?;
             let event = match r.u8()? {
                 0 => {
-                    let principal = r.string()?;
-                    let zone = r.string()?;
-                    let nonce = r.string()?;
-                    let expires_at = get_u64(&mut r)?;
-                    let role = match r.u8()? {
-                        0 => Role::Player,
-                        _ => Role::Observer,
-                    };
+                    let claims = get_claims(&mut r)?;
                     Event::Join {
                         at,
-                        claims: TicketClaims {
-                            principal,
-                            zone,
-                            expires_at,
-                            nonce,
-                            role,
-                        },
+                        claims,
                         capabilities: r.varuint()?,
                         content_version: r.string()?,
                         result: get_join_result(&mut r)?,

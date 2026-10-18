@@ -20,6 +20,8 @@ pub const MAX_CARRIED_BYTES: usize = 16 * 1024;
 pub struct HandoffRequest {
     /// Verified principal of the moving player.
     pub principal: String,
+    /// The player's display name (from its admission ticket), carried over.
+    pub name: Option<String>,
     /// Zone the player leaves.
     pub source_zone: String,
     /// Zone the player goes to.

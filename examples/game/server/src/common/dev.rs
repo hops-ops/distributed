@@ -170,6 +170,7 @@ async fn ticket<D: Demo>(
         expires_at,
         nonce: guests::random_hex(24),
         role,
+        name: None,
     });
     Ok(Json(TicketResponse {
         ticket,

@@ -24,6 +24,7 @@ fn claims(principal: &str, zone: &str) -> TicketClaims {
         expires_at: u64::MAX,
         nonce: format!("n-{principal}"),
         role: Role::Player,
+        name: None,
     }
 }
 
@@ -493,9 +494,11 @@ fn observers_receive_deltas_without_owning_a_player() {
     let clock = ManualClock::new();
     let mut h = host(HostConfig::default(), &clock, ArenaConfig::default());
     h.join(&claims("alice", "z1"), 0, "").unwrap();
-    let mut obs_claims = claims("watcher", "z1");
+    let mut obs_claims = claims("watcher", "z1").with_name("Wat");
     obs_claims.role = Role::Observer;
     let o = h.join(&obs_claims, 0, "").unwrap();
+    assert!(h.zone().log.contains(&"observe:watcher:Wat".to_string()));
+    assert_eq!(h.observers().next().unwrap().principal, "watcher");
     assert_eq!(h.player_count(), 1);
     assert_eq!(
         h.push_input(o.client, 1, 0, &[1, 0]),
@@ -504,13 +507,22 @@ fn observers_receive_deltas_without_owning_a_player() {
     clock.advance(MS(100));
     h.advance();
     let mut mirror = ClientMirror::new();
+    let mut events = Vec::new();
     for frame in frames_for(&h.drain_outbound(), o.client) {
-        mirror.apply(&frame).unwrap();
+        if let ServerMessage::Event { type_id, payload } = mirror.apply(&frame).unwrap() {
+            events.push((type_id, payload));
+        }
     }
     assert_eq!(mirror.welcome.as_ref().unwrap().role, Role::Observer);
     assert_eq!(mirror.entities.len(), 1);
+    assert!(
+        events
+            .iter()
+            .any(|(t, p)| *t == 7 && p == b"observe:watcher:Wat"),
+        "event addressed to the observer"
+    );
     h.disconnect(o.client, false);
-    assert!(h.zone().log.contains(&"unobserve".to_string()));
+    assert!(h.zone().log.contains(&"unobserve:watcher".to_string()));
 }
 
 #[test]
