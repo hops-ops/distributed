@@ -52,7 +52,7 @@ pub const STATION_SPACING: f32 = 3.0;
 /// Stations on the firing line.
 pub const STATIONS: u32 = 5;
 /// Furthest a shot is rewound (anti-cheat clamp).
-pub const MAX_REWIND_MS: u64 = 500;
+pub const MAX_REWIND_MS: u64 = 600;
 /// Hitscan range (m).
 pub const RANGE: f32 = 80.0;
 /// Number of targets.

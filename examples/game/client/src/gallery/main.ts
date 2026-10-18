@@ -24,6 +24,7 @@ import { Hud } from '../shared/hud.ts';
 import { InputSampler } from '../shared/input.ts';
 import { createStage, material, toWorld } from '../shared/scene.ts';
 import { createGalleryClient, DEFAULT_ZONE, KIND, targetPosition, type ShotRecord, type Vec3 } from './client.ts';
+import '@babylonjs/core/Culling/ray'; // side effect: scene.createPickingRay
 import './gallery.css';
 
 const params = new URLSearchParams(location.search);
@@ -187,7 +188,7 @@ stage.onFrame((now) => {
 	const hello = gallery.hello();
 	if (hello !== undefined) {
 		const eye = toWorld(hello.eye[0], hello.eye[1], hello.eye[2]);
-		if (!camera.target.equals(eye)) camera.setTarget(eye);
+		if (!camera.target.equals(eye)) camera.setTarget(eye, false, false, true); // keep alpha/beta/radius
 	}
 	const s = sampler.sample();
 	if (s.action && !actionWasDown) {

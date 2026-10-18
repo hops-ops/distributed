@@ -55,7 +55,7 @@ test('lag compensation confirms what the shooter saw; off misses; beyond max rew
 	try {
 		await gallery.client.connect('gallery-1');
 		const hello = await gallery.ready;
-		assert.equal(hello.maxRewindMs, 500);
+		assert.equal(hello.maxRewindMs, 600);
 		await until(() => gallery.targets().length === 6, 5_000, 'targets');
 
 		// 100 ms one way (RTT ≈ 200 ms): the client draws targets ~300 ms in the past.
@@ -69,13 +69,13 @@ test('lag compensation confirms what the shooter saw; off misses; beyond max rew
 		assert.ok(on.hits >= 18, `compensated hits ${on.hits}/20`);
 		assert.equal(on.clamped, 0);
 		const meanAge = on.ages.reduce((a, b) => a + b, 0) / on.ages.length;
-		assert.ok(meanAge > 250 && meanAge < 500, `rewind age ${meanAge}`);
+		assert.ok(meanAge > 250 && meanAge < 600, `rewind age ${meanAge}`);
 
 		const off = await volley(gallery, 20, false);
 		assert.ok(off.hits <= 6, `uncompensated hits ${off.hits}/20`);
 		assert.ok(off.ages.every((a) => a === 0), 'no rewind without compensation');
 
-		// 300 ms one way: the view is ~700 ms old, more than the 500 ms clamp.
+		// 300 ms one way: the view is ~700 ms old, more than the 600 ms clamp.
 		await api.setNetSim({ latencyMs: 300, jitterMs: 0, loss: 0 });
 		await until(() => zone.connection.clock.rtt > 550, 15_000, 'rtt 600');
 		await until(() => gallery.targets() && gallery.delay.settled(zone, 10), 20_000, 'adaptive delay 2');
@@ -84,8 +84,8 @@ test('lag compensation confirms what the shooter saw; off misses; beyond max rew
 			`comp on ${on.hits}/20 (mean rewind ${meanAge.toFixed(0)} ms) · off ${off.hits}/20 · 300 ms: clamped ${far.clamped}/10, hits ${far.hits}/10`
 		);
 		assert.ok(far.clamped >= 9, `clamped ${far.clamped}/10`);
-		assert.ok(far.requested.every((r) => r > 520), `requested ${far.requested}`);
-		assert.ok(far.ages.every((a) => a <= 501), `ages ${far.ages}`);
+		assert.ok(far.requested.every((r) => r > 620), `requested ${far.requested}`);
+		assert.ok(far.ages.every((a) => a <= 601), `ages ${far.ages}`);
 
 		assert.equal(gallery.stats.resolved, 50);
 		assert.equal(gallery.stats.predictedHits, 50);

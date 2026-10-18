@@ -127,10 +127,10 @@ fn rewound_shots_hit_what_the_shooter_saw() {
     let s = rig.shoot(5, 0, 0, FLAG_NO_COMP);
     assert_eq!(s.hits, 2);
     // Claiming 2 s of delay is clamped to MAX_REWIND_MS: aiming 2 s back
-    // misses, aiming at the clamp (15 ticks = 500 ms) still hits.
-    let s = rig.shoot(5, 15, 2000, 0);
+    // misses, aiming at the clamp (18 ticks = 600 ms) still hits.
+    let s = rig.shoot(5, 18, 2000, 0);
     assert_eq!((s.shots, s.hits, s.clamped), (4, 3, 1));
-    let s = rig.shoot(2, 15, 2000, 0);
+    let s = rig.shoot(2, 18, 2000, 0);
     assert_eq!((s.shots, s.clamped), (5, 2));
 }
 

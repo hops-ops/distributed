@@ -45,7 +45,7 @@ client's interpolation delay adapts to `rtt / 2 + 2 patches + 2 × jitter`
 (the SDK clock estimates the server's *present*, so a fixed 100 ms would ask
 for states not yet received); each shot carries `delay = tickTime(client_tick)
 - renderTime`, so the server rewinds to exactly what was on screen. Beyond
-`gallery::MAX_REWIND_MS` (500 ms of view age, ≈ 200 ms one way) shots are
+`gallery::MAX_REWIND_MS` (600 ms of view age, ≈ 250 ms one way) shots are
 clamped and reported as such.
 
 ## Architecture
