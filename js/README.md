@@ -609,6 +609,9 @@ keeps rendering; if the target refuses or stays silent the same Hello goes
 back to the source zone, then a fresh ticket. `Kick(RELOAD)` and handshake
 `VERSION_MISMATCH` emit `reloadRequired`; supply `reloadContent` (or call
 `connection.resumeAfterReload(version)`) to rejoin with the new content.
+`client.contentVersion` follows the reload, so later handoff targets and
+observers present the new version; a client that patches content live
+(e.g. on a `resume` with a new version) calls `client.setContentVersion(v)`.
 `encodeInput(input, ctx)` receives the interpolation delay and view tick for
 server-side lag compensation (`replica.interpolationDelayMs`,
 `client.inputContext()`).

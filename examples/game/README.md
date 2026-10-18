@@ -11,6 +11,8 @@ guests and lets any page change the network simulation.
 | **Arena** | `./run.sh arena` | Fixed 30 Hz tick / 20 Hz patches, binary deltas, interest management (view ring, drones pop in/out), client prediction + reconciliation (shared Rust/TS movement step, bit-exact), interpolation of remote entities, live latency/jitter/loss |
 | **Mob Pit** | `./run.sh mobpit` | Authoritative melee combat vs. 12 telegraphing mobs; kills are **non-blocking durable facts** committed exactly once into per-player native SQLite cells (`cell-sqlite`); "slow storage" toggle (tick stays flat, pending facts climb); `kill -9` crash recovery |
 | **Leaderboard** | `./run.sh leaderboard` | Same server as Mob Pit: kills/XP sorted-set boards (in-memory or Redis) fed fire-and-forget with idempotent apply keys, top 10 pushed live, your rank + neighbours, rebuild from the cells' event history |
+| **Shooting Gallery** | `./run.sh gallery` | Lag compensation: hitscan shots resolved with `ctx.rewind().hit_test_shot` at the shooter's view time (`client_tick` + interpolation delay in the payload), `max_rewind` clamp, per-shot compensation on/off, predicted vs confirmed hits |
+| **The Freeze** | `./run.sh freeze` | World-version barrier (`WorldCoordinator::rollout`) across **two server processes** as an in-world "admin update": freeze → apply → resume with change notes, inputs dropped while frozen, Hard reload vs safe-room gating (`StalePolicy::SafeRoom`, `Zone::is_gate`) of old clients, aborted rollout (`freeze_ready` → `NotAcked`), facts/events stamped with the content version |
 
 `./run.sh smoke` runs every demo's smoke tests; `./run.sh list` lists demos.
 
@@ -36,6 +38,53 @@ your keys), **G** the wireframe ghost at the latest server position. The
 NetSim sliders change the server's simulated one-way latency (applied in
 both directions), jitter and loss (a TCP-like retransmit delay) for every
 connection.
+
+Shooting Gallery controls: click a target (or Space / gamepad A through the
+crosshair), drag to look. **C** toggles lag compensation (sent with every
+shot), **G** wireframe ghosts at the newest received target state. Set the
+NetSim latency to 150–250 ms: with compensation the confirmed hits match the
+predicted ones (yellow marker → green); without it most turn red. The
+client's interpolation delay adapts to `rtt / 2 + 2 patches + 2 × jitter`
+(the SDK clock estimates the server's *present*, so a fixed 100 ms would ask
+for states not yet received); each shot carries `delay = tickTime(client_tick)
+- renderTime`, so the server rewinds to exactly what was on screen. Beyond
+`gallery::MAX_REWIND_MS` (600 ms of view age, ≈ 250 ms one way) shots are
+clamped and reported as such.
+
+The Freeze: the server prints an **admin secret** (`./run.sh freeze` shows
+it; set `DG_DEMO_ADMIN_SECRET` to choose one) — open
+`/freeze/?admin=<secret>` (add `&old=1` in a second tab for an old client).
+`game-demos freeze` hosts the Town Hub (safe-room gate) and Whisper Meadow
+and starts a second process of itself for Ember Fields (`beta`, shared
+ticket + admin secrets, exits with its parent); portals hand players off
+between them (`Redirect` + `/admin/transfer` across processes). Content is
+data-driven per version (`freeze::content`: v1 lava pools that burn, v2
+"lava is now ice", v3 back to lava; slime speed/size/color, crystals, gem
+value) and served by `GET /dev/freeze/content/{version}`; the client derives
+the scene from *its own* pack.
+
+- **Roll out update (Hard)**: every zone on both hosts freezes (SYSTEM
+  overlay, inputs dropped and counted — client side, plus any in flight on
+  the server), the "content CDN" stages the pack (`DG_FREEZE_STAGE_MS`,
+  default 2.5 s), every zone resumes on the next version with the notes,
+  and every client reloads (`Kick(RELOAD)` → `reloadContent` → reconnect
+  with the token).
+- **Roll out (Safe room)**: rolling commit. Normal clients patch live
+  (`client.setContentVersion`); an old client (**O** / `&old=1`) keeps its
+  old pack in the field — the server already runs the new rules — until it
+  walks through a portal into the Town Hub, where it gets `RELOAD`.
+  (An old client that is *already* in the hub when the update lands is
+  refused by the field it walks into next — `VERSION_MISMATCH` — returns to
+  the hub with its transfer ticket and is reloaded there.)
+- **Ritual in Ember Fields**: that zone's `freeze_ready()` is false; the
+  next rollout times out (`NotAcked: beta/freeze-ember`) and every zone
+  resumes on the old version with "update aborted".
+
+Each zone switch emits a `freeze.content_applied` fact and a stamped event;
+gems emit `freeze.gem_collected` facts — the admin panel lists them with
+their stamp. Display names live on the primary host: a player joining Ember
+Fields directly (`&zone=freeze-ember`) shows as a guest there, names carry
+over portals.
 
 ## Architecture
 
@@ -72,16 +121,21 @@ examples/game/
     src/common/              shared: Demo trait, run/spawn, dev routes, guests, JSON events
     src/arena/               Arena zone + movement.rs (twin of client movement.ts)
     src/mobpit/              Mob Pit zone, Crawler cell aggregate, fact sink, leaderboards, dev routes
+    src/gallery/             Shooting Gallery zone (targets, rewind hit tests)
+    src/freeze/              The Freeze zone, content packs, two-host world + admin routes
     tests/                   arena_smoke.rs (bots, dev routes), movement_fixture.rs,
-                             mobpit_smoke.rs (facts, slow storage, kill -9 recovery, boards)
+                             mobpit_smoke.rs (facts, slow storage, kill -9 recovery, boards),
+                             gallery_smoke.rs, freeze_smoke.rs
   client/                    Vite + TypeScript + Babylon.js 9.30 (multi-page)
     index.html, <demo>/index.html
     src/shared/              hud.ts, input.ts, scene.ts, dev-api.ts, events.ts, style.css
     src/arena/               client.ts (headless), main.ts (Babylon), movement.ts
     src/mobpit/              client.ts (headless + /dev/mobpit API), main.ts (Babylon), style.css
     src/leaderboard/         main.ts (DOM page over the observer connection), style.css
-    tests/                   movement-parity, arena-headless, mobpit-headless,
-                             leaderboard-headless (+ helpers/demo-server.mjs, helpers/mobpit.mjs)
+    src/gallery/             client.ts (shots, adaptive delay), main.ts
+    src/freeze/              client.ts (content packs, live patch / reload, admin API), main.ts
+    tests/                   movement-parity, arena-headless, mobpit-headless, leaderboard-headless,
+                             gallery-headless, freeze-headless (+ helpers/demo-server.mjs, helpers/mobpit.mjs)
 ```
 
 The server crate is excluded from the root workspace (`Cargo.toml`

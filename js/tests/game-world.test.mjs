@@ -249,3 +249,43 @@ test('interpolation delay and view tick are exposed for lag compensation', async
 	assert.deepEqual([...input.payload], [1, 100], 'encodeInput received the context');
 	client.close();
 });
+
+test('a reloaded content version is presented on later handoffs; setContentVersion patches live', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	network.onMessage = (conn, m) => {
+		if (m.type === 'Hello') conn.send(welcome({ zoneId: conn.zoneId, contentVersion: 'c2' }));
+	};
+	const client = new GameClient({
+		url: (zone) => `ws://game.test/zones/${zone}`,
+		ticket: ({ zoneId }) => `fresh:${zoneId}`,
+		contentVersion: 'c1',
+		socket: network.factory,
+		scheduler,
+		pingIntervalMs: 60_000,
+		reloadContent: async (request) => request.version ?? 'c2'
+	});
+	await client.connect('hub');
+	assert.equal(client.contentVersion, 'c1');
+	network.last('hub').send({ type: 'Kick', code: GameKickCode.RELOAD, message: 'content c2 required' });
+	network.last('hub').close();
+	await scheduler.advance(10);
+	assert.equal(network.last('hub').lastHello.contentVersion, 'c2', 'reloaded connection resumes on c2');
+	assert.equal(client.contentVersion, 'c2', 'client learns the reloaded version');
+
+	// The next zone (handoff target) must not present the stale option value.
+	network.last('hub').send({ type: 'Handoff', targetZone: 'field', transferTicket: 'transfer:t1' });
+	network.last('hub').close();
+	await scheduler.advance(10);
+	assert.equal(network.last('field').lastHello.contentVersion, 'c2');
+
+	// Live patch: reconnects of the current connection and new ones present c3.
+	client.setContentVersion('c3');
+	assert.equal(client.authority.connection.contentVersion, 'c3');
+	await client.observe('meadow');
+	assert.equal(network.last('meadow').lastHello.contentVersion, 'c3');
+	client.authority.connection.dropTransport();
+	await scheduler.advance(10);
+	assert.equal(network.last('field').lastHello.contentVersion, 'c3');
+	client.close();
+});

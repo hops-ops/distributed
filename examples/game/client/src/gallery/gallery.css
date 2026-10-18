@@ -1,0 +1,47 @@
+.crosshair {
+	position: fixed;
+	left: 50%;
+	top: 50%;
+	width: 18px;
+	height: 18px;
+	margin: -9px 0 0 -9px;
+	pointer-events: none;
+	border: 2px solid rgba(255, 255, 255, 0.75);
+	border-radius: 50%;
+	box-sizing: border-box;
+}
+.crosshair.kick {
+	animation: kick 120ms ease-out;
+}
+@keyframes kick {
+	from {
+		transform: scale(1.6);
+		border-color: #ffd84a;
+	}
+}
+.shot-feed {
+	position: fixed;
+	right: 12px;
+	bottom: 12px;
+	width: 340px;
+	margin: 0;
+	padding: 8px 12px 8px 28px;
+	border-radius: 8px;
+	background: var(--panel);
+	pointer-events: none;
+}
+.shot-feed:empty {
+	display: none;
+}
+.shot-feed .ok {
+	color: #59e08c;
+}
+.shot-feed .bad {
+	color: #ff5d5d;
+}
+@media (max-width: 640px) {
+	.shot-feed {
+		width: calc(100% - 24px);
+		box-sizing: border-box;
+	}
+}

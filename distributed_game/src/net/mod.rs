@@ -1485,6 +1485,10 @@ where
     let (reply_tx, reply_rx) = oneshot::channel();
     // Transfer record to settle once the zone answered: (issuer, nonce).
     let mut reserved: Option<(String, String)> = None;
+    // A failed handoff returning to its source presents a ticket whose nonce
+    // the target may have recorded on this same host; the issuer's transfer
+    // registry (`Return`) keeps it single use, so it gets its own replay key.
+    let mut returning = false;
     let cmd = if hello.reconnect_token.is_empty() {
         let now = unix_now();
         let verified = match cfg.ticket_key.verify_ticket(&hello.ticket, now) {
@@ -1515,6 +1519,7 @@ where
                     {
                         return reject(socket, error::UNAUTHORIZED, e).await;
                     }
+                    returning = true;
                     let never_reached =
                         std::mem::replace(&mut transfer.claims.zone, zone_id.clone());
                     transfer.source_zone = never_reached;
@@ -1524,8 +1529,13 @@ where
                 (transfer.claims.clone(), Some(transfer))
             }
         };
+        let replay_key = if returning {
+            format!("return:{}", claims.nonce)
+        } else {
+            claims.nonce.clone()
+        };
         let replay = inner.nonces.lock().expect("nonces").check_and_insert(
-            &claims.nonce,
+            &replay_key,
             claims.expires_at,
             now,
         );

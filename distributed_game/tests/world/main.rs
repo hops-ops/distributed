@@ -379,6 +379,45 @@ async fn refused_handoff_returns_to_source_with_carried_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_handoff_returns_to_a_source_on_the_same_host() {
+    // Source and target share a host (and its nonce replay cache): the
+    // target saw the ticket first, the return must still be admitted once.
+    let (a, _b, _dir) = two_hosts(
+        base_config,
+        &[("realm.east", "A"), ("realm.west", "A")],
+        realm_factory(&[("realm.east", "realm.west")], &["realm.west"]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut ana = join_url(
+        &a.addr.zone_url("realm.east"),
+        &ticket("ana", "realm.east", "s1"),
+        "",
+    )
+    .await
+    .unwrap();
+    input(&mut ana, 1, CMD_HANDOFF).await;
+    let transfer = loop {
+        if let Some(ServerMessage::Handoff {
+            transfer_ticket, ..
+        }) = control(&mut ana).await
+        {
+            break transfer_ticket;
+        }
+    };
+    match join_url(&a.addr.zone_url("realm.west"), &transfer, "").await {
+        Err(ServerMessage::Error { code, .. }) => assert_eq!(code, error::REJECTED),
+        other => panic!("expected rejection: {:?}", other.map(|c| c.welcome)),
+    }
+    let back = join_url(&a.addr.zone_url("realm.east"), &transfer, "").await;
+    assert!(back.is_ok(), "return admitted: {:?}", back.err());
+    // The return is single use.
+    assert!(join_url(&a.addr.zone_url("realm.east"), &transfer, "")
+        .await
+        .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn boss_defeat_tiers_up_to_parent_and_grandparent_across_hosts() {
     let (a, b, _dir) = two_hosts(
         base_config,
