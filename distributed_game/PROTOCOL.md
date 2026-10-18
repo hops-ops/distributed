@@ -218,6 +218,12 @@ Leave  := 0x04
   (default 120/s, burst 240); excess inputs are dropped and the server
   sends `Error(RATE_LIMITED)` at most once per second; sustained abuse
   gets `Kick(RATE_LIMITED)`. Observers' inputs are ignored.
+  `client_tick` SHOULD be the latest `server_tick` the client has applied
+  (the tick its interpolated view is based on). Servers that do lag
+  compensation evaluate shots at `time(client_tick) - interp_delay`, where
+  `interp_delay` is game-defined and carried **inside `payload`**; the
+  server clamps the rewind to its configured maximum, so the value is
+  advisory and never trusted beyond that bound.
 - **Ping**: the server answers with Pong immediately.
 - **Leave**: graceful exit; the player is removed at once (no reconnect
   grace).

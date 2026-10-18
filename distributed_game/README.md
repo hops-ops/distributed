@@ -15,7 +15,9 @@ Physics is out of scope: bring your own and step it in `on_tick`.
 | *(default)* | Zone/host runtime, facts queue, protocol, schema, replication | `serde_json` |
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
 | `cell` | `cell::CellFactSink` → `AggregateCell::dispatch_idempotent`, `stamp_event_record` | `distributed`, `sha2` |
-| `net` | `net::GameServer` (axum WebSocket), HMAC tickets | `axum`, `hmac`, `sha2`, `base64`, `tokio` |
+| `metrics` | `metrics::GameMetrics` per-zone Prometheus text | – |
+| `net` | `net::GameServer` (axum WebSocket), HMAC tickets, `GET /metrics` (implies `metrics`) | `axum`, `hmac`, `sha2`, `base64`, `tokio` |
+| `bots` | `bots` load-test client library + `game-bots` binary | `net` + `tokio-tungstenite` |
 
 ## Minimal zone
 
@@ -98,6 +100,41 @@ with bounded retries/backoff; `Zone::on_fact_settled` receives the outcome
 on a later tick. `cell::CellFactSink` dispatches into an `AggregateCell`
 with a deterministic command id per fact key, so retries replay instead of
 double-crediting.
+
+## Netcode and operations
+
+- **Lag compensation** (`rewind`): implement `Zone::record_rewind` to push
+  hit volumes (sphere / vertical capsule + numeric fields) each tick; the
+  host keeps a ring buffer sized by `HostConfig::rewind.max_rewind`
+  (default 500 ms). In a hook,
+  `ctx.rewind().hit_test_shot(ShotTiming { client_tick, interp_delay }, &HitQuery::ray(o, d, range), |id| id != me)`
+  evaluates at the shooter's view time, clamped to `max_rewind` and the
+  stored history. The interpolation delay travels in the game's input
+  payload (no wire change).
+- **Record/replay** (`replay`): drive a host through `Recorder` (same
+  methods as `ZoneHost`), save the compact `Recording` (`DGR1`), and
+  `replay::<Z>(&recording, config)` re-runs it on a `ManualClock`,
+  checking a per-tick state hash (`Zone::state_hash`, or the replicated
+  `WorldView`). A mismatch returns a `Divergence` naming the tick and the
+  stimuli applied since the last matching tick. Fact settlements are
+  replayed on the tick they were delivered.
+- **Metrics** (`metrics`, served by `GameServer` at `GET /metrics`):
+  tick duration histogram, ticks/dropped ticks, tier, players, observers,
+  entities, inputs by outcome, Delta bytes per frame, facts pending/settled.
+  Only the first `ServerConfig::metrics_zone_labels` (default 64) live
+  zones get a `zone` label; the rest aggregate into `zone="_other"`.
+  `AdvanceReport` carries the raw numbers for custom drivers.
+- **Bots** (`bots`): `run_bots(BotConfig, |i| behaviour)` connects N
+  WebSocket clients with signed tickets, sends inputs (random walk,
+  circle, or your own `Behaviour`), measures RTT and Delta bytes/s:
+  `cargo run -p distributed_game --features bots --bin game-bots -- --url ws://127.0.0.1:2567 --zone room-1 --bots 50`.
+- **Network simulation** (`NetSim`, dev only): one-way latency + uniform
+  jitter + loss, per direction. WebSockets are reliable and ordered, so
+  loss is simulated as a TCP retransmission delay (`retransmit`, default
+  200 ms, up to 3×) with head-of-line blocking, never as a dropped or
+  reordered message. `config.net_sim = NetSim::from_env()` reads
+  `DG_NET_LATENCY_MS`, `DG_NET_JITTER_MS`, `DG_NET_LOSS`,
+  `DG_NET_RETRANSMIT_MS`.
 
 ## Protocol
 
