@@ -40,7 +40,7 @@ test('kills become durable facts without stalling the tick, and survive a restar
 		await hunt(pit, () => saved.length >= 1);
 		assert.ok(saved[0].ok && XP.has(saved[0].xp), JSON.stringify(saved[0]));
 		assert.equal(saved[0].key, kills[0].key);
-		assert.match(saved[0].key, /^kill:[0-9a-f]+:pit-1:m\d+:\d+$/);
+		assert.match(saved[0].key, /^kill:pit-1:\d+:m\d+:\d+$/, "kill:{zone}:{boot_epoch}:m{mob}:{generation}");
 		// One swing can kill several mobs: wait until every own kill settled.
 		await until(() => pit.unsaved.size === 0 && saved.length === kills.length, 5_000, 'settlements');
 		await until(() => pit.profile().source === 'settled' && pit.profile().kills === kills.length, 5_000, `profile after settlement ${JSON.stringify(pit.profile())}`);
