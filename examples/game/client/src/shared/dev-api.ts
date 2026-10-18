@@ -4,8 +4,8 @@
  *
  * A real game gets admission tickets from its authenticated lobby; the dev
  * route mints one for a server-generated guest. We keep the server-signed
- * guest token (localStorage when available) so a page reload stays the same
- * player. Works in browsers (relative URLs) and in Node tests (`base`).
+ * guest token per tab (sessionStorage when available): a reload stays the
+ * same player, and each tab is its own player. Works in browsers (relative URLs) and in Node tests (`base`).
  */
 import type { GameTicketSource } from '@hops-ops/distributed/game';
 
@@ -25,7 +25,7 @@ export type DevApiOptions = Readonly<{
 	base?: string;
 	/** Display name for new tickets (read on every request). */
 	name?: () => string | undefined;
-	/** Where the guest token lives between reloads (default localStorage when present). */
+	/** Where the guest token lives between reloads (default sessionStorage when present: one guest per tab). */
 	storage?: Pick<Storage, 'getItem' | 'setItem'>;
 }>;
 
@@ -33,7 +33,7 @@ const GUEST_KEY = 'game-demos.guest';
 
 function defaultStorage(): Pick<Storage, 'getItem' | 'setItem'> | undefined {
 	try {
-		return globalThis.localStorage ?? undefined;
+		return globalThis.sessionStorage ?? undefined;
 	} catch {
 		return undefined;
 	}
