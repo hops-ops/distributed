@@ -1,6 +1,7 @@
 //! Shared plumbing for every demo: CLI options, the [`Demo`] trait, server
 //! startup ([`spawn`] / [`run`]), the dev-only routes ([`dev`]), guest display
-//! names ([`Guests`]) and small zone helpers ([`send_json_event`]).
+//! names ([`Guests`]), small zone helpers ([`send_json_event`]) and process
+//! helpers ([`shutdown_signal`], [`random_hex`]).
 //!
 //! A new demo implements [`Demo`] in its own module and adds one subcommand
 //! line in `main.rs`; everything else (ticket endpoint, NetSim control,
@@ -186,7 +187,8 @@ pub async fn run_with<D: Demo>(
     running.task.await.map_err(std::io::Error::other)?
 }
 
-async fn shutdown_signal() {
+/// Resolves on Ctrl-C or SIGTERM (graceful shutdown for every demo binary).
+pub async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };

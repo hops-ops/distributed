@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 
 use super::content::{self, ZoneKind, EMBER, HUB, MEADOW};
 use super::{freeze_config, FreezeConfig, FreezeDemo, FreezeZone, Rituals};
-use crate::common::{dev, server_config, DemoArgs, Guests};
+use crate::common::{self, dev, random_hex, server_config, DemoArgs, Guests};
 
 /// Default time the "content CDN" takes to stage an update while the world
 /// is frozen (makes the pause visible).
@@ -585,22 +585,9 @@ fn spawn_secondary(
     Ok((child, HostAddr::new("beta", addr)))
 }
 
+/// [`common::shutdown_signal`], plus (secondary host) the primary going away:
+/// the secondary exits when its stdin, held by the primary, closes.
 async fn shutdown_signal(watch_stdin: bool) {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let term = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending().await,
-        }
-    };
-    #[cfg(not(unix))]
-    let term = std::future::pending::<()>();
-    // The secondary exits when the primary (which holds its stdin) is gone.
     let (orphaned_tx, orphaned) = tokio::sync::oneshot::channel::<()>();
     if watch_stdin {
         std::thread::spawn(move || {
@@ -612,8 +599,7 @@ async fn shutdown_signal(watch_stdin: bool) {
         std::mem::forget(orphaned_tx);
     }
     tokio::select! {
-        _ = ctrl_c => {}
-        _ = term => {}
+        _ = common::shutdown_signal() => {}
         _ = orphaned => {}
     }
 }
@@ -623,15 +609,8 @@ async fn shutdown_signal(watch_stdin: bool) {
 pub async fn run(args: FreezeArgs) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind((args.demo.host.as_str(), args.demo.port)).await?;
     let addr = listener.local_addr()?;
-    let secret = args
-        .demo
-        .secret
-        .clone()
-        .unwrap_or_else(|| random_secret(32));
-    let admin = args
-        .admin_secret
-        .clone()
-        .unwrap_or_else(|| random_secret(24));
+    let secret = args.demo.secret.clone().unwrap_or_else(|| random_hex(32));
+    let admin = args.admin_secret.clone().unwrap_or_else(|| random_hex(24));
     let me = HostAddr::new(args.host_id.clone(), addr.to_string());
     let secondary = args.peer.is_some();
     let (peers, child) = match &args.peer {
@@ -686,19 +665,4 @@ pub async fn run(args: FreezeArgs) -> std::io::Result<()> {
         }
     }
     result
-}
-
-/// `len` random hex characters (OS-seeded SipHash; dev quality).
-fn random_secret(len: usize) -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let mut out = String::new();
-    let mut n = 0u64;
-    while out.len() < len {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u64(n);
-        n += 1;
-        out.push_str(&format!("{:016x}", h.finish()));
-    }
-    out.truncate(len);
-    out
 }
