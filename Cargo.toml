@@ -56,6 +56,8 @@ sqlite = ["dep:sqlx", "dep:tokio", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/s
 nats = ["dep:async-nats", "dep:futures", "dep:tokio"]
 rabbitmq = ["dep:lapin", "dep:futures", "dep:tokio"]
 kafka = ["dep:rdkafka", "dep:tokio"]
+# Redis sorted-set leaderboards and the Redis Streams `MessagePublisher`.
+redis = ["dep:redis", "dep:tokio"]
 workers-rs = ["dep:worker"]
 # Native durable aggregate cells: one synchronous SQLite file per cell, same
 # SQL store and one-transaction-per-command contract as Durable Object cells.
@@ -79,6 +81,7 @@ base64 = "0.23.0"
 futures = { version = "0.3", optional = true }
 lapin = { version = "4", optional = true }
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio"], optional = true }
+redis = { version = "1.7.1", default-features = false, features = ["script", "streams", "tokio-comp", "connection-manager"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 jsonwebtoken = { version = "9", optional = true }
 bitcode = { version = "0.6.9", features = ["serde"] }
