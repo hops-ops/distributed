@@ -65,17 +65,19 @@ the scene from *its own* pack.
 
 - **Roll out update (Hard)**: every zone on both hosts freezes (SYSTEM
   overlay, inputs dropped and counted — client side, plus any in flight on
-  the server), the "content CDN" stages the pack (`DG_FREEZE_STAGE_MS`,
-  default 2.5 s), every zone resumes on the next version with the notes,
+  the server), the "content CDN" stages the pack — an async `apply`
+  awaited by `WorldCoordinator::rollout_async` while everything stays
+  frozen (`DG_FREEZE_STAGE_MS`, default 2.5 s) — every zone resumes on the next version with the notes,
   and every client reloads (`Kick(RELOAD)` → `reloadContent` → reconnect
   with the token).
 - **Roll out (Safe room)**: rolling commit. Normal clients patch live
   (`client.setContentVersion`); an old client (**O** / `&old=1`) keeps its
   old pack in the field — the server already runs the new rules — until it
   walks through a portal into the Town Hub, where it gets `RELOAD`.
-  (An old client that is *already* in the hub when the update lands is
-  refused by the field it walks into next — `VERSION_MISMATCH` — returns to
-  the hub with its transfer ticket and is reloaded there.)
+  Every client already *in* the hub when the update lands is at a safe
+  point and reloads right there (a rolling commit reloads stale clients
+  inside gate zones); a live-patching client reports its new version on
+  that reconnect.
 - **Ritual in Ember Fields**: that zone's `freeze_ready()` is false; the
   next rollout times out (`NotAcked: beta/freeze-ember`) and every zone
   resumes on the old version with "update aborted".

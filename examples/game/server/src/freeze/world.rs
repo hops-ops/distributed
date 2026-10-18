@@ -29,13 +29,10 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use distributed_game::facts::BoxFuture;
 use distributed_game::net::peer::{post_json, ADMIN_SECRET_HEADER};
 use distributed_game::net::{
-    BarrierParticipant, GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey,
-    WorldCoordinator,
+    GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey, WorldCoordinator,
 };
-use distributed_game::protocol::Notice;
 use distributed_game::world::{HostAddr, StaticDirectory};
 use distributed_game::{BarrierMode, FreezeState, MemoryFactSink, RetryPolicy};
 use serde::Deserialize;
@@ -423,9 +420,8 @@ async fn rollout(
     let next = content::version_name(content::version_number(&current).unwrap_or(1) + 1);
     let pack = content::pack(&next).expect("valid version");
     let notes = pack.resume_notes();
-    let mut coordinator = WorldCoordinator::new(state.ack_timeout)
-        .participant(Arc::new(state.server.clone()))
-        .participant(Arc::new(ContentStage { delay: state.stage }));
+    let mut coordinator =
+        WorldCoordinator::new(state.ack_timeout).participant(Arc::new(state.server.clone()));
     for peer in &state.peers {
         coordinator = coordinator.participant(Arc::new(RemoteHost::new(
             peer.clone(),
@@ -433,7 +429,15 @@ async fn rollout(
         )));
     }
     let started = Instant::now();
-    let result = coordinator.rollout(&next, &notes, mode, |_| Ok(())).await;
+    // The "content CDN" stages the pack while every zone is frozen: an
+    // async apply, so clients see the SYSTEM "applying update" pause.
+    let stage = state.stage;
+    let result = coordinator
+        .rollout_async(&next, &notes, mode, |_version| async move {
+            tokio::time::sleep(stage).await;
+            Ok(())
+        })
+        .await;
     let took_ms = started.elapsed().as_millis() as u64;
     let mode_name = body.mode;
     let outcome = match result {
@@ -512,44 +516,6 @@ async fn stuck(
             value,
         ),
         Err(e) => reply(StatusCode::BAD_GATEWAY, json!({ "ok": false, "error": e })),
-    }
-}
-
-/// The content CDN as a barrier participant: staging the pack takes
-/// `delay` while the world is frozen (nothing to undo on abort).
-struct ContentStage {
-    delay: Duration,
-}
-
-impl BarrierParticipant for ContentStage {
-    fn name(&self) -> String {
-        "content-cdn".into()
-    }
-
-    fn prepare<'a>(
-        &'a self,
-        _barrier: u64,
-        _notice: &'a Notice,
-        _timeout: Duration,
-    ) -> BoxFuture<'a, Result<(), Vec<String>>> {
-        Box::pin(async move {
-            tokio::time::sleep(self.delay).await;
-            Ok(())
-        })
-    }
-
-    fn commit<'a>(
-        &'a self,
-        _barrier: u64,
-        _version: &'a str,
-        _notes: &'a str,
-        _mode: BarrierMode,
-    ) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
-    }
-
-    fn abort<'a>(&'a self, _barrier: u64, _notes: &'a str) -> BoxFuture<'a, Result<(), String>> {
-        Box::pin(async { Ok(()) })
     }
 }
 

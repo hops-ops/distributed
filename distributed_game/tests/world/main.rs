@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use distributed::lease::InMemoryLeaseStore;
 use distributed_game::net::{
-    GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey, WorldCoordinator,
+    AbortNotes, GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey, WorldCoordinator,
 };
 use distributed_game::protocol::{error, kick, Hello, Notice};
 use distributed_game::world::{
@@ -722,6 +722,109 @@ fn versioned(version: &'static str) -> impl Fn() -> ServerConfig {
         c.host.content_version = version.into();
         c
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rolling_commit_reloads_stale_clients_in_gates_and_apply_may_await() {
+    let safe_room = || {
+        let mut c = base_config();
+        c.host.content_version = "v1".into();
+        c.host.stale_policy = StalePolicy::SafeRoom { roam: false };
+        c
+    };
+    let (a, _b, _dir) = two_hosts(
+        safe_room,
+        &[("realm.inn", "A"), ("realm.field", "A")],
+        realm_factory(&[], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut inn = join_url(
+        &a.addr.zone_url("realm.inn"),
+        &ticket("ina", "realm.inn", "g1"),
+        "v1",
+    )
+    .await
+    .unwrap();
+    let mut field = join_url(
+        &a.addr.zone_url("realm.field"),
+        &ticket("fey", "realm.field", "g2"),
+        "v1",
+    )
+    .await
+    .unwrap();
+    let server = a.server.clone();
+    let coordinator = WorldCoordinator::new(Duration::from_secs(2))
+        .participant(Arc::new(a.server.clone()))
+        .with_abort_notes(AbortNotes {
+            not_acked: "the ritual held the world".into(),
+            apply_failed: "CDN said: {error}".into(),
+        });
+
+    // Async apply that fails: everyone resumes on v1 with the custom note.
+    let failed = coordinator
+        .rollout_async("v2", "", BarrierMode::Rolling, |_v| async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err("pack missing".to_string())
+        })
+        .await;
+    assert_eq!(
+        failed,
+        Err(RolloutError::ApplyFailed("pack missing".into()))
+    );
+    for c in [&mut inn, &mut field] {
+        assert!(matches!(
+            next_notice(c).await,
+            Some(ServerMessage::Freeze(_))
+        ));
+        let resumed = next_notice(c).await;
+        assert!(
+            matches!(&resumed, Some(ServerMessage::Resume(n))
+                if n.version == "v1" && n.notes == "CDN said: pack missing"),
+            "{resumed:?}"
+        );
+    }
+
+    // Async apply observed while every zone is frozen, then a rolling commit.
+    let report = coordinator
+        .rollout_async("v2", "ice", BarrierMode::Rolling, |v| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let frozen = server.inspect("realm.inn", |h| h.is_frozen()).await;
+            assert_eq!(frozen, Some(true), "zones stay frozen while applying {v}");
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.version, "v2");
+    for c in [&mut inn, &mut field] {
+        assert!(matches!(
+            next_notice(c).await,
+            Some(ServerMessage::Freeze(_))
+        ));
+        assert!(matches!(
+            next_notice(c).await,
+            Some(ServerMessage::Resume(n)) if n.version == "v2"
+        ));
+    }
+    // The stale client already inside the gate reloads there ...
+    match next_notice(&mut inn).await {
+        Some(ServerMessage::Kick { code, .. }) => assert_eq!(code, kick::RELOAD),
+        other => panic!("expected Kick(RELOAD), got {other:?}"),
+    }
+    // ... the one in the field keeps playing its old version.
+    let field_connected = a
+        .server
+        .inspect("realm.field", |h| h.players().all(|p| p.connected))
+        .await;
+    assert_eq!(field_connected, Some(true));
+    // The reloaded client reconnects with its token on v2.
+    let mut back = connect(&a.addr.zone_url("realm.inn")).await;
+    hello(&mut back, "", &inn.welcome.reconnect_token, "v2").await;
+    let mut mirror = ClientMirror::new();
+    assert!(matches!(
+        next_control(&mut back, &mut mirror).await,
+        Some(ServerMessage::Welcome(w)) if w.content_version == "v2"
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

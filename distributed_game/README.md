@@ -242,14 +242,19 @@ apply)` over `GameServer`s and `RemoteHost`s (admin HTTP, shared secret):
 freeze all zones (`Freeze{version}`; `Zone::freeze_ready` may delay),
 wait for every ack within the timeout, `apply(version)`, then commit
 (`Resume{version, notes}`; facts/`ctx.stamp()` carry the new version).
-A missing ack or failed `apply` aborts: everyone resumes on the old
-version. Inputs while frozen are dropped and counted
+`rollout_async(…, |version| async { … })` awaits an async `apply` while
+every zone stays frozen (a visible "applying update" pause, no extra
+barrier participant needed). A missing ack or failed `apply` aborts:
+everyone resumes on the old version with `AbortNotes`
+(`WorldCoordinator::with_abort_notes`; `{error}` expands to the apply
+error). Inputs while frozen are dropped and counted
 (`ZoneHost::inputs_dropped_frozen`). `HostConfig::stale_policy =
 StalePolicy::SafeRoom { roam }` lets old clients keep playing after a
 `BarrierMode::Rolling` commit until they reach a gate zone
 (`Zone::is_gate`), where they get `Kick(RELOAD)` and reconnect with their
-token after reloading; `BarrierMode::Hard` reloads every stale client at
-once.
+token after reloading — stale clients already inside a gate when the
+rolling commit lands are reloaded there at once; `BarrierMode::Hard`
+reloads every stale client at once.
 
 Admin routes (enabled by `ServerConfig::admin_secret`, header
 `x-game-admin-secret`): `POST /admin/transfer`, `/admin/child-event`,

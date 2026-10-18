@@ -66,7 +66,9 @@ pub use ticket::{
     VerifiedTicket,
 };
 pub use transfer::{TransferOp, TransferRegistry};
-pub use world::{BarrierParticipant, RemoteHost, RolloutError, RolloutReport, WorldCoordinator};
+pub use world::{
+    AbortNotes, BarrierParticipant, RemoteHost, RolloutError, RolloutReport, WorldCoordinator,
+};
 
 use crate::clock::{Clock, SystemClock};
 use crate::facts::{fact_channel, spawn_fact_worker, FactQueue, FactSink, RetryPolicy};
@@ -78,8 +80,8 @@ use crate::protocol::{error, kick, ClientMessage, Notice, ServerMessage, PROTOCO
 use crate::rng::ZoneRng;
 use crate::world::{
     BarrierMode, ChildEvent, DottedTopology, FreezeState, HostAddr, LocalOwnership, OwnershipError,
-    StateError, StoredZoneState, ZoneClaim, ZoneDirectory, ZoneOwnership, ZoneStateStore,
-    ZoneTopology,
+    StalePolicy, StateError, StoredZoneState, ZoneClaim, ZoneDirectory, ZoneOwnership,
+    ZoneStateStore, ZoneTopology,
 };
 use crate::zone::{ClientId, TicketClaims, Tier, Zone};
 
@@ -1359,7 +1361,11 @@ fn handle_cmd<Z: Zone>(
                     notes,
                 });
             }
-            if mode == BarrierMode::Hard {
+            // Hard reloads every stale client; Rolling reloads the ones
+            // already inside a safe-room gate (they will not walk into one).
+            let gate = host.zone().is_gate()
+                && matches!(host.config().stale_policy, StalePolicy::SafeRoom { .. });
+            if mode == BarrierMode::Hard || gate {
                 host.reload_stale_players();
             }
             freeze_acks.clear();

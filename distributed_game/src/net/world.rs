@@ -22,11 +22,16 @@
 //!    delay with [`Zone::freeze_ready`]). Zones
 //!    activated during the barrier start frozen.
 //! 2. if every host acknowledged within the timeout, the `apply` callback
-//!    installs the new content; then **commit**: every zone switches to the
-//!    new version and resumes (`Resume{version, notes}`).
+//!    installs the new content (sync, or awaited with
+//!    [`WorldCoordinator::rollout_async`] — zones stay frozen meanwhile);
+//!    then **commit**: every zone switches to the new version and resumes
+//!    (`Resume{version, notes}`). A **rolling** commit also reloads stale
+//!    clients already inside a safe-room gate ([`Zone::is_gate`] under
+//!    `StalePolicy::SafeRoom`): they reached a safe point, so they reload
+//!    there instead of waiting to walk into another gate.
 //!
 //! Any missing ack (or a failed `apply`) **aborts**: every zone resumes on
-//! the old version. No zone ever simulates the new version while another
+//! the old version with [`AbortNotes`] ([`WorldCoordinator::with_abort_notes`]). No zone ever simulates the new version while another
 //! still simulates the old one outside the barrier: nothing resumes before
 //! every zone is frozen.
 
@@ -409,11 +414,31 @@ pub enum RolloutError {
     ApplyFailed(String),
 }
 
+/// Notes sent with `Resume` when a rollout aborts
+/// ([`WorldCoordinator::with_abort_notes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbortNotes {
+    /// A zone or host did not acknowledge the freeze in time.
+    pub not_acked: String,
+    /// The `apply` callback failed; `{error}` is replaced by its message.
+    pub apply_failed: String,
+}
+
+impl Default for AbortNotes {
+    fn default() -> Self {
+        Self {
+            not_acked: "rollout aborted: freeze not acknowledged".into(),
+            apply_failed: "rollout aborted: apply failed".into(),
+        }
+    }
+}
+
 /// Runs content-version barriers across every participant of one world.
 pub struct WorldCoordinator {
     participants: Vec<Arc<dyn BarrierParticipant>>,
     ack_timeout: Duration,
     next: AtomicU64,
+    abort_notes: AbortNotes,
 }
 
 impl WorldCoordinator {
@@ -423,7 +448,16 @@ impl WorldCoordinator {
             participants: Vec::new(),
             ack_timeout,
             next: AtomicU64::new(1),
+            abort_notes: AbortNotes::default(),
         }
+    }
+
+    /// Notes clients see in `Resume(content_update_aborted)` when a rollout
+    /// aborts (defaults: "rollout aborted: freeze not acknowledged" /
+    /// "rollout aborted: apply failed").
+    pub fn with_abort_notes(mut self, notes: AbortNotes) -> Self {
+        self.abort_notes = notes;
+        self
     }
 
     /// Add a participant.
@@ -434,7 +468,8 @@ impl WorldCoordinator {
 
     /// Freeze everything, `apply(version)`, resume everything on `version`;
     /// abort (resume on the old version) if any zone fails to acknowledge
-    /// or `apply` fails.
+    /// or `apply` fails. Synchronous `apply`; see
+    /// [`rollout_async`](Self::rollout_async) for one that awaits.
     pub async fn rollout(
         &self,
         version: &str,
@@ -442,6 +477,27 @@ impl WorldCoordinator {
         mode: BarrierMode,
         apply: impl FnOnce(&str) -> Result<(), String>,
     ) -> Result<RolloutReport, RolloutError> {
+        self.rollout_async(version, notes, mode, |v: String| {
+            let result = apply(&v);
+            std::future::ready(result)
+        })
+        .await
+    }
+
+    /// [`rollout`](Self::rollout) with an async `apply(version)`, awaited
+    /// while every zone is frozen (e.g. staging a content pack, so clients
+    /// see an "applying update" pause). Nothing resumes before it returns.
+    pub async fn rollout_async<F, Fut>(
+        &self,
+        version: &str,
+        notes: &str,
+        mode: BarrierMode,
+        apply: F,
+    ) -> Result<RolloutReport, RolloutError>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
         let barrier = (unix_now() << 20) ^ self.next.fetch_add(1, Ordering::Relaxed);
         let notice = Notice {
             reason: "content_update".into(),
@@ -465,13 +521,12 @@ impl WorldCoordinator {
         }
         if !missing.is_empty() {
             missing.sort();
-            self.abort_all(barrier, "rollout aborted: freeze not acknowledged")
-                .await;
+            self.abort_all(barrier, &self.abort_notes.not_acked).await;
             return Err(RolloutError::NotAcked(missing));
         }
-        if let Err(e) = apply(version) {
-            self.abort_all(barrier, "rollout aborted: apply failed")
-                .await;
+        if let Err(e) = apply(version.to_string()).await {
+            let notes = self.abort_notes.apply_failed.replace("{error}", &e);
+            self.abort_all(barrier, &notes).await;
             return Err(RolloutError::ApplyFailed(e));
         }
         let mut commit_errors = Vec::new();
