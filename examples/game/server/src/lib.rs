@@ -8,3 +8,4 @@
 
 pub mod arena;
 pub mod common;
+pub mod mobpit;
