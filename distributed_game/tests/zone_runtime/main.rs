@@ -594,3 +594,79 @@ fn boot_epoch_defaults_to_wall_clock_and_can_be_pinned() {
         "kill:z1:42:7:m"
     );
 }
+
+/// Sink where keys starting with `slow` take `delay`; records completion order.
+struct LaggySink {
+    delay: Duration,
+    done: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl FactSink for LaggySink {
+    fn commit<'a>(
+        &'a self,
+        fact: &'a Fact,
+    ) -> distributed_game::BoxFuture<'a, Result<FactReceipt, FactError>> {
+        Box::pin(async move {
+            if fact.key().starts_with("slow") {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.done.lock().unwrap().push(fact.key().to_string());
+            Ok(FactReceipt {
+                payload: serde_json::Value::Null,
+                replayed: false,
+            })
+        })
+    }
+}
+
+async fn commit_order(concurrency: usize) -> Vec<String> {
+    let done = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (mut queue, feed) = fact_channel(16, RetryPolicy::default());
+    let worker = tokio::spawn(feed.with_max_concurrent_commits(concurrency).run(
+        LaggySink {
+            delay: MS(300),
+            done: done.clone(),
+        },
+        tokio::time::sleep,
+    ));
+    let fact = |key: &str, principal: &str| {
+        Fact::trusted(
+            key,
+            "cmd",
+            serde_json::Value::Null,
+            Some(principal.into()),
+            Default::default(),
+        )
+    };
+    queue.try_send(fact("slow-a1", "alice")).unwrap();
+    queue.try_send(fact("fast-a2", "alice")).unwrap();
+    queue.try_send(fact("fast-b1", "bob")).unwrap();
+    queue.try_send(fact("fast-c1", "carol")).unwrap();
+    let started = Instant::now();
+    while queue.in_flight() > 0 {
+        queue.drain();
+        assert!(started.elapsed() < Duration::from_secs(5), "settles");
+        tokio::time::sleep(MS(5)).await;
+    }
+    drop(queue);
+    worker.await.unwrap();
+    let order = done.lock().unwrap().clone();
+    order
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_commits_do_not_block_other_principals_and_keep_lane_order() {
+    // Default: strict emission order, the slow commit blocks everyone.
+    assert_eq!(
+        commit_order(1).await,
+        vec!["slow-a1", "fast-a2", "fast-b1", "fast-c1"]
+    );
+    // Concurrency: bob and carol overtake; alice's second fact waits for
+    // her first (same principal lane).
+    let order = commit_order(4).await;
+    assert_eq!(order.len(), 4);
+    let pos = |k: &str| order.iter().position(|o| o == k).unwrap();
+    assert!(pos("fast-b1") < pos("slow-a1"), "{order:?}");
+    assert!(pos("fast-c1") < pos("slow-a1"), "{order:?}");
+    assert!(pos("slow-a1") < pos("fast-a2"), "{order:?}");
+}

@@ -205,6 +205,11 @@ pub struct ServerConfig {
     pub admin_secret: Option<String>,
     /// Peer (host-to-host) request timeout.
     pub peer_timeout: Duration,
+    /// Fact commits each zone's worker may run at once (default 1 = strict
+    /// emission order). Above 1, facts of one principal stay sequential and
+    /// different principals overlap (see [`crate::facts`]). Read by
+    /// [`GameServer::with_fact_sink`].
+    pub max_concurrent_commits: usize,
 }
 
 impl ServerConfig {
@@ -235,6 +240,7 @@ impl ServerConfig {
             settle_timeout: Duration::from_secs(2),
             admin_secret: None,
             peer_timeout: Duration::from_secs(3),
+            max_concurrent_commits: 1,
         }
     }
 }
@@ -581,8 +587,10 @@ where
     ) -> Self {
         let sink = Arc::new(sink);
         let inner = Arc::get_mut(&mut self.inner).expect("configure before sharing the server");
+        let concurrency = inner.config.max_concurrent_commits;
         inner.facts = Some(Box::new(move |_zone: &str| {
             let (queue, feed) = fact_channel(capacity, policy);
+            let feed = feed.with_max_concurrent_commits(concurrency);
             let worker = spawn_fact_worker(feed, sink.clone());
             Some((queue, worker))
         }));

@@ -117,6 +117,14 @@ double-crediting. A custom sink needs only crate-root imports:
 (`BoxFuture` is also re-exported from `world` and `net` for
 `ZoneOwnership` / `BarrierParticipant` impls).
 
+**Throughput.** One worker per zone commits facts in emission order, one at
+a time (a slow commit delays every later fact). Set
+`ServerConfig::max_concurrent_commits` (or
+`FactFeed::with_max_concurrent_commits`) above 1 to overlap commits in
+**per-principal lanes**: a principal's facts (and, separately, zone facts
+without a principal) stay sequential in emission order; different
+principals commit concurrently; settlements arrive in completion order.
+
 ## Netcode and operations
 
 - **Admission tickets** (`net`): by default join tickets are HS256 JWTs

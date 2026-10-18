@@ -18,6 +18,16 @@
 //!   replay (the cell adapter maps it onto `dispatch_idempotent`).
 //! - Trusted identity: the principal is bound by the host from the player's
 //!   verified ticket — zones and clients cannot set it.
+//!
+//! Ordering: by default (`max_concurrent_commits = 1`) one worker commits
+//! facts strictly in emission order, one at a time, so a slow commit delays
+//! every later fact. With [`FactFeed::with_max_concurrent_commits`]`(n > 1)`
+//! up to `n` commits run at once, in **lanes by principal**: facts of the
+//! same principal (and, separately, all zone/system facts without one) are
+//! still committed one at a time in emission order, while facts of
+//! different principals overlap. A key is never in flight twice (the queue
+//! refuses duplicates), so per-key order always holds. Settlements arrive
+//! in completion order.
 
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
@@ -249,6 +259,7 @@ pub struct FactFeed {
     shared: Arc<Shared>,
     settlements: mpsc::Sender<FactSettlement>,
     policy: RetryPolicy,
+    max_concurrent: usize,
 }
 
 /// Create a queue allowing `capacity` unsettled facts.
@@ -267,6 +278,7 @@ pub fn fact_channel(capacity: usize, policy: RetryPolicy) -> (FactQueue, FactFee
             shared,
             settlements: tx,
             policy,
+            max_concurrent: 1,
         },
     )
 }
@@ -388,7 +400,21 @@ impl Future for NextFact<'_> {
 }
 
 impl FactFeed {
-    /// Commit facts in emission order until the queue is dropped and drained.
+    /// Allow up to `n` commits at once (default 1: strict emission order).
+    /// Facts of one principal stay sequential; see the module docs.
+    pub fn with_max_concurrent_commits(mut self, n: usize) -> Self {
+        self.max_concurrent = n.max(1);
+        self
+    }
+
+    /// Commits allowed at once.
+    pub fn max_concurrent_commits(&self) -> usize {
+        self.max_concurrent
+    }
+
+    /// Commit facts until the queue is dropped and drained: in emission
+    /// order, or with bounded concurrency in per-principal lanes
+    /// ([`with_max_concurrent_commits`](Self::with_max_concurrent_commits)).
     /// `sleep` provides the runtime's timer for backoff.
     pub async fn run<S, F, Fut>(self, sink: S, sleep: F)
     where
@@ -396,24 +422,124 @@ impl FactFeed {
         F: Fn(Duration) -> Fut,
         Fut: Future<Output = ()>,
     {
-        while let Some(fact) = NextFact(&self.shared).await {
-            let mut attempts = 0;
-            let outcome = loop {
-                attempts += 1;
-                match sink.commit(&fact).await {
-                    Ok(receipt) => break FactOutcome::Committed(receipt),
-                    Err(FactError::Retryable(_)) if attempts < self.policy.max_attempts.max(1) => {
-                        sleep(self.policy.backoff(attempts)).await;
-                    }
-                    Err(error) => break FactOutcome::Failed { error, attempts },
-                }
-            };
-            let _ = self.settlements.send(FactSettlement {
-                key: fact.key,
-                command: fact.command,
-                outcome,
-            });
+        let policy = self.policy;
+        if self.max_concurrent <= 1 {
+            while let Some(fact) = NextFact(&self.shared).await {
+                let settlement = commit_with_retries(&sink, fact, policy, &sleep).await;
+                let _ = self.settlements.send(settlement);
+            }
+            return;
         }
+        let start = |fact: Fact| Box::pin(commit_with_retries(&sink, fact, policy, &sleep));
+        Pump {
+            shared: &self.shared,
+            settlements: &self.settlements,
+            limit: self.max_concurrent,
+            start,
+            waiting: VecDeque::new(),
+            active: Vec::new(),
+        }
+        .await;
+    }
+}
+
+async fn commit_with_retries<S, F, Fut>(
+    sink: &S,
+    fact: Fact,
+    policy: RetryPolicy,
+    sleep: &F,
+) -> FactSettlement
+where
+    S: FactSink,
+    F: Fn(Duration) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut attempts = 0;
+    let outcome = loop {
+        attempts += 1;
+        match sink.commit(&fact).await {
+            Ok(receipt) => break FactOutcome::Committed(receipt),
+            Err(FactError::Retryable(_)) if attempts < policy.max_attempts.max(1) => {
+                sleep(policy.backoff(attempts)).await;
+            }
+            Err(error) => break FactOutcome::Failed { error, attempts },
+        }
+    };
+    FactSettlement {
+        key: fact.key,
+        command: fact.command,
+        outcome,
+    }
+}
+
+/// Concurrent commit driver: at most `limit` commits in flight, one per
+/// principal lane, admitted in emission order.
+struct Pump<'a, T, M> {
+    shared: &'a Shared,
+    settlements: &'a mpsc::Sender<FactSettlement>,
+    limit: usize,
+    start: M,
+    waiting: VecDeque<Fact>,
+    active: Vec<(Option<String>, Pin<Box<T>>)>,
+}
+
+impl<T, M> Future for Pump<'_, T, M>
+where
+    T: Future<Output = FactSettlement>,
+    M: FnMut(Fact) -> Pin<Box<T>> + Unpin,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        // Register before checking so a concurrent push cannot be missed.
+        *this.shared.waker.lock().expect("waker lock") = Some(cx.waker().clone());
+        loop {
+            this.waiting
+                .extend(this.shared.queue.lock().expect("fact queue lock").drain(..));
+            // Admit in order; a lane is blocked by an active commit or by an
+            // earlier waiting fact of the same lane.
+            let mut blocked: HashSet<Option<String>> =
+                this.active.iter().map(|(lane, _)| lane.clone()).collect();
+            let mut i = 0;
+            while i < this.waiting.len() && this.active.len() < this.limit {
+                let lane = this.waiting[i].principal.clone();
+                if blocked.contains(&lane) {
+                    i += 1;
+                    continue;
+                }
+                let fact = this.waiting.remove(i).expect("index in range");
+                blocked.insert(lane.clone());
+                this.active.push((lane, (this.start)(fact)));
+            }
+            let mut progressed = false;
+            let mut j = 0;
+            while j < this.active.len() {
+                match this.active[j].1.as_mut().poll(cx) {
+                    Poll::Ready(settlement) => {
+                        let _ = this.settlements.send(settlement);
+                        this.active.remove(j);
+                        progressed = true;
+                    }
+                    Poll::Pending => j += 1,
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        let drained = this.active.is_empty()
+            && this.waiting.is_empty()
+            && this
+                .shared
+                .queue
+                .lock()
+                .expect("fact queue lock")
+                .is_empty();
+        if drained && this.shared.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(());
+        }
+        Poll::Pending
     }
 }
 
