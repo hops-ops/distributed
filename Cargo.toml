@@ -1,5 +1,5 @@
 [workspace]
-members = ["distributed_macros", "distributed_cli"]
+members = ["distributed_macros", "distributed_cli", "distributed_game"]
 exclude = ["tests/e2e-ui", "tests/celld/worker", "tests/celld/relay-worker"]
 resolver = "2"
 
