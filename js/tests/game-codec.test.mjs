@@ -196,6 +196,8 @@ function messageFromJson(decoded, schema) {
 		case 'Kick':
 		case 'Error':
 			return { type: decoded.type, code: decoded.code, message: decoded.message };
+		case 'Redirect':
+			return { type: 'Redirect', zoneId: decoded.zone_id, url: decoded.url };
 	}
 	throw new Error(`unhandled ${decoded.type} (${schema})`);
 }
@@ -276,6 +278,8 @@ function messageToJson(message, kinds) {
 		case 'Kick':
 		case 'Error':
 			return { code: message.code, message: message.message, type: message.type };
+		case 'Redirect':
+			return { type: 'Redirect', url: message.url, zone_id: message.zoneId };
 	}
 }
 
@@ -361,10 +365,23 @@ test('quantization reproduces the Rust integers and binary32 results exactly', (
 	}
 });
 
-test('every message fixture encodes and decodes byte-exactly', () => {
+/**
+ * Rust fixtures plus the additive v1 messages (Redirect, Kick RELOAD) copied
+ * from the world branch until it is merged; the Rust file wins once present.
+ */
+function allMessages() {
 	const { messages } = fixture('messages.json');
+	const extra = JSON.parse(
+		readFileSync(new URL('./fixtures/game-world-messages.json', import.meta.url), 'utf8')
+	).messages;
+	const names = new Set(messages.map((m) => m.name));
+	return [...messages, ...extra.filter((m) => !names.has(m.name))];
+}
+
+test('every message fixture encodes and decodes byte-exactly', () => {
+	const messages = allMessages();
 	const names = messages.map((m) => m.name);
-	for (const required of ['hello', 'hello_reconnect', 'input', 'ping', 'leave', 'welcome', 'delta', 'delta_empty', 'event', 'pong', 'freeze', 'resume', 'handoff', 'kick', 'error']) {
+	for (const required of ['hello', 'hello_reconnect', 'input', 'ping', 'leave', 'welcome', 'delta', 'delta_empty', 'event', 'pong', 'freeze', 'resume', 'handoff', 'kick', 'error', 'kick_reload', 'redirect']) {
 		assert.ok(names.includes(required), `fixture ${required}`);
 	}
 	for (const entry of messages) {

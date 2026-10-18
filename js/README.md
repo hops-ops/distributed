@@ -604,7 +604,14 @@ sampled at `serverNow − interpolationDelay` (two patch intervals by default),
 with the controlled entity at its predicted state. Reconciliation rebases on
 every Delta's `ack_seq`; per-field `ease`, `snap` or `replace` resolves the
 divergence. A server Handoff connects to the target zone with the transfer
-ticket and swaps authority while the previous world keeps rendering.
+ticket (following `Redirect`s) and swaps authority while the previous world
+keeps rendering; if the target refuses or stays silent the same Hello goes
+back to the source zone, then a fresh ticket. `Kick(RELOAD)` and handshake
+`VERSION_MISMATCH` emit `reloadRequired`; supply `reloadContent` (or call
+`connection.resumeAfterReload(version)`) to rejoin with the new content.
+`encodeInput(input, ctx)` receives the interpolation delay and view tick for
+server-side lag compensation (`replica.interpolationDelayMs`,
+`client.inputContext()`).
 
 ## Protocol and security boundaries
 

@@ -65,8 +65,12 @@ export type ControlledEntityResolver = (
 
 export type GamePredictionOptions<TInput> = PredictorOptions<TInput> &
 	Readonly<{
-		/** Encode an input to its game-defined payload bytes. */
-		encodeInput(input: TInput): Uint8Array;
+		/**
+		 * Encode an input to its game-defined payload bytes. `context`
+		 * carries the interpolation delay / view tick the player is looking
+		 * at, for server-side lag compensation.
+		 */
+		encodeInput(input: TInput, context: GameInputContext): Uint8Array;
 		/**
 		 * Which entity the player controls in a zone. Re-evaluated on every
 		 * authoritative Delta until it returns an id; `setControlledEntity`
@@ -74,6 +78,17 @@ export type GamePredictionOptions<TInput> = PredictorOptions<TInput> &
 		 */
 		controlledEntity?: ControlledEntityResolver;
 	}>;
+
+/** What the player sees when an input is sampled (lag compensation). */
+export type GameInputContext = Readonly<{
+	zoneId: string;
+	/** Render delay behind the server clock (ms). */
+	interpolationDelayMs: number;
+	/** Server tick of the interpolated world being rendered. */
+	viewTick: number;
+	/** Estimated current server tick (also sent as Input.client_tick). */
+	clientTick: number;
+}>;
 
 export type GameClientOptions<TInput> = Readonly<{
 	/** WebSocket URL for a zone, e.g. `(z) => \`wss://game.example/zones/${z}\``. */
@@ -97,6 +112,10 @@ export type GameClientOptions<TInput> = Readonly<{
 	staleGraceMs?: number;
 	historyMs?: number;
 	prediction?: GamePredictionOptions<TInput>;
+	/** Give up on a handoff target without a Welcome after this long (default 10000 ms). */
+	handoffTimeoutMs?: number;
+	/** Called on content reload requests from any zone (see GameConnection). */
+	reloadContent?: GameConnectionOptions['reloadContent'];
 	/** After a handoff, keep the previous zone rendered this long once the target delivered its first Delta. Default 500 ms. */
 	handoffRetainMs?: number;
 	/** Default input dt (ms) when `sendInput` omits it. Default: 1000 / tickRate. */
@@ -115,6 +134,8 @@ export type GameClientEvents = {
 	error: [string, ErrorMessage];
 	handoff: [{ from: string; to: string; message: HandoffMessage }];
 	handoffComplete: [{ from: string; to: string }];
+	handoffFailed: [{ from: string; to: string; stage: 'target' | 'return'; reason: string }];
+	reloadRequired: [string, import('./connection.js').GameReloadRequest];
 	correction: [Correction];
 	zoneClosed: [string, GameCloseInfo];
 };
@@ -217,11 +238,25 @@ export class GameClient<TInput = unknown> {
 		if (authority === undefined || prediction === undefined) return undefined;
 		const connection = authority.connection;
 		if (!connection.canSendInput()) return undefined;
-		const seq = connection.sendInput(prediction.encodeInput(input));
+		const context = this.inputContext(authority)!;
+		const seq = connection.sendInput(prediction.encodeInput(input, context), context.clientTick);
 		if (seq === undefined) return undefined;
 		const tickRate = connection.welcome?.tickRate || 30;
 		this.#predictor!.record(seq, input, dtMs ?? this.#options.inputDtMs ?? 1000 / tickRate);
 		return seq;
+	}
+
+	/** Interpolation delay and view tick for inputs sampled now. */
+	inputContext(zone: GameZoneView | undefined = this.#authority): GameInputContext | undefined {
+		if (zone === undefined) return undefined;
+		const delay = this.interpolationDelay(zone);
+		const serverNow = zone.connection.serverNow();
+		return {
+			zoneId: zone.zoneId,
+			interpolationDelayMs: delay,
+			viewTick: zone.connection.tickAt(serverNow - delay),
+			clientTick: zone.connection.tickAt(serverNow)
+		};
 	}
 
 	/** Send raw input bytes (no prediction). */
@@ -250,7 +285,9 @@ export class GameClient<TInput = unknown> {
 		const controlled =
 			predictor?.active === true && this.#authority !== undefined ? predictor.entityId : undefined;
 		for (const zone of this.zones()) {
-			const renderTime = zone.connection.serverNow() - this.interpolationDelay(zone);
+			const delay = this.interpolationDelay(zone);
+			zone.replica.interpolationDelayMs = delay;
+			const renderTime = zone.connection.serverNow() - delay;
 			const authoritative = zone === this.#authority;
 			for (const entity of zone.replica.sample(renderTime)) {
 				const isControlled = authoritative && entity.id === controlled && !entity.stale;
@@ -292,6 +329,7 @@ export class GameClient<TInput = unknown> {
 			scheduler: this.#scheduler,
 			reconnect: o.reconnect,
 			pingIntervalMs: o.pingIntervalMs,
+			reloadContent: o.reloadContent,
 			onListenerError: o.onListenerError
 		};
 	}
@@ -335,6 +373,7 @@ export class GameClient<TInput = unknown> {
 		zone.offs.push(
 			c.on('welcome', (welcome) => {
 				zone.replica.reset(welcome.schema, c.serverNow());
+				zone.replica.interpolationDelayMs = this.interpolationDelay(zone);
 				zone.firstDeltaSeen = false;
 				if (zone === this.#authority) {
 					this.#predictor?.resetSession();
@@ -350,6 +389,7 @@ export class GameClient<TInput = unknown> {
 			c.on('kick', (m) => this.#emitter.emit('kick', zone.zoneId, m)),
 			c.on('error', (m) => this.#emitter.emit('error', zone.zoneId, m)),
 			c.on('handoff', (m) => this.#onHandoff(zone, m)),
+			c.on('reloadRequired', (r) => this.#emitter.emit('reloadRequired', zone.zoneId, r)),
 			c.on('close', (info) => {
 				this.#emitter.emit('zoneClosed', zone.zoneId, info);
 			})
@@ -412,15 +452,63 @@ export class GameClient<TInput = unknown> {
 		this.#emitter.emit('handoff', { from, to, message });
 		this.#controlledOverride = undefined;
 		this.#predictor?.bind(undefined);
-		const target = this.#adopt(to, 'authority', message.transferTicket);
-		this.#authority = target;
 		// Keep rendering the old zone until the new authority has content.
 		this.#retire(zone, true);
-		const off = target.connection.on('delta', () => {
-			off();
-			this.#emitter.emit('handoffComplete', { from, to });
-		});
-		void target.connection.connect().catch(() => undefined);
+		this.#attemptHandoff(from, to, message.transferTicket, 'target');
+	}
+
+	/**
+	 * Connect to `zoneId` as authority presenting the transfer ticket. If the
+	 * target refuses (Error before Welcome, close, or timeout) send the same
+	 * Hello back to the source zone (§8.1 return path); if that fails too,
+	 * rejoin the source with a fresh ticket from the app.
+	 */
+	#attemptHandoff(from: string, to: string, ticket: string, stage: 'target' | 'return'): void {
+		const zoneId = stage === 'target' ? to : from;
+		const target = this.#adopt(zoneId, 'authority', ticket);
+		this.#authority = target;
+		const connection = target.connection;
+		let done = false;
+		const offs: (() => void)[] = [];
+		const finish = () => {
+			done = true;
+			this.#scheduler.clearTimeout(timer);
+			for (const off of offs) off();
+		};
+		const fail = (reason: string) => {
+			if (done) return;
+			finish();
+			if (this.#closed || this.#authority !== target) return;
+			this.#emitter.emit('handoffFailed', { from, to, stage, reason });
+			connection.close({ leave: false });
+			// Keep the zone's replica rendering while the next attempt runs.
+			this.#retire(target, true);
+			if (stage === 'target') {
+				this.#attemptHandoff(from, to, ticket, 'return');
+			} else {
+				this.#authority = this.#adopt(from, 'authority');
+				void this.#authority.connection.connect().catch(() => undefined);
+			}
+		};
+		const timer = this.#scheduler.setTimeout(
+			() => fail('timeout'),
+			this.#options.handoffTimeoutMs ?? 10_000
+		);
+		offs.push(
+			connection.on('welcome', () => {
+				if (done) return;
+				finish();
+				const off = connection.on('delta', () => {
+					off();
+					this.#emitter.emit('handoffComplete', { from, to: zoneId });
+				});
+			}),
+			connection.on('error', (error) => {
+				if (connection.welcome === undefined) fail(`error ${error.code}: ${error.message}`);
+			}),
+			connection.on('close', (info) => fail(`closed: ${info.reason}`))
+		);
+		void connection.connect().catch(() => undefined);
 	}
 
 	#retire(zone: Zone, keepRendering: boolean): void {

@@ -67,6 +67,7 @@ export {
 	type NoticeFields,
 	type PingMessage,
 	type PongMessage,
+	type RedirectMessage,
 	type ResumeMessage,
 	type WelcomeMessage
 } from './messages.js';
@@ -81,6 +82,7 @@ export {
 	type GameConnectionOptions,
 	type GameConnectionState,
 	type GameReconnectOptions,
+	type GameReloadRequest,
 	type GameScheduler,
 	type GameSocket,
 	type GameSocketFactory,
@@ -114,6 +116,7 @@ export {
 	type ControlledEntityResolver,
 	type GameClientEvents,
 	type GameClientOptions,
+	type GameInputContext,
 	type GamePredictionOptions,
 	type GameZoneView,
 	type RenderedEntity,

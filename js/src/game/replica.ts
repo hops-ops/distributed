@@ -106,6 +106,13 @@ export class EntityReplica {
 		};
 	}
 
+	/**
+	 * Render delay (ms) behind the server clock this replica is sampled at.
+	 * Maintained by `GameClient`; games include it (or the matching view
+	 * tick) in input payloads so the server can lag-compensate.
+	 */
+	interpolationDelayMs: number | undefined;
+
 	get schema(): GameSchema | undefined {
 		return this.#schema;
 	}

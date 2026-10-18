@@ -13,6 +13,7 @@ import {
 	GAME_PROTOCOL_VERSION,
 	GameClientMirror,
 	GameErrorCode,
+	GameKickCode,
 	type DeltaMessage,
 	type ErrorMessage,
 	type EventMessage,
@@ -22,6 +23,7 @@ import {
 	type GameServerMessage,
 	type HandoffMessage,
 	type KickMessage,
+	type RedirectMessage,
 	type ResumeMessage,
 	type WelcomeMessage
 } from './messages.js';
@@ -94,10 +96,37 @@ export type GameConnectionOptions = Readonly<{
 	/** Ping cadence while open (default 1000 ms; first ping right after Welcome). */
 	pingIntervalMs?: number;
 	clock?: ClockSyncOptions;
+	/** Consecutive Redirects followed before giving up (default 3). */
+	maxRedirects?: number;
+	/**
+	 * Called when the server requires a content reload (`Kick(RELOAD)` or a
+	 * handshake `Error(VERSION_MISMATCH)`). Load content for `version` and
+	 * return the content version now running; the connection then resumes
+	 * (reconnect token within the grace window, else a fresh ticket). Without
+	 * it the connection waits in `reload-required` until
+	 * `resumeAfterReload()` is called.
+	 */
+	reloadContent?: (request: GameReloadRequest) => string | Promise<string>;
 	onListenerError?: (error: unknown) => void;
 }>;
 
-export type GameConnectionState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
+export type GameReloadRequest = Readonly<{
+	/**
+	 * Content version to load: the last Resume's version, else the last
+	 * Welcome's `content_version` (undefined if never welcomed).
+	 */
+	version: string | undefined;
+	reason: 'kick' | 'version-mismatch';
+	message: string;
+}>;
+
+export type GameConnectionState =
+	| 'idle'
+	| 'connecting'
+	| 'open'
+	| 'reconnecting'
+	| 'reload-required'
+	| 'closed';
 
 export type GameCloseReason =
 	| 'client'
@@ -105,6 +134,7 @@ export type GameCloseReason =
 	| 'handoff'
 	| 'rejected'
 	| 'reconnect-exhausted'
+	| 'too-many-redirects'
 	| 'connect-failed';
 
 export type GameCloseInfo = Readonly<{
@@ -129,6 +159,8 @@ export type GameConnectionEvents = {
 	handoff: [HandoffMessage];
 	kick: [KickMessage];
 	error: [ErrorMessage];
+	redirect: [RedirectMessage];
+	reloadRequired: [GameReloadRequest];
 	pong: [{ rtt: number; offset: number; jitter: number }];
 	state: [GameConnectionState];
 	disconnect: [{ code?: number; reason?: string }];
@@ -136,13 +168,20 @@ export type GameConnectionEvents = {
 	close: [GameCloseInfo];
 };
 
-type Attempt = { socket: GameSocket; mode: 'fresh' | 'resume'; welcomed: boolean };
+type Attempt = {
+	socket: GameSocket;
+	mode: 'fresh' | 'resume';
+	welcomed: boolean;
+	ticket: string;
+	token: string;
+	redirect?: string;
+	reload?: GameReloadRequest;
+};
 
 const defaultBackoff = (attempt: number): number => Math.min(5000, 250 * 2 ** (attempt - 1));
 
 export class GameConnection {
 	readonly zoneId: string;
-	readonly url: string;
 	readonly clock: ClockSync;
 	readonly mirror = new GameClientMirror();
 
@@ -154,6 +193,11 @@ export class GameConnection {
 	readonly #pingIntervalMs: number;
 
 	#state: GameConnectionState = 'idle';
+	readonly #baseUrl: string;
+	#url: string;
+	#contentVersion: string;
+	#redirects = 0;
+	#lastResumeVersion: string | undefined;
 	#attempt: Attempt | undefined;
 	#initialTicket: string | undefined;
 	#reconnectToken = '';
@@ -171,7 +215,9 @@ export class GameConnection {
 	constructor(options: GameConnectionOptions) {
 		this.#options = options;
 		this.zoneId = options.zoneId;
-		this.url = options.url;
+		this.#baseUrl = options.url;
+		this.#url = options.url;
+		this.#contentVersion = options.contentVersion ?? '';
 		this.#initialTicket = options.initialTicket;
 		this.#scheduler = options.scheduler ?? defaultScheduler;
 		const factory =
@@ -193,6 +239,16 @@ export class GameConnection {
 					};
 		this.#pingIntervalMs = options.pingIntervalMs ?? 1000;
 		this.clock = new ClockSync(options.clock);
+	}
+
+	/** URL of the current (possibly redirected) zone host. */
+	get url(): string {
+		return this.#url;
+	}
+
+	/** Content version sent in Hello. */
+	get contentVersion(): string {
+		return this.#contentVersion;
 	}
 
 	get state(): GameConnectionState {
@@ -256,6 +312,14 @@ export class GameConnection {
 		return w.serverTime + (diff * 1000) / w.tickRate;
 	}
 
+	/** Server tick (u32, wrapping) whose state belongs to server time `serverTime`. */
+	tickAt(serverTime: number): number {
+		const w = this.mirror.welcome;
+		if (w === undefined) return 0;
+		const ticks = Math.floor(((serverTime - w.serverTime) * w.tickRate) / 1000);
+		return (w.serverTick + ticks) >>> 0;
+	}
+
 	/** Estimated server tick at the current server time (wraps at 2^32). */
 	estimatedServerTick(): number {
 		const w = this.mirror.welcome;
@@ -315,6 +379,18 @@ export class GameConnection {
 		this.#finish({ reason: 'client' });
 	}
 
+	/**
+	 * Continue after a content reload (state `reload-required`): sends the
+	 * new `contentVersion` in Hello, with the reconnect token while the grace
+	 * window lasts, else with a fresh ticket.
+	 */
+	resumeAfterReload(contentVersion: string): void {
+		if (this.#state !== 'reload-required') return;
+		this.#contentVersion = contentVersion;
+		this.#setState(this.#welcomes === 0 ? 'connecting' : 'reconnecting');
+		void this.#open(this.#withinGrace() ? 'resume' : 'fresh');
+	}
+
 	/** Simulate an abrupt transport loss (tests, "airplane mode" toggles). */
 	dropTransport(): void {
 		this.#attempt?.socket.close(4000, 'dropped by client');
@@ -336,13 +412,16 @@ export class GameConnection {
 		}
 	}
 
-	async #open(mode: 'fresh' | 'resume'): Promise<void> {
-		let ticket = '';
-		if (mode === 'fresh') {
+	async #open(
+		mode: 'fresh' | 'resume',
+		reuse?: { ticket: string; token: string }
+	): Promise<void> {
+		let ticket = reuse?.ticket ?? '';
+		if (mode === 'fresh' && reuse === undefined) {
 			try {
 				if (this.#initialTicket !== undefined) {
+					// Kept until a Welcome: an unanswered Hello did not consume it.
 					ticket = this.#initialTicket;
-					this.#initialTicket = undefined;
 				} else {
 					ticket = await this.#options.ticket({
 						zoneId: this.zoneId,
@@ -357,15 +436,16 @@ export class GameConnection {
 			}
 			if (this.#state === 'closed') return;
 		}
-		const token = mode === 'resume' ? this.#reconnectToken : '';
+		const token = reuse?.token ?? (mode === 'resume' ? this.#reconnectToken : '');
+		if (reuse === undefined && mode === 'fresh') this.#url = this.#baseUrl;
 		let socket: GameSocket;
 		try {
-			socket = this.#socketFactory(this.url);
+			socket = this.#socketFactory(this.#url);
 		} catch (error) {
 			this.#attemptFailed(error);
 			return;
 		}
-		const attempt: Attempt = { socket, mode, welcomed: false };
+		const attempt: Attempt = { socket, mode, welcomed: false, ticket, token };
 		this.#attempt = attempt;
 		try {
 			socket.binaryType = 'arraybuffer';
@@ -377,7 +457,7 @@ export class GameConnection {
 			this.#send({
 				type: 'Hello',
 				protocolVersion: GAME_PROTOCOL_VERSION,
-				contentVersion: this.#options.contentVersion ?? '',
+				contentVersion: this.#contentVersion,
 				capabilities: this.#options.capabilities ?? 0,
 				ticket,
 				reconnectToken: token
@@ -439,6 +519,7 @@ export class GameConnection {
 				break;
 			case 'Resume':
 				this.#frozen = false;
+				this.#lastResumeVersion = message.version;
 				this.#emitter.emit('resume', message);
 				break;
 			case 'Handoff':
@@ -446,8 +527,21 @@ export class GameConnection {
 				this.#emitter.emit('handoff', message);
 				break;
 			case 'Kick':
-				this.#terminal = { reason: 'kick', code: message.code, message: message.message };
+				if (message.code === GameKickCode.RELOAD) {
+					// Not session-terminal: the player is held for the grace window.
+					attempt.reload = {
+						version: this.#lastResumeVersion ?? this.mirror.welcome?.contentVersion,
+						reason: 'kick',
+						message: message.message
+					};
+				} else {
+					this.#terminal = { reason: 'kick', code: message.code, message: message.message };
+				}
 				this.#emitter.emit('kick', message);
+				break;
+			case 'Redirect':
+				attempt.redirect = message.url;
+				this.#emitter.emit('redirect', message);
 				break;
 			case 'Error':
 				this.#onError(attempt, message);
@@ -459,6 +553,9 @@ export class GameConnection {
 		const reconnected = this.#welcomes > 0;
 		this.#welcomes += 1;
 		attempt.welcomed = true;
+		this.#redirects = 0;
+		this.#initialTicket = undefined;
+		this.#lastResumeVersion = undefined;
 		this.#failedAttempts = 0;
 		this.#disconnectedAt = undefined;
 		this.#reconnectToken = welcome.reconnectToken;
@@ -484,6 +581,14 @@ export class GameConnection {
 			this.#reconnectToken = '';
 			return;
 		}
+		if (error.code === GameErrorCode.VERSION_MISMATCH) {
+			attempt.reload = {
+				version: this.#lastResumeVersion ?? this.mirror.welcome?.contentVersion,
+				reason: 'version-mismatch',
+				message: error.message
+			};
+			return;
+		}
 		this.#terminal = { reason: 'rejected', code: error.code, message: error.message };
 	}
 
@@ -498,6 +603,21 @@ export class GameConnection {
 		if (attempt.welcomed) {
 			this.#disconnectedAt = this.#scheduler.now();
 			this.#failedAttempts = 0;
+		}
+		if (attempt.redirect !== undefined) {
+			this.#redirects += 1;
+			if (this.#redirects > (this.#options.maxRedirects ?? 3)) {
+				this.#finish({ reason: 'too-many-redirects', message: attempt.redirect });
+				return;
+			}
+			this.#url = attempt.redirect;
+			// Same Hello: the ticket was not consumed by the redirecting host.
+			void this.#open(attempt.mode, { ticket: attempt.ticket, token: attempt.token });
+			return;
+		}
+		if (attempt.reload !== undefined) {
+			this.#awaitReload(attempt.reload);
+			return;
 		}
 		if (this.#welcomes === 0 && this.#reconnect === undefined) {
 			this.#finish({ reason: 'connect-failed', code, message: reason });
@@ -528,12 +648,29 @@ export class GameConnection {
 		this.#retryTimer = this.#scheduler.setTimeout(() => {
 			this.#retryTimer = undefined;
 			if (this.#state === 'closed') return;
-			const withinGrace =
-				this.#reconnectToken !== '' &&
-				this.#disconnectedAt !== undefined &&
-				this.#scheduler.now() - this.#disconnectedAt < this.#reconnect!.graceMs;
-			void this.#open(withinGrace ? 'resume' : 'fresh');
+			void this.#open(this.#withinGrace() ? 'resume' : 'fresh');
 		}, delay);
+	}
+
+	#withinGrace(): boolean {
+		return (
+			this.#reconnectToken !== '' &&
+			this.#disconnectedAt !== undefined &&
+			this.#scheduler.now() - this.#disconnectedAt < (this.#reconnect?.graceMs ?? 15000)
+		);
+	}
+
+	#awaitReload(request: GameReloadRequest): void {
+		this.#setState('reload-required');
+		this.#emitter.emit('reloadRequired', request);
+		const reload = this.#options.reloadContent;
+		if (reload === undefined) return;
+		Promise.resolve()
+			.then(() => reload(request))
+			.then(
+				(version) => this.resumeAfterReload(version),
+				(error) => this.#finish({ reason: 'connect-failed', message: `reload failed: ${String(error)}` })
+			);
 	}
 
 	#startPing(): void {

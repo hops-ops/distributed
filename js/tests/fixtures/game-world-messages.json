@@ -1,0 +1,25 @@
+{
+  "source": "feat/v5-game-world:distributed_game/tests/fixtures/messages.json (additive v1 messages; drop once merged)",
+  "messages": [
+    {
+      "decoded": {
+        "code": 7,
+        "message": "content c2 required",
+        "type": "Kick"
+      },
+      "direction": "server_to_client",
+      "hex": "870713636f6e74656e74206332207265717569726564",
+      "name": "kick_reload"
+    },
+    {
+      "decoded": {
+        "type": "Redirect",
+        "url": "ws://10.0.0.2:2567/zones/realm.west",
+        "zone_id": "realm.west"
+      },
+      "direction": "server_to_client",
+      "hex": "890a7265616c6d2e776573742377733a2f2f31302e302e302e323a323536372f7a6f6e65732f7265616c6d2e77657374",
+      "name": "redirect"
+    }
+  ]
+}

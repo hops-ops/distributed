@@ -29,7 +29,8 @@ export const GameMessageTag = Object.freeze({
 	RESUME: 0x85,
 	HANDOFF: 0x86,
 	KICK: 0x87,
-	ERROR: 0x88
+	ERROR: 0x88,
+	REDIRECT: 0x89
 });
 
 /** Kick codes. */
@@ -39,7 +40,9 @@ export const GameKickCode = Object.freeze({
 	SHUTDOWN: 3,
 	RATE_LIMITED: 4,
 	ZONE_DISPOSED: 5,
-	SLOW_CONSUMER: 6
+	SLOW_CONSUMER: 6,
+	/** Not session-terminal: reload content, then reconnect with the token. */
+	RELOAD: 7
 });
 
 /** Error codes. */
@@ -117,6 +120,8 @@ export type HandoffMessage = Readonly<{
 }>;
 export type KickMessage = Readonly<{ type: 'Kick'; code: number; message: string }>;
 export type ErrorMessage = Readonly<{ type: 'Error'; code: number; message: string }>;
+/** This host does not own `zoneId`; resend the same Hello to `url`. */
+export type RedirectMessage = Readonly<{ type: 'Redirect'; zoneId: string; url: string }>;
 export type GameServerMessage =
 	| WelcomeMessage
 	| DeltaMessage
@@ -126,7 +131,8 @@ export type GameServerMessage =
 	| ResumeMessage
 	| HandoffMessage
 	| KickMessage
-	| ErrorMessage;
+	| ErrorMessage
+	| RedirectMessage;
 
 /** What the Delta codec needs: the Welcome schema and the kind of each known id. */
 export type EntityKinds = Readonly<{
@@ -241,6 +247,9 @@ export function encodeServerMessage(
 		case 'Error':
 			w.u8(GameMessageTag.ERROR).varuint(message.code).string(message.message);
 			break;
+		case 'Redirect':
+			w.u8(GameMessageTag.REDIRECT).string(message.zoneId).string(message.url);
+			break;
 	}
 	return w.finish();
 }
@@ -300,6 +309,9 @@ export function decodeServerMessage(
 			break;
 		case GameMessageTag.ERROR:
 			message = { type: 'Error', code: r.varuint(), message: r.string() };
+			break;
+		case GameMessageTag.REDIRECT:
+			message = { type: 'Redirect', zoneId: r.string(), url: r.string() };
 			break;
 		default:
 			throw new GameDecodeError('UNKNOWN_MESSAGE', `message type 0x${tag.toString(16)}`);
