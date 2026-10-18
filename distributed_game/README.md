@@ -157,6 +157,11 @@ double-crediting.
 | `ZoneStateStore` (`MemoryZoneStateStore`, `SqliteZoneStateStore`) | hibernation snapshots, written under the claim's fencing token (stale writers get `StateError::Stale`). |
 | `ZoneTopology` (`DottedTopology` default: `eldoria.port.docks` → `eldoria.port` → `eldoria`) | parent links for tier-up events. |
 
+**Per-zone host settings.** `GameServer::with_host_config(|zone_id, host|
+…)` adjusts the `HostConfig` of each activation (e.g. a province ticking at
+2 Hz while its neighborhoods run at 30 Hz); the world content version is
+applied afterwards.
+
 **Activate on demand / hibernate.** `GameServer` creates a zone on first
 join (or tier-up event). With `ServerConfig::hibernate_after = Some(d)` a
 zone that stays Dormant for `d` (no clients, no in-flight facts, not
