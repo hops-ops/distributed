@@ -7,4 +7,7 @@
 //! See `examples/game/README.md`.
 
 pub mod arena;
+pub mod cluster;
 pub mod common;
+pub mod grid;
+pub mod ripple;

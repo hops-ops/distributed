@@ -20,7 +20,7 @@ name = "game-demos"
 path = "src/main.rs"
 
 [dependencies]
-distributed_game = { path = "../../../distributed_game", features = ["net"] }
+distributed_game = { path = "../../../distributed_game", features = ["net", "sqlite"] }
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,3 +31,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 distributed_game = { path = "../../../distributed_game", features = ["net", "bots"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
