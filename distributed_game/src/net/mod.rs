@@ -172,7 +172,8 @@ pub struct ServerConfig {
     pub outbound_queue: usize,
     /// Largest accepted inbound frame.
     pub max_frame_bytes: usize,
-    /// Optional dev latency simulation.
+    /// Optional dev latency simulation (initial value; change it at runtime
+    /// with [`GameServer::set_net_sim`]).
     pub net_sim: Option<NetSim>,
     /// Zones that get their own `zone` metrics label (see [`crate::metrics`]).
     pub metrics_zone_labels: usize,
@@ -306,6 +307,8 @@ struct Inner<Z: Zone> {
     /// Lock order: `zones` before `world`.
     world: Mutex<WorldState>,
     activations: AtomicU64,
+    /// Live dev network simulation, read by every connection per message.
+    net_sim: watch::Sender<Option<NetSim>>,
 }
 
 /// Multi-zone WebSocket game server.
@@ -341,6 +344,7 @@ where
         factory: impl Fn(&str) -> Option<Z::Config> + Send + Sync + 'static,
     ) -> Self {
         let (shutdown, _) = watch::channel(false);
+        let (net_sim, _) = watch::channel(config.net_sim);
         let version = config.host.content_version.clone();
         Self {
             inner: Arc::new(Inner {
@@ -365,6 +369,7 @@ where
                     barrier: None,
                 }),
                 activations: AtomicU64::new(0),
+                net_sim,
             }),
         }
     }
@@ -579,6 +584,19 @@ where
                 .route("/admin/barrier/{phase}", post(world::admin_barrier::<Z>));
         }
         router.with_state(self.inner.clone())
+    }
+
+    /// Replace the dev network simulation at runtime (`None` disables it).
+    /// Applies to every message sent or received from now on, on existing
+    /// and new connections; messages already delayed keep their schedule
+    /// and order is always preserved.
+    pub fn set_net_sim(&self, sim: Option<NetSim>) {
+        self.inner.net_sim.send_replace(sim);
+    }
+
+    /// Network simulation currently in effect.
+    pub fn net_sim(&self) -> Option<NetSim> {
+        *self.inner.net_sim.borrow()
     }
 
     /// Per-zone metrics registry (also served at `GET /metrics`).
@@ -1322,14 +1340,14 @@ async fn reject(mut socket: WebSocket, code: u32, message: impl Into<String>) {
 
 /// Order-preserving delay line for [`NetSim`].
 struct DelayLine<T> {
-    sim: Option<NetSim>,
+    sim: watch::Receiver<Option<NetSim>>,
     rng: ZoneRng,
     queue: VecDeque<(Instant, T)>,
     last: Instant,
 }
 
 impl<T> DelayLine<T> {
-    fn new(sim: Option<NetSim>, seed: u64) -> Self {
+    fn new(sim: watch::Receiver<Option<NetSim>>, seed: u64) -> Self {
         Self {
             sim,
             rng: ZoneRng::from_seed(seed),
@@ -1338,12 +1356,17 @@ impl<T> DelayLine<T> {
         }
     }
 
-    /// Returns the item immediately when no simulation is configured.
+    /// Returns the item immediately when no simulation is in effect and
+    /// nothing is still queued (order is preserved when the simulation is
+    /// switched off while messages are in flight).
     fn push(&mut self, item: T) -> Option<T> {
-        let Some(sim) = self.sim else {
-            return Some(item);
+        let sim = *self.sim.borrow();
+        let delay = match sim {
+            Some(sim) => sim.delay(&mut self.rng),
+            None if self.queue.is_empty() => return Some(item),
+            None => Duration::ZERO,
         };
-        let at = (Instant::now() + sim.delay(&mut self.rng)).max(self.last);
+        let at = (Instant::now() + delay).max(self.last);
         self.last = at;
         self.queue.push_back((at, item));
         None
@@ -1564,8 +1587,8 @@ where
 
     // 2. Session loop.
     let seed = u64::from(client.0) ^ unix_now();
-    let mut outbound: DelayLine<ConnOut> = DelayLine::new(cfg.net_sim, seed);
-    let mut inbound: DelayLine<Inbound> = DelayLine::new(cfg.net_sim, !seed);
+    let mut outbound: DelayLine<ConnOut> = DelayLine::new(inner.net_sim.subscribe(), seed);
+    let mut inbound: DelayLine<Inbound> = DelayLine::new(inner.net_sim.subscribe(), !seed);
     let mut bucket = Bucket {
         tokens: cfg.input_burst,
         rate: cfg.input_rate,
@@ -1743,5 +1766,25 @@ mod netsim_tests {
         // Without loss the delay is bounded by latency + jitter.
         let clean = NetSim::new(Duration::from_millis(40), Duration::from_millis(10));
         assert!((0..500).all(|_| clean.delay(&mut rng) <= base_max));
+    }
+
+    #[test]
+    fn live_net_sim_changes_preserve_order() {
+        let (tx, rx) = watch::channel(None);
+        let mut line = DelayLine::new(rx, 1);
+        assert_eq!(line.push(1), Some(1), "no simulation: immediate");
+        tx.send_replace(Some(NetSim::new(
+            Duration::from_millis(200),
+            Duration::ZERO,
+        )));
+        assert_eq!(line.push(2), None, "simulation switched on: delayed");
+        let due = line.next_due().expect("queued");
+        tx.send_replace(None);
+        assert_eq!(line.push(3), None, "switched off: queues behind 2");
+        assert_eq!(line.pop_due(), None);
+        assert_eq!(line.queue.len(), 2);
+        assert!(line.queue.back().unwrap().0 >= due);
+        line.queue.clear();
+        assert_eq!(line.push(4), Some(4), "queue drained: immediate again");
     }
 }

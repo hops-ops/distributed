@@ -141,7 +141,8 @@ double-crediting.
   200 ms, up to 3×) with head-of-line blocking, never as a dropped or
   reordered message. `config.net_sim = NetSim::from_env()` reads
   `DG_NET_LATENCY_MS`, `DG_NET_JITTER_MS`, `DG_NET_LOSS`,
-  `DG_NET_RETRANSMIT_MS`.
+  `DG_NET_RETRANSMIT_MS`. `GameServer::set_net_sim(Some(sim) | None)`
+  changes it at runtime for every connection (order is preserved).
 
 ## World structure
 
