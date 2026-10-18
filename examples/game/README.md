@@ -10,6 +10,7 @@ guests and lets any page change the network simulation.
 |---|---|---|
 | **Arena** | `./run.sh arena` | Fixed 30 Hz tick / 20 Hz patches, binary deltas, interest management (view ring, drones pop in/out), client prediction + reconciliation (shared Rust/TS movement step, bit-exact), interpolation of remote entities, live latency/jitter/loss |
 | **Shooting Gallery** | `./run.sh gallery` | Lag compensation: hitscan shots resolved with `ctx.rewind().hit_test_shot` at the shooter's view time (`client_tick` + interpolation delay in the payload), `max_rewind` clamp, per-shot compensation on/off, predicted vs confirmed hits |
+| **The Freeze** | `./run.sh freeze` | World-version barrier (`WorldCoordinator::rollout`) across **two server processes** as an in-world "admin update": freeze → apply → resume with change notes, inputs dropped while frozen, Hard reload vs safe-room gating (`StalePolicy::SafeRoom`, `Zone::is_gate`) of old clients, aborted rollout (`freeze_ready` → `NotAcked`), facts/events stamped with the content version |
 
 `./run.sh smoke` runs every demo's smoke tests; `./run.sh list` lists demos.
 
@@ -48,6 +49,41 @@ for states not yet received); each shot carries `delay = tickTime(client_tick)
 `gallery::MAX_REWIND_MS` (600 ms of view age, ≈ 250 ms one way) shots are
 clamped and reported as such.
 
+The Freeze: the server prints an **admin secret** (`./run.sh freeze` shows
+it; set `DG_DEMO_ADMIN_SECRET` to choose one) — open
+`/freeze/?admin=<secret>` (add `&old=1` in a second tab for an old client).
+`game-demos freeze` hosts the Town Hub (safe-room gate) and Whisper Meadow
+and starts a second process of itself for Ember Fields (`beta`, shared
+ticket + admin secrets, exits with its parent); portals hand players off
+between them (`Redirect` + `/admin/transfer` across processes). Content is
+data-driven per version (`freeze::content`: v1 lava pools that burn, v2
+"lava is now ice", v3 back to lava; slime speed/size/color, crystals, gem
+value) and served by `GET /dev/freeze/content/{version}`; the client derives
+the scene from *its own* pack.
+
+- **Roll out update (Hard)**: every zone on both hosts freezes (SYSTEM
+  overlay, inputs dropped and counted — client side, plus any in flight on
+  the server), the "content CDN" stages the pack (`DG_FREEZE_STAGE_MS`,
+  default 2.5 s), every zone resumes on the next version with the notes,
+  and every client reloads (`Kick(RELOAD)` → `reloadContent` → reconnect
+  with the token).
+- **Roll out (Safe room)**: rolling commit. Normal clients patch live
+  (`client.setContentVersion`); an old client (**O** / `&old=1`) keeps its
+  old pack in the field — the server already runs the new rules — until it
+  walks through a portal into the Town Hub, where it gets `RELOAD`.
+  (An old client that is *already* in the hub when the update lands is
+  refused by the field it walks into next — `VERSION_MISMATCH` — returns to
+  the hub with its transfer ticket and is reloaded there.)
+- **Ritual in Ember Fields**: that zone's `freeze_ready()` is false; the
+  next rollout times out (`NotAcked: beta/freeze-ember`) and every zone
+  resumes on the old version with "update aborted".
+
+Each zone switch emits a `freeze.content_applied` fact and a stamped event;
+gems emit `freeze.gem_collected` facts — the admin panel lists them with
+their stamp. Display names live on the primary host: a player joining Ember
+Fields directly (`&zone=freeze-ember`) shows as a guest there, names carry
+over portals.
+
 ## Architecture
 
 ```
@@ -83,12 +119,14 @@ examples/game/
     src/common/              shared: Demo trait, run/spawn, dev routes, guests, JSON events
     src/arena/               Arena zone + movement.rs (twin of client movement.ts)
     src/gallery/             Shooting Gallery zone (targets, rewind hit tests); tests/gallery_smoke.rs
+    src/freeze/              The Freeze zone, content packs, two-host world + admin routes; tests/freeze_smoke.rs
     tests/                   arena_smoke.rs (bots, dev routes), movement_fixture.rs
   client/                    Vite + TypeScript + Babylon.js 9.30 (multi-page)
     index.html, <demo>/index.html
     src/shared/              hud.ts, input.ts, scene.ts, dev-api.ts, events.ts, style.css
     src/arena/               client.ts (headless), main.ts (Babylon), movement.ts
     src/gallery/             client.ts (shots, adaptive delay), main.ts; tests/gallery-headless
+    src/freeze/              client.ts (content packs, live patch / reload, admin API), main.ts; tests/freeze-headless
     tests/                   movement-parity, arena-headless (+ helpers/demo-server.mjs)
 ```
 
