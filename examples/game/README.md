@@ -9,6 +9,7 @@ guests and lets any page change the network simulation.
 | Demo | Run | Mechanic it demonstrates |
 |---|---|---|
 | **Arena** | `./run.sh arena` | Fixed 30 Hz tick / 20 Hz patches, binary deltas, interest management (view ring, drones pop in/out), client prediction + reconciliation (shared Rust/TS movement step, bit-exact), interpolation of remote entities, live latency/jitter/loss |
+| **Shooting Gallery** | `./run.sh gallery` | Lag compensation: hitscan shots resolved with `ctx.rewind().hit_test_shot` at the shooter's view time (`client_tick` + interpolation delay in the payload), `max_rewind` clamp, per-shot compensation on/off, predicted vs confirmed hits |
 
 `./run.sh smoke` runs every demo's smoke tests; `./run.sh list` lists demos.
 
@@ -34,6 +35,18 @@ your keys), **G** the wireframe ghost at the latest server position. The
 NetSim sliders change the server's simulated one-way latency (applied in
 both directions), jitter and loss (a TCP-like retransmit delay) for every
 connection.
+
+Shooting Gallery controls: click a target (or Space / gamepad A through the
+crosshair), drag to look. **C** toggles lag compensation (sent with every
+shot), **G** wireframe ghosts at the newest received target state. Set the
+NetSim latency to 150–250 ms: with compensation the confirmed hits match the
+predicted ones (yellow marker → green); without it most turn red. The
+client's interpolation delay adapts to `rtt / 2 + 2 patches + 2 × jitter`
+(the SDK clock estimates the server's *present*, so a fixed 100 ms would ask
+for states not yet received); each shot carries `delay = tickTime(client_tick)
+- renderTime`, so the server rewinds to exactly what was on screen. Beyond
+`gallery::MAX_REWIND_MS` (500 ms of view age, ≈ 200 ms one way) shots are
+clamped and reported as such.
 
 ## Architecture
 
@@ -69,11 +82,13 @@ examples/game/
     src/main.rs              `game-demos <demo>` subcommands
     src/common/              shared: Demo trait, run/spawn, dev routes, guests, JSON events
     src/arena/               Arena zone + movement.rs (twin of client movement.ts)
+    src/gallery/             Shooting Gallery zone (targets, rewind hit tests); tests/gallery_smoke.rs
     tests/                   arena_smoke.rs (bots, dev routes), movement_fixture.rs
   client/                    Vite + TypeScript + Babylon.js 9.30 (multi-page)
     index.html, <demo>/index.html
     src/shared/              hud.ts, input.ts, scene.ts, dev-api.ts, events.ts, style.css
     src/arena/               client.ts (headless), main.ts (Babylon), movement.ts
+    src/gallery/             client.ts (shots, adaptive delay), main.ts; tests/gallery-headless
     tests/                   movement-parity, arena-headless (+ helpers/demo-server.mjs)
 ```
 

@@ -16,7 +16,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 SERVER="$HERE/server"
 CLIENT="$HERE/client"
 BIN="$SERVER/target/debug/game-demos"
-DEMOS=(arena)
+DEMOS=(arena gallery)
 
 log() { printf '\033[1;36m[demos]\033[0m %s\n' "$*"; }
 

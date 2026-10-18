@@ -3,6 +3,7 @@
 use clap::{Parser, Subcommand};
 use game_demos::arena::ArenaDemo;
 use game_demos::common::{run, DemoArgs};
+use game_demos::gallery::GalleryDemo;
 
 #[derive(Parser)]
 #[command(
@@ -18,11 +19,14 @@ struct Cli {
 enum DemoCommand {
     /// Prediction, reconciliation, interpolation and interest management.
     Arena(DemoArgs),
+    /// Lag compensation: hitscan shots rewound to the shooter's view time.
+    Gallery(DemoArgs),
 }
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     match Cli::parse().demo {
         DemoCommand::Arena(args) => run::<ArenaDemo>(args).await,
+        DemoCommand::Gallery(args) => run::<GalleryDemo>(args).await,
     }
 }
