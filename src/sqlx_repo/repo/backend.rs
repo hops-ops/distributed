@@ -47,7 +47,7 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(
             descriptions,
             vec![
@@ -59,7 +59,8 @@ mod tests {
                 "gateway dependency versions",
                 "projection program identity",
                 "external command binding",
-                "projection delivery aliases"
+                "projection delivery aliases",
+                "coordination leases"
             ]
         );
         assert_eq!(
@@ -101,6 +102,10 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/sqlite/0009_projection_delivery_aliases.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0010_coordination_leases.sql"
+                )),
             ]
         );
     }
@@ -120,7 +125,7 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(
             descriptions,
             vec![
@@ -132,7 +137,8 @@ mod tests {
                 "gateway dependency versions",
                 "projection program identity",
                 "external command binding",
-                "projection delivery aliases"
+                "projection delivery aliases",
+                "coordination leases"
             ]
         );
         assert_eq!(
@@ -173,6 +179,10 @@ mod tests {
                 include_str!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/postgres/0009_projection_delivery_aliases.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0010_coordination_leases.sql"
                 )),
             ]
         );

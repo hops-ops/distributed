@@ -108,6 +108,18 @@
         "path": "migrations/postgres/0009_projection_delivery_aliases.sql",
         "sha256": "19845d4bfcb30d1bf43cb485a6bb9f765a6c1db7abf74fb004046457af83a2b9"
       }
+    },
+    {
+      "version": 10,
+      "description": "coordination leases",
+      "sqlite": {
+        "path": "migrations/sqlite/0010_coordination_leases.sql",
+        "sha256": "ec39b6bc567b2cbe06a8ba162b3b330735a67d83d8c19044f3e39e84df4119d7"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0010_coordination_leases.sql",
+        "sha256": "f5494517f00ba6f4a00ca140fcb77ac49444d6d7bdf3ac575d00e043f8c01072"
+      }
     }
   ]
 }
