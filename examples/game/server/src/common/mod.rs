@@ -16,7 +16,7 @@ use axum::Router;
 use distributed_game::net::{GameServer, NetSim, ServerConfig, TicketKey};
 use distributed_game::{Ctx, Viewer, Zone};
 
-pub use guests::Guests;
+pub use guests::{random_hex, Guests};
 
 /// One playable demo hosted by `game-demos <NAME>`.
 pub trait Demo: 'static {
@@ -115,14 +115,31 @@ pub fn spawn<D: Demo>(
     options: DemoOptions,
     signal: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<RunningDemo<D>> {
+    spawn_with::<D>(
+        listener,
+        options,
+        |config, guests| (D::server(config, guests), Router::new()),
+        signal,
+    )
+}
+
+/// Like [`spawn`], but `build` makes the server and the demo's own dev
+/// routes (merged next to `/dev/ticket`, only with `--dev`). For demos whose
+/// zones and routes share state (e.g. a durable store) built by the caller.
+pub fn spawn_with<D: Demo>(
+    listener: tokio::net::TcpListener,
+    options: DemoOptions,
+    build: impl FnOnce(ServerConfig, Guests) -> (GameServer<D::Zone>, Router),
+    signal: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<RunningDemo<D>> {
     let addr = listener.local_addr()?;
     let guests = Guests::default();
-    let server = D::server(
+    let (server, demo_routes) = build(
         server_config(options.key.clone(), options.net_sim),
         guests.clone(),
     );
     let extra = if options.dev {
-        dev::routes::<D>(server.clone(), options.key, guests.clone())
+        dev::routes::<D>(server.clone(), options.key, guests.clone()).merge(demo_routes)
     } else {
         Router::new()
     };
@@ -137,6 +154,17 @@ pub fn spawn<D: Demo>(
 
 /// CLI entry: bind, print the address, serve until Ctrl-C / SIGTERM.
 pub async fn run<D: Demo>(args: DemoArgs) -> std::io::Result<()> {
+    run_with::<D>(args, |config, guests| {
+        (D::server(config, guests), Router::new())
+    })
+    .await
+}
+
+/// [`run`] with a caller-built server and dev routes (see [`spawn_with`]).
+pub async fn run_with<D: Demo>(
+    args: DemoArgs,
+    build: impl FnOnce(ServerConfig, Guests) -> (GameServer<D::Zone>, Router),
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await?;
     let secret = args.secret.unwrap_or_else(|| guests::random_hex(32));
     let options = DemoOptions {
@@ -144,7 +172,7 @@ pub async fn run<D: Demo>(args: DemoArgs) -> std::io::Result<()> {
         dev: args.dev,
         net_sim: NetSim::from_env(),
     };
-    let running = spawn::<D>(listener, options, shutdown_signal())?;
+    let running = spawn_with::<D>(listener, options, build, shutdown_signal())?;
     // Parsed by run.sh and the client tests: keep the format.
     println!("LISTENING http://{}", running.addr);
     println!(
