@@ -10,6 +10,8 @@ use std::time::SystemTime;
 
 pub(crate) struct OutboxInsert<'a> {
     pub statement: Statement<'a>,
+    // Read by the SQLx adapters only; cell executors do not report it.
+    #[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
     pub first_id: &'a str,
 }
 

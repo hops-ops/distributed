@@ -78,6 +78,92 @@ where
         })
     }
 
+    /// Open a durable cell backed by its own SQLite file (`cell-sqlite`).
+    ///
+    /// The file is `location.resolve("{aggregate_type}:{shard_id}")`. Each
+    /// command commits events, snapshots, its ledger receipt and outbox rows
+    /// in one SQLite transaction, exactly as `from_state` does on Workers.
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    pub fn open_sqlite(
+        location: &super::CellSqlitePath,
+        shard_id: impl Into<String>,
+    ) -> Result<Self, RepositoryError> {
+        let shard = StreamIdentity::new(A::aggregate_type(), shard_id.into())?;
+        Self::from_store(CellStreamStore::open_sqlite(location, shard)?)
+    }
+
+    /// Host a prepared exclusive store (for example a SQLite cell configured
+    /// with [`CellStreamStore::with_sealed_row_reducer`]).
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub fn from_store(store: CellStreamStore) -> Result<Self, RepositoryError> {
+        let shard = Self::store_shard(&store)?;
+        Ok(Self::from_repository(
+            shard,
+            AggregateRepository::new(store),
+        ))
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn store_shard(store: &CellStreamStore) -> Result<StreamIdentity, RepositoryError> {
+        match store.identity() {
+            Some(identity) if identity.aggregate_type() == A::aggregate_type() => {
+                Ok(identity.clone())
+            }
+            Some(identity) => Err(RepositoryError::Model(format!(
+                "cell store `{identity}` does not hold aggregate type `{}`",
+                A::aggregate_type()
+            ))),
+            None => Err(RepositoryError::Model(
+                "aggregate cells require an exclusive cell store".into(),
+            )),
+        }
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn from_repository(
+        shard: StreamIdentity,
+        repository: AggregateRepository<CellStreamStore, A>,
+    ) -> Self {
+        Self {
+            shard,
+            routes: Routes::from_dependencies(repository),
+            #[cfg(feature = "workers-rs")]
+            celld_outbox: None,
+            #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+            activity: Default::default(),
+        }
+    }
+
+    /// Native equivalent of the celld alarm drain: one claim -> publish ->
+    /// delete pass over this cell's committed outbox (lease-fenced rows).
+    ///
+    /// Call it at startup (rows survive a restart), after dispatch for low
+    /// latency, and periodically; or hand [`Self::outbox_dispatcher`] to an
+    /// `OutboxDrainRunner` on a tokio runtime. Publication failures are
+    /// released (or failed after `max_attempts`) for the next pass. A crash
+    /// between publish and delete re-delivers the same stable message id, so
+    /// delivery is at-least-once and consumers must deduplicate.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub async fn drain_outbox_with<P>(
+        &self,
+        publisher: P,
+        lease: Duration,
+        max_attempts: u32,
+        batch_size: usize,
+    ) -> Result<crate::outbox_worker::OutboxDispatchOutcome, crate::bus::TransportError>
+    where
+        P: crate::bus::MessagePublisher,
+    {
+        self.outbox_dispatcher(
+            publisher,
+            format!("cell-outbox:{}", self.instance_name()),
+            lease,
+            max_attempts,
+        )
+        .dispatch_batch(batch_size)
+        .await
+    }
+
     /// Open the named runtime-owned SQLite cell. Mount commands and configure
     /// its Queue binding before dispatch; no in-memory persistence path exists.
     #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
@@ -374,6 +460,30 @@ where
             activity: Default::default(),
             storage,
         })
+    }
+
+    /// Open a durable SQLite cell with repository snapshot caching.
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    pub fn open_sqlite_with_snapshots(
+        location: &super::CellSqlitePath,
+        shard_id: impl Into<String>,
+        frequency: u64,
+    ) -> Result<Self, RepositoryError> {
+        let shard = StreamIdentity::new(A::aggregate_type(), shard_id.into())?;
+        Self::from_store_with_snapshots(CellStreamStore::open_sqlite(location, shard)?, frequency)
+    }
+
+    /// Host a prepared exclusive store with repository snapshot caching.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub fn from_store_with_snapshots(
+        store: CellStreamStore,
+        frequency: u64,
+    ) -> Result<Self, RepositoryError> {
+        let shard = Self::store_shard(&store)?;
+        Ok(Self::from_repository(
+            shard,
+            AggregateRepository::new(store).with_snapshots(frequency),
+        ))
     }
 
     /// Open a cell with repository snapshot caching (`with_snapshots`).
