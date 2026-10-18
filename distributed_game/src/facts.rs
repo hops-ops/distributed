@@ -217,6 +217,7 @@ pub struct FactQueue {
     settlements: mpsc::Receiver<FactSettlement>,
     in_flight: HashSet<String>,
     capacity: usize,
+    script: Option<SettlementScript>,
 }
 
 /// Worker-side handle consumed by [`FactFeed::run`].
@@ -237,6 +238,7 @@ pub fn fact_channel(capacity: usize, policy: RetryPolicy) -> (FactQueue, FactFee
             settlements: rx,
             in_flight: HashSet::new(),
             capacity: capacity.max(1),
+            script: None,
         },
         FactFeed {
             shared,
@@ -256,6 +258,9 @@ impl FactQueue {
             return Err(EmitError::Backpressure);
         }
         self.in_flight.insert(fact.key.clone());
+        if self.script.is_some() {
+            return Ok(());
+        }
         self.shared
             .queue
             .lock()
@@ -277,6 +282,59 @@ impl FactQueue {
     /// Unsettled facts.
     pub fn in_flight(&self) -> usize {
         self.in_flight.len()
+    }
+
+    /// Queue whose settlements come from a script instead of a worker
+    /// (record/replay). Emitted facts are tracked for backpressure and
+    /// duplicate keys exactly like a live queue but never committed.
+    pub fn scripted(capacity: usize) -> (Self, SettlementScript) {
+        let (mut queue, _feed) = fact_channel(capacity, RetryPolicy::default());
+        let script = SettlementScript::default();
+        queue.script = Some(script.clone());
+        (queue, script)
+    }
+
+    /// Settlements due at `tick`: scripted ones scheduled at or before it,
+    /// otherwise whatever the worker delivered.
+    pub(crate) fn drain_at(&mut self, tick: u64) -> Vec<FactSettlement> {
+        let Some(script) = &self.script else {
+            return self.drain();
+        };
+        let mut due = Vec::new();
+        {
+            let mut queue = script.0.lock().expect("script lock");
+            while queue.front().is_some_and(|(at, _)| *at <= tick) {
+                due.push(queue.pop_front().expect("front").1);
+            }
+        }
+        for s in &due {
+            self.in_flight.remove(&s.key);
+        }
+        due
+    }
+}
+
+/// Feeds scripted settlements into a [`FactQueue::scripted`] queue.
+#[derive(Debug, Clone, Default)]
+pub struct SettlementScript(Arc<Mutex<VecDeque<(u64, FactSettlement)>>>);
+
+impl SettlementScript {
+    /// Deliver `settlement` on the first settlement point at or after `tick`.
+    pub fn push(&self, tick: u64, settlement: FactSettlement) {
+        self.0
+            .lock()
+            .expect("script lock")
+            .push_back((tick, settlement));
+    }
+
+    /// Scheduled but not yet delivered.
+    pub fn len(&self) -> usize {
+        self.0.lock().expect("script lock").len()
+    }
+
+    /// True when nothing is scheduled.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

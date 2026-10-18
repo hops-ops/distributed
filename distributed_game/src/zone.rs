@@ -14,6 +14,7 @@ use crate::facts::FactSettlement;
 use crate::host::Ctx;
 use crate::protocol::Role;
 use crate::replication::WorldView;
+use crate::rewind::RewindFrame;
 use crate::schema::EntitySchema;
 use crate::timers::TimerId;
 
@@ -189,6 +190,17 @@ pub trait Zone: Sized + Send + 'static {
 
     /// Describe replicated entities for this patch.
     fn replicate(&self, out: &mut WorldView);
+
+    /// Record hit volumes for lag compensation after each tick
+    /// ([`Ctx::rewind`](crate::Ctx::rewind)). Default: nothing recorded.
+    fn record_rewind(&self, _frame: &mut RewindFrame) {}
+
+    /// Digest of the authoritative state for record/replay
+    /// ([`replay`](mod@crate::replay)). `None` hashes the replicated
+    /// [`WorldView`] instead, which misses unreplicated state.
+    fn state_hash(&self) -> Option<u64> {
+        None
+    }
 
     /// The zone is being destroyed; timers are cleared afterwards.
     fn on_dispose(&mut self, _ctx: &mut Ctx<'_, Self>) {}

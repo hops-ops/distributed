@@ -35,7 +35,9 @@ pub mod interest;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod protocol;
+pub mod replay;
 pub mod replication;
+pub mod rewind;
 pub mod rng;
 pub mod schema;
 pub mod stamp;
@@ -48,13 +50,15 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use facts::spawn_fact_worker;
 pub use facts::{
     fact_channel, EmitError, Fact, FactError, FactFeed, FactOutcome, FactQueue, FactReceipt,
-    FactSettlement, FactSink, MemoryFactSink, RetryPolicy,
+    FactSettlement, FactSink, MemoryFactSink, RetryPolicy, SettlementScript,
 };
-pub use host::{AdvanceReport, Ctx, HostConfig, JoinError, Joined, Outbound, ZoneHost};
+pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};
 pub use input::{ConsumePolicy, InputBuffer, PushOutcome, SequencedInput};
 pub use interest::{InterestConfig, View};
 pub use protocol::{ClientMessage, ClientMirror, Role, ServerMessage, PROTOCOL_VERSION};
+pub use replay::{replay, Recorder, Recording};
 pub use replication::{EntityState, WorldView};
+pub use rewind::{Historic, HitQuery, Rewind, RewindConfig, RewindFrame, ShotTiming};
 pub use rng::{Fnv64, ZoneRng};
 pub use schema::{EntitySchema, FieldType, FieldValue, KindDef};
 pub use stamp::{stamp_metadata, FactStamp};

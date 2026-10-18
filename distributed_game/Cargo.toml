@@ -35,6 +35,11 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 serde = { version = "1", features = ["derive"] }
 
 [[test]]
+name = "netcode"
+path = "tests/netcode/main.rs"
+required-features = ["runtime"]
+
+[[test]]
 name = "net_e2e"
 path = "tests/net_e2e/main.rs"
 required-features = ["net"]

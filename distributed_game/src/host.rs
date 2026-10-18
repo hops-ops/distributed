@@ -31,11 +31,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::clock::Clock;
-use crate::facts::{EmitError, Fact, FactQueue};
+use crate::facts::{EmitError, Fact, FactQueue, FactSettlement};
 use crate::input::{ConsumePolicy, InputBuffer, PushOutcome, SequencedInput};
 use crate::interest::{InterestConfig, View};
 use crate::protocol::{error, kick, Notice, Role, ServerMessage, Welcome};
-use crate::replication::{ClientReplica, EncodedWorld, WorldView};
+use crate::replication::{ClientReplica, DeltaStats, EncodedWorld, WorldView};
+use crate::rewind::{Rewind, RewindConfig, RewindFrame};
 use crate::rng::ZoneRng;
 use crate::schema::EntitySchema;
 use crate::stamp::FactStamp;
@@ -77,6 +78,8 @@ pub struct HostConfig {
     pub content_version: String,
     /// World seed; the zone RNG derives from it and the zone id.
     pub world_seed: u64,
+    /// Lag-compensation history ([`Ctx::rewind`]).
+    pub rewind: RewindConfig,
 }
 
 impl Default for HostConfig {
@@ -96,6 +99,7 @@ impl Default for HostConfig {
             interest: InterestConfig::default(),
             content_version: String::new(),
             world_seed: 0,
+            rewind: RewindConfig::default(),
         }
     }
 }
@@ -131,6 +135,31 @@ pub struct AdvanceReport {
     /// Clock time at which the host next wants `advance` (None = only on
     /// external events, i.e. Dormant).
     pub next_wake: Option<Duration>,
+    /// Fixed steps dropped by the catch-up cap (`dropped` / step).
+    pub dropped_ticks: u32,
+    /// Wall time spent in each simulated tick (metrics only; never fed back
+    /// into the simulation).
+    pub tick_durations: Vec<Duration>,
+    /// Replicated entity count when a patch ran.
+    pub entities: Option<usize>,
+    /// One entry per Delta frame built.
+    pub frames: Vec<FrameStats>,
+    /// Settlements delivered to the zone, with the tick they were delivered on.
+    pub settled: Vec<(u64, FactSettlement)>,
+    /// `(tick, state hash)` after each tick, when
+    /// [`ZoneHost::set_tick_hashing`] is on.
+    pub tick_hashes: Vec<(u64, u64)>,
+}
+
+/// One Delta frame built by a patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameStats {
+    /// Destination.
+    pub client: ClientId,
+    /// Encoded frame size.
+    pub bytes: usize,
+    /// Replication counters.
+    pub stats: DeltaStats,
 }
 
 /// Admission failure (code from [`protocol::error`](crate::protocol::error)).
@@ -198,6 +227,7 @@ pub(crate) struct Core<Z: Zone> {
     outbound: Vec<Outbound>,
     facts: Option<FactQueue>,
     pending_kicks: Vec<(PlayerId, String)>,
+    rewind: Rewind,
 }
 
 impl<Z: Zone> Core<Z> {
@@ -357,6 +387,11 @@ impl<Z: Zone> Ctx<'_, Z> {
         self.core.in_flight()
     }
 
+    /// Lag-compensation history (filled by [`Zone::record_rewind`]).
+    pub fn rewind(&self) -> &Rewind {
+        &self.core.rewind
+    }
+
     /// Reliable event to one viewer (dropped if it has no live connection).
     pub fn send_event(&mut self, to: impl Into<Viewer>, type_id: u32, payload: Vec<u8>) {
         if let Some(client) = self.core.client_of(to.into()) {
@@ -412,6 +447,8 @@ pub struct ZoneHost<Z: Zone> {
     frozen: bool,
     disposed: bool,
     token_source: Box<dyn FnMut() -> String + Send>,
+    pending: AdvanceReport,
+    hash_ticks: bool,
 }
 
 macro_rules! hook {
@@ -446,6 +483,7 @@ impl<Z: Zone> ZoneHost<Z> {
             outbound: Vec::new(),
             facts: None,
             pending_kicks: Vec::new(),
+            rewind: Rewind::new(config.rewind, config.tick_rate),
             config,
         };
         let zone = Z::on_create(&mut Ctx { core: &mut core }, zone_config);
@@ -467,6 +505,8 @@ impl<Z: Zone> ZoneHost<Z> {
             frozen: false,
             disposed: false,
             token_source: Box::new(default_token),
+            pending: AdvanceReport::default(),
+            hash_ticks: false,
         };
         host.process_kicks();
         host
@@ -527,6 +567,39 @@ impl<Z: Zone> ZoneHost<Z> {
     /// Live connections.
     pub fn client_count(&self) -> usize {
         self.core.clients.len()
+    }
+
+    /// Observers.
+    pub fn observer_count(&self) -> usize {
+        self.core.observers.len()
+    }
+
+    /// Lag-compensation history.
+    pub fn rewind(&self) -> &Rewind {
+        &self.core.rewind
+    }
+
+    /// Report a state hash after every tick in
+    /// [`AdvanceReport::tick_hashes`] (record/replay; costs a hash per tick).
+    pub fn set_tick_hashing(&mut self, on: bool) {
+        self.hash_ticks = on;
+    }
+
+    /// Deterministic digest of tick, simulation time, RNG state and
+    /// [`Zone::state_hash`] (or, when the zone has none, its replicated
+    /// [`WorldView`]).
+    pub fn state_hash(&self) -> u64 {
+        let zone = self.zone.state_hash().unwrap_or_else(|| {
+            let mut view = WorldView::default();
+            self.zone.replicate(&mut view);
+            crate::replay::hash_world(&view)
+        });
+        let mut h = crate::rng::Fnv64::new();
+        h.write_u64(self.core.tick)
+            .write_u64(self.core.sim_time.as_nanos() as u64)
+            .write_u64(self.core.rng.clone().next_u64())
+            .write_u64(zone);
+        h.finish()
     }
 
     /// Viewer bound to a connection.
@@ -953,17 +1026,20 @@ impl<Z: Zone> ZoneHost<Z> {
     }
 
     fn deliver_settlements(&mut self) {
+        let tick = self.core.tick;
         let settled = match &mut self.core.facts {
-            Some(queue) => queue.drain(),
+            Some(queue) => queue.drain_at(tick),
             None => return,
         };
         for settlement in settled {
+            self.pending.settled.push((tick, settlement.clone()));
             hook!(self.on_fact_settled(settlement));
         }
         self.process_kicks();
     }
 
     fn tick_once(&mut self, dt: Duration) {
+        let started = std::time::Instant::now();
         self.core.tick += 1;
         self.core.sim_time += dt;
         self.core.dt = dt;
@@ -974,12 +1050,26 @@ impl<Z: Zone> ZoneHost<Z> {
         }
         hook!(self.on_tick());
         self.process_kicks();
+        let mut frame = RewindFrame::default();
+        self.zone.record_rewind(&mut frame);
+        let entities = frame.into_entities();
+        if !entities.is_empty() || !self.core.rewind.is_empty() {
+            self.core
+                .rewind
+                .record(self.core.tick, self.core.sim_time, entities);
+        }
+        self.pending.tick_durations.push(started.elapsed());
+        if self.hash_ticks {
+            let hash = self.state_hash();
+            self.pending.tick_hashes.push((self.core.tick, hash));
+        }
     }
 
     fn patch(&mut self) {
         let mut view = WorldView::default();
         self.zone.replicate(&mut view);
         let core = &mut self.core;
+        self.pending.entities = Some(view.entities().len());
         let world = EncodedWorld::build(&self.schema, view, &core.config.interest);
         let tick = core.tick as u32;
         let budget = core.config.byte_budget;
@@ -995,7 +1085,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     None => continue,
                 },
             };
-            let (frame, _) = slot.replica.build_delta(
+            let (frame, stats) = slot.replica.build_delta(
                 &self.schema,
                 &world,
                 &core.config.interest,
@@ -1004,6 +1094,11 @@ impl<Z: Zone> ZoneHost<Z> {
                 tick,
                 ack,
             );
+            self.pending.frames.push(FrameStats {
+                client: *client,
+                bytes: frame.len(),
+                stats,
+            });
             frames.push(Outbound::Frame {
                 client: *client,
                 frame,
@@ -1014,7 +1109,7 @@ impl<Z: Zone> ZoneHost<Z> {
 
     /// Run due ticks and patches for the time elapsed on the clock.
     pub fn advance(&mut self) -> AdvanceReport {
-        let mut report = AdvanceReport::default();
+        let mut report = std::mem::take(&mut self.pending);
         if self.disposed {
             return report;
         }
@@ -1044,6 +1139,9 @@ impl<Z: Zone> ZoneHost<Z> {
             Tier::Dormant => Default::default(),
         };
         report.dropped = steps.dropped;
+        if !dt.is_zero() {
+            report.dropped_ticks = (steps.dropped.as_nanos() / dt.as_nanos()) as u32;
+        }
         if !self.frozen {
             for _ in 0..steps.steps {
                 self.tick_once(dt);
@@ -1087,11 +1185,17 @@ impl<Z: Zone> ZoneHost<Z> {
         }
         report.next_wake = wake;
         report.transitions = std::mem::take(&mut self.transitions);
+        let pending = std::mem::take(&mut self.pending);
+        report.tick_durations.extend(pending.tick_durations);
+        report.entities = pending.entities;
+        report.frames.extend(pending.frames);
+        report.settled.extend(pending.settled);
+        report.tick_hashes.extend(pending.tick_hashes);
         report
     }
 }
 
-fn default_token() -> String {
+pub(crate) fn default_token() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
