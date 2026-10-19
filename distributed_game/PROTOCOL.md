@@ -534,6 +534,10 @@ distributed_game --test golden`; a drift fails the test):
 - `messages.json` — `{messages: [{name, direction, hex, decoded,
   known_entities?, schema?}]}`. Delta entries include the schema and the
   `known_entities` (`[{id, kind}]`) needed to decode updates.
+- `authoring.json` (`--test authoring`) — a sample game surface and
+  input / event payloads encoded with the typed payload codec (§11), with
+  their expected TypeScript values; generated clients are round-tripped
+  against it (`js/tests/game-generated.test.mjs`).
 
 JSON conventions in `decoded`:
 
@@ -558,3 +562,34 @@ error codes and treat them as "session over" / "request failed"):
 - Kick code `7` RELOAD.
 - Transfer tickets (§8.1) and content-version policies (§8.2); `Handoff`
   and `Freeze`/`Resume` encodings are unchanged.
+
+## 11. Typed payload codec (informative)
+
+`Input.payload` and `Event.payload` stay game-defined; this section is not
+part of the frame format and changes nothing above. It specifies the
+encoding the authoring derives (`#[derive(GameInput)]`,
+`#[derive(GameEvent)]`, `#[derive(GameRecord)]`, `distributed_game::codec`)
+and generated clients use, so both sides of a game can agree on it from a
+game surface (`GameSurface` JSON, schema v1).
+
+A payload is its fields concatenated in declaration order, no tags or
+lengths between fields. A whole payload must be consumed (trailing bytes
+are an error). Field encodings:
+
+| Wire type | Encoding |
+|---|---|
+| `bool`, `u8`, `u16`, `u32`, `i32`, `f32`, `quant`, `angle`, `short_str`, `bytes` | exactly as the §4 field type of the same name (`quant` = `quant_f32`) |
+| `i8` | one byte, two's complement |
+| `i16` | zigzag `varint`, rejected outside `-32768..=32767` |
+| `u64` | unsigned LEB128 like `varuint`, up to 8 bytes, value ≤ `2^53 − 1` (encoders saturate; JavaScript decodes it exactly) |
+| `f64` | binary64 LE |
+| `str` | `string` (§2: `varuint` length + UTF-8) |
+| `list<T>` | `varuint` count, then the items |
+| `optional<T>` | `u8` 0 (absent) or 1 followed by the value; other tags are invalid |
+| `record` | the record's fields in order |
+
+An input decoded by `GameInput::from_payload` is then sanitized: fields
+with a `range [min, max]` are clamped (integers truncated after the
+clamp), bit-flag fields keep only their named bits, and a non-finite
+`f32` rejects the whole input.
+

@@ -632,6 +632,17 @@ server-side lag compensation (`replica.interpolationDelayMs`,
 `connection.stats` exposes cumulative bytes/messages in and out (Delta bytes
 separately) for bandwidth HUDs.
 
+**Generated clients.** Rather than writing `encodeInput`, field names,
+event ids and correction tables by hand, generate them from the zone's
+Rust definitions: `distributed game-manifest` + `distributed game-client`
+(see the [`distributed_game` README](../distributed_game/README.md#generated-clients))
+write a typed module per zone that wraps this `GameClient` —
+`createArenaClient(options)`, `playerFields(entity)`, `encodeInput`,
+`sanitizeInput`, typed `on('hello', …)`. It builds on the SDK's typed
+payload codec (`encodePayload`, `decodePayload`, `sanitizePayload`,
+`WireType`) and helpers (`onGameEvent`, `decodeGameEvent`, `fieldNumber`,
+`mergeCorrections`), which hand-written code may use directly.
+
 ## Protocol and security boundaries
 
 Every accepted artifact and response is protocol v1 and carries an exact
