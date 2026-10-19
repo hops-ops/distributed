@@ -30,6 +30,14 @@
       "types": "./dist/sveltekit/public-vite.d.ts",
       "import": "./dist/sveltekit/public-vite.js"
     },
+    "./sveltekit/game": {
+      "types": "./dist/sveltekit/game/index.d.ts",
+      "import": "./dist/sveltekit/game/index.js"
+    },
+    "./sveltekit/game/server": {
+      "types": "./dist/sveltekit/game/server.d.ts",
+      "import": "./dist/sveltekit/game/server.js"
+    },
     "./react": {
       "types": "./dist/react/index.d.ts",
       "import": "./dist/react/index.js"
@@ -64,7 +72,7 @@
   },
   "peerDependencies": {
     "react": "^18.2.0 || ^19.0.0",
-    "svelte": "^5.0.0"
+    "svelte": "^5.7.0"
   },
   "peerDependenciesMeta": {
     "react": {

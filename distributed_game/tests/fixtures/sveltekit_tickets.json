@@ -1,0 +1,19 @@
+{
+  "secret": "sveltekit-fixture-secret-0123456789abcdef",
+  "zone": "z-sveltekit",
+  "valid": {
+    "ticket": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzZXNzaW9uLXVzZXItMSIsInpvbmUiOiJ6LXN2ZWx0ZWtpdCIsImV4cCI6NDAwMDAwMDAwMCwibm9uY2UiOiJmaXh0dXJlLXZhbGlkIiwicm9sZSI6InBsYXllciIsIm5hbWUiOiJBbmEifQ.6dm_sJTidsFT1CAz_YrO6v4mPRk61DGA-sfkSZ2Zi40",
+    "principal": "session-user-1",
+    "name": "Ana",
+    "exp": 4000000000,
+    "nonce": "fixture-valid"
+  },
+  "observer": {
+    "ticket": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzZXNzaW9uLXVzZXItMiIsInpvbmUiOiJ6LXN2ZWx0ZWtpdCIsImV4cCI6NDAwMDAwMDAwMCwibm9uY2UiOiJmaXh0dXJlLW9ic2VydmVyIiwicm9sZSI6Im9ic2VydmVyIn0.1j2Ql0XePnslZ1kJf64VhjUeDYkdl_nAt6Vep2zQ1bs",
+    "principal": "session-user-2"
+  },
+  "expired": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzZXNzaW9uLXVzZXItMSIsInpvbmUiOiJ6LXN2ZWx0ZWtpdCIsImV4cCI6MzAwLCJub25jZSI6ImZpeHR1cmUtZXhwaXJlZCIsInJvbGUiOiJwbGF5ZXIifQ.pJED6dt-O-JNtFi-fqzUFNPtEWYljUs0pKR9gJrX380",
+  "wrongZone": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzZXNzaW9uLXVzZXItMSIsInpvbmUiOiJ6LWVsc2V3aGVyZSIsImV4cCI6NDAwMDAwMDAwMCwibm9uY2UiOiJmaXh0dXJlLXdyb25nLXpvbmUiLCJyb2xlIjoicGxheWVyIn0.s4mdpfnnVke8Ntt_LjHAgonARO5RRt_KVgKH5v96k7A",
+  "tampered": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsInpvbmUiOiJ6LXN2ZWx0ZWtpdCIsImV4cCI6NDAwMDAwMDAwMCwibm9uY2UiOiJmaXh0dXJlLXRhbXBlcmVkIiwicm9sZSI6InBsYXllciJ9.k0UNks88hcYz9M18yZdUA2OPH-Xwgf6jBwi6snvkoJE",
+  "otherKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzZXNzaW9uLXVzZXItMSIsInpvbmUiOiJ6LXN2ZWx0ZWtpdCIsImV4cCI6NDAwMDAwMDAwMCwibm9uY2UiOiJmaXh0dXJlLW90aGVyLWtleSIsInJvbGUiOiJwbGF5ZXIifQ.qVpH3bUXNhkfwk-J-AdLw40Fnyu0k6aEFf5ItmBIlLw"
+}
