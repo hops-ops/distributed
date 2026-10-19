@@ -14,10 +14,10 @@ use std::time::Duration;
 use distributed_game::protocol::{Reader, Writer};
 use distributed_game::surface::{EventPayload, GameSurface};
 use distributed_game::{
-    fact_channel, schema, Correction, Ctx, EntitySchema, FactCommand, FactOutcome, FactSettlement,
-    FieldType, FieldValue, GameEvent, GameInput, GameRecord, HostConfig, ManualClock,
-    MemoryFactSink, PlayerId, Replicated, RetryPolicy, Role, TicketClaims, Wire, WireType,
-    WorldView, Zone, ZoneHost,
+    fact_channel, predict, schema, Correction, Ctx, EntitySchema, FactCommand, FactOutcome,
+    FactSettlement, FieldType, FieldValue, GameEvent, GameInput, GameRecord, HostConfig,
+    ManualClock, MemoryFactSink, PlayerId, Replicated, RetryPolicy, Role, TicketClaims, Wire,
+    WireType, WorldView, Zone, ZoneHost,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -150,10 +150,46 @@ pub struct TickNote {
     pub note: String,
 }
 
+/// The predicted part of a `player` (fields named after the kind's).
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct SampleState {
+    pub x: f32,
+    pub vx: f32,
+    pub hp: u8,
+    pub dead: bool,
+}
+
+/// What a client tells the step.
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct SampleWind {
+    pub speed: f32,
+    pub gusts: u16,
+}
+
+/// The sample's client-predicted step.
+#[predict(SampleStep, kind = "player")]
+pub fn sample_step(
+    state: &SampleState,
+    input: &SampleInput,
+    wind: &SampleWind,
+    dt: f32,
+) -> SampleState {
+    if state.dead {
+        return *state;
+    }
+    let vx = f32::from(input.mx) / 127.0 * wind.speed;
+    SampleState {
+        x: state.x + vx * dt,
+        vx,
+        ..*state
+    }
+}
+
 pub fn sample_surface() -> GameSurface {
     GameSurface::for_zone::<Sample>("sample")
         .events::<SampleEvent>()
         .events::<Ping>()
+        .predict::<SampleStep>()
 }
 
 // ---- a zone using all of it ----------------------------------------------
@@ -419,7 +455,7 @@ fn records_round_trip_through_the_value_codec() {
 #[test]
 fn surface_describes_everything_once() {
     let surface = sample_surface();
-    assert_eq!(surface.schema_version, 1);
+    assert_eq!(surface.schema_version, 2);
     assert_eq!(surface.kinds.len(), 3);
     assert_eq!(
         surface.kinds[0].fields[0].correction,
@@ -453,7 +489,7 @@ fn surface_describes_everything_once() {
         }
     );
     let records: Vec<_> = surface.records.iter().map(|r| r.name.as_str()).collect();
-    assert_eq!(records, ["Board", "Row"]);
+    assert_eq!(records, ["Board", "Row", "SampleState", "SampleWind"]);
     // JSON round trip (the CLI reads this shape).
     let json = surface.to_json();
     let back: GameSurface = serde_json::from_str(&json).unwrap();
@@ -687,4 +723,116 @@ fn golden_fixture_is_current() {
         current, text,
         "run with UPDATE_GOLDEN=1 to regenerate {path}"
     );
+}
+
+// ---- predicted step ---------------------------------------------------------
+
+#[test]
+fn the_predicted_step_is_declared_in_the_surface() {
+    use distributed_game::prediction::{step_bytes, PredictContext, PredictStep};
+    let surface = sample_surface();
+    let predict = surface.predict.as_ref().expect("predicted step");
+    assert_eq!(predict.kind, "player");
+    assert_eq!(predict.export, "sample_step");
+    assert_eq!(predict.package, "distributed_game");
+    assert_eq!(predict.state, "SampleState");
+    assert_eq!(predict.context.as_deref(), Some("SampleWind"));
+    assert_eq!(predict.abi, distributed_game::prediction::ABI_VERSION);
+    for record in ["SampleState", "SampleWind"] {
+        assert!(surface.records.iter().any(|r| r.name == record), "{record}");
+    }
+    assert_eq!(<SampleStep as PredictStep>::KIND, "player");
+
+    // The ABI path: encoded state, input payload (sanitized) and context.
+    let state = SampleState {
+        x: 1.0,
+        vx: 0.0,
+        hp: 9,
+        dead: false,
+    };
+    let input = SampleInput {
+        mx: -128,
+        my: 0,
+        buttons: 0,
+        aim: 0.0,
+        power: 0.0,
+        view_tick: 0,
+    };
+    let wind = SampleWind {
+        speed: 2.0,
+        gusts: 3,
+    };
+    let next = step_bytes::<SampleStep>(
+        &distributed_game::codec::to_bytes(&state),
+        &input.to_payload(),
+        &wind.encode_context(),
+        0.5,
+    )
+    .unwrap();
+    let next: SampleState = distributed_game::codec::from_bytes(&next).unwrap();
+    // -128 is clamped to -127 before the step, as on the server.
+    assert_eq!(
+        next,
+        sample_step(&state, &input.sanitize().unwrap(), &wind, 0.5)
+    );
+    assert_eq!((next.x, next.vx, next.hp), (0.0, -2.0, 9));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct NotAField {
+    pub mana: f32,
+}
+
+#[predict(UnknownFieldStep, kind = "player")]
+pub fn unknown_field_step(state: &NotAField, _: &SampleInput, _: &(), _: f32) -> NotAField {
+    *state
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct WrongType {
+    pub hp: f32,
+}
+
+#[predict(WrongTypeStep, kind = "player")]
+pub fn wrong_type_step(state: &WrongType, _: &SampleInput, _: &(), _: f32) -> WrongType {
+    *state
+}
+
+#[predict(UnknownKindStep, kind = "ghost")]
+pub fn unknown_kind_step(state: &SampleState, _: &SampleInput, _: &(), _: f32) -> SampleState {
+    *state
+}
+
+#[predict(OtherInputStep, kind = "player")]
+pub fn other_input_step(state: &SampleState, _: &Ping2, _: &(), _: f32) -> SampleState {
+    *state
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, GameInput)]
+pub struct Ping2 {
+    pub n: u8,
+}
+
+#[test]
+#[should_panic(expected = "field mana is not a field of kind player")]
+fn a_state_field_must_name_a_kind_field() {
+    let _ = GameSurface::for_zone::<Sample>("sample").predict::<UnknownFieldStep>();
+}
+
+#[test]
+#[should_panic(expected = "does not match kind player field type")]
+fn a_state_field_must_have_the_kind_field_type() {
+    let _ = GameSurface::for_zone::<Sample>("sample").predict::<WrongTypeStep>();
+}
+
+#[test]
+#[should_panic(expected = "names kind \"ghost\"")]
+fn the_predicted_kind_must_be_replicated() {
+    let _ = GameSurface::for_zone::<Sample>("sample").predict::<UnknownKindStep>();
+}
+
+#[test]
+#[should_panic(expected = "must take the zone's input type")]
+fn the_step_takes_the_zone_input() {
+    let _ = GameSurface::for_zone::<Sample>("sample").predict::<OtherInputStep>();
 }
