@@ -281,7 +281,56 @@
     }
   ],
   "name": "grid",
+  "predict": {
+    "abi": 1,
+    "context": "GridContext",
+    "export": "grid_step",
+    "kind": "walker",
+    "package": "game_sim",
+    "state": "WalkerState"
+  },
   "protocolVersion": 1,
-  "records": [],
-  "schemaVersion": 1
+  "records": [
+    {
+      "fields": [
+        {
+          "name": "seed",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "cx",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "cy",
+          "type": {
+            "type": "i32"
+          }
+        }
+      ],
+      "name": "GridContext"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "WalkerState"
+    }
+  ],
+  "schemaVersion": 2
 }

@@ -1,0 +1,16 @@
+# The demos' deterministic client-predicted simulation: movement steps,
+# the inputs they read and the Endless Grid's procedural world. No server
+# dependencies, so `distributed game-wasm` compiles it to WebAssembly for
+# the browser while `game_demos` links the same code natively.
+[package]
+name = "game_sim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Shared deterministic simulation of the distributed_game demos (server + WASM client prediction)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+distributed_game = { path = "../../../../distributed_game" }

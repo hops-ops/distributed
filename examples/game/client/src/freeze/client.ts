@@ -24,7 +24,6 @@ import {
 	type FreezeMessage
 } from '@hops-ops/distributed/game';
 
-import { predictPlayer } from '../arena/movement.ts';
 import * as freeze from '../generated/freeze/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
 
@@ -140,7 +139,7 @@ export type FreezeClient = Readonly<{
 	/** Content pack the client renders. */
 	pack(): Pack;
 	hello(): FreezeHello | undefined;
-	/** Resolves on the next hello (each zone sends one). */
+	/** Resolves on the next hello (each zone sends one), once the predicted step is loaded. */
 	nextHello(): Promise<FreezeHello>;
 	/** Freeze notice while frozen. */
 	frozen(): FreezeMessage | undefined;
@@ -197,8 +196,8 @@ export async function createFreezeClient(options: FreezeClientOptions): Promise<
 			note(reloadingZone, 'reload', `server required content ${pack.version}: reloaded "${pack.name}"`);
 			changed('pack');
 			return pack.version;
-		},
-		prediction: { predict: (fields, input) => predictPlayer(fields, input) }
+		}
+		// Prediction: the generated default, `arena_step` compiled to WASM.
 	});
 	const { client } = typed;
 	client.on('reloadRequired', (zone) => (reloadingZone = zone));
@@ -260,7 +259,11 @@ export async function createFreezeClient(options: FreezeClientOptions): Promise<
 		client,
 		pack: () => pack,
 		hello: () => hello,
-		nextHello: () => new Promise((resolve) => helloWaiters.push(resolve)),
+		nextHello: () =>
+			Promise.all([
+				new Promise<FreezeHello>((resolve) => helloWaiters.push(resolve)),
+				typed.prediction?.ready
+			]).then(([h]) => h),
 		frozen: () => frozen,
 		lastResume: () => lastResume,
 		worldVersion: () => worldVersion,

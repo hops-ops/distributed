@@ -15,7 +15,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { stateFromFields } from '../src/arena/movement.ts';
 import { createFreezeClient, FreezeAdmin, ZONES } from '../src/freeze/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
 import { memoryStorage, sleep, startDemo, until } from './helpers/demo-server.mjs';
@@ -34,7 +33,7 @@ async function walk(p, [x, y], done, timeoutMs = 15_000) {
 		assert.ok(Date.now() < deadline, `walk to ${x},${y} timed out`);
 		const fields = p.client.predictor?.active ? p.client.predictor.predicted() : undefined;
 		if (fields !== undefined) {
-			const at = stateFromFields(fields);
+			const at = { x: Number(fields.x), y: Number(fields.y) };
 			const dx = x - at.x;
 			const dy = y - at.y;
 			const d = Math.hypot(dx, dy);

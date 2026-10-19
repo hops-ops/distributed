@@ -36,6 +36,10 @@ enum DemoCommand {
     Grid(ClusterArgs),
     /// Boss Ripple: realm > city > borough > hood, tier-up events across hosts.
     Ripple(ClusterArgs),
+    /// Print native traces of every predicted step over recorded input
+    /// streams (JSON; the WASM exact-match test replays them).
+    #[command(hide = true)]
+    PredictTrace,
 }
 
 #[tokio::main]
@@ -47,5 +51,9 @@ async fn main() -> std::io::Result<()> {
         DemoCommand::Freeze(args) => game_demos::freeze::world::run(args).await,
         DemoCommand::Grid(args) => run_cluster::<GridDemo>(args).await,
         DemoCommand::Ripple(args) => run_cluster::<RippleDemo>(args).await,
+        DemoCommand::PredictTrace => {
+            println!("{}", game_demos::predict_trace::traces());
+            Ok(())
+        }
     }
 }

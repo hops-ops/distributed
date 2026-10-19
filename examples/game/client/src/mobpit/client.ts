@@ -1,7 +1,7 @@
 /**
  * Mob Pit networking without rendering (Node-testable): the generated
- * `createMobpitClient` with the Arena's predicted movement for the own
- * capsule, the zone's typed events folded into a small state object, and
+ * `createMobpitClient` (the own capsule predicted by `pit_step`, the Rust
+ * Arena movement compiled to WebAssembly), the zone's typed events folded into a small state object, and
  * the `/dev/mobpit/*` routes.
  *
  * Event flow of one kill: `kill` (broadcast, the tick the mob dies — the
@@ -10,7 +10,6 @@
  */
 import { GameClient, type GameSocketFactory } from '@hops-ops/distributed/game';
 
-import { predictPlayer } from '../arena/movement.ts';
 import * as pit from '../generated/mobpit/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
 import { latest } from '../shared/latest.ts';
@@ -34,7 +33,7 @@ export type MobPitClient = pit.MobpitClient &
 		board(): pit.BoardSnapshot | undefined;
 		/** Kills by me whose fact has not settled yet (key → event). */
 		unsaved: ReadonlyMap<string, pit.KillEvent>;
-		/** Resolves on the first hello. */
+		/** Resolves on the first hello, once the predicted step is loaded. */
 		ready: Promise<pit.HelloEvent>;
 	}>;
 
@@ -50,9 +49,8 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
 		pingIntervalMs: 500,
-		inputDtMs: 1000 / 30,
-		// The movement part of the frame is the Arena's (attack only adds a bit).
-		prediction: { predict: (fields, input) => predictPlayer(fields, input) }
+		inputDtMs: 1000 / 30
+		// Prediction: the generated default, `pit_step` compiled to WASM.
 	});
 	const hello = latest<pit.HelloEvent>(
 		(h) => typed.on('hello', h),
@@ -71,7 +69,7 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		profile: profile.get,
 		board: board.get,
 		unsaved,
-		ready: hello.ready
+		ready: Promise.all([hello.ready, typed.prediction?.ready]).then(([h]) => h)
 	};
 }
 
@@ -85,7 +83,8 @@ export function createBoardWatcher(options: MobPitClientOptions): Readonly<{
 		url: (zone) => zoneUrl(zone, options.base),
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
-		pingIntervalMs: 1000
+		pingIntervalMs: 1000,
+		prediction: false
 	});
 	const board = latest<pit.BoardSnapshot>((h) => typed.on('board', h));
 	return { client: typed.client, board: board.get, on: (handler) => typed.on('board', handler) };

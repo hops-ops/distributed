@@ -14,7 +14,7 @@ import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
-import { HALF, PLAYER_RADIUS } from '../arena/movement.ts';
+import { HALF, PLAYER_RADIUS } from '../arena/floor.ts';
 import {
 	BUTTON,
 	isMob,

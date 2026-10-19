@@ -1,2 +1,4 @@
 node_modules/
 dist/
+# Compiled predicted steps (`distributed game-wasm`, built by run.sh)
+src/generated/*/wasm/

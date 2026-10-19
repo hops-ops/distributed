@@ -24,7 +24,7 @@ import { Minimap, type MinimapDot } from '../shared/minimap.ts';
 import { createRing, createStage, material, toWorld } from '../shared/scene.ts';
 import { droneFields, isDrone, isPillar, pillarFields, playerFields, BUTTON, type MoveInput } from '../generated/arena/index.ts';
 import { createArenaClient, DEFAULT_ZONE } from './client.ts';
-import { DASH_COOLDOWN, HALF, PLAYER_RADIUS } from './movement.ts';
+import { DASH_COOLDOWN, HALF, PLAYER_RADIUS } from './floor.ts';
 
 const params = new URLSearchParams(location.search);
 const zone = params.get('zone') ?? DEFAULT_ZONE;
@@ -233,6 +233,6 @@ declare global {
 		arena?: unknown;
 	}
 }
-window.arena = { client, api, scene: scene as Scene };
+window.arena = { client, api, prediction: arena.prediction, scene: scene as Scene };
 
 client.connect(zone).catch((error: unknown) => hud.row('Status', `failed: ${String(error)}`));

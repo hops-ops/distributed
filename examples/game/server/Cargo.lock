@@ -593,12 +593,20 @@ dependencies = [
  "distributed",
  "distributed_game",
  "futures-util",
+ "game_sim",
  "http-body-util",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tower",
+]
+
+[[package]]
+name = "game_sim"
+version = "0.1.0"
+dependencies = [
+ "distributed_game",
 ]
 
 [[package]]

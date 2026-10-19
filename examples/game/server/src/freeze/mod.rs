@@ -21,8 +21,8 @@
 //!   [`Zone::freeze_ready`]; the barrier times out (`NotAcked`) and every
 //!   zone resumes on the old version ("update aborted").
 //!
-//! Movement is the Arena's shared step ([`crate::arena::movement`], predicted
-//! by the client with the same TypeScript twin).
+//! Movement is the Arena's step ([`crate::arena::movement::arena_step`]),
+//! which the client predicts with, compiled to WebAssembly.
 //!
 //! Entities: 1 `player` (the Arena's [`PlayerView`]), 2 `slime` (x y yaw),
 //! 3 `gem` (x y), 4 `ritual` (global: x y stuck). Events: [`FreezeEvent`];
@@ -169,7 +169,9 @@ pub enum FreezeEvent {
 
 /// The Freeze's client surface.
 pub fn game_surface() -> GameSurface {
-    GameSurface::for_zone::<FreezeZone>("freeze").events::<FreezeEvent>()
+    GameSurface::for_zone::<FreezeZone>("freeze")
+        .events::<FreezeEvent>()
+        .predict::<movement::ArenaStep>()
 }
 
 /// Durable command recording a collected gem.
@@ -437,7 +439,8 @@ impl Zone for FreezeZone {
         for id in ids {
             let player = self.players.get_mut(&id).expect("present");
             for input in self.credits.take(ctx, id) {
-                player.state = movement::step(player.state, input.input);
+                // The declared predicted step: what the client runs as WASM.
+                player.state = movement::arena_step(&player.state, &input.input, &(), movement::DT);
             }
             let (x, y) = (player.state.x, player.state.y);
             // Lava burns (ice is safe): back to a spawn point.

@@ -4,7 +4,8 @@
 //! interest management (14 m view radius on a 40×40 m floor: far drones are
 //! culled at the ring's edge; players are global so you always see everyone
 //! in the room), client prediction + reconciliation of the
-//! own capsule ([`movement`] is shared with the TypeScript client) and
+//! own capsule ([`movement`], the `game_sim` step the browser runs as
+//! WebAssembly) and
 //! interpolation of everything else (players, ~30 wandering drones).
 //!
 //! Entities:
@@ -24,7 +25,8 @@
 //! move faster than real time by sending more inputs, but jitter bursts are
 //! absorbed.
 
-pub mod movement;
+/// The shared movement step and its `#[predict]` declaration.
+pub use game_sim::arena as movement;
 
 use std::collections::BTreeMap;
 
@@ -79,7 +81,7 @@ impl PlayerView {
             vx: state.vx,
             vy: state.vy,
             dash: state.dash,
-            cd: state.cooldown,
+            cd: state.cd,
             name: name.to_string(),
         }
     }
@@ -130,7 +132,9 @@ pub enum ArenaEvent {
 /// The Arena's client surface (`distributed game-manifest --entrypoint
 /// game_demos::arena::game_surface`).
 pub fn game_surface() -> GameSurface {
-    GameSurface::for_zone::<Arena>("arena").events::<ArenaEvent>()
+    GameSurface::for_zone::<Arena>("arena")
+        .events::<ArenaEvent>()
+        .predict::<movement::ArenaStep>()
 }
 
 /// Interest radius (m).
@@ -273,7 +277,8 @@ impl Zone for Arena {
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
         for (id, player) in &mut self.players {
             for input in self.credits.take(ctx, *id) {
-                player.state = movement::step(player.state, input.input);
+                // The declared predicted step: what the client runs as WASM.
+                player.state = movement::arena_step(&player.state, &input.input, &(), movement::DT);
             }
             ctx.set_view(*id, View::new(player.state.x, player.state.y, VIEW_RADIUS));
         }
