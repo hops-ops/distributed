@@ -33,7 +33,8 @@ use std::time::Instant;
 
 use distributed_game::{
     ConsumePolicy, Ctx, EmitError, EntitySchema, EntityState, Fact, FactOutcome, FactSettlement,
-    FieldType, FieldValue, KindDef, LeaveReason, ObserverId, PlayerId, View, WorldView, Zone,
+    FieldType, FieldValue, GameInput, KindDef, LeaveReason, ObserverId, PlayerId, View, WorldView,
+    Zone,
 };
 use serde_json::{json, Value};
 
@@ -753,7 +754,7 @@ impl Zone for MobPit {
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<PitInput> {
-        let movement = MoveInput::decode(payload)?;
+        let movement = MoveInput::from_payload(payload)?;
         Some(PitInput {
             movement,
             attack: payload[2] & BUTTON_ATTACK != 0,

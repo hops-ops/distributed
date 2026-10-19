@@ -1,0 +1,231 @@
+{
+  "events": [
+    {
+      "id": 1,
+      "name": "hello",
+      "payload": {
+        "fields": [
+          {
+            "name": "entity",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "view_radius",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "half",
+            "type": {
+              "type": "f32"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    }
+  ],
+  "input": {
+    "fields": [
+      {
+        "name": "mx",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "name": "my",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "buttons": [
+          "dash"
+        ],
+        "name": "buttons",
+        "type": {
+          "type": "u8"
+        }
+      }
+    ],
+    "name": "MoveInput"
+  },
+  "kinds": [
+    {
+      "fields": [
+        {
+          "correction": {
+            "durationMs": 150,
+            "mode": "ease"
+          },
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 19.999847,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "durationMs": 150,
+            "mode": "ease"
+          },
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 19.999847,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "vx",
+          "priority": 1.0,
+          "type": {
+            "bits": 12,
+            "max": 15.9921875,
+            "min": -16.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "vy",
+          "priority": 1.0,
+          "type": {
+            "bits": 12,
+            "max": 15.9921875,
+            "min": -16.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "dash",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "cd",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "name",
+          "priority": 0.2,
+          "type": {
+            "type": "short_str"
+          }
+        }
+      ],
+      "id": 1,
+      "name": "player",
+      "priority": 2.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 20.0,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 20.0,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "yaw",
+          "priority": 1.0,
+          "type": {
+            "bits": 8,
+            "type": "angle"
+          }
+        }
+      ],
+      "id": 2,
+      "name": "drone",
+      "priority": 1.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "correction": null,
+          "name": "r",
+          "priority": 1.0,
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "id": 3,
+      "name": "pillar",
+      "priority": 1.0
+    }
+  ],
+  "name": "arena",
+  "protocolVersion": 1,
+  "records": [],
+  "schemaVersion": 1
+}

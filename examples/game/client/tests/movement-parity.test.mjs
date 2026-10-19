@@ -26,10 +26,10 @@ test('constants and wire quantization match the Rust side', () => {
 	assert.equal(c.dashCooldown, movement.DASH_COOLDOWN);
 	assert.deepEqual(c.pillars, movement.PILLARS.map((p) => [...p]));
 	const byName = Object.fromEntries(fixture.fields.map((field) => [field.name, field]));
-	for (const [name, quant] of [['x', movement.POS], ['y', movement.POS], ['vx', movement.VEL], ['vy', movement.VEL]]) {
+	for (const [name, { min, max, bits }] of [['x', movement.POS], ['y', movement.POS], ['vx', movement.VEL], ['vy', movement.VEL]]) {
 		assert.deepEqual(
 			{ min: byName[name].min, max: byName[name].max, bits: byName[name].bits },
-			{ ...quant },
+			{ min, max, bits },
 			name
 		);
 	}

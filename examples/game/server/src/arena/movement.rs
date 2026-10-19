@@ -18,7 +18,7 @@
 //! it through the TypeScript step. Change both files together, then
 //! regenerate with `UPDATE_GOLDEN=1 cargo test --test movement_fixture`.
 
-use distributed_game::FieldType;
+use distributed_game::{FieldType, GameInput};
 
 /// Command frame length (s): the 30 Hz tick.
 pub const DT: f32 = 1.0 / 30.0;
@@ -37,7 +37,7 @@ pub const DASH_FRAMES: u8 = 6;
 /// Dash cooldown in command frames (1.5 s).
 pub const DASH_COOLDOWN: u8 = 45;
 /// Input bit: dash.
-pub const BUTTON_DASH: u8 = 1;
+pub const BUTTON_DASH: u8 = MoveInput::DASH;
 
 /// Static circular pillars `(x, y, radius)`.
 pub const PILLARS: [(f32, f32, f32); 9] = [
@@ -59,35 +59,20 @@ pub const POS: FieldType = FieldType::quant_centered(HALF, 18);
 pub const VEL: FieldType = FieldType::quant_centered(16.0, 12);
 
 /// One command frame from the client: stick in `[-127, 127]` per axis
-/// (+x right, +y forward) and button bits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// (+x right, +y forward) and button bits. Wire payload `[mx, my, buttons]`
+/// (3 bytes); [`GameInput::from_payload`] clamps `-128` to `-127` and clears
+/// unknown buttons. The TypeScript encoder/sanitizer is generated from this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameInput)]
 pub struct MoveInput {
     /// Stick x.
+    #[range(min = -127, max = 127)]
     pub mx: i8,
     /// Stick y.
+    #[range(min = -127, max = 127)]
     pub my: i8,
-    /// [`BUTTON_DASH`] …
+    /// [`MoveInput::DASH`].
+    #[buttons(dash)]
     pub buttons: u8,
-}
-
-impl MoveInput {
-    /// Wire payload: `[mx, my, buttons]`.
-    pub fn encode(self) -> [u8; 3] {
-        [self.mx as u8, self.my as u8, self.buttons]
-    }
-
-    /// Parse and sanitize a payload (`-128` clamps to `-127`, unknown
-    /// buttons are cleared). `None` for a wrong length.
-    pub fn decode(payload: &[u8]) -> Option<Self> {
-        let [mx, my, buttons] = payload else {
-            return None;
-        };
-        Some(Self {
-            mx: (*mx as i8).max(-127),
-            my: (*my as i8).max(-127),
-            buttons: buttons & BUTTON_DASH,
-        })
-    }
 }
 
 /// Everything the step reads. Every field is replicated, so a client can
@@ -342,15 +327,15 @@ mod tests {
             my: 5,
             buttons: BUTTON_DASH,
         };
-        assert_eq!(MoveInput::decode(&i.encode()), Some(i));
+        assert_eq!(MoveInput::from_payload(&i.to_payload()), Some(i));
         assert_eq!(
-            MoveInput::decode(&[0x80, 0, 0xff]),
+            MoveInput::from_payload(&[0x80, 0, 0xff]),
             Some(MoveInput {
                 mx: -127,
                 my: 0,
                 buttons: BUTTON_DASH
             })
         );
-        assert_eq!(MoveInput::decode(&[1, 2]), None);
+        assert_eq!(MoveInput::from_payload(&[1, 2]), None);
     }
 }

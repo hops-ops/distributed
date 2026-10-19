@@ -22,8 +22,9 @@ import { Hud } from '../shared/hud.ts';
 import { cameraRelative, describeGamepad, InputSampler, toAxis } from '../shared/input.ts';
 import { Minimap, type MinimapDot } from '../shared/minimap.ts';
 import { createRing, createStage, material, toWorld } from '../shared/scene.ts';
-import { createArenaClient, DEFAULT_ZONE, KIND } from './client.ts';
-import { BUTTON_DASH, DASH_COOLDOWN, HALF, PLAYER_RADIUS, type MoveInput } from './movement.ts';
+import { droneFields, isDrone, isPillar, pillarFields, playerFields, BUTTON, type MoveInput } from '../generated/arena/index.ts';
+import { createArenaClient, DEFAULT_ZONE } from './client.ts';
+import { DASH_COOLDOWN, HALF, PLAYER_RADIUS } from './movement.ts';
 
 const params = new URLSearchParams(location.search);
 const zone = params.get('zone') ?? DEFAULT_ZONE;
@@ -90,7 +91,8 @@ const droneTemplate = (() => {
 	return merged;
 })();
 
-type Visual = { mesh: Mesh | ReturnType<Mesh['createInstance']>; kind: string };
+type VisualKind = 'player' | 'drone' | 'pillar';
+type Visual = { mesh: Mesh | ReturnType<Mesh['createInstance']>; kind: VisualKind };
 const visuals = new Map<string, Visual>();
 const ghost = capsule('ghost', mats.ghost);
 const ring = createRing(scene, 14, '#6cc4ff');
@@ -111,27 +113,18 @@ const minimap = new Minimap({
 function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 	let visual = visuals.get(entity.key);
 	if (visual !== undefined) return visual;
-	switch (entity.kindName) {
-		case KIND.drone:
-			visual = { mesh: droneTemplate.createInstance(entity.key), kind: KIND.drone };
-			break;
-		case KIND.pillar: {
-			const r = num(entity, 'r');
-			const mesh = MeshBuilder.CreateCylinder(entity.key, { diameter: r * 2, height: 2, tessellation: 24 }, scene);
-			mesh.material = mats.pillar;
-			visual = { mesh, kind: KIND.pillar };
-			break;
-		}
-		default:
-			visual = { mesh: capsule(entity.key, mine ? mats.me : mats.other), kind: KIND.player };
+	if (isDrone(entity)) {
+		visual = { mesh: droneTemplate.createInstance(entity.key), kind: 'drone' };
+	} else if (isPillar(entity)) {
+		const { r } = pillarFields(entity);
+		const mesh = MeshBuilder.CreateCylinder(entity.key, { diameter: r * 2, height: 2, tessellation: 24 }, scene);
+		mesh.material = mats.pillar;
+		visual = { mesh, kind: 'pillar' };
+	} else {
+		visual = { mesh: capsule(entity.key, mine ? mats.me : mats.other), kind: 'player' };
 	}
 	visuals.set(entity.key, visual);
 	return visual;
-}
-
-function num(entity: RenderedEntity | { fields: RenderedEntity['fields'] }, field: string): number {
-	const v = entity.fields[field];
-	return typeof v === 'number' ? v : 0;
 }
 
 // ---- input: one command frame per 30 Hz tick ----
@@ -142,7 +135,7 @@ let lastInput: MoveInput = { mx: 0, my: 0, buttons: 0 };
 function sendCommandFrame(): void {
 	const s = sampler.sample();
 	const move = cameraRelative(s, stage.cameraForward());
-	lastInput = { mx: toAxis(move.x), my: toAxis(move.y), buttons: s.action ? BUTTON_DASH : 0 };
+	lastInput = { mx: toAxis(move.x), my: toAxis(move.y), buttons: s.action ? BUTTON.dash : 0 };
 	client.sendInput(lastInput);
 }
 
@@ -156,35 +149,34 @@ stage.onFrame((now, dtMs) => {
 	const isMine = (entity: RenderedEntity) =>
 		authority !== undefined && hello !== undefined && entity.zoneId === authority.zoneId && entity.id === hello.entity;
 	const mineEntity = rendered.find(isMine);
-	let me: { x: number; y: number } | undefined =
-		mineEntity === undefined ? undefined : { x: num(mineEntity, 'x'), y: num(mineEntity, 'y') };
+	let me: { x: number; y: number } | undefined = mineEntity === undefined ? undefined : playerFields(mineEntity);
 	const viewRadius = hello?.viewRadius ?? 14;
 	const dots: MinimapDot[] = [];
 	for (const entity of rendered) {
 		const mine = isMine(entity);
-		// Prediction off (P): the SDK renders the own capsule like everyone
-		// else's, interpolated in the past.
-		const fields = entity.fields;
 		const visual = visualFor(entity, mine);
-		const x = num({ fields }, 'x');
-		const y = num({ fields }, 'y');
 		seen.add(entity.key);
-		const distance = me === undefined ? 0 : Math.hypot(x - me.x, y - me.y);
-		if (visual.kind === KIND.drone) {
+		const distanceTo = (x: number, y: number) => (me === undefined ? 0 : Math.hypot(x - me.x, y - me.y));
+		if (visual.kind === 'drone') {
+			const { x, y, yaw } = droneFields(entity);
 			// Shrink toward the edge so culling at the ring reads as "out of view".
-			const s = Math.min(1, Math.max(0.2, (viewRadius - distance) / FADE_BAND));
+			const s = Math.min(1, Math.max(0.2, (viewRadius - distanceTo(x, y)) / FADE_BAND));
 			visual.mesh.position.copyFrom(toWorld(x, y, 1.3));
-			visual.mesh.rotation.y = -num(entity, 'yaw');
+			visual.mesh.rotation.y = -yaw;
 			visual.mesh.scaling.setAll(s);
 			dots.push({ x, y, color: COLORS.drone, size: 2 });
-		} else if (visual.kind === KIND.pillar) {
+		} else if (visual.kind === 'pillar') {
+			const { x, y, r } = pillarFields(entity);
 			visual.mesh.position.copyFrom(toWorld(x, y, 1));
-			dots.push({ x, y, color: COLORS.pillar, size: Math.max(2, num(entity, 'r') * 2), hollow: true });
+			dots.push({ x, y, color: COLORS.pillar, size: Math.max(2, r * 2), hollow: true });
 		} else {
+			// Prediction off (P): the SDK renders the own capsule like everyone
+			// else's, interpolated in the past.
+			const { x, y, dash, name: label } = playerFields(entity);
+			const distance = distanceTo(x, y);
 			visual.mesh.position.copyFrom(toWorld(x, y, 0.9));
-			const dashing = num({ fields }, 'dash') > 0;
+			const dashing = dash > 0;
 			visual.mesh.scaling.copyFromFloats(dashing ? 1.25 : 1, 1, dashing ? 1.25 : 1);
-			const label = String(fields.name ?? '');
 			const outside = !mine && distance > viewRadius;
 			if (!mine) (visual.mesh as Mesh).material = outside ? mats.otherFar : mats.other;
 			const text = mine ? `${label} (you)` : outside ? `${label} · outside view` : label;
@@ -194,7 +186,7 @@ stage.onFrame((now, dtMs) => {
 			if (mine) me = { x, y };
 			dots.push({ x, y, color: mine ? COLORS.me : COLORS.other, size: mine ? 4 : 3.5 });
 		}
-		visual.mesh.setEnabled((!entity.stale || visual.kind === KIND.pillar) && !(mine && stage.view() === 'first'));
+		visual.mesh.setEnabled((!entity.stale || visual.kind === 'pillar') && !(mine && stage.view() === 'first'));
 	}
 	for (const [key, visual] of visuals) {
 		if (seen.has(key)) continue;
@@ -206,8 +198,7 @@ stage.onFrame((now, dtMs) => {
 	const authoritative = client.predictor?.authoritative();
 	let ghostVisible = ghostOn && authoritative !== undefined;
 	if (authoritative !== undefined) {
-		const gx = num({ fields: authoritative }, 'x');
-		const gy = num({ fields: authoritative }, 'y');
+		const { x: gx, y: gy } = playerFields({ fields: authoritative });
 		ghost.position.copyFrom(toWorld(gx, gy, 0.9));
 		// First person: the eye sits inside the ghost; show it only once it lags visibly.
 		if (stage.view() === 'first' && me !== undefined && Math.hypot(gx - me.x, gy - me.y) < 0.8) ghostVisible = false;
@@ -226,7 +217,7 @@ stage.onFrame((now, dtMs) => {
 	minimap.draw({ me, viewRadius, dots });
 	hud.frame({ entities: rendered.length });
 	const predictor = client.predictor;
-	const cd = authoritative === undefined ? 0 : num({ fields: authoritative }, 'cd');
+	const cd = authoritative === undefined ? 0 : playerFields({ fields: authoritative }).cd;
 	hud.row('You', api.last === undefined ? '—' : `${api.last.name} · ${api.last.principal}`);
 	hud.row('Pending inputs', String(predictor?.pending.length ?? 0));
 	hud.row('Ack seq', String(predictor?.lastAck ?? 0));

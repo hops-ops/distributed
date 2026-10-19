@@ -6,7 +6,11 @@
 #   ./run.sh mobpit         same for Mob Pit; `leaderboard` = same server, board page
 #   ./run.sh grid|ripple    same with TWO hosts (A on GAME_DEMOS_PORT, B on
 #                           the next port), one process each
-#   ./run.sh smoke          every demo's smoke tests (Rust bots + headless JS)
+#   ./run.sh gen            regenerate client/src/generated/<surface>/ from the
+#                           Rust surfaces (`distributed game-manifest` +
+#                           `distributed game-client`); `gen --check` verifies
+#   ./run.sh smoke          every demo's smoke tests (Rust bots + headless JS,
+#                           generated clients checked)
 #   ./run.sh list           demos this script knows
 #
 # Env: GAME_DEMOS_PORT (server, default 2567), GAME_DEMOS_CLIENT_PORT (Vite,
@@ -25,6 +29,10 @@ DEMOS=(arena mobpit leaderboard gallery freeze grid ripple)
 export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
 # Multi-host demos: `game-demos <demo> --host-id A|B --peer …`.
 CLUSTER_DEMOS=(grid ripple)
+# Game surfaces with a generated client (`game_demos::<surface>::game_surface`);
+# the leaderboard page uses Mob Pit's.
+SURFACES=(arena mobpit gallery freeze grid ripple)
+CLI="$REPO/target/debug/distributed"
 
 log() { printf '\033[1;36m[demos]\033[0m %s\n' "$*"; }
 
@@ -52,6 +60,28 @@ ensure_client() {
 ensure_server() {
 	log "building game-demos server"
 	cargo build --quiet --manifest-path "$SERVER/Cargo.toml"
+}
+
+ensure_cli() {
+	log "building distributed CLI"
+	cargo build --quiet --manifest-path "$REPO/Cargo.toml" -p distributed_cli --bin distributed
+}
+
+# gen [--check]: GameSurface JSON from each Rust surface export → typed
+# TypeScript in client/src/generated/<surface>/ (surface.json included, so a
+# changed Rust definition shows up as drift).
+gen() {
+	local check="${1:-}"
+	ensure_cli
+	local tmp
+	tmp="$(mktemp -d "${TMPDIR:-/tmp}/game-surfaces.XXXXXX")"
+	trap 'rm -rf "$tmp"' RETURN
+	for surface in "${SURFACES[@]}"; do
+		"$CLI" game-manifest --manifest-path "$SERVER/Cargo.toml" \
+			--entrypoint "game_demos::$surface::game_surface" --out "$tmp/$surface.json"
+		"$CLI" game-client --manifest "$tmp/$surface.json" \
+			--out "$CLIENT/src/generated/$surface" $check
+	done
 }
 
 run_demo() {
@@ -132,6 +162,8 @@ run_cluster() {
 smoke() {
 	ensure_sdk
 	ensure_client
+	log "generated clients are current"
+	gen --check
 	log "server: fmt, clippy, tests (bots smoke + movement fixture)"
 	cargo fmt --manifest-path "$SERVER/Cargo.toml" --check
 	cargo clippy --quiet --manifest-path "$SERVER/Cargo.toml" --all-targets -- -D warnings
@@ -144,8 +176,9 @@ smoke() {
 
 case "${1:-}" in
 	smoke) smoke ;;
+	gen) gen "${2:-}" ;;
 	list) printf '%s\n' "${DEMOS[@]}" ;;
-	"" | -h | --help | help) sed -n '2,16p' "$0" ;;
+	"" | -h | --help | help) sed -n '2,21p' "$0" ;;
 	*)
 		if [[ " ${CLUSTER_DEMOS[*]} " == *" $1 "* ]]; then
 			run_cluster "$1"

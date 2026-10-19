@@ -39,8 +39,8 @@ use std::time::Duration;
 
 use distributed_game::net::{GameServer, ServerConfig};
 use distributed_game::{
-    Ctx, EntitySchema, EntityState, Fact, FactStamp, FieldType, FieldValue, InputCredits, KindDef,
-    LeaveReason, PlayerId, StalePolicy, View, WorldView, Zone,
+    Ctx, EntitySchema, EntityState, Fact, FactStamp, FieldType, FieldValue, GameInput,
+    InputCredits, KindDef, LeaveReason, PlayerId, StalePolicy, View, WorldView, Zone,
 };
 use serde_json::{json, Value};
 
@@ -336,7 +336,7 @@ impl Zone for FreezeZone {
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<MoveInput> {
-        MoveInput::decode(payload)
+        MoveInput::from_payload(payload)
     }
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {

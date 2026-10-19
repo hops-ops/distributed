@@ -437,13 +437,25 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "distributed",
+ "distributed_game_macros",
  "futures-util",
  "hmac",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
  "tokio-tungstenite 0.30.0",
+]
+
+[[package]]
+name = "distributed_game_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
