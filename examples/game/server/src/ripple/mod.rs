@@ -33,7 +33,8 @@
 //!
 //! Entities: 1 `tier` (id 1, every zone), 2 `boss` (id 2, hoods), 3
 //! `player` (1000 + player, hoods; Arena movement fields so the client
-//! predicts with the Arena step — the boss stands on its central pillar).
+//! predicts with [`hood_step`], the Arena movement compiled to WebAssembly —
+//! the boss stands on its central pillar).
 //! They are `#[derive(Replicated)]` views; client events are the typed
 //! [`RippleEvent`] and input the `#[derive(GameInput)]` [`HoodInput`]; the
 //! browser client is generated from [`game_surface`]. (Tier-up payloads
@@ -52,7 +53,7 @@ use distributed_game::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::arena::movement::{self, MoveInput, MoveState};
+use crate::arena::movement::{self, MoveState};
 use crate::cluster::{ClusterDemo, ClusterOptions, World};
 use crate::common::{Demo, Guests};
 
@@ -209,7 +210,9 @@ pub enum RippleEvent {
 
 /// Boss Ripple's client surface.
 pub fn game_surface() -> GameSurface {
-    GameSurface::for_zone::<Ripple>("ripple").events::<RippleEvent>()
+    GameSurface::for_zone::<Ripple>("ripple")
+        .events::<RippleEvent>()
+        .predict::<HoodStep>()
 }
 
 /// Kind id of [`TierView`] (tests mirror fields by it).
@@ -347,33 +350,7 @@ impl ZoneDirectory for TierPlacement {
     }
 }
 
-/// Hood input: Arena movement + action bits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameInput)]
-pub struct HoodInput {
-    /// Stick x.
-    #[range(min = -127, max = 127)]
-    pub mx: i8,
-    /// Stick y.
-    #[range(min = -127, max = 127)]
-    pub my: i8,
-    /// [`HoodInput::DASH`].
-    #[buttons(dash)]
-    pub buttons: u8,
-    /// [`HoodInput::ATTACK`] | [`HoodInput::SMITE`].
-    #[buttons(attack, smite)]
-    pub action: u8,
-}
-
-impl HoodInput {
-    /// The movement part (the Arena's step).
-    pub fn movement(self) -> MoveInput {
-        MoveInput {
-            mx: self.mx,
-            my: self.my,
-            buttons: self.buttons,
-        }
-    }
-}
+pub use game_sim::ripple::{hood_step, HoodInput, HoodStep};
 
 /// Timers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,7 +484,8 @@ impl Ripple {
                     break;
                 };
                 let input = input.input;
-                f.state = movement::step(f.state, input.movement());
+                // The declared predicted step: what the client runs as WASM.
+                f.state = hood_step(&f.state, &input, &(), movement::DT);
                 f.credits -= 1;
                 if input.action & ACTION_SMITE != 0 {
                     blows.push((u32::MAX, f.name.clone()));
@@ -763,7 +741,7 @@ impl Zone for Ripple {
                 vx: m.vx,
                 vy: m.vy,
                 dash: m.dash,
-                cd: m.cooldown,
+                cd: m.cd,
                 name: f.name.clone(),
             };
             out.add(f.entity, &view);

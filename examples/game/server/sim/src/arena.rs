@@ -1,24 +1,23 @@
-//! Shared deterministic movement step for the Arena demo.
+//! The Arena's deterministic movement step, shared by every demo with an
+//! Arena capsule (Arena, Mob Pit, The Freeze, Boss Ripple).
 //!
-//! **This file has a twin:** `examples/game/client/src/arena/movement.ts`.
-//! The client predicts its own capsule with the same step, so both must
-//! produce the same numbers for the same inputs. Rules that keep them equal:
+//! The server runs [`step`] in `on_tick`; the browser predicts its own
+//! capsule with the **same code** compiled to WebAssembly ([`arena_step`]
+//! is the `#[predict]` declaration; `distributed game-wasm` builds it).
+//! Prediction is exact because:
 //!
-//! - all state and arithmetic is binary32 (`f32` here, `Math.fround` after
-//!   every operation in TypeScript); only `+ - * /` and `sqrt` are used
-//!   (correctly rounded in both languages; no trig, no `powf`);
 //! - one input = one command frame of exactly [`DT`] seconds, independent
-//!   of the server's measured tick length;
+//!   of the server's measured tick length (the frame's `dt` is ignored);
 //! - after every step the replicated fields are snapped to their wire
 //!   quantization ([`canonicalize`]), so the server's state is exactly what
-//!   clients decode and a rebase never introduces error.
-//!
-//! `tests/movement_fixture.rs` writes `examples/game/fixtures/arena-movement.json`
-//! (inputs → states) and the client's `tests/movement-parity.test.mjs` replays
-//! it through the TypeScript step. Change both files together, then
-//! regenerate with `UPDATE_GOLDEN=1 cargo test --test movement_fixture`.
+//!   clients decode and a rebase never introduces error;
+//! - only IEEE operations that are correctly rounded on every target are
+//!   used (`+ - * /`, `sqrt`, comparisons; no trig, no `powf`), so native
+//!   and WASM results are bit-identical. The client's
+//!   `tests/prediction-wasm.test.mjs` proves it against the native build
+//!   over recorded input streams.
 
-use distributed_game::{FieldType, GameInput};
+use distributed_game::{predict, FieldType, GameInput, GameRecord};
 
 /// Command frame length (s): the 30 Hz tick.
 pub const DT: f32 = 1.0 / 30.0;
@@ -61,7 +60,7 @@ pub const VEL: FieldType = FieldType::quant_centered(16.0, 12);
 /// One command frame from the client: stick in `[-127, 127]` per axis
 /// (+x right, +y forward) and button bits. Wire payload `[mx, my, buttons]`
 /// (3 bytes); [`GameInput::from_payload`] clamps `-128` to `-127` and clears
-/// unknown buttons. The TypeScript encoder/sanitizer is generated from this.
+/// unknown buttons. The TypeScript encoder is generated from this.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameInput)]
 pub struct MoveInput {
     /// Stick x.
@@ -75,9 +74,10 @@ pub struct MoveInput {
     pub buttons: u8,
 }
 
-/// Everything the step reads. Every field is replicated, so a client can
-/// rebase its prediction on the authoritative copy.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// Everything the step reads. Every field is replicated under the same name
+/// (`player` kinds: `x y vx vy dash cd`), so a client can rebase its
+/// prediction on the authoritative copy; the record is the predicted state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, GameRecord)]
 pub struct MoveState {
     /// Position x.
     pub x: f32,
@@ -89,8 +89,15 @@ pub struct MoveState {
     pub vy: f32,
     /// Remaining dash frames.
     pub dash: u8,
-    /// Remaining cooldown frames.
-    pub cooldown: u8,
+    /// Remaining dash cooldown frames.
+    pub cd: u8,
+}
+
+/// The client-predicted step of every Arena capsule (`player` kinds whose
+/// zone takes a plain [`MoveInput`]: Arena, The Freeze).
+#[predict(ArenaStep, kind = "player")]
+pub fn arena_step(state: &MoveState, input: &MoveInput, _context: &(), _dt: f32) -> MoveState {
+    step(*state, *input)
 }
 
 /// Advance one command frame.
@@ -106,8 +113,8 @@ pub fn step(s: MoveState, input: MoveInput) -> MoveState {
         dy *= inv;
     }
 
-    s.cooldown = s.cooldown.saturating_sub(1);
-    if input.buttons & BUTTON_DASH != 0 && s.cooldown == 0 && s.dash == 0 {
+    s.cd = s.cd.saturating_sub(1);
+    if input.buttons & BUTTON_DASH != 0 && s.cd == 0 && s.dash == 0 {
         // Dash along the stick, else along the current velocity.
         let v2 = s.vx * s.vx + s.vy * s.vy;
         let dir = if l2 > 0.01 {
@@ -123,7 +130,7 @@ pub fn step(s: MoveState, input: MoveInput) -> MoveState {
             s.vx = nx * DASH_SPEED;
             s.vy = ny * DASH_SPEED;
             s.dash = DASH_FRAMES;
-            s.cooldown = DASH_COOLDOWN;
+            s.cd = DASH_COOLDOWN;
         }
     }
 
@@ -227,7 +234,7 @@ mod tests {
         vx: 0.0,
         vy: 0.0,
         dash: 0,
-        cooldown: 0,
+        cd: 0,
     };
 
     #[test]
@@ -305,19 +312,16 @@ mod tests {
             buttons: BUTTON_DASH,
         };
         let s = step(START, dash);
-        assert_eq!((s.dash, s.cooldown), (DASH_FRAMES - 1, DASH_COOLDOWN));
+        assert_eq!((s.dash, s.cd), (DASH_FRAMES - 1, DASH_COOLDOWN));
         assert!(s.vy > 13.9);
         let s = run(s, dash, 14);
         assert!(
             s.vy <= MAX_SPEED + 0.01,
             "dash over, back to walking: {s:?}"
         );
-        assert!(
-            s.cooldown > 0 && s.dash == 0,
-            "held button does not re-dash"
-        );
+        assert!(s.cd > 0 && s.dash == 0, "held button does not re-dash");
         let s = run(s, MoveInput::default(), 31);
-        assert_eq!(s.cooldown, 0);
+        assert_eq!(s.cd, 0);
     }
 
     #[test]

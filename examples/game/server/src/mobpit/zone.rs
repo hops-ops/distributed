@@ -1,8 +1,8 @@
 //! The Mob Pit zone: authoritative melee combat at 30 Hz.
 //!
-//! Movement reuses the Arena's predicted step ([`crate::arena::movement`],
-//! same floor and pillars) so the own capsule is client-predicted; combat is
-//! server-only. Entities:
+//! Movement reuses the Arena's step ([`crate::arena::movement`], same floor
+//! and pillars) through [`pit_step`], the declared predicted step the client
+//! runs as WebAssembly; combat is server-only. Entities:
 //!
 //! | kind | ids | fields |
 //! |---|---|---|
@@ -46,7 +46,7 @@ use distributed_game::{
 use super::board::BoardSnapshot;
 use super::crawler::{level_floor, KillReceipt, RecordKillInput};
 use super::world::MobPitWorld;
-use crate::arena::movement::{self, MoveInput, MoveState, PILLARS, PLAYER_RADIUS};
+use crate::arena::movement::{self, MoveState, PILLARS, PLAYER_RADIUS};
 use crate::arena::PillarView;
 use crate::common::Guests;
 
@@ -241,39 +241,12 @@ pub enum PitEvent {
 
 /// Mob Pit's client surface (also used by the leaderboard page).
 pub fn game_surface() -> GameSurface {
-    GameSurface::for_zone::<MobPit>("mobpit").events::<PitEvent>()
+    GameSurface::for_zone::<MobPit>("mobpit")
+        .events::<PitEvent>()
+        .predict::<PitStep>()
 }
 
-/// Input: the Arena's 3-byte frame (`[mx, my, buttons]`) with an attack
-/// bit next to dash.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameInput)]
-pub struct PitInput {
-    /// Stick x.
-    #[range(min = -127, max = 127)]
-    pub mx: i8,
-    /// Stick y.
-    #[range(min = -127, max = 127)]
-    pub my: i8,
-    /// [`PitInput::DASH`] | [`PitInput::ATTACK`].
-    #[buttons(dash, attack)]
-    pub buttons: u8,
-}
-
-impl PitInput {
-    /// The movement part (the Arena's step).
-    pub fn movement(self) -> MoveInput {
-        MoveInput {
-            mx: self.mx,
-            my: self.my,
-            buttons: self.buttons & MoveInput::DASH,
-        }
-    }
-
-    /// Attack held.
-    pub fn attack(self) -> bool {
-        self.buttons & Self::ATTACK != 0
-    }
-}
+pub use game_sim::mobpit::{pit_step, PitInput, PitStep};
 
 /// Input bit: attack (bit 0 is the Arena's dash).
 pub const BUTTON_ATTACK: u8 = PitInput::ATTACK;
@@ -552,7 +525,8 @@ impl MobPit {
                     break;
                 };
                 let input = input.input;
-                p.state = movement::step(p.state, input.movement());
+                // The declared predicted step: what the client runs as WASM.
+                p.state = pit_step(&p.state, &input, &(), movement::DT);
                 p.credits -= 1;
                 let (sx, sy) = (f32::from(input.mx), f32::from(input.my));
                 if sx * sx + sy * sy > 20.0 * 20.0 {
@@ -1014,7 +988,7 @@ impl Zone for MobPit {
                 vx: s.vx,
                 vy: s.vy,
                 dash: s.dash,
-                cd: s.cooldown,
+                cd: s.cd,
                 name: p.name.clone(),
                 hp: p.hp.clamp(0, 255) as u8,
                 face: p.face,

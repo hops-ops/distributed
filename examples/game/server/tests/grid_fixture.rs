@@ -1,15 +1,18 @@
-//! Golden fixture for the Endless Grid's procedural world and movement.
+//! Golden fixture for the Endless Grid's procedural world *content*
+//! (terrain, biomes, props), which the client still renders from a
+//! TypeScript twin.
 //!
 //! Writes/compares `examples/game/fixtures/grid-world.json`, which the
 //! TypeScript client replays in `client/tests/grid-world-parity.test.mjs`
 //! (bit-exact). Regenerate after an intended change to BOTH
-//! `server/src/grid/world.rs` and `client/src/grid/world.ts`:
-//! `UPDATE_GOLDEN=1 cargo test --test grid_fixture`.
+//! `server/sim/src/grid.rs` and `client/src/grid/world.ts`:
+//! `UPDATE_GOLDEN=1 cargo test --test grid_fixture`. Movement is not part
+//! of it: the client predicts with the Rust step compiled to WebAssembly
+//! (proved by `client/tests/prediction-wasm.test.mjs`).
 
 use std::path::PathBuf;
 
-use distributed_game::GameInput;
-use game_demos::grid::world::{self, MoveInput, BUTTON_SPRINT, DEFAULT_SEED};
+use game_demos::grid::world::{self, DEFAULT_SEED};
 use serde_json::{json, Value};
 
 const CELLS: [(i32, i32); 6] = [
@@ -40,52 +43,6 @@ fn cell_json(seed: u32, cell: (i32, i32)) -> Value {
     json!({ "cell": [cell.0, cell.1], "props": props, "heights": heights, "moisture": moisture, "biomes": biomes })
 }
 
-/// The densest of a few cells, so the walk bumps into props.
-fn busy_cell(seed: u32) -> (i32, i32) {
-    (0..12)
-        .map(|i| (i, 2))
-        .max_by_key(|c| {
-            world::cell_props(seed, *c)
-                .iter()
-                .filter(|p| p.solid)
-                .count()
-        })
-        .unwrap()
-}
-
-fn walk(seed: u32) -> Value {
-    let cell = busy_cell(seed);
-    let props = world::cell_props(seed, cell);
-    // Head for each solid prop in turn (pushing into it), then wander off.
-    let (mut x, mut y) = (16.0f32, 16.0f32);
-    let mut steps = Vec::new();
-    let targets: Vec<(f32, f32)> = props
-        .iter()
-        .filter(|p| p.solid)
-        .map(|p| (p.x, p.y))
-        .chain([(40.0, 16.0), (16.0, -5.0)])
-        .collect();
-    for (k, (tx, ty)) in targets.iter().enumerate() {
-        for _ in 0..60 {
-            let (dx, dy) = (tx - x, ty - y);
-            let l = (dx * dx + dy * dy).sqrt().max(1e-3);
-            let input = MoveInput {
-                mx: (dx / l * 127.0) as i8,
-                my: if k % 3 == 0 {
-                    -128
-                } else {
-                    (dy / l * 127.0) as i8
-                },
-                buttons: if k % 2 == 0 { BUTTON_SPRINT } else { 0 },
-            };
-            let decoded = MoveInput::from_payload(&input.to_payload()).unwrap();
-            (x, y) = world::step(x, y, decoded, &props);
-            steps.push(json!({ "input": [input.mx, input.my, input.buttons], "x": x, "y": y }));
-        }
-    }
-    json!({ "cell": [cell.0, cell.1], "start": [16.0, 16.0], "steps": steps })
-}
-
 fn build() -> Value {
     let seed = DEFAULT_SEED;
     let hashes = [0u32, 1, 0xdead_beef, u32::MAX].map(world::hash32);
@@ -94,16 +51,14 @@ fn build() -> Value {
         world::mix(0, 0, i32::MIN, i32::MAX),
     ];
     json!({
-        "description": "Endless Grid parity: Rust grid::world vs client/src/grid/world.ts",
+        "description": "Endless Grid world-content parity: Rust game_sim::grid vs client/src/grid/world.ts",
         "constants": {
             "seed": seed, "contentVersion": world::CONTENT_VERSION, "cell": world::CELL,
-            "propMargin": world::PROP_MARGIN, "hysteresis": world::HYSTERESIS,
-            "playerRadius": world::PLAYER_RADIUS, "walk": world::WALK_SPEED, "sprint": world::SPRINT_SPEED,
+            "propMargin": world::PROP_MARGIN,
             "hashes": hashes,
             "mix": mixes,
         },
         "cells": CELLS.iter().map(|c| cell_json(seed, *c)).collect::<Vec<_>>(),
-        "walk": walk(seed),
     })
 }
 
@@ -118,8 +73,7 @@ fn render(v: &Value) -> String {
         let sep = if i + 1 == cells.len() { "" } else { "," };
         out += &format!("    {cell}{sep}\n");
     }
-    out += &format!("  ],\n  \"walk\": {}\n}}\n", v["walk"]);
-    out
+    out + "  ]\n}\n"
 }
 
 #[test]

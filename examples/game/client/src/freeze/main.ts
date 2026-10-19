@@ -13,7 +13,7 @@ import type { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
-import { HALF, PILLARS, PLAYER_RADIUS } from '../arena/movement.ts';
+import { HALF, PILLARS, PLAYER_RADIUS } from '../arena/floor.ts';
 import { BUTTON, KIND, gemFields, playerFields, ritualFields, slimeFields, type KindName, type MoveInput } from '../generated/freeze/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';

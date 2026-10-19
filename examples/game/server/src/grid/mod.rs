@@ -40,7 +40,8 @@
 //! between zones is the client's choice of observed neighbours.
 
 pub mod dev;
-pub mod world;
+/// The procedural world, the walker step and its `#[predict]` declaration.
+pub use game_sim::grid as world;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -117,7 +118,9 @@ pub const EVENT_HELLO: u32 = GridHello::EVENT_ID;
 
 /// The grid's client surface.
 pub fn game_surface() -> GameSurface {
-    GameSurface::for_zone::<GridZone>("grid").events::<GridHello>()
+    GameSurface::for_zone::<GridZone>("grid")
+        .events::<GridHello>()
+        .predict::<world::GridStep>()
 }
 /// Most markers a cell keeps (oldest dropped first).
 pub const MAX_MARKERS: usize = 12;
@@ -484,6 +487,8 @@ impl Zone for GridZone {
                         break;
                     };
                     let input = input.input;
+                    // `world::grid_step` (the declared predicted step) with this
+                    // cell's props, which the zone already holds.
                     (w.x, w.y) = world::step(w.x, w.y, input, &self.props);
                     w.credits -= 1;
                     if input.buttons & world::BUTTON_MARK != 0 && w.mark_cooldown == 0 {

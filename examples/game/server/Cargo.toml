@@ -2,7 +2,7 @@
 # Own workspace (like tests/gateway-native) so demo-only dependencies never
 # reach the framework's lockfile; excluded from the root workspace.
 [workspace]
-members = ["."]
+members = [".", "sim"]
 resolver = "2"
 
 [package]
@@ -20,6 +20,8 @@ name = "game-demos"
 path = "src/main.rs"
 
 [dependencies]
+# The client-predicted simulation (also compiled to WASM for the browser).
+game_sim = { path = "sim" }
 distributed_game = { path = "../../../distributed_game", features = ["net", "cell", "sqlite"] }
 # Mob Pit: native durable SQLite cells + sorted-set leaderboards (Redis optional at runtime).
 distributed = { path = "../../..", features = ["cell-sqlite", "redis"] }

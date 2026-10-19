@@ -1,9 +1,10 @@
 /**
- * Rust ↔ TypeScript parity of the Endless Grid's procedural world and
- * movement: replays `examples/game/fixtures/grid-world.json` (written by
- * `server/tests/grid_fixture.rs`) through `src/grid/world.ts`. Every value
- * must match bit for bit — the client renders and predicts with the same
- * content the server collides against.
+ * Rust ↔ TypeScript parity of the Endless Grid's procedural world content
+ * (rendering only): replays `examples/game/fixtures/grid-world.json`
+ * (written by `server/tests/grid_fixture.rs`) through `src/grid/world.ts`.
+ * Every value must match bit for bit — the client draws the props the
+ * server collides against. Movement prediction runs the Rust step as WASM
+ * (`prediction-wasm.test.mjs`), so it has no TypeScript twin to check.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -20,10 +21,6 @@ test('constants and hashes match', () => {
 	assert.equal(c.contentVersion, world.CONTENT_VERSION);
 	assert.equal(c.cell, world.CELL);
 	assert.equal(c.propMargin, world.PROP_MARGIN);
-	assert.equal(c.hysteresis, world.HYSTERESIS);
-	assert.equal(f(c.playerRadius), world.PLAYER_RADIUS);
-	assert.equal(c.walk, world.WALK_SPEED);
-	assert.equal(c.sprint, world.SPRINT_SPEED);
 	assert.deepEqual([0, 1, 0xdeadbeef, 0xffffffff].map(world.hash32), c.hashes);
 	assert.deepEqual([world.mix(c.seed, 3, -5, 7), world.mix(0, 0, -2147483648, 2147483647)], c.mix);
 });
@@ -49,21 +46,6 @@ test('terrain, moisture, biomes and props are bit-identical', () => {
 		props += actual.length;
 	}
 	assert.ok(props > 10, 'fixture cells have props');
-});
-
-test('the movement step reproduces every Rust position', () => {
-	const walk = fixture.walk;
-	const props = world.cellProps(fixture.constants.seed, walk.cell);
-	let [x, y] = walk.start;
-	let pushed = 0;
-	walk.steps.forEach(({ input, x: wx, y: wy }, i) => {
-		const free = world.step(x, y, { mx: input[0], my: input[1], buttons: input[2] }, []);
-		[x, y] = world.step(x, y, { mx: input[0], my: input[1], buttons: input[2] }, props);
-		if (free[0] !== x || free[1] !== y) pushed += 1;
-		assert.equal(x, f(wx), `step ${i} x`);
-		assert.equal(y, f(wy), `step ${i} y`);
-	});
-	assert.ok(pushed > 0, 'the walk collides with props');
 });
 
 test('zone ids round-trip', () => {

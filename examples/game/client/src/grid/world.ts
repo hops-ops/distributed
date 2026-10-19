@@ -1,21 +1,20 @@
 /**
- * Procedural world and movement of the Endless Grid.
+ * Procedural world *content* of the Endless Grid, for rendering: terrain
+ * height, biomes, props, zone ids.
  *
- * **Twin of `examples/game/server/src/grid/world.rs`** — the server uses it
- * for collision, the client for rendering and prediction; nothing static
- * is replicated. Bit-identical by construction: `u32` hashing with
- * `Math.imul` / `>>> 0`, binary32 arithmetic with `f()` (= `Math.fround`)
- * after every operation, only `+ - * /`, `sqrt` and `floor`.
- * `tests/grid-world-parity.test.mjs` replays the Rust-written fixture
- * `examples/game/fixtures/grid-world.json`.
+ * **Twin of the generation in `examples/game/server/sim/src/grid.rs`**,
+ * bit-identical by construction (`u32` hashing with `Math.imul` / `>>> 0`,
+ * binary32 arithmetic with `f()` (= `Math.fround`) after every operation,
+ * only `+ - * /`, `sqrt` and `floor`) and checked against the Rust-written
+ * fixture `examples/game/fixtures/grid-world.json` by
+ * `tests/grid-world-parity.test.mjs`. Serving world content from WASM too
+ * would retire this file; it is a separate follow-up.
  *
- * The input type, its sanitize, the button bits and the wire quantization
- * of positions come from the client generated from the Rust surface
- * (`../generated/grid`).
+ * Movement is **not** here: the own walker is predicted by the Rust step
+ * compiled to WebAssembly (`grid_step`, which generates the cell's props
+ * itself), wired by the generated client (`../generated/grid`).
  */
-import { dequantizeLinear, quantizeLinear } from '@hops-ops/distributed/game';
-
-import { BUTTON, FIELD_TYPES, sanitizeInput, type MoveInput } from '../generated/grid/index.ts';
+import { BUTTON } from '../generated/grid/index.ts';
 
 export type { MoveInput } from '../generated/grid/index.ts';
 
@@ -28,16 +27,10 @@ export const SUB = 4;
 export const SUB_SIZE = 8;
 export const PROP_MARGIN = 2;
 export const PROP_SPAN = 4;
-export const HYSTERESIS = 0.5;
+/** Walker radius (m, for drawing; collision is in the WASM step). */
 export const PLAYER_RADIUS = f(0.45);
-export const WALK_SPEED = 6;
-export const SPRINT_SPEED = 10;
-export const DT = f(1 / 30);
-export const OUTSIDE_LIMIT = 2;
 export const BUTTON_SPRINT = BUTTON.sprint;
 export const BUTTON_MARK = BUTTON.mark;
-/** Wire quantization of local positions (server `grid::world::POS`). */
-export const POS = FIELD_TYPES.walker.x;
 
 export const BIOMES = ['highlands', 'steppe', 'forest', 'meadow'] as const;
 const PROP_DENSITY = [0.4375, 0.1875, 0.75, 0.3125];
@@ -168,58 +161,6 @@ export function cellProps(seed: number, cell: Cell): Prop[] {
 		}
 	}
 	return props;
-}
-
-export function snap(v: number): number {
-	return dequantizeLinear(quantizeLinear(v, POS.min, POS.max, POS.bits), POS.min, POS.max, POS.bits);
-}
-
-export function collide(x0: number, y0: number, radius: number, props: readonly Prop[]): [number, number] {
-	let x = x0;
-	let y = y0;
-	for (const p of props) {
-		if (!p.solid) continue;
-		const ox = f(x - p.x);
-		const oy = f(y - p.y);
-		const d2 = f(f(ox * ox) + f(oy * oy));
-		const min = f(radius + p.r);
-		if (d2 < f(min * min)) {
-			const d = f(Math.sqrt(d2));
-			const [nx, ny] = d > f(1e-6) ? [f(ox / d), f(oy / d)] : [1, 0];
-			x = f(p.x + f(nx * min));
-			y = f(p.y + f(ny * min));
-		}
-	}
-	return [x, y];
-}
-
-/** Advance a walker one command frame inside its cell (see the Rust docs). */
-export function step(x: number, y: number, raw: MoveInput, props: readonly Prop[]): [number, number] {
-	const input = sanitizeInput(raw);
-	let dx = f(input.mx / 127);
-	let dy = f(input.my / 127);
-	const l2 = f(f(dx * dx) + f(dy * dy));
-	if (l2 > 1) {
-		const inv = f(1 / f(Math.sqrt(l2)));
-		dx = f(dx * inv);
-		dy = f(dy * inv);
-	}
-	const speed = (input.buttons & BUTTON_SPRINT) !== 0 ? SPRINT_SPEED : WALK_SPEED;
-	const nx = f(x + f(f(dx * speed) * DT));
-	const ny = f(y + f(f(dy * speed) * DT));
-	const [cx, cy] = collide(nx, ny, PLAYER_RADIUS, props);
-	const lo = -OUTSIDE_LIMIT;
-	const hi = CELL + OUTSIDE_LIMIT;
-	return [snap(Math.min(hi, Math.max(lo, cx))), snap(Math.min(hi, Math.max(lo, cy)))];
-}
-
-/** Neighbour offset a walker belongs to past the hysteresis (x first), or undefined. */
-export function crossing(x: number, y: number): [number, number] | undefined {
-	if (x < -HYSTERESIS) return [-1, 0];
-	if (x > CELL + HYSTERESIS) return [1, 0];
-	if (y < -HYSTERESIS) return [0, -1];
-	if (y > CELL + HYSTERESIS) return [0, 1];
-	return undefined;
 }
 
 export const MAX_CELL = 1_000_000;
