@@ -3,12 +3,15 @@
 // `distributed_game/tests/fixtures/authoring.json` holds a sample surface and
 // payloads encoded by the Rust derives; the TypeScript generated from that
 // surface is pinned in `distributed_cli/tests/fixtures/game-client/sample/`.
-// This test loads the generated files (Node strips their types) and checks
-// they encode and decode byte-for-byte like Rust.
+// This test compiles the generated files to JavaScript (so it also runs on
+// Node 20, which cannot load .ts) and checks they encode and decode
+// byte-for-byte like Rust.
 import assert from 'node:assert/strict';
-import { cpSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { after, before, test } from 'node:test';
+
+import ts from 'typescript';
 
 import { decodeValue, fromHex, toHex } from '@hops-ops/distributed/game';
 
@@ -24,8 +27,14 @@ let gen;
 before(async () => {
 	// Inside the package so `@hops-ops/distributed/game` resolves to this build.
 	dir = mkdtempSync(fileURLToPath(new URL('./.generated-', import.meta.url)));
-	cpSync(GOLDEN, dir, { recursive: true });
-	gen = await import(pathToFileURL(`${dir}/index.ts`).href);
+	for (const file of readdirSync(GOLDEN)) {
+		if (!file.endsWith('.ts')) continue;
+		const { outputText } = ts.transpileModule(readFileSync(`${GOLDEN}/${file}`, 'utf8'), {
+			compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 }
+		});
+		writeFileSync(`${dir}/${file.replace(/\.ts$/, '.js')}`, outputText.replace(/(from '\.\/[\w-]+)\.ts'/g, "$1.js'"));
+	}
+	gen = await import(pathToFileURL(`${dir}/index.js`).href);
 });
 after(() => rmSync(dir, { recursive: true, force: true }));
 
