@@ -857,13 +857,16 @@ impl Zone for MobPit {
     }
 
     fn on_join(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
-        let principal = ctx
+        let (principal, ticket_name) = ctx
             .player(player)
-            .map(|p| p.principal.clone())
+            .map(|p| (p.principal.clone(), p.name.clone()))
             .unwrap_or_default();
+        // A dev guest's registered name, else the name the ticket issuer
+        // vouched for (e.g. a SvelteKit session), else the principal.
         let name = self
             .guests
             .name(&principal)
+            .or(ticket_name)
             .unwrap_or_else(|| principal.clone());
         let (x, y) = spawn_point(player);
         let entity = 1000 + player.0;
