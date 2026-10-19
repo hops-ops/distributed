@@ -142,6 +142,9 @@ export interface MoveState {
 export interface PitRules {
 	readonly tiers: readonly MobTier[];
 	readonly states: readonly string[];
+	readonly attackRange: number;
+	readonly attackHalfAngle: number;
+	readonly swingFrames: number;
 }
 
 /** Record `Profile` (`#[derive(GameRecord)]`). */

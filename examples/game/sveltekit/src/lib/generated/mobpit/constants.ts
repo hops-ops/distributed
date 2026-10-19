@@ -10,5 +10,8 @@ export const PIT_RULES: PitRules = {
 		{ tier: 2, radius: 0.699999988079071, tele: 2.200000047683716 },
 		{ tier: 3, radius: 0.800000011920929, tele: 2.5999999046325684 }
 	],
-	states: ['idle', 'chase', 'windup', 'recover', 'return', 'dead']
+	states: ['idle', 'chase', 'windup', 'recover', 'return', 'dead'],
+	attackRange: 2.200000047683716,
+	attackHalfAngle: 1.0471975803375244,
+	swingFrames: 6
 };

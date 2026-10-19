@@ -306,6 +306,12 @@ pub struct PitRules {
     pub tiers: Vec<MobTier>,
     /// `state` names by value.
     pub states: Vec<String>,
+    /// Melee reach (m, from the player's centre to the mob's edge).
+    pub attack_range: f32,
+    /// Half angle of the swing cone (radians).
+    pub attack_half_angle: f32,
+    /// Swing animation length (ticks; the player's `swing` counts down from it).
+    pub swing_frames: u8,
 }
 
 /// The `PIT_RULES` constant.
@@ -319,6 +325,9 @@ pub fn pit_rules() -> PitRules {
             })
             .collect(),
         states: MOB_STATES.map(String::from).to_vec(),
+        attack_range: ATTACK_RANGE,
+        attack_half_angle: ATTACK_ARC_COS.acos(),
+        swing_frames: SWING_FRAMES,
     }
 }
 
