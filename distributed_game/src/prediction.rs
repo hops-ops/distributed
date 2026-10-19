@@ -46,6 +46,9 @@
 //! start of the buffer; negative values are [`AbiError`] codes. No allocation
 //! crosses the boundary and nothing is JSON: floats stay binary32.
 //!
+//! Pure functions (`#[game_pure]`, [`crate::pure`]) live in the same module
+//! and share the buffer and ABI version: `dg_pure_<fn>(arg_len) -> i32`.
+//!
 //! # Determinism
 //!
 //! Native and WASM results are bit-identical when the step uses only
