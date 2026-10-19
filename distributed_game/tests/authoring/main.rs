@@ -14,10 +14,10 @@ use std::time::Duration;
 use distributed_game::protocol::{Reader, Writer};
 use distributed_game::surface::{EventPayload, GameSurface};
 use distributed_game::{
-    fact_channel, predict, schema, Correction, Ctx, EntitySchema, FactCommand, FactOutcome,
-    FactSettlement, FieldType, FieldValue, GameEvent, GameInput, GameRecord, HostConfig,
-    ManualClock, MemoryFactSink, PlayerId, Replicated, RetryPolicy, Role, TicketClaims, Wire,
-    WireType, WorldView, Zone, ZoneHost,
+    fact_channel, game_pure, predict, schema, Correction, Ctx, EntitySchema, FactCommand,
+    FactOutcome, FactSettlement, FieldType, FieldValue, GameEvent, GameInput, GameRecord,
+    HostConfig, ManualClock, MemoryFactSink, PlayerId, Replicated, RetryPolicy, Role, TicketClaims,
+    Wire, WireType, WorldView, Zone, ZoneHost,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -185,11 +185,47 @@ pub fn sample_step(
     }
 }
 
+/// A sample pure function compiled next to the step (generated `sampleMirror`).
+#[game_pure(SampleMirrorFn)]
+pub fn sample_mirror(wind: &SampleWind) -> SampleWind {
+    SampleWind {
+        speed: -wind.speed,
+        gusts: wind.gusts.wrapping_add(1),
+    }
+}
+
+/// One without an argument (generated `sampleRows()`).
+#[game_pure(SampleRowsFn)]
+pub fn sample_rows() -> Vec<Row> {
+    sample_board().kills
+}
+
+/// A record only a constant uses; its value is quantized like a payload.
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct Spot {
+    #[quant(min = 0.0, max = 64.0, bits = 10)]
+    pub at: f32,
+    pub label: String,
+}
+
+pub fn sample_spot() -> Spot {
+    Spot {
+        at: 1.3,
+        label: "dock".into(),
+    }
+}
+
 pub fn sample_surface() -> GameSurface {
     GameSurface::for_zone::<Sample>("sample")
         .events::<SampleEvent>()
         .events::<Ping>()
         .predict::<SampleStep>()
+        .pure::<SampleRowsFn>()
+        .pure::<SampleMirrorFn>()
+        .constant("sample_board", &sample_board())
+        .constant("sample_gusts", &vec![0.1f32, -2.5])
+        .constant("sample_spot", &sample_spot())
+        .record::<SampleWind>()
 }
 
 // ---- a zone using all of it ----------------------------------------------
@@ -455,7 +491,7 @@ fn records_round_trip_through_the_value_codec() {
 #[test]
 fn surface_describes_everything_once() {
     let surface = sample_surface();
-    assert_eq!(surface.schema_version, 2);
+    assert_eq!(surface.schema_version, 3);
     assert_eq!(surface.kinds.len(), 3);
     assert_eq!(
         surface.kinds[0].fields[0].correction,
@@ -489,7 +525,10 @@ fn surface_describes_everything_once() {
         }
     );
     let records: Vec<_> = surface.records.iter().map(|r| r.name.as_str()).collect();
-    assert_eq!(records, ["Board", "Row", "SampleState", "SampleWind"]);
+    assert_eq!(
+        records,
+        ["Board", "Row", "SampleState", "SampleWind", "Spot"]
+    );
     // JSON round trip (the CLI reads this shape).
     let json = surface.to_json();
     let back: GameSurface = serde_json::from_str(&json).unwrap();
@@ -679,6 +718,8 @@ fn hex(bytes: &[u8]) -> String {
 
 #[test]
 fn golden_fixture_is_current() {
+    use distributed_game::prediction::PredictContext;
+    use distributed_game::pure::call_bytes;
     let input = SampleInput {
         mx: -128,
         my: 100,
@@ -712,6 +753,25 @@ fn golden_fixture_is_current() {
             "sanitized": {"mx": sanitized.mx, "my": sanitized.my, "buttons": sanitized.buttons, "aim": aim_wire, "power": 0.25, "viewTick": 123_456},
         },
         "events": events,
+        // Each constant's encoding: the generated literal must decode-equal it.
+        "constants": {
+            "sample_board": hex(&distributed_game::codec::to_bytes(&sample_board())),
+            "sample_gusts": hex(&distributed_game::codec::to_bytes(&vec![0.1f32, -2.5])),
+            "sample_spot": hex(&distributed_game::codec::to_bytes(&sample_spot())),
+        },
+        // Native calls of the pure functions (argument → output bytes).
+        "pures": [
+            {
+                "export": "sample_mirror",
+                "arg": hex(&SampleWind { speed: 1.5, gusts: 65535 }.encode_context()),
+                "output": hex(&call_bytes::<SampleMirrorFn>(&SampleWind { speed: 1.5, gusts: 65535 }.encode_context()).unwrap()),
+            },
+            {
+                "export": "sample_rows",
+                "arg": "",
+                "output": hex(&call_bytes::<SampleRowsFn>(&[]).unwrap()),
+            },
+        ],
     });
     let text = serde_json::to_string_pretty(&fixture).unwrap() + "\n";
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/authoring.json");
@@ -835,4 +895,61 @@ fn the_predicted_kind_must_be_replicated() {
 #[should_panic(expected = "must take the zone's input type")]
 fn the_step_takes_the_zone_input() {
     let _ = GameSurface::for_zone::<Sample>("sample").predict::<OtherInputStep>();
+}
+
+// ---- pure functions, constants, standalone codecs ---------------------------
+
+#[test]
+fn pure_functions_constants_and_codecs_are_declared() {
+    use distributed_game::pure::{call_bytes, GamePure};
+    let surface = sample_surface();
+    let pures: Vec<_> = surface.pures.iter().map(|p| p.export.as_str()).collect();
+    assert_eq!(pures, ["sample_mirror", "sample_rows"], "sorted by export");
+    let mirror = &surface.pures[0];
+    assert_eq!(mirror.package, "distributed_game");
+    assert_eq!(
+        mirror.arg,
+        Some(WireType::Record {
+            name: "SampleWind".into()
+        })
+    );
+    assert_eq!(mirror.output, mirror.arg.clone().unwrap());
+    assert_eq!(surface.pures[1].arg, None);
+    assert_eq!(<SampleRowsFn as GamePure>::EXPORT, "sample_rows");
+    let rows: Vec<Row> =
+        distributed_game::codec::from_bytes(&call_bytes::<SampleRowsFn>(&[]).unwrap()).unwrap();
+    assert_eq!(rows, sample_board().kills);
+
+    let names: Vec<_> = surface.constants.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["sample_board", "sample_gusts", "sample_spot"]);
+    // Values are what a client decodes: exact binary32, quantized, Rust field names.
+    assert_eq!(surface.constants[1].value, json!([f64::from(0.1f32), -2.5]));
+    let spot = &surface.constants[2].value;
+    let quantized = f32_of(
+        FieldType::QuantF32 {
+            min: 0.0,
+            max: 64.0,
+            bits: 10,
+        },
+        1.3,
+    );
+    assert_eq!(spot, &json!({"at": quantized, "label": "dock"}));
+    assert_ne!(quantized, f64::from(1.3f32));
+    assert_eq!(
+        surface.constants[0].value["kills"][0]["score"],
+        9_007_199_254_740_991u64
+    );
+    assert_eq!(surface.codecs, ["SampleWind"]);
+}
+
+#[test]
+#[should_panic(expected = "snake_case")]
+fn constant_names_are_snake_case() {
+    let _ = sample_surface().constant("Bad", &1u8);
+}
+
+#[test]
+#[should_panic(expected = "added twice")]
+fn pure_exports_are_unique() {
+    let _ = sample_surface().pure::<SampleRowsFn>();
 }

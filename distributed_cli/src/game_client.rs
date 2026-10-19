@@ -1,5 +1,5 @@
 //! `distributed game-client`: typed TypeScript for one `distributed_game`
-//! zone surface (`GameSurface` JSON, schema v2, from `distributed
+//! zone surface (`GameSurface` JSON, schema v3, from `distributed
 //! game-manifest`).
 //!
 //! The generated files import only `@hops-ops/distributed/game` and are
@@ -9,9 +9,11 @@
 //! |---|---|
 //! | `schema.ts` | `KIND` ids, per-kind field interfaces + accessors over rendered entities, field wire types, `CORRECTIONS` defaults |
 //! | `input.ts` | the input interface, `BUTTON` bits, `encodeInput` / `decodeInput` / `sanitizeInput` |
-//! | `events.ts` | record + event payload interfaces, `EVENT` ids, `EVENTS` codecs, `decodeEvent`, `onEvent` |
+//! | `events.ts` | record + event payload interfaces, `EVENT` ids, `EVENTS` codecs, `decodeEvent`, `onEvent`; `encode<Record>` / `decode<Record>` for the surface's standalone codecs |
 //! | `client.ts` | `create<Surface>Client`: a `GameClient` with the input encoder and correction defaults wired in, plus typed `on`; with a predicted step, prediction defaults to the compiled WebAssembly step |
 //! | `predict.ts` | only with a `#[predict]` step: its state/context layouts, the module URL (`wasm/<surface>.wasm`, built by `distributed game-wasm`) and `create<Surface>Prediction` |
+//! | `pures.ts` | only with `#[game_pure]` functions: `create<Surface>Pures`, one typed wrapper per function over the same module |
+//! | `constants.ts` | only with constants: each value as a typed TypeScript literal (exact binary32 floats) |
 //! | `index.ts` | re-exports |
 //! | `surface.json` | the surface it was generated from (so `--check` also catches manifest drift) |
 //!
@@ -27,7 +29,7 @@ use serde::Deserialize;
 use crate::client_compiler::GeneratedClientFile;
 
 /// The only surface schema version this generator understands.
-pub const GAME_SURFACE_SCHEMA_VERSION: u32 = 2;
+pub const GAME_SURFACE_SCHEMA_VERSION: u32 = 3;
 
 /// The only prediction ABI version this generator (and the SDK) speaks.
 pub const PREDICT_ABI_VERSION: u32 = 1;
@@ -55,7 +57,7 @@ impl ImportExtension {
     }
 }
 
-// ---- surface mirror (schema v2) -------------------------------------------
+// ---- surface mirror (schema v3) -------------------------------------------
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -69,8 +71,47 @@ struct Surface {
     records: Vec<Record>,
     #[serde(default)]
     predict: Option<Predict>,
+    #[serde(default)]
+    pures: Vec<Pure>,
+    #[serde(default)]
+    constants: Vec<Constant>,
+    #[serde(default)]
+    codecs: Vec<String>,
 }
 
+/// A pure function compiled into the surface's module (`#[game_pure]`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Pure {
+    pub(crate) export: String,
+    pub(crate) package: String,
+    #[serde(default)]
+    arg: Option<Wire>,
+    output: Wire,
+    pub(crate) abi: u32,
+}
+
+/// A constant emitted as TypeScript data.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Constant {
+    name: String,
+    #[serde(rename = "type")]
+    ty: Wire,
+    value: serde_json::Value,
+}
+
+/// What `distributed game-wasm` compiles for a surface: one module from one
+/// Cargo package exporting the predicted step and the pure functions.
+#[derive(Debug)]
+pub(crate) struct ModulePlan {
+    /// The declaring Cargo package.
+    pub(crate) package: String,
+    /// Required function exports (`dg_predict_<step>`, `dg_pure_<fn>`).
+    pub(crate) exports: Vec<String>,
+    /// ABI version.
+    pub(crate) abi: u32,
+}
 /// The zone's client-predicted step (`#[predict]`).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -372,17 +413,47 @@ pub fn generate_game_client(
     if let Some(predict) = gen.predict_ts()? {
         files.push(file("predict.ts", predict));
     }
+    if let Some(pures) = gen.pures_ts()? {
+        files.push(file("pures.ts", pures));
+    }
+    if let Some(constants) = gen.constants_ts()? {
+        files.push(file("constants.ts", constants));
+    }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
 }
 
-/// What `distributed game-wasm` builds for a surface: its name and its
-/// validated predicted step (`None` when the zone predicts nothing).
-pub(crate) fn surface_prediction(manifest_json: &str) -> GenResult<(String, Option<Predict>)> {
+/// What `distributed game-wasm` builds for a surface: its name and the
+/// validated module plan (`None` when the zone compiles nothing: no
+/// predicted step and no pure functions).
+pub(crate) fn surface_module(manifest_json: &str) -> GenResult<(String, Option<ModulePlan>)> {
     validate_game_surface(manifest_json)?;
     let surface: Surface =
         serde_json::from_str(manifest_json).map_err(|e| format!("invalid game surface: {e}"))?;
-    Ok((surface.name, surface.predict))
+    let package = surface
+        .predict
+        .as_ref()
+        .map(|p| p.package.clone())
+        .or_else(|| surface.pures.first().map(|p| p.package.clone()));
+    let plan = package.map(|package| {
+        let mut exports: Vec<String> = surface
+            .predict
+            .iter()
+            .map(|p| format!("dg_predict_{}", p.export))
+            .collect();
+        exports.extend(
+            surface
+                .pures
+                .iter()
+                .map(|p| format!("dg_pure_{}", p.export)),
+        );
+        ModulePlan {
+            package,
+            exports,
+            abi: PREDICT_ABI_VERSION,
+        }
+    });
+    Ok((surface.name, plan))
 }
 
 /// Module path of a surface's compiled step, relative to the generated
@@ -489,7 +560,87 @@ impl<'a> Gen<'a> {
         }
         self.record_order()?;
         self.check_predict()?;
+        self.check_pures()?;
+        self.check_constants()?;
+        for codec in &self.surface.codecs {
+            if !self.records.contains_key(codec.as_str()) {
+                return Err(format!("codec record {codec} is missing"));
+            }
+        }
         self.check_exports()
+    }
+
+    /// Pure functions: valid unique exports, one Cargo package (the
+    /// predicted step's, if any), known types, the ABI this generator speaks.
+    fn check_pures(&self) -> GenResult<()> {
+        let mut exports = BTreeSet::new();
+        let mut wrappers = BTreeSet::new();
+        let package = self.surface.predict.as_ref().map(|p| p.package.as_str());
+        for pure in &self.surface.pures {
+            if pure.abi != PREDICT_ABI_VERSION {
+                return Err(format!(
+                    "pure function {} uses ABI v{}; this CLI generates ABI v{PREDICT_ABI_VERSION}",
+                    pure.export, pure.abi
+                ));
+            }
+            if pure.export.is_empty()
+                || !pure
+                    .export
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Err(format!("invalid pure function export {:?}", pure.export));
+            }
+            if !exports.insert(pure.export.as_str()) || !wrappers.insert(camel(&pure.export)) {
+                return Err(format!("duplicate pure function {}", pure.export));
+            }
+            if matches!(camel(&pure.export).as_str(), "ready" | "loaded" | "module") {
+                return Err(format!(
+                    "pure function name {} is reserved by the generated handle",
+                    pure.export
+                ));
+            }
+            if pure.package.is_empty() {
+                return Err(format!(
+                    "pure function {} names no Cargo package",
+                    pure.export
+                ));
+            }
+            let expected = package.unwrap_or(self.surface.pures[0].package.as_str());
+            if pure.package != expected {
+                return Err(format!(
+                    "pure function {} is declared in Cargo package {}, but the surface's module is built from {expected}",
+                    pure.export, pure.package
+                ));
+            }
+            if let Some(arg) = &pure.arg {
+                self.check_type(arg, &pure.export)?;
+            }
+            self.check_type(&pure.output, &pure.export)?;
+        }
+        Ok(())
+    }
+
+    /// Constants: unique `snake_case` names, values that match their type.
+    fn check_constants(&self) -> GenResult<()> {
+        let mut names = BTreeSet::new();
+        for constant in &self.surface.constants {
+            let valid = constant.name.starts_with(|c: char| c.is_ascii_lowercase())
+                && constant
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if !valid || !names.insert(constant.name.as_str()) {
+                return Err(format!(
+                    "constant name {:?} is not snake_case or is declared twice",
+                    constant.name
+                ));
+            }
+            self.check_type(&constant.ty, &constant.name)?;
+            self.literal(&constant.ty, &constant.value, 0)
+                .map_err(|e| format!("constant {}: {e}", constant.name))?;
+        }
+        Ok(())
     }
 
     /// The predicted step names a kind of this surface, a state record whose
@@ -620,6 +771,19 @@ impl<'a> Gen<'a> {
         }
         for event in &self.surface.events {
             names.push(format!("{}Event", pascal(&event.name)));
+        }
+        if !self.surface.pures.is_empty() {
+            names.extend(["PURES", "PURES_WASM_URL"].map(String::from));
+            names.push(format!("create{prefix}Pures"));
+            names.push(format!("{prefix}Pures"));
+            names.push(format!("{prefix}PureFns"));
+        }
+        for c in &self.surface.constants {
+            names.push(constant(&c.name));
+        }
+        for codec in &self.surface.codecs {
+            names.push(format!("encode{codec}"));
+            names.push(format!("decode{codec}"));
         }
         if self.surface.predict.is_some() {
             names.extend(
@@ -1013,10 +1177,12 @@ impl<'a> Gen<'a> {
         if uses_fields {
             sdk.extend(["decodePayload", "encodePayload", "type PayloadLayout"]);
         }
-        if uses_value {
+        let has_codecs = !self.surface.codecs.is_empty();
+        if uses_value || has_codecs {
             sdk.extend(["decodeValue", "encodeValue"]);
         }
         if uses_value
+            || has_codecs
             || records
                 .iter()
                 .any(|r| self.encoded_records().contains(r.name.as_str()))
@@ -1044,6 +1210,14 @@ impl<'a> Gen<'a> {
                     indent(&self.layout(&record.fields))
                 );
             }
+        }
+
+        for codec in &self.surface.codecs {
+            let c = constant(codec);
+            let _ = writeln!(
+                out,
+                "\n/** Encode a `{codec}` record (standalone codec, e.g. served over HTTP). */\nexport function encode{codec}(value: {codec}): Uint8Array {{\n\treturn encodeValue({c}_TYPE, value);\n}}\n\n/** Decode a whole `{codec}` record (throws on trailing or missing bytes). */\nexport function decode{codec}(bytes: Uint8Array): {codec} {{\n\treturn decodeValue({c}_TYPE, bytes) as {codec};\n}}"
+            );
         }
 
         for event in events {
@@ -1158,6 +1332,7 @@ impl<'a> Gen<'a> {
         if let Some(input) = &self.surface.input {
             input.fields.iter().for_each(|f| walk(&f.ty, &mut pending));
         }
+        pending.extend(self.surface.codecs.iter().map(String::as_str));
         let mut seen = BTreeSet::new();
         while let Some(name) = pending.pop() {
             if seen.insert(name) {
@@ -1250,9 +1425,16 @@ impl<'a> Gen<'a> {
 
     fn index_ts(&self) -> String {
         let mut out = self.header("Everything generated for this surface.");
-        let mut modules = vec!["client", "events", "input"];
+        let mut modules = vec!["client"];
+        if !self.surface.constants.is_empty() {
+            modules.push("constants");
+        }
+        modules.extend(["events", "input"]);
         if self.surface.predict.is_some() {
             modules.push("predict");
+        }
+        if !self.surface.pures.is_empty() {
+            modules.push("pures");
         }
         modules.push("schema");
         for module in modules {
@@ -1362,6 +1544,295 @@ impl<'a> Gen<'a> {
     }
 }
 
+impl Gen<'_> {
+    /// Records reachable from `roots` (nested ones included).
+    fn reachable<'t>(&self, roots: impl IntoIterator<Item = &'t Wire>) -> BTreeSet<&str> {
+        let mut pending = Vec::new();
+        for root in roots {
+            top_records(root, &mut pending);
+        }
+        let mut seen = BTreeSet::new();
+        while let Some(name) = pending.pop() {
+            if let Some((name, record)) = self.records.get_key_value(name.as_str()) {
+                if seen.insert(*name) {
+                    for field in &record.fields {
+                        top_records(&field.ty, &mut pending);
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    /// `const <RECORD>_TYPE: WireType` for `names`, dependencies first.
+    fn type_consts(&self, names: &BTreeSet<&str>) -> GenResult<String> {
+        let mut out = String::new();
+        for record in self.record_order()? {
+            if names.contains(record.name.as_str()) {
+                let _ = writeln!(
+                    out,
+                    "const {}_TYPE: WireType = {{\n\ttype: 'record',\n\tfields: {}\n}};\n",
+                    constant(&record.name),
+                    indent(&self.layout(&record.fields))
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// `import type { A, B } from './events'` for the records `types`
+    /// mention directly.
+    fn import_records<'t>(&self, types: impl IntoIterator<Item = &'t Wire>) -> String {
+        let mut names = Vec::new();
+        for ty in types {
+            top_records(ty, &mut names);
+        }
+        let names: BTreeSet<String> = names.into_iter().collect();
+        if names.is_empty() {
+            return String::new();
+        }
+        format!(
+            "import type {{ {} }} from '{}';\n",
+            names.into_iter().collect::<Vec<_>>().join(", "),
+            self.local("events")
+        )
+    }
+
+    fn pures_ts(&self) -> GenResult<Option<String>> {
+        let pures = &self.surface.pures;
+        let Some(first) = pures.first() else {
+            return Ok(None);
+        };
+        let prefix = pascal(&self.surface.name);
+        let mut out = self.header(
+            "Pure functions: the Rust `#[game_pure]` fns compiled to WebAssembly (binary ABI).",
+        );
+        let types: Vec<&Wire> = pures
+            .iter()
+            .flat_map(|p| p.arg.iter().chain([&p.output]))
+            .collect();
+        let records = self.reachable(types.iter().copied());
+        let _ = writeln!(
+            out,
+            "import {{ createWasmPures, type WasmPures, type WasmSource{} }} from '{SDK}';\n",
+            if records.is_empty() && !types.iter().any(|t| !matches!(t, Wire::Record { .. })) {
+                ""
+            } else {
+                ", type WireType"
+            }
+        );
+        let imports = self.import_records(types.iter().copied());
+        if !imports.is_empty() {
+            out.push_str(&imports);
+            out.push('\n');
+        }
+        out.push_str(&self.type_consts(&records)?);
+        let _ = writeln!(
+            out,
+            "/** The pure functions (`#[game_pure]`) of Cargo package `{}`: wrapper name → module export. */\nexport const PURES = {{",
+            first.package
+        );
+        for pure in pures {
+            let _ = writeln!(
+                out,
+                "\t{}: {{ export: {}, abi: {} }},",
+                key(&camel(&pure.export)),
+                string(&pure.export),
+                pure.abi
+            );
+        }
+        out.push_str("} as const;\n\n");
+        let _ = writeln!(
+            out,
+            "/** The compiled module (`distributed game-wasm`; shared with the predicted step); bundlers emit it as an asset. */\nexport const PURES_WASM_URL: URL = new URL({}, import.meta.url);\n",
+            string(&format!("./{}", predict_wasm_path(&self.surface.name)))
+        );
+        let _ = writeln!(
+            out,
+            "/** Typed calls of the compiled functions (synchronous; they throw until `ready` resolves). */\nexport interface {prefix}PureFns {{"
+        );
+        for pure in pures {
+            let signature = match &pure.arg {
+                Some(arg) => format!("arg: {}", self.ts_type(arg)),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "\t/** `{}` (`dg_pure_{}`). */\n\t{}({signature}): {};",
+                pure.export,
+                pure.export,
+                camel(&pure.export),
+                self.ts_type(&pure.output)
+            );
+        }
+        out.push_str("}\n\n");
+        let _ = writeln!(
+            out,
+            "/** The `{surface}` pure functions plus `ready` / `loaded()` / `module()`. */\nexport type {prefix}Pures = WasmPures<{prefix}PureFns>;\n",
+            surface = self.surface.name
+        );
+        let _ = writeln!(
+            out,
+            "/**\n * Load the compiled pure functions (default `PURES_WASM_URL`; a URL loaded by\n * the predicted step too is instantiated once).\n */\nexport function create{prefix}Pures(source: WasmSource = PURES_WASM_URL): {prefix}Pures {{\n\treturn createWasmPures<{prefix}PureFns>(source, {{"
+        );
+        for pure in pures {
+            let arg = match &pure.arg {
+                Some(arg) => format!(", arg: {}", self.wire_literal(arg)),
+                None => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "\t\t{}: {{ exportName: {}{arg}, output: {} }},",
+                key(&camel(&pure.export)),
+                string(&pure.export),
+                self.wire_literal(&pure.output)
+            );
+        }
+        out.push_str("\t});\n}\n");
+        Ok(Some(out))
+    }
+
+    fn constants_ts(&self) -> GenResult<Option<String>> {
+        let constants = &self.surface.constants;
+        if constants.is_empty() {
+            return Ok(None);
+        }
+        let mut out =
+            self.header("Constants: static data defined once in Rust (`GameSurface::constant`).");
+        let imports = self.import_records(constants.iter().map(|c| &c.ty));
+        if !imports.is_empty() {
+            out.push_str(&imports);
+        }
+        for c in constants {
+            let _ = writeln!(
+                out,
+                "\n/** `{}`, as the client decodes it. */\nexport const {}: {} = {};",
+                c.name,
+                constant(&c.name),
+                self.ts_type(&c.ty),
+                self.literal(&c.ty, &c.value, 0)
+                    .map_err(|e| format!("constant {}: {e}", c.name))?
+            );
+        }
+        Ok(Some(out))
+    }
+
+    /// A TypeScript literal of `value` (JSON as `GameSurface::constant`
+    /// stores it) of type `ty`: records keyed by camelCase field name, floats
+    /// as exact binary32 values, `null` as `undefined`.
+    fn literal(&self, ty: &Wire, value: &serde_json::Value, depth: usize) -> GenResult<String> {
+        use serde_json::Value;
+        let pad = "\t".repeat(depth + 1);
+        let close = "\t".repeat(depth);
+        let mismatch = || format!("value {value} does not match {}", self.ts_type(ty));
+        let int = |min: i128, max: i128| -> GenResult<String> {
+            let v = value
+                .as_i64()
+                .map(i128::from)
+                .or(value.as_u64().map(i128::from))
+                .ok_or_else(mismatch)?;
+            if v < min || v > max {
+                return Err(format!("{v} is out of range"));
+            }
+            Ok(v.to_string())
+        };
+        Ok(match ty {
+            Wire::Bool => value.as_bool().ok_or_else(mismatch)?.to_string(),
+            Wire::U8 => int(0, 255)?,
+            Wire::I8 => int(-128, 127)?,
+            Wire::U16 => int(0, 65_535)?,
+            Wire::I16 => int(-32_768, 32_767)?,
+            Wire::U32 => int(0, u32::MAX.into())?,
+            Wire::I32 => int(i32::MIN.into(), i32::MAX.into())?,
+            Wire::U64 => int(0, (1 << 53) - 1)?,
+            Wire::F32 | Wire::Quant { .. } | Wire::Angle { .. } => {
+                let v = value.as_f64().ok_or_else(mismatch)?;
+                if f64::from(v as f32) != v {
+                    return Err(format!("{v} is not a binary32 value"));
+                }
+                f32_exact(v as f32)
+            }
+            Wire::F64 => f64_literal(value.as_f64().ok_or_else(mismatch)?),
+            Wire::ShortStr | Wire::Str => string(value.as_str().ok_or_else(mismatch)?),
+            Wire::Bytes => {
+                let bytes = value.as_array().ok_or_else(mismatch)?;
+                let mut items = Vec::new();
+                for b in bytes {
+                    items.push(self.literal(&Wire::U8, b, depth)?);
+                }
+                format!("new Uint8Array([{}])", items.join(", "))
+            }
+            Wire::Optional { item } => match value {
+                Value::Null => "undefined".into(),
+                other => self.literal(item, other, depth)?,
+            },
+            Wire::List { item } => {
+                let items = value.as_array().ok_or_else(mismatch)?;
+                if items.is_empty() {
+                    return Ok("[]".into());
+                }
+                let parts = items
+                    .iter()
+                    .map(|v| self.literal(item, v, depth + 1))
+                    .collect::<GenResult<Vec<_>>>()?;
+                let inline = format!("[{}]", parts.join(", "));
+                if is_scalar(item) && inline.len() <= 100 {
+                    inline
+                } else {
+                    format!("[\n{pad}{}\n{close}]", parts.join(&format!(",\n{pad}")))
+                }
+            }
+            Wire::Record { name } => {
+                let record = self.records[name.as_str()];
+                let object = value.as_object().ok_or_else(mismatch)?;
+                if object.len() != record.fields.len() {
+                    return Err(format!(
+                        "record {name} value has fields {:?}",
+                        object.keys().collect::<Vec<_>>()
+                    ));
+                }
+                let mut parts = Vec::new();
+                let mut simple = true;
+                for field in &record.fields {
+                    let v = object
+                        .get(&field.name)
+                        .ok_or_else(|| format!("record {name} value lacks field {}", field.name))?;
+                    simple &= is_scalar(&field.ty);
+                    parts.push(format!(
+                        "{}: {}",
+                        key(&camel(&field.name)),
+                        self.literal(&field.ty, v, depth + 1)?
+                    ));
+                }
+                let inline = format!("{{ {} }}", parts.join(", "));
+                if simple && inline.len() <= 100 {
+                    inline
+                } else {
+                    format!("{{\n{pad}{}\n{close}}}", parts.join(&format!(",\n{pad}")))
+                }
+            }
+        })
+    }
+}
+
+/// Records a type names directly (through lists and options, not through
+/// other records).
+fn top_records(ty: &Wire, out: &mut Vec<String>) {
+    match ty {
+        Wire::List { item } | Wire::Optional { item } => top_records(item, out),
+        Wire::Record { name } => out.push(name.clone()),
+        _ => {}
+    }
+}
+
+fn is_scalar(ty: &Wire) -> bool {
+    match ty {
+        Wire::List { .. } | Wire::Record { .. } | Wire::Bytes => false,
+        Wire::Optional { item } => is_scalar(item),
+        _ => true,
+    }
+}
+
 fn simple_tag(ty: &Wire) -> &'static str {
     match ty {
         Wire::Bool => "bool",
@@ -1433,7 +1904,7 @@ mod tests {
         let err = generate_game_client(r#"{"schemaVersion": 1}"#, ImportExtension::Ts).unwrap_err();
         assert!(err.contains("schemaVersion"), "{err}");
         let err = generate_game_client(
-            r#"{"schemaVersion":2,"name":"x","protocolVersion":1,"kinds":[],"input":null,"events":[],"records":[],"extra":1}"#,
+            r#"{"schemaVersion":3,"name":"x","protocolVersion":1,"kinds":[],"input":null,"events":[],"records":[],"extra":1}"#,
             ImportExtension::Ts,
         )
         .unwrap_err();
@@ -1500,8 +1971,71 @@ mod tests {
     }
 
     #[test]
+    fn validates_pures_constants_and_codecs() {
+        type Mutate = fn(&mut serde_json::Value);
+        let cases: [(&str, Mutate); 9] = [
+            ("ABI v2", |s| s["pures"][0]["abi"] = 2.into()),
+            ("module is built from distributed_game", |s| {
+                s["pures"][1]["package"] = "other".into()
+            }),
+            ("reserved", |s| s["pures"][0]["export"] = "ready".into()),
+            ("duplicate pure function", |s| {
+                s["pures"][1]["export"] = "sample_mirror".into()
+            }),
+            ("unknown record Nope", |s| {
+                s["pures"][0]["output"] = serde_json::json!({"type": "record", "name": "Nope"})
+            }),
+            ("not a binary32 value", |s| {
+                s["constants"][1]["value"][0] = 0.1.into()
+            }),
+            ("out of range", |s| {
+                s["constants"][0]["value"]["version"] = (-1).into()
+            }),
+            ("lacks field label", |s| {
+                let spot = s["constants"][2]["value"].as_object_mut().unwrap();
+                spot.remove("label");
+                spot.insert("other".into(), "x".into());
+            }),
+            ("codec record Nope is missing", |s| {
+                s["codecs"][0] = "Nope".into()
+            }),
+        ];
+        for (expected, mutate) in cases {
+            let mut surface = sample();
+            mutate(&mut surface);
+            let err = generate(&surface).unwrap_err();
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+        // Without pures, constants or codecs: no extra files or functions.
+        let mut plain = sample();
+        for key in ["pures", "constants", "codecs"] {
+            plain.as_object_mut().unwrap().remove(key);
+        }
+        let files = generate(&plain).unwrap();
+        assert!(files
+            .iter()
+            .all(|f| f.path != "pures.ts" && f.path != "constants.ts"));
+        let events = files.iter().find(|f| f.path == "events.ts").unwrap();
+        assert!(!events.contents.contains("decodeSampleWind"));
+        // The module plan lists the step and every pure function.
+        let (name, plan) = surface_module(&sample().to_string()).unwrap();
+        let plan = plan.unwrap();
+        assert_eq!(name, "sample");
+        assert_eq!(
+            plan.exports,
+            [
+                "dg_predict_sample_step",
+                "dg_pure_sample_mirror",
+                "dg_pure_sample_rows"
+            ]
+        );
+        plain.as_object_mut().unwrap().remove("predict");
+        assert!(surface_module(&plain.to_string()).unwrap().1.is_none());
+    }
+
+    #[test]
     fn rejects_recursive_records() {
-        let json = r#"{"schemaVersion":2,"name":"x","protocolVersion":1,"kinds":[],"input":null,"events":[],
+        let json = r#"{"schemaVersion":3,"name":"x","protocolVersion":1,"kinds":[],"input":null,"events":[],
             "records":[{"name":"Node","fields":[{"name":"next","type":{"type":"optional","item":{"type":"record","name":"Node"}}}]}]}"#;
         let err = generate_game_client(json, ImportExtension::Ts).unwrap_err();
         assert!(err.contains("recursive"), "{err}");
