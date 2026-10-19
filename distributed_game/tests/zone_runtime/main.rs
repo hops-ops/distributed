@@ -210,12 +210,19 @@ fn reconnect_within_grace_keeps_player_then_expires() {
     let token = mirror.welcome.as_ref().unwrap().reconnect_token.clone();
     assert!(!token.is_empty());
 
+    for seq in 1..=5 {
+        assert_eq!(h.push_input(a.client, seq, 0, &[1, 0]), PushOutcome::Accepted);
+    }
+    h.advance();
+
     h.disconnect(a.client, false);
     clock.advance(Duration::from_secs(1));
     h.advance();
     assert_eq!(h.player_count(), 1);
     let b = h.reconnect(&token, 0).unwrap();
     assert_eq!(b.viewer, a.viewer, "same player after reconnect");
+    // The resumed session restarts its input sequence at 1 (new Welcome).
+    assert_eq!(h.push_input(b.client, 1, 0, &[1, 0]), PushOutcome::Accepted);
     assert!(h.reconnect(&token, 0).is_err(), "tokens rotate on use");
     assert_eq!(h.zone().log, vec!["create", "join:alice"]);
 
