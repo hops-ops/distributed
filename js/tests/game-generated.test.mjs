@@ -80,7 +80,9 @@ test('kinds, typed field accessors and correction defaults follow the surface', 
 	assert.deepEqual(gen.statsFields({ fields: { slow_ms: 12, tick_ms: 33 } }), { slowMs: 12, tickMs: 33 });
 	assert.deepEqual(gen.CORRECTIONS.player.x, { mode: 'ease', durationMs: 150 });
 	assert.deepEqual(gen.CORRECTIONS.player.name, { mode: 'replace' });
-	assert.deepEqual(gen.FIELD_TYPES.player.x, surface.kinds[0].fields[0].type);
+	// Generated bounds are the exact binary32 values (the surface JSON spells them shortest).
+	const x = surface.kinds[0].fields[0].type;
+	assert.deepEqual(gen.FIELD_TYPES.player.x, { ...x, min: Math.fround(x.min), max: Math.fround(x.max) });
 });
 
 test('typed subscriptions decode only their own event', () => {

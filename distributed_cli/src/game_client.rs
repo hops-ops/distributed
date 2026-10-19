@@ -298,6 +298,15 @@ fn f32_literal(v: f32) -> String {
     }
 }
 
+/// The exact binary32 value as a JS number (`Math.fround` of it is itself).
+fn f32_exact(v: f32) -> String {
+    if v.is_finite() {
+        format!("{}", f64::from(v))
+    } else {
+        "Number.NaN".into()
+    }
+}
+
 fn f64_literal(v: f64) -> String {
     format!("{v}")
 }
@@ -612,8 +621,8 @@ impl<'a> Gen<'a> {
         match ty {
             Wire::Quant { min, max, bits } => format!(
                 "{{ type: 'quant', min: {}, max: {}, bits: {bits} }}",
-                f32_literal(*min),
-                f32_literal(*max)
+                f32_exact(*min),
+                f32_exact(*max)
             ),
             Wire::Angle { bits } => format!("{{ type: 'angle', bits: {bits} }}"),
             Wire::List { item } => format!("{{ type: 'list', item: {} }}", self.wire_literal(item)),
