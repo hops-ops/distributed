@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use distributed_game::GameInput;
 use distributed_game::{HostConfig, ManualClock, Role, TicketClaims, Viewer, ZoneHost};
 use game_demos::gallery::{
     self, Gallery, GalleryConfig, ShotInput, FLAG_FIRE, FLAG_NO_COMP, MAX_REWIND_MS,
@@ -82,14 +83,14 @@ impl Rig {
         let d = [seen[0] - x, seen[1] - y, seen[2] - gallery::EYE];
         let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         self.seq += 1;
-        let shot = ShotInput {
-            flags: FLAG_FIRE | flags,
-            shot: self.seq as u16,
+        let shot = ShotInput::new(
+            FLAG_FIRE | flags,
+            self.seq as u16,
             delay_ms,
-            dir: [d[0] / len, d[1] / len, d[2] / len],
-        };
+            [d[0] / len, d[1] / len, d[2] / len],
+        );
         self.host
-            .push_input(self.client, self.seq, latest as u32, &shot.encode());
+            .push_input(self.client, self.seq, latest as u32, &shot.to_payload());
         self.ticks(1);
         self.host.zone().stats(self.player).unwrap()
     }
@@ -97,22 +98,18 @@ impl Rig {
 
 #[test]
 fn shot_payload_round_trips() {
-    let shot = ShotInput {
-        flags: FLAG_FIRE | FLAG_NO_COMP,
-        shot: 513,
-        delay_ms: 287,
-        dir: [0.6, 0.8, 0.0],
-    };
-    let back = ShotInput::decode(&shot.encode()).unwrap();
-    assert_eq!((back.flags, back.shot, back.delay_ms), (3, 513, 287));
-    assert!((back.dir[0] - 0.6).abs() < 1e-4 && (back.dir[1] - 0.8).abs() < 1e-4);
-    assert_eq!(ShotInput::decode(&[1, 0, 0]), None, "wrong length");
-    assert_eq!(ShotInput::decode(&[1; 10]), None);
+    let shot = ShotInput::new(FLAG_FIRE | FLAG_NO_COMP | 0x80, 513, 287, [0.6, 0.8, 0.0]);
+    let back = ShotInput::parse(&shot.to_payload()).unwrap();
     assert_eq!(
-        ShotInput::decode(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
-        None,
-        "zero direction"
+        (back.flags, back.shot, back.delay_ms),
+        (3, 513, 287),
+        "unknown flags cleared"
     );
+    assert!((back.dx - 0.6).abs() < 1e-4 && (back.dy - 0.8).abs() < 1e-4);
+    assert_eq!(ShotInput::parse(&[1, 0, 0]), None, "truncated");
+    assert_eq!(ShotInput::parse(&[1; 10]), None, "trailing bytes");
+    let zero = ShotInput::new(FLAG_FIRE, 1, 0, [0.0, 0.0, 0.0]);
+    assert_eq!(ShotInput::parse(&zero.to_payload()), None, "zero direction");
 }
 
 #[test]

@@ -23,7 +23,8 @@ import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { InputSampler } from '../shared/input.ts';
 import { createStage, material, toWorld } from '../shared/scene.ts';
-import { createGalleryClient, DEFAULT_ZONE, KIND, targetPosition, type ShotRecord, type Vec3 } from './client.ts';
+import { isShooter, isTarget, shooterFields, targetFields } from '../generated/gallery/index.ts';
+import { createGalleryClient, DEFAULT_ZONE, targetPosition, type ShotRecord, type Vec3 } from './client.ts';
 import '@babylonjs/core/Culling/ray'; // side effect: scene.createPickingRay
 import './gallery.css';
 
@@ -153,7 +154,7 @@ gallery.onVerdict((shot: ShotRecord) => {
 	const v = shot.verdict!;
 	const predictedMarker = pending.get(shot.id);
 	pending.delete(shot.id);
-	const confirmed = v.hit !== null;
+	const confirmed = v.hit !== undefined;
 	if (predictedMarker !== undefined) predictedMarker.material = confirmed && v.hit === shot.predicted ? mats.confirmed : mats.rejected;
 	else if (confirmed) {
 		const target = gallery.targets().find((t) => t.id === v.hit);
@@ -202,21 +203,22 @@ stage.onFrame((now) => {
 	const seen = new Set<string>();
 	for (const entity of rendered) {
 		seen.add(entity.key);
-		if (entity.kindName === KIND.target) {
-			const v = targetVisual(entity.key, Number(entity.fields.r ?? 0.5));
+		if (isTarget(entity)) {
+			const { r, flash } = targetFields(entity);
+			const v = targetVisual(entity.key, r);
 			const p = targetPosition(entity);
 			v.mesh.position.copyFrom(toWorld(p[0], p[1], p[2]));
-			const flash = Number(entity.fields.flash ?? 0);
 			if (v.flash >= 0 && flash !== v.flash) v.flashUntil = now + 150;
 			v.flash = flash;
 			v.mesh.material = now < v.flashUntil ? mats.flash : mats.target;
 			const newest = authority?.replica.get(entity.id);
 			v.ghost.setEnabled(ghostsOn && newest !== undefined);
 			if (newest !== undefined) {
-				const f = newest.fields;
-				v.ghost.position.copyFrom(toWorld(Number(f.x), Number(f.y), Number(f.z)));
+				const g = targetPosition(newest);
+				v.ghost.position.copyFrom(toWorld(g[0], g[1], g[2]));
 			}
-		} else if (entity.kindName === KIND.shooter) {
+		} else if (isShooter(entity)) {
+			const shooter = shooterFields(entity);
 			let mesh = shooters.get(entity.key);
 			const mine = entity.id === hello?.entity;
 			if (mesh === undefined) {
@@ -224,8 +226,8 @@ stage.onFrame((now) => {
 				mesh.material = mine ? mats.me : mats.station;
 				shooters.set(entity.key, mesh);
 			}
-			mesh.position.copyFrom(toWorld(Number(entity.fields.x), Number(entity.fields.y), 0.08));
-			if (!mine) stage.labels.set(entity.key, mesh, `${String(entity.fields.name)} · ${entity.fields.hits}/${entity.fields.shots}`, 1.9);
+			mesh.position.copyFrom(toWorld(shooter.x, shooter.y, 0.08));
+			if (!mine) stage.labels.set(entity.key, mesh, `${shooter.name} · ${shooter.hits}/${shooter.shots}`, 1.9);
 		}
 	}
 	for (const [key, v] of targets) {
