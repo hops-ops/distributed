@@ -17,7 +17,8 @@ import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { Scene } from '@babylonjs/core/scene';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
-import { BUTTON_DASH, HALF, PILLARS, PLAYER_RADIUS } from '../arena/movement.ts';
+import { HALF, PILLARS, PLAYER_RADIUS } from '../arena/movement.ts';
+import { BITS, isPlayer, playerFields } from '../generated/ripple/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
@@ -266,7 +267,7 @@ function sendFrame(): void {
 	const input: HoodInput = {
 		mx: toAxis(move.x),
 		my: toAxis(move.y),
-		buttons: s.action ? BUTTON_DASH : 0,
+		buttons: s.action ? BITS.buttons.dash : 0,
 		action: (s.alt ? ACTION_ATTACK : 0) | (smitePending ? ACTION_SMITE : 0)
 	};
 	if (client.sendInput(input) !== undefined) smitePending = false;
@@ -285,16 +286,15 @@ stage.onFrame((now, dtMs) => {
 	boss.position.y = 2.2 * s;
 	stage.labels.set('boss', boss, hp === 0 ? `defeated by ${view?.boss?.by ?? ''}` : `Boss ${hp}/${view?.boss?.max ?? ''}`, 2.2);
 
-	const rendered = client.render().filter((e) => e.authoritative && e.kindName === 'player');
+	const rendered = client.render().filter((e) => e.authoritative && isPlayer(e));
 	const seen = new Set<string>();
 	for (const entity of rendered) {
 		const mine = entity.predicted;
 		const mesh = capsule(entity, mine);
-		const x = Number(entity.fields.x ?? 0);
-		const y = Number(entity.fields.y ?? 0);
+		const { x, y, name: label } = playerFields(entity);
 		mesh.position.copyFrom(toWorld(x, y, 0.9));
 		mesh.setEnabled(!entity.stale);
-		stage.labels.set(entity.key, mesh, mine ? `${String(entity.fields.name ?? '')} (you)` : String(entity.fields.name ?? ''), 1.4, mine ? 'me' : '');
+		stage.labels.set(entity.key, mesh, mine ? `${label} (you)` : label, 1.4, mine ? 'me' : '');
 		if (mine) stage.follow(x, y, dtMs);
 		seen.add(entity.key);
 	}

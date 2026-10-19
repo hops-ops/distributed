@@ -12,11 +12,16 @@ export interface MoveInput {
 
 export type Input = MoveInput;
 
-/** Button bits (`#[buttons(..)]`). */
-export const BUTTON = {
-	sprint: 1,
-	mark: 2,
+/** Bits of each bit-flag field (`#[buttons(..)]`), by field. */
+export const BITS = {
+	buttons: {
+		sprint: 1,
+		mark: 2,
+	},
 } as const;
+
+/** Bits of `buttons`, the only bit-flag field. */
+export const BUTTON = BITS.buttons;
 
 /** Wire layout, in field order. */
 export const INPUT_LAYOUT: PayloadLayout = [

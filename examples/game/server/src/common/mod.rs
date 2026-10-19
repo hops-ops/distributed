@@ -1,7 +1,8 @@
 //! Shared plumbing for every demo: CLI options, the [`Demo`] trait, server
 //! startup ([`spawn`] / [`run`]), the dev-only routes ([`dev`]), guest display
-//! names ([`Guests`]), small zone helpers ([`send_json_event`]) and process
-//! helpers ([`shutdown_signal`], [`random_hex`]).
+//! names ([`Guests`]) and process helpers ([`shutdown_signal`],
+//! [`random_hex`]). Zone events are typed (`#[derive(GameEvent)]`, sent with
+//! `ctx.send` / `ctx.broadcast`) in each demo module.
 //!
 //! A new demo implements [`Demo`] in its own module and adds one subcommand
 //! line in `main.rs`; everything else (ticket endpoint, NetSim control,
@@ -15,7 +16,7 @@ use std::net::SocketAddr;
 
 use axum::Router;
 use distributed_game::net::{GameServer, NetSim, ServerConfig, TicketKey};
-use distributed_game::{Ctx, Viewer, Zone};
+use distributed_game::Zone;
 
 pub use guests::{random_hex, Guests};
 
@@ -207,25 +208,4 @@ pub async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = term => {}
     }
-}
-
-/// Send a JSON-encoded Event (`type_id`, UTF-8 JSON payload). Demos use JSON
-/// for low-rate events so clients can `JSON.parse` them; hot data belongs in
-/// replicated fields.
-pub fn send_json_event<Z: Zone>(
-    ctx: &mut Ctx<'_, Z>,
-    to: impl Into<Viewer>,
-    type_id: u32,
-    value: &serde_json::Value,
-) {
-    ctx.send_event(to, type_id, value.to_string().into_bytes());
-}
-
-/// Broadcast a JSON-encoded Event to every connection of the zone.
-pub fn broadcast_json_event<Z: Zone>(
-    ctx: &mut Ctx<'_, Z>,
-    type_id: u32,
-    value: &serde_json::Value,
-) {
-    ctx.broadcast_event(type_id, value.to_string().into_bytes());
 }

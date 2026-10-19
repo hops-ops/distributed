@@ -34,6 +34,10 @@
 //! Entities: 1 `tier` (id 1, every zone), 2 `boss` (id 2, hoods), 3
 //! `player` (1000 + player, hoods; Arena movement fields so the client
 //! predicts with the Arena step — the boss stands on its central pillar).
+//! They are `#[derive(Replicated)]` views; client events are the typed
+//! [`RippleEvent`] and input the `#[derive(GameInput)]` [`HoodInput`]; the
+//! browser client is generated from [`game_surface`]. (Tier-up payloads
+//! between zones are server-internal JSON.)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -42,15 +46,15 @@ use std::time::Duration;
 use distributed_game::net::{GameServer, ServerConfig};
 use distributed_game::world::{HostAddr, ZoneDirectory};
 use distributed_game::{
-    ChildEvent, ConsumePolicy, Ctx, EntitySchema, EntityState, FieldType, FieldValue, GameInput,
-    KindDef, LeaveReason, ObserverId, PlayerId, TimerId, WorldView, Zone,
+    schema, ChildEvent, ConsumePolicy, Ctx, EntitySchema, GameEvent, GameInput, GameRecord,
+    GameSurface, LeaveReason, ObserverId, PlayerId, Replicated, TimerId, WorldView, Zone,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::arena::movement::{self, MoveInput, MoveState};
 use crate::cluster::{ClusterDemo, ClusterOptions, World};
-use crate::common::{broadcast_json_event, send_json_event, Demo, Guests};
+use crate::common::{Demo, Guests};
 
 /// Root zone.
 pub const REALM: &str = "realm";
@@ -70,25 +74,150 @@ pub const REACH: f32 = 4.5;
 pub const RESPAWN: Duration = Duration::from_secs(60);
 
 /// Kind: tier state (every zone).
-pub const KIND_TIER: u16 = 1;
-/// Kind: the boss (hoods).
-pub const KIND_BOSS: u16 = 2;
-/// Kind: a player (hoods).
-pub const KIND_PLAYER: u16 = 3;
-/// Event: `{zone, tier, parent, children, host, tickRate, entity?}` on join/observe.
-pub const EVENT_HELLO: u32 = 1;
-/// Event: a tier received a child event `{at, kind, from, origin, originTick}`.
-pub const EVENT_RIPPLE: u32 = 2;
-/// Event (city): `{weather, remaining}`.
-pub const EVENT_WEATHER: u32 = 3;
-/// Event (realm): `{text}`.
-pub const EVENT_BANNER: u32 = 4;
-/// Event (hood): `{kind: "defeated" | "respawned", by?}`.
-pub const EVENT_BOSS: u32 = 5;
+/// A tier's tallies (every zone; global).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "tier", id = 1, global)]
+pub struct TierView {
+    /// Bosses defeated below this tier.
+    pub defeated: u8,
+    /// Bosses in the world.
+    pub total: u8,
+    /// Boroughs cleared.
+    pub cleared: u8,
+    /// The city is liberated.
+    pub liberated: bool,
+    /// Index into [`WEATHER`].
+    pub weather: u8,
+    /// Ticks of this zone.
+    pub clock: u32,
+    /// Tier-up events received.
+    pub events: u32,
+}
+
+/// A neighbourhood's boss (global).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "boss", id = 2, global)]
+pub struct BossView {
+    /// Hit points.
+    pub hp: u16,
+    /// Max hit points.
+    pub max: u16,
+    /// Who defeated it ("" while alive).
+    pub by: String,
+}
+
+/// A fighter (the Arena's movement fields; global within the hood).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "player", id = 3, priority = 2.0, global)]
+pub struct FighterView {
+    /// Position x.
+    #[field_type(movement::POS)]
+    #[correct(ease = 150)]
+    pub x: f32,
+    /// Position y.
+    #[field_type(movement::POS)]
+    #[correct(ease = 150)]
+    pub y: f32,
+    /// Velocity x.
+    #[field_type(movement::VEL)]
+    #[correct(snap)]
+    pub vx: f32,
+    /// Velocity y.
+    #[field_type(movement::VEL)]
+    #[correct(snap)]
+    pub vy: f32,
+    /// Remaining dash frames.
+    #[correct(snap)]
+    pub dash: u8,
+    /// Remaining dash cooldown frames.
+    #[correct(snap)]
+    pub cd: u8,
+    /// Display name.
+    #[priority(0.2)]
+    #[correct(replace)]
+    pub name: String,
+}
+
+/// The city's weather.
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct Weather {
+    /// One of [`WEATHER`].
+    pub weather: String,
+    /// Bosses still standing.
+    pub remaining: u32,
+}
+
+/// Boss Ripple's client events.
+#[derive(Debug, Clone, PartialEq, GameEvent)]
+pub enum RippleEvent {
+    /// To every joining player and observer.
+    #[game_event(id = 1)]
+    Hello {
+        /// Zone id.
+        zone: String,
+        /// `realm` / `city` / `borough` / `hood`.
+        tier: String,
+        /// Parent zone.
+        parent: Option<String>,
+        /// Child zones.
+        children: Vec<String>,
+        /// Host running the zone.
+        host: String,
+        /// Tick rate of this tier.
+        tick_rate: u32,
+        /// Own fighter (players in hoods).
+        entity: Option<u32>,
+        /// Weather (the city only).
+        weather: Option<Weather>,
+        /// Current realm banner.
+        banner: String,
+    },
+    /// A tier-up event arrived at this zone.
+    #[game_event(id = 2)]
+    Ripple {
+        /// Receiving zone.
+        at: String,
+        /// Event kind (`boss_defeated` …).
+        kind: String,
+        /// Child zone that forwarded it.
+        from: String,
+        /// Zone where it started.
+        origin: String,
+        /// Tick of the origin zone.
+        origin_tick: u64,
+        /// Tick of the receiving zone.
+        tick: u64,
+    },
+    /// The city's weather changed.
+    #[game_event(id = 3)]
+    Weather(Weather),
+    /// The realm's banner changed.
+    #[game_event(id = 4)]
+    Banner {
+        /// Banner text.
+        text: String,
+    },
+    /// The hood's boss fell or respawned.
+    #[game_event(id = 5)]
+    Boss {
+        /// `defeated` / `respawned`.
+        kind: String,
+        /// Who defeated it.
+        by: Option<String>,
+    },
+}
+
+/// Boss Ripple's client surface.
+pub fn game_surface() -> GameSurface {
+    GameSurface::for_zone::<Ripple>("ripple").events::<RippleEvent>()
+}
+
+/// Kind id of [`TierView`] (tests mirror fields by it).
+pub const KIND_TIER: u16 = TierView::KIND_ID;
 /// Input action bit: attack (needs [`REACH`]).
-pub const ACTION_ATTACK: u8 = 1;
+pub const ACTION_ATTACK: u8 = HoodInput::ATTACK;
 /// Input action bit: smite (demo shortcut: defeats the boss from anywhere).
-pub const ACTION_SMITE: u8 = 2;
+pub const ACTION_SMITE: u8 = HoodInput::SMITE;
 const ATTACK_COOLDOWN: u8 = 8;
 const MAX_CREDITS: u8 = 4;
 /// Weather names by index (city).
@@ -219,31 +348,30 @@ impl ZoneDirectory for TierPlacement {
 }
 
 /// Hood input: Arena movement + action bits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameInput)]
 pub struct HoodInput {
-    /// Movement (Arena step).
-    pub movement: MoveInput,
-    /// [`ACTION_ATTACK`] | [`ACTION_SMITE`].
+    /// Stick x.
+    #[range(min = -127, max = 127)]
+    pub mx: i8,
+    /// Stick y.
+    #[range(min = -127, max = 127)]
+    pub my: i8,
+    /// [`HoodInput::DASH`].
+    #[buttons(dash)]
+    pub buttons: u8,
+    /// [`HoodInput::ATTACK`] | [`HoodInput::SMITE`].
+    #[buttons(attack, smite)]
     pub action: u8,
 }
 
 impl HoodInput {
-    /// Wire payload `[mx, my, buttons, action]`.
-    pub fn encode(self) -> [u8; 4] {
-        let [mx, my, buttons] = <[u8; 3]>::try_from(self.movement.to_payload()).expect("3 bytes");
-        [mx, my, buttons, self.action]
-    }
-
-    /// Parse and sanitize.
-    pub fn decode(payload: &[u8]) -> Option<Self> {
-        let (movement, action) = payload.split_at_checked(3)?;
-        let [action] = action else {
-            return None;
-        };
-        Some(Self {
-            movement: MoveInput::from_payload(movement)?,
-            action: action & (ACTION_ATTACK | ACTION_SMITE),
-        })
+    /// The movement part (the Arena's step).
+    pub fn movement(self) -> MoveInput {
+        MoveInput {
+            mx: self.mx,
+            my: self.my,
+            buttons: self.buttons,
+        }
     }
 }
 
@@ -325,31 +453,31 @@ impl Ripple {
         }
     }
 
-    fn weather_json(&self) -> Value {
-        json!({
-            "weather": WEATHER[self.weather()],
-            "remaining": total_bosses() - self.state.defeated.len().min(total_bosses()),
-        })
+    fn weather_record(&self) -> Weather {
+        Weather {
+            weather: WEATHER[self.weather()].into(),
+            remaining: (total_bosses() - self.state.defeated.len().min(total_bosses())) as u32,
+        }
     }
 
-    fn hello(&self, ctx: &Ctx<'_, Self>, entity: Option<u32>) -> Value {
+    fn hello(&self, ctx: &Ctx<'_, Self>, entity: Option<u32>) -> RippleEvent {
         let tier = self.config.tier;
-        json!({
-            "zone": ctx.zone_id(),
-            "tier": tier.name(),
-            "parent": ctx.zone_id().rsplit_once('.').map(|(p, _)| p),
-            "children": children(ctx.zone_id()),
-            "host": self.config.host_id,
-            "tickRate": tier.rates().0,
-            "entity": entity,
-            "weather": (tier == TierKind::City).then(|| self.weather_json()),
-            "banner": self.state.banner,
-        })
+        RippleEvent::Hello {
+            zone: ctx.zone_id().into(),
+            tier: tier.name().into(),
+            parent: ctx.zone_id().rsplit_once('.').map(|(p, _)| p.to_string()),
+            children: children(ctx.zone_id()),
+            host: self.config.host_id.clone(),
+            tick_rate: tier.rates().0,
+            entity,
+            weather: (tier == TierKind::City).then(|| self.weather_record()),
+            banner: self.state.banner.clone(),
+        }
     }
 
     fn greet(&self, ctx: &mut Ctx<'_, Self>, to: distributed_game::Viewer, entity: Option<u32>) {
         let hello = self.hello(ctx, entity);
-        send_json_event(ctx, to, EVENT_HELLO, &hello);
+        ctx.send(to, &hello);
     }
 
     fn defeat(&mut self, ctx: &mut Ctx<'_, Self>, by: String) {
@@ -362,7 +490,10 @@ impl Ripple {
             payload.to_string().into_bytes(),
             ChildEvent::TO_ROOT,
         );
-        broadcast_json_event(ctx, EVENT_BOSS, &json!({ "kind": "defeated", "by": by }));
+        ctx.broadcast(&RippleEvent::Boss {
+            kind: "defeated".into(),
+            by: Some(by),
+        });
         self.respawn = Some(ctx.set_timeout(RESPAWN, RippleTimer::Respawn));
     }
 
@@ -376,7 +507,7 @@ impl Ripple {
                     break;
                 };
                 let input = input.input;
-                f.state = movement::step(f.state, input.movement);
+                f.state = movement::step(f.state, input.movement());
                 f.credits -= 1;
                 if input.action & ACTION_SMITE != 0 {
                     blows.push((u32::MAX, f.name.clone()));
@@ -449,8 +580,8 @@ impl Ripple {
                     ctx.emit_upward(kind, payload, 1);
                 }
                 if self.weather() != weather_before {
-                    let weather = self.weather_json();
-                    broadcast_json_event(ctx, EVENT_WEATHER, &weather);
+                    let weather = self.weather_record();
+                    ctx.broadcast(&RippleEvent::Weather(weather));
                 }
             }
             TierKind::Realm => {
@@ -471,21 +602,21 @@ impl Ripple {
                 };
                 if let Some(text) = banner {
                     self.state.banner = text.clone();
-                    broadcast_json_event(ctx, EVENT_BANNER, &json!({ "text": text }));
+                    ctx.broadcast(&RippleEvent::Banner { text });
                 }
             }
             TierKind::Hood => {}
         }
         self.state.events += 1;
-        let ripple = json!({
-            "at": ctx.zone_id(),
-            "kind": event.kind,
-            "from": event.from_zone,
-            "origin": event.origin_zone,
-            "originTick": event.origin_tick,
-            "tick": ctx.tick(),
-        });
-        broadcast_json_event(ctx, EVENT_RIPPLE, &ripple);
+        let ripple = RippleEvent::Ripple {
+            at: ctx.zone_id().into(),
+            kind: event.kind.clone(),
+            from: event.from_zone.clone(),
+            origin: event.origin_zone.clone(),
+            origin_tick: event.origin_tick,
+            tick: ctx.tick(),
+        };
+        ctx.broadcast(&ripple);
     }
 }
 
@@ -495,34 +626,7 @@ impl Zone for Ripple {
     type Timer = RippleTimer;
 
     fn schema() -> EntitySchema {
-        EntitySchema::new()
-            .kind(
-                KindDef::new(KIND_TIER, "tier")
-                    .field("defeated", FieldType::U8)
-                    .field("total", FieldType::U8)
-                    .field("cleared", FieldType::U8)
-                    .field("liberated", FieldType::Bool)
-                    .field("weather", FieldType::U8)
-                    .field("clock", FieldType::U32)
-                    .field("events", FieldType::U32),
-            )
-            .kind(
-                KindDef::new(KIND_BOSS, "boss")
-                    .field("hp", FieldType::U16)
-                    .field("max", FieldType::U16)
-                    .field("by", FieldType::ShortStr),
-            )
-            .kind(
-                KindDef::new(KIND_PLAYER, "player")
-                    .field("x", movement::POS)
-                    .field("y", movement::POS)
-                    .field("vx", movement::VEL)
-                    .field("vy", movement::VEL)
-                    .field("dash", FieldType::U8)
-                    .field("cd", FieldType::U8)
-                    .field_with_priority("name", FieldType::ShortStr, 0.2)
-                    .priority(2.0),
-            )
+        schema![TierView, BossView, FighterView]
     }
 
     fn on_create(_ctx: &mut Ctx<'_, Self>, config: RippleConfig) -> Self {
@@ -594,7 +698,7 @@ impl Zone for Ripple {
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<HoodInput> {
-        HoodInput::decode(payload)
+        HoodInput::from_payload(payload)
     }
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
@@ -613,7 +717,10 @@ impl Zone for Ripple {
                 self.state.defeated.remove(ctx.zone_id());
                 let payload = json!({ "hood": ctx.zone_id() }).to_string().into_bytes();
                 ctx.emit_upward("boss_respawned", payload, ChildEvent::TO_ROOT);
-                broadcast_json_event(ctx, EVENT_BOSS, &json!({ "kind": "respawned" }));
+                ctx.broadcast(&RippleEvent::Boss {
+                    kind: "respawned".into(),
+                    by: None,
+                });
             }
         }
     }
@@ -629,61 +736,37 @@ impl Zone for Ripple {
 
     fn replicate(&self, out: &mut WorldView) {
         let s = &self.state;
-        out.push(
-            EntityState::new(
-                1,
-                KIND_TIER,
-                0.0,
-                0.0,
-                vec![
-                    FieldValue::U(s.defeated.len() as u32),
-                    FieldValue::U(total_bosses() as u32),
-                    FieldValue::U(s.cleared.len() as u32),
-                    FieldValue::Bool(s.liberated),
-                    FieldValue::U(self.weather() as u32),
-                    FieldValue::U(self.ticks),
-                    FieldValue::U(s.events),
-                ],
-            )
-            .global(),
-        );
+        let tier = TierView {
+            defeated: s.defeated.len() as u8,
+            total: total_bosses() as u8,
+            cleared: s.cleared.len() as u8,
+            liberated: s.liberated,
+            weather: self.weather() as u8,
+            clock: self.ticks,
+            events: s.events,
+        };
+        out.add(1, &tier);
         if self.config.tier != TierKind::Hood {
             return;
         }
-        out.push(
-            EntityState::new(
-                2,
-                KIND_BOSS,
-                0.0,
-                0.0,
-                vec![
-                    FieldValue::U(s.hp),
-                    FieldValue::U(BOSS_HP),
-                    FieldValue::Str(s.defeated_by.clone().unwrap_or_default()),
-                ],
-            )
-            .global(),
-        );
+        let boss = BossView {
+            hp: s.hp as u16,
+            max: BOSS_HP as u16,
+            by: s.defeated_by.clone().unwrap_or_default(),
+        };
+        out.add(2, &boss);
         for f in self.fighters.values() {
             let m = f.state;
-            out.push(
-                EntityState::new(
-                    f.entity,
-                    KIND_PLAYER,
-                    m.x,
-                    m.y,
-                    vec![
-                        FieldValue::F(m.x),
-                        FieldValue::F(m.y),
-                        FieldValue::F(m.vx),
-                        FieldValue::F(m.vy),
-                        FieldValue::U(m.dash.into()),
-                        FieldValue::U(m.cooldown.into()),
-                        FieldValue::Str(f.name.clone()),
-                    ],
-                )
-                .global(),
-            );
+            let view = FighterView {
+                x: m.x,
+                y: m.y,
+                vx: m.vx,
+                vy: m.vy,
+                dash: m.dash,
+                cd: m.cooldown,
+                name: f.name.clone(),
+            };
+            out.add(f.entity, &view);
         }
     }
 
@@ -704,11 +787,12 @@ impl Zone for Ripple {
 /// Bot / test payload.
 pub fn encode_input(mx: i8, my: i8, action: u8) -> Vec<u8> {
     HoodInput {
-        movement: MoveInput { mx, my, buttons: 0 },
+        mx,
+        my,
+        buttons: 0,
         action,
     }
-    .encode()
-    .to_vec()
+    .to_payload()
 }
 
 /// Demo registration (`game-demos ripple`).
@@ -780,9 +864,9 @@ mod tests {
     #[test]
     fn input_round_trips() {
         let bytes = encode_input(-128, 5, 0xff);
-        let input = HoodInput::decode(&bytes).unwrap();
-        assert_eq!(input.movement.mx, -127);
+        let input = HoodInput::from_payload(&bytes).unwrap();
+        assert_eq!(input.movement().mx, -127);
         assert_eq!(input.action, ACTION_ATTACK | ACTION_SMITE);
-        assert_eq!(HoodInput::decode(&bytes[..3]), None);
+        assert_eq!(HoodInput::from_payload(&bytes[..3]), None);
     }
 }

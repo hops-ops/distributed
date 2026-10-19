@@ -19,8 +19,6 @@ import { dequantizeLinear, quantizeLinear, type EntityFields } from '@hops-ops/d
 import { BUTTON, FIELD_TYPES, sanitizeInput, type MoveInput } from '../generated/arena/index.ts';
 
 export type { MoveInput } from '../generated/arena/index.ts';
-/** TEMPORARY (demo conversion in progress): use the generated `encodeInput`. */
-export { encodeInput as encodeMoveInput } from '../generated/arena/index.ts';
 
 const f = Math.fround;
 
