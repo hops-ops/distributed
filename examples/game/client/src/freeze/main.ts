@@ -13,14 +13,17 @@ import type { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
-import { HALF, PILLARS, PLAYER_RADIUS } from '../arena/floor.ts';
-import { BUTTON, KIND, gemFields, playerFields, ritualFields, slimeFields, type KindName, type MoveInput } from '../generated/freeze/index.ts';
+import { ARENA_FLOOR } from '../generated/arena/constants.ts';
+import { BUTTON, FREEZE_WORLD, KIND, gemFields, playerFields, ritualFields, slimeFields, type KindName, type MoveInput } from '../generated/freeze/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
 import { createRing, createStage, material, toWorld } from '../shared/scene.ts';
-import { createFreezeClient, DEFAULT_ZONE, FreezeAdmin, ZONES, type Pack, type WorldStatus } from './client.ts';
+import { createFreezeClient, DEFAULT_ZONE, FreezeAdmin, ZONES, zoneLayout, type Pack, type WorldStatus } from './client.ts';
 import './freeze.css';
+
+/** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
+const { half: HALF, playerRadius: PLAYER_RADIUS } = ARENA_FLOOR;
 
 const params = new URLSearchParams(location.search);
 const zone = params.get('zone') ?? DEFAULT_ZONE;
@@ -206,7 +209,7 @@ async function main(): Promise<void> {
 	};
 	mats.portal.emissiveColor = Color3.FromHexString('#5b3fa8');
 	mats.gem.emissiveColor = Color3.FromHexString('#8a7d1e');
-	for (const [x, y, r] of PILLARS) {
+	for (const { x, y, r } of ARENA_FLOOR.pillars) {
 		const p = MeshBuilder.CreateCylinder('pillar', { diameter: r * 2, height: 2, tessellation: 24 }, scene);
 		p.position = toWorld(x, y, 1);
 		p.material = mats.pillar;
@@ -220,7 +223,7 @@ async function main(): Promise<void> {
 		for (const key of [...portalLabels]) stage.labels.delete(key);
 		portalLabels.clear();
 		scenery = [];
-		const layout = pack.zones[zoneId];
+		const layout = zoneLayout(zoneId);
 		if (layout === undefined) return;
 		const lava = pack.hazard === 'lava';
 		const pool = material(scene, `pool-${pack.version}`, lava ? '#ff5a1f' : '#bfe9ff', lava ? 1 : 0.85);
@@ -244,7 +247,7 @@ async function main(): Promise<void> {
 		}
 		const crystal = material(scene, `crystal-${pack.version}`, pack.crystalColor);
 		crystal.emissiveColor = Color3.FromHexString(pack.crystalColor).scale(0.35);
-		for (const [x, y] of pack.zones.crystals[pack.crystalLayout] ?? []) {
+		for (const { x, y } of FREEZE_WORLD.crystals[pack.crystalLayout] ?? []) {
 			const c = MeshBuilder.CreateCylinder('crystal', { diameterTop: 0, diameterBottom: 1.1, height: 2.6, tessellation: 5 }, scene);
 			c.position = toWorld(x, y, 1.3);
 			c.material = crystal;

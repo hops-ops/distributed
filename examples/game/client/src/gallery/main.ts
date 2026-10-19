@@ -23,7 +23,7 @@ import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { InputSampler } from '../shared/input.ts';
 import { createStage, material, toWorld } from '../shared/scene.ts';
-import { isShooter, isTarget, shooterFields, targetFields } from '../generated/gallery/index.ts';
+import { GALLERY_COURSE, isShooter, isTarget, shooterFields, targetFields } from '../generated/gallery/index.ts';
 import { createGalleryClient, DEFAULT_ZONE, targetPosition, type ShotRecord, type Vec3 } from './client.ts';
 import '@babylonjs/core/Culling/ray'; // side effect: scene.createPickingRay
 import './gallery.css';
@@ -87,27 +87,20 @@ const mats = {
 mats.ghost.wireframe = true;
 for (const m of [mats.predicted, mats.confirmed, mats.rejected, mats.flash]) m.emissiveColor = m.diffuseColor.clone();
 
-// Rails / circles (decor matching the server course) and the firing line.
-for (const [y, half] of [
-	[2, 12],
-	[6, 14],
-	[16, 16],
-	[-2, 10]
-] as const) {
-	const rail = MeshBuilder.CreateBox('rail', { width: half * 2, height: 0.05, depth: 0.1 }, scene);
-	rail.position = toWorld(0, y, 0.03);
+// Rails / circles of the server course (generated `GALLERY_COURSE`) and the
+// firing line (drawn just in front of the stations).
+for (const { y, x0, x1 } of GALLERY_COURSE.rails) {
+	const rail = MeshBuilder.CreateBox('rail', { width: x1 - x0, height: 0.05, depth: 0.1 }, scene);
+	rail.position = toWorld((x0 + x1) / 2, y, 0.03);
 	rail.material = mats.rail;
 }
-for (const [x, y, r] of [
-	[-7, 11, 4],
-	[7, 11, 3]
-] as const) {
+for (const { cx, cy, r } of GALLERY_COURSE.circles) {
 	const ring = MeshBuilder.CreateTorus('loop', { diameter: r * 2, thickness: 0.08, tessellation: 48 }, scene);
-	ring.position = toWorld(x, y, 0.04);
+	ring.position = toWorld(cx, cy, 0.04);
 	ring.material = mats.rail;
 }
 const line = MeshBuilder.CreateBox('firing-line', { width: 18, height: 0.04, depth: 0.15 }, scene);
-line.position = toWorld(0, -13.2, 0.02);
+line.position = toWorld(0, GALLERY_COURSE.firingLine + 0.8, 0.02);
 line.material = mats.station;
 
 type TargetVisual = { mesh: Mesh; ghost: Mesh; flash: number; flashUntil: number };

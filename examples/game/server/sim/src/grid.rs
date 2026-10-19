@@ -3,19 +3,23 @@
 //! The static content of a cell (terrain height, biome, props) is a pure
 //! function of `(world seed, cell x, cell y, CONTENT_VERSION)`; the server
 //! uses it for collision and the client for rendering, and **nothing
-//! static is replicated**. The walker's movement step collides with the
-//! cell's props; the browser predicts it with this code compiled to
-//! WebAssembly ([`grid_step`], whose context names the seed and cell, so
-//! the props are generated inside the module).
+//! static is replicated**. The browser runs this very code compiled to
+//! WebAssembly (`distributed game-wasm`), so there is no client twin:
 //!
-//! The rendering side still has a TypeScript twin of the *generation*
-//! (`examples/game/client/src/grid/world.ts`, checked bit-for-bit by
-//! `fixtures/grid-world.json`) until world content is served from WASM as
-//! well. Rules that keep everything bit-identical: integer hashing on `u32`
-//! only; floats are binary32 using only `+ - * /`, `sqrt` and `floor`;
-//! constants are dyadic where it matters. `tests/grid_fixture.rs` writes the
-//! fixture; change both files together, then `UPDATE_GOLDEN=1 cargo test
-//! --test grid_fixture`.
+//! - [`grid_step`] (`#[predict]`) predicts the own walker; its context
+//!   names the seed and cell, so the props are generated inside the module;
+//! - [`grid_cell`] (`#[game_pure]`) returns what the page draws for a cell:
+//!   the terrain lattice ([`SAMPLES`]² heights, moisture, biomes) and the
+//!   props;
+//! - [`grid_sample`] (`#[game_pure]`) samples one point (entity heights,
+//!   the HUD's biome);
+//! - [`grid_world`] is the generated `GRID_WORLD` constant (cell size,
+//!   biome and prop names, lattice spacing, default seed).
+//!
+//! `client/tests/prediction-wasm.test.mjs` requires the WASM results to
+//! equal the native ones byte for byte. Rules that keep them identical:
+//! integer hashing on `u32` only; floats are binary32 using only
+//! `+ - * /`, `sqrt` and `floor` (see `distributed_game::prediction`).
 //!
 //! Layout: a cell is [`CELL`] m square with local coordinates `0..CELL` on
 //! both axes; cell `(cx, cy)` covers world `cx*CELL .. (cx+1)*CELL`. Each
@@ -26,7 +30,9 @@
 
 use std::cell::RefCell;
 
-use distributed_game::{predict, FieldType, FieldValue, GameInput, GameRecord};
+use distributed_game::codec::{Wire, WireType};
+use distributed_game::protocol::{DecodeError, Reader, Writer};
+use distributed_game::{game_pure, predict, FieldType, FieldValue, GameInput, GameRecord};
 
 /// Cell edge length (m).
 pub const CELL: f32 = 32.0;
@@ -73,7 +79,7 @@ const SALT_HEIGHT: [u32; 3] = [1, 2, 3];
 const SALT_MOISTURE: u32 = 7;
 const SALT_PROP: u32 = 100;
 
-/// Prop kinds.
+/// Prop kinds (on the wire: their `u8` index into [`PROP_KINDS`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PropKind {
@@ -85,8 +91,28 @@ pub enum PropKind {
     Bush = 2,
 }
 
+/// Names of the [`PropKind`]s, by index.
+pub const PROP_KINDS: [&str; 3] = ["tree", "rock", "bush"];
+
+impl Wire for PropKind {
+    fn wire_type() -> WireType {
+        WireType::U8
+    }
+    fn encode(&self, w: &mut Writer) {
+        w.u8(*self as u8);
+    }
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        match r.u8()? {
+            0 => Ok(Self::Tree),
+            1 => Ok(Self::Rock),
+            2 => Ok(Self::Bush),
+            _ => Err(DecodeError::Invalid("unknown prop kind")),
+        }
+    }
+}
+
 /// One static prop in cell-local coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
 pub struct Prop {
     /// Kind.
     pub kind: PropKind,
@@ -179,8 +205,11 @@ pub fn moisture(seed: u32, cell: (i32, i32), l: (f32, f32)) -> f32 {
 
 /// Biome index into [`BIOMES`].
 pub fn biome(seed: u32, cell: (i32, i32), l: (f32, f32)) -> u8 {
-    let h = height(seed, cell, l);
-    let m = moisture(seed, cell, l);
+    biome_of(height(seed, cell, l), moisture(seed, cell, l))
+}
+
+/// Biome of a point with height `h` and moisture `m`.
+pub fn biome_of(h: f32, m: f32) -> u8 {
     if h > 0.6875 {
         0
     } else if m < 0.375 {
@@ -367,6 +396,128 @@ pub fn grid_step(
         let (x, y) = step(state.x, state.y, *input, props);
         WalkerState { x, y }
     })
+}
+
+/// Terrain lattice points per cell axis (every [`SAMPLE_SPACING`] m,
+/// borders included).
+pub const SAMPLES: usize = 17;
+/// Distance between lattice points (m).
+pub const SAMPLE_SPACING: f32 = 2.0;
+
+/// What the client draws for one cell ([`grid_cell`]).
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct GridCellContent {
+    /// Terrain height in `[0, 1)` at lattice point `(i, j)` (local
+    /// `(i, j) * SAMPLE_SPACING`), row-major by `j` (index `j * SAMPLES + i`).
+    pub heights: Vec<f32>,
+    /// Moisture in `[0, 1)`, same lattice.
+    pub moisture: Vec<f32>,
+    /// Biome index into [`BIOMES`], same lattice.
+    pub biomes: Vec<u8>,
+    /// The cell's props ([`cell_props`]).
+    pub props: Vec<Prop>,
+}
+
+/// A point of a cell ([`grid_sample`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, GameRecord)]
+pub struct GridPoint {
+    /// World seed.
+    pub seed: u32,
+    /// Cell x.
+    pub cx: i32,
+    /// Cell y.
+    pub cy: i32,
+    /// Local x (clamped to `0..=CELL`).
+    pub x: f32,
+    /// Local y (clamped to `0..=CELL`).
+    pub y: f32,
+}
+
+/// Terrain at one point.
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct GridSample {
+    /// Height in `[0, 1)`.
+    pub height: f32,
+    /// Moisture in `[0, 1)`.
+    pub moisture: f32,
+    /// Biome index into [`BIOMES`].
+    pub biome: u8,
+}
+
+/// Static facts of the world the client needs (generated `GRID_WORLD`).
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct GridWorld {
+    /// Cell edge length (m).
+    pub cell: f32,
+    /// Default world seed (before a zone's hello names it).
+    pub default_seed: u32,
+    /// Generation version.
+    pub content_version: u32,
+    /// Terrain lattice points per cell axis ([`SAMPLES`]).
+    pub samples: u8,
+    /// Lattice spacing (m).
+    pub sample_spacing: f32,
+    /// Walker radius (m).
+    pub player_radius: f32,
+    /// Largest |cell coordinate|.
+    pub max_cell: i32,
+    /// Biome names by index.
+    pub biomes: Vec<String>,
+    /// Prop kind names by index.
+    pub prop_kinds: Vec<String>,
+}
+
+/// The `GRID_WORLD` constant.
+pub fn grid_world() -> GridWorld {
+    GridWorld {
+        cell: CELL,
+        default_seed: DEFAULT_SEED,
+        content_version: CONTENT_VERSION,
+        samples: SAMPLES as u8,
+        sample_spacing: SAMPLE_SPACING,
+        player_radius: PLAYER_RADIUS,
+        max_cell: MAX_CELL,
+        biomes: BIOMES.map(String::from).to_vec(),
+        prop_kinds: PROP_KINDS.map(String::from).to_vec(),
+    }
+}
+
+/// Terrain lattice and props of the context's cell (the page's chunk).
+#[game_pure(GridCellFn)]
+pub fn grid_cell(cell: &GridContext) -> GridCellContent {
+    let at = (cell.cx, cell.cy);
+    let n = SAMPLES * SAMPLES;
+    let mut content = GridCellContent {
+        heights: Vec::with_capacity(n),
+        moisture: Vec::with_capacity(n),
+        biomes: Vec::with_capacity(n),
+        props: cell_props(cell.seed, at),
+    };
+    for j in 0..SAMPLES {
+        for i in 0..SAMPLES {
+            let l = (i as f32 * SAMPLE_SPACING, j as f32 * SAMPLE_SPACING);
+            let h = height(cell.seed, at, l);
+            let m = moisture(cell.seed, at, l);
+            content.heights.push(h);
+            content.moisture.push(m);
+            content.biomes.push(biome_of(h, m));
+        }
+    }
+    content
+}
+
+/// Terrain at one point of a cell (coordinates clamped into the cell).
+#[game_pure(GridSampleFn)]
+pub fn grid_sample(point: &GridPoint) -> GridSample {
+    let at = (point.cx, point.cy);
+    let l = (point.x.clamp(0.0, CELL), point.y.clamp(0.0, CELL));
+    let height = height(point.seed, at, l);
+    let moisture = moisture(point.seed, at, l);
+    GridSample {
+        height,
+        moisture,
+        biome: biome_of(height, moisture),
+    }
 }
 
 /// Neighbour a walker at `(x, y)` belongs to, as a cell offset, or None

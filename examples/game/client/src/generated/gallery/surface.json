@@ -1,4 +1,50 @@
 {
+  "constants": [
+    {
+      "name": "gallery_course",
+      "type": {
+        "name": "GalleryCourse",
+        "type": "record"
+      },
+      "value": {
+        "circles": [
+          {
+            "cx": -7.0,
+            "cy": 11.0,
+            "r": 4.0
+          },
+          {
+            "cx": 7.0,
+            "cy": 11.0,
+            "r": 3.0
+          }
+        ],
+        "firing_line": -14.0,
+        "rails": [
+          {
+            "x0": -12.0,
+            "x1": 12.0,
+            "y": 2.0
+          },
+          {
+            "x0": -14.0,
+            "x1": 14.0,
+            "y": 6.0
+          },
+          {
+            "x0": -16.0,
+            "x1": 16.0,
+            "y": 16.0
+          },
+          {
+            "x0": -10.0,
+            "x1": 10.0,
+            "y": -2.0
+          }
+        ]
+      }
+    }
+  ],
   "events": [
     {
       "id": 1,
@@ -264,6 +310,84 @@
   ],
   "name": "gallery",
   "protocolVersion": 1,
-  "records": [],
-  "schemaVersion": 2
+  "records": [
+    {
+      "fields": [
+        {
+          "name": "cx",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "cy",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "r",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "CircleTrack"
+    },
+    {
+      "fields": [
+        {
+          "name": "rails",
+          "type": {
+            "item": {
+              "name": "RailTrack",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "circles",
+          "type": {
+            "item": {
+              "name": "CircleTrack",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "firing_line",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "GalleryCourse"
+    },
+    {
+      "fields": [
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "x0",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "x1",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "RailTrack"
+    }
+  ],
+  "schemaVersion": 3
 }

@@ -1,18 +1,25 @@
 //! Native traces of every demo's client-predicted step over recorded input
-//! streams: the reference side of the native ↔ WebAssembly exact-match
-//! proof. `game-demos predict-trace` prints them as JSON; the client's
-//! `tests/prediction-wasm.test.mjs` replays the same streams through each
-//! surface's compiled module and requires every state to be byte-identical.
+//! streams, and of every `#[game_pure]` function over recorded arguments:
+//! the reference side of the native ↔ WebAssembly exact-match proof.
+//! `game-demos predict-trace` prints them as JSON; the client's
+//! `tests/prediction-wasm.test.mjs` replays the same streams and arguments
+//! through each surface's compiled module and requires every state and
+//! result to be byte-identical.
 //!
-//! Every step runs through [`step_bytes`], the same decode → step → encode
-//! path the WASM export takes, so the comparison covers the ABI as well as
-//! the arithmetic. Inputs are raw payload bytes, deliberately including
-//! values the decoder sanitizes (`-128` sticks, unknown button bits).
+//! Every step runs through [`step_bytes`] and every function through
+//! [`call_bytes`], the same decode → run → encode paths the WASM exports
+//! take, so the comparison covers the ABI as well as the arithmetic. Inputs
+//! are raw payload bytes, deliberately including values the decoder
+//! sanitizes (`-128` sticks, unknown button bits).
 
 use distributed_game::prediction::{step_bytes, PredictContext, PredictStep};
+use distributed_game::pure::{call_bytes, GamePure};
 use distributed_game::Wire;
 use game_sim::arena::{self, ArenaStep, MoveState};
-use game_sim::grid::{self, GridContext, GridStep, WalkerState, BUTTON_SPRINT, DEFAULT_SEED};
+use game_sim::grid::{
+    self, GridCellFn, GridContext, GridPoint, GridSampleFn, GridStep, WalkerState, BUTTON_SPRINT,
+    CELL, DEFAULT_SEED,
+};
 use game_sim::mobpit::PitStep;
 use game_sim::ripple::HoodStep;
 use serde_json::{json, Value};
@@ -238,18 +245,90 @@ fn grid_streams() -> Vec<Stream> {
     streams
 }
 
-/// Every demo step's native trace (see the module docs), plus the Arena
-/// drawing constants the client pages keep.
+fn pure_trace<F: GamePure>(args: Vec<Vec<u8>>) -> Value {
+    let calls: Vec<Value> = args
+        .iter()
+        .map(|arg| {
+            let output = call_bytes::<F>(arg).unwrap_or_else(|e| panic!("{}: {e:?}", F::EXPORT));
+            json!({ "arg": hex(arg), "output": hex(&output) })
+        })
+        .collect();
+    json!({ "export": F::EXPORT, "calls": calls })
+}
+
+/// Cells for the content traces: around the origin, far away, the
+/// coordinate limits (lattice wrap-around) and the random walk's cells.
+fn content_cells() -> Vec<(i32, i32)> {
+    let mut cells = vec![
+        (0, 0),
+        (-1, 0),
+        (1, -1),
+        (3, -7),
+        (-12, 5),
+        (999_999, -1_000_000),
+        (-1_000_000, 1_000_000),
+        busy_cell(DEFAULT_SEED),
+    ];
+    let mut rng = Rng(0x5eed_cafe);
+    for _ in 0..24 {
+        let c = |r: &mut Rng| (r.next() % 2001) as i32 - 1000;
+        cells.push((c(&mut rng), c(&mut rng)));
+    }
+    cells
+}
+
+/// `grid_cell` for every content cell, under two seeds.
+fn grid_cell_args() -> Vec<Vec<u8>> {
+    let mut args = Vec::new();
+    for seed in [DEFAULT_SEED, 0xdead_beef] {
+        for (cx, cy) in content_cells() {
+            args.push(GridContext { seed, cx, cy }.encode_context());
+        }
+    }
+    args
+}
+
+/// `grid_sample` on lattice points, borders, arbitrary floats and points
+/// outside the cell (clamped).
+fn grid_sample_args() -> Vec<Vec<u8>> {
+    let mut rng = Rng(0x0dd_ba11);
+    let mut args = Vec::new();
+    for (cx, cy) in content_cells() {
+        let mut points: Vec<(f32, f32)> = vec![
+            (0.0, 0.0),
+            (CELL, CELL),
+            (CELL, 7.25),
+            (16.0, 0.0),
+            (-3.0, 40.0),
+        ];
+        for _ in 0..40 {
+            let f = |r: &mut Rng| (r.next() >> 8) as f32 / 16_777_216.0 * (CELL + 4.0) - 2.0;
+            points.push((f(&mut rng), f(&mut rng)));
+        }
+        for (x, y) in points {
+            args.push(
+                GridPoint {
+                    seed: DEFAULT_SEED,
+                    cx,
+                    cy,
+                    x,
+                    y,
+                }
+                .encode_context(),
+            );
+        }
+    }
+    args
+}
+
+/// Every demo step's and pure function's native trace (see the module docs).
 pub fn traces() -> Value {
     json!({
         "abi": distributed_game::prediction::ABI_VERSION,
-        // Drawing constants the pages keep (`client/src/arena/floor.ts`).
-        "arena": {
-            "half": arena::HALF,
-            "playerRadius": arena::PLAYER_RADIUS,
-            "dashCooldown": arena::DASH_COOLDOWN,
-            "pillars": arena::PILLARS.iter().map(|(x, y, r)| json!([x, y, r])).collect::<Vec<_>>(),
-        },
+        "pures": [
+            pure_trace::<GridCellFn>(grid_cell_args()),
+            pure_trace::<GridSampleFn>(grid_sample_args()),
+        ],
         "steps": [
             trace::<ArenaStep>(capsule_streams(0)),
             trace::<PitStep>(capsule_streams(0)),
@@ -276,6 +355,33 @@ mod tests {
             predicted = grid::grid_step(&predicted, &input, &grid_context(cell), arena::DT);
             assert_eq!((predicted.x, predicted.y), zone);
         }
+    }
+
+    #[test]
+    fn grid_cell_is_the_world_generation() {
+        let cell = busy_cell(DEFAULT_SEED);
+        let content = grid::grid_cell(&grid_context(cell));
+        assert_eq!(content.props, grid::cell_props(DEFAULT_SEED, cell));
+        assert_eq!(content.heights.len(), grid::SAMPLES * grid::SAMPLES);
+        let (i, j) = (5, 11);
+        let l = (
+            i as f32 * grid::SAMPLE_SPACING,
+            j as f32 * grid::SAMPLE_SPACING,
+        );
+        let k = j * grid::SAMPLES + i;
+        assert_eq!(content.heights[k], grid::height(DEFAULT_SEED, cell, l));
+        assert_eq!(content.biomes[k], grid::biome(DEFAULT_SEED, cell, l));
+        let sample = grid::grid_sample(&GridPoint {
+            seed: DEFAULT_SEED,
+            cx: cell.0,
+            cy: cell.1,
+            x: l.0,
+            y: l.1,
+        });
+        assert_eq!(
+            (sample.height, sample.moisture, sample.biome),
+            (content.heights[k], content.moisture[k], content.biomes[k])
+        );
     }
 
     #[test]

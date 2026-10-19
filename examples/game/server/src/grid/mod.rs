@@ -121,6 +121,9 @@ pub fn game_surface() -> GameSurface {
     GameSurface::for_zone::<GridZone>("grid")
         .events::<GridHello>()
         .predict::<world::GridStep>()
+        .pure::<world::GridCellFn>()
+        .pure::<world::GridSampleFn>()
+        .constant("grid_world", &world::grid_world())
 }
 /// Most markers a cell keeps (oldest dropped first).
 pub const MAX_MARKERS: usize = 12;

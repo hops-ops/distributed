@@ -13,7 +13,7 @@
 //!
 //! | Route | Effect |
 //! |---|---|
-//! | `GET /dev/freeze/content/{version}` | content pack JSON (`current` = the world's version; future versions 404) |
+//! | `GET /dev/freeze/content/{version}` | content pack, payload-codec encoded (`application/octet-stream`, decoded by the generated `decodePack`; `current` = the world's version; future versions 404 with JSON) |
 //! | `GET /dev/freeze/world` | status of every host's zones (freeze state, players, inputs dropped while frozen, recent facts) |
 //! | `POST /dev/freeze/rollout` `{mode: hard\|rolling}` | **admin** — primary only: `WorldCoordinator::rollout` to the next version |
 //! | `POST /dev/freeze/stuck` `{zone, stuck}` | **admin** — start/stop a zone's ritual (forwarded to the owning host) |
@@ -270,7 +270,11 @@ fn routes(state: FreezeRoutes) -> Router {
         .with_state(state)
 }
 
-async fn content_pack(State(state): State<FreezeRoutes>, Path(version): Path<String>) -> Reply {
+async fn content_pack(
+    State(state): State<FreezeRoutes>,
+    Path(version): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let current = state.server.content_version();
     let wanted = if version == "current" {
         current.clone()
@@ -281,11 +285,17 @@ async fn content_pack(State(state): State<FreezeRoutes>, Path(version): Path<Str
         .zip(content::version_number(&current))
         .is_some_and(|(w, c)| w <= c);
     match content::pack(&wanted).filter(|_| published) {
-        Some(pack) => reply(StatusCode::OK, pack.to_json()),
+        Some(pack) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            pack.to_bytes(),
+        )
+            .into_response(),
         None => reply(
             StatusCode::NOT_FOUND,
             json!({ "error": format!("content {wanted} is not published (world runs {current})") }),
-        ),
+        )
+        .into_response(),
     }
 }
 

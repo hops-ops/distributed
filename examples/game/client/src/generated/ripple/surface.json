@@ -1,4 +1,41 @@
 {
+  "constants": [
+    {
+      "name": "ripple_world",
+      "type": {
+        "name": "RippleWorld",
+        "type": "record"
+      },
+      "value": {
+        "boroughs": [
+          {
+            "hoods": [
+              "realm.city.borough-1.hood-1",
+              "realm.city.borough-1.hood-2",
+              "realm.city.borough-1.hood-3"
+            ],
+            "id": "realm.city.borough-1"
+          },
+          {
+            "hoods": [
+              "realm.city.borough-2.hood-1",
+              "realm.city.borough-2.hood-2",
+              "realm.city.borough-2.hood-3"
+            ],
+            "id": "realm.city.borough-2"
+          }
+        ],
+        "city": "realm.city",
+        "realm": "realm",
+        "weather": [
+          "storm",
+          "rain",
+          "clearing",
+          "clear"
+        ]
+      }
+    }
+  ],
   "events": [
     {
       "id": 1,
@@ -416,6 +453,26 @@
     {
       "fields": [
         {
+          "name": "id",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "hoods",
+          "type": {
+            "item": {
+              "type": "short_str"
+            },
+            "type": "list"
+          }
+        }
+      ],
+      "name": "BoroughLayout"
+    },
+    {
+      "fields": [
+        {
           "name": "x",
           "type": {
             "type": "f32"
@@ -457,6 +514,42 @@
     {
       "fields": [
         {
+          "name": "realm",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "city",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "boroughs",
+          "type": {
+            "item": {
+              "name": "BoroughLayout",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "weather",
+          "type": {
+            "item": {
+              "type": "short_str"
+            },
+            "type": "list"
+          }
+        }
+      ],
+      "name": "RippleWorld"
+    },
+    {
+      "fields": [
+        {
           "name": "weather",
           "type": {
             "type": "short_str"
@@ -472,5 +565,5 @@
       "name": "Weather"
     }
   ],
-  "schemaVersion": 2
+  "schemaVersion": 3
 }

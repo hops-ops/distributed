@@ -172,6 +172,8 @@ pub fn game_surface() -> GameSurface {
     GameSurface::for_zone::<FreezeZone>("freeze")
         .events::<FreezeEvent>()
         .predict::<movement::ArenaStep>()
+        .record::<content::Pack>()
+        .constant("freeze_world", &content::freeze_world())
 }
 
 /// Durable command recording a collected gem.
