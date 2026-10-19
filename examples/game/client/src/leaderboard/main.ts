@@ -3,7 +3,7 @@
  * top-10 snapshots, reads your rank and neighbours on every push, and
  * triggers a rebuild from the cells' event history.
  */
-import { HALF } from '../arena/movement.ts';
+import { HALF } from '../arena/floor.ts';
 import {
 	isMob,
 	isPillar,

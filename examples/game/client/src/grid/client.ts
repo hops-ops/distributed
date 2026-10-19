@@ -8,8 +8,9 @@
  * - observer connections to the 8 neighbouring cells, re-synced whenever
  *   the authority changes, so what is across a border is visible before
  *   crossing;
- * - prediction of the own walker with the shared step (`world.ts`) against
- *   the props of the current cell;
+ * - prediction of the own walker by `grid_step`, the Rust step compiled to
+ *   WebAssembly, which collides against the props of the cell named in its
+ *   context (world seed + authoritative cell, set here);
  * - per-zone hello info (host, restored-from-hibernation …) and the
  *   `/dev/grid/map` world map.
  */
@@ -17,7 +18,7 @@ import { fieldNumber, type GameClient, type GameSocketFactory, type RenderedEnti
 
 import * as grid from '../generated/grid/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
-import { cellProps, parseZone, step, zoneId, CELL, DEFAULT_SEED, type Cell, type MoveInput, type Prop } from './world.ts';
+import { cellProps, parseZone, zoneId, CELL, DEFAULT_SEED, type Cell, type MoveInput, type Prop } from './world.ts';
 
 export const DEFAULT_ZONE = 'grid.0.0';
 
@@ -52,6 +53,8 @@ export type GridClientOptions = Readonly<{
 
 export type GridClient = Readonly<{
 	client: GameClient<MoveInput>;
+	/** The compiled `grid_step` (context: seed + authoritative cell). */
+	prediction: grid.GridPrediction | undefined;
 	/** Cell of the authoritative zone. */
 	cell(): Cell | undefined;
 	/** Latest hello per zone. */
@@ -64,7 +67,7 @@ export type GridClient = Readonly<{
 	worldOf(entity: RenderedEntity): { x: number; y: number } | undefined;
 	/** Handoffs completed so far. */
 	handoffs(): number;
-	/** Resolves on the first hello with an own entity. */
+	/** Resolves on the first hello with an own entity, once the predicted step is loaded. */
 	ready: Promise<GridHello>;
 	/** Called once per restored activation of any zone we see. */
 	onRestored(listener: (hello: GridHello) => void): () => void;
@@ -107,19 +110,21 @@ export function createGridClient(options: GridClientOptions): GridClient {
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
 		pingIntervalMs: 1000,
-		inputDtMs: 1000 / 30,
-		prediction: {
-			predict: (fields, input) => {
-				const cell = authorityCell ?? [0, 0];
-				const [x, y] = step(fieldNumber(fields, 'x'), fieldNumber(fields, 'y'), input, props(cell));
-				return { x, y };
-			}
-		}
+		inputDtMs: 1000 / 30
+		// Prediction: the generated default, `grid_step` compiled to WASM;
+		// its context (seed + cell) follows the authority below.
 	});
 	const { client } = typed;
+	const setContext = () => {
+		const cell = authorityCell ?? [0, 0];
+		typed.prediction?.setContext({ seed, cx: cell[0], cy: cell[1] });
+	};
 
 	let resolveReady: (h: GridHello) => void = () => undefined;
-	const ready = new Promise<GridHello>((resolve) => (resolveReady = resolve));
+	const ready = Promise.all([
+		new Promise<GridHello>((resolve) => (resolveReady = resolve)),
+		typed.prediction?.ready
+	]).then(([h]) => h);
 
 	const syncNeighbours = () => {
 		if (options.neighbours === false || authorityCell === undefined) return;
@@ -138,6 +143,7 @@ export function createGridClient(options: GridClientOptions): GridClient {
 
 	client.on('authority', (zone) => {
 		authorityCell = parseZone(zone);
+		setContext();
 		syncNeighbours();
 	});
 	client.on('handoffComplete', () => {
@@ -145,7 +151,10 @@ export function createGridClient(options: GridClientOptions): GridClient {
 	});
 	typed.on('hello', (hello, zone) => {
 		infos.set(zone, hello);
-		seed = hello.seed;
+		if (hello.seed !== seed) {
+			seed = hello.seed;
+			setContext();
+		}
 		if (hello.entity !== undefined && zone === client.authority?.zoneId) {
 			client.setControlledEntity(hello.entity);
 			resolveReady(hello);
@@ -159,6 +168,7 @@ export function createGridClient(options: GridClientOptions): GridClient {
 
 	return {
 		client,
+		prediction: typed.prediction,
 		cell: () => authorityCell,
 		info: (zone) => infos.get(zone),
 		seed: () => seed,

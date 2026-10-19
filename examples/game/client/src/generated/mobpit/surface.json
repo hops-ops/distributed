@@ -556,6 +556,13 @@
     }
   ],
   "name": "mobpit",
+  "predict": {
+    "abi": 1,
+    "export": "pit_step",
+    "kind": "player",
+    "package": "game_sim",
+    "state": "MoveState"
+  },
   "protocolVersion": 1,
   "records": [
     {
@@ -704,6 +711,47 @@
     {
       "fields": [
         {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vx",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vy",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "dash",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "cd",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "MoveState"
+    },
+    {
+      "fields": [
+        {
           "name": "xp",
           "type": {
             "type": "u64"
@@ -823,5 +871,5 @@
       "name": "Scores"
     }
   ],
-  "schemaVersion": 1
+  "schemaVersion": 2
 }

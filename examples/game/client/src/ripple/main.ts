@@ -17,7 +17,7 @@ import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { Scene } from '@babylonjs/core/scene';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
-import { HALF, PILLARS, PLAYER_RADIUS } from '../arena/movement.ts';
+import { HALF, PILLARS, PLAYER_RADIUS } from '../arena/floor.ts';
 import { BITS, isPlayer, playerFields } from '../generated/ripple/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';

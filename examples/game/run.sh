@@ -8,7 +8,11 @@
 #                           the next port), one process each
 #   ./run.sh gen            regenerate client/src/generated/<surface>/ from the
 #                           Rust surfaces (`distributed game-manifest` +
-#                           `distributed game-client`); `gen --check` verifies
+#                           `distributed game-client`) and compile each
+#                           `#[predict]` step to <surface>/wasm/<surface>.wasm
+#                           (`distributed game-wasm`, gitignored, stamped so
+#                           an unchanged step is not rebuilt); `gen --check`
+#                           verifies the TypeScript (and still builds WASM)
 #   ./run.sh smoke          every demo's smoke tests (Rust bots + headless JS,
 #                           generated clients checked)
 #   ./run.sh list           demos this script knows
@@ -69,7 +73,9 @@ ensure_cli() {
 
 # gen [--check]: GameSurface JSON from each Rust surface export → typed
 # TypeScript in client/src/generated/<surface>/ (surface.json included, so a
-# changed Rust definition shows up as drift).
+# changed Rust definition shows up as drift), then the surface's predicted
+# step → <surface>/wasm/<surface>.wasm. `--check` only applies to the
+# checked-in TypeScript; the WASM is a build output and is (re)built.
 gen() {
 	local check="${1:-}"
 	ensure_cli
@@ -79,7 +85,33 @@ gen() {
 		"$CLI" game-manifest --manifest-path "$SERVER/Cargo.toml" \
 			--entrypoint "game_demos::$surface::game_surface" --out "$tmp/$surface.json" &&
 			"$CLI" game-client --manifest "$tmp/$surface.json" \
-				--out "$CLIENT/src/generated/$surface" $check ||
+				--out "$CLIENT/src/generated/$surface" $check &&
+			wasm_for "$tmp/$surface.json" "$surface" ||
+			status=1
+	done
+	rm -rf "$tmp"
+	return "$status"
+}
+
+# wasm_for <surface.json> <surface>: compile the surface's `#[predict]` step
+# (if it declares one) next to its generated client.
+wasm_for() {
+	grep -q '"predict"' "$1" || return 0
+	"$CLI" game-wasm --manifest "$1" --manifest-path "$SERVER/Cargo.toml" \
+		--out "$CLIENT/src/generated/$2" >/dev/null
+}
+
+# ensure_wasm: build every predicted step the pages load (no TypeScript
+# generation; the stamps make this quick when nothing changed).
+ensure_wasm() {
+	ensure_cli
+	log "compiling predicted steps to WebAssembly"
+	local tmp status=0
+	tmp="$(mktemp -d "${TMPDIR:-/tmp}/game-surfaces.XXXXXX")"
+	for surface in "${SURFACES[@]}"; do
+		"$CLI" game-manifest --manifest-path "$SERVER/Cargo.toml" \
+			--entrypoint "game_demos::$surface::game_surface" --out "$tmp/$surface.json" &&
+			wasm_for "$tmp/$surface.json" "$surface" ||
 			status=1
 	done
 	rm -rf "$tmp"
@@ -93,6 +125,7 @@ run_demo() {
 	ensure_sdk
 	ensure_client
 	ensure_server
+	ensure_wasm
 
 	local log_file
 	log_file="$(mktemp -t game-demos.XXXXXX)"
@@ -137,6 +170,7 @@ run_cluster() {
 	ensure_sdk
 	ensure_client
 	ensure_server
+	ensure_wasm
 
 	local dir secret
 	dir="$(mktemp -d "${TMPDIR:-/tmp}/game-demos-$demo.XXXXXX")"
@@ -164,14 +198,14 @@ run_cluster() {
 smoke() {
 	ensure_sdk
 	ensure_client
-	log "generated clients are current"
+	log "generated clients are current; predicted steps compiled to WASM"
 	gen --check
-	log "server: fmt, clippy, tests (bots smoke + movement fixture)"
-	cargo fmt --manifest-path "$SERVER/Cargo.toml" --check
-	cargo clippy --quiet --manifest-path "$SERVER/Cargo.toml" --all-targets -- -D warnings
-	cargo test --quiet --manifest-path "$SERVER/Cargo.toml"
+	log "server: fmt, clippy, tests (bots smoke + grid world fixture)"
+	cargo fmt --manifest-path "$SERVER/Cargo.toml" --check -p game_demos -p game_sim
+	cargo clippy --quiet --manifest-path "$SERVER/Cargo.toml" --workspace --all-targets -- -D warnings
+	cargo test --quiet --manifest-path "$SERVER/Cargo.toml" --workspace
 	cargo build --quiet --manifest-path "$SERVER/Cargo.toml"
-	log "client: type-check, build, tests (movement parity + headless SDK)"
+	log "client: type-check, build, tests (WASM prediction exact match + headless SDK)"
 	(cd "$CLIENT" && npm run --silent check && npx vite build --logLevel warn && GAME_DEMOS_BIN="$BIN" npm test --silent)
 	log "smoke OK"
 }
@@ -180,7 +214,7 @@ case "${1:-}" in
 	smoke) smoke ;;
 	gen) gen "${2:-}" ;;
 	list) printf '%s\n' "${DEMOS[@]}" ;;
-	"" | -h | --help | help) sed -n '2,21p' "$0" ;;
+	"" | -h | --help | help) sed -n '2,24p' "$0" ;;
 	*)
 		if [[ " ${CLUSTER_DEMOS[*]} " == *" $1 "* ]]; then
 			run_cluster "$1"

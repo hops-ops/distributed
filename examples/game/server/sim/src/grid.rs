@@ -1,19 +1,21 @@
 //! Procedural world and movement of the Endless Grid.
 //!
-//! **This file has a twin:** `examples/game/client/src/grid/world.ts`. The
-//! static content of a cell (terrain height, biome, props) is a pure
+//! The static content of a cell (terrain height, biome, props) is a pure
 //! function of `(world seed, cell x, cell y, CONTENT_VERSION)`; the server
 //! uses it for collision and the client for rendering, and **nothing
-//! static is replicated**. The movement step is shared too, so the client
-//! predicts its own walker exactly.
+//! static is replicated**. The walker's movement step collides with the
+//! cell's props; the browser predicts it with this code compiled to
+//! WebAssembly ([`grid_step`], whose context names the seed and cell, so
+//! the props are generated inside the module).
 //!
-//! Rules that keep both sides bit-identical (as in the Arena movement):
-//! integer hashing on `u32` only (`Math.imul` / `>>> 0` in TypeScript);
-//! floats are binary32 (`Math.fround` after every operation) using only
-//! `+ - * /`, `sqrt` and `floor`; constants are dyadic where it matters.
-//! `tests/grid_fixture.rs` writes `examples/game/fixtures/grid-world.json`,
-//! replayed by the client's `tests/grid-world-parity.test.mjs`. Change both
-//! files together, then `UPDATE_GOLDEN=1 cargo test --test grid_fixture`.
+//! The rendering side still has a TypeScript twin of the *generation*
+//! (`examples/game/client/src/grid/world.ts`, checked bit-for-bit by
+//! `fixtures/grid-world.json`) until world content is served from WASM as
+//! well. Rules that keep everything bit-identical: integer hashing on `u32`
+//! only; floats are binary32 using only `+ - * /`, `sqrt` and `floor`;
+//! constants are dyadic where it matters. `tests/grid_fixture.rs` writes the
+//! fixture; change both files together, then `UPDATE_GOLDEN=1 cargo test
+//! --test grid_fixture`.
 //!
 //! Layout: a cell is [`CELL`] m square with local coordinates `0..CELL` on
 //! both axes; cell `(cx, cy)` covers world `cx*CELL .. (cx+1)*CELL`. Each
@@ -22,7 +24,9 @@
 //! is a multiple of 8 m is a free path ("trail"), and props never reach
 //! across a cell border.
 
-use distributed_game::{FieldType, FieldValue, GameInput};
+use std::cell::RefCell;
+
+use distributed_game::{predict, FieldType, FieldValue, GameInput, GameRecord};
 
 /// Cell edge length (m).
 pub const CELL: f32 = 32.0;
@@ -310,6 +314,59 @@ pub fn step(x: f32, y: f32, input: MoveInput, props: &[Prop]) -> (f32, f32) {
     let lo = -OUTSIDE_LIMIT;
     let hi = CELL + OUTSIDE_LIMIT;
     (snap(x.clamp(lo, hi)), snap(y.clamp(lo, hi)))
+}
+
+/// A walker's predicted state: its cell-local position (the `walker` kind's
+/// `x` / `y`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, GameRecord)]
+pub struct WalkerState {
+    /// Local x.
+    pub x: f32,
+    /// Local y.
+    pub y: f32,
+}
+
+/// What a client tells the predicted step: the world seed (from the
+/// zone's hello) and the cell it walks in (its authoritative zone).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameRecord)]
+pub struct GridContext {
+    /// World seed.
+    pub seed: u32,
+    /// Cell x.
+    pub cx: i32,
+    /// Cell y.
+    pub cy: i32,
+}
+
+/// `(seed, cell x, cell y)` → that cell's props.
+type PropsCache = Option<((u32, i32, i32), Vec<Prop>)>;
+
+thread_local! {
+    /// Props of the last cell stepped in (a walker stays in one cell for
+    /// many frames).
+    static PROPS: RefCell<PropsCache> = const { RefCell::new(None) };
+}
+
+/// The client-predicted step of the own walker: [`step`] against the
+/// props of the context's cell (generated here, so the browser needs no
+/// copy of the world to predict).
+#[predict(GridStep, kind = "walker")]
+pub fn grid_step(
+    state: &WalkerState,
+    input: &MoveInput,
+    context: &GridContext,
+    _dt: f32,
+) -> WalkerState {
+    let key = (context.seed, context.cx, context.cy);
+    PROPS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.as_ref().map(|(k, _)| *k) != Some(key) {
+            *cache = Some((key, cell_props(context.seed, (context.cx, context.cy))));
+        }
+        let props = &cache.as_ref().expect("filled above").1;
+        let (x, y) = step(state.x, state.y, *input, props);
+        WalkerState { x, y }
+    })
 }
 
 /// Neighbour a walker at `(x, y)` belongs to, as a cell offset, or None

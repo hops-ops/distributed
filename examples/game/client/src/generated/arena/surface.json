@@ -225,7 +225,56 @@
     }
   ],
   "name": "arena",
+  "predict": {
+    "abi": 1,
+    "export": "arena_step",
+    "kind": "player",
+    "package": "game_sim",
+    "state": "MoveState"
+  },
   "protocolVersion": 1,
-  "records": [],
-  "schemaVersion": 1
+  "records": [
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vx",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vy",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "dash",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "cd",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "MoveState"
+    }
+  ],
+  "schemaVersion": 2
 }

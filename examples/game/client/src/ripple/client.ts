@@ -1,8 +1,9 @@
 /**
  * Boss Ripple networking without rendering (Node-testable):
  *
- * - the player's authoritative zone is one neighborhood (predicted with
- *   the Arena movement step; the boss stands on the central pillar);
+ * - the player's authoritative zone is one neighborhood (predicted by
+ *   `hood_step`, the Rust Arena movement compiled to WebAssembly; the boss
+ *   stands on the central pillar);
  * - every other zone of the hierarchy is observed (realm, city, boroughs
  *   and the other hoods), so the page shows each tier's live state and
  *   receives what upper tiers broadcast: ripple events, the city's
@@ -10,7 +11,6 @@
  */
 import type { GameClient, GameSocketFactory } from '@hops-ops/distributed/game';
 
-import { predictPlayer } from '../arena/movement.ts';
 import * as gen from '../generated/ripple/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
 
@@ -73,7 +73,7 @@ export type RippleClientOptions = Readonly<{
 
 export type RippleClient = Readonly<{
 	client: GameClient<HoodInput>;
-	/** Resolves on the first hello of the player's hood. */
+	/** Resolves on the first hello of the player's hood, once the predicted step is loaded. */
 	ready: Promise<RippleHello>;
 	tier(zone: string): TierView;
 	/** Ripple events received (newest last, bounded). */
@@ -107,13 +107,15 @@ export function createRippleClient(options: RippleClientOptions): RippleClient {
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
 		pingIntervalMs: 1000,
-		inputDtMs: 1000 / 30,
-		// The movement part of the frame is the Arena's (`action` only adds bits).
-		prediction: { predict: (fields, input) => predictPlayer(fields, input) }
+		inputDtMs: 1000 / 30
+		// Prediction: the generated default, `hood_step` compiled to WASM.
 	});
 	const { client } = typed;
 	let resolveReady: (h: RippleHello) => void = () => undefined;
-	const ready = new Promise<RippleHello>((resolve) => (resolveReady = resolve));
+	const ready = Promise.all([
+		new Promise<RippleHello>((resolve) => (resolveReady = resolve)),
+		typed.prediction?.ready
+	]).then(([h]) => h);
 
 	typed.on('hello', (hello, zone) => {
 		hellos.set(zone, hello);
