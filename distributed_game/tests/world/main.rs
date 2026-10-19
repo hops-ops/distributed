@@ -534,9 +534,11 @@ async fn dormant_zone_hibernates_to_sqlite_and_restores() {
     })
     .await;
     send(&mut ana.ws, ClientMessage::Leave).await;
-    eventually("hibernation", || {
+    // The zone leaves the active set before its snapshot is written, so wait
+    // for the save itself.
+    eventually("hibernation save", || {
         let server = server.clone();
-        async move { !server.is_active("realm.vault") }
+        async move { !server.is_active("realm.vault") && hibernation_outcomes(&server) >= 1 }
     })
     .await;
     let saved = store.load("realm.vault").unwrap().expect("snapshot stored");
@@ -627,9 +629,10 @@ async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
                     .unwrap(),
             );
             send(&mut ana.ws, ClientMessage::Leave).await;
-            eventually("hibernation", || {
+            // Saved, stale or error: the assertions below say which.
+            eventually("hibernation save", || {
                 let server = server.clone();
-                async move { !server.is_active("realm.keep") }
+                async move { !server.is_active("realm.keep") && hibernation_outcomes(&server) >= cycle }
             })
             .await;
             assert_eq!(server.metrics().hibernation_saves("stale"), 0, "run {run}");
@@ -1044,4 +1047,10 @@ async fn barrier_aborts_and_resumes_old_version_when_a_zone_never_acks() {
 fn directory_types_are_object_safe() {
     let dir: Arc<dyn ZoneDirectory> = Arc::new(StaticDirectory::new());
     assert!(dir.locate("x").is_none());
+}
+
+/// Hibernation snapshot saves finished so far, whatever their outcome.
+fn hibernation_outcomes(server: &GameServer<Realm>) -> u64 {
+    let m = server.metrics();
+    m.hibernation_saves("saved") + m.hibernation_saves("stale") + m.hibernation_saves("error")
 }

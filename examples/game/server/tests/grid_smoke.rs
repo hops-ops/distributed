@@ -170,12 +170,17 @@ async fn empty_cell_hibernates_and_restores_critters_and_markers() {
     client
         .until("marker replicated", |c| c.count(MarkerView::KIND_ID) == 1)
         .await;
+    let saves_before = owner.demo.server.metrics().hibernation_saves("saved");
     client.leave().await;
     drop(client);
 
-    eventually("hibernation", || {
+    // The zone leaves the active set before its snapshot is written, so wait
+    // for the save itself.
+    eventually("hibernation save", || {
         let server = owner.demo.server.clone();
-        async move { !server.is_active(zone) }
+        async move {
+            !server.is_active(zone) && server.metrics().hibernation_saves("saved") >= saves_before + 1
+        }
     })
     .await;
     let saved = owner
