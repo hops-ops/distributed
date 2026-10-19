@@ -463,6 +463,15 @@ runnable: [`examples/game/sveltekit`](../examples/game/sveltekit)
    `status`, `zone`, `rttMs`, `predictionReady`, `error` and typed
    `latest(event)` / `events(event)`; it connects on mount and closes on
    destroy or navigation.
+4. **Settled progress through the business side.** Game state stays in the
+   zone; what a player keeps belongs to a Distributed service. Mark the cell
+   command's event as a domain event (`#[event(.., domain)]` +
+   `repo.publish_events()`), drain the cell outbox onto a bus
+   (`AggregateCell::drain_outbox_with(BusPublisher::new(bus), ..)`), project
+   it with a modeled projector into a SQL read model and read that with
+   generated `@load @live` GraphQL (`clients` in the same Vite plugin,
+   session-bound variables via `sessionClaim`). The example does this with
+   `mobpit_service` and a SQLite bus.
 
 ```ts
 // src/routes/api/game/ticket/+server.ts

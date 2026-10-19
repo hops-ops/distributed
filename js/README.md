@@ -419,7 +419,10 @@ module such as `$distributed/admin` and provide it only in the elevated layout.
 `distributed_game` zones get three pieces; the canvas, render loop and
 entity drawing stay outside Svelte, and game state is never server-rendered.
 Svelte 5.7+ is required (`svelte/reactivity`). A runnable example is
-[`examples/game/sveltekit`](../examples/game/sveltekit).
+[`examples/game/sveltekit`](../examples/game/sveltekit); it also reads the
+players' settled progress from a Distributed service's SQL read model with
+generated `@load @live` GraphQL (`clients` next to `games`, under
+`distributed dev|build`).
 
 **1. Generated game clients from the Vite plugin.** Add `games` to the same
 plugin. Each surface runs `distributed game-manifest` → `game-client` →
