@@ -1,0 +1,5 @@
+error: `#[predict]` needs the predicted kind: `kind = "player"`
+  --> tests/compile_fail/predict_needs_kind.rs:13:11
+   |
+13 | #[predict(Step)]
+   |           ^^^^

@@ -75,6 +75,8 @@ pub enum DistributedCommands {
     GameManifest(GameManifestArgs),
     /// Generate typed TypeScript for a distributed_game zone from its GameSurface
     GameClient(GameClientArgs),
+    /// Compile a distributed_game zone's `#[predict]` step to WebAssembly for its generated client
+    GameWasm(GameWasmArgs),
     /// Render schema artifacts (SQL or an Atlas Operator resource) from a read-model catalog
     Schema(SchemaArgs),
     /// Extract the embedded Distributed agent skills into a project
@@ -130,6 +132,8 @@ pub enum ServiceCommands {
     GameManifest(GameManifestArgs),
     /// Generate typed TypeScript for a distributed_game zone from its GameSurface
     GameClient(GameClientArgs),
+    /// Compile a distributed_game zone's `#[predict]` step to WebAssembly for its generated client
+    GameWasm(GameWasmArgs),
     /// Render schema artifacts (SQL or an Atlas Operator resource) from a read-model catalog
     Schema(SchemaArgs),
     /// Extract the embedded Distributed agent skills into a project
@@ -489,6 +493,25 @@ pub struct GameClientArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct GameWasmArgs {
+    /// GameSurface JSON (from `distributed game-manifest`) with a predicted step.
+    #[arg(long)]
+    pub manifest: PathBuf,
+    /// Generated client directory; the module is written to `<out>/wasm/<surface>.wasm`.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// Cargo project containing the package that declares the step.
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
+    /// Cargo.toml of that project. Overrides --path.
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
+    /// Verify the module is current without compiling.
+    #[arg(long)]
+    pub check: bool,
+}
+
+#[derive(Args, Debug)]
 #[command(group(
     ArgGroup::new("client_surface")
         .required(true)
@@ -695,6 +718,7 @@ pub fn run_distributed(args: &DistributedArgs) -> Result<(), Box<dyn Error>> {
         DistributedCommands::ClientManifest(client) => run_client_manifest(client),
         DistributedCommands::GameManifest(game) => run_game_manifest(game),
         DistributedCommands::GameClient(game) => run_game_client(game),
+        DistributedCommands::GameWasm(game) => run_game_wasm(game),
         DistributedCommands::Schema(schema) => run_schema(schema),
         DistributedCommands::Skills(skills) => match &skills.command {
             SkillsCommands::Init(init) => run_skills_init(init),
@@ -744,6 +768,7 @@ pub fn run(args: &ServiceArgs) -> Result<(), Box<dyn Error>> {
         ServiceCommands::ClientManifest(client) => run_client_manifest(client),
         ServiceCommands::GameManifest(game) => run_game_manifest(game),
         ServiceCommands::GameClient(game) => run_game_client(game),
+        ServiceCommands::GameWasm(game) => run_game_wasm(game),
         ServiceCommands::Schema(schema) => run_schema(schema),
         ServiceCommands::Skills(skills) => match &skills.command {
             SkillsCommands::Init(init) => run_skills_init(init),
@@ -2409,6 +2434,30 @@ fn run_game_client(args: &GameClientArgs) -> Result<(), Box<dyn Error>> {
             files.len(),
             args.out.display()
         );
+    }
+    Ok(())
+}
+
+fn run_game_wasm(args: &GameWasmArgs) -> Result<(), Box<dyn Error>> {
+    let source = read_utf8_bounded(&args.manifest, MAX_CLIENT_MANIFEST_BYTES, "game surface")?;
+    let cargo_manifest = args
+        .manifest_path
+        .clone()
+        .unwrap_or_else(|| args.path.join("Cargo.toml"));
+    let outcome = crate::game_wasm::run_game_wasm(&crate::game_wasm::GameWasmOptions {
+        surface: &source,
+        cargo_manifest: &cargo_manifest,
+        out: &args.out,
+        check: args.check,
+    })
+    .map_err(|error| format!("{}: {error}", args.manifest.display()))?;
+    match outcome {
+        crate::game_wasm::GameWasmOutcome::Current(path) => {
+            println!("Predicted step {} is current", path.display())
+        }
+        crate::game_wasm::GameWasmOutcome::Built(path) => {
+            println!("Compiled predicted step to {}", path.display())
+        }
     }
     Ok(())
 }

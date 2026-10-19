@@ -12,6 +12,8 @@ import { after, before, test } from 'node:test';
 
 import { fromHex, toHex } from '@hops-ops/distributed/game';
 
+import { predictModuleBytes } from './fixtures/predict-module.mjs';
+
 const fixture = JSON.parse(
 	readFileSync(new URL('../../distributed_game/tests/fixtures/authoring.json', import.meta.url), 'utf8')
 );
@@ -108,4 +110,35 @@ test('the client factory wires the encoder and merged corrections', () => {
 	assert.equal(typeof typed.client.sendInput, 'function');
 	assert.equal(typed.send({ mx: 0, my: 0, buttons: 0, aim: 0, power: 0, viewTick: 0 }), undefined, 'not connected');
 	typed.client.close();
+});
+
+test('the predicted step is described and wired in by default', async () => {
+	const surface = fixture.surface;
+	assert.equal(gen.PREDICT.export, surface.predict.export);
+	assert.equal(gen.PREDICT.kind, 'player');
+	// Wire field names of the kind, with the state record's plain types.
+	assert.deepEqual(gen.PREDICT_STATE.map(([name]) => name), ['x', 'vx', 'hp', 'dead']);
+	assert.deepEqual(gen.PREDICT_STATE.map(([, type]) => type.type), ['f32', 'f32', 'u8', 'bool']);
+	assert.deepEqual(gen.PREDICT_CONTEXT.map(([name]) => name), ['speed', 'gusts']);
+	assert.ok(gen.PREDICT_WASM_URL.href.endsWith('/wasm/sample.wasm'));
+
+	// Default: the compiled step (here a stand-in module that echoes the state).
+	const typed = gen.createSampleClient({ url: () => 'ws://unused', ticket: async () => 'unused', wasm: predictModuleBytes() });
+	assert.ok(typed.prediction !== undefined);
+	await typed.prediction.ready;
+	typed.prediction.setContext({ speed: 2, gusts: 1 });
+	const fields = { x: 1.25, vx: 0, hp: 5, dead: false, name: 'n' };
+	assert.deepEqual(typed.prediction.predict(fields, { mx: 1, my: 0, buttons: 0, aim: 0, power: 0, viewTick: 0 }, 33), {
+		x: 1.25,
+		vx: 0,
+		hp: 5,
+		dead: false
+	});
+	typed.client.close();
+
+	// `false` turns prediction off; a custom `predict` replaces the step.
+	const off = gen.createSampleClient({ url: () => 'ws://unused', ticket: async () => 'unused', prediction: false });
+	assert.equal(off.prediction, undefined);
+	assert.equal(off.client.predictor, undefined);
+	off.client.close();
 });

@@ -24,6 +24,10 @@
 //!   ([`Ctx::emit`]). The derives also describe the zone's
 //!   [`GameSurface`](surface::GameSurface), from which `distributed
 //!   game-client` generates typed TypeScript.
+//! - Client prediction ([`prediction`]): `#[predict]` declares a zone's
+//!   predicted step once in Rust; `distributed game-wasm` compiles it to
+//!   WebAssembly (binary ABI, no JSON) and the generated client predicts
+//!   with it.
 //!
 //! Physics is out of scope: games bring their own and run it in `on_tick`.
 //!
@@ -57,6 +61,7 @@ pub mod interest;
 pub mod metrics;
 #[cfg(feature = "net")]
 pub mod net;
+pub mod prediction;
 pub mod protocol;
 pub mod replay;
 pub mod replication;
@@ -74,7 +79,9 @@ pub use authoring::{GameEvent, GameInput, Pushed, Replicated};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use codec::{Wire, WireType};
 /// Authoring derives (see the crate docs and README).
-pub use distributed_game_macros::{FactCommand, GameEvent, GameInput, GameRecord, Replicated};
+pub use distributed_game_macros::{
+    predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated,
+};
 #[cfg(feature = "runtime")]
 pub use facts::spawn_fact_worker;
 pub use facts::{
@@ -86,6 +93,7 @@ pub use handoff::{HandoffError, HandoffRequest, Transfer};
 pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};
 pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, SequencedInput};
 pub use interest::{InterestConfig, View};
+pub use prediction::{PredictContext, PredictStep};
 pub use protocol::{ClientMessage, ClientMirror, Role, ServerMessage, PROTOCOL_VERSION};
 pub use replay::{replay, Recorder, Recording};
 pub use replication::{EntityState, WorldView};
@@ -109,6 +117,8 @@ pub mod __private {
     pub use crate::codec::{
         special, ButtonBits, EntityField, InputField, LongString, QuantizedF32, Wire, WireType,
     };
+    #[cfg(target_arch = "wasm32")]
+    pub use crate::prediction::wasm_export;
     pub use crate::protocol::wire::{DecodeError, Reader, Writer};
     pub use crate::schema::{Correction, FieldType, FieldValue, KindDef};
     pub use crate::surface::{

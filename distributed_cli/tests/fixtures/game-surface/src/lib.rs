@@ -1,8 +1,8 @@
 //! A minimal zone surface for `distributed game-manifest` tests.
 
 use distributed_game::{
-    schema, Ctx, EntitySchema, GameEvent, GameInput, GameSurface, PlayerId, Replicated, WorldView,
-    Zone,
+    predict, schema, Ctx, EntitySchema, GameEvent, GameInput, GameRecord, GameSurface, PlayerId,
+    Replicated, WorldView, Zone,
 };
 
 #[derive(Replicated)]
@@ -28,6 +28,20 @@ pub struct Steer {
 pub enum OrbEvent {
     #[game_event(id = 1)]
     Hello { entity: u32 },
+}
+
+/// The predicted part of an orb.
+#[derive(Clone, Copy, GameRecord)]
+pub struct OrbState {
+    pub x: f32,
+}
+
+/// The client-predicted step (compiled to WASM by `distributed game-wasm`).
+#[predict(OrbStep, kind = "orb")]
+pub fn orb_step(state: &OrbState, input: &Steer, _context: &(), dt: f32) -> OrbState {
+    OrbState {
+        x: state.x + f32::from(input.turn) * dt,
+    }
 }
 
 pub struct Orbs;
@@ -58,5 +72,7 @@ impl Zone for Orbs {
 
 /// The export `distributed game-manifest` runs by default.
 pub fn game_surface() -> GameSurface {
-    GameSurface::for_zone::<Orbs>("orbs").events::<OrbEvent>()
+    GameSurface::for_zone::<Orbs>("orbs")
+        .events::<OrbEvent>()
+        .predict::<OrbStep>()
 }

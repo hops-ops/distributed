@@ -374,6 +374,14 @@
     }
   ],
   "name": "sample",
+  "predict": {
+    "abi": 1,
+    "context": "SampleWind",
+    "export": "sample_step",
+    "kind": "player",
+    "package": "distributed_game",
+    "state": "SampleState"
+  },
   "protocolVersion": 1,
   "records": [
     {
@@ -434,7 +442,53 @@
         }
       ],
       "name": "Row"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vx",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "hp",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "dead",
+          "type": {
+            "type": "bool"
+          }
+        }
+      ],
+      "name": "SampleState"
+    },
+    {
+      "fields": [
+        {
+          "name": "speed",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "gusts",
+          "type": {
+            "type": "u16"
+          }
+        }
+      ],
+      "name": "SampleWind"
     }
   ],
-  "schemaVersion": 1
+  "schemaVersion": 2
 }

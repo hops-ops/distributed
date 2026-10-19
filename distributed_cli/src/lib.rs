@@ -10,6 +10,7 @@ mod cli;
 mod client_compiler;
 pub mod contracts;
 mod game_client;
+mod game_wasm;
 mod generate;
 mod js_framework;
 pub mod lifecycle;
@@ -22,9 +23,9 @@ pub use cli::{
     run, run_distributed, AgentHarness, BuildArgs, Bus, ClientArgs, ClientManifestArgs,
     ContractsAcceptArgs, ContractsArgs, ContractsCheckArgs, ContractsCommands, ContractsOutput,
     DescribeArgs, DevArgs, DistributedArgs, DistributedCommands, Framework, GameClientArgs,
-    GameManifestArgs, GitopsPromote, JavascriptWatchArgs, LifecycleOutput, ManifestFormat, Metrics,
-    ProbeArgs, ScaffoldArgs, SchemaArgs, SchemaDialect, SchemaFormat, ServiceArgs, ServiceCommands,
-    SkillsArgs, SkillsCommands, SkillsInitArgs, Store, Transport,
+    GameManifestArgs, GameWasmArgs, GitopsPromote, JavascriptWatchArgs, LifecycleOutput,
+    ManifestFormat, Metrics, ProbeArgs, ScaffoldArgs, SchemaArgs, SchemaDialect, SchemaFormat,
+    ServiceArgs, ServiceCommands, SkillsArgs, SkillsCommands, SkillsInitArgs, Store, Transport,
 };
 pub use client_compiler::{
     compile_client, ClientCompileError, ClientCompileInput, ClientDocument, ClientSourceLocation,
