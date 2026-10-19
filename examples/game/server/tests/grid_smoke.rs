@@ -179,7 +179,7 @@ async fn empty_cell_hibernates_and_restores_critters_and_markers() {
     eventually("hibernation save", || {
         let server = owner.demo.server.clone();
         async move {
-            !server.is_active(zone) && server.metrics().hibernation_saves("saved") >= saves_before + 1
+            !server.is_active(zone) && server.metrics().hibernation_saves("saved") > saves_before
         }
     })
     .await;
