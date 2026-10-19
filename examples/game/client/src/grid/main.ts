@@ -2,8 +2,9 @@
  * Endless Grid page: Babylon scene over `createGridClient`.
  *
  * - terrain, biomes and props of the 5×5 cells around you are generated
- *   locally from the seed (`world.ts`, bit-identical to the server) —
- *   nothing static comes over the wire;
+ *   locally from the seed by the server's own Rust world generation,
+ *   compiled to WebAssembly (`grid_cell` / `grid_sample` via the generated
+ *   `createGridPures`) — nothing static comes over the wire;
  * - cell borders are tinted by the host that runs the cell; the minimap
  *   (`/dev/grid/map`) shows active / hibernated / cold cells per host;
  * - your walker is predicted; everything else (critters, other walkers,
@@ -32,24 +33,22 @@ import { Hud } from '../shared/hud.ts';
 import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
 import { createStage, material } from '../shared/scene.ts';
 import { critterFields, isCritter, isMarker, markerFields, walkerFields } from '../generated/grid/index.ts';
-import { createGridClient, DEFAULT_ZONE, type GridHello, type MapCell, type WorldMap } from './client.ts';
 import {
-	BIOMES,
 	BUTTON_MARK,
 	BUTTON_SPRINT,
 	CELL,
-	PLAYER_RADIUS,
-	PROP_BUSH,
-	PROP_ROCK,
-	PROP_TREE,
-	biomeOf,
-	height,
-	moisture,
+	createGridClient,
+	DEFAULT_ZONE,
 	parseZone,
+	WORLD,
 	zoneId,
 	type Cell,
-	type MoveInput
-} from './world.ts';
+	type CellContent,
+	type GridHello,
+	type MapCell,
+	type MoveInput,
+	type WorldMap
+} from './client.ts';
 import './grid.css';
 
 const params = new URLSearchParams(location.search);
@@ -58,6 +57,10 @@ const name = params.get('name') ?? undefined;
 const VIEW_CELLS = 2;
 const RELIEF = 4;
 const HOST_COLORS = ['#4ea1ff', '#ff9f43', '#b48cff', '#5fd39a'];
+const PLAYER_RADIUS = WORLD.playerRadius;
+/** Ground mesh: one vertex per terrain lattice point. */
+const SUBDIVISIONS = WORLD.samples - 1;
+const PROP = Object.fromEntries(WORLD.propKinds.map((name, i) => [name, i])) as Record<'tree' | 'rock' | 'bush', number>;
 
 const api = new DevApi({ name: () => name });
 const grid = createGridClient({ api });
@@ -91,10 +94,15 @@ let origin: Cell = parseZone(startZone) ?? [0, 0];
 function local(cell: Cell, x: number, y: number, up = 0): Vector3 {
 	return new Vector3((cell[0] - origin[0]) * CELL + x, terrain(cell, x, y) + up, (cell[1] - origin[1]) * CELL + y);
 }
+/** Ground height (m) at a local point (`grid_sample`, clamped into the cell). */
 function terrain(cell: Cell, x: number, y: number): number {
-	const cx = Math.min(CELL, Math.max(0, x));
-	const cy = Math.min(CELL, Math.max(0, y));
-	return height(grid.seed(), cell, cx, cy) * RELIEF;
+	return (grid.sample(cell, x, y)?.height ?? 0) * RELIEF;
+}
+
+/** Lattice index of a ground vertex (local coordinates on the lattice). */
+function lattice(lx: number, ly: number): number {
+	const step = WORLD.sampleSpacing;
+	return Math.round(ly / step) * WORLD.samples + Math.round(lx / step);
 }
 
 // ---- terrain chunks ----
@@ -126,25 +134,24 @@ const templates = (() => {
 	bush.bakeCurrentTransformIntoVertices();
 	bush.material = material(scene, 'shrub', '#4f8f3a');
 	for (const m of [trunk, canopy, rock, bush]) m.setEnabled(false);
-	return { [PROP_TREE]: [trunk, canopy], [PROP_ROCK]: [rock], [PROP_BUSH]: [bush] } as Record<number, Mesh[]>;
+	return { [PROP.tree]: [trunk, canopy], [PROP.rock]: [rock], [PROP.bush]: [bush] } as Record<number, Mesh[]>;
 })();
 
 // Props are not parented to the ground: instanced children of a moved
 // parent rendered fully fogged (white) here, so they are placed directly.
-type Chunk = { cell: Cell; ground: Mesh; props: { mesh: InstancedMesh; at: Vector3 }[]; border: LinesMesh; owner?: string };
+type Chunk = { cell: Cell; content: CellContent; ground: Mesh; props: { mesh: InstancedMesh; at: Vector3 }[]; border: LinesMesh; owner?: string };
 const chunks = new Map<string, Chunk>();
 
-function chunkColors(cell: Cell, ground: Mesh, owner: string | undefined): void {
+function chunkColors(content: CellContent, ground: Mesh, owner: string | undefined): void {
 	const positions = ground.getVerticesData(VertexBuffer.PositionKind)!;
 	const colors = new Float32Array((positions.length / 3) * 4);
 	const tint = owner === undefined ? undefined : Color3.FromHexString(hostColor(owner));
-	const seed = grid.seed();
 	for (let i = 0; i < positions.length / 3; i += 1) {
 		const lx = positions[i * 3]! + CELL / 2;
 		const ly = positions[i * 3 + 2]! + CELL / 2;
-		const h = height(seed, cell, lx, ly);
-		const b = biomeOf(h, moisture(seed, cell, lx, ly));
-		let c = BIOME_COLORS[b]!.scale(0.72 + h * 0.55);
+		const k = lattice(lx, ly);
+		const h = content.heights[k]!;
+		let c = BIOME_COLORS[content.biomes[k]!]!.scale(0.72 + h * 0.55);
 		if (lx % 8 === 0 || ly % 8 === 0) c = Color3.Lerp(c, Color3.FromHexString('#d9c9a3'), 0.28); // trails
 		if (tint !== undefined) c = Color3.Lerp(c, tint, 0.1);
 		colors.set([c.r, c.g, c.b, 1], i * 4);
@@ -152,12 +159,12 @@ function chunkColors(cell: Cell, ground: Mesh, owner: string | undefined): void 
 	ground.setVerticesData(VertexBuffer.ColorKind, colors);
 }
 
-function createChunk(cell: Cell): Chunk {
+function createChunk(cell: Cell, content: CellContent): Chunk {
 	const key = zoneId(cell);
-	const ground = MeshBuilder.CreateGround(`ground-${key}`, { width: CELL, height: CELL, subdivisions: 16, updatable: true }, scene);
+	const ground = MeshBuilder.CreateGround(`ground-${key}`, { width: CELL, height: CELL, subdivisions: SUBDIVISIONS, updatable: true }, scene);
 	const positions = ground.getVerticesData(VertexBuffer.PositionKind)!;
 	for (let i = 0; i < positions.length / 3; i += 1) {
-		positions[i * 3 + 1] = height(grid.seed(), cell, positions[i * 3]! + CELL / 2, positions[i * 3 + 2]! + CELL / 2) * RELIEF;
+		positions[i * 3 + 1] = content.heights[lattice(positions[i * 3]! + CELL / 2, positions[i * 3 + 2]! + CELL / 2)]! * RELIEF;
 	}
 	const normals: number[] = [];
 	VertexData.ComputeNormals(positions, ground.getIndices()!, normals);
@@ -165,13 +172,13 @@ function createChunk(cell: Cell): Chunk {
 	ground.updateVerticesData(VertexBuffer.NormalKind, normals);
 	ground.material = groundMat;
 	const owner = owners.get(key);
-	chunkColors(cell, ground, owner);
+	chunkColors(content, ground, owner);
 
 	const props: Chunk['props'] = [];
-	for (const [i, p] of grid.props(cell).entries()) {
+	for (const [i, p] of content.props.entries()) {
 		for (const [j, template] of templates[p.kind]!.entries()) {
 			const inst = template.createInstance(`prop-${key}-${i}-${j}`);
-			inst.scaling.setAll(p.kind === PROP_TREE ? p.r / 0.55 : p.r);
+			inst.scaling.setAll(p.kind === PROP.tree ? p.r / 0.55 : p.r);
 			inst.rotation.y = (p.variant / 255) * Math.PI * 2;
 			props.push({ mesh: inst, at: new Vector3(p.x - CELL / 2, terrain(cell, p.x, p.y) - 0.1, p.y - CELL / 2) });
 		}
@@ -186,7 +193,7 @@ function createChunk(cell: Cell): Chunk {
 	const border = MeshBuilder.CreateLines(`border-${key}`, { points: edge }, scene);
 	border.parent = ground;
 	border.color = Color3.FromHexString(hostColor(owner));
-	return { cell, ground, props, border, owner };
+	return { cell, content, ground, props, border, owner };
 }
 
 function syncChunks(): void {
@@ -196,7 +203,10 @@ function syncChunks(): void {
 			const cell: Cell = [origin[0] + dx, origin[1] + dy];
 			const key = zoneId(cell);
 			wanted.add(key);
-			if (!chunks.has(key)) chunks.set(key, createChunk(cell));
+			if (chunks.has(key)) continue;
+			// Content comes from the compiled module; until it loads there is nothing to draw.
+			const content = grid.content(cell);
+			if (content !== undefined) chunks.set(key, createChunk(cell, content));
 		}
 	}
 	for (const [key, chunk] of chunks) {
@@ -212,7 +222,7 @@ function syncChunks(): void {
 		if (owner !== chunk.owner) {
 			chunk.owner = owner;
 			chunk.border.color = Color3.FromHexString(hostColor(owner));
-			chunkColors(chunk.cell, chunk.ground, owner);
+			chunkColors(chunk.content, chunk.ground, owner);
 		}
 	}
 }
@@ -409,6 +419,8 @@ function sendCommandFrame(): void {
 
 // ---- frame ----
 syncChunks();
+// The world generation is compiled Rust: draw the chunks once it is loaded.
+grid.pures.ready.then(syncChunks, (error: unknown) => hud.row('Status', `world module failed: ${String(error)}`));
 stage.onFrame((now, dtMs) => {
 	commandFrames.update(now, sendCommandFrame);
 	const cell = grid.cell();
@@ -457,7 +469,8 @@ stage.onFrame((now, dtMs) => {
 	hud.row('You', api.last === undefined ? '—' : `${api.last.name} · ${api.last.principal}`);
 	hud.row('Cell', cell === undefined ? '—' : `${cell[0]}, ${cell[1]} · local ${px.toFixed(1)}, ${py.toFixed(1)}`);
 	hud.row('Host', hello?.host ?? '—');
-	hud.row('Biome', cell === undefined ? '—' : BIOMES[biomeOf(height(grid.seed(), cell, px, py), moisture(grid.seed(), cell, px, py))]!);
+	const here = cell === undefined ? undefined : grid.sample(cell, px, py);
+	hud.row('Biome', here === undefined ? '—' : WORLD.biomes[here.biome]!);
 	hud.row('Neighbours', `${observers.filter((z) => z.connection.state === 'open').length}/8 observed`);
 	hud.row('Handoffs', String(grid.handoffs()));
 	hud.row('Markers here', String(markers));

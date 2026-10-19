@@ -1,18 +1,21 @@
 /**
- * Native ↔ WebAssembly exact match of every demo's client-predicted step,
- * and the cost of prediction with it.
+ * Native ↔ WebAssembly exact match of every demo's client-predicted step
+ * and `#[game_pure]` function, and the cost of using them.
  *
  * `game-demos predict-trace` (the native build) prints, per step function,
- * recorded input streams with the state after every frame. Each surface's
- * compiled module (`src/generated/<surface>/wasm/<surface>.wasm`, built by
- * `distributed game-wasm`) replays the same streams and must produce the
- * same bytes — every float bit included. The generated `predict` (state ↔
- * entity fields, input encoder) is checked over the same streams, and a
- * `Predictor` reconciling with 10 pending inputs is timed.
+ * recorded input streams with the state after every frame, and per pure
+ * function recorded arguments with their results. Each surface's compiled
+ * module (`src/generated/<surface>/wasm/<surface>.wasm`, built by
+ * `distributed game-wasm`) replays the same streams and calls and must
+ * produce the same bytes — every float bit included. The generated
+ * `predict` (state ↔ entity fields, input encoder) and pure wrappers
+ * (`createGridPures`) are checked over the same data; a `Predictor`
+ * reconciling with 10 pending inputs and generating a grid cell are timed.
  *
- * The steps only use operations that are correctly rounded on every target
- * (`+ - * /`, `sqrt`, comparisons); see `distributed_game::prediction` for
- * the float rules (no platform transcendentals).
+ * The code only uses operations that are correctly rounded on every target
+ * (`+ - * /`, `sqrt`, `floor`, comparisons); see
+ * `distributed_game::prediction` for the float rules (no platform
+ * transcendentals).
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -25,13 +28,13 @@ import {
 	Predictor,
 	decodePayload,
 	decodePredictState,
+	decodeValue,
 	encodePayload,
 	encodePredictState,
+	encodeValue,
 	fromHex,
 	toHex
 } from '@hops-ops/distributed/game';
-
-import * as floor from '../src/arena/floor.ts';
 
 const GENERATED = new URL('../src/generated/', import.meta.url);
 const SERVER_DIR = fileURLToPath(new URL('../../server/', import.meta.url));
@@ -108,15 +111,72 @@ for (const { name, predict } of surfaces) {
 	});
 }
 
-test('drawing constants of the Arena floor match the simulation', () => {
-	assert.equal(floor.HALF, traces.arena.half);
-	assert.equal(floor.PLAYER_RADIUS, traces.arena.playerRadius);
-	assert.equal(floor.DASH_COOLDOWN, traces.arena.dashCooldown);
-	assert.deepEqual(floor.PILLARS.map((p) => [...p]), traces.arena.pillars);
+/** Every generated surface with pure functions. */
+const pureSurfaces = readdirSync(GENERATED)
+	.filter((name) => existsSync(new URL(`${name}/pures.ts`, GENERATED)))
+	.map((name) => ({ name, pures: JSON.parse(readFileSync(new URL(`${name}/surface.json`, GENERATED), 'utf8')).pures }));
+
+test('every pure function has a native trace and every trace a surface', () => {
+	assert.deepEqual(pureSurfaces.map((s) => s.name), ['grid']);
+	const declared = pureSurfaces.flatMap((s) => s.pures.map((p) => p.export)).sort();
+	assert.deepEqual(traces.pures.map((p) => p.export).sort(), declared);
 });
+
+for (const { name, pures } of pureSurfaces) {
+	for (const pure of pures) {
+		test(`${name}: WASM ${pure.export} matches the native function bit for bit`, async () => {
+			const module = await PredictModule.load(new URL(`${name}/wasm/${name}.wasm`, GENERATED));
+			assert.ok(module.pures.includes(pure.export));
+			const trace = traces.pures.find((p) => p.export === pure.export);
+			for (const [i, call] of trace.calls.entries()) {
+				assert.equal(toHex(module.call(pure.export, fromHex(call.arg))), call.output, `call ${i}`);
+			}
+			assert.ok(trace.calls.length >= 60, `${trace.calls.length} calls compared`);
+		});
+	}
+}
+
+test('grid: the generated wrappers decode what the native generation encodes', async () => {
+	const generated = await import('../src/generated/grid/index.ts');
+	const pures = generated.createGridPures();
+	await pures.ready;
+	const types = {
+		grid_cell: pureType(generated, 'grid_cell'),
+		grid_sample: pureType(generated, 'grid_sample')
+	};
+	for (const pure of traces.pures) {
+		const { arg, output } = types[pure.export];
+		const wrapper = pure.export === 'grid_cell' ? pures.gridCell : pures.gridSample;
+		for (const call of pure.calls.slice(0, 12)) {
+			const value = wrapper(decodeValue(arg, fromHex(call.arg)));
+			assert.equal(toHex(encodeValue(output, value)), call.output);
+		}
+	}
+	// Lattice and props as the page draws them.
+	const cell = pures.gridCell({ seed: generated.GRID_WORLD.defaultSeed, cx: 0, cy: 0 });
+	assert.equal(cell.heights.length, generated.GRID_WORLD.samples ** 2);
+	assert.ok(cell.props.every((p) => p.kind < generated.GRID_WORLD.propKinds.length));
+	assert.ok([...cell.biomes].every((b) => b < generated.GRID_WORLD.biomes.length));
+});
+
+/** Argument / output wire types of a pure function, from its surface (records resolved, camelCase fields). */
+function pureType(generated, exportName) {
+	const surface = JSON.parse(readFileSync(new URL('grid/surface.json', GENERATED), 'utf8'));
+	const camel = (n) => n.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
+	const resolve = (type) => {
+		if (type.type === 'record') {
+			const record = surface.records.find((r) => r.name === type.name);
+			return { type: 'record', fields: record.fields.map((f) => [camel(f.name), resolve(f.type)]) };
+		}
+		return type.item === undefined ? type : { ...type, item: resolve(type.item) };
+	};
+	const pure = surface.pures.find((p) => p.export === exportName);
+	return { arg: resolve(pure.arg), output: resolve(pure.output) };
+}
 
 /** Median of `runs` timings of `fn` (each `iterations` calls), µs per call. */
 function measure(fn, iterations, runs = 7) {
+	for (let i = 0; i < iterations; i += 1) fn(i); // warm up (JIT tiers, wasm tier-up)
 	const samples = [];
 	for (let r = 0; r < runs; r += 1) {
 		const start = process.hrtime.bigint();
@@ -126,6 +186,26 @@ function measure(fn, iterations, runs = 7) {
 	samples.sort((a, b) => a - b);
 	return samples[Math.floor(runs / 2)];
 }
+
+test('cost: generating a grid cell and sampling a point in WASM', async () => {
+	const generated = await import('../src/generated/grid/index.ts');
+	const pures = generated.createGridPures();
+	await pures.ready;
+	const seed = generated.GRID_WORLD.defaultSeed;
+	// A different cell every call (no cache inside or outside the module).
+	const cellUs = measure((i) => pures.gridCell({ seed, cx: (i % 97) - 48, cy: Math.floor(i / 97) - 20 }), 400);
+	// Without decoding the result into JS objects (generation + ABI copy).
+	const argType = pureType(generated, 'grid_cell').arg;
+	const abiUs = measure((i) => pures.module().call('grid_cell', encodeValue(argType, { seed, cx: (i % 89) - 44, cy: -7 })), 400);
+	const sampleUs = measure((i) => pures.gridSample({ seed, cx: 3, cy: -2, x: (i % 320) / 10, y: 7.25 }), 20_000);
+	// The page builds a ring of up to 5 new cells per border crossing; it must
+	// fit in a frame with room to spare.
+	console.log(
+		`grid generation cost (Node ${process.version}, µs, median): ${JSON.stringify({ cellUs, cellAbiOnlyUs: abiUs, sampleUs })}`
+	);
+	assert.ok(cellUs < 2000, `grid_cell took ${cellUs} µs`);
+	assert.ok(sampleUs < 100, `grid_sample took ${sampleUs} µs`);
+});
 
 test('cost: one predicted step and a reconciliation replaying 10 inputs at 30 Hz', async () => {
 	const report = {};

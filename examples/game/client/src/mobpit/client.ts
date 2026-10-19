@@ -15,13 +15,21 @@ import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
 import { latest } from '../shared/latest.ts';
 
 export const DEFAULT_ZONE = 'pit-1';
-export const MOB_STATE = ['idle', 'chase', 'windup', 'recover', 'return'] as const;
-/** Per tier: display name, body radius, telegraph radius (server `tier_stats`). */
-export const TIERS: Readonly<Record<number, { name: string; radius: number; tele: number; color: string }>> = {
-	1: { name: 'Grunt', radius: 0.5, tele: 1.8, color: '#9ad16b' },
-	2: { name: 'Brute', radius: 0.7, tele: 2.2, color: '#b48cf2' },
-	3: { name: 'Elite', radius: 0.8, tele: 2.6, color: '#ff6b6b' }
+/** `state` names of the `mob` kind, by value (generated from the Rust `MOB_STATES`). */
+export const MOB_STATE = pit.PIT_RULES.states;
+/** Presentation of each tier (client only). */
+const TIER_LOOK: Readonly<Record<number, { name: string; color: string }>> = {
+	1: { name: 'Grunt', color: '#9ad16b' },
+	2: { name: 'Brute', color: '#b48cf2' },
+	3: { name: 'Elite', color: '#ff6b6b' }
 };
+/**
+ * Per tier: display name and color (client presentation), body and
+ * telegraph radius (the server's `tier_stats`, generated `PIT_RULES`).
+ */
+export const TIERS: Readonly<Record<number, { name: string; radius: number; tele: number; color: string }>> = Object.fromEntries(
+	pit.PIT_RULES.tiers.map((t) => [t.tier, { ...(TIER_LOOK[t.tier] ?? { name: `Tier ${t.tier}`, color: '#9ad16b' }), radius: t.radius, tele: t.tele }])
+);
 
 /** `/dev/mobpit/leaderboard` neighbourhood (HTTP only, not a zone event). */
 export type BoardPosition = Readonly<{ rank: number | null; score: number | null; around: pit.BoardRow[] }>;
