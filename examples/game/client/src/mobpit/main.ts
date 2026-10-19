@@ -14,22 +14,25 @@ import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
-import { HALF, PLAYER_RADIUS, type MoveInput } from '../arena/movement.ts';
+import { HALF, PLAYER_RADIUS } from '../arena/movement.ts';
+import {
+	BUTTON,
+	isMob,
+	isPillar,
+	isPit,
+	mobFields,
+	pillarFields,
+	pitFields,
+	playerFields,
+	type BoardSnapshot,
+	type PitFields,
+	type PitInput
+} from '../generated/mobpit/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
 import { createStage, material, toWorld } from '../shared/scene.ts';
-import {
-	BUTTON_ATTACK,
-	BUTTON_DASH,
-	createMobPitClient,
-	DEFAULT_ZONE,
-	KIND,
-	MobPitApi,
-	TIERS,
-	type BoardSnapshot,
-	type KillEvent
-} from './client.ts';
+import { createMobPitClient, DEFAULT_ZONE, MobPitApi, TIERS } from './client.ts';
 
 const SLOW_MS = 1500;
 const params = new URLSearchParams(location.search);
@@ -138,7 +141,7 @@ function createPlayer(entity: RenderedEntity, mine: boolean): PlayerVisual {
 }
 
 function createMob(entity: RenderedEntity): MobVisual {
-	const tier = num(entity, 'tier') || 1;
+	const tier = mobFields(entity).tier || 1;
 	const t = TIERS[tier] ?? TIERS[1]!;
 	const body =
 		tier === 3
@@ -159,19 +162,15 @@ function createMob(entity: RenderedEntity): MobVisual {
 function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 	let visual = visuals.get(entity.key);
 	if (visual !== undefined) return visual;
-	switch (entity.kindName) {
-		case KIND.mob:
-			visual = createMob(entity);
-			break;
-		case KIND.pillar: {
-			const r = num(entity, 'r');
-			const body = MeshBuilder.CreateCylinder(entity.key, { diameter: r * 2, height: 2.4, tessellation: 24 }, scene);
-			body.material = mats.pillar;
-			visual = { kind: 'pillar', body };
-			break;
-		}
-		default:
-			visual = createPlayer(entity, mine);
+	if (isMob(entity)) {
+		visual = createMob(entity);
+	} else if (isPillar(entity)) {
+		const { r } = pillarFields(entity);
+		const body = MeshBuilder.CreateCylinder(entity.key, { diameter: r * 2, height: 2.4, tessellation: 24 }, scene);
+		body.material = mats.pillar;
+		visual = { kind: 'pillar', body };
+	} else {
+		visual = createPlayer(entity, mine);
 	}
 	visuals.set(entity.key, visual);
 	return visual;
@@ -179,11 +178,6 @@ function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 
 function dispose(visual: Visual): void {
 	for (const mesh of Object.values(visual)) if (mesh instanceof Mesh) mesh.dispose();
-}
-
-function num(entity: RenderedEntity | { fields: RenderedEntity['fields'] }, f: string): number {
-	const v = entity.fields[f];
-	return typeof v === 'number' ? v : typeof v === 'boolean' ? Number(v) : 0;
 }
 
 // ---- kill / saved popups (DOM labels anchored to invisible meshes) ----
@@ -204,7 +198,7 @@ function popup(key: string, x: number, y: number, text: string, className: strin
 	stage.labels.set(`popup:${key}`, p.mesh, text, 0.6, `pit-pop ${className}`);
 }
 
-pit.on('kill', (kill: KillEvent) => {
+pit.on('kill', (kill) => {
 	const mine = kill.killer === pit.hello()?.entity;
 	const tier = TIERS[kill.tier]?.name ?? 'Mob';
 	if (mine) popup(kill.key, kill.x, kill.y, `${tier} slain · saving…`, 'pending', 60_000);
@@ -283,10 +277,10 @@ const commandFrames = new InputPacer({ tickRate: () => client.authority?.connect
 function sendCommandFrame(): void {
 	const s = sampler.sample();
 	const move = cameraRelative(s, stage.cameraForward());
-	const input: MoveInput = {
+	const input: PitInput = {
 		mx: toAxis(move.x),
 		my: toAxis(move.y),
-		buttons: (s.action ? BUTTON_ATTACK : 0) | (s.alt ? BUTTON_DASH : 0)
+		buttons: (s.action ? BUTTON.attack : 0) | (s.alt ? BUTTON.dash : 0)
 	};
 	client.sendInput(input);
 }
@@ -299,31 +293,32 @@ stage.onFrame((now, dtMs) => {
 	const rendered = client.render();
 	const seen = new Set<string>();
 	let me: { x: number; y: number; hp: number; dead: boolean } | undefined;
-	let stats: RenderedEntity | undefined;
+	let stats: PitFields | undefined;
 	for (const entity of rendered) {
-		if (entity.kindName === KIND.pit) {
-			stats = entity;
+		if (isPit(entity)) {
+			stats = pitFields(entity);
 			continue;
 		}
 		const mine = authority !== undefined && hello !== undefined && entity.zoneId === authority.zoneId && entity.id === hello.entity;
 		const visual = visualFor(entity, mine);
-		const x = num(entity, 'x');
-		const y = num(entity, 'y');
 		seen.add(entity.key);
 		const visible = !entity.stale || visual.kind === 'pillar';
 		if (visual.kind === 'pillar') {
+			const { x, y } = pillarFields(entity);
 			visual.body.position.copyFrom(toWorld(x, y, 1.2));
 		} else if (visual.kind === 'mob') {
+			const mob = mobFields(entity);
+			const { x, y } = mob;
 			const height = visual.tier === 3 ? 1 : visual.tier === 2 ? 0.75 : 0.45;
 			visual.body.position.copyFrom(toWorld(x, y, height));
-			visual.body.rotation.y = -num(entity, 'face');
-			const hp = num(entity, 'hp') / 100;
+			visual.body.rotation.y = -mob.face;
+			const hp = mob.hp / 100;
 			const top = height * 2 + 0.35;
 			visual.hpBack.position.copyFrom(toWorld(x, y, top));
 			visual.hpFill.position.copyFrom(toWorld(x, y, top));
 			visual.hpFill.scaling.x = Math.max(0.001, hp);
-			const tele = num(entity, 'tele') / 255;
-			const winding = num(entity, 'state') === 2;
+			const tele = mob.tele / 255;
+			const winding = mob.state === 2;
 			visual.ring.setEnabled(visible && winding);
 			visual.fill.setEnabled(visible && winding);
 			if (winding) {
@@ -334,9 +329,8 @@ stage.onFrame((now, dtMs) => {
 			visual.body.scaling.setAll(winding ? 1 + 0.15 * tele : 1);
 			for (const m of [visual.body, visual.hpBack, visual.hpFill]) m.setEnabled(visible);
 		} else {
-			const dead = num(entity, 'dead') > 0;
-			const face = num(entity, 'face');
-			const swing = num(entity, 'swing');
+			const player = playerFields(entity);
+			const { x, y, dead, face, swing } = player;
 			visual.body.position.copyFrom(toWorld(x, y, 0.9));
 			visual.body.material = dead ? mats.dead : mine ? mats.me : mats.other;
 			visual.nose.position.copyFrom(toWorld(x + Math.cos(face) * 0.5, y + Math.sin(face) * 0.5, 1.3));
@@ -353,11 +347,11 @@ stage.onFrame((now, dtMs) => {
 				// Disc arcs start at +x and run counter-clockwise; centre it on `face`.
 				visual.arc.rotation.y = -(face - Math.PI / 3);
 			}
-			const label = `${String(entity.fields.name ?? '')} · L${num(entity, 'level')} · ${num(entity, 'hp')} HP`;
+			const label = `${player.name} · L${player.level} · ${player.hp} HP`;
 			stage.labels.set(entity.key, visual.body, mine ? `${label} (you)` : label, 1.4, mine ? 'me' : '');
 			visual.body.setEnabled(visible);
 			visual.nose.setEnabled(visible && !dead);
-			if (mine) me = { x, y, hp: num(entity, 'hp'), dead };
+			if (mine) me = { x, y, hp: player.hp, dead };
 		}
 	}
 	for (const [key, visual] of visuals) {
@@ -376,18 +370,18 @@ stage.onFrame((now, dtMs) => {
 
 	// ---- HUD ----
 	hud.frame({ entities: rendered.length });
-	const pending = stats === undefined ? 0 : num(stats, 'pending');
-	const tickMs = stats === undefined ? 0 : num(stats, 'tickMs');
-	const tickMax = stats === undefined ? 0 : num(stats, 'tickMaxMs');
-	const slowMs = stats === undefined ? 0 : num(stats, 'slowMs');
+	const pending = stats?.pending ?? 0;
+	const tickMs = stats?.tickMs ?? 0;
+	const tickMax = stats?.tickMaxMs ?? 0;
+	const slowMs = stats?.slowMs ?? 0;
 	hud.row('You', api.last === undefined ? '—' : `${api.last.name} · ${api.last.principal}`);
 	hud.row('HP', me === undefined ? '—' : me.dead ? 'dead' : String(me.hp));
 	hud.row('Facts pending (zone)', String(pending));
-	hud.row('Facts saved (zone)', String(stats === undefined ? 0 : num(stats, 'committed')));
+	hud.row('Facts saved (zone)', String(stats?.committed ?? 0));
 	hud.row('My unsaved kills', String(pit.unsaved.size));
 	hud.row('Storage latency', slowMs > 0 ? `${slowMs} ms (slow)` : 'normal');
 	hud.row('Server tick interval', `${tickMs.toFixed(1)} ms avg · ${tickMax.toFixed(1)} max`);
-	hud.row('Tick work', `${stats === undefined ? 0 : num(stats, 'workUs')} µs`);
+	hud.row('Tick work', `${stats?.workUs ?? 0} µs`);
 	const profile = pit.profile();
 	if (profile !== undefined) {
 		const span = Math.max(1, profile.nextLevelXp - profile.levelXp);

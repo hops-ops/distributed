@@ -100,5 +100,6 @@ async fn leaderboard(
 }
 
 async fn rebuild(State(world): State<Arc<MobPitWorld>>) -> ApiResult {
-    Ok(Json(world.rebuild_board().await.map_err(internal)?))
+    let report = world.rebuild_board().await.map_err(internal)?;
+    Ok(Json(serde_json::to_value(report).map_err(internal)?))
 }

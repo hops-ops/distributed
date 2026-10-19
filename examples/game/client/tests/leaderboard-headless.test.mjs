@@ -48,13 +48,13 @@ test('board pushes match the cells and rebuild is identical', { timeout: 600_000
 		assert.equal(mine.kills.rank, 1);
 		assert.equal(mine.kills.around[0].member, me);
 
-		const top = JSON.stringify([watcher.board().kills, watcher.board().xp]);
+		const top = [watcher.board().kills, watcher.board().xp];
 		const report = await pitApi.rebuild();
 		assert.equal(report.events, profile.kills);
 		assert.equal(report.matchesCells, true);
 		assert.equal(report.identicalTop, true);
 		const after = (await pitApi.leaderboard()).snapshot;
-		assert.equal(JSON.stringify([after.kills, after.xp]), top, 'rebuild from events = live board');
+		assert.deepEqual([after.kills, after.xp], top, 'rebuild from events = live board');
 		await until(() => watcher.board().lastRebuild?.events === profile.kills, 5_000, 'rebuild pushed');
 	} finally {
 		for (const c of clients) c.close();

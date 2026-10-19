@@ -179,10 +179,10 @@ async fn facts_commit_once_and_board_rebuilds_identically() {
     assert_eq!(assert_board_matches_cells(&world).await, 2);
 
     let report = world.rebuild_board().await.unwrap();
-    assert_eq!(report["events"], 2);
-    assert_eq!(report["applied"], 4, "two boards per kill");
-    assert_eq!(report["matchesCells"], true, "{report}");
-    assert_eq!(report["identicalTop"], true, "{report}");
+    assert_eq!(report.events, 2);
+    assert_eq!(report.applied, 4, "two boards per kill");
+    assert!(report.matches_cells, "{report:?}");
+    assert!(report.identical_top, "{report:?}");
 
     // The live occurrence id equals the history one: replaying it after the
     // rebuild is a duplicate on both boards.
@@ -534,8 +534,8 @@ async fn redis_board_projects_and_rebuilds_when_redis_url_is_set() {
     })
     .await;
     let report = world.rebuild_board().await.unwrap();
-    assert_eq!(report["matchesCells"], true, "{report}");
-    assert_eq!(report["identicalTop"], true, "{report}");
+    assert!(report.matches_cells, "{report:?}");
+    assert!(report.identical_top, "{report:?}");
     let (kills, xp) = world.board().boards();
     for board in [kills, xp] {
         world.board().store().reset(board).await.unwrap();

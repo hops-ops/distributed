@@ -144,7 +144,7 @@ impl MobPitWorld {
     }
 
     /// Rebuild the leaderboards from the cells' event history.
-    pub async fn rebuild_board(&self) -> Result<Value, String> {
+    pub async fn rebuild_board(&self) -> Result<super::board::RebuildReport, String> {
         self.board.rebuild(&self.cells).await
     }
 

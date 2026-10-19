@@ -34,7 +34,7 @@ use distributed_game::net::{GameServer, ServerConfig};
 
 use crate::common::{self, random_hex, Demo, DemoArgs, DemoOptions, Guests, RunningDemo};
 pub use world::{MobPitWorld, WorldOptions};
-pub use zone::{encode_bot_input, MobPit};
+pub use zone::{encode_bot_input, game_surface, MobPit};
 
 /// `game-demos mobpit|leaderboard` options.
 #[derive(Debug, Clone, clap::Args)]
@@ -128,7 +128,10 @@ pub async fn run(mut args: MobPitArgs) -> std::io::Result<()> {
     // Board = projection of the cells: rebuild it before accepting players
     // (the in-memory board starts empty; Redis may have missed updates).
     match world.rebuild_board().await {
-        Ok(report) => eprintln!("mobpit: leaderboard rebuilt from cells: {report}"),
+        Ok(report) => eprintln!(
+            "mobpit: leaderboard rebuilt from cells: {}",
+            serde_json::to_string(&report).unwrap_or_default()
+        ),
         Err(error) => eprintln!("mobpit: leaderboard rebuild failed (serving anyway): {error}"),
     }
     eprintln!(
