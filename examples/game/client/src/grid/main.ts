@@ -31,7 +31,8 @@ import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
 import { createStage, material } from '../shared/scene.ts';
-import { createGridClient, DEFAULT_ZONE, KIND, type GridHello, type MapCell, type WorldMap } from './client.ts';
+import { critterFields, isCritter, isMarker, markerFields, walkerFields } from '../generated/grid/index.ts';
+import { createGridClient, DEFAULT_ZONE, type GridHello, type MapCell, type WorldMap } from './client.ts';
 import {
 	BIOMES,
 	BUTTON_MARK,
@@ -245,19 +246,23 @@ function hueMat(hue: number, kind: string): StandardMaterial {
 const meMat = material(scene, 'me', '#ffffff');
 meMat.emissiveColor = Color3.FromHexString('#2a4c66');
 
-type Visual = { mesh: AbstractMesh; kind: string };
+type Visual = { mesh: AbstractMesh; kind: 'walker' | 'critter' | 'marker' };
 const visuals = new Map<string, Visual>();
 function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 	let visual = visuals.get(entity.key);
-	const hue = typeof entity.fields.hue === 'number' ? entity.fields.hue : 0;
 	if (visual !== undefined) return visual;
 	let mesh: AbstractMesh;
-	if (entity.kindName === KIND.critter) {
+	let kind: Visual['kind'] = 'walker';
+	if (isCritter(entity)) {
+		const { hue } = critterFields(entity);
+		kind = 'critter';
 		const body = MeshBuilder.CreateSphere(entity.key, { diameter: 0.7, segments: 8 }, scene);
 		body.scaling.set(1.2, 0.7, 0.8);
 		body.material = hueMat(hue, 'critter');
 		mesh = body;
-	} else if (entity.kindName === KIND.marker) {
+	} else if (isMarker(entity)) {
+		const { hue } = markerFields(entity);
+		kind = 'marker';
 		const pole = MeshBuilder.CreateCylinder(entity.key, { diameter: 0.08, height: 2.2 }, scene);
 		pole.bakeTransformIntoVertices(Matrix.Translation(0, 1.1, 0));
 		const flag = MeshBuilder.CreateBox(`${entity.key}-flag`, { width: 0.8, height: 0.5, depth: 0.04 }, scene);
@@ -266,11 +271,12 @@ function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 		flag.material = hueMat(hue, 'marker');
 		mesh = pole;
 	} else {
+		const { hue } = walkerFields(entity);
 		const capsule = MeshBuilder.CreateCapsule(entity.key, { radius: PLAYER_RADIUS, height: 1.8 }, scene);
 		capsule.material = mine ? meMat : hueMat(hue, 'walker');
 		mesh = capsule;
 	}
-	visual = { mesh, kind: entity.kindName };
+	visual = { mesh, kind };
 	visuals.set(entity.key, visual);
 	return visual;
 }
@@ -303,7 +309,7 @@ grid.onRestored((hello) => {
 		const burst = restoredBurst;
 		restoredBurst = [];
 		const here = burst.find((h) => h.zone === client.authority?.zoneId) ?? burst[0]!;
-		const slept = here.hibernatedForMs === null ? '' : ` after ${(here.hibernatedForMs / 1000).toFixed(1)} s`;
+		const slept = here.hibernatedForMs === undefined ? '' : ` after ${(here.hibernatedForMs / 1000).toFixed(1)} s`;
 		const others = burst.length > 1 ? ` (+${burst.length - 1} neighbour${burst.length > 2 ? 's' : ''})` : '';
 		toast(
 			`${here.zone} restored from hibernation${slept} on host ${here.host}: ${here.restoredCritters} critters, ${here.restoredMarkers} markers${others}`,
@@ -417,19 +423,19 @@ stage.onFrame((now, dtMs) => {
 		if (ecell === undefined) continue;
 		const mine = entity.predicted || (entity.authoritative && hello?.entity === entity.id);
 		const visual = visualFor(entity, mine);
-		const x = Number(entity.fields.x ?? 0);
-		const y = Number(entity.fields.y ?? 0);
 		seen.add(entity.key);
-		if (visual.kind === KIND.critter) {
+		if (visual.kind === 'critter') {
+			const { x, y, yaw } = critterFields(entity);
 			visual.mesh.position.copyFrom(local(ecell, x, y, 0.3));
-			visual.mesh.rotation.y = -Number(entity.fields.yaw ?? 0);
-		} else if (visual.kind === KIND.marker) {
+			visual.mesh.rotation.y = -yaw;
+		} else if (visual.kind === 'marker') {
+			const { x, y, label } = markerFields(entity);
 			visual.mesh.position.copyFrom(local(ecell, x, y));
-			stage.labels.set(entity.key, visual.mesh, `⚑ ${String(entity.fields.label ?? '')}`, 2.6);
+			stage.labels.set(entity.key, visual.mesh, `⚑ ${label}`, 2.6);
 			if (entity.authoritative) markers += 1;
 		} else {
+			const { x, y, name: label } = walkerFields(entity);
 			visual.mesh.position.copyFrom(local(ecell, x, y, 0.9));
-			const label = String(entity.fields.name ?? '');
 			stage.labels.set(entity.key, visual.mesh, mine ? `${label} (you)` : label, 1.4, mine ? 'me' : '');
 			if (mine) me = visual.mesh.position;
 		}

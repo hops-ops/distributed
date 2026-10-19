@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use distributed_game::GameInput;
 use game_demos::grid::world::{self, MoveInput, BUTTON_SPRINT, DEFAULT_SEED};
 use serde_json::{json, Value};
 
@@ -77,7 +78,7 @@ fn walk(seed: u32) -> Value {
                 },
                 buttons: if k % 2 == 0 { BUTTON_SPRINT } else { 0 },
             };
-            let decoded = MoveInput::decode(&input.encode()).unwrap();
+            let decoded = MoveInput::from_payload(&input.to_payload()).unwrap();
             (x, y) = world::step(x, y, decoded, &props);
             steps.push(json!({ "input": [input.mx, input.my, input.buttons], "x": x, "y": y }));
         }

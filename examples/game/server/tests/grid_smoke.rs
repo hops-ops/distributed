@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use distributed_game::world::ZoneStateStore;
 use distributed_game::{FieldValue, Role, ServerMessage};
+use distributed_game::{GameInput, Replicated};
 use game_demos::grid::world::{self, MoveInput, BUTTON_MARK, BUTTON_SPRINT};
-use game_demos::grid::{GridDemo, EVENT_HELLO, KIND_CRITTER, KIND_MARKER};
+use game_demos::grid::{CritterView, GridDemo, GridHello, MarkerView};
 use serde_json::{json, Value};
 use support::{eventually, http, join, start_cluster, ticket, Client};
 
@@ -23,8 +24,7 @@ fn east(buttons: u8) -> Vec<u8> {
         my: 0,
         buttons: BUTTON_SPRINT | buttons,
     }
-    .encode()
-    .to_vec()
+    .to_payload()
 }
 
 fn f(fields: &[FieldValue], i: usize) -> f32 {
@@ -53,12 +53,12 @@ async fn walker_crosses_borders_and_hosts_without_losing_its_session() {
     )
     .await
     .unwrap();
-    let hello = observer.json_event(EVENT_HELLO).await;
-    assert_eq!(hello["host"], owner(1).as_str());
-    assert!(hello["entity"].is_null(), "observers control nothing");
+    let hello = observer.wait_event::<GridHello>(|_| true).await;
+    assert_eq!(hello.host, owner(1));
+    assert!(hello.entity.is_none(), "observers control nothing");
     observer
         .until("critters replicated to the observer", |c| {
-            c.count(KIND_CRITTER) >= 2
+            c.count(CritterView::KIND_ID) >= 2
         })
         .await;
 
@@ -69,10 +69,10 @@ async fn walker_crosses_borders_and_hosts_without_losing_its_session() {
     )
     .await
     .unwrap();
-    let hello = client.json_event(EVENT_HELLO).await;
+    let hello = client.wait_event::<GridHello>(|_| true).await;
     let name = format!("Guest {}", &"guest-walker"[6..10]);
-    assert_eq!(hello["cell"], json!([0, 0]));
-    assert!(hello["entity"].as_u64().is_some());
+    assert_eq!(hello.cell, [0, 0]);
+    assert!(hello.entity.is_some());
 
     let mut zone = "grid.0.0".to_string();
     let mut handoffs = 0;
@@ -104,9 +104,9 @@ async fn walker_crosses_borders_and_hosts_without_losing_its_session() {
             let from_owner = world.owner(&zone);
             let to_owner = world.owner(&to);
             let mut next: Client = join(&base, &to, &transfer).await.expect("target admits");
-            let hello = next.json_event(EVENT_HELLO).await;
-            assert_eq!(hello["zone"], to.as_str());
-            assert_eq!(hello["host"], to_owner.as_str());
+            let hello = next.wait_event::<GridHello>(|_| true).await;
+            assert_eq!(hello.zone, to);
+            assert_eq!(hello.host, to_owner);
             assert_eq!(
                 next.redirects > 0,
                 to_owner != "A",
@@ -164,11 +164,11 @@ async fn empty_cell_hibernates_and_restores_critters_and_markers() {
     let mut client = join(&base, zone, &ticket("guest-marker", zone, Role::Player))
         .await
         .unwrap();
-    let hello = client.json_event(EVENT_HELLO).await;
-    assert_eq!(hello["restored"], false);
+    let hello = client.wait_event::<GridHello>(|_| true).await;
+    assert!(!hello.restored);
     client.input(east(BUTTON_MARK)).await;
     client
-        .until("marker replicated", |c| c.count(KIND_MARKER) == 1)
+        .until("marker replicated", |c| c.count(MarkerView::KIND_ID) == 1)
         .await;
     client.leave().await;
     drop(client);
@@ -205,15 +205,15 @@ async fn empty_cell_hibernates_and_restores_critters_and_markers() {
     let mut again = join(&base, zone, &ticket("guest-marker", zone, Role::Player))
         .await
         .unwrap();
-    let hello = again.json_event(EVENT_HELLO).await;
-    assert_eq!(hello["restored"], true);
-    assert_eq!(hello["restores"], 1);
-    assert_eq!(hello["restoredMarkers"], 1);
-    assert_eq!(hello["restoredCritters"], critters.len());
+    let hello = again.wait_event::<GridHello>(|_| true).await;
+    assert!(hello.restored);
+    assert_eq!(hello.restores, 1);
+    assert_eq!(hello.restored_markers, 1);
+    assert_eq!(hello.restored_critters as usize, critters.len());
     let n = critters.len();
     again
         .until("restored entities replicated", |c| {
-            c.count(KIND_CRITTER) == n && c.count(KIND_MARKER) == 1
+            c.count(CritterView::KIND_ID) == n && c.count(MarkerView::KIND_ID) == 1
         })
         .await;
     // Critters resume exactly where they slept (first delta after restore).
@@ -264,7 +264,7 @@ async fn dev_routes_share_names_and_map_both_hosts() {
     .await
     .unwrap();
     assert_eq!(client.redirects, 1);
-    client.json_event(EVENT_HELLO).await;
+    client.wait_event::<GridHello>(|_| true).await;
     let walkers = cluster
         .host("B")
         .demo
