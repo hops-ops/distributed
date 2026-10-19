@@ -144,6 +144,20 @@ export {
 	type PredictorOptions
 } from './prediction.js';
 export {
+	PREDICT_ABI_VERSION,
+	PREDICT_SCRATCH_BYTES,
+	PredictAbiError,
+	PredictModule,
+	createWasmPrediction,
+	decodePredictState,
+	encodePredictState,
+	loadPredictModule,
+	type PredictStateLayout,
+	type WasmPrediction,
+	type WasmPredictionOptions,
+	type WasmSource
+} from './wasm-prediction.js';
+export {
 	AdaptiveDelay,
 	InputPacer,
 	type AdaptiveDelayOptions,
