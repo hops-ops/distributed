@@ -1,0 +1,5 @@
+error: fact input field `XP` looks like a reward: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards
+ --> tests/compile_fail/fact_reward_field.rs:7:22
+  |
+7 |     #[serde(rename = "XP")]
+  |                      ^^^^

@@ -1,0 +1,5 @@
+error: #[derive(FactCommand)] needs #[fact(command = COMMAND_NAME)] (the constant the cell mounts the command under, or a string literal)
+ --> tests/compile_fail/fact_missing_command.rs:4:8
+  |
+4 | struct RecordKill {
+  |        ^^^^^^^^^^

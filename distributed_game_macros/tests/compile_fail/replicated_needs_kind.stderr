@@ -1,0 +1,5 @@
+error: #[derive(Replicated)] needs #[replicated(kind = "name", id = N)]
+ --> tests/compile_fail/replicated_needs_kind.rs:4:8
+  |
+4 | struct OrbView {
+  |        ^^^^^^^

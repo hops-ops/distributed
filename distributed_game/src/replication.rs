@@ -86,6 +86,10 @@ impl WorldView {
     pub fn entities(&self) -> &[EntityState] {
         &self.entities
     }
+
+    pub(crate) fn last_mut(&mut self) -> Option<&mut EntityState> {
+        self.entities.last_mut()
+    }
 }
 
 #[derive(Debug, Clone)]

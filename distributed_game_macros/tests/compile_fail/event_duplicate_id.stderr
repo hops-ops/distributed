@@ -1,0 +1,5 @@
+error: event id 1 / name `bye` already used by `hello`
+ --> tests/compile_fail/event_duplicate_id.rs:7:23
+  |
+7 |     #[game_event(id = 1)]
+  |                       ^

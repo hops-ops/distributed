@@ -309,6 +309,25 @@ fn steps(bits: u8) -> f64 {
     (1u64 << bits.clamp(1, 32)) as f64
 }
 
+/// How a predicting client resolves a misprediction of one field (the JS
+/// SDK's `CorrectionPolicy`). Client metadata only: never sent on the wire,
+/// exported in the [`GameSurface`](crate::surface::GameSurface) so generated
+/// clients get per-field defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Correction {
+    /// Adopt the rebased value, easing the visual error out over `duration_ms`.
+    Ease {
+        /// Ease duration (ms).
+        #[serde(rename = "durationMs")]
+        duration_ms: u32,
+    },
+    /// Adopt the rebased value immediately.
+    Snap,
+    /// Server-owned: show the authoritative value, never replay inputs over it.
+    Replace,
+}
+
 /// One component field of a kind.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldDef {
@@ -318,6 +337,8 @@ pub struct FieldDef {
     pub ty: FieldType,
     /// Server-side replication priority multiplier (not sent on the wire).
     pub priority: f32,
+    /// Client correction default (not sent on the wire; see [`Correction`]).
+    pub correction: Option<Correction>,
 }
 
 /// An entity kind: id, name and ordered fields.
@@ -359,7 +380,20 @@ impl KindDef {
             name: name.into(),
             ty,
             priority: p,
+            correction: None,
         });
+        self
+    }
+
+    /// Set the client correction default of the last added field.
+    ///
+    /// # Panics
+    /// If the kind has no fields yet.
+    pub fn correct(mut self, correction: Correction) -> Self {
+        self.fields
+            .last_mut()
+            .expect("add a field before its correction")
+            .correction = Some(correction);
         self
     }
 
