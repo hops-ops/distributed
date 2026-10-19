@@ -278,7 +278,7 @@ smoke() {
 	log "generated clients are current; predicted steps and pure functions compiled to WASM"
 	gen --check
 	log "server: fmt, clippy, tests (bots smoke)"
-	cargo fmt --manifest-path "$SERVER/Cargo.toml" --check -p game_demos -p game_sim
+	cargo fmt --manifest-path "$SERVER/Cargo.toml" --check -p game_demos -p game_sim -p mobpit_crawler -p mobpit_service
 	cargo clippy --quiet --manifest-path "$SERVER/Cargo.toml" --workspace --all-targets -- -D warnings
 	cargo test --quiet --manifest-path "$SERVER/Cargo.toml" --workspace
 	cargo build --quiet --manifest-path "$SERVER/Cargo.toml" --workspace --bins
