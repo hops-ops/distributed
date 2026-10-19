@@ -8,7 +8,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createGalleryClient, encodeShot, raySphere, targetPosition } from '../src/gallery/client.ts';
+import { createGalleryClient, raySphere, targetPosition } from '../src/gallery/client.ts';
+import { BUTTON, decodeInput, encodeInput, sanitizeInput, shooterFields } from '../src/generated/gallery/index.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
 import { memoryStorage, sleep, startDemo, until } from './helpers/demo-server.mjs';
 
@@ -40,9 +41,15 @@ async function volley(gallery, n, compensated) {
 }
 
 test('shot payload and local ray test', () => {
-	const bytes = encodeShot(3, 0x1234, 287.4, [0, 2, 0]);
-	assert.deepEqual([...bytes.slice(0, 5)], [3, 0x34, 0x12, 31, 1]);
-	assert.equal(new DataView(bytes.buffer).getInt16(7, true), 32767);
+	// The generated codec (from the Rust `ShotInput` derive): flags u8,
+	// varuint shot id and delay, 16-bit centered quantized direction.
+	const shot = { flags: BUTTON.fire | BUTTON.noComp | 0x80, shot: 0x1234, delayMs: 287, dx: 0, dy: 1, dz: 0 };
+	const bytes = encodeInput(shot);
+	assert.deepEqual([...bytes.slice(0, 5)], [0x83, 0xb4, 0x24, 0x9f, 0x02]);
+	const back = decodeInput(bytes);
+	assert.equal(back.dx, 0, 'zero is exact on the centered grid');
+	assert.ok(Math.abs(back.dy - 1) < 1e-4);
+	assert.equal(sanitizeInput(shot).flags, 3, 'unknown flags cleared like the server');
 	assert.equal(raySphere([0, 0, 0], [0, 1, 0], [0, 10, 0], 1), 9);
 	assert.equal(raySphere([0, 0, 0], [0, 1, 0], [0, -10, 0], 1), undefined, 'behind');
 	assert.equal(raySphere([0, 0, 0], [0, 1, 0], [2, 10, 0], 1), undefined, 'beside');
@@ -91,7 +98,10 @@ test('lag compensation confirms what the shooter saw; off misses; beyond max rew
 		assert.equal(gallery.stats.predictedHits, 50);
 		const me = gallery.client.render().find((e) => e.id === hello.entity);
 		await until(
-			() => gallery.client.render().find((e) => e.id === hello.entity)?.fields.shots === 50,
+			() => {
+				const me = gallery.client.render().find((e) => e.id === hello.entity);
+				return me !== undefined && shooterFields(me).shots === 50;
+			},
 			5_000,
 			'replicated shot counter'
 		);

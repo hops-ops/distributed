@@ -17,8 +17,11 @@
 //! | 1 `shooter` | 1000 + player | x y name shots hits |
 //! | 2 `target` | 1..=[`TARGETS`] | x y z r flash |
 //!
-//! Inputs are shots only ([`ShotInput`], 11 bytes). The shooter gets one
-//! [`EVENT_SHOT`] (JSON) per shot with the verdict and the rewind used.
+//! Kinds are `#[derive(Replicated)]` views; inputs are shots only
+//! ([`ShotInput`], a `#[derive(GameInput)]`: flags, shot id, view delay and
+//! a 16-bit quantized unit direction). The shooter gets one
+//! [`GalleryEvent::Shot`] per shot with the verdict and the rewind used. The
+//! browser client is generated from [`game_surface`].
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -26,21 +29,11 @@ use std::time::Duration;
 use distributed_game::net::{GameServer, ServerConfig};
 use distributed_game::rewind::{Historic, HitQuery, RewindFrame, ShotTiming, Vec3};
 use distributed_game::{
-    ConsumePolicy, Ctx, EntitySchema, EntityState, FieldType, FieldValue, KindDef, LeaveReason,
-    PlayerId, View, WorldView, Zone,
+    schema, ConsumePolicy, Ctx, EntitySchema, FieldType, GameEvent, GameInput, GameSurface,
+    LeaveReason, PlayerId, Replicated, View, WorldView, Zone,
 };
-use serde_json::json;
 
-use crate::common::{send_json_event, Demo, Guests};
-
-/// Shooter kind.
-pub const KIND_SHOOTER: u16 = 1;
-/// Target kind.
-pub const KIND_TARGET: u16 = 2;
-/// Event: `{"entity", "eye": [x, y, z], "maxRewindMs", "range"}` (JSON).
-pub const EVENT_HELLO: u32 = 1;
-/// Event: shot verdict (JSON, see [`ShotVerdict`]).
-pub const EVENT_SHOT: u32 = 2;
+use crate::common::{Demo, Guests};
 /// Floor half extent (m).
 pub const HALF: f32 = 20.0;
 /// Firing line (m, game y).
@@ -58,11 +51,91 @@ pub const RANGE: f32 = 80.0;
 /// Number of targets.
 pub const TARGETS: u32 = 6;
 /// Input flag: this input is a shot.
-pub const FLAG_FIRE: u8 = 1;
+pub const FLAG_FIRE: u8 = ShotInput::FIRE;
 /// Input flag: evaluate without lag compensation.
-pub const FLAG_NO_COMP: u8 = 2;
+pub const FLAG_NO_COMP: u8 = ShotInput::NO_COMP;
 
 const POS: FieldType = FieldType::quant_centered(HALF, 18);
+
+/// A shooter at its station (positions never change while connected).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "shooter", id = 1, priority = 0.5)]
+pub struct ShooterView {
+    /// Station x.
+    #[field_type(POS)]
+    pub x: f32,
+    /// Station y.
+    #[field_type(POS)]
+    pub y: f32,
+    /// Display name.
+    #[priority(0.2)]
+    pub name: String,
+    /// Shots resolved.
+    pub shots: u32,
+    /// Shots that hit.
+    pub hits: u32,
+}
+
+/// A moving target (global).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "target", id = 2, priority = 2.0, global)]
+pub struct TargetView {
+    /// Position x.
+    #[field_type(POS)]
+    pub x: f32,
+    /// Position y.
+    #[field_type(POS)]
+    pub y: f32,
+    /// Height.
+    #[quant(min = 0.0, max = 4.0, bits = 12)]
+    pub z: f32,
+    /// Radius.
+    pub r: f32,
+    /// Bumps on every confirmed hit.
+    pub flash: u8,
+}
+
+/// The gallery's events.
+#[derive(Debug, Clone, PartialEq, GameEvent)]
+pub enum GalleryEvent {
+    /// To a joining shooter.
+    #[game_event(id = 1)]
+    Hello {
+        /// Own entity id.
+        entity: u32,
+        /// Eye position `[x, y, z]` (z up).
+        eye: Vec<f32>,
+        /// Furthest rewind (anti-cheat clamp).
+        max_rewind_ms: u32,
+        /// Hitscan range (m).
+        range: f32,
+        /// Floor half extent (m).
+        half: f32,
+    },
+    /// The verdict of one shot.
+    #[game_event(id = 2)]
+    Shot {
+        /// Client shot id.
+        shot: u16,
+        /// Target hit.
+        hit: Option<u32>,
+        /// Lag compensation used.
+        compensated: bool,
+        /// Rewind applied (0 without compensation).
+        age_ms: f64,
+        /// Rewind the client asked for.
+        requested_age_ms: f64,
+        /// Limited by the clamp / stored history.
+        clamped: bool,
+        /// Server tick of the verdict.
+        tick: u32,
+    },
+}
+
+/// The gallery's client surface.
+pub fn game_surface() -> GameSurface {
+    GameSurface::for_zone::<Gallery>("gallery").events::<GalleryEvent>()
+}
 
 /// How a target moves.
 #[derive(Debug, Clone, Copy)]
@@ -176,46 +249,65 @@ pub fn target_speed(index: usize) -> f32 {
     }
 }
 
-/// One shot: `[flags, shot u16, delay_ms u16, dx i16, dy i16, dz i16]`
-/// (little endian; the direction is a unit vector × 32767).
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// One shot (`#[derive(GameInput)]`): flags, shot id, view delay and the
+/// aim direction quantized to 16 bits per axis (centered, so a zero axis is
+/// exact; the zone re-normalizes, see [`ShotInput::parse`]).
+#[derive(Debug, Clone, Copy, PartialEq, GameInput)]
 pub struct ShotInput {
-    /// [`FLAG_FIRE`] | [`FLAG_NO_COMP`].
+    /// [`ShotInput::FIRE`] | [`ShotInput::NO_COMP`].
+    #[buttons(fire, no_comp)]
     pub flags: u8,
     /// Client shot id (echoed in the verdict).
     pub shot: u16,
     /// Interpolation delay behind `client_tick` the shooter was rendering (ms).
     pub delay_ms: u16,
-    /// Unit aim direction (game x, y, z-up).
-    pub dir: Vec3,
+    /// Aim direction x (game coordinates, z up).
+    #[quant(centered = 1.0, bits = 16)]
+    pub dx: f32,
+    /// Aim direction y.
+    #[quant(centered = 1.0, bits = 16)]
+    pub dy: f32,
+    /// Aim direction z.
+    #[quant(centered = 1.0, bits = 16)]
+    pub dz: f32,
 }
 
 impl ShotInput {
-    /// Wire payload.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = vec![self.flags];
-        out.extend_from_slice(&self.shot.to_le_bytes());
-        out.extend_from_slice(&self.delay_ms.to_le_bytes());
-        for v in self.dir {
-            out.extend_from_slice(&((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes());
+    /// A shot along `dir` (normalized here).
+    pub fn new(flags: u8, shot: u16, delay_ms: u16, dir: Vec3) -> Self {
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2])
+            .sqrt()
+            .max(f32::EPSILON);
+        Self {
+            flags,
+            shot,
+            delay_ms,
+            dx: dir[0] / len,
+            dy: dir[1] / len,
+            dz: dir[2] / len,
         }
-        out
     }
 
-    /// Parse a payload; `None` for a wrong length or a zero direction.
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != 11 {
-            return None;
-        }
-        let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
-        let axis = |i: usize| f32::from(u16_at(i) as i16) / 32767.0;
-        let dir = [axis(5), axis(7), axis(9)];
-        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    /// The aim direction.
+    pub fn dir(&self) -> Vec3 {
+        [self.dx, self.dy, self.dz]
+    }
+
+    /// Decode, sanitize and re-normalize a payload (the zone's decode);
+    /// `None` for a malformed frame or a (near-)zero direction.
+    pub fn parse(payload: &[u8]) -> Option<Self> {
+        Self::from_payload(payload).and_then(Self::normalized)
+    }
+
+    /// Re-normalized after quantization; `None` for a (near-)zero direction.
+    pub fn normalized(self) -> Option<Self> {
+        let [x, y, z] = self.dir();
+        let len = (x * x + y * y + z * z).sqrt();
         (len > 0.5).then(|| Self {
-            flags: bytes[0] & (FLAG_FIRE | FLAG_NO_COMP),
-            shot: u16_at(1),
-            delay_ms: u16_at(3),
-            dir: [dir[0] / len, dir[1] / len, dir[2] / len],
+            dx: x / len,
+            dy: y / len,
+            dz: z / len,
+            ..self
         })
     }
 }
@@ -309,7 +401,7 @@ impl Gallery {
         shot: &ShotInput,
     ) -> Option<ShotVerdict> {
         let shooter = self.shooters.get(&player)?;
-        let query = HitQuery::ray(shooter.eye(), shot.dir, RANGE);
+        let query = HitQuery::ray(shooter.eye(), shot.dir(), RANGE);
         let rewind = ctx.rewind();
         let latest = rewind.latest()?.time();
         let compensated = shot.flags & FLAG_NO_COMP == 0;
@@ -343,32 +435,7 @@ impl Zone for Gallery {
     type Timer = ();
 
     fn schema() -> EntitySchema {
-        EntitySchema::new()
-            .kind(
-                KindDef::new(KIND_SHOOTER, "shooter")
-                    .field("x", POS)
-                    .field("y", POS)
-                    .field_with_priority("name", FieldType::ShortStr, 0.2)
-                    .field("shots", FieldType::U32)
-                    .field("hits", FieldType::U32)
-                    .priority(0.5),
-            )
-            .kind(
-                KindDef::new(KIND_TARGET, "target")
-                    .field("x", POS)
-                    .field("y", POS)
-                    .field(
-                        "z",
-                        FieldType::QuantF32 {
-                            min: 0.0,
-                            max: 4.0,
-                            bits: 12,
-                        },
-                    )
-                    .field("r", FieldType::F32)
-                    .field("flash", FieldType::U8)
-                    .priority(2.0),
-            )
+        schema![ShooterView, TargetView]
     }
 
     fn on_create(ctx: &mut Ctx<'_, Self>, config: GalleryConfig) -> Self {
@@ -400,17 +467,15 @@ impl Zone for Gallery {
         let entity = shooter.entity;
         self.shooters.insert(player, shooter);
         ctx.set_view(player, View::new(0.0, 0.0, 100.0));
-        send_json_event(
-            ctx,
+        ctx.send(
             player,
-            EVENT_HELLO,
-            &json!({
-                "entity": entity,
-                "eye": eye,
-                "maxRewindMs": MAX_REWIND_MS,
-                "range": RANGE,
-                "half": HALF,
-            }),
+            &GalleryEvent::Hello {
+                entity,
+                eye: eye.to_vec(),
+                max_rewind_ms: MAX_REWIND_MS as u32,
+                range: RANGE,
+                half: HALF,
+            },
         );
     }
 
@@ -419,7 +484,7 @@ impl Zone for Gallery {
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<ShotInput> {
-        ShotInput::decode(payload).filter(|s| s.flags & FLAG_FIRE != 0)
+        ShotInput::parse(payload).filter(|s| s.flags & FLAG_FIRE != 0)
     }
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
@@ -440,19 +505,18 @@ impl Zone for Gallery {
                     let flash = &mut self.flash[(id - 1) as usize];
                     *flash = flash.wrapping_add(1);
                 }
-                send_json_event(
-                    ctx,
+                let tick = ctx.tick() as u32;
+                ctx.send(
                     player,
-                    EVENT_SHOT,
-                    &json!({
-                        "shot": verdict.shot,
-                        "hit": verdict.hit,
-                        "compensated": verdict.compensated,
-                        "ageMs": verdict.age.as_secs_f64() * 1000.0,
-                        "requestedAgeMs": verdict.requested_age.as_secs_f64() * 1000.0,
-                        "clamped": verdict.clamped,
-                        "tick": ctx.tick(),
-                    }),
+                    &GalleryEvent::Shot {
+                        shot: verdict.shot,
+                        hit: verdict.hit,
+                        compensated: verdict.compensated,
+                        age_ms: verdict.age.as_secs_f64() * 1000.0,
+                        requested_age_ms: verdict.requested_age.as_secs_f64() * 1000.0,
+                        clamped: verdict.clamped,
+                        tick,
+                    },
                 );
             }
         }
@@ -471,37 +535,24 @@ impl Zone for Gallery {
     fn replicate(&self, out: &mut WorldView) {
         for s in self.shooters.values() {
             let (x, y) = station_position(s.station);
-            out.push(EntityState::new(
-                s.entity,
-                KIND_SHOOTER,
+            let view = ShooterView {
                 x,
                 y,
-                vec![
-                    FieldValue::F(x),
-                    FieldValue::F(y),
-                    FieldValue::Str(s.name.clone()),
-                    FieldValue::U(s.stats.shots),
-                    FieldValue::U(s.stats.hits),
-                ],
-            ));
+                name: s.name.clone(),
+                shots: s.stats.shots,
+                hits: s.stats.hits,
+            };
+            out.add(s.entity, &view);
         }
         for (i, p) in self.targets.iter().enumerate() {
-            out.push(
-                EntityState::new(
-                    i as u32 + 1,
-                    KIND_TARGET,
-                    p[0],
-                    p[1],
-                    vec![
-                        FieldValue::F(p[0]),
-                        FieldValue::F(p[1]),
-                        FieldValue::F(p[2]),
-                        FieldValue::F(target_radius(i)),
-                        FieldValue::U(self.flash[i].into()),
-                    ],
-                )
-                .global(),
-            );
+            let view = TargetView {
+                x: p[0],
+                y: p[1],
+                z: p[2],
+                r: target_radius(i),
+                flash: self.flash[i],
+            };
+            out.add(i as u32 + 1, &view);
         }
     }
 }

@@ -15,38 +15,24 @@
  *   predicted and confirmed hits.
  */
 import {
-	GameClient,
 	type AdaptiveDelay,
 	type AdaptiveDelayOptions,
+	type GameClient,
 	type GameSocketFactory,
 	type GameZoneView,
 	type RenderedEntity
 } from '@hops-ops/distributed/game';
 
+import * as gallery from '../generated/gallery/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
-import { onJsonEvent } from '../shared/events.ts';
+import { latest } from '../shared/latest.ts';
 
 export const DEFAULT_ZONE = 'gallery-1';
-/** Event type ids (server `gallery::EVENT_*`). */
-export const EVENT_HELLO = 1;
-export const EVENT_SHOT = 2;
-export const FLAG_FIRE = 1;
-export const FLAG_NO_COMP = 2;
-export const KIND = { shooter: 'shooter', target: 'target' } as const;
 
 export type Vec3 = [number, number, number];
 
-export type GalleryHello = Readonly<{ entity: number; eye: Vec3; maxRewindMs: number; range: number; half: number }>;
-
-export type ShotVerdict = Readonly<{
-	shot: number;
-	hit: number | null;
-	compensated: boolean;
-	ageMs: number;
-	requestedAgeMs: number;
-	clamped: boolean;
-	tick: number;
-}>;
+export type GalleryHello = gallery.HelloEvent;
+export type ShotVerdict = gallery.ShotEvent;
 
 export type ShotRecord = {
 	id: number;
@@ -75,17 +61,8 @@ export type GalleryStats = {
 	lastAgeMs: number;
 };
 
-export function encodeShot(flags: number, shot: number, delayMs: number, dir: Vec3): Uint8Array {
-	const bytes = new Uint8Array(11);
-	const view = new DataView(bytes.buffer);
-	view.setUint8(0, flags);
-	view.setUint16(1, shot & 0xffff, true);
-	view.setUint16(3, Math.max(0, Math.min(0xffff, Math.round(delayMs))), true);
-	const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
-	for (let i = 0; i < 3; i += 1) {
-		view.setInt16(5 + i * 2, Math.round(Math.max(-1, Math.min(1, dir[i] / len)) * 32767), true);
-	}
-	return bytes;
+function vec3(v: readonly number[]): Vec3 {
+	return [v[0] ?? 0, v[1] ?? 0, v[2] ?? 0];
 }
 
 /** Entry distance of a ray (unit `dir`) into a sphere, if hit in front. */
@@ -100,12 +77,12 @@ export function raySphere(origin: Vec3, dir: Vec3, center: Vec3, radius: number)
 }
 
 export function targetPosition(entity: Pick<RenderedEntity, 'fields'>): Vec3 {
-	const f = entity.fields;
-	return [Number(f.x ?? 0), Number(f.y ?? 0), Number(f.z ?? 0)];
+	const { x, y, z } = gallery.targetFields(entity);
+	return [x, y, z];
 }
 
 export type GalleryClient = Readonly<{
-	client: GameClient<never>;
+	client: GameClient<gallery.ShotInput>;
 	/** The SDK's adaptive interpolation delay of `zone` (default: the authority). */
 	delay(zone?: GameZoneView): AdaptiveDelay;
 	hello(): GalleryHello | undefined;
@@ -131,24 +108,19 @@ export type GalleryClientOptions = Readonly<{
 }>;
 
 export function createGalleryClient(options: GalleryClientOptions): GalleryClient {
-	const client = new GameClient<never>({
+	const typed = gallery.createGalleryClient({
 		url: (zone) => zoneUrl(zone, options.base),
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
 		pingIntervalMs: 250,
 		adaptiveDelay: options.adaptiveDelay
 	});
+	const { client } = typed;
 	const delay = (zone: GameZoneView | undefined = client.authority): AdaptiveDelay => {
 		if (zone === undefined) throw new Error('not joined');
 		return client.adaptiveDelay(zone)!;
 	};
-	let hello: GalleryHello | undefined;
-	let resolveReady: (h: GalleryHello) => void = () => undefined;
-	const ready = new Promise<GalleryHello>((resolve) => (resolveReady = resolve));
-	onJsonEvent<GalleryHello>(client, EVENT_HELLO, (value) => {
-		hello = value;
-		resolveReady(value);
-	});
+	const hello = latest<GalleryHello>((h) => typed.on('hello', h));
 
 	const stats: GalleryStats = {
 		shots: 0,
@@ -166,13 +138,13 @@ export function createGalleryClient(options: GalleryClientOptions): GalleryClien
 	let next = 0;
 	let compensatedVerdicts = 0;
 
-	onJsonEvent<ShotVerdict>(client, EVENT_SHOT, (verdict) => {
+	typed.on('shot', (verdict) => {
 		const shot = shots.get(verdict.shot);
 		if (shot === undefined || shot.verdict !== undefined) return;
 		shot.verdict = verdict;
 		stats.resolved += 1;
-		if (verdict.hit !== null) stats.confirmedHits += 1;
-		if ((verdict.hit ?? undefined) === shot.predicted) stats.agreed += 1;
+		if (verdict.hit !== undefined) stats.confirmedHits += 1;
+		if (verdict.hit === shot.predicted) stats.agreed += 1;
 		if (verdict.clamped) stats.clamped += 1;
 		if (verdict.compensated) {
 			compensatedVerdicts += 1;
@@ -184,10 +156,10 @@ export function createGalleryClient(options: GalleryClientOptions): GalleryClien
 		for (const listener of listeners) listener(shot);
 	});
 
-	const targets = () => client.render().filter((e) => e.kindName === KIND.target && !e.stale);
+	const targets = () => client.render().filter((e) => gallery.isTarget(e) && !e.stale);
 
 	function predict(dir: Vec3): { target: number | undefined; point: Vec3 | undefined } {
-		const eye = hello?.eye;
+		const eye = hello.get()?.eye;
 		if (eye === undefined) return { target: undefined, point: undefined };
 		const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
 		const unit: Vec3 = [dir[0] / len, dir[1] / len, dir[2] / len];
@@ -195,8 +167,8 @@ export function createGalleryClient(options: GalleryClientOptions): GalleryClien
 		let point: Vec3 | undefined;
 		let best = Infinity;
 		for (const entity of targets()) {
-			const d = raySphere(eye, unit, targetPosition(entity), Number(entity.fields.r ?? 0.5));
-			if (d !== undefined && d < best && d <= (hello?.range ?? 80)) {
+			const d = raySphere(vec3(eye), unit, targetPosition(entity), gallery.targetFields(entity).r);
+			if (d !== undefined && d < best && d <= (hello.get()?.range ?? 80)) {
 				best = d;
 				target = entity.id;
 				point = [eye[0] + unit[0] * d, eye[1] + unit[1] * d, eye[2] + unit[2] * d];
@@ -207,7 +179,7 @@ export function createGalleryClient(options: GalleryClientOptions): GalleryClien
 
 	function shoot(dir: Vec3, opts: { compensated?: boolean } = {}): ShotRecord | undefined {
 		const zone = client.authority;
-		const eye = hello?.eye;
+		const eye = hello.get()?.eye;
 		if (zone === undefined || eye === undefined || !zone.connection.canSendInput()) return undefined;
 		const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
 		const unit: Vec3 = [dir[0] / len, dir[1] / len, dir[2] / len];
@@ -220,8 +192,16 @@ export function createGalleryClient(options: GalleryClientOptions): GalleryClien
 		const compensated = opts.compensated ?? true;
 		next = (next + 1) & 0xffff;
 		const id = next;
-		const flags = FLAG_FIRE | (compensated ? 0 : FLAG_NO_COMP);
-		const seq = zone.connection.sendInput(encodeShot(flags, id, delayMs, unit), context.clientTick);
+		const flags = gallery.BUTTON.fire | (compensated ? 0 : gallery.BUTTON.noComp);
+		const payload = gallery.encodeInput({
+			flags,
+			shot: id,
+			delayMs: Math.min(0xffff, Math.round(delayMs)),
+			dx: unit[0],
+			dy: unit[1],
+			dz: unit[2]
+		});
+		const seq = zone.connection.sendInput(payload, context.clientTick);
 		if (seq === undefined) return undefined;
 		const record: ShotRecord = {
 			id,
@@ -242,8 +222,8 @@ export function createGalleryClient(options: GalleryClientOptions): GalleryClien
 	return {
 		client,
 		delay,
-		hello: () => hello,
-		ready,
+		hello: hello.get,
+		ready: hello.ready,
 		stats,
 		shots,
 		targets,
