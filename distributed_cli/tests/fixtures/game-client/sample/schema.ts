@@ -114,8 +114,8 @@ export function statsFields(entity: { readonly fields: EntityFields }): StatsFie
 /** Wire type of every replicated field, by kind and wire field name. */
 export const FIELD_TYPES = {
 	player: {
-		x: { type: 'quant', min: -20, max: 19.999847, bits: 18 },
-		y: { type: 'quant', min: -20, max: 19.999847, bits: 18 },
+		x: { type: 'quant', min: -20, max: 19.999847412109375, bits: 18 },
+		y: { type: 'quant', min: -20, max: 19.999847412109375, bits: 18 },
 		vx: { type: 'quant', min: -16, max: 16, bits: 12 },
 		face: { type: 'angle', bits: 8 },
 		name: { type: 'short_str' },
@@ -128,8 +128,8 @@ export const FIELD_TYPES = {
 		kills: { type: 'u32' },
 	},
 	marker: {
-		px: { type: 'quant', min: -64, max: 63.998047, bits: 16 },
-		py: { type: 'quant', min: -64, max: 63.998047, bits: 16 },
+		px: { type: 'quant', min: -64, max: 63.998046875, bits: 16 },
+		py: { type: 'quant', min: -64, max: 63.998046875, bits: 16 },
 		label: { type: 'short_str' },
 	},
 	stats: {
