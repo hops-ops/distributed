@@ -250,30 +250,6 @@ impl Client {
         }
     }
 
-    /// JSON events of `type_id` received so far.
-    pub fn seen(&self, type_id: u32) -> Vec<Value> {
-        self.events
-            .iter()
-            .filter(|(t, _)| *t == type_id)
-            .filter_map(|(_, p)| serde_json::from_slice(p).ok())
-            .collect()
-    }
-
-    /// Wait for the first JSON event of `type_id`.
-    pub async fn json_event(&mut self, type_id: u32) -> Value {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match self.next(left).await.expect("event within 5 s") {
-                ServerMessage::Event {
-                    type_id: t,
-                    payload,
-                } if t == type_id => return serde_json::from_slice(&payload).unwrap(),
-                _ => continue,
-            }
-        }
-    }
-
     /// Read messages until `pred` holds (10 s).
     pub async fn until(&mut self, what: &str, pred: impl Fn(&Client) -> bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

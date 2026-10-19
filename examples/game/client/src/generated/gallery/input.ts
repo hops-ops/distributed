@@ -15,11 +15,16 @@ export interface ShotInput {
 
 export type Input = ShotInput;
 
-/** Button bits (`#[buttons(..)]`). */
-export const BUTTON = {
-	fire: 1,
-	noComp: 2,
+/** Bits of each bit-flag field (`#[buttons(..)]`), by field. */
+export const BITS = {
+	flags: {
+		fire: 1,
+		noComp: 2,
+	},
 } as const;
+
+/** Bits of `flags`, the only bit-flag field. */
+export const BUTTON = BITS.flags;
 
 /** Wire layout, in field order. */
 export const INPUT_LAYOUT: PayloadLayout = [

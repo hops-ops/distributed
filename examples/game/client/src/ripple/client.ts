@@ -8,39 +8,27 @@
  *   receives what upper tiers broadcast: ripple events, the city's
  *   weather, the realm's banner.
  */
-import { GameClient, type GameSocketFactory } from '@hops-ops/distributed/game';
+import type { GameClient, GameSocketFactory } from '@hops-ops/distributed/game';
 
-import { encodeMoveInput, predictPlayer } from '../arena/movement.ts';
+import { predictPlayer } from '../arena/movement.ts';
+import * as gen from '../generated/ripple/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
-import { onJsonEvent } from '../shared/events.ts';
 
 export const REALM = 'realm';
 export const CITY = 'realm.city';
 export const BOROUGHS = ['realm.city.borough-1', 'realm.city.borough-2'] as const;
 export const HOODS_PER_BOROUGH = 3;
 export const DEFAULT_ZONE = 'realm.city.borough-1.hood-1';
-/** Event type ids (server `ripple::EVENT_*`). */
-export const EVENT = { hello: 1, ripple: 2, weather: 3, banner: 4, boss: 5 } as const;
-export const ACTION_ATTACK = 1;
-export const ACTION_SMITE = 2;
+export const ACTION_ATTACK = gen.BITS.action.attack;
+export const ACTION_SMITE = gen.BITS.action.smite;
 export const WEATHER = ['storm', 'rain', 'clearing', 'clear'] as const;
 
-export type HoodInput = Readonly<{ mx: number; my: number; buttons: number; action: number }>;
+export type HoodInput = gen.HoodInput;
 export type TierName = 'realm' | 'city' | 'borough' | 'hood';
-
-export type RippleHello = Readonly<{
-	zone: string;
-	tier: TierName;
-	parent: string | null;
-	children: string[];
-	host: string;
-	tickRate: number;
-	entity: number | null;
-	weather: Readonly<{ weather: string; remaining: number }> | null;
-	banner: string;
-}>;
-
-export type RippleEvent = Readonly<{ at: string; kind: string; from: string; origin: string; originTick: number; tick: number }>;
+/** A zone's hello (generated from the Rust `RippleEvent::Hello`). */
+export type RippleHello = gen.HelloEvent;
+/** A tier-up event as broadcast by the receiving zone. */
+export type RippleEvent = gen.RippleEvent;
 
 /** Live state of one tier, from its replicated `tier` (and `boss`) entity. */
 export type TierView = Readonly<{
@@ -73,11 +61,6 @@ export function tierOf(zone: string): TierName | undefined {
 	if (zone === CITY) return 'city';
 	if ((BOROUGHS as readonly string[]).includes(zone)) return 'borough';
 	return BOROUGHS.some((b) => hoods(b).includes(zone)) ? 'hood' : undefined;
-}
-
-export function encodeHoodInput(input: HoodInput): Uint8Array {
-	const move = encodeMoveInput(input);
-	return new Uint8Array([move[0]!, move[1]!, move[2]!, input.action & 0xff]);
 }
 
 export type RippleClientOptions = Readonly<{
@@ -119,46 +102,42 @@ export function createRippleClient(options: RippleClientOptions): RippleClient {
 		weather: new Set<(w: string) => void>(),
 		boss: new Set<(z: string, e: { kind: string; by?: string }) => void>()
 	};
-	const ease = { mode: 'ease', durationMs: 150 } as const;
-	const snap = { mode: 'snap' } as const;
-	const client = new GameClient<HoodInput>({
+	const typed = gen.createRippleClient({
 		url: (zone) => zoneUrl(zone, options.base),
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
 		pingIntervalMs: 1000,
 		inputDtMs: 1000 / 30,
-		prediction: {
-			encodeInput: (input) => encodeHoodInput(input),
-			predict: (fields, input) => predictPlayer(fields, input),
-			corrections: { player: { x: ease, y: ease, vx: snap, vy: snap, dash: snap, cd: snap, name: { mode: 'replace' } } }
-		}
+		// The movement part of the frame is the Arena's (`action` only adds bits).
+		prediction: { predict: (fields, input) => predictPlayer(fields, input) }
 	});
+	const { client } = typed;
 	let resolveReady: (h: RippleHello) => void = () => undefined;
 	const ready = new Promise<RippleHello>((resolve) => (resolveReady = resolve));
 
-	onJsonEvent<RippleHello>(client, EVENT.hello, (hello, zone) => {
+	typed.on('hello', (hello, zone) => {
 		hellos.set(zone, hello);
-		if (hello.weather !== null) weather = hello.weather.weather;
+		if (hello.weather !== undefined) weather = hello.weather.weather;
 		if (hello.tier === 'realm' && hello.banner !== '') banner = hello.banner;
-		if (hello.entity !== null && zone === client.authority?.zoneId) {
+		if (hello.entity !== undefined && zone === client.authority?.zoneId) {
 			client.setControlledEntity(hello.entity);
 			resolveReady(hello);
 		}
 	});
-	onJsonEvent<RippleEvent>(client, EVENT.ripple, (event) => {
+	typed.on('ripple', (event) => {
 		ripples.push(event);
 		if (ripples.length > 200) ripples.shift();
 		for (const l of listeners.ripple) l(event);
 	});
-	onJsonEvent<{ weather: string }>(client, EVENT.weather, (value) => {
+	typed.on('weather', (value) => {
 		weather = value.weather;
 		for (const l of listeners.weather) l(value.weather);
 	});
-	onJsonEvent<{ text: string }>(client, EVENT.banner, (value) => {
+	typed.on('banner', (value) => {
 		banner = value.text;
 		for (const l of listeners.banner) l(value.text);
 	});
-	onJsonEvent<{ kind: string; by?: string }>(client, EVENT.boss, (value, zone) => {
+	typed.on('boss', (value, zone) => {
 		for (const l of listeners.boss) l(zone, value);
 	});
 
@@ -176,27 +155,25 @@ export function createRippleClient(options: RippleClientOptions): RippleClient {
 		set.add(l);
 		return () => set.delete(l);
 	};
-	const n = (v: unknown) => (typeof v === 'number' ? v : typeof v === 'boolean' ? Number(v) : 0);
-
 	return {
 		client,
 		ready,
 		tier(zone) {
 			const view = client.zone(zone);
-			const tier = view?.replica.get(1)?.fields ?? {};
-			const boss = view?.replica.get(2)?.fields;
+			const tier = gen.tierFields({ fields: view?.replica.get(1)?.fields ?? {} });
+			const boss = view?.replica.get(2);
 			return {
 				zone,
 				hello: hellos.get(zone),
 				connected: view?.connection.state === 'open',
-				defeated: n(tier.defeated),
-				total: n(tier.total),
-				cleared: n(tier.cleared),
-				liberated: tier.liberated === true,
-				weather: WEATHER[n(tier.weather)] ?? 'storm',
-				clock: n(tier.clock),
-				events: n(tier.events),
-				boss: boss === undefined ? undefined : { hp: n(boss.hp), max: n(boss.max), by: String(boss.by ?? '') }
+				defeated: tier.defeated,
+				total: tier.total,
+				cleared: tier.cleared,
+				liberated: tier.liberated,
+				weather: WEATHER[tier.weather] ?? 'storm',
+				clock: tier.clock,
+				events: tier.events,
+				boss: boss === undefined ? undefined : gen.bossFields(boss)
 			};
 		},
 		ripples: () => ripples,

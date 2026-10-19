@@ -6,12 +6,10 @@ mod support;
 
 use std::time::Duration;
 
-use distributed_game::{FieldValue, Role, ServerMessage};
+use distributed_game::{FieldValue, GameEvent, Role, ServerMessage};
 use game_demos::ripple::{
-    self, encode_input, RippleDemo, ACTION_ATTACK, ACTION_SMITE, BOROUGHS, CITY, EVENT_BANNER,
-    EVENT_BOSS, EVENT_HELLO, EVENT_RIPPLE, EVENT_WEATHER, REALM,
+    self, encode_input, RippleDemo, RippleEvent, ACTION_ATTACK, ACTION_SMITE, BOROUGHS, CITY, REALM,
 };
-use serde_json::Value;
 use support::{eventually, join, start_cluster, ticket, Client};
 
 /// Field `i` of the tier entity (id 1) as u32.
@@ -23,12 +21,36 @@ fn tier_field(client: &Client, i: usize) -> u32 {
     }
 }
 
+/// Wait for the zone's hello: `(zone, tier, entity)`.
+async fn hello(c: &mut Client) -> (String, String, Option<u32>) {
+    match c
+        .wait_event::<RippleEvent>(|e| matches!(e, RippleEvent::Hello { .. }))
+        .await
+    {
+        RippleEvent::Hello {
+            zone, tier, entity, ..
+        } => (zone, tier, entity),
+        _ => unreachable!(),
+    }
+}
+
+/// Wait for the next boss event's kind.
+async fn boss(c: &mut Client) -> String {
+    match c
+        .wait_event::<RippleEvent>(|e| matches!(e, RippleEvent::Boss { .. }))
+        .await
+    {
+        RippleEvent::Boss { kind, .. } => kind,
+        _ => unreachable!(),
+    }
+}
+
 async fn observe(base: &str, zone: &str) -> Client {
     let mut c = join(base, zone, &ticket("guest-watch", zone, Role::Observer))
         .await
         .unwrap();
-    let hello = c.json_event(EVENT_HELLO).await;
-    assert_eq!(hello["zone"], zone);
+    let (at, _, _) = hello(&mut c).await;
+    assert_eq!(at, zone);
     c.until("tier entity", |c| c.mirror.entities.contains_key(&1))
         .await;
     c
@@ -61,15 +83,14 @@ async fn boss_defeats_ripple_up_every_tier_across_hosts() {
         .await
         .unwrap();
     assert_eq!(fighter.welcome.tick_rate, 30, "hot neighborhood");
-    let hello = fighter.json_event(EVENT_HELLO).await;
-    assert_eq!(hello["tier"], "hood");
-    assert!(hello["entity"].as_u64().is_some());
+    let (_, tier, entity) = hello(&mut fighter).await;
+    assert_eq!(tier, "hood");
+    let me = entity.expect("own fighter");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let mut defeated = None;
     while defeated.is_none() {
         assert!(tokio::time::Instant::now() < deadline, "boss not defeated");
         // Steer toward the boss at the center, attacking once in reach.
-        let me = hello["entity"].as_u64().unwrap() as u32;
         let (x, y) = match fighter
             .mirror
             .entities
@@ -86,22 +107,24 @@ async fn boss_defeats_ripple_up_every_tier_across_hosts() {
             .await;
         while let Some(msg) = fighter.next(Duration::from_millis(33)).await {
             if let ServerMessage::Event { type_id, payload } = msg {
-                if type_id == EVENT_BOSS {
-                    defeated = Some(serde_json::from_slice::<Value>(&payload).unwrap());
+                if let Some(RippleEvent::Boss { kind, .. }) =
+                    RippleEvent::decode_event(type_id, &payload).unwrap()
+                {
+                    defeated = Some(kind);
                 }
             }
         }
     }
-    assert_eq!(defeated.unwrap()["kind"], "defeated");
+    assert_eq!(defeated.unwrap(), "defeated");
 
     // The rest of borough-1 by smiting.
     for hood in &ripple::hoods(BOROUGHS[0])[1..] {
         let mut c = join(&base, hood, &ticket("guest-smiter", hood, Role::Player))
             .await
             .unwrap();
-        c.json_event(EVENT_HELLO).await;
+        hello(&mut c).await;
         c.input(encode_input(0, 0, ACTION_SMITE)).await;
-        assert_eq!(c.json_event(EVENT_BOSS).await["kind"], "defeated");
+        assert_eq!(boss(&mut c).await, "defeated");
         let state = cluster
             .host("A")
             .demo
@@ -115,7 +138,16 @@ async fn boss_defeats_ripple_up_every_tier_across_hosts() {
             tier_field(c, 0) == 3 && tier_field(c, 2) == 1
         })
         .await;
-    let ripples = borough.seen(EVENT_RIPPLE);
+    let ripples: Vec<(String, String, String)> = borough
+        .seen_events::<RippleEvent>()
+        .into_iter()
+        .filter_map(|e| match e {
+            RippleEvent::Ripple {
+                at, kind, origin, ..
+            } => Some((at, kind, origin)),
+            _ => None,
+        })
+        .collect();
     city.until("city saw the borough cleared", |c| {
         tier_field(c, 2) == 1 && tier_field(c, 0) == 3
     })
@@ -133,15 +165,18 @@ async fn boss_defeats_ripple_up_every_tier_across_hosts() {
         let mut c = join(&base, &hood, &ticket("guest-smiter", &hood, Role::Player))
             .await
             .unwrap();
-        c.json_event(EVENT_HELLO).await;
+        hello(&mut c).await;
         c.input(encode_input(0, 0, ACTION_SMITE)).await;
-        c.json_event(EVENT_BOSS).await;
+        boss(&mut c).await;
     }
-    let banner = realm.json_event(EVENT_BANNER).await;
-    assert!(
-        banner["text"].as_str().unwrap().contains("liberated"),
-        "{banner}"
-    );
+    let banner = match realm
+        .wait_event::<RippleEvent>(|e| matches!(e, RippleEvent::Banner { .. }))
+        .await
+    {
+        RippleEvent::Banner { text } => text,
+        _ => unreachable!(),
+    };
+    assert!(banner.contains("liberated"), "{banner}");
     realm
         .until("realm state", |c| {
             tier_field(c, 0) == 6 && tier_field(c, 2) == 2 && tier_field(c, 3) == 1
@@ -152,9 +187,12 @@ async fn boss_defeats_ripple_up_every_tier_across_hosts() {
     })
     .await;
     let weather: Vec<String> = city
-        .seen(EVENT_WEATHER)
-        .iter()
-        .map(|w| w["weather"].as_str().unwrap().to_string())
+        .seen_events::<RippleEvent>()
+        .into_iter()
+        .filter_map(|e| match e {
+            RippleEvent::Weather(w) => Some(w.weather),
+            _ => None,
+        })
         .collect();
     assert_eq!(
         weather.last().map(String::as_str),
@@ -166,11 +204,11 @@ async fn boss_defeats_ripple_up_every_tier_across_hosts() {
     // Borough-1's ripple events name each hood as origin and the borough as receiver.
     let origins: std::collections::BTreeSet<String> = ripples
         .iter()
-        .filter(|r| r["kind"] == "boss_defeated")
-        .map(|r| r["origin"].as_str().unwrap().to_string())
+        .filter(|(_, kind, _)| kind == "boss_defeated")
+        .map(|(_, _, origin)| origin.clone())
         .collect();
     assert!(origins.len() >= 2, "{ripples:?}");
-    assert!(ripples.iter().all(|r| r["at"] == BOROUGHS[0]));
+    assert!(ripples.iter().all(|(at, _, _)| at == BOROUGHS[0]));
 
     // The cascade's state lives where each tier runs.
     let city_state = cluster

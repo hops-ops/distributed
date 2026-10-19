@@ -1,0 +1,428 @@
+{
+  "events": [
+    {
+      "id": 1,
+      "name": "hello",
+      "payload": {
+        "fields": [
+          {
+            "name": "zone",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "tier",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "parent",
+            "type": {
+              "item": {
+                "type": "short_str"
+              },
+              "type": "optional"
+            }
+          },
+          {
+            "name": "children",
+            "type": {
+              "item": {
+                "type": "short_str"
+              },
+              "type": "list"
+            }
+          },
+          {
+            "name": "host",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "tick_rate",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "entity",
+            "type": {
+              "item": {
+                "type": "u32"
+              },
+              "type": "optional"
+            }
+          },
+          {
+            "name": "weather",
+            "type": {
+              "item": {
+                "name": "Weather",
+                "type": "record"
+              },
+              "type": "optional"
+            }
+          },
+          {
+            "name": "banner",
+            "type": {
+              "type": "short_str"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 2,
+      "name": "ripple",
+      "payload": {
+        "fields": [
+          {
+            "name": "at",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "kind",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "from",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "origin",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "origin_tick",
+            "type": {
+              "type": "u64"
+            }
+          },
+          {
+            "name": "tick",
+            "type": {
+              "type": "u64"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 3,
+      "name": "weather",
+      "payload": {
+        "kind": "value",
+        "type": {
+          "name": "Weather",
+          "type": "record"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "name": "banner",
+      "payload": {
+        "fields": [
+          {
+            "name": "text",
+            "type": {
+              "type": "short_str"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 5,
+      "name": "boss",
+      "payload": {
+        "fields": [
+          {
+            "name": "kind",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "by",
+            "type": {
+              "item": {
+                "type": "short_str"
+              },
+              "type": "optional"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    }
+  ],
+  "input": {
+    "fields": [
+      {
+        "name": "mx",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "name": "my",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "buttons": [
+          "dash"
+        ],
+        "name": "buttons",
+        "type": {
+          "type": "u8"
+        }
+      },
+      {
+        "buttons": [
+          "attack",
+          "smite"
+        ],
+        "name": "action",
+        "type": {
+          "type": "u8"
+        }
+      }
+    ],
+    "name": "HoodInput"
+  },
+  "kinds": [
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "defeated",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": null,
+          "name": "total",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": null,
+          "name": "cleared",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": null,
+          "name": "liberated",
+          "priority": 1.0,
+          "type": {
+            "type": "bool"
+          }
+        },
+        {
+          "correction": null,
+          "name": "weather",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": null,
+          "name": "clock",
+          "priority": 1.0,
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "correction": null,
+          "name": "events",
+          "priority": 1.0,
+          "type": {
+            "type": "u32"
+          }
+        }
+      ],
+      "id": 1,
+      "name": "tier",
+      "priority": 1.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "hp",
+          "priority": 1.0,
+          "type": {
+            "type": "u16"
+          }
+        },
+        {
+          "correction": null,
+          "name": "max",
+          "priority": 1.0,
+          "type": {
+            "type": "u16"
+          }
+        },
+        {
+          "correction": null,
+          "name": "by",
+          "priority": 1.0,
+          "type": {
+            "type": "short_str"
+          }
+        }
+      ],
+      "id": 2,
+      "name": "boss",
+      "priority": 1.0
+    },
+    {
+      "fields": [
+        {
+          "correction": {
+            "durationMs": 150,
+            "mode": "ease"
+          },
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 19.999847,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "durationMs": 150,
+            "mode": "ease"
+          },
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 19.999847,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "vx",
+          "priority": 1.0,
+          "type": {
+            "bits": 12,
+            "max": 15.9921875,
+            "min": -16.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "vy",
+          "priority": 1.0,
+          "type": {
+            "bits": 12,
+            "max": 15.9921875,
+            "min": -16.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "dash",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "cd",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "name",
+          "priority": 0.2,
+          "type": {
+            "type": "short_str"
+          }
+        }
+      ],
+      "id": 3,
+      "name": "player",
+      "priority": 2.0
+    }
+  ],
+  "name": "ripple",
+  "protocolVersion": 1,
+  "records": [
+    {
+      "fields": [
+        {
+          "name": "weather",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "remaining",
+          "type": {
+            "type": "u32"
+          }
+        }
+      ],
+      "name": "Weather"
+    }
+  ],
+  "schemaVersion": 1
+}
