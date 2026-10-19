@@ -32,6 +32,7 @@ pub(crate) enum HarnessMode {
     SchemaSql(SchemaDialect),
     SchemaGraphql,
     ClientManifest,
+    GameManifest,
 }
 
 impl HarnessMode {
@@ -42,12 +43,14 @@ impl HarnessMode {
             HarnessMode::SchemaSql(SchemaDialect::Sqlite) => "schema-sqlite",
             HarnessMode::SchemaGraphql => "schema-graphql",
             HarnessMode::ClientManifest => "client-manifest",
+            HarnessMode::GameManifest => "game-manifest",
         }
     }
 
     fn default_entrypoint(self) -> &'static str {
         match self {
             HarnessMode::ClientManifest => "distributed_client_surface",
+            HarnessMode::GameManifest => "game_surface",
             HarnessMode::DescribeJson => "application_manifest",
             HarnessMode::SchemaSql(_) | HarnessMode::SchemaGraphql => "read_model_catalog",
         }
@@ -225,6 +228,13 @@ fn harness_main_rs(entrypoint: &str, mode: HarnessMode) -> String {
     let sdl = distributed::graphql::graphql_sdl_for_tables(&catalog.tables)
         .expect("read-model GraphQL SDL should render");
     print!("{{}}", sdl);
+}}
+"#
+        ),
+        HarnessMode::GameManifest => format!(
+            r#"fn main() {{
+    let surface = {entrypoint}();
+    println!("{{}}", serde_json::to_string_pretty(&surface).expect("game surface should serialize"));
 }}
 "#
         ),
@@ -421,6 +431,18 @@ mod tests {
         assert!(!main_rs.contains("distributed::graphql::DistributedClientSurfaceExport"));
         assert!(main_rs.contains(".manifest()"));
         assert!(!main_rs.contains("build_surface"));
+    }
+
+    #[test]
+    fn game_harness_prints_the_surface_export() {
+        assert_eq!(
+            HarnessMode::GameManifest.default_entrypoint(),
+            "game_surface"
+        );
+        assert!(!HarnessMode::GameManifest.requires_distributed_dependency());
+        let main_rs = harness_main_rs("game_demos::arena::game_surface", HarnessMode::GameManifest);
+        assert!(main_rs.contains("let surface = game_demos::arena::game_surface();"));
+        assert!(main_rs.contains("serde_json::to_string_pretty(&surface)"));
     }
 
     #[test]
