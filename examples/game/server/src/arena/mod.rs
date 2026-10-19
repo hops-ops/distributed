@@ -15,9 +15,11 @@
 //! | 2 `drone`  | 1..=30 | x y yaw | wander between random targets |
 //! | 3 `pillar` | 100 + i | x y r | global (visible everywhere) |
 //!
-//! Event [`EVENT_HELLO`] (JSON) tells a joining player its entity and the
-//! view radius. Inputs are 3 bytes ([`MoveInput`]); each input is one
-//! command frame. A player earns one frame credit per tick (max
+//! Kinds are `#[derive(Replicated)]` views ([`PlayerView`], [`DroneView`],
+//! [`PillarView`]); [`ArenaEvent::Hello`] tells a joining player its entity
+//! and the view radius. Inputs are 3 bytes ([`MoveInput`], a
+//! `#[derive(GameInput)]`); each input is one command frame. The browser
+//! client is generated from [`game_surface`] (`run.sh gen`). A player earns one frame credit per tick (max
 //! [`MAX_CREDITS`], `distributed_game::InputCredits`), so a client cannot
 //! move faster than real time by sending more inputs, but jitter bursts are
 //! absorbed.
@@ -28,22 +30,109 @@ use std::collections::BTreeMap;
 
 use distributed_game::net::{GameServer, ServerConfig};
 use distributed_game::{
-    Ctx, EntitySchema, EntityState, FieldType, FieldValue, InputCredits, KindDef, LeaveReason,
-    PlayerId, View, WorldView, Zone,
+    schema, Ctx, EntitySchema, GameEvent, GameInput, GameSurface, InputCredits, LeaveReason,
+    PlayerId, Replicated, View, WorldView, Zone,
 };
-use serde_json::json;
 
-use crate::common::{send_json_event, Demo, Guests};
+use crate::common::{Demo, Guests};
 pub use movement::{MoveInput, MoveState};
 
-/// Player kind.
-pub const KIND_PLAYER: u16 = 1;
-/// Drone kind.
-pub const KIND_DRONE: u16 = 2;
-/// Pillar kind.
-pub const KIND_PILLAR: u16 = 3;
-/// Event type: `{"entity": u32, "viewRadius": f32, "half": f32}` (JSON).
-pub const EVENT_HELLO: u32 = 1;
+/// A player's capsule: the full [`MoveState`] (so the client can rebase its
+/// prediction) plus the display name. Global: everyone in the room is seen.
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "player", id = 1, priority = 2.0, global)]
+pub struct PlayerView {
+    /// Position x.
+    #[field_type(movement::POS)]
+    #[correct(ease = 150)]
+    pub x: f32,
+    /// Position y.
+    #[field_type(movement::POS)]
+    #[correct(ease = 150)]
+    pub y: f32,
+    /// Velocity x.
+    #[field_type(movement::VEL)]
+    #[correct(snap)]
+    pub vx: f32,
+    /// Velocity y.
+    #[field_type(movement::VEL)]
+    #[correct(snap)]
+    pub vy: f32,
+    /// Remaining dash frames.
+    #[correct(snap)]
+    pub dash: u8,
+    /// Remaining dash cooldown frames.
+    #[correct(snap)]
+    pub cd: u8,
+    /// Display name.
+    #[priority(0.2)]
+    #[correct(replace)]
+    pub name: String,
+}
+
+impl PlayerView {
+    /// The view of a capsule.
+    pub fn of(state: &MoveState, name: &str) -> Self {
+        Self {
+            x: state.x,
+            y: state.y,
+            vx: state.vx,
+            vy: state.vy,
+            dash: state.dash,
+            cd: state.cooldown,
+            name: name.to_string(),
+        }
+    }
+}
+
+/// A wandering drone (culled by the view radius).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "drone", id = 2)]
+pub struct DroneView {
+    /// Position x.
+    #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    pub x: f32,
+    /// Position y.
+    #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    pub y: f32,
+    /// Heading.
+    #[angle(bits = 8)]
+    pub yaw: f32,
+}
+
+/// A static pillar (visible everywhere).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "pillar", id = 3, global)]
+pub struct PillarView {
+    /// Centre x.
+    pub x: f32,
+    /// Centre y.
+    pub y: f32,
+    /// Radius.
+    pub r: f32,
+}
+
+/// The Arena's events.
+#[derive(Debug, Clone, PartialEq, GameEvent)]
+pub enum ArenaEvent {
+    /// To a joining player: its entity, the interest radius and floor size.
+    #[game_event(id = 1)]
+    Hello {
+        /// Own entity id.
+        entity: u32,
+        /// Interest radius (m).
+        view_radius: f32,
+        /// Floor half extent (m).
+        half: f32,
+    },
+}
+
+/// The Arena's client surface (`distributed game-manifest --entrypoint
+/// game_demos::arena::game_surface`).
+pub fn game_surface() -> GameSurface {
+    GameSurface::for_zone::<Arena>("arena").events::<ArenaEvent>()
+}
+
 /// Interest radius (m).
 pub const VIEW_RADIUS: f32 = 14.0;
 /// Wandering drones.
@@ -116,35 +205,7 @@ impl Zone for Arena {
     type Timer = ();
 
     fn schema() -> EntitySchema {
-        let small = FieldType::QuantF32 {
-            min: -movement::HALF,
-            max: movement::HALF,
-            bits: 14,
-        };
-        EntitySchema::new()
-            .kind(
-                KindDef::new(KIND_PLAYER, "player")
-                    .field("x", movement::POS)
-                    .field("y", movement::POS)
-                    .field("vx", movement::VEL)
-                    .field("vy", movement::VEL)
-                    .field("dash", FieldType::U8)
-                    .field("cd", FieldType::U8)
-                    .field_with_priority("name", FieldType::ShortStr, 0.2)
-                    .priority(2.0),
-            )
-            .kind(
-                KindDef::new(KIND_DRONE, "drone")
-                    .field("x", small)
-                    .field("y", small)
-                    .field("yaw", FieldType::Angle { bits: 8 }),
-            )
-            .kind(
-                KindDef::new(KIND_PILLAR, "pillar")
-                    .field("x", FieldType::F32)
-                    .field("y", FieldType::F32)
-                    .field("r", FieldType::F32),
-            )
+        schema![PlayerView, DroneView, PillarView]
     }
 
     fn on_create(ctx: &mut Ctx<'_, Self>, config: ArenaConfig) -> Self {
@@ -190,11 +251,13 @@ impl Zone for Arena {
             },
         );
         ctx.set_view(player, View::new(x, y, VIEW_RADIUS));
-        send_json_event(
-            ctx,
+        ctx.send(
             player,
-            EVENT_HELLO,
-            &json!({ "entity": entity, "viewRadius": VIEW_RADIUS, "half": movement::HALF }),
+            &ArenaEvent::Hello {
+                entity,
+                view_radius: VIEW_RADIUS,
+                half: movement::HALF,
+            },
         );
     }
 
@@ -204,7 +267,7 @@ impl Zone for Arena {
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<MoveInput> {
-        MoveInput::decode(payload)
+        MoveInput::from_payload(payload)
     }
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
@@ -236,50 +299,24 @@ impl Zone for Arena {
 
     fn replicate(&self, out: &mut WorldView) {
         for p in self.players.values() {
-            let s = p.state;
-            out.push(
-                EntityState::new(
-                    p.entity,
-                    KIND_PLAYER,
-                    s.x,
-                    s.y,
-                    vec![
-                        FieldValue::F(s.x),
-                        FieldValue::F(s.y),
-                        FieldValue::F(s.vx),
-                        FieldValue::F(s.vy),
-                        FieldValue::U(s.dash.into()),
-                        FieldValue::U(s.cooldown.into()),
-                        FieldValue::Str(p.name.clone()),
-                    ],
-                )
-                // Players are global: a small room shows everyone; only drones are
-                // culled by the view radius.
-                .global(),
-            );
+            out.add(p.entity, &PlayerView::of(&p.state, &p.name));
         }
         for d in &self.drones {
-            out.push(
-                EntityState::new(
-                    d.id,
-                    KIND_DRONE,
-                    d.x,
-                    d.y,
-                    vec![FieldValue::F(d.x), FieldValue::F(d.y), FieldValue::F(d.yaw)],
-                )
-                .priority(0.5),
-            );
+            let view = DroneView {
+                x: d.x,
+                y: d.y,
+                yaw: d.yaw,
+            };
+            out.add(d.id, &view).priority(0.5);
         }
         for (i, (x, y, r)) in movement::PILLARS.iter().enumerate() {
-            out.push(
-                EntityState::new(
-                    100 + i as u32,
-                    KIND_PILLAR,
-                    *x,
-                    *y,
-                    vec![FieldValue::F(*x), FieldValue::F(*y), FieldValue::F(*r)],
-                )
-                .global(),
+            out.add(
+                100 + i as u32,
+                &PillarView {
+                    x: *x,
+                    y: *y,
+                    r: *r,
+                },
             );
         }
     }
@@ -293,8 +330,7 @@ pub fn encode_bot_input(dir: [f32; 2]) -> Vec<u8> {
         my: axis(dir[1]),
         buttons: 0,
     }
-    .encode()
-    .to_vec()
+    .to_payload()
 }
 
 /// Demo registration (`game-demos arena`).

@@ -42,8 +42,8 @@ use std::time::Duration;
 use distributed_game::net::{GameServer, ServerConfig};
 use distributed_game::world::{HostAddr, ZoneDirectory};
 use distributed_game::{
-    ChildEvent, ConsumePolicy, Ctx, EntitySchema, EntityState, FieldType, FieldValue, KindDef,
-    LeaveReason, ObserverId, PlayerId, TimerId, WorldView, Zone,
+    ChildEvent, ConsumePolicy, Ctx, EntitySchema, EntityState, FieldType, FieldValue, GameInput,
+    KindDef, LeaveReason, ObserverId, PlayerId, TimerId, WorldView, Zone,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -230,7 +230,7 @@ pub struct HoodInput {
 impl HoodInput {
     /// Wire payload `[mx, my, buttons, action]`.
     pub fn encode(self) -> [u8; 4] {
-        let [mx, my, buttons] = self.movement.encode();
+        let [mx, my, buttons] = <[u8; 3]>::try_from(self.movement.to_payload()).expect("3 bytes");
         [mx, my, buttons, self.action]
     }
 
@@ -241,7 +241,7 @@ impl HoodInput {
             return None;
         };
         Some(Self {
-            movement: MoveInput::decode(movement)?,
+            movement: MoveInput::from_payload(movement)?,
             action: action & (ACTION_ATTACK | ACTION_SMITE),
         })
     }

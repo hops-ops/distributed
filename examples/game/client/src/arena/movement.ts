@@ -11,9 +11,16 @@
  * `tests/movement-parity.test.mjs` replays the Rust-generated fixture
  * `examples/game/fixtures/arena-movement.json` through this file.
  *
- * No imports except the SDK quantizers so Node can run it directly.
+ * The input type, its sanitize and the wire quantization come from the
+ * client generated from the Rust surface (`../generated/arena`).
  */
 import { dequantizeLinear, quantizeLinear, type EntityFields } from '@hops-ops/distributed/game';
+
+import { BUTTON, FIELD_TYPES, sanitizeInput, type MoveInput } from '../generated/arena/index.ts';
+
+export type { MoveInput } from '../generated/arena/index.ts';
+/** TEMPORARY (demo conversion in progress): use the generated `encodeInput`. */
+export { encodeInput as encodeMoveInput } from '../generated/arena/index.ts';
 
 const f = Math.fround;
 
@@ -25,7 +32,7 @@ export const ACCEL = 40;
 export const DASH_SPEED = 14;
 export const DASH_FRAMES = 6;
 export const DASH_COOLDOWN = 45;
-export const BUTTON_DASH = 1;
+export const BUTTON_DASH = BUTTON.dash;
 
 /** Static circular pillars `[x, y, radius]`. */
 export const PILLARS: readonly (readonly [number, number, number])[] = [
@@ -42,17 +49,9 @@ export const PILLARS: readonly (readonly [number, number, number])[] = [
 
 export type Quant = Readonly<{ min: number; max: number; bits: number }>;
 
-/** `FieldType::quant_centered(range, bits)`: zero is on the grid. */
-export function quantCentered(range: number, bits: number): Quant {
-	return { min: -range, max: f(range - range / 2 ** (bits - 1)), bits };
-}
-
-/** Wire quantization of `x`/`y` and `vx`/`vy` (must match the Rust schema). */
-export const POS = quantCentered(HALF, 18);
-export const VEL = quantCentered(16, 12);
-
-/** One command frame: stick per axis in [-127, 127] and button bits. */
-export type MoveInput = Readonly<{ mx: number; my: number; buttons: number }>;
+/** Wire quantization of `x`/`y` and `vx`/`vy` (from the Rust schema). */
+export const POS: Quant = FIELD_TYPES.player.x;
+export const VEL: Quant = FIELD_TYPES.player.vx;
 
 export type MoveState = Readonly<{
 	x: number;
@@ -63,24 +62,14 @@ export type MoveState = Readonly<{
 	cooldown: number;
 }>;
 
-/** Wire payload `[mx, my, buttons]` (as the server decodes it). */
-export function encodeMoveInput(input: MoveInput): Uint8Array {
-	return new Uint8Array([input.mx & 0xff, input.my & 0xff, input.buttons & 0xff]);
-}
-
-/** The server's sanitization: -128 → -127, unknown buttons cleared. */
-export function sanitizeMoveInput(input: MoveInput): MoveInput {
-	const axis = (v: number) => Math.max(-127, Math.min(127, Math.trunc(v)));
-	return { mx: axis(input.mx), my: axis(input.my), buttons: input.buttons & BUTTON_DASH };
-}
-
 function snap(q: Quant, v: number): number {
 	return dequantizeLinear(quantizeLinear(v, q.min, q.max, q.bits), q.min, q.max, q.bits);
 }
 
 /** Advance one command frame (see the module docs). */
 export function step(state: MoveState, raw: MoveInput): MoveState {
-	const input = sanitizeMoveInput(raw);
+	// What the server simulates: -128 → -127, unknown buttons cleared.
+	const input = sanitizeInput(raw);
 	let { x, y, vx, vy, dash, cooldown } = state;
 	let dx = f(input.mx / 127);
 	let dy = f(input.my / 127);

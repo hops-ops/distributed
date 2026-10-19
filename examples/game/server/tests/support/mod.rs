@@ -10,7 +10,7 @@ use distributed_game::net::TicketKey;
 use distributed_game::protocol::{Hello, Welcome};
 use distributed_game::world::HostAddr;
 use distributed_game::{
-    ClientMessage, ClientMirror, Role, ServerMessage, TicketClaims, PROTOCOL_VERSION,
+    ClientMessage, ClientMirror, GameEvent, Role, ServerMessage, TicketClaims, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
 use game_demos::cluster::{spawn_cluster, ClusterDemo, ClusterOptions, RunningHost};
@@ -223,6 +223,31 @@ impl Client {
             self.events.push((*type_id, payload.clone()));
         }
         msg
+    }
+
+    /// Typed events of `E` received so far.
+    pub fn seen_events<E: GameEvent>(&self) -> Vec<E> {
+        self.events
+            .iter()
+            .filter_map(|(t, p)| E::decode_event(*t, p).expect("event decodes"))
+            .collect()
+    }
+
+    /// Wait (5 s) for the next event of `E` that `pick` accepts.
+    pub async fn wait_event<E: GameEvent>(&mut self, pick: impl Fn(&E) -> bool) -> E {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if let ServerMessage::Event { type_id, payload } =
+                self.next(left).await.expect("event within 5 s")
+            {
+                if let Some(event) = E::decode_event(type_id, &payload).expect("event decodes") {
+                    if pick(&event) {
+                        return event;
+                    }
+                }
+            }
+        }
     }
 
     /// JSON events of `type_id` received so far.

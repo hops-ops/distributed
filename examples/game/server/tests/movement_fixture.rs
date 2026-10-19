@@ -5,6 +5,7 @@
 //! Regenerate after an intended change to BOTH implementations:
 //! `UPDATE_GOLDEN=1 cargo test --test movement_fixture`.
 
+use distributed_game::GameInput;
 use std::path::PathBuf;
 
 use game_demos::arena::movement::{self, MoveInput, MoveState, BUTTON_DASH};
@@ -53,7 +54,7 @@ fn build() -> Value {
     let mut steps = Vec::new();
     for input in script() {
         // The server decodes the wire payload, so the fixture does too.
-        let decoded = MoveInput::decode(&input.encode()).unwrap();
+        let decoded = MoveInput::from_payload(&input.to_payload()).unwrap();
         s = movement::step(s, decoded);
         steps.push(json!({
             "input": [input.mx, input.my, input.buttons],
