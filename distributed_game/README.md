@@ -25,8 +25,9 @@ the browser, but the client SDK has no rendering dependency.
 - [Try it](#try-it)
 - [Build a zone](#build-a-zone)
 - [Guides](#guides): game loop · input · what clients see · the client SDK ·
-  generated clients · saving progress · scaling out · live updates · lag
-  compensation · testing and operations · security
+  generated clients · client prediction (Rust → WebAssembly) · saving
+  progress · scaling out · live updates · lag compensation · testing and
+  operations · security
 - [Design decisions](#design-decisions)
 - [Status and limits](#status-and-limits)
 - [Reference](#reference)
@@ -111,8 +112,10 @@ Then open `http://localhost:5173/<demo>/`. Each page explains what to try.
 
 A zone is a struct plus a few trait methods. You describe **what clients
 see**, **what they send** and **what you tell them** as plain Rust structs
-with derives; the engine encodes them, and `distributed game-client`
-generates the matching TypeScript, so field order, ids and quantization are
+with derives, and the rule clients **predict** as a plain Rust function;
+the engine encodes them, `distributed game-client` generates the matching
+TypeScript and `distributed game-wasm` compiles the predicted step to
+WebAssembly, so field order, ids, quantization and movement rules are
 written down exactly once. This zone is a dot that players push left and
 right:
 
@@ -146,6 +149,20 @@ enum RoomEvent {
     Hello { entity: u32 },
 }
 
+/// The predicted fields of a `dot` (named after the kind's fields).
+#[derive(Clone, Copy, GameRecord)]
+struct DotState {
+    x: f32,
+}
+
+/// The movement rule: run by `on_tick` on the server and, compiled to
+/// WebAssembly, by the browser to predict its own dot. One input is one
+/// fixed 30 Hz frame.
+#[predict(PushStep, kind = "dot")]
+fn push_step(state: &DotState, input: &Push, _context: &(), _dt: f32) -> DotState {
+    DotState { x: state.x + f32::from(input.dx) * 5.0 / 30.0 }
+}
+
 struct Room { x: f32 }
 
 impl Zone for Room {
@@ -171,7 +188,7 @@ impl Zone for Room {
         let players: Vec<_> = ctx.players().map(|p| p.id).collect();
         for p in players {
             for input in ctx.take_inputs(p, ConsumePolicy::Drain) {
-                self.x += f32::from(input.input.dx) * 5.0 * ctx.dt_secs();
+                self.x = push_step(&DotState { x: self.x }, &input.input, &(), ctx.dt_secs()).x;
             }
         }
     }
@@ -184,7 +201,9 @@ impl Zone for Room {
 
 /// Everything a browser needs to know about this zone, for the generator.
 pub fn game_surface() -> GameSurface {
-    GameSurface::for_zone::<Room>("room").events::<RoomEvent>()
+    GameSurface::for_zone::<Room>("room")
+        .events::<RoomEvent>()
+        .predict::<PushStep>()
 }
 
 // Drive it directly (tests, tools) with a manual clock:
@@ -215,11 +234,12 @@ Generate the browser client from `game_surface` (see
 ```sh
 distributed game-manifest --entrypoint my_game::game_surface --out room.surface.json
 distributed game-client --manifest room.surface.json --out web/src/generated/room
+distributed game-wasm --manifest room.surface.json --out web/src/generated/room  # push_step → wasm/room.wasm
 ```
 
-Connect a browser with it. The input encoder, the correction defaults and
-the event decoders are generated; you write only the prediction rule (the
-same rule as `on_tick`) and drawing:
+Connect a browser with it. The input encoder, the correction defaults, the
+event decoders and prediction (`push_step`, compiled) are generated; you
+write only drawing:
 
 ```ts
 import { InputPacer } from '@hops-ops/distributed/game';
@@ -227,9 +247,8 @@ import { createRoomClient, dotFields, isDot } from './generated/room/index.ts';
 
 const room = createRoomClient({
   url: (zone) => `wss://game.example/zones/${zone}`,
-  ticket: ({ zoneId, role }) => api.mintZoneTicket(zoneId, role), // your backend signs these
-  prediction: { predict: (s, push, dtMs) => ({ x: Number(s.x) + (push.dx * 5 * dtMs) / 1000 }) }
-});
+  ticket: ({ zoneId, role }) => api.mintZoneTicket(zoneId, role) // your backend signs these
+}); // predicts with wasm/room.wasm; `room.prediction.ready` once loaded
 room.on('hello', (hello) => room.client.setControlledEntity(hello.entity)); // typed payload
 await room.client.connect('room-1');
 const pacer = new InputPacer({ tickRate: () => room.client.authority?.connection.welcome?.tickRate });
@@ -352,7 +371,9 @@ zone's typed fields, input encoder, events and correction defaults.
   between two received states, so movement is smooth whatever the network
   does. The delay adapts to measured latency and jitter (`AdaptiveDelay`).
 - **Prediction.** The player's own entity moves the moment they press a
-  key, using your `predict` function (the same rule as the server). Each
+  key, using a `predict` function — with a generated client, the zone's
+  `#[predict]` step compiled to WebAssembly (see
+  [Client prediction](#client-prediction-rust--webassembly)). Each
   Delta, the client replays not-yet-acknowledged inputs on top of the
   server's state; any difference is resolved per field (`ease`, `snap` or
   `replace`). `setPredictionEnabled(false)` turns it off, to feel the raw
@@ -370,14 +391,17 @@ zone's typed fields, input encoder, events and correction defaults.
 ### Generated clients
 
 The derives also describe the zone for the browser. A **game surface**
-(`GameSurface`, versioned JSON, schema v1) lists the zone's kinds with
+(`GameSurface`, versioned JSON, schema v2) lists the zone's kinds with
 their fields, wire types, priorities and correction defaults, its input
-layout and sanitize rules, its events and the records they mention.
-Export one function per zone type, conventionally `game_surface`:
+layout and sanitize rules, its events and the records they mention, and
+its predicted step. Export one function per zone type, conventionally
+`game_surface`:
 
 ```rust,ignore
 pub fn game_surface() -> GameSurface {
-    GameSurface::for_zone::<Arena>("arena").events::<ArenaEvent>()
+    GameSurface::for_zone::<Arena>("arena")
+        .events::<ArenaEvent>()
+        .predict::<ArenaStep>()
 }
 ```
 
@@ -391,15 +415,105 @@ imports only `@hops-ops/distributed/game`:
 | `schema.ts` | `KIND` ids, `PlayerFields` interfaces with `isPlayer(e)` / `playerFields(e)` over rendered or replica entities (camelCase properties), `FIELD_TYPES`, `CORRECTIONS` |
 | `input.ts` | the input interface, `BITS` / `BUTTON`, `encodeInput`, `decodeInput`, `sanitizeInput` (what the server will simulate) |
 | `events.ts` | record and event interfaces, `EVENT` ids, `EVENTS` codecs, `decodeEvent`, `onEvent` |
-| `client.ts` | `create<Name>Client(options)`: a `GameClient` with the encoder and correction defaults wired in, a typed `on(name, handler)` and `send(input)` |
+| `client.ts` | `create<Name>Client(options)`: a `GameClient` with the encoder and correction defaults wired in (and, with a predicted step, prediction by the compiled step), a typed `on(name, handler)` and `send(input)` |
+| `predict.ts` | with a `#[predict]` step: `PREDICT`, the state/context layouts, `PREDICT_WASM_URL` (`./wasm/<name>.wasm`) and `create<Name>Prediction` |
 | `index.ts`, `surface.json` | re-exports; the surface it came from |
 
 The output is deterministic, so check it in and run `--check` in CI: a
 changed Rust definition then fails the build until the client is
 regenerated. The binary protocol is unchanged; the generated code only
-removes the hand-written glue around it. Prediction functions stay
-hand-written (they must match `on_tick` bit for bit), but they use the
-generated input type, sanitize and field wire types.
+removes the hand-written glue around it. The compiled step
+(`distributed game-wasm`, `wasm/<name>.wasm`) is a build output: ignore
+`wasm/` in version control and build it before bundling.
+
+### Client prediction (Rust → WebAssembly)
+
+Prediction is an optimistic update at tick rate: the client applies each
+input to its own entity at once and, on every Delta, replays the inputs the
+server has not acknowledged yet on top of the authoritative state. That is
+only invisible if the client's step is *exactly* the server's. So the step
+is declared **once**, in Rust, and the browser runs it compiled to
+WebAssembly — there is no TypeScript twin to keep in sync.
+
+```rust,ignore
+/// Predicted fields of the `player` kind (same names, plain scalar types:
+/// `f32` for quantized floats, u8/u16/u32/i32/bool otherwise).
+#[derive(Clone, Copy, GameRecord)]
+pub struct MoveState { pub x: f32, pub y: f32, pub vx: f32, pub vy: f32, pub dash: u8, pub cd: u8 }
+
+/// Read-only data the client supplies (optional; `&()` for none).
+#[derive(Clone, Copy, GameRecord)]
+pub struct GridContext { pub seed: u32, pub cx: i32, pub cy: i32 }
+
+#[predict(GridStep, kind = "walker")]
+pub fn grid_step(state: &WalkerState, input: &MoveInput, context: &GridContext, _dt: f32) -> WalkerState {
+    let props = cell_props(context.seed, (context.cx, context.cy));
+    let (x, y) = step(state.x, state.y, *input, &props);
+    WalkerState { x, y }
+}
+```
+
+- **Declare.** `#[predict(StepType, kind = "…")]` on a
+  `fn(&State, &Input, &Context, dt: f32) -> State` keeps the function and
+  adds `StepType: PredictStep`. `Input` is the zone's `GameInput`; the
+  WASM side decodes it with `from_payload`, so it steps exactly what the
+  server simulates (ranges clamped, unknown buttons cleared). Call the
+  function from `on_tick` (or the code it wraps) so there is one rule.
+- **Record.** `GameSurface::…​.predict::<StepType>()` checks that the kind
+  is replicated, that the step takes the zone's input, and that every state
+  field is a field of the kind with a matching type (it panics at export
+  time otherwise), then records the step, its state/context records and
+  the declaring Cargo package in the surface.
+- **Build.** `distributed game-wasm --manifest <surface.json>
+  --manifest-path <Cargo.toml> --out <generated dir>` compiles that package
+  for `wasm32-unknown-unknown` (`cargo rustc --release --crate-type
+  cdylib`) and writes `wasm/<name>.wasm`, stamped with the sources'
+  fingerprint. Put the step and everything it reads in a crate without
+  server-only dependencies (the demos use `game_sim`); `distributed_game`
+  itself compiles to `wasm32` with default features.
+- **Run.** The generated `create<Name>Client` loads the module and predicts
+  with it; `client.prediction.setContext(…)` provides the context.
+  `prediction: false` turns prediction off; a `predict` in `prediction`
+  replaces it.
+
+**Binary ABI (v1).** The module imports nothing and exports `memory`,
+`dg_predict_abi() -> 1`, `dg_predict_buffer()` (a 64 KiB scratch area) and
+`dg_predict_<fn>(state_len, input_len, context_len, dt) -> i32`. The client
+writes `state ‖ input ‖ context` into the scratch area — state and context
+with the payload codec (binary32 floats, never rounded through JSON or
+`f64`), the input as its wire payload — calls the step, and reads the next
+state from the start of the buffer (a negative result is an error code).
+`prediction::step_bytes::<Step>` runs the same path natively.
+
+**Determinism.** Native and WASM results are bit-identical when the step
+uses only operations that are correctly rounded on both targets: `+ - * /`,
+`sqrt`, `abs`, `min`/`max`, `floor`/`ceil`/`trunc`/`round`, comparisons and
+integer arithmetic (Rust never fuses `a * b + c` into an FMA on its own).
+Transcendentals are **not** portable: `sin`, `cos`, `atan2`, `exp`, `ln`,
+`powf` use the platform libm natively and another implementation on
+`wasm32`. If a step needs them, use one deterministic implementation on
+both sides (the `libm` crate, or a polynomial in plain arithmetic). Never
+produce NaN (payloads may differ). Prefer fixed command frames (one input
+= one tick, `dt` ignored) and snap replicated floats to their wire
+quantization after each step, so the server holds exactly what clients
+decode. The demos prove all of this per step function: `game-demos
+predict-trace` prints native traces over recorded input streams
+(scripted, random, every sanitize edge) and
+`examples/game/client/tests/prediction-wasm.test.mjs` requires every state
+from the compiled module to be byte-identical (16 788 frames across the
+four steps — 20 744 comparisons over the five surfaces' modules —
+including the grid's prop collisions).
+
+**Cost.** Measured on Apple silicon: ~0.2 µs per raw ABI call, ~0.8 µs per
+`predict` (fields → bytes → step → fields) in Node 24 and ~1.2 µs in Chrome
+156; a reconciliation that replays 10 pending inputs takes ~8–12 µs.
+At 30 Hz input and 20 Hz Deltas that is ≈ 0.2 ms of prediction per
+second — far below one 33 ms frame. The module is ~90 KB (the demos' four
+steps plus the grid's world generation).
+
+**Security.** Prediction is cosmetic. The server never runs client code
+and never trusts a predicted value: it simulates the inputs itself, and
+every Delta replaces the prediction with the authoritative state.
 
 ### Saving progress without pausing the game
 
@@ -529,6 +643,12 @@ unlimited rewind.
 - **Static world from a seed.** Terrain and props are a pure function of
   seed and content version, generated identically on server and client.
   Only things that change are replicated.
+- **Prediction compiled from the server's Rust, over a binary ABI.** A
+  TypeScript twin of the movement code drifts the first time someone
+  changes one side; running the same Rust as WebAssembly cannot. JSON
+  bridges (as browser WASM pures use) round-trip `f32` through `f64` and
+  allocate per call; a fixed scratch buffer with codec-encoded state keeps
+  every float bit and costs about a microsecond per step.
 - **Binary protocol with the schema sent on connect.** Small,
   diff-friendly frames, and any client can decode them without generated
   code.
@@ -546,8 +666,11 @@ unlimited rewind.
   was unavailable) and the Redis leaderboard against a real Redis (only a
   fake).
 - No production deployment or load testing beyond local bots.
-- WebSocket only (no UDP or WebTransport). No built-in physics. Input
-  replay on the client assumes your `predict` matches `on_tick` exactly.
+- WebSocket only (no UDP or WebTransport). No built-in physics. Exact
+  input replay needs the predicted step to be what `on_tick` runs: declare
+  it once with `#[predict]` and call it from the zone. Steps must stay
+  within portable float operations (see
+  [Client prediction](#client-prediction-rust--webassembly)).
 
 ---
 
@@ -565,16 +688,19 @@ errors for unsupported types and attributes.
 | `GameEvent` | enum / struct | `#[game_event(id = N, name = "..")]` per variant / on the struct | `quant`, `angle`, `field_type`, `long` | `GameEvent` (`decode_event`, `to_payload`) + id consts |
 | `GameRecord` | struct | – | `quant`, `angle`, `field_type`, `long` | `Wire` (nested payload record) |
 | `FactCommand` | struct (`Serialize`) | `#[fact(command = CONST_OR_LITERAL, key(field, ..))]` | – | `FactCommand` (`COMMAND`, `dedupe_parts`) |
+| `#[predict]` (attribute) | `fn(&State, &Input, &Context, f32) -> State` | `#[predict(StepType, kind = "name")]` | – | `struct StepType: PredictStep` + the `wasm32` export `dg_predict_<fn>` |
 
 `schema![A, B]` builds an `EntitySchema`; `GameSurface::for_zone::<Z>(name)`
-(kinds from `Z::schema()`, input from `Z::Input`) `.events::<E>()` builds
-the surface; `codec` holds the shared value codec (`Wire`, `WireType`).
+(kinds from `Z::schema()`, input from `Z::Input`) `.events::<E>()`
+`.predict::<S>()` builds the surface; `codec` holds the shared value codec
+(`Wire`, `WireType`); `prediction` the predicted-step trait, its ABI
+(`run_abi`, `step_bytes`) and the float rules.
 
 ## Features
 
 | Feature | Adds | Deps |
 |---|---|---|
-| *(default)* | Zone/host runtime, facts queue, protocol, schema, replication, authoring derives, game surface | `serde`, `serde_json`, `distributed_game_macros` |
+| *(default)* | Zone/host runtime, facts queue, protocol, schema, replication, authoring derives, game surface, predicted steps (compiles to `wasm32-unknown-unknown`, where `#[predict]` exports its steps) | `serde`, `serde_json`, `distributed_game_macros` |
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
 | `cell` | `cell::CellFactSink` → `AggregateCell::dispatch_idempotent`, `stamp_event_record` | `distributed`, `sha2` |
 | `metrics` | `metrics::GameMetrics` per-zone Prometheus text | – |
