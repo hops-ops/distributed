@@ -208,6 +208,33 @@ test('refused handoff returns to the source with the same Hello, then falls back
 	client2.close();
 });
 
+test('handoff holds the predicted entity until the target binds it (no source copy)', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	network.onMessage = (conn, m) => {
+		if (m.type === 'Hello') conn.send(welcome({ zoneId: conn.zoneId }));
+	};
+	const client = handoffClient(network, scheduler);
+	await client.connect('z1');
+	network.last('z1').send(delta({ creates: [avatar(1, 5)] }));
+	const own = () => client.render().filter((e) => e.id === 1);
+	assert.deepEqual(own().map((e) => [e.key, e.predicted]), [['z1:1', true]]);
+
+	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1' });
+	await scheduler.advance(10);
+	assert.equal(client.authority.zoneId, 'z2');
+	// Welcomed by z2 but no Delta yet: one frozen predicted copy, not the
+	// source's interpolated (older) one.
+	const held = own();
+	assert.deepEqual(held.map((e) => [e.key, e.predicted, e.stale]), [['z1:1', true, false]]);
+	assert.ok(Math.abs(held[0].fields.x - 5) < 1e-3, 'held at the last predicted position');
+
+	network.last('z2').send(delta({ creates: [avatar(1, 5.5)] }));
+	network.last('z1').send(delta({ serverTick: 101, updates: [] }));
+	assert.deepEqual(own().map((e) => [e.key, e.predicted]), [['z2:1', true]]);
+	client.close();
+});
+
 test('a silent handoff target times out into the return path', async () => {
 	const network = new FakeNetwork();
 	const scheduler = new FakeScheduler();

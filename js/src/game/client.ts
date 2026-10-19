@@ -169,6 +169,16 @@ export class GameClient<TInput = unknown> {
 	readonly #predictor: Predictor<TInput> | undefined;
 	#authority: Zone | undefined;
 	#controlledOverride: number | undefined;
+	/** Last rendered controlled entity (held through a handoff). */
+	#lastControlled: RenderedEntity | undefined;
+	/**
+	 * Handoff in flight: the controlled entity is drawn frozen at its last
+	 * predicted state until the target zone binds it, instead of the source
+	 * zone's interpolated (older) copy.
+	 */
+	#handoffBridge: RenderedEntity | undefined;
+	/** The source zone's copy of the handed-off entity: never drawn again. */
+	#handedOff: Readonly<{ zoneId: string; id: number }> | undefined;
 	#closed = false;
 	#contentVersion: string;
 	#predictionEnabled: boolean;
@@ -351,18 +361,41 @@ export class GameClient<TInput = unknown> {
 			this.#predictionEnabled && predictor?.active === true && this.#authority !== undefined
 				? predictor.entityId
 				: undefined;
+		if (controlled !== undefined) this.#handoffBridge = undefined;
+		const gone = this.#handedOff;
+		let goneSeen = false;
+		let mine: RenderedEntity | undefined;
 		for (const zone of this.zones()) {
 			const delay = this.interpolationDelay(zone);
 			zone.replica.interpolationDelayMs = delay;
 			const renderTime = zone.connection.serverNow() - delay;
 			const authoritative = zone === this.#authority;
 			for (const entity of zone.replica.sample(renderTime)) {
+				// (Unless a failed handoff returned control to the source zone.)
+				if (
+					gone !== undefined &&
+					zone.zoneId === gone.zoneId &&
+					entity.id === gone.id &&
+					!(authoritative && entity.id === controlled)
+				) {
+					goneSeen = true;
+					continue;
+				}
 				const isControlled = authoritative && entity.id === controlled && !entity.stale;
-				out.push(
-					rendered(zone.zoneId, entity, authoritative, isControlled, isControlled ? predictor!.current(now) : undefined)
+				const item = rendered(
+					zone.zoneId,
+					entity,
+					authoritative,
+					isControlled,
+					isControlled ? predictor!.current(now) : undefined
 				);
+				if (item.predicted) mine = item;
+				out.push(item);
 			}
 		}
+		if (gone !== undefined && !goneSeen) this.#handedOff = undefined;
+		if (this.#handoffBridge !== undefined) out.push(this.#handoffBridge);
+		this.#lastControlled = mine;
 		return out;
 	}
 
@@ -522,6 +555,11 @@ export class GameClient<TInput = unknown> {
 		const from = zone.zoneId;
 		const to = message.targetZone;
 		this.#emitter.emit('handoff', { from, to, message });
+		const last = this.#lastControlled;
+		if (last !== undefined && last.zoneId === from) {
+			this.#handoffBridge = { ...last, stale: false };
+			this.#handedOff = { zoneId: from, id: last.id };
+		}
 		this.#controlledOverride = undefined;
 		this.#predictor?.bind(undefined);
 		// Keep rendering the old zone until the new authority has content.
@@ -552,6 +590,7 @@ export class GameClient<TInput = unknown> {
 			finish();
 			if (this.#closed || this.#authority !== target) return;
 			this.#emitter.emit('handoffFailed', { from, to, stage, reason });
+			this.#handoffBridge = undefined;
 			connection.close({ leave: false });
 			// Keep the zone's replica rendering while the next attempt runs.
 			this.#retire(target, true);
