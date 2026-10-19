@@ -1,7 +1,7 @@
 //! A minimal zone surface for `distributed game-manifest` tests.
 
 use distributed_game::{
-    predict, schema, Ctx, EntitySchema, GameEvent, GameInput, GameRecord, GameSurface, PlayerId,
+    game_pure, predict, schema, Ctx, EntitySchema, GameEvent, GameInput, GameRecord, GameSurface, PlayerId,
     Replicated, WorldView, Zone,
 };
 
@@ -44,6 +44,18 @@ pub fn orb_step(state: &OrbState, input: &Steer, _context: &(), dt: f32) -> OrbS
     }
 }
 
+/// A pure function compiled into the same module (`dg_pure_orb_radius`).
+#[game_pure(OrbRadiusFn)]
+pub fn orb_radius(state: &OrbState) -> f32 {
+    (state.x * state.x).sqrt()
+}
+
+/// Static data the client gets as a generated constant.
+#[derive(Clone, Copy, GameRecord)]
+pub struct OrbLimits {
+    pub limit: f32,
+}
+
 pub struct Orbs;
 
 impl Zone for Orbs {
@@ -75,4 +87,6 @@ pub fn game_surface() -> GameSurface {
     GameSurface::for_zone::<Orbs>("orbs")
         .events::<OrbEvent>()
         .predict::<OrbStep>()
+        .pure::<OrbRadiusFn>()
+        .constant("orb_limits", &OrbLimits { limit: 32.0 })
 }

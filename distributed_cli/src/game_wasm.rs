@@ -1,14 +1,15 @@
 //! `distributed game-wasm`: compile a zone's client-predicted step
-//! (`#[predict]`, recorded in its `GameSurface`) to WebAssembly next to the
-//! generated client.
+//! (`#[predict]`) and pure functions (`#[game_pure]`), recorded in its
+//! `GameSurface`, to one WebAssembly module next to the generated client.
 //!
-//! The surface names the Cargo package that declares the step. The command
+//! The surface names the Cargo package that declares them. The command
 //! builds that package's library as a `cdylib` for `wasm32-unknown-unknown`
-//! (`cargo rustc --release`), checks the module speaks the prediction ABI
-//! (no imports; exports `memory`, `dg_predict_buffer`, `dg_predict_abi`
-//! and `dg_predict_<step>`) and writes it to `<out>/wasm/<surface>.wasm`,
-//! which the generated `predict.ts` loads. No wasm-bindgen glue, no JSON:
-//! the SDK instantiates the module directly.
+//! (`cargo rustc --release`), checks the module speaks the ABI (no imports;
+//! exports `memory`, `dg_predict_buffer`, `dg_predict_abi`, the step's
+//! `dg_predict_<step>` and every `dg_pure_<fn>`) and writes it to
+//! `<out>/wasm/<surface>.wasm`, which the generated `predict.ts` and
+//! `pures.ts` load. No wasm-bindgen glue, no JSON: the SDK instantiates the
+//! module directly.
 //!
 //! A stamp next to the module (`<surface>.stamp.json`) records the source
 //! fingerprint of the package and its local dependencies (the same one the
@@ -24,11 +25,11 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::game_client::{predict_wasm_path, surface_prediction};
+use crate::game_client::{predict_wasm_path, surface_module};
 use crate::wasm_pures::{cargo_metadata, ensure_real_directory_path, package_source_identity};
 
 const TARGET: &str = "wasm32-unknown-unknown";
-const STAMP_VERSION: u32 = 1;
+const STAMP_VERSION: u32 = 2;
 const MAX_MODULE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What to build.
@@ -48,7 +49,7 @@ pub(crate) struct GameWasmOptions<'a> {
 struct Stamp {
     version: u32,
     package: String,
-    export: String,
+    exports: Vec<String>,
     abi: u32,
     source_identity: String,
     compiler_identity: String,
@@ -67,29 +68,28 @@ pub(crate) enum GameWasmOutcome {
 pub(crate) fn run_game_wasm(
     options: &GameWasmOptions<'_>,
 ) -> Result<GameWasmOutcome, Box<dyn Error>> {
-    let (surface, predict) = surface_prediction(options.surface)?;
-    let predict = predict.ok_or_else(|| {
+    let (surface, plan) = surface_module(options.surface)?;
+    let plan = plan.ok_or_else(|| {
         format!(
-            "game surface `{surface}` declares no predicted step; add `.predict::<Step>()` (a `#[predict]` fn) to its GameSurface"
+            "game surface `{surface}` declares nothing to compile; add `.predict::<Step>()` (a `#[predict]` fn) or `.pure::<Fn>()` (a `#[game_pure]` fn) to its GameSurface"
         )
     })?;
     let metadata = cargo_metadata(options.cargo_manifest)?;
     let mut candidates = metadata
         .packages
         .iter()
-        .filter(|p| p.name == predict.package && p.source.is_none());
+        .filter(|p| p.name == plan.package && p.source.is_none());
     let package = candidates.next().ok_or_else(|| {
         format!(
-            "predicted step `{}` is declared by Cargo package `{}`, which is not a local package of {}",
-            predict.export,
-            predict.package,
+            "the WebAssembly functions of game surface `{surface}` are declared by Cargo package `{}`, which is not a local package of {}",
+            plan.package,
             options.cargo_manifest.display()
         )
     })?;
     if candidates.next().is_some() {
         return Err(format!(
             "more than one local Cargo package is named `{}`",
-            predict.package
+            plan.package
         )
         .into());
     }
@@ -109,9 +109,9 @@ pub(crate) fn run_game_wasm(
     let stamp_path = module_path.with_extension("stamp.json");
     let mut expected = Stamp {
         version: STAMP_VERSION,
-        package: predict.package.clone(),
-        export: predict.export.clone(),
-        abi: predict.abi,
+        package: plan.package.clone(),
+        exports: plan.exports.clone(),
+        abi: plan.abi,
         source_identity: package_source_identity(&metadata, &package.id)?,
         compiler_identity: compiler_identity()?,
         module_sha256: String::new(),
@@ -121,15 +121,16 @@ pub(crate) fn run_game_wasm(
     }
     if options.check {
         return Err(format!(
-            "compiled step {} is missing or stale; run `distributed game-wasm` without --check",
+            "compiled module {} is missing or stale; run `distributed game-wasm` without --check",
             module_path.display()
         )
         .into());
     }
 
     eprintln!(
-        "distributed: compiling predicted step `{}` (Cargo package {}) to WebAssembly",
-        predict.export, predict.package
+        "distributed: compiling {} (Cargo package {}) to WebAssembly",
+        plan.exports.join(", "),
+        plan.package
     );
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .arg("rustc")
@@ -137,7 +138,7 @@ pub(crate) fn run_game_wasm(
         .arg(options.cargo_manifest)
         .args([
             "-p",
-            &predict.package,
+            &plan.package,
             "--lib",
             "--release",
             "--target",
@@ -147,11 +148,11 @@ pub(crate) fn run_game_wasm(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit())
         .status()
-        .map_err(|error| format!("failed to run cargo for the predicted step: {error}"))?;
+        .map_err(|error| format!("failed to run cargo for the WebAssembly module: {error}"))?;
     if !status.success() {
         return Err(format!(
-            "compiling predicted step `{}` for {TARGET} failed ({status}); is the target installed (`rustup target add {TARGET}`)?",
-            predict.export
+            "compiling Cargo package `{}` for {TARGET} failed ({status}); is the target installed (`rustup target add {TARGET}`)?",
+            plan.package
         )
         .into());
     }
@@ -171,7 +172,7 @@ pub(crate) fn run_game_wasm(
         .into());
     }
     let module = fs::read(&artifact)?;
-    check_module(&module, &predict.export)
+    check_module(&module, &plan.exports)
         .map_err(|error| format!("{}: {error}", artifact.display()))?;
     expected.module_sha256 = format!("{:x}", Sha256::digest(&module));
 
@@ -221,8 +222,9 @@ fn compiler_identity() -> Result<String, Box<dyn Error>> {
     Ok(format!("sha256:{:x}", Sha256::digest(&output.stdout)))
 }
 
-/// The module imports nothing and exports the prediction ABI.
-pub(crate) fn check_module(module: &[u8], export: &str) -> Result<(), String> {
+/// The module imports nothing and exports the ABI plus every function in
+/// `functions` (`dg_predict_<step>`, `dg_pure_<fn>`).
+pub(crate) fn check_module(module: &[u8], functions: &[String]) -> Result<(), String> {
     let sections = wasm_sections(module)?;
     let mut exports = Vec::new();
     for (id, body) in sections {
@@ -230,7 +232,7 @@ pub(crate) fn check_module(module: &[u8], export: &str) -> Result<(), String> {
             2 => {
                 let mut r = WasmReader::new(body);
                 if r.u32()? != 0 {
-                    return Err("the module imports functions or memory; a predicted step must be self-contained (no wasm-bindgen, no host calls)".into());
+                    return Err("the module imports functions or memory; compiled game functions must be self-contained (no wasm-bindgen, no host calls)".into());
                 }
             }
             7 => {
@@ -245,16 +247,17 @@ pub(crate) fn check_module(module: &[u8], export: &str) -> Result<(), String> {
             _ => {}
         }
     }
-    let step = format!("dg_predict_{export}");
-    for (name, kind) in [
+    let required = [
         ("memory", 2u8),
         ("dg_predict_buffer", 0),
         ("dg_predict_abi", 0),
-        (step.as_str(), 0),
-    ] {
+    ]
+    .into_iter()
+    .chain(functions.iter().map(|f| (f.as_str(), 0)));
+    for (name, kind) in required {
         if !exports.iter().any(|(n, k)| n == name && *k == kind) {
             return Err(format!(
-                "the module does not export `{name}` (is the step declared with `#[predict]` in this package?)"
+                "the module does not export `{name}` (is it declared with `#[predict]` / `#[game_pure]` in this package?)"
             ));
         }
     }
@@ -365,20 +368,34 @@ mod tests {
         ("dg_predict_arena_step", 0),
     ];
 
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
     #[test]
     fn accepts_a_self_contained_module_with_the_abi() {
-        check_module(&module(0, &ABI), "arena_step").unwrap();
+        check_module(&module(0, &ABI), &names(&["dg_predict_arena_step"])).unwrap();
+        let mut with_pure = ABI.to_vec();
+        with_pure.push(("dg_pure_grid_cell", 0));
+        check_module(
+            &module(0, &with_pure),
+            &names(&["dg_predict_arena_step", "dg_pure_grid_cell"]),
+        )
+        .unwrap();
     }
 
     #[test]
     fn rejects_imports_missing_exports_and_garbage() {
-        let error = check_module(&module(1, &ABI), "arena_step").unwrap_err();
+        let step = names(&["dg_predict_arena_step"]);
+        let error = check_module(&module(1, &ABI), &step).unwrap_err();
         assert!(error.contains("imports"), "{error}");
-        let error = check_module(&module(0, &ABI), "grid_step").unwrap_err();
+        let error = check_module(&module(0, &ABI), &names(&["dg_predict_grid_step"])).unwrap_err();
         assert!(error.contains("dg_predict_grid_step"), "{error}");
-        assert!(check_module(b"nope", "x").is_err());
+        let error = check_module(&module(0, &ABI), &names(&["dg_pure_grid_cell"])).unwrap_err();
+        assert!(error.contains("dg_pure_grid_cell"), "{error}");
+        assert!(check_module(b"nope", &step).is_err());
         let mut truncated = module(0, &ABI);
         truncated.truncate(truncated.len() - 3);
-        assert!(check_module(&truncated, "arena_step").is_err());
+        assert!(check_module(&truncated, &step).is_err());
     }
 }

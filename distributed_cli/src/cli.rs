@@ -75,7 +75,7 @@ pub enum DistributedCommands {
     GameManifest(GameManifestArgs),
     /// Generate typed TypeScript for a distributed_game zone from its GameSurface
     GameClient(GameClientArgs),
-    /// Compile a distributed_game zone's `#[predict]` step to WebAssembly for its generated client
+    /// Compile a distributed_game zone's `#[predict]` step and `#[game_pure]` functions to WebAssembly for its generated client
     GameWasm(GameWasmArgs),
     /// Render schema artifacts (SQL or an Atlas Operator resource) from a read-model catalog
     Schema(SchemaArgs),
@@ -132,7 +132,7 @@ pub enum ServiceCommands {
     GameManifest(GameManifestArgs),
     /// Generate typed TypeScript for a distributed_game zone from its GameSurface
     GameClient(GameClientArgs),
-    /// Compile a distributed_game zone's `#[predict]` step to WebAssembly for its generated client
+    /// Compile a distributed_game zone's `#[predict]` step and `#[game_pure]` functions to WebAssembly for its generated client
     GameWasm(GameWasmArgs),
     /// Render schema artifacts (SQL or an Atlas Operator resource) from a read-model catalog
     Schema(SchemaArgs),
@@ -494,7 +494,7 @@ pub struct GameClientArgs {
 
 #[derive(Args, Debug)]
 pub struct GameWasmArgs {
-    /// GameSurface JSON (from `distributed game-manifest`) with a predicted step.
+    /// GameSurface JSON (from `distributed game-manifest`) with a predicted step or pure functions.
     #[arg(long)]
     pub manifest: PathBuf,
     /// Generated client directory; the module is written to `<out>/wasm/<surface>.wasm`.
@@ -2453,10 +2453,10 @@ fn run_game_wasm(args: &GameWasmArgs) -> Result<(), Box<dyn Error>> {
     .map_err(|error| format!("{}: {error}", args.manifest.display()))?;
     match outcome {
         crate::game_wasm::GameWasmOutcome::Current(path) => {
-            println!("Predicted step {} is current", path.display())
+            println!("Compiled game module {} is current", path.display())
         }
         crate::game_wasm::GameWasmOutcome::Built(path) => {
-            println!("Compiled predicted step to {}", path.display())
+            println!("Compiled game module to {}", path.display())
         }
     }
     Ok(())

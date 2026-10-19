@@ -28,6 +28,10 @@
 //!   predicted step once in Rust; `distributed game-wasm` compiles it to
 //!   WebAssembly (binary ABI, no JSON) and the generated client predicts
 //!   with it.
+//! - Shared client logic and data ([`pure`], [`GameSurface::constant`](surface::GameSurface::constant)):
+//!   `#[game_pure]` compiles any other pure function (procedural content,
+//!   …) into the same module with a typed generated wrapper; constants and
+//!   standalone records are emitted as generated TypeScript data / codecs.
 //!
 //! Physics is out of scope: games bring their own and run it in `on_tick`.
 //!
@@ -63,6 +67,7 @@ pub mod metrics;
 pub mod net;
 pub mod prediction;
 pub mod protocol;
+pub mod pure;
 pub mod replay;
 pub mod replication;
 pub mod rewind;
@@ -80,7 +85,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use codec::{Wire, WireType};
 /// Authoring derives (see the crate docs and README).
 pub use distributed_game_macros::{
-    predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated,
+    game_pure, predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated,
 };
 #[cfg(feature = "runtime")]
 pub use facts::spawn_fact_worker;
@@ -95,6 +100,7 @@ pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, Sequenced
 pub use interest::{InterestConfig, View};
 pub use prediction::{PredictContext, PredictStep};
 pub use protocol::{ClientMessage, ClientMirror, Role, ServerMessage, PROTOCOL_VERSION};
+pub use pure::GamePure;
 pub use replay::{replay, Recorder, Recording};
 pub use replication::{EntityState, WorldView};
 pub use rewind::{Historic, HitQuery, Rewind, RewindConfig, RewindFrame, ShotTiming};
@@ -120,6 +126,8 @@ pub mod __private {
     #[cfg(target_arch = "wasm32")]
     pub use crate::prediction::wasm_export;
     pub use crate::protocol::wire::{DecodeError, Reader, Writer};
+    #[cfg(target_arch = "wasm32")]
+    pub use crate::pure::wasm_export as pure_wasm_export;
     pub use crate::schema::{Correction, FieldType, FieldValue, KindDef};
     pub use crate::surface::{
         EventPayload, EventSurface, InputSurface, PayloadField, RecordSurface,
