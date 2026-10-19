@@ -90,6 +90,12 @@ pub(crate) fn run_manifest_harness(
         .join(&package.name);
     let harness_dir = harness_root.join(mode.cache_key());
     fs::create_dir_all(harness_dir.join("src"))?;
+    // One harness directory serves every entrypoint of this package and mode:
+    // hold it from writing `main.rs` until its output is read, or a concurrent
+    // run (a dev-server watcher next to a manual regenerate) swaps entrypoints
+    // under us and both print the last writer's export.
+    let lock = fs::File::create(harness_root.join(format!("{}.lock", mode.cache_key())))?;
+    fs2::FileExt::lock_exclusive(&lock)?;
     fs::write(
         harness_dir.join("Cargo.toml"),
         harness_cargo_toml(
