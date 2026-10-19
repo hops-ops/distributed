@@ -1,4 +1,9 @@
 {
+  "constants": {
+    "sample_board": "07020103416461ffffffffffffff0f0207426f6220e29c930300ac02787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878",
+    "sample_gusts": "02cdcccc3d000020c0",
+    "sample_spot": "1504646f636b"
+  },
   "events": [
     {
       "hex": "e90700006041ff07",
@@ -102,7 +107,72 @@
       "viewTick": 123456
     }
   },
+  "pures": [
+    {
+      "arg": "0000c03fffff03",
+      "export": "sample_mirror",
+      "output": "0000c0bf00"
+    },
+    {
+      "arg": "",
+      "export": "sample_rows",
+      "output": "020103416461ffffffffffffff0f0207426f6220e29c9303"
+    }
+  ],
   "surface": {
+    "codecs": [
+      "SampleWind"
+    ],
+    "constants": [
+      {
+        "name": "sample_board",
+        "type": {
+          "name": "Board",
+          "type": "record"
+        },
+        "value": {
+          "kills": [
+            {
+              "name": "Ada",
+              "rank": 1,
+              "score": 9007199254740991
+            },
+            {
+              "name": "Bob ✓",
+              "rank": 2,
+              "score": 3
+            }
+          ],
+          "motd": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "note": null,
+          "version": 7
+        }
+      },
+      {
+        "name": "sample_gusts",
+        "type": {
+          "item": {
+            "type": "f32"
+          },
+          "type": "list"
+        },
+        "value": [
+          0.10000000149011612,
+          -2.5
+        ]
+      },
+      {
+        "name": "sample_spot",
+        "type": {
+          "name": "Spot",
+          "type": "record"
+        },
+        "value": {
+          "at": 1.313783049583435,
+          "label": "dock"
+        }
+      }
+    ],
     "events": [
       {
         "id": 1,
@@ -487,6 +557,33 @@
       "state": "SampleState"
     },
     "protocolVersion": 1,
+    "pures": [
+      {
+        "abi": 1,
+        "arg": {
+          "name": "SampleWind",
+          "type": "record"
+        },
+        "export": "sample_mirror",
+        "output": {
+          "name": "SampleWind",
+          "type": "record"
+        },
+        "package": "distributed_game"
+      },
+      {
+        "abi": 1,
+        "export": "sample_rows",
+        "output": {
+          "item": {
+            "name": "Row",
+            "type": "record"
+          },
+          "type": "list"
+        },
+        "package": "distributed_game"
+      }
+    ],
     "records": [
       {
         "fields": [
@@ -592,8 +689,28 @@
           }
         ],
         "name": "SampleWind"
+      },
+      {
+        "fields": [
+          {
+            "name": "at",
+            "type": {
+              "bits": 10,
+              "max": 64.0,
+              "min": 0.0,
+              "type": "quant"
+            }
+          },
+          {
+            "name": "label",
+            "type": {
+              "type": "short_str"
+            }
+          }
+        ],
+        "name": "Spot"
       }
     ],
-    "schemaVersion": 2
+    "schemaVersion": 3
   }
 }

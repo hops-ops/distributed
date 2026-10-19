@@ -301,6 +301,85 @@ pub fn from_bytes<T: Wire>(bytes: &[u8]) -> Result<T, DecodeError> {
     Ok(value)
 }
 
+/// A value as the JSON a client decodes from its encoding: records are
+/// objects keyed by Rust field name, lists arrays, `None` `null`, `bytes`
+/// arrays of numbers, and every float the exact binary32 / binary64 value
+/// the decoder yields (quantized fields after quantization). Built by
+/// encoding the value and decoding it against its wire type, so it is the
+/// codec's view by construction
+/// ([`GameSurface::constant`](crate::GameSurface::constant)).
+pub fn to_json_value<T: Wire>(value: &T) -> Result<serde_json::Value, DecodeError> {
+    let mut records = Vec::new();
+    T::records(&mut records);
+    let bytes = to_bytes(value);
+    let mut r = Reader::new(&bytes);
+    let json = decode_json(&T::wire_type(), &records, &mut r)?;
+    r.finish()?;
+    Ok(json)
+}
+
+/// Decode one value of type `ty` (records looked up in `records`) as JSON;
+/// see [`to_json_value`]. Non-finite floats are rejected.
+pub fn decode_json(
+    ty: &WireType,
+    records: &[RecordSurface],
+    r: &mut Reader<'_>,
+) -> Result<serde_json::Value, DecodeError> {
+    use serde_json::{json, Map, Value};
+    let float = |v: f64| {
+        serde_json::Number::from_f64(v)
+            .map(Value::Number)
+            .ok_or(DecodeError::Invalid("non-finite float"))
+    };
+    Ok(match ty {
+        WireType::Bool => json!(r.bool()?),
+        WireType::U8 => json!(r.u8()?),
+        WireType::I8 => json!(r.u8()? as i8),
+        WireType::U16 => json!(u16::decode(r)?),
+        WireType::I16 => json!(i16::decode(r)?),
+        WireType::U32 => json!(r.varuint()?),
+        WireType::I32 => json!(r.varint()?),
+        WireType::U64 => json!(r.varuint64()?),
+        WireType::F32 => float(f64::from(r.f32()?))?,
+        WireType::F64 => float(r.f64()?)?,
+        WireType::Quant { .. } | WireType::Angle { .. } => {
+            let field = ty.field_type().expect("float field type");
+            float(f64::from(special::decode_f32(r, field)?))?
+        }
+        WireType::ShortStr => json!(r.short_string()?),
+        WireType::Str => json!(r.string()?),
+        WireType::Bytes => json!(r.bytes()?),
+        WireType::List { item } => {
+            let count = r.varuint()? as usize;
+            // As `Vec<T>::decode`: every item takes at least one byte.
+            if count > r.remaining() {
+                return Err(DecodeError::UnexpectedEof);
+            }
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                out.push(decode_json(item, records, r)?);
+            }
+            Value::Array(out)
+        }
+        WireType::Optional { item } => match r.u8()? {
+            0 => Value::Null,
+            1 => decode_json(item, records, r)?,
+            _ => return Err(DecodeError::Invalid("option tag must be 0 or 1")),
+        },
+        WireType::Record { name } => {
+            let record = records
+                .iter()
+                .find(|record| &record.name == name)
+                .ok_or(DecodeError::Invalid("unknown record"))?;
+            let mut out = Map::new();
+            for field in &record.fields {
+                out.insert(field.name.clone(), decode_json(&field.ty, records, r)?);
+            }
+            Value::Object(out)
+        }
+    })
+}
+
 /// A Rust type usable as a replicated entity field (`#[derive(Replicated)]`).
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be a replicated entity field",

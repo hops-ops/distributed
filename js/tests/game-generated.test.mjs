@@ -10,7 +10,7 @@ import { cpSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { after, before, test } from 'node:test';
 
-import { fromHex, toHex } from '@hops-ops/distributed/game';
+import { decodeValue, fromHex, toHex } from '@hops-ops/distributed/game';
 
 import { predictModuleBytes } from './fixtures/predict-module.mjs';
 
@@ -28,6 +28,18 @@ before(async () => {
 	gen = await import(pathToFileURL(`${dir}/index.ts`).href);
 });
 after(() => rmSync(dir, { recursive: true, force: true }));
+
+const ROW = { type: 'record', fields: [['rank', { type: 'u16' }], ['name', { type: 'short_str' }], ['score', { type: 'u64' }]] };
+
+/** A surface wire type as the SDK codec takes it (records resolved, camelCase fields). */
+function wireType(type) {
+	if (type.type === 'record') {
+		const record = fixture.surface.records.find((r) => r.name === type.name);
+		return { type: 'record', fields: record.fields.map((f) => [camel(f.name), wireType(f.type)]) };
+	}
+	if (type.item !== undefined) return { ...type, item: wireType(type.item) };
+	return type;
+}
 
 const camel = (name) => name.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
 
@@ -141,4 +153,39 @@ test('the predicted step is described and wired in by default', async () => {
 	assert.equal(off.prediction, undefined);
 	assert.equal(off.client.predictor, undefined);
 	off.client.close();
+});
+
+test('constants are the values the codec decodes from the Rust encoding', () => {
+	for (const constant of fixture.surface.constants) {
+		const name = constant.name.toUpperCase();
+		const decoded = decodeValue(wireType(constant.type), fromHex(fixture.constants[constant.name]));
+		assert.deepEqual(gen[name], decoded, constant.name);
+	}
+	assert.equal(gen.SAMPLE_GUSTS[0], Math.fround(0.1));
+	assert.notEqual(gen.SAMPLE_SPOT.at, Math.fround(1.3), 'quantized like a payload');
+});
+
+test('standalone record codecs round-trip the Rust encoding', () => {
+	const wind = { speed: 1.5, gusts: 65535 };
+	const hex = fixture.pures.find((p) => p.export === 'sample_mirror').arg;
+	assert.equal(toHex(gen.encodeSampleWind(wind)), hex);
+	assert.deepEqual(gen.decodeSampleWind(fromHex(hex)), wind);
+	assert.throws(() => gen.decodeSampleWind(fromHex(`${hex}00`)));
+});
+
+test('pure functions are wrapped with their types over the compiled module', async () => {
+	assert.deepEqual(gen.PURES, { sampleMirror: { export: 'sample_mirror', abi: 1 }, sampleRows: { export: 'sample_rows', abi: 1 } });
+	assert.ok(gen.PURES_WASM_URL.href.endsWith('/wasm/sample.wasm'));
+	// A stand-in module whose functions echo their argument.
+	const pures = gen.createSamplePures(predictModuleBytes({ pures: ['sample_mirror', 'sample_rows'] }));
+	await pures.ready;
+	const mirror = fixture.pures.find((p) => p.export === 'sample_mirror');
+	// Echo: the result is the argument, decoded with the output type.
+	assert.deepEqual(pures.sampleMirror(gen.decodeSampleWind(fromHex(mirror.arg))), { speed: 1.5, gusts: 65535 });
+	// No argument: the module sees zero bytes; echoed back they are not a
+	// list, and the decode error surfaces from the call.
+	assert.throws(() => pures.sampleRows(), /UNEXPECTED_EOF/);
+	// What the real module returns decodes with the generated types.
+	const rows = fixture.pures.find((p) => p.export === 'sample_rows');
+	assert.deepEqual(decodeValue({ type: 'list', item: ROW }, fromHex(rows.output)), normalize(fixture.events.find((e) => e.name === 'board').value.kills));
 });
