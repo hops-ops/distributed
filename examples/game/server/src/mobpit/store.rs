@@ -9,6 +9,14 @@
 //! [`CrawlerFactSink`] is the game's `FactSink`: optional artificial latency
 //! (the "slow storage" toggle), then `CellFactSink::commit` into the killer's
 //! cell, then a fire-and-forget leaderboard update.
+//!
+//! Each commit also writes the `crawler.mob_killed` domain event into the
+//! cell's outbox (same transaction). With a [`ProjectionBus`] attached
+//! (`--projection-bus`), the sink drains that outbox onto the SQLite bus
+//! after the commit, and a sweep drains every cell at startup and
+//! periodically (a crash between commit and drain, a bus outage). Delivery
+//! is at-least-once with stable message ids; the read-model service's
+//! projector deduplicates. Without a bus the rows wait in the cells.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -16,8 +24,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use distributed::bus::SqliteBus;
 use distributed::cell_host::{AggregateCell, CellSqlitePath, CellStreamStore};
 use distributed::entity::EventRecord;
+use distributed::BusPublisher;
 use distributed::{RepositoryError, StreamIdentity};
 use distributed_game::cell::CellFactSink;
 use distributed_game::{BoxFuture, Fact, FactError, FactReceipt, FactSink};
@@ -36,6 +46,8 @@ const FILE_PREFIX: &str = "Crawler%3A";
 pub struct CrawlerCell {
     cell: Arc<AggregateCell<Crawler>>,
     sink: CellFactSink<Crawler>,
+    /// One drain at a time per cell keeps the published order = commit order.
+    draining: tokio::sync::Mutex<()>,
 }
 
 impl CrawlerCell {
@@ -52,6 +64,70 @@ impl CrawlerCell {
     /// The cell (tests dispatch into it directly).
     pub fn cell(&self) -> &Arc<AggregateCell<Crawler>> {
         &self.cell
+    }
+
+    /// Publish this cell's pending outbox rows (its domain events) to `bus`,
+    /// oldest first; returns how many were published.
+    pub async fn drain_to(&self, bus: &ProjectionBus) -> Result<usize, String> {
+        let _turn = self.draining.lock().await;
+        let mut published = 0;
+        loop {
+            let outcome = self
+                .cell
+                .drain_outbox_with(
+                    bus.publisher.clone(),
+                    Duration::from_secs(30),
+                    DRAIN_MAX_ATTEMPTS,
+                    DRAIN_BATCH,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            published += outcome.published;
+            if outcome.released > 0 || outcome.failed > 0 {
+                return Err(format!(
+                    "projection bus publish failed ({} released, {} failed)",
+                    outcome.released, outcome.failed
+                ));
+            }
+            if outcome.claimed < DRAIN_BATCH {
+                return Ok(published);
+            }
+        }
+    }
+}
+
+const DRAIN_BATCH: usize = 32;
+/// Rows are retried by later drains rather than dropped.
+const DRAIN_MAX_ATTEMPTS: u32 = 10_000;
+
+/// The SQLite bus Crawler domain events are published to (consumed by
+/// `mobpit-service`'s projector).
+#[derive(Clone)]
+pub struct ProjectionBus {
+    publisher: BusPublisher<SqliteBus>,
+}
+
+impl ProjectionBus {
+    /// Open (creating) the bus at a `sqlite:` URL shared with the service.
+    pub async fn open(url: &str) -> Result<Self, String> {
+        use std::str::FromStr;
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(url)
+            .map_err(|e| format!("projection bus {url}: {e}"))?
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(10));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .map_err(|e| format!("projection bus {url}: {e}"))?;
+        let bus = SqliteBus::new(pool);
+        bus.ensure_tables()
+            .await
+            .map_err(|e| format!("projection bus tables: {e}"))?;
+        Ok(Self {
+            publisher: BusPublisher::new(Arc::new(bus)),
+        })
     }
 }
 
@@ -88,6 +164,7 @@ impl CrawlerCells {
         let entry = Arc::new(CrawlerCell {
             sink: CellFactSink::new(cell.clone(), SERVICE_ID, SYSTEM_PRINCIPAL),
             cell,
+            draining: tokio::sync::Mutex::new(()),
         });
         open.insert(principal.to_string(), entry.clone());
         Ok(entry)
@@ -118,6 +195,23 @@ impl CrawlerCells {
         out.sort();
         out.dedup();
         out
+    }
+
+    /// Drain every cell on disk to `bus` (startup recovery and the periodic
+    /// sweep). Returns rows published; per-cell errors are reported and
+    /// retried by the next sweep.
+    pub async fn drain_all(&self, bus: &ProjectionBus) -> usize {
+        let mut published = 0;
+        for principal in self.principals() {
+            match self.get(&principal) {
+                Ok(cell) => match cell.drain_to(bus).await {
+                    Ok(n) => published += n,
+                    Err(error) => eprintln!("mobpit: drain {principal}: {error}"),
+                },
+                Err(error) => eprintln!("mobpit: open {principal}: {error}"),
+            }
+        }
+        published
     }
 }
 
@@ -217,15 +311,22 @@ pub struct CrawlerFactSink {
     cells: Arc<CrawlerCells>,
     state: Arc<SinkState>,
     board: Arc<Leaderboards>,
+    projection: Arc<std::sync::OnceLock<ProjectionBus>>,
 }
 
 impl CrawlerFactSink {
     /// Sink over `cells`, reporting into `state`, feeding `board`.
-    pub fn new(cells: Arc<CrawlerCells>, state: Arc<SinkState>, board: Arc<Leaderboards>) -> Self {
+    pub fn new(
+        cells: Arc<CrawlerCells>,
+        state: Arc<SinkState>,
+        board: Arc<Leaderboards>,
+        projection: Arc<std::sync::OnceLock<ProjectionBus>>,
+    ) -> Self {
         Self {
             cells,
             state,
             board,
+            projection,
         }
     }
 
@@ -242,6 +343,16 @@ impl CrawlerFactSink {
             .get(principal)
             .map_err(|e| FactError::Retryable(format!("open cell: {e}")))?;
         let receipt = cell.sink.commit(fact).await?;
+        if let Some(bus) = self.projection.get().cloned() {
+            // Off the settlement path: the zone hears "saved" when the cell
+            // commits; the read model follows from the outbox.
+            let cell = cell.clone();
+            tokio::spawn(async move {
+                if let Err(error) = cell.drain_to(&bus).await {
+                    eprintln!("mobpit: projection drain (retried by the sweep): {error}");
+                }
+            });
+        }
         if fact.command() == RECORD_KILL {
             if let Ok(kill) = serde_json::from_value::<KillReceipt>(receipt.payload.clone()) {
                 // Fire-and-forget: never awaits the leaderboard store.
