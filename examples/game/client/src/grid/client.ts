@@ -13,43 +13,16 @@
  * - per-zone hello info (host, restored-from-hibernation …) and the
  *   `/dev/grid/map` world map.
  */
-import { GameClient, type GameSocketFactory, type RenderedEntity } from '@hops-ops/distributed/game';
+import { fieldNumber, type GameClient, type GameSocketFactory, type RenderedEntity } from '@hops-ops/distributed/game';
 
+import * as grid from '../generated/grid/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
-import { onJsonEvent } from '../shared/events.ts';
-import {
-	cellProps,
-	encodeMoveInput,
-	parseZone,
-	step,
-	zoneId,
-	CELL,
-	DEFAULT_SEED,
-	type Cell,
-	type MoveInput,
-	type Prop
-} from './world.ts';
+import { cellProps, parseZone, step, zoneId, CELL, DEFAULT_SEED, type Cell, type MoveInput, type Prop } from './world.ts';
 
 export const DEFAULT_ZONE = 'grid.0.0';
-/** Event type ids (server `grid::EVENT_*`). */
-export const EVENT_HELLO = 1;
-export const KIND = { walker: 'walker', critter: 'critter', marker: 'marker' } as const;
 
-export type GridHello = Readonly<{
-	zone: string;
-	cell: [number, number];
-	host: string;
-	seed: number;
-	contentVersion: number;
-	cellSize: number;
-	entity: number | null;
-	restored: boolean;
-	restores: number;
-	hibernatedForMs: number | null;
-	restoredCritters: number;
-	restoredMarkers: number;
-	activatedAt: number;
-}>;
+/** A zone's hello (generated from the Rust `GridHello` event). */
+export type GridHello = grid.HelloEvent;
 
 export type MapCell = Readonly<{
 	x: number;
@@ -129,25 +102,21 @@ export function createGridClient(options: GridClientOptions): GridClient {
 		}
 		return list;
 	};
-	const num = (v: unknown) => (typeof v === 'number' ? v : 0);
-	const ease = { mode: 'ease', durationMs: 120 } as const;
-
-	const client = new GameClient<MoveInput>({
+	const typed = grid.createGridClient({
 		url: (zone) => zoneUrl(zone, options.base),
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
 		pingIntervalMs: 1000,
 		inputDtMs: 1000 / 30,
 		prediction: {
-			encodeInput: (input) => encodeMoveInput(input),
 			predict: (fields, input) => {
 				const cell = authorityCell ?? [0, 0];
-				const [x, y] = step(num(fields.x), num(fields.y), input, props(cell));
+				const [x, y] = step(fieldNumber(fields, 'x'), fieldNumber(fields, 'y'), input, props(cell));
 				return { x, y };
-			},
-			corrections: { [KIND.walker]: { x: ease, y: ease, name: { mode: 'replace' }, hue: { mode: 'replace' } } }
+			}
 		}
 	});
+	const { client } = typed;
 
 	let resolveReady: (h: GridHello) => void = () => undefined;
 	const ready = new Promise<GridHello>((resolve) => (resolveReady = resolve));
@@ -174,10 +143,10 @@ export function createGridClient(options: GridClientOptions): GridClient {
 	client.on('handoffComplete', () => {
 		handoffs += 1;
 	});
-	onJsonEvent<GridHello>(client, EVENT_HELLO, (hello, zone) => {
+	typed.on('hello', (hello, zone) => {
 		infos.set(zone, hello);
 		seed = hello.seed;
-		if (hello.entity !== null && zone === client.authority?.zoneId) {
+		if (hello.entity !== undefined && zone === client.authority?.zoneId) {
 			client.setControlledEntity(hello.entity);
 			resolveReady(hello);
 		}
@@ -197,7 +166,8 @@ export function createGridClient(options: GridClientOptions): GridClient {
 		worldOf(entity) {
 			const cell = parseZone(entity.zoneId);
 			if (cell === undefined) return undefined;
-			return { x: cell[0] * CELL + num(entity.fields.x), y: cell[1] * CELL + num(entity.fields.y) };
+			// Every grid kind has local x / y.
+			return { x: cell[0] * CELL + fieldNumber(entity.fields, 'x'), y: cell[1] * CELL + fieldNumber(entity.fields, 'y') };
 		},
 		handoffs: () => handoffs,
 		ready,

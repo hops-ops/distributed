@@ -1,0 +1,287 @@
+{
+  "events": [
+    {
+      "id": 1,
+      "name": "hello",
+      "payload": {
+        "fields": [
+          {
+            "name": "zone",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "cell",
+            "type": {
+              "item": {
+                "type": "i32"
+              },
+              "type": "list"
+            }
+          },
+          {
+            "name": "host",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "seed",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "content_version",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "cell_size",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "entity",
+            "type": {
+              "item": {
+                "type": "u32"
+              },
+              "type": "optional"
+            }
+          },
+          {
+            "name": "restored",
+            "type": {
+              "type": "bool"
+            }
+          },
+          {
+            "name": "restores",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "hibernated_for_ms",
+            "type": {
+              "item": {
+                "type": "u64"
+              },
+              "type": "optional"
+            }
+          },
+          {
+            "name": "restored_critters",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "restored_markers",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "activated_at",
+            "type": {
+              "type": "u64"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    }
+  ],
+  "input": {
+    "fields": [
+      {
+        "name": "mx",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "name": "my",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "buttons": [
+          "sprint",
+          "mark"
+        ],
+        "name": "buttons",
+        "type": {
+          "type": "u8"
+        }
+      }
+    ],
+    "name": "MoveInput"
+  },
+  "kinds": [
+    {
+      "fields": [
+        {
+          "correction": {
+            "durationMs": 120,
+            "mode": "ease"
+          },
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "durationMs": 120,
+            "mode": "ease"
+          },
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "name",
+          "priority": 0.2,
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "hue",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "id": 1,
+      "name": "walker",
+      "priority": 2.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "yaw",
+          "priority": 1.0,
+          "type": {
+            "bits": 8,
+            "type": "angle"
+          }
+        },
+        {
+          "correction": null,
+          "name": "hue",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "id": 2,
+      "name": "critter",
+      "priority": 1.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "label",
+          "priority": 1.0,
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "correction": null,
+          "name": "hue",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "id": 3,
+      "name": "marker",
+      "priority": 1.0
+    }
+  ],
+  "name": "grid",
+  "protocolVersion": 1,
+  "records": [],
+  "schemaVersion": 1
+}

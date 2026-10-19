@@ -9,9 +9,15 @@
  * `tests/grid-world-parity.test.mjs` replays the Rust-written fixture
  * `examples/game/fixtures/grid-world.json`.
  *
- * No imports except the SDK quantizers so Node can run it directly.
+ * The input type, its sanitize, the button bits and the wire quantization
+ * of positions come from the client generated from the Rust surface
+ * (`../generated/grid`).
  */
 import { dequantizeLinear, quantizeLinear } from '@hops-ops/distributed/game';
+
+import { BUTTON, FIELD_TYPES, sanitizeInput, type MoveInput } from '../generated/grid/index.ts';
+
+export type { MoveInput } from '../generated/grid/index.ts';
 
 const f = Math.fround;
 
@@ -28,10 +34,10 @@ export const WALK_SPEED = 6;
 export const SPRINT_SPEED = 10;
 export const DT = f(1 / 30);
 export const OUTSIDE_LIMIT = 2;
-export const BUTTON_SPRINT = 1;
-export const BUTTON_MARK = 2;
+export const BUTTON_SPRINT = BUTTON.sprint;
+export const BUTTON_MARK = BUTTON.mark;
 /** Wire quantization of local positions (server `grid::world::POS`). */
-export const POS = { min: -8, max: 40, bits: 18 } as const;
+export const POS = FIELD_TYPES.walker.x;
 
 export const BIOMES = ['highlands', 'steppe', 'forest', 'meadow'] as const;
 const PROP_DENSITY = [0.4375, 0.1875, 0.75, 0.3125];
@@ -164,19 +170,6 @@ export function cellProps(seed: number, cell: Cell): Prop[] {
 	return props;
 }
 
-/** One command frame: stick per axis in [-127, 127] and button bits. */
-export type MoveInput = Readonly<{ mx: number; my: number; buttons: number }>;
-
-export function encodeMoveInput(input: MoveInput): Uint8Array {
-	return new Uint8Array([input.mx & 0xff, input.my & 0xff, input.buttons & 0xff]);
-}
-
-/** The server's sanitization: -128 → -127, unknown buttons cleared. */
-export function sanitizeMoveInput(input: MoveInput): MoveInput {
-	const axis = (v: number) => Math.max(-127, Math.min(127, Math.trunc(v)));
-	return { mx: axis(input.mx), my: axis(input.my), buttons: input.buttons & (BUTTON_SPRINT | BUTTON_MARK) };
-}
-
 export function snap(v: number): number {
 	return dequantizeLinear(quantizeLinear(v, POS.min, POS.max, POS.bits), POS.min, POS.max, POS.bits);
 }
@@ -202,7 +195,7 @@ export function collide(x0: number, y0: number, radius: number, props: readonly 
 
 /** Advance a walker one command frame inside its cell (see the Rust docs). */
 export function step(x: number, y: number, raw: MoveInput, props: readonly Prop[]): [number, number] {
-	const input = sanitizeMoveInput(raw);
+	const input = sanitizeInput(raw);
 	let dx = f(input.mx / 127);
 	let dy = f(input.my / 127);
 	const l2 = f(f(dx * dx) + f(dy * dy));

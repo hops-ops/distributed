@@ -22,7 +22,7 @@
 //! is a multiple of 8 m is a free path ("trail"), and props never reach
 //! across a cell border.
 
-use distributed_game::{FieldType, FieldValue};
+use distributed_game::{FieldType, FieldValue, GameInput};
 
 /// Cell edge length (m).
 pub const CELL: f32 = 32.0;
@@ -52,9 +52,9 @@ pub const DT: f32 = 1.0 / 30.0;
 /// How far outside its cell a walker may be before it is clamped (m).
 pub const OUTSIDE_LIMIT: f32 = 2.0;
 /// Input bit: sprint.
-pub const BUTTON_SPRINT: u8 = 1;
+pub const BUTTON_SPRINT: u8 = MoveInput::SPRINT;
 /// Input bit: drop a marker.
-pub const BUTTON_MARK: u8 = 2;
+pub const BUTTON_MARK: u8 = MoveInput::MARK;
 /// Wire type of local positions (covers the walker's slack outside the cell).
 pub const POS: FieldType = FieldType::QuantF32 {
     min: -8.0,
@@ -243,33 +243,19 @@ pub fn cell_props(seed: u32, cell: (i32, i32)) -> Vec<Prop> {
 }
 
 /// One command frame: stick per axis in `[-127, 127]` and button bits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Wire payload `[mx, my, buttons]`; `GameInput::from_payload` clamps `-128`
+/// to `-127` and clears unknown buttons (the client's encoder is generated).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameInput)]
 pub struct MoveInput {
     /// Stick x (+east).
+    #[range(min = -127, max = 127)]
     pub mx: i8,
     /// Stick y (+north).
+    #[range(min = -127, max = 127)]
     pub my: i8,
-    /// [`BUTTON_SPRINT`] | [`BUTTON_MARK`].
+    /// [`MoveInput::SPRINT`] | [`MoveInput::MARK`].
+    #[buttons(sprint, mark)]
     pub buttons: u8,
-}
-
-impl MoveInput {
-    /// Wire payload `[mx, my, buttons]`.
-    pub fn encode(self) -> [u8; 3] {
-        [self.mx as u8, self.my as u8, self.buttons]
-    }
-
-    /// Parse and sanitize (`-128` → `-127`, unknown buttons cleared).
-    pub fn decode(payload: &[u8]) -> Option<Self> {
-        let [mx, my, buttons] = payload else {
-            return None;
-        };
-        Some(Self {
-            mx: (*mx as i8).max(-127),
-            my: (*my as i8).max(-127),
-            buttons: buttons & (BUTTON_SPRINT | BUTTON_MARK),
-        })
-    }
 }
 
 /// Snap to the wire quantization so the server holds exactly what clients decode.

@@ -32,6 +32,10 @@
 //! | 2 `critter` | 1.. | x y yaw hue | wander, persisted on hibernation |
 //! | 3 `marker` | 500.. | x y label hue | dropped with E, persisted |
 //!
+//! The kinds are `#[derive(Replicated)]` views, the hello a struct-form
+//! `#[derive(GameEvent)]` ([`GridHello`]); the browser client is generated
+//! from [`game_surface`].
+//!
 //! Every entity is global within its zone (a cell is small); interest
 //! between zones is the client's choice of observed neighbours.
 
@@ -45,23 +49,76 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use distributed_game::net::{GameServer, ServerConfig};
 use distributed_game::world::{FlatTopology, HashRing, HostAddr, ZoneDirectory};
 use distributed_game::{
-    ConsumePolicy, Ctx, EntitySchema, EntityState, FieldType, FieldValue, KindDef, LeaveReason,
-    ObserverId, PlayerId, WorldView, Zone,
+    schema, ConsumePolicy, Ctx, EntitySchema, GameEvent, GameInput, GameSurface, LeaveReason,
+    ObserverId, PlayerId, Replicated, WorldView, Zone,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::cluster::{ClusterDemo, ClusterOptions, World};
-use crate::common::{send_json_event, Demo, Guests};
+use crate::common::{Demo, Guests};
 use world::{MoveInput, Prop, CELL, POS};
 
-/// Walker kind.
-pub const KIND_WALKER: u16 = 1;
-/// Critter kind.
-pub const KIND_CRITTER: u16 = 2;
-/// Marker kind.
-pub const KIND_MARKER: u16 = 3;
-/// Event type (JSON) sent to every joining player and observer, see [`GridHello`].
-pub const EVENT_HELLO: u32 = 1;
+/// A walker (a player), in cell-local coordinates.
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "walker", id = 1, priority = 2.0, global)]
+pub struct WalkerView {
+    /// Local x.
+    #[field_type(POS)]
+    #[correct(ease = 120)]
+    pub x: f32,
+    /// Local y.
+    #[field_type(POS)]
+    #[correct(ease = 120)]
+    pub y: f32,
+    /// Display name.
+    #[priority(0.2)]
+    #[correct(replace)]
+    pub name: String,
+    /// Colour.
+    #[correct(replace)]
+    pub hue: u8,
+}
+
+/// A wandering critter (persisted on hibernation).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "critter", id = 2, global)]
+pub struct CritterView {
+    /// Local x.
+    #[field_type(POS)]
+    pub x: f32,
+    /// Local y.
+    #[field_type(POS)]
+    pub y: f32,
+    /// Heading.
+    #[angle(bits = 8)]
+    pub yaw: f32,
+    /// Colour.
+    pub hue: u8,
+}
+
+/// A dropped marker (persisted on hibernation).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "marker", id = 3, global)]
+pub struct MarkerView {
+    /// Local x.
+    #[field_type(POS)]
+    pub x: f32,
+    /// Local y.
+    #[field_type(POS)]
+    pub y: f32,
+    /// Who dropped it.
+    pub label: String,
+    /// Colour.
+    pub hue: u8,
+}
+
+/// Type id of [`GridHello`].
+pub const EVENT_HELLO: u32 = GridHello::EVENT_ID;
+
+/// The grid's client surface.
+pub fn game_surface() -> GameSurface {
+    GameSurface::for_zone::<GridZone>("grid").events::<GridHello>()
+}
 /// Most markers a cell keeps (oldest dropped first).
 pub const MAX_MARKERS: usize = 12;
 /// Most command frames a walker may bank.
@@ -70,14 +127,14 @@ const CRITTER_SPEED: f32 = 1.6;
 const CRITTER_RADIUS: f32 = 0.3;
 const MARK_COOLDOWN: u8 = 15;
 
-/// What a zone tells each player / observer on arrival (JSON, camelCase).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+/// What a zone tells each player / observer on arrival.
+#[derive(Debug, Clone, PartialEq, GameEvent)]
+#[game_event(id = 1, name = "hello")]
 pub struct GridHello {
     /// Zone id.
     pub zone: String,
-    /// Cell coordinates.
-    pub cell: [i32; 2],
+    /// Cell coordinates `[x, y]`.
+    pub cell: Vec<i32>,
     /// Host running the zone.
     pub host: String,
     /// World seed (the client generates the same content).
@@ -214,10 +271,10 @@ impl GridZone {
         (CELL / 2.0, CELL / 2.0)
     }
 
-    fn hello(&self, ctx: &Ctx<'_, Self>, entity: Option<u32>) -> serde_json::Value {
-        let hello = GridHello {
+    fn hello(&self, ctx: &Ctx<'_, Self>, entity: Option<u32>) -> GridHello {
+        GridHello {
             zone: ctx.zone_id().to_string(),
-            cell: [self.config.cell.0, self.config.cell.1],
+            cell: vec![self.config.cell.0, self.config.cell.1],
             host: self.config.host_id.clone(),
             seed: self.config.seed,
             content_version: world::CONTENT_VERSION,
@@ -229,8 +286,7 @@ impl GridZone {
             restored_critters: self.restored.map_or(0, |(_, c, _)| c),
             restored_markers: self.restored.map_or(0, |(_, _, m)| m),
             activated_at: self.activated_at,
-        };
-        serde_json::to_value(hello).unwrap_or_default()
+        }
     }
 
     fn admit(
@@ -265,7 +321,7 @@ impl GridZone {
             },
         );
         let hello = self.hello(ctx, Some(entity));
-        send_json_event(ctx, player, EVENT_HELLO, &hello);
+        ctx.send(player, &hello);
     }
 
     fn drop_marker(&mut self, x: f32, y: f32, label: String, hue: u8) {
@@ -344,29 +400,7 @@ impl Zone for GridZone {
     type Timer = ();
 
     fn schema() -> EntitySchema {
-        EntitySchema::new()
-            .kind(
-                KindDef::new(KIND_WALKER, "walker")
-                    .field("x", POS)
-                    .field("y", POS)
-                    .field_with_priority("name", FieldType::ShortStr, 0.2)
-                    .field("hue", FieldType::U8)
-                    .priority(2.0),
-            )
-            .kind(
-                KindDef::new(KIND_CRITTER, "critter")
-                    .field("x", POS)
-                    .field("y", POS)
-                    .field("yaw", FieldType::Angle { bits: 8 })
-                    .field("hue", FieldType::U8),
-            )
-            .kind(
-                KindDef::new(KIND_MARKER, "marker")
-                    .field("x", POS)
-                    .field("y", POS)
-                    .field("label", FieldType::ShortStr)
-                    .field("hue", FieldType::U8),
-            )
+        schema![WalkerView, CritterView, MarkerView]
     }
 
     fn on_create(ctx: &mut Ctx<'_, Self>, config: GridConfig) -> Self {
@@ -425,11 +459,11 @@ impl Zone for GridZone {
 
     fn on_observe(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {
         let hello = self.hello(ctx, None);
-        send_json_event(ctx, observer, EVENT_HELLO, &hello);
+        ctx.send(observer, &hello);
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<MoveInput> {
-        MoveInput::decode(payload)
+        MoveInput::from_payload(payload)
     }
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
@@ -486,58 +520,33 @@ impl Zone for GridZone {
     }
 
     fn replicate(&self, out: &mut WorldView) {
-        for w in self.walkers.values() {
-            out.push(
-                EntityState::new(
-                    w.entity,
-                    KIND_WALKER,
-                    w.x,
-                    w.y,
-                    vec![
-                        FieldValue::F(w.x),
-                        FieldValue::F(w.y),
-                        FieldValue::Str(w.name.clone()),
-                        FieldValue::U(w.hue.into()),
-                    ],
-                )
-                .global(),
-            );
+        for w in &self.walkers {
+            let w = w.1;
+            let view = WalkerView {
+                x: w.x,
+                y: w.y,
+                name: w.name.clone(),
+                hue: w.hue,
+            };
+            out.add(w.entity, &view);
         }
         for c in &self.critters {
-            out.push(
-                EntityState::new(
-                    c.id,
-                    KIND_CRITTER,
-                    c.x,
-                    c.y,
-                    vec![
-                        FieldValue::F(c.x),
-                        FieldValue::F(c.y),
-                        FieldValue::F(c.yaw),
-                        FieldValue::U(c.hue.into()),
-                    ],
-                )
-                .global()
-                .priority(0.5),
-            );
+            let view = CritterView {
+                x: c.x,
+                y: c.y,
+                yaw: c.yaw,
+                hue: c.hue,
+            };
+            out.add(c.id, &view).priority(0.5);
         }
         for m in &self.markers {
-            out.push(
-                EntityState::new(
-                    m.id,
-                    KIND_MARKER,
-                    m.x,
-                    m.y,
-                    vec![
-                        FieldValue::F(m.x),
-                        FieldValue::F(m.y),
-                        FieldValue::Str(m.label.clone()),
-                        FieldValue::U(m.hue.into()),
-                    ],
-                )
-                .global()
-                .priority(0.3),
-            );
+            let view = MarkerView {
+                x: m.x,
+                y: m.y,
+                label: m.label.clone(),
+                hue: m.hue,
+            };
+            out.add(m.id, &view);
         }
     }
 
@@ -576,8 +585,7 @@ pub fn encode_bot_input(dir: [f32; 2]) -> Vec<u8> {
         my: axis(dir[1]),
         buttons: world::BUTTON_SPRINT,
     }
-    .encode()
-    .to_vec()
+    .to_payload()
 }
 
 /// World seed: `DG_GRID_SEED` (decimal or 0x-hex) or [`world::DEFAULT_SEED`].
