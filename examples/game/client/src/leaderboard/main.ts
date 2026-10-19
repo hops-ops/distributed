@@ -3,7 +3,7 @@
  * top-10 snapshots, reads your rank and neighbours on every push, and
  * triggers a rebuild from the cells' event history.
  */
-import { HALF } from '../arena/floor.ts';
+import { ARENA_FLOOR } from '../generated/arena/constants.ts';
 import {
 	isMob,
 	isPillar,
@@ -16,6 +16,9 @@ import {
 } from '../generated/mobpit/index.ts';
 import { createBoardWatcher, DEFAULT_ZONE, MobPitApi, TIERS, type BoardPosition } from '../mobpit/client.ts';
 import { DevApi } from '../shared/dev-api.ts';
+
+/** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
+const { half: HALF } = ARENA_FLOOR;
 
 const params = new URLSearchParams(location.search);
 const zone = params.get('zone') ?? DEFAULT_ZONE;

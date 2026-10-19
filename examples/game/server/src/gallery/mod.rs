@@ -29,8 +29,8 @@ use std::time::Duration;
 use distributed_game::net::{GameServer, ServerConfig};
 use distributed_game::rewind::{Historic, HitQuery, RewindFrame, ShotTiming, Vec3};
 use distributed_game::{
-    schema, ConsumePolicy, Ctx, EntitySchema, FieldType, GameEvent, GameInput, GameSurface,
-    LeaveReason, PlayerId, Replicated, View, WorldView, Zone,
+    schema, ConsumePolicy, Ctx, EntitySchema, FieldType, GameEvent, GameInput, GameRecord,
+    GameSurface, LeaveReason, PlayerId, Replicated, View, WorldView, Zone,
 };
 
 use crate::common::{Demo, Guests};
@@ -134,7 +134,58 @@ pub enum GalleryEvent {
 
 /// The gallery's client surface.
 pub fn game_surface() -> GameSurface {
-    GameSurface::for_zone::<Gallery>("gallery").events::<GalleryEvent>()
+    GameSurface::for_zone::<Gallery>("gallery")
+        .events::<GalleryEvent>()
+        .constant("gallery_course", &gallery_course())
+}
+
+/// A rail target's track.
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct RailTrack {
+    /// y (m).
+    pub y: f32,
+    /// West end (m).
+    pub x0: f32,
+    /// East end (m).
+    pub x1: f32,
+}
+
+/// A circling target's track.
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct CircleTrack {
+    /// Center x (m).
+    pub cx: f32,
+    /// Center y (m).
+    pub cy: f32,
+    /// Radius (m).
+    pub r: f32,
+}
+
+/// The course decor the page draws (generated `GALLERY_COURSE`).
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct GalleryCourse {
+    /// Rails, in course order.
+    pub rails: Vec<RailTrack>,
+    /// Circles, in course order.
+    pub circles: Vec<CircleTrack>,
+    /// y of the firing line (m).
+    pub firing_line: f32,
+}
+
+/// The `GALLERY_COURSE` constant (from [`COURSE`] and [`FIRING_LINE`]).
+pub fn gallery_course() -> GalleryCourse {
+    let mut course = GalleryCourse {
+        rails: Vec::new(),
+        circles: Vec::new(),
+        firing_line: FIRING_LINE,
+    };
+    for (path, _, _) in COURSE {
+        match path {
+            Path::Rail { y, x0, x1, .. } => course.rails.push(RailTrack { y, x0, x1 }),
+            Path::Circle { cx, cy, r, .. } => course.circles.push(CircleTrack { cx, cy, r }),
+        }
+    }
+    course
 }
 
 /// How a target moves.

@@ -135,6 +135,7 @@ pub fn game_surface() -> GameSurface {
     GameSurface::for_zone::<Arena>("arena")
         .events::<ArenaEvent>()
         .predict::<movement::ArenaStep>()
+        .constant("arena_floor", &movement::arena_floor())
 }
 
 /// Interest radius (m).

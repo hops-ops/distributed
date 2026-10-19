@@ -2,8 +2,10 @@
  * The Freeze networking without rendering (Node-testable).
  *
  * The client "build" runs one content pack (`pack()`), fetched from the
- * demo's content CDN (`GET /dev/freeze/content/{version}`). What happens
- * at a world barrier:
+ * demo's content CDN (`GET /dev/freeze/content/{version}`, the Rust `Pack`
+ * record in its payload encoding, decoded by the generated `decodePack`).
+ * The version-independent layout is the generated `FREEZE_WORLD`. What
+ * happens at a world barrier:
  *
  * - `Freeze`: `frozen()` holds the notice; inputs are not sent and are
  *   counted in `droppedWhileFrozen` (the server also drops and counts any
@@ -27,33 +29,22 @@ import {
 import * as freeze from '../generated/freeze/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
 
-export const ZONES = { hub: 'freeze-hub', meadow: 'freeze-meadow', ember: 'freeze-ember' } as const;
+const { hub, meadow, ember } = freeze.FREEZE_WORLD;
+/** Zone ids (from the generated `FREEZE_WORLD`). */
+export const ZONES = { hub: hub.id, meadow: meadow.id, ember: ember.id } as const;
 export const DEFAULT_ZONE = ZONES.hub;
 
 /** Provenance of an event or fact (generated from the Rust `Stamp` record). */
 export type Stamp = freeze.Stamp;
+/** One content pack (generated from the Rust `Pack` record). */
+export type Pack = freeze.Pack;
+/** A zone's layout (generated from the Rust `ZoneLayout` record). */
+export type ZoneLayout = freeze.ZoneLayout;
 
-export type ZoneLayout = Readonly<{
-	title: string;
-	gate: boolean;
-	portals: readonly Readonly<{ x: number; y: number; to: string; title: string }>[];
-	pools: readonly Readonly<{ x: number; y: number; r: number }>[];
-	ritual: Readonly<{ x: number; y: number }>;
-}>;
-
-export type Pack = Readonly<{
-	version: string;
-	name: string;
-	notes: readonly string[];
-	hazard: 'lava' | 'ice';
-	slimeSpeed: number;
-	slimeColor: string;
-	slimeScale: number;
-	crystalColor: string;
-	crystalLayout: number;
-	gemValue: number;
-	zones: Readonly<Record<string, ZoneLayout>> & { crystals: readonly (readonly [number, number])[][] };
-}>;
+/** Layout of a zone id (`undefined` for an unknown id). */
+export function zoneLayout(zoneId: string): ZoneLayout | undefined {
+	return [hub, meadow, ember].find((z) => z.id === zoneId);
+}
 
 export type FreezeHello = freeze.HelloEvent;
 
@@ -72,7 +63,7 @@ export type ResumeInfo = Readonly<{
 export async function fetchPack(base: string, version: string): Promise<Pack> {
 	const response = await fetch(`${base}/dev/freeze/content/${encodeURIComponent(version)}`);
 	if (!response.ok) throw new Error(`content ${version}: HTTP ${response.status}`);
-	return (await response.json()) as Pack;
+	return freeze.decodePack(new Uint8Array(await response.arrayBuffer()));
 }
 
 /** Admin side of the demo (`x-game-admin-secret`). */

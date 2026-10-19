@@ -17,7 +17,7 @@ import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { Scene } from '@babylonjs/core/scene';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
-import { HALF, PILLARS, PLAYER_RADIUS } from '../arena/floor.ts';
+import { ARENA_FLOOR } from '../generated/arena/constants.ts';
 import { BITS, isPlayer, playerFields } from '../generated/ripple/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
@@ -34,6 +34,9 @@ import {
 	type RippleEvent
 } from './client.ts';
 import './ripple.css';
+
+/** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
+const { half: HALF, playerRadius: PLAYER_RADIUS } = ARENA_FLOOR;
 
 const params = new URLSearchParams(location.search);
 let hood = params.get('hood') ?? DEFAULT_ZONE;
@@ -76,13 +79,13 @@ const mats = {
 	down: material(scene, 'down', '#4a4a4a')
 };
 mats.boss.emissiveColor = Color3.FromHexString('#3a0b08');
-for (const [i, [x, y, r]] of PILLARS.entries()) {
+for (const [i, { x, y, r }] of ARENA_FLOOR.pillars.entries()) {
 	if (i === 0) continue; // the boss stands on the central pillar
 	const ruin = MeshBuilder.CreateCylinder(`ruin-${i}`, { diameter: r * 2, height: 1.2 + (i % 3) * 0.8, tessellation: 7 }, scene);
 	ruin.position = toWorld(x, y, ruin.getBoundingInfo().boundingBox.extendSize.y);
 	ruin.material = mats.pillar;
 }
-const boss = MeshBuilder.CreateSphere('boss', { diameter: PILLARS[0]![2] * 2, segments: 12 }, scene);
+const boss = MeshBuilder.CreateSphere('boss', { diameter: ARENA_FLOOR.pillars[0]!.r * 2, segments: 12 }, scene);
 boss.scaling.y = 1.3;
 boss.material = mats.boss;
 boss.position = toWorld(0, 0, 2.2);

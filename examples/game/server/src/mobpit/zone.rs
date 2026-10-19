@@ -244,6 +244,7 @@ pub fn game_surface() -> GameSurface {
     GameSurface::for_zone::<MobPit>("mobpit")
         .events::<PitEvent>()
         .predict::<PitStep>()
+        .constant("pit_rules", &pit_rules())
 }
 
 pub use game_sim::mobpit::{pit_step, PitInput, PitStep};
@@ -279,6 +280,45 @@ fn tier_stats(tier: u8) -> (i32, f32, i32, f32, f32) {
         3 => (100, 3.3, 24, 0.8, 2.6),
         2 => (60, 2.4, 16, 0.7, 2.2),
         _ => (30, 3.0, 9, 0.5, 1.8),
+    }
+}
+
+/// Mob tiers (1..=3).
+pub const TIERS: [u8; 3] = [1, 2, 3];
+/// Names of the `mob` kind's `state` values, by value.
+pub const MOB_STATES: [&str; 6] = ["idle", "chase", "windup", "recover", "return", "dead"];
+
+/// What the page draws of a mob tier (from [`tier_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct MobTier {
+    /// Tier (the `mob` kind's `tier`).
+    pub tier: u8,
+    /// Body radius (m).
+    pub radius: f32,
+    /// Telegraph radius (m).
+    pub tele: f32,
+}
+
+/// Mob Pit rules the client draws with (generated `PIT_RULES`).
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct PitRules {
+    /// Every tier.
+    pub tiers: Vec<MobTier>,
+    /// `state` names by value.
+    pub states: Vec<String>,
+}
+
+/// The `PIT_RULES` constant.
+pub fn pit_rules() -> PitRules {
+    PitRules {
+        tiers: TIERS
+            .iter()
+            .map(|&tier| {
+                let (_, _, _, radius, tele) = tier_stats(tier);
+                MobTier { tier, radius, tele }
+            })
+            .collect(),
+        states: MOB_STATES.map(String::from).to_vec(),
     }
 }
 

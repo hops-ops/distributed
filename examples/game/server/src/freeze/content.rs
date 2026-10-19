@@ -3,19 +3,25 @@
 //! Version `v{n}` uses pack `(n - 1) % 3`, so the admin can keep rolling
 //! out "new" versions. The server derives its rules (hazard, slime speed,
 //! gem value) from the pack of the zone's content version; clients fetch
-//! the same pack as JSON (`GET /dev/freeze/content/{version}`, the demo's
-//! stand-in for a content CDN) and derive colors, props and labels from
-//! it. A client pinned to an old version keeps rendering its old pack.
+//! the same pack (`GET /dev/freeze/content/{version}`, the demo's stand-in
+//! for a content CDN) and derive colors, props and labels from it. A client
+//! pinned to an old version keeps rendering its old pack.
 //!
-//! The zone layout (portals, pools, gem spots) is version independent and
-//! shipped inside every pack so the client needs nothing else.
+//! Everything here is defined once, in Rust. A [`Pack`] is a
+//! `#[derive(GameRecord)]`: the CDN serves its payload-codec encoding and
+//! the generated client decodes it (`decodePack`, from
+//! `GameSurface::record::<Pack>()`). The version-independent layout
+//! (zones, portals, pools, crystal spots) is [`freeze_world`], the
+//! generated `FREEZE_WORLD` constant (`GameSurface::constant`). Packs are
+//! *served* rather than compiled into the client because the point of the
+//! demo is a client receiving content it was not built with.
 
-use serde::Serialize;
-use serde_json::{json, Value};
+use distributed_game::codec::{Wire, WireType};
+use distributed_game::protocol::{DecodeError, Reader, Writer};
+use distributed_game::GameRecord;
 
-/// What standing in a pool does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+/// What standing in a pool does (on the wire: `"lava"` / `"ice"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hazard {
     /// Burns: the player is sent back to a spawn point.
     Lava,
@@ -23,9 +29,34 @@ pub enum Hazard {
     Ice,
 }
 
-/// One content pack.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+impl Hazard {
+    /// Wire name.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lava => "lava",
+            Self::Ice => "ice",
+        }
+    }
+}
+
+impl Wire for Hazard {
+    fn wire_type() -> WireType {
+        WireType::ShortStr
+    }
+    fn encode(&self, w: &mut Writer) {
+        w.short_string(self.name());
+    }
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        match r.short_string()?.as_str() {
+            "lava" => Ok(Self::Lava),
+            "ice" => Ok(Self::Ice),
+            _ => Err(DecodeError::Invalid("unknown hazard")),
+        }
+    }
+}
+
+/// One content pack (served encoded; the client's `Pack` is generated).
+#[derive(Debug, Clone, PartialEq, GameRecord)]
 pub struct Pack {
     /// `v{n}`.
     pub version: String,
@@ -43,7 +74,7 @@ pub struct Pack {
     pub slime_scale: f32,
     /// Crystal prop color (hex).
     pub crystal_color: String,
-    /// Crystal props `(x, y)` per field zone (mirrored per pack).
+    /// Index into [`FreezeWorld::crystals`] (mirrored per pack).
     pub crystal_layout: u8,
     /// Value of a collected gem.
     pub gem_value: u32,
@@ -142,11 +173,9 @@ impl Pack {
         out
     }
 
-    /// Pack plus the world layout, as served to clients.
-    pub fn to_json(&self) -> Value {
-        let mut v = serde_json::to_value(self).expect("pack serializes");
-        v["zones"] = layout_json();
-        v
+    /// What the content CDN serves: the payload-codec encoding.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        distributed_game::codec::to_bytes(self)
     }
 }
 
@@ -261,22 +290,108 @@ pub fn crystals(layout: u8) -> Vec<(f32, f32)> {
         .collect()
 }
 
-fn layout_json() -> Value {
-    let zone = |kind: ZoneKind| {
-        json!({
-            "title": kind.title(),
-            "gate": kind == ZoneKind::Hub,
-            "portals": kind.portals().iter().map(|(x, y, to)| json!({"x": x, "y": y, "to": to, "title": ZoneKind::of(to).map(ZoneKind::title)})).collect::<Vec<_>>(),
-            "pools": kind.pools().iter().map(|(x, y, r)| json!({"x": x, "y": y, "r": r})).collect::<Vec<_>>(),
-            "ritual": { "x": kind.ritual().0, "y": kind.ritual().1 },
-        })
+/// A point of a zone (m).
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct Spot {
+    /// x.
+    pub x: f32,
+    /// y.
+    pub y: f32,
+}
+
+/// A portal to another zone.
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct Portal {
+    /// x.
+    pub x: f32,
+    /// y.
+    pub y: f32,
+    /// Target zone id.
+    pub to: String,
+    /// Target zone title.
+    pub title: String,
+}
+
+/// A pool (lava or ice, by pack).
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct Pool {
+    /// x.
+    pub x: f32,
+    /// y.
+    pub y: f32,
+    /// Radius.
+    pub r: f32,
+}
+
+/// The layout of one zone.
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct ZoneLayout {
+    /// Zone id.
+    pub id: String,
+    /// Display title.
+    pub title: String,
+    /// The safe-room gate (the hub).
+    pub gate: bool,
+    /// Portals.
+    pub portals: Vec<Portal>,
+    /// Pools.
+    pub pools: Vec<Pool>,
+    /// Where a ritual holds the zone.
+    pub ritual: Spot,
+}
+
+/// The version-independent world (generated `FREEZE_WORLD`).
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct FreezeWorld {
+    /// Town hub.
+    pub hub: ZoneLayout,
+    /// Whisper Meadow.
+    pub meadow: ZoneLayout,
+    /// Ember Fields.
+    pub ember: ZoneLayout,
+    /// Crystal spots per layout id ([`Pack::crystal_layout`]).
+    pub crystals: Vec<Vec<Spot>>,
+}
+
+/// The `FREEZE_WORLD` constant.
+pub fn freeze_world() -> FreezeWorld {
+    let zone = |kind: ZoneKind, id: &str| ZoneLayout {
+        id: id.into(),
+        title: kind.title().into(),
+        gate: kind == ZoneKind::Hub,
+        portals: kind
+            .portals()
+            .iter()
+            .map(|&(x, y, to)| Portal {
+                x,
+                y,
+                to: to.into(),
+                title: ZoneKind::of(to).map_or("", ZoneKind::title).into(),
+            })
+            .collect(),
+        pools: kind
+            .pools()
+            .iter()
+            .map(|&(x, y, r)| Pool { x, y, r })
+            .collect(),
+        ritual: Spot {
+            x: kind.ritual().0,
+            y: kind.ritual().1,
+        },
     };
-    json!({
-        HUB: zone(ZoneKind::Hub),
-        MEADOW: zone(ZoneKind::Meadow),
-        EMBER: zone(ZoneKind::Ember),
-        "crystals": [crystals(0), crystals(1), crystals(2)],
-    })
+    FreezeWorld {
+        hub: zone(ZoneKind::Hub, HUB),
+        meadow: zone(ZoneKind::Meadow, MEADOW),
+        ember: zone(ZoneKind::Ember, EMBER),
+        crystals: (0..PACKS as u8)
+            .map(|layout| {
+                crystals(layout)
+                    .into_iter()
+                    .map(|(x, y)| Spot { x, y })
+                    .collect()
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -292,9 +407,13 @@ mod tests {
         assert_eq!(pack("v2").unwrap().hazard, Hazard::Ice);
         assert_eq!(pack("v4").unwrap().name, pack("v1").unwrap().name);
         assert_eq!(pack("v4").unwrap().version, "v4");
-        let json = pack("v2").unwrap().to_json();
-        assert_eq!(json["hazard"], "ice");
-        assert_eq!(json["zones"][EMBER]["portals"][0]["to"], HUB);
+        let served: Pack =
+            distributed_game::codec::from_bytes(&pack("v2").unwrap().to_bytes()).unwrap();
+        assert_eq!(served, pack("v2").unwrap());
+        let world = freeze_world();
+        assert_eq!(world.ember.portals[0].to, HUB);
+        assert_eq!(world.ember.portals[0].title, ZoneKind::Hub.title());
+        assert_eq!(world.crystals.len(), PACKS as usize);
         assert!(pack("v2")
             .unwrap()
             .resume_notes()

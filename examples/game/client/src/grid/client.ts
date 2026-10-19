@@ -11,6 +11,10 @@
  * - prediction of the own walker by `grid_step`, the Rust step compiled to
  *   WebAssembly, which collides against the props of the cell named in its
  *   context (world seed + authoritative cell, set here);
+ * - world content for rendering — terrain lattice, biomes, props
+ *   (`grid_cell`) and point samples (`grid_sample`) — from the Rust world
+ *   generation compiled into the same module (`#[game_pure]`); nothing
+ *   static comes over the wire and there is no TypeScript twin;
  * - per-zone hello info (host, restored-from-hibernation …) and the
  *   `/dev/grid/map` world map.
  */
@@ -18,9 +22,38 @@ import { fieldNumber, type GameClient, type GameSocketFactory, type RenderedEnti
 
 import * as grid from '../generated/grid/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
-import { cellProps, parseZone, zoneId, CELL, DEFAULT_SEED, type Cell, type MoveInput, type Prop } from './world.ts';
+
+export type MoveInput = grid.MoveInput;
+
+/** Static world facts (cell size, biome / prop names, lattice), generated from Rust. */
+export const WORLD = grid.GRID_WORLD;
+export const CELL = WORLD.cell;
+export const BUTTON_SPRINT = grid.BUTTON.sprint;
+export const BUTTON_MARK = grid.BUTTON.mark;
+
+export type Cell = readonly [number, number];
+/** A cell's terrain lattice and props (`grid_cell`). */
+export type CellContent = grid.GridCellContent;
+export type Prop = grid.Prop;
+/** Terrain at one point (`grid_sample`). */
+export type Sample = grid.GridSample;
 
 export const DEFAULT_ZONE = 'grid.0.0';
+
+/** `grid.<x>.<y>` (the zone id naming scheme of `game_sim::grid::zone_id`). */
+export function zoneId(cell: Cell): string {
+	return `grid.${cell[0]}.${cell[1]}`;
+}
+
+/** Inverse of `zoneId` (canonical integers within ±`WORLD.maxCell` only). */
+export function parseZone(zone: string): [number, number] | undefined {
+	const m = /^grid\.(-?\d+)\.(-?\d+)$/.exec(zone);
+	if (m === null) return undefined;
+	const x = Number(m[1]);
+	const y = Number(m[2]);
+	if (String(x) !== m[1] || String(y) !== m[2] || Math.abs(x) > WORLD.maxCell || Math.abs(y) > WORLD.maxCell) return undefined;
+	return [x, y];
+}
 
 /** A zone's hello (generated from the Rust `GridHello` event). */
 export type GridHello = grid.HelloEvent;
@@ -61,13 +94,19 @@ export type GridClient = Readonly<{
 	info(zone: string): GridHello | undefined;
 	/** Seed announced by the zones (falls back to the default). */
 	seed(): number;
-	/** Props of a cell (memoized). */
+	/** The compiled world generation (`grid_cell`, `grid_sample`). */
+	pures: grid.GridPures;
+	/** Terrain lattice and props of a cell (memoized); undefined until the module loaded. */
+	content(cell: Cell): CellContent | undefined;
+	/** Props of a cell; empty until the module loaded. */
 	props(cell: Cell): readonly Prop[];
+	/** Terrain at a local point (clamped into the cell); undefined until the module loaded. */
+	sample(cell: Cell, x: number, y: number): Sample | undefined;
 	/** World position (m) of a rendered entity. */
 	worldOf(entity: RenderedEntity): { x: number; y: number } | undefined;
 	/** Handoffs completed so far. */
 	handoffs(): number;
-	/** Resolves on the first hello with an own entity, once the predicted step is loaded. */
+	/** Resolves on the first hello with an own entity, once the compiled module is loaded. */
 	ready: Promise<GridHello>;
 	/** Called once per restored activation of any zone we see. */
 	onRestored(listener: (hello: GridHello) => void): () => void;
@@ -88,22 +127,25 @@ export function neighbours(cell: Cell): string[] {
 
 export function createGridClient(options: GridClientOptions): GridClient {
 	const infos = new Map<string, GridHello>();
-	const propsCache = new Map<string, readonly Prop[]>();
-	let seed = DEFAULT_SEED;
+	const contentCache = new Map<string, CellContent>();
+	let seed = WORLD.defaultSeed;
 	let authorityCell: Cell | undefined;
 	let handoffs = 0;
 	const restoredSeen = new Set<string>();
 	const restoredListeners = new Set<(hello: GridHello) => void>();
 
-	const props = (cell: Cell): readonly Prop[] => {
+	// Same module URL as the predicted step: one fetch, one instance.
+	const pures = grid.createGridPures();
+	const content = (cell: Cell): CellContent | undefined => {
+		if (!pures.loaded()) return undefined;
 		const key = `${seed}:${cell[0]}:${cell[1]}`;
-		let list = propsCache.get(key);
-		if (list === undefined) {
-			list = cellProps(seed, cell);
-			if (propsCache.size > 256) propsCache.clear();
-			propsCache.set(key, list);
+		let cached = contentCache.get(key);
+		if (cached === undefined) {
+			cached = pures.gridCell({ seed, cx: cell[0], cy: cell[1] });
+			if (contentCache.size > 256) contentCache.clear();
+			contentCache.set(key, cached);
 		}
-		return list;
+		return cached;
 	};
 	const typed = grid.createGridClient({
 		url: (zone) => zoneUrl(zone, options.base),
@@ -123,7 +165,8 @@ export function createGridClient(options: GridClientOptions): GridClient {
 	let resolveReady: (h: GridHello) => void = () => undefined;
 	const ready = Promise.all([
 		new Promise<GridHello>((resolve) => (resolveReady = resolve)),
-		typed.prediction?.ready
+		typed.prediction?.ready,
+		pures.ready
 	]).then(([h]) => h);
 
 	const syncNeighbours = () => {
@@ -172,7 +215,10 @@ export function createGridClient(options: GridClientOptions): GridClient {
 		cell: () => authorityCell,
 		info: (zone) => infos.get(zone),
 		seed: () => seed,
-		props,
+		pures,
+		content,
+		props: (cell) => content(cell)?.props ?? [],
+		sample: (cell, x, y) => (pures.loaded() ? pures.gridSample({ seed, cx: cell[0], cy: cell[1], x, y }) : undefined),
 		worldOf(entity) {
 			const cell = parseZone(entity.zoneId);
 			if (cell === undefined) return undefined;

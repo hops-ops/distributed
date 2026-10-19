@@ -51,6 +51,44 @@ pub const PILLARS: [(f32, f32, f32); 9] = [
     (14.0, 0.0, 1.0),
 ];
 
+/// A pillar of the floor.
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct Pillar {
+    /// Center x (m).
+    pub x: f32,
+    /// Center y (m).
+    pub y: f32,
+    /// Radius (m).
+    pub r: f32,
+}
+
+/// What the pages draw of the Arena floor (generated `ARENA_FLOOR`, shared by
+/// every page with an Arena capsule): the simulation's own constants.
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct ArenaFloor {
+    /// Floor half extent (m).
+    pub half: f32,
+    /// Capsule radius (m).
+    pub player_radius: f32,
+    /// Dash cooldown in command frames (the HUD meter).
+    pub dash_cooldown: u8,
+    /// The pillars.
+    pub pillars: Vec<Pillar>,
+}
+
+/// The `ARENA_FLOOR` constant.
+pub fn arena_floor() -> ArenaFloor {
+    ArenaFloor {
+        half: HALF,
+        player_radius: PLAYER_RADIUS,
+        dash_cooldown: DASH_COOLDOWN,
+        pillars: PILLARS
+            .iter()
+            .map(|&(x, y, r)| Pillar { x, y, r })
+            .collect(),
+    }
+}
+
 /// Wire type of `x`/`y`: 20/2^17 m ≈ 0.15 mm steps, 0 exact.
 pub const POS: FieldType = FieldType::quant_centered(HALF, 18);
 /// Wire type of `vx`/`vy`: 1/128 m/s steps, 0 exact (a resting capsule
