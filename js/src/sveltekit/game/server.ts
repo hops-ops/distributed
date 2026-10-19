@@ -12,6 +12,18 @@ import {
 	type GameTicketRole,
 	type GameTicketSecret
 } from './ticket.js';
+import { createGameTicketRateLimiter, type GameTicketRateLimiter } from './rate-limit.js';
+
+export {
+	GAME_TICKET_RATE_LIMIT_SCRIPT,
+	GameTicketRateLimiterUnavailable,
+	createGameTicketRateLimiter,
+	createRedisGameTicketRateLimiter,
+	type GameTicketRateLimiter,
+	type GameTicketRedisClient,
+	type GameTicketRedisEval,
+	type RedisGameTicketRateLimiterOptions
+} from './rate-limit.js';
 
 export {
 	MAX_GAME_TICKET_TTL_SECONDS,
@@ -52,11 +64,6 @@ export type GameTicketZoneContext<TEvent, TSession> = Readonly<{
 	role: GameTicketRole;
 }>;
 
-/** Sliding-window limiter; `take` returns false when the key is over budget. */
-export type GameTicketRateLimiter = Readonly<{
-	take(key: string, now: number): boolean;
-}>;
-
 export type GameTicketRateLimit =
 	| false
 	| Readonly<{ max: number; windowMs: number }>
@@ -91,7 +98,12 @@ export type CreateGameTicketHandlerOptions<TEvent extends GameTicketRequestEvent
 	roles?: readonly GameTicketRole[];
 	/** Ticket lifetime in seconds (1..=300). Default 60. */
 	ttlSeconds?: number;
-	/** Per-principal limit. Default 10 tickets per minute; `false` disables. */
+	/**
+	 * Per-principal limit. Default 10 tickets per minute in memory (per
+	 * process); `createRedisGameTicketRateLimiter` shares one budget across
+	 * instances; `false` disables. A limiter that throws or rejects answers
+	 * 503 `rate_limit_unavailable` (fail closed).
+	 */
 	rateLimit?: GameTicketRateLimit;
 	/** Extra origins allowed besides the request URL's own (e.g. a dev proxy). */
 	allowedOrigins?: readonly string[];
@@ -146,32 +158,6 @@ function json(status: number, body: unknown): Response {
 			'content-type': 'application/json; charset=utf-8',
 			'cache-control': 'no-store',
 			'x-content-type-options': 'nosniff'
-		}
-	});
-}
-
-/** In-memory sliding window per key (one process; use a shared store behind a load balancer). */
-export function createGameTicketRateLimiter(max: number, windowMs: number): GameTicketRateLimiter {
-	if (!Number.isSafeInteger(max) || max < 1 || !Number.isFinite(windowMs) || windowMs <= 0) {
-		throw new TypeError('game ticket rate limit needs max >= 1 and windowMs > 0');
-	}
-	const starts = new Map<string, number[]>();
-	return Object.freeze({
-		take(key: string, now: number): boolean {
-			const since = now - windowMs;
-			if (starts.size > 10_000) {
-				for (const [existing, times] of starts) {
-					if (times.every((at) => at <= since)) starts.delete(existing);
-				}
-			}
-			const recent = (starts.get(key) ?? []).filter((at) => at > since);
-			if (recent.length >= max) {
-				starts.set(key, recent);
-				return false;
-			}
-			recent.push(now);
-			starts.set(key, recent);
-			return true;
 		}
 	});
 }
@@ -352,8 +338,21 @@ export function createGameTicketHandler<TEvent extends GameTicketRequestEvent, T
 			if (verified === undefined) {
 				throw new TicketRefusal(401, 'unauthenticated', 'Sign in to join the game.');
 			}
-			if (limiter !== undefined && !limiter.take(verified.principal, now())) {
-				throw new TicketRefusal(429, 'rate_limited', 'Too many ticket requests; wait a moment.');
+			if (limiter !== undefined) {
+				let allowed: boolean;
+				try {
+					allowed = await limiter.take(verified.principal, now());
+				} catch {
+					// Store unreachable / timed out: fail closed.
+					throw new TicketRefusal(
+						503,
+						'rate_limit_unavailable',
+						'Tickets are temporarily unavailable; try again shortly.'
+					);
+				}
+				if (allowed !== true) {
+					throw new TicketRefusal(429, 'rate_limited', 'Too many ticket requests; wait a moment.');
+				}
 			}
 			const body = await readBody(event.request);
 			const role = body.role ?? 'player';
