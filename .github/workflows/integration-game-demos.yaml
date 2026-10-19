@@ -1,0 +1,39 @@
+name: Game demos smoke
+
+# Reusable workflow: referenced via `uses: ./.github/workflows/integration-game-demos.yaml`.
+# `examples/game` is outside the root workspace, so nothing else runs its tests:
+# generated clients current (`gen --check`), demo server fmt/clippy/tests, client
+# type-check, build and headless tests, and the SvelteKit demo end to end
+# (Playwright against the production build and a real Mob Pit server).
+on:
+  workflow_call:
+
+jobs:
+  game-demos:
+    name: Game demos smoke (examples/game)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+          # Predicted steps and pure functions compile to WebAssembly.
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            js/package-lock.json
+            examples/game/client/package-lock.json
+            examples/game/sveltekit/package-lock.json
+      - name: Install SvelteKit demo dependencies and Chromium
+        working-directory: examples/game/sveltekit
+        run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
+      - name: Run examples/game smoke
+        run: examples/game/run.sh smoke
