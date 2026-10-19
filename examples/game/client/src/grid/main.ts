@@ -220,7 +220,7 @@ function moveOrigin(to: Cell): void {
 	if (to[0] === origin[0] && to[1] === origin[1]) return;
 	const shift = new Vector3((to[0] - origin[0]) * CELL, 0, (to[1] - origin[1]) * CELL);
 	origin = to;
-	camera.setTarget(camera.target.subtract(shift));
+	camera.setTarget(camera.target.subtract(shift), false, false, true); // keep the orbit angles
 	syncChunks();
 }
 
