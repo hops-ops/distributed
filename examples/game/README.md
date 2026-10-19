@@ -8,7 +8,7 @@ guests and lets any page change the network simulation.
 
 | Demo | Run | Mechanic it demonstrates |
 |---|---|---|
-| **Arena** | `./run.sh arena` | Fixed 30 Hz tick / 20 Hz patches, binary deltas, interest management (view ring, drones pop in/out), client prediction + reconciliation (shared Rust/TS movement step, bit-exact), interpolation of remote entities, live latency/jitter/loss |
+| **Arena** | `./run.sh arena` | Fixed 30 Hz tick / 20 Hz patches, binary deltas, interest management (view ring, drones pop in/out), client prediction + reconciliation (the Rust movement step compiled to WebAssembly, bit-exact), interpolation of remote entities, live latency/jitter/loss |
 | **Mob Pit** | `./run.sh mobpit` | Authoritative melee combat vs. 12 telegraphing mobs; kills are **non-blocking durable facts** committed exactly once into per-player native SQLite cells (`cell-sqlite`); "slow storage" toggle (tick stays flat, pending facts climb); `kill -9` crash recovery |
 | **Leaderboard** | `./run.sh leaderboard` | Same server as Mob Pit: kills/XP sorted-set boards (in-memory or Redis) fed fire-and-forget with idempotent apply keys, top 10 pushed live, your rank + neighbours, rebuild from the cells' event history |
 | **Shooting Gallery** | `./run.sh gallery` | Lag compensation: hitscan shots resolved with `ctx.rewind().hit_test_shot` at the shooter's view time (`client_tick` + interpolation delay in the payload), `max_rewind` clamp, per-shot compensation on/off, predicted vs confirmed hits |
@@ -27,16 +27,29 @@ for the kinds (`arena::PlayerView`, `mobpit::zone::MobView`, …),
 `gallery::ShotInput`, …), `#[derive(GameEvent)]` enums for events
 (`mobpit::zone::PitEvent`) and `#[derive(FactCommand)]` on the cell
 command inputs they emit as facts (`mobpit::crawler::RecordKillInput`).
-Each demo module exports `game_surface()`; `run.sh gen` runs `distributed
-game-manifest` on it and `distributed game-client` writes
-`client/src/generated/<demo>/` (checked in, verified by `run.sh smoke`).
-The pages use the generated `create<Demo>Client`, typed field accessors
+The movement that clients predict is declared once with `#[predict]` in
+the `game_sim` crate (`server/sim/`, no server dependencies):
+`arena_step` (Arena, The Freeze), `pit_step` (Mob Pit), `hood_step` (Boss
+Ripple) and `grid_step` (Endless Grid, whose context is the world seed and
+cell); the zones call those functions in `on_tick`. Each demo module
+exports `game_surface()`; `run.sh gen` runs `distributed game-manifest` on
+it, `distributed game-client` writes `client/src/generated/<demo>/`
+(checked in, verified by `run.sh smoke`) and `distributed game-wasm`
+compiles the step to `client/src/generated/<demo>/wasm/<demo>.wasm`
+(gitignored, rebuilt only when the Rust sources change; `run.sh <demo>`
+builds it too). The pages use the generated `create<Demo>Client`, which
+predicts with the compiled step, typed field accessors
 (`mobFields(entity).hp`), the input encoder and typed `on('kill', …)`
-handlers; only the prediction steps (`arena/movement.ts`, `grid/world.ts`,
-twins of the Rust step) are hand-written, and they import the generated
-input type, sanitize and wire quantization.
+handlers. No movement code is written in TypeScript; what remains
+hand-written for drawing is `arena/floor.ts` (floor size, pillars, capsule
+radius — checked against the native build) and `grid/world.ts` (the grid's
+terrain/props generation for rendering, see below). The Shooting Gallery
+predicts hits by ray-testing what it renders, not movement, so it has no
+predicted step.
 
-Requirements: Rust (stable), Node ≥ 22.18 (runs `.ts` test imports natively).
+Requirements: Rust (stable) with the `wasm32-unknown-unknown` target
+(`rustup target add wasm32-unknown-unknown`), Node ≥ 22.18 (runs `.ts`
+test imports natively).
 
 ## Run
 
@@ -126,13 +139,16 @@ is derived from it) and keeping hibernation snapshots under one
 - **World.** Cell `(x, y)` is zone `grid.<x>.<y>` (canonical integers,
   |x|,|y| ≤ 10⁶; the server uses `FlatTopology`, the dots are not a
   hierarchy). Its terrain height, biome and props are a pure function of
-  `(seed, x, y, CONTENT_VERSION)` in `server/src/grid/world.rs` and its twin
-  `client/src/grid/world.ts` (u32 hashing + binary32 value noise; checked
+  `(seed, x, y, CONTENT_VERSION)` in `server/sim/src/grid.rs` and, for
+  rendering only, its twin `client/src/grid/world.ts` (u32 hashing +
+  binary32 value noise; checked
   bit-for-bit by `fixtures/grid-world.json`). Props sit inside 8 m
   sub-cells 2 m from their edges, so lines every 8 m are free trails and no
   prop reaches across a border. Seed: `DG_GRID_SEED`.
-- **Zones.** A cell simulates walkers (predicted with the shared step,
-  colliding with the cell's props) and 2–4 critters. Past a border by
+- **Zones.** A cell simulates walkers (predicted by `grid_step` compiled to
+  WebAssembly, which generates and collides with the cell's props itself;
+  the client sets its context from the hello's seed and the authoritative
+  cell) and 2–4 critters. Past a border by
   0.5 m the walker is handed off with its position in the neighbour's
   frame (`ctx.handoff`); the SDK follows the Handoff — through a Redirect
   when the neighbour lives on the other host (`HashRing`, 64 vnodes).
@@ -186,52 +202,64 @@ hood to fight there.
  │       GameClient (SDK)            │ ───────────────► │   │   guest principal (server-made) │
  │       ├ GameConnection  ws ───────┼─ /zones/{zone} ─►│   │   /dev/netsim → set_net_sim     │
  │       ├ EntityReplica (interp.)   │ ◄─ Welcome/Delta │   └ GameServer::serve_with          │
- │       └ Predictor ── movement.ts ═╪═ parity fixture ═╪══► ZoneHost<Arena> 30 Hz           │
- │ src/shared/ hud · input · scene   │                  │        └ arena::movement (twin)     │
+ │       └ Predictor ── arena.wasm   │                  │   ZoneHost<Arena> 30 Hz             │
+ │ src/shared/ hud · input · scene   │                  │     └ game_sim::arena::arena_step   │
  │ src/generated/arena (typed glue)  │  GET /metrics    │   GET /metrics (Prometheus)         │
+ │   └ wasm/arena.wasm ◄═════════════╪══ distributed game-wasm (same Rust, wasm32) ══╝          │
  └──────────────────────────────────┘                  └─────────────────────────────────────┘
 ```
 
 Prediction is exact because (1) every input is one command frame of exactly
 one tick (sent by the SDK's `InputPacer`), consumed one per tick with a small
-credit bank (`distributed_game::InputCredits`, `arena::MAX_CREDITS`), (2) the step uses binary32 arithmetic only
-(`Math.fround` in TS) without trig, and (3) the server snaps its state to the
-wire quantization after each step, so the client rebases on exactly what the
-server holds. `fixtures/arena-movement.json` (written by Rust) is replayed by
-the TS step in `client/tests/movement-parity.test.mjs`.
+credit bank (`distributed_game::InputCredits`, `arena::MAX_CREDITS`), (2) the
+client runs the server's own Rust step compiled to WebAssembly, over a
+binary ABI that keeps every binary32 bit, and the step uses only operations
+that round identically on every target (`+ - * /`, `sqrt`, comparisons; no
+trig), and (3) the server snaps its state to the wire quantization after
+each step, so the client rebases on exactly what the server holds.
+`client/tests/prediction-wasm.test.mjs` replays the native traces of
+`game-demos predict-trace` (recorded input streams per step function)
+through every surface's module and requires byte-identical states; it also
+times prediction (≈ 1 µs per step, ≈ 8–12 µs for a reconciliation
+replaying 10 inputs).
 
 ## Layout
 
 ```
 examples/game/
   run.sh                     one-command dev + smoke runner
-  fixtures/                  cross-language golden data (Rust writes, TS checks)
-  server/                    Rust crate `game_demos`, its own cargo workspace
-    src/main.rs              `game-demos <demo>` subcommands
+  fixtures/                  grid-world.json: grid content golden data (Rust writes, world.ts checks)
+  server/                    Rust crate `game_demos`, its own cargo workspace (with sim/)
+    sim/                     crate `game_sim`: the `#[predict]` steps (arena.rs movement, mobpit.rs,
+                             ripple.rs inputs + steps, grid.rs world + walker step); compiled
+                             natively for the server and to wasm32 for the browser
+    src/main.rs              `game-demos <demo>` subcommands (+ hidden `predict-trace`)
+    src/predict_trace.rs     native traces of every step over recorded input streams
     src/common/              shared: Demo trait, run/spawn, dev routes, guests
     src/cluster.rs           multi-host demos: --host-id/--peer, directory, ownership, snapshots
-    src/arena/               Arena zone + movement.rs (twin of client movement.ts)
+    src/arena/               Arena zone (`movement` = `game_sim::arena`)
     src/mobpit/              Mob Pit zone, Crawler cell aggregate, fact sink, leaderboards, dev routes
     src/gallery/             Shooting Gallery zone (targets, rewind hit tests)
     src/freeze/              The Freeze zone, content packs, two-host world + admin routes
-    src/grid/                Endless Grid zone, world.rs (twin of world.ts), dev map routes
+    src/grid/                Endless Grid zone (`world` = `game_sim::grid`), dev map routes
     src/ripple/              Boss Ripple tiers and placement
-    tests/                   arena_smoke.rs (bots, dev routes), movement_fixture.rs,
+    tests/                   arena_smoke.rs (bots, dev routes),
                              mobpit_smoke.rs (facts, slow storage, kill -9 recovery, boards),
                              gallery_smoke.rs, freeze_smoke.rs, grid_smoke.rs, grid_fixture.rs,
                              ripple_smoke.rs (+ support/ for two in-process hosts)
   client/                    Vite + TypeScript + Babylon.js 9.30 (multi-page)
     index.html, <demo>/index.html
     src/generated/<demo>/    generated by `run.sh gen` (do not edit): schema/input/events/client.ts,
-                             surface.json; `mobpit` also serves the leaderboard page
+                             predict.ts, surface.json, wasm/<demo>.wasm (gitignored build output);
+                             `mobpit` also serves the leaderboard page
     src/shared/              hud.ts, input.ts, scene.ts, dev-api.ts, latest.ts, style.css
-    src/arena/               client.ts (headless), main.ts (Babylon), movement.ts
+    src/arena/               client.ts (headless), main.ts (Babylon), floor.ts (drawing constants)
     src/mobpit/              client.ts (headless + /dev/mobpit API), main.ts (Babylon), style.css
     src/leaderboard/         main.ts (DOM page over the observer connection), style.css
     src/gallery/             client.ts (shots, adaptive delay), main.ts
     src/freeze/              client.ts (content packs, live patch / reload, admin API), main.ts
-    src/grid/, src/ripple/   client.ts (headless), main.ts (Babylon); grid/world.ts
-    tests/                   movement-parity, arena-headless, mobpit-headless, leaderboard-headless,
+    src/grid/, src/ripple/   client.ts (headless), main.ts (Babylon); grid/world.ts (content, rendering)
+    tests/                   prediction-wasm (native ↔ WASM exact match + cost), arena-headless, mobpit-headless, leaderboard-headless,
                              gallery-headless, freeze-headless, grid-world-parity, grid-headless,
                              ripple-headless (+ helpers/demo-server.mjs, helpers/mobpit.mjs,
                              helpers/cluster.mjs for multi-host demos)
@@ -249,7 +277,7 @@ examples/game/run.sh mobpit        # → http://localhost:5173/mobpit/
 examples/game/run.sh leaderboard   # same server → http://localhost:5173/leaderboard/
 ```
 
-Controls: WASD / stick move (the Arena's predicted step, same floor and
+Controls: WASD / stick move (the Arena's movement, predicted by `pit_step`, same floor and
 pillars), **Space** attack (120° cone, 2.2 m), **E** dash, **L** slow
 storage. Mobs wander near home, aggro within 7 m, chase, stop and show a red
 **telegraph ring** that fills for 0.8 s, then hit everyone inside it. Grunts
@@ -372,9 +400,14 @@ pending, recent commits), `GET /dev/mobpit/crawlers` (every cell on disk),
      `decode_input` = `MyInput::from_payload(bytes)`. Events: a
      `#[derive(GameEvent)]` enum sent with `ctx.send` / `ctx.broadcast`.
      Facts: the cell command input with `#[derive(FactCommand)]`.
+   - Predicted movement: declare the step with `#[predict(Step, kind = "…")]`
+     in `server/sim/` (with the input type and everything the step reads;
+     no server-only dependencies), call it from `on_tick`, add
+     `.predict::<Step>()` to the surface and a stream for it in
+     `src/predict_trace.rs` (the exact-match test fails until you do).
    - Export `pub fn game_surface() -> GameSurface` from the module and add
      the demo to `SURFACES` in `run.sh`; `./run.sh gen` writes
-     `client/src/generated/<demo>/`.
+     `client/src/generated/<demo>/` and compiles the step.
    - Signed quantities that must rest at zero: `#[quant(centered = R, bits = N)]`.
    - State shared by the zones and demo-specific dev routes (a durable
      store, a leaderboard): build both in `common::spawn_with` /
@@ -385,8 +418,9 @@ pending, recent commits), `GET /dev/mobpit/crawlers` (every cell on disk),
 3. **Client** — `client/<demo>/index.html` + `src/<demo>/main.ts`, add the
    name to `DEMOS` in `vite.config.ts` and a link in `index.html`. Keep
    networking in `src/<demo>/client.ts` (no Babylon) so Node can test it:
-   a thin wrapper over the generated `create<Demo>Client` (URLs, tickets,
-   your `predict`). Reuse `DevApi` + `zoneUrl` (tickets), `Hud` (status/RTT/
+   a thin wrapper over the generated `create<Demo>Client` (URLs, tickets;
+   it predicts with the compiled step — set its context if it has one, and
+   await `prediction.ready` with the first hello). Reuse `DevApi` + `zoneUrl` (tickets), `Hud` (status/RTT/
    jitter/tick/delta B/s/entities + NetSim sliders + `row`/`toggle`),
    `InputSampler`, `FixedRate`, `cameraRelative`, `toAxis`,
    `createStage`/`toWorld`/`material`/`createRing`/`LabelLayer`, `latest`
