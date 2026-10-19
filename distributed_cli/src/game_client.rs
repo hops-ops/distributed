@@ -789,22 +789,29 @@ impl<'a> Gen<'a> {
             &input.fields,
         ));
         let _ = writeln!(out, "\nexport type Input = {};", input.name);
-        let buttons: Vec<(String, u32)> = input
+        let flag_fields: Vec<&Field> = input
             .fields
             .iter()
-            .flat_map(|f| {
-                f.buttons
-                    .iter()
-                    .enumerate()
-                    .map(|(bit, b)| (camel(b), 1u32 << bit))
-            })
+            .filter(|f| !f.buttons.is_empty())
             .collect();
-        if !buttons.is_empty() {
-            out.push_str("\n/** Button bits (`#[buttons(..)]`). */\nexport const BUTTON = {\n");
-            for (name, bit) in &buttons {
-                let _ = writeln!(out, "\t{}: {bit},", key(name));
+        if !flag_fields.is_empty() {
+            out.push_str("\n/** Bits of each bit-flag field (`#[buttons(..)]`), by field. */\nexport const BITS = {\n");
+            for field in &flag_fields {
+                let _ = writeln!(out, "\t{}: {{", key(&camel(&field.name)));
+                for (bit, name) in field.buttons.iter().enumerate() {
+                    let _ = writeln!(out, "\t\t{}: {},", key(&camel(name)), 1u32 << bit);
+                }
+                out.push_str("\t},\n");
             }
             out.push_str("} as const;\n");
+            if let [only] = flag_fields.as_slice() {
+                let _ = writeln!(
+                    out,
+                    "\n/** Bits of `{}`, the only bit-flag field. */\nexport const BUTTON = BITS.{};",
+                    camel(&only.name),
+                    camel(&only.name)
+                );
+            }
         }
         let _ = writeln!(
             out,

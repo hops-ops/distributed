@@ -15,11 +15,16 @@ export interface SampleInput {
 
 export type Input = SampleInput;
 
-/** Button bits (`#[buttons(..)]`). */
-export const BUTTON = {
-	dash: 1,
-	attack: 2,
+/** Bits of each bit-flag field (`#[buttons(..)]`), by field. */
+export const BITS = {
+	buttons: {
+		dash: 1,
+		attack: 2,
+	},
 } as const;
+
+/** Bits of `buttons`, the only bit-flag field. */
+export const BUTTON = BITS.buttons;
 
 /** Wire layout, in field order. */
 export const INPUT_LAYOUT: PayloadLayout = [
