@@ -125,6 +125,8 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 					ctx.fill();
 					ctx.strokeStyle = '#4da3ff';
 					ctx.stroke();
+					// Frames that drew an own swing, for the headless test.
+					if (mine) canvas.dataset.swings = String(Number(canvas.dataset.swings ?? 0) + 1);
 				}
 				circle(p.x, p.y, PLAYER_RADIUS, p.dead ? '#555' : mine ? '#ffd166' : '#6ec3ff');
 				const [nx, ny] = at(p.x + Math.cos(p.face) * 0.6, p.y + Math.sin(p.face) * 0.6);

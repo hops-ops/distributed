@@ -123,6 +123,11 @@ test('sign in, join, move, kill, settled read model updates', { timeout: 600_000
 		const moved = await page.evaluate(() => document.querySelector('canvas').dataset.me.split(',').map(Number));
 		assert.ok(moved[0] > start[0] + 0.5 || Math.hypot(moved[0] - start[0], moved[1] - start[1]) > 0.5, `moved ${start} → ${moved}`);
 
+		// Attack: the server's swing reaches the client and the cone is drawn.
+		await page.keyboard.down('Space');
+		await page.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.swings ?? 0) > 0, null, { timeout: 5_000 });
+		await page.keyboard.up('Space');
+
 		// Settled fact: auto-hunt kills a mob; the cell commit settles; the
 		// live read model (profile + board pushes) shows it.
 		assert.equal(await page.textContent('[data-testid=xp]'), '0');

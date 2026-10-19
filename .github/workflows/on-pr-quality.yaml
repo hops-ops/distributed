@@ -76,5 +76,9 @@ jobs:
     needs: [contracts]
     uses: ./.github/workflows/integration-js.yaml
 
+  game-demos:
+    needs: [contracts]
+    uses: ./.github/workflows/integration-game-demos.yaml
+
   celld:
     uses: ./.github/workflows/integration-celld.yaml
