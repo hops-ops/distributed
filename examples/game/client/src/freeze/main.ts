@@ -13,12 +13,13 @@ import type { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
-import { BUTTON_DASH, HALF, PILLARS, PLAYER_RADIUS, type MoveInput } from '../arena/movement.ts';
+import { HALF, PILLARS, PLAYER_RADIUS } from '../arena/movement.ts';
+import { BUTTON, KIND, gemFields, playerFields, ritualFields, slimeFields, type KindName, type MoveInput } from '../generated/freeze/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
 import { createRing, createStage, material, toWorld } from '../shared/scene.ts';
-import { createFreezeClient, DEFAULT_ZONE, FreezeAdmin, KIND, ZONES, type Pack, type WorldStatus } from './client.ts';
+import { createFreezeClient, DEFAULT_ZONE, FreezeAdmin, ZONES, type Pack, type WorldStatus } from './client.ts';
 import './freeze.css';
 
 const params = new URLSearchParams(location.search);
@@ -250,12 +251,14 @@ async function main(): Promise<void> {
 			scenery.push(c);
 		}
 		slimeMat = material(scene, `slime-${pack.version}`, pack.slimeColor);
-		for (const v of visuals.values()) if (v.kind === KIND.slime) v.mesh.material = slimeMat;
+		for (const v of visuals.values()) if (v.kind === 'slime') v.mesh.material = slimeMat;
 	}
 	const portalLabels = new Set<string>();
 
 	// ---- entities ----
-	type Visual = { mesh: Mesh; kind: string };
+	type Visual = { mesh: Mesh; kind: KindName };
+	const kindOf = (entity: RenderedEntity): KindName =>
+		(Object.keys(KIND) as KindName[]).find((k) => KIND[k] === entity.kind) ?? 'player';
 	const visuals = new Map<string, Visual>();
 	const ritualRing = createRing(scene, 2, '#ff4d6d');
 	ritualRing.setEnabled(false);
@@ -264,17 +267,18 @@ async function main(): Promise<void> {
 		let v = visuals.get(entity.key);
 		if (v !== undefined) return v;
 		let mesh: Mesh;
-		switch (entity.kindName) {
-			case KIND.slime:
+		const kind = kindOf(entity);
+		switch (kind) {
+			case 'slime':
 				mesh = MeshBuilder.CreateSphere(entity.key, { diameter: 0.9, segments: 10 }, scene);
 				mesh.scaling.y = 0.6;
 				mesh.material = slimeMat;
 				break;
-			case KIND.gem:
+			case 'gem':
 				mesh = MeshBuilder.CreatePolyhedron(entity.key, { type: 1, size: 0.35 }, scene);
 				mesh.material = mats.gem;
 				break;
-			case KIND.ritual:
+			case 'ritual':
 				mesh = MeshBuilder.CreateBox(entity.key, { size: 0.01 }, scene);
 				mesh.isVisible = false;
 				break;
@@ -282,7 +286,7 @@ async function main(): Promise<void> {
 				mesh = MeshBuilder.CreateCapsule(entity.key, { radius: PLAYER_RADIUS, height: 1.8 }, scene);
 				mesh.material = mine ? mats.me : mats.other;
 		}
-		v = { mesh, kind: entity.kindName };
+		v = { mesh, kind };
 		visuals.set(entity.key, v);
 		return v;
 	}
@@ -294,7 +298,7 @@ async function main(): Promise<void> {
 	const sendFrame = () => {
 		const s = sampler.sample();
 		const move = cameraRelative(s, stage.cameraForward());
-		lastInput = { mx: toAxis(move.x), my: toAxis(move.y), buttons: s.action ? BUTTON_DASH : 0 };
+		lastInput = { mx: toAxis(move.x), my: toAxis(move.y), buttons: s.action ? BUTTON.dash : 0 };
 		freeze.sendInput(lastInput);
 	};
 
@@ -317,28 +321,34 @@ async function main(): Promise<void> {
 			const mine = hello !== undefined && entity.id === hello.entity;
 			const v = visualFor(entity, mine);
 			seen.add(entity.key);
-			const x = Number(entity.fields.x ?? 0);
-			const y = Number(entity.fields.y ?? 0);
 			switch (v.kind) {
-				case KIND.slime:
+				case 'slime': {
+					const { x, y } = slimeFields(entity);
 					v.mesh.position.copyFrom(toWorld(x, y, 0.3 * pack.slimeScale));
 					v.mesh.scaling.set(pack.slimeScale, 0.6 * pack.slimeScale, pack.slimeScale);
 					break;
-				case KIND.gem:
+				}
+				case 'gem': {
+					const { x, y } = gemFields(entity);
 					v.mesh.position.copyFrom(toWorld(x, y, 0.8 + 0.15 * Math.sin(now / 300)));
 					v.mesh.rotation.y = now / 600;
 					break;
-				case KIND.ritual:
+				}
+				case 'ritual': {
+					const { x, y, stuck } = ritualFields(entity);
 					v.mesh.position.copyFrom(toWorld(x, y, 0));
-					ritualStuck = Number(entity.fields.stuck ?? 0) === 1;
+					ritualStuck = stuck === 1;
 					ritualRing.position.copyFrom(toWorld(x, y, 0));
 					if (ritualStuck) stage.labels.set('ritual', v.mesh, 'RITUAL IN PROGRESS — this zone cannot pause', 0.6, 'ritual');
 					else stage.labels.delete('ritual');
 					break;
-				default:
+				}
+				default: {
+					const { x, y, name } = playerFields(entity);
 					v.mesh.position.copyFrom(toWorld(x, y, 0.9));
-					stage.labels.set(entity.key, v.mesh, mine ? `${String(entity.fields.name)} (you)` : String(entity.fields.name ?? ''), 1.4, mine ? 'me' : '');
+					stage.labels.set(entity.key, v.mesh, mine ? `${name} (you)` : name, 1.4, mine ? 'me' : '');
 					if (mine) me = { x, y };
+				}
 			}
 			v.mesh.setEnabled(!entity.stale);
 		}
