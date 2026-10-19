@@ -46,6 +46,7 @@ fn generated_typescript_matches_the_golden_files() {
             "events.ts",
             "index.ts",
             "input.ts",
+            "predict.ts",
             "schema.ts",
             "surface.json"
         ]
@@ -178,8 +179,10 @@ fn game_manifest_runs_the_surface_export() {
     );
     let surface: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
-    assert_eq!(surface["schemaVersion"], 1);
+    assert_eq!(surface["schemaVersion"], 2);
     assert_eq!(surface["name"], "orbs");
+    assert_eq!(surface["predict"]["export"], "orb_step");
+    assert_eq!(surface["predict"]["package"], "game-surface-fixture");
     assert_eq!(
         surface["kinds"][0]["fields"][0]["correction"]["durationMs"],
         80
@@ -202,4 +205,60 @@ fn game_manifest_runs_the_surface_export() {
     assert!(fs::read_to_string(gen.join("client.ts"))
         .unwrap()
         .contains("createOrbsClient"));
+
+    // The predicted step compiles to a self-contained module next to the
+    // client; a second run is a stamp hit, and --check verifies it.
+    let wasm = |extra: &[&str]| {
+        let mut args = vec![
+            "game-wasm",
+            "--manifest",
+            out.to_str().unwrap(),
+            "--manifest-path",
+            manifest.to_str().unwrap(),
+            "--out",
+            gen.to_str().unwrap(),
+        ];
+        args.extend(extra);
+        distributed(&args)
+    };
+    let check = wasm(&["--check"]);
+    assert!(!check.status.success(), "nothing built yet");
+    let build = wasm(&[]);
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let module = fs::read(gen.join("wasm/orbs.wasm")).unwrap();
+    assert_eq!(&module[..4], b"\0asm");
+    let again = wasm(&[]);
+    assert!(String::from_utf8_lossy(&again.stdout).contains("is current"));
+    assert!(wasm(&["--check"]).status.success());
+    fs::write(gen.join("wasm/orbs.wasm"), b"tampered").unwrap();
+    assert!(
+        !wasm(&["--check"]).status.success(),
+        "a changed module is stale"
+    );
+}
+
+#[test]
+fn game_wasm_needs_a_predicted_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut surface: serde_json::Value = serde_json::from_str(&sample_surface()).unwrap();
+    surface.as_object_mut().unwrap().remove("predict");
+    let manifest = tmp.path().join("surface.json");
+    fs::write(&manifest, surface.to_string()).unwrap();
+    let run = distributed(&[
+        "game-wasm",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--out",
+        tmp.path().join("gen").to_str().unwrap(),
+    ]);
+    assert!(!run.status.success());
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("declares no predicted step"),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }

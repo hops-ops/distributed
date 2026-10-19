@@ -9,6 +9,7 @@
 //! | [`GameEvent`] | struct / enum | `GameEvent`: stable ids, typed payload codec |
 //! | [`GameRecord`] | struct | `Wire`: a nested payload record |
 //! | [`FactCommand`] | struct | `FactCommand`: the cell command name of a fact input |
+//! | [`macro@predict`] (attribute) | fn | `PredictStep` for a client-predicted step + its WebAssembly export |
 //!
 //! Field attributes (where they apply):
 //!
@@ -25,11 +26,12 @@
 mod event;
 mod fact;
 mod input;
+mod predict;
 mod replicated;
 mod shared;
 
 use proc_macro::TokenStream;
-use syn::{parse_macro_input, DeriveInput};
+use syn::{parse_macro_input, DeriveInput, ItemFn};
 
 fn finish(result: syn::Result<proc_macro2::TokenStream>) -> TokenStream {
     result.unwrap_or_else(|e| e.to_compile_error()).into()
@@ -82,4 +84,20 @@ pub fn derive_game_record(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(FactCommand, attributes(fact))]
 pub fn derive_fact_command(input: TokenStream) -> TokenStream {
     finish(fact::expand(parse_macro_input!(input as DeriveInput)))
+}
+
+/// Declare a zone's client-predicted step:
+/// `#[predict(ArenaStep, kind = "player")]` on
+/// `fn(state: &State, input: &Input, context: &Context, dt: f32) -> State`.
+///
+/// Keeps the function and adds `struct ArenaStep` implementing
+/// `distributed_game::prediction::PredictStep` (name it in
+/// `GameSurface::predict::<ArenaStep>()`). On `wasm32` it also exports the
+/// step as `dg_predict_<fn name>` over the binary ABI described in
+/// `distributed_game::prediction`.
+#[proc_macro_attribute]
+pub fn predict(args: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as predict::Args);
+    let function = parse_macro_input!(item as ItemFn);
+    finish(predict::expand(args, function))
 }

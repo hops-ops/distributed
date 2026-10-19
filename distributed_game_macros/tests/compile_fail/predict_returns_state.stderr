@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/predict_returns_state.rs:14:4
+   |
+14 | fn step(state: &State, _input: &Push, _context: &(), _dt: f32) -> f32 {
+   |    ^^^^^^^^^^^^^-----^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |    |            |
+   |    |            expected `State` because of return type
+   |    expected `State`, found `f32`
+   |
+help: try wrapping the expression in `State`
+   |
+14 | fn State { x: step(state: &State, _input: &Push, _context: &(), _dt: f32) -> f32 } {
+   |    ++++++++++                                                                    +

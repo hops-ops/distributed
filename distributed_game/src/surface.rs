@@ -21,12 +21,13 @@
 use serde::{Deserialize, Serialize};
 
 use crate::codec::WireType;
+use crate::prediction::{PredictContext, PredictStep};
 use crate::protocol::PROTOCOL_VERSION;
 use crate::schema::{Correction, EntitySchema};
-use crate::{GameEvent, GameInput, Zone};
+use crate::{GameEvent, GameInput, Wire, Zone};
 
 /// Version of the [`GameSurface`] JSON shape.
-pub const GAME_SURFACE_SCHEMA_VERSION: u32 = 1;
+pub const GAME_SURFACE_SCHEMA_VERSION: u32 = 2;
 
 /// One zone type's client-facing surface. See the module docs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,8 +45,31 @@ pub struct GameSurface {
     pub input: Option<InputSurface>,
     /// Events by id.
     pub events: Vec<EventSurface>,
-    /// Records mentioned by inputs or events, by name.
+    /// Records mentioned by inputs, events or the predicted step, by name.
     pub records: Vec<RecordSurface>,
+    /// The client-predicted step, compiled to WebAssembly (see
+    /// [`crate::prediction`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predict: Option<PredictSurface>,
+}
+
+/// The zone's client-predicted step ([`crate::prediction::PredictStep`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PredictSurface {
+    /// Predicted kind (the controlled entity's kind).
+    pub kind: String,
+    /// Cargo package declaring the step (compiled to WebAssembly).
+    pub package: String,
+    /// Export suffix: the module exports `dg_predict_<export>`.
+    pub export: String,
+    /// State record (fields named after the kind's fields).
+    pub state: String,
+    /// Context record, if the step takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Binary ABI version ([`crate::prediction::ABI_VERSION`]).
+    pub abi: u32,
 }
 
 /// One replicated kind.
@@ -167,6 +191,7 @@ impl GameSurface {
             input: None,
             events: Vec::new(),
             records: Vec::new(),
+            predict: None,
         }
     }
 
@@ -236,6 +261,74 @@ impl GameSurface {
         self
     }
 
+    /// Declare the zone's client-predicted step (`#[predict]`). Checks that
+    /// it predicts a kind of this surface, takes the surface's input, and
+    /// that every state field names a field of the kind with a matching
+    /// scalar type; panics otherwise (surface export time).
+    pub fn predict<P: PredictStep>(mut self) -> Self {
+        let mut records = Vec::new();
+        let input = P::Input::input_surface(&mut records);
+        assert_eq!(
+            self.input.as_ref(),
+            Some(&input),
+            "predicted step {} of game surface {} must take the zone's input type",
+            P::EXPORT,
+            self.name
+        );
+        let kind = self
+            .kinds
+            .iter()
+            .find(|k| k.name == P::KIND)
+            .unwrap_or_else(|| {
+                panic!(
+                    "predicted step {} names kind {:?}, which game surface {} does not replicate",
+                    P::EXPORT,
+                    P::KIND,
+                    self.name
+                )
+            })
+            .clone();
+        let state = record_name(P::State::wire_type(), "state", P::EXPORT);
+        P::State::records(&mut records);
+        let state_record = records
+            .iter()
+            .find(|r| r.name == state)
+            .expect("a record pushes its own definition")
+            .clone();
+        for field in &state_record.fields {
+            let entity = kind
+                .fields
+                .iter()
+                .find(|f| f.name == field.name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "predicted state {state} field {} is not a field of kind {}",
+                        field.name, kind.name
+                    )
+                });
+            assert!(
+                state_field_matches(&field.ty, &entity.ty),
+                "predicted state {state} field {} ({:?}) does not match kind {} field type {:?}",
+                field.name,
+                field.ty,
+                kind.name,
+                entity.ty
+            );
+        }
+        let context = P::Context::context_type().map(|ty| record_name(ty, "context", P::EXPORT));
+        P::Context::context_records(&mut records);
+        self.predict = Some(PredictSurface {
+            kind: P::KIND.to_string(),
+            package: P::PACKAGE.to_string(),
+            export: P::EXPORT.to_string(),
+            state,
+            context,
+            abi: crate::prediction::ABI_VERSION,
+        });
+        self.add_records(records);
+        self
+    }
+
     fn add_records(&mut self, records: Vec<RecordSurface>) {
         for record in records {
             match self.records.iter().find(|r| r.name == record.name) {
@@ -254,5 +347,30 @@ impl GameSurface {
     /// records by name).
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("game surface serializes")
+    }
+}
+
+fn record_name(ty: WireType, what: &str, export: &str) -> String {
+    match ty {
+        WireType::Record { name } => name,
+        other => panic!(
+            "predicted step {export}: the {what} must be a #[derive(GameRecord)] struct, not {other:?}"
+        ),
+    }
+}
+
+/// A state field holds the plain value of an entity field: `f32` for float
+/// fields (quantized or not, the step works on full binary32), the same
+/// integer / bool type otherwise.
+fn state_field_matches(state: &WireType, entity: &WireType) -> bool {
+    match state {
+        WireType::F32 => matches!(
+            entity,
+            WireType::F32 | WireType::Quant { .. } | WireType::Angle { .. }
+        ),
+        WireType::Bool | WireType::U8 | WireType::U16 | WireType::U32 | WireType::I32 => {
+            state == entity
+        }
+        _ => false,
     }
 }

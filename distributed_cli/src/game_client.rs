@@ -1,5 +1,5 @@
 //! `distributed game-client`: typed TypeScript for one `distributed_game`
-//! zone surface (`GameSurface` JSON, schema v1, from `distributed
+//! zone surface (`GameSurface` JSON, schema v2, from `distributed
 //! game-manifest`).
 //!
 //! The generated files import only `@hops-ops/distributed/game` and are
@@ -10,7 +10,8 @@
 //! | `schema.ts` | `KIND` ids, per-kind field interfaces + accessors over rendered entities, field wire types, `CORRECTIONS` defaults |
 //! | `input.ts` | the input interface, `BUTTON` bits, `encodeInput` / `decodeInput` / `sanitizeInput` |
 //! | `events.ts` | record + event payload interfaces, `EVENT` ids, `EVENTS` codecs, `decodeEvent`, `onEvent` |
-//! | `client.ts` | `create<Surface>Client`: a `GameClient` with the input encoder and correction defaults wired in, plus typed `on` |
+//! | `client.ts` | `create<Surface>Client`: a `GameClient` with the input encoder and correction defaults wired in, plus typed `on`; with a predicted step, prediction defaults to the compiled WebAssembly step |
+//! | `predict.ts` | only with a `#[predict]` step: its state/context layouts, the module URL (`wasm/<surface>.wasm`, built by `distributed game-wasm`) and `create<Surface>Prediction` |
 //! | `index.ts` | re-exports |
 //! | `surface.json` | the surface it was generated from (so `--check` also catches manifest drift) |
 //!
@@ -26,7 +27,10 @@ use serde::Deserialize;
 use crate::client_compiler::GeneratedClientFile;
 
 /// The only surface schema version this generator understands.
-pub const GAME_SURFACE_SCHEMA_VERSION: u32 = 1;
+pub const GAME_SURFACE_SCHEMA_VERSION: u32 = 2;
+
+/// The only prediction ABI version this generator (and the SDK) speaks.
+pub const PREDICT_ABI_VERSION: u32 = 1;
 
 const SDK: &str = "@hops-ops/distributed/game";
 
@@ -51,7 +55,7 @@ impl ImportExtension {
     }
 }
 
-// ---- surface mirror (schema v1) -------------------------------------------
+// ---- surface mirror (schema v2) -------------------------------------------
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -63,6 +67,21 @@ struct Surface {
     input: Option<Input>,
     events: Vec<Event>,
     records: Vec<Record>,
+    #[serde(default)]
+    predict: Option<Predict>,
+}
+
+/// The zone's client-predicted step (`#[predict]`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct Predict {
+    pub(crate) kind: String,
+    pub(crate) package: String,
+    pub(crate) export: String,
+    pub(crate) state: String,
+    #[serde(default)]
+    pub(crate) context: Option<String>,
+    pub(crate) abi: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,8 +369,26 @@ pub fn generate_game_client(
             serde_json::to_string_pretty(&value).expect("surface serializes") + "\n",
         ),
     ];
+    if let Some(predict) = gen.predict_ts()? {
+        files.push(file("predict.ts", predict));
+    }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+/// What `distributed game-wasm` builds for a surface: its name and its
+/// validated predicted step (`None` when the zone predicts nothing).
+pub(crate) fn surface_prediction(manifest_json: &str) -> GenResult<(String, Option<Predict>)> {
+    validate_game_surface(manifest_json)?;
+    let surface: Surface =
+        serde_json::from_str(manifest_json).map_err(|e| format!("invalid game surface: {e}"))?;
+    Ok((surface.name, surface.predict))
+}
+
+/// Module path of a surface's compiled step, relative to the generated
+/// client directory.
+pub(crate) fn predict_wasm_path(surface: &str) -> String {
+    format!("wasm/{surface}.wasm")
 }
 
 /// Validate a manifest (as `game-manifest` prints it).
@@ -451,7 +488,89 @@ impl<'a> Gen<'a> {
             }
         }
         self.record_order()?;
+        self.check_predict()?;
         self.check_exports()
+    }
+
+    /// The predicted step names a kind of this surface, a state record whose
+    /// fields are fields of that kind (plain scalar types), an optional
+    /// context record, and the ABI this generator speaks.
+    fn check_predict(&self) -> GenResult<()> {
+        let Some(predict) = &self.surface.predict else {
+            return Ok(());
+        };
+        if predict.abi != PREDICT_ABI_VERSION {
+            return Err(format!(
+                "predicted step uses ABI v{}; this CLI generates ABI v{PREDICT_ABI_VERSION}",
+                predict.abi
+            ));
+        }
+        if predict.export.is_empty()
+            || !predict
+                .export
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(format!(
+                "invalid predicted step export {:?}",
+                predict.export
+            ));
+        }
+        if predict.package.is_empty() {
+            return Err("predicted step names no Cargo package".into());
+        }
+        if self.surface.input.is_none() {
+            return Err("a predicted step needs the zone's input type".into());
+        }
+        let kind = self
+            .surface
+            .kinds
+            .iter()
+            .find(|k| k.name == predict.kind)
+            .ok_or_else(|| format!("predicted kind {:?} is not replicated", predict.kind))?;
+        let state = self
+            .records
+            .get(predict.state.as_str())
+            .ok_or_else(|| format!("predicted state record {} is missing", predict.state))?;
+        if state.fields.is_empty() {
+            return Err(format!("predicted state {} has no fields", state.name));
+        }
+        for field in &state.fields {
+            let entity = kind
+                .fields
+                .iter()
+                .find(|f| f.name == field.name)
+                .ok_or_else(|| {
+                    format!(
+                        "predicted state {} field {} is not a field of kind {}",
+                        state.name, field.name, kind.name
+                    )
+                })?;
+            let matches = match field.ty {
+                Wire::F32 => matches!(
+                    entity.ty,
+                    Wire::F32 | Wire::Quant { .. } | Wire::Angle { .. }
+                ),
+                Wire::Bool => matches!(entity.ty, Wire::Bool),
+                Wire::U8 => matches!(entity.ty, Wire::U8),
+                Wire::U16 => matches!(entity.ty, Wire::U16),
+                Wire::U32 => matches!(entity.ty, Wire::U32),
+                Wire::I32 => matches!(entity.ty, Wire::I32),
+                _ => false,
+            };
+            if !matches {
+                return Err(format!(
+                    "predicted state {} field {} does not match the type of kind {} field {}",
+                    state.name, field.name, kind.name, entity.name
+                ));
+            }
+        }
+        if let Some(context) = &predict.context {
+            if !self.records.contains_key(context.as_str()) {
+                return Err(format!("predicted context record {context} is missing"));
+            }
+        }
+        Ok(())
     }
 
     /// Every name the generated modules export, so `index.ts` re-exports
@@ -501,6 +620,20 @@ impl<'a> Gen<'a> {
         }
         for event in &self.surface.events {
             names.push(format!("{}Event", pascal(&event.name)));
+        }
+        if self.surface.predict.is_some() {
+            names.extend(
+                [
+                    "PREDICT",
+                    "PREDICT_STATE",
+                    "PREDICT_CONTEXT",
+                    "PREDICT_WASM_URL",
+                    "PredictContext",
+                ]
+                .map(String::from),
+            );
+            names.push(format!("create{prefix}Prediction"));
+            names.push(format!("{prefix}Prediction"));
         }
         let mut seen = BTreeSet::new();
         for name in names {
@@ -883,12 +1016,17 @@ impl<'a> Gen<'a> {
         if uses_value {
             sdk.extend(["decodeValue", "encodeValue"]);
         }
-        if uses_value || !records.is_empty() {
+        if uses_value
+            || records
+                .iter()
+                .any(|r| self.encoded_records().contains(r.name.as_str()))
+        {
             sdk.push("type WireType");
         }
         sdk.sort_by_key(|s| (s.starts_with("type "), s.to_string()));
         let _ = writeln!(out, "import {{ {} }} from '{SDK}';", sdk.join(", "));
 
+        let encoded = self.encoded_records();
         for record in &records {
             out.push('\n');
             out.push_str(&self.interface(
@@ -896,12 +1034,16 @@ impl<'a> Gen<'a> {
                 &format!("Record `{}` (`#[derive(GameRecord)]`).", record.name),
                 &record.fields,
             ));
-            let _ = writeln!(
-                out,
-                "\nconst {}_TYPE: WireType = {{\n\ttype: 'record',\n\tfields: {}\n}};",
-                constant(&record.name),
-                indent(&self.layout(&record.fields))
-            );
+            // Records only the predicted step uses (its state and context)
+            // are encoded by `predict.ts` layouts, not by an event codec.
+            if encoded.contains(record.name.as_str()) {
+                let _ = writeln!(
+                    out,
+                    "\nconst {}_TYPE: WireType = {{\n\ttype: 'record',\n\tfields: {}\n}};",
+                    constant(&record.name),
+                    indent(&self.layout(&record.fields))
+                );
+            }
         }
 
         for event in events {
@@ -997,11 +1139,44 @@ impl<'a> Gen<'a> {
         Ok(out)
     }
 
+    /// Records an event payload (or the input) encodes, directly or nested.
+    fn encoded_records(&self) -> BTreeSet<&'a str> {
+        fn walk<'r>(ty: &'r Wire, out: &mut Vec<&'r str>) {
+            match ty {
+                Wire::List { item } | Wire::Optional { item } => walk(item, out),
+                Wire::Record { name } => out.push(name),
+                _ => {}
+            }
+        }
+        let mut pending = Vec::new();
+        for event in &self.surface.events {
+            match &event.payload {
+                Payload::Fields { fields } => fields.iter().for_each(|f| walk(&f.ty, &mut pending)),
+                Payload::Value { ty } => walk(ty, &mut pending),
+            }
+        }
+        if let Some(input) = &self.surface.input {
+            input.fields.iter().for_each(|f| walk(&f.ty, &mut pending));
+        }
+        let mut seen = BTreeSet::new();
+        while let Some(name) = pending.pop() {
+            if seen.insert(name) {
+                if let Some(record) = self.records.get(name) {
+                    record.fields.iter().for_each(|f| walk(&f.ty, &mut pending));
+                }
+            }
+        }
+        seen
+    }
+
     fn client_ts(&self) -> String {
         let prefix = pascal(&self.surface.name);
         let mut out = self.header("Typed client factory.");
         let input = self.surface.input.as_ref().map(|i| i.name.as_str());
         match input {
+            Some(name) if self.surface.predict.is_some() => {
+                out.push_str(&self.predicted_client_ts(name));
+            }
             Some(name) => {
                 let _ = writeln!(
                     out,
@@ -1044,12 +1219,146 @@ impl<'a> Gen<'a> {
         out
     }
 
+    /// `client.ts` of a surface with a `#[predict]` step: prediction defaults
+    /// to the compiled WebAssembly step.
+    fn predicted_client_ts(&self, name: &str) -> String {
+        let prefix = pascal(&self.surface.name);
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "import {{ GameClient, mergeCorrections, type GameClientOptions, type GamePredictionOptions, type WasmSource }} from '{SDK}';\n\nimport {{ EVENTS, type Events }} from '{}';\nimport {{ encodeInput, type {name} }} from '{}';\nimport {{ create{prefix}Prediction, type {prefix}Prediction }} from '{}';\nimport {{ CORRECTIONS }} from '{}';\n",
+            self.local("events"),
+            self.local("input"),
+            self.local("predict"),
+            self.local("schema")
+        );
+        let _ = writeln!(
+            out,
+            "/**\n * Prediction tuning; `encodeInput`, the correction defaults and `predict` (the\n * compiled `#[predict]` step) are filled in. A `predict` given here replaces\n * the WebAssembly step.\n */\nexport type {prefix}PredictionOptions = Omit<GamePredictionOptions<{name}>, 'encodeInput' | 'predict'> &\n\tPartial<Pick<GamePredictionOptions<{name}>, 'encodeInput' | 'predict'>>;\n\nexport type {prefix}ClientOptions = Omit<GameClientOptions<{name}>, 'prediction'> &\n\tReadonly<{{\n\t\t/** Prediction tuning, or `false` for none. Default: the compiled step. */\n\t\tprediction?: {prefix}PredictionOptions | false;\n\t\t/** Where to load the compiled step from (default `PREDICT_WASM_URL`). */\n\t\twasm?: WasmSource;\n\t}}>;\n"
+        );
+        let _ = writeln!(
+            out,
+            "export type {prefix}Client = Readonly<{{\n\tclient: GameClient<{name}>;\n\t/** The compiled step (`ready`, `setContext`); undefined when prediction is off or custom. */\n\tprediction: {prefix}Prediction | undefined;\n\t/** Typed event subscription (every zone); returns the unsubscribe. */\n\ton<K extends keyof Events>(name: K, handler: (value: Events[K], zoneId: string) => void): () => void;\n\t/** Send one input: predicted when prediction is on, raw otherwise. */\n\tsend(input: {name}): number | undefined;\n}}>;\n"
+        );
+        let _ = write!(
+            out,
+            "/**\n * A `GameClient` for the `{surface}` surface with its input encoder, correction\n * defaults and the compiled predicted step wired in.\n */\nexport function create{prefix}Client(options: {prefix}ClientOptions): {prefix}Client {{\n\tconst {{ prediction: tuning, wasm, ...rest }} = options;\n\tconst prediction =\n\t\ttuning === false || tuning?.predict !== undefined ? undefined : create{prefix}Prediction(wasm);\n\tconst client = new GameClient<{name}>({{\n\t\t...rest,\n\t\tprediction:\n\t\t\ttuning === false\n\t\t\t\t? undefined\n\t\t\t\t: {{\n\t\t\t\t\t\t...tuning,\n\t\t\t\t\t\tpredict: tuning?.predict ?? prediction!.predict,\n\t\t\t\t\t\tencodeInput: tuning?.encodeInput ?? ((input) => encodeInput(input)),\n\t\t\t\t\t\tcorrections: mergeCorrections(CORRECTIONS, tuning?.corrections)\n\t\t\t\t\t}}\n\t}});\n\treturn {{\n\t\tclient,\n\t\tprediction,\n\t\ton: (name, handler) =>\n\t\t\tclient.on('event', (zoneId, event) => {{\n\t\t\t\tconst codec = EVENTS[name];\n\t\t\t\tif (event.typeId === codec.id) handler(codec.decode(event.payload), zoneId);\n\t\t\t}}),\n\t\tsend: (input) =>\n\t\t\ttuning === false ? client.sendRawInput(encodeInput(input)) : client.sendInput(input)\n\t}};\n}}\n",
+            surface = self.surface.name
+        );
+        out
+    }
+
     fn index_ts(&self) -> String {
         let mut out = self.header("Everything generated for this surface.");
-        for module in ["client", "events", "input", "schema"] {
+        let mut modules = vec!["client", "events", "input"];
+        if self.surface.predict.is_some() {
+            modules.push("predict");
+        }
+        modules.push("schema");
+        for module in modules {
             let _ = writeln!(out, "export * from '{}';", self.local(module));
         }
         out
+    }
+
+    fn predict_ts(&self) -> GenResult<Option<String>> {
+        let Some(predict) = &self.surface.predict else {
+            return Ok(None);
+        };
+        let input = self
+            .surface
+            .input
+            .as_ref()
+            .ok_or("a predicted step needs the zone's input type")?;
+        let state = self.records[predict.state.as_str()];
+        let prefix = pascal(&self.surface.name);
+        let mut out = self.header(
+            "Client-predicted step: the Rust `#[predict]` fn compiled to WebAssembly (binary ABI).",
+        );
+        let mut sdk = vec![
+            "createWasmPrediction",
+            "type PredictStateLayout",
+            "type WasmPrediction",
+            "type WasmSource",
+        ];
+        if predict.context.is_some() {
+            sdk.push("type PayloadLayout");
+        }
+        let _ = writeln!(out, "import {{ {} }} from '{SDK}';\n", sdk.join(", "));
+        if let Some(context) = &predict.context {
+            let _ = writeln!(
+                out,
+                "import type {{ {context} }} from '{}';",
+                self.local("events")
+            );
+        }
+        let _ = writeln!(
+            out,
+            "import {{ encodeInput, type {} }} from '{}';\n",
+            input.name,
+            self.local("input")
+        );
+        let _ = writeln!(
+            out,
+            "/** The predicted step: `#[predict]` fn `{}` of Cargo package `{}`, predicting kind `{}`. */\nexport const PREDICT = {{\n\tkind: {},\n\texport: {},\n\tpackage: {},\n\tstate: {},\n\tabi: {},\n}} as const;\n",
+            predict.export,
+            predict.package,
+            predict.kind,
+            string(&predict.kind),
+            string(&predict.export),
+            string(&predict.package),
+            string(&predict.state),
+            predict.abi
+        );
+        let _ = writeln!(
+            out,
+            "/** Predicted `{}` fields (record `{}`): wire field name and codec type, in record order. */\nexport const PREDICT_STATE: PredictStateLayout = [",
+            predict.kind, state.name
+        );
+        for field in &state.fields {
+            let _ = writeln!(
+                out,
+                "\t[{}, {}],",
+                string(&field.name),
+                self.wire_literal(&field.ty)
+            );
+        }
+        out.push_str("];\n\n");
+        match &predict.context {
+            Some(context) => {
+                let record = self.records[context.as_str()];
+                let _ = writeln!(
+                    out,
+                    "/** What the step reads besides state and input (`prediction.setContext`). */\nexport type PredictContext = {context};\n\n/** Layout of the context record `{context}`. */\nexport const PREDICT_CONTEXT: PayloadLayout | undefined = {};\n",
+                    self.layout(&record.fields)
+                );
+            }
+            None => {
+                out.push_str("/** The step takes no context. */\nexport type PredictContext = undefined;\n\n/** The step takes no context. */\nexport const PREDICT_CONTEXT = undefined;\n\n");
+            }
+        }
+        let _ = writeln!(
+            out,
+            "/** The compiled step (`distributed game-wasm`); bundlers emit it as an asset. */\nexport const PREDICT_WASM_URL: URL = new URL({}, import.meta.url);\n",
+            string(&format!("./{}", predict_wasm_path(&self.surface.name)))
+        );
+        let _ = writeln!(
+            out,
+            "/** The `{surface}` step as `GameClient` prediction (see `createWasmPrediction`). */\nexport type {prefix}Prediction = WasmPrediction<{input}, PredictContext>;\n",
+            surface = self.surface.name,
+            input = input.name
+        );
+        let _ = writeln!(
+            out,
+            "/**\n * Load the compiled step (default `PREDICT_WASM_URL`) as prediction: `predict`\n * leaves the state unchanged until `ready` resolves{}.\n */\nexport function create{prefix}Prediction(source: WasmSource = PREDICT_WASM_URL): {prefix}Prediction {{\n\treturn createWasmPrediction<{input}, PredictContext>({{\n\t\tsource,\n\t\texportName: PREDICT.export,\n\t\tstate: PREDICT_STATE,\n\t\tcontext: PREDICT_CONTEXT,\n\t\tencodeInput\n\t}});\n}}",
+            if predict.context.is_some() {
+                " and a context is set"
+            } else {
+                ""
+            },
+            input = input.name
+        );
+        Ok(Some(out))
     }
 }
 
@@ -1121,19 +1430,78 @@ mod tests {
 
     #[test]
     fn rejects_other_schema_versions_and_unknown_fields() {
-        let err = generate_game_client(r#"{"schemaVersion": 2}"#, ImportExtension::Ts).unwrap_err();
+        let err = generate_game_client(r#"{"schemaVersion": 1}"#, ImportExtension::Ts).unwrap_err();
         assert!(err.contains("schemaVersion"), "{err}");
         let err = generate_game_client(
-            r#"{"schemaVersion":1,"name":"x","protocolVersion":1,"kinds":[],"input":null,"events":[],"records":[],"extra":1}"#,
+            r#"{"schemaVersion":2,"name":"x","protocolVersion":1,"kinds":[],"input":null,"events":[],"records":[],"extra":1}"#,
             ImportExtension::Ts,
         )
         .unwrap_err();
         assert!(err.contains("unknown field"), "{err}");
     }
 
+    fn sample() -> serde_json::Value {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../distributed_game/tests/fixtures/authoring.json"
+        ))
+        .unwrap();
+        fixture["surface"].clone()
+    }
+
+    fn generate(surface: &serde_json::Value) -> GenResult<Vec<GeneratedClientFile>> {
+        generate_game_client(&surface.to_string(), ImportExtension::Ts)
+    }
+
+    #[test]
+    fn validates_the_predicted_step() {
+        let ok = sample();
+        let files = generate(&ok).unwrap();
+        let predict = files.iter().find(|f| f.path == "predict.ts").unwrap();
+        assert!(predict
+            .contents
+            .contains("new URL('./wasm/sample.wasm', import.meta.url)"));
+        assert!(predict.contents.contains("['dead', { type: 'bool' }]"));
+
+        type Mutate = fn(&mut serde_json::Value);
+        let cases: [(&str, Mutate); 6] = [
+            ("ABI v9", |s| s["predict"]["abi"] = 9.into()),
+            ("not replicated", |s| s["predict"]["kind"] = "ghost".into()),
+            ("state record Nope is missing", |s| {
+                s["predict"]["state"] = "Nope".into()
+            }),
+            ("context record Nope is missing", |s| {
+                s["predict"]["context"] = "Nope".into()
+            }),
+            ("invalid predicted step export", |s| {
+                s["predict"]["export"] = "a-b".into()
+            }),
+            ("does not match the type", |s| {
+                let records = s["records"].as_array_mut().unwrap();
+                let state = records
+                    .iter_mut()
+                    .find(|r| r["name"] == "SampleState")
+                    .unwrap();
+                state["fields"][2]["type"] = serde_json::json!({"type": "u16"});
+            }),
+        ];
+        for (expected, mutate) in cases {
+            let mut surface = ok.clone();
+            mutate(&mut surface);
+            let err = generate(&surface).unwrap_err();
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+
+        let mut none = ok.clone();
+        none.as_object_mut().unwrap().remove("predict");
+        let files = generate(&none).unwrap();
+        assert!(files.iter().all(|f| f.path != "predict.ts"));
+        let client = files.iter().find(|f| f.path == "client.ts").unwrap();
+        assert!(!client.contents.contains("Prediction("));
+    }
+
     #[test]
     fn rejects_recursive_records() {
-        let json = r#"{"schemaVersion":1,"name":"x","protocolVersion":1,"kinds":[],"input":null,"events":[],
+        let json = r#"{"schemaVersion":2,"name":"x","protocolVersion":1,"kinds":[],"input":null,"events":[],
             "records":[{"name":"Node","fields":[{"name":"next","type":{"type":"optional","item":{"type":"record","name":"Node"}}}]}]}"#;
         let err = generate_game_client(json, ImportExtension::Ts).unwrap_err();
         assert!(err.contains("recursive"), "{err}");
