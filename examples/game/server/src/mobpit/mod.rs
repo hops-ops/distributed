@@ -52,6 +52,12 @@ pub struct MobPitArgs {
     /// Start with this artificial storage latency (ms).
     #[arg(long, env = "MOBPIT_STORAGE_LATENCY_MS", default_value_t = 0)]
     pub storage_latency_ms: u64,
+    /// SQLite bus (`sqlite:/path/bus.db`) to publish the Crawler cells'
+    /// `crawler.mob_killed` domain events to; `mobpit-service` projects them
+    /// into its `player_stats` read model. Unset: events stay in the cells'
+    /// outboxes until a bus is attached.
+    #[arg(long, env = "MOBPIT_PROJECTION_BUS")]
+    pub projection_bus: Option<String>,
 }
 
 /// Demo registration.
@@ -133,6 +139,13 @@ pub async fn run(mut args: MobPitArgs) -> std::io::Result<()> {
             serde_json::to_string(&report).unwrap_or_default()
         ),
         Err(error) => eprintln!("mobpit: leaderboard rebuild failed (serving anyway): {error}"),
+    }
+    if let Some(url) = &args.projection_bus {
+        let published = world
+            .attach_projection_bus(url, std::time::Duration::from_secs(2))
+            .await
+            .map_err(std::io::Error::other)?;
+        eprintln!("mobpit: projection bus {url} (published {published} pending events)");
     }
     eprintln!(
         "mobpit: data dir {} · boot {} · leaderboard {}",

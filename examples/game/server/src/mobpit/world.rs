@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use distributed_game::net::{GameServer, ServerConfig};
@@ -12,7 +13,7 @@ use distributed_game::RetryPolicy;
 use serde_json::{json, Value};
 
 use super::board::Leaderboards;
-use super::store::{CrawlerCells, CrawlerFactSink, SinkState};
+use super::store::{CrawlerCells, CrawlerFactSink, ProjectionBus, SinkState};
 use super::zone::{MobPit, MobPitConfig};
 use super::{routes, MobPitDemo};
 use crate::common::{random_hex, Demo, Guests};
@@ -58,6 +59,7 @@ pub struct MobPitWorld {
     board: Arc<Leaderboards>,
     zone_pending: AtomicUsize,
     profiles: Arc<Mutex<Vec<LoadedProfile>>>,
+    projection: Arc<std::sync::OnceLock<ProjectionBus>>,
 }
 
 impl MobPitWorld {
@@ -74,6 +76,7 @@ impl MobPitWorld {
             board,
             zone_pending: AtomicUsize::new(0),
             profiles: Arc::default(),
+            projection: Arc::default(),
         }))
     }
 
@@ -105,7 +108,39 @@ impl MobPitWorld {
 
     /// The game's fact sink.
     pub fn fact_sink(&self) -> CrawlerFactSink {
-        CrawlerFactSink::new(self.cells.clone(), self.sink.clone(), self.board.clone())
+        CrawlerFactSink::new(
+            self.cells.clone(),
+            self.sink.clone(),
+            self.board.clone(),
+            self.projection.clone(),
+        )
+    }
+
+    /// Publish the cells' Crawler domain events to the SQLite bus at `url`
+    /// (the read-model service consumes it): drain what is pending now, then
+    /// after every commit, and sweep every `sweep` for anything a crash or a
+    /// bus outage left behind. Call once, inside a Tokio runtime.
+    pub async fn attach_projection_bus(&self, url: &str, sweep: Duration) -> Result<usize, String> {
+        let bus = ProjectionBus::open(url).await?;
+        let published = self.cells.drain_all(&bus).await;
+        self.projection
+            .set(bus.clone())
+            .map_err(|_| "projection bus already attached".to_string())?;
+        let cells = self.cells.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(sweep);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                cells.drain_all(&bus).await;
+            }
+        });
+        Ok(published)
+    }
+
+    /// The attached projection bus, if any.
+    pub fn projection_bus(&self) -> Option<&ProjectionBus> {
+        self.projection.get()
     }
 
     pub(crate) fn set_zone_pending(&self, n: usize) {
