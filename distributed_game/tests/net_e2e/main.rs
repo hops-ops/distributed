@@ -36,7 +36,14 @@ fn ticket(principal: &str, zone: &str, nonce: &str, role: Role) -> String {
 async fn start(
     net_sim: Option<NetSim>,
 ) -> (String, GameServer<Arena>, tokio::task::JoinHandle<()>) {
-    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    start_keyed(SECRET, net_sim).await
+}
+
+async fn start_keyed(
+    secret: &str,
+    net_sim: Option<NetSim>,
+) -> (String, GameServer<Arena>, tokio::task::JoinHandle<()>) {
+    let mut config = ServerConfig::new(TicketKey::new(secret));
     config.host.tick_rate = 30;
     config.host.patch_rate = 20;
     config.net_sim = net_sim;
@@ -251,6 +258,87 @@ async fn client_joins_sends_inputs_receives_deltas_and_reconnects() {
         }
     }
     assert!(kicked);
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("server stops")
+        .unwrap();
+}
+
+/// Tickets minted in JavaScript by `@hops-ops/distributed/sveltekit/game/server`
+/// (`mintGameTicket`, reproduced byte for byte by `js/tests/sveltekit-game.test.mjs`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admits_tickets_minted_by_the_sveltekit_handler() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../fixtures/sveltekit_tickets.json")).unwrap();
+    let text = |path: &str| {
+        fixture
+            .pointer(path)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("fixture {path}"))
+            .to_string()
+    };
+    let secret = text("/secret");
+    let zone = text("/zone");
+
+    // The same key verifies the claims exactly.
+    let claims = TicketKey::new(secret.as_str())
+        .verify(&text("/valid/ticket"), 1_700_000_000)
+        .unwrap();
+    assert_eq!(claims.principal, text("/valid/principal"));
+    assert_eq!(claims.zone, zone);
+    assert_eq!(claims.expires_at, 4_000_000_000);
+    assert_eq!(claims.nonce, text("/valid/nonce"));
+    assert_eq!(claims.role, Role::Player);
+    assert_eq!(claims.name.as_deref(), Some("Ana"));
+
+    let (url, server, handle) = start_keyed(&secret, None).await;
+
+    // A real GameServer admits the JS-minted player ticket ...
+    let mut ws = connect(&url, &zone).await;
+    hello(&mut ws, text("/valid/ticket"), String::new()).await;
+    let mut mirror = ClientMirror::new();
+    let Some(ServerMessage::Welcome(welcome)) = next(&mut ws, &mut mirror).await else {
+        panic!("expected Welcome for the JS-minted ticket")
+    };
+    assert_eq!(welcome.zone_id, zone);
+    assert_eq!(welcome.role, Role::Player);
+    let players = server
+        .inspect(&zone, |host| host.players().cloned().collect::<Vec<_>>())
+        .await
+        .expect("zone active");
+    let player = players
+        .iter()
+        .find(|p| p.principal == text("/valid/principal"))
+        .expect("the principal comes from the JS-minted ticket");
+    assert_eq!(player.name.as_deref(), Some("Ana"));
+
+    // ... and the observer ticket.
+    let mut obs = connect(&url, &zone).await;
+    hello(&mut obs, text("/observer/ticket"), String::new()).await;
+    let Some(ServerMessage::Welcome(w)) = next(&mut obs, &mut ClientMirror::new()).await else {
+        panic!("expected Welcome for the JS-minted observer ticket")
+    };
+    assert_eq!(w.role, Role::Observer);
+
+    // Single use, signature, expiry and zone binding are enforced.
+    for (what, ticket) in [
+        ("replayed", text("/valid/ticket")),
+        ("tampered", text("/tampered")),
+        ("expired", text("/expired")),
+        ("wrong zone", text("/wrongZone")),
+        ("other key", text("/otherKey")),
+    ] {
+        let mut ws = connect(&url, &zone).await;
+        hello(&mut ws, ticket, String::new()).await;
+        match next(&mut ws, &mut ClientMirror::new()).await {
+            Some(ServerMessage::Error { code, .. }) => {
+                assert_eq!(code, error::UNAUTHORIZED, "{what}")
+            }
+            other => panic!("{what}: expected UNAUTHORIZED, got {other:?}"),
+        }
+    }
+
+    server.shutdown();
     tokio::time::timeout(Duration::from_secs(5), handle)
         .await
         .expect("server stops")
