@@ -1,0 +1,12 @@
+error[E0277]: `#[quant]` / `#[angle]` need an `f32` field, not `u8`
+ --> tests/compile_fail/replicated_quant_on_integer.rs:7:8
+  |
+7 |     x: u8,
+  |        ^^ quantize an f32
+  |
+  = help: the trait `QuantizedF32` is not implemented for `u8`
+help: the trait `QuantizedF32` is implemented for `f32`
+ --> $WORKSPACE/distributed_game/src/codec.rs
+  |
+  | impl QuantizedF32 for f32 {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^

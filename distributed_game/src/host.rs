@@ -30,8 +30,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::authoring::GameEvent;
 use crate::clock::Clock;
-use crate::facts::{EmitError, Fact, FactQueue, FactSettlement};
+use crate::facts::{EmitError, Fact, FactCommand, FactQueue, FactSettlement};
 use crate::handoff::{HandoffError, HandoffRequest, Transfer, TransferIssuer, MAX_CARRIED_BYTES};
 use crate::input::{ConsumePolicy, InputBuffer, PushOutcome, SequencedInput};
 use crate::interest::{InterestConfig, View};
@@ -250,6 +251,8 @@ pub(crate) struct Core<Z: Zone> {
     upward: Vec<ChildEvent>,
     child_inbox: Vec<ChildEvent>,
     dropped_frozen: u64,
+    /// Typed facts keyed without dedupe parts this tick: `(tick, count)`.
+    fact_seq: (u64, u32),
 }
 
 impl<Z: Zone> Core<Z> {
@@ -419,9 +422,78 @@ impl<Z: Zone> Ctx<'_, Z> {
             .unwrap_or_default()
     }
 
+    /// Typed fact for a cell command input, keyed restart-safely:
+    /// `"{C::COMMAND}:{zone}:{boot_epoch}:{parts…}"` with the input's
+    /// [`dedupe_parts`](FactCommand::dedupe_parts), or `t{tick}:{n}` (the
+    /// n-th such fact this tick) when it has none. Emit it with
+    /// [`emit_fact_for`](Self::emit_fact_for) (e.g. to keep it in a retry
+    /// backlog) or use [`emit`](Self::emit) directly.
+    pub fn fact<C: FactCommand>(&mut self, input: &C) -> Result<Fact, EmitError> {
+        let parts = input.dedupe_parts();
+        let key = if parts.is_empty() {
+            let tick = self.core.tick;
+            if self.core.fact_seq.0 != tick {
+                self.core.fact_seq = (tick, 0);
+            }
+            let n = self.core.fact_seq.1;
+            self.core.fact_seq.1 += 1;
+            self.fact_key(C::COMMAND, &[&format_args!("t{tick}"), &n])
+        } else {
+            let parts: Vec<&dyn std::fmt::Display> =
+                parts.iter().map(|p| p as &dyn std::fmt::Display).collect();
+            self.fact_key(C::COMMAND, &parts)
+        };
+        Fact::typed(key, input).map_err(|e| EmitError::Encode(e.to_string()))
+    }
+
+    /// [`fact`](Self::fact) with explicit dedupe parts (overriding the
+    /// input's own).
+    pub fn fact_with_key<C: FactCommand>(
+        &self,
+        input: &C,
+        parts: &[&dyn std::fmt::Display],
+    ) -> Result<Fact, EmitError> {
+        Fact::typed(self.fact_key(C::COMMAND, parts), input)
+            .map_err(|e| EmitError::Encode(e.to_string()))
+    }
+
+    /// Emit a typed cell command input on behalf of `player`: the principal
+    /// is bound from the player's verified ticket (the input carries no
+    /// identity), the key is derived as in [`fact`](Self::fact). Returns
+    /// the key. Never blocks.
+    pub fn emit<C: FactCommand>(
+        &mut self,
+        player: PlayerId,
+        input: C,
+    ) -> Result<String, EmitError> {
+        let fact = self.fact(&input)?;
+        let key = fact.key().to_string();
+        self.emit_fact_for(player, fact).map(|()| key)
+    }
+
+    /// [`emit`](Self::emit) with explicit dedupe parts.
+    pub fn emit_keyed<C: FactCommand>(
+        &mut self,
+        player: PlayerId,
+        input: C,
+        parts: &[&dyn std::fmt::Display],
+    ) -> Result<String, EmitError> {
+        let fact = self.fact_with_key(&input, parts)?;
+        let key = fact.key().to_string();
+        self.emit_fact_for(player, fact).map(|()| key)
+    }
+
+    /// Emit a typed zone/system fact (no principal; the sink's system
+    /// principal applies). Returns the key.
+    pub fn emit_zone<C: FactCommand>(&mut self, input: C) -> Result<String, EmitError> {
+        let fact = self.fact(&input)?;
+        let key = fact.key().to_string();
+        self.emit_fact(fact).map(|()| key)
+    }
+
     /// Emit a zone/system fact (no principal). Never blocks.
     pub fn emit_fact(&mut self, fact: Fact) -> Result<(), EmitError> {
-        self.emit(fact, None)
+        self.emit_bound(fact, None)
     }
 
     /// Emit a fact on behalf of `player`; the principal is bound from the
@@ -433,10 +505,10 @@ impl<Z: Zone> Ctx<'_, Z> {
             .get(&player)
             .map(|slot| slot.info.principal.clone())
             .ok_or(EmitError::UnknownPlayer)?;
-        self.emit(fact, Some(principal))
+        self.emit_bound(fact, Some(principal))
     }
 
-    fn emit(&mut self, fact: Fact, principal: Option<String>) -> Result<(), EmitError> {
+    fn emit_bound(&mut self, fact: Fact, principal: Option<String>) -> Result<(), EmitError> {
         let stamp = FactStamp {
             zone_id: self.core.zone_id.clone(),
             tick: self.core.tick,
@@ -476,6 +548,17 @@ impl<Z: Zone> Ctx<'_, Z> {
         for client in clients {
             self.core.send(client, frame.clone());
         }
+    }
+
+    /// Typed reliable event to one viewer (dropped if it has no live
+    /// connection).
+    pub fn send<E: GameEvent>(&mut self, to: impl Into<Viewer>, event: &E) {
+        self.send_event(to, event.event_id(), event.to_payload());
+    }
+
+    /// Typed reliable event to every connection.
+    pub fn broadcast<E: GameEvent>(&mut self, event: &E) {
+        self.broadcast_event(event.event_id(), event.to_payload());
     }
 
     /// Set a viewer's area of interest.
@@ -645,6 +728,7 @@ impl<Z: Zone> ZoneHost<Z> {
             upward: Vec::new(),
             child_inbox: Vec::new(),
             dropped_frozen: 0,
+            fact_seq: (0, 0),
             config,
         };
         let zone = Z::on_create(&mut Ctx { core: &mut core }, zone_config);
@@ -1274,6 +1358,11 @@ impl<Z: Zone> ZoneHost<Z> {
             core: &mut self.core,
         }
         .send_event(to, type_id, payload);
+    }
+
+    /// Send a typed event now (see [`Ctx::send`]).
+    pub fn send<E: GameEvent>(&mut self, to: Viewer, event: &E) {
+        self.send_event(to, event.event_id(), event.to_payload());
     }
 
     /// Kick a player now.

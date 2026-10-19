@@ -28,6 +28,8 @@ lease = ["dep:distributed"]
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
+distributed_game_macros = { version = "0.1.0", path = "../distributed_game_macros" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"], optional = true }
 distributed = { path = "..", default-features = false, optional = true }
@@ -40,6 +42,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 
 [dev-dependencies]
+trybuild = "=1.0.120"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.30"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

@@ -66,6 +66,32 @@ pub fn fact_key(prefix: &str, zone: &str, epoch: u64, parts: &[&dyn std::fmt::Di
     key
 }
 
+/// A cell command input a zone may emit as a typed fact
+/// (`#[derive(FactCommand)]`, or implement by hand).
+///
+/// `COMMAND` names the durable command the input belongs to: point it at
+/// the same constant the cell mounts it under (`typed_command::<I, O>(NAME)`
+/// or `#[command]`'s generated `<HANDLER>_COMMAND_ID`), so the zone and the
+/// handler cannot disagree. [`Ctx::emit`](crate::Ctx::emit) then builds the
+/// restart-safe key (`"{COMMAND}:{zone}:{boot_epoch}:{parts…}"`) from
+/// [`dedupe_parts`](Self::dedupe_parts), or from the tick and emission order
+/// when it returns none.
+///
+/// Trust rules (enforced by the host, not by this trait): the principal is
+/// bound from the player's verified ticket, never from the input; the input
+/// reports *what happened* (which mob died) and the command handler decides
+/// any reward. The derive rejects identity- and reward-looking field names.
+pub trait FactCommand: serde::Serialize {
+    /// Durable command name.
+    const COMMAND: &'static str;
+
+    /// Parts that identify this logical outcome within one zone activation
+    /// (e.g. mob id + generation). Empty = use the tick and emission order.
+    fn dedupe_parts(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 /// A durable outcome to commit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fact {
@@ -89,6 +115,19 @@ impl Fact {
             principal: None,
             stamp: FactStamp::default(),
         }
+    }
+
+    /// Typed fact: `C::COMMAND` with `input` serialized as its payload.
+    pub fn typed<C: FactCommand>(
+        key: impl Into<String>,
+        input: &C,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self::new(key, C::COMMAND, serde_json::to_value(input)?))
+    }
+
+    /// True when this fact is a `C` command.
+    pub fn is<C: FactCommand>(&self) -> bool {
+        self.command == C::COMMAND
     }
 
     /// Idempotency key.
@@ -153,6 +192,13 @@ pub struct FactReceipt {
     pub replayed: bool,
 }
 
+impl FactReceipt {
+    /// The sink's result payload as a typed value (e.g. the command output).
+    pub fn payload_as<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        T::deserialize(&self.payload)
+    }
+}
+
 /// Final outcome of one fact.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FactOutcome {
@@ -176,6 +222,13 @@ pub struct FactSettlement {
     pub command: String,
     /// Outcome.
     pub outcome: FactOutcome,
+}
+
+impl FactSettlement {
+    /// True when the settled fact was a `C` command.
+    pub fn is<C: FactCommand>(&self) -> bool {
+        self.command == C::COMMAND
+    }
 }
 
 /// Durable commit target.
@@ -226,6 +279,8 @@ pub enum EmitError {
     NoSink,
     /// The player is unknown (cannot bind a principal).
     UnknownPlayer,
+    /// A typed fact input did not serialize.
+    Encode(String),
 }
 
 #[derive(Debug, Default)]

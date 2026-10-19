@@ -211,7 +211,10 @@ fn reconnect_within_grace_keeps_player_then_expires() {
     assert!(!token.is_empty());
 
     for seq in 1..=5 {
-        assert_eq!(h.push_input(a.client, seq, 0, &[1, 0]), PushOutcome::Accepted);
+        assert_eq!(
+            h.push_input(a.client, seq, 0, &[1, 0]),
+            PushOutcome::Accepted
+        );
     }
     h.advance();
 

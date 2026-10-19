@@ -14,6 +14,17 @@
 //! - Transport (`net` feature): axum WebSocket server hosting many zones
 //!   with HMAC-signed ticket admission ([`net`]).
 //!
+//! - Authoring derives (re-exported from `distributed_game_macros`):
+//!   `#[derive(Replicated)]` views generate a kind's schema and field
+//!   encoding from one struct ([`schema!`], [`WorldView::add`]);
+//!   `#[derive(GameInput)]` generates the input codec and sanitize;
+//!   `#[derive(GameEvent)]` / `#[derive(GameRecord)]` give events stable ids
+//!   and typed binary payloads ([`Ctx::send`], [`Ctx::broadcast`]);
+//!   `#[derive(FactCommand)]` binds a cell command input to its command name
+//!   ([`Ctx::emit`]). The derives also describe the zone's
+//!   [`GameSurface`](surface::GameSurface), from which `distributed
+//!   game-client` generates typed TypeScript.
+//!
 //! Physics is out of scope: games bring their own and run it in `on_tick`.
 //!
 //! - World structure ([`world`]): zone directory and consistent-hash ring,
@@ -26,11 +37,13 @@
 
 #![warn(missing_docs)]
 
+pub mod authoring;
 #[cfg(feature = "bots")]
 pub mod bots;
 #[cfg(feature = "cell")]
 pub mod cell;
 pub mod clock;
+pub mod codec;
 pub mod facts;
 pub mod handoff;
 pub mod host;
@@ -47,17 +60,22 @@ pub mod rewind;
 pub mod rng;
 pub mod schema;
 pub mod stamp;
+pub mod surface;
 pub mod timers;
 pub mod timestep;
 pub mod world;
 pub mod zone;
 
+pub use authoring::{GameEvent, GameInput, Pushed, Replicated};
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use codec::{Wire, WireType};
+/// Authoring derives (see the crate docs and README).
+pub use distributed_game_macros::{FactCommand, GameEvent, GameInput, GameRecord, Replicated};
 #[cfg(feature = "runtime")]
 pub use facts::spawn_fact_worker;
 pub use facts::{
-    fact_channel, fact_key, BoxFuture, EmitError, Fact, FactError, FactFeed, FactOutcome,
-    FactQueue, FactReceipt, FactSettlement, FactSink, MemoryFactSink, RetryPolicy,
+    fact_channel, fact_key, BoxFuture, EmitError, Fact, FactCommand, FactError, FactFeed,
+    FactOutcome, FactQueue, FactReceipt, FactSettlement, FactSink, MemoryFactSink, RetryPolicy,
     SettlementScript,
 };
 pub use handoff::{HandoffError, HandoffRequest, Transfer};
@@ -69,8 +87,9 @@ pub use replay::{replay, Recorder, Recording};
 pub use replication::{EntityState, WorldView};
 pub use rewind::{Historic, HitQuery, Rewind, RewindConfig, RewindFrame, ShotTiming};
 pub use rng::{Fnv64, ZoneRng};
-pub use schema::{EntitySchema, FieldType, FieldValue, KindDef};
+pub use schema::{Correction, EntitySchema, FieldType, FieldValue, KindDef};
 pub use stamp::{stamp_metadata, FactStamp};
+pub use surface::GameSurface;
 pub use timers::TimerId;
 pub use timestep::FixedTimestep;
 pub use world::{BarrierMode, ChildEvent, FreezeState, StalePolicy};
@@ -78,6 +97,22 @@ pub use zone::{
     Admission, ClientId, JoinRequest, LeaveReason, ObserverId, ObserverInfo, PlayerId, PlayerInfo,
     TicketClaims, Tier, Viewer, Zone,
 };
+
+/// Paths used by derive-generated code. Not public API.
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::authoring::{decode_whole, records_of};
+    pub use crate::codec::{
+        special, ButtonBits, EntityField, InputField, LongString, QuantizedF32, Wire, WireType,
+    };
+    pub use crate::protocol::wire::{DecodeError, Reader, Writer};
+    pub use crate::schema::{Correction, FieldType, FieldValue, KindDef};
+    pub use crate::surface::{
+        EventPayload, EventSurface, InputSurface, PayloadField, RecordSurface,
+    };
+    pub use serde;
+    pub use std;
+}
 
 #[doc = include_str!("../README.md")]
 #[cfg(doctest)]
