@@ -425,7 +425,11 @@ Svelte 5.7+ is required (`svelte/reactivity`). A runnable example is
 plugin. Each surface runs `distributed game-manifest` → `game-client` →
 `game-wasm` (the `#[predict]` step and `#[game_pure]` functions) when Vite
 starts, when the zone's Rust sources change (a full reload follows only if
-an output changed), and once per `vite build`; Vite emits the WebAssembly as
+an output changed), and once per `vite build`. In `vite dev` a failing run
+(a Rust compile error, say) is logged and shown in the error overlay — also
+to overlays opened later — and the server keeps serving the last generated
+client until the next change succeeds; `vite build` (and `build --watch`)
+fails instead; Vite emits the WebAssembly as
 an asset through the generated `new URL('./wasm/<surface>.wasm',
 import.meta.url)`. Game surfaces are not lifecycle outputs, so a games-only
 app runs under plain `vite dev` / `vite build`; GraphQL `clients` still need

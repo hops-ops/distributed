@@ -158,7 +158,7 @@ test('plugin: generates on start, regenerates on a Rust change and reloads; game
 	try {
 		// The public entry accepts a games-only configuration under plain Vite.
 		const plugin = distributedSvelteKitPublic(f.options({ watch: [join(f.root, 'missing-is-ignored')] }));
-		await plugin.configResolved({ root: f.app, command: 'serve' });
+		await plugin.configResolved({ root: f.app, command: 'serve', logger: { error: () => undefined } });
 		assert.match(await readFile(join(f.out, 'index.ts'), 'utf8'), /zone v1/);
 		const watched = [];
 		const sent = [];
@@ -191,6 +191,81 @@ test('plugin: generates on start, regenerates on a Rust change and reloads; game
 		assert.equal(sent.at(-1).type, 'error');
 		await plugin.closeBundle();
 	} finally {
+		if (previous !== undefined) process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE = previous;
+		await rm(f.root, { recursive: true, force: true });
+	}
+});
+
+test('dev: a failing Rust change never takes the server down (watcher, HMR, startup); builds still fail', async () => {
+	const f = await fixture();
+	const previous = process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE;
+	delete process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE;
+	const logged = [];
+	const logger = { error: (message) => logged.push(message) };
+	const server = () => {
+		const sent = [];
+		const listeners = [];
+		return {
+			sent,
+			connect: () => listeners.forEach((listener) => listener()),
+			watcher: { add: () => undefined },
+			ws: { send: (payload) => sent.push(payload), on: (event, listener) => event === 'connection' && listeners.push(listener) },
+			moduleGraph: { getModuleById: () => undefined, invalidateModule: () => undefined },
+			httpServer: { once: () => undefined }
+		};
+	};
+	const rustFile = join(f.rust, 'src', 'lib.rs');
+	try {
+		const plugin = distributedSvelteKitPublic(f.options());
+		await plugin.configResolved({ root: f.app, command: 'serve', logger });
+		const dev = server();
+		plugin.configureServer(dev);
+
+		// Vite's dev watcher awaits `watchChange` without a catch: it must resolve.
+		process.env.FAKE_RUST = join(f.root, 'nowhere');
+		await plugin.watchChange(rustFile);
+		assert.equal(logged.length, 1);
+		assert.match(logged[0], /game client generation failed[\s\S]*Distributed compiler command failed/);
+		assert.equal(dev.sent.at(-1).type, 'error');
+		assert.match(await readFile(join(f.out, 'index.ts'), 'utf8'), /zone v1/, 'last good client kept');
+		// HMR path: same (overlay + console, no throw).
+		assert.deepEqual(await plugin.handleHotUpdate({ file: rustFile, server: dev }), []);
+		assert.equal(logged.length, 2);
+
+		// Fixed: regenerates, reloads, and a newly opened overlay sees no stale error.
+		process.env.FAKE_RUST = f.rust;
+		await writeFile(rustFile, '// zone v3 with predict\n');
+		await plugin.handleHotUpdate({ file: rustFile, server: dev });
+		assert.deepEqual(dev.sent.at(-1), { type: 'full-reload', path: '*' });
+		const before = dev.sent.length;
+		dev.connect();
+		assert.equal(dev.sent.length, before);
+		await plugin.closeBundle();
+
+		// A broken surface at dev start: the server still starts; the error is
+		// logged and replayed to overlays that connect afterwards.
+		process.env.FAKE_RUST = join(f.root, 'nowhere');
+		const late = distributedSvelteKitPublic(f.options());
+		await late.configResolved({ root: f.app, command: 'serve', logger });
+		assert.equal(logged.length, 3);
+		const lateServer = server();
+		late.configureServer(lateServer);
+		lateServer.connect();
+		assert.equal(lateServer.sent.at(-1).type, 'error');
+		await late.closeBundle();
+
+		// Builds fail: one-shot build and `vite build --watch` rebuilds.
+		const build = distributedSvelteKit(f.options());
+		await assert.rejects(build.configResolved({ root: f.app, command: 'build', logger }), /Distributed compiler command failed/);
+		process.env.FAKE_RUST = f.rust;
+		const watching = distributedSvelteKit(f.options());
+		await watching.configResolved({ root: f.app, command: 'build', logger });
+		process.env.FAKE_RUST = join(f.root, 'nowhere');
+		await assert.rejects(watching.watchChange(rustFile), /Distributed compiler command failed/);
+		await watching.closeBundle();
+		assert.equal(logged.length, 3, 'build failures are thrown, not just logged');
+	} finally {
+		process.env.FAKE_RUST = f.rust;
 		if (previous !== undefined) process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE = previous;
 		await rm(f.root, { recursive: true, force: true });
 	}
