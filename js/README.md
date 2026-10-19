@@ -678,6 +678,26 @@ for a reconciliation replaying 10 pending inputs — well under 0.1 % of a
 box); with `--import-extension js` copy `wasm/` next to the emitted
 JavaScript.
 
+**Shared logic and data.** Pure functions the zone declares with
+`#[game_pure]` are compiled into the same module; the generated
+`create<Name>Pures()` returns one typed, synchronous wrapper per function
+(plus `ready`, `loaded()`, `module()`) and shares the instance the
+prediction already loaded:
+
+```ts
+const pures = createGridPures();
+await pures.ready;
+const cell = pures.gridCell({ seed, cx: 3, cy: -2 }); // the server's own world generation
+```
+
+Underneath, `createWasmPures(source, specs)` calls
+`PredictModule.call(exportName, argBytes)` (`dg_pure_<fn>`, payload codec in
+and out; calls before `ready` throw). Static data the zone exports with
+`GameSurface::constant` arrives as generated constants (`constants.ts`), and
+records it serves (e.g. a content pack over HTTP) get generated
+`decode<Record>` / `encode<Record>` functions over `decodeValue` /
+`encodeValue`.
+
 ## Protocol and security boundaries
 
 Every accepted artifact and response is protocol v1 and carries an exact
@@ -713,7 +733,8 @@ duplicated as decision documents in this package.
 - `@hops-ops/distributed/game` — binary `distributed_game` zone protocol
   client: codec, `GameConnection` (handshake, reconnect, clock sync),
   interpolating `EntityReplica`, `Predictor` reconciliation (with
-  `createWasmPrediction` for steps compiled from Rust) and the multi-zone
+  `createWasmPrediction` for steps compiled from Rust, and `createWasmPures`
+  for pure functions compiled alongside them) and the multi-zone
   `GameClient` with handoff, `AdaptiveDelay` and `InputPacer`.
   See `distributed_game/PROTOCOL.md`.
 

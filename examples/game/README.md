@@ -35,17 +35,25 @@ cell); the zones call those functions in `on_tick`. Each demo module
 exports `game_surface()`; `run.sh gen` runs `distributed game-manifest` on
 it, `distributed game-client` writes `client/src/generated/<demo>/`
 (checked in, verified by `run.sh smoke`) and `distributed game-wasm`
-compiles the step to `client/src/generated/<demo>/wasm/<demo>.wasm`
-(gitignored, rebuilt only when the Rust sources change; `run.sh <demo>`
-builds it too). The pages use the generated `create<Demo>Client`, which
-predicts with the compiled step, typed field accessors
-(`mobFields(entity).hp`), the input encoder and typed `on('kill', …)`
-handlers. No movement code is written in TypeScript; what remains
-hand-written for drawing is `arena/floor.ts` (floor size, pillars, capsule
-radius — checked against the native build) and `grid/world.ts` (the grid's
-terrain/props generation for rendering, see below). The Shooting Gallery
-predicts hits by ray-testing what it renders, not movement, so it has no
-predicted step.
+compiles the step — and the grid's `#[game_pure]` world generation — to
+`client/src/generated/<demo>/wasm/<demo>.wasm` (gitignored, rebuilt only
+when the Rust sources change; `run.sh <demo>` builds it too). The pages use
+the generated `create<Demo>Client`, which predicts with the compiled step,
+typed field accessors (`mobFields(entity).hp`), the input encoder and typed
+`on('kill', …)` handlers.
+
+No simulation or content code is written twice. Movement is the compiled
+step; the Endless Grid's terrain, biomes and props come from the compiled
+`grid_cell` / `grid_sample` (`createGridPures`); static data the pages
+draw is a generated constant from the Rust values (`ARENA_FLOOR` — floor
+size, pillars, capsule radius, used by every Arena-floor page —
+`GRID_WORLD`, `FREEZE_WORLD`, `PIT_RULES` tier radii, `RIPPLE_WORLD` zone
+hierarchy, `GALLERY_COURSE` rails); The Freeze's content packs are a Rust
+record served in its payload encoding and decoded by the generated
+`decodePack`. What TypeScript still mirrors is small and listed under
+[Remaining client-side mirrors](#remaining-client-side-mirrors). The
+Shooting Gallery predicts hits by ray-testing what it renders, not
+movement, so it has no predicted step.
 
 Requirements: Rust (stable) with the `wasm32-unknown-unknown` target
 (`rustup target add wasm32-unknown-unknown`), Node ≥ 22.18 (runs `.ts`
@@ -93,8 +101,12 @@ ticket + admin secrets, exits with its parent); portals hand players off
 between them (`Redirect` + `/admin/transfer` across processes). Content is
 data-driven per version (`freeze::content`: v1 lava pools that burn, v2
 "lava is now ice", v3 back to lava; slime speed/size/color, crystals, gem
-value) and served by `GET /dev/freeze/content/{version}`; the client derives
-the scene from *its own* pack.
+value) and served by `GET /dev/freeze/content/{version}` — the Rust `Pack`
+record in its payload encoding, decoded by the generated `decodePack`; the
+version-independent layout (zones, portals, pools, crystal spots) is the
+generated `FREEZE_WORLD` constant. The client derives the scene from *its
+own* pack. Packs are served, not compiled into the page, because the demo
+is about a client receiving content it was not built with.
 
 - **Roll out update (Hard)**: every zone on both hosts freezes (SYSTEM
   overlay, inputs dropped and counted — client side, plus any in flight on
@@ -139,10 +151,13 @@ is derived from it) and keeping hibernation snapshots under one
 - **World.** Cell `(x, y)` is zone `grid.<x>.<y>` (canonical integers,
   |x|,|y| ≤ 10⁶; the server uses `FlatTopology`, the dots are not a
   hierarchy). Its terrain height, biome and props are a pure function of
-  `(seed, x, y, CONTENT_VERSION)` in `server/sim/src/grid.rs` and, for
-  rendering only, its twin `client/src/grid/world.ts` (u32 hashing +
-  binary32 value noise; checked
-  bit-for-bit by `fixtures/grid-world.json`). Props sit inside 8 m
+  `(seed, x, y, CONTENT_VERSION)` in `server/sim/src/grid.rs` (u32 hashing
+  + binary32 value noise). The page renders the same code compiled to
+  WebAssembly: `grid_cell` returns a cell's 17 × 17 terrain lattice
+  (heights, moisture, biomes) and props, `grid_sample` one point (entity
+  heights, the HUD biome); generating a cell costs ~13 µs in Node including
+  decoding (~6 µs in the module; the removed TypeScript twin took ~77 µs).
+  Props sit inside 8 m
   sub-cells 2 m from their edges, so lines every 8 m are free trails and no
   prop reaches across a border. Seed: `DG_GRID_SEED`.
 - **Zones.** A cell simulates walkers (predicted by `grid_step` compiled to
@@ -218,23 +233,40 @@ that round identically on every target (`+ - * /`, `sqrt`, comparisons; no
 trig), and (3) the server snaps its state to the wire quantization after
 each step, so the client rebases on exactly what the server holds.
 `client/tests/prediction-wasm.test.mjs` replays the native traces of
-`game-demos predict-trace` (recorded input streams per step function)
-through every surface's module and requires byte-identical states; it also
-times prediction (≈ 1 µs per step, ≈ 8–12 µs for a reconciliation
-replaying 10 inputs).
+`game-demos predict-trace` (recorded input streams per step function, and
+recorded arguments per pure function) through every surface's module and
+requires byte-identical states and results; it also times prediction
+(≈ 1 µs per step, ≈ 8–12 µs for a reconciliation replaying 10 inputs) and
+grid generation (≈ 13 µs per cell, ≈ 0.5 µs per point sample).
+
+## Remaining client-side mirrors
+
+What the TypeScript still restates, and why it stays:
+
+- **Zone id formats and defaults** — `grid.<x>.<y>` (`zoneId` /
+  `parseZone` in `grid/client.ts`) and each page's default zone
+  (`arena-1`, `pit-1`, …). They are addressing, needed synchronously before
+  any module loads; a mismatch fails loudly (the server rejects the zone).
+- **Dev / admin HTTP JSON shapes** — `WorldMap`, `WorldStatus`,
+  `BoardPosition`: debugging routes outside the game surface.
+- **The Shooting Gallery's predicted hit** (`raySphere` over rendered
+  targets) — cosmetic feedback; the server's rewound `HitQuery` decides.
+  It could become a `#[game_pure]` over the rendered targets.
+- **Presentation** — colors, tier display names, camera and HUD constants:
+  client-only by nature.
 
 ## Layout
 
 ```
 examples/game/
   run.sh                     one-command dev + smoke runner
-  fixtures/                  grid-world.json: grid content golden data (Rust writes, world.ts checks)
   server/                    Rust crate `game_demos`, its own cargo workspace (with sim/)
-    sim/                     crate `game_sim`: the `#[predict]` steps (arena.rs movement, mobpit.rs,
-                             ripple.rs inputs + steps, grid.rs world + walker step); compiled
-                             natively for the server and to wasm32 for the browser
+    sim/                     crate `game_sim`: the `#[predict]` steps (arena.rs movement + floor,
+                             mobpit.rs, ripple.rs inputs + steps, grid.rs world + walker step +
+                             `#[game_pure]` grid_cell / grid_sample); compiled natively for the
+                             server and to wasm32 for the browser
     src/main.rs              `game-demos <demo>` subcommands (+ hidden `predict-trace`)
-    src/predict_trace.rs     native traces of every step over recorded input streams
+    src/predict_trace.rs     native traces of every step (recorded inputs) and pure function (arguments)
     src/common/              shared: Demo trait, run/spawn, dev routes, guests
     src/cluster.rs           multi-host demos: --host-id/--peer, directory, ownership, snapshots
     src/arena/               Arena zone (`movement` = `game_sim::arena`)
@@ -245,22 +277,24 @@ examples/game/
     src/ripple/              Boss Ripple tiers and placement
     tests/                   arena_smoke.rs (bots, dev routes),
                              mobpit_smoke.rs (facts, slow storage, kill -9 recovery, boards),
-                             gallery_smoke.rs, freeze_smoke.rs, grid_smoke.rs, grid_fixture.rs,
+                             gallery_smoke.rs, freeze_smoke.rs (binary content packs), grid_smoke.rs,
                              ripple_smoke.rs (+ support/ for two in-process hosts)
   client/                    Vite + TypeScript + Babylon.js 9.30 (multi-page)
     index.html, <demo>/index.html
     src/generated/<demo>/    generated by `run.sh gen` (do not edit): schema/input/events/client.ts,
-                             predict.ts, surface.json, wasm/<demo>.wasm (gitignored build output);
+                             predict.ts, pures.ts (grid), constants.ts, surface.json,
+                             wasm/<demo>.wasm (gitignored build output);
                              `mobpit` also serves the leaderboard page
     src/shared/              hud.ts, input.ts, scene.ts, dev-api.ts, latest.ts, style.css
-    src/arena/               client.ts (headless), main.ts (Babylon), floor.ts (drawing constants)
+    src/arena/               client.ts (headless), main.ts (Babylon)
     src/mobpit/              client.ts (headless + /dev/mobpit API), main.ts (Babylon), style.css
     src/leaderboard/         main.ts (DOM page over the observer connection), style.css
     src/gallery/             client.ts (shots, adaptive delay), main.ts
     src/freeze/              client.ts (content packs, live patch / reload, admin API), main.ts
-    src/grid/, src/ripple/   client.ts (headless), main.ts (Babylon); grid/world.ts (content, rendering)
-    tests/                   prediction-wasm (native ↔ WASM exact match + cost), arena-headless, mobpit-headless, leaderboard-headless,
-                             gallery-headless, freeze-headless, grid-world-parity, grid-headless,
+    src/grid/, src/ripple/   client.ts (headless; grid: compiled world content), main.ts (Babylon)
+    tests/                   prediction-wasm (native ↔ WASM exact match of steps + pure functions, cost),
+                             arena-headless, mobpit-headless, leaderboard-headless,
+                             gallery-headless, freeze-headless, grid-headless,
                              ripple-headless (+ helpers/demo-server.mjs, helpers/mobpit.mjs,
                              helpers/cluster.mjs for multi-host demos)
 ```

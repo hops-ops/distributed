@@ -25,9 +25,9 @@ the browser, but the client SDK has no rendering dependency.
 - [Try it](#try-it)
 - [Build a zone](#build-a-zone)
 - [Guides](#guides): game loop · input · what clients see · the client SDK ·
-  generated clients · client prediction (Rust → WebAssembly) · saving
-  progress · scaling out · live updates · lag compensation · testing and
-  operations · security
+  generated clients · client prediction (Rust → WebAssembly) · shared
+  logic and data (no TypeScript twins) · saving progress · scaling out ·
+  live updates · lag compensation · testing and operations · security
 - [Design decisions](#design-decisions)
 - [Status and limits](#status-and-limits)
 - [Reference](#reference)
@@ -391,17 +391,19 @@ zone's typed fields, input encoder, events and correction defaults.
 ### Generated clients
 
 The derives also describe the zone for the browser. A **game surface**
-(`GameSurface`, versioned JSON, schema v2) lists the zone's kinds with
+(`GameSurface`, versioned JSON, schema v3) lists the zone's kinds with
 their fields, wire types, priorities and correction defaults, its input
-layout and sanitize rules, its events and the records they mention, and
-its predicted step. Export one function per zone type, conventionally
-`game_surface`:
+layout and sanitize rules, its events and the records they mention, its
+predicted step, and what else the client shares with Rust: pure functions
+compiled to WebAssembly, constants and standalone record codecs. Export
+one function per zone type, conventionally `game_surface`:
 
 ```rust,ignore
 pub fn game_surface() -> GameSurface {
     GameSurface::for_zone::<Arena>("arena")
         .events::<ArenaEvent>()
         .predict::<ArenaStep>()
+        .constant("arena_floor", &arena_floor())
 }
 ```
 
@@ -417,14 +419,20 @@ imports only `@hops-ops/distributed/game`:
 | `events.ts` | record and event interfaces, `EVENT` ids, `EVENTS` codecs, `decodeEvent`, `onEvent` |
 | `client.ts` | `create<Name>Client(options)`: a `GameClient` with the encoder and correction defaults wired in (and, with a predicted step, prediction by the compiled step), a typed `on(name, handler)` and `send(input)` |
 | `predict.ts` | with a `#[predict]` step: `PREDICT`, the state/context layouts, `PREDICT_WASM_URL` (`./wasm/<name>.wasm`) and `create<Name>Prediction` |
+| `pures.ts` | with `#[game_pure]` functions: `PURES`, `PURES_WASM_URL` (the same module) and `create<Name>Pures()`, one typed wrapper per function |
+| `constants.ts` | with `.constant(..)`s: each value as a typed literal (`ARENA_FLOOR: ArenaFloor`) |
 | `index.ts`, `surface.json` | re-exports; the surface it came from |
+
+`events.ts` also gets `encode<Record>` / `decode<Record>` for every
+`.record::<T>()` (see [Shared logic and data](#shared-logic-and-data-no-typescript-twins)).
 
 The output is deterministic, so check it in and run `--check` in CI: a
 changed Rust definition then fails the build until the client is
 regenerated. The binary protocol is unchanged; the generated code only
-removes the hand-written glue around it. The compiled step
-(`distributed game-wasm`, `wasm/<name>.wasm`) is a build output: ignore
-`wasm/` in version control and build it before bundling.
+removes the hand-written glue around it. The compiled module
+(`distributed game-wasm`, `wasm/<name>.wasm`: the predicted step and the
+pure functions) is a build output: ignore `wasm/` in version control and
+build it before bundling.
 
 ### Client prediction (Rust → WebAssembly)
 
@@ -514,6 +522,78 @@ steps plus the grid's world generation).
 **Security.** Prediction is cosmetic. The server never runs client code
 and never trusts a predicted value: it simulates the inputs itself, and
 every Delta replaces the prediction with the authoritative state.
+
+### Shared logic and data (no TypeScript twins)
+
+Prediction is not the only client code that must agree with the server.
+Procedural content, drawing constants and served data have the same
+problem: a TypeScript copy drifts. The surface gives each kind of shared
+thing one home in Rust and one generated way into the client:
+
+| What | Rust | Surface | Client |
+|---|---|---|---|
+| **Logic** (pure functions: world generation, previews) | `#[game_pure(FnType)] fn f(arg: &A) -> R` (or `fn f() -> R`) | `.pure::<FnType>()` | `create<Name>Pures().f(arg)`: the same code, compiled into the surface's WebAssembly module |
+| **Static data** (sizes, layouts, names) | any `Wire` value (`#[derive(GameRecord)]` struct, list, …) | `.constant("name", &value)` | `NAME` in `constants.ts`, a typed literal |
+| **Served data** (fetched at run time, e.g. a content pack) | a `#[derive(GameRecord)]` struct | `.record::<T>()` | `decodeT(bytes)` / `encodeT(value)` over the payload codec |
+
+Choose by what the thing *is*: computation the client repeats with
+arguments it only knows at run time belongs in a pure function (the
+Endless Grid generates terrain and props for any cell); data fixed at
+build time is a constant (no module to wait for, readable in diffs);
+data that changes after the client was built is served and decoded (The
+Freeze's content packs, which a client must be able to receive without a
+rebuild).
+
+```rust,ignore
+/// What the page draws for one cell (terrain lattice + props).
+#[game_pure(GridCellFn)]
+pub fn grid_cell(cell: &GridContext) -> GridCellContent {
+    /* the server's own generation */
+}
+
+pub fn game_surface() -> GameSurface {
+    GameSurface::for_zone::<GridZone>("grid")
+        .predict::<GridStep>()
+        .pure::<GridCellFn>()
+        .constant("grid_world", &grid_world())
+}
+```
+
+```ts
+const pures = createGridPures(); // same module (and instance) as the predicted step
+await pures.ready;
+const content = pures.gridCell({ seed, cx: 3, cy: -2 }); // GridCellContent, exact binary32 floats
+```
+
+- **Pure functions** share the predicted step's module, package and ABI
+  v1: each is an export `dg_pure_<fn>(arg_len) -> i32`; the argument's
+  codec encoding goes into the scratch buffer, the result's comes back
+  (≤ 64 KiB; negative results are errors, `-6` = argument does not
+  decode). Every function and the step of one surface must be declared in
+  one Cargo package; `distributed game-wasm` builds the module when a
+  surface has either and checks every export. The wrappers are
+  synchronous and throw until `ready` resolves. `pure::call_bytes::<F>`
+  runs the export's path natively, so native ↔ WASM tests compare bytes.
+  The [determinism rules](#client-prediction-rust--webassembly) apply.
+- **Constants** are stored in the surface as the client decodes them
+  (`codec::to_json_value`: encoded, then decoded against the wire type —
+  floats are exact binary32 values, quantized fields quantized), so the
+  generated literal equals what `decodeValue` would return for the Rust
+  encoding.
+- **Record codecs** are the event payload codec for one record; serve the
+  bytes (`codec::to_bytes`) from any transport.
+
+The demos have no TypeScript twins left for these: the Endless Grid's
+terrain, biomes and props (`grid_cell`, `grid_sample`), the Arena floor,
+The Freeze's world layout and content packs, Mob Pit's tier radii and
+Boss Ripple's zone hierarchy all come from Rust. `game-demos
+predict-trace` also prints native traces of every pure function, and
+`prediction-wasm.test.mjs` requires the module's results to be
+byte-identical (1 440 `grid_sample` points and 64 `grid_cell` cells,
+coordinate limits included). Generating one grid cell (17 × 17 heights,
+moisture and biomes plus props) costs ~6 µs in the module and ~13 µs
+including decoding the result into JS objects in Node 24 (native Rust
+~5.6 µs; the removed TypeScript twin took ~77 µs); a point sample ~0.5 µs.
 
 ### Saving progress without pausing the game
 
@@ -689,12 +769,15 @@ errors for unsupported types and attributes.
 | `GameRecord` | struct | – | `quant`, `angle`, `field_type`, `long` | `Wire` (nested payload record) |
 | `FactCommand` | struct (`Serialize`) | `#[fact(command = CONST_OR_LITERAL, key(field, ..))]` | – | `FactCommand` (`COMMAND`, `dedupe_parts`) |
 | `#[predict]` (attribute) | `fn(&State, &Input, &Context, f32) -> State` | `#[predict(StepType, kind = "name")]` | – | `struct StepType: PredictStep` + the `wasm32` export `dg_predict_<fn>` |
+| `#[game_pure]` (attribute) | `fn(&A) -> R` or `fn() -> R` (`Wire` types) | `#[game_pure(FnType)]` | – | `struct FnType: GamePure` + the `wasm32` export `dg_pure_<fn>` |
 
 `schema![A, B]` builds an `EntitySchema`; `GameSurface::for_zone::<Z>(name)`
 (kinds from `Z::schema()`, input from `Z::Input`) `.events::<E>()`
-`.predict::<S>()` builds the surface; `codec` holds the shared value codec
-(`Wire`, `WireType`); `prediction` the predicted-step trait, its ABI
-(`run_abi`, `step_bytes`) and the float rules.
+`.predict::<S>()` `.pure::<F>()` `.constant(name, &v)` `.record::<T>()`
+builds the surface; `codec` holds the shared value codec (`Wire`,
+`WireType`, `to_json_value`); `prediction` the predicted-step trait, its
+ABI (`run_abi`, `step_bytes`) and the float rules; `pure` the pure-function
+trait and its ABI (`run_abi`, `call_bytes`).
 
 ## Features
 
