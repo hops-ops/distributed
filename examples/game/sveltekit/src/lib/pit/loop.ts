@@ -21,6 +21,10 @@ import {
 
 const TIER_COLOR: Record<number, string> = { 1: '#9ad16b', 2: '#b48cf2', 3: '#ff6b6b' };
 const TIER_RADIUS = Object.fromEntries(PIT_RULES.tiers.map((t) => [t.tier, t]));
+const PLAYER_RADIUS = 0.45;
+/** Swing cone, from the server's rules (reach to a mob's edge, plus the body). */
+const SWING_REACH = PIT_RULES.attackRange + PLAYER_RADIUS;
+const SWING_HALF = PIT_RULES.attackHalfAngle;
 
 export type PitLoopOptions = Readonly<{
 	client: GameClient<PitInput>;
@@ -107,7 +111,22 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				const mine = entity.id === options.hello()?.entity;
 				// Own position for the headless test (a DOM attribute, not Svelte state).
 				if (mine) canvas.dataset.me = `${p.x.toFixed(2)},${p.y.toFixed(2)}`;
-				circle(p.x, p.y, 0.45, p.dead ? '#555' : mine ? '#ffd166' : '#6ec3ff');
+				if (p.swing > 0 && !p.dead) {
+					// The swing cone (blue), fading as `swing` counts down.
+					const fade = p.swing / PIT_RULES.swingFrames;
+					ctx.beginPath();
+					ctx.moveTo(...at(p.x, p.y));
+					for (let i = 0; i <= 16; i += 1) {
+						const a = p.face - SWING_HALF + (2 * SWING_HALF * i) / 16;
+						ctx.lineTo(...at(p.x + Math.cos(a) * SWING_REACH, p.y + Math.sin(a) * SWING_REACH));
+					}
+					ctx.closePath();
+					ctx.fillStyle = `rgba(77,163,255,${0.12 + 0.25 * fade})`;
+					ctx.fill();
+					ctx.strokeStyle = '#4da3ff';
+					ctx.stroke();
+				}
+				circle(p.x, p.y, PLAYER_RADIUS, p.dead ? '#555' : mine ? '#ffd166' : '#6ec3ff');
 				const [nx, ny] = at(p.x + Math.cos(p.face) * 0.6, p.y + Math.sin(p.face) * 0.6);
 				const [cx, cy] = at(p.x, p.y);
 				ctx.strokeStyle = '#fff';

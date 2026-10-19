@@ -17,6 +17,7 @@ import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 import { ARENA_FLOOR } from '../generated/arena/constants.ts';
 import {
 	BUTTON,
+	PIT_RULES,
 	isMob,
 	isPillar,
 	isPit,
@@ -36,6 +37,9 @@ import { createMobPitClient, DEFAULT_ZONE, MobPitApi, TIERS } from './client.ts'
 
 /** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
 const { half: HALF, playerRadius: PLAYER_RADIUS } = ARENA_FLOOR;
+/** Swing cone, from the server's rules: reach to a mob's edge, plus the body. */
+const { attackRange, attackHalfAngle: SWING_HALF, swingFrames: SWING_FRAMES } = PIT_RULES;
+const ATTACK_REACH = attackRange + PLAYER_RADIUS;
 
 const SLOW_MS = 1500;
 const params = new URLSearchParams(location.search);
@@ -106,7 +110,7 @@ const mats = {
 	dead: material(scene, 'dead', '#555555', 0.4),
 	pillar: material(scene, 'pillar', '#5d5566'),
 	blade: material(scene, 'blade', '#e8eef7'),
-	swing: material(scene, 'swing', '#ffffff', 0.18),
+	swing: material(scene, 'swing', '#4da3ff', 0.3),
 	hpBack: material(scene, 'hp-back', '#1b1b1b'),
 	hpFill: material(scene, 'hp-fill', '#e04848'),
 	tele: material(scene, 'tele', '#ff3b3b', 0.25),
@@ -139,7 +143,7 @@ function createPlayer(entity: RenderedEntity, mine: boolean): PlayerVisual {
 	const blade = MeshBuilder.CreateBox(`${entity.key}-blade`, { width: 1.6, height: 0.08, depth: 0.14 }, scene);
 	blade.material = mats.blade;
 	// Swing wedge: 120° (the server's cone), flat on the floor.
-	const arc = flatDisc(`${entity.key}-arc`, 2.2 + PLAYER_RADIUS, mats.swing, 1 / 3);
+	const arc = flatDisc(`${entity.key}-arc`, ATTACK_REACH, mats.swing, SWING_HALF / Math.PI);
 	return { kind: 'player', body, blade, arc, nose };
 }
 
@@ -338,8 +342,8 @@ stage.onFrame((now, dtMs) => {
 			visual.body.material = dead ? mats.dead : mine ? mats.me : mats.other;
 			visual.nose.position.copyFrom(toWorld(x + Math.cos(face) * 0.5, y + Math.sin(face) * 0.5, 1.3));
 			visual.nose.rotation.y = -face;
-			// Blade sweeps through the 120° cone while `swing` counts down (6 → 0).
-			const sweep = swing > 0 ? ((6 - swing) / 6) * (Math.PI * 2 / 3) - Math.PI / 3 : -Math.PI / 2.5;
+			// Blade sweeps through the swing cone while `swing` counts down to 0.
+			const sweep = swing > 0 ? ((SWING_FRAMES - swing) / SWING_FRAMES) * 2 * SWING_HALF - SWING_HALF : -Math.PI / 2.5;
 			const a = face + sweep;
 			visual.blade.position.copyFrom(toWorld(x + Math.cos(a) * 0.8, y + Math.sin(a) * 0.8, 1.0));
 			visual.blade.rotation.y = -a;
@@ -348,7 +352,7 @@ stage.onFrame((now, dtMs) => {
 			if (swing > 0) {
 				visual.arc.position.copyFrom(toWorld(x, y, 0.05));
 				// Disc arcs start at +x and run counter-clockwise; centre it on `face`.
-				visual.arc.rotation.y = -(face - Math.PI / 3);
+				visual.arc.rotation.y = -(face - SWING_HALF);
 			}
 			const label = `${player.name} · L${player.level} · ${player.hp} HP`;
 			stage.labels.set(entity.key, visual.body, mine ? `${label} (you)` : label, 1.4, mine ? 'me' : '');
