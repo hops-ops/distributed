@@ -267,6 +267,42 @@ prove ownership. Unsupported or unprovable selections fail at build time with
 their source location; the compiler does not emit a partial normalization plan
 or an adapter-specific route registry.
 
+## `distributed game-manifest` / `distributed game-client` — typed game clients
+
+For [`distributed_game`](../distributed_game/README.md#generated-clients)
+zones. The zone's authoring derives (`#[derive(Replicated)]`,
+`#[derive(GameInput)]`, `#[derive(GameEvent)]`) describe a versioned
+`GameSurface` (schema v1): kinds with fields, wire types, priorities and
+client correction defaults, the input layout with its sanitize rules,
+events and the records they mention. It is deliberately separate from the
+GraphQL client manifest above.
+
+```bash
+# Build and run the crate's surface export through the manifest harness
+# (default entrypoint `<crate>::game_surface`).
+distributed game-manifest --manifest-path game/Cargo.toml \
+  --entrypoint my_game::arena::game_surface --out target/arena.surface.json
+
+# Generate TypeScript (imports only `@hops-ops/distributed/game`).
+distributed game-client --manifest target/arena.surface.json --out web/src/generated/arena
+
+# CI: compare without writing (also catches surface drift via surface.json)
+distributed game-client --manifest target/arena.surface.json --out web/src/generated/arena --check
+```
+
+`game-manifest` accepts the same `--path` / `--manifest-path` /
+`--package` / `--features` / `--no-default-features` options as `describe`
+and validates the JSON it prints (or writes with `--out`). `game-client`
+owns its `--out` directory: it writes `schema.ts` (kind ids, typed field
+interfaces and accessors, wire types, correction defaults), `input.ts`
+(input interface, bit maps, encoder/decoder/sanitize), `events.ts` (record
+and event types, codecs, `onEvent`), `client.ts` (`create<Name>Client`, a
+`GameClient` with the encoder and corrections wired in and typed `on`),
+`index.ts` and `surface.json`, removes stale files it generated earlier,
+and refuses to delete files it did not. Output is deterministic.
+`--import-extension ts|js|none` picks the specifier style between the
+generated files (default `ts`, for Vite and Node type stripping).
+
 ## `distributed describe` — manifest as JSON
 
 ```bash

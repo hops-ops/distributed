@@ -73,15 +73,17 @@ ensure_cli() {
 gen() {
 	local check="${1:-}"
 	ensure_cli
-	local tmp
+	local tmp status=0
 	tmp="$(mktemp -d "${TMPDIR:-/tmp}/game-surfaces.XXXXXX")"
-	trap 'rm -rf "$tmp"' RETURN
 	for surface in "${SURFACES[@]}"; do
 		"$CLI" game-manifest --manifest-path "$SERVER/Cargo.toml" \
-			--entrypoint "game_demos::$surface::game_surface" --out "$tmp/$surface.json"
-		"$CLI" game-client --manifest "$tmp/$surface.json" \
-			--out "$CLIENT/src/generated/$surface" $check
+			--entrypoint "game_demos::$surface::game_surface" --out "$tmp/$surface.json" &&
+			"$CLI" game-client --manifest "$tmp/$surface.json" \
+				--out "$CLIENT/src/generated/$surface" $check ||
+			status=1
 	done
+	rm -rf "$tmp"
+	return "$status"
 }
 
 run_demo() {

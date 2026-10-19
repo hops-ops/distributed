@@ -25,8 +25,8 @@ the browser, but the client SDK has no rendering dependency.
 - [Try it](#try-it)
 - [Build a zone](#build-a-zone)
 - [Guides](#guides): game loop · input · what clients see · the client SDK ·
-  saving progress · scaling out · live updates · lag compensation ·
-  testing and operations · security
+  generated clients · saving progress · scaling out · live updates · lag
+  compensation · testing and operations · security
 - [Design decisions](#design-decisions)
 - [Status and limits](#status-and-limits)
 - [Reference](#reference)
@@ -64,8 +64,8 @@ The words used throughout:
 | **Tick** | One fixed simulation step (30 Hz by default). Separate from the **patch** rate (20 Hz by default), how often clients get updates. |
 | **Player / Observer** | A *player* controls something and sends inputs. An *observer* only watches: a spectator, a leaderboard page, or a client looking into the zone next door. |
 | **Entity** | Something clients can see. The zone describes its entities each patch; the engine works out what changed for each client. |
-| **Schema** | The kinds of entity and their fields (with quantization). Sent to clients on connect, so clients need no generated code. |
-| **Fact** | An outcome worth keeping ("Alice killed the elite, +60 XP"). The zone emits it and moves on; a background worker commits it to storage and reports back later. |
+| **Schema** | The kinds of entity and their fields (with quantization), usually from `#[derive(Replicated)]` views. Sent to clients on connect, so a generic client needs no generated code; a generated one adds types. |
+| **Fact** | An outcome worth keeping ("Alice killed the elite"). The zone emits it (typically the cell command's own input) and moves on; a background worker commits it to storage, where the command decides the reward, and reports back later. |
 | **Cell** | Durable, event-sourced state in `distributed`, for example one player's profile. Facts usually end up as commands on a cell. |
 | **Ticket** | A signed, single-use admission token naming the player (principal), the zone and a role. Identity always comes from the ticket, never from game input. |
 
@@ -109,37 +109,61 @@ Then open `http://localhost:5173/<demo>/`. Each page explains what to try.
 
 ## Build a zone
 
-A zone is a struct plus a few trait methods. This one is a dot that
-players push left and right:
+A zone is a struct plus a few trait methods. You describe **what clients
+see**, **what they send** and **what you tell them** as plain Rust structs
+with derives; the engine encodes them, and `distributed game-client`
+generates the matching TypeScript, so field order, ids and quantization are
+written down exactly once. This zone is a dot that players push left and
+right:
 
 ```rust
 use std::sync::Arc;
 use std::time::Duration;
 use distributed_game::*;
 
+/// What clients see: one replicated kind. Field order is the wire order;
+/// the KindDef and the encoding both come from this struct.
+#[derive(Replicated)]
+#[replicated(kind = "dot", id = 1, global)]
+struct DotView {
+    #[quant(min = -50.0, max = 50.0, bits = 12)] // 12-bit wire precision
+    #[correct(ease = 100)]                       // client correction default
+    x: f32,
+}
+
+/// What a player sends, once per tick. `from_payload` decodes it and
+/// clamps `#[range]` fields, so cheating inputs never reach `on_tick`.
+#[derive(Clone, Copy, GameInput)]
+struct Push {
+    #[range(min = -1, max = 1)]
+    dx: i8,
+}
+
+/// One-off messages, with stable ids and typed payloads.
+#[derive(GameEvent)]
+enum RoomEvent {
+    #[game_event(id = 1)]
+    Hello { entity: u32 },
+}
+
 struct Room { x: f32 }
 
 impl Zone for Room {
     type Config = ();
-    type Input = i8;          // -1, 0, 1
+    type Input = Push;
     type Timer = ();
 
-    // What clients can see: one kind, "dot", with a quantized x.
-    fn schema() -> EntitySchema {
-        EntitySchema::new().kind(
-            KindDef::new(1, "dot")
-                .field("x", FieldType::QuantF32 { min: -50.0, max: 50.0, bits: 12 }),
-        )
-    }
+    fn schema() -> EntitySchema { schema![DotView] }
 
     fn on_create(_ctx: &mut Ctx<'_, Self>, _: ()) -> Self { Room { x: 0.0 } }
 
-    // Bytes from the client → your input type. Never trust them:
-    fn decode_input(&self, _p: PlayerId, bytes: &[u8]) -> Option<i8> {
-        bytes.first().map(|b| *b as i8)
+    fn on_join(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        ctx.send(player, &RoomEvent::Hello { entity: 1 });
     }
-    fn sanitize_input(&self, _p: PlayerId, dx: i8) -> Option<i8> {
-        (-1..=1).contains(&dx).then_some(dx)
+
+    // Bytes from the client → your input type (decoded and sanitized).
+    fn decode_input(&self, _p: PlayerId, bytes: &[u8]) -> Option<Push> {
+        Push::from_payload(bytes)
     }
 
     // The game rules, once per tick.
@@ -147,15 +171,20 @@ impl Zone for Room {
         let players: Vec<_> = ctx.players().map(|p| p.id).collect();
         for p in players {
             for input in ctx.take_inputs(p, ConsumePolicy::Drain) {
-                self.x += f32::from(input.input) * 5.0 * ctx.dt_secs();
+                self.x += f32::from(input.input.dx) * 5.0 * ctx.dt_secs();
             }
         }
     }
 
     // Describe the world; the engine diffs it per client.
     fn replicate(&self, out: &mut WorldView) {
-        out.push(EntityState::new(1, 1, self.x, 0.0, vec![FieldValue::F(self.x)]));
+        out.add(1, &DotView { x: self.x });
     }
+}
+
+/// Everything a browser needs to know about this zone, for the generator.
+pub fn game_surface() -> GameSurface {
+    GameSurface::for_zone::<Room>("room").events::<RoomEvent>()
 }
 
 // Drive it directly (tests, tools) with a manual clock:
@@ -163,10 +192,11 @@ let clock = ManualClock::new();
 let mut host = ZoneHost::<Room>::new("room-1", HostConfig::default(), Arc::new(clock.clone()), ());
 let claims = TicketClaims::new("alice", "room-1", u64::MAX, "n", Role::Player);
 let joined = host.join(&claims, 0, "").unwrap();
-host.push_input(joined.client, 1, 0, &[1]);
+host.push_input(joined.client, 1, 0, &Push { dx: 1 }.to_payload());
 clock.advance(Duration::from_millis(100));
 host.advance();
 for out in host.drain_outbound() { /* Outbound::Frame bytes go to the client */ }
+assert_eq!(game_surface().kinds[0].name, "dot");
 ```
 
 Serve it over WebSockets (`net` feature). The closure decides which zone
@@ -179,25 +209,33 @@ let server = GameServer::<Room>::new(ServerConfig::new(TicketKey::new(secret)), 
 server.serve(tokio::net::TcpListener::bind("0.0.0.0:2567").await?, shutdown_signal).await?;
 ```
 
-Connect a browser:
+Generate the browser client from `game_surface` (see
+[Generated clients](#generated-clients)):
+
+```sh
+distributed game-manifest --entrypoint my_game::game_surface --out room.surface.json
+distributed game-client --manifest room.surface.json --out web/src/generated/room
+```
+
+Connect a browser with it. The input encoder, the correction defaults and
+the event decoders are generated; you write only the prediction rule (the
+same rule as `on_tick`) and drawing:
 
 ```ts
-import { GameClient, InputPacer } from '@hops-ops/distributed/game';
+import { InputPacer } from '@hops-ops/distributed/game';
+import { createRoomClient, dotFields, isDot } from './generated/room/index.ts';
 
-const game = new GameClient<number>({
+const room = createRoomClient({
   url: (zone) => `wss://game.example/zones/${zone}`,
   ticket: ({ zoneId, role }) => api.mintZoneTicket(zoneId, role), // your backend signs these
-  prediction: {
-    encodeInput: (dx) => new Uint8Array([dx & 0xff]),
-    predict: (s, dx, dtMs) => ({ x: s.x + (dx * 5 * dtMs) / 1000 }), // same rule as on_tick
-    controlledEntity: () => 1
-  }
+  prediction: { predict: (s, push, dtMs) => ({ x: Number(s.x) + (push.dx * 5 * dtMs) / 1000 }) }
 });
-await game.connect('room-1');
-const pacer = new InputPacer({ tickRate: () => game.authority?.connection.welcome?.tickRate });
+room.on('hello', (hello) => room.client.setControlledEntity(hello.entity)); // typed payload
+await room.client.connect('room-1');
+const pacer = new InputPacer({ tickRate: () => room.client.authority?.connection.welcome?.tickRate });
 requestAnimationFrame(function frame(now) {
-  pacer.update(now, (dtMs) => game.sendInput(readKeys(), dtMs)); // one input per server tick
-  draw(game.render());                                  // entities ready to draw
+  pacer.update(now, (dtMs) => room.client.sendInput({ dx: readKeys() }, dtMs)); // one input per tick
+  for (const e of room.client.render()) if (isDot(e)) draw(dotFields(e).x); // typed fields
   requestAnimationFrame(frame);
 });
 ```
@@ -207,7 +245,10 @@ The rest of `Zone` is optional hooks: `on_auth`, `on_join`, `on_leave`,
 `on_tier_changed`, `on_dispose`, `hibernate` / `on_restore`,
 `on_handoff_join`, `on_child_event`, `is_gate`, `freeze_ready`,
 `on_content_version_changed`, `record_rewind`, `state_hash`. Each is
-explained in the guide that uses it.
+explained in the guide that uses it. Hand-written schemas
+(`EntitySchema::new().kind(KindDef::new(..).field(..))`), `EntityState`s,
+byte inputs and `ctx.send_event(viewer, type_id, bytes)` still work; the
+derives are a layer over them.
 
 ## Guides
 
@@ -240,8 +281,15 @@ rejects duplicates and inputs older than the last processed one, and
 reports the last processed number back in every Delta. The client uses
 that to drop inputs the server has already applied when it reconciles.
 
-- `decode_input` turns bytes into your type; `sanitize_input` rejects or
-  clamps anything a cheater could send (speed hacks, out-of-range values).
+- `#[derive(GameInput)]` generates a compact codec for an input struct
+  (`i8`/`u8`/`i16`/`u16`/`i32`/`u32`/`bool`/`f32`, `#[quant]` / `#[angle]`
+  floats) and its sanitize: `#[range(min, max)]` **clamps**, a
+  `#[buttons(dash, attack)]` bit field clears unknown bits (and gets
+  `Input::DASH`, `Input::ATTACK` constants), any non-finite `f32` rejects
+  the input, and a frame of the wrong length is dropped. `decode_input`
+  is then one line: `MyInput::from_payload(bytes)`. Hand-written
+  `decode_input` / `sanitize_input` (rejecting or clamping anything a
+  cheater could send) keep working.
 - `ctx.take_inputs(player, ConsumePolicy::…)` reads them in `on_tick`.
   `InputCredits` allows one input per tick per player (with a small bank
   for network jitter), so flooding inputs cannot make anyone move faster.
@@ -255,9 +303,19 @@ that to drop inputs the server has already applied when it reconciles.
 
 ### What each client sees
 
-Each patch, `replicate` describes every entity once, as `EntityState`s
-with a position and the schema's fields. For each client the engine then
-sends only the difference from what that client already has:
+Each patch, `replicate` describes every entity once: `out.add(id, &view)`
+with a `#[derive(Replicated)]` view (or a hand-built `EntityState`). The
+view's struct is the kind: `#[replicated(kind = "mob", id = 2, priority =
+2.0, global)]`, one field per replicated field in wire order (`bool`, `u8`,
+`u16`, `u32`, `i32`, `f32`, `String` as a short string, `Vec<u8>` as
+bytes), `#[quant(min, max, bits)]` / `#[quant(centered = R, bits)]` (zero
+exact) / `#[angle(bits)]` / `#[field_type(EXPR)]` for floats,
+`#[priority(p)]`, and `#[correct(ease = ms | snap | replace)]` client
+defaults. The interest position is the `x` / `y` fields (or
+`#[replicated(x = .., y = ..)]`); a kind without one must be `global`.
+`out.add(..)` returns a handle for `.global()`, `.local()`, `.priority(p)`.
+For each client the engine then sends only the difference from what that
+client already has:
 
 - **Schema and quantization.** Fields are typed (`QuantF32`, integers,
   booleans, strings, …). Floats are quantized to the precision you choose,
@@ -271,9 +329,15 @@ sends only the difference from what that client already has:
   (4 KiB). Creates and updates compete by priority (kind × entity ×
   field × nearness). Anything deferred builds up priority, so it is always
   sent eventually.
-- **Events** (`ctx.send_event(viewer, type_id, bytes)`,
-  `ctx.broadcast_event(type_id, bytes)`) carry one-off messages such as "kill", "saved" or "weather changed" next to the
-  Deltas.
+- **Events** carry one-off messages such as "kill", "saved" or "weather
+  changed" next to the Deltas. Declare them as a `#[derive(GameEvent)]`
+  enum (each variant `#[game_event(id = N)]`: unit, named fields, or one
+  value such as a `#[derive(GameRecord)]` struct) or struct, and send them
+  with `ctx.send(viewer, &event)` / `ctx.broadcast(&event)`. Payloads use
+  the same value codec as entity fields plus `i8`/`i16`/`u64`/`f64`,
+  `#[long]` strings, `Vec<T>`, `Option<T>` and nested records.
+  `E::decode_event(type_id, bytes)` decodes them (bots, tests). The raw
+  `ctx.send_event(viewer, type_id, bytes)` remains for custom payloads.
 
 Wire details are in [`PROTOCOL.md`](PROTOCOL.md).
 
@@ -281,7 +345,8 @@ Wire details are in [`PROTOCOL.md`](PROTOCOL.md).
 
 `GameClient` (`@hops-ops/distributed/game`) handles the connection,
 reconnection and clock sync, and gives you `render()`: a list of entities
-ready to draw.
+ready to draw. A [generated client](#generated-clients) wraps it with your
+zone's typed fields, input encoder, events and correction defaults.
 
 - **Interpolation.** Other entities are drawn a little in the past,
   between two received states, so movement is smooth whatever the network
@@ -302,20 +367,68 @@ ready to draw.
   a newer content version, and the client rejoins afterwards with the same
   player.
 
+### Generated clients
+
+The derives also describe the zone for the browser. A **game surface**
+(`GameSurface`, versioned JSON, schema v1) lists the zone's kinds with
+their fields, wire types, priorities and correction defaults, its input
+layout and sanitize rules, its events and the records they mention.
+Export one function per zone type, conventionally `game_surface`:
+
+```rust,ignore
+pub fn game_surface() -> GameSurface {
+    GameSurface::for_zone::<Arena>("arena").events::<ArenaEvent>()
+}
+```
+
+`distributed game-manifest` builds and runs it (through the same harness
+as `distributed describe`), and `distributed game-client --manifest
+<json> --out <dir> [--check]` writes framework-neutral TypeScript that
+imports only `@hops-ops/distributed/game`:
+
+| File | Contents |
+|---|---|
+| `schema.ts` | `KIND` ids, `PlayerFields` interfaces with `isPlayer(e)` / `playerFields(e)` over rendered or replica entities (camelCase properties), `FIELD_TYPES`, `CORRECTIONS` |
+| `input.ts` | the input interface, `BITS` / `BUTTON`, `encodeInput`, `decodeInput`, `sanitizeInput` (what the server will simulate) |
+| `events.ts` | record and event interfaces, `EVENT` ids, `EVENTS` codecs, `decodeEvent`, `onEvent` |
+| `client.ts` | `create<Name>Client(options)`: a `GameClient` with the encoder and correction defaults wired in, a typed `on(name, handler)` and `send(input)` |
+| `index.ts`, `surface.json` | re-exports; the surface it came from |
+
+The output is deterministic, so check it in and run `--check` in CI: a
+changed Rust definition then fails the build until the client is
+regenerated. The binary protocol is unchanged; the generated code only
+removes the hand-written glue around it. Prediction functions stay
+hand-written (they must match `on_tick` bit for bit), but they use the
+generated input type, sanitize and field wire types.
+
 ### Saving progress without pausing the game
 
 The rule: **the tick never waits for storage.** A slow disk or a busy
-database must not freeze the world. Zones emit **facts** and continue:
+database must not freeze the world. Zones emit **facts** and continue.
+A fact is the cell command's own input type, bound to the command name
+with `#[derive(FactCommand)]` (pointing at the same constant the cell
+mounts the command under):
 
 ```rust,ignore
-let key = ctx.fact_key("kill", &[&mob_id, &mob_generation]);
-ctx.emit_fact_for(killer, Fact::new(key, "crawler.record_kill", json!({"mob": "elite"})))?;
+#[derive(Serialize, CommandInput, FactCommand)]
+#[fact(command = RECORD_KILL)]          // typed_command::<RecordKillInput, _>(RECORD_KILL)
+pub struct RecordKillInput { pub mob: String, pub tier: u8 }
+
+// in on_tick: key "crawler.record_kill:{zone}:{boot_epoch}:m{mob}:{generation}"
+ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), &generation])?;
 ```
 
 - The host attaches the killer's **verified identity** from their ticket.
   The zone cannot claim to be someone else, and the payload names no
-  reward amount; the storage side decides the XP from the facts it
-  trusts.
+  reward amount; the command handler decides the XP from what it trusts.
+  The derive refuses identity- or reward-looking fields (`principal`,
+  `user_id`, `owner`, `xp`, `reward`, … including serde renames) at
+  compile time.
+- Keys are restart-safe automatically: `ctx.emit(player, input)` uses the
+  input's `#[fact(key(field, ..))]` parts, or the tick and emission order;
+  `ctx.emit_keyed` takes explicit parts; `ctx.emit_zone` emits a zone
+  fact with no principal; `ctx.fact(&input)` builds the `Fact` for a retry
+  backlog. `Fact::new(key, command, json)` still works.
 - A background worker commits facts with retries.
   `cell::CellFactSink` turns each one into a command on that player's
   cell, with a command id derived from the fact key. A retry or a
@@ -440,11 +553,28 @@ unlimited rewind.
 
 # Reference
 
+## Authoring derives
+
+Re-exported from `distributed_game_macros`; each has spanned compile
+errors for unsupported types and attributes.
+
+| Derive | On | Container attribute | Field attributes | Implements |
+|---|---|---|---|---|
+| `Replicated` | struct | `#[replicated(kind = "name", id = N, priority = P, global, x = f, y = f)]` | `quant`, `angle`, `field_type`, `priority`, `correct` | `Replicated` (`kind_def`, `field_values`, `position`) |
+| `GameInput` | struct | – | `range`, `buttons`, `quant`, `angle`, `field_type` | `GameInput` (`from_payload`, `to_payload`, `sanitize`) + button consts |
+| `GameEvent` | enum / struct | `#[game_event(id = N, name = "..")]` per variant / on the struct | `quant`, `angle`, `field_type`, `long` | `GameEvent` (`decode_event`, `to_payload`) + id consts |
+| `GameRecord` | struct | – | `quant`, `angle`, `field_type`, `long` | `Wire` (nested payload record) |
+| `FactCommand` | struct (`Serialize`) | `#[fact(command = CONST_OR_LITERAL, key(field, ..))]` | – | `FactCommand` (`COMMAND`, `dedupe_parts`) |
+
+`schema![A, B]` builds an `EntitySchema`; `GameSurface::for_zone::<Z>(name)`
+(kinds from `Z::schema()`, input from `Z::Input`) `.events::<E>()` builds
+the surface; `codec` holds the shared value codec (`Wire`, `WireType`).
+
 ## Features
 
 | Feature | Adds | Deps |
 |---|---|---|
-| *(default)* | Zone/host runtime, facts queue, protocol, schema, replication | `serde_json` |
+| *(default)* | Zone/host runtime, facts queue, protocol, schema, replication, authoring derives, game surface | `serde`, `serde_json`, `distributed_game_macros` |
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
 | `cell` | `cell::CellFactSink` → `AggregateCell::dispatch_idempotent`, `stamp_event_record` | `distributed`, `sha2` |
 | `metrics` | `metrics::GameMetrics` per-zone Prometheus text | – |
@@ -455,12 +585,19 @@ unlimited rewind.
 
 ## Durable facts
 
-Zones never await storage. Emit a fact during a tick:
+Zones never await storage. Emit a fact during a tick — typed (the cell
+command's input with `#[derive(FactCommand)]`, key derived for you) or by
+hand:
 
 ```rust,ignore
-let key = ctx.fact_key("kill", &[&enemy_id, &enemy_generation]); // "kill:{zone}:{boot_epoch}:…"
-ctx.emit_fact_for(player, Fact::new(key, "hero.credit_xp", json!({"amount": 25})))?;
+ctx.emit_keyed(player, SlayInput { enemy: enemy_id }, &[&enemy_id, &enemy_generation])?;
+// "hero.slay:{zone}:{boot_epoch}:{enemy}:{generation}"; or by hand:
+let key = ctx.fact_key("slay", &[&enemy_id, &enemy_generation]); // "slay:{zone}:{boot_epoch}:…"
+ctx.emit_fact_for(player, Fact::new(key, "hero.slay", json!({"enemy": enemy_id})))?;
 ```
+
+Settlements: `settlement.is::<SlayInput>()`, and
+`receipt.payload_as::<SlayReceipt>()` for the command's typed output.
 
 > **Warning — restart-safe keys.** Ticks, entity ids and generations all
 > restart from zero when a process restarts (or a zone is re-activated from
