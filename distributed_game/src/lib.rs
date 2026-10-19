@@ -37,6 +37,10 @@
 
 #![warn(missing_docs)]
 
+// Lets the authoring derives' `::distributed_game::…` paths resolve inside
+// this crate too.
+extern crate self as distributed_game;
+
 pub mod authoring;
 #[cfg(feature = "bots")]
 pub mod bots;

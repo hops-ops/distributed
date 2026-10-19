@@ -10,7 +10,11 @@ use syn::{Attribute, Data, DeriveInput, Expr, Field, Fields, Ident, LitStr, Type
 /// crate itself included).
 pub(crate) fn runtime() -> syn::Result<TokenStream> {
     let root = match crate_name("distributed_game") {
-        Ok(FoundCrate::Itself) => quote!(crate),
+        // `::distributed_game`, not `crate`: doctests of the crate itself
+        // report `Itself` but compile as a separate crate. The lib declares
+        // `extern crate self as distributed_game` so the path also works
+        // inside it.
+        Ok(FoundCrate::Itself) => quote!(::distributed_game),
         Ok(FoundCrate::Name(name)) => {
             let ident = Ident::new(&name, Span::call_site());
             quote!(::#ident)
