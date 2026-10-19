@@ -18,26 +18,21 @@
  * - `Resume` with reason `content_update_aborted`: `lastResume().aborted`.
  */
 import {
-	GameClient,
+	type GameClient,
 	type GameSocketFactory,
 	type ResumeMessage,
 	type FreezeMessage
 } from '@hops-ops/distributed/game';
 
-import { encodeMoveInput, predictPlayer, type MoveInput } from '../arena/movement.ts';
+import { predictPlayer } from '../arena/movement.ts';
+import * as freeze from '../generated/freeze/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
-import { onJsonEvent } from '../shared/events.ts';
 
 export const ZONES = { hub: 'freeze-hub', meadow: 'freeze-meadow', ember: 'freeze-ember' } as const;
 export const DEFAULT_ZONE = ZONES.hub;
-/** Event type ids (server `freeze::EVENT_*`). */
-export const EVENT_HELLO = 1;
-export const EVENT_GEM = 2;
-export const EVENT_BURNED = 3;
-export const EVENT_CONTENT = 4;
-export const KIND = { player: 'player', slime: 'slime', gem: 'gem', ritual: 'ritual' } as const;
 
-export type Stamp = Readonly<{ zone: string; tick: number; contentVersion: string }>;
+/** Provenance of an event or fact (generated from the Rust `Stamp` record). */
+export type Stamp = freeze.Stamp;
 
 export type ZoneLayout = Readonly<{
 	title: string;
@@ -61,15 +56,7 @@ export type Pack = Readonly<{
 	zones: Readonly<Record<string, ZoneLayout>> & { crystals: readonly (readonly [number, number])[][] };
 }>;
 
-export type FreezeHello = Readonly<{
-	entity: number;
-	zone: string;
-	title: string;
-	gate: boolean;
-	host: string;
-	half: number;
-	contentVersion: string;
-}>;
+export type FreezeHello = freeze.HelloEvent;
 
 export type LogEntry = Readonly<{ at: number; zone: string; kind: string; text: string; stamp?: Stamp }>;
 
@@ -149,7 +136,7 @@ export type WorldStatus = Readonly<{
 }>;
 
 export type FreezeClient = Readonly<{
-	client: GameClient<MoveInput>;
+	client: GameClient<freeze.MoveInput>;
 	/** Content pack the client renders. */
 	pack(): Pack;
 	hello(): FreezeHello | undefined;
@@ -168,7 +155,7 @@ export type FreezeClient = Readonly<{
 	reloads: { zone: string; version: string }[];
 	log: LogEntry[];
 	/** Send one command frame (counted when frozen). */
-	sendInput(input: MoveInput): number | undefined;
+	sendInput(input: freeze.MoveInput): number | undefined;
 	onChange(listener: (what: string) => void): () => void;
 }>;
 
@@ -196,10 +183,8 @@ export async function createFreezeClient(options: FreezeClientOptions): Promise<
 		if (log.length > 50) log.shift();
 		changed('log');
 	};
-	const ease = { mode: 'ease', durationMs: 150 } as const;
-	const snap = { mode: 'snap' } as const;
 	let reloadingZone = '';
-	const client = new GameClient<MoveInput>({
+	const typed = freeze.createFreezeClient({
 		url: (zone) => zoneUrl(zone, options.base),
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
@@ -213,14 +198,9 @@ export async function createFreezeClient(options: FreezeClientOptions): Promise<
 			changed('pack');
 			return pack.version;
 		},
-		prediction: {
-			encodeInput: (input) => encodeMoveInput(input),
-			predict: (fields, input) => predictPlayer(fields, input),
-			corrections: {
-				player: { x: ease, y: ease, vx: snap, vy: snap, dash: snap, cd: snap, name: { mode: 'replace' } }
-			}
-		}
+		prediction: { predict: (fields, input) => predictPlayer(fields, input) }
 	});
+	const { client } = typed;
 	client.on('reloadRequired', (zone) => (reloadingZone = zone));
 
 	let hello: FreezeHello | undefined;
@@ -230,7 +210,7 @@ export async function createFreezeClient(options: FreezeClientOptions): Promise<
 	let worldVersion: string | undefined;
 	let dropped = 0;
 
-	onJsonEvent<FreezeHello>(client, EVENT_HELLO, (value) => {
+	typed.on('hello', (value) => {
 		hello = value;
 		client.setControlledEntity(value.entity);
 		const waiters = helloWaiters;
@@ -272,15 +252,9 @@ export async function createFreezeClient(options: FreezeClientOptions): Promise<
 				.catch((error: unknown) => note(zone, 'error', String(error)));
 		}
 	});
-	onJsonEvent<{ by: string; value: number; stamp: Stamp }>(client, EVENT_GEM, (v, zone) =>
-		note(zone, 'gem', `${v.by} collected a gem (+${v.value})`, v.stamp)
-	);
-	onJsonEvent<{ name: string; stamp: Stamp }>(client, EVENT_BURNED, (v, zone) =>
-		note(zone, 'burned', `${v.name} stepped into lava`, v.stamp)
-	);
-	onJsonEvent<{ from: string; to: string; name: string; stamp: Stamp }>(client, EVENT_CONTENT, (v, zone) =>
-		note(zone, 'content', `zone switched ${v.from} → ${v.to} "${v.name}"`, v.stamp)
-	);
+	typed.on('gem', (v, zone) => note(zone, 'gem', `${v.by} collected a gem (+${v.value})`, v.stamp));
+	typed.on('burned', (v, zone) => note(zone, 'burned', `${v.name} stepped into lava`, v.stamp));
+	typed.on('content', (v, zone) => note(zone, 'content', `zone switched ${v.from} → ${v.to} "${v.name}"`, v.stamp));
 
 	return {
 		client,

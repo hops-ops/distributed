@@ -24,11 +24,12 @@
 //! Movement is the Arena's shared step ([`crate::arena::movement`], predicted
 //! by the client with the same TypeScript twin).
 //!
-//! Entities: 1 `player` (Arena fields), 2 `slime` (x y yaw), 3 `gem` (x y),
-//! 4 `ritual` (global: x y stuck). Events (JSON): [`EVENT_HELLO`],
-//! [`EVENT_GEM`], [`EVENT_BURNED`], [`EVENT_CONTENT`]; gameplay events carry
-//! `ctx.stamp()` (zone, tick, content version). Gems and content switches are
-//! also durable facts stamped by the host.
+//! Entities: 1 `player` (the Arena's [`PlayerView`]), 2 `slime` (x y yaw),
+//! 3 `gem` (x y), 4 `ritual` (global: x y stuck). Events: [`FreezeEvent`];
+//! gameplay events carry `ctx.stamp()` (zone, tick, content version). Gems
+//! and content switches are also typed durable facts ([`GemCollected`],
+//! [`ContentApplied`]) stamped by the host. The browser client is generated
+//! from [`game_surface`].
 
 pub mod content;
 pub mod world;
@@ -39,31 +40,162 @@ use std::time::Duration;
 
 use distributed_game::net::{GameServer, ServerConfig};
 use distributed_game::{
-    Ctx, EntitySchema, EntityState, Fact, FactStamp, FieldType, FieldValue, GameInput,
-    InputCredits, KindDef, LeaveReason, PlayerId, StalePolicy, View, WorldView, Zone,
+    schema, Ctx, EntitySchema, FactCommand, FactStamp, GameEvent, GameInput, GameRecord,
+    GameSurface, InputCredits, LeaveReason, PlayerId, Replicated, StalePolicy, View, WorldView,
+    Zone,
 };
-use serde_json::{json, Value};
+use serde::Serialize;
 
 use crate::arena::movement::{self, MoveInput, MoveState};
-use crate::common::{broadcast_json_event, send_json_event, Demo, Guests};
+use crate::arena::PlayerView;
+use crate::common::{Demo, Guests};
 use content::{Hazard, Pack, ZoneKind};
 
-/// Player kind (Arena fields: the client predicts it with Arena's step).
-pub const KIND_PLAYER: u16 = 1;
-/// Slime kind.
-pub const KIND_SLIME: u16 = 2;
-/// Gem kind.
-pub const KIND_GEM: u16 = 3;
-/// Ritual circle (global; `stuck` = 1 while it holds the zone).
-pub const KIND_RITUAL: u16 = 4;
-/// `{"entity", "zone", "title", "gate", "host", "half", "contentVersion"}`.
-pub const EVENT_HELLO: u32 = 1;
-/// `{"by", "value", "stamp"}` — someone collected a gem.
-pub const EVENT_GEM: u32 = 2;
-/// `{"name", "stamp"}` — someone stepped into lava.
-pub const EVENT_BURNED: u32 = 3;
-/// `{"from", "to", "name", "stamp"}` — the zone switched content.
-pub const EVENT_CONTENT: u32 = 4;
+/// A wandering slime.
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "slime", id = 2)]
+pub struct SlimeView {
+    /// Position x.
+    #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    pub x: f32,
+    /// Position y.
+    #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    pub y: f32,
+    /// Heading.
+    #[angle(bits = 8)]
+    pub yaw: f32,
+}
+
+/// A gem waiting to be collected (global).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "gem", id = 3, global)]
+pub struct GemView {
+    /// Position x.
+    #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    pub x: f32,
+    /// Position y.
+    #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    pub y: f32,
+}
+
+/// The ritual circle (global; `stuck` = 1 while it holds the zone).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "ritual", id = 4, global)]
+pub struct RitualView {
+    /// Position x.
+    #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    pub x: f32,
+    /// Position y.
+    #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    pub y: f32,
+    /// 1 while the ritual refuses the freeze.
+    pub stuck: u8,
+}
+
+/// Provenance of a gameplay event: which zone, tick and content version
+/// produced it.
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct Stamp {
+    /// Zone id.
+    pub zone: String,
+    /// Zone tick.
+    pub tick: u64,
+    /// Content version in effect.
+    pub content_version: String,
+}
+
+impl From<FactStamp> for Stamp {
+    fn from(stamp: FactStamp) -> Self {
+        Self {
+            zone: stamp.zone_id,
+            tick: stamp.tick,
+            content_version: stamp.content_version,
+        }
+    }
+}
+
+/// The Freeze's events.
+#[derive(Debug, Clone, PartialEq, GameEvent)]
+pub enum FreezeEvent {
+    /// To a joining player (also after a handoff).
+    #[game_event(id = 1)]
+    Hello {
+        /// Own entity id.
+        entity: u32,
+        /// Zone id.
+        zone: String,
+        /// Zone title.
+        title: String,
+        /// This zone is the safe-room gate.
+        gate: bool,
+        /// Host id (`alpha` / `beta`).
+        host: String,
+        /// Floor half extent (m).
+        half: f32,
+        /// Content version the zone runs.
+        content_version: String,
+    },
+    /// Someone collected a gem.
+    #[game_event(id = 2)]
+    Gem {
+        /// Collector's name.
+        by: String,
+        /// Gem value under the zone's content pack.
+        value: u32,
+        /// Provenance.
+        stamp: Stamp,
+    },
+    /// Someone stepped into lava.
+    #[game_event(id = 3)]
+    Burned {
+        /// Who.
+        name: String,
+        /// Provenance.
+        stamp: Stamp,
+    },
+    /// The zone switched content.
+    #[game_event(id = 4)]
+    Content {
+        /// Previous version.
+        from: String,
+        /// New version.
+        to: String,
+        /// New pack name.
+        name: String,
+        /// Provenance.
+        stamp: Stamp,
+    },
+}
+
+/// The Freeze's client surface.
+pub fn game_surface() -> GameSurface {
+    GameSurface::for_zone::<FreezeZone>("freeze").events::<FreezeEvent>()
+}
+
+/// Durable command recording a collected gem.
+pub const GEM_COLLECTED: &str = "freeze.gem_collected";
+/// Durable command recording a content switch.
+pub const CONTENT_APPLIED: &str = "freeze.content_applied";
+
+/// [`GEM_COLLECTED`] input: *which* gem spot was collected. Its value is a
+/// rule of the content pack at the fact's stamped content version, for the
+/// handler to apply — the zone never reports a reward amount.
+#[derive(Debug, Clone, PartialEq, Serialize, FactCommand)]
+#[fact(command = GEM_COLLECTED)]
+pub struct GemCollected {
+    /// Gem spot of the zone layout.
+    pub spot: u32,
+}
+
+/// [`CONTENT_APPLIED`] input (a zone/system fact).
+#[derive(Debug, Clone, PartialEq, Serialize, FactCommand)]
+#[fact(command = CONTENT_APPLIED, key(to))]
+pub struct ContentApplied {
+    /// Previous version.
+    pub from: String,
+    /// New version.
+    pub to: String,
+}
 /// Content version every host starts on.
 pub const INITIAL_VERSION: &str = "v1";
 const VIEW_RADIUS: f32 = 40.0;
@@ -159,10 +291,6 @@ impl FreezeZone {
         self.players.get(&player).map(|p| (p.state.x, p.state.y))
     }
 
-    fn stamp_json(stamp: &FactStamp) -> Value {
-        json!({ "zone": stamp.zone_id, "tick": stamp.tick, "contentVersion": stamp.content_version })
-    }
-
     fn arrival_point(&self, from_zone: &str) -> (f32, f32) {
         self.config
             .kind
@@ -195,20 +323,16 @@ impl FreezeZone {
             },
         );
         ctx.set_view(player, View::new(at.0, at.1, VIEW_RADIUS));
-        send_json_event(
-            ctx,
-            player,
-            EVENT_HELLO,
-            &json!({
-                "entity": entity,
-                "zone": self.zone_id,
-                "title": self.config.kind.title(),
-                "gate": self.config.kind == ZoneKind::Hub,
-                "host": self.config.host,
-                "half": movement::HALF,
-                "contentVersion": ctx.content_version(),
-            }),
-        );
+        let hello = FreezeEvent::Hello {
+            entity,
+            zone: self.zone_id.clone(),
+            title: self.config.kind.title().into(),
+            gate: self.config.kind == ZoneKind::Hub,
+            host: self.config.host.clone(),
+            half: movement::HALF,
+            content_version: ctx.content_version().into(),
+        };
+        ctx.send(player, &hello);
     }
 
     fn random_point(ctx: &mut Ctx<'_, Self>) -> (f32, f32) {
@@ -231,40 +355,7 @@ impl Zone for FreezeZone {
     type Timer = ();
 
     fn schema() -> EntitySchema {
-        let small = FieldType::QuantF32 {
-            min: -movement::HALF,
-            max: movement::HALF,
-            bits: 14,
-        };
-        EntitySchema::new()
-            .kind(
-                KindDef::new(KIND_PLAYER, "player")
-                    .field("x", movement::POS)
-                    .field("y", movement::POS)
-                    .field("vx", movement::VEL)
-                    .field("vy", movement::VEL)
-                    .field("dash", FieldType::U8)
-                    .field("cd", FieldType::U8)
-                    .field_with_priority("name", FieldType::ShortStr, 0.2)
-                    .priority(2.0),
-            )
-            .kind(
-                KindDef::new(KIND_SLIME, "slime")
-                    .field("x", small)
-                    .field("y", small)
-                    .field("yaw", FieldType::Angle { bits: 8 }),
-            )
-            .kind(
-                KindDef::new(KIND_GEM, "gem")
-                    .field("x", small)
-                    .field("y", small),
-            )
-            .kind(
-                KindDef::new(KIND_RITUAL, "ritual")
-                    .field("x", small)
-                    .field("y", small)
-                    .field("stuck", FieldType::U8),
-            )
+        schema![PlayerView, SlimeView, GemView, RitualView]
     }
 
     fn on_create(ctx: &mut Ctx<'_, Self>, config: FreezeConfig) -> Self {
@@ -362,8 +453,11 @@ impl Zone for FreezeZone {
                     y: sy,
                     ..MoveState::default()
                 };
-                let event = json!({ "name": player.name, "stamp": Self::stamp_json(&ctx.stamp()) });
-                broadcast_json_event(ctx, EVENT_BURNED, &event);
+                let event = FreezeEvent::Burned {
+                    name: player.name.clone(),
+                    stamp: ctx.stamp().into(),
+                };
+                ctx.broadcast(&event);
             }
             let player = self.players.get_mut(&id).expect("present");
             let (x, y) = (player.state.x, player.state.y);
@@ -376,16 +470,15 @@ impl Zone for FreezeZone {
                 {
                     gem.respawn_at = Some(now + GEM_RESPAWN);
                     self.collected += 1;
-                    let value = self.pack.gem_value;
-                    let key = format!("gem:{}:{}:{}", self.zone_id, ctx.tick(), gem.spot);
-                    let _ = ctx.emit_fact_for(
-                        id,
-                        Fact::new(key, "freeze.gem_collected", json!({ "value": value })),
-                    );
-                    let event = json!({
-                        "by": player.name, "value": value, "stamp": Self::stamp_json(&ctx.stamp()),
-                    });
-                    broadcast_json_event(ctx, EVENT_GEM, &event);
+                    // Keyed by tick + emission order (a spot respawns).
+                    let spot = gem.spot as u32;
+                    let _ = ctx.emit(id, GemCollected { spot });
+                    let event = FreezeEvent::Gem {
+                        by: player.name.clone(),
+                        value: self.pack.gem_value,
+                        stamp: ctx.stamp().into(),
+                    };
+                    ctx.broadcast(&event);
                 }
             }
             // Portals.
@@ -429,61 +522,26 @@ impl Zone for FreezeZone {
 
     fn replicate(&self, out: &mut WorldView) {
         for p in self.players.values() {
-            let s = p.state;
-            out.push(EntityState::new(
-                p.entity,
-                KIND_PLAYER,
-                s.x,
-                s.y,
-                vec![
-                    FieldValue::F(s.x),
-                    FieldValue::F(s.y),
-                    FieldValue::F(s.vx),
-                    FieldValue::F(s.vy),
-                    FieldValue::U(s.dash.into()),
-                    FieldValue::U(s.cooldown.into()),
-                    FieldValue::Str(p.name.clone()),
-                ],
-            ));
+            // The Arena's capsule, but culled by the view radius here.
+            out.add(p.entity, &PlayerView::of(&p.state, &p.name))
+                .local();
         }
         for (i, s) in self.slimes.iter().enumerate() {
-            out.push(EntityState::new(
-                1 + i as u32,
-                KIND_SLIME,
-                s.x,
-                s.y,
-                vec![FieldValue::F(s.x), FieldValue::F(s.y), FieldValue::F(s.yaw)],
-            ));
+            let view = SlimeView {
+                x: s.x,
+                y: s.y,
+                yaw: s.yaw,
+            };
+            out.add(1 + i as u32, &view);
         }
         let spots = self.config.kind.gem_spots();
         for gem in self.gems.iter().filter(|g| g.respawn_at.is_none()) {
             let (x, y) = spots[gem.spot];
-            out.push(
-                EntityState::new(
-                    100 + gem.spot as u32,
-                    KIND_GEM,
-                    x,
-                    y,
-                    vec![FieldValue::F(x), FieldValue::F(y)],
-                )
-                .global(),
-            );
+            out.add(100 + gem.spot as u32, &GemView { x, y });
         }
-        let (rx, ry) = self.config.kind.ritual();
-        out.push(
-            EntityState::new(
-                RITUAL_ID,
-                KIND_RITUAL,
-                rx,
-                ry,
-                vec![
-                    FieldValue::F(rx),
-                    FieldValue::F(ry),
-                    FieldValue::U(self.config.rituals.is_stuck(&self.zone_id).into()),
-                ],
-            )
-            .global(),
-        );
+        let (x, y) = self.config.kind.ritual();
+        let stuck = u8::from(self.config.rituals.is_stuck(&self.zone_id));
+        out.add(RITUAL_ID, &RitualView { x, y, stuck });
     }
 
     fn is_gate(&self) -> bool {
@@ -499,16 +557,17 @@ impl Zone for FreezeZone {
             self.pack = pack;
         }
         // A meaningful world transition: persisted (stamped with `to`).
-        let key = format!("content:{}:{to}", self.zone_id);
-        let _ = ctx.emit_fact(Fact::new(
-            key,
-            "freeze.content_applied",
-            json!({ "from": from, "to": to }),
-        ));
-        let event = json!({
-            "from": from, "to": to, "name": self.pack.name, "stamp": Self::stamp_json(&ctx.stamp()),
+        let _ = ctx.emit_zone(ContentApplied {
+            from: from.into(),
+            to: to.into(),
         });
-        broadcast_json_event(ctx, EVENT_CONTENT, &event);
+        let event = FreezeEvent::Content {
+            from: from.into(),
+            to: to.into(),
+            name: self.pack.name.clone(),
+            stamp: ctx.stamp().into(),
+        };
+        ctx.broadcast(&event);
     }
 
     fn has_pending_work(&self) -> bool {
