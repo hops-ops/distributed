@@ -578,7 +578,10 @@ explicit redactor.
 `@hops-ops/distributed/game` speaks the `distributed_game` binary protocol
 (golden-tested against the Rust fixtures). The app supplies tickets — a
 function, so a fresh single-use ticket is fetched whenever a reconnect token
-can no longer be used — and a pure `predict` for its own entity.
+can no longer be used — and a pure `predict` for its own entity. With a
+[generated client](#generated-game-clients) that `predict` is the zone's
+own Rust step compiled to WebAssembly; the hand-written form below is the
+low-level API.
 
 ```ts
 import { GameClient, InputPacer } from '@hops-ops/distributed/game';
@@ -632,9 +635,11 @@ server-side lag compensation (`replica.interpolationDelayMs`,
 `connection.stats` exposes cumulative bytes/messages in and out (Delta bytes
 separately) for bandwidth HUDs.
 
-**Generated clients.** Rather than writing `encodeInput`, field names,
-event ids and correction tables by hand, generate them from the zone's
-Rust definitions: `distributed game-manifest` + `distributed game-client`
+### Generated game clients
+
+Rather than writing `encodeInput`, field names, event ids, correction
+tables or the prediction step by hand, generate them from the zone's Rust
+definitions: `distributed game-manifest` + `distributed game-client`
 (see the [`distributed_game` README](../distributed_game/README.md#generated-clients))
 write a typed module per zone that wraps this `GameClient` —
 `createArenaClient(options)`, `playerFields(entity)`, `encodeInput`,
@@ -642,6 +647,36 @@ write a typed module per zone that wraps this `GameClient` —
 payload codec (`encodePayload`, `decodePayload`, `sanitizePayload`,
 `WireType`) and helpers (`onGameEvent`, `decodeGameEvent`, `fieldNumber`,
 `mergeCorrections`), which hand-written code may use directly.
+
+**Prediction from WebAssembly.** When the zone declares its step with
+`#[predict]`, `distributed game-wasm` compiles it to
+`<generated>/wasm/<surface>.wasm` and the generated `create<Name>Client`
+predicts with it by default (`prediction: false` turns prediction off, a
+`predict` in `prediction` replaces it, `wasm` overrides where the module
+is loaded from). The client exposes the step as `prediction`:
+
+```ts
+const grid = createGridClient({ url, ticket });            // loads wasm/grid.wasm
+await grid.prediction?.ready;                              // instantiated
+grid.prediction?.setContext({ seed, cx: 3, cy: -2 });      // steps with a context
+```
+
+Underneath, `createWasmPrediction({ source, exportName, state, context,
+encodeInput })` wraps a `PredictModule` (`loadPredictModule(source)`:
+URL, `file:` URL in Node, bytes, `Response` or compiled module; one
+instance per URL) as a `PredictFn`. The ABI is binary: the controlled
+entity's predicted fields (`PredictStateLayout`, binary32 floats), the
+input payload and the context are written into the module's scratch
+buffer and the next state is read back — no JSON, no allocation across the
+boundary. Until the module is ready (and, for steps with a context, until
+`setContext`), `predict` leaves the state unchanged; the next
+reconciliation replays every pending input through the step. Cost
+(Node 24 / Chrome 156, Apple silicon): ~0.8–1.2 µs per predicted step, ~8–12 µs
+for a reconciliation replaying 10 pending inputs — well under 0.1 % of a
+33 ms frame at 30 Hz. Bundlers emit the module as an asset through
+`new URL('./wasm/<surface>.wasm', import.meta.url)` (Vite does out of the
+box); with `--import-extension js` copy `wasm/` next to the emitted
+JavaScript.
 
 ## Protocol and security boundaries
 
@@ -677,8 +712,9 @@ duplicated as decision documents in this package.
 - `@hops-ops/distributed/react` — provider and query hook over the same replica.
 - `@hops-ops/distributed/game` — binary `distributed_game` zone protocol
   client: codec, `GameConnection` (handshake, reconnect, clock sync),
-  interpolating `EntityReplica`, `Predictor` reconciliation and the
-  multi-zone `GameClient` with handoff, `AdaptiveDelay` and `InputPacer`.
+  interpolating `EntityReplica`, `Predictor` reconciliation (with
+  `createWasmPrediction` for steps compiled from Rust) and the multi-zone
+  `GameClient` with handoff, `AdaptiveDelay` and `InputPacer`.
   See `distributed_game/PROTOCOL.md`.
 
 All other subpaths are private and blocked by the package export map.
