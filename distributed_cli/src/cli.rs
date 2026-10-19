@@ -2531,6 +2531,12 @@ fn write_game_client(root: &Path, files: &[GeneratedClientFile]) -> Result<(), B
     }
     for file in files {
         let path = root.join(&file.path);
+        // Leave unchanged files untouched: dev servers watching the
+        // directory (e.g. the Vite plugin's regeneration on Rust changes)
+        // would otherwise reload for nothing.
+        if fs::read(&path).is_ok_and(|current| current == file.contents.as_bytes()) {
+            continue;
+        }
         fs::write(&path, &file.contents)
             .map_err(|error| format!("write {}: {error}", path.display()))?;
     }
