@@ -17,6 +17,14 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
+    # The shared ticket rate limiter's Lua script runs against a real Redis.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -40,3 +48,9 @@ jobs:
         run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
       - name: Run examples/game smoke
         run: examples/game/run.sh smoke
+      - name: Ticket rate limiter against real Redis
+        working-directory: js
+        env:
+          DISTRIBUTED_REDIS_E2E: "1"
+          REDIS_URL: redis://127.0.0.1:6379
+        run: node --test tests/sveltekit-game-rate-limit.test.mjs
