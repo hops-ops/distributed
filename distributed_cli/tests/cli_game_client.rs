@@ -43,10 +43,12 @@ fn generated_typescript_matches_the_golden_files() {
         names,
         [
             "client.ts",
+            "constants.ts",
             "events.ts",
             "index.ts",
             "input.ts",
             "predict.ts",
+            "pures.ts",
             "schema.ts",
             "surface.json"
         ]
@@ -179,10 +181,12 @@ fn game_manifest_runs_the_surface_export() {
     );
     let surface: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
-    assert_eq!(surface["schemaVersion"], 2);
+    assert_eq!(surface["schemaVersion"], 3);
     assert_eq!(surface["name"], "orbs");
     assert_eq!(surface["predict"]["export"], "orb_step");
     assert_eq!(surface["predict"]["package"], "game-surface-fixture");
+    assert_eq!(surface["pures"][0]["export"], "orb_radius");
+    assert_eq!(surface["constants"][0]["value"]["limit"], 32.0);
     assert_eq!(
         surface["kinds"][0]["fields"][0]["correction"]["durationMs"],
         80
@@ -206,8 +210,9 @@ fn game_manifest_runs_the_surface_export() {
         .unwrap()
         .contains("createOrbsClient"));
 
-    // The predicted step compiles to a self-contained module next to the
-    // client; a second run is a stamp hit, and --check verifies it.
+    // The predicted step and the pure function compile to one
+    // self-contained module next to the client (game-wasm checks both
+    // exports); a second run is a stamp hit, and --check verifies it.
     let wasm = |extra: &[&str]| {
         let mut args = vec![
             "game-wasm",
@@ -242,10 +247,11 @@ fn game_manifest_runs_the_surface_export() {
 }
 
 #[test]
-fn game_wasm_needs_a_predicted_step() {
+fn game_wasm_needs_something_to_compile() {
     let tmp = tempfile::tempdir().unwrap();
     let mut surface: serde_json::Value = serde_json::from_str(&sample_surface()).unwrap();
     surface.as_object_mut().unwrap().remove("predict");
+    surface.as_object_mut().unwrap().remove("pures");
     let manifest = tmp.path().join("surface.json");
     fs::write(&manifest, surface.to_string()).unwrap();
     let run = distributed(&[
@@ -257,7 +263,7 @@ fn game_wasm_needs_a_predicted_step() {
     ]);
     assert!(!run.status.success());
     assert!(
-        String::from_utf8_lossy(&run.stderr).contains("declares no predicted step"),
+        String::from_utf8_lossy(&run.stderr).contains("declares nothing to compile"),
         "{}",
         String::from_utf8_lossy(&run.stderr)
     );

@@ -154,8 +154,11 @@ pub enum AbiError {
     Input = -3,
     /// The context bytes do not decode.
     Context = -4,
-    /// The next state does not fit the scratch buffer.
+    /// The next state (or a pure function's output) does not fit the
+    /// scratch buffer.
     Output = -5,
+    /// A pure function's argument does not decode ([`crate::pure`]).
+    Argument = -6,
 }
 
 /// One step over encoded bytes: what the WASM export does, callable
@@ -234,12 +237,18 @@ mod wasm {
         super::ABI_VERSION
     }
 
-    /// The scratch buffer (generated step exports).
+    /// The scratch buffer (generated step and pure function exports).
     pub fn scratch() -> &'static mut [u8] {
         // SAFETY: single-threaded; each export call borrows it once and
         // returns before the next call.
         unsafe { &mut *SCRATCH.0.get() }
     }
+}
+
+/// The module's scratch buffer (`wasm32` only).
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn scratch_buffer() -> &'static mut [u8] {
+    wasm::scratch()
 }
 
 /// Body of a generated step export (`#[predict]`, `wasm32` only).

@@ -10,6 +10,7 @@
 //! | [`GameRecord`] | struct | `Wire`: a nested payload record |
 //! | [`FactCommand`] | struct | `FactCommand`: the cell command name of a fact input |
 //! | [`macro@predict`] (attribute) | fn | `PredictStep` for a client-predicted step + its WebAssembly export |
+//! | [`macro@game_pure`] (attribute) | fn | `GamePure` for a pure function compiled to WebAssembly + its export |
 //!
 //! Field attributes (where they apply):
 //!
@@ -27,6 +28,7 @@ mod event;
 mod fact;
 mod input;
 mod predict;
+mod pure;
 mod replicated;
 mod shared;
 
@@ -100,4 +102,20 @@ pub fn predict(args: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as predict::Args);
     let function = parse_macro_input!(item as ItemFn);
     finish(predict::expand(args, function))
+}
+
+/// Declare a pure function the generated client calls through WebAssembly:
+/// `#[game_pure(GridCellFn)]` on `fn(arg: &A) -> R` or `fn() -> R` (`A`, `R`:
+/// `Wire` types, typically `#[derive(GameRecord)]` structs).
+///
+/// Keeps the function and adds `struct GridCellFn` implementing
+/// `distributed_game::pure::GamePure` (name it in
+/// `GameSurface::pure::<GridCellFn>()`). On `wasm32` it also exports the
+/// function as `dg_pure_<fn name>` over the binary ABI described in
+/// `distributed_game::pure`.
+#[proc_macro_attribute]
+pub fn game_pure(args: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as pure::Args);
+    let function = parse_macro_input!(item as ItemFn);
+    finish(pure::expand(args, function))
 }
