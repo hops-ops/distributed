@@ -14,6 +14,10 @@
 //! - Rebuild ([`Leaderboards::rebuild`]): read every cell's durable event
 //!   history, project it into the *staging* boards and atomically promote
 //!   them. Runs at startup too (the in-memory board starts empty).
+//! - Snapshot ([`BoardSnapshot`]): a `#[derive(GameRecord)]` struct, pushed
+//!   to clients as the zone's typed `board` event and served as camelCase
+//!   JSON by `/dev/mobpit/leaderboard`; the generated TypeScript type
+//!   describes both.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,6 +30,7 @@ use distributed::leaderboard::{
     LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy, ScoreSubmission,
 };
 use distributed::{DomainEventOccurrence, ExternalEventSource};
+use distributed_game::GameRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -40,6 +45,100 @@ pub const XP_BOARD: &str = "mobpit.xp";
 pub const PRODUCER: &str = "mobpit.crawler-cell";
 /// Rows pushed to clients.
 pub const TOP_N: usize = 10;
+
+/// One leaderboard row.
+#[derive(Debug, Clone, PartialEq, Serialize, GameRecord)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardRow {
+    /// 1-based rank.
+    pub rank: u32,
+    /// Principal.
+    pub member: String,
+    /// Last display name seen with a kill.
+    pub name: String,
+    /// Score (kills or XP).
+    pub score: f64,
+}
+
+/// Live-update counters of the background applier.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, GameRecord)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundStats {
+    /// Occurrences enqueued.
+    pub enqueued: u64,
+    /// Applied to the store.
+    pub applied: u64,
+    /// Dropped (queue full / store outage).
+    pub dropped: u64,
+    /// Failed to apply.
+    pub failed: u64,
+}
+
+/// Kills and XP of one principal.
+#[derive(Debug, Clone, PartialEq, Serialize, GameRecord)]
+#[serde(rename_all = "camelCase")]
+pub struct Scores {
+    /// Kills.
+    pub kills: f64,
+    /// XP.
+    pub xp: f64,
+}
+
+/// A principal whose board scores disagree with its cell.
+#[derive(Debug, Clone, PartialEq, Serialize, GameRecord)]
+#[serde(rename_all = "camelCase")]
+pub struct Mismatch {
+    /// Principal.
+    pub member: String,
+    /// What the cell says.
+    pub cell: Scores,
+    /// What the board says.
+    pub board: Scores,
+}
+
+/// Result of [`Leaderboards::rebuild`].
+#[derive(Debug, Clone, PartialEq, Serialize, GameRecord)]
+#[serde(rename_all = "camelCase")]
+pub struct RebuildReport {
+    /// `"memory"` or `"redis"`.
+    pub backend: String,
+    /// Cells read.
+    pub crawlers: u32,
+    /// Kill events replayed.
+    pub events: u32,
+    /// Changes applied.
+    pub applied: u32,
+    /// Changes already applied (idempotent repeats).
+    pub duplicates: u32,
+    /// The top rows were the same before and after.
+    pub identical_top: bool,
+    /// Every principal's scores equal its cell.
+    pub matches_cells: bool,
+    /// Principals whose scores did not.
+    pub mismatches: Vec<Mismatch>,
+    /// Duration (ms).
+    pub took_ms: f64,
+}
+
+/// The top-N boards pushed to clients (`board` event) and served over HTTP.
+#[derive(Debug, Clone, PartialEq, Serialize, GameRecord)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardSnapshot {
+    /// Bumps whenever anything else changes.
+    pub version: u64,
+    /// `"memory"` or `"redis"`.
+    pub backend: String,
+    /// Principals on the kills board.
+    pub members: u64,
+    /// Top kills.
+    pub kills: Vec<BoardRow>,
+    /// Top XP.
+    pub xp: Vec<BoardRow>,
+    /// Background applier counters.
+    pub background: BackgroundStats,
+    /// Last rebuild, if any.
+    pub last_rebuild: Option<RebuildReport>,
+}
 
 /// Leaderboard projection input: one committed kill.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, distributed::DomainEvent)]
@@ -128,10 +227,10 @@ pub struct Leaderboards {
     kills: Board,
     xp: Board,
     names: Mutex<HashMap<String, String>>,
-    snapshot: Mutex<Arc<Value>>,
+    snapshot: Mutex<Arc<BoardSnapshot>>,
     version: AtomicU64,
     dirty: AtomicBool,
-    last_rebuild: Mutex<Option<Value>>,
+    last_rebuild: Mutex<Option<RebuildReport>>,
     rebuilding: tokio::sync::Mutex<()>,
 }
 
@@ -164,7 +263,15 @@ impl Leaderboards {
             kills: Board::high_first(KILLS_BOARD).expect("board name"),
             xp: Board::high_first(XP_BOARD).expect("board name"),
             names: Mutex::new(HashMap::new()),
-            snapshot: Mutex::new(Arc::new(json!({ "version": 0, "kills": [], "xp": [] }))),
+            snapshot: Mutex::new(Arc::new(BoardSnapshot {
+                version: 0,
+                backend: backend.into(),
+                members: 0,
+                kills: Vec::new(),
+                xp: Vec::new(),
+                background: BackgroundStats::default(),
+                last_rebuild: None,
+            })),
             version: AtomicU64::new(0),
             dirty: AtomicBool::new(true),
             last_rebuild: Mutex::new(None),
@@ -238,8 +345,8 @@ impl Leaderboards {
         self.version.load(Ordering::Acquire)
     }
 
-    /// Latest top-N snapshot (JSON pushed as `EVENT_BOARD`).
-    pub fn snapshot(&self) -> Arc<Value> {
+    /// Latest top-N snapshot (pushed as the zone's `board` event).
+    pub fn snapshot(&self) -> Arc<BoardSnapshot> {
         self.snapshot.lock().expect("snapshot").clone()
     }
 
@@ -248,23 +355,19 @@ impl Leaderboards {
         self.dirty.store(true, Ordering::Release);
     }
 
-    fn rows(&self, entries: Vec<LeaderboardEntry>) -> Value {
-        Value::Array(
-            entries
-                .into_iter()
-                .map(|e| {
-                    json!({
-                        "rank": e.rank + 1,
-                        "member": e.member,
-                        "name": self.name_of(&e.member),
-                        "score": e.score,
-                    })
-                })
-                .collect(),
-        )
+    fn rows(&self, entries: Vec<LeaderboardEntry>) -> Vec<BoardRow> {
+        entries
+            .into_iter()
+            .map(|e| BoardRow {
+                rank: u32::try_from(e.rank + 1).unwrap_or(u32::MAX),
+                name: self.name_of(&e.member),
+                member: e.member,
+                score: e.score,
+            })
+            .collect()
     }
 
-    async fn top_rows(&self) -> Result<(Value, Value, u64), LeaderboardError> {
+    async fn top_rows(&self) -> Result<(Vec<BoardRow>, Vec<BoardRow>, u64), LeaderboardError> {
         let kills = self.store.top(&self.kills, TOP_N).await?;
         let xp = self.store.top(&self.xp, TOP_N).await?;
         let members = self.store.len(&self.kills).await?;
@@ -274,27 +377,28 @@ impl Leaderboards {
     async fn refresh(&self) -> Result<(), LeaderboardError> {
         let (kills, xp, members) = self.top_rows().await?;
         let stats = self.background.stats();
-        let mut body = json!({
-            "backend": self.backend,
-            "members": members,
-            "kills": kills,
-            "xp": xp,
-            "background": {
-                "enqueued": stats.enqueued,
-                "applied": stats.applied,
-                "dropped": stats.dropped,
-                "failed": stats.failed,
+        let mut body = BoardSnapshot {
+            version: 0,
+            backend: self.backend.into(),
+            members,
+            kills,
+            xp,
+            background: BackgroundStats {
+                enqueued: stats.enqueued,
+                applied: stats.applied,
+                dropped: stats.dropped,
+                failed: stats.failed,
             },
-            "lastRebuild": *self.last_rebuild.lock().expect("rebuild"),
-        });
+            last_rebuild: self.last_rebuild.lock().expect("rebuild").clone(),
+        };
         let mut snapshot = self.snapshot.lock().expect("snapshot");
-        let mut current = (**snapshot).clone();
-        if let Some(map) = current.as_object_mut() {
-            map.remove("version");
-        }
+        let current = BoardSnapshot {
+            version: 0,
+            ..(**snapshot).clone()
+        };
         if current != body {
             let version = self.version.load(Ordering::Acquire) + 1;
-            body["version"] = json!(version);
+            body.version = version;
             *snapshot = Arc::new(body);
             self.version.store(version, Ordering::Release);
         }
@@ -326,7 +430,7 @@ impl Leaderboards {
 
     /// Rebuild both boards from every cell's durable event history and check
     /// the result against the cells' current state.
-    pub async fn rebuild(&self, cells: &CrawlerCells) -> Result<Value, String> {
+    pub async fn rebuild(&self, cells: &CrawlerCells) -> Result<RebuildReport, String> {
         let _one_at_a_time = self.rebuilding.lock().await;
         let started = Instant::now();
         let before = self.top_rows().await.map_err(|e| e.to_string())?;
@@ -372,22 +476,28 @@ impl Leaderboards {
         for (principal, (kills, xp)) in &expected {
             let (k, x) = self.scores(principal).await.map_err(|e| e.to_string())?;
             if k != f64::from(*kills) || x != *xp as f64 {
-                mismatches.push(json!({
-                    "member": principal, "cell": { "kills": kills, "xp": xp }, "board": { "kills": k, "xp": x }
-                }));
+                mismatches.push(Mismatch {
+                    member: principal.clone(),
+                    cell: Scores {
+                        kills: f64::from(*kills),
+                        xp: *xp as f64,
+                    },
+                    board: Scores { kills: k, xp: x },
+                });
             }
         }
-        let result = json!({
-            "backend": self.backend,
-            "crawlers": principals.len(),
-            "events": occurrences.len(),
-            "applied": report.applied,
-            "duplicates": report.duplicates,
-            "identicalTop": before.0 == after.0 && before.1 == after.1,
-            "matchesCells": mismatches.is_empty(),
-            "mismatches": mismatches,
-            "tookMs": started.elapsed().as_secs_f64() * 1000.0,
-        });
+        let count = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+        let result = RebuildReport {
+            backend: self.backend.into(),
+            crawlers: count(principals.len() as u64),
+            events: count(occurrences.len() as u64),
+            applied: count(report.applied),
+            duplicates: count(report.duplicates),
+            identical_top: before.0 == after.0 && before.1 == after.1,
+            matches_cells: mismatches.is_empty(),
+            mismatches,
+            took_ms: started.elapsed().as_secs_f64() * 1000.0,
+        };
         *self.last_rebuild.lock().expect("rebuild") = Some(result.clone());
         self.mark_dirty();
         let _ = self.refresh().await;

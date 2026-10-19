@@ -18,58 +18,265 @@
 //! leash or target dead → `return` home → `idle`. Dead mobs respawn after 4 s
 //! with a new generation.
 //!
-//! A kill emits a fact **without awaiting storage**:
-//! `Fact::new(ctx.fact_key("kill", &[mob, generation]), "crawler.record_kill",
-//! {mob, tier, name})` via `ctx.emit_fact_for(killer)` — the host binds the
-//! killer's verified principal. The key is `kill:{zone}:{boot_epoch}:m{mob}:
-//! {generation}`: the boot epoch grows across restarts, so keys never collide
-//! with an earlier run's facts (generations and ticks restart at 0). The
-//! settlement arrives in [`Zone::on_fact_settled`] on a later tick and is
-//! pushed to the killer as [`EVENT_SAVED`] + [`EVENT_PROFILE`].
+//! Kinds are `#[derive(Replicated)]` views, events the typed [`PitEvent`],
+//! input the `#[derive(GameInput)]` [`PitInput`]; the browser client is
+//! generated from [`game_surface`].
+//!
+//! A kill emits a typed fact **without awaiting storage**: the cell
+//! command's own input, [`RecordKillInput`] `{mob, tier, name}`, keyed by
+//! `ctx.fact_with_key(&input, &[m{mob}, generation])` and emitted with
+//! `ctx.emit_fact_for(killer)` — the host binds the killer's verified
+//! principal and the handler decides the XP. The key is
+//! `crawler.record_kill:{zone}:{boot_epoch}:m{mob}:{generation}`: the boot
+//! epoch grows across restarts, so keys never collide with an earlier run's
+//! facts (generations and ticks restart at 0). The settlement arrives in
+//! [`Zone::on_fact_settled`] on a later tick and is pushed to the killer as
+//! [`PitEvent::Saved`] + [`PitEvent::Profile`].
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
 use distributed_game::{
-    ConsumePolicy, Ctx, EmitError, EntitySchema, EntityState, Fact, FactOutcome, FactSettlement,
-    FieldType, FieldValue, GameInput, KindDef, LeaveReason, ObserverId, PlayerId, View, WorldView,
-    Zone,
+    schema, ConsumePolicy, Ctx, EmitError, EntitySchema, Fact, FactOutcome, FactSettlement,
+    GameEvent, GameInput, GameRecord, GameSurface, LeaveReason, ObserverId, PlayerId, Replicated,
+    View, WorldView, Zone,
 };
-use serde_json::{json, Value};
 
-use super::crawler::{level_floor, KillReceipt, RECORD_KILL};
+use super::board::BoardSnapshot;
+use super::crawler::{level_floor, KillReceipt, RecordKillInput};
 use super::world::MobPitWorld;
 use crate::arena::movement::{self, MoveInput, MoveState, PILLARS, PLAYER_RADIUS};
-use crate::common::{broadcast_json_event, send_json_event, Guests};
+use crate::arena::PillarView;
+use crate::common::Guests;
 
-/// Player kind.
-pub const KIND_PLAYER: u16 = 1;
-/// Mob kind.
-pub const KIND_MOB: u16 = 2;
-/// Pillar kind.
-pub const KIND_PILLAR: u16 = 3;
-/// Zone stats kind.
-pub const KIND_PIT: u16 = 4;
 /// Entity id of the stats entity.
 pub const PIT_ENTITY: u32 = 900;
 
-/// `{entity, half, boot, attackRange, attackArcCos}` to a joining player.
-pub const EVENT_HELLO: u32 = 1;
-/// `{xp, level, kills, levelXp, nextLevelXp, source}` — from the cell on
-/// join (`source: "cell"`), after each settlement (`"settled"`).
-pub const EVENT_PROFILE: u32 = 2;
-/// Broadcast `{key, mob, tier, x, y, killer, killerName}` the tick a mob dies.
-pub const EVENT_KILL: u32 = 3;
-/// To the killer: `{key, ok, replayed, xp, totalXp, kills, level, waitedMs, x, y, error?}`.
-pub const EVENT_SAVED: u32 = 4;
-/// Broadcast leaderboard snapshot (see `board::Leaderboards::snapshot`).
-pub const EVENT_BOARD: u32 = 5;
-/// To a player that died: `{respawnMs}`.
-pub const EVENT_DIED: u32 = 6;
+/// A player: the Arena's predicted [`MoveState`] plus server-owned combat
+/// state (replaced, never predicted, on the client).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "player", id = 1, priority = 2.0)]
+pub struct PlayerView {
+    /// Position x.
+    #[field_type(movement::POS)]
+    #[correct(ease = 150)]
+    pub x: f32,
+    /// Position y.
+    #[field_type(movement::POS)]
+    #[correct(ease = 150)]
+    pub y: f32,
+    /// Velocity x.
+    #[field_type(movement::VEL)]
+    #[correct(snap)]
+    pub vx: f32,
+    /// Velocity y.
+    #[field_type(movement::VEL)]
+    #[correct(snap)]
+    pub vy: f32,
+    /// Remaining dash frames.
+    #[correct(snap)]
+    pub dash: u8,
+    /// Remaining dash cooldown frames.
+    #[correct(snap)]
+    pub cd: u8,
+    /// Display name.
+    #[priority(0.2)]
+    #[correct(replace)]
+    pub name: String,
+    /// Hit points.
+    #[correct(replace)]
+    pub hp: u8,
+    /// Facing (rad).
+    #[angle(bits = 8)]
+    #[correct(replace)]
+    pub face: f32,
+    /// Swing animation frames left.
+    #[correct(replace)]
+    pub swing: u8,
+    /// Level (from the durable cell).
+    #[correct(replace)]
+    pub level: u16,
+    /// Waiting to respawn.
+    #[correct(replace)]
+    pub dead: bool,
+}
+
+/// A mob (dead mobs are not replicated).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "mob", id = 2)]
+pub struct MobView {
+    /// Position x.
+    #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    pub x: f32,
+    /// Position y.
+    #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    pub y: f32,
+    /// Facing (rad).
+    #[angle(bits = 8)]
+    pub face: f32,
+    /// 1 grunt · 2 brute · 3 elite.
+    pub tier: u8,
+    /// HP percent.
+    pub hp: u8,
+    /// 0 idle · 1 chase · 2 windup · 3 recover · 4 return.
+    pub state: u8,
+    /// Telegraph progress 0..=255 during a windup.
+    pub tele: u8,
+}
+
+/// Zone numbers for the HUD (global).
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "pit", id = 4, global)]
+pub struct PitView {
+    /// Facts emitted and not settled.
+    pub pending: u16,
+    /// Artificial storage latency (ms).
+    pub slow_ms: u16,
+    /// Tick interval EMA (ms).
+    pub tick_ms: f32,
+    /// Longest tick interval of the last 30 ticks (ms).
+    pub tick_max_ms: f32,
+    /// Tick work EMA (µs).
+    pub work_us: u32,
+    /// Settlements received.
+    pub committed: u32,
+    /// Facts waiting for backpressure to clear.
+    pub backlog: u16,
+}
+
+/// A player's durable progress (from the cell on join, after each settlement).
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct Profile {
+    /// Total XP.
+    pub xp: u64,
+    /// Level.
+    pub level: u32,
+    /// Kills.
+    pub kills: u32,
+    /// First XP of the level.
+    pub level_xp: u64,
+    /// First XP of the next level.
+    pub next_level_xp: u64,
+    /// `"cell"` (loaded on join) or `"settled"` (after a kill committed).
+    pub source: String,
+}
+
+/// Mob Pit's events.
+#[derive(Debug, Clone, PartialEq, GameEvent)]
+pub enum PitEvent {
+    /// To a joining player.
+    #[game_event(id = 1)]
+    Hello {
+        /// Own entity id.
+        entity: u32,
+        /// Floor half extent (m).
+        half: f32,
+        /// Process boot id (changes on restart).
+        boot: String,
+        /// Melee reach (m).
+        attack_range: f32,
+        /// Cosine of the half cone angle.
+        attack_arc_cos: f32,
+    },
+    /// Durable progress.
+    #[game_event(id = 2)]
+    Profile(Profile),
+    /// Broadcast the tick a mob dies (the fact is only queued).
+    #[game_event(id = 3)]
+    Kill {
+        /// Fact key.
+        key: String,
+        /// Mob entity id.
+        mob: u32,
+        /// Mob tier.
+        tier: u8,
+        /// Where it died.
+        x: f32,
+        /// Where it died.
+        y: f32,
+        /// Killer entity id.
+        killer: u32,
+        /// Killer display name.
+        killer_name: String,
+    },
+    /// To the killer when its fact settled.
+    #[game_event(id = 4)]
+    Saved {
+        /// Fact key.
+        key: String,
+        /// Committed.
+        ok: bool,
+        /// The cell recognised the key (replayed receipt).
+        replayed: bool,
+        /// XP credited by this kill (decided by the cell).
+        xp: u32,
+        /// Total XP after it.
+        total_xp: u64,
+        /// Kills after it.
+        kills: u32,
+        /// Level after it.
+        level: u32,
+        /// Time from emit to settlement (ms).
+        waited_ms: u32,
+        /// Where the mob died.
+        x: f32,
+        /// Where the mob died.
+        y: f32,
+        /// Failure, if any.
+        error: Option<String>,
+        /// Commit attempts (failures).
+        attempts: u32,
+    },
+    /// Leaderboard snapshot (on join and whenever it changes).
+    #[game_event(id = 5)]
+    Board(BoardSnapshot),
+    /// To a player that died.
+    #[game_event(id = 6)]
+    Died {
+        /// Respawn delay (ms).
+        respawn_ms: u32,
+    },
+}
+
+/// Mob Pit's client surface (also used by the leaderboard page).
+pub fn game_surface() -> GameSurface {
+    GameSurface::for_zone::<MobPit>("mobpit").events::<PitEvent>()
+}
+
+/// Input: the Arena's 3-byte frame (`[mx, my, buttons]`) with an attack
+/// bit next to dash.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameInput)]
+pub struct PitInput {
+    /// Stick x.
+    #[range(min = -127, max = 127)]
+    pub mx: i8,
+    /// Stick y.
+    #[range(min = -127, max = 127)]
+    pub my: i8,
+    /// [`PitInput::DASH`] | [`PitInput::ATTACK`].
+    #[buttons(dash, attack)]
+    pub buttons: u8,
+}
+
+impl PitInput {
+    /// The movement part (the Arena's step).
+    pub fn movement(self) -> MoveInput {
+        MoveInput {
+            mx: self.mx,
+            my: self.my,
+            buttons: self.buttons & MoveInput::DASH,
+        }
+    }
+
+    /// Attack held.
+    pub fn attack(self) -> bool {
+        self.buttons & Self::ATTACK != 0
+    }
+}
 
 /// Input bit: attack (bit 0 is the Arena's dash).
-pub const BUTTON_ATTACK: u8 = 2;
+pub const BUTTON_ATTACK: u8 = PitInput::ATTACK;
 /// Melee reach (m, from the player's centre to the mob's edge).
 pub const ATTACK_RANGE: f32 = 2.2;
 /// Cosine of the half cone angle (60°).
@@ -237,24 +444,15 @@ fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
 }
 
-/// Player input: the Arena's 3-byte frame plus [`BUTTON_ATTACK`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PitInput {
-    /// Movement part (dash bit only).
-    pub movement: MoveInput,
-    /// Attack held.
-    pub attack: bool,
-}
-
 impl MobPit {
-    fn profile_event(xp: u64, level: u32, kills: u32, source: &str) -> Value {
-        json!({
-            "xp": xp,
-            "level": level,
-            "kills": kills,
-            "levelXp": level_floor(level),
-            "nextLevelXp": level_floor(level + 1),
-            "source": source,
+    fn profile_event(xp: u64, level: u32, kills: u32, source: &str) -> PitEvent {
+        PitEvent::Profile(Profile {
+            xp,
+            level,
+            kills,
+            level_xp: level_floor(level),
+            next_level_xp: level_floor(level + 1),
+            source: source.into(),
         })
     }
 
@@ -267,25 +465,29 @@ impl MobPit {
 
     fn emit_kill(&mut self, ctx: &mut Ctx<'_, Self>, killer: PlayerId, mob: usize) {
         let m = &self.mobs[mob];
-        let zone = ctx.zone_id().to_string();
-        let key = ctx.fact_key("kill", &[&format_args!("m{}", m.id), &m.generation]);
-        let (x, y, tier, id) = (m.x, m.y, m.tier, m.id);
+        let (x, y, tier, id, generation) = (m.x, m.y, m.tier, m.id, m.generation);
         let Some(player) = self.players.get(&killer) else {
             return;
         };
-        let fact = Fact::new(
-            key.clone(),
-            RECORD_KILL,
-            json!({ "mob": format!("{zone}/m{id}"), "tier": tier, "name": player.name }),
-        );
-        broadcast_json_event(
-            ctx,
-            EVENT_KILL,
-            &json!({
-                "key": key, "mob": id, "tier": tier, "x": x, "y": y,
-                "killer": player.entity, "killerName": player.name,
-            }),
-        );
+        // The cell command's own input: what died, never who or how much XP.
+        let input = RecordKillInput {
+            mob: format!("{}/m{id}", ctx.zone_id()),
+            tier,
+            name: player.name.clone(),
+        };
+        let Ok(fact) = ctx.fact_with_key(&input, &[&format_args!("m{id}"), &generation]) else {
+            return;
+        };
+        let key = fact.key().to_string();
+        ctx.broadcast(&PitEvent::Kill {
+            key,
+            mob: id,
+            tier,
+            x,
+            y,
+            killer: player.entity,
+            killer_name: player.name.clone(),
+        });
         self.backlog.push_back((killer, fact, x, y));
         self.flush_backlog(ctx);
     }
@@ -350,13 +552,13 @@ impl MobPit {
                     break;
                 };
                 let input = input.input;
-                p.state = movement::step(p.state, input.movement);
+                p.state = movement::step(p.state, input.movement());
                 p.credits -= 1;
-                let (sx, sy) = (f32::from(input.movement.mx), f32::from(input.movement.my));
+                let (sx, sy) = (f32::from(input.mx), f32::from(input.my));
                 if sx * sx + sy * sy > 20.0 * 20.0 {
                     p.face = sy.atan2(sx);
                 }
-                if input.attack && p.swing_cd == 0 {
+                if input.attack() && p.swing_cd == 0 {
                     p.swing_cd = SWING_COOLDOWN;
                     p.swing_anim = SWING_FRAMES;
                     swings.push((*id, p.state.x, p.state.y, p.face));
@@ -540,11 +742,11 @@ impl MobPit {
                         m.target = None;
                     }
                 }
-                send_json_event(
-                    ctx,
+                ctx.send(
                     id,
-                    EVENT_DIED,
-                    &json!({ "respawnMs": PLAYER_RESPAWN_TICKS * 1000 / 30 }),
+                    &PitEvent::Died {
+                        respawn_ms: (PLAYER_RESPAWN_TICKS * 1000 / 30) as u32,
+                    },
                 );
             }
         }
@@ -559,12 +761,7 @@ impl MobPit {
             if let Some(p) = self.players.get_mut(&id) {
                 p.level = level;
             }
-            send_json_event(
-                ctx,
-                id,
-                EVENT_PROFILE,
-                &Self::profile_event(xp, level, kills, "cell"),
-            );
+            ctx.send(id, &Self::profile_event(xp, level, kills, "cell"));
         }
     }
 
@@ -573,7 +770,7 @@ impl MobPit {
         if version != self.board_version {
             self.board_version = version;
             let snapshot = self.world.board().snapshot();
-            broadcast_json_event(ctx, EVENT_BOARD, &snapshot);
+            ctx.broadcast(&PitEvent::Board((*snapshot).clone()));
         }
     }
 
@@ -604,54 +801,7 @@ impl Zone for MobPit {
     type Timer = ();
 
     fn schema() -> EntitySchema {
-        let pos = FieldType::QuantF32 {
-            min: -movement::HALF,
-            max: movement::HALF,
-            bits: 14,
-        };
-        EntitySchema::new()
-            .kind(
-                KindDef::new(KIND_PLAYER, "player")
-                    .field("x", movement::POS)
-                    .field("y", movement::POS)
-                    .field("vx", movement::VEL)
-                    .field("vy", movement::VEL)
-                    .field("dash", FieldType::U8)
-                    .field("cd", FieldType::U8)
-                    .field_with_priority("name", FieldType::ShortStr, 0.2)
-                    .field("hp", FieldType::U8)
-                    .field("face", FieldType::Angle { bits: 8 })
-                    .field("swing", FieldType::U8)
-                    .field("level", FieldType::U16)
-                    .field("dead", FieldType::Bool)
-                    .priority(2.0),
-            )
-            .kind(
-                KindDef::new(KIND_MOB, "mob")
-                    .field("x", pos)
-                    .field("y", pos)
-                    .field("face", FieldType::Angle { bits: 8 })
-                    .field("tier", FieldType::U8)
-                    .field("hp", FieldType::U8)
-                    .field("state", FieldType::U8)
-                    .field("tele", FieldType::U8),
-            )
-            .kind(
-                KindDef::new(KIND_PILLAR, "pillar")
-                    .field("x", FieldType::F32)
-                    .field("y", FieldType::F32)
-                    .field("r", FieldType::F32),
-            )
-            .kind(
-                KindDef::new(KIND_PIT, "pit")
-                    .field("pending", FieldType::U16)
-                    .field("slowMs", FieldType::U16)
-                    .field("tickMs", FieldType::F32)
-                    .field("tickMaxMs", FieldType::F32)
-                    .field("workUs", FieldType::U32)
-                    .field("committed", FieldType::U32)
-                    .field("backlog", FieldType::U16),
-            )
+        schema![PlayerView, MobView, PillarView, PitView]
     }
 
     fn on_create(_ctx: &mut Ctx<'_, Self>, config: MobPitConfig) -> Self {
@@ -725,16 +875,20 @@ impl Zone for MobPit {
             },
         );
         ctx.set_view(player, View::new(x, y, VIEW_RADIUS));
-        send_json_event(
-            ctx,
+        ctx.send(
             player,
-            EVENT_HELLO,
-            &json!({
-                "entity": entity, "half": movement::HALF, "boot": self.world.boot(),
-                "attackRange": ATTACK_RANGE, "attackArcCos": ATTACK_ARC_COS,
-            }),
+            &PitEvent::Hello {
+                entity,
+                half: movement::HALF,
+                boot: self.world.boot().to_string(),
+                attack_range: ATTACK_RANGE,
+                attack_arc_cos: ATTACK_ARC_COS,
+            },
         );
-        send_json_event(ctx, player, EVENT_BOARD, &self.world.board().snapshot());
+        ctx.send(
+            player,
+            &PitEvent::Board((*self.world.board().snapshot()).clone()),
+        );
         // Read path: load the durable cell off the tick; delivered later.
         self.world.request_profile(&principal);
     }
@@ -750,15 +904,14 @@ impl Zone for MobPit {
 
     fn on_observe(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {
         ctx.set_view(observer, View::new(0.0, 0.0, VIEW_RADIUS));
-        send_json_event(ctx, observer, EVENT_BOARD, &self.world.board().snapshot());
+        ctx.send(
+            observer,
+            &PitEvent::Board((*self.world.board().snapshot()).clone()),
+        );
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<PitInput> {
-        let movement = MoveInput::from_payload(payload)?;
-        Some(PitInput {
-            movement,
-            attack: payload[2] & BUTTON_ATTACK != 0,
-        })
+        PitInput::from_payload(payload)
     }
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
@@ -787,7 +940,7 @@ impl Zone for MobPit {
                 p.principal.clone(),
                 p.x,
                 p.y,
-                p.emitted.elapsed().as_millis() as u64,
+                p.emitted.elapsed().as_millis().min(u128::from(u32::MAX)) as u32,
             ),
             None => (String::new(), 0.0, 0.0, 0),
         };
@@ -795,40 +948,53 @@ impl Zone for MobPit {
         match settlement.outcome {
             FactOutcome::Committed(receipt) => {
                 self.committed += 1;
-                let Ok(kill) = serde_json::from_value::<KillReceipt>(receipt.payload) else {
+                let Ok(kill) = receipt.payload_as::<KillReceipt>() else {
                     return;
                 };
                 let Some(player) = player else { return };
                 if let Some(p) = self.players.get_mut(&player) {
                     p.level = kill.level;
                 }
-                send_json_event(
-                    ctx,
+                ctx.send(
                     player,
-                    EVENT_SAVED,
-                    &json!({
-                        "key": settlement.key, "ok": true, "replayed": receipt.replayed,
-                        "xp": kill.xp, "totalXp": kill.total_xp, "kills": kill.kills,
-                        "level": kill.level, "waitedMs": waited_ms, "x": x, "y": y,
-                    }),
+                    &PitEvent::Saved {
+                        key: settlement.key,
+                        ok: true,
+                        replayed: receipt.replayed,
+                        xp: kill.xp,
+                        total_xp: kill.total_xp,
+                        kills: kill.kills,
+                        level: kill.level,
+                        waited_ms,
+                        x,
+                        y,
+                        error: None,
+                        attempts: 0,
+                    },
                 );
-                send_json_event(
-                    ctx,
+                ctx.send(
                     player,
-                    EVENT_PROFILE,
                     &Self::profile_event(kill.total_xp, kill.level, kill.kills, "settled"),
                 );
             }
             FactOutcome::Failed { error, attempts } => {
                 if let Some(player) = player {
-                    send_json_event(
-                        ctx,
+                    ctx.send(
                         player,
-                        EVENT_SAVED,
-                        &json!({
-                            "key": settlement.key, "ok": false, "error": format!("{error:?}"),
-                            "attempts": attempts, "waitedMs": waited_ms, "x": x, "y": y,
-                        }),
+                        &PitEvent::Saved {
+                            key: settlement.key,
+                            ok: false,
+                            replayed: false,
+                            xp: 0,
+                            total_xp: 0,
+                            kills: 0,
+                            level: 0,
+                            waited_ms,
+                            x,
+                            y,
+                            error: Some(format!("{error:?}")),
+                            attempts,
+                        },
                     );
                 }
             }
@@ -842,26 +1008,21 @@ impl Zone for MobPit {
     fn replicate(&self, out: &mut WorldView) {
         for p in self.players.values() {
             let s = p.state;
-            out.push(EntityState::new(
-                p.entity,
-                KIND_PLAYER,
-                s.x,
-                s.y,
-                vec![
-                    FieldValue::F(s.x),
-                    FieldValue::F(s.y),
-                    FieldValue::F(s.vx),
-                    FieldValue::F(s.vy),
-                    FieldValue::U(s.dash.into()),
-                    FieldValue::U(s.cooldown.into()),
-                    FieldValue::Str(p.name.clone()),
-                    FieldValue::U(p.hp.max(0) as u32),
-                    FieldValue::F(p.face),
-                    FieldValue::U(p.swing_anim.into()),
-                    FieldValue::U(p.level),
-                    FieldValue::Bool(p.dead_until.is_some()),
-                ],
-            ));
+            let view = PlayerView {
+                x: s.x,
+                y: s.y,
+                vx: s.vx,
+                vy: s.vy,
+                dash: s.dash,
+                cd: s.cooldown,
+                name: p.name.clone(),
+                hp: p.hp.clamp(0, 255) as u8,
+                face: p.face,
+                swing: p.swing_anim,
+                level: p.level.min(u32::from(u16::MAX)) as u16,
+                dead: p.dead_until.is_some(),
+            };
+            out.add(p.entity, &view);
         }
         for m in &self.mobs {
             if m.state == MobState::Dead {
@@ -873,52 +1034,38 @@ impl Zone for MobPit {
             } else {
                 0
             };
-            out.push(EntityState::new(
-                m.id,
-                KIND_MOB,
-                m.x,
-                m.y,
-                vec![
-                    FieldValue::F(m.x),
-                    FieldValue::F(m.y),
-                    FieldValue::F(m.face),
-                    FieldValue::U(m.tier.into()),
-                    FieldValue::U((m.hp.max(0) * 100 / max_hp) as u32),
-                    FieldValue::U(m.state as u32),
-                    FieldValue::U(tele),
-                ],
-            ));
+            let view = MobView {
+                x: m.x,
+                y: m.y,
+                face: m.face,
+                tier: m.tier,
+                hp: (m.hp.max(0) * 100 / max_hp) as u8,
+                state: m.state as u8,
+                tele: tele as u8,
+            };
+            out.add(m.id, &view);
         }
         for (i, (x, y, r)) in PILLARS.iter().enumerate() {
-            out.push(
-                EntityState::new(
-                    100 + i as u32,
-                    KIND_PILLAR,
-                    *x,
-                    *y,
-                    vec![FieldValue::F(*x), FieldValue::F(*y), FieldValue::F(*r)],
-                )
-                .global(),
+            out.add(
+                100 + i as u32,
+                &PillarView {
+                    x: *x,
+                    y: *y,
+                    r: *r,
+                },
             );
         }
-        out.push(
-            EntityState::new(
-                PIT_ENTITY,
-                KIND_PIT,
-                0.0,
-                0.0,
-                vec![
-                    FieldValue::U(self.pending.len().min(65_535) as u32),
-                    FieldValue::U(self.world.sink_state().latency().as_millis().min(65_535) as u32),
-                    FieldValue::F(self.tick_ms),
-                    FieldValue::F(self.tick_max_ms),
-                    FieldValue::U(self.work_us as u32),
-                    FieldValue::U(self.committed),
-                    FieldValue::U(self.backlog.len().min(65_535) as u32),
-                ],
-            )
-            .global(),
-        );
+        let clamp16 = |n: usize| n.min(65_535) as u16;
+        let stats = PitView {
+            pending: clamp16(self.pending.len()),
+            slow_ms: self.world.sink_state().latency().as_millis().min(65_535) as u16,
+            tick_ms: self.tick_ms,
+            tick_max_ms: self.tick_max_ms,
+            work_us: self.work_us as u32,
+            committed: self.committed,
+            backlog: clamp16(self.backlog.len()),
+        };
+        out.add(PIT_ENTITY, &stats);
     }
 }
 
@@ -960,5 +1107,10 @@ impl MobPit {
 /// Bot payload: the direction as a move plus attack always held.
 pub fn encode_bot_input(dir: [f32; 2]) -> Vec<u8> {
     let axis = |v: f32| (v.clamp(-1.0, 1.0) * 127.0).round() as i8;
-    vec![axis(dir[0]) as u8, axis(dir[1]) as u8, BUTTON_ATTACK]
+    PitInput {
+        mx: axis(dir[0]),
+        my: axis(dir[1]),
+        buttons: PitInput::ATTACK,
+    }
+    .to_payload()
 }

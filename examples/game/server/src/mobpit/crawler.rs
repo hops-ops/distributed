@@ -97,7 +97,15 @@ impl Crawler {
 pub type MobKilledArgs = (String, String, String, u8, u32);
 
 /// [`RECORD_KILL`] input. No principal, no XP: both are server-decided.
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandInput)]
+///
+/// `FactCommand` binds it to [`RECORD_KILL`] (the name [`RecordKill`]
+/// mounts it under), so the zone emits it typed — `ctx.emit_keyed(killer,
+/// RecordKillInput { .. }, &[mob, generation])` — and the derive rejects
+/// identity or reward fields at compile time.
+#[derive(
+    Debug, Clone, Serialize, Deserialize, distributed::CommandInput, distributed_game::FactCommand,
+)]
+#[fact(command = RECORD_KILL)]
 pub struct RecordKillInput {
     /// Mob instance (`{zone}/m{id}`).
     pub mob: String,

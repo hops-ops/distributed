@@ -4,17 +4,18 @@
  * triggers a rebuild from the cells' event history.
  */
 import { HALF } from '../arena/movement.ts';
-import { DevApi } from '../shared/dev-api.ts';
 import {
-	createBoardWatcher,
-	DEFAULT_ZONE,
-	KIND,
-	MobPitApi,
-	TIERS,
-	type BoardPosition,
+	isMob,
+	isPillar,
+	isPlayer,
+	mobFields,
+	pillarFields,
+	playerFields,
 	type BoardRow,
 	type BoardSnapshot
-} from '../mobpit/client.ts';
+} from '../generated/mobpit/index.ts';
+import { createBoardWatcher, DEFAULT_ZONE, MobPitApi, TIERS, type BoardPosition } from '../mobpit/client.ts';
+import { DevApi } from '../shared/dev-api.ts';
 
 const params = new URLSearchParams(location.search);
 const zone = params.get('zone') ?? DEFAULT_ZONE;
@@ -70,8 +71,8 @@ async function render(board: BoardSnapshot): Promise<void> {
 	table($('xp'), board.xp, 'XP', me);
 	const bg = board.background;
 	status.textContent =
-		`push #${pushes} · version ${board.version} · store ${board.backend ?? '?'} · ${board.members ?? 0} ranked` +
-		(bg === undefined ? '' : ` · background updates: ${bg.applied} applied, ${bg.dropped} dropped, ${bg.failed} failed`);
+		`push #${pushes} · version ${board.version} · store ${board.backend} · ${board.members} ranked` +
+		` · background updates: ${bg.applied} applied, ${bg.dropped} dropped, ${bg.failed} failed`;
 	status.classList.add('flash');
 	setTimeout(() => status.classList.remove('flash'), 120);
 	if (me === undefined) return;
@@ -114,18 +115,19 @@ function drawMap(): void {
 		const px = (v: number) => (v + HALF) * s;
 		ctx.clearRect(0, 0, map.width, map.height);
 		for (const e of client.render()) {
-			const x = Number(e.fields.x ?? 0);
-			const y = Number(e.fields.y ?? 0);
-			if (e.kindName === KIND.pillar) {
+			if (isPillar(e)) {
+				const { x, y, r } = pillarFields(e);
 				ctx.fillStyle = '#5d5566';
 				ctx.beginPath();
-				ctx.arc(px(x), map.height - px(y), Number(e.fields.r ?? 1) * s, 0, Math.PI * 2);
+				ctx.arc(px(x), map.height - px(y), r * s, 0, Math.PI * 2);
 				ctx.fill();
-			} else if (e.kindName === KIND.mob) {
-				ctx.fillStyle = TIERS[Number(e.fields.tier ?? 1)]?.color ?? '#9ad16b';
+			} else if (isMob(e)) {
+				const { x, y, tier } = mobFields(e);
+				ctx.fillStyle = TIERS[tier]?.color ?? '#9ad16b';
 				ctx.fillRect(px(x) - 3, map.height - px(y) - 3, 6, 6);
-			} else if (e.kindName === KIND.player) {
-				ctx.fillStyle = e.fields.dead ? '#555' : '#f2a65a';
+			} else if (isPlayer(e)) {
+				const { x, y, dead } = playerFields(e);
+				ctx.fillStyle = dead ? '#555' : '#f2a65a';
 				ctx.beginPath();
 				ctx.arc(px(x), map.height - px(y), 4, 0, Math.PI * 2);
 				ctx.fill();
