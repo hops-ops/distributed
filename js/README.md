@@ -414,6 +414,110 @@ Use a separate generated surface and replica for elevated routes. A normal
 client cannot import or mix admin artifacts. Configure it as a separate virtual
 module such as `$distributed/admin` and provide it only in the elevated layout.
 
+### Game zones in SvelteKit
+
+`distributed_game` zones get three pieces; the canvas, render loop and
+entity drawing stay outside Svelte, and game state is never server-rendered.
+Svelte 5.7+ is required (`svelte/reactivity`). A runnable example is
+[`examples/game/sveltekit`](../examples/game/sveltekit).
+
+**1. Generated game clients from the Vite plugin.** Add `games` to the same
+plugin. Each surface runs `distributed game-manifest` → `game-client` →
+`game-wasm` (the `#[predict]` step and `#[game_pure]` functions) when Vite
+starts, when the zone's Rust sources change (a full reload follows only if
+an output changed), and once per `vite build`; Vite emits the WebAssembly as
+an asset through the generated `new URL('./wasm/<surface>.wasm',
+import.meta.url)`. Game surfaces are not lifecycle outputs, so a games-only
+app runs under plain `vite dev` / `vite build`; GraphQL `clients` still need
+`distributed dev` / `distributed build`.
+
+```js
+// distributed.config.js
+export const distributedViteOptions = {
+  games: [{
+    manifest: {
+      args: ['game-manifest', '--manifest-path', '../game/Cargo.toml',
+        '--entrypoint', 'my_game::pit::game_surface']
+    },
+    out: 'src/lib/generated/pit',
+    watch: ['../game-sim'] // extra crates whose changes regenerate (optional)
+    // wasm: 'auto' (default) | false | { manifestPath }
+    // importExtension: 'ts' (default) | 'js' | 'none'
+  }]
+};
+// vite.config.ts: plugins: [distributedSvelteKit(distributedViteOptions), sveltekit()]
+```
+
+Commit the generated TypeScript (keep `wasm/` ignored) and check it in CI
+with `checkDistributedGames(distributedViteOptions)` from
+`@hops-ops/distributed/sveltekit/vite` (`game-client --check`, never writes;
+`generateDistributedGames` runs the full pipeline once). `command` /
+`commandArgs` choose the CLI exactly as for GraphQL clients.
+
+**2. Session-bound tickets** (`@hops-ops/distributed/sveltekit/game/server`,
+server-only). The route mints the zone server's HS256 admission ticket
+(PROTOCOL.md §8) with WebCrypto, so the shared secret stays on the SvelteKit
+server and no extra admission service is needed:
+
+```ts
+// src/lib/server/game.ts
+import { env } from '$env/dynamic/private';
+import { createGameTicketHandler } from '@hops-ops/distributed/sveltekit/game/server';
+
+export const tickets = createGameTicketHandler({
+  secret: () => env.GAME_TICKET_SECRET,          // the zone servers' TicketKey (>= 32 bytes)
+  getSession: (event) => event.locals.auth(),    // the same session source as GraphQL
+  zone: ({ principal, requested }) => zoneFor(principal) // decided here, never by the body
+});
+// src/routes/api/game/ticket/+server.ts
+export const POST = tickets;
+// a +page.server.ts load: const { zone, principal } = await tickets.resolve(event)
+```
+
+The principal is `session.user.id` (override with `principal(session)`;
+`name(session)` sets the ticket's display name). The handler answers 403
+unless the `Origin` is the app's own (`allowedOrigins` adds more) and
+`Sec-Fetch-Site`, when sent, is `same-origin`; 401 without a session; 429
+over the per-principal limit (default 10 per minute, in memory;
+`rateLimit: { max, windowMs }`, a custom `{ take(key, now) }`, or `false`);
+400 for any body field other than `zone` / `role` (so a body cannot name the
+principal, an owner or a reward); 409 with the server's zone when the
+requested zone differs; 403 when `zone` returns nothing; 503 without a valid
+secret. Every response is `cache-control: no-store`. Tickets live 60 s by
+default (`ttlSeconds` ≤ 300) and are single use on the zone server.
+`mintGameTicket({ secret, principal, zone, role, name })` signs one directly.
+
+**3. Runes state for the UI around the game**
+(`@hops-ops/distributed/sveltekit/game`, browser-safe):
+
+```svelte
+<script lang="ts">
+  import { gameTicketSource, useGame } from '@hops-ops/distributed/sveltekit/game';
+  import { createPitClient, EVENTS } from '$lib/generated/pit/index.ts';
+  let { data } = $props();
+  const game = useGame(
+    () => createPitClient({ url: (z) => `${data.zonesUrl}/zones/${z}`, ticket: gameTicketSource() }),
+    { zone: () => data.zone, events: EVENTS }
+  );
+  const profile = game.latest('profile');          // typed by the generated EVENTS
+  const kills = game.events('kill', { limit: 10 }); // newest first
+  $effect(() => game.client && startRenderLoop(canvas, game.client)); // your rAF loop
+</script>
+<p>{game.status} · {game.zone} · {game.rttMs ?? '–'} ms · {game.predictionReady ? 'predicted' : '…'}</p>
+<p>XP {profile.current?.xp ?? 0} · last kills {kills.items.length}</p>
+```
+
+`useGame` builds the client on mount (browser only, nothing during SSR),
+joins the zone and closes it on destroy, which includes navigation.
+`createGameState(source | factory, { events })` is the same state without the
+lifecycle (`connect(zone)`, `dispose()`). Getters — `status`, `connected`,
+`zone` (follows handoffs), `rttMs`, `jitterMs`, `predictionReady`, `error`,
+`client`, `source` — and `latest(name).current` / `events(name).items` are
+reactive through `createSubscriber`: an unchanged value does not re-run
+effects. `on(name, handler)` subscribes a callback (e.g. to set the
+controlled entity from a `hello`). `gameTicketSource({ endpoint })` POSTs
+`{ zone, role }` to the ticket route with the session cookie.
+
 ## Framework-neutral replica
 
 Other frameworks can bind the same core directly:
@@ -576,7 +680,9 @@ explicit redactor.
 ## Game zones
 
 `@hops-ops/distributed/game` speaks the `distributed_game` binary protocol
-(golden-tested against the Rust fixtures). The app supplies tickets — a
+(golden-tested against the Rust fixtures). In SvelteKit, see
+[game zones in SvelteKit](#game-zones-in-sveltekit) for session tickets,
+Vite-generated clients and runes state. The app supplies tickets — a
 function, so a fresh single-use ticket is fetched whenever a reconnect token
 can no longer be used — and a pure `predict` for its own entity. With a
 [generated client](#generated-game-clients) that `predict` is the zone's
@@ -727,8 +833,14 @@ duplicated as decision documents in this package.
   inspection.
 - `@hops-ops/distributed/sveltekit` — Svelte stores, island SSR composition,
   hydration, auth lifecycle, and tree-local generated bindings.
-- `@hops-ops/distributed/sveltekit/vite` — public Vite plugin, virtual module
-  aliases, and GraphQL HTTP/WebSocket proxy helpers.
+- `@hops-ops/distributed/sveltekit/vite` — public Vite plugin (GraphQL
+  clients and `games` surfaces), virtual module aliases, GraphQL
+  HTTP/WebSocket proxy helpers, `generateDistributedGames` /
+  `checkDistributedGames`.
+- `@hops-ops/distributed/sveltekit/game` — runes state for the UI around a
+  game zone (`useGame`, `createGameState`) and `gameTicketSource`.
+- `@hops-ops/distributed/sveltekit/game/server` — server-only
+  `createGameTicketHandler` and `mintGameTicket` (session-bound zone tickets).
 - `@hops-ops/distributed/react` — provider and query hook over the same replica.
 - `@hops-ops/distributed/game` — binary `distributed_game` zone protocol
   client: codec, `GameConnection` (handshake, reconnect, clock sync),
