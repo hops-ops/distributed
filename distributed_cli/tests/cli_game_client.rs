@@ -120,6 +120,15 @@ fn check_mode_detects_drift_and_write_keeps_foreign_files() {
             .success()
     );
 
+    // Regenerating identical output does not rewrite (or touch) any file.
+    let modified = |name: &str| fs::metadata(out.join(name)).unwrap().modified().unwrap();
+    let before = modified("schema.ts");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    assert!(distributed(&["game-client", "--manifest", m, "--out", o])
+        .status
+        .success());
+    assert_eq!(modified("schema.ts"), before);
+
     fs::write(out.join("events.ts"), "// edited").unwrap();
     fs::write(
         out.join("stale.ts"),
