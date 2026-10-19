@@ -90,3 +90,9 @@ pub fn game_surface() -> GameSurface {
         .pure::<OrbRadiusFn>()
         .constant("orb_limits", &OrbLimits { limit: 32.0 })
 }
+
+/// A second export of the same package (concurrent harness runs must each
+/// print their own entrypoint's surface).
+pub fn bare_surface() -> GameSurface {
+    GameSurface::for_zone::<Orbs>("bare")
+}

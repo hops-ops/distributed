@@ -277,3 +277,62 @@ fn game_wasm_needs_something_to_compile() {
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+#[test]
+#[ignore = "compiles the fixture via the manifest harness; run in the integration job"]
+fn concurrent_game_manifests_export_their_own_entrypoints() {
+    // Every entrypoint of a package shares one harness directory; without
+    // the harness lock, concurrent runs overwrote each other's `main.rs` and
+    // exported the last writer's surface.
+    let manifest = root().join("tests/fixtures/game-surface/Cargo.toml");
+    let tmp = tempfile::tempdir().unwrap();
+    // Warm the harness build so the concurrent runs race on `main.rs`, not
+    // on the first compile.
+    let warm = distributed(&[
+        "game-manifest",
+        "--manifest-path",
+        manifest.to_str().unwrap(),
+        "--out",
+        tmp.path().join("warm.json").to_str().unwrap(),
+    ]);
+    assert!(
+        warm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    for round in 0..4 {
+        let runs: Vec<_> = [("game_surface", "orbs"), ("bare_surface", "bare")]
+            .into_iter()
+            .flat_map(|pair| [pair, pair])
+            .enumerate()
+            .map(|(i, (entrypoint, name))| {
+                let out = tmp.path().join(format!("{round}-{i}.json"));
+                let child = Command::new(env!("CARGO_BIN_EXE_distributed"))
+                    .args([
+                        "game-manifest",
+                        "--manifest-path",
+                        manifest.to_str().unwrap(),
+                        "--entrypoint",
+                        entrypoint,
+                        "--out",
+                        out.to_str().unwrap(),
+                    ])
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("distributed should run");
+                (child, out, name)
+            })
+            .collect();
+        for (child, out, name) in runs {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let surface: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&out).unwrap()).unwrap();
+            assert_eq!(surface["name"], name, "round {round}: {}", out.display());
+        }
+    }
+}
