@@ -32,3 +32,11 @@ game_demos = { path = ".." }
 distributed_game = { path = "../../../../distributed_game", features = ["cell"] }
 async-graphql = "7"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# `distributed build|dev examples/game/server`: this crate is the
+# application (logical manifest + GraphQL client surface) and its runtime.
+[package.metadata.distributed.application]
+entrypoint = "application_manifest"
+
+[package.metadata.distributed.runtime]
+binary = "mobpit-service"

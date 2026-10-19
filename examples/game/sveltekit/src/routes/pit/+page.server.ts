@@ -1,6 +1,6 @@
 import { redirect } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
-import { settledFacts, tickets } from '$lib/server/game';
+import { tickets } from '$lib/server/game';
 
 export const load = async (event) => {
 	const joined = await tickets.resolve(event);
@@ -8,7 +8,6 @@ export const load = async (event) => {
 	return {
 		zone: joined.zone,
 		zonesUrl: env.GAME_ZONES_URL ?? 'ws://127.0.0.1:2967',
-		principal: joined.principal,
-		settled: await settledFacts(joined.principal)
+		principal: joined.principal
 	};
 };

@@ -1,1 +1,4 @@
 /target/
+# `distributed build|dev` lifecycle state (generated GraphQL clients, logs)
+/.distributed/
+/.distributed-dev.*

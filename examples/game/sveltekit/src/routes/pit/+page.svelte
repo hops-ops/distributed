@@ -1,6 +1,8 @@
 <script lang="ts">
 	import { gameTicketSource, useGame } from '@hops-ops/distributed/sveltekit/game';
 	import { createMobpitClient, EVENTS } from '$lib/generated/mobpit/index.ts';
+	import Leaderboard from '$lib/pit/Leaderboard.svelte';
+	import MyStats from '$lib/pit/MyStats.svelte';
 	import { startPitLoop } from '$lib/pit/loop';
 
 	let { data } = $props();
@@ -18,8 +20,6 @@
 		{ zone: () => data.zone, events: EVENTS }
 	);
 	const hello = game.latest('hello');
-	const profile = game.latest('profile');
-	const board = game.latest('board');
 	const kills = game.events('kill', { limit: 20 });
 	const saved = game.events('saved', { limit: 20 });
 	game.on('hello', (h) => game.client?.setControlledEntity(h.entity));
@@ -32,10 +32,7 @@
 		return startPitLoop(canvas, { client, hello: () => hello.current, autoHunt: () => autoHunt });
 	});
 
-	// Settled facts: SSR read model first, then the zone's live pushes.
-	const xp = $derived(profile.current?.xp ?? data.settled?.me?.xp.score ?? 0);
-	const killCount = $derived(profile.current?.kills ?? data.settled?.me?.kills.score ?? 0);
-	const top = $derived((board.current?.xp ?? data.settled?.board.xp ?? []).slice(0, 5));
+	// Kills the zone reported that the cell has not acknowledged yet.
 	const unsaved = $derived(
 		kills.items.filter((k) => k.killer === hello.current?.entity && !saved.items.some((s) => s.key === k.key)).length
 	);
@@ -55,13 +52,11 @@
 		</section>
 		<section data-testid="settled">
 			<h2>Settled</h2>
-			<div>XP <b data-testid="xp">{xp}</b> · kills <b data-testid="kills">{killCount}</b>{#if profile.current} · level {profile.current.level}{/if}</div>
+			<!-- Settled progress: mobpit-service's player_stats read model
+			     (projected from the Crawler cells' domain events): SSR, then @live. -->
+			<MyStats />
 			<div>saving <b data-testid="unsaved">{unsaved}</b></div>
-			<ol>
-				{#each top as row (row.member)}
-					<li class:me={row.member === data.principal}>{row.name} — {row.score} XP</li>
-				{/each}
-			</ol>
+			<Leaderboard me={data.principal} />
 			{#each saved.items.slice(0, 3) as s (s.key)}
 				<div class="saved">+{s.xp} XP saved ✓ <small>{s.waitedMs} ms</small></div>
 			{/each}
@@ -76,7 +71,5 @@
 	section { border: 1px solid #2b2533; border-radius: 6px; padding: 0.75rem; }
 	h2 { margin: 0 0 0.5rem; font-size: 1rem; }
 	.error { color: #ff6b6b; }
-	.me { color: #ffd166; }
 	.saved { color: #9ad16b; }
-	ol { padding-left: 1.2rem; }
 </style>

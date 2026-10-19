@@ -5,6 +5,11 @@
 members = [".", "sim", "crawler", "service"]
 resolver = "2"
 
+# `distributed build|dev examples/game/server` owns the SvelteKit demo's
+# GraphQL client generation (`sveltekit/distributed.clients.json`).
+[workspace.metadata.distributed.ui]
+path = "../sveltekit"
+
 [package]
 name = "game_demos"
 version = "0.1.0"

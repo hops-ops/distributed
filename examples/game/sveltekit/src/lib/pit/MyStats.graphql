@@ -1,0 +1,13 @@
+# "My stats": my row of the player_stats read model (mobpit-service).
+# `$playerId` is bound to the verified session's user id
+# (MyStats.graphql.bindings.js, `sessionClaim`); it is never a URL or form
+# value. SSR seeds it, `@live` keeps it current as kills settle.
+query MyStats($playerId: String!) @load @live {
+  player_stats(where: { player_id: { _eq: $playerId } }, limit: 1) {
+    player_id
+    name
+    xp
+    kills
+    level
+  }
+}
