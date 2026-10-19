@@ -132,16 +132,35 @@ impl SqliteZoneStateStore {
     }
 
     fn from_connection(conn: rusqlite::Connection) -> Result<Self, StateError> {
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS game_zone_state (
-               zone_id TEXT PRIMARY KEY,
-               token INTEGER NOT NULL,
-               content_version TEXT NOT NULL,
-               state BLOB NOT NULL
-             );",
-        )
-        .map_err(backend)?;
+        // Hosts sharing one file collide on writes; wait for the other writer
+        // instead of failing at once with "database is locked".
+        const BUSY: std::time::Duration = std::time::Duration::from_secs(5);
+        conn.busy_timeout(BUSY).map_err(backend)?;
+        // The WAL switch at open does not use the busy handler, so two hosts
+        // opening the file together retry it until the same deadline.
+        let deadline = std::time::Instant::now() + BUSY;
+        loop {
+            match conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE IF NOT EXISTS game_zone_state (
+                   zone_id TEXT PRIMARY KEY,
+                   token INTEGER NOT NULL,
+                   content_version TEXT NOT NULL,
+                   state BLOB NOT NULL
+                 );",
+            ) {
+                Ok(()) => break,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if matches!(
+                        e.code,
+                        rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                    ) && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(backend(e)),
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -230,6 +249,46 @@ mod tests {
     #[test]
     fn memory_store_is_fenced() {
         exercise(&MemoryZoneStateStore::new());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_stores_sharing_a_file_wait_for_each_other() {
+        // Hosts sharing one file (the multi-host demos) open and write at the
+        // same time; a colliding writer must wait, not fail "database is locked".
+        let path = std::env::temp_dir().join(format!(
+            "dg-zone-state-shared-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let threads: Vec<_> = (0..8u64)
+            .map(|host| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let store = SqliteZoneStateStore::open(&path)?;
+                    for token in 1..=50 {
+                        store.save(&format!("zone.{host}"), &snap(token, b"s"))?;
+                    }
+                    Ok::<_, StateError>(())
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let store = SqliteZoneStateStore::open(&path).unwrap();
+        for host in 0..8 {
+            assert_eq!(
+                store.load(&format!("zone.{host}")).unwrap(),
+                Some(snap(50, b"s"))
+            );
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[cfg(feature = "sqlite")]
