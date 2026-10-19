@@ -107,14 +107,17 @@ async function main(): Promise<void> {
 	});
 
 	// ---- admin panel ----
-	const admin = new FreezeAdmin('', params.get('admin') ?? stored('game-demos.freeze.admin') ?? '');
+	// `?admin=` is remembered, so other tabs (e.g. `?old=1`) can roll out too.
+	const adminParam = params.get('admin');
+	if (adminParam !== null) store('game-demos.freeze.admin', adminParam);
+	const admin = new FreezeAdmin('', adminParam ?? stored('game-demos.freeze.admin') ?? '');
 	const panel = el('fieldset', 'admin');
 	panel.append(el('legend', '', 'World admin (dev, admin secret)'));
 	const secret = el('input', 'secret');
 	secret.type = 'password';
 	secret.placeholder = 'admin secret (printed by the server)';
 	secret.value = admin.secret;
-	secret.addEventListener('change', () => {
+	secret.addEventListener('input', () => {
 		admin.secret = secret.value.trim();
 		store('game-demos.freeze.admin', admin.secret);
 	});
@@ -131,7 +134,15 @@ async function main(): Promise<void> {
 	panel.append(secret, buttons, ritualLabel, result, status);
 	hud.root.append(panel);
 
+	function needSecret(): boolean {
+		if (admin.secret !== '') return false;
+		result.textContent = 'Paste the admin secret printed by the server (or open /freeze/?admin=<secret>).';
+		secret.focus();
+		return true;
+	}
+
 	async function roll(mode: 'hard' | 'rolling'): Promise<void> {
+		if (needSecret()) return;
 		hardButton.disabled = rollingButton.disabled = true;
 		result.textContent = `rolling out (${mode})…`;
 		try {
@@ -148,6 +159,10 @@ async function main(): Promise<void> {
 	hardButton.addEventListener('click', () => void roll('hard'));
 	rollingButton.addEventListener('click', () => void roll('rolling'));
 	ritual.addEventListener('change', () => {
+		if (needSecret()) {
+			ritual.checked = !ritual.checked;
+			return;
+		}
 		admin.setStuck(ZONES.ember, ritual.checked).then(
 			() => (result.textContent = ritual.checked ? 'Ember Fields will refuse the next freeze' : 'ritual ended'),
 			(error: unknown) => {
