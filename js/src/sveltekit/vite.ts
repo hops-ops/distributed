@@ -235,6 +235,8 @@ type CompilerLockLease = {
 
 type ViteWebSocketLike = Readonly<{
 	send(payload: unknown): void;
+	/** Vite's `server.ws.on('connection', …)` (optional in test doubles). */
+	on?(event: 'connection', listener: () => void): void;
 }>;
 
 type ViteModuleGraphLike = Readonly<{
@@ -286,7 +288,13 @@ type RollupWatchContextLike = Readonly<{
 export type DistributedSvelteKitVitePlugin = Readonly<{
 	name: string;
 	enforce: 'pre';
-	configResolved(config: Readonly<{ root: string; command?: 'serve' | 'build' }>): Promise<void>;
+	configResolved(
+		config: Readonly<{
+			root: string;
+			command?: 'serve' | 'build';
+			logger?: Readonly<{ error(message: string): void }>;
+		}>
+	): Promise<void>;
 	configureServer(server: ViteServerLike): void;
 	buildStart(this: RollupWatchContextLike): void;
 	resolveId(source: string, importer?: string): string | undefined;
@@ -387,6 +395,41 @@ export function distributedSvelteKit(
 	let gamesDirty = false;
 	let gamesRunning: Promise<boolean> | undefined;
 	let gamesChanged = false;
+	/** `vite dev`: a failed game generation is reported, never thrown into Vite. */
+	let serving = false;
+	let logger: Readonly<{ error(message: string): void }> = { error: (message) => console.error(message) };
+	/** Last dev-mode game failure, replayed to overlays that connect later; cleared on success. */
+	let gameFailure: unknown;
+	let devServer: Readonly<{ ws: { send(payload: unknown): void } }> | undefined;
+
+	const reportGameFailure = (error: unknown): void => {
+		// The watcher and HMR hooks share one run: report its failure once.
+		if (error === gameFailure) return;
+		gameFailure = error;
+		logger.error(
+			`[distributed] game client generation failed; the dev server keeps the last generated client:\n${
+				error instanceof Error ? error.message : String(error)
+			}`
+		);
+		devServer?.ws.send({ type: 'error', err: viteError(error) });
+	};
+
+	/**
+	 * Dev-mode game regeneration (startup, HMR, watcher): failures go to the
+	 * console and the error overlay; the server keeps running on the last
+	 * generated client. Builds use `compileGames` directly and fail.
+	 */
+	const compileGamesInDev = async (): Promise<boolean> => {
+		try {
+			const changed = await compileGames();
+			gameFailure = undefined;
+			return changed;
+		} catch (error) {
+			if (stopped) return false;
+			reportGameFailure(error);
+			return false;
+		}
+	};
 
 	/** Serialized, coalescing game generation; resolves true when any output changed. */
 	const compileGames = (): Promise<boolean> => {
@@ -475,6 +518,8 @@ export function distributedSvelteKit(
 					'Distributed SvelteKit Vite plugin was configured more than once'
 				);
 			}
+			serving = config.command === 'serve';
+			if (config.logger !== undefined) logger = config.logger;
 			resolved = resolveIntegration(options, options.cwd ?? config.root);
 			frameworkDist = localFrameworkDist(config.root);
 			await validateResolvedPaths(resolved);
@@ -497,7 +542,8 @@ export function distributedSvelteKit(
 				if (config.command === 'build') {
 					await onceForBuild(resolved, () => compileGames());
 				} else {
-					await compileGames();
+					// A Rust error at dev start must not keep the server down.
+					await compileGamesInDev();
 				}
 			}
 			if (lifecycleOwnsCompile || resolved.clients.length === 0) return;
@@ -530,6 +576,11 @@ export function distributedSvelteKit(
 			}
 			const gameRoots = integration.games.flatMap((game) => game.watchRoots);
 			if (gameRoots.length > 0) server.watcher.add(gameRoots);
+			devServer = server;
+			// An overlay opened after a failed startup generation still shows it.
+			server.ws.on?.('connection', () => {
+				if (gameFailure !== undefined) server.ws.send({ type: 'error', err: viteError(gameFailure) });
+			});
 			server.httpServer?.once('close', () => {
 				void stop();
 			});
@@ -628,12 +679,9 @@ export function distributedSvelteKit(
 				return [];
 			}
 			if (isGameInput(context.file, integration)) {
-				try {
-					if (await compileGames()) {
-						context.server.ws.send({ type: 'full-reload', path: '*' });
-					}
-				} catch (error) {
-					context.server.ws.send({ type: 'error', err: viteError(error) });
+				devServer ??= context.server;
+				if (await compileGamesInDev()) {
+					context.server.ws.send({ type: 'full-reload', path: '*' });
 				}
 				if (!isCompilerInput(context.file, integration)) return [];
 			}
@@ -665,7 +713,13 @@ export function distributedSvelteKit(
 		},
 		async watchChange(id): Promise<void> {
 			const integration = requireResolved(resolved);
-			if (isGameInput(id, integration)) await compileGames();
+			// `vite dev` calls this hook from its file watcher without handling a
+			// rejection (the process would exit): there, report and keep serving.
+			// `vite build --watch` still fails the rebuild.
+			if (isGameInput(id, integration)) {
+				if (serving) await compileGamesInDev();
+				else await compileGames();
+			}
 			if (lifecycleOwnsCompile) return;
 			if (isCompilerInput(id, integration)) {
 				await compile(`GraphQL/Svelte watch change ${id}`);
