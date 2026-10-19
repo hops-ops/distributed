@@ -13,6 +13,10 @@
  *
  * Generated clients (`distributed game-client`) wire this in for you:
  * `create<Surface>Client` predicts with the compiled step by default.
+ *
+ * The same module may also export pure functions (`#[game_pure]`,
+ * `dg_pure_<fn>(arg_len) -> i32`, see `wasm-pures.ts`): `PredictModule.call`
+ * runs one over the same scratch area.
  */
 import { readWire, writeWire, encodePayload, type PayloadLayout, type WireType } from './codec.js';
 import type { PredictFn } from './prediction.js';
@@ -52,15 +56,17 @@ export class PredictAbiError extends Error {
 			[-2]: 'state does not decode',
 			[-3]: 'input payload rejected',
 			[-4]: 'context does not decode',
-			[-5]: 'next state does not fit'
+			[-5]: 'output does not fit',
+			[-6]: 'argument does not decode'
 		};
-		super(`dg_predict_${exportName} failed (${code}): ${reasons[code] ?? 'unknown error'}`);
+		super(`${exportName.startsWith('dg_') ? exportName : `dg_predict_${exportName}`} failed (${code}): ${reasons[code] ?? 'unknown error'}`);
 		this.name = 'PredictAbiError';
 		this.code = code;
 	}
 }
 
 type StepExport = (stateLen: number, inputLen: number, contextLen: number, dt: number) => number;
+type PureExport = (argLen: number) => number;
 
 /** An instantiated prediction module. One instance can serve every client. */
 export class PredictModule {
@@ -69,6 +75,7 @@ export class PredictModule {
 	readonly #pointer: number;
 	#view: Uint8Array;
 	readonly #steps = new Map<string, StepExport>();
+	readonly #pures = new Map<string, PureExport>();
 
 	constructor(instance: WebAssembly.Instance) {
 		const exports = instance.exports;
@@ -98,6 +105,33 @@ export class PredictModule {
 		return Object.keys(this.#exports)
 			.filter((name) => name.startsWith('dg_predict_') && name !== 'dg_predict_abi' && name !== 'dg_predict_buffer')
 			.map((name) => name.slice('dg_predict_'.length));
+	}
+
+	/** Pure function names (`dg_pure_<name>`) this module exports. */
+	get pures(): readonly string[] {
+		return Object.keys(this.#exports)
+			.filter((name) => name.startsWith('dg_pure_'))
+			.map((name) => name.slice('dg_pure_'.length));
+	}
+
+	/**
+	 * Call the pure function `dg_pure_<exportName>` with an encoded
+	 * argument (empty for none). Returns a copy of the encoded result.
+	 */
+	call(exportName: string, arg: Uint8Array): Uint8Array {
+		let fn = this.#pures.get(exportName);
+		if (fn === undefined) {
+			const found = this.#exports[`dg_pure_${exportName}`];
+			if (typeof found !== 'function') throw new TypeError(`module has no pure function dg_pure_${exportName}`);
+			fn = found as PureExport;
+			this.#pures.set(exportName, fn);
+		}
+		const name = `dg_pure_${exportName}`;
+		if (arg.length > PREDICT_SCRATCH_BYTES) throw new PredictAbiError(name, -1);
+		this.#scratch().set(arg, 0);
+		const length = fn(arg.length);
+		if (length < 0) throw new PredictAbiError(name, length);
+		return this.#scratch().slice(0, length);
 	}
 
 	/**

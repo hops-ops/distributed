@@ -4,7 +4,9 @@
  * toolchain. Steps:
  *
  * - `dg_predict_<echo>`: returns `state_len` (the next state is the state);
- * - `dg_predict_fail`: returns -3 (input rejected).
+ * - `dg_predict_fail`: returns -3 (input rejected);
+ * - `dg_pure_<name>` for each of `pures`: returns `arg_len` (the result is
+ *   the argument, `#[game_pure]` ABI).
  */
 function leb(value) {
 	const out = [];
@@ -28,17 +30,18 @@ function section(id, body) {
 }
 
 /** Bytes of a prediction module (`abi` is what `dg_predict_abi` returns). */
-export function predictModuleBytes({ echo = 'sample_step', abi = 1, buffer = 1024 } = {}) {
-	const types = [2, 0x60, 0, 1, 0x7f, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7d, 1, 0x7f];
-	const functions = [4, 0, 0, 1, 1];
+export function predictModuleBytes({ echo = 'sample_step', abi = 1, buffer = 1024, pures = [] } = {}) {
+	const types = [3, 0x60, 0, 1, 0x7f, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7d, 1, 0x7f, 0x60, 1, 0x7f, 1, 0x7f];
+	const functions = [4 + pures.length, 0, 0, 1, 1, ...pures.map(() => 2)];
 	const memory = [1, 0, 2]; // 2 pages: buffer + 64 KiB scratch
 	const exports = [
-		5,
+		5 + pures.length,
 		...str('memory'), 2, 0,
 		...str('dg_predict_abi'), 0, 0,
 		...str('dg_predict_buffer'), 0, 1,
 		...str(`dg_predict_${echo}`), 0, 2,
-		...str('dg_predict_fail'), 0, 3
+		...str('dg_predict_fail'), 0, 3,
+		...pures.flatMap((name, i) => [...str(`dg_pure_${name}`), 0, ...leb(4 + i)])
 	];
 	// Signed LEB128 for i32.const (small values only).
 	const sleb = (v) => {
@@ -55,11 +58,12 @@ export function predictModuleBytes({ echo = 'sample_step', abi = 1, buffer = 102
 	};
 	const body = (code) => [...leb(code.length + 1), 0, ...code];
 	const code = [
-		4,
+		4 + pures.length,
 		...body([0x41, ...sleb(abi), 0x0b]),
 		...body([0x41, ...sleb(buffer), 0x0b]),
 		...body([0x20, 0, 0x0b]),
-		...body([0x41, ...sleb(-3), 0x0b])
+		...body([0x41, ...sleb(-3), 0x0b]),
+		...pures.flatMap(() => body([0x20, 0, 0x0b]))
 	];
 	return new Uint8Array([
 		0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
