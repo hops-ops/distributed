@@ -1,4 +1,40 @@
 {
+  "constants": [
+    {
+      "name": "pit_rules",
+      "type": {
+        "name": "PitRules",
+        "type": "record"
+      },
+      "value": {
+        "states": [
+          "idle",
+          "chase",
+          "windup",
+          "recover",
+          "return",
+          "dead"
+        ],
+        "tiers": [
+          {
+            "radius": 0.5,
+            "tele": 1.7999999523162842,
+            "tier": 1
+          },
+          {
+            "radius": 0.699999988079071,
+            "tele": 2.200000047683716,
+            "tier": 2
+          },
+          {
+            "radius": 0.800000011920929,
+            "tele": 2.5999999046325684,
+            "tier": 3
+          }
+        ]
+      }
+    }
+  ],
   "events": [
     {
       "id": 1,
@@ -711,6 +747,29 @@
     {
       "fields": [
         {
+          "name": "tier",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "radius",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "tele",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "MobTier"
+    },
+    {
+      "fields": [
+        {
           "name": "x",
           "type": {
             "type": "f32"
@@ -748,6 +807,30 @@
         }
       ],
       "name": "MoveState"
+    },
+    {
+      "fields": [
+        {
+          "name": "tiers",
+          "type": {
+            "item": {
+              "name": "MobTier",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "states",
+          "type": {
+            "item": {
+              "type": "short_str"
+            },
+            "type": "list"
+          }
+        }
+      ],
+      "name": "PitRules"
     },
     {
       "fields": [
@@ -871,5 +954,5 @@
       "name": "Scores"
     }
   ],
-  "schemaVersion": 2
+  "schemaVersion": 3
 }

@@ -9,9 +9,10 @@
 #   ./run.sh gen            regenerate client/src/generated/<surface>/ from the
 #                           Rust surfaces (`distributed game-manifest` +
 #                           `distributed game-client`) and compile each
-#                           `#[predict]` step to <surface>/wasm/<surface>.wasm
+#                           surface's `#[predict]` step and `#[game_pure]`
+#                           functions to <surface>/wasm/<surface>.wasm
 #                           (`distributed game-wasm`, gitignored, stamped so
-#                           an unchanged step is not rebuilt); `gen --check`
+#                           an unchanged module is not rebuilt); `gen --check`
 #                           verifies the TypeScript (and still builds WASM)
 #   ./run.sh smoke          every demo's smoke tests (Rust bots + headless JS,
 #                           generated clients checked)
@@ -74,8 +75,9 @@ ensure_cli() {
 # gen [--check]: GameSurface JSON from each Rust surface export → typed
 # TypeScript in client/src/generated/<surface>/ (surface.json included, so a
 # changed Rust definition shows up as drift), then the surface's predicted
-# step → <surface>/wasm/<surface>.wasm. `--check` only applies to the
-# checked-in TypeScript; the WASM is a build output and is (re)built.
+# step and pure functions → <surface>/wasm/<surface>.wasm. `--check` only
+# applies to the checked-in TypeScript; the WASM is a build output and is
+# (re)built.
 gen() {
 	local check="${1:-}"
 	ensure_cli
@@ -94,18 +96,19 @@ gen() {
 }
 
 # wasm_for <surface.json> <surface>: compile the surface's `#[predict]` step
-# (if it declares one) next to its generated client.
+# and `#[game_pure]` functions (if it declares any) next to its generated
+# client.
 wasm_for() {
-	grep -q '"predict"' "$1" || return 0
+	grep -q -e '"predict"' -e '"pures"' "$1" || return 0
 	"$CLI" game-wasm --manifest "$1" --manifest-path "$SERVER/Cargo.toml" \
 		--out "$CLIENT/src/generated/$2" >/dev/null
 }
 
-# ensure_wasm: build every predicted step the pages load (no TypeScript
-# generation; the stamps make this quick when nothing changed).
+# ensure_wasm: build every module the pages load (no TypeScript generation;
+# the stamps make this quick when nothing changed).
 ensure_wasm() {
 	ensure_cli
-	log "compiling predicted steps to WebAssembly"
+	log "compiling predicted steps and pure functions to WebAssembly"
 	local tmp status=0
 	tmp="$(mktemp -d "${TMPDIR:-/tmp}/game-surfaces.XXXXXX")"
 	for surface in "${SURFACES[@]}"; do
@@ -198,14 +201,14 @@ run_cluster() {
 smoke() {
 	ensure_sdk
 	ensure_client
-	log "generated clients are current; predicted steps compiled to WASM"
+	log "generated clients are current; predicted steps and pure functions compiled to WASM"
 	gen --check
-	log "server: fmt, clippy, tests (bots smoke + grid world fixture)"
+	log "server: fmt, clippy, tests (bots smoke)"
 	cargo fmt --manifest-path "$SERVER/Cargo.toml" --check -p game_demos -p game_sim
 	cargo clippy --quiet --manifest-path "$SERVER/Cargo.toml" --workspace --all-targets -- -D warnings
 	cargo test --quiet --manifest-path "$SERVER/Cargo.toml" --workspace
 	cargo build --quiet --manifest-path "$SERVER/Cargo.toml"
-	log "client: type-check, build, tests (WASM prediction exact match + headless SDK)"
+	log "client: type-check, build, tests (WASM steps + pure functions exact match, headless SDK)"
 	(cd "$CLIENT" && npm run --silent check && npx vite build --logLevel warn && GAME_DEMOS_BIN="$BIN" npm test --silent)
 	log "smoke OK"
 }

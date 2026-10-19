@@ -24,7 +24,10 @@ import { Minimap, type MinimapDot } from '../shared/minimap.ts';
 import { createRing, createStage, material, toWorld } from '../shared/scene.ts';
 import { droneFields, isDrone, isPillar, pillarFields, playerFields, BUTTON, type MoveInput } from '../generated/arena/index.ts';
 import { createArenaClient, DEFAULT_ZONE } from './client.ts';
-import { DASH_COOLDOWN, HALF, PLAYER_RADIUS } from './floor.ts';
+import { ARENA_FLOOR } from '../generated/arena/constants.ts';
+
+/** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
+const { half: HALF, playerRadius: PLAYER_RADIUS, dashCooldown: DASH_COOLDOWN } = ARENA_FLOOR;
 
 const params = new URLSearchParams(location.search);
 const zone = params.get('zone') ?? DEFAULT_ZONE;

@@ -14,7 +14,7 @@ import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
-import { HALF, PLAYER_RADIUS } from '../arena/floor.ts';
+import { ARENA_FLOOR } from '../generated/arena/constants.ts';
 import {
 	BUTTON,
 	isMob,
@@ -33,6 +33,9 @@ import { Hud } from '../shared/hud.ts';
 import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
 import { createStage, material, toWorld } from '../shared/scene.ts';
 import { createMobPitClient, DEFAULT_ZONE, MobPitApi, TIERS } from './client.ts';
+
+/** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
+const { half: HALF, playerRadius: PLAYER_RADIUS } = ARENA_FLOOR;
 
 const SLOW_MS = 1500;
 const params = new URLSearchParams(location.search);

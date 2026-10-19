@@ -213,6 +213,7 @@ pub fn game_surface() -> GameSurface {
     GameSurface::for_zone::<Ripple>("ripple")
         .events::<RippleEvent>()
         .predict::<HoodStep>()
+        .constant("ripple_world", &ripple_world())
 }
 
 /// Kind id of [`TierView`] (tests mirror fields by it).
@@ -269,6 +270,44 @@ impl TierKind {
             Self::Borough => (10, 10, Some(1)),
             Self::Hood => (30, 20, Some(2)),
         }
+    }
+}
+
+/// A borough and its neighborhoods.
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct BoroughLayout {
+    /// Borough zone id.
+    pub id: String,
+    /// Neighborhood zone ids.
+    pub hoods: Vec<String>,
+}
+
+/// The zone hierarchy and weather names (generated `RIPPLE_WORLD`).
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct RippleWorld {
+    /// Root zone.
+    pub realm: String,
+    /// The city.
+    pub city: String,
+    /// Boroughs with their neighborhoods.
+    pub boroughs: Vec<BoroughLayout>,
+    /// [`WEATHER`] names by index.
+    pub weather: Vec<String>,
+}
+
+/// The `RIPPLE_WORLD` constant.
+pub fn ripple_world() -> RippleWorld {
+    RippleWorld {
+        realm: REALM.into(),
+        city: CITY.into(),
+        boroughs: BOROUGHS
+            .iter()
+            .map(|b| BoroughLayout {
+                id: b.to_string(),
+                hoods: hoods(b),
+            })
+            .collect(),
+        weather: WEATHER.map(String::from).to_vec(),
     }
 }
 

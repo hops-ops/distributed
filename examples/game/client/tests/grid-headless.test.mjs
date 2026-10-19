@@ -8,13 +8,14 @@
  *   between hosts, following every Handoff/Redirect with the SDK — the
  *   session survives and the walker ends in the expected cell;
  * - the cell left behind hibernates (world map) and a new visitor gets
- *   the "restored from hibernation" hello.
+ *   the "restored from hibernation" hello;
+ * - the world content each crossed cell renders (terrain lattice, props)
+ *   comes from the compiled Rust generation (`grid_cell`).
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createGridClient } from '../src/grid/client.ts';
-import { BUTTON_SPRINT, zoneId } from '../src/grid/world.ts';
+import { BUTTON_SPRINT, createGridClient, WORLD, zoneId } from '../src/grid/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
 import { startCluster } from './helpers/cluster.mjs';
 import { memoryStorage, sleep, until } from './helpers/demo-server.mjs';
@@ -34,6 +35,11 @@ test('grid walker crosses cells and hosts; empty cells hibernate and restore', {
 		await client.connect('grid.0.0');
 		const hello = await grid.ready;
 		assert.deepEqual(hello.cell, [0, 0]);
+		// The module is loaded with the step: content is there for every cell.
+		const origin = grid.content([0, 0]);
+		assert.equal(origin.heights.length, WORLD.samples * WORLD.samples);
+		assert.ok(grid.props([0, 0]).length > 0, 'the origin cell has props');
+		assert.equal(grid.sample([0, 0], 32, 32).height, grid.content([0, 0]).heights.at(-1));
 		const principal = api.last.principal;
 		await until(() => client.predictor.active, 5_000, 'walker bound');
 		await until(

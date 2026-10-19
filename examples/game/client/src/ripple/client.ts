@@ -14,14 +14,15 @@ import type { GameClient, GameSocketFactory } from '@hops-ops/distributed/game';
 import * as gen from '../generated/ripple/index.ts';
 import { zoneUrl, type DevApi } from '../shared/dev-api.ts';
 
-export const REALM = 'realm';
-export const CITY = 'realm.city';
-export const BOROUGHS = ['realm.city.borough-1', 'realm.city.borough-2'] as const;
-export const HOODS_PER_BOROUGH = 3;
-export const DEFAULT_ZONE = 'realm.city.borough-1.hood-1';
+/** The zone hierarchy and weather names, generated from the Rust `ripple_world()`. */
+const WORLD = gen.RIPPLE_WORLD;
+export const REALM = WORLD.realm;
+export const CITY = WORLD.city;
+export const BOROUGHS: readonly string[] = WORLD.boroughs.map((b) => b.id);
+export const DEFAULT_ZONE = WORLD.boroughs[0]!.hoods[0]!;
 export const ACTION_ATTACK = gen.BITS.action.attack;
 export const ACTION_SMITE = gen.BITS.action.smite;
-export const WEATHER = ['storm', 'rain', 'clearing', 'clear'] as const;
+export const WEATHER = WORLD.weather;
 
 export type HoodInput = gen.HoodInput;
 export type TierName = 'realm' | 'city' | 'borough' | 'hood';
@@ -46,7 +47,7 @@ export type TierView = Readonly<{
 }>;
 
 export function hoods(borough: string): string[] {
-	return Array.from({ length: HOODS_PER_BOROUGH }, (_, i) => `${borough}.hood-${i + 1}`);
+	return [...(WORLD.boroughs.find((b) => b.id === borough)?.hoods ?? [])];
 }
 
 /** Every zone, root first (tree order). */
@@ -59,7 +60,7 @@ export function allZones(): string[] {
 export function tierOf(zone: string): TierName | undefined {
 	if (zone === REALM) return 'realm';
 	if (zone === CITY) return 'city';
-	if ((BOROUGHS as readonly string[]).includes(zone)) return 'borough';
+	if (BOROUGHS.includes(zone)) return 'borough';
 	return BOROUGHS.some((b) => hoods(b).includes(zone)) ? 'hood' : undefined;
 }
 

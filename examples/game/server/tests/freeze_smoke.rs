@@ -11,7 +11,7 @@ use distributed_game::net::TicketKey;
 use distributed_game::world::HostAddr;
 use distributed_game::FreezeState;
 use game_demos::arena;
-use game_demos::freeze::content::{EMBER, HUB, MEADOW};
+use game_demos::freeze::content::{Hazard, Pack, EMBER, HUB, MEADOW};
 use game_demos::freeze::world::{assignment, start_host, HostSpec, WorldHost};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -52,13 +52,13 @@ async fn world() -> (WorldHost, WorldHost, Vec<tokio::sync::oneshot::Sender<()>>
 }
 
 /// Minimal HTTP/1.1 client: `(status, JSON body or Null)`.
-async fn http(
+async fn request(
     addr: SocketAddr,
     method: &str,
     path: &str,
     body: Option<Value>,
     admin: bool,
-) -> (u16, Value) {
+) -> (u16, Vec<u8>) {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let body = body.map(|b| b.to_string()).unwrap_or_default();
     let secret = if admin {
@@ -71,14 +71,42 @@ async fn http(
         body.len()
     );
     stream.write_all(request.as_bytes()).await.unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).await.unwrap();
-    let status = response[9..12].parse().unwrap();
-    let json = response
-        .split_once("\r\n\r\n")
-        .and_then(|(_, b)| serde_json::from_str(b).ok())
-        .unwrap_or(Value::Null);
-    (status, json)
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let status = std::str::from_utf8(&response[9..12])
+        .unwrap()
+        .parse()
+        .unwrap();
+    let body = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|at| response[at + 4..].to_vec())
+        .unwrap_or_default();
+    (status, body)
+}
+
+async fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    admin: bool,
+) -> (u16, Value) {
+    let (status, body) = request(addr, method, path, body, admin).await;
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+/// The content CDN: a pack in its payload encoding (what `decodePack` reads).
+async fn content(addr: SocketAddr, version: &str) -> (u16, Option<Pack>) {
+    let (status, body) = request(
+        addr,
+        "GET",
+        &format!("/dev/freeze/content/{version}"),
+        None,
+        false,
+    )
+    .await;
+    (status, distributed_game::codec::from_bytes(&body).ok())
 }
 
 fn bots(url: String, zone: &str) -> BotConfig {
@@ -115,10 +143,13 @@ async fn rollout_spans_both_hosts_drops_frozen_inputs_and_stamps_the_new_version
     )
     .await;
     assert_eq!(status, 401);
-    let (status, _) = http(a.addr, "GET", "/dev/freeze/content/v2", None, false).await;
+    let (status, _) = content(a.addr, "v2").await;
     assert_eq!(status, 404);
-    let (status, pack) = http(a.addr, "GET", "/dev/freeze/content/current", None, false).await;
-    assert_eq!((status, pack["version"].as_str()), (200, Some("v1")));
+    let (status, pack) = content(a.addr, "current").await;
+    assert_eq!(
+        (status, pack),
+        (200, game_demos::freeze::content::pack("v1"))
+    );
 
     // Bots keep sending inputs through the freeze on both hosts.
     let addr = a.addr;
@@ -176,8 +207,8 @@ async fn rollout_spans_both_hosts_drops_frozen_inputs_and_stamps_the_new_version
                 && f.stamp().zone_id == zone
                 && f.stamp().content_version == "v2"));
     }
-    let (_, pack) = http(a.addr, "GET", "/dev/freeze/content/current", None, false).await;
-    assert_eq!(pack["hazard"], "ice");
+    let (_, pack) = content(a.addr, "current").await;
+    assert_eq!(pack.unwrap().hazard, Hazard::Ice);
     let (_, status) = http(a.addr, "GET", "/dev/freeze/world", None, false).await;
     assert_eq!(status["hosts"][1]["host"], "beta");
     assert_eq!(status["hosts"][1]["zones"][0]["contentVersion"], "v2");
