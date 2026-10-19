@@ -479,13 +479,56 @@ The principal is `session.user.id` (override with `principal(session)`;
 unless the `Origin` is the app's own (`allowedOrigins` adds more) and
 `Sec-Fetch-Site`, when sent, is `same-origin`; 401 without a session; 429
 over the per-principal limit (default 10 per minute, in memory;
-`rateLimit: { max, windowMs }`, a custom `{ take(key, now) }`, or `false`);
-400 for any body field other than `zone` / `role` (so a body cannot name the
-principal, an owner or a reward); 409 with the server's zone when the
-requested zone differs; 403 when `zone` returns nothing; 503 without a valid
-secret. Every response is `cache-control: no-store`. Tickets live 60 s by
-default (`ttlSeconds` ≤ 300) and are single use on the zone server.
+`rateLimit: { max, windowMs }`, a custom `{ take(key, now) }` returning a
+boolean or a promise of one, or `false`); 400 for any body field other than
+`zone` / `role` (so a body cannot name the principal, an owner or a reward);
+409 with the server's zone when the requested zone differs; 403 when `zone`
+returns nothing; 503 without a valid secret. Every response is
+`cache-control: no-store`. Tickets live 60 s by default (`ttlSeconds` ≤ 300)
+and are single use on the zone server.
 `mintGameTicket({ secret, principal, zone, role, name })` signs one directly.
+
+The default limiter counts per process, so N instances behind a load
+balancer allow N× the budget. Share it through Redis (or any store that runs
+Redis Lua) with `createRedisGameTicketRateLimiter`. It imports no Redis
+package: pass your connected node-redis client (`sendCommand`) or ioredis
+client (`call`), or `eval(script, keys, args)` for anything else (cluster
+clients, a pooled wrapper):
+
+```ts
+import { createClient } from 'redis';
+import {
+  createGameTicketHandler,
+  createRedisGameTicketRateLimiter
+} from '@hops-ops/distributed/sveltekit/game/server';
+
+const redis = await createClient({ url: env.REDIS_URL }).connect();
+export const tickets = createGameTicketHandler({
+  // …
+  rateLimit: createRedisGameTicketRateLimiter({
+    client: redis,
+    prefix: 'mygame:ticket:',  // default 'distributed:game-ticket:' + principal
+    limit: 10,
+    windowMs: 60_000,
+    timeoutMs: 1_000,          // slower store calls count as errors (default)
+    onUnavailable: 'closed',   // default; 'open' = no limit while the store is down
+    onError: (error) => log.warn({ error }, 'ticket limiter store')
+  })
+});
+```
+
+One atomic `EVAL` (`GAME_TICKET_RATE_LIMIT_SCRIPT`) keeps a sliding-window
+log per principal in a sorted set: it drops entries older than the window,
+refuses when `limit` remain, else adds one, and expires the key with the
+window. Refused requests are not counted, matching the in-memory limiter.
+The timestamp is the instance clock, so keep instances NTP-synchronized.
+
+**Store unreachable:** a store error, a timeout or an unexpected reply makes
+the limiter reject, and the handler answers **503 `rate_limit_unavailable`**
+(fail closed — ticket issuance stops rather than run unlimited; the message
+carries no store details, which go to `onError`). `onUnavailable: 'open'`
+admits instead. The same applies to any custom limiter: a `take` that
+throws or rejects is a 503, never an allow.
 
 **3. Runes state for the UI around the game**
 (`@hops-ops/distributed/sveltekit/game`, browser-safe):
