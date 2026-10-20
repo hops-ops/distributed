@@ -110,6 +110,16 @@ fn of(facts: &[Fact], principal: &str) -> Vec<Lifecycle> {
 fn the_host_emits_every_transition_bound_to_the_verified_principal() {
     let (facts, hooks) = run_session(7);
     assert!(facts.iter().all(|f| f.stamp().zone_id == "z1"));
+    // Every stamp is strictly later than the previous one, even for
+    // transitions in the same tick and millisecond (emission sequence).
+    for pair in facts.windows(2) {
+        assert!(
+            pair[1].stamp().emitted_after(pair[0].stamp()),
+            "{:?} then {:?}",
+            pair[0].stamp(),
+            pair[1].stamp()
+        );
+    }
     let ana = of(&facts, "ana");
     let commands: Vec<_> = facts
         .iter()

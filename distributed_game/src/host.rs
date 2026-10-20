@@ -273,6 +273,8 @@ pub(crate) struct Core<Z: Zone> {
     dropped_frozen: u64,
     /// Typed facts keyed without dedupe parts this tick: `(tick, count)`.
     fact_seq: (u64, u32),
+    /// Facts stamped this activation ([`FactStamp::seq`] of the latest).
+    stamped: u64,
     /// Stamps are never earlier than this (Unix ms): raised past a handoff
     /// source's departure time when a transfer is admitted.
     stamp_floor_ms: u64,
@@ -328,7 +330,7 @@ impl<Z: Zone> Core<Z> {
         let Ok(fact) = Fact::typed(key, &input) else {
             return;
         };
-        let fact = fact.bind(Some(principal.to_string()), self.stamp());
+        let fact = fact.bind(Some(principal.to_string()), self.stamp_fact());
         self.lifecycle_backlog.push_back(fact);
         self.flush_lifecycle();
     }
@@ -380,7 +382,14 @@ impl<Z: Zone> Core<Z> {
             emitted_at_ms: self.stamp_ms(),
             activation: self.config.boot_epoch,
             config_version: self.config.config_version.clone(),
+            seq: self.stamped,
         }
+    }
+
+    /// Stamp for a fact: the next emission sequence number.
+    fn stamp_fact(&mut self) -> FactStamp {
+        self.stamped += 1;
+        self.stamp()
     }
 }
 
@@ -618,7 +627,7 @@ impl<Z: Zone> Ctx<'_, Z> {
     }
 
     fn emit_bound(&mut self, fact: Fact, principal: Option<String>) -> Result<(), EmitError> {
-        let stamp = self.core.stamp();
+        let stamp = self.core.stamp_fact();
         self.core
             .facts
             .as_mut()
@@ -840,6 +849,7 @@ impl<Z: Zone> ZoneHost<Z> {
             child_inbox: Vec::new(),
             dropped_frozen: 0,
             fact_seq: (0, 0),
+            stamped: 0,
             stamp_floor_ms: 0,
             pinned_stamp_ms: None,
             lifecycle_backlog: VecDeque::new(),

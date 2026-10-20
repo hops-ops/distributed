@@ -110,6 +110,7 @@ mod tests {
             tick,
             emitted_at_ms: at,
             activation,
+            seq: tick,
             ..FactStamp::default()
         }
     }
@@ -136,5 +137,31 @@ mod tests {
         );
         // Replaying the same fact is a no-op.
         assert!(!presence.apply("ana", &stamp("pit-2", 4, 2, 1_001), &joined_b));
+    }
+
+    #[test]
+    fn a_drop_in_the_join_tick_and_millisecond_still_marks_the_player_away() {
+        use distributed_game::lifecycle::{ConnectionLost, LostCause};
+        let presence = Presence::default();
+        let joined = Lifecycle::Joined(PlayerJoined {
+            zone: "pit-1".into(),
+            via: JoinVia::Ticket,
+            from_zone: None,
+        });
+        let lost = Lifecycle::ConnectionLost(ConnectionLost {
+            zone: "pit-1".into(),
+            grace_ms: 15_000,
+            cause: LostCause::Dropped,
+        });
+        // Same zone, activation, tick and wall time: only the host's
+        // emission sequence orders them.
+        let at = |seq| FactStamp {
+            seq,
+            ..stamp("pit-1", 3, 0, 1_000)
+        };
+        assert!(presence.apply("bo", &at(1), &joined));
+        assert!(presence.apply("bo", &at(2), &lost));
+        assert_eq!(presence.get("bo").unwrap().status, PresenceStatus::Away);
+        assert!(!presence.apply("bo", &at(1), &joined), "stale join ignored");
     }
 }

@@ -595,6 +595,7 @@ mod tests {
             emitted_at_ms: 1_700_000_000_000,
             activation: 3,
             config_version: "cfg-2".into(),
+            seq: 5,
         };
         let fact = Fact::trusted(
             "k",

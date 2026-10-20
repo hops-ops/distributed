@@ -122,6 +122,7 @@ async fn facts_dispatch_idempotently_with_trusted_principal() {
         emitted_at_ms: 1_700_000_000_456,
         activation: 77,
         config_version: "combat@12".into(),
+        seq: 12,
     };
     let fact = Fact::trusted(
         "coin:z1:7",

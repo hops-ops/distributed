@@ -701,12 +701,14 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
   (`/dev/mobpit/presence`), ordered by stamp.
 - Every fact carries a `FactStamp`: zone, activation (boot epoch), tick,
   host wall time `emitted_at_ms` (`Clock::unix_ms`; `ManualClock` in
-  tests), content version and config version (`HostConfig::config_version`,
-  `ctx.set_config_version`). The cell sink passes it to handlers as
+  tests), content version, config version (`HostConfig::config_version`,
+  `ctx.set_config_version`) and `seq`, the host's per-activation emission
+  sequence (every stamped fact gets the next number). The cell sink passes it to handlers as
   trusted `x-game-*` session variables (`cell::session_stamp`), and
   `stamp_metadata` / `FactStamp::from_metadata` copy it onto events.
 - **Commit order is not emission order.** Order facts with
-  `FactStamp::emission_order` (same zone: activation, then tick; across
+  `FactStamp::emission_order` (same zone: activation, then `seq`, so two
+  facts of one tick and millisecond still order strictly; across
   zones: wall time). After a handoff the target's stamps start after the
   source's departure time, which the transfer ticket carries, so "joined
   B" sorts after "left A" even when it commits first or the two hosts'
@@ -901,7 +903,7 @@ Settlements: `settlement.is::<SlayInput>()`, and
 > do it for you.
 
 The host binds the principal from the player's **verified ticket** and
-stamps zone, activation, tick, wall time, content and config version. A `FactSink` commits facts on a worker
+stamps zone, activation, tick, wall time, content and config version and emission sequence. A `FactSink` commits facts on a worker
 with bounded retries/backoff; `Zone::on_fact_settled` receives the outcome
 on a later tick. `cell::CellFactSink` dispatches into an `AggregateCell`
 with a deterministic command id per fact key, so retries replay instead of

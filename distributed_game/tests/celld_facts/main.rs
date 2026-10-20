@@ -64,6 +64,7 @@ fn stamp(tick: u64) -> FactStamp {
         emitted_at_ms: 1_700_000_000_000 + tick,
         activation: 1,
         config_version: "cfg-1".into(),
+        seq: tick,
     }
 }
 

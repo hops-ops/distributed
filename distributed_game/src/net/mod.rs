@@ -1896,10 +1896,14 @@ where
         while let Some(item) = outbound.pop_due() {
             match send_out(&mut socket, item).await {
                 Ok(true) => {}
-                _ => {
+                // The zone closed this connection and already forgot the client.
+                Ok(false) => {
                     notify_zone = false;
                     break 'session;
                 }
+                // The socket died under a write: the zone must still learn
+                // the connection is gone (grace + ConnectionLost).
+                Err(_) => break 'session,
             }
         }
         while let Some(item) = inbound.pop_due() {
@@ -1915,9 +1919,13 @@ where
             out = out_rx.recv() => {
                 let Some(out) = out else { notify_zone = false; break };
                 if let Some(out) = outbound.push(out) {
-                    if !send_out(&mut socket, out).await.unwrap_or(false) {
-                        notify_zone = false;
-                        break;
+                    match send_out(&mut socket, out).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            notify_zone = false;
+                            break;
+                        }
+                        Err(_) => break,
                     }
                 }
             }
