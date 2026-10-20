@@ -144,6 +144,18 @@
         "path": "migrations/postgres/0012_aggregate_schedules.sql",
         "sha256": "e56147e54924aadac88619ab722f005bbf127f3c009d0cdf80f7ee69b1c2823f"
       }
+    },
+    {
+      "version": 13,
+      "description": "schedule claims",
+      "sqlite": {
+        "path": "migrations/sqlite/0013_schedule_claims.sql",
+        "sha256": "fb6f15299dad6dde0e98333c11f8cc4f9d13bbee793e856741a5c43fb6d8d48b"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0013_schedule_claims.sql",
+        "sha256": "fb6f15299dad6dde0e98333c11f8cc4f9d13bbee793e856741a5c43fb6d8d48b"
+      }
     }
   ]
 }

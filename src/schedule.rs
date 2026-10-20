@@ -31,8 +31,10 @@
 //! **Backends declare [`Capabilities`].** Every backend stores schedule rows
 //! (cells in their own `cell_alarms` table, the in-memory repository in a
 //! per-stream table, SQL in `aggregate_schedules`); only some *dispatch*
-//! them ([`Capability::Scheduling`]: aggregate cells today — the Durable
-//! Object alarm on celld, `fire_due_schedules` on the reference host). Every
+//! them ([`Capability::Scheduling`]): aggregate cells (the Durable Object
+//! alarm on celld, `fire_due_schedules` on the reference host), and the SQL
+//! and in-memory repositories once a schedule worker is attached
+//! (`with_schedule_worker`, see `schedule::worker`, `graphql` feature). Every
 //! backend has a clock ([`Capability::Clock`]): the cell store clock (the DO
 //! clock on celld), the in-memory repository's injected
 //! [`Clock`](crate::Clock), the database clock on SQL. Routes declare what
@@ -46,6 +48,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::microsvc::Session;
+
+#[cfg(feature = "graphql")]
+pub mod worker;
 use crate::repository::RepositoryError;
 use crate::{ROLE_KEY, USER_ID_KEY};
 
@@ -549,7 +554,8 @@ where
     is_schedule_session(ctx.session())
 }
 
-/// Deterministic UUIDv7-shaped command id of one schedule arm.
+/// Deterministic UUIDv7-shaped command id of one schedule arm of a cell
+/// (the cell's own ledger scopes it to the owner).
 pub(crate) fn schedule_command_id(name: &str, generation: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(SCHEDULE_SERVICE_ID.as_bytes());
@@ -557,6 +563,32 @@ pub(crate) fn schedule_command_id(name: &str, generation: u64) -> String {
     hasher.update(name.as_bytes());
     hasher.update([0u8]);
     hasher.update(generation.to_be_bytes());
+    uuid_v7_shaped(hasher)
+}
+
+/// Command id of one schedule arm held in a shared store (SQL, in-memory):
+/// one command ledger serves every aggregate there, so the owning stream is
+/// part of the identity.
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
+pub(crate) fn owned_schedule_command_id(
+    owner: &crate::StreamIdentity,
+    name: &str,
+    generation: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(SCHEDULE_SERVICE_ID.as_bytes());
+    hasher.update([1u8]);
+    hasher.update(owner.aggregate_type().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(owner.aggregate_id().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(name.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(generation.to_be_bytes());
+    uuid_v7_shaped(hasher)
+}
+
+fn uuid_v7_shaped(hasher: Sha256) -> String {
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -613,6 +645,9 @@ pub(crate) struct MemorySchedules {
 struct MemoryScheduleRow {
     schedule: ArmedSchedule,
     armed: bool,
+    /// A schedule worker's claim (epoch ms); cleared by settling or
+    /// re-arming. Transient: not part of restart exports.
+    claimed_until_ms: Option<i64>,
 }
 
 impl MemorySchedules {
@@ -638,12 +673,14 @@ impl MemorySchedules {
                                 attempts: 0,
                             },
                             armed: true,
+                            claimed_until_ms: None,
                         },
                     );
                 }
                 ScheduleWrite::Cancel(name) => {
                     if let Some(row) = next.rows.get_mut(name) {
                         row.armed = false;
+                        row.claimed_until_ms = None;
                     }
                 }
             }
@@ -673,6 +710,45 @@ impl MemorySchedules {
             .collect()
     }
 
+    /// Claim up to `limit` due, unclaimed (or claim-expired) rows until
+    /// `claim_until_ms`, earliest first (the schedule worker's claim).
+    #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
+    pub(crate) fn claim_due(
+        &mut self,
+        now_ms: i64,
+        claim_until_ms: i64,
+        limit: usize,
+    ) -> Vec<ArmedSchedule> {
+        let mut due = self
+            .rows
+            .values()
+            .filter(|row| {
+                row.armed
+                    && row.schedule.due_at_ms <= now_ms
+                    && row.claimed_until_ms.is_none_or(|until| until <= now_ms)
+            })
+            .map(|row| row.schedule.clone())
+            .collect::<Vec<_>>();
+        due.sort_by(|a, b| (a.due_at_ms, &a.name).cmp(&(b.due_at_ms, &b.name)));
+        due.truncate(limit);
+        for schedule in &due {
+            if let Some(row) = self.rows.get_mut(&schedule.name) {
+                row.claimed_until_ms = Some(claim_until_ms);
+            }
+        }
+        due
+    }
+
+    /// Drop a claim taken by [`claim_due`](Self::claim_due) without settling.
+    #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
+    pub(crate) fn release_claim(&mut self, name: &str, generation: u64) {
+        if let Some(row) = self.rows.get_mut(name) {
+            if row.schedule.generation == generation {
+                row.claimed_until_ms = None;
+            }
+        }
+    }
+
     pub(crate) fn next_due_ms(&self) -> Option<i64> {
         self.rows
             .values()
@@ -688,6 +764,7 @@ impl MemorySchedules {
         if !row.armed || row.schedule.generation != generation {
             return;
         }
+        row.claimed_until_ms = None;
         match settlement {
             ScheduleSettlement::Done => {
                 row.armed = false;
@@ -721,6 +798,7 @@ impl MemorySchedules {
                         MemoryScheduleRow {
                             schedule: row.schedule,
                             armed: row.armed,
+                            claimed_until_ms: None,
                         },
                     )
                 })

@@ -121,6 +121,9 @@ pub(crate) trait SqlExecutor: Send {
     const COMMAND_LEDGER_SELECT: &'static str;
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str;
     const COMMAND_LEDGER_COMPACTION_LOCK_SUFFIX: &'static str;
+    /// Row-lock clause of the schedule worker's claim subquery (`FOR UPDATE
+    /// SKIP LOCKED` on Postgres; SQLite serializes writers instead).
+    const SCHEDULE_CLAIM_LOCK_SUFFIX: &'static str = "";
 
     fn query(
         &mut self,

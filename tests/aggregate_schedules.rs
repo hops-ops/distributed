@@ -1,8 +1,8 @@
 //! Schedule rows on the shared SQL repository: stored in the command's
 //! transaction, owned by the batch's one stream, relative due times resolved
 //! by the database clock, re-arming bumps the generation, cancelling
-//! disarms. (Dispatching them is a later SQL schedule worker; SQL does not
-//! declare `Capability::Scheduling` yet.)
+//! disarms. Dispatching them is the schedule worker's job
+//! (`tests/schedule_worker`).
 
 #![cfg(feature = "sqlite")]
 

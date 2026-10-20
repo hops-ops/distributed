@@ -94,8 +94,8 @@ ctx.schedule(Schedule::at("tick", due, "pool.tick", &input)?)?;
 | Backend | Stores schedules | Dispatches them (`Scheduling`) | Clock (`Clock`) |
 |---|---|---|---|
 | Aggregate cell (celld; reference host) | `cell_alarms` | yes: the Durable Object alarm; `fire_due_schedules` on the reference host | DO clock / store clock |
-| In-memory repository | per-stream table | not yet | injected `Clock` (`with_clock`) |
-| SQL (Postgres, SQLite) | `aggregate_schedules` | not yet (schedule worker planned) | database clock |
+| In-memory repository | per-stream table | with a schedule worker attached (`with_schedule_worker`) | injected `Clock` (`with_clock`) |
+| SQL (Postgres, SQLite) | `aggregate_schedules` | with a schedule worker attached (`with_schedule_worker`) | database clock |
 
 A route declares what it needs with `.requires(..)`; registering it on a
 backend without it panics with the missing capabilities while the service is
@@ -103,6 +103,42 @@ built, never at the first commit. `ctx.now()` answers only on routes that
 declared `Clock` (the dispatcher stamps the host clock into the session and
 removes any caller value); `ctx.schedule` refuses unless the route declared
 `Scheduling`.
+
+**Shared stores: the schedule worker** (`distributed::schedule::worker`,
+`graphql` feature). SQL and in-memory repositories store schedules for
+every aggregate in one table, so a worker process fires them:
+
+```rust
+let (repo, schedules) = PostgresRepository::connect_and_migrate(url)
+    .await?
+    .with_schedule_worker(ScheduleWorkerConfig::default()); // repo now declares Scheduling
+let service = Arc::new(build_service(repo.clone()));
+let host: Arc<dyn CommandHost> = Arc::new(LocalCommandHost::new(Arc::clone(&service)));
+let worker = schedules.spawn(host); // worker.stop().await on shutdown
+```
+
+- Each pass claims up to 32 due, unclaimed rows in one statement
+  (`UPDATE … WHERE … IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING`;
+  SQLite serializes writers instead), marking them `claimed_until_ms`
+  (default 30 s ahead). Concurrent workers in several processes get
+  disjoint rows.
+- Each claimed arm is dispatched through the `CommandHost` with
+  `schedule_session` and a command id derived from the owning stream, the
+  name and the generation (one ledger serves every aggregate here, so the
+  owner is part of the id). A worker that crashes after the command
+  committed leaves the claim to lapse; the next worker re-dispatches the
+  same id and the ledger replays it, so the arm fires once.
+- Settlement touches only the generation that fired, like on celld.
+- The scheduled command finds its aggregate through its input; the handler
+  that called `ctx.schedule` supplies that input.
+
+**Latency.** On celld the Durable Object alarm wakes the cell at the due
+time (a few milliseconds late) without any extra process. The schedule
+worker fires a due row within one poll interval (`poll_interval`, default
+250 ms) plus the dispatch, and only while a worker runs; in the test suite
+with a 20 ms poll the observed delay past due was about 20–45 ms on SQLite.
+Lower the interval for tighter timing at the cost of one claim query per
+interval per worker.
 
 **celld.** A Durable Object has one alarm. The outbox watchdog
 (`CelldOutbox`) and due schedules share it: every `setAlarm` targets the
