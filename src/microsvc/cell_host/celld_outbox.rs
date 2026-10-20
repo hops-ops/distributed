@@ -58,7 +58,7 @@ pub struct CelldOutboxDrainOutcome {
 #[derive(Debug, Default)]
 pub struct CelldAlarmOutcome {
     /// Domain alarms fired, retried or failed by this wake.
-    pub alarms: super::CellAlarmFireReport,
+    pub schedules: crate::schedule::ScheduleFireReport,
     /// The outbox drain that followed.
     pub drain: CelldOutboxDrainOutcome,
 }

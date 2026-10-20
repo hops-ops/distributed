@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use distributed::cell_host::{
-    cell_alarm_session, AggregateCell, CellCommandIdentity, CellDispatchError, CellStreamStore,
+    AggregateCell, CellCommandIdentity, CellDispatchError, CellStreamStore,
 };
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
+use distributed::schedule::schedule_session;
 use distributed::{Clock, ManualClock, StreamIdentity};
 use distributed_game::cell::command_id_for;
 use distributed_game::world::zone_lease::{
@@ -168,18 +169,18 @@ async fn renewals_produce_no_outbox_rows_and_move_the_expiry_alarm() {
     let mut current = own.acquire("z1", "a#1", ttl).await.unwrap();
     assert_eq!(outward(&own.cell), ["zone.activated"]);
     assert_eq!(
-        own.cell.next_alarm_due().unwrap(),
+        own.cell.next_schedule_due().unwrap(),
         Some(SystemTime::UNIX_EPOCH + Duration::from_millis(T0 + 10_000))
     );
     for step in 1..=20u64 {
         clock.advance(Duration::from_secs(3));
         current = own.renew(&current, ttl).await.unwrap();
         assert_eq!(
-            own.cell.next_alarm_due().unwrap(),
+            own.cell.next_schedule_due().unwrap(),
             Some(clock.now() + ttl),
             "step {step}"
         );
-        assert!(own.cell.fire_due_alarms().await.unwrap().is_empty());
+        assert!(own.cell.fire_due_schedules().await.unwrap().is_empty());
     }
     assert_eq!(
         outward(&own.cell),
@@ -199,14 +200,14 @@ async fn a_holder_that_stops_renewing_expires_exactly_once() {
     let ttl = Duration::from_secs(10);
     let held = own.acquire("z2", "a#1", ttl).await.unwrap();
     clock.advance(Duration::from_millis(9_999));
-    assert!(own.cell.fire_due_alarms().await.unwrap().is_empty());
+    assert!(own.cell.fire_due_schedules().await.unwrap().is_empty());
     clock.advance(Duration::from_millis(1));
-    let report = own.cell.fire_due_alarms().await.unwrap();
+    let report = own.cell.fire_due_schedules().await.unwrap();
     assert_eq!(report.fired.len(), 1);
     assert_eq!(report.fired[0].payload["expired"], true);
     assert_eq!(outward(&own.cell), ["zone.activated", "zone.lease_expired"]);
     clock.advance(Duration::from_secs(60));
-    assert!(own.cell.fire_due_alarms().await.unwrap().is_empty());
+    assert!(own.cell.fire_due_schedules().await.unwrap().is_empty());
     assert_eq!(outward(&own.cell).len(), 2, "exactly one expiry");
     assert_eq!(own.renew(&held, ttl).await, Err(OwnershipError::Lost));
     let next = own.acquire("z2", "b#1", ttl).await.unwrap();
@@ -223,12 +224,12 @@ async fn a_renewal_racing_the_alarm_never_produces_a_false_expiry() {
     // The alarm comes due, but the renewal lands before the wake.
     clock.advance(ttl);
     let held = own.renew(&held, ttl).await.unwrap();
-    assert!(own.cell.fire_due_alarms().await.unwrap().is_empty());
+    assert!(own.cell.fire_due_schedules().await.unwrap().is_empty());
 
     // The wake read the due alarm, then the renewal interleaved, then the
     // stale expiry command runs: the handler re-reads the lease and keeps it.
     clock.advance(ttl);
-    let stale = own.cell.armed_alarms().unwrap().remove(0);
+    let stale = own.cell.armed_schedules().unwrap().remove(0);
     let _held = own.renew(&held, ttl).await.unwrap();
     let result = own
         .cell
@@ -236,7 +237,7 @@ async fn a_renewal_racing_the_alarm_never_produces_a_false_expiry() {
             EXPIRE,
             &stale.command_identity().unwrap(),
             stale.input.clone(),
-            cell_alarm_session(&stale),
+            schedule_session(&stale),
         )
         .await
         .unwrap();

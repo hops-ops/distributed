@@ -8,8 +8,8 @@
 use chat_domain::{post, ChatMessage, ChatMessageState};
 use distributed::cell_host::{
     AggregateCell, CellCommandIdentity, CellDispatchError, CellDispatchResult, CellWaitPathRequest,
-    CelldOutbox, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
-    CELL_CAUSATION_ID_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
+    CelldOutbox, InternalHttpSecret, CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_ENV,
+    CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use serde::de::DeserializeOwned;
@@ -52,7 +52,7 @@ where
         .alarm(env)
         .await
         .map_err(|error| Error::RustError(error.to_string()))?;
-    for failed in wake.alarms.failed.iter().chain(&wake.alarms.retried) {
+    for failed in wake.schedules.failed.iter().chain(&wake.schedules.retried) {
         worker::console_error!(
             "cell alarm {} on {} failed: {} {}",
             failed.name,
@@ -431,7 +431,11 @@ fn optional_internal_header(
         .map_err(|error| {
             CellDispatchError::Internal(format!("could not read internal cell header: {error}"))
         })
-        .map(|value| value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()))
+        .map(|value| {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn wait_path_ok(

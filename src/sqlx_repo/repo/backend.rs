@@ -47,7 +47,7 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         assert_eq!(
             descriptions,
             vec![
@@ -61,7 +61,8 @@ mod tests {
                 "external command binding",
                 "projection delivery aliases",
                 "coordination leases",
-                "cell alarms"
+                "cell alarms",
+                "aggregate schedules"
             ]
         );
         assert_eq!(
@@ -111,6 +112,10 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/sqlite/0011_cell_alarms.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0012_aggregate_schedules.sql"
+                )),
             ]
         );
     }
@@ -130,7 +135,7 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         assert_eq!(
             descriptions,
             vec![
@@ -144,7 +149,8 @@ mod tests {
                 "external command binding",
                 "projection delivery aliases",
                 "coordination leases",
-                "cell alarms"
+                "cell alarms",
+                "aggregate schedules"
             ]
         );
         assert_eq!(
@@ -193,6 +199,10 @@ mod tests {
                 include_str!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/postgres/0011_cell_alarms.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0012_aggregate_schedules.sql"
                 )),
             ]
         );

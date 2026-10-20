@@ -46,55 +46,77 @@ retry) resets availability to now, so a timer that failed to publish is
 retried promptly instead of being re-delayed. `OutboxMessage.deliver_at` is
 `#[serde(default)]`.
 
-## Cell alarms: a cell schedules its own work
+## Schedules: an aggregate schedules its own work
 
-`deliver_at` leaves the cell and needs a consumer to send a command back.
-When a cell must act on itself later (a matchmaking tick, an invite expiry, a
-daily reset, a lease expiry), a causal command handler arms a **cell alarm**
-with its events:
+`deliver_at` leaves the aggregate and needs a consumer to send a command
+back. When an aggregate must act on itself later (a matchmaking tick, an
+invite expiry, a daily reset, a lease expiry), a causal command handler
+**schedules** it with its events (`distributed::schedule`):
 
 ```rust
-// in a causal command handler
-ctx.arm_alarm(CellAlarm::after("tick", Duration::from_secs(5), "pool.tick", &TickInput { pool })?)?;
-ctx.cancel_alarm("invite-expiry")?;
+// on the route: what the command needs from its host
+routes.typed_command(start).requires(Capability::Scheduling).requires(Capability::Clock)
 
-// in the alarm's own handler: re-arm from the fired due time (no drift)
-let due = ctx.alarm_due().expect("fired by an alarm") + period;
-ctx.arm_alarm(CellAlarm::at("tick", due, "pool.tick", &input)?)?;
+// in the handler
+let now = ctx.now()?;                                   // the host clock
+ctx.schedule(Schedule::after("tick", Duration::from_secs(5), "pool.tick", &TickInput { pool })?)?;
+ctx.cancel_schedule("invite-expiry")?;
+
+// in the schedule's own handler: re-schedule from the fired due time (no drift)
+let due = ctx.scheduled_due().expect("fired by a schedule") + period;
+ctx.schedule(Schedule::at("tick", due, "pool.tick", &input)?)?;
 ```
 
-- The alarm row (`cell_alarms`, migration 11) commits in the **same
-  transaction** as the command's events, ledger receipt and outbox rows. A
-  failed command arms nothing. `CellAlarm::after` resolves against the
-  cell's clock at commit; handlers have no wall clock of their own.
-- One row per alarm name. Arming a name again replaces it and bumps its
-  `generation`; `cancel_alarm` disarms it.
-- When due, the cell dispatches the alarm's command **into itself** through
-  its command ledger, with a command id derived from `(name, generation)` and
-  the trusted session from `cell_alarm_session` (role `cell-alarm`, plus
-  claims only the host sets). Mount alarm-only commands with
-  `guard: cell_alarm_guard` so callers cannot invoke them. A crash after the
-  handler committed but before the alarm settled replays the receipt; the
-  handler never runs twice for one arm.
-- Rejections disarm the alarm (reported as `failed`). Retryable failures back
-  off from 1 s, doubling, up to 5 min (`retried`). At most 32 alarms fire per
-  wake, 16 alarm writes per command and 1,024 armed alarms per cell.
-- Only aggregate cells have an alarm slot. Every other repository rejects a
-  batch carrying alarm writes.
+- Schedule rows are part of `CommitBatch` (`batch.schedules`) and commit in
+  the **same transaction** as the command's events, ledger receipt and
+  outbox rows, on every backend: a cell's own `cell_alarms` table (migration
+  11), the in-memory repository's per-stream table, SQL's
+  `aggregate_schedules` (migration 12, keyed by the owning stream). A failed
+  command schedules nothing. The batch must commit exactly one aggregate,
+  which owns the schedule. `Schedule::after` resolves against the backend's
+  clock at commit (cell clock, injected `Clock`, database clock).
+- One row per (owner, name). Scheduling a name again replaces it and bumps
+  its `generation`; `cancel_schedule` disarms it.
+- When due, the host dispatches the command **into the owner** through its
+  command ledger, with a command id derived from `(name, generation)` and
+  the trusted session from `schedule_session` (role `schedule`, plus claims
+  only the host sets). Guard schedule-only commands with `schedule_guard`
+  so callers cannot invoke them. A crash after the handler committed but
+  before the schedule settled replays the receipt; the handler never runs
+  twice for one arm.
+- Rejections disarm the schedule (reported as `failed`). Retryable failures
+  back off from 1 s, doubling, up to 5 min (`retried`). At most 32 schedules
+  fire per wake, 16 schedule writes per command and 1,024 armed schedules
+  per aggregate.
+
+**Capabilities.** Backends declare what they provide (`Capabilities`):
+
+| Backend | Stores schedules | Dispatches them (`Scheduling`) | Clock (`Clock`) |
+|---|---|---|---|
+| Aggregate cell (celld; reference host) | `cell_alarms` | yes: the Durable Object alarm; `fire_due_schedules` on the reference host | DO clock / store clock |
+| In-memory repository | per-stream table | not yet | injected `Clock` (`with_clock`) |
+| SQL (Postgres, SQLite) | `aggregate_schedules` | not yet (schedule worker planned) | database clock |
+
+A route declares what it needs with `.requires(..)`; registering it on a
+backend without it panics with the missing capabilities while the service is
+built, never at the first commit. `ctx.now()` answers only on routes that
+declared `Clock` (the dispatcher stamps the host clock into the session and
+removes any caller value); `ctx.schedule` refuses unless the route declared
+`Scheduling`.
 
 **celld.** A Durable Object has one alarm. The outbox watchdog
-(`CelldOutbox`) and domain alarms share it: every `setAlarm` targets the
-earliest of the next domain alarm and the next drain, so a watchdog rearm
-never postpones a domain alarm and a far domain alarm never postpones a
-drain. The Worker's `alarm()` handler calls `AggregateCell::alarm(&env)`,
-which fires due alarms, then drains the outbox and re-plans the wake.
-Commands that arm an alarm move the wake earlier right after they commit.
+(`CelldOutbox`) and due schedules share it: every `setAlarm` targets the
+earliest of the next schedule and the next drain, so a watchdog rearm never
+postpones a schedule and a far schedule never postpones a drain. The
+Worker's `alarm()` handler calls `AggregateCell::alarm(&env)`, which fires
+due schedules, then drains the outbox and re-plans the wake. Commands that
+schedule move the wake earlier right after they commit.
 
 **Reference host.** The in-process host (unit tests; durable cells run on
 celld) has no timer. Give the store a `ManualClock`
 (`CellStreamStore::with_clock`), advance it and call
-`AggregateCell::fire_due_alarms()`: the same ledger and settlement path runs
-deterministically.
+`AggregateCell::fire_due_schedules()`: the same ledger and settlement path
+runs deterministically.
 
 ## Leases with fencing tokens
 

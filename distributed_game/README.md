@@ -747,9 +747,11 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
   fact with no principal; `ctx.fact(&input)` builds the `Fact` for a retry
   backlog. `Fact::new(key, command, json)` still works.
 - A background worker commits facts with retries.
-  `celld::CelldFactSink` sends each one to its celld cell (that player's
-  cell, a match cell, ...) as a command over the internal path, with a
-  command id derived from the fact key. A retry or a duplicate is
+  `command_sink::CommandFactSink<H: CommandHost>` dispatches each one as a
+  command through a command host — `celld::CelldFactSink` to its celld cell
+  (that player's cell, a match cell, ...) over the internal path, or a
+  `LocalCommandHost` to a service over any repository — with a command id
+  derived from the fact key. A retry or a duplicate is
   therefore a harmless replay, never a double reward. (`cell::CellFactSink`
   does the same into an in-process reference cell, for unit tests.)
 - `on_fact_settled` reports the outcome on a later tick.
@@ -768,7 +770,7 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
   with `max_concurrent_commits > 1`) and wait in a host backlog rather
   than being dropped when the queue is full. `lifecycle::Lifecycle::of(&fact)`
   decodes them in a sink. Mob Pit routes them to per-player celld presence
-  cells (`CelldFactSink::lifecycle_route`), ordered by stamp.
+  cells (`CommandFactSink::lifecycle_route`), ordered by stamp.
 - Every fact carries a `FactStamp`: zone, activation (boot epoch), tick,
   host wall time `emitted_at_ms` (`Clock::unix_ms`; `ManualClock` in
   tests), content version, config version (`HostConfig::config_version`,
@@ -940,7 +942,8 @@ trait and its ABI (`run_abi`, `call_bytes`).
 | *(default)* | Zone/host runtime, facts queue, protocol, schema, replication, authoring derives, game surface, predicted steps (compiles to `wasm32-unknown-unknown`, where `#[predict]` exports its steps) | `serde`, `serde_json`, `distributed_game_macros` |
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
 | `cell` | `cell::CellFactSink` → in-process `AggregateCell::dispatch_idempotent` (native, unit tests); `cell::fact_session_from_headers` / `session_stamp` for cells (also wasm32); `stamp_event_record`; the `world::zone_lease` and `world::zone_state` cell aggregates | `distributed`, `sha2`, `base64` |
-| `celld` | `celld::CelldFactSink`: facts → celld cells over the internal HTTP path, routed by command; `celld::CellZoneOwnership`: zone leases in celld `ZoneLease` cells; `celld::CellZoneStateStore`: hibernation snapshots in celld `ZoneState` cells | `cell` + `reqwest`, `uuid` |
+| `command-host` | `command_sink::CommandFactSink<H: CommandHost>`: facts → commands through any command host, routed by command (`FactRoute`) | `cell` + `distributed/graphql` |
+| `celld` | `celld::CelldFactSink` (the command sink over a remote-only `CelldCommandHost`): facts → celld cells over the internal HTTP path; `celld::CellZoneOwnership`: zone leases in celld `ZoneLease` cells; `celld::CellZoneStateStore`: hibernation snapshots in celld `ZoneState` cells | `command-host` + `reqwest`, `uuid` |
 | `workers-rs` | `world::zone_state::celld_worker`: the `zone-state/{zone}` route of a celld worker (cell + R2 bucket binding for large snapshots) | `cell` + `worker` |
 | `metrics` | `metrics::GameMetrics` per-zone Prometheus text | – |
 | `net` | `net::GameServer` (axum WebSocket), HMAC tickets, `GET /metrics` (implies `metrics`), handoff, admin peer routes, `WorldCoordinator` | `axum`, `hmac`, `sha2`, `base64`, `tokio` |
@@ -984,25 +987,35 @@ double-crediting. A custom sink needs only crate-root imports:
 (`BoxFuture` is also re-exported from `world` and `net` for
 `ZoneOwnership` / `BarrierParticipant` impls).
 
-**Facts to celld cells.** Durable aggregates live in celld cells; a zone
-server sends its facts there with one `celld::CelldFactSink` (feature
-`celld`), routing each fact by its command to a cell kind and shard:
+**Facts as commands.** A zone server sends its facts to the durable
+aggregates as commands through a `CommandHost`, with one
+`command_sink::CommandFactSink` (feature `command-host`), routing each fact
+by its command to an aggregate kind and shard (`FactRoute`: by principal,
+by input field, by zone, or a function of the input and trusted session).
+The same routes serve every host: `celld::CelldFactSink` (feature `celld`)
+addresses celld cells by kind and shard; over a `LocalCommandHost` a
+service routes by command and its handler picks the stream
+(`tests/command_facts` runs the celld test's routes against an in-memory
+repository):
 
 ```rust,ignore
-let sink = CelldFactSink::new(celld_url, InternalHttpSecret::new(secret)?, "zone-server", "zone:pit-1")?
-    .route(CelldFactRoute::by_principal::<RecordKillInput>("crawler"))      // Crawler:{principal}
-    .route(CelldFactRoute::by_input_field::<MatchResultInput>("match", "match_id"))
+let sink = CelldFactSink::celld(celld_url, InternalHttpSecret::new(secret)?, "zone-server", "zone:pit-1")?
+    .route(FactRoute::by_principal::<RecordKillInput>("crawler"))            // Crawler:{principal}
+    .route(FactRoute::by_input_field::<MatchResultInput>("match", "match_id"))
     .lifecycle_route("presence");                                            // zone.* → Presence:{account}
+// or: CommandFactSink::new(LocalCommandHost::new(service), "zone-server", "zone:pit-1")?.route(..)
 let (queue, feed) = fact_channel(capacity, RetryPolicy::until_settled(base, max));
 spawn_fact_worker(feed.with_max_concurrent_commits(n), sink);
 ```
 
-Each fact is `POST {CELLD_URL}/{kind}/{shard}/{command}` with
-`{commandId, input}`; the command id is `cell::command_id_for(service,
-key)`, so a retry after a timeout replays the cell's ledger receipt
-(`replayed`) instead of committing twice. The principal travels as
-`x-user-id` and the command-ledger principal partition, the stamp as
-`x-game-*` headers, and every request carries
+Over celld each fact is `POST {CELLD_URL}/{kind}/{shard}/{command}` with
+`{commandId, input}` (the remote-only `CelldCommandHost`); the command id is
+`cell::command_id_for(service, key)`, so a retry after a timeout replays the
+cell's ledger receipt (`replayed`) instead of committing twice. Cells answer
+the standard wait-path body (`CellDispatchResult::wait_path_wire`). The
+principal travels as `x-user-id` and the command-ledger principal partition,
+the stamp as `x-game-*` headers (`CelldCommandHost::forward_session_prefix`),
+and every request carries
 `DISTRIBUTED_INTERNAL_SECRET`; the cell rebuilds the trusted session with
 `cell::fact_session_from_headers` after checking the secret. Player
 lifecycle facts route to presence, never to gameplay cells. celld slow,
@@ -1105,7 +1118,7 @@ principals commit concurrently; settlements arrive in completion order.
 | Piece | Purpose |
 |---|---|
 | `ZoneDirectory` (`StaticDirectory`, `HashRing`) | zone → owning `HostAddr`. `HashRing` uses virtual nodes; adding/removing one of N hosts moves ~1/N of the zones. A Hello for a zone owned elsewhere gets `Redirect(zone, url)`; `url` is the owner's `HostAddr::ws_url` (advertise a proxied public URL with `HostAddr::with_ws_url`) or `ServerConfig::with_redirect_url(\|host, zone\| …)`. |
-| `ZoneOwnership` (`LocalOwnership`, `FencedLeaseOwnership<S: LeaseStore>`, `celld::CellZoneOwnership`) | every activation acquires a fenced claim (`host#activation`) and renews it; a failed renewal disposes the zone **without** saving. Two hosts never run the same zone. `CellZoneOwnership` keeps each claim in a celld `ZoneLease:{zone}` cell (`world::zone_lease`, mount with `mount_zone_lease`): acquire and release publish `zone.activated` / `zone.released`, renewals are internal (no outward events), and the cell's alarm publishes `zone.lease_expired` when a holder stops renewing, so services see a crashed zone server; each event carries the lease's `ZoneLeaseStatus { zone_id, holder, token, status }`. `world::ownership_conformance` is the behaviour every implementation passes. |
+| `ZoneOwnership` (`LocalOwnership`, `FencedLeaseOwnership<S: LeaseStore>`, `celld::CellZoneOwnership`) | every activation acquires a fenced claim (`host#activation`) and renews it; a failed renewal disposes the zone **without** saving. Two hosts never run the same zone. `CellZoneOwnership` keeps each claim in a celld `ZoneLease:{zone}` cell (`world::zone_lease`, mount with `mount_zone_lease`): acquire and release publish `zone.activated` / `zone.released`, renewals are internal (no outward events), and the lease's expiry schedule (`ctx.schedule`; the routes require `Capability::Scheduling` and `Clock`) publishes `zone.lease_expired` when a holder stops renewing, so services see a crashed zone server; each event carries the lease's `ZoneLeaseStatus { zone_id, holder, token, status }`. `world::ownership_conformance` is the behaviour every implementation passes. |
 | `ZoneStateStore` (`celld::CellZoneStateStore`; `MemoryZoneStateStore` for unit tests) | hibernation snapshots (async `load` / `save` / `delete`), written under the claim's fencing token (stale writers get `StateError::Stale`, counted in `distributed_game_hibernation_saves_total{outcome="stale"}` and logged to stderr, never silently dropped). On celld each zone's snapshot is its own `ZoneState:{zone}` cell (`world::zone_state`): inline up to 64 KiB, larger ones in the worker's R2 bucket with the digest in the cell; saves and deletes publish `zone_state.saved` / `zone_state.deleted` with a `ZoneSnapshotStatus { zone_id, token, stored, content_version, bytes }` (no bytes). `LocalOwnership` seeds its tokens from the Unix time (µs) at creation, so a restarted host still outranks the snapshots its previous run saved. |
 | `world::zone_status` (feature `cell`) | the read model of those events: `zone_leases` and `zone_snapshots` rows (`projection!` upserts of the state bodies), `projectors()` to mount on any consumer service and read-model store, and `ZoneStatus::of` → `Active { holder }` / `Hibernated { bytes }` / `Cold`. For views (world maps, minimaps): it answers "which zones are active or asleep?" without opening a cell per zone (on celld a read of a never-used cell creates it). Eventually consistent; ownership and restore always go to the cells. |
 | `ZoneTopology` (`DottedTopology` default: `eldoria.port.docks` → `eldoria.port` → `eldoria`) | parent links for tier-up events. |

@@ -13,15 +13,16 @@
 use std::time::Duration;
 
 use distributed::cell_host::{
-    cell_alarm_guard, AggregateCell, CellAlarm, CellCommandIdentity, CellDispatchError,
-    CellWaitPathRequest, CelldOutbox, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,
-    CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
+    AggregateCell, CellCommandIdentity, CellDispatchError, CellWaitPathRequest, CelldOutbox,
+    InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
+    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes, Session,
     ROLE_KEY, USER_ID_KEY,
 };
+use distributed::schedule::{schedule_guard, Capability, Schedule};
 use distributed::{sourced, Entity};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -97,6 +98,7 @@ where
             .typed_command(typed_command::<StartInput, Succeeded<TickerPayload>>(
                 "ticker.start",
             ))
+            .requires(Capability::Scheduling)
             .guarded(is_user, handle_start)
     }
 }
@@ -113,8 +115,8 @@ async fn handle_start(
     ticker
         .start(input.id.clone(), input.limit, input.period_ms)
         .map_err(rejected)?;
-    ctx.arm_alarm(
-        CellAlarm::after(
+    ctx.schedule(
+        Schedule::after(
             "tick",
             Duration::from_millis(input.period_ms),
             TICK,
@@ -141,7 +143,8 @@ where
     fn install(self, routes: Routes<D>) -> Routes<D> {
         routes
             .typed_command(typed_command::<TickerInput, Succeeded<TickerPayload>>(TICK))
-            .guarded(cell_alarm_guard::<Ticker>, handle_tick)
+            .requires(Capability::Scheduling)
+            .guarded(schedule_guard::<Ticker>, handle_tick)
     }
 }
 
@@ -157,10 +160,10 @@ async fn handle_tick(
     ticker.tick().map_err(rejected)?;
     if ticker.ticks < ticker.limit {
         let due = ctx
-            .alarm_due()
+            .scheduled_due()
             .ok_or_else(|| rejected("tick outside an alarm"))?
             + Duration::from_millis(ticker.period_ms);
-        ctx.arm_alarm(CellAlarm::at("tick", due, TICK, &input).map_err(rejected)?)?;
+        ctx.schedule(Schedule::at("tick", due, TICK, &input).map_err(rejected)?)?;
     }
     let ticks = ticker.ticks;
     repo.publish_events()
@@ -256,7 +259,7 @@ impl DurableObject for TickerCell {
             .alarm(&self.env)
             .await
             .map_err(|error| Error::RustError(error.to_string()))?;
-        for failed in wake.alarms.failed.iter().chain(&wake.alarms.retried) {
+        for failed in wake.schedules.failed.iter().chain(&wake.schedules.retried) {
             worker::console_error!(
                 "cell alarm {} ({}) failed: {} {}",
                 failed.name,
@@ -286,7 +289,7 @@ impl TickerCell {
             .map_err(|error| Error::RustError(error.to_string()))?;
         let armed = self
             .cell
-            .armed_alarms()
+            .armed_schedules()
             .map_err(|error| Error::RustError(error.to_string()))?;
         let backlog = self
             .cell
@@ -433,7 +436,7 @@ fn request_identity(
 }
 
 /// Only the verified user and roles cross the HTTP boundary; the alarm claims
-/// that `cell_alarm_guard` checks are set by the cell host alone.
+/// that `schedule_guard` checks are set by the cell host alone.
 fn request_session(req: &Request) -> Session {
     let mut session = Session::new();
     for key in [USER_ID_KEY, ROLE_KEY] {

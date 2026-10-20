@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use super::alarm::{AlarmSettlement, ArmedCellAlarm, CellAlarmFireReport};
+use super::alarm::{ArmedSchedule, ScheduleFireReport, ScheduleSettlement};
 use super::causal::{CellCommandIdentity, CellDispatchError, CellDispatchResult};
 use super::store::CellStreamStore;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
@@ -212,7 +212,6 @@ where
         input: Value,
         session: Session,
     ) -> Result<Value, HandlerError> {
-        let session = self.stamp_now(session);
         #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         let _command = self
             .begin_command()
@@ -239,7 +238,6 @@ where
         input: Value,
         session: Session,
     ) -> Result<CellDispatchResult, CellDispatchError> {
-        let session = self.stamp_now(session);
         #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         let _command = self
             .begin_command()
@@ -254,21 +252,13 @@ where
         result
     }
 
-    /// Overwrite the cell-clock claim: handlers read the cell's time
-    /// (`ctx.cell_now()`), never a caller's.
-    fn stamp_now(&self, mut session: Session) -> Session {
-        let now = super::alarm::system_time_to_ms(self.routes.repo().repo().now()).unwrap_or(0);
-        session.set(super::alarm::CELL_NOW_CLAIM, now.to_string());
-        session
-    }
-
     /// Armed alarms of this cell, earliest first.
-    pub fn armed_alarms(&self) -> Result<Vec<ArmedCellAlarm>, RepositoryError> {
-        self.routes.repo().repo().armed_alarms()
+    pub fn armed_schedules(&self) -> Result<Vec<ArmedSchedule>, RepositoryError> {
+        self.routes.repo().repo().armed_schedules()
     }
 
     /// Due time of this cell's earliest armed alarm.
-    pub fn next_alarm_due(&self) -> Result<Option<SystemTime>, RepositoryError> {
+    pub fn next_schedule_due(&self) -> Result<Option<SystemTime>, RepositoryError> {
         Ok(self
             .routes
             .repo()
@@ -283,33 +273,33 @@ where
     /// [`ManualClock`](crate::ManualClock) ([`CellStreamStore::with_clock`]),
     /// advance it, and call this, exactly as the celld alarm handler does on
     /// every Durable Object wake.
-    pub async fn fire_due_alarms(&self) -> Result<CellAlarmFireReport, RepositoryError> {
-        self.fire_due_alarms_at(self.routes.repo().repo().now())
+    pub async fn fire_due_schedules(&self) -> Result<ScheduleFireReport, RepositoryError> {
+        self.fire_due_schedules_at(self.routes.repo().repo().now())
             .await
     }
 
-    /// Fire up to [`CELL_ALARM_FIRE_BATCH`](super::CELL_ALARM_FIRE_BATCH)
+    /// Fire up to [`SCHEDULE_FIRE_BATCH`](crate::schedule::SCHEDULE_FIRE_BATCH)
     /// alarms due at or before `now`, earliest first.
     ///
     /// Each one dispatches its command through this cell's command ledger with
     /// a stable `(name, generation)` command id and the trusted alarm session.
     /// The due set is read once, so a handler that re-arms in the past fires on
     /// the next wake, not in a loop.
-    pub async fn fire_due_alarms_at(
+    pub async fn fire_due_schedules_at(
         &self,
         now: SystemTime,
-    ) -> Result<CellAlarmFireReport, RepositoryError> {
+    ) -> Result<ScheduleFireReport, RepositoryError> {
         let store = self.routes.repo().repo();
         let now_ms = super::alarm::system_time_to_ms(now)?;
-        let mut report = CellAlarmFireReport::default();
-        for alarm in store.due_alarms(now_ms, super::CELL_ALARM_FIRE_BATCH)? {
+        let mut report = ScheduleFireReport::default();
+        for alarm in store.due_alarms(now_ms, crate::schedule::SCHEDULE_FIRE_BATCH)? {
             let result = match alarm.command_identity() {
                 Ok(identity) => {
                     self.dispatch_idempotent(
                         &alarm.command,
                         &identity,
                         alarm.input.clone(),
-                        super::cell_alarm_session(&alarm),
+                        super::schedule_session(&alarm),
                     )
                     .await
                 }
@@ -317,18 +307,18 @@ where
             };
             let settlement = match result {
                 Ok(dispatch) => {
-                    report.fired.push(super::FiredCellAlarm {
+                    report.fired.push(super::FiredSchedule {
                         name: alarm.name.clone(),
                         generation: alarm.generation,
                         command: alarm.command.clone(),
                         replayed: dispatch.replayed(),
                         payload: dispatch.payload().clone(),
                     });
-                    AlarmSettlement::Done
+                    ScheduleSettlement::Done
                 }
                 Err(error) => {
                     let retry = super::alarm::is_retryable(&error);
-                    let failed = super::FailedCellAlarm {
+                    let failed = super::FailedSchedule {
                         name: alarm.name.clone(),
                         generation: alarm.generation,
                         command: alarm.command.clone(),
@@ -340,14 +330,14 @@ where
                     };
                     if retry {
                         report.retried.push(failed);
-                        AlarmSettlement::Retry {
+                        ScheduleSettlement::Retry {
                             due_at_ms: now_ms.saturating_add(
                                 super::alarm::retry_delay(alarm.attempts).as_millis() as i64,
                             ),
                         }
                     } else {
                         report.failed.push(failed);
-                        AlarmSettlement::Done
+                        ScheduleSettlement::Done
                     }
                 }
             };
@@ -462,7 +452,7 @@ where
         &self,
         env: &worker::Env,
     ) -> Result<super::celld_outbox::CelldOutboxDrainOutcome, crate::bus::TransportError> {
-        let next_alarm = self.next_alarm_due().map_err(alarm_transport_error)?;
+        let next_alarm = self.next_schedule_due().map_err(alarm_transport_error)?;
         self.outbox_config()?
             .drain(self, env, &self.storage, next_alarm)
             .await
@@ -485,11 +475,14 @@ where
         env: &worker::Env,
     ) -> Result<super::celld_outbox::CelldAlarmOutcome, crate::bus::TransportError> {
         let alarms = self
-            .fire_due_alarms()
+            .fire_due_schedules()
             .await
             .map_err(alarm_transport_error)?;
         let drain = self.drain_outbox(env).await?;
-        Ok(super::celld_outbox::CelldAlarmOutcome { alarms, drain })
+        Ok(super::celld_outbox::CelldAlarmOutcome {
+            schedules: alarms,
+            drain,
+        })
     }
 
     /// A command may have armed an alarm due before the prearmed watchdog
@@ -500,7 +493,7 @@ where
         let Ok(outbox) = self.outbox_config() else {
             return;
         };
-        let next_alarm = match self.next_alarm_due() {
+        let next_alarm = match self.next_schedule_due() {
             Ok(next_alarm) => next_alarm,
             Err(error) => {
                 worker::console_error!("cell alarm lookup failed after command: {error}");
@@ -535,7 +528,7 @@ where
     async fn begin_command(
         &self,
     ) -> Result<super::celld_outbox::CommandGuard, crate::bus::TransportError> {
-        let next_alarm = self.next_alarm_due().map_err(alarm_transport_error)?;
+        let next_alarm = self.next_schedule_due().map_err(alarm_transport_error)?;
         self.outbox_config()?
             .begin_command(
                 &self.activity,

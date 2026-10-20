@@ -179,7 +179,7 @@ where
     let err = repo
         .commit_batch(CommitBatch {
             inbox_receipts: Vec::new(),
-            alarms: Vec::new(),
+            schedules: Vec::new(),
             streams: vec![StreamWrite::new(identity, stale.entity_mut())],
             outbox_messages: Vec::new(),
             read_model_plans: vec![read_models

@@ -1,0 +1,482 @@
+//! [`CommandFactSink`]: a zone server's facts dispatched as commands through
+//! any [`CommandHost`] — the same durable aggregates whether they run in
+//! celld cells ([`CelldCommandHost`], `POST {celld}/{kind}/{shard}/{command}`
+//! over the internal path) or in an ordinary service over any repository
+//! ([`LocalCommandHost`]: in-memory, SQLite, Postgres).
+//!
+//! One sink per zone server routes every fact by its command
+//! ([`FactCommand::COMMAND`](crate::FactCommand::COMMAND)) to a registered
+//! [`FactRoute`]: a cell kind and a shard function of the fact's input and
+//! trusted session (principal + [`FactStamp`](crate::FactStamp)). A host
+//! that addresses cells uses both ([`FactRouting`]); a service routes by
+//! command and its handler picks the stream from the same session or input.
+//! Player lifecycle facts (`zone.*`, [`crate::lifecycle`]) route to the
+//! presence aggregate of the player's account ([`CommandFactSink::lifecycle_route`]).
+//!
+//! - **Exactly one commit per key.** The command id is
+//!   [`command_id_for`]`(service_id, fact key)`, so a retry after a timeout
+//!   replays through the aggregate's command ledger (`replayed` receipt).
+//! - **Trusted identity.** The principal (bound by the zone host from the
+//!   verified ticket) is the session's `x-user-id` and the verified
+//!   principal ([`VerifiedPrincipal::from_trusted_transport`]); the stamp
+//!   travels as `x-game-*` session variables (forwarded to cells as trusted
+//!   metadata, [`CelldCommandHost::forward_session_prefix`]).
+//! - **No local durable fallback.** A host that is slow or unreachable, a
+//!   5xx, or a command still in progress is [`FactError::Retryable`]: the fact
+//!   stays in the zone's queue (use
+//!   [`RetryPolicy::until_settled`](crate::RetryPolicy::until_settled)). An
+//!   unrouted or rejected command is [`FactError::Permanent`].
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
+use distributed::command_dispatch::{CommandHost, LocalCommandHost};
+use distributed::graphql::identity::VerifiedPrincipal;
+use distributed::microsvc::{CausalDispatchError, Session};
+use serde_json::Value;
+
+use crate::cell::{command_id_for, session_stamp, trusted_session};
+use crate::facts::{BoxFuture, Fact, FactCommand, FactError, FactReceipt, FactSink};
+use crate::lifecycle::LIFECYCLE_COMMANDS;
+use crate::stamp::SESSION_PREFIX;
+
+type ShardFn = Arc<dyn Fn(&Value, &Session) -> Option<String> + Send + Sync>;
+
+/// Where facts of one command go: an aggregate kind and a shard function of
+/// the fact's input and trusted session.
+#[derive(Clone)]
+pub struct FactRoute {
+    command: String,
+    kind: String,
+    shard: ShardFn,
+}
+
+impl FactRoute {
+    /// Route `command` to `{kind}/{shard(input, session)}`. The session holds
+    /// the fact's principal (`user_id()`) and stamp
+    /// ([`session_stamp`]). Return `None` when the fact cannot be routed.
+    pub fn new(
+        command: impl Into<String>,
+        kind: impl Into<String>,
+        shard: impl Fn(&Value, &Session) -> Option<String> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            kind: kind.into(),
+            shard: Arc::new(shard),
+        }
+    }
+
+    /// Route the typed fact `C` to the aggregate of its principal.
+    pub fn by_principal<C: FactCommand>(kind: impl Into<String>) -> Self {
+        Self::new(C::COMMAND, kind, |_, session| {
+            session.user_id().map(str::to_string)
+        })
+    }
+
+    /// Route the typed fact `C` by a field of its input.
+    pub fn by_input_field<C: FactCommand>(kind: impl Into<String>, field: &'static str) -> Self {
+        Self::new(C::COMMAND, kind, move |input, _| {
+            match input.get(field)? {
+                Value::String(value) => Some(value.clone()),
+                Value::Number(value) => Some(value.to_string()),
+                _ => None,
+            }
+        })
+    }
+
+    /// Route the typed fact `C` to the aggregate of the zone that emitted it.
+    pub fn by_zone<C: FactCommand>(kind: impl Into<String>) -> Self {
+        Self::new(C::COMMAND, kind, |_, session| {
+            session_stamp(session).map(|stamp| stamp.zone_id)
+        })
+    }
+
+    /// The routed command.
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// The aggregate kind (cell URL segment).
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// The shard of a fact with `input` and `session`.
+    pub fn shard(&self, input: &Value, session: &Session) -> Option<String> {
+        (self.shard)(input, session)
+    }
+}
+
+/// A [`CommandHost`] that learns the fact routes it needs.
+pub trait FactRouting {
+    /// Register `route` (a host that addresses aggregates by kind and shard
+    /// records it; one that routes by command ignores it).
+    fn register_fact_route(&mut self, route: &FactRoute);
+}
+
+/// A service routes by command: its handler selects the stream.
+impl FactRouting for LocalCommandHost {
+    fn register_fact_route(&mut self, _route: &FactRoute) {}
+}
+
+/// celld addresses cells: `{kind}/{shard}/{command}`.
+impl FactRouting for CelldCommandHost {
+    fn register_fact_route(&mut self, route: &FactRoute) {
+        let shard = route.shard.clone();
+        self.add_cell_route(route.command(), route.kind(), move |input, session| {
+            shard(input, session)
+        });
+    }
+}
+
+/// See the module docs.
+pub struct CommandFactSink<H> {
+    host: Arc<H>,
+    service_id: String,
+    system_principal: String,
+    routes: Vec<FactRoute>,
+}
+
+impl<H> Clone for CommandFactSink<H> {
+    fn clone(&self) -> Self {
+        Self {
+            host: self.host.clone(),
+            service_id: self.service_id.clone(),
+            system_principal: self.system_principal.clone(),
+            routes: self.routes.clone(),
+        }
+    }
+}
+
+impl<H: CommandHost + FactRouting> CommandFactSink<H> {
+    /// A sink dispatching through `host` under command-ledger `service_id`;
+    /// zone facts without a player use `system_principal`.
+    pub fn new(
+        host: H,
+        service_id: impl Into<String>,
+        system_principal: impl Into<String>,
+    ) -> Result<Self, String> {
+        let service_id = service_id.into();
+        let system_principal = system_principal.into();
+        if service_id.trim().is_empty() || system_principal.trim().is_empty() {
+            return Err("a fact sink needs a service id and a system principal".into());
+        }
+        Ok(Self {
+            host: Arc::new(host),
+            service_id,
+            system_principal,
+            routes: Vec::new(),
+        })
+    }
+
+    /// Add a route (before the sink is cloned). A later route for the same
+    /// command replaces the earlier.
+    pub fn route(mut self, route: FactRoute) -> Self {
+        Arc::get_mut(&mut self.host)
+            .expect("add fact routes before cloning the sink")
+            .register_fact_route(&route);
+        self.routes
+            .retain(|existing| existing.command != route.command);
+        self.routes.push(route);
+        self
+    }
+
+    /// Route every player lifecycle fact (`zone.*`) to the presence
+    /// aggregate `{kind}/{principal}` (the player's account).
+    pub fn lifecycle_route(mut self, kind: impl Into<String>) -> Self {
+        let kind = kind.into();
+        for command in LIFECYCLE_COMMANDS {
+            self = self.route(FactRoute::new(command, kind.clone(), |_, session| {
+                session.user_id().map(str::to_string)
+            }));
+        }
+        self
+    }
+}
+
+impl<H> CommandFactSink<H> {
+    /// The host.
+    pub fn host(&self) -> &H {
+        &self.host
+    }
+
+    /// The route a fact would take, if any.
+    pub fn route_for(&self, command: &str) -> Option<&FactRoute> {
+        self.routes.iter().find(|route| route.command == command)
+    }
+
+    /// `(principal, trusted session, command id)` of a routed fact.
+    pub fn prepare(&self, fact: &Fact) -> Result<(String, Session, String), FactError> {
+        let route = self.route_for(fact.command()).ok_or_else(|| {
+            FactError::Permanent(format!("no route for fact command `{}`", fact.command()))
+        })?;
+        let principal = fact
+            .principal()
+            .unwrap_or(&self.system_principal)
+            .to_string();
+        let session = trusted_session(&principal, fact);
+        route
+            .shard(fact.input(), &session)
+            .filter(|shard| {
+                !shard.is_empty()
+                    && shard.len() <= 256
+                    && shard.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+            })
+            .ok_or_else(|| {
+                FactError::Permanent(format!(
+                    "fact `{}` has no valid `{}` shard",
+                    fact.key(),
+                    route.kind
+                ))
+            })?;
+        Ok((
+            principal,
+            session,
+            command_id_for(&self.service_id, fact.key()),
+        ))
+    }
+}
+
+/// celld slow, down or still running the command: keep the fact queued.
+fn classify(error: CausalDispatchError) -> FactError {
+    let detail = format!("{}: {error:?}", error.code());
+    match &error {
+        CausalDispatchError::InProgress | CausalDispatchError::Internal(_) => {
+            FactError::Retryable(detail)
+        }
+        CausalDispatchError::Rejected { status, .. }
+            if *status >= 500 || matches!(*status, 408 | 429) =>
+        {
+            FactError::Retryable(detail)
+        }
+        CausalDispatchError::Handler(handler) if handler.status_code() >= 500 => {
+            FactError::Retryable(detail)
+        }
+        _ => FactError::Permanent(detail),
+    }
+}
+
+impl<H: CommandHost + 'static> FactSink for CommandFactSink<H> {
+    fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+        Box::pin(async move {
+            let (principal, session, command_id) = self.prepare(fact)?;
+            let result = self
+                .host
+                .invoke(
+                    fact.command(),
+                    &command_id,
+                    fact.input().clone(),
+                    session,
+                    VerifiedPrincipal::from_trusted_transport(&principal),
+                    None,
+                )
+                .await
+                .map_err(classify)?;
+            Ok(FactReceipt {
+                payload: result.payload().clone(),
+                replayed: result.replayed(),
+            })
+        })
+    }
+}
+
+/// Default per-request timeout of [`CelldFactSink`].
+pub const DEFAULT_CELLD_FACT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Facts into celld cells over the internal path.
+pub type CelldFactSink = CommandFactSink<CelldCommandHost>;
+
+impl CommandFactSink<CelldCommandHost> {
+    /// A sink for the cells at `celld_url` under command-ledger
+    /// `service_id`: a remote-only [`CelldCommandHost`] forwarding the fact
+    /// stamp (`x-game-*`).
+    pub fn celld(
+        celld_url: impl Into<String>,
+        secret: InternalHttpSecret,
+        service_id: impl Into<String>,
+        system_principal: impl Into<String>,
+    ) -> Result<Self, String> {
+        Self::celld_with_timeout(
+            celld_url,
+            secret,
+            service_id,
+            system_principal,
+            DEFAULT_CELLD_FACT_TIMEOUT,
+        )
+    }
+
+    /// As [`celld`](Self::celld) with an explicit per-request timeout.
+    pub fn celld_with_timeout(
+        celld_url: impl Into<String>,
+        secret: InternalHttpSecret,
+        service_id: impl Into<String>,
+        system_principal: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        let service_id = service_id.into();
+        let host = CelldCommandHost::remote(celld_url, &service_id, secret, timeout)
+            .map_err(|error| format!("celld command host: {error:?}"))?
+            .forward_session_prefix(SESSION_PREFIX)
+            .map_err(|error| format!("celld command host: {error:?}"))?;
+        Self::new(host, service_id, system_principal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stamp::FactStamp;
+    use serde_json::json;
+
+    const SECRET: &str = "test-only-internal-secret-change-me-2026";
+
+    #[derive(serde::Serialize)]
+    struct Kill {
+        mob: String,
+    }
+    impl FactCommand for Kill {
+        const COMMAND: &'static str = "crawler.record_kill";
+    }
+    #[derive(serde::Serialize)]
+    struct Result_ {
+        match_id: String,
+    }
+    impl FactCommand for Result_ {
+        const COMMAND: &'static str = "match.record_result";
+    }
+
+    fn sink() -> CelldFactSink {
+        CelldFactSink::celld(
+            "http://127.0.0.1:9/",
+            InternalHttpSecret::new(SECRET).unwrap(),
+            "zone-server",
+            "zone:pit-1",
+        )
+        .unwrap()
+        .route(FactRoute::by_principal::<Kill>("crawler"))
+        .route(FactRoute::by_input_field::<Result_>("match", "match_id"))
+        .lifecycle_route("presence")
+    }
+
+    fn fact(command: &str, input: Value, principal: Option<&str>) -> Fact {
+        Fact::trusted(
+            format!("{command}:pit-1:1:0"),
+            command,
+            input,
+            principal.map(str::to_string),
+            FactStamp {
+                zone_id: "pit-1".into(),
+                ..FactStamp::default()
+            },
+        )
+    }
+
+    fn shard(sink: &CelldFactSink, fact: &Fact) -> Option<String> {
+        let (_, session, _) = sink.prepare(fact).ok()?;
+        sink.route_for(fact.command())?
+            .shard(fact.input(), &session)
+    }
+
+    #[test]
+    fn routes_by_command_to_kind_and_shard_with_a_stable_command_id() {
+        let sink = sink();
+        let kill = fact("crawler.record_kill", json!({ "mob": "m1" }), Some("alice"));
+        let (principal, session, id) = sink.prepare(&kill).unwrap();
+        assert_eq!(principal, "alice");
+        assert_eq!(session.user_id(), Some("alice"));
+        assert_eq!(session_stamp(&session).unwrap().zone_id, "pit-1");
+        assert_eq!(id, command_id_for("zone-server", kill.key()));
+        assert_eq!(sink.prepare(&kill).unwrap().2, id, "stable across retries");
+        assert_eq!(sink.route_for(kill.command()).unwrap().kind(), "crawler");
+        assert_eq!(shard(&sink, &kill).as_deref(), Some("alice"));
+
+        let result = fact("match.record_result", json!({ "match_id": "m/7" }), None);
+        assert_eq!(shard(&sink, &result).as_deref(), Some("m/7"));
+        assert_eq!(
+            sink.prepare(&result).unwrap().0,
+            "zone:pit-1",
+            "zone facts use the system principal"
+        );
+        let spaced = fact("match.record_result", json!({ "match_id": "m 7" }), None);
+        assert!(matches!(
+            sink.prepare(&spaced),
+            Err(FactError::Permanent(_))
+        ));
+
+        for command in LIFECYCLE_COMMANDS {
+            let lifecycle = fact(command, json!({ "zone": "pit-1" }), Some("alice"));
+            assert_eq!(sink.route_for(command).unwrap().kind(), "presence");
+            assert_eq!(shard(&sink, &lifecycle).as_deref(), Some("alice"));
+        }
+        let by_zone = FactRoute::by_zone::<Kill>("zone-log");
+        let (_, session, _) = sink.prepare(&kill).unwrap();
+        assert_eq!(
+            by_zone.shard(&json!({}), &session).as_deref(),
+            Some("pit-1")
+        );
+    }
+
+    #[test]
+    fn unknown_commands_and_unroutable_facts_are_permanent() {
+        let sink = sink();
+        let unknown = fact("guild.whatever", json!({}), Some("alice"));
+        assert!(matches!(
+            sink.prepare(&unknown),
+            Err(FactError::Permanent(_))
+        ));
+        let missing = fact("match.record_result", json!({}), None);
+        assert!(matches!(
+            sink.prepare(&missing),
+            Err(FactError::Permanent(_))
+        ));
+    }
+
+    #[test]
+    fn classifies_dispatch_errors() {
+        let retryable = |error| matches!(classify(error), FactError::Retryable(_));
+        assert!(retryable(CausalDispatchError::InProgress));
+        assert!(retryable(CausalDispatchError::Internal("down".into())));
+        assert!(retryable(CausalDispatchError::Rejected {
+            code: "REJECTED",
+            status: 503,
+            message: String::new()
+        }));
+        assert!(retryable(CausalDispatchError::Rejected {
+            code: "REJECTED",
+            status: 429,
+            message: String::new()
+        }));
+        assert!(!retryable(CausalDispatchError::BadRequest("bad".into())));
+        assert!(!retryable(CausalDispatchError::Forbidden));
+        assert!(!retryable(CausalDispatchError::Rejected {
+            code: "UNAUTHORIZED",
+            status: 401,
+            message: String::new()
+        }));
+        assert!(!retryable(CausalDispatchError::Rejected {
+            code: "REJECTED",
+            status: 422,
+            message: String::new()
+        }));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_host_is_retryable() {
+        let sink = sink();
+        let kill = fact("crawler.record_kill", json!({ "mob": "m1" }), Some("alice"));
+        assert!(matches!(
+            sink.commit(&kill).await,
+            Err(FactError::Retryable(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_configuration() {
+        let secret = || InternalHttpSecret::new(SECRET).unwrap();
+        assert!(CelldFactSink::celld("ftp://x", secret(), "s", "p").is_err());
+        assert!(CelldFactSink::celld("http://x", secret(), " ", "p").is_err());
+        assert!(CelldFactSink::celld("http://x", secret(), "s", " ").is_err());
+    }
+}

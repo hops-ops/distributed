@@ -43,7 +43,8 @@ where
     for<'q> Option<&'q str>: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
-    crate::microsvc::cell_host::alarm::reject_alarm_writes(&batch.alarms)?;
+    let mut batch = batch;
+    let schedule_owner = crate::schedule::schedule_owner(&batch)?;
     let prepared = validate_commit_batch(&batch)?;
     for plan in &batch.read_model_plans {
         validate_sql_write_plan(plan).map_err(RepositoryError::from)?;
@@ -101,6 +102,27 @@ where
 
     insert_events_in_tx(&repository.pool, &mut tx, &prepared).await?;
     insert_outbox_messages_in_tx(&mut tx, &batch.outbox_messages).await?;
+    if let Some(owner) = &schedule_owner {
+        // Relative schedules resolve against the database clock, inside the
+        // transaction that stores them.
+        if batch
+            .schedules
+            .iter()
+            .any(|write| matches!(write, crate::schedule::ScheduleWrite::Arm(schedule) if schedule.relative_delay_ms().is_some()))
+        {
+            let now = crate::repository::sql::ledger::now(
+                &mut executor::ConnectionExecutor::<DB>(&mut *tx),
+            )
+            .await?;
+            crate::schedule::resolve_schedule_writes(&mut batch.schedules, now)?;
+        }
+        crate::repository::sql::schedules::apply(
+            &mut executor::ConnectionExecutor::<DB>(&mut *tx),
+            owner,
+            &batch.schedules,
+        )
+        .await?;
+    }
 
     let mut changed_tables = std::collections::BTreeSet::new();
     for plan in batch.read_model_plans {
@@ -592,4 +614,72 @@ where
     }
 
     Ok(versions)
+}
+
+/// SQL stores schedules but does not dispatch them yet (the schedule worker
+/// is a later addition); its clock is the database clock.
+impl<DB> crate::microsvc::BackendHost for SqlxRepository<DB>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    fn capabilities(&self) -> crate::schedule::Capabilities {
+        crate::schedule::Capabilities {
+            scheduling: false,
+            clock: true,
+        }
+    }
+
+    fn host_now(&self) -> impl Future<Output = Result<SystemTime, RepositoryError>> + Send + '_ {
+        async move {
+            let mut connection =
+                self.pool.acquire().await.map_err(|err| {
+                    repository_storage_error::<DB>("acquire clock connection", err)
+                })?;
+            crate::repository::sql::ledger::now(&mut executor::ConnectionExecutor::<DB>(
+                &mut *connection,
+            ))
+            .await
+            .map_err(|error| match error {
+                CommandLedgerError::Storage(error) => error,
+                other => RepositoryError::Model(other.to_string()),
+            })
+        }
+    }
+}
+
+impl<DB> SqlxRepository<DB>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    /// Armed schedules of the aggregate stream `owner`, earliest first.
+    pub async fn armed_schedules(
+        &self,
+        owner: &crate::StreamIdentity,
+    ) -> Result<Vec<crate::schedule::ArmedSchedule>, RepositoryError> {
+        let mut connection =
+            self.pool.acquire().await.map_err(|err| {
+                repository_storage_error::<DB>("acquire schedule connection", err)
+            })?;
+        crate::repository::sql::schedules::armed(
+            &mut executor::ConnectionExecutor::<DB>(&mut *connection),
+            owner,
+        )
+        .await
+    }
 }

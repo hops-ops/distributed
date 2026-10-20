@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime};
 
 pub(crate) mod ledger;
 pub(crate) mod outbox;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) mod schedules;
 
 use crate::entity::{Entity, EventRecord, BITCODE_PAYLOAD_CODEC};
 use crate::snapshot::SnapshotRecord;

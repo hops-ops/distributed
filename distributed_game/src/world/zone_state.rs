@@ -589,13 +589,7 @@ pub mod celld_worker {
                         ::worker::console_error!("superseded zone-state blob {key}: {error}");
                     }
                 }
-                json_status(
-                    json!({
-                        "payload": dispatch.payload(),
-                        "receipt": { "commandId": dispatch.command_id(), "replayed": dispatch.replayed() },
-                    }),
-                    200,
-                )
+                json_status(dispatch.wait_path_wire(), 200)
             }
             Err(error) => {
                 if let CellDispatchError::Internal(message) = &error {

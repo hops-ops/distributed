@@ -3,9 +3,10 @@
 //!
 //! - [`MobPitFactSink`] is the game's `FactSink`: optional artificial
 //!   latency (the "slow storage" toggle), then
-//!   `distributed_game::celld::CelldFactSink` sends the fact over the
-//!   internal path to its cell — `crawler.record_kill` to
-//!   `crawler/{principal}` (`CelldFactRoute::by_principal`), the runtime's
+//!   `distributed_game::celld::CelldFactSink` (the command fact sink over a
+//!   remote-only celld command host) sends the fact over the internal path
+//!   to its cell — `crawler.record_kill` to `crawler/{principal}`
+//!   (`FactRoute::by_principal`), the runtime's
 //!   player lifecycle facts to `presence/{principal}` (`lifecycle_route`) —
 //!   then a fire-and-forget leaderboard update. The command id comes from
 //!   the fact key, so a retry replays through the cell's command ledger
@@ -26,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
-use distributed_game::celld::{CelldFactRoute, CelldFactSink};
+use distributed_game::celld::{CelldFactSink, FactRoute};
 use distributed_game::lifecycle::Lifecycle;
 use distributed_game::{BoxFuture, Fact, FactError, FactReceipt, FactSink};
 use serde::{Deserialize, Serialize};
@@ -249,15 +250,13 @@ impl MobPitFactSink {
         board: Arc<Leaderboards>,
         presence: Arc<Presence>,
     ) -> Result<Self, String> {
-        let sink = CelldFactSink::new(
+        let sink = CelldFactSink::celld(
             celld.url.clone(),
             celld.secret.clone(),
             SERVICE_ID,
             SYSTEM_PRINCIPAL,
         )?
-        .route(CelldFactRoute::by_principal::<RecordKillInput>(
-            CRAWLER_KIND,
-        ))
+        .route(FactRoute::by_principal::<RecordKillInput>(CRAWLER_KIND))
         .lifecycle_route(PRESENCE_KIND);
         Ok(Self {
             celld: sink,

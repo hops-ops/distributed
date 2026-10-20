@@ -1,7 +1,8 @@
-//! Re-armable cell alarms on the in-process reference host, driven by a
+//! Schedules on the in-process reference cell host, driven by a
 //! `ManualClock`. The same command/ledger/settlement path runs on celld; only
 //! the wake source differs (Durable Object alarm vs. the test calling
-//! `fire_due_alarms`).
+//! `fire_due_schedules`). Also: schedule rows on the in-memory repository,
+//! `ctx.now()`, and the capability check at registration.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
@@ -9,16 +10,17 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::super::{
-    cell_alarm_guard, cell_alarm_session, AggregateCell, CellAlarm, CellAlarmWrite,
-    CellCommandIdentity, CellStreamStore, CELL_ALARM_RETRY_BASE,
-};
+use super::super::{AggregateCell, CellCommandIdentity, CellStreamStore};
 use super::owner_session;
 use crate::command::{typed_command, PreparedCommand, Succeeded};
 use crate::entity::Entity;
 use crate::microsvc::service::{CausalCommandContext, PortableCommand, Routes};
 use crate::microsvc::HandlerError;
 use crate::repository::{CommitBatch, StreamIdentity, TransactionalCommit};
+use crate::schedule::{
+    schedule_guard, schedule_session, Capability, Schedule, ScheduleWrite, HOST_NOW_CLAIM,
+    SCHEDULE_RETRY_BASE,
+};
 use crate::{sourced, Clock, InMemoryRepository, ManualClock};
 
 #[derive(Clone, Default, Serialize, Deserialize, crate::Snapshot)]
@@ -62,6 +64,8 @@ struct TickInput {
 struct TickerPayload {
     id: String,
     ticks: u32,
+    /// `ctx.now()` of the start command (epoch ms), 0 otherwise.
+    started_at_ms: u64,
 }
 
 const TICK: &str = "ticker.tick";
@@ -76,6 +80,8 @@ where
             .typed_command(typed_command::<StartInput, Succeeded<TickerPayload>>(
                 "ticker.start",
             ))
+            .requires(Capability::Scheduling)
+            .requires(Capability::Clock)
             .guarded(
                 |ctx: &CausalCommandContext<'_, Ticker>| ctx.session().user_id().is_some(),
                 handle_start,
@@ -92,8 +98,8 @@ async fn handle_start(
     ticker
         .start(input.id.clone(), input.limit, input.period_ms)
         .map_err(|error| HandlerError::Rejected(error.to_string()))?;
-    ctx.arm_alarm(
-        CellAlarm::after(
+    ctx.schedule(
+        Schedule::after(
             "tick",
             Duration::from_millis(input.period_ms),
             &input.tick_command,
@@ -106,9 +112,14 @@ async fn handle_start(
     if input.fail_after_arming {
         return Err(HandlerError::Rejected("start refused after arming".into()));
     }
+    let started_at_ms = ctx
+        .now()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
     repo.commit(ticker)?.succeeded(TickerPayload {
         id: input.id,
         ticks: 0,
+        started_at_ms,
     })
 }
 
@@ -120,7 +131,8 @@ where
     fn install(self, routes: Routes<D>) -> Routes<D> {
         routes
             .typed_command(typed_command::<TickInput, Succeeded<TickerPayload>>(TICK))
-            .guarded(cell_alarm_guard::<Ticker>, handle_tick)
+            .requires(Capability::Scheduling)
+            .guarded(schedule_guard::<Ticker>, handle_tick)
     }
 }
 
@@ -138,9 +150,10 @@ async fn handle_tick(
         .map_err(|error| HandlerError::Rejected(error.to_string()))?;
     if ticker.ticks < ticker.limit {
         // Re-arm from the fired due time, not wall time: no drift.
-        let due = ctx.alarm_due().expect("alarm session") + Duration::from_millis(ticker.period_ms);
-        ctx.arm_alarm(
-            CellAlarm::at("tick", due, TICK, &input)
+        let due = ctx.scheduled_due().expect("schedule session")
+            + Duration::from_millis(ticker.period_ms);
+        ctx.schedule(
+            Schedule::at("tick", due, TICK, &input)
                 .map_err(|error| HandlerError::Rejected(error.to_string()))?,
         )?;
     }
@@ -148,6 +161,7 @@ async fn handle_tick(
     repo.commit(ticker)?.succeeded(TickerPayload {
         id: input.id,
         ticks,
+        started_at_ms: 0,
     })
 }
 
@@ -161,6 +175,7 @@ where
             .typed_command(typed_command::<TickInput, Succeeded<TickerPayload>>(
                 "ticker.stop",
             ))
+            .requires(Capability::Scheduling)
             .guarded(
                 |ctx: &CausalCommandContext<'_, Ticker>| ctx.session().user_id().is_some(),
                 handle_stop,
@@ -177,11 +192,12 @@ async fn handle_stop(
         .get(&input.id)
         .await?
         .ok_or_else(|| HandlerError::Rejected("no ticker".into()))?;
-    ctx.cancel_alarm("tick")?;
+    ctx.cancel_schedule("tick")?;
     let ticks = ticker.ticks;
     repo.commit(ticker)?.succeeded(TickerPayload {
         id: input.id,
         ticks,
+        started_at_ms: 0,
     })
 }
 
@@ -214,7 +230,8 @@ where
             .typed_command(typed_command::<TickInput, Succeeded<TickerPayload>>(
                 "ticker.flaky",
             ))
-            .guarded(cell_alarm_guard::<Ticker>, handle_flaky)
+            .requires(Capability::Scheduling)
+            .guarded(schedule_guard::<Ticker>, handle_flaky)
     }
 }
 
@@ -276,17 +293,17 @@ async fn alarm_commits_with_the_events_and_is_absent_when_the_command_fails() {
         )
         .await;
     assert!(refused.is_err());
-    assert!(cell.armed_alarms().unwrap().is_empty());
+    assert!(cell.armed_schedules().unwrap().is_empty());
     assert!(cell.load().await.unwrap().is_none());
 
     start(&cell, json!({ "id": "t1", "limit": 1, "period_ms": 1000, "fail_after_arming": false, "tick_command": "ticker.tick" })).await;
-    let armed = cell.armed_alarms().unwrap();
+    let armed = cell.armed_schedules().unwrap();
     assert_eq!(armed.len(), 1);
     assert_eq!(armed[0].name, "tick");
     assert_eq!(armed[0].command, TICK);
     assert_eq!(armed[0].generation, 1);
     assert_eq!(
-        cell.next_alarm_due().unwrap(),
+        cell.next_schedule_due().unwrap(),
         Some(clock.now() + Duration::from_millis(1000)),
         "a relative alarm resolves against the cell clock at commit"
     );
@@ -299,16 +316,16 @@ async fn alarm_fires_once_per_arm_with_the_trusted_session() {
     start(&cell, json!({ "id": "t1", "limit": 1, "period_ms": 1000, "fail_after_arming": false, "tick_command": "ticker.tick" })).await;
 
     clock.advance(Duration::from_millis(999));
-    assert!(cell.fire_due_alarms().await.unwrap().is_empty());
+    assert!(cell.fire_due_schedules().await.unwrap().is_empty());
     clock.advance(Duration::from_millis(1));
-    let report = cell.fire_due_alarms().await.unwrap();
+    let report = cell.fire_due_schedules().await.unwrap();
     assert_eq!(report.fired.len(), 1);
     assert!(!report.fired[0].replayed);
     assert_eq!(report.fired[0].payload["ticks"], 1);
     clock.advance(Duration::from_secs(60));
-    assert!(cell.fire_due_alarms().await.unwrap().is_empty());
+    assert!(cell.fire_due_schedules().await.unwrap().is_empty());
     assert_eq!(ticks(&cell).await, 1);
-    assert!(cell.armed_alarms().unwrap().is_empty());
+    assert!(cell.armed_schedules().unwrap().is_empty());
 
     // The alarm-only command refuses ordinary callers.
     let forged = cell
@@ -328,21 +345,21 @@ async fn rearming_in_the_handler_ticks_one_hundred_times_without_drift() {
     let clock = clock();
     let cell = ticker_cell(&clock);
     start(&cell, json!({ "id": "t1", "limit": 100, "period_ms": 1000, "fail_after_arming": false, "tick_command": "ticker.tick" })).await;
-    let first_due = cell.next_alarm_due().unwrap().unwrap();
+    let first_due = cell.next_schedule_due().unwrap().unwrap();
     for tick in 1..=100u64 {
         let expected_due = first_due + Duration::from_millis((tick - 1) * 1000);
-        assert_eq!(cell.next_alarm_due().unwrap(), Some(expected_due));
+        assert_eq!(cell.next_schedule_due().unwrap(), Some(expected_due));
         // Wake late; the next tick still re-arms from the due time.
         clock.set(expected_due + Duration::from_millis(250));
-        let report = cell.fire_due_alarms().await.unwrap();
+        let report = cell.fire_due_schedules().await.unwrap();
         assert_eq!(report.fired.len(), 1, "tick {tick}");
         assert_eq!(report.fired[0].generation, tick);
         assert!(report.failed.is_empty() && report.retried.is_empty());
     }
     assert_eq!(ticks(&cell).await, 100);
-    assert!(cell.armed_alarms().unwrap().is_empty());
+    assert!(cell.armed_schedules().unwrap().is_empty());
     clock.advance(Duration::from_secs(3600));
-    assert!(cell.fire_due_alarms().await.unwrap().is_empty());
+    assert!(cell.fire_due_schedules().await.unwrap().is_empty());
     assert_eq!(ticks(&cell).await, 100);
 }
 
@@ -354,22 +371,22 @@ async fn a_fired_command_that_committed_before_settlement_replays_instead_of_rer
     clock.advance(Duration::from_secs(1));
 
     // Crash window: the alarm command committed but its row was not settled.
-    let alarm = cell.armed_alarms().unwrap().remove(0);
+    let alarm = cell.armed_schedules().unwrap().remove(0);
     cell.dispatch_idempotent(
         &alarm.command,
         &alarm.command_identity().unwrap(),
         alarm.input.clone(),
-        cell_alarm_session(&alarm),
+        schedule_session(&alarm),
     )
     .await
     .unwrap();
     assert_eq!(ticks(&cell).await, 1);
 
-    let report = cell.fire_due_alarms().await.unwrap();
+    let report = cell.fire_due_schedules().await.unwrap();
     assert_eq!(report.fired.len(), 1);
     assert!(report.fired[0].replayed, "the ledger replays the receipt");
     assert_eq!(ticks(&cell).await, 1, "the handler did not run twice");
-    assert!(cell.armed_alarms().unwrap().is_empty());
+    assert!(cell.armed_schedules().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -385,9 +402,9 @@ async fn cancel_disarms_and_rejections_are_terminal() {
     )
     .await
     .unwrap();
-    assert!(cell.armed_alarms().unwrap().is_empty());
+    assert!(cell.armed_schedules().unwrap().is_empty());
     clock.advance(Duration::from_secs(10));
-    assert!(cell.fire_due_alarms().await.unwrap().is_empty());
+    assert!(cell.fire_due_schedules().await.unwrap().is_empty());
 
     let other = ticker_cell(&clock);
     start(
@@ -396,11 +413,11 @@ async fn cancel_disarms_and_rejections_are_terminal() {
     )
     .await;
     clock.advance(Duration::from_secs(1));
-    let report = other.fire_due_alarms().await.unwrap();
+    let report = other.fire_due_schedules().await.unwrap();
     assert!(report.fired.is_empty());
     assert_eq!(report.failed.len(), 1);
     assert_eq!(report.failed[0].code, "BAD_REQUEST");
-    assert!(other.armed_alarms().unwrap().is_empty());
+    assert!(other.armed_schedules().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -414,23 +431,23 @@ async fn retryable_failures_back_off_and_then_fire() {
     )
     .await;
     clock.advance(Duration::from_secs(1));
-    let first = cell.fire_due_alarms().await.unwrap();
+    let first = cell.fire_due_schedules().await.unwrap();
     assert_eq!(first.retried.len(), 1);
     assert_eq!(first.retried[0].code, "INTERNAL");
-    let armed = cell.armed_alarms().unwrap();
+    let armed = cell.armed_schedules().unwrap();
     assert_eq!(armed[0].attempts, 1);
-    assert_eq!(armed[0].due(), clock.now() + CELL_ALARM_RETRY_BASE);
+    assert_eq!(armed[0].due(), clock.now() + SCHEDULE_RETRY_BASE);
 
-    clock.advance(CELL_ALARM_RETRY_BASE);
-    let second = cell.fire_due_alarms().await.unwrap();
+    clock.advance(SCHEDULE_RETRY_BASE);
+    let second = cell.fire_due_schedules().await.unwrap();
     assert_eq!(second.retried.len(), 1);
     assert_eq!(
-        cell.armed_alarms().unwrap()[0].due(),
-        clock.now() + CELL_ALARM_RETRY_BASE * 2,
+        cell.armed_schedules().unwrap()[0].due(),
+        clock.now() + SCHEDULE_RETRY_BASE * 2,
         "backoff doubles"
     );
-    clock.advance(CELL_ALARM_RETRY_BASE * 2);
-    let third = cell.fire_due_alarms().await.unwrap();
+    clock.advance(SCHEDULE_RETRY_BASE * 2);
+    let third = cell.fire_due_schedules().await.unwrap();
     assert_eq!(third.fired.len(), 1);
     assert_eq!(ticks(&cell).await, 1);
 }
@@ -446,19 +463,61 @@ async fn armed_alarms_survive_a_reference_host_restart() {
     let restarted = ticker_cell(&clock);
     restarted.restore_durable_state(exported).unwrap();
     clock.advance(Duration::from_secs(1));
-    assert_eq!(restarted.fire_due_alarms().await.unwrap().fired.len(), 1);
+    assert_eq!(restarted.fire_due_schedules().await.unwrap().fired.len(), 1);
     clock.advance(Duration::from_secs(1));
-    assert_eq!(restarted.fire_due_alarms().await.unwrap().fired.len(), 1);
+    assert_eq!(restarted.fire_due_schedules().await.unwrap().fired.len(), 1);
     assert_eq!(ticks(&restarted).await, 2);
 }
 
 #[tokio::test]
-async fn repositories_without_an_alarm_slot_reject_alarm_writes() {
-    let repo = InMemoryRepository::new();
-    let mut batch = CommitBatch::empty();
-    batch.alarms.push(CellAlarmWrite::Cancel("tick".into()));
-    let error = repo.commit_batch(batch).await.unwrap_err();
-    assert!(error.to_string().contains("aggregate cell"), "{error}");
+async fn the_in_memory_repository_stores_schedules_with_their_one_owner() {
+    let clock = clock();
+    let repo = InMemoryRepository::new().with_clock(clock.clone());
+    let owner = StreamIdentity::new("Ticker", "t9").unwrap();
+    let mut ticker = Ticker::default();
+    ticker.start("t9".into(), 1, 1000).unwrap();
+    let mut batch = CommitBatch::new(vec![crate::repository::StreamWrite::new(
+        owner.clone(),
+        &mut ticker.entity,
+    )]);
+    batch.schedules.push(ScheduleWrite::Arm(
+        Schedule::after(
+            "tick",
+            Duration::from_secs(5),
+            TICK,
+            &TickInput { id: "t9".into() },
+        )
+        .unwrap(),
+    ));
+    repo.commit_batch(batch).await.unwrap();
+    let armed = repo.armed_schedules(&owner).unwrap();
+    assert_eq!(armed.len(), 1);
+    assert_eq!(armed[0].generation, 1);
+    assert_eq!(
+        armed[0].due(),
+        clock.now() + Duration::from_secs(5),
+        "a relative schedule resolves against the repository clock"
+    );
+
+    // A schedule needs exactly one owning stream.
+    let mut orphan = CommitBatch::empty();
+    orphan.schedules.push(ScheduleWrite::Cancel("tick".into()));
+    let error = repo.commit_batch(orphan).await.unwrap_err();
+    assert!(
+        error.to_string().contains("exactly one aggregate"),
+        "{error}"
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "command `ticker.start` requires scheduling that its backend does not provide"
+)]
+fn a_scheduling_route_on_a_backend_that_cannot_dispatch_fails_at_registration() {
+    let routes = Routes::new().with_repo(crate::aggregate::AggregateRepository::new(
+        InMemoryRepository::new(),
+    ));
+    let _ = Start.install(routes);
 }
 
 #[tokio::test]
@@ -466,8 +525,8 @@ async fn handlers_see_the_cell_clock_and_callers_cannot_forge_it() {
     let clock = clock();
     let cell = ticker_cell(&clock);
     let mut forged = owner_session();
-    forged.set(super::super::CELL_NOW_CLAIM, "1");
-    cell.dispatch_idempotent(
+    forged.set(HOST_NOW_CLAIM, "1");
+    let started = cell.dispatch_idempotent(
         "ticker.start",
         &identity("0190a000-0000-7000-8000-000000000009"),
         json!({ "id": "t1", "limit": 1, "period_ms": 1000, "fail_after_arming": false, "tick_command": "ticker.tick" }),
@@ -475,16 +534,21 @@ async fn handlers_see_the_cell_clock_and_callers_cannot_forge_it() {
     )
     .await
     .unwrap();
+    assert_eq!(
+        started.payload()["started_at_ms"],
+        START_MS,
+        "ctx.now() is the cell clock, not the forged claim"
+    );
     // `after(period)` resolved by the cell clock, not the forged claim.
     assert_eq!(
-        cell.next_alarm_due().unwrap(),
+        cell.next_schedule_due().unwrap(),
         Some(clock.now() + Duration::from_millis(1000))
     );
     let mut session = crate::microsvc::Session::new();
-    assert_eq!(super::super::cell_now(&session), None);
-    session.set(super::super::CELL_NOW_CLAIM, "1234");
+    assert_eq!(crate::schedule::host_now(&session), None);
+    session.set(HOST_NOW_CLAIM, "1234");
     assert_eq!(
-        super::super::cell_now(&session),
+        crate::schedule::host_now(&session),
         Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1234))
     );
 }

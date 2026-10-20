@@ -59,6 +59,8 @@ pub mod celld;
 pub mod claims;
 pub mod clock;
 pub mod codec;
+#[cfg(feature = "command-host")]
+pub mod command_sink;
 pub mod entity;
 pub mod facts;
 pub mod handoff;

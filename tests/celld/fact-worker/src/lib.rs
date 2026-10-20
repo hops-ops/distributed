@@ -299,13 +299,7 @@ where
         worker::console_error!("post-commit drain deferred: {error}");
     }
     match result {
-        Ok(dispatch) => json_status(
-            json!({
-                "payload": dispatch.payload(),
-                "receipt": { "commandId": dispatch.command_id(), "replayed": dispatch.replayed() },
-            }),
-            200,
-        ),
+        Ok(dispatch) => json_status(dispatch.wait_path_wire(), 200),
         Err(error) => error_response(error),
     }
 }
@@ -344,7 +338,7 @@ where
                 .map(|event| event.event_name.clone())
                 .collect::<Vec<_>>();
             let armed = cell
-                .armed_alarms()
+                .armed_schedules()
                 .map_err(|error| Error::RustError(error.to_string()))?
                 .len();
             json_status(
@@ -457,7 +451,7 @@ impl DurableObject for ZoneLeaseCell {
             .alarm(&self.env)
             .await
             .map_err(|error| Error::RustError(error.to_string()))?;
-        for failed in wake.alarms.failed.iter().chain(&wake.alarms.retried) {
+        for failed in wake.schedules.failed.iter().chain(&wake.schedules.retried) {
             worker::console_error!("lease alarm failed: {} {}", failed.code, failed.message);
         }
         Response::ok("ok")

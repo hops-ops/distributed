@@ -182,7 +182,7 @@ impl<'a, R> CommitBuilder<'a, R> {
                 read_model_plans: self.read_model_plans,
                 snapshots: Vec::new(),
                 inbox_receipts: Vec::new(),
-                alarms: Vec::new(),
+                schedules: Vec::new(),
             })
             .await
     }

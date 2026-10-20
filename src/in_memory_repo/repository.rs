@@ -62,6 +62,12 @@ pub struct InMemoryRepository {
     pub(super) projection_change_retention: ProjectionChangeRetention,
     #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
     causal_storage_identity: CausalStorageIdentity,
+    /// Schedule rows per owning stream (`storage_key`), committed with the
+    /// owner's events. Stored, not dispatched: no
+    /// [`Capability::Scheduling`](crate::schedule::Capability::Scheduling).
+    schedules: Arc<RwLock<HashMap<String, crate::schedule::MemorySchedules>>>,
+    /// The store clock: `ctx.now()` and relative schedules.
+    clock: Arc<dyn crate::Clock>,
 }
 
 /// In-memory outbox table handle.
@@ -93,7 +99,30 @@ impl InMemoryRepository {
             causal_tables,
             projection_change_retention: ProjectionChangeRetention::default(),
             causal_storage_identity: CausalStorageIdentity::new(),
+            schedules: Arc::new(RwLock::new(HashMap::new())),
+            clock: Arc::new(crate::SystemClock),
         }
+    }
+
+    /// Use `clock` as the store clock (`ctx.now()`, relative schedules),
+    /// e.g. a [`ManualClock`](crate::ManualClock) in tests.
+    pub fn with_clock(mut self, clock: impl crate::Clock + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    /// Armed schedules of the aggregate stream `owner`, earliest first.
+    pub fn armed_schedules(
+        &self,
+        owner: &StreamIdentity,
+    ) -> Result<Vec<crate::schedule::ArmedSchedule>, RepositoryError> {
+        Ok(self
+            .schedules
+            .read()
+            .map_err(|_| RepositoryError::LockPoisoned("schedule read"))?
+            .get(&owner.storage_key())
+            .map(crate::schedule::MemorySchedules::armed)
+            .unwrap_or_default())
     }
 
     /// Configure the maximum newest projection changes retained per partition.
@@ -296,7 +325,9 @@ impl InMemoryRepository {
         mut completion: Option<CommandCompletion>,
         direct_projection: Option<SameTransactionProjectionBatch>,
     ) -> Result<(), InMemoryCommitError> {
-        crate::microsvc::cell_host::alarm::reject_alarm_writes(&batch.alarms)?;
+        let mut batch = batch;
+        let schedule_owner = crate::schedule::schedule_owner(&batch)?;
+        crate::schedule::resolve_schedule_writes(&mut batch.schedules, self.clock.now())?;
         let prepared = validate_commit_batch(&batch)?;
         if let Some(direct_projection) = &direct_projection {
             direct_projection.validate()?;
@@ -496,7 +527,29 @@ impl InMemoryRepository {
             })
             .transpose()?;
 
+        // Schedules: plan on a copy of the owner's table (may fail), install
+        // with the other writes below.
+        let mut schedule_storage = self
+            .schedules
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("schedule write"))?;
+        let planned_schedules = match &schedule_owner {
+            Some(owner) => Some((
+                owner.storage_key(),
+                schedule_storage
+                    .get(&owner.storage_key())
+                    .cloned()
+                    .unwrap_or_default()
+                    .plan(&batch.schedules)?,
+            )),
+            None => None,
+        };
+
         // Nothing below can fail: mutate the live stores.
+        if let Some((owner, planned)) = planned_schedules {
+            schedule_storage.insert(owner, planned);
+        }
+        drop(schedule_storage);
         for append in prepared {
             storage
                 .entry(append.identity.storage_key())
@@ -848,8 +901,11 @@ impl ReadModelWritePlanStore for InMemoryRepository {
 }
 
 impl RelationalReadModelQueryStore for InMemoryRepository {
-    fn scan_read_model(&self, request: crate::read_model::ReadModelScanRequest)
-        -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_ {
+    fn scan_read_model(
+        &self,
+        request: crate::read_model::ReadModelScanRequest,
+    ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_
+    {
         self.model_store.scan_read_model(request)
     }
 
@@ -1087,5 +1143,22 @@ mod tests {
         assert!(!repo.inbox_contains("proj", "m1"));
         assert!(!repo.inbox_contains("proj", "m2"));
         assert_eq!(repo.clear_inbox(), 0);
+    }
+}
+
+/// Stores schedules, does not dispatch them (no worker yet); the store clock
+/// is the injected [`Clock`](crate::Clock).
+impl crate::microsvc::BackendHost for InMemoryRepository {
+    fn capabilities(&self) -> crate::schedule::Capabilities {
+        crate::schedule::Capabilities {
+            scheduling: false,
+            clock: true,
+        }
+    }
+
+    fn host_now(
+        &self,
+    ) -> impl Future<Output = Result<std::time::SystemTime, RepositoryError>> + Send + '_ {
+        std::future::ready(Ok(self.clock.now()))
     }
 }

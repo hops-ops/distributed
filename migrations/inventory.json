@@ -132,6 +132,18 @@
         "path": "migrations/postgres/0011_cell_alarms.sql",
         "sha256": "572da24fac96e56263b5dfdf17be26d99f7a330de5585325ba091a4fe3e6caf8"
       }
+    },
+    {
+      "version": 12,
+      "description": "aggregate schedules",
+      "sqlite": {
+        "path": "migrations/sqlite/0012_aggregate_schedules.sql",
+        "sha256": "7b95a6a81e9595916b65170c22404f78da3639bce5f51bdf4f2693677629848d"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0012_aggregate_schedules.sql",
+        "sha256": "e56147e54924aadac88619ab722f005bbf127f3c009d0cdf80f7ee69b1c2823f"
+      }
     }
   ]
 }

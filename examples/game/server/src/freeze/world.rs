@@ -36,7 +36,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use distributed_game::celld::{CelldFactRoute, CelldFactSink};
+use distributed_game::celld::{CelldFactSink, FactRoute};
 use distributed_game::net::peer::{post_json, ADMIN_SECRET_HEADER};
 use distributed_game::net::{
     GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey, WorldCoordinator, ZoneFactory,
@@ -70,18 +70,14 @@ pub struct FreezeFactSink {
 impl FreezeFactSink {
     /// Sink into the cells at `celld`.
     pub fn new(celld: &CelldOptions) -> Result<Self, String> {
-        let sink = CelldFactSink::new(
+        let sink = CelldFactSink::celld(
             celld.url.clone(),
             celld.secret.clone(),
             SERVICE_ID,
             SYSTEM_PRINCIPAL,
         )?
-        .route(CelldFactRoute::by_principal::<GemCollected>("gem-pouch"))
-        .route(CelldFactRoute::new(
-            <ContentApplied as distributed_game::FactCommand>::COMMAND,
-            "content-log",
-            |fact, _| Some(fact.stamp().zone_id.clone()),
-        ));
+        .route(FactRoute::by_principal::<GemCollected>("gem-pouch"))
+        .route(FactRoute::by_zone::<ContentApplied>("content-log"));
         Ok(Self {
             celld: sink,
             settled: Arc::default(),

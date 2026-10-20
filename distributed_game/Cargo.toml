@@ -16,9 +16,13 @@ default = []
 runtime = ["dep:tokio"]
 # Adapter that commits facts into a `distributed` AggregateCell.
 cell = ["dep:distributed", "dep:sha2", "dep:base64"]
-# `celld::CelldFactSink`: a zone server's facts sent to celld cells over the
-# internal HTTP path (routes by command; stable command ids; no local store).
-celld = ["cell", "dep:reqwest", "dep:uuid"]
+# `command_sink::CommandFactSink<H: CommandHost>`: facts dispatched as
+# commands through any command host (a local service over any repository,
+# or celld cells).
+command-host = ["cell", "distributed/graphql"]
+# celld clients: `CelldFactSink` (the command sink over a remote-only
+# `CelldCommandHost`), `CellZoneOwnership`, `CellZoneStateStore`.
+celld = ["cell", "command-host", "dep:reqwest", "dep:uuid"]
 # celld worker glue (wasm32 Durable Objects): `world::zone_state::worker`,
 # the zone-state HTTP surface over a cell and an R2 bucket binding.
 workers-rs = ["cell", "dep:worker", "distributed/workers-rs"]
@@ -88,6 +92,11 @@ required-features = ["cell"]
 name = "zone_state"
 path = "tests/zone_state/main.rs"
 required-features = ["cell"]
+
+[[test]]
+name = "command_facts"
+path = "tests/command_facts/main.rs"
+required-features = ["command-host"]
 
 [[test]]
 name = "zone_status"

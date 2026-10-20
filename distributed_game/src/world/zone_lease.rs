@@ -6,32 +6,35 @@
 //!
 //! | Command | Effect | Outward event |
 //! |---|---|---|
-//! | `zone_lease.acquire` | new holder, token + 1, alarm at expiry | `zone.activated` |
-//! | `zone_lease.renew` | later expiry, alarm re-armed | none (no heartbeat events) |
-//! | `zone_lease.release` | no holder, alarm cancelled | `zone.released` |
-//! | `zone_lease.expire` (alarm only) | no holder, if still expired | `zone.lease_expired` |
+//! | `zone_lease.acquire` | new holder, token + 1, expiry scheduled | `zone.activated` |
+//! | `zone_lease.renew` | later expiry, expiry rescheduled | none (no heartbeat events) |
+//! | `zone_lease.release` | no holder, expiry cancelled | `zone.released` |
+//! | `zone_lease.expire` (schedule only) | no holder, if still expired | `zone.lease_expired` |
 //!
 //! Outward events carry the lease's post-transition [`ZoneLeaseStatus`]
 //! (zone, holder, token, `active` / `released` / `expired`); the
 //! [`zone_status`](super::zone_status) read model projects them.
 //!
 //! Fencing tokens increase on every acquisition and are never reset. Expiry
-//! is declared by the cell's alarm ([`distributed::cell_host::CellAlarm`]):
-//! the alarm handler re-reads the lease and expires it only when the
-//! holder's expiry has passed by the cell clock, so a renewal that races the
-//! alarm never produces a false expiry. All times are the cell's clock
-//! (`ctx.cell_now()`), never the caller's.
+//! is declared by a schedule ([`distributed::schedule::Schedule`]): the
+//! expiry command re-reads the lease and expires it only when the holder's
+//! expiry has passed by the host clock, so a renewal that races it never
+//! produces a false expiry. All times are the host's clock (`ctx.now()`),
+//! never the caller's. The commands declare `Capability::Scheduling` and
+//! `Capability::Clock`: they mount on aggregate cells (celld; the reference
+//! host in tests) and on any backend that dispatches schedules.
 //!
 //! Callers must hold the `zone-host` role (an internal identity; the
 //! commands are not routed through the public GraphQL edge).
 
 use std::time::{Duration, SystemTime};
 
-use distributed::cell_host::{cell_alarm_guard, AggregateCell, CellAlarm};
+use distributed::cell_host::AggregateCell;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
 };
+use distributed::schedule::{schedule_guard, Capability, Schedule};
 use distributed::{sourced, Entity};
 use serde::{Deserialize, Serialize};
 
@@ -51,7 +54,7 @@ pub const EXPIRE: &str = "zone_lease.expire";
 pub const HELD_PREFIX: &str = "held:";
 /// Rejection message when a claim is no longer the live one.
 pub const LOST: &str = "lost";
-/// The expiry alarm's name.
+/// The expiry schedule's name.
 pub const EXPIRY_ALARM: &str = "expiry";
 
 /// [`ZoneLeaseStatus::status`] of a held lease.
@@ -188,7 +191,7 @@ pub struct ReleaseInput {
     pub token: u64,
 }
 
-/// `zone_lease.expire` input (armed by the cell itself).
+/// `zone_lease.expire` input (scheduled by the lease itself).
 #[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 pub struct ExpireInput {
     pub zone_id: String,
@@ -203,7 +206,7 @@ pub struct ClaimPayload {
     pub expires_at_ms: u64,
 }
 
-/// What an expiry alarm did.
+/// What an expiry schedule did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, distributed::CommandOutput)]
 pub struct ExpiryPayload {
     pub expired: bool,
@@ -233,10 +236,10 @@ fn is_zone_host(ctx: &CausalCommandContext<'_, ZoneLease>) -> bool {
 }
 
 fn now_ms(ctx: &CausalCommandContext<'_, ZoneLease>) -> Result<u64, HandlerError> {
-    ctx.cell_now()
-        .and_then(|now| now.duration_since(SystemTime::UNIX_EPOCH).ok())
+    ctx.now()?
+        .duration_since(SystemTime::UNIX_EPOCH)
         .map(|now| now.as_millis() as u64)
-        .ok_or_else(|| rejected("zone leases run only in an aggregate cell"))
+        .map_err(|_| rejected("host clock is before the Unix epoch"))
 }
 
 fn ttl(ttl_ms: u64) -> Result<u64, HandlerError> {
@@ -253,8 +256,8 @@ fn validate(zone_id: &str, holder: &str) -> Result<(), HandlerError> {
     Ok(())
 }
 
-fn expiry_alarm(zone_id: &str, expires_at_ms: u64) -> Result<CellAlarm, HandlerError> {
-    CellAlarm::at(
+fn expiry_schedule(zone_id: &str, expires_at_ms: u64) -> Result<Schedule, HandlerError> {
+    Schedule::at(
         EXPIRY_ALARM,
         SystemTime::UNIX_EPOCH + Duration::from_millis(expires_at_ms),
         EXPIRE,
@@ -288,7 +291,7 @@ async fn handle_acquire(
             };
             return repo.commit(lease)?.succeeded(claim);
         }
-        // Held until the expiry alarm declares otherwise.
+        // Held until the expiry schedule declares otherwise.
         Some(holder) => return Err(rejected(format!("{HELD_PREFIX}{holder}"))),
         None => {}
     }
@@ -302,7 +305,7 @@ async fn handle_acquire(
             expires_at_ms,
         )
         .map_err(rejected)?;
-    ctx.arm_alarm(expiry_alarm(&input.zone_id, expires_at_ms)?)?;
+    ctx.schedule(expiry_schedule(&input.zone_id, expires_at_ms)?)?;
     repo.publish_events()
         .commit(lease)?
         .succeeded(ClaimPayload {
@@ -330,7 +333,7 @@ async fn handle_renew(
     }
     let expires_at_ms = now + ttl;
     lease.renewed(expires_at_ms).map_err(rejected)?;
-    ctx.arm_alarm(expiry_alarm(&input.zone_id, expires_at_ms)?)?;
+    ctx.schedule(expiry_schedule(&input.zone_id, expires_at_ms)?)?;
     // Internal state only: no outward event, so no outbox row.
     repo.commit(lease)?.succeeded(ClaimPayload {
         zone_id: input.zone_id,
@@ -363,7 +366,7 @@ async fn handle_release(
     lease
         .released(input.zone_id, input.holder, input.token)
         .map_err(rejected)?;
-    ctx.cancel_alarm(EXPIRY_ALARM)?;
+    ctx.cancel_schedule(EXPIRY_ALARM)?;
     repo.publish_events().commit(lease)?.succeeded(claim)
 }
 
@@ -384,7 +387,7 @@ async fn handle_expire(
                 .map_err(rejected)?;
             true
         }
-        // Renewed (or released) after this alarm was read: not expired.
+        // Renewed (or released) after this schedule was read: not expired.
         _ => false,
     };
     if expired {
@@ -406,6 +409,8 @@ macro_rules! lease_command {
             fn install(self, routes: Routes<D>) -> Routes<D> {
                 routes
                     .typed_command(typed_command::<$input, Succeeded<$output>>($command))
+                    .requires(Capability::Scheduling)
+                    .requires(Capability::Clock)
                     .guarded($guard, $handler)
             }
         }
@@ -441,7 +446,7 @@ lease_command!(
     EXPIRE,
     ExpireInput,
     ExpiryPayload,
-    cell_alarm_guard::<ZoneLease>,
+    schedule_guard::<ZoneLease>,
     handle_expire
 );
 

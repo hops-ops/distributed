@@ -112,7 +112,7 @@ pub struct DurableAggregateCellState {
     pub sealed_row: Option<Value>,
     /// Alarm rows, including disarmed ones so generations never repeat.
     #[serde(default)]
-    pub alarms: Vec<super::alarm::DurableCellAlarm>,
+    pub alarms: Vec<super::alarm::DurableSchedule>,
 }
 
 /// Private command-side repository for one cell instance (`{aggregate_type}:{shard}`).
@@ -141,7 +141,7 @@ pub struct CellStreamStore {
     sealed_row_reducer: Option<SealedRowReducer>,
     /// Reference-host alarm table (SQL cells keep alarms in their database).
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
-    alarms: Arc<Mutex<super::alarm::MemoryCellAlarms>>,
+    alarms: Arc<Mutex<super::alarm::MemorySchedules>>,
 }
 
 impl CellStreamStore {
@@ -271,10 +271,10 @@ impl CellStreamStore {
 
     /// Replace the cell clock (default: the system clock). The reference host
     /// takes a [`ManualClock`](crate::ManualClock) so alarm tests are
-    /// deterministic; it resolves [`CellAlarm::after`](super::CellAlarm::after)
-    /// at commit and is what [`AggregateCell::fire_due_alarms`] reads.
+    /// deterministic; it resolves [`Schedule::after`](super::Schedule::after)
+    /// at commit and is what [`AggregateCell::fire_due_schedules`] reads.
     ///
-    /// [`AggregateCell::fire_due_alarms`]: super::AggregateCell::fire_due_alarms
+    /// [`AggregateCell::fire_due_schedules`]: super::AggregateCell::fire_due_schedules
     pub fn with_clock(mut self, clock: impl crate::Clock + 'static) -> Self {
         self.clock = Arc::new(clock);
         self
@@ -499,14 +499,14 @@ impl CellStreamStore {
             .lock()
             .map_err(|_| RepositoryError::Model("cell sealed row lock poisoned".into()))?;
         *sealed = state.sealed_row;
-        *self.lock_alarms()? = super::alarm::MemoryCellAlarms::restore(state.alarms);
+        *self.lock_alarms()? = super::alarm::MemorySchedules::restore(state.alarms);
         Ok(())
     }
 
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     fn lock_alarms(
         &self,
-    ) -> Result<std::sync::MutexGuard<'_, super::alarm::MemoryCellAlarms>, RepositoryError> {
+    ) -> Result<std::sync::MutexGuard<'_, super::alarm::MemorySchedules>, RepositoryError> {
         self.alarms
             .lock()
             .map_err(|_| RepositoryError::Model("cell alarm table lock poisoned".into()))
@@ -525,7 +525,7 @@ impl CellStreamStore {
     }
 
     /// Armed alarms, earliest first.
-    pub fn armed_alarms(&self) -> Result<Vec<super::ArmedCellAlarm>, RepositoryError> {
+    pub fn armed_schedules(&self) -> Result<Vec<super::ArmedSchedule>, RepositoryError> {
         #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
             return sql.armed_alarms();
@@ -541,7 +541,7 @@ impl CellStreamStore {
         &self,
         now_ms: i64,
         limit: usize,
-    ) -> Result<Vec<super::ArmedCellAlarm>, RepositoryError> {
+    ) -> Result<Vec<super::ArmedSchedule>, RepositoryError> {
         #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
             return sql.due_alarms(now_ms, limit);
@@ -568,7 +568,7 @@ impl CellStreamStore {
         &self,
         name: &str,
         generation: u64,
-        settlement: &super::alarm::AlarmSettlement,
+        settlement: &super::alarm::ScheduleSettlement,
     ) -> Result<(), RepositoryError> {
         #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
@@ -585,19 +585,19 @@ impl CellStreamStore {
     fn plan_memory_alarms(
         &self,
         batch: &mut CommitBatch<'_>,
-    ) -> Result<Option<super::alarm::MemoryCellAlarms>, RepositoryError> {
-        if self.alarm_sql().is_some() || batch.alarms.is_empty() {
+    ) -> Result<Option<super::alarm::MemorySchedules>, RepositoryError> {
+        if self.alarm_sql().is_some() || batch.schedules.is_empty() {
             return Ok(None);
         }
-        let writes = std::mem::take(&mut batch.alarms);
-        super::alarm::validate_alarm_writes(&writes)?;
+        let writes = std::mem::take(&mut batch.schedules);
+        super::alarm::validate_schedule_writes(&writes)?;
         self.lock_alarms()?.plan(&writes).map(Some)
     }
 
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     fn install_memory_alarms(
         &self,
-        planned: Option<super::alarm::MemoryCellAlarms>,
+        planned: Option<super::alarm::MemorySchedules>,
     ) -> Result<(), RepositoryError> {
         if let Some(planned) = planned {
             *self.lock_alarms()? = planned;
@@ -755,6 +755,21 @@ impl CommandLedgerStore for CellStreamStore {
     }
 }
 
+/// A cell dispatches its due schedules (the Durable Object alarm on celld,
+/// `AggregateCell::fire_due_schedules` on the reference host) and stamps the
+/// cell clock.
+impl crate::microsvc::BackendHost for CellStreamStore {
+    fn capabilities(&self) -> crate::schedule::Capabilities {
+        crate::schedule::Capabilities::ALL
+    }
+
+    fn host_now(
+        &self,
+    ) -> impl Future<Output = Result<std::time::SystemTime, RepositoryError>> + Send + '_ {
+        std::future::ready(Ok(self.now()))
+    }
+}
+
 impl TransactionalCommit for CellStreamStore {
     fn commit_batch<'a>(
         &'a self,
@@ -763,7 +778,8 @@ impl TransactionalCommit for CellStreamStore {
         let mut batch = batch;
         async move {
             self.ensure_batch(&batch)?;
-            super::alarm::resolve_alarm_writes(&mut batch.alarms, self.clock.now())?;
+            crate::schedule::schedule_owner(&batch)?;
+            super::alarm::resolve_schedule_writes(&mut batch.schedules, self.clock.now())?;
             #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
             let sealed = self.reduce_memory_sealed_row(&batch)?;
             #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
@@ -789,7 +805,8 @@ impl CausalTransactionalCommit for CellStreamStore {
         async move {
             self.ensure_batch(&batch.domain)
                 .map_err(CommandLedgerError::Storage)?;
-            super::alarm::resolve_alarm_writes(&mut batch.domain.alarms, self.clock.now())
+            crate::schedule::schedule_owner(&batch.domain).map_err(CommandLedgerError::Storage)?;
+            super::alarm::resolve_schedule_writes(&mut batch.domain.schedules, self.clock.now())
                 .map_err(CommandLedgerError::Storage)?;
             #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
             let sealed = self

@@ -57,6 +57,7 @@ pub mod projection_protocol;
 pub mod queued_repo;
 pub mod read_model;
 pub mod saga;
+pub mod schedule;
 pub mod snapshot;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_repo;
@@ -377,6 +378,7 @@ pub use saga::{
     Saga, SagaAction, SagaCommand, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaReply,
     SagaRunner, SagaStatus, SagaStep,
 };
+pub use schedule::{Capabilities, Capability, Schedule, ScheduleWrite};
 
 // Outbox: commit concerns (aggregate + outbox in one commit).
 //

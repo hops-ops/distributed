@@ -122,8 +122,9 @@ fn alarm_worker_arms_cell_alarms_and_shares_the_durable_object_alarm() {
     assert_eq!(spec["migrations"][0]["new_sqlite_classes"][0], "TickerCell");
     assert_eq!(spec["queues"]["producers"][0]["binding"], "OUTBOX");
     let source = std::fs::read_to_string(dir.join("src/lib.rs")).expect("lib.rs");
-    assert!(source.contains("ctx.arm_alarm("));
-    assert!(source.contains("cell_alarm_guard::<Ticker>"));
+    assert!(source.contains("ctx.schedule("));
+    assert!(source.contains("schedule_guard::<Ticker>"));
+    assert!(source.contains(".requires(Capability::Scheduling)"));
     assert!(source.contains(".alarm(&self.env)"));
     assert!(source.contains("with_celld_outbox(outbox)"));
     let harness = std::fs::read_to_string(concat!(

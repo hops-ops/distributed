@@ -276,7 +276,7 @@ where
                 read_model_plans: self.read_model_plans,
                 snapshots,
                 inbox_receipts: Vec::new(),
-                alarms: Vec::new(),
+                schedules: Vec::new(),
             })
             .await?;
         if let Some(version) = snapshot_version {

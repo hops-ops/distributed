@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use distributed::cell_host::InternalHttpSecret;
-use distributed_game::celld::{CelldFactRoute, CelldFactSink};
+use distributed_game::celld::{CelldFactSink, FactRoute};
 use distributed_game::lifecycle::{JoinVia, LeftReason, PlayerJoined, PlayerLeft};
 use distributed_game::{
     fact_channel, spawn_fact_worker, EmitError, Fact, FactCommand, FactError, FactOutcome,
@@ -41,7 +41,7 @@ struct MatchResult {
 }
 
 fn sink(base: &str, timeout: Duration) -> CelldFactSink {
-    CelldFactSink::with_timeout(
+    CelldFactSink::celld_with_timeout(
         base,
         InternalHttpSecret::new(SECRET).unwrap(),
         SERVICE,
@@ -49,8 +49,8 @@ fn sink(base: &str, timeout: Duration) -> CelldFactSink {
         timeout,
     )
     .unwrap()
-    .route(CelldFactRoute::by_principal::<Kill>("kills"))
-    .route(CelldFactRoute::by_input_field::<MatchResult>(
+    .route(FactRoute::by_principal::<Kill>("kills"))
+    .route(FactRoute::by_input_field::<MatchResult>(
         "match", "match_id",
     ))
     .lifecycle_route("presence")

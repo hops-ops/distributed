@@ -31,7 +31,7 @@ use crate::repository::{
 };
 use crate::snapshot::SnapshotRecord;
 
-use super::alarm::{AlarmSettlement, ArmedCellAlarm};
+use super::alarm::{ArmedSchedule, ScheduleSettlement};
 
 // Durable Object SQL limits bindings per statement, not per transaction.
 // Both shared insert planners split large commands within the same transaction.
@@ -120,7 +120,7 @@ impl CellSqlRepository {
             ));
         }
         let prepared = validate_commit_batch(&batch)?;
-        super::alarm::validate_alarm_writes(&batch.alarms)?;
+        super::alarm::validate_schedule_writes(&batch.schedules)?;
         self.connection.transaction(|executor| {
             finish_sql(async {
                 if let Some(completion) = &completion {
@@ -168,8 +168,8 @@ impl CellSqlRepository {
                 }
                 // Alarm rows join the same transaction: a failed command (or a
                 // lost ledger lease below) leaves no alarm armed.
-                if !batch.alarms.is_empty() {
-                    alarms::apply(executor, &batch.alarms).await?;
+                if !batch.schedules.is_empty() {
+                    alarms::apply(executor, &batch.schedules).await?;
                 }
                 // Native sealed read-model row: same transaction, so a reducer
                 // error or lost ledger lease rolls the row back with the events.
@@ -190,7 +190,7 @@ impl CellSqlRepository {
 
 impl CellSqlRepository {
     /// Armed alarms, earliest first.
-    pub(super) fn armed_alarms(&self) -> Result<Vec<ArmedCellAlarm>, RepositoryError> {
+    pub(super) fn armed_alarms(&self) -> Result<Vec<ArmedSchedule>, RepositoryError> {
         self.connection
             .read(|executor| finish_sql(alarms::armed(executor, None, usize::MAX)))
     }
@@ -200,7 +200,7 @@ impl CellSqlRepository {
         &self,
         now_ms: i64,
         limit: usize,
-    ) -> Result<Vec<ArmedCellAlarm>, RepositoryError> {
+    ) -> Result<Vec<ArmedSchedule>, RepositoryError> {
         self.connection
             .read(|executor| finish_sql(alarms::armed(executor, Some(now_ms), limit)))
     }
@@ -216,7 +216,7 @@ impl CellSqlRepository {
         &self,
         name: &str,
         generation: u64,
-        settlement: &AlarmSettlement,
+        settlement: &ScheduleSettlement,
     ) -> Result<(), RepositoryError> {
         self.connection.transaction(|executor| {
             finish_sql(alarms::settle(executor, name, generation, settlement))
@@ -428,20 +428,18 @@ impl CellSqlOutboxStore {
 /// native SQLite cells; the reference host mirrors these semantics in memory.
 mod alarms {
     use super::*;
-    use crate::microsvc::cell_host::alarm::{
-        CellAlarmError, CellAlarmWrite, MAX_ARMED_CELL_ALARMS,
-    };
+    use crate::microsvc::cell_host::alarm::{ScheduleError, ScheduleWrite, MAX_ARMED_SCHEDULES};
 
     const SELECT: &str =
         "SELECT name, command, input, due_at_ms, generation, attempts FROM cell_alarms WHERE armed = 1";
 
     pub(super) async fn apply(
         executor: &mut impl SqlExecutor,
-        writes: &[CellAlarmWrite],
+        writes: &[ScheduleWrite],
     ) -> Result<(), RepositoryError> {
         for write in writes {
             match write {
-                CellAlarmWrite::Arm(alarm) => {
+                ScheduleWrite::Arm(alarm) => {
                     let input = alarm.input_json()?;
                     executor
                         .execute(
@@ -457,7 +455,7 @@ mod alarms {
                         )
                         .await?;
                 }
-                CellAlarmWrite::Cancel(name) => {
+                ScheduleWrite::Cancel(name) => {
                     executor
                         .execute(
                             Statement::new(
@@ -479,8 +477,8 @@ mod alarms {
             .map(|row| row.integer("armed"))
             .transpose()?
             .unwrap_or(0);
-        if armed > MAX_ARMED_CELL_ALARMS as i64 {
-            return Err(CellAlarmError::TooManyArmed.into());
+        if armed > MAX_ARMED_SCHEDULES as i64 {
+            return Err(ScheduleError::TooManyArmed.into());
         }
         Ok(())
     }
@@ -489,7 +487,7 @@ mod alarms {
         executor: &mut impl SqlExecutor,
         due_by_ms: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<ArmedCellAlarm>, RepositoryError> {
+    ) -> Result<Vec<ArmedSchedule>, RepositoryError> {
         let limit = (limit as u64).min(9_007_199_254_740_991) as i64;
         let mut statement = Statement::new(SELECT);
         if let Some(due_by_ms) = due_by_ms {
@@ -505,7 +503,7 @@ mod alarms {
         rows.iter()
             .map(|row| {
                 let input = row.text("input")?;
-                Ok(ArmedCellAlarm {
+                Ok(ArmedSchedule {
                     name: row.text("name")?,
                     command: row.text("command")?,
                     input: serde_json::from_str(&input).map_err(|error| {
@@ -540,15 +538,15 @@ mod alarms {
         executor: &mut impl SqlExecutor,
         name: &str,
         generation: u64,
-        settlement: &AlarmSettlement,
+        settlement: &ScheduleSettlement,
     ) -> Result<(), RepositoryError> {
         let generation = i64::try_from(generation)
             .map_err(|_| RepositoryError::Model("cell alarm generation overflow".into()))?;
         let statement = match settlement {
-            AlarmSettlement::Done => {
+            ScheduleSettlement::Done => {
                 Statement::new("UPDATE cell_alarms SET armed = 0, attempts = 0 WHERE name = ")
             }
-            AlarmSettlement::Retry { due_at_ms } => {
+            ScheduleSettlement::Retry { due_at_ms } => {
                 Statement::new("UPDATE cell_alarms SET attempts = attempts + 1, due_at_ms = ")
                     .bind((*due_at_ms).into())
                     .sql(" WHERE name = ")
