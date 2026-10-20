@@ -1119,3 +1119,9 @@ async fn transfer_tickets_carry_extension_claims_across_hosts() {
     assert_eq!(players[0].principal, "ana");
     assert_eq!(players[0].extensions.typed::<PartyClaims>().unwrap(), party);
 }
+
+#[tokio::test]
+async fn fenced_lease_ownership_passes_the_conformance_suite() {
+    let ownership = FencedLeaseOwnership::new(InMemoryLeaseStore::new());
+    distributed_game::world::ownership_conformance(&ownership, "conformance").await;
+}

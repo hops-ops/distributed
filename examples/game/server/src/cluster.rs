@@ -11,7 +11,10 @@
 //! - the admin secret, derived from the shared ticket secret (all hosts of
 //!   a world must be started with the same `--secret`);
 //! - fenced zone claims (`LocalOwnership`, whose tokens are seeded from the
-//!   process start time so they outrank snapshots of an earlier run) and SQLite hibernation
+//!   process start time so they outrank snapshots of an earlier run; or,
+//!   with `--celld-url`, `CellZoneOwnership`: one celld `ZoneLease` cell per
+//!   zone, whose alarm declares `zone.lease_expired` when this host stops
+//!   renewing) and SQLite hibernation
 //!   snapshots ([`SqliteZoneStateStore`], one file per host under
 //!   `--state-dir`, in-memory without it);
 //! - guest display names shared with every peer: `/dev/ticket` on any host
@@ -33,10 +36,12 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
+use distributed::cell_host::InternalHttpSecret;
+use distributed_game::celld::CellZoneOwnership;
 use distributed_game::net::peer::{post_json, ADMIN_SECRET_HEADER};
 use distributed_game::net::{GameServer, NetSim, ServerConfig, TicketKey};
 use distributed_game::world::{
-    HostAddr, LocalOwnership, SqliteZoneStateStore, ZoneDirectory, ZoneStateStore,
+    HostAddr, LocalOwnership, SqliteZoneStateStore, ZoneDirectory, ZoneOwnership, ZoneStateStore,
 };
 use serde_json::{json, Value};
 
@@ -65,6 +70,14 @@ pub struct ClusterArgs {
     /// Dormant after half of this without clients.
     #[arg(long, default_value_t = 4000)]
     pub hibernate_after_ms: u64,
+    /// celld URL serving `ZoneLease` cells (kind `zone-lease`): zone
+    /// ownership lives there instead of in this process (needs
+    /// `DISTRIBUTED_INTERNAL_SECRET`).
+    #[arg(long, env = "CELLD_URL")]
+    pub celld_url: Option<String>,
+    /// Internal secret for celld cells (with `--celld-url`).
+    #[arg(long, env = "DISTRIBUTED_INTERNAL_SECRET", hide_env_values = true)]
+    pub internal_secret: Option<String>,
 }
 
 /// In-process cluster options (tests and [`run_cluster`]).
@@ -78,6 +91,9 @@ pub struct ClusterOptions {
     pub state_dir: Option<PathBuf>,
     /// Dormant time before hibernation.
     pub hibernate_after: Duration,
+    /// Zone ownership in celld `ZoneLease` cells: `(url, internal secret)`.
+    /// `None` = process-local `LocalOwnership`.
+    pub celld: Option<(String, String)>,
 }
 
 impl ClusterOptions {
@@ -88,6 +104,7 @@ impl ClusterOptions {
             peers: Vec::new(),
             state_dir: None,
             hibernate_after,
+            celld: None,
         }
     }
 }
@@ -250,10 +267,22 @@ pub fn spawn_cluster<D: ClusterDemo>(
     config.admin_secret = Some(world.admin_secret.clone());
     config.hibernate_after = Some(cluster.hibernate_after);
     config.host.dormant_after = cluster.hibernate_after / 2;
+    let ownership: Arc<dyn ZoneOwnership> = match &cluster.celld {
+        Some((url, secret)) => Arc::new(
+            CellZoneOwnership::new(
+                url.clone(),
+                InternalHttpSecret::new(secret.clone()).map_err(std::io::Error::other)?,
+                format!("game-demos-{}", D::NAME),
+                world.host.id.clone(),
+            )
+            .map_err(std::io::Error::other)?,
+        ),
+        None => Arc::new(LocalOwnership::new()),
+    };
     let server = D::cluster_server(config, &world)
         .with_host_id(world.host.id.clone())
         .with_directory(directory)
-        .with_ownership(Arc::new(LocalOwnership::new()))
+        .with_ownership(ownership)
         .with_state_store(world.state.clone() as Arc<dyn ZoneStateStore>);
 
     let extra = if options.dev {
@@ -303,6 +332,15 @@ pub async fn run_cluster<D: ClusterDemo>(args: ClusterArgs) -> std::io::Result<(
         peers,
         state_dir: args.state_dir,
         hibernate_after: Duration::from_millis(args.hibernate_after_ms.max(100)),
+        celld: match (args.celld_url, args.internal_secret) {
+            (Some(url), Some(secret)) => Some((url, secret)),
+            (Some(_), None) => {
+                return Err(std::io::Error::other(
+                    "--celld-url needs DISTRIBUTED_INTERNAL_SECRET (or --internal-secret)",
+                ))
+            }
+            _ => None,
+        },
     };
     let running = spawn_cluster::<D>(listener, options, cluster, common::shutdown_signal())?;
     // Parsed by run.sh and the client tests: keep the format.

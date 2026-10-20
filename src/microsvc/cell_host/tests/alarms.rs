@@ -517,3 +517,31 @@ async fn sqlite_cell_alarms_commit_atomically_and_survive_reopening() {
     drop(cell);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[tokio::test]
+async fn handlers_see_the_cell_clock_and_callers_cannot_forge_it() {
+    let clock = clock();
+    let cell = ticker_cell(&clock);
+    let mut forged = owner_session();
+    forged.set(super::super::CELL_NOW_CLAIM, "1");
+    cell.dispatch_idempotent(
+        "ticker.start",
+        &identity("0190a000-0000-7000-8000-000000000009"),
+        json!({ "id": "t1", "limit": 1, "period_ms": 1000, "fail_after_arming": false, "tick_command": "ticker.tick" }),
+        forged,
+    )
+    .await
+    .unwrap();
+    // `after(period)` resolved by the cell clock, not the forged claim.
+    assert_eq!(
+        cell.next_alarm_due().unwrap(),
+        Some(clock.now() + Duration::from_millis(1000))
+    );
+    let mut session = crate::microsvc::Session::new();
+    assert_eq!(super::super::cell_now(&session), None);
+    session.set(super::super::CELL_NOW_CLAIM, "1234");
+    assert_eq!(
+        super::super::cell_now(&session),
+        Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1234))
+    );
+}

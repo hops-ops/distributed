@@ -71,6 +71,10 @@ jobs:
         env:
           CELLD_FACTS_REQUIRED: "1"
         run: cargo test -p distributed_game --features celld,runtime --test celld_facts
+      - name: Zone leases in celld cells (CellZoneOwnership, alarm expiry, GameServer)
+        env:
+          CELLD_FACTS_REQUIRED: "1"
+        run: cargo test -p distributed_game --features celld,runtime,net --test celld_zone_lease
       - name: Retain storage proof results and logs
         if: always()
         uses: actions/upload-artifact@v4

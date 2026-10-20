@@ -86,6 +86,11 @@ pub async fn start_cluster<D: ClusterDemo>(ids: &[&str], hibernate_after: Durati
             peers: all.clone(),
             state_dir: Some(state_dir.clone()),
             hibernate_after,
+            // With CELLD_URL + DISTRIBUTED_INTERNAL_SECRET the hosts keep
+            // zone ownership in celld ZoneLease cells (same smoke tests).
+            celld: std::env::var("CELLD_URL")
+                .ok()
+                .zip(std::env::var("DISTRIBUTED_INTERNAL_SECRET").ok()),
         };
         let host = spawn_cluster::<D>(listener, DemoOptions::dev(SECRET), options, async move {
             let _ = stopped.await;

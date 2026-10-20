@@ -22,6 +22,10 @@ pub mod directory;
 pub mod ownership;
 pub mod state;
 pub mod topology;
+#[cfg(feature = "cell")]
+// The `sourced` and `Snapshot` derives generate undocumented public items.
+#[allow(missing_docs)]
+pub mod zone_lease;
 
 pub use crate::facts::BoxFuture;
 pub use allocation::{
@@ -30,6 +34,8 @@ pub use allocation::{
 };
 pub use barrier::{BarrierMode, FreezeState, StalePolicy};
 pub use directory::{HashRing, HostAddr, StaticDirectory, ZoneDirectory};
+#[doc(hidden)]
+pub use ownership::ownership_conformance;
 #[cfg(feature = "lease")]
 pub use ownership::FencedLeaseOwnership;
 pub use ownership::{LocalOwnership, OwnershipError, ZoneClaim, ZoneOwnership};

@@ -29,7 +29,7 @@ path = "src/main.rs"
 game_sim = { path = "sim" }
 # The Crawler aggregate + RecordKill (shared with the read-model service).
 mobpit_crawler = { path = "crawler" }
-distributed_game = { path = "../../../distributed_game", features = ["net", "cell", "sqlite"] }
+distributed_game = { path = "../../../distributed_game", features = ["net", "cell", "celld", "sqlite"] }
 # Mob Pit: native durable SQLite cells + sorted-set leaderboards (Redis optional
 # at runtime) + the SQLite bus for the read-model service.
 distributed = { path = "../../..", features = ["cell-sqlite", "redis", "sqlite"] }

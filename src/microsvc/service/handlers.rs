@@ -706,6 +706,13 @@ where
             .map_err(workspace_handler_error)
     }
 
+    /// The cell clock's time when this command was dispatched (the Durable
+    /// Object clock on celld, the store clock — e.g. a `ManualClock` — on the
+    /// reference host). `None` outside an aggregate cell.
+    pub fn cell_now(&self) -> Option<std::time::SystemTime> {
+        crate::cell_host::cell_now(self.session)
+    }
+
     /// Due time of the alarm that fired this command; `None` for any command
     /// not dispatched by a cell alarm.
     pub fn alarm_due(&self) -> Option<std::time::SystemTime> {

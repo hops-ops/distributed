@@ -6,11 +6,13 @@
     "bindings": [
       { "name": "KILLS", "class_name": "KillsCell" },
       { "name": "MATCH", "class_name": "MatchCell" },
-      { "name": "PRESENCE", "class_name": "PresenceCell" }
+      { "name": "PRESENCE", "class_name": "PresenceCell" },
+      { "name": "ZONE_LEASE", "class_name": "ZoneLeaseCell" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["KillsCell", "MatchCell", "PresenceCell"] }
+    { "tag": "v1", "new_sqlite_classes": ["KillsCell", "MatchCell", "PresenceCell"] },
+    { "tag": "v2", "new_sqlite_classes": ["ZoneLeaseCell"] }
   ],
   "queues": {
     "producers": [

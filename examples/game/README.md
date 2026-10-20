@@ -149,6 +149,15 @@ proxies to it) and **B** on the next port, each listing the other with
 is derived from it) and keeping hibernation snapshots under one
 `--state-dir` (`grid-A.sqlite3`, `grid-B.sqlite3`).
 
+Zone ownership is process-local (`LocalOwnership`) by default. With
+`CELLD_URL` and `DISTRIBUTED_INTERNAL_SECRET` set (or `--celld-url` /
+`--internal-secret`), every host keeps its zone claims in celld
+`ZoneLease:{zone}` cells (`CellZoneOwnership`; a celld project mounting
+`distributed_game::world::zone_lease`, such as `tests/celld/fact-worker`),
+and a host that stops renewing gets a `zone.lease_expired` from the cell's
+alarm. The cluster smoke tests honour the same variables:
+`CELLD_URL=… DISTRIBUTED_INTERNAL_SECRET=… cargo test --test grid_smoke`.
+
 - **World.** Cell `(x, y)` is zone `grid.<x>.<y>` (canonical integers,
   |x|,|y| ≤ 10⁶; the server uses `FlatTopology`, the dots are not a
   hierarchy). Its terrain height, biome and props are a pure function of

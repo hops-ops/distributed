@@ -6,6 +6,9 @@
 //! - `Presence:{principal}`: the runtime lifecycle facts `zone.player_joined`
 //!   and `zone.player_left` (lifecycle facts go to presence, never to the
 //!   player's gameplay cells).
+//! - `ZoneLease:{zone_id}` (kind `zone-lease`): zone ownership
+//!   (`distributed_game::world::zone_lease`) for `CellZoneOwnership`; its
+//!   alarm declares `zone.lease_expired`.
 //!
 //! Every route requires `DISTRIBUTED_INTERNAL_SECRET`. The handler's session
 //! is rebuilt from the trusted fact headers (`fact_session_from_headers`):
@@ -22,6 +25,7 @@ use distributed::microsvc::{
 };
 use distributed::{sourced, Aggregate, Entity};
 use distributed_game::cell::{fact_session_from_headers, session_stamp};
+use distributed_game::world::zone_lease::{mount_zone_lease, ZoneLease};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use worker::*;
@@ -273,7 +277,17 @@ where
         }
         _ => return error_response(CellDispatchError::Unauthorized),
     };
-    let session = fact_session_from_headers(header).unwrap_or_else(Session::new);
+    // Facts carry principal + stamp; zone hosts (lease commands) carry a
+    // user and role. Both arrive only on the authenticated internal path.
+    let session = fact_session_from_headers(header).unwrap_or_else(|| {
+        let mut session = Session::new();
+        for key in [distributed::USER_ID_KEY, distributed::microsvc::ROLE_KEY] {
+            if let Some(value) = header(key) {
+                session.set(key, value);
+            }
+        }
+        session
+    });
     let result = cell
         .dispatch_idempotent(command, &identity, parsed.input, session)
         .await;
@@ -317,13 +331,25 @@ where
                 .load()
                 .await
                 .map_err(|error| Error::RustError(error.to_string()))?;
-            let events = cell
+            let history = cell
                 .history()
                 .await
+                .map_err(|error| Error::RustError(error.to_string()))?;
+            let names = history
+                .iter()
+                .map(|event| event.event_name.clone())
+                .collect::<Vec<_>>();
+            let armed = cell
+                .armed_alarms()
                 .map_err(|error| Error::RustError(error.to_string()))?
                 .len();
             json_status(
-                json!({ "events": events, "state": loaded.as_ref().map(state) }),
+                json!({
+                    "events": history.len(),
+                    "eventNames": names,
+                    "armedAlarms": armed,
+                    "state": loaded.as_ref().map(state),
+                }),
                 200,
             )
         }
@@ -392,6 +418,48 @@ cell_object!(
     |presence: &Presence| json!({ "transitions": presence.transitions })
 );
 
+#[durable_object]
+pub struct ZoneLeaseCell {
+    cell: AggregateCell<ZoneLease>,
+    env: Env,
+}
+
+impl DurableObject for ZoneLeaseCell {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        let outbox = CelldOutbox::from_env(&env, "OUTBOX").expect("OUTBOX Queue binding");
+        // Renewals are internal events: snapshots keep loads short.
+        let cell = mount_zone_lease(
+            AggregateCell::<ZoneLease>::from_state_with_snapshots(state, 50)
+                .expect("zone lease cell identity"),
+        )
+        .with_celld_outbox(outbox);
+        Self { cell, env }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        route(
+            &self.env,
+            &self.cell,
+            req,
+            |lease: &ZoneLease| json!({ "holder": lease.holder(), "token": lease.token() }),
+        )
+        .await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        let wake = self
+            .cell
+            .alarm(&self.env)
+            .await
+            .map_err(|error| Error::RustError(error.to_string()))?;
+        for failed in wake.alarms.failed.iter().chain(&wake.alarms.retried) {
+            worker::console_error!("lease alarm failed: {} {}", failed.code, failed.message);
+        }
+        Response::ok("ok")
+    }
+}
+
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
@@ -408,6 +476,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Some("kills") => "KILLS",
         Some("match") => "MATCH",
         Some("presence") => "PRESENCE",
+        Some("zone-lease") => "ZONE_LEASE",
         _ => return json_status(json!({ "error": "unknown cell kind" }), 404),
     };
     let Some(shard) = parts.get(1) else {

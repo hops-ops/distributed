@@ -226,6 +226,7 @@ where
         input: Value,
         session: Session,
     ) -> Result<Value, HandlerError> {
+        let session = self.stamp_now(session);
         #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         let _command = self
             .begin_command()
@@ -252,6 +253,7 @@ where
         input: Value,
         session: Session,
     ) -> Result<CellDispatchResult, CellDispatchError> {
+        let session = self.stamp_now(session);
         #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         let _command = self
             .begin_command()
@@ -264,6 +266,14 @@ where
         #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         self.reschedule_after_command().await;
         result
+    }
+
+    /// Overwrite the cell-clock claim: handlers read the cell's time
+    /// (`ctx.cell_now()`), never a caller's.
+    fn stamp_now(&self, mut session: Session) -> Session {
+        let now = super::alarm::system_time_to_ms(self.routes.repo().repo().now()).unwrap_or(0);
+        session.set(super::alarm::CELL_NOW_CLAIM, now.to_string());
+        session
     }
 
     /// Armed alarms of this cell, earliest first.

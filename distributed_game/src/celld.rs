@@ -290,6 +290,177 @@ impl FactSink for CelldFactSink {
     }
 }
 
+/// [`ZoneOwnership`](crate::world::ZoneOwnership) over celld
+/// `ZoneLease:{zone_id}` cells ([`crate::world::zone_lease`]): zone servers
+/// acquire, renew and release over the internal path, and the cell's alarm
+/// declares expiry (`zone.lease_expired`) when a holder stops renewing, so
+/// services see a crashed zone server.
+///
+/// Every call uses a fresh command id. A retried `acquire` by the same
+/// holder returns its existing claim, so an ambiguous response is safe.
+#[derive(Clone)]
+pub struct CellZoneOwnership {
+    client: reqwest::Client,
+    base: String,
+    secret: InternalHttpSecret,
+    service_id: String,
+    host: String,
+    kind: String,
+}
+
+/// Cell kind (URL segment) of zone-lease cells.
+pub const ZONE_LEASE_KIND: &str = "zone-lease";
+
+impl CellZoneOwnership {
+    /// Ownership for zone server `host` (its internal identity) against
+    /// `celld_url`, under command-ledger `service_id`.
+    pub fn new(
+        celld_url: impl Into<String>,
+        secret: InternalHttpSecret,
+        service_id: impl Into<String>,
+        host: impl Into<String>,
+    ) -> Result<Self, String> {
+        let base = celld_url.into().trim_end_matches('/').to_string();
+        if !(base.starts_with("http://") || base.starts_with("https://")) {
+            return Err(format!("celld URL must be http(s): {base}"));
+        }
+        let service_id = service_id.into();
+        let host = host.into();
+        if service_id.trim().is_empty() || host.trim().is_empty() {
+            return Err("cell zone ownership needs a service id and a host identity".into());
+        }
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_CELLD_FACT_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| format!("celld ownership client: {error}"))?;
+        Ok(Self {
+            client,
+            base,
+            secret,
+            service_id,
+            host,
+            kind: ZONE_LEASE_KIND.to_string(),
+        })
+    }
+
+    async fn call(
+        &self,
+        zone_id: &str,
+        command: &str,
+        input: Value,
+    ) -> Result<crate::world::zone_lease::ClaimPayload, crate::world::OwnershipError> {
+        use crate::world::zone_lease::ZONE_HOST_ROLE;
+        use crate::world::OwnershipError;
+        if !valid_segment(zone_id) {
+            return Err(OwnershipError::Backend(format!(
+                "invalid zone id `{zone_id}`"
+            )));
+        }
+        let url = format!(
+            "{}/{}/{}/{}",
+            self.base,
+            encode_segment(&self.kind),
+            encode_segment(zone_id),
+            encode_segment(command)
+        );
+        let response = self
+            .client
+            .post(&url)
+            .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
+            .header(CELL_SERVICE_ID_HEADER, &self.service_id)
+            .header(CELL_PRINCIPAL_PARTITION_HEADER, &self.host)
+            .header(USER_ID_KEY, &self.host)
+            .header(distributed::microsvc::ROLE_KEY, ZONE_HOST_ROLE)
+            .json(&json!({
+                "commandId": uuid::Uuid::now_v7().hyphenated().to_string(),
+                "input": input,
+            }))
+            .send()
+            .await
+            .map_err(|error| OwnershipError::Backend(format!("celld unreachable: {error}")))?;
+        let status = response.status().as_u16();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if (200..300).contains(&status) {
+            return serde_json::from_value(body.get("payload").cloned().unwrap_or(Value::Null))
+                .map_err(|error| OwnershipError::Backend(format!("bad claim payload: {error}")));
+        }
+        let message = body.get("error").and_then(Value::as_str).unwrap_or("");
+        Err(match crate::world::zone_lease::ownership_error(message) {
+            OwnershipError::Backend(message) => {
+                OwnershipError::Backend(format!("HTTP {status}: {message}"))
+            }
+            error => error,
+        })
+    }
+}
+
+fn claim_of(payload: crate::world::zone_lease::ClaimPayload) -> crate::world::ZoneClaim {
+    crate::world::ZoneClaim {
+        zone_id: payload.zone_id,
+        holder: payload.holder,
+        token: payload.token,
+        expires_at: std::time::SystemTime::UNIX_EPOCH
+            + Duration::from_millis(payload.expires_at_ms),
+    }
+}
+
+fn ttl_ms(ttl: Duration) -> u64 {
+    u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX).max(1)
+}
+
+impl crate::world::ZoneOwnership for CellZoneOwnership {
+    fn acquire<'a>(
+        &'a self,
+        zone_id: &'a str,
+        holder: &'a str,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<crate::world::ZoneClaim, crate::world::OwnershipError>> {
+        Box::pin(async move {
+            self.call(
+                zone_id,
+                crate::world::zone_lease::ACQUIRE,
+                json!({ "zone_id": zone_id, "holder": holder, "ttl_ms": ttl_ms(ttl) }),
+            )
+            .await
+            .map(claim_of)
+        })
+    }
+
+    fn renew<'a>(
+        &'a self,
+        claim: &'a crate::world::ZoneClaim,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<crate::world::ZoneClaim, crate::world::OwnershipError>> {
+        Box::pin(async move {
+            self.call(
+                &claim.zone_id,
+                crate::world::zone_lease::RENEW,
+                json!({
+                    "zone_id": claim.zone_id,
+                    "holder": claim.holder,
+                    "token": claim.token,
+                    "ttl_ms": ttl_ms(ttl),
+                }),
+            )
+            .await
+            .map(claim_of)
+        })
+    }
+
+    fn release<'a>(&'a self, claim: &'a crate::world::ZoneClaim) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let _ = self
+                .call(
+                    &claim.zone_id,
+                    crate::world::zone_lease::RELEASE,
+                    json!({ "zone_id": claim.zone_id, "holder": claim.holder, "token": claim.token }),
+                )
+                .await;
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

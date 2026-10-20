@@ -845,12 +845,14 @@ dependencies = [
  "distributed_game_macros",
  "futures-util",
  "hmac 0.12.1",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "uuid",
 ]
 
 [[package]]

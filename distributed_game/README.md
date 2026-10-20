@@ -866,7 +866,7 @@ trait and its ABI (`run_abi`, `call_bytes`).
 | *(default)* | Zone/host runtime, facts queue, protocol, schema, replication, authoring derives, game surface, predicted steps (compiles to `wasm32-unknown-unknown`, where `#[predict]` exports its steps) | `serde`, `serde_json`, `distributed_game_macros` |
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
 | `cell` | `cell::CellFactSink` → in-process `AggregateCell::dispatch_idempotent` (native); `cell::fact_session_from_headers` / `session_stamp` for cells (also wasm32); `stamp_event_record` | `distributed`, `sha2` |
-| `celld` | `celld::CelldFactSink`: facts → celld cells over the internal HTTP path, routed by command | `cell` + `reqwest` |
+| `celld` | `celld::CelldFactSink`: facts → celld cells over the internal HTTP path, routed by command; `celld::CellZoneOwnership`: zone leases in celld `ZoneLease` cells | `cell` + `reqwest`, `uuid` |
 | `metrics` | `metrics::GameMetrics` per-zone Prometheus text | – |
 | `net` | `net::GameServer` (axum WebSocket), HMAC tickets, `GET /metrics` (implies `metrics`), handoff, admin peer routes, `WorldCoordinator` | `axum`, `hmac`, `sha2`, `base64`, `tokio` |
 | `bots` | `bots` load-test client library + `game-bots` binary | `net` + `tokio-tungstenite` |
@@ -1031,7 +1031,7 @@ principals commit concurrently; settlements arrive in completion order.
 | Piece | Purpose |
 |---|---|
 | `ZoneDirectory` (`StaticDirectory`, `HashRing`) | zone → owning `HostAddr`. `HashRing` uses virtual nodes; adding/removing one of N hosts moves ~1/N of the zones. A Hello for a zone owned elsewhere gets `Redirect(zone, url)`; `url` is the owner's `HostAddr::ws_url` (advertise a proxied public URL with `HostAddr::with_ws_url`) or `ServerConfig::with_redirect_url(\|host, zone\| …)`. |
-| `ZoneOwnership` (`LocalOwnership`, `FencedLeaseOwnership<S: LeaseStore>`) | every activation acquires a fenced claim (`host#activation`) and renews it; a failed renewal disposes the zone **without** saving. Two hosts never run the same zone. |
+| `ZoneOwnership` (`LocalOwnership`, `FencedLeaseOwnership<S: LeaseStore>`, `celld::CellZoneOwnership`) | every activation acquires a fenced claim (`host#activation`) and renews it; a failed renewal disposes the zone **without** saving. Two hosts never run the same zone. `CellZoneOwnership` keeps each claim in a celld `ZoneLease:{zone}` cell (`world::zone_lease`, mount with `mount_zone_lease`): acquire and release publish `zone.activated` / `zone.released`, renewals are internal (no outward events), and the cell's alarm publishes `zone.lease_expired { zone_id, holder, token }` when a holder stops renewing, so services see a crashed zone server. `world::ownership_conformance` is the behaviour every implementation passes. |
 | `ZoneStateStore` (`MemoryZoneStateStore`, `SqliteZoneStateStore`) | hibernation snapshots, written under the claim's fencing token (stale writers get `StateError::Stale`, counted in `distributed_game_hibernation_saves_total{outcome="stale"}` and logged to stderr, never silently dropped). `LocalOwnership` seeds its tokens from the Unix time (µs) at creation, so a restarted host still outranks the snapshots its previous run saved. |
 | `ZoneTopology` (`DottedTopology` default: `eldoria.port.docks` → `eldoria.port` → `eldoria`) | parent links for tier-up events. |
 

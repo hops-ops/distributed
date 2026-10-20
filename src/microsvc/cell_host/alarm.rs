@@ -54,6 +54,10 @@ pub const CELL_ALARM_NAME_CLAIM: &str = "x-distributed-cell-alarm";
 pub const CELL_ALARM_DUE_CLAIM: &str = "x-distributed-cell-alarm-due-ms";
 /// Session claim with the fired alarm's generation.
 pub const CELL_ALARM_GENERATION_CLAIM: &str = "x-distributed-cell-alarm-generation";
+/// Session claim with the cell clock's time at dispatch (epoch ms). The cell
+/// host overwrites it on every command, so callers cannot choose it; read it
+/// with `CausalCommandContext::cell_now`.
+pub const CELL_NOW_CLAIM: &str = "x-distributed-cell-now-ms";
 /// Command-ledger service id of fired alarms.
 pub const CELL_ALARM_SERVICE_ID: &str = "distributed.cell-alarm";
 /// Longest alarm name.
@@ -393,6 +397,16 @@ pub fn cell_alarm_session(alarm: &ArmedCellAlarm) -> Session {
     session.set(CELL_ALARM_DUE_CLAIM, alarm.due_at_ms.to_string());
     session.set(CELL_ALARM_GENERATION_CLAIM, alarm.generation.to_string());
     session
+}
+
+/// The cell clock's time at dispatch, when the command runs in a cell.
+pub fn cell_now(session: &Session) -> Option<SystemTime> {
+    session
+        .get(CELL_NOW_CLAIM)?
+        .parse::<i64>()
+        .ok()
+        .filter(|ms| *ms >= 0)
+        .map(ms_to_system_time)
 }
 
 /// Whether `session` is the trusted session of a fired alarm.
