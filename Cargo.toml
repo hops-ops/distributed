@@ -1,6 +1,6 @@
 [workspace]
 members = ["distributed_macros", "distributed_cli", "distributed_game", "distributed_game_macros"]
-exclude = ["tests/e2e-ui", "tests/celld/worker", "tests/celld/relay-worker", "tests/celld/alarm-worker", "tests/fixtures/wasm32-native-domain", "examples/game/server"]
+exclude = ["tests/e2e-ui", "tests/celld/worker", "tests/celld/relay-worker", "tests/celld/alarm-worker", "tests/celld/fact-worker", "tests/fixtures/wasm32-native-domain", "examples/game/server"]
 resolver = "2"
 
 [workspace.package]

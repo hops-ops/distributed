@@ -16,6 +16,9 @@ default = []
 runtime = ["dep:tokio"]
 # Adapter that commits facts into a `distributed` AggregateCell.
 cell = ["dep:distributed", "dep:sha2"]
+# `celld::CelldFactSink`: a zone server's facts sent to celld cells over the
+# internal HTTP path (routes by command; stable command ids; no local store).
+celld = ["cell", "dep:reqwest"]
 # Per-zone Prometheus metrics (dependency-free text exposition).
 metrics = []
 # Load-test bots (library + `game-bots` binary).
@@ -40,6 +43,7 @@ base64 = { version = "0.23", optional = true }
 tokio-tungstenite = { version = "0.30", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
 rusqlite = { version = "0.39", features = ["bundled"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 
 [dev-dependencies]
 trybuild = "=1.0.120"
@@ -67,6 +71,11 @@ required-features = ["bots"]
 name = "net_e2e"
 path = "tests/net_e2e/main.rs"
 required-features = ["net"]
+
+[[test]]
+name = "celld_facts"
+path = "tests/celld_facts/main.rs"
+required-features = ["celld", "runtime"]
 
 [[test]]
 name = "inbox"

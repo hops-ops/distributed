@@ -1,0 +1,24 @@
+{
+  "name": "distributed-fact-cells",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "KILLS", "class_name": "KillsCell" },
+      { "name": "MATCH", "class_name": "MatchCell" },
+      { "name": "PRESENCE", "class_name": "PresenceCell" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["KillsCell", "MatchCell", "PresenceCell"] }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "OUTBOX", "queue": "distributed-fact-outbox" }
+    ]
+  },
+  "vars": {
+    "DISTRIBUTED_INTERNAL_SECRET": "test-only-internal-secret-change-me-2026",
+    "OUTBOX_DRAIN_INTERVAL_MS": "5000"
+  }
+}

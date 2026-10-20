@@ -54,6 +54,8 @@ pub mod authoring;
 pub mod bots;
 #[cfg(feature = "cell")]
 pub mod cell;
+#[cfg(feature = "celld")]
+pub mod celld;
 pub mod claims;
 pub mod clock;
 pub mod codec;

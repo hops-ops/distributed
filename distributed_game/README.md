@@ -865,7 +865,8 @@ trait and its ABI (`run_abi`, `call_bytes`).
 |---|---|---|
 | *(default)* | Zone/host runtime, facts queue, protocol, schema, replication, authoring derives, game surface, predicted steps (compiles to `wasm32-unknown-unknown`, where `#[predict]` exports its steps) | `serde`, `serde_json`, `distributed_game_macros` |
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
-| `cell` | `cell::CellFactSink` → `AggregateCell::dispatch_idempotent`, `stamp_event_record` | `distributed`, `sha2` |
+| `cell` | `cell::CellFactSink` → in-process `AggregateCell::dispatch_idempotent` (native); `cell::fact_session_from_headers` / `session_stamp` for cells (also wasm32); `stamp_event_record` | `distributed`, `sha2` |
+| `celld` | `celld::CelldFactSink`: facts → celld cells over the internal HTTP path, routed by command | `cell` + `reqwest` |
 | `metrics` | `metrics::GameMetrics` per-zone Prometheus text | – |
 | `net` | `net::GameServer` (axum WebSocket), HMAC tickets, `GET /metrics` (implies `metrics`), handoff, admin peer routes, `WorldCoordinator` | `axum`, `hmac`, `sha2`, `base64`, `tokio` |
 | `bots` | `bots` load-test client library + `game-bots` binary | `net` + `tokio-tungstenite` |
@@ -908,6 +909,36 @@ double-crediting. A custom sink needs only crate-root imports:
 `impl FactSink for MySink { fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> { Box::pin(async move { … }) } }`
 (`BoxFuture` is also re-exported from `world` and `net` for
 `ZoneOwnership` / `BarrierParticipant` impls).
+
+**Facts to celld cells.** Durable aggregates live in celld cells; a zone
+server sends its facts there with one `celld::CelldFactSink` (feature
+`celld`), routing each fact by its command to a cell kind and shard:
+
+```rust,ignore
+let sink = CelldFactSink::new(celld_url, InternalHttpSecret::new(secret)?, "zone-server", "zone:pit-1")?
+    .route(CelldFactRoute::by_principal::<RecordKillInput>("crawler"))      // Crawler:{principal}
+    .route(CelldFactRoute::by_input_field::<MatchResultInput>("match", "match_id"))
+    .lifecycle_route("presence");                                            // zone.* → Presence:{account}
+let (queue, feed) = fact_channel(capacity, RetryPolicy::until_settled(base, max));
+spawn_fact_worker(feed.with_max_concurrent_commits(n), sink);
+```
+
+Each fact is `POST {CELLD_URL}/{kind}/{shard}/{command}` with
+`{commandId, input}`; the command id is `cell::command_id_for(service,
+key)`, so a retry after a timeout replays the cell's ledger receipt
+(`replayed`) instead of committing twice. The principal travels as
+`x-user-id` and the command-ledger principal partition, the stamp as
+`x-game-*` headers, and every request carries
+`DISTRIBUTED_INTERNAL_SECRET`; the cell rebuilds the trusted session with
+`cell::fact_session_from_headers` after checking the secret. Player
+lifecycle facts route to presence, never to gameplay cells. celld slow,
+unreachable or answering 5xx/`COMMAND_IN_PROGRESS` is `Retryable`: with
+`RetryPolicy::until_settled` the fact stays in the queue (no local durable
+fallback), the zone keeps ticking, a full queue answers `Backpressure`,
+and after celld returns the backlog drains in per-principal order. An
+unrouted command, a rejected command or a bad shard is `Permanent`.
+`tests/celld_facts` proves this on `celld dev` against
+`tests/celld/fact-worker`, including a crash and restart of celld.
 
 **Throughput.** One worker per zone commits facts in emission order, one at
 a time (a slow commit delays every later fact). Set

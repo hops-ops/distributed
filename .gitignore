@@ -62,6 +62,9 @@ tests/celld/relay-worker/build/
 tests/celld/alarm-worker/target/
 tests/celld/alarm-worker/build/
 tests/celld/alarm-worker/.celld/
+tests/celld/fact-worker/target/
+tests/celld/fact-worker/build/
+tests/celld/fact-worker/.celld/
 
 # Build output of CLI test fixture crates
 /distributed_cli/tests/fixtures/*/target/

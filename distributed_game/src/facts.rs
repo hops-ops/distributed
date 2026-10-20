@@ -260,6 +260,19 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// Retry retryable failures until the fact settles (backing off up to
+    /// `max_backoff`): a network sink whose target is down keeps the fact
+    /// pending in the queue, so the zone sees backpressure at capacity
+    /// instead of losing durable outcomes. Permanent failures still settle
+    /// immediately.
+    pub fn until_settled(base_backoff: Duration, max_backoff: Duration) -> Self {
+        Self {
+            max_attempts: u32::MAX,
+            base_backoff,
+            max_backoff,
+        }
+    }
+
     /// Backoff before attempt `attempt + 1` (attempt >= 1).
     pub fn backoff(&self, attempt: u32) -> Duration {
         let factor = 1u32 << attempt.saturating_sub(1).min(20);

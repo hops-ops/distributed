@@ -42,6 +42,7 @@ jobs:
           workspaces: |
             tests/celld/worker -> tests/celld/worker/target
             tests/celld/alarm-worker -> tests/celld/alarm-worker/target
+            tests/celld/fact-worker -> tests/celld/fact-worker/target
           shared-key: celld-storage
       - uses: actions/setup-node@v4
         with:
@@ -63,6 +64,13 @@ jobs:
         run: worker-build --release
       - name: Prove re-armable cell alarms (atomic arm, cadence, watchdog, restart)
         run: node tests/celld/alarms.mjs
+      - name: Build the zone-fact cells Worker
+        working-directory: tests/celld/fact-worker
+        run: worker-build --release
+      - name: Route zone facts to celld cells (CelldFactSink, outage and restart)
+        env:
+          CELLD_FACTS_REQUIRED: "1"
+        run: cargo test -p distributed_game --features celld,runtime --test celld_facts
       - name: Retain storage proof results and logs
         if: always()
         uses: actions/upload-artifact@v4
