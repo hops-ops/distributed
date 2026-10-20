@@ -28,6 +28,13 @@
 //!
 //! - **Forward**: step *n* succeeds → step *n+1* is dispatched; after the last
 //!   step the saga is [`Completed`](SagaStatus::Completed).
+//! - **Fan-out**: a step whose [`SagaDefinition::action`] returns
+//!   [`SagaAction::FanOut`] dispatches up to [`MAX_SAGA_FAN_OUT`] commands at
+//!   once, each with its own timer and a command id per `(step, member)`. It
+//!   succeeds when every member succeeds. It settles only after every member
+//!   replied or timed out; on any failure the members that applied (or timed
+//!   out, outcome unknown) are compensated one by one, highest index first,
+//!   and members that rejected are not. Late replies are ignored.
 //! - **Rejection**: a `failed` reply means "definitely not applied"; the saga
 //!   compensates the previously applied steps in reverse order.
 //! - **Timeout**: the outcome is unknown, so the timed-out step is
@@ -42,7 +49,8 @@
 //! - **Idempotency**: message ids that changed state are stored in the saga
 //!   ([`SagaOutcome::Duplicate`] on redelivery); late replies and superseded
 //!   timers are [`SagaOutcome::Ignored`]. Command ids are deterministic
-//!   (`type:id:step:phase:attempt`), so participants can dedupe with consumer
+//!   (`type:id:step:phase:attempt`, plus `:member` on fan-out steps), so
+//!   participants can dedupe with consumer
 //!   inbox receipts keyed by the command id, and reply ids derive from them.
 //! - **Concurrency**: the saga stream's optimistic version is the fence;
 //!   [`SagaRunner`] reloads and retries on `ConcurrentWrite`.
@@ -62,13 +70,13 @@
 //!         ];
 //!         STEPS
 //!     }
-//!     fn action(step: &str, id: &str, d: &TransferData) -> Result<SagaCommand, SagaError> {
-//!         match step {
-//!             "debit" => SagaCommand::json(&d.from_cell, "wallet.debit", &Move::new(id, d)),
-//!             _ => SagaCommand::json(&d.to_cell, "wallet.credit", &Move::new(id, d)),
-//!         }
+//!     fn action(step: &str, id: &str, d: &TransferData) -> Result<SagaAction, SagaError> {
+//!         Ok(match step {
+//!             "debit" => SagaCommand::json(&d.from_cell, "wallet.debit", &Move::new(id, d))?.into(),
+//!             _ => SagaCommand::json(&d.to_cell, "wallet.credit", &Move::new(id, d))?.into(),
+//!         })
 //!     }
-//!     fn compensation(step: &str, id: &str, d: &TransferData)
+//!     fn compensation(step: &str, member: usize, id: &str, d: &TransferData)
 //!         -> Result<Option<SagaCommand>, SagaError> { /* refund / reverse */ }
 //! }
 //!
@@ -81,15 +89,20 @@
 
 mod definition;
 mod error;
+#[cfg(test)]
+mod fan_out_tests;
 mod message;
 mod runner;
 mod state;
 
-pub use definition::{SagaCommand, SagaDefinition, SagaStep};
+pub use definition::{SagaAction, SagaCommand, SagaDefinition, SagaStep, MAX_SAGA_FAN_OUT};
 pub use error::SagaError;
 pub use message::{
-    SagaMessage, SagaPhase, SagaReply, SagaSignal, META_ATTEMPT, META_COMMAND_ID, META_OUTCOME,
-    META_PHASE, META_REPLY_TO, META_SAGA_ID, META_SAGA_TYPE, META_STEP, SAGA_REPLY, SAGA_TIMEOUT,
+    SagaMessage, SagaPhase, SagaReply, SagaSignal, META_ATTEMPT, META_COMMAND_ID, META_MEMBER,
+    META_OUTCOME, META_PHASE, META_REPLY_TO, META_SAGA_ID, META_SAGA_TYPE, META_STEP, SAGA_REPLY,
+    SAGA_TIMEOUT,
 };
 pub use runner::SagaRunner;
-pub use state::{Saga, SagaCursor, SagaFailure, SagaOutcome, SagaStatus, SagaTransition};
+pub use state::{
+    Saga, SagaCursor, SagaFailure, SagaFanOut, SagaOutcome, SagaStatus, SagaTransition,
+};

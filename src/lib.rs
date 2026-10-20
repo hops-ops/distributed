@@ -374,8 +374,8 @@ pub use lease::PostgresLeaseStore;
 pub use lease::SqliteLeaseStore;
 pub use lease::{Fence, FencingToken, InMemoryLeaseStore, Lease, LeaseError, LeaseStore};
 pub use saga::{
-    Saga, SagaCommand, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaReply, SagaRunner,
-    SagaStatus, SagaStep,
+    Saga, SagaAction, SagaCommand, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaReply,
+    SagaRunner, SagaStatus, SagaStep,
 };
 
 // Outbox: commit concerns (aggregate + outbox in one commit).

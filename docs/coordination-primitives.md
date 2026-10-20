@@ -174,6 +174,56 @@ Guarantees and obligations:
   the saga id and rejects a late action.
 - **`on_step_succeeded` is replayed,** so keep it deterministic.
 
+### Fan-out steps
+
+A step can send commands to N cells chosen at run time, for example one
+ticket reservation per party when a match starts. `action` returns
+`SagaAction::FanOut(commands)` instead of a single command
+(`SagaCommand` converts with `.into()`); `compensation` and
+`on_step_succeeded` receive the member index (`0` for single steps).
+
+```rust
+fn action(step: &str, saga_id: &str, d: &MatchStart) -> Result<SagaAction, SagaError> {
+    match step {
+        "reserve" => Ok(SagaAction::fan_out(
+            d.parties.iter().map(|p| SagaCommand::json(format!("party:{p}"), "ticket.reserve", &saga_id))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        _ => Ok(SagaCommand::json("match", "match.confirm", &saga_id)?.into()),
+    }
+}
+fn compensation(step: &str, member: usize, saga_id: &str, d: &MatchStart)
+    -> Result<Option<SagaCommand>, SagaError> {
+    match step {
+        "reserve" => {
+            SagaCommand::json(format!("party:{}", d.parties[member]), "ticket.release", &saga_id).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+```
+
+- 1 to `MAX_SAGA_FAN_OUT` (64) members; an empty or larger fan-out is a
+  `Definition` error. Membership must be a deterministic function of the data.
+- Every member gets its own command and timeout timer, both carrying
+  `saga-member` metadata. Command ids are
+  `type:saga:step:phase:attempt:member`, so retries dedupe per member.
+- The step **succeeds** when every member replies `succeeded`. It
+  **settles** only after every member has replied or timed out, so the saga
+  knows which members applied. On any rejection or timeout the step fails and
+  only the members that applied, or timed out (outcome unknown), are
+  compensated, one at a time, highest index first. Members that rejected are
+  not compensated.
+- A reply arriving after its member timed out is `Ignored`; the timeout
+  already settled that member and it will be compensated.
+- Events: `saga.member_succeeded`, `saga.member_failed`,
+  `saga.fan_out_settled`. Replaying the stream reproduces the per-member
+  state (`Saga::fan_out`, `Saga::applied_members`).
+
+The tests are in `src/saga/fan_out_tests.rs` (N = 1..16, partial failure,
+per-member timeouts and late replies, per-member compensation retries,
+bounds, and replay from a repository).
+
 ### Worked example
 
 `tests/saga_transfer/main.rs` moves value between wallets in two separate
