@@ -645,11 +645,17 @@ impl<Z: Zone> Ctx<'_, Z> {
         if carried.len() > MAX_CARRIED_BYTES {
             return Err(HandoffError::TooLarge);
         }
-        let (principal, name) = self
+        let (principal, name, extensions) = self
             .core
             .players
             .get(&player)
-            .map(|slot| (slot.info.principal.clone(), slot.info.name.clone()))
+            .map(|slot| {
+                (
+                    slot.info.principal.clone(),
+                    slot.info.name.clone(),
+                    slot.info.extensions.clone(),
+                )
+            })
             .ok_or(HandoffError::UnknownPlayer)?;
         if self
             .core
@@ -663,6 +669,7 @@ impl<Z: Zone> Ctx<'_, Z> {
         let request = HandoffRequest {
             principal,
             name,
+            extensions,
             source_zone: self.core.zone_id.clone(),
             target_zone: target_zone.to_string(),
             carried,
@@ -1056,6 +1063,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     if claims.name.is_some() {
                         slot.info.name = claims.name.clone();
                     }
+                    slot.info.extensions = claims.extensions.clone();
                 }
                 self.bind_player(player, client, capabilities);
                 if let Some((from, carried)) = handoff.take() {
@@ -1079,6 +1087,7 @@ impl<Z: Zone> ZoneHost<Z> {
                             id: player,
                             principal: claims.principal.clone(),
                             name: claims.name.clone(),
+                            extensions: claims.extensions.clone(),
                             capabilities,
                             connected: true,
                         },
@@ -1111,6 +1120,7 @@ impl<Z: Zone> ZoneHost<Z> {
                             id: observer,
                             principal: claims.principal.clone(),
                             name: claims.name.clone(),
+                            extensions: claims.extensions.clone(),
                             capabilities,
                         },
                         client,

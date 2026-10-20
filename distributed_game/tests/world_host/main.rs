@@ -20,6 +20,7 @@ fn claims(principal: &str, zone: &str) -> TicketClaims {
         nonce: format!("n-{principal}"),
         role: Role::Player,
         name: None,
+        extensions: Default::default(),
     }
 }
 

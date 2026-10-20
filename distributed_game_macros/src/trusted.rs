@@ -103,7 +103,29 @@ pub(crate) fn reject_forbidden(fields: &[&Field], what: &str, rule: &str) -> syn
 
 #[cfg(test)]
 mod tests {
-    use super::forbidden;
+    use super::{forbidden, FORBIDDEN};
+
+    /// The JS ticket handler enforces the same list from this fixture.
+    #[test]
+    fn deny_list_matches_the_shared_fixture() {
+        let fixture =
+            include_str!("../../distributed_game/tests/fixtures/trusted_field_denylist.json");
+        let mut expected = Vec::new();
+        for (group, why) in [
+            ("identity", "identity"),
+            ("reward", "a reward"),
+            ("economy", "an economy value"),
+        ] {
+            let start = fixture.find(&format!("\"{group}\": [")).expect(group);
+            let list = &fixture[start..];
+            let list = &list[list.find('[').unwrap() + 1..list.find(']').unwrap()];
+            for name in list.split(',') {
+                expected.push((name.trim().trim_matches('"').to_string(), why));
+            }
+        }
+        let actual: Vec<_> = FORBIDDEN.iter().map(|(n, w)| (n.to_string(), *w)).collect();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn matches_ignore_separators_and_case() {

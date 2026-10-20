@@ -579,6 +579,7 @@ fn put_claims(w: &mut Writer, claims: &TicketClaims) {
         Some(name) => w.u8(1).string(name),
         None => w.u8(0),
     };
+    w.string(&claims.extensions.to_json().to_string());
 }
 
 fn get_claims(r: &mut Reader<'_>) -> Result<TicketClaims, RecordingError> {
@@ -594,6 +595,10 @@ fn get_claims(r: &mut Reader<'_>) -> Result<TicketClaims, RecordingError> {
         0 => None,
         _ => Some(r.string()?),
     };
+    let extensions = serde_json::from_str(&r.string()?)
+        .ok()
+        .and_then(|value| crate::claims::TicketExtensions::from_json(value).ok())
+        .ok_or_else(|| bad("extension claims"))?;
     Ok(TicketClaims {
         principal,
         zone,
@@ -601,6 +606,7 @@ fn get_claims(r: &mut Reader<'_>) -> Result<TicketClaims, RecordingError> {
         nonce,
         role,
         name,
+        extensions,
     })
 }
 

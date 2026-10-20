@@ -47,6 +47,8 @@ pub struct Arena {
     pub ticks: u64,
     pub timer_fires: u64,
     pub tiers: Vec<(Tier, Tier)>,
+    /// Extension claims seen by `on_auth`.
+    pub auth_extensions: Vec<distributed_game::TicketExtensions>,
 }
 
 impl Arena {
@@ -114,10 +116,12 @@ impl Zone for Arena {
             ticks: 0,
             timer_fires: 0,
             tiers: Vec::new(),
+            auth_extensions: Vec::new(),
         }
     }
 
     fn on_auth(&mut self, _ctx: &mut Ctx<'_, Self>, req: &JoinRequest<'_>) -> Admission {
+        self.auth_extensions.push(req.claims.extensions.clone());
         if self.cfg.reject_principal.as_deref() == Some(req.claims.principal.as_str()) {
             return Admission::Reject("banned".into());
         }

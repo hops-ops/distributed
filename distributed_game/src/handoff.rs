@@ -9,6 +9,7 @@
 //! calls [`Zone::on_handoff_join`](crate::Zone::on_handoff_join) with the
 //! carried bytes.
 
+use crate::claims::TicketExtensions;
 use crate::zone::TicketClaims;
 
 /// Largest carried state accepted in a handoff (it travels inside the
@@ -22,6 +23,8 @@ pub struct HandoffRequest {
     pub principal: String,
     /// The player's display name (from its admission ticket), carried over.
     pub name: Option<String>,
+    /// The player's ticket extension claims, carried over.
+    pub extensions: TicketExtensions,
     /// Zone the player leaves.
     pub source_zone: String,
     /// Zone the player goes to.

@@ -36,6 +36,7 @@ fn ticket(principal: &str, zone: &str, nonce: &str) -> String {
         nonce: nonce.into(),
         role: Role::Player,
         name: None,
+        extensions: Default::default(),
     })
 }
 
@@ -327,6 +328,7 @@ async fn cross_host_handoff_follows_redirect_and_ticket_is_single_use() {
         nonce: "x".into(),
         role: Role::Player,
         name: None,
+        extensions: Default::default(),
     });
     assert!(join_url(&b.addr.zone_url("realm.west"), &forged, "")
         .await
@@ -1054,4 +1056,64 @@ fn directory_types_are_object_safe() {
 fn hibernation_outcomes(server: &GameServer<Realm>) -> u64 {
     let m = server.metrics();
     m.hibernation_saves("saved") + m.hibernation_saves("stale") + m.hibernation_saves("error")
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, TicketExtension)]
+struct PartyClaims {
+    party: String,
+    team: u8,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_tickets_carry_extension_claims_across_hosts() {
+    let (a, b, _dir) = two_hosts(
+        || base_config().with_ticket_extensions::<PartyClaims>(),
+        &[("realm.east", "A"), ("realm.west", "B")],
+        realm_factory(&[("realm.east", "realm.west")], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let party = PartyClaims {
+        party: "p-9".into(),
+        team: 1,
+    };
+    let t = TicketKey::new(SECRET).sign(
+        &TicketClaims::new("ana", "realm.east", 4_000_000_000, "ext-1", Role::Player)
+            .with_extensions(TicketExtensions::from_typed(&party).unwrap()),
+    );
+    let mut ana = join_url(&a.addr.zone_url("realm.east"), &t, "")
+        .await
+        .unwrap();
+    input(&mut ana, 1, CMD_HANDOFF).await;
+    let transfer = loop {
+        match control(&mut ana).await {
+            Some(ServerMessage::Handoff {
+                transfer_ticket, ..
+            }) => break transfer_ticket,
+            Some(_) => continue,
+            None => panic!("closed before Handoff"),
+        }
+    };
+    // The server-minted transfer ticket signs the claims...
+    let distributed_game::net::VerifiedTicket::Transfer(verified) = TicketKey::new(SECRET)
+        .verify_ticket(&transfer, 1_700_000_000)
+        .unwrap()
+    else {
+        panic!("transfer ticket")
+    };
+    assert_eq!(
+        verified.claims.extensions.typed::<PartyClaims>().unwrap(),
+        party
+    );
+    // ...and the target zone on the other host sees them.
+    let _west = join_url(&a.addr.zone_url("realm.west"), &transfer, "")
+        .await
+        .unwrap();
+    let players = b
+        .server
+        .inspect("realm.west", |h| h.players().cloned().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert_eq!(players[0].principal, "ana");
+    assert_eq!(players[0].extensions.typed::<PartyClaims>().unwrap(), party);
 }

@@ -171,6 +171,7 @@ async fn ticket<D: Demo>(
         nonce: guests::random_hex(24),
         role,
         name: None,
+        extensions: Default::default(),
     });
     Ok(Json(TicketResponse {
         ticket,

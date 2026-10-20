@@ -641,6 +641,7 @@ mod tests {
             nonce: "n".into(),
             role: Role::Player,
             name: None,
+            extensions: Default::default(),
         };
         let joined = h.join(&claims, 0, "").unwrap();
         metrics.record_input("z1", h.push_input(joined.client, 1, 0, &[1]));

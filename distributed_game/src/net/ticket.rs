@@ -14,6 +14,11 @@
 //! [`TicketKey::verify`] rejects them ([`TicketError::WrongKind`]); use
 //! [`TicketKey::verify_ticket`] to accept either kind.
 //!
+//! **Extension claims.** An optional `ext` object carries game-declared
+//! claims ([`TicketExtensions`]: match id, team…). Join and transfer
+//! tickets sign them alike; the server admits them only when they match
+//! `ServerConfig::ticket_extensions` (see [`crate::claims`]).
+//!
 //! **Custom admission tickets.** Join tickets go through a
 //! [`TicketVerifier`] (`ServerConfig::ticket_verifier`); the default is the
 //! `TicketKey` itself. A game whose web backend already mints its own tickets
@@ -33,6 +38,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
 
+use crate::claims::TicketExtensions;
 use crate::handoff::Transfer;
 use crate::protocol::Role;
 use crate::zone::TicketClaims;
@@ -323,6 +329,11 @@ impl TicketKey {
                     .and_then(Value::as_str)
                     .filter(|v| !v.is_empty())
                     .map(str::to_string),
+                extensions: match claims.get("ext") {
+                    None => TicketExtensions::new(),
+                    Some(ext) => TicketExtensions::from_json(ext.clone())
+                        .map_err(|e| TicketError::Invalid(e.to_string()))?,
+                },
             },
             claims,
         ))
@@ -330,8 +341,13 @@ impl TicketKey {
 }
 
 fn with_name(mut body: Value, claims: &TicketClaims) -> Value {
-    if let (Some(name), Some(object)) = (&claims.name, body.as_object_mut()) {
-        object.insert("name".into(), Value::String(name.clone()));
+    if let Some(object) = body.as_object_mut() {
+        if let Some(name) = &claims.name {
+            object.insert("name".into(), Value::String(name.clone()));
+        }
+        if !claims.extensions.is_empty() {
+            object.insert("ext".into(), claims.extensions.to_json());
+        }
     }
     body
 }
@@ -382,6 +398,7 @@ mod tests {
             nonce: "n1".into(),
             role: Role::Player,
             name: None,
+            extensions: Default::default(),
         }
     }
 

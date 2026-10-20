@@ -9,6 +9,7 @@ import {
 	MAX_GAME_TICKET_TTL_SECONDS,
 	MIN_GAME_TICKET_SECRET_BYTES,
 	mintGameTicket,
+	type GameTicketExtensions,
 	type GameTicketRole,
 	type GameTicketSecret
 } from './ticket.js';
@@ -26,9 +27,14 @@ export {
 } from './rate-limit.js';
 
 export {
+	MAX_GAME_TICKET_EXTENSION_BYTES,
 	MAX_GAME_TICKET_TTL_SECONDS,
 	MIN_GAME_TICKET_SECRET_BYTES,
+	TRUSTED_FIELD_DENYLIST,
+	checkGameTicketExtensions,
 	mintGameTicket,
+	type GameTicketClaimValue,
+	type GameTicketExtensions,
 	type GameTicketRole,
 	type GameTicketSecret,
 	type MintGameTicketOptions,
@@ -64,6 +70,12 @@ export type GameTicketZoneContext<TEvent, TSession> = Readonly<{
 	role: GameTicketRole;
 }>;
 
+export type GameTicketClaimsContext<TEvent, TSession> = GameTicketZoneContext<TEvent, TSession> &
+	Readonly<{
+		/** The zone the server chose (the ticket's `zone`). */
+		zone: string;
+	}>;
+
 export type GameTicketRateLimit =
 	| false
 	| Readonly<{ max: number; windowMs: number }>
@@ -94,6 +106,16 @@ export type CreateGameTicketHandlerOptions<TEvent extends GameTicketRequestEvent
 	zone(
 		context: GameTicketZoneContext<TEvent, TSession>
 	): string | null | undefined | Promise<string | null | undefined>;
+	/**
+	 * Extension claims for this ticket, decided on the server (match id,
+	 * team, party from the matchmaker or the session): signed under `ext`
+	 * and checked by the zone server against its declared
+	 * `TicketExtension` schema. The browser body can never add claims.
+	 * Identity-, reward- and economy-looking names are refused.
+	 */
+	claims?(
+		context: GameTicketClaimsContext<TEvent, TSession>
+	): GameTicketExtensions | null | undefined | Promise<GameTicketExtensions | null | undefined>;
 	/** Roles a browser may ask for. Default both (`observer` owns no player). */
 	roles?: readonly GameTicketRole[];
 	/** Ticket lifetime in seconds (1..=300). Default 60. */
@@ -259,8 +281,9 @@ async function readBody(request: Request): Promise<{ zone?: string; role?: GameT
  * A SvelteKit `POST` handler that mints a `distributed_game` admission
  * ticket for the **verified session's** principal and the zone **the server
  * chooses**. The request body may only carry `{ zone?, role? }` hints
- * (unknown fields → 400); identity, zone ownership and rewards are never
- * accepted from it. Every response is `cache-control: no-store`.
+ * (unknown fields → 400); identity, zone ownership, rewards and extension
+ * claims are never accepted from it (extension claims come only from the
+ * server-side `claims()` callback). Every response is `cache-control: no-store`.
  *
  * ```ts
  * // src/lib/server/game.ts
@@ -378,12 +401,24 @@ export function createGameTicketHandler<TEvent extends GameTicketRequestEvent, T
 				throw new TicketRefusal(503, 'not_configured', 'The game connection is not configured.');
 			}
 			const name = nameOf(verified.session, event) ?? undefined;
+			const extensions =
+				options.claims === undefined
+					? undefined
+					: ((await options.claims({
+							event,
+							session: verified.session,
+							principal: verified.principal,
+							requested: body.zone,
+							role,
+							zone
+						})) ?? undefined);
 			const minted = await mintGameTicket({
 				secret,
 				principal: verified.principal,
 				zone,
 				role,
 				...(name === undefined ? {} : { name }),
+				...(extensions === undefined ? {} : { extensions }),
 				ttlSeconds,
 				now: now()
 			});

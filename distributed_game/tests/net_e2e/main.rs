@@ -11,9 +11,10 @@ use distributed_game::net::{GameServer, NetSim, ServerConfig, TicketKey};
 use distributed_game::protocol::{error, kick, Hello};
 use distributed_game::{
     ClientMessage, ClientMirror, FieldValue, MemoryFactSink, RetryPolicy, Role, ServerMessage,
-    TicketClaims, PROTOCOL_VERSION,
+    TicketClaims, TicketExtension, TicketExtensions, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -30,6 +31,7 @@ fn ticket(principal: &str, zone: &str, nonce: &str, role: Role) -> String {
         nonce: nonce.into(),
         role,
         name: None,
+        extensions: Default::default(),
     })
 }
 
@@ -228,6 +230,7 @@ async fn client_joins_sends_inputs_receives_deltas_and_reconnects() {
         nonce: "n4".into(),
         role: Role::Player,
         name: None,
+        extensions: Default::default(),
     });
     expect_error(&url, "z1", forged, error::UNAUTHORIZED).await;
 
@@ -290,6 +293,21 @@ async fn admits_tickets_minted_by_the_sveltekit_handler() {
     assert_eq!(claims.nonce, text("/valid/nonce"));
     assert_eq!(claims.role, Role::Player);
     assert_eq!(claims.name.as_deref(), Some("Ana"));
+    assert!(claims.extensions.is_empty());
+
+    // Extension claims from the handler's server-side `claims()` callback.
+    let extended = TicketKey::new(secret.as_str())
+        .verify(&text("/extended/ticket"), 1_700_000_000)
+        .unwrap();
+    assert_eq!(extended.principal, text("/extended/principal"));
+    assert_eq!(
+        extended.extensions.typed::<MatchClaims>().unwrap(),
+        MatchClaims {
+            match_id: "m-7".into(),
+            side: 2,
+            party: None,
+        }
+    );
 
     let (url, server, handle) = start_keyed(&secret, None).await;
 
@@ -638,4 +656,124 @@ async fn host_config_hook_sets_per_zone_rates() {
     let hot = server.inspect("z-hot", |h| h.config().tick_rate).await;
     assert_eq!(hot, Some(30));
     server.shutdown();
+}
+
+/// A game's declared extension claims.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TicketExtension)]
+struct MatchClaims {
+    match_id: String,
+    #[serde(rename = "team")]
+    side: u8,
+    #[serde(default)]
+    party: Option<String>,
+}
+
+fn extended_ticket(nonce: &str, ext: serde_json::Value) -> String {
+    TicketKey::new(SECRET).sign(&TicketClaims {
+        principal: "ana".into(),
+        zone: "z-match".into(),
+        expires_at: 4_000_000_000,
+        nonce: nonce.into(),
+        role: Role::Player,
+        name: None,
+        extensions: TicketExtensions::from_json(ext).unwrap(),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extension_claims_reach_on_auth_and_player_info() {
+    assert_eq!(MatchClaims::CLAIMS, ["match_id", "team", "party"]);
+    let config = ServerConfig::new(TicketKey::new(SECRET)).with_ticket_extensions::<MatchClaims>();
+    let server = GameServer::<Arena>::new(config, |_| Some(ArenaConfig::default()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let serving = server.clone();
+    let handle = tokio::spawn(async move {
+        serving
+            .serve(listener, std::future::pending())
+            .await
+            .unwrap();
+    });
+
+    // Undeclared names and mistyped values are refused at admission.
+    for (nonce, ext) in [
+        (
+            "x-unknown",
+            serde_json::json!({"match_id": "m-7", "team": 2, "gold": 50}),
+        ),
+        (
+            "x-typed",
+            serde_json::json!({"match_id": "m-7", "team": "red"}),
+        ),
+        ("x-object", serde_json::json!(["m-7"])),
+    ] {
+        let ticket = if nonce == "x-object" {
+            TicketKey::new(SECRET).sign_json(&serde_json::json!({
+                "sub": "ana", "zone": "z-match", "exp": 4_000_000_000u64,
+                "nonce": nonce, "ext": ext,
+            }))
+        } else {
+            extended_ticket(nonce, ext)
+        };
+        expect_error(&url, "z-match", ticket, error::UNAUTHORIZED).await;
+    }
+
+    let expected = MatchClaims {
+        match_id: "m-7".into(),
+        side: 2,
+        party: None,
+    };
+    let mut ws = connect(&url, "z-match").await;
+    hello(
+        &mut ws,
+        extended_ticket("ok", serde_json::json!({"match_id": "m-7", "team": 2})),
+        String::new(),
+    )
+    .await;
+    let Some(ServerMessage::Welcome(_)) = next(&mut ws, &mut ClientMirror::new()).await else {
+        panic!("expected Welcome")
+    };
+    let (auth, players) = server
+        .inspect("z-match", |host| {
+            (
+                host.zone().auth_extensions.clone(),
+                host.players().cloned().collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .expect("zone active");
+    assert_eq!(
+        auth.last().unwrap().typed::<MatchClaims>().unwrap(),
+        expected
+    );
+    assert_eq!(
+        players[0].extensions.typed::<MatchClaims>().unwrap(),
+        expected
+    );
+
+    server.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("server stops")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extension_claims_are_refused_without_a_declared_schema() {
+    let (url, server, handle) = start(None).await;
+    let ticket = TicketKey::new(SECRET).sign(&TicketClaims {
+        principal: "ana".into(),
+        zone: "z1".into(),
+        expires_at: 4_000_000_000,
+        nonce: "undeclared".into(),
+        role: Role::Player,
+        name: None,
+        extensions: TicketExtensions::from_json(serde_json::json!({"match_id": "m"})).unwrap(),
+    });
+    expect_error(&url, "z1", ticket, error::UNAUTHORIZED).await;
+    server.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("server stops")
+        .unwrap();
 }

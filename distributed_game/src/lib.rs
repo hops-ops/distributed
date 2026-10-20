@@ -54,6 +54,7 @@ pub mod authoring;
 pub mod bots;
 #[cfg(feature = "cell")]
 pub mod cell;
+pub mod claims;
 pub mod clock;
 pub mod codec;
 pub mod facts;
@@ -81,11 +82,12 @@ pub mod world;
 pub mod zone;
 
 pub use authoring::{GameEvent, GameInput, Pushed, Replicated};
+pub use claims::{ExtensionError, ExtensionSchema, TicketExtension, TicketExtensions};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use codec::{Wire, WireType};
 /// Authoring derives (see the crate docs and README).
 pub use distributed_game_macros::{
-    game_pure, predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated,
+    game_pure, predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated, TicketExtension,
 };
 #[cfg(feature = "runtime")]
 pub use facts::spawn_fact_worker;

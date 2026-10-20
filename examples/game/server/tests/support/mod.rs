@@ -111,6 +111,7 @@ pub fn ticket(principal: &str, zone: &str, role: Role) -> String {
         nonce: format!("n-{principal}-{n}"),
         role,
         name: None,
+        extensions: Default::default(),
     })
 }
 

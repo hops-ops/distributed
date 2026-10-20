@@ -10,6 +10,7 @@
 //! `on_tick`/`on_timer`/`on_fact_settled` interleaved → `on_leave` /
 //! `on_unobserve` → `on_dispose`.
 
+use crate::claims::TicketExtensions;
 use crate::facts::FactSettlement;
 use crate::host::Ctx;
 use crate::protocol::Role;
@@ -74,6 +75,10 @@ pub struct TicketClaims {
     /// identity: use `principal` for that). Exposed as
     /// [`PlayerInfo::name`] / [`ObserverInfo::name`].
     pub name: Option<String>,
+    /// Game-declared claims the issuer vouches for (match id, team…; the
+    /// ticket's `ext`), checked by the `net` server against
+    /// `ServerConfig::ticket_extensions`. Never identity or rewards.
+    pub extensions: TicketExtensions,
 }
 
 impl TicketClaims {
@@ -92,7 +97,14 @@ impl TicketClaims {
             nonce: nonce.into(),
             role,
             name: None,
+            extensions: TicketExtensions::new(),
         }
+    }
+
+    /// Attach extension claims.
+    pub fn with_extensions(mut self, extensions: TicketExtensions) -> Self {
+        self.extensions = extensions;
+        self
     }
 
     /// Attach a display name.
@@ -154,6 +166,9 @@ pub struct PlayerInfo {
     pub principal: String,
     /// Display name from the ticket ([`TicketClaims::name`]), if any.
     pub name: Option<String>,
+    /// Extension claims from the ticket ([`TicketClaims::extensions`]);
+    /// replaced by a fresh ticket's on rejoin, carried across handoffs.
+    pub extensions: TicketExtensions,
     /// Hello capabilities.
     pub capabilities: u32,
     /// False while inside the reconnect grace window.
@@ -169,6 +184,8 @@ pub struct ObserverInfo {
     pub principal: String,
     /// Display name from the ticket, if any.
     pub name: Option<String>,
+    /// Extension claims from the ticket.
+    pub extensions: TicketExtensions,
     /// Hello capabilities.
     pub capabilities: u32,
 }

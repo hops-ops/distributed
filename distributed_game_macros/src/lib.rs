@@ -9,6 +9,7 @@
 //! | [`GameEvent`] | struct / enum | `GameEvent`: stable ids, typed payload codec |
 //! | [`GameRecord`] | struct | `Wire`: a nested payload record |
 //! | [`FactCommand`] | struct | `FactCommand`: the cell command name of a fact input |
+//! | [`TicketExtension`] | struct | `TicketExtension`: the extension claims a ticket may carry |
 //! | [`macro@predict`] (attribute) | fn | `PredictStep` for a client-predicted step + its WebAssembly export |
 //! | [`macro@game_pure`] (attribute) | fn | `GamePure` for a pure function compiled to WebAssembly + its export |
 //!
@@ -24,6 +25,7 @@
 //! - GameInput only: `#[range(min = A, max = B)]` (clamp), `#[buttons(a, b, ..)]`
 //!   (bit flags, unknown bits cleared; also generates `Type::A`, `Type::B` consts).
 
+mod claims;
 mod event;
 mod fact;
 mod input;
@@ -89,6 +91,16 @@ pub fn derive_game_record(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(FactCommand, attributes(fact))]
 pub fn derive_fact_command(input: TokenStream) -> TokenStream {
     finish(fact::expand(parse_macro_input!(input as DeriveInput)))
+}
+
+/// Declare a game's ticket extension claims (match id, team, party…):
+/// a struct with named fields that also derives serde `Serialize` and
+/// `Deserialize`. Generates `TicketExtension::CLAIMS` (serialized names).
+/// Identity-, reward- and economy-looking names are rejected with the same
+/// deny list as [`FactCommand`]; `rename_all` and `flatten` are refused.
+#[proc_macro_derive(TicketExtension)]
+pub fn derive_ticket_extension(input: TokenStream) -> TokenStream {
+    finish(claims::expand(parse_macro_input!(input as DeriveInput)))
 }
 
 /// Declare a zone's client-predicted step:

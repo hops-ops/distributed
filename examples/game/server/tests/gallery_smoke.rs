@@ -41,6 +41,7 @@ impl Rig {
                     nonce: "n1".into(),
                     role: Role::Player,
                     name: None,
+                    extensions: Default::default(),
                 },
                 0,
                 "",

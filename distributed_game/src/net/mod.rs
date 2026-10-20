@@ -174,6 +174,12 @@ pub struct ServerConfig {
     /// `None` = HS256 tickets signed with `ticket_key`. Expiry, route zone
     /// and single use are enforced by the server either way.
     pub ticket_verifier: Option<SharedTicketVerifier>,
+    /// Extension claims tickets may carry
+    /// ([`ExtensionSchema::of::<E>()`](crate::ExtensionSchema::of) for a
+    /// `#[derive(TicketExtension)]` type). `None` = a ticket with any `ext`
+    /// claims is refused. Applies to join (any verifier) and transfer
+    /// tickets.
+    pub ticket_extensions: Option<crate::claims::ExtensionSchema>,
     /// Deadline for the first (Hello) frame.
     pub hello_timeout: Duration,
     /// Sustained inputs per second per connection.
@@ -251,12 +257,19 @@ impl ServerConfig {
         self
     }
 
+    /// Admit ticket extension claims of type `E`.
+    pub fn with_ticket_extensions<E: crate::TicketExtension>(mut self) -> Self {
+        self.ticket_extensions = Some(crate::claims::ExtensionSchema::of::<E>());
+        self
+    }
+
     /// Defaults with the given ticket key.
     pub fn new(ticket_key: TicketKey) -> Self {
         Self {
             host: HostConfig::default(),
             ticket_key,
             ticket_verifier: None,
+            ticket_extensions: None,
             hello_timeout: Duration::from_secs(5),
             input_rate: 120.0,
             input_burst: 240.0,
@@ -1076,6 +1089,7 @@ async fn run_zone<Z>(
                 nonce,
                 role: Role::Player,
                 name: request.name.clone(),
+                extensions: request.extensions.clone(),
             },
             source_zone: request.source_zone.clone(),
             issuer: inner.host_id.clone(),
@@ -1836,6 +1850,12 @@ fn verify_hello_ticket(
             return Err(TicketError::Expired);
         }
     }
+    let extensions = match &verified {
+        VerifiedTicket::Join(claims) => &claims.extensions,
+        VerifiedTicket::Transfer(transfer) => &transfer.claims.extensions,
+    };
+    crate::claims::validate_extensions(cfg.ticket_extensions.as_ref(), extensions)
+        .map_err(|e| TicketError::Invalid(e.to_string()))?;
     Ok(verified)
 }
 

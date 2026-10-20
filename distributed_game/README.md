@@ -451,7 +451,9 @@ runnable: [`examples/game/sveltekit`](../examples/game/sveltekit)
    role }`; any other body field is refused, so identity, ownership and
    rewards never come from the request. Same-origin, a per-principal rate
    limit and `cache-control: no-store` are built in; the zone server still
-   enforces signature, zone, expiry and single use. `js/tests` reproduce
+   enforces signature, zone, expiry and single use. Extension claims (match
+   id, team…) come only from the server-side `claims(context)` callback and
+   are signed under `ext`. `js/tests` reproduce
    `tests/fixtures/sveltekit_tickets.json` byte for byte and `net_e2e`
    admits those tickets on a real `GameServer` (and refuses tampered,
    expired, wrong-zone and replayed ones).
@@ -913,6 +915,20 @@ principals commit concurrently; settlements arrive in completion order.
   enforces route zone, expiry and single use; `TicketClaims::name` becomes
   `PlayerInfo::name` / `ObserverInfo::name` and travels with handoffs.
   Transfer tickets always use `ticket_key`.
+- **Extension claims**: game-declared claims the issuer vouches for (match
+  id, team, party) travel in the ticket's `ext` object. Declare them once —
+  `#[derive(Serialize, Deserialize, TicketExtension)] struct MatchClaims {
+  match_id: String, team: u8 }` — and admit them with
+  `ServerConfig::with_ticket_extensions::<MatchClaims>()`. The derive
+  refuses identity-, reward- and economy-looking names (the `FactCommand`
+  deny list, shared with the JS handler through
+  `tests/fixtures/trusted_field_denylist.json`); the server refuses tickets
+  whose `ext` has undeclared names or wrong types, and any `ext` when no
+  schema is declared (join tickets from any verifier and transfer tickets
+  alike). Zones read them typed in `on_auth`
+  (`req.claims.extensions.typed::<MatchClaims>()`) and afterwards from
+  `PlayerInfo::extensions`; a rejoin replaces them with the fresh ticket's
+  and handoffs carry them to the next zone.
 - **Input pacing**: `InputCredits::new(max)` gives each player one input
   credit per tick (banking up to `max` for jitter bursts);
   `credits.take(ctx, player)` consumes queued inputs while credits last, so
