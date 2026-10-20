@@ -37,9 +37,9 @@ const headers = {
   "x-roles": "user",
 };
 const nonce = Date.now().toString(36);
-// `CELLD` selects the binary (default: `celld` on PATH). celld 0.6 watches the
+// `CELLD_BIN` selects the binary (default: `celld` on PATH). celld 0.6 watches the
 // project by default; this proof owns its build, so it opts out when supported.
-const celld = process.env.CELLD || "celld";
+const celld = process.env.CELLD_BIN || "celld";
 const celldVersion = execFileSync(celld, ["--version"], { encoding: "utf8" })
   .split("\n")
   .find(line => line.startsWith("celld "));

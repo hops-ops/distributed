@@ -51,7 +51,7 @@ make test               # cargo test --workspace (CI)
 ```sh
 cd tests/e2e-ui
 make up                 # Zitadel + Postgres (read models + login)
-make up-celld-nats      # celld 0.4 local store + NATS
+make up-celld-nats      # celld local store + Queue relay + NATS
 
 cd ../e2e-celld
 make run                # public gateway :8791 + internal UI :5180 (watches sources)
@@ -82,4 +82,5 @@ Open `http://localhost:8791`. The navbar shows a **celld** badge. Sign in
 (`alice` / `Password1!` when Zitadel is up). Todos create/complete and
 lobby posts go to cells; open Chat in two tabs to see `@live` still fire.
 
-Override a busy celld port: `CELLD_HTTP_PORT=18880 make run`.
+celld listens on 18880 by default (Zitadel owns 18080). Override a busy port
+with `CELLD_HTTP_PORT=<port>` on both `make up-celld-nats` and `make run`.

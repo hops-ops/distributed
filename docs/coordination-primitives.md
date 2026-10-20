@@ -275,7 +275,7 @@ cargo test --features workers-rs --lib cell_host
 ```
 
 `tests/celld/alarms.mjs` owns its own `celld dev` process (no Docker; set
-`CELLD` to choose the binary) and proves the alarm row commits atomically,
+`CELLD_BIN` to choose the binary) and proves the alarm row commits atomically,
 periodic re-arm at the alarm cadence, that the watchdog and domain alarms do
 not starve each other, and exactly-once firing across a celld restart.
 

@@ -37,7 +37,8 @@
 # multi-host demo's zone leases and hibernation snapshots) run on celld,
 # never natively; state persists in .data/<demo>/celld (Mob Pit:
 # MOBPIT_DATA_DIR/celld). CELLD_BIN names the binary (default: `celld` on
-# PATH; 0.6.2 or newer is required), CELLD_PORT its port (default
+# PATH; the version pinned in .celld-version, checked by
+# scripts/celld.sh), CELLD_PORT its port (default
 # GAME_DEMOS_PORT + 3; cluster demos GAME_DEMOS_PORT + 4),
 # CELLD_ESBUILD its bundler (default: the client's esbuild). The worker is
 # built with worker-build (`cargo install worker-build --locked`).
@@ -55,7 +56,6 @@ DEMOS=(arena mobpit leaderboard gallery freeze grid ripple)
 # Single-process demos whose durable state lives in celld cells (the
 # multi-host ones always run on celld too: zone leases and hibernation).
 CELLD_DEMOS=(mobpit leaderboard freeze)
-CELLD_MIN_VERSION="0.6.2"
 export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
 # Multi-host demos: `game-demos <demo> --host-id A|B --peer …`.
 CLUSTER_DEMOS=(grid ripple)
@@ -95,20 +95,10 @@ ensure_sveltekit() {
 	fi
 }
 
-# ensure_celld: resolve CELLD_BIN (>= CELLD_MIN_VERSION) and CELLD_ESBUILD.
+# ensure_celld: resolve CELLD_BIN (the pinned celld, `.celld-version`) and
+# CELLD_ESBUILD. scripts/celld.sh prints the upgrade command on a mismatch.
 ensure_celld() {
-	CELLD_BIN="${CELLD_BIN:-$(command -v celld || true)}"
-	if [[ -z "$CELLD_BIN" || ! -x "$CELLD_BIN" ]]; then
-		echo "celld not found: set CELLD_BIN to a celld $CELLD_MIN_VERSION+ binary" >&2
-		echo "  (install: curl -fsSL https://celld.dev/install.sh | CELLD_VERSION=v$CELLD_MIN_VERSION sh)" >&2
-		exit 1
-	fi
-	local version
-	version="$("$CELLD_BIN" --version 2>/dev/null | sed -n 's/^celld \([0-9][0-9.]*\).*/\1/p' | head -1)"
-	if [[ -z "$version" ]] || [[ "$(printf '%s\n%s\n' "$CELLD_MIN_VERSION" "$version" | sort -V | head -1)" != "$CELLD_MIN_VERSION" ]]; then
-		echo "$CELLD_BIN is celld ${version:-(unknown)}; Mob Pit needs celld $CELLD_MIN_VERSION or newer (set CELLD_BIN)" >&2
-		exit 1
-	fi
+	CELLD_BIN="$("$REPO/scripts/celld.sh" check "${CELLD_BIN:-}")" || exit 1
 	if [[ -z "${CELLD_ESBUILD:-}" ]]; then
 		ensure_client
 		CELLD_ESBUILD="$CLIENT/node_modules/.bin/esbuild"

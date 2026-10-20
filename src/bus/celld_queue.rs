@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// Version of the JSON body stored in celld Queue.
 pub const CELLD_QUEUE_ENVELOPE_VERSION: u16 = 1;
 
-/// celld 0.4 Queue's maximum serialized message body.
+/// celld Queue's maximum serialized message body.
 pub const CELLD_QUEUE_MAX_BODY_BYTES: usize = 128 * 1024;
 
 /// Conventional authenticated native relay endpoint used by Queue consumers.

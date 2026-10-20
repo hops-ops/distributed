@@ -1,4 +1,4 @@
-# celld 0.4 aggregate cells, Queue, and bus relay
+# celld aggregate cells, Queue, and bus relay
 
 This fixture exercises the write side of the Distributed flow:
 
@@ -45,7 +45,7 @@ on an isolated `celld dev` (including a crash and restart):
 
 ```sh
 (cd tests/celld/alarm-worker && worker-build --release)
-CELLD=celld node tests/celld/alarms.mjs
+CELLD_BIN=celld node tests/celld/alarms.mjs
 ```
 
 The Queue lives in another cell: its acceptance is **not** part of the
@@ -154,7 +154,8 @@ correctness.
 
 ## Local celld
 
-Prerequisites: Docker (for NATS), celld 0.4, `worker-build`, and the
+Prerequisites: Docker (for NATS), celld (the version in `/.celld-version`,
+checked by `scripts/celld.sh`; `CELLD_BIN` selects the binary), `worker-build`, and the
 `wasm32-unknown-unknown` Rust target.
 
 ```sh
@@ -163,7 +164,7 @@ make -C tests/celld test
 make -C tests/celld down
 ```
 
-celld 0.4 development mode supplies its own local object store; Azurite, MinIO,
+celld development mode supplies its own local object store; Azurite, MinIO,
 and an external S3 endpoint are not used. The canonical profile stores cell and
 Queue data in `tests/celld/worker/.celld/dev`. `make down` and `make reload`
 preserve that directory.

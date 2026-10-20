@@ -50,7 +50,7 @@ async function until(description, predicate, timeout = 70_000) {
 }
 async function start() {
   const log = createWriteStream(join(artifacts, `celld-${++generation}.log`));
-  child = spawn("celld", ["dev", project, "--host", "127.0.0.1", "--port", String(port), "--logs"], {
+  child = spawn(process.env.CELLD_BIN || "celld", ["dev", project, "--host", "127.0.0.1", "--port", String(port), "--logs"], {
     detached: true,
     env: { ...process.env, RUST_LOG: "warn" },
     stdio: ["ignore", "pipe", "pipe"],

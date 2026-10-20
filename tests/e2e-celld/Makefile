@@ -1,6 +1,6 @@
 # Celld GraphQL example — sibling of tests/e2e-ui, not make run there.
 #
-#   make -C tests/e2e-ui up-celld-nats   # celld 0.4 local store + Queue + NATS
+#   make -C tests/e2e-ui up-celld-nats   # celld local store + Queue + NATS
 #   make run                             # this GraphQL host + the e2e-ui Svelte app
 #
 # Distributed owns the GraphQL + sibling UI lifecycle. The independent celld
@@ -16,7 +16,7 @@ PUBLIC_ORIGIN ?= http://localhost:8791
 UI_INTERNAL_ORIGIN ?= http://localhost:$(UI_PORT)
 UI_URL       ?= $(PUBLIC_ORIGIN)
 ENV_FILE     ?= ../e2e-ui/e2e-ui.env
-CELLD_HTTP_PORT ?= 18080
+CELLD_HTTP_PORT ?= 18880
 CELLD_URL    ?= http://127.0.0.1:$(CELLD_HTTP_PORT)
 NATS_PORT    ?= 14222
 NATS_URL     ?= nats://127.0.0.1:$(NATS_PORT)
@@ -46,13 +46,9 @@ run: $(if $(filter 1,$(WATCH_WORKER)),ensure-watch)
 	_celld="$(CELLD_URL)"; \
 	code=$$(curl -s -o /dev/null -w '%{http_code}' "$${_celld}/health" 2>/dev/null || echo 000); \
 	if [ "$$code" != "200" ]; then \
-	  if curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18880/health" 2>/dev/null | grep -q 200; then \
-	    _celld="http://127.0.0.1:18880"; \
-	  else \
-	    echo "celld not healthy at $$_celld — start: make -C ../e2e-ui up-celld-nats"; \
-	    echo "or: CELLD_HTTP_PORT=18880 make run"; \
-	    exit 1; \
-	  fi; \
+	  echo "celld not healthy at $$_celld — start: make -C ../e2e-ui up-celld-nats"; \
+	  echo "(a non-default port: CELLD_HTTP_PORT=<port> make run)"; \
+	  exit 1; \
 	fi; \
 	export CELLD_URL="$$_celld"; \
 	_nats="$(NATS_URL)"; \

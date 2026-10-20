@@ -122,7 +122,7 @@ wait_http() {
 }
 
 if [[ "$SKIP_GITOPS" != "1" ]]; then
-  if ! kubectl get ns >/dev/null 2>&1; then
+  if ! kubectl --context "$CONTEXT" get ns >/dev/null 2>&1; then
     die "kubectl cannot talk to a cluster (set KUBECONFIG); dual gitops requires local CP"
   fi
   log "reconciling workspace $ALICE_NAME from $ALICE_E2E"
@@ -145,9 +145,9 @@ wait_http "$ALICE_URL" alice 120
 wait_http "$BOB_URL" bob 120
 
 # Assert gitops isolation: distinct OIDC names if present
-if kubectl get oidc.application.zitadel.m.crossplane.io -A >/dev/null 2>&1; then
-  kubectl get oidc.application.zitadel.m.crossplane.io -A -o wide 2>/dev/null | tee "$SCRATCH/oidc-apps.log" || true
-  kubectl get project.project.zitadel.m.crossplane.io -A 2>/dev/null | tee "$SCRATCH/projects.log" || true
+if kubectl --context "$CONTEXT" get oidc.application.zitadel.m.crossplane.io -A >/dev/null 2>&1; then
+  kubectl --context "$CONTEXT" get oidc.application.zitadel.m.crossplane.io -A -o wide 2>/dev/null | tee "$SCRATCH/oidc-apps.log" || true
+  kubectl --context "$CONTEXT" get project.project.zitadel.m.crossplane.io -A 2>/dev/null | tee "$SCRATCH/projects.log" || true
 fi
 
 # Playwright HMR — fail the suite if this fails (do not swallow via bare pipe).
