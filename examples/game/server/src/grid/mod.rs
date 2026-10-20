@@ -18,7 +18,8 @@
 //!   ring ([`HashRing`]); a Hello for a foreign zone gets `Redirect`, a
 //!   handoff into it reserves the transfer ticket with the issuing host.
 //! - **Hibernation**: a zone nobody is in or observing turns Dormant, then
-//!   hibernates into SQLite (critter positions and dropped markers) and
+//!   hibernates into its `zone-state/{zone}` celld cell (critter positions
+//!   and dropped markers; large snapshots in the cell's R2 bucket) and
 //!   restores on the next activation; its hello says `restored`.
 //!
 //! Zone ids: `grid.<x>.<y>` with canonical integers, |x|, |y| ≤ 1 000 000.

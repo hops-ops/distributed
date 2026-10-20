@@ -14,7 +14,7 @@
 //!   zone's queue (`RetryPolicy::until_settled`), never in a local store.
 //! - Each kill commit also writes the `crawler.mob_killed` domain event to
 //!   the cell's outbox in the same cell transaction. celld drains it to the
-//!   `mobpit-outbox` Queue; the worker's consumer relays every message to
+//!   `game-demo-outbox` Queue; the worker's consumer relays every message to
 //!   this server's authenticated `/internal/celld-queue/relay`
 //!   (`crate::common::relay`), which publishes it onto the projection bus.
 //!   `mobpit-service` and this server's [`super::directory`] project it

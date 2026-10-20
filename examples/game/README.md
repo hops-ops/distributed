@@ -369,6 +369,10 @@ What the TypeScript still restates, and why it stays:
 ```
 examples/game/
   run.sh                     one-command dev + smoke runner
+  cells/                     crate `game-demo-cells` (own workspace, wasm32, worker-build): the
+                             demos' celld cells — Crawler + presence (Mob Pit), gem pouch +
+                             content log (The Freeze), zone lease + zone state (multi-host
+                             demos), and the `game-demo-outbox` Queue consumer (relay)
   server/                    Rust crate `game_demos`, its own cargo workspace (with sim/,
                              crawler/, service/); also the `distributed build|dev` project
     crawler/                 crate `mobpit_crawler`: Crawler aggregate, RecordKill (XP rules),
@@ -382,11 +386,15 @@ examples/game/
                              server and to wasm32 for the browser
     src/main.rs              `game-demos <demo>` subcommands (+ hidden `predict-trace`)
     src/predict_trace.rs     native traces of every step (recorded inputs) and pure function (arguments)
-    src/common/              shared: Demo trait, run/spawn, dev routes, guests
+    src/common/              shared: Demo trait, run/spawn, dev routes, guests;
+                             celld.rs (CelldOptions: celld URL + internal secret),
+                             relay.rs (authenticated /internal/celld-queue/relay → SqliteBus),
+                             zone_status.rs (zone lease/snapshot status read model)
+    src/devcelld.rs          `celld dev` harness for tests (own project, port, process tree)
     src/cluster.rs           multi-host demos: --host-id/--peer, directory, ownership, snapshots
     src/arena/               Arena zone (`movement` = `game_sim::arena`)
-    src/mobpit/              Mob Pit zone, Crawler cells, fact sink + projection-bus drain,
-                             leaderboards, dev routes
+    src/mobpit/              Mob Pit zone, fact sink to the Crawler/presence cells, crawler
+                             directory projection, leaderboards, dev routes
     src/gallery/             Shooting Gallery zone (targets, rewind hit tests)
     src/freeze/              The Freeze zone, content packs, two-host world + admin routes
     src/grid/                Endless Grid zone (`world` = `game_sim::grid`), dev map routes
@@ -425,7 +433,8 @@ examples/game/
                              arena-headless, mobpit-headless, leaderboard-headless,
                              gallery-headless, freeze-headless, grid-headless,
                              ripple-headless (+ helpers/demo-server.mjs, helpers/mobpit.mjs,
-                             helpers/cluster.mjs for multi-host demos)
+                             helpers/cluster.mjs for multi-host demos, helpers/celld.mjs for
+                             a per-test `celld dev`)
 ```
 
 The server crate is excluded from the root workspace (`Cargo.toml`
@@ -481,7 +490,7 @@ after dying. Level `n` starts at `40·(n−1)²` XP.
 5. The read model (`crawler/`, `service/`): `crawler.mob_killed` is a
    **domain event** — the same transaction writes the post-kill
    `CrawlerState` (principal, name, XP, kills, level) to the cell's outbox
-   (`repo.publish_events()`). celld drains the outbox to the `mobpit-outbox`
+   (`repo.publish_events()`). celld drains the outbox to the `game-demo-outbox`
    Queue; the cells worker's Queue consumer relays each message to the zone
    server's `/internal/celld-queue/relay` (secret-authenticated), which
    publishes it onto the `SqliteBus` at `--projection-bus` (default
@@ -547,12 +556,15 @@ kills ≤ settled + in flight`, the board (rebuilt at boot) equals the cells,
 and re-committing a pre-crash fact (same key and input) returns the original
 receipt with `replayed: true` and unchanged kills.
 
-**celld.** `run.sh mobpit|leaderboard|sveltekit|smoke` need celld 0.6.2+
-(`CELLD_BIN`, default `celld` on PATH; install with
-`curl -fsSL https://celld.dev/install.sh | CELLD_VERSION=v0.6.2 sh`) and
-`worker-build` (`cargo install worker-build --locked`) for `cells/`. The
-tests (`tests/mobpit_smoke.rs`, `service/tests/projection.rs`, the headless
-and Playwright tests) each start their own `celld dev` on a temp project
+**celld.** Every demo with durable state runs its cells on celld:
+`run.sh mobpit|leaderboard|freeze|grid|ripple|sveltekit|smoke` need the celld
+version pinned in the repository's `.celld-version` (`CELLD_BIN`, default
+`celld` on PATH; `scripts/celld.sh check` verifies it and prints the install
+command) and `worker-build` (`cargo install worker-build --locked`) for
+`cells/`. Only `arena` and `gallery` run without celld. The tests
+(`tests/mobpit_smoke.rs`, `tests/freeze_smoke.rs`, `tests/grid_smoke.rs`,
+`tests/ripple_smoke.rs`, `service/tests/projection.rs`, the headless and
+Playwright tests) each start their own `celld dev` on a temp project
 (`game_demos::devcelld`, `client/tests/helpers/celld.mjs`).
 
 ## Leaderboard
@@ -584,7 +596,9 @@ and Playwright tests) each start their own `celld dev` on a temp project
 
 Dev routes (`--dev` only, none takes an identity or a reward):
 `GET|POST /dev/mobpit/storage`, `GET /dev/mobpit/stats` (sink counters,
-pending, recent commits), `GET /dev/mobpit/crawlers` (every cell on disk),
+pending, recent commits), `GET /dev/mobpit/crawlers` (every crawler in the
+directory: the `player_stats` projection of the cells' events, eventually
+consistent), `GET /dev/mobpit/presence` (the presence cells' view),
 `GET /dev/mobpit/leaderboard[?member=]`, `POST /dev/mobpit/leaderboard/rebuild`.
 
 ## Adding a demo

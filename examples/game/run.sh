@@ -106,7 +106,8 @@ ensure_celld() {
 	export CELLD_BIN CELLD_ESBUILD
 }
 
-# ensure_cells: build the Mob Pit cells worker when its sources changed.
+# ensure_cells: build the demos' cells worker (examples/game/cells) when its
+# sources changed.
 ensure_cells() {
 	local marker="$CELLS/build/worker/shim.mjs"
 	if [[ ! -f "$marker" ]] || [[ -n "$(find "$CELLS/src" "$CELLS/Cargo.toml" "$SERVER/crawler" "$REPO/src" "$REPO/distributed_game/src" -newer "$marker" -name '*.rs' -print -quit 2>/dev/null)" ]] ||
@@ -115,7 +116,7 @@ ensure_cells() {
 			echo "worker-build not found: cargo install worker-build --locked" >&2
 			exit 1
 		}
-		log "building the Mob Pit cells worker (worker-build)"
+		log "building the demos' cells worker (worker-build)"
 		(cd "$CELLS" && worker-build --release >/dev/null)
 	fi
 }
@@ -379,7 +380,8 @@ run_sveltekit() {
 smoke() {
 	ensure_sdk
 	ensure_client
-	# Mob Pit's tests start their own `celld dev` (CELLD_BIN) on the worker.
+	# The celld-backed tests (Mob Pit, The Freeze, grid, ripple) start their
+	# own `celld dev` (CELLD_BIN) on the cells worker.
 	ensure_celld
 	ensure_cells
 	log "generated clients are current; predicted steps and pure functions compiled to WASM"
@@ -411,7 +413,7 @@ case "${1:-}" in
 	gen) gen "${2:-}" ;;
 	sveltekit) run_sveltekit ;;
 	list) printf '%s\n' "${DEMOS[@]}" sveltekit ;;
-	"" | -h | --help | help) sed -n '2,39p' "$0" ;;
+	"" | -h | --help | help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
 	*)
 		if [[ " ${CLUSTER_DEMOS[*]} " == *" $1 "* ]]; then
 			run_cluster "$1"

@@ -436,7 +436,7 @@ async fn bots_fight_slow_storage_keeps_the_tick_flat_and_boards_match_cells() {
     })
     .await;
     let total = assert_board_matches_cells(&world).await;
-    eprintln!("bots: {stats:?}, kills on disk {total}");
+    eprintln!("bots: {stats:?}, durable kills in the cells {total}");
     assert_eq!(total, stats.committed, "one kill per committed fact");
     let (_, rebuild) = http(demo.addr, "POST", "/dev/mobpit/leaderboard/rebuild", None).await;
     assert_eq!(rebuild["matchesCells"], true, "{rebuild}");

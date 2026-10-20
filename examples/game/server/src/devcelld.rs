@@ -1,4 +1,5 @@
-//! `celld dev` serving Mob Pit's cells (`examples/game/cells`) for tests:
+//! `celld dev` serving the demos' cells (`examples/game/cells`: Mob Pit,
+//! The Freeze, zone leases and hibernation state) for tests:
 //! its own project directory, port and process tree (killed on drop; only
 //! the processes this harness started).
 //!
@@ -52,11 +53,11 @@ pub struct DevCelld {
 
 impl DevCelld {
     /// Start celld on a fresh temp project. `relay_url` is where the outbox
-    /// Queue consumer relays domain events (a Mob Pit server's
+    /// Queue consumer relays domain events (a demo server's
     /// `/internal/celld-queue/relay`); `None` keeps them queued.
     pub fn start(relay_url: Option<String>) -> Result<Self, String> {
         let project = std::env::temp_dir().join(format!(
-            "mobpit-celld-{}-{}",
+            "game-demo-celld-{}-{}",
             std::process::id(),
             crate::common::random_hex(8)
         ));
@@ -70,7 +71,7 @@ impl DevCelld {
         let build = cells_dir().join("build");
         if !build.join("worker/shim.mjs").exists() {
             return Err(format!(
-                "the Mob Pit cells worker is not built: run `worker-build --release` in {} \
+                "the demos' cells worker is not built: run `worker-build --release` in {} \
                  (examples/game/run.sh does)",
                 cells_dir().display()
             ));
@@ -100,7 +101,7 @@ impl DevCelld {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// Options for a Mob Pit world on this celld.
+    /// Options for a demo world on this celld.
     pub fn options(&self) -> CelldOptions {
         CelldOptions::new(self.url(), self.secret.clone()).expect("celld options")
     }
@@ -119,8 +120,8 @@ impl DevCelld {
         self.generation += 1;
         let binary = std::env::var(CELLD_BIN_ENV).map_err(|_| {
             format!(
-                "{CELLD_BIN_ENV} is not set: Mob Pit's cells run on celld (0.6.2+); \
-                 point {CELLD_BIN_ENV} at the celld binary"
+                "{CELLD_BIN_ENV} is not set: the demos' cells run on celld (the version in \
+                 .celld-version); point {CELLD_BIN_ENV} at the celld binary"
             )
         })?;
         let mut vars = format!("DISTRIBUTED_INTERNAL_SECRET={}\n", self.secret);

@@ -94,7 +94,7 @@ The words used throughout:
 
 ## Try it
 
-Seven runnable demos live in [`examples/game`](../examples/game/README.md),
+Eight runnable demos live in [`examples/game`](../examples/game/README.md),
 each built to show one part of the engine:
 
 | Demo | Run | Shows |

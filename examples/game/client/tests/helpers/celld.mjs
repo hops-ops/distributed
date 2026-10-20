@@ -1,5 +1,5 @@
 /**
- * `celld dev` serving Mob Pit's cells (`examples/game/cells`) for one Node
+ * `celld dev` serving the demos' cells (`examples/game/cells`) for one Node
  * test: its own temp project, port and internal secret; `stop()` kills the
  * process tree this helper started (nothing else).
  *
@@ -38,11 +38,11 @@ export function freePort() {
  */
 export async function startCelld({ relayPort } = {}) {
 	const bin = process.env.CELLD_BIN;
-	if (!bin) throw new Error('CELLD_BIN is not set: Mob Pit\'s cells run on celld (0.6.2+); point CELLD_BIN at the celld binary');
+	if (!bin) throw new Error('CELLD_BIN is not set: the demos\' cells run on celld (the version in .celld-version); point CELLD_BIN at the celld binary');
 	if (!existsSync(join(CELLS, 'build/worker/shim.mjs'))) {
-		throw new Error(`the Mob Pit cells worker is not built: run \`worker-build --release\` in ${CELLS}`);
+		throw new Error(`the demos' cells worker is not built: run \`worker-build --release\` in ${CELLS}`);
 	}
-	const project = mkdtempSync(join(tmpdir(), 'mobpit-celld-js-'));
+	const project = mkdtempSync(join(tmpdir(), 'game-demo-celld-js-'));
 	cpSync(join(CELLS, 'build'), join(project, 'build'), { recursive: true });
 	cpSync(join(CELLS, 'wrangler.jsonc'), join(project, 'wrangler.jsonc'));
 	const secret = `test-only-${randomBytes(24).toString('hex')}`;

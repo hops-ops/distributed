@@ -1,6 +1,7 @@
 # Mob Pit's business-side read model: a Distributed service that projects
-# the Crawler cells' published `crawler.mob_killed` domain events (drained
-# by the zone server onto a SQLite bus) into a `player_stats` SQL table and
+# the Crawler cells' published `crawler.mob_killed` domain events (celld
+# drains each cell outbox to a Queue; its consumer relays them through the
+# zone server onto a SQLite bus) into a `player_stats` SQL table and
 # serves it over GraphQL with `@live`. Read-only: it has no commands, so
 # nothing here can credit XP.
 [package]

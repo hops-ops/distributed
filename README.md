@@ -571,7 +571,7 @@ with interest management, client prediction (`@hops-ops/distributed/game`),
 outcomes saved as idempotent commands on cells without ever pausing the
 game, and zones spread across servers with handoff, hibernation and live
 content updates. Start with **[`distributed_game/README.md`](distributed_game/README.md)**;
-seven runnable demos are in [`examples/game`](examples/game/README.md).
+eight runnable demos are in [`examples/game`](examples/game/README.md).
 
 ---
 

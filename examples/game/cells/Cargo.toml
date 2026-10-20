@@ -10,7 +10,7 @@ members = ["."]
 resolver = "2"
 
 [package]
-name = "mobpit-cells"
+name = "game-demo-cells"
 version = "0.1.0"
 edition = "2021"
 publish = false

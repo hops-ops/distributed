@@ -7,7 +7,7 @@
 //!   aggregate with its `#[command]` `crawler.record_kill` (XP decided here
 //!   from the mob tier; the principal comes from the trusted fact session).
 //!   Each commit writes the `crawler.mob_killed` domain event to the cell
-//!   outbox, which drains to the `mobpit-outbox` Queue.
+//!   outbox, which drains to the `game-demo-outbox` Queue.
 //! - `presence/{principal}` (`PresenceCell`): the runtime's player lifecycle
 //!   facts (`zone.*`). A fact emitted before the one that set the current
 //!   entry (`FactStamp::emission_order`) is ignored, so a late "left pit-1"

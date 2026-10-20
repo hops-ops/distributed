@@ -3,7 +3,7 @@
 // copy of this file with DISTRIBUTED_INTERNAL_SECRET and
 // CELLD_QUEUE_RELAY_URL (the zone server's `/internal/celld-queue/relay`).
 {
-  "name": "mobpit-cells",
+  "name": "game-demo-cells",
   "main": "build/worker/shim.mjs",
   "compatibility_date": "2026-01-01",
   "durable_objects": {
@@ -27,15 +27,15 @@
   ],
   "queues": {
     "producers": [
-      { "binding": "OUTBOX", "queue": "mobpit-outbox" }
+      { "binding": "OUTBOX", "queue": "game-demo-outbox" }
     ],
     "consumers": [
       {
-        "queue": "mobpit-outbox",
+        "queue": "game-demo-outbox",
         "max_batch_size": 10,
         "max_batch_timeout": 1,
         "max_retries": 100,
-        "dead_letter_queue": "mobpit-outbox-dlq",
+        "dead_letter_queue": "game-demo-outbox-dlq",
         "retry_delay": 2
       }
     ]

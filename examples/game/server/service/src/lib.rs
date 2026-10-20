@@ -1,9 +1,11 @@
 //! Mob Pit's business-side read model (dev demo).
 //!
 //! ```text
-//! zone ──fact──▶ Crawler cell (RecordKill: XP decided there; event + outbox
-//!                row in one SQLite transaction)
-//!        └─ zone server drains the cell outbox ──▶ SQLite bus (`bus_log`)
+//! zone ──fact──▶ Crawler cell on celld (RecordKill: XP decided there; event
+//!                + outbox row in one cell SQLite transaction)
+//!        └─ celld drains the outbox ──▶ `game-demo-outbox` Queue ──▶ consumer
+//!           relays to the zone server's /internal/celld-queue/relay
+//!           ──▶ SQLite bus (`bus_log`)
 //!                                                   │ ordered, at-least-once
 //!   mobpit-service: modeled projector `project_player_stats` ◀──┘
 //!        └─ upsert `player_stats` (checkpointed, deduplicated) ──▶ GraphQL
