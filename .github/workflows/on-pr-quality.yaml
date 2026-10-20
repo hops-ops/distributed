@@ -82,3 +82,6 @@ jobs:
 
   celld:
     uses: ./.github/workflows/integration-celld.yaml
+
+  wasm32-domains:
+    uses: ./.github/workflows/integration-wasm32-domains.yaml

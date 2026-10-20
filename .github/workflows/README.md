@@ -14,6 +14,7 @@ existing unbounded-tech quality provider plus the integration/* jobs below —
 | [`integration-*.yaml`](./) | yes | **This repo:** broker / DB / CLI / observability / GraphQL identity+OIDC |
 | [`integration-e2e-ui.yaml`](./integration-e2e-ui.yaml) | yes | **This repo:** `tests/e2e-ui` offline suite, compose Playwright e2e, and kind local-GitOps Playwright e2e |
 | [`integration-celld.yaml`](./integration-celld.yaml) | yes | **This repo:** `tests/e2e-celld` workspace tests, celld storage and cell-alarm proofs (`celld dev`), live celld+NATS |
+| [`integration-wasm32-domains.yaml`](./integration-wasm32-domains.yaml) | yes | **This repo:** every domain crate builds for `wasm32-unknown-unknown` (`scripts/check-wasm32-domains.sh`), and a native-only fixture must fail |
 | [`integration-js.yaml`](./integration-js.yaml) | yes | **This repo:** install, typecheck, test, build, and packed-consumer smoke test for `js/` |
 | [`on-pr-quality.yaml`](./on-pr-quality.yaml) | entry | **This repo** PR gate (not the consumer quality contract) |
 | [`on-push-main-version-and-tag.yaml`](./on-push-main-version-and-tag.yaml) | entry | **This repo** main → **vnext** tag |
