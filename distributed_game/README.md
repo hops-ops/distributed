@@ -663,9 +663,11 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
 - The host attaches the killer's **verified identity** from their ticket.
   The zone cannot claim to be someone else, and the payload names no
   reward amount; the command handler decides the XP from what it trusts.
-  The derive refuses identity- or reward-looking fields (`principal`,
-  `user_id`, `owner`, `xp`, `reward`, … including serde renames) at
-  compile time.
+  The derive refuses identity-, reward- and economy-looking fields
+  (`principal`, `user_id`, `owner`, `xp`, `reward`, `amount`, `coins`,
+  `gold`, `currency`, `price`, `cost`, `balance`, `grant`, `payout`,
+  `credit`, `debit`; `_`/`-`/case ignored, serde renames and aliases
+  included) at compile time, one error per field.
 - Keys are restart-safe automatically: `ctx.emit(player, input)` uses the
   input's `#[fact(key(field, ..))]` parts, or the tick and emission order;
   `ctx.emit_keyed` takes explicit parts; `ctx.emit_zone` emits a zone

@@ -4,43 +4,10 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::spanned::Spanned;
-use syn::{DeriveInput, Expr, Ident, LitStr};
+use syn::{DeriveInput, Expr, Ident};
 
-use crate::shared::{field_name, find_attr, named_fields, no_generics, runtime};
-
-/// Field names a zone-emitted fact must never carry: identity is bound by
-/// the host from the verified ticket, rewards are decided by the handler.
-const FORBIDDEN: &[(&str, &str)] = &[
-    ("principal", "identity"),
-    ("user", "identity"),
-    ("user_id", "identity"),
-    ("userid", "identity"),
-    ("owner", "identity"),
-    ("owner_id", "identity"),
-    ("account", "identity"),
-    ("account_id", "identity"),
-    ("subject", "identity"),
-    ("sub", "identity"),
-    ("xp", "a reward"),
-    ("experience", "a reward"),
-    ("reward", "a reward"),
-    ("rewards", "a reward"),
-];
-
-fn normalized(name: &str) -> String {
-    name.chars()
-        .filter(|c| *c != '_' && *c != '-')
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn forbidden(name: &str) -> Option<&'static str> {
-    let n = normalized(name);
-    FORBIDDEN
-        .iter()
-        .find(|(bad, _)| normalized(bad) == n)
-        .map(|(_, why)| *why)
-}
+use crate::shared::{find_attr, named_fields, no_generics, runtime};
+use crate::trusted::reject_forbidden;
 
 pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     no_generics(&input, "FactCommand")?;
@@ -78,37 +45,11 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     };
 
     let fields = named_fields(&input, "FactCommand")?;
-    for field in &fields {
-        let ident = field.ident.as_ref().expect("named");
-        let mut names = vec![(field_name(ident), ident.span())];
-        // Serde renames change what the handler sees.
-        for a in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
-            let _ = a.parse_nested_meta(|meta| {
-                if meta.path.is_ident("rename") || meta.path.is_ident("alias") {
-                    if let Ok(value) = meta.value() {
-                        if let Ok(lit) = value.parse::<LitStr>() {
-                            names.push((lit.value(), lit.span()));
-                        }
-                    }
-                } else if meta.input.peek(syn::Token![=]) {
-                    let _ = meta.value()?.parse::<Expr>();
-                } else if meta.input.peek(syn::token::Paren) {
-                    let _ = meta.parse_nested_meta(|_| Ok(()));
-                }
-                Ok(())
-            });
-        }
-        for (name, span) in names {
-            if let Some(why) = forbidden(&name) {
-                return Err(syn::Error::new(
-                    span,
-                    format!(
-                        "fact input field `{name}` looks like {why}: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards"
-                    ),
-                ));
-            }
-        }
-    }
+    reject_forbidden(
+        &fields,
+        "fact input",
+        "a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values",
+    )?;
 
     let parts = match &key {
         None => quote!(::std::vec::Vec::new()),

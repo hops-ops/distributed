@@ -31,6 +31,7 @@ mod predict;
 mod pure;
 mod replicated;
 mod shared;
+mod trusted;
 
 use proc_macro::TokenStream;
 use syn::{parse_macro_input, DeriveInput, ItemFn};
@@ -81,8 +82,10 @@ pub fn derive_game_record(input: TokenStream) -> TokenStream {
 
 /// Bind a cell command input to its command:
 /// `#[fact(command = RECORD_KILL, key(mob, generation))]`. Requires
-/// `serde::Serialize`. Identity- and reward-looking field names are
-/// rejected.
+/// `serde::Serialize`. Identity-, reward- and economy-looking field names
+/// (`principal`, `user_id`, `xp`, `reward`, `amount`, `gold`, `price`,
+/// `balance`, `payout`, …; `_`/`-`/case ignored, serde renames included)
+/// are rejected.
 #[proc_macro_derive(FactCommand, attributes(fact))]
 pub fn derive_fact_command(input: TokenStream) -> TokenStream {
     finish(fact::expand(parse_macro_input!(input as DeriveInput)))

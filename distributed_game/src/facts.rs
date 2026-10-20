@@ -80,7 +80,8 @@ pub fn fact_key(prefix: &str, zone: &str, epoch: u64, parts: &[&dyn std::fmt::Di
 /// Trust rules (enforced by the host, not by this trait): the principal is
 /// bound from the player's verified ticket, never from the input; the input
 /// reports *what happened* (which mob died) and the command handler decides
-/// any reward. The derive rejects identity- and reward-looking field names.
+/// any reward or economy amount. The derive rejects identity-, reward- and
+/// economy-looking field names (`user_id`, `xp`, `amount`, `gold`, …).
 pub trait FactCommand: serde::Serialize {
     /// Durable command name.
     const COMMAND: &'static str;
