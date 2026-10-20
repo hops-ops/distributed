@@ -22,7 +22,9 @@ spec:
           projectName: e2e-ui
           projectNamespace: default
           humansNamespace: default
-          instanceLoginV2: true
+          # App-level OIDC loginVersion.baseUri is per namespace. Instance
+          # Features are global; only one primary lane may set this true.
+          instanceLoginV2: false
           demoUsers: true
           providerConfigRef:
             name: default
