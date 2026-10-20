@@ -333,6 +333,29 @@ keep `wasm/` out of version control and run `game-wasm` before bundling.
 Unlike browser WASM pures it needs no wasm-pack, wasm-bindgen glue or JSON
 bridge; the SDK instantiates the module directly over a binary ABI.
 
+## `distributed contracts check` / `accept` — the contract catalog
+
+```bash
+distributed contracts check                       # read-only; never writes tracked files
+distributed contracts check --output json
+distributed contracts accept --scope <scope> --staged staged.json
+```
+
+`check` loads the catalog (default `distributed.contracts.json` under
+`--root`, the current directory by default) and verifies that every entry's
+recorded identity still matches its sources (for this repository, the
+migration inventory). It exits non-zero on drift and
+prints what changed. `make contracts-check` and the PR quality workflow run it
+on this repository.
+
+`accept` takes one exact scope (no wildcards: `catalog`,
+`migration_inventory`, `surface_client_manifest`, `generated_client_tree`,
+`application_manifest`, `deployment_plan`, or `program:<id>`) and a staged JSON object mapping portable relative paths to UTF-8 contents.
+It writes those files through a staging directory with an atomic replace and
+rolls back on failure. An unchanged payload is a no-op.
+
+`distributed build` reads the same catalog.
+
 ## `distributed describe` — manifest as JSON
 
 ```bash

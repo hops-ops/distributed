@@ -887,6 +887,9 @@ duplicated as decision documents in this package.
   primitives.
 - `@hops-ops/distributed/replica` — replica, GraphQL transport, generated
   command runtime, query-plan helpers, and optional persistence.
+- `@hops-ops/distributed/replica/lazy` — `createLazyReplicaCommandRuntime`
+  only, so a client that loads commands on demand (the generated lazy
+  `commands.ts`) keeps eager command exports out of its first import graph.
 - `@hops-ops/distributed/diagnostics` — redacted support snapshots and artifact
   inspection.
 - `@hops-ops/distributed/sveltekit` — Svelte stores, island SSR composition,

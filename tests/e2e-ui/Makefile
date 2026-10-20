@@ -272,13 +272,9 @@ ui-install: js-build
 ui-test:
 	cd ui && $(NPM) test
 
-## Aggregate read-only contract check (repo root catalog when present).
+## Aggregate read-only contract check (the repository's distributed.contracts.json).
 contracts-check:
-	@if [ -f ../../contracts/catalog.json ] || [ -f contracts/catalog.json ]; then \
-	  $(MAKE) -C ../.. contracts-check; \
-	else \
-	  echo "contracts-check: no catalog yet; skipping aggregate gate"; \
-	fi
+	$(MAKE) -C ../.. contracts-check
 
 check: application-build
 	cargo check --workspace

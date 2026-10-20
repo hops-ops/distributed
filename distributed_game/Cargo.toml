@@ -23,7 +23,7 @@ command-host = ["cell", "distributed/graphql"]
 # celld clients: `CelldFactSink` (the command sink over a remote-only
 # `CelldCommandHost`), `CellZoneOwnership`, `CellZoneStateStore`.
 celld = ["cell", "command-host", "dep:reqwest", "dep:uuid"]
-# celld worker glue (wasm32 Durable Objects): `world::zone_state::worker`,
+# celld worker glue (wasm32 Durable Objects): `world::zone_state::celld_worker`,
 # the zone-state HTTP surface over a cell and an R2 bucket binding.
 workers-rs = ["cell", "dep:worker", "distributed/workers-rs"]
 # Per-zone Prometheus metrics (dependency-free text exposition).

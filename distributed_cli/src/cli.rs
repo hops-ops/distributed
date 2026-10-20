@@ -119,6 +119,8 @@ pub enum ServiceCommands {
     Build(BuildArgs),
     /// Run one coherent local application supervisor
     Dev(DevArgs),
+    /// Aggregate contract lifecycle check and accept
+    Contracts(ContractsArgs),
     /// Scaffold a new Distributed microservice crate
     #[command(alias = "create")]
     Scaffold(ScaffoldArgs),
@@ -222,7 +224,7 @@ pub struct ContractsCheckArgs {
     #[arg(long, default_value = ".")]
     pub root: PathBuf,
     /// Path to the contract catalog JSON (relative to root or absolute)
-    #[arg(long, default_value = "contracts/catalog.json")]
+    #[arg(long, default_value = "distributed.contracts.json")]
     pub catalog: PathBuf,
     /// Output format
     #[arg(long, value_enum, default_value = "human")]
@@ -762,6 +764,7 @@ pub fn run(args: &ServiceArgs) -> Result<(), Box<dyn Error>> {
     match &args.command {
         ServiceCommands::Build(build) => run_build(build, &["service"]),
         ServiceCommands::Dev(dev) => run_dev(dev, &["service"]),
+        ServiceCommands::Contracts(contracts) => run_contracts(contracts),
         ServiceCommands::Scaffold(scaffold) => run_scaffold(scaffold),
         ServiceCommands::Describe(describe) => run_describe(describe),
         ServiceCommands::Client(client) => run_client(client),
@@ -3225,5 +3228,27 @@ mod tests {
         let mut both = schema_args();
         both.db_url = Some("postgres://localhost/orders".to_string());
         assert!(atlas_spec_from_flags(&both, "sql".into()).is_err());
+    }
+
+    #[test]
+    fn hosted_service_commands_cover_every_public_distributed_command() {
+        use clap::Subcommand as _;
+        let names = |command: clap::Command| -> Vec<String> {
+            command
+                .get_subcommands()
+                .filter(|sub| !sub.is_hide_set())
+                .map(|sub| sub.get_name().to_string())
+                .collect()
+        };
+        let standalone = names(DistributedCommands::augment_subcommands(
+            clap::Command::new("distributed"),
+        ));
+        let hosted = names(ServiceCommands::augment_subcommands(clap::Command::new(
+            "service",
+        )));
+        assert_eq!(
+            standalone, hosted,
+            "`hops service` (ServiceArgs) must expose every public `distributed` command"
+        );
     }
 }

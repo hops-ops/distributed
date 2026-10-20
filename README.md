@@ -737,6 +737,16 @@ network servers.
 | `kafka` | No | `KafkaBus` (Kafka source/publisher). |
 | `redis` | No | `leaderboard::RedisLeaderboard` (sorted-set leaderboards) and `bus::RedisStreamPublisher` (Redis Streams `XADD`, id dedupe); implies `leaderboard-background`. The `leaderboard` module and `InMemoryLeaderboard` are always available. |
 | `leaderboard-background` | No | `leaderboard::BackgroundLeaderboard` (fire-and-forget updates on a Tokio task) over any `LeaderboardStore`, e.g. `InMemoryLeaderboard`, without pulling in Redis. |
+| `metrics` | No | `distributed::metrics`: framework counters and gauges with Prometheus text exposition (no SDK dependency); with `http`, a scrape handler. Bus receive loops record into it. |
+| `otel` | No | OpenTelemetry tracing spans for bus receive loops and `microsvc` dispatch/handlers (`opentelemetry`, `tracing-opentelemetry`). |
+| `workers-rs` | No | Cloudflare `worker` crate bindings for celld cells: the aggregate cell host and the celld Queue publisher/relay (`bus::CelldQueue*`) on `wasm32`. |
+| `application-runtime` (alias `runtime`) | No | Checked by `#[command]`/`portable_command!` output in the **declaring** crate: enable it in that crate's features to emit the runtime mounts (`*_mount`, `register_*`, `CommandDefinition`). Contract-only packages leave it off. |
+| `gateway` | No | `distributed::gateway`: portable gateway declarations (bindings, routes, dispatch). Starts no listeners. |
+| `gateway-native` | No | Native HTTP gateway adapter (hyper/tower), independent of GraphQL and SQL. |
+| `gateway-graphql` | No | Whole-operation GraphQL selection for the gateway (parser only). |
+| `gateway-delivery` | No | Portable identity, freshness and delivery contracts (snapshots, coalescing, live sharing). |
+| `gateway-graphql-native` | No | Native GraphQL execution behind the gateway, including WebSocket `@live` (implies `gateway-native`, `gateway-graphql`, `graphql`). |
+| `gateway-worker` | No | workers-rs gateway ingress and delivery contracts, without native executors. |
 
 > The `InMemoryBus`, `PostgresBus`, and `SqliteBus` need no separate broker
 > feature. SQL-backed bus support comes from the matching `postgres` or `sqlite`
@@ -816,7 +826,7 @@ Every infrastructure concern in `distributed` follows the same pattern: a **trai
 | Read model rows | `ReadModelWritePlanStore` + `RelationalReadModelQueryStore` | `InMemoryReadModelStore` | Postgres, SQLite |
 | Snapshot store | `SnapshotStore` | `InMemorySnapshotStore` | Postgres, SQLite, … |
 | Outbox publishing | `OutboxStore` + async `MessagePublisher` | `InMemoryRepository` outbox store (dev/test) | Any `MessagePublisher` (e.g. `BusPublisher` over a real `Bus`) |
-| Locking | `Lock` + `LockManager` | `InMemoryLockManager` | `PostgresLockManager`, `SqliteLockManager` (durable leases), Redis, … |
+| Locking | `Lock` + `LockManager` | `InMemoryLockManager` | `PostgresLockManager`, `SqliteLockManager` (durable leases); implement the traits for anything else |
 
 All in-memory defaults are `Clone` and `Send + Sync`, so they work in single-task tests and multi-task servers alike. When you're ready for production, implement the trait for your infrastructure and plug it in — handler code does not change.
 
@@ -2780,30 +2790,59 @@ reference: [`distributed_cli/README.md`](distributed_cli/README.md).
 
 ```text
 src/
-  aggregate/      # Aggregate trait, hydration, async aggregate repository helpers
-  bus/            # Bus facade + adapters (in-memory, sqlite, postgres, nats, rabbitmq, kafka, knative)
-  commit_builder/ # Transactional batches for aggregates, outbox, and read models
-  emitter/        # In-process event emitter helpers (feature = "emitter")
-  entity/         # Entity, event records, metadata, upcasting codecs
-  graphql/        # Query service: engine, permissions, identity, SDL, HTTP/WS (feature = "graphql")
-  in_memory_repo/   # In-memory repository (implements every async trait)
-  lock/           # Lock + lock manager traits, in-memory locks
-  microsvc/       # Command/event handler framework: service, context, session
-  outbox/         # Durable outbox message + commit extension
-  outbox_worker/  # Outbox claiming, publishing, workers
-  postgres_repo/  # Postgres async SQL repository (feature = "postgres")
-  queued_repo/    # Queue-based locking repository wrapper
-  read_model/     # Read model store traits, in-memory store, schema metadata
-  snapshot/       # Snapshot store traits, in-memory store, snapshot repository
-  sqlite_repo/    # SQLite async SQL repository (feature = "sqlite")
-  table/          # Neutral table/row primitives shared by read models and ops tables
-  lib.rs          # Public exports
-distributed_macros/
-  src/            # Proc macros: sourced, digest, aggregate, enqueue, ReadModel, Snapshot
-js/               # @hops-ops/distributed JS/TS client, command runtime, and SvelteKit adapter
-tests/e2e-ui/     # Full-stack CQRS + GraphQL + SvelteKit template (nested workspace)
-migrations/       # Explicit SQLite and Postgres migrations
-compose.yaml      # Local postgres / rabbitmq / kafka / nats for integration tests
+  aggregate/          # Aggregate trait, hydration, async aggregate repository helpers
+  application/        # Placement-independent application composition (modules, mounts, plans)
+  bus/                # Bus facade + adapters (in-memory, sqlite, postgres, nats, rabbitmq,
+                      #   kafka, knative, redis streams, celld Queue relay)
+  clock.rs            # Injectable wall clock for coordination primitives
+  command/            # Typed commands: Eventual/Atomic/Succeeded, prepared completions, client effects
+  command_dispatch/   # CommandHost: local, HTTP and remote dispatch boundary
+  command_ledger/     # Durable command identity and fenced commit primitives (crate-private)
+  commit_builder/     # Transactional batches for aggregates, outbox, and read models
+  domain_event/       # Typed outward domain events, separate from replay bytes
+  emitter/            # In-process event emitter helpers (feature = "emitter")
+  entity/             # Entity, event records, metadata, upcasting codecs
+  gateway/            # Portable application gateway contracts (feature = "gateway*")
+  graphql/            # Query service: engine, permissions, identity, SDL, HTTP/WS (feature = "graphql")
+  in_memory_repo/     # In-memory repository (implements every async trait)
+  leaderboard/        # Sorted-set leaderboards as a rebuildable projection target (memory, Redis)
+  lease/              # TTL leases with monotonic fencing tokens
+  lock/               # Lock + lock manager traits, in-memory locks
+  metrics/            # Prometheus-compatible framework metrics (feature = "metrics")
+  microsvc/           # Command/event handler framework: service, context, session, cell_host (celld)
+  mutation/           # Event-independent read-model mutation IR and interpreters
+  outbox/             # Durable outbox message + commit extension
+  outbox_worker/      # Outbox claiming, publishing, workers
+  postgres_repo/      # Postgres async SQL repository (feature = "postgres")
+  projection/         # Deterministic domain-event projection programs and runtime
+  projection_protocol/ # Projection identities, ordering vocabulary, codecs (+ projection_protocol.rs)
+  queued_repo/        # Queue-based locking repository wrapper
+  read_model/         # Read model store traits, in-memory store, schema metadata, keyset scans
+  repository/         # Repository traits (GetStream, TransactionalCommit, …)
+  saga/               # Event-sourced process managers for cross-cell workflows (incl. fan-out)
+  schedule.rs         # Portable aggregate schedules, host clock, backend capabilities
+  snapshot/           # Snapshot store traits, in-memory store, snapshot repository
+  sqlite_repo/        # SQLite async SQL repository (feature = "sqlite")
+  sqlx_repo/          # SQL code shared by the Postgres and SQLite repositories
+  table/              # Neutral table/row primitives shared by read models and ops tables
+  telemetry.rs        # Telemetry vocabulary shared by metrics and tracing
+  time.rs             # Wall clock that also works on wasm32
+  trace_context.rs    # W3C trace-context metadata helpers
+  lib.rs              # Public exports
+distributed_macros/   # Proc macros: sourced, digest, aggregate, enqueue, command, portable_command,
+                      #   module, application, mutation!, ReadModel, Snapshot, DomainState,
+                      #   DomainEvent, CommandInput, CommandOutput (projection! is in src/lib.rs)
+distributed_cli/      # The `distributed` CLI (build/dev lifecycle, client codegen, contracts
+                      #   check/accept, game-manifest/game-client/game-wasm); also a library
+distributed_game/     # Authoritative multiplayer zone runtime: fixed tick, facts, replication,
+                      #   WebSocket net, celld cells (zone lease/state, fact sink)
+distributed_game_macros/ # Derives for distributed_game: Replicated, GameInput, GameEvent, …
+js/                   # @hops-ops/distributed JS/TS client, command runtime, SvelteKit adapter, game SDK
+examples/             # graphiql.rs, and examples/game (game demos + SvelteKit Mob Pit; own workspace)
+tests/e2e-ui/         # Full-stack CQRS + GraphQL + SvelteKit template (nested workspace)
+tests/e2e-celld/      # The same UI with commands on celld cells and NATS (nested workspace)
+migrations/           # Explicit SQLite and Postgres migrations
+compose.yaml          # Local postgres / rabbitmq / kafka / nats / redis for integration tests
 ```
 
 ## Running Tests
