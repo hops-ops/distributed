@@ -87,12 +87,14 @@ Gitops (UI chart when `identity.enabled`):
 2. **Features** MR (`instance.zitadel…/Features`) — instance `loginV2.required`
    + `baseUri` so authorize redirects to this UI’s `/login`
 
-Both use `http://e2e-ui-ui.<workspace>.svc.cluster.local:5180`. Instance Features
-is global per AuthStack (last applied worktree wins). Do not hand-`PUT`
-`/v2/features/instance` — re-reconcile the UI chart instead.
+Each worktree's OIDC app sets `loginVersion.loginV2.baseUri` to
+`http://e2e-ui-ui.<workspace>.svc.cluster.local:5180`. That app-level URI is
+what lets alice and bob sign in without sharing a host.
 
-Prefer app-level baseUri over instance-wide
-defaults so multiple worktrees can coexist.
+Instance Features are global on one AuthStack. The worktree env leaves
+`identity.instanceLoginV2` false. Turn it on for one primary lane only. A
+second true value replaces the first lane's login host. Do not hand-`PUT`
+`/v2/features/instance`.
 
 ## SecretStack / ESO + Vault (`secrets/`)
 

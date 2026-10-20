@@ -84,23 +84,19 @@ overlay_e2e() {
 overlay_e2e "$ALICE_WT"
 overlay_e2e "$BOB_WT"
 
-# Bob: do not own instance Features
-BOB_ENV="$BOB_WT/tests/e2e-ui/.gitops/local/environment.yaml"
-if [[ -f "$BOB_ENV" ]]; then
-  if rg -q 'instanceLoginV2:' "$BOB_ENV"; then
-    sed -i.bak 's/instanceLoginV2: true/instanceLoginV2: false/' "$BOB_ENV" || true
-  else
-    # inject under identity:
-    python3 - <<PY
-from pathlib import Path
-p = Path("$BOB_ENV")
-t = p.read_text()
-if "instanceLoginV2" not in t:
-    t = t.replace("demoUsers: true", "instanceLoginV2: false\n          demoUsers: true")
-    p.write_text(t)
+# Alice owns the one global Login V2 Features record. Bob must not.
+set_instance_login() {
+  local env_file="$1" value="$2"
+  [[ -f "$env_file" ]] || return 0
+  python3 - "$env_file" "$value" <<'PY'
+import pathlib, sys
+path, value = sys.argv[1], sys.argv[2]
+file = pathlib.Path(path)
+file.write_text(file.read_text().replace("instanceLoginV2: true", f"instanceLoginV2: {value}").replace("instanceLoginV2: false", f"instanceLoginV2: {value}"))
 PY
-  fi
-fi
+}
+set_instance_login "$ALICE_WT/tests/e2e-ui/gitops/envs/local/ui.yaml" true
+set_instance_login "$BOB_WT/tests/e2e-ui/gitops/envs/local/ui.yaml" false
 
 ALICE_E2E="$ALICE_WT/tests/e2e-ui"
 BOB_E2E="$BOB_WT/tests/e2e-ui"
