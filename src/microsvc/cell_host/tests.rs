@@ -223,6 +223,11 @@ async fn command_replay_retains_confirmation_evidence_without_outbox_history() {
         "replay must not republish"
     );
     assert_eq!(reopened.durable_events().unwrap()[0].events.len(), 1);
+    // History reads the same log through the store.
+    let history = reopened.history().await.unwrap();
+    assert_eq!(history, cell.durable_events().unwrap()[0].events);
+    let foreign = StreamIdentity::new("CellItem", "someone-else").unwrap();
+    assert!(reopened.stream_events(&foreign).await.is_err());
 }
 
 fn fn_send_sync<T: Send + Sync>(_: &T) {}
@@ -626,3 +631,43 @@ fn cargo_features_keep_sqlite_and_do_not_add_celld() {
         "PCH-DEC-005: do not add a celld Cargo feature beside sqlite/postgres"
     );
 }
+
+#[tokio::test]
+async fn reference_host_applies_the_sealed_row_reducer_on_commit() {
+    let store = CellStreamStore::new("CellItem", "item-s")
+        .unwrap()
+        .with_sealed_row_reducer(|current, appends| {
+            let seen = current.and_then(|row| row["events"].as_u64()).unwrap_or(0);
+            let added = appends
+                .iter()
+                .map(|append| append.events.len() as u64)
+                .sum::<u64>();
+            Ok(Some(json!({ "events": seen + added })))
+        });
+    let cell = AggregateCell::<CellItem>::from_store(store)
+        .unwrap()
+        .mount(Create)
+        .mount(Complete);
+    cell.dispatch(
+        "cell_item.create",
+        json!({ "id": "item-s", "title": "seal" }),
+        owner_session(),
+    )
+    .await
+    .unwrap();
+    cell.dispatch(
+        "cell_item.complete",
+        json!({ "id": "item-s" }),
+        owner_session(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cell.sealed_row().unwrap(), Some(json!({ "events": 2 })));
+    assert!(AggregateCell::<CellItem>::from_store(
+        CellStreamStore::for_parent_shard("game", "g1", |_| true).unwrap()
+    )
+    .is_err());
+}
+
+#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+mod native_sqlite;

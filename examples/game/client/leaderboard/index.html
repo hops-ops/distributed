@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Leaderboard Demo</title>
+		<link rel="stylesheet" href="/src/shared/style.css" />
+		<link rel="stylesheet" href="/src/leaderboard/style.css" />
+	</head>
+	<body style="overflow: auto">
+		<main class="lb">
+			<header>
+				<h1>Mob Pit leaderboard</h1>
+				<p class="lb-hint">
+					Kill facts committed to the Crawler cells are projected into two sorted-set boards (fire-and-forget,
+					idempotent apply keys). The top 10 is pushed over the zone connection (observer); your rank is read on each push.
+					<a href="/mobpit/">Play the pit ↗</a>
+				</p>
+			</header>
+			<section class="lb-status" data-k="status">connecting…</section>
+			<div class="lb-grid">
+				<section><h2>Kills</h2><table data-k="kills"></table></section>
+				<section><h2>XP</h2><table data-k="xp"></table></section>
+				<section class="lb-me">
+					<h2>You</h2>
+					<div data-k="me">—</div>
+					<h2>Live pit</h2>
+					<canvas data-k="map" width="240" height="240"></canvas>
+				</section>
+			</div>
+			<section class="lb-rebuild">
+				<button data-k="rebuild">Rebuild from cell events</button>
+				<span class="lb-hint">Throws the boards away and replays every Crawler cell's durable event history into staging boards, then promotes them atomically.</span>
+				<pre data-k="report"></pre>
+			</section>
+		</main>
+		<script type="module" src="/src/leaderboard/main.ts"></script>
+	</body>
+</html>

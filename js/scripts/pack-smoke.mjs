@@ -79,11 +79,14 @@ function inspectPackageContract(packageJson) {
 	assert.deepEqual(Object.keys(packageJson.exports).sort(), [
 		'.',
 		'./diagnostics',
+		'./game',
 		'./package.json',
 		'./react',
 		'./replica',
 		'./replica/lazy',
 		'./sveltekit',
+		'./sveltekit/game',
+		'./sveltekit/game/server',
 		'./sveltekit/vite'
 	]);
 	assert.equal(
@@ -607,12 +610,32 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
 ]);
 assert.deepEqual(Object.keys(sveltekitViteSurface).sort(), [
   'analyzeDistributedSvelteKitBoundaries',
+  'checkDistributedGames',
   'distributedGraphqlProxy',
   'distributedSvelteKit',
   'distributedSvelteKitAliases',
+  'generateDistributedGames',
   'validateDistributedSvelteKitBoundaryPlan'
 ]);
 assert.equal(typeof sveltekitViteSurface.distributedSvelteKit, 'function');
+const sveltekitGameSurface = await import('@hops-ops/distributed/sveltekit/game');
+assert.deepEqual(Object.keys(sveltekitGameSurface).sort(), [
+  'GameState',
+  'createGameState',
+  'gameTicketSource',
+  'useGame'
+]);
+const sveltekitGameServerSurface = await import('@hops-ops/distributed/sveltekit/game/server');
+assert.deepEqual(Object.keys(sveltekitGameServerSurface).sort(), [
+  'GAME_TICKET_RATE_LIMIT_SCRIPT',
+  'GameTicketRateLimiterUnavailable',
+  'MAX_GAME_TICKET_TTL_SECONDS',
+  'MIN_GAME_TICKET_SECRET_BYTES',
+  'createGameTicketHandler',
+  'createGameTicketRateLimiter',
+  'createRedisGameTicketRateLimiter',
+  'mintGameTicket'
+]);
 
 const pageData = createPageDataSessionSource({
   session: null,

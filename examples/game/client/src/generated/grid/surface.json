@@ -1,0 +1,596 @@
+{
+  "constants": [
+    {
+      "name": "grid_world",
+      "type": {
+        "name": "GridWorld",
+        "type": "record"
+      },
+      "value": {
+        "biomes": [
+          "highlands",
+          "steppe",
+          "forest",
+          "meadow"
+        ],
+        "cell": 32.0,
+        "content_version": 1,
+        "default_seed": 12648430,
+        "max_cell": 1000000,
+        "player_radius": 0.44999998807907104,
+        "prop_kinds": [
+          "tree",
+          "rock",
+          "bush"
+        ],
+        "sample_spacing": 2.0,
+        "samples": 17
+      }
+    }
+  ],
+  "events": [
+    {
+      "id": 1,
+      "name": "hello",
+      "payload": {
+        "fields": [
+          {
+            "name": "zone",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "cell",
+            "type": {
+              "item": {
+                "type": "i32"
+              },
+              "type": "list"
+            }
+          },
+          {
+            "name": "host",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "seed",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "content_version",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "cell_size",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "entity",
+            "type": {
+              "item": {
+                "type": "u32"
+              },
+              "type": "optional"
+            }
+          },
+          {
+            "name": "restored",
+            "type": {
+              "type": "bool"
+            }
+          },
+          {
+            "name": "restores",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "hibernated_for_ms",
+            "type": {
+              "item": {
+                "type": "u64"
+              },
+              "type": "optional"
+            }
+          },
+          {
+            "name": "restored_critters",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "restored_markers",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "activated_at",
+            "type": {
+              "type": "u64"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    }
+  ],
+  "input": {
+    "fields": [
+      {
+        "name": "mx",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "name": "my",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "buttons": [
+          "sprint",
+          "mark"
+        ],
+        "name": "buttons",
+        "type": {
+          "type": "u8"
+        }
+      }
+    ],
+    "name": "MoveInput"
+  },
+  "kinds": [
+    {
+      "fields": [
+        {
+          "correction": {
+            "durationMs": 120,
+            "mode": "ease"
+          },
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "durationMs": 120,
+            "mode": "ease"
+          },
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "name",
+          "priority": 0.2,
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "hue",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "id": 1,
+      "name": "walker",
+      "priority": 2.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "yaw",
+          "priority": 1.0,
+          "type": {
+            "bits": 8,
+            "type": "angle"
+          }
+        },
+        {
+          "correction": null,
+          "name": "hue",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "id": 2,
+      "name": "critter",
+      "priority": 1.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 40.0,
+            "min": -8.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "label",
+          "priority": 1.0,
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "correction": null,
+          "name": "hue",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "id": 3,
+      "name": "marker",
+      "priority": 1.0
+    }
+  ],
+  "name": "grid",
+  "predict": {
+    "abi": 1,
+    "context": "GridContext",
+    "export": "grid_step",
+    "kind": "walker",
+    "package": "game_sim",
+    "state": "WalkerState"
+  },
+  "protocolVersion": 1,
+  "pures": [
+    {
+      "abi": 1,
+      "arg": {
+        "name": "GridContext",
+        "type": "record"
+      },
+      "export": "grid_cell",
+      "output": {
+        "name": "GridCellContent",
+        "type": "record"
+      },
+      "package": "game_sim"
+    },
+    {
+      "abi": 1,
+      "arg": {
+        "name": "GridPoint",
+        "type": "record"
+      },
+      "export": "grid_sample",
+      "output": {
+        "name": "GridSample",
+        "type": "record"
+      },
+      "package": "game_sim"
+    }
+  ],
+  "records": [
+    {
+      "fields": [
+        {
+          "name": "heights",
+          "type": {
+            "item": {
+              "type": "f32"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "moisture",
+          "type": {
+            "item": {
+              "type": "f32"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "biomes",
+          "type": {
+            "type": "bytes"
+          }
+        },
+        {
+          "name": "props",
+          "type": {
+            "item": {
+              "name": "Prop",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        }
+      ],
+      "name": "GridCellContent"
+    },
+    {
+      "fields": [
+        {
+          "name": "seed",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "cx",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "cy",
+          "type": {
+            "type": "i32"
+          }
+        }
+      ],
+      "name": "GridContext"
+    },
+    {
+      "fields": [
+        {
+          "name": "seed",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "cx",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "cy",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "GridPoint"
+    },
+    {
+      "fields": [
+        {
+          "name": "height",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "moisture",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "biome",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "GridSample"
+    },
+    {
+      "fields": [
+        {
+          "name": "cell",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "default_seed",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "content_version",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "samples",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "sample_spacing",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "player_radius",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "max_cell",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "biomes",
+          "type": {
+            "item": {
+              "type": "short_str"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "prop_kinds",
+          "type": {
+            "item": {
+              "type": "short_str"
+            },
+            "type": "list"
+          }
+        }
+      ],
+      "name": "GridWorld"
+    },
+    {
+      "fields": [
+        {
+          "name": "kind",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "r",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "solid",
+          "type": {
+            "type": "bool"
+          }
+        },
+        {
+          "name": "variant",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "Prop"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "WalkerState"
+    }
+  ],
+  "schemaVersion": 3
+}

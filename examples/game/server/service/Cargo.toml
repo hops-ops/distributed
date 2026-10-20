@@ -1,0 +1,42 @@
+# Mob Pit's business-side read model: a Distributed service that projects
+# the Crawler cells' published `crawler.mob_killed` domain events (drained
+# by the zone server onto a SQLite bus) into a `player_stats` SQL table and
+# serves it over GraphQL with `@live`. Read-only: it has no commands, so
+# nothing here can credit XP.
+[package]
+name = "mobpit_service"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Mob Pit player stats read model + GraphQL @live (dev demo)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "mobpit-service"
+path = "src/main.rs"
+
+[dependencies]
+mobpit_crawler = { path = "../crawler" }
+distributed = { path = "../../../..", features = ["sqlite", "http", "graphql"] }
+axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "ws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+
+[dev-dependencies]
+# The zone server's world: real Crawler cells + the fact sink + the bus drain.
+game_demos = { path = ".." }
+distributed_game = { path = "../../../../distributed_game", features = ["cell"] }
+async-graphql = "7"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# `distributed build|dev examples/game/server`: this crate is the
+# application (logical manifest + GraphQL client surface) and its runtime.
+[package.metadata.distributed.application]
+entrypoint = "application_manifest"
+
+[package.metadata.distributed.runtime]
+binary = "mobpit-service"

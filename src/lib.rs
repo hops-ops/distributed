@@ -24,6 +24,7 @@ mod time;
 pub mod aggregate;
 pub mod application;
 pub mod bus;
+pub mod clock;
 pub mod command;
 pub mod command_dispatch;
 pub mod domain_event;
@@ -38,6 +39,8 @@ pub mod emitter;
 pub mod gateway;
 pub mod graphql;
 mod in_memory_repo;
+pub mod leaderboard;
+pub mod lease;
 pub mod lock;
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -53,6 +56,7 @@ pub mod projection;
 pub mod projection_protocol;
 pub mod queued_repo;
 pub mod read_model;
+pub mod saga;
 pub mod snapshot;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_repo;
@@ -361,6 +365,18 @@ pub use lock::{
 pub use lock::{PostgresLock, PostgresLockManager};
 #[cfg(feature = "sqlite")]
 pub use lock::{SqliteLock, SqliteLockManager};
+
+// Coordination primitives: injectable clock, fenced leases, sagas.
+pub use clock::{Clock, ManualClock, SystemClock};
+#[cfg(feature = "postgres")]
+pub use lease::PostgresLeaseStore;
+#[cfg(feature = "sqlite")]
+pub use lease::SqliteLeaseStore;
+pub use lease::{Fence, FencingToken, InMemoryLeaseStore, Lease, LeaseError, LeaseStore};
+pub use saga::{
+    Saga, SagaCommand, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaReply, SagaRunner,
+    SagaStatus, SagaStep,
+};
 
 // Outbox: commit concerns (aggregate + outbox in one commit).
 //

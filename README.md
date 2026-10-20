@@ -544,6 +544,18 @@ that scope the client replica.
 
 ---
 
+## Multiplayer games
+
+`distributed_game` adds a server-authoritative realtime engine on top of
+this framework: zones that tick at a fixed rate, binary delta replication
+with interest management, client prediction (`@hops-ops/distributed/game`),
+outcomes saved as idempotent commands on cells without ever pausing the
+game, and zones spread across servers with handoff, hibernation and live
+content updates. Start with **[`distributed_game/README.md`](distributed_game/README.md)**;
+seven runnable demos are in [`examples/game`](examples/game/README.md).
+
+---
+
 ## See it run
 
 ### e2e-ui playground (`tests/e2e-ui`)
@@ -704,6 +716,8 @@ network servers.
 | `nats` | No | `NatsBus` (NATS JetStream source/publisher). |
 | `rabbitmq` | No | `RabbitBus` (RabbitMQ source/publisher). |
 | `kafka` | No | `KafkaBus` (Kafka source/publisher). |
+| `redis` | No | `leaderboard::RedisLeaderboard` (sorted-set leaderboards) and `bus::RedisStreamPublisher` (Redis Streams `XADD`, id dedupe); implies `leaderboard-background`. The `leaderboard` module and `InMemoryLeaderboard` are always available. |
+| `leaderboard-background` | No | `leaderboard::BackgroundLeaderboard` (fire-and-forget updates on a Tokio task) over any `LeaderboardStore`, e.g. `InMemoryLeaderboard`, without pulling in Redis. |
 
 > The `InMemoryBus`, `PostgresBus`, and `SqliteBus` need no separate broker
 > feature. SQL-backed bus support comes from the matching `postgres` or `sqlite`
@@ -1405,6 +1419,14 @@ republish an accepted prefix with the same IDs. This is at-least-once delivery,
 not an atomic external effect plus publish. Aggregate decisions still use a
 transactional outbox. Bound external reads and make effects idempotent before
 using this pattern.
+
+### Scheduled messages, sagas and fenced leases
+
+`OutboxMessage::deliver_at(at)` turns an outbox row into a durable timer that
+no claim path delivers before `at`. Cross-cell workflows use the event-sourced
+`Saga<D>` process manager (`distributed::saga`). Single-owner work uses TTL
+leases with monotonic fencing tokens (`distributed::lease`). See
+[coordination primitives](docs/coordination-primitives.md).
 
 ### Publishing the Outbox
 

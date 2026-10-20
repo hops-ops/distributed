@@ -1,0 +1,5 @@
+error: fact input field `principal` looks like identity: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards
+ --> tests/compile_fail/fact_identity_field.rs:7:5
+  |
+7 |     principal: String,
+  |     ^^^^^^^^^

@@ -1,10 +1,20 @@
 //! Cell-local execution of the ordinary SQL event/snapshot/receipt repository.
 //! No in-memory working copy and no whole-cell export are used here.
+//!
+//! Shared by both cell executors: Durable Object `storage.sql` on
+//! `workers-rs`/wasm32 and a synchronous rusqlite file on native
+//! `cell-sqlite`. Each executor supplies only `read` and a synchronous
+//! all-or-nothing `transaction`; schema bootstrap, the command commit, ledger
+//! fencing and outbox leases below are identical on both targets.
+
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
 
 use sha2::{Digest, Sha256};
+#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
 use worker::State;
 
-use super::sql_executor::{finish_sql, CellSqlConnection};
+use super::sql_executor::CellSqlConnection;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalStorageIdentity, CausalTransactionalCommit, CommandCompletion, CommandLedgerError,
@@ -26,15 +36,80 @@ use crate::snapshot::SnapshotRecord;
 // Both shared insert planners split large commands within the same transaction.
 const MAX_SQL_BIND_PARAMS: usize = 100;
 
+/// Shared SQL operations are async for SQLx, but every call through a cell
+/// executor completes synchronously. Refuse accidental async work; never spin
+/// or let a pending future outlive the transaction callback.
+pub(super) fn finish_sql<T, E: From<RepositoryError>>(
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let mut future = std::pin::pin!(future);
+    match future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(result) => result,
+        Poll::Pending => Err(RepositoryError::Model(
+            "cell SQL transaction attempted to await asynchronous work".into(),
+        )
+        .into()),
+    }
+}
+
+#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+use super::store::SealedRowReducer;
+
 #[derive(Clone)]
 pub(super) struct CellSqlRepository {
     connection: CellSqlConnection,
     identity: CausalStorageIdentity,
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    sealed_row_reducer: Option<SealedRowReducer>,
 }
 
 impl CellSqlRepository {
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
     pub fn from_state(state: State) -> Result<Self, RepositoryError> {
         let connection = CellSqlConnection::from_state(state)?;
+        Self::initialize(&connection)?;
+        Ok(Self {
+            connection,
+            identity: CausalStorageIdentity::new(),
+        })
+    }
+
+    /// Open one native cell file. The file is bound to `instance_name` on
+    /// first open; reopening it as another cell fails closed.
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    pub fn open(path: &std::path::Path, instance_name: &str) -> Result<Self, RepositoryError> {
+        let connection = CellSqlConnection::open(path)?;
+        Self::initialize(&connection)?;
+        connection
+            .transaction(|executor| finish_sql(native::bind_instance(executor, instance_name)))?;
+        Ok(Self {
+            connection,
+            identity: CausalStorageIdentity::new(),
+            sealed_row_reducer: None,
+        })
+    }
+
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    pub fn set_sealed_row_reducer(&mut self, reducer: SealedRowReducer) {
+        self.sealed_row_reducer = Some(reducer);
+    }
+
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    pub fn sealed_row(&self) -> Result<Option<serde_json::Value>, RepositoryError> {
+        self.connection
+            .read(|executor| finish_sql(native::sealed_row(executor)))
+    }
+
+    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+    pub fn replace_sealed_row(&self, row: &serde_json::Value) -> Result<(), RepositoryError> {
+        self.connection
+            .transaction(|executor| finish_sql(native::write_sealed_row(executor, row)))
+    }
+
+    fn initialize(connection: &CellSqlConnection) -> Result<(), RepositoryError> {
         connection.transaction(|executor| finish_sql(async {
             let tables = executor.query(Statement::new("SELECT name FROM sqlite_master WHERE type = 'table'")).await?;
             let tables = tables.iter().map(|row| row.text("name")).collect::<Result<Vec<_>, _>>()?;
@@ -66,11 +141,7 @@ impl CellSqlRepository {
                     .bind(migration.version.into()).sql(", ").bind(checksum.as_str().into()).sql(")")).await?;
             }
             Ok::<_, RepositoryError>(())
-        }))?;
-        Ok(Self {
-            connection,
-            identity: CausalStorageIdentity::new(),
-        })
+        }))
     }
 
     fn commit(
@@ -130,6 +201,19 @@ impl CellSqlRepository {
                     let SnapshotWrite::Save { identity, record } = snapshot;
                     sql::save_snapshot(executor, identity, record).await?;
                 }
+                // Native sealed read-model row: same transaction, so a reducer
+                // error or lost ledger lease rolls the row back with the events.
+                #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+                if let Some(reducer) = &self.sealed_row_reducer {
+                    if prepared.iter().any(|append| !append.events.is_empty()) {
+                        let current = native::sealed_row(executor).await?;
+                        if let Some(next) = reducer(current.as_ref(), &prepared)? {
+                            if current.as_ref() != Some(&next) {
+                                native::write_sealed_row(executor, &next).await?;
+                            }
+                        }
+                    }
+                }
                 // Same final fenced write as SQLx. A lost lease rolls back every
                 // participant, and entities are marked committed only afterwards.
                 if let Some(completion) = &completion {
@@ -150,22 +234,16 @@ impl GetStream for CellSqlRepository {
         &self,
         identity: &StreamIdentity,
     ) -> Result<Option<Entity>, RepositoryError> {
-        finish_sql(sql::load_stream(
-            &mut self.connection.executor(),
-            identity,
-            None,
-        ))
+        self.connection
+            .read(|executor| finish_sql(sql::load_stream(executor, identity, None)))
     }
     async fn get_stream_tail(
         &self,
         identity: &StreamIdentity,
         after_version: u64,
     ) -> Result<Option<Entity>, RepositoryError> {
-        finish_sql(sql::load_stream(
-            &mut self.connection.executor(),
-            identity,
-            Some(after_version),
-        ))
+        self.connection
+            .read(|executor| finish_sql(sql::load_stream(executor, identity, Some(after_version))))
     }
 }
 impl CausalGetStream for CellSqlRepository {
@@ -189,10 +267,8 @@ impl SnapshotStore for CellSqlRepository {
         &self,
         identity: &StreamIdentity,
     ) -> Result<Option<SnapshotRecord>, RepositoryError> {
-        finish_sql(sql::load_snapshot(
-            &mut self.connection.executor(),
-            identity,
-        ))
+        self.connection
+            .read(|executor| finish_sql(sql::load_snapshot(executor, identity)))
     }
     async fn save_snapshot(
         &self,
@@ -293,20 +369,22 @@ impl OutboxStore for CellSqlOutboxStore {
         // Match the native no-practical-bound convention within JS's exact
         // integer range; never round a bound crossing the runtime binding.
         let limit = (limit as u64).min(9_007_199_254_740_991) as i64;
-        let rows = finish_sql(
-            self.connection.executor().query(
-                Statement::new("SELECT ")
-                    .sql(crate::repository::sqlite_codec::OUTBOX_SELECT)
-                    .sql(" FROM outbox_messages WHERE status = ")
-                    .bind(status.as_str().into())
-                    .sql(" ORDER BY CAST(created_at AS REAL), message_id LIMIT ")
-                    .bind(limit.into()),
-            ),
-        )?;
+        let rows = self.connection.read(|executor| {
+            finish_sql(
+                executor.query(
+                    Statement::new("SELECT ")
+                        .sql(crate::repository::sqlite_codec::OUTBOX_SELECT)
+                        .sql(" FROM outbox_messages WHERE status = ")
+                        .bind(status.as_str().into())
+                        .sql(" ORDER BY CAST(created_at AS REAL), message_id LIMIT ")
+                        .bind(limit.into()),
+                ),
+            )
+        })?;
         rows.into_iter().map(outbox::from_row).collect()
     }
     async fn backlog_stats(&self) -> Result<OutboxBacklogStats, RepositoryError> {
-        let rows = finish_sql(self.connection.executor().query(Statement::new("SELECT COUNT(*) AS pending, MIN(CAST(created_at AS REAL)) AS oldest FROM outbox_messages WHERE status = 'pending'")))?;
+        let rows = self.connection.read(|executor| finish_sql(executor.query(Statement::new("SELECT COUNT(*) AS pending, MIN(CAST(created_at AS REAL)) AS oldest FROM outbox_messages WHERE status = 'pending'"))))?;
         let row = rows
             .first()
             .ok_or_else(|| RepositoryError::Model("outbox count returned no row".into()))?;
@@ -348,5 +426,92 @@ impl CellSqlOutboxStore {
                 crate::time::now(),
             ))
         })
+    }
+}
+
+/// Native-only cell metadata: the instance binding and the sealed row. Kept
+/// out of the shared migration inventory so Durable Object schemas (and their
+/// checksummed history) are unchanged by the native store.
+#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+mod native {
+    use super::*;
+    use serde_json::Value;
+
+    const CREATE: &str = "CREATE TABLE IF NOT EXISTS __distributed_native_cell (id INTEGER PRIMARY KEY CHECK (id = 1), instance_name TEXT NOT NULL, sealed_row TEXT)";
+
+    pub(super) async fn bind_instance(
+        executor: &mut impl SqlExecutor,
+        instance_name: &str,
+    ) -> Result<(), RepositoryError> {
+        executor.execute(Statement::new(CREATE)).await?;
+        let rows = executor
+            .query(Statement::new(
+                "SELECT instance_name FROM __distributed_native_cell WHERE id = 1",
+            ))
+            .await?;
+        match rows.first() {
+            Some(row) => {
+                let bound = row.text("instance_name")?;
+                if bound != instance_name {
+                    return Err(RepositoryError::Model(format!(
+                        "cell SQLite file belongs to `{bound}`, not `{instance_name}`"
+                    )));
+                }
+            }
+            None => {
+                executor
+                    .execute(
+                        Statement::new(
+                            "INSERT INTO __distributed_native_cell (id, instance_name) VALUES (1, ",
+                        )
+                        .bind(instance_name.into())
+                        .sql(")"),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn sealed_row(
+        executor: &mut impl SqlExecutor,
+    ) -> Result<Option<Value>, RepositoryError> {
+        let rows = executor
+            .query(Statement::new(
+                "SELECT sealed_row FROM __distributed_native_cell WHERE id = 1",
+            ))
+            .await?;
+        match rows
+            .first()
+            .map(|row| row.optional_text("sealed_row"))
+            .transpose()?
+            .flatten()
+        {
+            Some(json) => serde_json::from_str(&json).map(Some).map_err(|error| {
+                RepositoryError::Model(format!("cell sealed row is invalid JSON: {error}"))
+            }),
+            None => Ok(None),
+        }
+    }
+
+    pub(super) async fn write_sealed_row(
+        executor: &mut impl SqlExecutor,
+        row: &Value,
+    ) -> Result<(), RepositoryError> {
+        let json = serde_json::to_string(row)
+            .map_err(|error| RepositoryError::Model(format!("cell sealed row: {error}")))?;
+        let written = executor
+            .execute(
+                Statement::new("UPDATE __distributed_native_cell SET sealed_row = ")
+                    .bind(json.as_str().into())
+                    .sql(" WHERE id = 1"),
+            )
+            .await?;
+        if written != 1 {
+            return Err(RepositoryError::Model(
+                "cell SQLite file has no instance binding".into(),
+            ));
+        }
+        Ok(())
     }
 }

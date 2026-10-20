@@ -1,0 +1,865 @@
+{
+  "codecs": [
+    "Pack"
+  ],
+  "constants": [
+    {
+      "name": "freeze_world",
+      "type": {
+        "name": "FreezeWorld",
+        "type": "record"
+      },
+      "value": {
+        "crystals": [
+          [
+            {
+              "x": -17.0,
+              "y": -17.0
+            },
+            {
+              "x": -11.0,
+              "y": -17.5
+            },
+            {
+              "x": 17.0,
+              "y": -16.0
+            },
+            {
+              "x": 17.5,
+              "y": 11.0
+            },
+            {
+              "x": -17.5,
+              "y": 15.0
+            },
+            {
+              "x": -8.0,
+              "y": 17.0
+            },
+            {
+              "x": 10.0,
+              "y": 17.5
+            }
+          ],
+          [
+            {
+              "x": 17.0,
+              "y": -17.0
+            },
+            {
+              "x": 11.0,
+              "y": -17.5
+            },
+            {
+              "x": -17.0,
+              "y": -16.0
+            },
+            {
+              "x": -17.5,
+              "y": 11.0
+            },
+            {
+              "x": 17.5,
+              "y": 15.0
+            },
+            {
+              "x": 8.0,
+              "y": 17.0
+            },
+            {
+              "x": -10.0,
+              "y": 17.5
+            }
+          ],
+          [
+            {
+              "x": -17.0,
+              "y": -17.0
+            },
+            {
+              "x": -17.5,
+              "y": -11.0
+            },
+            {
+              "x": -16.0,
+              "y": 17.0
+            },
+            {
+              "x": 11.0,
+              "y": 17.5
+            },
+            {
+              "x": 15.0,
+              "y": -17.5
+            },
+            {
+              "x": 17.0,
+              "y": -8.0
+            },
+            {
+              "x": 17.5,
+              "y": 10.0
+            }
+          ]
+        ],
+        "ember": {
+          "gate": false,
+          "id": "freeze-ember",
+          "pools": [
+            {
+              "r": 2.5,
+              "x": -5.0,
+              "y": -5.0
+            },
+            {
+              "r": 3.0,
+              "x": 6.0,
+              "y": 5.0
+            },
+            {
+              "r": 2.0,
+              "x": -4.0,
+              "y": 12.0
+            }
+          ],
+          "portals": [
+            {
+              "title": "Town Hub (safe room)",
+              "to": "freeze-hub",
+              "x": -16.5,
+              "y": 5.0
+            }
+          ],
+          "ritual": {
+            "x": 0.0,
+            "y": -10.0
+          },
+          "title": "Ember Fields"
+        },
+        "hub": {
+          "gate": true,
+          "id": "freeze-hub",
+          "pools": [],
+          "portals": [
+            {
+              "title": "Whisper Meadow",
+              "to": "freeze-meadow",
+              "x": -16.5,
+              "y": 5.0
+            },
+            {
+              "title": "Ember Fields",
+              "to": "freeze-ember",
+              "x": 16.5,
+              "y": 5.0
+            }
+          ],
+          "ritual": {
+            "x": 0.0,
+            "y": -10.0
+          },
+          "title": "Town Hub (safe room)"
+        },
+        "meadow": {
+          "gate": false,
+          "id": "freeze-meadow",
+          "pools": [
+            {
+              "r": 2.200000047683716,
+              "x": -6.0,
+              "y": 6.0
+            },
+            {
+              "r": 2.5,
+              "x": 6.0,
+              "y": -5.0
+            }
+          ],
+          "portals": [
+            {
+              "title": "Town Hub (safe room)",
+              "to": "freeze-hub",
+              "x": 16.5,
+              "y": 5.0
+            }
+          ],
+          "ritual": {
+            "x": 0.0,
+            "y": -10.0
+          },
+          "title": "Whisper Meadow"
+        }
+      }
+    }
+  ],
+  "events": [
+    {
+      "id": 1,
+      "name": "hello",
+      "payload": {
+        "fields": [
+          {
+            "name": "entity",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "zone",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "title",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "gate",
+            "type": {
+              "type": "bool"
+            }
+          },
+          {
+            "name": "host",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "half",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "content_version",
+            "type": {
+              "type": "short_str"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 2,
+      "name": "gem",
+      "payload": {
+        "fields": [
+          {
+            "name": "by",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "value",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "stamp",
+            "type": {
+              "name": "Stamp",
+              "type": "record"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 3,
+      "name": "burned",
+      "payload": {
+        "fields": [
+          {
+            "name": "name",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "stamp",
+            "type": {
+              "name": "Stamp",
+              "type": "record"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 4,
+      "name": "content",
+      "payload": {
+        "fields": [
+          {
+            "name": "from",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "to",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "name",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "stamp",
+            "type": {
+              "name": "Stamp",
+              "type": "record"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    }
+  ],
+  "input": {
+    "fields": [
+      {
+        "name": "mx",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "name": "my",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "buttons": [
+          "dash"
+        ],
+        "name": "buttons",
+        "type": {
+          "type": "u8"
+        }
+      }
+    ],
+    "name": "MoveInput"
+  },
+  "kinds": [
+    {
+      "fields": [
+        {
+          "correction": {
+            "durationMs": 150,
+            "mode": "ease"
+          },
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 19.999847,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "durationMs": 150,
+            "mode": "ease"
+          },
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 19.999847,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "vx",
+          "priority": 1.0,
+          "type": {
+            "bits": 12,
+            "max": 15.9921875,
+            "min": -16.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "vy",
+          "priority": 1.0,
+          "type": {
+            "bits": 12,
+            "max": 15.9921875,
+            "min": -16.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "dash",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "cd",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "name",
+          "priority": 0.2,
+          "type": {
+            "type": "short_str"
+          }
+        }
+      ],
+      "id": 1,
+      "name": "player",
+      "priority": 2.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 20.0,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 20.0,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "yaw",
+          "priority": 1.0,
+          "type": {
+            "bits": 8,
+            "type": "angle"
+          }
+        }
+      ],
+      "id": 2,
+      "name": "slime",
+      "priority": 1.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 20.0,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 20.0,
+            "min": -20.0,
+            "type": "quant"
+          }
+        }
+      ],
+      "id": 3,
+      "name": "gem",
+      "priority": 1.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 20.0,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 20.0,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "stuck",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "id": 4,
+      "name": "ritual",
+      "priority": 1.0
+    }
+  ],
+  "name": "freeze",
+  "predict": {
+    "abi": 1,
+    "export": "arena_step",
+    "kind": "player",
+    "package": "game_sim",
+    "state": "MoveState"
+  },
+  "protocolVersion": 1,
+  "records": [
+    {
+      "fields": [
+        {
+          "name": "hub",
+          "type": {
+            "name": "ZoneLayout",
+            "type": "record"
+          }
+        },
+        {
+          "name": "meadow",
+          "type": {
+            "name": "ZoneLayout",
+            "type": "record"
+          }
+        },
+        {
+          "name": "ember",
+          "type": {
+            "name": "ZoneLayout",
+            "type": "record"
+          }
+        },
+        {
+          "name": "crystals",
+          "type": {
+            "item": {
+              "item": {
+                "name": "Spot",
+                "type": "record"
+              },
+              "type": "list"
+            },
+            "type": "list"
+          }
+        }
+      ],
+      "name": "FreezeWorld"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vx",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vy",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "dash",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "cd",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "MoveState"
+    },
+    {
+      "fields": [
+        {
+          "name": "version",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "name",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "notes",
+          "type": {
+            "item": {
+              "type": "short_str"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "hazard",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "slime_speed",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "slime_color",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "slime_scale",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "crystal_color",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "crystal_layout",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "gem_value",
+          "type": {
+            "type": "u32"
+          }
+        }
+      ],
+      "name": "Pack"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "r",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "Pool"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "to",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "title",
+          "type": {
+            "type": "short_str"
+          }
+        }
+      ],
+      "name": "Portal"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "Spot"
+    },
+    {
+      "fields": [
+        {
+          "name": "zone",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "tick",
+          "type": {
+            "type": "u64"
+          }
+        },
+        {
+          "name": "content_version",
+          "type": {
+            "type": "short_str"
+          }
+        }
+      ],
+      "name": "Stamp"
+    },
+    {
+      "fields": [
+        {
+          "name": "id",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "title",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "gate",
+          "type": {
+            "type": "bool"
+          }
+        },
+        {
+          "name": "portals",
+          "type": {
+            "item": {
+              "name": "Portal",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "pools",
+          "type": {
+            "item": {
+              "name": "Pool",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "ritual",
+          "type": {
+            "name": "Spot",
+            "type": "record"
+          }
+        }
+      ],
+      "name": "ZoneLayout"
+    }
+  ],
+  "schemaVersion": 3
+}

@@ -59,3 +59,6 @@ tests/celld/worker/build/
 tests/celld/worker/.celld/
 tests/celld/relay-worker/target/
 tests/celld/relay-worker/build/
+
+# Build output of CLI test fixture crates
+/distributed_cli/tests/fixtures/*/target/

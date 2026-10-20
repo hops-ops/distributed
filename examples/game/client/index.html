@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Game Demos</title>
+		<link rel="stylesheet" href="/src/shared/style.css" />
+	</head>
+	<body style="overflow: auto">
+		<main class="index">
+			<h1>distributed_game demos</h1>
+			<p>Each demo runs its own server: <code>examples/game/run.sh &lt;demo&gt;</code>. The page for the running demo works; the others need their server.</p>
+			<ul>
+				<li><a href="/arena/">Arena</a> — fixed tick, binary deltas, interest management, prediction + reconciliation, interpolation.</li>
+				<li><a href="/mobpit/">Mob Pit</a> — authoritative combat, non-blocking durable facts into SQLite cells, slow storage, crash recovery.</li>
+				<li><a href="/leaderboard/">Leaderboard</a> — kills/XP sorted-set boards projected from the cells, pushed live, rebuilt from events (runs with Mob Pit).</li>
+				<li><a href="/gallery/">Shooting Gallery</a> — lag compensation: hitscan shots rewound to the shooter's view time, max-rewind clamp, compensation on/off.</li>
+				<li><a href="/freeze/">The Freeze</a> — world-version barrier across two server processes as a story beat: hard reload, safe-room gating of old clients, aborted rollout.</li>
+				<li><a href="/grid/">Endless Grid</a> — seeded procedural cells as zones, observer connections across borders, handoff across two hosts, hibernation.</li>
+				<li><a href="/ripple/">Boss Ripple</a> — realm › city › borough › hood, per-tier tick rates, boss defeats rippling up as tier-up events across hosts.</li>
+			</ul>
+		</main>
+	</body>
+</html>

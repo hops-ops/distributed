@@ -2172,7 +2172,7 @@ where
                 for message in &mut batch.outbox_messages {
                     message.overwrite_causation_id(attempt.causation_id().as_str());
                     outbox_ids.push(message.id().to_string());
-                    if let Some(now) = claim_now {
+                    if let Some(now) = claim_now.filter(|now| message.is_due_at(*now)) {
                         if let Err(error) = message.claim_at(&config.worker_id, config.lease, now) {
                             claim_error = Some(error.to_string());
                             break;
@@ -2190,7 +2190,13 @@ where
                     .await;
                 }
                 if config.schedule.is_none() {
-                    fallback_rows = batch.outbox_messages.clone();
+                    // Scheduled rows were left pending (unclaimed) above.
+                    fallback_rows = batch
+                        .outbox_messages
+                        .iter()
+                        .filter(|message| message.is_in_flight())
+                        .cloned()
+                        .collect();
                 }
             }
 

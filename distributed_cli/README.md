@@ -267,6 +267,72 @@ prove ownership. Unsupported or unprovable selections fail at build time with
 their source location; the compiler does not emit a partial normalization plan
 or an adapter-specific route registry.
 
+## `distributed game-manifest` / `game-client` / `game-wasm` — typed game clients
+
+For [`distributed_game`](../distributed_game/README.md#generated-clients)
+zones. The zone's authoring derives (`#[derive(Replicated)]`,
+`#[derive(GameInput)]`, `#[derive(GameEvent)]`, `#[predict]`,
+`#[game_pure]`) describe a versioned `GameSurface` (schema v3): kinds with
+fields, wire types, priorities and client correction defaults, the input
+layout with its sanitize rules, events and the records they mention, the
+zone's client-predicted step, pure functions compiled to WebAssembly,
+constants and standalone record codecs. It is deliberately separate from
+the GraphQL client manifest above.
+
+```bash
+# Build and run the crate's surface export through the manifest harness
+# (default entrypoint `<crate>::game_surface`).
+distributed game-manifest --manifest-path game/Cargo.toml \
+  --entrypoint my_game::arena::game_surface --out target/arena.surface.json
+
+# Generate TypeScript (imports only `@hops-ops/distributed/game`).
+distributed game-client --manifest target/arena.surface.json --out web/src/generated/arena
+
+# CI: compare without writing (also catches surface drift via surface.json)
+distributed game-client --manifest target/arena.surface.json --out web/src/generated/arena --check
+
+# Compile the zone's `#[predict]` step and `#[game_pure]` functions to
+# web/src/generated/arena/wasm/arena.wasm
+# (skipped when the stamp says the sources are unchanged; --check verifies only).
+distributed game-wasm --manifest target/arena.surface.json --manifest-path game/Cargo.toml \
+  --out web/src/generated/arena
+```
+
+`game-manifest` accepts the same `--path` / `--manifest-path` /
+`--package` / `--features` / `--no-default-features` options as `describe`
+and validates the JSON it prints (or writes with `--out`). `game-client`
+owns its `--out` directory: it writes `schema.ts` (kind ids, typed field
+interfaces and accessors, wire types, correction defaults), `input.ts`
+(input interface, bit maps, encoder/decoder/sanitize), `events.ts` (record
+and event types, codecs, `onEvent`), `client.ts` (`create<Name>Client`, a
+`GameClient` with the encoder and corrections wired in and typed `on`),
+`index.ts` and `surface.json`, removes stale files it generated earlier,
+and refuses to delete files it did not. Output is deterministic.
+`--import-extension ts|js|none` picks the specifier style between the
+generated files (default `ts`, for Vite and Node type stripping). A surface
+with a predicted step also gets `predict.ts` (state and context layouts,
+`PREDICT_WASM_URL`, `create<Name>Prediction`), and `create<Name>Client`
+predicts with the compiled step by default. Pure functions add `pures.ts`
+(`create<Name>Pures`, one typed synchronous wrapper per function over the
+same module), constants add `constants.ts` (typed literals; floats are the
+exact binary32 values, and each value is validated against its type), and
+record codecs add `encode<Record>` / `decode<Record>` to `events.ts`.
+
+`game-wasm` builds the Cargo package the surface names as the declarer of
+its step and pure functions (one package per surface; `cargo rustc
+--release --target wasm32-unknown-unknown --crate-type cdylib`; install the
+target with `rustup target add wasm32-unknown-unknown`), checks the module
+is self-contained (no imports) and exports the ABI (`memory`,
+`dg_predict_abi`, `dg_predict_buffer`, `dg_predict_<step>`, every
+`dg_pure_<fn>`), and writes `<out>/wasm/<surface>.wasm` plus a stamp (the
+source fingerprint of the package and its local dependencies — the same
+one browser WASM pures use — the `rustc` identity, the required exports
+and the module hash). A surface with neither a step nor pure functions is
+an error. The module is a build output:
+keep `wasm/` out of version control and run `game-wasm` before bundling.
+Unlike browser WASM pures it needs no wasm-pack, wasm-bindgen glue or JSON
+bridge; the SDK instantiates the module directly over a binary ABI.
+
 ## `distributed describe` — manifest as JSON
 
 ```bash

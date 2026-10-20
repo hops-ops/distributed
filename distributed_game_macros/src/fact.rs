@@ -1,0 +1,137 @@
+//! `#[derive(FactCommand)]`: bind a cell command input type to its command
+//! name so a zone can `ctx.emit(player, input)`.
+
+use proc_macro2::TokenStream;
+use quote::quote;
+use syn::spanned::Spanned;
+use syn::{DeriveInput, Expr, Ident, LitStr};
+
+use crate::shared::{field_name, find_attr, named_fields, no_generics, runtime};
+
+/// Field names a zone-emitted fact must never carry: identity is bound by
+/// the host from the verified ticket, rewards are decided by the handler.
+const FORBIDDEN: &[(&str, &str)] = &[
+    ("principal", "identity"),
+    ("user", "identity"),
+    ("user_id", "identity"),
+    ("userid", "identity"),
+    ("owner", "identity"),
+    ("owner_id", "identity"),
+    ("account", "identity"),
+    ("account_id", "identity"),
+    ("subject", "identity"),
+    ("sub", "identity"),
+    ("xp", "a reward"),
+    ("experience", "a reward"),
+    ("reward", "a reward"),
+    ("rewards", "a reward"),
+];
+
+fn normalized(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn forbidden(name: &str) -> Option<&'static str> {
+    let n = normalized(name);
+    FORBIDDEN
+        .iter()
+        .find(|(bad, _)| normalized(bad) == n)
+        .map(|(_, why)| *why)
+}
+
+pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
+    no_generics(&input, "FactCommand")?;
+    let rt = runtime()?;
+    let Some(attr) = find_attr(&input.attrs, "fact") else {
+        return Err(syn::Error::new(
+            input.ident.span(),
+            "#[derive(FactCommand)] needs #[fact(command = COMMAND_NAME)] (the constant the cell mounts the command under, or a string literal)",
+        ));
+    };
+    let (mut command, mut key): (Option<Expr>, Option<Vec<Ident>>) = (None, None);
+    attr.parse_nested_meta(|meta| {
+        if meta.path.is_ident("command") {
+            command = Some(meta.value()?.parse()?);
+        } else if meta.path.is_ident("key") {
+            let mut parts = Vec::new();
+            meta.parse_nested_meta(|part| {
+                let Some(ident) = part.path.get_ident() else {
+                    return Err(part.error("key parts are field names"));
+                };
+                parts.push(ident.clone());
+                Ok(())
+            })?;
+            key = Some(parts);
+        } else {
+            return Err(meta.error("expected `command = ..` or `key(field, ..)` in #[fact(..)]"));
+        }
+        Ok(())
+    })?;
+    let Some(command) = command else {
+        return Err(syn::Error::new(
+            attr.path().span(),
+            "#[fact(..)] needs `command = ..`",
+        ));
+    };
+
+    let fields = named_fields(&input, "FactCommand")?;
+    for field in &fields {
+        let ident = field.ident.as_ref().expect("named");
+        let mut names = vec![(field_name(ident), ident.span())];
+        // Serde renames change what the handler sees.
+        for a in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+            let _ = a.parse_nested_meta(|meta| {
+                if meta.path.is_ident("rename") || meta.path.is_ident("alias") {
+                    if let Ok(value) = meta.value() {
+                        if let Ok(lit) = value.parse::<LitStr>() {
+                            names.push((lit.value(), lit.span()));
+                        }
+                    }
+                } else if meta.input.peek(syn::Token![=]) {
+                    let _ = meta.value()?.parse::<Expr>();
+                } else if meta.input.peek(syn::token::Paren) {
+                    let _ = meta.parse_nested_meta(|_| Ok(()));
+                }
+                Ok(())
+            });
+        }
+        for (name, span) in names {
+            if let Some(why) = forbidden(&name) {
+                return Err(syn::Error::new(
+                    span,
+                    format!(
+                        "fact input field `{name}` looks like {why}: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards"
+                    ),
+                ));
+            }
+        }
+    }
+
+    let parts = match &key {
+        None => quote!(::std::vec::Vec::new()),
+        Some(parts) => {
+            for part in parts {
+                if !fields.iter().any(|f| f.ident.as_ref() == Some(part)) {
+                    return Err(syn::Error::new(
+                        part.span(),
+                        format!("no field `{part}` in this struct"),
+                    ));
+                }
+            }
+            quote!(::std::vec![#(::std::string::ToString::to_string(&self.#parts)),*])
+        }
+    };
+    let ident = &input.ident;
+    Ok(quote! {
+        impl #rt::FactCommand for #ident {
+            const COMMAND: &'static str = #command;
+
+            fn dedupe_parts(&self) -> ::std::vec::Vec<::std::string::String> {
+                #parts
+            }
+        }
+    })
+}

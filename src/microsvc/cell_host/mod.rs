@@ -12,6 +12,14 @@
 //! The GraphQL wait-path (`CelldCommandHost`) is the same for every aggregate:
 //! routes only supply kind, shard, and payload. Aggregate Workers own outbox
 //! delivery through celld Queue.
+//!
+//! Durable storage is one SQLite database per cell on both targets, through
+//! one shared store (`sql_store.rs`): Durable Object `storage.sql` on
+//! `workers-rs`/wasm32, and a synchronous rusqlite file per cell on native
+//! hosts with the `cell-sqlite` feature (`CellSqlitePath`,
+//! `AggregateCell::open_sqlite`). `cell-sqlite` selects a storage backend
+//! only; the cell host itself stays ungated (`PCH-DEC-005`). Without it,
+//! native cells use the in-process reference host.
 
 pub(crate) mod causal;
 mod cell;
@@ -20,9 +28,19 @@ mod celld_outbox;
 #[cfg(feature = "graphql")]
 mod command;
 mod internal_auth;
+#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+mod native_sqlite;
 #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
 mod sql_executor;
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+// Native durable cells reuse the Durable Object store over a rusqlite executor
+// with the same `read`/`transaction` surface (see `native_sql_executor.rs`).
+#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+#[path = "native_sql_executor.rs"]
+mod sql_executor;
+#[cfg(any(
+    all(feature = "workers-rs", target_arch = "wasm32"),
+    all(feature = "cell-sqlite", not(target_arch = "wasm32"))
+))]
 mod sql_store;
 mod store;
 mod wire;
@@ -43,11 +61,15 @@ pub use command::{CelldCommandHost, CelldRoute};
 pub use internal_auth::{
     InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
 };
+#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+pub use native_sqlite::{CellOutboxStore, CellSqlitePath, NATIVE_CELL_SQLITE_EXTENSION};
+#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
+pub use sql_store::CellSqlOutboxStore;
 pub use store::CellStreamStore;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 pub use store::{
     DurableAggregateCellState, DurableCellCommand, DurableCellEvents, DurableCellSnapshot,
-    DURABLE_AGGREGATE_CELL_STATE_VERSION,
+    SealedRowReducer, DURABLE_AGGREGATE_CELL_STATE_VERSION,
 };
 pub(crate) use wire::validate_cell_projection_events;
 pub use wire::{

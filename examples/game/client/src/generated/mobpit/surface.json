@@ -1,0 +1,979 @@
+{
+  "constants": [
+    {
+      "name": "pit_rules",
+      "type": {
+        "name": "PitRules",
+        "type": "record"
+      },
+      "value": {
+        "attack_half_angle": 1.0471975803375244,
+        "attack_range": 2.200000047683716,
+        "states": [
+          "idle",
+          "chase",
+          "windup",
+          "recover",
+          "return",
+          "dead"
+        ],
+        "swing_frames": 6,
+        "tiers": [
+          {
+            "radius": 0.5,
+            "tele": 1.7999999523162842,
+            "tier": 1
+          },
+          {
+            "radius": 0.699999988079071,
+            "tele": 2.200000047683716,
+            "tier": 2
+          },
+          {
+            "radius": 0.800000011920929,
+            "tele": 2.5999999046325684,
+            "tier": 3
+          }
+        ]
+      }
+    }
+  ],
+  "events": [
+    {
+      "id": 1,
+      "name": "hello",
+      "payload": {
+        "fields": [
+          {
+            "name": "entity",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "half",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "boot",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "attack_range",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "attack_arc_cos",
+            "type": {
+              "type": "f32"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 2,
+      "name": "profile",
+      "payload": {
+        "kind": "value",
+        "type": {
+          "name": "Profile",
+          "type": "record"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "kill",
+      "payload": {
+        "fields": [
+          {
+            "name": "key",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "mob",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "tier",
+            "type": {
+              "type": "u8"
+            }
+          },
+          {
+            "name": "x",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "y",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "killer",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "killer_name",
+            "type": {
+              "type": "short_str"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 4,
+      "name": "saved",
+      "payload": {
+        "fields": [
+          {
+            "name": "key",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "ok",
+            "type": {
+              "type": "bool"
+            }
+          },
+          {
+            "name": "replayed",
+            "type": {
+              "type": "bool"
+            }
+          },
+          {
+            "name": "xp",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "total_xp",
+            "type": {
+              "type": "u64"
+            }
+          },
+          {
+            "name": "kills",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "level",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "waited_ms",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "x",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "y",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "error",
+            "type": {
+              "item": {
+                "type": "short_str"
+              },
+              "type": "optional"
+            }
+          },
+          {
+            "name": "attempts",
+            "type": {
+              "type": "u32"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 5,
+      "name": "board",
+      "payload": {
+        "kind": "value",
+        "type": {
+          "name": "BoardSnapshot",
+          "type": "record"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "name": "died",
+      "payload": {
+        "fields": [
+          {
+            "name": "respawn_ms",
+            "type": {
+              "type": "u32"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    }
+  ],
+  "input": {
+    "fields": [
+      {
+        "name": "mx",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "name": "my",
+        "range": [
+          -127.0,
+          127.0
+        ],
+        "type": {
+          "type": "i8"
+        }
+      },
+      {
+        "buttons": [
+          "dash",
+          "attack"
+        ],
+        "name": "buttons",
+        "type": {
+          "type": "u8"
+        }
+      }
+    ],
+    "name": "PitInput"
+  },
+  "kinds": [
+    {
+      "fields": [
+        {
+          "correction": {
+            "durationMs": 150,
+            "mode": "ease"
+          },
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 19.999847,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "durationMs": 150,
+            "mode": "ease"
+          },
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 18,
+            "max": 19.999847,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "vx",
+          "priority": 1.0,
+          "type": {
+            "bits": 12,
+            "max": 15.9921875,
+            "min": -16.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "vy",
+          "priority": 1.0,
+          "type": {
+            "bits": 12,
+            "max": 15.9921875,
+            "min": -16.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "dash",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "cd",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "name",
+          "priority": 0.2,
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "hp",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "face",
+          "priority": 1.0,
+          "type": {
+            "bits": 8,
+            "type": "angle"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "swing",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "level",
+          "priority": 1.0,
+          "type": {
+            "type": "u16"
+          }
+        },
+        {
+          "correction": {
+            "mode": "replace"
+          },
+          "name": "dead",
+          "priority": 1.0,
+          "type": {
+            "type": "bool"
+          }
+        }
+      ],
+      "id": 1,
+      "name": "player",
+      "priority": 2.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 20.0,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 20.0,
+            "min": -20.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": null,
+          "name": "face",
+          "priority": 1.0,
+          "type": {
+            "bits": 8,
+            "type": "angle"
+          }
+        },
+        {
+          "correction": null,
+          "name": "tier",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": null,
+          "name": "hp",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": null,
+          "name": "state",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": null,
+          "name": "tele",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "id": 2,
+      "name": "mob",
+      "priority": 1.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "x",
+          "priority": 1.0,
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "correction": null,
+          "name": "y",
+          "priority": 1.0,
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "correction": null,
+          "name": "r",
+          "priority": 1.0,
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "id": 3,
+      "name": "pillar",
+      "priority": 1.0
+    },
+    {
+      "fields": [
+        {
+          "correction": null,
+          "name": "pending",
+          "priority": 1.0,
+          "type": {
+            "type": "u16"
+          }
+        },
+        {
+          "correction": null,
+          "name": "slow_ms",
+          "priority": 1.0,
+          "type": {
+            "type": "u16"
+          }
+        },
+        {
+          "correction": null,
+          "name": "tick_ms",
+          "priority": 1.0,
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "correction": null,
+          "name": "tick_max_ms",
+          "priority": 1.0,
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "correction": null,
+          "name": "work_us",
+          "priority": 1.0,
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "correction": null,
+          "name": "committed",
+          "priority": 1.0,
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "correction": null,
+          "name": "backlog",
+          "priority": 1.0,
+          "type": {
+            "type": "u16"
+          }
+        }
+      ],
+      "id": 4,
+      "name": "pit",
+      "priority": 1.0
+    }
+  ],
+  "name": "mobpit",
+  "predict": {
+    "abi": 1,
+    "export": "pit_step",
+    "kind": "player",
+    "package": "game_sim",
+    "state": "MoveState"
+  },
+  "protocolVersion": 1,
+  "records": [
+    {
+      "fields": [
+        {
+          "name": "enqueued",
+          "type": {
+            "type": "u64"
+          }
+        },
+        {
+          "name": "applied",
+          "type": {
+            "type": "u64"
+          }
+        },
+        {
+          "name": "dropped",
+          "type": {
+            "type": "u64"
+          }
+        },
+        {
+          "name": "failed",
+          "type": {
+            "type": "u64"
+          }
+        }
+      ],
+      "name": "BackgroundStats"
+    },
+    {
+      "fields": [
+        {
+          "name": "rank",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "member",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "name",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "score",
+          "type": {
+            "type": "f64"
+          }
+        }
+      ],
+      "name": "BoardRow"
+    },
+    {
+      "fields": [
+        {
+          "name": "version",
+          "type": {
+            "type": "u64"
+          }
+        },
+        {
+          "name": "backend",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "members",
+          "type": {
+            "type": "u64"
+          }
+        },
+        {
+          "name": "kills",
+          "type": {
+            "item": {
+              "name": "BoardRow",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "xp",
+          "type": {
+            "item": {
+              "name": "BoardRow",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "background",
+          "type": {
+            "name": "BackgroundStats",
+            "type": "record"
+          }
+        },
+        {
+          "name": "last_rebuild",
+          "type": {
+            "item": {
+              "name": "RebuildReport",
+              "type": "record"
+            },
+            "type": "optional"
+          }
+        }
+      ],
+      "name": "BoardSnapshot"
+    },
+    {
+      "fields": [
+        {
+          "name": "member",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "cell",
+          "type": {
+            "name": "Scores",
+            "type": "record"
+          }
+        },
+        {
+          "name": "board",
+          "type": {
+            "name": "Scores",
+            "type": "record"
+          }
+        }
+      ],
+      "name": "Mismatch"
+    },
+    {
+      "fields": [
+        {
+          "name": "tier",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "radius",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "tele",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "MobTier"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vx",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vy",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "dash",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "cd",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "MoveState"
+    },
+    {
+      "fields": [
+        {
+          "name": "tiers",
+          "type": {
+            "item": {
+              "name": "MobTier",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "states",
+          "type": {
+            "item": {
+              "type": "short_str"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "attack_range",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "attack_half_angle",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "swing_frames",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "PitRules"
+    },
+    {
+      "fields": [
+        {
+          "name": "xp",
+          "type": {
+            "type": "u64"
+          }
+        },
+        {
+          "name": "level",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "kills",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "level_xp",
+          "type": {
+            "type": "u64"
+          }
+        },
+        {
+          "name": "next_level_xp",
+          "type": {
+            "type": "u64"
+          }
+        },
+        {
+          "name": "source",
+          "type": {
+            "type": "short_str"
+          }
+        }
+      ],
+      "name": "Profile"
+    },
+    {
+      "fields": [
+        {
+          "name": "backend",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "crawlers",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "events",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "applied",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "duplicates",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "identical_top",
+          "type": {
+            "type": "bool"
+          }
+        },
+        {
+          "name": "matches_cells",
+          "type": {
+            "type": "bool"
+          }
+        },
+        {
+          "name": "mismatches",
+          "type": {
+            "item": {
+              "name": "Mismatch",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "took_ms",
+          "type": {
+            "type": "f64"
+          }
+        }
+      ],
+      "name": "RebuildReport"
+    },
+    {
+      "fields": [
+        {
+          "name": "kills",
+          "type": {
+            "type": "f64"
+          }
+        },
+        {
+          "name": "xp",
+          "type": {
+            "type": "f64"
+          }
+        }
+      ],
+      "name": "Scores"
+    }
+  ],
+  "schemaVersion": 3
+}

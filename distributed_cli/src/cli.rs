@@ -71,6 +71,12 @@ pub enum DistributedCommands {
     Client(ClientArgs),
     /// Compile the service's authorized client Surface manifest as JSON
     ClientManifest(ClientManifestArgs),
+    /// Print a distributed_game zone's GameSurface (kinds, input, events) as JSON
+    GameManifest(GameManifestArgs),
+    /// Generate typed TypeScript for a distributed_game zone from its GameSurface
+    GameClient(GameClientArgs),
+    /// Compile a distributed_game zone's `#[predict]` step and `#[game_pure]` functions to WebAssembly for its generated client
+    GameWasm(GameWasmArgs),
     /// Render schema artifacts (SQL or an Atlas Operator resource) from a read-model catalog
     Schema(SchemaArgs),
     /// Extract the embedded Distributed agent skills into a project
@@ -122,6 +128,12 @@ pub enum ServiceCommands {
     Client(ClientArgs),
     /// Compile the service's authorized client Surface manifest as JSON
     ClientManifest(ClientManifestArgs),
+    /// Print a distributed_game zone's GameSurface (kinds, input, events) as JSON
+    GameManifest(GameManifestArgs),
+    /// Generate typed TypeScript for a distributed_game zone from its GameSurface
+    GameClient(GameClientArgs),
+    /// Compile a distributed_game zone's `#[predict]` step and `#[game_pure]` functions to WebAssembly for its generated client
+    GameWasm(GameWasmArgs),
     /// Render schema artifacts (SQL or an Atlas Operator resource) from a read-model catalog
     Schema(SchemaArgs),
     /// Extract the embedded Distributed agent skills into a project
@@ -429,6 +441,77 @@ pub struct ClientManifestArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct GameManifestArgs {
+    /// Game crate directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
+    /// Cargo.toml of the game crate. Overrides --path.
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
+    /// Cargo package to inspect when the manifest belongs to a workspace.
+    #[arg(long)]
+    pub package: Option<String>,
+    /// Comma-delimited feature list for the game crate.
+    #[arg(long, value_delimiter = ',')]
+    pub features: Vec<String>,
+    /// Disable default features on the game crate dependency.
+    #[arg(long)]
+    pub no_default_features: bool,
+    /// Surface export function returning `distributed_game::GameSurface`.
+    /// Defaults to `<crate>::game_surface`; e.g. `game_demos::arena::game_surface`.
+    #[arg(long)]
+    pub entrypoint: Option<String>,
+    /// Write the JSON here instead of stdout.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum GameImportExtension {
+    /// `./schema.ts` (Vite, Node type stripping, `allowImportingTsExtensions`)
+    Ts,
+    /// `./schema.js` (tsc NodeNext emit)
+    Js,
+    /// `./schema` (bundler resolution)
+    None,
+}
+
+#[derive(Args, Debug)]
+pub struct GameClientArgs {
+    /// GameSurface JSON (from `distributed game-manifest`).
+    #[arg(long)]
+    pub manifest: PathBuf,
+    /// Generated TypeScript directory (owned by the generator).
+    #[arg(long)]
+    pub out: PathBuf,
+    /// Verify the generated files are current without writing anything.
+    #[arg(long)]
+    pub check: bool,
+    /// Import specifier extension between generated files.
+    #[arg(long, value_enum, default_value = "ts")]
+    pub import_extension: GameImportExtension,
+}
+
+#[derive(Args, Debug)]
+pub struct GameWasmArgs {
+    /// GameSurface JSON (from `distributed game-manifest`) with a predicted step or pure functions.
+    #[arg(long)]
+    pub manifest: PathBuf,
+    /// Generated client directory; the module is written to `<out>/wasm/<surface>.wasm`.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// Cargo project containing the package that declares the step.
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
+    /// Cargo.toml of that project. Overrides --path.
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
+    /// Verify the module is current without compiling.
+    #[arg(long)]
+    pub check: bool,
+}
+
+#[derive(Args, Debug)]
 #[command(group(
     ArgGroup::new("client_surface")
         .required(true)
@@ -633,6 +716,9 @@ pub fn run_distributed(args: &DistributedArgs) -> Result<(), Box<dyn Error>> {
         DistributedCommands::Describe(describe) => run_describe(describe),
         DistributedCommands::Client(client) => run_client(client),
         DistributedCommands::ClientManifest(client) => run_client_manifest(client),
+        DistributedCommands::GameManifest(game) => run_game_manifest(game),
+        DistributedCommands::GameClient(game) => run_game_client(game),
+        DistributedCommands::GameWasm(game) => run_game_wasm(game),
         DistributedCommands::Schema(schema) => run_schema(schema),
         DistributedCommands::Skills(skills) => match &skills.command {
             SkillsCommands::Init(init) => run_skills_init(init),
@@ -680,6 +766,9 @@ pub fn run(args: &ServiceArgs) -> Result<(), Box<dyn Error>> {
         ServiceCommands::Describe(describe) => run_describe(describe),
         ServiceCommands::Client(client) => run_client(client),
         ServiceCommands::ClientManifest(client) => run_client_manifest(client),
+        ServiceCommands::GameManifest(game) => run_game_manifest(game),
+        ServiceCommands::GameClient(game) => run_game_client(game),
+        ServiceCommands::GameWasm(game) => run_game_wasm(game),
         ServiceCommands::Schema(schema) => run_schema(schema),
         ServiceCommands::Skills(skills) => match &skills.command {
             SkillsCommands::Init(init) => run_skills_init(init),
@@ -2290,6 +2379,167 @@ fn run_client_manifest(args: &ClientManifestArgs) -> Result<(), Box<dyn Error>> 
     let manifest: serde_json::Value = serde_json::from_str(&json)?;
     validate_client_manifest_json(&manifest)?;
     println!("{}", serde_json::to_string_pretty(&manifest)?);
+    Ok(())
+}
+
+fn run_game_manifest(args: &GameManifestArgs) -> Result<(), Box<dyn Error>> {
+    let json = run_manifest_harness(
+        &HarnessOptions {
+            path: args.path.clone(),
+            manifest_path: args.manifest_path.clone(),
+            package: args.package.clone(),
+            features: args.features.clone(),
+            no_default_features: args.no_default_features,
+            entrypoint: args.entrypoint.clone(),
+            distributed_path: None,
+        },
+        HarnessMode::GameManifest,
+    )?;
+    crate::game_client::validate_game_surface(&json)?;
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    let pretty = serde_json::to_string_pretty(&value)? + "\n";
+    match &args.out {
+        Some(path) => {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, pretty)
+                .map_err(|error| format!("write game surface {}: {error}", path.display()))?;
+        }
+        None => print!("{pretty}"),
+    }
+    Ok(())
+}
+
+fn run_game_client(args: &GameClientArgs) -> Result<(), Box<dyn Error>> {
+    let source = read_utf8_bounded(&args.manifest, MAX_CLIENT_MANIFEST_BYTES, "game surface")?;
+    let ext = match args.import_extension {
+        GameImportExtension::Ts => crate::game_client::ImportExtension::Ts,
+        GameImportExtension::Js => crate::game_client::ImportExtension::Js,
+        GameImportExtension::None => crate::game_client::ImportExtension::None,
+    };
+    let files = crate::game_client::generate_game_client(&source, ext)
+        .map_err(|error| format!("{}: {error}", args.manifest.display()))?;
+    if args.check {
+        check_game_client(&args.out, &files)?;
+        println!(
+            "Game client for {} is current ({} files)",
+            args.manifest.display(),
+            files.len()
+        );
+    } else {
+        write_game_client(&args.out, &files)?;
+        println!(
+            "Generated {} game client files at {}",
+            files.len(),
+            args.out.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_game_wasm(args: &GameWasmArgs) -> Result<(), Box<dyn Error>> {
+    let source = read_utf8_bounded(&args.manifest, MAX_CLIENT_MANIFEST_BYTES, "game surface")?;
+    let cargo_manifest = args
+        .manifest_path
+        .clone()
+        .unwrap_or_else(|| args.path.join("Cargo.toml"));
+    let outcome = crate::game_wasm::run_game_wasm(&crate::game_wasm::GameWasmOptions {
+        surface: &source,
+        cargo_manifest: &cargo_manifest,
+        out: &args.out,
+        check: args.check,
+    })
+    .map_err(|error| format!("{}: {error}", args.manifest.display()))?;
+    match outcome {
+        crate::game_wasm::GameWasmOutcome::Current(path) => {
+            println!("Compiled game module {} is current", path.display())
+        }
+        crate::game_wasm::GameWasmOutcome::Built(path) => {
+            println!("Compiled game module to {}", path.display())
+        }
+    }
+    Ok(())
+}
+
+/// Files directly in `root` (the generator owns the directory).
+fn game_client_dir_files(root: &Path) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let mut out = BTreeSet::new();
+    match fs::read_dir(root) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    out.insert(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("read {}: {error}", root.display()).into()),
+    }
+    Ok(out)
+}
+
+fn check_game_client(root: &Path, files: &[GeneratedClientFile]) -> Result<(), Box<dyn Error>> {
+    let mut drift = Vec::new();
+    let existing = game_client_dir_files(root)?;
+    for file in files {
+        match fs::read_to_string(root.join(&file.path)) {
+            Ok(actual) if actual == file.contents => {}
+            Ok(_) => drift.push(format!("changed {}", file.path)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                drift.push(format!("missing {}", file.path))
+            }
+            Err(error) => return Err(format!("read {}: {error}", file.path).into()),
+        }
+    }
+    for name in existing {
+        if !files.iter().any(|f| f.path == name) {
+            drift.push(format!("unexpected {name}"));
+        }
+    }
+    if drift.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "generated game client at {} is stale:\n  {}\nrun `distributed game-client` without --check to regenerate",
+        root.display(),
+        drift.join("\n  ")
+    )
+    .into())
+}
+
+fn write_game_client(root: &Path, files: &[GeneratedClientFile]) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(root)?;
+    for name in game_client_dir_files(root)? {
+        if files.iter().any(|f| f.path == name) {
+            continue;
+        }
+        let path = root.join(&name);
+        let owned = fs::read_to_string(&path)
+            .map(|text| text.starts_with("// @generated by `distributed game-client`"))
+            .unwrap_or(false);
+        if !owned {
+            return Err(format!(
+                "{} is not a generated game client file; refusing to overwrite the directory (move it out of {})",
+                path.display(),
+                root.display()
+            )
+            .into());
+        }
+        fs::remove_file(&path)?;
+    }
+    for file in files {
+        let path = root.join(&file.path);
+        // Leave unchanged files untouched: dev servers watching the
+        // directory (e.g. the Vite plugin's regeneration on Rust changes)
+        // would otherwise reload for nothing.
+        if fs::read(&path).is_ok_and(|current| current == file.contents.as_bytes()) {
+            continue;
+        }
+        fs::write(&path, &file.contents)
+            .map_err(|error| format!("write {}: {error}", path.display()))?;
+    }
     Ok(())
 }
 

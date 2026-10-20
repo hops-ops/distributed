@@ -1,0 +1,574 @@
+{
+  "cases": [
+    {
+      "decoded": {
+        "bits": "c2c80000",
+        "f32": -100.0
+      },
+      "field": {
+        "bits": 16,
+        "max": {
+          "bits": "42c80000",
+          "f32": 100.0
+        },
+        "min": {
+          "bits": "c2c80000",
+          "f32": -100.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "00",
+      "input_bits": "c2c80000",
+      "q": 0
+    },
+    {
+      "decoded": {
+        "bits": "3ac800c8",
+        "f32": 0.0015259021893143654
+      },
+      "field": {
+        "bits": 16,
+        "max": {
+          "bits": "42c80000",
+          "f32": 100.0
+        },
+        "min": {
+          "bits": "c2c80000",
+          "f32": -100.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "808002",
+      "input_bits": "00000000",
+      "q": 32768
+    },
+    {
+      "decoded": {
+        "bits": "420532f5",
+        "f32": 33.29976272583008
+      },
+      "field": {
+        "bits": 16,
+        "max": {
+          "bits": "42c80000",
+          "f32": 100.0
+        },
+        "min": {
+          "bits": "c2c80000",
+          "f32": -100.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "9fd502",
+      "input_bits": "42053333",
+      "q": 43679
+    },
+    {
+      "decoded": {
+        "bits": "42c80000",
+        "f32": 100.0
+      },
+      "field": {
+        "bits": 16,
+        "max": {
+          "bits": "42c80000",
+          "f32": 100.0
+        },
+        "min": {
+          "bits": "c2c80000",
+          "f32": -100.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "ffff03",
+      "input_bits": "42c7ff7d",
+      "q": 65535
+    },
+    {
+      "decoded": {
+        "bits": "42c80000",
+        "f32": 100.0
+      },
+      "field": {
+        "bits": 16,
+        "max": {
+          "bits": "42c80000",
+          "f32": 100.0
+        },
+        "min": {
+          "bits": "c2c80000",
+          "f32": -100.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "ffff03",
+      "input_bits": "437a0000",
+      "q": 65535
+    },
+    {
+      "decoded": {
+        "bits": "c2c80000",
+        "f32": -100.0
+      },
+      "field": {
+        "bits": 16,
+        "max": {
+          "bits": "42c80000",
+          "f32": 100.0
+        },
+        "min": {
+          "bits": "c2c80000",
+          "f32": -100.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "00",
+      "input_bits": "ce6e6b28",
+      "q": 0
+    },
+    {
+      "decoded": {
+        "bits": "00000000",
+        "f32": 0.0
+      },
+      "field": {
+        "bits": 12,
+        "max": {
+          "bits": "42800000",
+          "f32": 64.0
+        },
+        "min": {
+          "bits": "00000000",
+          "f32": 0.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "00",
+      "input_bits": "00000000",
+      "q": 0
+    },
+    {
+      "decoded": {
+        "bits": "3ea80a81",
+        "f32": 0.3282051384449005
+      },
+      "field": {
+        "bits": 12,
+        "max": {
+          "bits": "42800000",
+          "f32": 64.0
+        },
+        "min": {
+          "bits": "00000000",
+          "f32": 0.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "15",
+      "input_bits": "3eaaaaab",
+      "q": 21
+    },
+    {
+      "decoded": {
+        "bits": "41ffefff",
+        "f32": 31.992185592651367
+      },
+      "field": {
+        "bits": 12,
+        "max": {
+          "bits": "42800000",
+          "f32": 64.0
+        },
+        "min": {
+          "bits": "00000000",
+          "f32": 0.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "ff0f",
+      "input_bits": "41ffeb85",
+      "q": 2047
+    },
+    {
+      "decoded": {
+        "bits": "42800000",
+        "f32": 64.0
+      },
+      "field": {
+        "bits": 12,
+        "max": {
+          "bits": "42800000",
+          "f32": 64.0
+        },
+        "min": {
+          "bits": "00000000",
+          "f32": 0.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "ff1f",
+      "input_bits": "42800000",
+      "q": 4095
+    },
+    {
+      "decoded": {
+        "bits": "bf800000",
+        "f32": -1.0
+      },
+      "field": {
+        "bits": 8,
+        "max": {
+          "bits": "3f800000",
+          "f32": 1.0
+        },
+        "min": {
+          "bits": "bf800000",
+          "f32": -1.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "00",
+      "input_bits": "bf800000",
+      "q": 0
+    },
+    {
+      "decoded": {
+        "bits": "3b808081",
+        "f32": 0.003921568859368563
+      },
+      "field": {
+        "bits": 8,
+        "max": {
+          "bits": "3f800000",
+          "f32": 1.0
+        },
+        "min": {
+          "bits": "bf800000",
+          "f32": -1.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "8001",
+      "input_bits": "00000000",
+      "q": 128
+    },
+    {
+      "decoded": {
+        "bits": "3efefeff",
+        "f32": 0.49803921580314636
+      },
+      "field": {
+        "bits": 8,
+        "max": {
+          "bits": "3f800000",
+          "f32": 1.0
+        },
+        "min": {
+          "bits": "bf800000",
+          "f32": -1.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "bf01",
+      "input_bits": "3f000000",
+      "q": 191
+    },
+    {
+      "decoded": {
+        "bits": "bf800000",
+        "f32": -1.0
+      },
+      "field": {
+        "bits": 8,
+        "max": {
+          "bits": "3f800000",
+          "f32": 1.0
+        },
+        "min": {
+          "bits": "bf800000",
+          "f32": -1.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "00",
+      "input_bits": "7fc00000",
+      "q": 0
+    },
+    {
+      "decoded": {
+        "bits": "3dfcd6ea",
+        "f32": 0.12345679104328156
+      },
+      "field": {
+        "bits": 32,
+        "max": {
+          "bits": "3f800000",
+          "f32": 1.0
+        },
+        "min": {
+          "bits": "00000000",
+          "f32": 0.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "c0baebfc01",
+      "input_bits": "3dfcd6ea",
+      "q": 530242880
+    },
+    {
+      "decoded": {
+        "bits": "3f800000",
+        "f32": 1.0
+      },
+      "field": {
+        "bits": 32,
+        "max": {
+          "bits": "3f800000",
+          "f32": 1.0
+        },
+        "min": {
+          "bits": "00000000",
+          "f32": 0.0
+        },
+        "type": "quant_f32"
+      },
+      "hex": "ffffffff0f",
+      "input_bits": "3f800000",
+      "q": 4294967295
+    },
+    {
+      "decoded": {
+        "bits": "00000000",
+        "f32": 0.0
+      },
+      "field": {
+        "bits": 8,
+        "type": "angle"
+      },
+      "hex": "00",
+      "input_bits": "00000000",
+      "q": 0
+    },
+    {
+      "decoded": {
+        "bits": "3f80ce28",
+        "f32": 1.006291389465332
+      },
+      "field": {
+        "bits": 8,
+        "type": "angle"
+      },
+      "hex": "29",
+      "input_bits": "3f800000",
+      "q": 41
+    },
+    {
+      "decoded": {
+        "bits": "40490fdb",
+        "f32": 3.1415927410125732
+      },
+      "field": {
+        "bits": 8,
+        "type": "angle"
+      },
+      "hex": "8001",
+      "input_bits": "40490fdb",
+      "q": 128
+    },
+    {
+      "decoded": {
+        "bits": "4096cbe4",
+        "f32": 4.71238899230957
+      },
+      "field": {
+        "bits": 8,
+        "type": "angle"
+      },
+      "hex": "c001",
+      "input_bits": "bfc90fdb",
+      "q": 192
+    },
+    {
+      "decoded": {
+        "bits": "3f36365e",
+        "f32": 0.7117670774459839
+      },
+      "field": {
+        "bits": 8,
+        "type": "angle"
+      },
+      "hex": "1d",
+      "input_bits": "40e00000",
+      "q": 29
+    },
+    {
+      "decoded": {
+        "bits": "00000000",
+        "f32": 0.0
+      },
+      "field": {
+        "bits": 8,
+        "type": "angle"
+      },
+      "hex": "00",
+      "input_bits": "b58637bd",
+      "q": 0
+    },
+    {
+      "decoded": {
+        "bits": "00000000",
+        "f32": 0.0
+      },
+      "field": {
+        "bits": 10,
+        "type": "angle"
+      },
+      "hex": "00",
+      "input_bits": "00000000",
+      "q": 0
+    },
+    {
+      "decoded": {
+        "bits": "3f800518",
+        "f32": 1.0001554489135742
+      },
+      "field": {
+        "bits": 10,
+        "type": "angle"
+      },
+      "hex": "a301",
+      "input_bits": "3f800000",
+      "q": 163
+    },
+    {
+      "decoded": {
+        "bits": "40490fdb",
+        "f32": 3.1415927410125732
+      },
+      "field": {
+        "bits": 10,
+        "type": "angle"
+      },
+      "hex": "8004",
+      "input_bits": "40490fdb",
+      "q": 512
+    },
+    {
+      "decoded": {
+        "bits": "4096cbe4",
+        "f32": 4.71238899230957
+      },
+      "field": {
+        "bits": 10,
+        "type": "angle"
+      },
+      "hex": "8006",
+      "input_bits": "bfc90fdb",
+      "q": 768
+    },
+    {
+      "decoded": {
+        "bits": "3f37c87e",
+        "f32": 0.7179030179977417
+      },
+      "field": {
+        "bits": 10,
+        "type": "angle"
+      },
+      "hex": "75",
+      "input_bits": "40e00000",
+      "q": 117
+    },
+    {
+      "decoded": {
+        "bits": "00000000",
+        "f32": 0.0
+      },
+      "field": {
+        "bits": 10,
+        "type": "angle"
+      },
+      "hex": "00",
+      "input_bits": "b58637bd",
+      "q": 0
+    },
+    {
+      "decoded": {
+        "bits": "00000000",
+        "f32": 0.0
+      },
+      "field": {
+        "bits": 16,
+        "type": "angle"
+      },
+      "hex": "00",
+      "input_bits": "00000000",
+      "q": 0
+    },
+    {
+      "decoded": {
+        "bits": "3f7ffd9f",
+        "f32": 0.9999637007713318
+      },
+      "field": {
+        "bits": 16,
+        "type": "angle"
+      },
+      "hex": "be51",
+      "input_bits": "3f800000",
+      "q": 10430
+    },
+    {
+      "decoded": {
+        "bits": "40490fdb",
+        "f32": 3.1415927410125732
+      },
+      "field": {
+        "bits": 16,
+        "type": "angle"
+      },
+      "hex": "808002",
+      "input_bits": "40490fdb",
+      "q": 32768
+    },
+    {
+      "decoded": {
+        "bits": "4096cbe4",
+        "f32": 4.71238899230957
+      },
+      "field": {
+        "bits": 16,
+        "type": "angle"
+      },
+      "hex": "808003",
+      "input_bits": "bfc90fdb",
+      "q": 49152
+    },
+    {
+      "decoded": {
+        "bits": "3f378360",
+        "f32": 0.7168483734130859
+      },
+      "field": {
+        "bits": 16,
+        "type": "angle"
+      },
+      "hex": "b53a",
+      "input_bits": "40e00000",
+      "q": 7477
+    },
+    {
+      "decoded": {
+        "bits": "00000000",
+        "f32": 0.0
+      },
+      "field": {
+        "bits": 16,
+        "type": "angle"
+      },
+      "hex": "00",
+      "input_bits": "b58637bd",
+      "q": 0
+    }
+  ]
+}

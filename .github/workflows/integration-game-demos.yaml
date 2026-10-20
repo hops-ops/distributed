@@ -1,0 +1,56 @@
+name: Game demos smoke
+
+# Reusable workflow: referenced via `uses: ./.github/workflows/integration-game-demos.yaml`.
+# `examples/game` is outside the root workspace, so nothing else runs its tests:
+# generated clients current (`gen --check`), demo server fmt/clippy/tests
+# (incl. the mobpit_service projection test), client type-check, build and
+# headless tests, and the SvelteKit demo end to end: `distributed build
+# examples/game/server` (GraphQL client, svelte-check, vite build), then
+# Playwright against the production build, a real Mob Pit server and the real
+# mobpit-service read model (SQLite only; no external services).
+on:
+  workflow_call:
+
+jobs:
+  game-demos:
+    name: Game demos smoke (examples/game)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    # The shared ticket rate limiter's Lua script runs against a real Redis.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+          # Predicted steps and pure functions compile to WebAssembly.
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            js/package-lock.json
+            examples/game/client/package-lock.json
+            examples/game/sveltekit/package-lock.json
+      - name: Install SvelteKit demo dependencies and Chromium
+        working-directory: examples/game/sveltekit
+        run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
+      - name: Run examples/game smoke
+        run: examples/game/run.sh smoke
+      - name: Ticket rate limiter against real Redis
+        working-directory: js
+        env:
+          DISTRIBUTED_REDIS_E2E: "1"
+          REDIS_URL: redis://127.0.0.1:6379
+        run: node --test tests/sveltekit-game-rate-limit.test.mjs

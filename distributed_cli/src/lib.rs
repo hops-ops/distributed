@@ -9,6 +9,8 @@ mod atlas;
 mod cli;
 mod client_compiler;
 pub mod contracts;
+mod game_client;
+mod game_wasm;
 mod generate;
 mod js_framework;
 pub mod lifecycle;
@@ -20,10 +22,10 @@ pub use atlas::{render_atlas_schema, AtlasDatabaseUrl, AtlasSchemaSpec};
 pub use cli::{
     run, run_distributed, AgentHarness, BuildArgs, Bus, ClientArgs, ClientManifestArgs,
     ContractsAcceptArgs, ContractsArgs, ContractsCheckArgs, ContractsCommands, ContractsOutput,
-    DescribeArgs, DevArgs, DistributedArgs, DistributedCommands, Framework, GitopsPromote,
-    JavascriptWatchArgs, LifecycleOutput, ManifestFormat, Metrics, ProbeArgs, ScaffoldArgs,
-    SchemaArgs, SchemaDialect, SchemaFormat, ServiceArgs, ServiceCommands, SkillsArgs,
-    SkillsCommands, SkillsInitArgs, Store, Transport,
+    DescribeArgs, DevArgs, DistributedArgs, DistributedCommands, Framework, GameClientArgs,
+    GameManifestArgs, GameWasmArgs, GitopsPromote, JavascriptWatchArgs, LifecycleOutput,
+    ManifestFormat, Metrics, ProbeArgs, ScaffoldArgs, SchemaArgs, SchemaDialect, SchemaFormat,
+    ServiceArgs, ServiceCommands, SkillsArgs, SkillsCommands, SkillsInitArgs, Store, Transport,
 };
 pub use client_compiler::{
     compile_client, ClientCompileError, ClientCompileInput, ClientDocument, ClientSourceLocation,
@@ -50,6 +52,7 @@ pub use contracts::{
     MAX_SNAPSHOT_VALUE_BYTES, MIGRATION_INVENTORY_PATH, MIGRATION_INVENTORY_SCHEMA_VERSION,
     MIGRATION_OWNER, MIGRATION_SCOPE,
 };
+pub use game_client::{generate_game_client, validate_game_surface, ImportExtension};
 pub use generate::{generate_service_scaffold, package_name};
 pub use lifecycle::{
     run_lifecycle_build, run_lifecycle_dev, ArtifactNodeReceipt, BuildDrift,

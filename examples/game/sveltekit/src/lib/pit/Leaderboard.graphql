@@ -1,0 +1,8 @@
+# The leaderboard: a query over the player_stats read model (top 5 by XP).
+query Leaderboard($limit: Int! = 5) @load @live {
+  player_stats(order_by: [{ xp: desc }, { player_id: asc }], limit: $limit) {
+    player_id
+    name
+    xp
+  }
+}
