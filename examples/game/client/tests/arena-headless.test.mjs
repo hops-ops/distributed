@@ -67,8 +67,8 @@ test('headless client joins the arena and moves with exact prediction', { timeou
 		await until(() => connection.clock.synced, 5_000, 'clock');
 		const base = connection.clock.rtt;
 		await api.setNetSim({ latencyMs: 60, jitterMs: 0, loss: 0 });
-		await until(() => connection.clock.samples.at(-1)?.rtt >= 110, 10_000, 'rtt with netsim');
-		assert.ok(connection.clock.samples.at(-1).rtt > base + 100);
+		// Wait for exactly what is asserted: the baseline RTT varies by machine.
+		await until(() => connection.clock.samples.at(-1)?.rtt > base + 100, 10_000, 'rtt with netsim');
 		await api.setNetSim({ latencyMs: 0, jitterMs: 0, loss: 0 });
 		assert.deepEqual(await api.getNetSim(), { latencyMs: 0, jitterMs: 0, loss: 0 });
 
