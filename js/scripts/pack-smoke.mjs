@@ -627,10 +627,13 @@ assert.deepEqual(Object.keys(sveltekitGameSurface).sort(), [
 ]);
 const sveltekitGameServerSurface = await import('@hops-ops/distributed/sveltekit/game/server');
 assert.deepEqual(Object.keys(sveltekitGameServerSurface).sort(), [
+  'GAME_TICKET_RATE_LIMIT_SCRIPT',
+  'GameTicketRateLimiterUnavailable',
   'MAX_GAME_TICKET_TTL_SECONDS',
   'MIN_GAME_TICKET_SECRET_BYTES',
   'createGameTicketHandler',
   'createGameTicketRateLimiter',
+  'createRedisGameTicketRateLimiter',
   'mintGameTicket'
 ]);
 
