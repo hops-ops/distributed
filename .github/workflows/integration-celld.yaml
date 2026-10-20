@@ -7,8 +7,7 @@ name: celld (live + e2e-celld)
 #   make -C tests/e2e-celld test
 #   make -C tests/e2e-ui up && make -C tests/e2e-ui up-celld-nats
 #   WATCH=0 WATCH_WORKER=0 make -C tests/e2e-celld run
-#   E2E_UI_ORIGIN=http://localhost:8791 npx --prefix tests/e2e-ui playwright test \
-#     todos.user.spec.ts chat.user.spec.ts --project chromium-user
+#   make -C tests/e2e-celld test-browser   # the full Playwright suite
 #
 # Default `cargo test` (quality) still runs fixture-only celld checks and
 # skips live HTTP unless CELLD_URL is set. This job sets CELLD_URL / NATS_URL.
@@ -295,11 +294,9 @@ jobs:
             -H "x-distributed-internal-secret: $DISTRIBUTED_INTERNAL_SECRET" \
             -d '{"ids":["forged"]}'
 
-      - name: Todo + Chat browser lifecycle through celld
+      - name: Full Playwright suite through celld (user, admin, anon)
         working-directory: tests/e2e-ui
-        run: >-
-          npx playwright test todos.user.spec.ts chat.user.spec.ts
-          --project chromium-user
+        run: npx playwright test
         env:
           E2E_UI_ORIGIN: http://localhost:8791
           E2E_API_ORIGIN: http://127.0.0.1:8791

@@ -79,6 +79,15 @@ up-celld-nats:
 	@set -e; \
 	command -v docker >/dev/null || { echo "docker required"; exit 1; }; \
 	celld=$$($(CELLD_CHECK) "$(CELLD_BIN)"); \
+	if [ -z "$${CELLD_ESBUILD:-}" ] && ! command -v esbuild >/dev/null; then \
+		if [ -x "$(REPO_ROOT)/js/node_modules/.bin/esbuild" ]; then \
+			export CELLD_ESBUILD="$(REPO_ROOT)/js/node_modules/.bin/esbuild"; \
+		else \
+			echo "esbuild required (celld bundles Workers with it): npm install -g esbuild,"; \
+			echo "make js-install (uses js/node_modules), or CELLD_ESBUILD=<path>"; \
+			exit 1; \
+		fi; \
+	fi; \
 	command -v worker-build >/dev/null || { echo "worker-build required: cargo install worker-build"; exit 1; }; \
 	$(MAKE) --no-print-directory down-celld; \
 	if lsof -tiTCP:$(CELLD_HTTP_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
