@@ -169,6 +169,7 @@ impl Zone for Room {
     type Config = ();
     type Input = Push;
     type Timer = ();
+    type Message = NoMessages; // or a #[derive(GameEvent)] type (zone inbox)
 
     fn schema() -> EntitySchema { schema![DotView] }
 
@@ -1007,6 +1008,23 @@ principals commit concurrently; settlements arrive in completion order.
 …)` adjusts the `HostConfig` of each activation (e.g. a province ticking at
 2 Hz while its neighborhoods run at 30 Hz); the world content version is
 applied afterwards.
+
+**Zone inbox.** Services talk to a running zone through typed messages:
+`type Message = MyMessage` on the zone (a `#[derive(GameEvent)]` struct or
+enum, so it has stable ids and the event payload codec; `NoMessages` for
+none) and `Zone::on_message(ctx, message)`, which runs on the zone's task
+between ticks, never during one. Deliver with `GameServer::send(zone,
+ZoneInbound::Message(m))` locally, `POST /admin/zone-message` (admin
+secret; `{zone, message: {type_id, payload}}` or `{zone, kick:
+{principal, reason}}`) from peers, or `net::ZoneInboxClient` from a
+service: it finds the owner through the `ZoneDirectory` and follows `421
+wrong_owner` answers. The built-in `ZoneInbound::Kick { principal, reason
+}` removes every connection of the principal (`LeaveReason::Kicked`, and a
+`PlayerLeft` lifecycle fact). A message for a zone that is not running is
+refused (`404 inactive` / `InboxError::Inactive`) and never activates it.
+Messages appear in the game surface under `messages`; the generated
+TypeScript has `MESSAGE`, `MESSAGES` and `encodeMessage` for TS services.
+Recorded and replayed like the other entry points (`Recorder::deliver`).
 
 **Zone factory and allocation.** `ZoneFactory::new(|activation| async move
 { … })` may await storage: it runs on the activation task after the

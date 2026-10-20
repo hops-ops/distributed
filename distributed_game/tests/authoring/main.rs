@@ -127,6 +127,19 @@ pub enum SampleEvent {
     },
 }
 
+/// What services may send into the sample zone (zone inbox).
+#[derive(Debug, Clone, PartialEq, GameEvent)]
+pub enum SampleMessage {
+    #[game_event(id = 1)]
+    Announce {
+        #[long]
+        text: String,
+        urgent: bool,
+    },
+    #[game_event(id = 2)]
+    SetWind(SampleWind),
+}
+
 #[derive(Debug, Clone, PartialEq, GameEvent)]
 #[game_event(id = 9)]
 pub struct Ping {
@@ -243,6 +256,7 @@ impl Zone for Sample {
     type Config = ();
     type Input = SampleInput;
     type Timer = ();
+    type Message = SampleMessage;
 
     fn schema() -> EntitySchema {
         schema![PlayerView, MarkerView, StatsView]
@@ -753,6 +767,21 @@ fn golden_fixture_is_current() {
             "sanitized": {"mx": sanitized.mx, "my": sanitized.my, "buttons": sanitized.buttons, "aim": aim_wire, "power": 0.25, "viewTick": 123_456},
         },
         "events": events,
+        // Zone inbox messages (`/admin/zone-message` payloads).
+        "messages": [
+            {
+                "id": 1,
+                "name": "announce",
+                "value": { "text": "server restart in 5", "urgent": true },
+                "hex": hex(&SampleMessage::Announce { text: "server restart in 5".into(), urgent: true }.to_payload()),
+            },
+            {
+                "id": 2,
+                "name": "set_wind",
+                "value": { "speed": 2.5, "gusts": 7 },
+                "hex": hex(&SampleMessage::SetWind(SampleWind { speed: 2.5, gusts: 7 }).to_payload()),
+            },
+        ],
         // Each constant's encoding: the generated literal must decode-equal it.
         "constants": {
             "sample_board": hex(&distributed_game::codec::to_bytes(&sample_board())),

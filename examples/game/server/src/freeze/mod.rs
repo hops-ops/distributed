@@ -357,6 +357,7 @@ impl Zone for FreezeZone {
     type Config = FreezeConfig;
     type Input = MoveInput;
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         schema![PlayerView, SlimeView, GemView, RitualView]

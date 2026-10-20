@@ -34,6 +34,7 @@ use crate::authoring::GameEvent;
 use crate::clock::Clock;
 use crate::facts::{EmitError, Fact, FactCommand, FactQueue, FactSettlement};
 use crate::handoff::{HandoffError, HandoffRequest, Transfer, TransferIssuer, MAX_CARRIED_BYTES};
+use crate::inbox::{Delivered, ZoneInbound};
 use crate::input::{ConsumePolicy, InputBuffer, PushOutcome, SequencedInput};
 use crate::interest::{InterestConfig, View};
 use crate::lifecycle::{
@@ -1549,6 +1550,48 @@ impl<Z: Zone> ZoneHost<Z> {
     /// Send a typed event now (see [`Ctx::send`]).
     pub fn send<E: GameEvent>(&mut self, to: Viewer, event: &E) {
         self.send_event(to, event.event_id(), event.to_payload());
+    }
+
+    /// Deliver a service message ([`crate::inbox`]): a kick removes every
+    /// connection of the principal (players leave with
+    /// [`LeaveReason::Kicked`]), a game message runs
+    /// [`Zone::on_message`]. Call between ticks (the host is not ticking
+    /// while the caller holds `&mut self`).
+    pub fn deliver(&mut self, inbound: ZoneInbound<Z::Message>) -> Delivered {
+        let mut delivered = Delivered::default();
+        match inbound {
+            ZoneInbound::Kick { principal, reason } => {
+                let players: Vec<_> = self
+                    .core
+                    .players
+                    .values()
+                    .filter(|slot| slot.info.principal == principal)
+                    .map(|slot| slot.info.id)
+                    .collect();
+                delivered.players_kicked = players.len();
+                for player in players {
+                    self.core.pending_kicks.push((player, reason.clone()));
+                }
+                let observers: Vec<_> = self
+                    .core
+                    .observers
+                    .values()
+                    .filter(|slot| slot.info.principal == principal)
+                    .map(|slot| slot.info.id)
+                    .collect();
+                delivered.observers_kicked = observers.len();
+                let bye = ServerMessage::Kick {
+                    code: kick::BY_ZONE,
+                    message: reason,
+                };
+                for observer in observers {
+                    self.remove_observer(observer, Some(&bye));
+                }
+            }
+            ZoneInbound::Message(message) => hook!(self.on_message(message)),
+        }
+        self.process_kicks();
+        delivered
     }
 
     /// Kick a player now.

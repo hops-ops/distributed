@@ -822,6 +822,7 @@ impl Zone for MobPit {
     type Config = MobPitConfig;
     type Input = PitInput;
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         schema![PlayerView, MobView, PillarView, PitView]

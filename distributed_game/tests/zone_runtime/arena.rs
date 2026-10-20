@@ -83,6 +83,7 @@ impl Zone for Arena {
     type Config = ArenaConfig;
     type Input = (i8, i8);
     type Timer = ArenaTimer;
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         let pos = FieldType::QuantF32 {

@@ -641,6 +641,7 @@ impl Zone for Ripple {
     type Config = RippleConfig;
     type Input = HoodInput;
     type Timer = RippleTimer;
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         schema![TierView, BossView, FighterView]

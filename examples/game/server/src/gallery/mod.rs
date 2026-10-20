@@ -484,6 +484,7 @@ impl Zone for Gallery {
     type Config = GalleryConfig;
     type Input = ShotInput;
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         schema![ShooterView, TargetView]

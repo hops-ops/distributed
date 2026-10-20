@@ -208,6 +208,7 @@ impl Zone for Arena {
     type Config = ArenaConfig;
     type Input = MoveInput;
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         schema![PlayerView, DroneView, PillarView]

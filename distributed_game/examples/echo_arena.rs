@@ -33,6 +33,7 @@ impl Zone for EchoArena {
     type Config = ();
     type Input = (i8, i8);
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         let pos = FieldType::QuantF32 {

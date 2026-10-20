@@ -60,6 +60,7 @@ pub mod codec;
 pub mod facts;
 pub mod handoff;
 pub mod host;
+pub mod inbox;
 pub mod input;
 pub mod interest;
 pub mod lifecycle;
@@ -99,6 +100,7 @@ pub use facts::{
 };
 pub use handoff::{HandoffError, HandoffRequest, Transfer};
 pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};
+pub use inbox::{Delivered, NoMessages, ZoneInbound};
 pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, SequencedInput};
 pub use interest::{InterestConfig, View};
 pub use prediction::{PredictContext, PredictStep};

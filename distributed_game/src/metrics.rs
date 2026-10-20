@@ -642,6 +642,7 @@ mod tests {
         type Config = ();
         type Input = u8;
         type Timer = ();
+        type Message = distributed_game::NoMessages;
 
         fn schema() -> EntitySchema {
             EntitySchema::new().kind(KindDef::new(1, "dot").field("v", FieldType::U8))

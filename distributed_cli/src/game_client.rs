@@ -9,7 +9,7 @@
 //! |---|---|
 //! | `schema.ts` | `KIND` ids, per-kind field interfaces + accessors over rendered entities, field wire types, `CORRECTIONS` defaults |
 //! | `input.ts` | the input interface, `BUTTON` bits, `encodeInput` / `decodeInput` / `sanitizeInput` |
-//! | `events.ts` | record + event payload interfaces, `EVENT` ids, `EVENTS` codecs, `decodeEvent`, `onEvent`; `encode<Record>` / `decode<Record>` for the surface's standalone codecs |
+//! | `events.ts` | record + event payload interfaces, `EVENT` ids, `EVENTS` codecs, `decodeEvent`, `onEvent`; `encode<Record>` / `decode<Record>` for the surface's standalone codecs; with zone inbox messages, `<Name>Message` interfaces, `MESSAGE` ids, `MESSAGES` codecs and `encodeMessage` (for services posting to `/admin/zone-message`) |
 //! | `client.ts` | `create<Surface>Client`: a `GameClient` with the input encoder and correction defaults wired in, plus typed `on`; with a predicted step, prediction defaults to the compiled WebAssembly step |
 //! | `predict.ts` | only with a `#[predict]` step: its state/context layouts, the module URL (`wasm/<surface>.wasm`, built by `distributed game-wasm`) and `create<Surface>Prediction` |
 //! | `pures.ts` | only with `#[game_pure]` functions: `create<Surface>Pures`, one typed wrapper per function over the same module |
@@ -77,6 +77,8 @@ struct Surface {
     constants: Vec<Constant>,
     #[serde(default)]
     codecs: Vec<String>,
+    #[serde(default)]
+    messages: Vec<Event>,
 }
 
 /// A pure function compiled into the surface's module (`#[game_pure]`).
@@ -1168,11 +1170,14 @@ impl<'a> Gen<'a> {
             "type GameEventCodecs",
             "type GameEventSource",
         ];
+        let messages = &self.surface.messages;
         let uses_fields = events
             .iter()
+            .chain(messages)
             .any(|e| matches!(e.payload, Payload::Fields { .. }));
         let uses_value = events
             .iter()
+            .chain(messages)
             .any(|e| matches!(e.payload, Payload::Value { .. }));
         if uses_fields {
             sdk.extend(["decodePayload", "encodePayload", "type PayloadLayout"]);
@@ -1220,51 +1225,9 @@ impl<'a> Gen<'a> {
             );
         }
 
-        for event in events {
-            let type_name = format!("{}Event", pascal(&event.name));
-            out.push('\n');
-            match &event.payload {
-                Payload::Fields { fields } if fields.is_empty() => {
-                    let _ = writeln!(
-                        out,
-                        "/** Event `{}` (id {}): no payload. */\nexport type {type_name} = Readonly<Record<string, never>>;",
-                        event.name, event.id
-                    );
-                    let _ = writeln!(
-                        out,
-                        "\nconst {}_LAYOUT: PayloadLayout = [];",
-                        constant(&event.name)
-                    );
-                }
-                Payload::Fields { fields } => {
-                    out.push_str(&self.interface(
-                        &type_name,
-                        &format!("Event `{}` (id {}).", event.name, event.id),
-                        fields,
-                    ));
-                    let _ = writeln!(
-                        out,
-                        "\nconst {}_LAYOUT: PayloadLayout = {};",
-                        constant(&event.name),
-                        self.layout(fields)
-                    );
-                }
-                Payload::Value { ty } => {
-                    let _ = writeln!(
-                        out,
-                        "/** Event `{}` (id {}). */\nexport type {type_name} = {};",
-                        event.name,
-                        event.id,
-                        self.ts_type(ty)
-                    );
-                    let _ = writeln!(
-                        out,
-                        "\nconst {}_PAYLOAD: WireType = {};",
-                        constant(&event.name),
-                        self.wire_literal(ty)
-                    );
-                }
-            }
+        self.payload_types(&mut out, events, "Event", "");
+        if !messages.is_empty() {
+            self.payload_types(&mut out, messages, "Message", "MESSAGE_");
         }
 
         out.push_str("\n/** Event type ids by name. */\nexport const EVENT = {\n");
@@ -1310,7 +1273,104 @@ impl<'a> Gen<'a> {
         out.push_str("/** A decoded event, discriminated by `name`. */\nexport type AnyEvent = DecodedGameEvent<Events>;\n\n");
         out.push_str("/** Decode an Event message (`undefined` for ids this surface does not declare). */\nexport function decodeEvent(event: { readonly typeId: number; readonly payload: Uint8Array }): AnyEvent | undefined {\n\treturn decodeGameEvent(EVENTS, event);\n}\n\n");
         out.push_str("/** Subscribe to one typed event on every zone of `client`; returns the unsubscribe. */\nexport function onEvent<K extends keyof Events>(\n\tclient: GameEventSource,\n\tname: K,\n\thandler: (value: Events[K], zoneId: string) => void\n): () => void {\n\treturn onGameEvent(client, EVENTS, name, handler);\n}\n");
+        if !messages.is_empty() {
+            self.messages_ts(&mut out, messages);
+        }
         Ok(out)
+    }
+
+    /// Zone inbox message ids, codecs and `encodeMessage` (the body of a
+    /// `/admin/zone-message` `message`).
+    fn messages_ts(&self, out: &mut String, messages: &[Event]) {
+        out.push_str("\n/** Zone inbox message type ids by name. */\nexport const MESSAGE = {\n");
+        for m in messages {
+            let _ = writeln!(out, "\t{}: {},", key(&camel(&m.name)), m.id);
+        }
+        out.push_str("} as const;\n\n/** Zone inbox message payload types by name. */\nexport interface Messages {\n");
+        for m in messages {
+            let _ = writeln!(
+                out,
+                "\t{}: {}Message;",
+                key(&camel(&m.name)),
+                pascal(&m.name)
+            );
+        }
+        out.push_str("}\n\n/** Codecs of every zone inbox message. */\nexport const MESSAGES: GameEventCodecs<Messages> = {\n");
+        for m in messages {
+            let type_name = format!("{}Message", pascal(&m.name));
+            let c = format!("MESSAGE_{}", constant(&m.name));
+            let (encode, decode) = match &m.payload {
+                Payload::Fields { .. } => (
+                    format!("(value) => encodePayload({c}_LAYOUT, value)"),
+                    format!(
+                        "(payload) => decodePayload({c}_LAYOUT, payload) as unknown as {type_name}"
+                    ),
+                ),
+                Payload::Value { .. } => (
+                    format!("(value) => encodeValue({c}_PAYLOAD, value)"),
+                    format!("(payload) => decodeValue({c}_PAYLOAD, payload) as {type_name}"),
+                ),
+            };
+            let _ = writeln!(
+                out,
+                "\t{}: {{\n\t\tid: {},\n\t\tname: {},\n\t\tencode: {encode},\n\t\tdecode: {decode}\n\t}},",
+                key(&camel(&m.name)),
+                m.id,
+                string(&m.name)
+            );
+        }
+        out.push_str("};\n\n/** Encode a zone inbox message: `typeId` and `payload` of a `/admin/zone-message` body (base64url the payload). */\nexport function encodeMessage<K extends keyof Messages>(\n\tname: K,\n\tvalue: Messages[K]\n): { readonly typeId: number; readonly payload: Uint8Array } {\n\tconst codec = MESSAGES[name];\n\treturn { typeId: codec.id, payload: codec.encode(value) };\n}\n");
+    }
+
+    /// Payload interfaces and layouts of events (`suffix` `Event`) or zone
+    /// inbox messages (`Message`, constants prefixed `MESSAGE_`).
+    fn payload_types(&self, out: &mut String, items: &[Event], suffix: &str, prefix: &str) {
+        for event in items {
+            let type_name = format!("{}{suffix}", pascal(&event.name));
+            out.push('\n');
+            match &event.payload {
+                Payload::Fields { fields } if fields.is_empty() => {
+                    let _ = writeln!(
+                            out,
+                            "/** {suffix} `{}` (id {}): no payload. */\nexport type {type_name} = Readonly<Record<string, never>>;",
+                            event.name, event.id
+                        );
+                    let _ = writeln!(
+                        out,
+                        "\nconst {prefix}{}_LAYOUT: PayloadLayout = [];",
+                        constant(&event.name)
+                    );
+                }
+                Payload::Fields { fields } => {
+                    out.push_str(&self.interface(
+                        &type_name,
+                        &format!("{suffix} `{}` (id {}).", event.name, event.id),
+                        fields,
+                    ));
+                    let _ = writeln!(
+                        out,
+                        "\nconst {prefix}{}_LAYOUT: PayloadLayout = {};",
+                        constant(&event.name),
+                        self.layout(fields)
+                    );
+                }
+                Payload::Value { ty } => {
+                    let _ = writeln!(
+                        out,
+                        "/** {suffix} `{}` (id {}). */\nexport type {type_name} = {};",
+                        event.name,
+                        event.id,
+                        self.ts_type(ty)
+                    );
+                    let _ = writeln!(
+                        out,
+                        "\nconst {prefix}{}_PAYLOAD: WireType = {};",
+                        constant(&event.name),
+                        self.wire_literal(ty)
+                    );
+                }
+            }
+        }
     }
 
     /// Records an event payload (or the input) encodes, directly or nested.
@@ -1323,7 +1383,7 @@ impl<'a> Gen<'a> {
             }
         }
         let mut pending = Vec::new();
-        for event in &self.surface.events {
+        for event in self.surface.events.iter().chain(&self.surface.messages) {
             match &event.payload {
                 Payload::Fields { fields } => fields.iter().for_each(|f| walk(&f.ty, &mut pending)),
                 Payload::Value { ty } => walk(ty, &mut pending),

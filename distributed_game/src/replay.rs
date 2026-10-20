@@ -223,6 +223,24 @@ pub enum Event {
         /// New version.
         version: String,
     },
+    /// [`ZoneHost::deliver`]: a kick of `principal`.
+    DeliverKick {
+        /// Clock.
+        at: Duration,
+        /// Principal kicked.
+        principal: String,
+        /// Reason.
+        reason: String,
+    },
+    /// [`ZoneHost::deliver`]: a game message (encoded `Z::Message`).
+    DeliverMessage {
+        /// Clock.
+        at: Duration,
+        /// Message type id.
+        type_id: u32,
+        /// Encoded payload.
+        payload: Vec<u8>,
+    },
     /// [`ZoneHost::request_freeze`].
     RequestFreeze {
         /// Clock.
@@ -277,6 +295,8 @@ impl Event {
             | Self::ReconnectVersion { at, .. }
             | Self::SetContentVersion { at, .. }
             | Self::SetConfigVersion { at, .. }
+            | Self::DeliverKick { at, .. }
+            | Self::DeliverMessage { at, .. }
             | Self::RequestFreeze { at, .. }
             | Self::CancelFreeze { at, .. }
             | Self::ReloadStale { at }
@@ -346,6 +366,12 @@ impl fmt::Display for Event {
             }
             Self::SetConfigVersion { version, .. } => {
                 write!(f, "@{ms:.1}ms config version {version}")
+            }
+            Self::DeliverKick { principal, .. } => {
+                write!(f, "@{ms:.1}ms inbox kick {principal}")
+            }
+            Self::DeliverMessage { type_id, .. } => {
+                write!(f, "@{ms:.1}ms inbox message {type_id}")
             }
             Self::RequestFreeze { notice, .. } => {
                 write!(f, "@{ms:.1}ms request freeze {}", notice.reason)
@@ -811,6 +837,16 @@ impl Recording {
                 } => {
                     w.u8(16).bytes(state).string(saved_version);
                 }
+                Event::DeliverKick {
+                    principal, reason, ..
+                } => {
+                    w.u8(18).string(principal).string(reason);
+                }
+                Event::DeliverMessage {
+                    type_id, payload, ..
+                } => {
+                    w.u8(19).varuint(*type_id).bytes(payload);
+                }
                 Event::SetConfigVersion { version, .. } => {
                     w.u8(17).string(version);
                 }
@@ -967,6 +1003,16 @@ impl Recording {
                 17 => Event::SetConfigVersion {
                     at,
                     version: r.string()?,
+                },
+                18 => Event::DeliverKick {
+                    at,
+                    principal: r.string()?,
+                    reason: r.string()?,
+                },
+                19 => Event::DeliverMessage {
+                    at,
+                    type_id: r.varuint()?,
+                    payload: r.bytes()?.to_vec(),
                 },
                 _ => return Err(bad("event tag")),
             };
@@ -1280,6 +1326,29 @@ impl<Z: Zone> Recorder<Z> {
             at,
             version: version.into(),
         });
+    }
+
+    /// [`ZoneHost::deliver`].
+    pub fn deliver(
+        &mut self,
+        inbound: crate::inbox::ZoneInbound<Z::Message>,
+    ) -> crate::inbox::Delivered {
+        let at = self.now();
+        let event = match &inbound {
+            crate::inbox::ZoneInbound::Kick { principal, reason } => Event::DeliverKick {
+                at,
+                principal: principal.clone(),
+                reason: reason.clone(),
+            },
+            crate::inbox::ZoneInbound::Message(message) => Event::DeliverMessage {
+                at,
+                type_id: crate::GameEvent::event_id(message),
+                payload: crate::GameEvent::to_payload(message),
+            },
+        };
+        let delivered = self.host.deliver(inbound);
+        self.recording.events.push(event);
+        delivered
     }
 
     /// [`ZoneHost::request_freeze`].
@@ -1613,6 +1682,23 @@ pub fn replay_with<Z: Zone>(
             }
             Event::SetContentVersion { version, .. } => host.set_content_version(version.clone()),
             Event::SetConfigVersion { version, .. } => host.set_config_version(version.clone()),
+            Event::DeliverKick {
+                principal, reason, ..
+            } => {
+                host.deliver(crate::inbox::ZoneInbound::Kick {
+                    principal: principal.clone(),
+                    reason: reason.clone(),
+                });
+            }
+            Event::DeliverMessage {
+                type_id, payload, ..
+            } => {
+                if let Ok(Some(message)) =
+                    <Z::Message as crate::GameEvent>::decode_event(*type_id, payload)
+                {
+                    host.deliver(crate::inbox::ZoneInbound::Message(message));
+                }
+            }
             Event::RequestFreeze { notice, .. } => {
                 host.request_freeze(notice.clone());
             }

@@ -69,6 +69,11 @@ path = "tests/net_e2e/main.rs"
 required-features = ["net"]
 
 [[test]]
+name = "inbox"
+path = "tests/inbox/main.rs"
+required-features = ["net"]
+
+[[test]]
 name = "lifecycle"
 path = "tests/lifecycle/main.rs"
 required-features = ["runtime"]

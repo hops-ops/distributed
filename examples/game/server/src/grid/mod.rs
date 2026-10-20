@@ -404,6 +404,7 @@ impl Zone for GridZone {
     type Config = GridConfig;
     type Input = MoveInput;
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         schema![WalkerView, CritterView, MarkerView]

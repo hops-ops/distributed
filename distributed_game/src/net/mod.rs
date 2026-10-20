@@ -43,6 +43,7 @@
 //! - **Barrier**: [`GameServer::prepare_barrier`] / `commit_barrier` /
 //!   `abort_barrier`, driven by a [`world::WorldCoordinator`].
 
+pub mod inbox;
 pub mod peer;
 pub mod ticket;
 pub mod transfer;
@@ -66,6 +67,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 pub use crate::facts::BoxFuture;
+pub use inbox::{InboxError, ZoneInboxClient, ZONE_MESSAGE_PATH};
 pub use ticket::{
     decode_hs256, NonceCache, SharedTicketVerifier, TicketError, TicketKey, TicketVerifier,
     VerifiedTicket,
@@ -339,6 +341,11 @@ enum ZoneCmd {
         client: ClientId,
         graceful: bool,
     },
+    /// A zone inbox message (decoded into `Z::Message` on the zone task).
+    Deliver {
+        inbound: inbox::WireInbound,
+        reply: oneshot::Sender<Result<crate::inbox::Delivered, InboxError>>,
+    },
 }
 
 enum ConnOut {
@@ -578,6 +585,49 @@ where
         rx.await.ok()
     }
 
+    /// Deliver a zone inbox message ([`crate::inbox`]) to `zone_id` on this
+    /// server. Runs on the zone's task between ticks. Refused with
+    /// [`InboxError::Inactive`] when the zone is not running here (a message
+    /// never activates a zone) and [`InboxError::WrongOwner`] when the
+    /// directory places it on another host.
+    pub async fn send(
+        &self,
+        zone_id: &str,
+        inbound: crate::inbox::ZoneInbound<Z::Message>,
+    ) -> Result<crate::inbox::Delivered, InboxError> {
+        self.deliver_wire(zone_id, inbox::WireInbound::of(&inbound))
+            .await
+    }
+
+    pub(crate) async fn deliver_wire(
+        &self,
+        zone_id: &str,
+        inbound: inbox::WireInbound,
+    ) -> Result<crate::inbox::Delivered, InboxError> {
+        if let Some(owner) = self
+            .inner
+            .directory
+            .as_ref()
+            .and_then(|d| d.locate(zone_id))
+            .filter(|h| h.id != self.inner.host_id)
+        {
+            return Err(InboxError::WrongOwner(owner));
+        }
+        let tx = {
+            let zones = self.inner.zones.lock().expect("zones");
+            zones
+                .get(zone_id)
+                .filter(|e| !e.tx.is_closed())
+                .map(|e| e.tx.clone())
+                .ok_or(InboxError::Inactive)?
+        };
+        let (reply, rx) = oneshot::channel();
+        tx.send(ZoneCmd::Deliver { inbound, reply })
+            .await
+            .map_err(|_| InboxError::Inactive)?;
+        rx.await.map_err(|_| InboxError::Inactive)?
+    }
+
     /// Start activating `zone_id` locally without waiting (it is registered
     /// at once, so barriers and joins already reach it). False only while
     /// shutting down; an unknown zone unregisters itself once its factory
@@ -727,6 +777,7 @@ where
             router = router
                 .route("/admin/transfer", post(world::admin_transfer::<Z>))
                 .route("/admin/child-event", post(world::admin_child_event::<Z>))
+                .route(ZONE_MESSAGE_PATH, post(world::admin_zone_message::<Z>))
                 .route("/admin/barrier/{phase}", post(world::admin_barrier::<Z>));
         }
         router.with_state(self.inner.clone())
@@ -1046,6 +1097,9 @@ fn refuse_activation<Z: Zone>(
             ZoneCmd::Freeze { ack, .. } => {
                 let _ = ack.send(());
             }
+            ZoneCmd::Deliver { reply, .. } => {
+                let _ = reply.send(Err(InboxError::Inactive));
+            }
             _ => {}
         }
     }
@@ -1332,6 +1386,11 @@ async fn run_zone<Z>(
                 if matches!(cmd, ZoneCmd::Input { .. } | ZoneCmd::Disconnect { .. }) {
                     continue;
                 }
+                // Messages never activate a zone.
+                if let ZoneCmd::Deliver { reply, .. } = cmd {
+                    let _ = reply.send(Err(InboxError::Inactive));
+                    continue;
+                }
                 if let Some(tx) = activate_local(&inner, &zone_id) {
                     let _ = tx.send(cmd).await;
                 }
@@ -1464,6 +1523,9 @@ fn handle_cmd<Z: Zone>(
             host.disconnect(client, graceful);
         }
         ZoneCmd::ChildEvent(event) => host.deliver_child_event(event),
+        ZoneCmd::Deliver { inbound, reply } => {
+            let _ = reply.send(inbound.decode::<Z::Message>().map(|m| host.deliver(m)));
+        }
         ZoneCmd::Freeze { notice, ack } => {
             if host.request_freeze(notice) == FreezeState::Frozen {
                 let _ = ack.send(());

@@ -209,6 +209,10 @@ pub trait Zone: Sized + Send + 'static {
     type Input: Send + 'static;
     /// Timer payload.
     type Timer: Clone + Send + 'static;
+    /// Messages services deliver into the running zone
+    /// ([`on_message`](Self::on_message), [`crate::inbox`]): a
+    /// `#[derive(GameEvent)]` struct or enum, or [`NoMessages`](crate::NoMessages).
+    type Message: crate::GameEvent + Send + 'static;
 
     /// Replicated entity schema (called once at creation).
     fn schema() -> EntitySchema;
@@ -271,6 +275,11 @@ pub trait Zone: Sized + Send + 'static {
 
     /// One fixed simulation step (`ctx.dt()` is the step length of the tier).
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>);
+
+    /// A message from a service ([`crate::inbox`]), delivered on the zone's
+    /// task between ticks (never during one). The built-in kick is handled
+    /// by the host and never reaches this hook.
+    fn on_message(&mut self, _ctx: &mut Ctx<'_, Self>, _message: Self::Message) {}
 
     /// A timer fired (before `on_tick` of the same tick).
     fn on_timer(&mut self, _ctx: &mut Ctx<'_, Self>, _id: TimerId, _timer: Self::Timer) {}
