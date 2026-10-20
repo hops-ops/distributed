@@ -351,7 +351,7 @@ async fn outbox_rows_survive_reopen_and_drain_at_least_once() {
         .claim(ClaimOutboxMessages::new(
             "crashed-worker",
             10,
-            Duration::from_millis(200),
+            Duration::from_secs(2),
         ))
         .await
         .unwrap();
@@ -371,7 +371,7 @@ async fn outbox_rows_survive_reopen_and_drain_at_least_once() {
         .unwrap();
     assert_eq!(fenced.claimed, 0, "a live lease is not stolen");
 
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
     let store =
         CellStreamStore::open_sqlite(&location, StreamIdentity::new("CellItem", "pub-1").unwrap())
             .unwrap();
