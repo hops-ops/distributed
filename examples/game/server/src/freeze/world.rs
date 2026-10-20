@@ -31,7 +31,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use distributed_game::net::peer::{post_json, ADMIN_SECRET_HEADER};
 use distributed_game::net::{
-    GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey, WorldCoordinator,
+    GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey, WorldCoordinator, ZoneFactory,
 };
 use distributed_game::world::{HostAddr, StaticDirectory};
 use distributed_game::{BarrierMode, FreezeState, MemoryFactSink, RetryPolicy};
@@ -120,14 +120,18 @@ fn zone_server_with_sink(
     sink: MemoryFactSink,
 ) -> GameServer<FreezeZone> {
     let host = host.to_string();
-    GameServer::new(config, move |zone_id| {
-        ZoneKind::of(zone_id).map(|kind| FreezeConfig {
-            kind,
-            guests: guests.clone(),
-            rituals: rituals.clone(),
-            host: host.clone(),
-        })
-    })
+    GameServer::new(
+        config,
+        ZoneFactory::sync(move |activation| {
+            let zone_id = activation.zone_id.as_str();
+            ZoneKind::of(zone_id).map(|kind| FreezeConfig {
+                kind,
+                guests: guests.clone(),
+                rituals: rituals.clone(),
+                host: host.clone(),
+            })
+        }),
+    )
     .with_fact_sink(sink, 256, RetryPolicy::default())
 }
 
@@ -202,7 +206,7 @@ pub fn start_host(
     };
     let task = tokio::spawn(server.clone().serve_with(listener, extra, signal));
     for zone in &local {
-        server.activate(zone);
+        server.begin_activation(zone);
     }
     Ok(WorldHost {
         addr,

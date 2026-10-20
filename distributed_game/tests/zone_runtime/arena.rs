@@ -21,6 +21,8 @@ pub struct ArenaConfig {
     pub reject_principal: Option<String>,
     pub background: bool,
     pub spawn_every: Option<Duration>,
+    /// Allocation payload handed over by the zone factory.
+    pub allocation: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]

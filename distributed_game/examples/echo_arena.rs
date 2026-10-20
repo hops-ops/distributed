@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 
-use distributed_game::net::{GameServer, ServerConfig, TicketKey};
+use distributed_game::net::{GameServer, ServerConfig, TicketKey, ZoneFactory};
 use distributed_game::{
     ConsumePolicy, Ctx, EntitySchema, EntityState, FieldType, FieldValue, KindDef, LeaveReason,
     PlayerId, View, WorldView, Zone,
@@ -105,8 +105,10 @@ async fn main() -> std::io::Result<()> {
     let mut config = ServerConfig::new(TicketKey::new(secret));
     config.host.tick_rate = 30;
     config.host.patch_rate = 20;
-    let server =
-        GameServer::<EchoArena>::new(config, |zone| zone.starts_with("arena-").then_some(()));
+    let server = GameServer::<EchoArena>::new(
+        config,
+        ZoneFactory::sync(|a| a.zone_id.starts_with("arena-").then_some(())),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     println!("LISTENING ws://{addr}");

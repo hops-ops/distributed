@@ -10,9 +10,13 @@
 //!   ([`MemoryZoneStateStore`]; `SqliteZoneStateStore` with `sqlite`).
 //! - [`topology`]: [`ZoneTopology`] parent links (province > city > borough
 //!   > neighborhood) and [`ChildEvent`] tier-up propagation.
+//! - [`allocation`]: [`ZoneAllocation`] records written by the service that
+//!   allocates a zone, read before the zone is created
+//!   ([`ZoneActivation`], [`ZoneAllocationStore`]).
 //! - [`barrier`]: content-version policy types shared by the host and the
 //!   world barrier ([`StalePolicy`], [`BarrierMode`]).
 
+pub mod allocation;
 pub mod barrier;
 pub mod directory;
 pub mod ownership;
@@ -20,6 +24,10 @@ pub mod state;
 pub mod topology;
 
 pub use crate::facts::BoxFuture;
+pub use allocation::{
+    AllocationError, MemoryZoneAllocationStore, ZoneActivation, ZoneAllocation,
+    ZoneAllocationStore, ZoneCreateError,
+};
 pub use barrier::{BarrierMode, FreezeState, StalePolicy};
 pub use directory::{HashRing, HostAddr, StaticDirectory, ZoneDirectory};
 #[cfg(feature = "lease")]

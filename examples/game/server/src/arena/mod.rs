@@ -30,7 +30,7 @@ pub use game_sim::arena as movement;
 
 use std::collections::BTreeMap;
 
-use distributed_game::net::{GameServer, ServerConfig};
+use distributed_game::net::{GameServer, ServerConfig, ZoneFactory};
 use distributed_game::{
     schema, Ctx, EntitySchema, GameEvent, GameInput, GameSurface, InputCredits, LeaveReason,
     PlayerId, Replicated, View, WorldView, Zone,
@@ -352,10 +352,14 @@ impl Demo for ArenaDemo {
     }
 
     fn server(config: ServerConfig, guests: Guests) -> GameServer<Arena> {
-        GameServer::new(config, move |zone_id| {
-            Self::hosts_zone(zone_id).then(|| ArenaConfig {
-                guests: guests.clone(),
-            })
-        })
+        GameServer::new(
+            config,
+            ZoneFactory::sync(move |activation| {
+                let zone_id = activation.zone_id.as_str();
+                Self::hosts_zone(zone_id).then(|| ArenaConfig {
+                    guests: guests.clone(),
+                })
+            }),
+        )
     }
 }

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
-use distributed_game::net::{GameServer, ServerConfig};
+use distributed_game::net::{GameServer, ServerConfig, ZoneFactory};
 use distributed_game::RetryPolicy;
 use serde_json::{json, Value};
 
@@ -205,12 +205,16 @@ impl MobPitWorld {
         guests: Guests,
     ) -> (GameServer<MobPit>, Router) {
         let world = self.clone();
-        let server = GameServer::new(config, move |zone_id| {
-            MobPitDemo::hosts_zone(zone_id).then(|| MobPitConfig {
-                guests: guests.clone(),
-                world: world.clone(),
-            })
-        })
+        let server = GameServer::new(
+            config,
+            ZoneFactory::sync(move |activation| {
+                let zone_id = activation.zone_id.as_str();
+                MobPitDemo::hosts_zone(zone_id).then(|| MobPitConfig {
+                    guests: guests.clone(),
+                    world: world.clone(),
+                })
+            }),
+        )
         .with_fact_sink(self.fact_sink(), FACT_CAPACITY, RetryPolicy::default());
         (server, routes::routes(self.clone()))
     }

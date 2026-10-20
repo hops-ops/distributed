@@ -54,7 +54,9 @@ export const GameErrorCode = Object.freeze({
 	VERSION_MISMATCH: 5,
 	RATE_LIMITED: 6,
 	NOT_FOUND: 7,
-	RECONNECT_FAILED: 8
+	RECONNECT_FAILED: 8,
+	/** The zone could not be created right now (factory or allocation failure); retry later. */
+	ZONE_UNAVAILABLE: 9
 });
 
 export type HelloMessage = Readonly<{

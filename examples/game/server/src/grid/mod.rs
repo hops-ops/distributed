@@ -47,7 +47,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use distributed_game::net::{GameServer, ServerConfig};
+use distributed_game::net::{GameServer, ServerConfig, ZoneFactory};
 use distributed_game::world::{FlatTopology, HashRing, HostAddr, ZoneDirectory};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EntitySchema, GameEvent, GameInput, GameSurface, LeaveReason,
@@ -643,14 +643,18 @@ impl ClusterDemo for GridDemo {
         config.host.max_observers = 64;
         let guests = world.guests.clone();
         let host_id = world.host.id.clone();
-        GameServer::new(config, move |zone_id| {
-            world::parse_zone(zone_id).map(|cell| GridConfig {
-                guests: guests.clone(),
-                host_id: host_id.clone(),
-                seed,
-                cell,
-            })
-        })
+        GameServer::new(
+            config,
+            ZoneFactory::sync(move |activation| {
+                let zone_id = activation.zone_id.as_str();
+                world::parse_zone(zone_id).map(|cell| GridConfig {
+                    guests: guests.clone(),
+                    host_id: host_id.clone(),
+                    seed,
+                    cell,
+                })
+            }),
+        )
         .with_topology(Arc::new(FlatTopology))
     }
 

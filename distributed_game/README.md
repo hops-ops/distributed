@@ -218,13 +218,14 @@ for out in host.drain_outbound() { /* Outbound::Frame bytes go to the client */ 
 assert_eq!(game_surface().kinds[0].name, "dot");
 ```
 
-Serve it over WebSockets (`net` feature). The closure decides which zone
-ids this server hosts and with what config:
+Serve it over WebSockets (`net` feature). The zone factory decides which
+zone ids this server hosts and with what config:
 
 ```rust,ignore
-let server = GameServer::<Room>::new(ServerConfig::new(TicketKey::new(secret)), |zone_id| {
-    zone_id.starts_with("room-").then_some(())
-});
+let server = GameServer::<Room>::new(
+    ServerConfig::new(TicketKey::new(secret)),
+    ZoneFactory::sync(|activation| activation.zone_id.starts_with("room-").then_some(())),
+);
 server.serve(tokio::net::TcpListener::bind("0.0.0.0:2567").await?, shutdown_signal).await?;
 ```
 
@@ -993,6 +994,24 @@ principals commit concurrently; settlements arrive in completion order.
 …)` adjusts the `HostConfig` of each activation (e.g. a province ticking at
 2 Hz while its neighborhoods run at 30 Hz); the world content version is
 applied afterwards.
+
+**Zone factory and allocation.** `ZoneFactory::new(|activation| async move
+{ … })` may await storage: it runs on the activation task after the
+ownership claim and snapshot load, before the zone exists. It receives a
+`ZoneActivation { zone_id, activation, allocation }` — `activation` is the
+fencing token (= `boot_epoch` = the facts' stamp activation), `allocation`
+the `ZoneAllocation` record (roster, mode, config version) that the service
+which allocated the zone wrote into the store passed to
+`GameServer::with_allocation_store` (`MemoryZoneAllocationStore`, or your
+own `ZoneAllocationStore`). Return `Ok(Some(config))` to create the zone
+(`on_create` gets it), `Ok(None)` for "no such zone" (`Error(NOT_FOUND)`),
+`Err(ZoneCreateError)` when something it needs failed
+(`Error(ZONE_UNAVAILABLE)`). Store failures and a factory that outlives
+`ServerConfig::activation_timeout` also answer `ZONE_UNAVAILABLE`, never a
+hang. Joins that arrive during creation wait and are admitted afterwards;
+the tick never awaits. `ZoneFactory::sync(|activation| …)` covers factories
+without I/O. `GameServer::activate(zone).await` waits for a zone to run;
+`begin_activation(zone)` only starts it.
 
 **Activate on demand / hibernate.** `GameServer` creates a zone on first
 join (or tier-up event). With `ServerConfig::hibernate_after = Some(d)` a

@@ -10,6 +10,7 @@ use std::time::Duration;
 use distributed::lease::InMemoryLeaseStore;
 use distributed_game::net::{
     AbortNotes, GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey, WorldCoordinator,
+    ZoneFactory,
 };
 use distributed_game::protocol::{error, kick, Hello, Notice};
 use distributed_game::world::{
@@ -93,7 +94,7 @@ async fn two_hosts(
     for (host, listener) in [(a, la), (b, lb)] {
         let sink = MemoryFactSink::new();
         let f = factory.clone();
-        let server = GameServer::<Realm>::new(config(), move |zone| f(zone))
+        let server = GameServer::<Realm>::new(config(), ZoneFactory::sync(move |a| f(&a.zone_id)))
             .with_fact_sink(sink.clone(), 64, RetryPolicy::default())
             .with_host_id(host.id.clone())
             .with_directory(dir.clone())
@@ -519,7 +520,7 @@ async fn dormant_zone_hibernates_to_sqlite_and_restores() {
     let sink = MemoryFactSink::new();
     let (listener, addr) = listen().await;
     let factory = realm_factory(&[], &[]);
-    let server = GameServer::<Realm>::new(config, move |z| factory(z))
+    let server = GameServer::<Realm>::new(config, ZoneFactory::sync(move |a| factory(&a.zone_id)))
         .with_fact_sink(sink.clone(), 64, RetryPolicy::default())
         .with_state_store(store.clone());
     serve(&server, listener);
@@ -606,7 +607,8 @@ async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
         let (listener, addr) = listen().await;
         let factory = realm_factory(&[], &[]);
         let server =
-            GameServer::<Realm>::new(config, move |z| factory(z)).with_state_store(store.clone());
+            GameServer::<Realm>::new(config, ZoneFactory::sync(move |a| factory(&a.zone_id)))
+                .with_state_store(store.clone());
         serve(&server, listener);
         // Two activations per run, so the first run's last token exceeds
         // the restarted run's first token unless tokens survive restarts.
@@ -679,7 +681,7 @@ async fn fenced_lease_keeps_zone_on_one_host_and_loss_stops_it() {
     for id in ["A", "B"] {
         let (listener, addr) = listen().await;
         let f = realm_factory(&[], &[]);
-        let server = GameServer::<Realm>::new(config(), move |z| f(z))
+        let server = GameServer::<Realm>::new(config(), ZoneFactory::sync(move |a| f(&a.zone_id)))
             .with_host_id(id)
             .with_ownership(ownership.clone());
         serve(&server, listener);

@@ -1,8 +1,13 @@
 //! WebSocket transport (`net` feature): one axum server hosting many zones.
 //!
 //! - Route: `GET /zones/{zone_id}` upgrades to a WebSocket. Zones are created
-//!   on first use through the game's factory and each runs on its own Tokio
-//!   task driving a [`ZoneHost`].
+//!   on first use through the game's async [`ZoneFactory`] and each runs on
+//!   its own Tokio task driving a [`ZoneHost`]. Creation (ownership claim,
+//!   snapshot, [`ZoneAllocation`](crate::world::ZoneAllocation) record,
+//!   factory) happens before the first tick; joins that arrive meanwhile
+//!   wait and are admitted afterwards, or answered `Error(NOT_FOUND)` (the
+//!   factory knows no such zone) / `Error(ZONE_UNAVAILABLE)` (it failed or
+//!   timed out).
 //! - Binary frames only (one protocol message per frame); text frames get
 //!   `Error(BAD_MESSAGE)` and are closed.
 //! - Admission: the first frame must be Hello within `hello_timeout`. A fresh
@@ -80,8 +85,8 @@ use crate::protocol::{error, kick, ClientMessage, Notice, ServerMessage, PROTOCO
 use crate::rng::ZoneRng;
 use crate::world::{
     BarrierMode, ChildEvent, DottedTopology, FreezeState, HostAddr, LocalOwnership, OwnershipError,
-    StalePolicy, StateError, StoredZoneState, ZoneClaim, ZoneDirectory, ZoneOwnership,
-    ZoneStateStore, ZoneTopology,
+    StalePolicy, StateError, StoredZoneState, ZoneActivation, ZoneAllocationStore, ZoneClaim,
+    ZoneCreateError, ZoneDirectory, ZoneOwnership, ZoneStateStore, ZoneTopology,
 };
 use crate::zone::{ClientId, TicketClaims, Tier, Zone};
 
@@ -341,7 +346,41 @@ enum ConnOut {
     Close,
 }
 
-type ConfigFactory<Z> = dyn Fn(&str) -> Option<<Z as Zone>::Config> + Send + Sync;
+type ZoneFactoryFn<C> =
+    dyn Fn(ZoneActivation) -> BoxFuture<'static, Result<Option<C>, ZoneCreateError>> + Send + Sync;
+
+/// Creates the configuration of a zone being activated, or says it does
+/// not exist (`Ok(None)` → `Error(NOT_FOUND)`) or cannot be created now
+/// (`Err` → `Error(ZONE_UNAVAILABLE)`). Runs on the activation task before
+/// the zone exists: it may await storage, and joins wait for it (bounded by
+/// `ServerConfig::activation_timeout`). The tick never waits for it.
+pub struct ZoneFactory<C>(Box<ZoneFactoryFn<C>>);
+
+impl<C> std::fmt::Debug for ZoneFactory<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ZoneFactory(..)")
+    }
+}
+
+impl<C: Send + 'static> ZoneFactory<C> {
+    /// Async factory: `ZoneFactory::new(|activation| async move { … })`.
+    pub fn new<F, Fut>(factory: F) -> Self
+    where
+        F: Fn(ZoneActivation) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<C>, ZoneCreateError>> + Send + 'static,
+    {
+        Self(Box::new(move |activation| Box::pin(factory(activation))))
+    }
+
+    /// Factory that needs no I/O (the zone id and the allocation record
+    /// decide): `ZoneFactory::sync(|a| a.zone_id.starts_with("arena-").then(Config::default))`.
+    pub fn sync(factory: impl Fn(&ZoneActivation) -> Option<C> + Send + Sync + 'static) -> Self {
+        Self(Box::new(move |activation| {
+            let config = factory(&activation);
+            Box::pin(async move { Ok(config) })
+        }))
+    }
+}
 type FactsFactory = dyn Fn(&str) -> Option<(FactQueue, JoinHandle<()>)> + Send + Sync;
 type HostConfigFn = dyn Fn(&str, &mut HostConfig) + Send + Sync;
 
@@ -361,7 +400,8 @@ struct WorldState {
 struct Inner<Z: Zone> {
     config: ServerConfig,
     clock: Arc<dyn Clock>,
-    factory: Box<ConfigFactory<Z>>,
+    factory: ZoneFactory<Z::Config>,
+    allocations: Option<Arc<dyn ZoneAllocationStore>>,
     facts: Option<Box<FactsFactory>>,
     /// Per-zone adjustments of `config.host` (tick rates, capacity …).
     host_config: Option<Box<HostConfigFn>>,
@@ -402,11 +442,9 @@ where
     Z: Zone,
     Z::Config: Send,
 {
-    /// Server whose zones are created by `factory(zone_id)`; `None` = 404.
-    pub fn new(
-        config: ServerConfig,
-        factory: impl Fn(&str) -> Option<Z::Config> + Send + Sync + 'static,
-    ) -> Self {
+    /// Server whose zones are configured by `factory` when they activate
+    /// (see [`ZoneFactory`]).
+    pub fn new(config: ServerConfig, factory: ZoneFactory<Z::Config>) -> Self {
         Self::with_clock(config, Arc::new(SystemClock::new()), factory)
     }
 
@@ -414,7 +452,7 @@ where
     pub fn with_clock(
         config: ServerConfig,
         clock: Arc<dyn Clock>,
-        factory: impl Fn(&str) -> Option<Z::Config> + Send + Sync + 'static,
+        factory: ZoneFactory<Z::Config>,
     ) -> Self {
         let (shutdown, _) = watch::channel(false);
         let (net_sim, _) = watch::channel(config.net_sim);
@@ -422,7 +460,8 @@ where
         Self {
             inner: Arc::new(Inner {
                 clock,
-                factory: Box::new(factory),
+                factory,
+                allocations: None,
                 facts: None,
                 host_config: None,
                 nonces: Mutex::new(NonceCache::default()),
@@ -470,6 +509,13 @@ where
         self.configure(|inner| inner.ownership = ownership)
     }
 
+    /// Where zone allocation records are read at activation
+    /// ([`ZoneActivation::allocation`]); a store error refuses the
+    /// activation with `ZONE_UNAVAILABLE`.
+    pub fn with_allocation_store(self, store: Arc<dyn ZoneAllocationStore>) -> Self {
+        self.configure(|inner| inner.allocations = Some(store))
+    }
+
     /// Where hibernated zone snapshots go.
     pub fn with_state_store(self, store: Arc<dyn ZoneStateStore>) -> Self {
         self.configure(|inner| inner.state_store = Some(store))
@@ -501,7 +547,7 @@ where
         self.inner.world.lock().expect("world").version.clone()
     }
 
-    /// True when `zone_id` is active on this server.
+    /// True when `zone_id` is active (or being created) on this server.
     pub fn is_active(&self, zone_id: &str) -> bool {
         self.inner
             .zones
@@ -532,9 +578,22 @@ where
         rx.await.ok()
     }
 
-    /// Activate `zone_id` locally (as if a client asked for it).
-    pub fn activate(&self, zone_id: &str) -> bool {
+    /// Start activating `zone_id` locally without waiting (it is registered
+    /// at once, so barriers and joins already reach it). False only while
+    /// shutting down; an unknown zone unregisters itself once its factory
+    /// answers.
+    pub fn begin_activation(&self, zone_id: &str) -> bool {
         activate_local(&self.inner, zone_id).is_some()
+    }
+
+    /// Activate `zone_id` locally (as if a client asked for it) and wait
+    /// until it runs. False when the factory knows no such zone, creation
+    /// failed, or the server is shutting down.
+    pub async fn activate(&self, zone_id: &str) -> bool {
+        if activate_local(&self.inner, zone_id).is_none() {
+            return false;
+        }
+        self.inspect(zone_id, |_| ()).await.is_some()
     }
 
     /// Barrier phase 1 on this server: freeze every active zone (and every
@@ -789,7 +848,6 @@ where
     if let Some(entry) = zones.get(zone_id).filter(|e| !e.tx.is_closed()) {
         return Some(entry.tx.clone());
     }
-    let zone_config = (inner.factory)(zone_id)?;
     let (tx, rx) = mpsc::channel(1024);
     let activation = inner.activations.fetch_add(1, Ordering::Relaxed) + 1;
     let world = inner.world.lock().expect("world").clone();
@@ -804,7 +862,6 @@ where
     let task = tokio::spawn(run_zone::<Z>(
         inner.clone(),
         zone_id.to_string(),
-        zone_config,
         facts,
         rx,
         activation,
@@ -958,12 +1015,13 @@ async fn acquire_claim<Z: Zone>(
     }
 }
 
-/// Activation failed: answer everything queued and unregister.
+/// Activation failed: answer everything queued with `code` and unregister.
 fn refuse_activation<Z: Zone>(
     inner: &Arc<Inner<Z>>,
     zone_id: &str,
     activation: u64,
     mut rx: mpsc::Receiver<ZoneCmd>,
+    code: u32,
     message: &str,
 ) {
     {
@@ -980,7 +1038,7 @@ fn refuse_activation<Z: Zone>(
         match cmd {
             ZoneCmd::Join { reply, .. } | ZoneCmd::Reconnect { reply, .. } => {
                 let _ = reply.send(Err(JoinError {
-                    code: error::NOT_FOUND,
+                    code,
                     message: message.to_string(),
                 }));
             }
@@ -1018,7 +1076,6 @@ async fn renew_claim(
 async fn run_zone<Z>(
     inner: Arc<Inner<Z>>,
     zone_id: String,
-    zone_config: Z::Config,
     facts: Option<(FactQueue, JoinHandle<()>)>,
     mut rx: mpsc::Receiver<ZoneCmd>,
     activation: u64,
@@ -1031,7 +1088,9 @@ async fn run_zone<Z>(
     let holder = format!("{}#{activation}", inner.host_id);
     let claim = match acquire_claim(&inner, &zone_id, &holder).await {
         Ok(claim) => claim,
-        Err(message) => return refuse_activation(&inner, &zone_id, activation, rx, &message),
+        Err(message) => {
+            return refuse_activation(&inner, &zone_id, activation, rx, error::NOT_FOUND, &message)
+        }
     };
     // 2. Restore the hibernated snapshot, if any.
     let saved = match &inner.state_store {
@@ -1047,12 +1106,43 @@ async fn run_zone<Z>(
                         &zone_id,
                         activation,
                         rx,
+                        error::ZONE_UNAVAILABLE,
                         "zone state unavailable",
                     );
                 }
             }
         }
         None => None,
+    };
+    // 3. The allocation record and the game's factory, bounded together.
+    let created = tokio::time::timeout(inner.config.activation_timeout, async {
+        let allocation = match &inner.allocations {
+            Some(store) => store.load(&zone_id).await?,
+            None => None,
+        };
+        (inner.factory.0)(ZoneActivation {
+            zone_id: zone_id.clone(),
+            activation: claim.token,
+            allocation,
+        })
+        .await
+    })
+    .await;
+    let zone_config = match created {
+        Ok(Ok(Some(config))) => config,
+        refused => {
+            inner.ownership.release(&claim).await;
+            let (code, message) = match refused {
+                Ok(Ok(None)) => (error::NOT_FOUND, "unknown zone".to_string()),
+                Ok(Err(e)) => (error::ZONE_UNAVAILABLE, e.to_string()),
+                _ => (
+                    error::ZONE_UNAVAILABLE,
+                    "zone creation timed out".to_string(),
+                ),
+            };
+            inner.metrics.record_activation_refused(code);
+            return refuse_activation(&inner, &zone_id, activation, rx, code, &message);
+        }
     };
     let mut host_config = inner.config.host.clone();
     if let Some(adjust) = &inner.host_config {
@@ -1112,7 +1202,7 @@ async fn run_zone<Z>(
         host.request_freeze(notice);
     }
 
-    // 3. Keep the claim alive.
+    // 4. Keep the claim alive.
     let current = Arc::new(Mutex::new(claim));
     let (lost_tx, mut lost_rx) = oneshot::channel();
     let renewer = tokio::spawn(renew_claim(
