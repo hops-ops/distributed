@@ -1,0 +1,20 @@
+// Spike gr-p42: Mob Pit rooms as celld Durable Objects. `./run.sh deploy`
+// publishes this to the fleet bucket (`celld deploy`); every node runs it.
+{
+  "name": "zone-do-spike",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [{ "name": "PIT_ROOM", "class_name": "PitRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PitRoom"] }],
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+  "vars": {
+    // Dev-only ticket key (the spike's /ticket endpoint signs with it).
+    "TICKET_SECRET": "spike-only-ticket-secret-not-for-production",
+    "TICK_HZ": "30",
+    // Operator listeners, only to find out which node runs a room
+    // (celld does not tell application code its node id).
+    "NODES": "node-a=127.0.0.1:18201,node-b=127.0.0.1:18202,node-c=127.0.0.1:18203"
+  }
+}

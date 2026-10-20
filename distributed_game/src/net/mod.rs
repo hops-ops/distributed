@@ -45,7 +45,7 @@
 
 pub mod inbox;
 pub mod peer;
-pub mod ticket;
+pub use crate::ticket;
 pub mod transfer;
 pub mod world;
 

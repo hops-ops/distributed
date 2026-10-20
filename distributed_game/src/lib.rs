@@ -83,6 +83,11 @@ pub mod rng;
 pub mod schema;
 pub mod stamp;
 pub mod surface;
+/// Signed admission tickets (also `net::ticket`); usable without the axum
+/// server, e.g. by a celld zone host on wasm32.
+#[cfg(feature = "ticket")]
+#[path = "net/ticket.rs"]
+pub mod ticket;
 pub mod timers;
 pub mod timestep;
 pub mod world;

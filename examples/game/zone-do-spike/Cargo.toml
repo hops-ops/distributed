@@ -1,0 +1,27 @@
+# Spike gr-p42: one Mob Pit room as a celld Durable Object (wasm32).
+# Own workspace (cdylib for wasm32-unknown-unknown); built with
+# `worker-build --release` by `./run.sh`. Not a product crate.
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "zone-do-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Spike: a live Mob Pit zone as a celld Durable Object (dev only)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+console_error_panic_hook = "0.1"
+distributed_game = { path = "../../../distributed_game", default-features = false, features = ["ticket"] }
+game_sim = { path = "../server/sim" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+worker = "0.8"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

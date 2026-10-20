@@ -31,7 +31,10 @@ metrics = []
 # Load-test bots (library + `game-bots` binary).
 bots = ["net", "dep:tokio-tungstenite", "dep:futures-util", "tokio/rt-multi-thread"]
 # axum WebSocket zone server with signed-ticket admission (+ /metrics).
-net = ["runtime", "metrics", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros", "tokio/io-util"]
+# HMAC-signed admission tickets (`ticket`) without the axum server: what a
+# celld zone host (wasm32) needs to admit players (spike gr-p42).
+ticket = ["dep:hmac", "dep:sha2", "dep:base64"]
+net = ["runtime", "metrics", "ticket", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros", "tokio/io-util"]
 # `world::FencedLeaseOwnership`: zone ownership over `distributed::lease`.
 lease = ["dep:distributed"]
 

@@ -1847,7 +1847,12 @@ impl<Z: Zone> ZoneHost<Z> {
     }
 
     fn tick_once(&mut self, dt: Duration) {
+        // wasm32-unknown-unknown (celld) has no `Instant`: measure with the
+        // host clock there (spike gr-p42).
+        #[cfg(not(target_arch = "wasm32"))]
         let started = std::time::Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        let started = self.core.clock.now();
         self.core.tick += 1;
         self.core.sim_time += dt;
         self.core.dt = dt;
@@ -1867,7 +1872,12 @@ impl<Z: Zone> ZoneHost<Z> {
                 .rewind
                 .record(self.core.tick, self.core.sim_time, entities);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         self.pending.tick_durations.push(started.elapsed());
+        #[cfg(target_arch = "wasm32")]
+        self.pending
+            .tick_durations
+            .push(self.core.clock.now().saturating_sub(started));
         if self.hash_ticks {
             let hash = self.state_hash();
             self.pending.tick_hashes.push((self.core.tick, hash));
