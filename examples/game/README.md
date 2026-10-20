@@ -161,6 +161,14 @@ required, there is no local fallback):
   (`CellZoneStateStore`), fenced by the lease token; a sleeping zone is a
   sleeping Durable Object. Snapshots above 64 KiB go to celld's object
   storage (R2 binding `ZONE_SNAPSHOTS`), the cell keeps their digest.
+- **Zone status**: both cells publish their transitions (`zone.activated`
+  / `zone.released` / `zone.lease_expired`, `zone_state.saved` /
+  `zone_state.deleted`, each carrying the cell's small status, never the
+  snapshot bytes). celld's outbox Queue relays them to host A's
+  `/internal/celld-queue/relay`, which publishes onto the world's shared
+  projection bus (`--data-dir`, `run.sh` uses `.data/<demo>`); every host
+  projects the bus into its own zone status read model
+  (`distributed_game::world::zone_status`, `common/zone_status.rs`).
 
 The cluster smoke tests (`tests/grid_smoke.rs`, `tests/ripple_smoke.rs`)
 and the headless tests start their own `celld dev` the same way.
@@ -191,9 +199,11 @@ and the headless tests start their own `celld dev` the same way.
   hibernated after 4 s more (`--hibernate-after-ms`): critters and markers
   (E) go to the zone's celld `ZoneState` cell and come back on the next
   activation (on either host); its hello says
-  `restored` and the page toasts. The minimap (`GET /dev/grid/map`, which
-  asks the peer for its cells) shows active / hibernated / cold cells per
-  host; borders are tinted by owning host.
+  `restored` and the page toasts. The minimap (`GET /dev/grid/map`) shows
+  active / hibernated / cold cells per host from the zone status read model
+  (eventually consistent; it never opens a cell, since reading a never-used
+  celld cell creates it), with live tier and player counts asked from the
+  host running each active cell; borders are tinted by owning host.
 
 Controls: WASD / stick, Space/Shift sprint, E drops a marker.
 

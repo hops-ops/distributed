@@ -17,6 +17,12 @@
 //!   `CellZoneStateStore`, one `ZoneState` cell per zone holding its
 //!   hibernation snapshot, fenced by the lease token. There is no local
 //!   fallback: every host of a world shares the same celld;
+//! - the zone status read model (`common::zone_status`): every host serves
+//!   the celld outbox Queue relay (`common::relay`; celld relays to one of
+//!   them) onto the world's shared projection bus (`{data-dir}/bus.db`),
+//!   and projects the lease and zone-state cells' outward events into its
+//!   own `{data-dir}/zone-status-{host}.db`. The grid's world map reads it
+//!   instead of opening one cell per zone;
 //! - guest display names shared with every peer: `/dev/ticket` on any host
 //!   forwards the new `principal → name` to the others before it answers,
 //!   so a zone on another host greets the player by name.
@@ -25,7 +31,8 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -43,6 +50,8 @@ use distributed_game::world::{
 };
 use serde_json::{json, Value};
 
+use crate::common::relay::{relay_routes, ProjectionBus};
+use crate::common::zone_status::ZoneStatusView;
 use crate::common::{
     self, dev, random_hex, server_config, CelldOptions, Demo, DemoArgs, DemoOptions, Guests,
     RunningDemo,
@@ -72,6 +81,12 @@ pub struct ClusterArgs {
     /// Internal secret for the celld cells.
     #[arg(long, env = "DISTRIBUTED_INTERNAL_SECRET", hide_env_values = true)]
     pub internal_secret: String,
+    /// Directory shared by every host of the world: the projection bus the
+    /// celld outbox Queue relay publishes onto (`bus.db`) and each host's
+    /// zone status read model (`zone-status-{host}.db`). Default:
+    /// `$TMPDIR/game-demos-{demo}`.
+    #[arg(long, env = "GAME_DEMOS_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
 }
 
 /// In-process cluster options (tests and [`run_cluster`]).
@@ -86,6 +101,9 @@ pub struct ClusterOptions {
     /// celld holding zone ownership (`ZoneLease`) and hibernation
     /// snapshots (`ZoneState`).
     pub celld: CelldOptions,
+    /// The world's shared directory (projection bus, zone status read
+    /// models).
+    pub data_dir: PathBuf,
 }
 
 /// Parse `ID=HOST:PORT`.
@@ -115,6 +133,8 @@ pub struct World {
     pub guests: Guests,
     /// Dormant time before hibernation.
     pub hibernate_after: Duration,
+    /// Zone status read model (None for a [`Self::standalone`] world).
+    pub zone_status: Option<ZoneStatusView>,
 }
 
 impl World {
@@ -135,6 +155,7 @@ impl World {
             admin_secret: String::new(),
             guests,
             hibernate_after,
+            zone_status: None,
         }
     }
 
@@ -211,7 +232,7 @@ pub fn admin_secret(key: &TicketKey) -> String {
 }
 
 /// Start host `cluster.host_id` of demo `D` on `listener`.
-pub fn spawn_cluster<D: ClusterDemo>(
+pub async fn spawn_cluster<D: ClusterDemo>(
     listener: tokio::net::TcpListener,
     options: DemoOptions,
     cluster: ClusterOptions,
@@ -236,6 +257,28 @@ pub fn spawn_cluster<D: ClusterDemo>(
         host.id.clone(),
     )
     .map_err(std::io::Error::other)?;
+    // The relay and the zone status read model (see the module docs).
+    std::fs::create_dir_all(&cluster.data_dir)?;
+    let bus = ProjectionBus::open(&format!(
+        "sqlite:{}",
+        cluster.data_dir.join("bus.db").display()
+    ))
+    .await
+    .map_err(std::io::Error::other)?;
+    let zone_status = ZoneStatusView::open(
+        &format!(
+            "sqlite:{}?mode=rwc",
+            cluster
+                .data_dir
+                .join(format!("zone-status-{}.db", host.id))
+                .display()
+        ),
+        bus.pool().clone(),
+        &format!("zone-status-{}", host.id),
+    )
+    .await
+    .map_err(std::io::Error::other)?;
+    let relay = relay_routes(cluster.celld.secret.clone(), Arc::new(OnceLock::from(bus)));
     let guests = Guests::default();
     let world = Arc::new(World {
         host,
@@ -245,6 +288,7 @@ pub fn spawn_cluster<D: ClusterDemo>(
         admin_secret: admin_secret(&options.key),
         guests: guests.clone(),
         hibernate_after: cluster.hibernate_after,
+        zone_status: Some(zone_status),
     });
 
     let mut config = server_config(options.key.clone(), options.net_sim);
@@ -266,7 +310,7 @@ pub fn spawn_cluster<D: ClusterDemo>(
         .with_ownership(ownership)
         .with_state_store(world.state.clone());
 
-    let extra = if options.dev {
+    let extra = relay.merge(if options.dev {
         let tickets = dev::routes::<D>(server.clone(), options.key, guests.clone()).layer(
             middleware::from_fn_with_state(world.clone(), share_guest_names),
         );
@@ -279,7 +323,7 @@ pub fn spawn_cluster<D: ClusterDemo>(
             .merge(D::cluster_routes(server.clone(), world.clone()))
     } else {
         Router::new()
-    };
+    });
     let task = tokio::spawn(server.clone().serve_with(listener, extra, signal));
     Ok(RunningHost {
         demo: RunningDemo {
@@ -314,8 +358,11 @@ pub async fn run_cluster<D: ClusterDemo>(args: ClusterArgs) -> std::io::Result<(
         hibernate_after: Duration::from_millis(args.hibernate_after_ms.max(100)),
         celld: CelldOptions::new(args.celld_url, args.internal_secret)
             .map_err(std::io::Error::other)?,
+        data_dir: args
+            .data_dir
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("game-demos-{}", D::NAME))),
     };
-    let running = spawn_cluster::<D>(listener, options, cluster, common::shutdown_signal())?;
+    let running = spawn_cluster::<D>(listener, options, cluster, common::shutdown_signal()).await?;
     // Parsed by run.sh and the client tests: keep the format.
     println!("LISTENING http://{}", running.demo.addr);
     let hosts: Vec<String> = running

@@ -195,17 +195,16 @@ async fn empty_cell_hibernates_and_restores_critters_and_markers() {
     let critters = snapshot["critters"].as_array().unwrap().clone();
     assert!(critters.len() >= 2);
 
-    // The world map shows it hibernated (asked on the other host too).
+    // The world map shows it hibernated (asked on the other host too), from
+    // the zone status read model once the cells' events are projected.
     let other = if owner.world.host.id == "A" { "B" } else { "A" };
-    let (status, map) = http(
-        cluster.host(other).demo.addr,
-        "GET",
-        "/dev/grid/map?x=5&y=5&r=0",
-        None,
-    )
+    let other_addr = cluster.host(other).demo.addr;
+    eventually("map shows hibernated", || async move {
+        let (status, map) = http(other_addr, "GET", "/dev/grid/map?x=5&y=5&r=0", None).await;
+        status == 200 && map["cells"][0]["state"] == "hibernated"
+    })
     .await;
-    assert_eq!(status, 200, "{map}");
-    assert_eq!(map["cells"][0]["state"], "hibernated", "{map}");
+    let (_, map) = http(other_addr, "GET", "/dev/grid/map?x=5&y=5&r=0", None).await;
     assert_eq!(map["cells"][0]["owner"], owner.world.host.id.as_str());
 
     let mut again = join(&base, zone, &ticket("guest-marker", zone, Role::Player))

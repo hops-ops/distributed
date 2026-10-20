@@ -2,11 +2,15 @@
  * Start a multi-host demo (`game-demos <demo> --host-id … --peer …`) for a
  * Node test: one process per host on free ephemeral ports, a shared ticket
  * secret, dev routes on, and one private `celld dev` (zone leases and
- * hibernation snapshots in `examples/game/cells`). Uses GAME_DEMOS_BIN when
- * set, else `cargo run`.
+ * hibernation snapshots in `examples/game/cells`) whose outbox Queue relays
+ * to the first host; the hosts share a throwaway data dir (projection bus,
+ * zone status read models). Uses GAME_DEMOS_BIN when set, else `cargo run`.
  */
 import { spawn } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
 import { Socket } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { freePort, startCelld } from './celld.mjs';
@@ -20,7 +24,8 @@ const SERVER_DIR = fileURLToPath(new URL('../../../server/', import.meta.url));
 export async function startCluster(demo, { hosts = ['A', 'B'], hibernateAfterMs = 4000, env = {} } = {}) {
 	const ports = [];
 	for (const _ of hosts) ports.push(await freePort());
-	const celld = await startCelld();
+	const celld = await startCelld({ relayPort: ports[0] });
+	const dataDir = mkdtempSync(join(tmpdir(), `${demo}-js-`));
 	const secret = `test-secret-${process.pid}-${Date.now()}`;
 	const bin = process.env.GAME_DEMOS_BIN;
 	const children = [];
@@ -33,7 +38,10 @@ export async function startCluster(demo, { hosts = ['A', 'B'], hibernateAfterMs 
 				hosts.forEach((peer, j) => {
 					if (j !== i) args.push('--peer', `${peer}=127.0.0.1:${ports[j]}`);
 				});
-				const options = { env: { ...process.env, ...celld.env, ...env }, stdio: ['ignore', 'pipe', 'inherit'] };
+				const options = {
+					env: { ...process.env, ...celld.env, GAME_DEMOS_DATA_DIR: dataDir, ...env },
+					stdio: ['ignore', 'pipe', 'inherit']
+				};
 				const child = bin
 					? spawn(bin, args, options)
 					: spawn('cargo', ['run', '-q', '--', ...args], { ...options, cwd: SERVER_DIR });

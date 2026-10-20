@@ -307,11 +307,13 @@ run_cluster() {
 	dir="$(mktemp -d "${TMPDIR:-/tmp}/game-demos-$demo.XXXXXX")"
 	# Both hosts must share the ticket secret (and derive the admin secret).
 	secret="${DISTRIBUTED_GAME_SECRET:-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')}"
+	# The relay lands on host A; both hosts share the projection bus and keep
+	# their zone status read models in .data/<demo>.
 	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_a" --host-id A \
-		--peer "B=127.0.0.1:$port_b" >"$dir/A.log" 2>&1 &
+		--peer "B=127.0.0.1:$port_b" --data-dir "$HERE/.data/$demo" >"$dir/A.log" 2>&1 &
 	local pid_a=$!
 	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_b" --host-id B \
-		--peer "A=127.0.0.1:$port_a" >"$dir/B.log" 2>&1 &
+		--peer "A=127.0.0.1:$port_a" --data-dir "$HERE/.data/$demo" >"$dir/B.log" 2>&1 &
 	local pid_b=$!
 	trap 'kill "$pid_a" "$pid_b" 2>/dev/null || true; wait "$pid_a" "$pid_b" 2>/dev/null || true; kill_tree "$CELLD_PID"; rm -rf "$dir"' EXIT INT TERM
 	wait_listening "$dir/A.log" "$pid_a" "game-demos $demo host A"

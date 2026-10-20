@@ -12,6 +12,7 @@ pub mod celld;
 pub mod dev;
 mod guests;
 pub mod relay;
+pub mod zone_status;
 
 use std::future::Future;
 use std::net::SocketAddr;

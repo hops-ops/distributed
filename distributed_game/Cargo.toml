@@ -49,6 +49,10 @@ worker = { version = "0.8", optional = true }
 
 [dev-dependencies]
 base64 = "0.23"
+# `tests/zone_status`: the read model projected by a consumer service over
+# a SQLite bus and read-model store.
+distributed = { path = "..", default-features = false, features = ["sqlite", "graphql"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 trybuild = "=1.0.120"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.30"
@@ -83,6 +87,11 @@ required-features = ["cell"]
 [[test]]
 name = "zone_state"
 path = "tests/zone_state/main.rs"
+required-features = ["cell"]
+
+[[test]]
+name = "zone_status"
+path = "tests/zone_status/main.rs"
 required-features = ["cell"]
 
 [[test]]

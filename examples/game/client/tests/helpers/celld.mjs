@@ -33,7 +33,7 @@ export function freePort() {
 }
 
 /**
- * Start celld. `relayPort`: the Mob Pit server port its outbox Queue relays
+ * Start celld. `relayPort`: the demo server port its outbox Queue relays
  * domain events to (`/internal/celld-queue/relay`).
  */
 export async function startCelld({ relayPort } = {}) {

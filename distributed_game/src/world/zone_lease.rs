@@ -11,6 +11,10 @@
 //! | `zone_lease.release` | no holder, alarm cancelled | `zone.released` |
 //! | `zone_lease.expire` (alarm only) | no holder, if still expired | `zone.lease_expired` |
 //!
+//! Outward events carry the lease's post-transition [`ZoneLeaseStatus`]
+//! (zone, holder, token, `active` / `released` / `expired`); the
+//! [`zone_status`](super::zone_status) read model projects them.
+//!
 //! Fencing tokens increase on every acquisition and are never reset. Expiry
 //! is declared by the cell's alarm ([`distributed::cell_host::CellAlarm`]):
 //! the alarm handler re-reads the lease and expires it only when the
@@ -50,6 +54,13 @@ pub const LOST: &str = "lost";
 /// The expiry alarm's name.
 pub const EXPIRY_ALARM: &str = "expiry";
 
+/// [`ZoneLeaseStatus::status`] of a held lease.
+pub const STATUS_ACTIVE: &str = "active";
+/// [`ZoneLeaseStatus::status`] after `zone.released`.
+pub const STATUS_RELEASED: &str = "released";
+/// [`ZoneLeaseStatus::status`] after `zone.lease_expired`.
+pub const STATUS_EXPIRED: &str = "expired";
+
 /// The lease of one zone.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, distributed::Snapshot)]
 pub struct ZoneLease {
@@ -57,18 +68,62 @@ pub struct ZoneLease {
     holder: Option<String>,
     token: u64,
     expires_at_ms: u64,
+    /// Holder of the last claim (kept after release and expiry).
+    #[serde(default)]
+    last_holder: String,
+    /// How the last claim ended (`released` / `expired`; empty while held
+    /// or never claimed).
+    #[serde(default)]
+    ended: String,
 }
 
-#[sourced(entity, aggregate_type = "ZoneLease", events = "ZoneLeaseEvent")]
+/// The public state of a lease carried by its outward events (versioned
+/// independently of the replay events): one `zone_leases` read-model row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::DomainState)]
+#[domain_state(version = 1)]
+pub struct ZoneLeaseStatus {
+    /// Zone (the cell's stream id).
+    pub zone_id: String,
+    /// Holder of the current or, once ended, the last claim.
+    pub holder: String,
+    /// Fencing token of that claim.
+    pub token: u64,
+    /// [`STATUS_ACTIVE`], [`STATUS_RELEASED`] or [`STATUS_EXPIRED`].
+    pub status: String,
+}
+
+impl From<&ZoneLease> for ZoneLeaseStatus {
+    fn from(lease: &ZoneLease) -> Self {
+        Self {
+            zone_id: lease.entity.id().to_string(),
+            holder: lease.last_holder.clone(),
+            token: lease.token,
+            status: if lease.holder.is_some() {
+                STATUS_ACTIVE.to_string()
+            } else {
+                lease.ended.clone()
+            },
+        }
+    }
+}
+
+#[sourced(
+    entity,
+    aggregate_type = "ZoneLease",
+    events = "ZoneLeaseEvent",
+    domain_state = ZoneLeaseStatus
+)]
 impl ZoneLease {
-    #[event("zone.activated", version = 1, domain = event)]
+    #[event("zone.activated", version = 1, domain)]
     fn activated(&mut self, zone_id: String, holder: String, token: u64, expires_at_ms: u64) {
         if self.entity.id().is_empty() {
             self.entity.set_id(zone_id);
         }
+        self.last_holder = holder.clone();
         self.holder = Some(holder);
         self.token = token;
         self.expires_at_ms = expires_at_ms;
+        self.ended.clear();
     }
 
     #[event("zone_lease.renewed", version = 1)]
@@ -76,16 +131,18 @@ impl ZoneLease {
         self.expires_at_ms = expires_at_ms;
     }
 
-    #[event("zone.released", version = 1, domain = event)]
+    #[event("zone.released", version = 1, domain)]
     fn released(&mut self, zone_id: String, holder: String, token: u64) {
         let _ = (zone_id, holder, token);
         self.holder = None;
+        self.ended = STATUS_RELEASED.to_string();
     }
 
-    #[event("zone.lease_expired", version = 1, domain = event)]
+    #[event("zone.lease_expired", version = 1, domain)]
     fn lease_expired(&mut self, zone_id: String, holder: String, token: u64) {
         let _ = (zone_id, holder, token);
         self.holder = None;
+        self.ended = STATUS_EXPIRED.to_string();
     }
 }
 

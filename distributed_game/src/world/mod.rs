@@ -14,6 +14,10 @@
 //! - [`allocation`]: [`ZoneAllocation`] records written by the service that
 //!   allocates a zone, read before the zone is created
 //!   ([`ZoneActivation`], [`ZoneAllocationStore`]).
+//! - `zone_status` (feature `cell`): the read model of every zone's lease
+//!   and hibernation slot, projected from the `zone_lease` / `zone_state`
+//!   cells' outward events (active / hibernated / cold without opening a
+//!   cell).
 //! - [`barrier`]: content-version policy types shared by the host and the
 //!   world barrier ([`StalePolicy`], [`BarrierMode`]).
 
@@ -30,6 +34,9 @@ pub mod zone_lease;
 #[cfg(feature = "cell")]
 #[allow(missing_docs)]
 pub mod zone_state;
+#[cfg(feature = "cell")]
+#[allow(missing_docs)]
+pub mod zone_status;
 
 pub use crate::facts::BoxFuture;
 pub use allocation::{

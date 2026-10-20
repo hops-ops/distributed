@@ -27,6 +27,12 @@
 //! Every save is one small event (inline bytes or a blob reference); cells
 //! load from the aggregate snapshot, which is refreshed on every commit.
 //!
+//! Both commands publish the post-command [`ZoneSnapshotStatus`] (zone,
+//! token, whether a snapshot is stored, its content version and size, never
+//! the bytes) as `zone_state.saved` / `zone_state.deleted` domain events;
+//! the [`zone_status`](super::zone_status) read model projects them, so
+//! "is this zone asleep with state?" is answered without opening its cell.
+//!
 //! Callers must hold the `zone-host` role (an internal identity on the
 //! authenticated internal path).
 
@@ -90,9 +96,52 @@ pub struct ZoneState {
     bytes: Option<SnapshotBytes>,
 }
 
-#[sourced(entity, aggregate_type = "ZoneState", events = "ZoneStateEvent")]
+/// The public state of a zone's hibernation slot carried by its outward
+/// events: one `zone_snapshots` read-model row (no snapshot bytes).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::DomainState)]
+#[domain_state(version = 1)]
+pub struct ZoneSnapshotStatus {
+    /// Zone (the cell's stream id).
+    pub zone_id: String,
+    /// Highest token seen.
+    pub token: u64,
+    /// A snapshot is stored.
+    pub stored: bool,
+    /// Content version of the stored snapshot (empty when none).
+    pub content_version: String,
+    /// Size of the stored snapshot in bytes (0 when none).
+    pub bytes: u64,
+}
+
+impl From<&ZoneState> for ZoneSnapshotStatus {
+    fn from(state: &ZoneState) -> Self {
+        let bytes = match &state.bytes {
+            Some(SnapshotBytes::Inline(bytes)) => bytes.len() as u64,
+            Some(SnapshotBytes::Blob(blob)) => blob.len,
+            None => 0,
+        };
+        Self {
+            zone_id: state.entity.id().to_string(),
+            token: state.token,
+            stored: state.bytes.is_some(),
+            content_version: if state.bytes.is_some() {
+                state.content_version.clone()
+            } else {
+                String::new()
+            },
+            bytes,
+        }
+    }
+}
+
+#[sourced(
+    entity,
+    aggregate_type = "ZoneState",
+    events = "ZoneStateEvent",
+    domain_state = ZoneSnapshotStatus
+)]
 impl ZoneState {
-    #[event("zone_state.saved", version = 1)]
+    #[event("zone_state.saved", version = 1, domain)]
     fn saved(
         &mut self,
         zone_id: String,
@@ -108,7 +157,7 @@ impl ZoneState {
         self.bytes = Some(bytes);
     }
 
-    #[event("zone_state.deleted", version = 1)]
+    #[event("zone_state.deleted", version = 1, domain)]
     fn deleted(&mut self, zone_id: String, token: u64) {
         if self.entity.id().is_empty() {
             self.entity.set_id(zone_id);
@@ -236,11 +285,14 @@ async fn handle_save(
             bytes,
         )
         .map_err(rejected)?;
-    ctx.repo().commit(state)?.succeeded(StatePayload {
-        zone_id: input.zone_id,
-        token: input.token,
-        superseded_blob: superseded,
-    })
+    ctx.repo()
+        .publish_events()
+        .commit(state)?
+        .succeeded(StatePayload {
+            zone_id: input.zone_id,
+            token: input.token,
+            superseded_blob: superseded,
+        })
 }
 
 async fn handle_delete(
@@ -256,11 +308,14 @@ async fn handle_delete(
     state
         .deleted(input.zone_id.clone(), input.token)
         .map_err(rejected)?;
-    ctx.repo().commit(state)?.succeeded(StatePayload {
-        zone_id: input.zone_id,
-        token: input.token,
-        superseded_blob: superseded,
-    })
+    ctx.repo()
+        .publish_events()
+        .commit(state)?
+        .succeeded(StatePayload {
+            zone_id: input.zone_id,
+            token: input.token,
+            superseded_blob: superseded,
+        })
 }
 
 struct Save;

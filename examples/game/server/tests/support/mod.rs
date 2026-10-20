@@ -70,7 +70,19 @@ pub async fn start_cluster<D: ClusterDemo>(ids: &[&str], hibernate_after: Durati
         .iter()
         .map(|(id, addr, _)| HostAddr::new(id.clone(), addr.to_string()))
         .collect();
-    let celld = DevCelld::start(None).unwrap_or_else(|error| panic!("celld dev: {error}"));
+    // celld relays its outbox Queue (zone lease and state events) to the
+    // first host; every host projects the shared bus into its own zone
+    // status read model.
+    let relay = format!(
+        "http://{}{}",
+        listeners[0].1,
+        distributed::bus::CELLD_QUEUE_RELAY_PATH
+    );
+    let celld = DevCelld::start(Some(relay)).unwrap_or_else(|error| panic!("celld dev: {error}"));
+    let data_dir = std::env::temp_dir().join(format!(
+        "cluster-smoke-{}",
+        game_demos::common::random_hex(10)
+    ));
     let mut hosts = Vec::new();
     let mut stops = Vec::new();
     for (id, _, listener) in listeners {
@@ -80,10 +92,12 @@ pub async fn start_cluster<D: ClusterDemo>(ids: &[&str], hibernate_after: Durati
             peers: all.clone(),
             hibernate_after,
             celld: celld.options(),
+            data_dir: data_dir.clone(),
         };
         let host = spawn_cluster::<D>(listener, DemoOptions::dev(SECRET), options, async move {
             let _ = stopped.await;
         })
+        .await
         .unwrap();
         hosts.push(host);
         stops.push(stop);
