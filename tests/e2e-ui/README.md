@@ -320,7 +320,7 @@ collections for every model that references it.
 Read RBAC is attached to those same query models through
 `Todos::permissions()`, `BlobGames::permissions()`, and their peers. The
 runtime GraphQL engine and generated application surfaces reuse those
-declarations; `service.rs` does not recreate the grants.
+declarations; the service crate does not recreate the grants.
 
 ## Outcomes
 
@@ -341,8 +341,10 @@ the normal GraphQL command result.
 | `crates/readmodels/` | Query shapes, relationships, and model-owned read RBAC. |
 | `crates/projections/` | Todo, Chat, and Blob event-to-read-model programs. |
 | `crates/service/src/handlers/events/` | Explicit projector handlers that apply modeled programs. |
-| `crates/service/src/handlers/commands/` | Repository → get/create → domain operation → fluent commit. |
-| `crates/service/src/service.rs` | Deployment catalog, placement, routes, and typed commands. |
+| `crates/*-domain/src/commands/` | `portable_command!` handlers: repository → get/create → domain operation → fluent commit. |
+| `crates/service/src/application.rs` | Composition root: client surfaces and the module inventory. |
+| `crates/service/src/modules/` | One module per bounded context (`todo`, `chat`, `blob`) mounting its typed commands and projectors; `compose.rs` lists them. |
+| `crates/service/src/host.rs` | Infrastructure: SQL dialect, outbox, OIDC, serving. |
 | `ui/src/routes/*/+page.graphql` | Co-located SSR/live reads. |
 | `ui/src/routes/*/+page.svelte` | `*.use()` and ordinary typed command calls. |
 | `.distributed/lifecycle/generations/<id>/ui/src/lib/generated/` | Immutable lifecycle-owned user/admin/public clients. |

@@ -624,7 +624,7 @@ Start here in the code:
 | [`ui/src/lib/components/blob/SelectedBlobGame.graphql`](tests/e2e-ui/ui/src/lib/components/blob/SelectedBlobGame.graphql) | Reusable component island promoted to the nearest static route boundary; one route-param binding drives SSR and component reads. |
 | [`ui/src/routes/blob/[[gameId]]/+page.svelte`](tests/e2e-ui/ui/src/routes/blob/[[gameId]]/+page.svelte) | Arrow keys → `commands.blob.move`; board from `BlobGames.use()`. |
 | [`crates/service/src/modules/compose.rs`](tests/e2e-ui/crates/service/src/modules/compose.rs) | One `Service` lists modules. No `Runtime::role`. |
-| [`crates/service/src/handlers/commands/blob_move.rs`](tests/e2e-ui/crates/service/src/handlers/commands/blob_move.rs) | `PreparedCommand<Atomic<BlobGameView>>` — map/score written with the event. |
+| [`crates/blob-domain/src/commands/move_dir.rs`](tests/e2e-ui/crates/blob-domain/src/commands/move_dir.rs) | `portable_command!` returning `Atomic<BlobGames>`: the map/score row commits with the event, and a WASM pure previews the move. |
 | [`crates/todo-domain/src/models/todo.rs`](tests/e2e-ui/crates/todo-domain/src/models/todo.rs) | Plain aggregate — no GraphQL in the domain. |
 | [`ui/src/auth.ts`](tests/e2e-ui/ui/src/auth.ts) | Auth.js + Zitadel scopes/groups → engine roles. |
 
@@ -2868,7 +2868,7 @@ e2e-celld (`tests/e2e-celld`), Blob game, live chat, GraphiQL.
 | `tests/graphql_*` | Engine, HTTP/WS, harden, identity, multi-IdP OIDC |
 | `tests/typed_commands/` | Eventual / `Atomic` / `Succeeded` command registration |
 | `tests/microsvc/` | Handlers on HTTP, gRPC, bus, session |
-| `tests/read_models/`, `tests/distributed_read_model/` | Atomic vs eventual projections |
+| `tests/read_model_*/`, `tests/distributed_read_model/` | Read models: commit bridge, keyset scans, relationships, sessions, Atomic vs eventual projections |
 | `tests/sourced*` / `tests/snapshots/` / `tests/upcasting/` | Macros, snapshots, event versioning |
 | `tests/sagas/` | Orchestration + choreography with the outbox |
 | `tests/*_transport/`, `tests/knative_cloudevents/` | Broker adapters + conformance |
