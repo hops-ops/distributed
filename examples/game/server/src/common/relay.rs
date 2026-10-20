@@ -54,15 +54,33 @@ pub struct ProjectionBus {
 
 impl ProjectionBus {
     /// Open (creating) the bus at a `sqlite:` URL (shareable between
-    /// processes).
+    /// processes). Hosts of one world open the same file at the same time:
+    /// switching a new database to WAL and creating its tables take the
+    /// write lock, so a `database is locked` at startup is retried (10 s).
     pub async fn open(url: &str) -> Result<Self, String> {
-        let pool = open_shared_sqlite(url, 4)
-            .await
-            .map_err(|e| format!("projection bus {e}"))?;
-        let bus = SqliteBus::new(pool.clone());
-        bus.ensure_tables()
-            .await
-            .map_err(|e| format!("projection bus tables: {e}"))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (pool, bus) = loop {
+            let attempt = async {
+                let pool = open_shared_sqlite(url, 4)
+                    .await
+                    .map_err(|e| format!("projection bus {e}"))?;
+                let bus = SqliteBus::new(pool.clone());
+                bus.ensure_tables()
+                    .await
+                    .map_err(|e| format!("projection bus tables: {e}"))?;
+                Ok::<_, String>((pool, bus))
+            };
+            match attempt.await {
+                Ok(opened) => break opened,
+                Err(error)
+                    if error.contains("database is locked")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         Ok(Self {
             relay: celld_queue_relay_handler(BusPublisher::new(Arc::new(bus))),
             pool,

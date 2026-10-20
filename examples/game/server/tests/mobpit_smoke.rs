@@ -475,6 +475,7 @@ struct Binary {
 }
 
 async fn start_binary(dir: &Path, celld: &DevCelld, port: u16) -> Binary {
+    std::fs::create_dir_all(dir).expect("data dir");
     let mut child = Command::new(env!("CARGO_BIN_EXE_game-demos"))
         .args(["mobpit", "--port", &port.to_string(), "--dev"])
         .args(["--secret", SECRET, "--data-dir"])
@@ -483,7 +484,14 @@ async fn start_binary(dir: &Path, celld: &DevCelld, port: u16) -> Binary {
         .env("DISTRIBUTED_INTERNAL_SECRET", celld.secret())
         .env_remove("REDIS_URL")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Kept in the data dir: the failure messages below point at it.
+        .stderr(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("server.log"))
+                .expect("server log"),
+        )
         .spawn()
         .expect("spawn game-demos");
     let stdout = child.stdout.take().unwrap();
@@ -581,7 +589,10 @@ async fn kill_dash_nine_mid_fight_keeps_settled_facts_exactly_once() {
     while stable_since.elapsed() < Duration::from_secs(3) || total < settled_before {
         assert!(
             start.elapsed() < Duration::from_secs(60),
-            "directory never settled: {total} kills, {settled_before} settled before the crash"
+            "directory never settled: {total} kills, {settled_before} settled before the crash; \
+             server log {}, celld logs in {}",
+            dir.join("server.log").display(),
+            celld.project().display()
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
         let now = directory_total().await;
@@ -742,7 +753,7 @@ async fn presence_is_settled_in_presence_cells_from_the_lifecycle_facts() {
     let mut ana = join("guest-ana").await;
     let bo = join("guest-bo").await;
     let online = Some(("pit-1".to_string(), PresenceStatus::Online));
-    eventually("ana online", Duration::from_secs(5), {
+    eventually("ana online", Duration::from_secs(20), {
         let s = status("guest-ana");
         let online = online.clone();
         move || {
@@ -756,7 +767,7 @@ async fn presence_is_settled_in_presence_cells_from_the_lifecycle_facts() {
         .await
         .unwrap();
     drop(bo);
-    eventually("ana offline, bo away", Duration::from_secs(5), {
+    eventually("ana offline, bo away", Duration::from_secs(20), {
         let (a, b) = (status("guest-ana"), status("guest-bo"));
         move || {
             let (a, b) = (a.clone(), b.clone());
