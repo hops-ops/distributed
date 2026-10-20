@@ -32,8 +32,8 @@
 # uses GAME_DEMOS_PORT, default 2967 there, and its read-model service
 # MOBPIT_SERVICE_PORT, default GAME_DEMOS_PORT + 2).
 #
-# celld: the demos' durable cells (examples/game/cells: Mob Pit's Crawler,
-# roster and presence cells, The Freeze's gem and content cells, every
+# celld: the demos' durable cells (examples/game/cells: Mob Pit's Crawler
+# and presence cells, The Freeze's gem and content cells, every
 # multi-host demo's zone leases and hibernation snapshots) run on celld,
 # never natively; state persists in .data/<demo>/celld (Mob Pit:
 # MOBPIT_DATA_DIR/celld). CELLD_BIN names the binary (default: `celld` on

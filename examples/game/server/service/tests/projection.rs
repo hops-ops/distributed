@@ -100,14 +100,17 @@ async fn settled_kills_project_into_live_player_stats() {
         distributed::bus::CELLD_QUEUE_RELAY_PATH
     );
     let celld = DevCelld::start(Some(relay)).unwrap_or_else(|error| panic!("celld dev: {error}"));
-    let world = MobPitWorld::open(WorldOptions::new(dir.join("local"), celld.options())).unwrap();
-    let routes = game_demos::mobpit::routes::internal_routes(world.clone());
+    let mut options = WorldOptions::new(dir.join("local"), celld.options());
+    options.projection_bus = Some(bus_url.clone());
+    let world = MobPitWorld::open(options).unwrap();
+    let routes =
+        game_demos::common::relay::relay_routes(world.celld().secret.clone(), world.projection());
     tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
     let sink = world.fact_sink();
     // A kill settled before the bus is attached waits in the Queue (the
     // relay answers 503 and the consumer retries).
     sink.commit(&kill("k0", "dev-ana", 2, "ana")).await.unwrap();
-    world.attach_projection_bus(&bus_url).await.unwrap();
+    world.attach_projection().await.unwrap();
 
     // Service side.
     let repo = SqliteRepository::connect_and_migrate(&db_url)

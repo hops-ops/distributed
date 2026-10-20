@@ -9,7 +9,6 @@
   "durable_objects": {
     "bindings": [
       { "name": "CRAWLER", "class_name": "CrawlerCell" },
-      { "name": "CRAWLER_ROSTER", "class_name": "CrawlerRosterCell" },
       { "name": "PRESENCE", "class_name": "PresenceCell" },
       { "name": "ZONE_LEASE", "class_name": "ZoneLeaseCell" },
       { "name": "ZONE_STATE", "class_name": "ZoneStateCell" },
@@ -18,7 +17,7 @@
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["CrawlerCell", "CrawlerRosterCell", "PresenceCell"] },
+    { "tag": "v1", "new_sqlite_classes": ["CrawlerCell", "PresenceCell"] },
     { "tag": "v2", "new_sqlite_classes": ["ZoneLeaseCell", "ZoneStateCell"] },
     { "tag": "v3", "new_sqlite_classes": ["GemPouchCell", "ContentLogCell"] }
   ],

@@ -11,9 +11,10 @@
 //!   "mob_killed")` — the same id whether it comes from the live receipt, a
 //!   ledger replay of the same fact, or the cell's event history. The
 //!   projector's apply keys (`"{id}#{change}"`) make every repeat a no-op.
-//! - Rebuild ([`Leaderboards::rebuild`]): read every cell's durable event
-//!   history, project it into the *staging* boards and atomically promote
-//!   them. Runs at startup too (the in-memory board starts empty).
+//! - Rebuild ([`Leaderboards::rebuild`]): read the durable event history
+//!   of every crawler in the directory (`super::directory`) from its cell,
+//!   project it into the *staging* boards and atomically promote them.
+//!   Runs at startup too (the in-memory board starts empty).
 //! - Snapshot ([`BoardSnapshot`]): a `#[derive(GameRecord)]` struct, pushed
 //!   to clients as the zone's typed `board` event and served as camelCase
 //!   JSON by `/dev/mobpit/leaderboard`; the generated TypeScript type
@@ -428,15 +429,18 @@ impl Leaderboards {
         ))
     }
 
-    /// Rebuild both boards from every cell's durable event history and check
-    /// the result against the cells' current state.
-    pub async fn rebuild(&self, cells: &CrawlerCells) -> Result<RebuildReport, String> {
+    /// Rebuild both boards from the durable event history of `principals`'
+    /// cells and check the result against the cells' current state.
+    pub async fn rebuild(
+        &self,
+        principals: Vec<String>,
+        cells: &CrawlerCells,
+    ) -> Result<RebuildReport, String> {
         let _one_at_a_time = self.rebuilding.lock().await;
         let started = Instant::now();
         let before = self.top_rows().await.map_err(|e| e.to_string())?;
         let mut occurrences = Vec::new();
         let mut expected: BTreeMap<String, (u32, u64)> = BTreeMap::new();
-        let principals = cells.principals().await?;
         for principal in &principals {
             let view = cells.crawler(principal).await?;
             for kill in view.kills {

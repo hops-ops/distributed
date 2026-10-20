@@ -1,6 +1,9 @@
 //! Mob Pit + Leaderboard smoke tests, every one against its own `celld dev`
 //! serving `examples/game/cells` (`game_demos::devcelld`; `CELLD_BIN` must
 //! name celld and the worker must be built — `run.sh smoke` does both).
+//! celld relays its outbox Queue to the test's server, whose crawler
+//! directory projects the relayed events (the crawler list is eventually
+//! consistent with the cells).
 //!
 //! 1. Facts → celld Crawler cells exactly once (ledger replay), server-side
 //!    XP, trusted principal; leaderboard occurrences have the same ids live
@@ -47,8 +50,45 @@ impl Behaviour for Spin {
     }
 }
 
-fn celld() -> DevCelld {
-    DevCelld::start(None).unwrap_or_else(|error| panic!("celld dev: {error}"))
+/// A listener for the game server and a celld whose outbox Queue relays
+/// to it.
+async fn relayed_celld() -> (tokio::net::TcpListener, DevCelld) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = format!(
+        "http://{}{}",
+        listener.local_addr().unwrap(),
+        distributed::bus::CELLD_QUEUE_RELAY_PATH
+    );
+    let celld = DevCelld::start(Some(relay)).unwrap_or_else(|error| panic!("celld dev: {error}"));
+    (listener, celld)
+}
+
+/// The projected crawler list has caught up: `principals`, with their
+/// cells' kills.
+async fn crawlers_settled(world: &MobPitWorld, principals: &[&str]) {
+    eventually("crawler directory", Duration::from_secs(30), || async {
+        let Ok(crawlers) = world.crawlers().await else {
+            return false;
+        };
+        let listed: Vec<&str> = crawlers
+            .iter()
+            .map(|c| c["principal"].as_str().unwrap_or_default())
+            .collect();
+        if listed != principals {
+            return false;
+        }
+        for c in &crawlers {
+            let principal = c["principal"].as_str().unwrap();
+            let Ok(view) = world.cells().crawler(principal).await else {
+                return false;
+            };
+            if view.state.map(|s| u64::from(s.kills)) != c["kills"].as_u64() {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -111,8 +151,11 @@ async fn assert_board_matches_cells(world: &MobPitWorld) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn facts_commit_once_and_board_rebuilds_identically() {
     let dir = temp_dir("unit");
-    let mut celld = celld();
-    let world = MobPitWorld::open(WorldOptions::new(&dir, celld.options())).unwrap();
+    let (listener, mut celld) = relayed_celld().await;
+    let world = MobPitWorld::start(WorldOptions::new(&dir, celld.options()))
+        .await
+        .unwrap();
+    let (_demo, _stop) = start(listener, world.clone()).await;
     let sink = world.fact_sink();
     let input = json!({ "mob": "pit-1/m3", "tier": 2, "name": "Ana" });
 
@@ -178,11 +221,8 @@ async fn facts_commit_once_and_board_rebuilds_identically() {
         ana.kills[0].sequence,
         first.payload["sequence"].as_u64().unwrap()
     );
-    assert_eq!(
-        world.cells().principals().await.unwrap(),
-        vec!["guest-ana", "guest-bo"],
-        "enlisted on the roster before the first kill"
-    );
+    // Listed by the directory once their kill events are projected.
+    crawlers_settled(&world, &["guest-ana", "guest-bo"]).await;
 
     // Live updates are fire-and-forget; the replay was deduplicated.
     eventually("live board", Duration::from_secs(5), || async {
@@ -253,9 +293,9 @@ async fn facts_commit_once_and_board_rebuilds_identically() {
 }
 
 async fn start(
+    listener: tokio::net::TcpListener,
     world: Arc<MobPitWorld>,
 ) -> (RunningDemo<MobPitDemo>, tokio::sync::oneshot::Sender<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let running = mobpit::spawn(listener, DemoOptions::dev(SECRET), world, async move {
         let _ = stopped.await;
@@ -283,9 +323,11 @@ fn spin(i: usize) -> Box<dyn Behaviour> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bots_fight_slow_storage_keeps_the_tick_flat_and_boards_match_cells() {
     let dir = temp_dir("bots");
-    let celld = celld();
-    let world = MobPitWorld::open(WorldOptions::new(&dir, celld.options())).unwrap();
-    let (demo, stop) = start(world.clone()).await;
+    let (listener, celld) = relayed_celld().await;
+    let world = MobPitWorld::start(WorldOptions::new(&dir, celld.options()))
+        .await
+        .unwrap();
+    let (demo, stop) = start(listener, world.clone()).await;
 
     // Unknown fields (e.g. an identity) are rejected on the dev routes too.
     let (status, _) = http(
@@ -362,7 +404,20 @@ async fn bots_fight_slow_storage_keeps_the_tick_flat_and_boards_match_cells() {
     assert!(stats.committed >= 3, "bots killed mobs: {stats:?}");
     assert_eq!(stats.errors, 0, "{stats:?}");
 
-    // Boards = cells (fire-and-forget updates have drained), rebuild = same.
+    // Boards = cells (fire-and-forget updates have drained, the directory
+    // has projected every kill), rebuild = same.
+    let w = world.clone();
+    eventually("directory caught up", Duration::from_secs(30), || {
+        let w = w.clone();
+        async move {
+            let mut total = 0;
+            for c in w.crawlers().await.unwrap() {
+                total += c["kills"].as_u64().unwrap();
+            }
+            total == w.sink_state().stats().committed
+        }
+    })
+    .await;
     let w = world.clone();
     eventually("board caught up", Duration::from_secs(10), || {
         let w = w.clone();
@@ -419,17 +474,10 @@ struct Binary {
     addr: SocketAddr,
 }
 
-async fn start_binary(dir: &Path, celld: &DevCelld) -> Binary {
+async fn start_binary(dir: &Path, celld: &DevCelld, port: u16) -> Binary {
     let mut child = Command::new(env!("CARGO_BIN_EXE_game-demos"))
-        .args([
-            "mobpit",
-            "--port",
-            "0",
-            "--dev",
-            "--secret",
-            SECRET,
-            "--data-dir",
-        ])
+        .args(["mobpit", "--port", &port.to_string(), "--dev"])
+        .args(["--secret", SECRET, "--data-dir"])
         .arg(dir)
         .args(["--celld-url", &celld.url()])
         .env("DISTRIBUTED_INTERNAL_SECRET", celld.secret())
@@ -459,8 +507,15 @@ async fn start_binary(dir: &Path, celld: &DevCelld) -> Binary {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kill_dash_nine_mid_fight_keeps_settled_facts_exactly_once() {
     let dir = temp_dir("crash");
-    let mut celld = celld();
-    let mut first = start_binary(&dir, &celld).await;
+    // celld relays its outbox Queue to the server's fixed port (both runs).
+    let port = game_demos::devcelld::free_port();
+    let relay = format!(
+        "http://127.0.0.1:{port}{}",
+        distributed::bus::CELLD_QUEUE_RELAY_PATH
+    );
+    let mut celld =
+        DevCelld::start(Some(relay)).unwrap_or_else(|error| panic!("celld dev: {error}"));
+    let mut first = start_binary(&dir, &celld, port).await;
     let ws = format!("ws://{}", first.addr);
     // Settle some kills at full speed, then slow storage so facts are in
     // flight at the moment of the crash.
@@ -507,14 +562,34 @@ async fn kill_dash_nine_mid_fight_keeps_settled_facts_exactly_once() {
     // facts are all there; of the in-flight ones each either committed
     // atomically or not at all.
     celld.restart().unwrap();
-    let mut second = start_binary(&dir, &celld).await;
-    let (_, crawlers) = http(second.addr, "GET", "/dev/mobpit/crawlers", None).await;
-    let total: u64 = crawlers["crawlers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| c["kills"].as_u64().unwrap())
-        .sum();
+    let mut second = start_binary(&dir, &celld, port).await;
+    // The directory (persisted in the data dir) catches up with the kill
+    // events the Queue relays; then it is stable.
+    let addr = second.addr;
+    let directory_total = || async move {
+        let (_, crawlers) = http(addr, "GET", "/dev/mobpit/crawlers", None).await;
+        crawlers["crawlers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["kills"].as_u64().unwrap())
+            .sum::<u64>()
+    };
+    let mut total = 0;
+    let mut stable_since = Instant::now();
+    let start = Instant::now();
+    while stable_since.elapsed() < Duration::from_secs(3) || total < settled_before {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "directory never settled: {total} kills, {settled_before} settled before the crash"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = directory_total().await;
+        if now != total {
+            total = now;
+            stable_since = Instant::now();
+        }
+    }
     eprintln!(
         "crash: settled {settled_before}, in flight {in_flight}, durable after restart {total}"
     );
@@ -522,7 +597,10 @@ async fn kill_dash_nine_mid_fight_keeps_settled_facts_exactly_once() {
         total >= settled_before && total <= settled_before + in_flight,
         "settled {settled_before} ≤ durable {total} ≤ settled + in flight ({in_flight})"
     );
-    // The board was rebuilt from the cells at boot.
+    // The board is rebuilt from the cells of every crawler in the directory
+    // (at boot, and again now that the directory has caught up).
+    let (_, rebuild) = http(second.addr, "POST", "/dev/mobpit/leaderboard/rebuild", None).await;
+    assert_eq!(rebuild["matchesCells"], true, "{rebuild}");
     let (_, board) = http(second.addr, "GET", "/dev/mobpit/leaderboard", None).await;
     let board_kills: f64 = board["snapshot"]["kills"]
         .as_array()
@@ -571,11 +649,12 @@ async fn redis_board_projects_and_rebuilds_when_redis_url_is_set() {
         return;
     };
     let dir = temp_dir("redis");
-    let celld = celld();
+    let (listener, celld) = relayed_celld().await;
     let mut options = WorldOptions::new(&dir, celld.options());
     options.redis_url = Some(url);
     options.redis_prefix = format!("mobpit-test-{}", random_hex(8));
-    let world = MobPitWorld::open(options).unwrap();
+    let world = MobPitWorld::start(options).await.unwrap();
+    let (_demo, _stop) = start(listener, world.clone()).await;
     assert_eq!(world.board().backend(), "redis");
     let sink = world.fact_sink();
     for (i, tier) in [1u8, 3].into_iter().enumerate() {
@@ -588,6 +667,7 @@ async fn redis_board_projects_and_rebuilds_when_redis_url_is_set() {
         world.board().scores("guest-rae").await.unwrap() == (2.0, 70.0)
     })
     .await;
+    crawlers_settled(&world, &["guest-rae"]).await;
     let report = world.rebuild_board().await.unwrap();
     assert!(report.matches_cells, "{report:?}");
     assert!(report.identical_top, "{report:?}");
@@ -607,9 +687,11 @@ async fn presence_is_settled_in_presence_cells_from_the_lifecycle_facts() {
     use tokio_tungstenite::tungstenite::Message;
 
     let dir = temp_dir("presence");
-    let celld = celld();
-    let world = MobPitWorld::open(WorldOptions::new(&dir, celld.options())).unwrap();
-    let (demo, stop) = start(world.clone()).await;
+    let (listener, celld) = relayed_celld().await;
+    let world = MobPitWorld::start(WorldOptions::new(&dir, celld.options()))
+        .await
+        .unwrap();
+    let (demo, stop) = start(listener, world.clone()).await;
     let join = |principal: &'static str| {
         let url = format!("{}/zones/pit-1", demo.ws_url());
         async move {
@@ -698,7 +780,7 @@ async fn presence_is_settled_in_presence_cells_from_the_lifecycle_facts() {
     let bo = world.cells().presence("guest-bo").await.unwrap();
     assert_eq!(bo["status"], "away", "{bo}");
     // Lifecycle facts never touch the Crawler cells.
-    assert!(world.cells().principals().await.unwrap().is_empty());
+    assert!(world.crawlers().await.unwrap().is_empty());
     let _ = stop.send(());
     let _ = std::fs::remove_dir_all(dir);
 }

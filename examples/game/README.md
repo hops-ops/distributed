@@ -9,7 +9,7 @@ guests and lets any page change the network simulation.
 | Demo | Run | Mechanic it demonstrates | Durable state |
 |---|---|---|---|
 | **Arena** | `./run.sh arena` | Fixed 30 Hz tick / 20 Hz patches, binary deltas, interest management (view ring, drones pop in/out), client prediction + reconciliation (the Rust movement step compiled to WebAssembly, bit-exact), interpolation of remote entities, live latency/jitter/loss | none (stateless: positions only live in the zone) |
-| **Mob Pit** | `./run.sh mobpit` | Authoritative melee combat vs. 12 telegraphing mobs; kills are **non-blocking durable facts** committed exactly once into per-player celld cells (`cells/`, `celld dev` started by `run.sh`); "slow storage" toggle (tick stays flat, pending facts climb); `kill -9` crash recovery; presence cells fed by the runtime's player lifecycle facts (`/dev/mobpit/presence`) | celld: `crawler/{player}`, `crawler-roster/all`, `presence/{player}` |
+| **Mob Pit** | `./run.sh mobpit` | Authoritative melee combat vs. 12 telegraphing mobs; kills are **non-blocking durable facts** committed exactly once into per-player celld cells (`cells/`, `celld dev` started by `run.sh`); "slow storage" toggle (tick stays flat, pending facts climb); `kill -9` crash recovery; presence cells fed by the runtime's player lifecycle facts (`/dev/mobpit/presence`) | celld: `crawler/{player}`, `presence/{player}`; crawler list = `player_stats` read model projected from the cells' events |
 | **Leaderboard** | `./run.sh leaderboard` | Same server as Mob Pit: kills/XP sorted-set boards (in-memory or Redis) fed fire-and-forget with idempotent apply keys, top 10 pushed live, your rank + neighbours, rebuild from the cells' event history | celld (the Mob Pit cells); boards are a projection (memory or Redis) |
 | **Shooting Gallery** | `./run.sh gallery` | Lag compensation: hitscan shots resolved with `ctx.rewind().hit_test_shot` at the shooter's view time (`client_tick` + interpolation delay in the payload), `max_rewind` clamp, per-shot compensation on/off, predicted vs confirmed hits | none (stateless: score is per session) |
 | **The Freeze** | `./run.sh freeze` | World-version barrier (`WorldCoordinator::rollout`) across **two server processes** as an in-world "admin update": freeze → apply → resume with change notes, inputs dropped while frozen, Hard reload vs safe-room gating (`StalePolicy::SafeRoom`, `Zone::is_gate`) of old clients, aborted rollout (`freeze_ready` → `NotAcked`), facts/events stamped with the content version | celld: `gem-pouch/{player}`, `content-log/{zone}` |
@@ -454,11 +454,11 @@ after dying. Level `n` starts at `40·(n−1)²` XP.
    as trusted headers) to the killer's own celld cell, `crawler/{principal}`
    (`cells/`, a workers-rs Durable Object per player). The command id is
    `sha256(service ‖ fact key)`, so the cell's command ledger turns any repeat
-   of the key into a replay of the stored receipt. Before a principal's first
-   kill the sink enlists it in the `crawler-roster/all` cell (celld cannot
-   enumerate cells; the roster is what the board rebuild and
-   `/dev/mobpit/crawlers` read). celld down: the fact stays queued in the
-   zone (backpressure at capacity), never in a local store.
+   of the key into a replay of the stored receipt. Nothing else is written
+   per kill: there is no index cell every player passes through (celld
+   cannot enumerate cells, and such a cell would be a global hot spot); the
+   crawler list is a read model (step 5). celld down: the fact stays queued
+   in the zone (backpressure at capacity), never in a local store.
 3. `crawler/src/lib.rs`: `crawler.record_kill` (a `#[command]` method) takes
    the principal from the trusted session (`x-user-id`) and **decides the XP
    from the tier**; the input has no identity or XP field and unknown fields
@@ -478,10 +478,15 @@ after dying. Level `n` starts at `40·(n−1)²` XP.
    `sqlite:{data-dir}/bus.db`). A crash between commit and drain, or a relay
    outage, only delays it (the cell's alarm re-drains; the Queue retries).
    `mobpit-service` consumes the bus with a
-   modeled projector (`projection!` → `upsert_player_stats`), checkpointed
-   and deduplicated in its own SQLite database, and serves `player_stats`
-   over GraphQL with `@live`. The service has no commands: nothing on that
-   side can name a player or an amount.
+   modeled projector (`projection!` → `upsert_player_stats`, defined in
+   `crawler/src/stats.rs`), checkpointed and deduplicated in its own SQLite
+   database, and serves `player_stats` over GraphQL with `@live`. The service
+   has no commands: nothing on that side can name a player or an amount.
+   The zone server projects the same events into its own copy
+   (`mobpit/directory.rs`, bus consumer `mobpit-zone`,
+   `{data-dir}/read-models.db`): `/dev/mobpit/crawlers` and the leaderboard
+   rebuild list crawlers from it (eventually consistent; the rebuild then
+   reads each listed crawler's kill history from its cell).
 
 The read path: on join the zone asks a background task to load the player's
 cell and sends `profile` (`source: "cell"`) a few ticks later.

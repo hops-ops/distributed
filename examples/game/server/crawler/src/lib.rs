@@ -21,8 +21,11 @@
 //!   post-kill [`CrawlerState`] into the cell's outbox in the same cell (SQLite)
 //!   transaction ([`CrawlerMobKilledDomainEvent`]). celld drains that outbox
 //!   to a Queue whose consumer relays it to the zone server, which publishes
-//!   it onto a bus; the read-model service (`mobpit_service`) projects it
-//!   into the `player_stats` table behind GraphQL `@live`.
+//!   it onto a bus; [`stats`] is its `player_stats` read model, projected by
+//!   the read-model service (`mobpit_service`, GraphQL `@live`) and by the
+//!   zone server (its crawler list).
+
+pub mod stats;
 
 use distributed::{sourced, DomainState, Entity};
 use serde::{Deserialize, Serialize};
@@ -31,13 +34,6 @@ use serde::{Deserialize, Serialize};
 pub const AGGREGATE_TYPE: &str = "Crawler";
 /// celld cell kind (URL segment) of the Crawler cells: `crawler/{principal}`.
 pub const CRAWLER_KIND: &str = "crawler";
-/// celld cell kind of the crawler roster (celld cannot enumerate cells, so
-/// the principals with a Crawler cell are indexed there).
-pub const ROSTER_KIND: &str = "crawler-roster";
-/// The roster's one shard.
-pub const ROSTER_SHARD: &str = "all";
-/// Roster command: add the session principal (idempotent).
-pub const ENLIST: &str = "crawler.enlist";
 /// celld cell kind of per-player presence (the runtime lifecycle facts).
 pub const PRESENCE_KIND: &str = "presence";
 /// Command dispatched for every `MobKilled` fact.

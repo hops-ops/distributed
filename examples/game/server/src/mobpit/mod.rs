@@ -9,8 +9,9 @@
 //! - [`store`]: the zone server's side of the celld cells
 //!   (`examples/game/cells`): the `FactSink` (with the "slow storage"
 //!   latency knob) that routes facts to them via
-//!   `distributed_game::celld::CelldFactSink`, the roster and cell reader,
-//!   and the projection bus fed by the outbox Queue relay.
+//!   `distributed_game::celld::CelldFactSink`, and the cell reader.
+//! - [`directory`]: the crawler list, a projection of the cells' domain
+//!   events (outbox → Queue → `crate::common::relay` → bus).
 //! - [`board`]: kills/XP leaderboards (in-memory or Redis), fire-and-forget
 //!   live updates, idempotent apply keys, rebuild from the cells' events.
 //! - [`presence`]: who is online where, projected from the runtime's player
@@ -27,6 +28,7 @@
 
 pub mod board;
 pub mod crawler;
+pub mod directory;
 pub mod presence;
 pub mod routes;
 pub mod store;
@@ -49,13 +51,14 @@ pub struct MobPitArgs {
     /// Shared demo options.
     #[command(flatten)]
     pub common: DemoArgs,
-    /// celld serving `examples/game/cells` (the Crawler, roster and
-    /// presence cells). The internal secret comes from
+    /// celld serving `examples/game/cells` (the Crawler and presence
+    /// cells). The internal secret comes from
     /// `DISTRIBUTED_INTERNAL_SECRET`.
     #[arg(long, env = "CELLD_URL")]
     pub celld_url: String,
-    /// Directory of local dev files: the persisted dev ticket secret and
-    /// the default projection bus. Default: `$TMPDIR/game-demos-mobpit`.
+    /// Directory of local dev files: the persisted dev ticket secret, the
+    /// default projection bus and the crawler directory's read models.
+    /// Default: `$TMPDIR/game-demos-mobpit`.
     #[arg(long, env = "MOBPIT_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
     /// Redis for the leaderboard (`redis://127.0.0.1:6379`); default in memory.
@@ -66,8 +69,8 @@ pub struct MobPitArgs {
     pub storage_latency_ms: u64,
     /// SQLite bus (`sqlite:/path/bus.db`) the Crawler cells'
     /// `crawler.mob_killed` domain events are published to (relayed from
-    /// celld's outbox Queue); `mobpit-service` projects them into its
-    /// `player_stats` read model. Default: `sqlite:{data-dir}/bus.db`.
+    /// celld's outbox Queue); `mobpit-service` and this server's crawler
+    /// directory project them. Default: `sqlite:{data-dir}/bus.db`.
     #[arg(long, env = "MOBPIT_PROJECTION_BUS")]
     pub projection_bus: Option<String>,
 }
@@ -144,15 +147,19 @@ pub async fn run(mut args: MobPitArgs) -> std::io::Result<()> {
     let celld = store::CelldOptions::new(&args.celld_url, secret).map_err(std::io::Error::other)?;
     let mut options = WorldOptions::new(&data_dir, celld);
     options.redis_url = args.redis_url.clone();
-    let world = MobPitWorld::open(options).map_err(std::io::Error::other)?;
+    options.projection_bus = args.projection_bus.clone();
+    let world = MobPitWorld::start(options)
+        .await
+        .map_err(std::io::Error::other)?;
     world
         .sink_state()
         .set_latency(std::time::Duration::from_millis(args.storage_latency_ms));
     if args.common.secret.is_none() {
         args.common.secret = Some(persisted_secret(&data_dir)?);
     }
-    // Board = projection of the cells: rebuild it before accepting players
-    // (the in-memory board starts empty; Redis may have missed updates).
+    // Board = projection of the cells: rebuild it from the crawler
+    // directory before accepting players (the in-memory board starts
+    // empty; Redis may have missed updates).
     match world.rebuild_board().await {
         Ok(report) => eprintln!(
             "mobpit: leaderboard rebuilt from cells: {}",
@@ -160,14 +167,7 @@ pub async fn run(mut args: MobPitArgs) -> std::io::Result<()> {
         ),
         Err(error) => eprintln!("mobpit: leaderboard rebuild failed (serving anyway): {error}"),
     }
-    let bus = args
-        .projection_bus
-        .clone()
-        .unwrap_or_else(|| format!("sqlite:{}", data_dir.join("bus.db").display()));
-    world
-        .attach_projection_bus(&bus)
-        .await
-        .map_err(std::io::Error::other)?;
+    let bus = world.bus_url().to_string();
     eprintln!(
         "mobpit: celld {} · projection bus {bus} · data dir {} · boot {} · leaderboard {}",
         args.celld_url,

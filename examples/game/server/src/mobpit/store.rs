@@ -11,38 +11,29 @@
 //!   the fact key, so a retry replays through the cell's command ledger
 //!   instead of crediting twice; celld slow or down keeps facts in the
 //!   zone's queue (`RetryPolicy::until_settled`), never in a local store.
-//! - celld cannot enumerate cells, so before a principal's first kill
-//!   commits the sink enlists it in the `crawler-roster/all` cell
-//!   (`crawler.enlist`, idempotent by principal). Every committed Crawler
-//!   cell is therefore on the roster; [`CrawlerCells`] reads both over the
-//!   internal path (profiles, `/dev/mobpit/crawlers`, the board rebuild).
 //! - Each kill commit also writes the `crawler.mob_killed` domain event to
 //!   the cell's outbox in the same cell transaction. celld drains it to the
 //!   `mobpit-outbox` Queue; the worker's consumer relays every message to
-//!   this server's authenticated `/internal/celld-queue/relay`, which
-//!   publishes it onto the [`ProjectionBus`] (a SQLite bus read by
-//!   `mobpit-service`). Delivery is at-least-once with stable message ids;
-//!   the projector deduplicates. A relay that fails is retried by the Queue.
+//!   this server's authenticated `/internal/celld-queue/relay`
+//!   (`crate::common::relay`), which publishes it onto the projection bus.
+//!   `mobpit-service` and this server's [`super::directory`] project it
+//!   (the crawler list). [`CrawlerCells`] reads one cell by principal
+//!   (profiles, the board rebuild's kill histories).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use distributed::bus::{celld_queue_relay_handler, CelldQueueRelayHandler, SqliteBus};
 use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
-use distributed::BusPublisher;
 use distributed_game::celld::{CelldFactRoute, CelldFactSink};
 use distributed_game::lifecycle::Lifecycle;
 use distributed_game::{BoxFuture, Fact, FactError, FactReceipt, FactSink};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::board::Leaderboards;
-use super::crawler::{
-    KillReceipt, RecordKillInput, CRAWLER_KIND, ENLIST, PRESENCE_KIND, RECORD_KILL, ROSTER_KIND,
-    ROSTER_SHARD,
-};
+use super::crawler::{KillReceipt, RecordKillInput, CRAWLER_KIND, PRESENCE_KIND, RECORD_KILL};
 use super::presence::Presence;
 
 /// Command-ledger service id for game facts.
@@ -97,7 +88,7 @@ pub struct CrawlerView {
     pub kills: Vec<KillRecord>,
 }
 
-/// Read side of the Crawler cells and the roster, over the internal path.
+/// Read side of one Crawler or presence cell, over the internal path.
 #[derive(Clone)]
 pub struct CrawlerCells {
     client: reqwest::Client,
@@ -142,15 +133,6 @@ impl CrawlerCells {
         Ok(body)
     }
 
-    /// Principals with a Crawler cell (sorted), from the roster.
-    pub async fn principals(&self) -> Result<Vec<String>, String> {
-        let body = self.get(ROSTER_KIND, ROSTER_SHARD).await?;
-        let mut out: Vec<String> = serde_json::from_value(body["principals"].clone())
-            .map_err(|error| format!("roster: {error}"))?;
-        out.sort();
-        Ok(out)
-    }
-
     /// The durable presence entry of `principal` (`null` when none).
     pub async fn presence(&self, principal: &str) -> Result<Value, String> {
         Ok(self.get(PRESENCE_KIND, principal).await?["current"].take())
@@ -174,42 +156,6 @@ fn encode_segment(segment: &str) -> String {
         }
     }
     encoded
-}
-
-/// The SQLite bus Crawler domain events are published to (consumed by
-/// `mobpit-service`'s projector).
-#[derive(Clone)]
-pub struct ProjectionBus {
-    relay: CelldQueueRelayHandler,
-}
-
-impl ProjectionBus {
-    /// Open (creating) the bus at a `sqlite:` URL shared with the service.
-    pub async fn open(url: &str) -> Result<Self, String> {
-        use std::str::FromStr;
-        let options = sqlx::sqlite::SqliteConnectOptions::from_str(url)
-            .map_err(|e| format!("projection bus {url}: {e}"))?
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(10));
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect_with(options)
-            .await
-            .map_err(|e| format!("projection bus {url}: {e}"))?;
-        let bus = SqliteBus::new(pool);
-        bus.ensure_tables()
-            .await
-            .map_err(|e| format!("projection bus tables: {e}"))?;
-        Ok(Self {
-            relay: celld_queue_relay_handler(BusPublisher::new(Arc::new(bus))),
-        })
-    }
-
-    /// The Queue relay handler publishing onto this bus.
-    pub fn relay_handler(&self) -> &CelldQueueRelayHandler {
-        &self.relay
-    }
 }
 
 /// A committed kill as the dev routes report it.
@@ -292,8 +238,6 @@ pub struct MobPitFactSink {
     state: Arc<SinkState>,
     board: Arc<Leaderboards>,
     presence: Arc<Presence>,
-    /// Principals enlisted on the roster by this process.
-    enlisted: Arc<Mutex<HashSet<String>>>,
 }
 
 impl MobPitFactSink {
@@ -314,38 +258,13 @@ impl MobPitFactSink {
         .route(CelldFactRoute::by_principal::<RecordKillInput>(
             CRAWLER_KIND,
         ))
-        .route(CelldFactRoute::new(ENLIST, ROSTER_KIND, |_, _| {
-            Some(ROSTER_SHARD.to_string())
-        }))
         .lifecycle_route(PRESENCE_KIND);
         Ok(Self {
             celld: sink,
             state,
             board,
             presence,
-            enlisted: Arc::default(),
         })
-    }
-
-    /// Enlist `principal` on the roster before its first kill commits (once
-    /// per process; the ledger makes a repeat a replay).
-    async fn enlist(&self, principal: &str, fact: &Fact) -> Result<(), FactError> {
-        if self.enlisted.lock().expect("enlisted").contains(principal) {
-            return Ok(());
-        }
-        let enlist = Fact::trusted(
-            format!("{ENLIST}:{principal}"),
-            ENLIST,
-            json!({}),
-            Some(principal.to_string()),
-            fact.stamp().clone(),
-        );
-        self.celld.commit(&enlist).await?;
-        self.enlisted
-            .lock()
-            .expect("enlisted")
-            .insert(principal.to_string());
-        Ok(())
     }
 
     async fn commit_kill(&self, fact: &Fact) -> Result<FactReceipt, FactError> {
@@ -353,10 +272,11 @@ impl MobPitFactSink {
         if !latency.is_zero() {
             tokio::time::sleep(latency).await;
         }
-        let principal = fact
-            .principal()
-            .ok_or_else(|| FactError::Permanent("kill facts need a player principal".into()))?;
-        self.enlist(principal, fact).await?;
+        if fact.principal().is_none() {
+            return Err(FactError::Permanent(
+                "kill facts need a player principal".into(),
+            ));
+        }
         let receipt = self.celld.commit(fact).await?;
         if fact.command() == RECORD_KILL {
             if let Ok(kill) = serde_json::from_value::<KillReceipt>(receipt.payload.clone()) {

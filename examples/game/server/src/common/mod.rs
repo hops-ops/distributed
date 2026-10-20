@@ -11,6 +11,7 @@
 pub mod celld;
 pub mod dev;
 mod guests;
+pub mod relay;
 
 use std::future::Future;
 use std::net::SocketAddr;

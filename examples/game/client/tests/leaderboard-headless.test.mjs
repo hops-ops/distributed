@@ -8,7 +8,7 @@ import test from 'node:test';
 
 import { createBoardWatcher, createMobPitClient, MobPitApi } from '../src/mobpit/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
-import { memoryStorage, until } from './helpers/demo-server.mjs';
+import { eventually, memoryStorage, until } from './helpers/demo-server.mjs';
 import { hunt, startPit } from './helpers/mobpit.mjs';
 
 test('board pushes match the cells and rebuild is identical', { timeout: 600_000 }, async () => {
@@ -41,8 +41,14 @@ test('board pushes match the cells and rebuild is identical', { timeout: 600_000
 		await until(() => row(watcher.board(), 'kills')?.score === profile.kills, 10_000, 'pushed kills');
 		assert.equal(row(watcher.board(), 'kills').name, 'Ranker');
 		assert.equal(row(watcher.board(), 'xp').score, profile.xp);
-		const { crawlers } = await pitApi.crawlers();
-		assert.deepEqual(crawlers.map((c) => [c.principal, c.kills, c.xp]), [[me, profile.kills, profile.xp]]);
+		// The crawler list (and so the rebuild) is a projection of the cells'
+		// kill events: eventually equal to the cells.
+		const listed = async () => (await pitApi.crawlers()).crawlers.map((c) => [c.principal, c.kills, c.xp]);
+		await eventually(
+			async () => JSON.stringify(await listed()) === JSON.stringify([[me, profile.kills, profile.xp]]),
+			15_000,
+			'crawler directory'
+		);
 
 		const { me: mine } = await pitApi.leaderboard(me);
 		assert.equal(mine.kills.rank, 1);

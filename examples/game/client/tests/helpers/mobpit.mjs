@@ -1,6 +1,6 @@
 /**
- * Headless Mob Pit helpers: a server on its own `celld dev` (the Crawler,
- * roster and presence cells), a throwaway data dir and a scripted hunter
+ * Headless Mob Pit helpers: a server on its own `celld dev` (the Crawler
+ * and presence cells), a throwaway data dir and a scripted hunter
  * that walks to the nearest mob, faces it and swings until `done()` is true.
  */
 import { mkdtempSync } from 'node:fs';

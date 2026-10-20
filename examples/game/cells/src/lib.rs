@@ -8,11 +8,6 @@
 //!   from the mob tier; the principal comes from the trusted fact session).
 //!   Each commit writes the `crawler.mob_killed` domain event to the cell
 //!   outbox, which drains to the `mobpit-outbox` Queue.
-//! - `crawler-roster/all` (`CrawlerRosterCell`): the principals that have a
-//!   Crawler cell. Durable Objects cannot be enumerated, so the zone server
-//!   enlists a principal (`crawler.enlist`, idempotent by principal) before
-//!   its first kill commits; the board rebuild and `/dev/mobpit/crawlers`
-//!   read it.
 //! - `presence/{principal}` (`PresenceCell`): the runtime's player lifecycle
 //!   facts (`zone.*`). A fact emitted before the one that set the current
 //!   entry (`FactStamp::emission_order`) is ignored, so a late "left pit-1"
@@ -40,8 +35,6 @@
 //! publishes it onto the projection bus read by `mobpit-service`. Delivery
 //! is at-least-once with stable message ids; the projector deduplicates.
 
-use std::collections::BTreeSet;
-
 use distributed::bus::{CelldQueueEnvelope, CelldQueueHttpPublisher, CelldQueueRelay};
 use distributed::cell_host::{
     AggregateCell, CellCommandIdentity, CellDispatchError, CellWaitPathRequest, CelldOutbox,
@@ -61,8 +54,7 @@ use distributed_game::world::zone_lease::{mount_zone_lease, ZoneLease};
 use distributed_game::world::zone_state::{celld_worker, mount_zone_state, ZoneState};
 use distributed_game::FactStamp;
 use mobpit_crawler::{
-    Crawler, MobKilledArgs, RecordKill, CRAWLER_KIND, ENLIST, MOB_KILLED_EVENT, PRESENCE_KIND,
-    ROSTER_KIND, ROSTER_SHARD,
+    Crawler, MobKilledArgs, RecordKill, CRAWLER_KIND, MOB_KILLED_EVENT, PRESENCE_KIND,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -70,68 +62,6 @@ use worker::*;
 
 fn rejected(error: impl std::fmt::Display) -> HandlerError {
     HandlerError::Rejected(error.to_string())
-}
-
-// ---------------------------------------------------------------- Roster
-
-#[derive(Clone, Default, Serialize, Deserialize, distributed::Snapshot)]
-pub struct CrawlerRoster {
-    entity: Entity,
-    principals: BTreeSet<String>,
-}
-
-#[sourced(
-    entity,
-    aggregate_type = "CrawlerRoster",
-    events = "CrawlerRosterEvent"
-)]
-impl CrawlerRoster {
-    #[event("crawler_roster.enlisted", version = 1)]
-    fn enlisted(&mut self, roster: String, principal: String) {
-        if self.entity.id().is_empty() {
-            self.entity.set_id(roster);
-        }
-        self.principals.insert(principal);
-    }
-}
-
-#[derive(Debug, Deserialize, distributed::CommandInput)]
-pub struct EnlistInput {}
-
-#[derive(Debug, Serialize, distributed::CommandOutput)]
-pub struct Enlisted {
-    pub crawlers: u32,
-}
-
-struct Enlist;
-impl<D> PortableCommand<D> for Enlist
-where
-    D: CausalRouteDependencies<Aggregate = CrawlerRoster> + Send + Sync + 'static,
-{
-    fn install(self, routes: Routes<D>) -> Routes<D> {
-        routes
-            .typed_command(typed_command::<EnlistInput, Succeeded<Enlisted>>(ENLIST))
-            .handle(handle_enlist)
-    }
-}
-
-async fn handle_enlist(
-    ctx: &CausalCommandContext<'_, CrawlerRoster>,
-    _input: EnlistInput,
-) -> std::result::Result<PreparedCommand<Succeeded<Enlisted>>, HandlerError> {
-    let principal = ctx.user_id()?.to_string();
-    let repo = ctx.repo();
-    let mut roster = match repo.get(ROSTER_SHARD).await? {
-        Some(roster) => roster,
-        None => repo.create(),
-    };
-    if !roster.principals.contains(&principal) {
-        roster
-            .enlisted(ROSTER_SHARD.to_string(), principal)
-            .map_err(rejected)?;
-    }
-    let crawlers = roster.principals.len() as u32;
-    repo.commit(roster)?.succeeded(Enlisted { crawlers })
 }
 
 // ---------------------------------------------------------------- Presence
@@ -640,13 +570,6 @@ async fn read_crawler(cell: &AggregateCell<Crawler>) -> std::result::Result<Valu
     }))
 }
 
-async fn read_roster(cell: &AggregateCell<CrawlerRoster>) -> std::result::Result<Value, String> {
-    let roster = cell.load().await.map_err(|error| error.to_string())?;
-    Ok(json!({
-        "principals": roster.map(|r| r.principals.into_iter().collect::<Vec<_>>()).unwrap_or_default(),
-    }))
-}
-
 async fn read_presence(cell: &AggregateCell<PlayerPresence>) -> std::result::Result<Value, String> {
     let presence = cell.load().await.map_err(|error| error.to_string())?;
     Ok(json!({ "current": presence.and_then(|p| p.current) }))
@@ -674,31 +597,6 @@ impl DurableObject for CrawlerCell {
 
     async fn fetch(&self, req: Request) -> Result<Response> {
         route(&self.env, &self.cell, req, read_crawler, fact_session).await
-    }
-
-    async fn alarm(&self) -> Result<Response> {
-        alarm(&self.env, &self.cell).await
-    }
-}
-
-#[durable_object]
-pub struct CrawlerRosterCell {
-    cell: AggregateCell<CrawlerRoster>,
-    env: Env,
-}
-
-impl DurableObject for CrawlerRosterCell {
-    fn new(state: State, env: Env) -> Self {
-        console_error_panic_hook::set_once();
-        let cell = AggregateCell::<CrawlerRoster>::from_state_with_snapshots(state, 50)
-            .expect("roster cell identity")
-            .mount(Enlist)
-            .with_celld_outbox(outbox(&env));
-        Self { cell, env }
-    }
-
-    async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_roster, fact_session).await
     }
 
     async fn alarm(&self) -> Result<Response> {
@@ -837,7 +735,6 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     let binding = match parts.first().copied() {
         Some(CRAWLER_KIND) => "CRAWLER",
-        Some(ROSTER_KIND) => "CRAWLER_ROSTER",
         Some(PRESENCE_KIND) => "PRESENCE",
         Some("gem-pouch") => "GEM_POUCH",
         Some("content-log") => "CONTENT_LOG",
@@ -849,9 +746,6 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return json_status(json!({ "error": "missing shard" }), 400);
     };
     let shard = percent_decode(shard).ok_or_else(|| Error::RustError("bad shard".into()))?;
-    if binding == "CRAWLER_ROSTER" && shard != ROSTER_SHARD {
-        return json_status(json!({ "error": "unknown roster" }), 404);
-    }
     let stub = env
         .durable_object(binding)?
         .id_from_name(&shard)?

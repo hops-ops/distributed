@@ -49,6 +49,17 @@ export async function until(predicate, timeoutMs = 10_000, what = 'condition') {
 	}
 }
 
+/** Poll an async `probe` until it returns a truthy value (returned). */
+export async function eventually(probe, timeoutMs = 10_000, what = 'condition') {
+	const start = Date.now();
+	for (;;) {
+		const value = await probe();
+		if (value) return value;
+		if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${what}`);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+}
+
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** In-memory Storage for DevApi in Node. */
