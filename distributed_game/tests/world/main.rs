@@ -1,7 +1,12 @@
 //! Two GameServers in one process on different ports: cross-host handoff
 //! with a real WebSocket client, tier-up events across hosts, hibernation,
-//! fenced ownership and the world content barrier.
+//! fenced ownership and the world content barrier. Hibernation runs on
+//! celld (`CellZoneOwnership` + `CellZoneStateStore` against
+//! `tests/celld/fact-worker`; skipped unless the worker is built and celld
+//! starts, required with `CELLD_FACTS_REQUIRED=1`).
 
+#[path = "../support/celld.rs"]
+mod celld_support;
 mod realm;
 
 use std::sync::{Arc, Mutex};
@@ -14,8 +19,8 @@ use distributed_game::net::{
 };
 use distributed_game::protocol::{error, kick, Hello, Notice};
 use distributed_game::world::{
-    FencedLeaseOwnership, HostAddr, LocalOwnership, SqliteZoneStateStore, StaticDirectory,
-    ZoneDirectory, ZoneOwnership, ZoneStateStore,
+    FencedLeaseOwnership, HostAddr, LocalOwnership, StaticDirectory, ZoneDirectory, ZoneOwnership,
+    ZoneStateStore,
 };
 use distributed_game::*;
 use futures_util::{SinkExt, StreamExt};
@@ -503,16 +508,11 @@ async fn boss_defeat_tiers_up_to_parent_and_grandparent_across_hosts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dormant_zone_hibernates_to_sqlite_and_restores() {
-    let path = std::env::temp_dir().join(format!(
-        "dg-world-hibernate-{}-{}.sqlite3",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let store = Arc::new(SqliteZoneStateStore::open(&path).unwrap());
+async fn dormant_zone_hibernates_to_celld_and_restores() {
+    let Some(celld) = celld_support::Celld::start_new() else {
+        return;
+    };
+    let (ownership, store) = on_celld(&celld, "host-a");
     let mut config = base_config();
     config.host.idle_tick_rate = None;
     config.host.dormant_after = Duration::from_millis(50);
@@ -522,6 +522,7 @@ async fn dormant_zone_hibernates_to_sqlite_and_restores() {
     let factory = realm_factory(&[], &[]);
     let server = GameServer::<Realm>::new(config, ZoneFactory::sync(move |a| factory(&a.zone_id)))
         .with_fact_sink(sink.clone(), 64, RetryPolicy::default())
+        .with_ownership(ownership)
         .with_state_store(store.clone());
     serve(&server, listener);
     let url = format!("ws://{addr}/zones/realm.vault");
@@ -545,7 +546,11 @@ async fn dormant_zone_hibernates_to_sqlite_and_restores() {
         async move { !server.is_active("realm.vault") && hibernation_outcomes(&server) >= 1 }
     })
     .await;
-    let saved = store.load("realm.vault").unwrap().expect("snapshot stored");
+    let saved = store
+        .load("realm.vault")
+        .await
+        .unwrap()
+        .expect("snapshot stored");
     assert_eq!(saved.state, 3u32.to_le_bytes());
     // Facts emitted while disposing were still committed.
     eventually("dispose fact", || {
@@ -578,28 +583,51 @@ async fn dormant_zone_hibernates_to_sqlite_and_restores() {
         }
     };
     assert_eq!(counter, 3);
-    drop(store);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
+}
+
+/// Zone ownership and hibernation snapshots in celld cells.
+fn on_celld(
+    celld: &celld_support::Celld,
+    host: &str,
+) -> (
+    Arc<distributed_game::celld::CellZoneOwnership>,
+    Arc<distributed_game::celld::CellZoneStateStore>,
+) {
+    let secret = || distributed::cell_host::InternalHttpSecret::new(celld_support::SECRET).unwrap();
+    (
+        Arc::new(
+            distributed_game::celld::CellZoneOwnership::new(
+                celld.base(),
+                secret(),
+                "world-test",
+                host,
+            )
+            .unwrap(),
+        ),
+        Arc::new(
+            distributed_game::celld::CellZoneStateStore::new(
+                celld.base(),
+                secret(),
+                "world-test",
+                host,
+            )
+            .unwrap(),
+        ),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
-    let path = std::env::temp_dir().join(format!(
-        "dg-world-restart-{}-{}.sqlite3",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let Some(celld) = celld_support::Celld::start_new() else {
+        return;
+    };
     let url_of = |addr: &str| format!("ws://{addr}/zones/realm.keep");
     let mut epochs = Vec::new();
     let mut count = 0u32;
     for run in 1..=2 {
-        // A fresh process: new store handle, new (default) LocalOwnership.
-        let store = Arc::new(SqliteZoneStateStore::open(&path).unwrap());
+        // A fresh process: new store and ownership handles (the fencing
+        // tokens live in the celld lease cell, so they keep growing).
+        let (ownership, store) = on_celld(&celld, &format!("host-{run}"));
         let mut config = base_config();
         config.host.idle_tick_rate = None;
         config.host.dormant_after = Duration::from_millis(50);
@@ -608,6 +636,7 @@ async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
         let factory = realm_factory(&[], &[]);
         let server =
             GameServer::<Realm>::new(config, ZoneFactory::sync(move |a| factory(&a.zone_id)))
+                .with_ownership(ownership)
                 .with_state_store(store.clone());
         serve(&server, listener);
         // Two activations per run, so the first run's last token exceeds
@@ -646,7 +675,7 @@ async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
                 cycle,
                 "run {run}"
             );
-            let saved = store.load("realm.keep").unwrap().expect("snapshot");
+            let saved = store.load("realm.keep").await.unwrap().expect("snapshot");
             assert_eq!(saved.state, count.to_le_bytes(), "run {run} saved");
         }
         assert!(server
@@ -659,9 +688,6 @@ async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
         epochs.windows(2).all(|w| w[1] > w[0]),
         "epochs grow: {epochs:?}"
     );
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

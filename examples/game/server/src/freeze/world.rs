@@ -8,6 +8,13 @@
 //! for a zone on the other host is redirected and handoffs reserve their
 //! transfer with the issuing host over `/admin/transfer`.
 //!
+//! Facts go to celld (`--celld-url` / `CELLD_URL`, `DISTRIBUTED_INTERNAL_SECRET`,
+//! the `examples/game/cells` worker; the secondary inherits both through the
+//! environment) with [`FreezeFactSink`]: `freeze.gem_collected` to the
+//! player's `gem-pouch/{principal}` cell, `freeze.content_applied` to the
+//! zone's `content-log/{zone}` cell. The host keeps the last settled facts
+//! in memory only for `GET /dev/freeze/world`.
+//!
 //! Routes (dev only, mounted with `--dev`; the mutating ones require the
 //! `x-game-admin-secret` header):
 //!
@@ -29,18 +36,82 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use distributed_game::celld::{CelldFactRoute, CelldFactSink};
 use distributed_game::net::peer::{post_json, ADMIN_SECRET_HEADER};
 use distributed_game::net::{
     GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey, WorldCoordinator, ZoneFactory,
 };
 use distributed_game::world::{HostAddr, StaticDirectory};
-use distributed_game::{BarrierMode, FreezeState, MemoryFactSink, RetryPolicy};
+use distributed_game::{
+    BarrierMode, BoxFuture, Fact, FactError, FactReceipt, FactSink, FreezeState, RetryPolicy,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::content::{self, ZoneKind, EMBER, HUB, MEADOW};
-use super::{freeze_config, FreezeConfig, FreezeDemo, FreezeZone, Rituals};
-use crate::common::{self, dev, random_hex, server_config, DemoArgs, Guests};
+use super::{
+    freeze_config, ContentApplied, FreezeConfig, FreezeDemo, FreezeZone, GemCollected, Rituals,
+};
+use crate::common::{self, dev, random_hex, server_config, CelldOptions, DemoArgs, Guests};
+
+/// Command-ledger service id of Freeze facts.
+pub const SERVICE_ID: &str = "freeze";
+/// Principal of zone facts (`freeze.content_applied`).
+pub const SYSTEM_PRINCIPAL: &str = "freeze-zone";
+
+/// The Freeze's fact sink: facts to their celld cells, the settled ones
+/// mirrored (last 64) for the dev status route.
+#[derive(Clone)]
+pub struct FreezeFactSink {
+    celld: CelldFactSink,
+    settled: Arc<Mutex<std::collections::VecDeque<Fact>>>,
+}
+
+impl FreezeFactSink {
+    /// Sink into the cells at `celld`.
+    pub fn new(celld: &CelldOptions) -> Result<Self, String> {
+        let sink = CelldFactSink::new(
+            celld.url.clone(),
+            celld.secret.clone(),
+            SERVICE_ID,
+            SYSTEM_PRINCIPAL,
+        )?
+        .route(CelldFactRoute::by_principal::<GemCollected>("gem-pouch"))
+        .route(CelldFactRoute::new(
+            <ContentApplied as distributed_game::FactCommand>::COMMAND,
+            "content-log",
+            |fact, _| Some(fact.stamp().zone_id.clone()),
+        ));
+        Ok(Self {
+            celld: sink,
+            settled: Arc::default(),
+        })
+    }
+
+    /// Settled facts, oldest first (at most the last 64).
+    pub fn committed(&self) -> Vec<Fact> {
+        self.settled
+            .lock()
+            .expect("settled")
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+impl FactSink for FreezeFactSink {
+    fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+        Box::pin(async move {
+            let receipt = self.celld.commit(fact).await?;
+            let mut settled = self.settled.lock().expect("settled");
+            if settled.len() == 64 {
+                settled.pop_front();
+            }
+            settled.push_back(fact.clone());
+            Ok(receipt)
+        })
+    }
+}
 
 /// Default time the "content CDN" takes to stage an update while the world
 /// is frozen (makes the pause visible).
@@ -66,6 +137,12 @@ pub struct FreezeArgs {
     /// Simulated content staging time during the freeze (ms).
     #[arg(long, env = "DG_FREEZE_STAGE_MS", default_value_t = STAGE_MS)]
     pub stage_ms: u64,
+    /// celld serving the `gem-pouch` and `content-log` cells.
+    #[arg(long, env = "CELLD_URL")]
+    pub celld_url: String,
+    /// Internal secret for the celld cells.
+    #[arg(long, env = "DISTRIBUTED_INTERNAL_SECRET", hide_env_values = true)]
+    pub internal_secret: String,
 }
 
 /// Everything one host needs.
@@ -86,6 +163,8 @@ pub struct HostSpec {
     pub stage: Duration,
     /// Barrier acknowledgement timeout.
     pub ack_timeout: Duration,
+    /// celld holding the facts' cells.
+    pub celld: CelldOptions,
 }
 
 /// A running Freeze host.
@@ -95,7 +174,7 @@ pub struct WorldHost {
     /// The game server.
     pub server: GameServer<FreezeZone>,
     /// Facts committed by this host's zones.
-    pub sink: MemoryFactSink,
+    pub sink: FreezeFactSink,
     /// Stuck-zone toggles.
     pub rituals: Rituals,
     /// Resolves when the server stopped.
@@ -109,7 +188,9 @@ pub fn zone_server(
     rituals: Rituals,
     host: &str,
 ) -> GameServer<FreezeZone> {
-    zone_server_with_sink(config, guests, rituals, host, MemoryFactSink::new())
+    let celld = CelldOptions::from_env().expect("The Freeze needs celld");
+    let sink = FreezeFactSink::new(&celld).expect("freeze fact sink");
+    zone_server_with_sink(config, guests, rituals, host, sink)
 }
 
 fn zone_server_with_sink(
@@ -117,7 +198,7 @@ fn zone_server_with_sink(
     guests: Guests,
     rituals: Rituals,
     host: &str,
-    sink: MemoryFactSink,
+    sink: FreezeFactSink,
 ) -> GameServer<FreezeZone> {
     let host = host.to_string();
     GameServer::new(
@@ -132,7 +213,12 @@ fn zone_server_with_sink(
             })
         }),
     )
-    .with_fact_sink(sink, 256, RetryPolicy::default())
+    // celld down: facts wait in the zone's queue until they settle.
+    .with_fact_sink(
+        sink,
+        256,
+        RetryPolicy::until_settled(Duration::from_millis(50), Duration::from_secs(2)),
+    )
 }
 
 /// The default assignment: hub + meadow on `primary`, ember on `secondary`.
@@ -164,7 +250,7 @@ pub fn start_host(
     config.admin_secret = Some(spec.admin_secret.clone());
     let guests = Guests::default();
     let rituals = Rituals::default();
-    let sink = MemoryFactSink::new();
+    let sink = FreezeFactSink::new(&spec.celld).map_err(std::io::Error::other)?;
     let server = zone_server_with_sink(
         config,
         guests.clone(),
@@ -222,7 +308,7 @@ pub fn start_host(
 #[derive(Clone)]
 struct FreezeRoutes {
     server: GameServer<FreezeZone>,
-    sink: MemoryFactSink,
+    sink: FreezeFactSink,
     rituals: Rituals,
     admin_secret: String,
     me: HostAddr,
@@ -568,6 +654,8 @@ fn spawn_secondary(
             primary.admin_url.trim_start_matches("http://")
         ))
         .args(["--stage-ms", &args.stage_ms.to_string()])
+        .args(["--celld-url", &args.celld_url])
+        .env("DISTRIBUTED_INTERNAL_SECRET", &args.internal_secret)
         .env("DISTRIBUTED_GAME_SECRET", secret)
         .env("DG_DEMO_ADMIN_SECRET", admin)
         .env_remove("GAME_DEMOS_PORT")
@@ -648,6 +736,8 @@ pub async fn run(args: FreezeArgs) -> std::io::Result<()> {
         dev: args.demo.dev,
         stage: Duration::from_millis(args.stage_ms),
         ack_timeout: ACK_TIMEOUT,
+        celld: CelldOptions::new(args.celld_url.clone(), args.internal_secret.clone())
+            .map_err(std::io::Error::other)?,
     };
     let host = start_host(listener, spec, shutdown_signal(secondary))?;
     // Parsed by run.sh and the client tests: keep the format.

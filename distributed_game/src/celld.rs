@@ -1,5 +1,7 @@
 //! [`CelldFactSink`]: a zone server's facts, sent over the network to the
-//! durable aggregates in celld cells (game-services decision D3).
+//! durable aggregates in celld cells (game-services decision D3). Also the
+//! zone server's other celld clients: [`CellZoneOwnership`] (zone leases)
+//! and [`CellZoneStateStore`] (hibernation snapshots).
 //!
 //! One sink per zone server routes every fact by its command
 //! ([`FactCommand::COMMAND`](crate::FactCommand::COMMAND)) to a registered
@@ -457,6 +459,204 @@ impl crate::world::ZoneOwnership for CellZoneOwnership {
                     json!({ "zone_id": claim.zone_id, "holder": claim.holder, "token": claim.token }),
                 )
                 .await;
+        })
+    }
+}
+
+/// [`ZoneStateStore`](crate::world::ZoneStateStore) over celld
+/// `ZoneState:{zone_id}` cells ([`crate::world::zone_state`]): hibernation
+/// snapshots of a zone server live in one celld cell per zone (inline below
+/// [`ZONE_STATE_INLINE_MAX`](crate::world::zone_state::ZONE_STATE_INLINE_MAX),
+/// in celld's object storage above it), fenced by the ownership token.
+///
+/// Every write uses a fresh command id: a retried save under the same token
+/// is accepted again (equal tokens are allowed), so an ambiguous response is
+/// safe.
+#[derive(Clone)]
+pub struct CellZoneStateStore {
+    client: reqwest::Client,
+    base: String,
+    secret: InternalHttpSecret,
+    service_id: String,
+    host: String,
+}
+
+/// Cell kind (URL segment) of zone-state cells.
+pub const ZONE_STATE_KIND: &str = "zone-state";
+
+impl CellZoneStateStore {
+    /// Store for zone server `host` against `celld_url`, under
+    /// command-ledger `service_id`.
+    pub fn new(
+        celld_url: impl Into<String>,
+        secret: InternalHttpSecret,
+        service_id: impl Into<String>,
+        host: impl Into<String>,
+    ) -> Result<Self, String> {
+        let base = celld_url.into().trim_end_matches('/').to_string();
+        if !(base.starts_with("http://") || base.starts_with("https://")) {
+            return Err(format!("celld URL must be http(s): {base}"));
+        }
+        let service_id = service_id.into();
+        let host = host.into();
+        if service_id.trim().is_empty() || host.trim().is_empty() {
+            return Err("cell zone state needs a service id and a host identity".into());
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| format!("celld zone-state client: {error}"))?;
+        Ok(Self {
+            client,
+            base,
+            secret,
+            service_id,
+            host,
+        })
+    }
+
+    fn url(
+        &self,
+        zone_id: &str,
+        command: Option<&str>,
+    ) -> Result<String, crate::world::StateError> {
+        if !valid_segment(zone_id) {
+            return Err(crate::world::StateError::Backend(format!(
+                "invalid zone id `{zone_id}`"
+            )));
+        }
+        let mut url = format!(
+            "{}/{}/{}",
+            self.base,
+            encode_segment(ZONE_STATE_KIND),
+            encode_segment(zone_id)
+        );
+        if let Some(command) = command {
+            url.push('/');
+            url.push_str(&encode_segment(command));
+        }
+        Ok(url)
+    }
+
+    async fn command(
+        &self,
+        zone_id: &str,
+        command: &str,
+        input: Value,
+    ) -> Result<(), crate::world::StateError> {
+        use crate::world::zone_lease::ZONE_HOST_ROLE;
+        use crate::world::StateError;
+        let url = self.url(zone_id, Some(command))?;
+        let token = input.get("token").and_then(Value::as_u64).unwrap_or(0);
+        let response = self
+            .client
+            .post(&url)
+            .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
+            .header(CELL_SERVICE_ID_HEADER, &self.service_id)
+            .header(CELL_PRINCIPAL_PARTITION_HEADER, &self.host)
+            .header(USER_ID_KEY, &self.host)
+            .header(distributed::microsvc::ROLE_KEY, ZONE_HOST_ROLE)
+            .json(&json!({
+                "commandId": uuid::Uuid::now_v7().hyphenated().to_string(),
+                "input": input,
+            }))
+            .send()
+            .await
+            .map_err(|error| StateError::Backend(format!("celld unreachable: {error}")))?;
+        let status = response.status().as_u16();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        let message = body.get("error").and_then(Value::as_str).unwrap_or("");
+        match crate::world::zone_state::stale_current(message) {
+            Some(current) => Err(StateError::Stale {
+                presented: token,
+                current,
+            }),
+            None => Err(StateError::Backend(format!("HTTP {status}: {message}"))),
+        }
+    }
+}
+
+impl crate::world::ZoneStateStore for CellZoneStateStore {
+    fn load<'a>(
+        &'a self,
+        zone_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<crate::world::StoredZoneState>, crate::world::StateError>>
+    {
+        use crate::world::StateError;
+        Box::pin(async move {
+            use base64::Engine as _;
+            let url = self.url(zone_id, None)?;
+            let response = self
+                .client
+                .get(&url)
+                .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
+                .send()
+                .await
+                .map_err(|error| StateError::Backend(format!("celld unreachable: {error}")))?;
+            let status = response.status().as_u16();
+            let body: Value = response.json().await.unwrap_or(Value::Null);
+            if !(200..300).contains(&status) {
+                return Err(StateError::Backend(format!("HTTP {status}: {body}")));
+            }
+            let Some(state) = body.get("state").filter(|state| !state.is_null()) else {
+                return Ok(None);
+            };
+            let field = |name: &str| {
+                state
+                    .get(name)
+                    .ok_or_else(|| StateError::Backend(format!("zone state without `{name}`")))
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(field("state_b64")?.as_str().unwrap_or_default())
+                .map_err(|_| StateError::Backend("zone state is not base64".into()))?;
+            Ok(Some(crate::world::StoredZoneState {
+                token: field("token")?.as_u64().unwrap_or(0),
+                content_version: field("content_version")?
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                state: bytes,
+            }))
+        })
+    }
+
+    fn save<'a>(
+        &'a self,
+        zone_id: &'a str,
+        state: &'a crate::world::StoredZoneState,
+    ) -> BoxFuture<'a, Result<(), crate::world::StateError>> {
+        Box::pin(async move {
+            use base64::Engine as _;
+            self.command(
+                zone_id,
+                crate::world::zone_state::SAVE,
+                json!({
+                    "zone_id": zone_id,
+                    "token": state.token,
+                    "content_version": state.content_version,
+                    "state_b64": base64::engine::general_purpose::STANDARD.encode(&state.state),
+                }),
+            )
+            .await
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        zone_id: &'a str,
+        token: u64,
+    ) -> BoxFuture<'a, Result<(), crate::world::StateError>> {
+        Box::pin(async move {
+            self.command(
+                zone_id,
+                crate::world::zone_state::DELETE,
+                json!({ "zone_id": zone_id, "token": token }),
+            )
+            .await
         })
     }
 }

@@ -1,6 +1,7 @@
 //! Shared helpers for the multi-host smoke tests: start N in-process hosts
-//! of a cluster demo on ephemeral ports and a minimal protocol client that
-//! follows Redirects.
+//! of a cluster demo on ephemeral ports, sharing one private `celld dev`
+//! (zone leases and hibernation snapshots; `game_demos::devcelld`), and a
+//! minimal protocol client that follows Redirects.
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
@@ -15,6 +16,7 @@ use distributed_game::{
 use futures_util::{SinkExt, StreamExt};
 use game_demos::cluster::{spawn_cluster, ClusterDemo, ClusterOptions, RunningHost};
 use game_demos::common::DemoOptions;
+use game_demos::devcelld::DevCelld;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -28,7 +30,7 @@ pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub struct Cluster<D: ClusterDemo> {
     pub hosts: Vec<RunningHost<D>>,
     stops: Vec<tokio::sync::oneshot::Sender<()>>,
-    pub state_dir: std::path::PathBuf,
+    pub celld: DevCelld,
 }
 
 impl<D: ClusterDemo> Cluster<D> {
@@ -52,7 +54,7 @@ impl<D: ClusterDemo> Cluster<D> {
         for host in self.hosts {
             let _ = host.demo.task.await;
         }
-        let _ = std::fs::remove_dir_all(&self.state_dir);
+        drop(self.celld);
     }
 }
 
@@ -68,15 +70,7 @@ pub async fn start_cluster<D: ClusterDemo>(ids: &[&str], hibernate_after: Durati
         .iter()
         .map(|(id, addr, _)| HostAddr::new(id.clone(), addr.to_string()))
         .collect();
-    let state_dir = std::env::temp_dir().join(format!(
-        "game-demos-{}-{}-{}",
-        D::NAME,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let celld = DevCelld::start(None).unwrap_or_else(|error| panic!("celld dev: {error}"));
     let mut hosts = Vec::new();
     let mut stops = Vec::new();
     for (id, _, listener) in listeners {
@@ -84,13 +78,8 @@ pub async fn start_cluster<D: ClusterDemo>(ids: &[&str], hibernate_after: Durati
         let options = ClusterOptions {
             host_id: id,
             peers: all.clone(),
-            state_dir: Some(state_dir.clone()),
             hibernate_after,
-            // With CELLD_URL + DISTRIBUTED_INTERNAL_SECRET the hosts keep
-            // zone ownership in celld ZoneLease cells (same smoke tests).
-            celld: std::env::var("CELLD_URL")
-                .ok()
-                .zip(std::env::var("DISTRIBUTED_INTERNAL_SECRET").ok()),
+            celld: celld.options(),
         };
         let host = spawn_cluster::<D>(listener, DemoOptions::dev(SECRET), options, async move {
             let _ = stopped.await;
@@ -102,7 +91,7 @@ pub async fn start_cluster<D: ClusterDemo>(ids: &[&str], hibernate_after: Durati
     Cluster {
         hosts,
         stops,
-        state_dir,
+        celld,
     }
 }
 

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::mobpit::store::CelldOptions;
+use crate::common::CelldOptions;
 
 /// Env var naming the celld binary.
 pub const CELLD_BIN_ENV: &str = "CELLD_BIN";

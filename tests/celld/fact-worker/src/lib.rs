@@ -9,6 +9,9 @@
 //! - `ZoneLease:{zone_id}` (kind `zone-lease`): zone ownership
 //!   (`distributed_game::world::zone_lease`) for `CellZoneOwnership`; its
 //!   alarm declares `zone.lease_expired`.
+//! - `ZoneState:{zone_id}` (kind `zone-state`): hibernation snapshots
+//!   (`distributed_game::world::zone_state`) for `CellZoneStateStore`;
+//!   snapshots above the inline limit go to the `ZONE_SNAPSHOTS` R2 bucket.
 //!
 //! Every route requires `DISTRIBUTED_INTERNAL_SECRET`. The handler's session
 //! is rebuilt from the trusted fact headers (`fact_session_from_headers`):
@@ -26,6 +29,7 @@ use distributed::microsvc::{
 use distributed::{sourced, Aggregate, Entity};
 use distributed_game::cell::{fact_session_from_headers, session_stamp};
 use distributed_game::world::zone_lease::{mount_zone_lease, ZoneLease};
+use distributed_game::world::zone_state::{mount_zone_state, ZoneState};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use worker::*;
@@ -460,6 +464,35 @@ impl DurableObject for ZoneLeaseCell {
     }
 }
 
+#[durable_object]
+pub struct ZoneStateCell {
+    cell: AggregateCell<ZoneState>,
+    env: Env,
+}
+
+impl DurableObject for ZoneStateCell {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        let outbox = CelldOutbox::from_env(&env, "OUTBOX").expect("OUTBOX Queue binding");
+        // Every save replaces the value: snapshot each commit.
+        let cell = mount_zone_state(
+            AggregateCell::<ZoneState>::from_state_with_snapshots(state, 1)
+                .expect("zone state cell identity"),
+        )
+        .with_celld_outbox(outbox);
+        Self { cell, env }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        if let Err(error) = authenticate(&req, &self.env) {
+            return error_response(error);
+        }
+        let bucket =
+            distributed_game::world::zone_state::celld_worker::bucket(&self.env, "ZONE_SNAPSHOTS")?;
+        distributed_game::world::zone_state::celld_worker::fetch(&self.cell, &bucket, req).await
+    }
+}
+
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
@@ -477,6 +510,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Some("match") => "MATCH",
         Some("presence") => "PRESENCE",
         Some("zone-lease") => "ZONE_LEASE",
+        Some("zone-state") => "ZONE_STATE",
         _ => return json_status(json!({ "error": "unknown cell kind" }), 404),
     };
     let Some(shard) = parts.get(1) else {

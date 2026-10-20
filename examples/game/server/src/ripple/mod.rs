@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::arena::movement::{self, MoveState};
-use crate::cluster::{ClusterDemo, ClusterOptions, World};
+use crate::cluster::{ClusterDemo, World};
 use crate::common::{Demo, Guests};
 
 /// Root zone.
@@ -826,8 +826,7 @@ impl Demo for RippleDemo {
     }
 
     fn server(config: ServerConfig, guests: Guests) -> GameServer<Ripple> {
-        let options = ClusterOptions::single("local", Duration::from_secs(20));
-        let world = World::standalone::<Self>(&options, guests);
+        let world = World::standalone::<Self>("local", Duration::from_secs(20), guests);
         Self::cluster_server(config, &world)
     }
 }

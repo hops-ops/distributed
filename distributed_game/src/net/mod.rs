@@ -1148,24 +1148,20 @@ async fn run_zone<Z>(
     };
     // 2. Restore the hibernated snapshot, if any.
     let saved = match &inner.state_store {
-        Some(store) => {
-            let store = store.clone();
-            let id = zone_id.clone();
-            match tokio::task::spawn_blocking(move || store.load(&id)).await {
-                Ok(Ok(saved)) => saved,
-                _ => {
-                    inner.ownership.release(&claim).await;
-                    return refuse_activation(
-                        &inner,
-                        &zone_id,
-                        activation,
-                        rx,
-                        error::ZONE_UNAVAILABLE,
-                        "zone state unavailable",
-                    );
-                }
+        Some(store) => match store.load(&zone_id).await {
+            Ok(saved) => saved,
+            _ => {
+                inner.ownership.release(&claim).await;
+                return refuse_activation(
+                    &inner,
+                    &zone_id,
+                    activation,
+                    rx,
+                    error::ZONE_UNAVAILABLE,
+                    "zone state unavailable",
+                );
             }
-        }
+        },
         None => None,
     };
     // 3. The allocation record and the game's factory, bounded together.
@@ -1366,11 +1362,11 @@ async fn run_zone<Z>(
                 };
                 // A stale token means a newer owner saved already: ours is
                 // dropped, but never silently (metrics + stderr).
-                let saved = tokio::task::spawn_blocking(move || store.save(&id, &stored)).await;
+                let saved = store.save(&id, &stored).await;
                 let outcome = match &saved {
-                    Ok(Ok(())) => "saved",
-                    Ok(Err(StateError::Stale { .. })) => "stale",
-                    _ => "error",
+                    Ok(()) => "saved",
+                    Err(StateError::Stale { .. }) => "stale",
+                    Err(_) => "error",
                 };
                 inner.metrics.record_hibernation_save(outcome);
                 if outcome != "saved" {

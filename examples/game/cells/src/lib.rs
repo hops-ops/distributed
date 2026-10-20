@@ -1,5 +1,7 @@
-//! Mob Pit's durable cells on celld, fed by the zone server's
-//! `distributed_game::celld::CelldFactSink` over the internal HTTP path.
+//! The game demos' durable cells on celld. Mob Pit's are fed by the zone
+//! server's `distributed_game::celld::CelldFactSink` over the internal HTTP
+//! path; every multi-host demo keeps its zone ownership and hibernation
+//! snapshots here.
 //!
 //! - `crawler/{principal}` (`CrawlerCell`): the `mobpit_crawler::Crawler`
 //!   aggregate with its `#[command]` `crawler.record_kill` (XP decided here
@@ -15,11 +17,23 @@
 //!   facts (`zone.*`). A fact emitted before the one that set the current
 //!   entry (`FactStamp::emission_order`) is ignored, so a late "left pit-1"
 //!   cannot mark a player who already joined pit-2 offline.
+//! - `gem-pouch/{principal}` (`GemPouchCell`): The Freeze's
+//!   `freeze.gem_collected` facts (which gem spot, at which content
+//!   version; the zone reports no amount).
+//! - `content-log/{zone}` (`ContentLogCell`): The Freeze's
+//!   `freeze.content_applied` zone facts (every content switch of a zone).
+//! - `zone-lease/{zone}` (`ZoneLeaseCell`): zone ownership
+//!   (`distributed_game::world::zone_lease`, `CellZoneOwnership`); its
+//!   alarm declares `zone.lease_expired`.
+//! - `zone-state/{zone}` (`ZoneStateCell`): hibernation snapshots
+//!   (`distributed_game::world::zone_state`, `CellZoneStateStore`); large
+//!   ones in the `ZONE_SNAPSHOTS` R2 bucket.
 //!
-//! Every route requires `DISTRIBUTED_INTERNAL_SECRET`; commands also require
-//! the trusted fact session (principal + `FactStamp` headers, rebuilt with
-//! `fact_session_from_headers`), so nothing but a zone server's fact worker
-//! can run them.
+//! Every route requires `DISTRIBUTED_INTERNAL_SECRET`. Mob Pit commands also
+//! require the trusted fact session (principal + `FactStamp` headers,
+//! rebuilt with `fact_session_from_headers`), so nothing but a zone server's
+//! fact worker can run them; zone lease and state commands require the
+//! `zone-host` role.
 //!
 //! The Queue consumer relays each outbox message to `CELLD_QUEUE_RELAY_URL`
 //! (the zone server's authenticated `/internal/celld-queue/relay`), which
@@ -36,13 +50,15 @@ use distributed::cell_host::{
 };
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::microsvc::{
-    CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
+    CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes, Session,
 };
 use distributed::{sourced, Aggregate, Entity};
 use distributed_game::cell::{fact_session_from_headers, session_stamp};
 use distributed_game::lifecycle::{
     Lifecycle, CONNECTION_LOST, PLAYER_DISCONNECTED, PLAYER_JOINED, PLAYER_LEFT, PLAYER_RECONNECTED,
 };
+use distributed_game::world::zone_lease::{mount_zone_lease, ZoneLease};
+use distributed_game::world::zone_state::{celld_worker, mount_zone_state, ZoneState};
 use distributed_game::FactStamp;
 use mobpit_crawler::{
     Crawler, MobKilledArgs, RecordKill, CRAWLER_KIND, ENLIST, MOB_KILLED_EVENT, PRESENCE_KIND,
@@ -274,13 +290,248 @@ async fn handle_lifecycle(
         .succeeded(PresenceApplied { applied: newer })
 }
 
+// ---------------------------------------------------------------- The Freeze
+
+/// `freeze.gem_collected`.
+pub const GEM_COLLECTED: &str = "freeze.gem_collected";
+/// `freeze.content_applied`.
+pub const CONTENT_APPLIED: &str = "freeze.content_applied";
+
+/// One collected gem.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Gem {
+    pub zone: String,
+    pub spot: u32,
+    pub content_version: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, distributed::Snapshot)]
+pub struct GemPouch {
+    entity: Entity,
+    gems: u32,
+    last: Option<Gem>,
+}
+
+#[sourced(entity, aggregate_type = "GemPouch", events = "GemPouchEvent")]
+impl GemPouch {
+    #[event("freeze.gem_recorded", version = 1)]
+    fn recorded(&mut self, principal: String, gem: Gem) {
+        if self.entity.id().is_empty() {
+            self.entity.set_id(principal);
+        }
+        self.gems += 1;
+        self.last = Some(gem);
+    }
+}
+
+#[derive(Debug, Deserialize, distributed::CommandInput)]
+pub struct GemInput {
+    pub spot: u32,
+}
+
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Counted {
+    pub count: u32,
+}
+
+struct CollectGem;
+impl<D> PortableCommand<D> for CollectGem
+where
+    D: CausalRouteDependencies<Aggregate = GemPouch> + Send + Sync + 'static,
+{
+    fn install(self, routes: Routes<D>) -> Routes<D> {
+        routes
+            .typed_command(typed_command::<GemInput, Succeeded<Counted>>(GEM_COLLECTED))
+            .handle(handle_gem)
+    }
+}
+
+async fn handle_gem(
+    ctx: &CausalCommandContext<'_, GemPouch>,
+    input: GemInput,
+) -> std::result::Result<PreparedCommand<Succeeded<Counted>>, HandlerError> {
+    let principal = ctx.user_id()?.to_string();
+    let stamp =
+        session_stamp(ctx.session()).ok_or_else(|| rejected("gem facts need a fact stamp"))?;
+    let repo = ctx.repo();
+    let mut pouch = match repo.get(&principal).await? {
+        Some(pouch) => pouch,
+        None => repo.create(),
+    };
+    pouch
+        .recorded(
+            principal,
+            Gem {
+                zone: stamp.zone_id,
+                spot: input.spot,
+                content_version: stamp.content_version,
+            },
+        )
+        .map_err(rejected)?;
+    let count = pouch.gems;
+    repo.commit(pouch)?.succeeded(Counted { count })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentSwitch {
+    pub from: String,
+    pub to: String,
+    pub tick: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, distributed::Snapshot)]
+pub struct ContentLog {
+    entity: Entity,
+    switches: Vec<ContentSwitch>,
+}
+
+#[sourced(entity, aggregate_type = "ContentLog", events = "ContentLogEvent")]
+impl ContentLog {
+    #[event("freeze.content_recorded", version = 1)]
+    fn recorded(&mut self, zone: String, switch: ContentSwitch) {
+        if self.entity.id().is_empty() {
+            self.entity.set_id(zone);
+        }
+        self.switches.push(switch);
+    }
+}
+
+#[derive(Debug, Deserialize, distributed::CommandInput)]
+pub struct ContentInput {
+    pub from: String,
+    pub to: String,
+}
+
+struct ApplyContent;
+impl<D> PortableCommand<D> for ApplyContent
+where
+    D: CausalRouteDependencies<Aggregate = ContentLog> + Send + Sync + 'static,
+{
+    fn install(self, routes: Routes<D>) -> Routes<D> {
+        routes
+            .typed_command(typed_command::<ContentInput, Succeeded<Counted>>(
+                CONTENT_APPLIED,
+            ))
+            .handle(handle_content)
+    }
+}
+
+async fn handle_content(
+    ctx: &CausalCommandContext<'_, ContentLog>,
+    input: ContentInput,
+) -> std::result::Result<PreparedCommand<Succeeded<Counted>>, HandlerError> {
+    let stamp =
+        session_stamp(ctx.session()).ok_or_else(|| rejected("content facts need a fact stamp"))?;
+    let repo = ctx.repo();
+    // The zone's own log: the shard is the stamped zone.
+    let mut log = match repo.get(&stamp.zone_id).await? {
+        Some(log) => log,
+        None => repo.create(),
+    };
+    log.recorded(
+        stamp.zone_id.clone(),
+        ContentSwitch {
+            from: input.from,
+            to: input.to,
+            tick: stamp.tick,
+        },
+    )
+    .map_err(rejected)?;
+    let count = log.switches.len() as u32;
+    repo.commit(log)?.succeeded(Counted { count })
+}
+
+async fn read_pouch(cell: &AggregateCell<GemPouch>) -> std::result::Result<Value, String> {
+    let pouch = cell.load().await.map_err(|error| error.to_string())?;
+    Ok(json!({
+        "gems": pouch.as_ref().map_or(0, |p| p.gems),
+        "last": pouch.and_then(|p| p.last),
+    }))
+}
+
+async fn read_content_log(cell: &AggregateCell<ContentLog>) -> std::result::Result<Value, String> {
+    let log = cell.load().await.map_err(|error| error.to_string())?;
+    Ok(json!({ "switches": log.map(|l| l.switches).unwrap_or_default() }))
+}
+
+#[durable_object]
+pub struct GemPouchCell {
+    cell: AggregateCell<GemPouch>,
+    env: Env,
+}
+
+impl DurableObject for GemPouchCell {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        let cell = AggregateCell::<GemPouch>::from_state_with_snapshots(state, 50)
+            .expect("gem pouch cell identity")
+            .mount(CollectGem)
+            .with_celld_outbox(outbox(&env));
+        Self { cell, env }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        route(&self.env, &self.cell, req, read_pouch, fact_session).await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        alarm(&self.env, &self.cell).await
+    }
+}
+
+#[durable_object]
+pub struct ContentLogCell {
+    cell: AggregateCell<ContentLog>,
+    env: Env,
+}
+
+impl DurableObject for ContentLogCell {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        let cell = AggregateCell::<ContentLog>::from_state_with_snapshots(state, 50)
+            .expect("content log cell identity")
+            .mount(ApplyContent)
+            .with_celld_outbox(outbox(&env));
+        Self { cell, env }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        route(&self.env, &self.cell, req, read_content_log, fact_session).await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        alarm(&self.env, &self.cell).await
+    }
+}
+
 // ---------------------------------------------------------------- Hosting
+
+/// Mob Pit cells run only facts: the principal and the stamp, from the
+/// trusted headers of the authenticated internal path.
+fn fact_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
+    fact_session_from_headers(header)
+}
+
+/// Zone lease cells: the zone server's identity and role (the handlers
+/// require `zone-host`).
+fn zone_host_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
+    let mut session = Session::new();
+    for key in [distributed::USER_ID_KEY, distributed::microsvc::ROLE_KEY] {
+        if let Some(value) = header(key) {
+            session.set(key, value);
+        }
+    }
+    Some(session)
+}
+
+type Sessions = fn(&dyn Fn(&str) -> Option<String>) -> Option<Session>;
 
 async fn dispatch<A>(
     env: &Env,
     cell: &AggregateCell<A>,
     command: &str,
     req: &mut Request,
+    sessions: Sessions,
 ) -> Result<Response>
 where
     A: Aggregate + Send + Sync + 'static,
@@ -306,9 +557,7 @@ where
         }
         _ => return error_response(CellDispatchError::Unauthorized),
     };
-    // Only facts run here: the principal and the stamp, from the trusted
-    // headers of the authenticated internal path.
-    let Some(session) = fact_session_from_headers(header) else {
+    let Some(session) = sessions(&header) else {
         return error_response(CellDispatchError::Forbidden);
     };
     let result = cell
@@ -335,6 +584,7 @@ async fn route<A, F>(
     cell: &AggregateCell<A>,
     mut req: Request,
     read: F,
+    sessions: Sessions,
 ) -> Result<Response>
 where
     A: Aggregate + Send + Sync + 'static,
@@ -357,7 +607,7 @@ where
         },
         (Method::Post, Some(command)) => {
             let command = command.clone();
-            dispatch(env, cell, &command, &mut req).await
+            dispatch(env, cell, &command, &mut req, sessions).await
         }
         _ => json_status(json!({ "error": "not found" }), 404),
     }
@@ -423,7 +673,7 @@ impl DurableObject for CrawlerCell {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_crawler).await
+        route(&self.env, &self.cell, req, read_crawler, fact_session).await
     }
 
     async fn alarm(&self) -> Result<Response> {
@@ -448,7 +698,7 @@ impl DurableObject for CrawlerRosterCell {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_roster).await
+        route(&self.env, &self.cell, req, read_roster, fact_session).await
     }
 
     async fn alarm(&self) -> Result<Response> {
@@ -477,7 +727,7 @@ impl DurableObject for PresenceCell {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_presence).await
+        route(&self.env, &self.cell, req, read_presence, fact_session).await
     }
 
     async fn alarm(&self) -> Result<Response> {
@@ -499,6 +749,80 @@ where
     Response::ok("ok")
 }
 
+#[durable_object]
+pub struct ZoneLeaseCell {
+    cell: AggregateCell<ZoneLease>,
+    env: Env,
+}
+
+impl DurableObject for ZoneLeaseCell {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        // Renewals are internal events: snapshots keep loads short.
+        let cell = mount_zone_lease(
+            AggregateCell::<ZoneLease>::from_state_with_snapshots(state, 50)
+                .expect("zone lease cell identity"),
+        )
+        .with_celld_outbox(outbox(&env));
+        Self { cell, env }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        route(&self.env, &self.cell, req, read_lease, zone_host_session).await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        let wake = self
+            .cell
+            .alarm(&self.env)
+            .await
+            .map_err(|error| Error::RustError(error.to_string()))?;
+        for failed in wake.alarms.failed.iter().chain(&wake.alarms.retried) {
+            worker::console_error!("lease alarm failed: {} {}", failed.code, failed.message);
+        }
+        Response::ok("ok")
+    }
+}
+
+async fn read_lease(cell: &AggregateCell<ZoneLease>) -> std::result::Result<Value, String> {
+    let lease = cell.load().await.map_err(|error| error.to_string())?;
+    Ok(json!({
+        "holder": lease.as_ref().and_then(|l| l.holder().map(str::to_string)),
+        "token": lease.as_ref().map(|l| l.token()),
+    }))
+}
+
+#[durable_object]
+pub struct ZoneStateCell {
+    cell: AggregateCell<ZoneState>,
+    env: Env,
+}
+
+impl DurableObject for ZoneStateCell {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        // Every save replaces the value: snapshot each commit.
+        let cell = mount_zone_state(
+            AggregateCell::<ZoneState>::from_state_with_snapshots(state, 1)
+                .expect("zone state cell identity"),
+        )
+        .with_celld_outbox(outbox(&env));
+        Self { cell, env }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        if let Err(error) = authenticate(&req, &self.env) {
+            return error_response(error);
+        }
+        let bucket = celld_worker::bucket(&self.env, "ZONE_SNAPSHOTS")?;
+        celld_worker::fetch(&self.cell, &bucket, req).await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        alarm(&self.env, &self.cell).await
+    }
+}
+
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
@@ -515,6 +839,10 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Some(CRAWLER_KIND) => "CRAWLER",
         Some(ROSTER_KIND) => "CRAWLER_ROSTER",
         Some(PRESENCE_KIND) => "PRESENCE",
+        Some("gem-pouch") => "GEM_POUCH",
+        Some("content-log") => "CONTENT_LOG",
+        Some("zone-lease") => "ZONE_LEASE",
+        Some("zone-state") => "ZONE_STATE",
         _ => return json_status(json!({ "error": "unknown cell kind" }), 404),
     };
     let Some(shard) = parts.get(1) else {

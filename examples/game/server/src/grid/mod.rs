@@ -55,7 +55,7 @@ use distributed_game::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cluster::{ClusterDemo, ClusterOptions, World};
+use crate::cluster::{ClusterDemo, World};
 use crate::common::{Demo, Guests};
 use world::{MoveInput, Prop, CELL, POS};
 
@@ -626,8 +626,11 @@ impl Demo for GridDemo {
     /// Single host (used by `common::spawn`); `game-demos grid` runs
     /// [`crate::cluster::run_cluster`] instead.
     fn server(config: ServerConfig, guests: Guests) -> GameServer<GridZone> {
-        let options = ClusterOptions::single("local", std::time::Duration::from_secs(4));
-        let world = crate::cluster::World::standalone::<Self>(&options, guests);
+        let world = crate::cluster::World::standalone::<Self>(
+            "local",
+            std::time::Duration::from_secs(4),
+            guests,
+        );
         Self::cluster_server(config, &world)
     }
 }

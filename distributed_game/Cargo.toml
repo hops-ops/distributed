@@ -15,10 +15,13 @@ default = []
 # Tokio-driven fact worker (`spawn_fact_worker`). Core stays runtime-agnostic.
 runtime = ["dep:tokio"]
 # Adapter that commits facts into a `distributed` AggregateCell.
-cell = ["dep:distributed", "dep:sha2"]
+cell = ["dep:distributed", "dep:sha2", "dep:base64"]
 # `celld::CelldFactSink`: a zone server's facts sent to celld cells over the
 # internal HTTP path (routes by command; stable command ids; no local store).
 celld = ["cell", "dep:reqwest", "dep:uuid"]
+# celld worker glue (wasm32 Durable Objects): `world::zone_state::worker`,
+# the zone-state HTTP surface over a cell and an R2 bucket binding.
+workers-rs = ["cell", "dep:worker", "distributed/workers-rs"]
 # Per-zone Prometheus metrics (dependency-free text exposition).
 metrics = []
 # Load-test bots (library + `game-bots` binary).
@@ -27,8 +30,6 @@ bots = ["net", "dep:tokio-tungstenite", "dep:futures-util", "tokio/rt-multi-thre
 net = ["runtime", "metrics", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros", "tokio/io-util"]
 # `world::FencedLeaseOwnership`: zone ownership over `distributed::lease`.
 lease = ["dep:distributed"]
-# `world::SqliteZoneStateStore`: native SQLite hibernation snapshots.
-sqlite = ["dep:rusqlite"]
 
 [dependencies]
 distributed_game_macros = { version = "0.1.0", path = "../distributed_game_macros" }
@@ -42,11 +43,12 @@ sha2 = { version = "0.10", optional = true }
 base64 = { version = "0.23", optional = true }
 tokio-tungstenite = { version = "0.30", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
-rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 uuid = { version = "1", features = ["v7"], optional = true }
+worker = { version = "0.8", optional = true }
 
 [dev-dependencies]
+base64 = "0.23"
 trybuild = "=1.0.120"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.30"
@@ -79,9 +81,19 @@ path = "tests/zone_lease/main.rs"
 required-features = ["cell"]
 
 [[test]]
+name = "zone_state"
+path = "tests/zone_state/main.rs"
+required-features = ["cell"]
+
+[[test]]
 name = "celld_zone_lease"
 path = "tests/celld_zone_lease/main.rs"
 required-features = ["celld", "runtime", "net"]
+
+[[test]]
+name = "celld_zone_state"
+path = "tests/celld_zone_state/main.rs"
+required-features = ["celld", "runtime"]
 
 [[test]]
 name = "celld_facts"
@@ -106,7 +118,7 @@ required-features = ["cell", "runtime"]
 [[test]]
 name = "world"
 path = "tests/world/main.rs"
-required-features = ["net", "lease", "sqlite"]
+required-features = ["net", "lease", "celld"]
 
 [[example]]
 name = "echo_arena"

@@ -79,7 +79,9 @@ impl Celld {
     /// celld on PATH, or no esbuild for its bundler).
     pub fn start(&mut self) -> Result<(), String> {
         self.generation += 1;
-        let binary = std::env::var("CELLD").unwrap_or_else(|_| "celld".into());
+        let binary = std::env::var("CELLD_BIN")
+            .or_else(|_| std::env::var("CELLD"))
+            .unwrap_or_else(|_| "celld".into());
         let help = Command::new(&binary)
             .args(["dev", "--help"])
             .output()

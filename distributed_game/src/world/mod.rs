@@ -7,7 +7,8 @@
 //!   the same zone ([`LocalOwnership`]; `FencedLeaseOwnership` over
 //!   `distributed::lease` with the `lease` feature).
 //! - [`state`]: [`ZoneStateStore`] for hibernated zone state
-//!   ([`MemoryZoneStateStore`]; `SqliteZoneStateStore` with `sqlite`).
+//!   ([`MemoryZoneStateStore`] for unit tests; on celld,
+//!   `celld::CellZoneStateStore` over [`zone_state`] cells).
 //! - [`topology`]: [`ZoneTopology`] parent links (province > city > borough
 //!   > neighborhood) and [`ChildEvent`] tier-up propagation.
 //! - [`allocation`]: [`ZoneAllocation`] records written by the service that
@@ -26,6 +27,9 @@ pub mod topology;
 // The `sourced` and `Snapshot` derives generate undocumented public items.
 #[allow(missing_docs)]
 pub mod zone_lease;
+#[cfg(feature = "cell")]
+#[allow(missing_docs)]
+pub mod zone_state;
 
 pub use crate::facts::BoxFuture;
 pub use allocation::{
@@ -39,7 +43,7 @@ pub use ownership::ownership_conformance;
 #[cfg(feature = "lease")]
 pub use ownership::FencedLeaseOwnership;
 pub use ownership::{LocalOwnership, OwnershipError, ZoneClaim, ZoneOwnership};
-#[cfg(feature = "sqlite")]
-pub use state::SqliteZoneStateStore;
+#[doc(hidden)]
+pub use state::state_store_conformance;
 pub use state::{MemoryZoneStateStore, StateError, StoredZoneState, ZoneStateStore};
 pub use topology::{ChildEvent, DottedTopology, FlatTopology, ZoneTopology};

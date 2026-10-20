@@ -17,6 +17,7 @@ import test from 'node:test';
 
 import { createFreezeClient, FreezeAdmin, ZONES } from '../src/freeze/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
+import { startCelld } from './helpers/celld.mjs';
 import { memoryStorage, sleep, startDemo, until } from './helpers/demo-server.mjs';
 
 const ADMIN = 'freeze-test-admin';
@@ -45,7 +46,15 @@ async function walk(p, [x, y], done, timeoutMs = 15_000) {
 }
 
 test('world barrier across two hosts: rolling + safe room, hard reload, aborted rollout', { timeout: 600_000 }, async (t) => {
-	const server = await startDemo('freeze', { env: { DG_DEMO_ADMIN_SECRET: ADMIN, DG_FREEZE_STAGE_MS: '700' } });
+	// Both Freeze hosts settle their facts in celld cells.
+	const celld = await startCelld();
+	let server;
+	try {
+		server = await startDemo('freeze', { env: { ...celld.env, DG_DEMO_ADMIN_SECRET: ADMIN, DG_FREEZE_STAGE_MS: '700' } });
+	} catch (error) {
+		await celld.stop();
+		throw error;
+	}
 	const base = server.httpUrl;
 	const admin = new FreezeAdmin(base, ADMIN);
 	const players = [];
@@ -123,10 +132,18 @@ test('world barrier across two hosts: rolling + safe room, hard reload, aborted 
 		assert.deepEqual(bo.reloads.at(-1), { zone: ZONES.hub, version: 'v3' });
 		assert.equal(ana.pack().name, 'Bloom Update');
 
-		// Facts on both hosts carry the version they were produced under.
-		const world = await admin.world();
+		// Facts on both hosts carry the version they were produced under
+		// (listed once they settled in their celld cells).
+		const settledFacts = (world) => world.hosts.flatMap((h) => (h.facts ?? []).map((f) => ({ host: h.host, ...f })));
+		let world = await admin.world();
+		for (const deadline = Date.now() + 10_000; Date.now() < deadline; ) {
+			const applied = settledFacts(world).filter((f) => f.command === 'freeze.content_applied' && f.stamp.contentVersion === 'v3');
+			if (applied.length >= 3) break;
+			await sleep(100);
+			world = await admin.world();
+		}
 		assert.equal(world.version, 'v3');
-		const facts = world.hosts.flatMap((h) => (h.facts ?? []).map((f) => ({ host: h.host, ...f })));
+		const facts = settledFacts(world);
 		for (const [host, zone] of [
 			['alpha', ZONES.hub],
 			['beta', ZONES.ember]
@@ -161,5 +178,6 @@ test('world barrier across two hosts: rolling + safe room, hard reload, aborted 
 	} finally {
 		for (const p of players) p.client.close();
 		await server.stop();
+		await celld.stop();
 	}
 });

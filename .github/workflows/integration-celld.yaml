@@ -52,7 +52,8 @@ jobs:
           sudo apt-get update && sudo apt-get install -y sqlite3
           npm install -g esbuild
           cargo install worker-build --locked
-          curl -fsSL https://celld.dev/install.sh | sh
+          # Pinned: the zone-state R2 path and the fact routing are proven on it.
+          curl -fsSL https://celld.dev/install.sh | CELLD_VERSION=v0.6.2 sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Build isolated fault-probe Worker
         working-directory: tests/celld/worker
@@ -75,6 +76,12 @@ jobs:
         env:
           CELLD_FACTS_REQUIRED: "1"
         run: cargo test -p distributed_game --features celld,runtime,net --test celld_zone_lease
+      - name: Zone hibernation state in celld cells (inline + R2 snapshots, crash, GameServer)
+        env:
+          CELLD_FACTS_REQUIRED: "1"
+        run: |
+          cargo test -p distributed_game --features celld,runtime --test celld_zone_state
+          cargo test -p distributed_game --features celld,net,lease --test world
       - name: Retain storage proof results and logs
         if: always()
         uses: actions/upload-artifact@v4

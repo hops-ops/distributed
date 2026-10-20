@@ -8,6 +8,7 @@
 //! line in `main.rs`; everything else (ticket endpoint, NetSim control,
 //! `/metrics`, graceful shutdown) comes from here.
 
+pub mod celld;
 pub mod dev;
 mod guests;
 
@@ -18,6 +19,7 @@ use axum::Router;
 use distributed_game::net::{GameServer, NetSim, ServerConfig, TicketKey};
 use distributed_game::Zone;
 
+pub use celld::{CelldOptions, CELLD_URL_ENV};
 pub use guests::{random_hex, Guests};
 
 /// One playable demo hosted by `game-demos <NAME>`.

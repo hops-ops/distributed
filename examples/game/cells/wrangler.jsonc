@@ -1,4 +1,4 @@
-// Mob Pit cells for `celld dev` (and `celld deploy`). The launcher
+// The game demos' cells for `celld dev` (and `celld deploy`). The launcher
 // (`examples/game/run.sh`, the test harnesses) writes `.dev.vars` beside a
 // copy of this file with DISTRIBUTED_INTERNAL_SECRET and
 // CELLD_QUEUE_RELAY_URL (the zone server's `/internal/celld-queue/relay`).
@@ -10,11 +10,21 @@
     "bindings": [
       { "name": "CRAWLER", "class_name": "CrawlerCell" },
       { "name": "CRAWLER_ROSTER", "class_name": "CrawlerRosterCell" },
-      { "name": "PRESENCE", "class_name": "PresenceCell" }
+      { "name": "PRESENCE", "class_name": "PresenceCell" },
+      { "name": "ZONE_LEASE", "class_name": "ZoneLeaseCell" },
+      { "name": "ZONE_STATE", "class_name": "ZoneStateCell" },
+      { "name": "GEM_POUCH", "class_name": "GemPouchCell" },
+      { "name": "CONTENT_LOG", "class_name": "ContentLogCell" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["CrawlerCell", "CrawlerRosterCell", "PresenceCell"] }
+    { "tag": "v1", "new_sqlite_classes": ["CrawlerCell", "CrawlerRosterCell", "PresenceCell"] },
+    { "tag": "v2", "new_sqlite_classes": ["ZoneLeaseCell", "ZoneStateCell"] },
+    { "tag": "v3", "new_sqlite_classes": ["GemPouchCell", "ContentLogCell"] }
+  ],
+  // Hibernation snapshots above the inline limit (celld's object storage).
+  "r2_buckets": [
+    { "binding": "ZONE_SNAPSHOTS", "bucket_name": "zone-snapshots" }
   ],
   "queues": {
     "producers": [

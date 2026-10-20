@@ -16,7 +16,6 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use distributed_game::net::GameServer;
-use distributed_game::world::ZoneStateStore;
 use distributed_game::Tier;
 use serde_json::{json, Value};
 
@@ -58,9 +57,12 @@ fn tier_name(tier: Tier) -> &'static str {
     }
 }
 
-/// Facts about this host's cells among `zones`, keyed by zone id.
+/// Facts about this host's cells among `zones`, keyed by zone id. A cell
+/// that is not active is "hibernated" when celld holds a snapshot of it
+/// (the lookups run concurrently, bounded to 400 ms; "unknown" after that).
 async fn local_cells(state: &MapState, zones: &[String]) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
+    let mut lookups = tokio::task::JoinSet::new();
     for zone in zones {
         if state.world.owner(zone) != state.world.host.id || world::parse_zone(zone).is_none() {
             continue;
@@ -76,16 +78,47 @@ async fn local_cells(state: &MapState, zones: &[String]) -> serde_json::Map<Stri
         } else {
             None
         };
-        let value = match live {
-            Some((tier, players, observers)) => json!({
-                "state": "active", "tier": tier, "players": players, "observers": observers
-            }),
-            None => {
-                let stored = state.world.state.load(zone).ok().flatten();
-                json!({ "state": if stored.is_some() { "hibernated" } else { "cold" } })
+        match live {
+            Some((tier, players, observers)) => {
+                out.insert(
+                    zone.clone(),
+                    json!({
+                        "state": "active", "tier": tier, "players": players, "observers": observers
+                    }),
+                );
             }
-        };
-        out.insert(zone.clone(), value);
+            None => {
+                let store = state.world.state.clone();
+                let zone = zone.clone();
+                lookups.spawn(async move {
+                    let stored = store.load(&zone).await.ok().flatten();
+                    (zone, stored.is_some())
+                });
+            }
+        }
+    }
+    let mut pending: std::collections::BTreeSet<String> = zones
+        .iter()
+        .filter(|zone| !out.contains_key(zone.as_str()))
+        .filter(|zone| state.world.owner(zone) == state.world.host.id)
+        .filter(|zone| world::parse_zone(zone).is_some())
+        .cloned()
+        .collect();
+    // Bounded, so a peer asking for our cells gets an answer in time (a
+    // cold celld cell can take a while to activate); late ones are unknown.
+    let _ = tokio::time::timeout(Duration::from_millis(400), async {
+        while let Some(Ok((zone, stored))) = lookups.join_next().await {
+            pending.remove(&zone);
+            out.insert(
+                zone,
+                json!({ "state": if stored { "hibernated" } else { "cold" } }),
+            );
+        }
+    })
+    .await;
+    lookups.abort_all();
+    for zone in pending {
+        out.insert(zone, json!({ "state": "unknown" }));
     }
     out
 }

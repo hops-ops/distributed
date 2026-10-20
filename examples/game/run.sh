@@ -32,9 +32,13 @@
 # uses GAME_DEMOS_PORT, default 2967 there, and its read-model service
 # MOBPIT_SERVICE_PORT, default GAME_DEMOS_PORT + 2).
 #
-# celld: Mob Pit's durable cells (examples/game/cells) run on celld, never
-# natively. CELLD_BIN names the binary (default: `celld` on PATH; 0.6.2 or
-# newer is required), CELLD_PORT its port (default GAME_DEMOS_PORT + 3),
+# celld: the demos' durable cells (examples/game/cells: Mob Pit's Crawler,
+# roster and presence cells, The Freeze's gem and content cells, every
+# multi-host demo's zone leases and hibernation snapshots) run on celld,
+# never natively; state persists in .data/<demo>/celld (Mob Pit:
+# MOBPIT_DATA_DIR/celld). CELLD_BIN names the binary (default: `celld` on
+# PATH; 0.6.2 or newer is required), CELLD_PORT its port (default
+# GAME_DEMOS_PORT + 3; cluster demos GAME_DEMOS_PORT + 4),
 # CELLD_ESBUILD its bundler (default: the client's esbuild). The worker is
 # built with worker-build (`cargo install worker-build --locked`).
 set -euo pipefail
@@ -48,8 +52,9 @@ BIN="$SERVER/target/debug/game-demos"
 SERVICE_BIN="$SERVER/target/debug/mobpit-service"
 CELLS="$HERE/cells"
 DEMOS=(arena mobpit leaderboard gallery freeze grid ripple)
-# Demos whose durable state lives in celld cells.
-CELLD_DEMOS=(mobpit leaderboard)
+# Single-process demos whose durable state lives in celld cells (the
+# multi-host ones always run on celld too: zone leases and hibernation).
+CELLD_DEMOS=(mobpit leaderboard freeze)
 CELLD_MIN_VERSION="0.6.2"
 export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
 # Multi-host demos: `game-demos <demo> --host-id A|B --peer …`.
@@ -159,7 +164,7 @@ start_celld() {
 	DISTRIBUTED_INTERNAL_SECRET="$(cat "$project/internal-secret")"
 	printf 'DISTRIBUTED_INTERNAL_SECRET=%s\nCELLD_QUEUE_RELAY_URL=http://127.0.0.1:%s/internal/celld-queue/relay\n' \
 		"$DISTRIBUTED_INTERNAL_SECRET" "$relay_port" >"$project/.dev.vars"
-	log "starting celld dev on :$port ($("$CELLD_BIN" --version 2>/dev/null | tail -1); state in $project/.celld/dev)"
+	log "starting celld dev on :$port ($("$CELLD_BIN" --version 2>/dev/null | grep '^celld ' | head -1); state in $project/.celld/dev)"
 	RUST_LOG=warn "$CELLD_BIN" dev "$project" --host 127.0.0.1 --port "$port" --no-watch --logs >"$project/celld.log" 2>&1 &
 	CELLD_PID=$!
 	CELLD_URL="http://127.0.0.1:$port"
@@ -246,7 +251,9 @@ run_demo() {
 
 	CELLD_PID=""
 	if [[ " ${CELLD_DEMOS[*]} " == *" $demo "* ]]; then
-		start_celld "$MOBPIT_DATA_DIR/celld" "${CELLD_PORT:-$((port + 3))}" "$port"
+		local project="$HERE/.data/$demo/celld"
+		[[ "$demo" == mobpit || "$demo" == leaderboard ]] && project="$MOBPIT_DATA_DIR/celld"
+		start_celld "$project" "${CELLD_PORT:-$((port + 3))}" "$port"
 	fi
 	local log_file
 	log_file="$(mktemp -t game-demos.XXXXXX)"
@@ -293,24 +300,27 @@ run_cluster() {
 	ensure_server
 	ensure_wasm
 
+	# Zone leases and hibernation snapshots live in celld (shared by both
+	# hosts); its state persists in .data/<demo>/celld.
+	start_celld "$HERE/.data/$demo/celld" "${CELLD_PORT:-$((port_a + 4))}" "$port_a"
 	local dir secret
 	dir="$(mktemp -d "${TMPDIR:-/tmp}/game-demos-$demo.XXXXXX")"
 	# Both hosts must share the ticket secret (and derive the admin secret).
 	secret="${DISTRIBUTED_GAME_SECRET:-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')}"
 	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_a" --host-id A \
-		--peer "B=127.0.0.1:$port_b" --state-dir "$dir" >"$dir/A.log" 2>&1 &
+		--peer "B=127.0.0.1:$port_b" >"$dir/A.log" 2>&1 &
 	local pid_a=$!
 	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_b" --host-id B \
-		--peer "A=127.0.0.1:$port_a" --state-dir "$dir" >"$dir/B.log" 2>&1 &
+		--peer "A=127.0.0.1:$port_a" >"$dir/B.log" 2>&1 &
 	local pid_b=$!
-	trap 'kill "$pid_a" "$pid_b" 2>/dev/null || true; wait "$pid_a" "$pid_b" 2>/dev/null || true; rm -rf "$dir"' EXIT INT TERM
+	trap 'kill "$pid_a" "$pid_b" 2>/dev/null || true; wait "$pid_a" "$pid_b" 2>/dev/null || true; kill_tree "$CELLD_PID"; rm -rf "$dir"' EXIT INT TERM
 	wait_listening "$dir/A.log" "$pid_a" "game-demos $demo host A"
 	wait_listening "$dir/B.log" "$pid_b" "game-demos $demo host B"
 	sed -n '2p' "$dir/A.log"
 	sed -n '2p' "$dir/B.log"
 	echo
 	log "open  http://localhost:$client_port/$demo/   (hosts A :$port_a, B :$port_b, dev routes ON — local only)"
-	log "snapshots in $dir (removed on exit)"
+	log "zone leases and hibernation snapshots in celld ($CELLD_URL); host logs in $dir (removed on exit)"
 	echo
 	cd "$CLIENT"
 	GAME_DEMOS_SERVER="http://127.0.0.1:$port_a" GAME_DEMOS_CLIENT_PORT="$client_port" npx vite

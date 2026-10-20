@@ -7,12 +7,17 @@
       { "name": "KILLS", "class_name": "KillsCell" },
       { "name": "MATCH", "class_name": "MatchCell" },
       { "name": "PRESENCE", "class_name": "PresenceCell" },
-      { "name": "ZONE_LEASE", "class_name": "ZoneLeaseCell" }
+      { "name": "ZONE_LEASE", "class_name": "ZoneLeaseCell" },
+      { "name": "ZONE_STATE", "class_name": "ZoneStateCell" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["KillsCell", "MatchCell", "PresenceCell"] },
-    { "tag": "v2", "new_sqlite_classes": ["ZoneLeaseCell"] }
+    { "tag": "v2", "new_sqlite_classes": ["ZoneLeaseCell"] },
+    { "tag": "v3", "new_sqlite_classes": ["ZoneStateCell"] }
+  ],
+  "r2_buckets": [
+    { "binding": "ZONE_SNAPSHOTS", "bucket_name": "zone-snapshots" }
   ],
   "queues": {
     "producers": [

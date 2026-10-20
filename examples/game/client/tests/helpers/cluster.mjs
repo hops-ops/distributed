@@ -1,28 +1,17 @@
 /**
  * Start a multi-host demo (`game-demos <demo> --host-id … --peer …`) for a
  * Node test: one process per host on free ephemeral ports, a shared ticket
- * secret, dev routes on. Uses GAME_DEMOS_BIN when set, else `cargo run`.
+ * secret, dev routes on, and one private `celld dev` (zone leases and
+ * hibernation snapshots in `examples/game/cells`). Uses GAME_DEMOS_BIN when
+ * set, else `cargo run`.
  */
 import { spawn } from 'node:child_process';
-import { createServer, Socket } from 'node:net';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { Socket } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
-const SERVER_DIR = fileURLToPath(new URL('../../../server/', import.meta.url));
+import { freePort, startCelld } from './celld.mjs';
 
-function freePort() {
-	return new Promise((resolve, reject) => {
-		const server = createServer();
-		server.unref();
-		server.on('error', reject);
-		server.listen(0, '127.0.0.1', () => {
-			const { port } = server.address();
-			server.close(() => resolve(port));
-		});
-	});
-}
+const SERVER_DIR = fileURLToPath(new URL('../../../server/', import.meta.url));
 
 /**
  * @param {string} demo
@@ -31,7 +20,7 @@ function freePort() {
 export async function startCluster(demo, { hosts = ['A', 'B'], hibernateAfterMs = 4000, env = {} } = {}) {
 	const ports = [];
 	for (const _ of hosts) ports.push(await freePort());
-	const stateDir = mkdtempSync(join(tmpdir(), `game-demos-${demo}-`));
+	const celld = await startCelld();
 	const secret = `test-secret-${process.pid}-${Date.now()}`;
 	const bin = process.env.GAME_DEMOS_BIN;
 	const children = [];
@@ -40,11 +29,11 @@ export async function startCluster(demo, { hosts = ['A', 'B'], hibernateAfterMs 
 		await Promise.all(
 			hosts.map(async (id, i) => {
 				const args = [demo, '--dev', '--port', String(ports[i]), '--host-id', id, '--secret', secret];
-				args.push('--state-dir', stateDir, '--hibernate-after-ms', String(hibernateAfterMs));
+				args.push('--hibernate-after-ms', String(hibernateAfterMs));
 				hosts.forEach((peer, j) => {
 					if (j !== i) args.push('--peer', `${peer}=127.0.0.1:${ports[j]}`);
 				});
-				const options = { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'inherit'] };
+				const options = { env: { ...process.env, ...celld.env, ...env }, stdio: ['ignore', 'pipe', 'inherit'] };
 				const child = bin
 					? spawn(bin, args, options)
 					: spawn('cargo', ['run', '-q', '--', ...args], { ...options, cwd: SERVER_DIR });
@@ -62,7 +51,7 @@ export async function startCluster(demo, { hosts = ['A', 'B'], hibernateAfterMs 
 		);
 	} catch (error) {
 		for (const child of children) child.kill('SIGKILL');
-		rmSync(stateDir, { recursive: true, force: true });
+		await celld.stop();
 		throw error;
 	}
 	return {
@@ -81,7 +70,7 @@ export async function startCluster(demo, { hosts = ['A', 'B'], hibernateAfterMs 
 					clearTimeout(timer);
 				})
 			);
-			rmSync(stateDir, { recursive: true, force: true });
+			await celld.stop();
 			// Node's WebSocket (undici) keeps a socket whose closing handshake
 			// the server started (Redirect) paused until a ~60 s timeout, which
 			// would hold the test process open: drop what still points at us.
