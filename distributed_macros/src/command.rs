@@ -176,6 +176,17 @@ pub fn expand(
     item: proc_macro2::TokenStream,
 ) -> syn::Result<TokenStream> {
     let framework = crate::shared::framework_path()?;
+    if let Ok(name) = syn::parse2::<LitStr>(
+        attr.clone()
+            .into_iter()
+            .take(1)
+            .collect::<proc_macro2::TokenStream>(),
+    ) {
+        return Err(syn::Error::new(
+            name.span(),
+            "`#[command(\"aggregate.verb\", ..)]` on an aggregate method must be inside a `#[sourced]` impl (the handler-function form is `#[command(id = \"..\", ..)]`)",
+        ));
+    }
     let args = syn::parse2::<CommandArgs>(attr)?;
     let function = syn::parse2::<ItemFn>(item)?;
     let id = args.id.ok_or_else(|| {

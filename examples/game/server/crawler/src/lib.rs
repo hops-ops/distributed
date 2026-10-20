@@ -2,12 +2,16 @@
 //! its own native SQLite cell (`distributed` feature `cell-sqlite`, opened by
 //! `game_demos`).
 //!
-//! The only command is [`RECORD_KILL`]. It is dispatched by the zone's fact
+//! The only command is [`RECORD_KILL`], declared on the aggregate method
+//! [`Crawler::record_kill`] with `#[command]` (which generates the
+//! [`RecordKill`] mount and its handler). It is dispatched by the zone's fact
 //! worker through `distributed_game::cell::CellFactSink`, never by a client:
 //!
 //! - the **principal** comes from the trusted server-built session
-//!   (`x-user-id`, bound by the host from the player's verified ticket); the
-//!   input has no identity field and unknown fields are rejected;
+//!   (`x-user-id`, bound by the host from the player's verified ticket) into
+//!   the method's `#[principal]` parameter; the input has no identity field
+//!   (a field named like it would not compile) and unknown fields are
+//!   rejected;
 //! - the **XP amount** is decided here from the mob tier ([`xp_for_tier`]);
 //!   the zone only reports which mob died;
 //! - the command id is derived from the fact key, so a retry or re-emission
@@ -19,18 +23,13 @@
 //!   that outbox onto a bus and the read-model service (`mobpit_service`)
 //!   projects it into the `player_stats` table behind GraphQL `@live`.
 
-use distributed::command::{typed_command, PreparedCommand, Succeeded};
-use distributed::microsvc::{
-    CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
-};
 use distributed::{sourced, DomainState, Entity};
 use serde::{Deserialize, Serialize};
-use std::time::UNIX_EPOCH;
 
 /// Aggregate type (cell instance names are `Crawler:{principal}`).
 pub const AGGREGATE_TYPE: &str = "Crawler";
 /// Command dispatched for every `MobKilled` fact.
-pub const RECORD_KILL: &str = "crawler.record_kill";
+pub const RECORD_KILL: &str = RecordKill::COMMAND;
 /// Event recorded by [`RECORD_KILL`].
 pub const MOB_KILLED_EVENT: &str = "crawler.mob_killed";
 
@@ -110,6 +109,50 @@ impl From<&Crawler> for CrawlerState {
     domain_state = CrawlerState
 )]
 impl Crawler {
+    /// Credit a kill to the session principal: XP from the mob tier, the
+    /// name capped at 16 characters. The receipt carries the recorded
+    /// event's stream position (the leaderboard occurrence).
+    ///
+    /// The cell is the principal's own shard, so a mismatched principal
+    /// cannot load it either. Event, ledger receipt, snapshot and the outbox
+    /// row of the domain event commit in one cell transaction.
+    #[command(
+        "crawler.record_kill",
+        shard = principal,
+        load = or_create,
+        outcome = succeeded
+    )]
+    pub fn record_kill(
+        &mut self,
+        #[principal] principal: &str,
+        input: RecordKillInput,
+    ) -> Result<KillReceipt, String> {
+        let xp =
+            xp_for_tier(input.tier).ok_or_else(|| format!("unknown mob tier {}", input.tier))?;
+        let name: String = input.name.chars().take(16).collect();
+        self.mob_killed(
+            principal.to_string(),
+            name.clone(),
+            input.mob.clone(),
+            input.tier,
+            xp,
+        )
+        .map_err(|e| e.to_string())?;
+        let recorded = self.entity.last_recorded().ok_or("no event recorded")?;
+        Ok(KillReceipt {
+            crawler: principal.to_string(),
+            name,
+            mob: input.mob,
+            tier: input.tier,
+            xp,
+            total_xp: self.xp,
+            kills: self.kills,
+            level: self.level,
+            sequence: recorded.sequence,
+            at_ms: recorded.unix_ms(),
+        })
+    }
+
     #[event("crawler.mob_killed", version = 1, domain)]
     fn mob_killed(&mut self, id: String, name: String, mob: String, tier: u8, xp: u32) {
         let _ = (mob, tier);
@@ -139,8 +182,8 @@ pub type MobKilledArgs = (String, String, String, u8, u32);
 
 /// [`RECORD_KILL`] input. No principal, no XP: both are server-decided.
 ///
-/// `FactCommand` binds it to [`RECORD_KILL`] (the name [`RecordKill`]
-/// mounts it under), so the zone emits it typed — `ctx.emit_keyed(killer,
+/// `FactCommand` binds it to [`RECORD_KILL`] (the name the generated
+/// [`RecordKill`] mounts it under), so the zone emits it typed — `ctx.emit_keyed(killer,
 /// RecordKillInput { .. }, &[mob, generation])` — and the derive rejects
 /// identity or reward fields at compile time.
 #[derive(
@@ -179,78 +222,6 @@ pub struct KillReceipt {
     pub sequence: u64,
     /// Event time (Unix ms).
     pub at_ms: u64,
-}
-
-/// Mounts [`RECORD_KILL`] on a `Crawler` cell.
-pub struct RecordKill;
-
-impl<D> PortableCommand<D> for RecordKill
-where
-    D: CausalRouteDependencies<Aggregate = Crawler> + Send + Sync + 'static,
-{
-    fn install(self, routes: Routes<D>) -> Routes<D> {
-        routes
-            .typed_command(typed_command::<RecordKillInput, Succeeded<KillReceipt>>(
-                RECORD_KILL,
-            ))
-            .guarded(
-                |ctx: &CausalCommandContext<'_, Crawler>| ctx.session().user_id().is_some(),
-                handle_record_kill,
-            )
-    }
-}
-
-async fn handle_record_kill(
-    ctx: &CausalCommandContext<'_, Crawler>,
-    input: RecordKillInput,
-) -> Result<PreparedCommand<Succeeded<KillReceipt>>, HandlerError> {
-    // Identity: the trusted session only. The cell is the principal's own
-    // shard, so a mismatched principal cannot load it either.
-    let principal = ctx.session().user_id().unwrap_or_default().to_string();
-    let xp = xp_for_tier(input.tier)
-        .ok_or_else(|| HandlerError::Rejected(format!("unknown mob tier {}", input.tier)))?;
-    let name: String = input.name.chars().take(16).collect();
-    let repo = ctx.repo();
-    let mut crawler = match repo.get(&principal).await? {
-        Some(crawler) => crawler,
-        None => repo.create(),
-    };
-    crawler
-        .mob_killed(
-            principal.clone(),
-            name.clone(),
-            input.mob.clone(),
-            input.tier,
-            xp,
-        )
-        .map_err(|e| HandlerError::Rejected(e.to_string()))?;
-    let (sequence, at_ms) = crawler
-        .entity
-        .events()
-        .last()
-        .map(|record| {
-            let at = record
-                .timestamp
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64);
-            (record.sequence, at)
-        })
-        .unwrap_or_default();
-    let receipt = KillReceipt {
-        crawler: principal,
-        name,
-        mob: input.mob,
-        tier: input.tier,
-        xp,
-        total_xp: crawler.xp,
-        kills: crawler.kills,
-        level: crawler.level,
-        sequence,
-        at_ms,
-    };
-    // Event, ledger receipt, snapshot and the outbox row of the domain event
-    // commit in one cell transaction.
-    repo.publish_events().commit(crawler)?.succeeded(receipt)
 }
 
 #[cfg(test)]

@@ -373,9 +373,28 @@ perform online shadow swaps, or make several independent projections one
 transaction. Keep services stopped if a multi-projection maintenance run fails;
 capture fresh inventories and rerun before resuming them.
 
-Handlers stay thin: most Todo commands are `portable_command!` — shard,
-invoke one domain method, commit Eventual. `todo.create` keeps a `handle:`
-escape hatch when the body needs extra checks.
+Handlers stay thin. The shortest form is the command on the aggregate
+method itself: `#[command]` inside the `#[sourced]` impl generates the
+handler and the portable mount (see [Command contracts](#command-contracts)):
+
+```rust,ignore
+#[command(
+    "todo.complete",
+    shard = todo_id,
+    load = required,
+    input = TodoCompleteInput,
+    outcome = Eventual<TodoStatusPayload>,
+    payload = TodoStatusPayload::from_todo,
+    roles = ["user", "admin"],
+    field = "todos_complete",
+)]
+pub fn complete(&mut self, #[principal] owner_id: &str) -> Result<(), TodoError> { .. }
+```
+
+The Todo playground spells the same registration out with
+`portable_command!` — shard, invoke one domain method, commit Eventual.
+`todo.create` keeps a `handle:` escape hatch when the body needs extra
+checks.
 
 ```rust,ignore
 portable_command! {
@@ -1603,7 +1622,64 @@ run_source(service, source, RunOptions::idempotent()).await?;
 
 ## Command contracts
 
-Command semantics live in `distributed::command`, independently of the query
+**Commands on the aggregate.** Most commands are one aggregate method:
+take the actor from the session, load (or create) the aggregate, call the
+method, reject on its error, commit with a payload. Write the method and
+mark it `#[command]` inside the `#[sourced]` impl; the macro generates the
+handler and the portable mount (`pub struct RecordKill`, mounted with
+`routes.mount(RecordKill)` or `AggregateCell::mount(RecordKill)`):
+
+```rust,ignore
+#[sourced(entity, aggregate_type = "Crawler", events = "CrawlerEvent", domain_state = CrawlerState)]
+impl Crawler {
+    #[command("crawler.record_kill", shard = principal, load = or_create, outcome = succeeded)]
+    pub fn record_kill(
+        &mut self,
+        #[principal] principal: &str,
+        input: RecordKillInput,
+    ) -> Result<KillReceipt, String> {
+        let xp = xp_for_tier(input.tier).ok_or("unknown tier")?;
+        self.mob_killed(principal.into(), input.name, input.mob, input.tier, xp)
+            .map_err(|e| e.to_string())?;
+        // Receipt helper: the recorded event's stream position and time.
+        let recorded = self.entity.last_recorded().ok_or("nothing recorded")?;
+        Ok(KillReceipt { sequence: recorded.sequence, at_ms: recorded.unix_ms(), .. })
+    }
+
+    #[event("crawler.mob_killed", version = 1, domain)]
+    fn mob_killed(&mut self, id: String, name: String, mob: String, tier: u8, xp: u32) { .. }
+}
+```
+
+- **Principal.** Exactly one parameter is `#[principal]` (`&str` or
+  `String`); the generated handler fills it from the verified session
+  (`x-user-id`, else `Unauthorized`), never from the input. It is
+  mandatory, and an input whose field (Rust or serialized name) is named
+  like it does not compile.
+- **Input.** The other parameter is the `CommandInput` type; or, with
+  `input = Type`, the other parameters are that input's fields by name
+  (`&str` parameters borrow), so a domain method keeps plain arguments.
+- **`shard`** is an input field (also exposed as `RecordKill::shard`) or
+  the principal parameter; **`load`** is `required` (`NotFound` when
+  missing), `or_create` or `create`.
+- **`outcome`** is `succeeded` / `eventual` (the method's `Ok` value is
+  the payload) or `Succeeded<P>` / `Eventual<P>` with `payload = f`
+  (`fn(&Aggregate) -> P`). The method's error (`Display`) becomes
+  `Rejected`. Captured domain events are always published with the commit.
+- Optional: `roles = ["player"]`, `guard = f`, `field = "graphql_field"`,
+  `transition = path` (the emitted-event witness; by default the
+  `domain_commands::*` type `#[sourced]` derives for the method),
+  `mount = Name` (the struct name, default from the command name's last
+  segment).
+
+The generated registration is exactly the hand-written one
+(`command_transition::<domain_commands::X, I, K>(name)` + `field_name`,
+`roles`, `guarded`/`handle`): the command specs, GraphQL SDL and client
+manifest are identical (`tests/aggregate_command`). For unusual bodies write
+the handler and register it with `portable_command! { .., handle: f }` or
+the builder below.
+
+**Contracts.** Command semantics live in `distributed::command`, independently of the query
 transport. Use `CommandInput` and `CommandOutput` to describe Serde input/output
 shapes, and `command::{typed_command, Succeeded, Eventual, Atomic, PreparedCommand}`
 to declare and prepare commands. The GraphQL adapter derives its surface from

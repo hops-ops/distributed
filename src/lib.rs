@@ -69,8 +69,8 @@ pub mod trace_context;
 // Re-export entity types at crate root for convenience
 pub use entity::{
     upcast_events, upcast_events_for_replay, upcast_payload, BitcodePayloadCodec, Entity,
-    EventRecord, EventRecordError, EventUpcaster, PayloadCodec, UpcastError, BITCODE_PAYLOAD_CODEC,
-    BITCODE_PAYLOAD_CODEC_VERSION,
+    EventRecord, EventRecordError, EventUpcaster, PayloadCodec, Recorded, UpcastError,
+    BITCODE_PAYLOAD_CODEC, BITCODE_PAYLOAD_CODEC_VERSION,
 };
 
 // Placement-independent application composition. The module path remains the
