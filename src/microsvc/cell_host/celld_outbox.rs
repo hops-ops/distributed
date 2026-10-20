@@ -6,6 +6,8 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
+#[cfg(any(target_arch = "wasm32", test))]
+use std::time::SystemTime;
 
 use worker::Env;
 #[cfg(target_arch = "wasm32")]
@@ -47,6 +49,18 @@ pub struct CelldOutboxDrainOutcome {
     pub dispatch: OutboxDispatchOutcome,
     /// Post-commit failures whose recovery is owned by the durable watchdog.
     pub deferred: Vec<TransportError>,
+}
+
+/// Result of one Durable Object alarm wake ([`AggregateCell::alarm`]).
+///
+/// [`AggregateCell::alarm`]: super::AggregateCell
+#[must_use = "inspect fired alarms and deferred drain diagnostics"]
+#[derive(Debug, Default)]
+pub struct CelldAlarmOutcome {
+    /// Domain alarms fired, retried or failed by this wake.
+    pub alarms: super::CellAlarmFireReport,
+    /// The outbox drain that followed.
+    pub drain: CelldOutboxDrainOutcome,
 }
 
 impl CelldOutboxDrainOutcome {
@@ -173,6 +187,7 @@ impl CelldOutbox {
         cell: &AggregateCell<A>,
         env: &Env,
         storage: &Storage,
+        next_alarm: Option<SystemTime>,
     ) -> Result<CelldOutboxDrainOutcome, TransportError>
     where
         A: Aggregate + Send + Sync + 'static,
@@ -181,8 +196,37 @@ impl CelldOutbox {
             cell,
             || CelldQueuePublisher::from_env(env, &self.binding),
             &WorkerAlarm(storage),
+            crate::time::now(),
+            next_alarm,
         )
         .await
+    }
+
+    /// The one Durable Object alarm slot is shared by this watchdog and the
+    /// cell's domain alarms. Every write targets the earliest due time, so a
+    /// watchdog rearm never postpones a domain alarm and a far domain alarm
+    /// never postpones a drain. Returns `false` (and leaves the slot alone:
+    /// never delete an alarm) when neither wants a wake.
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(super) async fn schedule<W: CelldOutboxAlarm>(
+        &self,
+        alarm: &W,
+        now: SystemTime,
+        watchdog: bool,
+        next_alarm: Option<SystemTime>,
+    ) -> Result<bool, TransportError> {
+        let watchdog = watchdog.then(|| now + self.drain_interval);
+        let target = match (watchdog, next_alarm) {
+            (Some(watchdog), Some(domain)) => Some(watchdog.min(domain)),
+            (watchdog, domain) => watchdog.or(domain),
+        };
+        match target {
+            Some(target) => {
+                alarm.set(target, now).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     #[cfg(any(target_arch = "wasm32", test))]
@@ -190,11 +234,13 @@ impl CelldOutbox {
         &self,
         activity: &CommandActivity,
         alarm: &W,
+        now: SystemTime,
+        next_alarm: Option<SystemTime>,
     ) -> Result<CommandGuard, TransportError> {
         // Count the command before yielding to setAlarm. An alarm firing while
         // this command is suspended must keep the next wake scheduled.
         let guard = activity.enter()?;
-        alarm.arm(self.drain_interval).await?;
+        self.schedule(alarm, now, true, next_alarm).await?;
         Ok(guard)
     }
 
@@ -204,6 +250,8 @@ impl CelldOutbox {
         cell: &AggregateCell<A>,
         publisher: PF,
         alarm: &W,
+        now: SystemTime,
+        next_alarm: Option<SystemTime>,
     ) -> Result<CelldOutboxDrainOutcome, TransportError>
     where
         A: Aggregate + Send + Sync + 'static,
@@ -212,15 +260,13 @@ impl CelldOutbox {
         W: CelldOutboxAlarm,
     {
         let pending = has_pending(cell).await?;
-        if !pending && !cell.command_activity().is_active() {
-            // Never delete an alarm: doing so can erase a concurrent command's
-            // prearmed wake. The last scheduled alarm simply finds no work.
-            return Ok(CelldOutboxDrainOutcome::default());
-        }
-
+        let watchdog = pending || cell.command_activity().is_active();
         // Arm before Queue I/O, including during an alarm invocation. A crash
-        // after Queue acceptance but before deletion retries the stable event ID.
-        alarm.arm(self.drain_interval).await?;
+        // after Queue acceptance but before deletion retries the stable event
+        // ID. With no outbox work and no domain alarm, never delete an alarm:
+        // doing so can erase a concurrent command's prearmed wake. The last
+        // scheduled alarm simply finds no work.
+        self.schedule(alarm, now, watchdog, next_alarm).await?;
         if !pending {
             return Ok(CelldOutboxDrainOutcome::default());
         }
@@ -285,7 +331,9 @@ impl Drop for CommandGuard {
 #[cfg(any(target_arch = "wasm32", test))]
 #[async_trait::async_trait(?Send)]
 pub(super) trait CelldOutboxAlarm {
-    async fn arm(&self, interval: Duration) -> Result<(), TransportError>;
+    /// Set the single Durable Object alarm to `at` (`now` is the caller's
+    /// clock reading; a past `at` fires as soon as possible).
+    async fn set(&self, at: SystemTime, now: SystemTime) -> Result<(), TransportError>;
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -293,9 +341,10 @@ pub(super) struct WorkerAlarm<'a>(pub &'a Storage);
 #[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 impl CelldOutboxAlarm for WorkerAlarm<'_> {
-    async fn arm(&self, interval: Duration) -> Result<(), TransportError> {
-        self.0.set_alarm(interval).await.map_err(|error| {
-            TransportError::retryable(format!("cannot arm celld outbox watchdog: {error}"))
+    async fn set(&self, at: SystemTime, now: SystemTime) -> Result<(), TransportError> {
+        let offset = at.duration_since(now).unwrap_or(Duration::ZERO);
+        self.0.set_alarm(offset).await.map_err(|error| {
+            TransportError::retryable(format!("cannot arm celld cell alarm: {error}"))
         })
     }
 }
@@ -367,12 +416,17 @@ mod tests {
     }
     struct RecordingAlarm {
         log: Arc<Mutex<Vec<&'static str>>>,
+        targets: Mutex<Vec<Duration>>,
         fail: bool,
     }
     #[async_trait::async_trait(?Send)]
     impl CelldOutboxAlarm for RecordingAlarm {
-        async fn arm(&self, _: Duration) -> Result<(), TransportError> {
+        async fn set(&self, at: SystemTime, now: SystemTime) -> Result<(), TransportError> {
             self.log.lock().unwrap().push("arm");
+            self.targets
+                .lock()
+                .unwrap()
+                .push(at.duration_since(now).unwrap_or(Duration::ZERO));
             if self.fail {
                 Err(TransportError::retryable("alarm unavailable"))
             } else {
@@ -380,6 +434,8 @@ mod tests {
             }
         }
     }
+    const NOW: SystemTime = SystemTime::UNIX_EPOCH;
+
     fn cell(pending: bool) -> AggregateCell<TestAggregate> {
         let cell = AggregateCell::new("aggregate-1").unwrap();
         if pending {
@@ -399,6 +455,7 @@ mod tests {
             CelldOutbox::new("OUTBOX").unwrap(),
             RecordingAlarm {
                 log: log.clone(),
+                targets: Mutex::new(Vec::new()),
                 fail: false,
             },
             RecordingPublisher { log, fail: false },
@@ -435,13 +492,13 @@ mod tests {
             let cell = cell(true);
             let (outbox, alarm, publisher) = fixtures();
             let guard = outbox
-                .begin_command(cell.command_activity(), &alarm)
+                .begin_command(cell.command_activity(), &alarm, NOW, None)
                 .await
                 .unwrap();
             alarm.log.lock().unwrap().push("command");
             drop(guard);
             let result = outbox
-                .drain_with(&cell, || Ok(publisher), &alarm)
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
                 .await
                 .unwrap();
             assert_eq!(result.dispatch.published, 1);
@@ -453,7 +510,7 @@ mod tests {
             );
             let (_, _, publisher) = fixtures();
             assert!(!outbox
-                .drain_with(&cell, || Ok(publisher), &alarm)
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
                 .await
                 .unwrap()
                 .is_deferred());
@@ -471,7 +528,7 @@ mod tests {
             let (outbox, alarm, mut publisher) = fixtures();
             publisher.fail = true;
             let result = outbox
-                .drain_with(&cell, || Ok(publisher), &alarm)
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
                 .await
                 .unwrap();
             assert_eq!(result.dispatch.released, 1);
@@ -488,7 +545,7 @@ mod tests {
             let (outbox, mut alarm, _) = fixtures();
             alarm.fail = true;
             assert!(outbox
-                .begin_command(cell.command_activity(), &alarm)
+                .begin_command(cell.command_activity(), &alarm, NOW, None)
                 .await
                 .is_err());
             assert!(!cell.command_activity().is_active());
@@ -501,28 +558,28 @@ mod tests {
             let cell = cell(false);
             let (outbox, alarm, publisher) = fixtures();
             let first = outbox
-                .begin_command(cell.command_activity(), &alarm)
+                .begin_command(cell.command_activity(), &alarm, NOW, None)
                 .await
                 .unwrap();
             assert!(!outbox
-                .drain_with(&cell, || Ok(publisher.clone()), &alarm)
+                .drain_with(&cell, || Ok(publisher.clone()), &alarm, NOW, None)
                 .await
                 .unwrap()
                 .is_deferred());
             let second = outbox
-                .begin_command(cell.command_activity(), &alarm)
+                .begin_command(cell.command_activity(), &alarm, NOW, None)
                 .await
                 .unwrap();
             drop(first);
             assert!(!outbox
-                .drain_with(&cell, || Ok(publisher.clone()), &alarm)
+                .drain_with(&cell, || Ok(publisher.clone()), &alarm, NOW, None)
                 .await
                 .unwrap()
                 .is_deferred());
             assert_eq!(*alarm.log.lock().unwrap(), ["arm", "arm", "arm", "arm"]);
             drop(second);
             assert!(!outbox
-                .drain_with(&cell, || Ok(publisher), &alarm)
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
                 .await
                 .unwrap()
                 .is_deferred());
@@ -539,6 +596,8 @@ mod tests {
                     &cell,
                     || Err::<RecordingPublisher, _>(TransportError::permanent("missing Queue")),
                     &alarm,
+                    NOW,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -554,7 +613,7 @@ mod tests {
             let (outbox, mut alarm, publisher) = fixtures();
             alarm.fail = true;
             assert!(outbox
-                .drain_with(&cell, || Ok(publisher), &alarm)
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
                 .await
                 .is_err());
             assert_eq!(cell.durable_outbox().unwrap().len(), 1);
@@ -575,7 +634,7 @@ mod tests {
                 .await
                 .unwrap();
             let result = outbox
-                .drain_with(&cell, || Ok(publisher), &alarm)
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
                 .await
                 .unwrap();
             assert_eq!(result.dispatch.published, 0);
@@ -583,6 +642,74 @@ mod tests {
             assert_eq!(
                 cell.durable_outbox().unwrap()[0].status,
                 OutboxMessageStatus::InFlight
+            );
+        });
+    }
+
+    #[test]
+    fn domain_alarm_earlier_than_watchdog_wins_the_slot() {
+        block_on(async {
+            let cell = cell(true);
+            let (outbox, alarm, publisher) = fixtures();
+            let soon = NOW + Duration::from_millis(250);
+            let guard = outbox
+                .begin_command(cell.command_activity(), &alarm, NOW, Some(soon))
+                .await
+                .unwrap();
+            drop(guard);
+            let result = outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, Some(soon))
+                .await
+                .unwrap();
+            assert_eq!(result.dispatch.published, 1);
+            assert_eq!(
+                *alarm.targets.lock().unwrap(),
+                [Duration::from_millis(250), Duration::from_millis(250)],
+                "a watchdog rearm must never postpone an earlier domain alarm"
+            );
+        });
+    }
+
+    #[test]
+    fn watchdog_earlier_than_domain_alarm_keeps_draining() {
+        block_on(async {
+            let cell = cell(true);
+            let (outbox, alarm, publisher) = fixtures();
+            let later = NOW + Duration::from_secs(3_600);
+            let result = outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, Some(later))
+                .await
+                .unwrap();
+            assert_eq!(result.dispatch.published, 1);
+            assert_eq!(
+                *alarm.targets.lock().unwrap(),
+                [outbox.drain_interval()],
+                "a far domain alarm must not starve the outbox watchdog"
+            );
+        });
+    }
+
+    #[test]
+    fn idle_cell_arms_only_its_next_domain_alarm() {
+        block_on(async {
+            let cell = cell(false);
+            let (outbox, alarm, publisher) = fixtures();
+            let later = NOW + Duration::from_secs(60);
+            assert!(!outbox
+                .drain_with(&cell, || Ok(publisher.clone()), &alarm, NOW, Some(later))
+                .await
+                .unwrap()
+                .is_deferred());
+            assert_eq!(*alarm.targets.lock().unwrap(), [Duration::from_secs(60)]);
+            assert!(!outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
+                .await
+                .unwrap()
+                .is_deferred());
+            assert_eq!(
+                alarm.targets.lock().unwrap().len(),
+                1,
+                "with no work and no domain alarm the slot is left alone"
             );
         });
     }

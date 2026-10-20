@@ -296,6 +296,7 @@ impl InMemoryRepository {
         mut completion: Option<CommandCompletion>,
         direct_projection: Option<SameTransactionProjectionBatch>,
     ) -> Result<(), InMemoryCommitError> {
+        crate::microsvc::cell_host::alarm::reject_alarm_writes(&batch.alarms)?;
         let prepared = validate_commit_batch(&batch)?;
         if let Some(direct_projection) = &direct_projection {
             direct_projection.validate()?;

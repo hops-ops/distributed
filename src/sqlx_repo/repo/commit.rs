@@ -43,6 +43,7 @@ where
     for<'q> Option<&'q str>: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
+    crate::microsvc::cell_host::alarm::reject_alarm_writes(&batch.alarms)?;
     let prepared = validate_commit_batch(&batch)?;
     for plan in &batch.read_model_plans {
         validate_sql_write_plan(plan).map_err(RepositoryError::from)?;

@@ -39,6 +39,9 @@ pub struct CommitBatch<'a> {
     /// Consumer inbox receipts to record in the same transaction (the optional
     /// effectively-once effect fence). Empty for the default idempotent path.
     pub inbox_receipts: Vec<InboxReceipt>,
+    /// Re-armable cell alarm writes. Only aggregate cells accept them; every
+    /// other repository rejects a batch that carries any.
+    pub alarms: Vec<crate::microsvc::cell_host::CellAlarmWrite>,
 }
 
 impl<'a> CommitBatch<'a> {
@@ -49,6 +52,7 @@ impl<'a> CommitBatch<'a> {
             read_model_plans: Vec::new(),
             snapshots: Vec::new(),
             inbox_receipts: Vec::new(),
+            alarms: Vec::new(),
         }
     }
 

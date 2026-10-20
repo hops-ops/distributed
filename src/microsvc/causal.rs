@@ -24,6 +24,7 @@ use crate::command::{
 };
 use crate::command_ledger::CausalGetStream;
 use crate::domain_event::{DomainEventCaptureError, DomainEventCommitGuardError};
+use crate::microsvc::cell_host::CellAlarmWrite;
 use crate::outbox::{OutboxMessage, PreparedDomainEvent};
 use crate::projection::lower::{
     DirectCandidate, LoweredProjectionPlan, ProjectionDescriptor,
@@ -155,11 +156,13 @@ pub(crate) enum CausalWorkspaceError {
     DomainPublicationsAlreadyPrepared,
     DomainPublicationsNotPrepared,
     CommitBatchAlreadyPrepared,
+    Alarm(crate::microsvc::cell_host::CellAlarmError),
 }
 
 impl std::fmt::Display for CausalWorkspaceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Alarm(error) => write!(formatter, "cell alarm staging failed: {error}"),
             Self::Repository(error) => write!(formatter, "causal aggregate load failed: {error}"),
             Self::Table(error) => write!(formatter, "causal read-model staging failed: {error}"),
             Self::DomainEventCapture(error) => {
@@ -216,6 +219,7 @@ impl std::error::Error for CausalWorkspaceError {
             Self::DomainEventCapture(error) => Some(error),
             Self::DomainEventGuard(error) => Some(error),
             Self::Prepare(error) => Some(error),
+            Self::Alarm(error) => Some(error),
             Self::Poisoned
             | Self::IdentityChanged { .. }
             | Self::CommittedVersionChanged { .. }
@@ -280,6 +284,7 @@ struct WorkspaceState<A> {
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
+    alarms: Vec<CellAlarmWrite>,
     projection_staged: bool,
     modeled_direct_projection: Option<ProjectionServerExecutorDescriptor>,
 }
@@ -292,6 +297,7 @@ impl<A> Default for WorkspaceState<A> {
             outbox_messages: Vec::new(),
             read_model_plans: Vec::new(),
             snapshots: Vec::new(),
+            alarms: Vec::new(),
             projection_staged: false,
             modeled_direct_projection: None,
         }
@@ -411,6 +417,22 @@ where
             .map_err(|_| CausalWorkspaceError::Poisoned)?
             .outbox_messages
             .push(message);
+        Ok(())
+    }
+
+    /// Stage an alarm write. It commits with the command's events or not at
+    /// all; the batch is bounded by `MAX_CELL_ALARM_WRITES_PER_COMMAND`.
+    pub(crate) fn stage_alarm(&self, write: CellAlarmWrite) -> Result<(), CausalWorkspaceError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CausalWorkspaceError::Poisoned)?;
+        if state.alarms.len() >= crate::microsvc::cell_host::MAX_CELL_ALARM_WRITES_PER_COMMAND {
+            return Err(CausalWorkspaceError::Alarm(
+                crate::microsvc::cell_host::CellAlarmError::TooManyWrites,
+            ));
+        }
+        state.alarms.push(write);
         Ok(())
     }
 
@@ -545,6 +567,7 @@ where
             outbox_messages: state.outbox_messages,
             read_model_plans: state.read_model_plans,
             snapshots: state.snapshots,
+            alarms: state.alarms,
             domain_event_occurrences: Vec::new(),
             unpublished_direct_occurrences: HashSet::new(),
             modeled_direct_projection: state.modeled_direct_projection,
@@ -562,6 +585,7 @@ pub(crate) struct CausalWorkspaceParts<A> {
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
+    alarms: Vec<CellAlarmWrite>,
     /// Exact ledger-causation-stamped outward occurrences in publication order.
     domain_event_occurrences: Vec<crate::DomainEventOccurrence>,
     /// Captured occurrences consumed only by a direct modeled projection.
@@ -783,6 +807,7 @@ where
         batch.outbox_messages = std::mem::take(&mut self.outbox_messages);
         batch.read_model_plans = std::mem::take(&mut self.read_model_plans);
         batch.snapshots = std::mem::take(&mut self.snapshots);
+        batch.alarms = std::mem::take(&mut self.alarms);
         Ok(batch)
     }
 

@@ -111,6 +111,7 @@ async fn outbox_backlog_stats_order_sqlite_text_timestamps_numerically() {
         read_model_plans: Vec::new(),
         snapshots: Vec::new(),
         inbox_receipts: Vec::new(),
+        alarms: Vec::new(),
     })
     .await
     .expect("outbox-only batch should commit");
@@ -201,7 +202,7 @@ async fn projected_command_ledger_rows_upgrade_to_atomic_without_schema_drift() 
         .fetch_one(repo.pool())
         .await
         .unwrap();
-    assert_eq!(latest_version, 10);
+    assert_eq!(latest_version, 11);
 
     let created_at_type: String = sqlx::query_scalar(
         "SELECT typeof(created_at) FROM command_ledger WHERE service_id = 'service'",
@@ -317,6 +318,7 @@ async fn optimistic_conflict_rolls_back_other_stream_and_read_model_plan() {
     let err = repo
         .commit_batch(CommitBatch {
             inbox_receipts: Vec::new(),
+            alarms: Vec::new(),
             streams: vec![
                 StreamWrite::new(stale_identity.clone(), stale.entity_mut()),
                 StreamWrite::new(other_identity.clone(), other.entity_mut()),
@@ -407,6 +409,7 @@ async fn read_model_failure_mid_plan_rolls_back_events_and_outbox() {
     let err = repo
         .commit_batch(CommitBatch {
             inbox_receipts: Vec::new(),
+            alarms: Vec::new(),
             streams: vec![StreamWrite::new(identity.clone(), projection.entity_mut())],
             outbox_messages: vec![outbox_message],
             read_model_plans: vec![read_models.into_write_plan().unwrap()],

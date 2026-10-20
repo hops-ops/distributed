@@ -2,10 +2,11 @@
 //! one instance per shard (`{aggregate_type}:{shard}`).
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
+use super::alarm::{AlarmSettlement, ArmedCellAlarm, CellAlarmFireReport};
 use super::causal::{CellCommandIdentity, CellDispatchError, CellDispatchResult};
 use super::store::CellStreamStore;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
@@ -230,9 +231,13 @@ where
             .begin_command()
             .await
             .map_err(|error| HandlerError::Other(Box::new(error)))?;
-        self.routes
+        let result = self
+            .routes
             .dispatch_cell_command(command, input, session, &self.shard)
-            .await
+            .await;
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        self.reschedule_after_command().await;
+        result
     }
 
     /// Dispatch a wait-path command through this cell's fenced command ledger.
@@ -252,9 +257,107 @@ where
             .begin_command()
             .await
             .map_err(|error| CellDispatchError::Internal(error.to_string()))?;
-        self.routes
+        let result = self
+            .routes
             .dispatch_cell_causal(command, identity, input, session, &self.shard)
+            .await;
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        self.reschedule_after_command().await;
+        result
+    }
+
+    /// Armed alarms of this cell, earliest first.
+    pub fn armed_alarms(&self) -> Result<Vec<ArmedCellAlarm>, RepositoryError> {
+        self.routes.repo().repo().armed_alarms()
+    }
+
+    /// Due time of this cell's earliest armed alarm.
+    pub fn next_alarm_due(&self) -> Result<Option<SystemTime>, RepositoryError> {
+        Ok(self
+            .routes
+            .repo()
+            .repo()
+            .next_alarm_due_ms()?
+            .map(super::alarm::ms_to_system_time))
+    }
+
+    /// Fire this cell's alarms that are due now by the cell clock.
+    ///
+    /// The in-process reference host has no timer: tests give the store a
+    /// [`ManualClock`](crate::ManualClock) ([`CellStreamStore::with_clock`]),
+    /// advance it, and call this, exactly as the celld alarm handler does on
+    /// every Durable Object wake.
+    pub async fn fire_due_alarms(&self) -> Result<CellAlarmFireReport, RepositoryError> {
+        self.fire_due_alarms_at(self.routes.repo().repo().now())
             .await
+    }
+
+    /// Fire up to [`CELL_ALARM_FIRE_BATCH`](super::CELL_ALARM_FIRE_BATCH)
+    /// alarms due at or before `now`, earliest first.
+    ///
+    /// Each one dispatches its command through this cell's command ledger with
+    /// a stable `(name, generation)` command id and the trusted alarm session.
+    /// The due set is read once, so a handler that re-arms in the past fires on
+    /// the next wake, not in a loop.
+    pub async fn fire_due_alarms_at(
+        &self,
+        now: SystemTime,
+    ) -> Result<CellAlarmFireReport, RepositoryError> {
+        let store = self.routes.repo().repo();
+        let now_ms = super::alarm::system_time_to_ms(now)?;
+        let mut report = CellAlarmFireReport::default();
+        for alarm in store.due_alarms(now_ms, super::CELL_ALARM_FIRE_BATCH)? {
+            let result = match alarm.command_identity() {
+                Ok(identity) => {
+                    self.dispatch_idempotent(
+                        &alarm.command,
+                        &identity,
+                        alarm.input.clone(),
+                        super::cell_alarm_session(&alarm),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            let settlement = match result {
+                Ok(dispatch) => {
+                    report.fired.push(super::FiredCellAlarm {
+                        name: alarm.name.clone(),
+                        generation: alarm.generation,
+                        command: alarm.command.clone(),
+                        replayed: dispatch.replayed(),
+                        payload: dispatch.payload().clone(),
+                    });
+                    AlarmSettlement::Done
+                }
+                Err(error) => {
+                    let retry = super::alarm::is_retryable(&error);
+                    let failed = super::FailedCellAlarm {
+                        name: alarm.name.clone(),
+                        generation: alarm.generation,
+                        command: alarm.command.clone(),
+                        code: error.code(),
+                        message: match &error {
+                            CellDispatchError::Internal(message) => message.clone(),
+                            other => other.client_message(),
+                        },
+                    };
+                    if retry {
+                        report.retried.push(failed);
+                        AlarmSettlement::Retry {
+                            due_at_ms: now_ms.saturating_add(
+                                super::alarm::retry_delay(alarm.attempts).as_millis() as i64,
+                            ),
+                        }
+                    } else {
+                        report.failed.push(failed);
+                        AlarmSettlement::Done
+                    }
+                }
+            };
+            store.settle_alarm(&alarm.name, alarm.generation, &settlement)?;
+        }
+        Ok(report)
     }
 
     /// Load this cell's aggregate from the private stream store.
@@ -335,6 +438,19 @@ where
         )
     }
 
+    /// Rows of this cell's outbox still awaiting delivery.
+    pub async fn outbox_backlog(
+        &self,
+    ) -> Result<crate::outbox_worker::OutboxBacklogStats, RepositoryError> {
+        use crate::outbox_worker::OutboxStore;
+        self.routes
+            .repo()
+            .repo()
+            .outbox_store()
+            .backlog_stats()
+            .await
+    }
+
     /// Attach the celld Queue binding and drain policy used by this cell host.
     #[cfg(feature = "workers-rs")]
     pub fn with_celld_outbox(mut self, outbox: super::celld_outbox::CelldOutbox) -> Self {
@@ -350,7 +466,62 @@ where
         &self,
         env: &worker::Env,
     ) -> Result<super::celld_outbox::CelldOutboxDrainOutcome, crate::bus::TransportError> {
-        self.outbox_config()?.drain(self, env, &self.storage).await
+        let next_alarm = self.next_alarm_due().map_err(alarm_transport_error)?;
+        self.outbox_config()?
+            .drain(self, env, &self.storage, next_alarm)
+            .await
+    }
+
+    /// The Durable Object alarm handler: fire due domain alarms, then drain
+    /// the outbox. The one Durable Object alarm slot is shared: every wake is
+    /// set to the earliest of the next domain alarm and the outbox watchdog,
+    /// so neither starves the other.
+    ///
+    /// ```rust,ignore
+    /// async fn alarm(&self) -> Result<Response> {
+    ///     let wake = self.cell.alarm(&self.env).await?;
+    ///     Response::ok("ok")
+    /// }
+    /// ```
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    pub async fn alarm(
+        &self,
+        env: &worker::Env,
+    ) -> Result<super::celld_outbox::CelldAlarmOutcome, crate::bus::TransportError> {
+        let alarms = self
+            .fire_due_alarms()
+            .await
+            .map_err(alarm_transport_error)?;
+        let drain = self.drain_outbox(env).await?;
+        Ok(super::celld_outbox::CelldAlarmOutcome { alarms, drain })
+    }
+
+    /// A command may have armed an alarm due before the prearmed watchdog
+    /// wake; move the one Durable Object alarm earlier if so. Failure is only
+    /// logged: the prearmed watchdog still wakes the cell, which re-plans.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    async fn reschedule_after_command(&self) {
+        let Ok(outbox) = self.outbox_config() else {
+            return;
+        };
+        let next_alarm = match self.next_alarm_due() {
+            Ok(next_alarm) => next_alarm,
+            Err(error) => {
+                worker::console_error!("cell alarm lookup failed after command: {error}");
+                return;
+            }
+        };
+        if let Err(error) = outbox
+            .schedule(
+                &super::celld_outbox::WorkerAlarm(&self.storage),
+                crate::time::now(),
+                true,
+                next_alarm,
+            )
+            .await
+        {
+            worker::console_error!("cell alarm reschedule failed after command: {error}");
+        }
     }
 
     #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
@@ -368,10 +539,13 @@ where
     async fn begin_command(
         &self,
     ) -> Result<super::celld_outbox::CommandGuard, crate::bus::TransportError> {
+        let next_alarm = self.next_alarm_due().map_err(alarm_transport_error)?;
         self.outbox_config()?
             .begin_command(
                 &self.activity,
                 &super::celld_outbox::WorkerAlarm(&self.storage),
+                crate::time::now(),
+                next_alarm,
             )
             .await
     }
@@ -590,6 +764,11 @@ where
         }
         Ok(self.cells.get_mut(&name).expect("just inserted"))
     }
+}
+
+#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+fn alarm_transport_error(error: RepositoryError) -> crate::bus::TransportError {
+    crate::bus::TransportError::retryable(format!("cell alarm storage: {error}"))
 }
 
 /// Cell instance name: `{aggregate_type}:{shard_id}`.

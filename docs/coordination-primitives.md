@@ -10,6 +10,7 @@ twice.
 |------|-----------|--------|
 | Change state in two cells with rollback | Saga / process manager | `distributed::saga` |
 | Run something at a time in the future, across restarts | `OutboxMessage::deliver_at` | `distributed::outbox` |
+| A cell schedules its own future or recurring work | Re-armable cell alarm | `distributed::cell_host` |
 | One owner per key, with stale writers rejected | Lease with fencing token | `distributed::lease` |
 | Deterministic time in tests | `Clock`, `ManualClock` | `distributed::clock` |
 
@@ -44,6 +45,56 @@ so a timer fires within one poll interval of its deadline. `release` (a
 retry) resets availability to now, so a timer that failed to publish is
 retried promptly instead of being re-delayed. `OutboxMessage.deliver_at` is
 `#[serde(default)]`.
+
+## Cell alarms: a cell schedules its own work
+
+`deliver_at` leaves the cell and needs a consumer to send a command back.
+When a cell must act on itself later (a matchmaking tick, an invite expiry, a
+daily reset, a lease expiry), a causal command handler arms a **cell alarm**
+with its events:
+
+```rust
+// in a causal command handler
+ctx.arm_alarm(CellAlarm::after("tick", Duration::from_secs(5), "pool.tick", &TickInput { pool })?)?;
+ctx.cancel_alarm("invite-expiry")?;
+
+// in the alarm's own handler: re-arm from the fired due time (no drift)
+let due = ctx.alarm_due().expect("fired by an alarm") + period;
+ctx.arm_alarm(CellAlarm::at("tick", due, "pool.tick", &input)?)?;
+```
+
+- The alarm row (`cell_alarms`, migration 11) commits in the **same
+  transaction** as the command's events, ledger receipt and outbox rows. A
+  failed command arms nothing. `CellAlarm::after` resolves against the
+  cell's clock at commit; handlers have no wall clock of their own.
+- One row per alarm name. Arming a name again replaces it and bumps its
+  `generation`; `cancel_alarm` disarms it.
+- When due, the cell dispatches the alarm's command **into itself** through
+  its command ledger, with a command id derived from `(name, generation)` and
+  the trusted session from `cell_alarm_session` (role `cell-alarm`, plus
+  claims only the host sets). Mount alarm-only commands with
+  `guard: cell_alarm_guard` so callers cannot invoke them. A crash after the
+  handler committed but before the alarm settled replays the receipt; the
+  handler never runs twice for one arm.
+- Rejections disarm the alarm (reported as `failed`). Retryable failures back
+  off from 1 s, doubling, up to 5 min (`retried`). At most 32 alarms fire per
+  wake, 16 alarm writes per command and 1,024 armed alarms per cell.
+- Only aggregate cells have an alarm slot. Every other repository rejects a
+  batch carrying alarm writes.
+
+**celld.** A Durable Object has one alarm. The outbox watchdog
+(`CelldOutbox`) and domain alarms share it: every `setAlarm` targets the
+earliest of the next domain alarm and the next drain, so a watchdog rearm
+never postpones a domain alarm and a far domain alarm never postpones a
+drain. The Worker's `alarm()` handler calls `AggregateCell::alarm(&env)`,
+which fires due alarms, then drains the outbox and re-plans the wake.
+Commands that arm an alarm move the wake earlier right after they commit.
+
+**Reference host.** The in-process host and native `cell-sqlite` cells have
+no timer. Give the store a `ManualClock`
+(`CellStreamStore::with_clock`), advance it and call
+`AggregateCell::fire_due_alarms()`: the same ledger and settlement path runs
+deterministically.
 
 ## Leases with fencing tokens
 
@@ -147,6 +198,13 @@ A test network delivers outbox rows whose `deliver_at` is due on a
 ```sh
 cargo test --features sqlite,postgres --test saga_transfer --test coordination_lease --test scheduled_outbox
 cargo test --features sqlite --lib -- outbox lease clock
+cargo test --features cell-sqlite,workers-rs --lib cell_host
+(cd tests/celld/alarm-worker && worker-build --release) && node tests/celld/alarms.mjs
 ```
+
+`tests/celld/alarms.mjs` owns its own `celld dev` process (no Docker; set
+`CELLD` to choose the binary) and proves the alarm row commits atomically,
+periodic re-arm at the alarm cadence, that the watchdog and domain alarms do
+not starve each other, and exactly-once firing across a celld restart.
 
 The Postgres cases skip when `DATABASE_URL` is unset (see `compose.yaml`).

@@ -669,5 +669,6 @@ async fn reference_host_applies_the_sealed_row_reducer_on_commit() {
     .is_err());
 }
 
+mod alarms;
 #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
 mod native_sqlite;

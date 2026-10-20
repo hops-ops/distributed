@@ -34,7 +34,18 @@ match cell.drain_outbox(&env).await {
     Err(error) => worker::console_error!("outbox drain deferred: {error}"),
 }
 
-// The Durable Object alarm handler also calls drain_outbox(&env).
+// The Durable Object alarm handler calls cell.alarm(&env): it fires due cell
+// alarms (see docs/coordination-primitives.md) and then drains the outbox.
+```
+
+Domain cell alarms share the one Durable Object alarm with the outbox
+watchdog; every wake is set to the earliest of the two. `alarm-worker/` is a
+Ticker cell that arms, re-arms and cancels alarms, and `alarms.mjs` proves it
+on an isolated `celld dev` (including a crash and restart):
+
+```sh
+(cd tests/celld/alarm-worker && worker-build --release)
+CELLD=celld node tests/celld/alarms.mjs
 ```
 
 The Queue lives in another cell: its acceptance is **not** part of the

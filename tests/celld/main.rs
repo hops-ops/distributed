@@ -84,6 +84,10 @@ fn worker_declares_sqlite_todo_and_chat_cells() {
     assert!(source.contains("CelldOutbox::from_env(&env, \"OUTBOX\")"));
     assert!(source.contains("with_celld_outbox(outbox)"));
     assert!(source.contains(".drain_outbox(env)"));
+    assert!(
+        source.contains("cell\n        .alarm(env)"),
+        "the Durable Object alarm handler fires cell alarms and drains through AggregateCell::alarm"
+    );
     assert!(!source.contains("persist_and_drain_outbox"));
     assert!(!source.contains("CelldQueuePublisher::from_env"));
     assert!(!source.contains("drain_outbox_to_queue"));
@@ -101,6 +105,34 @@ fn worker_declares_sqlite_todo_and_chat_cells() {
     assert!(!source.contains("restore_durable_events"));
     assert!(!source.contains("restore_durable_snapshots"));
     assert!(!source.contains("restore_cell_state"));
+}
+
+#[test]
+fn alarm_worker_arms_cell_alarms_and_shares_the_durable_object_alarm() {
+    let dir = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/celld/alarm-worker"
+    ));
+    let wrangler = std::fs::read_to_string(dir.join("wrangler.jsonc")).expect("wrangler.jsonc");
+    let spec: Value = serde_json::from_str(&wrangler).expect("wrangler json");
+    assert_eq!(
+        spec["durable_objects"]["bindings"][0]["class_name"],
+        "TickerCell"
+    );
+    assert_eq!(spec["migrations"][0]["new_sqlite_classes"][0], "TickerCell");
+    assert_eq!(spec["queues"]["producers"][0]["binding"], "OUTBOX");
+    let source = std::fs::read_to_string(dir.join("src/lib.rs")).expect("lib.rs");
+    assert!(source.contains("ctx.arm_alarm("));
+    assert!(source.contains("cell_alarm_guard::<Ticker>"));
+    assert!(source.contains(".alarm(&self.env)"));
+    assert!(source.contains("with_celld_outbox(outbox)"));
+    let harness = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/celld/alarms.mjs"
+    ))
+    .expect("alarms.mjs");
+    assert!(harness.contains("fires once across restart"));
+    assert!(harness.contains("watchdog not starved by a far domain alarm"));
 }
 
 #[test]

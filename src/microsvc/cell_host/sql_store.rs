@@ -32,6 +32,8 @@ use crate::repository::{
 };
 use crate::snapshot::SnapshotRecord;
 
+use super::alarm::{AlarmSettlement, ArmedCellAlarm};
+
 // Durable Object SQL limits bindings per statement, not per transaction.
 // Both shared insert planners split large commands within the same transaction.
 const MAX_SQL_BIND_PARAMS: usize = 100;
@@ -156,6 +158,7 @@ impl CellSqlRepository {
             ));
         }
         let prepared = validate_commit_batch(&batch)?;
+        super::alarm::validate_alarm_writes(&batch.alarms)?;
         self.connection.transaction(|executor| {
             finish_sql(async {
                 if let Some(completion) = &completion {
@@ -201,6 +204,11 @@ impl CellSqlRepository {
                     let SnapshotWrite::Save { identity, record } = snapshot;
                     sql::save_snapshot(executor, identity, record).await?;
                 }
+                // Alarm rows join the same transaction: a failed command (or a
+                // lost ledger lease below) leaves no alarm armed.
+                if !batch.alarms.is_empty() {
+                    alarms::apply(executor, &batch.alarms).await?;
+                }
                 // Native sealed read-model row: same transaction, so a reducer
                 // error or lost ledger lease rolls the row back with the events.
                 #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
@@ -226,6 +234,42 @@ impl CellSqlRepository {
             stream.entity.mark_committed();
         }
         Ok(())
+    }
+}
+
+impl CellSqlRepository {
+    /// Armed alarms, earliest first.
+    pub(super) fn armed_alarms(&self) -> Result<Vec<ArmedCellAlarm>, RepositoryError> {
+        self.connection
+            .read(|executor| finish_sql(alarms::armed(executor, None, usize::MAX)))
+    }
+
+    /// Armed alarms due at or before `now_ms`, earliest first.
+    pub(super) fn due_alarms(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ArmedCellAlarm>, RepositoryError> {
+        self.connection
+            .read(|executor| finish_sql(alarms::armed(executor, Some(now_ms), limit)))
+    }
+
+    /// Due time of the earliest armed alarm.
+    pub(super) fn next_alarm_due_ms(&self) -> Result<Option<i64>, RepositoryError> {
+        self.connection
+            .read(|executor| finish_sql(alarms::next_due(executor)))
+    }
+
+    /// Settle the fired generation of `name`; a newer arm is left untouched.
+    pub(super) fn settle_alarm(
+        &self,
+        name: &str,
+        generation: u64,
+        settlement: &AlarmSettlement,
+    ) -> Result<(), RepositoryError> {
+        self.connection.transaction(|executor| {
+            finish_sql(alarms::settle(executor, name, generation, settlement))
+        })
     }
 }
 
@@ -512,6 +556,148 @@ mod native {
                 "cell SQLite file has no instance binding".into(),
             ));
         }
+        Ok(())
+    }
+}
+
+/// Cell alarm rows (`cell_alarms`, migration 11). Shared by Durable Object and
+/// native SQLite cells; the reference host mirrors these semantics in memory.
+mod alarms {
+    use super::*;
+    use crate::microsvc::cell_host::alarm::{
+        CellAlarmError, CellAlarmWrite, MAX_ARMED_CELL_ALARMS,
+    };
+
+    const SELECT: &str =
+        "SELECT name, command, input, due_at_ms, generation, attempts FROM cell_alarms WHERE armed = 1";
+
+    pub(super) async fn apply(
+        executor: &mut impl SqlExecutor,
+        writes: &[CellAlarmWrite],
+    ) -> Result<(), RepositoryError> {
+        for write in writes {
+            match write {
+                CellAlarmWrite::Arm(alarm) => {
+                    let input = alarm.input_json()?;
+                    executor
+                        .execute(
+                            Statement::new("INSERT INTO cell_alarms (name, command, input, due_at_ms, generation, attempts, armed) VALUES (")
+                                .bind(alarm.name().into())
+                                .sql(", ")
+                                .bind(alarm.command().into())
+                                .sql(", ")
+                                .bind(input.as_str().into())
+                                .sql(", ")
+                                .bind(alarm.due_at_ms()?.into())
+                                .sql(", 1, 0, 1) ON CONFLICT (name) DO UPDATE SET command = excluded.command, input = excluded.input, due_at_ms = excluded.due_at_ms, generation = cell_alarms.generation + 1, attempts = 0, armed = 1"),
+                        )
+                        .await?;
+                }
+                CellAlarmWrite::Cancel(name) => {
+                    executor
+                        .execute(
+                            Statement::new(
+                                "UPDATE cell_alarms SET armed = 0, attempts = 0 WHERE name = ",
+                            )
+                            .bind(name.as_str().into()),
+                        )
+                        .await?;
+                }
+            }
+        }
+        let rows = executor
+            .query(Statement::new(
+                "SELECT COUNT(*) AS armed FROM cell_alarms WHERE armed = 1",
+            ))
+            .await?;
+        let armed = rows
+            .first()
+            .map(|row| row.integer("armed"))
+            .transpose()?
+            .unwrap_or(0);
+        if armed > MAX_ARMED_CELL_ALARMS as i64 {
+            return Err(CellAlarmError::TooManyArmed.into());
+        }
+        Ok(())
+    }
+
+    pub(super) async fn armed(
+        executor: &mut impl SqlExecutor,
+        due_by_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ArmedCellAlarm>, RepositoryError> {
+        let limit = (limit as u64).min(9_007_199_254_740_991) as i64;
+        let mut statement = Statement::new(SELECT);
+        if let Some(due_by_ms) = due_by_ms {
+            statement = statement.sql(" AND due_at_ms <= ").bind(due_by_ms.into());
+        }
+        let rows = executor
+            .query(
+                statement
+                    .sql(" ORDER BY due_at_ms, name LIMIT ")
+                    .bind(limit.into()),
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let input = row.text("input")?;
+                Ok(ArmedCellAlarm {
+                    name: row.text("name")?,
+                    command: row.text("command")?,
+                    input: serde_json::from_str(&input).map_err(|error| {
+                        RepositoryError::Model(format!("cell alarm input is invalid JSON: {error}"))
+                    })?,
+                    due_at_ms: row.integer("due_at_ms")?,
+                    generation: u64::try_from(row.integer("generation")?).map_err(|_| {
+                        RepositoryError::Model("cell alarm generation is negative".into())
+                    })?,
+                    attempts: u32::try_from(row.integer("attempts")?).unwrap_or(u32::MAX),
+                })
+            })
+            .collect()
+    }
+
+    pub(super) async fn next_due(
+        executor: &mut impl SqlExecutor,
+    ) -> Result<Option<i64>, RepositoryError> {
+        let rows = executor
+            .query(Statement::new(
+                "SELECT MIN(due_at_ms) AS due FROM cell_alarms WHERE armed = 1",
+            ))
+            .await?;
+        Ok(rows
+            .first()
+            .map(|row| row.optional_integer("due"))
+            .transpose()?
+            .flatten())
+    }
+
+    pub(super) async fn settle(
+        executor: &mut impl SqlExecutor,
+        name: &str,
+        generation: u64,
+        settlement: &AlarmSettlement,
+    ) -> Result<(), RepositoryError> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| RepositoryError::Model("cell alarm generation overflow".into()))?;
+        let statement = match settlement {
+            AlarmSettlement::Done => {
+                Statement::new("UPDATE cell_alarms SET armed = 0, attempts = 0 WHERE name = ")
+            }
+            AlarmSettlement::Retry { due_at_ms } => {
+                Statement::new("UPDATE cell_alarms SET attempts = attempts + 1, due_at_ms = ")
+                    .bind((*due_at_ms).into())
+                    .sql(" WHERE name = ")
+            }
+        };
+        executor
+            .execute(
+                statement
+                    .bind(name.into())
+                    .sql(" AND armed = 1 AND generation = ")
+                    .bind(generation.into()),
+            )
+            .await?;
         Ok(())
     }
 }

@@ -234,7 +234,7 @@ async fn projected_command_ledger_rows_upgrade_to_atomic_and_preserve_checks() {
         .fetch_one(repo.pool())
         .await
         .unwrap();
-    assert_eq!(latest_version, 10);
+    assert_eq!(latest_version, 11);
 
     let invalid_service = sqlx::query(
         r#"
@@ -337,6 +337,7 @@ async fn read_model_failure_mid_plan_rolls_back_events_and_outbox() {
     let err = repo
         .commit_batch(CommitBatch {
             inbox_receipts: Vec::new(),
+            alarms: Vec::new(),
             streams: vec![StreamWrite::new(identity.clone(), projection.entity_mut())],
             outbox_messages: vec![outbox_message],
             read_model_plans: vec![read_models.into_write_plan().unwrap()],

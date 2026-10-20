@@ -47,7 +47,7 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         assert_eq!(
             descriptions,
             vec![
@@ -60,7 +60,8 @@ mod tests {
                 "projection program identity",
                 "external command binding",
                 "projection delivery aliases",
-                "coordination leases"
+                "coordination leases",
+                "cell alarms"
             ]
         );
         assert_eq!(
@@ -106,6 +107,10 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/sqlite/0010_coordination_leases.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0011_cell_alarms.sql"
+                )),
             ]
         );
     }
@@ -125,7 +130,7 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         assert_eq!(
             descriptions,
             vec![
@@ -138,7 +143,8 @@ mod tests {
                 "projection program identity",
                 "external command binding",
                 "projection delivery aliases",
-                "coordination leases"
+                "coordination leases",
+                "cell alarms"
             ]
         );
         assert_eq!(
@@ -183,6 +189,10 @@ mod tests {
                 include_str!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/postgres/0010_coordination_leases.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0011_cell_alarms.sql"
                 )),
             ]
         );

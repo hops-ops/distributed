@@ -686,6 +686,32 @@ where
         CausalCommitBuilder::empty(self).outbox(message)
     }
 
+    /// Arm (or re-arm) a cell alarm with this command's effects.
+    ///
+    /// The alarm row commits in the same transaction as the command's events
+    /// and receipt; if the command fails, nothing is armed. At the alarm's due
+    /// time the hosting cell dispatches its command into itself with the
+    /// trusted session from [`crate::cell_host::cell_alarm_session`]. Only
+    /// aggregate cells accept alarms: other hosts reject the commit.
+    pub fn arm_alarm(&self, alarm: crate::cell_host::CellAlarm) -> Result<(), HandlerError> {
+        self.workspace
+            .stage_alarm(crate::cell_host::CellAlarmWrite::Arm(alarm))
+            .map_err(workspace_handler_error)
+    }
+
+    /// Disarm a cell alarm with this command's effects (no-op when unarmed).
+    pub fn cancel_alarm(&self, name: impl Into<String>) -> Result<(), HandlerError> {
+        self.workspace
+            .stage_alarm(crate::cell_host::CellAlarmWrite::Cancel(name.into()))
+            .map_err(workspace_handler_error)
+    }
+
+    /// Due time of the alarm that fired this command; `None` for any command
+    /// not dispatched by a cell alarm.
+    pub fn alarm_due(&self) -> Option<std::time::SystemTime> {
+        crate::cell_host::cell_alarm_due(self.session)
+    }
+
     /// Low-level outbox staging retained for framework internals.
     #[cfg(all(test, feature = "graphql", feature = "sqlite"))]
     pub(crate) fn stage_outbox(&self, message: OutboxMessage) -> Result<(), HandlerError> {

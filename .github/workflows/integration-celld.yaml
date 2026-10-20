@@ -39,7 +39,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: tests/celld/worker -> tests/celld/worker/target
+          workspaces: |
+            tests/celld/worker -> tests/celld/worker/target
+            tests/celld/alarm-worker -> tests/celld/alarm-worker/target
           shared-key: celld-storage
       - uses: actions/setup-node@v4
         with:
@@ -56,6 +58,11 @@ jobs:
         run: worker-build --release --features storage-conformance
       - name: Prove SQL atomicity, fencing, autonomous recovery and growth
         run: node tests/celld/storage-conformance.mjs
+      - name: Build the cell-alarm Ticker Worker
+        working-directory: tests/celld/alarm-worker
+        run: worker-build --release
+      - name: Prove re-armable cell alarms (atomic arm, cadence, watchdog, restart)
+        run: node tests/celld/alarms.mjs
       - name: Retain storage proof results and logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -64,6 +71,8 @@ jobs:
           path: |
             /tmp/distributed-cell-storage-*/results.json
             /tmp/distributed-cell-storage-*/celld-*.log
+            /tmp/distributed-cell-alarms-*/results.json
+            /tmp/distributed-cell-alarms-*/celld-*.log
           if-no-files-found: ignore
 
   e2e-celld:

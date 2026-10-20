@@ -21,6 +21,7 @@
 //! only; the cell host itself stays ungated (`PCH-DEC-005`). Without it,
 //! native cells use the in-process reference host.
 
+pub(crate) mod alarm;
 pub(crate) mod causal;
 mod cell;
 #[cfg(feature = "workers-rs")]
@@ -45,6 +46,16 @@ mod sql_store;
 mod store;
 mod wire;
 
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+pub use alarm::DurableCellAlarm;
+pub use alarm::{
+    cell_alarm_due, cell_alarm_guard, cell_alarm_session, is_cell_alarm_session, ArmedCellAlarm,
+    CellAlarm, CellAlarmError, CellAlarmFireReport, CellAlarmWrite, FailedCellAlarm,
+    FiredCellAlarm, CELL_ALARM_DUE_CLAIM, CELL_ALARM_FIRE_BATCH, CELL_ALARM_GENERATION_CLAIM,
+    CELL_ALARM_NAME_CLAIM, CELL_ALARM_RETRY_BASE, CELL_ALARM_RETRY_MAX, CELL_ALARM_ROLE,
+    CELL_ALARM_SERVICE_ID, CELL_ALARM_USER_ID, MAX_ARMED_CELL_ALARMS, MAX_CELL_ALARM_INPUT_BYTES,
+    MAX_CELL_ALARM_NAME_BYTES, MAX_CELL_ALARM_WRITES_PER_COMMAND,
+};
 pub use causal::{
     CellCommandIdentity, CellDispatchError, CellDispatchResult, CELL_CAUSATION_ID_HEADER,
     CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
@@ -52,7 +63,7 @@ pub use causal::{
 pub use cell::{instance_name, parent_cell_name, AggregateCell, CellNamespace};
 #[cfg(feature = "workers-rs")]
 pub use celld_outbox::{
-    CelldOutbox, CelldOutboxDrainOutcome, CELLD_OUTBOX_DEFAULT_BATCH_SIZE,
+    CelldAlarmOutcome, CelldOutbox, CelldOutboxDrainOutcome, CELLD_OUTBOX_DEFAULT_BATCH_SIZE,
     CELLD_OUTBOX_DEFAULT_BINDING, CELLD_OUTBOX_DEFAULT_DRAIN_INTERVAL_MS,
     CELLD_OUTBOX_DEFAULT_LEASE, CELLD_OUTBOX_DEFAULT_MAX_ATTEMPTS, CELLD_OUTBOX_DRAIN_INTERVAL_ENV,
 };
