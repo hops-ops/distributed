@@ -243,6 +243,7 @@ fn realm_factory(
             reject_all: rejecting.contains(&zone),
             gate: zone.ends_with(".inn"),
             freeze_ready: !zone.ends_with(".stuck"),
+            move_facts: false,
         })
     })
 }

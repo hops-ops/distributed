@@ -28,6 +28,10 @@ pub struct HandoffRequest {
     pub target_zone: String,
     /// Game state carried along (inventory, buffs, position hint...).
     pub carried: Vec<u8>,
+    /// Source stamp time of the departure (Unix ms): the facts the source
+    /// emits while the player leaves carry it, and the target stamps
+    /// everything after it ([`FactStamp`](crate::FactStamp) ordering).
+    pub departed_at_ms: u64,
 }
 
 /// Verified transfer ticket contents.
@@ -43,6 +47,9 @@ pub struct Transfer {
     pub generation: u64,
     /// Carried state.
     pub carried: Vec<u8>,
+    /// Source stamp time of the departure (Unix ms, see
+    /// [`HandoffRequest::departed_at_ms`]).
+    pub departed_at_ms: u64,
 }
 
 /// Why [`Ctx::handoff`](crate::Ctx::handoff) refused.

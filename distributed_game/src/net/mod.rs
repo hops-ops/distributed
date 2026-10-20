@@ -1081,6 +1081,7 @@ async fn run_zone<Z>(
             issuer: inner.host_id.clone(),
             generation,
             carried: request.carried.clone(),
+            departed_at_ms: request.departed_at_ms,
         }))
     });
     if let Some(saved) = &saved {

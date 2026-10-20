@@ -10,9 +10,11 @@ use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
 };
 use distributed::{sourced, Entity};
-use distributed_game::cell::{command_id_for, CellFactSink};
+use std::collections::HashMap;
+
+use distributed_game::cell::{command_id_for, session_stamp, CellFactSink};
 use distributed_game::{
-    fact_channel, spawn_fact_worker, Fact, FactOutcome, FactStamp, RetryPolicy,
+    fact_channel, spawn_fact_worker, stamp_metadata, Fact, FactOutcome, FactStamp, RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -42,6 +44,11 @@ struct CreditPayload {
     hero: String,
     xp: u32,
     tick: String,
+    /// The stamp the handler read from the trusted session, after a trip
+    /// through event metadata.
+    emitted_at_ms: u64,
+    activation: u64,
+    config_version: String,
 }
 
 struct CreditXp;
@@ -69,6 +76,11 @@ async fn handle_credit(
     // Identity comes from the trusted session, never from the input.
     let principal = ctx.session().user_id().unwrap_or_default().to_string();
     let tick = ctx.session().get("x-game-tick").unwrap_or("").to_string();
+    let stamp = session_stamp(ctx.session())
+        .ok_or_else(|| HandlerError::Rejected("fact sessions carry a stamp".into()))?;
+    let mut metadata = HashMap::new();
+    stamp_metadata(&mut metadata, &stamp);
+    let stamp = FactStamp::from_metadata(&metadata).expect("metadata round trip");
     let repo = ctx.repo();
     let mut hero = match repo.get(&principal).await? {
         Some(hero) => hero,
@@ -81,6 +93,9 @@ async fn handle_credit(
         hero: principal,
         xp,
         tick,
+        emitted_at_ms: stamp.emitted_at_ms,
+        activation: stamp.activation,
+        config_version: stamp.config_version,
     })
 }
 
@@ -104,6 +119,9 @@ async fn facts_dispatch_idempotently_with_trusted_principal() {
         zone_id: "z1".into(),
         tick: 99,
         content_version: "c1".into(),
+        emitted_at_ms: 1_700_000_000_456,
+        activation: 77,
+        config_version: "combat@12".into(),
     };
     let fact = Fact::trusted(
         "coin:z1:7",
@@ -131,6 +149,9 @@ async fn facts_dispatch_idempotently_with_trusted_principal() {
     assert_eq!(first.payload["hero"], "alice");
     assert_eq!(first.payload["xp"], 10);
     assert_eq!(first.payload["tick"], "99");
+    assert_eq!(first.payload["emitted_at_ms"], 1_700_000_000_456u64);
+    assert_eq!(first.payload["activation"], 77);
+    assert_eq!(first.payload["config_version"], "combat@12");
     assert_eq!(cell.load().await.unwrap().unwrap().xp, 10, "credited once");
 
     // Payload-supplied identity is not a declared input: permanent failure.

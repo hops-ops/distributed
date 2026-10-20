@@ -92,6 +92,11 @@ pub struct HostConfig {
     /// Unix time in microseconds when the host is created. The `net` server
     /// sets it to the activation's fencing token.
     pub boot_epoch: u64,
+    /// Remote config version the zone runs (opaque; e.g. `"combat@12"`):
+    /// stamped on every fact ([`FactStamp::config_version`]). Change it at
+    /// runtime with [`ZoneHost::set_config_version`] /
+    /// [`Ctx::set_config_version`].
+    pub config_version: String,
 }
 
 impl Default for HostConfig {
@@ -114,6 +119,7 @@ impl Default for HostConfig {
             rewind: RewindConfig::default(),
             stale_policy: StalePolicy::Strict,
             boot_epoch: 0,
+            config_version: String::new(),
         }
     }
 }
@@ -247,12 +253,20 @@ pub(crate) struct Core<Z: Zone> {
     pending_kicks: Vec<(PlayerId, String)>,
     rewind: Rewind,
     transfer_issuer: Option<Box<TransferIssuer>>,
-    pending_handoffs: Vec<(PlayerId, ServerMessage)>,
+    /// Handoffs to finish after the hook: player, `Handoff` message and the
+    /// departure stamp time signed into the transfer ticket.
+    pending_handoffs: Vec<(PlayerId, ServerMessage, u64)>,
     upward: Vec<ChildEvent>,
     child_inbox: Vec<ChildEvent>,
     dropped_frozen: u64,
     /// Typed facts keyed without dedupe parts this tick: `(tick, count)`.
     fact_seq: (u64, u32),
+    /// Stamps are never earlier than this (Unix ms): raised past a handoff
+    /// source's departure time when a transfer is admitted.
+    stamp_floor_ms: u64,
+    /// Stamp time forced while a handoff departure runs `on_leave`, so the
+    /// source's departure facts carry exactly the time in the ticket.
+    pinned_stamp_ms: Option<u64>,
 }
 
 impl<Z: Zone> Core<Z> {
@@ -283,6 +297,23 @@ impl<Z: Zone> Core<Z> {
 
     fn in_flight(&self) -> usize {
         self.facts.as_ref().map_or(0, FactQueue::in_flight)
+    }
+
+    /// Wall time stamped on anything produced now (Unix ms).
+    fn stamp_ms(&self) -> u64 {
+        self.pinned_stamp_ms
+            .unwrap_or_else(|| self.clock.unix_ms().max(self.stamp_floor_ms))
+    }
+
+    fn stamp(&self) -> FactStamp {
+        FactStamp {
+            zone_id: self.zone_id.clone(),
+            tick: self.tick,
+            content_version: self.config.content_version.clone(),
+            emitted_at_ms: self.stamp_ms(),
+            activation: self.config.boot_epoch,
+            config_version: self.config.config_version.clone(),
+        }
     }
 }
 
@@ -330,6 +361,17 @@ impl<Z: Zone> Ctx<'_, Z> {
     /// Content version.
     pub fn content_version(&self) -> &str {
         &self.core.config.content_version
+    }
+
+    /// Remote config version ([`HostConfig::config_version`]).
+    pub fn config_version(&self) -> &str {
+        &self.core.config.config_version
+    }
+
+    /// Switch the remote config version (e.g. on a config-changed
+    /// message); facts and stamps produced afterwards carry it.
+    pub fn set_config_version(&mut self, version: impl Into<String>) {
+        self.core.config.config_version = version.into();
     }
 
     /// Epoch of this zone activation ([`HostConfig::boot_epoch`]): unique
@@ -509,11 +551,7 @@ impl<Z: Zone> Ctx<'_, Z> {
     }
 
     fn emit_bound(&mut self, fact: Fact, principal: Option<String>) -> Result<(), EmitError> {
-        let stamp = FactStamp {
-            zone_id: self.core.zone_id.clone(),
-            tick: self.core.tick,
-            content_version: self.core.config.content_version.clone(),
-        };
+        let stamp = self.core.stamp();
         self.core
             .facts
             .as_mut()
@@ -582,15 +620,11 @@ impl<Z: Zone> Ctx<'_, Z> {
         self.core.pending_kicks.push((player, message.into()));
     }
 
-    /// Provenance of anything produced now (zone, tick, content version);
-    /// embed it in events so clients and logs can tell which content
-    /// version produced them.
+    /// Provenance of anything produced now (zone, activation, tick, wall
+    /// time, content and config version); embed it in events so clients
+    /// and logs can tell which content version produced them.
     pub fn stamp(&self) -> FactStamp {
-        FactStamp {
-            zone_id: self.core.zone_id.clone(),
-            tick: self.core.tick,
-            content_version: self.core.config.content_version.clone(),
-        }
+        self.core.stamp()
     }
 
     /// Move `player` to `target_zone` with `carried` state. A signed
@@ -621,16 +655,18 @@ impl<Z: Zone> Ctx<'_, Z> {
             .core
             .pending_handoffs
             .iter()
-            .any(|(queued, _)| *queued == player)
+            .any(|(queued, _, _)| *queued == player)
         {
             return Err(HandoffError::Refused);
         }
+        let departed_at_ms = self.core.stamp_ms();
         let request = HandoffRequest {
             principal,
             name,
             source_zone: self.core.zone_id.clone(),
             target_zone: target_zone.to_string(),
             carried,
+            departed_at_ms,
         };
         let issuer = self
             .core
@@ -644,6 +680,7 @@ impl<Z: Zone> Ctx<'_, Z> {
                 target_zone: request.target_zone,
                 transfer_ticket: ticket,
             },
+            departed_at_ms,
         ));
         Ok(())
     }
@@ -729,6 +766,8 @@ impl<Z: Zone> ZoneHost<Z> {
             child_inbox: Vec::new(),
             dropped_frozen: 0,
             fact_seq: (0, 0),
+            stamp_floor_ms: 0,
+            pinned_stamp_ms: None,
             config,
         };
         let zone = Z::on_create(&mut Ctx { core: &mut core }, zone_config);
@@ -922,6 +961,10 @@ impl<Z: Zone> ZoneHost<Z> {
     /// Admit a player arriving with a verified transfer ticket; the zone
     /// sees [`Zone::on_handoff_join`] with the carried state (also when the
     /// principal is still present, e.g. inside its reconnect grace).
+    ///
+    /// From now on this zone stamps facts later than the source stamped the
+    /// departure ([`Transfer::departed_at_ms`]), whatever the two hosts'
+    /// clocks say.
     pub fn join_transfer(
         &mut self,
         transfer: &Transfer,
@@ -934,6 +977,10 @@ impl<Z: Zone> ZoneHost<Z> {
                 "transfers are for players",
             ));
         }
+        self.core.stamp_floor_ms = self
+            .core
+            .stamp_floor_ms
+            .max(transfer.departed_at_ms.saturating_add(1));
         self.admit(
             &transfer.claims,
             capabilities,
@@ -1207,6 +1254,12 @@ impl<Z: Zone> ZoneHost<Z> {
             .players
             .get(&player)
             .map(|slot| slot.content_version.as_str())
+    }
+
+    /// Switch the remote config version ([`HostConfig::config_version`]);
+    /// facts and stamps produced afterwards carry it.
+    pub fn set_config_version(&mut self, version: impl Into<String>) {
+        self.core.config.config_version = version.into();
     }
 
     /// Switch the zone to a new content version
@@ -1505,8 +1558,10 @@ impl<Z: Zone> ZoneHost<Z> {
     }
 
     fn process_kicks(&mut self) {
-        while let Some((player, message)) = self.core.pending_handoffs.pop() {
+        while let Some((player, message, departed_at_ms)) = self.core.pending_handoffs.pop() {
+            self.core.pinned_stamp_ms = Some(departed_at_ms);
             self.remove_player(player, LeaveReason::Handoff, Some(message));
+            self.core.pinned_stamp_ms = None;
         }
         while let Some((player, message)) = self.core.pending_kicks.pop() {
             let kick = ServerMessage::Kick {

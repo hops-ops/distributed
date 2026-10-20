@@ -682,6 +682,18 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
   activation's boot epoch for you (see [Durable facts](#durable-facts)).
 - If the process crashes, each in-flight fact is either fully saved or
   not saved at all. Mob Pit shows this with `kill -9`.
+- Every fact carries a `FactStamp`: zone, activation (boot epoch), tick,
+  host wall time `emitted_at_ms` (`Clock::unix_ms`; `ManualClock` in
+  tests), content version and config version (`HostConfig::config_version`,
+  `ctx.set_config_version`). The cell sink passes it to handlers as
+  trusted `x-game-*` session variables (`cell::session_stamp`), and
+  `stamp_metadata` / `FactStamp::from_metadata` copy it onto events.
+- **Commit order is not emission order.** Order facts with
+  `FactStamp::emission_order` (same zone: activation, then tick; across
+  zones: wall time). After a handoff the target's stamps start after the
+  source's departure time, which the transfer ticket carries, so "joined
+  B" sorts after "left A" even when it commits first or the two hosts'
+  clocks disagree.
 
 ### Scaling out: many zones, many servers
 
@@ -871,7 +883,7 @@ Settlements: `settlement.is::<SlayInput>()`, and
 > do it for you.
 
 The host binds the principal from the player's **verified ticket** and
-stamps zone/tick/content version. A `FactSink` commits facts on a worker
+stamps zone, activation, tick, wall time, content and config version. A `FactSink` commits facts on a worker
 with bounded retries/backoff; `Zone::on_fact_settled` receives the outcome
 on a later tick. `cell::CellFactSink` dispatches into an `AggregateCell`
 with a deterministic command id per fact key, so retries replay instead of
@@ -920,7 +932,7 @@ principals commit concurrently; settlements arrive in completion order.
   stored history. The interpolation delay travels in the game's input
   payload (no wire change).
 - **Record/replay** (`replay`): drive a host through `Recorder` (same
-  methods as `ZoneHost`), save the compact `Recording` (`DGR2`), and
+  methods as `ZoneHost`), save the compact `Recording` (`DGR3`), and
   `replay::<Z>(&recording, config)` re-runs it on a `ManualClock`,
   checking a per-tick state hash (`Zone::state_hash`, or the replicated
   `WorldView`). A mismatch returns a `Divergence` naming the tick and the

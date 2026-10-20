@@ -50,7 +50,7 @@ use crate::schema::FieldValue;
 use crate::world::{ChildEvent, StalePolicy};
 use crate::zone::{ClientId, PlayerId, TicketClaims, Zone};
 
-const MAGIC: &[u8; 4] = b"DGR2";
+const MAGIC: &[u8; 4] = b"DGR3";
 
 /// FNV digest of a replicated world (entity order, ids, kinds, positions,
 /// priorities and field values).
@@ -216,6 +216,13 @@ pub enum Event {
         /// New version.
         version: String,
     },
+    /// [`ZoneHost::set_config_version`].
+    SetConfigVersion {
+        /// Clock.
+        at: Duration,
+        /// New version.
+        version: String,
+    },
     /// [`ZoneHost::request_freeze`].
     RequestFreeze {
         /// Clock.
@@ -269,6 +276,7 @@ impl Event {
             | Self::JoinTransfer { at, .. }
             | Self::ReconnectVersion { at, .. }
             | Self::SetContentVersion { at, .. }
+            | Self::SetConfigVersion { at, .. }
             | Self::RequestFreeze { at, .. }
             | Self::CancelFreeze { at, .. }
             | Self::ReloadStale { at }
@@ -336,6 +344,9 @@ impl fmt::Display for Event {
             Self::SetContentVersion { version, .. } => {
                 write!(f, "@{ms:.1}ms content version {version}")
             }
+            Self::SetConfigVersion { version, .. } => {
+                write!(f, "@{ms:.1}ms config version {version}")
+            }
             Self::RequestFreeze { notice, .. } => {
                 write!(f, "@{ms:.1}ms request freeze {}", notice.reason)
             }
@@ -375,7 +386,7 @@ pub struct Recording {
 /// File decode failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingError {
-    /// Not a `DGR2` file.
+    /// Not a `DGR3` file.
     BadMagic,
     /// Malformed content.
     Decode(String),
@@ -552,6 +563,7 @@ fn put_config(w: &mut Writer, c: &HostConfig) {
         StalePolicy::SafeRoom { roam: true } => 2,
     });
     put_u64(w, c.boot_epoch);
+    w.string(&c.config_version);
 }
 
 fn put_claims(w: &mut Writer, claims: &TicketClaims) {
@@ -624,12 +636,13 @@ fn get_config(r: &mut Reader<'_>) -> Result<HostConfig, RecordingError> {
             _ => StalePolicy::SafeRoom { roam: true },
         },
         boot_epoch: get_u64(r)?,
+        config_version: r.string()?,
     })
 }
 
 impl Recording {
     /// Compact binary encoding:
-    /// `"DGR2" ‖ zone_id ‖ config ‖ created_at ‖ fact_capacity? ‖ zone_config ‖
+    /// `"DGR3" ‖ zone_id ‖ config ‖ created_at ‖ fact_capacity? ‖ zone_config ‖
     /// varuint(event count) ‖ events`. Integers are LEB128 varints,
     /// durations are nanosecond varints, clock readings are delta-coded
     /// against the previous event, hashes are 8 raw bytes.
@@ -741,6 +754,7 @@ impl Recording {
                     put_claims(&mut w, &transfer.claims);
                     w.string(&transfer.source_zone).string(&transfer.issuer);
                     put_u64(&mut w, transfer.generation);
+                    put_u64(&mut w, transfer.departed_at_ms);
                     w.bytes(&transfer.carried)
                         .varuint(*capabilities)
                         .string(content_version);
@@ -788,6 +802,9 @@ impl Recording {
                     ..
                 } => {
                     w.u8(16).bytes(state).string(saved_version);
+                }
+                Event::SetConfigVersion { version, .. } => {
+                    w.u8(17).string(version);
                 }
             }
         }
@@ -885,6 +902,7 @@ impl Recording {
                     let source_zone = r.string()?;
                     let issuer = r.string()?;
                     let generation = get_u64(&mut r)?;
+                    let departed_at_ms = get_u64(&mut r)?;
                     let carried = r.bytes()?.to_vec();
                     Event::JoinTransfer {
                         at,
@@ -894,6 +912,7 @@ impl Recording {
                             issuer,
                             generation,
                             carried,
+                            departed_at_ms,
                         },
                         capabilities: r.varuint()?,
                         content_version: r.string()?,
@@ -936,6 +955,10 @@ impl Recording {
                     at,
                     state: r.bytes()?.to_vec(),
                     saved_version: r.string()?,
+                },
+                17 => Event::SetConfigVersion {
+                    at,
+                    version: r.string()?,
                 },
                 _ => return Err(bad("event tag")),
             };
@@ -1236,6 +1259,16 @@ impl<Z: Zone> Recorder<Z> {
         let at = self.now();
         self.host.set_content_version(version);
         self.recording.events.push(Event::SetContentVersion {
+            at,
+            version: version.into(),
+        });
+    }
+
+    /// [`ZoneHost::set_config_version`].
+    pub fn set_config_version(&mut self, version: &str) {
+        let at = self.now();
+        self.host.set_config_version(version);
+        self.recording.events.push(Event::SetConfigVersion {
             at,
             version: version.into(),
         });
@@ -1571,6 +1604,7 @@ pub fn replay_with<Z: Zone>(
                 }
             }
             Event::SetContentVersion { version, .. } => host.set_content_version(version.clone()),
+            Event::SetConfigVersion { version, .. } => host.set_config_version(version.clone()),
             Event::RequestFreeze { notice, .. } => {
                 host.request_freeze(notice.clone());
             }

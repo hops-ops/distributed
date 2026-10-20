@@ -87,6 +87,14 @@ pub fn trusted_session(principal: &str, fact: &Fact) -> Session {
     session
 }
 
+/// The [`FactStamp`](crate::FactStamp) a [`trusted_session`] carries
+/// (None for a session that did not come from a fact). Handlers use it to
+/// order facts ([`FactStamp::emission_order`](crate::FactStamp::emission_order))
+/// and to [`stamp_metadata`](crate::stamp_metadata) their events.
+pub fn session_stamp(session: &Session) -> Option<crate::FactStamp> {
+    crate::FactStamp::from_session_vars(session.variables())
+}
+
 fn classify(error: CellDispatchError) -> FactError {
     match error {
         CellDispatchError::InProgress | CellDispatchError::Internal(_) => {
