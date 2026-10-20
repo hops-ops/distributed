@@ -791,6 +791,7 @@ pub struct ZoneHost<Z: Zone> {
     zone: Z,
     core: Core<Z>,
     schema: EntitySchema,
+    entities: crate::Entities<Z>,
     hot: FixedTimestep,
     idle: Option<FixedTimestep>,
     last_advance: Duration,
@@ -865,6 +866,7 @@ impl<Z: Zone> ZoneHost<Z> {
             zone,
             core,
             schema: Z::schema(),
+            entities: Z::entities(),
             hot,
             idle,
             last_advance: now,
@@ -990,11 +992,10 @@ impl<Z: Zone> ZoneHost<Z> {
     /// [`Zone::state_hash`] (or, when the zone has none, its replicated
     /// [`WorldView`]).
     pub fn state_hash(&self) -> u64 {
-        let zone = self.zone.state_hash().unwrap_or_else(|| {
-            let mut view = WorldView::default();
-            self.zone.replicate(&mut view);
-            crate::replay::hash_world(&view)
-        });
+        let zone = self
+            .zone
+            .state_hash()
+            .unwrap_or_else(|| crate::replay::hash_world(&self.world_view()));
         let mut h = crate::rng::Fnv64::new();
         h.write_u64(self.core.tick)
             .write_u64(self.core.sim_time.as_nanos() as u64)
@@ -1873,9 +1874,17 @@ impl<Z: Zone> ZoneHost<Z> {
         }
     }
 
-    fn patch(&mut self) {
+    /// This patch's replicated world: every registered entity collection's
+    /// projected views ([`Zone::entities`]), then [`Zone::replicate`].
+    pub fn world_view(&self) -> WorldView {
         let mut view = WorldView::default();
+        self.entities.project(&self.zone, &mut view);
         self.zone.replicate(&mut view);
+        view
+    }
+
+    fn patch(&mut self) {
+        let view = self.world_view();
         let core = &mut self.core;
         self.pending.entities = Some(view.entities().len());
         let world = EncodedWorld::build(&self.schema, view, &core.config.interest);

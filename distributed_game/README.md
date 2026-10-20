@@ -64,7 +64,8 @@ The words used throughout:
 | **GameServer** | (`net` feature) A WebSocket server hosting many zones, creating them on demand, routing players, and serving `/metrics` and admin routes. |
 | **Tick** | One fixed simulation step (30 Hz by default). Separate from the **patch** rate (20 Hz by default), how often clients get updates. |
 | **Player / Observer** | A *player* controls something and sends inputs. An *observer* only watches: a spectator, a leaderboard page, or a client looking into the zone next door. |
-| **Entity** | Something clients can see. The zone describes its entities each patch; the engine works out what changed for each client. |
+| **Entity** | A thing inside a zone with its own `EntityId`: a player, a mob, a pillar. It holds server state, some of which no client may see. |
+| **View** | What clients see of an entity: a `#[derive(Replicated)]` struct *projected* from it each patch (converted, derived, or left out). The engine works out what changed for each client. |
 | **Schema** | The kinds of entity and their fields (with quantization), usually from `#[derive(Replicated)]` views. Sent to clients on connect, so a generic client needs no generated code; a generated one adds types. |
 | **Fact** | An outcome worth keeping ("Alice killed the elite"). The zone emits it (typically the cell command's own input) and moves on; a background worker commits it to storage, where the command decides the reward, and reports back later. |
 | **Cell** | Durable, event-sourced state in `distributed`, for example one player's profile. Facts usually end up as commands on a cell. |
@@ -194,7 +195,9 @@ impl Zone for Room {
         }
     }
 
-    // Describe the world; the engine diffs it per client.
+    // Describe the world; the engine diffs it per client. (Zones with
+    // entity collections register them in `entities()` instead and
+    // project views from them: see "What each client sees".)
     fn replicate(&self, out: &mut WorldView) {
         out.add(1, &DotView { x: self.x });
     }
@@ -325,9 +328,74 @@ that to drop inputs the server has already applied when it reconciles.
 
 ### What each client sees
 
-Each patch, `replicate` describes every entity once: `out.add(id, &view)`
-with a `#[derive(Replicated)]` view (or a hand-built `EntityState`). The
-view's struct is the kind: `#[replicated(kind = "mob", id = 2, priority =
+**Zones, entities, views and facts.** The same split as on the business
+side of `distributed`:
+
+| game runtime | business side | here |
+|---|---|---|
+| zone | aggregate root | one consistency boundary, changed only on its own tick |
+| zone entity (`Entity`, `EntityId`) | entity inside the aggregate | `Mob { id, home, target, hp, .. }`, server-only state included |
+| view (`Replicated` + `Project`) | read model / projection | `MobView { x, y, hp% , tele }`, recomputed each patch |
+| fact | domain event | `crawler.record_kill`, committed by a cell |
+
+Views are projections, not copies: a view converts (`hp` as a percent),
+derives (a telegraph ring from a windup timer), flattens (a nested move
+state), clamps, or returns `None` to leave the entity out (a dead mob),
+and server-only fields (`target`, `home`, `principal`) simply have no
+view field. Declare the entity type with `of` and mark straight copies
+`#[from]` (same name) or `#[from(path.to.field)]`; the derive generates
+`MobView::project(&mob, MobViewRest { .. })` with only the hand-filled
+fields left in `MobViewRest` (a missing or mistyped `#[from]` field is a
+compile error at the attribute), and when every field is `#[from]` it
+also implements `Project` for you:
+
+```rust,ignore
+#[derive(Replicated)]
+#[replicated(kind = "mob", id = 2, of = Mob)]
+pub struct MobView {
+    #[quant(min = -40.0, max = 40.0, bits = 14)] #[from(body.x)] pub x: f32,
+    #[quant(min = -40.0, max = 40.0, bits = 14)] #[from(body.y)] pub y: f32,
+    pub hp: u8, // percent: filled by hand
+}
+
+impl Entity for Mob {
+    fn entity_id(&self) -> EntityId { self.id }
+}
+
+impl Project<MobView> for Mob {
+    fn view(&self) -> Option<MobView> {
+        (self.hp > 0).then(|| MobView::project(self, MobViewRest {
+            hp: (self.hp * 100 / self.max_hp) as u8,
+        }))
+    }
+}
+```
+
+The zone registers its collections once (`Zone::entities`, like
+`schema()`); each patch the host projects every entity in registration
+order (`Vec`, slices, `VecDeque`, `BTreeMap` values, `Option`, or one
+entity such as the zone itself for a HUD view) and then calls
+`Zone::replicate` for anything else:
+
+```rust,ignore
+fn entities() -> Entities<Self> {
+    Entities::new()
+        .each(|z: &Self| &z.players)
+        .each(|z: &Self| &z.mobs)
+        .one(|z: &Self| z) // impl Project<HudView> for the zone
+}
+```
+
+`replicate` now defaults to nothing and stays for unusual zones: there,
+`out.project::<MobView, _>(&mob)` pushes one entity's view, and
+`out.add(id, &view)` any `#[derive(Replicated)]` view (with or without
+`of`; or push a hand-built `EntityState`). `ZoneHost::world_view()`
+returns the patch's projected world (tests, tooling). Mob Pit
+(`examples/game/server/src/mobpit/zone.rs`) has no `replicate` at all,
+and a golden test there checks the projected world and the Delta bytes
+against its former hand-written loop.
+
+**Kinds.** The view's struct is the kind: `#[replicated(kind = "mob", id = 2, priority =
 2.0, global)]`, one field per replicated field in wire order (`bool`, `u8`,
 `u16`, `u32`, `i32`, `f32`, `String` as a short string, `Vec<u8>` as
 bytes), `#[quant(min, max, bits)]` / `#[quant(centered = R, bits)]` (zero
@@ -845,7 +913,7 @@ errors for unsupported types and attributes.
 
 | Derive | On | Container attribute | Field attributes | Implements |
 |---|---|---|---|---|
-| `Replicated` | struct | `#[replicated(kind = "name", id = N, priority = P, global, x = f, y = f)]` | `quant`, `angle`, `field_type`, `priority`, `correct` | `Replicated` (`kind_def`, `field_values`, `position`) |
+| `Replicated` | struct | `#[replicated(kind = "name", id = N, priority = P, global, x = f, y = f, of = Entity)]` | `quant`, `angle`, `field_type`, `priority`, `correct`, `from` / `from(a.b)` (with `of`) | `Replicated` (`kind_def`, `field_values`, `position`); with `of`: `View::project` + `ViewRest` (or, all `#[from]`, `impl Project<View> for Entity`) |
 | `GameInput` | struct | – | `range`, `buttons`, `quant`, `angle`, `field_type` | `GameInput` (`from_payload`, `to_payload`, `sanitize`) + button consts |
 | `GameEvent` | enum / struct | `#[game_event(id = N, name = "..")]` per variant / on the struct | `quant`, `angle`, `field_type`, `long` | `GameEvent` (`decode_event`, `to_payload`) + id consts |
 | `GameRecord` | struct | – | `quant`, `angle`, `field_type`, `long` | `Wire` (nested payload record) |

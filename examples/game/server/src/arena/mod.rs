@@ -32,8 +32,8 @@ use std::collections::BTreeMap;
 
 use distributed_game::net::{GameServer, ServerConfig, ZoneFactory};
 use distributed_game::{
-    schema, Ctx, EntitySchema, GameEvent, GameInput, GameSurface, InputCredits, LeaveReason,
-    PlayerId, Replicated, View, WorldView, Zone,
+    schema, Ctx, Entity, EntityId, EntitySchema, GameEvent, GameInput, GameSurface, InputCredits,
+    LeaveReason, PlayerId, Replicated, View, WorldView, Zone,
 };
 
 use crate::common::{Demo, Guests};
@@ -102,15 +102,53 @@ pub struct DroneView {
     pub yaw: f32,
 }
 
-/// A static pillar (visible everywhere).
-#[derive(Debug, Clone, PartialEq, Replicated)]
-#[replicated(kind = "pillar", id = 3, global)]
-pub struct PillarView {
+/// A static pillar of the shared floor ([`movement::PILLARS`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pillar {
+    /// Entity id (100 + index).
+    pub id: EntityId,
     /// Centre x.
     pub x: f32,
     /// Centre y.
     pub y: f32,
     /// Radius.
+    pub r: f32,
+}
+
+impl Pillar {
+    /// Every pillar of the floor.
+    pub fn all() -> Vec<Pillar> {
+        movement::PILLARS
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y, r))| Pillar {
+                id: EntityId(100 + i as u32),
+                x,
+                y,
+                r,
+            })
+            .collect()
+    }
+}
+
+impl Entity for Pillar {
+    fn entity_id(&self) -> EntityId {
+        self.id
+    }
+}
+
+/// A static pillar (visible everywhere), a straight projection of [`Pillar`].
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "pillar", id = 3, global, of = Pillar)]
+pub struct PillarView {
+    /// Centre x.
+    #[from]
+    pub x: f32,
+    /// Centre y.
+    #[from]
+    pub y: f32,
+    /// Radius.
+    #[from]
     pub r: f32,
 }
 
@@ -316,15 +354,8 @@ impl Zone for Arena {
             };
             out.add(d.id, &view).priority(0.5);
         }
-        for (i, (x, y, r)) in movement::PILLARS.iter().enumerate() {
-            out.add(
-                100 + i as u32,
-                &PillarView {
-                    x: *x,
-                    y: *y,
-                    r: *r,
-                },
-            );
+        for pillar in Pillar::all() {
+            out.project::<PillarView, _>(&pillar);
         }
     }
 }

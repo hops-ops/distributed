@@ -18,9 +18,15 @@
 //! leash or target dead → `return` home → `idle`. Dead mobs respawn after 4 s
 //! with a new generation.
 //!
-//! Kinds are `#[derive(Replicated)]` views, events the typed [`PitEvent`],
-//! input the `#[derive(GameInput)]` [`PitInput`]; the browser client is
-//! generated from [`game_surface`].
+//! The zone is the aggregate; players, mobs and pillars are its entities
+//! (each with an [`EntityId`]), and the kinds are `#[derive(Replicated)]`
+//! views *projected* from them (`of = Player`, `#[from]` fields copied, the
+//! rest derived in `impl Project<..>`): a mob's HP becomes a percent, its
+//! windup timer the `tele` ring, a dead mob no view at all. The zone
+//! registers its collections once ([`Zone::entities`]) and projects its own
+//! HUD numbers ([`PitView`]); there is no hand-written `replicate()`.
+//! Events are the typed [`PitEvent`], input the `#[derive(GameInput)]`
+//! [`PitInput`]; the browser client is generated from [`game_surface`].
 //!
 //! A kill emits a typed fact **without awaiting storage**: the cell
 //! command's own input, [`RecordKillInput`] `{mob, tier, name}`, keyed by
@@ -38,51 +44,60 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use distributed_game::{
-    schema, ConsumePolicy, Ctx, EmitError, EntitySchema, Fact, FactOutcome, FactSettlement,
-    GameEvent, GameInput, GameRecord, GameSurface, LeaveReason, ObserverId, PlayerId, Replicated,
-    View, WorldView, Zone,
+    schema, ConsumePolicy, Ctx, EmitError, Entities, Entity, EntityId, EntitySchema, Fact,
+    FactOutcome, FactSettlement, GameEvent, GameInput, GameRecord, GameSurface, LeaveReason,
+    ObserverId, PlayerId, Project, Replicated, View, Zone,
 };
 
 use super::board::BoardSnapshot;
 use super::crawler::{level_floor, KillReceipt, RecordKillInput};
 use super::world::MobPitWorld;
 use crate::arena::movement::{self, MoveState, PILLARS, PLAYER_RADIUS};
-use crate::arena::PillarView;
+use crate::arena::{Pillar, PillarView};
 use crate::common::Guests;
 
-/// Entity id of the stats entity.
-pub const PIT_ENTITY: u32 = 900;
+/// Entity id of the stats entity (the zone's own HUD view).
+pub const PIT_ENTITY: EntityId = EntityId(900);
 
 /// A player: the Arena's predicted [`MoveState`] plus server-owned combat
-/// state (replaced, never predicted, on the client).
+/// state (replaced, never predicted, on the client). Projected from the
+/// zone's `Player` entity: the move state is flattened, HP and level are
+/// clamped, and its principal, credits and timers stay on the server.
 #[derive(Debug, Clone, PartialEq, Replicated)]
-#[replicated(kind = "player", id = 1, priority = 2.0)]
+#[replicated(kind = "player", id = 1, priority = 2.0, of = Player)]
 pub struct PlayerView {
     /// Position x.
     #[field_type(movement::POS)]
     #[correct(ease = 150)]
+    #[from(state.x)]
     pub x: f32,
     /// Position y.
     #[field_type(movement::POS)]
     #[correct(ease = 150)]
+    #[from(state.y)]
     pub y: f32,
     /// Velocity x.
     #[field_type(movement::VEL)]
     #[correct(snap)]
+    #[from(state.vx)]
     pub vx: f32,
     /// Velocity y.
     #[field_type(movement::VEL)]
     #[correct(snap)]
+    #[from(state.vy)]
     pub vy: f32,
     /// Remaining dash frames.
     #[correct(snap)]
+    #[from(state.dash)]
     pub dash: u8,
     /// Remaining dash cooldown frames.
     #[correct(snap)]
+    #[from(state.cd)]
     pub cd: u8,
     /// Display name.
     #[priority(0.2)]
     #[correct(replace)]
+    #[from]
     pub name: String,
     /// Hit points.
     #[correct(replace)]
@@ -90,6 +105,7 @@ pub struct PlayerView {
     /// Facing (rad).
     #[angle(bits = 8)]
     #[correct(replace)]
+    #[from]
     pub face: f32,
     /// Swing animation frames left.
     #[correct(replace)]
@@ -102,20 +118,25 @@ pub struct PlayerView {
     pub dead: bool,
 }
 
-/// A mob (dead mobs are not replicated).
+/// A mob (dead mobs are not replicated); its home, target, generation and
+/// wander point stay on the server.
 #[derive(Debug, Clone, PartialEq, Replicated)]
-#[replicated(kind = "mob", id = 2)]
+#[replicated(kind = "mob", id = 2, of = Mob)]
 pub struct MobView {
     /// Position x.
     #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    #[from]
     pub x: f32,
     /// Position y.
     #[quant(min = -movement::HALF, max = movement::HALF, bits = 14)]
+    #[from]
     pub y: f32,
     /// Facing (rad).
     #[angle(bits = 8)]
+    #[from]
     pub face: f32,
     /// 1 grunt · 2 brute · 3 elite.
+    #[from]
     pub tier: u8,
     /// HP percent.
     pub hp: u8,
@@ -125,9 +146,9 @@ pub struct MobView {
     pub tele: u8,
 }
 
-/// Zone numbers for the HUD (global).
+/// Zone numbers for the HUD (global), projected from the zone itself.
 #[derive(Debug, Clone, PartialEq, Replicated)]
-#[replicated(kind = "pit", id = 4, global)]
+#[replicated(kind = "pit", id = 4, global, of = MobPit)]
 pub struct PitView {
     /// Facts emitted and not settled.
     pub pending: u16,
@@ -342,7 +363,7 @@ enum MobState {
 }
 
 struct Mob {
-    id: u32,
+    id: EntityId,
     tier: u8,
     home: (f32, f32),
     x: f32,
@@ -358,7 +379,7 @@ struct Mob {
 }
 
 struct Player {
-    entity: u32,
+    id: EntityId,
     principal: String,
     name: String,
     state: MoveState,
@@ -394,6 +415,7 @@ pub struct MobPit {
     world: Arc<MobPitWorld>,
     players: BTreeMap<PlayerId, Player>,
     mobs: Vec<Mob>,
+    pillars: Vec<Pillar>,
     pending: HashMap<String, PendingKill>,
     /// Facts refused by backpressure, retried each tick (oldest first).
     backlog: VecDeque<(PlayerId, Fact, f32, f32)>,
@@ -487,7 +509,7 @@ impl MobPit {
 
     fn emit_kill(&mut self, ctx: &mut Ctx<'_, Self>, killer: PlayerId, mob: usize) {
         let m = &self.mobs[mob];
-        let (x, y, tier, id, generation) = (m.x, m.y, m.tier, m.id, m.generation);
+        let (x, y, tier, id, generation) = (m.x, m.y, m.tier, m.id.get(), m.generation);
         let Some(player) = self.players.get(&killer) else {
             return;
         };
@@ -507,7 +529,7 @@ impl MobPit {
             tier,
             x,
             y,
-            killer: player.entity,
+            killer: player.id.get(),
             killer_name: player.name.clone(),
         });
         self.backlog.push_back((killer, fact, x, y));
@@ -828,12 +850,20 @@ impl Zone for MobPit {
         schema![PlayerView, MobView, PillarView, PitView]
     }
 
+    fn entities() -> Entities<Self> {
+        Entities::new()
+            .each(|z: &Self| &z.players)
+            .each(|z: &Self| &z.mobs)
+            .each(|z: &Self| &z.pillars)
+            .one(|z: &Self| z)
+    }
+
     fn on_create(_ctx: &mut Ctx<'_, Self>, config: MobPitConfig) -> Self {
         let mobs = mob_layout()
             .into_iter()
             .enumerate()
             .map(|(i, (tier, home))| Mob {
-                id: i as u32 + 1,
+                id: EntityId(i as u32 + 1),
                 tier,
                 home,
                 x: home.0,
@@ -853,6 +883,7 @@ impl Zone for MobPit {
             world: config.world,
             players: BTreeMap::new(),
             mobs,
+            pillars: Pillar::all(),
             pending: HashMap::new(),
             backlog: VecDeque::new(),
             board_version: u64::MAX,
@@ -879,11 +910,11 @@ impl Zone for MobPit {
             .or(ticket_name)
             .unwrap_or_else(|| principal.clone());
         let (x, y) = spawn_point(player);
-        let entity = 1000 + player.0;
+        let entity = EntityId(1000 + player.0);
         self.players.insert(
             player,
             Player {
-                entity,
+                id: entity,
                 principal: principal.clone(),
                 name,
                 state: MoveState {
@@ -905,7 +936,7 @@ impl Zone for MobPit {
         ctx.send(
             player,
             &PitEvent::Hello {
-                entity,
+                entity: entity.get(),
                 half: movement::HALF,
                 boot: self.world.boot().to_string(),
                 attack_range: ATTACK_RANGE,
@@ -1035,68 +1066,77 @@ impl Zone for MobPit {
     fn has_pending_work(&self) -> bool {
         !self.backlog.is_empty()
     }
+}
 
-    fn replicate(&self, out: &mut WorldView) {
-        for p in self.players.values() {
-            let s = p.state;
-            let view = PlayerView {
-                x: s.x,
-                y: s.y,
-                vx: s.vx,
-                vy: s.vy,
-                dash: s.dash,
-                cd: s.cd,
-                name: p.name.clone(),
-                hp: p.hp.clamp(0, 255) as u8,
-                face: p.face,
-                swing: p.swing_anim,
-                level: p.level.min(u32::from(u16::MAX)) as u16,
-                dead: p.dead_until.is_some(),
-            };
-            out.add(p.entity, &view);
+impl Entity for Player {
+    fn entity_id(&self) -> EntityId {
+        self.id
+    }
+}
+
+impl Project<PlayerView> for Player {
+    fn view(&self) -> Option<PlayerView> {
+        Some(PlayerView::project(
+            self,
+            PlayerViewRest {
+                hp: self.hp.clamp(0, 255) as u8,
+                swing: self.swing_anim,
+                level: self.level.min(u32::from(u16::MAX)) as u16,
+                dead: self.dead_until.is_some(),
+            },
+        ))
+    }
+}
+
+impl Entity for Mob {
+    fn entity_id(&self) -> EntityId {
+        self.id
+    }
+}
+
+impl Project<MobView> for Mob {
+    fn view(&self) -> Option<MobView> {
+        if self.state == MobState::Dead {
+            return None;
         }
-        for m in &self.mobs {
-            if m.state == MobState::Dead {
-                continue;
-            }
-            let max_hp = tier_stats(m.tier).0;
-            let tele = if m.state == MobState::Windup {
-                255 - (u32::from(m.timer) * 255 / u32::from(WINDUP_TICKS))
-            } else {
-                0
-            };
-            let view = MobView {
-                x: m.x,
-                y: m.y,
-                face: m.face,
-                tier: m.tier,
-                hp: (m.hp.max(0) * 100 / max_hp) as u8,
-                state: m.state as u8,
-                tele: tele as u8,
-            };
-            out.add(m.id, &view);
-        }
-        for (i, (x, y, r)) in PILLARS.iter().enumerate() {
-            out.add(
-                100 + i as u32,
-                &PillarView {
-                    x: *x,
-                    y: *y,
-                    r: *r,
-                },
-            );
-        }
-        let clamp16 = |n: usize| n.min(65_535) as u16;
-        let stats = PitView {
-            pending: clamp16(self.pending.len()),
-            slow_ms: self.world.sink_state().latency().as_millis().min(65_535) as u16,
-            tick_ms: self.tick_ms,
-            tick_max_ms: self.tick_max_ms,
-            work_us: self.work_us as u32,
-            committed: self.committed,
-            backlog: clamp16(self.backlog.len()),
+        let max_hp = tier_stats(self.tier).0;
+        let tele = if self.state == MobState::Windup {
+            255 - (u32::from(self.timer) * 255 / u32::from(WINDUP_TICKS))
+        } else {
+            0
         };
-        out.add(PIT_ENTITY, &stats);
+        Some(MobView::project(
+            self,
+            MobViewRest {
+                hp: (self.hp.max(0) * 100 / max_hp) as u8,
+                state: self.state as u8,
+                tele: tele as u8,
+            },
+        ))
+    }
+}
+
+impl Entity for MobPit {
+    fn entity_id(&self) -> EntityId {
+        PIT_ENTITY
+    }
+}
+
+impl Project<PitView> for MobPit {
+    fn view(&self) -> Option<PitView> {
+        let clamp16 = |n: usize| n.min(65_535) as u16;
+        Some(PitView::project(
+            self,
+            PitViewRest {
+                pending: clamp16(self.pending.len()),
+                slow_ms: self.world.sink_state().latency().as_millis().min(65_535) as u16,
+                tick_ms: self.tick_ms,
+                tick_max_ms: self.tick_max_ms,
+                work_us: self.work_us as u32,
+                committed: self.committed,
+                backlog: clamp16(self.backlog.len()),
+            },
+        ))
     }
 }
 
@@ -1144,4 +1184,183 @@ pub fn encode_bot_input(dir: [f32; 2]) -> Vec<u8> {
         buttons: PitInput::ATTACK,
     }
     .to_payload()
+}
+
+/// Golden test for the projected views (gr-p16): the hand-written
+/// `replicate()` loop Mob Pit used before its views were projected from
+/// registered entity collections, kept verbatim as the reference. A real
+/// host runs a fight (deaths, windups, respawns); every tick the world the
+/// runtime projects must equal the legacy one, entity for entity, and the
+/// Delta frames built from each must be byte-identical.
+#[cfg(test)]
+mod projection_golden {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use distributed_game::replication::{ClientReplica, EncodedWorld};
+    use distributed_game::{
+        HostConfig, InterestConfig, ManualClock, Role, TicketClaims, Viewer, WorldView, ZoneHost,
+    };
+
+    use super::*;
+    use crate::mobpit::{MobPitWorld, WorldOptions};
+
+    /// The pre-gr-p16 `MobPit::replicate`, unchanged.
+    fn legacy_replicate(pit: &MobPit, out: &mut WorldView) {
+        for p in pit.players.values() {
+            let s = p.state;
+            let view = PlayerView {
+                x: s.x,
+                y: s.y,
+                vx: s.vx,
+                vy: s.vy,
+                dash: s.dash,
+                cd: s.cd,
+                name: p.name.clone(),
+                hp: p.hp.clamp(0, 255) as u8,
+                face: p.face,
+                swing: p.swing_anim,
+                level: p.level.min(u32::from(u16::MAX)) as u16,
+                dead: p.dead_until.is_some(),
+            };
+            out.add(u32::from(p.id), &view);
+        }
+        for m in &pit.mobs {
+            if m.state == MobState::Dead {
+                continue;
+            }
+            let max_hp = tier_stats(m.tier).0;
+            let tele = if m.state == MobState::Windup {
+                255 - (u32::from(m.timer) * 255 / u32::from(WINDUP_TICKS))
+            } else {
+                0
+            };
+            let view = MobView {
+                x: m.x,
+                y: m.y,
+                face: m.face,
+                tier: m.tier,
+                hp: (m.hp.max(0) * 100 / max_hp) as u8,
+                state: m.state as u8,
+                tele: tele as u8,
+            };
+            out.add(u32::from(m.id), &view);
+        }
+        for (i, (x, y, r)) in PILLARS.iter().enumerate() {
+            out.add(
+                100 + i as u32,
+                &PillarView {
+                    x: *x,
+                    y: *y,
+                    r: *r,
+                },
+            );
+        }
+        let clamp16 = |n: usize| n.min(65_535) as u16;
+        let stats = PitView {
+            pending: clamp16(pit.pending.len()),
+            slow_ms: pit.world.sink_state().latency().as_millis().min(65_535) as u16,
+            tick_ms: pit.tick_ms,
+            tick_max_ms: pit.tick_max_ms,
+            work_us: pit.work_us as u32,
+            committed: pit.committed,
+            backlog: clamp16(pit.backlog.len()),
+        };
+        out.add(PIT_ENTITY, &stats);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn projected_world_and_delta_bytes_match_the_legacy_replicate() {
+        let world = MobPitWorld::open(WorldOptions::temporary()).unwrap();
+        let clock = ManualClock::new();
+        let mut host = ZoneHost::<MobPit>::new(
+            "pit-1",
+            HostConfig {
+                boot_epoch: 7,
+                ..HostConfig::default()
+            },
+            Arc::new(clock.clone()),
+            MobPitConfig {
+                guests: Guests::default(),
+                world,
+            },
+        );
+        let mut clients = Vec::new();
+        for name in ["ana", "bo", "cy"] {
+            let claims = TicketClaims::new(name, "pit-1", u64::MAX, name, Role::Player);
+            let joined = host.join(&claims, 0, "").unwrap();
+            let Viewer::Player(player) = joined.viewer else {
+                panic!("player")
+            };
+            clients.push((joined.client, player));
+        }
+        let schema = MobPit::schema();
+        let interest = InterestConfig::default();
+        let (mut legacy_replica, mut projected_replica) =
+            (ClientReplica::new(), ClientReplica::new());
+        let (mut saw_dead, mut saw_windup, mut saw_hurt_player) = (false, false, false);
+        for tick in 0..900u32 {
+            for (i, (client, player)) in clients.iter().enumerate() {
+                // Walk toward the nearest living mob, swinging all the time.
+                let me = host.zone().players[player].state;
+                let target = host
+                    .zone()
+                    .mobs
+                    .iter()
+                    .filter(|m| m.state != MobState::Dead)
+                    .min_by(|a, b| {
+                        dist((me.x, me.y), (a.x, a.y)).total_cmp(&dist((me.x, me.y), (b.x, b.y)))
+                    })
+                    .map(|m| (m.x, m.y))
+                    .unwrap_or((0.0, 0.0));
+                let (dx, dy) = (target.0 - me.x, target.1 - me.y);
+                let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+                let wobble = if (tick / 40 + i as u32).is_multiple_of(3) {
+                    0.4
+                } else {
+                    1.0
+                };
+                let payload = PitInput {
+                    mx: (dx / d * 127.0 * wobble) as i8,
+                    my: (dy / d * 127.0 * wobble) as i8,
+                    buttons: PitInput::ATTACK,
+                }
+                .to_payload();
+                host.push_input(*client, tick + 1, tick, &payload);
+            }
+            clock.advance(Duration::from_micros(33_334));
+            host.advance();
+            host.drain_outbound();
+
+            let mut legacy = WorldView::default();
+            legacy_replicate(host.zone(), &mut legacy);
+            let projected = host.world_view();
+            assert_eq!(projected.entities(), legacy.entities(), "tick {tick}");
+
+            let view = host.zone().players[&clients[0].1].state;
+            let view = View::new(view.x, view.y, VIEW_RADIUS);
+            let frame = |replica: &mut ClientReplica, world: WorldView| {
+                let encoded = EncodedWorld::build(&schema, world, &interest);
+                replica
+                    .build_delta(&schema, &encoded, &interest, &view, 1200, tick, tick)
+                    .0
+            };
+            assert_eq!(
+                frame(&mut projected_replica, projected),
+                frame(&mut legacy_replica, legacy),
+                "delta bytes at tick {tick}"
+            );
+
+            let pit = host.zone();
+            saw_dead |= pit.mobs.iter().any(|m| m.state == MobState::Dead);
+            saw_windup |= pit
+                .mobs
+                .iter()
+                .any(|m| m.state == MobState::Windup && m.timer > 0);
+            saw_hurt_player |= pit.players.values().any(|p| p.hp < PLAYER_HP);
+        }
+        assert!(saw_dead, "a mob died (its view is omitted)");
+        assert!(saw_windup, "a mob telegraphed (derived `tele`)");
+        assert!(saw_hurt_player, "a player took damage");
+    }
 }

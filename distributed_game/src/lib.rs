@@ -59,6 +59,7 @@ pub mod celld;
 pub mod claims;
 pub mod clock;
 pub mod codec;
+pub mod entity;
 pub mod facts;
 pub mod handoff;
 pub mod host;
@@ -93,6 +94,7 @@ pub use codec::{Wire, WireType};
 pub use distributed_game_macros::{
     game_pure, predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated, TicketExtension,
 };
+pub use entity::{Entities, Entity, EntityCollection, EntityId, Project};
 #[cfg(feature = "runtime")]
 pub use facts::spawn_fact_worker;
 pub use facts::{

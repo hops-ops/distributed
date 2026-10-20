@@ -21,7 +21,8 @@
 //!   `FieldType` expression (e.g. a shared `const POS: FieldType`).
 //! - `#[long]` on a `String` payload field: varuint length instead of the
 //!   255-byte short string.
-//! - Replicated only: `#[priority(P)]`, `#[correct(ease = MS | ease | snap | replace)]`.
+//! - Replicated only: `#[priority(P)]`, `#[correct(ease = MS | ease | snap | replace)]`,
+//!   `#[from]` / `#[from(path.to.field)]` (with `#[replicated(.., of = Entity)]`).
 //! - GameInput only: `#[range(min = A, max = B)]` (clamp), `#[buttons(a, b, ..)]`
 //!   (bit flags, unknown bits cleared; also generates `Type::A`, `Type::B` consts).
 
@@ -43,14 +44,21 @@ fn finish(result: syn::Result<proc_macro2::TokenStream>) -> TokenStream {
 }
 
 /// One replicated entity kind: `#[replicated(kind = "mob", id = 2,
-/// priority = 2.0, global, x = field, y = field)]` on a struct with named
-/// fields (Rust type → wire type: `bool`, `u8`, `u16`, `u32`, `i32`, `f32`,
-/// `String` → short_str, `Vec<u8>` → bytes). The interest position is the
-/// `x`/`y` fields unless overridden; a kind without a position must be
-/// `global`.
+/// priority = 2.0, global, x = field, y = field, of = Entity)]` on a struct
+/// with named fields (Rust type → wire type: `bool`, `u8`, `u16`, `u32`,
+/// `i32`, `f32`, `String` → short_str, `Vec<u8>` → bytes). The interest
+/// position is the `x`/`y` fields unless overridden; a kind without a
+/// position must be `global`.
+///
+/// `of = Entity` makes the struct a view projected from a zone entity
+/// (`distributed_game::entity`): fields marked `#[from]` (same name) or
+/// `#[from(path.to.field)]` are copied from the entity, and the derive
+/// generates `View::project(&entity, ViewRest { .. })`, `ViewRest` holding
+/// the remaining hand-filled fields. When every field is `#[from]` it
+/// generates `View::project(&entity)` and `impl Project<View> for Entity`.
 #[proc_macro_derive(
     Replicated,
-    attributes(replicated, quant, angle, field_type, priority, correct)
+    attributes(replicated, quant, angle, field_type, priority, correct, from)
 )]
 pub fn derive_replicated(input: TokenStream) -> TokenStream {
     finish(replicated::expand(parse_macro_input!(input as DeriveInput)))

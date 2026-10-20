@@ -300,8 +300,18 @@ pub trait Zone: Sized + Send + 'static {
         false
     }
 
-    /// Describe replicated entities for this patch.
-    fn replicate(&self, out: &mut WorldView);
+    /// The zone's entity collections, registered once at creation
+    /// ([`entity`](crate::entity)): every patch the host pushes each
+    /// entity's [`Project`](crate::Project)ed view (in registration order),
+    /// then calls [`replicate`](Self::replicate). Default: none.
+    fn entities() -> crate::Entities<Self> {
+        crate::Entities::new()
+    }
+
+    /// Describe replicated entities for this patch that are not projected
+    /// from a registered collection ([`entities`](Self::entities)).
+    /// Default: nothing.
+    fn replicate(&self, _out: &mut WorldView) {}
 
     /// Record hit volumes for lag compensation after each tick
     /// ([`Ctx::rewind`](crate::Ctx::rewind)). Default: nothing recorded.
