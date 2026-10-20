@@ -90,8 +90,8 @@ drain. The Worker's `alarm()` handler calls `AggregateCell::alarm(&env)`,
 which fires due alarms, then drains the outbox and re-plans the wake.
 Commands that arm an alarm move the wake earlier right after they commit.
 
-**Reference host.** The in-process host and native `cell-sqlite` cells have
-no timer. Give the store a `ManualClock`
+**Reference host.** The in-process host (unit tests; durable cells run on
+celld) has no timer. Give the store a `ManualClock`
 (`CellStreamStore::with_clock`), advance it and call
 `AggregateCell::fire_due_alarms()`: the same ledger and settlement path runs
 deterministically.
@@ -248,7 +248,7 @@ A test network delivers outbox rows whose `deliver_at` is due on a
 ```sh
 cargo test --features sqlite,postgres --test saga_transfer --test coordination_lease --test scheduled_outbox
 cargo test --features sqlite --lib -- outbox lease clock
-cargo test --features cell-sqlite,workers-rs --lib cell_host
+cargo test --features workers-rs --lib cell_host
 (cd tests/celld/alarm-worker && worker-build --release) && node tests/celld/alarms.mjs
 ```
 

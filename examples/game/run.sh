@@ -26,10 +26,17 @@
 # Env: GAME_DEMOS_PORT (server, default 2567), GAME_DEMOS_CLIENT_PORT (Vite,
 # default 5173), DG_NET_LATENCY_MS / DG_NET_JITTER_MS / DG_NET_LOSS (initial
 # server NetSim; the HUD sliders change it live), MOBPIT_DATA_DIR (Mob Pit /
-# Leaderboard cells, default examples/game/.data/mobpit), REDIS_URL (Redis
-# leaderboard instead of in-memory), SVELTEKIT_PORT (SvelteKit demo, default
-# 5573; its game server uses GAME_DEMOS_PORT, default 2967 there, and its
-# read-model service MOBPIT_SERVICE_PORT, default GAME_DEMOS_PORT + 2).
+# Leaderboard local files and their `celld dev` state, default
+# examples/game/.data/mobpit), REDIS_URL (Redis leaderboard instead of
+# in-memory), SVELTEKIT_PORT (SvelteKit demo, default 5573; its game server
+# uses GAME_DEMOS_PORT, default 2967 there, and its read-model service
+# MOBPIT_SERVICE_PORT, default GAME_DEMOS_PORT + 2).
+#
+# celld: Mob Pit's durable cells (examples/game/cells) run on celld, never
+# natively. CELLD_BIN names the binary (default: `celld` on PATH; 0.6.2 or
+# newer is required), CELLD_PORT its port (default GAME_DEMOS_PORT + 3),
+# CELLD_ESBUILD its bundler (default: the client's esbuild). The worker is
+# built with worker-build (`cargo install worker-build --locked`).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,7 +46,11 @@ CLIENT="$HERE/client"
 SVELTEKIT="$HERE/sveltekit"
 BIN="$SERVER/target/debug/game-demos"
 SERVICE_BIN="$SERVER/target/debug/mobpit-service"
+CELLS="$HERE/cells"
 DEMOS=(arena mobpit leaderboard gallery freeze grid ripple)
+# Demos whose durable state lives in celld cells.
+CELLD_DEMOS=(mobpit leaderboard)
+CELLD_MIN_VERSION="0.6.2"
 export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
 # Multi-host demos: `game-demos <demo> --host-id A|B --peer …`.
 CLUSTER_DEMOS=(grid ripple)
@@ -77,6 +88,92 @@ ensure_sveltekit() {
 		log "installing SvelteKit demo dependencies (npm ci)"
 		(cd "$SVELTEKIT" && npm ci --no-audit --no-fund)
 	fi
+}
+
+# ensure_celld: resolve CELLD_BIN (>= CELLD_MIN_VERSION) and CELLD_ESBUILD.
+ensure_celld() {
+	CELLD_BIN="${CELLD_BIN:-$(command -v celld || true)}"
+	if [[ -z "$CELLD_BIN" || ! -x "$CELLD_BIN" ]]; then
+		echo "celld not found: set CELLD_BIN to a celld $CELLD_MIN_VERSION+ binary" >&2
+		echo "  (install: curl -fsSL https://celld.dev/install.sh | CELLD_VERSION=v$CELLD_MIN_VERSION sh)" >&2
+		exit 1
+	fi
+	local version
+	version="$("$CELLD_BIN" --version 2>/dev/null | sed -n 's/^celld \([0-9][0-9.]*\).*/\1/p' | head -1)"
+	if [[ -z "$version" ]] || [[ "$(printf '%s\n%s\n' "$CELLD_MIN_VERSION" "$version" | sort -V | head -1)" != "$CELLD_MIN_VERSION" ]]; then
+		echo "$CELLD_BIN is celld ${version:-(unknown)}; Mob Pit needs celld $CELLD_MIN_VERSION or newer (set CELLD_BIN)" >&2
+		exit 1
+	fi
+	if [[ -z "${CELLD_ESBUILD:-}" ]]; then
+		ensure_client
+		CELLD_ESBUILD="$CLIENT/node_modules/.bin/esbuild"
+	fi
+	export CELLD_BIN CELLD_ESBUILD
+}
+
+# ensure_cells: build the Mob Pit cells worker when its sources changed.
+ensure_cells() {
+	local marker="$CELLS/build/worker/shim.mjs"
+	if [[ ! -f "$marker" ]] || [[ -n "$(find "$CELLS/src" "$CELLS/Cargo.toml" "$SERVER/crawler" "$REPO/src" "$REPO/distributed_game/src" -newer "$marker" -name '*.rs' -print -quit 2>/dev/null)" ]] ||
+		[[ "$CELLS/Cargo.toml" -nt "$marker" ]]; then
+		command -v worker-build >/dev/null || {
+			echo "worker-build not found: cargo install worker-build --locked" >&2
+			exit 1
+		}
+		log "building the Mob Pit cells worker (worker-build)"
+		(cd "$CELLS" && worker-build --release >/dev/null)
+	fi
+}
+
+# kill_tree <pid>: stop a process and every descendant (celld dev starts its
+# node in a session of its own, so collect the tree while the root is stopped).
+kill_tree() {
+	local root="$1" pids=() frontier=("$1") next pid
+	kill -STOP "$root" 2>/dev/null || return 0
+	while ((${#frontier[@]})); do
+		next=()
+		for pid in "${frontier[@]}"; do
+			pids+=("$pid")
+			while read -r child; do next+=("$child"); done < <(pgrep -P "$pid" 2>/dev/null || true)
+		done
+		frontier=("${next[@]+"${next[@]}"}")
+	done
+	kill -KILL "${pids[@]}" 2>/dev/null || true
+}
+
+# start_celld <project> <port> <relay port>: `celld dev` with the cells
+# worker in <project> (its state persists in <project>/.celld/dev), relaying
+# the outbox Queue to the game server on <relay port>. Sets CELLD_PID,
+# CELLD_URL and DISTRIBUTED_INTERNAL_SECRET (persisted in the project).
+start_celld() {
+	local project="$1" port="$2" relay_port="$3"
+	ensure_celld
+	ensure_cells
+	mkdir -p "$project"
+	rm -rf "$project/build"
+	cp -R "$CELLS/build" "$project/build"
+	cp "$CELLS/wrangler.jsonc" "$project/wrangler.jsonc"
+	if [[ ! -s "$project/internal-secret" ]]; then
+		(umask 077 && printf 'test-only-%s' "$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')" >"$project/internal-secret")
+	fi
+	DISTRIBUTED_INTERNAL_SECRET="$(cat "$project/internal-secret")"
+	printf 'DISTRIBUTED_INTERNAL_SECRET=%s\nCELLD_QUEUE_RELAY_URL=http://127.0.0.1:%s/internal/celld-queue/relay\n' \
+		"$DISTRIBUTED_INTERNAL_SECRET" "$relay_port" >"$project/.dev.vars"
+	log "starting celld dev on :$port ($("$CELLD_BIN" --version 2>/dev/null | tail -1); state in $project/.celld/dev)"
+	RUST_LOG=warn "$CELLD_BIN" dev "$project" --host 127.0.0.1 --port "$port" --no-watch --logs >"$project/celld.log" 2>&1 &
+	CELLD_PID=$!
+	CELLD_URL="http://127.0.0.1:$port"
+	for _ in $(seq 1 300); do
+		curl -fsS "$CELLD_URL/health" >/dev/null 2>&1 && break
+		if ! kill -0 "$CELLD_PID" 2>/dev/null; then
+			tail -20 "$project/celld.log"
+			echo "celld dev failed to start" >&2
+			exit 1
+		fi
+		sleep 0.2
+	done
+	curl -fsS "$CELLD_URL/health" >/dev/null || { tail -20 "$project/celld.log"; echo "celld dev not ready" >&2; exit 1; }
+	export CELLD_URL DISTRIBUTED_INTERNAL_SECRET
 }
 
 ensure_server() {
@@ -147,11 +244,15 @@ run_demo() {
 	ensure_server
 	ensure_wasm
 
+	CELLD_PID=""
+	if [[ " ${CELLD_DEMOS[*]} " == *" $demo "* ]]; then
+		start_celld "$MOBPIT_DATA_DIR/celld" "${CELLD_PORT:-$((port + 3))}" "$port"
+	fi
 	local log_file
 	log_file="$(mktemp -t game-demos.XXXXXX)"
 	"$BIN" "$demo" --dev --port "$port" >"$log_file" 2>&1 &
 	local server_pid=$!
-	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; rm -f "$log_file"' EXIT INT TERM
+	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; [[ -z "$CELLD_PID" ]] || kill_tree "$CELLD_PID"; rm -f "$log_file"' EXIT INT TERM
 	for _ in $(seq 1 100); do
 		grep -q '^LISTENING' "$log_file" && break
 		if ! kill -0 "$server_pid" 2>/dev/null; then
@@ -247,13 +348,14 @@ run_sveltekit() {
 	ensure_server
 	ensure_cli
 	mkdir -p "$data"
+	start_celld "$data/celld" "${CELLD_PORT:-$((port + 3))}" "$port"
 	local log_file secret
 	log_file="$(mktemp -t game-demos-sveltekit.XXXXXX)"
 	secret="${DISTRIBUTED_GAME_SECRET:-$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')}"
 	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" mobpit --port "$port" \
 		--data-dir "$data" --projection-bus "sqlite:$data/bus.db" >"$log_file" 2>&1 &
 	local server_pid=$!
-	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; rm -f "$log_file"' EXIT INT TERM
+	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; kill_tree "$CELLD_PID"; rm -f "$log_file"' EXIT INT TERM
 	wait_listening "$log_file" "$server_pid" "game-demos mobpit"
 	api_keys
 	echo
@@ -275,11 +377,16 @@ run_sveltekit() {
 smoke() {
 	ensure_sdk
 	ensure_client
+	# Mob Pit's tests start their own `celld dev` (CELLD_BIN) on the worker.
+	ensure_celld
+	ensure_cells
 	log "generated clients are current; predicted steps and pure functions compiled to WASM"
 	gen --check
 	log "server: fmt, clippy, tests (bots smoke)"
 	cargo fmt --manifest-path "$SERVER/Cargo.toml" --check -p game_demos -p game_sim -p mobpit_crawler -p mobpit_service
+	cargo fmt --manifest-path "$CELLS/Cargo.toml" --check
 	cargo clippy --quiet --manifest-path "$SERVER/Cargo.toml" --workspace --all-targets -- -D warnings
+	cargo clippy --quiet --manifest-path "$CELLS/Cargo.toml" --target wasm32-unknown-unknown -- -D warnings
 	cargo test --quiet --manifest-path "$SERVER/Cargo.toml" --workspace
 	cargo build --quiet --manifest-path "$SERVER/Cargo.toml" --workspace --bins
 	log "client: type-check, build, tests (WASM steps + pure functions exact match, headless SDK)"
@@ -302,7 +409,7 @@ case "${1:-}" in
 	gen) gen "${2:-}" ;;
 	sveltekit) run_sveltekit ;;
 	list) printf '%s\n' "${DEMOS[@]}" sveltekit ;;
-	"" | -h | --help | help) sed -n '2,32p' "$0" ;;
+	"" | -h | --help | help) sed -n '2,39p' "$0" ;;
 	*)
 		if [[ " ${CLUSTER_DEMOS[*]} " == *" $1 "* ]]; then
 			run_cluster "$1"

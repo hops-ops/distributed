@@ -14,10 +14,7 @@ include!(concat!(env!("OUT_DIR"), "/migration_inventory.rs"));
 /// Cells host commands, not read-model projectors. These are the event,
 /// snapshot, delivery and command-ledger migrations from the native inventory.
 /// Projection-owned tables are initialized by their separate query host.
-#[cfg(any(
-    all(feature = "workers-rs", target_arch = "wasm32"),
-    all(feature = "cell-sqlite", not(target_arch = "wasm32"))
-))]
+#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
 pub(crate) fn cell_migrations() -> impl Iterator<Item = &'static EmbeddedMigration> {
     SQLITE_MIGRATIONS
         .iter()

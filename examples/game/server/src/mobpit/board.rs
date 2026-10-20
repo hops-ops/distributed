@@ -34,7 +34,7 @@ use distributed_game::GameRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::crawler::{KillReceipt, MobKilledArgs, AGGREGATE_TYPE, MOB_KILLED_EVENT};
+use super::crawler::{KillReceipt, AGGREGATE_TYPE};
 use super::store::CrawlerCells;
 
 /// Kills board.
@@ -436,33 +436,24 @@ impl Leaderboards {
         let before = self.top_rows().await.map_err(|e| e.to_string())?;
         let mut occurrences = Vec::new();
         let mut expected: BTreeMap<String, (u32, u64)> = BTreeMap::new();
-        let principals = cells.principals();
+        let principals = cells.principals().await?;
         for principal in &principals {
-            let cell = cells.get(principal).map_err(|e| e.to_string())?;
-            for record in cell.history().await.map_err(|e| e.to_string())? {
-                if record.event_name != MOB_KILLED_EVENT {
-                    continue;
-                }
-                let (crawler, name, mob, tier, xp): MobKilledArgs =
-                    record.decode().map_err(|e| e.to_string())?;
-                self.remember_name(&crawler, &name);
-                let at_ms = record
-                    .timestamp
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as u64);
+            let view = cells.crawler(principal).await?;
+            for kill in view.kills {
+                self.remember_name(&kill.crawler, &kill.name);
                 occurrences.push(kill_occurrence(
                     principal,
-                    record.sequence,
-                    at_ms,
+                    kill.sequence,
+                    kill.at_ms,
                     &MobKilled {
-                        crawler,
-                        mob,
-                        tier,
-                        xp,
+                        crawler: kill.crawler,
+                        mob: kill.mob,
+                        tier: kill.tier,
+                        xp: kill.xp,
                     },
                 )?);
             }
-            if let Some(state) = cell.load().await.map_err(|e| e.to_string())? {
+            if let Some(state) = view.state {
                 expected.insert(principal.clone(), (state.kills, state.xp));
             }
         }

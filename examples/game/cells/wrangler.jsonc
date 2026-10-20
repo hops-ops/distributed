@@ -1,0 +1,37 @@
+// Mob Pit cells for `celld dev` (and `celld deploy`). The launcher
+// (`examples/game/run.sh`, the test harnesses) writes `.dev.vars` beside a
+// copy of this file with DISTRIBUTED_INTERNAL_SECRET and
+// CELLD_QUEUE_RELAY_URL (the zone server's `/internal/celld-queue/relay`).
+{
+  "name": "mobpit-cells",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "CRAWLER", "class_name": "CrawlerCell" },
+      { "name": "CRAWLER_ROSTER", "class_name": "CrawlerRosterCell" },
+      { "name": "PRESENCE", "class_name": "PresenceCell" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["CrawlerCell", "CrawlerRosterCell", "PresenceCell"] }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "OUTBOX", "queue": "mobpit-outbox" }
+    ],
+    "consumers": [
+      {
+        "queue": "mobpit-outbox",
+        "max_batch_size": 10,
+        "max_batch_timeout": 1,
+        "max_retries": 100,
+        "dead_letter_queue": "mobpit-outbox-dlq",
+        "retry_delay": 2
+      }
+    ]
+  },
+  "vars": {
+    "OUTBOX_DRAIN_INTERVAL_MS": "5000"
+  }
+}

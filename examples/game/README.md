@@ -9,7 +9,7 @@ guests and lets any page change the network simulation.
 | Demo | Run | Mechanic it demonstrates |
 |---|---|---|
 | **Arena** | `./run.sh arena` | Fixed 30 Hz tick / 20 Hz patches, binary deltas, interest management (view ring, drones pop in/out), client prediction + reconciliation (the Rust movement step compiled to WebAssembly, bit-exact), interpolation of remote entities, live latency/jitter/loss |
-| **Mob Pit** | `./run.sh mobpit` | Authoritative melee combat vs. 12 telegraphing mobs; kills are **non-blocking durable facts** committed exactly once into per-player native SQLite cells (`cell-sqlite`); "slow storage" toggle (tick stays flat, pending facts climb); `kill -9` crash recovery; presence (`/dev/mobpit/presence`) projected from the runtime's player lifecycle facts |
+| **Mob Pit** | `./run.sh mobpit` | Authoritative melee combat vs. 12 telegraphing mobs; kills are **non-blocking durable facts** committed exactly once into per-player celld cells (`cells/`, `celld dev` started by `run.sh`); "slow storage" toggle (tick stays flat, pending facts climb); `kill -9` crash recovery; presence cells fed by the runtime's player lifecycle facts (`/dev/mobpit/presence`) |
 | **Leaderboard** | `./run.sh leaderboard` | Same server as Mob Pit: kills/XP sorted-set boards (in-memory or Redis) fed fire-and-forget with idempotent apply keys, top 10 pushed live, your rank + neighbours, rebuild from the cells' event history |
 | **Shooting Gallery** | `./run.sh gallery` | Lag compensation: hitscan shots resolved with `ctx.rewind().hit_test_shot` at the shooter's view time (`client_tick` + interpolation delay in the payload), `max_rewind` clamp, per-shot compensation on/off, predicted vs confirmed hits |
 | **The Freeze** | `./run.sh freeze` | World-version barrier (`WorldCoordinator::rollout`) across **two server processes** as an in-world "admin update": freeze → apply → resume with change notes, inputs dropped while frozen, Hard reload vs safe-room gating (`StalePolicy::SafeRoom`, `Zone::is_gate`) of old clients, aborted rollout (`freeze_ready` → `NotAcked`), facts/events stamped with the content version |
@@ -225,9 +225,12 @@ examples/game/run.sh sveltekit     # → http://localhost:5573/ — sign in with
 
 `sveltekit/` is Mob Pit as a SvelteKit app over two backends: the Mob Pit
 zone server (gameplay) and `mobpit-service` (the business-side read model).
-The script starts `game-demos mobpit` (no `--dev`) on `GAME_DEMOS_PORT`
-(default 2967 here; data in `.data/mobpit-sveltekit`) with a fresh ticket secret and
-`--projection-bus sqlite:…/bus.db`, then runs `distributed dev server/`: the
+The script starts `celld dev` with the Mob Pit cells (`cells/`; state in
+`.data/mobpit-sveltekit/celld`), then `game-demos mobpit` (no `--dev`) on
+`GAME_DEMOS_PORT` (default 2967 here; data in `.data/mobpit-sveltekit`) with
+a fresh ticket secret and `--projection-bus sqlite:…/bus.db` (celld's outbox
+Queue relays the Crawler domain events to it), then runs
+`distributed dev server/`: the
 application lifecycle generates the `$distributed` GraphQL client, starts
 `mobpit-service` on `MOBPIT_SERVICE_PORT` (default `GAME_DEMOS_PORT + 2`)
 and `vite dev` on `SVELTEKIT_PORT` (default 5573). What each piece replaces:
@@ -436,17 +439,23 @@ after dying. Level `n` starts at `40·(n−1)²` XP.
    `emit_fact_for` only enqueues: the host binds the killer's **verified
    ticket principal**; the zone never awaits storage. Backpressure (256
    unsettled facts) parks facts in a backlog retried next tick.
-2. The zone's fact worker (`GameServer::with_fact_sink`) runs
-   `store::CrawlerFactSink`: optional artificial latency, then
-   `CellFactSink::commit` into the killer's own cell
-   (`$MOBPIT_DATA_DIR/Crawler%3A{principal}.sqlite3`, `AggregateCell::from_store`
-   over `CellStreamStore::open_sqlite`). The command id is
+2. The zone's fact worker (`GameServer::with_fact_sink`, retrying until
+   settled) runs `store::MobPitFactSink`: optional artificial latency, then
+   `distributed_game::celld::CelldFactSink` posts the fact over the
+   internal path (`DISTRIBUTED_INTERNAL_SECRET`, principal and `FactStamp`
+   as trusted headers) to the killer's own celld cell, `crawler/{principal}`
+   (`cells/`, a workers-rs Durable Object per player). The command id is
    `sha256(service ‖ fact key)`, so the cell's command ledger turns any repeat
-   of the key into a replay of the stored receipt.
-3. `crawler.rs`: `crawler.record_kill` takes the principal from the trusted
-   session (`x-user-id`) and **decides the XP from the tier**; the input has
-   no identity or XP field and unknown fields are rejected. Event, ledger
-   receipt and snapshot commit in one SQLite transaction (`synchronous=FULL`).
+   of the key into a replay of the stored receipt. Before a principal's first
+   kill the sink enlists it in the `crawler-roster/all` cell (celld cannot
+   enumerate cells; the roster is what the board rebuild and
+   `/dev/mobpit/crawlers` read). celld down: the fact stays queued in the
+   zone (backpressure at capacity), never in a local store.
+3. `crawler/src/lib.rs`: `crawler.record_kill` (a `#[command]` method) takes
+   the principal from the trusted session (`x-user-id`) and **decides the XP
+   from the tier**; the input has no identity or XP field and unknown fields
+   are rejected. Event, ledger receipt, snapshot and outbox row commit in one
+   Durable Object SQLite transaction.
 4. Tick N+k: `Zone::on_fact_settled` sends the killer `saved` (with
    `waitedMs`) and `profile`; the popup turns from "saving…" to
    "+XP saved ✓". The sink also hands the kill to the leaderboard
@@ -454,10 +463,13 @@ after dying. Level `n` starts at `40·(n−1)²` XP.
 5. The read model (`crawler/`, `service/`): `crawler.mob_killed` is a
    **domain event** — the same transaction writes the post-kill
    `CrawlerState` (principal, name, XP, kills, level) to the cell's outbox
-   (`repo.publish_events()`). With `--projection-bus sqlite:<file>` the sink
-   drains that outbox onto a `SqliteBus` after the commit (and a sweep drains
-   every cell at startup and every 2 s, so a crash between commit and drain
-   or a bus outage only delays it). `mobpit-service` consumes the bus with a
+   (`repo.publish_events()`). celld drains the outbox to the `mobpit-outbox`
+   Queue; the cells worker's Queue consumer relays each message to the zone
+   server's `/internal/celld-queue/relay` (secret-authenticated), which
+   publishes it onto the `SqliteBus` at `--projection-bus` (default
+   `sqlite:{data-dir}/bus.db`). A crash between commit and drain, or a relay
+   outage, only delays it (the cell's alarm re-drains; the Queue retries).
+   `mobpit-service` consumes the bus with a
    modeled projector (`projection!` → `upsert_player_stats`), checkpointed
    and deduplicated in its own SQLite database, and serves `player_stats`
    over GraphQL with `@live`. The service has no commands: nothing on that
@@ -484,13 +496,16 @@ examples/game/run.sh mobpit                      # restart (same .data/mobpit), 
 
 The ticket secret is persisted in the data dir (`dev-ticket-secret`), so the
 page's guest token still maps to the same principal, and the profile comes
-back from the cell. What survives:
+back from the cell. `run.sh` keeps celld's state in `.data/mobpit/celld`
+(`.celld/dev`), so celld itself can be killed and restarted too. What
+survives:
 
-- **Settled facts** (you saw "saved ✓"): durable. The commit was acknowledged
-  only after the SQLite transaction (event + ledger receipt) was fsynced.
+- **Settled facts** (you saw "saved ✓"): durable. celld acknowledged the
+  commit only after the cell's SQLite transaction (event + ledger receipt)
+  was durable.
 - **Facts in flight** at the crash: each is either fully committed (the
-  transaction finished; you just never saw the settlement) or not at all
-  (rolled back with the WAL) — never half-applied, never twice. The zone's
+  transaction finished; you just never saw the settlement) or not at all —
+  never half-applied, never twice. The zone's
   in-memory state (mob HP, positions, the fact queue) dies with the process,
   so an uncommitted kill is lost like any other unsaved world state; there is
   no zone-side outbox (see `distributed_game` README, *Facts on dispose*).
@@ -501,12 +516,21 @@ back from the cell. What survives:
   epoch (`Ctx::boot_epoch`, grows across restarts) because zone ticks and
   mob generations restart at 0.
 
-`tests/mobpit_smoke.rs` proves it with the real binary: bots fight, storage is
-made slow, the server gets `SIGKILL` with facts in flight, restarts on the
-same directory; then `settled ≤ durable kills ≤ settled + in flight`, the
-board (rebuilt at boot) equals the cells, and re-committing a pre-crash fact
-(same key and input) against the files returns the original receipt with
-`replayed: true` and unchanged kills.
+`tests/mobpit_smoke.rs` proves it with the real binary on its own
+`celld dev`: bots fight, storage is made slow, the server gets `SIGKILL` with
+facts in flight, then celld is killed (`SIGKILL` of its process tree) and
+restarted on its state, and the server restarts; then `settled ≤ durable
+kills ≤ settled + in flight`, the board (rebuilt at boot) equals the cells,
+and re-committing a pre-crash fact (same key and input) returns the original
+receipt with `replayed: true` and unchanged kills.
+
+**celld.** `run.sh mobpit|leaderboard|sveltekit|smoke` need celld 0.6.2+
+(`CELLD_BIN`, default `celld` on PATH; install with
+`curl -fsSL https://celld.dev/install.sh | CELLD_VERSION=v0.6.2 sh`) and
+`worker-build` (`cargo install worker-build --locked`) for `cells/`. The
+tests (`tests/mobpit_smoke.rs`, `service/tests/projection.rs`, the headless
+and Playwright tests) each start their own `celld dev` on a temp project
+(`game_demos::devcelld`, `client/tests/helpers/celld.mjs`).
 
 ## Leaderboard
 

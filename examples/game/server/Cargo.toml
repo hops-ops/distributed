@@ -30,10 +30,13 @@ game_sim = { path = "sim" }
 # The Crawler aggregate + RecordKill (shared with the read-model service).
 mobpit_crawler = { path = "crawler" }
 distributed_game = { path = "../../../distributed_game", features = ["net", "cell", "celld", "sqlite"] }
-# Mob Pit: native durable SQLite cells + sorted-set leaderboards (Redis optional
-# at runtime) + the SQLite bus for the read-model service.
-distributed = { path = "../../..", features = ["cell-sqlite", "redis", "sqlite"] }
-# The SQLite bus the cells' domain events are drained onto (`--projection-bus`).
+# Mob Pit: sorted-set leaderboards (Redis optional at runtime) + the SQLite
+# bus for the read-model service. Its durable cells run on celld
+# (`examples/game/cells`), reached with `distributed_game`'s `celld` feature.
+distributed = { path = "../../..", features = ["redis", "sqlite"] }
+# Reads of the celld cells over the internal path.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# The SQLite bus the cells' domain events are relayed onto (`--projection-bus`).
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 axum = { version = "0.8", default-features = false, features = ["json", "query", "tokio", "http1"] }
 clap = { version = "4", features = ["derive", "env"] }

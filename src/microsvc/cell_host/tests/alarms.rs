@@ -461,63 +461,6 @@ async fn repositories_without_an_alarm_slot_reject_alarm_writes() {
     assert!(error.to_string().contains("aggregate cell"), "{error}");
 }
 
-/// The SQL alarm table shared with Durable Object cells, on a native SQLite
-/// file: same transaction as the events, and armed rows survive a reopen.
-#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-#[tokio::test]
-async fn sqlite_cell_alarms_commit_atomically_and_survive_reopening() {
-    use super::super::CellSqlitePath;
-
-    let root =
-        std::env::temp_dir().join(format!("distributed-cell-alarms-{}", uuid::Uuid::now_v7()));
-    let location = CellSqlitePath::root(&root);
-    let clock = clock();
-    let open = |clock: &ManualClock| {
-        let store =
-            CellStreamStore::open_sqlite(&location, StreamIdentity::new("Ticker", "t1").unwrap())
-                .unwrap()
-                .with_clock(clock.clone());
-        mount(AggregateCell::from_store(store).unwrap())
-    };
-
-    let cell = open(&clock);
-    let refused = cell
-        .dispatch_idempotent(
-            "ticker.start",
-            &identity("0190a000-0000-7000-8000-000000000002"),
-            json!({ "id": "t1", "limit": 3, "period_ms": 1000, "fail_after_arming": true, "tick_command": "ticker.tick" }),
-            owner_session(),
-        )
-        .await;
-    assert!(refused.is_err());
-    assert!(cell.armed_alarms().unwrap().is_empty());
-    start(&cell, json!({ "id": "t1", "limit": 3, "period_ms": 1000, "fail_after_arming": false, "tick_command": "ticker.tick" })).await;
-    drop(cell);
-
-    let cell = open(&clock);
-    assert_eq!(cell.armed_alarms().unwrap().len(), 1);
-    clock.advance(Duration::from_secs(1));
-    assert_eq!(cell.fire_due_alarms().await.unwrap().fired.len(), 1);
-    drop(cell);
-
-    // Restart between ticks: the re-armed generation is still there, once.
-    let cell = open(&clock);
-    let armed = cell.armed_alarms().unwrap();
-    assert_eq!(armed.len(), 1);
-    assert_eq!(armed[0].generation, 2);
-    assert!(cell.fire_due_alarms().await.unwrap().is_empty());
-    for _ in 0..2 {
-        clock.advance(Duration::from_secs(1));
-        assert_eq!(cell.fire_due_alarms().await.unwrap().fired.len(), 1);
-    }
-    assert_eq!(ticks(&cell).await, 3);
-    assert!(cell.armed_alarms().unwrap().is_empty());
-    clock.advance(Duration::from_secs(60));
-    assert!(cell.fire_due_alarms().await.unwrap().is_empty());
-    drop(cell);
-    let _ = std::fs::remove_dir_all(root);
-}
-
 #[tokio::test]
 async fn handlers_see_the_cell_clock_and_callers_cannot_forge_it() {
     let clock = clock();

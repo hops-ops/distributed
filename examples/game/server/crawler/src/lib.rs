@@ -1,11 +1,11 @@
 //! The durable side of Mob Pit: one `Crawler` aggregate per player, each in
-//! its own native SQLite cell (`distributed` feature `cell-sqlite`, opened by
-//! `game_demos`).
+//! its own celld cell (`examples/game/cells`, kind [`CRAWLER_KIND`]), fed by
+//! the zone server's `distributed_game::celld::CelldFactSink`.
 //!
 //! The only command is [`RECORD_KILL`], declared on the aggregate method
 //! [`Crawler::record_kill`] with `#[command]` (which generates the
 //! [`RecordKill`] mount and its handler). It is dispatched by the zone's fact
-//! worker through `distributed_game::cell::CellFactSink`, never by a client:
+//! worker through `distributed_game::celld::CelldFactSink`, never by a client:
 //!
 //! - the **principal** comes from the trusted server-built session
 //!   (`x-user-id`, bound by the host from the player's verified ticket) into
@@ -18,16 +18,28 @@
 //!   replays the stored receipt through the cell's command ledger instead of
 //!   crediting twice;
 //! - `crawler.mob_killed` is a **domain event**: the commit publishes the
-//!   post-kill [`CrawlerState`] into the cell's outbox in the same SQLite
-//!   transaction ([`CrawlerMobKilledDomainEvent`]). The zone server drains
-//!   that outbox onto a bus and the read-model service (`mobpit_service`)
-//!   projects it into the `player_stats` table behind GraphQL `@live`.
+//!   post-kill [`CrawlerState`] into the cell's outbox in the same cell (SQLite)
+//!   transaction ([`CrawlerMobKilledDomainEvent`]). celld drains that outbox
+//!   to a Queue whose consumer relays it to the zone server, which publishes
+//!   it onto a bus; the read-model service (`mobpit_service`) projects it
+//!   into the `player_stats` table behind GraphQL `@live`.
 
 use distributed::{sourced, DomainState, Entity};
 use serde::{Deserialize, Serialize};
 
 /// Aggregate type (cell instance names are `Crawler:{principal}`).
 pub const AGGREGATE_TYPE: &str = "Crawler";
+/// celld cell kind (URL segment) of the Crawler cells: `crawler/{principal}`.
+pub const CRAWLER_KIND: &str = "crawler";
+/// celld cell kind of the crawler roster (celld cannot enumerate cells, so
+/// the principals with a Crawler cell are indexed there).
+pub const ROSTER_KIND: &str = "crawler-roster";
+/// The roster's one shard.
+pub const ROSTER_SHARD: &str = "all";
+/// Roster command: add the session principal (idempotent).
+pub const ENLIST: &str = "crawler.enlist";
+/// celld cell kind of per-player presence (the runtime lifecycle facts).
+pub const PRESENCE_KIND: &str = "presence";
 /// Command dispatched for every `MobKilled` fact.
 pub const RECORD_KILL: &str = RecordKill::COMMAND;
 /// Event recorded by [`RECORD_KILL`].

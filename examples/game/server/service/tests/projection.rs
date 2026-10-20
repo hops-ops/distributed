@@ -1,6 +1,8 @@
-//! Kill settlements → Crawler cell → outbox → SQLite bus → `player_stats`
-//! → GraphQL `@live`, with the real zone-server world (cells + fact sink +
-//! drain) and the service's projector and engine:
+//! Kill settlements → celld Crawler cell → outbox → celld Queue → the zone
+//! server's relay route → SQLite bus → `player_stats` → GraphQL `@live`,
+//! with a real `celld dev` serving `examples/game/cells`, the real
+//! zone-server world (fact sink + relay route) and the service's projector
+//! and engine:
 //!
 //! 1. settled kills project into one row per player with the cell's totals
 //!    (XP decided by the cell; a replayed fact changes nothing);
@@ -19,6 +21,7 @@ use distributed::SqliteRepository;
 use distributed_game::{Fact, FactSink, FactStamp};
 use futures_util::StreamExt;
 use game_demos::common::random_hex;
+use game_demos::devcelld::DevCelld;
 use game_demos::mobpit::crawler::RECORD_KILL;
 use game_demos::mobpit::{MobPitWorld, WorldOptions};
 use mobpit_service::{
@@ -74,7 +77,7 @@ async fn eventually<F: std::future::Future<Output = bool>>(
     let start = Instant::now();
     while !check().await {
         assert!(
-            start.elapsed() < Duration::from_secs(20),
+            start.elapsed() < Duration::from_secs(45),
             "timed out waiting for {what}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -88,16 +91,23 @@ async fn settled_kills_project_into_live_player_stats() {
     let bus_url = format!("sqlite:{}", dir.join("bus.db").display());
     let db_url = format!("sqlite:{}?mode=rwc", dir.join("service.db").display());
 
-    // Zone-server side: cells + sink, events drained to the bus.
-    let world = MobPitWorld::open(WorldOptions::new(dir.join("cells"))).unwrap();
+    // Zone-server side: the relay route on a known port, celld relaying its
+    // outbox Queue there, the world's fact sink into the cells.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = format!(
+        "http://{}{}",
+        listener.local_addr().unwrap(),
+        distributed::bus::CELLD_QUEUE_RELAY_PATH
+    );
+    let celld = DevCelld::start(Some(relay)).unwrap_or_else(|error| panic!("celld dev: {error}"));
+    let world = MobPitWorld::open(WorldOptions::new(dir.join("local"), celld.options())).unwrap();
+    let routes = game_demos::mobpit::routes::internal_routes(world.clone());
+    tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
     let sink = world.fact_sink();
-    // A kill settled before the bus existed waits in the cell's outbox.
+    // A kill settled before the bus is attached waits in the Queue (the
+    // relay answers 503 and the consumer retries).
     sink.commit(&kill("k0", "dev-ana", 2, "ana")).await.unwrap();
-    let pending = world
-        .attach_projection_bus(&bus_url, Duration::from_millis(200))
-        .await
-        .unwrap();
-    assert_eq!(pending, 1, "startup drain publishes the waiting event");
+    world.attach_projection_bus(&bus_url).await.unwrap();
 
     // Service side.
     let repo = SqliteRepository::connect_and_migrate(&db_url)
@@ -184,14 +194,7 @@ async fn settled_kills_project_into_live_player_stats() {
     sink.commit(&kill("k4", "dev-cy", 2, "cy")).await.unwrap();
     eventually("third player", || async { rows(&repo).await.len() == 3 }).await;
     for (player, _, xp, kills, level) in rows(&repo).await {
-        let cell = world
-            .cells()
-            .get(&player)
-            .unwrap()
-            .load()
-            .await
-            .unwrap()
-            .unwrap();
+        let cell = world.cells().crawler(&player).await.unwrap().state.unwrap();
         assert_eq!(
             (xp, kills, level),
             (cell.xp as i64, i64::from(cell.kills), i64::from(cell.level))

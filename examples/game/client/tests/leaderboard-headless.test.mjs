@@ -1,6 +1,6 @@
 /**
  * Headless Leaderboard: a hunter scores kills in the pit, an observer
- * receives pushed board snapshots whose scores equal the Crawler cells;
+ * receives pushed board snapshots whose scores equal the celld Crawler cells;
  * rebuilding from the cells' events yields the identical board.
  */
 import assert from 'node:assert/strict';
@@ -8,11 +8,11 @@ import test from 'node:test';
 
 import { createBoardWatcher, createMobPitClient, MobPitApi } from '../src/mobpit/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
-import { memoryStorage, startDemo, until } from './helpers/demo-server.mjs';
-import { hunt, tempDataDir } from './helpers/mobpit.mjs';
+import { memoryStorage, until } from './helpers/demo-server.mjs';
+import { hunt, startPit } from './helpers/mobpit.mjs';
 
 test('board pushes match the cells and rebuild is identical', { timeout: 600_000 }, async () => {
-	const server = await startDemo('leaderboard', { env: { MOBPIT_DATA_DIR: tempDataDir() } });
+	const server = await startPit('leaderboard');
 	const clients = [];
 	try {
 		const storage = memoryStorage();

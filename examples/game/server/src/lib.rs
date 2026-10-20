@@ -15,6 +15,7 @@
 pub mod arena;
 pub mod cluster;
 pub mod common;
+pub mod devcelld;
 pub mod freeze;
 pub mod gallery;
 pub mod grid;

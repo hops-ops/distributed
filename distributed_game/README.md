@@ -747,9 +747,11 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
   fact with no principal; `ctx.fact(&input)` builds the `Fact` for a retry
   backlog. `Fact::new(key, command, json)` still works.
 - A background worker commits facts with retries.
-  `cell::CellFactSink` turns each one into a command on that player's
-  cell, with a command id derived from the fact key. A retry or a
-  duplicate is therefore a harmless replay, never a double reward.
+  `celld::CelldFactSink` sends each one to its celld cell (that player's
+  cell, a match cell, ...) as a command over the internal path, with a
+  command id derived from the fact key. A retry or a duplicate is
+  therefore a harmless replay, never a double reward. (`cell::CellFactSink`
+  does the same into an in-process reference cell, for unit tests.)
 - `on_fact_settled` reports the outcome on a later tick.
 - Keys must be unique across restarts; `ctx.fact_key` includes the
   activation's boot epoch for you (see [Durable facts](#durable-facts)).
@@ -765,8 +767,8 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
   new after a restart); they share the principal's commit lane (order kept
   with `max_concurrent_commits > 1`) and wait in a host backlog rather
   than being dropped when the queue is full. `lifecycle::Lifecycle::of(&fact)`
-  decodes them in a sink. Mob Pit projects them into a presence read model
-  (`/dev/mobpit/presence`), ordered by stamp.
+  decodes them in a sink. Mob Pit routes them to per-player celld presence
+  cells (`CelldFactSink::lifecycle_route`), ordered by stamp.
 - Every fact carries a `FactStamp`: zone, activation (boot epoch), tick,
   host wall time `emitted_at_ms` (`Clock::unix_ms`; `ManualClock` in
   tests), content version, config version (`HostConfig::config_version`,

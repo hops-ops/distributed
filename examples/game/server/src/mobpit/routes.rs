@@ -5,22 +5,30 @@
 //!   artificial latency in front of every cell commit ("slow storage").
 //! - `GET /dev/mobpit/stats` — boot id, sink counters, pending facts, recent
 //!   commits (key, exact input, receipt).
-//! - `GET /dev/mobpit/crawlers` — every Crawler cell on disk (read path).
+//! - `GET /dev/mobpit/crawlers` — every Crawler cell on the roster (read
+//!   over celld's internal path).
 //! - `GET /dev/mobpit/leaderboard[?member=principal]` — the pushed top-N
 //!   snapshot, plus rank / neighbours of `member` on both boards.
 //! - `POST /dev/mobpit/leaderboard/rebuild` — rebuild both boards from the
 //!   cells' event history; reports whether the result matches the cells.
 //! - `GET /dev/mobpit/presence` — who is online / away / offline where,
 //!   projected from the runtime's player lifecycle facts.
+//!
+//! [`internal_routes`] (always mounted): `POST /internal/celld-queue/relay`,
+//! the celld outbox Queue consumer's hop, authenticated with
+//! `DISTRIBUTED_INTERNAL_SECRET`; it publishes the Crawler domain event onto
+//! the projection bus (503 until one is attached, so the Queue retries).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use distributed::bus::{CelldQueueEnvelope, CELLD_QUEUE_RELAY_PATH};
+use distributed::cell_host::CELL_INTERNAL_SECRET_HEADER;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -45,6 +53,47 @@ pub fn routes(world: Arc<MobPitWorld>) -> Router {
         .route("/dev/mobpit/leaderboard/rebuild", post(rebuild))
         .route("/dev/mobpit/presence", get(presence))
         .with_state(world)
+}
+
+/// Internal routes (see the module docs).
+pub fn internal_routes(world: Arc<MobPitWorld>) -> Router {
+    Router::new()
+        .route(CELLD_QUEUE_RELAY_PATH, post(relay))
+        .with_state(world)
+}
+
+async fn relay(
+    State(world): State<Arc<MobPitWorld>>,
+    headers: HeaderMap,
+    Json(envelope): Json<CelldQueueEnvelope>,
+) -> (StatusCode, Json<Value>) {
+    let authorized = headers
+        .get(CELL_INTERNAL_SECRET_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|candidate| world.celld().secret.matches(candidate));
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "code": "UNAUTHORIZED", "error": "unauthorized" })),
+        );
+    }
+    let Some(bus) = world.projection_bus() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "code": "UNAVAILABLE", "error": "no projection bus attached" })),
+        );
+    };
+    match bus.relay_handler()(envelope).await {
+        Ok(()) => (StatusCode::ACCEPTED, Json(json!({ "ok": true }))),
+        Err(error) if error.is_retryable() => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "code": "UNAVAILABLE", "error": error.message() })),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "code": "BAD_REQUEST", "error": error.message() })),
+        ),
+    }
 }
 
 /// `POST /dev/mobpit/storage` body.
@@ -76,6 +125,7 @@ async fn stats(State(world): State<Arc<MobPitWorld>>) -> Json<Value> {
     Json(json!({
         "boot": world.boot(),
         "dataDir": world.data_dir().display().to_string(),
+        "celld": world.cells().url(),
         "latencyMs": world.sink_state().latency().as_millis() as u64,
         "pending": world.zone_pending(),
         "sink": world.sink_state().stats(),

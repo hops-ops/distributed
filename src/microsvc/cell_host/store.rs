@@ -1,7 +1,7 @@
 //! One cell's private command-side repository, with enforced stream ownership.
-//! Workers use runtime-owned SQLite. Native hosts use the in-process reference
-//! host, or with `cell-sqlite` one SQLite file per cell sharing the Workers
-//! store (`open_sqlite*`). Ownership checks below apply to every backend.
+//! Workers (celld) use runtime-owned SQLite. Native builds have only the
+//! in-process reference host, for unit tests; durable cells run on celld.
+//! Ownership checks below apply to both.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -34,13 +34,8 @@ use crate::repository::{
 use crate::snapshot::SnapshotRecord;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 use crate::InMemoryRepository;
-#[cfg(not(any(
-    all(feature = "workers-rs", target_arch = "wasm32"),
-    all(feature = "cell-sqlite", not(target_arch = "wasm32"))
-)))]
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 type CellRepository = InMemoryRepository;
-#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-type CellRepository = super::native_sqlite::NativeCellRepository;
 #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
 type CellRepository = CellSqlRepository;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
@@ -219,51 +214,6 @@ impl CellStreamStore {
         }
     }
 
-    /// Open a durable exclusive cell backed by its own SQLite file.
-    ///
-    /// The file is `location.resolve("{type}:{id}")`; every command commits
-    /// events, snapshots, ledger receipt, outbox rows and the sealed row (see
-    /// [`Self::with_sealed_row_reducer`]) in one SQLite transaction. Dropping
-    /// every handle and reopening the same file restores the identical cell.
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    pub fn open_sqlite(
-        location: &super::CellSqlitePath,
-        identity: StreamIdentity,
-    ) -> Result<Self, RepositoryError> {
-        let sql = location.open(&identity.to_string())?;
-        Ok(Self::native(
-            CellOwnership::Exclusive(identity),
-            super::native_sqlite::NativeCellRepository::Sql(sql),
-        ))
-    }
-
-    /// Open a durable parent-shard cell (`"{parent_type}:{parent_id}"`) whose
-    /// owned sibling streams share one SQLite file. As on Workers, the
-    /// predicate never grants access to another cell's file.
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    pub fn open_sqlite_parent(
-        location: &super::CellSqlitePath,
-        parent_type: impl Into<String>,
-        parent_id: impl Into<String>,
-        owns: impl Fn(&StreamIdentity) -> bool + Send + Sync + 'static,
-    ) -> Result<Self, RepositoryError> {
-        let name = StreamIdentity::new(parent_type, parent_id)?;
-        let sql = location.open(&name.to_string())?;
-        Ok(Self::native(
-            CellOwnership::Parent {
-                name,
-                owns: Arc::new(owns),
-            },
-            super::native_sqlite::NativeCellRepository::Sql(sql),
-        ))
-    }
-
-    /// Whether this cell persists to a SQLite file (`open_sqlite*`).
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    pub fn is_sqlite(&self) -> bool {
-        self.inner.sql().is_some()
-    }
-
     /// Maintain the sealed read-model row from each commit's events, inside
     /// the command's transaction (SQLite cells) or alongside its in-memory
     /// commit (reference host). A reducer error rejects the command.
@@ -276,10 +226,6 @@ impl CellStreamStore {
             + 'static,
     ) -> Self {
         let reducer: SealedRowReducer = Arc::new(reducer);
-        #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-        if let Some(sql) = self.inner.sql_mut() {
-            sql.set_sealed_row_reducer(Arc::clone(&reducer));
-        }
         self.sealed_row_reducer = Some(reducer);
         self
     }
@@ -287,9 +233,6 @@ impl CellStreamStore {
     /// The in-process reference repository backing whole-state export.
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     fn memory(&self) -> Result<&InMemoryRepository, RepositoryError> {
-        #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-        return self.inner.memory();
-        #[cfg(not(all(feature = "cell-sqlite", not(target_arch = "wasm32"))))]
         Ok(&self.inner)
     }
 
@@ -375,10 +318,6 @@ impl CellStreamStore {
     /// Sealed read-model row for GET on this cell instance.
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn sealed_row(&self) -> Result<Option<Value>, RepositoryError> {
-        #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-        if let Some(sql) = self.inner.sql() {
-            return sql.sealed_row();
-        }
         self.sealed_row
             .lock()
             .map(|guard| guard.clone())
@@ -388,10 +327,6 @@ impl CellStreamStore {
     /// Replace the sealed read-model row (Atomic board / Todo view).
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn replace_sealed_row(&self, row: Value) -> Result<(), RepositoryError> {
-        #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-        if let Some(sql) = self.inner.sql() {
-            return sql.replace_sealed_row(&row);
-        }
         let mut guard = self
             .sealed_row
             .lock()
@@ -577,33 +512,21 @@ impl CellStreamStore {
             .map_err(|_| RepositoryError::Model("cell alarm table lock poisoned".into()))
     }
 
-    /// The SQL database holding alarms (Durable Object or native SQLite);
-    /// `None` on the reference host, which keeps them in memory.
-    #[cfg(any(
-        all(feature = "workers-rs", target_arch = "wasm32"),
-        all(feature = "cell-sqlite", not(target_arch = "wasm32"))
-    ))]
+    /// The SQL database holding alarms (the Durable Object's); `None` on
+    /// the reference host, which keeps them in memory.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
     fn alarm_sql(&self) -> Option<&super::sql_store::CellSqlRepository> {
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
-        return Some(&self.inner);
-        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
-        self.inner.sql()
+        Some(&self.inner)
     }
 
-    #[cfg(not(any(
-        all(feature = "workers-rs", target_arch = "wasm32"),
-        all(feature = "cell-sqlite", not(target_arch = "wasm32"))
-    )))]
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     fn alarm_sql(&self) -> Option<&std::convert::Infallible> {
         None
     }
 
     /// Armed alarms, earliest first.
     pub fn armed_alarms(&self) -> Result<Vec<super::ArmedCellAlarm>, RepositoryError> {
-        #[cfg(any(
-            all(feature = "workers-rs", target_arch = "wasm32"),
-            all(feature = "cell-sqlite", not(target_arch = "wasm32"))
-        ))]
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
             return sql.armed_alarms();
         }
@@ -619,10 +542,7 @@ impl CellStreamStore {
         now_ms: i64,
         limit: usize,
     ) -> Result<Vec<super::ArmedCellAlarm>, RepositoryError> {
-        #[cfg(any(
-            all(feature = "workers-rs", target_arch = "wasm32"),
-            all(feature = "cell-sqlite", not(target_arch = "wasm32"))
-        ))]
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
             return sql.due_alarms(now_ms, limit);
         }
@@ -634,10 +554,7 @@ impl CellStreamStore {
 
     /// Due time (epoch ms) of the earliest armed alarm.
     pub(super) fn next_alarm_due_ms(&self) -> Result<Option<i64>, RepositoryError> {
-        #[cfg(any(
-            all(feature = "workers-rs", target_arch = "wasm32"),
-            all(feature = "cell-sqlite", not(target_arch = "wasm32"))
-        ))]
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
             return sql.next_alarm_due_ms();
         }
@@ -653,10 +570,7 @@ impl CellStreamStore {
         generation: u64,
         settlement: &super::alarm::AlarmSettlement,
     ) -> Result<(), RepositoryError> {
-        #[cfg(any(
-            all(feature = "workers-rs", target_arch = "wasm32"),
-            all(feature = "cell-sqlite", not(target_arch = "wasm32"))
-        ))]
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
             return sql.settle_alarm(name, generation, settlement);
         }
@@ -900,13 +814,8 @@ impl CausalTransactionalCommit for CellStreamStore {
 }
 
 impl HasOutboxStore for CellStreamStore {
-    #[cfg(not(any(
-        all(feature = "workers-rs", target_arch = "wasm32"),
-        all(feature = "cell-sqlite", not(target_arch = "wasm32"))
-    )))]
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     type OutboxStore = crate::InMemoryOutboxStore;
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    type OutboxStore = super::native_sqlite::CellOutboxStore;
     #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
     type OutboxStore = super::sql_store::CellSqlOutboxStore;
 
@@ -930,15 +839,7 @@ impl crate::microsvc::dependencies::CausalHostProjections for CellStreamStore {
     }
 }
 
-#[cfg(not(any(
-    all(feature = "workers-rs", target_arch = "wasm32"),
-    all(feature = "cell-sqlite", not(target_arch = "wasm32"))
-)))]
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 fn memory_repository() -> CellRepository {
     InMemoryRepository::new()
-}
-
-#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-fn memory_repository() -> CellRepository {
-    super::native_sqlite::NativeCellRepository::Memory(InMemoryRepository::new())
 }

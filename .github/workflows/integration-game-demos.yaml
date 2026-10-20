@@ -7,7 +7,9 @@ name: Game demos smoke
 # headless tests, and the SvelteKit demo end to end: `distributed build
 # examples/game/server` (GraphQL client, svelte-check, vite build), then
 # Playwright against the production build, a real Mob Pit server and the real
-# mobpit-service read model (SQLite only; no external services).
+# mobpit-service read model. Mob Pit's durable cells run on celld: the tests
+# start their own `celld dev` (CELLD_BIN, pinned below; no Docker) serving
+# examples/game/cells, built with worker-build.
 on:
   workflow_call:
 
@@ -17,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
+      # Pinned celld for Mob Pit's cells (run.sh requires 0.6.2+).
+      CELLD_VERSION: v0.6.2
     # The shared ticket rate limiter's Lua script and the leaderboard store
     # (conformance suite, projector, GraphQL boards) run against a real Redis.
     services:
@@ -44,6 +48,18 @@ jobs:
             js/package-lock.json
             examples/game/client/package-lock.json
             examples/game/sveltekit/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            examples/game/server -> target
+            examples/game/cells -> target
+          shared-key: game-demos
+      - name: Install celld (pinned) and worker-build
+        run: |
+          curl -fsSL https://celld.dev/install.sh | CELLD_VERSION="$CELLD_VERSION" sh
+          echo "CELLD_BIN=$HOME/.local/bin/celld" >> "$GITHUB_ENV"
+          "$HOME/.local/bin/celld" --version
+          cargo install worker-build --locked
       - name: Install SvelteKit demo dependencies and Chromium
         working-directory: examples/game/sveltekit
         run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium

@@ -1,0 +1,30 @@
+# Mob Pit's durable cells on celld (workers-rs, wasm32): the per-player
+# Crawler aggregate, the crawler roster, per-player presence, and the outbox
+# Queue consumer that relays Crawler domain events to the zone server.
+# Own workspace (cdylib for wasm32-unknown-unknown); built with
+# `worker-build --release` by `examples/game/run.sh`.
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "mobpit-cells"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Mob Pit Crawler, roster and presence cells for celld (dev demo)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+console_error_panic_hook = "0.1"
+distributed = { path = "../../..", default-features = false, features = ["workers-rs"] }
+distributed_game = { path = "../../../distributed_game", default-features = false, features = ["cell"] }
+mobpit_crawler = { path = "../server/crawler" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+worker = { version = "0.8", features = ["queue"] }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

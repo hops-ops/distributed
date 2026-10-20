@@ -2,8 +2,9 @@
  * Headless SvelteKit demo (production build, real `game-demos mobpit` and
  * real `mobpit-service`): dev session sign-in → the page joins the
  * server-chosen zone with a session-minted ticket → keyboard movement →
- * auto-hunt kills a mob → the cell commits it, its domain event is drained to
- * the bus and projected into `player_stats` → the `@live` GraphQL queries
+ * auto-hunt kills a mob → the celld Crawler cell commits it, its domain event
+ * goes through the cell outbox and celld's Queue to the zone server's relay,
+ * onto the bus, and is projected into `player_stats` → the `@live` GraphQL queries
  * (MyStats, bound to the session; Leaderboard) update without a reload, for
  * the killer and for a second signed-in player → the SSR HTML after a reload
  * has the settled numbers → no page errors.
@@ -11,8 +12,10 @@
  * Ports: GAME_DEMOS_PORT (default 2967), SVELTEKIT_PORT (default 5573),
  * MOBPIT_SERVICE_PORT (default GAME_DEMOS_PORT + 2). Needs the lifecycle
  * build (`distributed build examples/game/server`, which runs `vite build`
- * with the generated `$distributed` client) and the binaries
- * (GAME_DEMOS_BIN / MOBPIT_SERVICE_BIN, else `cargo run`).
+ * with the generated `$distributed` client), the binaries
+ * (GAME_DEMOS_BIN / MOBPIT_SERVICE_BIN, else `cargo run`), and celld
+ * (CELLD_BIN, with the built `examples/game/cells` worker; the test starts
+ * its own `celld dev`).
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -24,6 +27,8 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { chromium } from 'playwright';
+
+import { startCelld } from '../../client/tests/helpers/celld.mjs';
 
 const APP = fileURLToPath(new URL('..', import.meta.url));
 const SERVER_DIR = fileURLToPath(new URL('../../server/', import.meta.url));
@@ -74,10 +79,14 @@ test('sign in, join, move, kill, live read model updates for two players', { tim
 	const busUrl = `sqlite:${join(dataDir, 'bus.db')}`;
 	const keys = apiKeys();
 	const bin = process.env.GAME_DEMOS_BIN;
-	const gameArgs = ['mobpit', '--port', String(GAME_PORT), '--data-dir', join(dataDir, 'cells'), '--projection-bus', busUrl];
+	// The Crawler cells run on celld; its outbox Queue relays the domain
+	// events to the game server, which publishes them onto the bus.
+	const celld = await startCelld({ relayPort: GAME_PORT });
+	const gameEnv = { ...process.env, ...celld.env, DISTRIBUTED_GAME_SECRET: secret };
+	const gameArgs = ['mobpit', '--port', String(GAME_PORT), '--data-dir', join(dataDir, 'local'), '--projection-bus', busUrl];
 	const game = bin
-		? start(bin, gameArgs, { env: { ...process.env, DISTRIBUTED_GAME_SECRET: secret } }, /LISTENING/)
-		: start('cargo', ['run', '-q', '--', ...gameArgs], { cwd: SERVER_DIR, env: { ...process.env, DISTRIBUTED_GAME_SECRET: secret } }, /LISTENING/);
+		? start(bin, gameArgs, { env: gameEnv }, /LISTENING/)
+		: start('cargo', ['run', '-q', '--', ...gameArgs], { cwd: SERVER_DIR, env: gameEnv }, /LISTENING/);
 	const serviceEnv = {
 		...process.env,
 		BIND: `127.0.0.1:${SERVICE_PORT}`,
@@ -245,6 +254,7 @@ test('sign in, join, move, kill, live read model updates for two players', { tim
 		await ui.stop();
 		await service.stop();
 		await game.stop();
+		await celld.stop();
 		rmSync(dataDir, { recursive: true, force: true });
 	}
 });

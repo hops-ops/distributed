@@ -227,6 +227,7 @@ impl CellAlarm {
         }
     }
 
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
     pub(crate) fn input_json(&self) -> Result<String, RepositoryError> {
         serde_json::to_string(&self.input)
             .map_err(|error| RepositoryError::Model(format!("cell alarm input: {error}")))

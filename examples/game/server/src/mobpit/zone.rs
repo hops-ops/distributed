@@ -1271,7 +1271,12 @@ mod projection_golden {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn projected_world_and_delta_bytes_match_the_legacy_replicate() {
-        let world = MobPitWorld::open(WorldOptions::temporary()).unwrap();
+        let celld = crate::mobpit::store::CelldOptions::new(
+            "http://127.0.0.1:9",
+            "test-only-unreachable-celld-0123456789",
+        )
+        .unwrap();
+        let world = MobPitWorld::open(WorldOptions::temporary(celld)).unwrap();
         let clock = ManualClock::new();
         let mut host = ZoneHost::<MobPit>::new(
             "pit-1",

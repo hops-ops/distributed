@@ -80,20 +80,6 @@ where
         })
     }
 
-    /// Open a durable cell backed by its own SQLite file (`cell-sqlite`).
-    ///
-    /// The file is `location.resolve("{aggregate_type}:{shard_id}")`. Each
-    /// command commits events, snapshots, its ledger receipt and outbox rows
-    /// in one SQLite transaction, exactly as `from_state` does on Workers.
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    pub fn open_sqlite(
-        location: &super::CellSqlitePath,
-        shard_id: impl Into<String>,
-    ) -> Result<Self, RepositoryError> {
-        let shard = StreamIdentity::new(A::aggregate_type(), shard_id.into())?;
-        Self::from_store(CellStreamStore::open_sqlite(location, shard)?)
-    }
-
     /// Host a prepared exclusive store (for example a SQLite cell configured
     /// with [`CellStreamStore::with_sealed_row_reducer`]).
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
@@ -380,8 +366,8 @@ where
 
     /// Durable event history of one stream this cell owns, oldest first
     /// (empty when the stream has no events). Reads the backing store, so it
-    /// works on the in-process reference host **and** on native SQLite
-    /// cells (`cell-sqlite`), unlike the whole-state
+    /// works on the in-process reference host **and** on celld (Durable
+    /// Object SQLite), unlike the whole-state
     /// [`durable_events`](Self::durable_events) export. A stream the cell
     /// does not own is rejected.
     pub async fn stream_events(
@@ -671,17 +657,6 @@ where
             activity: Default::default(),
             storage,
         })
-    }
-
-    /// Open a durable SQLite cell with repository snapshot caching.
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    pub fn open_sqlite_with_snapshots(
-        location: &super::CellSqlitePath,
-        shard_id: impl Into<String>,
-        frequency: u64,
-    ) -> Result<Self, RepositoryError> {
-        let shard = StreamIdentity::new(A::aggregate_type(), shard_id.into())?;
-        Self::from_store_with_snapshots(CellStreamStore::open_sqlite(location, shard)?, frequency)
     }
 
     /// Host a prepared exclusive store with repository snapshot caching.

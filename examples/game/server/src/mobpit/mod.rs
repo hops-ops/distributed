@@ -6,9 +6,11 @@
 //!   state machine, melee cones). A kill emits a fact and keeps ticking.
 //! - [`crawler`]: the per-player `Crawler` aggregate and its one command;
 //!   XP is decided there, the principal comes from the trusted session.
-//! - [`store`]: one native SQLite cell per player + the `FactSink` (with the
-//!   "slow storage" latency knob) that routes facts into them via
-//!   `distributed_game::cell::CellFactSink`.
+//! - [`store`]: the zone server's side of the celld cells
+//!   (`examples/game/cells`): the `FactSink` (with the "slow storage"
+//!   latency knob) that routes facts to them via
+//!   `distributed_game::celld::CelldFactSink`, the roster and cell reader,
+//!   and the projection bus fed by the outbox Queue relay.
 //! - [`board`]: kills/XP leaderboards (in-memory or Redis), fire-and-forget
 //!   live updates, idempotent apply keys, rebuild from the cells' events.
 //! - [`presence`]: who is online where, projected from the runtime's player
@@ -17,9 +19,11 @@
 //!
 //! `game-demos mobpit` and `game-demos leaderboard` start the same server
 //! (one process hosts the pit and the boards); they differ only in the page
-//! `run.sh` opens. Data lives in `--data-dir` / `MOBPIT_DATA_DIR`; the
-//! ticket secret is persisted there too so guests keep their identity across
-//! a restart (crash-recovery demo).
+//! `run.sh` opens. Durable state is in celld (`--celld-url` / `CELLD_URL`,
+//! secret `DISTRIBUTED_INTERNAL_SECRET`); `run.sh` and the tests start
+//! `celld dev` with `examples/game/cells`. `--data-dir` / `MOBPIT_DATA_DIR`
+//! keeps the persisted ticket secret (so guests keep their identity across
+//! a restart, the crash-recovery demo) and the default projection bus.
 
 pub mod board;
 pub mod crawler;
@@ -45,8 +49,13 @@ pub struct MobPitArgs {
     /// Shared demo options.
     #[command(flatten)]
     pub common: DemoArgs,
-    /// Directory of the per-player SQLite cells (and the persisted dev
-    /// ticket secret). Default: `$TMPDIR/game-demos-mobpit`.
+    /// celld serving `examples/game/cells` (the Crawler, roster and
+    /// presence cells). The internal secret comes from
+    /// `DISTRIBUTED_INTERNAL_SECRET`.
+    #[arg(long, env = "CELLD_URL")]
+    pub celld_url: String,
+    /// Directory of local dev files: the persisted dev ticket secret and
+    /// the default projection bus. Default: `$TMPDIR/game-demos-mobpit`.
     #[arg(long, env = "MOBPIT_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
     /// Redis for the leaderboard (`redis://127.0.0.1:6379`); default in memory.
@@ -55,10 +64,10 @@ pub struct MobPitArgs {
     /// Start with this artificial storage latency (ms).
     #[arg(long, env = "MOBPIT_STORAGE_LATENCY_MS", default_value_t = 0)]
     pub storage_latency_ms: u64,
-    /// SQLite bus (`sqlite:/path/bus.db`) to publish the Crawler cells'
-    /// `crawler.mob_killed` domain events to; `mobpit-service` projects them
-    /// into its `player_stats` read model. Unset: events stay in the cells'
-    /// outboxes until a bus is attached.
+    /// SQLite bus (`sqlite:/path/bus.db`) the Crawler cells'
+    /// `crawler.mob_killed` domain events are published to (relayed from
+    /// celld's outbox Queue); `mobpit-service` projects them into its
+    /// `player_stats` read model. Default: `sqlite:{data-dir}/bus.db`.
     #[arg(long, env = "MOBPIT_PROJECTION_BUS")]
     pub projection_bus: Option<String>,
 }
@@ -76,9 +85,11 @@ impl Demo for MobPitDemo {
     }
 
     /// Plain `common::spawn` gets a throwaway world (temp dir, in-memory
-    /// board, no dev routes of its own); use [`spawn`] / [`run`] instead.
+    /// board, no routes of its own) on the celld named by `CELLD_URL` and
+    /// `DISTRIBUTED_INTERNAL_SECRET`; use [`spawn`] / [`run`] instead.
     fn server(config: ServerConfig, guests: Guests) -> GameServer<MobPit> {
-        let world = MobPitWorld::open(WorldOptions::temporary())
+        let celld = store::CelldOptions::from_env().expect("Mob Pit needs celld");
+        let world = MobPitWorld::open(WorldOptions::temporary(celld))
             .expect("mobpit world (needs a Tokio runtime)");
         world.server(config, guests).0
     }
@@ -119,13 +130,19 @@ fn persisted_secret(dir: &std::path::Path) -> std::io::Result<String> {
     Ok(secret)
 }
 
-/// CLI entry: open the cells, rebuild the board from them, serve.
+/// CLI entry: connect to the cells, rebuild the board from them, serve.
 pub async fn run(mut args: MobPitArgs) -> std::io::Result<()> {
     let data_dir = args
         .data_dir
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("game-demos-mobpit"));
-    let mut options = WorldOptions::new(&data_dir);
+    let secret = std::env::var(distributed::cell_host::CELL_INTERNAL_SECRET_ENV).map_err(|_| {
+        std::io::Error::other(
+            "DISTRIBUTED_INTERNAL_SECRET is required (shared with the celld cells worker)",
+        )
+    })?;
+    let celld = store::CelldOptions::new(&args.celld_url, secret).map_err(std::io::Error::other)?;
+    let mut options = WorldOptions::new(&data_dir, celld);
     options.redis_url = args.redis_url.clone();
     let world = MobPitWorld::open(options).map_err(std::io::Error::other)?;
     world
@@ -143,15 +160,17 @@ pub async fn run(mut args: MobPitArgs) -> std::io::Result<()> {
         ),
         Err(error) => eprintln!("mobpit: leaderboard rebuild failed (serving anyway): {error}"),
     }
-    if let Some(url) = &args.projection_bus {
-        let published = world
-            .attach_projection_bus(url, std::time::Duration::from_secs(2))
-            .await
-            .map_err(std::io::Error::other)?;
-        eprintln!("mobpit: projection bus {url} (published {published} pending events)");
-    }
+    let bus = args
+        .projection_bus
+        .clone()
+        .unwrap_or_else(|| format!("sqlite:{}", data_dir.join("bus.db").display()));
+    world
+        .attach_projection_bus(&bus)
+        .await
+        .map_err(std::io::Error::other)?;
     eprintln!(
-        "mobpit: data dir {} · boot {} · leaderboard {}",
+        "mobpit: celld {} · projection bus {bus} · data dir {} · boot {} · leaderboard {}",
+        args.celld_url,
         data_dir.display(),
         world.boot(),
         world.board().backend()
