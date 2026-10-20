@@ -480,3 +480,98 @@ fn the_cli_compiles_a_framework_leaderboard_manifest_into_the_ts_client() {
         .contents
         .contains(r#"document: "query XpLeaderboardAround($radius: Int) { xpLeaderboardAround(radius: $radius) { rank member score } }","#));
 }
+
+/// The projector runs in another process (here: another bus connection and
+/// no shared engine): it publishes `distributed.leaderboard.changed` on the
+/// bus, and the GraphQL process's bus handlers drive `@live` from it.
+#[cfg(feature = "leaderboard-background")]
+#[tokio::test]
+async fn live_boards_follow_a_projector_in_another_process_over_the_bus() {
+    use distributed::bus::SqliteBus;
+    use distributed::bus::{BusConsumer, RunOptions};
+    use distributed::leaderboard::LeaderboardChangePublisher;
+    use distributed::outbox_worker::BusPublisher;
+
+    let path = std::env::temp_dir().join(format!(
+        "distributed-board-notices-{}-{}.db",
+        std::process::id(),
+        UNIX_EPOCH.elapsed().unwrap().as_nanos()
+    ));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let open = || async {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(
+                url.parse::<sqlx::sqlite::SqliteConnectOptions>()
+                    .unwrap()
+                    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                    .busy_timeout(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+        let bus = SqliteBus::new(pool).with_idle_poll(Duration::from_millis(20));
+        bus.ensure_tables().await.unwrap();
+        bus
+    };
+
+    // Shared board storage (Redis in production).
+    let store = Arc::new(InMemoryLeaderboard::new());
+    seed(&store).await;
+
+    // GraphQL process: engine + bus handlers under its own consumer group.
+    let engine = engine(store.clone()).await;
+    let handlers = engine.leaderboard_change_handlers("graphql-1-boards");
+    let graphql_bus = open().await;
+    let consumer = tokio::spawn(async move {
+        graphql_bus
+            .subscribe(Arc::new(handlers), RunOptions::default())
+            .await
+    });
+
+    // Projector process: no engine, only the bus.
+    let projector_bus = open().await;
+    let notices = LeaderboardChangePublisher::spawn(BusPublisher::new(Arc::new(projector_bus)));
+    let projection =
+        |event: &DomainEventOccurrence| -> Result<Vec<LeaderboardChange>, LeaderboardError> {
+            let body: XpGained = event
+                .decode_body()
+                .map_err(|error| LeaderboardError::invalid(error.to_string()))?;
+            Ok(vec![LeaderboardChange::new(
+                xp_board(),
+                ScoreSubmission::new(body.player, f64::from(body.xp), ScorePolicy::Increment),
+            )])
+        };
+    let projector = LeaderboardProjector::new(
+        store.clone() as Arc<dyn LeaderboardStore>,
+        Arc::new(projection),
+    )
+    .with_change_listener(notices.listener());
+
+    let mut stream = engine.execute_stream(
+        &session("user", Some("dan")),
+        Request::new("subscription { xpLeaderboard(first: 2) { member score } }"),
+    );
+    let first = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&first.data).unwrap()["xpLeaderboard"][0]["member"],
+        "ann"
+    );
+
+    projector.apply_event(&gained(1, "dan", 100)).await.unwrap();
+    let pushed = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("a projector in another process drives @live over the bus")
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&pushed.data).unwrap()["xpLeaderboard"],
+        serde_json::json!([{ "member": "dan", "score": 120.0 }, { "member": "ann", "score": 50.0 }])
+    );
+
+    consumer.abort();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}

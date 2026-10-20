@@ -455,11 +455,37 @@ fn live_stream(request: Request) -> LeaderboardLiveStream {
 impl GraphqlEngine {
     /// A [`LeaderboardChangeListener`] that refreshes `@live` leaderboard
     /// subscriptions of this engine: register it on the projector writing
-    /// the boards (`LeaderboardProjector::with_change_listener`).
+    /// the boards (`LeaderboardProjector::with_change_listener`) when that
+    /// projector runs in this process.
     pub fn leaderboard_change_listener(&self) -> LeaderboardChangeListener {
         let hub = self.inner.change_hub.clone();
         Arc::new(move |board: &Board| {
             hub.publish(ReadModelChange::new([leaderboard_change_key(board.name())]));
         })
+    }
+
+    /// Bus handlers that refresh `@live` leaderboard subscriptions of this
+    /// engine from [`LEADERBOARD_CHANGED_EVENT`](crate::leaderboard::LEADERBOARD_CHANGED_EVENT)
+    /// notices, for a projector running in another process (it publishes
+    /// them with `LeaderboardChangePublisher`). Run them with
+    /// `bus.subscribe(Arc::new(handlers), RunOptions::default())` under a
+    /// consumer `group` of this process's own, so every GraphQL process
+    /// receives every notice.
+    pub fn leaderboard_change_handlers(&self, group: impl Into<String>) -> crate::bus::Handlers {
+        let hub = self.inner.change_hub.clone();
+        crate::bus::Handlers::new().named(group).on_event(
+            crate::leaderboard::LEADERBOARD_CHANGED_EVENT,
+            move |message: &crate::bus::Message| {
+                let notice = crate::leaderboard::LeaderboardChanged::from_message(message);
+                let hub = hub.clone();
+                async move {
+                    let notice = notice?;
+                    hub.publish(ReadModelChange::new([leaderboard_change_key(
+                        &notice.board,
+                    )]));
+                    Ok(())
+                }
+            },
+        )
     }
 }

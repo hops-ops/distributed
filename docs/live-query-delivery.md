@@ -129,6 +129,20 @@ queries, and a failed execution is terminal. With the causal protocol on,
 a leaderboard result carries an incomplete snapshot
 (`recordsComplete: false`, `indexesComparable: false`) and live frames use
 `snapshot` mode with `reset: true`: leaderboard rows are never normalized
-into the replica cache or resumed from cursors. The listener is in-process;
-a projector in another process must forward its board changes to the
-engine (for example over the bus) to drive `@live` there.
+into the replica cache or resumed from cursors.
+
+The listener is in-process. When the projector runs in another process
+(a zone server projecting kills into Redis while a GraphQL service serves
+the same boards), the change goes over the application's bus:
+
+- the projector's process registers `LeaderboardChangePublisher::listener()`
+  (feature `leaderboard-background`), which publishes a
+  `distributed.leaderboard.changed` event (`{ "board": "<name>" }`) per
+  changed board, coalescing bursts and retrying until the bus accepts it;
+- the GraphQL process runs `engine.leaderboard_change_handlers(group)` with
+  `bus.subscribe(..)` under a consumer group of its own, so every GraphQL
+  process receives every notice and republishes `leaderboard:{board}` on
+  its `ChangeHub`.
+
+A notice only names the board; the subscriber re-reads its store, so
+duplicate or replayed notices push nothing new.

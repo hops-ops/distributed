@@ -33,7 +33,10 @@
 //! `@live` subscriptions, the client manifest and `leaderboards.ts`), and
 //! [`LeaderboardProjector::with_change_listener`] +
 //! `GraphqlEngine::leaderboard_change_listener` refresh live queries after an
-//! applied change. See `docs/live-query-delivery.md`.
+//! applied change. Across processes, `LeaderboardChangePublisher` publishes
+//! [`LEADERBOARD_CHANGED_EVENT`] notices on the bus and
+//! `GraphqlEngine::leaderboard_change_handlers` consumes them. See
+//! `docs/live-query-delivery.md`.
 //!
 //! # How it plugs into projections
 //!
@@ -84,6 +87,7 @@
 //! makes overlapping replay safe.
 
 mod in_memory;
+mod notify;
 mod projector;
 
 #[cfg(feature = "leaderboard-background")]
@@ -96,6 +100,9 @@ use std::fmt;
 use async_trait::async_trait;
 
 pub use in_memory::InMemoryLeaderboard;
+#[cfg(feature = "leaderboard-background")]
+pub use notify::LeaderboardChangePublisher;
+pub use notify::{LeaderboardChanged, LEADERBOARD_CHANGED_EVENT};
 pub use projector::{
     LeaderboardChange, LeaderboardChangeListener, LeaderboardProjection, LeaderboardProjector,
     LeaderboardRebuild, ProjectionReport,
