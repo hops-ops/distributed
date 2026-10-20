@@ -17,7 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
-    # The shared ticket rate limiter's Lua script runs against a real Redis.
+    # The shared ticket rate limiter's Lua script and the leaderboard store
+    # (conformance suite, projector, GraphQL boards) run against a real Redis.
     services:
       redis:
         image: redis:7-alpine
@@ -48,6 +49,10 @@ jobs:
         run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
       - name: Run examples/game smoke
         run: examples/game/run.sh smoke
+      - name: Leaderboard conformance and GraphQL boards against real Redis
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+        run: cargo test --features redis,graphql,sqlite --test redis_leaderboard -- --nocapture
       - name: Ticket rate limiter against real Redis
         working-directory: js
         env:

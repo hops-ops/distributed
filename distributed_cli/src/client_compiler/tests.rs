@@ -4482,3 +4482,148 @@ fn generated_lazy_commands_defer_definitions_and_preserve_command_signatures() {
         include_str!("../../tests/fixtures/generated-lazy-commands.ts")
     );
 }
+
+fn leaderboard_manifest() -> JsonValue {
+    let mut value = manifest();
+    value["leaderboards"] = json!([
+        {
+            "name": "xp",
+            "entry_typename": "LeaderboardEntry",
+            "order": "high_first",
+            "boards": "single",
+            "default_first": 3,
+            "max_first": 5,
+            "max_radius": 2,
+            "roots": [
+                {"name": "xpLeaderboard", "operation": "top", "list": true, "live": true,
+                 "arguments": [{"name": "first", "type_name": "Int", "nullable": true}]},
+                {"name": "xpMyRank", "operation": "my_rank", "list": false, "live": true,
+                 "arguments": []}
+            ]
+        },
+        {
+            "name": "season",
+            "entry_typename": "LeaderboardEntry",
+            "order": "low_first",
+            "boards": "family",
+            "default_first": 10,
+            "max_first": 100,
+            "max_radius": 25,
+            "roots": [
+                {"name": "seasonRank", "operation": "rank", "list": false, "live": false,
+                 "arguments": [
+                    {"name": "board", "type_name": "String", "nullable": false},
+                    {"name": "member", "type_name": "String", "nullable": false}
+                 ]}
+            ]
+        }
+    ]);
+    super::manifest::refresh_schema_fingerprint(&mut value);
+    value
+}
+
+const LEADERBOARD_PAGE: &str = r#"
+  query Todos($limit: Int!) {
+    todos(limit: $limit) { title }
+  }
+"#;
+
+#[test]
+fn leaderboard_roots_generate_typed_documents() {
+    let project = compile_client(input_with_manifest(
+        leaderboard_manifest(),
+        LEADERBOARD_PAGE,
+    ))
+    .unwrap();
+    let generated = file(&project, "leaderboards.ts");
+    assert!(generated.contains("export interface LeaderboardEntry {"));
+    assert!(generated
+        .contains("export type XpLeaderboardVariables = { readonly first?: number | null; };"));
+    assert!(generated.contains(
+        "export type XpLeaderboardData = { readonly xpLeaderboard: readonly LeaderboardEntry[] };"
+    ));
+    assert!(generated.contains(
+        r#"document: "query XpLeaderboard($first: Int) { xpLeaderboard(first: $first) { rank member score } }","#
+    ));
+    assert!(generated.contains(
+        r#"liveDocument: "subscription XpLeaderboard_Live($first: Int) { xpLeaderboard(first: $first) { rank member score } }","#
+    ));
+    // The viewer's rank takes no member argument: the server binds it from
+    // the verified session.
+    assert!(generated.contains("export type XpMyRankVariables = {};"));
+    assert!(generated.contains(r#"document: "query XpMyRank { xpMyRank { rank member score } }","#));
+    assert!(generated.contains(
+        "export type SeasonRankVariables = { readonly board: string; readonly member: string; };"
+    ));
+    assert!(generated.contains("liveDocument: null,"));
+    assert!(generated.contains("\"xpLeaderboard\": XpLeaderboardLeaderboard,"));
+    assert!(file(&project, "index.ts").contains("export * from './leaderboards.js';"));
+    assert_eq!(
+        generated,
+        include_str!("../../tests/fixtures/generated-leaderboards.ts"),
+        "the checked-in TypeScript consumer fixture must remain byte-exact"
+    );
+}
+
+#[test]
+fn manifests_without_leaderboards_generate_no_module() {
+    let project = compile_client(input(LEADERBOARD_PAGE)).unwrap();
+    assert!(project
+        .files
+        .iter()
+        .all(|file| file.path != "leaderboards.ts"));
+    assert!(!file(&project, "index.ts").contains("leaderboards"));
+}
+
+type ManifestMutation = Box<dyn Fn(&mut JsonValue)>;
+
+#[test]
+fn malformed_leaderboard_sections_are_refused() {
+    let cases: Vec<(&str, ManifestMutation)> = vec![
+        (
+            "a member argument on my_rank",
+            Box::new(|value: &mut JsonValue| {
+                value["leaderboards"][0]["roots"][1]["arguments"] =
+                    json!([{"name": "member", "type_name": "String", "nullable": false}]);
+            }),
+        ),
+        (
+            "a live rank root",
+            Box::new(|value: &mut JsonValue| {
+                value["leaderboards"][1]["roots"][0]["live"] = json!(true);
+            }),
+        ),
+        (
+            "an unknown operation",
+            Box::new(|value: &mut JsonValue| {
+                value["leaderboards"][0]["roots"][0]["operation"] = json!("everyone");
+            }),
+        ),
+        (
+            "a root colliding with a read-model root",
+            Box::new(|value: &mut JsonValue| {
+                value["leaderboards"][0]["roots"][0]["name"] = json!("todos");
+            }),
+        ),
+        (
+            "a family root without board",
+            Box::new(|value: &mut JsonValue| {
+                value["leaderboards"][1]["roots"][0]["arguments"] =
+                    json!([{"name": "member", "type_name": "String", "nullable": false}]);
+            }),
+        ),
+    ];
+    for (case, mutate) in cases {
+        let mut value = leaderboard_manifest();
+        mutate(&mut value);
+        super::manifest::refresh_schema_fingerprint(&mut value);
+        let error = compile_client(input_with_manifest(value, LEADERBOARD_PAGE)).expect_err(case);
+        assert_eq!(error.code, "client.manifest.leaderboard", "{case}: {error}");
+    }
+
+    // A stale fingerprint is still caught.
+    let mut tampered = leaderboard_manifest();
+    tampered["leaderboards"][0]["max_first"] = json!(50);
+    let error = compile_client(input_with_manifest(tampered, LEADERBOARD_PAGE)).unwrap_err();
+    assert_eq!(error.code, "client.manifest.schema_fingerprint");
+}

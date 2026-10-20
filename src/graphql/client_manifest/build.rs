@@ -437,8 +437,12 @@ pub(super) fn client_manifest_from_surface_with_execution(
 
     let scalar_codecs = supported_scalar_codecs();
     let record_evidence = query_footprint_has_record_evidence(surface);
+    let leaderboards = client_leaderboards(surface);
+    let live_leaderboards = leaderboards
+        .iter()
+        .any(|leaderboard| leaderboard.roots.iter().any(|root| root.live));
     let capabilities = ClientCapabilities {
-        live_queries: !surface.subscription_fields.is_empty(),
+        live_queries: !surface.subscription_fields.is_empty() || live_leaderboards,
         record_revisions: record_evidence,
         tombstones: record_evidence,
         causal_receipts: !commands.is_empty(),
@@ -467,6 +471,8 @@ pub(super) fn client_manifest_from_surface_with_execution(
         projectors: &'a [ClientProjector],
         projection_programs: &'a [ClientProjectionProgram],
         projection_bindings: &'a [ClientProjectionBinding],
+        #[serde(skip_serializing_if = "<[ClientLeaderboard]>::is_empty")]
+        leaderboards: &'a [ClientLeaderboard],
     }
     let schema_material = SchemaMaterial {
         manifest_version: DISTRIBUTED_CLIENT_MANIFEST_VERSION,
@@ -483,6 +489,7 @@ pub(super) fn client_manifest_from_surface_with_execution(
         projectors: &projectors,
         projection_programs: &projection_programs,
         projection_bindings: &projection_bindings,
+        leaderboards: &leaderboards,
     };
     let schema_fingerprint = hash_json(&schema_material)?;
 
@@ -503,10 +510,55 @@ pub(super) fn client_manifest_from_surface_with_execution(
         projectors,
         projection_programs,
         projection_bindings,
+        leaderboards,
     };
     // Validate the one exact scope-wide descriptor union while the complete
     // role-selected manifest is still available. The serialized manifest need
     // not duplicate this deterministic derivation.
     trusted_preset_descriptors(&manifest)?;
     Ok(manifest)
+}
+
+/// Leaderboard roots of the selected surface (same names and arguments as
+/// the runtime schema and SDL).
+fn client_leaderboards(surface: &Surface) -> Vec<ClientLeaderboard> {
+    let mut out = surface
+        .leaderboards()
+        .iter()
+        .map(|leaderboard| ClientLeaderboard {
+            name: leaderboard.name().to_string(),
+            entry_typename: crate::graphql::surface::LEADERBOARD_ENTRY_TYPE.to_string(),
+            order: crate::graphql::surface::leaderboard_order_str(leaderboard.order()).to_string(),
+            boards: match leaderboard.boards() {
+                crate::graphql::surface::LeaderboardBoards::Single { .. } => "single",
+                crate::graphql::surface::LeaderboardBoards::Family { .. } => "family",
+            }
+            .to_string(),
+            default_first: leaderboard.default_first(),
+            max_first: leaderboard.max_first(),
+            max_radius: leaderboard.max_radius(),
+            roots: leaderboard
+                .roots(leaderboard.selected_grant())
+                .into_iter()
+                .map(|root| ClientLeaderboardRoot {
+                    live: surface.subscriptions && root.operation.is_live(),
+                    list: root.operation.is_list(),
+                    operation: root.operation.as_str().to_string(),
+                    arguments: root
+                        .arguments
+                        .iter()
+                        .map(|argument| ClientLeaderboardArgument {
+                            name: argument.name.to_string(),
+                            type_name: argument.type_name.to_string(),
+                            nullable: argument.nullable,
+                        })
+                        .collect(),
+                    name: root.name,
+                })
+                .collect(),
+        })
+        .filter(|leaderboard| !leaderboard.roots.is_empty())
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }

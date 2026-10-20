@@ -206,3 +206,98 @@ async fn unreachable_redis_fails_fast_as_retryable() {
         .unwrap_err();
     assert!(err.is_retryable());
 }
+
+/// The same Redis boards served through GraphQL: roots read the sorted sets
+/// and an applied projector change refreshes a `@live` top-N.
+#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[tokio::test]
+async fn redis_boards_serve_graphql_queries_and_live_updates() {
+    use distributed::graphql::surface::{LeaderboardGrant, LeaderboardSurface};
+    use distributed::graphql::GraphqlEngine;
+    use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
+    use futures_util::StreamExt;
+
+    let Some(url) = redis_url() else { return };
+    let store = Arc::new(
+        RedisLeaderboard::connect(&url)
+            .unwrap()
+            .with_prefix(unique("gql")),
+    );
+    let board = Board::high_first("gold").unwrap();
+    for (member, score) in [("ann", 30.0), ("bob", 20.0)] {
+        store
+            .submit(
+                &board,
+                &ScoreSubmission::new(member, score, ScorePolicy::Replace),
+            )
+            .await
+            .unwrap();
+    }
+    let repo = distributed::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .unwrap();
+    let engine = GraphqlEngine::from_schema_catalog(
+        &distributed::ReadModelCatalog::new("gold-service"),
+        repo.pool().clone(),
+    )
+    .unwrap()
+    .roles(&["user"])
+    .leaderboard(
+        LeaderboardSurface::single("gold", &board).grant("user", LeaderboardGrant::read()),
+        store.clone(),
+    )
+    .build()
+    .unwrap();
+    let mut session = Session::new();
+    session.set(ROLE_KEY, "user");
+    session.set(USER_ID_KEY, "bob");
+
+    let mine = engine
+        .execute(
+            &session,
+            async_graphql::Request::new("{ goldMyRank { rank score } }"),
+        )
+        .await;
+    assert!(mine.errors.is_empty(), "{:?}", mine.errors);
+    assert_eq!(
+        serde_json::to_value(&mine.data).unwrap()["goldMyRank"],
+        serde_json::json!({ "rank": 1, "score": 20.0 })
+    );
+
+    let projector = LeaderboardProjector::new(
+        store.clone(),
+        Arc::new(
+            |event: &DomainEventOccurrence| -> Result<Vec<LeaderboardChange>, LeaderboardError> {
+                let body: GoldLooted = event
+                    .decode_body()
+                    .map_err(|error| LeaderboardError::invalid(error.to_string()))?;
+                Ok(vec![LeaderboardChange::new(
+                    Board::high_first("gold").unwrap(),
+                    ScoreSubmission::new(body.player, f64::from(body.gold), ScorePolicy::Increment),
+                )])
+            },
+        ),
+    )
+    .with_change_listener(engine.leaderboard_change_listener());
+    let mut live = engine.execute_stream(
+        &session,
+        async_graphql::Request::new("subscription { goldLeaderboard(first: 1) { member } }"),
+    );
+    let first = tokio::time::timeout(Duration::from_secs(5), live.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&first.data).unwrap()["goldLeaderboard"],
+        serde_json::json!([{ "member": "ann" }])
+    );
+    projector.apply_event(&looted(1, "bob", 50)).await.unwrap();
+    let pushed = tokio::time::timeout(Duration::from_secs(5), live.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&pushed.data).unwrap()["goldLeaderboard"],
+        serde_json::json!([{ "member": "bob" }])
+    );
+}
