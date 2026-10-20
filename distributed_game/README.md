@@ -261,7 +261,8 @@ requestAnimationFrame(function frame(now) {
 ```
 
 The rest of `Zone` is optional hooks: `on_auth`, `on_join`, `on_leave`,
-`on_rejoin`, `on_observe`, `on_timer`, `on_fact_settled`,
+`on_rejoin`, `on_connection_lost` (grace started), `on_reconnected`,
+`on_observe`, `on_timer`, `on_fact_settled`,
 `on_tier_changed`, `on_dispose`, `hibernate` / `on_restore`,
 `on_handoff_join`, `on_child_event`, `is_gate`, `freeze_ready`,
 `on_content_version_changed`, `record_rewind`, `state_hash`. Each is
@@ -685,6 +686,18 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
   activation's boot epoch for you (see [Durable facts](#durable-facts)).
 - If the process crashes, each in-flight fact is either fully saved or
   not saved at all. Mob Pit shows this with `kill -9`.
+- **Player lifecycle facts.** With `HostConfig::lifecycle_facts = true`
+  the host itself emits `lifecycle::PlayerJoined` (ticket, rejoin or
+  handoff), `ConnectionLost` (grace started; dropped or told to reload),
+  `PlayerReconnected`, `PlayerDisconnected` (grace expired) and
+  `PlayerLeft { reason }` as facts bound to the verified principal, so
+  presence, match admission and abandon need no hand-written facts. Keys
+  are `{command}:{zone}:{boot_epoch}:p{slot}:{n}` (stable across retries,
+  new after a restart); they share the principal's commit lane (order kept
+  with `max_concurrent_commits > 1`) and wait in a host backlog rather
+  than being dropped when the queue is full. `lifecycle::Lifecycle::of(&fact)`
+  decodes them in a sink. Mob Pit projects them into a presence read model
+  (`/dev/mobpit/presence`), ordered by stamp.
 - Every fact carries a `FactStamp`: zone, activation (boot epoch), tick,
   host wall time `emitted_at_ms` (`Clock::unix_ms`; `ManualClock` in
   tests), content version and config version (`HostConfig::config_version`,

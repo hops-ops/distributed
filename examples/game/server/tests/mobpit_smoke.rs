@@ -542,3 +542,98 @@ async fn redis_board_projects_and_rebuilds_when_redis_url_is_set() {
     }
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn presence_is_projected_from_the_runtime_lifecycle_facts() {
+    use distributed_game::protocol::Hello;
+    use distributed_game::{ClientMessage, ClientMirror, Role, ServerMessage, TicketClaims};
+    use futures_util::{SinkExt, StreamExt};
+    use game_demos::mobpit::presence::PresenceStatus;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let dir = temp_dir("presence");
+    let world = MobPitWorld::open(WorldOptions::new(&dir)).unwrap();
+    let (demo, stop) = start(world.clone()).await;
+    let join = |principal: &'static str| {
+        let url = format!("{}/zones/pit-1", demo.ws_url());
+        async move {
+            let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+            let ticket = TicketKey::new(SECRET).sign(&TicketClaims::new(
+                principal,
+                "pit-1",
+                4_000_000_000,
+                format!("presence-{principal}"),
+                Role::Player,
+            ));
+            let hello = ClientMessage::Hello(Hello {
+                protocol_version: distributed_game::PROTOCOL_VERSION,
+                content_version: String::new(),
+                capabilities: 0,
+                ticket,
+                reconnect_token: String::new(),
+            });
+            ws.send(Message::Binary(hello.encode().into()))
+                .await
+                .unwrap();
+            let mut mirror = ClientMirror::new();
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Binary(bytes) => {
+                        if let ServerMessage::Welcome(_) = mirror.apply(&bytes).unwrap() {
+                            break;
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            ws
+        }
+    };
+    let status = |principal: &'static str| {
+        let world = world.clone();
+        move || {
+            let world = world.clone();
+            async move {
+                world
+                    .presence()
+                    .get(principal)
+                    .map(|e| (e.zone.clone(), e.status))
+            }
+        }
+    };
+    let mut ana = join("guest-ana").await;
+    let bo = join("guest-bo").await;
+    let online = Some(("pit-1".to_string(), PresenceStatus::Online));
+    eventually("ana online", Duration::from_secs(5), {
+        let s = status("guest-ana");
+        let online = online.clone();
+        move || {
+            let (s, online) = (s.clone(), online.clone());
+            async move { s().await == online }
+        }
+    })
+    .await;
+    // Graceful leave → offline; a dropped socket → away (grace running).
+    ana.send(Message::Binary(ClientMessage::Leave.encode().into()))
+        .await
+        .unwrap();
+    drop(bo);
+    eventually("ana offline, bo away", Duration::from_secs(5), {
+        let (a, b) = (status("guest-ana"), status("guest-bo"));
+        move || {
+            let (a, b) = (a.clone(), b.clone());
+            async move {
+                a().await == Some(("pit-1".into(), PresenceStatus::Offline))
+                    && b().await == Some(("pit-1".into(), PresenceStatus::Away))
+            }
+        }
+    })
+    .await;
+    let (code, body) = http(demo.addr, "GET", "/dev/mobpit/presence", None).await;
+    assert_eq!(code, 200);
+    assert_eq!(body["presence"].as_array().unwrap().len(), 2, "{body}");
+    // Lifecycle facts never touch the Crawler cells.
+    assert!(world.cells().principals().is_empty());
+    let _ = stop.send(());
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -960,6 +960,10 @@ impl Zone for MobPit {
     }
 
     fn on_fact_settled(&mut self, ctx: &mut Ctx<'_, Self>, settlement: FactSettlement) {
+        // The host's own lifecycle facts (presence) are not kills.
+        if distributed_game::lifecycle::LIFECYCLE_COMMANDS.contains(&settlement.command.as_str()) {
+            return;
+        }
         let pending = self.pending.remove(&settlement.key);
         let (principal, x, y, waited_ms) = match &pending {
             Some(p) => (

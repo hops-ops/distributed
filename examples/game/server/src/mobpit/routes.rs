@@ -10,6 +10,8 @@
 //!   snapshot, plus rank / neighbours of `member` on both boards.
 //! - `POST /dev/mobpit/leaderboard/rebuild` — rebuild both boards from the
 //!   cells' event history; reports whether the result matches the cells.
+//! - `GET /dev/mobpit/presence` — who is online / away / offline where,
+//!   projected from the runtime's player lifecycle facts.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,6 +43,7 @@ pub fn routes(world: Arc<MobPitWorld>) -> Router {
         .route("/dev/mobpit/crawlers", get(crawlers))
         .route("/dev/mobpit/leaderboard", get(leaderboard))
         .route("/dev/mobpit/leaderboard/rebuild", post(rebuild))
+        .route("/dev/mobpit/presence", get(presence))
         .with_state(world)
 }
 
@@ -97,6 +100,10 @@ async fn leaderboard(
         None => Value::Null,
     };
     Ok(Json(json!({ "snapshot": snapshot, "me": me })))
+}
+
+async fn presence(State(world): State<Arc<MobPitWorld>>) -> Json<Value> {
+    Json(json!({ "presence": world.presence().snapshot() }))
 }
 
 async fn rebuild(State(world): State<Arc<MobPitWorld>>) -> ApiResult {

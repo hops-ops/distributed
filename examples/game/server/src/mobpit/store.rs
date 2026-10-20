@@ -30,11 +30,13 @@ use distributed::entity::EventRecord;
 use distributed::BusPublisher;
 use distributed::{RepositoryError, StreamIdentity};
 use distributed_game::cell::CellFactSink;
+use distributed_game::lifecycle::Lifecycle;
 use distributed_game::{BoxFuture, Fact, FactError, FactReceipt, FactSink};
 use serde::Serialize;
 
 use super::board::Leaderboards;
 use super::crawler::{Crawler, KillReceipt, RecordKill, AGGREGATE_TYPE, RECORD_KILL};
+use super::presence::Presence;
 
 /// Command-ledger service id for game facts.
 pub const SERVICE_ID: &str = "mobpit";
@@ -262,6 +264,8 @@ pub struct SinkStats {
     pub errors: u64,
     /// Facts currently inside `commit` (incl. the artificial latency).
     pub in_sink: u64,
+    /// Lifecycle facts projected into presence (not counted above).
+    pub presence: u64,
 }
 
 /// Shared sink state (lives in the world).
@@ -312,6 +316,7 @@ pub struct CrawlerFactSink {
     state: Arc<SinkState>,
     board: Arc<Leaderboards>,
     projection: Arc<std::sync::OnceLock<ProjectionBus>>,
+    presence: Arc<Presence>,
 }
 
 impl CrawlerFactSink {
@@ -327,7 +332,14 @@ impl CrawlerFactSink {
             state,
             board,
             projection,
+            presence: Arc::default(),
         }
+    }
+
+    /// Project lifecycle facts into `presence` (instead of a private one).
+    pub fn with_presence(mut self, presence: Arc<Presence>) -> Self {
+        self.presence = presence;
+        self
     }
 
     async fn commit_inner(&self, fact: &Fact) -> Result<FactReceipt, FactError> {
@@ -338,6 +350,7 @@ impl CrawlerFactSink {
         let principal = fact
             .principal()
             .ok_or_else(|| FactError::Permanent("kill facts need a player principal".into()))?;
+
         let cell = self
             .cells
             .get(principal)
@@ -376,6 +389,16 @@ impl CrawlerFactSink {
 impl FactSink for CrawlerFactSink {
     fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
         Box::pin(async move {
+            // Runtime lifecycle facts feed the presence read model, not a
+            // cell (and not the kill counters).
+            if let (Some(event), Some(principal)) = (Lifecycle::of(fact), fact.principal()) {
+                let applied = self.presence.apply(principal, fact.stamp(), &event);
+                self.state.update(|s| s.presence += 1);
+                return Ok(FactReceipt {
+                    payload: serde_json::json!({ "presence": applied }),
+                    replayed: !applied,
+                });
+            }
             self.state.update(|s| {
                 s.attempts += 1;
                 s.in_sink += 1;

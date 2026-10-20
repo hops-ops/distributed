@@ -11,6 +11,8 @@
 //!   `distributed_game::cell::CellFactSink`.
 //! - [`board`]: kills/XP leaderboards (in-memory or Redis), fire-and-forget
 //!   live updates, idempotent apply keys, rebuild from the cells' events.
+//! - [`presence`]: who is online where, projected from the runtime's player
+//!   lifecycle facts (`HostConfig::lifecycle_facts`), ordered by fact stamp.
 //! - [`routes`]: dev routes (`/dev/mobpit/*`).
 //!
 //! `game-demos mobpit` and `game-demos leaderboard` start the same server
@@ -21,6 +23,7 @@
 
 pub mod board;
 pub mod crawler;
+pub mod presence;
 pub mod routes;
 pub mod store;
 pub mod world;

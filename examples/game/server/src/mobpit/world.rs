@@ -13,6 +13,7 @@ use distributed_game::RetryPolicy;
 use serde_json::{json, Value};
 
 use super::board::Leaderboards;
+use super::presence::Presence;
 use super::store::{CrawlerCells, CrawlerFactSink, ProjectionBus, SinkState};
 use super::zone::{MobPit, MobPitConfig};
 use super::{routes, MobPitDemo};
@@ -60,6 +61,7 @@ pub struct MobPitWorld {
     zone_pending: AtomicUsize,
     profiles: Arc<Mutex<Vec<LoadedProfile>>>,
     projection: Arc<std::sync::OnceLock<ProjectionBus>>,
+    presence: Arc<Presence>,
 }
 
 impl MobPitWorld {
@@ -77,6 +79,7 @@ impl MobPitWorld {
             zone_pending: AtomicUsize::new(0),
             profiles: Arc::default(),
             projection: Arc::default(),
+            presence: Arc::default(),
         }))
     }
 
@@ -106,6 +109,11 @@ impl MobPitWorld {
         &self.board
     }
 
+    /// Presence projected from the zones' lifecycle facts.
+    pub fn presence(&self) -> &Arc<Presence> {
+        &self.presence
+    }
+
     /// The game's fact sink.
     pub fn fact_sink(&self) -> CrawlerFactSink {
         CrawlerFactSink::new(
@@ -114,6 +122,7 @@ impl MobPitWorld {
             self.board.clone(),
             self.projection.clone(),
         )
+        .with_presence(self.presence.clone())
     }
 
     /// Publish the cells' Crawler domain events to the SQLite bus at `url`
@@ -205,6 +214,10 @@ impl MobPitWorld {
         guests: Guests,
     ) -> (GameServer<MobPit>, Router) {
         let world = self.clone();
+        let mut config = config;
+        // Joined / connection lost / reconnected / disconnected / left facts
+        // for the presence projection.
+        config.host.lifecycle_facts = true;
         let server = GameServer::new(
             config,
             ZoneFactory::sync(move |activation| {

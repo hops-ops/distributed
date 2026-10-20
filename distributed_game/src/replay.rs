@@ -564,6 +564,7 @@ fn put_config(w: &mut Writer, c: &HostConfig) {
     });
     put_u64(w, c.boot_epoch);
     w.string(&c.config_version);
+    w.bool(c.lifecycle_facts);
 }
 
 fn put_claims(w: &mut Writer, claims: &TicketClaims) {
@@ -643,6 +644,7 @@ fn get_config(r: &mut Reader<'_>) -> Result<HostConfig, RecordingError> {
         },
         boot_epoch: get_u64(r)?,
         config_version: r.string()?,
+        lifecycle_facts: r.bool()?,
     })
 }
 

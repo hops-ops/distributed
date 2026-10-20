@@ -51,6 +51,8 @@ pub struct Arena {
     pub tiers: Vec<(Tier, Tier)>,
     /// Extension claims seen by `on_auth`.
     pub auth_extensions: Vec<distributed_game::TicketExtensions>,
+    /// `lost:{player}` / `back:{player}` from the connection hooks.
+    pub connection_events: Vec<String>,
 }
 
 impl Arena {
@@ -119,6 +121,7 @@ impl Zone for Arena {
             timer_fires: 0,
             tiers: Vec::new(),
             auth_extensions: Vec::new(),
+            connection_events: Vec::new(),
         }
     }
 
@@ -150,6 +153,14 @@ impl Zone for Arena {
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId, reason: LeaveReason) {
         self.avatars.remove(&player);
         self.log.push(format!("leave:{reason:?}"));
+    }
+
+    fn on_connection_lost(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        self.connection_events.push(format!("lost:{}", player.0));
+    }
+
+    fn on_reconnected(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        self.connection_events.push(format!("back:{}", player.0));
     }
 
     fn on_observe(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {

@@ -224,8 +224,18 @@ pub trait Zone: Sized + Send + 'static {
     /// A player joined (not called on reconnect).
     fn on_join(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId) {}
 
-    /// A player left for `reason` (not called on a disconnect still inside the grace window).
+    /// A player left for `reason` (not called on a disconnect still inside
+    /// the grace window: see [`on_connection_lost`](Self::on_connection_lost)).
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId, _reason: LeaveReason) {}
+
+    /// A player's connection dropped (or it was told to reload) and its
+    /// reconnect grace window started; the slot and its entity stay.
+    /// `on_leave(Disconnected)` follows if it does not come back in time.
+    fn on_connection_lost(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId) {}
+
+    /// A player resumed its slot with a reconnect token within the grace
+    /// window.
+    fn on_reconnected(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId) {}
 
     /// A fresh ticket (not a reconnect token) arrived for a principal that
     /// already holds a player slot here, e.g. the page was reloaded or opened

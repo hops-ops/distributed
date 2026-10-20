@@ -62,6 +62,7 @@ pub mod handoff;
 pub mod host;
 pub mod input;
 pub mod interest;
+pub mod lifecycle;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(feature = "net")]
