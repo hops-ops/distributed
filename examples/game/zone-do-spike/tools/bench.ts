@@ -116,6 +116,59 @@ if (mode === 'join') {
 	const st = await (await fetch(`${base}/rooms/${encodeURIComponent(room)}/stats`)).json() as any;
 	console.log(JSON.stringify({ room, via: base, owner: st.node, rtt: summary(rtts) }));
 	b.ws.close();
+} else if (mode === 'crowd') {
+	// crowd <base> <room> <players> <secs> [hz] [pids] [bases]: <players> bots
+	// in ONE room, joins spread over [bases] (comma list, default <base>), so
+	// every bot not on the owner node is forwarded. Reports the room's loop
+	// timing, per-bot Delta size/interval/bandwidth, ping and node CPU.
+	const [count, secs, hz = '30', pidList = '', baseList = ''] = rest;
+	const pids = pidList ? pidList.split(',') : [];
+	const bases = baseList ? baseList.split(',') : [base];
+	const r = `${room}@${hz}`;
+	const bots: Bot[] = [];
+	const bytes: number[][] = [];
+	const t0 = performance.now();
+	for (let i = 0; i < Number(count); i += 10) {
+		const batch = await Promise.all(Array.from({ length: Math.min(10, Number(count) - i) }, (_, j) => bot(bases[(i + j) % bases.length], r, `p${i + j}`)));
+		for (const b of batch) {
+			const sizes: number[] = [];
+			bytes.push(sizes);
+			const prev = b.ws.onmessage!;
+			b.ws.onmessage = (e) => { const d = e.data as ArrayBuffer; if (new Uint8Array(d)[0] === TAG_DELTA) sizes.push(d.byteLength); (prev as any).call(b.ws, e); };
+			bots.push(b);
+		}
+	}
+	const joinS = (performance.now() - t0) / 1000;
+	const welcome = bots.map((b) => b.timings.welcome);
+	const timers = bots.map((b, i) => drive(b, i * 7));
+	await sleep(3000);
+	await fetch(`${base}/rooms/${encodeURIComponent(r)}/stats?reset=1`).catch(() => undefined);
+	for (const b of bots) b.deltas.length = 0;
+	for (const s of bytes) s.length = 0;
+	const samples: ReturnType<typeof cpu>[] = [];
+	const end = Date.now() + Number(secs) * 1000;
+	while (Date.now() < end) { await sleep(1000); samples.push(cpu(pids)); }
+	const st = (await (await fetch(`${base}/rooms/${encodeURIComponent(r)}/stats`)).json()) as any;
+	const rtts: number[] = [];
+	for (const b of bots.filter((_, i) => i % 5 === 0)) rtts.push(await ping(b));
+	timers.forEach(clearInterval);
+	const arrivals = bots.flatMap((b) => b.deltas.slice(1).map((t, i) => t - b.deltas[i]));
+	const sizes = bytes.flat();
+	const perBotKBps = bytes.map((s) => s.reduce((a, x) => a + x, 0) / 1024 / Number(secs));
+	const cpuByPid: Record<string, number[]> = {};
+	for (const s of samples) for (const c of s) (cpuByPid[c.pid] ??= []).push(c.cpu);
+	console.log(JSON.stringify({
+		room: r, players: bots.length, connected: bots.filter((b) => b.ws.readyState === 1).length, hz: Number(hz), secs: Number(secs),
+		joinS: +joinS.toFixed(1), welcome: summary(welcome), owner: st.node,
+		lateP50: st.late_ms?.p50, lateP99: st.late_ms?.p99, intervalP99: st.interval_ms?.p99, droppedTicks: st.dropped_ticks,
+		iterations: st.iterations, expectedIterations: Math.round(Number(hz) * Number(secs)),
+		deltaBytes: summary(sizes), deltaArrival: summary(arrivals),
+		perBotKBps: summary(perBotKBps), roomOutKBps: +perBotKBps.reduce((a, x) => a + x, 0).toFixed(1),
+		pingUnderLoad: summary(rtts),
+		cpu: Object.fromEntries(Object.entries(cpuByPid).map(([p, a]) => [p, { avg: +(a.reduce((x, y) => x + y, 0) / a.length).toFixed(1), max: Math.max(...a) }]))
+	}));
+	for (const b of bots) b.ws.close();
+	await sleep(500);
 } else if (mode === 'load') {
 	const [count, secs, hz = '30', pidList = ''] = rest;
 	const pids = pidList ? pidList.split(',') : [];
