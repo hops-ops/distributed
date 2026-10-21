@@ -46,6 +46,10 @@ export interface PitRoomLayout {
 	readonly biome: number;
 	readonly danger: number;
 	readonly mobs: readonly RoomMob[];
+	readonly boss: boolean;
+	readonly hoodX: number;
+	readonly hoodY: number;
+	readonly bossDistance: number;
 }
 
 /** Record `PitRules` (`#[derive(GameRecord)]`). */
@@ -91,6 +95,40 @@ const PROFILE_TYPE: WireType = {
 		['levelXp', { type: 'u64' }],
 		['nextLevelXp', { type: 'u64' }],
 		['source', { type: 'short_str' }],
+	]
+};
+
+/** Record `WorldTiers` (`#[derive(GameRecord)]`). */
+export interface WorldTiers {
+	readonly hoodX: number;
+	readonly hoodY: number;
+	readonly hoodTier: number;
+	readonly bossDown: boolean;
+	readonly lastBy: string;
+	readonly boroughX: number;
+	readonly boroughY: number;
+	readonly boroughBossesDown: number;
+	readonly weather: number;
+	readonly hoodsDown: readonly string[];
+	readonly cityBossesDown: number;
+	readonly banner: string;
+}
+
+const WORLD_TIERS_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['hoodX', { type: 'i32' }],
+		['hoodY', { type: 'i32' }],
+		['hoodTier', { type: 'u32' }],
+		['bossDown', { type: 'bool' }],
+		['lastBy', { type: 'short_str' }],
+		['boroughX', { type: 'i32' }],
+		['boroughY', { type: 'i32' }],
+		['boroughBossesDown', { type: 'u32' }],
+		['weather', { type: 'u8' }],
+		['hoodsDown', { type: 'list', item: { type: 'short_str' } }],
+		['cityBossesDown', { type: 'u32' }],
+		['banner', { type: 'short_str' }],
 	]
 };
 
@@ -187,6 +225,22 @@ const DIED_LAYOUT: PayloadLayout = [
 	['respawnMs', { type: 'u32' }],
 ];
 
+/** Event `world` (id 7). */
+export type WorldEvent = WorldTiers;
+
+const WORLD_PAYLOAD: WireType = WORLD_TIERS_TYPE;
+
+/** Event `boss_down` (id 8). */
+export interface BossDownEvent {
+	readonly by: string;
+	readonly hoodTier: number;
+}
+
+const BOSS_DOWN_LAYOUT: PayloadLayout = [
+	['by', { type: 'short_str' }],
+	['hoodTier', { type: 'u32' }],
+];
+
 /** Message `loaded` (id 1). */
 export interface LoadedMessage {
 	readonly principal: string;
@@ -202,6 +256,16 @@ const MESSAGE_LOADED_LAYOUT: PayloadLayout = [
 	['kills', { type: 'u32' }],
 ];
 
+/** Message `world` (id 2). */
+export type WorldMessage = WorldTiers;
+
+const MESSAGE_WORLD_PAYLOAD: WireType = WORLD_TIERS_TYPE;
+
+/** Message `world_keep_city` (id 3). */
+export type WorldKeepCityMessage = WorldTiers;
+
+const MESSAGE_WORLD_KEEP_CITY_PAYLOAD: WireType = WORLD_TIERS_TYPE;
+
 /** Event type ids by name. */
 export const EVENT = {
 	hello: 1,
@@ -209,6 +273,8 @@ export const EVENT = {
 	kill: 3,
 	saved: 4,
 	died: 6,
+	world: 7,
+	bossDown: 8,
 } as const;
 
 /** Event payload types by name. */
@@ -218,6 +284,8 @@ export interface Events {
 	kill: KillEvent;
 	saved: SavedEvent;
 	died: DiedEvent;
+	world: WorldEvent;
+	bossDown: BossDownEvent;
 }
 
 /** Codecs of every event. */
@@ -252,6 +320,18 @@ export const EVENTS: GameEventCodecs<Events> = {
 		encode: (value) => encodePayload(DIED_LAYOUT, value),
 		decode: (payload) => decodePayload(DIED_LAYOUT, payload) as unknown as DiedEvent
 	},
+	world: {
+		id: 7,
+		name: 'world',
+		encode: (value) => encodeValue(WORLD_PAYLOAD, value),
+		decode: (payload) => decodeValue(WORLD_PAYLOAD, payload) as WorldEvent
+	},
+	bossDown: {
+		id: 8,
+		name: 'boss_down',
+		encode: (value) => encodePayload(BOSS_DOWN_LAYOUT, value),
+		decode: (payload) => decodePayload(BOSS_DOWN_LAYOUT, payload) as unknown as BossDownEvent
+	},
 };
 
 /** A decoded event, discriminated by `name`. */
@@ -274,11 +354,15 @@ export function onEvent<K extends keyof Events>(
 /** Zone inbox message type ids by name. */
 export const MESSAGE = {
 	loaded: 1,
+	world: 2,
+	worldKeepCity: 3,
 } as const;
 
 /** Zone inbox message payload types by name. */
 export interface Messages {
 	loaded: LoadedMessage;
+	world: WorldMessage;
+	worldKeepCity: WorldKeepCityMessage;
 }
 
 /** Codecs of every zone inbox message. */
@@ -288,6 +372,18 @@ export const MESSAGES: GameEventCodecs<Messages> = {
 		name: 'loaded',
 		encode: (value) => encodePayload(MESSAGE_LOADED_LAYOUT, value),
 		decode: (payload) => decodePayload(MESSAGE_LOADED_LAYOUT, payload) as unknown as LoadedMessage
+	},
+	world: {
+		id: 2,
+		name: 'world',
+		encode: (value) => encodeValue(MESSAGE_WORLD_PAYLOAD, value),
+		decode: (payload) => decodeValue(MESSAGE_WORLD_PAYLOAD, payload) as WorldMessage
+	},
+	worldKeepCity: {
+		id: 3,
+		name: 'world_keep_city',
+		encode: (value) => encodeValue(MESSAGE_WORLD_KEEP_CITY_PAYLOAD, value),
+		decode: (payload) => decodeValue(MESSAGE_WORLD_KEEP_CITY_PAYLOAD, payload) as WorldKeepCityMessage
 	},
 };
 

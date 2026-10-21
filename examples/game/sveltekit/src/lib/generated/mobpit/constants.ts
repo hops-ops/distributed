@@ -8,7 +8,8 @@ export const PIT_RULES: PitRules = {
 	tiers: [
 		{ tier: 1, radius: 0.5, tele: 1.7999999523162842 },
 		{ tier: 2, radius: 0.699999988079071, tele: 2.200000047683716 },
-		{ tier: 3, radius: 0.800000011920929, tele: 2.5999999046325684 }
+		{ tier: 3, radius: 0.800000011920929, tele: 2.5999999046325684 },
+		{ tier: 4, radius: 1.2000000476837158, tele: 3.200000047683716 }
 	],
 	states: ['idle', 'chase', 'windup', 'recover', 'return', 'dead'],
 	attackRange: 2.200000047683716,
@@ -40,3 +41,6 @@ export const PIT_WORLD: PitWorld = {
 	maxRoom: 1000000,
 	biomes: ['highlands', 'steppe', 'forest', 'meadow']
 };
+
+/** `weather`, as the client decodes it. */
+export const WEATHER: readonly string[] = ['storm', 'rain', 'clearing', 'clear'];

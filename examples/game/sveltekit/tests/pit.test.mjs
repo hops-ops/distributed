@@ -302,6 +302,12 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		await page.waitForFunction((b) => Number(document.querySelector('[data-testid=rtt]')?.textContent) < b + 60, baseRtt, { timeout: 15_000 });
 		assert.ok(Number(await page.textContent('[data-testid=corrections]')) >= 0);
 
+		// The world above the room (its hood's cell, the borough's weather):
+		// nobody felled a boss yet, so the storm darkens the view.
+		await page.waitForSelector('[data-testid=weather]:text-is("storm")', { timeout: 15_000 });
+		assert.equal(await page.textContent('[data-testid=hood-tier]'), '0');
+		await page.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.dark ?? 0) > 0.3, null, { timeout: 5_000 });
+
 		// Attack: the server's swing reaches the client and the cone is drawn.
 		await page.keyboard.down('Space');
 		await page.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.swings ?? 0) > 0, null, { timeout: 5_000 });

@@ -11,25 +11,25 @@
     "bindings": [
       { "name": "CRAWLER", "class_name": "CrawlerCell" },
       { "name": "PRESENCE", "class_name": "PresenceCell" },
-      { "name": "ZONE_LEASE", "class_name": "ZoneLeaseCell" },
-      { "name": "ZONE_STATE", "class_name": "ZoneStateCell" },
       { "name": "GEM_POUCH", "class_name": "GemPouchCell" },
       { "name": "CONTENT_LOG", "class_name": "ContentLogCell" },
       { "name": "PIT_ROOM", "class_name": "PitRoom" },
       { "name": "ZONE_ACTIVITY", "class_name": "ZoneActivityObject" },
-      { "name": "ZONE_DEV", "class_name": "ZoneDevObject" }
+      { "name": "ZONE_DEV", "class_name": "ZoneDevObject" },
+      { "name": "HOOD", "class_name": "HoodCell" },
+      { "name": "BOROUGH", "class_name": "BoroughCell" },
+      { "name": "CITY", "class_name": "CityCell" }
     ]
   },
+  // v2's ZoneLeaseCell / ZoneStateCell (the deleted multi-host demos) are
+  // no longer exported; celld has no `deleted_classes` migration key.
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["CrawlerCell", "PresenceCell"] },
     { "tag": "v2", "new_sqlite_classes": ["ZoneLeaseCell", "ZoneStateCell"] },
     { "tag": "v3", "new_sqlite_classes": ["GemPouchCell", "ContentLogCell"] },
     { "tag": "v4", "new_sqlite_classes": ["PitRoom", "ZoneActivityObject"] },
-    { "tag": "v5", "new_sqlite_classes": ["ZoneDevObject"] }
-  ],
-  // Hibernation snapshots above the inline limit (celld's object storage).
-  "r2_buckets": [
-    { "binding": "ZONE_SNAPSHOTS", "bucket_name": "zone-snapshots" }
+    { "tag": "v5", "new_sqlite_classes": ["ZoneDevObject"] },
+    { "tag": "v6", "new_sqlite_classes": ["HoodCell", "BoroughCell", "CityCell"] }
   ],
   "queues": {
     "producers": [

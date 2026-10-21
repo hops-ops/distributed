@@ -57,10 +57,11 @@ use distributed_game::{
 };
 use game_sim::arena::{self as movement, MoveState, PILLARS, PLAYER_RADIUS};
 use game_sim::mobpit::{
-    self as rooms, admissible, crossing, into_neighbour, parse_room, pit_room, pit_world,
-    room_zone, PitRoomContext, PitRoomFn,
+    self as rooms, admissible, borough_of, crossing, hood_of, into_neighbour, pair_shard,
+    parse_room, pit_room, pit_world, room_zone, PitRoomContext, PitRoomFn, BOSS_TIER,
 };
 use mobpit_crawler::{level_floor, KillReceipt, RecordKillInput};
+use mobpit_tiers::{BossDefeatedInput, WEATHER};
 use serde::{Deserialize, Serialize};
 
 pub use game_sim::mobpit::{pit_step, PitInput, PitStep};
@@ -319,6 +320,47 @@ pub enum PitEvent {
         /// Respawn delay (ms).
         respawn_ms: u32,
     },
+    /// The world above the room (its hood, borough and city): on join and
+    /// whenever it changes.
+    #[game_event(id = 7)]
+    World(WorldTiers),
+    /// The hood's boss fell here.
+    #[game_event(id = 8)]
+    BossDown {
+        /// Display name of the slayer.
+        by: String,
+        /// The hood's tier now.
+        hood_tier: u32,
+    },
+}
+
+/// The tiers above a room, as its players see them.
+#[derive(Debug, Clone, Default, PartialEq, GameRecord)]
+pub struct WorldTiers {
+    /// Hood x.
+    pub hood_x: i32,
+    /// Hood y.
+    pub hood_y: i32,
+    /// Times the hood's boss fell: how much tougher its rooms are.
+    pub hood_tier: u32,
+    /// The hood's boss is down.
+    pub boss_down: bool,
+    /// Who felled it last.
+    pub last_by: String,
+    /// Borough x.
+    pub borough_x: i32,
+    /// Borough y.
+    pub borough_y: i32,
+    /// Bosses down in the borough (of 9).
+    pub borough_bosses_down: u32,
+    /// The borough's weather (index into `WEATHER`).
+    pub weather: u8,
+    /// Hoods of the borough whose boss is down (`hx.hy`).
+    pub hoods_down: Vec<String>,
+    /// Bosses down across the city.
+    pub city_bosses_down: u32,
+    /// The city's banner.
+    pub banner: String,
 }
 
 /// What services deliver into a room.
@@ -337,6 +379,12 @@ pub enum PitMessage {
         /// Kills.
         kills: u32,
     },
+    /// The tiers above the room, read from their cells (off the tick).
+    #[game_event(id = 2)]
+    World(WorldTiers),
+    /// The same without the city (not read this round: kept as it was).
+    #[game_event(id = 3)]
+    WorldKeepCity(WorldTiers),
 }
 
 /// Mob Pit's client surface (also used by the leaderboard page).
@@ -346,6 +394,7 @@ pub fn game_surface() -> GameSurface {
         .predict::<PitStep>()
         .pure::<PitRoomFn>()
         .constant("pit_rules", &pit_rules())
+        .constant("weather", &WEATHER.map(String::from).to_vec())
         .constant("pit_world", &pit_world())
 }
 
@@ -381,14 +430,32 @@ const PLAYER_RESPAWN_TICKS: u64 = 90;
 /// Mob tier stats: (max hp, speed m/s, damage, radius, telegraph radius).
 fn tier_stats(tier: u8) -> (i32, f32, i32, f32, f32) {
     match tier {
+        4 => (400, 2.2, 22, 1.2, 3.2),
         3 => (100, 3.3, 24, 0.8, 2.6),
         2 => (60, 2.4, 16, 0.7, 2.2),
         _ => (30, 3.0, 9, 0.5, 1.8),
     }
 }
 
-/// Mob tiers (1..=3).
-pub const TIERS: [u8; 3] = [1, 2, 3];
+/// Mob tiers (1..=3, and 4: a hood's boss).
+pub const TIERS: [u8; 4] = [1, 2, 3, BOSS_TIER];
+/// A fallen boss stays down at least this long here (its hood's schedule
+/// brings it back; the hood's state is read every few seconds).
+const BOSS_RESPAWN_TICKS: u64 = 30 * mobpit_tiers::BOSS_RESPAWN_MS / 1000;
+
+/// Hit points of a mob of `tier` in a room of hood tier `difficulty`
+/// (each boss kill in the hood makes its rooms 25 % tougher, up to
+/// `mobpit_tiers::MAX_TIER`).
+fn max_hp(tier: u8, difficulty: u32) -> i32 {
+    let d = difficulty.min(mobpit_tiers::MAX_TIER) as i32;
+    tier_stats(tier).0 * (4 + d) / 4
+}
+
+/// Damage of a mob of `tier` at hood tier `difficulty` (+20 % per tier).
+fn damage(tier: u8, difficulty: u32) -> i32 {
+    let d = difficulty.min(mobpit_tiers::MAX_TIER) as i32;
+    tier_stats(tier).2 * (5 + d) / 5
+}
 /// Names of the `mob` kind's `state` values, by value.
 pub const MOB_STATES: [&str; 6] = ["idle", "chase", "windup", "recover", "return", "dead"];
 
@@ -459,6 +526,8 @@ struct Mob {
     generation: u32,
     respawn_at: u64,
     wander: (f32, f32),
+    /// The hood tier its hit points are scaled to (for the HP bar).
+    difficulty: u32,
 }
 
 struct Player {
@@ -562,6 +631,8 @@ pub struct MobPit {
     tick: u64,
     /// Players whose slot ended here, oldest first (see [`Parked`]).
     parked: Vec<Parked>,
+    /// The tiers above the room (from their cells).
+    world: WorldTiers,
 }
 
 fn spawn_state(player: PlayerId) -> MoveState {
@@ -715,6 +786,7 @@ impl MobPit {
         let Some(player) = self.players.get(&killer) else {
             return;
         };
+        let player_name = player.name.clone();
         self.kills += 1;
         // The cell command's own input: what died, never who or how much XP.
         let input = RecordKillInput {
@@ -737,6 +809,35 @@ impl MobPit {
         });
         self.backlog.push_back((killer, fact, x, y));
         self.flush_backlog(ctx);
+        if tier == BOSS_TIER {
+            self.boss_fell(ctx, generation, player_name);
+        }
+    }
+
+    /// The hood's boss fell here: a zone fact into the hood's cell (keyed
+    /// by the boss's life; the hood raises its tier and brings the boss
+    /// back on its own schedule) and the news to everyone in the room.
+    fn boss_fell(&mut self, ctx: &mut Ctx<'_, Self>, generation: u32, by: String) {
+        let hood = (self.world.hood_x, self.world.hood_y);
+        let input = BossDefeatedInput {
+            hood: pair_shard(hood),
+            room: ctx.zone_id().to_string(),
+            generation,
+            by: by.clone(),
+        };
+        if let Ok(fact) = ctx.fact_with_key(&input, &[&"boss", &generation]) {
+            if ctx.emit_fact(fact).is_err() {
+                // Backpressure or shutdown: the hood learns of the next fall.
+            }
+        }
+        self.world.boss_down = true;
+        self.world.hood_tier += 1;
+        self.world.last_by = by.clone();
+        ctx.broadcast(&PitEvent::BossDown {
+            by,
+            hood_tier: self.world.hood_tier,
+        });
+        ctx.broadcast(&PitEvent::World(self.world.clone()));
     }
 
     /// Hand queued facts to the host; never blocks. Backpressure keeps the
@@ -885,7 +986,12 @@ impl MobPit {
                 if m.hp <= 0 {
                     m.hp = 0;
                     m.state = MobState::Dead;
-                    m.respawn_at = ctx.tick() + RESPAWN_TICKS;
+                    m.respawn_at = ctx.tick()
+                        + if m.tier == BOSS_TIER {
+                            BOSS_RESPAWN_TICKS
+                        } else {
+                            RESPAWN_TICKS
+                        };
                     m.target = None;
                     self.emit_kill(ctx, player, i);
                 }
@@ -903,16 +1009,22 @@ impl MobPit {
             .map(|(id, p)| (*id, p.state.x, p.state.y))
             .collect();
         let mut hits: Vec<(PlayerId, i32)> = Vec::new();
+        let difficulty = self.world.hood_tier;
+        let boss_down = self.world.boss_down;
         for i in 0..self.mobs.len() {
-            let (max_hp, speed, damage, radius, tele) = tier_stats(self.mobs[i].tier);
+            let tier = self.mobs[i].tier;
+            let (_, speed, _, radius, tele) = tier_stats(tier);
+            let (max_hp, damage) = (max_hp(tier, difficulty), damage(tier, difficulty));
             let target_pos = |t: Option<PlayerId>| {
                 t.and_then(|t| living.iter().find(|(id, _, _)| *id == t))
                     .map(|(_, x, y)| (*x, *y))
             };
             let m = &mut self.mobs[i];
+            m.difficulty = difficulty;
             match m.state {
                 MobState::Dead => {
-                    if tick >= m.respawn_at {
+                    // A boss returns only once its hood says so.
+                    if tick >= m.respawn_at && !(m.tier == BOSS_TIER && boss_down) {
                         m.generation += 1;
                         m.hp = max_hp;
                         (m.x, m.y) = m.home;
@@ -976,7 +1088,9 @@ impl MobPit {
                 MobState::Return => {
                     let (hx, hy) = m.home;
                     m.face = step_toward(&mut m.x, &mut m.y, hx, hy, speed * 1.3 * dt);
-                    m.hp = (m.hp + 1).min(max_hp);
+                    if m.tier != BOSS_TIER {
+                        m.hp = (m.hp + 1).min(max_hp);
+                    }
                     if dist((m.x, m.y), m.home) < 0.3 {
                         m.state = MobState::Idle;
                         m.wander = m.home;
@@ -1116,6 +1230,7 @@ impl MobPit {
                 view_radius: VIEW_RADIUS,
             },
         );
+        ctx.send(player, &PitEvent::World(self.world.clone()));
     }
 }
 
@@ -1156,13 +1271,14 @@ impl Zone for MobPit {
                     x: home.0,
                     y: home.1,
                     face: 0.0,
-                    hp: tier_stats(slot.tier).0,
+                    hp: max_hp(slot.tier, 0),
                     state: MobState::Idle,
                     timer: 0,
                     target: None,
                     generation: 0,
                     respawn_at: 0,
                     wander: home,
+                    difficulty: 0,
                 }
             })
             .collect();
@@ -1183,6 +1299,17 @@ impl Zone for MobPit {
             restored: false,
             tick: 0,
             parked: Vec::new(),
+            world: {
+                let hood = hood_of(room.room);
+                let borough = borough_of(hood);
+                WorldTiers {
+                    hood_x: hood.0,
+                    hood_y: hood.1,
+                    borough_x: borough.0,
+                    borough_y: borough.1,
+                    ..WorldTiers::default()
+                }
+            },
         }
     }
 
@@ -1283,6 +1410,43 @@ impl Zone for MobPit {
                     p.level = level.max(1);
                 }
                 ctx.send(id, &Self::profile_event(xp, level.max(1), kills, "cell"));
+            }
+            message @ (PitMessage::World(_) | PitMessage::WorldKeepCity(_)) => {
+                let (world, keep_city) = match message {
+                    PitMessage::World(world) => (world, false),
+                    PitMessage::WorldKeepCity(world) => (world, true),
+                    PitMessage::Loaded { .. } => unreachable!(),
+                };
+                // Only the hood, borough and city this room belongs to.
+                // A fall reported here may not have reached the hood yet:
+                // tiers never go down, and a boss that died here stays down
+                // until its time is up.
+                let tick = self.tick;
+                let fallen_here = self.mobs.iter().any(|m| {
+                    m.tier == BOSS_TIER && m.state == MobState::Dead && tick < m.respawn_at
+                });
+                let world = WorldTiers {
+                    hood_x: self.world.hood_x,
+                    hood_y: self.world.hood_y,
+                    borough_x: self.world.borough_x,
+                    borough_y: self.world.borough_y,
+                    hood_tier: world.hood_tier.max(self.world.hood_tier),
+                    boss_down: world.boss_down || fallen_here,
+                    ..world
+                };
+                let world = if keep_city {
+                    WorldTiers {
+                        city_bosses_down: self.world.city_bosses_down,
+                        banner: self.world.banner.clone(),
+                        ..world
+                    }
+                } else {
+                    world
+                };
+                if world != self.world {
+                    self.world = world;
+                    ctx.broadcast(&PitEvent::World(self.world.clone()));
+                }
             }
         }
     }
@@ -1423,7 +1587,7 @@ impl Zone for MobPit {
                 // Back home-side where it stood, calm again.
                 m.x = saved.x;
                 m.y = saved.y;
-                m.hp = saved.hp.clamp(1, tier_stats(m.tier).0);
+                m.hp = saved.hp.clamp(1, max_hp(m.tier, mobpit_tiers::MAX_TIER));
                 m.state = MobState::Return;
             }
         }
@@ -1461,7 +1625,7 @@ impl Project<MobView> for Mob {
         if self.state == MobState::Dead {
             return None;
         }
-        let max_hp = tier_stats(self.tier).0;
+        let max_hp = max_hp(self.tier, self.difficulty);
         let tele = if self.state == MobState::Windup {
             255 - (u32::from(self.timer) * 255 / u32::from(WINDUP_TICKS))
         } else {
@@ -1470,7 +1634,7 @@ impl Project<MobView> for Mob {
         Some(MobView::project(
             self,
             MobViewRest {
-                hp: (self.hp.max(0) * 100 / max_hp) as u8,
+                hp: (self.hp.max(0) * 100 / max_hp).min(100) as u8,
                 state: self.state as u8,
                 tele: tele as u8,
             },

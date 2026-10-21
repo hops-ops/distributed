@@ -11,7 +11,6 @@
 //! |---|---|---|
 //! | [`arena::ArenaStep`] | `player` | The Freeze |
 //! | [`mobpit::PitStep`] | `player` | Mob Pit |
-//! | [`ripple::HoodStep`] | `player` | Boss Ripple (hoods) |
 //!
 //! The seeded world generation ([`grid`]: noise, biomes, props) feeds Mob
 //! Pit's rooms; [`mobpit::pit_room`] is a `#[game_pure]` function, so the
@@ -24,4 +23,3 @@
 pub mod arena;
 pub mod grid;
 pub mod mobpit;
-pub mod ripple;

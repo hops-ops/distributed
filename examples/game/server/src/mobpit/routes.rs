@@ -20,6 +20,9 @@
 //! - `POST /dev/mobpit/leaderboard/rebuild` — rebuild both boards from the
 //!   event history of every crawler in the directory.
 //! - `GET /dev/mobpit/presence?principal=` — the player's presence cell.
+//! - `GET /dev/mobpit/tiers?room=pit.<x>.<y>` — the 3 × 3 hoods around the
+//!   room's (boss room, boss down, tier), their boroughs (bosses down,
+//!   weather) and the city, read from the tier cells (the minimap).
 //! - `GET /dev/netsim` / `POST /dev/netsim` `{latencyMs, jitterMs, loss}` —
 //!   read / replace the network simulation of **every** room (dev settings
 //!   object on celld, read by each room within a second; applied per
@@ -72,6 +75,7 @@ pub fn routes(world: Arc<MobPitWorld>, key: TicketKey) -> Router {
         .route("/dev/mobpit/leaderboard", get(leaderboard))
         .route("/dev/mobpit/leaderboard/rebuild", post(rebuild))
         .route("/dev/mobpit/presence", get(presence))
+        .route("/dev/mobpit/tiers", get(tiers))
         .route("/dev/netsim", get(get_netsim).post(set_netsim))
         .with_state(Dev { world, key })
 }
@@ -228,4 +232,57 @@ async fn set_netsim(
         .await
         .map_err(internal)?;
     Ok(Json(applied))
+}
+
+async fn tiers(State(dev): State<Dev>, Query(query): Query<HashMap<String, String>>) -> ApiResult {
+    use game_sim::mobpit::{borough_of, boss_room, hood_of, pair_shard, parse_room};
+    let room = query
+        .get("room")
+        .and_then(|r| parse_room(r))
+        .ok_or_else(|| bad_request("room=pit.<x>.<y> is required"))?;
+    let seed = std::env::var(mobpit_rooms::SEED_VAR)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(mobpit_rooms::DEFAULT_SEED);
+    let cells = dev.world.cells();
+    let (hx, hy) = hood_of(room);
+    let mut hoods = Vec::new();
+    let mut boroughs = std::collections::BTreeSet::new();
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            let hood = (hx + dx, hy + dy);
+            let state = cells
+                .tier(mobpit_tiers::HOOD_KIND, &pair_shard(hood))
+                .await
+                .map_err(internal)?;
+            let boss = boss_room(seed, hood);
+            boroughs.insert(borough_of(hood));
+            hoods.push(json!({
+                "hood": pair_shard(hood), "x": hood.0, "y": hood.1,
+                "bossRoom": [boss.0, boss.1],
+                "bossDown": state["boss_down"].as_bool().unwrap_or(false),
+                "tier": state["tier"].as_u64().unwrap_or(0),
+            }));
+        }
+    }
+    let mut out = Vec::new();
+    for borough in boroughs {
+        let state = cells
+            .tier(mobpit_tiers::BOROUGH_KIND, &pair_shard(borough))
+            .await
+            .map_err(internal)?;
+        let down = state["bosses_down"].as_u64().unwrap_or(0);
+        out.push(json!({
+            "borough": pair_shard(borough), "x": borough.0, "y": borough.1,
+            "bossesDown": down,
+            "weather": mobpit_tiers::WEATHER[mobpit_tiers::weather_for(down as u32) as usize],
+        }));
+    }
+    let city = cells
+        .tier(mobpit_tiers::CITY_KIND, mobpit_tiers::CITY_SHARD)
+        .await
+        .map_err(internal)?;
+    Ok(Json(
+        json!({ "hoods": hoods, "boroughs": out, "city": city }),
+    ))
 }

@@ -100,7 +100,8 @@ export const MOB_STATE = pit.PIT_RULES.states;
 const TIER_LOOK: Readonly<Record<number, { name: string; color: string }>> = {
 	1: { name: 'Grunt', color: '#9ad16b' },
 	2: { name: 'Brute', color: '#b48cf2' },
-	3: { name: 'Elite', color: '#ff6b6b' }
+	3: { name: 'Elite', color: '#ff6b6b' },
+	4: { name: 'Boss', color: '#ff2d55' }
 };
 /**
  * Per tier: display name and color (client presentation), body and
@@ -152,6 +153,13 @@ export type RoomStatus = Readonly<{
 	changedAtMs: number;
 }>;
 
+/** The tiers around a room (`/dev/mobpit/tiers`): hoods, their boroughs, the city. */
+export type TiersAround = Readonly<{
+	hoods: { hood: string; x: number; y: number; bossRoom: [number, number]; bossDown: boolean; tier: number }[];
+	boroughs: { borough: string; x: number; y: number; bossesDown: number; weather: string }[];
+	city: { bosses_down: number; boroughs_cleared: number; banner: string } | null;
+}>;
+
 /** A room object's debug JSON (`/rooms/{room}/info`). */
 export type RoomInfo = Readonly<{
 	zone: string;
@@ -172,6 +180,8 @@ export type RoomInfo = Readonly<{
 export type MobPitClient = pit.MobpitClient &
 	Readonly<{
 		hello(): pit.HelloEvent | undefined;
+		/** The tiers above the room (hood, borough, city), latest. */
+		world(): pit.WorldTiers | undefined;
 		profile(): pit.Profile | undefined;
 		/** The room the player is in (authority zone). */
 		room(): string | undefined;
@@ -216,6 +226,11 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		(value) => typed.client.setControlledEntity(value.entity)
 	);
 	const profile = latest<pit.Profile>((h) => typed.on('profile', h));
+	// Only the own room's view of the tiers (watched neighbours send theirs too).
+	let world: pit.WorldTiers | undefined;
+	typed.on('world', (w, zoneId) => {
+		if (zoneId === typed.client.authority?.zoneId) world = w;
+	});
 	const unsaved = new Map<string, pit.KillEvent>();
 	typed.on('kill', (kill, zoneId) => {
 		// Entity ids are per room: only kills in your own room can be yours.
@@ -235,6 +250,7 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 	return {
 		...typed,
 		hello: hello.get,
+		world: () => world,
 		profile: profile.get,
 		room: () => typed.client.authority?.zoneId,
 		me,
@@ -307,6 +323,11 @@ export class MobPitApi {
 	async startRoom(guest: string | undefined): Promise<string> {
 		const { zone } = await this.#json<{ zone: string; resumed: boolean }>('/dev/mobpit/start', guest === undefined ? {} : { guest });
 		return parseRoom(zone) === undefined ? DEFAULT_ZONE : zone;
+	}
+
+	/** The hoods around `room`, their boroughs and the city (tier cells). */
+	tiers(room: string): Promise<TiersAround> {
+		return this.#json(`/dev/mobpit/tiers?room=${encodeURIComponent(room)}`);
 	}
 
 	/** Every room the zone status read model knows. */

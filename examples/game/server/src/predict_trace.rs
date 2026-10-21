@@ -17,7 +17,6 @@ use distributed_game::pure::{call_bytes, GamePure};
 use distributed_game::Wire;
 use game_sim::arena::{self, ArenaStep, MoveState};
 use game_sim::mobpit::PitStep;
-use game_sim::ripple::HoodStep;
 use serde_json::{json, Value};
 
 /// Deterministic xorshift32 (streams must be identical on every run).
@@ -211,7 +210,6 @@ pub fn traces() -> Value {
         "steps": [
             trace::<ArenaStep>(capsule_streams(0)),
             trace::<PitStep>(capsule_streams(0)),
-            trace::<HoodStep>(capsule_streams(1)),
         ],
     })
 }
@@ -224,7 +222,7 @@ mod tests {
     fn traces_cover_every_step_and_collide() {
         let traces = traces();
         let steps = traces["steps"].as_array().unwrap();
-        assert_eq!(steps.len(), 3);
+        assert_eq!(steps.len(), 2);
         for step in steps {
             for stream in step["streams"].as_array().unwrap() {
                 assert_eq!(

@@ -7,8 +7,10 @@ use distributed_game::command_sink::FactRoute;
 use distributed_game::HostConfig;
 use mobpit_crawler::{RecordKillInput, CRAWLER_KIND, PRESENCE_KIND};
 
-use crate::zone::{MobPit, PitMessage, RoomConfig};
+use crate::zone::{MobPit, PitMessage, RoomConfig, WorldTiers};
 use crate::{DEFAULT_SEED, SEED_VAR};
+use game_sim::mobpit::pair_shard;
+use mobpit_tiers::{BossDefeatedInput, BOROUGH_KIND, CITY_KIND, CITY_SHARD, HOOD_KIND};
 
 impl CelldZone for MobPit {
     fn object_config(zone_id: &str, env: &ObjectEnv) -> Result<RoomConfig, String> {
@@ -30,7 +32,71 @@ impl CelldZone for MobPit {
 
     fn fact_routes(sink: ObjectFactSink) -> ObjectFactSink {
         sink.route(FactRoute::by_principal::<RecordKillInput>(CRAWLER_KIND))
+            .route(FactRoute::by_input_field::<BossDefeatedInput>(
+                HOOD_KIND, "hood",
+            ))
             .lifecycle_route(PRESENCE_KIND)
+    }
+
+    /// The tiers above the room: its hood and borough every refresh (2 s),
+    /// the city every 5th.
+    fn refresh_every() -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(2))
+    }
+
+    fn refresh(
+        env: &ObjectEnv,
+        zone_id: &str,
+        round: u64,
+    ) -> Option<LocalFuture<Option<PitMessage>>> {
+        let room = game_sim::mobpit::parse_room(zone_id)?;
+        let hood = game_sim::mobpit::hood_of(room);
+        let borough = game_sim::mobpit::borough_of(hood);
+        let env = env.clone();
+        Some(Box::pin(async move {
+            let hood_state = env.read_cell(HOOD_KIND, &pair_shard(hood)).await.ok()?;
+            let borough_state = env
+                .read_cell(BOROUGH_KIND, &pair_shard(borough))
+                .await
+                .ok()?;
+            let city = if round % 5 == 0 {
+                env.read_cell(CITY_KIND, CITY_SHARD).await.ok()
+            } else {
+                None
+            };
+            let h = &hood_state["state"];
+            let b = &borough_state["state"];
+            let mut world = WorldTiers {
+                hood_tier: h["tier"].as_u64().unwrap_or(0) as u32,
+                boss_down: h["boss_down"].as_bool().unwrap_or(false),
+                last_by: h["last_by"].as_str().unwrap_or_default().to_string(),
+                borough_bosses_down: b["bosses_down"].as_u64().unwrap_or(0) as u32,
+                weather: b["weather"].as_u64().unwrap_or(0) as u8,
+                hoods_down: b["hoods_down"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                ..WorldTiers::default()
+            };
+            match city {
+                Some(c) => {
+                    world.city_bosses_down = c["state"]["bosses_down"].as_u64().unwrap_or(0) as u32;
+                    world.banner = c["state"]["banner"]
+                        .as_str()
+                        .unwrap_or("The bosses hold the city")
+                        .to_string();
+                }
+                None => {
+                    // Not read this round: keep what the room knows.
+                    return Some(PitMessage::WorldKeepCity(world));
+                }
+            }
+            Some(PitMessage::World(world))
+        }))
     }
 
     /// Read the player's Crawler cell (off the tick) for its level and XP.

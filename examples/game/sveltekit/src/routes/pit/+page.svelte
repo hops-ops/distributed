@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { watchZones, type WatchState } from '@hops-ops/distributed/game';
 	import { gameTicketSource, useGame } from '@hops-ops/distributed/sveltekit/game';
-	import { createMobpitClient, EVENTS } from '$lib/generated/mobpit/index.ts';
+	import { createMobpitClient, EVENTS, WEATHER } from '$lib/generated/mobpit/index.ts';
 	import Leaderboard from '$lib/pit/Leaderboard.svelte';
 	import MyStats from '$lib/pit/MyStats.svelte';
 	import Rooms from '$lib/pit/Rooms.svelte';
@@ -27,6 +27,14 @@
 		{ zone: () => data.zone, events: EVENTS }
 	);
 	const hello = game.latest('hello');
+	// The tiers above the own room (hood, borough, city); neighbours' are ignored.
+	let world = $state<import('$lib/generated/mobpit/index.ts').WorldTiers | undefined>();
+	game.on('world', (w, zoneId) => {
+		if (zoneId === game.zone) world = w;
+	});
+	game.on('bossDown', (b, zoneId) => {
+		if (zoneId === game.zone) toast(`${b.by} felled the boss — the hood is now tier ${b.hoodTier}`);
+	});
 	const saved = game.events('saved', { limit: 20 });
 	// Your kills not settled yet. Entity ids are per room, so only kills in
 	// your own room can be yours (the rooms next door are watched too).
@@ -79,7 +87,7 @@
 	$effect(() => {
 		const client = game.client;
 		if (client === undefined || canvas === undefined) return;
-		return startPitLoop(canvas, { client, hello: () => hello.current, autoHunt: () => autoHunt, ghost: () => ghost });
+		return startPitLoop(canvas, { client, hello: () => hello.current, autoHunt: () => autoHunt, ghost: () => ghost, world: () => world });
 	});
 	$effect(() => game.client?.setPredictionEnabled(predict));
 
@@ -151,6 +159,16 @@
 			{#if game.error}<div class="error" data-testid="error">{game.error}</div>{/if}
 			<label><input type="checkbox" bind:checked={autoHunt} data-testid="autohunt" /> auto-hunt</label>
 			<small>WASD move · Space attack · E dash · walk through a doorway (the gaps in the walls) to the next room</small>
+		</section>
+		<section data-testid="world">
+			<h2>World</h2>
+			{#if world}
+				<div>hood <b>{world.hoodX},{world.hoodY}</b> · tier <b data-testid="hood-tier">{world.hoodTier}</b> · boss <b data-testid="boss">{world.bossDown ? `down (${world.lastBy})` : 'standing'}</b></div>
+				<div>borough <b>{world.boroughX},{world.boroughY}</b> · <b data-testid="weather">{WEATHER[world.weather]}</b> · {world.boroughBossesDown}/9 bosses down</div>
+				<div data-testid="banner">{world.banner}</div>
+			{:else}
+				<div>…</div>
+			{/if}
 		</section>
 		<section data-testid="network">
 			<h2>Network</h2>

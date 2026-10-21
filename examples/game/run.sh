@@ -10,8 +10,6 @@
 #                           3) in production mode on one RustFS bucket
 #                           (docker compose), entered round-robin, so rooms
 #                           land on different nodes (debug overlay shows which)
-#   ./run.sh ripple         Boss Ripple with TWO hosts (A on GAME_DEMOS_PORT, B on
-#                           the next port), one process each
 #   ./run.sh gen            regenerate client/src/generated/<surface>/ from the
 #                           Rust surfaces (`distributed game-manifest` +
 #                           `distributed game-client`) and compile each
@@ -41,16 +39,15 @@
 # MOBPIT_SERVICE_PORT, default GAME_DEMOS_PORT + 2).
 #
 # celld: Mob Pit's rooms and the demos' durable cells (examples/game/cells:
-# Mob Pit's rooms, Crawler, presence and zone-activity cells, The Freeze's
-# gem and content cells, every multi-host demo's zone leases and
-# hibernation snapshots) run on celld, never natively; state persists in
+# Mob Pit's rooms, Crawler, presence, zone-activity and hood / borough /
+# city tier cells, The Freeze's gem and content cells) run on celld, never natively; state persists in
 # .data/<demo>/celld (Mob Pit: MOBPIT_DATA_DIR/celld, the fleet's bucket in
 # a RustFS volume of its compose project). Fleet ports: nodes' public
 # listeners GAME_DEMOS_PORT + 10.., operators + 20.., RustFS + 30
 # (MOBPIT_FLEET_S3_PORT); `docker compose down -v` runs on exit. CELLD_BIN names the binary (default: `celld` on
 # PATH; the version pinned in .celld-version, checked by
 # scripts/celld.sh), CELLD_PORT its port (default
-# GAME_DEMOS_PORT + 3; cluster demos GAME_DEMOS_PORT + 4),
+# GAME_DEMOS_PORT + 3),
 # CELLD_ESBUILD its bundler (default: the client's esbuild). The worker is
 # built with worker-build (`cargo install worker-build --locked`).
 set -euo pipefail
@@ -63,16 +60,13 @@ SVELTEKIT="$HERE/sveltekit"
 BIN="$SERVER/target/debug/game-demos"
 SERVICE_BIN="$SERVER/target/debug/mobpit-service"
 CELLS="$HERE/cells"
-DEMOS=(mobpit leaderboard gallery freeze ripple)
-# Single-process demos whose durable state lives in celld cells (the
-# multi-host ones always run on celld too: zone leases and hibernation).
+DEMOS=(mobpit leaderboard gallery freeze)
+# Demos whose durable state lives in celld cells.
 CELLD_DEMOS=(mobpit leaderboard freeze)
 export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
-# Multi-host demos: `game-demos <demo> --host-id A|B --peer …`.
-CLUSTER_DEMOS=(ripple)
 # Game surfaces with a generated client (`game_demos::<surface>::game_surface`);
 # the leaderboard page uses Mob Pit's.
-SURFACES=(mobpit gallery freeze ripple)
+SURFACES=(mobpit gallery freeze)
 CLI="$REPO/target/debug/distributed"
 
 log() { printf '\033[1;36m[demos]\033[0m %s\n' "$*"; }
@@ -456,44 +450,6 @@ wait_listening() {
 	done
 }
 
-run_cluster() {
-	local demo="$1"
-	local port_a="${GAME_DEMOS_PORT:-2567}"
-	local port_b=$((port_a + 1))
-	local client_port="${GAME_DEMOS_CLIENT_PORT:-5173}"
-	ensure_sdk
-	ensure_client
-	ensure_server
-	ensure_wasm
-
-	# Zone leases and hibernation snapshots live in celld (shared by both
-	# hosts); its state persists in .data/<demo>/celld.
-	start_celld "$HERE/.data/$demo/celld" "${CELLD_PORT:-$((port_a + 4))}" "$port_a"
-	local dir secret
-	dir="$(mktemp -d "${TMPDIR:-/tmp}/game-demos-$demo.XXXXXX")"
-	# Both hosts must share the ticket secret (and derive the admin secret).
-	secret="${DISTRIBUTED_GAME_SECRET:-$(dev_secret "$HERE/.data/$demo")}"
-	# The relay lands on host A; both hosts share the projection bus and keep
-	# their zone status read models in .data/<demo>.
-	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_a" --host-id A \
-		--peer "B=127.0.0.1:$port_b" --data-dir "$HERE/.data/$demo" >"$dir/A.log" 2>&1 &
-	local pid_a=$!
-	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_b" --host-id B \
-		--peer "A=127.0.0.1:$port_a" --data-dir "$HERE/.data/$demo" >"$dir/B.log" 2>&1 &
-	local pid_b=$!
-	trap 'kill "$pid_a" "$pid_b" 2>/dev/null || true; wait "$pid_a" "$pid_b" 2>/dev/null || true; kill_tree "$CELLD_PID"; rm -rf "$dir"' EXIT INT TERM
-	wait_listening "$dir/A.log" "$pid_a" "game-demos $demo host A"
-	wait_listening "$dir/B.log" "$pid_b" "game-demos $demo host B"
-	sed -n '2p' "$dir/A.log"
-	sed -n '2p' "$dir/B.log"
-	echo
-	log "open  http://localhost:$client_port/$demo/   (hosts A :$port_a, B :$port_b, dev routes ON — local only)"
-	log "zone leases and hibernation snapshots in celld ($CELLD_URL); host logs in $dir (removed on exit)"
-	echo
-	cd "$CLIENT"
-	GAME_DEMOS_SERVER="http://127.0.0.1:$port_a" GAME_DEMOS_CLIENT_PORT="$client_port" npx vite
-}
-
 # api_keys: an ES256 key pair for the SvelteKit server's read-model Bearer
 # tokens — sets API_SIGNING_JWK (private, for the UI) and API_JWKS (public,
 # for mobpit-service). Fresh per run; nothing is written to disk.
@@ -579,7 +535,7 @@ run_sveltekit() {
 smoke() {
 	ensure_sdk
 	ensure_client
-	# The celld-backed tests (Mob Pit, The Freeze, ripple) start their
+	# The celld-backed tests (Mob Pit, The Freeze) start their
 	# own `celld dev` (CELLD_BIN) on the cells worker.
 	ensure_celld
 	ensure_cells
@@ -591,7 +547,7 @@ smoke() {
 	log "generated clients are current; predicted steps and pure functions compiled to WASM"
 	gen --check
 	log "server: fmt, clippy, tests (bots smoke)"
-	cargo fmt --manifest-path "$SERVER/Cargo.toml" --check -p game_demos -p game_sim -p mobpit_crawler -p mobpit_service
+	cargo fmt --manifest-path "$SERVER/Cargo.toml" --check -p game_demos -p game_sim -p mobpit_crawler -p mobpit_service -p mobpit_rooms -p mobpit_tiers
 	cargo fmt --manifest-path "$CELLS/Cargo.toml" --check
 	cargo clippy --quiet --manifest-path "$SERVER/Cargo.toml" --workspace --all-targets -- -D warnings
 	cargo clippy --quiet --manifest-path "$CELLS/Cargo.toml" --target wasm32-unknown-unknown -- -D warnings
@@ -619,9 +575,7 @@ case "${1:-}" in
 	list) printf '%s\n' "${DEMOS[@]}" sveltekit ;;
 	"" | -h | --help | help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
 	*)
-		if [[ " ${CLUSTER_DEMOS[*]} " == *" $1 "* ]]; then
-			run_cluster "$1"
-		elif [[ "$1" == mobpit || "$1" == leaderboard ]]; then
+		if [[ "$1" == mobpit || "$1" == leaderboard ]]; then
 			run_mobpit "$1" "${2:-}" "${3:-3}"
 		elif [[ " ${DEMOS[*]} " == *" $1 "* ]]; then
 			run_demo "$1"

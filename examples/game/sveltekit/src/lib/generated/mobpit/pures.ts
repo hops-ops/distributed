@@ -29,6 +29,10 @@ const PIT_ROOM_LAYOUT_TYPE: WireType = {
 		['biome', { type: 'u8' }],
 		['danger', { type: 'u8' }],
 		['mobs', { type: 'list', item: ROOM_MOB_TYPE }],
+		['boss', { type: 'bool' }],
+		['hoodX', { type: 'i32' }],
+		['hoodY', { type: 'i32' }],
+		['bossDistance', { type: 'u8' }],
 	]
 };
 

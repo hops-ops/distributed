@@ -54,6 +54,8 @@ pub fn xp_for_tier(tier: u8) -> Option<u32> {
         1 => Some(10),
         2 => Some(25),
         3 => Some(60),
+        // A hood's boss.
+        4 => Some(200),
         _ => None,
     }
 }
@@ -208,7 +210,7 @@ pub type MobKilledArgs = (String, String, String, u8, u32);
 pub struct RecordKillInput {
     /// Mob instance (`{zone}/m{id}`).
     pub mob: String,
-    /// Mob tier (1..=3); XP comes from [`xp_for_tier`].
+    /// Mob tier (1..=3, 4 a boss); XP comes from [`xp_for_tier`].
     pub tier: u8,
     /// Display name at the time of the kill (server-sanitized).
     pub name: String,

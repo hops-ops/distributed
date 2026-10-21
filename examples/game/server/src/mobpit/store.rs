@@ -158,6 +158,12 @@ impl CrawlerCells {
         Ok(body)
     }
 
+    /// A tier cell's state (`kind` = hood / borough / city; `null` before
+    /// its first event).
+    pub async fn tier(&self, kind: &str, shard: &str) -> Result<Value, String> {
+        Ok(self.get(kind, shard).await?["state"].take())
+    }
+
     /// The durable presence entry of `principal` (`null` when none).
     pub async fn presence(&self, principal: &str) -> Result<Value, String> {
         Ok(self.get(PRESENCE_KIND, principal).await?["current"].take())

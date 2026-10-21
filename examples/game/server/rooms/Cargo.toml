@@ -21,8 +21,10 @@ celld = ["distributed_game/celld-zone"]
 distributed_game = { path = "../../../../distributed_game" }
 game_sim = { path = "../sim" }
 mobpit_crawler = { path = "../crawler" }
+mobpit_tiers = { path = "../tiers" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
 distributed_game = { path = "../../../../distributed_game", features = ["cell"] }
+serde_json = "1"

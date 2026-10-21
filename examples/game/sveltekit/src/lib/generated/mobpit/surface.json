@@ -33,6 +33,11 @@
             "radius": 0.800000011920929,
             "tele": 2.5999999046325684,
             "tier": 3
+          },
+          {
+            "radius": 1.2000000476837158,
+            "tele": 3.200000047683716,
+            "tier": 4
           }
         ]
       }
@@ -107,6 +112,21 @@
         "player_radius": 0.5,
         "room_size": 40.0
       }
+    },
+    {
+      "name": "weather",
+      "type": {
+        "item": {
+          "type": "short_str"
+        },
+        "type": "list"
+      },
+      "value": [
+        "storm",
+        "rain",
+        "clearing",
+        "clear"
+      ]
     }
   ],
   "events": [
@@ -332,6 +352,38 @@
         "fields": [
           {
             "name": "respawn_ms",
+            "type": {
+              "type": "u32"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 7,
+      "name": "world",
+      "payload": {
+        "kind": "value",
+        "type": {
+          "name": "WorldTiers",
+          "type": "record"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "name": "boss_down",
+      "payload": {
+        "fields": [
+          {
+            "name": "by",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "hood_tier",
             "type": {
               "type": "u32"
             }
@@ -709,6 +761,28 @@
         ],
         "kind": "fields"
       }
+    },
+    {
+      "id": 2,
+      "name": "world",
+      "payload": {
+        "kind": "value",
+        "type": {
+          "name": "WorldTiers",
+          "type": "record"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "name": "world_keep_city",
+      "payload": {
+        "kind": "value",
+        "type": {
+          "name": "WorldTiers",
+          "type": "record"
+        }
+      }
     }
   ],
   "name": "mobpit",
@@ -868,6 +942,30 @@
               "type": "record"
             },
             "type": "list"
+          }
+        },
+        {
+          "name": "boss",
+          "type": {
+            "type": "bool"
+          }
+        },
+        {
+          "name": "hood_x",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "hood_y",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "boss_distance",
+          "type": {
+            "type": "u8"
           }
         }
       ],
@@ -1056,6 +1154,86 @@
         }
       ],
       "name": "RoomMob"
+    },
+    {
+      "fields": [
+        {
+          "name": "hood_x",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "hood_y",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "hood_tier",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "boss_down",
+          "type": {
+            "type": "bool"
+          }
+        },
+        {
+          "name": "last_by",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "borough_x",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "borough_y",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "borough_bosses_down",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "weather",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "hoods_down",
+          "type": {
+            "item": {
+              "type": "short_str"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "city_bosses_down",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "banner",
+          "type": {
+            "type": "short_str"
+          }
+        }
+      ],
+      "name": "WorldTiers"
     }
   ],
   "schemaVersion": 3

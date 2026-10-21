@@ -12,11 +12,9 @@
 //!
 //! See `examples/game/README.md`.
 
-pub mod cluster;
 pub mod common;
 pub mod devcelld;
 pub mod freeze;
 pub mod gallery;
 pub mod mobpit;
 pub mod predict_trace;
-pub mod ripple;

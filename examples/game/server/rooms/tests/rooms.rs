@@ -324,3 +324,123 @@ fn positions_survive_hibernation_and_a_crash_snapshot() {
     old.restore(br#"{"kills":3,"mobs":[]}"#, "");
     assert_eq!(old.zone().stats().kills, 3);
 }
+
+/// Every event of `out` (decoded).
+fn events(out: &[Outbound]) -> Vec<PitEvent> {
+    messages(out)
+        .into_iter()
+        .filter_map(|m| match m {
+            ServerMessage::Event {
+                type_id, payload, ..
+            } => PitEvent::decode_event(type_id, &payload).ok().flatten(),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_boss_falls_to_a_party_its_hood_hears_and_it_stays_down() {
+    use distributed_game::ZoneInbound;
+    use game_sim::mobpit::{boss_room, room_zone, BOSS_TIER};
+    use mobpit_rooms::{PitMessage, WorldTiers};
+
+    let clock = ManualClock::new();
+    let zone = room_zone(boss_room(DEFAULT_SEED, (0, 0)));
+    let (facts, _script) = FactQueue::scripted(256);
+    let mut room = ZoneHost::<MobPit>::new(
+        &zone,
+        HostConfig::default(),
+        Arc::new(clock.clone()),
+        RoomConfig::for_zone(&zone, DEFAULT_SEED).expect("room"),
+    )
+    .with_facts(facts.with_journal());
+    let party: Vec<_> = ["ana", "bob", "cy", "di"]
+        .iter()
+        .map(|who| join(&mut room, who))
+        .collect();
+    let boss = |room: &ZoneHost<MobPit>| *room.zone().mob_positions().last().expect("mobs");
+    let mut emitted = Vec::new();
+    let mut seen = Vec::new();
+    for seq in 1..3000u32 {
+        let (_, bx, by, alive) = boss(&room);
+        if !alive {
+            break;
+        }
+        for (client, player) in &party {
+            let Some(me) = room.zone().player_position(*player) else {
+                continue;
+            };
+            let (dx, dy) = (bx - me.0, by - me.1);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            let near = d < 2.6;
+            let k = if near { 40.0 } else { 127.0 } / d;
+            let input = PitInput {
+                mx: (dx * k).round().clamp(-127.0, 127.0) as i8,
+                my: (dy * k).round().clamp(-127.0, 127.0) as i8,
+                buttons: if near { PitInput::ATTACK } else { 0 },
+            };
+            room.push_input(
+                *client,
+                seq,
+                seq,
+                &distributed_game::GameInput::to_payload(&input),
+            );
+        }
+        let out = tick(&mut room, &clock);
+        seen.extend(events(&out));
+        emitted.extend(room.take_emitted_facts());
+    }
+    assert!(!boss(&room).3, "the party felled the boss");
+    for _ in 0..3 {
+        seen.extend(events(&tick(&mut room, &clock)));
+        emitted.extend(room.take_emitted_facts());
+    }
+    let reports: Vec<_> = emitted
+        .iter()
+        .filter(|f| f.command() == mobpit_tiers::BOSS_DEFEATED)
+        .collect();
+    assert_eq!(reports.len(), 1, "one report of the fall");
+    assert_eq!(reports[0].input()["hood"], "0.0");
+    assert_eq!(reports[0].input()["room"], zone.as_str());
+    let kills: Vec<_> = emitted
+        .iter()
+        .filter(|f| f.command() == mobpit_crawler::RECORD_KILL && f.input()["tier"] == BOSS_TIER)
+        .collect();
+    assert_eq!(
+        kills.len(),
+        1,
+        "the slayer is credited (XP decided by the cell)"
+    );
+    assert!(seen
+        .iter()
+        .any(|e| matches!(e, PitEvent::BossDown { hood_tier: 1, .. })));
+    // The hood has not heard yet (tier 0): the room keeps what it knows.
+    room.deliver(ZoneInbound::Message(PitMessage::World(
+        WorldTiers::default(),
+    )));
+    let out = tick(&mut room, &clock);
+    assert!(!events(&out)
+        .iter()
+        .any(|e| matches!(e, PitEvent::World(w) if w.hood_tier == 0 || !w.boss_down)));
+    // Long past its local respawn: still down while the hood says so.
+    for _ in 0..(30 * 95) {
+        tick(&mut room, &clock);
+    }
+    let down = WorldTiers {
+        hood_tier: 1,
+        boss_down: true,
+        ..WorldTiers::default()
+    };
+    room.deliver(ZoneInbound::Message(PitMessage::World(down.clone())));
+    tick(&mut room, &clock);
+    tick(&mut room, &clock);
+    assert!(!boss(&room).3, "down while its hood says so");
+    // The hood brings it back.
+    room.deliver(ZoneInbound::Message(PitMessage::World(WorldTiers {
+        boss_down: false,
+        ..down
+    })));
+    tick(&mut room, &clock);
+    tick(&mut room, &clock);
+    assert!(boss(&room).3, "back when its hood says so");
+}

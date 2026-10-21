@@ -24,10 +24,11 @@ import {
 	pillarFields,
 	playerFields,
 	type HelloEvent,
-	type PitInput
+	type PitInput,
+	type WorldTiers
 } from '$lib/generated/mobpit/index.ts';
 
-const TIER_COLOR: Record<number, string> = { 1: '#9ad16b', 2: '#b48cf2', 3: '#ff6b6b' };
+const TIER_COLOR: Record<number, string> = { 1: '#9ad16b', 2: '#b48cf2', 3: '#ff6b6b', 4: '#ff2d55' };
 const TIER_RADIUS = Object.fromEntries(PIT_RULES.tiers.map((t) => [t.tier, t]));
 const PLAYER_RADIUS = 0.45;
 const DOOR_HALF = PIT_WORLD.doorHalf;
@@ -86,7 +87,12 @@ export type PitLoopOptions = Readonly<{
 	autoHunt: () => boolean;
 	/** Draw the server's authoritative copy of you (the ghost). */
 	ghost?: () => boolean;
+	/** The tiers above the room (borough weather darkens the view). */
+	world?: () => WorldTiers | undefined;
 }>;
+
+/** Darkness of the view (0..1): the borough's weather, thicker near a boss room. */
+const WEATHER_DARK = [0.55, 0.4, 0.22, 0.05];
 
 /** Start drawing on `canvas`; returns the stop function. */
 export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions): () => void {
@@ -301,6 +307,15 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 			}
 		}
 		canvas.dataset.nextDoorMobs = String(nextDoor);
+		// Weather and darkness: the borough's sky, thicker toward bosses.
+		if (here !== undefined && pures.loaded()) {
+			const world = options.world?.();
+			const near = Math.max(0, 1 - pures.pitRoom({ seed, x: here[0], y: here[1] }).bossDistance / 6);
+			const dark = Math.min(0.85, (WEATHER_DARK[world?.weather ?? 0] ?? 0.55) * (1 + 0.6 * near));
+			ctx.fillStyle = `rgba(8,10,20,${dark.toFixed(3)})`;
+			ctx.fillRect(0, 0, width, height);
+			canvas.dataset.dark = dark.toFixed(3);
+		}
 		frame = requestAnimationFrame(draw);
 	});
 

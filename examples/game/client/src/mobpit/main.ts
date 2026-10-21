@@ -26,7 +26,8 @@
  */
 import type { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture';
-import { Color3 } from '@babylonjs/core/Maths/math.color';
+import { Color3, Color4 } from '@babylonjs/core/Maths/math.color';
+import { Scene } from '@babylonjs/core/scene';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector';
 import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
@@ -41,6 +42,7 @@ import {
 	isPillar,
 	isPit,
 	mobFields,
+	WEATHER,
 	pitFields,
 	playerFields,
 	type PitFields,
@@ -61,7 +63,8 @@ import {
 	TIERS,
 	type BoardSnapshot,
 	type RoomInfo,
-	type RoomStatus
+	type RoomStatus,
+	type TiersAround
 } from './client.ts';
 
 /** The rooms' floor, generated from the simulation's constants (`game_sim::mobpit::pit_world`). */
@@ -95,6 +98,41 @@ const { client } = pit;
 const canvas = document.getElementById('stage') as HTMLCanvasElement;
 const stage = createStage(canvas, { half: HALF, background: '#120f14' });
 const { scene } = stage;
+
+// ---- weather and darkness (Boss Ripple's sky, now the borough's) ----
+// The borough's weather lifts as its bosses fall (storm → rain → clearing →
+// clear); within it, the fog thickens and the light dims the closer the room
+// is to a boss room (`boss_distance`, the shared Rust room generator).
+scene.fogMode = Scene.FOGMODE_EXP2;
+const SKY: Record<string, { clear: string; fog: number; light: number }> = {
+	storm: { clear: '#141821', fog: 0.035, light: 0.35 },
+	rain: { clear: '#2a3442', fog: 0.022, light: 0.55 },
+	clearing: { clear: '#56708c', fog: 0.012, light: 0.8 },
+	clear: { clear: '#8fc3f0', fog: 0.004, light: 1.1 }
+};
+const lights = scene.lights.map((l) => ({ light: l, base: l.intensity }));
+/** Fog and darkness of the current room: its borough's weather × closeness to a boss. */
+function roomSky(): { clear: string; fog: number; light: number; near: number } {
+	const sky = SKY[WEATHER[pit.world()?.weather ?? 0] ?? 'storm'] ?? SKY.storm!;
+	const here = parseRoom(pit.room() ?? DEFAULT_ZONE);
+	const seed = pit.hello()?.seed ?? PIT_WORLD.defaultSeed;
+	const distance = here !== undefined && pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: here[0], y: here[1] }).bossDistance : 6;
+	// 1 in a boss room, 0 six rooms away.
+	const near = Math.max(0, 1 - distance / 6);
+	return { clear: sky.clear, fog: sky.fog * (1 + 2 * near), light: sky.light * (1 - 0.45 * near), near };
+}
+function applySky(dtMs: number): void {
+	const target = roomSky();
+	const want = Color4.FromHexString(`${target.clear}ff`).scale(1 - 0.5 * target.near);
+	const k = 1 - Math.exp(-dtMs / 600);
+	scene.clearColor = Color4.Lerp(scene.clearColor, new Color4(want.r, want.g, want.b, 1), k);
+	scene.fogColor = new Color3(scene.clearColor.r, scene.clearColor.g, scene.clearColor.b);
+	scene.fogDensity += (target.fog - scene.fogDensity) * k;
+	const storm = (pit.world()?.weather ?? 0) === 0;
+	const flash = storm && Math.random() < 0.004 ? 2.5 : 1;
+	for (const { light, base } of lights) light.intensity += (base * target.light * flash - light.intensity) * Math.min(1, k * (flash > 1 ? 20 : 1));
+	canvas.dataset.fog = scene.fogDensity.toFixed(4);
+}
 
 const hud = new Hud({
 	title: 'Mob Pit',
@@ -191,6 +229,16 @@ async function pollRoomInfo(): Promise<void> {
 }
 void pollRoomInfo();
 
+let tiers: TiersAround | undefined;
+async function pollTiers(): Promise<void> {
+	for (;;) {
+		const here = pit.room();
+		if (here !== undefined) tiers = await pitApi.tiers(here).catch(() => tiers);
+		await new Promise((r) => setTimeout(r, 2000));
+	}
+}
+void pollTiers();
+
 function drawRooms(): void {
 	const ctx = roomsMap.getContext('2d');
 	const here = parseRoom(pit.room() ?? DEFAULT_ZONE);
@@ -225,7 +273,37 @@ function drawRooms(): void {
 			ctx.font = '10px monospace';
 			if (row !== undefined && row.players > 0) ctx.fillText(`${row.players}p`, i * cell + 5, j * cell + 13);
 			if (debug && row !== undefined && row.node !== '') ctx.fillText(row.node.replace(/^node-/, ''), i * cell + 5, j * cell + cell - 6);
+			// Boss rooms: a red mark (grey while the boss is down) and the hood's tier.
+			const hood = tiers?.hoods.find((h) => h.bossRoom[0] === x && h.bossRoom[1] === y);
+			if (hood !== undefined) {
+				ctx.fillStyle = hood.bossDown ? '#777' : '#ff2d55';
+				ctx.beginPath();
+				ctx.arc(i * cell + cell - 9, j * cell + 9, 5, 0, Math.PI * 2);
+				ctx.fill();
+				ctx.fillStyle = '#fff';
+				ctx.fillText(`T${hood.tier}`, i * cell + cell - 22, j * cell + cell - 6);
+			}
 		}
+	}
+	// Hood (3 × 3 rooms) and borough (9 × 9) borders.
+	const line = (fixed: number, vertical: boolean, color: string, width: number) => {
+		ctx.strokeStyle = color;
+		ctx.lineWidth = width;
+		ctx.beginPath();
+		if (vertical) {
+			ctx.moveTo(fixed, 0);
+			ctx.lineTo(fixed, roomsMap.height);
+		} else {
+			ctx.moveTo(0, fixed);
+			ctx.lineTo(roomsMap.width, fixed);
+		}
+		ctx.stroke();
+	};
+	for (let i = 0; i <= span; i++) {
+		const x = here[0] + i - 3;
+		if (((x % 3) + 3) % 3 === 0) line(i * cell, true, ((x % 9) + 9) % 9 === 0 ? '#ffd166' : '#8a6dd1', ((x % 9) + 9) % 9 === 0 ? 3 : 1.5);
+		const y = here[1] - (i - 4) ;
+		if (((y % 3) + 3) % 3 === 0) line(i * cell, false, ((y % 9) + 9) % 9 === 0 ? '#ffd166' : '#8a6dd1', ((y % 9) + 9) % 9 === 0 ? 3 : 1.5);
 	}
 }
 
@@ -478,7 +556,9 @@ function createMob(entity: RenderedEntity): MobVisual {
 	const tier = mobFields(entity).tier || 1;
 	const t = TIERS[tier] ?? TIERS[1]!;
 	const body =
-		tier === 3
+		tier === 4
+			? MeshBuilder.CreateCylinder(entity.key, { diameterTop: t.radius * 0.8, diameterBottom: t.radius * 2, height: 2.8, tessellation: 8 }, scene)
+			: tier === 3
 			? MeshBuilder.CreateCylinder(entity.key, { diameterTop: 0, diameterBottom: t.radius * 2, height: 2, tessellation: 6 }, scene)
 			: MeshBuilder.CreateBox(entity.key, { width: t.radius * 2, depth: t.radius * 2, height: tier === 2 ? 1.5 : 0.9 }, scene);
 	body.material = tierMats.get(tier) ?? mats.other;
@@ -548,6 +628,15 @@ pit.on('saved', (saved, zoneId) => {
 	} else {
 		popup(saved.key, zoneId, saved.x, saved.y, `save failed: ${saved.error ?? '?'}`, 'failed', 4000);
 	}
+});
+pit.on('bossDown', (b, zoneId) => {
+	if (zoneId === pit.room()) toast(`${b.by} felled the boss! The hood is now tier ${b.hoodTier} — its rooms get tougher`);
+});
+let lastWeather: number | undefined;
+pit.on('world', (w, zoneId) => {
+	if (zoneId !== pit.room()) return;
+	if (lastWeather !== undefined && w.weather > lastWeather) toast(`The sky over the borough lifts: ${WEATHER[w.weather]}`);
+	lastWeather = w.weather;
 });
 pit.on('died', (d) => {
 	deathBanner.textContent = 'You died — respawning…';
@@ -626,6 +715,7 @@ function sendCommandFrame(): void {
 
 // ---- frame ----
 stage.onFrame((now, dtMs) => {
+	applySky(dtMs);
 	commandFrames.update(now, sendCommandFrame);
 	const here = pit.room();
 	const hereRoom = here === undefined ? undefined : parseRoom(here);
@@ -653,7 +743,7 @@ stage.onFrame((now, dtMs) => {
 		if (visual.kind === 'mob') {
 			const mob = mobFields(entity);
 			const { x, y } = mob;
-			const height = visual.tier === 3 ? 1 : visual.tier === 2 ? 0.75 : 0.45;
+			const height = visual.tier === 4 ? 1.4 : visual.tier === 3 ? 1 : visual.tier === 2 ? 0.75 : 0.45;
 			visual.body.position.copyFrom(at(x, y, height));
 			visual.body.rotation.y = -mob.face;
 			const hp = mob.hp / 100;
@@ -749,6 +839,10 @@ stage.onFrame((now, dtMs) => {
 	hud.row('Ghost gap', ghostGap === undefined ? '—' : `${ghostGap.toFixed(2)} m`);
 	const around = [...pit.neighbours().values()];
 	hud.row('Next door', `${around.filter((s) => s === 'watching').length} rooms watched · ${around.filter((s) => s === 'asleep').length} asleep (not woken)`);
+	const w = pit.world();
+	hud.row('Hood', w === undefined ? '—' : `${w.hoodX},${w.hoodY} · tier ${w.hoodTier} · boss ${w.bossDown ? `down (${w.lastBy})` : 'standing'}`);
+	hud.row('Borough', w === undefined ? '—' : `${w.boroughX},${w.boroughY} · ${WEATHER[w.weather]} · ${w.boroughBossesDown}/9 bosses down`);
+	hud.row('City', w === undefined || w.banner === '' ? '—' : w.banner);
 	hud.row('Interest', hello === undefined ? '—' : `${hello.viewRadius} m ring · ${rendered.filter((e) => isMob(e) && !e.stale).length} mobs replicated`);
 	const profile = pit.profile();
 	if (profile !== undefined) {

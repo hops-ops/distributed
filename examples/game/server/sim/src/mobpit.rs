@@ -134,8 +134,19 @@ pub const MAX_ROOM: i32 = 1_000_000;
 pub const DOOR_HALF: f32 = 2.5;
 /// Default world seed of the rooms.
 pub const DEFAULT_SEED: u32 = 0x0B1D_5EED;
-/// Mobs a room holds at most.
-pub const MAX_MOBS: usize = 12;
+/// Mobs a room holds at most (12 slots, plus a boss room's boss).
+pub const MAX_MOBS: usize = 13;
+/// Mob tier of a hood's boss.
+pub const BOSS_TIER: u8 = 4;
+/// Where a boss stands (room-local), between the central pillar and the
+/// south door.
+pub const BOSS_HOME: (f32, f32) = (0.0, -7.0);
+/// Rooms per hood side: a hood is 3 × 3 rooms.
+pub const HOOD_ROOMS: i32 = 3;
+/// Hoods per borough side: a borough is 3 × 3 hoods (9 × 9 rooms).
+pub const BOROUGH_HOODS: i32 = 3;
+/// Hash salt of the boss rooms.
+const SALT_BOSS: u32 = 901;
 
 /// Unit directions of the 12 mob slots (angles `(k + 0.5) / 12 · τ`), as
 /// literals so native and WebAssembly agree bit for bit (no `sin`/`cos`).
@@ -198,8 +209,98 @@ pub struct PitRoomLayout {
     pub biome: u8,
     /// Danger 1..=3: grows with the distance from the entrance room.
     pub danger: u8,
-    /// Mob slots (ids 1..).
+    /// Mob slots (ids 1..); a boss room's last slot is its boss
+    /// ([`BOSS_TIER`]).
     pub mobs: Vec<RoomMob>,
+    /// This is its hood's boss room.
+    pub boss: bool,
+    /// Hood x (see [`hood_of`]).
+    pub hood_x: i32,
+    /// Hood y.
+    pub hood_y: i32,
+    /// Rooms to the nearest boss room (Chebyshev; 0 in a boss room, at most
+    /// [`BOSS_DISTANCE_MAX`]): fog and darkness thicken toward bosses.
+    pub boss_distance: u8,
+}
+
+/// The farthest [`PitRoomLayout::boss_distance`] reported.
+pub const BOSS_DISTANCE_MAX: u8 = 6;
+
+/// The hood of room `room` (3 × 3 rooms each, floor division).
+pub fn hood_of(room: (i32, i32)) -> (i32, i32) {
+    (room.0.div_euclid(HOOD_ROOMS), room.1.div_euclid(HOOD_ROOMS))
+}
+
+/// The borough of hood `hood` (3 × 3 hoods each).
+pub fn borough_of(hood: (i32, i32)) -> (i32, i32) {
+    (
+        hood.0.div_euclid(BOROUGH_HOODS),
+        hood.1.div_euclid(BOROUGH_HOODS),
+    )
+}
+
+/// The 9 hoods of borough `borough`.
+pub fn borough_hoods(borough: (i32, i32)) -> Vec<(i32, i32)> {
+    let mut hoods = Vec::with_capacity(9);
+    for dy in 0..BOROUGH_HOODS {
+        for dx in 0..BOROUGH_HOODS {
+            hoods.push((
+                borough.0 * BOROUGH_HOODS + dx,
+                borough.1 * BOROUGH_HOODS + dy,
+            ));
+        }
+    }
+    hoods
+}
+
+/// `x.y`: the cell shard of a hood or borough.
+pub fn pair_shard(at: (i32, i32)) -> String {
+    format!("{}.{}", at.0, at.1)
+}
+
+/// Parse `x.y` (canonical integers within [`MAX_ROOM`]).
+pub fn parse_pair(shard: &str) -> Option<(i32, i32)> {
+    let (x, y) = shard.split_once('.')?;
+    let parse = |s: &str| -> Option<i32> {
+        let v: i32 = s.parse().ok()?;
+        (v.to_string() == s && v.abs() <= MAX_ROOM).then_some(v)
+    };
+    Some((parse(x)?, parse(y)?))
+}
+
+/// The boss room of hood `hood`: one of its 9 rooms, seeded (never the
+/// entrance `pit.0.0`).
+pub fn boss_room(seed: u32, hood: (i32, i32)) -> (i32, i32) {
+    let h = grid::mix(seed, SALT_BOSS, hood.0, hood.1);
+    let pick = |k: i32| {
+        (
+            hood.0 * HOOD_ROOMS + k % HOOD_ROOMS,
+            hood.1 * HOOD_ROOMS + k / HOOD_ROOMS,
+        )
+    };
+    let room = pick((h % 9) as i32);
+    if room == (0, 0) {
+        pick(((h % 9) as i32 + 1) % 9)
+    } else {
+        room
+    }
+}
+
+/// Rooms from `room` to the nearest boss room (Chebyshev, capped at
+/// [`BOSS_DISTANCE_MAX`]).
+pub fn boss_distance(seed: u32, room: (i32, i32)) -> u8 {
+    let (hx, hy) = hood_of(room);
+    let mut best = u32::from(BOSS_DISTANCE_MAX);
+    for dy in -2..=2 {
+        for dx in -2..=2 {
+            let b = boss_room(seed, (hx + dx, hy + dy));
+            let d = (b.0 - room.0)
+                .unsigned_abs()
+                .max((b.1 - room.1).unsigned_abs());
+            best = best.min(d);
+        }
+    }
+    best as u8
 }
 
 /// The contents of room `(x, y)`: biome from the Endless Grid's noise,
@@ -231,10 +332,23 @@ pub fn pit_room(room: &PitRoomContext) -> PitRoomLayout {
             y: ring * dy,
         });
     }
+    let hood = hood_of(at);
+    let boss = boss_room(room.seed, hood) == at;
+    if boss {
+        mobs.push(RoomMob {
+            tier: BOSS_TIER,
+            x: BOSS_HOME.0,
+            y: BOSS_HOME.1,
+        });
+    }
     PitRoomLayout {
         biome,
         danger,
         mobs,
+        boss,
+        hood_x: hood.0,
+        hood_y: hood.1,
+        boss_distance: boss_distance(room.seed, at),
     }
 }
 
@@ -359,6 +473,40 @@ mod tests {
         assert!(rooms
             .iter()
             .all(|r| (r.biome as usize) < grid::BIOMES.len()));
+    }
+
+    #[test]
+    fn every_hood_has_one_boss_room() {
+        for hy in -4..4 {
+            for hx in -4..4 {
+                let rooms: Vec<(i32, i32)> = (0..9)
+                    .map(|k| (hx * 3 + k % 3, hy * 3 + k / 3))
+                    .filter(|&(x, y)| {
+                        pit_room(&PitRoomContext {
+                            seed: DEFAULT_SEED,
+                            x,
+                            y,
+                        })
+                        .boss
+                    })
+                    .collect();
+                assert_eq!(rooms, vec![boss_room(DEFAULT_SEED, (hx, hy))]);
+                assert_eq!(hood_of(rooms[0]), (hx, hy));
+                assert_ne!(rooms[0], (0, 0), "never the entrance");
+            }
+        }
+        let b = boss_room(DEFAULT_SEED, (0, 0));
+        let layout = pit_room(&PitRoomContext {
+            seed: DEFAULT_SEED,
+            x: b.0,
+            y: b.1,
+        });
+        assert_eq!(layout.boss_distance, 0);
+        assert_eq!(layout.mobs.last().map(|m| m.tier), Some(BOSS_TIER));
+        assert_eq!(hood_of((-1, -1)), (-1, -1));
+        assert_eq!(borough_of((-1, 5)), (-1, 1));
+        assert_eq!(parse_pair(&pair_shard((-3, 7))), Some((-3, 7)));
+        assert_eq!(borough_hoods((0, 0)).len(), 9);
     }
 
     #[test]
