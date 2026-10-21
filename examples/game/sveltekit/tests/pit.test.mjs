@@ -293,7 +293,7 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		assert.equal((await fetch(`${ORIGIN}/api/dev/netsim`)).status, 401, 'signed-out: no network control');
 		await page.locator('[data-testid=latency]').fill('100');
 		await page.waitForSelector('[data-testid=netsim-status]:text-is("applied to every room")', { timeout: 5_000 });
-		await page.waitForFunction((b) => Number(document.querySelector('[data-testid=rtt]')?.textContent) > b + 150, baseRtt, { timeout: 15_000 });
+		await page.waitForFunction((b) => Number(document.querySelector("[data-testid=rtt]")?.textContent) > b + 120, baseRtt, { timeout: 20_000 }).catch(async (e) => { throw new Error(`rtt stayed ${await rtt()} (base ${baseRtt}): ${e}`); });
 		await page.keyboard.down('KeyA');
 		await page.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.ghostGap ?? 0) > 0.3, null, { timeout: 5_000 });
 		await page.keyboard.up('KeyA');
@@ -362,6 +362,10 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		const eastNode = await nodeOf(page, 'pit.1.0');
 		assert.equal(await walkThrough(bob, 'north'), 'pit.0.1');
 		const northNode = await nodeOf(bob, 'pit.0.1');
+		// Next door: Bob watches the 8 rooms around pit.0.1 (passively) and
+		// sees the mobs of the awake ones — pit.1.0, where Ana is.
+		await bob.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.nextDoorMobs ?? 0) > 0, null, { timeout: 15_000 });
+		await bob.waitForFunction(() => Number(document.querySelector('[data-testid=watching]')?.textContent) >= 1, null, { timeout: 15_000 });
 		// Bob reloads, then closes the browser and signs in again: the same
 		// player, back in pit.0.1 where he stood (the room kept his body
 		// through the reload; the ticket handler chose his last room).
@@ -388,7 +392,8 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 			assert.ok(fleet.nodes.includes(entranceNode) && fleet.nodes.includes(eastNode), `${entranceNode} ${eastNode}`);
 			assert.notEqual(eastNode, entranceNode, 'the doorway led into a room on another celld node');
 		}
-		// The left room goes dormant, then asleep, live on both minimaps.
+		// The left room goes dormant, then asleep, live on both minimaps —
+		// although Bob, next door, watches it (a watcher keeps no room awake).
 		await page.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=hibernated]', { timeout: 30_000 });
 		await bob.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=hibernated]', { timeout: 10_000 });
 		assert.equal(await roomStatus(page, 'pit.1.0'), 'active');

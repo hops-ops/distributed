@@ -368,6 +368,9 @@ const MAX_CREDITS: u8 = 4;
 /// (the page draws it as the interest ring). From any spawn point every mob
 /// home is inside it; walk to a corner and the far side drops out.
 pub const VIEW_RADIUS: f32 = 24.0;
+/// What a watcher sees (from the room's centre: the whole room). On celld a
+/// watcher is passive: it never keeps the room awake.
+pub const WATCH_RADIUS: f32 = 30.0;
 const AGGRO: f32 = 7.0;
 const LEASH: f32 = 15.0;
 const WINDUP_TICKS: u16 = 24;
@@ -1246,8 +1249,9 @@ impl Zone for MobPit {
         }
     }
 
+    /// A watcher (a player next door, a board page): the whole room.
     fn on_observe(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {
-        ctx.set_view(observer, View::new(0.0, 0.0, VIEW_RADIUS));
+        ctx.set_view(observer, View::new(0.0, 0.0, WATCH_RADIUS));
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<PitInput> {

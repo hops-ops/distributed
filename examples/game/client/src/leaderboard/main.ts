@@ -162,4 +162,21 @@ declare global {
 }
 window.leaderboard = { client, api, pitApi, watcher };
 
-client.observe(zone).catch((error: unknown) => (status.textContent = `failed: ${String(error)}`));
+// A passive watcher: it never wakes the entrance; while it sleeps, retry.
+const watchEntrance = () => {
+	client.unobserve(zone);
+	client.observe(zone).then(
+		() => {
+			if (status.textContent?.startsWith('the entrance')) status.textContent = '';
+		},
+		() => {
+			status.textContent = 'the entrance is asleep (nobody playing) — watching for it…';
+			client.unobserve(zone);
+			setTimeout(watchEntrance, 3000);
+		}
+	);
+};
+client.on('zoneClosed', (closed) => {
+	if (closed === zone) setTimeout(watchEntrance, 3000);
+});
+watchEntrance();

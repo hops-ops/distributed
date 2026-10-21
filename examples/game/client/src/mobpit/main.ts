@@ -143,7 +143,7 @@ function div(className: string, parent: HTMLElement): HTMLDivElement {
 const roomsPanel = div('pit-rooms', document.body);
 roomsPanel.innerHTML = `<h2>Rooms <small data-k="here"></small></h2>
 	<canvas width="210" height="210"></canvas>
-	<div class="pit-legend"><span class="c-active">■ active</span> <span class="c-dormant">■ dormant</span> <span class="c-hibernated">■ asleep</span> <span class="c-cold">■ never ran</span></div>
+	<div class="pit-legend"><span class="c-active">■ active</span> <span class="c-dormant">■ dormant</span> <span class="c-hibernated">■ asleep</span> <span class="c-cold">■ never ran</span> <span class="c-watched">□ watched</span></div>
 	<div class="pit-debug" data-k="debug"></div>`;
 const roomsMap = roomsPanel.querySelector('canvas') as HTMLCanvasElement;
 const roomsField = (k: string) => roomsPanel.querySelector(`[data-k="${k}"]`) as HTMLElement;
@@ -215,6 +215,11 @@ function drawRooms(): void {
 				ctx.strokeStyle = '#ffffff';
 				ctx.lineWidth = 2;
 				ctx.strokeRect(i * cell + 1, j * cell + 1, cell - 2, cell - 2);
+			} else if (pit.neighbours().get(zone) === 'watching') {
+				// Watched next door (passive: it never keeps the room awake).
+				ctx.strokeStyle = '#4dd0e1';
+				ctx.lineWidth = 1;
+				ctx.strokeRect(i * cell + 2.5, j * cell + 2.5, cell - 5, cell - 5);
 			}
 			ctx.fillStyle = '#0e1116';
 			ctx.font = '10px monospace';
@@ -528,7 +533,8 @@ function popup(key: string, zoneId: string, x: number, y: number, text: string, 
 }
 
 pit.on('kill', (kill, zoneId) => {
-	const mine = kill.killer === pit.hello()?.entity;
+	// Entity ids are per room: a kill next door is never yours.
+	const mine = zoneId === pit.room() && kill.killer === pit.hello()?.entity;
 	const tier = TIERS[kill.tier]?.name ?? 'Mob';
 	if (mine) popup(kill.key, zoneId, kill.x, kill.y, `${tier} slain · saving…`, 'pending', 60_000);
 	else popup(kill.key, zoneId, kill.x, kill.y, `${kill.killerName} slew a ${tier}`, 'other', 2000);
@@ -741,6 +747,8 @@ stage.onFrame((now, dtMs) => {
 	hud.row('Ack seq', String(predictor?.lastAck ?? 0));
 	hud.row('Corrections', `${corrections} (last ${lastCorrection.toFixed(3)} m)`);
 	hud.row('Ghost gap', ghostGap === undefined ? '—' : `${ghostGap.toFixed(2)} m`);
+	const around = [...pit.neighbours().values()];
+	hud.row('Next door', `${around.filter((s) => s === 'watching').length} rooms watched · ${around.filter((s) => s === 'asleep').length} asleep (not woken)`);
 	hud.row('Interest', hello === undefined ? '—' : `${hello.viewRadius} m ring · ${rendered.filter((e) => isMob(e) && !e.stale).length} mobs replicated`);
 	const profile = pit.profile();
 	if (profile !== undefined) {

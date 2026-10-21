@@ -17,7 +17,6 @@ pub mod common;
 pub mod devcelld;
 pub mod freeze;
 pub mod gallery;
-pub mod grid;
 pub mod mobpit;
 pub mod predict_trace;
 pub mod ripple;

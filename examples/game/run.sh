@@ -10,7 +10,7 @@
 #                           3) in production mode on one RustFS bucket
 #                           (docker compose), entered round-robin, so rooms
 #                           land on different nodes (debug overlay shows which)
-#   ./run.sh grid|ripple    same with TWO hosts (A on GAME_DEMOS_PORT, B on
+#   ./run.sh ripple         Boss Ripple with TWO hosts (A on GAME_DEMOS_PORT, B on
 #                           the next port), one process each
 #   ./run.sh gen            regenerate client/src/generated/<surface>/ from the
 #                           Rust surfaces (`distributed game-manifest` +
@@ -63,16 +63,16 @@ SVELTEKIT="$HERE/sveltekit"
 BIN="$SERVER/target/debug/game-demos"
 SERVICE_BIN="$SERVER/target/debug/mobpit-service"
 CELLS="$HERE/cells"
-DEMOS=(mobpit leaderboard gallery freeze grid ripple)
+DEMOS=(mobpit leaderboard gallery freeze ripple)
 # Single-process demos whose durable state lives in celld cells (the
 # multi-host ones always run on celld too: zone leases and hibernation).
 CELLD_DEMOS=(mobpit leaderboard freeze)
 export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
 # Multi-host demos: `game-demos <demo> --host-id A|B --peer …`.
-CLUSTER_DEMOS=(grid ripple)
+CLUSTER_DEMOS=(ripple)
 # Game surfaces with a generated client (`game_demos::<surface>::game_surface`);
 # the leaderboard page uses Mob Pit's.
-SURFACES=(mobpit gallery freeze grid ripple)
+SURFACES=(mobpit gallery freeze ripple)
 CLI="$REPO/target/debug/distributed"
 
 log() { printf '\033[1;36m[demos]\033[0m %s\n' "$*"; }
@@ -579,7 +579,7 @@ run_sveltekit() {
 smoke() {
 	ensure_sdk
 	ensure_client
-	# The celld-backed tests (Mob Pit, The Freeze, grid, ripple) start their
+	# The celld-backed tests (Mob Pit, The Freeze, ripple) start their
 	# own `celld dev` (CELLD_BIN) on the cells worker.
 	ensure_celld
 	ensure_cells

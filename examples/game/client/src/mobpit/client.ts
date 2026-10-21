@@ -16,11 +16,17 @@
  * any room (the doorway arrival is the same world point, see
  * `game_sim::mobpit`).
  *
+ * Neighbours: the client also watches the 8 rooms around its own as an
+ * observer (`watchZones` over `neighbourRooms`), so their mobs are drawn where they are. On
+ * celld an observer is a passive watcher: it keeps no room awake and wakes
+ * none (a sleeping room answers `ASLEEP`; it is tried again every few
+ * seconds and shows nothing meanwhile).
+ *
  * Event flow of one kill: `kill` (broadcast, the tick the mob dies — the
  * fact is only *queued*) → `saved` (to the killer, when the durable cell
  * commit settled) → `profile`.
  */
-import type { EntityFields, GameSocketFactory, RenderedEntity } from '@hops-ops/distributed/game';
+import { watchZones, type EntityFields, type GameSocketFactory, type RenderedEntity, type WatchState } from '@hops-ops/distributed/game';
 
 import * as pit from '../generated/mobpit/index.ts';
 import type { DevApi } from '../shared/dev-api.ts';
@@ -66,6 +72,18 @@ export function pitHandoffFrame(fields: EntityFields, from: string, to: string):
 export function roomZone(x: number, y: number): string {
 	return `pit.${x}.${y}`;
 }
+
+/** The 8 rooms around `zone`. */
+export function neighbourRooms(zone: string): string[] {
+	const at = parseRoom(zone);
+	if (at === undefined) return [];
+	const out: string[] = [];
+	for (let dy = -1; dy <= 1; dy += 1) {
+		for (let dx = -1; dx <= 1; dx += 1) if (dx !== 0 || dy !== 0) out.push(roomZone(at[0] + dx, at[1] + dy));
+	}
+	return out;
+}
+
 
 /**
  * WebSocket URL of a room. `base` is the http(s) origin rooms are reached
@@ -167,6 +185,10 @@ export type MobPitClient = pit.MobpitClient &
 		pures: ReturnType<typeof pit.createMobpitPures>;
 		/** Resolves on the first hello, once the predicted step is loaded. */
 		ready: Promise<pit.HelloEvent>;
+		/** The neighbour rooms watched (`watchZones` over `neighbourRooms`), when enabled. */
+		neighbours(): ReadonlyMap<string, WatchState>;
+		/** Stop watching neighbours and close the client. */
+		close(): void;
 	}>;
 
 export type MobPitClientOptions = Readonly<{
@@ -174,6 +196,8 @@ export type MobPitClientOptions = Readonly<{
 	/** http(s) origin of the rooms (celld); default the page's origin. */
 	roomsBase?: string;
 	socket?: GameSocketFactory;
+	/** Watch the 8 neighbour rooms (default true). */
+	neighbours?: boolean;
 }>;
 
 export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
@@ -193,8 +217,9 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 	);
 	const profile = latest<pit.Profile>((h) => typed.on('profile', h));
 	const unsaved = new Map<string, pit.KillEvent>();
-	typed.on('kill', (kill) => {
-		if (kill.killer === hello.get()?.entity) unsaved.set(kill.key, kill);
+	typed.on('kill', (kill, zoneId) => {
+		// Entity ids are per room: only kills in your own room can be yours.
+		if (zoneId === typed.client.authority?.zoneId && kill.killer === hello.get()?.entity) unsaved.set(kill.key, kill);
 	});
 	typed.on('saved', (saved) => unsaved.delete(saved.key));
 	const pures = pit.createMobpitPures();
@@ -202,9 +227,11 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 	// bridge, the last predicted state in the room just left.
 	const me = () => {
 		const id = hello.get()?.entity;
-		const rendered = typed.client.render().filter((e) => pit.isPlayer(e));
+		// Never a watched neighbour's player (entity ids are per room).
+		const rendered = typed.client.render().filter((e) => pit.isPlayer(e) && typed.client.zone(e.zoneId)?.role !== 'observer');
 		return rendered.find((e) => e.predicted) ?? rendered.find((e) => e.id === id && e.zoneId === typed.client.authority?.zoneId) ?? rendered.find((e) => e.id === id);
 	};
+	const watcher = options.neighbours === false ? undefined : watchZones(typed.client, neighbourRooms);
 	return {
 		...typed,
 		hello: hello.get,
@@ -217,7 +244,12 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		},
 		unsaved,
 		pures,
-		ready: Promise.all([hello.ready, typed.prediction?.ready, pures.ready]).then(([h]) => h)
+		ready: Promise.all([hello.ready, typed.prediction?.ready, pures.ready]).then(([h]) => h),
+		neighbours: () => watcher?.states() ?? new Map(),
+		close: () => {
+			watcher?.stop();
+			typed.client.close();
+		}
 	};
 }
 

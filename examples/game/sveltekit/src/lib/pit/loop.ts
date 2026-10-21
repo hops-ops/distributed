@@ -45,6 +45,17 @@ function parseRoom(zone: string | undefined): [number, number] | undefined {
 	return m === null ? undefined : [Number(m[1]), Number(m[2])];
 }
 
+/** The 8 rooms around `zone` (watched as passive observers: `watchZones`). */
+export function neighbourRooms(zone: string): string[] {
+	const at = parseRoom(zone);
+	if (at === undefined) return [];
+	const out: string[] = [];
+	for (let dy = -1; dy <= 1; dy += 1) {
+		for (let dx = -1; dx <= 1; dx += 1) if (dx !== 0 || dy !== 0) out.push(`pit.${at[0] + dx}.${at[1] + dy}`);
+	}
+	return out;
+}
+
 /**
  * The own player's predicted fields in the next room's frame (the same world
  * point): the SDK keeps predicting through a doorway handoff (`handoffFrame`).
@@ -237,6 +248,8 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 			}
 		}
 		ctx.lineWidth = 1;
+		// Mobs drawn from the rooms next door (watched), for the headless test.
+		let nextDoor = 0;
 		for (const entity of rendered) {
 			const w = worldOf(entity);
 			if (w === undefined) continue;
@@ -245,6 +258,7 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				if (!pillars.some((q) => q.x === p.x && q.y === p.y)) pillars = [...pillars, { x: p.x, y: p.y, r: p.r }];
 			} else if (isMob(entity)) {
 				if (entity.stale) continue;
+				if (entity.zoneId !== room) nextDoor += 1;
 				const m = mobFields(entity);
 				const look = TIER_RADIUS[m.tier];
 				if (m.tele > 0 && look !== undefined) circle(w.x, w.y, look.tele, 'rgba(255,80,80,0.12)', '#ff5050');
@@ -286,6 +300,7 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				ctx.fillText(p.name, px - 16, py - 0.7 * scale);
 			}
 		}
+		canvas.dataset.nextDoorMobs = String(nextDoor);
 		frame = requestAnimationFrame(draw);
 	});
 

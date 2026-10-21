@@ -47,6 +47,9 @@ export async function lastRoom(principal: string): Promise<string | undefined> {
  */
 export const tickets = createGameTicketHandler({
 	secret: () => env.GAME_TICKET_SECRET,
+	// The page also watches the 8 rooms next door (one observer ticket each
+	// per doorway, retried with back-off while a room sleeps).
+	rateLimit: { max: 120, windowMs: 60_000 },
 	getSession: (event: RequestEvent) => event.locals.auth(),
 	zone: async ({ requested, principal }) => (isRoom(requested) ? requested : ((await lastRoom(principal)) ?? ENTRANCE))
 });

@@ -1,10 +1,11 @@
 <script lang="ts">
+	import { watchZones, type WatchState } from '@hops-ops/distributed/game';
 	import { gameTicketSource, useGame } from '@hops-ops/distributed/sveltekit/game';
 	import { createMobpitClient, EVENTS } from '$lib/generated/mobpit/index.ts';
 	import Leaderboard from '$lib/pit/Leaderboard.svelte';
 	import MyStats from '$lib/pit/MyStats.svelte';
 	import Rooms from '$lib/pit/Rooms.svelte';
-	import { pitHandoffFrame, startPitLoop } from '$lib/pit/loop';
+	import { neighbourRooms, pitHandoffFrame, startPitLoop } from '$lib/pit/loop';
 
 	let { data } = $props();
 
@@ -26,8 +27,13 @@
 		{ zone: () => data.zone, events: EVENTS }
 	);
 	const hello = game.latest('hello');
-	const kills = game.events('kill', { limit: 20 });
 	const saved = game.events('saved', { limit: 20 });
+	// Your kills not settled yet. Entity ids are per room, so only kills in
+	// your own room can be yours (the rooms next door are watched too).
+	let mine = $state<string[]>([]);
+	game.on('kill', (k, zoneId) => {
+		if (zoneId === game.zone && k.killer === hello.current?.entity) mine = [k.key, ...mine].slice(0, 20);
+	});
 	game.on('hello', (h) => {
 		game.client?.setControlledEntity(h.entity);
 		if (h.restored) toast(`pit.${h.roomX}.${h.roomY}: restored from hibernation (${h.roomKills} kills here so far)`);
@@ -115,9 +121,23 @@
 	}
 
 	// Kills the zone reported that the cell has not acknowledged yet.
-	const unsaved = $derived(
-		kills.items.filter((k) => k.killer === hello.current?.entity && !saved.items.some((s) => s.key === k.key)).length
-	);
+	const unsaved = $derived(mine.filter((key) => !saved.items.some((s) => s.key === key)).length);
+
+	// The 8 rooms next door, watched as passive observers: their mobs are
+	// drawn, a sleeping room is not woken (it shows nothing).
+	let around = $state<Record<string, WatchState>>({});
+	$effect(() => {
+		const client = game.client;
+		if (client === undefined) return;
+		const watch = watchZones(client, neighbourRooms);
+		const timer = setInterval(() => (around = Object.fromEntries(watch.states())), 500);
+		return () => {
+			clearInterval(timer);
+			watch.stop();
+		};
+	});
+	const watching = $derived(Object.values(around).filter((s) => s === 'watching').length);
+	const asleep = $derived(Object.values(around).filter((s) => s === 'asleep').length);
 </script>
 
 <main>
@@ -139,6 +159,7 @@
 			<div>pending inputs <b data-testid="pending">{net.pending}</b> · ack <b>{net.ack}</b></div>
 			<div>corrections <b data-testid="corrections">{net.corrections}</b> (last {net.last.toFixed(3)} m)</div>
 			<div>interest ring <b>{hello.current?.viewRadius ?? '–'}</b> m</div>
+			<div>next door <b data-testid="watching">{watching}</b> watched · <b data-testid="asleep">{asleep}</b> asleep</div>
 			<label>latency <input type="range" min="0" max="300" step="5" bind:value={sim.latencyMs} oninput={pushSim} data-testid="latency" /> {sim.latencyMs} ms</label>
 			<label>jitter <input type="range" min="0" max="100" step="1" bind:value={sim.jitterMs} oninput={pushSim} /> {sim.jitterMs} ms</label>
 			<label>loss <input type="range" min="0" max="0.2" step="0.01" bind:value={sim.loss} oninput={pushSim} /> {Math.round(sim.loss * 100)}%</label>

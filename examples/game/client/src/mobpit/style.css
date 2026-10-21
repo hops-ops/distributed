@@ -149,6 +149,9 @@
 .pit-rooms .c-cold {
 	color: #556070;
 }
+.pit-rooms .c-watched {
+	color: #4dd0e1;
+}
 .pit-debug {
 	margin-top: 6px;
 	font: 11px/1.4 monospace;
