@@ -102,24 +102,42 @@ async function walkThrough(page, side) {
 	const goal = { east: [21, 1.7], west: [-21, 1.7], north: [1.7, 21], south: [1.7, -21] }[side];
 	const room = () => page.evaluate(() => document.querySelector('canvas')?.dataset.room);
 	const world = () => page.evaluate(() => document.querySelector('canvas')?.dataset.world?.split(',').map(Number));
+	const deaths = () => page.evaluate(() => Number(document.querySelector('canvas')?.dataset.deaths ?? 0));
 	const from = await room();
-	console.error(`before ${side}: ${await page.evaluate(() => JSON.stringify({ me: document.querySelector('canvas').dataset.me, ghostGap: document.querySelector('canvas').dataset.ghostGap }))}`);
-	await page.evaluate(() => (document.querySelector('canvas').dataset.jump = '0'));
-	const before = await world();
-	const arrived = await walkInto(page, goal, room, from);
-	// The new room's first snapshot, then the held prediction resumes there.
-	await page.waitForSelector(`[data-testid=zone]:text-is("${arrived}")`, { timeout: 10_000 });
-	await page.waitForTimeout(500);
-	const jump = Number(await page.evaluate(() => document.querySelector('canvas').dataset.jump));
-	const after = await world();
-	const [dx, dy] = { east: [1, 0], west: [-1, 0], north: [0, 1], south: [0, -1] }[side];
-	console.error(`doorway ${from} → ${arrived}: largest frame move ${jump} m, world ${before} → ${after}`);
-	if (jump > MAX_JUMP) console.error(`JUMP DEBUG ${await page.evaluate(() => JSON.stringify({ jump: document.querySelector('canvas').dataset.jumpDebug, failed: document.querySelector('canvas').dataset.handoffFailed, closed: document.querySelector('canvas').dataset.zoneClosed }))}`);
-	assert.ok(jump <= MAX_JUMP, `${from} → ${arrived}: the view jumped ${jump} m in one frame`);
-	// Moved on in the doorway's direction, a few metres, not a room.
-	const along = (after[0] - before[0]) * dx + (after[1] - before[1]) * dy;
-	assert.ok(along > 0 && Math.hypot(after[0] - before[0], after[1] - before[1]) < 40, `${before} → ${after}`);
-	return arrived;
+	for (let attempt = 1; ; attempt += 1) {
+		// Measured only on a walk you survive: a death respawns you at a
+		// spawn point (a cut by design, not a doorway jump).
+		await page.waitForFunction(() => document.querySelector('canvas')?.dataset.dead === 'false', null, { timeout: 15_000 });
+		const died = await deaths();
+		await page.evaluate(() => (document.querySelector('canvas').dataset.jump = '0'));
+		const before = await world();
+		const arrived = await walkInto(page, goal, room, from);
+		// The new room's first snapshot, then the held prediction resumes there.
+		await page.waitForSelector(`[data-testid=zone]:text-is("${arrived}")`, { timeout: 10_000 });
+		await page.waitForTimeout(500);
+		if ((await deaths()) !== died) {
+			assert.ok(attempt < 3, `died on every walk ${side} out of ${from}`);
+			console.error(`walk ${side} out of ${from}: died on the way (attempt ${attempt}); walking again`);
+			if (arrived !== from) {
+				// Back (unmeasured), then the measured walk again.
+				const back = { east: [-21, 1.7], west: [21, 1.7], north: [1.7, -21], south: [1.7, 21] }[side];
+				await page.waitForFunction(() => document.querySelector('canvas')?.dataset.dead === 'false', null, { timeout: 15_000 });
+				assert.equal(await walkInto(page, back, room, arrived), from);
+				await page.waitForSelector(`[data-testid=zone]:text-is("${from}")`, { timeout: 10_000 });
+			}
+			continue;
+		}
+		const jump = Number(await page.evaluate(() => document.querySelector('canvas').dataset.jump));
+		const after = await world();
+		const [dx, dy] = { east: [1, 0], west: [-1, 0], north: [0, 1], south: [0, -1] }[side];
+		console.error(`doorway ${from} → ${arrived}: largest frame move ${jump} m, world ${before} → ${after}`);
+		if (jump > MAX_JUMP) console.error(`JUMP DEBUG ${await page.evaluate(() => JSON.stringify({ jump: document.querySelector('canvas').dataset.jumpDebug, failed: document.querySelector('canvas').dataset.handoffFailed, closed: document.querySelector('canvas').dataset.zoneClosed }))}`);
+		assert.ok(jump <= MAX_JUMP, `${from} → ${arrived}: the view jumped ${jump} m in one frame`);
+		// Moved on in the doorway's direction, a few metres, not a room.
+		const along = (after[0] - before[0]) * dx + (after[1] - before[1]) * dy;
+		assert.ok(along > 0 && Math.hypot(after[0] - before[0], after[1] - before[1]) < 40, `${before} → ${after}`);
+		return arrived;
+	}
 }
 
 async function walkInto(page, goal, room, from) {
@@ -362,6 +380,22 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 			{ timeout: 15_000 }
 		);
 
+		// Bow: auto-hunt turns ana to the nearest mob; R looses arrows; the
+		// room rewinds the mobs to what she saw (lag compensation) and its
+		// verdicts come back (green markers). First person turns the view.
+		await page.check('[data-testid=autohunt]');
+		await page.check('[data-testid=first-person]');
+		for (let i = 0; i < 30; i += 1) {
+			if (Number(await page.evaluate(() => document.querySelector('canvas')?.dataset.confirmed ?? 0)) > 0) break;
+			await page.keyboard.press('KeyR');
+			await page.waitForTimeout(450);
+		}
+		await page.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.confirmed ?? 0) > 0, null, { timeout: 10_000 });
+		const bow = await page.evaluate(() => ({ ...document.querySelector('canvas').dataset }));
+		console.error(`bow: ${bow.shots} arrows, ${bow.resolved} verdicts, ${bow.confirmed} confirmed hits, ${bow.agreed} as seen`);
+		await page.uncheck('[data-testid=first-person]');
+		await page.uncheck('[data-testid=autohunt]');
+
 		// Rooms. The overlay shows which celld node runs the entrance (celld
 		// chose it; the game only shows it).
 		await page.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=active]', { timeout: 15_000 });
@@ -449,22 +483,6 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		assert.equal(await page.getAttribute('[data-testid=events]', 'data-live'), 'active');
 		console.error(`world event (read model, @live): ${await page.textContent('[data-testid=events] li[data-borough="0.0"]')}`);
 		await page.waitForSelector('[data-testid=world-event]', { timeout: 10_000 });
-
-		// Bow: auto-hunt turns ana to the nearest mob; R looses arrows; the
-		// room rewinds the mobs to what she saw (lag compensation) and its
-		// verdicts come back (green markers). First person turns the view.
-		await page.check('[data-testid=autohunt]');
-		await page.check('[data-testid=first-person]');
-		for (let i = 0; i < 30; i += 1) {
-			if (Number(await page.evaluate(() => document.querySelector('canvas')?.dataset.confirmed ?? 0)) > 0) break;
-			await page.keyboard.press('KeyR');
-			await page.waitForTimeout(450);
-		}
-		await page.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.confirmed ?? 0) > 0, null, { timeout: 10_000 });
-		const bow = await page.evaluate(() => ({ ...document.querySelector('canvas').dataset }));
-		console.error(`bow: ${bow.shots} arrows, ${bow.resolved} verdicts, ${bow.confirmed} confirmed hits, ${bow.agreed} as seen`);
-		await page.uncheck('[data-testid=first-person]');
-		await page.uncheck('[data-testid=autohunt]');
 
 		// Live content update (dev admin): every room freezes with the change
 		// notes, switches to the pack and resumes; the page patches live.

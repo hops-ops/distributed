@@ -216,8 +216,8 @@ export const FIELD_TYPES = {
 /** Client correction defaults (`#[correct(..)]`), by kind and wire field name. */
 export const CORRECTIONS: CorrectionPolicies = {
 	player: {
-		x: { mode: 'ease', durationMs: 150 },
-		y: { mode: 'ease', durationMs: 150 },
+		x: { mode: 'ease', durationMs: 150, snapAbove: 2 },
+		y: { mode: 'ease', durationMs: 150, snapAbove: 2 },
 		vx: { mode: 'snap' },
 		vy: { mode: 'snap' },
 		dash: { mode: 'snap' },

@@ -63,7 +63,9 @@ test('Mob Pit network panel: exact prediction, NetSim on celld rooms, interest r
 		// NetSim: the rooms' setting raises the RTT through celld.
 		const connection = client.authority.connection;
 		await until(() => connection.clock.synced, 5_000, 'clock');
-		const base = connection.clock.rtt;
+		// The quietest round trip seen so far (a busy machine spikes single samples).
+		await sleep(1500);
+		const base = Math.min(...connection.clock.samples.map((sample) => sample.rtt));
 		assert.deepEqual(await api.getNetSim(), { latencyMs: 0, jitterMs: 0, loss: 0 });
 		assert.deepEqual(await api.setNetSim({ latencyMs: 80, jitterMs: 0, loss: 0 }), { latencyMs: 80, jitterMs: 0, loss: 0 });
 		await until(() => connection.clock.samples.at(-1)?.rtt > base + 100, 20_000, 'rtt with netsim');

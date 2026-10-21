@@ -77,14 +77,16 @@ pub const PIT_ENTITY: EntityId = EntityId(900);
 #[derive(Debug, Clone, PartialEq, Replicated)]
 #[replicated(kind = "player", id = 1, priority = 2.0, of = Player)]
 pub struct PlayerView {
-    /// Position x (room-local; past ±HALF in a doorway passage).
+    /// Position x (room-local; past ±HALF in a doorway passage). A
+    /// misprediction eases out over 150 ms; a jump over 2 m (a respawn) is
+    /// a cut, never a slide.
     #[field_type(rooms::POS)]
-    #[correct(ease = 150)]
+    #[correct(ease = 150, snap_above = 2.0)]
     #[from(state.x)]
     pub x: f32,
     /// Position y.
     #[field_type(rooms::POS)]
-    #[correct(ease = 150)]
+    #[correct(ease = 150, snap_above = 2.0)]
     #[from(state.y)]
     pub y: f32,
     /// Velocity x.

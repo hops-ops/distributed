@@ -353,6 +353,8 @@ examples/game/
                              mobpit-headless, mobpit-network-headless (NetSim on celld rooms,
                              exact prediction, interest), mobpit-restarts-headless, leaderboard-headless,
                              mobpit-neighbours-headless (passive watchers), mobpit-ranged-headless (lag-compensated arrows), mobpit-events-headless, mobpit-content-headless (live content rollout),
+                             mobpit-respawn-headless (a respawn is a cut), mobpit-doorway-bow-headless
+                             (a bow fight, then doorways into a sleeping room: exact, no jump),
                              mobpit-bosses-headless (hood → borough → city) (+ helpers/demo-server.mjs,
                              helpers/mobpit.mjs, helpers/celld.mjs for
                              a per-test `celld dev`)

@@ -627,7 +627,8 @@
         {
           "correction": {
             "durationMs": 150,
-            "mode": "ease"
+            "mode": "ease",
+            "snapAbove": 2.0
           },
           "name": "x",
           "priority": 1.0,
@@ -641,7 +642,8 @@
         {
           "correction": {
             "durationMs": 150,
-            "mode": "ease"
+            "mode": "ease",
+            "snapAbove": 2.0
           },
           "name": "y",
           "priority": 1.0,

@@ -156,6 +156,11 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 	const offClosed = client.on('zoneClosed', (zone, info) => {
 		canvas.dataset.zoneClosed = `${canvas.dataset.zoneClosed ?? ''} ${zone} ${info.reason} ${info.code ?? ''};`;
 	});
+	// Deaths of the own player (a respawn is a cut to a spawn point), for the
+	// headless test: a doorway walk is measured only while you stay alive.
+	const offDied = onGameEvent(client, EVENTS, 'died', () => {
+		canvas.dataset.deaths = String(Number(canvas.dataset.deaths ?? 0) + 1);
+	});
 	const offShots = onGameEvent(client, EVENTS, 'shot', (v) => {
 		const shot = shots.get(v.shot);
 		if (shot === undefined || shot.verdict !== undefined) return;
@@ -443,7 +448,11 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				const isMe = entity === meEntity;
 				if (!isMe && mine(entity)) continue;
 				// Own room-local position for the headless test (a DOM attribute, not Svelte state).
-				if (isMe) canvas.dataset.me = `${p.x.toFixed(2)},${p.y.toFixed(2)}`;
+				if (isMe) {
+					canvas.dataset.me = `${p.x.toFixed(2)},${p.y.toFixed(2)}`;
+					canvas.dataset.dead = String(p.dead);
+					canvas.dataset.hp = String(p.hp);
+				}
 				if (p.swing > 0 && !p.dead) {
 					// The swing cone (blue), fading as `swing` counts down.
 					const fade = p.swing / PIT_RULES.swingFrames;
@@ -536,6 +545,7 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 		document.removeEventListener('mousemove', onMove);
 		canvas.removeEventListener('mousedown', onDown);
 		offShots();
+		offDied();
 		offFail();
 		offClosed();
 	};
