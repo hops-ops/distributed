@@ -1,24 +1,32 @@
 /**
- * Headless SvelteKit demo (production build, real `game-demos mobpit` and
- * real `mobpit-service`): dev session sign-in → the page joins the
- * server-chosen zone with a session-minted ticket → keyboard movement →
- * auto-hunt kills a mob → the celld Crawler cell commits it, its domain event
- * goes through the cell outbox and celld's Queue to the zone server's relay,
- * onto the bus, and is projected into `player_stats` → the `@live` GraphQL queries
- * (MyStats, bound to the session; the leaderboard's names) update without a
- * reload; the zone server's Redis XP board reaches the page through
- * mobpit-service's GraphQL board roots (`xpLeaderboard`, SSR-seeded, `@live`
- * from the board change notices on the bus) for the killer and for a second
- * signed-in player → the SSR HTML after a reload has the settled numbers →
- * no page errors. Needs REDIS_URL.
+ * Headless SvelteKit demo (production build, real `game-demos mobpit`
+ * services, real `mobpit-service`, Mob Pit's rooms on a multi-node celld):
+ * dev session sign-in → the page joins the entrance room with a
+ * session-minted ticket → keyboard movement → auto-hunt kills a mob → the
+ * celld Crawler cell commits it, its domain event goes through the cell
+ * outbox and celld's Queue to the services' relay, onto the bus, and is
+ * projected into `player_stats` → the `@live` GraphQL queries (MyStats,
+ * bound to the session; Leaderboard) update without a reload, for the
+ * killer and for a second signed-in player → both players walk through
+ * doorways into other rooms (one on another celld node: the debug overlay
+ * shows each room's node) → the room they left goes dormant, then asleep
+ * on the live minimap (`zone_activities` @live) → walking back restores it
+ * (toast, minimap active) → the SSR HTML after a reload has the settled
+ * numbers → no page errors. The leaderboard is the services' Redis XP board,
+ * served by mobpit-service's GraphQL board roots (SSR-seeded, `@live` from
+ * the board change notices on the bus). Needs REDIS_URL.
+ *
+ * celld: a 3-node fleet in production mode on one RustFS bucket (docker
+ * compose, `client/tests/helpers/fleet.mjs`) when docker and the aws CLI
+ * are available (required with MOBPIT_FLEET_REQUIRED=1); otherwise a
+ * single `celld dev` and the cross-node check is skipped.
  *
  * Ports: GAME_DEMOS_PORT (default 2967), SVELTEKIT_PORT (default 5573),
  * MOBPIT_SERVICE_PORT (default GAME_DEMOS_PORT + 2). Needs the lifecycle
  * build (`distributed build examples/game/server`, which runs `vite build`
  * with the generated `$distributed` client), the binaries
  * (GAME_DEMOS_BIN / MOBPIT_SERVICE_BIN, else `cargo run`), and celld
- * (CELLD_BIN, with the built `examples/game/cells` worker; the test starts
- * its own `celld dev`).
+ * (CELLD_BIN, with the built `examples/game/cells` worker).
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -32,6 +40,7 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 
 import { startCelld } from '../../client/tests/helpers/celld.mjs';
+import { startFleet } from '../../client/tests/helpers/fleet.mjs';
 
 const APP = fileURLToPath(new URL('..', import.meta.url));
 const SERVER_DIR = fileURLToPath(new URL('../../server/', import.meta.url));
@@ -76,21 +85,57 @@ function start(command, args, options, ready) {
 	};
 }
 
-test('sign in, join, move, kill, live read model updates for two players', { timeout: 600_000 }, async () => {
-	// The leaderboard is the Redis board the zone server writes and
+/** Walk `page`'s player through the doorway on `side`; resolves with the new room. */
+async function walkThrough(page, side) {
+	const goal = { east: [21, 2], west: [-21, 2], north: [2, 21], south: [2, -21] }[side];
+	const room = () => page.evaluate(() => document.querySelector('canvas')?.dataset.room);
+	const from = await room();
+	const held = new Set();
+	const hold = async (keys) => {
+		for (const k of [...held]) if (!keys.includes(k)) (await page.keyboard.up(k), held.delete(k));
+		for (const k of keys) if (!held.has(k)) (await page.keyboard.down(k), held.add(k));
+	};
+	try {
+		for (const start = Date.now(); Date.now() - start < 60_000; ) {
+			const now = await room();
+			if (now !== from) return now;
+			const me = await page.evaluate(() => document.querySelector('canvas')?.dataset.me);
+			const [x, y] = (me ?? '0,0').split(',').map(Number);
+			const keys = [];
+			if (goal[0] - x > 0.3) keys.push('KeyD');
+			if (goal[0] - x < -0.3) keys.push('KeyA');
+			if (goal[1] - y > 0.3) keys.push('KeyW');
+			if (goal[1] - y < -0.3) keys.push('KeyS');
+			await hold(keys);
+			await page.waitForTimeout(80);
+		}
+		throw new Error(`walking ${side} out of ${from} timed out`);
+	} finally {
+		await hold([]);
+	}
+}
+
+/** The minimap's view of `zone` (the zone status read model, live). */
+const roomStatus = (page, zone) => page.getAttribute(`[data-testid="room-${zone}"]`, 'data-status');
+
+test('sign in, join, move, kill, walk through rooms on celld, live read models for two players', { timeout: 600_000 }, async () => {
+	// The leaderboard is the Redis board the services write and
 	// mobpit-service serves through its GraphQL board roots.
 	const redisUrl = process.env.REDIS_URL;
 	assert.ok(redisUrl, 'REDIS_URL is required: the SvelteKit leaderboard is the Redis board (docker compose up -d redis)');
 	const redisPrefix = `mobpit-sveltekit-${randomBytes(6).toString('hex')}`;
-	const secret = randomBytes(32).toString('hex');
 	const dataDir = mkdtempSync(join(tmpdir(), 'mobpit-sveltekit-'));
 	const busUrl = `sqlite:${join(dataDir, 'bus.db')}`;
 	const keys = apiKeys();
 	const bin = process.env.GAME_DEMOS_BIN;
-	// The Crawler cells run on celld; its outbox Queue relays the domain
-	// events to the game server, which publishes them onto the bus.
-	const celld = await startCelld({ relayPort: GAME_PORT });
-	const gameEnv = { ...process.env, ...celld.env, DISTRIBUTED_GAME_SECRET: secret, REDIS_URL: redisUrl, MOBPIT_REDIS_PREFIX: redisPrefix };
+	// The rooms and the Crawler cells run on celld; its outbox Queue relays
+	// the domain events to the services, which publish them onto the bus.
+	const roomVars = { ZONE_HIBERNATE_AFTER_MS: '2500' };
+	const fleet = await startFleet({ relayPort: GAME_PORT, vars: roomVars });
+	const celld = fleet ?? (await startCelld({ relayPort: GAME_PORT, vars: { ...roomVars, CELLD_ZONE_NODE: 'celld-dev' } }));
+	const roomsUrls = (fleet?.urls ?? [celld.url]).map((u) => u.replace(/^http/, 'ws')).join(',');
+	const secret = celld.ticketSecret;
+	const gameEnv = { ...process.env, ...celld.env, REDIS_URL: redisUrl, MOBPIT_REDIS_PREFIX: redisPrefix };
 	const gameArgs = ['mobpit', '--port', String(GAME_PORT), '--data-dir', join(dataDir, 'local'), '--projection-bus', busUrl];
 	const game = bin
 		? start(bin, gameArgs, { env: gameEnv }, /LISTENING/)
@@ -122,7 +167,7 @@ test('sign in, join, move, kill, live read model updates for two players', { tim
 			AUTH_SECRET: randomBytes(32).toString('hex'),
 			GAME_DEV_AUTH: '1',
 			GAME_TICKET_SECRET: secret,
-			GAME_ZONES_URL: `ws://127.0.0.1:${GAME_PORT}`,
+			GAME_ZONES_URL: roomsUrls,
 			MOBPIT_API_SIGNING_JWK: keys.signingJwk,
 			MOBPIT_GRAPHQL_URL: GRAPHQL
 		}
@@ -142,7 +187,7 @@ test('sign in, join, move, kill, live read model updates for two players', { tim
 
 		// No session → no ticket; a body cannot name the principal.
 		const anonymous = await fetch(`${ORIGIN}/api/game/ticket`, {
-			method: 'POST', headers: { origin: ORIGIN, 'content-type': 'application/json' }, body: '{"zone":"pit-1"}'
+			method: 'POST', headers: { origin: ORIGIN, 'content-type': 'application/json' }, body: '{"zone":"pit.0.0"}'
 		});
 		assert.equal(anonymous.status, 401);
 		assert.equal(anonymous.headers.get('cache-control'), 'no-store');
@@ -175,22 +220,24 @@ test('sign in, join, move, kill, live read model updates for two players', { tim
 		};
 		const page = await signIn('ana');
 
-		// With the session cookie: a ticket for the server's zone; a smuggled
-		// principal, a foreign zone or a cross-site origin is refused.
+		// With the session cookie: a ticket for the entrance (or a room the
+		// player rejoins); a smuggled principal, something that is not a room
+		// or a cross-site origin is refused.
 		const cookie = (await page.context().cookies()).map((c) => `${c.name}=${c.value}`).join('; ');
 		const ticket = (body, origin = ORIGIN) =>
 			fetch(`${ORIGIN}/api/game/ticket`, { method: 'POST', headers: { cookie, origin, 'content-type': 'application/json' }, body: JSON.stringify(body) });
-		const minted = await ticket({ zone: 'pit-1' });
+		const minted = await ticket({ zone: 'pit.0.0' });
 		assert.equal(minted.status, 200);
 		const claims = JSON.parse(Buffer.from((await minted.json()).ticket.split('.')[1], 'base64url').toString());
 		assert.equal(claims.sub, 'dev-ana');
-		assert.equal((await ticket({ zone: 'pit-1', principal: 'admin' })).status, 400);
+		assert.equal((await ticket({ zone: 'pit.0.0', principal: 'admin' })).status, 400);
 		assert.equal((await ticket({ zone: 'pit-2' })).status, 409);
-		assert.equal((await ticket({ zone: 'pit-1' }, 'http://evil.example')).status, 403);
+		assert.equal((await ticket({ zone: 'pit.3.-1' })).status, 200, 'rejoining a room');
+		assert.equal((await ticket({ zone: 'pit.0.0' }, 'http://evil.example')).status, 403);
 
-		// HUD: connected to the server-chosen zone, RTT measured, WASM prediction loaded.
+		// HUD: connected to the entrance room, RTT measured, WASM prediction loaded.
 		await page.waitForSelector('[data-testid=status]:text-is("open")', { timeout: 30_000 });
-		assert.equal(await page.textContent('[data-testid=zone]'), 'pit-1');
+		assert.equal(await page.textContent('[data-testid=zone]'), 'pit.0.0');
 		await page.waitForFunction(() => /^\d+$/.test(document.querySelector('[data-testid=rtt]')?.textContent ?? ''), null, { timeout: 10_000 });
 		await page.waitForSelector('[data-testid=prediction]:text-is("wasm")', { timeout: 10_000 });
 
@@ -243,6 +290,55 @@ test('sign in, join, move, kill, live read model updates for two players', { tim
 		// board roots) updated live too: the zone server's board change
 		// notice crossed the bus to mobpit-service, which pushed it.
 		assert.equal(await bob.getAttribute('[data-testid=leaderboard]', 'data-live'), 'active');
+		await bob.waitForFunction(
+			(expected) => [...document.querySelectorAll('[data-testid=leaderboard] li')].some((li) => li.textContent === expected),
+			`ana — ${xp} XP`,
+			{ timeout: 15_000 }
+		);
+
+		// Rooms. The overlay shows which celld node runs the entrance (celld
+		// chose it; the game only shows it).
+		await page.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=active]', { timeout: 15_000 });
+		const nodeOf = async (p, zone) => {
+			await p.waitForFunction((z) => document.querySelector('[data-testid=overlay]')?.textContent?.includes(z) && document.querySelector('[data-testid=node]')?.textContent !== 'unknown', zone, { timeout: 20_000 });
+			return p.textContent('[data-testid=node]');
+		};
+		const entranceNode = await nodeOf(page, 'pit.0.0');
+		// Ana walks east, Bob north: the entrance empties.
+		assert.equal(await walkThrough(page, 'east'), 'pit.1.0');
+		await page.waitForSelector('[data-testid=zone]:text-is("pit.1.0")', { timeout: 10_000 });
+		const eastNode = await nodeOf(page, 'pit.1.0');
+		assert.equal(await walkThrough(bob, 'north'), 'pit.0.1');
+		const northNode = await nodeOf(bob, 'pit.0.1');
+		console.error(`rooms: pit.0.0 on ${entranceNode}, pit.1.0 on ${eastNode}, pit.0.1 on ${northNode}`);
+		if (fleet !== null) {
+			assert.ok(fleet.nodes.includes(entranceNode) && fleet.nodes.includes(eastNode), `${entranceNode} ${eastNode}`);
+			assert.notEqual(eastNode, entranceNode, 'the doorway led into a room on another celld node');
+		}
+		// The left room goes dormant, then asleep, live on both minimaps.
+		await page.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=hibernated]', { timeout: 30_000 });
+		await bob.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=hibernated]', { timeout: 10_000 });
+		assert.equal(await roomStatus(page, 'pit.1.0'), 'active');
+		// Ana walks back: the entrance wakes from its snapshot.
+		assert.equal(await walkThrough(page, 'west'), 'pit.0.0');
+		await page.waitForSelector('[data-testid=toasts] .toast:has-text("restored from hibernation")', { timeout: 15_000 });
+		await page.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=active]', { timeout: 15_000 });
+		await bob.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=active]', { timeout: 15_000 });
+		// A kill in the restored room settles and the read model follows live.
+		const before = Number(await page.textContent('[data-testid=kills]'));
+		await page.check('[data-testid=autohunt]');
+		await page.waitForFunction((k) => Number(document.querySelector('[data-testid=kills]')?.textContent) > k, before, { timeout: 90_000 });
+		await page.uncheck('[data-testid=autohunt]');
+		await page.waitForFunction(() => document.querySelector('[data-testid=unsaved]')?.textContent === '0', null, { timeout: 15_000 });
+		xp = -1;
+		kills = -1;
+		for (let stable = 0, start = Date.now(); stable < 3; ) {
+			assert.ok(Date.now() - start < 20_000, 'read model settles again');
+			await page.waitForTimeout(500);
+			const now = [Number(await page.textContent('[data-testid=xp]')), Number(await page.textContent('[data-testid=kills]'))];
+			stable = now[0] === xp && now[1] === kills ? stable + 1 : 0;
+			[xp, kills] = now;
+		}
 		await bob.waitForFunction(
 			(expected) => [...document.querySelectorAll('[data-testid=leaderboard] li')].some((li) => li.textContent === expected),
 			`ana — ${xp} XP`,

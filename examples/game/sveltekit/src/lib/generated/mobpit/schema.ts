@@ -131,18 +131,16 @@ export function pillarFields(entity: { readonly fields: EntityFields }): PillarF
 export interface PitFields {
 	/** `u16` */
 	readonly pending: number;
+	/** `u32` */
+	readonly committed: number;
 	/** `u16` */
-	readonly slowMs: number;
+	readonly backlog: number;
 	/** `f32` */
 	readonly tickMs: number;
 	/** `f32` */
 	readonly tickMaxMs: number;
 	/** `u32` */
-	readonly workUs: number;
-	/** `u32` */
-	readonly committed: number;
-	/** `u16` */
-	readonly backlog: number;
+	readonly kills: number;
 }
 
 /** True for a `pit` entity. */
@@ -155,12 +153,11 @@ export function pitFields(entity: { readonly fields: EntityFields }): PitFields 
 	const f = entity.fields;
 	return {
 		pending: fieldNumber(f, 'pending'),
-		slowMs: fieldNumber(f, 'slow_ms'),
-		tickMs: fieldNumber(f, 'tick_ms'),
-		tickMaxMs: fieldNumber(f, 'tick_max_ms'),
-		workUs: fieldNumber(f, 'work_us'),
 		committed: fieldNumber(f, 'committed'),
 		backlog: fieldNumber(f, 'backlog'),
+		tickMs: fieldNumber(f, 'tick_ms'),
+		tickMaxMs: fieldNumber(f, 'tick_max_ms'),
+		kills: fieldNumber(f, 'kills'),
 	};
 }
 
@@ -196,12 +193,11 @@ export const FIELD_TYPES = {
 	},
 	pit: {
 		pending: { type: 'u16' },
-		slow_ms: { type: 'u16' },
-		tick_ms: { type: 'f32' },
-		tick_max_ms: { type: 'f32' },
-		work_us: { type: 'u32' },
 		committed: { type: 'u32' },
 		backlog: { type: 'u16' },
+		tick_ms: { type: 'f32' },
+		tick_max_ms: { type: 'f32' },
+		kills: { type: 'u32' },
 	},
 } as const satisfies Record<string, Record<string, WireType>>;
 

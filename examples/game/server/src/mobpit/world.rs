@@ -16,8 +16,8 @@ use super::directory::CrawlerDirectory;
 use super::store::{CelldOptions, CrawlerCells};
 use crate::common::random_hex;
 use crate::common::relay::{ProjectionBus, ProjectionPublisher};
-use distributed::leaderboard::LeaderboardChangePublisher;
 use crate::common::zone_status::ZoneStatusView;
+use distributed::leaderboard::LeaderboardChangePublisher;
 
 /// Bus consumer group of the rooms' zone status projection here.
 pub const ZONE_STATUS_CONSUMER: &str = "mobpit-rooms";

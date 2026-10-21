@@ -9,6 +9,7 @@ import { InputPacer, type GameClient } from '@hops-ops/distributed/game';
 import {
 	BUTTON,
 	PIT_RULES,
+	PIT_WORLD,
 	isMob,
 	isPillar,
 	isPlayer,
@@ -22,6 +23,7 @@ import {
 const TIER_COLOR: Record<number, string> = { 1: '#9ad16b', 2: '#b48cf2', 3: '#ff6b6b' };
 const TIER_RADIUS = Object.fromEntries(PIT_RULES.tiers.map((t) => [t.tier, t]));
 const PLAYER_RADIUS = 0.45;
+const DOOR_HALF = PIT_WORLD.doorHalf;
 /** Swing cone, from the server's rules (reach to a mob's edge, plus the body). */
 const SWING_REACH = PIT_RULES.attackRange + PLAYER_RADIUS;
 const SWING_HALF = PIT_RULES.attackHalfAngle;
@@ -49,7 +51,8 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 
 	const steer = (): PitInput => {
 		const hello = options.hello();
-		const rendered = client.render();
+		const room = client.authority?.zoneId;
+		const rendered = client.render().filter((e) => room === undefined || e.zoneId === room);
 		const me = rendered.find((e) => e.id === hello?.entity && isPlayer(e));
 		if (options.autoHunt() && me !== undefined) {
 			const p = playerFields(me);
@@ -79,6 +82,10 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 	let frame = requestAnimationFrame(function draw(now) {
 		pacer.update(now, () => client.sendInput(steer()));
 		const half = options.hello()?.half ?? 12;
+		// Only the room the player is in (during a doorway handoff the
+		// client briefly holds both).
+		const room = client.authority?.zoneId;
+		if (room !== undefined) canvas.dataset.room = room;
 		const { width, height } = canvas;
 		const scale = Math.min(width, height) / (2 * half);
 		const at = (x: number, y: number): [number, number] => [width / 2 + x * scale, height / 2 - y * scale];
@@ -97,7 +104,23 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 		ctx.fillRect(0, 0, width, height);
 		ctx.strokeStyle = '#2b2533';
 		ctx.strokeRect(...at(-half, half), 2 * half * scale, 2 * half * scale);
+		// Doorways: the middle of each wall leads to the neighbouring room.
+		ctx.strokeStyle = '#4dd0e1';
+		ctx.lineWidth = 4;
+		for (const [x0, y0, x1, y1] of [
+			[half, -DOOR_HALF, half, DOOR_HALF],
+			[-half, -DOOR_HALF, -half, DOOR_HALF],
+			[-DOOR_HALF, half, DOOR_HALF, half],
+			[-DOOR_HALF, -half, DOOR_HALF, -half]
+		]) {
+			ctx.beginPath();
+			ctx.moveTo(...at(x0!, y0!));
+			ctx.lineTo(...at(x1!, y1!));
+			ctx.stroke();
+		}
+		ctx.lineWidth = 1;
 		for (const entity of client.render()) {
+			if (room !== undefined && entity.zoneId !== room) continue;
 			if (isPillar(entity)) {
 				const p = pillarFields(entity);
 				circle(p.x, p.y, p.r, '#3a3443');
