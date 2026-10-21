@@ -505,7 +505,10 @@ Controls: WASD / stick move (the Arena's movement, predicted by `pit_step`,
 same floor and pillars), **Space** attack (120° cone, 2.2 m), **E** dash,
 **O** debug overlay. Walk through a **doorway** — the glowing gap in the
 middle of each wall (go beside the pillar on its axis) — into the
-neighbouring room. Mobs wander near home, aggro within 7 m, chase, stop and
+neighbouring room. The rooms are **one continuous world**: room `(x, y)`
+sits at world `(x, y) × 40 m` (they share walls), the rooms around yours
+are drawn from their seeded layout, so you see into the next room, and
+going through a doorway just carries on walking — no scene swap, no jump. Mobs wander near home, aggro within 7 m, chase, stop and
 show a red **telegraph ring** that fills for 0.8 s, then hit everyone
 inside it. Grunts (green, 10 XP), brutes (purple, 25 XP) and elites (red,
 60 XP) respawn 4 s after dying. Level `n` starts at `40·(n−1)²` XP.
@@ -518,10 +521,19 @@ the same Rust compiled to WebAssembly (`createMobpitPures().pitRoom`) for
 the floor colour and the minimap; nothing static is replicated. Seed:
 `MOBPIT_SEED` (worker var).
 
-**Leaving and coming back.** A doorway hands the player over
-(`ctx.handoff`, carrying where along the wall it went through); the room
-signs a single-use transfer ticket and the SDK reconnects to the next
-room's object, wherever it runs. A room that empties writes its snapshot
+**Leaving and coming back.** A doorway is a passage: the predicted step
+(`pit_step`) lets you walk through the gap past the wall line, and 0.5 m
+past it (hysteresis, so dithering at the line does not bounce you back) the
+room hands you over (`ctx.handoff`, carrying your movement state in the
+next room's frame: the same world point and velocity); the room signs a
+single-use transfer ticket and the SDK reconnects to the next room's
+object, wherever it runs. The client keeps predicting through the
+handoff (`prediction.handoffFrame`: the room offset), sends the inputs of
+the transfer to the new room once it is in, and eases into the new room's
+state, so the handoff's latency never shows. Positions on the wire stay
+room-local; the page adds the room's offset and keeps a floating origin at
+your room. Mobs of neighbouring rooms are not shown yet: observing a room
+keeps it awake, which would defeat room hibernation. A room that empties writes its snapshot
 (`Zone::hibernate`: every mob's position, HP, state, generation and
 respawn timer, and the room's kill count) and goes **dormant**; after
 `ZONE_HIBERNATE_AFTER_MS` (10 s) it is **hibernated**: dropped from memory,

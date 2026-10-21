@@ -85,11 +85,39 @@ function start(command, args, options, ready) {
 	};
 }
 
-/** Walk `page`'s player through the doorway on `side`; resolves with the new room. */
+/** Largest frame-to-frame move (m) of the own world position / view, ≈ one tick of walking. */
+const MAX_JUMP = 0.25;
+
+/**
+ * Walk `page`'s player through the doorway on `side`; resolves with the new
+ * room once the handoff completed. Asserts the world stays continuous: the
+ * own world position (= the view centre) never moves more than a tick's
+ * walk between frames, across the doorway too (room-local positions would
+ * jump by a whole room).
+ */
 async function walkThrough(page, side) {
-	const goal = { east: [21, 2], west: [-21, 2], north: [2, 21], south: [2, -21] }[side];
+	const goal = { east: [21, 1.7], west: [-21, 1.7], north: [1.7, 21], south: [1.7, -21] }[side];
 	const room = () => page.evaluate(() => document.querySelector('canvas')?.dataset.room);
+	const world = () => page.evaluate(() => document.querySelector('canvas')?.dataset.world?.split(',').map(Number));
 	const from = await room();
+	await page.evaluate(() => (document.querySelector('canvas').dataset.jump = '0'));
+	const before = await world();
+	const arrived = await walkInto(page, goal, room, from);
+	// The new room's first snapshot, then the held prediction resumes there.
+	await page.waitForSelector(`[data-testid=zone]:text-is("${arrived}")`, { timeout: 10_000 });
+	await page.waitForTimeout(500);
+	const jump = Number(await page.evaluate(() => document.querySelector('canvas').dataset.jump));
+	const after = await world();
+	const [dx, dy] = { east: [1, 0], west: [-1, 0], north: [0, 1], south: [0, -1] }[side];
+	console.error(`doorway ${from} → ${arrived}: largest frame move ${jump} m, world ${before} → ${after}`);
+	assert.ok(jump <= MAX_JUMP, `${from} → ${arrived}: the view jumped ${jump} m in one frame`);
+	// Moved on in the doorway's direction, a few metres, not a room.
+	const along = (after[0] - before[0]) * dx + (after[1] - before[1]) * dy;
+	assert.ok(along > 0 && Math.hypot(after[0] - before[0], after[1] - before[1]) < 40, `${before} → ${after}`);
+	return arrived;
+}
+
+async function walkInto(page, goal, room, from) {
 	const held = new Set();
 	const hold = async (keys) => {
 		for (const k of [...held]) if (!keys.includes(k)) (await page.keyboard.up(k), held.delete(k));

@@ -11,11 +11,16 @@
  * Walking through a doorway, the room hands the player to the next room
  * (`Handoff`), and the SDK reconnects there with the transfer ticket.
  *
+ * One continuous world: room `(x, y)` sits at world `(x, y) × ROOM_SIZE`
+ * and entity positions are room-local, so `worldOf` places anything from
+ * any room (the doorway arrival is the same world point, see
+ * `game_sim::mobpit`).
+ *
  * Event flow of one kill: `kill` (broadcast, the tick the mob dies — the
  * fact is only *queued*) → `saved` (to the killer, when the durable cell
  * commit settled) → `profile`.
  */
-import type { GameSocketFactory } from '@hops-ops/distributed/game';
+import type { EntityFields, GameSocketFactory, RenderedEntity } from '@hops-ops/distributed/game';
 
 import * as pit from '../generated/mobpit/index.ts';
 import type { DevApi } from '../shared/dev-api.ts';
@@ -27,6 +32,34 @@ export const DEFAULT_ZONE = 'pit.0.0';
 export function parseRoom(zone: string): [number, number] | undefined {
 	const m = /^pit\.(-?\d+)\.(-?\d+)$/.exec(zone);
 	return m === null ? undefined : [Number(m[1]), Number(m[2])];
+}
+
+/** Room edge length (m): room `(x, y)` is centred at world `(x, y) × ROOM_SIZE`. */
+export const ROOM_SIZE = pit.PIT_WORLD.roomSize;
+
+/** World position (m) of a room-local point of `zone` (undefined for a non-room zone). */
+export function toWorldXY(zone: string, x: number, y: number): { x: number; y: number } | undefined {
+	const room = parseRoom(zone);
+	return room === undefined ? undefined : { x: room[0] * ROOM_SIZE + x, y: room[1] * ROOM_SIZE + y };
+}
+
+/** World position (m) of a rendered entity (every Mob Pit kind has local `x` / `y`). */
+export function worldOf(entity: RenderedEntity): { x: number; y: number } | undefined {
+	const { x, y } = entity.fields as { x?: unknown; y?: unknown };
+	return typeof x === 'number' && typeof y === 'number' ? toWorldXY(entity.zoneId, x, y) : undefined;
+}
+
+/**
+ * The own player's predicted fields re-expressed in the next room's frame
+ * (the same world point): lets the SDK keep predicting through a doorway
+ * handoff instead of holding the player still (`handoffFrame`).
+ */
+export function pitHandoffFrame(fields: EntityFields, from: string, to: string): EntityFields | undefined {
+	const a = parseRoom(from);
+	const b = parseRoom(to);
+	const { x, y } = fields as { x?: unknown; y?: unknown };
+	if (a === undefined || b === undefined || typeof x !== 'number' || typeof y !== 'number') return undefined;
+	return { ...fields, x: x + (a[0] - b[0]) * ROOM_SIZE, y: y + (a[1] - b[1]) * ROOM_SIZE };
 }
 
 /** `[x, y]` → `pit.<x>.<y>`. */
@@ -124,6 +157,10 @@ export type MobPitClient = pit.MobpitClient &
 		profile(): pit.Profile | undefined;
 		/** The room the player is in (authority zone). */
 		room(): string | undefined;
+		/** The own player as rendered now (predicted; held through a handoff). */
+		me(): RenderedEntity | undefined;
+		/** World position (m) of the own player as rendered now. */
+		position(): { x: number; y: number } | undefined;
 		/** Kills by me whose fact has not settled yet (key → event). */
 		unsaved: ReadonlyMap<string, pit.KillEvent>;
 		/** The rooms' generated contents (the Rust generator as WASM). */
@@ -145,8 +182,10 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
 		pingIntervalMs: 500,
-		inputDtMs: 1000 / 30
-		// Prediction: the generated default, `pit_step` compiled to WASM.
+		inputDtMs: 1000 / 30,
+		// Prediction: the generated default, `pit_step` compiled to WASM,
+		// carried on through doorways in the next room's frame.
+		prediction: { handoffFrame: pitHandoffFrame }
 	});
 	const hello = latest<pit.HelloEvent>(
 		(h) => typed.on('hello', h),
@@ -159,11 +198,23 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 	});
 	typed.on('saved', (saved) => unsaved.delete(saved.key));
 	const pures = pit.createMobpitPures();
+	// The own player: the predicted entity, or (mid-handoff) the SDK's
+	// bridge, the last predicted state in the room just left.
+	const me = () => {
+		const id = hello.get()?.entity;
+		const rendered = typed.client.render().filter((e) => pit.isPlayer(e));
+		return rendered.find((e) => e.predicted) ?? rendered.find((e) => e.id === id && e.zoneId === typed.client.authority?.zoneId) ?? rendered.find((e) => e.id === id);
+	};
 	return {
 		...typed,
 		hello: hello.get,
 		profile: profile.get,
 		room: () => typed.client.authority?.zoneId,
+		me,
+		position: () => {
+			const entity = me();
+			return entity === undefined ? undefined : worldOf(entity);
+		},
 		unsaved,
 		pures,
 		ready: Promise.all([hello.ready, typed.prediction?.ready, pures.ready]).then(([h]) => h)

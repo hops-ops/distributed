@@ -4,7 +4,7 @@
 	import Leaderboard from '$lib/pit/Leaderboard.svelte';
 	import MyStats from '$lib/pit/MyStats.svelte';
 	import Rooms from '$lib/pit/Rooms.svelte';
-	import { startPitLoop } from '$lib/pit/loop';
+	import { pitHandoffFrame, startPitLoop } from '$lib/pit/loop';
 
 	let { data } = $props();
 
@@ -19,7 +19,9 @@
 				url: (zone) => `${data.roomsUrls[entry++ % data.roomsUrls.length]}/rooms/${encodeURIComponent(zone)}`,
 				ticket: gameTicketSource(),
 				pingIntervalMs: 500,
-				inputDtMs: 1000 / 30
+				inputDtMs: 1000 / 30,
+				// One continuous world: keep predicting through doorways.
+				prediction: { handoffFrame: pitHandoffFrame }
 			}),
 		{ zone: () => data.zone, events: EVENTS }
 	);

@@ -12,10 +12,13 @@
 //!
 //! The room's mobs come from its seeded layout ([`pit_room`]: tiers and
 //! homes); the rest of a room is the Arena floor with a doorway in the
-//! middle of each wall. Pushing through a doorway hands the player to the
-//! neighbouring room ([`Ctx::handoff`], carrying where along the wall it
-//! went through); the client follows the Handoff to the next room's zone,
-//! wherever it runs.
+//! middle of each wall. The rooms tile one continuous world (room `(x, y)`
+//! at `(x, y) × ROOM_SIZE`): a doorway is a passage the predicted step walks
+//! through, and a player [`HYSTERESIS`](game_sim::mobpit::HYSTERESIS) past
+//! the wall line is handed to the neighbouring room ([`Ctx::handoff`],
+//! carrying its [`MoveState`] in the neighbour's frame: the same world
+//! point and velocity); the client follows the Handoff to the next room's
+//! zone, wherever it runs, and draws it where it always was.
 //!
 //! Mob state machine (deterministic, zone RNG only for wander targets):
 //! `idle` (wander near home) → `chase` (living player within aggro radius or
@@ -46,7 +49,8 @@ use distributed_game::{
 };
 use game_sim::arena::{self as movement, MoveState, PILLARS, PLAYER_RADIUS};
 use game_sim::mobpit::{
-    arrival, doorway, parse_room, pit_room, pit_world, room_zone, PitRoomContext, PitRoomFn,
+    self as rooms, admissible, crossing, into_neighbour, parse_room, pit_room, pit_world,
+    room_zone, PitRoomContext, PitRoomFn,
 };
 use mobpit_crawler::{level_floor, KillReceipt, RecordKillInput};
 use serde::{Deserialize, Serialize};
@@ -61,13 +65,13 @@ pub const PIT_ENTITY: EntityId = EntityId(900);
 #[derive(Debug, Clone, PartialEq, Replicated)]
 #[replicated(kind = "player", id = 1, priority = 2.0, of = Player)]
 pub struct PlayerView {
-    /// Position x.
-    #[field_type(movement::POS)]
+    /// Position x (room-local; past ±HALF in a doorway passage).
+    #[field_type(rooms::POS)]
     #[correct(ease = 150)]
     #[from(state.x)]
     pub x: f32,
     /// Position y.
-    #[field_type(movement::POS)]
+    #[field_type(rooms::POS)]
     #[correct(ease = 150)]
     #[from(state.y)]
     pub y: f32,
@@ -454,8 +458,8 @@ struct Player {
     dead_until: Option<u64>,
     level: u32,
     regen: u8,
-    /// Stick of the last input (doorways need the push direction).
-    stick: (i8, i8),
+    /// Handed to a neighbouring room: no more steps here.
+    leaving: bool,
 }
 
 struct PendingKill {
@@ -522,6 +526,15 @@ pub struct MobPit {
     tick: u64,
 }
 
+fn spawn_state(player: PlayerId) -> MoveState {
+    let (x, y) = spawn_point(player);
+    MoveState {
+        x,
+        y,
+        ..MoveState::default()
+    }
+}
+
 fn spawn_point(player: PlayerId) -> (f32, f32) {
     const SPOTS: [(f32, f32); 6] = [
         (-4.5, -4.5),
@@ -565,22 +578,32 @@ fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
 }
 
-/// Carried through a doorway: the room offset it came from and where along
-/// the wall it went through.
-fn encode_carried(from: (i32, i32), along: f32) -> Vec<u8> {
-    let mut out = vec![from.0 as i8 as u8, from.1 as i8 as u8];
-    out.extend_from_slice(&along.to_le_bytes());
+/// Carried through a doorway: the player's [`MoveState`] in the
+/// neighbour's frame (x y vx vy as f32 LE, dash, cd).
+fn encode_carried(s: &MoveState) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18);
+    for v in [s.x, s.y, s.vx, s.vy] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&[s.dash, s.cd]);
     out
 }
 
-fn decode_carried(bytes: &[u8]) -> Option<((i32, i32), f32)> {
-    let [dx, dy, a, b, c, d] = bytes else {
+/// Inverse of [`encode_carried`]; None unless it is a place a player can be.
+fn decode_carried(bytes: &[u8]) -> Option<MoveState> {
+    if bytes.len() != 18 {
         return None;
+    }
+    let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
+    let state = MoveState {
+        x: f(0),
+        y: f(1),
+        vx: f(2),
+        vy: f(3),
+        dash: bytes[16],
+        cd: bytes[17],
     };
-    Some((
-        (i32::from(*dx as i8), i32::from(*dy as i8)),
-        f32::from_le_bytes([*a, *b, *c, *d]),
-    ))
+    admissible(&state).then(|| rooms::canonicalize(state))
 }
 
 impl MobPit {
@@ -692,6 +715,9 @@ impl MobPit {
                 }
                 continue;
             }
+            if p.leaving {
+                continue;
+            }
             while p.credits > 0 {
                 let Some(input) = ctx.take_inputs(*id, ConsumePolicy::Next).pop() else {
                     break;
@@ -700,7 +726,6 @@ impl MobPit {
                 // The declared predicted step: what the client runs as WASM.
                 p.state = pit_step(&p.state, &input, &(), movement::DT);
                 p.credits -= 1;
-                p.stick = (input.mx, input.my);
                 let (sx, sy) = (f32::from(input.mx), f32::from(input.my));
                 if sx * sx + sy * sy > 20.0 * 20.0 {
                     p.face = sy.atan2(sx);
@@ -709,6 +734,10 @@ impl MobPit {
                     p.swing_cd = SWING_COOLDOWN;
                     p.swing_anim = SWING_FRAMES;
                     swings.push((*id, p.state.x, p.state.y, p.face));
+                }
+                // Past a wall line: the neighbour takes the rest.
+                if crossing(p.state.x, p.state.y).is_some() {
+                    break;
                 }
             }
             p.regen = p.regen.wrapping_add(1);
@@ -720,27 +749,30 @@ impl MobPit {
         swings
     }
 
-    /// Players pushing through a doorway move to the neighbouring room.
+    /// Players past a wall line (through a doorway passage) move to the
+    /// neighbouring room, at the same world point.
     fn walk_through_doorways(&mut self, ctx: &mut Ctx<'_, Self>) {
         let (rx, ry) = self.room.room;
-        let leaving: Vec<(PlayerId, (i32, i32), f32)> = self
+        let crossing_now: Vec<(PlayerId, (i32, i32))> = self
             .players
             .iter()
-            .filter(|(_, p)| p.dead_until.is_none())
-            .filter_map(|(id, p)| {
-                let step = doorway(p.state.x, p.state.y, p.stick.0, p.stick.1)?;
-                let along = if step.0 != 0 { p.state.y } else { p.state.x };
-                Some((*id, step, along))
-            })
+            .filter(|(_, p)| p.dead_until.is_none() && !p.leaving)
+            .filter_map(|(id, p)| Some((*id, crossing(p.state.x, p.state.y)?)))
             .collect();
-        for (player, (dx, dy), along) in leaving {
+        for (player, (dx, dy)) in crossing_now {
             let target = room_zone((rx + dx, ry + dy));
-            if parse_room(&target).is_none() {
-                continue;
+            let p = self.players.get_mut(&player).expect("player");
+            let carried = encode_carried(&into_neighbour((dx, dy), p.state));
+            if parse_room(&target).is_some() && ctx.handoff(player, &target, carried).is_ok() {
+                p.leaving = true;
+            } else {
+                // The edge of the world: back inside the wall line.
+                let line = movement::HALF - PLAYER_RADIUS;
+                p.state.x = p.state.x.clamp(-line, line);
+                p.state.y = p.state.y.clamp(-line, line);
+                p.state.vx = 0.0;
+                p.state.vy = 0.0;
             }
-            // The neighbour sees where it came from (the opposite side).
-            let carried = encode_carried((-dx, -dy), along);
-            let _ = ctx.handoff(player, &target, carried);
         }
     }
 
@@ -943,7 +975,7 @@ impl MobPit {
     }
 
     /// Admit `player` at `(x, y)` and greet it.
-    fn admit(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId, (x, y): (f32, f32)) {
+    fn admit(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId, state: MoveState) {
         let (principal, name) = ctx
             .player(player)
             .map(|p| {
@@ -960,11 +992,7 @@ impl MobPit {
                 id: entity,
                 principal,
                 name,
-                state: MoveState {
-                    x,
-                    y,
-                    ..MoveState::default()
-                },
+                state,
                 credits: MAX_CREDITS,
                 hp: PLAYER_HP,
                 face: 0.0,
@@ -973,10 +1001,10 @@ impl MobPit {
                 dead_until: None,
                 level: 1,
                 regen: 0,
-                stick: (0, 0),
+                leaving: false,
             },
         );
-        ctx.set_view(player, View::new(x, y, VIEW_RADIUS));
+        ctx.set_view(player, View::new(state.x, state.y, VIEW_RADIUS));
         ctx.send(
             player,
             &PitEvent::Hello {
@@ -1061,7 +1089,7 @@ impl Zone for MobPit {
     }
 
     fn on_join(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
-        self.admit(ctx, player, spawn_point(player));
+        self.admit(ctx, player, spawn_state(player));
     }
 
     fn on_handoff_join(
@@ -1071,9 +1099,7 @@ impl Zone for MobPit {
         _from_zone: &str,
         carried: Vec<u8>,
     ) {
-        let at = decode_carried(&carried)
-            .map(|(from, along)| arrival(from, along))
-            .unwrap_or_else(|| spawn_point(player));
+        let at = decode_carried(&carried).unwrap_or_else(|| spawn_state(player));
         // Still here inside its reconnect grace (a doorway bounce): replace.
         self.players.remove(&player);
         self.admit(ctx, player, at);

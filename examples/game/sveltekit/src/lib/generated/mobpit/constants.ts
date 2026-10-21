@@ -21,6 +21,9 @@ export const PIT_WORLD: PitWorld = {
 	defaultSeed: 186474221,
 	half: 20,
 	doorHalf: 2.5,
+	roomSize: 40,
+	passage: 2,
+	hysteresis: 0.5,
 	maxRoom: 1000000,
 	biomes: ['highlands', 'steppe', 'forest', 'meadow']
 };

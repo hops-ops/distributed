@@ -5,7 +5,8 @@
  *
  * join the entrance room → profile read from the celld Crawler cell → kill
  * a mob → the fact settles ("saved") with server-decided XP → walk through
- * a doorway into the next room → the left room goes dormant, then
+ * a doorway into the next room, continuously (one world: the own world
+ * position never jumps across the handoff) → the left room goes dormant, then
  * hibernated (zone status read model) → walk back → the room wakes from its
  * snapshot with the mobs killed there still dead → restart the services:
  * the profile is still there.
@@ -17,9 +18,23 @@ import { isMob, isPit, pitFields } from '../src/generated/mobpit/index.ts';
 import { createMobPitClient, MobPitApi } from '../src/mobpit/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
 import { eventually, memoryStorage, until } from './helpers/demo-server.mjs';
-import { hunt, startPit, walkThroughDoor } from './helpers/mobpit.mjs';
+import { hunt, largestStep, startPit, walkThroughDoor } from './helpers/mobpit.mjs';
 
 const XP = new Set([10, 25, 60]);
+/** One 30 Hz command frame of walking (5 m/s ≈ 0.167 m) plus float slack. */
+const STEP = 0.2;
+
+/** The own world position across a doorway: from room `a` into room `b`, never more than a step at once. */
+function assertContinuous(trace, a, b) {
+	const last = trace.findLast((s) => s.room === a);
+	const first = trace.find((s) => s.room === b && s.predicted);
+	assert.ok(last && first, `trace covers ${a} → ${b}`);
+	// Room-local positions would be a whole room (40 m) apart.
+	const across = Math.hypot(first.x - last.x, first.y - last.y);
+	console.error(`doorway ${a} → ${b}: ${across.toFixed(3)} m across, largest step ${largestStep(trace).toFixed(3)} m, ${trace.length} samples`);
+	assert.ok(across <= STEP, `${a} → ${b}: ${JSON.stringify(last)} → ${JSON.stringify(first)} (${across.toFixed(3)} m)`);
+	assert.ok(largestStep(trace) <= STEP, `largest step ${largestStep(trace).toFixed(3)} m`);
+}
 
 test('rooms on celld: kills settle, doorways hand over, left rooms sleep and restore', { timeout: 600_000 }, async () => {
 	const storage = memoryStorage();
@@ -58,9 +73,11 @@ test('rooms on celld: kills settle, doorways hand over, left rooms sleep and res
 		await until(() => (pitStats()?.kills ?? 0) >= kills.length, 5_000, 'room kill count');
 		const roomKills = pitStats().kills;
 
-		// Through the east doorway: the room hands the player to pit.1.0.
-		const next = await walkThroughDoor(pit, [1, 0]);
-		assert.equal(next, 'pit.1.0');
+		// Through the east doorway: the room hands the player to pit.1.0,
+		// at the same world point (no jump, no slide back across the room).
+		const east = await walkThroughDoor(pit, [1, 0]);
+		assert.equal(east.room, 'pit.1.0');
+		assertContinuous(east.trace, 'pit.0.0', 'pit.1.0');
 		await until(() => pit.hello()?.roomX === 1, 10_000, 'hello of the next room');
 		// The left room empties: dormant, then hibernated.
 		const status = async (zone) => (await pitApi.rooms()).rooms.find((r) => r.zone === zone)?.status;
@@ -69,7 +86,9 @@ test('rooms on celld: kills settle, doorways hand over, left rooms sleep and res
 		assert.equal(await status('pit.1.0'), 'active');
 
 		// Back west: the room wakes from its snapshot, the dead stay dead.
-		assert.equal(await walkThroughDoor(pit, [-1, 0]), 'pit.0.0');
+		const west = await walkThroughDoor(pit, [-1, 0]);
+		assert.equal(west.room, 'pit.0.0');
+		assertContinuous(west.trace, 'pit.1.0', 'pit.0.0');
 		await until(() => pit.hello()?.roomX === 0, 10_000, 'hello of the entrance again');
 		assert.equal(pit.hello().restored, true, 'restored from hibernation');
 		assert.equal(pit.hello().roomKills, roomKills);

@@ -55,6 +55,9 @@ export interface PitWorld {
 	readonly defaultSeed: number;
 	readonly half: number;
 	readonly doorHalf: number;
+	readonly roomSize: number;
+	readonly passage: number;
+	readonly hysteresis: number;
 	readonly maxRoom: number;
 	readonly biomes: readonly string[];
 }

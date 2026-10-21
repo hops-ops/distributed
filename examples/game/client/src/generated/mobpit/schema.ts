@@ -15,9 +15,9 @@ export type KindName = keyof typeof KIND;
 
 /** `player` (kind 1, priority 2). */
 export interface PlayerFields {
-	/** `quant [-20, 19.999847] / 18 bits` */
+	/** `quant [-22, 21.999832] / 18 bits` */
 	readonly x: number;
-	/** `quant [-20, 19.999847] / 18 bits` */
+	/** `quant [-22, 21.999832] / 18 bits` */
 	readonly y: number;
 	/** `quant [-16, 15.9921875] / 12 bits` */
 	readonly vx: number;
@@ -164,8 +164,8 @@ export function pitFields(entity: { readonly fields: EntityFields }): PitFields 
 /** Wire type of every replicated field, by kind and wire field name. */
 export const FIELD_TYPES = {
 	player: {
-		x: { type: 'quant', min: -20, max: 19.999847412109375, bits: 18 },
-		y: { type: 'quant', min: -20, max: 19.999847412109375, bits: 18 },
+		x: { type: 'quant', min: -22, max: 21.999832153320313, bits: 18 },
+		y: { type: 'quant', min: -22, max: 21.999832153320313, bits: 18 },
 		vx: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		vy: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		dash: { type: 'u8' },

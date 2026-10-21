@@ -1,17 +1,23 @@
 //! The room zone on the reference host (`ZoneHost`, manual clock): what a
 //! celld room object runs, without celld.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use distributed_game::protocol::ServerMessage;
 use distributed_game::{
-    ClientId, FactQueue, GameEvent, HostConfig, ManualClock, Outbound, Role, TicketClaims, Viewer,
-    ZoneHost,
+    ClientId, FactQueue, GameEvent, HandoffRequest, HostConfig, ManualClock, Outbound, Role,
+    TicketClaims, Transfer, Viewer, ZoneHost,
 };
 use mobpit_rooms::{encode_bot_input, MobPit, PitEvent, PitInput, RoomConfig, DEFAULT_SEED};
 
+type Issued = Arc<Mutex<Option<HandoffRequest>>>;
+
 fn host(zone: &str, clock: &ManualClock) -> ZoneHost<MobPit> {
+    host_issuing(zone, clock, Issued::default())
+}
+
+fn host_issuing(zone: &str, clock: &ManualClock, issued: Issued) -> ZoneHost<MobPit> {
     let (facts, _script) = FactQueue::scripted(64);
     ZoneHost::<MobPit>::new(
         zone,
@@ -23,7 +29,10 @@ fn host(zone: &str, clock: &ManualClock) -> ZoneHost<MobPit> {
         RoomConfig::for_zone(zone, DEFAULT_SEED).expect("room"),
     )
     .with_facts(facts)
-    .with_transfer_issuer(|request| Some(format!("transfer:{}", request.target_zone)))
+    .with_transfer_issuer(move |request| {
+        *issued.lock().expect("issued") = Some(request.clone());
+        Some(format!("transfer:{}", request.target_zone))
+    })
 }
 
 fn join(host: &mut ZoneHost<MobPit>, who: &str) -> (ClientId, distributed_game::PlayerId) {
@@ -66,7 +75,8 @@ fn hellos(out: &[Outbound]) -> Vec<PitEvent> {
 #[test]
 fn a_room_greets_with_its_coordinates_and_hands_off_through_doorways() {
     let clock = ManualClock::new();
-    let mut room = host("pit.0.0", &clock);
+    let issued = Issued::default();
+    let mut room = host_issuing("pit.0.0", &clock, issued.clone());
     let (client, player) = join(&mut room, "ana");
     let out = tick(&mut room, &clock);
     let hello = hellos(&out);
@@ -82,8 +92,10 @@ fn a_room_greets_with_its_coordinates_and_hands_off_through_doorways() {
     // Walk to the east doorway (beside the pillar on its axis) and push
     // through it, no attack, until the room hands the player over.
     let mut target = None;
+    let mut last = (0.0, 0.0);
     for seq in 1..600u32 {
         let me = room.zone().player_position(player).expect("in the room");
+        last = me;
         let (dx, dy) = (21.0 - me.0, 2.0 - me.1);
         let len = (dx * dx + dy * dy).sqrt().max(1e-3);
         let east = PitInput {
@@ -113,6 +125,41 @@ fn a_room_greets_with_its_coordinates_and_hands_off_through_doorways() {
     assert_eq!(target, "pit.1.0");
     assert_eq!(ticket, "transfer:pit.1.0");
     assert!(room.zone().player_position(player).is_none(), "left");
+    // Through the passage, past the wall line (x = 20) by the hysteresis.
+    assert!(last.0 > 19.5 && last.1.abs() < 2.5, "{last:?}");
+
+    // The neighbour admits the player at the same world point: room 1's
+    // local x is 40 m less (one step further at most).
+    let request = issued
+        .lock()
+        .expect("issued")
+        .take()
+        .expect("handoff request");
+    let mut next = host("pit.1.0", &clock);
+    let claims = TicketClaims::new("ana", "pit.1.0", u64::MAX, "t2", Role::Player).with_name("ana");
+    let transfer = Transfer {
+        claims,
+        source_zone: "pit.0.0".into(),
+        issuer: "test".into(),
+        generation: 0,
+        carried: request.carried,
+        departed_at_ms: 0,
+    };
+    let joined = next.join_transfer(&transfer, 0, "").expect("transfer join");
+    let Viewer::Player(arrived) = joined.viewer else {
+        panic!("player")
+    };
+    let at = next.zone().player_position(arrived).expect("arrived");
+    let world_before = (last.0, last.1);
+    let world_after = (40.0 + at.0, at.1);
+    let moved = ((world_after.0 - world_before.0).powi(2)
+        + (world_after.1 - world_before.1).powi(2))
+    .sqrt();
+    assert!(
+        moved < 0.5,
+        "same world point: {world_before:?} → {world_after:?}"
+    );
+    assert!(at.0 < -19.0, "just inside the west wall of pit.1.0: {at:?}");
 }
 
 #[test]

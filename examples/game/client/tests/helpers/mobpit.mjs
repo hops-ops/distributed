@@ -50,31 +50,49 @@ export async function startPit(demo = 'mobpit', vars = {}) {
 	};
 }
 
-/** Walk to the doorway on side `[dx, dy]` and push through it until the
- * client's authority is another room (one command frame per tick). */
+/**
+ * Walk to the doorway on side `[dx, dy]` and through it (one command frame
+ * per tick) until the client's authority is the next room and the own
+ * player is predicted there again. Returns the new room and the own world
+ * position sampled every frame on the way (`{ t, room, x, y }`).
+ */
 export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000) {
 	const { client } = pit;
 	const from = pit.room();
 	const deadline = Date.now() + timeoutMs;
-	while (pit.room() === from) {
+	const trace = [];
+	const settled = () => pit.room() !== from && pit.me()?.predicted === true && pit.me()?.zoneId === pit.room();
+	for (let after = 0; after < 10; after += settled() ? 1 : 0) {
 		if (Date.now() > deadline) throw new Error(`walk through door ${dx},${dy} timed out`);
-		const rendered = client.render();
-		const meEntity = rendered.find((e) => e.id === pit.hello()?.entity && isPlayer(e) && e.zoneId === from);
-		const me = meEntity && playerFields(meEntity);
+		const me = pit.me();
+		const at = pit.position();
+		if (at !== undefined) trace.push({ t: Date.now(), room: me.zoneId, predicted: me.predicted, ...at });
 		let input = { mx: 0, my: 0, buttons: 0 };
-		if (me !== undefined) {
-			// Beside the pillar on the door's axis, then straight out.
-			const tx = dx !== 0 ? dx * 21 : 2;
-			const ty = dy !== 0 ? dy * 21 : 2;
-			const ddx = tx - me.x;
-			const ddy = ty - me.y;
+		if (at !== undefined) {
+			// Beside the pillar on the door's axis, through the gap, and on
+			// into the next room (world coordinates: the rooms are one world).
+			const [rx, ry] = from.split('.').slice(1).map(Number);
+			const size = 2 * 20;
+			const tx = rx * size + (dx !== 0 ? dx * 24 : 1.7);
+			const ty = ry * size + (dy !== 0 ? dy * 24 : 1.7);
+			const ddx = tx - at.x;
+			const ddy = ty - at.y;
 			const len = Math.max(Math.hypot(ddx, ddy), 1e-3);
 			input = { mx: Math.round((ddx / len) * 127), my: Math.round((ddy / len) * 127), buttons: 0 };
 		}
 		client.sendInput(input);
 		await sleep(1000 / 30);
 	}
-	return pit.room();
+	return { room: pit.room(), trace };
+}
+
+/** Largest move (m) between consecutive samples of a `walkThroughDoor` trace. */
+export function largestStep(trace) {
+	let max = 0;
+	for (let i = 1; i < trace.length; i += 1) {
+		max = Math.max(max, Math.hypot(trace[i].x - trace[i - 1].x, trace[i].y - trace[i - 1].y));
+	}
+	return max;
 }
 
 /** Hunt mobs (one command frame per 30 Hz tick) until `done()` or timeout. */

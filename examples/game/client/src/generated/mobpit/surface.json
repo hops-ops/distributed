@@ -53,7 +53,10 @@
         "default_seed": 186474221,
         "door_half": 2.5,
         "half": 20.0,
-        "max_room": 1000000
+        "hysteresis": 0.5,
+        "max_room": 1000000,
+        "passage": 2.0,
+        "room_size": 40.0
       }
     }
   ],
@@ -330,8 +333,8 @@
           "priority": 1.0,
           "type": {
             "bits": 18,
-            "max": 19.999847,
-            "min": -20.0,
+            "max": 21.999832,
+            "min": -22.0,
             "type": "quant"
           }
         },
@@ -344,8 +347,8 @@
           "priority": 1.0,
           "type": {
             "bits": 18,
-            "max": 19.999847,
-            "min": -20.0,
+            "max": 21.999832,
+            "min": -22.0,
             "type": "quant"
           }
         },
@@ -850,6 +853,24 @@
         },
         {
           "name": "door_half",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "room_size",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "passage",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "hysteresis",
           "type": {
             "type": "f32"
           }
