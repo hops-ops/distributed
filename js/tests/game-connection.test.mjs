@@ -20,7 +20,7 @@ import {
 } from './fixtures/game-harness.mjs';
 
 /** A scripted zone: tickets `t:<zone>:<n>` admit; tokens rotate per Welcome. */
-function scriptedServer(network, { graceTokens = true } = {}) {
+function scriptedServer(network, { graceTokens = true, closeOnError = true } = {}) {
 	const tokens = new Set();
 	let issued = 0;
 	network.onMessage = (conn, message) => {
@@ -28,12 +28,12 @@ function scriptedServer(network, { graceTokens = true } = {}) {
 			if (message.reconnectToken !== '') {
 				if (!graceTokens || !tokens.delete(message.reconnectToken)) {
 					conn.send({ type: 'Error', code: GameErrorCode.RECONNECT_FAILED, message: 'expired' });
-					conn.close(1008);
+					if (closeOnError) conn.close(1008);
 					return;
 				}
 			} else if (!message.ticket.startsWith(`t:${conn.zoneId}`) && !message.ticket.startsWith('transfer:')) {
 				conn.send({ type: 'Error', code: GameErrorCode.UNAUTHORIZED, message: 'bad ticket' });
-				conn.close(1008);
+				if (closeOnError) conn.close(1008);
 				return;
 			}
 			issued += 1;
@@ -213,6 +213,38 @@ test('reconnects with the token inside the grace window, then falls back to a fr
 	assert.equal(conn.state, 'open');
 	assert.equal(welcomes.at(-1).resumed, false);
 	conn.close();
+});
+
+test('a refused Hello ends the attempt even when the server never closes the socket', async () => {
+	// E.g. a restarted zone refusing the old session's token: the error
+	// arrives, the close may not (seen with celld room objects).
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	const tokens = scriptedServer(network, { closeOnError: false });
+	const { conn, tickets } = connection(network, scheduler);
+	await conn.connect();
+	tokens.clear();
+	network.last().close(1006);
+	await scheduler.advance(10);
+	assert.equal(network.last().lastHello.reconnectToken, 'rt-1', 'tried the token');
+	await scheduler.advance(1000);
+	const hello = network.last().lastHello;
+	assert.equal(hello.reconnectToken, '', 'then a fresh ticket');
+	assert.equal(hello.ticket, `t:z1:${tickets.length}`);
+	assert.equal(conn.state, 'open');
+	conn.close();
+
+	// A refused first Hello rejects connect() instead of hanging.
+	const refused = new GameConnection({
+		url: 'ws://game.test/zones/z1',
+		zoneId: 'z1',
+		ticket: () => 'forged',
+		socket: network.factory,
+		scheduler,
+		reconnect: false
+	});
+	await assert.rejects(refused.connect(), /bad ticket|rejected/);
+	assert.equal(refused.state, 'closed');
 });
 
 test('a zone that restarted (close 1012) is rejoined at once with a fresh ticket', async () => {

@@ -585,6 +585,14 @@ export class GameConnection {
 				break;
 			case 'Error':
 				this.#onError(attempt, message);
+				if (!attempt.welcomed && this.#attempt === attempt) {
+					// A refused Hello ends the attempt: nothing else follows it.
+					// Do not wait for the server's close (a host may never send
+					// one, e.g. a restarted zone refusing a void token).
+					this.#attempt = undefined;
+					attempt.socket.close(1000, 'refused');
+					this.#onSocketClosed(attempt, 1008, message.message);
+				}
 				break;
 		}
 	}
