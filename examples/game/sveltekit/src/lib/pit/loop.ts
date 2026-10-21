@@ -122,8 +122,13 @@ function rayCapsule(origin: number[], dir: number[], x: number, y: number, radiu
 	return z >= 0 && z <= height ? entry : undefined;
 }
 
-/** Darkness of the view (0..1): the borough's weather, thicker near a boss room. */
-const WEATHER_DARK = [0.55, 0.4, 0.22, 0.05];
+/**
+ * Darkness at the edge of the view (0..1) per weather, and how far around
+ * the player (metres) it stays clear: the borough's weather, closing in near
+ * a boss room. The player's surroundings are never darkened.
+ */
+const WEATHER_DARK = [0.7, 0.55, 0.3, 0.05];
+const WEATHER_CLEAR_M = [10, 13, 18, 30];
 
 /** Start drawing on `canvas`; returns the stop function. */
 export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions): () => void {
@@ -528,8 +533,15 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 		if (here !== undefined && pures.loaded()) {
 			const world = options.world?.();
 			const near = Math.max(0, 1 - pures.pitRoom({ seed, x: here[0], y: here[1] }).bossDistance / 6);
-			const dark = Math.min(0.85, (WEATHER_DARK[world?.weather ?? 0] ?? 0.55) * (1 + 0.6 * near));
-			ctx.fillStyle = `rgba(8,10,20,${dark.toFixed(3)})`;
+			const weather = world?.weather ?? 0;
+			const dark = Math.min(0.8, (WEATHER_DARK[weather] ?? 0.7) * (1 + 0.15 * near));
+			const clearM = (WEATHER_CLEAR_M[weather] ?? 10) * (1 - 0.4 * near);
+			const inner = clearM * scale;
+			const outer = Math.max(inner + 1, (clearM + 14) * scale);
+			const shade = ctx.createRadialGradient(width / 2, height / 2, inner, width / 2, height / 2, outer);
+			shade.addColorStop(0, 'rgba(8,10,20,0)');
+			shade.addColorStop(1, `rgba(8,10,20,${dark.toFixed(3)})`);
+			ctx.fillStyle = shade;
 			ctx.fillRect(0, 0, width, height);
 			canvas.dataset.dark = dark.toFixed(3);
 		}

@@ -115,35 +115,48 @@ const { scene } = stage;
 // The borough's weather lifts as its bosses fall (storm → rain → clearing →
 // clear); within it, the fog thickens and the light dims the closer the room
 // is to a boss room (`boss_distance`, the shared Rust room generator).
-scene.fogMode = Scene.FOGMODE_EXP2;
-const SKY: Record<string, { clear: string; fog: number; light: number }> = {
-	storm: { clear: '#141821', fog: 0.035, light: 0.35 },
-	rain: { clear: '#2a3442', fog: 0.022, light: 0.55 },
-	clearing: { clear: '#56708c', fog: 0.012, light: 0.8 },
-	clear: { clear: '#8fc3f0', fog: 0.004, light: 1.1 }
+// The fog is linear and starts at the player, not at the camera: whatever the
+// zoom (or first person), the ground around you stays readable and only the
+// distance fades. `clearM` is how far past the player it stays clear, `fadeM`
+// how much further until the fog is solid.
+scene.fogMode = Scene.FOGMODE_LINEAR;
+const SKY: Record<string, { clear: string; clearM: number; fadeM: number; light: number }> = {
+	storm: { clear: '#1c2230', clearM: 12, fadeM: 34, light: 0.7 },
+	rain: { clear: '#2e3a4a', clearM: 16, fadeM: 40, light: 0.8 },
+	clearing: { clear: '#56708c', clearM: 24, fadeM: 50, light: 0.95 },
+	clear: { clear: '#8fc3f0', clearM: 36, fadeM: 70, light: 1.1 }
 };
 const lights = scene.lights.map((l) => ({ light: l, base: l.intensity }));
 /** Light tint per biome (highlands, steppe, forest, meadow). */
 const BIOME_LIGHT = ['#d6dcea', '#ffe1b3', '#b9dfb4', '#eaf6cf'];
 /** Fog and darkness of the current room: its borough's weather × closeness to a boss. */
-function roomSky(): { clear: string; fog: number; light: number; near: number } {
+function roomSky(): { clear: string; clearM: number; fadeM: number; light: number; near: number } {
 	const sky = SKY[WEATHER[pit.world()?.weather ?? 0] ?? 'storm'] ?? SKY.storm!;
 	const here = parseRoom(pit.room() ?? DEFAULT_ZONE);
 	const seed = pit.hello()?.seed ?? PIT_WORLD.defaultSeed;
 	const distance = here !== undefined && pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: here[0], y: here[1] }).bossDistance : 6;
-	// 1 in a boss room, 0 six rooms away.
+	// 1 in a boss room, 0 six rooms away. Near a boss the fog closes in to
+	// half the distance and the light drops by a fifth, never to black.
 	const near = Math.max(0, 1 - distance / 6);
-	return { clear: sky.clear, fog: sky.fog * (1 + 2 * near), light: sky.light * (1 - 0.45 * near), near };
+	const close = 1 - 0.5 * near;
+	return { clear: sky.clear, clearM: sky.clearM * close, fadeM: sky.fadeM * close, light: sky.light * (1 - 0.2 * near), near };
 }
+let fogClearM = SKY.storm!.clearM;
+let fogFadeM = SKY.storm!.fadeM;
 function applySky(dtMs: number): void {
 	const target = roomSky();
-	const want = Color4.FromHexString(`${target.clear}ff`).scale(1 - 0.5 * target.near);
+	const want = Color4.FromHexString(`${target.clear}ff`).scale(1 - 0.25 * target.near);
 	const k = 1 - Math.exp(-dtMs / 600);
 	scene.clearColor = Color4.Lerp(scene.clearColor, new Color4(want.r, want.g, want.b, 1), k);
 	scene.fogColor = new Color3(scene.clearColor.r, scene.clearColor.g, scene.clearColor.b);
-	scene.fogDensity += (target.fog - scene.fogDensity) * k;
+	fogClearM += (target.clearM - fogClearM) * k;
+	fogFadeM += (target.fadeM - fogFadeM) * k;
+	// Measured from the camera, so offset by the camera's distance to the player.
+	const toPlayer = stage.view() === 'first' ? 0 : stage.camera.radius;
+	scene.fogStart = toPlayer + fogClearM;
+	scene.fogEnd = scene.fogStart + fogFadeM;
 	const storm = (pit.world()?.weather ?? 0) === 0;
-	const flash = storm && Math.random() < 0.004 ? 2.5 : 1;
+	const flash = storm && Math.random() < 0.004 ? 1.8 : 1;
 	for (const { light, base } of lights) light.intensity += (base * target.light * flash - light.intensity) * Math.min(1, k * (flash > 1 ? 20 : 1));
 	// The room's biome tints the light.
 	const here = parseRoom(pit.room() ?? DEFAULT_ZONE);
@@ -152,7 +165,7 @@ function applySky(dtMs: number): void {
 		const tint = Color3.FromHexString(BIOME_LIGHT[pit.pures.pitRoom({ seed, x: here[0], y: here[1] }).biome] ?? '#ffffff');
 		for (const { light } of lights) light.diffuse = Color3.Lerp(light.diffuse, tint, k);
 	}
-	canvas.dataset.fog = scene.fogDensity.toFixed(4);
+	canvas.dataset.fog = `${fogClearM.toFixed(1)}/${fogFadeM.toFixed(1)}`;
 }
 
 const hud = new Hud({
