@@ -575,3 +575,38 @@ async fn live_boards_follow_a_projector_in_another_process_over_the_bus() {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }
+
+#[test]
+fn an_application_manifest_carries_and_validates_its_leaderboards() {
+    let spec = distributed::SurfaceSpec::from_surface("boards", &surfaces()).unwrap();
+    assert_eq!(spec.leaderboards.len(), 2);
+    let built = distributed::Application::new("boards")
+        .surface(spec.clone())
+        .build()
+        .expect("a surface with leaderboards validates");
+    let json = serde_json::to_value(built.manifest()).unwrap();
+    assert!(json.to_string().contains("\"leaderboards\""));
+
+    // Tampering with the leaderboard section breaks the contract identity.
+    let mut tampered = spec;
+    tampered.leaderboards.pop();
+    assert!(distributed::Application::new("boards")
+        .surface(tampered)
+        .build()
+        .is_err());
+
+    // Without leaderboards the section is absent (existing manifests keep
+    // their bytes).
+    let plain = distributed::SurfaceSpec::from_surface(
+        "plain",
+        &build_surface(
+            &distributed::ReadModelCatalog::new("plain").tables,
+            &SurfaceOptions::sqlite(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(!serde_json::to_string(&plain)
+        .unwrap()
+        .contains("leaderboards"));
+}
