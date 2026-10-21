@@ -265,8 +265,10 @@ and `vite dev` on `SVELTEKIT_PORT` (default 5573). What each piece replaces:
   path: `createGameTicketHandler({ secret, getSession: (e) =>
   e.locals.auth(), zone })`, exported as `POST` from
   `routes/api/game/ticket/+server.ts`. The principal comes from the session,
-  the room from the server: the entrance `pit.0.0`, or the room a client
-  rejoins (after a room restart closed its socket with 1012); moving
+  the room from the server: on a page load the room the player was last
+  in (its presence cell on celld, read with `CELLD_URL` /
+  `DISTRIBUTED_INTERNAL_SECRET`), else the entrance `pit.0.0`; or the room
+  a client rejoins (after a room restart closed its socket with 1012); moving
   through doorways needs no ticket from here (the room signs a transfer
   ticket). A body naming a principal is refused (400), something that is
   not a room gets 409, another origin 403, no session 401. The page's
@@ -513,6 +515,19 @@ show a red **telegraph ring** that fills for 0.8 s, then hit everyone
 inside it. Grunts (green, 10 XP), brutes (purple, 25 XP) and elites (red,
 60 XP) respawn 4 s after dying. Level `n` starts at `40·(n−1)²` XP.
 
+**Coming back.** The same browser is the same player (the dev guest token
+is kept in `localStorage`; `?player=<label>` gives one browser several
+guests, `?zone=` forces a room). A page load asks `/dev/mobpit/start` for
+the room you were last in — the presence cell, written from the rooms'
+verified lifecycle facts — and you are back where you stood: a reload
+inside the reconnect grace takes over the same body (`on_rejoin` keeps it
+and re-greets the page; a network drop resumes it with the reconnect
+token), and a room keeps the place and HP of every player whose slot ended
+(closed page, grace expired) and of the connected ones in its snapshot, so
+it survives the room sleeping, the services restarting and celld
+restarting (the last periodic snapshot). XP, level and kills come from
+your Crawler cell. Tested by `client/tests/mobpit-restarts-headless.test.mjs`.
+
 **Rooms.** What a room holds — its biome (the Endless Grid's seeded noise),
 danger (grows with the distance from `pit.0.0`) and 6–12 mobs with their
 tiers and homes — is `game_sim::mobpit::pit_room(seed, x, y)`, a
@@ -708,7 +723,9 @@ over the hosts, `cluster_server`, optional dev routes), uses
   stay the same guest. Unknown fields (e.g. `principal`) are rejected.
 - `/dev/netsim` changes the simulation for every connection on the server.
 - The ticket secret is random per process unless `DISTRIBUTED_GAME_SECRET`
-  is set (needed to point `game-bots` at a running demo).
+  is set (needed to point `game-bots` at a running demo). `run.sh` sets it
+  from `.data/<demo>/dev-ticket-secret` (Mob Pit: `MOBPIT_DATA_DIR`), kept
+  across runs so a returning browser's guest token still verifies.
 - The SvelteKit demo uses no `/dev/*` route: its tickets are minted by the
   SvelteKit server from the Auth.js session, and its read model is
   `mobpit-service`, so `run.sh sveltekit` and the smoke test start the zone

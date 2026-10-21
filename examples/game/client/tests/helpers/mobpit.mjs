@@ -20,7 +20,8 @@ export function tempDataDir() {
  * celld (rooms + cells) + `game-demos <demo>` (mobpit / leaderboard: the
  * services) on a fixed port that celld's outbox relay targets.
  * `roomsUrl` is where rooms are (celld). `restart()` restarts only the
- * services (same port, data dir and cells); `stop()` stops both.
+ * services (same port, data dir and cells); `restartCelld()` kills celld
+ * and starts it again on its state (rooms, cells); `stop()` stops both.
  */
 export async function startPit(demo = 'mobpit', vars = {}) {
 	const port = await freePort();
@@ -43,6 +44,7 @@ export async function startPit(demo = 'mobpit', vars = {}) {
 			await server.stop();
 			server = await startDemo(demo, { env, port });
 		},
+		restartCelld: () => celld.restart(),
 		async stop() {
 			await server.stop();
 			await celld.stop();

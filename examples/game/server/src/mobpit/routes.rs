@@ -6,6 +6,10 @@
 //!   rooms' ticket secret (see `crate::common::dev` for the fields). Only
 //!   `pit.<x>.<y>` rooms. A real game mints tickets from its sign-in (the
 //!   SvelteKit demo does).
+//! - `POST /dev/mobpit/start` `{guest?}` → `{zone, resumed}`: the room a
+//!   returning guest starts in — its last room from its presence cell (the
+//!   host's verified lifecycle facts), else the entrance. The guest token is
+//!   verified like `/dev/ticket`'s; the caller never names a principal.
 //! - `GET /dev/mobpit/rooms` — every known room's status (`active` /
 //!   `dormant` / `hibernated`, players, restored, debug node), the
 //!   `zone_status` read model projected from the rooms' activity cells.
@@ -56,6 +60,7 @@ struct Dev {
 pub fn routes(world: Arc<MobPitWorld>, key: TicketKey) -> Router {
     Router::new()
         .route("/dev/ticket", post(ticket))
+        .route("/dev/mobpit/start", post(start))
         .route("/dev/mobpit/rooms", get(rooms))
         .route("/dev/mobpit/stats", get(stats))
         .route("/dev/mobpit/crawlers", get(crawlers))
@@ -110,6 +115,30 @@ async fn ticket(
         name,
         zone: request.zone,
         expires_at,
+    }))
+}
+
+/// `POST /dev/mobpit/start` body.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartRequest {
+    /// Guest token from an earlier `/dev/ticket` response.
+    #[serde(default)]
+    guest: Option<String>,
+}
+
+async fn start(State(dev): State<Dev>, Json(request): Json<StartRequest>) -> Json<Value> {
+    let principal = request
+        .guest
+        .as_deref()
+        .and_then(|token| guests::verify_guest_token(&dev.key, token));
+    let last = match principal {
+        Some(principal) => dev.world.last_room(&principal).await,
+        None => None,
+    };
+    Json(json!({
+        "resumed": last.is_some(),
+        "zone": last.unwrap_or_else(|| mobpit_rooms::ENTRANCE.to_string()),
     }))
 }
 

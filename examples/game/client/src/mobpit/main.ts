@@ -69,7 +69,8 @@ const { attackRange, attackHalfAngle: SWING_HALF, swingFrames: SWING_FRAMES } = 
 const ATTACK_REACH = attackRange + PLAYER_RADIUS;
 
 const params = new URLSearchParams(location.search);
-const zone = params.get('zone') ?? DEFAULT_ZONE;
+/** `?zone=` forces a room; otherwise you start where you last were (`/dev/mobpit/start`). */
+const forcedZone = params.get('zone') ?? undefined;
 const storedName = (() => {
 	try {
 		return localStorage.getItem('game-demos.name') ?? undefined;
@@ -247,7 +248,7 @@ for (const [tier, t] of Object.entries(TIERS)) tierMats.set(Number(tier), materi
 // The stage's single floor and walls give way to one chunk per room.
 for (const mesh of [...scene.meshes]) if (mesh.name === 'floor' || mesh.name === 'wall') mesh.dispose();
 type Room = readonly [number, number];
-let origin: Room = parseRoom(zone) ?? [0, 0];
+let origin: Room = parseRoom(forcedZone ?? DEFAULT_ZONE) ?? [0, 0];
 
 /** Scene position of a room-local point of room `room`. */
 function place(room: Room, x: number, y: number, height = 0): Vector3 {
@@ -719,4 +720,9 @@ declare global {
 }
 window.mobpit = { client, api, pitApi, pit, scene, rooms, boards, camera: stage.camera, origin: () => origin };
 
-client.connect(zone).catch((error: unknown) => hud.row('Status', `failed: ${String(error)}`));
+// The same browser is the same player: back in the room you were last in.
+(async () => {
+	const zone = forcedZone ?? (await pitApi.startRoom(api.guest).catch(() => DEFAULT_ZONE));
+	origin = parseRoom(zone) ?? origin;
+	await client.connect(zone);
+})().catch((error: unknown) => hud.row('Status', `failed: ${String(error)}`));

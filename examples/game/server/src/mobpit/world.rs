@@ -219,6 +219,15 @@ impl MobPitWorld {
         self.board.rebuild(principals, &self.cells).await
     }
 
+    /// The room `principal` was last in (its presence cell: joins,
+    /// handoffs and departures, from the rooms' verified lifecycle facts);
+    /// None when it never played or celld is unreachable.
+    pub async fn last_room(&self, principal: &str) -> Option<String> {
+        let presence = self.cells.presence(principal).await.ok()?;
+        let zone = presence["zone"].as_str()?;
+        mobpit_rooms::parse_room(zone).map(|_| zone.to_string())
+    }
+
     /// Every crawler in the directory: `{principal, name, xp, kills, level}`
     /// (eventually consistent with the cells).
     pub async fn crawlers(&self) -> Result<Vec<Value>, String> {

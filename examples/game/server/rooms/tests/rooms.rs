@@ -209,3 +209,118 @@ fn kills_emit_facts_and_hibernation_keeps_the_mobs() {
         Some(PitEvent::Hello { restored: true, room_kills, .. }) if *room_kills == stats.kills
     ));
 }
+
+/// Walk `player` (client `client`) with `dir` for `frames` ticks.
+fn walk(
+    room: &mut ZoneHost<MobPit>,
+    clock: &ManualClock,
+    client: ClientId,
+    seq: &mut u32,
+    dir: [f32; 2],
+    frames: u32,
+) {
+    for _ in 0..frames {
+        *seq += 1;
+        let input = PitInput {
+            mx: (dir[0] * 127.0) as i8,
+            my: (dir[1] * 127.0) as i8,
+            buttons: 0,
+        };
+        room.push_input(
+            client,
+            *seq,
+            *seq,
+            &distributed_game::GameInput::to_payload(&input),
+        );
+        tick(room, clock);
+    }
+}
+
+fn near(a: (f32, f32), b: (f32, f32)) -> bool {
+    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt() < 0.05
+}
+
+#[test]
+fn a_reload_takes_over_the_same_body() {
+    // A page reload: a fresh ticket while the old connection still holds
+    // the slot (or is inside its reconnect grace).
+    let clock = ManualClock::new();
+    let mut room = host("pit.0.0", &clock);
+    let (client, player) = join(&mut room, "ana");
+    tick(&mut room, &clock);
+    let mut seq = 0;
+    walk(&mut room, &clock, client, &mut seq, [1.0, 0.0], 20);
+    let before = room.zone().player_position(player).expect("in the room");
+    room.disconnect(client, false);
+    tick(&mut room, &clock);
+    let (_, again) = join(&mut room, "ana");
+    assert_eq!(again, player, "same slot");
+    let out = tick(&mut room, &clock);
+    let after = room
+        .zone()
+        .player_position(player)
+        .expect("still in the room");
+    assert!(near(before, after), "same body: {before:?} → {after:?}");
+    assert!(
+        matches!(hellos(&out).first(), Some(PitEvent::Hello { entity, .. }) if *entity == 1000 + player.0),
+        "the new client session is greeted with its own entity"
+    );
+    assert_eq!(room.zone().stats().players, 1);
+}
+
+#[test]
+fn a_player_who_left_comes_back_where_it_stood() {
+    let clock = ManualClock::new();
+    let mut room = host("pit.0.0", &clock);
+    let (client, player) = join(&mut room, "ana");
+    tick(&mut room, &clock);
+    let mut seq = 0;
+    walk(&mut room, &clock, client, &mut seq, [0.0, 1.0], 25);
+    let before = room.zone().player_position(player).expect("in the room");
+    // Gone for good (closed the tab): the slot ends.
+    room.disconnect(client, true);
+    tick(&mut room, &clock);
+    assert!(room.zone().player_position(player).is_none(), "slot gone");
+    let (_, back) = join(&mut room, "ana");
+    tick(&mut room, &clock);
+    let at = room.zone().player_position(back).expect("back");
+    assert!(near(before, at), "where it stood: {before:?} → {at:?}");
+    // Someone else still starts at a spawn point.
+    let (_, other) = join(&mut room, "bo");
+    tick(&mut room, &clock);
+    let theirs = room.zone().player_position(other).expect("bo");
+    assert!(!near(before, theirs));
+}
+
+#[test]
+fn positions_survive_hibernation_and_a_crash_snapshot() {
+    let clock = ManualClock::new();
+    let mut room = host("pit.1.0", &clock);
+    let (ana, ana_player) = join(&mut room, "ana");
+    let (bo, bo_player) = join(&mut room, "bo");
+    tick(&mut room, &clock);
+    let mut seq = 0;
+    walk(&mut room, &clock, ana, &mut seq, [-1.0, 0.5], 20);
+    let mut seq_bo = 0;
+    walk(&mut room, &clock, bo, &mut seq_bo, [0.3, -1.0], 20);
+    let ana_at = room.zone().player_position(ana_player).expect("ana");
+    let bo_at = room.zone().player_position(bo_player).expect("bo");
+    // Ana left before the room slept; Bo was still connected when the
+    // last periodic snapshot was written (the node then crashed).
+    room.disconnect(ana, true);
+    tick(&mut room, &clock);
+    let snapshot = room.hibernate_state().expect("snapshot");
+    let mut woke = host("pit.1.0", &clock);
+    woke.restore(&snapshot, "");
+    let (_, ana_back) = join(&mut woke, "ana");
+    let (_, bo_back) = join(&mut woke, "bo");
+    tick(&mut woke, &clock);
+    let ana_now = woke.zone().player_position(ana_back).expect("ana back");
+    let bo_now = woke.zone().player_position(bo_back).expect("bo back");
+    assert!(near(ana_at, ana_now), "ana: {ana_at:?} → {ana_now:?}");
+    assert!(near(bo_at, bo_now), "bo: {bo_at:?} → {bo_now:?}");
+    // A snapshot written before parking existed still restores.
+    let mut old = host("pit.1.0", &clock);
+    old.restore(br#"{"kills":3,"mobs":[]}"#, "");
+    assert_eq!(old.zone().stats().kills, 3);
+}

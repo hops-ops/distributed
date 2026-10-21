@@ -12,16 +12,43 @@ export function isRoom(zone: string | undefined): zone is string {
 }
 
 /**
+ * The room `principal` was last in, from its presence cell on celld
+ * (`presence/{principal}`: joins, handoffs and departures, written from the
+ * rooms' verified lifecycle facts). Server-only: it uses celld's internal
+ * secret (`CELLD_URL`, `DISTRIBUTED_INTERNAL_SECRET`). Undefined when the
+ * player never played, or celld is not configured or unreachable.
+ */
+export async function lastRoom(principal: string): Promise<string | undefined> {
+	const base = env.CELLD_URL;
+	const secret = env.DISTRIBUTED_INTERNAL_SECRET;
+	if (!base || !secret) return undefined;
+	try {
+		const response = await fetch(`${base.replace(/\/$/, '')}/presence/${encodeURIComponent(principal)}`, {
+			headers: { 'x-distributed-internal-secret': secret },
+			signal: AbortSignal.timeout(2000)
+		});
+		if (!response.ok) return undefined;
+		const body = (await response.json()) as { current?: { zone?: unknown } | null };
+		const zone = body.current?.zone;
+		return typeof zone === 'string' && isRoom(zone) ? zone : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Room admission: principal from the Auth.js session, the room chosen here —
- * the entrance for a fresh join; the room the client asks for when it
- * rejoins one (a room that restarted closes sockets with 1012, a reload).
- * Moving between rooms needs no ticket from here: a doorway hands the player
- * over with a transfer ticket the room itself signs.
+ * on a page load the room the player was last in (so a reload, a new tab
+ * or a restart brings you back where you were; the room keeps your place),
+ * else the entrance; the room the client asks for when it rejoins one (a
+ * room that restarted closes sockets with 1012). Moving between rooms needs
+ * no ticket from here: a doorway hands the player over with a transfer
+ * ticket the room itself signs.
  */
 export const tickets = createGameTicketHandler({
 	secret: () => env.GAME_TICKET_SECRET,
 	getSession: (event: RequestEvent) => event.locals.auth(),
-	zone: ({ requested }) => (isRoom(requested) ? requested : ENTRANCE)
+	zone: async ({ requested, principal }) => (isRoom(requested) ? requested : ((await lastRoom(principal)) ?? ENTRANCE))
 });
 
 /**

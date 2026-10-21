@@ -268,6 +268,15 @@ export class MobPitApi {
 		this.roomsBase = roomsBase;
 	}
 
+	/**
+	 * The room a returning guest starts in: its last room (presence cell,
+	 * verified on the server from the guest token), else the entrance.
+	 */
+	async startRoom(guest: string | undefined): Promise<string> {
+		const { zone } = await this.#json<{ zone: string; resumed: boolean }>('/dev/mobpit/start', guest === undefined ? {} : { guest });
+		return parseRoom(zone) === undefined ? DEFAULT_ZONE : zone;
+	}
+
 	/** Every room the zone status read model knows. */
 	rooms(): Promise<{ rooms: RoomStatus[] }> {
 		return this.#json('/dev/mobpit/rooms');

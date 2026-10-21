@@ -11,7 +11,9 @@
  * doorways into other rooms (one on another celld node: the debug overlay
  * shows each room's node) → the room they left goes dormant, then asleep
  * on the live minimap (`zone_activities` @live) → walking back restores it
- * (toast, minimap active) → the SSR HTML after a reload has the settled
+ * (toast, minimap active) → a player who reloads, or closes the browser and
+ * signs in again, is the same player in the same room at the same place →
+ * the SSR HTML after a reload has the settled
  * numbers → no page errors. The leaderboard is the services' Redis XP board,
  * served by mobpit-service's GraphQL board roots (SSR-seeded, `@live` from
  * the board change notices on the bus). Needs REDIS_URL.
@@ -196,6 +198,9 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 			GAME_DEV_AUTH: '1',
 			GAME_TICKET_SECRET: secret,
 			GAME_ZONES_URL: roomsUrls,
+			// The ticket handler reads the player's last room (presence cell).
+			CELLD_URL: celld.env.CELLD_URL,
+			DISTRIBUTED_INTERNAL_SECRET: celld.env.DISTRIBUTED_INTERNAL_SECRET,
 			MOBPIT_API_SIGNING_JWK: keys.signingJwk,
 			MOBPIT_GRAPHQL_URL: GRAPHQL
 		}
@@ -284,7 +289,7 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		await page.keyboard.up('Space');
 
 		// A second signed-in player watches the same leaderboard.
-		const bob = await signIn('bob');
+		let bob = await signIn('bob');
 		await bob.waitForSelector('[data-testid=leaderboard]', { state: 'attached' });
 		assert.equal(await bob.locator('[data-testid=leaderboard] li', { hasText: 'ana' }).count(), 0);
 
@@ -338,6 +343,27 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		const eastNode = await nodeOf(page, 'pit.1.0');
 		assert.equal(await walkThrough(bob, 'north'), 'pit.0.1');
 		const northNode = await nodeOf(bob, 'pit.0.1');
+		// Bob reloads, then closes the browser and signs in again: the same
+		// player, back in pit.0.1 where he stood (the room kept his body
+		// through the reload; the ticket handler chose his last room).
+		const here = (p) => p.evaluate(() => document.querySelector('canvas')?.dataset.me?.split(',').map(Number));
+		const sameSpot = async (p, what, at) => {
+			await p.waitForSelector('[data-testid=zone]:text-is("pit.0.1")', { timeout: 20_000 });
+			await p.waitForSelector('[data-testid=status]:text-is("open")', { timeout: 20_000 });
+			await p.waitForFunction(() => document.querySelector('canvas')?.dataset.me !== undefined, null, { timeout: 10_000 });
+			await p.waitForTimeout(300);
+			const now = await here(p);
+			console.error(`${what}: ${at} → ${now}`);
+			assert.ok(Math.hypot(now[0] - at[0], now[1] - at[1]) < 0.3, `${what}: same place ${at} → ${now}`);
+			assert.equal(await p.textContent('[data-testid=user]'), 'bob');
+		};
+		await bob.waitForTimeout(300);
+		const bobAt = await here(bob);
+		await bob.reload();
+		await sameSpot(bob, 'bob reloads', bobAt);
+		await bob.context().close();
+		bob = await signIn('bob');
+		await sameSpot(bob, 'bob signs in again in a new browser', bobAt);
 		console.error(`rooms: pit.0.0 on ${entranceNode}, pit.1.0 on ${eastNode}, pit.0.1 on ${northNode}`);
 		if (fleet !== null) {
 			assert.ok(fleet.nodes.includes(entranceNode) && fleet.nodes.includes(eastNode), `${entranceNode} ${eastNode}`);

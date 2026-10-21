@@ -38,6 +38,14 @@
 //! state, generation, respawn timer) and the room's kill count; a room that
 //! wakes up restores them ([`Zone::on_restore`]) and tells joining players
 //! ([`PitEvent::Hello::restored`]).
+//!
+//! **Coming back.** A reloaded page (a fresh ticket for a slot its
+//! principal still holds) takes over the same body ([`Zone::on_rejoin`]
+//! re-greets it). When a slot ends (closed page, grace expired, kicked) the
+//! room parks the player's place and HP by verified principal; the
+//! snapshot keeps the parked players and the connected ones, so a fresh
+//! join after the room slept, or after celld restarted, resumes there
+//! instead of at a spawn point. Nothing is written per tick.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
@@ -485,12 +493,32 @@ impl RoomConfig {
     }
 }
 
-/// What a room keeps while it hibernates.
+/// What a room keeps while it hibernates (and in every periodic persist).
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Snapshot {
     kills: u32,
     mobs: Vec<SavedMob>,
+    /// Where each player last stood, by verified principal: the parked
+    /// players and, at the time of the snapshot, the connected ones (so a
+    /// node crash keeps the last persisted position).
+    #[serde(default)]
+    parked: Vec<Parked>,
 }
+
+/// A player's place in a room after its slot ended (closed the page, grace
+/// expired, room restarted): a fresh join of the same principal resumes
+/// there instead of at a spawn point.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Parked {
+    principal: String,
+    x: f32,
+    y: f32,
+    face: f32,
+    hp: i32,
+}
+
+/// Most players a room remembers (oldest forgotten first).
+const MAX_PARKED: usize = 256;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SavedMob {
@@ -524,6 +552,8 @@ pub struct MobPit {
     restored: bool,
     /// The last tick run (hibernation stores timers relative to it).
     tick: u64,
+    /// Players whose slot ended here, oldest first (see [`Parked`]).
+    parked: Vec<Parked>,
 }
 
 fn spawn_state(player: PlayerId) -> MoveState {
@@ -628,6 +658,47 @@ impl MobPit {
             .iter()
             .find(|(_, p)| p.principal == principal)
             .map(|(id, _)| *id)
+    }
+
+    /// Where `player` stands now, unless it is dead or handed off.
+    fn parked_of(player: &Player) -> Option<Parked> {
+        (player.dead_until.is_none() && !player.leaving && !player.principal.is_empty()).then(
+            || Parked {
+                principal: player.principal.clone(),
+                x: player.state.x,
+                y: player.state.y,
+                face: player.face,
+                hp: player.hp,
+            },
+        )
+    }
+
+    /// Remember `parked` (replacing the principal's older entry).
+    fn park(&mut self, parked: Parked) {
+        self.parked.retain(|p| p.principal != parked.principal);
+        if self.parked.len() >= MAX_PARKED {
+            self.parked.remove(0);
+        }
+        self.parked.push(parked);
+    }
+
+    /// Take `principal`'s parked place, if it is still a place a player can
+    /// stand (never trusted blindly: snapshots outlive code changes).
+    fn unpark(&mut self, principal: &str) -> Option<(MoveState, i32, f32)> {
+        let index = self.parked.iter().position(|p| p.principal == principal)?;
+        let parked = self.parked.remove(index);
+        let state = MoveState {
+            x: parked.x,
+            y: parked.y,
+            ..MoveState::default()
+        };
+        (admissible(&state) && parked.face.is_finite()).then(|| {
+            (
+                rooms::canonicalize(state),
+                parked.hp.clamp(1, PLAYER_HP),
+                parked.face,
+            )
+        })
     }
 
     fn emit_kill(&mut self, ctx: &mut Ctx<'_, Self>, killer: PlayerId, mob: usize) {
@@ -974,8 +1045,15 @@ impl MobPit {
         self.last_tick = Some(now);
     }
 
-    /// Admit `player` at `(x, y)` and greet it.
-    fn admit(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId, state: MoveState) {
+    /// Admit `player` at `state` (with `hp` and facing `face`) and greet it.
+    fn admit(
+        &mut self,
+        ctx: &mut Ctx<'_, Self>,
+        player: PlayerId,
+        state: MoveState,
+        hp: i32,
+        face: f32,
+    ) {
         let (principal, name) = ctx
             .player(player)
             .map(|p| {
@@ -994,8 +1072,8 @@ impl MobPit {
                 name,
                 state,
                 credits: MAX_CREDITS,
-                hp: PLAYER_HP,
-                face: 0.0,
+                hp,
+                face,
                 swing_cd: 0,
                 swing_anim: 0,
                 dead_until: None,
@@ -1004,6 +1082,16 @@ impl MobPit {
                 leaving: false,
             },
         );
+        self.greet(ctx, player);
+    }
+
+    /// Tell `player`'s client session who it is and where (on every join,
+    /// and again on a rejoin: a reloaded page knows nothing).
+    fn greet(&self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        let Some(p) = self.players.get(&player) else {
+            return;
+        };
+        let (entity, state) = (p.id, p.state);
         ctx.set_view(player, View::new(state.x, state.y, VIEW_RADIUS));
         ctx.send(
             player,
@@ -1085,11 +1173,39 @@ impl Zone for MobPit {
             kills: 0,
             restored: false,
             tick: 0,
+            parked: Vec::new(),
         }
     }
 
     fn on_join(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
-        self.admit(ctx, player, spawn_state(player));
+        // Back where it last stood here (see `Parked`), else a spawn point.
+        let principal = ctx
+            .player(player)
+            .map(|p| p.principal.clone())
+            .unwrap_or_default();
+        let (state, hp, face) = self
+            .unpark(&principal)
+            .unwrap_or_else(|| (spawn_state(player), PLAYER_HP, 0.0));
+        self.admit(ctx, player, state, hp, face);
+    }
+
+    /// A reloaded page (a fresh ticket for a slot this principal still
+    /// holds): the same body, only the new client session is greeted.
+    fn on_rejoin(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        let name = ctx.player(player).and_then(|p| p.name.clone());
+        match self.players.get_mut(&player) {
+            Some(p) if !p.leaving => {
+                if let Some(name) = name {
+                    p.name = name;
+                }
+                p.swing_anim = 0;
+                self.greet(ctx, player);
+            }
+            _ => {
+                self.on_leave(ctx, player, LeaveReason::Rejoined);
+                self.on_join(ctx, player);
+            }
+        }
     }
 
     fn on_handoff_join(
@@ -1101,12 +1217,22 @@ impl Zone for MobPit {
     ) {
         let at = decode_carried(&carried).unwrap_or_else(|| spawn_state(player));
         // Still here inside its reconnect grace (a doorway bounce): replace.
-        self.players.remove(&player);
-        self.admit(ctx, player, at);
+        let hp = self.players.remove(&player).map_or(PLAYER_HP, |p| p.hp);
+        if let Some(principal) = ctx.player(player).map(|p| p.principal.clone()) {
+            // It arrives from elsewhere: an old place here is stale.
+            self.parked.retain(|p| p.principal != principal);
+        }
+        self.admit(ctx, player, at, hp, 0.0);
     }
 
-    fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId, _reason: LeaveReason) {
-        self.players.remove(&player);
+    fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId, reason: LeaveReason) {
+        let left = self.players.remove(&player);
+        // Its place is kept unless it moved on (a doorway) or is rejoining.
+        if !matches!(reason, LeaveReason::Handoff | LeaveReason::Rejoined) {
+            if let Some(parked) = left.as_ref().and_then(Self::parked_of) {
+                self.park(parked);
+            }
+        }
         for m in &mut self.mobs {
             if m.target == Some(player) {
                 m.target = None;
@@ -1249,6 +1375,18 @@ impl Zone for MobPit {
                     respawn_in: m.respawn_at.saturating_sub(tick),
                 })
                 .collect(),
+            parked: {
+                // Connected players too, newest: a crash after this
+                // snapshot brings them back here.
+                let mut parked = self.parked.clone();
+                for p in self.players.values().filter_map(Self::parked_of) {
+                    parked.retain(|q| q.principal != p.principal);
+                    parked.push(p);
+                }
+                let excess = parked.len().saturating_sub(MAX_PARKED);
+                parked.drain(..excess);
+                parked
+            },
         };
         serde_json::to_vec(&snapshot).ok()
     }
@@ -1259,6 +1397,7 @@ impl Zone for MobPit {
         };
         self.kills = snapshot.kills;
         self.restored = true;
+        self.parked = snapshot.parked;
         let tick = ctx.tick();
         for saved in snapshot.mobs {
             let Some(m) = self.mobs.iter_mut().find(|m| m.id.get() == saved.id) else {
