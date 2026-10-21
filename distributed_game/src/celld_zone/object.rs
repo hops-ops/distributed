@@ -107,6 +107,25 @@ pub trait CelldZone: Zone {
     ) -> Option<LocalFuture<Option<Self::Message>>> {
         None
     }
+
+    /// How often [`refresh`](Self::refresh) runs while the zone ticks
+    /// (`None`: never). It also runs once on every wake.
+    fn refresh_every() -> Option<Duration> {
+        None
+    }
+
+    /// Async work that keeps the zone in step with the world around it —
+    /// e.g. read the cells of the tiers it belongs to — off the tick; the
+    /// message it returns is delivered into the zone ([`Zone::on_message`]).
+    /// `round` counts the calls of this activation (0 on wake), so a zone
+    /// can read slower tiers less often.
+    fn refresh(
+        _env: &ObjectEnv,
+        _zone_id: &str,
+        _round: u64,
+    ) -> Option<LocalFuture<Option<Self::Message>>> {
+        None
+    }
 }
 
 // ------------------------------------------------------------------ env
@@ -411,6 +430,9 @@ struct Inner<Z: CelldZone> {
     /// Spawns a drain task waking at the given time (set by the object).
     drainer: Option<Rc<dyn Fn(f64)>>,
     last_dev_read_ms: f64,
+    /// [`CelldZone::refresh`] calls of this activation, and the last one.
+    refresh_round: u64,
+    last_refresh_ms: f64,
 }
 
 impl<Z: CelldZone> Inner<Z> {
@@ -682,6 +704,8 @@ impl<Z: CelldZone> ZoneObject<Z> {
             drain_at: None,
             drainer: None,
             last_dev_read_ms: 0.0,
+            refresh_round: 0,
+            last_refresh_ms: 0.0,
         };
         let inner = Rc::new(RefCell::new(inner));
         let weak = Rc::downgrade(&inner);
@@ -1061,6 +1085,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             inner.host = Some(host);
             inner.restored = restored;
             inner.wakes += 1;
+            inner.refresh_round = 0;
             // Each wake is a new activation: sockets of an earlier one are
             // told to rejoin (1012).
             if inner.wakes > 1 {
@@ -1073,7 +1098,43 @@ impl<Z: CelldZone> ZoneObject<Z> {
         self.store_status().await;
         self.find_node();
         self.read_dev_settings().await;
+        self.refresh();
         Ok(())
+    }
+
+    /// Run [`CelldZone::refresh`] off the tick and deliver its message.
+    fn refresh(&self) {
+        let (zone_id, round) = {
+            let mut inner = self.inner.borrow_mut();
+            inner.last_refresh_ms = now_ms();
+            let round = inner.refresh_round;
+            inner.refresh_round += 1;
+            (inner.zone_id.clone(), round)
+        };
+        let Some(work) = Z::refresh(&self.env, &zone_id, round) else {
+            return;
+        };
+        let inner = self.inner.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(message) = work.await {
+                let mut inner = inner.borrow_mut();
+                if let Some(host) = inner.host.as_mut() {
+                    host.deliver(ZoneInbound::Message(message));
+                    inner.flush();
+                }
+            }
+        });
+    }
+
+    /// [`refresh`](Self::refresh) when [`CelldZone::refresh_every`] is due.
+    fn refresh_if_due(&self) {
+        let Some(every) = Z::refresh_every() else {
+            return;
+        };
+        let due = now_ms() - self.inner.borrow().last_refresh_ms >= every.as_millis() as f64;
+        if due {
+            self.refresh();
+        }
     }
 
     /// Dev only (`ZONE_DEV_SETTINGS=1`): read the network simulation from
@@ -1344,6 +1405,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             };
             self.spool().await;
             self.refresh_dev_settings();
+            self.refresh_if_due();
             if persist {
                 self.persist().await;
                 if !stop {

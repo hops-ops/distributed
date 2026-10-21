@@ -40,6 +40,10 @@
 //!   the object's outbox before it is sent and deleted when settled; the
 //!   next activation or the outbox alarm resends what is left, and the
 //!   cells' command ledger turns a resend into a replay: exactly once.
+//! - **The world around.** [`CelldZone::refresh`] runs off the tick on
+//!   every wake and every [`CelldZone::refresh_every`] while the zone
+//!   ticks (e.g. reading the cells of the tiers a room belongs to); its
+//!   message is delivered into the zone.
 //! - **Status.** The zone reports its lifecycle as facts into its
 //!   [`zone_activity`](crate::world::zone_activity) cell, projected into the
 //!   [`zone_status`](crate::world::zone_status) read model (minimaps).

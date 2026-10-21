@@ -101,12 +101,10 @@ their mechanic moves in):
 
 | Demo | Run | Shows |
 |---|---|---|
-| Mob Pit | `examples/game/run.sh mobpit` (`--fleet` for several celld nodes) | rooms as celld objects joined by doorways, sleeping when empty and restored on return; combat whose rewards are saved exactly once without stalling; a network panel (simulated latency / jitter / loss on every room, prediction on/off with a server ghost, the interest ring) |
+| Mob Pit | `examples/game/run.sh mobpit` (`--fleet` for several celld nodes) | rooms as celld objects joined by doorways, sleeping when empty and restored on return; combat whose rewards are saved exactly once without stalling; a network panel (simulated latency / jitter / loss on every room, prediction on/off with a server ghost, the interest ring); the rooms next door seen through passive watchers; hoods › boroughs › city as tier cells (boss kills ripple up through a saga, weather lifts as bosses fall) |
 | Leaderboard | `run.sh leaderboard` | a live ranking fed from saved kills, rebuilt from history |
 | Shooting Gallery | `run.sh gallery` | lag compensation on/off under latency |
 | The Freeze | `run.sh freeze` | pausing every zone on two servers, updating content, resuming; safe-room reloads |
-| Endless Grid | `run.sh grid` | a generated world split into zones across two servers, seamless border crossings, zones sleeping and waking |
-| Boss Ripple | `run.sh ripple` | nested zones (realm › city › borough › neighbourhood) with events travelling up |
 
 Then open `http://localhost:5173/<demo>/`. Each page explains what to try.
 
