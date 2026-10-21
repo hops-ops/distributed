@@ -560,7 +560,10 @@ impl<Z: CelldZone> ZoneObject<Z> {
         }
         let path = req.url()?.path().to_string();
         if path.ends_with("/info") {
-            return Response::from_json(&self.info());
+            // Debug JSON without secrets; pages on other origins may read it.
+            let response = Response::from_json(&self.info())?;
+            response.headers().set("access-control-allow-origin", "*")?;
+            return Ok(response);
         }
         if req.headers().get("upgrade")?.as_deref() != Some("websocket") {
             return Response::error("expected a WebSocket upgrade", 426);
