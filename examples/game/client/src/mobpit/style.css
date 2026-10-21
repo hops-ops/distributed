@@ -123,7 +123,7 @@
 	position: fixed;
 	right: 12px;
 	bottom: 16px;
-	width: 234px;
+	width: 280px;
 	padding: 10px 12px;
 	border-radius: 8px;
 	background: var(--panel);
@@ -257,4 +257,13 @@
 
 .pit-admin button {
 	margin: 4px 4px 0 0;
+}
+.pit-rooms .c-me {
+	color: #ffffff;
+}
+.pit-rooms .c-other {
+	color: #64b5f6;
+}
+.pit-rooms .c-mob {
+	color: #ff8a65;
 }

@@ -263,8 +263,8 @@ function div(className: string, parent: HTMLElement): HTMLDivElement {
 // ---- rooms: minimap from the zone status read model, toasts, debug ----
 const roomsPanel = div('pit-rooms', document.body);
 roomsPanel.innerHTML = `<h2>Rooms <small data-k="here"></small></h2>
-	<canvas width="210" height="210"></canvas>
-	<div class="pit-legend"><span class="c-active">■ active</span> <span class="c-dormant">■ dormant</span> <span class="c-hibernated">■ asleep</span> <span class="c-cold">■ never ran</span> <span class="c-watched">□ watched</span></div>
+	<canvas width="256" height="256" title="Scroll to zoom"></canvas>
+	<div class="pit-legend"><span class="c-active">■ active</span> <span class="c-dormant">■ dormant</span> <span class="c-hibernated">■ asleep</span> <span class="c-cold">■ never ran</span> <span class="c-watched">□ watched</span> <span class="c-me">▲ you</span> <span class="c-other">● players</span> <span class="c-mob">● mobs</span></div>
 	<div class="pit-debug" data-k="debug"></div>`;
 const roomsMap = roomsPanel.querySelector('canvas') as HTMLCanvasElement;
 const roomsField = (k: string) => roomsPanel.querySelector(`[data-k="${k}"]`) as HTMLElement;
@@ -322,71 +322,184 @@ async function pollTiers(): Promise<void> {
 }
 void pollTiers();
 
+/** A dot on the minimap, in world metres (room (x, y) is centred on (x, y) × ROOM_SIZE). */
+type MiniDot = { wx: number; wy: number; kind: 'me' | 'player' | 'mob'; tier: number; face: number; dead: boolean };
+const miniDots: MiniDot[] = [];
+let miniMe: MiniDot | undefined;
+/** Metres across the minimap; the mouse wheel zooms. */
+let miniSpanM = 4 * ROOM_SIZE;
+roomsMap.addEventListener(
+	'wheel',
+	(event) => {
+		event.preventDefault();
+		miniSpanM = Math.min(12 * ROOM_SIZE, Math.max(1.5 * ROOM_SIZE, miniSpanM * Math.exp(event.deltaY * 0.0015)));
+	},
+	{ passive: false }
+);
+const roomLayouts = new Map<string, { biome: number; obstacles: { x: number; y: number; r: number }[] }>();
+function roomLayout(seed: number, x: number, y: number): { biome: number; obstacles: { x: number; y: number; r: number }[] } | undefined {
+	if (!pit.pures.loaded()) return undefined;
+	const key = `${seed}:${x}:${y}`;
+	let layout = roomLayouts.get(key);
+	if (layout === undefined) {
+		const room = pit.pures.pitRoom({ seed, x, y });
+		layout = { biome: room.biome, obstacles: room.obstacles.map(({ x, y, r }) => ({ x, y, r })) };
+		if (roomLayouts.size > 400) roomLayouts.clear();
+		roomLayouts.set(key, layout);
+	}
+	return layout;
+}
+const mod = (n: number, m: number) => ((n % m) + m) % m;
+
+/**
+ * The minimap: a top-down map that follows you every frame. Rooms show their
+ * biome floor, walls with doorway gaps and obstacles; the room's state (zone
+ * status read model) is the tile's border; you, other players and mobs are
+ * dots at their live positions (your room and the watched rooms next door).
+ */
 function drawRooms(): void {
 	const ctx = roomsMap.getContext('2d');
 	const here = parseRoom(pit.room() ?? DEFAULT_ZONE);
 	if (ctx === null || here === undefined) return;
-	const { width } = roomsMap;
-	const span = 7;
-	const cell = width / span;
-	ctx.clearRect(0, 0, width, width);
+	const { width, height } = roomsMap;
+	const s = width / miniSpanM;
+	// Centre on you (between frames of a handoff: your room's centre).
+	const cx = miniMe?.wx ?? here[0] * ROOM_SIZE;
+	const cy = miniMe?.wy ?? here[1] * ROOM_SIZE;
+	const toMap = (wx: number, wy: number): [number, number] => [width / 2 + (wx - cx) * s, height / 2 - (wy - cy) * s];
+	ctx.fillStyle = '#0b0d12';
+	ctx.fillRect(0, 0, width, height);
 	const seed = pit.hello()?.seed ?? PIT_WORLD.defaultSeed;
-	for (let j = 0; j < span; j++) {
-		for (let i = 0; i < span; i++) {
-			const x = here[0] + i - 3;
-			const y = here[1] + (span - 1 - j) - 3;
-			const zone = roomZone(x, y);
+	const reach = Math.ceil(miniSpanM / ROOM_SIZE / 2) + 1;
+	const rx0 = Math.round(cx / ROOM_SIZE);
+	const ry0 = Math.round(cy / ROOM_SIZE);
+	const door = PIT_WORLD.doorHalf;
+	// Node names only say something when the rooms run on more than one node.
+	const manyNodes = new Set([...rooms.values()].map((r) => r.node).filter((n) => n !== '')).size > 1;
+	ctx.font = '10px monospace';
+	for (let ry = ry0 - reach; ry <= ry0 + reach; ry++) {
+		for (let rx = rx0 - reach; rx <= rx0 + reach; rx++) {
+			const zone = roomZone(rx, ry);
 			const row = rooms.get(zone);
-			let color = '#20252e';
-			if (row !== undefined) color = STATUS_COLOR[row.status] ?? color;
-			else if (pit.pures.loaded()) color = `${BIOME_COLOR[pit.pures.pitRoom({ seed, x, y }).biome] ?? '#333'}55`;
-			ctx.fillStyle = color;
-			ctx.fillRect(i * cell + 2, j * cell + 2, cell - 4, cell - 4);
-			if (x === here[0] && y === here[1]) {
-				ctx.strokeStyle = '#ffffff';
+			const layout = roomLayout(seed, rx, ry);
+			const [x0, y0] = toMap(rx * ROOM_SIZE - HALF, ry * ROOM_SIZE + HALF);
+			const size = HALF * 2 * s;
+			// Floor: biome colour, dimmer for rooms that never ran.
+			ctx.fillStyle = `${BIOME_COLOR[layout?.biome ?? 0] ?? '#333'}${row === undefined ? '33' : '66'}`;
+			ctx.fillRect(x0, y0, size, size);
+			// Obstacles.
+			if (layout !== undefined && s > 0.6) {
+				ctx.fillStyle = '#0b0d12aa';
+				for (const o of layout.obstacles) {
+					const [ox, oy] = toMap(rx * ROOM_SIZE + o.x, ry * ROOM_SIZE + o.y);
+					ctx.beginPath();
+					ctx.arc(ox, oy, Math.max(1, o.r * s), 0, Math.PI * 2);
+					ctx.fill();
+				}
+			}
+			// Walls with a doorway gap in the middle of each.
+			ctx.strokeStyle = '#9aa3b2';
+			ctx.lineWidth = 1;
+			const wall = (ax: number, ay: number, bx: number, by: number) => {
+				ctx.beginPath();
+				ctx.moveTo(...toMap(rx * ROOM_SIZE + ax, ry * ROOM_SIZE + ay));
+				ctx.lineTo(...toMap(rx * ROOM_SIZE + bx, ry * ROOM_SIZE + by));
+				ctx.stroke();
+			};
+			for (const sign of [-1, 1]) {
+				wall(-HALF, sign * HALF, -door, sign * HALF);
+				wall(door, sign * HALF, HALF, sign * HALF);
+				wall(sign * HALF, -HALF, sign * HALF, -door);
+				wall(sign * HALF, door, sign * HALF, HALF);
+			}
+			// Room state as the tile's inner border.
+			const status = row === undefined ? undefined : STATUS_COLOR[row.status];
+			if (status !== undefined) {
+				ctx.strokeStyle = status;
 				ctx.lineWidth = 2;
-				ctx.strokeRect(i * cell + 1, j * cell + 1, cell - 2, cell - 2);
-			} else if (pit.neighbours().get(zone) === 'watching') {
-				// Watched next door (passive: it never keeps the room awake).
+				ctx.strokeRect(x0 + 3, y0 + 3, size - 6, size - 6);
+			}
+			if (pit.neighbours().get(zone) === 'watching' && !(rx === here[0] && ry === here[1])) {
 				ctx.strokeStyle = '#4dd0e1';
 				ctx.lineWidth = 1;
-				ctx.strokeRect(i * cell + 2.5, j * cell + 2.5, cell - 5, cell - 5);
+				ctx.setLineDash([3, 3]);
+				ctx.strokeRect(x0 + 6, y0 + 6, size - 12, size - 12);
+				ctx.setLineDash([]);
 			}
-			ctx.fillStyle = '#0e1116';
-			ctx.font = '10px monospace';
-			if (row !== undefined && row.players > 0) ctx.fillText(`${row.players}p`, i * cell + 5, j * cell + 13);
-			if (debug && row !== undefined && row.node !== '') ctx.fillText(row.node.replace(/^node-/, ''), i * cell + 5, j * cell + cell - 6);
+			if (size > 36) {
+				ctx.fillStyle = '#e6e9ef';
+				if (row !== undefined && row.players > 0) ctx.fillText(`${row.players}p`, x0 + 6, y0 + 14);
+				if (debug && manyNodes && row !== undefined && row.node !== '') ctx.fillText(row.node.replace(/^(celld-|node-)/, ''), x0 + 6, y0 + size - 6);
+			}
 			// Boss rooms: a red mark (grey while the boss is down) and the hood's tier.
-			const hood = tiers?.hoods.find((h) => h.bossRoom[0] === x && h.bossRoom[1] === y);
+			const hood = tiers?.hoods.find((h) => h.bossRoom[0] === rx && h.bossRoom[1] === ry);
 			if (hood !== undefined) {
+				const [bx, by] = toMap(rx * ROOM_SIZE, ry * ROOM_SIZE);
 				ctx.fillStyle = hood.bossDown ? '#777' : '#ff2d55';
 				ctx.beginPath();
-				ctx.arc(i * cell + cell - 9, j * cell + 9, 5, 0, Math.PI * 2);
+				ctx.arc(bx, by, Math.max(4, 3 * s), 0, Math.PI * 2);
 				ctx.fill();
 				ctx.fillStyle = '#fff';
-				ctx.fillText(`T${hood.tier}`, i * cell + cell - 22, j * cell + cell - 6);
+				ctx.fillText(`T${hood.tier}`, bx + 7, by - 5);
 			}
 		}
 	}
-	// Hood (3 × 3 rooms) and borough (9 × 9) borders.
-	const line = (fixed: number, vertical: boolean, color: string, width: number) => {
-		ctx.strokeStyle = color;
-		ctx.lineWidth = width;
+	// Hood (3 × 3 rooms) and borough (9 × 9) borders: the left / bottom wall of
+	// every room whose index is a multiple of 3 (9).
+	for (let r = rx0 - reach; r <= rx0 + reach; r++) {
+		if (mod(r, 3) !== 0) continue;
+		const borough = mod(r, 9) === 0;
+		const [x] = toMap(r * ROOM_SIZE - HALF, 0);
+		ctx.strokeStyle = borough ? '#ffd166' : '#8a6dd1';
+		ctx.lineWidth = borough ? 2.5 : 1.25;
 		ctx.beginPath();
-		if (vertical) {
-			ctx.moveTo(fixed, 0);
-			ctx.lineTo(fixed, roomsMap.height);
-		} else {
-			ctx.moveTo(0, fixed);
-			ctx.lineTo(roomsMap.width, fixed);
-		}
+		ctx.moveTo(x, 0);
+		ctx.lineTo(x, height);
 		ctx.stroke();
-	};
-	for (let i = 0; i <= span; i++) {
-		const x = here[0] + i - 3;
-		if (((x % 3) + 3) % 3 === 0) line(i * cell, true, ((x % 9) + 9) % 9 === 0 ? '#ffd166' : '#8a6dd1', ((x % 9) + 9) % 9 === 0 ? 3 : 1.5);
-		const y = here[1] - (i - 4) ;
-		if (((y % 3) + 3) % 3 === 0) line(i * cell, false, ((y % 9) + 9) % 9 === 0 ? '#ffd166' : '#8a6dd1', ((y % 9) + 9) % 9 === 0 ? 3 : 1.5);
+	}
+	for (let r = ry0 - reach; r <= ry0 + reach; r++) {
+		if (mod(r, 3) !== 0) continue;
+		const borough = mod(r, 9) === 0;
+		const [, y] = toMap(0, r * ROOM_SIZE - HALF);
+		ctx.strokeStyle = borough ? '#ffd166' : '#8a6dd1';
+		ctx.lineWidth = borough ? 2.5 : 1.25;
+		ctx.beginPath();
+		ctx.moveTo(0, y);
+		ctx.lineTo(width, y);
+		ctx.stroke();
+	}
+	// Your interest ring.
+	const viewRadius = pit.hello()?.viewRadius;
+	if (miniMe !== undefined && viewRadius !== undefined) {
+		ctx.strokeStyle = '#ffffff22';
+		ctx.lineWidth = 1;
+		ctx.beginPath();
+		ctx.arc(width / 2, height / 2, viewRadius * s, 0, Math.PI * 2);
+		ctx.stroke();
+	}
+	// Mobs, other players, then you on top.
+	for (const d of miniDots) {
+		const [x, y] = toMap(d.wx, d.wy);
+		if (x < -4 || y < -4 || x > width + 4 || y > height + 4) continue;
+		ctx.fillStyle = d.kind === 'mob' ? (d.tier >= 4 ? '#ff2d55' : '#ff8a65') : d.dead ? '#666' : '#64b5f6';
+		ctx.beginPath();
+		ctx.arc(x, y, d.kind === 'mob' ? (d.tier >= 4 ? 3.5 : 2) : 3, 0, Math.PI * 2);
+		ctx.fill();
+	}
+	if (miniMe !== undefined) {
+		const [x, y] = toMap(miniMe.wx, miniMe.wy);
+		const f = miniMe.face;
+		const tip = (a: number, r: number): [number, number] => [x + Math.cos(f + a) * r, y - Math.sin(f + a) * r];
+		ctx.fillStyle = miniMe.dead ? '#888' : '#ffffff';
+		ctx.strokeStyle = '#0b0d12';
+		ctx.lineWidth = 1.5;
+		ctx.beginPath();
+		ctx.moveTo(...tip(0, 8));
+		ctx.lineTo(...tip(2.5, 5));
+		ctx.lineTo(...tip(-2.5, 5));
+		ctx.closePath();
+		ctx.stroke();
+		ctx.fill();
 	}
 }
 
@@ -915,6 +1028,7 @@ stage.onFrame((now, dtMs) => {
 	const hello = pit.hello();
 	const authority = client.authority;
 	const rendered = client.render();
+	miniDots.length = 0;
 	const seen = new Set<string>();
 	let me: { at: Vector3; hp: number; dead: boolean } | undefined;
 	let stats: PitFields | undefined;
@@ -932,6 +1046,19 @@ stage.onFrame((now, dtMs) => {
 		const visual = visualFor(entity, mine);
 		seen.add(entity.key);
 		const visible = !entity.stale;
+		const entityRoom = parseRoom(entity.zoneId);
+		if (entityRoom !== undefined && visible) {
+			const base = { wx: entityRoom[0] * ROOM_SIZE, wy: entityRoom[1] * ROOM_SIZE };
+			if (visual.kind === 'mob') {
+				const m = mobFields(entity);
+				miniDots.push({ wx: base.wx + m.x, wy: base.wy + m.y, kind: 'mob', tier: visual.tier, face: m.face, dead: false });
+			} else {
+				const p = playerFields(entity);
+				const dot: MiniDot = { wx: base.wx + p.x, wy: base.wy + p.y, kind: mine ? 'me' : 'player', tier: 0, face: p.face, dead: p.dead };
+				if (mine) miniMe = dot;
+				else miniDots.push(dot);
+			}
+		}
 		if (visual.kind === 'mob') {
 			const mob = mobFields(entity);
 			const { x, y } = mob;
@@ -1071,8 +1198,8 @@ stage.onFrame((now, dtMs) => {
 	field('saved').textContent = String(savedCount);
 	field('note').textContent = 'Kills settle in your Crawler cell next to the room on celld; the tick never waits for them.';
 	if (here !== undefined) showRoom(here);
+	drawRooms();
 	if (now - lastSampleAt > 250) {
-		drawRooms();
 		renderDebug();
 		lastSampleAt = now;
 		samples.push({ pending, tick: tickMs });
