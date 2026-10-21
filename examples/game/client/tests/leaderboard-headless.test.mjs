@@ -33,7 +33,18 @@ test('board pushes match the cells and rebuild is identical', { timeout: 600_000
 		await pit.client.connect('pit-1');
 		await pit.ready;
 		const me = api.last.principal;
+		const kills = [];
+		pit.on('kill', (k) => k.killer === pit.hello().entity && kills.push(k));
 		await hunt(pit, () => (pit.profile()?.kills ?? 0) >= 2);
+		// One swing can kill several mobs, and kills keep landing from inputs
+		// sent before the hunt saw the second settlement: wait until every
+		// input is acknowledged and every own kill settled before comparing.
+		await until(() => pit.client.predictor.pending.length === 0, 5_000, 'inputs acknowledged');
+		await until(
+			() => pit.unsaved.size === 0 && pit.profile()?.kills === kills.length,
+			10_000,
+			`settled profile ${JSON.stringify(pit.profile())} for ${kills.length} kills`
+		);
 		const profile = pit.profile();
 
 		// Pushed, not polled: the observer sees my kills without asking.
