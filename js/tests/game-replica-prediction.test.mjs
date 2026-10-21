@@ -102,6 +102,20 @@ test('prediction replays unacked inputs over authoritative state', () => {
 	assert.deepEqual(predictor.pending.map((p) => p.seq), [4, 5]);
 });
 
+test('inputs recorded before the entity is known are replayed when it binds', () => {
+	const predictor = new Predictor({ predict: moverPredict });
+	predictor.bind(7);
+	predictor.record(1, 10, 100);
+	predictor.record(2, 10, 100);
+	assert.equal(predictor.active, false);
+	predictor.bind(7, ARENA_SCHEMA.byId.get(1), { x: 0, y: 0, yaw: 0, hp: 100, name: 'p' });
+	close(predictor.predicted().x, 2, 1e-9, 'both replayed');
+	// Another entity: the inputs were not its.
+	predictor.bind(8, ARENA_SCHEMA.byId.get(1), { x: 0, y: 0, yaw: 0, hp: 100, name: 'p' });
+	close(predictor.predicted().x, 0, 1e-9);
+	assert.deepEqual(predictor.pending, []);
+});
+
 test('ease blends the divergence out over time while snap jumps', () => {
 	const authoritative = { x: 1, y: 0, yaw: 0, hp: 80, name: 'p' }; // server hit a wall
 	const eased = boundPredictor({ mode: 'ease', durationMs: 200 });
