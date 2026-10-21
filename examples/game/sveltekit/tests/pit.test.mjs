@@ -315,6 +315,14 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		// delays its sockets); the RTT rises, the server ghost trails the
 		// predicted player while walking, and it all drops back.
 		const rtt = () => page.textContent('[data-testid=rtt]').then(Number);
+		// The RTT is smoothed (1/8 per 500 ms ping) and seeded by the first
+		// sample, which can be slow while the page boots: let it settle to
+		// a loopback value before taking the baseline.
+		await page
+			.waitForFunction(() => Number(document.querySelector('[data-testid=rtt]')?.textContent) < 40, null, { timeout: 15_000 })
+			.catch(async (e) => {
+				throw new Error(`base rtt stayed ${await rtt()}: ${e}`);
+			});
 		const baseRtt = await rtt();
 		assert.equal((await fetch(`${ORIGIN}/api/dev/netsim`)).status, 401, 'signed-out: no network control');
 		await page.locator('[data-testid=latency]').fill('100');
