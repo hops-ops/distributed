@@ -10,6 +10,7 @@ import { ClockSync, type ClockSyncOptions } from './clock.js';
 import { Emitter } from './emitter.js';
 import {
 	encodeClientMessage,
+	GAME_CLOSE_RESTARTED,
 	GAME_PROTOCOL_VERSION,
 	GameClientMirror,
 	GameErrorCode,
@@ -642,6 +643,11 @@ export class GameConnection {
 		if (attempt.welcomed) {
 			this.#disconnectedAt = this.#scheduler.now();
 			this.#failedAttempts = 0;
+		}
+		if (code === GAME_CLOSE_RESTARTED) {
+			// The zone restarted or moved: its sessions are gone. Rejoin now
+			// with a fresh ticket instead of presenting a void token.
+			this.#reconnectToken = '';
 		}
 		if (attempt.redirect !== undefined) {
 			this.#redirects += 1;

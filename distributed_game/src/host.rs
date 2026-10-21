@@ -1014,6 +1014,16 @@ impl<Z: Zone> ZoneHost<Z> {
         self.core.in_flight()
     }
 
+    /// Facts emitted since the last call, when the fact queue keeps a
+    /// journal ([`FactQueue::with_journal`]); empty otherwise.
+    pub fn take_emitted_facts(&mut self) -> Vec<Fact> {
+        self.core
+            .facts
+            .as_mut()
+            .map(FactQueue::take_journal)
+            .unwrap_or_default()
+    }
+
     /// True after [`dispose`](Self::dispose).
     pub fn is_disposed(&self) -> bool {
         self.disposed

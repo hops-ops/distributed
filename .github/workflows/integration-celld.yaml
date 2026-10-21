@@ -42,6 +42,7 @@ jobs:
             tests/celld/worker -> tests/celld/worker/target
             tests/celld/alarm-worker -> tests/celld/alarm-worker/target
             tests/celld/fact-worker -> tests/celld/fact-worker/target
+            tests/celld/zone-worker -> tests/celld/zone-worker/target
           shared-key: celld-storage
       - uses: actions/setup-node@v4
         with:
@@ -82,6 +83,13 @@ jobs:
         run: |
           cargo test -p distributed_game --features celld,runtime --test celld_zone_state
           cargo test -p distributed_game --features celld,net,lease --test world
+      - name: Build the celld zone host test Worker
+        working-directory: tests/celld/zone-worker
+        run: worker-build --release
+      - name: Zones as celld objects (celld dev; 3-node fleet on RustFS, crash, facts exactly once)
+        env:
+          CELLD_ZONE_REQUIRED: "1"
+        run: cargo test -p distributed_game --features celld,net --test celld_zone
       - name: Retain storage proof results and logs
         if: always()
         uses: actions/upload-artifact@v4

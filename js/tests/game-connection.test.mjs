@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+	GAME_CLOSE_RESTARTED,
 	GAME_PROTOCOL_VERSION,
 	GameClient,
 	GameConnection,
@@ -211,6 +212,25 @@ test('reconnects with the token inside the grace window, then falls back to a fr
 	assert.equal(hello.ticket, `t:z1:${tickets.length}`);
 	assert.equal(conn.state, 'open');
 	assert.equal(welcomes.at(-1).resumed, false);
+	conn.close();
+});
+
+test('a zone that restarted (close 1012) is rejoined at once with a fresh ticket', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	scriptedServer(network);
+	const { conn, tickets } = connection(network, scheduler, {
+		reconnect: { graceMs: 15_000, maxAttempts: 100, backoffMs: () => 1000 }
+	});
+	await conn.connect();
+	assert.equal(conn.reconnectToken, 'rt-1');
+	network.last().close(GAME_CLOSE_RESTARTED);
+	await scheduler.advance(10);
+	const hello = network.last().lastHello;
+	assert.equal(hello.reconnectToken, '', 'the old session is gone: no token');
+	assert.equal(hello.ticket, 't:z1:2');
+	assert.deepEqual(tickets.at(-1), { zoneId: 'z1', role: 'player', reason: 'rejoin' });
+	assert.equal(conn.state, 'open');
 	conn.close();
 });
 

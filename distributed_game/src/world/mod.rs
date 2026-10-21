@@ -14,10 +14,12 @@
 //! - [`allocation`]: [`ZoneAllocation`] records written by the service that
 //!   allocates a zone, read before the zone is created
 //!   ([`ZoneActivation`], [`ZoneAllocationStore`]).
-//! - `zone_status` (feature `cell`): the read model of every zone's lease
-//!   and hibernation slot, projected from the `zone_lease` / `zone_state`
-//!   cells' outward events (active / hibernated / cold without opening a
-//!   cell).
+//! - `zone_activity` (feature `cell`): a celld-hosted zone's own lifecycle
+//!   reports (active / dormant / hibernated) as a cell.
+//! - `zone_status` (feature `cell`): the read model of every zone's lease,
+//!   hibernation slot and activity, projected from the `zone_lease` /
+//!   `zone_state` / `zone_activity` cells' outward events (active / dormant
+//!   / hibernated / cold without opening a cell).
 //! - [`barrier`]: content-version policy types shared by the host and the
 //!   world barrier ([`StalePolicy`], [`BarrierMode`]).
 
@@ -27,6 +29,9 @@ pub mod directory;
 pub mod ownership;
 pub mod state;
 pub mod topology;
+#[cfg(feature = "cell")]
+#[allow(missing_docs)]
+pub mod zone_activity;
 #[cfg(feature = "cell")]
 // The `sourced` and `Snapshot` derives generate undocumented public items.
 #[allow(missing_docs)]

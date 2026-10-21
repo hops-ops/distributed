@@ -320,6 +320,7 @@ pub struct FactQueue {
     in_flight: HashSet<String>,
     capacity: usize,
     script: Option<SettlementScript>,
+    journal: Option<Vec<Fact>>,
 }
 
 /// Worker-side handle consumed by [`FactFeed::run`].
@@ -342,6 +343,7 @@ pub fn fact_channel(capacity: usize, policy: RetryPolicy) -> (FactQueue, FactFee
             in_flight: HashSet::new(),
             capacity: capacity.max(1),
             script: None,
+            journal: None,
         },
         FactFeed {
             shared,
@@ -362,6 +364,9 @@ impl FactQueue {
             return Err(EmitError::Backpressure);
         }
         self.in_flight.insert(fact.key.clone());
+        if let Some(journal) = self.journal.as_mut() {
+            journal.push(fact.clone());
+        }
         if self.script.is_some() {
             return Ok(());
         }
@@ -372,6 +377,22 @@ impl FactQueue {
             .push_back(fact);
         self.shared.wake();
         Ok(())
+    }
+
+    /// Keep a copy of every accepted fact until [`take_journal`](Self::take_journal):
+    /// a host that keeps its own durable outbox writes them there right
+    /// after the tick that emitted them (the celld zone host does).
+    pub fn with_journal(mut self) -> Self {
+        self.journal = Some(Vec::new());
+        self
+    }
+
+    /// Facts accepted since the last call (empty without a journal).
+    pub fn take_journal(&mut self) -> Vec<Fact> {
+        self.journal
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Settlements that arrived since the last call.
