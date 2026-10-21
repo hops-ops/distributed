@@ -11,11 +11,11 @@ export const PREDICT = {
 	kind: 'player',
 	export: 'pit_step',
 	package: 'game_sim',
-	state: 'MoveState',
+	state: 'PitState',
 	abi: 1,
 } as const;
 
-/** Predicted `player` fields (record `MoveState`): wire field name and codec type, in record order. */
+/** Predicted `player` fields (record `PitState`): wire field name and codec type, in record order. */
 export const PREDICT_STATE: PredictStateLayout = [
 	['x', { type: 'f32' }],
 	['y', { type: 'f32' }],
@@ -23,6 +23,8 @@ export const PREDICT_STATE: PredictStateLayout = [
 	['vy', { type: 'f32' }],
 	['dash', { type: 'u8' }],
 	['cd', { type: 'u8' }],
+	['z', { type: 'f32' }],
+	['vz', { type: 'f32' }],
 ];
 
 /** What the step reads besides state and input (`prediction.setContext`). */

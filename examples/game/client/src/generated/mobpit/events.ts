@@ -10,16 +10,6 @@ export interface MobTier {
 	readonly tele: number;
 }
 
-/** Record `MoveState` (`#[derive(GameRecord)]`). */
-export interface MoveState {
-	readonly x: number;
-	readonly y: number;
-	readonly vx: number;
-	readonly vy: number;
-	readonly dash: number;
-	readonly cd: number;
-}
-
 /** Record `Obstacle` (`#[derive(GameRecord)]`). */
 export interface Obstacle {
 	readonly x: number;
@@ -69,6 +59,18 @@ export interface PitRules {
 	readonly attackRange: number;
 	readonly attackHalfAngle: number;
 	readonly swingFrames: number;
+}
+
+/** Record `PitState` (`#[derive(GameRecord)]`). */
+export interface PitState {
+	readonly x: number;
+	readonly y: number;
+	readonly vx: number;
+	readonly vy: number;
+	readonly dash: number;
+	readonly cd: number;
+	readonly z: number;
+	readonly vz: number;
 }
 
 /** Record `PitWorld` (`#[derive(GameRecord)]`). */

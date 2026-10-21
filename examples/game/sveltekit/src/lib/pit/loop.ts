@@ -102,7 +102,7 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 	const ctx = canvas.getContext('2d')!;
 	const keys = new Set<string>();
 	const down = (e: KeyboardEvent) => {
-		if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'KeyE'].includes(e.code)) e.preventDefault();
+		if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'KeyE', 'KeyQ'].includes(e.code)) e.preventDefault();
 		keys.add(e.code);
 	};
 	const up = (e: KeyboardEvent) => keys.delete(e.code);
@@ -136,7 +136,7 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 			mx: axis('KeyA', 'KeyD'),
 			// Screen y grows downwards; world y grows upwards.
 			my: axis('KeyS', 'KeyW'),
-			buttons: (keys.has('Space') ? BUTTON.attack : 0) | (keys.has('KeyE') ? BUTTON.dash : 0)
+			buttons: (keys.has('Space') ? BUTTON.attack : 0) | (keys.has('KeyE') ? BUTTON.dash : 0) | (keys.has('KeyQ') ? BUTTON.jump : 0)
 		};
 	};
 
@@ -297,7 +297,10 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 					// Frames that drew an own swing, for the headless test.
 					if (isMe) canvas.dataset.swings = String(Number(canvas.dataset.swings ?? 0) + 1);
 				}
-				circle(w.x, w.y, PLAYER_RADIUS, p.dead ? '#555' : isMe ? '#ffd166' : '#6ec3ff');
+				// A jump: a shadow on the floor, the body up and bigger.
+				if (p.z > 0.01) circle(w.x, w.y, PLAYER_RADIUS, 'rgba(0,0,0,0.35)');
+				if (isMe) canvas.dataset.z = p.z.toFixed(2);
+				circle(w.x, w.y + p.z * 0.6, PLAYER_RADIUS * (1 + p.z * 0.25), p.dead ? '#555' : isMe ? '#ffd166' : '#6ec3ff');
 				const [nx, ny] = at(w.x + Math.cos(p.face) * 0.6, w.y + Math.sin(p.face) * 0.6);
 				const [px, py] = at(w.x, w.y);
 				ctx.strokeStyle = '#fff';

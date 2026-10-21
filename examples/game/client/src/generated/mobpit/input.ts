@@ -17,6 +17,7 @@ export const BITS = {
 	buttons: {
 		dash: 1,
 		attack: 2,
+		jump: 4,
 	},
 } as const;
 
@@ -33,7 +34,7 @@ export const INPUT_LAYOUT: PayloadLayout = [
 const INPUT_RULES: readonly InputRule[] = [
 	{ range: [-127, 127] },
 	{ range: [-127, 127] },
-	{ buttons: 3 },
+	{ buttons: 7 },
 ];
 
 /** Payload bytes of one input frame. */

@@ -406,9 +406,18 @@ crashes. The game never names a node; the debug overlay only *shows* the
 one celld chose.
 
 Controls: WASD / stick move (predicted by `pit_step`, the Rust step as
-WASM), **Space** attack (120° cone, 2.2 m), **E** dash, **O** debug
-overlay, **P** prediction, **G** server ghost (see the network panel under
-[Run](#run)). Walk through a **doorway** — the glowing gap in the
+WASM), **Space** attack (120° cone, 2.2 m), **E** dash, **Q** jump, **O**
+debug overlay, **P** prediction, **G** server ghost (see the network panel
+under [Run](#run)).
+
+**Jumping** is part of the predicted step: Mob Pit's state is the Arena
+capsule plus a height (`PitState`: `z`, `vz`; take-off 8.5 m/s, gravity
+24 m/s², ≈ 1.5 m up, ≈ 0.7 s in the air), predicted in WASM and
+reconciled like the rest, replicated to everyone (`z`), and carried
+through a doorway mid-air (the handoff carries `z`/`vz`). A mob's slam
+is a ring on the floor: a player 0.9 m up or higher clears it
+(`SLAM_CLEARANCE`; ranged hits will test the height too). Like every
+step, gravity runs per command frame (one input per tick). Walk through a **doorway** — the glowing gap in the
 middle of each wall (go beside the pillar on its axis) — into the
 neighbouring room. The rooms are **one continuous world**: room `(x, y)`
 sits at world `(x, y) × 40 m` (they share walls), the rooms around yours

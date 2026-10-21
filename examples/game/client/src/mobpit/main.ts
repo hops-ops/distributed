@@ -146,7 +146,7 @@ function applySky(dtMs: number): void {
 
 const hud = new Hud({
 	title: 'Mob Pit',
-	hint: 'WASD move · Space attack · E dash · walk through a doorway to the next room · O debug overlay · P prediction · G server ghost. Rooms run on celld; kills are durable facts.',
+	hint: 'WASD move · Space attack · E dash · Q jump (over a slam) · walk through a doorway to the next room · O debug overlay · P prediction · G server ghost. Rooms run on celld; kills are durable facts.',
 	client,
 	devApi: api
 });
@@ -755,7 +755,7 @@ function sendCommandFrame(): void {
 	const input: PitInput = {
 		mx: toAxis(move.x),
 		my: toAxis(move.y),
-		buttons: (s.action ? BUTTON.attack : 0) | (s.alt ? BUTTON.dash : 0)
+		buttons: (s.action ? BUTTON.attack : 0) | (s.alt ? BUTTON.dash : 0) | (s.jump ? BUTTON.jump : 0)
 	};
 	client.sendInput(input);
 }
@@ -811,15 +811,15 @@ stage.onFrame((now, dtMs) => {
 			for (const m of [visual.body, visual.hpBack, visual.hpFill]) m.setEnabled(visible);
 		} else {
 			const player = playerFields(entity);
-			const { x, y, dead, face, swing } = player;
-			visual.body.position.copyFrom(at(x, y, 0.9));
+			const { x, y, z, dead, face, swing } = player;
+			visual.body.position.copyFrom(at(x, y, 0.9 + z));
 			visual.body.material = dead ? mats.dead : mine ? mats.me : mats.other;
-			visual.nose.position.copyFrom(at(x + Math.cos(face) * 0.5, y + Math.sin(face) * 0.5, 1.3));
+			visual.nose.position.copyFrom(at(x + Math.cos(face) * 0.5, y + Math.sin(face) * 0.5, 1.3 + z));
 			visual.nose.rotation.y = -face;
 			// Blade sweeps through the swing cone while `swing` counts down to 0.
 			const sweep = swing > 0 ? ((SWING_FRAMES - swing) / SWING_FRAMES) * 2 * SWING_HALF - SWING_HALF : -Math.PI / 2.5;
 			const a = face + sweep;
-			visual.blade.position.copyFrom(at(x + Math.cos(a) * 0.8, y + Math.sin(a) * 0.8, 1.0));
+			visual.blade.position.copyFrom(at(x + Math.cos(a) * 0.8, y + Math.sin(a) * 0.8, 1.0 + z));
 			visual.blade.rotation.y = -a;
 			visual.blade.setEnabled(visible && !dead);
 			visual.arc.setEnabled(visible && swing > 0);
@@ -856,7 +856,7 @@ stage.onFrame((now, dtMs) => {
 	let ghostGap: number | undefined;
 	if (authoritative !== undefined && authority !== undefined) {
 		const g = playerFields({ fields: authoritative });
-		ghost.position.copyFrom(placeIn(authority.zoneId, g.x, g.y, 0.9));
+		ghost.position.copyFrom(placeIn(authority.zoneId, g.x, g.y, 0.9 + g.z));
 		if (me !== undefined) ghostGap = Math.hypot(ghost.position.x - me.at.x, ghost.position.z - me.at.z);
 	}
 	ghost.setEnabled(ghostOn && authoritative !== undefined && !(stage.view() === 'first' && (ghostGap ?? 0) < 0.8));

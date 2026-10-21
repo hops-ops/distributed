@@ -12,14 +12,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { isMob, playerFields } from '../src/generated/mobpit/index.ts';
+import { BUTTON, isMob, playerFields } from '../src/generated/mobpit/index.ts';
 import { createMobPitClient, MobPitApi } from '../src/mobpit/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
 import { eventually, memoryStorage, sleep, until } from './helpers/demo-server.mjs';
 import { startPit } from './helpers/mobpit.mjs';
 
 /** The predicted `player` fields (the Rust `MoveState`). */
-const stateFromFields = (f) => ({ x: f.x, y: f.y, vx: f.vx, vy: f.vy, dash: f.dash, cd: f.cd });
+const stateFromFields = (f) => ({ x: f.x, y: f.y, vx: f.vx, vy: f.vy, dash: f.dash, cd: f.cd, z: f.z, vz: f.vz });
 
 test('Mob Pit network panel: exact prediction, NetSim on celld rooms, interest ring', { timeout: 600_000 }, async () => {
 	const server = await startPit('mobpit');
@@ -46,6 +46,19 @@ test('Mob Pit network panel: exact prediction, NetSim on celld rooms, interest r
 		const authoritative = stateFromFields(client.authority.replica.get(hello.entity).fields);
 		assert.deepEqual(authoritative, expected, 'the room agrees with the WASM prediction');
 		assert.deepEqual(stateFromFields(client.predictor.authoritative()), authoritative, 'the ghost is the replica');
+
+		// A jump: up and down, predicted exactly too.
+		let apex = 0;
+		for (let i = 0; i < 30; i += 1) {
+			client.sendInput({ mx: 40, my: 0, buttons: i < 3 ? BUTTON.jump : 0 });
+			apex = Math.max(apex, client.predictor.predicted().z);
+			await sleep(1000 / 30);
+		}
+		assert.ok(apex > 1, `jumped (apex ${apex})`);
+		const landed = stateFromFields(client.predictor.predicted());
+		await until(() => client.predictor.pending.length === 0, 5_000, 'acks');
+		assert.deepEqual(stateFromFields(client.authority.replica.get(hello.entity).fields), landed, 'the jump agrees bit for bit');
+		assert.equal(landed.z, 0, 'back on the floor');
 
 		// NetSim: the rooms' setting raises the RTT through celld.
 		const connection = client.authority.connection;

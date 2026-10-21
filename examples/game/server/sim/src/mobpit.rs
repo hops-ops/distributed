@@ -26,8 +26,8 @@ use distributed_game::{game_pure, predict, FieldType, GameInput, GameRecord};
 use crate::arena::{self, MoveInput, MoveState};
 use crate::grid;
 
-/// Input: the Arena's 3-byte frame (`[mx, my, buttons]`) with an attack
-/// bit next to dash.
+/// Input: the Arena's 3-byte frame (`[mx, my, buttons]`) with attack and
+/// jump bits next to dash.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameInput)]
 pub struct PitInput {
     /// Stick x.
@@ -36,8 +36,8 @@ pub struct PitInput {
     /// Stick y.
     #[range(min = -127, max = 127)]
     pub my: i8,
-    /// [`PitInput::DASH`] | [`PitInput::ATTACK`].
-    #[buttons(dash, attack)]
+    /// [`PitInput::DASH`] | [`PitInput::ATTACK`] | [`PitInput::JUMP`].
+    #[buttons(dash, attack, jump)]
     pub buttons: u8,
 }
 
@@ -54,6 +54,73 @@ impl PitInput {
     /// Attack held.
     pub fn attack(self) -> bool {
         self.buttons & Self::ATTACK != 0
+    }
+
+    /// Jump held.
+    pub fn jump(self) -> bool {
+        self.buttons & Self::JUMP != 0
+    }
+}
+
+/// Gravity (m/s²).
+pub const GRAVITY: f32 = 24.0;
+/// Take-off speed of a jump (m/s): about 1.5 m up, 0.7 s in the air.
+pub const JUMP_SPEED: f32 = 8.5;
+/// Wire type of `z` (height above the floor, m).
+pub const HEIGHT: FieldType = FieldType::quant_centered(4.0, 14);
+
+/// Mob Pit's predicted state: the Arena capsule on the floor plus a
+/// vertical axis (`z` above the floor, `vz`). Every field is replicated
+/// under the same name, so clients rebase on the authoritative copy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, GameRecord)]
+pub struct PitState {
+    /// Position x.
+    pub x: f32,
+    /// Position y.
+    pub y: f32,
+    /// Velocity x.
+    pub vx: f32,
+    /// Velocity y.
+    pub vy: f32,
+    /// Remaining dash frames.
+    pub dash: u8,
+    /// Remaining dash cooldown frames.
+    pub cd: u8,
+    /// Height above the floor (m); 0 on the ground.
+    pub z: f32,
+    /// Vertical velocity (m/s).
+    pub vz: f32,
+}
+
+impl PitState {
+    /// The floor part (the Arena's state).
+    pub fn planar(self) -> MoveState {
+        MoveState {
+            x: self.x,
+            y: self.y,
+            vx: self.vx,
+            vy: self.vy,
+            dash: self.dash,
+            cd: self.cd,
+        }
+    }
+
+    /// `self` with its floor part replaced.
+    pub fn with_planar(self, m: MoveState) -> Self {
+        Self {
+            x: m.x,
+            y: m.y,
+            vx: m.vx,
+            vy: m.vy,
+            dash: m.dash,
+            cd: m.cd,
+            ..self
+        }
+    }
+
+    /// Standing on the floor.
+    pub fn grounded(self) -> bool {
+        self.z <= 0.0
     }
 }
 
@@ -72,11 +139,11 @@ thread_local! {
 /// generated inside the step (the browser needs no copy of the room).
 #[predict(PitStep, kind = "player")]
 pub fn pit_step(
-    state: &MoveState,
+    state: &PitState,
     input: &PitInput,
     context: &PitRoomContext,
     _dt: f32,
-) -> MoveState {
+) -> PitState {
     let key = (context.seed, context.x, context.y);
     OBSTACLES.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -106,25 +173,43 @@ const SLACK: f32 = 0.01;
 pub const POS: FieldType = FieldType::quant_centered(22.0, 18);
 
 /// One command frame in a room with the classic pillars (the entrance).
-pub fn step(s: MoveState, input: PitInput) -> MoveState {
+pub fn step(s: PitState, input: PitInput) -> PitState {
     step_among(s, input, &arena::PILLARS)
 }
 
 /// One command frame: [`arena::advance_among`] (stick, dash, the room's
-/// obstacles), then the walls with their doorway passages, snapped to the
-/// wire precision.
-pub fn step_among(s: MoveState, input: PitInput, obstacles: &[(f32, f32, f32)]) -> MoveState {
-    let next = arena::advance_among(s, input.movement(), obstacles);
-    canonicalize(walls(s, next))
+/// obstacles), then the walls with their doorway passages, then the jump
+/// (take off from the floor, gravity, land), snapped to the wire precision.
+pub fn step_among(s: PitState, input: PitInput, obstacles: &[(f32, f32, f32)]) -> PitState {
+    let planar = s.planar();
+    let next = walls(
+        planar,
+        arena::advance_among(planar, input.movement(), obstacles),
+    );
+    let (mut z, mut vz) = (s.z, s.vz);
+    if input.jump() && s.grounded() {
+        vz = JUMP_SPEED;
+    }
+    if z > 0.0 || vz > 0.0 {
+        z += vz * arena::DT;
+        vz -= GRAVITY * arena::DT;
+        if z <= 0.0 {
+            z = 0.0;
+            vz = 0.0;
+        }
+    }
+    canonicalize(PitState { z, vz, ..s }.with_planar(next))
 }
 
 /// Snap to the replicated precision of a Mob Pit player.
-pub fn canonicalize(s: MoveState) -> MoveState {
-    MoveState {
+pub fn canonicalize(s: PitState) -> PitState {
+    PitState {
         x: arena::snap(POS, s.x),
         y: arena::snap(POS, s.y),
         vx: arena::snap(arena::VEL, s.vx),
         vy: arena::snap(arena::VEL, s.vy),
+        z: arena::snap(HEIGHT, s.z).max(0.0),
+        vz: arena::snap(arena::VEL, s.vz),
         ..s
     }
 }
@@ -641,8 +726,8 @@ pub fn crossing(x: f32, y: f32) -> Option<(i32, i32)> {
 
 /// The same player in the frame of the neighbour at room offset `step`:
 /// the same world point and velocity (world = room × [`ROOM_SIZE`] + local).
-pub fn into_neighbour(step: (i32, i32), s: MoveState) -> MoveState {
-    canonicalize(MoveState {
+pub fn into_neighbour(step: (i32, i32), s: PitState) -> PitState {
+    canonicalize(PitState {
         x: s.x - step.0 as f32 * ROOM_SIZE,
         y: s.y - step.1 as f32 * ROOM_SIZE,
         ..s
@@ -650,7 +735,7 @@ pub fn into_neighbour(step: (i32, i32), s: MoveState) -> MoveState {
 }
 
 /// Whether `s` is a position a player can be in (the room or a passage).
-pub fn admissible(s: &MoveState) -> bool {
+pub fn admissible(s: &PitState) -> bool {
     let lim = arena::HALF - arena::PLAYER_RADIUS + SLACK;
     let gap = DOOR_HALF - arena::PLAYER_RADIUS + SLACK;
     let far = arena::HALF + PASSAGE + SLACK;
@@ -659,6 +744,9 @@ pub fn admissible(s: &MoveState) -> bool {
         && s.y.is_finite()
         && s.vx.is_finite()
         && s.vy.is_finite()
+        && s.z.is_finite()
+        && s.vz.is_finite()
+        && (0.0..=4.0).contains(&s.z)
         && ((ax <= lim && ay <= lim) || (ay <= gap && ax <= far) || (ax <= gap && ay <= far))
 }
 
@@ -806,10 +894,10 @@ mod tests {
         assert_eq!(pattern, 3);
         let o = obstacles[0];
         let circles: Vec<(f32, f32, f32)> = obstacles.iter().map(|o| (o.x, o.y, o.r)).collect();
-        let mut s = canonicalize(MoveState {
+        let mut s = canonicalize(PitState {
             x: o.x - (o.r + 3.0),
             y: o.y,
-            ..MoveState::default()
+            ..PitState::default()
         });
         for _ in 0..90 {
             s = step_among(
@@ -830,6 +918,44 @@ mod tests {
     }
 
     #[test]
+    fn a_jump_goes_up_and_lands() {
+        let jump = PitInput {
+            mx: 0,
+            my: 0,
+            buttons: PitInput::JUMP,
+        };
+        let mut s = canonicalize(PitState {
+            x: 4.5,
+            y: 4.5,
+            ..PitState::default()
+        });
+        s = step(s, jump);
+        assert!(s.z > 0.2 && s.vz > 0.0, "{s:?}");
+        let mut apex = 0.0f32;
+        let mut frames = 1;
+        while !s.grounded() {
+            // Holding jump in the air does nothing more.
+            s = step(s, jump);
+            apex = apex.max(s.z);
+            frames += 1;
+            assert!(frames < 60, "lands: {s:?}");
+        }
+        assert!((1.2..1.8).contains(&apex), "apex {apex}");
+        assert_eq!((s.z, s.vz), (0.0, 0.0));
+        assert!((18..26).contains(&frames), "{frames} frames in the air");
+        // Through a doorway mid-air, the height is carried.
+        let air = canonicalize(PitState {
+            x: 20.6,
+            y: 0.5,
+            z: 0.8,
+            vz: 2.0,
+            ..PitState::default()
+        });
+        let n = into_neighbour((1, 0), air);
+        assert_eq!((n.z, n.vz), (air.z, air.vz));
+    }
+
+    #[test]
     fn room_ids_and_doorways() {
         assert_eq!(room_zone((1, -2)), "pit.1.-2");
         assert_eq!(parse_room("pit.1.-2"), Some((1, -2)));
@@ -838,7 +964,7 @@ mod tests {
         assert_eq!(parse_room("pit.2000000.0"), None);
     }
 
-    fn walk(mut s: MoveState, mx: i8, my: i8, frames: usize) -> MoveState {
+    fn walk(mut s: PitState, mx: i8, my: i8, frames: usize) -> PitState {
         for _ in 0..frames {
             s = step(s, PitInput { mx, my, buttons: 0 });
         }
@@ -850,10 +976,10 @@ mod tests {
         let lim = arena::HALF - arena::PLAYER_RADIUS;
         // Along the east door axis (y = 0.5): through the gap past the wall
         // line, up to the passage's end.
-        let at = |x, y| MoveState {
+        let at = |x, y| PitState {
             x,
             y,
-            ..MoveState::default()
+            ..PitState::default()
         };
         let s = walk(at(17.0, 0.5), 127, 0, 60);
         assert!((s.x - (arena::HALF + PASSAGE)).abs() < 1e-3, "{s:?}");
@@ -873,11 +999,11 @@ mod tests {
 
     #[test]
     fn crossing_keeps_the_world_point() {
-        let s = canonicalize(MoveState {
+        let s = canonicalize(PitState {
             x: arena::HALF + HYSTERESIS + 0.1,
             y: 1.25,
             vx: 5.0,
-            ..MoveState::default()
+            ..PitState::default()
         });
         let step = crossing(s.x, s.y).expect("past the line");
         let n = into_neighbour(step, s);
@@ -887,18 +1013,18 @@ mod tests {
         assert!(admissible(&n));
         assert_eq!(crossing(n.x, n.y), None, "hysteresis: no bounce back");
         // West / south mirror.
-        let w = into_neighbour((-1, 0), MoveState { x: -21.0, ..s });
+        let w = into_neighbour((-1, 0), PitState { x: -21.0, ..s });
         assert!((w.x - 19.0).abs() < 1e-3, "{w:?}");
         let south = into_neighbour(
             (0, -1),
-            MoveState {
+            PitState {
                 x: 0.0,
                 y: -21.0,
                 ..s
             },
         );
         assert!((south.y - 19.0).abs() < 1e-3, "{south:?}");
-        assert!(!admissible(&MoveState {
+        assert!(!admissible(&PitState {
             x: 21.0,
             y: 5.0,
             ..s

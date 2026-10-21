@@ -55,7 +55,8 @@ use distributed_game::{
     FactOutcome, FactSettlement, GameEvent, GameInput, GameRecord, GameSurface, LeaveReason,
     ObserverId, PlayerId, Project, Replicated, View, Zone,
 };
-use game_sim::arena::{self as movement, MoveState, PLAYER_RADIUS};
+use game_sim::arena::{self as movement, PLAYER_RADIUS};
+use game_sim::mobpit::PitState as MoveState;
 use game_sim::mobpit::{
     self as rooms, admissible, borough_of, crossing, hood_of, into_neighbour, pair_shard,
     parse_room, pit_room, pit_world, room_zone, PitRoomContext, PitRoomFn, BOSS_TIER,
@@ -69,7 +70,8 @@ pub use game_sim::mobpit::{pit_step, PitInput, PitStep};
 /// Entity id of the stats entity (the zone's own HUD view).
 pub const PIT_ENTITY: EntityId = EntityId(900);
 
-/// A player: the Arena's predicted [`MoveState`] plus server-owned combat
+/// A player: the predicted [`MoveState`] (the Arena capsule plus a jump's
+/// height, `game_sim::mobpit::PitState`) plus server-owned combat
 /// state.
 #[derive(Debug, Clone, PartialEq, Replicated)]
 #[replicated(kind = "player", id = 1, priority = 2.0, of = Player)]
@@ -102,6 +104,16 @@ pub struct PlayerView {
     #[correct(snap)]
     #[from(state.cd)]
     pub cd: u8,
+    /// Height above the floor (a jump).
+    #[field_type(rooms::HEIGHT)]
+    #[correct(ease = 100)]
+    #[from(state.z)]
+    pub z: f32,
+    /// Vertical velocity.
+    #[field_type(movement::VEL)]
+    #[correct(snap)]
+    #[from(state.vz)]
+    pub vz: f32,
     /// Display name.
     #[priority(0.2)]
     #[correct(replace)]
@@ -429,6 +441,8 @@ const LEASH: f32 = 15.0;
 const WINDUP_TICKS: u16 = 24;
 const RECOVER_TICKS: u16 = 18;
 const RESPAWN_TICKS: u64 = 120;
+/// A player at least this high (m) jumps over a mob's slam.
+pub const SLAM_CLEARANCE: f32 = 0.9;
 const PLAYER_RESPAWN_TICKS: u64 = 90;
 
 /// Mob tier stats: (max hp, speed m/s, damage, radius, telegraph radius).
@@ -698,10 +712,10 @@ fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
 }
 
 /// Carried through a doorway: the player's [`MoveState`] in the
-/// neighbour's frame (x y vx vy as f32 LE, dash, cd).
+/// neighbour's frame (x y vx vy z vz as f32 LE, dash, cd): a jump carries on.
 fn encode_carried(s: &MoveState) -> Vec<u8> {
-    let mut out = Vec::with_capacity(18);
-    for v in [s.x, s.y, s.vx, s.vy] {
+    let mut out = Vec::with_capacity(26);
+    for v in [s.x, s.y, s.vx, s.vy, s.z, s.vz] {
         out.extend_from_slice(&v.to_le_bytes());
     }
     out.extend_from_slice(&[s.dash, s.cd]);
@@ -710,7 +724,7 @@ fn encode_carried(s: &MoveState) -> Vec<u8> {
 
 /// Inverse of [`encode_carried`]; None unless it is a place a player can be.
 fn decode_carried(bytes: &[u8]) -> Option<MoveState> {
-    if bytes.len() != 18 {
+    if bytes.len() != 26 {
         return None;
     }
     let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
@@ -719,8 +733,10 @@ fn decode_carried(bytes: &[u8]) -> Option<MoveState> {
         y: f(1),
         vx: f(2),
         vy: f(3),
-        dash: bytes[16],
-        cd: bytes[17],
+        z: f(4),
+        vz: f(5),
+        dash: bytes[24],
+        cd: bytes[25],
     };
     admissible(&state).then(|| rooms::canonicalize(state))
 }
@@ -1024,6 +1040,13 @@ impl MobPit {
             .filter(|(_, p)| p.dead_until.is_none())
             .map(|(id, p)| (*id, p.state.x, p.state.y))
             .collect();
+        // Who a slam reaches: the ring is on the floor, a jump clears it.
+        let low: Vec<PlayerId> = self
+            .players
+            .iter()
+            .filter(|(_, p)| p.state.z < SLAM_CLEARANCE)
+            .map(|(id, _)| *id)
+            .collect();
         let mut hits: Vec<(PlayerId, i32)> = Vec::new();
         let difficulty = self.world.hood_tier;
         let boss_down = self.world.boss_down;
@@ -1087,7 +1110,9 @@ impl MobPit {
                     m.timer = m.timer.saturating_sub(1);
                     if m.timer == 0 {
                         for (id, x, y) in &living {
-                            if dist((m.x, m.y), (*x, *y)) <= tele + PLAYER_RADIUS * 0.5 {
+                            if dist((m.x, m.y), (*x, *y)) <= tele + PLAYER_RADIUS * 0.5
+                                && low.contains(id)
+                            {
                                 hits.push((*id, damage));
                             }
                         }
@@ -1732,6 +1757,20 @@ impl MobPit {
     /// A player's position (tests and bots).
     pub fn player_position(&self, player: PlayerId) -> Option<(f32, f32)> {
         self.players.get(&player).map(|p| (p.state.x, p.state.y))
+    }
+
+    /// A player's predicted state and hit points (tests and bots).
+    pub fn player_state(&self, player: PlayerId) -> Option<(MoveState, i32)> {
+        self.players.get(&player).map(|p| (p.state, p.hp))
+    }
+
+    /// Mobs winding up a slam: `(id, x, y, ticks left)` (tests and bots).
+    pub fn mob_windups(&self) -> Vec<(u32, f32, f32, u16)> {
+        self.mobs
+            .iter()
+            .filter(|m| m.state == MobState::Windup)
+            .map(|m| (m.id.get(), m.x, m.y, m.timer))
+            .collect()
     }
 }
 

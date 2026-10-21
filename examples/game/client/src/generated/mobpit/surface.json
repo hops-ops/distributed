@@ -435,7 +435,8 @@
       {
         "buttons": [
           "dash",
-          "attack"
+          "attack",
+          "jump"
         ],
         "name": "buttons",
         "type": {
@@ -520,6 +521,33 @@
           "priority": 1.0,
           "type": {
             "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "durationMs": 100,
+            "mode": "ease"
+          },
+          "name": "z",
+          "priority": 1.0,
+          "type": {
+            "bits": 14,
+            "max": 3.9995117,
+            "min": -4.0,
+            "type": "quant"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "vz",
+          "priority": 1.0,
+          "type": {
+            "bits": 12,
+            "max": 15.9921875,
+            "min": -16.0,
+            "type": "quant"
           }
         },
         {
@@ -809,7 +837,7 @@
     "export": "pit_step",
     "kind": "player",
     "package": "game_sim",
-    "state": "MoveState"
+    "state": "PitState"
   },
   "protocolVersion": 1,
   "pures": [
@@ -850,47 +878,6 @@
         }
       ],
       "name": "MobTier"
-    },
-    {
-      "fields": [
-        {
-          "name": "x",
-          "type": {
-            "type": "f32"
-          }
-        },
-        {
-          "name": "y",
-          "type": {
-            "type": "f32"
-          }
-        },
-        {
-          "name": "vx",
-          "type": {
-            "type": "f32"
-          }
-        },
-        {
-          "name": "vy",
-          "type": {
-            "type": "f32"
-          }
-        },
-        {
-          "name": "dash",
-          "type": {
-            "type": "u8"
-          }
-        },
-        {
-          "name": "cd",
-          "type": {
-            "type": "u8"
-          }
-        }
-      ],
-      "name": "MoveState"
     },
     {
       "fields": [
@@ -1075,6 +1062,59 @@
         }
       ],
       "name": "PitRules"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vx",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vy",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "dash",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "cd",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "z",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "vz",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "PitState"
     },
     {
       "fields": [

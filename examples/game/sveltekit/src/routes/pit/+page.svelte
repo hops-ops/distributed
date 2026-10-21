@@ -171,7 +171,7 @@
 			<div>prediction <b data-testid="prediction">{game.predictionReady ? 'wasm' : 'loading'}</b></div>
 			{#if game.error}<div class="error" data-testid="error">{game.error}</div>{/if}
 			<label><input type="checkbox" bind:checked={autoHunt} data-testid="autohunt" /> auto-hunt</label>
-			<small>WASD move · Space attack · E dash · walk through a doorway (the gaps in the walls) to the next room</small>
+			<small>WASD move · Space attack · E dash · Q jump · walk through a doorway (the gaps in the walls) to the next room</small>
 		</section>
 		<section data-testid="world">
 			<h2>World</h2>

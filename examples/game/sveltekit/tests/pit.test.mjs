@@ -284,6 +284,12 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		const moved = await page.evaluate(() => document.querySelector('canvas').dataset.me.split(',').map(Number));
 		assert.ok(moved[0] > start[0] + 0.5 || Math.hypot(moved[0] - start[0], moved[1] - start[1]) > 0.5, `moved ${start} → ${moved}`);
 
+		// Jump (Q): the predicted height rises and comes back to the floor.
+		await page.keyboard.down('KeyQ');
+		await page.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.z ?? 0) > 0.5, null, { timeout: 5_000 });
+		await page.keyboard.up('KeyQ');
+		await page.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.z ?? 1) === 0, null, { timeout: 5_000 });
+
 		// Network panel: the latency slider sets the rooms' simulated network
 		// (dev route → the cells worker's dev settings → every room on celld
 		// delays its sockets); the RTT rises, the server ghost trails the

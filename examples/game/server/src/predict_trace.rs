@@ -162,7 +162,7 @@ fn capsule_streams(extra_bytes: usize) -> Vec<Stream> {
 /// other seeded patterns (the context names the room; its obstacles are
 /// generated inside the step).
 fn pit_streams() -> Vec<Stream> {
-    use game_sim::mobpit::{room_obstacles, PitRoomContext, DEFAULT_SEED};
+    use game_sim::mobpit::{canonicalize, room_obstacles, PitRoomContext, PitState, DEFAULT_SEED};
     let context = |x: i32, y: i32| {
         PitRoomContext {
             seed: DEFAULT_SEED,
@@ -171,13 +171,44 @@ fn pit_streams() -> Vec<Stream> {
         }
         .encode_context()
     };
-    let mut streams: Vec<Stream> = capsule_streams(0)
+    let start = |x: f32, y: f32| {
+        state_bytes(&canonicalize(PitState {
+            x,
+            y,
+            ..PitState::default()
+        }))
+    };
+    // The capsule script with a jump every 37 frames (the jump bit is 0x04).
+    let scripted_jumps: Vec<Vec<u8>> = scripted(&|_| Vec::new())
         .into_iter()
-        .map(|s| Stream {
-            context: context(0, 0),
-            ..s
+        .enumerate()
+        .map(|(i, mut f)| {
+            if i % 37 < 3 {
+                f[2] |= 0x04;
+            }
+            f
         })
         .collect();
+    let mut streams = vec![
+        Stream {
+            name: "scripted + jumps".into(),
+            start: start(-5.0, -5.0),
+            context: context(0, 0),
+            inputs: scripted_jumps,
+        },
+        Stream {
+            name: "random".into(),
+            start: start(8.0, 3.0),
+            context: context(0, 0),
+            inputs: random(0x1234_5678, 3000, 0),
+        },
+        Stream {
+            name: "corner".into(),
+            start: start(18.5, -18.5),
+            context: context(0, 0),
+            inputs: random(0x0bad_cafe, 600, 0),
+        },
+    ];
     let mut patterns = std::collections::BTreeSet::new();
     for x in 1..60 {
         let (pattern, _) = room_obstacles(DEFAULT_SEED, (x, 2));
@@ -186,11 +217,7 @@ fn pit_streams() -> Vec<Stream> {
         }
         streams.push(Stream {
             name: format!("pit.{x}.2 pattern {pattern}"),
-            start: state_bytes(&arena::canonicalize(MoveState {
-                x: 4.5,
-                y: 4.5,
-                ..MoveState::default()
-            })),
+            start: start(4.5, 4.5),
             context: context(x, 2),
             inputs: random(0x51ed ^ x as u32, 1200, 0),
         });

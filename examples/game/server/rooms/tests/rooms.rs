@@ -444,3 +444,84 @@ fn a_boss_falls_to_a_party_its_hood_hears_and_it_stays_down() {
     tick(&mut room, &clock);
     assert!(boss(&room).3, "back when its hood says so");
 }
+
+/// Walk `player` toward the nearest living mob until one winds up a slam
+/// next to it; then, with `jump`, take off so the slam lands mid-air.
+/// Returns the player's HP before and after the slam.
+fn face_a_slam(jump: bool) -> (i32, i32) {
+    let clock = ManualClock::new();
+    let mut room = host("pit.0.0", &clock);
+    let (client, player) = join(&mut room, "ana");
+    let mut seq = 0u32;
+    let mut send = |room: &mut ZoneHost<MobPit>, input: PitInput| {
+        seq += 1;
+        room.push_input(
+            client,
+            seq,
+            seq,
+            &distributed_game::GameInput::to_payload(&input),
+        );
+    };
+    for _ in 0..900 {
+        let (me, hp) = room.zone().player_state(player).expect("in the room");
+        if let Some(&(_, _, _, left)) = room.zone().mob_windups().first() {
+            if left <= 12 {
+                let before = hp;
+                send(
+                    &mut room,
+                    PitInput {
+                        buttons: if jump { PitInput::JUMP } else { 0 },
+                        ..PitInput::default()
+                    },
+                );
+                // One command frame per tick, as clients send them (the
+                // step, gravity included, runs per input).
+                for _ in 0..20 {
+                    tick(&mut room, &clock);
+                    send(&mut room, PitInput::default());
+                }
+                let (_, after) = room.zone().player_state(player).expect("in the room");
+                return (before, after);
+            }
+            send(&mut room, PitInput::default());
+        } else {
+            let target = room
+                .zone()
+                .mob_positions()
+                .into_iter()
+                .filter(|m| m.3)
+                .min_by(|a, b| {
+                    let d = |m: &(u32, f32, f32, bool)| (m.1 - me.x).powi(2) + (m.2 - me.y).powi(2);
+                    d(a).total_cmp(&d(b))
+                })
+                .expect("a mob");
+            let (dx, dy) = (target.1 - me.x, target.2 - me.y);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            let k = if d < 1.6 { 0.0 } else { 127.0 / d };
+            send(
+                &mut room,
+                PitInput {
+                    mx: (dx * k) as i8,
+                    my: (dy * k) as i8,
+                    buttons: 0,
+                },
+            );
+        }
+        tick(&mut room, &clock);
+    }
+    panic!("no slam");
+}
+
+#[test]
+fn a_jump_clears_a_mobs_slam() {
+    let (before, after) = face_a_slam(false);
+    assert!(
+        after < before,
+        "standing in the ring hurts: {before} → {after}"
+    );
+    let (before, after) = face_a_slam(true);
+    assert!(
+        after >= before,
+        "jumping over it does not: {before} → {after}"
+    );
+}

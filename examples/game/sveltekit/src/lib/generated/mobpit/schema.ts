@@ -27,6 +27,10 @@ export interface PlayerFields {
 	readonly dash: number;
 	/** `u8` */
 	readonly cd: number;
+	/** `quant [-4, 3.9995117] / 14 bits` */
+	readonly z: number;
+	/** `quant [-16, 15.9921875] / 12 bits` */
+	readonly vz: number;
 	/** `short_str`, priority 0.2 */
 	readonly name: string;
 	/** `u8` */
@@ -56,6 +60,8 @@ export function playerFields(entity: { readonly fields: EntityFields }): PlayerF
 		vy: fieldNumber(f, 'vy'),
 		dash: fieldNumber(f, 'dash'),
 		cd: fieldNumber(f, 'cd'),
+		z: fieldNumber(f, 'z'),
+		vz: fieldNumber(f, 'vz'),
 		name: fieldString(f, 'name'),
 		hp: fieldNumber(f, 'hp'),
 		face: fieldNumber(f, 'face'),
@@ -170,6 +176,8 @@ export const FIELD_TYPES = {
 		vy: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		dash: { type: 'u8' },
 		cd: { type: 'u8' },
+		z: { type: 'quant', min: -4, max: 3.99951171875, bits: 14 },
+		vz: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		name: { type: 'short_str' },
 		hp: { type: 'u8' },
 		face: { type: 'angle', bits: 8 },
@@ -210,6 +218,8 @@ export const CORRECTIONS: CorrectionPolicies = {
 		vy: { mode: 'snap' },
 		dash: { mode: 'snap' },
 		cd: { mode: 'snap' },
+		z: { mode: 'ease', durationMs: 100 },
+		vz: { mode: 'snap' },
 		name: { mode: 'replace' },
 		hp: { mode: 'replace' },
 		face: { mode: 'replace' },
