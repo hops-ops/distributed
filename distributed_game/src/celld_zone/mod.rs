@@ -65,8 +65,21 @@
 //! ticking (they keep its last state), goes dormant and hibernates (their
 //! sockets are closed) — and an observer Hello never wakes a sleeping zone:
 //! it is refused with [`error::ASLEEP`](crate::protocol::error::ASLEEP).
-//! Only a player wakes a zone. A watcher joining a dormant zone gets its
-//! current state at once ([`ZoneHost::patch_now`](crate::ZoneHost::patch_now)).
+//! Only a player — or a *near* watcher — wakes a zone. A watcher joining
+//! a dormant zone gets its current state at once
+//! ([`ZoneHost::patch_now`](crate::ZoneHost::patch_now)).
+//!
+//! **Near watchers** (proximity wake): an observer whose ticket grants
+//! `wake` ([`TicketClaims::wake`](crate::TicketClaims::wake)) and that says
+//! it is near (Hello `near`, later
+//! [`ClientMessage::Near`](crate::protocol::ClientMessage::Near), no
+//! reconnect) counts as occupancy like a player: it wakes a sleeping zone
+//! and keeps it ticking. When it says it is no longer near, or closes, the
+//! zone goes dormant and hibernates as usual. Without the grant the
+//! watcher stays passive and is told
+//! [`error::WAKE_DENIED`](crate::protocol::error::WAKE_DENIED) (still
+//! connected; a fresh ticket may carry the grant). The ticket issuer bounds who may wake what (e.g. only rooms
+//! next to the principal's own); the zone checks only the signed grant.
 //!
 //! **Live content updates.** With `ZONE_CONTENT_ROLLOUT=<world>` every
 //! zone object follows the world's

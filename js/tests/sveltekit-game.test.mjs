@@ -456,3 +456,27 @@ test('useGame does nothing during SSR (no client, no connection)', async () => {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test('ticket handler: wake() grants observers the wake claim; players and the browser never get it', async () => {
+	const asked = [];
+	const { call } = harness({
+		rateLimit: false,
+		wake: (context) => {
+			asked.push(context);
+			return context.zone === 'pit-u1';
+		}
+	});
+	const granted = await expectStatus(call({ body: { role: 'observer' } }), 200);
+	assert.equal(decodeClaims(granted.ticket).wake, true);
+	assert.equal(asked.at(-1).principal, 'u1');
+	assert.equal(asked.at(-1).role, 'observer');
+	const player = await expectStatus(call({ body: {} }), 200);
+	assert.equal('wake' in decodeClaims(player.ticket), false, 'players never carry wake');
+	assert.equal(asked.length, 1, 'not asked for players');
+	await expectStatus(call({ body: { role: 'observer', wake: true } }), 400);
+	const denied = await expectStatus(harness({ rateLimit: false, wake: () => false }).call({ body: { role: 'observer' } }), 200);
+	assert.equal('wake' in decodeClaims(denied.ticket), false);
+	const none = await expectStatus(harness({ rateLimit: false }).call({ body: { role: 'observer' } }), 200);
+	assert.equal('wake' in decodeClaims(none.ticket), false, 'default: never');
+	await assert.rejects(mintGameTicket({ secret: SECRET, principal: 'p', zone: 'z', wake: true }), /only observer/);
+});

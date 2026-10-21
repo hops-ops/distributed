@@ -1160,6 +1160,7 @@ async fn run_zone<Z>(
                 role: Role::Player,
                 name: request.name.clone(),
                 extensions: request.extensions.clone(),
+                wake: false,
             },
             source_zone: request.source_zone.clone(),
             issuer: inner.host_id.clone(),
@@ -1891,6 +1892,9 @@ where
                     }
                     Ok(ClientMessage::Ping { client_time }) => Inbound::Ping(client_time),
                     Ok(ClientMessage::Content { content_version }) => Inbound::Content(content_version),
+                    // Native zones keep observers' zones running already;
+                    // nearness only matters to celld zones.
+                    Ok(ClientMessage::Near { .. }) => continue,
                     Ok(ClientMessage::Leave) => { graceful = true; break; }
                     Ok(ClientMessage::Hello(_)) => {
                         let _ = socket.send(Message::Binary(error_frame(error::BAD_MESSAGE, "already joined").into())).await;

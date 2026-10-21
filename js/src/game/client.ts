@@ -286,12 +286,29 @@ export class GameClient<TInput = unknown> {
 		return zone.connection.connect();
 	}
 
-	/** Observe a neighbouring zone (read-only; merged into `render`). */
-	observe(zoneId: string): Promise<WelcomeMessage> {
+	/**
+	 * Observe a neighbouring zone (read-only; merged into `render`). With
+	 * `near` the observer says it is near the zone (celld zones: with a
+	 * ticket that grants `wake` it wakes the zone and keeps it awake; see
+	 * `setNear`).
+	 */
+	observe(zoneId: string, options: { near?: boolean } = {}): Promise<WelcomeMessage> {
 		this.#assertOpen();
 		const existing = this.#zones.get(zoneId);
-		if (existing !== undefined) return existing.connection.connect();
-		return this.#adopt(zoneId, 'observer').connection.connect();
+		if (existing !== undefined) {
+			if (options.near !== undefined && existing.role === 'observer') existing.connection.setNear(options.near);
+			return existing.connection.connect();
+		}
+		return this.#adopt(zoneId, 'observer', undefined, options.near).connection.connect();
+	}
+
+	/**
+	 * Say whether an observed zone is near (keep it awake) or not (a passive
+	 * watcher), without reconnecting. No-op for zones not observed.
+	 */
+	setNear(zoneId: string, near: boolean): void {
+		const zone = this.#zones.get(zoneId);
+		if (zone?.role === 'observer') zone.connection.setNear(near);
 	}
 
 	/** Stop observing a zone. */
@@ -463,7 +480,12 @@ export class GameClient<TInput = unknown> {
 		if (this.#closed) throw new Error('GameClient is closed');
 	}
 
-	#connectionOptions(zoneId: string, role: 'authority' | 'observer', initialTicket?: string): GameConnectionOptions {
+	#connectionOptions(
+		zoneId: string,
+		role: 'authority' | 'observer',
+		initialTicket?: string,
+		near?: boolean
+	): GameConnectionOptions {
 		const o = this.#options;
 		const observerTicket: GameTicketSource =
 			o.observerTicket ?? ((request) => o.ticket({ ...request, role: 'observer' }));
@@ -471,6 +493,7 @@ export class GameClient<TInput = unknown> {
 			url: o.url(zoneId),
 			zoneId,
 			role: role === 'authority' ? 'player' : 'observer',
+			near: role === 'observer' && near === true,
 			ticket: role === 'authority' ? o.ticket : observerTicket,
 			initialTicket,
 			contentVersion: this.#contentVersion,
@@ -489,7 +512,7 @@ export class GameClient<TInput = unknown> {
 	 * same zone (observer, or retired after a handoff) hands its replica over
 	 * so already-rendered entities continue without a gap.
 	 */
-	#adopt(zoneId: string, role: 'authority' | 'observer', initialTicket?: string): Zone {
+	#adopt(zoneId: string, role: 'authority' | 'observer', initialTicket?: string, near?: boolean): Zone {
 		const prior = this.#zones.get(zoneId) ?? this.#retired.get(zoneId);
 		const replica =
 			prior?.replica ??
@@ -498,7 +521,7 @@ export class GameClient<TInput = unknown> {
 				staleGraceMs: this.#options.staleGraceMs,
 				historyMs: this.#options.historyMs
 			});
-		const connection = new GameConnection(this.#connectionOptions(zoneId, role, initialTicket));
+		const connection = new GameConnection(this.#connectionOptions(zoneId, role, initialTicket, near));
 		const zone: Zone = { zoneId, role, connection, replica, offs: [], firstDeltaSeen: false };
 		if (prior !== undefined) {
 			// The prior connection keeps feeding the shared replica until the

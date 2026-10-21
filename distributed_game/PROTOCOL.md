@@ -195,6 +195,7 @@ replication priorities are not transmitted.
 | `0x03` | C→S | Ping |
 | `0x04` | C→S | Leave |
 | `0x05` | C→S | Content |
+| `0x06` | C→S | Near |
 | `0x80` | S→C | Welcome |
 | `0x81` | S→C | Delta |
 | `0x82` | S→C | Event |
@@ -213,11 +214,13 @@ decode errors.
 
 ```
 Hello  := 0x01, varuint protocol_version, string content_version,
-          varuint capabilities, string ticket, string reconnect_token
+          varuint capabilities, string ticket, string reconnect_token,
+          bool near
 Input  := 0x02, varuint seq, varuint client_tick, bytes payload
 Ping   := 0x03, f64 client_time
 Leave  := 0x04
 Content := 0x05, string content_version
+Near   := 0x06, bool near
 ```
 
 - **Hello** MUST be the first message, sent within the server's hello
@@ -227,6 +230,7 @@ Content := 0x05, string content_version
   join `ticket` is a signed admission ticket (§8) and `reconnect_token` is
   empty; for a reconnect `ticket` MAY be empty and `reconnect_token` is the
   token from the last Welcome. A second Hello gets `Error(BAD_MESSAGE)`.
+  `near` is for observers (ignored for players): see **Near**.
 - **Input**: `payload` is game-defined. Duplicate or already-processed
   `seq` values are ignored. Inputs are rate limited per connection
   (default 120/s, burst 240); excess inputs are dropped and the server
@@ -247,6 +251,16 @@ Content := 0x05, string content_version
   zone's current content version (a client can catch up, never get
   ahead) and ignores it otherwise; observers' are ignored. Without it a
   live-patched client counts as stale until its next Hello.
+- **Near** (and Hello `near`): an observer says it is near the zone (e.g.
+  its player is close to this room) or no longer is. On zones hosted as
+  celld objects a near observer whose ticket grants `wake` (§8) counts as
+  occupancy: its Hello wakes a sleeping zone (instead of `ASLEEP`) and the
+  zone keeps ticking while it stays near; `near = false` (or closing the
+  connection) lets the zone go dormant and hibernate as usual. Without the
+  grant the observer stays a passive watcher and is sent
+  `Error(WAKE_DENIED)` (the connection stays open).
+  Servers that keep observed zones running anyway (the native `net`
+  server) ignore it; players' are ignored.
 
 Worked example — Hello (`version 1, content "c1", caps 5, ticket "t.k.n"`):
 
@@ -257,6 +271,7 @@ Worked example — Hello (`version 1, content "c1", caps 5, ticket "t.k.n"`):
 05                 capabilities 5
 05 74 2e 6b 2e 6e  ticket "t.k.n"
 00                 reconnect_token ""
+00                 near false
 ```
 
 Input (`seq 300, client_tick 1000, payload 01 ff`): `02 ac02 e807 02 01ff`.
@@ -319,8 +334,11 @@ Redirect := 0x89, string zone_id, string url
   `8` RECONNECT_FAILED, `9` ZONE_UNAVAILABLE (the zone could not be created
   right now; retry later), `10` ASLEEP (an observer is not admitted to a
   sleeping zone it would otherwise wake; zones hosted as celld objects treat
-  observers as passive watchers; retry later). Errors during the handshake are followed by close;
-  `BAD_MESSAGE` and `RATE_LIMITED` after joining are not.
+  observers as passive watchers unless near with a `wake` grant; retry
+  later), `11` WAKE_DENIED (an observer said it is near but its ticket
+  does not grant `wake`; it stays a passive watcher — a fresh ticket may
+  grant it). Errors during the handshake are followed by close;
+  `BAD_MESSAGE`, `RATE_LIMITED` and `WAKE_DENIED` after joining are not.
 
 Worked example — Welcome (session "s1", zone "z1", player, 30 Hz ticks,
 20 Hz patches, tick 42, time 1000.25 ms, token "rt", content "c1",
@@ -466,6 +484,11 @@ unpadded base64url). Any HS256 JWT library can mint one.
     inputs.
   - `name` (string, optional) — display name vouched for by the issuer
     (never identity). Carried into transfer tickets.
+  - `wake` (bool, optional, default false) — observers only: the issuer
+    lets this watcher wake the zone and keep it awake while it is near
+    (Hello `near` / `Near`, celld zones). The issuer decides who may (for
+    example only rooms next to the principal's own); the zone never
+    trusts the client for it.
 - Failures produce `Error(UNAUTHORIZED)` and close.
 
 **Custom ticket formats.** A server MAY admit join tickets in another
@@ -563,7 +586,7 @@ JSON conventions in `decoded`:
 ## 10. Versioning
 
 `protocol_version` changes on any incompatible wire change. Message type
-bytes `0x05..0x7f` and `0x8a..0xff`, and field type tags `10..255`, are
+bytes `0x07..0x7f` and `0x8a..0xff`, and field type tags `10..255`, are
 reserved for future versions.
 
 Additive changes within version 1 (clients SHOULD ignore unknown kick and
@@ -573,6 +596,12 @@ error codes and treat them as "session over" / "request failed"):
 - Kick code `7` RELOAD.
 - Error code `9` ZONE_UNAVAILABLE.
 - Error code `10` ASLEEP.
+- Error code `11` WAKE_DENIED.
+- `0x06 Near` (client → server) and the ticket claim `wake`.
+
+Not additive (made before the first release, so the version stays 1):
+Hello's trailing `bool near` — clients built before it send one byte
+less and are refused with `BAD_MESSAGE`; rebuild them.
 - Transfer tickets (§8.1) and content-version policies (§8.2); `Handoff`
   and `Freeze`/`Resume` encodings are unchanged.
 

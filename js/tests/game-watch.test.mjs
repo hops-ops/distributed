@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { watchZones } from '../dist/game/index.js';
+import { GameErrorCode, watchZones } from '../dist/game/index.js';
 
 /** A GameClient stand-in: zones, observe / unobserve, events. */
 function stubClient() {
@@ -13,16 +13,24 @@ function stubClient() {
 		observed: [],
 		zones: () => [...zones.values()],
 		zone: (id) => zones.get(id),
-		observe(id) {
+		nearCalls: [],
+		observe(id, options = {}) {
 			client.observed.push(id);
-			const zone = { zoneId: id, role: 'observer', connection: { state: 'connecting' } };
+			const zone = { zoneId: id, role: 'observer', near: options.near === true, connection: { state: 'connecting' } };
 			zones.set(id, zone);
-			if ((answers.get(id) ?? 'asleep') === 'ok') {
+			// A near watcher wakes a sleeping zone (its ticket grants wake).
+			if ((answers.get(id) ?? 'asleep') === 'ok' || zone.near) {
 				zone.connection.state = 'open';
 				return Promise.resolve({});
 			}
 			zone.connection.state = 'closed';
 			return Promise.reject(new Error('ASLEEP'));
+		},
+		setNear(id, near) {
+			const zone = zones.get(id);
+			if (zone?.role !== 'observer') return;
+			if (zone.near !== near) client.nearCalls.push([id, near]);
+			zone.near = near;
 		},
 		unobserve(id) {
 			if (zones.get(id)?.role === 'observer') zones.delete(id);
@@ -86,4 +94,79 @@ test('watchZones observes the zones around the authority, lets sleeping ones go 
 	client.join('z9');
 	tick();
 	assert.equal(client.observed.length, before, 'stopped');
+});
+
+test('watchZones: near zones are observed near, a sleeping one is retried at once, and released', async () => {
+	const client = stubClient();
+	let clock = 0;
+	const around = (zone) => {
+		const n = Number(zone.slice(1));
+		return [`z${n - 1}`, `z${n + 1}`];
+	};
+	const watch = watchZones(client, around, { now: () => clock, setInterval: () => 1, clearInterval: () => {} });
+	client.answers.set('z1', 'ok');
+	client.join('z2');
+	await flush();
+	assert.deepEqual(Object.fromEntries(watch.states()), { z1: 'watching', z3: 'asleep' });
+	// Near z1 (awake, open): told without reconnecting.
+	const opened = client.observed.length;
+	watch.setNear(['z1']);
+	assert.equal(client.zone('z1').near, true);
+	assert.equal(client.observed.length, opened, 'no reconnect');
+	// Near z3 (asleep, backing off): retried at once, near, and it wakes.
+	watch.setNear(['z1', 'z3']);
+	await flush();
+	assert.equal(client.zone('z3').near, true);
+	assert.equal(watch.states().get('z3'), 'watching');
+	assert.deepEqual([...watch.near()].sort(), ['z1', 'z3']);
+	// Released: passive again, still watched.
+	watch.setNear(['z3']);
+	assert.equal(client.zone('z1').near, false);
+	assert.equal(watch.states().get('z1'), 'watching');
+	assert.deepEqual(client.nearCalls, [['z1', true], ['z1', false]]);
+	// Nothing near: z3 passive too.
+	watch.setNear([]);
+	assert.equal(client.zone('z3').near, false);
+	watch.stop();
+});
+
+test('watchZones: a near watcher refused WAKE_DENIED asks for a fresh ticket, at once then backing off', async () => {
+	const client = stubClient();
+	let clock = 0;
+	let tick = () => {};
+	const watch = watchZones(client, (zone) => [zone === 'z2' ? 'z3' : 'z2'], {
+		now: () => clock,
+		setInterval: (fn) => ((tick = fn), 1),
+		clearInterval: () => {}
+	});
+	client.answers.set('z3', 'ok');
+	client.join('z2');
+	await flush();
+	assert.equal(watch.states().get('z3'), 'watching');
+	const deny = () => client.emit('error', 'z3', { type: 'Error', code: GameErrorCode.WAKE_DENIED, message: 'no grant' });
+	watch.setNear(['z3']);
+	const opened = client.observed.length;
+	// Not near-ready (the ticket had no grant): reopened at once.
+	deny();
+	await flush();
+	assert.equal(client.observed.length, opened + 1, 'a fresh ticket at once');
+	assert.equal(client.zone('z3').near, true, 'reopened near');
+	// Refused again: backs off (3 s), then tries once more.
+	deny();
+	await flush();
+	tick();
+	assert.equal(client.observed.length, opened + 1, 'backing off');
+	clock += 3000;
+	tick();
+	await flush();
+	assert.equal(client.observed.length, opened + 2);
+	// A refusal for a zone that is no longer near is ignored.
+	watch.setNear([]);
+	deny();
+	clock += 60_000;
+	tick();
+	await flush();
+	assert.equal(client.observed.length, opened + 2);
+	assert.equal(client.zone('z3').near, false);
+	watch.stop();
 });

@@ -369,6 +369,7 @@ async fn drive(
         role: Role::Player,
         name: None,
         extensions: Default::default(),
+        wake: false,
     });
     let url = format!(
         "{}/{}/{}",
@@ -385,6 +386,7 @@ async fn drive(
         capabilities: 0,
         ticket,
         reconnect_token: String::new(),
+        near: false,
     });
     ws.send(Message::Binary(hello.encode().into()))
         .await

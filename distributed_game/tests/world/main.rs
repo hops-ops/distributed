@@ -43,6 +43,7 @@ fn ticket(principal: &str, zone: &str, nonce: &str) -> String {
         role: Role::Player,
         name: None,
         extensions: Default::default(),
+        wake: false,
     })
 }
 
@@ -129,6 +130,7 @@ async fn hello(ws: &mut Ws, ticket: &str, token: &str, version: &str) {
             capabilities: 0,
             ticket: ticket.into(),
             reconnect_token: token.into(),
+            near: false,
         }),
     )
     .await;
@@ -335,6 +337,7 @@ async fn cross_host_handoff_follows_redirect_and_ticket_is_single_use() {
         role: Role::Player,
         name: None,
         extensions: Default::default(),
+        wake: false,
     });
     assert!(join_url(&b.addr.zone_url("realm.west"), &forged, "")
         .await

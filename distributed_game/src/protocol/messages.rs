@@ -20,6 +20,9 @@ pub mod tag {
     pub const LEAVE: u8 = 0x04;
     /// Client → server Content (patched live to a content version).
     pub const CONTENT: u8 = 0x05;
+    /// Client → server Near (an observer asks to keep the zone awake, or
+    /// lets go).
+    pub const NEAR: u8 = 0x06;
     /// Server → client Welcome.
     pub const WELCOME: u8 = 0x80;
     /// Server → client Delta.
@@ -85,6 +88,10 @@ pub mod error {
     /// The zone is asleep and an observer does not wake it (zones hosted as
     /// celld objects: observers are passive watchers); try again later.
     pub const ASLEEP: u32 = 10;
+    /// An observer said it is near (Hello `near` / `Near`) but its ticket
+    /// does not grant `wake`: it stays a passive watcher. Sent after the
+    /// join, without closing; a fresh ticket may grant it.
+    pub const WAKE_DENIED: u32 = 11;
 }
 
 /// Client handshake.
@@ -100,6 +107,12 @@ pub struct Hello {
     pub ticket: String,
     /// Reconnect token from a previous Welcome (empty for a fresh join).
     pub reconnect_token: String,
+    /// An observer that is *near* (e.g. its player is close to this zone):
+    /// on zones hosted as celld objects a near observer whose ticket grants
+    /// `wake` wakes a sleeping zone and keeps it awake like a player;
+    /// otherwise it is a passive watcher. Changed later with
+    /// [`ClientMessage::Near`]. Ignored for players.
+    pub near: bool,
 }
 
 /// Messages a client sends.
@@ -130,6 +143,12 @@ pub enum ClientMessage {
         /// The version the client runs now.
         content_version: String,
     },
+    /// An observer is near the zone (keep it awake) or no longer is
+    /// (passive watcher again); see [`Hello::near`].
+    Near {
+        /// Near (true) or passive (false).
+        near: bool,
+    },
 }
 
 impl ClientMessage {
@@ -143,7 +162,8 @@ impl ClientMessage {
                     .string(&h.content_version)
                     .varuint(h.capabilities)
                     .string(&h.ticket)
-                    .string(&h.reconnect_token);
+                    .string(&h.reconnect_token)
+                    .bool(h.near);
             }
             Self::Input {
                 seq,
@@ -164,6 +184,9 @@ impl ClientMessage {
             Self::Content { content_version } => {
                 w.u8(tag::CONTENT).string(content_version);
             }
+            Self::Near { near } => {
+                w.u8(tag::NEAR).bool(*near);
+            }
         }
         w.into_bytes()
     }
@@ -178,6 +201,7 @@ impl ClientMessage {
                 capabilities: r.varuint()?,
                 ticket: r.string()?,
                 reconnect_token: r.string()?,
+                near: r.bool()?,
             }),
             tag::INPUT => Self::Input {
                 seq: r.varuint()?,
@@ -191,6 +215,7 @@ impl ClientMessage {
             tag::CONTENT => Self::Content {
                 content_version: r.string()?,
             },
+            tag::NEAR => Self::Near { near: r.bool()? },
             other => return Err(DecodeError::UnknownMessage(other)),
         };
         r.finish()?;

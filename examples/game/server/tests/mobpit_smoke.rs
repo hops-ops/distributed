@@ -602,6 +602,7 @@ async fn presence_is_settled_in_presence_cells_from_the_rooms_lifecycle_facts() 
                 capabilities: 0,
                 ticket,
                 reconnect_token: String::new(),
+                near: false,
             });
             ws.send(Message::Binary(hello.encode().into()))
                 .await

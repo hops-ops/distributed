@@ -85,6 +85,12 @@ export type GameConnectionOptions = Readonly<{
 	zoneId: string;
 	/** Expected role (informational; the ticket decides). Default `player`. */
 	role?: GameRole;
+	/**
+	 * Observers: start near the zone (Hello `near`). On celld zones a near
+	 * observer whose ticket grants `wake` wakes the zone and keeps it
+	 * awake; see `setNear`. Default false (a passive watcher).
+	 */
+	near?: boolean;
 	ticket: GameTicketSource;
 	/** Ticket for the first Hello only (e.g. a Handoff transfer ticket). */
 	initialTicket?: string;
@@ -210,6 +216,7 @@ export class GameConnection {
 	readonly #baseUrl: string;
 	#url: string;
 	#contentVersion: string;
+	#near: boolean;
 	#redirects = 0;
 	#lastResumeVersion: string | undefined;
 	#attempt: Attempt | undefined;
@@ -233,6 +240,7 @@ export class GameConnection {
 		this.#baseUrl = options.url;
 		this.#url = options.url;
 		this.#contentVersion = options.contentVersion ?? '';
+		this.#near = options.near ?? false;
 		this.#initialTicket = options.initialTicket;
 		this.#scheduler = options.scheduler ?? defaultScheduler;
 		const factory =
@@ -417,6 +425,24 @@ export class GameConnection {
 		}
 	}
 
+	/** Whether this (observer) connection says it is near the zone. */
+	get near(): boolean {
+		return this.#near;
+	}
+
+	/**
+	 * Observers: say whether the zone is near (keep it awake — celld zones,
+	 * with a ticket that grants `wake`) or not (a passive watcher). Sent at
+	 * once on an open observer connection (`Near`) and in every later Hello.
+	 */
+	setNear(near: boolean): void {
+		const changed = near !== this.#near;
+		this.#near = near;
+		if (changed && this.#state === 'open' && this.mirror.welcome?.role === 'observer') {
+			this.#send({ type: 'Near', near });
+		}
+	}
+
 	/**
 	 * Continue after a content reload (state `reload-required`): sends the
 	 * new `contentVersion` in Hello, with the reconnect token while the grace
@@ -501,7 +527,8 @@ export class GameConnection {
 				contentVersion: this.#contentVersion,
 				capabilities: this.#options.capabilities ?? 0,
 				ticket,
-				reconnectToken: token
+				reconnectToken: token,
+				near: this.#near
 			});
 		};
 		socket.onmessage = (event) => {

@@ -4,8 +4,10 @@
 //! base64url(header) "." base64url(claims)))`, unpadded base64url. The header
 //! must be `{"alg":"HS256",...}`; claims are
 //! `{"sub","zone","exp","nonce","role"?}` where `exp` is Unix seconds and
-//! `role` is `"player"` (default) or `"observer"`. Any HS256 JWT library can
-//! mint them. The principal is taken **only** from a verified `sub`.
+//! `role` is `"player"` (default) or `"observer"`; an optional `wake: true`
+//! lets an observer wake the zone when near (celld zones,
+//! [`TicketClaims::wake`]). Any HS256 JWT library can mint them. The
+//! principal is taken **only** from a verified `sub`.
 //!
 //! **Transfer tickets** (zone handoff) are the same format with
 //! `"kind":"transfer"` plus `src` (source zone), `iss` (issuing host id),
@@ -334,6 +336,7 @@ impl TicketKey {
                     Some(ext) => TicketExtensions::from_json(ext.clone())
                         .map_err(|e| TicketError::Invalid(e.to_string()))?,
                 },
+                wake: claims.get("wake").and_then(Value::as_bool) == Some(true),
             },
             claims,
         ))
@@ -347,6 +350,9 @@ fn with_name(mut body: Value, claims: &TicketClaims) -> Value {
         }
         if !claims.extensions.is_empty() {
             object.insert("ext".into(), claims.extensions.to_json());
+        }
+        if claims.wake {
+            object.insert("wake".into(), Value::Bool(true));
         }
     }
     body
@@ -399,6 +405,7 @@ mod tests {
             role: Role::Player,
             name: None,
             extensions: Default::default(),
+            wake: false,
         }
     }
 
@@ -412,6 +419,20 @@ mod tests {
             TicketKey::new("other").verify(&ticket, 1_000),
             Err(TicketError::BadSignature)
         );
+    }
+
+    #[test]
+    fn the_wake_grant_round_trips_and_defaults_to_off() {
+        let key = TicketKey::new("secret");
+        let mut watcher = claims().with_wake(true);
+        watcher.role = Role::Observer;
+        let ticket = key.sign(&watcher);
+        assert!(key.verify(&ticket, 1_000).unwrap().wake);
+        let passive = key.sign(&TicketClaims {
+            role: Role::Observer,
+            ..claims()
+        });
+        assert!(!key.verify(&passive, 1_000).unwrap().wake);
     }
 
     #[test]

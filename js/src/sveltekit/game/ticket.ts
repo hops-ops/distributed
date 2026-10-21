@@ -71,6 +71,12 @@ export type MintGameTicketOptions = Readonly<{
 	 * Identity-, reward- and economy-looking names are refused.
 	 */
 	extensions?: GameTicketExtensions;
+	/**
+	 * Observers only: let this watcher wake the zone and keep it awake while
+	 * it says it is near (claim `wake`; celld zones). Decided on the server
+	 * (e.g. only rooms next to the principal's own). Default false.
+	 */
+	wake?: boolean;
 	/** Lifetime in seconds (1..=300, default 60). */
 	ttlSeconds?: number;
 	/** Clock in Unix milliseconds (tests). Default `Date.now()`. */
@@ -221,6 +227,9 @@ export async function mintGameTicket(options: MintGameTicketOptions): Promise<Mi
 		name = trimmed.length === 0 ? undefined : trimmed;
 	}
 	const ext = checkGameTicketExtensions(options.extensions);
+	if (options.wake === true && role !== 'observer') {
+		throw new TypeError('only observer tickets can grant wake');
+	}
 	const exp = Math.floor(now / 1000) + ttl;
 	const ticket = await signHs256(options.secret, {
 		sub: principal,
@@ -229,7 +238,8 @@ export async function mintGameTicket(options: MintGameTicketOptions): Promise<Mi
 		nonce,
 		role,
 		...(name === undefined ? {} : { name }),
-		...(ext === undefined ? {} : { ext })
+		...(ext === undefined ? {} : { ext }),
+		...(options.wake === true ? { wake: true } : {})
 	});
 	return Object.freeze({ ticket, zone, role, expiresAt: exp * 1000, nonce });
 }

@@ -634,6 +634,7 @@ fn get_claims(r: &mut Reader<'_>) -> Result<TicketClaims, RecordingError> {
         role,
         name,
         extensions,
+        wake: false,
     })
 }
 

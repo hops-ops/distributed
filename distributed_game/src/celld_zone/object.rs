@@ -1,7 +1,7 @@
 //! The Durable Object side of the celld zone host (wasm32 only).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
@@ -411,6 +411,10 @@ struct Inner<Z: CelldZone> {
     wakes: u64,
     state: RoomState,
     sockets: HashMap<u32, WebSocket>,
+    /// Observers whose ticket grants `wake` ([`TicketClaims::wake`]).
+    may_wake: HashSet<u32>,
+    /// Of those, the ones near right now: they keep the zone awake.
+    near: HashSet<u32>,
     ticking: bool,
     nonces: NonceCache,
     sink: Option<DurableFacts>,
@@ -465,8 +469,7 @@ impl<Z: CelldZone> Inner<Z> {
                 }
             }
             OutItem::Close => {
-                self.out_lines.remove(&client);
-                self.in_lines.remove(&client);
+                self.forget(client);
                 if let Some(ws) = self.sockets.remove(&client) {
                     let _ = ws.close(Some(1000), Some("closed by zone"));
                 }
@@ -551,16 +554,46 @@ impl<Z: CelldZone> Inner<Z> {
         }
     }
 
-    /// Forget a socket's delay lines.
+    /// Forget a socket's delay lines and nearness.
     fn forget(&mut self, client: u32) {
         self.out_lines.remove(&client);
         self.in_lines.remove(&client);
+        self.may_wake.remove(&client);
+        self.near.remove(&client);
     }
 
-    /// Players keep a zone awake (also inside their reconnect grace);
-    /// observers are passive watchers and never do.
+    /// Players keep a zone awake (also inside their reconnect grace), and
+    /// so do near observers; other observers are passive watchers.
     fn occupied(&self) -> bool {
-        self.host.as_ref().is_some_and(|h| h.player_count() > 0)
+        self.host.as_ref().is_some_and(|h| {
+            h.player_count() > 0 || self.near.iter().any(|c| self.sockets.contains_key(c))
+        })
+    }
+
+    /// An observer declares itself near (or not). Only an observer whose
+    /// ticket grants `wake` can be near (others are told `WAKE_DENIED`);
+    /// returns whether the zone must start ticking (it was not and is
+    /// occupied now).
+    fn set_near(&mut self, client: u32, near: bool) -> bool {
+        if !self.sockets.contains_key(&client) {
+            return false;
+        }
+        if near && self.may_wake.contains(&client) {
+            self.near.insert(client);
+        } else {
+            self.near.remove(&client);
+            if near {
+                if let Ok(frame) = (ServerMessage::Error {
+                    code: error::WAKE_DENIED,
+                    message: "ticket does not grant wake".into(),
+                })
+                .encode(&())
+                {
+                    self.send_out(client, OutItem::Frame(frame));
+                }
+            }
+        }
+        self.occupied() && !self.ticking
     }
 
     fn flush(&mut self) {
@@ -691,6 +724,8 @@ impl<Z: CelldZone> ZoneObject<Z> {
             wakes: 0,
             state: RoomState::Cold,
             sockets: HashMap::new(),
+            may_wake: HashSet::new(),
+            near: HashSet::new(),
             ticking: false,
             nonces: NonceCache::default(),
             sink: None,
@@ -831,6 +866,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 .encode(&())
                 {
                     let _ = ws.send_with_bytes(pong);
+                }
+            }
+            (Some(client), ClientMessage::Near { near }) => {
+                let start = self.inner.borrow_mut().set_near(client, near);
+                if start {
+                    self.keep_awake().await;
                 }
             }
             (Some(client), ClientMessage::Content { content_version }) => {
@@ -1062,6 +1103,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                                 role: Role::Player,
                                 name: request.name.clone(),
                                 extensions: request.extensions.clone(),
+                                wake: false,
                             },
                             source_zone: request.source_zone.clone(),
                             issuer: issuer_zone.clone(),
@@ -1292,6 +1334,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let now = (now_ms() / 1000.0) as u64;
         // Transfer tickets are single use across activations too.
         let mut principal = None;
+        let mut wake_grant = false;
         let joined = if hello.reconnect_token.is_empty() {
             let verified = {
                 let inner = self.inner.borrow();
@@ -1314,8 +1357,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 reject(ws, error::UNAUTHORIZED, "ticket is for another zone");
                 return Ok(());
             }
-            // A passive watcher never wakes a sleeping zone.
-            if cold && claims.role == Role::Observer {
+            // A passive watcher never wakes a sleeping zone; a near one
+            // whose ticket grants `wake` does.
+            let observer = claims.role == Role::Observer;
+            wake_grant = observer && claims.wake;
+            if cold && observer && !(hello.near && wake_grant) {
                 reject(ws, error::ASLEEP, "zone asleep");
                 return Ok(());
             }
@@ -1397,7 +1443,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         };
         match joined {
             Ok(joined) => {
-                let observer = matches!(joined.viewer, Viewer::Observer(_));
+                let mut observer = matches!(joined.viewer, Viewer::Observer(_));
                 {
                     let mut inner = self.inner.borrow_mut();
                     let activation = inner.activation.clone();
@@ -1406,6 +1452,17 @@ impl<Z: CelldZone> ZoneObject<Z> {
                         activation,
                     })?;
                     inner.sockets.insert(joined.client.0, ws.clone());
+                    if observer && wake_grant {
+                        inner.may_wake.insert(joined.client.0);
+                    }
+                    if observer && hello.near {
+                        // A near watcher (with the grant) keeps the zone
+                        // awake like a player; without it, it is told so
+                        // after its Welcome and stays passive.
+                        inner.flush();
+                        inner.set_near(joined.client.0, true);
+                        observer = !wake_grant;
+                    }
                     if observer && !inner.ticking {
                         // A dormant zone does not tick: greet the watcher
                         // with its current state (it stays dormant).
@@ -1431,6 +1488,23 @@ impl<Z: CelldZone> ZoneObject<Z> {
             Err(e) => reject(ws, e.code, &e.message),
         }
         Ok(())
+    }
+
+    /// A near watcher arrived on an awake zone that is not ticking
+    /// (dormant): it is active again and ticks.
+    async fn keep_awake(&self) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.host.is_none() {
+                return;
+            }
+            if inner.state != RoomState::Active {
+                inner.state = RoomState::Active;
+                inner.report(ACTIVITY_ACTIVE);
+            }
+        }
+        self.store_status().await;
+        self.start_loop();
     }
 
     fn after_join(&self, principal: String) {
@@ -1588,6 +1662,8 @@ impl<Z: CelldZone> ZoneObject<Z> {
             }
             inner.out_lines.clear();
             inner.in_lines.clear();
+            inner.may_wake.clear();
+            inner.near.clear();
             // Dropped, so the next join restores from storage.
             inner.host = None;
             inner.state = RoomState::Cold;
@@ -1715,6 +1791,8 @@ impl<Z: CelldZone> ZoneObject<Z> {
             "node": inner.node,
             "isolate": ISOLATE.with(|i| i.clone()),
             "players": host.map_or(0, |h| h.player_count()),
+            "observers": host.map_or(0, |h| h.observer_count()),
+            "near": inner.near.len(),
             "tick": host.map_or(0, |h| h.tick()),
             "hz": inner.options.as_ref().map_or(0, |o| o.tick_hz),
             "ticking": inner.ticking,

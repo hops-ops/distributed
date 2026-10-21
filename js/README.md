@@ -776,7 +776,12 @@ requestAnimationFrame(function frame(now) {
 `watchZones(game, around)` keeps the zones `around(authority)` observed
 across handoffs, lets go of closed ones and retries them every 3 s — zones
 hosted as celld objects treat observers as passive watchers that never wake
-a sleeping zone, which refuses them with `GameErrorCode.ASLEEP`)
+a sleeping zone, which refuses them with `GameErrorCode.ASLEEP`; unless
+they are *near*: `watch.setNear(zones)` / `game.setNear(zone, near)` /
+`observe(zone, { near: true })` tell the zone without reconnecting, and a
+near watcher whose ticket grants `wake` — `mintGameTicket({ wake })`, the
+ticket handler's server-side `wake(context)` — wakes the zone and keeps it
+awake; a sleeping zone that becomes near is retried at once)
 sampled at `serverNow − interpolationDelay`, with the controlled entity at
 its predicted state. The delay is **adaptive** per zone by default
 (`AdaptiveDelay`: `rtt / 2 + 2 patch intervals + 2 × jitter`, clamped to

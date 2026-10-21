@@ -4,26 +4,28 @@
       "decoded": {
         "capabilities": 5,
         "content_version": "c1",
+        "near": false,
         "protocol_version": 1,
         "reconnect_token": "",
         "ticket": "t.k.n",
         "type": "Hello"
       },
       "direction": "client_to_server",
-      "hex": "01010263310505742e6b2e6e00",
+      "hex": "01010263310505742e6b2e6e0000",
       "name": "hello"
     },
     {
       "decoded": {
         "capabilities": 0,
         "content_version": "c1",
+        "near": false,
         "protocol_version": 1,
         "reconnect_token": "abcd",
         "ticket": "",
         "type": "Hello"
       },
       "direction": "client_to_server",
-      "hex": "010102633100000461626364",
+      "hex": "01010263310000046162636400",
       "name": "hello_reconnect"
     },
     {
@@ -62,6 +64,38 @@
       "direction": "client_to_server",
       "hex": "05026332",
       "name": "content"
+    },
+    {
+      "decoded": {
+        "capabilities": 0,
+        "content_version": "c1",
+        "near": true,
+        "protocol_version": 1,
+        "reconnect_token": "",
+        "ticket": "t.k.n",
+        "type": "Hello"
+      },
+      "direction": "client_to_server",
+      "hex": "01010263310005742e6b2e6e0001",
+      "name": "hello_near"
+    },
+    {
+      "decoded": {
+        "near": true,
+        "type": "Near"
+      },
+      "direction": "client_to_server",
+      "hex": "0601",
+      "name": "near"
+    },
+    {
+      "decoded": {
+        "near": false,
+        "type": "Near"
+      },
+      "direction": "client_to_server",
+      "hex": "0600",
+      "name": "passive"
     },
     {
       "decoded": {

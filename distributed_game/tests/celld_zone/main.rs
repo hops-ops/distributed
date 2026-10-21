@@ -11,6 +11,11 @@
 //!   refused (`ASLEEP`) by a zone that never ran or sleeps, without waking
 //!   it; it sees an awake zone, and does not keep it awake (dormant, then
 //!   hibernated, its socket closed).
+//! - `near_watchers`: `celld dev`. An observer whose ticket grants `wake`
+//!   and that says it is near wakes a sleeping zone and keeps it ticking;
+//!   `Near { near: false }` lets it go dormant, `Near { near: true }` makes
+//!   it active again, and when it lets go for good the zone hibernates.
+//!   Without the grant, or without saying near, a watcher stays passive.
 //! - `fleet`: three celld nodes in production mode on one RustFS bucket
 //!   (docker compose). A zone is reached through a node that does not own
 //!   it, the owner is killed while 200 facts are in flight: the socket
@@ -80,6 +85,27 @@ fn ticket_as(principal: &str, zone: &str, role: Role) -> String {
         .sign(&TicketClaims::new(principal, zone, exp, nonce, role).with_name(principal))
 }
 
+/// An observer ticket that grants `wake` (a near watcher may wake the zone).
+fn wake_ticket(principal: &str, zone: &str) -> String {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 120;
+    let nonce = format!(
+        "{principal}-{zone}-wake-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    TicketKey::new(TICKET_SECRET).sign(
+        &TicketClaims::new(principal, zone, exp, nonce, Role::Observer)
+            .with_name(principal)
+            .with_wake(true),
+    )
+}
+
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -115,12 +141,17 @@ impl Player {
     }
 
     async fn hello(&mut self, ticket: &str) {
+        self.hello_near(ticket, false).await;
+    }
+
+    async fn hello_near(&mut self, ticket: &str, near: bool) {
         self.send(ClientMessage::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
             content_version: String::new(),
             capabilities: 0,
             ticket: ticket.into(),
             reconnect_token: String::new(),
+            near,
         }))
         .await;
     }
@@ -394,6 +425,115 @@ async fn watchers() {
     let info = get(&base, "/rooms/room-w/info").await;
     assert_eq!(info["awake"], false, "{info}");
     assert_eq!(info["wakes"], 1, "woken once, by the player: {info}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn near_watchers() {
+    let _serial = serial();
+    let Some(celld) = celld_support::Celld::start_worker(&worker(), REQUIRED) else {
+        return;
+    };
+    let base = celld.base();
+    let long = Duration::from_secs(30);
+    let zone = "room-n";
+
+    // Near without the ticket's grant: passive, refused while asleep.
+    let mut eve = Player::connect(&base, zone).await;
+    eve.hello_near(&ticket_as("eve", zone, Role::Observer), true)
+        .await;
+    assert_eq!(eve.refused().await, error::ASLEEP);
+    // The grant without saying near: passive too.
+    let mut eve = Player::connect(&base, zone).await;
+    eve.hello_near(&wake_ticket("eve", zone), false).await;
+    assert_eq!(eve.refused().await, error::ASLEEP);
+    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    assert_eq!(info["awake"], false, "{info}");
+    assert_eq!(info["wakes"], 0, "{info}");
+
+    // Granted and near: wakes the zone, which ticks with no player.
+    let mut near = Player::connect(&base, zone).await;
+    near.hello_near(&wake_ticket("ana", zone), true).await;
+    near.welcome().await;
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "active"
+    })
+    .await;
+    // Kept awake past the hibernation delay (2 s here).
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    assert_eq!(info["ticking"], true, "{info}");
+    assert_eq!(info["players"], 0, "{info}");
+    assert_eq!(info["near"], 1, "{info}");
+    assert_eq!(
+        status(&get(&base, &format!("/zone-activity/{zone}")).await),
+        "active"
+    );
+
+    // A watcher without the grant cannot become near.
+    let mut passive = Player::connect(&base, zone).await;
+    passive.hello(&ticket_as("bo", zone, Role::Observer)).await;
+    passive.welcome().await;
+    passive.send(ClientMessage::Near { near: true }).await;
+    let denied = passive
+        .expect(long, "WAKE_DENIED", |got| match got {
+            Got::Server(ServerMessage::Error { code, .. }) => Some(*code),
+            _ => None,
+        })
+        .await;
+    assert_eq!(denied, error::WAKE_DENIED);
+    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    assert_eq!(info["near"], 1, "{info}");
+
+    // Passive again: dormant; near again: active (no reconnect).
+    near.send(ClientMessage::Near { near: false }).await;
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "dormant"
+    })
+    .await;
+    near.send(ClientMessage::Near { near: true }).await;
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "active"
+    })
+    .await;
+    let info = until(&base, &format!("/rooms/{zone}/info"), long, |v| {
+        v["ticking"] == true
+    })
+    .await;
+    assert_eq!(info["wakes"], 1, "woken once: {info}");
+
+    // Let go for good: dormant, then hibernated; the watchers are closed.
+    near.send(ClientMessage::Near { near: false }).await;
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "hibernated"
+    })
+    .await;
+    for watcher in [&mut near, &mut passive] {
+        let closed = watcher
+            .expect(long, "the watcher let go", |got| match got {
+                Got::Closed(code) => Some(*code),
+                _ => None,
+            })
+            .await;
+        assert_eq!(closed, Some(1000));
+    }
+    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    assert_eq!(info["awake"], false, "{info}");
+
+    // A near watcher that disconnects releases the zone too.
+    let mut near = Player::connect(&base, zone).await;
+    near.hello_near(&wake_ticket("ana", zone), true).await;
+    near.welcome().await;
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "active"
+    })
+    .await;
+    drop(near);
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "hibernated"
+    })
+    .await;
+    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    assert_eq!(info["wakes"], 2, "{info}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
