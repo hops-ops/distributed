@@ -68,11 +68,15 @@ export async function startFleet({ relayPort, nodes = 3, vars = {} } = {}) {
 	try {
 		const up = spawnSync('docker', ['compose', '-p', project, '-f', compose, 'up', '-d'], { encoding: 'utf8' });
 		if (up.status !== 0) throw new Error(`docker compose up: ${up.stderr}`);
-		const deadline = Date.now() + 60_000;
+		const deadline = Date.now() + 30_000;
 		for (;;) {
 			const mb = spawnSync('aws', ['--endpoint-url', aws.S3_ENDPOINT, 's3', 'mb', 's3://mobpit-fleet'], { env: aws, encoding: 'utf8' });
 			if (mb.status === 0 || /BucketAlready/.test(mb.stderr)) break;
-			if (Date.now() > deadline) throw new Error(`bucket: ${mb.stderr}`);
+			if (Date.now() > deadline) {
+				// Docker ran the container but its port is not reachable here.
+				down();
+				return skip(`RustFS unreachable on 127.0.0.1:${s3Port}: ${mb.stderr.trim()}`);
+			}
 			await new Promise((r) => setTimeout(r, 500));
 		}
 		const secret = `test-only-${randomBytes(24).toString('hex')}`;
