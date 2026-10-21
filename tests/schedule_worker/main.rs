@@ -162,9 +162,12 @@ async fn handle_tick(
     })
 }
 
-static FLAKY_FAILURES: AtomicUsize = AtomicUsize::new(0);
+/// Ticker ids whose next `ticker.flaky` fails once (tests on different
+/// backends run in parallel, so each uses its own id).
+static FLAKY_ONCE: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// Fails with a retryable (500) error while `FLAKY_FAILURES` > 0.
+/// Fails with a retryable (500) error once per id in `FLAKY_ONCE`.
 struct Flaky;
 impl<D> PortableCommand<D> for Flaky
 where
@@ -182,23 +185,7 @@ async fn handle_flaky(
     ctx: &CausalCommandContext<'_, Ticker>,
     input: TickInput,
 ) -> Result<PreparedCommand<Succeeded<TickerPayload>>, HandlerError> {
-    let mut current = FLAKY_FAILURES.load(Ordering::SeqCst);
-    let mut fail = false;
-    while current > 0 {
-        match FLAKY_FAILURES.compare_exchange(
-            current,
-            current - 1,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        ) {
-            Ok(_) => {
-                fail = true;
-                break;
-            }
-            Err(actual) => current = actual,
-        }
-    }
-    if fail {
+    if FLAKY_ONCE.lock().unwrap().remove(&input.id) {
         return Err(HandlerError::Other("transient dependency outage".into()));
     }
     handle_tick(ctx, input).await
@@ -389,7 +376,13 @@ macro_rules! scenarios {
         #[tokio::test]
         async fn crash_between_commit_and_settle_does_not_fire_twice() {
             let Some(ctx) = $fresh.await else { return };
-            let (repo, crashing_worker) = ctx.repo().await.with_schedule_worker(fast());
+            // A claim long enough to still hold after the restart below
+            // (opening and migrating a Postgres pool takes a while).
+            let claim_ttl = Duration::from_secs(3);
+            let (repo, crashing_worker) = ctx
+                .repo()
+                .await
+                .with_schedule_worker(fast().with_claim_ttl(claim_ttl));
             let committed = Arc::new(AtomicUsize::new(0));
             let crashing: Arc<dyn CommandHost> = Arc::new(CrashAfterCommit {
                 inner: LocalCommandHost::new(service(repo.clone())),
@@ -408,6 +401,9 @@ macro_rules! scenarios {
                 committed.load(Ordering::SeqCst) == 1
             })
             .await;
+            // The claim was taken before the commit, so it lapses before
+            // `committed_at + claim_ttl`.
+            let committed_at = Instant::now();
             running.abort();
             assert_eq!(ticks(&repo, "crash").await, 1);
             assert_eq!(
@@ -420,8 +416,15 @@ macro_rules! scenarios {
             let (repo, worker) = $reopen(&ctx).await.with_schedule_worker(fast());
             let host = LocalCommandHost::new(service(repo.clone()));
             let first = worker.run_once(&host).await.unwrap();
-            assert!(first.is_empty(), "the crashed worker's claim still holds");
-            tokio::time::sleep(Duration::from_millis(450)).await;
+            assert!(
+                committed_at.elapsed() >= claim_ttl - Duration::from_millis(500)
+                    || first.is_empty(),
+                "the crashed worker's claim still holds: {first:?}"
+            );
+            tokio::time::sleep(
+                (claim_ttl + Duration::from_millis(100)).saturating_sub(committed_at.elapsed()),
+            )
+            .await;
             let replay = worker.run_once(&host).await.unwrap();
             assert_eq!(replay.fired.len(), 1, "{replay:?}");
             assert!(
@@ -472,11 +475,12 @@ macro_rules! scenarios {
             let Some(ctx) = $fresh.await else { return };
             let (repo, worker) = ctx.repo().await.with_schedule_worker(fast());
             let host = LocalCommandHost::new(service(repo.clone()));
-            FLAKY_FAILURES.store(1, Ordering::SeqCst);
-            start(&host, "flaky", 1, 0, FLAKY).await;
+            let flaky = format!("flaky-{}", command_id());
+            FLAKY_ONCE.lock().unwrap().insert(flaky.clone());
+            start(&host, &flaky, 1, 0, FLAKY).await;
             let report = worker.run_once(&host).await.unwrap();
             assert_eq!(report.retried.len(), 1, "{report:?}");
-            let retry = repo.armed_schedules(&owner("flaky")).await.unwrap();
+            let retry = repo.armed_schedules(&owner(&flaky)).await.unwrap();
             assert_eq!(retry[0].attempts, 1);
             assert!(
                 worker.run_once(&host).await.unwrap().is_empty(),
@@ -485,8 +489,8 @@ macro_rules! scenarios {
             tokio::time::sleep(Duration::from_millis(1_050)).await;
             let report = worker.run_once(&host).await.unwrap();
             assert_eq!(report.fired.len(), 1, "{report:?}");
-            assert_eq!(ticks(&repo, "flaky").await, 1);
-            assert_eq!(armed(&repo, "flaky").await, 0);
+            assert_eq!(ticks(&repo, &flaky).await, 1);
+            assert_eq!(armed(&repo, &flaky).await, 0);
         }
     };
 }
