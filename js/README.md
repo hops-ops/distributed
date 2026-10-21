@@ -756,7 +756,8 @@ const game = new GameClient<{ dx: number; dy: number }>({
   prediction: {
     encodeInput: ({ dx, dy }) => new Uint8Array([dx & 0xff, dy & 0xff]),
     predict: (s, i, dt) => ({ x: s.x + i.dx * 10 * dt / 1000, y: s.y + i.dy * 10 * dt / 1000 }),
-    corrections: { avatar: { x: { mode: 'ease', durationMs: 120 }, hp: { mode: 'replace' } } }
+    // `snapAbove`: a larger error (a respawn, a teleport) cuts instead of sliding.
+    corrections: { avatar: { x: { mode: 'ease', durationMs: 120, snapAbove: 2 }, hp: { mode: 'replace' } } }
   }
 });
 await game.connect('room-1');

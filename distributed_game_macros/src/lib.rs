@@ -21,7 +21,8 @@
 //!   `FieldType` expression (e.g. a shared `const POS: FieldType`).
 //! - `#[long]` on a `String` payload field: varuint length instead of the
 //!   255-byte short string.
-//! - Replicated only: `#[priority(P)]`, `#[correct(ease = MS | ease | snap | replace)]`,
+//! - Replicated only: `#[priority(P)]`, `#[correct(ease = MS | ease | snap | replace)]`
+//!   (with `ease`, `snap_above = M`: larger errors snap — a teleport is a cut),,
 //!   `#[from]` / `#[from(path.to.field)]` (with `#[replicated(.., of = Entity)]`).
 //! - GameInput only: `#[range(min = A, max = B)]` (clamp), `#[buttons(a, b, ..)]`
 //!   (bit flags, unknown bits cleared; also generates `Type::A`, `Type::B` consts).

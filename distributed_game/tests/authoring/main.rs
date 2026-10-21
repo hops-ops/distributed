@@ -31,7 +31,7 @@ pub struct PlayerView {
     #[correct(ease = 150)]
     pub x: f32,
     #[quant(centered = 20.0, bits = 18)]
-    #[correct(ease = 150)]
+    #[correct(ease = 150, snap_above = 2.5)]
     pub y: f32,
     #[quant(min = -16.0, max = 16.0, bits = 12)]
     #[correct(snap)]
@@ -371,7 +371,17 @@ fn replicated_kind_def_and_values_share_one_field_order() {
     assert_eq!(kind.fields[0].ty, FieldType::quant_centered(20.0, 18));
     assert_eq!(
         kind.fields[0].correction,
-        Some(Correction::Ease { duration_ms: 150 })
+        Some(Correction::Ease {
+            duration_ms: 150,
+            snap_above: None
+        })
+    );
+    assert_eq!(
+        kind.fields[1].correction,
+        Some(Correction::Ease {
+            duration_ms: 150,
+            snap_above: Some(2.5)
+        })
     );
     assert_eq!(kind.fields[2].correction, Some(Correction::Snap));
     assert_eq!(kind.fields[3].ty, FieldType::Angle { bits: 8 });
@@ -509,7 +519,10 @@ fn surface_describes_everything_once() {
     assert_eq!(surface.kinds.len(), 3);
     assert_eq!(
         surface.kinds[0].fields[0].correction,
-        Some(Correction::Ease { duration_ms: 150 })
+        Some(Correction::Ease {
+            duration_ms: 150,
+            snap_above: None
+        })
     );
     let input = surface.input.as_ref().expect("typed input");
     assert_eq!(input.name, "SampleInput");

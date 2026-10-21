@@ -399,7 +399,8 @@ against its former hand-written loop.
 bytes), `#[quant(min, max, bits)]` / `#[quant(centered = R, bits)]` (zero
 exact) / `#[angle(bits)]` / `#[field_type(EXPR)]` for floats,
 `#[priority(p)]`, and `#[correct(ease = ms | snap | replace)]` client
-defaults. The interest position is the `x` / `y` fields (or
+defaults (`ease = ms, snap_above = m`: an error larger than `m` cuts the whole
+entity — a respawn or another server-side teleport is a cut, not a slide). The interest position is the `x` / `y` fields (or
 `#[replicated(x = .., y = ..)]`); a kind without one must be `global`.
 `out.add(..)` returns a handle for `.global()`, `.local()`, `.priority(p)`.
 For each client the engine then sends only the difference from what that

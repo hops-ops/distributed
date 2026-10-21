@@ -18,7 +18,13 @@ import { angleDelta, wrapAngle, type EntityFields } from './replica.js';
 import { canonicalizeField, type FieldValue, type GameKindDef } from './schema.js';
 
 export type CorrectionPolicy =
-	| Readonly<{ mode: 'ease'; durationMs?: number }>
+	/**
+	 * Ease the visual error out over `durationMs`. An error larger than
+	 * `snapAbove` cuts instead — every eased field of the entity at once (a
+	 * teleport such as a respawn moves x and y together; easing it would
+	 * slide the entity across the floor).
+	 */
+	| Readonly<{ mode: 'ease'; durationMs?: number; snapAbove?: number }>
 	| Readonly<{ mode: 'snap' }>
 	| Readonly<{ mode: 'replace' }>;
 
@@ -146,6 +152,7 @@ export class Predictor<TInput> {
 		const kind = this.#kind;
 		if (predicted === undefined || kind === undefined) return;
 		const epsilon = this.#options.epsilon ?? 1e-6;
+		const cut = this.#teleported(shown, predicted);
 		for (const field of kind.fields) {
 			const policy = this.#policy(field.name);
 			const from = shown[field.name];
@@ -154,12 +161,28 @@ export class Predictor<TInput> {
 			const angle = field.type === 'angle';
 			const value = angle ? -angleDelta(from, to) : from - to;
 			const duration = policy.durationMs ?? 100;
-			if (Math.abs(value) > epsilon && duration > 0) {
+			if (Math.abs(value) > epsilon && duration > 0 && !cut) {
 				this.#offsets.set(field.name, { value, start: now, durationMs: duration, angle });
 			} else {
 				this.#offsets.delete(field.name);
 			}
 		}
+	}
+
+	/** True when an `ease` field with `snapAbove` moved further than that (a teleport). */
+	#teleported(shown: EntityFields, next: EntityFields): boolean {
+		const kind = this.#kind;
+		if (kind === undefined) return false;
+		for (const field of kind.fields) {
+			const policy = this.#policy(field.name);
+			if (policy.mode !== 'ease' || policy.snapAbove === undefined) continue;
+			const from = shown[field.name];
+			const to = next[field.name];
+			if (typeof from !== 'number' || typeof to !== 'number') continue;
+			const value = field.type === 'angle' ? -angleDelta(from, to) : from - to;
+			if (Math.abs(value) > policy.snapAbove) return true;
+		}
+		return false;
 	}
 
 	/** New session (Welcome): sequence numbers restart, pending inputs are void. */
@@ -200,6 +223,8 @@ export class Predictor<TInput> {
 		const errors: Record<string, number> = {};
 		const resolved: Record<string, CorrectionPolicy['mode']> = {};
 		const epsilon = this.#options.epsilon ?? 1e-6;
+		// A teleport is a cut, not a misprediction to slide over.
+		const cut = before !== undefined && this.#teleported(before, rebased);
 		for (const field of this.#kind.fields) {
 			const name = field.name;
 			const policy = this.#policy(name);
@@ -213,20 +238,20 @@ export class Predictor<TInput> {
 			const newValue = rebased[name];
 			if (typeof oldValue === 'number' && typeof newValue === 'number') {
 				const error = angle ? -angleDelta(oldValue, newValue) : oldValue - newValue;
+				const shown = before[name];
+				const visual =
+					typeof shown === 'number'
+						? angle
+							? -angleDelta(shown, newValue)
+							: shown - newValue
+						: 0;
 				if (Math.abs(error) > epsilon) {
 					errors[name] = error;
-					resolved[name] = policy.mode;
+					resolved[name] = cut && policy.mode === 'ease' ? 'snap' : policy.mode;
 				}
 				if (policy.mode === 'ease') {
-					const shown = before[name];
-					const visual =
-						typeof shown === 'number'
-							? angle
-								? -angleDelta(shown, newValue)
-								: shown - newValue
-							: 0;
 					const duration = policy.durationMs ?? 100;
-					if (Math.abs(visual) > epsilon && duration > 0) {
+					if (Math.abs(visual) > epsilon && duration > 0 && !cut) {
 						this.#offsets.set(name, { value: visual, start: now, durationMs: duration, angle });
 					} else {
 						this.#offsets.delete(name);
