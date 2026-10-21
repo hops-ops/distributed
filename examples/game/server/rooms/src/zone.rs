@@ -55,7 +55,7 @@ use distributed_game::{
     FactOutcome, FactSettlement, GameEvent, GameInput, GameRecord, GameSurface, LeaveReason,
     ObserverId, PlayerId, Project, Replicated, View, Zone,
 };
-use game_sim::arena::{self as movement, MoveState, PILLARS, PLAYER_RADIUS};
+use game_sim::arena::{self as movement, MoveState, PLAYER_RADIUS};
 use game_sim::mobpit::{
     self as rooms, admissible, borough_of, crossing, hood_of, into_neighbour, pair_shard,
     parse_room, pit_room, pit_world, room_zone, PitRoomContext, PitRoomFn, BOSS_TIER,
@@ -167,16 +167,16 @@ pub struct Pillar {
 }
 
 impl Pillar {
-    /// Every pillar of the floor.
-    pub fn all() -> Vec<Pillar> {
-        PILLARS
+    /// The obstacles of a room's seeded layout.
+    pub fn of(obstacles: &[game_sim::mobpit::Obstacle]) -> Vec<Pillar> {
+        obstacles
             .iter()
             .enumerate()
-            .map(|(i, &(x, y, r))| Pillar {
+            .map(|(i, o)| Pillar {
                 id: EntityId(100 + i as u32),
-                x,
-                y,
-                r,
+                x: o.x,
+                y: o.y,
+                r: o.r,
             })
             .collect()
     }
@@ -395,6 +395,10 @@ pub fn game_surface() -> GameSurface {
         .pure::<PitRoomFn>()
         .constant("pit_rules", &pit_rules())
         .constant("weather", &WEATHER.map(String::from).to_vec())
+        .constant(
+            "patterns",
+            &game_sim::mobpit::PATTERNS.map(String::from).to_vec(),
+        )
         .constant("pit_world", &pit_world())
 }
 
@@ -656,8 +660,14 @@ fn spawn_point(player: PlayerId) -> (f32, f32) {
     SPOTS[player.0 as usize % SPOTS.len()]
 }
 
-fn push_out_of_pillars(x: &mut f32, y: &mut f32, radius: f32) {
-    for (px, py, pr) in PILLARS {
+fn push_out_of_pillars(x: &mut f32, y: &mut f32, radius: f32, pillars: &[Pillar]) {
+    for &Pillar {
+        x: px,
+        y: py,
+        r: pr,
+        ..
+    } in pillars
+    {
         let (ox, oy) = (*x - px, *y - py);
         let d2 = ox * ox + oy * oy;
         let min = radius + pr;
@@ -876,6 +886,12 @@ impl MobPit {
     fn step_players(&mut self, ctx: &mut Ctx<'_, Self>) -> Vec<(PlayerId, f32, f32, f32)> {
         let tick = ctx.tick();
         let mut swings = Vec::new();
+        // The predicted step's context: this room (its seeded obstacles).
+        let context = PitRoomContext {
+            seed: self.room.seed,
+            x: self.room.room.0,
+            y: self.room.room.1,
+        };
         for (id, p) in &mut self.players {
             p.credits = (p.credits + 1).min(MAX_CREDITS);
             p.swing_cd = p.swing_cd.saturating_sub(1);
@@ -904,7 +920,7 @@ impl MobPit {
                 };
                 let input = input.input;
                 // The declared predicted step: what the client runs as WASM.
-                p.state = pit_step(&p.state, &input, &(), movement::DT);
+                p.state = pit_step(&p.state, &input, &context, movement::DT);
                 p.credits -= 1;
                 let (sx, sy) = (f32::from(input.mx), f32::from(input.my));
                 if sx * sx + sy * sy > 20.0 * 20.0 {
@@ -1098,7 +1114,7 @@ impl MobPit {
                 }
             }
             let m = &mut self.mobs[i];
-            push_out_of_pillars(&mut m.x, &mut m.y, radius);
+            push_out_of_pillars(&mut m.x, &mut m.y, radius, &self.pillars);
         }
         // Light separation so a pack does not stack on one spot.
         for i in 0..self.mobs.len() {
@@ -1286,7 +1302,7 @@ impl Zone for MobPit {
             room,
             players: BTreeMap::new(),
             mobs,
-            pillars: Pillar::all(),
+            pillars: Pillar::of(&layout.obstacles),
             pending: HashMap::new(),
             backlog: VecDeque::new(),
             last_tick: None,

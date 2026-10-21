@@ -42,6 +42,7 @@ import {
 	isPillar,
 	isPit,
 	mobFields,
+	PATTERNS,
 	WEATHER,
 	pitFields,
 	playerFields,
@@ -111,6 +112,8 @@ const SKY: Record<string, { clear: string; fog: number; light: number }> = {
 	clear: { clear: '#8fc3f0', fog: 0.004, light: 1.1 }
 };
 const lights = scene.lights.map((l) => ({ light: l, base: l.intensity }));
+/** Light tint per biome (highlands, steppe, forest, meadow). */
+const BIOME_LIGHT = ['#d6dcea', '#ffe1b3', '#b9dfb4', '#eaf6cf'];
 /** Fog and darkness of the current room: its borough's weather × closeness to a boss. */
 function roomSky(): { clear: string; fog: number; light: number; near: number } {
 	const sky = SKY[WEATHER[pit.world()?.weather ?? 0] ?? 'storm'] ?? SKY.storm!;
@@ -131,6 +134,13 @@ function applySky(dtMs: number): void {
 	const storm = (pit.world()?.weather ?? 0) === 0;
 	const flash = storm && Math.random() < 0.004 ? 2.5 : 1;
 	for (const { light, base } of lights) light.intensity += (base * target.light * flash - light.intensity) * Math.min(1, k * (flash > 1 ? 20 : 1));
+	// The room's biome tints the light.
+	const here = parseRoom(pit.room() ?? DEFAULT_ZONE);
+	if (here !== undefined && pit.pures.loaded()) {
+		const seed = pit.hello()?.seed ?? PIT_WORLD.defaultSeed;
+		const tint = Color3.FromHexString(BIOME_LIGHT[pit.pures.pitRoom({ seed, x: here[0], y: here[1] }).biome] ?? '#ffffff');
+		for (const { light } of lights) light.diffuse = Color3.Lerp(light.diffuse, tint, k);
+	}
 	canvas.dataset.fog = scene.fogDensity.toFixed(4);
 }
 
@@ -408,7 +418,29 @@ const templates = (() => {
 	pillar.material = mats.pillar;
 	pillar.isPickable = false;
 	pillar.setEnabled(false);
-	return { floors, wall, segment, gate, pillar };
+	// Obstacle looks of the seeded layouts: 0 column · 1 boulder · 2 tree · 3 crystal.
+	const boulder = MeshBuilder.CreateSphere('room-boulder', { diameter: 1, segments: 6 }, scene);
+	boulder.material = material(scene, 'boulder', '#6e6a62');
+	boulder.isPickable = false;
+	boulder.setEnabled(false);
+	const tree = MeshBuilder.CreateCylinder('room-tree', { diameterTop: 0, diameterBottom: 1.6, height: 3.2, tessellation: 7 }, scene);
+	tree.material = material(scene, 'tree', '#2f6b3a');
+	tree.isPickable = false;
+	tree.setEnabled(false);
+	const crystalMat = material(scene, 'crystal', '#7fe3ff', 0.85);
+	crystalMat.emissiveColor = Color3.FromHexString('#2a6f88');
+	const crystal = MeshBuilder.CreateBox('room-crystal', { size: 1 }, scene);
+	crystal.material = crystalMat;
+	crystal.isPickable = false;
+	crystal.setEnabled(false);
+	// Walls take the biome's tone.
+	const walls = BIOME_COLOR.map((color, biome) => {
+		const w = wall.clone(`room-wall-${biome}`);
+		w.material = material(scene, `room-wall-${biome}`, Color3.FromHexString(color).scale(0.55).toHexString());
+		w.setEnabled(false);
+		return w;
+	});
+	return { floors, wall, walls, segment, gate, pillar, boulder, tree, crystal };
 })();
 
 type Chunk = { room: Room; node: TransformNode; biome: number | undefined; seed: number };
@@ -433,17 +465,32 @@ function createChunk(room: Room): Chunk {
 	// the floor (the neighbour's wall stands right behind it).
 	const off = PIT_WORLD.doorHalf + templates.segment / 2;
 	const out = HALF + WALL_T / 2;
+	const wall = templates.walls[biome ?? 0] ?? templates.wall;
 	for (const side of [-1, 1]) {
 		for (const along of [-1, 1]) {
-			add(templates.wall, `wall-h${side}${along}`, along * off, side * out, WALL_H / 2);
-			add(templates.wall, `wall-v${side}${along}`, side * out, along * off, WALL_H / 2, Math.PI / 2);
+			add(wall, `wall-h${side}${along}`, along * off, side * out, WALL_H / 2);
+			add(wall, `wall-v${side}${along}`, side * out, along * off, WALL_H / 2, Math.PI / 2);
 		}
 		add(templates.gate, `door-h${side}`, 0, side * HALF, 0.04);
 		add(templates.gate, `door-v${side}`, side * HALF, 0, 0.04, Math.PI / 2);
 	}
-	PILLARS.forEach(({ x, y, r }, i) => {
-		const instance = add(templates.pillar, `pillar-${i}`, x, y, 1.2);
-		instance.scaling.set(r * 2, 1, r * 2);
+	// The room's seeded obstacles (what the step collides with).
+	const obstacles = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }).obstacles : PILLARS.map((p) => ({ ...p, look: 0 }));
+	obstacles.forEach(({ x, y, r, look }, i) => {
+		if (look === 1) {
+			const instance = add(templates.boulder, `obstacle-${i}`, x, y, r * 0.55);
+			instance.scaling.set(r * 2, r * 1.3, r * 2);
+		} else if (look === 2) {
+			const instance = add(templates.tree, `obstacle-${i}`, x, y, 1.6);
+			instance.scaling.set(r * 1.25, 1, r * 1.25);
+		} else if (look === 3) {
+			const instance = add(templates.crystal, `obstacle-${i}`, x, y, r);
+			instance.scaling.set(r * 1.4, r * 2, r * 1.4);
+			instance.rotation.y = 0.6;
+		} else {
+			const instance = add(templates.pillar, `pillar-${i}`, x, y, 1.2);
+			instance.scaling.set(r * 2, 1, r * 2);
+		}
 	});
 	return { room, node, biome, seed };
 }
@@ -513,7 +560,7 @@ function showRoom(zone: string): void {
 	const seed = pit.hello()?.seed ?? PIT_WORLD.defaultSeed;
 	if (pit.pures.loaded()) {
 		const room = pit.pures.pitRoom({ seed, x: at[0], y: at[1] });
-		hud.row('Room', `${zone} · ${PIT_WORLD.biomes[room.biome] ?? '?'} · danger ${room.danger} · ${room.mobs.length} mobs`);
+		hud.row('Room', `${zone} · ${PIT_WORLD.biomes[room.biome] ?? '?'} · ${PATTERNS[room.pattern] ?? '?'} · danger ${room.danger} · ${room.mobs.length} mobs${room.boss ? ' · BOSS ROOM' : ''}`);
 	}
 }
 

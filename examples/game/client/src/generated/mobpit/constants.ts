@@ -3,6 +3,9 @@
 // Do not edit: change the Rust definitions and regenerate.
 import type { PitRules, PitWorld } from './events.ts';
 
+/** `patterns`, as the client decodes it. */
+export const PATTERNS: readonly string[] = ['pillars', 'colonnade', 'ring', 'rubble', 'hall', 'grove'];
+
 /** `pit_rules`, as the client decodes it. */
 export const PIT_RULES: PitRules = {
 	tiers: [

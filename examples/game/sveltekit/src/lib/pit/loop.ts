@@ -28,6 +28,8 @@ import {
 	type WorldTiers
 } from '$lib/generated/mobpit/index.ts';
 
+/** Obstacle fill by look: column, boulder, tree, crystal. */
+const OBSTACLE_COLOR = ['#3a3443', '#4a463f', '#24452b', '#2f5e70'];
 const TIER_COLOR: Record<number, string> = { 1: '#9ad16b', 2: '#b48cf2', 3: '#ff6b6b', 4: '#ff2d55' };
 const TIER_RADIUS = Object.fromEntries(PIT_RULES.tiers.map((t) => [t.tier, t]));
 const PLAYER_RADIUS = 0.45;
@@ -201,7 +203,9 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				const biome = pures.loaded() ? pures.pitRoom({ seed, x: rx, y: ry }).biome : undefined;
 				ctx.fillStyle = biome === undefined ? '#120f14' : `${BIOME_COLOR[biome] ?? '#333333'}30`;
 				ctx.fillRect(...at(ox - HALF, oy + HALF), 2 * HALF * scale, 2 * HALF * scale);
-				for (const p of pillars) circle(ox + p.x, oy + p.y, p.r, '#3a3443');
+				// The room's seeded obstacles (what the step collides with).
+				const obstacles = pures.loaded() ? pures.pitRoom({ seed, x: rx, y: ry }).obstacles : pillars;
+				for (const p of obstacles) circle(ox + p.x, oy + p.y, p.r, OBSTACLE_COLOR[(p as { look?: number }).look ?? 0] ?? '#3a3443');
 				// Walls with a doorway gap in the middle of each.
 				ctx.strokeStyle = '#4b5668';
 				ctx.lineWidth = 3;

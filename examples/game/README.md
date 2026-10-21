@@ -439,6 +439,21 @@ the same Rust compiled to WebAssembly (`createMobpitPures().pitRoom`) for
 the floor colour and the minimap; nothing static is replicated. Seed:
 `MOBPIT_SEED` (worker var).
 
+**Every room looks different.** Besides biome and mobs, `pit_room` lays
+out the room's obstacles in one of six seeded patterns (`PATTERNS`:
+classic pillars — always in the entrance —, a colonnade, a ring of columns
+round a plinth, scattered boulders, a rounded hall with corner boulders, a
+grove of trees). Generation keeps the door corridors, the walls, the spawn
+points, the boss's home and every mob home clear and leaves at least a
+player's width between obstacles, so every room stays one connected floor
+(`rooms_vary_and_every_room_stays_one_floor` walks it on a 0.5 m lattice)
+and the doorways sit where they always do. Collision is part of the step:
+`pit_step` takes the room (`PitRoomContext`) as its predicted context and
+generates the obstacles inside (cached), so the room and the browser's
+WASM prediction collide identically (`prediction-wasm` replays streams in
+rooms of every pattern); the page sets the context on every authority
+change. Floors, walls and the light's tint follow the biome.
+
 **Leaving and coming back.** A doorway is a passage: the predicted step
 (`pit_step`) lets you walk through the gap past the wall line, and 0.5 m
 past it (hysteresis, so dithering at the line does not bounce you back) the

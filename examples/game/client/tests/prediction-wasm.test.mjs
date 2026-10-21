@@ -197,6 +197,9 @@ test('cost: one predicted step and a reconciliation replaying 10 inputs at 30 Hz
 		const generated = await import(`../src/generated/${name}/index.ts`);
 		const prediction = generated[`create${name[0].toUpperCase()}${name.slice(1)}Prediction`]();
 		await prediction.ready;
+		// Mob Pit's step reads its room (the context): the entrance here.
+		const context = generated.PREDICT_CONTEXT === undefined ? undefined : { seed: generated.PIT_WORLD.defaultSeed, x: 0, y: 0 };
+		if (context !== undefined) prediction.setContext(context);
 		const kind = { id: 1, name: generated.PREDICT.kind, priority: 1, fields: generated.PREDICT_STATE.map(([field]) => ({ name: field, type: 'f32', priority: 1 })) };
 		const start = { x: -5, y: -5, vx: 0, vy: 0, dash: 0, cd: 0 };
 		const input = { mx: 90, my: -40, buttons: 0 };
@@ -205,7 +208,7 @@ test('cost: one predicted step and a reconciliation replaying 10 inputs at 30 Hz
 		const module = prediction.module();
 		const stateBytes = encodePredictState(generated.PREDICT_STATE, start);
 		const inputBytes = generated.encodeInput(input);
-		const contextBytes = new Uint8Array(0);
+		const contextBytes = context === undefined ? new Uint8Array(0) : encodePayload(generated.PREDICT_CONTEXT, context);
 		const abiUs = measure(() => module.step(generated.PREDICT.export, stateBytes, inputBytes, contextBytes, DT), 20_000);
 		// `predict` as GameClient calls it (fields → bytes → step → fields).
 		const predictUs = measure(() => prediction.predict(start, input, 1000 / 30), 20_000);

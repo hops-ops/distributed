@@ -5,6 +5,16 @@ import { createWasmPures, type WasmPures, type WasmSource, type WireType } from 
 
 import type { PitRoomContext, PitRoomLayout } from './events.ts';
 
+const OBSTACLE_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['x', { type: 'f32' }],
+		['y', { type: 'f32' }],
+		['r', { type: 'f32' }],
+		['look', { type: 'u8' }],
+	]
+};
+
 const PIT_ROOM_CONTEXT_TYPE: WireType = {
 	type: 'record',
 	fields: [
@@ -33,6 +43,8 @@ const PIT_ROOM_LAYOUT_TYPE: WireType = {
 		['hoodX', { type: 'i32' }],
 		['hoodY', { type: 'i32' }],
 		['bossDistance', { type: 'u8' }],
+		['pattern', { type: 'u8' }],
+		['obstacles', { type: 'list', item: OBSTACLE_TYPE }],
 	]
 };
 

@@ -1,6 +1,23 @@
 {
   "constants": [
     {
+      "name": "patterns",
+      "type": {
+        "item": {
+          "type": "short_str"
+        },
+        "type": "list"
+      },
+      "value": [
+        "pillars",
+        "colonnade",
+        "ring",
+        "rubble",
+        "hall",
+        "grove"
+      ]
+    },
+    {
       "name": "pit_rules",
       "type": {
         "name": "PitRules",
@@ -788,6 +805,7 @@
   "name": "mobpit",
   "predict": {
     "abi": 1,
+    "context": "PitRoomContext",
     "export": "pit_step",
     "kind": "player",
     "package": "game_sim",
@@ -893,6 +911,35 @@
           "type": {
             "type": "f32"
           }
+        },
+        {
+          "name": "look",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "Obstacle"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "r",
+          "type": {
+            "type": "f32"
+          }
         }
       ],
       "name": "Pillar"
@@ -966,6 +1013,22 @@
           "name": "boss_distance",
           "type": {
             "type": "u8"
+          }
+        },
+        {
+          "name": "pattern",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "obstacles",
+          "type": {
+            "item": {
+              "name": "Obstacle",
+              "type": "record"
+            },
+            "type": "list"
           }
         }
       ],

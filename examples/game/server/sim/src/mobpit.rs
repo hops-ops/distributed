@@ -19,6 +19,8 @@
 //! the Endless Grid's seeded hashing and biomes ([`crate::grid`]); the page
 //! runs the same code compiled to WebAssembly (minimap colours, floor).
 
+use std::cell::RefCell;
+
 use distributed_game::{game_pure, predict, FieldType, GameInput, GameRecord};
 
 use crate::arena::{self, MoveInput, MoveState};
@@ -55,11 +57,40 @@ impl PitInput {
     }
 }
 
+/// `(seed, x, y)` → that room's obstacles as `(x, y, radius)`.
+type ObstacleCache = Option<((u32, i32, i32), Vec<(f32, f32, f32)>)>;
+
+thread_local! {
+    /// Obstacles of the last room stepped in (a player stays in a room for
+    /// many frames).
+    static OBSTACLES: RefCell<ObstacleCache> = const { RefCell::new(None) };
+}
+
 /// The own capsule's predicted step: the Arena's movement of
-/// [`PitInput::movement`] inside walls with doorway passages.
+/// [`PitInput::movement`] among the room's seeded obstacles, inside walls
+/// with doorway passages. The context names the room, so the obstacles are
+/// generated inside the step (the browser needs no copy of the room).
 #[predict(PitStep, kind = "player")]
-pub fn pit_step(state: &MoveState, input: &PitInput, _context: &(), _dt: f32) -> MoveState {
-    step(*state, *input)
+pub fn pit_step(
+    state: &MoveState,
+    input: &PitInput,
+    context: &PitRoomContext,
+    _dt: f32,
+) -> MoveState {
+    let key = (context.seed, context.x, context.y);
+    OBSTACLES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.as_ref().map(|(k, _)| *k) != Some(key) {
+            let circles = room_obstacles(context.seed, (context.x, context.y))
+                .1
+                .iter()
+                .map(|o| (o.x, o.y, o.r))
+                .collect();
+            *cache = Some((key, circles));
+        }
+        let obstacles = &cache.as_ref().expect("filled above").1;
+        step_among(*state, *input, obstacles)
+    })
 }
 
 /// Room edge length (m): rooms tile the world, sharing walls.
@@ -74,10 +105,16 @@ const SLACK: f32 = 0.01;
 /// Wire type of player `x`/`y`: the room plus its passages, ≈ 0.17 mm steps.
 pub const POS: FieldType = FieldType::quant_centered(22.0, 18);
 
-/// One command frame: [`arena::advance`] (stick, dash, pillars), then the
-/// walls with their doorway passages, snapped to the wire precision.
+/// One command frame in a room with the classic pillars (the entrance).
 pub fn step(s: MoveState, input: PitInput) -> MoveState {
-    let next = arena::advance(s, input.movement());
+    step_among(s, input, &arena::PILLARS)
+}
+
+/// One command frame: [`arena::advance_among`] (stick, dash, the room's
+/// obstacles), then the walls with their doorway passages, snapped to the
+/// wire precision.
+pub fn step_among(s: MoveState, input: PitInput, obstacles: &[(f32, f32, f32)]) -> MoveState {
+    let next = arena::advance_among(s, input.movement(), obstacles);
     canonicalize(walls(s, next))
 }
 
@@ -180,6 +217,162 @@ const SLOTS: [(f32, f32); 12] = [
 /// Hash salt of the room contents.
 const SALT_ROOM: u32 = 900;
 
+/// A round obstacle of a room (room-local): a column, a boulder, a tree.
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct Obstacle {
+    /// Centre x (m, room-local).
+    pub x: f32,
+    /// Centre y.
+    pub y: f32,
+    /// Radius.
+    pub r: f32,
+    /// What it looks like: 0 column · 1 boulder · 2 tree · 3 crystal.
+    pub look: u8,
+}
+
+/// Room patterns, by index ([`PitRoomLayout::pattern`]).
+pub const PATTERNS: [&str; 6] = ["pillars", "colonnade", "ring", "rubble", "hall", "grove"];
+/// Most obstacles a room has.
+pub const MAX_OBSTACLES: usize = 24;
+/// Hash salt of the room obstacles.
+const SALT_OBSTACLE: u32 = 902;
+/// Half width of the clear corridor along each door axis near the walls.
+const CORRIDOR: f32 = 3.2;
+/// Free gap kept between obstacles, and between an obstacle and a wall or
+/// a kept spot (a player's diameter plus slack): every room stays one
+/// connected floor.
+const GAP: f32 = 1.3;
+
+/// Whether `(x, y, r)` keeps clear of the door corridors, the walls and the
+/// `keep` spots (`(x, y, clearance)`) and of `placed`.
+fn fits(x: f32, y: f32, r: f32, keep: &[(f32, f32, f32)], placed: &[Obstacle]) -> bool {
+    let wall = arena::HALF - r - GAP;
+    if x.abs() > wall || y.abs() > wall {
+        return false;
+    }
+    // Door corridors: from each doorway 8 m into the room.
+    let inner = arena::HALF - 8.0;
+    if (x.abs() < CORRIDOR + r && y.abs() > inner - r)
+        || (y.abs() < CORRIDOR + r && x.abs() > inner - r)
+    {
+        return false;
+    }
+    keep.iter().all(|&(kx, ky, c)| {
+        let (dx, dy) = (x - kx, y - ky);
+        dx * dx + dy * dy >= (r + c) * (r + c)
+    }) && placed.iter().all(|o| {
+        let (dx, dy) = (x - o.x, y - o.y);
+        let min = r + o.r + GAP;
+        dx * dx + dy * dy >= min * min
+    })
+}
+
+/// Unit vectors at `(k + 0.5) / 8 · τ`, as literals (no trig: native and
+/// WebAssembly agree bit for bit).
+const RING8: [(f32, f32); 8] = [
+    (0.9238795, 0.38268343),
+    (0.38268343, 0.9238795),
+    (-0.38268343, 0.9238795),
+    (-0.9238795, 0.38268343),
+    (-0.9238795, -0.38268343),
+    (-0.38268343, -0.9238795),
+    (0.38268343, -0.9238795),
+    (0.9238795, -0.38268343),
+];
+
+/// Spots every room keeps clear: the spawn points and the boss's home.
+const KEEP: [(f32, f32, f32); 7] = [
+    (-4.5, -4.5, 1.6),
+    (4.5, -4.5, 1.6),
+    (4.5, 4.5, 1.6),
+    (-4.5, 4.5, 1.6),
+    (0.0, -5.5, 1.6),
+    (0.0, 5.5, 1.6),
+    (BOSS_HOME.0, BOSS_HOME.1, 2.6),
+];
+
+/// The obstacles of room `room` and its pattern ([`PATTERNS`]): the
+/// entrance has the classic pillars; every other room one seeded pattern,
+/// each obstacle kept clear of the door corridors, the walls, the spawn
+/// points, the mob homes and the other obstacles (by at least a player's
+/// width), so the floor stays one connected place. Pure and deterministic.
+pub fn room_obstacles(seed: u32, room: (i32, i32)) -> (u8, Vec<Obstacle>) {
+    let classic = || {
+        arena::PILLARS
+            .iter()
+            .map(|&(x, y, r)| Obstacle { x, y, r, look: 0 })
+            .collect::<Vec<_>>()
+    };
+    if room == (0, 0) {
+        return (0, classic());
+    }
+    let h = grid::mix(seed, SALT_OBSTACLE, room.0, room.1);
+    let pattern = (h % PATTERNS.len() as u32) as u8;
+    if pattern == 0 {
+        return (0, classic());
+    }
+    let mut keep: Vec<(f32, f32, f32)> = KEEP.to_vec();
+    for m in mob_slots(seed, room) {
+        keep.push((m.x, m.y, 0.8 + GAP));
+    }
+    let mut placed: Vec<Obstacle> = Vec::new();
+    let place = |x: f32, y: f32, r: f32, look: u8, placed: &mut Vec<Obstacle>| {
+        if placed.len() < MAX_OBSTACLES && fits(x, y, r, &keep, placed) {
+            placed.push(Obstacle { x, y, r, look });
+        }
+    };
+    let roll = |i: u32| grid::unit(grid::hash32(h ^ i.wrapping_mul(0x9e37_79b9)));
+    match pattern {
+        // Two rows of columns along one axis.
+        1 => {
+            let along_x = h & 0x100 != 0;
+            for row in [-6.5f32, 6.5] {
+                let mut t = -15.0f32;
+                while t <= 15.0 {
+                    let (x, y) = if along_x { (t, row) } else { (row, t) };
+                    place(x, y, 0.8, 0, &mut placed);
+                    t += 3.75;
+                }
+            }
+        }
+        // A ring of columns around a central plinth.
+        2 => {
+            place(0.0, 0.0, 2.0, 0, &mut placed);
+            let radius = 8.5 + 2.0 * roll(1);
+            for (ux, uy) in RING8 {
+                place(ux * radius, uy * radius, 1.0, 0, &mut placed);
+            }
+        }
+        // Scattered boulders.
+        3 => {
+            for i in 0..40u32 {
+                let x = -17.0 + 34.0 * roll(2 * i + 2);
+                let y = -17.0 + 34.0 * roll(2 * i + 3);
+                let r = 0.6 + 1.2 * roll(100 + i);
+                place(x, y, r, 1, &mut placed);
+            }
+        }
+        // A rounded hall: boulders in the corners, four columns.
+        4 => {
+            for (sx, sy) in [(1.0f32, 1.0f32), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
+                place(sx * 15.0, sy * 15.0, 3.5, 1, &mut placed);
+                place(sx * 6.5, sy * 6.5, 1.0, 0, &mut placed);
+            }
+            place(0.0, 0.0, 1.5, 3, &mut placed);
+        }
+        // A grove of trees.
+        _ => {
+            for i in 0..60u32 {
+                let x = -17.5 + 35.0 * roll(2 * i + 7);
+                let y = -17.5 + 35.0 * roll(2 * i + 8);
+                let r = 0.45 + 0.4 * roll(200 + i);
+                place(x, y, r, 2, &mut placed);
+            }
+        }
+    }
+    (pattern, placed)
+}
+
 /// Which room ([`pit_room`]'s input).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameRecord)]
 pub struct PitRoomContext {
@@ -221,6 +414,10 @@ pub struct PitRoomLayout {
     /// Rooms to the nearest boss room (Chebyshev; 0 in a boss room, at most
     /// [`BOSS_DISTANCE_MAX`]): fog and darkness thicken toward bosses.
     pub boss_distance: u8,
+    /// Index into [`PATTERNS`]: how the room is laid out.
+    pub pattern: u8,
+    /// The room's obstacles (collision in the step, drawn by the pages).
+    pub obstacles: Vec<Obstacle>,
 }
 
 /// The farthest [`PitRoomLayout::boss_distance`] reported.
@@ -312,7 +509,36 @@ pub fn pit_room(room: &PitRoomContext) -> PitRoomLayout {
     let biome = grid::biome(room.seed, at, (grid::CELL / 2.0, grid::CELL / 2.0));
     let distance = room.x.unsigned_abs().saturating_add(room.y.unsigned_abs());
     let danger = (1 + distance / 3).min(3) as u8;
-    let h = grid::mix(room.seed, SALT_ROOM, room.x, room.y);
+    let mut mobs = mob_slots(room.seed, at);
+    let hood = hood_of(at);
+    let boss = boss_room(room.seed, hood) == at;
+    if boss {
+        mobs.push(RoomMob {
+            tier: BOSS_TIER,
+            x: BOSS_HOME.0,
+            y: BOSS_HOME.1,
+        });
+    }
+    let (pattern, obstacles) = room_obstacles(room.seed, at);
+    PitRoomLayout {
+        biome,
+        danger,
+        mobs,
+        boss,
+        hood_x: hood.0,
+        hood_y: hood.1,
+        boss_distance: boss_distance(room.seed, at),
+        pattern,
+        obstacles,
+    }
+}
+
+/// The 6–12 ordinary mob slots of a room: two rings between the pillars,
+/// tiers weighted by the room's danger.
+fn mob_slots(seed: u32, at: (i32, i32)) -> Vec<RoomMob> {
+    let distance = at.0.unsigned_abs().saturating_add(at.1.unsigned_abs());
+    let danger = (1 + distance / 3).min(3) as u8;
+    let h = grid::mix(seed, SALT_ROOM, at.0, at.1);
     let count = 6 + (h % 7) as usize;
     let mut mobs = Vec::with_capacity(count);
     for i in 0..count {
@@ -332,24 +558,7 @@ pub fn pit_room(room: &PitRoomContext) -> PitRoomLayout {
             y: ring * dy,
         });
     }
-    let hood = hood_of(at);
-    let boss = boss_room(room.seed, hood) == at;
-    if boss {
-        mobs.push(RoomMob {
-            tier: BOSS_TIER,
-            x: BOSS_HOME.0,
-            y: BOSS_HOME.1,
-        });
-    }
-    PitRoomLayout {
-        biome,
-        danger,
-        mobs,
-        boss,
-        hood_x: hood.0,
-        hood_y: hood.1,
-        boss_distance: boss_distance(room.seed, at),
-    }
+    mobs
 }
 
 /// The rooms' world, for the page (generated `PIT_WORLD`).
@@ -507,6 +716,117 @@ mod tests {
         assert_eq!(borough_of((-1, 5)), (-1, 1));
         assert_eq!(parse_pair(&pair_shard((-3, 7))), Some((-3, 7)));
         assert_eq!(borough_hoods((0, 0)).len(), 9);
+    }
+
+    /// Free floor points reachable from a spawn point (0.5 m lattice).
+    fn reachable(obstacles: &[Obstacle]) -> Vec<Vec<bool>> {
+        let n = 79usize; // -19.5 ..= 19.5
+        let at = |i: usize| -19.5 + i as f32 * 0.5;
+        let free = |x: f32, y: f32| {
+            let lim = arena::HALF - arena::PLAYER_RADIUS;
+            x.abs() <= lim
+                && y.abs() <= lim
+                && obstacles.iter().all(|o| {
+                    let (dx, dy) = (x - o.x, y - o.y);
+                    dx * dx + dy * dy >= (o.r + arena::PLAYER_RADIUS).powi(2)
+                })
+        };
+        let mut seen = vec![vec![false; n]; n];
+        let start = ((4.5 + 19.5) / 0.5) as usize;
+        let mut stack = vec![(start, start)];
+        while let Some((i, j)) = stack.pop() {
+            if seen[i][j] || !free(at(i), at(j)) {
+                continue;
+            }
+            seen[i][j] = true;
+            if i > 0 {
+                stack.push((i - 1, j));
+            }
+            if j > 0 {
+                stack.push((i, j - 1));
+            }
+            if i + 1 < n {
+                stack.push((i + 1, j));
+            }
+            if j + 1 < n {
+                stack.push((i, j + 1));
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn rooms_vary_and_every_room_stays_one_floor() {
+        let mut patterns = std::collections::BTreeSet::new();
+        let cell = |v: f32| ((v + 19.5) / 0.5).round() as usize;
+        for y in -6..=6 {
+            for x in -6..=6 {
+                let layout = pit_room(&PitRoomContext {
+                    seed: DEFAULT_SEED,
+                    x,
+                    y,
+                });
+                patterns.insert(layout.pattern);
+                assert!(layout.obstacles.len() <= MAX_OBSTACLES);
+                let seen = reachable(&layout.obstacles);
+                // Every doorway, spawn point and mob home is reachable.
+                for (px, py) in [(18.5, 0.0), (-18.5, 0.0), (0.0, 18.5), (0.0, -18.5)]
+                    .into_iter()
+                    .chain(KEEP.iter().map(|k| (k.0, k.1)))
+                {
+                    assert!(
+                        seen[cell(px)][cell(py)],
+                        "pit.{x}.{y} ({}): {px},{py} cut off",
+                        PATTERNS[layout.pattern as usize]
+                    );
+                }
+                for m in &layout.mobs {
+                    let near = [(0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)]
+                        .iter()
+                        .any(|(dx, dy)| seen[cell(m.x + dx)][cell(m.y + dy)]);
+                    assert!(near, "pit.{x}.{y}: mob home {},{} cut off", m.x, m.y);
+                }
+            }
+        }
+        assert!(patterns.len() >= 5, "{patterns:?}");
+        assert_eq!(
+            room_obstacles(DEFAULT_SEED, (0, 0)).0,
+            0,
+            "the entrance is classic"
+        );
+    }
+
+    #[test]
+    fn the_step_collides_with_the_rooms_obstacles() {
+        // A room with a ring: walk from the centre outwards along a column.
+        let (pattern, obstacles) = (1..40)
+            .map(|x| room_obstacles(DEFAULT_SEED, (x, 3)))
+            .find(|(p, o)| *p == 3 && !o.is_empty())
+            .expect("a rubble room");
+        assert_eq!(pattern, 3);
+        let o = obstacles[0];
+        let circles: Vec<(f32, f32, f32)> = obstacles.iter().map(|o| (o.x, o.y, o.r)).collect();
+        let mut s = canonicalize(MoveState {
+            x: o.x - (o.r + 3.0),
+            y: o.y,
+            ..MoveState::default()
+        });
+        for _ in 0..90 {
+            s = step_among(
+                s,
+                PitInput {
+                    mx: 127,
+                    my: 0,
+                    buttons: 0,
+                },
+                &circles,
+            );
+            let (dx, dy) = (s.x - o.x, s.y - o.y);
+            assert!(
+                dx * dx + dy * dy >= (o.r + arena::PLAYER_RADIUS - 1e-3).powi(2),
+                "{s:?}"
+            );
+        }
     }
 
     #[test]

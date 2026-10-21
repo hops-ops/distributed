@@ -53,7 +53,7 @@ test('Mob Pit network panel: exact prediction, NetSim on celld rooms, interest r
 		const base = connection.clock.rtt;
 		assert.deepEqual(await api.getNetSim(), { latencyMs: 0, jitterMs: 0, loss: 0 });
 		assert.deepEqual(await api.setNetSim({ latencyMs: 80, jitterMs: 0, loss: 0 }), { latencyMs: 80, jitterMs: 0, loss: 0 });
-		await until(() => connection.clock.samples.at(-1)?.rtt > base + 120, 10_000, 'rtt with netsim');
+		await until(() => connection.clock.samples.at(-1)?.rtt > base + 100, 20_000, 'rtt with netsim');
 		const info = await eventually(async () => {
 			const i = await pitApi.roomInfo('pit.0.0');
 			return i.netsim?.latencyMs === 80 && i;

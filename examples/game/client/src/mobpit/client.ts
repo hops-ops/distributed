@@ -225,6 +225,15 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		(h) => typed.on('hello', h),
 		(value) => typed.client.setControlledEntity(value.entity)
 	);
+	// The predicted step's context is the room (its seeded obstacles are
+	// generated inside the step): follow the authority and the world seed.
+	const setRoomContext = () => {
+		const room = parseRoom(typed.client.authority?.zoneId ?? '');
+		if (room === undefined) return;
+		typed.prediction?.setContext({ seed: hello.get()?.seed ?? pit.PIT_WORLD.defaultSeed, x: room[0], y: room[1] });
+	};
+	typed.client.on('authority', setRoomContext);
+	typed.on('hello', setRoomContext);
 	const profile = latest<pit.Profile>((h) => typed.on('profile', h));
 	// Only the own room's view of the tiers (watched neighbours send theirs too).
 	let world: pit.WorldTiers | undefined;

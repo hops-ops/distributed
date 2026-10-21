@@ -158,6 +158,46 @@ fn capsule_streams(extra_bytes: usize) -> Vec<Stream> {
     ]
 }
 
+/// Mob Pit's step in the entrance (the classic pillars) and in rooms of
+/// other seeded patterns (the context names the room; its obstacles are
+/// generated inside the step).
+fn pit_streams() -> Vec<Stream> {
+    use game_sim::mobpit::{room_obstacles, PitRoomContext, DEFAULT_SEED};
+    let context = |x: i32, y: i32| {
+        PitRoomContext {
+            seed: DEFAULT_SEED,
+            x,
+            y,
+        }
+        .encode_context()
+    };
+    let mut streams: Vec<Stream> = capsule_streams(0)
+        .into_iter()
+        .map(|s| Stream {
+            context: context(0, 0),
+            ..s
+        })
+        .collect();
+    let mut patterns = std::collections::BTreeSet::new();
+    for x in 1..60 {
+        let (pattern, _) = room_obstacles(DEFAULT_SEED, (x, 2));
+        if pattern == 0 || !patterns.insert(pattern) {
+            continue;
+        }
+        streams.push(Stream {
+            name: format!("pit.{x}.2 pattern {pattern}"),
+            start: state_bytes(&arena::canonicalize(MoveState {
+                x: 4.5,
+                y: 4.5,
+                ..MoveState::default()
+            })),
+            context: context(x, 2),
+            inputs: random(0x51ed ^ x as u32, 1200, 0),
+        });
+    }
+    streams
+}
+
 fn pure_trace<F: GamePure>(args: Vec<Vec<u8>>) -> Value {
     let calls: Vec<Value> = args
         .iter()
@@ -209,7 +249,7 @@ pub fn traces() -> Value {
         ],
         "steps": [
             trace::<ArenaStep>(capsule_streams(0)),
-            trace::<PitStep>(capsule_streams(0)),
+            trace::<PitStep>(pit_streams()),
         ],
     })
 }

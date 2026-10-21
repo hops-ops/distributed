@@ -144,9 +144,15 @@ pub fn step(s: MoveState, input: MoveInput) -> MoveState {
 }
 
 /// One command frame of stick, dash and pillars, without the walls and
-/// unsnapped: the part of [`step`] Mob Pit shares (its rooms have doorways
-/// in the walls, see `mobpit::pit_step`).
+/// unsnapped.
 pub fn advance(s: MoveState, input: MoveInput) -> MoveState {
+    advance_among(s, input, &PILLARS)
+}
+
+/// [`advance`] among round obstacles `(x, y, radius)`: the part Mob Pit
+/// shares (its rooms have seeded obstacles and doorways in the walls, see
+/// `mobpit::pit_step`).
+pub fn advance_among(s: MoveState, input: MoveInput, obstacles: &[(f32, f32, f32)]) -> MoveState {
     let mut s = s;
     // Stick direction, length clamped to 1.
     let mut dx = f32::from(input.mx) / 127.0;
@@ -199,7 +205,7 @@ pub fn advance(s: MoveState, input: MoveInput) -> MoveState {
     s.x += s.vx * DT;
     s.y += s.vy * DT;
 
-    for (px, py, pr) in PILLARS {
+    for &(px, py, pr) in obstacles {
         let ox = s.x - px;
         let oy = s.y - py;
         let d2 = ox * ox + oy * oy;

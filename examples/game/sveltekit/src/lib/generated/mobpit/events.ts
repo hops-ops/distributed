@@ -20,6 +20,14 @@ export interface MoveState {
 	readonly cd: number;
 }
 
+/** Record `Obstacle` (`#[derive(GameRecord)]`). */
+export interface Obstacle {
+	readonly x: number;
+	readonly y: number;
+	readonly r: number;
+	readonly look: number;
+}
+
 /** Record `Pillar` (`#[derive(GameRecord)]`). */
 export interface Pillar {
 	readonly x: number;
@@ -50,6 +58,8 @@ export interface PitRoomLayout {
 	readonly hoodX: number;
 	readonly hoodY: number;
 	readonly bossDistance: number;
+	readonly pattern: number;
+	readonly obstacles: readonly Obstacle[];
 }
 
 /** Record `PitRules` (`#[derive(GameRecord)]`). */

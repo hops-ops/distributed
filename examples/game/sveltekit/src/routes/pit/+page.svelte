@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { watchZones, type WatchState } from '@hops-ops/distributed/game';
 	import { gameTicketSource, useGame } from '@hops-ops/distributed/sveltekit/game';
-	import { createMobpitClient, EVENTS, WEATHER } from '$lib/generated/mobpit/index.ts';
+	import { createMobpitClient, EVENTS, PIT_WORLD, WEATHER } from '$lib/generated/mobpit/index.ts';
 	import Leaderboard from '$lib/pit/Leaderboard.svelte';
 	import MyStats from '$lib/pit/MyStats.svelte';
 	import Rooms from '$lib/pit/Rooms.svelte';
@@ -15,15 +15,28 @@
 	// forwards); the page rotates over the entry points it was given.
 	let entry = 0;
 	const game = useGame(
-		() =>
-			createMobpitClient({
+		() => {
+			const typed = createMobpitClient({
 				url: (zone) => `${data.roomsUrls[entry++ % data.roomsUrls.length]}/rooms/${encodeURIComponent(zone)}`,
 				ticket: gameTicketSource(),
 				pingIntervalMs: 500,
 				inputDtMs: 1000 / 30,
 				// One continuous world: keep predicting through doorways.
 				prediction: { handoffFrame: pitHandoffFrame }
-			}),
+			});
+			// The predicted step's context is the room (its seeded obstacles).
+			let seed = PIT_WORLD.defaultSeed;
+			const setRoom = () => {
+				const m = /^pit\.(-?\d+)\.(-?\d+)$/.exec(typed.client.authority?.zoneId ?? '');
+				if (m !== null) typed.prediction?.setContext({ seed, x: Number(m[1]), y: Number(m[2]) });
+			};
+			typed.client.on('authority', setRoom);
+			typed.on('hello', (h) => {
+				seed = h.seed;
+				setRoom();
+			});
+			return typed;
+		},
 		{ zone: () => data.zone, events: EVENTS }
 	);
 	const hello = game.latest('hello');
