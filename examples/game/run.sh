@@ -399,8 +399,11 @@ smoke() {
 	# own `celld dev` (CELLD_BIN) on the cells worker.
 	ensure_celld
 	ensure_cells
-	# The SvelteKit test's leaderboard is the Redis board.
+	# The SvelteKit test's leaderboard is the Redis board. Only that test gets
+	# REDIS_URL: the other demos' tests expect their in-memory boards.
 	require_redis
+	local sveltekit_redis="$REDIS_URL"
+	unset REDIS_URL
 	log "generated clients are current; predicted steps and pure functions compiled to WASM"
 	gen --check
 	log "server: fmt, clippy, tests (bots smoke)"
@@ -421,7 +424,7 @@ smoke() {
 	"$CLI" build "$SERVER" >"$build_log" 2>&1 || { cat "$build_log"; rm -f "$build_log"; exit 1; }
 	rm -f "$build_log"
 	(cd "$SVELTEKIT" && npx playwright install chromium >/dev/null &&
-		GAME_DEMOS_BIN="$BIN" MOBPIT_SERVICE_BIN="$SERVICE_BIN" npm test --silent)
+		REDIS_URL="$sveltekit_redis" GAME_DEMOS_BIN="$BIN" MOBPIT_SERVICE_BIN="$SERVICE_BIN" npm test --silent)
 	log "smoke OK"
 }
 
