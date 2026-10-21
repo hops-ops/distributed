@@ -23,6 +23,12 @@
  * authoritative position as a wireframe ghost, and the readout counts
  * pending inputs and corrections. The ring on the floor is your interest
  * radius: mobs and players beyond it are not replicated to you.
+ *
+ * Next door: the 8 rooms around yours are watched (their mobs drawn where
+ * they are) without keeping them awake. "Wake rooms in reach" (N, on by
+ * default, remembered): walk toward a doorway and the room behind it wakes
+ * and stays live until you walk away (minimap: solid cyan border = kept
+ * awake, dashed = watched only).
  */
 import type { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture';
@@ -100,9 +106,19 @@ const pitApi = new MobPitApi();
 // `?old=1` simulates a client built before the next content update: it
 // keeps its pack when the rooms move on, and only the entrance reloads it.
 const pinContent = params.has('old');
+/** "Wake rooms in reach" (proximity wake), remembered per browser. */
+const WAKE_KEY = 'game-demos.mobpit.wake';
+const wakeInitial = (() => {
+	try {
+		return localStorage.getItem(WAKE_KEY) !== 'off';
+	} catch {
+		return true;
+	}
+})();
 const pit = createMobPitClient({
 	api,
 	pinContent,
+	wake: wakeInitial,
 	liveVersion: async () => (await pitApi.content()).state?.version ?? ''
 });
 const { client } = pit;
@@ -170,7 +186,7 @@ function applySky(dtMs: number): void {
 
 const hud = new Hud({
 	title: 'Mob Pit',
-	hint: 'WASD move · Space attack · R / click shoot · E dash · Q jump (over a slam) · V first person · C lag compensation · walk through a doorway to the next room · O debug overlay · P prediction · G server ghost. Rooms run on celld; kills are durable facts.',
+	hint: 'WASD move · Space attack · R / click shoot · E dash · Q jump (over a slam) · V first person · C lag compensation · walk through a doorway to the next room · N wake rooms in reach · O debug overlay · P prediction · G server ghost. Rooms run on celld; kills are durable facts.',
 	client,
 	devApi: api
 });
@@ -181,6 +197,19 @@ hud.toggle('First-person view (click to look, R / click fires)', false, (on) => 
 hud.toggle('Lag compensation (ranged)', true, (on) => (compensated = on), 'c');
 let ghostOn = true;
 hud.toggle('Server ghost', true, (on) => (ghostOn = on), 'g');
+hud.toggle(
+	'Wake rooms in reach (doorway neighbours you walk up to)',
+	wakeInitial,
+	(on) => {
+		pit.setWakeRooms(on);
+		try {
+			localStorage.setItem(WAKE_KEY, on ? 'on' : 'off');
+		} catch {
+			// Not remembered (private mode); still applied.
+		}
+	},
+	'n'
+);
 let corrections = 0;
 let lastCorrection = 0;
 client.on('correction', (c) => {
@@ -264,7 +293,7 @@ function div(className: string, parent: HTMLElement): HTMLDivElement {
 const roomsPanel = div('pit-rooms', document.body);
 roomsPanel.innerHTML = `<h2>Rooms <small data-k="here"></small></h2>
 	<canvas width="256" height="256" title="Scroll to zoom"></canvas>
-	<div class="pit-legend"><span class="c-active">■ active</span> <span class="c-dormant">■ dormant</span> <span class="c-hibernated">■ asleep</span> <span class="c-cold">■ never ran</span> <span class="c-watched">□ watched</span> <span class="c-me">▲ you</span> <span class="c-other">● players</span> <span class="c-mob">● mobs</span></div>
+	<div class="pit-legend"><span class="c-active">■ active</span> <span class="c-dormant">■ dormant</span> <span class="c-hibernated">■ asleep</span> <span class="c-cold">■ never ran</span> <span class="c-watched">┄ watched</span> <span class="c-watched">□ kept awake</span> <span class="c-me">▲ you</span> <span class="c-other">● players</span> <span class="c-mob">● mobs</span></div>
 	<div class="pit-debug" data-k="debug"></div>`;
 const roomsMap = roomsPanel.querySelector('canvas') as HTMLCanvasElement;
 const roomsField = (k: string) => roomsPanel.querySelector(`[data-k="${k}"]`) as HTMLElement;
@@ -356,6 +385,8 @@ const mod = (n: number, m: number) => ((n % m) + m) % m;
  * biome floor, walls with doorway gaps and obstacles; the room's state (zone
  * status read model) is the tile's border; you, other players and mobs are
  * dots at their live positions (your room and the watched rooms next door).
+ * A watched neighbour has a dashed cyan border; one you keep awake
+ * (proximity wake) a solid one.
  */
 function drawRooms(): void {
 	const ctx = roomsMap.getContext('2d');
@@ -419,7 +450,12 @@ function drawRooms(): void {
 				ctx.lineWidth = 2;
 				ctx.strokeRect(x0 + 3, y0 + 3, size - 6, size - 6);
 			}
-			if (pit.neighbours().get(zone) === 'watching' && !(rx === here[0] && ry === here[1])) {
+			const watched = pit.neighbours().get(zone);
+			if (pit.near().has(zone)) {
+				ctx.strokeStyle = '#4dd0e1';
+				ctx.lineWidth = 2;
+				ctx.strokeRect(x0 + 6, y0 + 6, size - 12, size - 12);
+			} else if (watched === 'watching' && !(rx === here[0] && ry === here[1])) {
 				ctx.strokeStyle = '#4dd0e1';
 				ctx.lineWidth = 1;
 				ctx.setLineDash([3, 3]);
@@ -1162,6 +1198,8 @@ stage.onFrame((now, dtMs) => {
 	hud.row('Ghost gap', ghostGap === undefined ? '—' : `${ghostGap.toFixed(2)} m`);
 	const around = [...pit.neighbours().values()];
 	hud.row('Next door', `${around.filter((s) => s === 'watching').length} rooms watched · ${around.filter((s) => s === 'asleep').length} asleep (not woken)`);
+	const awake = [...pit.near()];
+	hud.row('Wake rooms in reach (N)', pit.wakeRooms() ? `on · ${awake.length === 0 ? 'no doorway in reach' : `keeping ${awake.join(', ')} awake`}` : 'off (every neighbour a passive watcher)');
 	const w = pit.world();
 	hud.row('Hood', w === undefined ? '—' : `${w.hoodX},${w.hoodY} · tier ${w.hoodTier} · boss ${w.bossDown ? `down (${w.lastBy})` : 'standing'}`);
 	hud.row('Borough', w === undefined ? '—' : `${w.boroughX},${w.boroughY} · ${WEATHER[w.weather]} · ${w.boroughBossesDown}/9 bosses down`);

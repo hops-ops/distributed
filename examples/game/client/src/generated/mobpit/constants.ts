@@ -72,7 +72,9 @@ export const PIT_WORLD: PitWorld = {
 	passage: 2,
 	hysteresis: 0.5,
 	maxRoom: 1000000,
-	biomes: ['highlands', 'steppe', 'forest', 'meadow']
+	biomes: ['highlands', 'steppe', 'forest', 'meadow'],
+	wakeReach: 11,
+	wakeRelease: 19
 };
 
 /** `weather`, as the client decodes it. */

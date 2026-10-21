@@ -262,12 +262,48 @@ fn pit_room_args() -> Vec<Vec<u8>> {
     args
 }
 
+/// Proximity wake: positions over the room and its doorway passages (a
+/// lattice plus seeded random points, edge values included), with every
+/// prior near set.
+fn rooms_in_reach_args() -> Vec<Vec<u8>> {
+    let mut args = Vec::new();
+    let mut rng = 0x00c0_ffeeu32;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        rng
+    };
+    for near in 0..16u8 {
+        for &(x, y) in &[
+            (0.0, 0.0),
+            (9.0, 0.0),
+            (-9.0, 0.0),
+            (0.0, 9.0),
+            (0.0, -9.0),
+            (1.0, 0.0),
+            (21.5, 0.0),
+            (18.0, 18.0),
+            (-6.0, 11.0),
+        ] {
+            args.push(game_sim::mobpit::ReachContext { x, y, near }.encode_context());
+        }
+        for _ in 0..4 {
+            let x = (next() % 4400) as f32 / 100.0 - 22.0;
+            let y = (next() % 4400) as f32 / 100.0 - 22.0;
+            args.push(game_sim::mobpit::ReachContext { x, y, near }.encode_context());
+        }
+    }
+    args
+}
+
 /// Every demo step's and pure function's native trace (see the module docs).
 pub fn traces() -> Value {
     json!({
         "abi": distributed_game::prediction::ABI_VERSION,
         "pures": [
             pure_trace::<game_sim::mobpit::PitRoomFn>(pit_room_args()),
+            pure_trace::<game_sim::mobpit::RoomsInReachFn>(rooms_in_reach_args()),
         ],
         "steps": [
             trace::<PitStep>(pit_streams()),

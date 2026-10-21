@@ -7,7 +7,7 @@
 	import MyStats from '$lib/pit/MyStats.svelte';
 	import Rooms from '$lib/pit/Rooms.svelte';
 	import Events from '$lib/pit/Events.svelte';
-	import { neighbourRooms, pitHandoffFrame, startPitLoop } from '$lib/pit/loop';
+	import { neighbourRooms, pitHandoffFrame, startPitLoop, startProximityWake } from '$lib/pit/loop';
 
 	let { data } = $props();
 
@@ -181,7 +181,8 @@
 			world: () => world,
 			firstPerson: () => firstPerson,
 			compensated: () => compensated,
-			tint: () => pack.tint
+			tint: () => pack.tint,
+			near: () => nearRooms
 		});
 	});
 	$effect(() => game.client?.setPredictionEnabled(predict));
@@ -227,14 +228,53 @@
 	const unsaved = $derived(mine.filter((key) => !saved.items.some((s) => s.key === key)).length);
 
 	// The 8 rooms next door, watched as passive observers: their mobs are
-	// drawn, a sleeping room is not woken (it shows nothing).
+	// drawn, a sleeping room is not woken (it shows nothing) — unless you
+	// walk up to its doorway: "Wake rooms in reach" (N, on by default,
+	// remembered) keeps the doorway rooms in reach awake.
+	const WAKE_KEY = 'game-demos.mobpit.wake';
+	let wakeRooms = $state(
+		(() => {
+			try {
+				return typeof localStorage === 'undefined' || localStorage.getItem(WAKE_KEY) !== 'off';
+			} catch {
+				return true;
+			}
+		})()
+	);
+	$effect(() => {
+		const on = wakeRooms;
+		try {
+			localStorage.setItem(WAKE_KEY, on ? 'on' : 'off');
+		} catch {
+			// Not remembered (private mode); still applied.
+		}
+	});
+	$effect(() => {
+		const toggle = (e: KeyboardEvent) => {
+			// Not while typing (a focused checkbox still lets N through).
+			const target = e.target as HTMLInputElement | null;
+			const typing = target?.tagName === 'TEXTAREA' || (target?.tagName === 'INPUT' && target.type !== 'checkbox');
+			if (e.code !== 'KeyN' || e.repeat || typing) return;
+			wakeRooms = !wakeRooms;
+		};
+		window.addEventListener('keydown', toggle);
+		return () => window.removeEventListener('keydown', toggle);
+	});
+	let nearRooms = $state<string[]>([]);
 	let around = $state<Record<string, WatchState>>({});
 	$effect(() => {
 		const client = game.client;
 		if (client === undefined) return;
 		const watch = watchZones(client, neighbourRooms);
 		const timer = setInterval(() => (around = Object.fromEntries(watch.states())), 500);
+		const stopWake = startProximityWake(
+			client,
+			watch,
+			() => wakeRooms,
+			(near) => (nearRooms = [...near])
+		);
 		return () => {
+			stopWake();
 			clearInterval(timer);
 			watch.stop();
 		};
@@ -301,6 +341,8 @@
 			<div>corrections <b data-testid="corrections">{net.corrections}</b> (last {net.last.toFixed(3)} m)</div>
 			<div>interest ring <b>{hello.current?.viewRadius ?? '–'}</b> m</div>
 			<div>next door <b data-testid="watching">{watching}</b> watched · <b data-testid="asleep">{asleep}</b> asleep</div>
+			<label><input type="checkbox" bind:checked={wakeRooms} data-testid="wake" /> wake rooms in reach (N)</label>
+			<div>kept awake <b data-testid="near" data-rooms={nearRooms.join(' ')}>{wakeRooms ? nearRooms.join(', ') || 'none in reach' : 'off'}</b></div>
 			<label>latency <input type="range" min="0" max="300" step="5" bind:value={sim.latencyMs} oninput={pushSim} data-testid="latency" /> {sim.latencyMs} ms</label>
 			<label>jitter <input type="range" min="0" max="100" step="1" bind:value={sim.jitterMs} oninput={pushSim} /> {sim.jitterMs} ms</label>
 			<label>loss <input type="range" min="0" max="0.2" step="0.01" bind:value={sim.loss} oninput={pushSim} /> {Math.round(sim.loss * 100)}%</label>
@@ -309,7 +351,7 @@
 		<section data-testid="rooms">
 			<h2>Rooms</h2>
 			<!-- The zone status read model (mobpit-service zone_activities): SSR, then @live. -->
-			<Rooms here={game.zone} {debug} ontoast={toast} />
+			<Rooms here={game.zone} {debug} near={nearRooms} ontoast={toast} />
 			<label><input type="checkbox" bind:checked={debug} data-testid="debug" /> debug overlay</label>
 			{#if debug && info && info.zone === game.zone}
 				<div class="debug" data-testid="overlay" data-node={info.node}>

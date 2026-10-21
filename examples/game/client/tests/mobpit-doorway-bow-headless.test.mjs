@@ -67,7 +67,9 @@ test('a doorway into a sleeping room after a bow fight: no correction, no jump',
 	try {
 		const api = new DevApi({ base: server.httpUrl, name: () => 'Ana', storage: memoryStorage() });
 		const pitApi = new MobPitApi(server.httpUrl, server.roomsUrl);
-		const pit = createMobPitClient({ api, roomsBase: server.roomsUrl });
+		// Proximity wake off: standing at the doorway would keep the room
+		// behind it awake, and this is about a doorway into a sleeping room.
+		const pit = createMobPitClient({ api, roomsBase: server.roomsUrl, wake: false });
 		clients.push(pit);
 		const corrections = [];
 		pit.client.on('correction', (c) => corrections.push({ room: pit.room(), at: Date.now(), m: Math.hypot(c.errors.x ?? 0, c.errors.y ?? 0), errors: c.errors }));

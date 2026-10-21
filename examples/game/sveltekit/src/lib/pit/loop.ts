@@ -10,7 +10,7 @@
  * continues into the next room (the room hands the player over at the same
  * world point).
  */
-import { InputPacer, onGameEvent, type EntityFields, type GameClient, type RenderedEntity } from '@hops-ops/distributed/game';
+import { InputPacer, onGameEvent, type EntityFields, type GameClient, type RenderedEntity, type ZoneWatch } from '@hops-ops/distributed/game';
 
 import {
 	BUTTON,
@@ -47,6 +47,59 @@ const BIOME_COLOR = ['#8a8f99', '#c9a86a', '#3f7d4e', '#7fbf6a'];
 function parseRoom(zone: string | undefined): [number, number] | undefined {
 	const m = zone === undefined ? null : /^pit\.(-?\d+)\.(-?\d+)$/.exec(zone);
 	return m === null ? undefined : [Number(m[1]), Number(m[2])];
+}
+
+/** The doorway neighbours of `room` behind `near` bits (`rooms_in_reach`: east, west, north, south). */
+export function reachRooms(room: readonly [number, number], near: number): string[] {
+	const doors: [number, [number, number]][] = [
+		[1, [1, 0]],
+		[2, [-1, 0]],
+		[4, [0, 1]],
+		[8, [0, -1]]
+	];
+	return doors.filter(([bit]) => (near & bit) !== 0).map(([, [dx, dy]]) => `pit.${room[0] + dx}.${room[1] + dy}`);
+}
+
+/**
+ * Proximity wake ("Wake rooms in reach"): every 100 ms, from the predicted
+ * position, the doorway neighbours in reach (`rooms_in_reach`, the shared
+ * Rust as WASM: within `PIT_WORLD.wakeReach` of their doorway, released
+ * beyond `wakeRelease`, at most the two of a corner, corner rooms never)
+ * are made near on `watch` — the rooms wake and stay live (the ticket
+ * route grants `wake` only for rooms within two doorways of the player's
+ * last room). `enabled()` false: none (passive watchers). Returns stop.
+ */
+export function startProximityWake(
+	client: GameClient<PitInput>,
+	watch: ZoneWatch,
+	enabled: () => boolean,
+	onChange: (near: readonly string[]) => void
+): () => void {
+	const pures = createMobpitPures();
+	let room: string | undefined;
+	let bits = 0;
+	let near: string[] = [];
+	const timer = setInterval(() => {
+		const zone = client.authority?.zoneId;
+		const at = parseRoom(zone);
+		if (zone !== room) {
+			room = zone;
+			bits = 0;
+		}
+		const me = client.render().find((e) => e.predicted && e.zoneId === zone && isPlayer(e));
+		let next = 0;
+		if (enabled() && at !== undefined && me !== undefined && pures.loaded()) {
+			const p = playerFields(me);
+			next = pures.roomsInReach({ x: p.x, y: p.y, near: bits }).near;
+		}
+		bits = next;
+		const rooms = at === undefined ? [] : reachRooms(at, next);
+		if (rooms.length === near.length && rooms.every((z) => near.includes(z))) return;
+		near = rooms;
+		watch.setNear(rooms);
+		onChange(rooms);
+	}, 100);
+	return () => clearInterval(timer);
 }
 
 /** The 8 rooms around `zone` (watched as passive observers: `watchZones`). */
@@ -98,6 +151,8 @@ export type PitLoopOptions = Readonly<{
 	compensated?: () => boolean;
 	/** The tint (0xRRGGBB, 0: none) of the content pack this client runs. */
 	tint?: () => number;
+	/** Rooms kept awake (proximity wake): outlined solid cyan. */
+	near?: () => readonly string[];
 }>;
 
 /** `color` blended 60 % towards `tint` (0: unchanged). */
@@ -394,6 +449,11 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				for (const s of [-1, 1]) {
 					line(ox - DOOR_HALF, oy + s * HALF, ox + DOOR_HALF, oy + s * HALF);
 					line(ox + s * HALF, oy - DOOR_HALF, ox + s * HALF, oy + DOOR_HALF);
+				}
+				if (options.near?.().includes(`pit.${rx}.${ry}`)) {
+					ctx.strokeStyle = '#4dd0e1';
+					ctx.lineWidth = 2;
+					ctx.strokeRect(...at(ox - HALF + 1, oy + HALF - 1), (2 * HALF - 2) * scale, (2 * HALF - 2) * scale);
 				}
 				if (rx === here?.[0] && ry === here?.[1]) {
 					ctx.strokeStyle = 'rgba(255,255,255,0.25)';

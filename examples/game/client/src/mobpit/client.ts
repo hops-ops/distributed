@@ -22,6 +22,17 @@
  * none (a sleeping room answers `ASLEEP`; it is tried again every few
  * seconds and shows nothing meanwhile).
  *
+ * Proximity wake ("Wake rooms in reach", `wake`, default on): rooms connect
+ * only through the four mid-wall doorways, so only those four neighbours
+ * can be woken. Within `PIT_WORLD.wakeReach` (11 m) of a doorway — from the
+ * predicted position — the watcher of the room behind it says it is *near*
+ * (`watchZones(...).setNear`): the room wakes and stays live until the
+ * player is beyond `wakeRelease` (19 m) of that doorway (`rooms_in_reach`,
+ * shared Rust as WASM: at most the two doorways of a corner, nothing from
+ * the middle of the room, corner rooms never). The services grant `wake`
+ * only on observer tickets for rooms within two doorways of the player's
+ * last room. Off: every neighbour is a passive watcher.
+ *
  * Live content updates: the page starts on the world's live content
  * version (`/dev/mobpit/content`). An admin rollout freezes every room
  * (`Freeze`, inputs held; the change notes on screen), switches them to the
@@ -88,6 +99,17 @@ export function pitHandoffFrame(fields: EntityFields, from: string, to: string):
 /** `[x, y]` → `pit.<x>.<y>`. */
 export function roomZone(x: number, y: number): string {
 	return `pit.${x}.${y}`;
+}
+
+/** The doorway neighbours of `room` behind `near` bits (`rooms_in_reach`: east, west, north, south). */
+export function reachRooms(room: readonly [number, number], near: number): string[] {
+	const doors: [number, [number, number]][] = [
+		[1, [1, 0]],
+		[2, [-1, 0]],
+		[4, [0, 1]],
+		[8, [0, -1]]
+	];
+	return doors.filter(([bit]) => (near & bit) !== 0).map(([, [dx, dy]]) => roomZone(room[0] + dx, room[1] + dy));
 }
 
 /** The 8 rooms around `zone`. */
@@ -241,6 +263,11 @@ export type RoomInfo = Readonly<{
 	node: string;
 	isolate: string;
 	players: number;
+	/** Observers connected, and how many of them keep the room awake (near). */
+	observers?: number;
+	near?: number;
+	/** The room is ticking (active). */
+	ticking?: boolean;
 	tick: number;
 	hz: number;
 	lateMs: { p50: number; p99: number };
@@ -310,6 +337,12 @@ export type MobPitClient = pit.MobpitClient &
 		verdict(id: number): Promise<pit.ShotEvent>;
 		/** The neighbour rooms watched (`watchZones` over `neighbourRooms`), when enabled. */
 		neighbours(): ReadonlyMap<string, WatchState>;
+		/** The doorway neighbours kept awake now (proximity wake; empty when off). */
+		near(): ReadonlySet<string>;
+		/** Proximity wake ("Wake rooms in reach") on? */
+		wakeRooms(): boolean;
+		/** Turn proximity wake on or off (off: every neighbour passive). */
+		setWakeRooms(on: boolean): void;
 		/** Live content (version, pack, freeze, staleness). */
 		content(): ContentView;
 		/** Stop watching neighbours and close the client. */
@@ -323,6 +356,8 @@ export type MobPitClientOptions = Readonly<{
 	socket?: GameSocketFactory;
 	/** Watch the 8 neighbour rooms (default true). */
 	neighbours?: boolean;
+	/** Proximity wake: keep the doorway neighbours in reach awake (default true). */
+	wake?: boolean;
 	/** Content version to start on (the world's live one; default ''). */
 	contentVersion?: string;
 	/** Simulate an old client: never patch content live on Resume. */
@@ -488,6 +523,35 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		return rendered.find((e) => e.predicted) ?? rendered.find((e) => e.id === id && e.zoneId === typed.client.authority?.zoneId) ?? rendered.find((e) => e.id === id);
 	};
 	const watcher = options.neighbours === false ? undefined : watchZones(typed.client, neighbourRooms);
+	// ---- proximity wake ----
+	let wake = options.wake ?? true;
+	let reachRoom: string | undefined;
+	let reachBits = 0;
+	let near: ReadonlySet<string> = new Set();
+	const updateReach = () => {
+		if (watcher === undefined) return;
+		const room = typed.client.authority?.zoneId;
+		const at = parseRoom(room ?? '');
+		// The hysteresis is per room (a doorway re-frames everything).
+		if (room !== reachRoom) {
+			reachRoom = room;
+			reachBits = 0;
+		}
+		const meNow = me();
+		let bits = 0;
+		if (wake && at !== undefined && meNow !== undefined && meNow.zoneId === room && pures.loaded()) {
+			const p = pit.playerFields(meNow);
+			bits = pures.roomsInReach({ x: p.x, y: p.y, near: reachBits }).near;
+		}
+		reachBits = bits;
+		const rooms = at === undefined ? [] : reachRooms(at, bits);
+		if (rooms.length === near.size && rooms.every((z) => near.has(z))) return;
+		near = new Set(rooms);
+		watcher.setNear(rooms);
+	};
+	const reachTimer = setInterval(updateReach, 100);
+	// Never keep a Node process alive for this.
+	(reachTimer as { unref?: () => void }).unref?.();
 	return {
 		...typed,
 		hello: hello.get,
@@ -503,6 +567,12 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		pures,
 		ready: Promise.all([hello.ready, typed.prediction?.ready, pures.ready]).then(([h]) => h),
 		neighbours: () => watcher?.states() ?? new Map(),
+		near: () => near,
+		wakeRooms: () => wake,
+		setWakeRooms(on) {
+			wake = on;
+			updateReach();
+		},
 		content,
 		shots,
 		rangedStats,
@@ -513,6 +583,7 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 			return new Promise((resolve) => waiters.set(id, resolve));
 		},
 		close: () => {
+			clearInterval(reachTimer);
 			watcher?.stop();
 			typed.client.close();
 		}

@@ -713,6 +713,11 @@ pub struct PitWorld {
     pub max_room: i32,
     /// Biome names by index.
     pub biomes: Vec<String>,
+    /// Proximity wake: a doorway neighbour wakes within this distance of
+    /// its doorway ([`WAKE_REACH`], m).
+    pub wake_reach: f32,
+    /// … and is released beyond this one ([`WAKE_RELEASE`], m).
+    pub wake_release: f32,
 }
 
 /// The `PIT_WORLD` constant.
@@ -729,6 +734,8 @@ pub fn pit_world() -> PitWorld {
         hysteresis: HYSTERESIS,
         max_room: MAX_ROOM,
         biomes: grid::BIOMES.map(String::from).to_vec(),
+        wake_reach: WAKE_REACH,
+        wake_release: WAKE_RELEASE,
     }
 }
 
@@ -792,9 +799,160 @@ pub fn admissible(s: &PitState) -> bool {
         && ((ax <= lim && ay <= lim) || (ay <= gap && ax <= far) || (ax <= gap && ay <= far))
 }
 
+// ------------------------------------------------------------ proximity wake
+
+/// A doorway neighbour wakes (its watcher becomes *near*) when the player
+/// is this close to the doorway leading to it (m, room-local, measured to
+/// the middle of the doorway on the shared wall). Below half the room
+/// (20 m) so that at most two doorways — the two of a corner — are ever in
+/// reach, and nothing is from the middle of the room.
+pub const WAKE_REACH: f32 = 11.0;
+/// A near neighbour goes back to a passive watcher only beyond this
+/// distance from its doorway ([`WAKE_REACH`] + 8 m hysteresis). Below 20 m,
+/// so the middle of the room releases every neighbour.
+pub const WAKE_RELEASE: f32 = WAKE_REACH + 8.0;
+/// At most this many neighbours near at once (two doorways of a corner).
+pub const WAKE_MAX: usize = 2;
+/// An observer ticket grants `wake` only for rooms at most this many
+/// doorways from the room the principal was last seen in (one doorway of
+/// slack: a watcher for the next room's neighbours is asked for right after
+/// a doorway, before the presence record follows).
+pub const WAKE_DOORS: u32 = 2;
+
+/// The doorway neighbours as [`Reach::near`] bits and room offsets: east
+/// (+x), west, north (+y), south. Corner (diagonal) rooms have no doorway
+/// to this one and never wake.
+pub const DOORWAYS: [(u8, (i32, i32)); 4] = [(1, (1, 0)), (2, (-1, 0)), (4, (0, 1)), (8, (0, -1))];
+
+/// Where the player stands (room-local) and which doorway neighbours were
+/// near ([`rooms_in_reach`]'s input).
+#[derive(Debug, Clone, Copy, Default, PartialEq, GameRecord)]
+pub struct ReachContext {
+    /// Room-local x (m).
+    pub x: f32,
+    /// Room-local y (m).
+    pub y: f32,
+    /// [`DOORWAYS`] bits near so far (the hysteresis).
+    pub near: u8,
+}
+
+/// The doorway neighbours near now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameRecord)]
+pub struct Reach {
+    /// [`DOORWAYS`] bits.
+    pub near: u8,
+}
+
+/// Proximity wake: which of the four doorway neighbours a player at
+/// room-local `(x, y)` keeps awake. A neighbour becomes near within
+/// [`WAKE_REACH`] of its doorway and stays near until beyond
+/// [`WAKE_RELEASE`]; at most [`WAKE_MAX`] (the nearest). Pure, so both
+/// pages run this code as WebAssembly.
+#[game_pure(RoomsInReachFn)]
+pub fn rooms_in_reach(at: &ReachContext) -> Reach {
+    let mut near: Vec<(f32, u8)> = DOORWAYS
+        .iter()
+        .filter_map(|&(bit, (dx, dy))| {
+            let door = (dx as f32 * arena::HALF, dy as f32 * arena::HALF);
+            let d = ((at.x - door.0).powi(2) + (at.y - door.1).powi(2)).sqrt();
+            let limit = if at.near & bit != 0 {
+                WAKE_RELEASE
+            } else {
+                WAKE_REACH
+            };
+            (d.is_finite() && d <= limit).then_some((d, bit))
+        })
+        .collect();
+    near.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Reach {
+        near: near
+            .iter()
+            .take(WAKE_MAX)
+            .fold(0, |bits, &(_, bit)| bits | bit),
+    }
+}
+
+/// The rooms of [`Reach::near`] bits around `room`.
+pub fn reach_rooms(room: (i32, i32), near: u8) -> Vec<(i32, i32)> {
+    DOORWAYS
+        .iter()
+        .filter(|(bit, _)| near & bit != 0)
+        .map(|&(_, (dx, dy))| (room.0 + dx, room.1 + dy))
+        .collect()
+}
+
+/// May a principal last seen in room `from` be granted `wake` for room
+/// `to` (an observer ticket)? Only other rooms within [`WAKE_DOORS`]
+/// doorways.
+pub fn wake_allowed(from: (i32, i32), to: (i32, i32)) -> bool {
+    let doors = from.0.abs_diff(to.0).saturating_add(from.1.abs_diff(to.1));
+    (1..=WAKE_DOORS).contains(&doors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proximity_wake_reaches_doorways_only_two_at_most_with_hysteresis() {
+        let reach = |x: f32, y: f32, near: u8| rooms_in_reach(&ReachContext { x, y, near }).near;
+        // The middle of the room: nothing, and it releases everything.
+        assert_eq!(reach(0.0, 0.0, 0), 0);
+        assert_eq!(reach(0.0, 0.0, 15), 0);
+        // Walking east toward the doorway: wakes within WAKE_REACH.
+        assert_eq!(reach(20.0 - WAKE_REACH - 0.1, 0.0, 0), 0);
+        assert_eq!(reach(20.0 - WAKE_REACH + 0.1, 0.0, 0), 1);
+        assert_eq!(reach(19.0, 0.0, 0), 1);
+        // In the doorway passage (past the wall line), still east only.
+        assert_eq!(reach(21.5, 0.0, 0), 1);
+        // Walking back: stays near until beyond WAKE_RELEASE.
+        assert_eq!(reach(20.0 - WAKE_RELEASE + 0.1, 0.0, 1), 1);
+        assert_eq!(reach(20.0 - WAKE_RELEASE - 0.1, 0.0, 1), 0);
+        // A room corner: no doorway is in reach (diagonals never wake).
+        assert_eq!(reach(18.5, 18.5, 0), 0);
+        // Every spot of the room (and the hysteresis from any prior set):
+        // at most two, never two opposite ones.
+        let mut seen_two = false;
+        for prior in 0..16u8 {
+            for i in 0..=88 {
+                for j in 0..=88 {
+                    let (x, y) = (-22.0 + i as f32 * 0.5, -22.0 + j as f32 * 0.5);
+                    let near = reach(x, y, prior);
+                    assert!(
+                        near.count_ones() as usize <= WAKE_MAX,
+                        "({x}, {y}) {prior:#b}"
+                    );
+                    assert!(
+                        near & 3 != 3 && near & 12 != 12,
+                        "opposite doorways at ({x}, {y})"
+                    );
+                    seen_two |= near.count_ones() == 2;
+                }
+            }
+        }
+        assert!(seen_two, "two doorways of a corner can both be near");
+        // Walking a corner path east then north holds both briefly.
+        let mut near = 0;
+        for (x, y) in [(15.0, 0.0), (12.0, 6.0), (6.0, 11.0)] {
+            near = reach(x, y, near);
+        }
+        assert_eq!(near, 1 | 4);
+        assert_eq!(reach_rooms((3, -2), near), vec![(4, -2), (3, -1)]);
+    }
+
+    #[test]
+    fn wake_is_granted_only_within_two_doorways() {
+        assert!(wake_allowed((0, 0), (1, 0)));
+        assert!(wake_allowed((0, 0), (2, 0)), "the next room's neighbour");
+        assert!(wake_allowed((0, 0), (1, 1)));
+        assert!(
+            !wake_allowed((0, 0), (0, 0)),
+            "the own room needs no watcher"
+        );
+        assert!(!wake_allowed((0, 0), (3, 0)));
+        assert!(!wake_allowed((0, 0), (2, 1)));
+        assert!(!wake_allowed((MAX_ROOM, 0), (-MAX_ROOM, 0)));
+    }
 
     #[test]
     fn rooms_are_deterministic_and_vary() {

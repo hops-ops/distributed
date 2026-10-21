@@ -80,11 +80,29 @@ export async function liveContent(): Promise<ContentState | null> {
 export const tickets = createGameTicketHandler({
 	secret: () => env.GAME_TICKET_SECRET,
 	// The page also watches the 8 rooms next door (one observer ticket each
-	// per doorway, retried with back-off while a room sleeps).
+	// per doorway, retried with back-off while a room sleeps; a fresh one
+	// when a doorway room in reach was refused WAKE_DENIED).
 	rateLimit: { max: 120, windowMs: 60_000 },
 	getSession: (event: RequestEvent) => event.locals.auth(),
-	zone: async ({ requested, principal }) => (isRoom(requested) ? requested : ((await lastRoom(principal)) ?? ENTRANCE))
+	zone: async ({ requested, principal }) => (isRoom(requested) ? requested : ((await lastRoom(principal)) ?? ENTRANCE)),
+	// Proximity wake: an observer ticket may wake (and keep awake) only a
+	// room within two doorways of the room the player was last seen in
+	// (one doorway of slack: the next room's watchers are asked for right
+	// after a doorway, before the presence record follows).
+	wake: async ({ principal, zone }) => {
+		const from = parseRoom(await lastRoom(principal));
+		const to = parseRoom(zone);
+		if (from === undefined || to === undefined) return false;
+		const doors = Math.abs(from[0] - to[0]) + Math.abs(from[1] - to[1]);
+		return doors >= 1 && doors <= 2;
+	}
 });
+
+/** `pit.<x>.<y>` → `[x, y]`. */
+function parseRoom(zone: string | undefined): [number, number] | undefined {
+	const m = zone === undefined ? null : /^pit\.(-?\d+)\.(-?\d+)$/.exec(zone);
+	return m === null ? undefined : [Number(m[1]), Number(m[2])];
+}
 
 /**
  * Where browsers reach the rooms: celld's public listeners (`ws://…`,

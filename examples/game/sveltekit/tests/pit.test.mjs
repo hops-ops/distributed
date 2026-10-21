@@ -166,6 +166,35 @@ async function walkInto(page, goal, room, from) {
 	}
 }
 
+/** Walk `page`'s player to room-local `goal` in its room (keyboard). */
+async function walkTo(page, goal) {
+	const held = new Set();
+	const hold = async (keys) => {
+		for (const k of [...held]) if (!keys.includes(k)) (await page.keyboard.up(k), held.delete(k));
+		for (const k of keys) if (!held.has(k)) (await page.keyboard.down(k), held.add(k));
+	};
+	try {
+		for (const start = Date.now(); Date.now() - start < 30_000; ) {
+			const me = await page.evaluate(() => document.querySelector('canvas')?.dataset.me);
+			const [x, y] = (me ?? '0,0').split(',').map(Number);
+			if (Math.hypot(goal[0] - x, goal[1] - y) < 0.6) return;
+			const keys = [];
+			if (goal[0] - x > 0.3) keys.push('KeyD');
+			if (goal[0] - x < -0.3) keys.push('KeyA');
+			if (goal[1] - y > 0.3) keys.push('KeyW');
+			if (goal[1] - y < -0.3) keys.push('KeyS');
+			await hold(keys);
+			await page.waitForTimeout(60);
+		}
+		throw new Error(`walking to ${goal} timed out`);
+	} finally {
+		await hold([]);
+	}
+}
+
+/** Rooms the page keeps awake (proximity wake). */
+const nearRooms = (page) => page.evaluate(() => (document.querySelector('[data-testid=near]')?.dataset.rooms ?? '').split(' ').filter(Boolean));
+
 /** The minimap's view of `zone` (the zone status read model, live). */
 const roomStatus = (page, zone) => page.getAttribute(`[data-testid="room-${zone}"]`, 'data-status');
 
@@ -448,8 +477,15 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 			assert.ok(fleet.nodes.includes(entranceNode) && fleet.nodes.includes(eastNode), `${entranceNode} ${eastNode}`);
 			assert.notEqual(eastNode, entranceNode, 'the doorway led into a room on another celld node');
 		}
+		// Both step away from the doorways they came through (standing in one
+		// keeps the room behind it awake: "wake rooms in reach").
+		assert.deepEqual(await nearRooms(page), ['pit.0.0'], 'Ana at the doorway keeps the entrance awake');
+		await walkTo(page, [3, 3]);
+		await walkTo(bob, [2, 1]);
+		await page.waitForFunction(() => document.querySelector('[data-testid=near]')?.dataset.rooms === '', null, { timeout: 10_000 });
 		// The left room goes dormant, then asleep, live on both minimaps —
-		// although Bob, next door, watches it (a watcher keeps no room awake).
+		// although Bob, next door, watches it (a passive watcher keeps no
+		// room awake).
 		await page.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=hibernated]', { timeout: 30_000 });
 		await bob.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=hibernated]', { timeout: 10_000 });
 		assert.equal(await roomStatus(page, 'pit.1.0'), 'active');
@@ -458,6 +494,22 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		await page.waitForSelector('[data-testid=toasts] .toast:has-text("restored from hibernation")', { timeout: 15_000 });
 		await page.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=active]', { timeout: 15_000 });
 		await bob.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=active]', { timeout: 15_000 });
+		// Proximity wake (on by default): walking up to the west doorway wakes
+		// the room behind it, which never ran, before Ana gets there; N turns
+		// it off and the room is let go.
+		assert.equal(await page.isChecked('[data-testid=wake]'), true, 'wake rooms in reach: on by default');
+		await walkTo(page, [-3, 3]);
+		await walkTo(page, [-13, 1.7]);
+		await page.waitForFunction(() => (document.querySelector('[data-testid=near]')?.dataset.rooms ?? '').split(' ').includes('pit.-1.0'), null, { timeout: 10_000 });
+		await page.waitForSelector('[data-testid="room-pit.-1.0"][data-status=active]', { timeout: 20_000 });
+		assert.equal(await page.textContent('[data-testid=zone]'), 'pit.0.0', 'woken before the doorway');
+		console.error(`proximity wake: pit.-1.0 woke with Ana 7 m from its doorway (kept awake: ${await nearRooms(page)})`);
+		await page.keyboard.press('KeyN');
+		assert.equal(await page.isChecked('[data-testid=wake]'), false);
+		assert.equal(await page.textContent('[data-testid=near]'), 'off');
+		await page.waitForSelector('[data-testid="room-pit.-1.0"][data-status=hibernated]', { timeout: 30_000 });
+		await page.keyboard.press('KeyN');
+		assert.equal(await page.isChecked('[data-testid=wake]'), true);
 		// A kill in the restored room settles and the read model follows live.
 		const before = Number(await page.textContent('[data-testid=kills]'));
 		await page.check('[data-testid=autohunt]');

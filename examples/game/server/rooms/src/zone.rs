@@ -60,7 +60,8 @@ use game_sim::arena::{self as movement, PLAYER_RADIUS};
 use game_sim::mobpit::PitState as MoveState;
 use game_sim::mobpit::{
     self as rooms, admissible, borough_of, crossing, hood_of, into_neighbour, pair_shard,
-    parse_room, pit_room, pit_world, room_zone, PitRoomContext, PitRoomFn, BOSS_TIER,
+    parse_room, pit_room, pit_world, room_zone, PitRoomContext, PitRoomFn, RoomsInReachFn,
+    BOSS_TIER,
 };
 use mobpit_crawler::{level_floor, KillReceipt, RecordKillInput};
 use mobpit_tiers::{BossDefeatedInput, WEATHER};
@@ -448,6 +449,7 @@ pub fn game_surface() -> GameSurface {
         .events::<PitEvent>()
         .predict::<PitStep>()
         .pure::<PitRoomFn>()
+        .pure::<RoomsInReachFn>()
         .constant("pit_rules", &pit_rules())
         .constant("weather", &WEATHER.map(String::from).to_vec())
         .constant(

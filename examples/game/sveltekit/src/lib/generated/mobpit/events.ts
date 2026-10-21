@@ -102,6 +102,8 @@ export interface PitWorld {
 	readonly hysteresis: number;
 	readonly maxRoom: number;
 	readonly biomes: readonly string[];
+	readonly wakeReach: number;
+	readonly wakeRelease: number;
 }
 
 /** Record `Profile` (`#[derive(GameRecord)]`). */
@@ -125,6 +127,18 @@ const PROFILE_TYPE: WireType = {
 		['source', { type: 'short_str' }],
 	]
 };
+
+/** Record `Reach` (`#[derive(GameRecord)]`). */
+export interface Reach {
+	readonly near: number;
+}
+
+/** Record `ReachContext` (`#[derive(GameRecord)]`). */
+export interface ReachContext {
+	readonly x: number;
+	readonly y: number;
+	readonly near: number;
+}
 
 /** Record `WorldTiers` (`#[derive(GameRecord)]`). */
 export interface WorldTiers {

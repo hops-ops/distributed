@@ -130,6 +130,9 @@ async fn ticket(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
         + TICKET_TTL_SECS;
+    // Proximity wake: an observer may wake (and keep awake) only a room
+    // within two doorways of the room its principal was last seen in.
+    let wake = role == Role::Observer && may_wake(&dev, &principal, &request.zone).await;
     let ticket = dev.key.sign(
         &TicketClaims::new(
             principal.clone(),
@@ -138,7 +141,8 @@ async fn ticket(
             guests::random_hex(24),
             role,
         )
-        .with_name(name.clone()),
+        .with_name(name.clone())
+        .with_wake(wake),
     );
     Ok(Json(TicketResponse {
         ticket,
@@ -148,6 +152,19 @@ async fn ticket(
         zone: request.zone,
         expires_at,
     }))
+}
+
+/// The wake grant of an observer ticket for `zone`: the principal's last
+/// room (its presence) is at most [`WAKE_DOORS`](game_sim::mobpit::WAKE_DOORS)
+/// doorways away.
+async fn may_wake(dev: &Dev, principal: &str, zone: &str) -> bool {
+    let (Some(to), Some(from)) = (
+        mobpit_rooms::parse_room(zone),
+        dev.world.last_room(principal).await,
+    ) else {
+        return false;
+    };
+    mobpit_rooms::parse_room(&from).is_some_and(|from| game_sim::mobpit::wake_allowed(from, to))
 }
 
 /// `POST /dev/mobpit/start` body.

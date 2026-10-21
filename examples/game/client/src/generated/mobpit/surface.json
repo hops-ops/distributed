@@ -182,7 +182,9 @@
           }
         ],
         "player_radius": 0.5,
-        "room_size": 40.0
+        "room_size": 40.0,
+        "wake_reach": 11.0,
+        "wake_release": 19.0
       }
     },
     {
@@ -1040,6 +1042,19 @@
         "type": "record"
       },
       "package": "game_sim"
+    },
+    {
+      "abi": 1,
+      "arg": {
+        "name": "ReachContext",
+        "type": "record"
+      },
+      "export": "rooms_in_reach",
+      "output": {
+        "name": "Reach",
+        "type": "record"
+      },
+      "package": "game_sim"
     }
   ],
   "records": [
@@ -1457,6 +1472,18 @@
             },
             "type": "list"
           }
+        },
+        {
+          "name": "wake_reach",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "wake_release",
+          "type": {
+            "type": "f32"
+          }
         }
       ],
       "name": "PitWorld"
@@ -1501,6 +1528,40 @@
         }
       ],
       "name": "Profile"
+    },
+    {
+      "fields": [
+        {
+          "name": "near",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "Reach"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "near",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "ReachContext"
     },
     {
       "fields": [
