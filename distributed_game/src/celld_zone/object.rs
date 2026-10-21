@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +24,7 @@ use worker::{
 
 use super::plan::{
     cell_binding, classify_wait_path, zone_from_path, ObjectOptions, RoomState, StoredFact,
-    TickSchedule, Window, CLOSE_RESTARTED, OUTBOX_PREFIX, ZONE_HEADER,
+    TickSchedule, Window, CLOSE_RESTARTED, NETSIM_SHARD, OUTBOX_PREFIX, ZONE_DEV_KIND, ZONE_HEADER,
 };
 use crate::command_sink::{CommandFactSink, FactCall, FactHost, FactRoute};
 use crate::facts::{
@@ -32,6 +32,7 @@ use crate::facts::{
 };
 use crate::handoff::{HandoffRequest, Transfer};
 use crate::inbox::ZoneInbound;
+use crate::netsim::{DelayLine, NetSim, NetSimJson};
 use crate::protocol::{error, ClientMessage, Role, ServerMessage, PROTOCOL_VERSION};
 use crate::stamp::FactStamp;
 use crate::ticket::{NonceCache, TicketKey, VerifiedTicket};
@@ -56,6 +57,24 @@ const TRANSFER_TTL_SECS: u64 = 30;
 const FACT_CAPACITY: usize = 512;
 /// Retry stored facts this often while any is unsettled (ms).
 const OUTBOX_RETRY_MS: f64 = 10_000.0;
+/// Read the dev settings this often while ticking (ms).
+const DEV_SETTINGS_EVERY_MS: f64 = 1_000.0;
+
+/// Server → client, through the socket's simulated network.
+enum OutItem {
+    Frame(Vec<u8>),
+    Close,
+}
+
+/// Client → server, through the socket's simulated network.
+enum InItem {
+    Input {
+        seq: u32,
+        client_tick: u32,
+        payload: Vec<u8>,
+    },
+    Ping(f64),
+}
 
 /// A game zone the framework can host as a celld Durable Object: one object
 /// per zone id (celld places it, forwards to it, hibernates and moves it).
@@ -381,9 +400,136 @@ struct Inner<Z: CelldZone> {
     stats: TickStats,
     last_persist_ms: f64,
     spooled: u64,
+    /// Dev network simulation in effect (from the dev settings object).
+    net_sim: Option<NetSim>,
+    /// Per socket: server → client and client → server delay lines.
+    out_lines: HashMap<u32, DelayLine<OutItem>>,
+    in_lines: HashMap<u32, DelayLine<InItem>>,
+    /// When the pending drain task wakes up (one per earliest deadline).
+    drain_at: Option<f64>,
+    /// Spawns a drain task waking at the given time (set by the object).
+    drainer: Option<Rc<dyn Fn(f64)>>,
+    last_dev_read_ms: f64,
 }
 
 impl<Z: CelldZone> Inner<Z> {
+    /// Send `item` to `client` through its simulated network.
+    fn send_out(&mut self, client: u32, item: OutItem) {
+        let sim = self.net_sim;
+        let line = self
+            .out_lines
+            .entry(client)
+            .or_insert_with(|| DelayLine::new(u64::from(client) ^ 0x5eed_0u64));
+        match line.push(sim, now_ms(), item) {
+            Some(item) => self.deliver(client, item),
+            None => {
+                if let Some(due) = line.next_due() {
+                    self.want_drain(due);
+                }
+            }
+        }
+    }
+
+    fn deliver(&mut self, client: u32, item: OutItem) {
+        match item {
+            OutItem::Frame(frame) => {
+                if let Some(ws) = self.sockets.get(&client) {
+                    let _ = ws.send_with_bytes(frame);
+                }
+            }
+            OutItem::Close => {
+                self.out_lines.remove(&client);
+                self.in_lines.remove(&client);
+                if let Some(ws) = self.sockets.remove(&client) {
+                    let _ = ws.close(Some(1000), Some("closed by zone"));
+                }
+            }
+        }
+    }
+
+    /// Take `item` from `client` through its simulated network.
+    fn receive(&mut self, client: u32, item: InItem) {
+        let sim = self.net_sim;
+        let line = self
+            .in_lines
+            .entry(client)
+            .or_insert_with(|| DelayLine::new(u64::from(client) ^ 0xfeed_0u64));
+        match line.push(sim, now_ms(), item) {
+            Some(item) => self.apply(client, item),
+            None => {
+                if let Some(due) = line.next_due() {
+                    self.want_drain(due);
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, client: u32, item: InItem) {
+        match item {
+            InItem::Input {
+                seq,
+                client_tick,
+                payload,
+            } => {
+                if let Some(host) = self.host.as_mut() {
+                    host.push_input(ClientId(client), seq, client_tick, &payload);
+                }
+            }
+            InItem::Ping(client_time) => {
+                let server_time = self.host.as_ref().map_or(0.0, |h| h.server_time_ms());
+                if let Ok(pong) = (ServerMessage::Pong {
+                    client_time,
+                    server_time,
+                })
+                .encode(&())
+                {
+                    self.send_out(client, OutItem::Frame(pong));
+                }
+            }
+        }
+    }
+
+    /// Deliver and apply everything due at `now`.
+    fn drain_due(&mut self, now: f64) {
+        let clients: Vec<u32> = self.in_lines.keys().copied().collect();
+        for client in clients {
+            while let Some(item) = self.in_lines.get_mut(&client).and_then(|l| l.pop_due(now)) {
+                self.apply(client, item);
+            }
+        }
+        let clients: Vec<u32> = self.out_lines.keys().copied().collect();
+        for client in clients {
+            while let Some(item) = self.out_lines.get_mut(&client).and_then(|l| l.pop_due(now)) {
+                self.deliver(client, item);
+            }
+        }
+    }
+
+    fn next_due(&self) -> Option<f64> {
+        self.in_lines
+            .values()
+            .filter_map(DelayLine::next_due)
+            .chain(self.out_lines.values().filter_map(DelayLine::next_due))
+            .min_by(f64::total_cmp)
+    }
+
+    /// Make sure a drain task wakes up by `due`.
+    fn want_drain(&mut self, due: f64) {
+        if self.drain_at.is_some_and(|at| at <= due) {
+            return;
+        }
+        self.drain_at = Some(due);
+        if let Some(drainer) = self.drainer.clone() {
+            drainer(due);
+        }
+    }
+
+    /// Forget a socket's delay lines.
+    fn forget(&mut self, client: u32) {
+        self.out_lines.remove(&client);
+        self.in_lines.remove(&client);
+    }
+
     fn occupied(&self) -> bool {
         self.host
             .as_ref()
@@ -394,18 +540,13 @@ impl<Z: CelldZone> Inner<Z> {
         let Some(host) = self.host.as_mut() else {
             return;
         };
-        for out in host.drain_outbound() {
+        let outbound = host.drain_outbound();
+        for out in outbound {
             match out {
                 Outbound::Frame { client, frame } => {
-                    if let Some(ws) = self.sockets.get(&client.0) {
-                        let _ = ws.send_with_bytes(frame);
-                    }
+                    self.send_out(client.0, OutItem::Frame(frame));
                 }
-                Outbound::Close { client } => {
-                    if let Some(ws) = self.sockets.remove(&client.0) {
-                        let _ = ws.close(Some(1000), Some("closed by zone"));
-                    }
-                }
+                Outbound::Close { client } => self.send_out(client.0, OutItem::Close),
             }
         }
     }
@@ -534,11 +675,22 @@ impl<Z: CelldZone> ZoneObject<Z> {
             stats: TickStats::default(),
             last_persist_ms: 0.0,
             spooled: 0,
+            net_sim: None,
+            out_lines: HashMap::new(),
+            in_lines: HashMap::new(),
+            drain_at: None,
+            drainer: None,
+            last_dev_read_ms: 0.0,
         };
+        let inner = Rc::new(RefCell::new(inner));
+        let weak = Rc::downgrade(&inner);
+        inner.borrow_mut().drainer = Some(Rc::new(move |due: f64| {
+            wasm_bindgen_futures::spawn_local(drain_task(weak.clone(), due));
+        }));
         Self {
             state: Rc::new(state),
             env,
-            inner: Rc::new(RefCell::new(inner)),
+            inner,
         }
     }
 
@@ -616,17 +768,26 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 },
             ) => {
                 let mut inner = self.inner.borrow_mut();
-                match inner.host.as_mut() {
-                    Some(host) => {
-                        host.push_input(ClientId(client), seq, client_tick, &payload);
-                    }
-                    None => {
-                        drop(inner);
-                        let _ = ws.close(Some(CLOSE_RESTARTED), Some("zone asleep; rejoin"));
-                    }
+                if inner.host.is_some() {
+                    inner.receive(
+                        client,
+                        InItem::Input {
+                            seq,
+                            client_tick,
+                            payload,
+                        },
+                    );
+                } else {
+                    drop(inner);
+                    let _ = ws.close(Some(CLOSE_RESTARTED), Some("zone asleep; rejoin"));
                 }
             }
-            (_, ClientMessage::Ping { client_time }) => {
+            (Some(client), ClientMessage::Ping { client_time }) => {
+                self.inner
+                    .borrow_mut()
+                    .receive(client, InItem::Ping(client_time));
+            }
+            (None, ClientMessage::Ping { client_time }) => {
                 let server_time = self
                     .inner
                     .borrow()
@@ -646,6 +807,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 {
                     let mut inner = self.inner.borrow_mut();
                     inner.sockets.remove(&client);
+                    inner.forget(client);
                     if let Some(host) = inner.host.as_mut() {
                         host.disconnect(ClientId(client), true);
                     }
@@ -909,7 +1071,45 @@ impl<Z: CelldZone> ZoneObject<Z> {
         }
         self.store_status().await;
         self.find_node();
+        self.read_dev_settings().await;
         Ok(())
+    }
+
+    /// Dev only (`ZONE_DEV_SETTINGS=1`): read the network simulation from
+    /// the worker's dev settings object.
+    async fn read_dev_settings(&self) {
+        let enabled = {
+            let mut inner = self.inner.borrow_mut();
+            inner.last_dev_read_ms = now_ms();
+            inner.options.as_ref().is_some_and(|o| o.dev_settings)
+        };
+        if !enabled {
+            return;
+        }
+        match self.env.read_cell(ZONE_DEV_KIND, NETSIM_SHARD).await {
+            Ok(value) => {
+                let sim = serde_json::from_value::<NetSimJson>(value)
+                    .unwrap_or_default()
+                    .to_sim();
+                self.inner.borrow_mut().net_sim = sim;
+            }
+            Err(e) => worker::console_warn!("zone dev settings: {e}"),
+        }
+    }
+
+    /// [`read_dev_settings`](Self::read_dev_settings) off the tick, at most
+    /// every [`DEV_SETTINGS_EVERY_MS`].
+    fn refresh_dev_settings(&self) {
+        let due = {
+            let inner = self.inner.borrow();
+            inner.options.as_ref().is_some_and(|o| o.dev_settings)
+                && now_ms() - inner.last_dev_read_ms >= DEV_SETTINGS_EVERY_MS
+        };
+        if due {
+            self.inner.borrow_mut().last_dev_read_ms = now_ms();
+            let this = self.handle();
+            wasm_bindgen_futures::spawn_local(async move { this.read_dev_settings().await });
+        }
     }
 
     async fn hello(&self, ws: &WebSocket, hello: crate::protocol::Hello) -> Result<()> {
@@ -1040,6 +1240,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let mut inner = self.inner.borrow_mut();
         if let Some(a) = attached.filter(|a| a.activation == inner.activation) {
             inner.sockets.remove(&a.client);
+            inner.forget(a.client);
             if let Some(host) = inner.host.as_mut() {
                 host.disconnect(ClientId(a.client), false);
             }
@@ -1108,6 +1309,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 (stop, persist)
             };
             self.spool().await;
+            self.refresh_dev_settings();
             if persist {
                 self.persist().await;
                 if !stop {
@@ -1298,8 +1500,38 @@ impl<Z: CelldZone> ZoneObject<Z> {
             "iterations": stats.iterations,
             "droppedTicks": stats.dropped,
             "lateMs": { "p50": stats.late.percentile(0.5), "p99": stats.late.percentile(0.99) },
+            "netsim": NetSim::to_json(inner.net_sim),
             "workMs": { "p50": stats.work.percentile(0.5), "p99": stats.work.percentile(0.99) },
         })
+    }
+}
+
+/// Deliver what the delay lines hold as it falls due, then stop (a newer
+/// task with an earlier deadline takes over).
+async fn drain_task<Z: CelldZone>(inner: Weak<RefCell<Inner<Z>>>, mut target: f64) {
+    loop {
+        Delay::from(Duration::from_micros(
+            ((target - now_ms()).max(0.0) * 1000.0) as u64,
+        ))
+        .await;
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let mut inner = inner.borrow_mut();
+        inner.drain_due(now_ms());
+        if inner.drain_at != Some(target) {
+            return;
+        }
+        match inner.next_due() {
+            Some(next) => {
+                inner.drain_at = Some(next);
+                target = next;
+            }
+            None => {
+                inner.drain_at = None;
+                return;
+            }
+        }
     }
 }
 

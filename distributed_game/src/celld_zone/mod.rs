@@ -55,6 +55,13 @@
 //! loses at most the snapshot interval of zone state (facts are kept by
 //! the outbox) and takes the node lease TTL (~10 s) to recover.
 //!
+//! Dev only: with `ZONE_DEV_SETTINGS=1` every zone object applies the
+//! network simulation ([`NetSim`](crate::netsim::NetSim): latency, jitter,
+//! loss per socket and direction) stored in the worker's
+//! [`ZoneDevSettings`] object (`zone-dev/netsim`), read on wake and every
+//! second while it ticks; a dev route writes it (one setting for every
+//! zone, like the native server's `set_net_sim`).
+//!
 //! Debug only: celld does not tell application code which node runs an
 //! object. With `CELLD_ZONE_NODES` set (operator listeners) the object asks
 //! each node whether it holds it; `CELLD_ZONE_NODE` names a fixed node.
@@ -68,13 +75,14 @@ mod cells;
 mod object;
 
 pub use plan::{
-    cell_binding, ObjectOptions, RoomState, StoredFact, TickSchedule, CLOSE_RESTARTED, ZONE_HEADER,
+    cell_binding, ObjectOptions, RoomState, StoredFact, TickSchedule, CLOSE_RESTARTED,
+    DEV_SETTINGS_VAR, NETSIM_SHARD, ZONE_DEV_KIND, ZONE_HEADER,
 };
 
 #[cfg(target_arch = "wasm32")]
 pub use cells::{
     authenticate, cell_alarm, error_response, fact_sessions, json_status, serve_cell, Sessions,
-    ZoneActivityCell,
+    ZoneActivityCell, ZoneDevSettings,
 };
 #[cfg(target_arch = "wasm32")]
 pub use object::{

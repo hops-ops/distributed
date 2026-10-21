@@ -187,3 +187,48 @@ async fn read_activity(cell: &AggregateCell<ZoneActivity>) -> std::result::Resul
     let activity = cell.load().await.map_err(|error| error.to_string())?;
     Ok(json!({ "activity": activity.map(|a| a.row()) }))
 }
+
+/// Dev-only settings shared by every zone object of a worker (kind
+/// [`ZONE_DEV_KIND`](super::ZONE_DEV_KIND), binding `ZONE_DEV`), e.g. the
+/// network simulation under shard [`NETSIM_SHARD`](super::NETSIM_SHARD).
+/// `GET /zone-dev/{shard}` returns the stored JSON (`{}` when unset), `PUT`
+/// (or `POST`) replaces it. Every request needs the internal secret. Zone
+/// objects read it only when `ZONE_DEV_SETTINGS=1`.
+pub struct ZoneDevSettings {
+    state: State,
+    env: Env,
+}
+
+impl ZoneDevSettings {
+    /// The settings object of `state`.
+    pub fn new(state: State, env: Env) -> Self {
+        Self { state, env }
+    }
+
+    /// Durable Object `fetch`.
+    pub async fn fetch(&self, mut req: Request) -> Result<Response> {
+        if let Err(error) = authenticate(&req, &self.env) {
+            return error_response(error);
+        }
+        const KEY: &str = "settings";
+        match req.method() {
+            Method::Get => {
+                let stored: Option<Value> = self.state.storage().get(KEY).await.ok().flatten();
+                json_status(stored.unwrap_or_else(|| json!({})), 200)
+            }
+            Method::Put | Method::Post => {
+                let body: Value = match req.json().await {
+                    Ok(body @ Value::Object(_)) => body,
+                    _ => {
+                        return error_response(CellDispatchError::BadRequest(
+                            "a JSON object is required".into(),
+                        ))
+                    }
+                };
+                self.state.storage().put(KEY, &body).await?;
+                json_status(body, 200)
+            }
+            _ => json_status(json!({ "error": "not found" }), 404),
+        }
+    }
+}
