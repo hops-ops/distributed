@@ -1097,7 +1097,10 @@ impl<Z: CelldZone> ZoneObject<Z> {
         }
         self.store_status().await;
         self.find_node();
-        self.read_dev_settings().await;
+        // Off the join path: a wake (often a doorway into a sleeping zone,
+        // with the player's inputs waiting) does not wait for dev settings.
+        let this = self.handle();
+        wasm_bindgen_futures::spawn_local(async move { this.read_dev_settings().await });
         self.refresh();
         Ok(())
     }
