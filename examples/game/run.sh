@@ -123,7 +123,7 @@ ensure_celld() {
 # sources changed.
 ensure_cells() {
 	local marker="$CELLS/build/worker/shim.mjs"
-	if [[ ! -f "$marker" ]] || [[ -n "$(find "$CELLS/src" "$CELLS/Cargo.toml" "$SERVER/crawler" "$REPO/src" "$REPO/distributed_game/src" -newer "$marker" -name '*.rs' -print -quit 2>/dev/null)" ]] ||
+	if [[ ! -f "$marker" ]] || [[ -n "$(find "$CELLS/src" "$CELLS/Cargo.toml" "$SERVER/crawler" "$SERVER/rooms" "$SERVER/sim" "$REPO/src" "$REPO/distributed_game/src" -newer "$marker" -name '*.rs' -print -quit 2>/dev/null)" ]] ||
 		[[ "$CELLS/Cargo.toml" -nt "$marker" ]]; then
 		command -v worker-build >/dev/null || {
 			echo "worker-build not found: cargo install worker-build --locked" >&2
@@ -245,10 +245,12 @@ ensure_wasm() {
 	return "$status"
 }
 
-# mobpit_secret <dir>: the rooms' ticket secret, persisted in <dir> (the
-# services read the same file: guests keep their identity across restarts).
-mobpit_secret() {
-	local file="$1/dev-ticket-secret"
+# dev_secret <dir> [name]: a dev secret persisted in <dir>/<name> (default
+# dev-ticket-secret: the ticket secret; Mob Pit's services read the same
+# file). Persisted so a returning browser is the same player after a
+# restart: its guest token (or session cookie) still verifies.
+dev_secret() {
+	local file="$1/${2:-dev-ticket-secret}"
 	mkdir -p "$1"
 	if [[ ! -s "$file" ]]; then
 		(umask 077 && od -An -N32 -tx1 /dev/urandom | tr -d ' \n' >"$file")
@@ -378,7 +380,7 @@ run_mobpit() {
 	ensure_server
 	ensure_wasm
 	local secret
-	secret="$(mobpit_secret "$MOBPIT_DATA_DIR")"
+	secret="$(dev_secret "$MOBPIT_DATA_DIR")"
 	CELLD_PID=""
 	FLEET_PROJECT=""
 	if [[ "$fleet" == --fleet ]]; then
@@ -419,9 +421,11 @@ run_demo() {
 		[[ "$demo" == mobpit || "$demo" == leaderboard ]] && project="$MOBPIT_DATA_DIR/celld"
 		start_celld "$project" "${CELLD_PORT:-$((port + 3))}" "$port"
 	fi
-	local log_file
+	local log_file secret
 	log_file="$(mktemp -t game-demos.XXXXXX)"
-	"$BIN" "$demo" --dev --port "$port" >"$log_file" 2>&1 &
+	secret="${DISTRIBUTED_GAME_SECRET:-$(dev_secret "$HERE/.data/$demo")}"
+	[[ "$demo" == mobpit || "$demo" == leaderboard ]] && secret="$(dev_secret "$MOBPIT_DATA_DIR")"
+	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port" >"$log_file" 2>&1 &
 	local server_pid=$!
 	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; [[ -z "$CELLD_PID" ]] || kill_tree "$CELLD_PID"; rm -f "$log_file"' EXIT INT TERM
 	for _ in $(seq 1 100); do
@@ -470,7 +474,7 @@ run_cluster() {
 	local dir secret
 	dir="$(mktemp -d "${TMPDIR:-/tmp}/game-demos-$demo.XXXXXX")"
 	# Both hosts must share the ticket secret (and derive the admin secret).
-	secret="${DISTRIBUTED_GAME_SECRET:-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')}"
+	secret="${DISTRIBUTED_GAME_SECRET:-$(dev_secret "$HERE/.data/$demo")}"
 	# The relay lands on host A; both hosts share the projection bus and keep
 	# their zone status read models in .data/<demo>.
 	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_a" --host-id A \
@@ -539,7 +543,7 @@ run_sveltekit() {
 	ensure_cli
 	mkdir -p "$data"
 	local secret
-	secret="$(mobpit_secret "$data")"
+	secret="$(dev_secret "$data")"
 	CELLD_PID=""
 	FLEET_PROJECT=""
 	if [[ "$fleet" == --fleet ]]; then
@@ -569,7 +573,7 @@ run_sveltekit() {
 		MOBPIT_PROTOCOL_KEY="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" \
 		MOBPIT_UI_ORIGINS="http://localhost:$ui_port,http://127.0.0.1:$ui_port" \
 		MOBPIT_GRAPHQL_URL="http://127.0.0.1:$service_port/graphql" \
-		GAME_DEV_AUTH=1 AUTH_SECRET="${AUTH_SECRET:-$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')}" \
+		GAME_DEV_AUTH=1 AUTH_SECRET="${AUTH_SECRET:-$(dev_secret "$data" auth-secret)}" \
 		GAME_TICKET_SECRET="$secret" GAME_ZONES_URL="$(echo "$ROOMS_URLS" | sed 's#http://#ws://#g')" \
 		"$CLI" dev "$SERVER"
 }
