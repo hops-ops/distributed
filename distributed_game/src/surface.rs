@@ -67,6 +67,11 @@ pub struct GameSurface {
     /// (`encode<Record>` / `decode<Record>`), by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codecs: Vec<String>,
+    /// Zone inbox messages ([`Zone::Message`], [`crate::inbox`]) by id:
+    /// what services may send into a running zone. Same payload encoding
+    /// as events.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<EventSurface>,
 }
 
 /// A pure function compiled to WebAssembly ([`crate::pure::GamePure`]).
@@ -242,16 +247,42 @@ impl GameSurface {
             pures: Vec::new(),
             constants: Vec::new(),
             codecs: Vec::new(),
+            messages: Vec::new(),
         }
     }
 
-    /// Kinds from the zone's [`Zone::schema`] and its typed input.
+    /// Kinds from the zone's [`Zone::schema`], its typed input and its
+    /// inbox messages ([`Zone::Message`]).
     pub fn for_zone<Z>(name: impl Into<String>) -> Self
     where
         Z: Zone,
         Z::Input: GameInput,
     {
-        Self::new(name).schema(&Z::schema()).input::<Z::Input>()
+        Self::new(name)
+            .schema(&Z::schema())
+            .input::<Z::Input>()
+            .messages::<Z::Message>()
+    }
+
+    /// Add the zone inbox message type (done by [`for_zone`](Self::for_zone)).
+    /// Message ids and names must be unique among messages.
+    pub fn messages<M: GameEvent>(mut self) -> Self {
+        let mut records = Vec::new();
+        for message in M::event_surfaces(&mut records) {
+            assert!(
+                self.messages
+                    .iter()
+                    .all(|m| m.id != message.id && m.name != message.name),
+                "duplicate message id {} / name {} in game surface {}",
+                message.id,
+                message.name,
+                self.name
+            );
+            self.messages.push(message);
+        }
+        self.messages.sort_by_key(|m| m.id);
+        self.add_records(records);
+        self
     }
 
     /// Add every kind of `schema` (derived or hand-written).

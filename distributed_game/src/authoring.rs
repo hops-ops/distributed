@@ -84,8 +84,8 @@ impl Pushed<'_> {
 
 impl WorldView {
     /// Push entity `id` described by a `Replicated` view.
-    pub fn add<R: Replicated>(&mut self, id: u32, view: &R) -> Pushed<'_> {
-        self.push(view.entity(id));
+    pub fn add<R: Replicated>(&mut self, id: impl Into<crate::EntityId>, view: &R) -> Pushed<'_> {
+        self.push(view.entity(id.into().get()));
         Pushed(self.last_mut().expect("just pushed"))
     }
 }

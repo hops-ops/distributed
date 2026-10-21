@@ -10,6 +10,7 @@ twice.
 |------|-----------|--------|
 | Change state in two cells with rollback | Saga / process manager | `distributed::saga` |
 | Run something at a time in the future, across restarts | `OutboxMessage::deliver_at` | `distributed::outbox` |
+| A cell schedules its own future or recurring work | Re-armable cell alarm | `distributed::cell_host` |
 | One owner per key, with stale writers rejected | Lease with fencing token | `distributed::lease` |
 | Deterministic time in tests | `Clock`, `ManualClock` | `distributed::clock` |
 
@@ -44,6 +45,114 @@ so a timer fires within one poll interval of its deadline. `release` (a
 retry) resets availability to now, so a timer that failed to publish is
 retried promptly instead of being re-delayed. `OutboxMessage.deliver_at` is
 `#[serde(default)]`.
+
+## Schedules: an aggregate schedules its own work
+
+`deliver_at` leaves the aggregate and needs a consumer to send a command
+back. When an aggregate must act on itself later (a matchmaking tick, an
+invite expiry, a daily reset, a lease expiry), a causal command handler
+**schedules** it with its events (`distributed::schedule`):
+
+```rust
+// on the route: what the command needs from its host
+routes.typed_command(start).requires(Capability::Scheduling).requires(Capability::Clock)
+
+// in the handler
+let now = ctx.now()?;                                   // the host clock
+ctx.schedule(Schedule::after("tick", Duration::from_secs(5), "pool.tick", &TickInput { pool })?)?;
+ctx.cancel_schedule("invite-expiry")?;
+
+// in the schedule's own handler: re-schedule from the fired due time (no drift)
+let due = ctx.scheduled_due().expect("fired by a schedule") + period;
+ctx.schedule(Schedule::at("tick", due, "pool.tick", &input)?)?;
+```
+
+- Schedule rows are part of `CommitBatch` (`batch.schedules`) and commit in
+  the **same transaction** as the command's events, ledger receipt and
+  outbox rows, on every backend: a cell's own `cell_alarms` table (migration
+  11), the in-memory repository's per-stream table, SQL's
+  `aggregate_schedules` (migration 12, keyed by the owning stream). A failed
+  command schedules nothing. The batch must commit exactly one aggregate,
+  which owns the schedule. `Schedule::after` resolves against the backend's
+  clock at commit (cell clock, injected `Clock`, database clock).
+- One row per (owner, name). Scheduling a name again replaces it and bumps
+  its `generation`; `cancel_schedule` disarms it.
+- When due, the host dispatches the command **into the owner** through its
+  command ledger, with a command id derived from `(name, generation)` and
+  the trusted session from `schedule_session` (role `schedule`, plus claims
+  only the host sets). Guard schedule-only commands with `schedule_guard`
+  so callers cannot invoke them. A crash after the handler committed but
+  before the schedule settled replays the receipt; the handler never runs
+  twice for one arm.
+- Rejections disarm the schedule (reported as `failed`). Retryable failures
+  back off from 1 s, doubling, up to 5 min (`retried`). At most 32 schedules
+  fire per wake, 16 schedule writes per command and 1,024 armed schedules
+  per aggregate.
+
+**Capabilities.** Backends declare what they provide (`Capabilities`):
+
+| Backend | Stores schedules | Dispatches them (`Scheduling`) | Clock (`Clock`) |
+|---|---|---|---|
+| Aggregate cell (celld; reference host) | `cell_alarms` | yes: the Durable Object alarm; `fire_due_schedules` on the reference host | DO clock / store clock |
+| In-memory repository | per-stream table | with a schedule worker attached (`with_schedule_worker`) | injected `Clock` (`with_clock`) |
+| SQL (Postgres, SQLite) | `aggregate_schedules` | with a schedule worker attached (`with_schedule_worker`) | database clock |
+
+A route declares what it needs with `.requires(..)`; registering it on a
+backend without it panics with the missing capabilities while the service is
+built, never at the first commit. `ctx.now()` answers only on routes that
+declared `Clock` (the dispatcher stamps the host clock into the session and
+removes any caller value); `ctx.schedule` refuses unless the route declared
+`Scheduling`.
+
+**Shared stores: the schedule worker** (`distributed::schedule::worker`,
+`graphql` feature). SQL and in-memory repositories store schedules for
+every aggregate in one table, so a worker process fires them:
+
+```rust
+let (repo, schedules) = PostgresRepository::connect_and_migrate(url)
+    .await?
+    .with_schedule_worker(ScheduleWorkerConfig::default()); // repo now declares Scheduling
+let service = Arc::new(build_service(repo.clone()));
+let host: Arc<dyn CommandHost> = Arc::new(LocalCommandHost::new(Arc::clone(&service)));
+let worker = schedules.spawn(host); // worker.stop().await on shutdown
+```
+
+- Each pass claims up to 32 due, unclaimed rows in one statement
+  (`UPDATE … WHERE … IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING`;
+  SQLite serializes writers instead), marking them `claimed_until_ms`
+  (default 30 s ahead). Concurrent workers in several processes get
+  disjoint rows.
+- Each claimed arm is dispatched through the `CommandHost` with
+  `schedule_session` and a command id derived from the owning stream, the
+  name and the generation (one ledger serves every aggregate here, so the
+  owner is part of the id). A worker that crashes after the command
+  committed leaves the claim to lapse; the next worker re-dispatches the
+  same id and the ledger replays it, so the arm fires once.
+- Settlement touches only the generation that fired, like on celld.
+- The scheduled command finds its aggregate through its input; the handler
+  that called `ctx.schedule` supplies that input.
+
+**Latency.** On celld the Durable Object alarm wakes the cell at the due
+time (a few milliseconds late) without any extra process. The schedule
+worker fires a due row within one poll interval (`poll_interval`, default
+250 ms) plus the dispatch, and only while a worker runs; in the test suite
+with a 20 ms poll the observed delay past due was about 20–45 ms on SQLite.
+Lower the interval for tighter timing at the cost of one claim query per
+interval per worker.
+
+**celld.** A Durable Object has one alarm. The outbox watchdog
+(`CelldOutbox`) and due schedules share it: every `setAlarm` targets the
+earliest of the next schedule and the next drain, so a watchdog rearm never
+postpones a schedule and a far schedule never postpones a drain. The
+Worker's `alarm()` handler calls `AggregateCell::alarm(&env)`, which fires
+due schedules, then drains the outbox and re-plans the wake. Commands that
+schedule move the wake earlier right after they commit.
+
+**Reference host.** The in-process host (unit tests; durable cells run on
+celld) has no timer. Give the store a `ManualClock`
+(`CellStreamStore::with_clock`), advance it and call
+`AggregateCell::fire_due_schedules()`: the same ledger and settlement path
+runs deterministically.
 
 ## Leases with fencing tokens
 
@@ -123,6 +232,56 @@ Guarantees and obligations:
   the saga id and rejects a late action.
 - **`on_step_succeeded` is replayed,** so keep it deterministic.
 
+### Fan-out steps
+
+A step can send commands to N cells chosen at run time, for example one
+ticket reservation per party when a match starts. `action` returns
+`SagaAction::FanOut(commands)` instead of a single command
+(`SagaCommand` converts with `.into()`); `compensation` and
+`on_step_succeeded` receive the member index (`0` for single steps).
+
+```rust
+fn action(step: &str, saga_id: &str, d: &MatchStart) -> Result<SagaAction, SagaError> {
+    match step {
+        "reserve" => Ok(SagaAction::fan_out(
+            d.parties.iter().map(|p| SagaCommand::json(format!("party:{p}"), "ticket.reserve", &saga_id))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        _ => Ok(SagaCommand::json("match", "match.confirm", &saga_id)?.into()),
+    }
+}
+fn compensation(step: &str, member: usize, saga_id: &str, d: &MatchStart)
+    -> Result<Option<SagaCommand>, SagaError> {
+    match step {
+        "reserve" => {
+            SagaCommand::json(format!("party:{}", d.parties[member]), "ticket.release", &saga_id).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+```
+
+- 1 to `MAX_SAGA_FAN_OUT` (64) members; an empty or larger fan-out is a
+  `Definition` error. Membership must be a deterministic function of the data.
+- Every member gets its own command and timeout timer, both carrying
+  `saga-member` metadata. Command ids are
+  `type:saga:step:phase:attempt:member`, so retries dedupe per member.
+- The step **succeeds** when every member replies `succeeded`. It
+  **settles** only after every member has replied or timed out, so the saga
+  knows which members applied. On any rejection or timeout the step fails and
+  only the members that applied, or timed out (outcome unknown), are
+  compensated, one at a time, highest index first. Members that rejected are
+  not compensated.
+- A reply arriving after its member timed out is `Ignored`; the timeout
+  already settled that member and it will be compensated.
+- Events: `saga.member_succeeded`, `saga.member_failed`,
+  `saga.fan_out_settled`. Replaying the stream reproduces the per-member
+  state (`Saga::fan_out`, `Saga::applied_members`).
+
+The tests are in `src/saga/fan_out_tests.rs` (N = 1..16, partial failure,
+per-member timeouts and late replies, per-member compensation retries,
+bounds, and replay from a repository).
+
 ### Worked example
 
 `tests/saga_transfer/main.rs` moves value between wallets in two separate
@@ -147,6 +306,13 @@ A test network delivers outbox rows whose `deliver_at` is due on a
 ```sh
 cargo test --features sqlite,postgres --test saga_transfer --test coordination_lease --test scheduled_outbox
 cargo test --features sqlite --lib -- outbox lease clock
+cargo test --features workers-rs --lib cell_host
+(cd tests/celld/alarm-worker && worker-build --release) && node tests/celld/alarms.mjs
 ```
+
+`tests/celld/alarms.mjs` owns its own `celld dev` process (no Docker; set
+`CELLD_BIN` to choose the binary) and proves the alarm row commits atomically,
+periodic re-arm at the alarm cadence, that the watchdog and domain alarms do
+not starve each other, and exactly-once firing across a celld restart.
 
 The Postgres cases skip when `DATABASE_URL` is unset (see `compose.yaml`).

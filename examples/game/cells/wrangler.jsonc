@@ -1,0 +1,46 @@
+// The game demos' cells for `celld dev` (and `celld deploy`). The launcher
+// (`examples/game/run.sh`, the test harnesses) writes `.dev.vars` beside a
+// copy of this file with DISTRIBUTED_INTERNAL_SECRET and
+// CELLD_QUEUE_RELAY_URL (the zone server's `/internal/celld-queue/relay`).
+{
+  "name": "game-demo-cells",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "CRAWLER", "class_name": "CrawlerCell" },
+      { "name": "PRESENCE", "class_name": "PresenceCell" },
+      { "name": "ZONE_LEASE", "class_name": "ZoneLeaseCell" },
+      { "name": "ZONE_STATE", "class_name": "ZoneStateCell" },
+      { "name": "GEM_POUCH", "class_name": "GemPouchCell" },
+      { "name": "CONTENT_LOG", "class_name": "ContentLogCell" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["CrawlerCell", "PresenceCell"] },
+    { "tag": "v2", "new_sqlite_classes": ["ZoneLeaseCell", "ZoneStateCell"] },
+    { "tag": "v3", "new_sqlite_classes": ["GemPouchCell", "ContentLogCell"] }
+  ],
+  // Hibernation snapshots above the inline limit (celld's object storage).
+  "r2_buckets": [
+    { "binding": "ZONE_SNAPSHOTS", "bucket_name": "zone-snapshots" }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "OUTBOX", "queue": "game-demo-outbox" }
+    ],
+    "consumers": [
+      {
+        "queue": "game-demo-outbox",
+        "max_batch_size": 10,
+        "max_batch_timeout": 1,
+        "max_retries": 100,
+        "dead_letter_queue": "game-demo-outbox-dlq",
+        "retry_delay": 2
+      }
+    ]
+  },
+  "vars": {
+    "OUTBOX_DRAIN_INTERVAL_MS": "5000"
+  }
+}

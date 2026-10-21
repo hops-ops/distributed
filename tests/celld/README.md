@@ -1,4 +1,4 @@
-# celld 0.4 aggregate cells, Queue, and bus relay
+# celld aggregate cells, Queue, and bus relay
 
 This fixture exercises the write side of the Distributed flow:
 
@@ -34,7 +34,18 @@ match cell.drain_outbox(&env).await {
     Err(error) => worker::console_error!("outbox drain deferred: {error}"),
 }
 
-// The Durable Object alarm handler also calls drain_outbox(&env).
+// The Durable Object alarm handler calls cell.alarm(&env): it fires due cell
+// alarms (see docs/coordination-primitives.md) and then drains the outbox.
+```
+
+Domain cell alarms share the one Durable Object alarm with the outbox
+watchdog; every wake is set to the earliest of the two. `alarm-worker/` is a
+Ticker cell that arms, re-arms and cancels alarms, and `alarms.mjs` proves it
+on an isolated `celld dev` (including a crash and restart):
+
+```sh
+(cd tests/celld/alarm-worker && worker-build --release)
+CELLD_BIN=celld node tests/celld/alarms.mjs
 ```
 
 The Queue lives in another cell: its acceptance is **not** part of the
@@ -62,33 +73,16 @@ The whole-state export/restore and `persist_and_drain_outbox` APIs are not
 available on the Worker host. Native in-process conformance fixtures are not a
 production persistence adapter.
 
-### Native durable cells (`cell-sqlite`)
+### No native durable cells
 
-Native hosts get the same store with the `cell-sqlite` Cargo feature: one
-SQLite file per cell, executed through a synchronous rusqlite connection that
-exposes the same `read`/`transaction` surface as `storage.transactionSync`.
-Schema bootstrap, the per-command transaction (events, snapshots, ledger
-receipt, outbox rows) and lease-fenced outbox settlement are the shared
-`sql_store.rs` code, not a copy. Native cells additionally keep the sealed
-read-model row in the same file and, with
-`CellStreamStore::with_sealed_row_reducer`, update it inside the command
-transaction.
-
-```rust,ignore
-let cells = CellSqlitePath::root("var/cells"); // var/cells/Todo%3At1.sqlite3
-let cell = AggregateCell::<Todo>::open_sqlite_with_snapshots(&cells, "t1", 100)?
-    .mount(create());
-let result = cell.dispatch_idempotent(command, &identity, input, session).await?;
-
-// Alarm equivalent: run at startup, after dispatch and periodically, or spawn
-// OutboxDrainRunner::new(cell.outbox_dispatcher(..)) on a tokio runtime.
-let drained = cell.drain_outbox_with(publisher, lease, max_attempts, 100).await?;
-```
-
-Dropping every handle and reopening the file restores the identical cell, and
-an already-applied idempotent command replays its recorded outcome. A file is
-bound to the first cell instance that opens it. Whole-state export/restore
-remains a reference-host (in-memory) API and is rejected for SQLite cells.
+Durable cells run on celld only, for local development (`celld dev`) and
+deployment alike. The native `cell-sqlite` backend (one rusqlite file per
+cell) was removed in v5: a native build has only the in-process reference
+host, for unit tests (`CellStreamStore::for_identity`, whole-state
+export/restore, `ManualClock` alarms). A native process that needs durable
+aggregates talks to celld over the internal path (`CelldCommandHost`,
+`distributed_game::celld::CelldFactSink`); see `examples/game/cells` for a
+zone server's cells.
 
 Existing `cell_state` databases are rejected with an explicit migration-required
 error. They are not silently reset or opened through a legacy adapter. Back up
@@ -160,7 +154,8 @@ correctness.
 
 ## Local celld
 
-Prerequisites: Docker (for NATS), celld 0.4, `worker-build`, and the
+Prerequisites: Docker (for NATS), celld (the version in `/.celld-version`,
+checked by `scripts/celld.sh`; `CELLD_BIN` selects the binary), `worker-build`, and the
 `wasm32-unknown-unknown` Rust target.
 
 ```sh
@@ -169,7 +164,7 @@ make -C tests/celld test
 make -C tests/celld down
 ```
 
-celld 0.4 development mode supplies its own local object store; Azurite, MinIO,
+celld development mode supplies its own local object store; Azurite, MinIO,
 and an external S3 endpoint are not used. The canonical profile stores cell and
 Queue data in `tests/celld/worker/.celld/dev`. `make down` and `make reload`
 preserve that directory.

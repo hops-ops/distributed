@@ -54,13 +54,21 @@ pub mod authoring;
 pub mod bots;
 #[cfg(feature = "cell")]
 pub mod cell;
+#[cfg(feature = "celld")]
+pub mod celld;
+pub mod claims;
 pub mod clock;
 pub mod codec;
+#[cfg(feature = "command-host")]
+pub mod command_sink;
+pub mod entity;
 pub mod facts;
 pub mod handoff;
 pub mod host;
+pub mod inbox;
 pub mod input;
 pub mod interest;
+pub mod lifecycle;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(feature = "net")]
@@ -81,12 +89,14 @@ pub mod world;
 pub mod zone;
 
 pub use authoring::{GameEvent, GameInput, Pushed, Replicated};
+pub use claims::{ExtensionError, ExtensionSchema, TicketExtension, TicketExtensions};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use codec::{Wire, WireType};
 /// Authoring derives (see the crate docs and README).
 pub use distributed_game_macros::{
-    game_pure, predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated,
+    game_pure, predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated, TicketExtension,
 };
+pub use entity::{Entities, Entity, EntityCollection, EntityId, Project};
 #[cfg(feature = "runtime")]
 pub use facts::spawn_fact_worker;
 pub use facts::{
@@ -96,6 +106,7 @@ pub use facts::{
 };
 pub use handoff::{HandoffError, HandoffRequest, Transfer};
 pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};
+pub use inbox::{Delivered, NoMessages, ZoneInbound};
 pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, SequencedInput};
 pub use interest::{InterestConfig, View};
 pub use prediction::{PredictContext, PredictStep};

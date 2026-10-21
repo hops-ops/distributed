@@ -26,6 +26,18 @@
 //!   in-process queue in front of a projector, so a Redis outage never blocks
 //!   gameplay.
 //!
+//! # GraphQL
+//!
+//! With the `graphql` feature, `GraphqlEngineBuilder::leaderboard` exposes a
+//! store through the generated surface (top-N, around-me and my-rank roots,
+//! `@live` subscriptions, the client manifest and `leaderboards.ts`), and
+//! [`LeaderboardProjector::with_change_listener`] +
+//! `GraphqlEngine::leaderboard_change_listener` refresh live queries after an
+//! applied change. Across processes, `LeaderboardChangePublisher` publishes
+//! [`LEADERBOARD_CHANGED_EVENT`] notices on the bus and
+//! `GraphqlEngine::leaderboard_change_handlers` consumes them. See
+//! `docs/live-query-delivery.md`.
+//!
 //! # How it plugs into projections
 //!
 //! A leaderboard is an *eventual* projection: the source of truth stays the
@@ -75,6 +87,7 @@
 //! makes overlapping replay safe.
 
 mod in_memory;
+mod notify;
 mod projector;
 
 #[cfg(feature = "leaderboard-background")]
@@ -87,9 +100,12 @@ use std::fmt;
 use async_trait::async_trait;
 
 pub use in_memory::InMemoryLeaderboard;
+#[cfg(feature = "leaderboard-background")]
+pub use notify::LeaderboardChangePublisher;
+pub use notify::{LeaderboardChanged, LEADERBOARD_CHANGED_EVENT};
 pub use projector::{
-    LeaderboardChange, LeaderboardProjection, LeaderboardProjector, LeaderboardRebuild,
-    ProjectionReport,
+    LeaderboardChange, LeaderboardChangeListener, LeaderboardProjection, LeaderboardProjector,
+    LeaderboardRebuild, ProjectionReport,
 };
 
 #[cfg(feature = "leaderboard-background")]

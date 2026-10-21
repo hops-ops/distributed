@@ -77,6 +77,9 @@ pub mod error {
     pub const NOT_FOUND: u32 = 7;
     /// Reconnect token unknown or grace window elapsed.
     pub const RECONNECT_FAILED: u32 = 8;
+    /// The zone could not be created right now (its factory or allocation
+    /// store failed or timed out); retry later.
+    pub const ZONE_UNAVAILABLE: u32 = 9;
 }
 
 /// Client handshake.

@@ -47,7 +47,7 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
         assert_eq!(
             descriptions,
             vec![
@@ -60,7 +60,10 @@ mod tests {
                 "projection program identity",
                 "external command binding",
                 "projection delivery aliases",
-                "coordination leases"
+                "coordination leases",
+                "cell alarms",
+                "aggregate schedules",
+                "schedule claims"
             ]
         );
         assert_eq!(
@@ -106,6 +109,18 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/sqlite/0010_coordination_leases.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0011_cell_alarms.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0012_aggregate_schedules.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0013_schedule_claims.sql"
+                )),
             ]
         );
     }
@@ -125,7 +140,7 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
         assert_eq!(
             descriptions,
             vec![
@@ -138,7 +153,10 @@ mod tests {
                 "projection program identity",
                 "external command binding",
                 "projection delivery aliases",
-                "coordination leases"
+                "coordination leases",
+                "cell alarms",
+                "aggregate schedules",
+                "schedule claims"
             ]
         );
         assert_eq!(
@@ -183,6 +201,18 @@ mod tests {
                 include_str!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/postgres/0010_coordination_leases.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0011_cell_alarms.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0012_aggregate_schedules.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0013_schedule_claims.sql"
                 )),
             ]
         );
@@ -233,6 +263,8 @@ pub trait SqlxRepoBackend: SqlxReadModelBackend {
     /// Command-ledger projection with timestamp columns normalized for
     /// [`decode_timestamp`](Self::decode_timestamp) and JSON surfaced as text.
     const COMMAND_LEDGER_SELECT: &'static str;
+    /// See [`SqlExecutor::SCHEDULE_CLAIM_LOCK_SUFFIX`](crate::repository::sql::SqlExecutor).
+    const SCHEDULE_CLAIM_LOCK_SUFFIX: &'static str;
     /// Row-lock suffix for a reservation/status transaction.
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str;
     /// Row-lock suffix for a bounded compaction scan.

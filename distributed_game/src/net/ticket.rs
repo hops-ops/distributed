@@ -9,9 +9,15 @@
 //!
 //! **Transfer tickets** (zone handoff) are the same format with
 //! `"kind":"transfer"` plus `src` (source zone), `iss` (issuing host id),
-//! `gen` (source ownership token) and `carry` (base64url carried state).
+//! `gen` (source ownership token), `left` (source departure stamp time,
+//! Unix ms) and `carry` (base64url carried state).
 //! [`TicketKey::verify`] rejects them ([`TicketError::WrongKind`]); use
 //! [`TicketKey::verify_ticket`] to accept either kind.
+//!
+//! **Extension claims.** An optional `ext` object carries game-declared
+//! claims ([`TicketExtensions`]: match id, team…). Join and transfer
+//! tickets sign them alike; the server admits them only when they match
+//! `ServerConfig::ticket_extensions` (see [`crate::claims`]).
 //!
 //! **Custom admission tickets.** Join tickets go through a
 //! [`TicketVerifier`] (`ServerConfig::ticket_verifier`); the default is the
@@ -32,6 +38,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
 
+use crate::claims::TicketExtensions;
 use crate::handoff::Transfer;
 use crate::protocol::Role;
 use crate::zone::TicketClaims;
@@ -185,6 +192,7 @@ impl TicketKey {
             "src": transfer.source_zone,
             "iss": transfer.issuer,
             "gen": transfer.generation,
+            "left": transfer.departed_at_ms,
             "carry": URL_SAFE_NO_PAD.encode(&transfer.carried),
         });
         self.sign_body(&with_name(body, claims))
@@ -238,6 +246,10 @@ impl TicketKey {
                         .get("gen")
                         .and_then(Value::as_u64)
                         .ok_or(TicketError::MissingClaim("gen"))?,
+                    departed_at_ms: body
+                        .get("left")
+                        .and_then(Value::as_u64)
+                        .ok_or(TicketError::MissingClaim("left"))?,
                     carried,
                     claims,
                 }))
@@ -317,6 +329,11 @@ impl TicketKey {
                     .and_then(Value::as_str)
                     .filter(|v| !v.is_empty())
                     .map(str::to_string),
+                extensions: match claims.get("ext") {
+                    None => TicketExtensions::new(),
+                    Some(ext) => TicketExtensions::from_json(ext.clone())
+                        .map_err(|e| TicketError::Invalid(e.to_string()))?,
+                },
             },
             claims,
         ))
@@ -324,8 +341,13 @@ impl TicketKey {
 }
 
 fn with_name(mut body: Value, claims: &TicketClaims) -> Value {
-    if let (Some(name), Some(object)) = (&claims.name, body.as_object_mut()) {
-        object.insert("name".into(), Value::String(name.clone()));
+    if let Some(object) = body.as_object_mut() {
+        if let Some(name) = &claims.name {
+            object.insert("name".into(), Value::String(name.clone()));
+        }
+        if !claims.extensions.is_empty() {
+            object.insert("ext".into(), claims.extensions.to_json());
+        }
     }
     body
 }
@@ -376,6 +398,7 @@ mod tests {
             nonce: "n1".into(),
             role: Role::Player,
             name: None,
+            extensions: Default::default(),
         }
     }
 
@@ -411,6 +434,7 @@ mod tests {
             issuer: "h1".into(),
             generation: 9,
             carried: vec![1, 2, 3],
+            departed_at_ms: 1_700_000_000_123,
         };
         let ticket = key.sign_transfer(&transfer);
         assert_eq!(

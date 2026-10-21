@@ -1,8 +1,10 @@
-# The leaderboard: a query over the player_stats read model (top 5 by XP).
-query Leaderboard($limit: Int! = 5) @load @live {
-  player_stats(order_by: [{ xp: desc }, { player_id: asc }], limit: $limit) {
+# The leaderboard component's read-model island: display names. The ranking
+# itself is the Redis XP board through the GraphQL board roots
+# (`xpLeaderboard`, see Leaderboard.svelte); names live in the player_stats
+# read model, keyed by the same principal.
+query Leaderboard($limit: Int! = 100) @load @live {
+  player_stats(order_by: [{ player_id: asc }], limit: $limit) {
     player_id
     name
-    xp
   }
 }

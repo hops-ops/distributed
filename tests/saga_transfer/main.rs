@@ -26,8 +26,8 @@ use distributed::saga::SagaCursor;
 use distributed::{
     sourced, AggregateBuilder, AggregateRepository, ClaimOutboxMessages, Entity,
     InMemoryOutboxStore, InMemoryRepository, ManualClock, OutboxClaimRef, OutboxMessage,
-    OutboxStore, Saga, SagaCommand, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaReply,
-    SagaRunner, SagaStatus, SagaStep,
+    OutboxStore, Saga, SagaAction, SagaCommand, SagaDefinition, SagaError, SagaMessage,
+    SagaOutcome, SagaReply, SagaRunner, SagaStatus, SagaStep,
 };
 
 // ===========================================================================
@@ -127,7 +127,7 @@ impl SagaDefinition for Transfer {
         STEPS
     }
 
-    fn action(step: &str, saga_id: &str, data: &TransferData) -> Result<SagaCommand, SagaError> {
+    fn action(step: &str, saga_id: &str, data: &TransferData) -> Result<SagaAction, SagaError> {
         let (cell, kind, wallet) = match step {
             "debit" => (SOURCE_CELL, "wallet.debit", &data.from),
             "credit" => (TARGET_CELL, "wallet.credit", &data.to),
@@ -142,10 +142,12 @@ impl SagaDefinition for Transfer {
                 amount: data.amount,
             },
         )
+        .map(Into::into)
     }
 
     fn compensation(
         step: &str,
+        _member: usize,
         saga_id: &str,
         data: &TransferData,
     ) -> Result<Option<SagaCommand>, SagaError> {
@@ -166,7 +168,7 @@ impl SagaDefinition for Transfer {
         .map(Some)
     }
 
-    fn on_step_succeeded(step: &str, data: &mut TransferData, output: &[u8]) {
+    fn on_step_succeeded(step: &str, _member: usize, data: &mut TransferData, output: &[u8]) {
         if step == "credit" {
             data.credit_receipt = Some(String::from_utf8_lossy(output).into_owned());
         }

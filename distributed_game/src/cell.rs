@@ -17,16 +17,25 @@
 //! `InProgress` and `Internal` errors are retryable; everything else is
 //! permanent.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 use distributed::cell_host::{AggregateCell, CellCommandIdentity, CellDispatchError};
 use distributed::microsvc::Session;
-use distributed::{Aggregate, USER_ID_KEY};
+#[cfg(not(target_arch = "wasm32"))]
+use distributed::Aggregate;
+use distributed::USER_ID_KEY;
 use sha2::{Digest, Sha256};
 
-use crate::facts::{BoxFuture, Fact, FactError, FactReceipt, FactSink};
+use crate::facts::Fact;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::facts::{BoxFuture, FactError, FactReceipt, FactSink};
 
-/// Fact sink backed by an aggregate cell.
+/// Fact sink backed by an aggregate cell hosted in the zone server's own
+/// process (native only: on wasm32 a cell is a Durable Object, reached over
+/// the network with [`crate::celld::CelldFactSink`]).
+#[cfg(not(target_arch = "wasm32"))]
 pub struct CellFactSink<A>
 where
     A: Aggregate + Send + Sync + 'static,
@@ -36,6 +45,7 @@ where
     system_principal: String,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<A> CellFactSink<A>
 where
     A: Aggregate + Send + Sync + 'static,
@@ -87,6 +97,35 @@ pub fn trusted_session(principal: &str, fact: &Fact) -> Session {
     session
 }
 
+/// The trusted session of a fact received by a celld cell over the internal
+/// path ([`crate::celld::CelldFactSink`]): `x-user-id` plus the `x-game-*`
+/// stamp headers. `header` reads one request header. Call it only after the
+/// request authenticated with `DISTRIBUTED_INTERNAL_SECRET`; returns `None`
+/// when the principal or a stamp field is missing (not a fact request).
+pub fn fact_session_from_headers(header: impl Fn(&str) -> Option<String>) -> Option<Session> {
+    let principal = header(USER_ID_KEY).filter(|value| !value.is_empty())?;
+    let mut vars = std::collections::HashMap::new();
+    for (name, _) in crate::FactStamp::default().session_vars() {
+        vars.insert(name.clone(), header(&name)?);
+    }
+    let stamp = crate::FactStamp::from_session_vars(&vars)?;
+    let mut session = Session::new();
+    session.set(USER_ID_KEY, principal);
+    for (key, value) in stamp.session_vars() {
+        session.set(key, value);
+    }
+    Some(session)
+}
+
+/// The [`FactStamp`](crate::FactStamp) a [`trusted_session`] carries
+/// (None for a session that did not come from a fact). Handlers use it to
+/// order facts ([`FactStamp::emission_order`](crate::FactStamp::emission_order))
+/// and to [`stamp_metadata`](crate::stamp_metadata) their events.
+pub fn session_stamp(session: &Session) -> Option<crate::FactStamp> {
+    crate::FactStamp::from_session_vars(session.variables())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn classify(error: CellDispatchError) -> FactError {
     match error {
         CellDispatchError::InProgress | CellDispatchError::Internal(_) => {
@@ -96,6 +135,7 @@ fn classify(error: CellDispatchError) -> FactError {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<A> FactSink for CellFactSink<A>
 where
     A: Aggregate + Send + Sync + 'static,

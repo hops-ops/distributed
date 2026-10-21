@@ -7,13 +7,14 @@ mod arena;
 use std::time::Duration;
 
 use arena::{Arena, ArenaConfig, AVATAR};
-use distributed_game::net::{GameServer, NetSim, ServerConfig, TicketKey};
+use distributed_game::net::{GameServer, NetSim, ServerConfig, TicketKey, ZoneFactory};
 use distributed_game::protocol::{error, kick, Hello};
 use distributed_game::{
     ClientMessage, ClientMirror, FieldValue, MemoryFactSink, RetryPolicy, Role, ServerMessage,
-    TicketClaims, PROTOCOL_VERSION,
+    TicketClaims, TicketExtension, TicketExtensions, PROTOCOL_VERSION,
 };
 use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
@@ -30,6 +31,7 @@ fn ticket(principal: &str, zone: &str, nonce: &str, role: Role) -> String {
         nonce: nonce.into(),
         role,
         name: None,
+        extensions: Default::default(),
     })
 }
 
@@ -47,9 +49,10 @@ async fn start_keyed(
     config.host.tick_rate = 30;
     config.host.patch_rate = 20;
     config.net_sim = net_sim;
-    let server = GameServer::<Arena>::new(config, |zone_id| {
-        zone_id.starts_with('z').then(ArenaConfig::default)
-    })
+    let server = GameServer::<Arena>::new(
+        config,
+        ZoneFactory::sync(|a| a.zone_id.starts_with('z').then(ArenaConfig::default)),
+    )
     .with_fact_sink(MemoryFactSink::new(), 64, RetryPolicy::default());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -228,6 +231,7 @@ async fn client_joins_sends_inputs_receives_deltas_and_reconnects() {
         nonce: "n4".into(),
         role: Role::Player,
         name: None,
+        extensions: Default::default(),
     });
     expect_error(&url, "z1", forged, error::UNAUTHORIZED).await;
 
@@ -290,6 +294,21 @@ async fn admits_tickets_minted_by_the_sveltekit_handler() {
     assert_eq!(claims.nonce, text("/valid/nonce"));
     assert_eq!(claims.role, Role::Player);
     assert_eq!(claims.name.as_deref(), Some("Ana"));
+    assert!(claims.extensions.is_empty());
+
+    // Extension claims from the handler's server-side `claims()` callback.
+    let extended = TicketKey::new(secret.as_str())
+        .verify(&text("/extended/ticket"), 1_700_000_000)
+        .unwrap();
+    assert_eq!(extended.principal, text("/extended/principal"));
+    assert_eq!(
+        extended.extensions.typed::<MatchClaims>().unwrap(),
+        MatchClaims {
+            match_id: "m-7".into(),
+            side: 2,
+            party: None,
+        }
+    );
 
     let (url, server, handle) = start_keyed(&secret, None).await;
 
@@ -401,9 +420,10 @@ async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
 async fn serve_with_merges_extra_routes_and_shuts_down_gracefully() {
     let mut config = ServerConfig::new(TicketKey::new(SECRET));
     config.host.tick_rate = 30;
-    let server = GameServer::<Arena>::new(config, |zone_id| {
-        zone_id.starts_with('z').then(ArenaConfig::default)
-    });
+    let server = GameServer::<Arena>::new(
+        config,
+        ZoneFactory::sync(|a| a.zone_id.starts_with('z').then(ArenaConfig::default)),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let extra = axum::Router::new().route("/hello", axum::routing::get(|| async { "hi" }));
@@ -530,9 +550,10 @@ fn bff_ticket(jti: &str, exp_in: u64, zone_route: Option<&str>) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn custom_verifier_admits_web_bff_tickets_with_replay_protection() {
     let config = ServerConfig::new(TicketKey::new(SECRET)).with_ticket_verifier(bff_verifier);
-    let server = GameServer::<Arena>::new(config, |zone_id| {
-        zone_id.starts_with('z').then(ArenaConfig::default)
-    });
+    let server = GameServer::<Arena>::new(
+        config,
+        ZoneFactory::sync(|a| a.zone_id.starts_with('z').then(ArenaConfig::default)),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());
     let serving = server.clone();
@@ -613,9 +634,10 @@ async fn host_config_hook_sets_per_zone_rates() {
     let mut config = ServerConfig::new(TicketKey::new(SECRET));
     config.host.tick_rate = 30;
     config.host.content_version = "c1".into();
-    let server = GameServer::<Arena>::new(config, |zone_id| {
-        zone_id.starts_with('z').then(ArenaConfig::default)
-    })
+    let server = GameServer::<Arena>::new(
+        config,
+        ZoneFactory::sync(|a| a.zone_id.starts_with('z').then(ArenaConfig::default)),
+    )
     .with_host_config(|zone_id, host| {
         if zone_id == "z-slow" {
             host.tick_rate = 5;
@@ -623,8 +645,8 @@ async fn host_config_hook_sets_per_zone_rates() {
             host.content_version = "ignored".into();
         }
     });
-    assert!(server.activate("z-slow"));
-    assert!(server.activate("z-hot"));
+    assert!(server.activate("z-slow").await);
+    assert!(server.activate("z-hot").await);
     let slow = server
         .inspect("z-slow", |h| {
             (
@@ -638,4 +660,286 @@ async fn host_config_hook_sets_per_zone_rates() {
     let hot = server.inspect("z-hot", |h| h.config().tick_rate).await;
     assert_eq!(hot, Some(30));
     server.shutdown();
+}
+
+/// A game's declared extension claims.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TicketExtension)]
+struct MatchClaims {
+    match_id: String,
+    #[serde(rename = "team")]
+    side: u8,
+    #[serde(default)]
+    party: Option<String>,
+}
+
+fn extended_ticket(nonce: &str, ext: serde_json::Value) -> String {
+    TicketKey::new(SECRET).sign(&TicketClaims {
+        principal: "ana".into(),
+        zone: "z-match".into(),
+        expires_at: 4_000_000_000,
+        nonce: nonce.into(),
+        role: Role::Player,
+        name: None,
+        extensions: TicketExtensions::from_json(ext).unwrap(),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extension_claims_reach_on_auth_and_player_info() {
+    assert_eq!(MatchClaims::CLAIMS, ["match_id", "team", "party"]);
+    let config = ServerConfig::new(TicketKey::new(SECRET)).with_ticket_extensions::<MatchClaims>();
+    let server =
+        GameServer::<Arena>::new(config, ZoneFactory::sync(|_| Some(ArenaConfig::default())));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let serving = server.clone();
+    let handle = tokio::spawn(async move {
+        serving
+            .serve(listener, std::future::pending())
+            .await
+            .unwrap();
+    });
+
+    // Undeclared names and mistyped values are refused at admission.
+    for (nonce, ext) in [
+        (
+            "x-unknown",
+            serde_json::json!({"match_id": "m-7", "team": 2, "gold": 50}),
+        ),
+        (
+            "x-typed",
+            serde_json::json!({"match_id": "m-7", "team": "red"}),
+        ),
+        ("x-object", serde_json::json!(["m-7"])),
+    ] {
+        let ticket = if nonce == "x-object" {
+            TicketKey::new(SECRET).sign_json(&serde_json::json!({
+                "sub": "ana", "zone": "z-match", "exp": 4_000_000_000u64,
+                "nonce": nonce, "ext": ext,
+            }))
+        } else {
+            extended_ticket(nonce, ext)
+        };
+        expect_error(&url, "z-match", ticket, error::UNAUTHORIZED).await;
+    }
+
+    let expected = MatchClaims {
+        match_id: "m-7".into(),
+        side: 2,
+        party: None,
+    };
+    let mut ws = connect(&url, "z-match").await;
+    hello(
+        &mut ws,
+        extended_ticket("ok", serde_json::json!({"match_id": "m-7", "team": 2})),
+        String::new(),
+    )
+    .await;
+    let Some(ServerMessage::Welcome(_)) = next(&mut ws, &mut ClientMirror::new()).await else {
+        panic!("expected Welcome")
+    };
+    let (auth, players) = server
+        .inspect("z-match", |host| {
+            (
+                host.zone().auth_extensions.clone(),
+                host.players().cloned().collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .expect("zone active");
+    assert_eq!(
+        auth.last().unwrap().typed::<MatchClaims>().unwrap(),
+        expected
+    );
+    assert_eq!(
+        players[0].extensions.typed::<MatchClaims>().unwrap(),
+        expected
+    );
+
+    server.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("server stops")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extension_claims_are_refused_without_a_declared_schema() {
+    let (url, server, handle) = start(None).await;
+    let ticket = TicketKey::new(SECRET).sign(&TicketClaims {
+        principal: "ana".into(),
+        zone: "z1".into(),
+        expires_at: 4_000_000_000,
+        nonce: "undeclared".into(),
+        role: Role::Player,
+        name: None,
+        extensions: TicketExtensions::from_json(serde_json::json!({"match_id": "m"})).unwrap(),
+    });
+    expect_error(&url, "z1", ticket, error::UNAUTHORIZED).await;
+    server.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("server stops")
+        .unwrap();
+}
+
+async fn serve_arena(server: &GameServer<Arena>) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let serving = server.clone();
+    let handle = tokio::spawn(async move {
+        serving
+            .serve(listener, std::future::pending())
+            .await
+            .unwrap();
+    });
+    (url, handle)
+}
+
+async fn stop(server: GameServer<Arena>, handle: tokio::task::JoinHandle<()>) {
+    server.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("server stops")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_factory_reads_the_allocation_before_admitting_queued_joins() {
+    use distributed_game::world::{MemoryZoneAllocationStore, ZoneAllocation, ZoneAllocationStore};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let store = Arc::new(MemoryZoneAllocationStore::new());
+    let roster = serde_json::json!({ "mode": "duel", "roster": ["ana", "bo"] });
+    store
+        .put(
+            "z-match",
+            ZoneAllocation::new("game-services.match", 1, &roster).unwrap(),
+        )
+        .await
+        .unwrap();
+    let created = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicU32::new(0));
+    let (done, calls_in) = (created.clone(), calls.clone());
+    let server = GameServer::<Arena>::new(
+        ServerConfig::new(TicketKey::new(SECRET)),
+        ZoneFactory::new(move |activation| {
+            let (done, calls) = (done.clone(), calls_in.clone());
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                assert!(activation.activation > 0, "the fencing token");
+                // Storage is slow: both joins arrive while this awaits.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                done.store(true, Ordering::SeqCst);
+                Ok(Some(ArenaConfig {
+                    allocation: activation.allocation.map(|a| a.payload),
+                    ..ArenaConfig::default()
+                }))
+            }
+        }),
+    )
+    .with_allocation_store(store);
+    let (url, handle) = serve_arena(&server).await;
+
+    let join = |principal: &'static str, nonce: &'static str| {
+        let url = url.clone();
+        let created = created.clone();
+        async move {
+            let mut ws = connect(&url, "z-match").await;
+            hello(
+                &mut ws,
+                ticket(principal, "z-match", nonce, Role::Player),
+                String::new(),
+            )
+            .await;
+            let msg = next(&mut ws, &mut ClientMirror::new()).await;
+            assert!(
+                created.load(Ordering::SeqCst),
+                "admitted only after the factory finished"
+            );
+            matches!(msg, Some(ServerMessage::Welcome(_)))
+        }
+    };
+    let (ana, bo) = tokio::join!(join("ana", "q1"), join("bo", "q2"));
+    assert!(ana && bo, "both queued joins admitted");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one activation");
+    let allocation = server
+        .inspect("z-match", |host| host.zone().cfg.allocation.clone())
+        .await
+        .unwrap();
+    assert_eq!(allocation, Some(roster), "the allocation reached on_create");
+    stop(server, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn factory_failures_answer_joins_with_typed_errors() {
+    use distributed_game::world::{
+        AllocationError, BoxFuture, ZoneAllocation, ZoneAllocationStore, ZoneCreateError,
+    };
+    use std::sync::Arc;
+
+    struct DownStore;
+    impl ZoneAllocationStore for DownStore {
+        fn load<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> BoxFuture<'a, Result<Option<ZoneAllocation>, AllocationError>> {
+            Box::pin(async { Err(AllocationError("connection refused".into())) })
+        }
+        fn put<'a>(
+            &'a self,
+            _: &'a str,
+            _: ZoneAllocation,
+        ) -> BoxFuture<'a, Result<(), AllocationError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn remove<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), AllocationError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    config.activation_timeout = Duration::from_millis(300);
+    let server = GameServer::<Arena>::new(
+        config,
+        ZoneFactory::new(|activation| async move {
+            match activation.zone_id.as_str() {
+                "z-broken" => Err(ZoneCreateError::new("roster store unavailable")),
+                "z-hang" => std::future::pending().await,
+                "z-ok" => Ok(Some(ArenaConfig::default())),
+                _ => Ok(None),
+            }
+        }),
+    );
+    let (url, handle) = serve_arena(&server).await;
+    let started = std::time::Instant::now();
+    for (zone, code, nonce) in [
+        ("z-broken", error::ZONE_UNAVAILABLE, "f1"),
+        ("z-hang", error::ZONE_UNAVAILABLE, "f2"),
+        ("z-unknown", error::NOT_FOUND, "f3"),
+    ] {
+        expect_error(&url, zone, ticket("ana", zone, nonce, Role::Player), code).await;
+        assert!(!server.is_active(zone), "{zone} unregistered");
+    }
+    assert!(started.elapsed() < Duration::from_secs(3), "no hang");
+    assert!(!server.activate("z-broken").await);
+    assert!(server.activate("z-ok").await);
+    stop(server, handle).await;
+
+    // An allocation store failure refuses too, without calling the factory.
+    let server = GameServer::<Arena>::new(
+        ServerConfig::new(TicketKey::new(SECRET)),
+        ZoneFactory::new(|_| async { panic!("factory must not run without its allocation") }),
+    )
+    .with_allocation_store(Arc::new(DownStore));
+    let (url, handle) = serve_arena(&server).await;
+    expect_error(
+        &url,
+        "z-match",
+        ticket("ana", "z-match", "f4", Role::Player),
+        error::ZONE_UNAVAILABLE,
+    )
+    .await;
+    stop(server, handle).await;
 }

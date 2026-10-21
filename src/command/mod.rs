@@ -13,7 +13,8 @@ mod types;
 
 pub(crate) use types::scalar_type_name;
 pub use types::{
-    CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField, CommandUnsignedInteger,
+    __input_has_field, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
+    CommandUnsignedInteger,
 };
 
 mod direct_projection;

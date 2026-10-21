@@ -130,6 +130,22 @@ const PING_LAYOUT: PayloadLayout = [
 	['seq', { type: 'u32' }],
 ];
 
+/** Message `announce` (id 1). */
+export interface AnnounceMessage {
+	readonly text: string;
+	readonly urgent: boolean;
+}
+
+const MESSAGE_ANNOUNCE_LAYOUT: PayloadLayout = [
+	['text', { type: 'str' }],
+	['urgent', { type: 'bool' }],
+];
+
+/** Message `set_wind` (id 2). */
+export type SetWindMessage = SampleWind;
+
+const MESSAGE_SET_WIND_PAYLOAD: WireType = SAMPLE_WIND_TYPE;
+
 /** Event type ids by name. */
 export const EVENT = {
 	hello: 1,
@@ -197,4 +213,41 @@ export function onEvent<K extends keyof Events>(
 	handler: (value: Events[K], zoneId: string) => void
 ): () => void {
 	return onGameEvent(client, EVENTS, name, handler);
+}
+
+/** Zone inbox message type ids by name. */
+export const MESSAGE = {
+	announce: 1,
+	setWind: 2,
+} as const;
+
+/** Zone inbox message payload types by name. */
+export interface Messages {
+	announce: AnnounceMessage;
+	setWind: SetWindMessage;
+}
+
+/** Codecs of every zone inbox message. */
+export const MESSAGES: GameEventCodecs<Messages> = {
+	announce: {
+		id: 1,
+		name: 'announce',
+		encode: (value) => encodePayload(MESSAGE_ANNOUNCE_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_ANNOUNCE_LAYOUT, payload) as unknown as AnnounceMessage
+	},
+	setWind: {
+		id: 2,
+		name: 'set_wind',
+		encode: (value) => encodeValue(MESSAGE_SET_WIND_PAYLOAD, value),
+		decode: (payload) => decodeValue(MESSAGE_SET_WIND_PAYLOAD, payload) as SetWindMessage
+	},
+};
+
+/** Encode a zone inbox message: `typeId` and `payload` of a `/admin/zone-message` body (base64url the payload). */
+export function encodeMessage<K extends keyof Messages>(
+	name: K,
+	value: Messages[K]
+): { readonly typeId: number; readonly payload: Uint8Array } {
+	const codec = MESSAGES[name];
+	return { typeId: codec.id, payload: codec.encode(value) };
 }

@@ -493,7 +493,15 @@ boolean or a promise of one, or `false`); 400 for any body field other than
 returns nothing; 503 without a valid secret. Every response is
 `cache-control: no-store`. Tickets live 60 s by default (`ttlSeconds` ≤ 300)
 and are single use on the zone server.
-`mintGameTicket({ secret, principal, zone, role, name })` signs one directly.
+`mintGameTicket({ secret, principal, zone, role, name, extensions })` signs one directly.
+
+Extension claims (match id, team, party) come from the server-side
+`claims({ principal, zone, role, session, event })` callback — never from the
+body — and are signed under the ticket's `ext`; the zone server admits them
+only against its declared `TicketExtension` schema
+(`ServerConfig::with_ticket_extensions`). Names that look like identity,
+rewards or economy values (`TRUSTED_FIELD_DENYLIST`, the same list as the
+Rust derives) and objects over 2 KiB are refused with 400 `invalid_claims`.
 
 The default limiter counts per process, so N instances behind a load
 balancer allow N× the budget. Share it through Redis (or any store that runs
@@ -879,6 +887,9 @@ duplicated as decision documents in this package.
   primitives.
 - `@hops-ops/distributed/replica` — replica, GraphQL transport, generated
   command runtime, query-plan helpers, and optional persistence.
+- `@hops-ops/distributed/replica/lazy` — `createLazyReplicaCommandRuntime`
+  only, so a client that loads commands on demand (the generated lazy
+  `commands.ts`) keeps eager command exports out of its first import graph.
 - `@hops-ops/distributed/diagnostics` — redacted support snapshots and artifact
   inspection.
 - `@hops-ops/distributed/sveltekit` — Svelte stores, island SSR composition,

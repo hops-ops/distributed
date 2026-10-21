@@ -118,6 +118,32 @@ pub fn graphql_sdl_for_role(
     graphql_sdl_from_surface(&role_surface)
 }
 
+fn leaderboard_root_sdl(root: &super::surface::LeaderboardRoot) -> String {
+    let arguments = if root.arguments.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "({})",
+            root.arguments
+                .iter()
+                .map(|argument| format!(
+                    "{}: {}{}",
+                    argument.name,
+                    argument.type_name,
+                    if argument.nullable { "" } else { "!" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let result = if root.operation.is_list() {
+        format!("[{}!]!", super::surface::LEADERBOARD_ENTRY_TYPE)
+    } else {
+        super::surface::LEADERBOARD_ENTRY_TYPE.to_string()
+    };
+    format!("  {}{arguments}: {result}\n", root.name)
+}
+
 /// Internal renderer over an already IR-filtered set of read models.
 fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<String, String> {
     let has_causal_commands = !surface.commands.is_empty();
@@ -188,6 +214,20 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     for root in &surface.subscription_fields {
         claim_name(&mut subscription_fields, &root.name)?;
     }
+    let leaderboard_roots = surface
+        .leaderboards
+        .iter()
+        .flat_map(|leaderboard| leaderboard.roots(leaderboard.selected_grant()))
+        .collect::<Vec<_>>();
+    if !leaderboard_roots.is_empty() {
+        claim_name(&mut type_names, super::surface::LEADERBOARD_ENTRY_TYPE)?;
+    }
+    for root in &leaderboard_roots {
+        claim_name(&mut query_fields, &root.name)?;
+        if surface.subscriptions && root.operation.is_live() {
+            claim_name(&mut subscription_fields, &root.name)?;
+        }
+    }
 
     let mut out = String::new();
 
@@ -228,6 +268,13 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
         }
     }
 
+    if !leaderboard_roots.is_empty() {
+        out.push_str(&format!(
+            "type {} {{\n  rank: Int!\n  member: String!\n  score: Float!\n}}\n\n",
+            super::surface::LEADERBOARD_ENTRY_TYPE
+        ));
+    }
+
     emit_command_types(&mut out, &surface.commands, &surface.models)?;
     if has_causal_commands {
         emit_causal_command_protocol_types(&mut out);
@@ -237,7 +284,7 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     // schemas. This is what keeps hidden/partial by-PK identity and per-model
     // aggregate grants aligned with runtime and client manifest output.
     out.push_str("type Query {\n");
-    if surface.query_fields.is_empty() && !has_causal_commands {
+    if surface.query_fields.is_empty() && leaderboard_roots.is_empty() && !has_causal_commands {
         // async-graphql requires a non-empty Query object and the runtime uses
         // this same fail-closed sentinel for roles with no readable models.
         // It is intentionally not a client-manifest root.
@@ -247,6 +294,9 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
             out.push_str(&surface_root_sdl(field));
             out.push('\n');
         }
+        for root in &leaderboard_roots {
+            out.push_str(&leaderboard_root_sdl(root));
+        }
         if has_causal_commands {
             out.push_str(&format!(
                 "  {COMMAND_STATUS_ROOT_FIELD}(commandId: ID!): {DISTRIBUTED_COMMAND_STATUS_TYPE}!\n"
@@ -255,11 +305,18 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     }
     out.push_str("}\n");
 
-    if !surface.subscription_fields.is_empty() {
+    let live_leaderboard_roots = leaderboard_roots
+        .iter()
+        .filter(|root| surface.subscriptions && root.operation.is_live())
+        .collect::<Vec<_>>();
+    if !surface.subscription_fields.is_empty() || !live_leaderboard_roots.is_empty() {
         out.push_str("\ntype Subscription {\n");
         for field in &surface.subscription_fields {
             out.push_str(&surface_root_sdl(field));
             out.push('\n');
+        }
+        for root in live_leaderboard_roots {
+            out.push_str(&leaderboard_root_sdl(root));
         }
         out.push_str("}\n");
     }
@@ -649,6 +706,7 @@ mod causal_command_sdl_tests {
             projectors: Vec::new(),
             projectors_attached: false,
             service_binding: None,
+            leaderboards: Vec::new(),
         }
     }
 

@@ -44,7 +44,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use distributed_game::net::{GameServer, ServerConfig};
+use distributed_game::net::{GameServer, ServerConfig, ZoneFactory};
 use distributed_game::world::{HostAddr, ZoneDirectory};
 use distributed_game::{
     schema, ChildEvent, ConsumePolicy, Ctx, EntitySchema, GameEvent, GameInput, GameRecord,
@@ -54,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::arena::movement::{self, MoveState};
-use crate::cluster::{ClusterDemo, ClusterOptions, World};
+use crate::cluster::{ClusterDemo, World};
 use crate::common::{Demo, Guests};
 
 /// Root zone.
@@ -641,6 +641,7 @@ impl Zone for Ripple {
     type Config = RippleConfig;
     type Input = HoodInput;
     type Timer = RippleTimer;
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         schema![TierView, BossView, FighterView]
@@ -825,8 +826,7 @@ impl Demo for RippleDemo {
     }
 
     fn server(config: ServerConfig, guests: Guests) -> GameServer<Ripple> {
-        let options = ClusterOptions::single("local", Duration::from_secs(20));
-        let world = World::standalone::<Self>(&options, guests);
+        let world = World::standalone::<Self>("local", Duration::from_secs(20), guests);
         Self::cluster_server(config, &world)
     }
 }
@@ -840,13 +840,17 @@ impl ClusterDemo for RippleDemo {
         config.host.max_observers = 64;
         let guests = world.guests.clone();
         let host_id = world.host.id.clone();
-        GameServer::new(config, move |zone_id| {
-            tier_of(zone_id).map(|tier| RippleConfig {
-                guests: guests.clone(),
-                host_id: host_id.clone(),
-                tier,
-            })
-        })
+        GameServer::new(
+            config,
+            ZoneFactory::sync(move |activation| {
+                let zone_id = activation.zone_id.as_str();
+                tier_of(zone_id).map(|tier| RippleConfig {
+                    guests: guests.clone(),
+                    host_id: host_id.clone(),
+                    tier,
+                })
+            }),
+        )
         .with_host_config(|zone_id, host| {
             if let Some(tier) = tier_of(zone_id) {
                 let (tick, patch, idle) = tier.rates();

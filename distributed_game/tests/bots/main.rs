@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use arena::{Arena, ArenaConfig};
 use distributed_game::bots::{run_bots, BehaviourKind, BotConfig};
-use distributed_game::net::{GameServer, NetSim, ServerConfig, TicketKey};
+use distributed_game::net::{GameServer, NetSim, ServerConfig, TicketKey, ZoneFactory};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SECRET: &str = "bots-secret";
@@ -34,9 +34,10 @@ async fn fifty_bots_join_play_and_receive_deltas() {
         Duration::from_millis(5),
         Duration::from_millis(5),
     ));
-    let server = GameServer::<Arena>::new(config, |zone| {
-        zone.starts_with("load").then(ArenaConfig::default)
-    });
+    let server = GameServer::<Arena>::new(
+        config,
+        ZoneFactory::sync(|a| a.zone_id.starts_with("load").then(ArenaConfig::default)),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let serving = server.clone();

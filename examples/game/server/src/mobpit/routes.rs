@@ -5,11 +5,18 @@
 //!   artificial latency in front of every cell commit ("slow storage").
 //! - `GET /dev/mobpit/stats` — boot id, sink counters, pending facts, recent
 //!   commits (key, exact input, receipt).
-//! - `GET /dev/mobpit/crawlers` — every Crawler cell on disk (read path).
+//! - `GET /dev/mobpit/crawlers` — every crawler in the directory (the
+//!   `player_stats` projection of the cells' domain events; eventually
+//!   consistent).
 //! - `GET /dev/mobpit/leaderboard[?member=principal]` — the pushed top-N
 //!   snapshot, plus rank / neighbours of `member` on both boards.
 //! - `POST /dev/mobpit/leaderboard/rebuild` — rebuild both boards from the
-//!   cells' event history; reports whether the result matches the cells.
+//!   event history of every crawler in the directory (read from its cell);
+//!   reports whether the result matches the cells.
+//! - `GET /dev/mobpit/presence` — who is online / away / offline where,
+//!   projected from the runtime's player lifecycle facts.
+//!
+//! The always-mounted internal relay route is `crate::common::relay`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,6 +48,7 @@ pub fn routes(world: Arc<MobPitWorld>) -> Router {
         .route("/dev/mobpit/crawlers", get(crawlers))
         .route("/dev/mobpit/leaderboard", get(leaderboard))
         .route("/dev/mobpit/leaderboard/rebuild", post(rebuild))
+        .route("/dev/mobpit/presence", get(presence))
         .with_state(world)
 }
 
@@ -73,6 +81,7 @@ async fn stats(State(world): State<Arc<MobPitWorld>>) -> Json<Value> {
     Json(json!({
         "boot": world.boot(),
         "dataDir": world.data_dir().display().to_string(),
+        "celld": world.cells().url(),
         "latencyMs": world.sink_state().latency().as_millis() as u64,
         "pending": world.zone_pending(),
         "sink": world.sink_state().stats(),
@@ -97,6 +106,10 @@ async fn leaderboard(
         None => Value::Null,
     };
     Ok(Json(json!({ "snapshot": snapshot, "me": me })))
+}
+
+async fn presence(State(world): State<Arc<MobPitWorld>>) -> Json<Value> {
+    Json(json!({ "presence": world.presence().snapshot() }))
 }
 
 async fn rebuild(State(world): State<Arc<MobPitWorld>>) -> ApiResult {

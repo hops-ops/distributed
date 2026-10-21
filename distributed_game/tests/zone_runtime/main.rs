@@ -25,6 +25,7 @@ fn claims(principal: &str, zone: &str) -> TicketClaims {
         nonce: format!("n-{principal}"),
         role: Role::Player,
         name: None,
+        extensions: Default::default(),
     }
 }
 
@@ -720,6 +721,7 @@ impl distributed_game::Zone for Paced {
     type Config = ();
     type Input = u8;
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> distributed_game::EntitySchema {
         distributed_game::EntitySchema::new()

@@ -56,7 +56,7 @@
 			     (projected from the Crawler cells' domain events): SSR, then @live. -->
 			<MyStats />
 			<div>saving <b data-testid="unsaved">{unsaved}</b></div>
-			<Leaderboard me={data.principal} />
+			<Leaderboard me={data.principal} initial={data.board} />
 			{#each saved.items.slice(0, 3) as s (s.key)}
 				<div class="saved">+{s.xp} XP saved ✓ <small>{s.waitedMs} ms</small></div>
 			{/each}

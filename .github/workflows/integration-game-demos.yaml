@@ -7,7 +7,9 @@ name: Game demos smoke
 # headless tests, and the SvelteKit demo end to end: `distributed build
 # examples/game/server` (GraphQL client, svelte-check, vite build), then
 # Playwright against the production build, a real Mob Pit server and the real
-# mobpit-service read model (SQLite only; no external services).
+# mobpit-service read model. Mob Pit's durable cells run on celld: the tests
+# start their own `celld dev` (CELLD_BIN, pinned in /.celld-version; no Docker) serving
+# examples/game/cells, built with worker-build.
 on:
   workflow_call:
 
@@ -17,7 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
-    # The shared ticket rate limiter's Lua script runs against a real Redis.
+    # The shared ticket rate limiter's Lua script and the leaderboard store
+    # (conformance suite, projector, GraphQL boards) run against a real Redis.
     services:
       redis:
         image: redis:7-alpine
@@ -43,11 +46,29 @@ jobs:
             js/package-lock.json
             examples/game/client/package-lock.json
             examples/game/sveltekit/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            examples/game/server -> target
+            examples/game/cells -> target
+          shared-key: game-demos
+      - name: Install celld (pinned) and worker-build
+        run: |
+          scripts/celld.sh install
+          echo "CELLD_BIN=$HOME/.local/bin/celld" >> "$GITHUB_ENV"
+          cargo install worker-build --locked
       - name: Install SvelteKit demo dependencies and Chromium
         working-directory: examples/game/sveltekit
         run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
       - name: Run examples/game smoke
+        env:
+          # The SvelteKit leaderboard is the Redis board (GraphQL board roots).
+          REDIS_URL: redis://127.0.0.1:6379
         run: examples/game/run.sh smoke
+      - name: Leaderboard conformance and GraphQL boards against real Redis
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+        run: cargo test --features redis,graphql,sqlite --test redis_leaderboard -- --nocapture
       - name: Ticket rate limiter against real Redis
         working-directory: js
         env:

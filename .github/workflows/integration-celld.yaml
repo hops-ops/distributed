@@ -7,8 +7,7 @@ name: celld (live + e2e-celld)
 #   make -C tests/e2e-celld test
 #   make -C tests/e2e-ui up && make -C tests/e2e-ui up-celld-nats
 #   WATCH=0 WATCH_WORKER=0 make -C tests/e2e-celld run
-#   E2E_UI_ORIGIN=http://localhost:8791 npx --prefix tests/e2e-ui playwright test \
-#     todos.user.spec.ts chat.user.spec.ts --project chromium-user
+#   make -C tests/e2e-celld test-browser   # the full Playwright suite
 #
 # Default `cargo test` (quality) still runs fixture-only celld checks and
 # skips live HTTP unless CELLD_URL is set. This job sets CELLD_URL / NATS_URL.
@@ -39,7 +38,10 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: tests/celld/worker -> tests/celld/worker/target
+          workspaces: |
+            tests/celld/worker -> tests/celld/worker/target
+            tests/celld/alarm-worker -> tests/celld/alarm-worker/target
+            tests/celld/fact-worker -> tests/celld/fact-worker/target
           shared-key: celld-storage
       - uses: actions/setup-node@v4
         with:
@@ -49,13 +51,37 @@ jobs:
           sudo apt-get update && sudo apt-get install -y sqlite3
           npm install -g esbuild
           cargo install worker-build --locked
-          curl -fsSL https://celld.dev/install.sh | sh
+          # The pinned celld (/.celld-version) is the one the zone-state R2
+          # path, fact routing and every profile below are proven on.
+          scripts/celld.sh install
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Build isolated fault-probe Worker
         working-directory: tests/celld/worker
         run: worker-build --release --features storage-conformance
       - name: Prove SQL atomicity, fencing, autonomous recovery and growth
         run: node tests/celld/storage-conformance.mjs
+      - name: Build the cell-alarm Ticker Worker
+        working-directory: tests/celld/alarm-worker
+        run: worker-build --release
+      - name: Prove re-armable cell alarms (atomic arm, cadence, watchdog, restart)
+        run: node tests/celld/alarms.mjs
+      - name: Build the zone-fact cells Worker
+        working-directory: tests/celld/fact-worker
+        run: worker-build --release
+      - name: Route zone facts to celld cells (CelldFactSink, outage and restart)
+        env:
+          CELLD_FACTS_REQUIRED: "1"
+        run: cargo test -p distributed_game --features celld,runtime --test celld_facts
+      - name: Zone leases in celld cells (CellZoneOwnership, alarm expiry, GameServer)
+        env:
+          CELLD_FACTS_REQUIRED: "1"
+        run: cargo test -p distributed_game --features celld,runtime,net --test celld_zone_lease
+      - name: Zone hibernation state in celld cells (inline + R2 snapshots, crash, GameServer)
+        env:
+          CELLD_FACTS_REQUIRED: "1"
+        run: |
+          cargo test -p distributed_game --features celld,runtime --test celld_zone_state
+          cargo test -p distributed_game --features celld,net,lease --test world
       - name: Retain storage proof results and logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -64,6 +90,8 @@ jobs:
           path: |
             /tmp/distributed-cell-storage-*/results.json
             /tmp/distributed-cell-storage-*/celld-*.log
+            /tmp/distributed-cell-alarms-*/results.json
+            /tmp/distributed-cell-alarms-*/celld-*.log
           if-no-files-found: ignore
 
   e2e-celld:
@@ -87,7 +115,7 @@ jobs:
         run: cargo test --workspace --verbose
 
   live:
-    name: celld 0.4 live (local store + Queue + NATS)
+    name: celld live (local store + Queue + NATS)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -126,9 +154,9 @@ jobs:
       - name: Install worker-build
         run: cargo install worker-build --locked || cargo install worker-build
 
-      - name: Install celld CLI
+      - name: Install celld CLI (pinned in /.celld-version)
         run: |
-          curl -fsSL https://celld.dev/install.sh | sh
+          scripts/celld.sh install
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Bring up Postgres + Zitadel and bootstrap OIDC
@@ -155,7 +183,7 @@ jobs:
         working-directory: tests/e2e-ui
         run: npx playwright install chromium --with-deps
 
-      - name: Bring up celld 0.4 + Queue relay + NATS
+      - name: Bring up celld + Queue relay + NATS
         run: |
           command -v celld
           command -v worker-build
@@ -266,11 +294,9 @@ jobs:
             -H "x-distributed-internal-secret: $DISTRIBUTED_INTERNAL_SECRET" \
             -d '{"ids":["forged"]}'
 
-      - name: Todo + Chat browser lifecycle through celld
+      - name: Full Playwright suite through celld (user, admin, anon)
         working-directory: tests/e2e-ui
-        run: >-
-          npx playwright test todos.user.spec.ts chat.user.spec.ts
-          --project chromium-user
+        run: npx playwright test
         env:
           E2E_UI_ORIGIN: http://localhost:8791
           E2E_API_ORIGIN: http://127.0.0.1:8791

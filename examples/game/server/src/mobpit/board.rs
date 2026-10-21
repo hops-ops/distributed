@@ -11,9 +11,10 @@
 //!   "mob_killed")` — the same id whether it comes from the live receipt, a
 //!   ledger replay of the same fact, or the cell's event history. The
 //!   projector's apply keys (`"{id}#{change}"`) make every repeat a no-op.
-//! - Rebuild ([`Leaderboards::rebuild`]): read every cell's durable event
-//!   history, project it into the *staging* boards and atomically promote
-//!   them. Runs at startup too (the in-memory board starts empty).
+//! - Rebuild ([`Leaderboards::rebuild`]): read the durable event history
+//!   of every crawler in the directory (`super::directory`) from its cell,
+//!   project it into the *staging* boards and atomically promote them.
+//!   Runs at startup too (the in-memory board starts empty).
 //! - Snapshot ([`BoardSnapshot`]): a `#[derive(GameRecord)]` struct, pushed
 //!   to clients as the zone's typed `board` event and served as camelCase
 //!   JSON by `/dev/mobpit/leaderboard`; the generated TypeScript type
@@ -26,21 +27,19 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use distributed::leaderboard::{
     BackgroundLeaderboard, BackgroundLeaderboardOptions, Board, InMemoryLeaderboard,
-    LeaderboardChange, LeaderboardEntry, LeaderboardError, LeaderboardProjection,
-    LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy, ScoreSubmission,
+    LeaderboardChange, LeaderboardChangeListener, LeaderboardEntry, LeaderboardError,
+    LeaderboardProjection, LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy,
+    ScoreSubmission,
 };
 use distributed::{DomainEventOccurrence, ExternalEventSource};
 use distributed_game::GameRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::crawler::{KillReceipt, MobKilledArgs, AGGREGATE_TYPE, MOB_KILLED_EVENT};
+use super::crawler::{KillReceipt, AGGREGATE_TYPE};
 use super::store::CrawlerCells;
 
-/// Kills board.
-pub const KILLS_BOARD: &str = "mobpit.kills";
-/// XP board.
-pub const XP_BOARD: &str = "mobpit.xp";
+pub use mobpit_crawler::{KILLS_BOARD, XP_BOARD};
 /// Producer of kill occurrences.
 pub const PRODUCER: &str = "mobpit.crawler-cell";
 /// Rows pushed to clients.
@@ -237,7 +236,15 @@ pub struct Leaderboards {
 impl Leaderboards {
     /// Redis when `redis_url` is given, else in memory. Must run inside a
     /// Tokio runtime (spawns the background applier and the refresher).
-    pub fn open(redis_url: Option<&str>, redis_prefix: &str) -> Result<Arc<Self>, String> {
+    /// `on_change` is told every board whose scores changed (applied kills
+    /// and rebuild promotions): the zone server publishes it on the
+    /// projection bus as `distributed.leaderboard.changed`, which drives
+    /// `@live` boards in `mobpit-service`.
+    pub fn open(
+        redis_url: Option<&str>,
+        redis_prefix: &str,
+        on_change: Option<LeaderboardChangeListener>,
+    ) -> Result<Arc<Self>, String> {
         let (store, backend): (Arc<dyn LeaderboardStore>, _) = match redis_url {
             Some(url) => (
                 Arc::new(
@@ -250,7 +257,10 @@ impl Leaderboards {
             None => (Arc::new(InMemoryLeaderboard::new()), "memory"),
         };
         let projection = Arc::new(KillProjection::new());
-        let projector: Projector = LeaderboardProjector::new(store.clone(), projection);
+        let mut projector: Projector = LeaderboardProjector::new(store.clone(), projection);
+        if let Some(listener) = on_change {
+            projector = projector.with_change_listener(listener);
+        }
         let background = BackgroundLeaderboard::spawn(
             projector.clone(),
             BackgroundLeaderboardOptions::default(),
@@ -428,41 +438,35 @@ impl Leaderboards {
         ))
     }
 
-    /// Rebuild both boards from every cell's durable event history and check
-    /// the result against the cells' current state.
-    pub async fn rebuild(&self, cells: &CrawlerCells) -> Result<RebuildReport, String> {
+    /// Rebuild both boards from the durable event history of `principals`'
+    /// cells and check the result against the cells' current state.
+    pub async fn rebuild(
+        &self,
+        principals: Vec<String>,
+        cells: &CrawlerCells,
+    ) -> Result<RebuildReport, String> {
         let _one_at_a_time = self.rebuilding.lock().await;
         let started = Instant::now();
         let before = self.top_rows().await.map_err(|e| e.to_string())?;
         let mut occurrences = Vec::new();
         let mut expected: BTreeMap<String, (u32, u64)> = BTreeMap::new();
-        let principals = cells.principals();
         for principal in &principals {
-            let cell = cells.get(principal).map_err(|e| e.to_string())?;
-            for record in cell.history().await.map_err(|e| e.to_string())? {
-                if record.event_name != MOB_KILLED_EVENT {
-                    continue;
-                }
-                let (crawler, name, mob, tier, xp): MobKilledArgs =
-                    record.decode().map_err(|e| e.to_string())?;
-                self.remember_name(&crawler, &name);
-                let at_ms = record
-                    .timestamp
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as u64);
+            let view = cells.crawler(principal).await?;
+            for kill in view.kills {
+                self.remember_name(&kill.crawler, &kill.name);
                 occurrences.push(kill_occurrence(
                     principal,
-                    record.sequence,
-                    at_ms,
+                    kill.sequence,
+                    kill.at_ms,
                     &MobKilled {
-                        crawler,
-                        mob,
-                        tier,
-                        xp,
+                        crawler: kill.crawler,
+                        mob: kill.mob,
+                        tier: kill.tier,
+                        xp: kill.xp,
                     },
                 )?);
             }
-            if let Some(state) = cell.load().await.map_err(|e| e.to_string())? {
+            if let Some(state) = view.state {
                 expected.insert(principal.clone(), (state.kills, state.xp));
             }
         }

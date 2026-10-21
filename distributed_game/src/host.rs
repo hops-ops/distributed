@@ -26,7 +26,7 @@
 //! reported in [`AdvanceReport::transitions`] and via
 //! [`Zone::on_tier_changed`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,8 +34,13 @@ use crate::authoring::GameEvent;
 use crate::clock::Clock;
 use crate::facts::{EmitError, Fact, FactCommand, FactQueue, FactSettlement};
 use crate::handoff::{HandoffError, HandoffRequest, Transfer, TransferIssuer, MAX_CARRIED_BYTES};
+use crate::inbox::{Delivered, ZoneInbound};
 use crate::input::{ConsumePolicy, InputBuffer, PushOutcome, SequencedInput};
 use crate::interest::{InterestConfig, View};
+use crate::lifecycle::{
+    ConnectionLost, JoinVia, LeftReason, LostCause, PlayerDisconnected, PlayerJoined, PlayerLeft,
+    PlayerReconnected,
+};
 use crate::protocol::{error, kick, Notice, Role, ServerMessage, Welcome};
 use crate::replication::{ClientReplica, DeltaStats, EncodedWorld, WorldView};
 use crate::rewind::{Rewind, RewindConfig, RewindFrame};
@@ -92,6 +97,15 @@ pub struct HostConfig {
     /// Unix time in microseconds when the host is created. The `net` server
     /// sets it to the activation's fencing token.
     pub boot_epoch: u64,
+    /// Remote config version the zone runs (opaque; e.g. `"combat@12"`):
+    /// stamped on every fact ([`FactStamp::config_version`]). Change it at
+    /// runtime with [`ZoneHost::set_config_version`] /
+    /// [`Ctx::set_config_version`].
+    pub config_version: String,
+    /// Emit the player lifecycle facts ([`crate::lifecycle`]: joined,
+    /// connection lost, reconnected, disconnected, left) on the zone's fact
+    /// queue, bound to each player's verified principal. Off by default.
+    pub lifecycle_facts: bool,
 }
 
 impl Default for HostConfig {
@@ -114,6 +128,8 @@ impl Default for HostConfig {
             rewind: RewindConfig::default(),
             stale_policy: StalePolicy::Strict,
             boot_epoch: 0,
+            config_version: String::new(),
+            lifecycle_facts: false,
         }
     }
 }
@@ -212,6 +228,8 @@ struct PlayerSlot<I> {
     reconnect_token: String,
     session_id: String,
     content_version: String,
+    /// Lifecycle facts emitted for this slot (part of their keys).
+    transitions: u32,
 }
 
 struct ObserverSlot {
@@ -247,12 +265,24 @@ pub(crate) struct Core<Z: Zone> {
     pending_kicks: Vec<(PlayerId, String)>,
     rewind: Rewind,
     transfer_issuer: Option<Box<TransferIssuer>>,
-    pending_handoffs: Vec<(PlayerId, ServerMessage)>,
+    /// Handoffs to finish after the hook: player, `Handoff` message and the
+    /// departure stamp time signed into the transfer ticket.
+    pending_handoffs: Vec<(PlayerId, ServerMessage, u64)>,
     upward: Vec<ChildEvent>,
     child_inbox: Vec<ChildEvent>,
     dropped_frozen: u64,
     /// Typed facts keyed without dedupe parts this tick: `(tick, count)`.
     fact_seq: (u64, u32),
+    /// Facts stamped this activation ([`FactStamp::seq`] of the latest).
+    stamped: u64,
+    /// Stamps are never earlier than this (Unix ms): raised past a handoff
+    /// source's departure time when a transfer is admitted.
+    stamp_floor_ms: u64,
+    /// Stamp time forced while a handoff departure runs `on_leave`, so the
+    /// source's departure facts carry exactly the time in the ticket.
+    pinned_stamp_ms: Option<u64>,
+    /// Lifecycle facts waiting for queue capacity, in emission order.
+    lifecycle_backlog: VecDeque<Fact>,
 }
 
 impl<Z: Zone> Core<Z> {
@@ -282,7 +312,84 @@ impl<Z: Zone> Core<Z> {
     }
 
     fn in_flight(&self) -> usize {
-        self.facts.as_ref().map_or(0, FactQueue::in_flight)
+        self.facts.as_ref().map_or(0, FactQueue::in_flight) + self.lifecycle_backlog.len()
+    }
+
+    /// Queue a lifecycle fact for `principal`'s slot `player` (transition
+    /// `n`), keyed restart-safely and stamped now.
+    fn lifecycle<C: FactCommand>(&mut self, player: PlayerId, principal: &str, n: u32, input: C) {
+        if !self.config.lifecycle_facts || self.facts.is_none() {
+            return;
+        }
+        let key = crate::facts::fact_key(
+            C::COMMAND,
+            &self.zone_id,
+            self.config.boot_epoch,
+            &[&format_args!("p{}", player.0), &n],
+        );
+        let Ok(fact) = Fact::typed(key, &input) else {
+            return;
+        };
+        let fact = fact.bind(Some(principal.to_string()), self.stamp_fact());
+        self.lifecycle_backlog.push_back(fact);
+        self.flush_lifecycle();
+    }
+
+    /// Send backlogged lifecycle facts while the queue has room.
+    fn flush_lifecycle(&mut self) {
+        let Some(queue) = self.facts.as_mut() else {
+            self.lifecycle_backlog.clear();
+            return;
+        };
+        while let Some(fact) = self.lifecycle_backlog.front() {
+            match queue.try_send(fact.clone()) {
+                Err(EmitError::Backpressure) => return,
+                // Sent, or a duplicate already in flight: done either way.
+                _ => {
+                    self.lifecycle_backlog.pop_front();
+                }
+            }
+        }
+    }
+
+    /// Next transition number of a slot.
+    fn transition(&mut self, player: PlayerId) -> Option<(String, u32)> {
+        let slot = self.players.get_mut(&player)?;
+        slot.transitions += 1;
+        Some((slot.info.principal.clone(), slot.transitions))
+    }
+
+    fn emit_lifecycle<C: FactCommand>(&mut self, player: PlayerId, input: C) {
+        if !self.config.lifecycle_facts {
+            return;
+        }
+        if let Some((principal, n)) = self.transition(player) {
+            self.lifecycle(player, &principal, n, input);
+        }
+    }
+
+    /// Wall time stamped on anything produced now (Unix ms).
+    fn stamp_ms(&self) -> u64 {
+        self.pinned_stamp_ms
+            .unwrap_or_else(|| self.clock.unix_ms().max(self.stamp_floor_ms))
+    }
+
+    fn stamp(&self) -> FactStamp {
+        FactStamp {
+            zone_id: self.zone_id.clone(),
+            tick: self.tick,
+            content_version: self.config.content_version.clone(),
+            emitted_at_ms: self.stamp_ms(),
+            activation: self.config.boot_epoch,
+            config_version: self.config.config_version.clone(),
+            seq: self.stamped,
+        }
+    }
+
+    /// Stamp for a fact: the next emission sequence number.
+    fn stamp_fact(&mut self) -> FactStamp {
+        self.stamped += 1;
+        self.stamp()
     }
 }
 
@@ -330,6 +437,17 @@ impl<Z: Zone> Ctx<'_, Z> {
     /// Content version.
     pub fn content_version(&self) -> &str {
         &self.core.config.content_version
+    }
+
+    /// Remote config version ([`HostConfig::config_version`]).
+    pub fn config_version(&self) -> &str {
+        &self.core.config.config_version
+    }
+
+    /// Switch the remote config version (e.g. on a config-changed
+    /// message); facts and stamps produced afterwards carry it.
+    pub fn set_config_version(&mut self, version: impl Into<String>) {
+        self.core.config.config_version = version.into();
     }
 
     /// Epoch of this zone activation ([`HostConfig::boot_epoch`]): unique
@@ -509,11 +627,7 @@ impl<Z: Zone> Ctx<'_, Z> {
     }
 
     fn emit_bound(&mut self, fact: Fact, principal: Option<String>) -> Result<(), EmitError> {
-        let stamp = FactStamp {
-            zone_id: self.core.zone_id.clone(),
-            tick: self.core.tick,
-            content_version: self.core.config.content_version.clone(),
-        };
+        let stamp = self.core.stamp_fact();
         self.core
             .facts
             .as_mut()
@@ -582,15 +696,11 @@ impl<Z: Zone> Ctx<'_, Z> {
         self.core.pending_kicks.push((player, message.into()));
     }
 
-    /// Provenance of anything produced now (zone, tick, content version);
-    /// embed it in events so clients and logs can tell which content
-    /// version produced them.
+    /// Provenance of anything produced now (zone, activation, tick, wall
+    /// time, content and config version); embed it in events so clients
+    /// and logs can tell which content version produced them.
     pub fn stamp(&self) -> FactStamp {
-        FactStamp {
-            zone_id: self.core.zone_id.clone(),
-            tick: self.core.tick,
-            content_version: self.core.config.content_version.clone(),
-        }
+        self.core.stamp()
     }
 
     /// Move `player` to `target_zone` with `carried` state. A signed
@@ -611,26 +721,35 @@ impl<Z: Zone> Ctx<'_, Z> {
         if carried.len() > MAX_CARRIED_BYTES {
             return Err(HandoffError::TooLarge);
         }
-        let (principal, name) = self
+        let (principal, name, extensions) = self
             .core
             .players
             .get(&player)
-            .map(|slot| (slot.info.principal.clone(), slot.info.name.clone()))
+            .map(|slot| {
+                (
+                    slot.info.principal.clone(),
+                    slot.info.name.clone(),
+                    slot.info.extensions.clone(),
+                )
+            })
             .ok_or(HandoffError::UnknownPlayer)?;
         if self
             .core
             .pending_handoffs
             .iter()
-            .any(|(queued, _)| *queued == player)
+            .any(|(queued, _, _)| *queued == player)
         {
             return Err(HandoffError::Refused);
         }
+        let departed_at_ms = self.core.stamp_ms();
         let request = HandoffRequest {
             principal,
             name,
+            extensions,
             source_zone: self.core.zone_id.clone(),
             target_zone: target_zone.to_string(),
             carried,
+            departed_at_ms,
         };
         let issuer = self
             .core
@@ -644,6 +763,7 @@ impl<Z: Zone> Ctx<'_, Z> {
                 target_zone: request.target_zone,
                 transfer_ticket: ticket,
             },
+            departed_at_ms,
         ));
         Ok(())
     }
@@ -671,6 +791,7 @@ pub struct ZoneHost<Z: Zone> {
     zone: Z,
     core: Core<Z>,
     schema: EntitySchema,
+    entities: crate::Entities<Z>,
     hot: FixedTimestep,
     idle: Option<FixedTimestep>,
     last_advance: Duration,
@@ -729,6 +850,10 @@ impl<Z: Zone> ZoneHost<Z> {
             child_inbox: Vec::new(),
             dropped_frozen: 0,
             fact_seq: (0, 0),
+            stamped: 0,
+            stamp_floor_ms: 0,
+            pinned_stamp_ms: None,
+            lifecycle_backlog: VecDeque::new(),
             config,
         };
         let zone = Z::on_create(&mut Ctx { core: &mut core }, zone_config);
@@ -741,6 +866,7 @@ impl<Z: Zone> ZoneHost<Z> {
             zone,
             core,
             schema: Z::schema(),
+            entities: Z::entities(),
             hot,
             idle,
             last_advance: now,
@@ -866,11 +992,10 @@ impl<Z: Zone> ZoneHost<Z> {
     /// [`Zone::state_hash`] (or, when the zone has none, its replicated
     /// [`WorldView`]).
     pub fn state_hash(&self) -> u64 {
-        let zone = self.zone.state_hash().unwrap_or_else(|| {
-            let mut view = WorldView::default();
-            self.zone.replicate(&mut view);
-            crate::replay::hash_world(&view)
-        });
+        let zone = self
+            .zone
+            .state_hash()
+            .unwrap_or_else(|| crate::replay::hash_world(&self.world_view()));
         let mut h = crate::rng::Fnv64::new();
         h.write_u64(self.core.tick)
             .write_u64(self.core.sim_time.as_nanos() as u64)
@@ -922,6 +1047,10 @@ impl<Z: Zone> ZoneHost<Z> {
     /// Admit a player arriving with a verified transfer ticket; the zone
     /// sees [`Zone::on_handoff_join`] with the carried state (also when the
     /// principal is still present, e.g. inside its reconnect grace).
+    ///
+    /// From now on this zone stamps facts later than the source stamped the
+    /// departure ([`Transfer::departed_at_ms`]), whatever the two hosts'
+    /// clocks say.
     pub fn join_transfer(
         &mut self,
         transfer: &Transfer,
@@ -934,6 +1063,10 @@ impl<Z: Zone> ZoneHost<Z> {
                 "transfers are for players",
             ));
         }
+        self.core.stamp_floor_ms = self
+            .core
+            .stamp_floor_ms
+            .max(transfer.departed_at_ms.saturating_add(1));
         self.admit(
             &transfer.claims,
             capabilities,
@@ -1009,11 +1142,29 @@ impl<Z: Zone> ZoneHost<Z> {
                     if claims.name.is_some() {
                         slot.info.name = claims.name.clone();
                     }
+                    slot.info.extensions = claims.extensions.clone();
                 }
                 self.bind_player(player, client, capabilities);
+                let zone = self.core.zone_id.clone();
                 if let Some((from, carried)) = handoff.take() {
+                    self.core.emit_lifecycle(
+                        player,
+                        PlayerJoined {
+                            zone,
+                            via: JoinVia::Handoff,
+                            from_zone: Some(from.to_string()),
+                        },
+                    );
                     hook!(self.on_handoff_join(player, from, carried));
                 } else {
+                    self.core.emit_lifecycle(
+                        player,
+                        PlayerJoined {
+                            zone,
+                            via: JoinVia::Rejoin,
+                            from_zone: None,
+                        },
+                    );
                     hook!(self.on_rejoin(player));
                 }
                 Joined {
@@ -1032,6 +1183,7 @@ impl<Z: Zone> ZoneHost<Z> {
                             id: player,
                             principal: claims.principal.clone(),
                             name: claims.name.clone(),
+                            extensions: claims.extensions.clone(),
                             capabilities,
                             connected: true,
                         },
@@ -1042,12 +1194,34 @@ impl<Z: Zone> ZoneHost<Z> {
                         reconnect_token: String::new(),
                         session_id: (self.token_source)(),
                         content_version: content_version.to_string(),
+                        transitions: 0,
                     },
                 );
                 self.bind_player(player, client, capabilities);
+                let zone = self.core.zone_id.clone();
                 match handoff.take() {
-                    Some((from, carried)) => hook!(self.on_handoff_join(player, from, carried)),
-                    None => hook!(self.on_join(player)),
+                    Some((from, carried)) => {
+                        self.core.emit_lifecycle(
+                            player,
+                            PlayerJoined {
+                                zone,
+                                via: JoinVia::Handoff,
+                                from_zone: Some(from.to_string()),
+                            },
+                        );
+                        hook!(self.on_handoff_join(player, from, carried));
+                    }
+                    None => {
+                        self.core.emit_lifecycle(
+                            player,
+                            PlayerJoined {
+                                zone,
+                                via: JoinVia::Ticket,
+                                from_zone: None,
+                            },
+                        );
+                        hook!(self.on_join(player));
+                    }
                 }
                 Joined {
                     client,
@@ -1064,6 +1238,7 @@ impl<Z: Zone> ZoneHost<Z> {
                             id: observer,
                             principal: claims.principal.clone(),
                             name: claims.name.clone(),
+                            extensions: claims.extensions.clone(),
                             capabilities,
                         },
                         client,
@@ -1147,9 +1322,13 @@ impl<Z: Zone> ZoneHost<Z> {
                 slot.content_version = version.to_string();
             }
         }
+        let zone = self.core.zone_id.clone();
+        self.core.emit_lifecycle(player, PlayerReconnected { zone });
+        hook!(self.on_reconnected(player));
         if reload {
             self.reload_player(player);
         }
+        self.process_kicks();
         Ok(Joined {
             client,
             viewer: Viewer::Player(player),
@@ -1177,7 +1356,19 @@ impl<Z: Zone> ZoneHost<Z> {
             self.core.clients.remove(&client);
             self.core.server_message(client, &message);
             self.core.outbound.push(Outbound::Close { client });
+            self.connection_lost(player, LostCause::Reload);
         }
+    }
+
+    /// Grace started: lifecycle fact, then [`Zone::on_connection_lost`].
+    fn connection_lost(&mut self, player: PlayerId, cause: LostCause) {
+        let lost = ConnectionLost {
+            zone: self.core.zone_id.clone(),
+            grace_ms: self.core.config.reconnect_grace.as_millis() as u64,
+            cause,
+        };
+        self.core.emit_lifecycle(player, lost);
+        hook!(self.on_connection_lost(player));
     }
 
     /// [`reload_player`](Self::reload_player) every connected player whose
@@ -1207,6 +1398,12 @@ impl<Z: Zone> ZoneHost<Z> {
             .players
             .get(&player)
             .map(|slot| slot.content_version.as_str())
+    }
+
+    /// Switch the remote config version ([`HostConfig::config_version`]);
+    /// facts and stamps produced afterwards carry it.
+    pub fn set_config_version(&mut self, version: impl Into<String>) {
+        self.core.config.config_version = version.into();
     }
 
     /// Switch the zone to a new content version
@@ -1308,6 +1505,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     p.info.connected = false;
                     p.inputs.clear();
                     p.grace_until = Some(self.core.clock.now() + self.core.config.reconnect_grace);
+                    self.connection_lost(player, LostCause::Dropped);
                 }
             }
             Viewer::Observer(observer) => self.remove_observer(observer, None),
@@ -1363,6 +1561,48 @@ impl<Z: Zone> ZoneHost<Z> {
     /// Send a typed event now (see [`Ctx::send`]).
     pub fn send<E: GameEvent>(&mut self, to: Viewer, event: &E) {
         self.send_event(to, event.event_id(), event.to_payload());
+    }
+
+    /// Deliver a service message ([`crate::inbox`]): a kick removes every
+    /// connection of the principal (players leave with
+    /// [`LeaveReason::Kicked`]), a game message runs
+    /// [`Zone::on_message`]. Call between ticks (the host is not ticking
+    /// while the caller holds `&mut self`).
+    pub fn deliver(&mut self, inbound: ZoneInbound<Z::Message>) -> Delivered {
+        let mut delivered = Delivered::default();
+        match inbound {
+            ZoneInbound::Kick { principal, reason } => {
+                let players: Vec<_> = self
+                    .core
+                    .players
+                    .values()
+                    .filter(|slot| slot.info.principal == principal)
+                    .map(|slot| slot.info.id)
+                    .collect();
+                delivered.players_kicked = players.len();
+                for player in players {
+                    self.core.pending_kicks.push((player, reason.clone()));
+                }
+                let observers: Vec<_> = self
+                    .core
+                    .observers
+                    .values()
+                    .filter(|slot| slot.info.principal == principal)
+                    .map(|slot| slot.info.id)
+                    .collect();
+                delivered.observers_kicked = observers.len();
+                let bye = ServerMessage::Kick {
+                    code: kick::BY_ZONE,
+                    message: reason,
+                };
+                for observer in observers {
+                    self.remove_observer(observer, Some(&bye));
+                }
+            }
+            ZoneInbound::Message(message) => hook!(self.on_message(message)),
+        }
+        self.process_kicks();
+        delivered
     }
 
     /// Kick a player now.
@@ -1486,6 +1726,19 @@ impl<Z: Zone> ZoneHost<Z> {
             self.core.outbound.push(Outbound::Close { client });
         }
         hook!(self.on_leave(player, reason));
+        if self.core.config.lifecycle_facts {
+            let zone = self.core.zone_id.clone();
+            let (principal, n) = (slot.info.principal, slot.transitions + 1);
+            match LeftReason::from_leave(reason) {
+                Some(reason) => {
+                    self.core
+                        .lifecycle(player, &principal, n, PlayerLeft { zone, reason })
+                }
+                None => self
+                    .core
+                    .lifecycle(player, &principal, n, PlayerDisconnected { zone }),
+            }
+        }
     }
 
     fn remove_observer(&mut self, observer: ObserverId, last: Option<&ServerMessage>) {
@@ -1505,8 +1758,10 @@ impl<Z: Zone> ZoneHost<Z> {
     }
 
     fn process_kicks(&mut self) {
-        while let Some((player, message)) = self.core.pending_handoffs.pop() {
+        while let Some((player, message, departed_at_ms)) = self.core.pending_handoffs.pop() {
+            self.core.pinned_stamp_ms = Some(departed_at_ms);
             self.remove_player(player, LeaveReason::Handoff, Some(message));
+            self.core.pinned_stamp_ms = None;
         }
         while let Some((player, message)) = self.core.pending_kicks.pop() {
             let kick = ServerMessage::Kick {
@@ -1619,9 +1874,17 @@ impl<Z: Zone> ZoneHost<Z> {
         }
     }
 
-    fn patch(&mut self) {
+    /// This patch's replicated world: every registered entity collection's
+    /// projected views ([`Zone::entities`]), then [`Zone::replicate`].
+    pub fn world_view(&self) -> WorldView {
         let mut view = WorldView::default();
+        self.entities.project(&self.zone, &mut view);
         self.zone.replicate(&mut view);
+        view
+    }
+
+    fn patch(&mut self) {
+        let view = self.world_view();
         let core = &mut self.core;
         self.pending.entities = Some(view.entities().len());
         let world = EncodedWorld::build(&self.schema, view, &core.config.interest);
@@ -1670,6 +1933,7 @@ impl<Z: Zone> ZoneHost<Z> {
         let now = self.core.clock.now();
         let elapsed = now.saturating_sub(self.last_advance);
         self.last_advance = now;
+        self.core.flush_lifecycle();
 
         let expired: Vec<_> = self
             .core

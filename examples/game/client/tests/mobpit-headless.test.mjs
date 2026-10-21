@@ -1,8 +1,9 @@
 /**
- * Headless Mob Pit (Node, real `game-demos mobpit` binary): join → profile
- * read from the Crawler cell → kill a mob → the fact settles ("saved") with
- * server-decided XP → slow storage makes the settlement wait while the tick
- * stays flat → restart the server on the same data dir → XP is still there.
+ * Headless Mob Pit (Node, real `game-demos mobpit` binary on its own
+ * `celld dev`): join → profile read from the celld Crawler cell → kill a mob
+ * → the fact settles ("saved") with server-decided XP → slow storage makes
+ * the settlement wait while the tick stays flat → restart the server → XP is
+ * still there.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -10,16 +11,14 @@ import test from 'node:test';
 import { isPit, pitFields } from '../src/generated/mobpit/index.ts';
 import { createMobPitClient, MobPitApi } from '../src/mobpit/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
-import { memoryStorage, startDemo, until } from './helpers/demo-server.mjs';
-import { hunt, tempDataDir } from './helpers/mobpit.mjs';
+import { eventually, memoryStorage, until } from './helpers/demo-server.mjs';
+import { hunt, startPit } from './helpers/mobpit.mjs';
 
 const XP = new Set([10, 25, 60]);
 
 test('kills become durable facts without stalling the tick, and survive a restart', { timeout: 600_000 }, async () => {
-	const dataDir = tempDataDir();
-	const env = { MOBPIT_DATA_DIR: dataDir };
 	const storage = memoryStorage();
-	let server = await startDemo('mobpit', { env });
+	const server = await startPit('mobpit');
 	const clients = [];
 	try {
 		const api = new DevApi({ base: server.httpUrl, name: () => 'Hunter', storage });
@@ -77,8 +76,7 @@ test('kills become durable facts without stalling the tick, and survive a restar
 		// the guest token stays valid (secret persisted in the data dir) and
 		// the profile is read back from the cell.
 		pit.client.close();
-		await server.stop();
-		server = await startDemo('mobpit', { env });
+		await server.restart();
 		const again = createMobPitClient({ api: new DevApi({ base: server.httpUrl, storage }), base: server.httpUrl });
 		clients.push(again.client);
 		await again.client.connect('pit-1');
@@ -86,8 +84,15 @@ test('kills become durable facts without stalling the tick, and survive a restar
 		assert.equal(again.profile().source, 'cell');
 		assert.equal(again.profile().kills, before.kills);
 		assert.equal(again.profile().xp, before.xp);
-		const crawlers = (await new MobPitApi(server.httpUrl).crawlers()).crawlers;
-		assert.equal(crawlers.length, 1);
+		// The crawler list is a projection of the cells' kill events.
+		const crawlers = await eventually(
+			async () => {
+				const { crawlers } = await new MobPitApi(server.httpUrl).crawlers();
+				return crawlers.length === 1 && crawlers[0].kills === kills.length && crawlers;
+			},
+			15_000,
+			'crawler directory'
+		);
 		assert.equal(crawlers[0].kills, kills.length);
 	} finally {
 		for (const c of clients) c.close();

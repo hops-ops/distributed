@@ -21,6 +21,8 @@ pub struct ArenaConfig {
     pub reject_principal: Option<String>,
     pub background: bool,
     pub spawn_every: Option<Duration>,
+    /// Allocation payload handed over by the zone factory.
+    pub allocation: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,10 @@ pub struct Arena {
     pub ticks: u64,
     pub timer_fires: u64,
     pub tiers: Vec<(Tier, Tier)>,
+    /// Extension claims seen by `on_auth`.
+    pub auth_extensions: Vec<distributed_game::TicketExtensions>,
+    /// `lost:{player}` / `back:{player}` from the connection hooks.
+    pub connection_events: Vec<String>,
 }
 
 impl Arena {
@@ -77,6 +83,7 @@ impl Zone for Arena {
     type Config = ArenaConfig;
     type Input = (i8, i8);
     type Timer = ArenaTimer;
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         let pos = FieldType::QuantF32 {
@@ -114,10 +121,13 @@ impl Zone for Arena {
             ticks: 0,
             timer_fires: 0,
             tiers: Vec::new(),
+            auth_extensions: Vec::new(),
+            connection_events: Vec::new(),
         }
     }
 
     fn on_auth(&mut self, _ctx: &mut Ctx<'_, Self>, req: &JoinRequest<'_>) -> Admission {
+        self.auth_extensions.push(req.claims.extensions.clone());
         if self.cfg.reject_principal.as_deref() == Some(req.claims.principal.as_str()) {
             return Admission::Reject("banned".into());
         }
@@ -144,6 +154,14 @@ impl Zone for Arena {
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId, reason: LeaveReason) {
         self.avatars.remove(&player);
         self.log.push(format!("leave:{reason:?}"));
+    }
+
+    fn on_connection_lost(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        self.connection_events.push(format!("lost:{}", player.0));
+    }
+
+    fn on_reconnected(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        self.connection_events.push(format!("back:{}", player.0));
     }
 
     fn on_observe(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {

@@ -90,6 +90,18 @@ test('every event encodes and decodes like Rust', () => {
 	assert.throws(() => gen.EVENTS.hello.decode(fromHex('01')));
 });
 
+test('zone inbox messages encode and decode like Rust', () => {
+	assert.ok(fixture.messages.length > 0);
+	for (const sample of fixture.messages) {
+		const name = camel(sample.name);
+		assert.equal(gen.MESSAGE[name], sample.id);
+		const { typeId, payload } = gen.encodeMessage(name, sample.value);
+		assert.equal(typeId, sample.id);
+		assert.equal(toHex(payload), sample.hex, `${sample.name} encodes`);
+		assert.deepEqual(normalize(gen.MESSAGES[name].decode(fromHex(sample.hex))), normalize(sample.value));
+	}
+});
+
 test('kinds, typed field accessors and correction defaults follow the surface', () => {
 	const surface = fixture.surface;
 	for (const kind of surface.kinds) assert.equal(gen.KIND[camel(kind.name)], kind.id);

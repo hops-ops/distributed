@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use distributed_game::net::{GameServer, ServerConfig};
+use distributed_game::net::{GameServer, ServerConfig, ZoneFactory};
 use distributed_game::rewind::{Historic, HitQuery, RewindFrame, ShotTiming, Vec3};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EntitySchema, FieldType, GameEvent, GameInput, GameRecord,
@@ -484,6 +484,7 @@ impl Zone for Gallery {
     type Config = GalleryConfig;
     type Input = ShotInput;
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         schema![ShooterView, TargetView]
@@ -622,10 +623,14 @@ impl Demo for GalleryDemo {
 
     fn server(mut config: ServerConfig, guests: Guests) -> GameServer<Gallery> {
         config.host.rewind.max_rewind = Duration::from_millis(MAX_REWIND_MS);
-        GameServer::new(config, move |zone_id| {
-            Self::hosts_zone(zone_id).then(|| GalleryConfig {
-                guests: guests.clone(),
-            })
-        })
+        GameServer::new(
+            config,
+            ZoneFactory::sync(move |activation| {
+                let zone_id = activation.zone_id.as_str();
+                Self::hosts_zone(zone_id).then(|| GalleryConfig {
+                    guests: guests.clone(),
+                })
+            }),
+        )
     }
 }

@@ -164,6 +164,7 @@ where
     let err = repo
         .commit_batch(CommitBatch {
             inbox_receipts: Vec::new(),
+            schedules: Vec::new(),
             streams: vec![
                 StreamWrite::new(stale_identity, stale.entity_mut()),
                 StreamWrite::new(checkout_identity.clone(), checkout.entity_mut()),

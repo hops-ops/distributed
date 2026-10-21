@@ -1,0 +1,5 @@
+error: with `payload = ..` name the payload type: `outcome = Succeeded<P>` or `Eventual<P>`
+  --> tests/compile_fail/aggregate_command_payload_needs_type.rs:20:73
+   |
+20 |     #[command("hero.equip", shard = hero_id, load = required, outcome = eventual, payload = payload)]
+   |                                                                         ^^^^^^^^

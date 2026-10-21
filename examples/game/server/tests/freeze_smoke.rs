@@ -19,7 +19,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const SECRET: &str = "freeze-smoke-secret";
 const ADMIN: &str = "freeze-smoke-admin";
 
-async fn world() -> (WorldHost, WorldHost, Vec<tokio::sync::oneshot::Sender<()>>) {
+async fn world() -> (
+    WorldHost,
+    WorldHost,
+    Vec<tokio::sync::oneshot::Sender<()>>,
+    game_demos::devcelld::DevCelld,
+) {
+    // Both hosts' facts go to one private `celld dev`.
+    let celld = game_demos::devcelld::DevCelld::start(None)
+        .unwrap_or_else(|error| panic!("celld dev: {error}"));
     let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = HostAddr::new("alpha", la.local_addr().unwrap().to_string());
@@ -38,6 +46,7 @@ async fn world() -> (WorldHost, WorldHost, Vec<tokio::sync::oneshot::Sender<()>>
             dev: true,
             stage: Duration::from_millis(600),
             ack_timeout: Duration::from_millis(800),
+            celld: celld.options(),
         };
         hosts.push(
             start_host(listener, spec, async move {
@@ -48,7 +57,7 @@ async fn world() -> (WorldHost, WorldHost, Vec<tokio::sync::oneshot::Sender<()>>
     }
     let b = hosts.pop().unwrap();
     let a = hosts.pop().unwrap();
-    (a, b, stops)
+    (a, b, stops, celld)
 }
 
 /// Minimal HTTP/1.1 client: `(status, JSON body or Null)`.
@@ -129,7 +138,7 @@ async fn dropped(host: &WorldHost, zone: &str) -> u64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rollout_spans_both_hosts_drops_frozen_inputs_and_stamps_the_new_version() {
-    let (a, b, stops) = world().await;
+    let (a, b, stops, celld) = world().await;
     let ws_a = format!("ws://{}", a.addr);
     let ws_b = format!("ws://{}", b.addr);
 
@@ -206,6 +215,17 @@ async fn rollout_spans_both_hosts_drops_frozen_inputs_and_stamps_the_new_version
             .any(|f| f.command() == "freeze.content_applied"
                 && f.stamp().zone_id == zone
                 && f.stamp().content_version == "v2"));
+        // Durable in the zone's celld content-log cell.
+        let log: Value = reqwest::Client::new()
+            .get(format!("{}/content-log/{zone}", celld.url()))
+            .header("x-distributed-internal-secret", celld.secret())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(log["switches"][0]["to"], "v2", "{zone}: {log}");
     }
     let (_, pack) = content(a.addr, "current").await;
     assert_eq!(pack.unwrap().hazard, Hazard::Ice);
@@ -219,7 +239,7 @@ async fn rollout_spans_both_hosts_drops_frozen_inputs_and_stamps_the_new_version
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stuck_zone_aborts_and_everyone_resumes_on_the_old_version() {
-    let (a, b, stops) = world().await;
+    let (a, b, stops, _celld) = world().await;
     // The stuck toggle is forwarded to the host owning the zone.
     let (status, reply) = http(
         a.addr,

@@ -20,11 +20,16 @@ import test from 'node:test';
 import { compile, compileModule } from 'svelte/compiler';
 import { render } from 'svelte/server';
 
-import { createGameTicketHandler, mintGameTicket } from '@hops-ops/distributed/sveltekit/game/server';
+import {
+	TRUSTED_FIELD_DENYLIST,
+	createGameTicketHandler,
+	mintGameTicket
+} from '@hops-ops/distributed/sveltekit/game/server';
 import { createGameState, gameTicketSource } from '@hops-ops/distributed/sveltekit/game';
 
 const FIXTURE = new URL('../../distributed_game/tests/fixtures/sveltekit_tickets.json', import.meta.url);
 const SECRET = 'sveltekit-fixture-secret-0123456789abcdef';
+const DENYLIST = new URL('../../distributed_game/tests/fixtures/trusted_field_denylist.json', import.meta.url);
 const TMP = fileURLToPath(new URL('./.tmp-sveltekit-game/', import.meta.url));
 
 const decodeClaims = (ticket) => JSON.parse(Buffer.from(ticket.split('.')[1], 'base64url').toString('utf8'));
@@ -60,6 +65,11 @@ async function fixtureTickets() {
 	const forgedClaims = Buffer.from(JSON.stringify({
 		sub: 'admin', zone: 'z-sveltekit', exp: 4_000_000_000, nonce: 'fixture-tampered', role: 'player'
 	})).toString('base64url');
+	const extended = await mintGameTicket({
+		secret: SECRET, principal: 'session-user-3', zone: 'z-sveltekit',
+		ttlSeconds: 300, now: future, nonce: 'fixture-extended',
+		extensions: { match_id: 'm-7', team: 2 }
+	});
 	const otherKey = await mintGameTicket({
 		secret: 'a-different-secret-0123456789abcdef!!', principal: 'session-user-1', zone: 'z-sveltekit',
 		ttlSeconds: 300, now: future, nonce: 'fixture-other-key'
@@ -69,6 +79,7 @@ async function fixtureTickets() {
 		zone: 'z-sveltekit',
 		valid: { ticket: valid.ticket, principal: 'session-user-1', name: 'Ana', exp: 4_000_000_000, nonce: 'fixture-valid' },
 		observer: { ticket: observer.ticket, principal: 'session-user-2' },
+		extended: { ticket: extended.ticket, principal: 'session-user-3', ext: { match_id: 'm-7', team: 2 } },
 		expired: expired.ticket,
 		wrongZone: wrongZone.ticket,
 		tampered: `${h}.${forgedClaims}.${s}`,
@@ -90,6 +101,55 @@ test('mintGameTicket is the PROTOCOL.md §8 format the Rust GameServer admits (f
 	assert.ok(signatureValid(tickets.valid.ticket, SECRET));
 	assert.ok(!signatureValid(tickets.tampered, SECRET));
 	assert.equal(decodeClaims(tickets.observer.ticket).role, 'observer');
+});
+
+test('extension claims: server-only, deny list shared with the Rust derives', async () => {
+	const fixture = JSON.parse(readFileSync(DENYLIST, 'utf8'));
+	assert.deepEqual([...TRUSTED_FIELD_DENYLIST], [...fixture.identity, ...fixture.reward, ...fixture.economy]);
+	const secret = SECRET;
+	const minted = await mintGameTicket({ secret, principal: 'p', zone: 'z', extensions: { match_id: 'm', team: 1 } });
+	assert.deepEqual(decodeClaims(minted.ticket).ext, { match_id: 'm', team: 1 });
+	const none = await mintGameTicket({ secret, principal: 'p', zone: 'z', extensions: {} });
+	assert.equal('ext' in decodeClaims(none.ticket), false);
+	for (const name of ['userId', 'Gold', 'pay_out', 'XP', 'sub', 'owner-id']) {
+		await assert.rejects(
+			mintGameTicket({ secret, principal: 'p', zone: 'z', extensions: { [name]: 1 } }),
+			/identity, a reward or an economy value/,
+			name
+		);
+	}
+	await assert.rejects(mintGameTicket({ secret, principal: 'p', zone: 'z', extensions: ['m'] }), /plain JSON object/);
+	await assert.rejects(mintGameTicket({ secret, principal: 'p', zone: 'z', extensions: { at: new Date() } }), /plain JSON object/);
+	await assert.rejects(mintGameTicket({ secret, principal: 'p', zone: 'z', extensions: { 'match id': 1 } }), /identifier/);
+	await assert.rejects(
+		mintGameTicket({ secret, principal: 'p', zone: 'z', extensions: { blob: 'x'.repeat(2100) } }),
+		/exceed 2048 bytes/
+	);
+});
+
+test('ticket handler: claims() adds server-side extensions; the browser body cannot', async () => {
+	const contexts = [];
+	const { call } = harness({
+		claims: (context) => {
+			contexts.push(context);
+			return { match_id: `match-of-${context.principal}`, team: 2 };
+		}
+	});
+	const body = await expectStatus(call({ body: { zone: 'pit-u1' } }), 200);
+	assert.deepEqual(decodeClaims(body.ticket).ext, { match_id: 'match-of-u1', team: 2 });
+	assert.equal(contexts[0].zone, 'pit-u1');
+	assert.equal(contexts[0].principal, 'u1');
+
+	// Claims are never request fields, whatever they are called.
+	for (const field of ['ext', 'claims', 'extensions', 'match_id', 'team']) {
+		const fresh = harness({ claims: () => ({ team: 1 }) });
+		await expectStatus(fresh.call({ body: { zone: 'pit-u1', [field]: { team: 9 } } }), 400, 'unexpected_field');
+	}
+	// No callback: no ext claim at all.
+	const plain = await expectStatus(harness().call({}), 200);
+	assert.equal('ext' in decodeClaims(plain.ticket), false);
+	// A callback returning a denied name is refused, not signed.
+	await expectStatus(harness({ claims: () => ({ gold: 100 }) }).call({}), 400, 'invalid_claims');
 });
 
 test('mintGameTicket rejects short secrets and malformed claims', async () => {

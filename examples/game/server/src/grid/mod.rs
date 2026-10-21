@@ -18,7 +18,8 @@
 //!   ring ([`HashRing`]); a Hello for a foreign zone gets `Redirect`, a
 //!   handoff into it reserves the transfer ticket with the issuing host.
 //! - **Hibernation**: a zone nobody is in or observing turns Dormant, then
-//!   hibernates into SQLite (critter positions and dropped markers) and
+//!   hibernates into its `zone-state/{zone}` celld cell (critter positions
+//!   and dropped markers; large snapshots in the cell's R2 bucket) and
 //!   restores on the next activation; its hello says `restored`.
 //!
 //! Zone ids: `grid.<x>.<y>` with canonical integers, |x|, |y| ≤ 1 000 000.
@@ -47,7 +48,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use distributed_game::net::{GameServer, ServerConfig};
+use distributed_game::net::{GameServer, ServerConfig, ZoneFactory};
 use distributed_game::world::{FlatTopology, HashRing, HostAddr, ZoneDirectory};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EntitySchema, GameEvent, GameInput, GameSurface, LeaveReason,
@@ -55,7 +56,7 @@ use distributed_game::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cluster::{ClusterDemo, ClusterOptions, World};
+use crate::cluster::{ClusterDemo, World};
 use crate::common::{Demo, Guests};
 use world::{MoveInput, Prop, CELL, POS};
 
@@ -404,6 +405,7 @@ impl Zone for GridZone {
     type Config = GridConfig;
     type Input = MoveInput;
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         schema![WalkerView, CritterView, MarkerView]
@@ -625,8 +627,11 @@ impl Demo for GridDemo {
     /// Single host (used by `common::spawn`); `game-demos grid` runs
     /// [`crate::cluster::run_cluster`] instead.
     fn server(config: ServerConfig, guests: Guests) -> GameServer<GridZone> {
-        let options = ClusterOptions::single("local", std::time::Duration::from_secs(4));
-        let world = crate::cluster::World::standalone::<Self>(&options, guests);
+        let world = crate::cluster::World::standalone::<Self>(
+            "local",
+            std::time::Duration::from_secs(4),
+            guests,
+        );
         Self::cluster_server(config, &world)
     }
 }
@@ -643,14 +648,18 @@ impl ClusterDemo for GridDemo {
         config.host.max_observers = 64;
         let guests = world.guests.clone();
         let host_id = world.host.id.clone();
-        GameServer::new(config, move |zone_id| {
-            world::parse_zone(zone_id).map(|cell| GridConfig {
-                guests: guests.clone(),
-                host_id: host_id.clone(),
-                seed,
-                cell,
-            })
-        })
+        GameServer::new(
+            config,
+            ZoneFactory::sync(move |activation| {
+                let zone_id = activation.zone_id.as_str();
+                world::parse_zone(zone_id).map(|cell| GridConfig {
+                    guests: guests.clone(),
+                    host_id: host_id.clone(),
+                    seed,
+                    cell,
+                })
+            }),
+        )
         .with_topology(Arc::new(FlatTopology))
     }
 

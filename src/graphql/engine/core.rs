@@ -274,6 +274,8 @@ pub(crate) struct EngineInner {
     pub(crate) read_stores: BTreeMap<String, crate::graphql::read_store::ReadStoreKind>,
     pub(crate) cell_getters:
         BTreeMap<String, std::sync::Arc<dyn crate::graphql::read_store::CellByKeyGetter>>,
+    /// Leaderboard stores by surface name ([`GraphqlEngineBuilder::leaderboard`]).
+    pub(crate) leaderboard_stores: BTreeMap<String, Arc<dyn crate::leaderboard::LeaderboardStore>>,
 }
 
 pub struct GraphqlEngine {
@@ -325,4 +327,8 @@ pub struct GraphqlEngineBuilder {
     pub(crate) pending_errors: Vec<String>,
     pub(crate) identity: IdentityConfig,
     pub(crate) read_stores: BTreeMap<String, crate::graphql::read_store::ReadStore>,
+    pub(crate) leaderboards: Vec<(
+        crate::graphql::surface::LeaderboardSurface,
+        Arc<dyn crate::leaderboard::LeaderboardStore>,
+    )>,
 }

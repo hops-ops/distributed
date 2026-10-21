@@ -26,10 +26,23 @@
 # Env: GAME_DEMOS_PORT (server, default 2567), GAME_DEMOS_CLIENT_PORT (Vite,
 # default 5173), DG_NET_LATENCY_MS / DG_NET_JITTER_MS / DG_NET_LOSS (initial
 # server NetSim; the HUD sliders change it live), MOBPIT_DATA_DIR (Mob Pit /
-# Leaderboard cells, default examples/game/.data/mobpit), REDIS_URL (Redis
-# leaderboard instead of in-memory), SVELTEKIT_PORT (SvelteKit demo, default
-# 5573; its game server uses GAME_DEMOS_PORT, default 2967 there, and its
-# read-model service MOBPIT_SERVICE_PORT, default GAME_DEMOS_PORT + 2).
+# Leaderboard local files and their `celld dev` state, default
+# examples/game/.data/mobpit), REDIS_URL (Redis leaderboard instead of
+# in-memory; required by `sveltekit` and `smoke`, whose SvelteKit
+# leaderboard is the Redis board served through GraphQL), SVELTEKIT_PORT (SvelteKit demo, default 5573; its game server
+# uses GAME_DEMOS_PORT, default 2967 there, and its read-model service
+# MOBPIT_SERVICE_PORT, default GAME_DEMOS_PORT + 2).
+#
+# celld: the demos' durable cells (examples/game/cells: Mob Pit's Crawler
+# and presence cells, The Freeze's gem and content cells, every
+# multi-host demo's zone leases and hibernation snapshots) run on celld,
+# never natively; state persists in .data/<demo>/celld (Mob Pit:
+# MOBPIT_DATA_DIR/celld). CELLD_BIN names the binary (default: `celld` on
+# PATH; the version pinned in .celld-version, checked by
+# scripts/celld.sh), CELLD_PORT its port (default
+# GAME_DEMOS_PORT + 3; cluster demos GAME_DEMOS_PORT + 4),
+# CELLD_ESBUILD its bundler (default: the client's esbuild). The worker is
+# built with worker-build (`cargo install worker-build --locked`).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,7 +52,11 @@ CLIENT="$HERE/client"
 SVELTEKIT="$HERE/sveltekit"
 BIN="$SERVER/target/debug/game-demos"
 SERVICE_BIN="$SERVER/target/debug/mobpit-service"
+CELLS="$HERE/cells"
 DEMOS=(arena mobpit leaderboard gallery freeze grid ripple)
+# Single-process demos whose durable state lives in celld cells (the
+# multi-host ones always run on celld too: zone leases and hibernation).
+CELLD_DEMOS=(mobpit leaderboard freeze)
 export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
 # Multi-host demos: `game-demos <demo> --host-id A|B --peer …`.
 CLUSTER_DEMOS=(grid ripple)
@@ -77,6 +94,83 @@ ensure_sveltekit() {
 		log "installing SvelteKit demo dependencies (npm ci)"
 		(cd "$SVELTEKIT" && npm ci --no-audit --no-fund)
 	fi
+}
+
+# ensure_celld: resolve CELLD_BIN (the pinned celld, `.celld-version`) and
+# CELLD_ESBUILD. scripts/celld.sh prints the upgrade command on a mismatch.
+ensure_celld() {
+	CELLD_BIN="$("$REPO/scripts/celld.sh" check "${CELLD_BIN:-}")" || exit 1
+	if [[ -z "${CELLD_ESBUILD:-}" ]]; then
+		ensure_client
+		CELLD_ESBUILD="$CLIENT/node_modules/.bin/esbuild"
+	fi
+	export CELLD_BIN CELLD_ESBUILD
+}
+
+# ensure_cells: build the demos' cells worker (examples/game/cells) when its
+# sources changed.
+ensure_cells() {
+	local marker="$CELLS/build/worker/shim.mjs"
+	if [[ ! -f "$marker" ]] || [[ -n "$(find "$CELLS/src" "$CELLS/Cargo.toml" "$SERVER/crawler" "$REPO/src" "$REPO/distributed_game/src" -newer "$marker" -name '*.rs' -print -quit 2>/dev/null)" ]] ||
+		[[ "$CELLS/Cargo.toml" -nt "$marker" ]]; then
+		command -v worker-build >/dev/null || {
+			echo "worker-build not found: cargo install worker-build --locked" >&2
+			exit 1
+		}
+		log "building the demos' cells worker (worker-build)"
+		(cd "$CELLS" && worker-build --release >/dev/null)
+	fi
+}
+
+# kill_tree <pid>: stop a process and every descendant (celld dev starts its
+# node in a session of its own, so collect the tree while the root is stopped).
+kill_tree() {
+	local root="$1" pids=() frontier=("$1") next pid
+	kill -STOP "$root" 2>/dev/null || return 0
+	while ((${#frontier[@]})); do
+		next=()
+		for pid in "${frontier[@]}"; do
+			pids+=("$pid")
+			while read -r child; do next+=("$child"); done < <(pgrep -P "$pid" 2>/dev/null || true)
+		done
+		frontier=("${next[@]+"${next[@]}"}")
+	done
+	kill -KILL "${pids[@]}" 2>/dev/null || true
+}
+
+# start_celld <project> <port> <relay port>: `celld dev` with the cells
+# worker in <project> (its state persists in <project>/.celld/dev), relaying
+# the outbox Queue to the game server on <relay port>. Sets CELLD_PID,
+# CELLD_URL and DISTRIBUTED_INTERNAL_SECRET (persisted in the project).
+start_celld() {
+	local project="$1" port="$2" relay_port="$3"
+	ensure_celld
+	ensure_cells
+	mkdir -p "$project"
+	rm -rf "$project/build"
+	cp -R "$CELLS/build" "$project/build"
+	cp "$CELLS/wrangler.jsonc" "$project/wrangler.jsonc"
+	if [[ ! -s "$project/internal-secret" ]]; then
+		(umask 077 && printf 'test-only-%s' "$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')" >"$project/internal-secret")
+	fi
+	DISTRIBUTED_INTERNAL_SECRET="$(cat "$project/internal-secret")"
+	printf 'DISTRIBUTED_INTERNAL_SECRET=%s\nCELLD_QUEUE_RELAY_URL=http://127.0.0.1:%s/internal/celld-queue/relay\n' \
+		"$DISTRIBUTED_INTERNAL_SECRET" "$relay_port" >"$project/.dev.vars"
+	log "starting celld dev on :$port ($("$CELLD_BIN" --version 2>/dev/null | grep '^celld ' | head -1); state in $project/.celld/dev)"
+	RUST_LOG=warn "$CELLD_BIN" dev "$project" --host 127.0.0.1 --port "$port" --no-watch --logs >"$project/celld.log" 2>&1 &
+	CELLD_PID=$!
+	CELLD_URL="http://127.0.0.1:$port"
+	for _ in $(seq 1 300); do
+		curl -fsS "$CELLD_URL/health" >/dev/null 2>&1 && break
+		if ! kill -0 "$CELLD_PID" 2>/dev/null; then
+			tail -20 "$project/celld.log"
+			echo "celld dev failed to start" >&2
+			exit 1
+		fi
+		sleep 0.2
+	done
+	curl -fsS "$CELLD_URL/health" >/dev/null || { tail -20 "$project/celld.log"; echo "celld dev not ready" >&2; exit 1; }
+	export CELLD_URL DISTRIBUTED_INTERNAL_SECRET
 }
 
 ensure_server() {
@@ -147,11 +241,17 @@ run_demo() {
 	ensure_server
 	ensure_wasm
 
+	CELLD_PID=""
+	if [[ " ${CELLD_DEMOS[*]} " == *" $demo "* ]]; then
+		local project="$HERE/.data/$demo/celld"
+		[[ "$demo" == mobpit || "$demo" == leaderboard ]] && project="$MOBPIT_DATA_DIR/celld"
+		start_celld "$project" "${CELLD_PORT:-$((port + 3))}" "$port"
+	fi
 	local log_file
 	log_file="$(mktemp -t game-demos.XXXXXX)"
 	"$BIN" "$demo" --dev --port "$port" >"$log_file" 2>&1 &
 	local server_pid=$!
-	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; rm -f "$log_file"' EXIT INT TERM
+	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; [[ -z "$CELLD_PID" ]] || kill_tree "$CELLD_PID"; rm -f "$log_file"' EXIT INT TERM
 	for _ in $(seq 1 100); do
 		grep -q '^LISTENING' "$log_file" && break
 		if ! kill -0 "$server_pid" 2>/dev/null; then
@@ -192,24 +292,29 @@ run_cluster() {
 	ensure_server
 	ensure_wasm
 
+	# Zone leases and hibernation snapshots live in celld (shared by both
+	# hosts); its state persists in .data/<demo>/celld.
+	start_celld "$HERE/.data/$demo/celld" "${CELLD_PORT:-$((port_a + 4))}" "$port_a"
 	local dir secret
 	dir="$(mktemp -d "${TMPDIR:-/tmp}/game-demos-$demo.XXXXXX")"
 	# Both hosts must share the ticket secret (and derive the admin secret).
 	secret="${DISTRIBUTED_GAME_SECRET:-$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')}"
+	# The relay lands on host A; both hosts share the projection bus and keep
+	# their zone status read models in .data/<demo>.
 	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_a" --host-id A \
-		--peer "B=127.0.0.1:$port_b" --state-dir "$dir" >"$dir/A.log" 2>&1 &
+		--peer "B=127.0.0.1:$port_b" --data-dir "$HERE/.data/$demo" >"$dir/A.log" 2>&1 &
 	local pid_a=$!
 	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port_b" --host-id B \
-		--peer "A=127.0.0.1:$port_a" --state-dir "$dir" >"$dir/B.log" 2>&1 &
+		--peer "A=127.0.0.1:$port_a" --data-dir "$HERE/.data/$demo" >"$dir/B.log" 2>&1 &
 	local pid_b=$!
-	trap 'kill "$pid_a" "$pid_b" 2>/dev/null || true; wait "$pid_a" "$pid_b" 2>/dev/null || true; rm -rf "$dir"' EXIT INT TERM
+	trap 'kill "$pid_a" "$pid_b" 2>/dev/null || true; wait "$pid_a" "$pid_b" 2>/dev/null || true; kill_tree "$CELLD_PID"; rm -rf "$dir"' EXIT INT TERM
 	wait_listening "$dir/A.log" "$pid_a" "game-demos $demo host A"
 	wait_listening "$dir/B.log" "$pid_b" "game-demos $demo host B"
 	sed -n '2p' "$dir/A.log"
 	sed -n '2p' "$dir/B.log"
 	echo
 	log "open  http://localhost:$client_port/$demo/   (hosts A :$port_a, B :$port_b, dev routes ON — local only)"
-	log "snapshots in $dir (removed on exit)"
+	log "zone leases and hibernation snapshots in celld ($CELLD_URL); host logs in $dir (removed on exit)"
 	echo
 	cd "$CLIENT"
 	GAME_DEMOS_SERVER="http://127.0.0.1:$port_a" GAME_DEMOS_CLIENT_PORT="$client_port" npx vite
@@ -232,12 +337,25 @@ api_keys() {
 	API_JWKS="$(sed -n 2p <<<"$keys")"
 }
 
+# require_redis: the SvelteKit demo's leaderboard is the Redis board the
+# zone server writes and mobpit-service serves (REDIS_URL).
+require_redis() {
+	if [[ -z "${REDIS_URL:-}" ]]; then
+		echo "REDIS_URL is required: the SvelteKit leaderboard is the Redis board" >&2
+		echo "  (docker compose up -d redis at the repo root, then REDIS_URL=redis://127.0.0.1:6379)" >&2
+		exit 1
+	fi
+}
+
 # The SvelteKit demo: the Mob Pit zone server (publishing Crawler domain
-# events to a SQLite bus), then `distributed dev server/`, which generates
-# the `$distributed` GraphQL client, runs mobpit-service (the player_stats
-# read model, GraphQL @live) and `vite dev` (the Vite plugin also generates
-# src/lib/generated/mobpit and its WASM on start and on Rust changes).
+# events and board change notices to a SQLite bus, kills into the Redis
+# boards), then `distributed dev server/`, which generates the
+# `$distributed` GraphQL client, runs mobpit-service (the player_stats read
+# model and the Redis boards, GraphQL @live) and `vite dev` (the Vite plugin
+# also generates src/lib/generated/mobpit and its WASM on start and on Rust
+# changes).
 run_sveltekit() {
+	require_redis
 	local port="${GAME_DEMOS_PORT:-2967}"
 	local ui_port="${SVELTEKIT_PORT:-5573}"
 	local service_port="${MOBPIT_SERVICE_PORT:-$((port + 2))}"
@@ -247,13 +365,15 @@ run_sveltekit() {
 	ensure_server
 	ensure_cli
 	mkdir -p "$data"
+	start_celld "$data/celld" "${CELLD_PORT:-$((port + 3))}" "$port"
 	local log_file secret
 	log_file="$(mktemp -t game-demos-sveltekit.XXXXXX)"
 	secret="${DISTRIBUTED_GAME_SECRET:-$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')}"
 	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" mobpit --port "$port" \
-		--data-dir "$data" --projection-bus "sqlite:$data/bus.db" >"$log_file" 2>&1 &
+		--data-dir "$data" --projection-bus "sqlite:$data/bus.db" \
+		--redis-url "$REDIS_URL" >"$log_file" 2>&1 &
 	local server_pid=$!
-	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; rm -f "$log_file"' EXIT INT TERM
+	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; kill_tree "$CELLD_PID"; rm -f "$log_file"' EXIT INT TERM
 	wait_listening "$log_file" "$server_pid" "game-demos mobpit"
 	api_keys
 	echo
@@ -275,11 +395,22 @@ run_sveltekit() {
 smoke() {
 	ensure_sdk
 	ensure_client
+	# The celld-backed tests (Mob Pit, The Freeze, grid, ripple) start their
+	# own `celld dev` (CELLD_BIN) on the cells worker.
+	ensure_celld
+	ensure_cells
+	# The SvelteKit test's leaderboard is the Redis board. Only that test gets
+	# REDIS_URL: the other demos' tests expect their in-memory boards.
+	require_redis
+	local sveltekit_redis="$REDIS_URL"
+	unset REDIS_URL
 	log "generated clients are current; predicted steps and pure functions compiled to WASM"
 	gen --check
 	log "server: fmt, clippy, tests (bots smoke)"
 	cargo fmt --manifest-path "$SERVER/Cargo.toml" --check -p game_demos -p game_sim -p mobpit_crawler -p mobpit_service
+	cargo fmt --manifest-path "$CELLS/Cargo.toml" --check
 	cargo clippy --quiet --manifest-path "$SERVER/Cargo.toml" --workspace --all-targets -- -D warnings
+	cargo clippy --quiet --manifest-path "$CELLS/Cargo.toml" --target wasm32-unknown-unknown -- -D warnings
 	cargo test --quiet --manifest-path "$SERVER/Cargo.toml" --workspace
 	cargo build --quiet --manifest-path "$SERVER/Cargo.toml" --workspace --bins
 	log "client: type-check, build, tests (WASM steps + pure functions exact match, headless SDK)"
@@ -293,7 +424,7 @@ smoke() {
 	"$CLI" build "$SERVER" >"$build_log" 2>&1 || { cat "$build_log"; rm -f "$build_log"; exit 1; }
 	rm -f "$build_log"
 	(cd "$SVELTEKIT" && npx playwright install chromium >/dev/null &&
-		GAME_DEMOS_BIN="$BIN" MOBPIT_SERVICE_BIN="$SERVICE_BIN" npm test --silent)
+		REDIS_URL="$sveltekit_redis" GAME_DEMOS_BIN="$BIN" MOBPIT_SERVICE_BIN="$SERVICE_BIN" npm test --silent)
 	log "smoke OK"
 }
 
@@ -302,7 +433,7 @@ case "${1:-}" in
 	gen) gen "${2:-}" ;;
 	sveltekit) run_sveltekit ;;
 	list) printf '%s\n' "${DEMOS[@]}" sveltekit ;;
-	"" | -h | --help | help) sed -n '2,32p' "$0" ;;
+	"" | -h | --help | help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
 	*)
 		if [[ " ${CLUSTER_DEMOS[*]} " == *" $1 "* ]]; then
 			run_cluster "$1"

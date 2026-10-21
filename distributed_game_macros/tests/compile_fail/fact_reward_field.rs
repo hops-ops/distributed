@@ -5,7 +5,7 @@ use distributed_game::FactCommand;
 struct RecordKill {
     mob: String,
     #[serde(rename = "XP")]
-    amount: u32,
+    count: u32,
 }
 
 fn main() {}

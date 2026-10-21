@@ -10,6 +10,7 @@
 //! `on_tick`/`on_timer`/`on_fact_settled` interleaved → `on_leave` /
 //! `on_unobserve` → `on_dispose`.
 
+use crate::claims::TicketExtensions;
 use crate::facts::FactSettlement;
 use crate::host::Ctx;
 use crate::protocol::Role;
@@ -74,6 +75,10 @@ pub struct TicketClaims {
     /// identity: use `principal` for that). Exposed as
     /// [`PlayerInfo::name`] / [`ObserverInfo::name`].
     pub name: Option<String>,
+    /// Game-declared claims the issuer vouches for (match id, team…; the
+    /// ticket's `ext`), checked by the `net` server against
+    /// `ServerConfig::ticket_extensions`. Never identity or rewards.
+    pub extensions: TicketExtensions,
 }
 
 impl TicketClaims {
@@ -92,7 +97,14 @@ impl TicketClaims {
             nonce: nonce.into(),
             role,
             name: None,
+            extensions: TicketExtensions::new(),
         }
+    }
+
+    /// Attach extension claims.
+    pub fn with_extensions(mut self, extensions: TicketExtensions) -> Self {
+        self.extensions = extensions;
+        self
     }
 
     /// Attach a display name.
@@ -154,6 +166,9 @@ pub struct PlayerInfo {
     pub principal: String,
     /// Display name from the ticket ([`TicketClaims::name`]), if any.
     pub name: Option<String>,
+    /// Extension claims from the ticket ([`TicketClaims::extensions`]);
+    /// replaced by a fresh ticket's on rejoin, carried across handoffs.
+    pub extensions: TicketExtensions,
     /// Hello capabilities.
     pub capabilities: u32,
     /// False while inside the reconnect grace window.
@@ -169,6 +184,8 @@ pub struct ObserverInfo {
     pub principal: String,
     /// Display name from the ticket, if any.
     pub name: Option<String>,
+    /// Extension claims from the ticket.
+    pub extensions: TicketExtensions,
     /// Hello capabilities.
     pub capabilities: u32,
 }
@@ -192,6 +209,10 @@ pub trait Zone: Sized + Send + 'static {
     type Input: Send + 'static;
     /// Timer payload.
     type Timer: Clone + Send + 'static;
+    /// Messages services deliver into the running zone
+    /// ([`on_message`](Self::on_message), [`crate::inbox`]): a
+    /// `#[derive(GameEvent)]` struct or enum, or [`NoMessages`](crate::NoMessages).
+    type Message: crate::GameEvent + Send + 'static;
 
     /// Replicated entity schema (called once at creation).
     fn schema() -> EntitySchema;
@@ -207,8 +228,18 @@ pub trait Zone: Sized + Send + 'static {
     /// A player joined (not called on reconnect).
     fn on_join(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId) {}
 
-    /// A player left for `reason` (not called on a disconnect still inside the grace window).
+    /// A player left for `reason` (not called on a disconnect still inside
+    /// the grace window: see [`on_connection_lost`](Self::on_connection_lost)).
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId, _reason: LeaveReason) {}
+
+    /// A player's connection dropped (or it was told to reload) and its
+    /// reconnect grace window started; the slot and its entity stay.
+    /// `on_leave(Disconnected)` follows if it does not come back in time.
+    fn on_connection_lost(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId) {}
+
+    /// A player resumed its slot with a reconnect token within the grace
+    /// window.
+    fn on_reconnected(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId) {}
 
     /// A fresh ticket (not a reconnect token) arrived for a principal that
     /// already holds a player slot here, e.g. the page was reloaded or opened
@@ -245,6 +276,11 @@ pub trait Zone: Sized + Send + 'static {
     /// One fixed simulation step (`ctx.dt()` is the step length of the tier).
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>);
 
+    /// A message from a service ([`crate::inbox`]), delivered on the zone's
+    /// task between ticks (never during one). The built-in kick is handled
+    /// by the host and never reaches this hook.
+    fn on_message(&mut self, _ctx: &mut Ctx<'_, Self>, _message: Self::Message) {}
+
     /// A timer fired (before `on_tick` of the same tick).
     fn on_timer(&mut self, _ctx: &mut Ctx<'_, Self>, _id: TimerId, _timer: Self::Timer) {}
 
@@ -264,8 +300,18 @@ pub trait Zone: Sized + Send + 'static {
         false
     }
 
-    /// Describe replicated entities for this patch.
-    fn replicate(&self, out: &mut WorldView);
+    /// The zone's entity collections, registered once at creation
+    /// ([`entity`](crate::entity)): every patch the host pushes each
+    /// entity's [`Project`](crate::Project)ed view (in registration order),
+    /// then calls [`replicate`](Self::replicate). Default: none.
+    fn entities() -> crate::Entities<Self> {
+        crate::Entities::new()
+    }
+
+    /// Describe replicated entities for this patch that are not projected
+    /// from a registered collection ([`entities`](Self::entities)).
+    /// Default: nothing.
+    fn replicate(&self, _out: &mut WorldView) {}
 
     /// Record hit volumes for lag compensation after each tick
     /// ([`Ctx::rewind`](crate::Ctx::rewind)). Default: nothing recorded.

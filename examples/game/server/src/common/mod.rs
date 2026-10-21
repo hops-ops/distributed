@@ -8,8 +8,11 @@
 //! line in `main.rs`; everything else (ticket endpoint, NetSim control,
 //! `/metrics`, graceful shutdown) comes from here.
 
+pub mod celld;
 pub mod dev;
 mod guests;
+pub mod relay;
+pub mod zone_status;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -18,6 +21,7 @@ use axum::Router;
 use distributed_game::net::{GameServer, NetSim, ServerConfig, TicketKey};
 use distributed_game::Zone;
 
+pub use celld::{CelldOptions, CELLD_URL_ENV};
 pub use guests::{random_hex, Guests};
 
 /// One playable demo hosted by `game-demos <NAME>`.
@@ -102,6 +106,17 @@ impl<D: Demo> RunningDemo<D> {
     }
 }
 
+/// Routes a demo adds to its server: `dev` only with `--dev` (next to
+/// `/dev/ticket`), `internal` always (each route authenticates itself, e.g.
+/// Mob Pit's secret-protected celld Queue relay).
+#[derive(Default)]
+pub struct DemoRoutes {
+    /// Dev-only routes.
+    pub dev: Router,
+    /// Always-mounted internal routes.
+    pub internal: Router,
+}
+
 /// Server config every demo starts from.
 pub fn server_config(key: TicketKey, net_sim: Option<NetSim>) -> ServerConfig {
     let mut config = ServerConfig::new(key);
@@ -120,30 +135,32 @@ pub fn spawn<D: Demo>(
     spawn_with::<D>(
         listener,
         options,
-        |config, guests| (D::server(config, guests), Router::new()),
+        |config, guests| (D::server(config, guests), DemoRoutes::default()),
         signal,
     )
 }
 
-/// Like [`spawn`], but `build` makes the server and the demo's own dev
-/// routes (merged next to `/dev/ticket`, only with `--dev`). For demos whose
-/// zones and routes share state (e.g. a durable store) built by the caller.
+/// Like [`spawn`], but `build` makes the server and the demo's own routes
+/// ([`DemoRoutes`]). For demos whose zones and routes share state (e.g. a
+/// durable store) built by the caller.
 pub fn spawn_with<D: Demo>(
     listener: tokio::net::TcpListener,
     options: DemoOptions,
-    build: impl FnOnce(ServerConfig, Guests) -> (GameServer<D::Zone>, Router),
+    build: impl FnOnce(ServerConfig, Guests) -> (GameServer<D::Zone>, DemoRoutes),
     signal: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<RunningDemo<D>> {
     let addr = listener.local_addr()?;
     let guests = Guests::default();
-    let (server, demo_routes) = build(
+    let (server, routes) = build(
         server_config(options.key.clone(), options.net_sim),
         guests.clone(),
     );
     let extra = if options.dev {
-        dev::routes::<D>(server.clone(), options.key, guests.clone()).merge(demo_routes)
+        dev::routes::<D>(server.clone(), options.key, guests.clone())
+            .merge(routes.dev)
+            .merge(routes.internal)
     } else {
-        Router::new()
+        routes.internal
     };
     let task = tokio::spawn(server.clone().serve_with(listener, extra, signal));
     Ok(RunningDemo {
@@ -157,15 +174,15 @@ pub fn spawn_with<D: Demo>(
 /// CLI entry: bind, print the address, serve until Ctrl-C / SIGTERM.
 pub async fn run<D: Demo>(args: DemoArgs) -> std::io::Result<()> {
     run_with::<D>(args, |config, guests| {
-        (D::server(config, guests), Router::new())
+        (D::server(config, guests), DemoRoutes::default())
     })
     .await
 }
 
-/// [`run`] with a caller-built server and dev routes (see [`spawn_with`]).
+/// [`run`] with a caller-built server and routes (see [`spawn_with`]).
 pub async fn run_with<D: Demo>(
     args: DemoArgs,
-    build: impl FnOnce(ServerConfig, Guests) -> (GameServer<D::Zone>, Router),
+    build: impl FnOnce(ServerConfig, Guests) -> (GameServer<D::Zone>, DemoRoutes),
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind((args.host.as_str(), args.port)).await?;
     let secret = args.secret.unwrap_or_else(|| guests::random_hex(32));
