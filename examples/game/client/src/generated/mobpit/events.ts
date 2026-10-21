@@ -3,124 +3,6 @@
 // Do not edit: change the Rust definitions and regenerate.
 import { decodeGameEvent, decodePayload, decodeValue, encodePayload, encodeValue, onGameEvent, type DecodedGameEvent, type GameEventCodecs, type GameEventSource, type PayloadLayout, type WireType } from '@hops-ops/distributed/game';
 
-/** Record `BackgroundStats` (`#[derive(GameRecord)]`). */
-export interface BackgroundStats {
-	readonly enqueued: number;
-	readonly applied: number;
-	readonly dropped: number;
-	readonly failed: number;
-}
-
-const BACKGROUND_STATS_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['enqueued', { type: 'u64' }],
-		['applied', { type: 'u64' }],
-		['dropped', { type: 'u64' }],
-		['failed', { type: 'u64' }],
-	]
-};
-
-/** Record `BoardRow` (`#[derive(GameRecord)]`). */
-export interface BoardRow {
-	readonly rank: number;
-	readonly member: string;
-	readonly name: string;
-	readonly score: number;
-}
-
-const BOARD_ROW_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['rank', { type: 'u32' }],
-		['member', { type: 'short_str' }],
-		['name', { type: 'short_str' }],
-		['score', { type: 'f64' }],
-	]
-};
-
-/** Record `Scores` (`#[derive(GameRecord)]`). */
-export interface Scores {
-	readonly kills: number;
-	readonly xp: number;
-}
-
-const SCORES_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['kills', { type: 'f64' }],
-		['xp', { type: 'f64' }],
-	]
-};
-
-/** Record `Mismatch` (`#[derive(GameRecord)]`). */
-export interface Mismatch {
-	readonly member: string;
-	readonly cell: Scores;
-	readonly board: Scores;
-}
-
-const MISMATCH_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['member', { type: 'short_str' }],
-		['cell', SCORES_TYPE],
-		['board', SCORES_TYPE],
-	]
-};
-
-/** Record `RebuildReport` (`#[derive(GameRecord)]`). */
-export interface RebuildReport {
-	readonly backend: string;
-	readonly crawlers: number;
-	readonly events: number;
-	readonly applied: number;
-	readonly duplicates: number;
-	readonly identicalTop: boolean;
-	readonly matchesCells: boolean;
-	readonly mismatches: readonly Mismatch[];
-	readonly tookMs: number;
-}
-
-const REBUILD_REPORT_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['backend', { type: 'short_str' }],
-		['crawlers', { type: 'u32' }],
-		['events', { type: 'u32' }],
-		['applied', { type: 'u32' }],
-		['duplicates', { type: 'u32' }],
-		['identicalTop', { type: 'bool' }],
-		['matchesCells', { type: 'bool' }],
-		['mismatches', { type: 'list', item: MISMATCH_TYPE }],
-		['tookMs', { type: 'f64' }],
-	]
-};
-
-/** Record `BoardSnapshot` (`#[derive(GameRecord)]`). */
-export interface BoardSnapshot {
-	readonly version: number;
-	readonly backend: string;
-	readonly members: number;
-	readonly kills: readonly BoardRow[];
-	readonly xp: readonly BoardRow[];
-	readonly background: BackgroundStats;
-	readonly lastRebuild: RebuildReport | undefined;
-}
-
-const BOARD_SNAPSHOT_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['version', { type: 'u64' }],
-		['backend', { type: 'short_str' }],
-		['members', { type: 'u64' }],
-		['kills', { type: 'list', item: BOARD_ROW_TYPE }],
-		['xp', { type: 'list', item: BOARD_ROW_TYPE }],
-		['background', BACKGROUND_STATS_TYPE],
-		['lastRebuild', { type: 'optional', item: REBUILD_REPORT_TYPE }],
-	]
-};
-
 /** Record `MobTier` (`#[derive(GameRecord)]`). */
 export interface MobTier {
 	readonly tier: number;
@@ -138,6 +20,27 @@ export interface MoveState {
 	readonly cd: number;
 }
 
+/** Record `PitRoomContext` (`#[derive(GameRecord)]`). */
+export interface PitRoomContext {
+	readonly seed: number;
+	readonly x: number;
+	readonly y: number;
+}
+
+/** Record `RoomMob` (`#[derive(GameRecord)]`). */
+export interface RoomMob {
+	readonly tier: number;
+	readonly x: number;
+	readonly y: number;
+}
+
+/** Record `PitRoomLayout` (`#[derive(GameRecord)]`). */
+export interface PitRoomLayout {
+	readonly biome: number;
+	readonly danger: number;
+	readonly mobs: readonly RoomMob[];
+}
+
 /** Record `PitRules` (`#[derive(GameRecord)]`). */
 export interface PitRules {
 	readonly tiers: readonly MobTier[];
@@ -145,6 +48,15 @@ export interface PitRules {
 	readonly attackRange: number;
 	readonly attackHalfAngle: number;
 	readonly swingFrames: number;
+}
+
+/** Record `PitWorld` (`#[derive(GameRecord)]`). */
+export interface PitWorld {
+	readonly defaultSeed: number;
+	readonly half: number;
+	readonly doorHalf: number;
+	readonly maxRoom: number;
+	readonly biomes: readonly string[];
 }
 
 /** Record `Profile` (`#[derive(GameRecord)]`). */
@@ -173,17 +85,25 @@ const PROFILE_TYPE: WireType = {
 export interface HelloEvent {
 	readonly entity: number;
 	readonly half: number;
-	readonly boot: string;
 	readonly attackRange: number;
 	readonly attackArcCos: number;
+	readonly roomX: number;
+	readonly roomY: number;
+	readonly seed: number;
+	readonly restored: boolean;
+	readonly roomKills: number;
 }
 
 const HELLO_LAYOUT: PayloadLayout = [
 	['entity', { type: 'u32' }],
 	['half', { type: 'f32' }],
-	['boot', { type: 'short_str' }],
 	['attackRange', { type: 'f32' }],
 	['attackArcCos', { type: 'f32' }],
+	['roomX', { type: 'i32' }],
+	['roomY', { type: 'i32' }],
+	['seed', { type: 'u32' }],
+	['restored', { type: 'bool' }],
+	['roomKills', { type: 'u32' }],
 ];
 
 /** Event `profile` (id 2). */
@@ -243,11 +163,6 @@ const SAVED_LAYOUT: PayloadLayout = [
 	['attempts', { type: 'u32' }],
 ];
 
-/** Event `board` (id 5). */
-export type BoardEvent = BoardSnapshot;
-
-const BOARD_PAYLOAD: WireType = BOARD_SNAPSHOT_TYPE;
-
 /** Event `died` (id 6). */
 export interface DiedEvent {
 	readonly respawnMs: number;
@@ -257,13 +172,27 @@ const DIED_LAYOUT: PayloadLayout = [
 	['respawnMs', { type: 'u32' }],
 ];
 
+/** Message `loaded` (id 1). */
+export interface LoadedMessage {
+	readonly principal: string;
+	readonly xp: number;
+	readonly level: number;
+	readonly kills: number;
+}
+
+const MESSAGE_LOADED_LAYOUT: PayloadLayout = [
+	['principal', { type: 'short_str' }],
+	['xp', { type: 'u64' }],
+	['level', { type: 'u32' }],
+	['kills', { type: 'u32' }],
+];
+
 /** Event type ids by name. */
 export const EVENT = {
 	hello: 1,
 	profile: 2,
 	kill: 3,
 	saved: 4,
-	board: 5,
 	died: 6,
 } as const;
 
@@ -273,7 +202,6 @@ export interface Events {
 	profile: ProfileEvent;
 	kill: KillEvent;
 	saved: SavedEvent;
-	board: BoardEvent;
 	died: DiedEvent;
 }
 
@@ -303,12 +231,6 @@ export const EVENTS: GameEventCodecs<Events> = {
 		encode: (value) => encodePayload(SAVED_LAYOUT, value),
 		decode: (payload) => decodePayload(SAVED_LAYOUT, payload) as unknown as SavedEvent
 	},
-	board: {
-		id: 5,
-		name: 'board',
-		encode: (value) => encodeValue(BOARD_PAYLOAD, value),
-		decode: (payload) => decodeValue(BOARD_PAYLOAD, payload) as BoardEvent
-	},
 	died: {
 		id: 6,
 		name: 'died',
@@ -332,4 +254,33 @@ export function onEvent<K extends keyof Events>(
 	handler: (value: Events[K], zoneId: string) => void
 ): () => void {
 	return onGameEvent(client, EVENTS, name, handler);
+}
+
+/** Zone inbox message type ids by name. */
+export const MESSAGE = {
+	loaded: 1,
+} as const;
+
+/** Zone inbox message payload types by name. */
+export interface Messages {
+	loaded: LoadedMessage;
+}
+
+/** Codecs of every zone inbox message. */
+export const MESSAGES: GameEventCodecs<Messages> = {
+	loaded: {
+		id: 1,
+		name: 'loaded',
+		encode: (value) => encodePayload(MESSAGE_LOADED_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_LOADED_LAYOUT, payload) as unknown as LoadedMessage
+	},
+};
+
+/** Encode a zone inbox message: `typeId` and `payload` of a `/admin/zone-message` body (base64url the payload). */
+export function encodeMessage<K extends keyof Messages>(
+	name: K,
+	value: Messages[K]
+): { readonly typeId: number; readonly payload: Uint8Array } {
+	const codec = MESSAGES[name];
+	return { typeId: codec.id, payload: codec.encode(value) };
 }

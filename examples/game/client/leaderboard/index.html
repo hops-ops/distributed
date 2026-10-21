@@ -12,8 +12,9 @@
 			<header>
 				<h1>Mob Pit leaderboard</h1>
 				<p class="lb-hint">
-					Kill facts committed to the Crawler cells are projected into two sorted-set boards (fire-and-forget,
-					idempotent apply keys). The top 10 is pushed over the zone connection (observer); your rank is read on each push.
+					Kills settle in the Crawler cells next to the rooms on celld; their events are projected into the crawler list
+					and from there into two sorted-set boards (idempotent `max` updates). The top 10 refreshes live; your rank is
+					read on each change.
 					<a href="/mobpit/">Play the pit ↗</a>
 				</p>
 			</header>
@@ -24,7 +25,7 @@
 				<section class="lb-me">
 					<h2>You</h2>
 					<div data-k="me">—</div>
-					<h2>Live pit</h2>
+					<h2>Entrance room (observer)</h2>
 					<canvas data-k="map" width="240" height="240"></canvas>
 				</section>
 			</div>

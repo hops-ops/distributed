@@ -36,6 +36,25 @@
           }
         ]
       }
+    },
+    {
+      "name": "pit_world",
+      "type": {
+        "name": "PitWorld",
+        "type": "record"
+      },
+      "value": {
+        "biomes": [
+          "highlands",
+          "steppe",
+          "forest",
+          "meadow"
+        ],
+        "default_seed": 186474221,
+        "door_half": 2.5,
+        "half": 20.0,
+        "max_room": 1000000
+      }
     }
   ],
   "events": [
@@ -57,12 +76,6 @@
             }
           },
           {
-            "name": "boot",
-            "type": {
-              "type": "short_str"
-            }
-          },
-          {
             "name": "attack_range",
             "type": {
               "type": "f32"
@@ -72,6 +85,36 @@
             "name": "attack_arc_cos",
             "type": {
               "type": "f32"
+            }
+          },
+          {
+            "name": "room_x",
+            "type": {
+              "type": "i32"
+            }
+          },
+          {
+            "name": "room_y",
+            "type": {
+              "type": "i32"
+            }
+          },
+          {
+            "name": "seed",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "restored",
+            "type": {
+              "type": "bool"
+            }
+          },
+          {
+            "name": "room_kills",
+            "type": {
+              "type": "u32"
             }
           }
         ],
@@ -222,17 +265,6 @@
           }
         ],
         "kind": "fields"
-      }
-    },
-    {
-      "id": 5,
-      "name": "board",
-      "payload": {
-        "kind": "value",
-        "type": {
-          "name": "BoardSnapshot",
-          "type": "record"
-        }
       }
     },
     {
@@ -542,7 +574,15 @@
         },
         {
           "correction": null,
-          "name": "slow_ms",
+          "name": "committed",
+          "priority": 1.0,
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "correction": null,
+          "name": "backlog",
           "priority": 1.0,
           "type": {
             "type": "u16"
@@ -566,32 +606,51 @@
         },
         {
           "correction": null,
-          "name": "work_us",
+          "name": "kills",
           "priority": 1.0,
           "type": {
             "type": "u32"
-          }
-        },
-        {
-          "correction": null,
-          "name": "committed",
-          "priority": 1.0,
-          "type": {
-            "type": "u32"
-          }
-        },
-        {
-          "correction": null,
-          "name": "backlog",
-          "priority": 1.0,
-          "type": {
-            "type": "u16"
           }
         }
       ],
       "id": 4,
       "name": "pit",
       "priority": 1.0
+    }
+  ],
+  "messages": [
+    {
+      "id": 1,
+      "name": "loaded",
+      "payload": {
+        "fields": [
+          {
+            "name": "principal",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "xp",
+            "type": {
+              "type": "u64"
+            }
+          },
+          {
+            "name": "level",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "kills",
+            "type": {
+              "type": "u32"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
     }
   ],
   "name": "mobpit",
@@ -603,150 +662,22 @@
     "state": "MoveState"
   },
   "protocolVersion": 1,
+  "pures": [
+    {
+      "abi": 1,
+      "arg": {
+        "name": "PitRoomContext",
+        "type": "record"
+      },
+      "export": "pit_room",
+      "output": {
+        "name": "PitRoomLayout",
+        "type": "record"
+      },
+      "package": "game_sim"
+    }
+  ],
   "records": [
-    {
-      "fields": [
-        {
-          "name": "enqueued",
-          "type": {
-            "type": "u64"
-          }
-        },
-        {
-          "name": "applied",
-          "type": {
-            "type": "u64"
-          }
-        },
-        {
-          "name": "dropped",
-          "type": {
-            "type": "u64"
-          }
-        },
-        {
-          "name": "failed",
-          "type": {
-            "type": "u64"
-          }
-        }
-      ],
-      "name": "BackgroundStats"
-    },
-    {
-      "fields": [
-        {
-          "name": "rank",
-          "type": {
-            "type": "u32"
-          }
-        },
-        {
-          "name": "member",
-          "type": {
-            "type": "short_str"
-          }
-        },
-        {
-          "name": "name",
-          "type": {
-            "type": "short_str"
-          }
-        },
-        {
-          "name": "score",
-          "type": {
-            "type": "f64"
-          }
-        }
-      ],
-      "name": "BoardRow"
-    },
-    {
-      "fields": [
-        {
-          "name": "version",
-          "type": {
-            "type": "u64"
-          }
-        },
-        {
-          "name": "backend",
-          "type": {
-            "type": "short_str"
-          }
-        },
-        {
-          "name": "members",
-          "type": {
-            "type": "u64"
-          }
-        },
-        {
-          "name": "kills",
-          "type": {
-            "item": {
-              "name": "BoardRow",
-              "type": "record"
-            },
-            "type": "list"
-          }
-        },
-        {
-          "name": "xp",
-          "type": {
-            "item": {
-              "name": "BoardRow",
-              "type": "record"
-            },
-            "type": "list"
-          }
-        },
-        {
-          "name": "background",
-          "type": {
-            "name": "BackgroundStats",
-            "type": "record"
-          }
-        },
-        {
-          "name": "last_rebuild",
-          "type": {
-            "item": {
-              "name": "RebuildReport",
-              "type": "record"
-            },
-            "type": "optional"
-          }
-        }
-      ],
-      "name": "BoardSnapshot"
-    },
-    {
-      "fields": [
-        {
-          "name": "member",
-          "type": {
-            "type": "short_str"
-          }
-        },
-        {
-          "name": "cell",
-          "type": {
-            "name": "Scores",
-            "type": "record"
-          }
-        },
-        {
-          "name": "board",
-          "type": {
-            "name": "Scores",
-            "type": "record"
-          }
-        }
-      ],
-      "name": "Mismatch"
-    },
     {
       "fields": [
         {
@@ -814,6 +745,56 @@
     {
       "fields": [
         {
+          "name": "seed",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "x",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "i32"
+          }
+        }
+      ],
+      "name": "PitRoomContext"
+    },
+    {
+      "fields": [
+        {
+          "name": "biome",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "danger",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "mobs",
+          "type": {
+            "item": {
+              "name": "RoomMob",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        }
+      ],
+      "name": "PitRoomLayout"
+    },
+    {
+      "fields": [
+        {
           "name": "tiers",
           "type": {
             "item": {
@@ -852,6 +833,44 @@
         }
       ],
       "name": "PitRules"
+    },
+    {
+      "fields": [
+        {
+          "name": "default_seed",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "half",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "door_half",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "max_room",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "biomes",
+          "type": {
+            "item": {
+              "type": "short_str"
+            },
+            "type": "list"
+          }
+        }
+      ],
+      "name": "PitWorld"
     },
     {
       "fields": [
@@ -897,82 +916,25 @@
     {
       "fields": [
         {
-          "name": "backend",
+          "name": "tier",
           "type": {
-            "type": "short_str"
+            "type": "u8"
           }
         },
         {
-          "name": "crawlers",
+          "name": "x",
           "type": {
-            "type": "u32"
+            "type": "f32"
           }
         },
         {
-          "name": "events",
+          "name": "y",
           "type": {
-            "type": "u32"
-          }
-        },
-        {
-          "name": "applied",
-          "type": {
-            "type": "u32"
-          }
-        },
-        {
-          "name": "duplicates",
-          "type": {
-            "type": "u32"
-          }
-        },
-        {
-          "name": "identical_top",
-          "type": {
-            "type": "bool"
-          }
-        },
-        {
-          "name": "matches_cells",
-          "type": {
-            "type": "bool"
-          }
-        },
-        {
-          "name": "mismatches",
-          "type": {
-            "item": {
-              "name": "Mismatch",
-              "type": "record"
-            },
-            "type": "list"
-          }
-        },
-        {
-          "name": "took_ms",
-          "type": {
-            "type": "f64"
+            "type": "f32"
           }
         }
       ],
-      "name": "RebuildReport"
-    },
-    {
-      "fields": [
-        {
-          "name": "kills",
-          "type": {
-            "type": "f64"
-          }
-        },
-        {
-          "name": "xp",
-          "type": {
-            "type": "f64"
-          }
-        }
-      ],
-      "name": "Scores"
+      "name": "RoomMob"
     }
   ],
   "schemaVersion": 3

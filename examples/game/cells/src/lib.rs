@@ -1,6 +1,17 @@
-//! The game demos' durable cells on celld. Mob Pit's are fed by the zone
-//! server's `distributed_game::celld::CelldFactSink` over the internal HTTP
-//! path; every multi-host demo keeps its zone ownership and hibernation
+//! The game demos' durable cells on celld, and Mob Pit's rooms.
+//!
+//! - `GET /rooms/{room}` (WebSocket) and `/rooms/{room}/info`: `PitRoom`,
+//!   one Durable Object per Mob Pit room (`pit.<x>.<y>`), hosted by
+//!   `distributed_game::celld_zone` (`mobpit_rooms::MobPit`). celld places
+//!   each room; its kill and lifecycle facts reach the Crawler and presence
+//!   cells below object to object, exactly once.
+//! - `zone-activity/{room}` (`ZoneActivityObject`): each room's lifecycle
+//!   (active / dormant / hibernated); its `zone.activity_changed` events
+//!   leave through the outbox Queue for the zone status read model.
+//!
+//! The Freeze's cells are fed by its zone server's
+//! `distributed_game::celld::CelldFactSink` over the internal HTTP path;
+//! every native multi-host demo keeps its zone ownership and hibernation
 //! snapshots here.
 //!
 //! - `crawler/{principal}` (`CrawlerCell`): the `mobpit_crawler::Crawler`
@@ -47,9 +58,11 @@ use distributed::microsvc::{
 };
 use distributed::{sourced, Aggregate, Entity};
 use distributed_game::cell::{fact_session_from_headers, session_stamp};
+use distributed_game::celld_zone::{forward_to_zone, ZoneActivityCell};
 use distributed_game::lifecycle::{
     Lifecycle, CONNECTION_LOST, PLAYER_DISCONNECTED, PLAYER_JOINED, PLAYER_LEFT, PLAYER_RECONNECTED,
 };
+use distributed_game::world::zone_activity::ZONE_ACTIVITY_KIND;
 use distributed_game::world::zone_lease::{mount_zone_lease, ZoneLease};
 use distributed_game::world::zone_state::{celld_worker, mount_zone_state, ZoneState};
 use distributed_game::FactStamp;
@@ -715,13 +728,47 @@ impl DurableObject for ZoneStateCell {
     }
 }
 
+// ---------------------------------------------------------------- Rooms
+
+distributed_game::celld_zone_object!(PitRoom, mobpit_rooms::MobPit);
+
+#[durable_object]
+pub struct ZoneActivityObject {
+    cell: ZoneActivityCell,
+}
+
+impl DurableObject for ZoneActivityObject {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        let outbox = outbox(&env);
+        Self {
+            cell: ZoneActivityCell::new(state, env, outbox),
+        }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        self.cell.fetch(req).await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        self.cell.alarm().await
+    }
+}
+
 #[event(fetch)]
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
     let url = req.url()?;
-    let path = url.path();
+    let path = url.path().to_string();
     if path == "/" || path == "/health" {
         return Response::ok("mobpit cells\n");
+    }
+    // A room is public: its WebSocket admits signed tickets only.
+    if path.starts_with("/rooms/") {
+        return match forward_to_zone(req, &env, "PIT_ROOM", "/rooms/").await? {
+            Some(response) => Ok(response),
+            None => json_status(json!({ "error": "no such room" }), 404),
+        };
     }
     if let Err(error) = authenticate(&req, &env) {
         return error_response(error);
@@ -734,6 +781,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Some("content-log") => "CONTENT_LOG",
         Some("zone-lease") => "ZONE_LEASE",
         Some("zone-state") => "ZONE_STATE",
+        Some(ZONE_ACTIVITY_KIND) => "ZONE_ACTIVITY",
         _ => return json_status(json!({ "error": "unknown cell kind" }), 404),
     };
     let Some(shard) = parts.get(1) else {

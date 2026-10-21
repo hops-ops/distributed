@@ -321,6 +321,17 @@ fn grid_sample_args() -> Vec<Vec<u8>> {
     args
 }
 
+/// `pit_room` for the content cells (as rooms), under two seeds.
+fn pit_room_args() -> Vec<Vec<u8>> {
+    let mut args = Vec::new();
+    for seed in [game_sim::mobpit::DEFAULT_SEED, 0xdead_beef] {
+        for (x, y) in content_cells() {
+            args.push(game_sim::mobpit::PitRoomContext { seed, x, y }.encode_context());
+        }
+    }
+    args
+}
+
 /// Every demo step's and pure function's native trace (see the module docs).
 pub fn traces() -> Value {
     json!({
@@ -328,6 +339,7 @@ pub fn traces() -> Value {
         "pures": [
             pure_trace::<GridCellFn>(grid_cell_args()),
             pure_trace::<GridSampleFn>(grid_sample_args()),
+            pure_trace::<game_sim::mobpit::PitRoomFn>(pit_room_args()),
         ],
         "steps": [
             trace::<ArenaStep>(capsule_streams(0)),

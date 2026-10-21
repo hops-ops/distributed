@@ -2,7 +2,7 @@
 # Own workspace (like tests/gateway-native) so demo-only dependencies never
 # reach the framework's lockfile; excluded from the root workspace.
 [workspace]
-members = [".", "sim", "crawler", "service"]
+members = [".", "sim", "crawler", "rooms", "service"]
 resolver = "2"
 
 # `distributed build|dev examples/game/server` owns the SvelteKit demo's
@@ -29,6 +29,9 @@ path = "src/main.rs"
 game_sim = { path = "sim" }
 # The Crawler aggregate + RecordKill (shared with the read-model service).
 mobpit_crawler = { path = "crawler" }
+# Mob Pit's room zone (hosted on celld; linked here for the client surface,
+# tests and bots).
+mobpit_rooms = { path = "rooms" }
 distributed_game = { path = "../../../distributed_game", features = ["net", "cell", "celld"] }
 # Mob Pit: sorted-set leaderboards (Redis optional at runtime), the SQLite
 # projection bus and the modeled projector of the crawler directory

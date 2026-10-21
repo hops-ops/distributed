@@ -1,12 +1,15 @@
 /**
  * Mob Pit page: Babylon scene over `createMobPitClient`.
  *
- * What to look at: kill a mob (Space) and watch the grey "saving…" popup
- * turn into "+XP saved ✓" when the durable cell commit settles. Toggle
- * *Slow storage* (L): every commit now takes 1.5 s — the pending-facts graph
- * climbs while the tick graph stays flat at ~33 ms, because the zone never
- * waits for storage. Kill the server (`kill -9`), restart it, reload: your
- * XP and kills come back from the cell.
+ * What to look at: rooms are celld Durable Objects on a near-infinite
+ * seeded grid. Walk through a doorway (the gaps in the middle of each wall)
+ * into the next room; the minimap (bottom right) shows every known room
+ * live — active, dormant (just left), hibernated (asleep in storage) — from
+ * the `zone_status` read model. Come back to a room after it slept: it
+ * wakes from its snapshot with the mobs you left (toast). Kill a mob
+ * (Space): the grey "saving…" popup turns into "+XP saved ✓" when the kill
+ * settled in your Crawler cell. The debug overlay (O) shows which celld
+ * node and isolate run the room — celld decides, the game never does.
  */
 import type { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { Color3 } from '@babylonjs/core/Maths/math.color';
@@ -18,6 +21,7 @@ import { ARENA_FLOOR } from '../generated/arena/constants.ts';
 import {
 	BUTTON,
 	PIT_RULES,
+	PIT_WORLD,
 	isMob,
 	isPillar,
 	isPit,
@@ -25,7 +29,6 @@ import {
 	pillarFields,
 	pitFields,
 	playerFields,
-	type BoardSnapshot,
 	type PitFields,
 	type PitInput
 } from '../generated/mobpit/index.ts';
@@ -33,7 +36,18 @@ import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
 import { createStage, material, toWorld } from '../shared/scene.ts';
-import { createMobPitClient, DEFAULT_ZONE, MobPitApi, TIERS } from './client.ts';
+import {
+	createBoardWatcher,
+	createMobPitClient,
+	DEFAULT_ZONE,
+	MobPitApi,
+	parseRoom,
+	roomZone,
+	TIERS,
+	type BoardSnapshot,
+	type RoomInfo,
+	type RoomStatus
+} from './client.ts';
 
 /** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
 const { half: HALF, playerRadius: PLAYER_RADIUS } = ARENA_FLOOR;
@@ -41,7 +55,6 @@ const { half: HALF, playerRadius: PLAYER_RADIUS } = ARENA_FLOOR;
 const { attackRange, attackHalfAngle: SWING_HALF, swingFrames: SWING_FRAMES } = PIT_RULES;
 const ATTACK_REACH = attackRange + PLAYER_RADIUS;
 
-const SLOW_MS = 1500;
 const params = new URLSearchParams(location.search);
 const zone = params.get('zone') ?? DEFAULT_ZONE;
 const storedName = (() => {
@@ -64,19 +77,12 @@ const { scene } = stage;
 
 const hud = new Hud({
 	title: 'Mob Pit',
-	hint: 'WASD move · Space attack · E dash · L slow storage. Kills are durable facts; the tick never waits for them.',
+	hint: 'WASD move · Space attack · E dash · walk through a doorway to the next room · O debug overlay. Rooms run on celld; kills are durable facts.',
 	client,
 	devApi: api
 });
-let slow = false;
-hud.toggle(`Slow storage (${SLOW_MS} ms per commit)`, false, (on) => {
-	slow = on;
-	pitApi.setStorage(on ? SLOW_MS : 0).catch((e: unknown) => hud.row('Storage', `failed: ${String(e)}`));
-}, 'l');
-pitApi
-	.storage()
-	.then((s) => (slow = s.latencyMs > 0))
-	.catch(() => undefined);
+let debug = params.get('debug') !== '0';
+hud.toggle('Debug overlay (celld node per room)', debug, (on) => (debug = on), 'o');
 
 // ---- side panels: XP bar, durable facts graph, mini leaderboard ----
 const xpPanel = div('pit-xp', document.body);
@@ -103,6 +109,109 @@ function div(className: string, parent: HTMLElement): HTMLDivElement {
 	return d;
 }
 
+// ---- rooms: minimap from the zone status read model, toasts, debug ----
+const roomsPanel = div('pit-rooms', document.body);
+roomsPanel.innerHTML = `<h2>Rooms <small data-k="here"></small></h2>
+	<canvas width="210" height="210"></canvas>
+	<div class="pit-legend"><span class="c-active">■ active</span> <span class="c-dormant">■ dormant</span> <span class="c-hibernated">■ asleep</span> <span class="c-cold">■ never ran</span></div>
+	<div class="pit-debug" data-k="debug"></div>`;
+const roomsMap = roomsPanel.querySelector('canvas') as HTMLCanvasElement;
+const roomsField = (k: string) => roomsPanel.querySelector(`[data-k="${k}"]`) as HTMLElement;
+const toasts = div('pit-toasts', document.body);
+const rooms = new Map<string, RoomStatus>();
+let roomInfo: RoomInfo | undefined;
+const STATUS_COLOR: Record<string, string> = { active: '#4caf50', dormant: '#f2c94c', hibernated: '#6c7aa0' };
+const BIOME_COLOR = ['#8a8f99', '#c9a86a', '#3f7d4e', '#7fbf6a'];
+
+function toast(text: string): void {
+	const t = div('pit-toast', toasts);
+	t.textContent = text;
+	setTimeout(() => t.remove(), 5000);
+}
+
+async function pollRooms(): Promise<void> {
+	for (;;) {
+		try {
+			const { rooms: rows } = await pitApi.rooms();
+			for (const row of rows) {
+				const before = rooms.get(row.zone);
+				if (before !== undefined && before.status !== row.status) {
+					if (row.status === 'active' && row.restored && row.activations > before.activations) {
+						toast(`${row.zone} woke up from hibernation — its mobs are back`);
+					} else if (row.status === 'hibernated') {
+						toast(`${row.zone} went to sleep (snapshot in celld storage)`);
+					}
+				}
+				rooms.set(row.zone, row);
+			}
+		} catch {
+			// The services restarting: keep the last view.
+		}
+		await new Promise((r) => setTimeout(r, 500));
+	}
+}
+void pollRooms();
+
+async function pollRoomInfo(): Promise<void> {
+	for (;;) {
+		const here = pit.room();
+		if (debug && here !== undefined) roomInfo = await pitApi.roomInfo(here).catch(() => roomInfo);
+		await new Promise((r) => setTimeout(r, 1000));
+	}
+}
+void pollRoomInfo();
+
+function drawRooms(): void {
+	const ctx = roomsMap.getContext('2d');
+	const here = parseRoom(pit.room() ?? DEFAULT_ZONE);
+	if (ctx === null || here === undefined) return;
+	const { width } = roomsMap;
+	const span = 7;
+	const cell = width / span;
+	ctx.clearRect(0, 0, width, width);
+	const seed = pit.hello()?.seed ?? PIT_WORLD.defaultSeed;
+	for (let j = 0; j < span; j++) {
+		for (let i = 0; i < span; i++) {
+			const x = here[0] + i - 3;
+			const y = here[1] + (span - 1 - j) - 3;
+			const zone = roomZone(x, y);
+			const row = rooms.get(zone);
+			let color = '#20252e';
+			if (row !== undefined) color = STATUS_COLOR[row.status] ?? color;
+			else if (pit.pures.loaded()) color = `${BIOME_COLOR[pit.pures.pitRoom({ seed, x, y }).biome] ?? '#333'}55`;
+			ctx.fillStyle = color;
+			ctx.fillRect(i * cell + 2, j * cell + 2, cell - 4, cell - 4);
+			if (x === here[0] && y === here[1]) {
+				ctx.strokeStyle = '#ffffff';
+				ctx.lineWidth = 2;
+				ctx.strokeRect(i * cell + 1, j * cell + 1, cell - 2, cell - 2);
+			}
+			ctx.fillStyle = '#0e1116';
+			ctx.font = '10px monospace';
+			if (row !== undefined && row.players > 0) ctx.fillText(`${row.players}p`, i * cell + 5, j * cell + 13);
+			if (debug && row !== undefined && row.node !== '') ctx.fillText(row.node.replace(/^node-/, ''), i * cell + 5, j * cell + cell - 6);
+		}
+	}
+}
+
+function renderDebug(): void {
+	const el = roomsField('debug');
+	roomsField('here').textContent = pit.room() ?? '';
+	if (!debug) {
+		el.textContent = '';
+		return;
+	}
+	const info = roomInfo;
+	if (info === undefined || info.zone !== pit.room()) {
+		el.textContent = 'room object: …';
+		return;
+	}
+	const node = info.node === '' ? 'unknown (celld does not tell code its node; set CELLD_ZONE_NODES)' : info.node;
+	el.innerHTML = `<b>celld object</b> ${info.zone}<br>node ${node}<br>isolate ${info.isolate} · activation ${info.activation}` +
+		`<br>wakes ${info.wakes} · ${info.restored ? 'restored from snapshot' : 'fresh'} · ${info.players} players` +
+		`<br>tick ${info.hz} Hz · late p50 ${info.lateMs.p50.toFixed(1)} / p99 ${info.lateMs.p99.toFixed(1)} ms`;
+}
+
 // ---- materials and templates ----
 const mats = {
 	me: material(scene, 'me', '#6cc4ff'),
@@ -120,6 +229,49 @@ for (const m of [mats.swing, mats.tele, mats.teleFill, mats.hpFill]) m.emissiveC
 mats.blade.emissiveColor = new Color3(0.6, 0.6, 0.7);
 const tierMats = new Map<number, StandardMaterial>();
 for (const [tier, t] of Object.entries(TIERS)) tierMats.set(Number(tier), material(scene, `mob-${tier}`, t.color));
+
+// Doorways: a glowing gate in the middle of each wall, labelled with the
+// room behind it; the floor takes the room's biome colour.
+const doorMat = material(scene, 'door', '#4dd0e1', 0.55);
+doorMat.emissiveColor = Color3.FromHexString('#4dd0e1');
+const DOORS: { dx: number; dy: number }[] = [
+	{ dx: 1, dy: 0 },
+	{ dx: -1, dy: 0 },
+	{ dx: 0, dy: 1 },
+	{ dx: 0, dy: -1 }
+];
+const doorMeshes = DOORS.map(({ dx, dy }, i) => {
+	const gate = MeshBuilder.CreateBox(
+		`door-${i}`,
+		{ width: dx === 0 ? PIT_WORLD.doorHalf * 2 : 0.3, depth: dy === 0 ? PIT_WORLD.doorHalf * 2 : 0.3, height: 0.2 },
+		scene
+	);
+	gate.material = doorMat;
+	gate.isPickable = false;
+	gate.position.copyFrom(toWorld(dx * HALF, dy * HALF, 0.1));
+	return gate;
+});
+const biomeFloor = MeshBuilder.CreateGround('biome', { width: HALF * 2, height: HALF * 2 }, scene);
+biomeFloor.position.y = 0.01;
+biomeFloor.isPickable = false;
+const biomeMat = material(scene, 'biome', '#3f7d4e', 0.18);
+biomeFloor.material = biomeMat;
+let shownRoom = '';
+
+function showRoom(zone: string): void {
+	const at = parseRoom(zone);
+	if (at === undefined || zone === shownRoom) return;
+	shownRoom = zone;
+	DOORS.forEach(({ dx, dy }, i) => {
+		stage.labels.set(`door-${i}`, doorMeshes[i]!, `→ ${roomZone(at[0] + dx, at[1] + dy)}`, 0.6, 'door');
+	});
+	const seed = pit.hello()?.seed ?? PIT_WORLD.defaultSeed;
+	if (pit.pures.loaded()) {
+		const room = pit.pures.pitRoom({ seed, x: at[0], y: at[1] });
+		biomeMat.diffuseColor = Color3.FromHexString(BIOME_COLOR[room.biome] ?? '#3f7d4e');
+		hud.row('Room', `${zone} · ${PIT_WORLD.biomes[room.biome] ?? '?'} · danger ${room.danger} · ${room.mobs.length} mobs`);
+	}
+}
 
 type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh };
 type MobVisual = { kind: 'mob'; body: Mesh; hpBack: Mesh; hpFill: Mesh; ring: Mesh; fill: Mesh; tier: number };
@@ -226,7 +378,11 @@ pit.on('died', (d) => {
 	deathBanner.style.display = '';
 	setTimeout(() => (deathBanner.style.display = 'none'), d.respawnMs);
 });
-pit.on('board', (board) => renderBoard(board));
+pit.on('hello', (hello) => {
+	if (hello.restored) toast(`You entered ${roomZone(hello.roomX, hello.roomY)}: restored from hibernation (${hello.roomKills} kills here so far)`);
+});
+const boards = createBoardWatcher(pitApi, 1000);
+boards.on((board) => renderBoard(board));
 
 function renderBoard(board: BoardSnapshot): void {
 	const me = api.last?.principal;
@@ -380,15 +536,13 @@ stage.onFrame((now, dtMs) => {
 	const pending = stats?.pending ?? 0;
 	const tickMs = stats?.tickMs ?? 0;
 	const tickMax = stats?.tickMaxMs ?? 0;
-	const slowMs = stats?.slowMs ?? 0;
 	hud.row('You', api.last === undefined ? '—' : `${api.last.name} · ${api.last.principal}`);
 	hud.row('HP', me === undefined ? '—' : me.dead ? 'dead' : String(me.hp));
 	hud.row('Facts pending (zone)', String(pending));
 	hud.row('Facts saved (zone)', String(stats?.committed ?? 0));
 	hud.row('My unsaved kills', String(pit.unsaved.size));
-	hud.row('Storage latency', slowMs > 0 ? `${slowMs} ms (slow)` : 'normal');
-	hud.row('Server tick interval', `${tickMs.toFixed(1)} ms avg · ${tickMax.toFixed(1)} max`);
-	hud.row('Tick work', `${stats?.workUs ?? 0} µs`);
+	hud.row('Kills in this room', String(stats?.kills ?? 0));
+	hud.row('Room tick interval', `${tickMs.toFixed(1)} ms avg · ${tickMax.toFixed(1)} max`);
 	const profile = pit.profile();
 	if (profile !== undefined) {
 		const span = Math.max(1, profile.nextLevelXp - profile.levelXp);
@@ -399,10 +553,12 @@ stage.onFrame((now, dtMs) => {
 	}
 	field('pending').textContent = String(pending);
 	field('saved').textContent = String(savedCount);
-	field('note').textContent = slow || slowMs > 0
-		? `Storage is slow: each commit waits ${slowMs} ms. Pending climbs, the tick does not.`
-		: 'Storage is fast: facts settle within a tick or two.';
+	field('note').textContent = 'Kills settle in your Crawler cell next to the room on celld; the tick never waits for them.';
+	const here = pit.room();
+	if (here !== undefined) showRoom(here);
 	if (now - lastSampleAt > 250) {
+		drawRooms();
+		renderDebug();
 		lastSampleAt = now;
 		samples.push({ pending, tick: tickMs });
 		if (samples.length > 120) samples.shift();
@@ -415,6 +571,6 @@ declare global {
 		mobpit?: unknown;
 	}
 }
-window.mobpit = { client, api, pitApi, pit, scene };
+window.mobpit = { client, api, pitApi, pit, scene, rooms, boards };
 
 client.connect(zone).catch((error: unknown) => hud.row('Status', `failed: ${String(error)}`));

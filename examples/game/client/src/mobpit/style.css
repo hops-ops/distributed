@@ -118,3 +118,61 @@
 		width: 220px;
 	}
 }
+/* Rooms minimap (zone status read model) and the debug overlay. */
+.pit-rooms {
+	position: fixed;
+	right: 12px;
+	bottom: 16px;
+	width: 234px;
+	padding: 10px 12px;
+	border-radius: 8px;
+	background: var(--panel);
+	box-sizing: border-box;
+}
+.pit-rooms h2 {
+	margin: 0 0 6px;
+	font-size: 13px;
+}
+.pit-rooms h2 small {
+	color: var(--muted);
+	font-weight: normal;
+}
+.pit-rooms .c-active {
+	color: #4caf50;
+}
+.pit-rooms .c-dormant {
+	color: #f2c94c;
+}
+.pit-rooms .c-hibernated {
+	color: #6c7aa0;
+}
+.pit-rooms .c-cold {
+	color: #556070;
+}
+.pit-debug {
+	margin-top: 6px;
+	font: 11px/1.4 monospace;
+	color: var(--muted);
+	word-break: break-word;
+}
+.pit-toasts {
+	position: fixed;
+	top: 12px;
+	left: 50%;
+	transform: translateX(-50%);
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	pointer-events: none;
+	z-index: 10;
+}
+.pit-toast {
+	padding: 8px 14px;
+	border-radius: 6px;
+	background: #1f3a4d;
+	color: #e8f4ff;
+	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+.label.door {
+	color: #4dd0e1;
+}

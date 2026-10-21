@@ -110,7 +110,7 @@ async fn settled_kills_project_into_live_player_stats() {
     let routes =
         game_demos::common::relay::relay_routes(world.celld().secret.clone(), world.projection());
     tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
-    let sink = world.fact_sink();
+    let sink = game_demos::mobpit::store::kill_sink(world.celld()).unwrap();
     // A kill settled before the bus is attached waits in the Queue (the
     // relay answers 503 and the consumer retries).
     sink.commit(&kill("k0", "dev-ana", 2, "ana")).await.unwrap();

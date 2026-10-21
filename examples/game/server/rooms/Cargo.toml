@@ -1,0 +1,28 @@
+# Mob Pit's rooms: the zone (combat, mobs, doorways, hibernation) on the
+# seeded room grid. Portable: the celld cells worker hosts every room as a
+# Durable Object (`celld` feature, wasm32); `game_demos` links the same zone
+# natively for the client surface, unit tests and bots.
+[package]
+name = "mobpit_rooms"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Mob Pit rooms: the zone and its celld object hooks (dev demo)"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+# `CelldZone` for the room zone (wasm32): what the cells worker needs.
+celld = ["distributed_game/celld-zone"]
+
+[dependencies]
+distributed_game = { path = "../../../../distributed_game" }
+game_sim = { path = "../sim" }
+mobpit_crawler = { path = "../crawler" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+distributed_game = { path = "../../../../distributed_game", features = ["cell"] }

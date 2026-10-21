@@ -1,63 +1,66 @@
-//! **Mob Pit** (+ **Leaderboard**) — non-blocking durable facts, crash
-//! recovery and authoritative combat; kills projected into sorted-set
-//! leaderboards.
+//! **Mob Pit** (+ **Leaderboard**) — a near-infinite grid of rooms joined by
+//! doorways, authoritative melee combat, kills settled exactly once in the
+//! players' durable cells, and live room status.
 //!
-//! - [`zone`]: the 30 Hz zone (players, 12 mobs with a telegraphed attack
-//!   state machine, melee cones). A kill emits a fact and keeps ticking.
-//! - [`crawler`]: the per-player `Crawler` aggregate and its one command;
-//!   XP is decided there, the principal comes from the trusted session.
-//! - [`store`]: the zone server's side of the celld cells
-//!   (`examples/game/cells`): the `FactSink` (with the "slow storage"
-//!   latency knob) that routes facts to them via
-//!   `distributed_game::celld::CelldFactSink`, and the cell reader.
-//! - [`directory`]: the crawler list, a projection of the cells' domain
-//!   events (outbox → Queue → `crate::common::relay` → bus).
-//! - [`board`]: kills/XP leaderboards (in-memory or Redis), fire-and-forget
-//!   live updates, idempotent apply keys, rebuild from the cells' events.
-//! - [`presence`]: who is online where, projected from the runtime's player
-//!   lifecycle facts (`HostConfig::lifecycle_facts`), ordered by fact stamp.
-//! - [`routes`]: dev routes (`/dev/mobpit/*`).
+//! The rooms run on **celld**: every room (`pit.<x>.<y>`) is a Durable
+//! Object of the cells worker (`examples/game/cells`, zone code in
+//! `mobpit_rooms`, hosted by `distributed_game::celld_zone`). celld decides
+//! which node runs a room; the game never does. A room's kill facts go to
+//! the killer's Crawler cell object to object; its lifecycle (active /
+//! dormant / hibernated) goes to its zone-activity cell.
 //!
-//! `game-demos mobpit` and `game-demos leaderboard` start the same server
-//! (one process hosts the pit and the boards); they differ only in the page
-//! `run.sh` opens. Durable state is in celld (`--celld-url` / `CELLD_URL`,
-//! secret `DISTRIBUTED_INTERNAL_SECRET`); `run.sh` and the tests start
-//! `celld dev` with `examples/game/cells`. `--data-dir` / `MOBPIT_DATA_DIR`
-//! keeps the persisted ticket secret (so guests keep their identity across
-//! a restart, the crash-recovery demo) and the default projection bus.
+//! This process (`game-demos mobpit|leaderboard`) is the services side, no
+//! room runs here:
+//! - [`routes`]: the dev routes — `/dev/ticket` mints room tickets for
+//!   guests (signed with the secret the rooms verify), `/dev/mobpit/*`.
+//! - [`world`]: the projection bus the cells' outbox Queue relays onto
+//!   (`crate::common::relay`), the crawler directory ([`directory`]), the
+//!   rooms' status (`zone_status`, for the minimap) and the leaderboards
+//!   ([`board`]) fed from the directory.
+//! - [`store`]: reads of the Crawler and presence cells.
+//!
+//! `--data-dir` / `MOBPIT_DATA_DIR` keeps the dev ticket secret (shared
+//! with the rooms through celld's `GAME_TICKET_SECRET`; guests keep their
+//! identity across restarts) and the default projection bus.
 
 pub mod board;
 pub mod crawler;
 pub mod directory;
-pub mod presence;
 pub mod routes;
 pub mod store;
 pub mod world;
 pub mod zone;
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use distributed_game::net::{GameServer, ServerConfig};
+use distributed_game::net::TicketKey;
 
-use crate::common::{self, random_hex, Demo, DemoArgs, DemoOptions, Guests, RunningDemo};
+use crate::common::relay::relay_routes;
+use crate::common::{random_hex, shutdown_signal, DemoArgs};
 pub use world::{MobPitWorld, WorldOptions};
 pub use zone::{encode_bot_input, game_surface, MobPit};
+
+/// Room ids this demo admits (`pit.<x>.<y>`).
+pub fn hosts_zone(zone_id: &str) -> bool {
+    mobpit_rooms::parse_room(zone_id).is_some()
+}
 
 /// `game-demos mobpit|leaderboard` options.
 #[derive(Debug, Clone, clap::Args)]
 pub struct MobPitArgs {
-    /// Shared demo options.
+    /// Shared demo options (`--secret` / `DISTRIBUTED_GAME_SECRET` is the
+    /// rooms' ticket secret, `GAME_TICKET_SECRET` on celld).
     #[command(flatten)]
     pub common: DemoArgs,
-    /// celld serving `examples/game/cells` (the Crawler and presence
-    /// cells). The internal secret comes from
-    /// `DISTRIBUTED_INTERNAL_SECRET`.
+    /// celld serving `examples/game/cells` (the rooms and their cells).
+    /// The internal secret comes from `DISTRIBUTED_INTERNAL_SECRET`.
     #[arg(long, env = "CELLD_URL")]
     pub celld_url: String,
     /// Directory of local dev files: the persisted dev ticket secret, the
-    /// default projection bus and the crawler directory's read models.
+    /// default projection bus and this server's read models.
     /// Default: `$TMPDIR/game-demos-mobpit`.
     #[arg(long, env = "MOBPIT_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
@@ -67,58 +70,54 @@ pub struct MobPitArgs {
     /// Redis key prefix of the boards (`mobpit-service` reads the same).
     #[arg(long, env = "MOBPIT_REDIS_PREFIX", default_value = mobpit_crawler::BOARD_REDIS_PREFIX)]
     pub redis_prefix: String,
-    /// Start with this artificial storage latency (ms).
-    #[arg(long, env = "MOBPIT_STORAGE_LATENCY_MS", default_value_t = 0)]
-    pub storage_latency_ms: u64,
-    /// SQLite bus (`sqlite:/path/bus.db`) the Crawler cells'
-    /// `crawler.mob_killed` domain events are published to (relayed from
-    /// celld's outbox Queue); `mobpit-service` and this server's crawler
-    /// directory project them. Default: `sqlite:{data-dir}/bus.db`.
+    /// SQLite bus the cells' domain events are published to (relayed from
+    /// celld's outbox Queue); `mobpit-service` and this server project it.
+    /// Default: `sqlite:{data-dir}/bus.db`.
     #[arg(long, env = "MOBPIT_PROJECTION_BUS")]
     pub projection_bus: Option<String>,
 }
 
-/// Demo registration.
-pub struct MobPitDemo;
+/// The services running on a Tokio task.
+pub struct RunningServices {
+    /// Bound address.
+    pub addr: SocketAddr,
+    /// Resolves when the server stopped.
+    pub task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
 
-impl Demo for MobPitDemo {
-    type Zone = MobPit;
-    const NAME: &'static str = "mobpit";
-    const DEFAULT_ZONE: &'static str = "pit-1";
-
-    fn hosts_zone(zone_id: &str) -> bool {
-        zone_id.starts_with("pit-")
-    }
-
-    /// Plain `common::spawn` gets a throwaway world (temp dir, in-memory
-    /// board, no routes of its own) on the celld named by `CELLD_URL` and
-    /// `DISTRIBUTED_INTERNAL_SECRET`; use [`spawn`] / [`run`] instead.
-    fn server(config: ServerConfig, guests: Guests) -> GameServer<MobPit> {
-        let celld = store::CelldOptions::from_env().expect("Mob Pit needs celld");
-        let world = MobPitWorld::open(WorldOptions::temporary(celld))
-            .expect("mobpit world (needs a Tokio runtime)");
-        world.server(config, guests).0
+impl RunningServices {
+    /// `http://addr`.
+    pub fn http_url(&self) -> String {
+        format!("http://{}", self.addr)
     }
 }
 
-/// Start Mob Pit over `world` (tests; dev routes need `options.dev`).
+/// Serve `world` on `listener` until `signal` (tests): the internal relay
+/// route always, the dev routes when `dev`.
 pub fn spawn(
     listener: tokio::net::TcpListener,
-    options: DemoOptions,
+    key: TicketKey,
+    dev: bool,
     world: Arc<MobPitWorld>,
     signal: impl Future<Output = ()> + Send + 'static,
-) -> std::io::Result<RunningDemo<MobPitDemo>> {
-    common::spawn_with::<MobPitDemo>(
-        listener,
-        options,
-        move |config, guests| world.server(config, guests),
-        signal,
-    )
+) -> std::io::Result<RunningServices> {
+    let addr = listener.local_addr()?;
+    let mut app = relay_routes(world.celld().secret.clone(), world.projection());
+    if dev {
+        app = app.merge(routes::routes(world, key));
+    }
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(signal)
+            .await
+    });
+    Ok(RunningServices { addr, task })
 }
 
-/// Dev ticket secret kept in the data dir, so guest tokens (and therefore
-/// principals) survive a server restart.
-fn persisted_secret(dir: &std::path::Path) -> std::io::Result<String> {
+/// The dev ticket secret kept in the data dir (`dev-ticket-secret`), so
+/// guests keep their identity across restarts; `run.sh` gives the same
+/// file to celld as the rooms' `GAME_TICKET_SECRET`.
+pub fn persisted_secret(dir: &std::path::Path) -> std::io::Result<String> {
     let path = dir.join("dev-ticket-secret");
     if let Ok(secret) = std::fs::read_to_string(&path) {
         let secret = secret.trim().to_string();
@@ -126,6 +125,7 @@ fn persisted_secret(dir: &std::path::Path) -> std::io::Result<String> {
             return Ok(secret);
         }
     }
+    std::fs::create_dir_all(dir)?;
     let secret = random_hex(64);
     std::fs::write(&path, &secret)?;
     #[cfg(unix)]
@@ -136,8 +136,8 @@ fn persisted_secret(dir: &std::path::Path) -> std::io::Result<String> {
     Ok(secret)
 }
 
-/// CLI entry: connect to the cells, rebuild the board from them, serve.
-pub async fn run(mut args: MobPitArgs) -> std::io::Result<()> {
+/// CLI entry: open the services, rebuild the board from the cells, serve.
+pub async fn run(args: MobPitArgs) -> std::io::Result<()> {
     let data_dir = args
         .data_dir
         .clone()
@@ -155,15 +155,10 @@ pub async fn run(mut args: MobPitArgs) -> std::io::Result<()> {
     let world = MobPitWorld::start(options)
         .await
         .map_err(std::io::Error::other)?;
-    world
-        .sink_state()
-        .set_latency(std::time::Duration::from_millis(args.storage_latency_ms));
-    if args.common.secret.is_none() {
-        args.common.secret = Some(persisted_secret(&data_dir)?);
-    }
-    // Board = projection of the cells: rebuild it from the crawler
-    // directory before accepting players (the in-memory board starts
-    // empty; Redis may have missed updates).
+    let ticket_secret = match args.common.secret.clone() {
+        Some(secret) => secret,
+        None => persisted_secret(&data_dir)?,
+    };
     match world.rebuild_board().await {
         Ok(report) => eprintln!(
             "mobpit: leaderboard rebuilt from cells: {}",
@@ -171,16 +166,24 @@ pub async fn run(mut args: MobPitArgs) -> std::io::Result<()> {
         ),
         Err(error) => eprintln!("mobpit: leaderboard rebuild failed (serving anyway): {error}"),
     }
-    let bus = world.bus_url().to_string();
-    eprintln!(
-        "mobpit: celld {} · projection bus {bus} · data dir {} · boot {} · leaderboard {}",
+    let listener =
+        tokio::net::TcpListener::bind((args.common.host.as_str(), args.common.port)).await?;
+    let running = spawn(
+        listener,
+        TicketKey::new(ticket_secret),
+        args.common.dev,
+        world.clone(),
+        shutdown_signal(),
+    )?;
+    // Parsed by run.sh and the client tests: keep the format.
+    println!("LISTENING http://{}", running.addr);
+    println!(
+        "demo mobpit · rooms on celld {} (ws …/rooms/{}) · projection bus {} · leaderboard {} · dev routes {}",
         args.celld_url,
-        data_dir.display(),
-        world.boot(),
-        world.board().backend()
+        mobpit_rooms::ENTRANCE,
+        world.bus_url(),
+        world.board().backend(),
+        if args.common.dev { "ON" } else { "off" }
     );
-    common::run_with::<MobPitDemo>(args.common, move |config, guests| {
-        world.server(config, guests)
-    })
-    .await
+    running.task.await.map_err(std::io::Error::other)?
 }
