@@ -461,6 +461,21 @@ impl Zone for GridZone {
         }
     }
 
+    /// A reloaded page (fresh ticket for a slot it still holds): keep the
+    /// walker where it is, greet the new client session.
+    fn on_rejoin(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        match self.walkers.get(&player) {
+            Some(w) if !w.leaving => {
+                let hello = self.hello(ctx, Some(w.entity));
+                ctx.send(player, &hello);
+            }
+            _ => {
+                self.walkers.remove(&player);
+                self.on_join(ctx, player);
+            }
+        }
+    }
+
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId, _reason: LeaveReason) {
         self.walkers.remove(&player);
     }
@@ -678,5 +693,50 @@ mod tests {
         assert_eq!(decode_carried(&bytes), Some((0.5, 31.0, "Ana".into())));
         assert_eq!(decode_carried(&encode_carried(99.0, 1.0, "x")), None);
         assert_eq!(decode_carried(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn a_reload_keeps_the_walker() {
+        use distributed_game::{HostConfig, ManualClock, Role, TicketClaims, Viewer, ZoneHost};
+        let clock = ManualClock::new();
+        let mut host = ZoneHost::<GridZone>::new(
+            "cell.0.0",
+            HostConfig::default(),
+            std::sync::Arc::new(clock.clone()),
+            GridConfig {
+                guests: Guests::default(),
+                host_id: "A".into(),
+                seed: 7,
+                cell: (0, 0),
+            },
+        );
+        let claims = TicketClaims::new("guest-ana", "cell.0.0", u64::MAX, "n1", Role::Player);
+        let joined = host.join(&claims, 0, "").expect("join");
+        let Viewer::Player(player) = joined.viewer else {
+            panic!("player")
+        };
+        for seq in 1..=20u32 {
+            let input = MoveInput {
+                mx: 127,
+                my: 60,
+                buttons: 0,
+            };
+            host.push_input(joined.client, seq, seq, &input.to_payload());
+            clock.advance(std::time::Duration::from_millis(33));
+            host.advance();
+        }
+        let at = |host: &ZoneHost<GridZone>| {
+            let w = &host.zone().walkers[&player];
+            (w.x, w.y)
+        };
+        let before = at(&host);
+        assert_ne!(before, (CELL / 2.0, CELL / 2.0), "walked");
+        host.disconnect(joined.client, false);
+        let claims = TicketClaims::new("guest-ana", "cell.0.0", u64::MAX, "n2", Role::Player);
+        let again = host.join(&claims, 0, "").expect("rejoin");
+        assert_eq!(again.viewer, Viewer::Player(player));
+        clock.advance(std::time::Duration::from_millis(33));
+        host.advance();
+        assert_eq!(at(&host), before, "same walker");
     }
 }
