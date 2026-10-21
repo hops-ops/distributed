@@ -144,6 +144,8 @@ function messageFromJson(decoded, schema) {
 			return { type: 'Ping', clientTime: decoded.client_time };
 		case 'Leave':
 			return { type: 'Leave' };
+		case 'Content':
+			return { type: 'Content', contentVersion: decoded.content_version };
 		case 'Welcome':
 			return {
 				type: 'Welcome',
@@ -224,6 +226,8 @@ function messageToJson(message, kinds) {
 			return { client_time: message.clientTime, type: 'Ping' };
 		case 'Leave':
 			return { type: 'Leave' };
+		case 'Content':
+			return { content_version: message.contentVersion, type: 'Content' };
 		case 'Welcome':
 			return {
 				content_version: message.contentVersion,
@@ -432,7 +436,7 @@ test('decoders reject malformed input like the Rust reference', () => {
 	assert.throws(() => new WireReader(fromHex('ffffffff10')).varuint(), /VARINT_OVERFLOW/);
 	assert.throws(() => new WireReader(fromHex('02')).bool(), /INVALID/);
 	assert.throws(() => new WireReader(fromHex('02c328')).string(), /INVALID_UTF8/);
-	assert.throws(() => decodeClientMessage(fromHex('05')), /UNKNOWN_MESSAGE/);
+	assert.throws(() => decodeClientMessage(fromHex('06')), /UNKNOWN_MESSAGE/);
 	// A delta update for an unknown entity id.
 	const { messages } = fixture('messages.json');
 	const delta = messages.find((m) => m.name === 'delta');

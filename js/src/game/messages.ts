@@ -21,6 +21,7 @@ export const GameMessageTag = Object.freeze({
 	INPUT: 0x02,
 	PING: 0x03,
 	LEAVE: 0x04,
+	CONTENT: 0x05,
 	WELCOME: 0x80,
 	DELTA: 0x81,
 	EVENT: 0x82,
@@ -84,7 +85,9 @@ export type InputMessage = Readonly<{
 }>;
 export type PingMessage = Readonly<{ type: 'Ping'; clientTime: number }>;
 export type LeaveMessage = Readonly<{ type: 'Leave' }>;
-export type GameClientMessage = HelloMessage | InputMessage | PingMessage | LeaveMessage;
+/** The client patched its content live and now runs `contentVersion`. */
+export type ContentMessage = Readonly<{ type: 'Content'; contentVersion: string }>;
+export type GameClientMessage = HelloMessage | InputMessage | PingMessage | LeaveMessage | ContentMessage;
 
 export type GameRole = 'player' | 'observer';
 
@@ -177,6 +180,9 @@ export function encodeClientMessage(message: GameClientMessage): Uint8Array {
 		case 'Leave':
 			w.u8(GameMessageTag.LEAVE);
 			break;
+		case 'Content':
+			w.u8(GameMessageTag.CONTENT).string(message.contentVersion);
+			break;
 	}
 	return w.finish();
 }
@@ -205,6 +211,9 @@ export function decodeClientMessage(bytes: Uint8Array): GameClientMessage {
 			break;
 		case GameMessageTag.LEAVE:
 			message = { type: 'Leave' };
+			break;
+		case GameMessageTag.CONTENT:
+			message = { type: 'Content', contentVersion: r.string() };
 			break;
 		default:
 			throw new GameDecodeError('UNKNOWN_MESSAGE', `message type 0x${tag.toString(16)}`);

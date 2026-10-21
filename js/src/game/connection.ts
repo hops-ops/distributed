@@ -403,13 +403,18 @@ export class GameConnection {
 	}
 
 	/**
-	 * Content version presented in the next Hello (reconnects, reloads).
-	 * For clients that patch content live (e.g. after a Resume with a new
-	 * version) without a reload round-trip; the server learns it on the
-	 * next Hello.
+	 * The app patched its content live to `contentVersion` (e.g. after a
+	 * Resume with a new version), without a reload round-trip: presented in
+	 * the next Hello (reconnects, reloads) and, on an open player
+	 * connection, told to the server at once (`Content`), which records it
+	 * when it is the zone's current version (the player is no longer stale).
 	 */
 	setContentVersion(contentVersion: string): void {
+		const changed = contentVersion !== this.#contentVersion;
 		this.#contentVersion = contentVersion;
+		if (changed && this.#state === 'open' && this.mirror.welcome?.role === 'player') {
+			this.#send({ type: 'Content', contentVersion });
+		}
 	}
 
 	/**

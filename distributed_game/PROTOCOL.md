@@ -194,6 +194,7 @@ replication priorities are not transmitted.
 | `0x02` | C→S | Input |
 | `0x03` | C→S | Ping |
 | `0x04` | C→S | Leave |
+| `0x05` | C→S | Content |
 | `0x80` | S→C | Welcome |
 | `0x81` | S→C | Delta |
 | `0x82` | S→C | Event |
@@ -216,6 +217,7 @@ Hello  := 0x01, varuint protocol_version, string content_version,
 Input  := 0x02, varuint seq, varuint client_tick, bytes payload
 Ping   := 0x03, f64 client_time
 Leave  := 0x04
+Content := 0x05, string content_version
 ```
 
 - **Hello** MUST be the first message, sent within the server's hello
@@ -239,6 +241,12 @@ Leave  := 0x04
 - **Ping**: the server answers with Pong immediately.
 - **Leave**: graceful exit; the player is removed at once (no reconnect
   grace).
+- **Content**: the client patched its content live (typically after a
+  `Resume` carrying a new version) and now runs `content_version`. The
+  server records it for the connection's player only when it equals the
+  zone's current content version (a client can catch up, never get
+  ahead) and ignores it otherwise; observers' are ignored. Without it a
+  live-patched client counts as stale until its next Hello.
 
 Worked example — Hello (`version 1, content "c1", caps 5, ticket "t.k.n"`):
 

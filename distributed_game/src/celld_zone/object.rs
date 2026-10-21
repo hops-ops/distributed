@@ -33,13 +33,15 @@ use crate::facts::{
 use crate::handoff::{HandoffRequest, Transfer};
 use crate::inbox::ZoneInbound;
 use crate::netsim::{DelayLine, NetSim, NetSimJson};
-use crate::protocol::{error, ClientMessage, Role, ServerMessage, PROTOCOL_VERSION};
+use crate::protocol::{error, ClientMessage, Notice, Role, ServerMessage, PROTOCOL_VERSION};
 use crate::stamp::FactStamp;
 use crate::ticket::{NonceCache, TicketKey, VerifiedTicket};
+use crate::world::content_rollout::{zone_step, ContentState, ZoneStep, CONTENT_ROLLOUT_KIND};
 use crate::world::zone_activity::{
     zone_principal, RecordActivity, ACTIVITY_ACTIVE, ACTIVITY_DORMANT, ACTIVITY_HIBERNATED,
     ZONE_ACTIVITY_KIND,
 };
+use crate::world::FreezeState;
 use crate::zone::Viewer;
 use crate::{ClientId, Clock, HostConfig, Outbound, TicketClaims, Zone, ZoneHost};
 
@@ -430,6 +432,8 @@ struct Inner<Z: CelldZone> {
     /// Spawns a drain task waking at the given time (set by the object).
     drainer: Option<Rc<dyn Fn(f64)>>,
     last_dev_read_ms: f64,
+    /// Last read of the world's content rollout cell.
+    last_content_read_ms: f64,
     /// [`CelldZone::refresh`] calls of this activation, and the last one.
     refresh_round: u64,
     last_refresh_ms: f64,
@@ -704,6 +708,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             drain_at: None,
             drainer: None,
             last_dev_read_ms: 0.0,
+            last_content_read_ms: 0.0,
             refresh_round: 0,
             last_refresh_ms: 0.0,
         };
@@ -826,6 +831,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 .encode(&())
                 {
                     let _ = ws.send_with_bytes(pong);
+                }
+            }
+            (Some(client), ClientMessage::Content { content_version }) => {
+                let mut inner = self.inner.borrow_mut();
+                if let Some(host) = inner.host.as_mut() {
+                    host.content_patched(ClientId(client), &content_version);
                 }
             }
             (Some(client), ClientMessage::Leave) => {
@@ -1029,6 +1040,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
             host_config.idle_tick_rate = None;
             host_config.reconnect_grace = options.reconnect_grace;
             host_config.boot_epoch = (now_ms() * 1000.0) as u64;
+            // The content version the zone slept on (a rollout it missed is
+            // caught up by `read_content`).
+            if let Some(snapshot) = &stored {
+                host_config.content_version = snapshot.version.clone();
+            }
             let key = inner.key.clone().expect("ticket key with options");
             let issuer_zone = zone_id.clone();
             let generation = inner.activation_epoch;
@@ -1101,6 +1117,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
         // with the player's inputs waiting) does not wait for dev settings.
         let this = self.handle();
         wasm_bindgen_futures::spawn_local(async move { this.read_dev_settings().await });
+        // The snapshot restored the zone's last content version; catch up
+        // with a rollout it slept through (off the join path too: a Hello
+        // on another version waits for its own read, see `hello`).
+        let this = self.handle();
+        wasm_bindgen_futures::spawn_local(async move { this.read_content().await });
         self.refresh();
         Ok(())
     }
@@ -1174,6 +1195,85 @@ impl<Z: CelldZone> ZoneObject<Z> {
             self.inner.borrow_mut().last_dev_read_ms = now_ms();
             let this = self.handle();
             wasm_bindgen_futures::spawn_local(async move { this.read_dev_settings().await });
+        }
+    }
+
+    /// Read the world's content rollout cell and follow it
+    /// ([`zone_step`]: freeze, apply + resume).
+    async fn read_content(&self) {
+        let world = {
+            let mut inner = self.inner.borrow_mut();
+            inner.last_content_read_ms = now_ms();
+            inner
+                .options
+                .as_ref()
+                .and_then(|o| o.content_rollout.clone())
+        };
+        let Some(world) = world else {
+            return;
+        };
+        match self.env.read_cell(CONTENT_ROLLOUT_KIND, &world).await {
+            Ok(value) => {
+                let state = value
+                    .get("state")
+                    .cloned()
+                    .and_then(|state| serde_json::from_value::<ContentState>(state).ok());
+                if let Some(state) = state {
+                    self.apply_content(&state);
+                }
+            }
+            Err(e) => worker::console_warn!("content rollout: {e}"),
+        }
+    }
+
+    fn apply_content(&self, state: &ContentState) {
+        let mut inner = self.inner.borrow_mut();
+        let Some(host) = inner.host.as_mut() else {
+            return;
+        };
+        let frozen = host.freeze_state() != FreezeState::Running;
+        let current = host.config().content_version.clone();
+        match zone_step(state, &current, frozen) {
+            ZoneStep::Stay => return,
+            ZoneStep::Freeze => {
+                host.request_freeze(Notice {
+                    reason: "content_update".into(),
+                    version: state.target.clone(),
+                    notes: state.notes.clone(),
+                });
+            }
+            ZoneStep::Apply(version) => {
+                host.set_content_version(version.clone());
+                if frozen {
+                    host.resume(Notice {
+                        reason: "content_updated".into(),
+                        version,
+                        notes: state.notes.clone(),
+                    });
+                }
+                if state.hard {
+                    host.reload_stale_players();
+                }
+            }
+        }
+        inner.flush();
+    }
+
+    /// [`read_content`](Self::read_content) off the tick, at most every
+    /// [`DEV_SETTINGS_EVERY_MS`].
+    fn refresh_content(&self) {
+        let due = {
+            let inner = self.inner.borrow();
+            inner
+                .options
+                .as_ref()
+                .is_some_and(|o| o.content_rollout.is_some())
+                && now_ms() - inner.last_content_read_ms >= DEV_SETTINGS_EVERY_MS
+        };
+        if due {
+            self.inner.borrow_mut().last_content_read_ms = now_ms();
+            let this = self.handle();
+            wasm_bindgen_futures::spawn_local(async move { this.read_content().await });
         }
     }
 
@@ -1252,6 +1352,23 @@ impl<Z: CelldZone> ZoneObject<Z> {
             }
             if claims.role == Role::Player {
                 principal = Some(claims.principal.clone());
+            }
+            // A client on another content version than the zone: the zone
+            // may be behind the world (it slept through a rollout), so it
+            // learns the live version before deciding.
+            let behind = {
+                let inner = self.inner.borrow();
+                inner
+                    .options
+                    .as_ref()
+                    .is_some_and(|o| o.content_rollout.is_some())
+                    && inner
+                        .host
+                        .as_ref()
+                        .is_some_and(|h| h.config().content_version != hello.content_version)
+            };
+            if behind {
+                self.read_content().await;
             }
             let mut inner = self.inner.borrow_mut();
             let Some(host) = inner.host.as_mut() else {
@@ -1408,6 +1525,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             };
             self.spool().await;
             self.refresh_dev_settings();
+            self.refresh_content();
             self.refresh_if_due();
             if persist {
                 self.persist().await;
@@ -1607,6 +1725,10 @@ impl<Z: CelldZone> ZoneObject<Z> {
             "droppedTicks": stats.dropped,
             "lateMs": { "p50": stats.late.percentile(0.5), "p99": stats.late.percentile(0.99) },
             "netsim": NetSim::to_json(inner.net_sim),
+            "content": host.map(|h| json!({
+                "version": h.config().content_version,
+                "freeze": format!("{:?}", h.freeze_state()).to_lowercase(),
+            })),
             "workMs": { "p50": stats.work.percentile(0.5), "p99": stats.work.percentile(0.99) },
         })
     }

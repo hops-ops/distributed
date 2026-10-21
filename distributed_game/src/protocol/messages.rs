@@ -18,6 +18,8 @@ pub mod tag {
     pub const PING: u8 = 0x03;
     /// Client → server Leave.
     pub const LEAVE: u8 = 0x04;
+    /// Client → server Content (patched live to a content version).
+    pub const CONTENT: u8 = 0x05;
     /// Server → client Welcome.
     pub const WELCOME: u8 = 0x80;
     /// Server → client Delta.
@@ -121,6 +123,13 @@ pub enum ClientMessage {
     },
     /// Graceful leave (no reconnect grace).
     Leave,
+    /// The client patched its content live (after a `Resume` with a new
+    /// version) and now runs `content_version`. Only the zone's current
+    /// version is accepted; anything else is ignored.
+    Content {
+        /// The version the client runs now.
+        content_version: String,
+    },
 }
 
 impl ClientMessage {
@@ -152,6 +161,9 @@ impl ClientMessage {
             Self::Leave => {
                 w.u8(tag::LEAVE);
             }
+            Self::Content { content_version } => {
+                w.u8(tag::CONTENT).string(content_version);
+            }
         }
         w.into_bytes()
     }
@@ -176,6 +188,9 @@ impl ClientMessage {
                 client_time: r.f64()?,
             },
             tag::LEAVE => Self::Leave,
+            tag::CONTENT => Self::Content {
+                content_version: r.string()?,
+            },
             other => return Err(DecodeError::UnknownMessage(other)),
         };
         r.finish()?;

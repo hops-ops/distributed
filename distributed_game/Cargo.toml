@@ -98,6 +98,11 @@ path = "tests/zone_lease/main.rs"
 required-features = ["cell"]
 
 [[test]]
+name = "content_rollout"
+path = "tests/content_rollout/main.rs"
+required-features = ["cell"]
+
+[[test]]
 name = "zone_state"
 path = "tests/zone_state/main.rs"
 required-features = ["cell"]

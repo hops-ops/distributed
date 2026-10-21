@@ -68,6 +68,20 @@
 //! Only a player wakes a zone. A watcher joining a dormant zone gets its
 //! current state at once ([`ZoneHost::patch_now`](crate::ZoneHost::patch_now)).
 //!
+//! **Live content updates.** With `ZONE_CONTENT_ROLLOUT=<world>` every
+//! zone object follows the world's
+//! [`content_rollout`](crate::world::content_rollout) cell
+//! ([`ContentRolloutCell`], binding `CONTENT_ROLLOUT`): it reads it on wake
+//! and every second while it ticks and runs
+//! [`zone_step`](crate::world::content_rollout::zone_step) — freeze with
+//! the change notes, then switch to the new version and resume (a hard
+//! rollout reloads stale clients at once). A zone that slept through a
+//! rollout restores its snapshot's version and catches up on wake; a Hello
+//! whose content version differs from the zone's waits for that read
+//! before admission, so a doorway into a sleeping zone admits on the live
+//! version. Stale clients are handled by the host's
+//! [`StalePolicy`](crate::world::StalePolicy).
+//!
 //! Dev only: with `ZONE_DEV_SETTINGS=1` every zone object applies the
 //! network simulation ([`NetSim`](crate::netsim::NetSim): latency, jitter,
 //! loss per socket and direction) stored in the worker's
@@ -89,13 +103,13 @@ mod object;
 
 pub use plan::{
     cell_binding, ObjectOptions, RoomState, StoredFact, TickSchedule, CLOSE_RESTARTED,
-    DEV_SETTINGS_VAR, NETSIM_SHARD, ZONE_DEV_KIND, ZONE_HEADER,
+    CONTENT_ROLLOUT_VAR, DEV_SETTINGS_VAR, NETSIM_SHARD, ZONE_DEV_KIND, ZONE_HEADER,
 };
 
 #[cfg(target_arch = "wasm32")]
 pub use cells::{
-    authenticate, cell_alarm, error_response, fact_sessions, json_status, serve_cell, Sessions,
-    ZoneActivityCell, ZoneDevSettings,
+    authenticate, cell_alarm, error_response, fact_sessions, json_status, serve_cell,
+    ContentRolloutCell, Sessions, ZoneActivityCell, ZoneDevSettings,
 };
 #[cfg(target_arch = "wasm32")]
 pub use object::{

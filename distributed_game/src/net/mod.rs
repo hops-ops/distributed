@@ -266,6 +266,11 @@ enum ZoneCmd {
         client: ClientId,
         graceful: bool,
     },
+    /// The client patched its content live.
+    Content {
+        client: ClientId,
+        version: String,
+    },
     /// A zone inbox message (decoded into `Z::Message` on the zone task).
     Deliver {
         inbound: inbox::WireInbound,
@@ -1443,6 +1448,9 @@ fn handle_cmd<Z: Zone>(
             conns.remove(&client);
             host.disconnect(client, graceful);
         }
+        ZoneCmd::Content { client, version } => {
+            host.content_patched(client, &version);
+        }
         ZoneCmd::ChildEvent(event) => host.deliver_child_event(event),
         ZoneCmd::Deliver { inbound, reply } => {
             let _ = reply.send(inbound.decode::<Z::Message>().map(|m| host.deliver(m)));
@@ -1624,6 +1632,7 @@ enum Inbound {
         payload: Vec<u8>,
     },
     Ping(f64),
+    Content(String),
 }
 
 async fn connection<Z>(inner: Arc<Inner<Z>>, zone_id: String, mut socket: WebSocket)
@@ -1879,6 +1888,7 @@ where
                         Inbound::Input { seq, client_tick, payload }
                     }
                     Ok(ClientMessage::Ping { client_time }) => Inbound::Ping(client_time),
+                    Ok(ClientMessage::Content { content_version }) => Inbound::Content(content_version),
                     Ok(ClientMessage::Leave) => { graceful = true; break; }
                     Ok(ClientMessage::Hello(_)) => {
                         let _ = socket.send(Message::Binary(error_frame(error::BAD_MESSAGE, "already joined").into())).await;
@@ -1971,6 +1981,10 @@ async fn forward_in<Z: Zone>(
                 client_tick,
                 payload,
             })
+            .await
+            .is_ok(),
+        Inbound::Content(version) => zone
+            .send(ZoneCmd::Content { client, version })
             .await
             .is_ok(),
         Inbound::Ping(client_time) => {

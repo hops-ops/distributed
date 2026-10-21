@@ -439,6 +439,31 @@ impl<Z: Zone> Ctx<'_, Z> {
         &self.core.config.content_version
     }
 
+    /// Content version `player`'s client runs (what it presented on its
+    /// last Hello; differs from [`content_version`](Self::content_version)
+    /// for a stale client kept under [`StalePolicy::SafeRoom`]).
+    pub fn player_content_version(&self, player: PlayerId) -> Option<&str> {
+        self.core
+            .players
+            .get(&player)
+            .map(|slot| slot.content_version.as_str())
+    }
+
+    /// True when `player`'s client runs older content than the zone (it
+    /// may only be handed off into a gate zone, unless the policy roams).
+    pub fn is_stale(&self, player: PlayerId) -> bool {
+        let expected = &self.core.config.content_version;
+        !expected.is_empty()
+            && self
+                .player_content_version(player)
+                .is_some_and(|version| version != expected)
+    }
+
+    /// The host's [`StalePolicy`].
+    pub fn stale_policy(&self) -> StalePolicy {
+        self.core.config.stale_policy
+    }
+
     /// Remote config version ([`HostConfig::config_version`]).
     pub fn config_version(&self) -> &str {
         &self.core.config.config_version
@@ -1409,6 +1434,26 @@ impl<Z: Zone> ZoneHost<Z> {
             self.reload_player(*player);
         }
         stale.len()
+    }
+
+    /// A client patched its content live and now runs `version`
+    /// (`ClientMessage::Content`): recorded for its player only when it is
+    /// the zone's current version (a client can catch up, never get
+    /// ahead). Returns whether it was recorded.
+    pub fn content_patched(&mut self, client: ClientId, version: &str) -> bool {
+        if version != self.core.config.content_version {
+            return false;
+        }
+        let Some(Viewer::Player(player)) = self.viewer_of(client) else {
+            return false;
+        };
+        match self.core.players.get_mut(&player) {
+            Some(slot) => {
+                slot.content_version = version.to_string();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Content version a player's client reported.

@@ -99,6 +99,9 @@ fn client_json(m: &ClientMessage) -> Value {
             json!({ "type": "Ping", "client_time": client_time })
         }
         ClientMessage::Leave => json!({ "type": "Leave" }),
+        ClientMessage::Content { content_version } => {
+            json!({ "type": "Content", "content_version": content_version })
+        }
     }
 }
 
@@ -347,6 +350,12 @@ fn messages() {
             },
         ),
         ("leave", ClientMessage::Leave),
+        (
+            "content",
+            ClientMessage::Content {
+                content_version: "c2".into(),
+            },
+        ),
     ];
     for (name, msg) in client {
         let bytes = msg.encode();

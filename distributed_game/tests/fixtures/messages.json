@@ -56,6 +56,15 @@
     },
     {
       "decoded": {
+        "content_version": "c2",
+        "type": "Content"
+      },
+      "direction": "client_to_server",
+      "hex": "05026332",
+      "name": "content"
+    },
+    {
+      "decoded": {
         "content_version": "c1",
         "patch_rate": 20,
         "reconnect_token": "rt",
