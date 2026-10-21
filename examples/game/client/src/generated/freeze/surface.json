@@ -4,6 +4,65 @@
   ],
   "constants": [
     {
+      "name": "arena_floor",
+      "type": {
+        "name": "ArenaFloor",
+        "type": "record"
+      },
+      "value": {
+        "dash_cooldown": 45,
+        "half": 20.0,
+        "pillars": [
+          {
+            "r": 2.5,
+            "x": 0.0,
+            "y": 0.0
+          },
+          {
+            "r": 1.5,
+            "x": -9.0,
+            "y": -9.0
+          },
+          {
+            "r": 1.5,
+            "x": 9.0,
+            "y": -9.0
+          },
+          {
+            "r": 1.5,
+            "x": -9.0,
+            "y": 9.0
+          },
+          {
+            "r": 1.5,
+            "x": 9.0,
+            "y": 9.0
+          },
+          {
+            "r": 1.0,
+            "x": 0.0,
+            "y": -14.0
+          },
+          {
+            "r": 1.0,
+            "x": 0.0,
+            "y": 14.0
+          },
+          {
+            "r": 1.0,
+            "x": -14.0,
+            "y": 0.0
+          },
+          {
+            "r": 1.0,
+            "x": 14.0,
+            "y": 0.0
+          }
+        ],
+        "player_radius": 0.5
+      }
+    },
+    {
       "name": "freeze_world",
       "type": {
         "name": "FreezeWorld",
@@ -573,6 +632,39 @@
     {
       "fields": [
         {
+          "name": "half",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "player_radius",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "dash_cooldown",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "pillars",
+          "type": {
+            "item": {
+              "name": "Pillar",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        }
+      ],
+      "name": "ArenaFloor"
+    },
+    {
+      "fields": [
+        {
           "name": "hub",
           "type": {
             "name": "ZoneLayout",
@@ -717,6 +809,29 @@
         }
       ],
       "name": "Pack"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "r",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "Pillar"
     },
     {
       "fields": [

@@ -245,6 +245,12 @@ pub struct PitWorld {
     pub default_seed: u32,
     /// Floor half extent (m).
     pub half: f32,
+    /// Player capsule radius (m).
+    pub player_radius: f32,
+    /// Dash cooldown in command frames (the HUD meter).
+    pub dash_cooldown: u8,
+    /// The pillars every room has (room-local).
+    pub pillars: Vec<arena::Pillar>,
     /// Doorway half width (m).
     pub door_half: f32,
     /// Room edge length (m): room `(x, y)` is centred at world `(x, y) × room_size`.
@@ -264,6 +270,9 @@ pub fn pit_world() -> PitWorld {
     PitWorld {
         default_seed: DEFAULT_SEED,
         half: arena::HALF,
+        player_radius: arena::PLAYER_RADIUS,
+        dash_cooldown: arena::DASH_COOLDOWN,
+        pillars: arena::arena_floor().pillars,
         door_half: DOOR_HALF,
         room_size: ROOM_SIZE,
         passage: PASSAGE,

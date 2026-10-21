@@ -3,6 +3,21 @@
 // Do not edit: change the Rust definitions and regenerate.
 import { decodeGameEvent, decodePayload, decodeValue, encodePayload, encodeValue, onGameEvent, type DecodedGameEvent, type GameEventCodecs, type GameEventSource, type PayloadLayout, type WireType } from '@hops-ops/distributed/game';
 
+/** Record `Pillar` (`#[derive(GameRecord)]`). */
+export interface Pillar {
+	readonly x: number;
+	readonly y: number;
+	readonly r: number;
+}
+
+/** Record `ArenaFloor` (`#[derive(GameRecord)]`). */
+export interface ArenaFloor {
+	readonly half: number;
+	readonly playerRadius: number;
+	readonly dashCooldown: number;
+	readonly pillars: readonly Pillar[];
+}
+
 /** Record `Portal` (`#[derive(GameRecord)]`). */
 export interface Portal {
 	readonly x: number;

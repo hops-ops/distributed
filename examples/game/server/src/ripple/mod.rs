@@ -53,9 +53,9 @@ use distributed_game::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::arena::movement::{self, MoveState};
 use crate::cluster::{ClusterDemo, World};
 use crate::common::{Demo, Guests};
+use game_sim::arena::{self as movement, MoveState};
 
 /// Root zone.
 pub const REALM: &str = "realm";
@@ -214,6 +214,7 @@ pub fn game_surface() -> GameSurface {
         .events::<RippleEvent>()
         .predict::<HoodStep>()
         .constant("ripple_world", &ripple_world())
+        .constant("arena_floor", &game_sim::arena::arena_floor())
 }
 
 /// Kind id of [`TierView`] (tests mirror fields by it).

@@ -59,7 +59,7 @@ const surfaces = readdirSync(GENERATED)
 	});
 
 test('every predicting demo has a compiled step and a native trace', () => {
-	assert.deepEqual(surfaces.map((s) => s.name).sort(), ['arena', 'freeze', 'grid', 'mobpit', 'ripple']);
+	assert.deepEqual(surfaces.map((s) => s.name).sort(), ['freeze', 'grid', 'mobpit', 'ripple']);
 	assert.equal(traces.abi, 1);
 	for (const { name, predict } of surfaces) {
 		assert.ok(existsSync(new URL(`${name}/wasm/${name}.wasm`, GENERATED)), `${name}: run \`run.sh gen\``);
@@ -209,7 +209,7 @@ test('cost: generating a grid cell and sampling a point in WASM', async () => {
 
 test('cost: one predicted step and a reconciliation replaying 10 inputs at 30 Hz', async () => {
 	const report = {};
-	for (const name of ['arena', 'grid']) {
+	for (const name of ['mobpit', 'grid']) {
 		const generated = await import(`../src/generated/${name}/index.ts`);
 		const prediction = generated[`create${name[0].toUpperCase()}${name.slice(1)}Prediction`]();
 		await prediction.ready;

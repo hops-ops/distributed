@@ -126,6 +126,38 @@ impl CrawlerCells {
         Ok(body)
     }
 
+    /// The rooms' dev settings under `shard` (`distributed_game::celld_zone`'s
+    /// `zone-dev` object; `{}` when unset).
+    pub async fn dev_settings(&self, shard: &str) -> Result<Value, String> {
+        self.get(distributed_game::netsim::ZONE_DEV_KIND, shard)
+            .await
+    }
+
+    /// Replace the rooms' dev settings under `shard` (every room reads them
+    /// within a second).
+    pub async fn set_dev_settings(&self, shard: &str, value: &Value) -> Result<Value, String> {
+        let url = format!(
+            "{}/{}/{}",
+            self.base,
+            distributed_game::netsim::ZONE_DEV_KIND,
+            encode_segment(shard)
+        );
+        let response = self
+            .client
+            .put(&url)
+            .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
+            .json(value)
+            .send()
+            .await
+            .map_err(|error| format!("celld unreachable at {url}: {error}"))?;
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            return Err(format!("PUT {url}: HTTP {status}: {body}"));
+        }
+        Ok(body)
+    }
+
     /// The durable presence entry of `principal` (`null` when none).
     pub async fn presence(&self, principal: &str) -> Result<Value, String> {
         Ok(self.get(PRESENCE_KIND, principal).await?["current"].take())

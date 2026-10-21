@@ -50,12 +50,61 @@
           "forest",
           "meadow"
         ],
+        "dash_cooldown": 45,
         "default_seed": 186474221,
         "door_half": 2.5,
         "half": 20.0,
         "hysteresis": 0.5,
         "max_room": 1000000,
         "passage": 2.0,
+        "pillars": [
+          {
+            "r": 2.5,
+            "x": 0.0,
+            "y": 0.0
+          },
+          {
+            "r": 1.5,
+            "x": -9.0,
+            "y": -9.0
+          },
+          {
+            "r": 1.5,
+            "x": 9.0,
+            "y": -9.0
+          },
+          {
+            "r": 1.5,
+            "x": -9.0,
+            "y": 9.0
+          },
+          {
+            "r": 1.5,
+            "x": 9.0,
+            "y": 9.0
+          },
+          {
+            "r": 1.0,
+            "x": 0.0,
+            "y": -14.0
+          },
+          {
+            "r": 1.0,
+            "x": 0.0,
+            "y": 14.0
+          },
+          {
+            "r": 1.0,
+            "x": -14.0,
+            "y": 0.0
+          },
+          {
+            "r": 1.0,
+            "x": 14.0,
+            "y": 0.0
+          }
+        ],
+        "player_radius": 0.5,
         "room_size": 40.0
       }
     }
@@ -118,6 +167,12 @@
             "name": "room_kills",
             "type": {
               "type": "u32"
+            }
+          },
+          {
+            "name": "view_radius",
+            "type": {
+              "type": "f32"
             }
           }
         ],
@@ -748,6 +803,29 @@
     {
       "fields": [
         {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "r",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "Pillar"
+    },
+    {
+      "fields": [
+        {
           "name": "seed",
           "type": {
             "type": "u32"
@@ -849,6 +927,28 @@
           "name": "half",
           "type": {
             "type": "f32"
+          }
+        },
+        {
+          "name": "player_radius",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "dash_cooldown",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "pillars",
+          "type": {
+            "item": {
+              "name": "Pillar",
+              "type": "record"
+            },
+            "type": "list"
           }
         },
         {

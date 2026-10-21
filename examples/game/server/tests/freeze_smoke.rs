@@ -10,7 +10,7 @@ use distributed_game::bots::{run_bots, BotConfig, RandomWalk};
 use distributed_game::net::TicketKey;
 use distributed_game::world::HostAddr;
 use distributed_game::FreezeState;
-use game_demos::arena;
+
 use game_demos::freeze::content::{Hazard, Pack, EMBER, HUB, MEADOW};
 use game_demos::freeze::world::{assignment, start_host, HostSpec, WorldHost};
 use serde_json::{json, Value};
@@ -125,7 +125,7 @@ fn bots(url: String, zone: &str) -> BotConfig {
     config.duration = Duration::from_millis(2600);
     config.content_version = "v1".into();
     config.principal_prefix = format!("bot-{zone}");
-    config.encoder = Arc::new(arena::encode_bot_input);
+    config.encoder = Arc::new(game_demos::freeze::encode_bot_input);
     config
 }
 

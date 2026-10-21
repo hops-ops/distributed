@@ -16,14 +16,16 @@
       { "name": "GEM_POUCH", "class_name": "GemPouchCell" },
       { "name": "CONTENT_LOG", "class_name": "ContentLogCell" },
       { "name": "PIT_ROOM", "class_name": "PitRoom" },
-      { "name": "ZONE_ACTIVITY", "class_name": "ZoneActivityObject" }
+      { "name": "ZONE_ACTIVITY", "class_name": "ZoneActivityObject" },
+      { "name": "ZONE_DEV", "class_name": "ZoneDevObject" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["CrawlerCell", "PresenceCell"] },
     { "tag": "v2", "new_sqlite_classes": ["ZoneLeaseCell", "ZoneStateCell"] },
     { "tag": "v3", "new_sqlite_classes": ["GemPouchCell", "ContentLogCell"] },
-    { "tag": "v4", "new_sqlite_classes": ["PitRoom", "ZoneActivityObject"] }
+    { "tag": "v4", "new_sqlite_classes": ["PitRoom", "ZoneActivityObject"] },
+    { "tag": "v5", "new_sqlite_classes": ["ZoneDevObject"] }
   ],
   // Hibernation snapshots above the inline limit (celld's object storage).
   "r2_buckets": [
@@ -52,6 +54,9 @@
     "ZONE_PATCH_HZ": "20",
     "ZONE_PERSIST_MS": "5000",
     "ZONE_HIBERNATE_AFTER_MS": "10000",
-    "ZONE_FACT_SERVICE": "mobpit-rooms"
+    "ZONE_FACT_SERVICE": "mobpit-rooms",
+    // Dev demo: rooms apply the network simulation of the HUD sliders
+    // (`zone-dev/netsim`, written by the services' `/dev/netsim`).
+    "ZONE_DEV_SETTINGS": "1"
   }
 }

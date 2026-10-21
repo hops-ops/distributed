@@ -3,7 +3,7 @@
  * e.g. a zone's `hello` (own entity id) that arrives right after joining:
  *
  * ```ts
- * const hello = latest<arena.HelloEvent>((h) => typed.on('hello', h));
+ * const hello = latest<pit.HelloEvent>((h) => typed.on('hello', h));
  * ```
  */
 export type Latest<T> = Readonly<{

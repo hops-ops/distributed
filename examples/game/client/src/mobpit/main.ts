@@ -15,6 +15,14 @@
  * (Space): the grey "saving…" popup turns into "+XP saved ✓" when the kill
  * settled in your Crawler cell. The debug overlay (O) shows which celld
  * node and isolate run the room — celld decides, the game never does.
+ *
+ * Network panel (the HUD): latency / jitter / loss sliders apply to every
+ * room on celld (each room object delays its sockets' frames both ways);
+ * your capsule is predicted (the Rust step as WASM) and reconciled — P
+ * turns prediction off to feel the raw round trip, G shows the server's
+ * authoritative position as a wireframe ghost, and the readout counts
+ * pending inputs and corrections. The ring on the floor is your interest
+ * radius: mobs and players beyond it are not replicated to you.
  */
 import type { StandardMaterial } from '@babylonjs/core/Materials/standardMaterial';
 import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture';
@@ -25,7 +33,6 @@ import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
-import { ARENA_FLOOR } from '../generated/arena/constants.ts';
 import {
 	BUTTON,
 	PIT_RULES,
@@ -42,7 +49,7 @@ import {
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
-import { createStage, material } from '../shared/scene.ts';
+import { createRing, createStage, material } from '../shared/scene.ts';
 import {
 	createBoardWatcher,
 	createMobPitClient,
@@ -57,8 +64,8 @@ import {
 	type RoomStatus
 } from './client.ts';
 
-/** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
-const { half: HALF, playerRadius: PLAYER_RADIUS, pillars: PILLARS } = ARENA_FLOOR;
+/** The rooms' floor, generated from the simulation's constants (`game_sim::mobpit::pit_world`). */
+const { half: HALF, playerRadius: PLAYER_RADIUS, pillars: PILLARS } = PIT_WORLD;
 /** Rooms drawn around yours (2 → 5×5). */
 const ROOM_VIEW = 2;
 /** Wall thickness and height (m), drawn just outside each room's floor. */
@@ -91,12 +98,21 @@ const { scene } = stage;
 
 const hud = new Hud({
 	title: 'Mob Pit',
-	hint: 'WASD move · Space attack · E dash · walk through a doorway to the next room · O debug overlay. Rooms run on celld; kills are durable facts.',
+	hint: 'WASD move · Space attack · E dash · walk through a doorway to the next room · O debug overlay · P prediction · G server ghost. Rooms run on celld; kills are durable facts.',
 	client,
 	devApi: api
 });
 let debug = params.get('debug') !== '0';
 hud.toggle('Debug overlay (celld node per room)', debug, (on) => (debug = on), 'o');
+hud.toggle('Client prediction', true, (on) => client.setPredictionEnabled(on), 'p');
+let ghostOn = true;
+hud.toggle('Server ghost', true, (on) => (ghostOn = on), 'g');
+let corrections = 0;
+let lastCorrection = 0;
+client.on('correction', (c) => {
+	corrections += 1;
+	lastCorrection = Math.hypot(c.errors.x ?? 0, c.errors.y ?? 0);
+});
 
 // ---- side panels: XP bar, durable facts graph, mini leaderboard ----
 const xpPanel = div('pit-xp', document.body);
@@ -237,8 +253,10 @@ const mats = {
 	hpBack: material(scene, 'hp-back', '#1b1b1b'),
 	hpFill: material(scene, 'hp-fill', '#e04848'),
 	tele: material(scene, 'tele', '#ff3b3b', 0.25),
-	teleFill: material(scene, 'tele-fill', '#ff3b3b', 0.45)
+	teleFill: material(scene, 'tele-fill', '#ff3b3b', 0.45),
+	ghost: material(scene, 'ghost', '#ffffff', 0.25)
 };
+mats.ghost.wireframe = true;
 for (const m of [mats.swing, mats.tele, mats.teleFill, mats.hpFill]) m.emissiveColor = m.diffuseColor.clone();
 mats.blade.emissiveColor = new Color3(0.6, 0.6, 0.7);
 const tierMats = new Map<number, StandardMaterial>();
@@ -415,6 +433,16 @@ function showRoom(zone: string): void {
 		hud.row('Room', `${zone} · ${PIT_WORLD.biomes[room.biome] ?? '?'} · danger ${room.danger} · ${room.mobs.length} mobs`);
 	}
 }
+
+// ---- network panel: server ghost and interest ring ----
+const ghost = MeshBuilder.CreateCapsule('ghost', { radius: PLAYER_RADIUS, height: 1.8 }, scene);
+ghost.material = mats.ghost;
+ghost.isPickable = false;
+ghost.setEnabled(false);
+/** Unit ring scaled to the room's interest radius (`hello.viewRadius`). */
+const interestRing = createRing(scene, 1, '#6cc4ff');
+interestRing.isPickable = false;
+interestRing.setEnabled(false);
 
 type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh };
 type MobVisual = { kind: 'mob'; body: Mesh; hpBack: Mesh; hpFill: Mesh; ring: Mesh; fill: Mesh; tier: number };
@@ -679,6 +707,22 @@ stage.onFrame((now, dtMs) => {
 	}
 	if (me !== undefined) stage.follow(me.at.x, me.at.z, dtMs);
 
+	// The server's own copy of you (authoritative, behind by the round
+	// trip): a wireframe ghost in the room that owns you.
+	const authoritative = client.predictor?.authoritative();
+	let ghostGap: number | undefined;
+	if (authoritative !== undefined && authority !== undefined) {
+		const g = playerFields({ fields: authoritative });
+		ghost.position.copyFrom(placeIn(authority.zoneId, g.x, g.y, 0.9));
+		if (me !== undefined) ghostGap = Math.hypot(ghost.position.x - me.at.x, ghost.position.z - me.at.z);
+	}
+	ghost.setEnabled(ghostOn && authoritative !== undefined && !(stage.view() === 'first' && (ghostGap ?? 0) < 0.8));
+	interestRing.setEnabled(me !== undefined && hello !== undefined);
+	if (me !== undefined && hello !== undefined) {
+		interestRing.position.set(me.at.x, 0, me.at.z);
+		interestRing.scaling.setAll(hello.viewRadius);
+	}
+
 	// ---- HUD ----
 	hud.frame({ entities: rendered.length });
 	const pending = stats?.pending ?? 0;
@@ -691,6 +735,13 @@ stage.onFrame((now, dtMs) => {
 	hud.row('My unsaved kills', String(pit.unsaved.size));
 	hud.row('Kills in this room', String(stats?.kills ?? 0));
 	hud.row('Room tick interval', `${tickMs.toFixed(1)} ms avg · ${tickMax.toFixed(1)} max`);
+	const predictor = client.predictor;
+	hud.row('Prediction', client.predictionEnabled ? 'on (pit_step as WASM)' : 'off (raw round trip)');
+	hud.row('Pending inputs', String(predictor?.pending.length ?? 0));
+	hud.row('Ack seq', String(predictor?.lastAck ?? 0));
+	hud.row('Corrections', `${corrections} (last ${lastCorrection.toFixed(3)} m)`);
+	hud.row('Ghost gap', ghostGap === undefined ? '—' : `${ghostGap.toFixed(2)} m`);
+	hud.row('Interest', hello === undefined ? '—' : `${hello.viewRadius} m ring · ${rendered.filter((e) => isMob(e) && !e.stale).length} mobs replicated`);
 	const profile = pit.profile();
 	if (profile !== undefined) {
 		const span = Math.max(1, profile.nextLevelXp - profile.levelXp);

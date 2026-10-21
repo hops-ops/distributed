@@ -20,6 +20,19 @@ export const PIT_RULES: PitRules = {
 export const PIT_WORLD: PitWorld = {
 	defaultSeed: 186474221,
 	half: 20,
+	playerRadius: 0.5,
+	dashCooldown: 45,
+	pillars: [
+		{ x: 0, y: 0, r: 2.5 },
+		{ x: -9, y: -9, r: 1.5 },
+		{ x: 9, y: -9, r: 1.5 },
+		{ x: -9, y: 9, r: 1.5 },
+		{ x: 9, y: 9, r: 1.5 },
+		{ x: 0, y: -14, r: 1 },
+		{ x: 0, y: 14, r: 1 },
+		{ x: -14, y: 0, r: 1 },
+		{ x: 14, y: 0, r: 1 }
+	],
 	doorHalf: 2.5,
 	roomSize: 40,
 	passage: 2,

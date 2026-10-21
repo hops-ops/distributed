@@ -261,6 +261,8 @@ pub enum PitEvent {
         restored: bool,
         /// Mobs killed in this room so far.
         room_kills: u32,
+        /// Interest radius (m): what the room replicates around the player.
+        view_radius: f32,
     },
     /// Durable progress.
     #[game_event(id = 2)]
@@ -362,7 +364,10 @@ const SWING_FRAMES: u8 = 6;
 /// Player max HP.
 pub const PLAYER_HP: i32 = 100;
 const MAX_CREDITS: u8 = 4;
-const VIEW_RADIUS: f32 = 40.0;
+/// Interest radius (m): mobs and players farther away are not replicated
+/// (the page draws it as the interest ring). From any spawn point every mob
+/// home is inside it; walk to a corner and the far side drops out.
+pub const VIEW_RADIUS: f32 = 24.0;
 const AGGRO: f32 = 7.0;
 const LEASH: f32 = 15.0;
 const WINDUP_TICKS: u16 = 24;
@@ -1105,6 +1110,7 @@ impl MobPit {
                 seed: self.room.seed,
                 restored: self.restored,
                 room_kills: self.kills,
+                view_radius: VIEW_RADIUS,
             },
         );
     }

@@ -14,7 +14,8 @@
  * (toast, minimap active) → a player who reloads, or closes the browser and
  * signs in again, is the same player in the same room at the same place →
  * the SSR HTML after a reload has the settled
- * numbers → no page errors. The leaderboard is the services' Redis XP board,
+ * numbers → the network panel's latency slider raises the RTT on every room
+ * (and the server ghost trails the predicted player) → no page errors. The leaderboard is the services' Redis XP board,
  * served by mobpit-service's GraphQL board roots (SSR-seeded, `@live` from
  * the board change notices on the bus). Needs REDIS_URL.
  *
@@ -282,6 +283,24 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		await page.keyboard.up('KeyD');
 		const moved = await page.evaluate(() => document.querySelector('canvas').dataset.me.split(',').map(Number));
 		assert.ok(moved[0] > start[0] + 0.5 || Math.hypot(moved[0] - start[0], moved[1] - start[1]) > 0.5, `moved ${start} → ${moved}`);
+
+		// Network panel: the latency slider sets the rooms' simulated network
+		// (dev route → the cells worker's dev settings → every room on celld
+		// delays its sockets); the RTT rises, the server ghost trails the
+		// predicted player while walking, and it all drops back.
+		const rtt = () => page.textContent('[data-testid=rtt]').then(Number);
+		const baseRtt = await rtt();
+		assert.equal((await fetch(`${ORIGIN}/api/dev/netsim`)).status, 401, 'signed-out: no network control');
+		await page.locator('[data-testid=latency]').fill('100');
+		await page.waitForSelector('[data-testid=netsim-status]:text-is("applied to every room")', { timeout: 5_000 });
+		await page.waitForFunction((b) => Number(document.querySelector('[data-testid=rtt]')?.textContent) > b + 150, baseRtt, { timeout: 15_000 });
+		await page.keyboard.down('KeyA');
+		await page.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.ghostGap ?? 0) > 0.3, null, { timeout: 5_000 });
+		await page.keyboard.up('KeyA');
+		console.error(`network panel: rtt ${baseRtt} → ${await rtt()} ms with 100 ms one way, ghost gap seen > 0.3 m`);
+		await page.locator('[data-testid=latency]').fill('0');
+		await page.waitForFunction((b) => Number(document.querySelector('[data-testid=rtt]')?.textContent) < b + 60, baseRtt, { timeout: 15_000 });
+		assert.ok(Number(await page.textContent('[data-testid=corrections]')) >= 0);
 
 		// Attack: the server's swing reaches the client and the cone is drawn.
 		await page.keyboard.down('Space');

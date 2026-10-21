@@ -5,6 +5,9 @@
 //!   `distributed_game::celld_zone` (`mobpit_rooms::MobPit`). celld places
 //!   each room; its kill and lifecycle facts reach the Crawler and presence
 //!   cells below object to object, exactly once.
+//! - `zone-dev/{shard}` (`ZoneDevObject`, dev only): settings every room
+//!   reads (`ZONE_DEV_SETTINGS=1`): the network simulation of the HUD's
+//!   sliders.
 //! - `zone-activity/{room}` (`ZoneActivityObject`): each room's lifecycle
 //!   (active / dormant / hibernated); its `zone.activity_changed` events
 //!   leave through the outbox Queue for the zone status read model.
@@ -58,7 +61,7 @@ use distributed::microsvc::{
 };
 use distributed::{sourced, Aggregate, Entity};
 use distributed_game::cell::{fact_session_from_headers, session_stamp};
-use distributed_game::celld_zone::{forward_to_zone, ZoneActivityCell};
+use distributed_game::celld_zone::{forward_to_zone, ZoneActivityCell, ZoneDevSettings};
 use distributed_game::lifecycle::{
     Lifecycle, CONNECTION_LOST, PLAYER_DISCONNECTED, PLAYER_JOINED, PLAYER_LEFT, PLAYER_RECONNECTED,
 };
@@ -732,6 +735,26 @@ impl DurableObject for ZoneStateCell {
 
 distributed_game::celld_zone_object!(PitRoom, mobpit_rooms::MobPit);
 
+/// The rooms' dev settings (`zone-dev/{shard}`: the network simulation the
+/// rooms apply, written by the services' `/dev/netsim`).
+#[durable_object]
+pub struct ZoneDevObject {
+    dev: ZoneDevSettings,
+}
+
+impl DurableObject for ZoneDevObject {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        Self {
+            dev: ZoneDevSettings::new(state, env),
+        }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        self.dev.fetch(req).await
+    }
+}
+
 #[durable_object]
 pub struct ZoneActivityObject {
     cell: ZoneActivityCell,
@@ -782,6 +805,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Some("zone-lease") => "ZONE_LEASE",
         Some("zone-state") => "ZONE_STATE",
         Some(ZONE_ACTIVITY_KIND) => "ZONE_ACTIVITY",
+        Some(distributed_game::netsim::ZONE_DEV_KIND) => "ZONE_DEV",
         _ => return json_status(json!({ "error": "unknown cell kind" }), 404),
     };
     let Some(shard) = parts.get(1) else {

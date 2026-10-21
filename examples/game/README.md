@@ -8,8 +8,7 @@ guests and lets any page change the network simulation.
 
 | Demo | Run | Mechanic it demonstrates | Durable state |
 |---|---|---|---|
-| **Arena** | `./run.sh arena` | Fixed 30 Hz tick / 20 Hz patches, binary deltas, interest management (view ring, drones pop in/out), client prediction + reconciliation (the Rust movement step compiled to WebAssembly, bit-exact), interpolation of remote entities, live latency/jitter/loss | none (stateless: positions only live in the zone) |
-| **Mob Pit** | `./run.sh mobpit` (`--fleet` for a local multi-node celld) | A near-infinite seeded grid of rooms joined by doorways, **each room a celld Durable Object** (celld places, forwards, hibernates and recovers rooms; the debug overlay shows the node); authoritative melee combat vs. telegraphing mobs; kills are **non-blocking durable facts** settled exactly once in per-player cells; rooms you leave go dormant then asleep (live minimap from the zone status read model) and come back with their mobs | celld: `pit.<x>.<y>` rooms (snapshots), `crawler/{player}`, `presence/{player}`, `zone-activity/{room}`; crawler list and room status = read models projected from the cells' events |
+| **Mob Pit** | `./run.sh mobpit` (`--fleet` for a local multi-node celld) | A near-infinite seeded grid of rooms joined by doorways, **each room a celld Durable Object** (celld places, forwards, hibernates and recovers rooms; the debug overlay shows the node); authoritative melee combat vs. telegraphing mobs; a **network panel** (latency / jitter / loss applied by every room object on celld, client prediction of the Rust step as WASM with reconciliation, a server ghost, an interest ring: what is outside is not replicated); kills are **non-blocking durable facts** settled exactly once in per-player cells; rooms you leave go dormant then asleep (live minimap from the zone status read model) and come back with their mobs | celld: `pit.<x>.<y>` rooms (snapshots), `crawler/{player}`, `presence/{player}`, `zone-activity/{room}`; crawler list and room status = read models projected from the cells' events |
 | **Leaderboard** | `./run.sh leaderboard` | Same setup as Mob Pit: kills/XP sorted-set boards (in-memory or Redis) fed from the projected crawler list with idempotent `max` updates, your rank + neighbours, rebuild from the cells' event history | celld (the Mob Pit cells); boards are a projection (memory or Redis) |
 | **Shooting Gallery** | `./run.sh gallery` | Lag compensation: hitscan shots resolved with `ctx.rewind().hit_test_shot` at the shooter's view time (`client_tick` + interpolation delay in the payload), `max_rewind` clamp, per-shot compensation on/off, predicted vs confirmed hits | none (stateless: score is per session) |
 | **The Freeze** | `./run.sh freeze` | World-version barrier (`WorldCoordinator::rollout`) across **two server processes** as an in-world "admin update": freeze → apply → resume with change notes, inputs dropped while frozen, Hard reload vs safe-room gating (`StalePolicy::SafeRoom`, `Zone::is_gate`) of old clients, aborted rollout (`freeze_ready` → `NotAcked`), facts/events stamped with the content version | celld: `gem-pouch/{player}`, `content-log/{zone}` |
@@ -23,14 +22,14 @@ list` lists demos.
 
 **How the demos are written.** Each zone describes its world with the
 `distributed_game` authoring derives: `#[derive(Replicated)]` view structs
-for the kinds (`arena::PlayerView`, `mobpit::zone::MobView`, …),
-`#[derive(GameInput)]` for the input frame (`arena::movement::MoveInput`,
+for the kinds (`mobpit::zone::PlayerView`, `mobpit::zone::MobView`, …),
+`#[derive(GameInput)]` for the input frame (`game_sim::mobpit::PitInput`,
 `gallery::ShotInput`, …), `#[derive(GameEvent)]` enums for events
 (`mobpit::zone::PitEvent`) and `#[derive(FactCommand)]` on the cell
 command inputs they emit as facts (`mobpit::crawler::RecordKillInput`).
 The movement that clients predict is declared once with `#[predict]` in
 the `game_sim` crate (`server/sim/`, no server dependencies):
-`arena_step` (Arena, The Freeze), `pit_step` (Mob Pit), `hood_step` (Boss
+`arena_step` (The Freeze), `pit_step` (Mob Pit), `hood_step` (Boss
 Ripple) and `grid_step` (Endless Grid, whose context is the world seed and
 cell); the zones call those functions in `on_tick`. Each demo module
 exports `game_surface()`; `run.sh gen` runs `distributed game-manifest` on
@@ -46,9 +45,9 @@ typed field accessors (`mobFields(entity).hp`), the input encoder and typed
 No simulation or content code is written twice. Movement is the compiled
 step; the Endless Grid's terrain, biomes and props come from the compiled
 `grid_cell` / `grid_sample` (`createGridPures`); static data the pages
-draw is a generated constant from the Rust values (`ARENA_FLOOR` — floor
-size, pillars, capsule radius, used by every Arena-floor page —
-`GRID_WORLD`, `FREEZE_WORLD`, `PIT_RULES` tier radii, `RIPPLE_WORLD` zone
+draw is a generated constant from the Rust values (`PIT_WORLD` — room
+size, doorways, pillars, capsule radius —, `ARENA_FLOOR` for The Freeze and
+Boss Ripple, `GRID_WORLD`, `FREEZE_WORLD`, `PIT_RULES` tier radii, `RIPPLE_WORLD` zone
 hierarchy, `GALLERY_COURSE` rails); The Freeze's content packs are a Rust
 record served in its payload encoding and decoded by the generated
 `decodePack`. What TypeScript still mirrors is small and listed under
@@ -63,23 +62,28 @@ test imports natively).
 ## Run
 
 ```sh
-examples/game/run.sh arena
-# → open http://localhost:5173/arena/   (?name=Ana&zone=arena-2 optional)
+examples/game/run.sh mobpit
+# → open http://localhost:5173/mobpit/   (?name=Ana&zone=pit.1.0 optional)
 ```
 
 The script builds the JS SDK if `js/dist` is stale, runs `npm ci` for the
-client, builds `game-demos`, starts it on `127.0.0.1:2567` with `--dev`, then
-runs Vite (which proxies `/zones` (WebSocket), `/dev` and `/metrics` to the
-server). Ports: `GAME_DEMOS_PORT`, `GAME_DEMOS_CLIENT_PORT`. Open a second tab
-to see another player interpolated. Server metrics: `/metrics`.
+client, builds `game-demos` and the cells worker, starts `celld dev` (the
+rooms), the services on `127.0.0.1:2567` with `--dev`, then runs Vite (which
+proxies `/rooms` (WebSocket) to celld and `/dev` to the services). Ports:
+`GAME_DEMOS_PORT`, `GAME_DEMOS_CLIENT_PORT`. Open a second browser (or
+`?player=two`) to see another player interpolated.
 
-Arena controls: WASD / arrows / left stick to move (camera-relative, drag to
-orbit), Space / Shift / gamepad A to dash. **P** toggles client prediction
-(off = your capsule is drawn like everyone else's, one RTT + 100 ms behind
-your keys), **G** the wireframe ghost at the latest server position. The
-NetSim sliders change the server's simulated one-way latency (applied in
-both directions), jitter and loss (a TCP-like retransmit delay) for every
-connection.
+Network panel (Mob Pit's HUD): **P** toggles client prediction (off = your
+capsule is drawn like everyone else's, one RTT + the interpolation delay
+behind your keys), **G** the wireframe ghost at the room's latest
+authoritative position; the readout shows pending inputs, the last acked
+input and corrections. The NetSim sliders set the simulated one-way latency
+(applied in both directions), jitter and loss (a TCP-like retransmit delay)
+for **every room on celld**: `/dev/netsim` writes the cells worker's dev
+settings object (`zone-dev/netsim`), every room object reads it within a
+second and delays its sockets' frames and inputs (`distributed_game::netsim`,
+`ZONE_DEV_SETTINGS=1`). The dashed ring is your interest radius
+(`hello.viewRadius`, 24 m): mobs and players outside it are not replicated.
 
 Shooting Gallery controls: click a target (or Space / gamepad A through the
 crosshair), drag to look. **C** toggles lag compensation (sent with every
@@ -364,16 +368,16 @@ errors.
  │       GameClient (SDK)            │ ───────────────► │   │   guest principal (server-made) │
  │       ├ GameConnection  ws ───────┼─ /zones/{zone} ─►│   │   /dev/netsim → set_net_sim     │
  │       ├ EntityReplica (interp.)   │ ◄─ Welcome/Delta │   └ GameServer::serve_with          │
- │       └ Predictor ── arena.wasm   │                  │   ZoneHost<Arena> 30 Hz             │
+ │       └ Predictor ── mobpit.wasm  │                  │   ZoneHost<Freeze> 30 Hz            │
  │ src/shared/ hud · input · scene   │                  │     └ game_sim::arena::arena_step   │
- │ src/generated/arena (typed glue)  │  GET /metrics    │   GET /metrics (Prometheus)         │
- │   └ wasm/arena.wasm ◄═════════════╪══ distributed game-wasm (same Rust, wasm32) ══╝          │
+ │ src/generated/<demo> (typed glue) │  GET /metrics    │   GET /metrics (Prometheus)         │
+ │   └ wasm/<demo>.wasm ◄════════════╪══ distributed game-wasm (same Rust, wasm32) ══╝          │
  └──────────────────────────────────┘                  └─────────────────────────────────────┘
 ```
 
 Prediction is exact because (1) every input is one command frame of exactly
 one tick (sent by the SDK's `InputPacer`), consumed one per tick with a small
-credit bank (`distributed_game::InputCredits`, `arena::MAX_CREDITS`), (2) the
+credit bank (`distributed_game::InputCredits`, a room's `MAX_CREDITS`), (2) the
 client runs the server's own Rust step compiled to WebAssembly, over a
 binary ABI that keeps every binary32 bit, and the step uses only operations
 that round identically on every target (`+ - * /`, `sqrt`, comparisons; no
@@ -392,7 +396,7 @@ What the TypeScript still restates, and why it stays:
 
 - **Zone id formats and defaults** — `grid.<x>.<y>` (`zoneId` /
   `parseZone` in `grid/client.ts`) and each page's default zone
-  (`arena-1`, `pit-1`, …). They are addressing, needed synchronously before
+  (`pit.0.0`, `freeze-hub`, …). They are addressing, needed synchronously before
   any module loads; a mismatch fails loudly (the server rejects the zone).
 - **Dev / admin HTTP JSON shapes** — `WorldMap`, `WorldStatus`,
   `BoardPosition`: debugging routes outside the game surface.
@@ -410,7 +414,8 @@ examples/game/
   scripts/round-robin.mjs    dev TCP balancer in front of a local celld fleet (`run.sh mobpit --fleet`)
   cells/                     crate `game-demo-cells` (own workspace, wasm32, worker-build): Mob
                              Pit's rooms (`PitRoom`, one Durable Object per room) and the demos'
-                             celld cells — Crawler + presence + zone activity (Mob Pit), gem
+                             celld cells — Crawler + presence + zone activity + dev settings
+                             (`ZoneDevObject`: the rooms' NetSim) (Mob Pit), gem
                              pouch + content log (The Freeze), zone lease + zone state
                              (multi-host demos), and the `game-demo-outbox` Queue consumer (relay)
   server/                    Rust crate `game_demos`, its own cargo workspace (with sim/,
@@ -436,15 +441,13 @@ examples/game/
                              zone_status.rs (zone lease/snapshot/activity status read model)
     src/devcelld.rs          `celld dev` harness for tests (own project, port, process tree)
     src/cluster.rs           multi-host demos: --host-id/--peer, directory, ownership, snapshots
-    src/arena/               Arena zone (`movement` = `game_sim::arena`)
     src/mobpit/              Mob Pit services (the rooms run on celld): dev room tickets, relay,
                              crawler directory and room status projections, leaderboards
     src/gallery/             Shooting Gallery zone (targets, rewind hit tests)
     src/freeze/              The Freeze zone, content packs, two-host world + admin routes
     src/grid/                Endless Grid zone (`world` = `game_sim::grid`), dev map routes
     src/ripple/              Boss Ripple tiers and placement
-    tests/                   arena_smoke.rs (bots, dev routes),
-                             mobpit_smoke.rs (facts, rooms on celld, celld crash, boards, presence),
+    tests/                   mobpit_smoke.rs (facts, rooms on celld, celld crash, boards, presence),
                              gallery_smoke.rs, freeze_smoke.rs (binary content packs), grid_smoke.rs,
                              ripple_smoke.rs (+ support/ for two in-process hosts)
   sveltekit/                 SvelteKit app over the Mob Pit server + mobpit-service (see SvelteKit above)
@@ -467,14 +470,14 @@ examples/game/
                              wasm/<demo>.wasm (gitignored build output);
                              `mobpit` also serves the leaderboard page
     src/shared/              hud.ts, input.ts, scene.ts, dev-api.ts, latest.ts, style.css
-    src/arena/               client.ts (headless), main.ts (Babylon)
     src/mobpit/              client.ts (headless + /dev/mobpit API), main.ts (Babylon), style.css
     src/leaderboard/         main.ts (DOM page over the observer connection), style.css
     src/gallery/             client.ts (shots, adaptive delay), main.ts
     src/freeze/              client.ts (content packs, live patch / reload, admin API), main.ts
     src/grid/, src/ripple/   client.ts (headless; grid: compiled world content), main.ts (Babylon)
     tests/                   prediction-wasm (native ↔ WASM exact match of steps + pure functions, cost),
-                             arena-headless, mobpit-headless, leaderboard-headless,
+                             mobpit-headless, mobpit-network-headless (NetSim on celld rooms,
+                             exact prediction, interest), mobpit-restarts-headless, leaderboard-headless,
                              gallery-headless, freeze-headless, grid-headless,
                              ripple-headless (+ helpers/demo-server.mjs, helpers/mobpit.mjs,
                              helpers/cluster.mjs for multi-host demos, helpers/celld.mjs for
@@ -503,9 +506,10 @@ evicted when idle, moved when idle, recovered elsewhere if its node
 crashes. The game never names a node; the debug overlay only *shows* the
 one celld chose.
 
-Controls: WASD / stick move (the Arena's movement, predicted by `pit_step`,
-same floor and pillars), **Space** attack (120° cone, 2.2 m), **E** dash,
-**O** debug overlay. Walk through a **doorway** — the glowing gap in the
+Controls: WASD / stick move (predicted by `pit_step`, the Rust step as
+WASM), **Space** attack (120° cone, 2.2 m), **E** dash, **O** debug
+overlay, **P** prediction, **G** server ghost (see the network panel under
+[Run](#run)). Walk through a **doorway** — the glowing gap in the
 middle of each wall (go beside the pillar on its axis) — into the
 neighbouring room. The rooms are **one continuous world**: room `(x, y)`
 sits at world `(x, y) × 40 m` (they share walls), the rooms around yours
@@ -626,7 +630,7 @@ counts exactly 200 in the cell.
 version pinned in the repository's `.celld-version` (`CELLD_BIN`, default
 `celld` on PATH; `scripts/celld.sh check` verifies it and prints the install
 command) and `worker-build` (`cargo install worker-build --locked`) for
-`cells/`. Only `arena` and `gallery` run without celld. The tests each
+`cells/`. Only `gallery` runs without celld. The tests each
 start their own `celld dev` on a temp project (`game_demos::devcelld`,
 `client/tests/helpers/celld.mjs`); the SvelteKit Playwright test starts a
 3-node fleet (`client/tests/helpers/fleet.mjs`) when docker and the aws CLI

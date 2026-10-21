@@ -73,6 +73,8 @@ export type PitLoopOptions = Readonly<{
 	hello: () => HelloEvent | undefined;
 	/** Steer to the nearest mob and swing (demo and headless test). */
 	autoHunt: () => boolean;
+	/** Draw the server's authoritative copy of you (the ghost). */
+	ghost?: () => boolean;
 }>;
 
 /** Start drawing on `canvas`; returns the stop function. */
@@ -203,6 +205,35 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 					ctx.lineWidth = 1;
 					ctx.strokeRect(...at(ox - HALF, oy + HALF), 2 * HALF * scale, 2 * HALF * scale);
 				}
+			}
+		}
+		// Interest ring: the room replicates mobs and players inside it only.
+		if (me !== undefined && hello !== undefined) {
+			const [mx, my] = at(me.x, me.y);
+			ctx.beginPath();
+			ctx.arc(mx, my, hello.viewRadius * scale, 0, Math.PI * 2);
+			ctx.strokeStyle = 'rgba(108,196,255,0.35)';
+			ctx.setLineDash([6, 6]);
+			ctx.lineWidth = 1.5;
+			ctx.stroke();
+			ctx.setLineDash([]);
+		}
+		// The ghost: the room's authoritative copy of you (behind by the round trip).
+		const authoritative = client.predictor?.authoritative();
+		const ghostZone = client.authority?.zoneId;
+		const ghostRoom = parseRoom(ghostZone);
+		if (authoritative !== undefined && ghostRoom !== undefined) {
+			const g = playerFields({ fields: authoritative });
+			const gw = { x: ghostRoom[0] * ROOM + g.x, y: ghostRoom[1] * ROOM + g.y };
+			if (me !== undefined) canvas.dataset.ghostGap = Math.hypot(gw.x - me.x, gw.y - me.y).toFixed(3);
+			if (options.ghost?.() ?? true) {
+				const [gx, gy] = at(gw.x, gw.y);
+				ctx.beginPath();
+				ctx.arc(gx, gy, PLAYER_RADIUS * scale, 0, Math.PI * 2);
+				ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+				ctx.setLineDash([3, 3]);
+				ctx.stroke();
+				ctx.setLineDash([]);
 			}
 		}
 		ctx.lineWidth = 1;

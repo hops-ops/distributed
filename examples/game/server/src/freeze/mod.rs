@@ -21,7 +21,7 @@
 //!   [`Zone::freeze_ready`]; the barrier times out (`NotAcked`) and every
 //!   zone resumes on the old version ("update aborted").
 //!
-//! Movement is the Arena's step ([`crate::arena::movement::arena_step`]),
+//! Movement is the Arena's step ([`movement::arena_step`]),
 //! which the client predicts with, compiled to WebAssembly.
 //!
 //! Entities: 1 `player` (the Arena's [`PlayerView`]), 2 `slime` (x y yaw),
@@ -46,10 +46,62 @@ use distributed_game::{
 };
 use serde::Serialize;
 
-use crate::arena::movement::{self, MoveInput, MoveState};
-use crate::arena::PlayerView;
 use crate::common::{Demo, Guests};
 use content::{Hazard, Pack, ZoneKind};
+/// The shared movement step (Mob Pit's capsule without doorways).
+pub use game_sim::arena as movement;
+use movement::{MoveInput, MoveState};
+
+/// A player's capsule: the full [`MoveState`] (so the client can rebase its
+/// prediction) plus the display name.
+#[derive(Debug, Clone, PartialEq, Replicated)]
+#[replicated(kind = "player", id = 1, priority = 2.0, global)]
+pub struct PlayerView {
+    /// Position x.
+    #[field_type(movement::POS)]
+    #[correct(ease = 150)]
+    pub x: f32,
+    /// Position y.
+    #[field_type(movement::POS)]
+    #[correct(ease = 150)]
+    pub y: f32,
+    /// Velocity x.
+    #[field_type(movement::VEL)]
+    #[correct(snap)]
+    pub vx: f32,
+    /// Velocity y.
+    #[field_type(movement::VEL)]
+    #[correct(snap)]
+    pub vy: f32,
+    /// Remaining dash frames.
+    #[correct(snap)]
+    pub dash: u8,
+    /// Remaining dash cooldown frames.
+    #[correct(snap)]
+    pub cd: u8,
+    /// Display name.
+    #[priority(0.2)]
+    #[correct(replace)]
+    pub name: String,
+}
+
+impl PlayerView {
+    /// The view of a capsule.
+    pub fn of(state: &MoveState, name: &str) -> Self {
+        Self {
+            x: state.x,
+            y: state.y,
+            vx: state.vx,
+            vy: state.vy,
+            dash: state.dash,
+            cd: state.cd,
+            name: name.to_string(),
+        }
+    }
+}
+
+/// Most command frames a player may bank (absorbs input jitter).
+pub const MAX_CREDITS: u8 = 4;
 
 /// A wandering slime.
 #[derive(Debug, Clone, PartialEq, Replicated)]
@@ -174,6 +226,7 @@ pub fn game_surface() -> GameSurface {
         .predict::<movement::ArenaStep>()
         .record::<content::Pack>()
         .constant("freeze_world", &content::freeze_world())
+        .constant("arena_floor", &movement::arena_floor())
 }
 
 /// Durable command recording a collected gem.
@@ -384,7 +437,7 @@ impl Zone for FreezeZone {
             config,
             pack,
             players: BTreeMap::new(),
-            credits: InputCredits::new(u32::from(crate::arena::MAX_CREDITS)),
+            credits: InputCredits::new(u32::from(MAX_CREDITS)),
             slimes,
             gems: (0..kind.gem_spots().len())
                 .map(|spot| Gem {
@@ -606,4 +659,15 @@ impl Demo for FreezeDemo {
     fn server(config: ServerConfig, guests: Guests) -> GameServer<FreezeZone> {
         world::zone_server(freeze_config(config), guests, Rituals::default(), "local")
     }
+}
+
+/// Bot payload for `distributed_game::bots`: direction → [`MoveInput`].
+pub fn encode_bot_input(dir: [f32; 2]) -> Vec<u8> {
+    let axis = |v: f32| (v.clamp(-1.0, 1.0) * 127.0).round() as i8;
+    MoveInput {
+        mx: axis(dir[0]),
+        my: axis(dir[1]),
+        buttons: 0,
+    }
+    .to_payload()
 }

@@ -68,11 +68,51 @@
 
 	let canvas = $state<HTMLCanvasElement>();
 	let autoHunt = $state(false);
+	let ghost = $state(true);
+	let predict = $state(true);
 	$effect(() => {
 		const client = game.client;
 		if (client === undefined || canvas === undefined) return;
-		return startPitLoop(canvas, { client, hello: () => hello.current, autoHunt: () => autoHunt });
+		return startPitLoop(canvas, { client, hello: () => hello.current, autoHunt: () => autoHunt, ghost: () => ghost });
 	});
+	$effect(() => game.client?.setPredictionEnabled(predict));
+
+	// Network panel: prediction / reconciliation readout and the rooms'
+	// network simulation (dev only: every room on celld delays its sockets).
+	let net = $state({ pending: 0, ack: 0, corrections: 0, last: 0 });
+	$effect(() => {
+		const client = game.client;
+		if (client === undefined) return;
+		let corrections = 0;
+		let last = 0;
+		const off = client.on('correction', (c) => {
+			corrections += 1;
+			last = Math.hypot(c.errors.x ?? 0, c.errors.y ?? 0);
+		});
+		const timer = setInterval(() => {
+			const p = client.predictor;
+			net = { pending: p?.pending.length ?? 0, ack: p?.lastAck ?? 0, corrections, last };
+		}, 250);
+		return () => {
+			clearInterval(timer);
+			off();
+		};
+	});
+	let sim = $state({ latencyMs: 0, jitterMs: 0, loss: 0 });
+	let simStatus = $state('');
+	$effect(() => {
+		fetch('/api/dev/netsim')
+			.then(async (r) => (r.ok ? (sim = await r.json()) : (simStatus = `dev routes off (${r.status})`)))
+			.catch(() => (simStatus = 'unavailable'));
+	});
+	let simTimer: ReturnType<typeof setTimeout> | undefined;
+	function pushSim() {
+		clearTimeout(simTimer);
+		simTimer = setTimeout(async () => {
+			const r = await fetch('/api/dev/netsim', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(sim) });
+			simStatus = r.ok ? 'applied to every room' : `failed (${r.status})`;
+		}, 150);
+	}
 
 	// Kills the zone reported that the cell has not acknowledged yet.
 	const unsaved = $derived(
@@ -91,6 +131,18 @@
 			{#if game.error}<div class="error" data-testid="error">{game.error}</div>{/if}
 			<label><input type="checkbox" bind:checked={autoHunt} data-testid="autohunt" /> auto-hunt</label>
 			<small>WASD move · Space attack · E dash · walk through a doorway (the gaps in the walls) to the next room</small>
+		</section>
+		<section data-testid="network">
+			<h2>Network</h2>
+			<label><input type="checkbox" bind:checked={predict} data-testid="predict" /> client prediction</label>
+			<label><input type="checkbox" bind:checked={ghost} data-testid="ghost" /> server ghost</label>
+			<div>pending inputs <b data-testid="pending">{net.pending}</b> · ack <b>{net.ack}</b></div>
+			<div>corrections <b data-testid="corrections">{net.corrections}</b> (last {net.last.toFixed(3)} m)</div>
+			<div>interest ring <b>{hello.current?.viewRadius ?? '–'}</b> m</div>
+			<label>latency <input type="range" min="0" max="300" step="5" bind:value={sim.latencyMs} oninput={pushSim} data-testid="latency" /> {sim.latencyMs} ms</label>
+			<label>jitter <input type="range" min="0" max="100" step="1" bind:value={sim.jitterMs} oninput={pushSim} /> {sim.jitterMs} ms</label>
+			<label>loss <input type="range" min="0" max="0.2" step="0.01" bind:value={sim.loss} oninput={pushSim} /> {Math.round(sim.loss * 100)}%</label>
+			<small data-testid="netsim-status">{simStatus}</small>
 		</section>
 		<section data-testid="rooms">
 			<h2>Rooms</h2>
@@ -131,6 +183,7 @@
 	canvas { background: #120f14; border: 1px solid #2b2533; max-width: 100%; }
 	aside { min-width: 16rem; display: grid; gap: 1rem; align-content: start; }
 	section { border: 1px solid #2b2533; border-radius: 6px; padding: 0.75rem; }
+	section label { display: block; }
 	h2 { margin: 0 0 0.5rem; font-size: 1rem; }
 	.error { color: #ff6b6b; }
 	.saved { color: #9ad16b; }

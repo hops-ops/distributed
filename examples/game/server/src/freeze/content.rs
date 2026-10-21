@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn layout_is_clear_of_pillars() {
-        use crate::arena::movement::PILLARS;
+        use game_sim::arena::PILLARS;
         for kind in [ZoneKind::Hub, ZoneKind::Meadow, ZoneKind::Ember] {
             let points = kind
                 .portals()

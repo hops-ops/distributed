@@ -20,6 +20,13 @@ export interface MoveState {
 	readonly cd: number;
 }
 
+/** Record `Pillar` (`#[derive(GameRecord)]`). */
+export interface Pillar {
+	readonly x: number;
+	readonly y: number;
+	readonly r: number;
+}
+
 /** Record `PitRoomContext` (`#[derive(GameRecord)]`). */
 export interface PitRoomContext {
 	readonly seed: number;
@@ -54,6 +61,9 @@ export interface PitRules {
 export interface PitWorld {
 	readonly defaultSeed: number;
 	readonly half: number;
+	readonly playerRadius: number;
+	readonly dashCooldown: number;
+	readonly pillars: readonly Pillar[];
 	readonly doorHalf: number;
 	readonly roomSize: number;
 	readonly passage: number;
@@ -95,6 +105,7 @@ export interface HelloEvent {
 	readonly seed: number;
 	readonly restored: boolean;
 	readonly roomKills: number;
+	readonly viewRadius: number;
 }
 
 const HELLO_LAYOUT: PayloadLayout = [
@@ -107,6 +118,7 @@ const HELLO_LAYOUT: PayloadLayout = [
 	['seed', { type: 'u32' }],
 	['restored', { type: 'bool' }],
 	['roomKills', { type: 'u32' }],
+	['viewRadius', { type: 'f32' }],
 ];
 
 /** Event `profile` (id 2). */

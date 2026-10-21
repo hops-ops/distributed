@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # distributed_game demos — one command per demo (dev only).
 #
-#   ./run.sh arena          build what is needed, start the arena server
-#                           (dev routes on) + Vite, print the URL
 #   ./run.sh mobpit         Mob Pit: its rooms run on celld (`celld dev`, the
 #                           cells worker hosts one Durable Object per room),
 #                           the services (tickets, read models, boards) and
@@ -65,7 +63,7 @@ SVELTEKIT="$HERE/sveltekit"
 BIN="$SERVER/target/debug/game-demos"
 SERVICE_BIN="$SERVER/target/debug/mobpit-service"
 CELLS="$HERE/cells"
-DEMOS=(arena mobpit leaderboard gallery freeze grid ripple)
+DEMOS=(mobpit leaderboard gallery freeze grid ripple)
 # Single-process demos whose durable state lives in celld cells (the
 # multi-host ones always run on celld too: zone leases and hibernation).
 CELLD_DEMOS=(mobpit leaderboard freeze)
@@ -74,7 +72,7 @@ export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
 CLUSTER_DEMOS=(grid ripple)
 # Game surfaces with a generated client (`game_demos::<surface>::game_surface`);
 # the leaderboard page uses Mob Pit's.
-SURFACES=(arena mobpit gallery freeze grid ripple)
+SURFACES=(mobpit gallery freeze grid ripple)
 CLI="$REPO/target/debug/distributed"
 
 log() { printf '\033[1;36m[demos]\033[0m %s\n' "$*"; }

@@ -20,6 +20,10 @@
 //! - `POST /dev/mobpit/leaderboard/rebuild` — rebuild both boards from the
 //!   event history of every crawler in the directory.
 //! - `GET /dev/mobpit/presence?principal=` — the player's presence cell.
+//! - `GET /dev/netsim` / `POST /dev/netsim` `{latencyMs, jitterMs, loss}` —
+//!   read / replace the network simulation of **every** room (dev settings
+//!   object on celld, read by each room within a second; applied per
+//!   socket in both directions, so the RTT grows by 2 × latency).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +34,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use distributed_game::net::TicketKey;
+use distributed_game::netsim::{NetSim, NetSimJson, NETSIM_SHARD};
 use distributed_game::{Role, TicketClaims};
 use serde_json::{json, Value};
 
@@ -67,6 +72,7 @@ pub fn routes(world: Arc<MobPitWorld>, key: TicketKey) -> Router {
         .route("/dev/mobpit/leaderboard", get(leaderboard))
         .route("/dev/mobpit/leaderboard/rebuild", post(rebuild))
         .route("/dev/mobpit/presence", get(presence))
+        .route("/dev/netsim", get(get_netsim).post(set_netsim))
         .with_state(Dev { world, key })
 }
 
@@ -197,4 +203,29 @@ async fn presence(
         .await
         .map_err(internal)?;
     Ok(Json(json!({ "principal": principal, "presence": current })))
+}
+
+async fn get_netsim(State(dev): State<Dev>) -> Result<Json<NetSimJson>, (StatusCode, Json<Value>)> {
+    let value = dev
+        .world
+        .cells()
+        .dev_settings(NETSIM_SHARD)
+        .await
+        .map_err(internal)?;
+    Ok(Json(serde_json::from_value(value).unwrap_or_default()))
+}
+
+async fn set_netsim(
+    State(dev): State<Dev>,
+    Json(body): Json<NetSimJson>,
+) -> Result<Json<NetSimJson>, (StatusCode, Json<Value>)> {
+    // Bounded and normalized (what the rooms will apply).
+    let applied = NetSim::to_json(body.to_sim());
+    let value = serde_json::to_value(applied).map_err(internal)?;
+    dev.world
+        .cells()
+        .set_dev_settings(NETSIM_SHARD, &value)
+        .await
+        .map_err(internal)?;
+    Ok(Json(applied))
 }
