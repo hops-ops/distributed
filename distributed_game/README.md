@@ -101,7 +101,7 @@ each built to show one part of the engine:
 | Demo | Run | Shows |
 |---|---|---|
 | Arena | `examples/game/run.sh arena` | ticks, deltas, prediction on/off, interest radius vs. global entities, simulated latency |
-| Mob Pit | `run.sh mobpit` | combat whose rewards are saved without stalling; "slow storage"; `kill -9` crash recovery |
+| Mob Pit | `run.sh mobpit` (`--fleet` for several celld nodes) | rooms as celld objects joined by doorways, sleeping when empty and restored on return; combat whose rewards are saved exactly once without stalling |
 | Leaderboard | `run.sh leaderboard` | a live ranking fed from saved kills, rebuilt from history |
 | Shooting Gallery | `run.sh gallery` | lag compensation on/off under latency |
 | The Freeze | `run.sh freeze` | pausing every zone on two servers, updating content, resuming; safe-room reloads |
@@ -759,7 +759,9 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
 - Keys must be unique across restarts; `ctx.fact_key` includes the
   activation's boot epoch for you (see [Durable facts](#durable-facts)).
 - If the process crashes, each in-flight fact is either fully saved or
-  not saved at all. Mob Pit shows this with `kill -9`.
+  not saved at all. A zone hosted on celld (`celld_zone`) also keeps its
+  emitted facts in an outbox in object storage, so they are resent after
+  a crash: exactly once (Mob Pit's rooms).
 - **Player lifecycle facts.** With `HostConfig::lifecycle_facts = true`
   the host itself emits `lifecycle::PlayerJoined` (ticket, rejoin or
   handoff), `ConnectionLost` (grace started; dropped or told to reload),

@@ -1858,7 +1858,7 @@ impl<Z: Zone> ZoneHost<Z> {
 
     fn tick_once(&mut self, dt: Duration) {
         // wasm32-unknown-unknown (celld) has no `Instant`: measure with the
-        // host clock there (spike gr-p42).
+        // host clock there (the celld zone host).
         #[cfg(not(target_arch = "wasm32"))]
         let started = std::time::Instant::now();
         #[cfg(target_arch = "wasm32")]
