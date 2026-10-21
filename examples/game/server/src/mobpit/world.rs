@@ -18,8 +18,9 @@ use super::presence::Presence;
 use super::store::{CelldOptions, CrawlerCells, MobPitFactSink, SinkState};
 use super::zone::{MobPit, MobPitConfig};
 use super::{routes, MobPitDemo};
-use crate::common::relay::{relay_routes, ProjectionBus};
+use crate::common::relay::{relay_routes, ProjectionBus, ProjectionPublisher};
 use crate::common::{random_hex, Demo, DemoRoutes, Guests};
+use distributed::leaderboard::LeaderboardChangePublisher;
 
 /// Unsettled facts one zone may hold before `emit_fact` reports backpressure.
 pub const FACT_CAPACITY: usize = 256;
@@ -51,7 +52,7 @@ impl WorldOptions {
             data_dir: data_dir.into(),
             celld,
             redis_url: None,
-            redis_prefix: "mobpit".into(),
+            redis_prefix: mobpit_crawler::BOARD_REDIS_PREFIX.into(),
             projection_bus: None,
             read_models: None,
         }
@@ -119,7 +120,15 @@ impl MobPitWorld {
     pub fn open(options: WorldOptions) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(&options.data_dir)
             .map_err(|e| format!("create {}: {e}", options.data_dir.display()))?;
-        let board = Leaderboards::open(options.redis_url.as_deref(), &options.redis_prefix)?;
+        // Board changes go out on the projection bus (once attached) so the
+        // GraphQL service's `@live` boards follow them.
+        let projection: Arc<OnceLock<ProjectionBus>> = Arc::default();
+        let notices = LeaderboardChangePublisher::spawn(ProjectionPublisher(projection.clone()));
+        let board = Leaderboards::open(
+            options.redis_url.as_deref(),
+            &options.redis_prefix,
+            Some(notices.listener()),
+        )?;
         let sink = Arc::new(SinkState::default());
         let presence = Arc::new(Presence::default());
         let fact_sink = MobPitFactSink::new(
@@ -143,7 +152,7 @@ impl MobPitWorld {
             board,
             zone_pending: AtomicUsize::new(0),
             profiles: Arc::default(),
-            projection: Arc::default(),
+            projection,
             presence,
         }))
     }

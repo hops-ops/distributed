@@ -28,7 +28,8 @@
 # server NetSim; the HUD sliders change it live), MOBPIT_DATA_DIR (Mob Pit /
 # Leaderboard local files and their `celld dev` state, default
 # examples/game/.data/mobpit), REDIS_URL (Redis leaderboard instead of
-# in-memory), SVELTEKIT_PORT (SvelteKit demo, default 5573; its game server
+# in-memory; required by `sveltekit` and `smoke`, whose SvelteKit
+# leaderboard is the Redis board served through GraphQL), SVELTEKIT_PORT (SvelteKit demo, default 5573; its game server
 # uses GAME_DEMOS_PORT, default 2967 there, and its read-model service
 # MOBPIT_SERVICE_PORT, default GAME_DEMOS_PORT + 2).
 #
@@ -336,12 +337,25 @@ api_keys() {
 	API_JWKS="$(sed -n 2p <<<"$keys")"
 }
 
+# require_redis: the SvelteKit demo's leaderboard is the Redis board the
+# zone server writes and mobpit-service serves (REDIS_URL).
+require_redis() {
+	if [[ -z "${REDIS_URL:-}" ]]; then
+		echo "REDIS_URL is required: the SvelteKit leaderboard is the Redis board" >&2
+		echo "  (docker compose up -d redis at the repo root, then REDIS_URL=redis://127.0.0.1:6379)" >&2
+		exit 1
+	fi
+}
+
 # The SvelteKit demo: the Mob Pit zone server (publishing Crawler domain
-# events to a SQLite bus), then `distributed dev server/`, which generates
-# the `$distributed` GraphQL client, runs mobpit-service (the player_stats
-# read model, GraphQL @live) and `vite dev` (the Vite plugin also generates
-# src/lib/generated/mobpit and its WASM on start and on Rust changes).
+# events and board change notices to a SQLite bus, kills into the Redis
+# boards), then `distributed dev server/`, which generates the
+# `$distributed` GraphQL client, runs mobpit-service (the player_stats read
+# model and the Redis boards, GraphQL @live) and `vite dev` (the Vite plugin
+# also generates src/lib/generated/mobpit and its WASM on start and on Rust
+# changes).
 run_sveltekit() {
+	require_redis
 	local port="${GAME_DEMOS_PORT:-2967}"
 	local ui_port="${SVELTEKIT_PORT:-5573}"
 	local service_port="${MOBPIT_SERVICE_PORT:-$((port + 2))}"
@@ -356,7 +370,8 @@ run_sveltekit() {
 	log_file="$(mktemp -t game-demos-sveltekit.XXXXXX)"
 	secret="${DISTRIBUTED_GAME_SECRET:-$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')}"
 	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" mobpit --port "$port" \
-		--data-dir "$data" --projection-bus "sqlite:$data/bus.db" >"$log_file" 2>&1 &
+		--data-dir "$data" --projection-bus "sqlite:$data/bus.db" \
+		--redis-url "$REDIS_URL" >"$log_file" 2>&1 &
 	local server_pid=$!
 	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; kill_tree "$CELLD_PID"; rm -f "$log_file"' EXIT INT TERM
 	wait_listening "$log_file" "$server_pid" "game-demos mobpit"
@@ -384,6 +399,8 @@ smoke() {
 	# own `celld dev` (CELLD_BIN) on the cells worker.
 	ensure_celld
 	ensure_cells
+	# The SvelteKit test's leaderboard is the Redis board.
+	require_redis
 	log "generated clients are current; predicted steps and pure functions compiled to WASM"
 	gen --check
 	log "server: fmt, clippy, tests (bots smoke)"

@@ -27,8 +27,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use distributed::leaderboard::{
     BackgroundLeaderboard, BackgroundLeaderboardOptions, Board, InMemoryLeaderboard,
-    LeaderboardChange, LeaderboardEntry, LeaderboardError, LeaderboardProjection,
-    LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy, ScoreSubmission,
+    LeaderboardChange, LeaderboardChangeListener, LeaderboardEntry, LeaderboardError,
+    LeaderboardProjection, LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy,
+    ScoreSubmission,
 };
 use distributed::{DomainEventOccurrence, ExternalEventSource};
 use distributed_game::GameRecord;
@@ -38,10 +39,7 @@ use serde_json::{json, Value};
 use super::crawler::{KillReceipt, AGGREGATE_TYPE};
 use super::store::CrawlerCells;
 
-/// Kills board.
-pub const KILLS_BOARD: &str = "mobpit.kills";
-/// XP board.
-pub const XP_BOARD: &str = "mobpit.xp";
+pub use mobpit_crawler::{KILLS_BOARD, XP_BOARD};
 /// Producer of kill occurrences.
 pub const PRODUCER: &str = "mobpit.crawler-cell";
 /// Rows pushed to clients.
@@ -238,7 +236,15 @@ pub struct Leaderboards {
 impl Leaderboards {
     /// Redis when `redis_url` is given, else in memory. Must run inside a
     /// Tokio runtime (spawns the background applier and the refresher).
-    pub fn open(redis_url: Option<&str>, redis_prefix: &str) -> Result<Arc<Self>, String> {
+    /// `on_change` is told every board whose scores changed (applied kills
+    /// and rebuild promotions): the zone server publishes it on the
+    /// projection bus as `distributed.leaderboard.changed`, which drives
+    /// `@live` boards in `mobpit-service`.
+    pub fn open(
+        redis_url: Option<&str>,
+        redis_prefix: &str,
+        on_change: Option<LeaderboardChangeListener>,
+    ) -> Result<Arc<Self>, String> {
         let (store, backend): (Arc<dyn LeaderboardStore>, _) = match redis_url {
             Some(url) => (
                 Arc::new(
@@ -251,7 +257,10 @@ impl Leaderboards {
             None => (Arc::new(InMemoryLeaderboard::new()), "memory"),
         };
         let projection = Arc::new(KillProjection::new());
-        let projector: Projector = LeaderboardProjector::new(store.clone(), projection);
+        let mut projector: Projector = LeaderboardProjector::new(store.clone(), projection);
+        if let Some(listener) = on_change {
+            projector = projector.with_change_listener(listener);
+        }
         let background = BackgroundLeaderboard::spawn(
             projector.clone(),
             BackgroundLeaderboardOptions::default(),

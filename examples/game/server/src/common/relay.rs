@@ -18,8 +18,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 use distributed::bus::{
-    celld_queue_relay_handler, CelldQueueEnvelope, CelldQueueRelayHandler, SqliteBus,
-    CELLD_QUEUE_RELAY_PATH,
+    celld_queue_relay_handler, Bus, CelldQueueEnvelope, CelldQueueRelayHandler, Message,
+    MessagePublisher, SqliteBus, TransportError, CELLD_QUEUE_RELAY_PATH,
 };
 use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
 use distributed::BusPublisher;
@@ -95,6 +95,25 @@ impl ProjectionBus {
     /// The Queue relay handler publishing onto this bus.
     pub fn relay_handler(&self) -> &CelldQueueRelayHandler {
         &self.relay
+    }
+}
+
+/// Publishes onto the projection bus once it is attached (the slot of
+/// `MobPitWorld::projection`); before that every publish is a retryable
+/// error, so a retrying publisher (`LeaderboardChangePublisher`) waits for
+/// the bus instead of dropping the message.
+#[derive(Clone)]
+pub struct ProjectionPublisher(pub Arc<OnceLock<ProjectionBus>>);
+
+impl MessagePublisher for ProjectionPublisher {
+    async fn publish(&self, message: Message) -> Result<(), TransportError> {
+        let bus = self
+            .0
+            .get()
+            .ok_or_else(|| TransportError::retryable("projection bus not attached yet"))?;
+        SqliteBus::new(bus.pool().clone())
+            .publish_message(message)
+            .await
     }
 }
 

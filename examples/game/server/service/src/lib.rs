@@ -30,12 +30,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use distributed::bus::SqliteBus;
+use distributed::bus::{BusConsumer, RunOptions, SqliteBus};
+use distributed::graphql::surface::{LeaderboardGrant, LeaderboardSurface};
 use distributed::graphql::{
     build_surface, read, surface_for_application_contract, DistributedClientSurfaceExport,
     GraphqlEngine, IdentityConfig, ModelPermissions, OidcConfig, RoleGrant, Surface,
     SurfaceOptions,
 };
+use distributed::leaderboard::{Board, LeaderboardStore, RedisLeaderboard};
 use distributed::microsvc::{
     spawn_service_consumer_loop, CausalProjectorContext, HandlerError, ModeledProjection, Routes,
     Service, CONSUMER_IDLE_POLL,
@@ -51,6 +53,27 @@ pub use mobpit_crawler::stats::{
 };
 /// The one engine role. Every signed-in player reads the whole board.
 pub const ROLE: &str = "user";
+/// Bus consumer group of this process's board change notices (every
+/// GraphQL process subscribes under its own group).
+pub const BOARD_NOTICE_GROUP: &str = "mobpit-service-boards";
+
+/// The Redis boards the zone server projects kills into, as GraphQL roots:
+/// `xpLeaderboard(first)`, `xpLeaderboardAround(radius)`, `xpMyRank` and
+/// the `kills…` twins, all `@live`. `…MyRank` and `…Around` rank the viewer
+/// (the session's user id); no root ranks an arbitrary member.
+pub fn leaderboard_surfaces() -> Vec<LeaderboardSurface> {
+    [
+        ("xp", mobpit_crawler::XP_BOARD),
+        ("kills", mobpit_crawler::KILLS_BOARD),
+    ]
+    .into_iter()
+    .map(|(name, board)| {
+        LeaderboardSurface::single(name, &Board::high_first(board).expect("board name"))
+            .limits(5, 20, 5)
+            .grant(ROLE, LeaderboardGrant::read())
+    })
+    .collect()
+}
 
 /// Read authorization: the leaderboard is public to signed-in players;
 /// there is nothing to write (no commands, no mutations).
@@ -99,6 +122,8 @@ fn grants() -> BTreeMap<String, BTreeMap<String, RoleGrant>> {
 fn full_surface() -> Surface {
     build_surface(&read_model_catalog().tables, &SurfaceOptions::sqlite())
         .expect("mobpit Surface should build")
+        .with_leaderboards(leaderboard_surfaces())
+        .expect("mobpit boards should attach")
         .with_projection_owners([projector().into()])
         .expect("mobpit projector should bind")
 }
@@ -147,13 +172,20 @@ impl BearerIdentity {
     }
 }
 
-/// The GraphQL engine over `repo` with `@live` pushes from its change stream.
+/// The GraphQL engine over `repo` (`player_stats`, `@live` from its change
+/// stream) and `boards` (the Redis leaderboards, `@live` from the zone
+/// server's change notices: [`spawn_board_notices`]).
 pub fn build_engine(
     repo: &SqliteRepository,
+    boards: Arc<dyn LeaderboardStore>,
     identity: &BearerIdentity,
     protocol_key: [u8; 32],
 ) -> Result<GraphqlEngine, String> {
-    GraphqlEngine::builder(repo.pool().clone())
+    let mut builder = GraphqlEngine::builder(repo.pool().clone());
+    for surface in leaderboard_surfaces() {
+        builder = builder.leaderboard(surface, boards.clone());
+    }
+    builder
         .service_id(APPLICATION)
         .protocol_token_key(protocol_key)
         .roles(&[ROLE])
@@ -182,6 +214,30 @@ pub async fn open_shared_sqlite(url: &str) -> Result<sqlx::SqlitePool, sqlx::Err
         .await
 }
 
+/// Follow the zone server's `distributed.leaderboard.changed` notices on
+/// the bus and refresh `engine`'s `@live` boards (restarted on errors).
+pub fn spawn_board_notices(engine: Arc<GraphqlEngine>, bus: sqlx::SqlitePool) {
+    tokio::spawn(async move {
+        loop {
+            let handlers = Arc::new(engine.leaderboard_change_handlers(BOARD_NOTICE_GROUP));
+            let bus = SqliteBus::new(bus.clone()).with_idle_poll(CONSUMER_IDLE_POLL);
+            if let Err(error) = bus.subscribe(handlers, RunOptions::default()).await {
+                eprintln!("mobpit-service: board notices: {error}");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+/// The Redis boards at `url` under `prefix` (the zone server's).
+pub fn open_boards(url: &str, prefix: &str) -> Result<Arc<dyn LeaderboardStore>, String> {
+    Ok(Arc::new(
+        RedisLeaderboard::connect(url)
+            .map_err(|error| format!("REDIS_URL {url}: {error}"))?
+            .with_prefix(prefix),
+    ))
+}
+
 /// Runtime configuration.
 #[derive(Debug, Clone)]
 pub struct ServiceOptions {
@@ -189,6 +245,10 @@ pub struct ServiceOptions {
     pub database_url: String,
     /// `sqlite:` URL of the bus the zone server publishes to.
     pub bus_url: String,
+    /// `redis://…` of the leaderboards the zone server writes.
+    pub redis_url: String,
+    /// Their key prefix (the zone server's `--redis-prefix`).
+    pub redis_prefix: String,
     /// Listen address.
     pub bind: String,
     /// Bearer verification.
@@ -207,12 +267,15 @@ pub async fn run(options: ServiceOptions) -> Result<(), Box<dyn std::error::Erro
     let bus_pool = open_shared_sqlite(&options.bus_url).await?;
     SqliteBus::new(bus_pool.clone()).ensure_tables().await?;
 
+    let boards = open_boards(&options.redis_url, &options.redis_prefix)?;
     let engine = Arc::new(build_engine(
         &repo,
+        boards,
         &options.identity,
         options.protocol_key,
     )?);
-    spawn_projector(repo.clone(), bus_pool);
+    spawn_projector(repo.clone(), bus_pool.clone());
+    spawn_board_notices(engine.clone(), bus_pool);
     let app = http::router(engine, &options.allowed_origins);
     let listener = tokio::net::TcpListener::bind(&options.bind).await?;
     eprintln!(

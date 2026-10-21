@@ -64,6 +64,9 @@ pub struct MobPitArgs {
     /// Redis for the leaderboard (`redis://127.0.0.1:6379`); default in memory.
     #[arg(long, env = "REDIS_URL")]
     pub redis_url: Option<String>,
+    /// Redis key prefix of the boards (`mobpit-service` reads the same).
+    #[arg(long, env = "MOBPIT_REDIS_PREFIX", default_value = mobpit_crawler::BOARD_REDIS_PREFIX)]
+    pub redis_prefix: String,
     /// Start with this artificial storage latency (ms).
     #[arg(long, env = "MOBPIT_STORAGE_LATENCY_MS", default_value_t = 0)]
     pub storage_latency_ms: u64,
@@ -147,6 +150,7 @@ pub async fn run(mut args: MobPitArgs) -> std::io::Result<()> {
     let celld = store::CelldOptions::new(&args.celld_url, secret).map_err(std::io::Error::other)?;
     let mut options = WorldOptions::new(&data_dir, celld);
     options.redis_url = args.redis_url.clone();
+    options.redis_prefix = args.redis_prefix.clone();
     options.projection_bus = args.projection_bus.clone();
     let world = MobPitWorld::start(options)
         .await

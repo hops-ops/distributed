@@ -9,7 +9,10 @@
 //! 2. a live leaderboard subscription pushes the next settled kill;
 //! 3. the rows equal the cells after a restart of the projector (cursor
 //!    resumes, redelivery is deduplicated);
-//! 4. the surface has no mutations and the HTTP endpoint refuses a request
+//! 4. the leaderboard roots (`xpLeaderboard`, `@live`) read the zone
+//!    server's board, and its change notices travel over the bus to push
+//!    them (the engine shares no listener with the zone server's projector);
+//! 5. the surface has no mutations and the HTTP endpoint refuses a request
 //!    without a verified Bearer token.
 
 use std::path::PathBuf;
@@ -25,7 +28,8 @@ use game_demos::devcelld::DevCelld;
 use game_demos::mobpit::crawler::RECORD_KILL;
 use game_demos::mobpit::{MobPitWorld, WorldOptions};
 use mobpit_service::{
-    build_engine, open_shared_sqlite, read_model_catalog, spawn_projector, BearerIdentity,
+    build_engine, open_shared_sqlite, read_model_catalog, spawn_board_notices, spawn_projector,
+    BearerIdentity,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -121,7 +125,13 @@ async fn settled_kills_project_into_live_player_stats() {
         .unwrap();
     let bus = open_shared_sqlite(&bus_url).await.unwrap();
     spawn_projector(repo.clone(), bus.clone());
-    let engine = build_engine(&repo, &identity(), [7; 32]).unwrap();
+    // The boards are the zone server's store (Redis in the demo; the same
+    // in-memory store here). Their `@live` pushes come only from the
+    // change notices on the bus.
+    let engine = std::sync::Arc::new(
+        build_engine(&repo, world.board().store().clone(), &identity(), [7; 32]).unwrap(),
+    );
+    spawn_board_notices(engine.clone(), bus.clone());
 
     sink.commit(&kill("k1", "dev-ana", 3, "ana")).await.unwrap();
     sink.commit(&kill("k2", "dev-bo", 1, "bo")).await.unwrap();
@@ -182,6 +192,53 @@ async fn settled_kills_project_into_live_player_stats() {
         json!({ "player_stats": [{ "xp": 70 }] })
     );
 
+    // The XP board through the GraphQL roots, live over the bus notices.
+    let mut board = Box::pin(engine.execute_stream(
+        &user("dev-bo"),
+        Request::new("subscription { xpLeaderboard(first: 3) { member score } }"),
+    ));
+    eventually("the board to catch up", || async {
+        let now = engine
+            .execute(
+                &user("dev-bo"),
+                Request::new("{ xpLeaderboard(first: 3) { member score } }"),
+            )
+            .await;
+        serde_json::to_value(&now.data).unwrap()["xpLeaderboard"]
+            == json!([{ "member": "dev-ana", "score": 85.0 }, { "member": "dev-bo", "score": 70.0 }])
+    })
+    .await;
+    let first = tokio::time::timeout(Duration::from_secs(5), board.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    sink.commit(&kill("k5", "dev-bo", 3, "bo")).await.unwrap();
+    let pushed = loop {
+        let next = tokio::time::timeout(Duration::from_secs(15), board.next())
+            .await
+            .expect("board push after the settled kill (notice over the bus)")
+            .unwrap();
+        let data = serde_json::to_value(&next.data).unwrap();
+        if data["xpLeaderboard"][0]["member"] == "dev-bo" {
+            break data;
+        }
+    };
+    assert_eq!(
+        pushed["xpLeaderboard"],
+        json!([{ "member": "dev-bo", "score": 130.0 }, { "member": "dev-ana", "score": 85.0 }])
+    );
+    let mine = engine
+        .execute(
+            &user("dev-bo"),
+            Request::new("{ xpMyRank { rank member score } }"),
+        )
+        .await;
+    assert_eq!(
+        serde_json::to_value(&mine.data).unwrap()["xpMyRank"],
+        json!({ "rank": 0, "member": "dev-bo", "score": 130.0 })
+    );
+
     // Read-only surface: there is no mutation to credit XP with.
     let forged = engine
         .execute(
@@ -205,7 +262,7 @@ async fn settled_kills_project_into_live_player_stats() {
     }
 
     // HTTP: no Bearer → refused (no header-trust identity mode).
-    let app = mobpit_service::http::router(std::sync::Arc::new(engine), &["http://ui.test".into()]);
+    let app = mobpit_service::http::router(engine, &["http://ui.test".into()]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

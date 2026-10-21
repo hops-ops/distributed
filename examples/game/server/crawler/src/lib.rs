@@ -36,6 +36,13 @@ pub const AGGREGATE_TYPE: &str = "Crawler";
 pub const CRAWLER_KIND: &str = "crawler";
 /// celld cell kind of per-player presence (the runtime lifecycle facts).
 pub const PRESENCE_KIND: &str = "presence";
+/// Redis kills board (`+1` per kill), written by the zone server's
+/// leaderboard projector and served by `mobpit_service`'s GraphQL roots.
+pub const KILLS_BOARD: &str = "mobpit.kills";
+/// Redis XP board (`+xp` per kill).
+pub const XP_BOARD: &str = "mobpit.xp";
+/// Default Redis key prefix of the boards (zone server and service must agree).
+pub const BOARD_REDIS_PREFIX: &str = "mobpit";
 /// Command dispatched for every `MobKilled` fact.
 pub const RECORD_KILL: &str = RecordKill::COMMAND;
 /// Event recorded by [`RECORD_KILL`].

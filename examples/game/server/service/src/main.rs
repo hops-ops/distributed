@@ -3,7 +3,10 @@
 //! Env (dev defaults in `examples/game/run.sh`):
 //! - `DATABASE_URL` — read model, `sqlite:…` (default `sqlite:./mobpit-service.db`)
 //! - `MOBPIT_BUS_URL` — the SQLite bus the zone server publishes Crawler
-//!   domain events to (default `sqlite:./mobpit-bus.db`)
+//!   domain events and board change notices to (default `sqlite:./mobpit-bus.db`)
+//! - `REDIS_URL` — the Redis leaderboards the zone server writes (required)
+//! - `MOBPIT_REDIS_PREFIX` — their key prefix (default `mobpit`, the zone
+//!   server's default)
 //! - `BIND` (default `127.0.0.1:8791`, the `distributed dev` convention)
 //! - `MOBPIT_API_ISSUER`, `MOBPIT_API_AUDIENCE` — expected `iss` / `aud` of the
 //!   Bearer JWT (required)
@@ -48,6 +51,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         database_url: env::var("DATABASE_URL")
             .unwrap_or_else(|_| "sqlite:./mobpit-service.db?mode=rwc".into()),
         bus_url: env::var("MOBPIT_BUS_URL").unwrap_or_else(|_| "sqlite:./mobpit-bus.db".into()),
+        redis_url: required("REDIS_URL")?,
+        redis_prefix: env::var("MOBPIT_REDIS_PREFIX")
+            .ok()
+            .filter(|prefix| !prefix.trim().is_empty())
+            .unwrap_or_else(|| mobpit_crawler::BOARD_REDIS_PREFIX.into()),
         bind: env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8791".into()),
         identity: BearerIdentity {
             issuer: required("MOBPIT_API_ISSUER")?,

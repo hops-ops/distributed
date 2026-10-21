@@ -5,9 +5,12 @@
  * auto-hunt kills a mob → the celld Crawler cell commits it, its domain event
  * goes through the cell outbox and celld's Queue to the zone server's relay,
  * onto the bus, and is projected into `player_stats` → the `@live` GraphQL queries
- * (MyStats, bound to the session; Leaderboard) update without a reload, for
- * the killer and for a second signed-in player → the SSR HTML after a reload
- * has the settled numbers → no page errors.
+ * (MyStats, bound to the session; the leaderboard's names) update without a
+ * reload; the zone server's Redis XP board reaches the page through
+ * mobpit-service's GraphQL board roots (`xpLeaderboard`, SSR-seeded, `@live`
+ * from the board change notices on the bus) for the killer and for a second
+ * signed-in player → the SSR HTML after a reload has the settled numbers →
+ * no page errors. Needs REDIS_URL.
  *
  * Ports: GAME_DEMOS_PORT (default 2967), SVELTEKIT_PORT (default 5573),
  * MOBPIT_SERVICE_PORT (default GAME_DEMOS_PORT + 2). Needs the lifecycle
@@ -74,6 +77,11 @@ function start(command, args, options, ready) {
 }
 
 test('sign in, join, move, kill, live read model updates for two players', { timeout: 600_000 }, async () => {
+	// The leaderboard is the Redis board the zone server writes and
+	// mobpit-service serves through its GraphQL board roots.
+	const redisUrl = process.env.REDIS_URL;
+	assert.ok(redisUrl, 'REDIS_URL is required: the SvelteKit leaderboard is the Redis board (docker compose up -d redis)');
+	const redisPrefix = `mobpit-sveltekit-${randomBytes(6).toString('hex')}`;
 	const secret = randomBytes(32).toString('hex');
 	const dataDir = mkdtempSync(join(tmpdir(), 'mobpit-sveltekit-'));
 	const busUrl = `sqlite:${join(dataDir, 'bus.db')}`;
@@ -82,7 +90,7 @@ test('sign in, join, move, kill, live read model updates for two players', { tim
 	// The Crawler cells run on celld; its outbox Queue relays the domain
 	// events to the game server, which publishes them onto the bus.
 	const celld = await startCelld({ relayPort: GAME_PORT });
-	const gameEnv = { ...process.env, ...celld.env, DISTRIBUTED_GAME_SECRET: secret };
+	const gameEnv = { ...process.env, ...celld.env, DISTRIBUTED_GAME_SECRET: secret, REDIS_URL: redisUrl, MOBPIT_REDIS_PREFIX: redisPrefix };
 	const gameArgs = ['mobpit', '--port', String(GAME_PORT), '--data-dir', join(dataDir, 'local'), '--projection-bus', busUrl];
 	const game = bin
 		? start(bin, gameArgs, { env: gameEnv }, /LISTENING/)
@@ -92,6 +100,8 @@ test('sign in, join, move, kill, live read model updates for two players', { tim
 		BIND: `127.0.0.1:${SERVICE_PORT}`,
 		DATABASE_URL: `sqlite:${join(dataDir, 'service.db')}?mode=rwc`,
 		MOBPIT_BUS_URL: busUrl,
+		REDIS_URL: redisUrl,
+		MOBPIT_REDIS_PREFIX: redisPrefix,
 		MOBPIT_API_ISSUER: 'mobpit-sveltekit',
 		MOBPIT_API_AUDIENCE: 'mobpit-service',
 		MOBPIT_API_JWKS: keys.jwks,
@@ -229,7 +239,10 @@ test('sign in, join, move, kill, live read model updates for two players', { tim
 		assert.ok([10, 25, 60].some((tier) => xp >= tier) && kills >= 1, `xp ${xp} kills ${kills}`);
 		assert.deepEqual(navigations, [], 'the read model updated without a reload');
 
-		// The other player's leaderboard updated live too.
+		// The other player's leaderboard (the Redis board via the GraphQL
+		// board roots) updated live too: the zone server's board change
+		// notice crossed the bus to mobpit-service, which pushed it.
+		assert.equal(await bob.getAttribute('[data-testid=leaderboard]', 'data-live'), 'active');
 		await bob.waitForFunction(
 			(expected) => [...document.querySelectorAll('[data-testid=leaderboard] li')].some((li) => li.textContent === expected),
 			`ana — ${xp} XP`,

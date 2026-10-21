@@ -61,6 +61,9 @@ jobs:
         working-directory: examples/game/sveltekit
         run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
       - name: Run examples/game smoke
+        env:
+          # The SvelteKit leaderboard is the Redis board (GraphQL board roots).
+          REDIS_URL: redis://127.0.0.1:6379
         run: examples/game/run.sh smoke
       - name: Leaderboard conformance and GraphQL boards against real Redis
         env:
