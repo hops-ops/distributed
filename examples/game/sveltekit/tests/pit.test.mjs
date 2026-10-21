@@ -435,6 +435,19 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 			{ timeout: 15_000 }
 		);
 
+		// World events: the entrance's borough runs its own (scheduled by its
+		// cell); the boroughs read model lists the running one live, and the
+		// room shows it to its players.
+		// (One with time to spare, so the room's view is checked while it runs.)
+		await page.waitForFunction(
+			() => Number(/(\d+) s left/.exec(document.querySelector('[data-testid=events] li[data-borough="0.0"]')?.textContent ?? '')?.[1] ?? 0) >= 8,
+			null,
+			{ timeout: 90_000 }
+		);
+		assert.equal(await page.getAttribute('[data-testid=events]', 'data-live'), 'active');
+		console.error(`world event (read model, @live): ${await page.textContent('[data-testid=events] li[data-borough="0.0"]')}`);
+		await page.waitForSelector('[data-testid=world-event]', { timeout: 10_000 });
+
 		// SSR after a reload: the settled numbers are in the server HTML.
 		const html = await page.evaluate(() => fetch('/pit', { headers: { accept: 'text/html' } }).then((r) => r.text()));
 		assert.match(html, new RegExp(`data-testid="kills"[^>]*>${kills}<`));

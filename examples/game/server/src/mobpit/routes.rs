@@ -276,6 +276,8 @@ async fn tiers(State(dev): State<Dev>, Query(query): Query<HashMap<String, Strin
             "borough": pair_shard(borough), "x": borough.0, "y": borough.1,
             "bossesDown": down,
             "weather": mobpit_tiers::WEATHER[mobpit_tiers::weather_for(down as u32) as usize],
+            "event": state["event"].as_str().unwrap_or_default(),
+            "eventUntilMs": state["event_until_ms"].as_u64().unwrap_or(0),
         }));
     }
     let city = cells

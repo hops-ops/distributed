@@ -5,6 +5,7 @@
 	import Leaderboard from '$lib/pit/Leaderboard.svelte';
 	import MyStats from '$lib/pit/MyStats.svelte';
 	import Rooms from '$lib/pit/Rooms.svelte';
+	import Events from '$lib/pit/Events.svelte';
 	import { neighbourRooms, pitHandoffFrame, startPitLoop } from '$lib/pit/loop';
 
 	let { data } = $props();
@@ -179,9 +180,17 @@
 				<div>hood <b>{world.hoodX},{world.hoodY}</b> · tier <b data-testid="hood-tier">{world.hoodTier}</b> · boss <b data-testid="boss">{world.bossDown ? `down (${world.lastBy})` : 'standing'}</b></div>
 				<div>borough <b>{world.boroughX},{world.boroughY}</b> · <b data-testid="weather">{WEATHER[world.weather]}</b> · {world.boroughBossesDown}/9 bosses down</div>
 				<div data-testid="banner">{world.banner}</div>
+				{#if world.event}
+					<div class="event" data-testid="world-event">{world.event} in this borough</div>
+				{/if}
 			{:else}
 				<div>…</div>
 			{/if}
+		</section>
+		<section data-testid="world-events">
+			<h2>World events</h2>
+			<!-- The boroughs read model (mobpit-service): SSR, then @live. -->
+			<Events />
 		</section>
 		<section data-testid="network">
 			<h2>Network</h2>
@@ -239,4 +248,5 @@
 	h2 { margin: 0 0 0.5rem; font-size: 1rem; }
 	.error { color: #ff6b6b; }
 	.saved { color: #9ad16b; }
+	.event { color: #e0a8ff; font-weight: 600; }
 </style>

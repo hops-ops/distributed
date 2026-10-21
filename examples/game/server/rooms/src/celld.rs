@@ -35,6 +35,10 @@ impl CelldZone for MobPit {
             .route(FactRoute::by_input_field::<BossDefeatedInput>(
                 HOOD_KIND, "hood",
             ))
+            .route(FactRoute::by_input_field::<mobpit_tiers::RoomAwakeInput>(
+                BOROUGH_KIND,
+                "borough",
+            ))
             .lifecycle_route(PRESENCE_KIND)
     }
 
@@ -72,7 +76,9 @@ impl CelldZone for MobPit {
                 last_by: h["last_by"].as_str().unwrap_or_default().to_string(),
                 borough_bosses_down: b["bosses_down"].as_u64().unwrap_or(0) as u32,
                 weather: b["weather"].as_u64().unwrap_or(0) as u8,
-                hoods_down: b["hoods_down"]
+                event: b["event"].as_str().unwrap_or_default().to_string(),
+                event_until_ms: b["event_until_ms"].as_u64().unwrap_or(0),
+                hoods_down: borough_state["hoods_down"]
                     .as_array()
                     .map(|a| {
                         a.iter()

@@ -179,3 +179,17 @@
 .label.door {
 	color: #4dd0e1;
 }
+
+.pit-event {
+	position: fixed;
+	top: 12px;
+	left: 50%;
+	transform: translateX(-50%);
+	padding: 8px 16px;
+	border-radius: 6px;
+	background: rgba(120, 30, 160, 0.85);
+	color: #fff;
+	font-weight: 600;
+	pointer-events: none;
+	z-index: 5;
+}

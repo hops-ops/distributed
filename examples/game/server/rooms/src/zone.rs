@@ -369,6 +369,11 @@ pub struct WorldTiers {
     pub weather: u8,
     /// Hoods of the borough whose boss is down (`hx.hy`).
     pub hoods_down: Vec<String>,
+    /// The borough's world event (`invasion`, `frenzy`, `blessing`; empty
+    /// when none), scheduled by its cell.
+    pub event: String,
+    /// When the event ends (Unix ms, 0 when none).
+    pub event_until_ms: u64,
     /// Bosses down across the city.
     pub city_bosses_down: u32,
     /// The city's banner.
@@ -651,6 +656,8 @@ pub struct MobPit {
     parked: Vec<Parked>,
     /// The tiers above the room (from their cells).
     world: WorldTiers,
+    /// This activation told its borough it is awake (arms its events).
+    awake_reported: bool,
 }
 
 fn spawn_state(player: PlayerId) -> MoveState {
@@ -840,6 +847,24 @@ impl MobPit {
         }
     }
 
+    /// Tell the borough a room of it is awake (a zone fact, once per
+    /// activation): its cell arms its world event cycle.
+    fn report_awake(&mut self, ctx: &mut Ctx<'_, Self>) {
+        let input = mobpit_tiers::RoomAwakeInput {
+            borough: pair_shard((self.world.borough_x, self.world.borough_y)),
+            room: ctx.zone_id().to_string(),
+        };
+        let boot = ctx.boot_epoch();
+        if let Ok(fact) = ctx.fact_with_key(&input, &[&"awake", &boot]) {
+            self.awake_reported = ctx.emit_fact(fact).is_ok();
+        }
+    }
+
+    /// The effect of the borough's world event right now.
+    fn event(&self) -> &str {
+        self.world.event.as_str()
+    }
+
     /// The hood's boss fell here: a zone fact into the hood's cell (keyed
     /// by the boss's life; the hood raises its tier and brings the boss
     /// back on its own schedule) and the news to everyone in the room.
@@ -908,6 +933,7 @@ impl MobPit {
             x: self.room.room.0,
             y: self.room.room.1,
         };
+        let blessing = self.world.event == "blessing";
         for (id, p) in &mut self.players {
             p.credits = (p.credits + 1).min(MAX_CREDITS);
             p.swing_cd = p.swing_cd.saturating_sub(1);
@@ -953,7 +979,9 @@ impl MobPit {
                 }
             }
             p.regen = p.regen.wrapping_add(1);
-            if p.regen % 15 == 0 && p.hp < PLAYER_HP {
+            // A blessing (the borough's world event) heals five times as fast.
+            let every = if blessing { 3 } else { 15 };
+            if p.regen % every == 0 && p.hp < PLAYER_HP {
                 p.hp += 1;
             }
             ctx.set_view(*id, View::new(p.state.x, p.state.y, VIEW_RADIUS));
@@ -1050,6 +1078,11 @@ impl MobPit {
         let mut hits: Vec<(PlayerId, i32)> = Vec::new();
         let difficulty = self.world.hood_tier;
         let boss_down = self.world.boss_down;
+        // The borough's world event: an invasion (mobs aggro from twice as
+        // far and come back at once) or a frenzy (mobs 40 % faster).
+        let invasion = self.event() == "invasion";
+        let pace = if self.event() == "frenzy" { 1.4 } else { 1.0 };
+        let aggro = if invasion { AGGRO * 2.0 } else { AGGRO };
         for i in 0..self.mobs.len() {
             let tier = self.mobs[i].tier;
             let (_, speed, _, radius, tele) = tier_stats(tier);
@@ -1063,7 +1096,12 @@ impl MobPit {
             match m.state {
                 MobState::Dead => {
                     // A boss returns only once its hood says so.
-                    if tick >= m.respawn_at && !(m.tier == BOSS_TIER && boss_down) {
+                    // An invasion brings the fallen back after a second.
+                    let due = tick >= m.respawn_at
+                        || (invasion
+                            && m.tier != BOSS_TIER
+                            && tick + RESPAWN_TICKS >= m.respawn_at + 30);
+                    if due && !(m.tier == BOSS_TIER && boss_down) {
                         m.generation += 1;
                         m.hp = max_hp;
                         (m.x, m.y) = m.home;
@@ -1075,7 +1113,7 @@ impl MobPit {
                     let nearest = living
                         .iter()
                         .map(|(id, x, y)| (*id, dist((m.x, m.y), (*x, *y))))
-                        .filter(|(_, d)| *d < AGGRO)
+                        .filter(|(_, d)| *d < aggro)
                         .min_by(|a, b| a.1.total_cmp(&b.1));
                     if let Some((id, _)) = nearest {
                         m.state = MobState::Chase;
@@ -1098,7 +1136,7 @@ impl MobPit {
                             m.timer = WINDUP_TICKS;
                             m.face = (ty - m.y).atan2(tx - m.x);
                         } else {
-                            m.face = step_toward(&mut m.x, &mut m.y, tx, ty, speed * dt);
+                            m.face = step_toward(&mut m.x, &mut m.y, tx, ty, speed * pace * dt);
                         }
                     }
                     _ => {
@@ -1351,6 +1389,7 @@ impl Zone for MobPit {
                     ..WorldTiers::default()
                 }
             },
+            awake_reported: false,
         }
     }
 
@@ -1428,6 +1467,9 @@ impl Zone for MobPit {
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
         self.tick = ctx.tick();
+        if !self.awake_reported {
+            self.report_awake(ctx);
+        }
         self.measure_tick(ctx.now());
         let swings = self.step_players(ctx);
         self.resolve_swings(ctx, swings);

@@ -206,3 +206,74 @@ async fn a_boss_kill_ripples_up_and_the_boss_returns() {
         0
     );
 }
+
+#[tokio::test]
+async fn a_borough_runs_world_events_on_its_own_schedule() {
+    let clock = ManualClock::new(SystemTime::UNIX_EPOCH + Duration::from_millis(T0));
+    let borough = mount_borough(cell::<Borough>(&clock, "Borough", "0.0"));
+    let awake = |room: &str| json!({ "borough": "0.0", "room": room });
+    // Only a room of the borough, as itself.
+    assert!(run(
+        &borough,
+        ROOM_AWAKE,
+        "a0",
+        awake("pit.20.0"),
+        "zone:pit.20.0"
+    )
+    .await
+    .is_err());
+    assert!(
+        run(&borough, ROOM_AWAKE, "a1", awake("pit.1.1"), "zone:pit.2.2")
+            .await
+            .is_err()
+    );
+    let armed = run(&borough, ROOM_AWAKE, "a2", awake("pit.1.1"), "zone:pit.1.1")
+        .await
+        .unwrap();
+    assert_eq!(armed["changed"], true, "the first room arms the cycle");
+    let again = run(&borough, ROOM_AWAKE, "a3", awake("pit.2.1"), "zone:pit.2.1")
+        .await
+        .unwrap();
+    assert_eq!(again["changed"], false, "armed once");
+
+    clock.advance(Duration::from_millis(EVENT_FIRST_MS));
+    assert_eq!(borough.fire_due_schedules().await.unwrap().fired.len(), 1);
+    let b = borough.load().await.unwrap().unwrap().state();
+    assert_eq!(b.event, EVENTS[0]);
+    assert_eq!(b.event_until_ms, T0 + EVENT_FIRST_MS + EVENT_LENGTH_MS);
+    clock.advance(Duration::from_millis(EVENT_LENGTH_MS));
+    assert_eq!(borough.fire_due_schedules().await.unwrap().fired.len(), 1);
+    assert_eq!(borough.load().await.unwrap().unwrap().state().event, "");
+    clock.advance(Duration::from_millis(EVENT_GAP_MS));
+    borough.fire_due_schedules().await.unwrap();
+    assert_eq!(
+        borough.load().await.unwrap().unwrap().state().event,
+        EVENTS[1],
+        "the next kind"
+    );
+
+    // Outward: every start and end is a domain event (the read model's rows).
+    let names: Vec<String> = borough
+        .durable_outbox()
+        .unwrap()
+        .into_iter()
+        .map(|m| m.event_type)
+        .collect();
+    assert_eq!(
+        names
+            .iter()
+            .filter(|n| *n == "borough.event_started")
+            .count(),
+        2
+    );
+    assert_eq!(
+        names.iter().filter(|n| *n == "borough.event_ended").count(),
+        1
+    );
+
+    // Nobody about for long: the cycle stops after the running event.
+    clock.advance(Duration::from_millis(EVENT_IDLE_MS));
+    borough.fire_due_schedules().await.unwrap();
+    let b = borough.load().await.unwrap().unwrap();
+    assert!(b.event.is_empty() && !b.armed, "stopped");
+}

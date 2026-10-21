@@ -1761,6 +1761,7 @@ dependencies = [
  "futures-util",
  "game_demos",
  "mobpit_crawler",
+ "mobpit_tiers",
  "serde",
  "serde_json",
  "sqlx",

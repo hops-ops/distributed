@@ -178,6 +178,14 @@ factsPanel.innerHTML = `<h2>Durable facts</h2>
 const graph = factsPanel.querySelector('canvas') as HTMLCanvasElement;
 const field = (k: string) => factsPanel.querySelector(`[data-k="${k}"]`) as HTMLElement;
 const deathBanner = div('pit-death', document.body);
+// The borough's world event (scheduled by its cell): a banner while it runs.
+const eventBanner = div('pit-event', document.body);
+eventBanner.style.display = 'none';
+const EVENT_TEXT: Record<string, string> = {
+	invasion: 'INVASION — the mobs of this borough come at you from afar and rise again at once',
+	frenzy: 'FRENZY — the mobs of this borough are 40 % faster',
+	blessing: 'BLESSING — you heal five times as fast in this borough'
+};
 deathBanner.style.display = 'none';
 
 function div(className: string, parent: HTMLElement): HTMLDivElement {
@@ -680,8 +688,11 @@ pit.on('bossDown', (b, zoneId) => {
 	if (zoneId === pit.room()) toast(`${b.by} felled the boss! The hood is now tier ${b.hoodTier} — its rooms get tougher`);
 });
 let lastWeather: number | undefined;
+let lastEvent = '';
 pit.on('world', (w, zoneId) => {
 	if (zoneId !== pit.room()) return;
+	if (w.event !== lastEvent && w.event !== '') toast(`World event in borough ${w.boroughX},${w.boroughY}: ${w.event}`);
+	lastEvent = w.event;
 	if (lastWeather !== undefined && w.weather > lastWeather) toast(`The sky over the borough lifts: ${WEATHER[w.weather]}`);
 	lastWeather = w.weather;
 });
@@ -890,6 +901,10 @@ stage.onFrame((now, dtMs) => {
 	hud.row('Hood', w === undefined ? '—' : `${w.hoodX},${w.hoodY} · tier ${w.hoodTier} · boss ${w.bossDown ? `down (${w.lastBy})` : 'standing'}`);
 	hud.row('Borough', w === undefined ? '—' : `${w.boroughX},${w.boroughY} · ${WEATHER[w.weather]} · ${w.boroughBossesDown}/9 bosses down`);
 	hud.row('City', w === undefined || w.banner === '' ? '—' : w.banner);
+	const left = w === undefined || w.event === '' ? 0 : Math.max(0, Math.round((w.eventUntilMs - Date.now()) / 1000));
+	hud.row('World event', w === undefined || w.event === '' ? 'none (the borough schedules the next)' : `${w.event} · ${left} s left`);
+	eventBanner.style.display = w !== undefined && w.event !== '' ? '' : 'none';
+	if (w !== undefined && w.event !== '') eventBanner.textContent = `${EVENT_TEXT[w.event] ?? w.event} · ${left} s`;
 	hud.row('Interest', hello === undefined ? '—' : `${hello.viewRadius} m ring · ${rendered.filter((e) => isMob(e) && !e.stale).length} mobs replicated`);
 	const profile = pit.profile();
 	if (profile !== undefined) {

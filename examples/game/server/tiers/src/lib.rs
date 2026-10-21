@@ -29,6 +29,8 @@
 //! hood that room belongs to; the saga commands only for [`SAGA_PRINCIPAL`],
 //! a session the worker builds itself. No input names a reward.
 
+pub mod events;
+
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
@@ -307,13 +309,44 @@ pub struct HoodSeen {
     pub sequence: u64,
 }
 
-/// One borough: its 9 hoods as last heard.
+/// One borough: its 9 hoods as last heard, and its world event cycle.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, distributed::Snapshot)]
 pub struct Borough {
     entity: Entity,
     /// Hood shard → what was heard last.
     pub hoods: BTreeMap<String, HoodSeen>,
+    /// The world event running now (one of [`EVENTS`]; empty between them).
+    pub event: String,
+    /// When it ends (cell clock, ms).
+    pub event_until_ms: u64,
+    /// Events run so far (picks the next kind).
+    pub events_run: u32,
+    /// The event cycle is scheduled.
+    pub armed: bool,
+    /// The last time a room of the borough woke (cell clock, ms).
+    pub last_awake_ms: u64,
 }
+
+/// World events a borough runs, in turn: `invasion` (mobs aggro from twice
+/// as far and come back at once), `frenzy` (mobs 40 % faster), `blessing`
+/// (players heal fast). Effects only — rewards stay the cells' business.
+pub const EVENTS: [&str; 3] = ["invasion", "frenzy", "blessing"];
+/// The first event starts this long after the cycle is armed (ms).
+pub const EVENT_FIRST_MS: u64 = 10_000;
+/// An event lasts this long (ms).
+pub const EVENT_LENGTH_MS: u64 = 30_000;
+/// The next event starts this long after the last ended (ms).
+pub const EVENT_GAP_MS: u64 = 30_000;
+/// With no room of the borough awake for this long the cycle stops (ms).
+pub const EVENT_IDLE_MS: u64 = 300_000;
+/// Command: a room of the borough woke (zone fact; arms the cycle).
+pub const ROOM_AWAKE: &str = "borough.room_awake";
+/// Command (schedule only): the next event starts.
+pub const EVENT_START: &str = "borough.event_start";
+/// Command (schedule only): the event ends.
+pub const EVENT_END: &str = "borough.event_end";
+/// Schedule name of the cycle.
+const EVENT_ALARM: &str = "event";
 
 /// A borough as its outward events carry it (and rooms read it).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::DomainState)]
@@ -327,25 +360,22 @@ pub struct BoroughState {
     pub weather: u8,
     /// Sum of its hoods' tiers.
     pub tier: u32,
-    /// Hoods whose boss is down (`hx.hy`).
-    pub hoods_down: Vec<String>,
+    /// The world event running (one of [`EVENTS`], empty when none).
+    pub event: String,
+    /// When it ends (ms, 0 when none).
+    pub event_until_ms: u64,
 }
 
 impl From<&Borough> for BoroughState {
     fn from(b: &Borough) -> Self {
-        let hoods_down: Vec<String> = b
-            .hoods
-            .iter()
-            .filter(|(_, h)| h.boss_down)
-            .map(|(k, _)| k.clone())
-            .collect();
-        let bosses_down = hoods_down.len() as u32;
+        let bosses_down = b.hoods_down().len() as u32;
         Self {
             borough: b.entity.id().to_string(),
             bosses_down,
             weather: weather_for(bosses_down),
             tier: b.hoods.values().map(|h| h.tier).sum(),
-            hoods_down,
+            event: b.event.clone(),
+            event_until_ms: b.event_until_ms,
         }
     }
 }
@@ -364,6 +394,29 @@ impl Borough {
         }
         self.hoods.insert(hood, seen);
     }
+
+    #[event("borough.room_awake", version = 1)]
+    fn room_awake(&mut self, borough: String, at_ms: u64, arm: bool) {
+        if self.entity.id().is_empty() {
+            self.entity.set_id(borough);
+        }
+        self.last_awake_ms = at_ms;
+        self.armed |= arm;
+    }
+
+    #[event("borough.event_started", version = 1, domain)]
+    fn event_started(&mut self, kind: String, until_ms: u64) {
+        self.event = kind;
+        self.event_until_ms = until_ms;
+        self.events_run += 1;
+    }
+
+    #[event("borough.event_ended", version = 1, domain)]
+    fn event_ended(&mut self, rearmed: bool) {
+        self.event.clear();
+        self.event_until_ms = 0;
+        self.armed = rearmed;
+    }
 }
 
 impl Borough {
@@ -371,6 +424,133 @@ impl Borough {
     pub fn state(&self) -> BoroughState {
         BoroughState::from(self)
     }
+
+    /// Hoods whose boss is down (`hx.hy`).
+    pub fn hoods_down(&self) -> Vec<String> {
+        self.hoods
+            .iter()
+            .filter(|(_, h)| h.boss_down)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+}
+
+/// [`ROOM_AWAKE`]: a room of the borough woke (zone fact of that room).
+#[derive(
+    Debug, Clone, Serialize, Deserialize, distributed::CommandInput, distributed_game::FactCommand,
+)]
+#[fact(command = ROOM_AWAKE)]
+pub struct RoomAwakeInput {
+    /// `bx.by`: the borough's shard (the fact route's key).
+    pub borough: String,
+    /// The room (`pit.<x>.<y>`).
+    pub room: String,
+}
+
+/// [`EVENT_START`] / [`EVENT_END`] input (the borough's own schedule).
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandInput)]
+pub struct EventInput {
+    /// `bx.by`.
+    pub borough: String,
+}
+
+fn event_schedule(borough: &str, at_ms: u64, command: &str) -> Result<Schedule, HandlerError> {
+    Schedule::at(
+        EVENT_ALARM,
+        SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms),
+        command,
+        &EventInput {
+            borough: borough.to_string(),
+        },
+    )
+    .map_err(rejected)
+}
+
+/// Only a room of the borough, as itself.
+fn is_room_of_borough(ctx: &CausalCommandContext<'_, Borough>) -> bool {
+    ctx.session()
+        .user_id()
+        .is_some_and(|p| p.starts_with("zone:pit."))
+}
+
+async fn handle_room_awake(
+    ctx: &CausalCommandContext<'_, Borough>,
+    input: RoomAwakeInput,
+) -> Result<PreparedCommand<Succeeded<TierReceipt>>, HandlerError> {
+    let room = parse_room(&input.room).ok_or_else(|| rejected("not a room"))?;
+    if ctx.session().user_id() != Some(zone_principal(&input.room).as_str()) {
+        return Err(rejected("only the room itself reports it woke"));
+    }
+    if pair_shard(borough_of(hood_of(room))) != input.borough {
+        return Err(rejected("the room is not in this borough"));
+    }
+    let now = now_ms(ctx)?;
+    let repo = ctx.repo();
+    let mut borough = match repo.get(&input.borough).await? {
+        Some(b) => b,
+        None => repo.create(),
+    };
+    let arm = !borough.armed;
+    borough
+        .room_awake(input.borough.clone(), now, arm)
+        .map_err(rejected)?;
+    if arm {
+        // The cycle: the first event soon, then the schedule keeps it going.
+        ctx.schedule(event_schedule(
+            &input.borough,
+            now + EVENT_FIRST_MS,
+            EVENT_START,
+        )?)?;
+    }
+    repo.commit(borough)?
+        .succeeded(TierReceipt { changed: arm })
+}
+
+async fn handle_event_start(
+    ctx: &CausalCommandContext<'_, Borough>,
+    input: EventInput,
+) -> Result<PreparedCommand<Succeeded<TierReceipt>>, HandlerError> {
+    let now = now_ms(ctx)?;
+    let repo = ctx.repo();
+    let Some(mut borough) = repo.get(&input.borough).await? else {
+        return Err(rejected("no borough"));
+    };
+    if !borough.event.is_empty() {
+        return repo
+            .commit(borough)?
+            .succeeded(TierReceipt { changed: false });
+    }
+    let kind = EVENTS[borough.events_run as usize % EVENTS.len()].to_string();
+    let until = now + EVENT_LENGTH_MS;
+    borough.event_started(kind, until).map_err(rejected)?;
+    ctx.schedule(event_schedule(&input.borough, until, EVENT_END)?)?;
+    repo.publish_events()
+        .commit(borough)?
+        .succeeded(TierReceipt { changed: true })
+}
+
+async fn handle_event_end(
+    ctx: &CausalCommandContext<'_, Borough>,
+    input: EventInput,
+) -> Result<PreparedCommand<Succeeded<TierReceipt>>, HandlerError> {
+    let now = now_ms(ctx)?;
+    let repo = ctx.repo();
+    let Some(mut borough) = repo.get(&input.borough).await? else {
+        return Err(rejected("no borough"));
+    };
+    // Keep the cycle going while rooms of the borough are about.
+    let rearm = now.saturating_sub(borough.last_awake_ms) < EVENT_IDLE_MS;
+    borough.event_ended(rearm).map_err(rejected)?;
+    if rearm {
+        ctx.schedule(event_schedule(
+            &input.borough,
+            now + EVENT_GAP_MS,
+            EVENT_START,
+        )?)?;
+    }
+    repo.publish_events()
+        .commit(borough)?
+        .succeeded(TierReceipt { changed: true })
 }
 
 /// [`HOOD_CHANGED`] (saga step).
@@ -614,6 +794,39 @@ tier_command!(
     handle_hood_changed,
 );
 tier_command!(
+    RoomAwake,
+    Borough,
+    ROOM_AWAKE,
+    RoomAwakeInput,
+    TierReceipt,
+    is_room_of_borough,
+    handle_room_awake,
+    Capability::Scheduling,
+    Capability::Clock
+);
+tier_command!(
+    EventStart,
+    Borough,
+    EVENT_START,
+    EventInput,
+    TierReceipt,
+    schedule_guard::<Borough>,
+    handle_event_start,
+    Capability::Scheduling,
+    Capability::Clock
+);
+tier_command!(
+    EventEnd,
+    Borough,
+    EVENT_END,
+    EventInput,
+    TierReceipt,
+    schedule_guard::<Borough>,
+    handle_event_end,
+    Capability::Scheduling,
+    Capability::Clock
+);
+tier_command!(
     BoroughChanged,
     City,
     BOROUGH_CHANGED,
@@ -631,6 +844,9 @@ pub fn mount_hood(cell: AggregateCell<Hood>) -> AggregateCell<Hood> {
 /// Mount the borough command on a `Borough` cell.
 pub fn mount_borough(cell: AggregateCell<Borough>) -> AggregateCell<Borough> {
     cell.mount(HoodChanged)
+        .mount(RoomAwake)
+        .mount(EventStart)
+        .mount(EventEnd)
 }
 
 /// Mount the city command on the `City` cell.
@@ -738,7 +954,8 @@ mod tests {
                 bosses_down: 9,
                 weather: 3,
                 tier: 9,
-                hoods_down: vec![],
+                event: String::new(),
+                event_until_ms: 0,
             },
             3,
         );

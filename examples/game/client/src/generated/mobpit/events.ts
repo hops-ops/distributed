@@ -122,6 +122,8 @@ export interface WorldTiers {
 	readonly boroughBossesDown: number;
 	readonly weather: number;
 	readonly hoodsDown: readonly string[];
+	readonly event: string;
+	readonly eventUntilMs: number;
 	readonly cityBossesDown: number;
 	readonly banner: string;
 }
@@ -139,6 +141,8 @@ const WORLD_TIERS_TYPE: WireType = {
 		['boroughBossesDown', { type: 'u32' }],
 		['weather', { type: 'u8' }],
 		['hoodsDown', { type: 'list', item: { type: 'short_str' } }],
+		['event', { type: 'short_str' }],
+		['eventUntilMs', { type: 'u64' }],
 		['cityBossesDown', { type: 'u32' }],
 		['banner', { type: 'short_str' }],
 	]

@@ -448,6 +448,21 @@ the same Rust compiled to WebAssembly (`createMobpitPures().pitRoom`) for
 the floor colour and the minimap; nothing static is replicated. Seed:
 `MOBPIT_SEED` (worker var).
 
+**World events.** Each borough runs its own events on its own schedule:
+a room that wakes tells its borough (a zone fact, `borough.room_awake`),
+whose cell arms its cycle (`ctx.schedule`): 10 s later an event starts
+(in turn `invasion` — mobs aggro from twice as far and rise again a
+second after falling —, `frenzy` — mobs 40 % faster —, `blessing` —
+players heal five times as fast), runs 30 s, and the next starts 30 s
+after it ends, for as long as rooms of the borough keep waking. Rooms
+read the event with their tiers and apply it; the pages show a banner
+with the time left. Events are effects only: XP stays the Crawler cell's
+decision, so there is no "double XP" a room could claim. The borough's
+domain events (`borough.event_started` / `event_ended` / `changed`) feed
+the `boroughs` read model in `mobpit-service` (GraphQL, `@live`: the
+SvelteKit page's "World events" list); the Vite page reads them from the
+borough cells (`/dev/mobpit/tiers`).
+
 **Every room looks different.** Besides biome and mobs, `pit_room` lays
 out the room's obstacles in one of six seeded patterns (`PATTERNS`:
 classic pillars — always in the entrance —, a colonnade, a ring of columns

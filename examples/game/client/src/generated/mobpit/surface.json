@@ -1324,6 +1324,18 @@
           }
         },
         {
+          "name": "event",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "event_until_ms",
+          "type": {
+            "type": "u64"
+          }
+        },
+        {
           "name": "city_bosses_down",
           "type": {
             "type": "u32"

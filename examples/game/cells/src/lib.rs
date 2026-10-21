@@ -661,6 +661,12 @@ fn saga_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
     })
 }
 
+/// A borough hears the saga (its hoods) and its rooms' own facts (a room
+/// woke: the world event cycle); each command checks which it accepts.
+fn borough_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
+    saga_session(header).or_else(|| fact_session(header))
+}
+
 async fn read_hood(cell: &AggregateCell<Hood>) -> std::result::Result<Value, String> {
     let hood = cell.load().await.map_err(|error| error.to_string())?;
     Ok(json!({ "state": hood.map(|h| h.state()) }))
@@ -668,7 +674,10 @@ async fn read_hood(cell: &AggregateCell<Hood>) -> std::result::Result<Value, Str
 
 async fn read_borough(cell: &AggregateCell<Borough>) -> std::result::Result<Value, String> {
     let borough = cell.load().await.map_err(|error| error.to_string())?;
-    Ok(json!({ "state": borough.map(|b| b.state()) }))
+    Ok(json!({
+        "state": borough.as_ref().map(|b| b.state()),
+        "hoods_down": borough.map(|b| b.hoods_down()).unwrap_or_default(),
+    }))
 }
 
 async fn read_city(cell: &AggregateCell<City>) -> std::result::Result<Value, String> {
@@ -722,7 +731,7 @@ impl DurableObject for BoroughCell {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_borough, saga_session).await
+        route(&self.env, &self.cell, req, read_borough, borough_session).await
     }
 
     async fn alarm(&self) -> Result<Response> {
