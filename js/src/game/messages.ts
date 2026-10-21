@@ -63,7 +63,9 @@ export const GameErrorCode = Object.freeze({
 	NOT_FOUND: 7,
 	RECONNECT_FAILED: 8,
 	/** The zone could not be created right now (factory or allocation failure); retry later. */
-	ZONE_UNAVAILABLE: 9
+	ZONE_UNAVAILABLE: 9,
+	/** The zone is asleep and an observer does not wake it (celld zones: observers are passive watchers); try later. */
+	ASLEEP: 10
 });
 
 export type HelloMessage = Readonly<{

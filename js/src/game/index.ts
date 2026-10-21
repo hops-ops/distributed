@@ -7,6 +7,8 @@
  * - `Predictor`: client prediction + per-field reconciliation policies.
  * - `GameClient`: authority + observer zones, merged render, handoff,
  *   adaptive interpolation delay, runtime prediction toggle.
+ * - `watchZones`: observe the zones around the authority (neighbouring
+ *   rooms), letting go of sleeping ones and retrying them.
  * - `AdaptiveDelay` / `InputPacer`: network-following render delay and
  *   one-input-per-tick pacing for render loops.
  * - Typed payload codec (`encodePayload`, …) and helpers for clients
@@ -168,6 +170,7 @@ export {
 	type DelaySource,
 	type InputPacerOptions
 } from './pacing.js';
+export { watchZones, type WatchState, type WatchZonesOptions, type ZoneWatch } from './watch.js';
 export {
 	GameClient,
 	type ControlledEntityResolver,

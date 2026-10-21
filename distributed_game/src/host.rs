@@ -1039,6 +1039,15 @@ impl<Z: Zone> ZoneHost<Z> {
         self.core.server_time_ms()
     }
 
+    /// Send every client the current state now, without ticking (a host
+    /// that is not ticking — a celld zone with only passive observers —
+    /// greets a new observer with it).
+    pub fn patch_now(&mut self) {
+        if !self.core.clients.is_empty() {
+            self.patch();
+        }
+    }
+
     /// Frames and closes produced since the last call, in order.
     pub fn drain_outbound(&mut self) -> Vec<Outbound> {
         std::mem::take(&mut self.core.outbound)

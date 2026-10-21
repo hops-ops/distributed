@@ -55,6 +55,15 @@
 //! loses at most the snapshot interval of zone state (facts are kept by
 //! the outbox) and takes the node lease TTL (~10 s) to recover.
 //!
+//! **Observers are passive watchers** on celld: an observer connection
+//! (a ticket with role `observer`, e.g. a page watching the rooms next to
+//! its own) never counts as occupancy — a zone with only observers stops
+//! ticking (they keep its last state), goes dormant and hibernates (their
+//! sockets are closed) — and an observer Hello never wakes a sleeping zone:
+//! it is refused with [`error::ASLEEP`](crate::protocol::error::ASLEEP).
+//! Only a player wakes a zone. A watcher joining a dormant zone gets its
+//! current state at once ([`ZoneHost::patch_now`](crate::ZoneHost::patch_now)).
+//!
 //! Dev only: with `ZONE_DEV_SETTINGS=1` every zone object applies the
 //! network simulation ([`NetSim`](crate::netsim::NetSim): latency, jitter,
 //! loss per socket and direction) stored in the worker's

@@ -309,7 +309,9 @@ Redirect := 0x89, string zone_id, string url
 - **Error**: codes `1` BAD_MESSAGE, `2` UNAUTHORIZED, `3` REJECTED,
   `4` ZONE_FULL, `5` VERSION_MISMATCH, `6` RATE_LIMITED, `7` NOT_FOUND,
   `8` RECONNECT_FAILED, `9` ZONE_UNAVAILABLE (the zone could not be created
-  right now; retry later). Errors during the handshake are followed by close;
+  right now; retry later), `10` ASLEEP (an observer is not admitted to a
+  sleeping zone it would otherwise wake; zones hosted as celld objects treat
+  observers as passive watchers; retry later). Errors during the handshake are followed by close;
   `BAD_MESSAGE` and `RATE_LIMITED` after joining are not.
 
 Worked example — Welcome (session "s1", zone "z1", player, 30 Hz ticks,
@@ -562,6 +564,7 @@ error codes and treat them as "session over" / "request failed"):
 - `0x89 Redirect` (server → client).
 - Kick code `7` RELOAD.
 - Error code `9` ZONE_UNAVAILABLE.
+- Error code `10` ASLEEP.
 - Transfer tickets (§8.1) and content-version policies (§8.2); `Handoff`
   and `Freeze`/`Resume` encodings are unchanged.
 

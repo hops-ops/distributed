@@ -80,6 +80,9 @@ pub mod error {
     /// The zone could not be created right now (its factory or allocation
     /// store failed or timed out); retry later.
     pub const ZONE_UNAVAILABLE: u32 = 9;
+    /// The zone is asleep and an observer does not wake it (zones hosted as
+    /// celld objects: observers are passive watchers); try again later.
+    pub const ASLEEP: u32 = 10;
 }
 
 /// Client handshake.

@@ -40,6 +40,7 @@ use crate::world::zone_activity::{
     zone_principal, RecordActivity, ACTIVITY_ACTIVE, ACTIVITY_DORMANT, ACTIVITY_HIBERNATED,
     ZONE_ACTIVITY_KIND,
 };
+use crate::zone::Viewer;
 use crate::{ClientId, Clock, HostConfig, Outbound, TicketClaims, Zone, ZoneHost};
 
 /// A future that runs on the object's (single) thread.
@@ -530,10 +531,10 @@ impl<Z: CelldZone> Inner<Z> {
         self.in_lines.remove(&client);
     }
 
+    /// Players keep a zone awake (also inside their reconnect grace);
+    /// observers are passive watchers and never do.
     fn occupied(&self) -> bool {
-        self.host
-            .as_ref()
-            .is_some_and(|h| h.player_count() > 0 || h.client_count() > 0)
+        self.host.as_ref().is_some_and(|h| h.player_count() > 0)
     }
 
     fn flush(&mut self) {
@@ -723,7 +724,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         if self.inner.borrow().options.is_none() {
             return Response::error("zone host is not configured", 503);
         }
-        self.wake().await?;
+        // Not woken here: only a player's Hello wakes a sleeping zone.
         let pair = WebSocketPair::new()?;
         self.state.accept_web_socket(&pair.server);
         Response::from_websocket(pair.client)
@@ -1117,8 +1118,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
             reject(ws, error::VERSION_MISMATCH, "protocol version");
             return Ok(());
         }
-        if let Err(e) = self.wake().await {
-            reject(ws, error::NOT_FOUND, &e.to_string());
+        let cold = self.inner.borrow().host.is_none();
+        if cold && !hello.reconnect_token.is_empty() {
+            // Sessions die with the activation: rejoin with a ticket (which
+            // wakes the zone for a player, not for an observer).
+            reject(ws, error::RECONNECT_FAILED, "zone restarted; rejoin");
             return Ok(());
         }
         let now = (now_ms() / 1000.0) as u64;
@@ -1144,6 +1148,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
             };
             if claims.zone != zone_id {
                 reject(ws, error::UNAUTHORIZED, "ticket is for another zone");
+                return Ok(());
+            }
+            // A passive watcher never wakes a sleeping zone.
+            if cold && claims.role == Role::Observer {
+                reject(ws, error::ASLEEP, "zone asleep");
                 return Ok(());
             }
             let replayed = self
@@ -1173,9 +1182,19 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     .put(&nonce_key, claims.expires_at)
                     .await;
             }
-            principal = Some(claims.principal.clone());
+            if let Err(e) = self.wake().await {
+                reject(ws, error::NOT_FOUND, &e.to_string());
+                return Ok(());
+            }
+            if claims.role == Role::Player {
+                principal = Some(claims.principal.clone());
+            }
             let mut inner = self.inner.borrow_mut();
-            let host = inner.host.as_mut().expect("woken");
+            let Some(host) = inner.host.as_mut() else {
+                drop(inner);
+                reject(ws, error::ZONE_UNAVAILABLE, "zone asleep");
+                return Ok(());
+            };
             match &transfer {
                 Some(transfer) => {
                     host.join_transfer(transfer, hello.capabilities, &hello.content_version)
@@ -1184,7 +1203,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
             }
         } else {
             let mut inner = self.inner.borrow_mut();
-            let host = inner.host.as_mut().expect("woken");
+            let Some(host) = inner.host.as_mut() else {
+                drop(inner);
+                reject(ws, error::RECONNECT_FAILED, "zone restarted; rejoin");
+                return Ok(());
+            };
             host.reconnect_with_version(
                 &hello.reconnect_token,
                 hello.capabilities,
@@ -1193,6 +1216,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         };
         match joined {
             Ok(joined) => {
+                let observer = matches!(joined.viewer, Viewer::Observer(_));
                 {
                     let mut inner = self.inner.borrow_mut();
                     let activation = inner.activation.clone();
@@ -1201,11 +1225,21 @@ impl<Z: CelldZone> ZoneObject<Z> {
                         activation,
                     })?;
                     inner.sockets.insert(joined.client.0, ws.clone());
+                    if observer && !inner.ticking {
+                        // A dormant zone does not tick: greet the watcher
+                        // with its current state (it stays dormant).
+                        if let Some(host) = inner.host.as_mut() {
+                            host.patch_now();
+                        }
+                    }
                     inner.flush();
-                    if inner.state != RoomState::Active {
+                    if !observer && inner.state != RoomState::Active {
                         inner.state = RoomState::Active;
                         inner.report(ACTIVITY_ACTIVE);
                     }
+                }
+                if observer {
+                    return Ok(());
                 }
                 self.store_status().await;
                 self.start_loop();
@@ -1364,6 +1398,13 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 return;
             }
             inner.report(ACTIVITY_HIBERNATED);
+            // Watchers of a sleeping zone are let go (they may come back
+            // and are told it is asleep).
+            for (_, ws) in inner.sockets.drain() {
+                let _ = ws.close(Some(1000), Some("zone asleep"));
+            }
+            inner.out_lines.clear();
+            inner.in_lines.clear();
             // Dropped, so the next join restores from storage.
             inner.host = None;
             inner.state = RoomState::Cold;
