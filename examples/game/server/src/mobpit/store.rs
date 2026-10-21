@@ -164,6 +164,60 @@ impl CrawlerCells {
         Ok(self.get(kind, shard).await?["state"].take())
     }
 
+    /// The world's content rollout (`content-rollout/{world}`: live
+    /// version, phase, notes; `null` before the first rollout).
+    pub async fn content(&self, world: &str) -> Result<Value, String> {
+        Ok(self
+            .get(
+                distributed_game::world::content_rollout::CONTENT_ROLLOUT_KIND,
+                world,
+            )
+            .await?["state"]
+            .take())
+    }
+
+    /// Run `command` on the cell `kind/shard` as `principal` (an internal
+    /// session the caller vouches for, e.g. an admin it authenticated).
+    /// Returns the HTTP status and the cell's answer.
+    pub async fn command(
+        &self,
+        kind: &str,
+        shard: &str,
+        command: &str,
+        principal: &str,
+        input: &Value,
+    ) -> Result<(u16, Value), String> {
+        let url = format!(
+            "{}/{}/{}/{}",
+            self.base,
+            kind,
+            encode_segment(shard),
+            command
+        );
+        let command_id =
+            distributed_game::cell::command_id_for("mobpit-admin", &crate::common::random_hex(16));
+        let response = self
+            .client
+            .post(&url)
+            .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
+            .header(
+                distributed::cell_host::CELL_SERVICE_ID_HEADER,
+                "mobpit-admin",
+            )
+            .header(
+                distributed::cell_host::CELL_PRINCIPAL_PARTITION_HEADER,
+                principal,
+            )
+            .header(distributed::USER_ID_KEY, principal)
+            .json(&serde_json::json!({ "commandId": command_id, "input": input }))
+            .send()
+            .await
+            .map_err(|error| format!("celld unreachable at {url}: {error}"))?;
+        let status = response.status().as_u16();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
     /// The durable presence entry of `principal` (`null` when none).
     pub async fn presence(&self, principal: &str) -> Result<Value, String> {
         Ok(self.get(PRESENCE_KIND, principal).await?["current"].take())

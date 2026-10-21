@@ -15,7 +15,7 @@
 use distributed_game::prediction::{step_bytes, PredictContext, PredictStep};
 use distributed_game::pure::{call_bytes, GamePure};
 use distributed_game::Wire;
-use game_sim::arena::{self, ArenaStep, MoveState};
+use game_sim::arena;
 use game_sim::mobpit::PitStep;
 use serde_json::{json, Value};
 
@@ -125,37 +125,6 @@ fn random(seed: u32, frames: usize, extra_bytes: usize) -> Vec<Vec<u8>> {
         }
     }
     out
-}
-
-fn capsule_streams(extra_bytes: usize) -> Vec<Stream> {
-    let start = |x: f32, y: f32| {
-        state_bytes(&arena::canonicalize(MoveState {
-            x,
-            y,
-            ..MoveState::default()
-        }))
-    };
-    let extra = move |i: usize| vec![(i as u8).wrapping_mul(37); extra_bytes];
-    vec![
-        Stream {
-            name: "scripted".into(),
-            start: start(-5.0, -5.0),
-            context: Vec::new(),
-            inputs: scripted(&extra),
-        },
-        Stream {
-            name: "random".into(),
-            start: start(8.0, 3.0),
-            context: Vec::new(),
-            inputs: random(0x1234_5678, 3000, extra_bytes),
-        },
-        Stream {
-            name: "corner".into(),
-            start: start(18.5, -18.5),
-            context: Vec::new(),
-            inputs: random(0x0bad_cafe, 600, extra_bytes),
-        },
-    ]
 }
 
 /// Mob Pit's step in the entrance (the classic pillars) and in rooms of
@@ -301,7 +270,6 @@ pub fn traces() -> Value {
             pure_trace::<game_sim::mobpit::PitRoomFn>(pit_room_args()),
         ],
         "steps": [
-            trace::<ArenaStep>(capsule_streams(0)),
             trace::<PitStep>(pit_streams()),
         ],
     })
@@ -315,7 +283,7 @@ mod tests {
     fn traces_cover_every_step_and_collide() {
         let traces = traces();
         let steps = traces["steps"].as_array().unwrap();
-        assert_eq!(steps.len(), 2);
+        assert_eq!(steps.len(), 1);
         for step in steps {
             for stream in step["streams"].as_array().unwrap() {
                 assert_eq!(

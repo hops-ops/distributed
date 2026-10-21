@@ -466,6 +466,23 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		await page.uncheck('[data-testid=first-person]');
 		await page.uncheck('[data-testid=autohunt]');
 
+		// Live content update (dev admin): every room freezes with the change
+		// notes, switches to the pack and resumes; the page patches live.
+		assert.equal(await page.getAttribute('[data-testid=content]', 'data-version'), '');
+		const notes = 'Frostfall: slower, tougher mobs.';
+		const started = await page.evaluate(
+			(n) => fetch('/api/dev/rollout', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ version: 'frostfall', notes: n }) }).then((r) => r.status),
+			notes
+		);
+		assert.equal(started, 200);
+		await page.waitForSelector('[data-testid=frozen]', { timeout: 10_000 });
+		assert.match(await page.textContent('[data-testid=frozen]'), /Frostfall: slower, tougher mobs\./);
+		await page.waitForSelector('[data-testid=frozen]', { state: 'detached', timeout: 15_000 });
+		await page.waitForFunction(() => document.querySelector('[data-testid=content]')?.getAttribute('data-version') === 'frostfall', null, { timeout: 5_000 });
+		assert.equal(await page.textContent('[data-testid=world-content]'), 'Frostfall');
+		assert.equal(await page.$('[data-testid=stale]'), null, 'patched live: not stale');
+		console.error(`content: rolled out ${await page.textContent('[data-testid=content]')} (froze with the notes, resumed)`);
+
 		// SSR after a reload: the settled numbers are in the server HTML.
 		const html = await page.evaluate(() => fetch('/pit', { headers: { accept: 'text/html' } }).then((r) => r.text()));
 		assert.match(html, new RegExp(`data-testid="kills"[^>]*>${kills}<`));

@@ -18,8 +18,11 @@
 //!   the saga that ripples hood events into the borough and borough events
 //!   into the city (idempotent commands, ids derived from the event ids).
 //!
-//! The Freeze's cells are fed by its zone server's
-//! `distributed_game::celld::CelldFactSink` over the internal HTTP path.
+//! - `content-rollout/world` (`ContentRolloutObject`): the world's live
+//!   content (`distributed_game::world::content_rollout`). The services'
+//!   admin route starts a rollout (an `admin:*` session it built after
+//!   checking the admin secret); the cell freezes, applies and resumes on
+//!   its own schedule and every room follows it (`ZONE_CONTENT_ROLLOUT`).
 //!
 //! - `crawler/{principal}` (`CrawlerCell`): the `mobpit_crawler::Crawler`
 //!   aggregate with its `#[command]` `crawler.record_kill` (XP decided here
@@ -30,11 +33,6 @@
 //!   facts (`zone.*`). A fact emitted before the one that set the current
 //!   entry (`FactStamp::emission_order`) is ignored, so a late "left pit-1"
 //!   cannot mark a player who already joined pit-2 offline.
-//! - `gem-pouch/{principal}` (`GemPouchCell`): The Freeze's
-//!   `freeze.gem_collected` facts (which gem spot, at which content
-//!   version; the zone reports no amount).
-//! - `content-log/{zone}` (`ContentLogCell`): The Freeze's
-//!   `freeze.content_applied` zone facts (every content switch of a zone).
 //!
 //! Every route requires `DISTRIBUTED_INTERNAL_SECRET`. Mob Pit commands also
 //! require the trusted fact session (principal + `FactStamp` headers,
@@ -59,10 +57,13 @@ use distributed::microsvc::{
 };
 use distributed::{sourced, Aggregate, Entity};
 use distributed_game::cell::{fact_session_from_headers, session_stamp};
-use distributed_game::celld_zone::{forward_to_zone, ZoneActivityCell, ZoneDevSettings};
+use distributed_game::celld_zone::{
+    forward_to_zone, ContentRolloutCell, ZoneActivityCell, ZoneDevSettings,
+};
 use distributed_game::lifecycle::{
     Lifecycle, CONNECTION_LOST, PLAYER_DISCONNECTED, PLAYER_JOINED, PLAYER_LEFT, PLAYER_RECONNECTED,
 };
+use distributed_game::world::content_rollout::{CONTENT_ADMIN_ROLE, CONTENT_ROLLOUT_KIND};
 use distributed_game::world::zone_activity::ZONE_ACTIVITY_KIND;
 use distributed_game::FactStamp;
 use mobpit_crawler::{
@@ -234,220 +235,6 @@ async fn handle_lifecycle(
     }
     repo.commit(presence)?
         .succeeded(PresenceApplied { applied: newer })
-}
-
-// ---------------------------------------------------------------- The Freeze
-
-/// `freeze.gem_collected`.
-pub const GEM_COLLECTED: &str = "freeze.gem_collected";
-/// `freeze.content_applied`.
-pub const CONTENT_APPLIED: &str = "freeze.content_applied";
-
-/// One collected gem.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Gem {
-    pub zone: String,
-    pub spot: u32,
-    pub content_version: String,
-}
-
-#[derive(Clone, Default, Serialize, Deserialize, distributed::Snapshot)]
-pub struct GemPouch {
-    entity: Entity,
-    gems: u32,
-    last: Option<Gem>,
-}
-
-#[sourced(entity, aggregate_type = "GemPouch", events = "GemPouchEvent")]
-impl GemPouch {
-    #[event("freeze.gem_recorded", version = 1)]
-    fn recorded(&mut self, principal: String, gem: Gem) {
-        if self.entity.id().is_empty() {
-            self.entity.set_id(principal);
-        }
-        self.gems += 1;
-        self.last = Some(gem);
-    }
-}
-
-#[derive(Debug, Deserialize, distributed::CommandInput)]
-pub struct GemInput {
-    pub spot: u32,
-}
-
-#[derive(Debug, Serialize, distributed::CommandOutput)]
-pub struct Counted {
-    pub count: u32,
-}
-
-struct CollectGem;
-impl<D> PortableCommand<D> for CollectGem
-where
-    D: CausalRouteDependencies<Aggregate = GemPouch> + Send + Sync + 'static,
-{
-    fn install(self, routes: Routes<D>) -> Routes<D> {
-        routes
-            .typed_command(typed_command::<GemInput, Succeeded<Counted>>(GEM_COLLECTED))
-            .handle(handle_gem)
-    }
-}
-
-async fn handle_gem(
-    ctx: &CausalCommandContext<'_, GemPouch>,
-    input: GemInput,
-) -> std::result::Result<PreparedCommand<Succeeded<Counted>>, HandlerError> {
-    let principal = ctx.user_id()?.to_string();
-    let stamp =
-        session_stamp(ctx.session()).ok_or_else(|| rejected("gem facts need a fact stamp"))?;
-    let repo = ctx.repo();
-    let mut pouch = match repo.get(&principal).await? {
-        Some(pouch) => pouch,
-        None => repo.create(),
-    };
-    pouch
-        .recorded(
-            principal,
-            Gem {
-                zone: stamp.zone_id,
-                spot: input.spot,
-                content_version: stamp.content_version,
-            },
-        )
-        .map_err(rejected)?;
-    let count = pouch.gems;
-    repo.commit(pouch)?.succeeded(Counted { count })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContentSwitch {
-    pub from: String,
-    pub to: String,
-    pub tick: u64,
-}
-
-#[derive(Clone, Default, Serialize, Deserialize, distributed::Snapshot)]
-pub struct ContentLog {
-    entity: Entity,
-    switches: Vec<ContentSwitch>,
-}
-
-#[sourced(entity, aggregate_type = "ContentLog", events = "ContentLogEvent")]
-impl ContentLog {
-    #[event("freeze.content_recorded", version = 1)]
-    fn recorded(&mut self, zone: String, switch: ContentSwitch) {
-        if self.entity.id().is_empty() {
-            self.entity.set_id(zone);
-        }
-        self.switches.push(switch);
-    }
-}
-
-#[derive(Debug, Deserialize, distributed::CommandInput)]
-pub struct ContentInput {
-    pub from: String,
-    pub to: String,
-}
-
-struct ApplyContent;
-impl<D> PortableCommand<D> for ApplyContent
-where
-    D: CausalRouteDependencies<Aggregate = ContentLog> + Send + Sync + 'static,
-{
-    fn install(self, routes: Routes<D>) -> Routes<D> {
-        routes
-            .typed_command(typed_command::<ContentInput, Succeeded<Counted>>(
-                CONTENT_APPLIED,
-            ))
-            .handle(handle_content)
-    }
-}
-
-async fn handle_content(
-    ctx: &CausalCommandContext<'_, ContentLog>,
-    input: ContentInput,
-) -> std::result::Result<PreparedCommand<Succeeded<Counted>>, HandlerError> {
-    let stamp =
-        session_stamp(ctx.session()).ok_or_else(|| rejected("content facts need a fact stamp"))?;
-    let repo = ctx.repo();
-    // The zone's own log: the shard is the stamped zone.
-    let mut log = match repo.get(&stamp.zone_id).await? {
-        Some(log) => log,
-        None => repo.create(),
-    };
-    log.recorded(
-        stamp.zone_id.clone(),
-        ContentSwitch {
-            from: input.from,
-            to: input.to,
-            tick: stamp.tick,
-        },
-    )
-    .map_err(rejected)?;
-    let count = log.switches.len() as u32;
-    repo.commit(log)?.succeeded(Counted { count })
-}
-
-async fn read_pouch(cell: &AggregateCell<GemPouch>) -> std::result::Result<Value, String> {
-    let pouch = cell.load().await.map_err(|error| error.to_string())?;
-    Ok(json!({
-        "gems": pouch.as_ref().map_or(0, |p| p.gems),
-        "last": pouch.and_then(|p| p.last),
-    }))
-}
-
-async fn read_content_log(cell: &AggregateCell<ContentLog>) -> std::result::Result<Value, String> {
-    let log = cell.load().await.map_err(|error| error.to_string())?;
-    Ok(json!({ "switches": log.map(|l| l.switches).unwrap_or_default() }))
-}
-
-#[durable_object]
-pub struct GemPouchCell {
-    cell: AggregateCell<GemPouch>,
-    env: Env,
-}
-
-impl DurableObject for GemPouchCell {
-    fn new(state: State, env: Env) -> Self {
-        console_error_panic_hook::set_once();
-        let cell = AggregateCell::<GemPouch>::from_state_with_snapshots(state, 50)
-            .expect("gem pouch cell identity")
-            .mount(CollectGem)
-            .with_celld_outbox(outbox(&env));
-        Self { cell, env }
-    }
-
-    async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_pouch, fact_session).await
-    }
-
-    async fn alarm(&self) -> Result<Response> {
-        alarm(&self.env, &self.cell).await
-    }
-}
-
-#[durable_object]
-pub struct ContentLogCell {
-    cell: AggregateCell<ContentLog>,
-    env: Env,
-}
-
-impl DurableObject for ContentLogCell {
-    fn new(state: State, env: Env) -> Self {
-        console_error_panic_hook::set_once();
-        let cell = AggregateCell::<ContentLog>::from_state_with_snapshots(state, 50)
-            .expect("content log cell identity")
-            .mount(ApplyContent)
-            .with_celld_outbox(outbox(&env));
-        Self { cell, env }
-    }
-
-    async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_content_log, fact_session).await
-    }
-
-    async fn alarm(&self) -> Result<Response> {
-        alarm(&self.env, &self.cell).await
-    }
 }
 
 // ---------------------------------------------------------------- Hosting
@@ -825,6 +612,50 @@ async fn saga(env: &Env, envelope: &CelldQueueEnvelope) -> std::result::Result<(
     }
 }
 
+// ---------------------------------------------------------------- Content
+
+/// Principal prefix of the services' admin sessions.
+pub const ADMIN_PREFIX: &str = "admin:";
+
+/// A rollout starts only for an admin session the services built after
+/// checking the admin's credential (an `admin:*` principal over the
+/// internal path); it gets the content-admin role here. The rollout's own
+/// schedule needs no session.
+fn admin_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
+    let principal = header(distributed::USER_ID_KEY)?;
+    principal.starts_with(ADMIN_PREFIX).then(|| {
+        let mut session = Session::new();
+        session.set(distributed::USER_ID_KEY, principal);
+        session.set(distributed::ROLE_KEY, CONTENT_ADMIN_ROLE);
+        session
+    })
+}
+
+/// The world's live content (`content-rollout/world`): every room follows
+/// it (`ZONE_CONTENT_ROLLOUT`).
+#[durable_object]
+pub struct ContentRolloutObject {
+    cell: ContentRolloutCell,
+}
+
+impl DurableObject for ContentRolloutObject {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        let outbox = outbox(&env);
+        Self {
+            cell: ContentRolloutCell::new(state, env, outbox, admin_session),
+        }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        self.cell.fetch(req).await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        self.cell.alarm().await
+    }
+}
+
 /// The rooms' dev settings (`zone-dev/{shard}`: the network simulation the
 /// rooms apply, written by the services' `/dev/netsim`).
 #[durable_object]
@@ -890,13 +721,12 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let binding = match parts.first().copied() {
         Some(CRAWLER_KIND) => "CRAWLER",
         Some(PRESENCE_KIND) => "PRESENCE",
-        Some("gem-pouch") => "GEM_POUCH",
-        Some("content-log") => "CONTENT_LOG",
         Some(ZONE_ACTIVITY_KIND) => "ZONE_ACTIVITY",
         Some(distributed_game::netsim::ZONE_DEV_KIND) => "ZONE_DEV",
         Some(HOOD_KIND) => "HOOD",
         Some(BOROUGH_KIND) => "BOROUGH",
         Some(CITY_KIND) => "CITY",
+        Some(CONTENT_ROLLOUT_KIND) => "CONTENT_ROLLOUT",
         _ => return json_status(json!({ "error": "unknown cell kind" }), 404),
     };
     let Some(shard) = parts.get(1) else {

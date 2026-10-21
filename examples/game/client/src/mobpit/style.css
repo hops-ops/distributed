@@ -205,3 +205,56 @@
 	pointer-events: none;
 	z-index: 6;
 }
+
+.pit-freeze {
+	position: fixed;
+	top: 40%;
+	left: 50%;
+	transform: translate(-50%, -50%);
+	max-width: 520px;
+	padding: 16px 22px;
+	border-radius: 8px;
+	background: rgba(20, 60, 110, 0.92);
+	color: #fff;
+	text-align: center;
+	line-height: 1.5;
+	pointer-events: none;
+	z-index: 6;
+}
+
+.pit-stale {
+	position: fixed;
+	bottom: 70px;
+	left: 50%;
+	transform: translateX(-50%);
+	padding: 8px 16px;
+	border-radius: 6px;
+	background: rgba(170, 110, 20, 0.9);
+	color: #fff;
+	font-weight: 600;
+	pointer-events: none;
+	z-index: 5;
+}
+
+.pit-admin {
+	position: fixed;
+	right: 12px;
+	bottom: 12px;
+	width: 260px;
+	padding: 8px 10px;
+	border-radius: 6px;
+	background: rgba(18, 15, 20, 0.85);
+	color: #ddd;
+	font-size: 12px;
+	z-index: 5;
+}
+
+.pit-admin input:not([type='checkbox']) {
+	width: 100%;
+	box-sizing: border-box;
+	margin-bottom: 4px;
+}
+
+.pit-admin button {
+	margin: 4px 4px 0 0;
+}

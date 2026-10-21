@@ -27,6 +27,15 @@
 //!   read / replace the network simulation of **every** room (dev settings
 //!   object on celld, read by each room within a second; applied per
 //!   socket in both directions, so the RTT grows by 2 × latency).
+//! - `GET /dev/mobpit/content` — the world's live content (`content-rollout/
+//!   world`: version, phase, notes) and every content pack.
+//! - `POST /dev/mobpit/rollout` `{version, notes?, hard?, freezeMs?}` —
+//!   **admin** (`x-game-admin-secret`, the services' admin secret): a live
+//!   content update of every room. The rollout cell freezes the rooms
+//!   (change notes on screen), applies the pack and resumes them on its own
+//!   schedule. Only known packs (`mobpit_rooms::content_packs`). The cell
+//!   runs it for the services' admin session (`admin:dev`), never for a
+//!   principal from the body.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,10 +71,17 @@ fn bad_request(message: &str) -> (StatusCode, Json<Value>) {
 struct Dev {
     world: Arc<MobPitWorld>,
     key: TicketKey,
+    admin_secret: Arc<str>,
 }
 
-/// The router.
-pub fn routes(world: Arc<MobPitWorld>, key: TicketKey) -> Router {
+/// The world whose content the rooms follow (`ZONE_CONTENT_ROLLOUT` in the
+/// cells worker's `wrangler.jsonc`).
+pub const CONTENT_WORLD: &str = "world";
+/// The services' admin session principal.
+const ADMIN_PRINCIPAL: &str = "admin:dev";
+
+/// The router. `admin_secret` guards the admin routes (rollouts).
+pub fn routes(world: Arc<MobPitWorld>, key: TicketKey, admin_secret: String) -> Router {
     Router::new()
         .route("/dev/ticket", post(ticket))
         .route("/dev/mobpit/start", post(start))
@@ -77,7 +93,13 @@ pub fn routes(world: Arc<MobPitWorld>, key: TicketKey) -> Router {
         .route("/dev/mobpit/presence", get(presence))
         .route("/dev/mobpit/tiers", get(tiers))
         .route("/dev/netsim", get(get_netsim).post(set_netsim))
-        .with_state(Dev { world, key })
+        .route("/dev/mobpit/content", get(content))
+        .route("/dev/mobpit/rollout", post(rollout))
+        .with_state(Dev {
+            world,
+            key,
+            admin_secret: admin_secret.into(),
+        })
 }
 
 async fn ticket(
@@ -287,4 +309,106 @@ async fn tiers(State(dev): State<Dev>, Query(query): Query<HashMap<String, Strin
     Ok(Json(
         json!({ "hoods": hoods, "boroughs": out, "city": city }),
     ))
+}
+
+fn packs_json() -> Value {
+    Value::Array(
+        mobpit_rooms::content_packs()
+            .into_iter()
+            .map(|p| {
+                json!({
+                    "version": p.version, "name": p.name, "mobPace": p.mob_pace,
+                    "mobHpPct": p.mob_hp_pct, "tint": p.tint, "notes": p.notes,
+                })
+            })
+            .collect(),
+    )
+}
+
+async fn content(State(dev): State<Dev>) -> ApiResult {
+    let state = dev
+        .world
+        .cells()
+        .content(CONTENT_WORLD)
+        .await
+        .map_err(internal)?;
+    Ok(Json(
+        json!({ "world": CONTENT_WORLD, "state": state, "packs": packs_json() }),
+    ))
+}
+
+/// `POST /dev/mobpit/rollout` body.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RolloutRequest {
+    version: String,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    hard: bool,
+    #[serde(default)]
+    freeze_ms: Option<u64>,
+}
+
+async fn rollout(
+    State(dev): State<Dev>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<RolloutRequest>,
+) -> ApiResult {
+    let given = headers
+        .get(distributed_game::net::peer::ADMIN_SECRET_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if dev.admin_secret.is_empty()
+        || !constant_time_eq(given.as_bytes(), dev.admin_secret.as_bytes())
+    {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "admin secret required (x-game-admin-secret)" })),
+        ));
+    }
+    let Some(pack) = mobpit_rooms::content_packs()
+        .into_iter()
+        .find(|p| p.version == request.version)
+    else {
+        return Err(bad_request("unknown content version"));
+    };
+    let notes = request
+        .notes
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| pack.notes.clone());
+    let input = json!({
+        "world": CONTENT_WORLD,
+        "version": pack.version,
+        "notes": notes,
+        "freeze_ms": request.freeze_ms.unwrap_or(3_000),
+        "hard": request.hard,
+    });
+    let (status, body) = dev
+        .world
+        .cells()
+        .command(
+            distributed_game::world::content_rollout::CONTENT_ROLLOUT_KIND,
+            CONTENT_WORLD,
+            distributed_game::world::content_rollout::START,
+            ADMIN_PRINCIPAL,
+            &input,
+        )
+        .await
+        .map_err(internal)?;
+    if (200..300).contains(&status) {
+        Ok(Json(
+            json!({ "started": body["payload"], "version": pack.version, "notes": notes }),
+        ))
+    } else {
+        Err((
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(body),
+        ))
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }

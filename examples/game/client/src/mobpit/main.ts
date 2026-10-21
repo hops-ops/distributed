@@ -36,6 +36,8 @@ import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
 import {
 	BUTTON,
+	CONTENT_PACKS,
+	GATE_ROOM,
 	PIT_RULES,
 	PIT_WORLD,
 	isMob,
@@ -47,6 +49,7 @@ import {
 	pitFields,
 	playerFields,
 	type PitFields,
+	type ContentPack,
 	type PitInput
 } from '../generated/mobpit/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
@@ -94,7 +97,14 @@ const name = params.get('name') ?? storedName;
 
 const api = new DevApi({ name: () => name });
 const pitApi = new MobPitApi();
-const pit = createMobPitClient({ api });
+// `?old=1` simulates a client built before the next content update: it
+// keeps its pack when the rooms move on, and only the entrance reloads it.
+const pinContent = params.has('old');
+const pit = createMobPitClient({
+	api,
+	pinContent,
+	liveVersion: async () => (await pitApi.content()).state?.version ?? ''
+});
 const { client } = pit;
 
 const canvas = document.getElementById('stage') as HTMLCanvasElement;
@@ -190,6 +200,45 @@ const EVENT_TEXT: Record<string, string> = {
 	blessing: 'BLESSING — you heal five times as fast in this borough'
 };
 deathBanner.style.display = 'none';
+// ---- live content: freeze overlay, old-client banner, admin panel ----
+const freezeOverlay = div('pit-freeze', document.body);
+freezeOverlay.style.display = 'none';
+const staleBanner = div('pit-stale', document.body);
+staleBanner.style.display = 'none';
+client.on('resume', (zone, message) => {
+	if (zone !== client.authority?.zoneId || message.version === '' && message.notes === '') return;
+	const pack = CONTENT_PACKS.find((p) => p.version === message.version);
+	toast(`World updated to ${pack?.name ?? message.version}${message.notes === '' ? '' : ` — ${message.notes}`}`);
+});
+const adminParam = params.get('admin');
+const adminSecret = (() => {
+	try {
+		if (adminParam !== null) localStorage.setItem('game-demos.mobpit.admin', adminParam);
+		return adminParam ?? localStorage.getItem('game-demos.mobpit.admin') ?? undefined;
+	} catch {
+		return adminParam ?? undefined;
+	}
+})();
+if (adminSecret !== undefined && adminSecret !== '') {
+	const panel = div('pit-admin', document.body);
+	panel.innerHTML = `<h2>World admin <small>(dev, admin secret)</small></h2>
+		<input data-k="notes" placeholder="change notes (default: the pack's)" />
+		<label><input type="checkbox" data-k="hard" /> hard (reload old clients now)</label>
+		<div data-k="packs"></div><div class="pit-note" data-k="result"></div>`;
+	const q = (k: string) => panel.querySelector(`[data-k="${k}"]`) as HTMLInputElement;
+	for (const pack of CONTENT_PACKS) {
+		const button = document.createElement('button');
+		button.textContent = `Roll out ${pack.name}`;
+		button.addEventListener('click', () => {
+			q('result').textContent = 'rolling out…';
+			pitApi
+				.rollout(adminSecret, { version: pack.version, notes: q('notes').value.trim() || undefined, hard: q('hard').checked })
+				.then(() => (q('result').textContent = `rolling out ${pack.name}: every room freezes, then resumes on it`))
+				.catch((error: unknown) => (q('result').textContent = String(error)));
+		});
+		q('packs').append(button);
+	}
+}
 
 function div(className: string, parent: HTMLElement): HTMLDivElement {
 	const d = document.createElement('div');
@@ -365,6 +414,18 @@ for (const m of [mats.swing, mats.tele, mats.teleFill, mats.hpFill]) m.emissiveC
 mats.blade.emissiveColor = new Color3(0.6, 0.6, 0.7);
 const tierMats = new Map<number, StandardMaterial>();
 for (const [tier, t] of Object.entries(TIERS)) tierMats.set(Number(tier), material(scene, `mob-${tier}`, t.color));
+// The content pack this client runs tints the mobs (its own pack: an old
+// client keeps drawing the old one).
+let tintedFor: string | undefined;
+function tintMobs(pack: ContentPack): void {
+	if (tintedFor === pack.version) return;
+	tintedFor = pack.version;
+	const tint = Color3.FromHexString(`#${pack.tint.toString(16).padStart(6, '0')}`);
+	for (const [tier, t] of Object.entries(TIERS)) {
+		const base = Color3.FromHexString(t.color);
+		tierMats.get(Number(tier))!.diffuseColor = pack.tint === 0 ? base : Color3.Lerp(base, tint, 0.6);
+	}
+}
 
 // ---- the world: rooms at fixed places, floating origin at your room ----
 // The stage's single floor and walls give way to one chunk per room.
@@ -969,6 +1030,19 @@ stage.onFrame((now, dtMs) => {
 	hud.row('World event', w === undefined || w.event === '' ? 'none (the borough schedules the next)' : `${w.event} · ${left} s left`);
 	eventBanner.style.display = w !== undefined && w.event !== '' ? '' : 'none';
 	if (w !== undefined && w.event !== '') eventBanner.textContent = `${EVENT_TEXT[w.event] ?? w.event} · ${left} s`;
+	const c = pit.content();
+	tintMobs(c.pack);
+	hud.row('Content', `${c.pack.name}${pinContent ? ' (old client: no live patch)' : ''} · world ${CONTENT_PACKS.find((p) => p.version === c.worldVersion)?.name ?? c.worldVersion}${c.reloads.length > 0 ? ` · ${c.reloads.length} reload(s)` : ''}`);
+	freezeOverlay.style.display = c.frozen === undefined ? 'none' : '';
+	if (c.frozen !== undefined) {
+		const target = CONTENT_PACKS.find((p) => p.version === c.frozen!.version)?.name ?? c.frozen.version;
+		freezeOverlay.innerHTML = `<b>SYSTEM: an administrator has paused the world to update it to ${target}.</b><br/>${c.frozen.notes}`;
+	}
+	staleBanner.style.display = c.stale ? '' : 'none';
+	if (c.stale) {
+		const world = CONTENT_PACKS.find((p) => p.version === c.worldVersion)?.name ?? c.worldVersion;
+		staleBanner.textContent = `Your client runs ${c.pack.name}; the world runs ${world}. Only the entrance (${GATE_ROOM}) lets you through — it updates you.${c.staleNotice === undefined ? '' : ' (that doorway is closed to you)'}`;
+	}
 	const r = pit.rangedStats;
 	hud.row('Ranged', `${r.shots} shots · ${r.confirmedHits} hits confirmed · ${r.agreed}/${r.resolved} as seen · last rewind ${r.lastAgeMs.toFixed(0)} ms${compensated ? '' : ' (compensation OFF)'}`);
 	hud.row('Interest', hello === undefined ? '—' : `${hello.viewRadius} m ring · ${rendered.filter((e) => isMob(e) && !e.stale).length} mobs replicated`);
@@ -1003,6 +1077,9 @@ window.mobpit = { client, api, pitApi, pit, scene, rooms, boards, camera: stage.
 
 // The same browser is the same player: back in the room you were last in.
 (async () => {
+	// Start on the world's live content (the packs are built in).
+	const live = await pitApi.content().catch(() => undefined);
+	client.setContentVersion(live?.state?.version ?? '');
 	const zone = forcedZone ?? (await pitApi.startRoom(api.guest).catch(() => DEFAULT_ZONE));
 	origin = parseRoom(zone) ?? origin;
 	await client.connect(zone);

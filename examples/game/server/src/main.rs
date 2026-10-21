@@ -1,7 +1,6 @@
 //! `game-demos <demo> [--port N] [--dev]` — one subcommand per demo.
 
 use clap::{Parser, Subcommand};
-use game_demos::freeze::world::FreezeArgs;
 use game_demos::mobpit::{self, MobPitArgs};
 
 #[derive(Parser)]
@@ -20,8 +19,6 @@ enum DemoCommand {
     Mobpit(MobPitArgs),
     /// Kills/XP leaderboards (same server as `mobpit`).
     Leaderboard(MobPitArgs),
-    /// World-version barrier across two server processes, safe-room reloads.
-    Freeze(FreezeArgs),
     /// Print native traces of every predicted step over recorded input
     /// streams (JSON; the WASM exact-match test replays them).
     #[command(hide = true)]
@@ -32,7 +29,6 @@ enum DemoCommand {
 async fn main() -> std::io::Result<()> {
     match Cli::parse().demo {
         DemoCommand::Mobpit(args) | DemoCommand::Leaderboard(args) => mobpit::run(args).await,
-        DemoCommand::Freeze(args) => game_demos::freeze::world::run(args).await,
         DemoCommand::PredictTrace => {
             println!("{}", game_demos::predict_trace::traces());
             Ok(())

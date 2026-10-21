@@ -22,11 +22,28 @@
  * none (a sleeping room answers `ASLEEP`; it is tried again every few
  * seconds and shows nothing meanwhile).
  *
+ * Live content updates: the page starts on the world's live content
+ * version (`/dev/mobpit/content`). An admin rollout freezes every room
+ * (`Freeze`, inputs held; the change notes on screen), switches them to the
+ * new pack and resumes them (`Resume` with the version). A normal client
+ * patches live (`setContentVersion`); a pinned one (`pinContent`, the page's
+ * `?old=1`) stays on its pack and is `stale`: the room keeps it from every
+ * doorway but the entrance (`stale` event) and reloads it there
+ * (`Kick(RELOAD)` → `reloadContent` → back with the new version).
+ *
  * Event flow of one kill: `kill` (broadcast, the tick the mob dies — the
  * fact is only *queued*) → `saved` (to the killer, when the durable cell
  * commit settled) → `profile`.
  */
-import { watchZones, type EntityFields, type GameSocketFactory, type RenderedEntity, type WatchState } from '@hops-ops/distributed/game';
+import {
+	watchZones,
+	type EntityFields,
+	type FreezeMessage,
+	type GameSocketFactory,
+	type RenderedEntity,
+	type ResumeMessage,
+	type WatchState
+} from '@hops-ops/distributed/game';
 
 import * as pit from '../generated/mobpit/index.ts';
 import type { DevApi } from '../shared/dev-api.ts';
@@ -228,6 +245,38 @@ export type RoomInfo = Readonly<{
 	hz: number;
 	lateMs: { p50: number; p99: number };
 	droppedTicks: number;
+	/** The room's content version and freeze state (awake rooms only). */
+	content: { version: string; freeze: 'running' | 'freezing' | 'frozen' } | null;
+}>;
+
+/** The pack of a content version (unknown versions draw the built-in one). */
+export function contentPack(version: string): pit.ContentPack {
+	return pit.CONTENT_PACKS.find((p) => p.version === version) ?? pit.CONTENT_PACKS[0]!;
+}
+
+/** What the client knows about live content. */
+export type ContentView = Readonly<{
+	/** The content version this client runs (its pack). */
+	version: string;
+	pack: pit.ContentPack;
+	/** The world's version (last Welcome / Resume of the own room). */
+	worldVersion: string;
+	/** Running older content than the world. */
+	stale: boolean;
+	/** The room's Freeze notice while frozen. */
+	frozen: FreezeMessage | undefined;
+	lastResume: ResumeMessage | undefined;
+	/** The room's last `stale` notice (only the entrance lets you through). */
+	staleNotice: pit.StaleEvent | undefined;
+	/** Reloads the rooms required (room, version). */
+	reloads: readonly { zone: string; version: string }[];
+}>;
+
+/** The world's live content as `/dev/mobpit/content` reports it. */
+export type ContentInfo = Readonly<{
+	world: string;
+	state: Readonly<{ version: string; target: string; phase: string; notes: string; since_ms: number; hard: boolean }> | null;
+	packs: readonly pit.ContentPack[];
 }>;
 
 export type MobPitClient = pit.MobpitClient &
@@ -261,6 +310,8 @@ export type MobPitClient = pit.MobpitClient &
 		verdict(id: number): Promise<pit.ShotEvent>;
 		/** The neighbour rooms watched (`watchZones` over `neighbourRooms`), when enabled. */
 		neighbours(): ReadonlyMap<string, WatchState>;
+		/** Live content (version, pack, freeze, staleness). */
+		content(): ContentView;
 		/** Stop watching neighbours and close the client. */
 		close(): void;
 	}>;
@@ -272,10 +323,27 @@ export type MobPitClientOptions = Readonly<{
 	socket?: GameSocketFactory;
 	/** Watch the 8 neighbour rooms (default true). */
 	neighbours?: boolean;
+	/** Content version to start on (the world's live one; default ''). */
+	contentVersion?: string;
+	/** Simulate an old client: never patch content live on Resume. */
+	pinContent?: boolean;
+	/** The world's live version, for a reload no room named (default ''). */
+	liveVersion?: () => Promise<string>;
 }>;
 
 export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
+	const reloads: { zone: string; version: string }[] = [];
+	let typedRef: pit.MobpitClient | undefined;
 	const typed = pit.createMobpitClient({
+		contentVersion: options.contentVersion ?? '',
+		// A room required a reload (the entrance, for a stale client; or a
+		// fresh join on old content): "load" the pack of the version it
+		// named (the packs are built in), else the world's live one.
+		reloadContent: async (request) => {
+			const version = request.version ?? (await options.liveVersion?.()) ?? '';
+			reloads.push({ zone: typedRef?.client.authority?.zoneId ?? '', version });
+			return version;
+		},
 		url: (zone) => roomUrl(zone, options.roomsBase),
 		ticket: options.api.ticketSource(),
 		socket: options.socket,
@@ -285,6 +353,44 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		// carried on through doorways in the next room's frame.
 		prediction: { handoffFrame: pitHandoffFrame }
 	});
+	typedRef = typed;
+	// ---- live content ----
+	let worldVersion = options.contentVersion ?? '';
+	let frozen: FreezeMessage | undefined;
+	let lastResume: ResumeMessage | undefined;
+	let staleNotice: pit.StaleEvent | undefined;
+	typed.client.on('authority', (_zone, welcome) => {
+		worldVersion = welcome.contentVersion;
+		frozen = typed.client.authority?.connection.frozen ? frozen : undefined;
+		staleNotice = undefined;
+	});
+	typed.client.on('freeze', (zone, message) => {
+		if (zone === typed.client.authority?.zoneId) frozen = message;
+	});
+	typed.client.on('resume', (zone, message) => {
+		if (zone !== typed.client.authority?.zoneId) return;
+		frozen = undefined;
+		lastResume = message;
+		worldVersion = message.version;
+		// Patch live (the packs are built in) unless simulating an old build.
+		if (options.pinContent !== true && message.version !== typed.client.contentVersion) typed.client.setContentVersion(message.version);
+	});
+	typed.on('stale', (notice, zoneId) => {
+		if (zoneId === typed.client.authority?.zoneId) staleNotice = notice;
+	});
+	const content = (): ContentView => {
+		const version = typed.client.contentVersion;
+		return {
+			version,
+			pack: contentPack(version),
+			worldVersion,
+			stale: version !== worldVersion,
+			frozen,
+			lastResume,
+			staleNotice: version !== worldVersion ? staleNotice : undefined,
+			reloads
+		};
+	};
 	const hello = latest<pit.HelloEvent>(
 		(h) => typed.on('hello', h),
 		(value) => typed.client.setControlledEntity(value.entity)
@@ -397,6 +503,7 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		pures,
 		ready: Promise.all([hello.ready, typed.prediction?.ready, pures.ready]).then(([h]) => h),
 		neighbours: () => watcher?.states() ?? new Map(),
+		content,
 		shots,
 		rangedStats,
 		aimShot,
@@ -505,6 +612,26 @@ export class MobPitApi {
 
 	rebuild(): Promise<RebuildReport> {
 		return this.#json('/dev/mobpit/leaderboard/rebuild', {});
+	}
+
+	/** The world's live content and every pack. */
+	content(): Promise<ContentInfo> {
+		return this.#json('/dev/mobpit/content');
+	}
+
+	/**
+	 * **Admin** (the services' admin secret): roll `version` out to every
+	 * room (freeze → apply → resume with `notes`; `hard` reloads old
+	 * clients at once instead of at the entrance).
+	 */
+	async rollout(secret: string, request: { version: string; notes?: string; hard?: boolean; freezeMs?: number }): Promise<{ version: string; notes: string }> {
+		const response = await fetch(`${this.base}/dev/mobpit/rollout`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json', 'x-game-admin-secret': secret },
+			body: JSON.stringify(request)
+		});
+		if (!response.ok) throw new Error(`rollout: HTTP ${response.status} ${await response.text()}`);
+		return (await response.json()) as { version: string; notes: string };
 	}
 
 	async #json<T>(path: string, body?: unknown): Promise<T> {

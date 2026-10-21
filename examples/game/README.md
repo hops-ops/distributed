@@ -1,32 +1,34 @@
-# distributed_game demos
+# distributed_game demo: Mob Pit
 
-Small playable demos of the authoritative game runtime
-([`distributed_game`](../../distributed_game/README.md)) and its browser SDK
-([`@hops-ops/distributed/game`](../../js/README.md#game-zones)), each focused
-on one mechanic. **Dev only**: the demo server mints tickets for anonymous
-guests and lets any page change the network simulation.
+One playable game, **Mob Pit**, on the authoritative game runtime
+([`distributed_game`](../../distributed_game/README.md)), its browser SDK
+([`@hops-ops/distributed/game`](../../js/README.md#game-zones)) and celld.
+Every mechanic of the earlier standalone demos (Arena, Endless Grid, Boss
+Ripple, Shooting Gallery, The Freeze) now lives in it; the same game runs
+behind a Vite page and a SvelteKit app. **Dev only**: the services mint
+tickets for anonymous guests and let any page change the network
+simulation.
 
-| Demo | Run | Mechanic it demonstrates | Durable state |
+| Page | Run | What it shows | Durable state |
 |---|---|---|---|
-| **Mob Pit** | `./run.sh mobpit` (`--fleet` for a local multi-node celld) | A near-infinite seeded grid of rooms joined by doorways, **each room a celld Durable Object** (celld places, forwards, hibernates and recovers rooms; the debug overlay shows the node); authoritative melee combat vs. telegraphing mobs; **hoods, boroughs and a city** above the rooms (each tier a celld cell: a seeded boss room per hood, a boss kill raises the hood's tier — tougher rooms — and a saga ripples it up; the borough's weather and darkness lift as its bosses fall, fog thickens toward boss rooms); the **rooms next door** watched as passive observers (their mobs are drawn; a watcher never wakes a sleeping room or keeps one awake); a **network panel** (latency / jitter / loss applied by every room object on celld, client prediction of the Rust step as WASM with reconciliation, a server ghost, an interest ring: what is outside is not replicated); kills are **non-blocking durable facts** settled exactly once in per-player cells; rooms you leave go dormant then asleep (live minimap from the zone status read model) and come back with their mobs | celld: `pit.<x>.<y>` rooms (snapshots), `crawler/{player}`, `presence/{player}`, `zone-activity/{room}`; crawler list and room status = read models projected from the cells' events |
+| **Mob Pit** | `./run.sh mobpit` (`--fleet` for a local multi-node celld) | A near-infinite seeded grid of rooms joined by doorways, **each room a celld Durable Object** (celld places, forwards, hibernates and recovers rooms; the debug overlay shows the node); authoritative melee combat vs. telegraphing mobs; **hoods, boroughs and a city** above the rooms (each tier a celld cell: a seeded boss room per hood, a boss kill raises the hood's tier — tougher rooms — and a saga ripples it up; the borough's weather and darkness lift as its bosses fall, fog thickens toward boss rooms); the **rooms next door** watched as passive observers (their mobs are drawn; a watcher never wakes a sleeping room or keeps one awake); a **network panel** (latency / jitter / loss applied by every room object on celld, client prediction of the Rust step as WASM with reconciliation, a server ghost, an interest ring: what is outside is not replicated); kills are **non-blocking durable facts** settled exactly once in per-player cells; rooms you leave go dormant then asleep (live minimap from the zone status read model) and come back with their mobs; seeded room layouts (obstacles in the authoritative and predicted step), **jumping**, a **bow** with lag-compensated hits and **first person**; borough **world events** (invasion, frenzy, blessing) on the boroughs' own schedules; **live content updates**: an admin rolls a content pack out to every live room (freeze → apply → resume with change notes; old clients held until the entrance reloads them; facts stamped with the content version) | celld: `pit.<x>.<y>` rooms (snapshots), `crawler/{player}`, `presence/{player}`, `zone-activity/{room}`, `hood/…`, `borough/…`, `city/city`, `content-rollout/world`; crawler list, room status and boroughs = read models projected from the cells' events |
 | **Leaderboard** | `./run.sh leaderboard` | Same setup as Mob Pit: kills/XP sorted-set boards (in-memory or Redis) fed from the projected crawler list with idempotent `max` updates, your rank + neighbours, rebuild from the cells' event history | celld (the Mob Pit cells); boards are a projection (memory or Redis) |
-| **The Freeze** | `./run.sh freeze` | World-version barrier (`WorldCoordinator::rollout`) across **two server processes** as an in-world "admin update": freeze → apply → resume with change notes, inputs dropped while frozen, Hard reload vs safe-room gating (`StalePolicy::SafeRoom`, `Zone::is_gate`) of old clients, aborted rollout (`freeze_ready` → `NotAcked`), facts/events stamped with the content version | celld: `gem-pouch/{player}`, `content-log/{zone}` |
 | **Mob Pit · SvelteKit** | `REDIS_URL=… ./run.sh sveltekit` | The same Mob Pit server behind a SvelteKit app: Auth.js session sign-in, admission tickets minted from the session (`createGameTicketHandler`), the game client and WASM step generated by the Vite plugin (`games`), a runes HUD (`useGame`) next to a plain canvas loop, the settled kills as a business-side read model (Crawler domain events projected by `mobpit-service` into SQL, read through generated `@load @live` GraphQL), and the zone server's Redis XP board through GraphQL board roots, live across processes over the bus. See [SvelteKit](#sveltekit) | celld (the Mob Pit cells) + `mobpit-service`'s SQL read model + the Redis boards |
 
-`./run.sh smoke` runs every demo's smoke tests (and checks the generated
-clients are current, and drives the SvelteKit demo headlessly); `./run.sh gen` regenerates the clients; `./run.sh
-list` lists demos.
+`./run.sh smoke` runs the smoke tests (Rust bots, headless JS, the generated
+client checked current, the SvelteKit app driven headlessly); `./run.sh gen`
+regenerates the client; `./run.sh list` lists the pages.
 
 **How the demos are written.** Each zone describes its world with the
 `distributed_game` authoring derives: `#[derive(Replicated)]` view structs
 for the kinds (`mobpit::zone::PlayerView`, `mobpit::zone::MobView`, …),
-`#[derive(GameInput)]` for the input frame (`game_sim::mobpit::PitInput`,
-`freeze`'s `MoveInput`, …), `#[derive(GameEvent)]` enums for events
+`#[derive(GameInput)]` for the input frame (`game_sim::mobpit::PitInput`),
+`#[derive(GameEvent)]` enums for events
 (`mobpit::zone::PitEvent`) and `#[derive(FactCommand)]` on the cell
 command inputs they emit as facts (`mobpit::crawler::RecordKillInput`).
 The movement that clients predict is declared once with `#[predict]` in
 the `game_sim` crate (`server/sim/`, no server dependencies):
-`arena_step` (The Freeze) and `pit_step` (Mob Pit); the zones call those functions in `on_tick`. Each demo module
+`pit_step`; the rooms call it in `on_tick`. The surface module
 exports `game_surface()`; `run.sh gen` runs `distributed game-manifest` on
 it, `distributed game-client` writes `client/src/generated/<demo>/`
 (checked in, verified by `run.sh smoke`) and `distributed game-wasm`
@@ -41,11 +43,9 @@ No simulation or content code is written twice. Movement is the compiled
 step; Mob Pit's rooms (biome, danger, mobs) come from the compiled
 `pit_room` (`createMobpitPures`); static data the pages
 draw is a generated constant from the Rust values (`PIT_WORLD` — room
-size, doorways, pillars, capsule radius —, `WEATHER` names, `ARENA_FLOOR`
-for The Freeze, `FREEZE_WORLD`, `PIT_RULES` tier radii, ranged reach,
-eye and hip heights, mob heights); The Freeze's content packs are a Rust
-record served in its payload encoding and decoded by the generated
-`decodePack`. What TypeScript still mirrors is small and listed under
+size, doorways, pillars, capsule radius —, `WEATHER` names, `PIT_RULES`
+tier radii, ranged reach, eye and hip heights, mob heights,
+`CONTENT_PACKS`, `GATE_ROOM`). What TypeScript still mirrors is small and listed under
 [Remaining client-side mirrors](#remaining-client-side-mirrors).
 
 Requirements: Rust (stable) with the `wasm32-unknown-unknown` target
@@ -93,52 +93,35 @@ aim (yaw, pitch), the shot id and the view delay (`PitInput`, 11–14
 bytes). The SvelteKit page aims with the mouse (top-down), and its "first
 person" turns the canvas with the aim under pointer lock.
 
-The Freeze: the server prints an **admin secret** (`./run.sh freeze` shows
-it; set `DG_DEMO_ADMIN_SECRET` to choose one) — open
-`/freeze/?admin=<secret>` (add `&old=1` in a second tab for an old client).
-`game-demos freeze` hosts the Town Hub (safe-room gate) and Whisper Meadow
-and starts a second process of itself for Ember Fields (`beta`, shared
-ticket + admin secrets, exits with its parent); portals hand players off
-between them (`Redirect` + `/admin/transfer` across processes). Content is
-data-driven per version (`freeze::content`: v1 lava pools that burn, v2
-"lava is now ice", v3 back to lava; slime speed/size/color, crystals, gem
-value) and served by `GET /dev/freeze/content/{version}` — the Rust `Pack`
-record in its payload encoding, decoded by the generated `decodePack`; the
-version-independent layout (zones, portals, pools, crystal spots) is the
-generated `FREEZE_WORLD` constant. The client derives the scene from *its
-own* pack. Packs are served, not compiled into the page, because the demo
-is about a client receiving content it was not built with.
+**Live content updates** (Mob Pit, from The Freeze): `run.sh mobpit`
+prints an admin link (`/mobpit/?admin=<secret>`, the services' admin secret
+`DG_DEMO_ADMIN_SECRET`, kept in `MOBPIT_DATA_DIR/admin-secret`); add
+`&old=1` in another tab for a client built before the update. The admin
+panel rolls a content pack (`mobpit_rooms::content_packs`: Classic,
+Frostfall — mobs 30 % slower, 20 % tougher, icy —, Emberfall — 25 %
+faster, brittle, glowing) out to **every live room**:
 
-- **Roll out update (Hard)**: every zone on both hosts freezes (SYSTEM
-  overlay, inputs dropped and counted — client side, plus any in flight on
-  the server), the "content CDN" stages the pack — an async `apply`
-  awaited by `WorldCoordinator::rollout_async` while everything stays
-  frozen (`DG_FREEZE_STAGE_MS`, default 2.5 s) — every zone resumes on the next version with the notes,
-  and every client reloads (`Kick(RELOAD)` → `reloadContent` → reconnect
-  with the token).
-- **Roll out (Safe room)**: rolling commit. Normal clients patch live
-  (`client.setContentVersion`); an old client (**O** / `&old=1`) keeps its
-  old pack in the field — the server already runs the new rules — until it
-  walks through a portal into the Town Hub, where it gets `RELOAD`.
-  Every client already *in* the hub when the update lands is at a safe
-  point and reloads right there (a rolling commit reloads stale clients
-  inside gate zones); a live-patching client reports its new version on
-  that reconnect.
-- **Ritual in Ember Fields**: that zone's `freeze_ready()` is false; the
-  next rollout times out (`NotAcked: beta/freeze-ember`) and every zone
-  resumes on the old version with "update aborted".
-
-Each zone switch emits a typed `ContentApplied` fact
-(`freeze.content_applied`) and a stamped event; gems emit `GemCollected`
-facts (`freeze.gem_collected`, naming the gem spot — the gem's value is a
-content-pack rule for the handler, not a zone-reported amount). Both hosts
-settle them in celld (`run.sh` starts `celld dev`; both processes share it
-through `CELLD_URL` / `DISTRIBUTED_INTERNAL_SECRET`): gems in the player's
-`gem-pouch/{principal}` cell, content switches in the zone's
-`content-log/{zone}` cell. The admin panel lists the last settled facts with
-their stamp. Display names live on the primary host: a player joining Ember
-Fields directly (`&zone=freeze-ember`) shows as a guest there, names carry
-over portals.
+- `POST /dev/mobpit/rollout` (admin secret) starts the rollout on the
+  world's `content-rollout/world` cell
+  (`distributed_game::world::content_rollout`) for the services' admin
+  session — the body names a known pack, never a principal.
+- The cell drives itself on its own schedule: `freezing` → (`freezeMs`,
+  default 3 s) `applied` → (3 s) `running`; each phase is an outward
+  event. Every room object follows it (`ZONE_CONTENT_ROLLOUT=world`: read
+  on wake and every second while it ticks): it freezes (the SYSTEM overlay
+  with the change notes; inputs are held by the SDK), switches to the pack
+  (`ZoneHost::set_content_version` → `on_content_version_changed`) and
+  resumes (`Resume` with the version). Facts from then on carry the new
+  version in their stamp. A room that slept through it catches up on wake
+  (a Hello on another version waits for the read, so a doorway admits on
+  the live version).
+- The page patches live (`setContentVersion`, which tells the room —
+  protocol `Content`); an old client keeps its pack and is stale
+  (`StalePolicy::SafeRoom { roam: false }`): every doorway but the
+  entrance's stays closed to it (a `stale` notice), and the entrance
+  (`Zone::is_gate`) reloads it (`Kick(RELOAD)` → `reloadContent` → back
+  with the new version and the same body). A fresh join on old content is
+  told to reload. `hard` reloads stale clients at once instead.
 
 ## SvelteKit
 
@@ -262,18 +245,17 @@ errors.
 ## Architecture
 
 ```
- browser (Vite dev server :5173)                        game-demos <demo> --dev (:2567)
- ┌──────────────────────────────────┐                  ┌─────────────────────────────────────┐
- │ src/<demo>/main.ts  Babylon scene │                  │ common::run / spawn                 │
- │   └ src/<demo>/client.ts          │  POST /dev/ticket │   ├ dev::routes  /dev/ticket        │
- │       GameClient (SDK)            │ ───────────────► │   │   guest principal (server-made) │
- │       ├ GameConnection  ws ───────┼─ /zones/{zone} ─►│   │   /dev/netsim → set_net_sim     │
- │       ├ EntityReplica (interp.)   │ ◄─ Welcome/Delta │   └ GameServer::serve_with          │
- │       └ Predictor ── mobpit.wasm  │                  │   ZoneHost<Freeze> 30 Hz            │
- │ src/shared/ hud · input · scene   │                  │     └ game_sim::arena::arena_step   │
- │ src/generated/<demo> (typed glue) │  GET /metrics    │   GET /metrics (Prometheus)         │
- │   └ wasm/<demo>.wasm ◄════════════╪══ distributed game-wasm (same Rust, wasm32) ══╝          │
- └──────────────────────────────────┘                  └─────────────────────────────────────┘
+ browser (Vite :5173 / SvelteKit)        game-demos mobpit --dev (:2567)       celld (cells worker)
+ ┌──────────────────────────────────┐    ┌──────────────────────────────┐     ┌────────────────────────────────┐
+ │ src/mobpit/main.ts  Babylon scene │    │ /dev/ticket  guest tickets   │     │ PitRoom  one Durable Object    │
+ │   └ src/mobpit/client.ts          │───►│ /dev/mobpit/* (rooms, tiers, │     │   per room pit.<x>.<y>:        │
+ │       GameClient (SDK)            │    │   boards, content, rollout)  │────►│   ZoneHost<MobPit> 30 Hz       │
+ │       ├ GameConnection ws ────────┼─ /rooms/{room} ─────────────────────►│   └ game_sim::mobpit::pit_step │
+ │       ├ EntityReplica (interp.)   │    │ /internal/celld-queue/relay  │◄────│ crawler · presence · activity  │
+ │       └ Predictor ── mobpit.wasm  │    │   bus → read models, boards  │     │ hood · borough · city · rollout│
+ │ src/generated/mobpit (typed glue) │    └──────────────────────────────┘     │ outbox Queue → saga + relay    │
+ │   └ wasm/mobpit.wasm ◄════════════╪══ distributed game-wasm (same Rust, wasm32)     └────────────────────────────────┘
+ └──────────────────────────────────┘
 ```
 
 Prediction is exact because (1) every input is one command frame of exactly
@@ -297,10 +279,10 @@ What the TypeScript still restates, and why it stays:
 
 - **Zone id formats and defaults** — `pit.<x>.<y>` (`parseRoom` /
   `roomZone` in `mobpit/client.ts`) and each page's default zone
-  (`pit.0.0`, `freeze-hub`, …). They are addressing, needed synchronously before
+  (`pit.0.0`). They are addressing, needed synchronously before
   any module loads; a mismatch fails loudly (the server rejects the zone).
-- **Dev / admin HTTP JSON shapes** — `WorldMap`, `WorldStatus`,
-  `BoardPosition`: debugging routes outside the game surface.
+- **Dev / admin HTTP JSON shapes** — `RoomStatus`, `TiersAround`,
+  `ContentInfo`, `BoardPosition`: debugging routes outside the game surface.
 - **The predicted arrow hit** (`rayCapsule` over rendered mobs) — cosmetic
   feedback; the room's rewound `HitQuery` decides. It could become a
   `#[game_pure]` over the rendered mobs.
@@ -317,7 +299,7 @@ examples/game/
                              Pit's rooms (`PitRoom`, one Durable Object per room) and the demos'
                              celld cells — Crawler + presence + zone activity + dev settings
                              (`ZoneDevObject`: the rooms' NetSim) + hood / borough / city tiers
-                             (Mob Pit), gem pouch + content log (The Freeze), and the
+                             + the world's content rollout (`ContentRolloutObject`), and the
                              `game-demo-outbox` Queue consumer (relay + the tier saga)
   server/                    Rust crate `game_demos`, its own cargo workspace (with sim/,
                              crawler/, rooms/, service/); also the `distributed build|dev` project
@@ -332,23 +314,20 @@ examples/game/
                              boards as GraphQL board roots (@live from bus notices), GraphQL
                              @live (Bearer only), tests/projection.rs (cells → bus → table →
                              live push, board push over bus notices, no mutations, 401)
-    sim/                     crate `game_sim`: the `#[predict]` steps (arena.rs movement + floor,
-                             mobpit.rs (+ `#[game_pure]` pit_room, doorways),
+    sim/                     crate `game_sim`: the `#[predict]` step (arena.rs planar movement,
+                             mobpit.rs `pit_step` + `#[game_pure]` pit_room, doorways, obstacles),
                              grid.rs seeded noise, biomes and props); compiled natively for the
                              server and to wasm32 for the browser
-    src/main.rs              `game-demos <demo>` subcommands (+ hidden `predict-trace`)
+    src/main.rs              `game-demos mobpit|leaderboard` (+ hidden `predict-trace`)
     src/predict_trace.rs     native traces of every step (recorded inputs) and pure function (arguments)
-    src/common/              shared: Demo trait, run/spawn, dev routes, guests;
+    src/common/              shared: CLI options, dev ticket wire types, guests;
                              celld.rs (CelldOptions: celld URL + internal secret),
                              relay.rs (authenticated /internal/celld-queue/relay → SqliteBus),
                              zone_status.rs (zone lease/snapshot/activity status read model)
     src/devcelld.rs          `celld dev` harness for tests (own project, port, process tree)
     src/mobpit/              Mob Pit services (the rooms run on celld): dev room tickets, relay,
                              crawler directory and room status projections, leaderboards
-    src/freeze/              The Freeze zone, content packs, two-host world + admin routes
-    tests/                   mobpit_smoke.rs (facts, rooms on celld, celld crash, boards, presence),
-                             freeze_smoke.rs (binary content packs),
-                             (Boss Ripple and the multi-host plumbing are gone: Mob Pit's tiers are cells)
+    tests/                   mobpit_smoke.rs (facts, rooms on celld, celld crash, boards, presence)
   sveltekit/                 SvelteKit app over the Mob Pit server + mobpit-service (see SvelteKit above)
     distributed.config.js    game surface (`games`) + GraphQL client (`clients`) for the Vite plugin
     distributed.clients.json the `$distributed` client of `mobpit_service` (lifecycle-generated)
@@ -363,19 +342,17 @@ examples/game/
     src/routes/pit/          load (zone) + page (useGame HUD, settled panel)
     tests/pit.test.mjs       headless Playwright against `node build` + game-demos + mobpit-service
   client/                    Vite + TypeScript + Babylon.js 9.30 (multi-page)
-    index.html, <demo>/index.html
-    src/generated/<demo>/    generated by `run.sh gen` (do not edit): schema/input/events/client.ts,
-                             predict.ts, pures.ts (mobpit), constants.ts, surface.json,
-                             wasm/<demo>.wasm (gitignored build output);
-                             `mobpit` also serves the leaderboard page
+    index.html, mobpit/index.html, leaderboard/index.html
+    src/generated/mobpit/    generated by `run.sh gen` (do not edit): schema/input/events/client.ts,
+                             predict.ts, pures.ts, constants.ts, surface.json,
+                             wasm/mobpit.wasm (gitignored build output); also the leaderboard page's
     src/shared/              hud.ts, input.ts, scene.ts, dev-api.ts, latest.ts, style.css
     src/mobpit/              client.ts (headless + /dev/mobpit API), main.ts (Babylon), style.css
     src/leaderboard/         main.ts (DOM page over the observer connection), style.css
-    src/freeze/              client.ts (content packs, live patch / reload, admin API), main.ts
     tests/                   prediction-wasm (native ↔ WASM exact match of steps + pure functions, cost),
                              mobpit-headless, mobpit-network-headless (NetSim on celld rooms,
                              exact prediction, interest), mobpit-restarts-headless, leaderboard-headless,
-                             mobpit-neighbours-headless (passive watchers), mobpit-ranged-headless (lag-compensated arrows), mobpit-events-headless, freeze-headless,
+                             mobpit-neighbours-headless (passive watchers), mobpit-ranged-headless (lag-compensated arrows), mobpit-events-headless, mobpit-content-headless (live content rollout),
                              mobpit-bosses-headless (hood → borough → city) (+ helpers/demo-server.mjs,
                              helpers/mobpit.mjs, helpers/celld.mjs for
                              a per-test `celld dev`)
@@ -602,7 +579,7 @@ fleet test) kills the owner node of a room with 200 facts in flight and
 counts exactly 200 in the cell.
 
 **celld.** Every demo with durable state runs on celld:
-`run.sh mobpit|leaderboard|freeze|sveltekit|smoke` need the celld
+`run.sh mobpit|leaderboard|sveltekit|smoke` need the celld
 version pinned in the repository's `.celld-version` (`CELLD_BIN`, default
 `celld` on PATH; `scripts/celld.sh check` verifies it and prints the install
 command) and `worker-build` (`cargo install worker-build --locked`) for
@@ -639,59 +616,46 @@ are available.
   map stays empty while the entrance sleeps).
 
 Dev routes (`--dev` only, none takes an identity or a reward):
-`POST /dev/ticket`, `GET /dev/mobpit/rooms` (room status), `GET
-/dev/mobpit/stats`, `GET /dev/mobpit/crawlers` (every crawler in the
-directory, eventually consistent), `GET /dev/mobpit/presence?principal=`
-(the presence cell), `GET /dev/mobpit/leaderboard[?member=]`, `POST
-/dev/mobpit/leaderboard/rebuild`. On celld, `GET /rooms/{room}/info` is the
+`POST /dev/ticket`, `POST /dev/mobpit/start`, `GET /dev/mobpit/rooms`
+(room status), `GET /dev/mobpit/stats`, `GET /dev/mobpit/crawlers` (every
+crawler in the directory, eventually consistent), `GET
+/dev/mobpit/presence?principal=` (the presence cell), `GET
+/dev/mobpit/leaderboard[?member=]`, `POST /dev/mobpit/leaderboard/rebuild`,
+`GET /dev/mobpit/tiers?room=`, `GET|POST /dev/netsim`, `GET
+/dev/mobpit/content` and `POST /dev/mobpit/rollout` (admin secret). On celld, `GET /rooms/{room}/info` is the
 room object's debug JSON (node, isolate, activation, wakes, tick timing).
 
-## Adding a demo
+## Adding a mechanic
 
-1. **Server** — `server/src/<demo>/mod.rs`: the zone plus a unit struct
-   implementing `common::Demo` (`NAME`, `DEFAULT_ZONE`, `hosts_zone`,
-   `server(config, guests)`); add `pub mod <demo>;` to `lib.rs` and one
-   variant to `DemoCommand` in `main.rs`. You get `/dev/ticket`,
-   `/dev/netsim`, `/metrics`, `--port/--dev/--secret`, graceful shutdown.
-   - Display names: `guests.name(&ctx.player(p)?.principal)` in `on_join`.
-   - Kinds: `#[derive(Replicated)]` views, `schema![..]` in `Zone::schema`,
-     `out.add(id, &view)` in `replicate`. Input: `#[derive(GameInput)]`,
-     `decode_input` = `MyInput::from_payload(bytes)`. Events: a
-     `#[derive(GameEvent)]` enum sent with `ctx.send` / `ctx.broadcast`.
-     Facts: the cell command input with `#[derive(FactCommand)]`.
-   - Predicted movement: declare the step with `#[predict(Step, kind = "…")]`
-     in `server/sim/` (with the input type and everything the step reads;
-     no server-only dependencies), call it from `on_tick`, add
-     `.predict::<Step>()` to the surface and a stream for it in
-     `src/predict_trace.rs` (the exact-match test fails until you do).
-   - Export `pub fn game_surface() -> GameSurface` from the module and add
-     the demo to `SURFACES` in `run.sh`; `./run.sh gen` writes
-     `client/src/generated/<demo>/` and compiles the step.
-   - Signed quantities that must rest at zero: `#[quant(centered = R, bits = N)]`.
-   - State shared by the zones and demo-specific dev routes (a durable
-     store, a leaderboard): build both in `common::spawn_with` /
-     `common::run_with` (see `mobpit::spawn` / `mobpit::run`).
-2. **Smoke test** — `server/tests/<demo>_smoke.rs`: `common::spawn::<YourDemo>`
-   on `127.0.0.1:0` with `DemoOptions::dev(secret)` and
-   `distributed_game::bots::run_bots` (custom `encoder` for your input).
-3. **Client** — `client/<demo>/index.html` + `src/<demo>/main.ts`, add the
-   name to `DEMOS` in `vite.config.ts` and a link in `index.html`. Keep
-   networking in `src/<demo>/client.ts` (no Babylon) so Node can test it:
-   a thin wrapper over the generated `create<Demo>Client` (URLs, tickets;
-   it predicts with the compiled step — set its context if it has one, and
-   await `prediction.ready` with the first hello). Reuse `DevApi` + `zoneUrl` (tickets), `Hud` (status/RTT/
-   jitter/tick/delta B/s/entities + NetSim sliders + `row`/`toggle`),
-   `InputSampler`, `FixedRate`, `cameraRelative`, `toAxis`,
-   `createStage`/`toWorld`/`material`/`createRing`/`LabelLayer`, `latest`
-   (latest value of a typed event, e.g. the hello).
-4. **Headless test** — `client/tests/<demo>-headless.test.mjs` with
-   `startDemo('<demo>')` from `tests/helpers/demo-server.mjs`.
-5. Register the demo in `run.sh` (`DEMOS=(…)`) and in the table above.
+Mob Pit is the one game; a new mechanic goes into it, not into a new demo.
+
+1. **Rules the client must agree with** (movement, room contents) go into
+   `server/sim/` (`game_sim`, wasm32-portable, no server dependencies): the
+   predicted step (`#[predict]`) or a `#[game_pure]` function, with a trace
+   in `src/predict_trace.rs` (the exact-match test fails until you add one).
+2. **Authority** goes into the room (`server/rooms/src/zone.rs`): input
+   fields in `PitInput`, events in `PitEvent`, replicated fields in the
+   view structs, facts as the cell command inputs (`#[derive(FactCommand)]`).
+   Anything above one room is a cell (`server/tiers/`, mounted in
+   `cells/`), read off the tick by `CelldZone::refresh`.
+3. `./run.sh gen` regenerates `client/src/generated/mobpit/`; the SvelteKit
+   copy is generated by its Vite plugin.
+4. Both pages get the feature (`client/src/mobpit/`,
+   `sveltekit/src/routes/pit/` + `src/lib/pit/loop.ts`), networking in
+   `client/src/mobpit/client.ts` so Node can test it.
+5. Tests: `server/rooms/tests/rooms.rs` (the room on the reference host), a
+   headless `client/tests/mobpit-<feature>-headless.test.mjs` on its own
+   `celld dev` (`startPit` from `tests/helpers/mobpit.mjs`), and a step in
+   `sveltekit/tests/pit.test.mjs`.
 
 ## Security notes (why this is dev only)
 
-- `--dev` (or `DG_DEMO_DEV=1`) mounts `/dev/*`; without it only `/zones` and
-  `/metrics` exist. `run.sh` binds `127.0.0.1` and always sets it.
+- `--dev` (or `DG_DEMO_DEV=1`) mounts `/dev/*`; without it only the
+  internal relay route exists. `run.sh` binds `127.0.0.1` and always sets it.
+- `/dev/mobpit/rollout` needs the admin secret (`x-game-admin-secret`); the
+  services then run the rollout cell's command for their own admin session.
+  The SvelteKit app's `/api/dev/rollout` (dev sign-in only) builds the admin
+  session from the signed-in user; in the dev demo every user is an admin.
 - `/dev/ticket` never accepts an identity: the principal is generated by the
   server (`guest-<hex>`); the caller may pass a display name (sanitized,
   ≤ 16 chars) and a server-signed guest token from an earlier response to
@@ -701,7 +665,7 @@ room object's debug JSON (node, isolate, activation, wakes, tick timing).
   is set (needed to point `game-bots` at a running demo). `run.sh` sets it
   from `.data/<demo>/dev-ticket-secret` (Mob Pit: `MOBPIT_DATA_DIR`), kept
   across runs so a returning browser's guest token still verifies.
-- The SvelteKit demo uses no `/dev/*` route: its tickets are minted by the
+- The SvelteKit demo uses no services `/dev/*` route: its tickets are minted by the
   SvelteKit server from the Auth.js session, and its read model is
   `mobpit-service`, so `run.sh sveltekit` and the smoke test start the zone
   server without `--dev`. It is still dev only: `GAME_DEV_AUTH=1` lets

@@ -29,6 +29,9 @@ impl CelldZone for MobPit {
             // A doorway into a sleeping room waits for it to wake while the
             // client keeps predicting: keep up to 3 s of its inputs.
             input_capacity: 90,
+            // A live content update keeps old clients playing where they
+            // are; they reload when they walk into the entrance.
+            stale_policy: distributed_game::StalePolicy::SafeRoom { roam: false },
             // Ranged shots are rewound at most this far (lag compensation).
             rewind: distributed_game::RewindConfig {
                 max_rewind: std::time::Duration::from_millis(crate::zone::MAX_REWIND_MS),

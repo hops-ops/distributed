@@ -362,6 +362,16 @@ pub enum PitEvent {
         /// Where the arrow stopped (height).
         z: f32,
     },
+    /// To a player whose client runs older content than the room (a live
+    /// content update happened): only the entrance (a gate) lets it through,
+    /// and reloads it there. Sent when it tries another doorway.
+    #[game_event(id = 10)]
+    Stale {
+        /// The gate room (`pit.0.0`).
+        gate: String,
+        /// The world's content version.
+        version: String,
+    },
     /// The hood's boss fell here.
     #[game_event(id = 8)]
     BossDown {
@@ -443,6 +453,8 @@ pub fn game_surface() -> GameSurface {
             &game_sim::mobpit::PATTERNS.map(String::from).to_vec(),
         )
         .constant("pit_world", &pit_world())
+        .constant("content_packs", &content_packs())
+        .constant("gate_room", &GATE_ROOM.to_string())
 }
 
 /// Input bit: attack (bit 0 is the Arena's dash).
@@ -501,6 +513,71 @@ fn mob_height(tier: u8) -> f32 {
 }
 const PLAYER_RESPAWN_TICKS: u64 = 90;
 
+/// One content pack: what a content version changes in the rooms (mob
+/// pace and toughness) and how clients running it draw them (the tint).
+/// The live version comes from the world's content rollout
+/// (`distributed_game::world::content_rollout`); the generated
+/// `CONTENT_PACKS` gives the pages the same table.
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct ContentPack {
+    /// Content version (`""`: the built-in pack).
+    pub version: String,
+    /// Display name.
+    pub name: String,
+    /// Mob speed multiplier.
+    pub mob_pace: f32,
+    /// Mob hit points, percent of the base.
+    pub mob_hp_pct: u16,
+    /// Mob tint (0xRRGGBB, 0: none).
+    pub tint: u32,
+    /// Default change notes.
+    pub notes: String,
+}
+
+/// Every content pack, the built-in one first.
+pub fn content_packs() -> Vec<ContentPack> {
+    let pack = |version: &str, name: &str, mob_pace, mob_hp_pct, tint, notes: &str| ContentPack {
+        version: version.into(),
+        name: name.into(),
+        mob_pace,
+        mob_hp_pct,
+        tint,
+        notes: notes.into(),
+    };
+    vec![
+        pack("", "Classic", 1.0, 100, 0, ""),
+        pack(
+            "frostfall",
+            "Frostfall",
+            0.7,
+            120,
+            0x8fd3ff,
+            "Frostfall: the mobs are frozen stiff (30 % slower) but tougher (+20 % HP).",
+        ),
+        pack(
+            "emberfall",
+            "Emberfall",
+            1.25,
+            85,
+            0xff7a3a,
+            "Emberfall: the mobs burn hot (25 % faster) and brittle (-15 % HP).",
+        ),
+    ]
+}
+
+/// The pack of `version` (unknown versions run the built-in pack).
+pub fn content_pack(version: &str) -> ContentPack {
+    let packs = content_packs();
+    packs
+        .iter()
+        .find(|p| p.version == version)
+        .cloned()
+        .unwrap_or_else(|| packs[0].clone())
+}
+
+/// The gate room: stale clients reload when they walk into it.
+pub const GATE_ROOM: &str = "pit.0.0";
+
 /// Mob tier stats: (max hp, speed m/s, damage, radius, telegraph radius).
 fn tier_stats(tier: u8) -> (i32, f32, i32, f32, f32) {
     match tier {
@@ -523,6 +600,11 @@ const BOSS_RESPAWN_TICKS: u64 = 30 * mobpit_tiers::BOSS_RESPAWN_MS / 1000;
 fn max_hp(tier: u8, difficulty: u32) -> i32 {
     let d = difficulty.min(mobpit_tiers::MAX_TIER) as i32;
     tier_stats(tier).0 * (4 + d) / 4
+}
+
+/// [`max_hp`] under a content pack.
+fn pack_hp(tier: u8, difficulty: u32, pack: &ContentPack) -> i32 {
+    (max_hp(tier, difficulty) * i32::from(pack.mob_hp_pct) / 100).max(1)
 }
 
 /// Damage of a mob of `tier` at hood tier `difficulty` (+20 % per tier).
@@ -620,6 +702,8 @@ struct Mob {
     wander: (f32, f32),
     /// The hood tier its hit points are scaled to (for the HP bar).
     difficulty: u32,
+    /// The content pack's hit points (percent, for the HP bar).
+    hp_pct: u16,
 }
 
 struct Player {
@@ -640,6 +724,8 @@ struct Player {
     shot_anim: u8,
     /// Handed to a neighbouring room: no more steps here.
     leaving: bool,
+    /// Told it must reload at the entrance (it runs older content).
+    told_stale: bool,
 }
 
 struct PendingKill {
@@ -732,6 +818,8 @@ pub struct MobPit {
     awake_reported: bool,
     /// Ranged shots of this tick, resolved after the players stepped.
     fires: Vec<Fire>,
+    /// The content pack of the room's content version.
+    pack: ContentPack,
 }
 
 /// A ranged shot to resolve.
@@ -1121,9 +1209,25 @@ impl MobPit {
             .collect();
         for (player, (dx, dy)) in crossing_now {
             let target = room_zone((rx + dx, ry + dy));
+            // A client on older content (a live update happened) only
+            // passes into the entrance, which reloads it.
+            let held = ctx.is_stale(player) && target != GATE_ROOM;
             let p = self.players.get_mut(&player).expect("player");
             let carried = encode_carried(&into_neighbour((dx, dy), p.state));
-            if parse_room(&target).is_some() && ctx.handoff(player, &target, carried).is_ok() {
+            if held && !p.told_stale {
+                p.told_stale = true;
+                ctx.send(
+                    player,
+                    &PitEvent::Stale {
+                        gate: GATE_ROOM.into(),
+                        version: ctx.content_version().to_string(),
+                    },
+                );
+            }
+            if !held
+                && parse_room(&target).is_some()
+                && ctx.handoff(player, &target, carried).is_ok()
+            {
                 p.leaving = true;
             } else {
                 // The edge of the world: back inside the wall line.
@@ -1302,18 +1406,22 @@ impl MobPit {
         // The borough's world event: an invasion (mobs aggro from twice as
         // far and come back at once) or a frenzy (mobs 40 % faster).
         let invasion = self.event() == "invasion";
-        let pace = if self.event() == "frenzy" { 1.4 } else { 1.0 };
+        let pace = if self.event() == "frenzy" { 1.4 } else { 1.0 } * self.pack.mob_pace;
         let aggro = if invasion { AGGRO * 2.0 } else { AGGRO };
         for i in 0..self.mobs.len() {
             let tier = self.mobs[i].tier;
             let (_, speed, _, radius, tele) = tier_stats(tier);
-            let (max_hp, damage) = (max_hp(tier, difficulty), damage(tier, difficulty));
+            let (max_hp, damage) = (
+                pack_hp(tier, difficulty, &self.pack),
+                damage(tier, difficulty),
+            );
             let target_pos = |t: Option<PlayerId>| {
                 t.and_then(|t| living.iter().find(|(id, _, _)| *id == t))
                     .map(|(_, x, y)| (*x, *y))
             };
             let m = &mut self.mobs[i];
             m.difficulty = difficulty;
+            m.hp_pct = self.pack.mob_hp_pct;
             match m.state {
                 MobState::Dead => {
                     // A boss returns only once its hood says so.
@@ -1504,6 +1612,7 @@ impl MobPit {
                 fire_cd: 0,
                 shot_anim: 0,
                 leaving: false,
+                told_stale: false,
             },
         );
         self.greet(ctx, player);
@@ -1554,7 +1663,7 @@ impl Zone for MobPit {
             .one(|z: &Self| z)
     }
 
-    fn on_create(_ctx: &mut Ctx<'_, Self>, room: RoomConfig) -> Self {
+    fn on_create(ctx: &mut Ctx<'_, Self>, room: RoomConfig) -> Self {
         let layout = pit_room(&PitRoomContext {
             seed: room.seed,
             x: room.room.0,
@@ -1573,7 +1682,7 @@ impl Zone for MobPit {
                     x: home.0,
                     y: home.1,
                     face: 0.0,
-                    hp: max_hp(slot.tier, 0),
+                    hp: pack_hp(slot.tier, 0, &content_pack(ctx.content_version())),
                     state: MobState::Idle,
                     timer: 0,
                     target: None,
@@ -1581,6 +1690,7 @@ impl Zone for MobPit {
                     respawn_at: 0,
                     wander: home,
                     difficulty: 0,
+                    hp_pct: content_pack(ctx.content_version()).mob_hp_pct,
                 }
             })
             .collect();
@@ -1614,6 +1724,7 @@ impl Zone for MobPit {
             },
             awake_reported: false,
             fires: Vec::new(),
+            pack: content_pack(ctx.content_version()),
         }
     }
 
@@ -1677,6 +1788,21 @@ impl Zone for MobPit {
             if m.target == Some(player) {
                 m.target = None;
             }
+        }
+    }
+
+    /// The entrance is the safe room of a live content update: a client on
+    /// older content is let in there (and only there) and reloaded.
+    fn is_gate(&self) -> bool {
+        self.room.room == (0, 0)
+    }
+
+    /// A live content update: the room runs the new pack from this tick
+    /// (facts and stamps carry the new version).
+    fn on_content_version_changed(&mut self, _ctx: &mut Ctx<'_, Self>, _from: &str, to: &str) {
+        self.pack = content_pack(to);
+        for p in self.players.values_mut() {
+            p.told_stale = false;
         }
     }
 
@@ -1910,7 +2036,9 @@ impl Zone for MobPit {
                 // Back home-side where it stood, calm again.
                 m.x = saved.x;
                 m.y = saved.y;
-                m.hp = saved.hp.clamp(1, max_hp(m.tier, mobpit_tiers::MAX_TIER));
+                m.hp = saved
+                    .hp
+                    .clamp(1, pack_hp(m.tier, mobpit_tiers::MAX_TIER, &self.pack));
                 m.state = MobState::Return;
             }
         }
@@ -1949,7 +2077,7 @@ impl Project<MobView> for Mob {
         if self.state == MobState::Dead {
             return None;
         }
-        let max_hp = max_hp(self.tier, self.difficulty);
+        let max_hp = (max_hp(self.tier, self.difficulty) * i32::from(self.hp_pct) / 100).max(1);
         let tele = if self.state == MobState::Windup {
             255 - (u32::from(self.timer) * 255 / u32::from(WINDUP_TICKS))
         } else {
@@ -2012,6 +2140,11 @@ pub struct PitStats {
 
 impl MobPit {
     /// Current numbers.
+    /// The content pack the room runs.
+    pub fn pack(&self) -> &ContentPack {
+        &self.pack
+    }
+
     pub fn stats(&self) -> PitStats {
         PitStats {
             pending: self.pending.len() + self.backlog.len(),

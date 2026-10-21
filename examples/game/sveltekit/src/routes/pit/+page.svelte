@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { watchZones, type WatchState } from '@hops-ops/distributed/game';
 	import { gameTicketSource, useGame } from '@hops-ops/distributed/sveltekit/game';
-	import { createMobpitClient, EVENTS, PIT_WORLD, WEATHER } from '$lib/generated/mobpit/index.ts';
+	import { CONTENT_PACKS, createMobpitClient, EVENTS, GATE_ROOM, PIT_WORLD, WEATHER, type StaleEvent } from '$lib/generated/mobpit/index.ts';
+	import type { FreezeMessage } from '@hops-ops/distributed/game';
 	import Leaderboard from '$lib/pit/Leaderboard.svelte';
 	import MyStats from '$lib/pit/MyStats.svelte';
 	import Rooms from '$lib/pit/Rooms.svelte';
@@ -23,7 +24,19 @@
 				pingIntervalMs: 500,
 				inputDtMs: 1000 / 30,
 				// One continuous world: keep predicting through doorways.
-				prediction: { handoffFrame: pitHandoffFrame }
+				prediction: { handoffFrame: pitHandoffFrame },
+				// Live content: start on the world's version; a room that
+				// requires a reload names the version (else ask the server).
+				contentVersion: data.contentVersion,
+				reloadContent: async (request) =>
+					request.version ?? ((await (await fetch('/api/game/content')).json()) as { version: string }).version
+			});
+			// A Resume with a new version: the packs are built in, so patch
+			// live (the room records it; no reload round trip).
+			typed.client.on('resume', (zone, message) => {
+				if (zone === typed.client.authority?.zoneId && message.version !== typed.client.contentVersion) {
+					typed.client.setContentVersion(message.version);
+				}
 			});
 			// The predicted step's context is the room (its seeded obstacles).
 			let seed = PIT_WORLD.defaultSeed;
@@ -60,6 +73,63 @@
 		game.client?.setControlledEntity(h.entity);
 		if (h.restored) toast(`pit.${h.roomX}.${h.roomY}: restored from hibernation (${h.roomKills} kills here so far)`);
 	});
+
+	// ---- live content: freeze overlay with the change notes, pack, staleness ----
+	let frozen = $state<FreezeMessage | undefined>();
+	// Both follow the client (its version) and the room (Welcome / Resume).
+	let contentVersion = $state('');
+	let worldVersion = $state('');
+	let staleNotice = $state<StaleEvent | undefined>();
+	const packName = (version: string) => CONTENT_PACKS.find((p) => p.version === version)?.name ?? version;
+	const pack = $derived(CONTENT_PACKS.find((p) => p.version === contentVersion) ?? CONTENT_PACKS[0]!);
+	$effect(() => {
+		const client = game.client;
+		if (client === undefined) return;
+		contentVersion = client.contentVersion;
+		worldVersion = data.contentVersion;
+		const offs = [
+			client.on('freeze', (zone, message) => {
+				if (zone === client.authority?.zoneId) frozen = message;
+			}),
+			client.on('resume', (zone, message) => {
+				if (zone !== client.authority?.zoneId) return;
+				frozen = undefined;
+				worldVersion = message.version;
+				toast(`World updated to ${packName(message.version)}${message.notes ? ` — ${message.notes}` : ''}`);
+			}),
+			client.on('authority', (_zone, welcome) => {
+				worldVersion = welcome.contentVersion;
+				staleNotice = undefined;
+				if (!client.authority?.connection.frozen) frozen = undefined;
+			})
+		];
+		const timer = setInterval(() => (contentVersion = client.contentVersion), 250);
+		return () => {
+			clearInterval(timer);
+			for (const off of offs) off();
+		};
+	});
+	game.on('stale', (notice, zoneId) => {
+		if (zoneId === game.zone) staleNotice = notice;
+	});
+	// Dev admin: roll a pack out to every room (dev sign-in only).
+	let adminOk = $state(false);
+	let rolloutNotes = $state('');
+	let rolloutStatus = $state('');
+	$effect(() => {
+		fetch('/api/dev/rollout')
+			.then((r) => (adminOk = r.ok))
+			.catch(() => (adminOk = false));
+	});
+	async function rollout(version: string) {
+		rolloutStatus = 'rolling out…';
+		const r = await fetch('/api/dev/rollout', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ version, notes: rolloutNotes || undefined })
+		});
+		rolloutStatus = r.ok ? `rolling out ${packName(version)}: every room freezes, then resumes on it` : `failed (${r.status}) ${await r.text()}`;
+	}
 
 	// Toasts (room restores, sleeps).
 	let toasts = $state<{ id: number; text: string }[]>([]);
@@ -110,7 +180,8 @@
 			ghost: () => ghost,
 			world: () => world,
 			firstPerson: () => firstPerson,
-			compensated: () => compensated
+			compensated: () => compensated,
+			tint: () => pack.tint
 		});
 	});
 	$effect(() => game.client?.setPredictionEnabled(predict));
@@ -190,6 +261,20 @@
 			<label><input type="checkbox" bind:checked={compensated} data-testid="compensated" /> lag compensation</label>
 			<small>R / click shoots where you aim (the mouse). Yellow: where you saw it land; green / red: the room's verdict.</small>
 		</section>
+		<section data-testid="content-panel">
+			<h2>Content</h2>
+			<div>pack <b data-testid="content" data-version={contentVersion}>{pack.name}</b> · world <b data-testid="world-content">{packName(worldVersion)}</b></div>
+			{#if contentVersion !== worldVersion}
+				<div class="stale" data-testid="stale">Your client runs {pack.name}; only the entrance ({GATE_ROOM}) lets you through — it updates you.{staleNotice ? ' (that doorway is closed to you)' : ''}</div>
+			{/if}
+			{#if adminOk}
+				<input placeholder="change notes (default: the pack's)" bind:value={rolloutNotes} data-testid="rollout-notes" />
+				{#each CONTENT_PACKS as p (p.version)}
+					<button onclick={() => rollout(p.version)} data-testid="rollout-{p.version || 'classic'}">Roll out {p.name}</button>
+				{/each}
+				<small data-testid="rollout-status">{rolloutStatus}</small>
+			{/if}
+		</section>
 		<section data-testid="world">
 			<h2>World</h2>
 			{#if world}
@@ -248,6 +333,11 @@
 		</section>
 	</aside>
 </main>
+{#if frozen}
+	<div class="frozen" data-testid="frozen">
+		<b>SYSTEM: an administrator has paused the world to update it to {packName(frozen.version)}.</b><br />{frozen.notes}
+	</div>
+{/if}
 <div class="toasts" data-testid="toasts">
 	{#each toasts as t (t.id)}<div class="toast">{t.text}</div>{/each}
 </div>
@@ -265,4 +355,6 @@
 	.error { color: #ff6b6b; }
 	.saved { color: #9ad16b; }
 	.event { color: #e0a8ff; font-weight: 600; }
+	.stale { color: #f2b84b; font-weight: 600; }
+	.frozen { position: fixed; top: 40%; left: 50%; transform: translate(-50%, -50%); max-width: 32rem; background: rgba(20, 60, 110, 0.92); color: #fff; padding: 1rem 1.4rem; border-radius: 8px; text-align: center; pointer-events: none; }
 </style>

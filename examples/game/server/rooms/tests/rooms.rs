@@ -627,3 +627,134 @@ fn an_arrow_hits_the_mob_it_was_aimed_at_and_obstacles_stop_it() {
         "stopped at the pillar: {from_centre}"
     );
 }
+
+/// Walk `player` towards `(tx, ty)` (room-local) until the room hands it
+/// off or `frames` pass; returns the handoff target and the events seen.
+fn walk_to(
+    room: &mut ZoneHost<MobPit>,
+    clock: &ManualClock,
+    client: ClientId,
+    player: distributed_game::PlayerId,
+    seq: &mut u32,
+    (tx, ty): (f32, f32),
+    frames: u32,
+) -> (Option<String>, Vec<PitEvent>) {
+    let mut seen = Vec::new();
+    for _ in 0..frames {
+        let Some(me) = room.zone().player_position(player) else {
+            break;
+        };
+        let (dx, dy) = (tx - me.0, ty - me.1);
+        let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+        *seq += 1;
+        let input = PitInput {
+            mx: (dx / len * 127.0) as i8,
+            my: (dy / len * 127.0) as i8,
+            ..PitInput::default()
+        };
+        room.push_input(
+            client,
+            *seq,
+            *seq,
+            &distributed_game::GameInput::to_payload(&input),
+        );
+        let out = tick(room, clock);
+        seen.extend(events(&out));
+        if let Some(target) = messages(&out).into_iter().find_map(|m| match m {
+            ServerMessage::Handoff { target_zone, .. } => Some(target_zone),
+            _ => None,
+        }) {
+            return (Some(target), seen);
+        }
+    }
+    (None, seen)
+}
+
+#[test]
+fn a_content_update_switches_the_pack_stamps_facts_and_holds_old_clients() {
+    use distributed_game::StalePolicy;
+
+    let clock = ManualClock::new();
+    let (facts, _script) = FactQueue::scripted(256);
+    let mut room = ZoneHost::<MobPit>::new(
+        "pit.1.0",
+        HostConfig {
+            stale_policy: StalePolicy::SafeRoom { roam: false },
+            lifecycle_facts: true,
+            ..HostConfig::default()
+        },
+        Arc::new(clock.clone()),
+        RoomConfig::for_zone("pit.1.0", DEFAULT_SEED).expect("room"),
+    )
+    .with_facts(facts.with_journal())
+    .with_transfer_issuer(|request| Some(format!("transfer:{}", request.target_zone)));
+    let (old, old_player) = join(&mut room, "old");
+    let (new, new_player) = join(&mut room, "new");
+    tick(&mut room, &clock);
+
+    // The live update: the room runs frostfall from here on.
+    room.set_content_version("frostfall");
+    assert_eq!(room.zone().pack().name, "Frostfall");
+    // The patched client says so; the old one does not.
+    assert!(room.content_patched(new, "frostfall"));
+    assert!(
+        !room.content_patched(new, "emberfall"),
+        "never ahead of the room"
+    );
+
+    // The old client may not leave through the east doorway (pit.2.0)…
+    let mut seq = 0;
+    let (target, seen) = walk_to(
+        &mut room,
+        &clock,
+        old,
+        old_player,
+        &mut seq,
+        (24.0, 1.7),
+        400,
+    );
+    assert_eq!(target, None, "held in the room");
+    assert!(
+        seen.iter().any(|e| matches!(e, PitEvent::Stale { gate, version } if gate == "pit.0.0" && version == "frostfall")),
+        "told to head to the entrance"
+    );
+    // …but through the west one, into the entrance (the gate).
+    let (target, _) = walk_to(
+        &mut room,
+        &clock,
+        old,
+        old_player,
+        &mut seq,
+        (-24.0, 1.7),
+        600,
+    );
+    assert_eq!(target.as_deref(), Some("pit.0.0"));
+    // The patched client goes east.
+    let mut seq = 0;
+    let (target, _) = walk_to(
+        &mut room,
+        &clock,
+        new,
+        new_player,
+        &mut seq,
+        (24.0, 1.7),
+        600,
+    );
+    assert_eq!(target.as_deref(), Some("pit.2.0"));
+
+    // Facts after the update carry its version.
+    let emitted = room.take_emitted_facts();
+    assert!(!emitted.is_empty(), "lifecycle facts were emitted");
+    let after: Vec<_> = emitted
+        .iter()
+        .filter(|f| f.stamp().content_version == "frostfall")
+        .collect();
+    assert!(
+        !after.is_empty(),
+        "facts after the update are stamped frostfall: {:?}",
+        emitted
+            .iter()
+            .map(|f| (f.command(), f.stamp().content_version.clone()))
+            .collect::<Vec<_>>()
+    );
+}

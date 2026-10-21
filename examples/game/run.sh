@@ -40,7 +40,7 @@
 #
 # celld: Mob Pit's rooms and the demos' durable cells (examples/game/cells:
 # Mob Pit's rooms, Crawler, presence, zone-activity and hood / borough /
-# city tier cells, The Freeze's gem and content cells) run on celld, never natively; state persists in
+# city tier cells, the world's content rollout) run on celld, never natively; state persists in
 # .data/<demo>/celld (Mob Pit: MOBPIT_DATA_DIR/celld, the fleet's bucket in
 # a RustFS volume of its compose project). Fleet ports: nodes' public
 # listeners GAME_DEMOS_PORT + 10.., operators + 20.., RustFS + 30
@@ -60,13 +60,11 @@ SVELTEKIT="$HERE/sveltekit"
 BIN="$SERVER/target/debug/game-demos"
 SERVICE_BIN="$SERVER/target/debug/mobpit-service"
 CELLS="$HERE/cells"
-DEMOS=(mobpit leaderboard freeze)
-# Demos whose durable state lives in celld cells.
-CELLD_DEMOS=(mobpit leaderboard freeze)
+DEMOS=(mobpit leaderboard)
 export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
 # Game surfaces with a generated client (`game_demos::<surface>::game_surface`);
 # the leaderboard page uses Mob Pit's.
-SURFACES=(mobpit freeze)
+SURFACES=(mobpit)
 CLI="$REPO/target/debug/distributed"
 
 log() { printf '\033[1;36m[demos]\033[0m %s\n' "$*"; }
@@ -115,7 +113,7 @@ ensure_celld() {
 # sources changed.
 ensure_cells() {
 	local marker="$CELLS/build/worker/shim.mjs"
-	if [[ ! -f "$marker" ]] || [[ -n "$(find "$CELLS/src" "$CELLS/Cargo.toml" "$SERVER/crawler" "$SERVER/rooms" "$SERVER/sim" "$REPO/src" "$REPO/distributed_game/src" -newer "$marker" -name '*.rs' -print -quit 2>/dev/null)" ]] ||
+	if [[ ! -f "$marker" ]] || [[ -n "$(find "$CELLS/src" "$CELLS/Cargo.toml" "$SERVER/crawler" "$SERVER/rooms" "$SERVER/sim" "$SERVER/tiers" "$REPO/src" "$REPO/distributed_game/src" -newer "$marker" -name '*.rs' -print -quit 2>/dev/null)" ]] ||
 		[[ "$CELLS/Cargo.toml" -nt "$marker" ]]; then
 		command -v worker-build >/dev/null || {
 			echo "worker-build not found: cargo install worker-build --locked" >&2
@@ -384,7 +382,9 @@ run_mobpit() {
 	fi
 	local log_file
 	log_file="$(mktemp -t game-demos.XXXXXX)"
-	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" mobpit --dev --port "$port" \
+	local admin
+	admin="$(dev_secret "$MOBPIT_DATA_DIR" admin-secret)"
+	DISTRIBUTED_GAME_SECRET="$secret" DG_DEMO_ADMIN_SECRET="$admin" "$BIN" mobpit --dev --port "$port" \
 		--data-dir "$MOBPIT_DATA_DIR" --celld-url "$CELLD_URL" >"$log_file" 2>&1 &
 	local server_pid=$!
 	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; [[ -z "$CELLD_PID" ]] || kill_tree "$CELLD_PID"; stop_fleet; rm -f "$log_file"' EXIT INT TERM
@@ -392,49 +392,11 @@ run_mobpit() {
 	sed -n '2p' "$log_file"
 	echo
 	log "open  http://localhost:$client_port/$demo/   (services :$port, rooms on celld ${ROOMS_URLS}; dev routes ON — local only)"
+	log "admin http://localhost:$client_port/mobpit/?admin=$admin   (live content updates; add &old=1 in another tab for an old client)"
 	echo
 	cd "$CLIENT"
 	GAME_DEMOS_SERVER="http://127.0.0.1:$port" GAME_DEMOS_ROOMS="$ROOMS_URLS" \
 		GAME_DEMOS_CLIENT_PORT="$client_port" npx vite
-}
-
-run_demo() {
-	local demo="$1"
-	local port="${GAME_DEMOS_PORT:-2567}"
-	local client_port="${GAME_DEMOS_CLIENT_PORT:-5173}"
-	ensure_sdk
-	ensure_client
-	ensure_server
-	ensure_wasm
-
-	CELLD_PID=""
-	if [[ " ${CELLD_DEMOS[*]} " == *" $demo "* ]]; then
-		local project="$HERE/.data/$demo/celld"
-		[[ "$demo" == mobpit || "$demo" == leaderboard ]] && project="$MOBPIT_DATA_DIR/celld"
-		start_celld "$project" "${CELLD_PORT:-$((port + 3))}" "$port"
-	fi
-	local log_file secret
-	log_file="$(mktemp -t game-demos.XXXXXX)"
-	secret="${DISTRIBUTED_GAME_SECRET:-$(dev_secret "$HERE/.data/$demo")}"
-	[[ "$demo" == mobpit || "$demo" == leaderboard ]] && secret="$(dev_secret "$MOBPIT_DATA_DIR")"
-	DISTRIBUTED_GAME_SECRET="$secret" "$BIN" "$demo" --dev --port "$port" >"$log_file" 2>&1 &
-	local server_pid=$!
-	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; [[ -z "$CELLD_PID" ]] || kill_tree "$CELLD_PID"; rm -f "$log_file"' EXIT INT TERM
-	for _ in $(seq 1 100); do
-		grep -q '^LISTENING' "$log_file" && break
-		if ! kill -0 "$server_pid" 2>/dev/null; then
-			cat "$log_file"
-			echo "game-demos $demo failed to start" >&2
-			exit 1
-		fi
-		sleep 0.1
-	done
-	sed -n '2p' "$log_file"
-	echo
-	log "open  http://localhost:$client_port/$demo/   (server :$port, dev routes ON — local only)"
-	echo
-	cd "$CLIENT"
-	GAME_DEMOS_SERVER="http://127.0.0.1:$port" GAME_DEMOS_CLIENT_PORT="$client_port" npx vite
 }
 
 wait_listening() {
@@ -535,8 +497,8 @@ run_sveltekit() {
 smoke() {
 	ensure_sdk
 	ensure_client
-	# The celld-backed tests (Mob Pit, The Freeze) start their
-	# own `celld dev` (CELLD_BIN) on the cells worker.
+	# The celld-backed tests start their own `celld dev` (CELLD_BIN) on
+	# the cells worker.
 	ensure_celld
 	ensure_cells
 	# The SvelteKit test's leaderboard is the Redis board. Only that test gets
@@ -575,10 +537,8 @@ case "${1:-}" in
 	list) printf '%s\n' "${DEMOS[@]}" sveltekit ;;
 	"" | -h | --help | help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
 	*)
-		if [[ "$1" == mobpit || "$1" == leaderboard ]]; then
+		if [[ " ${DEMOS[*]} " == *" $1 "* ]]; then
 			run_mobpit "$1" "${2:-}" "${3:-3}"
-		elif [[ " ${DEMOS[*]} " == *" $1 "* ]]; then
-			run_demo "$1"
 		else
 			echo "unknown demo '$1' (known: ${DEMOS[*]})" >&2
 			exit 2

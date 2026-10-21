@@ -1,6 +1,49 @@
 {
   "constants": [
     {
+      "name": "content_packs",
+      "type": {
+        "item": {
+          "name": "ContentPack",
+          "type": "record"
+        },
+        "type": "list"
+      },
+      "value": [
+        {
+          "mob_hp_pct": 100,
+          "mob_pace": 1.0,
+          "name": "Classic",
+          "notes": "",
+          "tint": 0,
+          "version": ""
+        },
+        {
+          "mob_hp_pct": 120,
+          "mob_pace": 0.699999988079071,
+          "name": "Frostfall",
+          "notes": "Frostfall: the mobs are frozen stiff (30 % slower) but tougher (+20 % HP).",
+          "tint": 9425919,
+          "version": "frostfall"
+        },
+        {
+          "mob_hp_pct": 85,
+          "mob_pace": 1.25,
+          "name": "Emberfall",
+          "notes": "Emberfall: the mobs burn hot (25 % faster) and brittle (-15 % HP).",
+          "tint": 16742970,
+          "version": "emberfall"
+        }
+      ]
+    },
+    {
+      "name": "gate_room",
+      "type": {
+        "type": "short_str"
+      },
+      "value": "pit.0.0"
+    },
+    {
       "name": "patterns",
       "type": {
         "item": {
@@ -481,6 +524,27 @@
             "name": "z",
             "type": {
               "type": "f32"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 10,
+      "name": "stale",
+      "payload": {
+        "fields": [
+          {
+            "name": "gate",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "version",
+            "type": {
+              "type": "short_str"
             }
           }
         ],
@@ -977,6 +1041,47 @@
     }
   ],
   "records": [
+    {
+      "fields": [
+        {
+          "name": "version",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "name",
+          "type": {
+            "type": "short_str"
+          }
+        },
+        {
+          "name": "mob_pace",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "mob_hp_pct",
+          "type": {
+            "type": "u16"
+          }
+        },
+        {
+          "name": "tint",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "notes",
+          "type": {
+            "type": "short_str"
+          }
+        }
+      ],
+      "name": "ContentPack"
+    },
     {
       "fields": [
         {

@@ -3,6 +3,16 @@
 // Do not edit: change the Rust definitions and regenerate.
 import { decodeGameEvent, decodePayload, decodeValue, encodePayload, encodeValue, onGameEvent, type DecodedGameEvent, type GameEventCodecs, type GameEventSource, type PayloadLayout, type WireType } from '@hops-ops/distributed/game';
 
+/** Record `ContentPack` (`#[derive(GameRecord)]`). */
+export interface ContentPack {
+	readonly version: string;
+	readonly name: string;
+	readonly mobPace: number;
+	readonly mobHpPct: number;
+	readonly tint: number;
+	readonly notes: string;
+}
+
 /** Record `MobTier` (`#[derive(GameRecord)]`). */
 export interface MobTier {
 	readonly tier: number;
@@ -288,6 +298,17 @@ const SHOT_LAYOUT: PayloadLayout = [
 	['z', { type: 'f32' }],
 ];
 
+/** Event `stale` (id 10). */
+export interface StaleEvent {
+	readonly gate: string;
+	readonly version: string;
+}
+
+const STALE_LAYOUT: PayloadLayout = [
+	['gate', { type: 'short_str' }],
+	['version', { type: 'short_str' }],
+];
+
 /** Message `loaded` (id 1). */
 export interface LoadedMessage {
 	readonly principal: string;
@@ -323,6 +344,7 @@ export const EVENT = {
 	world: 7,
 	bossDown: 8,
 	shot: 9,
+	stale: 10,
 } as const;
 
 /** Event payload types by name. */
@@ -335,6 +357,7 @@ export interface Events {
 	world: WorldEvent;
 	bossDown: BossDownEvent;
 	shot: ShotEvent;
+	stale: StaleEvent;
 }
 
 /** Codecs of every event. */
@@ -386,6 +409,12 @@ export const EVENTS: GameEventCodecs<Events> = {
 		name: 'shot',
 		encode: (value) => encodePayload(SHOT_LAYOUT, value),
 		decode: (payload) => decodePayload(SHOT_LAYOUT, payload) as unknown as ShotEvent
+	},
+	stale: {
+		id: 10,
+		name: 'stale',
+		encode: (value) => encodePayload(STALE_LAYOUT, value),
+		decode: (payload) => decodePayload(STALE_LAYOUT, payload) as unknown as StaleEvent
 	},
 };
 

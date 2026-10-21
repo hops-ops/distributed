@@ -12,6 +12,9 @@ import { BUTTON, isMob, isPlayer, mobFields, playerFields } from '../../src/gene
 import { freePort, startCelld } from './celld.mjs';
 import { sleep, startDemo } from './demo-server.mjs';
 
+/** The services' admin secret in the tests (live content rollouts). */
+export const ADMIN_SECRET = 'mobpit-test-admin-secret';
+
 export function tempDataDir() {
 	return mkdtempSync(join(tmpdir(), 'mobpit-js-'));
 }
@@ -26,7 +29,7 @@ export function tempDataDir() {
 export async function startPit(demo = 'mobpit', vars = {}) {
 	const port = await freePort();
 	const celld = await startCelld({ relayPort: port, vars: { ZONE_HIBERNATE_AFTER_MS: '1500', ...vars } });
-	const env = { ...celld.env, MOBPIT_DATA_DIR: tempDataDir() };
+	const env = { ...celld.env, MOBPIT_DATA_DIR: tempDataDir(), DG_DEMO_ADMIN_SECRET: ADMIN_SECRET };
 	let server;
 	try {
 		server = await startDemo(demo, { env, port });

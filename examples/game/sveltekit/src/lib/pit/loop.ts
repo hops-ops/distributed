@@ -96,7 +96,17 @@ export type PitLoopOptions = Readonly<{
 	firstPerson?: () => boolean;
 	/** Resolve arrows with lag compensation (default on). */
 	compensated?: () => boolean;
+	/** The tint (0xRRGGBB, 0: none) of the content pack this client runs. */
+	tint?: () => number;
 }>;
+
+/** `color` blended 60 % towards `tint` (0: unchanged). */
+function tinted(color: string, tint: number): string {
+	if (tint === 0) return color;
+	const c = Number.parseInt(color.slice(1), 16);
+	const mix = (shift: number) => Math.round(((c >> shift) & 255) * 0.4 + ((tint >> shift) & 255) * 0.6);
+	return `#${((mix(16) << 16) | (mix(8) << 8) | mix(0)).toString(16).padStart(6, '0')}`;
+}
 
 /** Entry distance of a ray (unit `dir`) into a vertical capsule on the floor. */
 function rayCapsule(origin: number[], dir: number[], x: number, y: number, radius: number, height: number): number | undefined {
@@ -426,7 +436,7 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				const m = mobFields(entity);
 				const look = TIER_RADIUS[m.tier];
 				if (m.tele > 0 && look !== undefined) circle(w.x, w.y, look.tele, 'rgba(255,80,80,0.12)', '#ff5050');
-				circle(w.x, w.y, look?.radius ?? 0.5, TIER_COLOR[m.tier] ?? '#9ad16b');
+				circle(w.x, w.y, look?.radius ?? 0.5, tinted(TIER_COLOR[m.tier] ?? '#9ad16b', options.tint?.() ?? 0));
 			} else if (isPlayer(entity)) {
 				if (entity.stale) continue;
 				const p = playerFields(entity);

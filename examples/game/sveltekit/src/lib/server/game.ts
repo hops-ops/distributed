@@ -36,6 +36,38 @@ export async function lastRoom(principal: string): Promise<string | undefined> {
 	}
 }
 
+/** The world whose content the rooms follow (`ZONE_CONTENT_ROLLOUT`). */
+export const CONTENT_WORLD = 'world';
+
+/** The world's content rollout cell (`content-rollout/world`) as celld reports it. */
+export type ContentState = { version: string; target: string; phase: string; notes: string; since_ms: number; hard: boolean };
+
+/**
+ * celld's internal path for a cell (`CELLD_URL`, `DISTRIBUTED_INTERNAL_SECRET`;
+ * server-only). Undefined when celld is not configured.
+ */
+export async function cellFetch(path: string, init: RequestInit = {}): Promise<Response | undefined> {
+	const base = env.CELLD_URL;
+	const secret = env.DISTRIBUTED_INTERNAL_SECRET;
+	if (!base || !secret) return undefined;
+	return fetch(`${base.replace(/\/$/, '')}${path}`, {
+		...init,
+		headers: { ...(init.headers as Record<string, string> | undefined), 'x-distributed-internal-secret': secret },
+		signal: AbortSignal.timeout(3000)
+	});
+}
+
+/** The world's live content (null before the first rollout or when celld is unreachable). */
+export async function liveContent(): Promise<ContentState | null> {
+	try {
+		const response = await cellFetch(`/content-rollout/${CONTENT_WORLD}`);
+		if (response === undefined || !response.ok) return null;
+		return ((await response.json()) as { state?: ContentState | null }).state ?? null;
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Room admission: principal from the Auth.js session, the room chosen here —
  * on a page load the room the player was last in (so a reload, a new tab

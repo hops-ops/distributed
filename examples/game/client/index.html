@@ -9,11 +9,10 @@
 	<body style="overflow: auto">
 		<main class="index">
 			<h1>distributed_game demos</h1>
-			<p>Each demo runs its own server: <code>examples/game/run.sh &lt;demo&gt;</code>. The page for the running demo works; the others need their server.</p>
+			<p>One game, Mob Pit, on celld: <code>examples/game/run.sh mobpit</code> (the leaderboard page runs with it).</p>
 			<ul>
-				<li><a href="/mobpit/">Mob Pit</a> — authoritative combat, non-blocking durable facts into per-player celld cells, slow storage, crash recovery.</li>
+				<li><a href="/mobpit/">Mob Pit</a> — a world of rooms on celld: authoritative melee and ranged combat with prediction and lag compensation, rooms you see into, hoods › boroughs › city with bosses, weather and world events, live content updates, durable facts into per-player cells.</li>
 				<li><a href="/leaderboard/">Leaderboard</a> — kills/XP sorted-set boards projected from the cells, pushed live, rebuilt from events (runs with Mob Pit).</li>
-				<li><a href="/freeze/">The Freeze</a> — world-version barrier across two server processes as a story beat: hard reload, safe-room gating of old clients, aborted rollout.</li>
 			</ul>
 		</main>
 	</body>
