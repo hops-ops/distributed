@@ -1857,15 +1857,17 @@ where
     }
     let result = reply_rx.await;
     if let Some((issuer, nonce)) = reserved.take() {
-        let op = if matches!(result, Ok(Ok(_))) {
-            TransferOp::Confirm
+        if matches!(result, Ok(Ok(_))) {
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                let _ = transfer_op(&inner, &issuer, TransferOp::Confirm, &nonce).await;
+            });
         } else {
-            TransferOp::Release
-        };
-        let inner = inner.clone();
-        tokio::spawn(async move {
-            let _ = transfer_op(&inner, &issuer, op, &nonce).await;
-        });
+            // Release before the client hears the refusal: it may present
+            // the same ticket to its source right away, and the issuer only
+            // accepts that return once the reservation is released.
+            let _ = transfer_op(&inner, &issuer, TransferOp::Release, &nonce).await;
+        }
     }
     let client = match result {
         Ok(Ok(joined)) => joined.client,
