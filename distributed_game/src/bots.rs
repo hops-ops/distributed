@@ -113,8 +113,13 @@ pub fn encode_i8_pair(dir: [f32; 2]) -> Vec<u8> {
 /// Bot run settings.
 #[derive(Clone)]
 pub struct BotConfig {
-    /// Server base URL, e.g. `ws://127.0.0.1:2567` (`/zones/{zone}` is appended).
+    /// Server base URL, e.g. `ws://127.0.0.1:2567` (`{path}/{zone}` is
+    /// appended).
     pub url: String,
+    /// Path the zone id is appended to: `/zones` on the `net` server,
+    /// whatever the worker routes to its zone objects on celld (e.g.
+    /// `/rooms`).
+    pub path: String,
     /// Zone to join.
     pub zone: String,
     /// Number of bots.
@@ -145,6 +150,7 @@ impl BotConfig {
     pub fn new(url: impl Into<String>, zone: impl Into<String>, ticket_key: TicketKey) -> Self {
         Self {
             url: url.into(),
+            path: "/zones".into(),
             zone: zone.into(),
             bots: 10,
             input_rate: 20.0,
@@ -364,7 +370,12 @@ async fn drive(
         name: None,
         extensions: Default::default(),
     });
-    let url = format!("{}/zones/{}", config.url.trim_end_matches('/'), config.zone);
+    let url = format!(
+        "{}/{}/{}",
+        config.url.trim_end_matches('/'),
+        config.path.trim_matches('/'),
+        config.zone
+    );
     let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
         .await
         .map_err(|e| format!("connect: {e}"))?;

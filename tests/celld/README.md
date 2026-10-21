@@ -211,3 +211,20 @@ from the full Queue/NATS/browser profile.
 Every non-health aggregate route requires `DISTRIBUTED_INTERNAL_SECRET`. The
 checked-in value is loopback test data only; production requires a separately
 provisioned secret plus the normal network policy.
+
+## Zones as celld objects
+
+`zone-worker/` hosts a small tally zone with `distributed_game`'s
+`celld-zone` feature (one Durable Object per zone, `celld_zone_object!`),
+its `Tally` cells and the `ZoneActivity` cell. `distributed_game`'s
+`celld_zone` test drives it over WebSockets: on `celld dev` (join, input,
+facts, dormant → hibernated, wake with state, single-use tickets, a
+doorway handoff) and on a three-node production-mode fleet on one RustFS
+bucket started with docker compose (a forwarded socket closes with 1012
+when the owner node is killed, the zone recovers on another node, and 200
+in-flight facts reach the cell exactly once):
+
+```sh
+(cd tests/celld/zone-worker && worker-build --release)
+CELLD_BIN=… CELLD_ESBUILD=… cargo test -p distributed_game --features celld,net --test celld_zone
+```

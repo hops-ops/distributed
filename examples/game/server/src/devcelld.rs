@@ -45,6 +45,8 @@ pub struct DevCelld {
     project: PathBuf,
     port: u16,
     secret: String,
+    ticket_secret: String,
+    vars: Vec<(String, String)>,
     relay_url: Option<String>,
     child: Option<Child>,
     generation: u32,
@@ -56,18 +58,33 @@ impl DevCelld {
     /// Queue consumer relays domain events (a demo server's
     /// `/internal/celld-queue/relay`); `None` keeps them queued.
     pub fn start(relay_url: Option<String>) -> Result<Self, String> {
+        Self::start_with(relay_url, &[])
+    }
+
+    /// [`start`](Self::start) with extra worker vars (e.g.
+    /// `ZONE_HIBERNATE_AFTER_MS` for the rooms).
+    pub fn start_with(relay_url: Option<String>, vars: &[(&str, &str)]) -> Result<Self, String> {
         let project = std::env::temp_dir().join(format!(
             "game-demo-celld-{}-{}",
             std::process::id(),
             crate::common::random_hex(8)
         ));
-        let mut celld = Self::in_project(&project, relay_url)?;
+        let mut celld = Self::in_project_with(&project, relay_url, vars)?;
         celld.keep = false;
         Ok(celld)
     }
 
     /// Start celld on `project` (created; existing state is reused).
     pub fn in_project(project: &Path, relay_url: Option<String>) -> Result<Self, String> {
+        Self::in_project_with(project, relay_url, &[])
+    }
+
+    /// [`in_project`](Self::in_project) with extra worker vars.
+    pub fn in_project_with(
+        project: &Path,
+        relay_url: Option<String>,
+        vars: &[(&str, &str)],
+    ) -> Result<Self, String> {
         let build = cells_dir().join("build");
         if !build.join("worker/shim.mjs").exists() {
             return Err(format!(
@@ -87,6 +104,11 @@ impl DevCelld {
             project: project.to_path_buf(),
             port: free_port(),
             secret: test_secret(),
+            ticket_secret: test_secret(),
+            vars: vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             relay_url,
             child: None,
             generation: 0,
@@ -111,6 +133,16 @@ impl DevCelld {
         &self.secret
     }
 
+    /// The secret the rooms verify tickets with (`GAME_TICKET_SECRET`).
+    pub fn ticket_secret(&self) -> &str {
+        &self.ticket_secret
+    }
+
+    /// `ws://127.0.0.1:{port}` (append `/rooms/{room}`).
+    pub fn ws_url(&self) -> String {
+        format!("ws://127.0.0.1:{}", self.port)
+    }
+
     /// Project directory (holds `.celld/dev` and the logs).
     pub fn project(&self) -> &Path {
         &self.project
@@ -124,7 +156,13 @@ impl DevCelld {
                  .celld-version); point {CELLD_BIN_ENV} at the celld binary"
             )
         })?;
-        let mut vars = format!("DISTRIBUTED_INTERNAL_SECRET={}\n", self.secret);
+        let mut vars = format!(
+            "DISTRIBUTED_INTERNAL_SECRET={}\nGAME_TICKET_SECRET={}\n",
+            self.secret, self.ticket_secret
+        );
+        for (key, value) in &self.vars {
+            vars.push_str(&format!("{key}={value}\n"));
+        }
         if let Some(relay) = &self.relay_url {
             vars.push_str(&format!("CELLD_QUEUE_RELAY_URL={relay}\n"));
         }

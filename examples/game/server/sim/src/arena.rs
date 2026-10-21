@@ -140,6 +140,13 @@ pub fn arena_step(state: &MoveState, input: &MoveInput, _context: &(), _dt: f32)
 
 /// Advance one command frame.
 pub fn step(s: MoveState, input: MoveInput) -> MoveState {
+    canonicalize(clamp_walls(advance(s, input)))
+}
+
+/// One command frame of stick, dash and pillars, without the walls and
+/// unsnapped: the part of [`step`] Mob Pit shares (its rooms have doorways
+/// in the walls, see `mobpit::pit_step`).
+pub fn advance(s: MoveState, input: MoveInput) -> MoveState {
     let mut s = s;
     // Stick direction, length clamped to 1.
     let mut dx = f32::from(input.mx) / 127.0;
@@ -213,7 +220,12 @@ pub fn step(s: MoveState, input: MoveInput) -> MoveState {
             }
         }
     }
+    s
+}
 
+/// The Arena's closed walls.
+fn clamp_walls(s: MoveState) -> MoveState {
+    let mut s = s;
     let lim = HALF - PLAYER_RADIUS;
     if s.x < -lim {
         s.x = -lim;
@@ -229,10 +241,11 @@ pub fn step(s: MoveState, input: MoveInput) -> MoveState {
         s.y = lim;
         s.vy = s.vy.min(0.0);
     }
-    canonicalize(s)
+    s
 }
 
-fn snap(ty: FieldType, v: f32) -> f32 {
+/// Snap `v` to the precision of wire type `ty`.
+pub fn snap(ty: FieldType, v: f32) -> f32 {
     match ty {
         FieldType::QuantF32 { min, max, bits } => FieldType::dequantize_linear(
             FieldType::quantize_linear(v, min, max, bits),

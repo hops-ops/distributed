@@ -1,20 +1,29 @@
 /**
- * Leaderboard page: observes the pit zone (no avatar), renders the pushed
- * top-10 snapshots, reads your rank and neighbours on every push, and
- * triggers a rebuild from the cells' event history.
+ * Leaderboard page: renders the services' top-10 snapshots (a projection of
+ * the Crawler cells, polled), reads your rank and neighbours on every
+ * change, triggers a rebuild from the cells' event history, and observes
+ * the entrance room (no avatar) for a live mini map.
  */
 import { ARENA_FLOOR } from '../generated/arena/constants.ts';
 import {
+	createMobpitClient,
 	isMob,
 	isPillar,
 	isPlayer,
 	mobFields,
 	pillarFields,
-	playerFields,
+	playerFields
+} from '../generated/mobpit/index.ts';
+import {
+	createBoardWatcher,
+	DEFAULT_ZONE,
+	MobPitApi,
+	roomUrl,
+	TIERS,
+	type BoardPosition,
 	type BoardRow,
 	type BoardSnapshot
-} from '../generated/mobpit/index.ts';
-import { createBoardWatcher, DEFAULT_ZONE, MobPitApi, TIERS, type BoardPosition } from '../mobpit/client.ts';
+} from '../mobpit/client.ts';
 import { DevApi } from '../shared/dev-api.ts';
 
 /** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
@@ -24,8 +33,13 @@ const params = new URLSearchParams(location.search);
 const zone = params.get('zone') ?? DEFAULT_ZONE;
 const api = new DevApi();
 const pitApi = new MobPitApi();
-const watcher = createBoardWatcher({ api });
-const { client } = watcher;
+const watcher = createBoardWatcher(pitApi);
+const { client } = createMobpitClient({
+	url: (room) => roomUrl(room),
+	ticket: api.ticketSource(),
+	pingIntervalMs: 1000,
+	prediction: false
+});
 
 const $ = (k: string) => document.querySelector(`[data-k="${k}"]`) as HTMLElement;
 const status = $('status');
@@ -74,7 +88,7 @@ async function render(board: BoardSnapshot): Promise<void> {
 	table($('xp'), board.xp, 'XP', me);
 	const bg = board.background;
 	status.textContent =
-		`push #${pushes} · version ${board.version} · store ${board.backend} · ${board.members} ranked` +
+		`update #${pushes} · version ${board.version} · store ${board.backend} · ${board.members} ranked` +
 		` · background updates: ${bg.applied} applied, ${bg.dropped} dropped, ${bg.failed} failed`;
 	status.classList.add('flash');
 	setTimeout(() => status.classList.remove('flash'), 120);

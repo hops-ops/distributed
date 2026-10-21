@@ -13,6 +13,9 @@
 //!   priority accumulation. Wire format: [`protocol`] / `PROTOCOL.md`.
 //! - Transport (`net` feature): axum WebSocket server hosting many zones
 //!   with HMAC-signed ticket admission ([`net`]).
+//! - celld (`celld-zone` feature, wasm32): each zone is a celld Durable
+//!   Object; celld places, forwards, hibernates and recovers it
+//!   ([`celld_zone`]).
 //!
 //! - Authoring derives (re-exported from `distributed_game_macros`):
 //!   `#[derive(Replicated)]` views generate a kind's schema and field
@@ -56,10 +59,12 @@ pub mod bots;
 pub mod cell;
 #[cfg(feature = "celld")]
 pub mod celld;
+#[cfg(feature = "celld-zone")]
+pub mod celld_zone;
 pub mod claims;
 pub mod clock;
 pub mod codec;
-#[cfg(feature = "command-host")]
+#[cfg(feature = "cell")]
 pub mod command_sink;
 pub mod entity;
 pub mod facts;
@@ -83,6 +88,11 @@ pub mod rng;
 pub mod schema;
 pub mod stamp;
 pub mod surface;
+/// Signed admission tickets (also `net::ticket`); usable without the axum
+/// server, e.g. by a celld zone host on wasm32.
+#[cfg(feature = "ticket")]
+#[path = "net/ticket.rs"]
+pub mod ticket;
 pub mod timers;
 pub mod timestep;
 pub mod world;

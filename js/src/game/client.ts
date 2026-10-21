@@ -78,6 +78,17 @@ export type GamePredictionOptions<TInput> = PredictorOptions<TInput> &
 		 * overrides it (e.g. from a game Event).
 		 */
 		controlledEntity?: ControlledEntityResolver;
+		/**
+		 * Continue the controlled entity's prediction through a handoff: its
+		 * predicted fields re-expressed in the target zone's frame (e.g. a
+		 * cell offset when positions are zone-local), or undefined to hold
+		 * it still as before. When given, inputs sampled while the handoff
+		 * is in flight are predicted (with the target's frame) and sent to
+		 * the target once it welcomes the player, and the switch to the
+		 * target's own state is eased instead of snapped: the handoff's
+		 * latency is hidden.
+		 */
+		handoffFrame?: (fields: EntityFields, from: string, to: string) => EntityFields | undefined;
 	}>;
 
 /** What the player sees when an input is sampled (lag compensation). */
@@ -179,6 +190,13 @@ export class GameClient<TInput = unknown> {
 	#handoffBridge: RenderedEntity | undefined;
 	/** The source zone's copy of the handed-off entity: never drawn again. */
 	#handedOff: Readonly<{ zoneId: string; id: number }> | undefined;
+	/**
+	 * Handoff in flight with `handoffFrame`: the controlled entity predicted
+	 * on in the target's frame, and the inputs not yet sent to the target.
+	 */
+	#carry:
+		| { zoneId: string; base: RenderedEntity; fields: EntityFields; unsent: { input: TInput; dtMs: number }[] }
+		| undefined;
 	#closed = false;
 	#contentVersion: string;
 	#predictionEnabled: boolean;
@@ -298,12 +316,27 @@ export class GameClient<TInput = unknown> {
 		const prediction = this.#options.prediction;
 		if (authority === undefined || prediction === undefined) return undefined;
 		const connection = authority.connection;
+		const tickRate = connection.welcome?.tickRate || 30;
+		const dt = dtMs ?? this.#options.inputDtMs ?? 1000 / tickRate;
+		const carry = this.#carry;
+		if (carry !== undefined) {
+			// Handoff in flight: keep predicting what is drawn.
+			carry.fields = this.#predictor!.step(carry.fields, input, dt);
+			if (!connection.canSendInput()) {
+				carry.unsent.push({ input, dtMs: dt });
+				return undefined;
+			}
+		}
+		return this.#send(authority, input, dt);
+	}
+
+	#send(authority: Zone, input: TInput, dtMs: number): number | undefined {
+		const connection = authority.connection;
 		if (!connection.canSendInput()) return undefined;
 		const context = this.inputContext(authority)!;
-		const seq = connection.sendInput(prediction.encodeInput(input, context), context.clientTick);
+		const seq = connection.sendInput(this.#options.prediction!.encodeInput(input, context), context.clientTick);
 		if (seq === undefined) return undefined;
-		const tickRate = connection.welcome?.tickRate || 30;
-		this.#predictor!.record(seq, input, dtMs ?? this.#options.inputDtMs ?? 1000 / tickRate);
+		this.#predictor!.record(seq, input, dtMs);
 		return seq;
 	}
 
@@ -361,7 +394,24 @@ export class GameClient<TInput = unknown> {
 			this.#predictionEnabled && predictor?.active === true && this.#authority !== undefined
 				? predictor.entityId
 				: undefined;
-		if (controlled !== undefined) this.#handoffBridge = undefined;
+		let carry = this.#carry;
+		if (controlled !== undefined) {
+			this.#handoffBridge = undefined;
+			if (carry !== undefined && carry.zoneId === this.#authority?.zoneId) {
+				// The target bound the entity: ease from what was drawn.
+				predictor!.easeFrom(carry.fields, now);
+				this.#carry = carry = undefined;
+			}
+		}
+		if (carry !== undefined) {
+			this.#handoffBridge = {
+				...carry.base,
+				key: `${carry.zoneId}:${carry.base.id}`,
+				zoneId: carry.zoneId,
+				fields: { ...carry.base.fields, ...carry.fields },
+				stale: false
+			};
+		}
 		const gone = this.#handedOff;
 		let goneSeen = false;
 		let mine: RenderedEntity | undefined;
@@ -513,7 +563,7 @@ export class GameClient<TInput = unknown> {
 			if (id !== undefined) {
 				const entity = zone.replica.get(id);
 				if (entity !== undefined && !this.#predictor.active) {
-					this.#predictor.bind(id, zone.replica.schema?.byId.get(entity.kind), entity.fields);
+					this.#predictor.bind(id, zone.replica.schema?.byId.get(entity.kind), entity.fields, delta.ackSeq);
 				}
 				const correction = this.#predictor.reconcile(
 					delta.ackSeq,
@@ -556,9 +606,13 @@ export class GameClient<TInput = unknown> {
 		const to = message.targetZone;
 		this.#emitter.emit('handoff', { from, to, message });
 		const last = this.#lastControlled;
+		this.#carry = undefined;
 		if (last !== undefined && last.zoneId === from) {
 			this.#handoffBridge = { ...last, stale: false };
 			this.#handedOff = { zoneId: from, id: last.id };
+			const predicted = this.#predictor?.predicted();
+			const fields = predicted === undefined ? undefined : this.#options.prediction?.handoffFrame?.(predicted, from, to);
+			if (fields !== undefined) this.#carry = { zoneId: to, base: last, fields, unsent: [] };
 		}
 		this.#controlledOverride = undefined;
 		this.#predictor?.bind(undefined);
@@ -591,6 +645,7 @@ export class GameClient<TInput = unknown> {
 			if (this.#closed || this.#authority !== target) return;
 			this.#emitter.emit('handoffFailed', { from, to, stage, reason });
 			this.#handoffBridge = undefined;
+			this.#carry = undefined;
 			connection.close({ leave: false });
 			// Keep the zone's replica rendering while the next attempt runs.
 			this.#retire(target, true);
@@ -609,6 +664,12 @@ export class GameClient<TInput = unknown> {
 			connection.on('welcome', () => {
 				if (done) return;
 				finish();
+				// Inputs predicted while the handoff was in flight go to the
+				// target (recorded, so the target's state replays them).
+				const carry = this.#carry;
+				if (carry !== undefined && carry.zoneId === zoneId) {
+					for (const { input, dtMs } of carry.unsent.splice(0)) this.#send(target, input, dtMs);
+				}
 				const off = connection.on('delta', () => {
 					off();
 					this.#emitter.emit('handoffComplete', { from, to: zoneId });

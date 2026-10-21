@@ -107,17 +107,59 @@ export class Predictor<TInput> {
 	}
 
 	/**
-	 * Bind (or rebind) the controlled entity. Clears pending inputs: they
-	 * belonged to the previous binding or session.
+	 * Bind (or rebind) the controlled entity. Switching from one entity to
+	 * another clears pending inputs (they belonged to the previous binding);
+	 * inputs recorded while no entity or this same entity was bound belong
+	 * to it and are replayed onto `authoritative` (those after `ackSeq`, the
+	 * last input `authoritative` includes, when known).
 	 */
-	bind(entityId: number | undefined, kind?: GameKindDef, authoritative?: EntityFields): void {
+	bind(entityId: number | undefined, kind?: GameKindDef, authoritative?: EntityFields, ackSeq?: number): void {
+		if (entityId === undefined || (this.#entityId !== undefined && this.#entityId !== entityId)) {
+			this.#pending = [];
+			this.#lastAck = 0;
+		}
+		if (ackSeq !== undefined && ackSeq > this.#lastAck) this.#lastAck = ackSeq;
+		this.#pending = this.#pending.filter((p) => p.seq > this.#lastAck);
 		this.#entityId = entityId;
 		this.#kind = entityId === undefined ? undefined : kind;
-		this.#pending = [];
 		this.#offsets.clear();
-		this.#lastAck = 0;
 		this.#authoritative = authoritative === undefined ? undefined : { ...authoritative };
-		this.#predicted = authoritative === undefined ? undefined : { ...authoritative };
+		let predicted: Record<string, FieldValue> | undefined = authoritative === undefined ? undefined : { ...authoritative };
+		if (predicted !== undefined) for (const p of this.#pending) predicted = this.#step(predicted, p.input, p.dtMs);
+		this.#predicted = predicted;
+	}
+
+	/**
+	 * One predicted step of `state` without recording it (e.g. continuing a
+	 * prediction through a handoff, before the target knows the entity).
+	 */
+	step(state: EntityFields, input: TInput, dtMs: number): EntityFields {
+		return this.#step({ ...state }, input, dtMs);
+	}
+
+	/**
+	 * Show `shown` now and ease into the prediction (each `ease` field by its
+	 * policy), e.g. what was drawn before a handoff rebound the entity.
+	 */
+	easeFrom(shown: EntityFields, now: number): void {
+		const predicted = this.#predicted;
+		const kind = this.#kind;
+		if (predicted === undefined || kind === undefined) return;
+		const epsilon = this.#options.epsilon ?? 1e-6;
+		for (const field of kind.fields) {
+			const policy = this.#policy(field.name);
+			const from = shown[field.name];
+			const to = predicted[field.name];
+			if (policy.mode !== 'ease' || typeof from !== 'number' || typeof to !== 'number') continue;
+			const angle = field.type === 'angle';
+			const value = angle ? -angleDelta(from, to) : from - to;
+			const duration = policy.durationMs ?? 100;
+			if (Math.abs(value) > epsilon && duration > 0) {
+				this.#offsets.set(field.name, { value, start: now, durationMs: duration, angle });
+			} else {
+				this.#offsets.delete(field.name);
+			}
+		}
 	}
 
 	/** New session (Welcome): sequence numbers restart, pending inputs are void. */

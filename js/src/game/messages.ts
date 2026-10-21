@@ -45,6 +45,13 @@ export const GameKickCode = Object.freeze({
 	RELOAD: 7
 });
 
+/**
+ * WebSocket close code of a zone that restarted or moved (a celld zone
+ * object woke up again, its node stopped or crashed): the reconnect token is
+ * void, the client rejoins at once with a fresh ticket.
+ */
+export const GAME_CLOSE_RESTARTED = 1012;
+
 /** Error codes. */
 export const GameErrorCode = Object.freeze({
 	BAD_MESSAGE: 1,

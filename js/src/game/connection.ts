@@ -10,6 +10,7 @@ import { ClockSync, type ClockSyncOptions } from './clock.js';
 import { Emitter } from './emitter.js';
 import {
 	encodeClientMessage,
+	GAME_CLOSE_RESTARTED,
 	GAME_PROTOCOL_VERSION,
 	GameClientMirror,
 	GameErrorCode,
@@ -584,6 +585,14 @@ export class GameConnection {
 				break;
 			case 'Error':
 				this.#onError(attempt, message);
+				if (!attempt.welcomed && this.#attempt === attempt) {
+					// A refused Hello ends the attempt: nothing else follows it.
+					// Do not wait for the server's close (a host may never send
+					// one, e.g. a restarted zone refusing a void token).
+					this.#attempt = undefined;
+					attempt.socket.close(1000, 'refused');
+					this.#onSocketClosed(attempt, 1008, message.message);
+				}
 				break;
 		}
 	}
@@ -642,6 +651,11 @@ export class GameConnection {
 		if (attempt.welcomed) {
 			this.#disconnectedAt = this.#scheduler.now();
 			this.#failedAttempts = 0;
+		}
+		if (code === GAME_CLOSE_RESTARTED) {
+			// The zone restarted or moved: its sessions are gone. Rejoin now
+			// with a fresh ticket instead of presenting a void token.
+			this.#reconnectToken = '';
 		}
 		if (attempt.redirect !== undefined) {
 			this.#redirects += 1;

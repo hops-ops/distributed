@@ -103,6 +103,7 @@ async fn stored_cells(state: &MapState, zones: &[String]) -> serde_json::Map<Str
                     ZoneStatus::Hibernated { bytes } => {
                         json!({ "state": "hibernated", "bytes": bytes })
                     }
+                    ZoneStatus::Dormant => json!({ "state": "dormant" }),
                     ZoneStatus::Cold => json!({ "state": "cold" }),
                 };
                 out.insert(zone, fact);

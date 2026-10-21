@@ -45,6 +45,7 @@ export {
 	type GameSchema
 } from './schema.js';
 export {
+	GAME_CLOSE_RESTARTED,
 	GAME_PROTOCOL_VERSION,
 	GameClientMirror,
 	GameErrorCode,

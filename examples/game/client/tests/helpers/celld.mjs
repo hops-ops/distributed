@@ -34,9 +34,13 @@ export function freePort() {
 
 /**
  * Start celld. `relayPort`: the demo server port its outbox Queue relays
- * domain events to (`/internal/celld-queue/relay`).
+ * domain events to (`/internal/celld-queue/relay`); `vars`: extra worker
+ * vars (e.g. `ZONE_HIBERNATE_AFTER_MS` for Mob Pit's rooms). The rooms'
+ * ticket secret (`GAME_TICKET_SECRET`) is generated here and returned as
+ * `ticketSecret` (and in `env` as `DISTRIBUTED_GAME_SECRET`, what
+ * `game-demos mobpit` signs room tickets with).
  */
-export async function startCelld({ relayPort } = {}) {
+export async function startCelld({ relayPort, vars: extra = {} } = {}) {
 	const bin = process.env.CELLD_BIN;
 	if (!bin) throw new Error('CELLD_BIN is not set: the demos\' cells run on celld (the version in .celld-version); point CELLD_BIN at the celld binary');
 	if (!existsSync(join(CELLS, 'build/worker/shim.mjs'))) {
@@ -46,42 +50,57 @@ export async function startCelld({ relayPort } = {}) {
 	cpSync(join(CELLS, 'build'), join(project, 'build'), { recursive: true });
 	cpSync(join(CELLS, 'wrangler.jsonc'), join(project, 'wrangler.jsonc'));
 	const secret = `test-only-${randomBytes(24).toString('hex')}`;
-	let vars = `DISTRIBUTED_INTERNAL_SECRET=${secret}\n`;
+	const ticketSecret = randomBytes(32).toString('hex');
+	let vars = `DISTRIBUTED_INTERNAL_SECRET=${secret}\nGAME_TICKET_SECRET=${ticketSecret}\n`;
 	if (relayPort) vars += `CELLD_QUEUE_RELAY_URL=http://127.0.0.1:${relayPort}${RELAY_PATH}\n`;
+	for (const [key, value] of Object.entries(extra)) vars += `${key}=${value}\n`;
 	writeFileSync(join(project, '.dev.vars'), vars);
 	const port = await freePort();
-	const child = spawn(bin, ['dev', project, '--host', '127.0.0.1', '--port', String(port), '--no-watch', '--logs'], {
-		env: { ...process.env, RUST_LOG: 'warn' },
-		stdio: ['ignore', 'pipe', 'pipe']
-	});
-	let output = '';
-	child.stdout.on('data', (chunk) => (output += chunk));
-	child.stderr.on('data', (chunk) => (output += chunk));
 	const url = `http://127.0.0.1:${port}`;
-	const deadline = Date.now() + 90_000;
-	for (;;) {
-		if (child.exitCode !== null) throw new Error(`celld dev exited with ${child.exitCode}:\n${output}`);
-		try {
-			if ((await fetch(`${url}/health`)).ok) break;
-		} catch {
-			// not listening yet
+	let child;
+	let output = '';
+	// Start (or start again: same project, port and state) and wait until healthy.
+	const up = async () => {
+		child = spawn(bin, ['dev', project, '--host', '127.0.0.1', '--port', String(port), '--no-watch', '--logs'], {
+			env: { ...process.env, RUST_LOG: 'warn' },
+			stdio: ['ignore', 'pipe', 'pipe']
+		});
+		const started = child;
+		started.stdout.on('data', (chunk) => (output += chunk));
+		started.stderr.on('data', (chunk) => (output += chunk));
+		const deadline = Date.now() + 90_000;
+		for (;;) {
+			if (started.exitCode !== null) throw new Error(`celld dev exited with ${started.exitCode}:\n${output}`);
+			try {
+				if ((await fetch(`${url}/health`)).ok) break;
+			} catch {
+				// not listening yet
+			}
+			if (Date.now() > deadline) throw new Error(`celld dev did not become ready:\n${output}`);
+			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
-		if (Date.now() > deadline) throw new Error(`celld dev did not become ready:\n${output}`);
-		await new Promise((resolve) => setTimeout(resolve, 100));
-	}
+	};
+	const stop = async () => {
+		if (child.exitCode !== null || child.signalCode !== null) return;
+		const exited = new Promise((resolve) => child.on('exit', resolve));
+		killTree(child.pid);
+		await exited;
+	};
+	await up();
 	return {
 		url,
 		secret,
+		ticketSecret,
 		project,
 		/** Env for `game-demos mobpit`. */
-		env: { CELLD_URL: url, DISTRIBUTED_INTERNAL_SECRET: secret },
+		env: { CELLD_URL: url, DISTRIBUTED_INTERNAL_SECRET: secret, DISTRIBUTED_GAME_SECRET: ticketSecret },
 		output: () => output,
-		async stop() {
-			if (child.exitCode !== null || child.signalCode !== null) return;
-			const exited = new Promise((resolve) => child.on('exit', resolve));
-			killTree(child.pid);
-			await exited;
-		}
+		/** Kill celld (SIGKILL, like a crash) and start it again on the same state and port. */
+		async restart() {
+			await stop();
+			await up();
+		},
+		stop
 	};
 }
 

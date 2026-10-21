@@ -8,11 +8,15 @@
 //! |---|---|---|
 //! | [`ZoneLease`](super::zone_lease::ZoneLease) | `zone.activated`, `zone.released`, `zone.lease_expired` | [`ZoneLeases`] (`zone_leases`) |
 //! | [`ZoneState`](super::zone_state::ZoneState) | `zone_state.saved`, `zone_state.deleted` | [`ZoneSnapshots`] (`zone_snapshots`) |
+//! | [`ZoneActivity`](super::zone_activity::ZoneActivity) (zones hosted as celld objects) | `zone.activity_changed` | [`ZoneActivities`] (`zone_activities`) |
 //!
 //! Each event carries its cell's post-transition state, so a row is an
-//! upsert of the body ([`ZONE_LEASES`], [`ZONE_SNAPSHOTS`]); the projector
-//! runtime orders and deduplicates per stream. [`ZoneStatus::of`] combines
-//! a zone's two rows. Mount [`projectors`] on a consumer service (any read
+//! upsert of the body ([`ZONE_LEASES`], [`ZONE_SNAPSHOTS`],
+//! [`ZONE_ACTIVITIES`]); the projector runtime orders and deduplicates per
+//! stream. [`ZoneStatus::of`] combines a zone's rows: a zone hosted as a
+//! celld object ([`crate::celld_zone`]) has only an activity row (active /
+//! dormant / hibernated); a zone on the native multi-host server has lease
+//! and snapshot rows. Mount [`projectors`] on a consumer service (any read
 //! model store: SQLite, Postgres) fed by the bus the cells' outbox reaches.
 //!
 //! The read model is eventually consistent: it is for views (world maps,
@@ -27,6 +31,9 @@ use distributed::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::zone_activity::{
+    ZoneActivityActivityChangedDomainEvent, ACTIVITY_ACTIVE, ACTIVITY_DORMANT, ACTIVITY_HIBERNATED,
+};
 use super::zone_lease::{
     ZoneLeaseActivatedDomainEvent, ZoneLeaseLeaseExpiredDomainEvent, ZoneLeaseReleasedDomainEvent,
     STATUS_ACTIVE,
@@ -44,6 +51,10 @@ pub const SNAPSHOTS_PROJECTOR: &str = "project_zone_snapshots";
 pub const LEASES_EPOCH: &str = "zone-leases-v1";
 /// Epoch of [`ZONE_SNAPSHOTS`].
 pub const SNAPSHOTS_EPOCH: &str = "zone-snapshots-v1";
+/// Projector of [`ZoneActivities`].
+pub const ACTIVITIES_PROJECTOR: &str = "project_zone_activities";
+/// Epoch of [`ZONE_ACTIVITIES`].
+pub const ACTIVITIES_EPOCH: &str = "zone-activities-v1";
 
 /// One `zone_leases` row: the last lease transition of a zone
 /// ([`ZoneLeaseStatus`](super::zone_lease::ZoneLeaseStatus); the type is
@@ -78,6 +89,39 @@ pub struct ZoneSnapshots {
     pub content_version: String,
     /// Snapshot size in bytes.
     pub bytes: i64,
+}
+
+/// One `zone_activities` row: what a zone hosted as a celld object last
+/// reported about itself
+/// ([`ZoneActivityStatus`](super::zone_activity::ZoneActivityStatus)).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ReadModel)]
+#[table("zone_activities")]
+pub struct ZoneActivities {
+    /// Zone id.
+    #[id("zone_id")]
+    pub zone_id: String,
+    /// `active`, `dormant` or `hibernated`.
+    pub status: String,
+    /// Object activation id.
+    pub activation: String,
+    /// The activation restored a snapshot.
+    pub restored: bool,
+    /// Players when reported.
+    pub players: i64,
+    /// celld node of the activation (debug; empty when unknown).
+    pub node: String,
+    /// V8 isolate of the activation (debug).
+    pub isolate: String,
+    /// Activations seen.
+    pub activations: i64,
+    /// When the zone reported it (Unix ms).
+    pub changed_at_ms: i64,
+}
+
+/// Upsert a [`ZoneActivities`] row from a `zone.activity_changed` body.
+#[allow(non_snake_case)]
+pub fn SaveZoneActivity() -> Mutation<()> {
+    mutation_file!("src/world/mutations/save_zone_activity.mutation.graphql")
 }
 
 /// Upsert a [`ZoneLeases`] from a lease event's state body.
@@ -124,11 +168,52 @@ distributed::projection! {
     };
 }
 
-/// Physical read-model catalog (`zone_leases`, `zone_snapshots`).
+distributed::projection! {
+    pub const ZONE_ACTIVITIES: ProjectionDescriptor<EventualOnly> = {
+        name: "project_zone_activities",
+        version: 1,
+        epoch: "zone-activities-v1",
+        model: ZoneActivities,
+        on {
+            events: [ZoneActivityActivityChangedDomainEvent],
+            mutation: SaveZoneActivity,
+            input: { activity: body },
+        },
+    };
+}
+
+/// Physical read-model catalog (`zone_leases`, `zone_snapshots`,
+/// `zone_activities`).
 pub fn read_model_catalog() -> ReadModelCatalog {
     ReadModelCatalog::new(APPLICATION)
         .table_schema(ZoneLeases::schema().clone())
         .table_schema(ZoneSnapshots::schema().clone())
+        .table_schema(ZoneActivities::schema().clone())
+}
+
+/// The modeled projector of [`ZoneActivities`] alone (a consumer that
+/// shows celld-hosted zones, e.g. a minimap service), applying
+/// [`ZONE_ACTIVITIES`]. Mount it on a consumer service named
+/// [`APPLICATION`] (or any name of the caller's, with its own cursor).
+pub fn activity_projector() -> SurfaceProjector {
+    activity_projector_for(APPLICATION)
+}
+
+/// [`activity_projector`] owned by `application` (when the consumer service
+/// is not named [`APPLICATION`]).
+pub fn activity_projector_for(application: &str) -> SurfaceProjector {
+    LocalProjectionMountsBuilder::new(application, "ordered-domain-events")
+        .expect("projection source")
+        .eventual_model::<ZoneActivities, _>(
+            ACTIVITIES_PROJECTOR,
+            ZONE_ACTIVITIES,
+            ACTIVITIES_EPOCH,
+        )
+        .expect("zone activities mount")
+        .build()
+        .expect("projection catalog")
+        .projector(ACTIVITIES_PROJECTOR)
+        .expect("zone activities projector")
 }
 
 /// The modeled projector mounts `(leases, snapshots)`: mount both on one
@@ -157,11 +242,16 @@ pub fn projectors() -> (SurfaceProjector, SurfaceProjector) {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum ZoneStatus {
-    /// A holder has the lease.
+    /// Running: a holder has the lease (native multi-host server; `holder`
+    /// is the host) or a celld object reported `active` (`holder` is its
+    /// node when known, a debug detail).
     Active {
-        /// The lease holder.
+        /// The lease holder, or the celld node (may be empty).
         holder: String,
     },
+    /// A celld-hosted zone that emptied: still in memory, snapshot written,
+    /// about to hibernate.
+    Dormant,
     /// No holder; a hibernation snapshot is stored.
     Hibernated {
         /// Snapshot size in bytes.
@@ -172,6 +262,18 @@ pub enum ZoneStatus {
 }
 
 impl ZoneStatus {
+    /// The status of a celld-hosted zone from its activity row.
+    pub fn of_activity(activity: Option<&ZoneActivities>) -> Self {
+        match activity.map(|row| row.status.as_str()) {
+            Some(ACTIVITY_ACTIVE) => Self::Active {
+                holder: activity.map(|row| row.node.clone()).unwrap_or_default(),
+            },
+            Some(ACTIVITY_DORMANT) => Self::Dormant,
+            Some(ACTIVITY_HIBERNATED) => Self::Hibernated { bytes: 0 },
+            _ => Self::Cold,
+        }
+    }
+
     /// Combine a zone's rows (either may be missing).
     pub fn of(lease: Option<&ZoneLeases>, snapshot: Option<&ZoneSnapshots>) -> Self {
         if let Some(lease) = lease.filter(|lease| lease.status == STATUS_ACTIVE) {
@@ -224,7 +326,28 @@ mod tests {
         assert_eq!(ZoneStatus::of(None, None), ZoneStatus::Cold);
         // The projections compile against the cells' outward events.
         let (leases, snapshots) = projectors();
-        drop((leases, snapshots));
-        assert_eq!(read_model_catalog().tables.len(), 2);
+        drop((leases, snapshots, activity_projector()));
+        assert_eq!(read_model_catalog().tables.len(), 3);
+        let activity = |status: &str| ZoneActivities {
+            zone_id: "z".into(),
+            status: status.into(),
+            node: "node-a".into(),
+            ..ZoneActivities::default()
+        };
+        assert_eq!(
+            ZoneStatus::of_activity(Some(&activity("active"))),
+            ZoneStatus::Active {
+                holder: "node-a".into()
+            }
+        );
+        assert_eq!(
+            ZoneStatus::of_activity(Some(&activity("dormant"))),
+            ZoneStatus::Dormant
+        );
+        assert_eq!(
+            ZoneStatus::of_activity(Some(&activity("hibernated"))),
+            ZoneStatus::Hibernated { bytes: 0 }
+        );
+        assert_eq!(ZoneStatus::of_activity(None), ZoneStatus::Cold);
     }
 }

@@ -26,7 +26,8 @@ the browser, but the client SDK has no rendering dependency.
 - [Build a zone](#build-a-zone)
 - [Guides](#guides): game loop · input · what clients see · the client SDK ·
   generated clients · SvelteKit apps · client prediction (Rust → WebAssembly) · shared
-  logic and data (no TypeScript twins) · saving progress · scaling out ·
+  logic and data (no TypeScript twins) · saving progress · scaling out
+  (zones as celld objects, the native multi-host server) ·
   live updates · lag compensation · testing and operations · security
 - [Design decisions](#design-decisions)
 - [Status and limits](#status-and-limits)
@@ -100,7 +101,7 @@ each built to show one part of the engine:
 | Demo | Run | Shows |
 |---|---|---|
 | Arena | `examples/game/run.sh arena` | ticks, deltas, prediction on/off, interest radius vs. global entities, simulated latency |
-| Mob Pit | `run.sh mobpit` | combat whose rewards are saved without stalling; "slow storage"; `kill -9` crash recovery |
+| Mob Pit | `run.sh mobpit` (`--fleet` for several celld nodes) | rooms as celld objects joined by doorways, sleeping when empty and restored on return; combat whose rewards are saved exactly once without stalling |
 | Leaderboard | `run.sh leaderboard` | a live ranking fed from saved kills, rebuilt from history |
 | Shooting Gallery | `run.sh gallery` | lag compensation on/off under latency |
 | The Freeze | `run.sh freeze` | pausing every zone on two servers, updating content, resuming; safe-room reloads |
@@ -291,7 +292,7 @@ A zone is in one of three **tiers**:
   Idle forever (a city clock, say) or from `has_pending_work` to stay Hot.
 - **Dormant**: idle for `dormant_after` (30 s); no ticks. With
   hibernation on, a Dormant zone is saved and unloaded (see
-  [Scaling out](#scaling-out-many-zones-many-servers)).
+  [Scaling out](#scaling-out-zones-as-celld-objects)).
 
 `on_tier_changed` tells you about transitions. Timers
 (`ctx.set_timeout(after, value)`, `ctx.set_interval(every, value)`,
@@ -758,7 +759,9 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
 - Keys must be unique across restarts; `ctx.fact_key` includes the
   activation's boot epoch for you (see [Durable facts](#durable-facts)).
 - If the process crashes, each in-flight fact is either fully saved or
-  not saved at all. Mob Pit shows this with `kill -9`.
+  not saved at all. A zone hosted on celld (`celld_zone`) also keeps its
+  emitted facts in an outbox in object storage, so they are resent after
+  a crash: exactly once (Mob Pit's rooms).
 - **Player lifecycle facts.** With `HostConfig::lifecycle_facts = true`
   the host itself emits `lifecycle::PlayerJoined` (ticket, rejoin or
   handoff), `ConnectionLost` (grace started; dropped or told to reload),
@@ -786,7 +789,66 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
   B" sorts after "left A" even when it commits first or the two hosts'
   clocks disagree.
 
-### Scaling out: many zones, many servers
+### Scaling out: zones as celld objects
+
+On celld every zone is a Durable Object (feature `celld-zone`,
+[`celld_zone`](src/celld_zone/mod.rs)): one object per zone id, so a room
+*is* a cell. Game code implements `CelldZone` for its `Zone` and declares
+the class; nothing in the game or its API names a server.
+
+```rust,ignore
+impl CelldZone for MobPit {
+    fn object_config(zone: &str, env: &ObjectEnv) -> Result<PitConfig, String> { /* … */ }
+    fn fact_routes(sink: ObjectFactSink) -> ObjectFactSink {
+        sink.route(FactRoute::by_principal::<RecordKillInput>("crawler"))
+    }
+}
+distributed_game::celld_zone_object!(PitRoom, MobPit);
+
+// worker entry: /rooms/{zone} → the zone's object (WebSocket or …/info)
+if let Some(response) = forward_to_zone(req, &env, "PIT_ROOM", "/rooms/").await? { … }
+```
+
+**What celld handles:** where a zone runs (first touch; overflow to the
+least-loaded node with `CELLD_MAX_RESIDENT_CELLS`), forwarding a WebSocket
+from any node to the owner, one live instance per zone (fenced by its own
+epochs), evicting idle objects, moving idle ones to balance load, draining
+a stopping node and recovering a crashed node's objects elsewhere.
+
+**What the framework handles:** the WebSocket join (signed ticket, transfer
+ticket of a doorway handoff — single use across activations — or reconnect
+token), a self-correcting tick loop that runs only while someone is
+connected, the zone's snapshot in object storage (every
+`ZONE_PERSIST_MS` while occupied, and when it empties), dormancy and
+hibernation (`ZONE_HIBERNATE_AFTER_MS` later, by object alarm, so it also
+happens after an eviction), restore on the next join, facts to the cells
+of the same worker object to object (`CelldObjectHost` under the usual
+`CommandFactSink` routes; a durable outbox in the object's storage makes
+them exactly once across crashes), and the zone's lifecycle reports
+(`active` / `dormant` / `hibernated`) into its
+[`zone_activity`](src/world/zone_activity.rs) cell, which the
+`zone_status` read model projects for minimaps.
+
+**Limits.** A live zone never moves (only idle objects are rebalanced), so
+load spreads by first touch and node caps. Objects of one class share V8
+isolates: a slow zone delays its neighbours. A node crash takes about the
+node lease TTL (`CELLD_TTL_MS`, 10 s) to recover and loses at most the
+snapshot interval of zone state; facts survive in the outbox. A socket
+that outlives its activation closes with 1012 and the SDK rejoins with a
+fresh ticket. celld does not tell code which node it runs on: the node
+shown in debug views comes from an opt-in operator lookup
+(`CELLD_ZONE_NODES`), never used for routing.
+
+Measured on celld 0.6.2 (gr-p42 spike, a loaded 18-core laptop): about 150
+one-player rooms or 4–5 fifty-player rooms per core at 30 Hz; forwarding
+through another node adds under a millisecond; a hibernated room wakes in
+35–130 ms (p50).
+
+### Scaling out: the native multi-host server
+
+The `net` server can also spread zones over several processes itself
+(Endless Grid and Boss Ripple use it): placement, ownership and
+hibernation are then the framework's job.
 
 - **Placement.** A `ZoneDirectory` (`HashRing`) maps each zone id to a
   host. A client that connects to the wrong host is told where to go
@@ -942,7 +1004,10 @@ trait and its ABI (`run_abi`, `call_bytes`).
 | *(default)* | Zone/host runtime, facts queue, protocol, schema, replication, authoring derives, game surface, predicted steps (compiles to `wasm32-unknown-unknown`, where `#[predict]` exports its steps) | `serde`, `serde_json`, `distributed_game_macros` |
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
 | `cell` | `cell::CellFactSink` → in-process `AggregateCell::dispatch_idempotent` (native, unit tests); `cell::fact_session_from_headers` / `session_stamp` for cells (also wasm32); `stamp_event_record`; the `world::zone_lease` and `world::zone_state` cell aggregates | `distributed`, `sha2`, `base64` |
-| `command-host` | `command_sink::CommandFactSink<H: CommandHost>`: facts → commands through any command host, routed by command (`FactRoute`) | `cell` + `distributed/graphql` |
+| `cell` (also) | `command_sink::CommandFactSink<H: FactHost>`: facts → commands through any fact host, routed by command (`FactRoute`); `world::zone_activity` | |
+| `command-host` | `FactHost` for `CelldCommandHost` / `LocalCommandHost` (`CelldFactSink`) | `cell` + `distributed/graphql` |
+| `celld-zone` | `celld_zone`: any `Zone` as a celld Durable Object (`ZoneObject`, `celld_zone_object!`, `forward_to_zone`), facts object to object (`CelldObjectHost`), `serve_cell` / `ZoneActivityCell` for the worker's cells (wasm32) | `cell`, `ticket`, `workers-rs` + `js-sys`, `wasm-bindgen(-futures)` |
+| `ticket` | `ticket`: HS256 admission and transfer tickets without the axum server | `hmac`, `sha2`, `base64` |
 | `celld` | `celld::CelldFactSink` (the command sink over a remote-only `CelldCommandHost`): facts → celld cells over the internal HTTP path; `celld::CellZoneOwnership`: zone leases in celld `ZoneLease` cells; `celld::CellZoneStateStore`: hibernation snapshots in celld `ZoneState` cells | `command-host` + `reqwest`, `uuid` |
 | `workers-rs` | `world::zone_state::celld_worker`: the `zone-state/{zone}` route of a celld worker (cell + R2 bucket binding for large snapshots) | `cell` + `worker` |
 | `metrics` | `metrics::GameMetrics` per-zone Prometheus text | – |

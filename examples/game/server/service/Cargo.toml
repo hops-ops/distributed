@@ -1,9 +1,10 @@
-# Mob Pit's business-side read model: a Distributed service that projects
-# the Crawler cells' published `crawler.mob_killed` domain events (celld
-# drains each cell outbox to a Queue; its consumer relays them through the
-# zone server onto a SQLite bus) into a `player_stats` SQL table and
-# serves it over GraphQL with `@live`. Read-only: it has no commands, so
-# nothing here can credit XP.
+# Mob Pit's business-side read models: a Distributed service that projects
+# the Crawler cells' published `crawler.mob_killed` domain events and the
+# rooms' `zone.activity_changed` events (celld drains each cell outbox to a
+# Queue; its consumer relays them through the services onto a SQLite bus)
+# into `player_stats` and `zone_activities` SQL tables and serves them over
+# GraphQL with `@live`. Read-only: it has no commands, so nothing here can
+# credit XP.
 [package]
 name = "mobpit_service"
 version = "0.1.0"
@@ -23,6 +24,8 @@ mobpit_crawler = { path = "../crawler" }
 # `redis`: the Redis leaderboards the zone server writes, served as GraphQL
 # board roots (`xpLeaderboard`, `killsMyRank`, … with `@live`).
 distributed = { path = "../../../..", features = ["sqlite", "http", "graphql", "redis"] }
+# The rooms' zone status read model (`zone_activities`, the minimap).
+distributed_game = { path = "../../../../distributed_game", features = ["cell"] }
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,9 +33,8 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
 
 [dev-dependencies]
-# The zone server's world: real Crawler cells + the fact sink + the bus drain.
+# The services' world: real Crawler cells + the relay + the bus drain.
 game_demos = { path = ".." }
-distributed_game = { path = "../../../../distributed_game", features = ["cell"] }
 async-graphql = "7"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 

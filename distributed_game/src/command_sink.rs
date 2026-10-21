@@ -1,26 +1,27 @@
-//! [`CommandFactSink`]: a zone server's facts dispatched as commands through
-//! any [`CommandHost`] — the same durable aggregates whether they run in
-//! celld cells ([`CelldCommandHost`], `POST {celld}/{kind}/{shard}/{command}`
-//! over the internal path) or in an ordinary service over any repository
-//! ([`LocalCommandHost`]: in-memory, SQLite, Postgres).
+//! [`CommandFactSink`]: a zone's facts dispatched as commands through any
+//! [`FactHost`] — the same durable aggregates whether they are reached over
+//! celld's internal HTTP path ([`CelldCommandHost`], feature `command-host`,
+//! `POST {celld}/{kind}/{shard}/{command}`), object-to-object from a zone
+//! running as a celld Durable Object
+//! ([`CelldObjectHost`](crate::celld_zone::CelldObjectHost), feature
+//! `celld-zone`, wasm32), or in an ordinary service over any repository
+//! ([`LocalCommandHost`], feature `command-host`).
 //!
-//! One sink per zone server routes every fact by its command
+//! One sink per zone (host) routes every fact by its command
 //! ([`FactCommand::COMMAND`](crate::FactCommand::COMMAND)) to a registered
 //! [`FactRoute`]: a cell kind and a shard function of the fact's input and
 //! trusted session (principal + [`FactStamp`](crate::FactStamp)). A host
-//! that addresses cells uses both ([`FactRouting`]); a service routes by
-//! command and its handler picks the stream from the same session or input.
-//! Player lifecycle facts (`zone.*`, [`crate::lifecycle`]) route to the
-//! presence aggregate of the player's account ([`CommandFactSink::lifecycle_route`]).
+//! that addresses cells uses both; a service routes by command and its
+//! handler picks the stream from the same session or input. Player
+//! lifecycle facts (`zone.*`, [`crate::lifecycle`]) route to the presence
+//! aggregate of the player's account ([`CommandFactSink::lifecycle_route`]).
 //!
 //! - **Exactly one commit per key.** The command id is
 //!   [`command_id_for`]`(service_id, fact key)`, so a retry after a timeout
 //!   replays through the aggregate's command ledger (`replayed` receipt).
 //! - **Trusted identity.** The principal (bound by the zone host from the
-//!   verified ticket) is the session's `x-user-id` and the verified
-//!   principal ([`VerifiedPrincipal::from_trusted_transport`]); the stamp
-//!   travels as `x-game-*` session variables (forwarded to cells as trusted
-//!   metadata, [`CelldCommandHost::forward_session_prefix`]).
+//!   verified ticket) is the session's `x-user-id`; the stamp travels as
+//!   `x-game-*` session variables (forwarded to cells as trusted metadata).
 //! - **No local durable fallback.** A host that is slow or unreachable, a
 //!   5xx, or a command still in progress is [`FactError::Retryable`]: the fact
 //!   stays in the zone's queue (use
@@ -28,17 +29,24 @@
 //!   unrouted or rejected command is [`FactError::Permanent`].
 
 use std::sync::Arc;
+#[cfg(feature = "command-host")]
 use std::time::Duration;
 
+#[cfg(feature = "command-host")]
 use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
+#[cfg(feature = "command-host")]
 use distributed::command_dispatch::{CommandHost, LocalCommandHost};
+#[cfg(feature = "command-host")]
 use distributed::graphql::identity::VerifiedPrincipal;
-use distributed::microsvc::{CausalDispatchError, Session};
+#[cfg(feature = "command-host")]
+use distributed::microsvc::CausalDispatchError;
+use distributed::microsvc::Session;
 use serde_json::Value;
 
 use crate::cell::{command_id_for, session_stamp, trusted_session};
 use crate::facts::{BoxFuture, Fact, FactCommand, FactError, FactReceipt, FactSink};
 use crate::lifecycle::LIFECYCLE_COMMANDS;
+#[cfg(feature = "command-host")]
 use crate::stamp::SESSION_PREFIX;
 
 type ShardFn = Arc<dyn Fn(&Value, &Session) -> Option<String> + Send + Sync>;
@@ -109,26 +117,41 @@ impl FactRoute {
     }
 }
 
-/// A [`CommandHost`] that learns the fact routes it needs.
-pub trait FactRouting {
-    /// Register `route` (a host that addresses aggregates by kind and shard
+/// One routed fact, ready for a [`FactHost`].
+#[derive(Debug, Clone)]
+pub struct FactCall<'a> {
+    /// Durable command name.
+    pub command: &'a str,
+    /// Aggregate kind of the route.
+    pub kind: &'a str,
+    /// Validated shard (non-empty, printable ASCII, ≤ 256 bytes).
+    pub shard: String,
+    /// Deterministic command id ([`command_id_for`]).
+    pub command_id: String,
+    /// Command input.
+    pub input: &'a Value,
+    /// Verified principal of the fact (or the sink's system principal).
+    pub principal: String,
+    /// Trusted session: `x-user-id` + the `x-game-*` stamp.
+    pub session: Session,
+}
+
+/// What a [`CommandFactSink`] dispatches through: anything that runs one
+/// durable command idempotently by command id. Implemented for
+/// [`CelldCommandHost`] and [`LocalCommandHost`] (feature `command-host`)
+/// and for the celld object host (feature `celld-zone`).
+pub trait FactHost: Send + Sync + 'static {
+    /// Learn `route` (a host that addresses aggregates by kind and shard
     /// records it; one that routes by command ignores it).
-    fn register_fact_route(&mut self, route: &FactRoute);
-}
-
-/// A service routes by command: its handler selects the stream.
-impl FactRouting for LocalCommandHost {
     fn register_fact_route(&mut self, _route: &FactRoute) {}
-}
 
-/// celld addresses cells: `{kind}/{shard}/{command}`.
-impl FactRouting for CelldCommandHost {
-    fn register_fact_route(&mut self, route: &FactRoute) {
-        let shard = route.shard.clone();
-        self.add_cell_route(route.command(), route.kind(), move |input, session| {
-            shard(input, session)
-        });
-    }
+    /// Run `call` once per command id. Classify failures: unreachable,
+    /// 5xx, in progress → [`FactError::Retryable`]; anything else →
+    /// [`FactError::Permanent`].
+    fn dispatch_fact<'a>(
+        &'a self,
+        call: FactCall<'a>,
+    ) -> BoxFuture<'a, Result<FactReceipt, FactError>>;
 }
 
 /// See the module docs.
@@ -150,7 +173,7 @@ impl<H> Clone for CommandFactSink<H> {
     }
 }
 
-impl<H: CommandHost + FactRouting> CommandFactSink<H> {
+impl<H: FactHost> CommandFactSink<H> {
     /// A sink dispatching through `host` under command-ledger `service_id`;
     /// zone facts without a player use `system_principal`.
     pub fn new(
@@ -202,6 +225,11 @@ impl<H> CommandFactSink<H> {
         &self.host
     }
 
+    /// The command-ledger service id.
+    pub fn service_id(&self) -> &str {
+        &self.service_id
+    }
+
     /// The route a fact would take, if any.
     pub fn route_for(&self, command: &str) -> Option<&FactRoute> {
         self.routes.iter().find(|route| route.command == command)
@@ -209,6 +237,15 @@ impl<H> CommandFactSink<H> {
 
     /// `(principal, trusted session, command id)` of a routed fact.
     pub fn prepare(&self, fact: &Fact) -> Result<(String, Session, String), FactError> {
+        let (_, _, principal, session, command_id) = self.resolve(fact)?;
+        Ok((principal, session, command_id))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn resolve(
+        &self,
+        fact: &Fact,
+    ) -> Result<(&FactRoute, String, String, Session, String), FactError> {
         let route = self.route_for(fact.command()).ok_or_else(|| {
             FactError::Permanent(format!("no route for fact command `{}`", fact.command()))
         })?;
@@ -217,7 +254,7 @@ impl<H> CommandFactSink<H> {
             .unwrap_or(&self.system_principal)
             .to_string();
         let session = trusted_session(&principal, fact);
-        route
+        let shard = route
             .shard(fact.input(), &session)
             .filter(|shard| {
                 !shard.is_empty()
@@ -232,6 +269,8 @@ impl<H> CommandFactSink<H> {
                 ))
             })?;
         Ok((
+            route,
+            shard,
             principal,
             session,
             command_id_for(&self.service_id, fact.key()),
@@ -239,7 +278,27 @@ impl<H> CommandFactSink<H> {
     }
 }
 
+impl<H: FactHost> FactSink for CommandFactSink<H> {
+    fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+        Box::pin(async move {
+            let (route, shard, principal, session, command_id) = self.resolve(fact)?;
+            self.host
+                .dispatch_fact(FactCall {
+                    command: fact.command(),
+                    kind: route.kind(),
+                    shard,
+                    command_id,
+                    input: fact.input(),
+                    principal,
+                    session,
+                })
+                .await
+        })
+    }
+}
+
 /// celld slow, down or still running the command: keep the fact queued.
+#[cfg(feature = "command-host")]
 fn classify(error: CausalDispatchError) -> FactError {
     let detail = format!("{}: {error:?}", error.code());
     match &error {
@@ -258,36 +317,69 @@ fn classify(error: CausalDispatchError) -> FactError {
     }
 }
 
-impl<H: CommandHost + 'static> FactSink for CommandFactSink<H> {
-    fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
-        Box::pin(async move {
-            let (principal, session, command_id) = self.prepare(fact)?;
-            let result = self
-                .host
-                .invoke(
-                    fact.command(),
-                    &command_id,
-                    fact.input().clone(),
-                    session,
-                    VerifiedPrincipal::from_trusted_transport(&principal),
-                    None,
-                )
-                .await
-                .map_err(classify)?;
-            Ok(FactReceipt {
-                payload: result.payload().clone(),
-                replayed: result.replayed(),
-            })
+/// Any [`CommandHost`]: `invoke` with the fact's trusted session.
+#[cfg(feature = "command-host")]
+fn invoke_command_host<'a, H: CommandHost>(
+    host: &'a H,
+    call: FactCall<'a>,
+) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+    Box::pin(async move {
+        let result = host
+            .invoke(
+                call.command,
+                &call.command_id,
+                call.input.clone(),
+                call.session,
+                VerifiedPrincipal::from_trusted_transport(&call.principal),
+                None,
+            )
+            .await
+            .map_err(classify)?;
+        Ok(FactReceipt {
+            payload: result.payload().clone(),
+            replayed: result.replayed(),
         })
+    })
+}
+
+/// A service routes by command: its handler selects the stream.
+#[cfg(feature = "command-host")]
+impl FactHost for LocalCommandHost {
+    fn dispatch_fact<'a>(
+        &'a self,
+        call: FactCall<'a>,
+    ) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+        invoke_command_host(self, call)
+    }
+}
+
+/// celld addresses cells: `{kind}/{shard}/{command}`.
+#[cfg(feature = "command-host")]
+impl FactHost for CelldCommandHost {
+    fn register_fact_route(&mut self, route: &FactRoute) {
+        let shard = route.shard.clone();
+        self.add_cell_route(route.command(), route.kind(), move |input, session| {
+            shard(input, session)
+        });
+    }
+
+    fn dispatch_fact<'a>(
+        &'a self,
+        call: FactCall<'a>,
+    ) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+        invoke_command_host(self, call)
     }
 }
 
 /// Default per-request timeout of [`CelldFactSink`].
+#[cfg(feature = "command-host")]
 pub const DEFAULT_CELLD_FACT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Facts into celld cells over the internal path.
+#[cfg(feature = "command-host")]
 pub type CelldFactSink = CommandFactSink<CelldCommandHost>;
 
+#[cfg(feature = "command-host")]
 impl CommandFactSink<CelldCommandHost> {
     /// A sink for the cells at `celld_url` under command-ledger
     /// `service_id`: a remote-only [`CelldCommandHost`] forwarding the fact
@@ -324,7 +416,7 @@ impl CommandFactSink<CelldCommandHost> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "command-host"))]
 mod tests {
     use super::*;
     use crate::stamp::FactStamp;

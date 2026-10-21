@@ -206,6 +206,24 @@ pub struct ArenaConfig {
     pub guests: Guests,
 }
 
+impl Arena {
+    /// Tell `player`'s client session its entity and set its view.
+    fn greet(&self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        let Some(p) = self.players.get(&player) else {
+            return;
+        };
+        ctx.set_view(player, View::new(p.state.x, p.state.y, VIEW_RADIUS));
+        ctx.send(
+            player,
+            &ArenaEvent::Hello {
+                entity: p.entity,
+                view_radius: VIEW_RADIUS,
+                half: movement::HALF,
+            },
+        );
+    }
+}
+
 /// The Arena zone.
 pub struct Arena {
     guests: Guests,
@@ -294,15 +312,17 @@ impl Zone for Arena {
                 },
             },
         );
-        ctx.set_view(player, View::new(x, y, VIEW_RADIUS));
-        ctx.send(
-            player,
-            &ArenaEvent::Hello {
-                entity,
-                view_radius: VIEW_RADIUS,
-                half: movement::HALF,
-            },
-        );
+        self.greet(ctx, player);
+    }
+
+    /// A reloaded page (fresh ticket for a slot it still holds): keep the
+    /// body where it is, greet the new client session.
+    fn on_rejoin(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        if self.players.contains_key(&player) {
+            self.greet(ctx, player);
+        } else {
+            self.on_join(ctx, player);
+        }
     }
 
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId, _reason: LeaveReason) {
@@ -393,5 +413,52 @@ impl Demo for ArenaDemo {
                 })
             }),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use distributed_game::{HostConfig, ManualClock, Role, TicketClaims, Viewer, ZoneHost};
+
+    use super::*;
+
+    #[test]
+    fn a_reload_keeps_the_body() {
+        let clock = ManualClock::new();
+        let mut host = ZoneHost::<Arena>::new(
+            "arena",
+            HostConfig::default(),
+            Arc::new(clock.clone()),
+            ArenaConfig {
+                guests: Guests::default(),
+            },
+        );
+        let claims = TicketClaims::new("ana", "arena", u64::MAX, "n1", Role::Player);
+        let joined = host.join(&claims, 0, "").expect("join");
+        let Viewer::Player(player) = joined.viewer else {
+            panic!("player")
+        };
+        for seq in 1..=20u32 {
+            let input = MoveInput {
+                mx: 127,
+                my: 0,
+                buttons: 0,
+            };
+            host.push_input(joined.client, seq, seq, &input.to_payload());
+            clock.advance(Duration::from_millis(33));
+            host.advance();
+        }
+        let before = host.zone().players[&player].state;
+        host.disconnect(joined.client, false);
+        let claims = TicketClaims::new("ana", "arena", u64::MAX, "n2", Role::Player);
+        let again = host.join(&claims, 0, "").expect("rejoin");
+        assert_eq!(again.viewer, Viewer::Player(player));
+        clock.advance(Duration::from_millis(33));
+        host.advance();
+        let after = host.zone().players[&player].state;
+        assert_eq!((before.x, before.y), (after.x, after.y), "same body");
     }
 }

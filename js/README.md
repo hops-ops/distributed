@@ -787,7 +787,14 @@ every Delta's `ack_seq`; per-field `ease`, `snap` or `replace` resolves the
 divergence. A server Handoff connects to the target zone with the transfer
 ticket (following `Redirect`s) and swaps authority while the previous world
 keeps rendering; if the target refuses or stays silent the same Hello goes
-back to the source zone, then a fresh ticket. `Kick(RELOAD)` and handshake
+back to the source zone, then a fresh ticket. Meanwhile the controlled
+entity is held at its last predicted state; with `prediction.handoffFrame`
+(its predicted fields re-expressed in the target zone's frame, e.g. a cell
+offset for zone-local positions) it is predicted on instead, the inputs of
+the transfer go to the target once it welcomes the player, and the switch
+to the target's state is eased, so a border crossing shows no hold or jump.
+Inputs recorded before the controlled entity is known are replayed when it
+binds. `Kick(RELOAD)` and handshake
 `VERSION_MISMATCH` emit `reloadRequired`; supply `reloadContent` (or call
 `connection.resumeAfterReload(version)`) to rejoin with the new content.
 `client.contentVersion` follows the reload, so later handoff targets and

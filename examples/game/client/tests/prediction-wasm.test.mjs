@@ -117,7 +117,7 @@ const pureSurfaces = readdirSync(GENERATED)
 	.map((name) => ({ name, pures: JSON.parse(readFileSync(new URL(`${name}/surface.json`, GENERATED), 'utf8')).pures }));
 
 test('every pure function has a native trace and every trace a surface', () => {
-	assert.deepEqual(pureSurfaces.map((s) => s.name), ['grid']);
+	assert.deepEqual(pureSurfaces.map((s) => s.name), ['grid', 'mobpit']);
 	const declared = pureSurfaces.flatMap((s) => s.pures.map((p) => p.export)).sort();
 	assert.deepEqual(traces.pures.map((p) => p.export).sort(), declared);
 });
@@ -144,7 +144,7 @@ test('grid: the generated wrappers decode what the native generation encodes', a
 		grid_cell: pureType(generated, 'grid_cell'),
 		grid_sample: pureType(generated, 'grid_sample')
 	};
-	for (const pure of traces.pures) {
+	for (const pure of traces.pures.filter((p) => p.export in types)) {
 		const { arg, output } = types[pure.export];
 		const wrapper = pure.export === 'grid_cell' ? pures.gridCell : pures.gridSample;
 		for (const call of pure.calls.slice(0, 12)) {

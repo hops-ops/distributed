@@ -9,8 +9,8 @@ guests and lets any page change the network simulation.
 | Demo | Run | Mechanic it demonstrates | Durable state |
 |---|---|---|---|
 | **Arena** | `./run.sh arena` | Fixed 30 Hz tick / 20 Hz patches, binary deltas, interest management (view ring, drones pop in/out), client prediction + reconciliation (the Rust movement step compiled to WebAssembly, bit-exact), interpolation of remote entities, live latency/jitter/loss | none (stateless: positions only live in the zone) |
-| **Mob Pit** | `./run.sh mobpit` | Authoritative melee combat vs. 12 telegraphing mobs; kills are **non-blocking durable facts** committed exactly once into per-player celld cells (`cells/`, `celld dev` started by `run.sh`); "slow storage" toggle (tick stays flat, pending facts climb); `kill -9` crash recovery; presence cells fed by the runtime's player lifecycle facts (`/dev/mobpit/presence`) | celld: `crawler/{player}`, `presence/{player}`; crawler list = `player_stats` read model projected from the cells' events |
-| **Leaderboard** | `./run.sh leaderboard` | Same server as Mob Pit: kills/XP sorted-set boards (in-memory or Redis) fed fire-and-forget with idempotent apply keys, top 10 pushed live, your rank + neighbours, rebuild from the cells' event history | celld (the Mob Pit cells); boards are a projection (memory or Redis) |
+| **Mob Pit** | `./run.sh mobpit` (`--fleet` for a local multi-node celld) | A near-infinite seeded grid of rooms joined by doorways, **each room a celld Durable Object** (celld places, forwards, hibernates and recovers rooms; the debug overlay shows the node); authoritative melee combat vs. telegraphing mobs; kills are **non-blocking durable facts** settled exactly once in per-player cells; rooms you leave go dormant then asleep (live minimap from the zone status read model) and come back with their mobs | celld: `pit.<x>.<y>` rooms (snapshots), `crawler/{player}`, `presence/{player}`, `zone-activity/{room}`; crawler list and room status = read models projected from the cells' events |
+| **Leaderboard** | `./run.sh leaderboard` | Same setup as Mob Pit: kills/XP sorted-set boards (in-memory or Redis) fed from the projected crawler list with idempotent `max` updates, your rank + neighbours, rebuild from the cells' event history | celld (the Mob Pit cells); boards are a projection (memory or Redis) |
 | **Shooting Gallery** | `./run.sh gallery` | Lag compensation: hitscan shots resolved with `ctx.rewind().hit_test_shot` at the shooter's view time (`client_tick` + interpolation delay in the payload), `max_rewind` clamp, per-shot compensation on/off, predicted vs confirmed hits | none (stateless: score is per session) |
 | **The Freeze** | `./run.sh freeze` | World-version barrier (`WorldCoordinator::rollout`) across **two server processes** as an in-world "admin update": freeze → apply → resume with change notes, inputs dropped while frozen, Hard reload vs safe-room gating (`StalePolicy::SafeRoom`, `Zone::is_gate`) of old clients, aborted rollout (`freeze_ready` → `NotAcked`), facts/events stamped with the content version | celld: `gem-pouch/{player}`, `content-log/{zone}` |
 | **Endless Grid** | `./run.sh grid` | Seeded procedural world (terrain/biomes/props generated bit-identically in Rust and TS, nothing static replicated), 32 m cells as zones, observer connections to the 8 neighbours, handoff across borders **and hosts** (2 processes, hash ring, Redirect + transfer tickets), hibernation to celld and restore | celld: `zone-lease/{zone}`, `zone-state/{zone}` (hibernation) |
@@ -243,15 +243,16 @@ REDIS_URL=redis://127.0.0.1:6379 examples/game/run.sh sveltekit
 # → http://localhost:5573/ — sign in with any username
 ```
 
-`sveltekit/` is Mob Pit as a SvelteKit app over two backends: the Mob Pit
-zone server (gameplay) and `mobpit-service` (the business-side read model).
-The script starts `celld dev` with the Mob Pit cells (`cells/`; state in
-`.data/mobpit-sveltekit/celld`), then `game-demos mobpit` (no `--dev`) on
-`GAME_DEMOS_PORT` (default 2967 here; data in `.data/mobpit-sveltekit`) with
-a fresh ticket secret, `--redis-url "$REDIS_URL"` (its kill boards) and
-`--projection-bus sqlite:…/bus.db` (celld's outbox Queue relays the Crawler
-domain events to it; the board change notices go there too), then runs
-`distributed dev server/`: the
+`sveltekit/` is Mob Pit as a SvelteKit app over its rooms on celld
+(gameplay) and `mobpit-service` (the business-side read models). The
+script starts `celld dev` with the rooms and cells (`cells/`; state in
+`.data/mobpit-sveltekit/celld`; `run.sh sveltekit --fleet [N]` starts a
+local multi-node fleet instead, see *Mob Pit*), then `game-demos mobpit`
+(the services, no `--dev`) on `GAME_DEMOS_PORT` (default 2967 here; data in
+`.data/mobpit-sveltekit`) with the rooms' ticket secret, `--redis-url
+"$REDIS_URL"` (its kill boards) and `--projection-bus sqlite:…/bus.db`
+(celld's outbox Queue relays the cells' domain events to it; the board
+change notices go there too), then runs `distributed dev server/`: the
 application lifecycle generates the `$distributed` GraphQL client, starts
 `mobpit-service` on `MOBPIT_SERVICE_PORT` (default `GAME_DEMOS_PORT + 2`)
 and `vite dev` on `SVELTEKIT_PORT` (default 5573). What each piece replaces:
@@ -262,12 +263,17 @@ and `vite dev` on `SVELTEKIT_PORT` (default 5573). What each piece replaces:
   username sign-in (`dev-<username>` principal, same encrypted session
   cookie, nothing external). `src/lib/server/game.ts` is the whole ticket
   path: `createGameTicketHandler({ secret, getSession: (e) =>
-  e.locals.auth(), zone: () => 'pit-1' })`, exported as `POST` from
+  e.locals.auth(), zone })`, exported as `POST` from
   `routes/api/game/ticket/+server.ts`. The principal comes from the session,
-  the zone from the server; a body naming a principal is refused (400), a
-  foreign zone gets 409, another origin 403, no session 401. The page's
-  `load` uses `tickets.resolve(event)` for the same zone. There is no
-  `/dev/ticket` call and no guest token.
+  the room from the server: on a page load the room the player was last
+  in (its presence cell on celld, read with `CELLD_URL` /
+  `DISTRIBUTED_INTERNAL_SECRET`), else the entrance `pit.0.0`; or the room
+  a client rejoins (after a room restart closed its socket with 1012); moving
+  through doorways needs no ticket from here (the room signs a transfer
+  ticket). A body naming a principal is refused (400), something that is
+  not a room gets 409, another origin 403, no session 401. The page's
+  `load` uses `tickets.resolve(event)`. There is no `/dev/ticket` call and
+  no guest token.
 - **Code generation.** `distributed.config.js` lists both surfaces.
   `games`: the Mob Pit zone surface; the Vite plugin runs `game-manifest`,
   `game-client` and `game-wasm` on start and on Rust changes (`server/src`,
@@ -313,9 +319,16 @@ and `vite dev` on `SVELTEKIT_PORT` (default 5573). What each piece replaces:
   `GraphqlEngine::leaderboard_change_handlers` (`spawn_board_notices`).
   Both processes use `REDIS_URL` and the same key prefix
   (`MOBPIT_REDIS_PREFIX`, default `mobpit`).
-  The rows come from the cells (see *Mob Pit*, step 5): the zone's
-  `profile`/`board` pushes and the `--dev` leaderboard route are not used by
-  this app (they remain for the vanilla client pages).
+  The rows come from the cells (see *Mob Pit*, step 5).
+- **Rooms.** `src/lib/pit/Rooms.graphql` (`zone_activities`, `@load
+  @live`) is the minimap: every room's status (active, dormant, asleep,
+  never ran) live as rooms wake, empty and sleep, with toasts when a room
+  goes to sleep or wakes from its snapshot. The debug overlay polls the
+  current room object's `GET /rooms/{room}/info` (node, isolate,
+  activation). `GAME_ZONES_URL` lists celld's entry points (comma
+  separated for a local fleet); the page rotates over them per connection —
+  entry points, not placement: celld forwards each socket to the room's
+  node.
 - **API identity.** `mobpit-service` trusts no identity header
   (`IdentityMode::OidcBearer`). Auth.js's `session` callback puts a Bearer
   in `session.accessToken`: an ES256 JWT this server signs for the session's
@@ -329,12 +342,17 @@ and `vite dev` on `SVELTEKIT_PORT` (default 5573). What each piece replaces:
 `./run.sh smoke` runs `check:games`, then `distributed build server/` (the
 GraphQL client, `svelte-check`, `vite build` with the game codegen and WASM)
 and `tests/pit.test.mjs`: the production build (`node build`) against the
-real zone server and `mobpit-service` (on the Redis in `REDIS_URL`, with a
-per-run key prefix) in headless Chromium — sign-in, ticket
-rejection paths, an unauthenticated GraphQL request refused, join, keyboard
-movement, auto-hunt until a kill settles, the killer's stats and a second
-signed-in player's leaderboard updating live without a reload, the
-server-rendered numbers after a reload, navigation away, no page errors.
+rooms on a 3-node celld fleet (docker compose + RustFS; a single `celld
+dev` when docker or the aws CLI is missing), the services and
+`mobpit-service` (on the Redis in `REDIS_URL`, with a per-run key prefix)
+in headless Chromium — sign-in, ticket rejection paths, an
+unauthenticated GraphQL request refused, join, keyboard movement, auto-hunt
+until a kill settles, the killer's stats and a second signed-in player's
+leaderboard updating live without a reload, both players walking through
+doorways (one into a room on another node, by the overlay), the room they
+left asleep on the minimap and restored on return, another kill settled
+live, the server-rendered numbers after a reload, navigation away, no page
+errors.
 
 ## Architecture
 
@@ -389,40 +407,44 @@ What the TypeScript still restates, and why it stays:
 ```
 examples/game/
   run.sh                     one-command dev + smoke runner
-  cells/                     crate `game-demo-cells` (own workspace, wasm32, worker-build): the
-                             demos' celld cells — Crawler + presence (Mob Pit), gem pouch +
-                             content log (The Freeze), zone lease + zone state (multi-host
-                             demos), and the `game-demo-outbox` Queue consumer (relay)
+  scripts/round-robin.mjs    dev TCP balancer in front of a local celld fleet (`run.sh mobpit --fleet`)
+  cells/                     crate `game-demo-cells` (own workspace, wasm32, worker-build): Mob
+                             Pit's rooms (`PitRoom`, one Durable Object per room) and the demos'
+                             celld cells — Crawler + presence + zone activity (Mob Pit), gem
+                             pouch + content log (The Freeze), zone lease + zone state
+                             (multi-host demos), and the `game-demo-outbox` Queue consumer (relay)
   server/                    Rust crate `game_demos`, its own cargo workspace (with sim/,
-                             crawler/, service/); also the `distributed build|dev` project
+                             crawler/, rooms/, service/); also the `distributed build|dev` project
     crawler/                 crate `mobpit_crawler`: Crawler aggregate, RecordKill (XP rules),
                              `CrawlerState` domain event (shared by the zone and the service)
-    service/                 crate `mobpit_service` (bin `mobpit-service`): player_stats read
-                             model, modeled projector from the bus, the Redis boards as GraphQL
-                             board roots (@live from bus notices), GraphQL @live (Bearer only),
-                             tests/projection.rs (cells → bus → table → live push, board push
-                             over bus notices, no mutations, 401)
+    rooms/                   crate `mobpit_rooms` (wasm32-portable): the Mob Pit room zone
+                             (combat, doorways, hibernation) and its `CelldZone` hooks
+    service/                 crate `mobpit_service` (bin `mobpit-service`): player_stats and
+                             zone_activities read models, projectors from the bus, the Redis
+                             boards as GraphQL board roots (@live from bus notices), GraphQL
+                             @live (Bearer only), tests/projection.rs (cells → bus → table →
+                             live push, board push over bus notices, no mutations, 401)
     sim/                     crate `game_sim`: the `#[predict]` steps (arena.rs movement + floor,
-                             mobpit.rs, ripple.rs inputs + steps, grid.rs world + walker step +
-                             `#[game_pure]` grid_cell / grid_sample); compiled natively for the
+                             mobpit.rs (+ `#[game_pure]` pit_room, doorways), ripple.rs inputs + steps,
+                             grid.rs world + walker step + `#[game_pure]` grid_cell / grid_sample); compiled natively for the
                              server and to wasm32 for the browser
     src/main.rs              `game-demos <demo>` subcommands (+ hidden `predict-trace`)
     src/predict_trace.rs     native traces of every step (recorded inputs) and pure function (arguments)
     src/common/              shared: Demo trait, run/spawn, dev routes, guests;
                              celld.rs (CelldOptions: celld URL + internal secret),
                              relay.rs (authenticated /internal/celld-queue/relay → SqliteBus),
-                             zone_status.rs (zone lease/snapshot status read model)
+                             zone_status.rs (zone lease/snapshot/activity status read model)
     src/devcelld.rs          `celld dev` harness for tests (own project, port, process tree)
     src/cluster.rs           multi-host demos: --host-id/--peer, directory, ownership, snapshots
     src/arena/               Arena zone (`movement` = `game_sim::arena`)
-    src/mobpit/              Mob Pit zone, fact sink to the Crawler/presence cells, crawler
-                             directory projection, leaderboards, dev routes
+    src/mobpit/              Mob Pit services (the rooms run on celld): dev room tickets, relay,
+                             crawler directory and room status projections, leaderboards
     src/gallery/             Shooting Gallery zone (targets, rewind hit tests)
     src/freeze/              The Freeze zone, content packs, two-host world + admin routes
     src/grid/                Endless Grid zone (`world` = `game_sim::grid`), dev map routes
     src/ripple/              Boss Ripple tiers and placement
     tests/                   arena_smoke.rs (bots, dev routes),
-                             mobpit_smoke.rs (facts, slow storage, kill -9 recovery, boards),
+                             mobpit_smoke.rs (facts, rooms on celld, celld crash, boards, presence),
                              gallery_smoke.rs, freeze_smoke.rs (binary content packs), grid_smoke.rs,
                              ripple_smoke.rs (+ support/ for two in-process hosts)
   sveltekit/                 SvelteKit app over the Mob Pit server + mobpit-service (see SvelteKit above)
@@ -467,161 +489,181 @@ The server crate is excluded from the root workspace (`Cargo.toml`
 ## Mob Pit
 
 ```sh
-examples/game/run.sh mobpit        # → http://localhost:5173/mobpit/
-examples/game/run.sh leaderboard   # same server → http://localhost:5173/leaderboard/
+examples/game/run.sh mobpit               # → http://localhost:5173/mobpit/   (rooms on `celld dev`)
+examples/game/run.sh mobpit --fleet       # same on a local 3-node celld (docker compose + RustFS)
+examples/game/run.sh leaderboard          # same, board page → http://localhost:5173/leaderboard/
 ```
 
-Controls: WASD / stick move (the Arena's movement, predicted by `pit_step`, same floor and
-pillars), **Space** attack (120° cone, 2.2 m), **E** dash, **L** slow
-storage. Mobs wander near home, aggro within 7 m, chase, stop and show a red
-**telegraph ring** that fills for 0.8 s, then hit everyone inside it. Grunts
-(green, 10 XP), brutes (purple, 25 XP) and the elite (red, 60 XP) respawn 4 s
-after dying. Level `n` starts at `40·(n−1)²` XP.
+Mob Pit is a near-infinite grid of **rooms**: room `(x, y)` is zone
+`pit.<x>.<y>`, and **every room is a celld Durable Object** (the cells
+worker declares `PitRoom` with `distributed_game::celld_zone_object!`; the
+zone code is `server/rooms`, `mobpit_rooms`). celld decides where a room
+runs — the node that first touched it, forwarded from any other node,
+evicted when idle, moved when idle, recovered elsewhere if its node
+crashes. The game never names a node; the debug overlay only *shows* the
+one celld chose.
 
-**One kill, end to end** (`server/src/mobpit/`):
+Controls: WASD / stick move (the Arena's movement, predicted by `pit_step`,
+same floor and pillars), **Space** attack (120° cone, 2.2 m), **E** dash,
+**O** debug overlay. Walk through a **doorway** — the glowing gap in the
+middle of each wall (go beside the pillar on its axis) — into the
+neighbouring room. The rooms are **one continuous world**: room `(x, y)`
+sits at world `(x, y) × 40 m` (they share walls), the rooms around yours
+are drawn from their seeded layout, so you see into the next room, and
+going through a doorway just carries on walking — no scene swap, no jump. Mobs wander near home, aggro within 7 m, chase, stop and
+show a red **telegraph ring** that fills for 0.8 s, then hit everyone
+inside it. Grunts (green, 10 XP), brutes (purple, 25 XP) and elites (red,
+60 XP) respawn 4 s after dying. Level `n` starts at `40·(n−1)²` XP.
 
-1. `zone.rs`, tick N: the mob's HP reaches 0. The zone builds the cell
-   command's own input, `RecordKillInput { mob, tier, name }` — a
-   `#[derive(FactCommand)]` bound to `RECORD_KILL` — as a typed fact with
-   `ctx.fact_with_key(&input, &[m{id}, gen])`, emits it with
-   `ctx.emit_fact_for(killer, fact)` and broadcasts a typed `kill` event.
-   `emit_fact_for` only enqueues: the host binds the killer's **verified
-   ticket principal**; the zone never awaits storage. Backpressure (256
-   unsettled facts) parks facts in a backlog retried next tick.
-2. The zone's fact worker (`GameServer::with_fact_sink`, retrying until
-   settled) runs `store::MobPitFactSink`: optional artificial latency, then
-   `distributed_game::celld::CelldFactSink` posts the fact over the
-   internal path (`DISTRIBUTED_INTERNAL_SECRET`, principal and `FactStamp`
-   as trusted headers) to the killer's own celld cell, `crawler/{principal}`
-   (`cells/`, a workers-rs Durable Object per player). The command id is
-   `sha256(service ‖ fact key)`, so the cell's command ledger turns any repeat
-   of the key into a replay of the stored receipt. Nothing else is written
-   per kill: there is no index cell every player passes through (celld
-   cannot enumerate cells, and such a cell would be a global hot spot); the
-   crawler list is a read model (step 5). celld down: the fact stays queued
-   in the zone (backpressure at capacity), never in a local store.
-3. `crawler/src/lib.rs`: `crawler.record_kill` (a `#[command]` method) takes
-   the principal from the trusted session (`x-user-id`) and **decides the XP
-   from the tier**; the input has no identity or XP field and unknown fields
-   are rejected. Event, ledger receipt, snapshot and outbox row commit in one
-   Durable Object SQLite transaction.
-4. Tick N+k: `Zone::on_fact_settled` sends the killer `saved` (with
-   `waitedMs`) and `profile`; the popup turns from "saving…" to
-   "+XP saved ✓". The sink also hands the kill to the leaderboard
-   (fire-and-forget).
-5. The read model (`crawler/`, `service/`): `crawler.mob_killed` is a
-   **domain event** — the same transaction writes the post-kill
-   `CrawlerState` (principal, name, XP, kills, level) to the cell's outbox
-   (`repo.publish_events()`). celld drains the outbox to the `game-demo-outbox`
-   Queue; the cells worker's Queue consumer relays each message to the zone
-   server's `/internal/celld-queue/relay` (secret-authenticated), which
-   publishes it onto the `SqliteBus` at `--projection-bus` (default
-   `sqlite:{data-dir}/bus.db`). A crash between commit and drain, or a relay
-   outage, only delays it (the cell's alarm re-drains; the Queue retries).
-   `mobpit-service` consumes the bus with a
-   modeled projector (`projection!` → `upsert_player_stats`, defined in
-   `crawler/src/stats.rs`), checkpointed and deduplicated in its own SQLite
-   database, and serves `player_stats` over GraphQL with `@live`. The service
-   has no commands: nothing on that side can name a player or an amount.
-   The zone server projects the same events into its own copy
-   (`mobpit/directory.rs`, bus consumer `mobpit-zone`,
-   `{data-dir}/read-models.db`): `/dev/mobpit/crawlers` and the leaderboard
-   rebuild list crawlers from it (eventually consistent; the rebuild then
-   reads each listed crawler's kill history from its cell).
+**Coming back.** The same browser is the same player (the dev guest token
+is kept in `localStorage`; `?player=<label>` gives one browser several
+guests, `?zone=` forces a room). A page load asks `/dev/mobpit/start` for
+the room you were last in — the presence cell, written from the rooms'
+verified lifecycle facts — and you are back where you stood: a reload
+inside the reconnect grace takes over the same body (`on_rejoin` keeps it
+and re-greets the page; a network drop resumes it with the reconnect
+token), and a room keeps the place and HP of every player whose slot ended
+(closed page, grace expired) and of the connected ones in its snapshot, so
+it survives the room sleeping, the services restarting and celld
+restarting (the last periodic snapshot). XP, level and kills come from
+your Crawler cell. Tested by `client/tests/mobpit-restarts-headless.test.mjs`.
 
-The read path: on join the zone asks a background task to load the player's
-cell and sends `profile` (`source: "cell"`) a few ticks later.
+**Rooms.** What a room holds — its biome (the Endless Grid's seeded noise),
+danger (grows with the distance from `pit.0.0`) and 6–12 mobs with their
+tiers and homes — is `game_sim::mobpit::pit_room(seed, x, y)`, a
+`#[game_pure]` function: the zone builds the room from it, the page runs
+the same Rust compiled to WebAssembly (`createMobpitPures().pitRoom`) for
+the floor colour and the minimap; nothing static is replicated. Seed:
+`MOBPIT_SEED` (worker var).
 
-**Slow storage.** The *Slow storage* toggle (`POST /dev/mobpit/storage
-{latencyMs: 1500}`) delays every commit by 1.5 s. Facts commit in order per
-zone, so pending climbs when you kill faster than one per 1.5 s; the top-right
-graph shows pending (orange) rising and settling while the tick interval
-(blue, `pit` entity `tickMs`/`tickMaxMs`) stays at ~33 ms and the HUD's tick
-work stays in microseconds. This is the fix for a world that froze while
-awaiting durable commits: the tick only enqueues.
+**Leaving and coming back.** A doorway is a passage: the predicted step
+(`pit_step`) lets you walk through the gap past the wall line, and 0.5 m
+past it (hysteresis, so dithering at the line does not bounce you back) the
+room hands you over (`ctx.handoff`, carrying your movement state in the
+next room's frame: the same world point and velocity); the room signs a
+single-use transfer ticket and the SDK reconnects to the next room's
+object, wherever it runs. The client keeps predicting through the
+handoff (`prediction.handoffFrame`: the room offset), sends the inputs of
+the transfer to the new room once it is in, and eases into the new room's
+state, so the handoff's latency never shows. Positions on the wire stay
+room-local; the page adds the room's offset and keeps a floating origin at
+your room. Mobs of neighbouring rooms are not shown yet: observing a room
+keeps it awake, which would defeat room hibernation. A room that empties writes its snapshot
+(`Zone::hibernate`: every mob's position, HP, state, generation and
+respawn timer, and the room's kill count) and goes **dormant**; after
+`ZONE_HIBERNATE_AFTER_MS` (10 s) it is **hibernated**: dropped from memory,
+the snapshot in celld's object storage. Coming back wakes it and restores
+the mobs as you left them (the dead stay dead until their respawn), with
+a toast. The minimap (bottom right) shows every known room live from the
+`zone_status` read model — active, dormant, asleep, never ran — fed by
+each room's lifecycle facts into its `zone-activity/{room}` cell, whose
+events reach the services through the outbox Queue relay.
 
-**Crash recovery** (`kill -9`):
+**One kill, end to end:**
 
-```sh
-examples/game/run.sh mobpit                      # play, get some kills, toggle slow storage, kill more
-kill -9 $(lsof -t -iTCP:2567 -sTCP:LISTEN)       # in another terminal, mid-fight
-examples/game/run.sh mobpit                      # restart (same .data/mobpit), reload the page
-```
+1. `rooms/src/zone.rs`, tick N: the mob's HP reaches 0. The zone builds
+   the Crawler command's own input, `RecordKillInput { mob, tier, name }`
+   (a `#[derive(FactCommand)]` bound to `RECORD_KILL`), as a typed fact
+   keyed by `m{id}` and the mob's generation, emits it for the killer and
+   broadcasts a `kill` event. The host binds the killer's **verified ticket
+   principal**; the zone never awaits storage.
+2. The room object writes the fact to its **outbox** in object storage
+   right after the tick and sends it **object to object** to the killer's
+   `crawler/{principal}` cell (`CelldObjectHost` under `CommandFactSink`;
+   the command id is `sha256(service ‖ fact key)`, so the cell's ledger
+   turns any repeat into a replay of the stored receipt). Settled, it is
+   deleted; a crash leaves it to be resent by the room's next activation or
+   its alarm: **exactly once**.
+3. `crawler/src/lib.rs`: `crawler.record_kill` takes the principal from the
+   trusted session and **decides the XP from the tier**; event, ledger
+   receipt, snapshot and outbox row commit in one cell SQLite transaction.
+4. Tick N+k: `Zone::on_fact_settled` sends the killer `saved` and
+   `profile`; the popup turns from "saving…" to "+XP saved ✓". (The profile
+   on joining a room comes from the Crawler cell too, read by the room
+   object off the tick and delivered as a zone message.)
+5. Read models: `crawler.mob_killed` is a **domain event** (the post-kill
+   `CrawlerState`). celld drains the cell outbox to the `game-demo-outbox`
+   Queue; its consumer relays each message to the services'
+   `/internal/celld-queue/relay`, which publishes it onto the `SqliteBus` at
+   `--projection-bus`. `mobpit-service` projects `player_stats` (and the
+   rooms' `zone_activities`) and serves them over GraphQL `@live`; the
+   services (`game-demos mobpit`) project their own copy (crawler list,
+   room status) and feed the leaderboard from it.
 
-The ticket secret is persisted in the data dir (`dev-ticket-secret`), so the
-page's guest token still maps to the same principal, and the profile comes
-back from the cell. `run.sh` keeps celld's state in `.data/mobpit/celld`
-(`.celld/dev`), so celld itself can be killed and restarted too. What
-survives:
+**What `game-demos mobpit` is now.** The services next to the rooms, no
+room runs in it: the dev ticket route (`POST /dev/ticket` for `pit.<x>.<y>`,
+signed with the rooms' `GAME_TICKET_SECRET`, persisted in the data dir as
+`dev-ticket-secret`), the Queue relay, the read models, the boards and the
+`/dev/mobpit/*` routes. The Vite page reaches rooms at `/rooms/{room}`
+(proxied to celld, `GAME_DEMOS_ROOMS`) and the services at `/dev`.
 
-- **Settled facts** (you saw "saved ✓"): durable. celld acknowledged the
-  commit only after the cell's SQLite transaction (event + ledger receipt)
-  was durable.
-- **Facts in flight** at the crash: each is either fully committed (the
-  transaction finished; you just never saw the settlement) or not at all —
-  never half-applied, never twice. The zone's
-  in-memory state (mob HP, positions, the fact queue) dies with the process,
-  so an uncommitted kill is lost like any other unsaved world state; there is
-  no zone-side outbox (see `distributed_game` README, *Facts on dispose*).
-- **Retries and replays** of the same key (the worker's retry after a
-  timeout, or a re-emitted fact) replay the stored receipt through the
-  ledger: `replayed: true`, nothing credited twice. Fact keys
-  (`crawler.record_kill:{zone}:{boot_epoch}:m{id}:{gen}`) contain the activation's boot
-  epoch (`Ctx::boot_epoch`, grows across restarts) because zone ticks and
-  mob generations restart at 0.
+**Local fleet** (`--fleet [N]`): one RustFS container (docker compose:
+this machine's Docker publishes ports for compose, not for plain `docker
+run`) holds the fleet bucket; the cells worker is deployed to it with
+`celld deploy` (vars inlined: the internal and ticket secrets, the relay
+URL, `CELLD_ZONE_NODES`), and N nodes run in production mode
+(`node-a`…; public listeners `GAME_DEMOS_PORT + 10…`, operators `+ 20…`).
+Browsers enter through a dev round-robin TCP balancer
+(`scripts/round-robin.mjs`, `GAME_DEMOS_PORT + 9`), so new rooms land on
+different nodes; walk through a few doorways with the overlay on to watch
+it. Kill a node (`kill -9` of one `celld --bucket …` process): its rooms'
+sockets close with 1012, the page rejoins, celld recovers the room on a
+live node after the lease TTL (~10 s) from its last snapshot, and the
+room's unsettled kills settle from its outbox. Ctrl-C stops the nodes and
+removes the container (`docker compose down -v`).
 
-`tests/mobpit_smoke.rs` proves it with the real binary on its own
-`celld dev`: bots fight, storage is made slow, the server gets `SIGKILL` with
-facts in flight, then celld is killed (`SIGKILL` of its process tree) and
-restarted on its state, and the server restarts; then `settled ≤ durable
-kills ≤ settled + in flight`, the board (rebuilt at boot) equals the cells,
-and re-committing a pre-crash fact (same key and input) returns the original
-receipt with `replayed: true` and unchanged kills.
+`tests/mobpit_smoke.rs` (each test on its own `celld dev`): kill facts
+exactly once into the cells and the board following them; bots fighting in
+a room, the room going dormant → hibernated → restored; `celld dev` killed
+(`SIGKILL` of its process tree) mid-fight and restarted, after which cells,
+crawler list and board agree; presence cells fed by the rooms' lifecycle
+facts. The framework's own crash test (`distributed_game`'s `celld_zone`
+fleet test) kills the owner node of a room with 200 facts in flight and
+counts exactly 200 in the cell.
 
-**celld.** Every demo with durable state runs its cells on celld:
+**celld.** Every demo with durable state runs on celld:
 `run.sh mobpit|leaderboard|freeze|grid|ripple|sveltekit|smoke` need the celld
 version pinned in the repository's `.celld-version` (`CELLD_BIN`, default
 `celld` on PATH; `scripts/celld.sh check` verifies it and prints the install
 command) and `worker-build` (`cargo install worker-build --locked`) for
-`cells/`. Only `arena` and `gallery` run without celld. The tests
-(`tests/mobpit_smoke.rs`, `tests/freeze_smoke.rs`, `tests/grid_smoke.rs`,
-`tests/ripple_smoke.rs`, `service/tests/projection.rs`, the headless and
-Playwright tests) each start their own `celld dev` on a temp project
-(`game_demos::devcelld`, `client/tests/helpers/celld.mjs`).
+`cells/`. Only `arena` and `gallery` run without celld. The tests each
+start their own `celld dev` on a temp project (`game_demos::devcelld`,
+`client/tests/helpers/celld.mjs`); the SvelteKit Playwright test starts a
+3-node fleet (`client/tests/helpers/fleet.mjs`) when docker and the aws CLI
+are available.
 
 ## Leaderboard
 
 `server/src/mobpit/board.rs`. Kills project into two boards,
-`mobpit.kills` (+1) and `mobpit.xp` (+xp), through `LeaderboardProjector`.
+`mobpit.kills` and `mobpit.xp`, through `LeaderboardProjector`.
 
 - **Store**: `InMemoryLeaderboard` by default; `RedisLeaderboard` when
   `REDIS_URL` is set (`docker compose up -d redis` at the repo root, then
   `REDIS_URL=redis://127.0.0.1:6379 examples/game/run.sh leaderboard`).
-- **Fire-and-forget**: after a commit the sink calls
-  `BackgroundLeaderboard::submit`, which never awaits the store; a full queue
-  or a Redis outage drops (and counts) the update.
-- **Idempotent**: each kill becomes a `DomainEventOccurrence`
-  (`capture_external`, source `mobpit.crawler-cell` / `Crawler:{principal}` /
-  event sequence / `mob_killed`). The id is identical whether it comes from
-  the live receipt, a ledger replay of the fact, or the cell's event history,
-  and the store applies `"{id}#{change}"` at most once per board.
+- **Live**: the services' crawler list (the `player_stats` projection of
+  the cells' events) feeds the boards: every change of a crawler's totals
+  becomes one `CrawlerTotals` occurrence applied with `max` on both boards,
+  fire-and-forget through `BackgroundLeaderboard` (a full queue or a Redis
+  outage drops and counts the update; the next change heals it). Repeats,
+  replays and reordering are no-ops.
 - **Rebuild** (button, `POST /dev/mobpit/leaderboard/rebuild`, and at every
-  server start): read every cell's durable event stream, project it into the
-  staging boards, promote atomically, then compare each cell's kills/XP with
-  its scores (`matchesCells`) and the top 10 with the previous one
-  (`identicalTop`). Dropped live updates are healed here.
-- **Push**: the zone broadcasts the top-10 snapshot (`board` event) whenever
-  it changes; the leaderboard page joins the pit as an **observer** (no
-  avatar) and renders those pushes; on each push it reads your rank and
-  neighbours from `GET /dev/mobpit/leaderboard?member=…` (ranks are public;
-  the page knows its principal from its own ticket).
+  server start): read every cell's durable event stream, project each kill
+  (`capture_external`, source `mobpit.crawler-cell` /
+  `Crawler:{principal}` / event sequence / `mob_killed`) into the staging
+  boards, promote atomically, then compare each cell's kills/XP with its
+  scores (`matchesCells`) and the top 10 with the previous one
+  (`identicalTop`).
+- **Page**: polls the snapshot (`GET /dev/mobpit/leaderboard`), reads your
+  rank and neighbours on each change (`?member=…`), and observes the
+  entrance room (no avatar) for a live mini map.
 
 Dev routes (`--dev` only, none takes an identity or a reward):
-`GET|POST /dev/mobpit/storage`, `GET /dev/mobpit/stats` (sink counters,
-pending, recent commits), `GET /dev/mobpit/crawlers` (every crawler in the
-directory: the `player_stats` projection of the cells' events, eventually
-consistent), `GET /dev/mobpit/presence` (the presence cells' view),
-`GET /dev/mobpit/leaderboard[?member=]`, `POST /dev/mobpit/leaderboard/rebuild`.
+`POST /dev/ticket`, `GET /dev/mobpit/rooms` (room status), `GET
+/dev/mobpit/stats`, `GET /dev/mobpit/crawlers` (every crawler in the
+directory, eventually consistent), `GET /dev/mobpit/presence?principal=`
+(the presence cell), `GET /dev/mobpit/leaderboard[?member=]`, `POST
+/dev/mobpit/leaderboard/rebuild`. On celld, `GET /rooms/{room}/info` is the
+room object's debug JSON (node, isolate, activation, wakes, tick timing).
 
 ## Adding a demo
 
@@ -681,7 +723,9 @@ over the hosts, `cluster_server`, optional dev routes), uses
   stay the same guest. Unknown fields (e.g. `principal`) are rejected.
 - `/dev/netsim` changes the simulation for every connection on the server.
 - The ticket secret is random per process unless `DISTRIBUTED_GAME_SECRET`
-  is set (needed to point `game-bots` at a running demo).
+  is set (needed to point `game-bots` at a running demo). `run.sh` sets it
+  from `.data/<demo>/dev-ticket-secret` (Mob Pit: `MOBPIT_DATA_DIR`), kept
+  across runs so a returning browser's guest token still verifies.
 - The SvelteKit demo uses no `/dev/*` route: its tickets are minted by the
   SvelteKit server from the Auth.js session, and its read model is
   `mobpit-service`, so `run.sh sveltekit` and the smoke test start the zone

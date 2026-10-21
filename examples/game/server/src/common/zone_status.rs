@@ -4,10 +4,12 @@
 //! this host, under a bus consumer group of its own.
 //!
 //! This is the consumer of `zone.activated` / `zone.released` /
-//! `zone.lease_expired` and `zone_state.saved` / `zone_state.deleted`; the
-//! grid's world map reads it to tell active, hibernated and cold zones apart
-//! without opening one cell per zone (a read of a never-used cell would
-//! create it). Eventually consistent: for views only.
+//! `zone.lease_expired` and `zone_state.saved` / `zone_state.deleted` (the
+//! native multi-host demos' zones) and of `zone.activity_changed` (zones
+//! hosted as celld objects: Mob Pit's rooms); the grid's world map and Mob
+//! Pit's minimap read it to tell active, dormant, hibernated and cold zones
+//! apart without opening one cell per zone (a read of a never-used cell
+//! would create it). Eventually consistent: for views only.
 
 use std::collections::HashMap;
 
@@ -18,8 +20,8 @@ use distributed::microsvc::{
 };
 use distributed::SqliteRepository;
 use distributed_game::world::zone_status::{
-    projectors, read_model_catalog, ZoneLeases, ZoneSnapshots, ZoneStatus, APPLICATION,
-    ZONE_LEASES, ZONE_SNAPSHOTS,
+    activity_projector, projectors, read_model_catalog, ZoneActivities, ZoneLeases, ZoneSnapshots,
+    ZoneStatus, APPLICATION, ZONE_ACTIVITIES, ZONE_LEASES, ZONE_SNAPSHOTS,
 };
 
 /// See the module docs.
@@ -40,6 +42,13 @@ async fn project_snapshots(
     projection: ModeledProjection,
 ) -> Result<(), HandlerError> {
     projection.apply(ZONE_SNAPSHOTS, &context).await
+}
+
+async fn project_activities(
+    context: CausalProjectorContext,
+    projection: ModeledProjection,
+) -> Result<(), HandlerError> {
+    projection.apply(ZONE_ACTIVITIES, &context).await
 }
 
 /// `{select} WHERE zone_id IN (?, ?, …)` over `zones`.
@@ -80,7 +89,9 @@ impl ZoneStatusView {
                         .modeled_projector(leases)
                         .handle(project_leases)
                         .modeled_projector(snapshots)
-                        .handle(project_snapshots),
+                        .handle(project_snapshots)
+                        .modeled_projector(activity_projector())
+                        .handle(project_activities),
                 )
                 .with_bus(
                     SqliteBus::new_with_group(bus.clone(), group.clone())
@@ -88,6 +99,45 @@ impl ZoneStatusView {
                 )
         });
         Ok(Self { repo })
+    }
+
+    /// Every `zone_activities` row whose zone id starts with `prefix`
+    /// (zones hosted as celld objects).
+    pub async fn activities(&self, prefix: &str) -> Result<Vec<ZoneActivities>, String> {
+        let rows = sqlx::query_as::<_, (String, String, String, bool, i64, String, String, i64, i64)>(
+            "SELECT zone_id, status, activation, restored, players, node, isolate, activations, \
+             changed_at_ms FROM zone_activities WHERE zone_id LIKE ? ORDER BY zone_id",
+        )
+        .bind(format!("{prefix}%"))
+        .fetch_all(self.repo.pool())
+        .await
+        .map_err(|e| format!("zone activities: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    zone_id,
+                    status,
+                    activation,
+                    restored,
+                    players,
+                    node,
+                    isolate,
+                    activations,
+                    changed_at_ms,
+                )| ZoneActivities {
+                    zone_id,
+                    status,
+                    activation,
+                    restored,
+                    players,
+                    node,
+                    isolate,
+                    activations,
+                    changed_at_ms,
+                },
+            )
+            .collect())
     }
 
     /// The status of each of `zones` (`Cold` when the read model has no

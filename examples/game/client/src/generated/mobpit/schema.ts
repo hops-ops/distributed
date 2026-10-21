@@ -15,9 +15,9 @@ export type KindName = keyof typeof KIND;
 
 /** `player` (kind 1, priority 2). */
 export interface PlayerFields {
-	/** `quant [-20, 19.999847] / 18 bits` */
+	/** `quant [-22, 21.999832] / 18 bits` */
 	readonly x: number;
-	/** `quant [-20, 19.999847] / 18 bits` */
+	/** `quant [-22, 21.999832] / 18 bits` */
 	readonly y: number;
 	/** `quant [-16, 15.9921875] / 12 bits` */
 	readonly vx: number;
@@ -131,18 +131,16 @@ export function pillarFields(entity: { readonly fields: EntityFields }): PillarF
 export interface PitFields {
 	/** `u16` */
 	readonly pending: number;
+	/** `u32` */
+	readonly committed: number;
 	/** `u16` */
-	readonly slowMs: number;
+	readonly backlog: number;
 	/** `f32` */
 	readonly tickMs: number;
 	/** `f32` */
 	readonly tickMaxMs: number;
 	/** `u32` */
-	readonly workUs: number;
-	/** `u32` */
-	readonly committed: number;
-	/** `u16` */
-	readonly backlog: number;
+	readonly kills: number;
 }
 
 /** True for a `pit` entity. */
@@ -155,20 +153,19 @@ export function pitFields(entity: { readonly fields: EntityFields }): PitFields 
 	const f = entity.fields;
 	return {
 		pending: fieldNumber(f, 'pending'),
-		slowMs: fieldNumber(f, 'slow_ms'),
-		tickMs: fieldNumber(f, 'tick_ms'),
-		tickMaxMs: fieldNumber(f, 'tick_max_ms'),
-		workUs: fieldNumber(f, 'work_us'),
 		committed: fieldNumber(f, 'committed'),
 		backlog: fieldNumber(f, 'backlog'),
+		tickMs: fieldNumber(f, 'tick_ms'),
+		tickMaxMs: fieldNumber(f, 'tick_max_ms'),
+		kills: fieldNumber(f, 'kills'),
 	};
 }
 
 /** Wire type of every replicated field, by kind and wire field name. */
 export const FIELD_TYPES = {
 	player: {
-		x: { type: 'quant', min: -20, max: 19.999847412109375, bits: 18 },
-		y: { type: 'quant', min: -20, max: 19.999847412109375, bits: 18 },
+		x: { type: 'quant', min: -22, max: 21.999832153320313, bits: 18 },
+		y: { type: 'quant', min: -22, max: 21.999832153320313, bits: 18 },
 		vx: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		vy: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		dash: { type: 'u8' },
@@ -196,12 +193,11 @@ export const FIELD_TYPES = {
 	},
 	pit: {
 		pending: { type: 'u16' },
-		slow_ms: { type: 'u16' },
-		tick_ms: { type: 'f32' },
-		tick_max_ms: { type: 'f32' },
-		work_us: { type: 'u32' },
 		committed: { type: 'u32' },
 		backlog: { type: 'u16' },
+		tick_ms: { type: 'f32' },
+		tick_max_ms: { type: 'f32' },
+		kills: { type: 'u32' },
 	},
 } as const satisfies Record<string, Record<string, WireType>>;
 

@@ -249,8 +249,10 @@ pub trait Zone: Sized + Send + 'static {
     /// state the zone sent on join (own entity id, hello events…).
     ///
     /// Defaults to `on_leave(Rejoined)` then `on_join`, i.e. a fresh join in
-    /// the same [`PlayerId`]. Override to keep in-zone state and only resend
-    /// what the client needs.
+    /// the same [`PlayerId`]: the body is respawned. Override to keep
+    /// in-zone state and only resend what the client needs, so a reloaded
+    /// page takes over the same body (what players expect; the examples'
+    /// Mob Pit, Arena and Endless Grid do).
     fn on_rejoin(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
         self.on_leave(ctx, player, LeaveReason::Rejoined);
         self.on_join(ctx, player);

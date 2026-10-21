@@ -1,7 +1,8 @@
 /**
- * Headless Mob Pit helpers: a server on its own `celld dev` (the Crawler
- * and presence cells), a throwaway data dir and a scripted hunter
- * that walks to the nearest mob, faces it and swings until `done()` is true.
+ * Headless Mob Pit helpers: the rooms and cells on their own `celld dev`,
+ * the services (`game-demos mobpit`) on a throwaway data dir, and a
+ * scripted hunter that walks to the nearest mob, faces it and swings until
+ * `done()` is true.
  */
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,13 +17,15 @@ export function tempDataDir() {
 }
 
 /**
- * celld + `game-demos <demo>` (mobpit / leaderboard) on a fixed port that
- * celld's outbox relay targets. `restart()` restarts only the game server
- * (same port, data dir and cells); `stop()` stops both.
+ * celld (rooms + cells) + `game-demos <demo>` (mobpit / leaderboard: the
+ * services) on a fixed port that celld's outbox relay targets.
+ * `roomsUrl` is where rooms are (celld). `restart()` restarts only the
+ * services (same port, data dir and cells); `restartCelld()` kills celld
+ * and starts it again on its state (rooms, cells); `stop()` stops both.
  */
-export async function startPit(demo = 'mobpit') {
+export async function startPit(demo = 'mobpit', vars = {}) {
 	const port = await freePort();
-	const celld = await startCelld({ relayPort: port });
+	const celld = await startCelld({ relayPort: port, vars: { ZONE_HIBERNATE_AFTER_MS: '1500', ...vars } });
 	const env = { ...celld.env, MOBPIT_DATA_DIR: tempDataDir() };
 	let server;
 	try {
@@ -33,6 +36,7 @@ export async function startPit(demo = 'mobpit') {
 	}
 	return {
 		celld,
+		roomsUrl: celld.url,
 		get httpUrl() {
 			return server.httpUrl;
 		},
@@ -40,11 +44,57 @@ export async function startPit(demo = 'mobpit') {
 			await server.stop();
 			server = await startDemo(demo, { env, port });
 		},
+		restartCelld: () => celld.restart(),
 		async stop() {
 			await server.stop();
 			await celld.stop();
 		}
 	};
+}
+
+/**
+ * Walk to the doorway on side `[dx, dy]` and through it (one command frame
+ * per tick) until the client's authority is the next room and the own
+ * player is predicted there again. Returns the new room and the own world
+ * position sampled every frame on the way (`{ t, room, x, y }`).
+ */
+export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000) {
+	const { client } = pit;
+	const from = pit.room();
+	const deadline = Date.now() + timeoutMs;
+	const trace = [];
+	const settled = () => pit.room() !== from && pit.me()?.predicted === true && pit.me()?.zoneId === pit.room();
+	for (let after = 0; after < 10; after += settled() ? 1 : 0) {
+		if (Date.now() > deadline) throw new Error(`walk through door ${dx},${dy} timed out`);
+		const me = pit.me();
+		const at = pit.position();
+		if (at !== undefined) trace.push({ t: Date.now(), room: me.zoneId, predicted: me.predicted, ...at });
+		let input = { mx: 0, my: 0, buttons: 0 };
+		if (at !== undefined) {
+			// Beside the pillar on the door's axis, through the gap, and on
+			// into the next room (world coordinates: the rooms are one world).
+			const [rx, ry] = from.split('.').slice(1).map(Number);
+			const size = 2 * 20;
+			const tx = rx * size + (dx !== 0 ? dx * 24 : 1.7);
+			const ty = ry * size + (dy !== 0 ? dy * 24 : 1.7);
+			const ddx = tx - at.x;
+			const ddy = ty - at.y;
+			const len = Math.max(Math.hypot(ddx, ddy), 1e-3);
+			input = { mx: Math.round((ddx / len) * 127), my: Math.round((ddy / len) * 127), buttons: 0 };
+		}
+		client.sendInput(input);
+		await sleep(1000 / 30);
+	}
+	return { room: pit.room(), trace };
+}
+
+/** Largest move (m) between consecutive samples of a `walkThroughDoor` trace. */
+export function largestStep(trace) {
+	let max = 0;
+	for (let i = 1; i < trace.length; i += 1) {
+		max = Math.max(max, Math.hypot(trace[i].x - trace[i - 1].x, trace[i].y - trace[i - 1].y));
+	}
+	return max;
 }
 
 /** Hunt mobs (one command frame per 30 Hz tick) until `done()` or timeout. */
@@ -54,9 +104,10 @@ export async function hunt(pit, done, timeoutMs = 45_000) {
 	while (!done()) {
 		if (Date.now() > deadline) throw new Error('hunt timed out');
 		const rendered = client.render();
-		const meEntity = rendered.find((e) => e.id === pit.hello()?.entity && isPlayer(e));
+		const room = pit.room?.();
+		const meEntity = rendered.find((e) => e.id === pit.hello()?.entity && isPlayer(e) && (room === undefined || e.zoneId === room));
 		const me = meEntity && playerFields(meEntity);
-		const mobs = rendered.filter((e) => isMob(e) && !e.stale).map(mobFields);
+		const mobs = rendered.filter((e) => isMob(e) && !e.stale && (room === undefined || e.zoneId === room)).map(mobFields);
 		let input = { mx: 0, my: 0, buttons: 0 };
 		if (me !== undefined && mobs.length > 0 && !me.dead) {
 			const target = mobs
