@@ -26,6 +26,14 @@ impl CelldZone for MobPit {
             // Joined / lost / reconnected / left facts for the presence cells.
             lifecycle_facts: true,
             max_players: 32,
+            // A doorway into a sleeping room waits for it to wake while the
+            // client keeps predicting: keep up to 3 s of its inputs.
+            input_capacity: 90,
+            // Ranged shots are rewound at most this far (lag compensation).
+            rewind: distributed_game::RewindConfig {
+                max_rewind: std::time::Duration::from_millis(crate::zone::MAX_REWIND_MS),
+                ..distributed_game::RewindConfig::default()
+            },
             ..HostConfig::default()
         }
     }

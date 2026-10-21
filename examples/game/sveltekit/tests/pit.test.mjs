@@ -103,6 +103,7 @@ async function walkThrough(page, side) {
 	const room = () => page.evaluate(() => document.querySelector('canvas')?.dataset.room);
 	const world = () => page.evaluate(() => document.querySelector('canvas')?.dataset.world?.split(',').map(Number));
 	const from = await room();
+	console.error(`before ${side}: ${await page.evaluate(() => JSON.stringify({ me: document.querySelector('canvas').dataset.me, ghostGap: document.querySelector('canvas').dataset.ghostGap }))}`);
 	await page.evaluate(() => (document.querySelector('canvas').dataset.jump = '0'));
 	const before = await world();
 	const arrived = await walkInto(page, goal, room, from);
@@ -113,6 +114,7 @@ async function walkThrough(page, side) {
 	const after = await world();
 	const [dx, dy] = { east: [1, 0], west: [-1, 0], north: [0, 1], south: [0, -1] }[side];
 	console.error(`doorway ${from} → ${arrived}: largest frame move ${jump} m, world ${before} → ${after}`);
+	if (jump > MAX_JUMP) console.error(`JUMP DEBUG ${await page.evaluate(() => JSON.stringify({ jump: document.querySelector('canvas').dataset.jumpDebug, failed: document.querySelector('canvas').dataset.handoffFailed, closed: document.querySelector('canvas').dataset.zoneClosed }))}`);
 	assert.ok(jump <= MAX_JUMP, `${from} → ${arrived}: the view jumped ${jump} m in one frame`);
 	// Moved on in the doorway's direction, a few metres, not a room.
 	const along = (after[0] - before[0]) * dx + (after[1] - before[1]) * dy;
@@ -447,6 +449,22 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		assert.equal(await page.getAttribute('[data-testid=events]', 'data-live'), 'active');
 		console.error(`world event (read model, @live): ${await page.textContent('[data-testid=events] li[data-borough="0.0"]')}`);
 		await page.waitForSelector('[data-testid=world-event]', { timeout: 10_000 });
+
+		// Bow: auto-hunt turns ana to the nearest mob; R looses arrows; the
+		// room rewinds the mobs to what she saw (lag compensation) and its
+		// verdicts come back (green markers). First person turns the view.
+		await page.check('[data-testid=autohunt]');
+		await page.check('[data-testid=first-person]');
+		for (let i = 0; i < 30; i += 1) {
+			if (Number(await page.evaluate(() => document.querySelector('canvas')?.dataset.confirmed ?? 0)) > 0) break;
+			await page.keyboard.press('KeyR');
+			await page.waitForTimeout(450);
+		}
+		await page.waitForFunction(() => Number(document.querySelector('canvas')?.dataset.confirmed ?? 0) > 0, null, { timeout: 10_000 });
+		const bow = await page.evaluate(() => ({ ...document.querySelector('canvas').dataset }));
+		console.error(`bow: ${bow.shots} arrows, ${bow.resolved} verdicts, ${bow.confirmed} confirmed hits, ${bow.agreed} as seen`);
+		await page.uncheck('[data-testid=first-person]');
+		await page.uncheck('[data-testid=autohunt]');
 
 		// SSR after a reload: the settled numbers are in the server HTML.
 		const html = await page.evaluate(() => fetch('/pit', { headers: { accept: 'text/html' } }).then((r) => r.text()));

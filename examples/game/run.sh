@@ -60,13 +60,13 @@ SVELTEKIT="$HERE/sveltekit"
 BIN="$SERVER/target/debug/game-demos"
 SERVICE_BIN="$SERVER/target/debug/mobpit-service"
 CELLS="$HERE/cells"
-DEMOS=(mobpit leaderboard gallery freeze)
+DEMOS=(mobpit leaderboard freeze)
 # Demos whose durable state lives in celld cells.
 CELLD_DEMOS=(mobpit leaderboard freeze)
 export MOBPIT_DATA_DIR="${MOBPIT_DATA_DIR:-$HERE/.data/mobpit}"
 # Game surfaces with a generated client (`game_demos::<surface>::game_surface`);
 # the leaderboard page uses Mob Pit's.
-SURFACES=(mobpit gallery freeze)
+SURFACES=(mobpit freeze)
 CLI="$REPO/target/debug/distributed"
 
 log() { printf '\033[1;36m[demos]\033[0m %s\n' "$*"; }

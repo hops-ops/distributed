@@ -17,7 +17,13 @@ export const PIT_RULES: PitRules = {
 	states: ['idle', 'chase', 'windup', 'recover', 'return', 'dead'],
 	attackRange: 2.200000047683716,
 	attackHalfAngle: 1.0471975803375244,
-	swingFrames: 6
+	swingFrames: 6,
+	range: 30,
+	fireCooldown: 12,
+	eyeHeight: 1.5,
+	hipHeight: 0.6000000238418579,
+	maxRewindMs: 600,
+	mobHeights: [0.8999999761581421, 0.8999999761581421, 1.5, 2, 2.799999952316284]
 };
 
 /** `pit_world`, as the client decodes it. */

@@ -98,10 +98,20 @@
 	let autoHunt = $state(false);
 	let ghost = $state(true);
 	let predict = $state(true);
+	let firstPerson = $state(false);
+	let compensated = $state(true);
 	$effect(() => {
 		const client = game.client;
 		if (client === undefined || canvas === undefined) return;
-		return startPitLoop(canvas, { client, hello: () => hello.current, autoHunt: () => autoHunt, ghost: () => ghost, world: () => world });
+		return startPitLoop(canvas, {
+			client,
+			hello: () => hello.current,
+			autoHunt: () => autoHunt,
+			ghost: () => ghost,
+			world: () => world,
+			firstPerson: () => firstPerson,
+			compensated: () => compensated
+		});
 	});
 	$effect(() => game.client?.setPredictionEnabled(predict));
 
@@ -173,6 +183,12 @@
 			{#if game.error}<div class="error" data-testid="error">{game.error}</div>{/if}
 			<label><input type="checkbox" bind:checked={autoHunt} data-testid="autohunt" /> auto-hunt</label>
 			<small>WASD move · Space attack · E dash · Q jump · walk through a doorway (the gaps in the walls) to the next room</small>
+		</section>
+		<section data-testid="ranged">
+			<h2>Bow</h2>
+			<label><input type="checkbox" bind:checked={firstPerson} data-testid="first-person" /> first person (click to look; the view turns with you)</label>
+			<label><input type="checkbox" bind:checked={compensated} data-testid="compensated" /> lag compensation</label>
+			<small>R / click shoots where you aim (the mouse). Yellow: where you saw it land; green / red: the room's verdict.</small>
 		</section>
 		<section data-testid="world">
 			<h2>World</h2>

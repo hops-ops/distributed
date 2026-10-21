@@ -161,6 +161,31 @@ fn capsule_streams(extra_bytes: usize) -> Vec<Stream> {
 /// Mob Pit's step in the entrance (the classic pillars) and in rooms of
 /// other seeded patterns (the context names the room; its obstacles are
 /// generated inside the step).
+/// Mob Pit frames from `[mx, my, buttons]` frames: the aim and shot
+/// fields (varint-encoded) filled from a seeded generator, every button bit
+/// kept (unknown ones are cleared by the decoder).
+fn pit_frames(frames: Vec<Vec<u8>>, seed: u32) -> Vec<Vec<u8>> {
+    use distributed_game::GameInput;
+    use game_sim::mobpit::PitInput;
+    let mut rng = Rng(0x7a11_0000 ^ seed.max(1));
+    frames
+        .into_iter()
+        .map(|f| {
+            let unit = |r: &mut Rng| (r.next() >> 8) as f32 / 16_777_216.0;
+            PitInput {
+                mx: f[0] as i8,
+                my: f[1] as i8,
+                buttons: f[2],
+                yaw: (unit(&mut rng) - 0.5) * 6.2,
+                pitch: unit(&mut rng) * 3.0 - 1.5,
+                shot: rng.next() as u16,
+                delay_ms: (rng.next() % 900) as u16,
+            }
+            .to_payload()
+        })
+        .collect()
+}
+
 fn pit_streams() -> Vec<Stream> {
     use game_sim::mobpit::{canonicalize, room_obstacles, PitRoomContext, PitState, DEFAULT_SEED};
     let context = |x: i32, y: i32| {
@@ -189,6 +214,7 @@ fn pit_streams() -> Vec<Stream> {
             f
         })
         .collect();
+    let scripted_jumps = pit_frames(scripted_jumps, 7);
     let mut streams = vec![
         Stream {
             name: "scripted + jumps".into(),
@@ -200,13 +226,13 @@ fn pit_streams() -> Vec<Stream> {
             name: "random".into(),
             start: start(8.0, 3.0),
             context: context(0, 0),
-            inputs: random(0x1234_5678, 3000, 0),
+            inputs: pit_frames(random(0x1234_5678, 3000, 0), 1),
         },
         Stream {
             name: "corner".into(),
             start: start(18.5, -18.5),
             context: context(0, 0),
-            inputs: random(0x0bad_cafe, 600, 0),
+            inputs: pit_frames(random(0x0bad_cafe, 600, 0), 2),
         },
     ];
     let mut patterns = std::collections::BTreeSet::new();
@@ -219,7 +245,7 @@ fn pit_streams() -> Vec<Stream> {
             name: format!("pit.{x}.2 pattern {pattern}"),
             start: start(4.5, 4.5),
             context: context(x, 2),
-            inputs: random(0x51ed ^ x as u32, 1200, 0),
+            inputs: pit_frames(random(0x51ed ^ x as u32, 1200, 0), x as u32),
         });
     }
     streams

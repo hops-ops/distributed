@@ -111,6 +111,59 @@ export const TIERS: Readonly<Record<number, { name: string; radius: number; tele
 	pit.PIT_RULES.tiers.map((t) => [t.tier, { ...(TIER_LOOK[t.tier] ?? { name: `Tier ${t.tier}`, color: '#9ad16b' }), radius: t.radius, tele: t.tele }])
 );
 
+export type Vec3 = [number, number, number];
+
+/** One ranged shot: what the client saw, then the room's verdict. */
+export type ShotRecord = {
+	id: number;
+	/** Room-local eye position and unit aim (z up). */
+	origin: Vec3;
+	dir: Vec3;
+	zone: string;
+	compensated: boolean;
+	/** The mob the client saw the arrow hit (undefined: a predicted miss). */
+	predicted: number | undefined;
+	/** Where it met the predicted mob, or where it stops. */
+	point: Vec3;
+	delayMs: number;
+	verdict?: pit.ShotEvent;
+};
+
+/** Ranged numbers for the HUD and tests. */
+export type RangedStats = {
+	shots: number;
+	predictedHits: number;
+	confirmedHits: number;
+	/** Client and room agree (same mob, or both a miss). */
+	agreed: number;
+	resolved: number;
+	clamped: number;
+	lastAgeMs: number;
+};
+
+/** Entry distance of a ray (unit `dir`) into a vertical capsule standing on the floor. */
+export function rayCapsule(origin: Vec3, dir: Vec3, x: number, y: number, radius: number, height: number): number | undefined {
+	// Horizontal circle first, then the height at the entry.
+	const flat = Math.hypot(dir[0], dir[1]);
+	if (flat < 1e-6) return undefined;
+	const ux = dir[0] / flat;
+	const uy = dir[1] / flat;
+	const ox = x - origin[0];
+	const oy = y - origin[1];
+	const along = ox * ux + oy * uy;
+	const off2 = ox * ox + oy * oy - along * along;
+	if (along <= 0 || off2 > radius * radius) return undefined;
+	const entry = (along - Math.sqrt(radius * radius - off2)) / flat;
+	const z = origin[2] + dir[2] * entry;
+	return z >= 0 && z <= height ? entry : undefined;
+}
+
+/** Unit aim from yaw (radians from +x) and pitch (up positive). */
+export function aimDir(yaw: number, pitch: number): Vec3 {
+	const flat = Math.cos(pitch);
+	return [Math.cos(yaw) * flat, Math.sin(yaw) * flat, Math.sin(pitch)];
+}
+
 /** One leaderboard row (`/dev/mobpit/leaderboard`). */
 export type BoardRow = Readonly<{ rank: number; member: string; name: string; score: number }>;
 /** The leaderboard snapshot the services keep (top-N, store, rebuilds). */
@@ -195,6 +248,17 @@ export type MobPitClient = pit.MobpitClient &
 		pures: ReturnType<typeof pit.createMobpitPures>;
 		/** Resolves on the first hello, once the predicted step is loaded. */
 		ready: Promise<pit.HelloEvent>;
+		/** Ranged shots by id (latest 256). */
+		shots: Map<number, ShotRecord>;
+		rangedStats: RangedStats;
+		/**
+		 * Prepare a ranged shot along `yaw`/`pitch` from the own eye: the
+		 * predicted hit (ray against the mobs as rendered) and the input
+		 * fields to send this frame (shot id, view delay, the fire bits).
+		 */
+		aimShot(yaw: number, pitch: number, compensated: boolean, firstPerson?: boolean): { record: ShotRecord; input: Pick<pit.PitInput, 'buttons' | 'shot' | 'delayMs' | 'yaw' | 'pitch'> } | undefined;
+		/** Resolves with the verdict of shot `id`. */
+		verdict(id: number): Promise<pit.ShotEvent>;
 		/** The neighbour rooms watched (`watchZones` over `neighbourRooms`), when enabled. */
 		neighbours(): ReadonlyMap<string, WatchState>;
 		/** Stop watching neighbours and close the client. */
@@ -247,6 +311,68 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 	});
 	typed.on('saved', (saved) => unsaved.delete(saved.key));
 	const pures = pit.createMobpitPures();
+
+	// ---- ranged: predicted hits, verdicts ----
+	const shots = new Map<number, ShotRecord>();
+	const waiters = new Map<number, (v: pit.ShotEvent) => void>();
+	const rangedStats: RangedStats = { shots: 0, predictedHits: 0, confirmedHits: 0, agreed: 0, resolved: 0, clamped: 0, lastAgeMs: 0 };
+	let nextShot = 0;
+	typed.on('shot', (verdict) => {
+		const shot = shots.get(verdict.shot);
+		if (shot === undefined || shot.verdict !== undefined) return;
+		shot.verdict = verdict;
+		rangedStats.resolved += 1;
+		if (verdict.hit !== undefined) rangedStats.confirmedHits += 1;
+		if (verdict.hit === shot.predicted) rangedStats.agreed += 1;
+		if (verdict.clamped) rangedStats.clamped += 1;
+		rangedStats.lastAgeMs = verdict.ageMs;
+		waiters.get(verdict.shot)?.(verdict);
+		waiters.delete(verdict.shot);
+	});
+	const heights = pit.PIT_RULES.mobHeights;
+	const range = pit.PIT_RULES.range;
+	const aimShot = (yaw: number, pitch: number, compensated: boolean, firstPerson = false) => {
+		const zone = typed.client.authority;
+		const meNow = me();
+		if (zone === undefined || meNow === undefined || !zone.connection.canSendInput()) return undefined;
+		const p = pit.playerFields(meNow);
+		// First person: from the eye along the look; else level at the hip.
+		const origin: Vec3 = [p.x, p.y, p.z + (firstPerson ? pit.PIT_RULES.eyeHeight : pit.PIT_RULES.hipHeight)];
+		const dir = aimDir(yaw, firstPerson ? pitch : 0);
+		// The view time: the room rewinds to exactly what is drawn.
+		const context = typed.client.inputContext(zone)!;
+		const renderTime = zone.connection.serverNow() - context.interpolationDelayMs;
+		const delayMs = Math.max(0, zone.connection.tickTime(context.clientTick) - renderTime);
+		let predicted: number | undefined;
+		let best = range;
+		for (const e of typed.client.render()) {
+			if (!pit.isMob(e) || e.stale || e.zoneId !== zone.zoneId) continue;
+			const m = pit.mobFields(e);
+			const t = TIERS[m.tier];
+			const d = rayCapsule(origin, dir, m.x, m.y, t?.radius ?? 0.5, heights[m.tier] ?? 1);
+			if (d !== undefined && d < best) {
+				best = d;
+				predicted = e.id;
+			}
+		}
+		nextShot = (nextShot % 0xffff) + 1;
+		const record: ShotRecord = {
+			id: nextShot,
+			origin,
+			dir,
+			zone: zone.zoneId,
+			compensated,
+			predicted,
+			point: [origin[0] + dir[0] * best, origin[1] + dir[1] * best, origin[2] + dir[2] * best],
+			delayMs
+		};
+		shots.set(record.id, record);
+		if (shots.size > 256) shots.delete(shots.keys().next().value!);
+		rangedStats.shots += 1;
+		if (predicted !== undefined) rangedStats.predictedHits += 1;
+		const buttons = pit.BUTTON.fire | (compensated ? 0 : pit.BUTTON.noComp) | (firstPerson ? pit.BUTTON.aim : 0);
+		return { record, input: { buttons, shot: record.id, delayMs: Math.min(0xffff, Math.round(delayMs)), yaw, pitch } };
+	};
 	// The own player: the predicted entity, or (mid-handoff) the SDK's
 	// bridge, the last predicted state in the room just left.
 	const me = () => {
@@ -271,6 +397,14 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		pures,
 		ready: Promise.all([hello.ready, typed.prediction?.ready, pures.ready]).then(([h]) => h),
 		neighbours: () => watcher?.states() ?? new Map(),
+		shots,
+		rangedStats,
+		aimShot,
+		verdict(id) {
+			const known = shots.get(id)?.verdict;
+			if (known !== undefined) return Promise.resolve(known);
+			return new Promise((resolve) => waiters.set(id, resolve));
+		},
 		close: () => {
 			watcher?.stop();
 			typed.client.close();

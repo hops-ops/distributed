@@ -63,6 +63,7 @@ import {
 	roomZone,
 	TIERS,
 	type BoardSnapshot,
+	type ShotRecord,
 	type RoomInfo,
 	type RoomStatus,
 	type TiersAround
@@ -146,13 +147,15 @@ function applySky(dtMs: number): void {
 
 const hud = new Hud({
 	title: 'Mob Pit',
-	hint: 'WASD move · Space attack · E dash · Q jump (over a slam) · walk through a doorway to the next room · O debug overlay · P prediction · G server ghost. Rooms run on celld; kills are durable facts.',
+	hint: 'WASD move · Space attack · R / click shoot · E dash · Q jump (over a slam) · V first person · C lag compensation · walk through a doorway to the next room · O debug overlay · P prediction · G server ghost. Rooms run on celld; kills are durable facts.',
 	client,
 	devApi: api
 });
 let debug = params.get('debug') !== '0';
 hud.toggle('Debug overlay (celld node per room)', debug, (on) => (debug = on), 'o');
 hud.toggle('Client prediction', true, (on) => client.setPredictionEnabled(on), 'p');
+hud.toggle('First-person view (click to look, R / click fires)', false, (on) => stage.setView(on ? 'first' : 'third'), 'v');
+hud.toggle('Lag compensation (ranged)', true, (on) => (compensated = on), 'c');
 let ghostOn = true;
 hud.toggle('Server ghost', true, (on) => (ghostOn = on), 'g');
 let corrections = 0;
@@ -760,16 +763,73 @@ function drawGraph(): void {
 const sampler = new InputSampler();
 const commandFrames = new InputPacer({ tickRate: () => client.authority?.connection.welcome?.tickRate });
 
+// Ranged: R or a click fires along the view (first person: where you
+// look; third person: the camera's heading). The room resolves the arrow
+// lag-compensated (C toggles it per shot).
+let fireQueued = false;
+let lastFireAt = 0;
+let compensated = true;
+window.addEventListener('keydown', (e) => {
+	if (e.code === 'KeyR' && !e.repeat) fireQueued = true;
+});
+canvas.addEventListener('mousedown', (e) => {
+	if (e.button !== 0) return;
+	// First person: the first click only captures the mouse.
+	if (stage.view() === 'first' && document.pointerLockElement !== canvas) return;
+	fireQueued = true;
+});
+
 function sendCommandFrame(): void {
 	const s = sampler.sample();
 	const move = cameraRelative(s, stage.cameraForward());
-	const input: PitInput = {
+	const aim = stage.aim();
+	const first = stage.view() === 'first';
+	let input: PitInput = {
 		mx: toAxis(move.x),
 		my: toAxis(move.y),
-		buttons: (s.action ? BUTTON.attack : 0) | (s.alt ? BUTTON.dash : 0) | (s.jump ? BUTTON.jump : 0)
+		buttons: (s.action ? BUTTON.attack : 0) | (s.alt ? BUTTON.dash : 0) | (s.jump ? BUTTON.jump : 0) | (first ? BUTTON.aim : 0),
+		yaw: aim.yaw,
+		pitch: aim.pitch,
+		shot: 0,
+		delayMs: 0
 	};
+	const now = performance.now();
+	if (fireQueued && now - lastFireAt >= (PIT_RULES.fireCooldown * 1000) / 30) {
+		const shot = pit.aimShot(aim.yaw, aim.pitch, compensated, first);
+		if (shot !== undefined) {
+			input = { ...input, ...shot.input, buttons: input.buttons | shot.input.buttons };
+			lastFireAt = now;
+			marker(shot.record);
+		}
+	}
+	fireQueued = false;
 	client.sendInput(input);
 }
+
+// ---- shot markers: yellow where you saw it land, then green (the room
+// confirmed the hit) or red (it missed) ----
+const markerMats = {
+	pending: material(scene, 'marker-pending', '#ffd166'),
+	hit: material(scene, 'marker-hit', '#3ddc84'),
+	miss: material(scene, 'marker-miss', '#ff5252')
+};
+for (const m of Object.values(markerMats)) m.emissiveColor = m.diffuseColor.clone();
+function marker(record: ShotRecord): void {
+	const ball = MeshBuilder.CreateSphere(`shot-${record.id}`, { diameter: 0.35, segments: 6 }, scene);
+	ball.material = markerMats.pending;
+	ball.isPickable = false;
+	ball.position.copyFrom(placeIn(record.zone, record.point[0], record.point[1], record.point[2]));
+	const done = () => setTimeout(() => ball.dispose(), 1200);
+	pit.verdict(record.id).then((v) => {
+		ball.material = v.hit !== undefined ? markerMats.hit : markerMats.miss;
+		ball.position.copyFrom(placeIn(record.zone, v.x, v.y, v.z));
+		done();
+	});
+	setTimeout(() => ball.dispose(), 4000);
+}
+// A crosshair in first person.
+const crosshair = div('pit-crosshair', document.body);
+crosshair.textContent = '+';
 
 // ---- frame ----
 stage.onFrame((now, dtMs) => {
@@ -840,9 +900,12 @@ stage.onFrame((now, dtMs) => {
 				visual.arc.rotation.y = -(face - SWING_HALF);
 			}
 			const label = `${player.name} · L${player.level} · ${player.hp} HP`;
-			stage.labels.set(entity.key, visual.body, mine ? `${label} (you)` : label, 1.4, mine ? 'me' : '');
-			visual.body.setEnabled(visible);
-			visual.nose.setEnabled(visible && !dead);
+			// First person: you are the camera (no body, no label of your own).
+			const hidden = mine && stage.view() === 'first';
+			if (hidden) stage.labels.delete(entity.key);
+			else stage.labels.set(entity.key, visual.body, mine ? `${label} (you)` : label, 1.4, mine ? 'me' : '');
+			visual.body.setEnabled(visible && !hidden);
+			visual.nose.setEnabled(visible && !dead && !hidden);
 			if (mine) me = { at: visual.body.position, hp: player.hp, dead };
 		}
 	}
@@ -859,7 +922,8 @@ stage.onFrame((now, dtMs) => {
 		stage.labels.delete(`popup:${key}`);
 		popups.delete(key);
 	}
-	if (me !== undefined) stage.follow(me.at.x, me.at.z, dtMs);
+	if (me !== undefined) stage.follow(me.at.x, me.at.z, dtMs, me.at.y - 0.9);
+	crosshair.style.display = stage.view() === 'first' ? '' : 'none';
 
 	// The server's own copy of you (authoritative, behind by the round
 	// trip): a wireframe ghost in the room that owns you.
@@ -905,6 +969,8 @@ stage.onFrame((now, dtMs) => {
 	hud.row('World event', w === undefined || w.event === '' ? 'none (the borough schedules the next)' : `${w.event} · ${left} s left`);
 	eventBanner.style.display = w !== undefined && w.event !== '' ? '' : 'none';
 	if (w !== undefined && w.event !== '') eventBanner.textContent = `${EVENT_TEXT[w.event] ?? w.event} · ${left} s`;
+	const r = pit.rangedStats;
+	hud.row('Ranged', `${r.shots} shots · ${r.confirmedHits} hits confirmed · ${r.agreed}/${r.resolved} as seen · last rewind ${r.lastAgeMs.toFixed(0)} ms${compensated ? '' : ' (compensation OFF)'}`);
 	hud.row('Interest', hello === undefined ? '—' : `${hello.viewRadius} m ring · ${rendered.filter((e) => isMob(e) && !e.stale).length} mobs replicated`);
 	const profile = pit.profile();
 	if (profile !== undefined) {

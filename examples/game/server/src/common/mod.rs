@@ -28,7 +28,7 @@ pub use guests::{random_hex, Guests};
 pub trait Demo: 'static {
     /// The zone type.
     type Zone: Zone<Config: Send>;
-    /// Subcommand / URL path name (`gallery` → `/gallery/`).
+    /// Subcommand / URL path name (`freeze` → `/freeze/`).
     const NAME: &'static str;
     /// Zone the client joins by default.
     const DEFAULT_ZONE: &'static str;

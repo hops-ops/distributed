@@ -50,6 +50,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
+use distributed_game::rewind::{Historic, HitQuery, RewindFrame, ShotTiming};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EmitError, Entities, Entity, EntityId, EntitySchema, Fact,
     FactOutcome, FactSettlement, GameEvent, GameInput, GameRecord, GameSurface, LeaveReason,
@@ -136,6 +137,9 @@ pub struct PlayerView {
     /// Waiting to respawn.
     #[correct(replace)]
     pub dead: bool,
+    /// Bow animation frames left (a ranged shot was loosed).
+    #[correct(replace)]
+    pub shot: u8,
 }
 
 /// A mob (dead mobs are not replicated).
@@ -336,6 +340,28 @@ pub enum PitEvent {
     /// whenever it changes.
     #[game_event(id = 7)]
     World(WorldTiers),
+    /// The verdict of one ranged shot (to the shooter).
+    #[game_event(id = 9)]
+    Shot {
+        /// Client shot id.
+        shot: u16,
+        /// Mob hit.
+        hit: Option<u32>,
+        /// Lag compensation used.
+        compensated: bool,
+        /// Rewind applied (ms, 0 without compensation).
+        age_ms: f32,
+        /// Rewind the shooter asked for (ms).
+        requested_age_ms: f32,
+        /// Limited by the clamp or the stored history.
+        clamped: bool,
+        /// Where the arrow stopped (room-local).
+        x: f32,
+        /// Where the arrow stopped.
+        y: f32,
+        /// Where the arrow stopped (height).
+        z: f32,
+    },
     /// The hood's boss fell here.
     #[game_event(id = 8)]
     BossDown {
@@ -448,6 +474,31 @@ const RECOVER_TICKS: u16 = 18;
 const RESPAWN_TICKS: u64 = 120;
 /// A player at least this high (m) jumps over a mob's slam.
 pub const SLAM_CLEARANCE: f32 = 0.9;
+/// Ranged reach (m).
+pub const RANGE: f32 = 30.0;
+/// Damage per arrow.
+pub const RANGED_DAMAGE: i32 = 12;
+/// Ticks between shots.
+pub const FIRE_COOLDOWN: u8 = 12;
+/// Bow animation frames.
+const SHOT_FRAMES: u8 = 6;
+/// Eye height above the feet (m): where first-person arrows leave from.
+pub const EYE_HEIGHT: f32 = 1.5;
+/// Where third-person (and top-down) arrows leave from, flying level (m).
+pub const HIP_HEIGHT: f32 = 0.6;
+/// Furthest a shot is rewound (ms): the anti-cheat clamp.
+pub const MAX_REWIND_MS: u64 = 600;
+/// Obstacles stop arrows below this height (m).
+const OBSTACLE_HEIGHT: f32 = 2.4;
+/// Mob body height by tier (m): their hit capsule.
+fn mob_height(tier: u8) -> f32 {
+    match tier {
+        4 => 2.8,
+        3 => 2.0,
+        2 => 1.5,
+        _ => 0.9,
+    }
+}
 const PLAYER_RESPAWN_TICKS: u64 = 90;
 
 /// Mob tier stats: (max hp, speed m/s, damage, radius, telegraph radius).
@@ -506,6 +557,18 @@ pub struct PitRules {
     pub attack_half_angle: f32,
     /// Swing animation length (ticks; the player's `swing` counts down from it).
     pub swing_frames: u8,
+    /// Ranged reach (m).
+    pub range: f32,
+    /// Ticks between shots.
+    pub fire_cooldown: u8,
+    /// Eye height above the feet (m): first-person arrows.
+    pub eye_height: f32,
+    /// Hip height (m): level third-person arrows.
+    pub hip_height: f32,
+    /// Furthest a shot is rewound (ms).
+    pub max_rewind_ms: u32,
+    /// Mob body height by tier (index = tier).
+    pub mob_heights: Vec<f32>,
 }
 
 /// The `PIT_RULES` constant.
@@ -522,6 +585,12 @@ pub fn pit_rules() -> PitRules {
         attack_range: ATTACK_RANGE,
         attack_half_angle: ATTACK_ARC_COS.acos(),
         swing_frames: SWING_FRAMES,
+        range: RANGE,
+        fire_cooldown: FIRE_COOLDOWN,
+        eye_height: EYE_HEIGHT,
+        hip_height: HIP_HEIGHT,
+        max_rewind_ms: MAX_REWIND_MS as u32,
+        mob_heights: (0..=4).map(mob_height).collect(),
     }
 }
 
@@ -566,6 +635,9 @@ struct Player {
     dead_until: Option<u64>,
     level: u32,
     regen: u8,
+    /// Ranged cooldown (ticks) and bow animation frames.
+    fire_cd: u8,
+    shot_anim: u8,
     /// Handed to a neighbouring room: no more steps here.
     leaving: bool,
 }
@@ -658,6 +730,19 @@ pub struct MobPit {
     world: WorldTiers,
     /// This activation told its borough it is awake (arms its events).
     awake_reported: bool,
+    /// Ranged shots of this tick, resolved after the players stepped.
+    fires: Vec<Fire>,
+}
+
+/// A ranged shot to resolve.
+struct Fire {
+    player: PlayerId,
+    shot: u16,
+    client_tick: u32,
+    delay_ms: u16,
+    origin: [f32; 3],
+    dir: [f32; 3],
+    compensated: bool,
 }
 
 fn spawn_state(player: PlayerId) -> MoveState {
@@ -927,6 +1012,7 @@ impl MobPit {
     fn step_players(&mut self, ctx: &mut Ctx<'_, Self>) -> Vec<(PlayerId, f32, f32, f32)> {
         let tick = ctx.tick();
         let mut swings = Vec::new();
+        let mut fires = Vec::new();
         // The predicted step's context: this room (its seeded obstacles).
         let context = PitRoomContext {
             seed: self.room.seed,
@@ -937,6 +1023,8 @@ impl MobPit {
         for (id, p) in &mut self.players {
             p.credits = (p.credits + 1).min(MAX_CREDITS);
             p.swing_cd = p.swing_cd.saturating_sub(1);
+            p.fire_cd = p.fire_cd.saturating_sub(1);
+            p.shot_anim = p.shot_anim.saturating_sub(1);
             p.swing_anim = p.swing_anim.saturating_sub(1);
             if let Some(until) = p.dead_until {
                 // Dead: inputs are consumed but ignored.
@@ -960,13 +1048,44 @@ impl MobPit {
                 let Some(input) = ctx.take_inputs(*id, ConsumePolicy::Next).pop() else {
                     break;
                 };
+                let client_tick = input.client_tick;
                 let input = input.input;
                 // The declared predicted step: what the client runs as WASM.
                 p.state = pit_step(&p.state, &input, &context, movement::DT);
                 p.credits -= 1;
                 let (sx, sy) = (f32::from(input.mx), f32::from(input.my));
-                if sx * sx + sy * sy > 20.0 * 20.0 {
+                if input.aims() && input.yaw.is_finite() {
+                    // First person: you face where you look.
+                    p.face = input.yaw;
+                } else if sx * sx + sy * sy > 20.0 * 20.0 {
                     p.face = sy.atan2(sx);
+                }
+                if input.fire() && p.fire_cd == 0 {
+                    p.fire_cd = FIRE_COOLDOWN;
+                    p.shot_anim = SHOT_FRAMES;
+                    fires.push(Fire {
+                        player: *id,
+                        shot: input.shot,
+                        client_tick,
+                        delay_ms: input.delay_ms,
+                        // First person: from the eye along the look; else
+                        // level, at waist height, along the yaw.
+                        origin: [
+                            p.state.x,
+                            p.state.y,
+                            p.state.z + if input.aims() { EYE_HEIGHT } else { HIP_HEIGHT },
+                        ],
+                        dir: if input.aims() {
+                            input.aim_dir()
+                        } else {
+                            PitInput {
+                                pitch: 0.0,
+                                ..input
+                            }
+                            .aim_dir()
+                        },
+                        compensated: input.buttons & PitInput::NO_COMP == 0,
+                    });
                 }
                 if input.attack() && p.swing_cd == 0 {
                     p.swing_cd = SWING_COOLDOWN;
@@ -986,6 +1105,7 @@ impl MobPit {
             }
             ctx.set_view(*id, View::new(p.state.x, p.state.y, VIEW_RADIUS));
         }
+        self.fires = fires;
         swings
     }
 
@@ -1038,25 +1158,126 @@ impl MobPit {
                 if cos < ATTACK_ARC_COS && d > radius + PLAYER_RADIUS {
                     continue;
                 }
-                m.hp -= ATTACK_DAMAGE;
-                if matches!(m.state, MobState::Idle | MobState::Return) {
-                    m.state = MobState::Chase;
-                    m.target = Some(player);
-                }
-                if m.hp <= 0 {
-                    m.hp = 0;
-                    m.state = MobState::Dead;
-                    m.respawn_at = ctx.tick()
-                        + if m.tier == BOSS_TIER {
-                            BOSS_RESPAWN_TICKS
-                        } else {
-                            RESPAWN_TICKS
-                        };
-                    m.target = None;
-                    self.emit_kill(ctx, player, i);
-                }
+                self.hurt_mob(ctx, player, i, ATTACK_DAMAGE);
             }
         }
+    }
+
+    /// `player` deals `damage` to mob `i` (it turns on them; at 0 HP it
+    /// dies and the kill is a fact).
+    fn hurt_mob(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId, i: usize, damage: i32) {
+        let m = &mut self.mobs[i];
+        m.hp -= damage;
+        if matches!(m.state, MobState::Idle | MobState::Return) {
+            m.state = MobState::Chase;
+            m.target = Some(player);
+        }
+        if m.hp <= 0 {
+            m.hp = 0;
+            m.state = MobState::Dead;
+            m.respawn_at = ctx.tick()
+                + if m.tier == BOSS_TIER {
+                    BOSS_RESPAWN_TICKS
+                } else {
+                    RESPAWN_TICKS
+                };
+            m.target = None;
+            self.emit_kill(ctx, player, i);
+        }
+    }
+
+    /// Resolve this tick's ranged shots, **lag-compensated**: each is a ray
+    /// from the shooter's eye (its jump height included) along its aim,
+    /// tested against the mobs as they were at the shooter's view time
+    /// (`client_tick` minus the interpolation delay the shot carries,
+    /// `ctx.rewind()`, clamped to `MAX_REWIND_MS`), or against the latest
+    /// state with compensation off. Obstacles stop arrows. Each shooter
+    /// gets a verdict ([`PitEvent::Shot`]).
+    fn resolve_fires(&mut self, ctx: &mut Ctx<'_, Self>) {
+        let fires = std::mem::take(&mut self.fires);
+        let mut verdicts = Vec::with_capacity(fires.len());
+        {
+            let rewind = ctx.rewind();
+            let Some(latest) = rewind.latest().map(|f| f.time()) else {
+                return;
+            };
+            for fire in &fires {
+                let query = HitQuery::ray(fire.origin, fire.dir, RANGE);
+                let timing = ShotTiming {
+                    client_tick: fire.client_tick,
+                    interp_delay: Duration::from_millis(fire.delay_ms.into()),
+                };
+                let resolved = rewind.resolve(timing);
+                let (time, age, requested, clamped) = match (fire.compensated, resolved) {
+                    (true, Some(r)) => (r.time, r.age, r.requested_age, r.clamped),
+                    (_, r) => (
+                        latest,
+                        Duration::ZERO,
+                        r.map_or(Duration::ZERO, |r| r.requested_age),
+                        false,
+                    ),
+                };
+                let mobs = &self.mobs;
+                let hit = rewind
+                    .hit_test(time, &query, |id| {
+                        mobs.get(id as usize - 1)
+                            .is_some_and(|m| m.state != MobState::Dead)
+                    })
+                    .map(|h| (h.id, h.distance))
+                    .filter(|&(_, d)| d < self.blocked_at(fire.origin, fire.dir));
+                verdicts.push((hit, time, age, requested, clamped));
+            }
+        }
+        for (fire, (hit, _, age, requested, clamped)) in fires.into_iter().zip(verdicts) {
+            let distance = hit.map_or(RANGE.min(self.blocked_at(fire.origin, fire.dir)), |h| h.1);
+            let at = [
+                fire.origin[0] + fire.dir[0] * distance,
+                fire.origin[1] + fire.dir[1] * distance,
+                fire.origin[2] + fire.dir[2] * distance,
+            ];
+            if let Some((id, _)) = hit {
+                self.hurt_mob(ctx, fire.player, id as usize - 1, RANGED_DAMAGE);
+            }
+            ctx.send(
+                fire.player,
+                &PitEvent::Shot {
+                    shot: fire.shot,
+                    hit: hit.map(|h| h.0),
+                    compensated: fire.compensated,
+                    age_ms: age.as_secs_f32() * 1000.0,
+                    requested_age_ms: requested.as_secs_f32() * 1000.0,
+                    clamped: fire.compensated && clamped,
+                    x: at[0],
+                    y: at[1],
+                    z: at[2],
+                },
+            );
+        }
+    }
+
+    /// Distance along a ray to the first obstacle it meets below its top
+    /// (a column, boulder or tree), or the range.
+    fn blocked_at(&self, origin: [f32; 3], dir: [f32; 3]) -> f32 {
+        let flat = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+        if flat < 1e-4 {
+            return RANGE;
+        }
+        let (ux, uy) = (dir[0] / flat, dir[1] / flat);
+        let mut best = RANGE;
+        for o in &self.pillars {
+            let (ox, oy) = (o.x - origin[0], o.y - origin[1]);
+            let along = ox * ux + oy * uy;
+            let off2 = ox * ox + oy * oy - along * along;
+            if along <= 0.0 || off2 > o.r * o.r {
+                continue;
+            }
+            // Horizontal distance to the entry, then along the 3D ray.
+            let entry = (along - (o.r * o.r - off2).sqrt()) / flat;
+            if (0.0..best).contains(&entry) && origin[2] + dir[2] * entry < OBSTACLE_HEIGHT {
+                best = entry;
+            }
+        }
+        best
     }
 
     fn step_mobs(&mut self, ctx: &mut Ctx<'_, Self>) {
@@ -1280,6 +1501,8 @@ impl MobPit {
                 dead_until: None,
                 level: 1,
                 regen: 0,
+                fire_cd: 0,
+                shot_anim: 0,
                 leaving: false,
             },
         );
@@ -1390,6 +1613,7 @@ impl Zone for MobPit {
                 }
             },
             awake_reported: false,
+            fires: Vec::new(),
         }
     }
 
@@ -1472,6 +1696,9 @@ impl Zone for MobPit {
         }
         self.measure_tick(ctx.now());
         let swings = self.step_players(ctx);
+        // Shots first, against the history up to the previous tick (what
+        // the shooters were shown), then the melee swings.
+        self.resolve_fires(ctx);
         self.resolve_swings(ctx, swings);
         self.step_mobs(ctx);
         self.walk_through_doorways(ctx);
@@ -1609,6 +1836,19 @@ impl Zone for MobPit {
         }
     }
 
+    /// The mobs' hit capsules each tick (ranged lag compensation).
+    fn record_rewind(&self, frame: &mut RewindFrame) {
+        for m in self.mobs.iter().filter(|m| m.state != MobState::Dead) {
+            let half = mob_height(m.tier) / 2.0;
+            frame.push(Historic::capsule(
+                m.id.get(),
+                [m.x, m.y, half],
+                half,
+                tier_stats(m.tier).3,
+            ));
+        }
+    }
+
     fn has_pending_work(&self) -> bool {
         !self.backlog.is_empty()
     }
@@ -1692,6 +1932,7 @@ impl Project<PlayerView> for Player {
                 swing: self.swing_anim,
                 level: self.level.min(u32::from(u16::MAX)) as u16,
                 dead: self.dead_until.is_some(),
+                shot: self.shot_anim,
             },
         ))
     }
@@ -1823,6 +2064,7 @@ pub fn encode_bot_input(dir: [f32; 2]) -> Vec<u8> {
         mx: axis(dir[0]),
         my: axis(dir[1]),
         buttons: PitInput::ATTACK,
+        ..PitInput::default()
     }
     .to_payload()
 }

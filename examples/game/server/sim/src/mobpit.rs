@@ -26,9 +26,13 @@ use distributed_game::{game_pure, predict, FieldType, GameInput, GameRecord};
 use crate::arena::{self, MoveInput, MoveState};
 use crate::grid;
 
-/// Input: the Arena's 3-byte frame (`[mx, my, buttons]`) with attack and
-/// jump bits next to dash.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameInput)]
+/// Input: the Arena's frame (`[mx, my, buttons]`) with attack, jump, fire,
+/// no-compensation and aim bits next to dash, then the aim — the yaw (the
+/// facing in the room's plane, radians from +x) and pitch (up positive) the
+/// player looks along — and, for a ranged shot, its id and the view delay
+/// behind `client_tick` the shooter was rendering (lag compensation). 11
+/// bytes per command frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, GameInput)]
 pub struct PitInput {
     /// Stick x.
     #[range(min = -127, max = 127)]
@@ -36,9 +40,22 @@ pub struct PitInput {
     /// Stick y.
     #[range(min = -127, max = 127)]
     pub my: i8,
-    /// [`PitInput::DASH`] | [`PitInput::ATTACK`] | [`PitInput::JUMP`].
-    #[buttons(dash, attack, jump)]
+    /// [`PitInput::DASH`] | [`PitInput::ATTACK`] | [`PitInput::JUMP`] |
+    /// [`PitInput::FIRE`] (a ranged shot) | [`PitInput::NO_COMP`] (resolve it
+    /// without lag compensation) | [`PitInput::AIM`] (face the aim: first
+    /// person).
+    #[buttons(dash, attack, jump, fire, no_comp, aim)]
     pub buttons: u8,
+    /// Aim yaw (radians from +x in the room's plane).
+    #[quant(centered = 3.2, bits = 16)]
+    pub yaw: f32,
+    /// Aim pitch (radians, up positive).
+    #[quant(centered = 1.6, bits = 16)]
+    pub pitch: f32,
+    /// Client shot id (with [`PitInput::FIRE`]; echoed in the verdict).
+    pub shot: u16,
+    /// Interpolation delay behind `client_tick` the shooter was rendering (ms).
+    pub delay_ms: u16,
 }
 
 impl PitInput {
@@ -59,6 +76,31 @@ impl PitInput {
     /// Jump held.
     pub fn jump(self) -> bool {
         self.buttons & Self::JUMP != 0
+    }
+
+    /// A ranged shot this frame.
+    pub fn fire(self) -> bool {
+        self.buttons & Self::FIRE != 0
+    }
+
+    /// Face the aim (first person).
+    pub fn aims(self) -> bool {
+        self.buttons & Self::AIM != 0
+    }
+
+    /// The unit aim direction `[x, y, z]` (z up), from yaw and pitch.
+    /// Server-side only (trig is not part of the predicted step).
+    pub fn aim_dir(self) -> [f32; 3] {
+        let (yaw, pitch) = (
+            if self.yaw.is_finite() { self.yaw } else { 0.0 },
+            if self.pitch.is_finite() {
+                self.pitch.clamp(-1.5, 1.5)
+            } else {
+                0.0
+            },
+        );
+        let flat = pitch.cos();
+        [yaw.cos() * flat, yaw.sin() * flat, pitch.sin()]
     }
 }
 
@@ -904,8 +946,7 @@ mod tests {
                 s,
                 PitInput {
                     mx: 127,
-                    my: 0,
-                    buttons: 0,
+                    ..PitInput::default()
                 },
                 &circles,
             );
@@ -920,9 +961,8 @@ mod tests {
     #[test]
     fn a_jump_goes_up_and_lands() {
         let jump = PitInput {
-            mx: 0,
-            my: 0,
             buttons: PitInput::JUMP,
+            ..PitInput::default()
         };
         let mut s = canonicalize(PitState {
             x: 4.5,
@@ -966,7 +1006,14 @@ mod tests {
 
     fn walk(mut s: PitState, mx: i8, my: i8, frames: usize) -> PitState {
         for _ in 0..frames {
-            s = step(s, PitInput { mx, my, buttons: 0 });
+            s = step(
+                s,
+                PitInput {
+                    mx,
+                    my,
+                    ..PitInput::default()
+                },
+            );
         }
         s
     }

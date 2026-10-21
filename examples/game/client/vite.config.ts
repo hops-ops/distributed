@@ -7,7 +7,7 @@
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 
-const DEMOS = ['mobpit', 'leaderboard', 'gallery', 'freeze'];
+const DEMOS = ['mobpit', 'leaderboard', 'freeze'];
 const server = process.env.GAME_DEMOS_SERVER ?? 'http://127.0.0.1:2567';
 const rooms = process.env.GAME_DEMOS_ROOMS ?? 'http://127.0.0.1:2570';
 

@@ -102,6 +102,7 @@ fn a_room_greets_with_its_coordinates_and_hands_off_through_doorways() {
             mx: (dx / len * 127.0) as i8,
             my: (dy / len * 127.0) as i8,
             buttons: 0,
+            ..PitInput::default()
         };
         room.push_input(
             client,
@@ -225,6 +226,7 @@ fn walk(
             mx: (dir[0] * 127.0) as i8,
             my: (dir[1] * 127.0) as i8,
             buttons: 0,
+            ..PitInput::default()
         };
         room.push_input(
             client,
@@ -378,6 +380,7 @@ fn a_boss_falls_to_a_party_its_hood_hears_and_it_stays_down() {
                 mx: (dx * k).round().clamp(-127.0, 127.0) as i8,
                 my: (dy * k).round().clamp(-127.0, 127.0) as i8,
                 buttons: if near { PitInput::ATTACK } else { 0 },
+                ..PitInput::default()
             };
             room.push_input(
                 *client,
@@ -504,6 +507,7 @@ fn face_a_slam(jump: bool) -> (i32, i32) {
                     mx: (dx * k) as i8,
                     my: (dy * k) as i8,
                     buttons: 0,
+                    ..PitInput::default()
                 },
             );
         }
@@ -523,5 +527,103 @@ fn a_jump_clears_a_mobs_slam() {
     assert!(
         after >= before,
         "jumping over it does not: {before} → {after}"
+    );
+}
+
+#[test]
+fn an_arrow_hits_the_mob_it_was_aimed_at_and_obstacles_stop_it() {
+    let clock = ManualClock::new();
+    let mut room = host("pit.0.0", &clock);
+    let (client, player) = join(&mut room, "ana");
+    for _ in 0..3 {
+        tick(&mut room, &clock);
+    }
+    let me = room.zone().player_state(player).expect("in").0;
+    // The nearest living mob with nothing in between.
+    let (id, mx, my, _) = room
+        .zone()
+        .mob_positions()
+        .into_iter()
+        .filter(|m| m.3)
+        .min_by(|a, b| {
+            let d = |m: &(u32, f32, f32, bool)| (m.1 - me.x).powi(2) + (m.2 - me.y).powi(2);
+            d(a).total_cmp(&d(b))
+        })
+        .expect("a mob");
+    let yaw = (my - me.y).atan2(mx - me.x);
+    let d = ((mx - me.x).powi(2) + (my - me.y).powi(2)).sqrt();
+    // Aim at the mob's middle from the eye.
+    let pitch = ((0.45 - mobpit_rooms::EYE_HEIGHT) / d).atan();
+    let shot = |n: u16, flags: u8| PitInput {
+        buttons: PitInput::FIRE | flags,
+        yaw,
+        pitch,
+        shot: n,
+        delay_ms: 100,
+        ..PitInput::default()
+    };
+    let mut verdicts = Vec::new();
+    for (seq, flags) in [(1u32, 0u8), (2, PitInput::NO_COMP)] {
+        room.push_input(
+            client,
+            seq,
+            room.tick() as u32,
+            &distributed_game::GameInput::to_payload(&shot(seq as u16, flags)),
+        );
+        for _ in 0..14 {
+            let out = tick(&mut room, &clock);
+            verdicts.extend(events(&out).into_iter().filter_map(|e| match e {
+                PitEvent::Shot {
+                    shot,
+                    hit,
+                    compensated,
+                    age_ms,
+                    ..
+                } => Some((shot, hit, compensated, age_ms)),
+                _ => None,
+            }));
+        }
+    }
+    assert_eq!(verdicts.len(), 2, "{verdicts:?}");
+    assert_eq!(verdicts[0].1, Some(id), "compensated: hit {verdicts:?}");
+    assert!(
+        verdicts[0].2 && verdicts[0].3 > 50.0,
+        "rewound ~100 ms: {verdicts:?}"
+    );
+    assert!(
+        !verdicts[1].2 && verdicts[1].3 == 0.0,
+        "uncompensated: no rewind"
+    );
+    // Straight into the central pillar (0, 0, r 2.5): stopped short.
+    let into_pillar = PitInput {
+        buttons: PitInput::FIRE,
+        yaw: (0.0 - me.y).atan2(0.0 - me.x),
+        pitch: 0.0,
+        shot: 9,
+        ..PitInput::default()
+    };
+    room.push_input(
+        client,
+        3,
+        room.tick() as u32,
+        &distributed_game::GameInput::to_payload(&into_pillar),
+    );
+    let mut stopped = None;
+    for _ in 0..3 {
+        let out = tick(&mut room, &clock);
+        for e in events(&out) {
+            if let PitEvent::Shot {
+                shot: 9, hit, x, y, ..
+            } = e
+            {
+                stopped = Some((hit, (x * x + y * y).sqrt()));
+            }
+        }
+    }
+    let (hit, from_centre) = stopped.expect("verdict");
+    assert_eq!(hit, None);
+    assert!(
+        (from_centre - 2.5).abs() < 0.2,
+        "stopped at the pillar: {from_centre}"
     );
 }

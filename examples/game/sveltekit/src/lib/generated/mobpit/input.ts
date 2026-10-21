@@ -8,6 +8,10 @@ export interface PitInput {
 	readonly mx: number;
 	readonly my: number;
 	readonly buttons: number;
+	readonly yaw: number;
+	readonly pitch: number;
+	readonly shot: number;
+	readonly delayMs: number;
 }
 
 export type Input = PitInput;
@@ -18,6 +22,9 @@ export const BITS = {
 		dash: 1,
 		attack: 2,
 		jump: 4,
+		fire: 8,
+		noComp: 16,
+		aim: 32,
 	},
 } as const;
 
@@ -29,12 +36,20 @@ export const INPUT_LAYOUT: PayloadLayout = [
 	['mx', { type: 'i8' }],
 	['my', { type: 'i8' }],
 	['buttons', { type: 'u8' }],
+	['yaw', { type: 'quant', min: -3.200000047683716, max: 3.199902296066284, bits: 16 }],
+	['pitch', { type: 'quant', min: -1.600000023841858, max: 1.599951148033142, bits: 16 }],
+	['shot', { type: 'u16' }],
+	['delayMs', { type: 'u16' }],
 ];
 
 const INPUT_RULES: readonly InputRule[] = [
 	{ range: [-127, 127] },
 	{ range: [-127, 127] },
-	{ buttons: 7 },
+	{ buttons: 63 },
+	undefined,
+	undefined,
+	undefined,
+	undefined,
 ];
 
 /** Payload bytes of one input frame. */

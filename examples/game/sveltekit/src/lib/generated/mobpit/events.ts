@@ -59,6 +59,12 @@ export interface PitRules {
 	readonly attackRange: number;
 	readonly attackHalfAngle: number;
 	readonly swingFrames: number;
+	readonly range: number;
+	readonly fireCooldown: number;
+	readonly eyeHeight: number;
+	readonly hipHeight: number;
+	readonly maxRewindMs: number;
+	readonly mobHeights: readonly number[];
 }
 
 /** Record `PitState` (`#[derive(GameRecord)]`). */
@@ -257,6 +263,31 @@ const BOSS_DOWN_LAYOUT: PayloadLayout = [
 	['hoodTier', { type: 'u32' }],
 ];
 
+/** Event `shot` (id 9). */
+export interface ShotEvent {
+	readonly shot: number;
+	readonly hit: number | undefined;
+	readonly compensated: boolean;
+	readonly ageMs: number;
+	readonly requestedAgeMs: number;
+	readonly clamped: boolean;
+	readonly x: number;
+	readonly y: number;
+	readonly z: number;
+}
+
+const SHOT_LAYOUT: PayloadLayout = [
+	['shot', { type: 'u16' }],
+	['hit', { type: 'optional', item: { type: 'u32' } }],
+	['compensated', { type: 'bool' }],
+	['ageMs', { type: 'f32' }],
+	['requestedAgeMs', { type: 'f32' }],
+	['clamped', { type: 'bool' }],
+	['x', { type: 'f32' }],
+	['y', { type: 'f32' }],
+	['z', { type: 'f32' }],
+];
+
 /** Message `loaded` (id 1). */
 export interface LoadedMessage {
 	readonly principal: string;
@@ -291,6 +322,7 @@ export const EVENT = {
 	died: 6,
 	world: 7,
 	bossDown: 8,
+	shot: 9,
 } as const;
 
 /** Event payload types by name. */
@@ -302,6 +334,7 @@ export interface Events {
 	died: DiedEvent;
 	world: WorldEvent;
 	bossDown: BossDownEvent;
+	shot: ShotEvent;
 }
 
 /** Codecs of every event. */
@@ -347,6 +380,12 @@ export const EVENTS: GameEventCodecs<Events> = {
 		name: 'boss_down',
 		encode: (value) => encodePayload(BOSS_DOWN_LAYOUT, value),
 		decode: (payload) => decodePayload(BOSS_DOWN_LAYOUT, payload) as unknown as BossDownEvent
+	},
+	shot: {
+		id: 9,
+		name: 'shot',
+		encode: (value) => encodePayload(SHOT_LAYOUT, value),
+		decode: (payload) => decodePayload(SHOT_LAYOUT, payload) as unknown as ShotEvent
 	},
 };
 

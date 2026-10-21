@@ -193,3 +193,15 @@
 	pointer-events: none;
 	z-index: 5;
 }
+
+.pit-crosshair {
+	position: fixed;
+	left: 50%;
+	top: 50%;
+	transform: translate(-50%, -50%);
+	color: #fff;
+	font: 24px/1 monospace;
+	text-shadow: 0 0 3px #000;
+	pointer-events: none;
+	z-index: 6;
+}

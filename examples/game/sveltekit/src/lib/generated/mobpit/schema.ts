@@ -43,6 +43,8 @@ export interface PlayerFields {
 	readonly level: number;
 	/** `bool` */
 	readonly dead: boolean;
+	/** `u8` */
+	readonly shot: number;
 }
 
 /** True for a `player` entity. */
@@ -68,6 +70,7 @@ export function playerFields(entity: { readonly fields: EntityFields }): PlayerF
 		swing: fieldNumber(f, 'swing'),
 		level: fieldNumber(f, 'level'),
 		dead: fieldBool(f, 'dead'),
+		shot: fieldNumber(f, 'shot'),
 	};
 }
 
@@ -184,6 +187,7 @@ export const FIELD_TYPES = {
 		swing: { type: 'u8' },
 		level: { type: 'u16' },
 		dead: { type: 'bool' },
+		shot: { type: 'u8' },
 	},
 	mob: {
 		x: { type: 'quant', min: -20, max: 20, bits: 14 },
@@ -226,5 +230,6 @@ export const CORRECTIONS: CorrectionPolicies = {
 		swing: { mode: 'replace' },
 		level: { mode: 'replace' },
 		dead: { mode: 'replace' },
+		shot: { mode: 'replace' },
 	},
 };
