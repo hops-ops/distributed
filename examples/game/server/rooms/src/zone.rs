@@ -475,6 +475,7 @@ pub const SWING_COOLDOWN: u8 = 13;
 const SWING_FRAMES: u8 = 6;
 /// Player max HP.
 pub const PLAYER_HP: i32 = 100;
+/// Inputs a player may bank (one per tick, plus one per dropped tick).
 const MAX_CREDITS: u8 = 4;
 /// Interest radius (m): mobs and players farther away are not replicated
 /// (the page draws it as the interest ring). From any spawn point every mob
@@ -1112,8 +1113,16 @@ impl MobPit {
             y: self.room.room.1,
         };
         let blessing = self.world.event == "blessing";
+        // Inputs are paced by wall-clock time: a tick the host dropped is a
+        // credit too, or the inputs sent during it stay queued for good (the
+        // ghost then trails by the whole queue).
+        let dropped = u8::try_from(ctx.dropped_ticks()).unwrap_or(u8::MAX);
         for (id, p) in &mut self.players {
-            p.credits = (p.credits + 1).min(MAX_CREDITS);
+            p.credits = p
+                .credits
+                .saturating_add(1)
+                .min(MAX_CREDITS)
+                .saturating_add(dropped);
             p.swing_cd = p.swing_cd.saturating_sub(1);
             p.fire_cd = p.fire_cd.saturating_sub(1);
             p.shot_anim = p.shot_anim.saturating_sub(1);

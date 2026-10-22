@@ -758,3 +758,81 @@ fn a_content_update_switches_the_pack_stamps_facts_and_holds_old_clients() {
             .collect::<Vec<_>>()
     );
 }
+
+/// Highest input sequence the room acked to `client` in `out` (read from
+/// the Delta header: the body needs the client's entity map).
+fn acked(out: &[Outbound], client: ClientId, last: u32) -> u32 {
+    out.iter()
+        .filter_map(|o| match o {
+            Outbound::Frame { client: c, frame } if *c == client => {
+                let mut r = distributed_game::protocol::Reader::new(frame);
+                if r.u8().ok()? != 0x81 {
+                    return None;
+                }
+                let _server_tick = r.varuint().ok()?;
+                r.varuint().ok()
+            }
+            _ => None,
+        })
+        .fold(last, u32::max)
+}
+
+/// Three ticks without input: the next patch carries the latest ack.
+fn settle(room: &mut ZoneHost<MobPit>, clock: &ManualClock, client: ClientId, ack: u32) -> u32 {
+    (0..3).fold(ack, |ack, _| acked(&tick(room, clock), client, ack))
+}
+
+#[test]
+fn inputs_sent_through_a_stall_drain_but_a_fast_client_is_still_paced() {
+    let clock = ManualClock::new();
+    let mut room = host("pit.0.0", &clock);
+    let (client, _) = join(&mut room, "ana");
+    let idle = PitInput::default();
+    let payload = distributed_game::GameInput::to_payload(&idle);
+    let mut seq = 0;
+    let mut ack = 0;
+    for _ in 0..10 {
+        seq += 1;
+        room.push_input(client, seq, seq, &payload);
+        ack = acked(&tick(&mut room, &clock), client, ack);
+    }
+    ack = settle(&mut room, &clock, client, ack);
+    assert_eq!(ack, seq, "in step before the stall");
+
+    // The room stalls for a second while the client keeps sending at 30 Hz:
+    // the host runs its catch-up cap and drops the other ticks.
+    for _ in 0..30 {
+        seq += 1;
+        room.push_input(client, seq, seq, &payload);
+    }
+    clock.advance(Duration::from_secs(1));
+    let report = room.advance();
+    assert!(
+        report.dropped_ticks > 20,
+        "dropped {}",
+        report.dropped_ticks
+    );
+    ack = acked(&room.drain_outbound(), client, ack);
+    for _ in 0..5 {
+        seq += 1;
+        room.push_input(client, seq, seq, &payload);
+        ack = acked(&tick(&mut room, &clock), client, ack);
+    }
+    ack = settle(&mut room, &clock, client, ack);
+    assert_eq!(ack, seq, "the stall's inputs did not stay queued");
+
+    // A client sending two inputs a tick is still held to one a tick.
+    let start = ack;
+    for _ in 0..30 {
+        for _ in 0..2 {
+            seq += 1;
+            room.push_input(client, seq, seq, &payload);
+        }
+        ack = acked(&tick(&mut room, &clock), client, ack);
+    }
+    assert!(
+        ack - start <= 30 + 4,
+        "paced: {} inputs in 30 ticks",
+        ack - start
+    );
+}

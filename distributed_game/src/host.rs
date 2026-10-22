@@ -253,6 +253,9 @@ pub(crate) struct Core<Z: Zone> {
     tick: u64,
     sim_time: Duration,
     dt: Duration,
+    /// Ticks dropped (catch-up cap) since the last simulated tick; seen by
+    /// the next `on_tick` through `Ctx::dropped_ticks`, then reset.
+    dropped_ticks: u32,
     tier: Tier,
     players: BTreeMap<PlayerId, PlayerSlot<Z::Input>>,
     observers: BTreeMap<ObserverId, ObserverSlot>,
@@ -412,6 +415,15 @@ impl<Z: Zone> Ctx<'_, Z> {
     /// Step length of the current tick (Hot or Idle rate).
     pub fn dt(&self) -> Duration {
         self.core.dt
+    }
+
+    /// Ticks the host dropped right before this one: the clock ran further
+    /// ahead than `max_catch_up` steps, so the rest of the backlog was not
+    /// simulated (0 normally). Simulated ticks then lag wall-clock time; a
+    /// zone that paces players' inputs per tick credits these so inputs
+    /// sent in real time do not queue up for good.
+    pub fn dropped_ticks(&self) -> u32 {
+        self.core.dropped_ticks
     }
 
     /// Step length in seconds.
@@ -859,6 +871,7 @@ impl<Z: Zone> ZoneHost<Z> {
             tick: 0,
             sim_time: Duration::ZERO,
             dt: rate_to_step(config.tick_rate),
+            dropped_ticks: 0,
             tier: Tier::Hot,
             players: BTreeMap::new(),
             observers: BTreeMap::new(),
@@ -1927,6 +1940,7 @@ impl<Z: Zone> ZoneHost<Z> {
             hook!(self.on_timer(id, timer));
         }
         hook!(self.on_tick());
+        self.core.dropped_ticks = 0;
         self.process_kicks();
         let mut frame = RewindFrame::default();
         self.zone.record_rewind(&mut frame);
@@ -2034,6 +2048,7 @@ impl<Z: Zone> ZoneHost<Z> {
         if !dt.is_zero() {
             report.dropped_ticks = (steps.dropped.as_nanos() / dt.as_nanos()) as u32;
         }
+        self.core.dropped_ticks = self.core.dropped_ticks.saturating_add(report.dropped_ticks);
         if !self.frozen {
             for _ in 0..steps.steps {
                 self.tick_once(dt);
