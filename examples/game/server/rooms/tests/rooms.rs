@@ -800,8 +800,10 @@ fn inputs_sent_through_a_stall_drain_but_a_fast_client_is_still_paced() {
     assert_eq!(ack, seq, "in step before the stall");
 
     // The room stalls for a second while the client keeps sending at 30 Hz:
-    // the host runs its catch-up cap and drops the other ticks.
-    for _ in 0..30 {
+    // the host runs its catch-up cap and drops the other ticks. Half the
+    // stall's inputs were queued before the catch-up tick, half land after
+    // it (still in the socket when the room woke up).
+    for _ in 0..15 {
         seq += 1;
         room.push_input(client, seq, seq, &payload);
     }
@@ -813,6 +815,10 @@ fn inputs_sent_through_a_stall_drain_but_a_fast_client_is_still_paced() {
         report.dropped_ticks
     );
     ack = acked(&room.drain_outbound(), client, ack);
+    for _ in 0..15 {
+        seq += 1;
+        room.push_input(client, seq, seq, &payload);
+    }
     for _ in 0..5 {
         seq += 1;
         room.push_input(client, seq, seq, &payload);
@@ -821,18 +827,23 @@ fn inputs_sent_through_a_stall_drain_but_a_fast_client_is_still_paced() {
     ack = settle(&mut room, &clock, client, ack);
     assert_eq!(ack, seq, "the stall's inputs did not stay queued");
 
-    // A client sending two inputs a tick is still held to one a tick.
-    let start = ack;
-    for _ in 0..30 {
+    // A client sending two inputs a tick is still held to one a tick once
+    // the banked ticks are used: never ahead of wall-clock time.
+    let mut mid = 0;
+    for t in 0..30 {
         for _ in 0..2 {
             seq += 1;
             room.push_input(client, seq, seq, &payload);
         }
         ack = acked(&tick(&mut room, &clock), client, ack);
+        if t == 9 {
+            mid = ack;
+        }
     }
+    assert!(ack - mid <= 21, "paced: {} inputs in 20 ticks", ack - mid);
+    let wall_ticks = (distributed_game::Clock::now(&clock).as_micros() / 33_334) as u32;
     assert!(
-        ack - start <= 30 + 4,
-        "paced: {} inputs in 30 ticks",
-        ack - start
+        ack <= wall_ticks + 4,
+        "{ack} inputs in {wall_ticks} ticks of wall time"
     );
 }

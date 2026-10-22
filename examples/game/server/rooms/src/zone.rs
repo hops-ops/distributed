@@ -475,8 +475,11 @@ pub const SWING_COOLDOWN: u8 = 13;
 const SWING_FRAMES: u8 = 6;
 /// Player max HP.
 pub const PLAYER_HP: i32 = 100;
-/// Inputs a player may bank (one per tick, plus one per dropped tick).
+/// Inputs a player may bank (one per tick).
 const MAX_CREDITS: u8 = 4;
+/// Dropped ticks a player may bank: the room's input capacity, the most
+/// that can be queued.
+const MAX_OWED: u16 = 90;
 /// Interest radius (m): mobs and players farther away are not replicated
 /// (the page draws it as the interest ring). From any spawn point every mob
 /// home is inside it; walk to a corner and the far side drops out.
@@ -717,6 +720,8 @@ struct Player {
     name: String,
     state: MoveState,
     credits: u8,
+    /// Ticks the host dropped that this player has not used yet.
+    owed: u16,
     hp: i32,
     face: f32,
     swing_cd: u8,
@@ -1113,16 +1118,15 @@ impl MobPit {
             y: self.room.room.1,
         };
         let blessing = self.world.event == "blessing";
-        // Inputs are paced by wall-clock time: a tick the host dropped is a
-        // credit too, or the inputs sent during it stay queued for good (the
-        // ghost then trails by the whole queue).
-        let dropped = u8::try_from(ctx.dropped_ticks()).unwrap_or(u8::MAX);
+        // Inputs are paced by wall-clock time: a tick the host dropped is
+        // owed too, or the inputs sent during it stay queued for good (the
+        // ghost then trails by the whole queue). Owed ticks are banked until
+        // inputs arrive: after a stall the socket's inputs often land after
+        // the catch-up tick.
+        let dropped = u16::try_from(ctx.dropped_ticks()).unwrap_or(u16::MAX);
         for (id, p) in &mut self.players {
-            p.credits = p
-                .credits
-                .saturating_add(1)
-                .min(MAX_CREDITS)
-                .saturating_add(dropped);
+            p.credits = (p.credits + 1).min(MAX_CREDITS);
+            p.owed = p.owed.saturating_add(dropped).min(MAX_OWED);
             p.swing_cd = p.swing_cd.saturating_sub(1);
             p.fire_cd = p.fire_cd.saturating_sub(1);
             p.shot_anim = p.shot_anim.saturating_sub(1);
@@ -1145,7 +1149,7 @@ impl MobPit {
             if p.leaving {
                 continue;
             }
-            while p.credits > 0 {
+            while p.credits > 0 || p.owed > 0 {
                 let Some(input) = ctx.take_inputs(*id, ConsumePolicy::Next).pop() else {
                     break;
                 };
@@ -1153,7 +1157,11 @@ impl MobPit {
                 let input = input.input;
                 // The declared predicted step: what the client runs as WASM.
                 p.state = pit_step(&p.state, &input, &context, movement::DT);
-                p.credits -= 1;
+                if p.credits > 0 {
+                    p.credits -= 1;
+                } else {
+                    p.owed -= 1;
+                }
                 let (sx, sy) = (f32::from(input.mx), f32::from(input.my));
                 if input.aims() && input.yaw.is_finite() {
                     // First person: you face where you look.
@@ -1615,6 +1623,7 @@ impl MobPit {
                 name,
                 state,
                 credits: MAX_CREDITS,
+                owed: 0,
                 hp,
                 face,
                 swing_cd: 0,
