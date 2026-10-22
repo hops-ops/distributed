@@ -160,7 +160,8 @@ start_celld() {
 	printf 'DISTRIBUTED_INTERNAL_SECRET=%s\nCELLD_QUEUE_RELAY_URL=http://127.0.0.1:%s/internal/celld-queue/relay\n%s' \
 		"$DISTRIBUTED_INTERNAL_SECRET" "$relay_port" "${CELLD_EXTRA_VARS:-}" >"$project/.dev.vars"
 	log "starting celld dev on :$port ($("$CELLD_BIN" --version 2>/dev/null | grep '^celld ' | head -1); state in $project/.celld/dev)"
-	RUST_LOG=warn "$CELLD_BIN" dev "$project" --host 127.0.0.1 --port "$port" --no-watch --logs >"$project/celld.log" 2>&1 &
+	# One node: no ownership balancing (its sampler walks every cell).
+	CELLD_REBALANCE_INTERVAL_MS="${CELLD_REBALANCE_INTERVAL_MS:-0}" RUST_LOG=warn "$CELLD_BIN" dev "$project" --host 127.0.0.1 --port "$port" --no-watch --logs >"$project/celld.log" 2>&1 &
 	CELLD_PID=$!
 	CELLD_URL="http://127.0.0.1:$port"
 	for _ in $(seq 1 300); do

@@ -62,7 +62,8 @@ export async function startCelld({ relayPort, vars: extra = {} } = {}) {
 	// Start (or start again: same project, port and state) and wait until healthy.
 	const up = async () => {
 		child = spawn(bin, ['dev', project, '--host', '127.0.0.1', '--port', String(port), '--no-watch', '--logs'], {
-			env: { ...process.env, RUST_LOG: 'warn' },
+			// One node: no ownership balancing (its sampler walks every cell).
+			env: { CELLD_REBALANCE_INTERVAL_MS: '0', ...process.env, RUST_LOG: 'warn' },
 			stdio: ['ignore', 'pipe', 'pipe']
 		});
 		const started = child;
