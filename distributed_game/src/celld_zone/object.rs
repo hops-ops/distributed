@@ -396,6 +396,9 @@ struct Snapshot {
 struct TickStats {
     late: Window,
     work: Window,
+    /// Object storage writes (outbox, snapshot): one node acks a write when
+    /// its bucket upload lands.
+    write: Window,
     dropped: u64,
     iterations: u64,
 }
@@ -425,6 +428,8 @@ struct Inner<Z: CelldZone> {
     node: String,
     stats: TickStats,
     last_persist_ms: f64,
+    /// A snapshot write is in flight (see [`ZoneObject::persist_later`]).
+    persisting: bool,
     spooled: u64,
     /// Dev network simulation in effect (from the dev settings object).
     net_sim: Option<NetSim>,
@@ -736,6 +741,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             node,
             stats: TickStats::default(),
             last_persist_ms: 0.0,
+            persisting: false,
             spooled: 0,
             net_sim: None,
             out_lines: HashMap::new(),
@@ -1566,7 +1572,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             (options.tick_hz, options.persist_every.as_millis() as f64)
         };
         let mut schedule = TickSchedule::new(now_ms(), hz);
-        self.arm(persist_every * 3.0).await;
+        self.arm_later(persist_every * 3.0);
         loop {
             Delay::from(Duration::from_micros(
                 (schedule.wait_ms(now_ms()) * 1000.0) as u64,
@@ -1597,19 +1603,19 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 }
                 (stop, persist)
             };
-            self.spool().await;
+            // Storage stays off the loop: the simulation keeps its pace
+            // while a write waits on the bucket.
+            self.spool_later();
             self.refresh_dev_settings();
             self.refresh_content();
             self.refresh_if_due();
-            if persist {
-                self.persist().await;
-                if !stop {
-                    self.arm(persist_every * 3.0).await;
-                }
-            }
             if stop {
+                self.persist().await;
                 self.go_dormant().await;
                 return;
+            }
+            if persist {
+                self.persist_later(persist_every * 3.0);
             }
         }
     }
@@ -1624,10 +1630,33 @@ impl<Z: CelldZone> ZoneObject<Z> {
             inner.snapshot()
         };
         if let Some(snapshot) = snapshot {
+            let started = now_ms();
             if let Err(e) = self.state.storage().put(SNAPSHOT_KEY, snapshot).await {
                 worker::console_error!("zone snapshot write failed: {e}");
             }
+            self.inner.borrow_mut().stats.write.push(now_ms() - started);
         }
+    }
+
+    /// [`persist`](Self::persist) and re-arm the alarm `arm_ms` from now,
+    /// off the tick loop. One snapshot write at a time: while one is in
+    /// flight a due tick leaves it to a later tick. Spawned after the
+    /// tick's [`spool_later`](Self::spool_later), so the outbox write is
+    /// issued before the snapshot that reflects it.
+    fn persist_later(&self, arm_ms: f64) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.persisting {
+                return;
+            }
+            inner.persisting = true;
+        }
+        let this = self.handle();
+        wasm_bindgen_futures::spawn_local(async move {
+            this.persist().await;
+            this.arm(arm_ms).await;
+            this.inner.borrow_mut().persisting = false;
+        });
     }
 
     async fn go_dormant(&self) {
@@ -1679,6 +1708,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             return;
         }
         let storage = self.state.storage();
+        let started = now_ms();
         // One batched write (the storage API takes at most 128 keys).
         for chunk in facts.chunks(128) {
             let batch = js_sys::Object::new();
@@ -1694,7 +1724,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 worker::console_error!("fact outbox write failed: {e}");
             }
         }
-        self.inner.borrow_mut().spooled += facts.len() as u64;
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.spooled += facts.len() as u64;
+            inner.stats.write.push(now_ms() - started);
+        }
         self.arm_outbox().await;
     }
 
@@ -1722,6 +1756,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
         {
             worker::console_error!("zone alarm: {e}");
         }
+    }
+
+    /// [`arm`](Self::arm) off the caller's path.
+    fn arm_later(&self, in_ms: f64) {
+        let this = self.handle();
+        wasm_bindgen_futures::spawn_local(async move { this.arm(in_ms).await });
     }
 
     /// Keep an alarm while unsettled facts wait in the outbox.
@@ -1808,6 +1848,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 "freeze": format!("{:?}", h.freeze_state()).to_lowercase(),
             })),
             "workMs": { "p50": stats.work.percentile(0.5), "p99": stats.work.percentile(0.99) },
+            "writeMs": {
+                "p50": stats.write.percentile(0.5),
+                "p99": stats.write.percentile(0.99),
+                "max": stats.write.percentile(1.0),
+            },
         })
     }
 }
