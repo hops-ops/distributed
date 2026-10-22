@@ -177,6 +177,13 @@ impl DevCelld {
             .args(["--host", "127.0.0.1", "--port", &self.port.to_string()])
             .args(["--no-watch", "--logs"])
             .env("RUST_LOG", "warn")
+            // One node: nothing to balance, and the sampler walks every
+            // cell each interval (hundreds of % CPU on a long-lived dev
+            // state, stalling the rooms' ticks).
+            .env(
+                "CELLD_REBALANCE_INTERVAL_MS",
+                std::env::var("CELLD_REBALANCE_INTERVAL_MS").unwrap_or_else(|_| "0".into()),
+            )
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|e| e.to_string())?)
             .stderr(log);
