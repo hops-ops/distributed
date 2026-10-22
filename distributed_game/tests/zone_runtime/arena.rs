@@ -53,6 +53,8 @@ pub struct Arena {
     pub auth_extensions: Vec<distributed_game::TicketExtensions>,
     /// `lost:{player}` / `back:{player}` from the connection hooks.
     pub connection_events: Vec<String>,
+    /// `Ctx::dropped_ticks` seen by each `on_tick`.
+    pub dropped_seen: Vec<u32>,
 }
 
 impl Arena {
@@ -123,6 +125,7 @@ impl Zone for Arena {
             tiers: Vec::new(),
             auth_extensions: Vec::new(),
             connection_events: Vec::new(),
+            dropped_seen: Vec::new(),
         }
     }
 
@@ -202,6 +205,7 @@ impl Zone for Arena {
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
         self.ticks += 1;
+        self.dropped_seen.push(ctx.dropped_ticks());
         let dt = ctx.dt_secs();
         let players: Vec<PlayerId> = self.avatars.keys().copied().collect();
         for player in players {

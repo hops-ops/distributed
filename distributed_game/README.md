@@ -95,18 +95,15 @@ The words used throughout:
 
 ## Try it
 
-Eight runnable demos live in [`examples/game`](../examples/game/README.md),
-each built to show one part of the engine:
+The runnable demos live in [`examples/game`](../examples/game/README.md).
+They are being folded into one game, Mob Pit (the others are deleted as
+their mechanic moves in):
 
 | Demo | Run | Shows |
 |---|---|---|
-| Arena | `examples/game/run.sh arena` | ticks, deltas, prediction on/off, interest radius vs. global entities, simulated latency |
-| Mob Pit | `run.sh mobpit` (`--fleet` for several celld nodes) | rooms as celld objects joined by doorways, sleeping when empty and restored on return; combat whose rewards are saved exactly once without stalling |
+| Mob Pit | `examples/game/run.sh mobpit` (`--fleet` for several celld nodes) | rooms as celld objects joined by doorways, sleeping when empty and restored on return; combat whose rewards are saved exactly once without stalling; a network panel (simulated latency / jitter / loss on every room, prediction on/off with a server ghost, the interest ring); the rooms next door seen through passive watchers (the doorway rooms in reach woken by near watchers); hoods › boroughs › city as tier cells (boss kills ripple up through a saga, weather lifts as bosses fall); world events scheduled by boroughs; jumping; a bow with lag-compensated hits and first person |
 | Leaderboard | `run.sh leaderboard` | a live ranking fed from saved kills, rebuilt from history |
-| Shooting Gallery | `run.sh gallery` | lag compensation on/off under latency |
 | The Freeze | `run.sh freeze` | pausing every zone on two servers, updating content, resuming; safe-room reloads |
-| Endless Grid | `run.sh grid` | a generated world split into zones across two servers, seamless border crossings, zones sleeping and waking |
-| Boss Ripple | `run.sh ripple` | nested zones (realm › city › borough › neighbourhood) with events travelling up |
 
 Then open `http://localhost:5173/<demo>/`. Each page explains what to try.
 
@@ -402,7 +399,8 @@ against its former hand-written loop.
 bytes), `#[quant(min, max, bits)]` / `#[quant(centered = R, bits)]` (zero
 exact) / `#[angle(bits)]` / `#[field_type(EXPR)]` for floats,
 `#[priority(p)]`, and `#[correct(ease = ms | snap | replace)]` client
-defaults. The interest position is the `x` / `y` fields (or
+defaults (`ease = ms, snap_above = m`: an error larger than `m` cuts the whole
+entity — a respawn or another server-side teleport is a cut, not a slide). The interest position is the `x` / `y` fields (or
 `#[replicated(x = .., y = ..)]`); a kind without one must be `global`.
 `out.add(..)` returns a handle for `.global()`, `.local()`, `.priority(p)`.
 For each client the engine then sends only the difference from what that
@@ -1175,6 +1173,12 @@ principals commit concurrently; settlements arrive in completion order.
   `DG_NET_LATENCY_MS`, `DG_NET_JITTER_MS`, `DG_NET_LOSS`,
   `DG_NET_RETRANSMIT_MS`. `GameServer::set_net_sim(Some(sim) | None)`
   changes it at runtime for every connection (order is preserved).
+  `distributed_game::netsim` is portable: zones hosted as celld objects
+  (`celld-zone`) apply the same simulation to each socket when the worker
+  sets `ZONE_DEV_SETTINGS=1`; the setting lives in the worker's dev
+  settings object (`celld_zone::ZoneDevSettings`, `PUT /zone-dev/netsim`
+  `{latencyMs, jitterMs, loss}` with the internal secret) and every zone
+  object reads it within a second.
 
 ## World structure
 

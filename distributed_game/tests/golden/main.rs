@@ -87,6 +87,7 @@ fn client_json(m: &ClientMessage) -> Value {
             "capabilities": h.capabilities,
             "ticket": h.ticket,
             "reconnect_token": h.reconnect_token,
+            "near": h.near,
         }),
         ClientMessage::Input {
             seq,
@@ -99,6 +100,10 @@ fn client_json(m: &ClientMessage) -> Value {
             json!({ "type": "Ping", "client_time": client_time })
         }
         ClientMessage::Leave => json!({ "type": "Leave" }),
+        ClientMessage::Content { content_version } => {
+            json!({ "type": "Content", "content_version": content_version })
+        }
+        ClientMessage::Near { near } => json!({ "type": "Near", "near": near }),
     }
 }
 
@@ -320,6 +325,7 @@ fn messages() {
                 capabilities: 5,
                 ticket: "t.k.n".into(),
                 reconnect_token: String::new(),
+                near: false,
             }),
         ),
         (
@@ -330,6 +336,7 @@ fn messages() {
                 capabilities: 0,
                 ticket: String::new(),
                 reconnect_token: "abcd".into(),
+                near: false,
             }),
         ),
         (
@@ -347,6 +354,25 @@ fn messages() {
             },
         ),
         ("leave", ClientMessage::Leave),
+        (
+            "content",
+            ClientMessage::Content {
+                content_version: "c2".into(),
+            },
+        ),
+        (
+            "hello_near",
+            ClientMessage::Hello(Hello {
+                protocol_version: PROTOCOL_VERSION,
+                content_version: "c1".into(),
+                capabilities: 0,
+                ticket: "t.k.n".into(),
+                reconnect_token: String::new(),
+                near: true,
+            }),
+        ),
+        ("near", ClientMessage::Near { near: true }),
+        ("passive", ClientMessage::Near { near: false }),
     ];
     for (name, msg) in client {
         let bytes = msg.encode();

@@ -3,8 +3,8 @@
 # their zone-activity cells, Mob Pit's per-player Crawler aggregate and
 # per-player presence
 # (with the outbox Queue consumer that relays Crawler domain events to the
-# zone server), and the zone lease and hibernation-state cells every
-# multi-host demo uses.
+# zone server and runs the world tier saga), and the hood / borough / city
+# tier cells and the world's content rollout.
 # Own workspace (cdylib for wasm32-unknown-unknown); built with
 # `worker-build --release` by `examples/game/run.sh`.
 [workspace]
@@ -16,7 +16,7 @@ name = "game-demo-cells"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Game demo cells for celld: Mob Pit, zone leases and zone state (dev demo)"
+description = "Mob Pit on celld: rooms, crawler, presence, tier and content cells (dev demo)"
 
 [lib]
 crate-type = ["cdylib"]
@@ -26,6 +26,8 @@ console_error_panic_hook = "0.1"
 distributed = { path = "../../..", default-features = false, features = ["workers-rs"] }
 distributed_game = { path = "../../../distributed_game", default-features = false, features = ["cell", "workers-rs", "celld-zone"] }
 mobpit_crawler = { path = "../server/crawler" }
+# The world tiers (hood, borough, city cells) and their saga steps.
+mobpit_tiers = { path = "../server/tiers" }
 # Mob Pit's rooms, each one a Durable Object (`PitRoom`).
 mobpit_rooms = { path = "../server/rooms", features = ["celld"] }
 serde = { version = "1", features = ["derive"] }

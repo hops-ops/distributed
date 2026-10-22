@@ -4,7 +4,6 @@
  * change, triggers a rebuild from the cells' event history, and observes
  * the entrance room (no avatar) for a live mini map.
  */
-import { ARENA_FLOOR } from '../generated/arena/constants.ts';
 import {
 	createMobpitClient,
 	isMob,
@@ -12,7 +11,8 @@ import {
 	isPlayer,
 	mobFields,
 	pillarFields,
-	playerFields
+	playerFields,
+	PIT_WORLD
 } from '../generated/mobpit/index.ts';
 import {
 	createBoardWatcher,
@@ -26,8 +26,8 @@ import {
 } from '../mobpit/client.ts';
 import { DevApi } from '../shared/dev-api.ts';
 
-/** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
-const { half: HALF } = ARENA_FLOOR;
+/** A room's floor, generated from the simulation's constants (`game_sim::mobpit::pit_world`). */
+const { half: HALF } = PIT_WORLD;
 
 const params = new URLSearchParams(location.search);
 const zone = params.get('zone') ?? DEFAULT_ZONE;
@@ -162,4 +162,21 @@ declare global {
 }
 window.leaderboard = { client, api, pitApi, watcher };
 
-client.observe(zone).catch((error: unknown) => (status.textContent = `failed: ${String(error)}`));
+// A passive watcher: it never wakes the entrance; while it sleeps, retry.
+const watchEntrance = () => {
+	client.unobserve(zone);
+	client.observe(zone).then(
+		() => {
+			if (status.textContent?.startsWith('the entrance')) status.textContent = '';
+		},
+		() => {
+			status.textContent = 'the entrance is asleep (nobody playing) — watching for it…';
+			client.unobserve(zone);
+			setTimeout(watchEntrance, 3000);
+		}
+	);
+};
+client.on('zoneClosed', (closed) => {
+	if (closed === zone) setTimeout(watchEntrance, 3000);
+});
+watchEntrance();

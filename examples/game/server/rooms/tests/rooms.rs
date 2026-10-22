@@ -102,6 +102,7 @@ fn a_room_greets_with_its_coordinates_and_hands_off_through_doorways() {
             mx: (dx / len * 127.0) as i8,
             my: (dy / len * 127.0) as i8,
             buttons: 0,
+            ..PitInput::default()
         };
         room.push_input(
             client,
@@ -225,6 +226,7 @@ fn walk(
             mx: (dir[0] * 127.0) as i8,
             my: (dir[1] * 127.0) as i8,
             buttons: 0,
+            ..PitInput::default()
         };
         room.push_input(
             client,
@@ -323,4 +325,525 @@ fn positions_survive_hibernation_and_a_crash_snapshot() {
     let mut old = host("pit.1.0", &clock);
     old.restore(br#"{"kills":3,"mobs":[]}"#, "");
     assert_eq!(old.zone().stats().kills, 3);
+}
+
+/// Every event of `out` (decoded).
+fn events(out: &[Outbound]) -> Vec<PitEvent> {
+    messages(out)
+        .into_iter()
+        .filter_map(|m| match m {
+            ServerMessage::Event {
+                type_id, payload, ..
+            } => PitEvent::decode_event(type_id, &payload).ok().flatten(),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_boss_falls_to_a_party_its_hood_hears_and_it_stays_down() {
+    use distributed_game::ZoneInbound;
+    use game_sim::mobpit::{boss_room, room_zone, BOSS_TIER};
+    use mobpit_rooms::{PitMessage, WorldTiers};
+
+    let clock = ManualClock::new();
+    let zone = room_zone(boss_room(DEFAULT_SEED, (0, 0)));
+    let (facts, _script) = FactQueue::scripted(256);
+    let mut room = ZoneHost::<MobPit>::new(
+        &zone,
+        HostConfig::default(),
+        Arc::new(clock.clone()),
+        RoomConfig::for_zone(&zone, DEFAULT_SEED).expect("room"),
+    )
+    .with_facts(facts.with_journal());
+    let party: Vec<_> = ["ana", "bob", "cy", "di"]
+        .iter()
+        .map(|who| join(&mut room, who))
+        .collect();
+    let boss = |room: &ZoneHost<MobPit>| *room.zone().mob_positions().last().expect("mobs");
+    let mut emitted = Vec::new();
+    let mut seen = Vec::new();
+    for seq in 1..3000u32 {
+        let (_, bx, by, alive) = boss(&room);
+        if !alive {
+            break;
+        }
+        for (client, player) in &party {
+            let Some(me) = room.zone().player_position(*player) else {
+                continue;
+            };
+            let (dx, dy) = (bx - me.0, by - me.1);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            let near = d < 2.6;
+            let k = if near { 40.0 } else { 127.0 } / d;
+            let input = PitInput {
+                mx: (dx * k).round().clamp(-127.0, 127.0) as i8,
+                my: (dy * k).round().clamp(-127.0, 127.0) as i8,
+                buttons: if near { PitInput::ATTACK } else { 0 },
+                ..PitInput::default()
+            };
+            room.push_input(
+                *client,
+                seq,
+                seq,
+                &distributed_game::GameInput::to_payload(&input),
+            );
+        }
+        let out = tick(&mut room, &clock);
+        seen.extend(events(&out));
+        emitted.extend(room.take_emitted_facts());
+    }
+    assert!(!boss(&room).3, "the party felled the boss");
+    for _ in 0..3 {
+        seen.extend(events(&tick(&mut room, &clock)));
+        emitted.extend(room.take_emitted_facts());
+    }
+    let reports: Vec<_> = emitted
+        .iter()
+        .filter(|f| f.command() == mobpit_tiers::BOSS_DEFEATED)
+        .collect();
+    assert_eq!(reports.len(), 1, "one report of the fall");
+    assert_eq!(reports[0].input()["hood"], "0.0");
+    assert_eq!(reports[0].input()["room"], zone.as_str());
+    let kills: Vec<_> = emitted
+        .iter()
+        .filter(|f| f.command() == mobpit_crawler::RECORD_KILL && f.input()["tier"] == BOSS_TIER)
+        .collect();
+    assert_eq!(
+        kills.len(),
+        1,
+        "the slayer is credited (XP decided by the cell)"
+    );
+    assert!(seen
+        .iter()
+        .any(|e| matches!(e, PitEvent::BossDown { hood_tier: 1, .. })));
+    // The hood has not heard yet (tier 0): the room keeps what it knows.
+    room.deliver(ZoneInbound::Message(PitMessage::World(
+        WorldTiers::default(),
+    )));
+    let out = tick(&mut room, &clock);
+    assert!(!events(&out)
+        .iter()
+        .any(|e| matches!(e, PitEvent::World(w) if w.hood_tier == 0 || !w.boss_down)));
+    // Long past its local respawn: still down while the hood says so.
+    for _ in 0..(30 * 95) {
+        tick(&mut room, &clock);
+    }
+    let down = WorldTiers {
+        hood_tier: 1,
+        boss_down: true,
+        ..WorldTiers::default()
+    };
+    room.deliver(ZoneInbound::Message(PitMessage::World(down.clone())));
+    tick(&mut room, &clock);
+    tick(&mut room, &clock);
+    assert!(!boss(&room).3, "down while its hood says so");
+    // The hood brings it back.
+    room.deliver(ZoneInbound::Message(PitMessage::World(WorldTiers {
+        boss_down: false,
+        ..down
+    })));
+    tick(&mut room, &clock);
+    tick(&mut room, &clock);
+    assert!(boss(&room).3, "back when its hood says so");
+}
+
+/// Walk `player` toward the nearest living mob until one winds up a slam
+/// next to it; then, with `jump`, take off so the slam lands mid-air.
+/// Returns the player's HP before and after the slam.
+fn face_a_slam(jump: bool) -> (i32, i32) {
+    let clock = ManualClock::new();
+    let mut room = host("pit.0.0", &clock);
+    let (client, player) = join(&mut room, "ana");
+    let mut seq = 0u32;
+    let mut send = |room: &mut ZoneHost<MobPit>, input: PitInput| {
+        seq += 1;
+        room.push_input(
+            client,
+            seq,
+            seq,
+            &distributed_game::GameInput::to_payload(&input),
+        );
+    };
+    for _ in 0..900 {
+        let (me, hp) = room.zone().player_state(player).expect("in the room");
+        if let Some(&(_, _, _, left)) = room.zone().mob_windups().first() {
+            if left <= 12 {
+                let before = hp;
+                send(
+                    &mut room,
+                    PitInput {
+                        buttons: if jump { PitInput::JUMP } else { 0 },
+                        ..PitInput::default()
+                    },
+                );
+                // One command frame per tick, as clients send them (the
+                // step, gravity included, runs per input).
+                for _ in 0..20 {
+                    tick(&mut room, &clock);
+                    send(&mut room, PitInput::default());
+                }
+                let (_, after) = room.zone().player_state(player).expect("in the room");
+                return (before, after);
+            }
+            send(&mut room, PitInput::default());
+        } else {
+            let target = room
+                .zone()
+                .mob_positions()
+                .into_iter()
+                .filter(|m| m.3)
+                .min_by(|a, b| {
+                    let d = |m: &(u32, f32, f32, bool)| (m.1 - me.x).powi(2) + (m.2 - me.y).powi(2);
+                    d(a).total_cmp(&d(b))
+                })
+                .expect("a mob");
+            let (dx, dy) = (target.1 - me.x, target.2 - me.y);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            let k = if d < 1.6 { 0.0 } else { 127.0 / d };
+            send(
+                &mut room,
+                PitInput {
+                    mx: (dx * k) as i8,
+                    my: (dy * k) as i8,
+                    buttons: 0,
+                    ..PitInput::default()
+                },
+            );
+        }
+        tick(&mut room, &clock);
+    }
+    panic!("no slam");
+}
+
+#[test]
+fn a_jump_clears_a_mobs_slam() {
+    let (before, after) = face_a_slam(false);
+    assert!(
+        after < before,
+        "standing in the ring hurts: {before} → {after}"
+    );
+    let (before, after) = face_a_slam(true);
+    assert!(
+        after >= before,
+        "jumping over it does not: {before} → {after}"
+    );
+}
+
+#[test]
+fn an_arrow_hits_the_mob_it_was_aimed_at_and_obstacles_stop_it() {
+    let clock = ManualClock::new();
+    let mut room = host("pit.0.0", &clock);
+    let (client, player) = join(&mut room, "ana");
+    for _ in 0..3 {
+        tick(&mut room, &clock);
+    }
+    let me = room.zone().player_state(player).expect("in").0;
+    // The nearest living mob with nothing in between.
+    let (id, mx, my, _) = room
+        .zone()
+        .mob_positions()
+        .into_iter()
+        .filter(|m| m.3)
+        .min_by(|a, b| {
+            let d = |m: &(u32, f32, f32, bool)| (m.1 - me.x).powi(2) + (m.2 - me.y).powi(2);
+            d(a).total_cmp(&d(b))
+        })
+        .expect("a mob");
+    let yaw = (my - me.y).atan2(mx - me.x);
+    let d = ((mx - me.x).powi(2) + (my - me.y).powi(2)).sqrt();
+    // Aim at the mob's middle from the eye.
+    let pitch = ((0.45 - mobpit_rooms::EYE_HEIGHT) / d).atan();
+    let shot = |n: u16, flags: u8| PitInput {
+        buttons: PitInput::FIRE | flags,
+        yaw,
+        pitch,
+        shot: n,
+        delay_ms: 100,
+        ..PitInput::default()
+    };
+    let mut verdicts = Vec::new();
+    for (seq, flags) in [(1u32, 0u8), (2, PitInput::NO_COMP)] {
+        room.push_input(
+            client,
+            seq,
+            room.tick() as u32,
+            &distributed_game::GameInput::to_payload(&shot(seq as u16, flags)),
+        );
+        for _ in 0..14 {
+            let out = tick(&mut room, &clock);
+            verdicts.extend(events(&out).into_iter().filter_map(|e| match e {
+                PitEvent::Shot {
+                    shot,
+                    hit,
+                    compensated,
+                    age_ms,
+                    ..
+                } => Some((shot, hit, compensated, age_ms)),
+                _ => None,
+            }));
+        }
+    }
+    assert_eq!(verdicts.len(), 2, "{verdicts:?}");
+    assert_eq!(verdicts[0].1, Some(id), "compensated: hit {verdicts:?}");
+    assert!(
+        verdicts[0].2 && verdicts[0].3 > 50.0,
+        "rewound ~100 ms: {verdicts:?}"
+    );
+    assert!(
+        !verdicts[1].2 && verdicts[1].3 == 0.0,
+        "uncompensated: no rewind"
+    );
+    // Straight into the central pillar (0, 0, r 2.5): stopped short.
+    let into_pillar = PitInput {
+        buttons: PitInput::FIRE,
+        yaw: (0.0 - me.y).atan2(0.0 - me.x),
+        pitch: 0.0,
+        shot: 9,
+        ..PitInput::default()
+    };
+    room.push_input(
+        client,
+        3,
+        room.tick() as u32,
+        &distributed_game::GameInput::to_payload(&into_pillar),
+    );
+    let mut stopped = None;
+    for _ in 0..3 {
+        let out = tick(&mut room, &clock);
+        for e in events(&out) {
+            if let PitEvent::Shot {
+                shot: 9, hit, x, y, ..
+            } = e
+            {
+                stopped = Some((hit, (x * x + y * y).sqrt()));
+            }
+        }
+    }
+    let (hit, from_centre) = stopped.expect("verdict");
+    assert_eq!(hit, None);
+    assert!(
+        (from_centre - 2.5).abs() < 0.2,
+        "stopped at the pillar: {from_centre}"
+    );
+}
+
+/// Walk `player` towards `(tx, ty)` (room-local) until the room hands it
+/// off or `frames` pass; returns the handoff target and the events seen.
+fn walk_to(
+    room: &mut ZoneHost<MobPit>,
+    clock: &ManualClock,
+    client: ClientId,
+    player: distributed_game::PlayerId,
+    seq: &mut u32,
+    (tx, ty): (f32, f32),
+    frames: u32,
+) -> (Option<String>, Vec<PitEvent>) {
+    let mut seen = Vec::new();
+    for _ in 0..frames {
+        let Some(me) = room.zone().player_position(player) else {
+            break;
+        };
+        let (dx, dy) = (tx - me.0, ty - me.1);
+        let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+        *seq += 1;
+        let input = PitInput {
+            mx: (dx / len * 127.0) as i8,
+            my: (dy / len * 127.0) as i8,
+            ..PitInput::default()
+        };
+        room.push_input(
+            client,
+            *seq,
+            *seq,
+            &distributed_game::GameInput::to_payload(&input),
+        );
+        let out = tick(room, clock);
+        seen.extend(events(&out));
+        if let Some(target) = messages(&out).into_iter().find_map(|m| match m {
+            ServerMessage::Handoff { target_zone, .. } => Some(target_zone),
+            _ => None,
+        }) {
+            return (Some(target), seen);
+        }
+    }
+    (None, seen)
+}
+
+#[test]
+fn a_content_update_switches_the_pack_stamps_facts_and_holds_old_clients() {
+    use distributed_game::StalePolicy;
+
+    let clock = ManualClock::new();
+    let (facts, _script) = FactQueue::scripted(256);
+    let mut room = ZoneHost::<MobPit>::new(
+        "pit.1.0",
+        HostConfig {
+            stale_policy: StalePolicy::SafeRoom { roam: false },
+            lifecycle_facts: true,
+            ..HostConfig::default()
+        },
+        Arc::new(clock.clone()),
+        RoomConfig::for_zone("pit.1.0", DEFAULT_SEED).expect("room"),
+    )
+    .with_facts(facts.with_journal())
+    .with_transfer_issuer(|request| Some(format!("transfer:{}", request.target_zone)));
+    let (old, old_player) = join(&mut room, "old");
+    let (new, new_player) = join(&mut room, "new");
+    tick(&mut room, &clock);
+
+    // The live update: the room runs frostfall from here on.
+    room.set_content_version("frostfall");
+    assert_eq!(room.zone().pack().name, "Frostfall");
+    // The patched client says so; the old one does not.
+    assert!(room.content_patched(new, "frostfall"));
+    assert!(
+        !room.content_patched(new, "emberfall"),
+        "never ahead of the room"
+    );
+
+    // The old client may not leave through the east doorway (pit.2.0)…
+    let mut seq = 0;
+    let (target, seen) = walk_to(
+        &mut room,
+        &clock,
+        old,
+        old_player,
+        &mut seq,
+        (24.0, 1.7),
+        400,
+    );
+    assert_eq!(target, None, "held in the room");
+    assert!(
+        seen.iter().any(|e| matches!(e, PitEvent::Stale { gate, version } if gate == "pit.0.0" && version == "frostfall")),
+        "told to head to the entrance"
+    );
+    // …but through the west one, into the entrance (the gate).
+    let (target, _) = walk_to(
+        &mut room,
+        &clock,
+        old,
+        old_player,
+        &mut seq,
+        (-24.0, 1.7),
+        600,
+    );
+    assert_eq!(target.as_deref(), Some("pit.0.0"));
+    // The patched client goes east.
+    let mut seq = 0;
+    let (target, _) = walk_to(
+        &mut room,
+        &clock,
+        new,
+        new_player,
+        &mut seq,
+        (24.0, 1.7),
+        600,
+    );
+    assert_eq!(target.as_deref(), Some("pit.2.0"));
+
+    // Facts after the update carry its version.
+    let emitted = room.take_emitted_facts();
+    assert!(!emitted.is_empty(), "lifecycle facts were emitted");
+    let after: Vec<_> = emitted
+        .iter()
+        .filter(|f| f.stamp().content_version == "frostfall")
+        .collect();
+    assert!(
+        !after.is_empty(),
+        "facts after the update are stamped frostfall: {:?}",
+        emitted
+            .iter()
+            .map(|f| (f.command(), f.stamp().content_version.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Highest input sequence the room acked to `client` in `out` (read from
+/// the Delta header: the body needs the client's entity map).
+fn acked(out: &[Outbound], client: ClientId, last: u32) -> u32 {
+    out.iter()
+        .filter_map(|o| match o {
+            Outbound::Frame { client: c, frame } if *c == client => {
+                let mut r = distributed_game::protocol::Reader::new(frame);
+                if r.u8().ok()? != 0x81 {
+                    return None;
+                }
+                let _server_tick = r.varuint().ok()?;
+                r.varuint().ok()
+            }
+            _ => None,
+        })
+        .fold(last, u32::max)
+}
+
+/// Three ticks without input: the next patch carries the latest ack.
+fn settle(room: &mut ZoneHost<MobPit>, clock: &ManualClock, client: ClientId, ack: u32) -> u32 {
+    (0..3).fold(ack, |ack, _| acked(&tick(room, clock), client, ack))
+}
+
+#[test]
+fn inputs_sent_through_a_stall_drain_but_a_fast_client_is_still_paced() {
+    let clock = ManualClock::new();
+    let mut room = host("pit.0.0", &clock);
+    let (client, _) = join(&mut room, "ana");
+    let idle = PitInput::default();
+    let payload = distributed_game::GameInput::to_payload(&idle);
+    let mut seq = 0;
+    let mut ack = 0;
+    for _ in 0..10 {
+        seq += 1;
+        room.push_input(client, seq, seq, &payload);
+        ack = acked(&tick(&mut room, &clock), client, ack);
+    }
+    ack = settle(&mut room, &clock, client, ack);
+    assert_eq!(ack, seq, "in step before the stall");
+
+    // The room stalls for a second while the client keeps sending at 30 Hz:
+    // the host runs its catch-up cap and drops the other ticks. Half the
+    // stall's inputs were queued before the catch-up tick, half land after
+    // it (still in the socket when the room woke up).
+    for _ in 0..15 {
+        seq += 1;
+        room.push_input(client, seq, seq, &payload);
+    }
+    clock.advance(Duration::from_secs(1));
+    let report = room.advance();
+    assert!(
+        report.dropped_ticks > 20,
+        "dropped {}",
+        report.dropped_ticks
+    );
+    ack = acked(&room.drain_outbound(), client, ack);
+    for _ in 0..15 {
+        seq += 1;
+        room.push_input(client, seq, seq, &payload);
+    }
+    for _ in 0..5 {
+        seq += 1;
+        room.push_input(client, seq, seq, &payload);
+        ack = acked(&tick(&mut room, &clock), client, ack);
+    }
+    ack = settle(&mut room, &clock, client, ack);
+    assert_eq!(ack, seq, "the stall's inputs did not stay queued");
+
+    // A client sending two inputs a tick is still held to one a tick once
+    // the banked ticks are used: never ahead of wall-clock time.
+    let mut mid = 0;
+    for t in 0..30 {
+        for _ in 0..2 {
+            seq += 1;
+            room.push_input(client, seq, seq, &payload);
+        }
+        ack = acked(&tick(&mut room, &clock), client, ack);
+        if t == 9 {
+            mid = ack;
+        }
+    }
+    assert!(ack - mid <= 21, "paced: {} inputs in 20 ticks", ack - mid);
+    let wall_ticks = (distributed_game::Clock::now(&clock).as_micros() / 33_334) as u32;
+    assert!(
+        ack <= wall_ticks + 4,
+        "{ack} inputs in {wall_ticks} ticks of wall time"
+    );
 }

@@ -217,35 +217,63 @@ pub(crate) fn parse_field_attrs(field: &Field, rt: &TokenStream) -> syn::Result<
                     return Err(syn::Error::new(span, "duplicate #[correct]"));
                 }
                 let mut policy = None;
+                let mut ease_ms: Option<Expr> = None;
+                let mut snap_above: Option<Expr> = None;
                 attr.parse_nested_meta(|meta| {
-                    if policy.is_some() {
-                        return Err(meta.error("#[correct(..)] takes one policy"));
-                    }
                     let key = meta
                         .path
                         .get_ident()
                         .map(Ident::to_string)
                         .unwrap_or_default();
+                    if key == "snap_above" {
+                        if snap_above.is_some() {
+                            return Err(meta.error("duplicate `snap_above`"));
+                        }
+                        snap_above = Some(meta.value()?.parse()?);
+                        return Ok(());
+                    }
+                    if policy.is_some() {
+                        return Err(meta.error("#[correct(..)] takes one policy"));
+                    }
                     policy = Some(match key.as_str() {
                         "ease" => {
-                            let ms: Expr = if meta.input.peek(syn::Token![=]) {
+                            ease_ms = Some(if meta.input.peek(syn::Token![=]) {
                                 meta.value()?.parse()?
                             } else {
                                 syn::parse_quote!(100)
-                            };
-                            quote!(#rt::__private::Correction::Ease { duration_ms: (#ms) as u32 })
+                            });
+                            quote!()
                         }
                         "snap" => quote!(#rt::__private::Correction::Snap),
                         "replace" => quote!(#rt::__private::Correction::Replace),
                         _ => return Err(meta.error(
-                            "expected `ease`, `ease = MS`, `snap` or `replace` in #[correct(..)]",
+                            "expected `ease`, `ease = MS`, `snap` or `replace` (with `ease`: `snap_above = M`) in #[correct(..)]",
                         )),
                     });
                     Ok(())
                 })?;
-                let Some(policy) = policy else {
+                let Some(mut policy) = policy else {
                     return Err(syn::Error::new(span, "#[correct(..)] needs a policy"));
                 };
+                match (ease_ms, snap_above) {
+                    (Some(ms), above) => {
+                        let above = match above {
+                            Some(m) => quote!(::core::option::Option::Some((#m) as f32)),
+                            None => quote!(::core::option::Option::None),
+                        };
+                        policy = quote!(#rt::__private::Correction::Ease {
+                            duration_ms: (#ms) as u32,
+                            snap_above: #above,
+                        });
+                    }
+                    (None, Some(_)) => {
+                        return Err(syn::Error::new(
+                            span,
+                            "`snap_above` only applies to `ease` in #[correct(..)]",
+                        ))
+                    }
+                    (None, None) => {}
+                }
                 out.correct = Some((policy, span));
             }
             "range" => {

@@ -756,7 +756,8 @@ const game = new GameClient<{ dx: number; dy: number }>({
   prediction: {
     encodeInput: ({ dx, dy }) => new Uint8Array([dx & 0xff, dy & 0xff]),
     predict: (s, i, dt) => ({ x: s.x + i.dx * 10 * dt / 1000, y: s.y + i.dy * 10 * dt / 1000 }),
-    corrections: { avatar: { x: { mode: 'ease', durationMs: 120 }, hp: { mode: 'replace' } } }
+    // `snapAbove`: a larger error (a respawn, a teleport) cuts instead of sliding.
+    corrections: { avatar: { x: { mode: 'ease', durationMs: 120, snapAbove: 2 }, hp: { mode: 'replace' } } }
   }
 });
 await game.connect('room-1');
@@ -771,7 +772,16 @@ requestAnimationFrame(function frame(now) {
 });
 ```
 
-`render()` merges the authoritative zone and observed neighbours (`observe`)
+`render()` merges the authoritative zone and observed neighbours (`observe`;
+`watchZones(game, around)` keeps the zones `around(authority)` observed
+across handoffs, lets go of closed ones and retries them every 3 s — zones
+hosted as celld objects treat observers as passive watchers that never wake
+a sleeping zone, which refuses them with `GameErrorCode.ASLEEP`; unless
+they are *near*: `watch.setNear(zones)` / `game.setNear(zone, near)` /
+`observe(zone, { near: true })` tell the zone without reconnecting, and a
+near watcher whose ticket grants `wake` — `mintGameTicket({ wake })`, the
+ticket handler's server-side `wake(context)` — wakes the zone and keeps it
+awake; a sleeping zone that becomes near is retried at once)
 sampled at `serverNow − interpolationDelay`, with the controlled entity at
 its predicted state. The delay is **adaptive** per zone by default
 (`AdaptiveDelay`: `rtt / 2 + 2 patch intervals + 2 × jitter`, clamped to

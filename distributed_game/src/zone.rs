@@ -79,6 +79,12 @@ pub struct TicketClaims {
     /// ticket's `ext`), checked by the `net` server against
     /// `ServerConfig::ticket_extensions`. Never identity or rewards.
     pub extensions: TicketExtensions,
+    /// The issuer lets this **observer** wake the zone and keep it awake
+    /// while it declares itself near ([`Hello::near`](crate::protocol::Hello::near),
+    /// zones hosted as celld objects); the ticket's `wake` claim. The
+    /// issuer decides who may (e.g. only rooms next to the principal's
+    /// own). Ignored for players.
+    pub wake: bool,
 }
 
 impl TicketClaims {
@@ -98,7 +104,15 @@ impl TicketClaims {
             role,
             name: None,
             extensions: TicketExtensions::new(),
+            wake: false,
         }
+    }
+
+    /// Grant an observer ticket the right to wake the zone when near
+    /// ([`wake`](Self::wake)).
+    pub fn with_wake(mut self, wake: bool) -> Self {
+        self.wake = wake;
+        self
     }
 
     /// Attach extension claims.

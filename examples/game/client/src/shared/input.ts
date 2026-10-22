@@ -15,6 +15,8 @@ export type Sample = Readonly<{
 	action: boolean;
 	/** Secondary action: E / F / gamepad B or LB. */
 	alt: boolean;
+	/** Jump: Q / C / gamepad Y. */
+	jump: boolean;
 }>;
 
 const UP = ['KeyW', 'ArrowUp'];
@@ -23,6 +25,7 @@ const LEFT = ['KeyA', 'ArrowLeft'];
 const RIGHT = ['KeyD', 'ArrowRight'];
 const ACTION = ['Space', 'ShiftLeft', 'ShiftRight'];
 const ALT = ['KeyE', 'KeyF'];
+const JUMP = ['KeyQ', 'KeyC'];
 const DEADZONE = 0.15;
 
 export class InputSampler {
@@ -56,6 +59,7 @@ export class InputSampler {
 		let y = (this.#any(UP) ? 1 : 0) - (this.#any(DOWN) ? 1 : 0);
 		let action = this.#any(ACTION);
 		let alt = this.#any(ALT);
+		let jump = this.#any(JUMP);
 		const pad = firstGamepad();
 		if (pad !== undefined) {
 			const gx = pad.axes[0] ?? 0;
@@ -66,13 +70,14 @@ export class InputSampler {
 			}
 			action ||= pad.buttons[0]?.pressed === true || pad.buttons[5]?.pressed === true;
 			alt ||= pad.buttons[1]?.pressed === true || pad.buttons[4]?.pressed === true;
+			jump ||= pad.buttons[3]?.pressed === true;
 		}
 		const length = Math.hypot(x, y);
 		if (length > 1) {
 			x /= length;
 			y /= length;
 		}
-		return { x, y, action, alt };
+		return { x, y, action, alt, jump };
 	}
 
 	dispose(): void {

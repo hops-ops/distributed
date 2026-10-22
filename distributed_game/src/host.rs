@@ -253,6 +253,9 @@ pub(crate) struct Core<Z: Zone> {
     tick: u64,
     sim_time: Duration,
     dt: Duration,
+    /// Ticks dropped (catch-up cap) since the last simulated tick; seen by
+    /// the next `on_tick` through `Ctx::dropped_ticks`, then reset.
+    dropped_ticks: u32,
     tier: Tier,
     players: BTreeMap<PlayerId, PlayerSlot<Z::Input>>,
     observers: BTreeMap<ObserverId, ObserverSlot>,
@@ -414,6 +417,15 @@ impl<Z: Zone> Ctx<'_, Z> {
         self.core.dt
     }
 
+    /// Ticks the host dropped right before this one: the clock ran further
+    /// ahead than `max_catch_up` steps, so the rest of the backlog was not
+    /// simulated (0 normally). Simulated ticks then lag wall-clock time; a
+    /// zone that paces players' inputs per tick credits these so inputs
+    /// sent in real time do not queue up for good.
+    pub fn dropped_ticks(&self) -> u32 {
+        self.core.dropped_ticks
+    }
+
     /// Step length in seconds.
     pub fn dt_secs(&self) -> f32 {
         self.core.dt.as_secs_f32()
@@ -437,6 +449,31 @@ impl<Z: Zone> Ctx<'_, Z> {
     /// Content version.
     pub fn content_version(&self) -> &str {
         &self.core.config.content_version
+    }
+
+    /// Content version `player`'s client runs (what it presented on its
+    /// last Hello; differs from [`content_version`](Self::content_version)
+    /// for a stale client kept under [`StalePolicy::SafeRoom`]).
+    pub fn player_content_version(&self, player: PlayerId) -> Option<&str> {
+        self.core
+            .players
+            .get(&player)
+            .map(|slot| slot.content_version.as_str())
+    }
+
+    /// True when `player`'s client runs older content than the zone (it
+    /// may only be handed off into a gate zone, unless the policy roams).
+    pub fn is_stale(&self, player: PlayerId) -> bool {
+        let expected = &self.core.config.content_version;
+        !expected.is_empty()
+            && self
+                .player_content_version(player)
+                .is_some_and(|version| version != expected)
+    }
+
+    /// The host's [`StalePolicy`].
+    pub fn stale_policy(&self) -> StalePolicy {
+        self.core.config.stale_policy
     }
 
     /// Remote config version ([`HostConfig::config_version`]).
@@ -834,6 +871,7 @@ impl<Z: Zone> ZoneHost<Z> {
             tick: 0,
             sim_time: Duration::ZERO,
             dt: rate_to_step(config.tick_rate),
+            dropped_ticks: 0,
             tier: Tier::Hot,
             players: BTreeMap::new(),
             observers: BTreeMap::new(),
@@ -1037,6 +1075,15 @@ impl<Z: Zone> ZoneHost<Z> {
     /// Server clock in ms (for Pong).
     pub fn server_time_ms(&self) -> f64 {
         self.core.server_time_ms()
+    }
+
+    /// Send every client the current state now, without ticking (a host
+    /// that is not ticking — a celld zone with only passive observers —
+    /// greets a new observer with it).
+    pub fn patch_now(&mut self) {
+        if !self.core.clients.is_empty() {
+            self.patch();
+        }
     }
 
     /// Frames and closes produced since the last call, in order.
@@ -1400,6 +1447,26 @@ impl<Z: Zone> ZoneHost<Z> {
             self.reload_player(*player);
         }
         stale.len()
+    }
+
+    /// A client patched its content live and now runs `version`
+    /// (`ClientMessage::Content`): recorded for its player only when it is
+    /// the zone's current version (a client can catch up, never get
+    /// ahead). Returns whether it was recorded.
+    pub fn content_patched(&mut self, client: ClientId, version: &str) -> bool {
+        if version != self.core.config.content_version {
+            return false;
+        }
+        let Some(Viewer::Player(player)) = self.viewer_of(client) else {
+            return false;
+        };
+        match self.core.players.get_mut(&player) {
+            Some(slot) => {
+                slot.content_version = version.to_string();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Content version a player's client reported.
@@ -1873,6 +1940,7 @@ impl<Z: Zone> ZoneHost<Z> {
             hook!(self.on_timer(id, timer));
         }
         hook!(self.on_tick());
+        self.core.dropped_ticks = 0;
         self.process_kicks();
         let mut frame = RewindFrame::default();
         self.zone.record_rewind(&mut frame);
@@ -1980,6 +2048,7 @@ impl<Z: Zone> ZoneHost<Z> {
         if !dt.is_zero() {
             report.dropped_ticks = (steps.dropped.as_nanos() / dt.as_nanos()) as u32;
         }
+        self.core.dropped_ticks = self.core.dropped_ticks.saturating_add(report.dropped_ticks);
         if !self.frozen {
             for _ in 0..steps.steps {
                 self.tick_once(dt);

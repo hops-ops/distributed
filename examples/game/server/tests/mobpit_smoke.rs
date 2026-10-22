@@ -38,6 +38,9 @@ use game_demos::mobpit::{self, encode_bot_input, MobPitWorld, RunningServices, W
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// The services' admin secret in these tests.
+const ADMIN_SECRET: &str = "smoke-admin-secret";
+
 /// The rooms' empty → hibernated delay in these tests.
 const HIBERNATE_AFTER_MS: &str = "1500";
 
@@ -309,6 +312,7 @@ async fn start(
         listener,
         TicketKey::new(celld.ticket_secret()),
         true,
+        ADMIN_SECRET.to_string(),
         world,
         async move {
             let _ = stopped.await;
@@ -598,6 +602,7 @@ async fn presence_is_settled_in_presence_cells_from_the_rooms_lifecycle_facts() 
                 capabilities: 0,
                 ticket,
                 reconnect_token: String::new(),
+                near: false,
             });
             ws.send(Message::Binary(hello.encode().into()))
                 .await

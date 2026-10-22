@@ -81,7 +81,8 @@ test('handshake sends Hello with versions, capabilities and the app ticket', asy
 		contentVersion: 'c1',
 		capabilities: 5,
 		ticket: 't:z1:1',
-		reconnectToken: ''
+		reconnectToken: '',
+		near: false
 	});
 	assert.deepEqual(tickets, [{ zoneId: 'z1', role: 'player', reason: 'join' }]);
 	assert.deepEqual(states, ['connecting', 'open']);
@@ -90,6 +91,40 @@ test('handshake sends Hello with versions, capabilities and the app ticket', asy
 	await flush();
 	assert.deepEqual(network.last().inbox.at(-1), { type: 'Leave' }, 'clean close sends Leave');
 	assert.equal(conn.state, 'closed');
+});
+
+test('an observer says it is near in Hello and with Near, without reconnecting', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	network.onMessage = (conn, message) => {
+		if (message.type === 'Hello') conn.send(welcome({ zoneId: conn.zoneId, role: 'observer', serverTime: 10_000 }));
+	};
+	const { conn } = connection(network, scheduler, { role: 'observer', near: true });
+	await conn.connect();
+	const server = network.last();
+	assert.equal(server.lastHello.near, true);
+	assert.equal(conn.near, true);
+	conn.setNear(false);
+	conn.setNear(false);
+	conn.setNear(true);
+	assert.deepEqual(
+		server.inbox.filter((m) => m.type === 'Near'),
+		[
+			{ type: 'Near', near: false },
+			{ type: 'Near', near: true }
+		]
+	);
+	assert.equal(network.connections.length, 1, 'same socket');
+	conn.close();
+	// A player's nearness is never sent.
+	network.onMessage = (c, message) => {
+		if (message.type === 'Hello') c.send(welcome({ zoneId: c.zoneId, serverTime: 10_000 }));
+	};
+	const player = connection(network, scheduler).conn;
+	await player.connect();
+	player.setNear(true);
+	assert.deepEqual(network.last().inbox.filter((m) => m.type === 'Near'), []);
+	player.close();
 });
 
 test('ping/pong estimates offset, rtt and jitter', async () => {

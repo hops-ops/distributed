@@ -1,10 +1,10 @@
 //! The Durable Object side of the celld zone host (wasm32 only).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +24,7 @@ use worker::{
 
 use super::plan::{
     cell_binding, classify_wait_path, zone_from_path, ObjectOptions, RoomState, StoredFact,
-    TickSchedule, Window, CLOSE_RESTARTED, OUTBOX_PREFIX, ZONE_HEADER,
+    TickSchedule, Window, CLOSE_RESTARTED, NETSIM_SHARD, OUTBOX_PREFIX, ZONE_DEV_KIND, ZONE_HEADER,
 };
 use crate::command_sink::{CommandFactSink, FactCall, FactHost, FactRoute};
 use crate::facts::{
@@ -32,13 +32,17 @@ use crate::facts::{
 };
 use crate::handoff::{HandoffRequest, Transfer};
 use crate::inbox::ZoneInbound;
-use crate::protocol::{error, ClientMessage, Role, ServerMessage, PROTOCOL_VERSION};
+use crate::netsim::{DelayLine, NetSim, NetSimJson};
+use crate::protocol::{error, ClientMessage, Notice, Role, ServerMessage, PROTOCOL_VERSION};
 use crate::stamp::FactStamp;
 use crate::ticket::{NonceCache, TicketKey, VerifiedTicket};
+use crate::world::content_rollout::{zone_step, ContentState, ZoneStep, CONTENT_ROLLOUT_KIND};
 use crate::world::zone_activity::{
     zone_principal, RecordActivity, ACTIVITY_ACTIVE, ACTIVITY_DORMANT, ACTIVITY_HIBERNATED,
     ZONE_ACTIVITY_KIND,
 };
+use crate::world::FreezeState;
+use crate::zone::Viewer;
 use crate::{ClientId, Clock, HostConfig, Outbound, TicketClaims, Zone, ZoneHost};
 
 /// A future that runs on the object's (single) thread.
@@ -56,6 +60,24 @@ const TRANSFER_TTL_SECS: u64 = 30;
 const FACT_CAPACITY: usize = 512;
 /// Retry stored facts this often while any is unsettled (ms).
 const OUTBOX_RETRY_MS: f64 = 10_000.0;
+/// Read the dev settings this often while ticking (ms).
+const DEV_SETTINGS_EVERY_MS: f64 = 1_000.0;
+
+/// Server → client, through the socket's simulated network.
+enum OutItem {
+    Frame(Vec<u8>),
+    Close,
+}
+
+/// Client → server, through the socket's simulated network.
+enum InItem {
+    Input {
+        seq: u32,
+        client_tick: u32,
+        payload: Vec<u8>,
+    },
+    Ping(f64),
+}
 
 /// A game zone the framework can host as a celld Durable Object: one object
 /// per zone id (celld places it, forwards to it, hibernates and moves it).
@@ -84,6 +106,25 @@ pub trait CelldZone: Zone {
     fn after_join(
         _env: &ObjectEnv,
         _principal: &str,
+    ) -> Option<LocalFuture<Option<Self::Message>>> {
+        None
+    }
+
+    /// How often [`refresh`](Self::refresh) runs while the zone ticks
+    /// (`None`: never). It also runs once on every wake.
+    fn refresh_every() -> Option<Duration> {
+        None
+    }
+
+    /// Async work that keeps the zone in step with the world around it —
+    /// e.g. read the cells of the tiers it belongs to — off the tick; the
+    /// message it returns is delivered into the zone ([`Zone::on_message`]).
+    /// `round` counts the calls of this activation (0 on wake), so a zone
+    /// can read slower tiers less often.
+    fn refresh(
+        _env: &ObjectEnv,
+        _zone_id: &str,
+        _round: u64,
     ) -> Option<LocalFuture<Option<Self::Message>>> {
         None
     }
@@ -370,6 +411,10 @@ struct Inner<Z: CelldZone> {
     wakes: u64,
     state: RoomState,
     sockets: HashMap<u32, WebSocket>,
+    /// Observers whose ticket grants `wake` ([`TicketClaims::wake`]).
+    may_wake: HashSet<u32>,
+    /// Of those, the ones near right now: they keep the zone awake.
+    near: HashSet<u32>,
     ticking: bool,
     nonces: NonceCache,
     sink: Option<DurableFacts>,
@@ -381,31 +426,187 @@ struct Inner<Z: CelldZone> {
     stats: TickStats,
     last_persist_ms: f64,
     spooled: u64,
+    /// Dev network simulation in effect (from the dev settings object).
+    net_sim: Option<NetSim>,
+    /// Per socket: server → client and client → server delay lines.
+    out_lines: HashMap<u32, DelayLine<OutItem>>,
+    in_lines: HashMap<u32, DelayLine<InItem>>,
+    /// When the pending drain task wakes up (one per earliest deadline).
+    drain_at: Option<f64>,
+    /// Spawns a drain task waking at the given time (set by the object).
+    drainer: Option<Rc<dyn Fn(f64)>>,
+    last_dev_read_ms: f64,
+    /// Last read of the world's content rollout cell.
+    last_content_read_ms: f64,
+    /// [`CelldZone::refresh`] calls of this activation, and the last one.
+    refresh_round: u64,
+    last_refresh_ms: f64,
 }
 
 impl<Z: CelldZone> Inner<Z> {
+    /// Send `item` to `client` through its simulated network.
+    fn send_out(&mut self, client: u32, item: OutItem) {
+        let sim = self.net_sim;
+        let line = self
+            .out_lines
+            .entry(client)
+            .or_insert_with(|| DelayLine::new(u64::from(client) ^ 0x5eed_0u64));
+        match line.push(sim, now_ms(), item) {
+            Some(item) => self.deliver(client, item),
+            None => {
+                if let Some(due) = line.next_due() {
+                    self.want_drain(due);
+                }
+            }
+        }
+    }
+
+    fn deliver(&mut self, client: u32, item: OutItem) {
+        match item {
+            OutItem::Frame(frame) => {
+                if let Some(ws) = self.sockets.get(&client) {
+                    let _ = ws.send_with_bytes(frame);
+                }
+            }
+            OutItem::Close => {
+                self.forget(client);
+                if let Some(ws) = self.sockets.remove(&client) {
+                    let _ = ws.close(Some(1000), Some("closed by zone"));
+                }
+            }
+        }
+    }
+
+    /// Take `item` from `client` through its simulated network.
+    fn receive(&mut self, client: u32, item: InItem) {
+        let sim = self.net_sim;
+        let line = self
+            .in_lines
+            .entry(client)
+            .or_insert_with(|| DelayLine::new(u64::from(client) ^ 0xfeed_0u64));
+        match line.push(sim, now_ms(), item) {
+            Some(item) => self.apply(client, item),
+            None => {
+                if let Some(due) = line.next_due() {
+                    self.want_drain(due);
+                }
+            }
+        }
+    }
+
+    fn apply(&mut self, client: u32, item: InItem) {
+        match item {
+            InItem::Input {
+                seq,
+                client_tick,
+                payload,
+            } => {
+                if let Some(host) = self.host.as_mut() {
+                    host.push_input(ClientId(client), seq, client_tick, &payload);
+                }
+            }
+            InItem::Ping(client_time) => {
+                let server_time = self.host.as_ref().map_or(0.0, |h| h.server_time_ms());
+                if let Ok(pong) = (ServerMessage::Pong {
+                    client_time,
+                    server_time,
+                })
+                .encode(&())
+                {
+                    self.send_out(client, OutItem::Frame(pong));
+                }
+            }
+        }
+    }
+
+    /// Deliver and apply everything due at `now`.
+    fn drain_due(&mut self, now: f64) {
+        let clients: Vec<u32> = self.in_lines.keys().copied().collect();
+        for client in clients {
+            while let Some(item) = self.in_lines.get_mut(&client).and_then(|l| l.pop_due(now)) {
+                self.apply(client, item);
+            }
+        }
+        let clients: Vec<u32> = self.out_lines.keys().copied().collect();
+        for client in clients {
+            while let Some(item) = self.out_lines.get_mut(&client).and_then(|l| l.pop_due(now)) {
+                self.deliver(client, item);
+            }
+        }
+    }
+
+    fn next_due(&self) -> Option<f64> {
+        self.in_lines
+            .values()
+            .filter_map(DelayLine::next_due)
+            .chain(self.out_lines.values().filter_map(DelayLine::next_due))
+            .min_by(f64::total_cmp)
+    }
+
+    /// Make sure a drain task wakes up by `due`.
+    fn want_drain(&mut self, due: f64) {
+        if self.drain_at.is_some_and(|at| at <= due) {
+            return;
+        }
+        self.drain_at = Some(due);
+        if let Some(drainer) = self.drainer.clone() {
+            drainer(due);
+        }
+    }
+
+    /// Forget a socket's delay lines and nearness.
+    fn forget(&mut self, client: u32) {
+        self.out_lines.remove(&client);
+        self.in_lines.remove(&client);
+        self.may_wake.remove(&client);
+        self.near.remove(&client);
+    }
+
+    /// Players keep a zone awake (also inside their reconnect grace), and
+    /// so do near observers; other observers are passive watchers.
     fn occupied(&self) -> bool {
-        self.host
-            .as_ref()
-            .is_some_and(|h| h.player_count() > 0 || h.client_count() > 0)
+        self.host.as_ref().is_some_and(|h| {
+            h.player_count() > 0 || self.near.iter().any(|c| self.sockets.contains_key(c))
+        })
+    }
+
+    /// An observer declares itself near (or not). Only an observer whose
+    /// ticket grants `wake` can be near (others are told `WAKE_DENIED`);
+    /// returns whether the zone must start ticking (it was not and is
+    /// occupied now).
+    fn set_near(&mut self, client: u32, near: bool) -> bool {
+        if !self.sockets.contains_key(&client) {
+            return false;
+        }
+        if near && self.may_wake.contains(&client) {
+            self.near.insert(client);
+        } else {
+            self.near.remove(&client);
+            if near {
+                if let Ok(frame) = (ServerMessage::Error {
+                    code: error::WAKE_DENIED,
+                    message: "ticket does not grant wake".into(),
+                })
+                .encode(&())
+                {
+                    self.send_out(client, OutItem::Frame(frame));
+                }
+            }
+        }
+        self.occupied() && !self.ticking
     }
 
     fn flush(&mut self) {
         let Some(host) = self.host.as_mut() else {
             return;
         };
-        for out in host.drain_outbound() {
+        let outbound = host.drain_outbound();
+        for out in outbound {
             match out {
                 Outbound::Frame { client, frame } => {
-                    if let Some(ws) = self.sockets.get(&client.0) {
-                        let _ = ws.send_with_bytes(frame);
-                    }
+                    self.send_out(client.0, OutItem::Frame(frame));
                 }
-                Outbound::Close { client } => {
-                    if let Some(ws) = self.sockets.remove(&client.0) {
-                        let _ = ws.close(Some(1000), Some("closed by zone"));
-                    }
-                }
+                Outbound::Close { client } => self.send_out(client.0, OutItem::Close),
             }
         }
     }
@@ -523,6 +724,8 @@ impl<Z: CelldZone> ZoneObject<Z> {
             wakes: 0,
             state: RoomState::Cold,
             sockets: HashMap::new(),
+            may_wake: HashSet::new(),
+            near: HashSet::new(),
             ticking: false,
             nonces: NonceCache::default(),
             sink: None,
@@ -534,11 +737,25 @@ impl<Z: CelldZone> ZoneObject<Z> {
             stats: TickStats::default(),
             last_persist_ms: 0.0,
             spooled: 0,
+            net_sim: None,
+            out_lines: HashMap::new(),
+            in_lines: HashMap::new(),
+            drain_at: None,
+            drainer: None,
+            last_dev_read_ms: 0.0,
+            last_content_read_ms: 0.0,
+            refresh_round: 0,
+            last_refresh_ms: 0.0,
         };
+        let inner = Rc::new(RefCell::new(inner));
+        let weak = Rc::downgrade(&inner);
+        inner.borrow_mut().drainer = Some(Rc::new(move |due: f64| {
+            wasm_bindgen_futures::spawn_local(drain_task(weak.clone(), due));
+        }));
         Self {
             state: Rc::new(state),
             env,
-            inner: Rc::new(RefCell::new(inner)),
+            inner,
         }
     }
 
@@ -571,7 +788,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         if self.inner.borrow().options.is_none() {
             return Response::error("zone host is not configured", 503);
         }
-        self.wake().await?;
+        // Not woken here: only a player's Hello wakes a sleeping zone.
         let pair = WebSocketPair::new()?;
         self.state.accept_web_socket(&pair.server);
         Response::from_websocket(pair.client)
@@ -616,17 +833,26 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 },
             ) => {
                 let mut inner = self.inner.borrow_mut();
-                match inner.host.as_mut() {
-                    Some(host) => {
-                        host.push_input(ClientId(client), seq, client_tick, &payload);
-                    }
-                    None => {
-                        drop(inner);
-                        let _ = ws.close(Some(CLOSE_RESTARTED), Some("zone asleep; rejoin"));
-                    }
+                if inner.host.is_some() {
+                    inner.receive(
+                        client,
+                        InItem::Input {
+                            seq,
+                            client_tick,
+                            payload,
+                        },
+                    );
+                } else {
+                    drop(inner);
+                    let _ = ws.close(Some(CLOSE_RESTARTED), Some("zone asleep; rejoin"));
                 }
             }
-            (_, ClientMessage::Ping { client_time }) => {
+            (Some(client), ClientMessage::Ping { client_time }) => {
+                self.inner
+                    .borrow_mut()
+                    .receive(client, InItem::Ping(client_time));
+            }
+            (None, ClientMessage::Ping { client_time }) => {
                 let server_time = self
                     .inner
                     .borrow()
@@ -642,10 +868,23 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     let _ = ws.send_with_bytes(pong);
                 }
             }
+            (Some(client), ClientMessage::Near { near }) => {
+                let start = self.inner.borrow_mut().set_near(client, near);
+                if start {
+                    self.keep_awake().await;
+                }
+            }
+            (Some(client), ClientMessage::Content { content_version }) => {
+                let mut inner = self.inner.borrow_mut();
+                if let Some(host) = inner.host.as_mut() {
+                    host.content_patched(ClientId(client), &content_version);
+                }
+            }
             (Some(client), ClientMessage::Leave) => {
                 {
                     let mut inner = self.inner.borrow_mut();
                     inner.sockets.remove(&client);
+                    inner.forget(client);
                     if let Some(host) = inner.host.as_mut() {
                         host.disconnect(ClientId(client), true);
                     }
@@ -842,6 +1081,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
             host_config.idle_tick_rate = None;
             host_config.reconnect_grace = options.reconnect_grace;
             host_config.boot_epoch = (now_ms() * 1000.0) as u64;
+            // The content version the zone slept on (a rollout it missed is
+            // caught up by `read_content`).
+            if let Some(snapshot) = &stored {
+                host_config.content_version = snapshot.version.clone();
+            }
             let key = inner.key.clone().expect("ticket key with options");
             let issuer_zone = zone_id.clone();
             let generation = inner.activation_epoch;
@@ -859,6 +1103,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                                 role: Role::Player,
                                 name: request.name.clone(),
                                 extensions: request.extensions.clone(),
+                                wake: false,
                             },
                             source_zone: request.source_zone.clone(),
                             issuer: issuer_zone.clone(),
@@ -898,6 +1143,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             inner.host = Some(host);
             inner.restored = restored;
             inner.wakes += 1;
+            inner.refresh_round = 0;
             // Each wake is a new activation: sockets of an earlier one are
             // told to rejoin (1012).
             if inner.wakes > 1 {
@@ -909,7 +1155,168 @@ impl<Z: CelldZone> ZoneObject<Z> {
         }
         self.store_status().await;
         self.find_node();
+        // Off the join path: a wake (often a doorway into a sleeping zone,
+        // with the player's inputs waiting) does not wait for dev settings.
+        let this = self.handle();
+        wasm_bindgen_futures::spawn_local(async move { this.read_dev_settings().await });
+        // The snapshot restored the zone's last content version; catch up
+        // with a rollout it slept through (off the join path too: a Hello
+        // on another version waits for its own read, see `hello`).
+        let this = self.handle();
+        wasm_bindgen_futures::spawn_local(async move { this.read_content().await });
+        self.refresh();
         Ok(())
+    }
+
+    /// Run [`CelldZone::refresh`] off the tick and deliver its message.
+    fn refresh(&self) {
+        let (zone_id, round) = {
+            let mut inner = self.inner.borrow_mut();
+            inner.last_refresh_ms = now_ms();
+            let round = inner.refresh_round;
+            inner.refresh_round += 1;
+            (inner.zone_id.clone(), round)
+        };
+        let Some(work) = Z::refresh(&self.env, &zone_id, round) else {
+            return;
+        };
+        let inner = self.inner.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(message) = work.await {
+                let mut inner = inner.borrow_mut();
+                if let Some(host) = inner.host.as_mut() {
+                    host.deliver(ZoneInbound::Message(message));
+                    inner.flush();
+                }
+            }
+        });
+    }
+
+    /// [`refresh`](Self::refresh) when [`CelldZone::refresh_every`] is due.
+    fn refresh_if_due(&self) {
+        let Some(every) = Z::refresh_every() else {
+            return;
+        };
+        let due = now_ms() - self.inner.borrow().last_refresh_ms >= every.as_millis() as f64;
+        if due {
+            self.refresh();
+        }
+    }
+
+    /// Dev only (`ZONE_DEV_SETTINGS=1`): read the network simulation from
+    /// the worker's dev settings object.
+    async fn read_dev_settings(&self) {
+        let enabled = {
+            let mut inner = self.inner.borrow_mut();
+            inner.last_dev_read_ms = now_ms();
+            inner.options.as_ref().is_some_and(|o| o.dev_settings)
+        };
+        if !enabled {
+            return;
+        }
+        match self.env.read_cell(ZONE_DEV_KIND, NETSIM_SHARD).await {
+            Ok(value) => {
+                let sim = serde_json::from_value::<NetSimJson>(value)
+                    .unwrap_or_default()
+                    .to_sim();
+                self.inner.borrow_mut().net_sim = sim;
+            }
+            Err(e) => worker::console_warn!("zone dev settings: {e}"),
+        }
+    }
+
+    /// [`read_dev_settings`](Self::read_dev_settings) off the tick, at most
+    /// every [`DEV_SETTINGS_EVERY_MS`].
+    fn refresh_dev_settings(&self) {
+        let due = {
+            let inner = self.inner.borrow();
+            inner.options.as_ref().is_some_and(|o| o.dev_settings)
+                && now_ms() - inner.last_dev_read_ms >= DEV_SETTINGS_EVERY_MS
+        };
+        if due {
+            self.inner.borrow_mut().last_dev_read_ms = now_ms();
+            let this = self.handle();
+            wasm_bindgen_futures::spawn_local(async move { this.read_dev_settings().await });
+        }
+    }
+
+    /// Read the world's content rollout cell and follow it
+    /// ([`zone_step`]: freeze, apply + resume).
+    async fn read_content(&self) {
+        let world = {
+            let mut inner = self.inner.borrow_mut();
+            inner.last_content_read_ms = now_ms();
+            inner
+                .options
+                .as_ref()
+                .and_then(|o| o.content_rollout.clone())
+        };
+        let Some(world) = world else {
+            return;
+        };
+        match self.env.read_cell(CONTENT_ROLLOUT_KIND, &world).await {
+            Ok(value) => {
+                let state = value
+                    .get("state")
+                    .cloned()
+                    .and_then(|state| serde_json::from_value::<ContentState>(state).ok());
+                if let Some(state) = state {
+                    self.apply_content(&state);
+                }
+            }
+            Err(e) => worker::console_warn!("content rollout: {e}"),
+        }
+    }
+
+    fn apply_content(&self, state: &ContentState) {
+        let mut inner = self.inner.borrow_mut();
+        let Some(host) = inner.host.as_mut() else {
+            return;
+        };
+        let frozen = host.freeze_state() != FreezeState::Running;
+        let current = host.config().content_version.clone();
+        match zone_step(state, &current, frozen) {
+            ZoneStep::Stay => return,
+            ZoneStep::Freeze => {
+                host.request_freeze(Notice {
+                    reason: "content_update".into(),
+                    version: state.target.clone(),
+                    notes: state.notes.clone(),
+                });
+            }
+            ZoneStep::Apply(version) => {
+                host.set_content_version(version.clone());
+                if frozen {
+                    host.resume(Notice {
+                        reason: "content_updated".into(),
+                        version,
+                        notes: state.notes.clone(),
+                    });
+                }
+                if state.hard {
+                    host.reload_stale_players();
+                }
+            }
+        }
+        inner.flush();
+    }
+
+    /// [`read_content`](Self::read_content) off the tick, at most every
+    /// [`DEV_SETTINGS_EVERY_MS`].
+    fn refresh_content(&self) {
+        let due = {
+            let inner = self.inner.borrow();
+            inner
+                .options
+                .as_ref()
+                .is_some_and(|o| o.content_rollout.is_some())
+                && now_ms() - inner.last_content_read_ms >= DEV_SETTINGS_EVERY_MS
+        };
+        if due {
+            self.inner.borrow_mut().last_content_read_ms = now_ms();
+            let this = self.handle();
+            wasm_bindgen_futures::spawn_local(async move { this.read_content().await });
+        }
     }
 
     async fn hello(&self, ws: &WebSocket, hello: crate::protocol::Hello) -> Result<()> {
@@ -917,13 +1324,17 @@ impl<Z: CelldZone> ZoneObject<Z> {
             reject(ws, error::VERSION_MISMATCH, "protocol version");
             return Ok(());
         }
-        if let Err(e) = self.wake().await {
-            reject(ws, error::NOT_FOUND, &e.to_string());
+        let cold = self.inner.borrow().host.is_none();
+        if cold && !hello.reconnect_token.is_empty() {
+            // Sessions die with the activation: rejoin with a ticket (which
+            // wakes the zone for a player, not for an observer).
+            reject(ws, error::RECONNECT_FAILED, "zone restarted; rejoin");
             return Ok(());
         }
         let now = (now_ms() / 1000.0) as u64;
         // Transfer tickets are single use across activations too.
         let mut principal = None;
+        let mut wake_grant = false;
         let joined = if hello.reconnect_token.is_empty() {
             let verified = {
                 let inner = self.inner.borrow();
@@ -944,6 +1355,14 @@ impl<Z: CelldZone> ZoneObject<Z> {
             };
             if claims.zone != zone_id {
                 reject(ws, error::UNAUTHORIZED, "ticket is for another zone");
+                return Ok(());
+            }
+            // A passive watcher never wakes a sleeping zone; a near one
+            // whose ticket grants `wake` does.
+            let observer = claims.role == Role::Observer;
+            wake_grant = observer && claims.wake;
+            if cold && observer && !(hello.near && wake_grant) {
+                reject(ws, error::ASLEEP, "zone asleep");
                 return Ok(());
             }
             let replayed = self
@@ -973,9 +1392,36 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     .put(&nonce_key, claims.expires_at)
                     .await;
             }
-            principal = Some(claims.principal.clone());
+            if let Err(e) = self.wake().await {
+                reject(ws, error::NOT_FOUND, &e.to_string());
+                return Ok(());
+            }
+            if claims.role == Role::Player {
+                principal = Some(claims.principal.clone());
+            }
+            // A client on another content version than the zone: the zone
+            // may be behind the world (it slept through a rollout), so it
+            // learns the live version before deciding.
+            let behind = {
+                let inner = self.inner.borrow();
+                inner
+                    .options
+                    .as_ref()
+                    .is_some_and(|o| o.content_rollout.is_some())
+                    && inner
+                        .host
+                        .as_ref()
+                        .is_some_and(|h| h.config().content_version != hello.content_version)
+            };
+            if behind {
+                self.read_content().await;
+            }
             let mut inner = self.inner.borrow_mut();
-            let host = inner.host.as_mut().expect("woken");
+            let Some(host) = inner.host.as_mut() else {
+                drop(inner);
+                reject(ws, error::ZONE_UNAVAILABLE, "zone asleep");
+                return Ok(());
+            };
             match &transfer {
                 Some(transfer) => {
                     host.join_transfer(transfer, hello.capabilities, &hello.content_version)
@@ -984,7 +1430,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
             }
         } else {
             let mut inner = self.inner.borrow_mut();
-            let host = inner.host.as_mut().expect("woken");
+            let Some(host) = inner.host.as_mut() else {
+                drop(inner);
+                reject(ws, error::RECONNECT_FAILED, "zone restarted; rejoin");
+                return Ok(());
+            };
             host.reconnect_with_version(
                 &hello.reconnect_token,
                 hello.capabilities,
@@ -993,6 +1443,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         };
         match joined {
             Ok(joined) => {
+                let mut observer = matches!(joined.viewer, Viewer::Observer(_));
                 {
                     let mut inner = self.inner.borrow_mut();
                     let activation = inner.activation.clone();
@@ -1001,11 +1452,32 @@ impl<Z: CelldZone> ZoneObject<Z> {
                         activation,
                     })?;
                     inner.sockets.insert(joined.client.0, ws.clone());
+                    if observer && wake_grant {
+                        inner.may_wake.insert(joined.client.0);
+                    }
+                    if observer && hello.near {
+                        // A near watcher (with the grant) keeps the zone
+                        // awake like a player; without it, it is told so
+                        // after its Welcome and stays passive.
+                        inner.flush();
+                        inner.set_near(joined.client.0, true);
+                        observer = !wake_grant;
+                    }
+                    if observer && !inner.ticking {
+                        // A dormant zone does not tick: greet the watcher
+                        // with its current state (it stays dormant).
+                        if let Some(host) = inner.host.as_mut() {
+                            host.patch_now();
+                        }
+                    }
                     inner.flush();
-                    if inner.state != RoomState::Active {
+                    if !observer && inner.state != RoomState::Active {
                         inner.state = RoomState::Active;
                         inner.report(ACTIVITY_ACTIVE);
                     }
+                }
+                if observer {
+                    return Ok(());
                 }
                 self.store_status().await;
                 self.start_loop();
@@ -1016,6 +1488,23 @@ impl<Z: CelldZone> ZoneObject<Z> {
             Err(e) => reject(ws, e.code, &e.message),
         }
         Ok(())
+    }
+
+    /// A near watcher arrived on an awake zone that is not ticking
+    /// (dormant): it is active again and ticks.
+    async fn keep_awake(&self) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if inner.host.is_none() {
+                return;
+            }
+            if inner.state != RoomState::Active {
+                inner.state = RoomState::Active;
+                inner.report(ACTIVITY_ACTIVE);
+            }
+        }
+        self.store_status().await;
+        self.start_loop();
     }
 
     fn after_join(&self, principal: String) {
@@ -1040,6 +1529,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let mut inner = self.inner.borrow_mut();
         if let Some(a) = attached.filter(|a| a.activation == inner.activation) {
             inner.sockets.remove(&a.client);
+            inner.forget(a.client);
             if let Some(host) = inner.host.as_mut() {
                 host.disconnect(ClientId(a.client), false);
             }
@@ -1108,6 +1598,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 (stop, persist)
             };
             self.spool().await;
+            self.refresh_dev_settings();
+            self.refresh_content();
+            self.refresh_if_due();
             if persist {
                 self.persist().await;
                 if !stop {
@@ -1162,6 +1655,15 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 return;
             }
             inner.report(ACTIVITY_HIBERNATED);
+            // Watchers of a sleeping zone are let go (they may come back
+            // and are told it is asleep).
+            for (_, ws) in inner.sockets.drain() {
+                let _ = ws.close(Some(1000), Some("zone asleep"));
+            }
+            inner.out_lines.clear();
+            inner.in_lines.clear();
+            inner.may_wake.clear();
+            inner.near.clear();
             // Dropped, so the next join restores from storage.
             inner.host = None;
             inner.state = RoomState::Cold;
@@ -1289,6 +1791,8 @@ impl<Z: CelldZone> ZoneObject<Z> {
             "node": inner.node,
             "isolate": ISOLATE.with(|i| i.clone()),
             "players": host.map_or(0, |h| h.player_count()),
+            "observers": host.map_or(0, |h| h.observer_count()),
+            "near": inner.near.len(),
             "tick": host.map_or(0, |h| h.tick()),
             "hz": inner.options.as_ref().map_or(0, |o| o.tick_hz),
             "ticking": inner.ticking,
@@ -1298,8 +1802,42 @@ impl<Z: CelldZone> ZoneObject<Z> {
             "iterations": stats.iterations,
             "droppedTicks": stats.dropped,
             "lateMs": { "p50": stats.late.percentile(0.5), "p99": stats.late.percentile(0.99) },
+            "netsim": NetSim::to_json(inner.net_sim),
+            "content": host.map(|h| json!({
+                "version": h.config().content_version,
+                "freeze": format!("{:?}", h.freeze_state()).to_lowercase(),
+            })),
             "workMs": { "p50": stats.work.percentile(0.5), "p99": stats.work.percentile(0.99) },
         })
+    }
+}
+
+/// Deliver what the delay lines hold as it falls due, then stop (a newer
+/// task with an earlier deadline takes over).
+async fn drain_task<Z: CelldZone>(inner: Weak<RefCell<Inner<Z>>>, mut target: f64) {
+    loop {
+        Delay::from(Duration::from_micros(
+            ((target - now_ms()).max(0.0) * 1000.0) as u64,
+        ))
+        .await;
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let mut inner = inner.borrow_mut();
+        inner.drain_due(now_ms());
+        if inner.drain_at != Some(target) {
+            return;
+        }
+        match inner.next_due() {
+            Some(next) => {
+                inner.drain_at = Some(next);
+                target = next;
+            }
+            None => {
+                inner.drain_at = None;
+                return;
+            }
+        }
     }
 }
 

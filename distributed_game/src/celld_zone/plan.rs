@@ -36,6 +36,15 @@ pub const NODES_VAR: &str = "CELLD_ZONE_NODES";
 /// Env var (debug only): a fixed node name (e.g. `dev` for `celld dev`).
 pub const NODE_VAR: &str = "CELLD_ZONE_NODE";
 
+/// Env var (dev only): `1` makes zone objects read the worker's dev
+/// settings (the network simulation, [`NETSIM_SHARD`]).
+pub const DEV_SETTINGS_VAR: &str = "ZONE_DEV_SETTINGS";
+/// Env var: the world whose content rollout the zones follow (the shard of
+/// the worker's `content-rollout` cell, e.g. `world`; unset: no live
+/// content updates).
+pub const CONTENT_ROLLOUT_VAR: &str = "ZONE_CONTENT_ROLLOUT";
+pub use crate::netsim::{NETSIM_SHARD, ZONE_DEV_KIND};
+
 /// Request header naming the zone (set by [`super::forward_to_zone`]; the
 /// object's id has no name on some celld paths).
 pub const ZONE_HEADER: &str = "x-celld-zone";
@@ -67,6 +76,11 @@ pub struct ObjectOptions {
     pub nodes: Vec<(String, String)>,
     /// Debug fixed node name.
     pub node: Option<String>,
+    /// Dev only: read the worker's dev settings (network simulation).
+    pub dev_settings: bool,
+    /// The world (`content-rollout` shard) whose live content version and
+    /// rollout the zone follows.
+    pub content_rollout: Option<String>,
 }
 
 fn parse<T: std::str::FromStr>(
@@ -116,6 +130,11 @@ impl ObjectOptions {
                 .unwrap_or_else(|| "celld-zone".into()),
             nodes,
             node: get(NODE_VAR).filter(|node| !node.is_empty()),
+            dev_settings: get(DEV_SETTINGS_VAR)
+                .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes")),
+            content_rollout: get(CONTENT_ROLLOUT_VAR)
+                .map(|world| world.trim().to_string())
+                .filter(|world| !world.is_empty()),
         })
     }
 }

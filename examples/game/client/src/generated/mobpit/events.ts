@@ -3,6 +3,16 @@
 // Do not edit: change the Rust definitions and regenerate.
 import { decodeGameEvent, decodePayload, decodeValue, encodePayload, encodeValue, onGameEvent, type DecodedGameEvent, type GameEventCodecs, type GameEventSource, type PayloadLayout, type WireType } from '@hops-ops/distributed/game';
 
+/** Record `ContentPack` (`#[derive(GameRecord)]`). */
+export interface ContentPack {
+	readonly version: string;
+	readonly name: string;
+	readonly mobPace: number;
+	readonly mobHpPct: number;
+	readonly tint: number;
+	readonly notes: string;
+}
+
 /** Record `MobTier` (`#[derive(GameRecord)]`). */
 export interface MobTier {
 	readonly tier: number;
@@ -10,14 +20,19 @@ export interface MobTier {
 	readonly tele: number;
 }
 
-/** Record `MoveState` (`#[derive(GameRecord)]`). */
-export interface MoveState {
+/** Record `Obstacle` (`#[derive(GameRecord)]`). */
+export interface Obstacle {
 	readonly x: number;
 	readonly y: number;
-	readonly vx: number;
-	readonly vy: number;
-	readonly dash: number;
-	readonly cd: number;
+	readonly r: number;
+	readonly look: number;
+}
+
+/** Record `Pillar` (`#[derive(GameRecord)]`). */
+export interface Pillar {
+	readonly x: number;
+	readonly y: number;
+	readonly r: number;
 }
 
 /** Record `PitRoomContext` (`#[derive(GameRecord)]`). */
@@ -39,6 +54,12 @@ export interface PitRoomLayout {
 	readonly biome: number;
 	readonly danger: number;
 	readonly mobs: readonly RoomMob[];
+	readonly boss: boolean;
+	readonly hoodX: number;
+	readonly hoodY: number;
+	readonly bossDistance: number;
+	readonly pattern: number;
+	readonly obstacles: readonly Obstacle[];
 }
 
 /** Record `PitRules` (`#[derive(GameRecord)]`). */
@@ -48,18 +69,41 @@ export interface PitRules {
 	readonly attackRange: number;
 	readonly attackHalfAngle: number;
 	readonly swingFrames: number;
+	readonly range: number;
+	readonly fireCooldown: number;
+	readonly eyeHeight: number;
+	readonly hipHeight: number;
+	readonly maxRewindMs: number;
+	readonly mobHeights: readonly number[];
+}
+
+/** Record `PitState` (`#[derive(GameRecord)]`). */
+export interface PitState {
+	readonly x: number;
+	readonly y: number;
+	readonly vx: number;
+	readonly vy: number;
+	readonly dash: number;
+	readonly cd: number;
+	readonly z: number;
+	readonly vz: number;
 }
 
 /** Record `PitWorld` (`#[derive(GameRecord)]`). */
 export interface PitWorld {
 	readonly defaultSeed: number;
 	readonly half: number;
+	readonly playerRadius: number;
+	readonly dashCooldown: number;
+	readonly pillars: readonly Pillar[];
 	readonly doorHalf: number;
 	readonly roomSize: number;
 	readonly passage: number;
 	readonly hysteresis: number;
 	readonly maxRoom: number;
 	readonly biomes: readonly string[];
+	readonly wakeReach: number;
+	readonly wakeRelease: number;
 }
 
 /** Record `Profile` (`#[derive(GameRecord)]`). */
@@ -84,6 +128,56 @@ const PROFILE_TYPE: WireType = {
 	]
 };
 
+/** Record `Reach` (`#[derive(GameRecord)]`). */
+export interface Reach {
+	readonly near: number;
+}
+
+/** Record `ReachContext` (`#[derive(GameRecord)]`). */
+export interface ReachContext {
+	readonly x: number;
+	readonly y: number;
+	readonly near: number;
+}
+
+/** Record `WorldTiers` (`#[derive(GameRecord)]`). */
+export interface WorldTiers {
+	readonly hoodX: number;
+	readonly hoodY: number;
+	readonly hoodTier: number;
+	readonly bossDown: boolean;
+	readonly lastBy: string;
+	readonly boroughX: number;
+	readonly boroughY: number;
+	readonly boroughBossesDown: number;
+	readonly weather: number;
+	readonly hoodsDown: readonly string[];
+	readonly event: string;
+	readonly eventUntilMs: number;
+	readonly cityBossesDown: number;
+	readonly banner: string;
+}
+
+const WORLD_TIERS_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['hoodX', { type: 'i32' }],
+		['hoodY', { type: 'i32' }],
+		['hoodTier', { type: 'u32' }],
+		['bossDown', { type: 'bool' }],
+		['lastBy', { type: 'short_str' }],
+		['boroughX', { type: 'i32' }],
+		['boroughY', { type: 'i32' }],
+		['boroughBossesDown', { type: 'u32' }],
+		['weather', { type: 'u8' }],
+		['hoodsDown', { type: 'list', item: { type: 'short_str' } }],
+		['event', { type: 'short_str' }],
+		['eventUntilMs', { type: 'u64' }],
+		['cityBossesDown', { type: 'u32' }],
+		['banner', { type: 'short_str' }],
+	]
+};
+
 /** Event `hello` (id 1). */
 export interface HelloEvent {
 	readonly entity: number;
@@ -95,6 +189,7 @@ export interface HelloEvent {
 	readonly seed: number;
 	readonly restored: boolean;
 	readonly roomKills: number;
+	readonly viewRadius: number;
 }
 
 const HELLO_LAYOUT: PayloadLayout = [
@@ -107,6 +202,7 @@ const HELLO_LAYOUT: PayloadLayout = [
 	['seed', { type: 'u32' }],
 	['restored', { type: 'bool' }],
 	['roomKills', { type: 'u32' }],
+	['viewRadius', { type: 'f32' }],
 ];
 
 /** Event `profile` (id 2). */
@@ -175,6 +271,58 @@ const DIED_LAYOUT: PayloadLayout = [
 	['respawnMs', { type: 'u32' }],
 ];
 
+/** Event `world` (id 7). */
+export type WorldEvent = WorldTiers;
+
+const WORLD_PAYLOAD: WireType = WORLD_TIERS_TYPE;
+
+/** Event `boss_down` (id 8). */
+export interface BossDownEvent {
+	readonly by: string;
+	readonly hoodTier: number;
+}
+
+const BOSS_DOWN_LAYOUT: PayloadLayout = [
+	['by', { type: 'short_str' }],
+	['hoodTier', { type: 'u32' }],
+];
+
+/** Event `shot` (id 9). */
+export interface ShotEvent {
+	readonly shot: number;
+	readonly hit: number | undefined;
+	readonly compensated: boolean;
+	readonly ageMs: number;
+	readonly requestedAgeMs: number;
+	readonly clamped: boolean;
+	readonly x: number;
+	readonly y: number;
+	readonly z: number;
+}
+
+const SHOT_LAYOUT: PayloadLayout = [
+	['shot', { type: 'u16' }],
+	['hit', { type: 'optional', item: { type: 'u32' } }],
+	['compensated', { type: 'bool' }],
+	['ageMs', { type: 'f32' }],
+	['requestedAgeMs', { type: 'f32' }],
+	['clamped', { type: 'bool' }],
+	['x', { type: 'f32' }],
+	['y', { type: 'f32' }],
+	['z', { type: 'f32' }],
+];
+
+/** Event `stale` (id 10). */
+export interface StaleEvent {
+	readonly gate: string;
+	readonly version: string;
+}
+
+const STALE_LAYOUT: PayloadLayout = [
+	['gate', { type: 'short_str' }],
+	['version', { type: 'short_str' }],
+];
+
 /** Message `loaded` (id 1). */
 export interface LoadedMessage {
 	readonly principal: string;
@@ -190,6 +338,16 @@ const MESSAGE_LOADED_LAYOUT: PayloadLayout = [
 	['kills', { type: 'u32' }],
 ];
 
+/** Message `world` (id 2). */
+export type WorldMessage = WorldTiers;
+
+const MESSAGE_WORLD_PAYLOAD: WireType = WORLD_TIERS_TYPE;
+
+/** Message `world_keep_city` (id 3). */
+export type WorldKeepCityMessage = WorldTiers;
+
+const MESSAGE_WORLD_KEEP_CITY_PAYLOAD: WireType = WORLD_TIERS_TYPE;
+
 /** Event type ids by name. */
 export const EVENT = {
 	hello: 1,
@@ -197,6 +355,10 @@ export const EVENT = {
 	kill: 3,
 	saved: 4,
 	died: 6,
+	world: 7,
+	bossDown: 8,
+	shot: 9,
+	stale: 10,
 } as const;
 
 /** Event payload types by name. */
@@ -206,6 +368,10 @@ export interface Events {
 	kill: KillEvent;
 	saved: SavedEvent;
 	died: DiedEvent;
+	world: WorldEvent;
+	bossDown: BossDownEvent;
+	shot: ShotEvent;
+	stale: StaleEvent;
 }
 
 /** Codecs of every event. */
@@ -240,6 +406,30 @@ export const EVENTS: GameEventCodecs<Events> = {
 		encode: (value) => encodePayload(DIED_LAYOUT, value),
 		decode: (payload) => decodePayload(DIED_LAYOUT, payload) as unknown as DiedEvent
 	},
+	world: {
+		id: 7,
+		name: 'world',
+		encode: (value) => encodeValue(WORLD_PAYLOAD, value),
+		decode: (payload) => decodeValue(WORLD_PAYLOAD, payload) as WorldEvent
+	},
+	bossDown: {
+		id: 8,
+		name: 'boss_down',
+		encode: (value) => encodePayload(BOSS_DOWN_LAYOUT, value),
+		decode: (payload) => decodePayload(BOSS_DOWN_LAYOUT, payload) as unknown as BossDownEvent
+	},
+	shot: {
+		id: 9,
+		name: 'shot',
+		encode: (value) => encodePayload(SHOT_LAYOUT, value),
+		decode: (payload) => decodePayload(SHOT_LAYOUT, payload) as unknown as ShotEvent
+	},
+	stale: {
+		id: 10,
+		name: 'stale',
+		encode: (value) => encodePayload(STALE_LAYOUT, value),
+		decode: (payload) => decodePayload(STALE_LAYOUT, payload) as unknown as StaleEvent
+	},
 };
 
 /** A decoded event, discriminated by `name`. */
@@ -262,11 +452,15 @@ export function onEvent<K extends keyof Events>(
 /** Zone inbox message type ids by name. */
 export const MESSAGE = {
 	loaded: 1,
+	world: 2,
+	worldKeepCity: 3,
 } as const;
 
 /** Zone inbox message payload types by name. */
 export interface Messages {
 	loaded: LoadedMessage;
+	world: WorldMessage;
+	worldKeepCity: WorldKeepCityMessage;
 }
 
 /** Codecs of every zone inbox message. */
@@ -276,6 +470,18 @@ export const MESSAGES: GameEventCodecs<Messages> = {
 		name: 'loaded',
 		encode: (value) => encodePayload(MESSAGE_LOADED_LAYOUT, value),
 		decode: (payload) => decodePayload(MESSAGE_LOADED_LAYOUT, payload) as unknown as LoadedMessage
+	},
+	world: {
+		id: 2,
+		name: 'world',
+		encode: (value) => encodeValue(MESSAGE_WORLD_PAYLOAD, value),
+		decode: (payload) => decodeValue(MESSAGE_WORLD_PAYLOAD, payload) as WorldMessage
+	},
+	worldKeepCity: {
+		id: 3,
+		name: 'world_keep_city',
+		encode: (value) => encodeValue(MESSAGE_WORLD_KEEP_CITY_PAYLOAD, value),
+		decode: (payload) => decodeValue(MESSAGE_WORLD_KEEP_CITY_PAYLOAD, payload) as WorldKeepCityMessage
 	},
 };
 

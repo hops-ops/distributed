@@ -142,6 +142,25 @@ test('ease blends the divergence out over time while snap jumps', () => {
 	assert.equal(ce.resolved.hp, 'replace');
 });
 
+test('ease with snapAbove: a small error eases, a teleport cuts', () => {
+	const near = boundPredictor({ mode: 'ease', durationMs: 200, snapAbove: 3 });
+	const far = boundPredictor({ mode: 'ease', durationMs: 200, snapAbove: 3 });
+	for (const p of [near, far]) {
+		for (let seq = 1; seq <= 4; seq += 1) p.record(seq, 10, 100);
+	}
+	// Shown 4. A wall (rebased 2: error 2) eases; a respawn at -10 (rebased
+	// -9: error 13) cuts at once.
+	const cn = near.reconcile(3, { x: 1, y: 0, yaw: 0, hp: 100, name: 'p' }, 1000);
+	const cf = far.reconcile(3, { x: -10, y: 0, yaw: 0, hp: 100, name: 'p' }, 1000);
+	assert.equal(cn.resolved.x, 'ease');
+	close(near.current(1000).x, 4, 1e-9, 'small: eased from what was shown');
+	assert.equal(cf.resolved.x, 'snap');
+	close(cf.errors.x, 13, 1e-9);
+	close(far.current(1000).x, -9, 1e-9, 'teleport: shown at once, no slide');
+	assert.equal(far.current(1000).hp, 100);
+	assert.deepEqual(far.visualError(1000), {});
+});
+
 test('a new correction while easing starts from the currently displayed value', () => {
 	const p = boundPredictor({ mode: 'ease', durationMs: 100 });
 	p.record(1, 10, 1000); // predicted x = 10

@@ -21,6 +21,9 @@ export const GameMessageTag = Object.freeze({
 	INPUT: 0x02,
 	PING: 0x03,
 	LEAVE: 0x04,
+	CONTENT: 0x05,
+	/** Client → server: an observer is near (keep the zone awake) or passive again. */
+	NEAR: 0x06,
 	WELCOME: 0x80,
 	DELTA: 0x81,
 	EVENT: 0x82,
@@ -63,7 +66,11 @@ export const GameErrorCode = Object.freeze({
 	NOT_FOUND: 7,
 	RECONNECT_FAILED: 8,
 	/** The zone could not be created right now (factory or allocation failure); retry later. */
-	ZONE_UNAVAILABLE: 9
+	ZONE_UNAVAILABLE: 9,
+	/** The zone is asleep and an observer does not wake it (celld zones: observers are passive watchers); try later. */
+	ASLEEP: 10,
+	/** A near observer's ticket does not grant `wake`: it stays a passive watcher (a fresh ticket may grant it). */
+	WAKE_DENIED: 11
 });
 
 export type HelloMessage = Readonly<{
@@ -73,6 +80,11 @@ export type HelloMessage = Readonly<{
 	capabilities: number;
 	ticket: string;
 	reconnectToken: string;
+	/**
+	 * Observers: near the zone (celld zones: with a ticket that grants
+	 * `wake`, wakes it and keeps it awake). Default false.
+	 */
+	near?: boolean;
 }>;
 export type InputMessage = Readonly<{
 	type: 'Input';
@@ -82,7 +94,11 @@ export type InputMessage = Readonly<{
 }>;
 export type PingMessage = Readonly<{ type: 'Ping'; clientTime: number }>;
 export type LeaveMessage = Readonly<{ type: 'Leave' }>;
-export type GameClientMessage = HelloMessage | InputMessage | PingMessage | LeaveMessage;
+/** The client patched its content live and now runs `contentVersion`. */
+export type ContentMessage = Readonly<{ type: 'Content'; contentVersion: string }>;
+/** An observer is near the zone (keep it awake, with a `wake` ticket) or passive again. */
+export type NearMessage = Readonly<{ type: 'Near'; near: boolean }>;
+export type GameClientMessage = HelloMessage | InputMessage | PingMessage | LeaveMessage | ContentMessage | NearMessage;
 
 export type GameRole = 'player' | 'observer';
 
@@ -161,7 +177,8 @@ export function encodeClientMessage(message: GameClientMessage): Uint8Array {
 				.string(message.contentVersion)
 				.varuint(message.capabilities)
 				.string(message.ticket)
-				.string(message.reconnectToken);
+				.string(message.reconnectToken)
+				.bool(message.near ?? false);
 			break;
 		case 'Input':
 			w.u8(GameMessageTag.INPUT)
@@ -174,6 +191,12 @@ export function encodeClientMessage(message: GameClientMessage): Uint8Array {
 			break;
 		case 'Leave':
 			w.u8(GameMessageTag.LEAVE);
+			break;
+		case 'Content':
+			w.u8(GameMessageTag.CONTENT).string(message.contentVersion);
+			break;
+		case 'Near':
+			w.u8(GameMessageTag.NEAR).bool(message.near);
 			break;
 	}
 	return w.finish();
@@ -192,7 +215,8 @@ export function decodeClientMessage(bytes: Uint8Array): GameClientMessage {
 				contentVersion: r.string(),
 				capabilities: r.varuint(),
 				ticket: r.string(),
-				reconnectToken: r.string()
+				reconnectToken: r.string(),
+				near: r.bool()
 			};
 			break;
 		case GameMessageTag.INPUT:
@@ -203,6 +227,12 @@ export function decodeClientMessage(bytes: Uint8Array): GameClientMessage {
 			break;
 		case GameMessageTag.LEAVE:
 			message = { type: 'Leave' };
+			break;
+		case GameMessageTag.CONTENT:
+			message = { type: 'Content', contentVersion: r.string() };
+			break;
+		case GameMessageTag.NEAR:
+			message = { type: 'Near', near: r.bool() };
 			break;
 		default:
 			throw new GameDecodeError('UNKNOWN_MESSAGE', `message type 0x${tag.toString(16)}`);

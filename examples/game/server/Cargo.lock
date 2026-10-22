@@ -1136,6 +1136,7 @@ dependencies = [
  "http-body-util",
  "mobpit_crawler",
  "mobpit_rooms",
+ "mobpit_tiers",
  "reqwest",
  "serde",
  "serde_json",
@@ -1744,6 +1745,7 @@ dependencies = [
  "distributed_game",
  "game_sim",
  "mobpit_crawler",
+ "mobpit_tiers",
  "serde",
  "serde_json",
 ]
@@ -1759,9 +1761,22 @@ dependencies = [
  "futures-util",
  "game_demos",
  "mobpit_crawler",
+ "mobpit_tiers",
  "serde",
  "serde_json",
  "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "mobpit_tiers"
+version = "0.1.0"
+dependencies = [
+ "distributed",
+ "distributed_game",
+ "game_sim",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use worker::{Env, Method, Request, Response, Result, State};
 
 use crate::cell::fact_session_from_headers;
+use crate::world::content_rollout::{mount_content_rollout, ContentRollout};
 use crate::world::zone_activity::{mount_zone_activity, ZoneActivity};
 
 /// Builds the handler session from trusted request headers (after the
@@ -186,4 +187,94 @@ impl ZoneActivityCell {
 async fn read_activity(cell: &AggregateCell<ZoneActivity>) -> std::result::Result<Value, String> {
     let activity = cell.load().await.map_err(|error| error.to_string())?;
     Ok(json!({ "activity": activity.map(|a| a.row()) }))
+}
+
+/// Dev-only settings shared by every zone object of a worker (kind
+/// [`ZONE_DEV_KIND`](super::ZONE_DEV_KIND), binding `ZONE_DEV`), e.g. the
+/// network simulation under shard [`NETSIM_SHARD`](super::NETSIM_SHARD).
+/// `GET /zone-dev/{shard}` returns the stored JSON (`{}` when unset), `PUT`
+/// (or `POST`) replaces it. Every request needs the internal secret. Zone
+/// objects read it only when `ZONE_DEV_SETTINGS=1`.
+pub struct ZoneDevSettings {
+    state: State,
+    env: Env,
+}
+
+impl ZoneDevSettings {
+    /// The settings object of `state`.
+    pub fn new(state: State, env: Env) -> Self {
+        Self { state, env }
+    }
+
+    /// Durable Object `fetch`.
+    pub async fn fetch(&self, mut req: Request) -> Result<Response> {
+        if let Err(error) = authenticate(&req, &self.env) {
+            return error_response(error);
+        }
+        const KEY: &str = "settings";
+        match req.method() {
+            Method::Get => {
+                let stored: Option<Value> = self.state.storage().get(KEY).await.ok().flatten();
+                json_status(stored.unwrap_or_else(|| json!({})), 200)
+            }
+            Method::Put | Method::Post => {
+                let body: Value = match req.json().await {
+                    Ok(body @ Value::Object(_)) => body,
+                    _ => {
+                        return error_response(CellDispatchError::BadRequest(
+                            "a JSON object is required".into(),
+                        ))
+                    }
+                };
+                self.state.storage().put(KEY, &body).await?;
+                json_status(body, 200)
+            }
+            _ => json_status(json!({ "error": "not found" }), 404),
+        }
+    }
+}
+
+/// The content-rollout cell of a game worker (`ContentRollout:{world}`,
+/// kind [`CONTENT_ROLLOUT_KIND`](crate::world::content_rollout::CONTENT_ROLLOUT_KIND),
+/// binding `CONTENT_ROLLOUT`): the world's live content version and rollout
+/// phase, read by every zone object ([`ObjectOptions::content_rollout`](super::ObjectOptions::content_rollout)).
+/// `sessions` decides who may start a rollout: it must give the admin's
+/// session the [`CONTENT_ADMIN_ROLE`](crate::world::content_rollout::CONTENT_ADMIN_ROLE)
+/// (the cell's own schedules need no session). `GET` returns
+/// `{"state": ContentState | null}`.
+pub struct ContentRolloutCell {
+    cell: AggregateCell<ContentRollout>,
+    env: Env,
+    sessions: Sessions,
+}
+
+impl ContentRolloutCell {
+    /// Open the cell of `state`, publishing its events to `outbox`.
+    pub fn new(state: State, env: Env, outbox: CelldOutbox, sessions: Sessions) -> Self {
+        let cell = mount_content_rollout(
+            AggregateCell::<ContentRollout>::from_state_with_snapshots(state, 20)
+                .expect("content rollout cell identity"),
+        )
+        .with_celld_outbox(outbox);
+        Self {
+            cell,
+            env,
+            sessions,
+        }
+    }
+
+    /// Durable Object `fetch`.
+    pub async fn fetch(&self, req: Request) -> Result<Response> {
+        serve_cell(&self.env, &self.cell, req, read_rollout, self.sessions).await
+    }
+
+    /// Durable Object `alarm` (the rollout's own schedule).
+    pub async fn alarm(&self) -> Result<Response> {
+        cell_alarm(&self.env, &self.cell).await
+    }
+}
+
+async fn read_rollout(cell: &AggregateCell<ContentRollout>) -> std::result::Result<Value, String> {
+    let rollout = cell.load().await.map_err(|error| error.to_string())?;
+    Ok(json!({ "state": rollout.map(|r| r.state()) }))
 }

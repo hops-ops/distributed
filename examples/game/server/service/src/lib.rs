@@ -57,9 +57,32 @@ pub use mobpit_crawler::stats::{
     projector, PlayerStats, SavePlayerStats, APPLICATION, EPOCH, PLAYER_STATS, PROJECTOR,
 };
 
-/// Both tables: `player_stats` and `zone_activities`.
+/// The boroughs (bosses down, weather, the world event running) and their
+/// projection, from the borough cells' domain events.
+pub use mobpit_tiers::events::{Boroughs, BOROUGHS};
+
+/// The tables: `player_stats`, `zone_activities` and `boroughs`.
 pub fn read_model_catalog() -> distributed::ReadModelCatalog {
-    mobpit_crawler::stats::read_model_catalog().table_schema(ZoneActivities::schema().clone())
+    mobpit_crawler::stats::read_model_catalog()
+        .table_schema(ZoneActivities::schema().clone())
+        .table_schema(Boroughs::schema().clone())
+}
+
+/// The projector of `boroughs`, owned by this application.
+pub fn boroughs_projector() -> distributed::graphql::SurfaceProjector {
+    mobpit_tiers::events::projector(APPLICATION)
+}
+
+/// The boroughs (and their world events) are public to signed-in players.
+pub fn borough_permissions() -> ModelPermissions<Boroughs> {
+    ModelPermissions::new().grant(ROLE, read().all_columns())
+}
+
+async fn project_boroughs(
+    context: CausalProjectorContext,
+    projection: ModeledProjection,
+) -> Result<(), HandlerError> {
+    projection.apply(BOROUGHS, &context).await
 }
 
 /// The projector of `zone_activities`, owned by this application.
@@ -124,7 +147,9 @@ pub fn projection_service(read_models: SqliteRepository) -> Service {
             .modeled_projector(projector())
             .handle(project)
             .modeled_projector(rooms_projector())
-            .handle(project_rooms),
+            .handle(project_rooms)
+            .modeled_projector(boroughs_projector())
+            .handle(project_boroughs),
     )
 }
 
@@ -151,6 +176,12 @@ fn grants() -> BTreeMap<String, BTreeMap<String, RoleGrant>> {
             .or_default()
             .insert(ZoneActivities::schema().model_name.clone(), grant);
     }
+    for (role, grant) in borough_permissions().surface_grants() {
+        grants
+            .entry(role)
+            .or_default()
+            .insert(Boroughs::schema().model_name.clone(), grant);
+    }
     grants
 }
 
@@ -159,7 +190,11 @@ fn full_surface() -> Surface {
         .expect("mobpit Surface should build")
         .with_leaderboards(leaderboard_surfaces())
         .expect("mobpit boards should attach")
-        .with_projection_owners([projector().into(), rooms_projector().into()])
+        .with_projection_owners([
+            projector().into(),
+            rooms_projector().into(),
+            boroughs_projector().into(),
+        ])
         .expect("mobpit projectors should bind")
 }
 
@@ -227,7 +262,12 @@ pub fn build_engine(
         .client_application_surface(APPLICATION, [ROLE], [ROLE])
         .model::<PlayerStats>(permissions())
         .model::<ZoneActivities>(room_permissions())
-        .client_projection_owners([projector().into(), rooms_projector().into()])
+        .model::<Boroughs>(borough_permissions())
+        .client_projection_owners([
+            projector().into(),
+            rooms_projector().into(),
+            boroughs_projector().into(),
+        ])
         .identity(identity.config())
         .graphiql(false)
         .change_stream(repo.read_model_changes())

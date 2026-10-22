@@ -32,6 +32,7 @@ fn ticket(principal: &str, zone: &str, nonce: &str, role: Role) -> String {
         role,
         name: None,
         extensions: Default::default(),
+        wake: false,
     })
 }
 
@@ -79,6 +80,7 @@ async fn hello(ws: &mut Ws, ticket: String, reconnect_token: String) {
             capabilities: 0,
             ticket,
             reconnect_token,
+            near: false,
         }),
     )
     .await;
@@ -232,6 +234,7 @@ async fn client_joins_sends_inputs_receives_deltas_and_reconnects() {
         role: Role::Player,
         name: None,
         extensions: Default::default(),
+        wake: false,
     });
     expect_error(&url, "z1", forged, error::UNAUTHORIZED).await;
 
@@ -681,6 +684,7 @@ fn extended_ticket(nonce: &str, ext: serde_json::Value) -> String {
         role: Role::Player,
         name: None,
         extensions: TicketExtensions::from_json(ext).unwrap(),
+        wake: false,
     })
 }
 
@@ -774,6 +778,7 @@ async fn extension_claims_are_refused_without_a_declared_schema() {
         role: Role::Player,
         name: None,
         extensions: TicketExtensions::from_json(serde_json::json!({"match_id": "m"})).unwrap(),
+        wake: false,
     });
     expect_error(&url, "z1", ticket, error::UNAUTHORIZED).await;
     server.shutdown();

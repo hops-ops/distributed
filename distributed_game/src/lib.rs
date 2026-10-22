@@ -78,6 +78,7 @@ pub mod lifecycle;
 pub mod metrics;
 #[cfg(feature = "net")]
 pub mod net;
+pub mod netsim;
 pub mod prediction;
 pub mod protocol;
 pub mod pure;

@@ -142,7 +142,7 @@ export const FIELD_TYPES = {
 export const CORRECTIONS: CorrectionPolicies = {
 	player: {
 		x: { mode: 'ease', durationMs: 150 },
-		y: { mode: 'ease', durationMs: 150 },
+		y: { mode: 'ease', durationMs: 150, snapAbove: 2.5 },
 		vx: { mode: 'snap' },
 		face: { mode: 'replace' },
 		name: { mode: 'replace' },

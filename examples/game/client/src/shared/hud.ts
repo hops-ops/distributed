@@ -4,7 +4,7 @@
  * toggles and the server-side NetSim controls (`/dev/netsim`).
  *
  * ```ts
- * const hud = new Hud({ title: 'Arena', client, devApi });
+ * const hud = new Hud({ title: 'Mob Pit', client, devApi });
  * hud.toggle('Prediction', true, (on) => (predict = on));
  * stage.onFrame(() => hud.frame({ entities: rendered.length }));
  * hud.row('Pending inputs', String(n));

@@ -26,6 +26,7 @@ fn claims(principal: &str, zone: &str) -> TicketClaims {
         role: Role::Player,
         name: None,
         extensions: Default::default(),
+        wake: false,
     }
 }
 
@@ -115,9 +116,16 @@ fn fixed_timestep_caps_catch_up_and_patches_independently() {
 
     // A 2s stall runs at most 5 steps and drops the rest.
     clock.advance(Duration::from_secs(2));
+    let seen = h.zone().dropped_seen.len();
     let report = h.advance();
     assert_eq!(report.ticks, 5);
     assert!(report.dropped >= Duration::from_millis(1_900));
+    // The first tick after the stall sees the dropped ticks, the rest none.
+    assert_eq!(
+        h.zone().dropped_seen[seen..],
+        [report.dropped_ticks, 0, 0, 0, 0]
+    );
+    assert_eq!(report.dropped_ticks, 95);
 
     // Steady state: 1s in 2 ms frames = 50 ticks, 10 patches.
     let (mut ticks, mut patches) = (0, 0);

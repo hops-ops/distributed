@@ -75,6 +75,10 @@ pub struct MobPitArgs {
     /// Default: `sqlite:{data-dir}/bus.db`.
     #[arg(long, env = "MOBPIT_PROJECTION_BUS")]
     pub projection_bus: Option<String>,
+    /// Admin secret of the dev admin routes (`/dev/mobpit/rollout`,
+    /// header `x-game-admin-secret`). Default: random, printed at startup.
+    #[arg(long, env = "DG_DEMO_ADMIN_SECRET", hide_env_values = true)]
+    pub admin_secret: Option<String>,
 }
 
 /// The services running on a Tokio task.
@@ -98,13 +102,14 @@ pub fn spawn(
     listener: tokio::net::TcpListener,
     key: TicketKey,
     dev: bool,
+    admin_secret: String,
     world: Arc<MobPitWorld>,
     signal: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<RunningServices> {
     let addr = listener.local_addr()?;
     let mut app = relay_routes(world.celld().secret.clone(), world.projection());
     if dev {
-        app = app.merge(routes::routes(world, key));
+        app = app.merge(routes::routes(world, key, admin_secret));
     }
     let task = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -168,10 +173,16 @@ pub async fn run(args: MobPitArgs) -> std::io::Result<()> {
     }
     let listener =
         tokio::net::TcpListener::bind((args.common.host.as_str(), args.common.port)).await?;
+    let admin_secret = args
+        .admin_secret
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| random_hex(24));
     let running = spawn(
         listener,
         TicketKey::new(ticket_secret),
         args.common.dev,
+        admin_secret.clone(),
         world.clone(),
         shutdown_signal(),
     )?;
@@ -185,5 +196,8 @@ pub async fn run(args: MobPitArgs) -> std::io::Result<()> {
         world.board().backend(),
         if args.common.dev { "ON" } else { "off" }
     );
+    if args.common.dev {
+        println!("admin secret (live content updates, ?admin=…): {admin_secret}");
+    }
     running.task.await.map_err(std::io::Error::other)?
 }
