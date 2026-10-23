@@ -142,14 +142,14 @@ kill_tree() {
 
 # warn_celld_state <state dir>: a `celld dev` state only grows (celld keeps
 # every write; epoch GC stalls rooms while it runs). Past a few hundred
-# cells or a few hundred MB, rooms drop ticks and a restart takes minutes
-# to answer (client/tests/mobpit-soak-headless.test.mjs). Say so and how
+# cells or ~100 MB, rooms drop ticks and a restart takes minutes (a
+# 255-cell, 216 MB state never became ready) to answer (client/tests/mobpit-soak-headless.test.mjs). Say so and how
 # to reset; never reset on its own.
 warn_celld_state() {
 	local state="$1" cells=0 mb=0
 	[[ -d "$state/runtime" ]] && cells=$(find "$state/runtime" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
 	[[ -f "$state/objects.sqlite3" ]] && mb=$(($(wc -c <"$state/objects.sqlite3") / 1048576))
-	if ((cells > ${CELLD_STATE_WARN_CELLS:-500} || mb > ${CELLD_STATE_WARN_MB:-250})); then
+	if ((cells > ${CELLD_STATE_WARN_CELLS:-500} || mb > ${CELLD_STATE_WARN_MB:-100})); then
 		printf '\033[1;33m[demos]\033[0m celld dev state is large (%s cells, %s MB): rooms may stutter and a restart\n' "$cells" "$mb"
 		printf '        can take minutes. Reset it (local rooms, players and progress on celld are lost):\n'
 		printf '        rm -rf %q\n' "$state"

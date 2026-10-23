@@ -77,7 +77,8 @@ crashed `celld dev` (run.sh stops it with SIGKILL) recovers every cell
 before rooms answer (~2 min at ~730 cells). On a few-day state with
 rebalancing on (~560 cells, 91k objects), rooms dropped 166 ticks per 30 s.
 `run.sh` launches it with `CELLD_REBALANCE_INTERVAL_MS=0` (one node) and
-warns at start past 500 cells or 250 MB (`CELLD_STATE_WARN_CELLS`,
+warns at start past 500 cells or 100 MB (a 255-cell, 216 MB state, 2.5
+hours of play at 5 s snapshots, never became ready after a restart) (`CELLD_STATE_WARN_CELLS`,
 `CELLD_STATE_WARN_MB`) with the reset command (deleting `.celld/dev` drops
 the rooms, players and progress on celld). The debug overlay (rooms panel;
 on by default, **O** toggles) shows the room's dropped ticks over the last ~30 s, red
