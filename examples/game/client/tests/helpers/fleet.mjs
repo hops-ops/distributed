@@ -92,16 +92,21 @@ export async function startFleet({ relayPort, nodes = 3, vars = {} } = {}) {
 				.filter((l) => !l.trimStart().startsWith('//'))
 				.join('\n')
 		);
-		Object.assign(config.vars, {
+		const base = {
+			...config.vars,
 			DISTRIBUTED_INTERNAL_SECRET: secret,
 			GAME_TICKET_SECRET: ticketSecret,
 			CELLD_QUEUE_RELAY_URL: `http://127.0.0.1:${relayPort}${RELAY_PATH}`,
-			CELLD_ZONE_NODES: ports.map((p) => `${p.name}=127.0.0.1:${p.op}`).join(','),
-			...vars
-		});
-		writeFileSync(join(worker, 'wrangler.json'), JSON.stringify(config));
-		const deploy = spawnSync(bin, ['deploy', worker, '--bucket', 's3://mobpit-fleet/fleet'], { env: aws, encoding: 'utf8' });
-		if (deploy.status !== 0) throw new Error(`celld deploy: ${deploy.stdout}${deploy.stderr}`);
+			CELLD_ZONE_NODES: ports.map((p) => `${p.name}=127.0.0.1:${p.op}`).join(',')
+		};
+		// `celld deploy` the worker with `extra` vars over the base ones.
+		const deploy = (extra) => {
+			config.vars = { ...base, ...extra };
+			writeFileSync(join(worker, 'wrangler.json'), JSON.stringify(config));
+			const run = spawnSync(bin, ['deploy', worker, '--bucket', 's3://mobpit-fleet/fleet'], { env: aws, encoding: 'utf8' });
+			if (run.status !== 0) throw new Error(`celld deploy: ${run.stdout}${run.stderr}`);
+		};
+		deploy(vars);
 		for (const p of ports) {
 			const ndir = join(dir, p.name);
 			mkdirSync(ndir, { recursive: true });
@@ -123,6 +128,8 @@ export async function startFleet({ relayPort, nodes = 3, vars = {} } = {}) {
 			nodes: ports.map((p) => p.name),
 			ticketSecret,
 			env: { CELLD_URL: urls[0], DISTRIBUTED_INTERNAL_SECRET: secret, DISTRIBUTED_GAME_SECRET: ticketSecret },
+			/** Deploy the worker again with these vars over the base ones (not over earlier `vars`). */
+			redeploy: deploy,
 			async stop() {
 				down();
 				rmSync(dir, { recursive: true, force: true });

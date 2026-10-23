@@ -19,8 +19,16 @@ pub const TICKET_SECRET_VAR: &str = "GAME_TICKET_SECRET";
 pub const TICK_HZ_VAR: &str = "ZONE_TICK_HZ";
 /// Env var: patch rate (Hz, default 20, at most the tick rate).
 pub const PATCH_HZ_VAR: &str = "ZONE_PATCH_HZ";
-/// Env var: snapshot interval while occupied (ms, default 5000).
+/// Env var: snapshot interval while occupied (ms, default 60000). Each
+/// snapshot is a durable write celld keeps (an LTX file per write), so a
+/// short interval grows the store and the cost of every later write.
 pub const PERSIST_MS_VAR: &str = "ZONE_PERSIST_MS";
+/// Env var: how long an emptied room keeps ticking before it goes dormant
+/// (ms, default 10000). Going dormant reports the room's activity and writes
+/// its snapshot, so a room whose last player or near watcher comes and goes
+/// (a player by a doorway wakes and releases the room behind it every few
+/// seconds) would otherwise pay those writes on every swing.
+pub const DORMANT_AFTER_MS_VAR: &str = "ZONE_DORMANT_AFTER_MS";
 /// Env var: how long an empty room stays dormant before it hibernates (ms,
 /// default 10000).
 pub const HIBERNATE_AFTER_MS_VAR: &str = "ZONE_HIBERNATE_AFTER_MS";
@@ -66,6 +74,8 @@ pub struct ObjectOptions {
     pub patch_hz: u32,
     /// Snapshot interval while occupied.
     pub persist_every: Duration,
+    /// Emptied → dormant.
+    pub dormant_after: Duration,
     /// Dormant → hibernated.
     pub hibernate_after: Duration,
     /// Reconnect grace window.
@@ -122,7 +132,8 @@ impl ObjectOptions {
                 .filter(|secret| !secret.is_empty()),
             tick_hz,
             patch_hz: patch_hz.clamp(1, tick_hz),
-            persist_every: Duration::from_millis(parse(&get, PERSIST_MS_VAR, 5_000)?),
+            persist_every: Duration::from_millis(parse(&get, PERSIST_MS_VAR, 60_000)?),
+            dormant_after: Duration::from_millis(parse(&get, DORMANT_AFTER_MS_VAR, 10_000)?),
             hibernate_after: Duration::from_millis(parse(&get, HIBERNATE_AFTER_MS_VAR, 10_000)?),
             reconnect_grace: Duration::from_millis(parse(&get, RECONNECT_GRACE_MS_VAR, 5_000)?),
             fact_service: get(FACT_SERVICE_VAR)
@@ -367,6 +378,7 @@ mod tests {
         let options =
             ObjectOptions::from_vars(vars(&[(TICKET_SECRET_VAR, "0123456789abcdef")])).unwrap();
         assert_eq!((options.tick_hz, options.patch_hz), (30, 20));
+        assert_eq!(options.dormant_after, Duration::from_secs(10));
         assert_eq!(options.hibernate_after, Duration::from_secs(10));
         assert!(options.nodes.is_empty(), "node lookup is off by default");
         assert_eq!(options.fact_service, "celld-zone");

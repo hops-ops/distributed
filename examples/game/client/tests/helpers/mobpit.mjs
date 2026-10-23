@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { BUTTON, isMob, isPlayer, mobFields, playerFields } from '../../src/generated/mobpit/index.ts';
 import { freePort, startCelld } from './celld.mjs';
 import { sleep, startDemo } from './demo-server.mjs';
+import { startFleet } from './fleet.mjs';
 
 /** The services' admin secret in the tests (live content rollouts). */
 export const ADMIN_SECRET = 'mobpit-test-admin-secret';
@@ -18,6 +19,9 @@ export const ADMIN_SECRET = 'mobpit-test-admin-secret';
 export function tempDataDir() {
 	return mkdtempSync(join(tmpdir(), 'mobpit-js-'));
 }
+
+/** Rooms go dormant and to sleep fast (tests wait for both). */
+const FAST_ROOMS = { ZONE_DORMANT_AFTER_MS: '1000', ZONE_HIBERNATE_AFTER_MS: '1500' };
 
 /**
  * celld (rooms + cells) + `game-demos <demo>` (mobpit / leaderboard: the
@@ -28,7 +32,7 @@ export function tempDataDir() {
  */
 export async function startPit(demo = 'mobpit', vars = {}) {
 	const port = await freePort();
-	const celld = await startCelld({ relayPort: port, vars: { ZONE_HIBERNATE_AFTER_MS: '1500', ...vars } });
+	const celld = await startCelld({ relayPort: port, vars: { ...FAST_ROOMS, ...vars } });
 	const env = { ...celld.env, MOBPIT_DATA_DIR: tempDataDir(), DG_DEMO_ADMIN_SECRET: ADMIN_SECRET };
 	let server;
 	try {
@@ -51,6 +55,39 @@ export async function startPit(demo = 'mobpit', vars = {}) {
 		async stop() {
 			await server.stop();
 			await celld.stop();
+		}
+	};
+}
+
+/**
+ * `startPit` on a local celld fleet (`nodes` nodes on one RustFS bucket,
+ * see `fleet.mjs`): rooms are entered through the first node and placed
+ * by celld. `redeploy(vars)` deploys the worker again with `vars` over the
+ * worker's own (not over the earlier ones). Null when the fleet's tools are
+ * missing (docker, aws CLI, celld).
+ */
+export async function startPitFleet(demo = 'mobpit', vars = {}, nodes = 3) {
+	const port = await freePort();
+	const fleet = await startFleet({ relayPort: port, nodes, vars: { ...FAST_ROOMS, ...vars } });
+	if (fleet === null) return null;
+	const env = { ...fleet.env, MOBPIT_DATA_DIR: tempDataDir(), DG_DEMO_ADMIN_SECRET: ADMIN_SECRET };
+	let server;
+	try {
+		server = await startDemo(demo, { env, port });
+	} catch (error) {
+		await fleet.stop();
+		throw error;
+	}
+	return {
+		fleet,
+		roomsUrl: fleet.url,
+		get httpUrl() {
+			return server.httpUrl;
+		},
+		redeploy: (more) => fleet.redeploy({ ...FAST_ROOMS, ...more }),
+		async stop() {
+			await server.stop();
+			await fleet.stop();
 		}
 	};
 }

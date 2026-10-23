@@ -140,6 +140,22 @@ kill_tree() {
 	kill -KILL "${pids[@]}" 2>/dev/null || true
 }
 
+# warn_celld_state <state dir>: a `celld dev` state only grows (celld keeps
+# every write; epoch GC stalls rooms while it runs). Past a few hundred
+# cells or ~100 MB, rooms drop ticks and a restart takes minutes (a
+# 255-cell, 216 MB state never became ready) to answer (client/tests/mobpit-soak-headless.test.mjs). Say so and how
+# to reset; never reset on its own.
+warn_celld_state() {
+	local state="$1" cells=0 mb=0
+	[[ -d "$state/runtime" ]] && cells=$(find "$state/runtime" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+	[[ -f "$state/objects.sqlite3" ]] && mb=$(($(wc -c <"$state/objects.sqlite3") / 1048576))
+	if ((cells > ${CELLD_STATE_WARN_CELLS:-500} || mb > ${CELLD_STATE_WARN_MB:-100})); then
+		printf '\033[1;33m[demos]\033[0m celld dev state is large (%s cells, %s MB): rooms may stutter and a restart\n' "$cells" "$mb"
+		printf '        can take minutes. Reset it (local rooms, players and progress on celld are lost):\n'
+		printf '        rm -rf %q\n' "$state"
+	fi
+}
+
 # start_celld <project> <port> <relay port>: `celld dev` with the cells
 # worker in <project> (its state persists in <project>/.celld/dev), relaying
 # the outbox Queue to the game server on <relay port>. Sets CELLD_PID,
@@ -149,6 +165,7 @@ start_celld() {
 	local project="$1" port="$2" relay_port="$3"
 	ensure_celld
 	ensure_cells
+	warn_celld_state "$project/.celld/dev"
 	mkdir -p "$project"
 	rm -rf "$project/build"
 	cp -R "$CELLS/build" "$project/build"

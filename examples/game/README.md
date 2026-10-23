@@ -66,6 +66,26 @@ proxies `/rooms` (WebSocket) to celld and `/dev` to the services). Ports:
 `GAME_DEMOS_PORT`, `GAME_DEMOS_CLIENT_PORT`. Open a second browser (or
 `?player=two`) to see another player interpolated.
 
+**The celld dev state only grows.** `celld dev` keeps every write
+(`MOBPIT_DATA_DIR/celld/.celld/dev`; epoch GC, `CELLD_LTX_RETENTION_SECS`,
+stalls rooms by ~20 % of their ticks while it deletes, so it stays off).
+A room writes its snapshot every minute and when a player leaves, and its
+crash watchdog alarm about every 3 minutes, but facts, the outbox queue
+and rooms waking and sleeping around players add up: ~5k stored objects
+per played room-hour. Past a few hundred cells, restarts get slow: a
+crashed `celld dev` (run.sh stops it with SIGKILL) recovers every cell
+before rooms answer (~2 min at ~730 cells). On a few-day state with
+rebalancing on (~560 cells, 91k objects), rooms dropped 166 ticks per 30 s.
+`run.sh` launches it with `CELLD_REBALANCE_INTERVAL_MS=0` (one node) and
+warns at start past 500 cells or 100 MB (a 255-cell, 216 MB state, 2.5
+hours of play at 5 s snapshots, never became ready after a restart) (`CELLD_STATE_WARN_CELLS`,
+`CELLD_STATE_WARN_MB`) with the reset command (deleting `.celld/dev` drops
+the rooms, players and progress on celld). The debug overlay (rooms panel;
+on by default, **O** toggles) shows the room's dropped ticks over the last ~30 s, red
+when it degrades. `MOBPIT_SOAK=1 node --test
+client/tests/mobpit-soak-headless.test.mjs` ages a state and checks rooms
+still keep their pace (`MOBPIT_SOAK_FLEET=3` on a local fleet).
+
 Network panel (Mob Pit's HUD): **P** toggles client prediction (off = your
 capsule is drawn like everyone else's, one RTT + the interpolation delay
 behind your keys), **G** the wireframe ghost at the room's latest
@@ -414,7 +434,8 @@ and re-greets the page; a network drop resumes it with the reconnect
 token), and a room keeps the place and HP of every player whose slot ended
 (closed page, grace expired) and of the connected ones in its snapshot, so
 it survives the room sleeping, the services restarting and celld
-restarting (the last periodic snapshot). XP, level and kills come from
+restarting (the last snapshot: one a minute, and one whenever a player
+leaves the room). XP, level and kills come from
 your Crawler cell. Tested by `client/tests/mobpit-restarts-headless.test.mjs`.
 
 **Rooms.** What a room holds — its biome (the seeded noise of `game_sim::grid`),
@@ -499,7 +520,9 @@ backing off). The grant is checked when the ticket is issued: a client that
 keeps its near watchers open and walks far away keeps those rooms awake
 until it closes them (bounded by how many rooms it walked past; tickets are
 rate limited) — the rooms do not ask where their watchers' players are now.
-A room that empties writes its snapshot
+A room that has been empty for `ZONE_DORMANT_AFTER_MS` (10 s; a player
+circling by a doorway would otherwise wake and release the room behind it
+every few seconds) writes its snapshot
 (`Zone::hibernate`: every mob's position, HP, state, generation and
 respawn timer, and the room's kill count) and goes **dormant**; after
 `ZONE_HIBERNATE_AFTER_MS` (10 s) it is **hibernated**: dropped from memory,
