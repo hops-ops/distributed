@@ -1789,7 +1789,13 @@ impl<Z: CelldZone> ZoneObject<Z> {
     /// Keep an alarm while unsettled facts wait in the outbox.
     async fn arm_outbox(&self) {
         let pending = {
-            let inner = self.inner.borrow();
+            let mut inner = self.inner.borrow_mut();
+            // Settlements only leave the queue on `drain`; a hibernated
+            // room has no tick loop to drain it, and would otherwise re-arm
+            // this alarm forever on a report that settled long ago.
+            if let Some(queue) = inner.activity.as_mut() {
+                queue.drain();
+            }
             inner.activity.as_ref().map_or(0, |q| q.in_flight())
                 + inner.host.as_ref().map_or(0, |h| h.facts_in_flight())
         };

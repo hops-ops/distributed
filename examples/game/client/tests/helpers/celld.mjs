@@ -129,3 +129,19 @@ function killTree(root) {
 		}
 	}
 }
+
+/**
+ * Objects in `celld dev`'s local store, or only those under `prefix`
+ * (e.g. `cells/PitRoom:`); `?` when unreadable.
+ */
+export function storeObjects(project, prefix = '') {
+	try {
+		const { DatabaseSync } = process.getBuiltinModule('node:sqlite');
+		const db = new DatabaseSync(join(project, '.celld/dev/objects.sqlite3'), { readOnly: true, timeout: 10_000 });
+		const { n } = db.prepare('select count(*) as n from objects where substr(key, 1, length(?1)) = ?1').get(prefix);
+		db.close();
+		return n;
+	} catch {
+		return '?';
+	}
+}

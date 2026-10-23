@@ -33,6 +33,7 @@ import test from 'node:test';
 import { createMobPitClient, MobPitApi } from '../src/mobpit/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
 import { memoryStorage, sleep, until } from './helpers/demo-server.mjs';
+import { storeObjects } from './helpers/celld.mjs';
 import { startPit, startPitFleet } from './helpers/mobpit.mjs';
 
 const SOAK = process.env.MOBPIT_SOAK === '1';
@@ -173,17 +174,4 @@ function setVar(project, key, value) {
 	const lines = readFileSync(path, 'utf8').split('\n').filter((l) => l !== '' && !l.startsWith(`${key}=`));
 	if (value !== undefined) lines.push(`${key}=${value}`);
 	writeFileSync(path, `${lines.join('\n')}\n`);
-}
-
-/** Objects in `celld dev`'s local store (logged; `?` when unreadable). */
-function storeObjects(project) {
-	try {
-		const { DatabaseSync } = process.getBuiltinModule('node:sqlite');
-		const db = new DatabaseSync(join(project, '.celld/dev/objects.sqlite3'), { readOnly: true, timeout: 10_000 });
-		const { n } = db.prepare('select count(*) as n from objects').get();
-		db.close();
-		return n;
-	} catch {
-		return '?';
-	}
 }
