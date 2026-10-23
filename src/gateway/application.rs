@@ -15,6 +15,7 @@ impl Gateway {
                 BindingKind::Admission => serde_json::json!({"kind":"admission"}),
                 BindingKind::Assets => serde_json::json!({"kind":"assets"}),
                 BindingKind::UiProxy { .. } => serde_json::json!({"kind":"ui"}),
+                BindingKind::Zones { .. } => serde_json::json!({"kind":"zones"}),
                 BindingKind::Graphql { capabilities, delivery, schema_extensions, .. } => serde_json::json!({"kind":"graphql","operations":capabilities,"delivery":delivery,"schemaExtensions":schema_extensions}),
             };
             serde_json::json!({"id":binding.id,"capability":capability})
