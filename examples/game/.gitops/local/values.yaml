@@ -10,7 +10,6 @@ celld:
 images:
   rust: rust:1.99-bookworm
   node: node:24-bookworm
-  nginx: nginx:1.27-alpine
 
 # Cargo target dir, registry cache and the services' data dir.
 cache:

@@ -12,7 +12,7 @@
 {{- end -}}
 
 {{- define "mobpit.relayUrl" -}}
-{{- printf "https://mobpit-relay.%s.svc.cluster.local:8443/internal/celld-queue/relay" .Values.environment.namespace -}}
+{{- printf "http://mobpit.%s.svc.cluster.local:2567/internal/celld-queue/relay" .Values.environment.namespace -}}
 {{- end -}}
 
 {{- define "mobpit.labels" -}}

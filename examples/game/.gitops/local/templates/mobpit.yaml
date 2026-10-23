@@ -1,6 +1,8 @@
 # The Mob Pit pod: the services behind the framework gateway (cargo, from
-# the mounted checkout), Vite (the client, `/` through the gateway) and the
-# HTTPS endpoint of the celld outbox relay (nginx, the relay route only).
+# the mounted checkout) and Vite (the client, `/` through the gateway).
+# The pod is in the Istio ambient mesh, like celld's namespace, so the celld
+# outbox relay (`/internal/celld-queue/relay` on the `mobpit` Service) is
+# mTLS between the two (the worker opts in with CELLD_QUEUE_RELAY_MESH).
 {{- $repo := include "mobpit.repo" . }}
 {{- $game := include "mobpit.game" . }}
 apiVersion: apps/v1
@@ -22,8 +24,7 @@ spec:
       labels:
         {{- include "mobpit.labels" . | nindent 8 }}
         app.kubernetes.io/name: mobpit
-      annotations:
-        checksum/relay: {{ include (print $.Template.BasePath "/relay-config.yaml") . | sha256sum }}
+        istio.io/dataplane-mode: ambient
     spec:
       containers:
         - name: services
@@ -81,14 +82,6 @@ spec:
             - {name: source, mountPath: {{ $repo }}}
             # Linux packages, not the host's.
             - {name: client-node-modules, mountPath: {{ $game }}/client/node_modules}
-        - name: relay
-          image: {{ .Values.images.nginx }}
-          ports:
-            - name: relay
-              containerPort: 8443
-          volumeMounts:
-            - {name: relay-config, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf}
-            - {name: relay-tls, mountPath: /etc/relay-tls, readOnly: true}
       volumes:
         - name: source
           hostPath:
@@ -99,12 +92,6 @@ spec:
             claimName: mobpit-cache
         - name: client-node-modules
           emptyDir: {}
-        - name: relay-config
-          configMap:
-            name: mobpit-relay
-        - name: relay-tls
-          secret:
-            secretName: mobpit-relay-tls
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -121,7 +108,8 @@ spec:
     requests:
       storage: {{ .Values.cache.size }}
 ---
-# The gateway: the page, its API and the rooms (`/zones/{room}`).
+# The gateway: the page, its API, the rooms (`/zones/{room}`) and, in the
+# cluster, the celld outbox relay.
 apiVersion: v1
 kind: Service
 metadata:
@@ -135,21 +123,6 @@ spec:
     - name: http
       port: 2567
       targetPort: http
----
-# The celld outbox relay (HTTPS, cluster-internal).
-apiVersion: v1
-kind: Service
-metadata:
-  name: mobpit-relay
-  labels:
-    {{- include "mobpit.labels" . | nindent 4 }}
-spec:
-  selector:
-    app.kubernetes.io/name: mobpit
-  ports:
-    - name: https
-      port: 8443
-      targetPort: relay
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

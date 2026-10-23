@@ -47,6 +47,9 @@ spec:
               value: {{ .Values.esbuildVersion | quote }}
             - name: CELLD_QUEUE_RELAY_URL
               value: {{ include "mobpit.relayUrl" . | quote }}
+            # HTTP to the relay's Service, mTLS through Istio ambient.
+            - name: CELLD_QUEUE_RELAY_MESH
+              value: "1"
             - name: GAME_TICKET_SECRET
               valueFrom: {secretKeyRef: {name: mobpit, key: GAME_TICKET_SECRET}}
             - name: DISTRIBUTED_INTERNAL_SECRET

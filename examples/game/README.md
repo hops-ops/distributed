@@ -160,17 +160,20 @@ hops local env enable distributed-mobpit-world
 
 - **`mobpit-system`** (`.gitops/local/mobpit-system.yaml`, manifests in
   `.gitops/mobpit-system/`): a `CelldStack` (celld-stack, RustFS) in
-  namespace `mobpit-celld`, and a local CA for the outbox relay. Shared by
+  namespace `mobpit-celld`, enrolled in the Istio ambient mesh. Shared by
   every Mob Pit Environment; the last one to deploy its worker owns it.
 - **The Environment** (`.gitops/local/mobpit.yaml`, chart
   `.gitops/local/`): its setup (`scripts/hops/mobpit-setup.sh`) runs
   `./run.sh build` on the host (JS SDK, WebAssembly, cells worker) and makes
-  the Environment's secrets and relay certificate. The pod runs the
-  services + gateway (`cargo run` from the mounted checkout; target dir on a
-  PVC), Vite (`/` through the gateway) and an nginx HTTPS endpoint for the
-  relay only (celld's relay is HTTPS-only; celld trusts the CA via
-  `SSL_CERT_FILE`). A deployer `celld deploy`s the worker whenever
-  `cells/build` changes, with this Environment's secrets and relay URL.
+  the Environment's secrets. The pod (ambient too) runs the services +
+  gateway (`cargo run` from the mounted checkout; target dir on a PVC) and
+  Vite (`/` through the gateway). A deployer `celld deploy`s the worker
+  whenever `cells/build` changes, with this Environment's secrets and relay
+  URL.
+- Outbox relay: celld → `http://mobpit.<ns>.svc.cluster.local:2567` over
+  ztunnel mTLS. The worker opts in with `CELLD_QUEUE_RELAY_MESH=1`
+  (`CelldQueueHttpPublisher::new_mesh`: HTTP only to `*.svc` hosts);
+  without it the relay must be HTTPS.
 - Traffic: browser → Dory (TLS) → Istio Gateway `platform` → HTTPRoute
   `<checkout>.gitkb.localhost` → gateway → `/zones/{room}` to celld,
   `/dev` to the services, `/` to Vite.
