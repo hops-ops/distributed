@@ -1,8 +1,8 @@
-# First celld-stack release with RustFS (hops-ops/celld-stack#15).
+# First celld-stack release with RustFS (hops-ops/celld-stack#15). Its
+# render function and provider-aws-s3 come in through dependency resolution.
 apiVersion: pkg.crossplane.io/v1
 kind: Configuration
 metadata:
   name: hops-ops-celld-stack
 spec:
-  package: ghcr.io/hops-ops/celld-stack:v0.10.0
-  skipDependencyResolution: true
+  package: ghcr.io/hops-ops/celld-stack:v0.11.0

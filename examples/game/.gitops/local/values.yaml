@@ -5,7 +5,7 @@
 celld:
   url: http://celld.mobpit-celld.svc.cluster.local:8080
   bucket: s3://celld
-  image: ghcr.io/denoland/celld:0.6.2
+  image: ghcr.io/denoland/celld:0.6.3
 
 images:
   rust: rust:1.99-bookworm
