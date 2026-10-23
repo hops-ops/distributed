@@ -432,6 +432,9 @@ struct Inner<Z: CelldZone> {
     /// Players at the last tick; a drop (leave, handoff, grace expired)
     /// snapshots on that tick, not at the next interval.
     players_seen: usize,
+    /// When the ticking room last became empty (it goes dormant after
+    /// `dormant_after` of that).
+    empty_since_ms: Option<f64>,
     /// A player left since the last snapshot.
     persist_soon: bool,
     spooled: u64,
@@ -747,6 +750,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             last_persist_ms: 0.0,
             persisting: false,
             players_seen: 0,
+            empty_since_ms: None,
             persist_soon: false,
             spooled: 0,
             net_sim: None,
@@ -1575,10 +1579,15 @@ impl<Z: CelldZone> ZoneObject<Z> {
     }
 
     async fn tick_loop(&self) {
-        let (hz, persist_every) = {
-            let inner = self.inner.borrow();
+        let (hz, persist_every, dormant_after) = {
+            let mut inner = self.inner.borrow_mut();
+            inner.empty_since_ms = None;
             let options = inner.options.as_ref().expect("configured");
-            (options.tick_hz, options.persist_every.as_millis() as f64)
+            (
+                options.tick_hz,
+                options.persist_every.as_millis() as f64,
+                options.dormant_after.as_millis() as f64,
+            )
         };
         let mut schedule = TickSchedule::new(now_ms(), hz);
         // Crash watchdog: if this activation dies while awake, the alarm
@@ -1616,7 +1625,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 if let Some(queue) = inner.activity.as_mut() {
                     queue.drain();
                 }
-                let stop = !inner.occupied();
+                let stop = if inner.occupied() {
+                    inner.empty_since_ms = None;
+                    false
+                } else {
+                    woke - *inner.empty_since_ms.get_or_insert(woke) >= dormant_after
+                };
                 let persist =
                     stop || inner.persist_soon || woke - inner.last_persist_ms >= persist_every;
                 if stop {

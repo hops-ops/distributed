@@ -20,6 +20,9 @@ export function tempDataDir() {
 	return mkdtempSync(join(tmpdir(), 'mobpit-js-'));
 }
 
+/** Rooms go dormant and to sleep fast (tests wait for both). */
+const FAST_ROOMS = { ZONE_DORMANT_AFTER_MS: '1000', ZONE_HIBERNATE_AFTER_MS: '1500' };
+
 /**
  * celld (rooms + cells) + `game-demos <demo>` (mobpit / leaderboard: the
  * services) on a fixed port that celld's outbox relay targets.
@@ -29,7 +32,7 @@ export function tempDataDir() {
  */
 export async function startPit(demo = 'mobpit', vars = {}) {
 	const port = await freePort();
-	const celld = await startCelld({ relayPort: port, vars: { ZONE_HIBERNATE_AFTER_MS: '1500', ...vars } });
+	const celld = await startCelld({ relayPort: port, vars: { ...FAST_ROOMS, ...vars } });
 	const env = { ...celld.env, MOBPIT_DATA_DIR: tempDataDir(), DG_DEMO_ADMIN_SECRET: ADMIN_SECRET };
 	let server;
 	try {
@@ -65,7 +68,7 @@ export async function startPit(demo = 'mobpit', vars = {}) {
  */
 export async function startPitFleet(demo = 'mobpit', vars = {}, nodes = 3) {
 	const port = await freePort();
-	const fleet = await startFleet({ relayPort: port, nodes, vars: { ZONE_HIBERNATE_AFTER_MS: '1500', ...vars } });
+	const fleet = await startFleet({ relayPort: port, nodes, vars: { ...FAST_ROOMS, ...vars } });
 	if (fleet === null) return null;
 	const env = { ...fleet.env, MOBPIT_DATA_DIR: tempDataDir(), DG_DEMO_ADMIN_SECRET: ADMIN_SECRET };
 	let server;
@@ -81,7 +84,7 @@ export async function startPitFleet(demo = 'mobpit', vars = {}, nodes = 3) {
 		get httpUrl() {
 			return server.httpUrl;
 		},
-		redeploy: (more) => fleet.redeploy({ ZONE_HIBERNATE_AFTER_MS: '1500', ...more }),
+		redeploy: (more) => fleet.redeploy({ ...FAST_ROOMS, ...more }),
 		async stop() {
 			await server.stop();
 			await fleet.stop();

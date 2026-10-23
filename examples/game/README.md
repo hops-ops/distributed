@@ -520,7 +520,9 @@ backing off). The grant is checked when the ticket is issued: a client that
 keeps its near watchers open and walks far away keeps those rooms awake
 until it closes them (bounded by how many rooms it walked past; tickets are
 rate limited) — the rooms do not ask where their watchers' players are now.
-A room that empties writes its snapshot
+A room that has been empty for `ZONE_DORMANT_AFTER_MS` (10 s; a player
+circling by a doorway would otherwise wake and release the room behind it
+every few seconds) writes its snapshot
 (`Zone::hibernate`: every mob's position, HP, state, generation and
 respawn timer, and the room's kill count) and goes **dormant**; after
 `ZONE_HIBERNATE_AFTER_MS` (10 s) it is **hibernated**: dropped from memory,

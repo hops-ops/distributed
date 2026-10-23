@@ -816,9 +816,11 @@ a stopping node and recovering a crashed node's objects elsewhere.
 **What the framework handles:** the WebSocket join (signed ticket, transfer
 ticket of a doorway handoff — single use across activations — or reconnect
 token), a self-correcting tick loop that runs only while someone is
-connected, the zone's snapshot in object storage (every
+connected (and `ZONE_DORMANT_AFTER_MS`, default 10 s, after it empties,
+so a room whose last player or near watcher comes and goes does not report
+and snapshot every swing), the zone's snapshot in object storage (every
 `ZONE_PERSIST_MS`, default 60 s, while occupied, when a player leaves and
-when it empties: each snapshot is a durable write celld keeps, so a short
+when it goes dormant: each snapshot is a durable write celld keeps, so a short
 interval grows the store and slows every later write), dormancy and
 hibernation (`ZONE_HIBERNATE_AFTER_MS` later, by object alarm, so it also
 happens after an eviction), restore on the next join, facts to the cells

@@ -25,11 +25,12 @@
 //! - **Ticks.** A self-correcting `setTimeout` loop over absolute deadlines
 //!   ([`TickSchedule`]; `setInterval` drifts) drives
 //!   [`ZoneHost::advance`](crate::ZoneHost::advance) while anyone is
-//!   connected, and stops when the zone is empty.
+//!   connected, and stops `ZONE_DORMANT_AFTER_MS` (10 s) after the zone
+//!   empties.
 //! - **State.** The zone's [`Zone::hibernate`] snapshot is written to object
 //!   storage every `ZONE_PERSIST_MS` (60 s) while occupied, on the tick a
-//!   player leaves (leave, handoff, grace expired) and when the last one
-//!   does (`dormant`); after `ZONE_HIBERNATE_AFTER_MS` empty (an
+//!   player leaves (leave, handoff, grace expired) and when the loop stops
+//!   (`dormant`); after `ZONE_HIBERNATE_AFTER_MS` empty (an
 //!   object alarm, so it survives eviction) the zone is dropped from memory
 //!   (`hibernated`). The next join wakes it and restores the snapshot.
 //! - **Restarts.** A socket that outlives its activation (eviction, a move,
