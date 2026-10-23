@@ -10,6 +10,7 @@ apiVersion: hops.ops.com.ai/v1alpha1
 kind: CelldStack
 metadata:
   name: celld
+  namespace: mobpit-system
 spec:
   clusterName: mobpit
   namespace: mobpit-celld
@@ -38,6 +39,7 @@ apiVersion: kubernetes.m.crossplane.io/v1alpha1
 kind: Object
 metadata:
   name: mobpit-relay-ca
+  namespace: mobpit-system
 spec:
   forProvider:
     manifest:

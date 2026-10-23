@@ -4,6 +4,7 @@ apiVersion: helm.m.crossplane.io/v1beta1
 kind: ProviderConfig
 metadata:
   name: mobpit
+  namespace: mobpit-system
 spec:
   credentials:
     source: InjectedIdentity
@@ -12,6 +13,7 @@ apiVersion: kubernetes.m.crossplane.io/v1alpha1
 kind: ProviderConfig
 metadata:
   name: mobpit
+  namespace: mobpit-system
 spec:
   credentials:
     source: InjectedIdentity
