@@ -478,16 +478,16 @@ mod tests {
         assert_eq!(cell_binding("zone-activity"), "ZONE_ACTIVITY");
         assert_eq!(cell_binding("crawler"), "CRAWLER");
         assert_eq!(
-            zone_from_path("/rooms/", "/rooms/pit.1.-2/info"),
+            zone_from_path("/zones/", "/zones/pit.1.-2/info"),
             Some(("pit.1.-2".to_string(), "info"))
         );
         assert_eq!(
-            zone_from_path("/rooms/", "/rooms/a%20b"),
+            zone_from_path("/zones/", "/zones/a%20b"),
             None,
             "zones are printable ASCII without spaces"
         );
-        assert_eq!(zone_from_path("/rooms/", "/rooms/"), None);
-        assert_eq!(zone_from_path("/rooms/", "/other/x"), None);
+        assert_eq!(zone_from_path("/zones/", "/zones/"), None);
+        assert_eq!(zone_from_path("/zones/", "/other/x"), None);
     }
 
     #[test]

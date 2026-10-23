@@ -138,7 +138,7 @@ impl DevCelld {
         &self.ticket_secret
     }
 
-    /// `ws://127.0.0.1:{port}` (append `/rooms/{room}`).
+    /// `ws://127.0.0.1:{port}` (append `/zones/{room}`).
     pub fn ws_url(&self) -> String {
         format!("ws://127.0.0.1:{}", self.port)
     }

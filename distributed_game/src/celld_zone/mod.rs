@@ -5,7 +5,7 @@
 //! server.
 //!
 //! ```text
-//! client ──WebSocket /rooms/{zone}──▶ any celld node ──forward──▶ the zone's object
+//! client ──WebSocket /zones/{zone}──▶ any celld node ──forward──▶ the zone's object
 //!                                                         │ ZoneHost<Z> (this activation)
 //!         Hello(ticket | transfer ticket | reconnect token) ┤ deadline tick loop while occupied
 //!                                                         │ snapshot every min + on leave/empty

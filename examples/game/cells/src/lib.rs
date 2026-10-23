@@ -1,6 +1,6 @@
 //! The game demos' durable cells on celld, and Mob Pit's rooms.
 //!
-//! - `GET /rooms/{room}` (WebSocket) and `/rooms/{room}/info`: `PitRoom`,
+//! - `GET /zones/{room}` (WebSocket) and `/zones/{room}/info`: `PitRoom`,
 //!   one Durable Object per Mob Pit room (`pit.<x>.<y>`), hosted by
 //!   `distributed_game::celld_zone` (`mobpit_rooms::MobPit`). celld places
 //!   each room; its kill and lifecycle facts reach the Crawler and presence
@@ -708,8 +708,8 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Response::ok("mobpit cells\n");
     }
     // A room is public: its WebSocket admits signed tickets only.
-    if path.starts_with("/rooms/") {
-        return match forward_to_zone(req, &env, "PIT_ROOM", "/rooms/").await? {
+    if path.starts_with("/zones/") {
+        return match forward_to_zone(req, &env, "PIT_ROOM", "/zones/").await? {
             Some(response) => Ok(response),
             None => json_status(json!({ "error": "no such room" }), 404),
         };

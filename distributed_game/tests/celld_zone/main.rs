@@ -126,7 +126,7 @@ impl Player {
     }
 
     async fn try_connect(base: &str, zone: &str) -> Result<Self, String> {
-        let url = format!("{}/rooms/{zone}", base.replacen("http://", "ws://", 1));
+        let url = format!("{}/zones/{zone}", base.replacen("http://", "ws://", 1));
         let (ws, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| e.to_string())?;
@@ -327,7 +327,7 @@ async fn single_node() {
         status(v) == "hibernated"
     })
     .await;
-    let info = get(&base, "/rooms/room-a/info").await;
+    let info = get(&base, "/zones/room-a/info").await;
     assert_eq!(info["awake"], false, "{info}");
 
     // Wake with state.
@@ -380,7 +380,7 @@ async fn watchers() {
     let mut eve = Player::connect(&base, "room-w").await;
     eve.hello(&ticket_as("eve", "room-w", Role::Observer)).await;
     assert_eq!(eve.refused().await, error::ASLEEP);
-    let info = get(&base, "/rooms/room-w/info").await;
+    let info = get(&base, "/zones/room-w/info").await;
     assert_eq!(info["awake"], false, "{info}");
     assert_eq!(info["wakes"], 0, "{info}");
 
@@ -415,14 +415,14 @@ async fn watchers() {
         })
         .await;
     assert_eq!(closed, Some(1000));
-    let info = get(&base, "/rooms/room-w/info").await;
+    let info = get(&base, "/zones/room-w/info").await;
     assert_eq!(info["awake"], false, "{info}");
 
     // Asleep: a watcher is refused again, the zone stays asleep.
     let mut eve = Player::connect(&base, "room-w").await;
     eve.hello(&ticket_as("eve", "room-w", Role::Observer)).await;
     assert_eq!(eve.refused().await, error::ASLEEP);
-    let info = get(&base, "/rooms/room-w/info").await;
+    let info = get(&base, "/zones/room-w/info").await;
     assert_eq!(info["awake"], false, "{info}");
     assert_eq!(info["wakes"], 1, "woken once, by the player: {info}");
 }
@@ -446,7 +446,7 @@ async fn near_watchers() {
     let mut eve = Player::connect(&base, zone).await;
     eve.hello_near(&wake_ticket("eve", zone), false).await;
     assert_eq!(eve.refused().await, error::ASLEEP);
-    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
     assert_eq!(info["awake"], false, "{info}");
     assert_eq!(info["wakes"], 0, "{info}");
 
@@ -460,7 +460,7 @@ async fn near_watchers() {
     .await;
     // Kept awake past the hibernation delay (2 s here).
     tokio::time::sleep(Duration::from_secs(4)).await;
-    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
     assert_eq!(info["ticking"], true, "{info}");
     assert_eq!(info["players"], 0, "{info}");
     assert_eq!(info["near"], 1, "{info}");
@@ -481,7 +481,7 @@ async fn near_watchers() {
         })
         .await;
     assert_eq!(denied, error::WAKE_DENIED);
-    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
     assert_eq!(info["near"], 1, "{info}");
 
     // Passive again: dormant; near again: active (no reconnect).
@@ -495,7 +495,7 @@ async fn near_watchers() {
         status(v) == "active"
     })
     .await;
-    let info = until(&base, &format!("/rooms/{zone}/info"), long, |v| {
+    let info = until(&base, &format!("/zones/{zone}/info"), long, |v| {
         v["ticking"] == true
     })
     .await;
@@ -516,7 +516,7 @@ async fn near_watchers() {
             .await;
         assert_eq!(closed, Some(1000));
     }
-    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
     assert_eq!(info["awake"], false, "{info}");
 
     // A near watcher that disconnects releases the zone too.
@@ -532,7 +532,7 @@ async fn near_watchers() {
         status(v) == "hibernated"
     })
     .await;
-    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
     assert_eq!(info["wakes"], 2, "{info}");
 }
 
@@ -550,7 +550,7 @@ async fn fleet() {
     let mut probe = Player::connect(&a, "room-x").await;
     probe.hello(&ticket("probe", "room-x")).await;
     probe.welcome().await;
-    let info = until(&a, "/rooms/room-x/info", long, |v| {
+    let info = until(&a, "/zones/room-x/info", long, |v| {
         v["node"].as_str().is_some_and(|n| !n.is_empty())
     })
     .await;
@@ -575,7 +575,7 @@ async fn fleet() {
     // Crash the owner once the 200 facts are in the zone's outbox (written
     // right after the tick that emitted them); some may already be
     // committed, most are in flight.
-    until(&a, "/rooms/room-x/info", long, |v| {
+    until(&a, "/zones/room-x/info", long, |v| {
         v["spooledFacts"].as_u64().unwrap_or(0) >= 200
     })
     .await;

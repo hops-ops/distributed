@@ -116,9 +116,9 @@ pub struct BotConfig {
     /// Server base URL, e.g. `ws://127.0.0.1:2567` (`{path}/{zone}` is
     /// appended).
     pub url: String,
-    /// Path the zone id is appended to: `/zones` on the `net` server,
-    /// whatever the worker routes to its zone objects on celld (e.g.
-    /// `/rooms`).
+    /// Path the zone id is appended to: `/zones` on the `net` server and
+    /// whatever the worker routes to its zone objects on celld (Mob Pit:
+    /// `/zones` too).
     pub path: String,
     /// Zone to join.
     pub zone: String,

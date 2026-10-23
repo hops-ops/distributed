@@ -26,7 +26,8 @@ const FAST_ROOMS = { ZONE_DORMANT_AFTER_MS: '1000', ZONE_HIBERNATE_AFTER_MS: '15
 /**
  * celld (rooms + cells) + `game-demos <demo>` (mobpit / leaderboard: the
  * services) on a fixed port that celld's outbox relay targets.
- * `roomsUrl` is where rooms are (celld). `restart()` restarts only the
+ * `roomsUrl` is where rooms are reached: the services' gateway, which
+ * routes `/zones/{room}` to celld. `restart()` restarts only the
  * services (same port, data dir and cells); `restartCelld()` kills celld
  * and starts it again on its state (rooms, cells); `stop()` stops both.
  */
@@ -43,7 +44,9 @@ export async function startPit(demo = 'mobpit', vars = {}) {
 	}
 	return {
 		celld,
-		roomsUrl: celld.url,
+		get roomsUrl() {
+			return server.httpUrl;
+		},
 		get httpUrl() {
 			return server.httpUrl;
 		},
@@ -61,10 +64,10 @@ export async function startPit(demo = 'mobpit', vars = {}) {
 
 /**
  * `startPit` on a local celld fleet (`nodes` nodes on one RustFS bucket,
- * see `fleet.mjs`): rooms are entered through the first node and placed
- * by celld. `redeploy(vars)` deploys the worker again with `vars` over the
- * worker's own (not over the earlier ones). Null when the fleet's tools are
- * missing (docker, aws CLI, celld).
+ * see `fleet.mjs`): rooms are entered through the gateway, which sends
+ * them to the first node; celld places them. `redeploy(vars)` deploys the
+ * worker again with `vars` over the worker's own (not over the earlier
+ * ones). Null when the fleet's tools are missing (docker, aws CLI, celld).
  */
 export async function startPitFleet(demo = 'mobpit', vars = {}, nodes = 3) {
 	const port = await freePort();
@@ -80,7 +83,9 @@ export async function startPitFleet(demo = 'mobpit', vars = {}, nodes = 3) {
 	}
 	return {
 		fleet,
-		roomsUrl: fleet.url,
+		get roomsUrl() {
+			return server.httpUrl;
+		},
 		get httpUrl() {
 			return server.httpUrl;
 		},

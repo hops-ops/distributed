@@ -61,8 +61,10 @@ examples/game/run.sh mobpit
 
 The script builds the JS SDK if `js/dist` is stale, runs `npm ci` for the
 client, builds `game-demos` and the cells worker, starts `celld dev` (the
-rooms), the services on `127.0.0.1:2567` with `--dev`, then runs Vite (which
-proxies `/rooms` (WebSocket) to celld and `/dev` to the services). Ports:
+rooms), the services on `127.0.0.1:2567` with `--dev` behind the framework
+gateway (`distributed::gateway`: `/zones/{room}` → celld, the rest → the
+services), then runs Vite, which proxies `/zones` and `/dev` to that gateway.
+Ports:
 `GAME_DEMOS_PORT`, `GAME_DEMOS_CLIENT_PORT`. Open a second browser (or
 `?player=two`) to see another player interpolated.
 
@@ -232,7 +234,7 @@ and `vite dev` on `SVELTEKIT_PORT` (default 5573). What each piece replaces:
   @live`) is the minimap: every room's status (active, dormant, asleep,
   never ran) live as rooms wake, empty and sleep, with toasts when a room
   goes to sleep or wakes from its snapshot. The debug overlay polls the
-  current room object's `GET /rooms/{room}/info` (node, isolate,
+  current room object's `GET /zones/{room}/info` (node, isolate,
   activation). `GAME_ZONES_URL` lists celld's entry points (comma
   separated for a local fleet); the page rotates over them per connection —
   entry points, not placement: celld forwards each socket to the room's
@@ -270,7 +272,7 @@ errors.
  │ src/mobpit/main.ts  Babylon scene │    │ /dev/ticket  guest tickets   │     │ PitRoom  one Durable Object    │
  │   └ src/mobpit/client.ts          │───►│ /dev/mobpit/* (rooms, tiers, │     │   per room pit.<x>.<y>:        │
  │       GameClient (SDK)            │    │   boards, content, rollout)  │────►│   ZoneHost<MobPit> 30 Hz       │
- │       ├ GameConnection ws ────────┼─ /rooms/{room} ─────────────────────►│   └ game_sim::mobpit::pit_step │
+ │       ├ GameConnection ws ────────┼─ /zones/{room} ─ gateway ───────────►│   └ game_sim::mobpit::pit_step │
  │       ├ EntityReplica (interp.)   │    │ /internal/celld-queue/relay  │◄────│ crawler · presence · activity  │
  │       └ Predictor ── mobpit.wasm  │    │   bus → read models, boards  │     │ hood · borough · city · rollout│
  │ src/generated/mobpit (typed glue) │    └──────────────────────────────┘     │ outbox Queue → saga + relay    │
@@ -601,8 +603,12 @@ celld (`server/tiers`, `mobpit_tiers`), with its own schedule:
 room runs in it: the dev ticket route (`POST /dev/ticket` for `pit.<x>.<y>`,
 signed with the rooms' `GAME_TICKET_SECRET`, persisted in the data dir as
 `dev-ticket-secret`), the Queue relay, the read models, the boards and the
-`/dev/mobpit/*` routes. The Vite page reaches rooms at `/rooms/{room}`
-(proxied to celld, `GAME_DEMOS_ROOMS`) and the services at `/dev`.
+`/dev/mobpit/*` routes, all behind the framework gateway, which also
+routes `/zones/{room}` to the rooms (`--zones-origin`, default
+`--celld-url`; the fleet's load balancer with `--fleet`) and, with
+`--ui-origin`, `/` to a UI. `--public-origin` names the origin clients use
+behind an ingress. The Vite page reaches rooms at `/zones/{room}` and the
+services at `/dev`, both through the gateway.
 
 **Local fleet** (`--fleet [N]`): one RustFS container (docker compose:
 this machine's Docker publishes ports for compose, not for plain `docker
@@ -672,7 +678,7 @@ crawler in the directory, eventually consistent), `GET
 /dev/mobpit/presence?principal=` (the presence cell), `GET
 /dev/mobpit/leaderboard[?member=]`, `POST /dev/mobpit/leaderboard/rebuild`,
 `GET /dev/mobpit/tiers?room=`, `GET|POST /dev/netsim`, `GET
-/dev/mobpit/content` and `POST /dev/mobpit/rollout` (admin secret). On celld, `GET /rooms/{room}/info` is the
+/dev/mobpit/content` and `POST /dev/mobpit/rollout` (admin secret). On celld, `GET /zones/{room}/info` is the
 room object's debug JSON (node, isolate, activation, wakes, tick timing).
 
 ## Adding a mechanic

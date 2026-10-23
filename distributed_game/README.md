@@ -803,8 +803,8 @@ impl CelldZone for MobPit {
 }
 distributed_game::celld_zone_object!(PitRoom, MobPit);
 
-// worker entry: /rooms/{zone} → the zone's object (WebSocket or …/info)
-if let Some(response) = forward_to_zone(req, &env, "PIT_ROOM", "/rooms/").await? { … }
+// worker entry: /zones/{zone} → the zone's object (WebSocket or …/info)
+if let Some(response) = forward_to_zone(req, &env, "PIT_ROOM", "/zones/").await? { … }
 ```
 
 **What celld handles:** where a zone runs (first touch; overflow to the
