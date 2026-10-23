@@ -9,6 +9,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: mobpit-worker-deployer
+  namespace: {{ .Values.environment.namespace }}
   labels:
     {{- include "mobpit.labels" . | nindent 4 }}
     app.kubernetes.io/name: mobpit-worker-deployer
