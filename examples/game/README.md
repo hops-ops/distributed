@@ -145,6 +145,39 @@ faster, brittle, glowing) out to **every live room**:
   with the new version and the same body). A fresh join on old content is
   told to reload. `hard` reloads stale clients at once instead.
 
+## Hops local (Kubernetes)
+
+Mob Pit also runs in the machine's Hops cluster (kind-hops), through the same
+gateway, at a portless HTTPS address per checkout:
+`https://<checkout>.gitkb.localhost/mobpit/` (this checkout:
+`https://distributed-mobpit-world.gitkb.localhost/mobpit/`).
+
+```sh
+hops local env discover .            # from the repo root
+hops local env enable mobpit-system  # once per machine: the celld fleet
+hops local env enable distributed-mobpit-world
+```
+
+- **`mobpit-system`** (`.gitops/local/mobpit-system.yaml`, manifests in
+  `.gitops/mobpit-system/`): a `CelldStack` (celld-stack, RustFS) in
+  namespace `mobpit-celld`, and a local CA for the outbox relay. Shared by
+  every Mob Pit Environment; the last one to deploy its worker owns it.
+- **The Environment** (`.gitops/local/mobpit.yaml`, chart
+  `.gitops/local/`): its setup (`scripts/hops/mobpit-setup.sh`) runs
+  `./run.sh build` on the host (JS SDK, WebAssembly, cells worker) and makes
+  the Environment's secrets and relay certificate. The pod runs the
+  services + gateway (`cargo run` from the mounted checkout; target dir on a
+  PVC), Vite (`/` through the gateway) and an nginx HTTPS endpoint for the
+  relay only (celld's relay is HTTPS-only; celld trusts the CA via
+  `SSL_CERT_FILE`). A deployer `celld deploy`s the worker whenever
+  `cells/build` changes, with this Environment's secrets and relay URL.
+- Traffic: browser → Dory (TLS) → Istio Gateway `platform` → HTTPRoute
+  `<checkout>.gitkb.localhost` → gateway → `/zones/{room}` to celld,
+  `/dev` to the services, `/` to Vite.
+
+The cluster overlay (`.gitops/local/cluster/`) pins the celld-stack
+package; the first boot compiles the services in the pod (minutes).
+
 ## SvelteKit
 
 ```sh

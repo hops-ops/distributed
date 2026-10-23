@@ -1,0 +1,64 @@
+# The Mob Pit celld fleet: one node on in-cluster RustFS (bucket s3://celld)
+# in namespace mobpit-celld, public listener
+# http://celld.mobpit-celld.svc.cluster.local:8080. Each Mob Pit
+# Environment deploys the cells worker into it (the last deploy wins).
+#
+# The worker's outbox Queue relay is HTTPS only; celld trusts the Mob Pit
+# relay CA (mobpit-relay-ca, made by scripts/hops/mobpit-system-setup.sh)
+# through SSL_CERT_FILE, next to the public roots.
+apiVersion: hops.ops.com.ai/v1alpha1
+kind: CelldStack
+metadata:
+  name: celld
+spec:
+  clusterName: mobpit
+  namespace: mobpit-celld
+  releaseName: celld
+  # extraVolumes / extraVolumeMounts (hops-ops/celld-chart#22).
+  chartVersion: "0.5.0"
+  rustfs:
+    enabled: true
+    credentialsSecretRef:
+      name: mobpit-rustfs-credentials
+  values:
+    extraEnv:
+      - name: SSL_CERT_FILE
+        value: /etc/celld/trust/ca.crt
+    extraVolumes:
+      - name: trust
+        secret:
+          secretName: mobpit-relay-ca
+    extraVolumeMounts:
+      - name: trust
+        mountPath: /etc/celld/trust
+        readOnly: true
+---
+# The relay CA's certificate (never its key) in the fleet's namespace.
+apiVersion: kubernetes.m.crossplane.io/v1alpha1
+kind: Object
+metadata:
+  name: mobpit-relay-ca
+spec:
+  forProvider:
+    manifest:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: mobpit-relay-ca
+        namespace: mobpit-celld
+      type: Opaque
+  references:
+    - patchesFrom:
+        apiVersion: v1
+        kind: Secret
+        name: mobpit-relay-ca
+        namespace: mobpit-system
+        fieldPath: data[ca.crt]
+      toFieldPath: data[ca.crt]
+    - dependsOn:
+        apiVersion: v1
+        kind: Namespace
+        name: mobpit-celld
+  providerConfigRef:
+    name: mobpit
+    kind: ProviderConfig

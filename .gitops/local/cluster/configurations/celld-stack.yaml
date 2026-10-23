@@ -1,0 +1,8 @@
+# First celld-stack release with RustFS (hops-ops/celld-stack#15).
+apiVersion: pkg.crossplane.io/v1
+kind: Configuration
+metadata:
+  name: hops-ops-celld-stack
+spec:
+  package: ghcr.io/hops-ops/celld-stack:v0.10.0
+  skipDependencyResolution: true

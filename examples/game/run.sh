@@ -24,6 +24,9 @@
 #                           the Vite plugin, Svelte HUD, and the settled
 #                           read model from mobpit-service over GraphQL @live
 #                           (`distributed dev server/` runs the service + UI)
+#   ./run.sh build          build what Mob Pit on Hops local loads from this
+#                           checkout (JS SDK, WebAssembly, cells worker);
+#                           the Environment's setup runs it (.gitops/local)
 #   ./run.sh smoke          every demo's smoke tests (Rust bots + headless JS,
 #                           generated clients checked, SvelteKit headless)
 #   ./run.sh list           demos this script knows
@@ -550,6 +553,12 @@ smoke() {
 }
 
 case "${1:-}" in
+	build)
+		ensure_sdk
+		ensure_client
+		ensure_wasm
+		ensure_cells
+		;;
 	smoke) smoke ;;
 	gen) gen "${2:-}" ;;
 	sveltekit) run_sveltekit "${2:-}" "${3:-3}" ;;

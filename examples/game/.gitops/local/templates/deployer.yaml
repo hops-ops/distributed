@@ -1,0 +1,71 @@
+# Deploys the cells worker (rooms + cells, built on the host by
+# `./run.sh build` into examples/game/cells/build) into the mobpit-system
+# fleet, and again whenever that build changes. celld nodes adopt a new
+# deployment in place. The worker's vars get this Environment's secrets and
+# its relay URL (the last Environment to deploy owns the fleet).
+{{- $repo := include "mobpit.repo" . }}
+{{- $game := include "mobpit.game" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mobpit-worker-deployer
+  labels:
+    {{- include "mobpit.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mobpit-worker-deployer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mobpit-worker-deployer
+  template:
+    metadata:
+      labels:
+        {{- include "mobpit.labels" . | nindent 8 }}
+        app.kubernetes.io/name: mobpit-worker-deployer
+      annotations:
+        checksum/script: {{ include (print $.Template.BasePath "/deployer-script.yaml") . | sha256sum }}
+    spec:
+      initContainers:
+        # celld's own CLI, from the fleet's image.
+        - name: celld
+          image: {{ .Values.celld.image }}
+          command: [/bin/sh, -c, 'cp "$(command -v celld)" /tools/celld']
+          volumeMounts:
+            - {name: tools, mountPath: /tools}
+      containers:
+        - name: deployer
+          image: {{ .Values.images.node }}
+          command: [/bin/bash, /deployer/deploy.sh]
+          env:
+            - name: CELLS
+              value: {{ printf "%s/cells" $game | quote }}
+            - name: BUCKET
+              value: {{ .Values.celld.bucket | quote }}
+            - name: ESBUILD_VERSION
+              value: {{ .Values.esbuildVersion | quote }}
+            - name: CELLD_QUEUE_RELAY_URL
+              value: {{ include "mobpit.relayUrl" . | quote }}
+            - name: GAME_TICKET_SECRET
+              valueFrom: {secretKeyRef: {name: mobpit, key: GAME_TICKET_SECRET}}
+            - name: DISTRIBUTED_INTERNAL_SECRET
+              valueFrom: {secretKeyRef: {name: mobpit, key: DISTRIBUTED_INTERNAL_SECRET}}
+          envFrom:
+            # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_ENDPOINT.
+            - secretRef:
+                name: mobpit-rustfs
+          volumeMounts:
+            - {name: source, mountPath: {{ $repo }}, readOnly: true}
+            - {name: tools, mountPath: /tools}
+            - {name: script, mountPath: /deployer}
+      volumes:
+        - name: source
+          hostPath:
+            path: {{ $repo }}
+            type: Directory
+        - name: tools
+          emptyDir: {}
+        - name: script
+          configMap:
+            name: mobpit-worker-deployer

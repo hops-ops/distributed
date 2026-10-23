@@ -1,0 +1,170 @@
+# The Mob Pit pod: the services behind the framework gateway (cargo, from
+# the mounted checkout), Vite (the client, `/` through the gateway) and the
+# HTTPS endpoint of the celld outbox relay (nginx, the relay route only).
+{{- $repo := include "mobpit.repo" . }}
+{{- $game := include "mobpit.game" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mobpit
+  labels:
+    {{- include "mobpit.labels" . | nindent 4 }}
+    app.kubernetes.io/name: mobpit
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mobpit
+  template:
+    metadata:
+      labels:
+        {{- include "mobpit.labels" . | nindent 8 }}
+        app.kubernetes.io/name: mobpit
+      annotations:
+        checksum/relay: {{ include (print $.Template.BasePath "/relay-config.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: services
+          image: {{ .Values.images.rust }}
+          workingDir: {{ $game }}/server
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              exec cargo run --locked --bin game-demos -- mobpit --dev --host 0.0.0.0 --port 2567
+          env:
+            - name: CARGO_TARGET_DIR
+              value: /cache/target
+            - name: CARGO_HOME
+              value: /cache/cargo
+            - name: CELLD_URL
+              value: {{ .Values.celld.url | quote }}
+            - name: PUBLIC_ORIGIN
+              value: {{ printf "https://%s" (include "mobpit.host" .) | quote }}
+            - name: GAME_DEMOS_UI_ORIGIN
+              value: http://127.0.0.1:5173
+            - name: MOBPIT_DATA_DIR
+              value: /cache/data
+            - name: DISTRIBUTED_GAME_SECRET
+              valueFrom: {secretKeyRef: {name: mobpit, key: GAME_TICKET_SECRET}}
+            - name: DISTRIBUTED_INTERNAL_SECRET
+              valueFrom: {secretKeyRef: {name: mobpit, key: DISTRIBUTED_INTERNAL_SECRET}}
+            - name: DG_DEMO_ADMIN_SECRET
+              valueFrom: {secretKeyRef: {name: mobpit, key: DG_DEMO_ADMIN_SECRET}}
+          ports:
+            - name: http
+              containerPort: 2567
+          readinessProbe:
+            tcpSocket: {port: http}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: source, mountPath: {{ $repo }}}
+            - {name: cache, mountPath: /cache}
+        - name: ui
+          image: {{ .Values.images.node }}
+          workingDir: {{ $game }}/client
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              npm ci --no-audit --no-fund
+              exec npx vite --host 127.0.0.1 --port 5173 --strictPort
+          env:
+            # Edits arrive through the host mount; inotify does not see them.
+            - name: CHOKIDAR_USEPOLLING
+              value: "true"
+          volumeMounts:
+            - {name: source, mountPath: {{ $repo }}}
+            # Linux packages, not the host's.
+            - {name: client-node-modules, mountPath: {{ $game }}/client/node_modules}
+        - name: relay
+          image: {{ .Values.images.nginx }}
+          ports:
+            - name: relay
+              containerPort: 8443
+          volumeMounts:
+            - {name: relay-config, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf}
+            - {name: relay-tls, mountPath: /etc/relay-tls, readOnly: true}
+      volumes:
+        - name: source
+          hostPath:
+            path: {{ $repo }}
+            type: Directory
+        - name: cache
+          persistentVolumeClaim:
+            claimName: mobpit-cache
+        - name: client-node-modules
+          emptyDir: {}
+        - name: relay-config
+          configMap:
+            name: mobpit-relay
+        - name: relay-tls
+          secret:
+            secretName: mobpit-relay-tls
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mobpit-cache
+  labels:
+    {{- include "mobpit.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.cache.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.cache.size }}
+---
+# The gateway: the page, its API and the rooms (`/zones/{room}`).
+apiVersion: v1
+kind: Service
+metadata:
+  name: mobpit
+  labels:
+    {{- include "mobpit.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: mobpit
+  ports:
+    - name: http
+      port: 2567
+      targetPort: http
+---
+# The celld outbox relay (HTTPS, cluster-internal).
+apiVersion: v1
+kind: Service
+metadata:
+  name: mobpit-relay
+  labels:
+    {{- include "mobpit.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: mobpit
+  ports:
+    - name: https
+      port: 8443
+      targetPort: relay
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mobpit
+  labels:
+    {{- include "mobpit.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: platform
+      namespace: istio-ingress
+      sectionName: http
+  hostnames:
+    - {{ include "mobpit.host" . | quote }}
+  rules:
+    - backendRefs:
+        - name: mobpit
+          port: 2567
