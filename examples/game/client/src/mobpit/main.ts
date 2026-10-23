@@ -300,6 +300,10 @@ const roomsField = (k: string) => roomsPanel.querySelector(`[data-k="${k}"]`) as
 const toasts = div('pit-toasts', document.body);
 const rooms = new Map<string, RoomStatus>();
 let roomInfo: RoomInfo | undefined;
+/** Recent room info samples (one activation), for the dropped-tick rate. */
+const tickSamples: { at: number; activation: string; dropped: number }[] = [];
+/** Window of the overlay's dropped-tick count. */
+const DROP_WINDOW_MS = 30_000;
 const STATUS_COLOR: Record<string, string> = { active: '#4caf50', dormant: '#f2c94c', hibernated: '#6c7aa0' };
 const BIOME_COLOR = ['#8a8f99', '#c9a86a', '#3f7d4e', '#7fbf6a'];
 
@@ -335,7 +339,16 @@ void pollRooms();
 async function pollRoomInfo(): Promise<void> {
 	for (;;) {
 		const here = pit.room();
-		if (debug && here !== undefined) roomInfo = await pitApi.roomInfo(here).catch(() => roomInfo);
+		if (debug && here !== undefined) {
+			roomInfo = await pitApi.roomInfo(here).catch(() => roomInfo);
+			if (roomInfo !== undefined && roomInfo.zone === here) {
+				const now = performance.now();
+				const last = tickSamples.at(-1);
+				if (last !== undefined && last.activation !== `${roomInfo.zone}/${roomInfo.activation}`) tickSamples.length = 0;
+				tickSamples.push({ at: now, activation: `${roomInfo.zone}/${roomInfo.activation}`, dropped: roomInfo.droppedTicks });
+				while (tickSamples.length > 1 && now - tickSamples[0]!.at > DROP_WINDOW_MS) tickSamples.shift();
+			}
+		}
 		await new Promise((r) => setTimeout(r, 1000));
 	}
 }
@@ -554,7 +567,26 @@ function renderDebug(): void {
 	const node = info.node === '' ? 'unknown (celld does not tell code its node; set CELLD_ZONE_NODES)' : info.node;
 	el.innerHTML = `<b>celld object</b> ${info.zone}<br>node ${node}<br>isolate ${info.isolate} · activation ${info.activation}` +
 		`<br>wakes ${info.wakes} · ${info.restored ? 'restored from snapshot' : 'fresh'} · ${info.players} players` +
-		`<br>tick ${info.hz} Hz · late p50 ${info.lateMs.p50.toFixed(1)} / p99 ${info.lateMs.p99.toFixed(1)} ms`;
+		`<br>tick ${info.hz} Hz · late p50 ${info.lateMs.p50.toFixed(1)} / p99 ${info.lateMs.p99.toFixed(1)} ms` +
+		`<br>${tickHealth(info)}`;
+}
+
+/**
+ * Dropped ticks over the last ~30 s: a room on a degraded celld state shows
+ * a rising count (and a late p99 in the hundreds of ms) before play feels
+ * it. Red past 1 % of the window's ticks.
+ */
+function tickHealth(info: RoomInfo): string {
+	const first = tickSamples[0];
+	const last = tickSamples.at(-1);
+	if (first === undefined || last === undefined || last.at - first.at < 2000) {
+		return `dropped ticks ${info.droppedTicks} (measuring…)`;
+	}
+	const span = last.at - first.at;
+	const recent = last.dropped - first.dropped;
+	const bad = recent > (info.hz * span) / 1000 / 100 || info.lateMs.p99 > 50;
+	const color = bad ? '#ff6b6b' : '#7bd88f';
+	return `<span style="color:${color}">dropped ticks ${recent} in ${Math.round(span / 1000)} s</span> · ${info.droppedTicks} this activation`;
 }
 
 // ---- materials and templates ----
