@@ -60,6 +60,8 @@ const TRANSFER_TTL_SECS: u64 = 30;
 const FACT_CAPACITY: usize = 512;
 /// Retry stored facts this often while any is unsettled (ms).
 const OUTBOX_RETRY_MS: f64 = 10_000.0;
+/// Shortest crash watchdog period (each re-arm is a durable alarm write).
+const WATCHDOG_MIN_MS: f64 = 60_000.0;
 /// Read the dev settings this often while ticking (ms).
 const DEV_SETTINGS_EVERY_MS: f64 = 1_000.0;
 
@@ -396,9 +398,6 @@ struct Snapshot {
 struct TickStats {
     late: Window,
     work: Window,
-    /// Object storage writes (outbox, snapshot): one node acks a write when
-    /// its bucket upload lands.
-    write: Window,
     dropped: u64,
     iterations: u64,
 }
@@ -430,6 +429,11 @@ struct Inner<Z: CelldZone> {
     last_persist_ms: f64,
     /// A snapshot write is in flight (see [`ZoneObject::persist_later`]).
     persisting: bool,
+    /// Players at the last tick; a drop (leave, handoff, grace expired)
+    /// snapshots on that tick, not at the next interval.
+    players_seen: usize,
+    /// A player left since the last snapshot.
+    persist_soon: bool,
     spooled: u64,
     /// Dev network simulation in effect (from the dev settings object).
     net_sim: Option<NetSim>,
@@ -742,6 +746,8 @@ impl<Z: CelldZone> ZoneObject<Z> {
             stats: TickStats::default(),
             last_persist_ms: 0.0,
             persisting: false,
+            players_seen: 0,
+            persist_soon: false,
             spooled: 0,
             net_sim: None,
             out_lines: HashMap::new(),
@@ -960,6 +966,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             if let Some(since) = since {
                 let wait = since + hibernate_after.as_millis() as f64 - now_ms();
                 self.arm(wait.max(10.0)).await;
+            } else if let Some(watchdog) = self.watchdog_ms() {
+                // Still ticking: keep the crash watchdog (see `tick_loop`).
+                self.arm(watchdog).await;
             }
         }
         self.arm_outbox().await;
@@ -1572,7 +1581,13 @@ impl<Z: CelldZone> ZoneObject<Z> {
             (options.tick_hz, options.persist_every.as_millis() as f64)
         };
         let mut schedule = TickSchedule::new(now_ms(), hz);
-        self.arm_later(persist_every * 3.0);
+        // Crash watchdog: if this activation dies while awake, the alarm
+        // wakes a fresh one that reports the room asleep. Armed once here and
+        // again from `alarm` while ticking — never per snapshot: each
+        // `set_alarm` leaves a wake entry celld scans when it starts.
+        if let Some(watchdog) = self.watchdog_ms() {
+            self.arm_later(watchdog);
+        }
         loop {
             Delay::from(Duration::from_micros(
                 (schedule.wait_ms(now_ms()) * 1000.0) as u64,
@@ -1587,6 +1602,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     return;
                 };
                 let report = host.advance();
+                let players = host.player_count();
+                if players < inner.players_seen {
+                    inner.persist_soon = true;
+                }
+                inner.players_seen = players;
                 inner.flush();
                 let stats = &mut inner.stats;
                 stats.iterations += 1;
@@ -1597,7 +1617,8 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     queue.drain();
                 }
                 let stop = !inner.occupied();
-                let persist = stop || woke - inner.last_persist_ms >= persist_every;
+                let persist =
+                    stop || inner.persist_soon || woke - inner.last_persist_ms >= persist_every;
                 if stop {
                     inner.ticking = false;
                 }
@@ -1615,7 +1636,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 return;
             }
             if persist {
-                self.persist_later(persist_every * 3.0);
+                self.persist_later();
             }
         }
     }
@@ -1627,23 +1648,21 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let snapshot = {
             let mut inner = self.inner.borrow_mut();
             inner.last_persist_ms = now_ms();
+            inner.persist_soon = false;
             inner.snapshot()
         };
         if let Some(snapshot) = snapshot {
-            let started = now_ms();
             if let Err(e) = self.state.storage().put(SNAPSHOT_KEY, snapshot).await {
                 worker::console_error!("zone snapshot write failed: {e}");
             }
-            self.inner.borrow_mut().stats.write.push(now_ms() - started);
         }
     }
 
-    /// [`persist`](Self::persist) and re-arm the alarm `arm_ms` from now,
-    /// off the tick loop. One snapshot write at a time: while one is in
-    /// flight a due tick leaves it to a later tick. Spawned after the
-    /// tick's [`spool_later`](Self::spool_later), so the outbox write is
-    /// issued before the snapshot that reflects it.
-    fn persist_later(&self, arm_ms: f64) {
+    /// [`persist`](Self::persist) off the tick loop. One snapshot write at
+    /// a time: while one is in flight a due tick leaves it to a later tick.
+    /// Spawned after the tick's [`spool_later`](Self::spool_later), so the
+    /// outbox write is issued before the snapshot that reflects it.
+    fn persist_later(&self) {
         {
             let mut inner = self.inner.borrow_mut();
             if inner.persisting {
@@ -1654,7 +1673,6 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let this = self.handle();
         wasm_bindgen_futures::spawn_local(async move {
             this.persist().await;
-            this.arm(arm_ms).await;
             this.inner.borrow_mut().persisting = false;
         });
     }
@@ -1708,7 +1726,6 @@ impl<Z: CelldZone> ZoneObject<Z> {
             return;
         }
         let storage = self.state.storage();
-        let started = now_ms();
         // One batched write (the storage API takes at most 128 keys).
         for chunk in facts.chunks(128) {
             let batch = js_sys::Object::new();
@@ -1724,11 +1741,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 worker::console_error!("fact outbox write failed: {e}");
             }
         }
-        {
-            let mut inner = self.inner.borrow_mut();
-            inner.spooled += facts.len() as u64;
-            inner.stats.write.push(now_ms() - started);
-        }
+        self.inner.borrow_mut().spooled += facts.len() as u64;
         self.arm_outbox().await;
     }
 
@@ -1756,6 +1769,15 @@ impl<Z: CelldZone> ZoneObject<Z> {
         {
             worker::console_error!("zone alarm: {e}");
         }
+    }
+
+    /// The crash watchdog's period while ticking (three snapshot
+    /// intervals, at least a minute), when configured and ticking.
+    fn watchdog_ms(&self) -> Option<f64> {
+        let inner = self.inner.borrow();
+        let options = inner.options.as_ref()?;
+        (inner.ticking && inner.host.is_some())
+            .then(|| (options.persist_every.as_millis() as f64 * 3.0).max(WATCHDOG_MIN_MS))
     }
 
     /// [`arm`](Self::arm) off the caller's path.
@@ -1848,11 +1870,6 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 "freeze": format!("{:?}", h.freeze_state()).to_lowercase(),
             })),
             "workMs": { "p50": stats.work.percentile(0.5), "p99": stats.work.percentile(0.99) },
-            "writeMs": {
-                "p50": stats.write.percentile(0.5),
-                "p99": stats.write.percentile(0.99),
-                "max": stats.write.percentile(1.0),
-            },
         })
     }
 }

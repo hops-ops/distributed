@@ -53,7 +53,7 @@
     // from .dev.vars (the launcher shares it with the ticket issuer).
     "ZONE_TICK_HZ": "30",
     "ZONE_PATCH_HZ": "20",
-    "ZONE_PERSIST_MS": "5000",
+    "ZONE_PERSIST_MS": "60000",
     "ZONE_HIBERNATE_AFTER_MS": "10000",
     "ZONE_FACT_SERVICE": "mobpit-rooms",
     // Dev demo: rooms apply the network simulation of the HUD sliders

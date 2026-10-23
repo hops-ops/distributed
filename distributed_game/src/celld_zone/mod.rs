@@ -8,7 +8,7 @@
 //! client ──WebSocket /rooms/{zone}──▶ any celld node ──forward──▶ the zone's object
 //!                                                         │ ZoneHost<Z> (this activation)
 //!         Hello(ticket | transfer ticket | reconnect token) ┤ deadline tick loop while occupied
-//!                                                         │ snapshot every few s + when empty
+//!                                                         │ snapshot every min + on leave/empty
 //!                     facts (outbox in object storage) ───┼──▶ cell objects (CommandFactSink
 //!                                                         │     over CelldObjectHost, exactly once)
 //!     zone_activity.record (active / dormant / hibernated)┘──▶ zone-activity/{zone} cell
@@ -27,8 +27,9 @@
 //!   [`ZoneHost::advance`](crate::ZoneHost::advance) while anyone is
 //!   connected, and stops when the zone is empty.
 //! - **State.** The zone's [`Zone::hibernate`] snapshot is written to object
-//!   storage every `ZONE_PERSIST_MS` while occupied and when the last
-//!   player leaves (`dormant`); after `ZONE_HIBERNATE_AFTER_MS` empty (an
+//!   storage every `ZONE_PERSIST_MS` (60 s) while occupied, on the tick a
+//!   player leaves (leave, handoff, grace expired) and when the last one
+//!   does (`dormant`); after `ZONE_HIBERNATE_AFTER_MS` empty (an
 //!   object alarm, so it survives eviction) the zone is dropped from memory
 //!   (`hibernated`). The next join wakes it and restores the snapshot.
 //! - **Restarts.** A socket that outlives its activation (eviction, a move,
