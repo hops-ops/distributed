@@ -1,8 +1,8 @@
 # The Mob Pit pod: the services behind the framework gateway (cargo, from
 # the mounted checkout) and Vite (the client, `/` through the gateway).
-# The pod is in the Istio ambient mesh, like celld's namespace, so the celld
-# outbox relay (`/internal/celld-queue/relay` on the `mobpit` Service) is
-# mTLS between the two (the worker opts in with CELLD_QUEUE_RELAY_MESH).
+# The pod has an Istio sidecar, like the celld pods, so the celld outbox
+# relay (`/internal/celld-queue/relay` on the `mobpit` Service) is mTLS
+# between the two (the worker opts in with CELLD_QUEUE_RELAY_MESH).
 {{- $repo := include "mobpit.repo" . }}
 {{- $game := include "mobpit.game" . }}
 apiVersion: apps/v1
@@ -24,7 +24,9 @@ spec:
       labels:
         {{- include "mobpit.labels" . | nindent 8 }}
         app.kubernetes.io/name: mobpit
-        istio.io/dataplane-mode: ambient
+        sidecar.istio.io/inject: "true"
+      annotations:
+        proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
     spec:
       containers:
         - name: services

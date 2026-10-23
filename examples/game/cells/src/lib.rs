@@ -786,7 +786,7 @@ fn relay(env: &Env) -> std::result::Result<CelldQueueRelay<CelldQueueHttpPublish
     let endpoint = var("CELLD_QUEUE_RELAY_URL")?;
     let secret = var(CELL_INTERNAL_SECRET_ENV)?;
     // `http://127.0.0.1` relays are dev-only. `CELLD_QUEUE_RELAY_MESH=1`
-    // (Hops local: celld and Mob Pit in Istio ambient) allows HTTP to a
+    // (Hops local: celld and Mob Pit with Istio sidecars) allows HTTP to a
     // cluster Service. Anything else must be HTTPS.
     let local =
         endpoint.starts_with("http://127.0.0.1") || endpoint.starts_with("http://localhost");

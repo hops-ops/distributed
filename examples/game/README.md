@@ -160,18 +160,19 @@ hops local env enable distributed-mobpit-world
 
 - **`mobpit-system`** (`.gitops/local/mobpit-system.yaml`, manifests in
   `.gitops/mobpit-system/`): a `CelldStack` (celld-stack, RustFS) in
-  namespace `mobpit-celld`, enrolled in the Istio ambient mesh. Shared by
+  namespace `mobpit-celld`; its celld pods carry Istio sidecars. Shared by
   every Mob Pit Environment; the last one to deploy its worker owns it.
 - **The Environment** (`.gitops/local/mobpit.yaml`, chart
   `.gitops/local/`): its setup (`scripts/hops/mobpit-setup.sh`) runs
   `./run.sh build` on the host (JS SDK, WebAssembly, cells worker) and makes
-  the Environment's secrets. The pod (ambient too) runs the services +
+  the Environment's secrets. The pod (sidecar too) runs the services +
   gateway (`cargo run` from the mounted checkout; target dir on a PVC) and
   Vite (`/` through the gateway). A deployer `celld deploy`s the worker
   whenever `cells/build` changes, with this Environment's secrets and relay
   URL.
-- Outbox relay: celld → `http://mobpit.<ns>.svc.cluster.local:2567` over
-  ztunnel mTLS. The worker opts in with `CELLD_QUEUE_RELAY_MESH=1`
+- Outbox relay: celld → `http://mobpit.<ns>.svc.cluster.local:2567`, mTLS
+  between the sidecars (not ambient: kind-hops' Dory kernel has no IPv6
+  policy routing, which istio-cni's ambient redirection needs). The worker opts in with `CELLD_QUEUE_RELAY_MESH=1`
   (`CelldQueueHttpPublisher::new_mesh`: HTTP only to `*.svc` hosts);
   without it the relay must be HTTPS.
 - Traffic: browser → Dory (TLS) → Istio Gateway `platform` → HTTPRoute

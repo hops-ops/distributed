@@ -3,8 +3,10 @@
 # http://celld.mobpit-celld.svc.cluster.local:8080. Each Mob Pit
 # Environment deploys the cells worker into it (the last deploy wins).
 #
-# The namespace is in the Istio ambient mesh, like the Mob Pit pods: the
-# worker's outbox relay to a Mob Pit Service is mTLS through ztunnel.
+# The celld pods get Istio sidecars, like the Mob Pit pods: the worker's
+# outbox relay to a Mob Pit Service is mTLS between them. (kind-hops can't
+# run ambient: istio-cni needs IPv6 policy routing, which the Dory kernel
+# lacks. RustFS stays out of the mesh.)
 apiVersion: hops.ops.com.ai/v1alpha1
 kind: CelldStack
 metadata:
@@ -14,9 +16,13 @@ spec:
   clusterName: mobpit
   namespace: mobpit-celld
   releaseName: celld
-  labels:
-    istio.io/dataplane-mode: ambient
   rustfs:
     enabled: true
     credentialsSecretRef:
       name: mobpit-rustfs-credentials
+  values:
+    podLabels:
+      sidecar.istio.io/inject: "true"
+    podAnnotations:
+      # celld reaches RustFS as it starts.
+      proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'

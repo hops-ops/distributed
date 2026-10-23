@@ -256,7 +256,7 @@ impl CelldQueueHttpPublisher {
     }
 
     /// Build a publisher for a relay inside a service mesh that encrypts
-    /// pod-to-pod traffic (for example Istio ambient mTLS).
+    /// pod-to-pod traffic (for example Istio sidecar or ambient mTLS).
     ///
     /// Cleartext is allowed only to a cluster Service host
     /// (`*.svc.cluster.local` or `*.svc`); anything else must be HTTPS. The
