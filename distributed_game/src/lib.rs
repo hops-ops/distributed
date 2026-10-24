@@ -44,7 +44,8 @@
 //!   barrier / safe-room policy.
 //!
 //! # Extension seams (later phases)
-//! Metrics hook [`AdvanceReport`] and [`replication::DeltaStats`].
+//! Metrics hook [`AdvanceReport`] and [`replication::DeltaStats`]; plain
+//! work counts in [`WorkCounters`] ([`work`]).
 
 #![warn(missing_docs)]
 
@@ -96,6 +97,7 @@ pub mod surface;
 pub mod ticket;
 pub mod timers;
 pub mod timestep;
+pub mod work;
 pub mod world;
 pub mod zone;
 
@@ -132,6 +134,7 @@ pub use stamp::{stamp_metadata, FactStamp};
 pub use surface::GameSurface;
 pub use timers::TimerId;
 pub use timestep::FixedTimestep;
+pub use work::WorkCounters;
 pub use world::{BarrierMode, ChildEvent, FreezeState, StalePolicy};
 pub use zone::{
     Admission, ClientId, JoinRequest, LeaveReason, ObserverId, ObserverInfo, PlayerId, PlayerInfo,

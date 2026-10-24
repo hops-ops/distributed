@@ -18,6 +18,7 @@ use crate::cell::{fact_session_from_headers, run_fact_batch};
 use crate::world::content_rollout::{mount_content_rollout, ContentRollout};
 use crate::world::watch::{
     parse_watcher_address, topic, watch_query, WatchUpdate, Watchers, PUSH_CONCURRENCY, PUSH_ROUTE,
+    STATS_ROUTE,
 };
 use crate::world::zone_activity::{mount_zone_activity, ZoneActivity};
 
@@ -213,7 +214,9 @@ impl CellWatchers {
 
     /// [`serve_cell`], plus: a read with `?watch=` leaves a lease and its
     /// body carries the cell's `version`; a command that changed the view
-    /// is pushed to the live watchers.
+    /// is pushed to the live watchers; `GET /{kind}/{shard}/__watchers`
+    /// ([`STATS_ROUTE`]) answers the live watchers and
+    /// [`WatcherStats`](crate::world::watch::WatcherStats).
     pub async fn serve<A, F>(
         &self,
         env: &Env,
@@ -231,6 +234,9 @@ impl CellWatchers {
                 return error_response(error);
             }
             let url = req.url()?;
+            if url.path().ends_with(&format!("/{STATS_ROUTE}")) {
+                return json_status(self.stats(), 200);
+            }
             if let Some((watcher, lease)) = url.query().and_then(watch_query) {
                 self.watchers.borrow_mut().watch(&watcher, now_ms(), lease);
             }
@@ -248,6 +254,11 @@ impl CellWatchers {
             self.publish(env, cell, &read).await;
         }
         response
+    }
+
+    /// The live watchers and what the cell did for them.
+    fn stats(&self) -> Value {
+        stats_body(&self.topic, &mut self.watchers.borrow_mut())
     }
 
     /// [`cell_alarm`], then a push if a schedule moved the version.
@@ -277,8 +288,12 @@ impl CellWatchers {
             return;
         };
         let version = crate::world::watch::view_version(&view);
-        if !self.watchers.borrow_mut().publish(version, &view) {
-            return;
+        {
+            let mut watchers = self.watchers.borrow_mut();
+            if !watchers.publish(version, &view) {
+                return;
+            }
+            watchers.pushed(live.len());
         }
         let update = WatchUpdate {
             topic: self.topic.clone(),
@@ -287,6 +302,16 @@ impl CellWatchers {
         };
         push_all(env.clone(), live, update);
     }
+}
+
+/// `{topic, live, ...WatcherStats}`.
+fn stats_body(topic: &str, watchers: &mut Watchers) -> Value {
+    let mut body = serde_json::to_value(watchers.stats()).unwrap_or_else(|_| json!({}));
+    if let Value::Object(fields) = &mut body {
+        fields.insert("topic".into(), json!(topic));
+        fields.insert("live".into(), json!(watchers.live(now_ms()).len()));
+    }
+    body
 }
 
 /// `read(cell)` with the aggregate's version in its `version` field.
@@ -455,7 +480,14 @@ impl ZoneDevSettings {
         const VERSION: &str = "version";
         match req.method() {
             Method::Get => {
-                if let Some((watcher, lease)) = req.url()?.query().and_then(watch_query) {
+                let url = req.url()?;
+                if url.path().ends_with(&format!("/{STATS_ROUTE}")) {
+                    return json_status(
+                        stats_body(&self.topic, &mut self.watchers.borrow_mut()),
+                        200,
+                    );
+                }
+                if let Some((watcher, lease)) = url.query().and_then(watch_query) {
                     self.watchers.borrow_mut().watch(&watcher, now_ms(), lease);
                 }
                 let stored: Option<Value> = self.state.storage().get(KEY).await.ok().flatten();
@@ -499,6 +531,7 @@ impl ZoneDevSettings {
                     fields.insert(VERSION.into(), json!(version));
                 }
                 if !live.is_empty() && self.watchers.borrow_mut().publish(version, &view) {
+                    self.watchers.borrow_mut().pushed(live.len());
                     push_all(
                         self.env.clone(),
                         live,

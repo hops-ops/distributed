@@ -176,6 +176,9 @@ pub struct AdvanceReport {
     pub entities: Option<usize>,
     /// One entry per Delta frame built.
     pub frames: Vec<FrameStats>,
+    /// Entity records encoded by the patches
+    /// ([`EncodedWorld::encodes`]: shared across clients).
+    pub encodes: usize,
     /// Settlements delivered to the zone, with the tick they were delivered on.
     pub settled: Vec<(u64, FactSettlement)>,
     /// `(tick, state hash)` after each tick, when
@@ -2073,6 +2076,7 @@ impl<Z: Zone> ZoneHost<Z> {
             });
         }
         core.outbound.extend(frames);
+        self.pending.encodes += world.encodes();
         self.last_world = Some(world);
     }
 
@@ -2162,6 +2166,7 @@ impl<Z: Zone> ZoneHost<Z> {
         report.tick_durations.extend(pending.tick_durations);
         report.entities = pending.entities;
         report.frames.extend(pending.frames);
+        report.encodes += pending.encodes;
         report.settled.extend(pending.settled);
         report.tick_hashes.extend(pending.tick_hashes);
         report
