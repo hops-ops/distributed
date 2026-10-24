@@ -418,6 +418,21 @@ client already has:
   (4 KiB). Creates and updates compete by priority (kind × entity ×
   field × nearness). Anything deferred builds up priority, so it is always
   sent eventually.
+- **Update rates.** Far entities are updated less often: within half the
+  view radius every patch, up to 0.8 of it every 2nd patch, beyond that
+  every 4th (`HostConfig::interest.update_rates`, staggered by entity id,
+  so a far entity's latest state is at most 3 patches late). Creates,
+  removes and global entities are never held, nor are kinds marked
+  `#[replicated(.., every_patch)]`; keep your own entity near the view
+  centre (it is when the view follows the player) or mark its kind.
+  `UpdateRates::every_patch()` turns the rates off.
+- **Encoded once.** Each changed entity's update is encoded once per patch
+  and copied into every Delta of a client that was current; clients
+  further behind (budget or update rates) share one encoding per
+  baseline. The bytes are exactly those of a per-client encoding (a
+  randomized test checks it), so a dense room's cost per client is
+  selection and copying: 128 mutually visible players build a patch
+  about 5× faster than encoding per client.
 - **Events** carry one-off messages such as "kill", "saved" or "weather
   changed" next to the Deltas. Declare them as a `#[derive(GameEvent)]`
   enum (each variant `#[game_event(id = N)]`: unit, named fields, or one
@@ -997,6 +1012,11 @@ unlimited rewind.
   client last received, which only works because nothing is lost or
   reordered. Loss shows up as delay, which the adaptive interpolation
   absorbs.
+- **Shared encodings, per-client baselines.** Deltas stay per client
+  (each knows only what it was sent), but each distinct entity state and
+  each update between two states is encoded once and shared, so dense
+  rooms pay for copying, not encoding. Lowering far update rates on top
+  is a server choice: the wire and the client are unchanged.
 
 ## Status and limits
 

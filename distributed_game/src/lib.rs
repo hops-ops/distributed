@@ -119,7 +119,7 @@ pub use handoff::{HandoffError, HandoffRequest, Transfer};
 pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};
 pub use inbox::{Delivered, NoMessages, ZoneInbound};
 pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, SequencedInput};
-pub use interest::{InterestConfig, View};
+pub use interest::{InterestConfig, UpdateRates, View};
 pub use prediction::{PredictContext, PredictStep};
 pub use protocol::{ClientMessage, ClientMirror, Role, ServerMessage, PROTOCOL_VERSION};
 pub use pure::GamePure;

@@ -841,6 +841,9 @@ pub struct ZoneHost<Z: Zone> {
     token_source: Box<dyn FnMut() -> String + Send>,
     pending: AdvanceReport,
     hash_ticks: bool,
+    /// The last patch's world: the next one shares its unchanged entities
+    /// and encodes each change once for every client.
+    last_world: Option<EncodedWorld>,
 }
 
 macro_rules! hook {
@@ -917,6 +920,7 @@ impl<Z: Zone> ZoneHost<Z> {
             token_source: Box::new(default_token),
             pending: AdvanceReport::default(),
             hash_ticks: false,
+            last_world: None,
         };
         host.process_kicks();
         host
@@ -1975,7 +1979,11 @@ impl<Z: Zone> ZoneHost<Z> {
         let view = self.world_view();
         let core = &mut self.core;
         self.pending.entities = Some(view.entities().len());
-        let world = EncodedWorld::build(&self.schema, view, &core.config.interest);
+        let interest = &core.config.interest;
+        let world = match self.last_world.take() {
+            Some(last) => last.next(&self.schema, view, interest),
+            None => EncodedWorld::build(&self.schema, view, interest),
+        };
         let tick = core.tick as u32;
         let budget = core.config.byte_budget;
         let mut frames = Vec::with_capacity(core.clients.len());
@@ -2010,6 +2018,7 @@ impl<Z: Zone> ZoneHost<Z> {
             });
         }
         core.outbound.extend(frames);
+        self.last_world = Some(world);
     }
 
     /// Run due ticks and patches for the time elapsed on the clock.

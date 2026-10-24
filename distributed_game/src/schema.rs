@@ -357,6 +357,9 @@ pub struct KindDef {
     pub fields: Vec<FieldDef>,
     /// Server-side priority multiplier (not sent on the wire).
     pub priority: f32,
+    /// Exempt from distance-based update rates
+    /// ([`UpdateRates`](crate::UpdateRates); server-side, not on the wire).
+    pub every_patch: bool,
 }
 
 impl KindDef {
@@ -367,6 +370,7 @@ impl KindDef {
             name: name.into(),
             fields: Vec::new(),
             priority: 1.0,
+            every_patch: false,
         }
     }
 
@@ -405,6 +409,12 @@ impl KindDef {
     /// Set the kind priority multiplier.
     pub fn priority(mut self, p: f32) -> Self {
         self.priority = p;
+        self
+    }
+
+    /// Update every patch at any distance (no distance-based rates).
+    pub fn every_patch(mut self) -> Self {
+        self.every_patch = true;
         self
     }
 }

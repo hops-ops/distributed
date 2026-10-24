@@ -425,6 +425,9 @@ update  := varuint id, varuint mask, value(field_i) for each set bit i, ascendin
   accumulator; the highest accumulators are sent first and reset;
   deferred entities keep accumulating, so none starve. At least one
   candidate is sent per Delta. Removes are never budgeted.
+- Update rates (default): a changed, already-known, non-global entity
+  beyond half the radius is a candidate only every 2nd patch, beyond 0.8
+  of it every 4th. Clients see this only as less frequent updates.
 
 ### 7.4 Worked example
 
