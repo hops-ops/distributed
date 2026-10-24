@@ -14,11 +14,19 @@ data:
     last=""
     while true; do
       # The build's outputs and the worker config; empty until built.
-      stamp="$(stat -c '%n %Y %s' "$CELLS/wrangler.jsonc" "$CELLS"/build/worker/* "$CELLS"/build/*.wasm "$CELLS"/build/*.js 2>/dev/null | sha256sum)"
+      # A failed read (missing build, host share I/O error) skips the round.
+      if ! stamp="$(stat -c '%n %Y %s' "$CELLS/wrangler.jsonc" "$CELLS"/build/worker/* "$CELLS"/build/*.wasm "$CELLS"/build/*.js | sha256sum)"; then
+        sleep 3
+        continue
+      fi
       if [ -f "$CELLS/build/worker/shim.mjs" ] && [ "$stamp" != "$last" ]; then
         rm -rf /tmp/worker && mkdir -p /tmp/worker
-        cp -R "$CELLS/build" /tmp/worker/build
-        node /deployer/wrangler.mjs "$CELLS/wrangler.jsonc" /tmp/worker/wrangler.json
+        if ! cp -R "$CELLS/build" /tmp/worker/build ||
+          ! node /deployer/wrangler.mjs "$CELLS/wrangler.jsonc" /tmp/worker/wrangler.json; then
+          echo "reading the build failed; retrying" >&2
+          sleep 3
+          continue
+        fi
         echo "deploying the cells worker to $BUCKET"
         if celld deploy /tmp/worker --bucket "$BUCKET"; then
           last="$stamp"
