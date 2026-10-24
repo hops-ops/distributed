@@ -233,8 +233,10 @@ factsPanel.innerHTML = `<h2>Durable facts</h2>
 const graph = factsPanel.querySelector('canvas') as HTMLCanvasElement;
 const field = (k: string) => factsPanel.querySelector(`[data-k="${k}"]`) as HTMLElement;
 const deathBanner = div('pit-death', document.body);
-// The borough's world event (scheduled by its cell): a banner while it runs.
-const eventBanner = div('pit-event', document.body);
+// Top centre, one column: the borough's world event (scheduled by its cell;
+// a banner while it runs), then the toasts under it.
+const topStack = div('pit-top', document.body);
+const eventBanner = div('pit-event', topStack);
 eventBanner.style.display = 'none';
 const EVENT_TEXT: Record<string, string> = {
 	invasion: 'INVASION — the mobs of this borough come at you from afar and rise again at once',
@@ -297,7 +299,7 @@ roomsPanel.innerHTML = `<h2>Rooms <small data-k="here"></small></h2>
 	<div class="pit-debug" data-k="debug"></div>`;
 const roomsMap = roomsPanel.querySelector('canvas') as HTMLCanvasElement;
 const roomsField = (k: string) => roomsPanel.querySelector(`[data-k="${k}"]`) as HTMLElement;
-const toasts = div('pit-toasts', document.body);
+const toasts = div('pit-toasts', topStack);
 const rooms = new Map<string, RoomStatus>();
 let roomInfo: RoomInfo | undefined;
 /** Recent room info samples (one activation), for the dropped-tick rate. */

@@ -158,16 +158,27 @@
 	color: var(--muted);
 	word-break: break-word;
 }
-.pit-toasts {
+/* Top centre: the world event banner, then the toasts (never overlapping);
+   clear of the facts panel on the right. */
+.pit-top {
 	position: fixed;
 	top: 12px;
 	left: 50%;
 	transform: translateX(-50%);
+	width: max-content;
+	max-width: max(280px, calc(100vw - 2 * 310px));
 	display: flex;
 	flex-direction: column;
+	align-items: center;
 	gap: 6px;
 	pointer-events: none;
 	z-index: 10;
+}
+.pit-toasts {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 6px;
 }
 .pit-toast {
 	padding: 8px 14px;
@@ -181,17 +192,12 @@
 }
 
 .pit-event {
-	position: fixed;
-	top: 12px;
-	left: 50%;
-	transform: translateX(-50%);
 	padding: 8px 16px;
 	border-radius: 6px;
 	background: rgba(120, 30, 160, 0.85);
 	color: #fff;
 	font-weight: 600;
-	pointer-events: none;
-	z-index: 5;
+	text-align: center;
 }
 
 .pit-crosshair {
