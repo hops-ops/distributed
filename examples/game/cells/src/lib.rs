@@ -49,9 +49,8 @@
 
 use distributed::bus::{CelldQueueEnvelope, CelldQueueHttpPublisher, CelldQueueRelay};
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CellDispatchError, CellWaitPathRequest, CelldOutbox,
-    InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
-    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
+    AggregateCell, CellDispatchError, CelldOutbox, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,
+    CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::microsvc::{
@@ -60,7 +59,8 @@ use distributed::microsvc::{
 use distributed::{sourced, Aggregate, Entity};
 use distributed_game::cell::{fact_session_from_headers, session_stamp};
 use distributed_game::celld_zone::{
-    forward_to_zone, CellWatchers, ContentRolloutCell, ZoneActivityCell, ZoneDevSettings,
+    forward_to_zone, serve_cell, CellWatchers, ContentRolloutCell, ZoneActivityCell,
+    ZoneDevSettings,
 };
 use distributed_game::lifecycle::{
     Lifecycle, CONNECTION_LOST, PLAYER_DISCONNECTED, PLAYER_JOINED, PLAYER_LEFT, PLAYER_RECONNECTED,
@@ -247,89 +247,6 @@ fn fact_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
     fact_session_from_headers(header)
 }
 
-type Sessions = fn(&dyn Fn(&str) -> Option<String>) -> Option<Session>;
-
-async fn dispatch<A>(
-    env: &Env,
-    cell: &AggregateCell<A>,
-    command: &str,
-    req: &mut Request,
-    sessions: Sessions,
-) -> Result<Response>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
-    let body: Value = match req.json().await {
-        Ok(body) => body,
-        Err(_) => return error_response(CellDispatchError::BadRequest("invalid JSON".into())),
-    };
-    let parsed = match CellWaitPathRequest::parse(body) {
-        Ok(parsed) => parsed,
-        Err(error) => return error_response(CellDispatchError::BadRequest(error)),
-    };
-    let header = |name: &str| req.headers().get(name).ok().flatten();
-    let identity = match (
-        header(CELL_SERVICE_ID_HEADER),
-        header(CELL_PRINCIPAL_PARTITION_HEADER),
-    ) {
-        (Some(service), Some(partition)) => {
-            match CellCommandIdentity::new(service, partition, &parsed.command_id) {
-                Ok(identity) => identity,
-                Err(error) => return error_response(error),
-            }
-        }
-        _ => return error_response(CellDispatchError::Unauthorized),
-    };
-    let Some(session) = sessions(&header) else {
-        return error_response(CellDispatchError::Forbidden);
-    };
-    let result = cell
-        .dispatch_idempotent(command, &identity, parsed.input, session)
-        .await;
-    if let Err(error) = cell.drain_outbox(env).await {
-        worker::console_error!("post-commit drain deferred: {error}");
-    }
-    match result {
-        Ok(dispatch) => json_status(dispatch.wait_path_wire(), 200),
-        Err(error) => error_response(error),
-    }
-}
-
-/// `GET /{kind}/{shard}` → `read(cell)`; `POST /{kind}/{shard}/{command}`.
-async fn route<A, F>(
-    env: &Env,
-    cell: &AggregateCell<A>,
-    mut req: Request,
-    read: F,
-    sessions: Sessions,
-) -> Result<Response>
-where
-    A: Aggregate + Send + Sync + 'static,
-    F: AsyncFnOnce(&AggregateCell<A>) -> std::result::Result<Value, String>,
-{
-    if let Err(error) = authenticate(&req, env) {
-        return error_response(error);
-    }
-    let url = req.url()?;
-    let parts: Vec<String> = url
-        .path()
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect();
-    match (req.method(), parts.get(2)) {
-        (Method::Get, None) => match read(cell).await {
-            Ok(body) => json_status(body, 200),
-            Err(error) => error_response(CellDispatchError::Internal(error)),
-        },
-        (Method::Post, Some(command)) => {
-            let command = command.clone();
-            dispatch(env, cell, &command, &mut req, sessions).await
-        }
-        _ => json_status(json!({ "error": "not found" }), 404),
-    }
-}
-
 async fn read_crawler(cell: &AggregateCell<Crawler>) -> std::result::Result<Value, String> {
     let state = cell.load().await.map_err(|error| error.to_string())?;
     let mut kills = Vec::new();
@@ -383,7 +300,7 @@ impl DurableObject for CrawlerCell {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_crawler, fact_session).await
+        serve_cell(&self.env, &self.cell, req, read_crawler, fact_session).await
     }
 
     async fn alarm(&self) -> Result<Response> {
@@ -412,7 +329,7 @@ impl DurableObject for PresenceCell {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_presence, fact_session).await
+        serve_cell(&self.env, &self.cell, req, read_presence, fact_session).await
     }
 
     async fn alarm(&self) -> Result<Response> {

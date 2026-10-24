@@ -26,9 +26,10 @@ use super::plan::{
     cell_binding, classify_wait_path, zone_from_path, ObjectOptions, RoomState, StoredFact,
     TickSchedule, Window, CLOSE_RESTARTED, NETSIM_SHARD, OUTBOX_PREFIX, ZONE_DEV_KIND, ZONE_HEADER,
 };
-use crate::command_sink::{CommandFactSink, FactCall, FactHost, FactRoute};
+use crate::command_sink::{CommandFactSink, FactBatchHost, FactCall, FactHost, FactRoute};
 use crate::facts::{
-    fact_channel, BoxFuture, Fact, FactError, FactQueue, FactReceipt, FactSink, RetryPolicy,
+    fact_channel, BoxFuture, Fact, FactBatchSink, FactError, FactQueue, FactReceipt, FactSink,
+    RetryPolicy,
 };
 use crate::handoff::{HandoffRequest, Transfer};
 use crate::inbox::ZoneInbound;
@@ -293,8 +294,8 @@ impl CelldObjectHost {
 
     /// `calls` (one aggregate) in one `POST /{kind}/{shard}/__batch`
     /// ([`super::cells::serve_cell`]); each entry carries its own command
-    /// id, principal and stamp. A cell without the route gets them one by
-    /// one.
+    /// id, principal and stamp. A cell without the route, or one refusing
+    /// the batch request as a whole (4xx), gets them one by one.
     async fn post_batch(
         &self,
         calls: Vec<FactCall<'_>>,
@@ -340,7 +341,10 @@ impl CelldObjectHost {
             )
             .await;
         match sent {
-            Ok((404, _)) => {
+            // No batch route (404; a cell serving only commands answers
+            // `__batch` 400), or the batch itself refused: each fact gets
+            // its own answer, never the first fact the batch's.
+            Ok((status, _)) if (400..500).contains(&status) && !matches!(status, 408 | 429) => {
                 let mut results = Vec::with_capacity(calls.len());
                 for call in &calls {
                     let result = self.post(call).await;
@@ -413,12 +417,14 @@ impl FactHost for CelldObjectHost {
         Box::pin(SendFuture::new(async move { self.post(&call).await }))
     }
 
-    /// Any number: one `__batch` request per cell (the feed's
-    /// `ZONE_FACT_BATCH` bounds it).
-    fn max_fact_batch(&self) -> usize {
-        usize::MAX
+    /// One `__batch` request per cell (the feed's `ZONE_FACT_BATCH` bounds
+    /// it).
+    fn fact_batches(&self) -> Option<&dyn FactBatchHost> {
+        Some(self)
     }
+}
 
+impl FactBatchHost for CelldObjectHost {
     fn dispatch_fact_batch<'a>(
         &'a self,
         calls: Vec<FactCall<'a>>,
@@ -471,10 +477,13 @@ impl FactSink for DurableFacts {
         }))
     }
 
-    fn max_batch(&self) -> usize {
-        self.sink.max_batch()
+    /// Batches when the cells take them.
+    fn batches(&self) -> Option<&dyn FactBatchSink> {
+        self.sink.batches().map(|_| self as &dyn FactBatchSink)
     }
+}
 
+impl FactBatchSink for DurableFacts {
     /// One batched delete for the facts the batch settled.
     fn commit_batch<'a>(
         &'a self,
