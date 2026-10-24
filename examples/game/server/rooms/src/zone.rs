@@ -54,7 +54,7 @@ use distributed_game::rewind::{Historic, HitQuery, RewindFrame, ShotTiming};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EmitError, Entities, Entity, EntityId, EntitySchema, Fact,
     FactOutcome, FactSettlement, GameEvent, GameInput, GameRecord, GameSurface, LeaveReason,
-    ObserverId, PlayerId, Project, Replicated, View, Zone,
+    ObserverId, Origin, PlayerId, Project, Replicated, View, Zone,
 };
 use game_sim::arena::{self as movement, PLAYER_RADIUS};
 use game_sim::mobpit::PitState as MoveState;
@@ -1861,22 +1861,22 @@ impl Zone for MobPit {
     }
 
     /// A watcher (a player next door, a board page): the whole room, until
-    /// it says where it stands (`on_observer_focus`).
+    /// it says where it stands (`Focus`: then [`VIEW_RADIUS`] around it, as
+    /// in its own room, by the default `on_observer_focus`).
     fn on_observe(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {
         ctx.set_view(observer, View::new(0.0, 0.0, WATCH_RADIUS));
     }
 
-    /// A player next door, at `(x, y)` in this room's coordinates, sees this
-    /// room as it sees its own: [`VIEW_RADIUS`] around it, so interest and
-    /// update rates carry on across the wall.
-    fn on_observer_focus(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId, x: f32, y: f32) {
-        if !(x.is_finite() && y.is_finite()) {
-            return;
-        }
-        // A watcher stands at most one room away.
-        let reach = 3.0 * movement::HALF;
-        let view = View::new(x.clamp(-reach, reach), y.clamp(-reach, reach), VIEW_RADIUS);
-        ctx.set_view(observer, view);
+    /// Room `(x, y)` is centred at world `(x, y) × ROOM_SIZE`: clients focus
+    /// the rooms they watch from the player's position by themselves.
+    fn origin(&self) -> Option<Origin> {
+        let (x, y) = self.room.room;
+        let size = f64::from(rooms::ROOM_SIZE);
+        Some(Origin::new(f64::from(x) * size, f64::from(y) * size))
+    }
+
+    fn view_radius(&self) -> Option<f32> {
+        Some(VIEW_RADIUS)
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<PitInput> {

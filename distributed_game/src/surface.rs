@@ -26,10 +26,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::WireType;
 use crate::prediction::{PredictContext, PredictStep};
-use crate::protocol::PROTOCOL_VERSION;
 use crate::pure::GamePure;
 use crate::schema::{Correction, EntitySchema};
 use crate::{GameEvent, GameInput, Wire, Zone};
+
+/// Wire protocol version whose payload encodings (fields, inputs, events)
+/// a surface describes. They have not changed since 1: protocol 2 only
+/// added handshake negotiation (Welcome `features` and `origin`), which the
+/// SDK handles, so generated clients stay valid for both.
+pub const SURFACE_PROTOCOL_VERSION: u32 = 1;
 
 /// Version of the [`GameSurface`] JSON shape.
 pub const GAME_SURFACE_SCHEMA_VERSION: u32 = 3;
@@ -42,7 +47,8 @@ pub struct GameSurface {
     pub schema_version: u32,
     /// Surface name (generated TypeScript prefixes exports with it).
     pub name: String,
-    /// Zone wire protocol version (`PROTOCOL_VERSION`).
+    /// Zone wire protocol version of the payload encodings
+    /// ([`SURFACE_PROTOCOL_VERSION`]).
     pub protocol_version: u32,
     /// Replicated kinds in schema order.
     pub kinds: Vec<KindSurface>,
@@ -238,7 +244,7 @@ impl GameSurface {
         Self {
             schema_version: GAME_SURFACE_SCHEMA_VERSION,
             name: name.into(),
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: SURFACE_PROTOCOL_VERSION,
             kinds: Vec::new(),
             input: None,
             events: Vec::new(),

@@ -78,10 +78,23 @@ Results come back on a later tick in `on_fact_settled`.
   
   Creates and removes are never held. `UpdateRates::every_patch()` turns
   the rates off.
-- A client watching the zone next door tells it where the player is
-  (`watchZones(...).setFocus(at)`, zone-local coordinates). The
-  neighbour's `Zone::on_observer_focus` then centres that observer's view
-  on the player, so interest continues across the border.
+- Interest across borders: place each zone in the world and give its
+  players' view radius, once:
+
+  ```rust
+  fn origin(&self) -> Option<Origin> {      // world = origin + zone-local
+      let (x, y) = self.room.room;
+      Some(Origin::new(f64::from(x) * 48.0, f64::from(y) * 48.0))
+  }
+  fn view_radius(&self) -> Option<f32> { Some(VIEW_RADIUS) }
+  ```
+
+  The client then reports the player once per frame or tick
+  (`client.setPosition(p.x, p.y, me.zoneId)`). The SDK focuses every
+  watched neighbour on the player in that neighbour's coordinates. The
+  default `Zone::on_observer_focus` gives that watcher the same view
+  radius there. No coordinate math in the game. Zones without an origin:
+  `watchZones(...).setFocus(at)`.
 - Each changed entity is encoded once per patch and shared by every client
   that was up to date. A dense room costs selection plus copying, not one
   encode per client.

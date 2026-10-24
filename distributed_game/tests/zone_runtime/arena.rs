@@ -23,6 +23,10 @@ pub struct ArenaConfig {
     pub spawn_every: Option<Duration>,
     /// Allocation payload handed over by the zone factory.
     pub allocation: Option<serde_json::Value>,
+    /// `Zone::origin` (Welcome v2).
+    pub origin: Option<distributed_game::Origin>,
+    /// `Zone::view_radius` (the default observer focus).
+    pub view_radius: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +191,14 @@ impl Zone for Arena {
         let principal = ctx.observer(observer).map(|o| o.principal.clone());
         self.log
             .push(format!("unobserve:{}", principal.as_deref().unwrap_or("?")));
+    }
+
+    fn origin(&self) -> Option<distributed_game::Origin> {
+        self.cfg.origin
+    }
+
+    fn view_radius(&self) -> Option<f32> {
+        self.cfg.view_radius
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<(i8, i8)> {

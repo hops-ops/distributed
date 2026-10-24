@@ -34,7 +34,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use distributed_game::protocol::{error, ClientMessage, Hello, ServerMessage, PROTOCOL_VERSION};
+use distributed_game::protocol::{
+    error, feature, ClientMessage, ClientMirror, Hello, ServerMessage, Welcome, PROTOCOL_VERSION,
+};
 use distributed_game::ticket::TicketKey;
 use distributed_game::{Role, TicketClaims};
 use futures_util::{SinkExt, StreamExt};
@@ -118,6 +120,8 @@ enum Got {
 struct Player {
     ws: Ws,
     seq: u32,
+    /// Protocol version offered in Hello (Welcomes decode in it).
+    protocol: u32,
 }
 
 impl Player {
@@ -130,7 +134,11 @@ impl Player {
         let (ws, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(Self { ws, seq: 0 })
+        Ok(Self {
+            ws,
+            seq: 0,
+            protocol: PROTOCOL_VERSION,
+        })
     }
 
     async fn send(&mut self, message: ClientMessage) {
@@ -146,7 +154,7 @@ impl Player {
 
     async fn hello_near(&mut self, ticket: &str, near: bool) {
         self.send(ClientMessage::Hello(Hello {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: self.protocol,
             content_version: String::new(),
             capabilities: 0,
             ticket: ticket.into(),
@@ -172,11 +180,13 @@ impl Player {
             let left = deadline.saturating_duration_since(Instant::now());
             let frame = tokio::time::timeout(left, self.ws.next()).await.ok()?;
             match frame {
-                Some(Ok(Message::Binary(bytes))) => match ServerMessage::decode(&bytes, &()) {
-                    Ok(message) => return Some(Got::Server(message)),
-                    // Deltas need the Welcome's schema; these tests skip them.
-                    Err(_) => continue,
-                },
+                Some(Ok(Message::Binary(bytes))) => {
+                    match ServerMessage::decode(&bytes, &ClientMirror::speaking(self.protocol)) {
+                        Ok(message) => return Some(Got::Server(message)),
+                        // Deltas need the Welcome's schema; these tests skip them.
+                        Err(_) => continue,
+                    }
+                }
                 Some(Ok(Message::Close(frame))) => {
                     return Some(Got::Closed(frame.map(|f| u16::from(f.code))))
                 }
@@ -209,8 +219,12 @@ impl Player {
     }
 
     async fn welcome(&mut self) {
+        self.welcome_message().await;
+    }
+
+    async fn welcome_message(&mut self) -> Welcome {
         self.expect(Duration::from_secs(20), "Welcome", |got| match got {
-            Got::Server(ServerMessage::Welcome(_)) => Some(()),
+            Got::Server(ServerMessage::Welcome(w)) => Some(w.clone()),
             Got::Server(ServerMessage::Error { code, message }) => {
                 panic!("join refused: {code} {message}")
             }
@@ -311,6 +325,30 @@ async fn single_node() {
     ana.input(&[1, 5]).await;
     assert_eq!(ana.total(2).await, 5);
     until(&base, "/tally/ana", long, |v| exactly_once(v, 5)).await;
+
+    // The zone answers in the client's protocol version: v1 Welcome for a
+    // v1 client, v2 (runtime features) for v2; a version it does not speak
+    // is refused before the ticket is used, so the same ticket then joins.
+    let mut old = Player::connect(&base, "room-a").await;
+    old.protocol = 1;
+    old.hello(&ticket_as("old", "room-a", Role::Observer)).await;
+    let w = old.welcome_message().await;
+    assert_eq!((w.protocol_version, w.features, w.origin), (1, 0, None));
+    let mut new = Player::connect(&base, "room-a").await;
+    new.hello(&ticket_as("new", "room-a", Role::Observer)).await;
+    let w = new.welcome_message().await;
+    assert_eq!(w.protocol_version, 2);
+    assert_eq!(w.features & feature::FOCUS, feature::FOCUS);
+    new.send(ClientMessage::Focus { x: 1.0, y: 2.0 }).await;
+    let mut future = Player::connect(&base, "room-a").await;
+    future.protocol = PROTOCOL_VERSION + 1;
+    let same = ticket_as("future", "room-a", Role::Observer);
+    future.hello(&same).await;
+    assert_eq!(future.refused().await, error::VERSION_MISMATCH);
+    let mut future = Player::connect(&base, "room-a").await;
+    future.hello(&same).await;
+    future.welcome().await;
+    drop((old, new, future));
 
     // A used ticket is refused.
     let mut replay = Player::connect(&base, "room-a").await;

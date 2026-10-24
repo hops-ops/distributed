@@ -83,7 +83,10 @@ use crate::handoff::{HandoffRequest, Transfer};
 use crate::host::{HostConfig, JoinError, Joined, Outbound, ZoneHost};
 use crate::metrics::GameMetrics;
 use crate::protocol::Role;
-use crate::protocol::{error, kick, ClientMessage, Notice, ServerMessage, PROTOCOL_VERSION};
+use crate::protocol::{
+    error, kick, supports_protocol, ClientMessage, Notice, ServerMessage, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+};
 use crate::rng::ZoneRng;
 use crate::world::{
     BarrierMode, ChildEvent, DottedTopology, FreezeState, HostAddr, LocalOwnership, OwnershipError,
@@ -230,6 +233,7 @@ enum ZoneCmd {
     Join {
         claims: TicketClaims,
         transfer: Option<Transfer>,
+        protocol: u32,
         capabilities: u32,
         content_version: String,
         out: mpsc::Sender<ConnOut>,
@@ -237,6 +241,7 @@ enum ZoneCmd {
     },
     Reconnect {
         token: String,
+        protocol: u32,
         capabilities: u32,
         content_version: String,
         out: mpsc::Sender<ConnOut>,
@@ -1410,11 +1415,13 @@ fn handle_cmd<Z: Zone>(
         ZoneCmd::Join {
             claims,
             transfer,
+            protocol,
             capabilities,
             content_version,
             out,
             reply,
         } => {
+            let host = host.speaking(protocol);
             let result = match &transfer {
                 Some(transfer) => host.join_transfer(transfer, capabilities, &content_version),
                 None => host.join(&claims, capabilities, &content_version),
@@ -1426,12 +1433,17 @@ fn handle_cmd<Z: Zone>(
         }
         ZoneCmd::Reconnect {
             token,
+            protocol,
             capabilities,
             content_version,
             out,
             reply,
         } => {
-            let result = host.reconnect_with_version(&token, capabilities, &content_version);
+            let result = host.speaking(protocol).reconnect_with_version(
+                &token,
+                capabilities,
+                &content_version,
+            );
             if let Ok(joined) = &result {
                 conns.insert(joined.client, out);
             }
@@ -1660,11 +1672,16 @@ where
         Ok(Some(Ok(_))) => return reject(socket, error::BAD_MESSAGE, "binary frames only").await,
         _ => return,
     };
-    if hello.protocol_version != PROTOCOL_VERSION {
+    // Answer in the client's version; refuse others before the ticket is
+    // touched, so the client can retry with an older one (§6.0).
+    if !supports_protocol(hello.protocol_version) {
         return reject(
             socket,
             error::VERSION_MISMATCH,
-            format!("protocol {} != {PROTOCOL_VERSION}", hello.protocol_version),
+            format!(
+                "protocol {} unsupported ({MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION})",
+                hello.protocol_version
+            ),
         )
         .await;
     }
@@ -1756,6 +1773,7 @@ where
         ZoneCmd::Join {
             claims,
             transfer,
+            protocol: hello.protocol_version,
             capabilities: hello.capabilities,
             content_version: hello.content_version,
             out: out_tx,
@@ -1764,6 +1782,7 @@ where
     } else {
         ZoneCmd::Reconnect {
             token: hello.reconnect_token,
+            protocol: hello.protocol_version,
             capabilities: hello.capabilities,
             content_version: hello.content_version,
             out: out_tx,

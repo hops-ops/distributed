@@ -12,8 +12,20 @@ import {
 } from './schema.js';
 import { GameDecodeError, WireReader, WireWriter } from './wire.js';
 
-/** Wire protocol version spoken by this client. */
-export const GAME_PROTOCOL_VERSION = 1;
+/**
+ * Newest wire protocol version this client speaks (offered in Hello; a
+ * server that only speaks 1 is retried once with 1, see `GameConnection`).
+ */
+export const GAME_PROTOCOL_VERSION = 2;
+
+/**
+ * Runtime feature bits a server announces in Welcome v2 (`features`): the
+ * client sends a message a feature covers only when its bit is set.
+ */
+export const GameFeature = Object.freeze({
+	/** The server handles `Focus` (observers steer their view). */
+	FOCUS: 1 << 0
+});
 
 /** Message type bytes (§6.1). */
 export const GameMessageTag = Object.freeze({
@@ -106,8 +118,16 @@ export type GameClientMessage = HelloMessage | InputMessage | PingMessage | Leav
 
 export type GameRole = 'player' | 'observer';
 
+/** A point in world coordinates (or a zone's origin in them). */
+export type WorldPoint = Readonly<{ x: number; y: number }>;
+
 export type WelcomeMessage = Readonly<{
 	type: 'Welcome';
+	/**
+	 * Protocol version the Welcome is encoded in: the version the client
+	 * offered (not itself on the wire). 1: `features` 0, no `origin`.
+	 */
+	protocolVersion: number;
 	sessionId: string;
 	zoneId: string;
 	role: GameRole;
@@ -118,6 +138,14 @@ export type WelcomeMessage = Readonly<{
 	reconnectToken: string;
 	contentVersion: string;
 	schema: GameSchema;
+	/** v2: runtime features of the server (`GameFeature` bits); 0 in v1. */
+	features: number;
+	/**
+	 * v2: where the zone sits in the world (world = origin + zone-local),
+	 * when it says (`Zone::origin`); `GameClient.setPosition` focuses the
+	 * zone from it.
+	 */
+	origin?: WorldPoint;
 }>;
 export type EntityCreate = Readonly<{
 	id: number;
@@ -163,8 +191,12 @@ export type GameServerMessage =
 	| ErrorMessage
 	| RedirectMessage;
 
-/** What the Delta codec needs: the Welcome schema and the kind of each known id. */
+/**
+ * What the codecs need: the negotiated protocol version (Welcome; default
+ * the newest), the Welcome schema and the kind of each known id (Deltas).
+ */
 export type EntityKinds = Readonly<{
+	protocolVersion?: number;
 	schema: GameSchema | undefined;
 	kindOf(id: number): number | undefined;
 }>;
@@ -270,6 +302,11 @@ export function encodeServerMessage(
 				.string(message.reconnectToken)
 				.string(message.contentVersion);
 			encodeSchema(w, message.schema);
+			if ((message.protocolVersion ?? GAME_PROTOCOL_VERSION) >= 2) {
+				const origin = message.origin;
+				w.varuint(message.features ?? 0).bool(origin !== undefined);
+				if (origin !== undefined) w.f64(origin.x).f64(origin.y);
+			}
 			break;
 		case 'Delta':
 			encodeDelta(w, message, kinds);
@@ -317,11 +354,13 @@ export function decodeServerMessage(
 			const zoneId = r.string();
 			const roleByte = r.u8();
 			if (roleByte > 1) throw new GameDecodeError('INVALID', 'role');
-			message = {
-				type: 'Welcome',
+			const protocolVersion = kinds.protocolVersion ?? GAME_PROTOCOL_VERSION;
+			const welcome = {
+				type: 'Welcome' as const,
+				protocolVersion,
 				sessionId,
 				zoneId,
-				role: roleByte === 0 ? 'player' : 'observer',
+				role: (roleByte === 0 ? 'player' : 'observer') as GameRole,
 				tickRate: r.varuint(),
 				patchRate: r.varuint(),
 				serverTick: r.varuint(),
@@ -330,6 +369,13 @@ export function decodeServerMessage(
 				contentVersion: r.string(),
 				schema: decodeSchema(r)
 			};
+			if (protocolVersion >= 2) {
+				const features = r.varuint();
+				const origin = r.bool() ? { x: r.f64(), y: r.f64() } : undefined;
+				message = origin === undefined ? { ...welcome, features } : { ...welcome, features, origin };
+			} else {
+				message = { ...welcome, features: 0 };
+			}
 			break;
 		}
 		case GameMessageTag.DELTA:
@@ -463,6 +509,8 @@ export type MirrorEntity = { kind: number; fields: FieldValue[] };
  * the decoded messages it returns.
  */
 export class GameClientMirror implements EntityKinds {
+	/** Protocol version offered in Hello (Welcomes decode in it). */
+	protocolVersion = GAME_PROTOCOL_VERSION;
 	welcome: WelcomeMessage | undefined;
 	readonly entities = new Map<number, MirrorEntity>();
 	serverTick = 0;
