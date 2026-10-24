@@ -573,6 +573,41 @@ fn observers_receive_deltas_without_owning_a_player() {
     assert!(h.zone().log.contains(&"unobserve:watcher".to_string()));
 }
 
+/// An observer's mirror after a few patches (entity count).
+fn observed(h: &mut ZoneHost<Arena>, clock: &ManualClock, mirror: &mut ClientMirror, o: ClientId) {
+    for _ in 0..4 {
+        clock.advance(MS(100));
+        h.advance();
+        for frame in frames_for(&h.drain_outbound(), o) {
+            mirror.apply(&frame).unwrap();
+        }
+    }
+}
+
+#[test]
+fn focus_gives_an_observer_the_zones_view_radius() {
+    for (view_radius, seen) in [(None, 1), (Some(5.0), 0)] {
+        let clock = ManualClock::new();
+        let cfg = ArenaConfig {
+            view_radius,
+            ..ArenaConfig::default()
+        };
+        let mut h = host(HostConfig::default(), &clock, cfg);
+        h.join(&claims("alice", "z1"), 0, "").unwrap();
+        let mut obs = claims("watcher", "z1");
+        obs.role = Role::Observer;
+        let o = h.join(&obs, 0, "").unwrap();
+        let mut mirror = ClientMirror::new();
+        observed(&mut h, &clock, &mut mirror, o.client);
+        assert_eq!(mirror.entities.len(), 1, "the whole arena before Focus");
+        // Alice is 10..90 on both axes: 20 m beyond the corner is out of a
+        // 5 m view, inside the observer's own 1000 m one.
+        h.observer_focus(o.client, -20.0, -20.0);
+        observed(&mut h, &clock, &mut mirror, o.client);
+        assert_eq!(mirror.entities.len(), seen, "view radius {view_radius:?}");
+    }
+}
+
 #[test]
 fn welcome_is_encoded_in_the_clients_protocol_version() {
     use distributed_game::protocol::feature;

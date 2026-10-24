@@ -414,13 +414,18 @@ client already has:
   the client when they leave it. A spatial grid makes this cheap. Mark
   entities that everyone must always see (players in a small room, a boss,
   pillars) with `.global()`.
-- **Across borders.** A client watching the zone next door (an observer)
-  tells it where the player is in that zone's coordinates (`Focus`; JS:
-  `watchZones(...).setFocus(at)`, throttled for you). By default the
-  observer's view centre follows (`Zone::on_observer_focus`; override it
-  to resize or clamp, as Mob Pit does with the player's own radius), so
-  interest and update rates carry on past the wall instead of the
-  neighbour sending all it has.
+- **Across borders.** A zone says where it sits in the world once
+  (`fn origin(&self) -> Option<Origin>`, e.g. from the room in its zone
+  id) and how far its players see (`fn view_radius(&self) -> Option<f32>`).
+  The origin travels in Welcome; the game tells the JS client where the
+  player is with one call (`client.setPosition(x, y, zoneId)`, local to
+  the player's zone, or world coordinates without `zoneId`), and the SDK
+  focuses every zone it watches next door on the player in that zone's
+  coordinates (`Focus`, throttled). The default
+  `Zone::on_observer_focus` gives that observer the zone's player view
+  radius around the player, so interest and update rates carry on past
+  the wall instead of the neighbour sending all it has. Zones without an
+  origin are focused by hand (`watchZones(...).setFocus(at)`).
 - **Bandwidth budget.** Each client has `byte_budget` bytes per Delta
   (4 KiB). Creates and updates compete by priority (kind × entity ×
   field × nearness). Anything deferred builds up priority, so it is always

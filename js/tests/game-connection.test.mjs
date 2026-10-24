@@ -261,6 +261,45 @@ test('a content VERSION_MISMATCH still asks for a reload, without a protocol fal
 	conn.close();
 });
 
+test('setPosition focuses every observed zone that declares its origin', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	// Rooms 48 m wide: pit.<x>.<y> centred at (x, y) × 48; pit.9.9 is unplaced.
+	const origin = (zone) => {
+		const m = /^pit\.(-?\d+)\.(-?\d+)$/.exec(zone);
+		return m === null || zone === 'pit.9.9' ? undefined : { x: Number(m[1]) * 48, y: Number(m[2]) * 48 };
+	};
+	network.onMessage = (conn, m) => {
+		if (m.type !== 'Hello') return;
+		const role = m.ticket.endsWith(':observer') ? 'observer' : 'player';
+		const at = origin(conn.zoneId);
+		conn.send(welcome({ zoneId: conn.zoneId, role, serverTime: 10_000, ...(at ? { origin: at } : {}) }));
+	};
+	const client = gameClient(network, scheduler);
+	const focus = (zone) => network.last(zone).inbox.filter((m) => m.type === 'Focus').map(({ x, y }) => [x, y]);
+	await client.connect('pit.0.0');
+	await client.observe('pit.1.0');
+	await client.observe('pit.9.9');
+	// Local to the player's own room: (5, 3) there is (-43, 3) east.
+	client.setPosition(5, 3, 'pit.0.0');
+	assert.deepEqual(client.position, { x: 5, y: 3 });
+	assert.deepEqual(focus('pit.1.0'), [[-43, 3]]);
+	assert.deepEqual(focus('pit.9.9'), [], 'an unplaced zone is focused by hand only');
+	assert.deepEqual(focus('pit.0.0'), [], 'the own zone is not an observer');
+	// A zone observed later is focused right after its Welcome.
+	await client.observe('pit.0.-1');
+	assert.deepEqual(focus('pit.0.-1'), [[5, 51]]);
+	// World coordinates work too.
+	await scheduler.advance(250);
+	client.setPosition(40, -10);
+	assert.deepEqual(focus('pit.1.0').at(-1), [-8, -10]);
+	assert.deepEqual(focus('pit.0.-1').at(-1), [40, 38]);
+	// A zone whose origin is unknown cannot place a local position.
+	client.setPosition(1, 1, 'pit.7.7');
+	assert.deepEqual(client.position, { x: 40, y: -10 });
+	client.close();
+});
+
 test('ping/pong estimates offset, rtt and jitter', async () => {
 	const network = new FakeNetwork();
 	const scheduler = new FakeScheduler();

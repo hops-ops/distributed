@@ -887,6 +887,23 @@ fn a_player_next_door_sees_this_room_from_where_it_stands() {
     let watcher = room.join(&claims, 0, "").expect("observe").client;
     let mut mirror = distributed_game::ClientMirror::new();
     observe(&mut room, &clock, watcher, &mut mirror);
+    // The room says where it sits in the world (Welcome), so the client
+    // focuses it from the player's position by itself.
+    let welcome = mirror.welcome.as_ref().expect("welcome");
+    assert_eq!(
+        welcome.origin,
+        Some(distributed_game::Origin::new(0.0, 0.0))
+    );
+    let mut east = host("pit.2.-1", &clock);
+    let claims_east = TicketClaims::new("ana", east.zone_id(), u64::MAX, "ana-e", Role::Observer);
+    let joined = east.join(&claims_east, 0, "").expect("observe").client;
+    let mut east_mirror = distributed_game::ClientMirror::new();
+    observe(&mut east, &clock, joined, &mut east_mirror);
+    let size = f64::from(game_sim::mobpit::ROOM_SIZE);
+    assert_eq!(
+        east_mirror.welcome.as_ref().and_then(|w| w.origin),
+        Some(distributed_game::Origin::new(2.0 * size, -size))
+    );
     let whole = mob_positions(&mirror);
     assert!(
         whole.iter().any(|&(x, _)| x > 5.0),
@@ -894,6 +911,7 @@ fn a_player_next_door_sees_this_room_from_where_it_stands() {
     );
 
     // Ana stands in the west room, 5 m from the shared wall: (-25, 0) here.
+    // The default `on_observer_focus` gives her the room's `view_radius`.
     let focus = (-25.0_f32, 0.0_f32);
     room.observer_focus(watcher, focus.0, focus.1);
     observe(&mut room, &clock, watcher, &mut mirror);

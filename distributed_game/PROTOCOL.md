@@ -296,8 +296,9 @@ Focus  := 0x07, f32 x, f32 y
   it): where an observer is looking, in the zone's local coordinates
   (e.g. its player next door, seen from this zone: world position minus
   the zone's Welcome `origin`). The zone decides what it means; by
-  default the observer's view centre moves there and keeps its radius.
-  It only steers what that observer is sent. Clients SHOULD throttle it (the JS
+  default the observer's view centre moves there, with the zone's player
+  view radius when it declares one (else the observer's radius). It only
+  steers what that observer is sent. Clients SHOULD throttle it (the JS
   SDK: at most every 200 ms, after a move of 0.25 or more) and send it
   again after each Welcome. Players' are ignored; non-finite values are
   ignored.
