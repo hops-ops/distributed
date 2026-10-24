@@ -168,7 +168,8 @@ async fn main() -> Result<(), String> {
         zones[zones.len() - 1],
         args.wake_secs
     );
-    let (lost_tx, mut lost_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Instant)>();
+    let (lost_tx, mut lost_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(usize, Instant, Option<String>)>();
     let mut wake = Vec::new();
     for (i, zone) in zones.iter().enumerate() {
         let delay = args.ramp_secs as f64 * i as f64 / zones.len().max(1) as f64;
@@ -177,7 +178,7 @@ async fn main() -> Result<(), String> {
         wake.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs_f64(delay)).await;
             let stats = run_bot(&config, 0, circle(i)).await;
-            let _ = lost.send((i, Instant::now()));
+            let _ = lost.send((i, Instant::now(), stats.error.clone()));
             stats
         }));
     }
@@ -195,9 +196,13 @@ async fn main() -> Result<(), String> {
     tokio::time::sleep(Duration::from_secs(args.wake_secs.saturating_sub(3))).await;
     // A bot that already left (a room refused it) is not the kill.
     let mut early = 0;
-    while let Ok((i, _)) = lost_rx.try_recv() {
+    while let Ok((i, _, error)) = lost_rx.try_recv() {
         early += 1;
-        eprintln!("{} lost its bot before the kill", zones[i]);
+        eprintln!(
+            "{} lost its bot before the kill: {}",
+            zones[i],
+            error.as_deref().unwrap_or("?")
+        );
     }
     if early > 0 {
         eprintln!("{early} rooms lost their bot before the kill");
@@ -219,11 +224,12 @@ async fn main() -> Result<(), String> {
         println!("READY {:.3}", unix_secs());
     }
     let wait = Duration::from_secs(args.kill_wait_secs);
-    let (first, t0) = tokio::time::timeout(wait, lost_rx.recv())
+    let (first, t0, _) = tokio::time::timeout(wait, lost_rx.recv())
         .await
         .map_err(|_| "no bot lost its socket: celld was not killed")?
         .ok_or("bots gone")?;
-    let t0_unix = unix_secs();
+    // When the socket was lost (the kill command may have run on).
+    let t0_unix = unix_secs() - t0.elapsed().as_secs_f64();
     println!(
         "t0 {t0_unix:.3}: {} lost its socket{}",
         zones[first],
@@ -291,8 +297,10 @@ async fn main() -> Result<(), String> {
                 let probe = config(
                     &args,
                     &zone,
-                    format!("rp{run}z{i}a{attempt}"),
-                    i as u64 + 1,
+                    // The room's player coming back (its own principal; a
+                    // fresh nonce per attempt).
+                    format!("rw{run}z{i}"),
+                    (i as u64 + 1) * 1000 + u64::from(attempt),
                     Duration::ZERO,
                 );
                 let stats =
@@ -329,7 +337,13 @@ async fn main() -> Result<(), String> {
                 tokio::time::sleep_until(next).await;
             }
             // Back: a player stays (until the hold ends).
-            let config = config(&args, &zone, format!("rs{run}z{i}"), i as u64 + 7, FOREVER);
+            let config = config(
+                &args,
+                &zone,
+                format!("rw{run}z{i}"),
+                (i as u64 + 1) * 1000 + 999,
+                FOREVER,
+            );
             let stats = run_bot(&config, 0, circle(i)).await;
             relost.lock().unwrap().push((
                 i,
