@@ -26,7 +26,8 @@
 //!   `sent/patch` creates + updates sent, `held` the share of updates held
 //!   back by update rates, `B/frame` Delta bytes per client frame;
 //! - `facts/room-s`, `req/room-s` (cell requests; a `__batch` is one),
-//!   `batches`, `deletes/room-s` (outbox deletes);
+//!   `batches`, `facts/req`, `deletes/room-s` (outbox deletes) and
+//!   `deletes/fact` (rates depend on the fighting; the ratios do not);
 //! - `reads/room-min` (watched-cell reads by the rooms), `pushes/room-min`
 //!   (received), and per minute the cells' `pushed` / `skipped` (unchanged)
 //!   views and watching `reads`.
@@ -702,7 +703,7 @@ impl Row {
     }
 
     /// Names of [`metrics`](Self::metrics), in order.
-    fn metric_names() -> [&'static str; 16] {
+    fn metric_names() -> [&'static str; 18] {
         [
             "dropped %",
             "late p99 ms",
@@ -716,6 +717,8 @@ impl Row {
             "facts/room-s",
             "req/room-s",
             "deletes/room-s",
+            "facts/req",
+            "deletes/fact",
             "reads/room-min",
             "pushes/room-min",
             "cell pushed/min",
@@ -724,7 +727,7 @@ impl Row {
     }
 
     /// The numbers A/B compares (see [`metric_names`](Self::metric_names)).
-    fn metrics(&self) -> [Option<f64>; 16] {
+    fn metrics(&self) -> [Option<f64>; 18] {
         let secs = (self.window.1 - self.window.0).max(1e-3);
         let w = self.work.map(|(w, rooms)| (w, rooms as f64 * secs));
         let per = |num: fn(&WorkCounters) -> u64, den: fn(&WorkCounters) -> u64| {
@@ -747,6 +750,8 @@ impl Row {
             per_room_s(|w| w.fact_commands),
             per_room_s(|w| w.fact_requests),
             per_room_s(|w| w.outbox_deletes),
+            per(|w| w.fact_commands, |w| w.fact_requests),
+            per(|w| w.outbox_deletes, |w| w.fact_commands),
             per_room_s(|w| w.world_reads * 60),
             per_room_s(|w| w.world_pushes * 60),
             cell_per_min(|c| c.pushes),
@@ -764,7 +769,7 @@ impl Row {
             |v: Option<f64>, digits: usize| v.map_or("—".to_owned(), |v| format!("{v:.digits$}"));
         let mut line = format!(
             "work ({rooms} rooms): enc/patch {} · sent/patch {} · held {}% · B/frame {} · \
-             facts/room-s {} · req/room-s {} ({} batches) · deletes/room-s {} · \
+             facts/room-s {} · req/room-s {} ({} batches, {} facts/req) · deletes/room-s {} · \
              reads/room-min {} · pushes/room-min {}",
             opt(m[5], 1),
             opt(m[6], 1),
@@ -773,15 +778,16 @@ impl Row {
             opt(m[9], 2),
             opt(m[10], 2),
             w.fact_batches,
+            opt(m[12], 2),
             opt(m[11], 2),
-            opt(m[12], 1),
-            opt(m[13], 1),
+            opt(m[14], 1),
+            opt(m[15], 1),
         );
         if let Some(c) = self.cells {
             line.push_str(&format!(
                 " · cells/min: pushed {} skipped {} reads {}",
-                opt(m[14], 0),
-                opt(m[15], 0),
+                opt(m[16], 0),
+                opt(m[17], 0),
                 opt(
                     Some(c.reads as f64 * 60.0 / (self.window.1 - self.window.0).max(1e-3)),
                     0
