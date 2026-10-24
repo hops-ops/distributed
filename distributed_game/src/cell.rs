@@ -20,12 +20,13 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
-#[cfg(not(target_arch = "wasm32"))]
-use distributed::cell_host::{AggregateCell, CellCommandIdentity, CellDispatchError};
+use distributed::cell_host::{
+    AggregateCell, CellBatchCommand, CellCommandIdentity, CellDispatchError, CellWaitPathRequest,
+};
 use distributed::microsvc::Session;
-#[cfg(not(target_arch = "wasm32"))]
 use distributed::Aggregate;
 use distributed::USER_ID_KEY;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::facts::Fact;
@@ -123,6 +124,107 @@ pub fn fact_session_from_headers(header: impl Fn(&str) -> Option<String>) -> Opt
 /// and to [`stamp_metadata`](crate::stamp_metadata) their events.
 pub fn session_stamp(session: &Session) -> Option<crate::FactStamp> {
     crate::FactStamp::from_session_vars(session.variables())
+}
+
+/// Run a fact batch (`POST /{kind}/{shard}/__batch`, the celld object
+/// host's batch request) against `cell`: `{ entries: [{ command,
+/// commandId, input, partition, session }] }` → `{ results: [{ status,
+/// body }] }`, each body as the entry's own wait-path response. Every entry
+/// gets its own ledger id (`service` + `partition` + `commandId`) and its
+/// session from its `session` variables through `sessions`, and runs in
+/// order ([`AggregateCell::dispatch_idempotent_batch`]); the results end at
+/// the first retryable one. Call it only after the request authenticated
+/// with `DISTRIBUTED_INTERNAL_SECRET`.
+pub async fn run_fact_batch<A>(
+    cell: &AggregateCell<A>,
+    service: &str,
+    body: &Value,
+    sessions: impl Fn(&dyn Fn(&str) -> Option<String>) -> Option<Session>,
+) -> Result<Value, CellDispatchError>
+where
+    A: Aggregate + Send + Sync + 'static,
+{
+    let entries = body
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CellDispatchError::BadRequest("`entries` is required".into()))?;
+    // An entry that does not parse never reaches the cell; it is answered
+    // in its place.
+    let mut refused = Vec::with_capacity(entries.len());
+    let mut commands = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match batch_command(service, entry, &sessions) {
+            Ok(command) => {
+                commands.push(command);
+                refused.push(None);
+            }
+            Err(error) => refused.push(Some(error)),
+        }
+    }
+    let mut dispatched = cell.dispatch_idempotent_batch(commands).await.into_iter();
+    let mut results = Vec::with_capacity(entries.len());
+    for refused in refused {
+        let result = match refused {
+            Some(error) => Err(error),
+            None => match dispatched.next() {
+                Some(result) => result.map(|dispatch| dispatch.wait_path_wire()),
+                // Not attempted: an earlier entry ended the batch.
+                None => break,
+            },
+        };
+        let (status, body) = match result {
+            Ok(body) => (200, body),
+            Err(error) => (
+                error.status_code(),
+                json!({ "error": error.client_message(), "code": error.code() }),
+            ),
+        };
+        let retryable = status >= 500
+            || matches!(status, 408 | 429)
+            || body.get("code").and_then(Value::as_str) == Some("COMMAND_IN_PROGRESS");
+        results.push(json!({ "status": status, "body": body }));
+        if retryable {
+            break;
+        }
+    }
+    Ok(json!({ "results": results }))
+}
+
+/// One `__batch` entry as its own wait-path command.
+fn batch_command(
+    service: &str,
+    entry: &Value,
+    sessions: &impl Fn(&dyn Fn(&str) -> Option<String>) -> Option<Session>,
+) -> Result<CellBatchCommand, CellDispatchError> {
+    let field = |name: &str| entry.get(name).and_then(Value::as_str);
+    let (Some(command), Some(partition)) = (field("command"), field("partition")) else {
+        return Err(CellDispatchError::BadRequest(
+            "`command` and `partition` are required".into(),
+        ));
+    };
+    let parsed = CellWaitPathRequest::parse(json!({
+        "commandId": entry.get("commandId"),
+        "input": entry.get("input"),
+    }))
+    .map_err(CellDispatchError::BadRequest)?;
+    let identity = CellCommandIdentity::new(
+        service.to_string(),
+        partition.to_string(),
+        &parsed.command_id,
+    )?;
+    let vars = entry.get("session").and_then(Value::as_object);
+    let header = |name: &str| {
+        vars.and_then(|vars| vars.get(name))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let session = sessions(&header).ok_or(CellDispatchError::Forbidden)?;
+    Ok(CellBatchCommand {
+        command: command.to_string(),
+        identity,
+        input: parsed.input,
+        session,
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]

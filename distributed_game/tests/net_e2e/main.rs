@@ -948,3 +948,64 @@ async fn factory_failures_answer_joins_with_typed_errors() {
     .await;
     stop(server, handle).await;
 }
+
+/// Hello offering `version` with a fresh ticket.
+async fn hello_version(ws: &mut Ws, version: u32, ticket: String) {
+    send(
+        ws,
+        ClientMessage::Hello(Hello {
+            protocol_version: version,
+            content_version: String::new(),
+            capabilities: 0,
+            ticket,
+            reconnect_token: String::new(),
+            near: false,
+        }),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn negotiates_the_protocol_version_in_hello() {
+    use distributed_game::protocol::feature;
+    let (url, server, handle) = start(None).await;
+
+    // v1 client: v1 Welcome (no features, no origin).
+    let mut ws = connect(&url, "z1").await;
+    hello_version(&mut ws, 1, ticket("ana", "z1", "v-1", Role::Player)).await;
+    let mut v1 = ClientMirror::speaking(1);
+    let Some(ServerMessage::Welcome(w)) = next(&mut ws, &mut v1).await else {
+        panic!("v1 Welcome")
+    };
+    assert_eq!((w.protocol_version, w.features), (1, 0));
+
+    // v2 client: v2 Welcome with the runtime features.
+    let mut ws2 = connect(&url, "z1").await;
+    hello_version(&mut ws2, 2, ticket("bo", "z1", "v-2", Role::Observer)).await;
+    let Some(ServerMessage::Welcome(w)) = next(&mut ws2, &mut ClientMirror::new()).await else {
+        panic!("v2 Welcome")
+    };
+    assert_eq!(w.protocol_version, 2);
+    assert_eq!(w.features & feature::FOCUS, feature::FOCUS);
+
+    // A version the server does not speak is refused before the ticket is
+    // used (message starting `protocol`): the same ticket then joins.
+    let mut ws3 = connect(&url, "z1").await;
+    let same = ticket("cy", "z1", "v-3", Role::Player);
+    hello_version(&mut ws3, 3, same.clone()).await;
+    match next(&mut ws3, &mut ClientMirror::new()).await {
+        Some(ServerMessage::Error { code, message }) => {
+            assert_eq!(code, error::VERSION_MISMATCH);
+            assert!(message.starts_with("protocol"), "{message}");
+        }
+        other => panic!("expected VERSION_MISMATCH, got {other:?}"),
+    }
+    let mut ws4 = connect(&url, "z1").await;
+    hello_version(&mut ws4, 2, same).await;
+    assert!(matches!(
+        next(&mut ws4, &mut ClientMirror::new()).await,
+        Some(ServerMessage::Welcome(_))
+    ));
+    drop((ws, ws2, ws3, ws4));
+    stop(server, handle).await;
+}

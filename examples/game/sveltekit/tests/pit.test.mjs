@@ -88,8 +88,14 @@ function start(command, args, options, ready) {
 	};
 }
 
-/** Largest frame-to-frame move (m) of the own world position / view, ≈ one tick of walking. */
-const MAX_JUMP = 0.25;
+/**
+ * Largest frame-to-frame move (m) of the own world position / view: one
+ * tick of walking (5 m/s × 50 ms = 0.25 m, frames are measured up to 50 ms
+ * apart) plus f32 rounding where the position crosses into the next room's
+ * coordinates (0.251 seen in CI). A real doorway jump is a room (40 m) or a
+ * visible snap.
+ */
+const MAX_JUMP = 0.26;
 
 /**
  * Walk `page`'s player through the doorway on `side`; resolves with the new

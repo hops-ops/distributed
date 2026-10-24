@@ -1,6 +1,6 @@
 use super::{
-    instance_name, parent_cell_name, AggregateCell, CellCommandIdentity, CellDispatchError,
-    CellNamespace, CellStreamStore, DURABLE_AGGREGATE_CELL_STATE_VERSION,
+    instance_name, parent_cell_name, AggregateCell, CellBatchCommand, CellCommandIdentity,
+    CellDispatchError, CellNamespace, CellStreamStore, DURABLE_AGGREGATE_CELL_STATE_VERSION,
 };
 use crate::aggregate::{Aggregate, AggregateRepository};
 use crate::command::{typed_command, PreparedCommand, Succeeded};
@@ -453,6 +453,98 @@ async fn cell_wait_path_replays_the_same_command_without_new_domain_effects() {
             .sum::<usize>(),
         1
     );
+}
+
+fn batch_command(command: &str, id: &str, input: serde_json::Value) -> CellBatchCommand {
+    CellBatchCommand {
+        command: command.into(),
+        identity: CellCommandIdentity::new("cell-test-service", "principal-alice", id).unwrap(),
+        input,
+        session: owner_session(),
+    }
+}
+
+fn event_count(cell: &AggregateCell<CellItem>) -> usize {
+    cell.durable_events()
+        .unwrap()
+        .iter()
+        .map(|stream| stream.events.len())
+        .sum()
+}
+
+#[tokio::test]
+async fn a_batch_runs_in_order_and_replays_as_a_whole() {
+    let cell = AggregateCell::<CellItem>::new("item-batch")
+        .unwrap()
+        .mount(Create)
+        .mount(Complete);
+    let batch = || {
+        vec![
+            batch_command(
+                "cell_item.create",
+                "0190a000-0000-7000-8000-000000000410",
+                json!({ "id": "item-batch", "title": "once" }),
+            ),
+            // Sees the create before it.
+            batch_command(
+                "cell_item.complete",
+                "0190a000-0000-7000-8000-000000000411",
+                json!({ "id": "item-batch" }),
+            ),
+        ]
+    };
+    let first = cell.dispatch_idempotent_batch(batch()).await;
+    assert_eq!(first.len(), 2);
+    assert!(first.iter().all(|r| !r.as_ref().unwrap().replayed()));
+    assert_eq!(first[1].as_ref().unwrap().payload()["done"], json!(true));
+    assert_eq!(event_count(&cell), 2);
+
+    let replay = cell.dispatch_idempotent_batch(batch()).await;
+    assert_eq!(replay.len(), 2);
+    for (replayed, original) in replay.iter().zip(&first) {
+        let (replayed, original) = (replayed.as_ref().unwrap(), original.as_ref().unwrap());
+        assert!(replayed.replayed());
+        assert_eq!(replayed.payload(), original.payload());
+        assert_eq!(replayed.causation_id(), original.causation_id());
+    }
+    assert_eq!(event_count(&cell), 2, "a replayed batch appends nothing");
+}
+
+#[tokio::test]
+async fn a_rejected_batch_entry_leaves_the_others_committed() {
+    let cell = AggregateCell::<CellItem>::new("item-batch-reject")
+        .unwrap()
+        .mount(Create)
+        .mount(Complete);
+    let create = json!({ "id": "item-batch-reject", "title": "once" });
+    let results = cell
+        .dispatch_idempotent_batch(vec![
+            batch_command(
+                "cell_item.create",
+                "0190a000-0000-7000-8000-000000000420",
+                create.clone(),
+            ),
+            // Already exists: rejected by the handler.
+            batch_command(
+                "cell_item.create",
+                "0190a000-0000-7000-8000-000000000421",
+                create,
+            ),
+            batch_command(
+                "cell_item.complete",
+                "0190a000-0000-7000-8000-000000000422",
+                json!({ "id": "item-batch-reject" }),
+            ),
+        ])
+        .await;
+    assert_eq!(results.len(), 3);
+    assert!(results[0].is_ok());
+    assert!(matches!(
+        results[1],
+        Err(CellDispatchError::Rejected { .. })
+    ));
+    assert!(results[2].is_ok());
+    assert_eq!(event_count(&cell), 2);
 }
 
 #[tokio::test]

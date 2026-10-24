@@ -1,13 +1,13 @@
 //! P3 replication: interest enter/leave with hysteresis, global entities,
-//! change detection and byte-budget fairness.
+//! change detection, byte-budget fairness and distance-based update rates.
 
 use std::collections::BTreeMap;
 
 use distributed_game::protocol::{Delta, ServerMessage};
 use distributed_game::replication::{ClientReplica, EncodedWorld};
 use distributed_game::{
-    ClientMirror, EntitySchema, EntityState, FieldType, FieldValue, InterestConfig, KindDef, View,
-    WorldView,
+    ClientMirror, EntitySchema, EntityState, FieldType, FieldValue, InterestConfig, KindDef,
+    UpdateRates, View, WorldView,
 };
 
 fn schema() -> EntitySchema {
@@ -16,12 +16,20 @@ fn schema() -> EntitySchema {
         max: 1000.0,
         bits: 20,
     };
-    EntitySchema::new().kind(
-        KindDef::new(1, "thing")
-            .field("x", pos)
-            .field("y", pos)
-            .field("hp", FieldType::U16),
-    )
+    EntitySchema::new()
+        .kind(
+            KindDef::new(1, "thing")
+                .field("x", pos)
+                .field("y", pos)
+                .field("hp", FieldType::U16),
+        )
+        .kind(
+            KindDef::new(2, "beacon")
+                .field("x", pos)
+                .field("y", pos)
+                .field("hp", FieldType::U16)
+                .every_patch(),
+        )
 }
 
 fn thing(id: u32, x: f32, y: f32, hp: u32) -> EntityState {
@@ -39,13 +47,20 @@ struct Client {
     mirror: ClientMirror,
     view: View,
     budget: usize,
+    interest: InterestConfig,
+    world: Option<EncodedWorld>,
 }
 
 impl Client {
     fn new(view: View, budget: usize) -> Self {
+        Self::with_rates(view, budget, UpdateRates::every_patch())
+    }
+
+    fn with_rates(view: View, budget: usize, update_rates: UpdateRates) -> Self {
         // Seed the mirror with the schema as a Welcome would.
         let mut mirror = ClientMirror::new();
         mirror.welcome = Some(distributed_game::protocol::Welcome {
+            protocol_version: distributed_game::PROTOCOL_VERSION,
             session_id: "s".into(),
             zone_id: "z".into(),
             role: distributed_game::Role::Player,
@@ -56,12 +71,20 @@ impl Client {
             reconnect_token: String::new(),
             content_version: String::new(),
             schema: schema(),
+            features: 0,
+            origin: None,
         });
         Self {
             replica: ClientReplica::new(),
             mirror,
             view,
             budget,
+            interest: InterestConfig {
+                cell_size: 8.0,
+                leave_margin: 0.1,
+                update_rates,
+            },
+            world: None,
         }
     }
 
@@ -70,20 +93,20 @@ impl Client {
         for e in entities {
             view.push(e);
         }
-        let interest = InterestConfig {
-            cell_size: 8.0,
-            leave_margin: 0.1,
+        let world = match &self.world {
+            Some(last) => last.next(&schema(), view, &self.interest),
+            None => EncodedWorld::build(&schema(), view, &self.interest),
         };
-        let world = EncodedWorld::build(&schema(), view, &interest);
         let (frame, _) = self.replica.build_delta(
             &schema(),
             &world,
-            &interest,
+            &self.interest,
             &self.view,
             self.budget,
             tick,
             0,
         );
+        self.world = Some(world);
         match self.mirror.apply(&frame).unwrap() {
             ServerMessage::Delta(d) => d,
             other => panic!("{other:?}"),
@@ -175,4 +198,81 @@ fn byte_budget_prioritizes_but_never_starves() {
     );
     // Mirror converges to the server state for everything sent recently.
     assert_eq!(c.mirror.entities.len(), n as usize);
+}
+
+fn hp(c: &Client, id: u32) -> u32 {
+    match c.mirror.entities[&id].fields[2] {
+        FieldValue::U(hp) => hp,
+        ref other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn far_updates_thin_out_and_converge_within_their_interval() {
+    // Defaults: within 50 every patch, within 80 every 2nd, beyond every 4th.
+    let mut c = Client::with_rates(View::new(0.0, 0.0, 100.0), 1 << 20, UpdateRates::default());
+    let world = |hp: u32| {
+        vec![
+            thing(1, 10.0, 0.0, hp),
+            thing(2, 65.0, 0.0, hp),
+            thing(3, 95.0, 0.0, hp),
+            thing(4, 0.0, 95.0, hp).global(),
+            EntityState::new(
+                5,
+                2,
+                -95.0,
+                0.0,
+                vec![FieldValue::F(-95.0), FieldValue::F(0.0), FieldValue::U(hp)],
+            ),
+        ]
+    };
+    let d = c.patch(world(0), 0);
+    assert_eq!(d.creates.len(), 5, "creates are never held");
+
+    let mut updates: BTreeMap<u32, u32> = BTreeMap::new();
+    for tick in 1..=40 {
+        let d = c.patch(world(tick), tick);
+        for u in &d.updates {
+            *updates.entry(u.id).or_insert(0) += 1;
+        }
+        // Every entity shows a state at most its interval - 1 patches old.
+        for (id, every) in [(1, 1), (2, 2), (3, 4), (4, 1), (5, 1)] {
+            assert!(hp(&c, id) + every > tick, "entity {id} at tick {tick}");
+        }
+    }
+    assert_eq!(updates[&1], 40, "near: every patch");
+    assert_eq!(updates[&2], 20, "mid: every 2nd");
+    assert_eq!(updates[&3], 10, "far: every 4th");
+    assert_eq!(updates[&4], 40, "global: never held");
+    assert_eq!(updates[&5], 40, "every_patch kind: never held");
+
+    // The last change arrives within 4 patches, then nothing more is sent.
+    for tick in 41..=44 {
+        c.patch(world(40), tick);
+    }
+    assert!((1..=5).all(|id| hp(&c, id) == 40));
+    let d = c.patch(world(40), 45);
+    assert!(d.updates.is_empty());
+}
+
+#[test]
+fn update_rates_never_hold_entering_spawning_or_leaving_entities() {
+    let mut c = Client::with_rates(View::new(0.0, 0.0, 100.0), 1 << 20, UpdateRates::default());
+    c.patch(vec![thing(1, 95.0, 0.0, 1)], 0);
+    // A far spawn is created at once, whatever the patch.
+    for tick in 1..=4 {
+        let d = c.patch(
+            vec![thing(1, 95.0, 0.0, 1), thing(10 + tick, 0.0, 95.0, 1)],
+            tick,
+        );
+        assert_eq!(
+            d.creates.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![10 + tick]
+        );
+        assert_eq!(d.removes, if tick == 1 { vec![] } else { vec![9 + tick] });
+    }
+    // Leaving the view (beyond 110) and despawning are removed at once.
+    let d = c.patch(vec![thing(1, 111.0, 0.0, 2)], 5);
+    assert_eq!(d.removes, vec![1, 14]);
+    assert!(c.mirror.entities.is_empty());
 }

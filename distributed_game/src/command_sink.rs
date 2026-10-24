@@ -44,7 +44,9 @@ use distributed::microsvc::Session;
 use serde_json::Value;
 
 use crate::cell::{command_id_for, session_stamp, trusted_session};
-use crate::facts::{BoxFuture, Fact, FactCommand, FactError, FactReceipt, FactSink};
+use crate::facts::{
+    commit_each, BoxFuture, Fact, FactBatchSink, FactCommand, FactError, FactReceipt, FactSink,
+};
 use crate::lifecycle::LIFECYCLE_COMMANDS;
 #[cfg(feature = "command-host")]
 use crate::stamp::SESSION_PREFIX;
@@ -152,6 +154,26 @@ pub trait FactHost: Send + Sync + 'static {
         &'a self,
         call: FactCall<'a>,
     ) -> BoxFuture<'a, Result<FactReceipt, FactError>>;
+
+    /// The host's batch route, if it runs many facts for one aggregate in
+    /// one request (default none: one by one). Opting in and supplying the
+    /// batch dispatch are the same override, usually `Some(self)`; the
+    /// sink's [`FactSink::batches`] follows it.
+    fn fact_batches(&self) -> Option<&dyn FactBatchHost> {
+        None
+    }
+}
+
+/// A [`FactHost`] with a batch route, handed out by
+/// [`FactHost::fact_batches`].
+pub trait FactBatchHost: Send + Sync {
+    /// Run `calls` (consecutive facts for one aggregate: same kind and
+    /// shard) in order, under [`FactBatchSink::commit_batch`]'s contract:
+    /// the results end at the first retryable failure.
+    fn dispatch_fact_batch<'a>(
+        &'a self,
+        calls: Vec<FactCall<'a>>,
+    ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>>;
 }
 
 /// See the module docs.
@@ -278,21 +300,80 @@ impl<H> CommandFactSink<H> {
     }
 }
 
+impl<H: FactHost> CommandFactSink<H> {
+    fn call_for<'a>(&'a self, fact: &'a Fact) -> Result<FactCall<'a>, FactError> {
+        let (route, shard, principal, session, command_id) = self.resolve(fact)?;
+        Ok(FactCall {
+            command: fact.command(),
+            kind: route.kind(),
+            shard,
+            command_id,
+            input: fact.input(),
+            principal,
+            session,
+        })
+    }
+}
+
 impl<H: FactHost> FactSink for CommandFactSink<H> {
     fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+        Box::pin(async move { self.host.dispatch_fact(self.call_for(fact)?).await })
+    }
+
+    fn batches(&self) -> Option<&dyn FactBatchSink> {
+        self.host.fact_batches().map(|_| self as &dyn FactBatchSink)
+    }
+}
+
+impl<H: FactHost> FactBatchSink for CommandFactSink<H> {
+    /// Consecutive facts for the same aggregate go to the host together
+    /// ([`FactBatchHost::dispatch_fact_batch`]).
+    fn commit_batch<'a>(
+        &'a self,
+        facts: &'a [Fact],
+    ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
         Box::pin(async move {
-            let (route, shard, principal, session, command_id) = self.resolve(fact)?;
-            self.host
-                .dispatch_fact(FactCall {
-                    command: fact.command(),
-                    kind: route.kind(),
-                    shard,
-                    command_id,
-                    input: fact.input(),
-                    principal,
-                    session,
-                })
-                .await
+            let Some(host) = self.host.fact_batches() else {
+                return commit_each(self, facts).await;
+            };
+            let mut results = Vec::with_capacity(facts.len());
+            let mut i = 0;
+            while i < facts.len() {
+                let call = match self.call_for(&facts[i]) {
+                    Ok(call) => call,
+                    Err(error) => {
+                        results.push(Err(error));
+                        i += 1;
+                        continue;
+                    }
+                };
+                let mut run = vec![call];
+                let mut next = i + 1;
+                while let Some(fact) = facts.get(next) {
+                    match self.call_for(fact) {
+                        Ok(call) if call.kind == run[0].kind && call.shard == run[0].shard => {
+                            run.push(call);
+                            next += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                let n = run.len();
+                let batch: Vec<_> = host
+                    .dispatch_fact_batch(run)
+                    .await
+                    .into_iter()
+                    .take(n)
+                    .collect();
+                let complete =
+                    batch.len() == n && !matches!(batch.last(), Some(Err(FactError::Retryable(_))));
+                results.extend(batch);
+                if !complete {
+                    break;
+                }
+                i = next;
+            }
+            results
         })
     }
 }
@@ -570,5 +651,116 @@ mod tests {
         assert!(CelldFactSink::celld("ftp://x", secret(), "s", "p").is_err());
         assert!(CelldFactSink::celld("http://x", secret(), " ", "p").is_err());
         assert!(CelldFactSink::celld("http://x", secret(), "s", " ").is_err());
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use std::sync::Mutex;
+
+    use serde_json::json;
+
+    use super::*;
+
+    /// Records each batch as `(shard, commands)`; `busy` answers retryable.
+    #[derive(Default)]
+    struct RecordingHost {
+        batches: Mutex<Vec<(String, usize)>>,
+        busy: Option<String>,
+    }
+
+    impl FactHost for RecordingHost {
+        fn dispatch_fact<'a>(
+            &'a self,
+            _: FactCall<'a>,
+        ) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+            unreachable!("batches only")
+        }
+
+        fn fact_batches(&self) -> Option<&dyn FactBatchHost> {
+            Some(self)
+        }
+    }
+
+    impl FactBatchHost for RecordingHost {
+        fn dispatch_fact_batch<'a>(
+            &'a self,
+            calls: Vec<FactCall<'a>>,
+        ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
+            Box::pin(async move {
+                let shard = calls[0].shard.clone();
+                self.batches.lock().unwrap().push((shard, calls.len()));
+                let mut results = Vec::new();
+                for call in &calls {
+                    if self.busy.as_deref() == Some(call.input["n"].as_str().unwrap()) {
+                        results.push(Err(FactError::Retryable("busy".into())));
+                        break;
+                    }
+                    results.push(Ok(FactReceipt {
+                        payload: Value::Null,
+                        replayed: false,
+                    }));
+                }
+                results
+            })
+        }
+    }
+
+    fn sink(host: RecordingHost) -> CommandFactSink<RecordingHost> {
+        CommandFactSink::new(host, "zone-test", "zone:z1")
+            .unwrap()
+            .route(FactRoute::new("credit", "room", |input, _| {
+                input.get("room")?.as_str().map(str::to_string)
+            }))
+    }
+
+    fn facts(rooms: &[&str]) -> Vec<Fact> {
+        rooms
+            .iter()
+            .enumerate()
+            .map(|(i, room)| {
+                let command = if room.is_empty() {
+                    "unrouted"
+                } else {
+                    "credit"
+                };
+                Fact::new(
+                    format!("k{i}"),
+                    command,
+                    json!({ "room": room, "n": format!("n{i}") }),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn consecutive_facts_for_one_aggregate_travel_together() {
+        let sink = sink(RecordingHost::default());
+        let facts = facts(&["r1", "r1", "", "r2", "r2", "r2", "r1"]);
+        let results = sink.commit_batch(&facts).await;
+        assert_eq!(results.len(), 7);
+        assert!(matches!(results[2], Err(FactError::Permanent(_))));
+        assert!(results.iter().enumerate().all(|(i, r)| i == 2 || r.is_ok()));
+        assert_eq!(
+            *sink.host.batches.lock().unwrap(),
+            [("r1".into(), 2), ("r2".into(), 3), ("r1".into(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retryable_fact_ends_the_batch() {
+        let sink = sink(RecordingHost {
+            busy: Some("n3".into()),
+            ..RecordingHost::default()
+        });
+        let facts = facts(&["r1", "r1", "r2", "r2", "r2", "r3"]);
+        let results = sink.commit_batch(&facts).await;
+        // r1 ×2, then r2 stops at its second fact; r3 is not attempted.
+        assert_eq!(results.len(), 4);
+        assert!(matches!(results[3], Err(FactError::Retryable(_))));
+        assert_eq!(
+            *sink.host.batches.lock().unwrap(),
+            [("r1".into(), 2), ("r2".into(), 3)]
+        );
     }
 }
