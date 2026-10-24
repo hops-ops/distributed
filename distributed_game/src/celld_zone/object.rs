@@ -37,6 +37,10 @@ use crate::protocol::{error, ClientMessage, Notice, Role, ServerMessage, PROTOCO
 use crate::stamp::FactStamp;
 use crate::ticket::{NonceCache, TicketKey, VerifiedTicket};
 use crate::world::content_rollout::{zone_step, ContentState, ZoneStep, CONTENT_ROLLOUT_KIND};
+use crate::world::watch::{
+    next_reconcile_ms, topic, view_version, watch_query_string, watcher_address, TopicVersions,
+    WatchUpdate, Watches, PUSH_ROUTE, WATCH_LEASE_MS,
+};
 use crate::world::zone_activity::{
     zone_principal, RecordActivity, ACTIVITY_ACTIVE, ACTIVITY_DORMANT, ACTIVITY_HIBERNATED,
     ZONE_ACTIVITY_KIND,
@@ -62,8 +66,9 @@ const FACT_CAPACITY: usize = 512;
 const OUTBOX_RETRY_MS: f64 = 10_000.0;
 /// Shortest crash watchdog period (each re-arm is a durable alarm write).
 const WATCHDOG_MIN_MS: f64 = 60_000.0;
-/// Read the dev settings this often while ticking (ms).
-const DEV_SETTINGS_EVERY_MS: f64 = 1_000.0;
+/// Re-read watched cells this often when the object cannot take pushes
+/// (no class binding: built with [`ZoneObject::new`] and no `ZONE_BINDING`).
+const POLL_MS: f64 = 1_000.0;
 
 /// Server → client, through the socket's simulated network.
 enum OutItem {
@@ -112,8 +117,23 @@ pub trait CelldZone: Zone {
         None
     }
 
+    /// The world cells the zone watches ([`Watches`]): each is read on
+    /// wake, pushed by its cell after every change and re-read every ~45 s;
+    /// its view becomes a message ([`Zone::on_message`]). Eventually
+    /// consistent: world flavour, never reward settlement.
+    ///
+    /// ```ignore
+    /// fn watch(zone_id: &str) -> Watches<PitMessage> {
+    ///     Watches::new().cell(HOOD_KIND, &hood_of(zone_id), |read: HoodRead| read.state.map(PitMessage::Hood))
+    /// }
+    /// ```
+    fn watch(_zone_id: &str) -> Watches<Self::Message> {
+        Watches::new()
+    }
+
     /// How often [`refresh`](Self::refresh) runs while the zone ticks
-    /// (`None`: never). It also runs once on every wake.
+    /// (`None`: never). It also runs once on every wake. For cell state,
+    /// prefer [`watch`](Self::watch) (pushed, no polling).
     fn refresh_every() -> Option<Duration> {
         None
     }
@@ -163,6 +183,18 @@ impl ObjectEnv {
     /// `GET /{kind}/{shard}` on a cell of this worker (its read route),
     /// object to object, with the internal secret.
     pub async fn read_cell(&self, kind: &str, shard: &str) -> std::result::Result<Value, String> {
+        self.read_cell_watching(kind, shard, None).await
+    }
+
+    /// [`read_cell`](Self::read_cell) that also watches the cell for
+    /// `watcher` ([`crate::world::watch`]): the cell pushes its next
+    /// versions until the lease ends.
+    pub async fn read_cell_watching(
+        &self,
+        kind: &str,
+        shard: &str,
+        watcher: Option<&str>,
+    ) -> std::result::Result<Value, String> {
         let secret = self
             .var(CELL_INTERNAL_SECRET_ENV)
             .ok_or_else(|| format!("{CELL_INTERNAL_SECRET_ENV} is required"))?;
@@ -172,7 +204,11 @@ impl ObjectEnv {
             .map_err(|e| e.to_string())?;
         let mut init = RequestInit::new();
         init.with_method(Method::Get).with_headers(headers);
-        let url = format!("https://cell/{kind}/{}", encode_segment(shard));
+        let mut url = format!("https://cell/{kind}/{}", encode_segment(shard));
+        if let Some(watcher) = watcher {
+            url.push('?');
+            url.push_str(&watch_query_string(watcher, WATCH_LEASE_MS));
+        }
         let request = Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
         let stub = stub_for(&self.env, kind, shard).map_err(|e| e.to_string())?;
         let mut response = stub
@@ -447,9 +483,13 @@ struct Inner<Z: CelldZone> {
     drain_at: Option<f64>,
     /// Spawns a drain task waking at the given time (set by the object).
     drainer: Option<Rc<dyn Fn(f64)>>,
-    last_dev_read_ms: f64,
-    /// Last read of the world's content rollout cell.
-    last_content_read_ms: f64,
+    /// Watched world cells ([`CelldZone::watch`] plus the dev settings and
+    /// content rollout), built on the first wake.
+    watches: Option<Rc<Watches<Z::Message>>>,
+    /// Highest version applied per watched topic (this activation).
+    world_versions: TopicVersions,
+    /// When each watched topic is read next (ms).
+    world_due: HashMap<String, f64>,
     /// [`CelldZone::refresh`] calls of this activation, and the last one.
     refresh_round: u64,
     last_refresh_ms: f64,
@@ -706,10 +746,24 @@ pub struct ZoneObject<Z: CelldZone> {
     state: Rc<State>,
     env: ObjectEnv,
     inner: Rc<RefCell<Inner<Z>>>,
+    /// Namespace binding of the object's class (`PIT_ROOM`): where watched
+    /// cells push. Empty: no pushes, watched cells are polled.
+    binding: Rc<str>,
 }
 
 impl<Z: CelldZone> ZoneObject<Z> {
-    /// The object for `state` (constructor of the Durable Object).
+    /// The object of Durable Object class `class` (bound, by convention, as
+    /// [`class_binding`](crate::world::watch::class_binding)`(class)`, e.g.
+    /// `PitRoom` → `PIT_ROOM`); [`crate::celld_zone_object!`] calls it.
+    pub fn of_class(state: State, env: Env, class: &str) -> Self {
+        let mut object = Self::new(state, env);
+        object.binding = crate::world::watch::class_binding(class).into();
+        object
+    }
+
+    /// The object for `state` (constructor of the Durable Object). Watched
+    /// cells push to it only if `ZONE_BINDING` names its class binding;
+    /// prefer [`of_class`](Self::of_class).
     pub fn new(state: State, env: Env) -> Self {
         let zone_id = state.id().name().unwrap_or_default();
         let env = ObjectEnv::new(env);
@@ -758,8 +812,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             in_lines: HashMap::new(),
             drain_at: None,
             drainer: None,
-            last_dev_read_ms: 0.0,
-            last_content_read_ms: 0.0,
+            watches: None,
+            world_versions: TopicVersions::new(),
+            world_due: HashMap::new(),
             refresh_round: 0,
             last_refresh_ms: 0.0,
         };
@@ -768,10 +823,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
         inner.borrow_mut().drainer = Some(Rc::new(move |due: f64| {
             wasm_bindgen_futures::spawn_local(drain_task(weak.clone(), due));
         }));
+        let binding = env.var("ZONE_BINDING").unwrap_or_default().into();
         Self {
             state: Rc::new(state),
             env,
             inner,
+            binding,
         }
     }
 
@@ -792,6 +849,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             return Response::error("zone id required", 400);
         }
         let path = req.url()?.path().to_string();
+        if req.method() == Method::Post && path.ends_with(&format!("/{PUSH_ROUTE}")) {
+            return self.take_push(req).await;
+        }
         if path.ends_with("/info") {
             // Debug JSON without secrets; pages on other origins may read it.
             let response = Response::from_json(&self.info())?;
@@ -1101,7 +1161,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             host_config.reconnect_grace = options.reconnect_grace;
             host_config.boot_epoch = (now_ms() * 1000.0) as u64;
             // The content version the zone slept on (a rollout it missed is
-            // caught up by `read_content`).
+            // caught up by its first content rollout read).
             if let Some(snapshot) = &stored {
                 host_config.content_version = snapshot.version.clone();
             }
@@ -1174,15 +1234,14 @@ impl<Z: CelldZone> ZoneObject<Z> {
         }
         self.store_status().await;
         self.find_node();
-        // Off the join path: a wake (often a doorway into a sleeping zone,
-        // with the player's inputs waiting) does not wait for dev settings.
-        let this = self.handle();
-        wasm_bindgen_futures::spawn_local(async move { this.read_dev_settings().await });
-        // The snapshot restored the zone's last content version; catch up
-        // with a rollout it slept through (off the join path too: a Hello
-        // on another version waits for its own read, see `hello`).
-        let this = self.handle();
-        wasm_bindgen_futures::spawn_local(async move { this.read_content().await });
+        // Hydrate every watched cell, off the join path: a wake (often a
+        // doorway into a sleeping zone, with the player's inputs waiting)
+        // does not wait for them. The snapshot restored the zone's last
+        // content version; the rollout read catches up with one it slept
+        // through (a Hello on another version waits for its own read, see
+        // `hello`).
+        self.inner.borrow_mut().world_versions.clear();
+        self.reconcile_world(true);
         self.refresh();
         Ok(())
     }
@@ -1222,68 +1281,148 @@ impl<Z: CelldZone> ZoneObject<Z> {
         }
     }
 
-    /// Dev only (`ZONE_DEV_SETTINGS=1`): read the network simulation from
-    /// the worker's dev settings object.
-    async fn read_dev_settings(&self) {
-        let enabled = {
-            let mut inner = self.inner.borrow_mut();
-            inner.last_dev_read_ms = now_ms();
-            inner.options.as_ref().is_some_and(|o| o.dev_settings)
-        };
-        if !enabled {
-            return;
-        }
-        match self.env.read_cell(ZONE_DEV_KIND, NETSIM_SHARD).await {
-            Ok(value) => {
-                let sim = serde_json::from_value::<NetSimJson>(value)
-                    .unwrap_or_default()
-                    .to_sim();
-                self.inner.borrow_mut().net_sim = sim;
-            }
-            Err(e) => worker::console_warn!("zone dev settings: {e}"),
-        }
+    /// The world whose content rollout the zone follows, if any.
+    fn content_world(&self) -> Option<String> {
+        let inner = self.inner.borrow();
+        inner
+            .options
+            .as_ref()
+            .and_then(|o| o.content_rollout.clone())
     }
 
-    /// [`read_dev_settings`](Self::read_dev_settings) off the tick, at most
-    /// every [`DEV_SETTINGS_EVERY_MS`].
-    fn refresh_dev_settings(&self) {
-        let due = {
+    /// Every watched topic: the dev settings (`ZONE_DEV_SETTINGS=1`), the
+    /// content rollout (`ZONE_CONTENT_ROLLOUT`) and the game's
+    /// [`CelldZone::watch`].
+    fn world_topics(&self) -> Vec<String> {
+        let (dev, zone_id) = {
             let inner = self.inner.borrow();
-            inner.options.as_ref().is_some_and(|o| o.dev_settings)
-                && now_ms() - inner.last_dev_read_ms >= DEV_SETTINGS_EVERY_MS
+            let dev = inner.options.as_ref().is_some_and(|o| o.dev_settings);
+            (dev, inner.zone_id.clone())
         };
-        if due {
-            self.inner.borrow_mut().last_dev_read_ms = now_ms();
-            let this = self.handle();
-            wasm_bindgen_futures::spawn_local(async move { this.read_dev_settings().await });
+        let watches = self
+            .inner
+            .borrow_mut()
+            .watches
+            .get_or_insert_with(|| Rc::new(Z::watch(&zone_id)))
+            .clone();
+        let mut topics = Vec::with_capacity(watches.len() + 2);
+        if dev {
+            topics.push(topic(ZONE_DEV_KIND, NETSIM_SHARD));
+        }
+        if let Some(world) = self.content_world() {
+            topics.push(topic(CONTENT_ROLLOUT_KIND, &world));
+        }
+        topics.extend(watches.iter().map(|w| w.topic()));
+        topics
+    }
+
+    /// Read the watched topics that are due (all of them with `all`, on
+    /// wake) off the tick. With a class binding each read renews the
+    /// zone's watch and the next comes ~45 s later (pushes carry the
+    /// changes); without one the cells are polled every [`POLL_MS`].
+    fn reconcile_world(&self, all: bool) {
+        let now = now_ms();
+        let pushed = !self.binding.is_empty();
+        for topic in self.world_topics() {
+            let due = {
+                let mut inner = self.inner.borrow_mut();
+                let next = inner.world_due.get(&topic).copied().unwrap_or(0.0);
+                if !all && now < next {
+                    continue;
+                }
+                let after = if pushed {
+                    next_reconcile_ms(now as u64, js_sys::Math::random()) as f64
+                } else {
+                    now + POLL_MS
+                };
+                inner.world_due.insert(topic.clone(), after);
+                true
+            };
+            if due {
+                let this = self.handle();
+                wasm_bindgen_futures::spawn_local(async move { this.reconcile(&topic).await });
+            }
         }
     }
 
-    /// Read the world's content rollout cell and follow it
-    /// ([`zone_step`]: freeze, apply + resume).
-    async fn read_content(&self) {
-        let world = {
-            let mut inner = self.inner.borrow_mut();
-            inner.last_content_read_ms = now_ms();
-            inner
-                .options
-                .as_ref()
-                .and_then(|o| o.content_rollout.clone())
-        };
-        let Some(world) = world else {
+    /// Read watched `topic` (`kind/shard`), watching it when the object
+    /// can take pushes, and apply its view.
+    async fn reconcile(&self, topic: &str) {
+        let Some((kind, shard)) = topic.split_once('/') else {
             return;
         };
-        match self.env.read_cell(CONTENT_ROLLOUT_KIND, &world).await {
-            Ok(value) => {
-                let state = value
-                    .get("state")
-                    .cloned()
-                    .and_then(|state| serde_json::from_value::<ContentState>(state).ok());
-                if let Some(state) = state {
-                    self.apply_content(&state);
-                }
+        let watcher = (!self.binding.is_empty()).then(|| {
+            let zone_id = self.inner.borrow().zone_id.clone();
+            watcher_address(&self.binding, &zone_id)
+        });
+        match self
+            .env
+            .read_cell_watching(kind, shard, watcher.as_deref())
+            .await
+        {
+            Ok(view) => self.apply_view(topic, view),
+            Err(e) => worker::console_warn!("world view {topic}: {e}"),
+        }
+    }
+
+    /// A pushed update (`POST …/__world`, internal secret): applied when
+    /// the zone is in memory and watches the topic; a sleeping zone
+    /// hydrates on wake instead (a push never wakes it).
+    async fn take_push(&self, mut req: Request) -> Result<Response> {
+        if let Err(error) = super::cells::authenticate(&req, self.env.env()) {
+            return super::cells::error_response(error);
+        }
+        let Ok(update) = req.json::<WatchUpdate>().await else {
+            return Response::error("a world update is required", 400);
+        };
+        let awake = self.inner.borrow().host.is_some();
+        if awake && self.world_topics().contains(&update.topic) {
+            self.apply_view(&update.topic, update.view);
+        }
+        Response::empty().map(|r| r.with_status(204))
+    }
+
+    /// Apply `view` of `topic` if it is newer than what the zone has.
+    fn apply_view(&self, topic: &str, view: Value) {
+        let version = view_version(&view);
+        if !self
+            .inner
+            .borrow_mut()
+            .world_versions
+            .accept(topic, version)
+        {
+            return;
+        }
+        let (kind, shard) = topic.split_once('/').unwrap_or((topic, ""));
+        if kind == ZONE_DEV_KIND && shard == NETSIM_SHARD {
+            let sim = serde_json::from_value::<NetSimJson>(view)
+                .unwrap_or_default()
+                .to_sim();
+            self.inner.borrow_mut().net_sim = sim;
+            return;
+        }
+        if kind == CONTENT_ROLLOUT_KIND && self.content_world().as_deref() == Some(shard) {
+            let state = view
+                .get("state")
+                .cloned()
+                .and_then(|state| serde_json::from_value::<ContentState>(state).ok());
+            if let Some(state) = state {
+                self.apply_content(&state);
             }
-            Err(e) => worker::console_warn!("content rollout: {e}"),
+            return;
+        }
+        let watches = self.inner.borrow().watches.clone();
+        let Some(message) = watches
+            .as_ref()
+            .and_then(|w| w.get(topic))
+            .and_then(|watch| watch.message(view))
+        else {
+            return;
+        };
+        let mut inner = self.inner.borrow_mut();
+        if let Some(host) = inner.host.as_mut() {
+            host.deliver(ZoneInbound::Message(message));
+            inner.flush();
         }
     }
 
@@ -1318,24 +1457,6 @@ impl<Z: CelldZone> ZoneObject<Z> {
             }
         }
         inner.flush();
-    }
-
-    /// [`read_content`](Self::read_content) off the tick, at most every
-    /// [`DEV_SETTINGS_EVERY_MS`].
-    fn refresh_content(&self) {
-        let due = {
-            let inner = self.inner.borrow();
-            inner
-                .options
-                .as_ref()
-                .is_some_and(|o| o.content_rollout.is_some())
-                && now_ms() - inner.last_content_read_ms >= DEV_SETTINGS_EVERY_MS
-        };
-        if due {
-            self.inner.borrow_mut().last_content_read_ms = now_ms();
-            let this = self.handle();
-            wasm_bindgen_futures::spawn_local(async move { this.read_content().await });
-        }
     }
 
     async fn hello(&self, ws: &WebSocket, hello: crate::protocol::Hello) -> Result<()> {
@@ -1433,7 +1554,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
                         .is_some_and(|h| h.config().content_version != hello.content_version)
             };
             if behind {
-                self.read_content().await;
+                if let Some(world) = self.content_world() {
+                    self.reconcile(&topic(CONTENT_ROLLOUT_KIND, &world)).await;
+                }
             }
             let mut inner = self.inner.borrow_mut();
             let Some(host) = inner.host.as_mut() else {
@@ -1575,6 +1698,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             state: self.state.clone(),
             env: self.env.clone(),
             inner: self.inner.clone(),
+            binding: self.binding.clone(),
         }
     }
 
@@ -1641,8 +1765,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             // Storage stays off the loop: the simulation keeps its pace
             // while a write waits on the bucket.
             self.spool_later();
-            self.refresh_dev_settings();
-            self.refresh_content();
+            self.reconcile_world(false);
             self.refresh_if_due();
             if stop {
                 self.persist().await;
@@ -1988,7 +2111,11 @@ macro_rules! celld_zone_object {
         impl ::worker::DurableObject for $name {
             fn new(state: ::worker::State, env: ::worker::Env) -> Self {
                 Self {
-                    zone: $crate::celld_zone::ZoneObject::new(state, env),
+                    zone: $crate::celld_zone::ZoneObject::of_class(
+                        state,
+                        env,
+                        ::core::stringify!($name),
+                    ),
                 }
             }
 

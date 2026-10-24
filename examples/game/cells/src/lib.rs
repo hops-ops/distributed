@@ -17,6 +17,8 @@
 //!   boss room's zone fact raises its hood; the Queue consumer below runs
 //!   the saga that ripples hood events into the borough and borough events
 //!   into the city (idempotent commands, ids derived from the event ids).
+//!   Rooms watch them (`CellWatchers`): each change is pushed to the rooms
+//!   holding a watch lease, which re-read every ~45 s (no polling).
 //!
 //! - `content-rollout/world` (`ContentRolloutObject`): the world's live
 //!   content (`distributed_game::world::content_rollout`). The services'
@@ -58,7 +60,7 @@ use distributed::microsvc::{
 use distributed::{sourced, Aggregate, Entity};
 use distributed_game::cell::{fact_session_from_headers, session_stamp};
 use distributed_game::celld_zone::{
-    forward_to_zone, ContentRolloutCell, ZoneActivityCell, ZoneDevSettings,
+    forward_to_zone, CellWatchers, ContentRolloutCell, ZoneActivityCell, ZoneDevSettings,
 };
 use distributed_game::lifecycle::{
     Lifecycle, CONNECTION_LOST, PLAYER_DISCONNECTED, PLAYER_JOINED, PLAYER_LEFT, PLAYER_RECONNECTED,
@@ -70,8 +72,8 @@ use mobpit_crawler::{
     Crawler, MobKilledArgs, RecordKill, CRAWLER_KIND, MOB_KILLED_EVENT, PRESENCE_KIND,
 };
 use mobpit_tiers::{
-    mount_borough, mount_city, mount_hood, Borough, City, Hood, BOROUGH_KIND, CITY_KIND, HOOD_KIND,
-    SAGA_PRINCIPAL,
+    mount_borough, mount_city, mount_hood, Borough, BoroughRead, City, CityRead, Hood, HoodRead,
+    BOROUGH_KIND, CITY_KIND, HOOD_KIND, SAGA_PRINCIPAL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -456,20 +458,17 @@ fn borough_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
 
 async fn read_hood(cell: &AggregateCell<Hood>) -> std::result::Result<Value, String> {
     let hood = cell.load().await.map_err(|error| error.to_string())?;
-    Ok(json!({ "state": hood.map(|h| h.state()) }))
+    serde_json::to_value(HoodRead::of(hood.as_ref())).map_err(|error| error.to_string())
 }
 
 async fn read_borough(cell: &AggregateCell<Borough>) -> std::result::Result<Value, String> {
     let borough = cell.load().await.map_err(|error| error.to_string())?;
-    Ok(json!({
-        "state": borough.as_ref().map(|b| b.state()),
-        "hoods_down": borough.map(|b| b.hoods_down()).unwrap_or_default(),
-    }))
+    serde_json::to_value(BoroughRead::of(borough.as_ref())).map_err(|error| error.to_string())
 }
 
 async fn read_city(cell: &AggregateCell<City>) -> std::result::Result<Value, String> {
     let city = cell.load().await.map_err(|error| error.to_string())?;
-    Ok(json!({ "state": city.map(|c| c.state()) }))
+    serde_json::to_value(CityRead::of(city.as_ref())).map_err(|error| error.to_string())
 }
 
 /// A hood: its boss rooms' facts and its own respawn schedule.
@@ -477,25 +476,34 @@ async fn read_city(cell: &AggregateCell<City>) -> std::result::Result<Value, Str
 pub struct HoodCell {
     cell: AggregateCell<Hood>,
     env: Env,
+    /// Rooms watching it (pushed after every change).
+    watchers: CellWatchers,
 }
 
 impl DurableObject for HoodCell {
     fn new(state: State, env: Env) -> Self {
         console_error_panic_hook::set_once();
+        let watchers = CellWatchers::new(HOOD_KIND, &state);
         let cell = mount_hood(
             AggregateCell::<Hood>::from_state_with_snapshots(state, 50)
                 .expect("hood cell identity"),
         )
         .with_celld_outbox(outbox(&env));
-        Self { cell, env }
+        Self {
+            cell,
+            env,
+            watchers,
+        }
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_hood, fact_session).await
+        self.watchers
+            .serve(&self.env, &self.cell, req, read_hood, fact_session)
+            .await
     }
 
     async fn alarm(&self) -> Result<Response> {
-        alarm(&self.env, &self.cell).await
+        self.watchers.alarm(&self.env, &self.cell, read_hood).await
     }
 }
 
@@ -504,25 +512,36 @@ impl DurableObject for HoodCell {
 pub struct BoroughCell {
     cell: AggregateCell<Borough>,
     env: Env,
+    /// Rooms watching it (pushed after every change).
+    watchers: CellWatchers,
 }
 
 impl DurableObject for BoroughCell {
     fn new(state: State, env: Env) -> Self {
         console_error_panic_hook::set_once();
+        let watchers = CellWatchers::new(BOROUGH_KIND, &state);
         let cell = mount_borough(
             AggregateCell::<Borough>::from_state_with_snapshots(state, 50)
                 .expect("borough cell identity"),
         )
         .with_celld_outbox(outbox(&env));
-        Self { cell, env }
+        Self {
+            cell,
+            env,
+            watchers,
+        }
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_borough, borough_session).await
+        self.watchers
+            .serve(&self.env, &self.cell, req, read_borough, borough_session)
+            .await
     }
 
     async fn alarm(&self) -> Result<Response> {
-        alarm(&self.env, &self.cell).await
+        self.watchers
+            .alarm(&self.env, &self.cell, read_borough)
+            .await
     }
 }
 
@@ -531,25 +550,34 @@ impl DurableObject for BoroughCell {
 pub struct CityCell {
     cell: AggregateCell<City>,
     env: Env,
+    /// Rooms watching it (pushed after every change).
+    watchers: CellWatchers,
 }
 
 impl DurableObject for CityCell {
     fn new(state: State, env: Env) -> Self {
         console_error_panic_hook::set_once();
+        let watchers = CellWatchers::new(CITY_KIND, &state);
         let cell = mount_city(
             AggregateCell::<City>::from_state_with_snapshots(state, 50)
                 .expect("city cell identity"),
         )
         .with_celld_outbox(outbox(&env));
-        Self { cell, env }
+        Self {
+            cell,
+            env,
+            watchers,
+        }
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_city, saga_session).await
+        self.watchers
+            .serve(&self.env, &self.cell, req, read_city, saga_session)
+            .await
     }
 
     async fn alarm(&self) -> Result<Response> {
-        alarm(&self.env, &self.cell).await
+        self.watchers.alarm(&self.env, &self.cell, read_city).await
     }
 }
 

@@ -831,6 +831,42 @@ them exactly once across crashes), and the zone's lifecycle reports
 [`zone_activity`](src/world/zone_activity.rs) cell, which the
 `zone_status` read model projects for minimaps.
 
+**The world around: watched cells (CQRS).** World cells (a hood, a
+borough, the content rollout, the dev settings) are the write model; each
+zone keeps a small read model of the ones it cares about. The zone
+declares them; each cell's view decodes into a plain struct and becomes a
+normal zone message:
+
+```rust,ignore
+impl CelldZone for MobPit {
+    fn watch(zone: &str) -> Watches<PitMessage> {
+        Watches::new()
+            .cell(HOOD_KIND, &hood_of(zone), |read: HoodRead| read.state.map(PitMessage::hood))
+            .cell(CITY_KIND, CITY_SHARD, |read: CityRead| read.state.map(PitMessage::city))
+    }
+}
+
+// the cell: one field and two calls (reads leave a lease, commits push)
+self.watchers.serve(&self.env, &self.cell, req, read_hood, sessions).await
+self.watchers.alarm(&self.env, &self.cell, read_hood).await
+```
+
+The zone reads each cell on wake (`GET …?watch=PIT_ROOM/pit.0.0`, which
+leaves a lease in the cell's memory — no write); after every commit or
+alarm that moves the aggregate's version the cell pushes `{topic,
+version, view}` to the live watchers ([`CellWatchers`](src/celld_zone/cells.rs));
+the zone applies only newer versions and re-reads every 45 ± 15 s, renewing
+its lease and repairing a lost push. A command that moves the aggregate but
+not its view (a heartbeat such as Mob Pit's `room_awake`) pushes nothing,
+so N rooms waking do not cost N² pushes. A push never wakes a sleeping zone
+(it hydrates on wake). Load is O(view changes × watchers + zones / 45 s),
+not every zone reading every cell every second: on one laptop node the
+refusals of saturated world cells (celld's 64-in-flight cap) fell from 85
+to 25 with 128 one-player Mob Pit rooms and from 12 to 3 with 64 fighting
+ones (numbers in the `mobpit-zone-load-test` task). Read models are for
+display and world flavour; rewards stay on the fact → command path.
+`CelldZone::refresh` remains for other async reads.
+
 **Limits.** A live zone never moves (only idle objects are rebalanced), so
 load spreads by first touch and node caps. Objects of one class share V8
 isolates: a slow zone delays its neighbours. A node crash takes about the
@@ -1181,8 +1217,8 @@ principals commit concurrently; settlements arrive in completion order.
   (`celld-zone`) apply the same simulation to each socket when the worker
   sets `ZONE_DEV_SETTINGS=1`; the setting lives in the worker's dev
   settings object (`celld_zone::ZoneDevSettings`, `PUT /zone-dev/netsim`
-  `{latencyMs, jitterMs, loss}` with the internal secret) and every zone
-  object reads it within a second.
+  `{latencyMs, jitterMs, loss}` with the internal secret), pushed to every
+  zone object watching it (`world::watch`).
 
 ## World structure
 
@@ -1194,6 +1230,7 @@ principals commit concurrently; settlements arrive in completion order.
 | `ZoneOwnership` (`LocalOwnership`, `FencedLeaseOwnership<S: LeaseStore>`, `celld::CellZoneOwnership`) | every activation acquires a fenced claim (`host#activation`) and renews it; a failed renewal disposes the zone **without** saving. Two hosts never run the same zone. `CellZoneOwnership` keeps each claim in a celld `ZoneLease:{zone}` cell (`world::zone_lease`, mount with `mount_zone_lease`): acquire and release publish `zone.activated` / `zone.released`, renewals are internal (no outward events), and the lease's expiry schedule (`ctx.schedule`; the routes require `Capability::Scheduling` and `Clock`) publishes `zone.lease_expired` when a holder stops renewing, so services see a crashed zone server; each event carries the lease's `ZoneLeaseStatus { zone_id, holder, token, status }`. `world::ownership_conformance` is the behaviour every implementation passes. |
 | `ZoneStateStore` (`celld::CellZoneStateStore`; `MemoryZoneStateStore` for unit tests) | hibernation snapshots (async `load` / `save` / `delete`), written under the claim's fencing token (stale writers get `StateError::Stale`, counted in `distributed_game_hibernation_saves_total{outcome="stale"}` and logged to stderr, never silently dropped). On celld each zone's snapshot is its own `ZoneState:{zone}` cell (`world::zone_state`): inline up to 64 KiB, larger ones in the worker's R2 bucket with the digest in the cell; saves and deletes publish `zone_state.saved` / `zone_state.deleted` with a `ZoneSnapshotStatus { zone_id, token, stored, content_version, bytes }` (no bytes). `LocalOwnership` seeds its tokens from the Unix time (µs) at creation, so a restarted host still outranks the snapshots its previous run saved. |
 | `world::zone_status` (feature `cell`) | the read model of those events: `zone_leases` and `zone_snapshots` rows (`projection!` upserts of the state bodies), `projectors()` to mount on any consumer service and read-model store, and `ZoneStatus::of` → `Active { holder }` / `Hibernated { bytes }` / `Cold`. For views (world maps, minimaps): it answers "which zones are active or asleep?" without opening a cell per zone (on celld a read of a never-used cell creates it). Eventually consistent; ownership and restore always go to the cells. |
+| `world::watch` (`Watches`, `Watchers`, `TopicVersions`) | watched world views: a zone's typed list of the cells it watches; a cell's in-memory watcher leases; the zone's per-topic version guard (a late push or read never rolls back). On celld: `CelldZone::watch` + `celld_zone::CellWatchers`. |
 | `ZoneTopology` (`DottedTopology` default: `eldoria.port.docks` → `eldoria.port` → `eldoria`) | parent links for tier-up events. |
 
 **Per-zone host settings.** `GameServer::with_host_config(|zone_id, host|

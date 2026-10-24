@@ -42,10 +42,15 @@
 //!   the object's outbox before it is sent and deleted when settled; the
 //!   next activation or the outbox alarm resends what is left, and the
 //!   cells' command ledger turns a resend into a replay: exactly once.
-//! - **The world around.** [`CelldZone::refresh`] runs off the tick on
-//!   every wake and every [`CelldZone::refresh_every`] while the zone
-//!   ticks (e.g. reading the cells of the tiers a room belongs to); its
-//!   message is delivered into the zone.
+//! - **The world around.** A zone *watches* the world cells it cares
+//!   about ([`CelldZone::watch`], [`crate::world::watch`]): each is read
+//!   on wake, then pushed by its cell ([`CellWatchers`]) after every
+//!   change, and re-read every ~45 s (renewing the zone's in-memory watch
+//!   lease, repairing a lost push). Each view decodes into a plain struct
+//!   that becomes a zone message. The object takes pushes at its class
+//!   binding (`celld_zone_object!(PitRoom, …)` → `PIT_ROOM`). Custom async
+//!   reads still go through [`CelldZone::refresh`] /
+//!   [`CelldZone::refresh_every`].
 //! - **Status.** The zone reports its lifecycle as facts into its
 //!   [`zone_activity`](crate::world::zone_activity) cell, projected into the
 //!   [`zone_status`](crate::world::zone_status) read model (minimaps).
@@ -86,8 +91,8 @@
 //! **Live content updates.** With `ZONE_CONTENT_ROLLOUT=<world>` every
 //! zone object follows the world's
 //! [`content_rollout`](crate::world::content_rollout) cell
-//! ([`ContentRolloutCell`], binding `CONTENT_ROLLOUT`): it reads it on wake
-//! and every second while it ticks and runs
+//! ([`ContentRolloutCell`], binding `CONTENT_ROLLOUT`): it watches the cell
+//! (each phase is pushed) and runs
 //! [`zone_step`](crate::world::content_rollout::zone_step) — freeze with
 //! the change notes, then switch to the new version and resume (a hard
 //! rollout reloads stale clients at once). A zone that slept through a
@@ -100,9 +105,9 @@
 //! Dev only: with `ZONE_DEV_SETTINGS=1` every zone object applies the
 //! network simulation ([`NetSim`](crate::netsim::NetSim): latency, jitter,
 //! loss per socket and direction) stored in the worker's
-//! [`ZoneDevSettings`] object (`zone-dev/netsim`), read on wake and every
-//! second while it ticks; a dev route writes it (one setting for every
-//! zone, like the native server's `set_net_sim`).
+//! [`ZoneDevSettings`] object (`zone-dev/netsim`), watched like the content
+//! rollout (each write is pushed); a dev route writes it (one setting for
+//! every zone, like the native server's `set_net_sim`).
 //!
 //! Debug only: celld does not tell application code which node runs an
 //! object. With `CELLD_ZONE_NODES` set (operator listeners) the object asks
@@ -123,7 +128,7 @@ pub use plan::{
 
 #[cfg(target_arch = "wasm32")]
 pub use cells::{
-    authenticate, cell_alarm, error_response, fact_sessions, json_status, serve_cell,
+    authenticate, cell_alarm, error_response, fact_sessions, json_status, serve_cell, CellWatchers,
     ContentRolloutCell, Sessions, ZoneActivityCell, ZoneDevSettings,
 };
 #[cfg(target_arch = "wasm32")]

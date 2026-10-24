@@ -441,6 +441,38 @@ pub enum PitMessage {
     /// The same without the city (not read this round: kept as it was).
     #[game_event(id = 3)]
     WorldKeepCity(WorldTiers),
+    /// The room's hood, pushed by its cell (or re-read).
+    #[game_event(id = 4)]
+    Hood {
+        /// Times its boss fell.
+        tier: u32,
+        /// Its boss is down.
+        boss_down: bool,
+        /// Who felled it last.
+        last_by: String,
+    },
+    /// The room's borough, pushed by its cell (or re-read).
+    #[game_event(id = 5)]
+    Borough {
+        /// Bosses down in the borough.
+        bosses_down: u32,
+        /// Weather (index into `WEATHER`).
+        weather: u8,
+        /// World event (empty when none).
+        event: String,
+        /// When it ends (Unix ms).
+        event_until_ms: u64,
+        /// Hoods whose boss is down (`hx.hy`).
+        hoods_down: Vec<String>,
+    },
+    /// The city, pushed by its cell (or re-read).
+    #[game_event(id = 6)]
+    City {
+        /// Bosses down across the city.
+        bosses_down: u32,
+        /// The city's banner.
+        banner: String,
+    },
 }
 
 /// Mob Pit's client surface (also used by the leaderboard page).
@@ -1854,6 +1886,42 @@ impl Zone for MobPit {
     }
 
     fn on_message(&mut self, ctx: &mut Ctx<'_, Self>, message: PitMessage) {
+        // One tier pushed: the room's world with that tier replaced.
+        let message = match message {
+            PitMessage::Hood {
+                tier,
+                boss_down,
+                last_by,
+            } => PitMessage::World(WorldTiers {
+                hood_tier: tier,
+                boss_down,
+                last_by,
+                ..self.world.clone()
+            }),
+            PitMessage::Borough {
+                bosses_down,
+                weather,
+                event,
+                event_until_ms,
+                hoods_down,
+            } => PitMessage::World(WorldTiers {
+                borough_bosses_down: bosses_down,
+                weather,
+                event,
+                event_until_ms,
+                hoods_down,
+                ..self.world.clone()
+            }),
+            PitMessage::City {
+                bosses_down,
+                banner,
+            } => PitMessage::World(WorldTiers {
+                city_bosses_down: bosses_down,
+                banner,
+                ..self.world.clone()
+            }),
+            message => message,
+        };
         match message {
             PitMessage::Loaded {
                 principal,
@@ -1869,11 +1937,13 @@ impl Zone for MobPit {
                 }
                 ctx.send(id, &Self::profile_event(xp, level.max(1), kills, "cell"));
             }
+            // Mapped to `World` above.
+            PitMessage::Hood { .. } | PitMessage::Borough { .. } | PitMessage::City { .. } => {}
             message @ (PitMessage::World(_) | PitMessage::WorldKeepCity(_)) => {
                 let (world, keep_city) = match message {
                     PitMessage::World(world) => (world, false),
                     PitMessage::WorldKeepCity(world) => (world, true),
-                    PitMessage::Loaded { .. } => unreachable!(),
+                    _ => unreachable!(),
                 };
                 // Only the hood, borough and city this room belongs to.
                 // A fall reported here may not have reached the hood yet:
