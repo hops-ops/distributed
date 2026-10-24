@@ -109,6 +109,16 @@
 //! rollout (each write is pushed); a dev route writes it (one setting for
 //! every zone, like the native server's `set_net_sim`).
 //!
+//! **Work counters.** `GET …/info` carries the object's
+//! [`WorkCounters`](crate::work::WorkCounters) as `work` (records encoded,
+//! updates sent and held, Delta bytes, fact commands and `__batch`
+//! requests, outbox deletes, world reads and pushes) and the switches in
+//! effect; a watched cell answers `GET /{kind}/{shard}/__watchers` with its
+//! [`WatcherStats`](crate::world::watch::WatcherStats). A/B switches (worker
+//! vars, default on): `ZONE_FACT_BATCH` (1 = one fact per request),
+//! `ZONE_UPDATE_RATES=0` (every change every patch), `ZONE_WORLD_PUSH=0`
+//! (poll watched cells every second instead of taking pushes).
+//!
 //! Debug only: celld does not tell application code which node runs an
 //! object. With `CELLD_ZONE_NODES` set (operator listeners) the object asks
 //! each node whether it holds it; `CELLD_ZONE_NODE` names a fixed node.
@@ -123,7 +133,8 @@ mod object;
 
 pub use plan::{
     cell_binding, ObjectOptions, RoomState, StoredFact, TickSchedule, CLOSE_RESTARTED,
-    CONTENT_ROLLOUT_VAR, DEV_SETTINGS_VAR, NETSIM_SHARD, ZONE_DEV_KIND, ZONE_HEADER,
+    CONTENT_ROLLOUT_VAR, DEV_SETTINGS_VAR, NETSIM_SHARD, UPDATE_RATES_VAR, WORLD_PUSH_VAR,
+    ZONE_DEV_KIND, ZONE_HEADER,
 };
 
 #[cfg(target_arch = "wasm32")]

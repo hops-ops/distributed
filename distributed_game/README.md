@@ -969,6 +969,11 @@ unlimited rewind.
   inputs by outcome, bytes per Delta, facts pending and settled.
 - **Load bots**: `game-bots` connects N WebSocket clients and reports
   round-trip time and bandwidth.
+- **Work counters**: `WorkCounters` counts what a zone did (records
+  encoded, updates sent and held back, Delta bytes, fact commands and
+  cell requests, outbox deletes, world reads and pushes). Counts do not
+  move with machine load, so they compare runs exactly where timings
+  cannot.
 - **Network simulation**: `NetSim` adds latency, jitter and loss in
   development, and can be changed at runtime.
 
@@ -1249,6 +1254,24 @@ batch route (404) gets the facts one by one.
   Only the first `ServerConfig::metrics_zone_labels` (default 64) live
   zones get a `zone` label; the rest aggregate into `zone="_other"`.
   `AdvanceReport` carries the raw numbers for custom drivers.
+- **Work counters** (`work::WorkCounters`, always on, plain integers):
+  `record_advance(&report)` adds a patch's records encoded
+  (`AdvanceReport::encodes`, shared by every client), frames, Delta bytes,
+  creates, updates, updates held back by update rates
+  (`DeltaStats::held`) and budget deferrals. A celld zone object keeps one
+  per object and adds its fact commands, cell requests and `__batch`
+  requests, outbox deletes, watched-cell reads and pushes received; `GET
+  /zones/{zone}/info` reports it as `work`, with the A/B switches in effect
+  (`switches`). A watched cell answers `GET /{kind}/{shard}/__watchers`
+  (internal secret) with its live watchers and `WatcherStats` (watching
+  reads, views published, views skipped as unchanged, pushes sent).
+  Switches (worker vars, default on): `ZONE_FACT_BATCH=1` (one fact per
+  request), `ZONE_UPDATE_RATES=0` (every visible change every patch),
+  `ZONE_WORLD_PUSH=0` (zones poll watched cells every second instead of
+  taking pushes). Mob Pit's `mobpit-load` prints the counters per step,
+  normalised per room patch, room-second or room-minute, and runs
+  interleaved A/B (`--ab ZONE_UPDATE_RATES=0 --pairs 3`: A,B then B,A …,
+  medians per side and of the per-pair change).
 - **Bots** (`bots`): `run_bots(BotConfig, |i| behaviour)` connects N
   WebSocket clients with signed tickets, sends inputs (random walk,
   circle, or your own `Behaviour`), measures RTT and Delta bytes/s:

@@ -243,6 +243,9 @@ pub struct EncodedWorld {
     grid: SpatialGrid,
     globals: Vec<u32>,
     patch: u32,
+    /// Records encoded building this world (changed entities' payloads and
+    /// shared updates).
+    encoded: usize,
     cache: Mutex<UpdateCache>,
 }
 
@@ -254,6 +257,7 @@ impl Clone for EncodedWorld {
             grid: self.grid.clone(),
             globals: self.globals.clone(),
             patch: self.patch,
+            encoded: self.encoded,
             cache: Mutex::default(),
         }
     }
@@ -286,6 +290,7 @@ impl EncodedWorld {
             grid: SpatialGrid::new(interest.cell_size),
             globals: Vec::new(),
             patch: previous.map_or(0, |p| p.patch.wrapping_add(1)),
+            encoded: 0,
             cache: Mutex::default(),
         };
         let zero = FieldValue::U(0);
@@ -313,6 +318,7 @@ impl EncodedWorld {
                 }
                 _ => {
                     let payload = Arc::new(Payload::new(e.id, e.kind, data, offsets));
+                    world.encoded += 1 + usize::from(before.is_some());
                     let update = before.map(|p| {
                         let mask = payload.changed_since(&p.payload, kind.fields.len());
                         let mut w = Writer::new();
@@ -356,6 +362,15 @@ impl EncodedWorld {
     pub fn is_empty(&self) -> bool {
         self.entities.is_empty()
     }
+
+    /// Entity records encoded for this patch so far: one payload (with its
+    /// create record) and one shared update per changed entity, plus the
+    /// update records for older baselines built for clients. Encoding per
+    /// client would cost one per record sent or deferred instead.
+    pub fn encodes(&self) -> usize {
+        let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        self.encoded + cache.records.len()
+    }
 }
 
 /// Counters from one Delta build.
@@ -369,6 +384,8 @@ pub struct DeltaStats {
     pub removes: usize,
     /// Candidates deferred by the budget.
     pub deferred: usize,
+    /// Changed known entities held back by the update rates this patch.
+    pub held: usize,
     /// Create+update section bytes (what the budget limits).
     pub budget_bytes: usize,
 }
@@ -440,6 +457,7 @@ impl ClientReplica {
         // Visible entities (indices are unique) become candidates with
         // accumulated priority.
         let mut visible = 0usize;
+        let mut held = 0usize;
         let mut candidates: Vec<(usize, Candidate, f32)> = Vec::new();
         for index in hits {
             let index = index as usize;
@@ -491,6 +509,7 @@ impl ClientReplica {
                         let every = interest.update_rates.interval(d, radius);
                         if every > 1 && !world.patch.wrapping_add(e.id).is_multiple_of(every) {
                             // Held: keeps its accumulated priority.
+                            held += 1;
                             continue;
                         }
                     }
@@ -555,6 +574,7 @@ impl ClientReplica {
 
         let mut stats = DeltaStats {
             removes: removes.len(),
+            held,
             ..DeltaStats::default()
         };
         let mut creates = Writer::new();
@@ -752,6 +772,7 @@ mod tests {
 
             let mut stats = DeltaStats {
                 removes: removes.len(),
+                held: held.len(),
                 ..DeltaStats::default()
             };
             let mut creates = Writer::new();

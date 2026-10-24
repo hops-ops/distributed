@@ -36,10 +36,11 @@ use crate::netsim::{DelayLine, NetSim, NetSimJson};
 use crate::protocol::{error, ClientMessage, Notice, Role, ServerMessage, PROTOCOL_VERSION};
 use crate::stamp::FactStamp;
 use crate::ticket::{NonceCache, TicketKey, VerifiedTicket};
+use crate::work::WorkCounters;
 use crate::world::content_rollout::{zone_step, ContentState, ZoneStep, CONTENT_ROLLOUT_KIND};
 use crate::world::watch::{
-    next_reconcile_ms, topic, view_version, watch_query_string, watcher_address, TopicVersions,
-    WatchUpdate, Watches, PUSH_ROUTE, WATCH_LEASE_MS,
+    topic, view_version, watch_query_string, watcher_address, WatchUpdate, Watches, WorldSync,
+    PUSH_ROUTE, WATCH_LEASE_MS,
 };
 use crate::world::zone_activity::{
     zone_principal, RecordActivity, ACTIVITY_ACTIVE, ACTIVITY_DORMANT, ACTIVITY_HIBERNATED,
@@ -66,9 +67,6 @@ const FACT_CAPACITY: usize = 512;
 const OUTBOX_RETRY_MS: f64 = 10_000.0;
 /// Shortest crash watchdog period (each re-arm is a durable alarm write).
 const WATCHDOG_MIN_MS: f64 = 60_000.0;
-/// Re-read watched cells this often when the object cannot take pushes
-/// (no class binding: built with [`ZoneObject::new`] and no `ZONE_BINDING`).
-const POLL_MS: f64 = 1_000.0;
 
 /// Server → client, through the socket's simulated network.
 enum OutItem {
@@ -255,6 +253,7 @@ pub struct CelldObjectHost {
     env: SendWrapper<Env>,
     secret: String,
     service_id: String,
+    work: SendWrapper<Rc<RefCell<WorkCounters>>>,
 }
 
 impl CelldObjectHost {
@@ -264,7 +263,14 @@ impl CelldObjectHost {
             env: SendWrapper::new(env),
             secret: secret.into(),
             service_id: service_id.into(),
+            work: SendWrapper::new(Rc::default()),
         }
+    }
+
+    /// Count the facts and requests it sends into `work`.
+    fn counting(mut self, work: Rc<RefCell<WorkCounters>>) -> Self {
+        self.work = SendWrapper::new(work);
+        self
     }
 
     async fn post(&self, call: &FactCall<'_>) -> std::result::Result<FactReceipt, FactError> {
@@ -285,6 +291,11 @@ impl CelldObjectHost {
             }
         }
         let body = json!({ "commandId": call.command_id, "input": call.input });
+        {
+            let mut work = self.work.borrow_mut();
+            work.fact_commands += 1;
+            work.fact_requests += 1;
+        }
         let (status, body) = self
             .send(call.kind, &call.shard, call.command, headers, body)
             .await?;
@@ -329,6 +340,12 @@ impl CelldObjectHost {
             && set("content-type", "application/json"))
         {
             return vec![Err(FactError::Permanent("batch headers".into()))];
+        }
+        {
+            let mut work = self.work.borrow_mut();
+            work.fact_commands += calls.len() as u64;
+            work.fact_requests += 1;
+            work.fact_batches += 1;
         }
         let sent = self
             .send(
@@ -443,6 +460,7 @@ impl FactHost for CelldObjectHost {
 struct DurableFacts {
     sink: ObjectFactSink,
     storage: SendWrapper<Rc<Storage>>,
+    work: SendWrapper<Rc<RefCell<WorkCounters>>>,
 }
 
 impl FactSink for DurableFacts {
@@ -462,6 +480,7 @@ impl FactSink for DurableFacts {
                 Ok(_) => {}
             }
             if !matches!(result, Err(FactError::Retryable(_))) {
+                self.work.borrow_mut().outbox_deletes += 1;
                 let _ = self
                     .storage
                     .delete(&StoredFact::storage_key(fact.key()))
@@ -497,6 +516,7 @@ impl FactSink for DurableFacts {
                 settled.push(StoredFact::storage_key(fact.key()));
             }
             if !settled.is_empty() {
+                self.work.borrow_mut().outbox_deletes += 1;
                 let _ = self.storage.delete_multiple(settled).await;
             }
             results
@@ -645,10 +665,11 @@ struct Inner<Z: CelldZone> {
     /// Watched world cells ([`CelldZone::watch`] plus the dev settings and
     /// content rollout), built on the first wake.
     watches: Option<Rc<Watches<Z::Message>>>,
-    /// Highest version applied per watched topic (this activation).
-    world_versions: TopicVersions,
-    /// When each watched topic is read next (ms).
-    world_due: HashMap<String, f64>,
+    /// Highest version applied per watched topic (this activation) and
+    /// when each is read next.
+    world: WorldSync,
+    /// Work done by this object (all its activations).
+    work: Rc<RefCell<WorkCounters>>,
     /// [`CelldZone::refresh`] calls of this activation, and the last one.
     refresh_round: u64,
     last_refresh_ms: f64,
@@ -972,8 +993,8 @@ impl<Z: CelldZone> ZoneObject<Z> {
             drain_at: None,
             drainer: None,
             watches: None,
-            world_versions: TopicVersions::new(),
-            world_due: HashMap::new(),
+            world: WorldSync::new(),
+            work: Rc::default(),
             refresh_round: 0,
             last_refresh_ms: 0.0,
         };
@@ -1243,7 +1264,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             );
             return;
         };
-        let host = CelldObjectHost::new(self.env.env().clone(), secret, &service);
+        let work = self.inner.borrow().work.clone();
+        let host =
+            CelldObjectHost::new(self.env.env().clone(), secret, &service).counting(work.clone());
         let sink = match ObjectFactSink::new(host, service, zone_principal(&zone_id)) {
             Ok(sink) => {
                 Z::fact_routes(sink.route(FactRoute::by_zone::<RecordActivity>(ZONE_ACTIVITY_KIND)))
@@ -1256,6 +1279,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let durable = DurableFacts {
             sink,
             storage: SendWrapper::new(Rc::new(self.state.storage())),
+            work: SendWrapper::new(work),
         };
         let (queue, feed) = fact_channel(FACT_CAPACITY, retry_policy());
         let queue = queue.with_journal();
@@ -1327,6 +1351,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             host_config.idle_tick_rate = None;
             host_config.reconnect_grace = options.reconnect_grace;
             host_config.boot_epoch = (now_ms() * 1000.0) as u64;
+            if !options.update_rates {
+                host_config.interest.update_rates = crate::UpdateRates::every_patch();
+            }
             // The content version the zone slept on (a rollout it missed is
             // caught up by its first content rollout read).
             if let Some(snapshot) = &stored {
@@ -1409,7 +1436,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         // content version; the rollout read catches up with one it slept
         // through (a Hello on another version waits for its own read, see
         // `hello`).
-        self.inner.borrow_mut().world_versions.clear();
+        self.inner.borrow_mut().world.clear();
         self.reconcile_world(true);
         self.refresh();
         Ok(())
@@ -1485,32 +1512,35 @@ impl<Z: CelldZone> ZoneObject<Z> {
         topics
     }
 
+    /// Whether watched cells push to this object: it has a class binding
+    /// and `ZONE_WORLD_PUSH` is not `0`.
+    fn pushed(&self) -> bool {
+        !self.binding.is_empty()
+            && self
+                .inner
+                .borrow()
+                .options
+                .as_ref()
+                .is_some_and(|o| o.world_push)
+    }
+
     /// Read the watched topics that are due (all of them with `all`, on
-    /// wake) off the tick. With a class binding each read renews the
-    /// zone's watch and the next comes ~45 s later (pushes carry the
-    /// changes); without one the cells are polled every [`POLL_MS`].
+    /// wake) off the tick ([`WorldSync::due`]). When pushed, each read
+    /// renews the zone's watch and the next comes ~45 s later (pushes
+    /// carry the changes); otherwise the cells are polled every second.
     fn reconcile_world(&self, all: bool) {
-        let now = now_ms();
-        let pushed = !self.binding.is_empty();
-        for topic in self.world_topics() {
-            let due = {
-                let mut inner = self.inner.borrow_mut();
-                let next = inner.world_due.get(&topic).copied().unwrap_or(0.0);
-                if !all && now < next {
-                    continue;
-                }
-                let after = if pushed {
-                    next_reconcile_ms(now as u64, js_sys::Math::random()) as f64
-                } else {
-                    now + POLL_MS
-                };
-                inner.world_due.insert(topic.clone(), after);
-                true
-            };
-            if due {
-                let this = self.handle();
-                wasm_bindgen_futures::spawn_local(async move { this.reconcile(&topic).await });
-            }
+        let topics = self.world_topics();
+        let pushed = self.pushed();
+        let due = self.inner.borrow_mut().world.due(
+            topics,
+            now_ms() as u64,
+            all,
+            pushed,
+            js_sys::Math::random,
+        );
+        for topic in due {
+            let this = self.handle();
+            wasm_bindgen_futures::spawn_local(async move { this.reconcile(&topic).await });
         }
     }
 
@@ -1520,10 +1550,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let Some((kind, shard)) = topic.split_once('/') else {
             return;
         };
-        let watcher = (!self.binding.is_empty()).then(|| {
+        let watcher = self.pushed().then(|| {
             let zone_id = self.inner.borrow().zone_id.clone();
             watcher_address(&self.binding, &zone_id)
         });
+        self.inner.borrow().work.borrow_mut().world_reads += 1;
         match self
             .env
             .read_cell_watching(kind, shard, watcher.as_deref())
@@ -1544,7 +1575,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let Ok(update) = req.json::<WatchUpdate>().await else {
             return Response::error("a world update is required", 400);
         };
-        let awake = self.inner.borrow().host.is_some();
+        let awake = {
+            let inner = self.inner.borrow();
+            inner.work.borrow_mut().world_pushes += 1;
+            inner.host.is_some()
+        };
         if awake && self.world_topics().contains(&update.topic) {
             self.apply_view(&update.topic, update.view);
         }
@@ -1554,12 +1589,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
     /// Apply `view` of `topic` if it is newer than what the zone has.
     fn apply_view(&self, topic: &str, view: Value) {
         let version = view_version(&view);
-        if !self
-            .inner
-            .borrow_mut()
-            .world_versions
-            .accept(topic, version)
-        {
+        if !self.inner.borrow_mut().world.accept(topic, version) {
             return;
         }
         let (kind, shard) = topic.split_once('/').unwrap_or((topic, ""));
@@ -1905,6 +1935,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 };
                 let report = host.advance();
                 let players = host.player_count();
+                inner.work.borrow_mut().record_advance(&report);
                 if players < inner.players_seen {
                     inner.persist_soon = true;
                 }
@@ -2182,6 +2213,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 "freeze": format!("{:?}", h.freeze_state()).to_lowercase(),
             })),
             "workMs": { "p50": stats.work.percentile(0.5), "p99": stats.work.percentile(0.99) },
+            "work": *inner.work.borrow(),
+            "switches": inner.options.as_ref().map(|o| json!({
+                "factBatch": o.fact_batch,
+                "updateRates": o.update_rates,
+                "worldPush": o.world_push && !self.binding.is_empty(),
+            })),
         })
     }
 }
