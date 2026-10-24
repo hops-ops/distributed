@@ -4,13 +4,22 @@
 
 use distributed_game::celld_zone::{CelldZone, LocalFuture, ObjectEnv, ObjectFactSink};
 use distributed_game::command_sink::FactRoute;
+use distributed_game::world::watch::Watches;
 use distributed_game::HostConfig;
 use mobpit_crawler::{RecordKillInput, CRAWLER_KIND, PRESENCE_KIND};
 
-use crate::zone::{MobPit, PitMessage, RoomConfig, WorldTiers};
+use crate::zone::{MobPit, PitMessage, RoomConfig};
 use crate::{DEFAULT_SEED, SEED_VAR};
 use game_sim::mobpit::pair_shard;
-use mobpit_tiers::{BossDefeatedInput, BOROUGH_KIND, CITY_KIND, CITY_SHARD, HOOD_KIND};
+use mobpit_tiers::{
+    BoroughRead, BossDefeatedInput, CityRead, HoodRead, BOROUGH_KIND, CITY_KIND, CITY_SHARD,
+    HOOD_KIND,
+};
+
+/// Players a room admits (the game's cap).
+pub const MAX_PLAYERS: usize = 32;
+/// Worker var overriding [`MAX_PLAYERS`] (load tests).
+pub const MAX_PLAYERS_VAR: &str = "ZONE_MAX_PLAYERS";
 
 impl CelldZone for MobPit {
     fn object_config(zone_id: &str, env: &ObjectEnv) -> Result<RoomConfig, String> {
@@ -21,11 +30,17 @@ impl CelldZone for MobPit {
         RoomConfig::for_zone(zone_id, seed).ok_or_else(|| format!("no room `{zone_id}`"))
     }
 
-    fn host_config(_zone_id: &str, _env: &ObjectEnv) -> HostConfig {
+    fn host_config(_zone_id: &str, env: &ObjectEnv) -> HostConfig {
+        // Load tests raise the cap with `ZONE_MAX_PLAYERS`; the game's is 32.
+        let max_players = env
+            .var(MAX_PLAYERS_VAR)
+            .and_then(|n| n.trim().parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(MAX_PLAYERS);
         HostConfig {
             // Joined / lost / reconnected / left facts for the presence cells.
             lifecycle_facts: true,
-            max_players: 32,
+            max_players,
             // A doorway into a sleeping room waits for it to wake while the
             // client keeps predicting: keep up to 3 s of its inputs.
             input_capacity: 90,
@@ -53,67 +68,38 @@ impl CelldZone for MobPit {
             .lifecycle_route(PRESENCE_KIND)
     }
 
-    /// The tiers above the room: its hood and borough every refresh (2 s),
-    /// the city every 5th.
-    fn refresh_every() -> Option<std::time::Duration> {
-        Some(std::time::Duration::from_secs(2))
-    }
-
-    fn refresh(
-        env: &ObjectEnv,
-        zone_id: &str,
-        round: u64,
-    ) -> Option<LocalFuture<Option<PitMessage>>> {
-        let room = game_sim::mobpit::parse_room(zone_id)?;
+    /// The tiers above the room: its hood, borough and the city, pushed by
+    /// their cells after every change (each view a plain `mobpit_tiers`
+    /// read struct; the room merges it into its world).
+    fn watch(zone_id: &str) -> Watches<PitMessage> {
+        let Some(room) = game_sim::mobpit::parse_room(zone_id) else {
+            return Watches::new();
+        };
         let hood = game_sim::mobpit::hood_of(room);
         let borough = game_sim::mobpit::borough_of(hood);
-        let env = env.clone();
-        Some(Box::pin(async move {
-            let hood_state = env.read_cell(HOOD_KIND, &pair_shard(hood)).await.ok()?;
-            let borough_state = env
-                .read_cell(BOROUGH_KIND, &pair_shard(borough))
-                .await
-                .ok()?;
-            let city = if round % 5 == 0 {
-                env.read_cell(CITY_KIND, CITY_SHARD).await.ok()
-            } else {
-                None
-            };
-            let h = &hood_state["state"];
-            let b = &borough_state["state"];
-            let mut world = WorldTiers {
-                hood_tier: h["tier"].as_u64().unwrap_or(0) as u32,
-                boss_down: h["boss_down"].as_bool().unwrap_or(false),
-                last_by: h["last_by"].as_str().unwrap_or_default().to_string(),
-                borough_bosses_down: b["bosses_down"].as_u64().unwrap_or(0) as u32,
-                weather: b["weather"].as_u64().unwrap_or(0) as u8,
-                event: b["event"].as_str().unwrap_or_default().to_string(),
-                event_until_ms: b["event_until_ms"].as_u64().unwrap_or(0),
-                hoods_down: borough_state["hoods_down"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                ..WorldTiers::default()
-            };
-            match city {
-                Some(c) => {
-                    world.city_bosses_down = c["state"]["bosses_down"].as_u64().unwrap_or(0) as u32;
-                    world.banner = c["state"]["banner"]
-                        .as_str()
-                        .unwrap_or("The bosses hold the city")
-                        .to_string();
-                }
-                None => {
-                    // Not read this round: keep what the room knows.
-                    return Some(PitMessage::WorldKeepCity(world));
-                }
-            }
-            Some(PitMessage::World(world))
-        }))
+        Watches::new()
+            .cell(HOOD_KIND, &pair_shard(hood), |read: HoodRead| {
+                read.state.map(|h| PitMessage::Hood {
+                    tier: h.tier,
+                    boss_down: h.boss_down,
+                    last_by: h.last_by,
+                })
+            })
+            .cell(BOROUGH_KIND, &pair_shard(borough), |read: BoroughRead| {
+                read.state.map(|b| PitMessage::Borough {
+                    bosses_down: b.bosses_down,
+                    weather: b.weather,
+                    event: b.event,
+                    event_until_ms: b.event_until_ms,
+                    hoods_down: read.hoods_down,
+                })
+            })
+            .cell(CITY_KIND, CITY_SHARD, |read: CityRead| {
+                read.state.map(|c| PitMessage::City {
+                    bosses_down: c.bosses_down,
+                    banner: c.banner,
+                })
+            })
     }
 
     /// Read the player's Crawler cell (off the tick) for its level and XP.

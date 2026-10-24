@@ -24,6 +24,9 @@
 #                           the Vite plugin, Svelte HUD, and the settled
 #                           read model from mobpit-service over GraphQL @live
 #                           (`distributed dev server/` runs the service + UI)
+#   ./run.sh build          build what Mob Pit on Hops local loads from this
+#                           checkout (JS SDK, WebAssembly, cells worker);
+#                           the Environment's setup runs it (.gitops/local)
 #   ./run.sh smoke          every demo's smoke tests (Rust bots + headless JS,
 #                           generated clients checked, SvelteKit headless)
 #   ./run.sh list           demos this script knows
@@ -402,19 +405,20 @@ run_mobpit() {
 	log_file="$(mktemp -t game-demos.XXXXXX)"
 	local admin
 	admin="$(dev_secret "$MOBPIT_DATA_DIR" admin-secret)"
+	# The services' gateway routes `/zones/{room}` to the rooms (celld, or
+	# the fleet's load balancer); Vite proxies game traffic to it only.
 	DISTRIBUTED_GAME_SECRET="$secret" DG_DEMO_ADMIN_SECRET="$admin" "$BIN" mobpit --dev --port "$port" \
-		--data-dir "$MOBPIT_DATA_DIR" --celld-url "$CELLD_URL" >"$log_file" 2>&1 &
+		--data-dir "$MOBPIT_DATA_DIR" --celld-url "$CELLD_URL" --zones-origin "$ROOMS_URLS" >"$log_file" 2>&1 &
 	local server_pid=$!
 	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; [[ -z "$CELLD_PID" ]] || kill_tree "$CELLD_PID"; stop_fleet; rm -f "$log_file"' EXIT INT TERM
 	wait_listening "$log_file" "$server_pid" "game-demos mobpit"
 	sed -n '2p' "$log_file"
 	echo
-	log "open  http://localhost:$client_port/$demo/   (services :$port, rooms on celld ${ROOMS_URLS}; dev routes ON — local only)"
+	log "open  http://localhost:$client_port/$demo/   (gateway + services :$port, rooms on celld ${ROOMS_URLS}; dev routes ON — local only)"
 	log "admin http://localhost:$client_port/mobpit/?admin=$admin   (live content updates; add &old=1 in another tab for an old client)"
 	echo
 	cd "$CLIENT"
-	GAME_DEMOS_SERVER="http://127.0.0.1:$port" GAME_DEMOS_ROOMS="$ROOMS_URLS" \
-		GAME_DEMOS_CLIENT_PORT="$client_port" npx vite
+	GAME_DEMOS_SERVER="http://127.0.0.1:$port" GAME_DEMOS_CLIENT_PORT="$client_port" npx vite
 }
 
 wait_listening() {
@@ -549,6 +553,12 @@ smoke() {
 }
 
 case "${1:-}" in
+	build)
+		ensure_sdk
+		ensure_client
+		ensure_wasm
+		ensure_cells
+		;;
 	smoke) smoke ;;
 	gen) gen "${2:-}" ;;
 	sveltekit) run_sveltekit "${2:-}" "${3:-3}" ;;

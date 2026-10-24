@@ -44,7 +44,8 @@
 //!   barrier / safe-room policy.
 //!
 //! # Extension seams (later phases)
-//! Metrics hook [`AdvanceReport`] and [`replication::DeltaStats`].
+//! Metrics hook [`AdvanceReport`] and [`replication::DeltaStats`]; plain
+//! work counts in [`WorkCounters`] ([`work`]).
 
 #![warn(missing_docs)]
 
@@ -96,6 +97,7 @@ pub mod surface;
 pub mod ticket;
 pub mod timers;
 pub mod timestep;
+pub mod work;
 pub mod world;
 pub mod zone;
 
@@ -111,17 +113,17 @@ pub use entity::{Entities, Entity, EntityCollection, EntityId, Project};
 #[cfg(feature = "runtime")]
 pub use facts::spawn_fact_worker;
 pub use facts::{
-    fact_channel, fact_key, BoxFuture, EmitError, Fact, FactCommand, FactError, FactFeed,
-    FactOutcome, FactQueue, FactReceipt, FactSettlement, FactSink, MemoryFactSink, RetryPolicy,
-    SettlementScript,
+    fact_channel, fact_key, BoxFuture, EmitError, Fact, FactBatchSink, FactCommand, FactError,
+    FactFeed, FactOutcome, FactQueue, FactReceipt, FactSettlement, FactSink, MemoryFactSink,
+    RetryPolicy, SettlementScript,
 };
 pub use handoff::{HandoffError, HandoffRequest, Transfer};
 pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};
 pub use inbox::{Delivered, NoMessages, ZoneInbound};
 pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, SequencedInput};
-pub use interest::{InterestConfig, View};
+pub use interest::{InterestConfig, UpdateRates, View};
 pub use prediction::{PredictContext, PredictStep};
-pub use protocol::{ClientMessage, ClientMirror, Role, ServerMessage, PROTOCOL_VERSION};
+pub use protocol::{ClientMessage, ClientMirror, Origin, Role, ServerMessage, PROTOCOL_VERSION};
 pub use pure::GamePure;
 pub use replay::{replay, Recorder, Recording};
 pub use replication::{EntityState, WorldView};
@@ -132,6 +134,7 @@ pub use stamp::{stamp_metadata, FactStamp};
 pub use surface::GameSurface;
 pub use timers::TimerId;
 pub use timestep::FixedTimestep;
+pub use work::WorkCounters;
 pub use world::{BarrierMode, ChildEvent, FreezeState, StalePolicy};
 pub use zone::{
     Admission, ClientId, JoinRequest, LeaveReason, ObserverId, ObserverInfo, PlayerId, PlayerInfo,

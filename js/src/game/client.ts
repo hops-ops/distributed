@@ -24,7 +24,8 @@ import type {
 	HandoffMessage,
 	KickMessage,
 	ResumeMessage,
-	WelcomeMessage
+	WelcomeMessage,
+	WorldPoint
 } from './messages.js';
 import { AdaptiveDelay, type AdaptiveDelayOptions } from './pacing.js';
 import { Predictor, type Correction, type PredictorOptions } from './prediction.js';
@@ -89,6 +90,15 @@ export type GamePredictionOptions<TInput> = PredictorOptions<TInput> &
 		 * latency is hidden.
 		 */
 		handoffFrame?: (fields: EntityFields, from: string, to: string) => EntityFields | undefined;
+		/**
+		 * Draw each predicted step as motion over its input interval
+		 * (fixed-timestep interpolation; default true). The controlled
+		 * entity is then drawn up to one input interval behind its
+		 * prediction, but moves smoothly on a display faster than the tick
+		 * rate instead of in tick-sized hops against a smooth camera. False
+		 * draws the prediction itself, the instant it is made.
+		 */
+		smoothSteps?: boolean;
 	}>;
 
 /** What the player sees when an input is sampled (lag compensation). */
@@ -198,6 +208,8 @@ export class GameClient<TInput = unknown> {
 		| { zoneId: string; base: RenderedEntity; fields: EntityFields; unsent: { input: TInput; dtMs: number }[] }
 		| undefined;
 	#closed = false;
+	/** The player's world position (`setPosition`): observed zones focus on it. */
+	#position: WorldPoint | undefined;
 	#contentVersion: string;
 	#predictionEnabled: boolean;
 	/** Adaptive delay per zone, keyed by the replica (shared across a zone's connections). */
@@ -311,6 +323,52 @@ export class GameClient<TInput = unknown> {
 		if (zone?.role === 'observer') zone.connection.setNear(near);
 	}
 
+	/**
+	 * Where the player is: world coordinates, or local to `zoneId` (its own
+	 * zone, converted with that zone's Welcome `origin`). Every observed
+	 * zone that declares its origin (`Zone::origin`) is then told where the
+	 * player is in its own coordinates (`Focus`), now and after each
+	 * (re)connect, so each neighbour sends what the player's view covers
+	 * there. Call it every frame or tick; connections throttle it. Ignored
+	 * while `zoneId`'s origin is unknown. Zones without an origin are
+	 * focused by hand (`setFocus`).
+	 */
+	setPosition(x: number, y: number, zoneId?: string): void {
+		if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+		let at: WorldPoint = { x, y };
+		if (zoneId !== undefined) {
+			const origin = this.zone(zoneId)?.connection.welcome?.origin;
+			if (origin === undefined) return;
+			at = { x: origin.x + x, y: origin.y + y };
+		}
+		this.#position = at;
+		for (const zone of this.#zones.values()) this.#focus(zone);
+	}
+
+	/** The player's last world position (`setPosition`). */
+	get position(): WorldPoint | undefined {
+		return this.#position;
+	}
+
+	/** An observed, placed zone looks at the player's position. */
+	#focus(zone: Zone): void {
+		const at = this.#position;
+		const origin = zone.connection.welcome?.origin;
+		if (zone.role !== 'observer' || at === undefined || origin === undefined) return;
+		zone.connection.setFocus(at.x - origin.x, at.y - origin.y);
+	}
+
+	/**
+	 * Tell an observed zone where this client is looking, in that zone's
+	 * local coordinates (`GameConnection.setFocus`), for zones that do not
+	 * declare an origin or odd cases (prefer `setPosition`). No-op for zones
+	 * not observed.
+	 */
+	setFocus(zoneId: string, x: number, y: number): void {
+		const zone = this.#zones.get(zoneId);
+		if (zone?.role === 'observer') zone.connection.setFocus(x, y);
+	}
+
 	/** Stop observing a zone. */
 	unobserve(zoneId: string): void {
 		const zone = this.#zones.get(zoneId);
@@ -353,7 +411,8 @@ export class GameClient<TInput = unknown> {
 		const context = this.inputContext(authority)!;
 		const seq = connection.sendInput(this.#options.prediction!.encodeInput(input, context), context.clientTick);
 		if (seq === undefined) return undefined;
-		this.#predictor!.record(seq, input, dtMs);
+		const smooth = this.#options.prediction!.smoothSteps !== false;
+		this.#predictor!.record(seq, input, dtMs, smooth ? this.#scheduler.now() : undefined);
 		return seq;
 	}
 
@@ -401,7 +460,8 @@ export class GameClient<TInput = unknown> {
 	/**
 	 * The merged world to draw now: every zone sampled at its own
 	 * `serverNow - interpolationDelay`, the controlled entity at its predicted
-	 * (present) state with correction smoothing.
+	 * (present) state with correction smoothing (and, with `smoothSteps`,
+	 * partway through its last step).
 	 */
 	render(): RenderedEntity[] {
 		const out: RenderedEntity[] = [];
@@ -558,6 +618,7 @@ export class GameClient<TInput = unknown> {
 					this.#bindControlled(true);
 					this.#emitter.emit('authority', zone.zoneId, welcome);
 				}
+				this.#focus(zone);
 				this.#emitter.emit('welcome', zone.zoneId, welcome);
 			}),
 			c.on('delta', (delta) => this.#onDelta(zone, delta)),

@@ -348,6 +348,47 @@ export type WorldKeepCityMessage = WorldTiers;
 
 const MESSAGE_WORLD_KEEP_CITY_PAYLOAD: WireType = WORLD_TIERS_TYPE;
 
+/** Message `hood` (id 4). */
+export interface HoodMessage {
+	readonly tier: number;
+	readonly bossDown: boolean;
+	readonly lastBy: string;
+}
+
+const MESSAGE_HOOD_LAYOUT: PayloadLayout = [
+	['tier', { type: 'u32' }],
+	['bossDown', { type: 'bool' }],
+	['lastBy', { type: 'short_str' }],
+];
+
+/** Message `borough` (id 5). */
+export interface BoroughMessage {
+	readonly bossesDown: number;
+	readonly weather: number;
+	readonly event: string;
+	readonly eventUntilMs: number;
+	readonly hoodsDown: readonly string[];
+}
+
+const MESSAGE_BOROUGH_LAYOUT: PayloadLayout = [
+	['bossesDown', { type: 'u32' }],
+	['weather', { type: 'u8' }],
+	['event', { type: 'short_str' }],
+	['eventUntilMs', { type: 'u64' }],
+	['hoodsDown', { type: 'list', item: { type: 'short_str' } }],
+];
+
+/** Message `city` (id 6). */
+export interface CityMessage {
+	readonly bossesDown: number;
+	readonly banner: string;
+}
+
+const MESSAGE_CITY_LAYOUT: PayloadLayout = [
+	['bossesDown', { type: 'u32' }],
+	['banner', { type: 'short_str' }],
+];
+
 /** Event type ids by name. */
 export const EVENT = {
 	hello: 1,
@@ -454,6 +495,9 @@ export const MESSAGE = {
 	loaded: 1,
 	world: 2,
 	worldKeepCity: 3,
+	hood: 4,
+	borough: 5,
+	city: 6,
 } as const;
 
 /** Zone inbox message payload types by name. */
@@ -461,6 +505,9 @@ export interface Messages {
 	loaded: LoadedMessage;
 	world: WorldMessage;
 	worldKeepCity: WorldKeepCityMessage;
+	hood: HoodMessage;
+	borough: BoroughMessage;
+	city: CityMessage;
 }
 
 /** Codecs of every zone inbox message. */
@@ -482,6 +529,24 @@ export const MESSAGES: GameEventCodecs<Messages> = {
 		name: 'world_keep_city',
 		encode: (value) => encodeValue(MESSAGE_WORLD_KEEP_CITY_PAYLOAD, value),
 		decode: (payload) => decodeValue(MESSAGE_WORLD_KEEP_CITY_PAYLOAD, payload) as WorldKeepCityMessage
+	},
+	hood: {
+		id: 4,
+		name: 'hood',
+		encode: (value) => encodePayload(MESSAGE_HOOD_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_HOOD_LAYOUT, payload) as unknown as HoodMessage
+	},
+	borough: {
+		id: 5,
+		name: 'borough',
+		encode: (value) => encodePayload(MESSAGE_BOROUGH_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_BOROUGH_LAYOUT, payload) as unknown as BoroughMessage
+	},
+	city: {
+		id: 6,
+		name: 'city',
+		encode: (value) => encodePayload(MESSAGE_CITY_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_CITY_LAYOUT, payload) as unknown as CityMessage
 	},
 };
 

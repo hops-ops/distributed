@@ -51,6 +51,7 @@ export {
 	GAME_PROTOCOL_VERSION,
 	GameClientMirror,
 	GameErrorCode,
+	GameFeature,
 	GameKickCode,
 	GameMessageTag,
 	decodeClientMessage,
@@ -78,6 +79,7 @@ export {
 	type PingMessage,
 	type PongMessage,
 	type RedirectMessage,
+	type WorldPoint,
 	type ResumeMessage,
 	type WelcomeMessage
 } from './messages.js';
@@ -109,6 +111,8 @@ export {
 } from './typed.js';
 export { ClockSync, type ClockSample, type ClockSyncOptions } from './clock.js';
 export {
+	FOCUS_INTERVAL_MS,
+	FOCUS_MIN_MOVE,
 	GameConnection,
 	GameConnectionClosedError,
 	defaultScheduler,

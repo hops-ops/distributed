@@ -257,7 +257,8 @@ test('handoffFrame: the prediction continues through a handoff in the target fra
 			encodeInput: (dx) => new Uint8Array([dx & 0xff]),
 			predict: (s, dx, dt) => ({ x: s.x + (dx * dt) / 1000 }),
 			controlledEntity: () => 1,
-			handoffFrame: (fields, from, to) => (from === 'z1' && to === 'z2' ? { ...fields, x: fields.x - 10 } : undefined)
+			handoffFrame: (fields, from, to) => (from === 'z1' && to === 'z2' ? { ...fields, x: fields.x - 10 } : undefined),
+			smoothSteps: false
 		}
 	});
 	const world = (e) => (e.zoneId === 'z2' ? 10 : 0) + e.fields.x;
