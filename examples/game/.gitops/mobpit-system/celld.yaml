@@ -16,6 +16,9 @@ spec:
   clusterName: mobpit
   namespace: mobpit-celld
   releaseName: celld
+  # Probes celld's own /.well-known/celld/health (hops-ops/celld-chart#23);
+  # earlier charts probe a path the deployed Worker answers.
+  chartVersion: "0.5.1"
   rustfs:
     enabled: true
     credentialsSecretRef:
