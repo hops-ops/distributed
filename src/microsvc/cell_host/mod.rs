@@ -45,7 +45,7 @@ pub use causal::{
     CellCommandIdentity, CellDispatchError, CellDispatchResult, CELL_CAUSATION_ID_HEADER,
     CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
-pub use cell::{instance_name, parent_cell_name, AggregateCell, CellNamespace};
+pub use cell::{instance_name, parent_cell_name, AggregateCell, CellBatchCommand, CellNamespace};
 #[cfg(feature = "workers-rs")]
 pub use celld_outbox::{
     CelldAlarmOutcome, CelldOutbox, CelldOutboxDrainOutcome, CELLD_OUTBOX_DEFAULT_BATCH_SIZE,

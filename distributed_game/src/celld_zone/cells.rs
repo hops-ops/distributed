@@ -14,7 +14,7 @@ use distributed::Aggregate;
 use serde_json::{json, Value};
 use worker::{Env, Headers, Method, Request, RequestInit, Response, Result, State};
 
-use crate::cell::fact_session_from_headers;
+use crate::cell::{fact_session_from_headers, run_fact_batch};
 use crate::world::content_rollout::{mount_content_rollout, ContentRollout};
 use crate::world::watch::{
     parse_watcher_address, topic, watch_query, WatchUpdate, Watchers, PUSH_CONCURRENCY, PUSH_ROUTE,
@@ -80,11 +80,10 @@ pub const BATCH_ROUTE: &str = "__batch";
 /// from the service-id and principal-partition headers, the session from
 /// `sessions`), then a best-effort outbox drain. `POST
 /// /{kind}/{shard}/__batch` ([`BATCH_ROUTE`]) runs a zone's consecutive
-/// facts for this cell in one request: `{ entries: [{ command, commandId,
-/// input, partition, session }] }` → `{ results: [{ status, body }] }`,
-/// each entry exactly as its own wait-path command (its own ledger id and
-/// session), in order, stopping after the first retryable result, then one
-/// outbox drain. Every request must carry the internal secret.
+/// facts for this cell in one request ([`run_fact_batch`]: each entry as
+/// its own wait-path command, with its own ledger id and session, in order,
+/// stopping after the first retryable result), then one outbox drain.
+/// Every request must carry the internal secret.
 pub async fn serve_cell<A, F>(
     env: &Env,
     cell: &AggregateCell<A>,
@@ -173,67 +172,14 @@ where
         Ok(body) => body,
         Err(_) => return error_response(CellDispatchError::BadRequest("invalid JSON".into())),
     };
-    let Some(entries) = body.get("entries").and_then(Value::as_array) else {
-        return error_response(CellDispatchError::BadRequest(
-            "`entries` is required".into(),
-        ));
-    };
-    let mut results = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let (status, body) = match batch_entry(cell, &service, entry, sessions).await {
-            Ok(body) => (200, body),
-            Err(error) => (error.status_code(), error_body(&error)),
-        };
-        let retryable = status >= 500
-            || matches!(status, 408 | 429)
-            || body.get("code").and_then(Value::as_str) == Some("COMMAND_IN_PROGRESS");
-        results.push(json!({ "status": status, "body": body }));
-        if retryable {
-            break;
-        }
-    }
+    let results = run_fact_batch(cell, &service, &body, sessions).await;
     if let Err(error) = cell.drain_outbox(env).await {
         worker::console_error!("post-commit drain deferred: {error}");
     }
-    json_status(json!({ "results": results }), 200)
-}
-
-/// One `__batch` entry as its own wait-path command.
-async fn batch_entry<A>(
-    cell: &AggregateCell<A>,
-    service: &str,
-    entry: &Value,
-    sessions: Sessions,
-) -> std::result::Result<Value, CellDispatchError>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
-    let field = |name: &str| entry.get(name).and_then(Value::as_str);
-    let (Some(command), Some(partition)) = (field("command"), field("partition")) else {
-        return Err(CellDispatchError::BadRequest(
-            "`command` and `partition` are required".into(),
-        ));
-    };
-    let parsed = CellWaitPathRequest::parse(json!({
-        "commandId": entry.get("commandId"),
-        "input": entry.get("input"),
-    }))
-    .map_err(CellDispatchError::BadRequest)?;
-    let identity = CellCommandIdentity::new(
-        service.to_string(),
-        partition.to_string(),
-        &parsed.command_id,
-    )?;
-    let vars = entry.get("session").and_then(Value::as_object);
-    let header = |name: &str| {
-        vars.and_then(|vars| vars.get(name))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-    };
-    let session = sessions(&header).ok_or(CellDispatchError::Forbidden)?;
-    cell.dispatch_idempotent(command, &identity, parsed.input, session)
-        .await
-        .map(|dispatch| dispatch.wait_path_wire())
+    match results {
+        Ok(results) => json_status(results, 200),
+        Err(error) => error_response(error),
+    }
 }
 
 /// A watched world cell's watchers ([`crate::world::watch`]): zones that
