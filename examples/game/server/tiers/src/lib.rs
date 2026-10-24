@@ -923,6 +923,60 @@ pub fn saga_step(name: &str, payload: &[u8]) -> Option<SagaStep> {
     })
 }
 
+// ------------------------------------------------------------ read views
+
+/// What a hood cell's read route returns (rooms watch it).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoodRead {
+    /// The hood (`None` until its first event).
+    pub state: Option<HoodState>,
+}
+
+/// What a borough cell's read route returns (rooms watch it).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoroughRead {
+    /// The borough (`None` until its first event).
+    pub state: Option<BoroughState>,
+    /// Its hoods whose boss is down (`hx.hy`).
+    #[serde(default)]
+    pub hoods_down: Vec<String>,
+}
+
+/// What the city cell's read route returns (rooms watch it).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CityRead {
+    /// The city (`None` until its first event).
+    pub state: Option<CityState>,
+}
+
+impl HoodRead {
+    /// The read view of `hood`.
+    pub fn of(hood: Option<&Hood>) -> Self {
+        Self {
+            state: hood.map(Hood::state),
+        }
+    }
+}
+
+impl BoroughRead {
+    /// The read view of `borough`.
+    pub fn of(borough: Option<&Borough>) -> Self {
+        Self {
+            state: borough.map(Borough::state),
+            hoods_down: borough.map(Borough::hoods_down).unwrap_or_default(),
+        }
+    }
+}
+
+impl CityRead {
+    /// The read view of `city`.
+    pub fn of(city: Option<&City>) -> Self {
+        Self {
+            state: city.map(City::state),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

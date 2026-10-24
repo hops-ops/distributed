@@ -17,7 +17,11 @@
  * `game_sim::mobpit`).
  *
  * Neighbours: the client also watches the 8 rooms around its own as an
- * observer (`watchZones` over `neighbourRooms`), so their mobs are drawn where they are. On
+ * observer (`watchZones` over `neighbourRooms`), so their mobs are drawn where they are.
+ * The client tells the SDK where the player is (`setPosition`); every room
+ * says where it sits in the world (Welcome origin), so each watcher is
+ * focused on the player in that room's coordinates, and the room
+ * replicates only what is within the player's own view radius around it. On
  * celld an observer is a passive watcher: it keeps no room awake and wakes
  * none (a sleeping room answers `ASLEEP`; it is tried again every few
  * seconds and shows nothing meanwhile).
@@ -538,6 +542,13 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 			reachBits = 0;
 		}
 		const meNow = me();
+		// Each watched room (placed in the world by its Welcome origin)
+		// applies the player's own view around it: its interest radius
+		// carries on across the wall.
+		if (meNow !== undefined) {
+			const p = pit.playerFields(meNow);
+			typed.client.setPosition(p.x, p.y, meNow.zoneId);
+		}
 		let bits = 0;
 		if (wake && at !== undefined && meNow !== undefined && meNow.zoneId === room && pures.loaded()) {
 			const p = pit.playerFields(meNow);

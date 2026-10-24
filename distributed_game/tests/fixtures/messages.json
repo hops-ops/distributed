@@ -99,8 +99,33 @@
     },
     {
       "decoded": {
+        "type": "Focus",
+        "x": -25.5,
+        "y": 3.25
+      },
+      "direction": "client_to_server",
+      "hex": "070000ccc100005040",
+      "name": "focus"
+    },
+    {
+      "decoded": {
+        "capabilities": 5,
+        "content_version": "c1",
+        "near": false,
+        "protocol_version": 2,
+        "reconnect_token": "",
+        "ticket": "t.k.n",
+        "type": "Hello"
+      },
+      "direction": "client_to_server",
+      "hex": "01020263310505742e6b2e6e0000",
+      "name": "hello_v2"
+    },
+    {
+      "decoded": {
         "content_version": "c1",
         "patch_rate": 20,
+        "protocol_version": 1,
         "reconnect_token": "rt",
         "role": "player",
         "schema": [
@@ -190,6 +215,203 @@
       "direction": "server_to_client",
       "hex": "80027331027a31001e142a0000000000428f400272740263310201046865726f0a05616c69766500056c6576656c010268700204676f6c640302647a04057370656564050178060000c8c20000c8421003796177070a046e616d6508037461670902036f72620101780600000000000080420c",
       "name": "welcome"
+    },
+    {
+      "decoded": {
+        "content_version": "c1",
+        "features": 1,
+        "origin": {
+          "x": -48.0,
+          "y": 1000000.5
+        },
+        "patch_rate": 20,
+        "protocol_version": 2,
+        "reconnect_token": "rt",
+        "role": "observer",
+        "schema": [
+          {
+            "fields": [
+              {
+                "name": "alive",
+                "type": "bool"
+              },
+              {
+                "name": "level",
+                "type": "u8"
+              },
+              {
+                "name": "hp",
+                "type": "u16"
+              },
+              {
+                "name": "gold",
+                "type": "u32"
+              },
+              {
+                "name": "dz",
+                "type": "i32"
+              },
+              {
+                "name": "speed",
+                "type": "f32"
+              },
+              {
+                "bits": 16,
+                "max": {
+                  "bits": "42c80000",
+                  "f32": 100.0
+                },
+                "min": {
+                  "bits": "c2c80000",
+                  "f32": -100.0
+                },
+                "name": "x",
+                "type": "quant_f32"
+              },
+              {
+                "bits": 10,
+                "name": "yaw",
+                "type": "angle"
+              },
+              {
+                "name": "name",
+                "type": "short_str"
+              },
+              {
+                "name": "tag",
+                "type": "bytes"
+              }
+            ],
+            "id": 1,
+            "name": "hero"
+          },
+          {
+            "fields": [
+              {
+                "bits": 12,
+                "max": {
+                  "bits": "42800000",
+                  "f32": 64.0
+                },
+                "min": {
+                  "bits": "00000000",
+                  "f32": 0.0
+                },
+                "name": "x",
+                "type": "quant_f32"
+              }
+            ],
+            "id": 2,
+            "name": "orb"
+          }
+        ],
+        "server_tick": 42,
+        "server_time": 1000.25,
+        "session_id": "s1",
+        "tick_rate": 30,
+        "type": "Welcome",
+        "zone_id": "z1"
+      },
+      "direction": "server_to_client",
+      "hex": "80027331027a31011e142a0000000000428f400272740263310201046865726f0a05616c69766500056c6576656c010268700204676f6c640302647a04057370656564050178060000c8c20000c8421003796177070a046e616d6508037461670902036f72620101780600000000000080420c010100000000000048c00000000081842e41",
+      "name": "welcome_v2"
+    },
+    {
+      "decoded": {
+        "content_version": "c1",
+        "features": 1,
+        "origin": null,
+        "patch_rate": 20,
+        "protocol_version": 2,
+        "reconnect_token": "rt",
+        "role": "player",
+        "schema": [
+          {
+            "fields": [
+              {
+                "name": "alive",
+                "type": "bool"
+              },
+              {
+                "name": "level",
+                "type": "u8"
+              },
+              {
+                "name": "hp",
+                "type": "u16"
+              },
+              {
+                "name": "gold",
+                "type": "u32"
+              },
+              {
+                "name": "dz",
+                "type": "i32"
+              },
+              {
+                "name": "speed",
+                "type": "f32"
+              },
+              {
+                "bits": 16,
+                "max": {
+                  "bits": "42c80000",
+                  "f32": 100.0
+                },
+                "min": {
+                  "bits": "c2c80000",
+                  "f32": -100.0
+                },
+                "name": "x",
+                "type": "quant_f32"
+              },
+              {
+                "bits": 10,
+                "name": "yaw",
+                "type": "angle"
+              },
+              {
+                "name": "name",
+                "type": "short_str"
+              },
+              {
+                "name": "tag",
+                "type": "bytes"
+              }
+            ],
+            "id": 1,
+            "name": "hero"
+          },
+          {
+            "fields": [
+              {
+                "bits": 12,
+                "max": {
+                  "bits": "42800000",
+                  "f32": 64.0
+                },
+                "min": {
+                  "bits": "00000000",
+                  "f32": 0.0
+                },
+                "name": "x",
+                "type": "quant_f32"
+              }
+            ],
+            "id": 2,
+            "name": "orb"
+          }
+        ],
+        "server_tick": 42,
+        "server_time": 1000.25,
+        "session_id": "s1",
+        "tick_rate": 30,
+        "type": "Welcome",
+        "zone_id": "z1"
+      },
+      "direction": "server_to_client",
+      "hex": "80027331027a31001e142a0000000000428f400272740263310201046865726f0a05616c69766500056c6576656c010268700204676f6c640302647a04057370656564050178060000c8c20000c8421003796177070a046e616d6508037461670902036f72620101780600000000000080420c0100",
+      "name": "welcome_v2_unplaced"
     },
     {
       "decoded": {

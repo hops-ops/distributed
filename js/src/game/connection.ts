@@ -14,6 +14,7 @@ import {
 	GAME_PROTOCOL_VERSION,
 	GameClientMirror,
 	GameErrorCode,
+	GameFeature,
 	GameKickCode,
 	type DeltaMessage,
 	type ErrorMessage,
@@ -190,6 +191,8 @@ export type GameConnectionEvents = {
 
 type Attempt = {
 	socket: GameSocket;
+	/** Protocol version offered in this attempt's Hello. */
+	protocol: number;
 	mode: 'fresh' | 'resume';
 	welcomed: boolean;
 	ticket: string;
@@ -199,6 +202,27 @@ type Attempt = {
 };
 
 const defaultBackoff = (attempt: number): number => Math.min(5000, 250 * 2 ** (attempt - 1));
+
+/**
+ * Hosts (connection URLs) that refused protocol 2 and answered 1: later
+ * connections and reconnects offer 1 at once (for this page's lifetime).
+ */
+const v1Hosts = new Set<string>();
+
+/**
+ * Whether a handshake `Error` is a server refusing the offered protocol
+ * version (servers check it before the ticket, so the Hello can be resent
+ * with an older version): `VERSION_MISMATCH` with a message starting
+ * `protocol` (content mismatches start `content version`).
+ */
+function protocolRefused(error: ErrorMessage): boolean {
+	return error.code === GameErrorCode.VERSION_MISMATCH && error.message.startsWith('protocol');
+}
+
+/** Observers: at most one `Focus` per this many ms (see `setFocus`). */
+export const FOCUS_INTERVAL_MS = 200;
+/** Observers: a `Focus` is sent only after a move of this many metres. */
+export const FOCUS_MIN_MOVE = 0.25;
 
 export class GameConnection {
 	readonly zoneId: string;
@@ -217,6 +241,9 @@ export class GameConnection {
 	#url: string;
 	#contentVersion: string;
 	#near: boolean;
+	/** Observers: the focus asked for, and the last one sent (and when). */
+	#focus: { x: number; y: number } | undefined;
+	#focusSent: { x: number; y: number; at: number } | undefined;
 	#redirects = 0;
 	#lastResumeVersion: string | undefined;
 	#attempt: Attempt | undefined;
@@ -288,6 +315,16 @@ export class GameConnection {
 
 	get role(): GameRole | undefined {
 		return this.mirror.welcome?.role;
+	}
+
+	/** Protocol version the server answered in (last Welcome). */
+	get protocolVersion(): number | undefined {
+		return this.mirror.welcome?.protocolVersion;
+	}
+
+	/** Whether the server announced a runtime feature (`GameFeature`) in its last Welcome. */
+	hasFeature(feature: number): boolean {
+		return ((this.mirror.welcome?.features ?? 0) & feature) !== 0;
 	}
 
 	/** Reconnect token from the latest Welcome (rotated on every Welcome). */
@@ -444,6 +481,33 @@ export class GameConnection {
 	}
 
 	/**
+	 * Observers: where this watcher is looking, in the zone's local
+	 * coordinates (a player next door: its position seen from this zone, so
+	 * the zone's interest management follows it). Call it as often as you
+	 * like (e.g. every frame): it is sent at most every
+	 * {@link FOCUS_INTERVAL_MS} and only after a move of
+	 * {@link FOCUS_MIN_MOVE} or more, and again after every (re)connect;
+	 * never to a server without the `FOCUS` feature (protocol 1). For a
+	 * player's position, `GameClient.setPosition` does this per zone.
+	 */
+	setFocus(x: number, y: number): void {
+		if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+		this.#focus = { x, y };
+		this.#sendFocus();
+	}
+
+	#sendFocus(): void {
+		const focus = this.#focus;
+		if (focus === undefined || this.#state !== 'open' || this.mirror.welcome?.role !== 'observer') return;
+		if (!this.hasFeature(GameFeature.FOCUS)) return;
+		const now = this.#scheduler.now();
+		const last = this.#focusSent;
+		if (last !== undefined && (now - last.at < FOCUS_INTERVAL_MS || Math.hypot(focus.x - last.x, focus.y - last.y) < FOCUS_MIN_MOVE)) return;
+		this.#focusSent = { ...focus, at: now };
+		this.#send({ type: 'Focus', x: focus.x, y: focus.y });
+	}
+
+	/**
 	 * Continue after a content reload (state `reload-required`): sends the
 	 * new `contentVersion` in Hello, with the reconnect token while the grace
 	 * window lasts, else with a fresh ticket.
@@ -512,7 +576,8 @@ export class GameConnection {
 			this.#attemptFailed(error);
 			return;
 		}
-		const attempt: Attempt = { socket, mode, welcomed: false, ticket, token };
+		const protocol = v1Hosts.has(this.#url) ? 1 : GAME_PROTOCOL_VERSION;
+		const attempt: Attempt = { socket, protocol, mode, welcomed: false, ticket, token };
 		this.#attempt = attempt;
 		try {
 			socket.binaryType = 'arraybuffer';
@@ -521,9 +586,10 @@ export class GameConnection {
 		}
 		socket.onopen = () => {
 			if (this.#attempt !== attempt) return;
+			this.mirror.protocolVersion = protocol;
 			this.#send({
 				type: 'Hello',
-				protocolVersion: GAME_PROTOCOL_VERSION,
+				protocolVersion: protocol,
 				contentVersion: this.#contentVersion,
 				capabilities: this.#options.capabilities ?? 0,
 				ticket,
@@ -616,6 +682,15 @@ export class GameConnection {
 				this.#emitter.emit('redirect', message);
 				break;
 			case 'Error':
+				if (!attempt.welcomed && attempt.protocol > 1 && protocolRefused(message)) {
+					// A server that only speaks 1: the same Hello again with
+					// 1 (the ticket was not used), once; remembered per host.
+					v1Hosts.add(this.#url);
+					this.#attempt = undefined;
+					attempt.socket.close(1000, 'protocol fallback');
+					void this.#open(attempt.mode, { ticket: attempt.ticket, token: attempt.token });
+					break;
+				}
 				this.#onError(attempt, message);
 				if (!attempt.welcomed && this.#attempt === attempt) {
 					// A refused Hello ends the attempt: nothing else follows it.
@@ -645,6 +720,8 @@ export class GameConnection {
 		this.clock.reset();
 		this.clock.seed(welcome.serverTime, this.#scheduler.now());
 		this.#setState('open');
+		this.#focusSent = undefined;
+		this.#sendFocus();
 		this.#startPing();
 		this.#emitter.emit('welcome', welcome, { resumed: attempt.mode === 'resume', reconnected });
 		const waiters = this.#connectWaiters;

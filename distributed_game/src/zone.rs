@@ -13,7 +13,8 @@
 use crate::claims::TicketExtensions;
 use crate::facts::FactSettlement;
 use crate::host::Ctx;
-use crate::protocol::Role;
+use crate::interest::View;
+use crate::protocol::{Origin, Role};
 use crate::replication::WorldView;
 use crate::rewind::RewindFrame;
 use crate::schema::EntitySchema;
@@ -280,6 +281,44 @@ pub trait Zone: Sized + Send + 'static {
     /// An observer left. [`Ctx::observer`](crate::Ctx::observer) still
     /// returns it during this hook (it can no longer receive events).
     fn on_unobserve(&mut self, _ctx: &mut Ctx<'_, Self>, _observer: ObserverId) {}
+
+    /// An observer says where it is looking, in this zone's local
+    /// coordinates (`Focus`; e.g. a player next door, so this zone's
+    /// interest management follows that player across the border). The
+    /// default centres the observer's view there with the zone's
+    /// [`view_radius`](Self::view_radius) (the player sees this zone as it
+    /// sees its own), else keeps the observer's radius; override to clamp,
+    /// resize or ignore it. Untrusted: it only steers what the observer
+    /// sees.
+    fn on_observer_focus(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId, x: f32, y: f32) {
+        if !(x.is_finite() && y.is_finite()) {
+            return;
+        }
+        if let Some(view) = ctx.view_of(observer) {
+            let radius = self.view_radius().unwrap_or(view.radius);
+            ctx.set_view(observer, View::new(x, y, radius));
+        }
+    }
+
+    /// Where this zone sits in the world: the world position of its local
+    /// (0, 0), for zones whose positions are local to a place in one
+    /// continuous world (a grid of rooms, map tiles). Sent in Welcome, so a
+    /// client that knows where its player is focuses every neighbour it
+    /// watches by itself (JS: `GameClient.setPosition`). Derive it from the
+    /// zone's config (e.g. the room parsed from its zone id). `None`
+    /// (default): the zone is not placed and clients focus it only by hand.
+    fn origin(&self) -> Option<Origin> {
+        None
+    }
+
+    /// How far a player sees in this zone (the radius the zone gives player
+    /// views), when it is one radius. The default
+    /// [`on_observer_focus`](Self::on_observer_focus) gives a player next
+    /// door the same view here. `None` (default): focused observers keep
+    /// their radius.
+    fn view_radius(&self) -> Option<f32> {
+        None
+    }
 
     /// Decode raw input bytes from the wire; `None` drops the input.
     fn decode_input(&self, player: PlayerId, payload: &[u8]) -> Option<Self::Input>;

@@ -20,6 +20,14 @@
  * before the issuer knew where the player is) is reopened with a fresh
  * ticket while its zone stays near — at once the first time, then backing
  * off like a sleeping zone.
+ *
+ * **Focus** (interest across borders): zones that declare their world
+ * origin (Welcome v2) are focused by the client itself from
+ * `client.setPosition(x, y, zoneId)`, so each neighbour applies the
+ * player's own view around it instead of sending everything. For zones
+ * without an origin, `setFocus(at)` tells every watched zone where the
+ * player is in that zone's local coordinates (`at(zone)`). Call either
+ * every frame; connections throttle it and resend after reconnects.
  */
 import type { GameClient } from './client.js';
 import { GameErrorCode } from './messages.js';
@@ -53,6 +61,11 @@ export type ZoneWatch = Readonly<{
 	setNear(zones: Iterable<string>): void;
 	/** The zones last passed to `setNear`. */
 	near(): ReadonlySet<string>;
+	/**
+	 * Where the player is, per watched zone, in that zone's local
+	 * coordinates (`undefined`: no focus for it).
+	 */
+	setFocus(at: (zone: string) => { x: number; y: number } | undefined): void;
 }>;
 
 /**
@@ -176,6 +189,12 @@ export function watchZones(
 			else for (const zone of wanted) client.setNear(zone, near.has(zone));
 		},
 		near: () => near,
+		setFocus: (at) => {
+			for (const zone of wanted) {
+				const point = at(zone);
+				if (point !== undefined) client.setFocus(zone, point.x, point.y);
+			}
+		},
 		stop: () => {
 			stopped = true;
 			clear(timer);

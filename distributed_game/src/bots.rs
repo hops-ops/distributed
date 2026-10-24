@@ -173,6 +173,8 @@ pub struct BotStats {
     pub index: usize,
     /// Welcome received.
     pub joined: bool,
+    /// Time from the start of the connect to the Welcome.
+    pub joined_after: Option<Duration>,
     /// Why it stopped early.
     pub error: Option<String>,
     /// Deltas applied.
@@ -371,6 +373,7 @@ async fn drive(
         extensions: Default::default(),
         wake: false,
     });
+    let started = Instant::now();
     let url = format!(
         "{}/{}/{}",
         config.url.trim_end_matches('/'),
@@ -432,6 +435,7 @@ async fn drive(
                     ServerMessage::Welcome(_) => {
                         stats.joined = true;
                         let now = Instant::now();
+                        stats.joined_after = Some(now - started);
                         joined_at = Some(now);
                         next_input = now;
                         next_ping = now;

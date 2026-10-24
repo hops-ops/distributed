@@ -654,9 +654,11 @@ fn get_config(r: &mut Reader<'_>) -> Result<HostConfig, RecordingError> {
         reconnect_grace: get_dur(r)?,
         byte_budget: get_u64(r)? as usize,
         default_view_radius: r.f32()?,
+        // Update rates only shape Deltas, never the replayed world.
         interest: InterestConfig {
             cell_size: r.f32()?,
             leave_margin: r.f32()?,
+            ..InterestConfig::default()
         },
         content_version: r.string()?,
         world_seed: get_u64(r)?,

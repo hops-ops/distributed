@@ -1,4 +1,4 @@
-# distributed_game wire protocol — version 1
+# distributed_game wire protocol — version 2 (and 1)
 
 Normative specification of the binary protocol spoken between a
 `distributed_game` zone server and its clients. The Rust implementation
@@ -7,6 +7,11 @@ state machine is `protocol::ClientMirror`. Golden byte fixtures for
 independent implementations live in `tests/fixtures/*.json` (§9).
 
 Key words MUST / MUST NOT / SHOULD / MAY are used as in RFC 2119.
+
+Two versions are specified: 2 (current) and 1. They differ only in the
+handshake: Hello's `protocol_version` is negotiated (§6.0) and Welcome v2
+appends the server's runtime `features` and the zone's world `origin`
+(§6.3). Everything else is the same in both.
 
 ---
 
@@ -186,6 +191,30 @@ replication priorities are not transmitted.
 
 ## 6. Messages
 
+### 6.0 Version negotiation
+
+- A client offers the newest version it speaks in Hello
+  `protocol_version`.
+- A server that speaks the offered version answers in it: a v1 Hello gets
+  a v1 Welcome, a v2 Hello a v2 Welcome. Every later frame is the same in
+  both versions.
+- A server that does not speak it MUST answer `Error(VERSION_MISMATCH)`
+  whose message starts with `protocol` (e.g. `protocol 3 unsupported`)
+  and close, **before** verifying the ticket or reconnect token, so
+  neither is consumed. (Content mismatches use the same code with a
+  message starting `content version`.) Servers built before version 2
+  already behave this way: the native server sends `protocol 2 != 1` and
+  closes the socket normally, a celld zone sends `protocol version` and
+  closes with 1008.
+- On that refusal a client MAY send the same Hello (same ticket or token)
+  once more with an older version. The JS SDK falls back from 2 to 1 once
+  per host and remembers it for later connections to the same URL; it
+  surfaces neither the Error nor the close.
+- The Welcome is decoded in the version the client offered: v2 bytes are
+  the v1 bytes plus a tail, and trailing bytes stay a decode error.
+- A client MUST NOT send a message gated by a runtime feature (`Focus`)
+  unless the Welcome announced it: a v1 Welcome announces none.
+
 ### 6.1 Type bytes
 
 | Byte | Direction | Message |
@@ -196,6 +225,7 @@ replication priorities are not transmitted.
 | `0x04` | C→S | Leave |
 | `0x05` | C→S | Content |
 | `0x06` | C→S | Near |
+| `0x07` | C→S | Focus |
 | `0x80` | S→C | Welcome |
 | `0x81` | S→C | Delta |
 | `0x82` | S→C | Event |
@@ -221,10 +251,11 @@ Ping   := 0x03, f64 client_time
 Leave  := 0x04
 Content := 0x05, string content_version
 Near   := 0x06, bool near
+Focus  := 0x07, f32 x, f32 y
 ```
 
 - **Hello** MUST be the first message, sent within the server's hello
-  timeout (default 5 s). `protocol_version` MUST be `1`.
+  timeout (default 5 s). `protocol_version` is `2` or `1` (§6.0).
   `content_version` MUST equal the server's when the server pins one.
   `capabilities` are game-defined bits, opaque to the runtime. For a fresh
   join `ticket` is a signed admission ticket (§8) and `reconnect_token` is
@@ -261,8 +292,19 @@ Near   := 0x06, bool near
   `Error(WAKE_DENIED)` (the connection stays open).
   Servers that keep observed zones running anyway (the native `net`
   server) ignore it; players' are ignored.
+- **Focus** (feature `FOCUS`; only to servers whose Welcome announces
+  it): where an observer is looking, in the zone's local coordinates
+  (e.g. its player next door, seen from this zone: world position minus
+  the zone's Welcome `origin`). The zone decides what it means; by
+  default the observer's view centre moves there, with the zone's player
+  view radius when it declares one (else the observer's radius). It only
+  steers what that observer is sent. Clients SHOULD throttle it (the JS
+  SDK: at most every 200 ms, after a move of 0.25 or more) and send it
+  again after each Welcome. Players' are ignored; non-finite values are
+  ignored.
 
-Worked example — Hello (`version 1, content "c1", caps 5, ticket "t.k.n"`):
+Worked example — Hello (`version 1, content "c1", caps 5, ticket "t.k.n"`;
+`hello_v2` in the fixtures is the same with `02` as the second byte):
 
 ```
 01                 type Hello
@@ -284,6 +326,8 @@ Welcome := 0x80, string session_id, string zone_id, u8 role,
            varuint tick_rate, varuint patch_rate, varuint server_tick,
            f64 server_time, string reconnect_token, string content_version,
            schema
+           [v2: varuint features, bool placed,
+                [placed: f64 origin_x, f64 origin_y]]
 Delta   := 0x81, see §7
 Event   := 0x82, varuint type_id, bytes payload
 Pong    := 0x83, f64 client_time, f64 server_time
@@ -300,6 +344,13 @@ Redirect := 0x89, string zone_id, string url
   rotated on every Welcome (empty for observers). A client MUST discard all
   mirrored entities on Welcome; the server resends creates afterwards.
   `tick_rate`/`patch_rate` are Hz.
+  v2 only: `features` are runtime feature bits (defined by the runtime,
+  unlike Hello's game-defined `capabilities`): bit 0 `FOCUS` = the server
+  handles `Focus`; unknown bits MUST be ignored. `origin` (when `placed`)
+  is where the zone sits in the world: world = origin + zone-local, for
+  zones whose positions are local to one place in a continuous world
+  (`Zone::origin`). A client that knows its player's world position
+  focuses each placed zone it observes on `world - origin` by itself.
 - **Event**: reliable, ordered, game-defined (`type_id`, `payload`). Events
   are queued when emitted and may arrive before the Delta of the tick that
   produced them.
@@ -340,7 +391,7 @@ Redirect := 0x89, string zone_id, string url
   grant it). Errors during the handshake are followed by close;
   `BAD_MESSAGE`, `RATE_LIMITED` and `WAKE_DENIED` after joining are not.
 
-Worked example — Welcome (session "s1", zone "z1", player, 30 Hz ticks,
+Worked example — Welcome v1 (session "s1", zone "z1", player, 30 Hz ticks,
 20 Hz patches, tick 42, time 1000.25 ms, token "rt", content "c1",
 schema of `fixtures/messages.json`):
 
@@ -370,6 +421,18 @@ schema of `fixtures/messages.json`):
   02 03 6f 72 62 01      kind 2 "orb", 1 field
     01 78 06 00000000 00008042 0c    "x" quant_f32 min 0 max 64 bits 12
 ```
+
+Welcome v2 (`welcome_v2`: the same fields with role observer, then the
+v2 tail):
+
+```
+01                       features FOCUS
+01                       placed
+00 00 00 00 00 00 48 c0  origin_x -48
+00 00 00 00 81 84 2e 41  origin_y 1000000.5
+```
+
+`welcome_v2_unplaced` (player) ends `01 00`: features `FOCUS`, not placed.
 
 Redirect (`fixtures/messages.json` → `redirect`):
 `89 0a 7265616c6d2e77657374 23 77733a2f2f31302e302e302e323a323536372f7a6f6e65732f7265616c6d2e77657374`
@@ -425,6 +488,9 @@ update  := varuint id, varuint mask, value(field_i) for each set bit i, ascendin
   accumulator; the highest accumulators are sent first and reset;
   deferred entities keep accumulating, so none starve. At least one
   candidate is sent per Delta. Removes are never budgeted.
+- Update rates (default): a changed, already-known, non-global entity
+  beyond half the radius is a candidate only every 2nd patch, beyond 0.8
+  of it every 4th. Clients see this only as less frequent updates.
 
 ### 7.4 Worked example
 
@@ -567,7 +633,10 @@ distributed_game --test golden`; a drift fails the test):
   `q` the quantized integer, `hex` its varuint bytes.
 - `messages.json` — `{messages: [{name, direction, hex, decoded,
   known_entities?, schema?}]}`. Delta entries include the schema and the
-  `known_entities` (`[{id, kind}]`) needed to decode updates.
+  `known_entities` (`[{id, kind}]`) needed to decode updates. Welcome
+  entries carry `decoded.protocol_version` (the version to decode them
+  in); v2 ones add `features` and `origin` (`{x, y}` or `null`). Hellos
+  cover both versions (`hello` v1, `hello_v2`).
 - `authoring.json` (`--test authoring`) — a sample game surface and
   input / event payloads encoded with the typed payload codec (§11), with
   their expected TypeScript values; generated clients are round-tripped
@@ -585,9 +654,22 @@ JSON conventions in `decoded`:
 
 ## 10. Versioning
 
-`protocol_version` changes on any incompatible wire change. Message type
-bytes `0x07..0x7f` and `0x8a..0xff`, and field type tags `10..255`, are
-reserved for future versions.
+`protocol_version` changes on any incompatible wire change, and is
+negotiated (§6.0): servers keep answering older versions they still
+speak, so clients and servers may be deployed in either order. Message
+type bytes `0x08..0x7f` and `0x8a..0xff`, and field type tags `10..255`,
+are reserved for future versions.
+
+Version 2 (negotiated; v1 peers keep working unchanged):
+
+- Welcome appends `features` and the optional `origin` (§6.3).
+- `0x07 Focus` is gated on the `FOCUS` feature: a client sends it only
+  to servers that announce it, so a server built before it (which
+  answers `Error(BAD_MESSAGE)`; a celld zone also closes the connection)
+  never receives it.
+- Payload encodings (fields, inputs, events, §11) are unchanged, so a
+  game surface keeps `protocolVersion: 1` and generated clients work
+  with both versions.
 
 Additive changes within version 1 (clients SHOULD ignore unknown kick and
 error codes and treat them as "session over" / "request failed"):
@@ -598,6 +680,7 @@ error codes and treat them as "session over" / "request failed"):
 - Error code `10` ASLEEP.
 - Error code `11` WAKE_DENIED.
 - `0x06 Near` (client → server) and the ticket claim `wake`.
+- `0x07 Focus` (client → server), gated since version 2 (above).
 
 Not additive (made before the first release, so the version stays 1):
 Hello's trailing `bool near` — clients built before it send one byte
