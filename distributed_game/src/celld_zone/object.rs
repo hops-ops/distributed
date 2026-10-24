@@ -294,8 +294,8 @@ impl CelldObjectHost {
 
     /// `calls` (one aggregate) in one `POST /{kind}/{shard}/__batch`
     /// ([`super::cells::serve_cell`]); each entry carries its own command
-    /// id, principal and stamp. A cell without the route gets them one by
-    /// one.
+    /// id, principal and stamp. A cell without the route, or one refusing
+    /// the batch request as a whole (4xx), gets them one by one.
     async fn post_batch(
         &self,
         calls: Vec<FactCall<'_>>,
@@ -341,7 +341,10 @@ impl CelldObjectHost {
             )
             .await;
         match sent {
-            Ok((404, _)) => {
+            // No batch route (404; a cell serving only commands answers
+            // `__batch` 400), or the batch itself refused: each fact gets
+            // its own answer, never the first fact the batch's.
+            Ok((status, _)) if (400..500).contains(&status) && !matches!(status, 408 | 429) => {
                 let mut results = Vec::with_capacity(calls.len());
                 for call in &calls {
                     let result = self.post(call).await;

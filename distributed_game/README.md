@@ -1188,7 +1188,12 @@ order through the same idempotent wait path and drains the cell outbox
 once). A batch stops at its first retryable failure and is retried from
 there; attempts count per fact, so order, exactly-once and
 `RetryPolicy` mean what they mean for single facts. A cell without the
-batch route (404) gets the facts one by one.
+batch route, or one refusing the batch request as a whole (a 4xx other
+than 408/429), gets the facts one by one. Serve fact cells with
+`serve_cell` (or `CellWatchers::serve`), whose `__batch` runs the batch
+under one command guard and one alarm reschedule
+(`AggregateCell::dispatch_idempotent_batch`); each entry is still its own
+ledger reservation and commit.
 
 ## Netcode and operations
 
