@@ -589,6 +589,31 @@ struct Snapshot {
     state: String,
 }
 
+/// When this activation woke and where its first join spent its time
+/// (`Date.now()` ms; celld advances it at I/O boundaries, so the spans are
+/// the awaited storage calls). Debug info for recovery timing.
+#[derive(Default, Clone, Copy)]
+struct WakeTrace {
+    /// The object was constructed (celld claimed and opened the cell).
+    constructed_at: f64,
+    /// First request of any kind (fetch, socket message, alarm).
+    first_call_at: Option<f64>,
+    /// What woke it: 1 fetch, 2 socket message, 3 alarm.
+    first_call: u8,
+    /// [`ZoneObject::start_facts`] (zone id write + outbox listing).
+    facts_ms: Option<f64>,
+    /// Facts resent from the outbox on wake.
+    outbox_resent: usize,
+    /// Snapshot read.
+    snapshot_read_ms: Option<f64>,
+    /// Restore + the first status write.
+    restore_ms: Option<f64>,
+    /// The join's own status write and start of the loop, after the wake.
+    join_ms: Option<f64>,
+    /// First Welcome handed to celld (the output gate may hold it).
+    welcome_at: Option<f64>,
+}
+
 #[derive(Default)]
 struct TickStats {
     late: Window,
@@ -652,6 +677,7 @@ struct Inner<Z: CelldZone> {
     /// [`CelldZone::refresh`] calls of this activation, and the last one.
     refresh_round: u64,
     last_refresh_ms: f64,
+    trace: WakeTrace,
 }
 
 impl<Z: CelldZone> Inner<Z> {
@@ -976,6 +1002,10 @@ impl<Z: CelldZone> ZoneObject<Z> {
             world_due: HashMap::new(),
             refresh_round: 0,
             last_refresh_ms: 0.0,
+            trace: WakeTrace {
+                constructed_at: now_ms(),
+                ..WakeTrace::default()
+            },
         };
         let inner = Rc::new(RefCell::new(inner));
         let weak = Rc::downgrade(&inner);
@@ -998,6 +1028,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
 
     /// Durable Object `fetch`.
     pub async fn fetch(&self, req: Request) -> Result<Response> {
+        self.first_call(1);
         if let Some(zone) = req.headers().get(ZONE_HEADER)? {
             let mut inner = self.inner.borrow_mut();
             if inner.zone_id.is_empty() {
@@ -1035,6 +1066,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         ws: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
+        self.first_call(2);
         let WebSocketIncomingMessage::Binary(bytes) = message else {
             let _ = ws.close(Some(1003), Some("binary frames only"));
             return Ok(());
@@ -1160,6 +1192,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
     /// Durable Object `alarm`: hibernate a room that stayed empty, resend
     /// unsettled facts, and after a crash mark the room asleep.
     pub async fn alarm(&self) -> Result<Response> {
+        self.first_call(3);
         if self.inner.borrow().options.is_none() {
             return Response::ok("unconfigured");
         }
@@ -1206,6 +1239,14 @@ impl<Z: CelldZone> ZoneObject<Z> {
 
     // -------------------------------------------------------------- internals
 
+    fn first_call(&self, kind: u8) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.trace.first_call_at.is_none() {
+            inner.trace.first_call_at = Some(now_ms());
+            inner.trace.first_call = kind;
+        }
+    }
+
     /// Sockets accepted before an eviction reach a new instance without a
     /// zone id from a request; the id is kept in storage.
     async fn load_zone_id(&self) {
@@ -1243,6 +1284,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             );
             return;
         };
+        let started = now_ms();
         let host = CelldObjectHost::new(self.env.env().clone(), secret, &service);
         let sink = match ObjectFactSink::new(host, service, zone_principal(&zone_id)) {
             Ok(sink) => {
@@ -1282,7 +1324,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             .await;
         let mut inner = self.inner.borrow_mut();
         inner.outbox_loaded = true;
+        inner.trace.facts_ms.get_or_insert(now_ms() - started);
         if let Ok(map) = stored {
+            let mut resent = 0;
             let Some(queue) = inner.activity.as_mut() else {
                 return;
             };
@@ -1295,10 +1339,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 };
                 if let Some(fact) = stored.into_fact() {
                     let _ = queue.try_send(fact);
+                    resent += 1;
                 }
             }
             // Already stored.
             queue.take_journal();
+            inner.trace.outbox_resent += resent;
         }
     }
 
@@ -1308,7 +1354,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
         if self.inner.borrow().host.is_some() {
             return Ok(());
         }
+        let read_at = now_ms();
         let stored: Option<Snapshot> = self.state.storage().get(SNAPSHOT_KEY).await.ok().flatten();
+        let restore_at = now_ms();
         let host = {
             let inner = self.inner.borrow();
             if inner.host.is_some() {
@@ -1402,6 +1450,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
             inner.report(ACTIVITY_ACTIVE);
         }
         self.store_status().await;
+        {
+            let mut inner = self.inner.borrow_mut();
+            let trace = &mut inner.trace;
+            trace.snapshot_read_ms.get_or_insert(restore_at - read_at);
+            trace.restore_ms.get_or_insert(now_ms() - restore_at);
+        }
         self.find_node();
         // Hydrate every watched cell, off the join path: a wake (often a
         // doorway into a sleeping zone, with the player's inputs waiting)
@@ -1790,8 +1844,17 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 if observer {
                     return Ok(());
                 }
+                let joined_at = now_ms();
                 self.store_status().await;
                 self.start_loop();
+                {
+                    let mut inner = self.inner.borrow_mut();
+                    let trace = &mut inner.trace;
+                    if trace.welcome_at.is_none() {
+                        trace.welcome_at = Some(joined_at);
+                        trace.join_ms = Some(now_ms() - joined_at);
+                    }
+                }
                 if let Some(principal) = principal {
                     self.after_join(principal);
                 }
@@ -2182,6 +2245,17 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 "freeze": format!("{:?}", h.freeze_state()).to_lowercase(),
             })),
             "workMs": { "p50": stats.work.percentile(0.5), "p99": stats.work.percentile(0.99) },
+            "wake": {
+                "constructedAt": inner.trace.constructed_at,
+                "firstCallAt": inner.trace.first_call_at,
+                "firstCall": inner.trace.first_call,
+                "factsMs": inner.trace.facts_ms,
+                "outboxResent": inner.trace.outbox_resent,
+                "snapshotReadMs": inner.trace.snapshot_read_ms,
+                "restoreMs": inner.trace.restore_ms,
+                "joinMs": inner.trace.join_ms,
+                "welcomeAt": inner.trace.welcome_at,
+            },
         })
     }
 }
