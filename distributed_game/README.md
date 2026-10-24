@@ -1163,13 +1163,15 @@ a time (a slow commit delays every later fact). Set
 without a principal) stay sequential in emission order; different
 principals commit concurrently; settlements arrive in completion order.
 
-**Batches.** The feed hands its sink up to `max_batch` (default 16,
+**Batches.** A sink that settles many facts in one round trip says so
+(`FactSink::max_batch`, `FactHost::max_fact_batch`; the celld object host
+does) and the feed then hands it up to `max_batch` (default 16,
 `FactFeed::with_max_batch`; celld zones: `ZONE_FACT_BATCH`) waiting facts
-of a lane at once, `FactSink::commit_batch`. Game code is unchanged
-(`ctx.emit`, `#[derive(FactCommand)]`, `#[command]` handlers). The default
-commits them one by one; `CommandFactSink` groups consecutive facts for
-the same aggregate and calls `FactHost::dispatch_fact_batch`, which the
-celld object host sends as one `POST {kind}/{shard}/__batch` (each entry
+of a lane at once, `FactSink::commit_batch`. Other sinks keep getting one
+fact at a time. Game code is unchanged (`ctx.emit`,
+`#[derive(FactCommand)]`, `#[command]` handlers). `CommandFactSink`
+groups consecutive facts for the same aggregate and calls
+`FactHost::dispatch_fact_batch`, which the celld object host sends as one `POST {kind}/{shard}/__batch` (each entry
 with its own command id, principal and stamp; `serve_cell` runs them in
 order through the same idempotent wait path and drains the cell outbox
 once). A batch stops at its first retryable failure and is retried from

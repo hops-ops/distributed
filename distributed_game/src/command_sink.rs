@@ -153,6 +153,13 @@ pub trait FactHost: Send + Sync + 'static {
         call: FactCall<'a>,
     ) -> BoxFuture<'a, Result<FactReceipt, FactError>>;
 
+    /// Facts this host runs per [`dispatch_fact_batch`](Self::dispatch_fact_batch)
+    /// at most (default 1). A host with a batch route returns more, and
+    /// the sink's [`FactSink::max_batch`] follows it.
+    fn max_fact_batch(&self) -> usize {
+        1
+    }
+
     /// Run `calls` (consecutive facts for one aggregate: same kind and
     /// shard) in order, under [`FactSink::commit_batch`]'s contract: the
     /// results end at the first retryable failure. The default runs them
@@ -318,6 +325,10 @@ impl<H: FactHost> CommandFactSink<H> {
 impl<H: FactHost> FactSink for CommandFactSink<H> {
     fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
         Box::pin(async move { self.host.dispatch_fact(self.call_for(fact)?).await })
+    }
+
+    fn max_batch(&self) -> usize {
+        self.host.max_fact_batch()
     }
 
     /// Consecutive facts for the same aggregate go to the host together

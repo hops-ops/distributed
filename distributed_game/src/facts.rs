@@ -29,14 +29,15 @@
 //! refuses duplicates), so per-key order always holds. Settlements arrive
 //! in completion order.
 //!
-//! Batching: the feed hands a sink up to
-//! [`max_batch`](FactFeed::with_max_batch) (default
-//! [`DEFAULT_MAX_BATCH`]) consecutive facts of one lane at once
-//! ([`FactSink::commit_batch`]). A sink that can settle many facts in
-//! one round trip (the celld cell hosts: one `__batch` request per cell)
-//! overrides it; the default commits them one by one. A batch commits in
-//! order and stops at its first retryable failure, which is retried from
-//! there, so order and exactly-once hold as for single facts.
+//! Batching: a sink that settles many facts in one round trip (the
+//! celld object host: one `__batch` request per cell) says so with
+//! [`FactSink::max_batch`]; the feed then hands it up to that many (and
+//! at most [`FactFeed::with_max_batch`], default [`DEFAULT_MAX_BATCH`])
+//! consecutive facts of one lane at once ([`FactSink::commit_batch`]).
+//! Other sinks keep getting one fact at a time, so their settlements flow
+//! back per fact. A batch commits in order and stops at its first
+//! retryable failure, which is retried from there, so order and
+//! exactly-once hold as for single facts.
 
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
@@ -245,6 +246,14 @@ impl FactSettlement {
 pub trait FactSink: Send + Sync + 'static {
     /// Commit one fact. Must be idempotent per [`Fact::key`].
     fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>>;
+
+    /// Facts this sink settles per [`commit_batch`](Self::commit_batch)
+    /// round trip at most (default 1: one fact at a time, each settlement
+    /// delivered as soon as it commits). Override when a batch is cheaper
+    /// than its facts one by one.
+    fn max_batch(&self) -> usize {
+        1
+    }
 
     /// Commit `facts` in order: one result per fact attempted. The
     /// results end at the first [`FactError::Retryable`] (included), or
@@ -542,8 +551,9 @@ impl FactFeed {
         self.max_concurrent
     }
 
-    /// Hand the sink up to `n` facts of a lane at once (default
-    /// [`DEFAULT_MAX_BATCH`]; 1 commits fact by fact).
+    /// Hand a batching sink ([`FactSink::max_batch`] > 1) up to `n` facts
+    /// of a lane at once (default [`DEFAULT_MAX_BATCH`]; 1 commits fact by
+    /// fact).
     pub fn with_max_batch(mut self, n: usize) -> Self {
         self.max_batch = n.max(1);
         self
@@ -565,8 +575,9 @@ impl FactFeed {
         Fut: Future<Output = ()>,
     {
         let policy = self.policy;
+        let max_batch = self.max_batch.min(sink.max_batch()).max(1);
         if self.max_concurrent <= 1 {
-            while let Some(facts) = NextFact(&self.shared, self.max_batch).await {
+            while let Some(facts) = NextFact(&self.shared, max_batch).await {
                 for settlement in commit_with_retries(&sink, facts, policy, &sleep).await {
                     let _ = self.settlements.send(settlement);
                 }
@@ -578,7 +589,7 @@ impl FactFeed {
             shared: &self.shared,
             settlements: &self.settlements,
             limit: self.max_concurrent,
-            max_batch: self.max_batch,
+            max_batch,
             start,
             waiting: VecDeque::new(),
             active: Vec::new(),
@@ -780,6 +791,10 @@ impl<S: FactSink> FactSink for Arc<S> {
         (**self).commit(fact)
     }
 
+    fn max_batch(&self) -> usize {
+        (**self).max_batch()
+    }
+
     fn commit_batch<'a>(
         &'a self,
         facts: &'a [Fact],
@@ -804,6 +819,10 @@ mod batch_tests {
     impl FactSink for BatchSink {
         fn commit<'a>(&'a self, _: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
             unreachable!("batches only")
+        }
+
+        fn max_batch(&self) -> usize {
+            usize::MAX
         }
 
         fn commit_batch<'a>(

@@ -413,6 +413,12 @@ impl FactHost for CelldObjectHost {
         Box::pin(SendFuture::new(async move { self.post(&call).await }))
     }
 
+    /// Any number: one `__batch` request per cell (the feed's
+    /// `ZONE_FACT_BATCH` bounds it).
+    fn max_fact_batch(&self) -> usize {
+        usize::MAX
+    }
+
     fn dispatch_fact_batch<'a>(
         &'a self,
         calls: Vec<FactCall<'a>>,
@@ -463,6 +469,10 @@ impl FactSink for DurableFacts {
             }
             result
         }))
+    }
+
+    fn max_batch(&self) -> usize {
+        self.sink.max_batch()
     }
 
     /// One batched delete for the facts the batch settled.
