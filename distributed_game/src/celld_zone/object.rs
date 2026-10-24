@@ -598,6 +598,32 @@ struct Snapshot {
     state: String,
 }
 
+/// When this activation woke and where its first join spent its time
+/// (`Date.now()` ms; celld advances it at I/O boundaries, so the spans are
+/// the awaited storage calls). Debug info for recovery timing.
+#[derive(Default, Clone, Copy)]
+struct WakeTrace {
+    /// The object was constructed (celld claimed and opened the cell).
+    constructed_at: f64,
+    /// First request of any kind (fetch, socket message, alarm).
+    first_call_at: Option<f64>,
+    /// What woke it: 1 fetch, 2 socket message, 3 alarm.
+    first_call: u8,
+    /// [`ZoneObject::start_facts`] (zone id write + outbox listing).
+    facts_ms: Option<f64>,
+    /// Facts resent from the outbox on wake.
+    outbox_resent: usize,
+    /// Snapshot read.
+    snapshot_read_ms: Option<f64>,
+    /// Restore (and, before the join writes moved after the Welcome, the
+    /// wake's status write).
+    restore_ms: Option<f64>,
+    /// The join's own status write and start of the loop, after the wake.
+    join_ms: Option<f64>,
+    /// First Welcome handed to celld (the output gate may hold it).
+    welcome_at: Option<f64>,
+}
+
 #[derive(Default)]
 struct TickStats {
     late: Window,
@@ -628,6 +654,8 @@ struct Inner<Z: CelldZone> {
     activity_seq: u64,
     outbox_loaded: bool,
     last_status: String,
+    /// The status last written (`None`: not read yet this activation).
+    stored_status: Option<String>,
     node: String,
     stats: TickStats,
     last_persist_ms: f64,
@@ -661,6 +689,7 @@ struct Inner<Z: CelldZone> {
     /// [`CelldZone::refresh`] calls of this activation, and the last one.
     refresh_round: u64,
     last_refresh_ms: f64,
+    trace: WakeTrace,
 }
 
 impl<Z: CelldZone> Inner<Z> {
@@ -967,6 +996,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             activity_seq: 0,
             outbox_loaded: false,
             last_status: String::new(),
+            stored_status: None,
             node,
             stats: TickStats::default(),
             last_persist_ms: 0.0,
@@ -985,6 +1015,10 @@ impl<Z: CelldZone> ZoneObject<Z> {
             world_due: HashMap::new(),
             refresh_round: 0,
             last_refresh_ms: 0.0,
+            trace: WakeTrace {
+                constructed_at: now_ms(),
+                ..WakeTrace::default()
+            },
         };
         let inner = Rc::new(RefCell::new(inner));
         let weak = Rc::downgrade(&inner);
@@ -1007,6 +1041,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
 
     /// Durable Object `fetch`.
     pub async fn fetch(&self, req: Request) -> Result<Response> {
+        self.first_call(1);
         if let Some(zone) = req.headers().get(ZONE_HEADER)? {
             let mut inner = self.inner.borrow_mut();
             if inner.zone_id.is_empty() {
@@ -1044,6 +1079,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         ws: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
+        self.first_call(2);
         let WebSocketIncomingMessage::Binary(bytes) = message else {
             let _ = ws.close(Some(1003), Some("binary frames only"));
             return Ok(());
@@ -1169,6 +1205,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
     /// Durable Object `alarm`: hibernate a room that stayed empty, resend
     /// unsettled facts, and after a crash mark the room asleep.
     pub async fn alarm(&self) -> Result<Response> {
+        self.first_call(3);
         if self.inner.borrow().options.is_none() {
             return Response::ok("unconfigured");
         }
@@ -1215,6 +1252,14 @@ impl<Z: CelldZone> ZoneObject<Z> {
 
     // -------------------------------------------------------------- internals
 
+    fn first_call(&self, kind: u8) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.trace.first_call_at.is_none() {
+            inner.trace.first_call_at = Some(now_ms());
+            inner.trace.first_call = kind;
+        }
+    }
+
     /// Sockets accepted before an eviction reach a new instance without a
     /// zone id from a request; the id is kept in storage.
     async fn load_zone_id(&self) {
@@ -1252,6 +1297,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             );
             return;
         };
+        let started = now_ms();
         let host = CelldObjectHost::new(self.env.env().clone(), secret, &service);
         let sink = match ObjectFactSink::new(host, service, zone_principal(&zone_id)) {
             Ok(sink) => {
@@ -1282,7 +1328,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
             inner.sink = Some(durable);
             inner.activity = Some(queue);
         }
-        let _ = self.state.storage().put("zone:id", &zone_id).await;
+        // Written once per zone, not per activation: a wake after a crash
+        // writes nothing before its first player is in.
+        let stored_id: Option<String> = self.state.storage().get("zone:id").await.ok().flatten();
+        if stored_id.as_deref() != Some(zone_id.as_str()) {
+            let _ = self.state.storage().put("zone:id", &zone_id).await;
+        }
         // Resend the previous activations' unsettled facts.
         let stored = self
             .state
@@ -1291,7 +1342,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             .await;
         let mut inner = self.inner.borrow_mut();
         inner.outbox_loaded = true;
+        inner.trace.facts_ms.get_or_insert(now_ms() - started);
         if let Ok(map) = stored {
+            let mut resent = 0;
             let Some(queue) = inner.activity.as_mut() else {
                 return;
             };
@@ -1304,24 +1357,31 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 };
                 if let Some(fact) = stored.into_fact() {
                     let _ = queue.try_send(fact);
+                    resent += 1;
                 }
             }
             // Already stored.
             queue.take_journal();
+            inner.trace.outbox_resent += resent;
         }
     }
 
-    /// Make sure the zone is in memory (restoring its snapshot).
-    async fn wake(&self) -> Result<()> {
+    /// Make sure the zone is in memory (restoring its snapshot); true when
+    /// it was not. Reads only: the caller stores the zone's status (and the
+    /// facts of the wake) once its frames are out, so celld's output gate
+    /// does not hold a joining player's Welcome for writes of the wake.
+    async fn wake(&self) -> Result<bool> {
         self.start_facts().await;
         if self.inner.borrow().host.is_some() {
-            return Ok(());
+            return Ok(false);
         }
+        let read_at = now_ms();
         let stored: Option<Snapshot> = self.state.storage().get(SNAPSHOT_KEY).await.ok().flatten();
+        let restore_at = now_ms();
         let host = {
             let inner = self.inner.borrow();
             if inner.host.is_some() {
-                return Ok(());
+                return Ok(false);
             }
             let options = inner
                 .options
@@ -1395,7 +1455,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         {
             let mut inner = self.inner.borrow_mut();
             if inner.host.is_some() {
-                return Ok(());
+                return Ok(false);
             }
             inner.host = Some(host);
             inner.restored = restored;
@@ -1409,8 +1469,10 @@ impl<Z: CelldZone> ZoneObject<Z> {
             inner.state = RoomState::Active;
             inner.last_persist_ms = now_ms();
             inner.report(ACTIVITY_ACTIVE);
+            let trace = &mut inner.trace;
+            trace.snapshot_read_ms.get_or_insert(restore_at - read_at);
+            trace.restore_ms.get_or_insert(now_ms() - restore_at);
         }
-        self.store_status().await;
         self.find_node();
         // Hydrate every watched cell, off the join path: a wake (often a
         // doorway into a sleeping zone, with the player's inputs waiting)
@@ -1421,7 +1483,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         self.inner.borrow_mut().world_versions.clear();
         self.reconcile_world(true);
         self.refresh();
-        Ok(())
+        Ok(true)
     }
 
     /// Run [`CelldZone::refresh`] off the tick and deliver its message.
@@ -1656,6 +1718,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         // Transfer tickets are single use across activations too.
         let mut principal = None;
         let mut wake_grant = false;
+        let mut woke = false;
         let joined = if hello.reconnect_token.is_empty() {
             let verified = {
                 let inner = self.inner.borrow();
@@ -1713,10 +1776,13 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     .put(&nonce_key, claims.expires_at)
                     .await;
             }
-            if let Err(e) = self.wake().await {
-                reject(ws, error::NOT_FOUND, &e.to_string());
-                return Ok(());
-            }
+            woke = match self.wake().await {
+                Ok(woke) => woke,
+                Err(e) => {
+                    reject(ws, error::NOT_FOUND, &e.to_string());
+                    return Ok(());
+                }
+            };
             if claims.role == Role::Player {
                 principal = Some(claims.principal.clone());
             }
@@ -1802,15 +1868,32 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     }
                 }
                 if observer {
+                    if woke {
+                        self.store_status().await;
+                    }
                     return Ok(());
                 }
+                let joined_at = now_ms();
                 self.store_status().await;
                 self.start_loop();
+                {
+                    let mut inner = self.inner.borrow_mut();
+                    let trace = &mut inner.trace;
+                    if trace.welcome_at.is_none() {
+                        trace.welcome_at = Some(joined_at);
+                        trace.join_ms = Some(now_ms() - joined_at);
+                    }
+                }
                 if let Some(principal) = principal {
                     self.after_join(principal);
                 }
             }
-            Err(e) => reject(ws, e.code, &e.message),
+            Err(e) => {
+                reject(ws, e.code, &e.message);
+                if woke {
+                    self.store_status().await;
+                }
+            }
         }
         Ok(())
     }
@@ -2041,28 +2124,50 @@ impl<Z: CelldZone> ZoneObject<Z> {
 
     /// Write the facts emitted since the last call to the outbox.
     async fn spool(&self) {
+        self.spool_with(None).await;
+    }
+
+    /// [`spool`](Self::spool), with the zone's `status` in the same batch.
+    async fn spool_with(&self, status: Option<String>) {
         let facts = self.inner.borrow_mut().emitted();
-        if facts.is_empty() {
+        if facts.is_empty() && status.is_none() {
             return;
         }
-        let storage = self.state.storage();
         // One batched write (the storage API takes at most 128 keys).
-        for chunk in facts.chunks(128) {
-            let batch = js_sys::Object::new();
-            for fact in chunk {
-                let text = serde_json::to_string(&StoredFact::of(fact)).unwrap_or_default();
-                let _ = js_sys::Reflect::set(
-                    &batch,
-                    &StoredFact::storage_key(fact.key()).into(),
-                    &text.into(),
-                );
+        let mut batches: Vec<(js_sys::Object, usize)> = facts
+            .chunks(128)
+            .map(|chunk| {
+                let batch = js_sys::Object::new();
+                for fact in chunk {
+                    let text = serde_json::to_string(&StoredFact::of(fact)).unwrap_or_default();
+                    let _ = js_sys::Reflect::set(
+                        &batch,
+                        &StoredFact::storage_key(fact.key()).into(),
+                        &text.into(),
+                    );
+                }
+                (batch, chunk.len())
+            })
+            .collect();
+        if let Some(status) = status {
+            if batches.last().is_none_or(|(_, keys)| *keys >= 128) {
+                batches.push((js_sys::Object::new(), 0));
             }
+            if let Some((batch, keys)) = batches.last_mut() {
+                let _ = js_sys::Reflect::set(batch, &STATUS_KEY.into(), &status.into());
+                *keys += 1;
+            }
+        }
+        let storage = self.state.storage();
+        for (batch, _) in batches {
             if let Err(e) = storage.put_multiple_raw(batch).await {
                 worker::console_error!("fact outbox write failed: {e}");
             }
         }
-        self.inner.borrow_mut().spooled += facts.len() as u64;
-        self.arm_outbox().await;
+        if !facts.is_empty() {
+            self.inner.borrow_mut().spooled += facts.len() as u64;
+            self.arm_outbox().await;
+        }
     }
 
     /// [`spool`](Self::spool) from a synchronous handler.
@@ -2071,12 +2176,30 @@ impl<Z: CelldZone> ZoneObject<Z> {
         wasm_bindgen_futures::spawn_local(async move { this.spool().await });
     }
 
+    /// Spool the pending facts and write the zone's status with them when
+    /// it changed (one batch; an unchanged status writes nothing).
     async fn store_status(&self) {
-        self.spool().await;
-        let status = self.inner.borrow().last_status.clone();
-        if !status.is_empty() {
-            let _ = self.state.storage().put(STATUS_KEY, status).await;
-        }
+        let (status, known) = {
+            let inner = self.inner.borrow();
+            (inner.last_status.clone(), inner.stored_status.clone())
+        };
+        let stored = match known {
+            Some(stored) => Some(stored),
+            None => self
+                .state
+                .storage()
+                .get::<String>(STATUS_KEY)
+                .await
+                .ok()
+                .flatten(),
+        };
+        let changed = !status.is_empty() && stored.as_deref() != Some(status.as_str());
+        self.inner.borrow_mut().stored_status = Some(if changed {
+            status.clone()
+        } else {
+            stored.unwrap_or_default()
+        });
+        self.spool_with(changed.then_some(status)).await;
     }
 
     /// Set the object's alarm `in_ms` from now.
@@ -2196,6 +2319,17 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 "freeze": format!("{:?}", h.freeze_state()).to_lowercase(),
             })),
             "workMs": { "p50": stats.work.percentile(0.5), "p99": stats.work.percentile(0.99) },
+            "wake": {
+                "constructedAt": inner.trace.constructed_at,
+                "firstCallAt": inner.trace.first_call_at,
+                "firstCall": inner.trace.first_call,
+                "factsMs": inner.trace.facts_ms,
+                "outboxResent": inner.trace.outbox_resent,
+                "snapshotReadMs": inner.trace.snapshot_read_ms,
+                "restoreMs": inner.trace.restore_ms,
+                "joinMs": inner.trace.join_ms,
+                "welcomeAt": inner.trace.welcome_at,
+            },
         })
     }
 }
