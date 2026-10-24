@@ -89,6 +89,15 @@ export type GamePredictionOptions<TInput> = PredictorOptions<TInput> &
 		 * latency is hidden.
 		 */
 		handoffFrame?: (fields: EntityFields, from: string, to: string) => EntityFields | undefined;
+		/**
+		 * Draw each predicted step as motion over its input interval
+		 * (fixed-timestep interpolation; default true). The controlled
+		 * entity is then drawn up to one input interval behind its
+		 * prediction, but moves smoothly on a display faster than the tick
+		 * rate instead of in tick-sized hops against a smooth camera. False
+		 * draws the prediction itself, the instant it is made.
+		 */
+		smoothSteps?: boolean;
 	}>;
 
 /** What the player sees when an input is sampled (lag compensation). */
@@ -353,7 +362,8 @@ export class GameClient<TInput = unknown> {
 		const context = this.inputContext(authority)!;
 		const seq = connection.sendInput(this.#options.prediction!.encodeInput(input, context), context.clientTick);
 		if (seq === undefined) return undefined;
-		this.#predictor!.record(seq, input, dtMs);
+		const smooth = this.#options.prediction!.smoothSteps !== false;
+		this.#predictor!.record(seq, input, dtMs, smooth ? this.#scheduler.now() : undefined);
 		return seq;
 	}
 
@@ -401,7 +411,8 @@ export class GameClient<TInput = unknown> {
 	/**
 	 * The merged world to draw now: every zone sampled at its own
 	 * `serverNow - interpolationDelay`, the controlled entity at its predicted
-	 * (present) state with correction smoothing.
+	 * (present) state with correction smoothing (and, with `smoothSteps`,
+	 * partway through its last step).
 	 */
 	render(): RenderedEntity[] {
 		const out: RenderedEntity[] = [];

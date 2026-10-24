@@ -359,7 +359,9 @@ function gameClient(network, scheduler, extra = {}) {
 			encodeInput: (dx) => new Uint8Array([dx & 0xff, 0]),
 			predict: (s, dx, dt) => ({ x: s.x + (dx * 10 * dt) / 1000 }),
 			corrections: { avatar: { x: { mode: 'ease', durationMs: 100 }, hp: { mode: 'replace' } } },
-			controlledEntity: ({ zoneId }) => (zoneId === 'z1' ? 7 : 70)
+			controlledEntity: ({ zoneId }) => (zoneId === 'z1' ? 7 : 70),
+			// These tests check predicted values the instant they are made.
+			smoothSteps: false
 		},
 		...extra
 	});
