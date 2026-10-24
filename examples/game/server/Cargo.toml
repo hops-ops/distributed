@@ -2,7 +2,7 @@
 # Own workspace (like tests/gateway-native) so demo-only dependencies never
 # reach the framework's lockfile; excluded from the root workspace.
 [workspace]
-members = [".", "sim", "crawler", "rooms", "service"]
+members = [".", "sim", "crawler", "rooms", "service", "tiers"]
 resolver = "2"
 
 # `distributed build|dev examples/game/server` owns the SvelteKit demo's
@@ -32,12 +32,14 @@ mobpit_crawler = { path = "crawler" }
 # Mob Pit's room zone (hosted on celld; linked here for the client surface,
 # tests and bots).
 mobpit_rooms = { path = "rooms" }
+# The world tiers (hood / borough / city cells) the minimap reads.
+mobpit_tiers = { path = "tiers" }
 distributed_game = { path = "../../../distributed_game", features = ["net", "cell", "celld"] }
 # Mob Pit: sorted-set leaderboards (Redis optional at runtime), the SQLite
 # projection bus and the modeled projector of the crawler directory
 # (`graphql` gates modeled projections). Its durable cells run on celld
 # (`examples/game/cells`), reached with `distributed_game`'s `celld` feature.
-distributed = { path = "../../..", features = ["redis", "sqlite", "graphql"] }
+distributed = { path = "../../..", features = ["redis", "sqlite", "graphql", "gateway-native"] }
 # Reads of the celld cells over the internal path.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # The SQLite bus the cells' domain events are relayed onto (`--projection-bus`).

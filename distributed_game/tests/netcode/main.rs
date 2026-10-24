@@ -25,6 +25,7 @@ fn claims(principal: &str, zone: &str) -> TicketClaims {
         role: Role::Player,
         name: None,
         extensions: Default::default(),
+        wake: false,
     }
 }
 

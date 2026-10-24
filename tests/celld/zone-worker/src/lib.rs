@@ -1,13 +1,13 @@
 //! A test zone hosted by `distributed_game::celld_zone` and the cells its
 //! facts go to.
 //!
-//! - `GET /rooms/{zone}` (WebSocket): `TallyRoom`, one object per zone
+//! - `GET /zones/{zone}` (WebSocket): `TallyRoom`, one object per zone
 //!   `room-*`. Input `[1, n]` counts `n` hits, each a `tally.hit` fact for
 //!   the player's `Tally` cell; `[2, c]` walks through a door into
 //!   `room-{c}` (handoff). On join the player gets event 1 with the zone's
 //!   total hits (u64 LE); after a hits input, event 2 with the new total.
 //!   The zone's snapshot is its total.
-//! - `GET /rooms/{zone}/info`: the object's debug info.
+//! - `GET /zones/{zone}/info`: the object's debug info.
 //! - `GET|POST /tally/{principal}[/command]`, `/zone-activity/{zone}[/command]`:
 //!   the cells (internal secret).
 
@@ -259,8 +259,8 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if path == "/health" {
         return Response::ok("ok");
     }
-    if path.starts_with("/rooms/") {
-        return match forward_to_zone(req, &env, "ROOM", "/rooms/").await? {
+    if path.starts_with("/zones/") {
+        return match forward_to_zone(req, &env, "ROOM", "/zones/").await? {
             Some(response) => Ok(response),
             None => Response::error("bad zone", 400),
         };

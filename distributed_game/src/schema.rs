@@ -313,7 +313,7 @@ fn steps(bits: u8) -> f64 {
 /// SDK's `CorrectionPolicy`). Client metadata only: never sent on the wire,
 /// exported in the [`GameSurface`](crate::surface::GameSurface) so generated
 /// clients get per-field defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Correction {
     /// Adopt the rebased value, easing the visual error out over `duration_ms`.
@@ -321,6 +321,11 @@ pub enum Correction {
         /// Ease duration (ms).
         #[serde(rename = "durationMs")]
         duration_ms: u32,
+        /// An error larger than this cuts instead, every eased field of the
+        /// entity at once (a teleport — a respawn, a server-side move — is a
+        /// cut, not a misprediction to slide over).
+        #[serde(rename = "snapAbove", default, skip_serializing_if = "Option::is_none")]
+        snap_above: Option<f32>,
     },
     /// Adopt the rebased value immediately.
     Snap,
@@ -352,6 +357,9 @@ pub struct KindDef {
     pub fields: Vec<FieldDef>,
     /// Server-side priority multiplier (not sent on the wire).
     pub priority: f32,
+    /// Exempt from distance-based update rates
+    /// ([`UpdateRates`](crate::UpdateRates); server-side, not on the wire).
+    pub every_patch: bool,
 }
 
 impl KindDef {
@@ -362,6 +370,7 @@ impl KindDef {
             name: name.into(),
             fields: Vec::new(),
             priority: 1.0,
+            every_patch: false,
         }
     }
 
@@ -400,6 +409,12 @@ impl KindDef {
     /// Set the kind priority multiplier.
     pub fn priority(mut self, p: f32) -> Self {
         self.priority = p;
+        self
+    }
+
+    /// Update every patch at any distance (no distance-based rates).
+    pub fn every_patch(mut self) -> Self {
+        self.every_patch = true;
         self
     }
 }

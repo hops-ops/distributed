@@ -83,7 +83,10 @@ use crate::handoff::{HandoffRequest, Transfer};
 use crate::host::{HostConfig, JoinError, Joined, Outbound, ZoneHost};
 use crate::metrics::GameMetrics;
 use crate::protocol::Role;
-use crate::protocol::{error, kick, ClientMessage, Notice, ServerMessage, PROTOCOL_VERSION};
+use crate::protocol::{
+    error, kick, supports_protocol, ClientMessage, Notice, ServerMessage, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+};
 use crate::rng::ZoneRng;
 use crate::world::{
     BarrierMode, ChildEvent, DottedTopology, FreezeState, HostAddr, LocalOwnership, OwnershipError,
@@ -92,82 +95,7 @@ use crate::world::{
 };
 use crate::zone::{ClientId, TicketClaims, Tier, Zone};
 
-/// Development network simulation, applied independently to each direction
-/// of every connection.
-///
-/// Semantics over WebSocket (a reliable, ordered stream): a message is never
-/// dropped or reordered, because Deltas are encoded against the previous
-/// one. `loss` models what TCP does with a lost segment instead: with
-/// probability `loss` a message is delayed by an extra `retransmit` (repeated
-/// with the same probability, at most 3 times), and since order is preserved
-/// every later message queues behind it (head-of-line blocking). Total
-/// one-way delay = `latency + U[0, jitter] + k·retransmit`.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct NetSim {
-    /// Fixed one-way delay.
-    pub latency: Duration,
-    /// Extra uniform random delay in `[0, jitter]` (order is preserved).
-    pub jitter: Duration,
-    /// Probability in `[0, 1]` that a message needs a retransmission.
-    pub loss: f32,
-    /// Delay added per simulated retransmission (TCP minimum RTO ≈ 200 ms).
-    pub retransmit: Duration,
-}
-
-impl NetSim {
-    /// Latency + jitter, no loss.
-    pub fn new(latency: Duration, jitter: Duration) -> Self {
-        Self {
-            latency,
-            jitter,
-            loss: 0.0,
-            retransmit: Duration::from_millis(200),
-        }
-    }
-
-    /// Add simulated loss (see the type docs for WebSocket semantics).
-    pub fn with_loss(mut self, loss: f32, retransmit: Duration) -> Self {
-        self.loss = loss.clamp(0.0, 1.0);
-        self.retransmit = retransmit;
-        self
-    }
-
-    /// Read `DG_NET_LATENCY_MS`, `DG_NET_JITTER_MS`, `DG_NET_LOSS` (fraction,
-    /// e.g. `0.02`) and `DG_NET_RETRANSMIT_MS` (default 200). `None` when
-    /// none of the first three is set or all are zero.
-    pub fn from_env() -> Option<Self> {
-        Self::from_lookup(|key| std::env::var(key).ok())
-    }
-
-    /// [`from_env`](Self::from_env) over any key lookup.
-    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<Self> {
-        let ms = |key: &str| {
-            lookup(key)
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .map(Duration::from_millis)
-        };
-        let latency = ms("DG_NET_LATENCY_MS").unwrap_or_default();
-        let jitter = ms("DG_NET_JITTER_MS").unwrap_or_default();
-        let loss = lookup("DG_NET_LOSS")
-            .and_then(|v| v.trim().parse::<f32>().ok())
-            .unwrap_or(0.0);
-        let retransmit = ms("DG_NET_RETRANSMIT_MS").unwrap_or(Duration::from_millis(200));
-        (!latency.is_zero() || !jitter.is_zero() || loss > 0.0)
-            .then(|| Self::new(latency, jitter).with_loss(loss, retransmit))
-    }
-
-    /// One-way delay for one message.
-    fn delay(&self, rng: &mut ZoneRng) -> Duration {
-        let mut delay = self.latency + self.jitter.mul_f32(rng.next_f32());
-        for _ in 0..3 {
-            if self.loss <= 0.0 || !rng.chance(self.loss) {
-                break;
-            }
-            delay += self.retransmit;
-        }
-        delay
-    }
-}
+pub use crate::netsim::NetSim;
 
 /// Server settings.
 #[derive(Debug, Clone)]
@@ -305,6 +233,7 @@ enum ZoneCmd {
     Join {
         claims: TicketClaims,
         transfer: Option<Transfer>,
+        protocol: u32,
         capabilities: u32,
         content_version: String,
         out: mpsc::Sender<ConnOut>,
@@ -312,6 +241,7 @@ enum ZoneCmd {
     },
     Reconnect {
         token: String,
+        protocol: u32,
         capabilities: u32,
         content_version: String,
         out: mpsc::Sender<ConnOut>,
@@ -340,6 +270,17 @@ enum ZoneCmd {
     Disconnect {
         client: ClientId,
         graceful: bool,
+    },
+    /// The client patched its content live.
+    Content {
+        client: ClientId,
+        version: String,
+    },
+    /// An observer's `Focus`.
+    Focus {
+        client: ClientId,
+        x: f32,
+        y: f32,
     },
     /// A zone inbox message (decoded into `Z::Message` on the zone task).
     Deliver {
@@ -1230,6 +1171,7 @@ async fn run_zone<Z>(
                 role: Role::Player,
                 name: request.name.clone(),
                 extensions: request.extensions.clone(),
+                wake: false,
             },
             source_zone: request.source_zone.clone(),
             issuer: inner.host_id.clone(),
@@ -1473,11 +1415,13 @@ fn handle_cmd<Z: Zone>(
         ZoneCmd::Join {
             claims,
             transfer,
+            protocol,
             capabilities,
             content_version,
             out,
             reply,
         } => {
+            let host = host.speaking(protocol);
             let result = match &transfer {
                 Some(transfer) => host.join_transfer(transfer, capabilities, &content_version),
                 None => host.join(&claims, capabilities, &content_version),
@@ -1489,12 +1433,17 @@ fn handle_cmd<Z: Zone>(
         }
         ZoneCmd::Reconnect {
             token,
+            protocol,
             capabilities,
             content_version,
             out,
             reply,
         } => {
-            let result = host.reconnect_with_version(&token, capabilities, &content_version);
+            let result = host.speaking(protocol).reconnect_with_version(
+                &token,
+                capabilities,
+                &content_version,
+            );
             if let Ok(joined) = &result {
                 conns.insert(joined.client, out);
             }
@@ -1518,6 +1467,10 @@ fn handle_cmd<Z: Zone>(
             conns.remove(&client);
             host.disconnect(client, graceful);
         }
+        ZoneCmd::Content { client, version } => {
+            host.content_patched(client, &version);
+        }
+        ZoneCmd::Focus { client, x, y } => host.observer_focus(client, x, y),
         ZoneCmd::ChildEvent(event) => host.deliver_child_event(event),
         ZoneCmd::Deliver { inbound, reply } => {
             let _ = reply.send(inbound.decode::<Z::Message>().map(|m| host.deliver(m)));
@@ -1699,6 +1652,8 @@ enum Inbound {
         payload: Vec<u8>,
     },
     Ping(f64),
+    Content(String),
+    Focus(f32, f32),
 }
 
 async fn connection<Z>(inner: Arc<Inner<Z>>, zone_id: String, mut socket: WebSocket)
@@ -1717,11 +1672,16 @@ where
         Ok(Some(Ok(_))) => return reject(socket, error::BAD_MESSAGE, "binary frames only").await,
         _ => return,
     };
-    if hello.protocol_version != PROTOCOL_VERSION {
+    // Answer in the client's version; refuse others before the ticket is
+    // touched, so the client can retry with an older one (§6.0).
+    if !supports_protocol(hello.protocol_version) {
         return reject(
             socket,
             error::VERSION_MISMATCH,
-            format!("protocol {} != {PROTOCOL_VERSION}", hello.protocol_version),
+            format!(
+                "protocol {} unsupported ({MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION})",
+                hello.protocol_version
+            ),
         )
         .await;
     }
@@ -1813,6 +1773,7 @@ where
         ZoneCmd::Join {
             claims,
             transfer,
+            protocol: hello.protocol_version,
             capabilities: hello.capabilities,
             content_version: hello.content_version,
             out: out_tx,
@@ -1821,6 +1782,7 @@ where
     } else {
         ZoneCmd::Reconnect {
             token: hello.reconnect_token,
+            protocol: hello.protocol_version,
             capabilities: hello.capabilities,
             content_version: hello.content_version,
             out: out_tx,
@@ -1956,6 +1918,11 @@ where
                         Inbound::Input { seq, client_tick, payload }
                     }
                     Ok(ClientMessage::Ping { client_time }) => Inbound::Ping(client_time),
+                    Ok(ClientMessage::Content { content_version }) => Inbound::Content(content_version),
+                    // Native zones keep observers' zones running already;
+                    // nearness only matters to celld zones.
+                    Ok(ClientMessage::Near { .. }) => continue,
+                    Ok(ClientMessage::Focus { x, y }) => Inbound::Focus(x, y),
                     Ok(ClientMessage::Leave) => { graceful = true; break; }
                     Ok(ClientMessage::Hello(_)) => {
                         let _ = socket.send(Message::Binary(error_frame(error::BAD_MESSAGE, "already joined").into())).await;
@@ -2050,6 +2017,11 @@ async fn forward_in<Z: Zone>(
             })
             .await
             .is_ok(),
+        Inbound::Content(version) => zone
+            .send(ZoneCmd::Content { client, version })
+            .await
+            .is_ok(),
+        Inbound::Focus(x, y) => zone.send(ZoneCmd::Focus { client, x, y }).await.is_ok(),
         Inbound::Ping(client_time) => {
             let pong = ServerMessage::Pong {
                 client_time,
@@ -2068,39 +2040,6 @@ async fn forward_in<Z: Zone>(
 #[cfg(test)]
 mod netsim_tests {
     use super::*;
-
-    #[test]
-    fn netsim_from_env_and_loss_semantics() {
-        let env = |pairs: &'static [(&'static str, &'static str)]| {
-            move |k: &str| {
-                pairs
-                    .iter()
-                    .find(|(key, _)| *key == k)
-                    .map(|(_, v)| v.to_string())
-            }
-        };
-        assert_eq!(NetSim::from_lookup(env(&[])), None);
-        let sim = NetSim::from_lookup(env(&[
-            ("DG_NET_LATENCY_MS", "40"),
-            ("DG_NET_JITTER_MS", "10"),
-            ("DG_NET_LOSS", "0.5"),
-        ]))
-        .unwrap();
-        assert_eq!(sim.latency, Duration::from_millis(40));
-        assert_eq!(sim.jitter, Duration::from_millis(10));
-        assert_eq!(sim.retransmit, Duration::from_millis(200));
-        let mut rng = ZoneRng::from_seed(7);
-        let delays: Vec<Duration> = (0..2000).map(|_| sim.delay(&mut rng)).collect();
-        let base_max = Duration::from_millis(50);
-        let retransmitted = delays.iter().filter(|d| **d > base_max).count();
-        // P(at least one retransmit) = 0.5.
-        assert!((850..1150).contains(&retransmitted), "{retransmitted}");
-        assert!(delays.iter().all(|d| *d >= sim.latency));
-        assert!(delays.iter().all(|d| *d <= base_max + sim.retransmit * 3));
-        // Without loss the delay is bounded by latency + jitter.
-        let clean = NetSim::new(Duration::from_millis(40), Duration::from_millis(10));
-        assert!((0..500).all(|_| clean.delay(&mut rng) <= base_max));
-    }
 
     #[test]
     fn live_net_sim_changes_preserve_order() {

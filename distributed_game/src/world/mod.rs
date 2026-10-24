@@ -20,15 +20,25 @@
 //!   hibernation slot and activity, projected from the `zone_lease` /
 //!   `zone_state` / `zone_activity` cells' outward events (active / dormant
 //!   / hibernated / cold without opening a cell).
+//! - `content_rollout` (feature `cell`): a world's live content rollout
+//!   (freeze → apply → resume across every celld-hosted zone) as a cell.
+//! - [`watch`]: watched world views — a zone keeps pushed read models of
+//!   the world cells it cares about ([`watch::Watches`]); cells keep
+//!   in-memory watcher leases ([`watch::Watchers`]) and push each new
+//!   version; a slow reconcile read repairs lost pushes.
 //! - [`barrier`]: content-version policy types shared by the host and the
 //!   world barrier ([`StalePolicy`], [`BarrierMode`]).
 
 pub mod allocation;
 pub mod barrier;
+#[cfg(feature = "cell")]
+#[allow(missing_docs)]
+pub mod content_rollout;
 pub mod directory;
 pub mod ownership;
 pub mod state;
 pub mod topology;
+pub mod watch;
 #[cfg(feature = "cell")]
 #[allow(missing_docs)]
 pub mod zone_activity;

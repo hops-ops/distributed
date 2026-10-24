@@ -10,6 +10,31 @@
 	background: var(--panel);
 	box-sizing: border-box;
 }
+.pit-hp {
+	margin-bottom: 8px;
+}
+.pit-hp-label {
+	margin-bottom: 4px;
+	font-weight: 600;
+}
+.pit-hp-bar {
+	height: 12px;
+	border-radius: 6px;
+	background: #2a3240;
+	overflow: hidden;
+}
+.pit-hp-fill {
+	height: 100%;
+	width: 100%;
+	background: #4caf50;
+	transition: width 0.15s ease;
+}
+.pit-hp-fill.mid {
+	background: #f2c94c;
+}
+.pit-hp-fill.low {
+	background: #e04848;
+}
 .pit-xp-label {
 	margin-bottom: 4px;
 	color: var(--muted);
@@ -123,7 +148,7 @@
 	position: fixed;
 	right: 12px;
 	bottom: 16px;
-	width: 234px;
+	width: 280px;
 	padding: 10px 12px;
 	border-radius: 8px;
 	background: var(--panel);
@@ -149,22 +174,36 @@
 .pit-rooms .c-cold {
 	color: #556070;
 }
+.pit-rooms .c-watched {
+	color: #4dd0e1;
+}
 .pit-debug {
 	margin-top: 6px;
 	font: 11px/1.4 monospace;
 	color: var(--muted);
 	word-break: break-word;
 }
-.pit-toasts {
+/* Top centre: the world event banner, then the toasts (never overlapping);
+   clear of the facts panel on the right. */
+.pit-top {
 	position: fixed;
 	top: 12px;
 	left: 50%;
 	transform: translateX(-50%);
+	width: max-content;
+	max-width: max(280px, calc(100vw - 2 * 310px));
 	display: flex;
 	flex-direction: column;
+	align-items: center;
 	gap: 6px;
 	pointer-events: none;
 	z-index: 10;
+}
+.pit-toasts {
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 6px;
 }
 .pit-toast {
 	padding: 8px 14px;
@@ -175,4 +214,87 @@
 }
 .label.door {
 	color: #4dd0e1;
+}
+
+.pit-event {
+	padding: 8px 16px;
+	border-radius: 6px;
+	background: rgba(120, 30, 160, 0.85);
+	color: #fff;
+	font-weight: 600;
+	text-align: center;
+}
+
+.pit-crosshair {
+	position: fixed;
+	left: 50%;
+	top: 50%;
+	transform: translate(-50%, -50%);
+	color: #fff;
+	font: 24px/1 monospace;
+	text-shadow: 0 0 3px #000;
+	pointer-events: none;
+	z-index: 6;
+}
+
+.pit-freeze {
+	position: fixed;
+	top: 40%;
+	left: 50%;
+	transform: translate(-50%, -50%);
+	max-width: 520px;
+	padding: 16px 22px;
+	border-radius: 8px;
+	background: rgba(20, 60, 110, 0.92);
+	color: #fff;
+	text-align: center;
+	line-height: 1.5;
+	pointer-events: none;
+	z-index: 6;
+}
+
+.pit-stale {
+	position: fixed;
+	bottom: 70px;
+	left: 50%;
+	transform: translateX(-50%);
+	padding: 8px 16px;
+	border-radius: 6px;
+	background: rgba(170, 110, 20, 0.9);
+	color: #fff;
+	font-weight: 600;
+	pointer-events: none;
+	z-index: 5;
+}
+
+.pit-admin {
+	position: fixed;
+	right: 12px;
+	bottom: 12px;
+	width: 260px;
+	padding: 8px 10px;
+	border-radius: 6px;
+	background: rgba(18, 15, 20, 0.85);
+	color: #ddd;
+	font-size: 12px;
+	z-index: 5;
+}
+
+.pit-admin input:not([type='checkbox']) {
+	width: 100%;
+	box-sizing: border-box;
+	margin-bottom: 4px;
+}
+
+.pit-admin button {
+	margin: 4px 4px 0 0;
+}
+.pit-rooms .c-me {
+	color: #ffffff;
+}
+.pit-rooms .c-other {
+	color: #64b5f6;
+}
+.pit-rooms .c-mob {
+	color: #ff8a65;
 }

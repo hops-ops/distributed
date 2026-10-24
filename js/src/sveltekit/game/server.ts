@@ -116,6 +116,13 @@ export type CreateGameTicketHandlerOptions<TEvent extends GameTicketRequestEvent
 	claims?(
 		context: GameTicketClaimsContext<TEvent, TSession>
 	): GameTicketExtensions | null | undefined | Promise<GameTicketExtensions | null | undefined>;
+	/**
+	 * Observer tickets: whether this watcher may wake the zone and keep it
+	 * awake while it says it is near (claim `wake`; celld zones), decided on
+	 * the server — e.g. only zones next to where the principal plays. The
+	 * browser cannot ask for it. Default: never.
+	 */
+	wake?(context: GameTicketClaimsContext<TEvent, TSession>): boolean | Promise<boolean>;
 	/** Roles a browser may ask for. Default both (`observer` owns no player). */
 	roles?: readonly GameTicketRole[];
 	/** Ticket lifetime in seconds (1..=300). Default 60. */
@@ -412,6 +419,17 @@ export function createGameTicketHandler<TEvent extends GameTicketRequestEvent, T
 							role,
 							zone
 						})) ?? undefined);
+			const wake =
+				role === 'observer' && options.wake !== undefined
+					? (await options.wake({
+							event,
+							session: verified.session,
+							principal: verified.principal,
+							requested: body.zone,
+							role,
+							zone
+						})) === true
+					: false;
 			const minted = await mintGameTicket({
 				secret,
 				principal: verified.principal,
@@ -419,6 +437,7 @@ export function createGameTicketHandler<TEvent extends GameTicketRequestEvent, T
 				role,
 				...(name === undefined ? {} : { name }),
 				...(extensions === undefined ? {} : { extensions }),
+				...(wake ? { wake } : {}),
 				ttlSeconds,
 				now: now()
 			});

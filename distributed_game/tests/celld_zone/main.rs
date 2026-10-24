@@ -1,4 +1,5 @@
 //! Zones as celld Durable Objects (`celld_zone`), end to end against
+#![allow(clippy::await_holding_lock)] // one celld at a time (`serial`)
 //! `tests/celld/zone-worker` (a tally zone, its Tally cells and its
 //! ZoneActivity cell):
 //!
@@ -6,6 +7,15 @@
 //!   the player's cell, the empty zone goes dormant then hibernated, a new
 //!   join wakes it with its state, tickets and transfer tickets are single
 //!   use, a doorway hands the player to the next zone.
+//! - `watchers`: `celld dev`. Observers are passive watchers: one is
+//!   refused (`ASLEEP`) by a zone that never ran or sleeps, without waking
+//!   it; it sees an awake zone, and does not keep it awake (dormant, then
+//!   hibernated, its socket closed).
+//! - `near_watchers`: `celld dev`. An observer whose ticket grants `wake`
+//!   and that says it is near wakes a sleeping zone and keeps it ticking;
+//!   `Near { near: false }` lets it go dormant, `Near { near: true }` makes
+//!   it active again, and when it lets go for good the zone hibernates.
+//!   Without the grant, or without saying near, a watcher stays passive.
 //! - `fleet`: three celld nodes in production mode on one RustFS bucket
 //!   (docker compose). A zone is reached through a node that does not own
 //!   it, the owner is killed while 200 facts are in flight: the socket
@@ -24,7 +34,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use distributed_game::protocol::{error, ClientMessage, Hello, ServerMessage, PROTOCOL_VERSION};
+use distributed_game::protocol::{
+    error, feature, ClientMessage, ClientMirror, Hello, ServerMessage, Welcome, PROTOCOL_VERSION,
+};
 use distributed_game::ticket::TicketKey;
 use distributed_game::{Role, TicketClaims};
 use futures_util::{SinkExt, StreamExt};
@@ -41,11 +53,24 @@ const INTERNAL_SECRET: &str = "test-only-internal-secret-change-me-2026";
 const TICKET_SECRET: &str = "test-only-ticket-secret-change-me-2026";
 const REQUIRED: &str = "CELLD_ZONE_REQUIRED";
 
+/// One `celld dev` at a time: two starting together race for the bundler.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn worker() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/celld/zone-worker")
 }
 
 fn ticket(principal: &str, zone: &str) -> String {
+    ticket_as(principal, zone, Role::Player)
+}
+
+fn ticket_as(principal: &str, zone: &str, role: Role) -> String {
     let exp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -59,7 +84,28 @@ fn ticket(principal: &str, zone: &str) -> String {
             .as_nanos()
     );
     TicketKey::new(TICKET_SECRET)
-        .sign(&TicketClaims::new(principal, zone, exp, nonce, Role::Player).with_name(principal))
+        .sign(&TicketClaims::new(principal, zone, exp, nonce, role).with_name(principal))
+}
+
+/// An observer ticket that grants `wake` (a near watcher may wake the zone).
+fn wake_ticket(principal: &str, zone: &str) -> String {
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 120;
+    let nonce = format!(
+        "{principal}-{zone}-wake-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    TicketKey::new(TICKET_SECRET).sign(
+        &TicketClaims::new(principal, zone, exp, nonce, Role::Observer)
+            .with_name(principal)
+            .with_wake(true),
+    )
 }
 
 type Ws =
@@ -74,6 +120,8 @@ enum Got {
 struct Player {
     ws: Ws,
     seq: u32,
+    /// Protocol version offered in Hello (Welcomes decode in it).
+    protocol: u32,
 }
 
 impl Player {
@@ -82,11 +130,15 @@ impl Player {
     }
 
     async fn try_connect(base: &str, zone: &str) -> Result<Self, String> {
-        let url = format!("{}/rooms/{zone}", base.replacen("http://", "ws://", 1));
+        let url = format!("{}/zones/{zone}", base.replacen("http://", "ws://", 1));
         let (ws, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(Self { ws, seq: 0 })
+        Ok(Self {
+            ws,
+            seq: 0,
+            protocol: PROTOCOL_VERSION,
+        })
     }
 
     async fn send(&mut self, message: ClientMessage) {
@@ -97,12 +149,17 @@ impl Player {
     }
 
     async fn hello(&mut self, ticket: &str) {
+        self.hello_near(ticket, false).await;
+    }
+
+    async fn hello_near(&mut self, ticket: &str, near: bool) {
         self.send(ClientMessage::Hello(Hello {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: self.protocol,
             content_version: String::new(),
             capabilities: 0,
             ticket: ticket.into(),
             reconnect_token: String::new(),
+            near,
         }))
         .await;
     }
@@ -123,11 +180,13 @@ impl Player {
             let left = deadline.saturating_duration_since(Instant::now());
             let frame = tokio::time::timeout(left, self.ws.next()).await.ok()?;
             match frame {
-                Some(Ok(Message::Binary(bytes))) => match ServerMessage::decode(&bytes, &()) {
-                    Ok(message) => return Some(Got::Server(message)),
-                    // Deltas need the Welcome's schema; these tests skip them.
-                    Err(_) => continue,
-                },
+                Some(Ok(Message::Binary(bytes))) => {
+                    match ServerMessage::decode(&bytes, &ClientMirror::speaking(self.protocol)) {
+                        Ok(message) => return Some(Got::Server(message)),
+                        // Deltas need the Welcome's schema; these tests skip them.
+                        Err(_) => continue,
+                    }
+                }
                 Some(Ok(Message::Close(frame))) => {
                     return Some(Got::Closed(frame.map(|f| u16::from(f.code))))
                 }
@@ -160,8 +219,12 @@ impl Player {
     }
 
     async fn welcome(&mut self) {
+        self.welcome_message().await;
+    }
+
+    async fn welcome_message(&mut self) -> Welcome {
         self.expect(Duration::from_secs(20), "Welcome", |got| match got {
-            Got::Server(ServerMessage::Welcome(_)) => Some(()),
+            Got::Server(ServerMessage::Welcome(w)) => Some(w.clone()),
             Got::Server(ServerMessage::Error { code, message }) => {
                 panic!("join refused: {code} {message}")
             }
@@ -241,6 +304,7 @@ fn exactly_once(value: &Value, count: u64) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_node() {
+    let _serial = serial();
     let Some(celld) = celld_support::Celld::start_worker(&worker(), REQUIRED) else {
         return;
     };
@@ -262,6 +326,30 @@ async fn single_node() {
     assert_eq!(ana.total(2).await, 5);
     until(&base, "/tally/ana", long, |v| exactly_once(v, 5)).await;
 
+    // The zone answers in the client's protocol version: v1 Welcome for a
+    // v1 client, v2 (runtime features) for v2; a version it does not speak
+    // is refused before the ticket is used, so the same ticket then joins.
+    let mut old = Player::connect(&base, "room-a").await;
+    old.protocol = 1;
+    old.hello(&ticket_as("old", "room-a", Role::Observer)).await;
+    let w = old.welcome_message().await;
+    assert_eq!((w.protocol_version, w.features, w.origin), (1, 0, None));
+    let mut new = Player::connect(&base, "room-a").await;
+    new.hello(&ticket_as("new", "room-a", Role::Observer)).await;
+    let w = new.welcome_message().await;
+    assert_eq!(w.protocol_version, 2);
+    assert_eq!(w.features & feature::FOCUS, feature::FOCUS);
+    new.send(ClientMessage::Focus { x: 1.0, y: 2.0 }).await;
+    let mut future = Player::connect(&base, "room-a").await;
+    future.protocol = PROTOCOL_VERSION + 1;
+    let same = ticket_as("future", "room-a", Role::Observer);
+    future.hello(&same).await;
+    assert_eq!(future.refused().await, error::VERSION_MISMATCH);
+    let mut future = Player::connect(&base, "room-a").await;
+    future.hello(&same).await;
+    future.welcome().await;
+    drop((old, new, future));
+
     // A used ticket is refused.
     let mut replay = Player::connect(&base, "room-a").await;
     replay.hello(&first).await;
@@ -277,7 +365,7 @@ async fn single_node() {
         status(v) == "hibernated"
     })
     .await;
-    let info = get(&base, "/rooms/room-a/info").await;
+    let info = get(&base, "/zones/room-a/info").await;
     assert_eq!(info["awake"], false, "{info}");
 
     // Wake with state.
@@ -318,7 +406,177 @@ async fn single_node() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watchers() {
+    let _serial = serial();
+    let Some(celld) = celld_support::Celld::start_worker(&worker(), REQUIRED) else {
+        return;
+    };
+    let base = celld.base();
+    let long = Duration::from_secs(30);
+
+    // A zone that never ran is not woken by a watcher.
+    let mut eve = Player::connect(&base, "room-w").await;
+    eve.hello(&ticket_as("eve", "room-w", Role::Observer)).await;
+    assert_eq!(eve.refused().await, error::ASLEEP);
+    let info = get(&base, "/zones/room-w/info").await;
+    assert_eq!(info["awake"], false, "{info}");
+    assert_eq!(info["wakes"], 0, "{info}");
+
+    // A player wakes it; a watcher then sees it.
+    let mut ana = Player::connect(&base, "room-w").await;
+    ana.hello(&ticket("ana", "room-w")).await;
+    ana.welcome().await;
+    let mut eve = Player::connect(&base, "room-w").await;
+    eve.hello(&ticket_as("eve", "room-w", Role::Observer)).await;
+    eve.welcome().await;
+
+    // The watcher keeps nothing awake: the player leaves, the zone goes
+    // dormant and hibernates, and the watcher is let go.
+    ana.send(ClientMessage::Leave).await;
+    until(&base, "/zone-activity/room-w", long, |v| {
+        status(v) == "dormant"
+    })
+    .await;
+    // A watcher joining the dormant zone is greeted, and it stays dormant.
+    let mut late = Player::connect(&base, "room-w").await;
+    late.hello(&ticket_as("late", "room-w", Role::Observer))
+        .await;
+    late.welcome().await;
+    until(&base, "/zone-activity/room-w", long, |v| {
+        status(v) == "hibernated"
+    })
+    .await;
+    let closed = eve
+        .expect(long, "the watcher let go", |got| match got {
+            Got::Closed(code) => Some(*code),
+            _ => None,
+        })
+        .await;
+    assert_eq!(closed, Some(1000));
+    let info = get(&base, "/zones/room-w/info").await;
+    assert_eq!(info["awake"], false, "{info}");
+
+    // Asleep: a watcher is refused again, the zone stays asleep.
+    let mut eve = Player::connect(&base, "room-w").await;
+    eve.hello(&ticket_as("eve", "room-w", Role::Observer)).await;
+    assert_eq!(eve.refused().await, error::ASLEEP);
+    let info = get(&base, "/zones/room-w/info").await;
+    assert_eq!(info["awake"], false, "{info}");
+    assert_eq!(info["wakes"], 1, "woken once, by the player: {info}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn near_watchers() {
+    let _serial = serial();
+    let Some(celld) = celld_support::Celld::start_worker(&worker(), REQUIRED) else {
+        return;
+    };
+    let base = celld.base();
+    let long = Duration::from_secs(30);
+    let zone = "room-n";
+
+    // Near without the ticket's grant: passive, refused while asleep.
+    let mut eve = Player::connect(&base, zone).await;
+    eve.hello_near(&ticket_as("eve", zone, Role::Observer), true)
+        .await;
+    assert_eq!(eve.refused().await, error::ASLEEP);
+    // The grant without saying near: passive too.
+    let mut eve = Player::connect(&base, zone).await;
+    eve.hello_near(&wake_ticket("eve", zone), false).await;
+    assert_eq!(eve.refused().await, error::ASLEEP);
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
+    assert_eq!(info["awake"], false, "{info}");
+    assert_eq!(info["wakes"], 0, "{info}");
+
+    // Granted and near: wakes the zone, which ticks with no player.
+    let mut near = Player::connect(&base, zone).await;
+    near.hello_near(&wake_ticket("ana", zone), true).await;
+    near.welcome().await;
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "active"
+    })
+    .await;
+    // Kept awake past the hibernation delay (2 s here).
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
+    assert_eq!(info["ticking"], true, "{info}");
+    assert_eq!(info["players"], 0, "{info}");
+    assert_eq!(info["near"], 1, "{info}");
+    assert_eq!(
+        status(&get(&base, &format!("/zone-activity/{zone}")).await),
+        "active"
+    );
+
+    // A watcher without the grant cannot become near.
+    let mut passive = Player::connect(&base, zone).await;
+    passive.hello(&ticket_as("bo", zone, Role::Observer)).await;
+    passive.welcome().await;
+    passive.send(ClientMessage::Near { near: true }).await;
+    let denied = passive
+        .expect(long, "WAKE_DENIED", |got| match got {
+            Got::Server(ServerMessage::Error { code, .. }) => Some(*code),
+            _ => None,
+        })
+        .await;
+    assert_eq!(denied, error::WAKE_DENIED);
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
+    assert_eq!(info["near"], 1, "{info}");
+
+    // Passive again: dormant; near again: active (no reconnect).
+    near.send(ClientMessage::Near { near: false }).await;
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "dormant"
+    })
+    .await;
+    near.send(ClientMessage::Near { near: true }).await;
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "active"
+    })
+    .await;
+    let info = until(&base, &format!("/zones/{zone}/info"), long, |v| {
+        v["ticking"] == true
+    })
+    .await;
+    assert_eq!(info["wakes"], 1, "woken once: {info}");
+
+    // Let go for good: dormant, then hibernated; the watchers are closed.
+    near.send(ClientMessage::Near { near: false }).await;
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "hibernated"
+    })
+    .await;
+    for watcher in [&mut near, &mut passive] {
+        let closed = watcher
+            .expect(long, "the watcher let go", |got| match got {
+                Got::Closed(code) => Some(*code),
+                _ => None,
+            })
+            .await;
+        assert_eq!(closed, Some(1000));
+    }
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
+    assert_eq!(info["awake"], false, "{info}");
+
+    // A near watcher that disconnects releases the zone too.
+    let mut near = Player::connect(&base, zone).await;
+    near.hello_near(&wake_ticket("ana", zone), true).await;
+    near.welcome().await;
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "active"
+    })
+    .await;
+    drop(near);
+    until(&base, &format!("/zone-activity/{zone}"), long, |v| {
+        status(v) == "hibernated"
+    })
+    .await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
+    assert_eq!(info["wakes"], 2, "{info}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fleet() {
+    let _serial = serial();
     let Some(mut fleet) =
         fleet::Fleet::start(&worker(), 3, &[("CELLD_ZONE_NODES", "{nodes}")], REQUIRED)
     else {
@@ -330,7 +588,7 @@ async fn fleet() {
     let mut probe = Player::connect(&a, "room-x").await;
     probe.hello(&ticket("probe", "room-x")).await;
     probe.welcome().await;
-    let info = until(&a, "/rooms/room-x/info", long, |v| {
+    let info = until(&a, "/zones/room-x/info", long, |v| {
         v["node"].as_str().is_some_and(|n| !n.is_empty())
     })
     .await;
@@ -355,7 +613,7 @@ async fn fleet() {
     // Crash the owner once the 200 facts are in the zone's outbox (written
     // right after the tick that emitted them); some may already be
     // committed, most are in flight.
-    until(&a, "/rooms/room-x/info", long, |v| {
+    until(&a, "/zones/room-x/info", long, |v| {
         v["spooledFacts"].as_u64().unwrap_or(0) >= 200
     })
     .await;

@@ -10,11 +10,12 @@
  * continues into the next room (the room hands the player over at the same
  * world point).
  */
-import { InputPacer, type EntityFields, type GameClient, type RenderedEntity } from '@hops-ops/distributed/game';
+import { InputPacer, onGameEvent, type EntityFields, type GameClient, type RenderedEntity, type ZoneWatch } from '@hops-ops/distributed/game';
 
 import {
 	BUTTON,
 	createMobpitPures,
+	EVENTS,
 	PIT_RULES,
 	PIT_WORLD,
 	isMob,
@@ -24,10 +25,13 @@ import {
 	pillarFields,
 	playerFields,
 	type HelloEvent,
-	type PitInput
+	type PitInput,
+	type WorldTiers
 } from '$lib/generated/mobpit/index.ts';
 
-const TIER_COLOR: Record<number, string> = { 1: '#9ad16b', 2: '#b48cf2', 3: '#ff6b6b' };
+/** Obstacle fill by look: column, boulder, tree, crystal. */
+const OBSTACLE_COLOR = ['#3a3443', '#4a463f', '#24452b', '#2f5e70'];
+const TIER_COLOR: Record<number, string> = { 1: '#9ad16b', 2: '#b48cf2', 3: '#ff6b6b', 4: '#ff2d55' };
 const TIER_RADIUS = Object.fromEntries(PIT_RULES.tiers.map((t) => [t.tier, t]));
 const PLAYER_RADIUS = 0.45;
 const DOOR_HALF = PIT_WORLD.doorHalf;
@@ -43,6 +47,79 @@ const BIOME_COLOR = ['#8a8f99', '#c9a86a', '#3f7d4e', '#7fbf6a'];
 function parseRoom(zone: string | undefined): [number, number] | undefined {
 	const m = zone === undefined ? null : /^pit\.(-?\d+)\.(-?\d+)$/.exec(zone);
 	return m === null ? undefined : [Number(m[1]), Number(m[2])];
+}
+
+/** The doorway neighbours of `room` behind `near` bits (`rooms_in_reach`: east, west, north, south). */
+export function reachRooms(room: readonly [number, number], near: number): string[] {
+	const doors: [number, [number, number]][] = [
+		[1, [1, 0]],
+		[2, [-1, 0]],
+		[4, [0, 1]],
+		[8, [0, -1]]
+	];
+	return doors.filter(([bit]) => (near & bit) !== 0).map(([, [dx, dy]]) => `pit.${room[0] + dx}.${room[1] + dy}`);
+}
+
+/**
+ * Proximity wake ("Wake rooms in reach"): every 100 ms, from the predicted
+ * position, the doorway neighbours in reach (`rooms_in_reach`, the shared
+ * Rust as WASM: within `PIT_WORLD.wakeReach` of their doorway, released
+ * beyond `wakeRelease`, at most the two of a corner, corner rooms never)
+ * are made near on `watch` — the rooms wake and stay live (the ticket
+ * route grants `wake` only for rooms within two doorways of the player's
+ * last room). `enabled()` false: none (passive watchers). Every tick also
+ * tells the client where the player stands (`setPosition`); the SDK focuses
+ * each watched neighbour on it in that room's coordinates, so it sends
+ * only what the player's own view covers. Returns stop.
+ */
+export function startProximityWake(
+	client: GameClient<PitInput>,
+	watch: ZoneWatch,
+	enabled: () => boolean,
+	onChange: (near: readonly string[]) => void
+): () => void {
+	const pures = createMobpitPures();
+	let room: string | undefined;
+	let bits = 0;
+	let near: string[] = [];
+	const timer = setInterval(() => {
+		const zone = client.authority?.zoneId;
+		const at = parseRoom(zone);
+		if (zone !== room) {
+			room = zone;
+			bits = 0;
+		}
+		const me = client.render().find((e) => e.predicted && e.zoneId === zone && isPlayer(e));
+		if (me !== undefined) {
+			// Each watched room (placed by its Welcome origin) applies the
+			// player's own view around it.
+			const p = playerFields(me);
+			client.setPosition(p.x, p.y, me.zoneId);
+		}
+		let next = 0;
+		if (enabled() && at !== undefined && me !== undefined && pures.loaded()) {
+			const p = playerFields(me);
+			next = pures.roomsInReach({ x: p.x, y: p.y, near: bits }).near;
+		}
+		bits = next;
+		const rooms = at === undefined ? [] : reachRooms(at, next);
+		if (rooms.length === near.length && rooms.every((z) => near.includes(z))) return;
+		near = rooms;
+		watch.setNear(rooms);
+		onChange(rooms);
+	}, 100);
+	return () => clearInterval(timer);
+}
+
+/** The 8 rooms around `zone` (watched as passive observers: `watchZones`). */
+export function neighbourRooms(zone: string): string[] {
+	const at = parseRoom(zone);
+	if (at === undefined) return [];
+	const out: string[] = [];
+	for (let dy = -1; dy <= 1; dy += 1) {
+		for (let dx = -1; dx <= 1; dx += 1) if (dx !== 0 || dy !== 0) out.push(`pit.${at[0] + dx}.${at[1] + dy}`);
+	}
+	return out;
 }
 
 /**
@@ -73,7 +150,49 @@ export type PitLoopOptions = Readonly<{
 	hello: () => HelloEvent | undefined;
 	/** Steer to the nearest mob and swing (demo and headless test). */
 	autoHunt: () => boolean;
+	/** Draw the server's authoritative copy of you (the ghost). */
+	ghost?: () => boolean;
+	/** The tiers above the room (borough weather darkens the view). */
+	world?: () => WorldTiers | undefined;
+	/** First person: the view turns with your aim (pointer lock), arrows leave from the eye. */
+	firstPerson?: () => boolean;
+	/** Resolve arrows with lag compensation (default on). */
+	compensated?: () => boolean;
+	/** The tint (0xRRGGBB, 0: none) of the content pack this client runs. */
+	tint?: () => number;
+	/** Rooms kept awake (proximity wake): outlined solid cyan. */
+	near?: () => readonly string[];
 }>;
+
+/** `color` blended 60 % towards `tint` (0: unchanged). */
+function tinted(color: string, tint: number): string {
+	if (tint === 0) return color;
+	const c = Number.parseInt(color.slice(1), 16);
+	const mix = (shift: number) => Math.round(((c >> shift) & 255) * 0.4 + ((tint >> shift) & 255) * 0.6);
+	return `#${((mix(16) << 16) | (mix(8) << 8) | mix(0)).toString(16).padStart(6, '0')}`;
+}
+
+/** Entry distance of a ray (unit `dir`) into a vertical capsule on the floor. */
+function rayCapsule(origin: number[], dir: number[], x: number, y: number, radius: number, height: number): number | undefined {
+	const flat = Math.hypot(dir[0]!, dir[1]!);
+	if (flat < 1e-6) return undefined;
+	const [ux, uy] = [dir[0]! / flat, dir[1]! / flat];
+	const [ox, oy] = [x - origin[0]!, y - origin[1]!];
+	const along = ox * ux + oy * uy;
+	const off2 = ox * ox + oy * oy - along * along;
+	if (along <= 0 || off2 > radius * radius) return undefined;
+	const entry = (along - Math.sqrt(radius * radius - off2)) / flat;
+	const z = origin[2]! + dir[2]! * entry;
+	return z >= 0 && z <= height ? entry : undefined;
+}
+
+/**
+ * Darkness at the edge of the view (0..1) per weather, and how far around
+ * the player (metres) it stays clear: the borough's weather, closing in near
+ * a boss room. The player's surroundings are never darkened.
+ */
+const WEATHER_DARK = [0.7, 0.55, 0.3, 0.05];
+const WEATHER_CLEAR_M = [10, 13, 18, 30];
 
 /** Start drawing on `canvas`; returns the stop function. */
 export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions): () => void {
@@ -81,7 +200,7 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 	const ctx = canvas.getContext('2d')!;
 	const keys = new Set<string>();
 	const down = (e: KeyboardEvent) => {
-		if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'KeyE'].includes(e.code)) e.preventDefault();
+		if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'KeyE', 'KeyQ'].includes(e.code)) e.preventDefault();
 		keys.add(e.code);
 	};
 	const up = (e: KeyboardEvent) => keys.delete(e.code);
@@ -89,7 +208,127 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 	window.addEventListener('keyup', up);
 	const pacer = new InputPacer({ tickRate: () => client.authority?.connection.welcome?.tickRate });
 
+	// ---- ranged: aim with the mouse (first person: pointer lock turns
+	// you), R or a click looses an arrow; markers yellow (as you saw it),
+	// then green / red with the room's verdict ----
+	let yaw = Math.PI / 2;
+	let fireQueued = false;
+	let lastFire = 0;
+	let nextShot = 0;
+	type Shot = { zone: string; point: [number, number]; predicted: number | undefined; verdict?: { hit?: number; x: number; y: number }; at: number };
+	const shots = new Map<number, Shot>();
+	const stats = { shots: 0, confirmed: 0, agreed: 0, resolved: 0 };
+	const first = () => options.firstPerson?.() ?? false;
+	const offFail = client.on('handoffFailed', (f) => {
+		canvas.dataset.handoffFailed = `${canvas.dataset.handoffFailed ?? ''} ${f.from}→${f.to} ${f.stage} ${f.reason};`;
+	});
+	const offClosed = client.on('zoneClosed', (zone, info) => {
+		canvas.dataset.zoneClosed = `${canvas.dataset.zoneClosed ?? ''} ${zone} ${info.reason} ${info.code ?? ''};`;
+	});
+	// Deaths of the own player (a respawn is a cut to a spawn point), for the
+	// headless test: a doorway walk is measured only while you stay alive.
+	const offDied = onGameEvent(client, EVENTS, 'died', () => {
+		canvas.dataset.deaths = String(Number(canvas.dataset.deaths ?? 0) + 1);
+	});
+	const offShots = onGameEvent(client, EVENTS, 'shot', (v) => {
+		const shot = shots.get(v.shot);
+		if (shot === undefined || shot.verdict !== undefined) return;
+		shot.verdict = { hit: v.hit, x: v.x, y: v.y };
+		shot.at = performance.now();
+		stats.resolved += 1;
+		if (v.hit !== undefined) stats.confirmed += 1;
+		if (v.hit === shot.predicted) stats.agreed += 1;
+	});
+	const onMove = (e: MouseEvent) => {
+		if (first()) {
+			if (document.pointerLockElement === canvas) yaw -= e.movementX * 0.004;
+			return;
+		}
+		// Top-down: aim at the cursor (you are at the centre).
+		const r = canvas.getBoundingClientRect();
+		const cx = ((e.clientX - r.left) * canvas.width) / r.width - canvas.width / 2;
+		const cy = ((e.clientY - r.top) * canvas.height) / r.height - canvas.height / 2;
+		if (Math.hypot(cx, cy) > 4) yaw = Math.atan2(-cy, cx);
+	};
+	const onDown = (e: MouseEvent) => {
+		if (e.button !== 0) return;
+		if (first() && document.pointerLockElement !== canvas) {
+			Promise.resolve(canvas.requestPointerLock?.()).catch(() => undefined);
+			return;
+		}
+		fireQueued = true;
+	};
+	const onKey = (e: KeyboardEvent) => {
+		if (e.code === 'KeyR' && !e.repeat) fireQueued = true;
+	};
+	canvas.addEventListener('mousemove', onMove);
+	document.addEventListener('mousemove', onMove);
+	canvas.addEventListener('mousedown', onDown);
+	window.addEventListener('keydown', onKey);
+
+	/** The arrow fields of this frame, when one is loosed. */
+	const loose = (): Partial<PitInput> => {
+		const zone = client.authority;
+		const hello = options.hello();
+		const now = performance.now();
+		if (!fireQueued || zone === undefined || hello === undefined || now - lastFire < (PIT_RULES.fireCooldown * 1000) / 30) return {};
+		fireQueued = false;
+		const me = client.render().find((e) => e.id === hello.entity && isPlayer(e) && e.zoneId === zone.zoneId);
+		if (me === undefined || !zone.connection.canSendInput()) return {};
+		const p = playerFields(me);
+		// Top-down: level from the hip. First person: from the eye, pitched
+		// at the middle of the mob straight ahead (the view has no pitch).
+		const fp = first();
+		const origin = [p.x, p.y, p.z + (fp ? PIT_RULES.eyeHeight : PIT_RULES.hipHeight)];
+		let pitch = 0;
+		if (fp) {
+			const ahead = client
+				.render()
+				.filter((e) => isMob(e) && !e.stale && e.zoneId === zone.zoneId)
+				.map((e) => mobFields(e))
+				.map((m) => ({ m, d: rayCapsule([p.x, p.y, 0.1], [Math.cos(yaw), Math.sin(yaw), 0], m.x, m.y, TIER_RADIUS[m.tier]?.radius ?? 0.5, 10) }))
+				.filter((a) => a.d !== undefined)
+				.sort((a, b) => a.d! - b.d!)[0];
+			if (ahead !== undefined) pitch = Math.atan2((PIT_RULES.mobHeights[ahead.m.tier] ?? 1) / 2 - origin[2]!, ahead.d! + 0.3);
+		}
+		const dir = [Math.cos(yaw) * Math.cos(pitch), Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch)];
+		const context = client.inputContext(zone)!;
+		const delayMs = Math.max(0, zone.connection.tickTime(context.clientTick) - (zone.connection.serverNow() - context.interpolationDelayMs));
+		let predicted: number | undefined;
+		let best = PIT_RULES.range;
+		for (const e of client.render()) {
+			if (!isMob(e) || e.stale || e.zoneId !== zone.zoneId) continue;
+			const m = mobFields(e);
+			const d = rayCapsule(origin, dir, m.x, m.y, TIER_RADIUS[m.tier]?.radius ?? 0.5, PIT_RULES.mobHeights[m.tier] ?? 1);
+			if (d !== undefined && d < best) {
+				best = d;
+				predicted = e.id;
+			}
+		}
+		nextShot = (nextShot % 0xffff) + 1;
+		shots.set(nextShot, { zone: zone.zoneId, point: [origin[0]! + dir[0]! * best, origin[1]! + dir[1]! * best], predicted, at: now });
+		if (shots.size > 64) shots.delete(shots.keys().next().value!);
+		stats.shots += 1;
+		lastFire = now;
+		const compensated = options.compensated?.() ?? true;
+		return { buttons: BUTTON.fire | (compensated ? 0 : BUTTON.noComp), shot: nextShot, delayMs: Math.min(0xffff, Math.round(delayMs)), pitch };
+	};
+
 	const steer = (): PitInput => {
+		const base = steerMove();
+		const arrow = loose();
+		return {
+			...base,
+			// First person faces the aim (and the stick turns with it).
+			buttons: base.buttons | (arrow.buttons ?? 0) | (first() ? BUTTON.aim : 0),
+			yaw,
+			pitch: arrow.pitch ?? 0,
+			shot: arrow.shot ?? 0,
+			delayMs: arrow.delayMs ?? 0
+		};
+	};
+
+	const steerMove = (): Pick<PitInput, 'mx' | 'my' | 'buttons'> => {
 		const hello = options.hello();
 		const room = client.authority?.zoneId;
 		const rendered = client.render().filter((e) => room === undefined || e.zoneId === room);
@@ -102,6 +341,8 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				.map((m) => ({ m, d: Math.hypot(m.x - p.x, m.y - p.y) }))
 				.sort((a, b) => a.d - b.d)[0];
 			if (target === undefined || p.dead) return { mx: 0, my: 0, buttons: 0 };
+			// Face the prey (an arrow loosed meanwhile flies at it).
+			yaw = Math.atan2(target.m.y - p.y, target.m.x - p.x);
 			const near = target.d < 1.9;
 			const k = (near ? 40 : 127) / Math.max(target.d, 1e-3);
 			return {
@@ -111,11 +352,17 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 			};
 		}
 		const axis = (neg: string, pos: string) => (keys.has(pos) ? 127 : 0) - (keys.has(neg) ? 127 : 0);
+		let [mx, my] = [axis('KeyA', 'KeyD'), axis('KeyS', 'KeyW')];
+		if (first()) {
+			// W walks where you look, D to its right.
+			const [fx, fy] = [Math.cos(yaw), Math.sin(yaw)];
+			[mx, my] = [Math.round(fy * mx + fx * my), Math.round(-fx * mx + fy * my)];
+		}
 		return {
-			mx: axis('KeyA', 'KeyD'),
+			mx: Math.max(-127, Math.min(127, mx)),
 			// Screen y grows downwards; world y grows upwards.
-			my: axis('KeyS', 'KeyW'),
-			buttons: (keys.has('Space') ? BUTTON.attack : 0) | (keys.has('KeyE') ? BUTTON.dash : 0)
+			my: Math.max(-127, Math.min(127, my)),
+			buttons: (keys.has('Space') ? BUTTON.attack : 0) | (keys.has('KeyE') ? BUTTON.dash : 0) | (keys.has('KeyQ') ? BUTTON.jump : 0)
 		};
 	};
 
@@ -125,6 +372,7 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 	/** Pillars are the same in every room: learned from the replicated ones. */
 	let pillars: { x: number; y: number; r: number }[] = [];
 	let lastMe: { x: number; y: number } | undefined;
+	let lastZone: string | undefined;
 	let lastFrame = 0;
 
 	let frame = requestAnimationFrame(function draw(now) {
@@ -146,9 +394,13 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 			// apart; the headless test resets it to 0 before a doorway.
 			if (lastMe !== undefined && now - lastFrame <= 50) {
 				const jump = Math.hypot(me.x - lastMe.x, me.y - lastMe.y);
-				if (jump > Number(canvas.dataset.jump ?? 0)) canvas.dataset.jump = jump.toFixed(3);
+				if (jump > Number(canvas.dataset.jump ?? 0)) {
+					canvas.dataset.jump = jump.toFixed(3);
+					canvas.dataset.jumpDebug = JSON.stringify({ from: lastMe, to: me, zone: meEntity?.zoneId, lastZone, room, predicted: meEntity?.predicted, fields: meEntity?.fields });
+				}
 			}
 			lastMe = me;
+			lastZone = meEntity?.zoneId;
 		}
 		lastFrame = now;
 		const { width, height } = canvas;
@@ -171,8 +423,15 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 			ctx.lineTo(...at(x1, y1));
 			ctx.stroke();
 		};
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
 		ctx.fillStyle = '#0b090d';
 		ctx.fillRect(0, 0, width, height);
+		// First person: the world turns so that your aim points up.
+		if (first()) {
+			ctx.translate(width / 2, height / 2);
+			ctx.rotate(yaw - Math.PI / 2);
+			ctx.translate(-width / 2, -height / 2);
+		}
 		const seed = hello?.seed ?? PIT_WORLD.defaultSeed;
 		const [cx, cy] = [Math.round(centre.x / ROOM), Math.round(centre.y / ROOM)];
 		for (let dy = -1; dy <= 1; dy += 1) {
@@ -182,7 +441,9 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				const biome = pures.loaded() ? pures.pitRoom({ seed, x: rx, y: ry }).biome : undefined;
 				ctx.fillStyle = biome === undefined ? '#120f14' : `${BIOME_COLOR[biome] ?? '#333333'}30`;
 				ctx.fillRect(...at(ox - HALF, oy + HALF), 2 * HALF * scale, 2 * HALF * scale);
-				for (const p of pillars) circle(ox + p.x, oy + p.y, p.r, '#3a3443');
+				// The room's seeded obstacles (what the step collides with).
+				const obstacles = pures.loaded() ? pures.pitRoom({ seed, x: rx, y: ry }).obstacles : pillars;
+				for (const p of obstacles) circle(ox + p.x, oy + p.y, p.r, OBSTACLE_COLOR[(p as { look?: number }).look ?? 0] ?? '#3a3443');
 				// Walls with a doorway gap in the middle of each.
 				ctx.strokeStyle = '#4b5668';
 				ctx.lineWidth = 3;
@@ -198,6 +459,11 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 					line(ox - DOOR_HALF, oy + s * HALF, ox + DOOR_HALF, oy + s * HALF);
 					line(ox + s * HALF, oy - DOOR_HALF, ox + s * HALF, oy + DOOR_HALF);
 				}
+				if (options.near?.().includes(`pit.${rx}.${ry}`)) {
+					ctx.strokeStyle = '#4dd0e1';
+					ctx.lineWidth = 2;
+					ctx.strokeRect(...at(ox - HALF + 1, oy + HALF - 1), (2 * HALF - 2) * scale, (2 * HALF - 2) * scale);
+				}
 				if (rx === here?.[0] && ry === here?.[1]) {
 					ctx.strokeStyle = 'rgba(255,255,255,0.25)';
 					ctx.lineWidth = 1;
@@ -205,7 +471,38 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				}
 			}
 		}
+		// Interest ring: the room replicates mobs and players inside it only.
+		if (me !== undefined && hello !== undefined) {
+			const [mx, my] = at(me.x, me.y);
+			ctx.beginPath();
+			ctx.arc(mx, my, hello.viewRadius * scale, 0, Math.PI * 2);
+			ctx.strokeStyle = 'rgba(108,196,255,0.35)';
+			ctx.setLineDash([6, 6]);
+			ctx.lineWidth = 1.5;
+			ctx.stroke();
+			ctx.setLineDash([]);
+		}
+		// The ghost: the room's authoritative copy of you (behind by the round trip).
+		const authoritative = client.predictor?.authoritative();
+		const ghostZone = client.authority?.zoneId;
+		const ghostRoom = parseRoom(ghostZone);
+		if (authoritative !== undefined && ghostRoom !== undefined) {
+			const g = playerFields({ fields: authoritative });
+			const gw = { x: ghostRoom[0] * ROOM + g.x, y: ghostRoom[1] * ROOM + g.y };
+			if (me !== undefined) canvas.dataset.ghostGap = Math.hypot(gw.x - me.x, gw.y - me.y).toFixed(3);
+			if (options.ghost?.() ?? true) {
+				const [gx, gy] = at(gw.x, gw.y);
+				ctx.beginPath();
+				ctx.arc(gx, gy, PLAYER_RADIUS * scale, 0, Math.PI * 2);
+				ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+				ctx.setLineDash([3, 3]);
+				ctx.stroke();
+				ctx.setLineDash([]);
+			}
+		}
 		ctx.lineWidth = 1;
+		// Mobs drawn from the rooms next door (watched), for the headless test.
+		let nextDoor = 0;
 		for (const entity of rendered) {
 			const w = worldOf(entity);
 			if (w === undefined) continue;
@@ -214,17 +511,22 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				if (!pillars.some((q) => q.x === p.x && q.y === p.y)) pillars = [...pillars, { x: p.x, y: p.y, r: p.r }];
 			} else if (isMob(entity)) {
 				if (entity.stale) continue;
+				if (entity.zoneId !== room) nextDoor += 1;
 				const m = mobFields(entity);
 				const look = TIER_RADIUS[m.tier];
 				if (m.tele > 0 && look !== undefined) circle(w.x, w.y, look.tele, 'rgba(255,80,80,0.12)', '#ff5050');
-				circle(w.x, w.y, look?.radius ?? 0.5, TIER_COLOR[m.tier] ?? '#9ad16b');
+				circle(w.x, w.y, look?.radius ?? 0.5, tinted(TIER_COLOR[m.tier] ?? '#9ad16b', options.tint?.() ?? 0));
 			} else if (isPlayer(entity)) {
 				if (entity.stale) continue;
 				const p = playerFields(entity);
 				const isMe = entity === meEntity;
 				if (!isMe && mine(entity)) continue;
 				// Own room-local position for the headless test (a DOM attribute, not Svelte state).
-				if (isMe) canvas.dataset.me = `${p.x.toFixed(2)},${p.y.toFixed(2)}`;
+				if (isMe) {
+					canvas.dataset.me = `${p.x.toFixed(2)},${p.y.toFixed(2)}`;
+					canvas.dataset.dead = String(p.dead);
+					canvas.dataset.hp = String(p.hp);
+				}
 				if (p.swing > 0 && !p.dead) {
 					// The swing cone (blue), fading as `swing` counts down.
 					const fade = p.swing / PIT_RULES.swingFrames;
@@ -242,7 +544,10 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 					// Frames that drew an own swing, for the headless test.
 					if (isMe) canvas.dataset.swings = String(Number(canvas.dataset.swings ?? 0) + 1);
 				}
-				circle(w.x, w.y, PLAYER_RADIUS, p.dead ? '#555' : isMe ? '#ffd166' : '#6ec3ff');
+				// A jump: a shadow on the floor, the body up and bigger.
+				if (p.z > 0.01) circle(w.x, w.y, PLAYER_RADIUS, 'rgba(0,0,0,0.35)');
+				if (isMe) canvas.dataset.z = p.z.toFixed(2);
+				circle(w.x, w.y + p.z * 0.6, PLAYER_RADIUS * (1 + p.z * 0.25), p.dead ? '#555' : isMe ? '#ffd166' : '#6ec3ff');
 				const [nx, ny] = at(w.x + Math.cos(p.face) * 0.6, w.y + Math.sin(p.face) * 0.6);
 				const [px, py] = at(w.x, w.y);
 				ctx.strokeStyle = '#fff';
@@ -255,6 +560,60 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 				ctx.fillText(p.name, px - 16, py - 0.7 * scale);
 			}
 		}
+		canvas.dataset.nextDoorMobs = String(nextDoor);
+		// Arrows: the aim line, markers (yellow: as you saw it; green / red:
+		// the room's verdict), the counters for the headless test.
+		if (me !== undefined) {
+			const [ax, ay] = at(me.x, me.y);
+			const [bx, by] = at(me.x + Math.cos(yaw) * 6, me.y + Math.sin(yaw) * 6);
+			ctx.strokeStyle = 'rgba(255,209,102,0.6)';
+			ctx.setLineDash([4, 4]);
+			ctx.beginPath();
+			ctx.moveTo(ax, ay);
+			ctx.lineTo(bx, by);
+			ctx.stroke();
+			ctx.setLineDash([]);
+		}
+		const tnow = performance.now();
+		for (const [id, shot] of shots) {
+			const r = parseRoom(shot.zone);
+			if (r === undefined) continue;
+			const p = shot.verdict ?? { x: shot.point[0], y: shot.point[1], hit: undefined };
+			const color = shot.verdict === undefined ? '#ffd166' : shot.verdict.hit !== undefined ? '#3ddc84' : '#ff5252';
+			circle(r[0] * ROOM + p.x, r[1] * ROOM + p.y, 0.3, color);
+			if (shot.verdict !== undefined && tnow - shot.at > 1200) shots.delete(id);
+		}
+		canvas.dataset.shots = String(stats.shots);
+		canvas.dataset.confirmed = String(stats.confirmed);
+		canvas.dataset.agreed = String(stats.agreed);
+		canvas.dataset.resolved = String(stats.resolved);
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		if (first()) {
+			// Crosshair: ahead of you, straight up the screen.
+			ctx.strokeStyle = '#fff';
+			ctx.beginPath();
+			ctx.moveTo(width / 2 - 8, height / 2 - 6 * scale);
+			ctx.lineTo(width / 2 + 8, height / 2 - 6 * scale);
+			ctx.moveTo(width / 2, height / 2 - 6 * scale - 8);
+			ctx.lineTo(width / 2, height / 2 - 6 * scale + 8);
+			ctx.stroke();
+		}
+		// Weather and darkness: the borough's sky, thicker toward bosses.
+		if (here !== undefined && pures.loaded()) {
+			const world = options.world?.();
+			const near = Math.max(0, 1 - pures.pitRoom({ seed, x: here[0], y: here[1] }).bossDistance / 6);
+			const weather = world?.weather ?? 0;
+			const dark = Math.min(0.8, (WEATHER_DARK[weather] ?? 0.7) * (1 + 0.15 * near));
+			const clearM = (WEATHER_CLEAR_M[weather] ?? 10) * (1 - 0.4 * near);
+			const inner = clearM * scale;
+			const outer = Math.max(inner + 1, (clearM + 14) * scale);
+			const shade = ctx.createRadialGradient(width / 2, height / 2, inner, width / 2, height / 2, outer);
+			shade.addColorStop(0, 'rgba(8,10,20,0)');
+			shade.addColorStop(1, `rgba(8,10,20,${dark.toFixed(3)})`);
+			ctx.fillStyle = shade;
+			ctx.fillRect(0, 0, width, height);
+			canvas.dataset.dark = dark.toFixed(3);
+		}
 		frame = requestAnimationFrame(draw);
 	});
 
@@ -262,5 +621,13 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 		cancelAnimationFrame(frame);
 		window.removeEventListener('keydown', down);
 		window.removeEventListener('keyup', up);
+		window.removeEventListener('keydown', onKey);
+		canvas.removeEventListener('mousemove', onMove);
+		document.removeEventListener('mousemove', onMove);
+		canvas.removeEventListener('mousedown', onDown);
+		offShots();
+		offDied();
+		offFail();
+		offClosed();
 	};
 }

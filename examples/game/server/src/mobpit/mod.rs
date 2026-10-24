@@ -10,7 +10,9 @@
 //! dormant / hibernated) goes to its zone-activity cell.
 //!
 //! This process (`game-demos mobpit|leaderboard`) is the services side, no
-//! room runs here:
+//! room runs here. It serves behind the framework gateway
+//! (`distributed::gateway`): `/zones/{room}` goes to the rooms on celld,
+//! `/` to the UI when `--ui-origin` names one, the rest to:
 //! - [`routes`]: the dev routes — `/dev/ticket` mints room tickets for
 //!   guests (signed with the secret the rooms verify), `/dev/mobpit/*`.
 //! - [`world`]: the projection bus the cells' outbox Queue relays onto
@@ -75,7 +77,36 @@ pub struct MobPitArgs {
     /// Default: `sqlite:{data-dir}/bus.db`.
     #[arg(long, env = "MOBPIT_PROJECTION_BUS")]
     pub projection_bus: Option<String>,
+    /// Admin secret of the dev admin routes (`/dev/mobpit/rollout`,
+    /// header `x-game-admin-secret`). Default: random, printed at startup.
+    #[arg(long, env = "DG_DEMO_ADMIN_SECRET", hide_env_values = true)]
+    pub admin_secret: Option<String>,
+    /// Origin clients reach this server at (e.g. behind an ingress,
+    /// `https://mobpit.gitkb.localhost`); default `http://{host}:{port}`.
+    #[arg(long, env = "PUBLIC_ORIGIN")]
+    pub public_origin: Option<String>,
+    /// Where the gateway sends `/zones` (default `--celld-url`; a local
+    /// fleet's load balancer).
+    #[arg(long, env = "GAME_DEMOS_ZONES_ORIGIN")]
+    pub zones_origin: Option<String>,
+    /// UI served under `/` through the gateway (e.g. Vite in the cluster).
+    #[arg(long, env = "GAME_DEMOS_UI_ORIGIN")]
+    pub ui_origin: Option<String>,
 }
+
+/// What the gateway in front of the services routes elsewhere.
+#[derive(Debug, Clone)]
+pub struct Front {
+    /// Origin clients use (Host and forwarded headers are rebuilt from it).
+    pub public_origin: String,
+    /// The rooms' host (celld's public listener), behind `/zones`.
+    pub zones_origin: String,
+    /// UI behind `/` (otherwise `/` is the services').
+    pub ui_origin: Option<String>,
+}
+
+/// How long one room connection may stay open through the gateway.
+const ZONE_CONNECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// The services running on a Tokio task.
 pub struct RunningServices {
@@ -93,25 +124,83 @@ impl RunningServices {
 }
 
 /// Serve `world` on `listener` until `signal` (tests): the internal relay
-/// route always, the dev routes when `dev`.
+/// route always, the dev routes when `dev`, all behind the gateway `front`
+/// (`None`: rooms at the celld URL, no UI, origin `http://{addr}`).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     listener: tokio::net::TcpListener,
     key: TicketKey,
     dev: bool,
+    admin_secret: String,
     world: Arc<MobPitWorld>,
+    front: Option<Front>,
     signal: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<RunningServices> {
     let addr = listener.local_addr()?;
-    let mut app = relay_routes(world.celld().secret.clone(), world.projection());
+    let front = front.unwrap_or_else(|| Front {
+        public_origin: format!("http://{addr}"),
+        zones_origin: world.celld().url.clone(),
+        ui_origin: None,
+    });
+    let mut services = relay_routes(world.celld().secret.clone(), world.projection());
     if dev {
-        app = app.merge(routes::routes(world, key));
+        services = services.merge(routes::routes(world, key, admin_secret));
     }
+    let app = gateway(&front, services).map_err(std::io::Error::other)?;
     let task = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(signal)
             .await
     });
     Ok(RunningServices { addr, task })
+}
+
+/// The gateway: `/zones` → the rooms, `/` → the UI (if any), the rest →
+/// `services`.
+fn gateway(front: &Front, services: axum::Router) -> Result<axum::Router, String> {
+    use distributed::gateway::native::{NativeAuth, NativeBinding, NativeGateway, NativeOptions};
+    use distributed::gateway::{Binding, BindingKind, GatewayConfig, Route, RoutePath};
+
+    let mut bindings = vec![
+        Binding::new("services", BindingKind::Handler),
+        Binding::new(
+            "zones",
+            BindingKind::Zones {
+                origin: front.zones_origin.clone(),
+            },
+        ),
+    ];
+    let mut runtime = vec![
+        ("services".to_string(), NativeBinding::Handler(services)),
+        ("zones".to_string(), NativeBinding::Zones),
+    ];
+    let mut routes = vec![
+        Route::new("zones", RoutePath::prefix("/zones"), "zones"),
+        Route::new("internal", RoutePath::prefix("/internal"), "services"),
+        Route::new("dev", RoutePath::prefix("/dev"), "services"),
+    ];
+    match &front.ui_origin {
+        Some(origin) => {
+            bindings.push(Binding::new(
+                "ui",
+                BindingKind::UiProxy {
+                    origin: origin.clone(),
+                },
+            ));
+            // Vite's HMR socket.
+            runtime.push(("ui".into(), NativeBinding::UiProxy { websocket: true }));
+            routes.push(Route::new("ui", RoutePath::prefix("/"), "ui"));
+        }
+        None => routes.push(Route::new("root", RoutePath::prefix("/"), "services")),
+    }
+    let config = GatewayConfig { bindings, routes }
+        .build()
+        .map_err(|e| format!("gateway: {e}"))?;
+    let mut options = NativeOptions::new(&front.public_origin);
+    options.limits.upgrade_lifetime = ZONE_CONNECTION_LIFETIME;
+    let gateway = NativeGateway::new(config, options, runtime, NativeAuth::anonymous())
+        .map_err(|e| format!("gateway: {e}"))?;
+    Ok(gateway.router())
 }
 
 /// The dev ticket secret kept in the data dir (`dev-ticket-secret`), so
@@ -168,22 +257,44 @@ pub async fn run(args: MobPitArgs) -> std::io::Result<()> {
     }
     let listener =
         tokio::net::TcpListener::bind((args.common.host.as_str(), args.common.port)).await?;
+    let admin_secret = args
+        .admin_secret
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| random_hex(24));
+    let addr = listener.local_addr()?;
+    let front = Front {
+        public_origin: args
+            .public_origin
+            .clone()
+            .unwrap_or_else(|| format!("http://{addr}")),
+        zones_origin: args
+            .zones_origin
+            .clone()
+            .unwrap_or_else(|| args.celld_url.clone()),
+        ui_origin: args.ui_origin.clone(),
+    };
     let running = spawn(
         listener,
         TicketKey::new(ticket_secret),
         args.common.dev,
+        admin_secret.clone(),
         world.clone(),
+        Some(front),
         shutdown_signal(),
     )?;
     // Parsed by run.sh and the client tests: keep the format.
     println!("LISTENING http://{}", running.addr);
     println!(
-        "demo mobpit · rooms on celld {} (ws …/rooms/{}) · projection bus {} · leaderboard {} · dev routes {}",
+        "demo mobpit · rooms on celld {} through the gateway (ws …/zones/{}) · projection bus {} · leaderboard {} · dev routes {}",
         args.celld_url,
         mobpit_rooms::ENTRANCE,
         world.bus_url(),
         world.board().backend(),
         if args.common.dev { "ON" } else { "off" }
     );
+    if args.common.dev {
+        println!("admin secret (live content updates, ?admin=…): {admin_secret}");
+    }
     running.task.await.map_err(std::io::Error::other)?
 }

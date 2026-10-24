@@ -9,11 +9,36 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use distributed_game::protocol::{
-    error, kick, ClientMessage, Delta, EntityCreate, EntityUpdate, Hello, Notice, Reader,
-    ServerMessage, Welcome, Writer,
+    error, feature, kick, ClientMessage, Delta, EntityCreate, EntityKinds, EntityUpdate, Hello,
+    Notice, Reader, ServerMessage, Welcome, Writer,
 };
-use distributed_game::{EntitySchema, FieldType, FieldValue, KindDef, Role, PROTOCOL_VERSION};
+use distributed_game::{
+    EntitySchema, FieldType, FieldValue, KindDef, Origin, Role, PROTOCOL_VERSION,
+};
 use serde_json::{json, Value};
+
+/// Schema, known ids and the negotiated protocol version of a fixture.
+struct Kinds<'a>(&'a EntitySchema, &'a BTreeMap<u32, u16>, u32);
+
+impl EntityKinds for Kinds<'_> {
+    fn protocol_version(&self) -> u32 {
+        self.2
+    }
+    fn schema(&self) -> Option<&EntitySchema> {
+        Some(self.0)
+    }
+    fn kind_of(&self, id: u32) -> Option<u16> {
+        self.1.get(&id).copied()
+    }
+}
+
+/// Protocol version a server fixture is encoded in (Welcome v2 entries).
+fn version_of(m: &ServerMessage) -> u32 {
+    match m {
+        ServerMessage::Welcome(w) => w.protocol_version,
+        _ => PROTOCOL_VERSION,
+    }
+}
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -87,6 +112,7 @@ fn client_json(m: &ClientMessage) -> Value {
             "capabilities": h.capabilities,
             "ticket": h.ticket,
             "reconnect_token": h.reconnect_token,
+            "near": h.near,
         }),
         ClientMessage::Input {
             seq,
@@ -99,13 +125,20 @@ fn client_json(m: &ClientMessage) -> Value {
             json!({ "type": "Ping", "client_time": client_time })
         }
         ClientMessage::Leave => json!({ "type": "Leave" }),
+        ClientMessage::Content { content_version } => {
+            json!({ "type": "Content", "content_version": content_version })
+        }
+        ClientMessage::Near { near } => json!({ "type": "Near", "near": near }),
+        ClientMessage::Focus { x, y } => json!({ "type": "Focus", "x": x, "y": y }),
     }
 }
 
 fn server_json(m: &ServerMessage) -> Value {
     match m {
-        ServerMessage::Welcome(w) => json!({
+        ServerMessage::Welcome(w) => {
+            let mut v = json!({
             "type": "Welcome",
+            "protocol_version": w.protocol_version,
             "session_id": w.session_id,
             "zone_id": w.zone_id,
             "role": match w.role { Role::Player => "player", Role::Observer => "observer" },
@@ -116,7 +149,16 @@ fn server_json(m: &ServerMessage) -> Value {
             "reconnect_token": w.reconnect_token,
             "content_version": w.content_version,
             "schema": schema_json(&w.schema),
-        }),
+            });
+            if w.protocol_version >= 2 {
+                v["features"] = json!(w.features);
+                v["origin"] = match w.origin {
+                    Some(o) => json!({ "x": o.x, "y": o.y }),
+                    None => Value::Null,
+                };
+            }
+            v
+        }
         ServerMessage::Delta(d) => json!({
             "type": "Delta",
             "server_tick": d.server_tick,
@@ -315,21 +357,23 @@ fn messages() {
         (
             "hello",
             ClientMessage::Hello(Hello {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: 1,
                 content_version: "c1".into(),
                 capabilities: 5,
                 ticket: "t.k.n".into(),
                 reconnect_token: String::new(),
+                near: false,
             }),
         ),
         (
             "hello_reconnect",
             ClientMessage::Hello(Hello {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: 1,
                 content_version: "c1".into(),
                 capabilities: 0,
                 ticket: String::new(),
                 reconnect_token: "abcd".into(),
+                near: false,
             }),
         ),
         (
@@ -347,6 +391,37 @@ fn messages() {
             },
         ),
         ("leave", ClientMessage::Leave),
+        (
+            "content",
+            ClientMessage::Content {
+                content_version: "c2".into(),
+            },
+        ),
+        (
+            "hello_near",
+            ClientMessage::Hello(Hello {
+                protocol_version: 1,
+                content_version: "c1".into(),
+                capabilities: 0,
+                ticket: "t.k.n".into(),
+                reconnect_token: String::new(),
+                near: true,
+            }),
+        ),
+        ("near", ClientMessage::Near { near: true }),
+        ("passive", ClientMessage::Near { near: false }),
+        ("focus", ClientMessage::Focus { x: -25.5, y: 3.25 }),
+        (
+            "hello_v2",
+            ClientMessage::Hello(Hello {
+                protocol_version: 2,
+                content_version: "c1".into(),
+                capabilities: 5,
+                ticket: "t.k.n".into(),
+                reconnect_token: String::new(),
+                near: false,
+            }),
+        ),
     ];
     for (name, msg) in client {
         let bytes = msg.encode();
@@ -358,7 +433,6 @@ fn messages() {
     }
 
     let known: BTreeMap<u32, u16> = [(5u32, 1u16), (6, 2)].into_iter().collect();
-    let ctx = (schema.clone(), known.clone());
     let hero_fields = vec![
         FieldValue::Bool(true),
         FieldValue::U(7),
@@ -371,20 +445,39 @@ fn messages() {
         FieldValue::Str("Ana".into()),
         FieldValue::Bytes(vec![0xde, 0xad]),
     ];
+    let welcome = Welcome {
+        protocol_version: 1,
+        session_id: "s1".into(),
+        zone_id: "z1".into(),
+        role: Role::Player,
+        tick_rate: 30,
+        patch_rate: 20,
+        server_tick: 42,
+        server_time: 1000.25,
+        reconnect_token: "rt".into(),
+        content_version: "c1".into(),
+        schema: schema.clone(),
+        features: 0,
+        origin: None,
+    };
     let server = vec![
+        ("welcome", ServerMessage::Welcome(welcome.clone())),
         (
-            "welcome",
+            "welcome_v2",
             ServerMessage::Welcome(Welcome {
-                session_id: "s1".into(),
-                zone_id: "z1".into(),
-                role: Role::Player,
-                tick_rate: 30,
-                patch_rate: 20,
-                server_tick: 42,
-                server_time: 1000.25,
-                reconnect_token: "rt".into(),
-                content_version: "c1".into(),
-                schema: schema.clone(),
+                protocol_version: 2,
+                role: Role::Observer,
+                features: feature::FOCUS,
+                origin: Some(Origin::new(-48.0, 1e6 + 0.5)),
+                ..welcome.clone()
+            }),
+        ),
+        (
+            "welcome_v2_unplaced",
+            ServerMessage::Welcome(Welcome {
+                protocol_version: 2,
+                features: feature::FOCUS,
+                ..welcome
             }),
         ),
         (
@@ -499,6 +592,7 @@ fn messages() {
         ),
     ];
     for (name, msg) in server {
+        let ctx = Kinds(&schema, &known, version_of(&msg));
         let bytes = msg.encode(&ctx).unwrap();
         let decoded = ServerMessage::decode(&bytes, &ctx).unwrap();
         // Quantized values decode to their canonical form; compare JSON of
@@ -531,8 +625,54 @@ fn messages() {
                 m["decoded"]
             );
         } else {
-            let msg = ServerMessage::decode(&bytes, &ctx).unwrap();
+            // Welcomes decode in the version the client offered.
+            let version = m["decoded"]["protocol_version"]
+                .as_u64()
+                .map_or(PROTOCOL_VERSION, |v| v as u32);
+            let msg = ServerMessage::decode(&bytes, &Kinds(&schema, &known, version)).unwrap();
             assert_eq!(server_json(&msg), m["decoded"]);
         }
     }
+}
+
+#[test]
+fn welcome_decodes_only_in_the_version_offered() {
+    use distributed_game::protocol::DecodeError;
+    let fixture = |name: &str| {
+        let text = std::fs::read_to_string(fixtures_dir().join("messages.json")).unwrap();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        let hex = parsed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name)
+            .unwrap()["hex"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        unhex(&hex)
+    };
+    let schema = fixture_schema();
+    let known = BTreeMap::new();
+    // v2 bytes are v1 bytes plus the v2 tail: a decoder must know which it
+    // asked for (trailing bytes stay an error).
+    assert!(matches!(
+        ServerMessage::decode(&fixture("welcome_v2"), &Kinds(&schema, &known, 1)),
+        Err(DecodeError::TrailingBytes(_))
+    ));
+    assert_eq!(
+        ServerMessage::decode(&fixture("welcome"), &Kinds(&schema, &known, 2)),
+        Err(DecodeError::UnexpectedEof)
+    );
+    let mut v1 = distributed_game::ClientMirror::speaking(1);
+    let Ok(ServerMessage::Welcome(w)) = v1.apply(&fixture("welcome")) else {
+        panic!("v1 welcome")
+    };
+    assert_eq!((w.protocol_version, w.features, w.origin), (1, 0, None));
+    let mut v2 = distributed_game::ClientMirror::new();
+    let Ok(ServerMessage::Welcome(w)) = v2.apply(&fixture("welcome_v2")) else {
+        panic!("v2 welcome")
+    };
+    assert_eq!(w.features, feature::FOCUS);
+    assert_eq!(w.origin, Some(Origin::new(-48.0, 1e6 + 0.5)));
 }

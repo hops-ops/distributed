@@ -3,7 +3,17 @@
 // Do not edit: change the Rust definitions and regenerate.
 import { createWasmPures, type WasmPures, type WasmSource, type WireType } from '@hops-ops/distributed/game';
 
-import type { PitRoomContext, PitRoomLayout } from './events.ts';
+import type { PitRoomContext, PitRoomLayout, Reach, ReachContext } from './events.ts';
+
+const OBSTACLE_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['x', { type: 'f32' }],
+		['y', { type: 'f32' }],
+		['r', { type: 'f32' }],
+		['look', { type: 'u8' }],
+	]
+};
 
 const PIT_ROOM_CONTEXT_TYPE: WireType = {
 	type: 'record',
@@ -29,12 +39,35 @@ const PIT_ROOM_LAYOUT_TYPE: WireType = {
 		['biome', { type: 'u8' }],
 		['danger', { type: 'u8' }],
 		['mobs', { type: 'list', item: ROOM_MOB_TYPE }],
+		['boss', { type: 'bool' }],
+		['hoodX', { type: 'i32' }],
+		['hoodY', { type: 'i32' }],
+		['bossDistance', { type: 'u8' }],
+		['pattern', { type: 'u8' }],
+		['obstacles', { type: 'list', item: OBSTACLE_TYPE }],
+	]
+};
+
+const REACH_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['near', { type: 'u8' }],
+	]
+};
+
+const REACH_CONTEXT_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['x', { type: 'f32' }],
+		['y', { type: 'f32' }],
+		['near', { type: 'u8' }],
 	]
 };
 
 /** The pure functions (`#[game_pure]`) of Cargo package `game_sim`: wrapper name → module export. */
 export const PURES = {
 	pitRoom: { export: 'pit_room', abi: 1 },
+	roomsInReach: { export: 'rooms_in_reach', abi: 1 },
 } as const;
 
 /** The compiled module (`distributed game-wasm`; shared with the predicted step); bundlers emit it as an asset. */
@@ -44,6 +77,8 @@ export const PURES_WASM_URL: URL = new URL('./wasm/mobpit.wasm', import.meta.url
 export interface MobpitPureFns {
 	/** `pit_room` (`dg_pure_pit_room`). */
 	pitRoom(arg: PitRoomContext): PitRoomLayout;
+	/** `rooms_in_reach` (`dg_pure_rooms_in_reach`). */
+	roomsInReach(arg: ReachContext): Reach;
 }
 
 /** The `mobpit` pure functions plus `ready` / `loaded()` / `module()`. */
@@ -56,5 +91,6 @@ export type MobpitPures = WasmPures<MobpitPureFns>;
 export function createMobpitPures(source: WasmSource = PURES_WASM_URL): MobpitPures {
 	return createWasmPures<MobpitPureFns>(source, {
 		pitRoom: { exportName: 'pit_room', arg: PIT_ROOM_CONTEXT_TYPE, output: PIT_ROOM_LAYOUT_TYPE },
+		roomsInReach: { exportName: 'rooms_in_reach', arg: REACH_CONTEXT_TYPE, output: REACH_TYPE },
 	});
 }

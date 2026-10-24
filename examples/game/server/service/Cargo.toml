@@ -21,6 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 mobpit_crawler = { path = "../crawler" }
+mobpit_tiers = { path = "../tiers" }
 # `redis`: the Redis leaderboards the zone server writes, served as GraphQL
 # board roots (`xpLeaderboard`, `killsMyRank`, … with `@live`).
 distributed = { path = "../../../..", features = ["sqlite", "http", "graphql", "redis"] }

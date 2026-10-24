@@ -28,7 +28,7 @@ celld = ["cell", "command-host", "dep:reqwest", "dep:uuid"]
 workers-rs = ["cell", "dep:worker", "distributed/workers-rs"]
 # Zones as celld Durable Objects (wasm32): `celld_zone::ZoneObject`,
 # `CelldObjectHost` (facts object to object), `celld_zone_object!`.
-celld-zone = ["cell", "ticket", "workers-rs", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures"]
+celld-zone = ["cell", "ticket", "workers-rs", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:futures-util"]
 # Per-zone Prometheus metrics (dependency-free text exposition).
 metrics = []
 # Load-test bots (library + `game-bots` binary).
@@ -95,6 +95,11 @@ required-features = ["net"]
 [[test]]
 name = "zone_lease"
 path = "tests/zone_lease/main.rs"
+required-features = ["cell"]
+
+[[test]]
+name = "content_rollout"
+path = "tests/content_rollout/main.rs"
 required-features = ["cell"]
 
 [[test]]

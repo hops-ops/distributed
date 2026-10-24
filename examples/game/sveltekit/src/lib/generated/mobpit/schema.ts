@@ -27,6 +27,10 @@ export interface PlayerFields {
 	readonly dash: number;
 	/** `u8` */
 	readonly cd: number;
+	/** `quant [-4, 3.9995117] / 14 bits` */
+	readonly z: number;
+	/** `quant [-16, 15.9921875] / 12 bits` */
+	readonly vz: number;
 	/** `short_str`, priority 0.2 */
 	readonly name: string;
 	/** `u8` */
@@ -39,6 +43,8 @@ export interface PlayerFields {
 	readonly level: number;
 	/** `bool` */
 	readonly dead: boolean;
+	/** `u8` */
+	readonly shot: number;
 }
 
 /** True for a `player` entity. */
@@ -56,12 +62,15 @@ export function playerFields(entity: { readonly fields: EntityFields }): PlayerF
 		vy: fieldNumber(f, 'vy'),
 		dash: fieldNumber(f, 'dash'),
 		cd: fieldNumber(f, 'cd'),
+		z: fieldNumber(f, 'z'),
+		vz: fieldNumber(f, 'vz'),
 		name: fieldString(f, 'name'),
 		hp: fieldNumber(f, 'hp'),
 		face: fieldNumber(f, 'face'),
 		swing: fieldNumber(f, 'swing'),
 		level: fieldNumber(f, 'level'),
 		dead: fieldBool(f, 'dead'),
+		shot: fieldNumber(f, 'shot'),
 	};
 }
 
@@ -170,12 +179,15 @@ export const FIELD_TYPES = {
 		vy: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		dash: { type: 'u8' },
 		cd: { type: 'u8' },
+		z: { type: 'quant', min: -4, max: 3.99951171875, bits: 14 },
+		vz: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		name: { type: 'short_str' },
 		hp: { type: 'u8' },
 		face: { type: 'angle', bits: 8 },
 		swing: { type: 'u8' },
 		level: { type: 'u16' },
 		dead: { type: 'bool' },
+		shot: { type: 'u8' },
 	},
 	mob: {
 		x: { type: 'quant', min: -20, max: 20, bits: 14 },
@@ -204,17 +216,20 @@ export const FIELD_TYPES = {
 /** Client correction defaults (`#[correct(..)]`), by kind and wire field name. */
 export const CORRECTIONS: CorrectionPolicies = {
 	player: {
-		x: { mode: 'ease', durationMs: 150 },
-		y: { mode: 'ease', durationMs: 150 },
+		x: { mode: 'ease', durationMs: 150, snapAbove: 2 },
+		y: { mode: 'ease', durationMs: 150, snapAbove: 2 },
 		vx: { mode: 'snap' },
 		vy: { mode: 'snap' },
 		dash: { mode: 'snap' },
 		cd: { mode: 'snap' },
+		z: { mode: 'ease', durationMs: 100 },
+		vz: { mode: 'snap' },
 		name: { mode: 'replace' },
 		hp: { mode: 'replace' },
 		face: { mode: 'replace' },
 		swing: { mode: 'replace' },
 		level: { mode: 'replace' },
 		dead: { mode: 'replace' },
+		shot: { mode: 'replace' },
 	},
 };

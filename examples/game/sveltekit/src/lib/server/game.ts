@@ -36,6 +36,38 @@ export async function lastRoom(principal: string): Promise<string | undefined> {
 	}
 }
 
+/** The world whose content the rooms follow (`ZONE_CONTENT_ROLLOUT`). */
+export const CONTENT_WORLD = 'world';
+
+/** The world's content rollout cell (`content-rollout/world`) as celld reports it. */
+export type ContentState = { version: string; target: string; phase: string; notes: string; since_ms: number; hard: boolean };
+
+/**
+ * celld's internal path for a cell (`CELLD_URL`, `DISTRIBUTED_INTERNAL_SECRET`;
+ * server-only). Undefined when celld is not configured.
+ */
+export async function cellFetch(path: string, init: RequestInit = {}): Promise<Response | undefined> {
+	const base = env.CELLD_URL;
+	const secret = env.DISTRIBUTED_INTERNAL_SECRET;
+	if (!base || !secret) return undefined;
+	return fetch(`${base.replace(/\/$/, '')}${path}`, {
+		...init,
+		headers: { ...(init.headers as Record<string, string> | undefined), 'x-distributed-internal-secret': secret },
+		signal: AbortSignal.timeout(3000)
+	});
+}
+
+/** The world's live content (null before the first rollout or when celld is unreachable). */
+export async function liveContent(): Promise<ContentState | null> {
+	try {
+		const response = await cellFetch(`/content-rollout/${CONTENT_WORLD}`);
+		if (response === undefined || !response.ok) return null;
+		return ((await response.json()) as { state?: ContentState | null }).state ?? null;
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Room admission: principal from the Auth.js session, the room chosen here —
  * on a page load the room the player was last in (so a reload, a new tab
@@ -47,9 +79,30 @@ export async function lastRoom(principal: string): Promise<string | undefined> {
  */
 export const tickets = createGameTicketHandler({
 	secret: () => env.GAME_TICKET_SECRET,
+	// The page also watches the 8 rooms next door (one observer ticket each
+	// per doorway, retried with back-off while a room sleeps; a fresh one
+	// when a doorway room in reach was refused WAKE_DENIED).
+	rateLimit: { max: 120, windowMs: 60_000 },
 	getSession: (event: RequestEvent) => event.locals.auth(),
-	zone: async ({ requested, principal }) => (isRoom(requested) ? requested : ((await lastRoom(principal)) ?? ENTRANCE))
+	zone: async ({ requested, principal }) => (isRoom(requested) ? requested : ((await lastRoom(principal)) ?? ENTRANCE)),
+	// Proximity wake: an observer ticket may wake (and keep awake) only a
+	// room within two doorways of the room the player was last seen in
+	// (one doorway of slack: the next room's watchers are asked for right
+	// after a doorway, before the presence record follows).
+	wake: async ({ principal, zone }) => {
+		const from = parseRoom(await lastRoom(principal));
+		const to = parseRoom(zone);
+		if (from === undefined || to === undefined) return false;
+		const doors = Math.abs(from[0] - to[0]) + Math.abs(from[1] - to[1]);
+		return doors >= 1 && doors <= 2;
+	}
 });
+
+/** `pit.<x>.<y>` → `[x, y]`. */
+function parseRoom(zone: string | undefined): [number, number] | undefined {
+	const m = zone === undefined ? null : /^pit\.(-?\d+)\.(-?\d+)$/.exec(zone);
+	return m === null ? undefined : [Number(m[1]), Number(m[2])];
+}
 
 /**
  * Where browsers reach the rooms: celld's public listeners (`ws://…`,

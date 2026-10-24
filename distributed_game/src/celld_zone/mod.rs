@@ -5,10 +5,10 @@
 //! server.
 //!
 //! ```text
-//! client ──WebSocket /rooms/{zone}──▶ any celld node ──forward──▶ the zone's object
+//! client ──WebSocket /zones/{zone}──▶ any celld node ──forward──▶ the zone's object
 //!                                                         │ ZoneHost<Z> (this activation)
 //!         Hello(ticket | transfer ticket | reconnect token) ┤ deadline tick loop while occupied
-//!                                                         │ snapshot every few s + when empty
+//!                                                         │ snapshot every min + on leave/empty
 //!                     facts (outbox in object storage) ───┼──▶ cell objects (CommandFactSink
 //!                                                         │     over CelldObjectHost, exactly once)
 //!     zone_activity.record (active / dormant / hibernated)┘──▶ zone-activity/{zone} cell
@@ -25,10 +25,12 @@
 //! - **Ticks.** A self-correcting `setTimeout` loop over absolute deadlines
 //!   ([`TickSchedule`]; `setInterval` drifts) drives
 //!   [`ZoneHost::advance`](crate::ZoneHost::advance) while anyone is
-//!   connected, and stops when the zone is empty.
+//!   connected, and stops `ZONE_DORMANT_AFTER_MS` (10 s) after the zone
+//!   empties.
 //! - **State.** The zone's [`Zone::hibernate`] snapshot is written to object
-//!   storage every `ZONE_PERSIST_MS` while occupied and when the last
-//!   player leaves (`dormant`); after `ZONE_HIBERNATE_AFTER_MS` empty (an
+//!   storage every `ZONE_PERSIST_MS` (60 s) while occupied, on the tick a
+//!   player leaves (leave, handoff, grace expired) and when the loop stops
+//!   (`dormant`); after `ZONE_HIBERNATE_AFTER_MS` empty (an
 //!   object alarm, so it survives eviction) the zone is dropped from memory
 //!   (`hibernated`). The next join wakes it and restores the snapshot.
 //! - **Restarts.** A socket that outlives its activation (eviction, a move,
@@ -40,6 +42,15 @@
 //!   the object's outbox before it is sent and deleted when settled; the
 //!   next activation or the outbox alarm resends what is left, and the
 //!   cells' command ledger turns a resend into a replay: exactly once.
+//! - **The world around.** A zone *watches* the world cells it cares
+//!   about ([`CelldZone::watch`], [`crate::world::watch`]): each is read
+//!   on wake, then pushed by its cell ([`CellWatchers`]) after every
+//!   change, and re-read every ~45 s (renewing the zone's in-memory watch
+//!   lease, repairing a lost push). Each view decodes into a plain struct
+//!   that becomes a zone message. The object takes pushes at its class
+//!   binding (`celld_zone_object!(PitRoom, …)` → `PIT_ROOM`). Custom async
+//!   reads still go through [`CelldZone::refresh`] /
+//!   [`CelldZone::refresh_every`].
 //! - **Status.** The zone reports its lifecycle as facts into its
 //!   [`zone_activity`](crate::world::zone_activity) cell, projected into the
 //!   [`zone_status`](crate::world::zone_status) read model (minimaps).
@@ -55,6 +66,59 @@
 //! loses at most the snapshot interval of zone state (facts are kept by
 //! the outbox) and takes the node lease TTL (~10 s) to recover.
 //!
+//! **Observers are passive watchers** on celld: an observer connection
+//! (a ticket with role `observer`, e.g. a page watching the rooms next to
+//! its own) never counts as occupancy — a zone with only observers stops
+//! ticking (they keep its last state), goes dormant and hibernates (their
+//! sockets are closed) — and an observer Hello never wakes a sleeping zone:
+//! it is refused with [`error::ASLEEP`](crate::protocol::error::ASLEEP).
+//! Only a player — or a *near* watcher — wakes a zone. A watcher joining
+//! a dormant zone gets its current state at once
+//! ([`ZoneHost::patch_now`](crate::ZoneHost::patch_now)).
+//!
+//! **Near watchers** (proximity wake): an observer whose ticket grants
+//! `wake` ([`TicketClaims::wake`](crate::TicketClaims::wake)) and that says
+//! it is near (Hello `near`, later
+//! [`ClientMessage::Near`](crate::protocol::ClientMessage::Near), no
+//! reconnect) counts as occupancy like a player: it wakes a sleeping zone
+//! and keeps it ticking. When it says it is no longer near, or closes, the
+//! zone goes dormant and hibernates as usual. Without the grant the
+//! watcher stays passive and is told
+//! [`error::WAKE_DENIED`](crate::protocol::error::WAKE_DENIED) (still
+//! connected; a fresh ticket may carry the grant). The ticket issuer bounds who may wake what (e.g. only rooms
+//! next to the principal's own); the zone checks only the signed grant.
+//!
+//! **Live content updates.** With `ZONE_CONTENT_ROLLOUT=<world>` every
+//! zone object follows the world's
+//! [`content_rollout`](crate::world::content_rollout) cell
+//! ([`ContentRolloutCell`], binding `CONTENT_ROLLOUT`): it watches the cell
+//! (each phase is pushed) and runs
+//! [`zone_step`](crate::world::content_rollout::zone_step) — freeze with
+//! the change notes, then switch to the new version and resume (a hard
+//! rollout reloads stale clients at once). A zone that slept through a
+//! rollout restores its snapshot's version and catches up on wake; a Hello
+//! whose content version differs from the zone's waits for that read
+//! before admission, so a doorway into a sleeping zone admits on the live
+//! version. Stale clients are handled by the host's
+//! [`StalePolicy`](crate::world::StalePolicy).
+//!
+//! Dev only: with `ZONE_DEV_SETTINGS=1` every zone object applies the
+//! network simulation ([`NetSim`](crate::netsim::NetSim): latency, jitter,
+//! loss per socket and direction) stored in the worker's
+//! [`ZoneDevSettings`] object (`zone-dev/netsim`), watched like the content
+//! rollout (each write is pushed); a dev route writes it (one setting for
+//! every zone, like the native server's `set_net_sim`).
+//!
+//! **Work counters.** `GET …/info` carries the object's
+//! [`WorkCounters`](crate::work::WorkCounters) as `work` (records encoded,
+//! updates sent and held, Delta bytes, fact commands and `__batch`
+//! requests, outbox deletes, world reads and pushes) and the switches in
+//! effect; a watched cell answers `GET /{kind}/{shard}/__watchers` with its
+//! [`WatcherStats`](crate::world::watch::WatcherStats). A/B switches (worker
+//! vars, default on): `ZONE_FACT_BATCH` (1 = one fact per request),
+//! `ZONE_UPDATE_RATES=0` (every change every patch), `ZONE_WORLD_PUSH=0`
+//! (poll watched cells every second instead of taking pushes).
+//!
 //! Debug only: celld does not tell application code which node runs an
 //! object. With `CELLD_ZONE_NODES` set (operator listeners) the object asks
 //! each node whether it holds it; `CELLD_ZONE_NODE` names a fixed node.
@@ -68,13 +132,15 @@ mod cells;
 mod object;
 
 pub use plan::{
-    cell_binding, ObjectOptions, RoomState, StoredFact, TickSchedule, CLOSE_RESTARTED, ZONE_HEADER,
+    cell_binding, ObjectOptions, RoomState, StoredFact, TickSchedule, CLOSE_RESTARTED,
+    CONTENT_ROLLOUT_VAR, DEV_SETTINGS_VAR, NETSIM_SHARD, UPDATE_RATES_VAR, WORLD_PUSH_VAR,
+    ZONE_DEV_KIND, ZONE_HEADER,
 };
 
 #[cfg(target_arch = "wasm32")]
 pub use cells::{
-    authenticate, cell_alarm, error_response, fact_sessions, json_status, serve_cell, Sessions,
-    ZoneActivityCell,
+    authenticate, cell_alarm, error_response, fact_sessions, json_status, serve_cell, CellWatchers,
+    ContentRolloutCell, Sessions, ZoneActivityCell, ZoneDevSettings,
 };
 #[cfg(target_arch = "wasm32")]
 pub use object::{

@@ -4,8 +4,9 @@
 	let {
 		here,
 		debug = true,
+		near = [],
 		ontoast
-	}: { here: string | undefined; debug?: boolean; ontoast?: (text: string) => void } = $props();
+	}: { here: string | undefined; debug?: boolean; near?: readonly string[]; ontoast?: (text: string) => void } = $props();
 
 	// Island: promoted to the page's `@load` (SSR), then live.
 	const rooms = Rooms.use();
@@ -53,10 +54,12 @@
 			<div
 				class="room {cell.row?.status ?? 'cold'}"
 				class:current={cell.current}
+				class:near={near.includes(cell.zone)}
 				data-testid="room-{cell.zone}"
 				data-status={cell.row?.status ?? 'cold'}
 				data-node={cell.row?.node ?? ''}
-				title="{cell.zone}: {cell.row?.status ?? 'never ran'}"
+				data-near={near.includes(cell.zone) ? 'yes' : undefined}
+				title="{cell.zone}: {cell.row?.status ?? 'never ran'}{near.includes(cell.zone) ? ' (kept awake: in reach)' : ''}"
 			>
 				{#if cell.row && cell.row.players > 0}<b>{cell.row.players}</b>{/if}
 				{#if debug && cell.row?.node}<small>{cell.row.node.replace(/^node-/, '')}</small>{/if}
@@ -64,12 +67,14 @@
 		{/each}
 	{/each}
 </div>
-<div class="legend"><span class="active">■ active</span> <span class="dormant">■ dormant</span> <span class="hibernated">■ asleep</span> <span class="cold">■ never ran</span></div>
+<div class="legend"><span class="active">■ active</span> <span class="dormant">■ dormant</span> <span class="hibernated">■ asleep</span> <span class="cold">■ never ran</span> <span class="kept">□ kept awake</span></div>
 
 <style>
 	.map { display: grid; grid-template-columns: repeat(5, 2.2rem); gap: 3px; }
 	.room { height: 2.2rem; border-radius: 3px; font-size: 0.7rem; color: #0e1116; display: flex; flex-direction: column; align-items: center; justify-content: center; }
 	.room.current { outline: 2px solid #fff; }
+	.room.near { box-shadow: inset 0 0 0 2px #4dd0e1; }
+	.kept { color: #4dd0e1; }
 	.active { background: #4caf50; color: #4caf50; }
 	.dormant { background: #f2c94c; color: #f2c94c; }
 	.hibernated { background: #6c7aa0; color: #6c7aa0; }

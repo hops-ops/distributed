@@ -1,23 +1,10 @@
-//! Procedural world and movement of the Endless Grid.
+//! The seeded world generation (from the Endless Grid demo): hashing,
+//! value noise, biomes and props of 32 m cells. Mob Pit's rooms build on
+//! it ([`crate::mobpit::pit_room`]: a room's biome); it is a pure function
+//! of `(world seed, cell x, cell y, CONTENT_VERSION)`, compiled natively
+//! and to WebAssembly.
 //!
-//! The static content of a cell (terrain height, biome, props) is a pure
-//! function of `(world seed, cell x, cell y, CONTENT_VERSION)`; the server
-//! uses it for collision and the client for rendering, and **nothing
-//! static is replicated**. The browser runs this very code compiled to
-//! WebAssembly (`distributed game-wasm`), so there is no client twin:
-//!
-//! - [`grid_step`] (`#[predict]`) predicts the own walker; its context
-//!   names the seed and cell, so the props are generated inside the module;
-//! - [`grid_cell`] (`#[game_pure]`) returns what the page draws for a cell:
-//!   the terrain lattice ([`SAMPLES`]² heights, moisture, biomes) and the
-//!   props;
-//! - [`grid_sample`] (`#[game_pure]`) samples one point (entity heights,
-//!   the HUD's biome);
-//! - [`grid_world`] is the generated `GRID_WORLD` constant (cell size,
-//!   biome and prop names, lattice spacing, default seed).
-//!
-//! `client/tests/prediction-wasm.test.mjs` requires the WASM results to
-//! equal the native ones byte for byte. Rules that keep them identical:
+//! Rules that keep them identical:
 //! integer hashing on `u32` only; floats are binary32 using only
 //! `+ - * /`, `sqrt` and `floor` (see `distributed_game::prediction`).
 //!
@@ -28,11 +15,9 @@
 //! is a multiple of 8 m is a free path ("trail"), and props never reach
 //! across a cell border.
 
-use std::cell::RefCell;
-
 use distributed_game::codec::{Wire, WireType};
 use distributed_game::protocol::{DecodeError, Reader, Writer};
-use distributed_game::{game_pure, predict, FieldType, FieldValue, GameInput, GameRecord};
+use distributed_game::GameRecord;
 
 /// Cell edge length (m).
 pub const CELL: f32 = 32.0;
@@ -48,29 +33,8 @@ pub const SUB_SIZE: f32 = 8.0;
 pub const PROP_MARGIN: f32 = 2.0;
 /// Prop placement span inside a sub-cell: `SUB_SIZE - 2 * PROP_MARGIN`.
 pub const PROP_SPAN: f32 = 4.0;
-/// Handoff hysteresis (m): a walker belongs to the neighbour once it is
-/// this far past the border, and arrives this far inside it.
-pub const HYSTERESIS: f32 = 0.5;
 /// Walker radius (m).
 pub const PLAYER_RADIUS: f32 = 0.45;
-/// Walking speed (m/s).
-pub const WALK_SPEED: f32 = 6.0;
-/// Sprint speed (m/s).
-pub const SPRINT_SPEED: f32 = 10.0;
-/// Command frame length (s): the 30 Hz tick.
-pub const DT: f32 = 1.0 / 30.0;
-/// How far outside its cell a walker may be before it is clamped (m).
-pub const OUTSIDE_LIMIT: f32 = 2.0;
-/// Input bit: sprint.
-pub const BUTTON_SPRINT: u8 = MoveInput::SPRINT;
-/// Input bit: drop a marker.
-pub const BUTTON_MARK: u8 = MoveInput::MARK;
-/// Wire type of local positions (covers the walker's slack outside the cell).
-pub const POS: FieldType = FieldType::QuantF32 {
-    min: -8.0,
-    max: 40.0,
-    bits: 18,
-};
 
 /// Biomes, by index.
 pub const BIOMES: [&str; 4] = ["highlands", "steppe", "forest", "meadow"];
@@ -275,30 +239,6 @@ pub fn cell_props(seed: u32, cell: (i32, i32)) -> Vec<Prop> {
     props
 }
 
-/// One command frame: stick per axis in `[-127, 127]` and button bits.
-/// Wire payload `[mx, my, buttons]`; `GameInput::from_payload` clamps `-128`
-/// to `-127` and clears unknown buttons (the client's encoder is generated).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameInput)]
-pub struct MoveInput {
-    /// Stick x (+east).
-    #[range(min = -127, max = 127)]
-    pub mx: i8,
-    /// Stick y (+north).
-    #[range(min = -127, max = 127)]
-    pub my: i8,
-    /// [`MoveInput::SPRINT`] | [`MoveInput::MARK`].
-    #[buttons(sprint, mark)]
-    pub buttons: u8,
-}
-
-/// Snap to the wire quantization so the server holds exactly what clients decode.
-pub fn snap(v: f32) -> f32 {
-    match POS.canonicalize(&FieldValue::F(v)) {
-        FieldValue::F(v) => v,
-        _ => v,
-    }
-}
-
 /// Push a circle of radius `radius` at `(x, y)` out of every solid prop.
 pub fn collide(mut x: f32, mut y: f32, radius: f32, props: &[Prop]) -> (f32, f32) {
     for p in props.iter().filter(|p| p.solid) {
@@ -320,261 +260,9 @@ pub fn collide(mut x: f32, mut y: f32, radius: f32, props: &[Prop]) -> (f32, f32
     (x, y)
 }
 
-/// Advance a walker one command frame inside its cell (`props` = the
-/// cell's props). Positions may leave `0..CELL` by up to
-/// [`OUTSIDE_LIMIT`]; the zone hands the walker off past [`HYSTERESIS`].
-pub fn step(x: f32, y: f32, input: MoveInput, props: &[Prop]) -> (f32, f32) {
-    let mut dx = f32::from(input.mx) / 127.0;
-    let mut dy = f32::from(input.my) / 127.0;
-    let l2 = dx * dx + dy * dy;
-    if l2 > 1.0 {
-        let inv = 1.0 / l2.sqrt();
-        dx *= inv;
-        dy *= inv;
-    }
-    let speed = if input.buttons & BUTTON_SPRINT != 0 {
-        SPRINT_SPEED
-    } else {
-        WALK_SPEED
-    };
-    let x = x + dx * speed * DT;
-    let y = y + dy * speed * DT;
-    let (x, y) = collide(x, y, PLAYER_RADIUS, props);
-    let lo = -OUTSIDE_LIMIT;
-    let hi = CELL + OUTSIDE_LIMIT;
-    (snap(x.clamp(lo, hi)), snap(y.clamp(lo, hi)))
-}
-
-/// A walker's predicted state: its cell-local position (the `walker` kind's
-/// `x` / `y`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, GameRecord)]
-pub struct WalkerState {
-    /// Local x.
-    pub x: f32,
-    /// Local y.
-    pub y: f32,
-}
-
-/// What a client tells the predicted step: the world seed (from the
-/// zone's hello) and the cell it walks in (its authoritative zone).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameRecord)]
-pub struct GridContext {
-    /// World seed.
-    pub seed: u32,
-    /// Cell x.
-    pub cx: i32,
-    /// Cell y.
-    pub cy: i32,
-}
-
-/// `(seed, cell x, cell y)` → that cell's props.
-type PropsCache = Option<((u32, i32, i32), Vec<Prop>)>;
-
-thread_local! {
-    /// Props of the last cell stepped in (a walker stays in one cell for
-    /// many frames).
-    static PROPS: RefCell<PropsCache> = const { RefCell::new(None) };
-}
-
-/// The client-predicted step of the own walker: [`step`] against the
-/// props of the context's cell (generated here, so the browser needs no
-/// copy of the world to predict).
-#[predict(GridStep, kind = "walker")]
-pub fn grid_step(
-    state: &WalkerState,
-    input: &MoveInput,
-    context: &GridContext,
-    _dt: f32,
-) -> WalkerState {
-    let key = (context.seed, context.cx, context.cy);
-    PROPS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.as_ref().map(|(k, _)| *k) != Some(key) {
-            *cache = Some((key, cell_props(context.seed, (context.cx, context.cy))));
-        }
-        let props = &cache.as_ref().expect("filled above").1;
-        let (x, y) = step(state.x, state.y, *input, props);
-        WalkerState { x, y }
-    })
-}
-
-/// Terrain lattice points per cell axis (every [`SAMPLE_SPACING`] m,
-/// borders included).
-pub const SAMPLES: usize = 17;
-/// Distance between lattice points (m).
-pub const SAMPLE_SPACING: f32 = 2.0;
-
-/// What the client draws for one cell ([`grid_cell`]).
-#[derive(Debug, Clone, PartialEq, GameRecord)]
-pub struct GridCellContent {
-    /// Terrain height in `[0, 1)` at lattice point `(i, j)` (local
-    /// `(i, j) * SAMPLE_SPACING`), row-major by `j` (index `j * SAMPLES + i`).
-    pub heights: Vec<f32>,
-    /// Moisture in `[0, 1)`, same lattice.
-    pub moisture: Vec<f32>,
-    /// Biome index into [`BIOMES`], same lattice.
-    pub biomes: Vec<u8>,
-    /// The cell's props ([`cell_props`]).
-    pub props: Vec<Prop>,
-}
-
-/// A point of a cell ([`grid_sample`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, GameRecord)]
-pub struct GridPoint {
-    /// World seed.
-    pub seed: u32,
-    /// Cell x.
-    pub cx: i32,
-    /// Cell y.
-    pub cy: i32,
-    /// Local x (clamped to `0..=CELL`).
-    pub x: f32,
-    /// Local y (clamped to `0..=CELL`).
-    pub y: f32,
-}
-
-/// Terrain at one point.
-#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
-pub struct GridSample {
-    /// Height in `[0, 1)`.
-    pub height: f32,
-    /// Moisture in `[0, 1)`.
-    pub moisture: f32,
-    /// Biome index into [`BIOMES`].
-    pub biome: u8,
-}
-
-/// Static facts of the world the client needs (generated `GRID_WORLD`).
-#[derive(Debug, Clone, PartialEq, GameRecord)]
-pub struct GridWorld {
-    /// Cell edge length (m).
-    pub cell: f32,
-    /// Default world seed (before a zone's hello names it).
-    pub default_seed: u32,
-    /// Generation version.
-    pub content_version: u32,
-    /// Terrain lattice points per cell axis ([`SAMPLES`]).
-    pub samples: u8,
-    /// Lattice spacing (m).
-    pub sample_spacing: f32,
-    /// Walker radius (m).
-    pub player_radius: f32,
-    /// Largest |cell coordinate|.
-    pub max_cell: i32,
-    /// Biome names by index.
-    pub biomes: Vec<String>,
-    /// Prop kind names by index.
-    pub prop_kinds: Vec<String>,
-}
-
-/// The `GRID_WORLD` constant.
-pub fn grid_world() -> GridWorld {
-    GridWorld {
-        cell: CELL,
-        default_seed: DEFAULT_SEED,
-        content_version: CONTENT_VERSION,
-        samples: SAMPLES as u8,
-        sample_spacing: SAMPLE_SPACING,
-        player_radius: PLAYER_RADIUS,
-        max_cell: MAX_CELL,
-        biomes: BIOMES.map(String::from).to_vec(),
-        prop_kinds: PROP_KINDS.map(String::from).to_vec(),
-    }
-}
-
-/// Terrain lattice and props of the context's cell (the page's chunk).
-#[game_pure(GridCellFn)]
-pub fn grid_cell(cell: &GridContext) -> GridCellContent {
-    let at = (cell.cx, cell.cy);
-    let n = SAMPLES * SAMPLES;
-    let mut content = GridCellContent {
-        heights: Vec::with_capacity(n),
-        moisture: Vec::with_capacity(n),
-        biomes: Vec::with_capacity(n),
-        props: cell_props(cell.seed, at),
-    };
-    for j in 0..SAMPLES {
-        for i in 0..SAMPLES {
-            let l = (i as f32 * SAMPLE_SPACING, j as f32 * SAMPLE_SPACING);
-            let h = height(cell.seed, at, l);
-            let m = moisture(cell.seed, at, l);
-            content.heights.push(h);
-            content.moisture.push(m);
-            content.biomes.push(biome_of(h, m));
-        }
-    }
-    content
-}
-
-/// Terrain at one point of a cell (coordinates clamped into the cell).
-#[game_pure(GridSampleFn)]
-pub fn grid_sample(point: &GridPoint) -> GridSample {
-    let at = (point.cx, point.cy);
-    let l = (point.x.clamp(0.0, CELL), point.y.clamp(0.0, CELL));
-    let height = height(point.seed, at, l);
-    let moisture = moisture(point.seed, at, l);
-    GridSample {
-        height,
-        moisture,
-        biome: biome_of(height, moisture),
-    }
-}
-
-/// Neighbour a walker at `(x, y)` belongs to, as a cell offset, or None
-/// while inside (with hysteresis). X first, then y.
-pub fn crossing(x: f32, y: f32) -> Option<(i32, i32)> {
-    if x < -HYSTERESIS {
-        Some((-1, 0))
-    } else if x > CELL + HYSTERESIS {
-        Some((1, 0))
-    } else if y < -HYSTERESIS {
-        Some((0, -1))
-    } else if y > CELL + HYSTERESIS {
-        Some((0, 1))
-    } else {
-        None
-    }
-}
-
-/// `grid.<x>.<y>`; coordinates are limited to ±1 000 000.
-pub fn zone_id(cell: (i32, i32)) -> String {
-    format!("grid.{}.{}", cell.0, cell.1)
-}
-
-/// Largest |cell coordinate|.
-pub const MAX_CELL: i32 = 1_000_000;
-
-/// Parse `grid.<x>.<y>` (canonical integers only).
-pub fn parse_zone(zone_id: &str) -> Option<(i32, i32)> {
-    let rest = zone_id.strip_prefix("grid.")?;
-    let (x, y) = rest.split_once('.')?;
-    let parse = |s: &str| -> Option<i32> {
-        let v: i32 = s.parse().ok()?;
-        (v.to_string() == s && v.abs() <= MAX_CELL).then_some(v)
-    };
-    Some((parse(x)?, parse(y)?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn zone_ids_round_trip() {
-        assert_eq!(parse_zone("grid.0.0"), Some((0, 0)));
-        assert_eq!(parse_zone("grid.-3.12"), Some((-3, 12)));
-        assert_eq!(parse_zone(&zone_id((-7, 9))), Some((-7, 9)));
-        for bad in [
-            "grid.1",
-            "grid.01.2",
-            "grid.+1.2",
-            "grid.1.2.3",
-            "grid.2000000.0",
-            "arena-1",
-        ] {
-            assert_eq!(parse_zone(bad), None, "{bad}");
-        }
-    }
 
     #[test]
     fn borders_match_and_trails_stay_free() {
@@ -598,32 +286,12 @@ mod tests {
                     for line in [0.0, 8.0, 16.0, 24.0, 32.0] {
                         assert!((p.x - line).abs() > reach && (p.y - line).abs() > reach);
                     }
-                    // A walker up to HYSTERESIS past the border (still
-                    // owned by this cell) never overlaps a neighbour's prop.
-                    let clear = HYSTERESIS + PLAYER_RADIUS;
+                    // Props keep clear of the cell border.
+                    let clear = 0.5 + PLAYER_RADIUS;
                     assert!(p.x - p.r >= clear && p.x + p.r <= CELL - clear);
                     assert!(p.y - p.r >= clear && p.y + p.r <= CELL - clear);
                 }
             }
         }
-    }
-
-    #[test]
-    fn walking_a_trail_crosses_the_cell() {
-        let props = cell_props(DEFAULT_SEED, (0, 0));
-        let (mut x, mut y) = (16.0, 16.0);
-        let east = MoveInput {
-            mx: 127,
-            my: 0,
-            buttons: BUTTON_SPRINT,
-        };
-        let mut frames = 0;
-        while crossing(x, y).is_none() {
-            (x, y) = step(x, y, east, &props);
-            frames += 1;
-            assert!(frames < 200, "stuck at {x},{y}");
-        }
-        assert_eq!(crossing(x, y), Some((1, 0)));
-        assert!((y - 16.0).abs() < 1e-3);
     }
 }

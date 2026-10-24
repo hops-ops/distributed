@@ -18,6 +18,7 @@ struct KindAttrs {
     id: u16,
     priority: Option<Expr>,
     global: bool,
+    every_patch: bool,
     x: Option<Ident>,
     y: Option<Ident>,
     of: Option<Type>,
@@ -30,8 +31,8 @@ fn parse_kind_attrs(input: &DeriveInput) -> syn::Result<KindAttrs> {
             "#[derive(Replicated)] needs #[replicated(kind = \"name\", id = N)]",
         ));
     };
-    let (mut kind, mut id, mut priority, mut global, mut x, mut y, mut of) =
-        (None, None, None, false, None, None, None);
+    let (mut kind, mut id, mut priority, mut global, mut every_patch, mut x, mut y, mut of) =
+        (None, None, None, false, false, None, None, None);
     attr.parse_nested_meta(|meta| {
         let key = meta
             .path
@@ -46,12 +47,13 @@ fn parse_kind_attrs(input: &DeriveInput) -> syn::Result<KindAttrs> {
             }
             "priority" => priority = Some(meta.value()?.parse::<Expr>()?),
             "global" => global = true,
+            "every_patch" => every_patch = true,
             "x" => x = Some(meta.value()?.parse::<Ident>()?),
             "y" => y = Some(meta.value()?.parse::<Ident>()?),
             "of" => of = Some(meta.value()?.parse::<Type>()?),
             _ => {
                 return Err(meta.error(
-                    "expected `kind`, `id`, `priority`, `global`, `x`, `y` or `of` in #[replicated(..)]",
+                    "expected `kind`, `id`, `priority`, `global`, `every_patch`, `x`, `y` or `of` in #[replicated(..)]",
                 ))
             }
         }
@@ -66,6 +68,7 @@ fn parse_kind_attrs(input: &DeriveInput) -> syn::Result<KindAttrs> {
         })?,
         priority,
         global,
+        every_patch,
         x,
         y,
         of,
@@ -275,6 +278,11 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         .as_ref()
         .map(|e| quote!(.priority((#e) as f32)))
         .unwrap_or_default();
+    let every_patch = if attrs.every_patch {
+        quote!(.every_patch())
+    } else {
+        TokenStream::new()
+    };
     Ok(quote! {
         impl #rt::Replicated for #ident {
             const KIND_ID: u16 = #id;
@@ -285,6 +293,7 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 #p::KindDef::new(#id, #kind)
                     #(#defs)*
                     #kind_priority
+                    #every_patch
             }
 
             #[allow(clippy::unnecessary_cast)]

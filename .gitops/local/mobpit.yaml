@@ -1,0 +1,17 @@
+apiVersion: hops.local/v1alpha1
+kind: Environment
+metadata:
+  # Template name; the runtime name and namespace come from the checkout
+  # (e.g. distributed-mobpit-world → https://distributed-mobpit-world.gitkb.localhost).
+  name: mobpit
+spec:
+  clusterRef:
+    name: hops
+  root: examples/game
+  # Builds from this checkout on the host (JS SDK, WebAssembly, cells
+  # worker) and this Environment's secrets. Needs mobpit-system.
+  setup:
+    - path: examples/game/scripts/hops/mobpit-setup.sh
+  deploys:
+    - path: .gitops/local
+      type: helm
