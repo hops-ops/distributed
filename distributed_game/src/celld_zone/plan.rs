@@ -37,6 +37,10 @@ pub const RECONNECT_GRACE_MS_VAR: &str = "ZONE_RECONNECT_GRACE_MS";
 /// Env var: command-ledger service id of the zone's facts (default
 /// `celld-zone`).
 pub const FACT_SERVICE_VAR: &str = "ZONE_FACT_SERVICE";
+/// Env var: facts of a lane settled in one cell request at most (default
+/// [`DEFAULT_MAX_BATCH`](crate::facts::DEFAULT_MAX_BATCH), 1..=256; 1
+/// sends each fact alone).
+pub const FACT_BATCH_VAR: &str = "ZONE_FACT_BATCH";
 /// Env var (debug only, off by default): `name=host:port,…` celld operator
 /// listeners asked which node holds the room (celld does not tell
 /// application code its node id).
@@ -82,6 +86,8 @@ pub struct ObjectOptions {
     pub reconnect_grace: Duration,
     /// Fact command-ledger service id.
     pub fact_service: String,
+    /// Facts per cell batch at most ([`FACT_BATCH_VAR`]).
+    pub fact_batch: usize,
     /// Debug node lookup: `(name, operator host:port)`.
     pub nodes: Vec<(String, String)>,
     /// Debug fixed node name.
@@ -118,6 +124,10 @@ impl ObjectOptions {
             return Err(format!("{TICK_HZ_VAR} must be within 1..=120"));
         }
         let patch_hz: u32 = parse(&get, PATCH_HZ_VAR, 20)?;
+        let fact_batch: usize = parse(&get, FACT_BATCH_VAR, crate::facts::DEFAULT_MAX_BATCH)?;
+        if !(1..=256).contains(&fact_batch) {
+            return Err(format!("{FACT_BATCH_VAR} must be within 1..=256"));
+        }
         let nodes = get(NODES_VAR)
             .unwrap_or_default()
             .split(',')
@@ -139,6 +149,7 @@ impl ObjectOptions {
             fact_service: get(FACT_SERVICE_VAR)
                 .filter(|service| !service.trim().is_empty())
                 .unwrap_or_else(|| "celld-zone".into()),
+            fact_batch,
             nodes,
             node: get(NODE_VAR).filter(|node| !node.is_empty()),
             dev_settings: get(DEV_SETTINGS_VAR)

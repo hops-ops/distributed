@@ -63,17 +63,28 @@ pub fn json_status(body: Value, status: u16) -> Result<Response> {
 
 /// The wire form of a dispatch error.
 pub fn error_response(error: CellDispatchError) -> Result<Response> {
-    json_status(
-        json!({ "error": error.client_message(), "code": error.code() }),
-        error.status_code(),
-    )
+    let status = error.status_code();
+    json_status(error_body(&error), status)
 }
+
+fn error_body(error: &CellDispatchError) -> Value {
+    json!({ "error": error.client_message(), "code": error.code() })
+}
+
+/// The route of a fact batch: `POST /{kind}/{shard}/__batch` (see
+/// [`serve_cell`]).
+pub const BATCH_ROUTE: &str = "__batch";
 
 /// One cell's internal routes: `GET /{kind}/{shard}` → `read(cell)`, `POST
 /// /{kind}/{shard}/{command}` → the idempotent wait-path dispatch (identity
 /// from the service-id and principal-partition headers, the session from
-/// `sessions`), then a best-effort outbox drain. Every request must carry
-/// the internal secret.
+/// `sessions`), then a best-effort outbox drain. `POST
+/// /{kind}/{shard}/__batch` ([`BATCH_ROUTE`]) runs a zone's consecutive
+/// facts for this cell in one request: `{ entries: [{ command, commandId,
+/// input, partition, session }] }` → `{ results: [{ status, body }] }`,
+/// each entry exactly as its own wait-path command (its own ledger id and
+/// session), in order, stopping after the first retryable result, then one
+/// outbox drain. Every request must carry the internal secret.
 pub async fn serve_cell<A, F>(
     env: &Env,
     cell: &AggregateCell<A>,
@@ -100,6 +111,9 @@ where
             Ok(body) => json_status(body, 200),
             Err(error) => error_response(CellDispatchError::Internal(error)),
         },
+        (Method::Post, Some(route)) if route == BATCH_ROUTE => {
+            serve_batch(env, cell, req, sessions).await
+        }
         (Method::Post, Some(command)) => {
             let command = command.clone();
             let body: Value = match req.json().await {
@@ -141,6 +155,85 @@ where
         }
         _ => json_status(json!({ "error": "not found" }), 404),
     }
+}
+
+async fn serve_batch<A>(
+    env: &Env,
+    cell: &AggregateCell<A>,
+    mut req: Request,
+    sessions: Sessions,
+) -> Result<Response>
+where
+    A: Aggregate + Send + Sync + 'static,
+{
+    let Some(service) = req.headers().get(CELL_SERVICE_ID_HEADER).ok().flatten() else {
+        return error_response(CellDispatchError::Unauthorized);
+    };
+    let body: Value = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return error_response(CellDispatchError::BadRequest("invalid JSON".into())),
+    };
+    let Some(entries) = body.get("entries").and_then(Value::as_array) else {
+        return error_response(CellDispatchError::BadRequest(
+            "`entries` is required".into(),
+        ));
+    };
+    let mut results = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let (status, body) = match batch_entry(cell, &service, entry, sessions).await {
+            Ok(body) => (200, body),
+            Err(error) => (error.status_code(), error_body(&error)),
+        };
+        let retryable = status >= 500
+            || matches!(status, 408 | 429)
+            || body.get("code").and_then(Value::as_str) == Some("COMMAND_IN_PROGRESS");
+        results.push(json!({ "status": status, "body": body }));
+        if retryable {
+            break;
+        }
+    }
+    if let Err(error) = cell.drain_outbox(env).await {
+        worker::console_error!("post-commit drain deferred: {error}");
+    }
+    json_status(json!({ "results": results }), 200)
+}
+
+/// One `__batch` entry as its own wait-path command.
+async fn batch_entry<A>(
+    cell: &AggregateCell<A>,
+    service: &str,
+    entry: &Value,
+    sessions: Sessions,
+) -> std::result::Result<Value, CellDispatchError>
+where
+    A: Aggregate + Send + Sync + 'static,
+{
+    let field = |name: &str| entry.get(name).and_then(Value::as_str);
+    let (Some(command), Some(partition)) = (field("command"), field("partition")) else {
+        return Err(CellDispatchError::BadRequest(
+            "`command` and `partition` are required".into(),
+        ));
+    };
+    let parsed = CellWaitPathRequest::parse(json!({
+        "commandId": entry.get("commandId"),
+        "input": entry.get("input"),
+    }))
+    .map_err(CellDispatchError::BadRequest)?;
+    let identity = CellCommandIdentity::new(
+        service.to_string(),
+        partition.to_string(),
+        &parsed.command_id,
+    )?;
+    let vars = entry.get("session").and_then(Value::as_object);
+    let header = |name: &str| {
+        vars.and_then(|vars| vars.get(name))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let session = sessions(&header).ok_or(CellDispatchError::Forbidden)?;
+    cell.dispatch_idempotent(command, &identity, parsed.input, session)
+        .await
+        .map(|dispatch| dispatch.wait_path_wire())
 }
 
 /// A watched world cell's watchers ([`crate::world::watch`]): zones that

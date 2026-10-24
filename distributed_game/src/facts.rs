@@ -28,6 +28,15 @@
 //! different principals overlap. A key is never in flight twice (the queue
 //! refuses duplicates), so per-key order always holds. Settlements arrive
 //! in completion order.
+//!
+//! Batching: the feed hands a sink up to
+//! [`max_batch`](FactFeed::with_max_batch) (default
+//! [`DEFAULT_MAX_BATCH`]) consecutive facts of one lane at once
+//! ([`FactSink::commit_batch`]). A sink that can settle many facts in
+//! one round trip (the celld cell hosts: one `__batch` request per cell)
+//! overrides it; the default commits them one by one. A batch commits in
+//! order and stops at its first retryable failure, which is retried from
+//! there, so order and exactly-once hold as for single facts.
 
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
@@ -236,7 +245,32 @@ impl FactSettlement {
 pub trait FactSink: Send + Sync + 'static {
     /// Commit one fact. Must be idempotent per [`Fact::key`].
     fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>>;
+
+    /// Commit `facts` in order: one result per fact attempted. The
+    /// results end at the first [`FactError::Retryable`] (included), or
+    /// earlier; facts past the end were not attempted and are retried.
+    /// The default commits them one by one.
+    fn commit_batch<'a>(
+        &'a self,
+        facts: &'a [Fact],
+    ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(facts.len());
+            for fact in facts {
+                let result = self.commit(fact).await;
+                let stop = matches!(result, Err(FactError::Retryable(_)));
+                results.push(result);
+                if stop {
+                    break;
+                }
+            }
+            results
+        })
+    }
 }
+
+/// Facts per [`FactSink::commit_batch`] unless the feed says otherwise.
+pub const DEFAULT_MAX_BATCH: usize = 16;
 
 /// Retry/backoff policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +364,7 @@ pub struct FactFeed {
     settlements: mpsc::Sender<FactSettlement>,
     policy: RetryPolicy,
     max_concurrent: usize,
+    max_batch: usize,
 }
 
 /// Create a queue allowing `capacity` unsettled facts.
@@ -350,6 +385,7 @@ pub fn fact_channel(capacity: usize, policy: RetryPolicy) -> (FactQueue, FactFee
             settlements: tx,
             policy,
             max_concurrent: 1,
+            max_batch: DEFAULT_MAX_BATCH,
         },
     )
 }
@@ -470,18 +506,22 @@ impl Drop for FactQueue {
     }
 }
 
-struct NextFact<'a>(&'a Shared);
+/// The next facts in emission order (at most `.1`).
+struct NextFact<'a>(&'a Shared, usize);
 
 impl Future for NextFact<'_> {
-    type Output = Option<Fact>;
+    type Output = Option<Vec<Fact>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let shared = self.0;
         // Register before checking so a concurrent push cannot be missed.
         *shared.waker.lock().expect("waker lock") = Some(cx.waker().clone());
-        if let Some(fact) = shared.queue.lock().expect("fact queue lock").pop_front() {
-            return Poll::Ready(Some(fact));
+        let mut queue = shared.queue.lock().expect("fact queue lock");
+        if !queue.is_empty() {
+            let n = queue.len().min(self.1);
+            return Poll::Ready(Some(queue.drain(..n).collect()));
         }
+        drop(queue);
         if shared.closed.load(Ordering::SeqCst) {
             return Poll::Ready(None);
         }
@@ -502,6 +542,18 @@ impl FactFeed {
         self.max_concurrent
     }
 
+    /// Hand the sink up to `n` facts of a lane at once (default
+    /// [`DEFAULT_MAX_BATCH`]; 1 commits fact by fact).
+    pub fn with_max_batch(mut self, n: usize) -> Self {
+        self.max_batch = n.max(1);
+        self
+    }
+
+    /// Facts per batch at most.
+    pub fn max_batch(&self) -> usize {
+        self.max_batch
+    }
+
     /// Commit facts until the queue is dropped and drained: in emission
     /// order, or with bounded concurrency in per-principal lanes
     /// ([`with_max_concurrent_commits`](Self::with_max_concurrent_commits)).
@@ -514,17 +566,19 @@ impl FactFeed {
     {
         let policy = self.policy;
         if self.max_concurrent <= 1 {
-            while let Some(fact) = NextFact(&self.shared).await {
-                let settlement = commit_with_retries(&sink, fact, policy, &sleep).await;
-                let _ = self.settlements.send(settlement);
+            while let Some(facts) = NextFact(&self.shared, self.max_batch).await {
+                for settlement in commit_with_retries(&sink, facts, policy, &sleep).await {
+                    let _ = self.settlements.send(settlement);
+                }
             }
             return;
         }
-        let start = |fact: Fact| Box::pin(commit_with_retries(&sink, fact, policy, &sleep));
+        let start = |facts: Vec<Fact>| Box::pin(commit_with_retries(&sink, facts, policy, &sleep));
         Pump {
             shared: &self.shared,
             settlements: &self.settlements,
             limit: self.max_concurrent,
+            max_batch: self.max_batch,
             start,
             waiting: VecDeque::new(),
             active: Vec::new(),
@@ -533,33 +587,68 @@ impl FactFeed {
     }
 }
 
+/// Commit `facts` in order through [`FactSink::commit_batch`], retrying
+/// from the first unsettled fact; `policy` bounds the attempts at each
+/// fact as if it were committed alone.
 async fn commit_with_retries<S, F, Fut>(
     sink: &S,
-    fact: Fact,
+    facts: Vec<Fact>,
     policy: RetryPolicy,
     sleep: &F,
-) -> FactSettlement
+) -> Vec<FactSettlement>
 where
     S: FactSink,
     F: Fn(Duration) -> Fut,
     Fut: Future<Output = ()>,
 {
+    let max_attempts = policy.max_attempts.max(1);
+    let mut settled = Vec::with_capacity(facts.len());
+    let mut pending: VecDeque<Fact> = facts.into();
+    // Attempts at the head of `pending`.
     let mut attempts = 0;
-    let outcome = loop {
+    while !pending.is_empty() {
         attempts += 1;
-        match sink.commit(&fact).await {
-            Ok(receipt) => break FactOutcome::Committed(receipt),
-            Err(FactError::Retryable(_)) if attempts < policy.max_attempts.max(1) => {
-                sleep(policy.backoff(attempts)).await;
-            }
-            Err(error) => break FactOutcome::Failed { error, attempts },
+        let results = sink.commit_batch(pending.make_contiguous()).await;
+        let answered = results.len().min(pending.len());
+        // A sink that answered for nothing is retried like a retryable head.
+        let mut retry = answered == 0;
+        for result in results.into_iter().take(answered) {
+            let outcome = match result {
+                Ok(receipt) => FactOutcome::Committed(receipt),
+                Err(FactError::Retryable(_)) if attempts < max_attempts => {
+                    retry = true;
+                    break;
+                }
+                Err(error) => FactOutcome::Failed { error, attempts },
+            };
+            let fact = pending.pop_front().expect("a result per attempted fact");
+            settled.push(FactSettlement {
+                key: fact.key,
+                command: fact.command,
+                outcome,
+            });
+            // The next result is the next fact's first attempt.
+            attempts = 1;
         }
-    };
-    FactSettlement {
-        key: fact.key,
-        command: fact.command,
-        outcome,
+        if !retry {
+            // The facts left (if any) were not attempted yet.
+            attempts = 0;
+        } else if answered == 0 && attempts >= max_attempts {
+            let fact = pending.pop_front().expect("a pending fact");
+            settled.push(FactSettlement {
+                key: fact.key,
+                command: fact.command,
+                outcome: FactOutcome::Failed {
+                    error: FactError::Retryable("the sink committed nothing".into()),
+                    attempts,
+                },
+            });
+            attempts = 0;
+        } else {
+            sleep(policy.backoff(attempts)).await;
+        }
     }
+    settled
 }
 
 /// Concurrent commit driver: at most `limit` commits in flight, one per
@@ -568,6 +657,7 @@ struct Pump<'a, T, M> {
     shared: &'a Shared,
     settlements: &'a mpsc::Sender<FactSettlement>,
     limit: usize,
+    max_batch: usize,
     start: M,
     waiting: VecDeque<Fact>,
     active: Vec<(Option<String>, Pin<Box<T>>)>,
@@ -575,8 +665,8 @@ struct Pump<'a, T, M> {
 
 impl<T, M> Future for Pump<'_, T, M>
 where
-    T: Future<Output = FactSettlement>,
-    M: FnMut(Fact) -> Pin<Box<T>> + Unpin,
+    T: Future<Output = Vec<FactSettlement>>,
+    M: FnMut(Vec<Fact>) -> Pin<Box<T>> + Unpin,
 {
     type Output = ();
 
@@ -598,16 +688,27 @@ where
                     i += 1;
                     continue;
                 }
-                let fact = this.waiting.remove(i).expect("index in range");
+                // The lane's waiting facts, in order, up to a batch.
+                let mut batch = vec![this.waiting.remove(i).expect("index in range")];
+                let mut k = i;
+                while k < this.waiting.len() && batch.len() < this.max_batch {
+                    if this.waiting[k].principal == lane {
+                        batch.push(this.waiting.remove(k).expect("index in range"));
+                    } else {
+                        k += 1;
+                    }
+                }
                 blocked.insert(lane.clone());
-                this.active.push((lane, (this.start)(fact)));
+                this.active.push((lane, (this.start)(batch)));
             }
             let mut progressed = false;
             let mut j = 0;
             while j < this.active.len() {
                 match this.active[j].1.as_mut().poll(cx) {
-                    Poll::Ready(settlement) => {
-                        let _ = this.settlements.send(settlement);
+                    Poll::Ready(settlements) => {
+                        for settlement in settlements {
+                            let _ = this.settlements.send(settlement);
+                        }
                         this.active.remove(j);
                         progressed = true;
                     }
@@ -677,5 +778,183 @@ impl FactSink for MemoryFactSink {
 impl<S: FactSink> FactSink for Arc<S> {
     fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
         (**self).commit(fact)
+    }
+
+    fn commit_batch<'a>(
+        &'a self,
+        facts: &'a [Fact],
+    ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
+        (**self).commit_batch(facts)
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    /// Commits whole batches, recording each; `flaky` answers retryable
+    /// `failures` times when it reaches that key.
+    #[derive(Default)]
+    struct BatchSink {
+        batches: Mutex<Vec<Vec<String>>>,
+        committed: Mutex<Vec<String>>,
+        flaky: Option<(String, Mutex<u32>)>,
+    }
+
+    impl FactSink for BatchSink {
+        fn commit<'a>(&'a self, _: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+            unreachable!("batches only")
+        }
+
+        fn commit_batch<'a>(
+            &'a self,
+            facts: &'a [Fact],
+        ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
+            Box::pin(async move {
+                let keys = facts.iter().map(|f| f.key().to_string()).collect();
+                self.batches.lock().unwrap().push(keys);
+                let mut results = Vec::new();
+                for fact in facts {
+                    if let Some((key, failures)) = &self.flaky {
+                        let mut failures = failures.lock().unwrap();
+                        if fact.key() == key && *failures > 0 {
+                            *failures -= 1;
+                            results.push(Err(FactError::Retryable("busy".into())));
+                            break;
+                        }
+                    }
+                    let mut committed = self.committed.lock().unwrap();
+                    let replayed = committed.iter().any(|k| k == fact.key());
+                    if !replayed {
+                        committed.push(fact.key().to_string());
+                    }
+                    results.push(Ok(FactReceipt {
+                        payload: Value::Null,
+                        replayed,
+                    }));
+                }
+                results
+            })
+        }
+    }
+
+    fn fact(key: &str, principal: Option<&str>) -> Fact {
+        Fact::new(key, "credit", Value::Null)
+            .bind(principal.map(str::to_string), FactStamp::default())
+    }
+
+    async fn settle(queue: &mut FactQueue, n: usize) -> Vec<FactSettlement> {
+        let mut settled = Vec::new();
+        while settled.len() < n {
+            settled.extend(queue.drain());
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        settled
+    }
+
+    fn keys(settled: &[FactSettlement]) -> Vec<&str> {
+        settled.iter().map(|s| s.key.as_str()).collect()
+    }
+
+    fn policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lane_settles_in_batches_in_order() {
+        let (mut queue, feed) = fact_channel(64, policy(3));
+        for i in 0..5 {
+            queue
+                .try_send(fact(&format!("a{i}"), Some("alice")))
+                .unwrap();
+        }
+        for i in 0..3 {
+            queue.try_send(fact(&format!("b{i}"), Some("bob"))).unwrap();
+        }
+        let sink = Arc::new(BatchSink::default());
+        let feed = feed.with_max_concurrent_commits(4).with_max_batch(4);
+        let worker = tokio::spawn(feed.run(sink.clone(), tokio::time::sleep));
+        let settled = settle(&mut queue, 8).await;
+        drop(queue);
+        worker.await.unwrap();
+
+        let batches = sink.batches.lock().unwrap().clone();
+        assert!(batches.contains(&vec!["a0".into(), "a1".into(), "a2".into(), "a3".into()]));
+        assert!(batches.contains(&vec!["b0".into(), "b1".into(), "b2".into()]));
+        assert!(batches.contains(&vec!["a4".into()]));
+        assert_eq!(batches.len(), 3);
+        let lane = |p: char| -> Vec<&str> {
+            keys(&settled)
+                .into_iter()
+                .filter(|k| k.starts_with(p))
+                .collect()
+        };
+        assert_eq!(lane('a'), ["a0", "a1", "a2", "a3", "a4"]);
+        assert_eq!(lane('b'), ["b0", "b1", "b2"]);
+        assert!(settled
+            .iter()
+            .all(|s| matches!(s.outcome, FactOutcome::Committed(_))));
+    }
+
+    #[tokio::test]
+    async fn a_batch_retries_from_its_first_retryable_fact() {
+        let (mut queue, feed) = fact_channel(64, policy(3));
+        for i in 0..5 {
+            queue.try_send(fact(&format!("f{i}"), None)).unwrap();
+        }
+        let sink = Arc::new(BatchSink {
+            flaky: Some(("f2".into(), Mutex::new(1))),
+            ..BatchSink::default()
+        });
+        let worker = tokio::spawn(feed.with_max_batch(8).run(sink.clone(), tokio::time::sleep));
+        let settled = settle(&mut queue, 5).await;
+        drop(queue);
+        worker.await.unwrap();
+
+        assert_eq!(keys(&settled), ["f0", "f1", "f2", "f3", "f4"]);
+        assert!(settled
+            .iter()
+            .all(|s| matches!(s.outcome, FactOutcome::Committed(_))));
+        // Exactly once each, in order; the retry resent only f2 onward.
+        assert_eq!(
+            *sink.committed.lock().unwrap(),
+            ["f0", "f1", "f2", "f3", "f4"]
+        );
+        assert_eq!(
+            *sink.batches.lock().unwrap(),
+            [vec!["f0", "f1", "f2", "f3", "f4"], vec!["f2", "f3", "f4"]]
+        );
+    }
+
+    #[tokio::test]
+    async fn attempts_count_per_fact_in_a_batch() {
+        let (mut queue, feed) = fact_channel(64, policy(2));
+        for i in 0..3 {
+            queue.try_send(fact(&format!("f{i}"), None)).unwrap();
+        }
+        let sink = Arc::new(BatchSink {
+            flaky: Some(("f1".into(), Mutex::new(u32::MAX))),
+            ..BatchSink::default()
+        });
+        let worker = tokio::spawn(feed.with_max_batch(8).run(sink.clone(), tokio::time::sleep));
+        let settled = settle(&mut queue, 3).await;
+        drop(queue);
+        worker.await.unwrap();
+
+        assert_eq!(keys(&settled), ["f0", "f1", "f2"]);
+        assert!(matches!(settled[0].outcome, FactOutcome::Committed(_)));
+        assert!(matches!(
+            settled[1].outcome,
+            FactOutcome::Failed {
+                error: FactError::Retryable(_),
+                attempts: 2
+            }
+        ));
+        assert!(matches!(settled[2].outcome, FactOutcome::Committed(_)));
+        assert_eq!(*sink.committed.lock().unwrap(), ["f0", "f2"]);
     }
 }

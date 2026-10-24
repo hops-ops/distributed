@@ -826,7 +826,9 @@ hibernation (`ZONE_HIBERNATE_AFTER_MS` later, by object alarm, so it also
 happens after an eviction), restore on the next join, facts to the cells
 of the same worker object to object (`CelldObjectHost` under the usual
 `CommandFactSink` routes; a durable outbox in the object's storage makes
-them exactly once across crashes), and the zone's lifecycle reports
+them exactly once across crashes; a lane's waiting facts for one cell go
+as one `POST …/__batch` and leave the outbox in one delete, see
+[Durable facts](#durable-facts)), and the zone's lifecycle reports
 (`active` / `dormant` / `hibernated`) into its
 [`zone_activity`](src/world/zone_activity.rs) cell, which the
 `zone_status` read model projects for minimaps.
@@ -972,10 +974,13 @@ unlimited rewind.
 - **Facts, not per-tick persistence.** Movement and combat ticks are never
   stored, only meaningful outcomes. The tick enqueues and moves on, so
   storage speed never shows up as lag.
-- **Idempotency through keys, not a zone-side outbox.** A fact key plus
-  the cell's command ledger make retries safe. An outbox on the zone
-  would add a second write per outcome for little gain, since the zone
-  state lost in a crash is lost either way.
+- **Idempotency through keys; the outbox is a log consumed in batches.**
+  A fact key plus the cell's command ledger make retries safe. A native
+  zone keeps facts in its bounded queue only (the zone state lost in a
+  crash is lost either way). A celld zone also journals them in object
+  storage, written with the tick's other writes and settled in batches
+  (one cell request and one delete per batch), so the outbox costs one
+  batched write per tick, not two writes and a request per outcome.
 - **Static world from a seed.** Terrain and props are a pure function of
   seed and content version, generated identically on server and client.
   Only things that change are replicated.
@@ -1137,6 +1142,20 @@ a time (a slow commit delays every later fact). Set
 **per-principal lanes**: a principal's facts (and, separately, zone facts
 without a principal) stay sequential in emission order; different
 principals commit concurrently; settlements arrive in completion order.
+
+**Batches.** The feed hands its sink up to `max_batch` (default 16,
+`FactFeed::with_max_batch`; celld zones: `ZONE_FACT_BATCH`) waiting facts
+of a lane at once, `FactSink::commit_batch`. Game code is unchanged
+(`ctx.emit`, `#[derive(FactCommand)]`, `#[command]` handlers). The default
+commits them one by one; `CommandFactSink` groups consecutive facts for
+the same aggregate and calls `FactHost::dispatch_fact_batch`, which the
+celld object host sends as one `POST {kind}/{shard}/__batch` (each entry
+with its own command id, principal and stamp; `serve_cell` runs them in
+order through the same idempotent wait path and drains the cell outbox
+once). A batch stops at its first retryable failure and is retried from
+there; attempts count per fact, so order, exactly-once and
+`RetryPolicy` mean what they mean for single facts. A cell without the
+batch route (404) gets the facts one by one.
 
 ## Netcode and operations
 

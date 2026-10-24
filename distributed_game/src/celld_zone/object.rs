@@ -268,7 +268,6 @@ impl CelldObjectHost {
     }
 
     async fn post(&self, call: &FactCall<'_>) -> std::result::Result<FactReceipt, FactError> {
-        let retry = |e: worker::Error| FactError::Retryable(e.to_string());
         let headers = Headers::new();
         let set = |name: &str, value: &str| {
             headers
@@ -285,24 +284,124 @@ impl CelldObjectHost {
                 set(name, value)?;
             }
         }
-        let body = json!({ "commandId": call.command_id, "input": call.input }).to_string();
+        let body = json!({ "commandId": call.command_id, "input": call.input });
+        let (status, body) = self
+            .send(call.kind, &call.shard, call.command, headers, body)
+            .await?;
+        classify_wait_path(status, &body)
+    }
+
+    /// `calls` (one aggregate) in one `POST /{kind}/{shard}/__batch`
+    /// ([`super::cells::serve_cell`]); each entry carries its own command
+    /// id, principal and stamp. A cell without the route gets them one by
+    /// one.
+    async fn post_batch(
+        &self,
+        calls: Vec<FactCall<'_>>,
+    ) -> Vec<std::result::Result<FactReceipt, FactError>> {
+        let Some(first) = calls.first() else {
+            return Vec::new();
+        };
+        let (kind, shard) = (first.kind, first.shard.clone());
+        let entries: Vec<Value> = calls
+            .iter()
+            .map(|call| {
+                let mut session = serde_json::Map::new();
+                session.insert(USER_ID_KEY.into(), json!(call.principal));
+                for (name, value) in call.session.variables() {
+                    if name.starts_with(crate::stamp::SESSION_PREFIX) {
+                        session.insert(name.clone(), json!(value));
+                    }
+                }
+                json!({
+                    "command": call.command,
+                    "commandId": call.command_id,
+                    "input": call.input,
+                    "partition": call.principal,
+                    "session": session,
+                })
+            })
+            .collect();
+        let headers = Headers::new();
+        let set = |name: &str, value: &str| headers.set(name, value).is_ok();
+        if !(set(CELL_INTERNAL_SECRET_HEADER, &self.secret)
+            && set(CELL_SERVICE_ID_HEADER, &self.service_id)
+            && set("content-type", "application/json"))
+        {
+            return vec![Err(FactError::Permanent("batch headers".into()))];
+        }
+        let sent = self
+            .send(
+                kind,
+                &shard,
+                super::cells::BATCH_ROUTE,
+                headers,
+                json!({ "entries": entries }),
+            )
+            .await;
+        match sent {
+            Ok((404, _)) => {
+                let mut results = Vec::with_capacity(calls.len());
+                for call in &calls {
+                    let result = self.post(call).await;
+                    let stop = matches!(result, Err(FactError::Retryable(_)));
+                    results.push(result);
+                    if stop {
+                        break;
+                    }
+                }
+                results
+            }
+            Ok((status, body)) if (200..300).contains(&status) => body
+                .get("results")
+                .and_then(Value::as_array)
+                .map(|results| {
+                    results
+                        .iter()
+                        .map(|result| {
+                            let status = result
+                                .get("status")
+                                .and_then(Value::as_u64)
+                                .and_then(|status| u16::try_from(status).ok())
+                                .unwrap_or(500);
+                            classify_wait_path(status, result.get("body").unwrap_or(&Value::Null))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Ok((status, body)) => vec![classify_wait_path(status, &body)],
+            Err(error) => vec![Err(error)],
+        }
+    }
+
+    /// `POST https://cell/{kind}/{shard}/{route}` to the cell's stub:
+    /// `(status, JSON body)`.
+    async fn send(
+        &self,
+        kind: &str,
+        shard: &str,
+        route: &str,
+        headers: Headers,
+        body: Value,
+    ) -> std::result::Result<(u16, Value), FactError> {
+        let retry = |e: worker::Error| FactError::Retryable(e.to_string());
         let mut init = RequestInit::new();
         init.with_method(Method::Post)
             .with_headers(headers)
-            .with_body(Some(body.into()));
+            .with_body(Some(body.to_string().into()));
         let url = format!(
             "https://cell/{}/{}/{}",
-            encode_segment(call.kind),
-            encode_segment(&call.shard),
-            encode_segment(call.command)
+            encode_segment(kind),
+            encode_segment(shard),
+            encode_segment(route)
         );
         let request = Request::new_with_init(&url, &init).map_err(retry)?;
-        let stub = stub_for(&self.env, call.kind, &call.shard)
-            .map_err(|e| FactError::Permanent(format!("cell `{}`: {e}", call.kind)))?;
+        let stub = stub_for(&self.env, kind, shard)
+            .map_err(|e| FactError::Permanent(format!("cell `{kind}`: {e}")))?;
         let mut response = stub.fetch_with_request(request).await.map_err(retry)?;
         let status = response.status_code();
         let body: Value = response.json().await.unwrap_or(Value::Null);
-        classify_wait_path(status, &body)
+        Ok((status, body))
     }
 }
 
@@ -312,6 +411,19 @@ impl FactHost for CelldObjectHost {
         call: FactCall<'a>,
     ) -> BoxFuture<'a, std::result::Result<FactReceipt, FactError>> {
         Box::pin(SendFuture::new(async move { self.post(&call).await }))
+    }
+
+    fn dispatch_fact_batch<'a>(
+        &'a self,
+        calls: Vec<FactCall<'a>>,
+    ) -> BoxFuture<'a, Vec<std::result::Result<FactReceipt, FactError>>> {
+        Box::pin(SendFuture::new(async move {
+            if calls.len() == 1 {
+                let call = calls.into_iter().next().expect("one call");
+                return vec![self.post(&call).await];
+            }
+            self.post_batch(calls).await
+        }))
     }
 }
 
@@ -352,6 +464,43 @@ impl FactSink for DurableFacts {
             result
         }))
     }
+
+    /// One batched delete for the facts the batch settled.
+    fn commit_batch<'a>(
+        &'a self,
+        facts: &'a [Fact],
+    ) -> BoxFuture<'a, Vec<std::result::Result<FactReceipt, FactError>>> {
+        Box::pin(SendFuture::new(async move {
+            let results = self.sink.commit_batch(facts).await;
+            let mut settled = Vec::new();
+            for (fact, result) in facts.iter().zip(&results) {
+                match result {
+                    Err(FactError::Permanent(e)) => {
+                        worker::console_error!("fact {} refused: {e}", fact.key())
+                    }
+                    Err(FactError::Retryable(e)) => {
+                        worker::console_warn!("fact {} will be retried: {e}", fact.key());
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
+                settled.push(StoredFact::storage_key(fact.key()));
+            }
+            if !settled.is_empty() {
+                let _ = self.storage.delete_multiple(settled).await;
+            }
+            results
+        }))
+    }
+}
+
+/// Facts per cell batch from the zone's options.
+fn fact_batch(options: &Option<ObjectOptions>) -> usize {
+    options
+        .as_ref()
+        .map_or(crate::facts::DEFAULT_MAX_BATCH, |options| {
+            options.fact_batch
+        })
 }
 
 // ------------------------------------------------------------------ time
@@ -1094,8 +1243,10 @@ impl<Z: CelldZone> ZoneObject<Z> {
         };
         let (queue, feed) = fact_channel(FACT_CAPACITY, retry_policy());
         let queue = queue.with_journal();
+        let batch = fact_batch(&self.inner.borrow().options);
         wasm_bindgen_futures::spawn_local(
             feed.with_max_concurrent_commits(4)
+                .with_max_batch(batch)
                 .run(durable.clone(), sleep),
         );
         {
@@ -1194,7 +1345,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             let (queue, feed) = fact_channel(FACT_CAPACITY, retry_policy());
             if let Some(sink) = inner.sink.clone() {
                 wasm_bindgen_futures::spawn_local(
-                    feed.with_max_concurrent_commits(4).run(sink, sleep),
+                    feed.with_max_concurrent_commits(4)
+                        .with_max_batch(fact_batch(&inner.options))
+                        .run(sink, sleep),
                 );
                 host = host.with_facts(queue.with_journal());
             }
