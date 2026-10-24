@@ -41,7 +41,9 @@ use crate::lifecycle::{
     ConnectionLost, JoinVia, LeftReason, LostCause, PlayerDisconnected, PlayerJoined, PlayerLeft,
     PlayerReconnected,
 };
-use crate::protocol::{error, kick, Notice, Role, ServerMessage, Welcome};
+use crate::protocol::{
+    error, feature, kick, Notice, Role, ServerMessage, Welcome, PROTOCOL_VERSION,
+};
 use crate::replication::{ClientReplica, DeltaStats, EncodedWorld, WorldView};
 use crate::rewind::{Rewind, RewindConfig, RewindFrame};
 use crate::rng::ZoneRng;
@@ -852,6 +854,8 @@ pub struct ZoneHost<Z: Zone> {
     /// The last patch's world: the next one shares its unchanged entities
     /// and encodes each change once for every client.
     last_world: Option<EncodedWorld>,
+    /// Protocol version of the next admission's client ([`ZoneHost::speaking`]).
+    next_protocol: Option<u32>,
 }
 
 macro_rules! hook {
@@ -929,6 +933,7 @@ impl<Z: Zone> ZoneHost<Z> {
             pending: AdvanceReport::default(),
             hash_ticks: false,
             last_world: None,
+            next_protocol: None,
         };
         host.process_kicks();
         host
@@ -1103,6 +1108,22 @@ impl<Z: Zone> ZoneHost<Z> {
         std::mem::take(&mut self.core.outbound)
     }
 
+    /// The protocol version of the client the next
+    /// [`join`](Self::join) / [`join_transfer`](Self::join_transfer) /
+    /// [`reconnect`](Self::reconnect) admits (its Hello's
+    /// `protocol_version`, already checked with
+    /// [`supports_protocol`](crate::protocol::supports_protocol)): its
+    /// Welcome is encoded in it. Applies to that one call; without it the
+    /// client speaks [`PROTOCOL_VERSION`].
+    ///
+    /// ```ignore
+    /// host.speaking(hello.protocol_version).join(&claims, hello.capabilities, &hello.content_version)
+    /// ```
+    pub fn speaking(&mut self, protocol_version: u32) -> &mut Self {
+        self.next_protocol = Some(protocol_version);
+        self
+    }
+
     /// Admit a verified ticket holder.
     pub fn join(
         &mut self,
@@ -1151,6 +1172,7 @@ impl<Z: Zone> ZoneHost<Z> {
         content_version: &str,
         handoff: Option<(&str, Vec<u8>)>,
     ) -> Result<Joined, JoinError> {
+        let protocol = self.next_protocol.take().unwrap_or(PROTOCOL_VERSION);
         if self.disposed {
             return Err(JoinError::new(error::NOT_FOUND, "zone disposed"));
         }
@@ -1213,7 +1235,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     }
                     slot.info.extensions = claims.extensions.clone();
                 }
-                self.bind_player(player, client, capabilities);
+                self.bind_player(player, client, capabilities, protocol);
                 let zone = self.core.zone_id.clone();
                 if let Some((from, carried)) = handoff.take() {
                     self.core.emit_lifecycle(
@@ -1266,7 +1288,7 @@ impl<Z: Zone> ZoneHost<Z> {
                         transitions: 0,
                     },
                 );
-                self.bind_player(player, client, capabilities);
+                self.bind_player(player, client, capabilities, protocol);
                 let zone = self.core.zone_id.clone();
                 match handoff.take() {
                     Some((from, carried)) => {
@@ -1315,7 +1337,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     },
                 );
                 self.attach_client(client, Viewer::Observer(observer));
-                self.welcome(client, session_id, String::new(), Role::Observer);
+                self.welcome(client, session_id, String::new(), Role::Observer, protocol);
                 hook!(self.on_observe(observer));
                 Joined {
                     client,
@@ -1360,6 +1382,7 @@ impl<Z: Zone> ZoneHost<Z> {
         capabilities: u32,
         content_version: Option<&str>,
     ) -> Result<Joined, JoinError> {
+        let protocol = self.next_protocol.take().unwrap_or(PROTOCOL_VERSION);
         let player = (!token.is_empty() && !self.disposed)
             .then(|| {
                 self.core
@@ -1385,7 +1408,7 @@ impl<Z: Zone> ZoneHost<Z> {
         }
         self.wake();
         let client = ClientId(self.core.next_id());
-        self.bind_player(player, client, capabilities);
+        self.bind_player(player, client, capabilities, protocol);
         if let Some(version) = content_version {
             if let Some(slot) = self.core.players.get_mut(&player) {
                 slot.content_version = version.to_string();
@@ -1544,7 +1567,13 @@ impl<Z: Zone> ZoneHost<Z> {
         );
     }
 
-    fn bind_player(&mut self, player: PlayerId, client: ClientId, capabilities: u32) {
+    fn bind_player(
+        &mut self,
+        player: PlayerId,
+        client: ClientId,
+        capabilities: u32,
+        protocol: u32,
+    ) {
         let token = (self.token_source)();
         let slot = self.core.players.get_mut(&player).expect("player exists");
         let previous = slot.client.replace(client);
@@ -1568,11 +1597,19 @@ impl<Z: Zone> ZoneHost<Z> {
             self.core.outbound.push(Outbound::Close { client: old });
         }
         self.attach_client(client, Viewer::Player(player));
-        self.welcome(client, session_id, token, Role::Player);
+        self.welcome(client, session_id, token, Role::Player, protocol);
     }
 
-    fn welcome(&mut self, client: ClientId, session_id: String, token: String, role: Role) {
+    fn welcome(
+        &mut self,
+        client: ClientId,
+        session_id: String,
+        token: String,
+        role: Role,
+        protocol_version: u32,
+    ) {
         let welcome = ServerMessage::Welcome(Welcome {
+            protocol_version,
             session_id,
             zone_id: self.core.zone_id.clone(),
             role,
@@ -1583,6 +1620,8 @@ impl<Z: Zone> ZoneHost<Z> {
             reconnect_token: token,
             content_version: self.core.config.content_version.clone(),
             schema: self.schema.clone(),
+            features: feature::ALL,
+            origin: self.zone.origin(),
         });
         self.core.server_message(client, &welcome);
     }

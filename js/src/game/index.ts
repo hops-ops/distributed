@@ -51,6 +51,7 @@ export {
 	GAME_PROTOCOL_VERSION,
 	GameClientMirror,
 	GameErrorCode,
+	GameFeature,
 	GameKickCode,
 	GameMessageTag,
 	decodeClientMessage,
@@ -78,6 +79,7 @@ export {
 	type PingMessage,
 	type PongMessage,
 	type RedirectMessage,
+	type WorldPoint,
 	type ResumeMessage,
 	type WelcomeMessage
 } from './messages.js';

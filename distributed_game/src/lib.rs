@@ -121,7 +121,7 @@ pub use inbox::{Delivered, NoMessages, ZoneInbound};
 pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, SequencedInput};
 pub use interest::{InterestConfig, UpdateRates, View};
 pub use prediction::{PredictContext, PredictStep};
-pub use protocol::{ClientMessage, ClientMirror, Role, ServerMessage, PROTOCOL_VERSION};
+pub use protocol::{ClientMessage, ClientMirror, Origin, Role, ServerMessage, PROTOCOL_VERSION};
 pub use pure::GamePure;
 pub use replay::{replay, Recorder, Recording};
 pub use replication::{EntityState, WorldView};

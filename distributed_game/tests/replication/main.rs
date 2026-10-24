@@ -60,6 +60,7 @@ impl Client {
         // Seed the mirror with the schema as a Welcome would.
         let mut mirror = ClientMirror::new();
         mirror.welcome = Some(distributed_game::protocol::Welcome {
+            protocol_version: distributed_game::PROTOCOL_VERSION,
             session_id: "s".into(),
             zone_id: "z".into(),
             role: distributed_game::Role::Player,
@@ -70,6 +71,8 @@ impl Client {
             reconnect_token: String::new(),
             content_version: String::new(),
             schema: schema(),
+            features: 0,
+            origin: None,
         });
         Self {
             replica: ClientReplica::new(),

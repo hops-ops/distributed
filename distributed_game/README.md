@@ -1014,7 +1014,10 @@ unlimited rewind.
   every float bit and costs about a microsecond per step.
 - **Binary protocol with the schema sent on connect.** Small,
   diff-friendly frames, and any client can decode them without generated
-  code.
+  code. The version is negotiated in the handshake (`PROTOCOL.md` §6.0):
+  servers answer v1 and v2 clients, the JS SDK falls back to v1 against
+  an old server and sends feature-gated messages (`Focus`) only to
+  servers that announce them, so servers and clients deploy in any order.
 - **Reliable, ordered WebSockets.** Deltas are computed against what each
   client last received, which only works because nothing is lost or
   reordered. Loss shows up as delay, which the adaptive interpolation

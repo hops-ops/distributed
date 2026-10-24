@@ -574,6 +574,43 @@ fn observers_receive_deltas_without_owning_a_player() {
 }
 
 #[test]
+fn welcome_is_encoded_in_the_clients_protocol_version() {
+    use distributed_game::protocol::feature;
+    use distributed_game::Origin;
+    let clock = ManualClock::new();
+    let cfg = ArenaConfig {
+        origin: Some(Origin::new(120.0, -40.0)),
+        ..ArenaConfig::default()
+    };
+    let mut h = host(HostConfig::default(), &clock, cfg);
+    let welcome = |h: &mut ZoneHost<Arena>, version: Option<u32>, who: &str| {
+        let joined = match version {
+            Some(v) => h.speaking(v).join(&claims(who, "z1"), 0, ""),
+            None => h.join(&claims(who, "z1"), 0, ""),
+        }
+        .unwrap();
+        let frame = frames_for(&h.drain_outbound(), joined.client).remove(0);
+        let mut mirror = ClientMirror::speaking(version.unwrap_or(2));
+        match mirror.apply(&frame).unwrap() {
+            ServerMessage::Welcome(w) => w,
+            other => panic!("{other:?}"),
+        }
+    };
+    let v1 = welcome(&mut h, Some(1), "ana");
+    assert_eq!((v1.protocol_version, v1.features, v1.origin), (1, 0, None));
+    let v2 = welcome(&mut h, None, "bo");
+    assert_eq!(v2.protocol_version, 2);
+    assert_eq!(v2.features & feature::FOCUS, feature::FOCUS);
+    assert_eq!(v2.origin, Some(Origin::new(120.0, -40.0)));
+    // `speaking` applies to one admission: a failed one consumes it too.
+    assert!(h
+        .speaking(1)
+        .join(&claims("cy", "elsewhere"), 0, "")
+        .is_err());
+    assert_eq!(welcome(&mut h, None, "cy").protocol_version, 2);
+}
+
+#[test]
 fn same_principal_replaces_previous_connection() {
     let clock = ManualClock::new();
     let mut h = host(HostConfig::default(), &clock, ArenaConfig::default());

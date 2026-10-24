@@ -14,7 +14,7 @@ use crate::claims::TicketExtensions;
 use crate::facts::FactSettlement;
 use crate::host::Ctx;
 use crate::interest::View;
-use crate::protocol::Role;
+use crate::protocol::{Origin, Role};
 use crate::replication::WorldView;
 use crate::rewind::RewindFrame;
 use crate::schema::EntitySchema;
@@ -295,6 +295,17 @@ pub trait Zone: Sized + Send + 'static {
         if let Some(view) = ctx.view_of(observer) {
             ctx.set_view(observer, View::new(x, y, view.radius));
         }
+    }
+
+    /// Where this zone sits in the world: the world position of its local
+    /// (0, 0), for zones whose positions are local to a place in one
+    /// continuous world (a grid of rooms, map tiles). Sent in Welcome, so a
+    /// client that knows where its player is focuses every neighbour it
+    /// watches by itself. Derive it from the
+    /// zone's config (e.g. the room parsed from its zone id). `None`
+    /// (default): the zone is not placed and clients focus it only by hand.
+    fn origin(&self) -> Option<Origin> {
+        None
     }
 
     /// Decode raw input bytes from the wire; `None` drops the input.

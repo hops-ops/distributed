@@ -33,7 +33,7 @@ use crate::facts::{
 use crate::handoff::{HandoffRequest, Transfer};
 use crate::inbox::ZoneInbound;
 use crate::netsim::{DelayLine, NetSim, NetSimJson};
-use crate::protocol::{error, ClientMessage, Notice, Role, ServerMessage, PROTOCOL_VERSION};
+use crate::protocol::{error, supports_protocol, ClientMessage, Notice, Role, ServerMessage};
 use crate::stamp::FactStamp;
 use crate::ticket::{NonceCache, TicketKey, VerifiedTicket};
 use crate::world::content_rollout::{zone_step, ContentState, ZoneStep, CONTENT_ROLLOUT_KIND};
@@ -1629,8 +1629,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
     }
 
     async fn hello(&self, ws: &WebSocket, hello: crate::protocol::Hello) -> Result<()> {
-        if hello.protocol_version != PROTOCOL_VERSION {
-            reject(ws, error::VERSION_MISMATCH, "protocol version");
+        // Answer in the client's version; refuse others before the ticket
+        // is touched, so the client can retry with an older one (§6.0).
+        if !supports_protocol(hello.protocol_version) {
+            let message = format!("protocol {} unsupported", hello.protocol_version);
+            reject(ws, error::VERSION_MISMATCH, &message);
             return Ok(());
         }
         let cold = self.inner.borrow().host.is_none();
@@ -1733,6 +1736,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 reject(ws, error::ZONE_UNAVAILABLE, "zone asleep");
                 return Ok(());
             };
+            let host = host.speaking(hello.protocol_version);
             match &transfer {
                 Some(transfer) => {
                     host.join_transfer(transfer, hello.capabilities, &hello.content_version)
@@ -1746,11 +1750,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 reject(ws, error::RECONNECT_FAILED, "zone restarted; rejoin");
                 return Ok(());
             };
-            host.reconnect_with_version(
-                &hello.reconnect_token,
-                hello.capabilities,
-                &hello.content_version,
-            )
+            host.speaking(hello.protocol_version)
+                .reconnect_with_version(
+                    &hello.reconnect_token,
+                    hello.capabilities,
+                    &hello.content_version,
+                )
         };
         match joined {
             Ok(joined) => {

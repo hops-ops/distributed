@@ -5,8 +5,28 @@ use std::collections::BTreeMap;
 use super::wire::{DecodeError, Reader, Writer};
 use crate::schema::{EntitySchema, FieldValue};
 
-/// Wire protocol version spoken by this crate.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Newest wire protocol version spoken by this crate (what its clients
+/// offer in Hello).
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Oldest protocol version this crate's servers still answer
+/// (`PROTOCOL.md` §6.0): a v1 client gets a v1 Welcome.
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
+
+/// Whether this crate's servers answer a Hello offering `version`.
+pub fn supports_protocol(version: u32) -> bool {
+    (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
+}
+
+/// Runtime feature bits a server announces in Welcome v2 (`features`).
+/// Unlike Hello's game-defined `capabilities`, the runtime defines these: a
+/// client sends a message a feature covers only when the bit is set.
+pub mod feature {
+    /// The server handles `Focus` (observers steer their view).
+    pub const FOCUS: u32 = 1 << 0;
+    /// Every feature this crate's runtime implements.
+    pub const ALL: u32 = FOCUS;
+}
 
 /// Message type bytes.
 pub mod tag {
@@ -99,7 +119,10 @@ pub mod error {
 /// Client handshake.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Hello {
-    /// Must equal [`PROTOCOL_VERSION`].
+    /// The newest protocol version the client speaks; the server answers
+    /// in it or refuses with `Error(VERSION_MISMATCH)` (message starting
+    /// `protocol`) before touching the ticket, and the client may retry
+    /// with an older one. See [`supports_protocol`].
     pub protocol_version: u32,
     /// Game content version the client was built against.
     pub content_version: String,
@@ -252,9 +275,41 @@ pub enum Role {
     Observer,
 }
 
+/// Where a zone sits in the world: its origin in world coordinates, so
+/// world = origin + zone-local (`Zone::origin`). Clients use it to say
+/// where their player is in a neighbour's coordinates (`Focus`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Origin {
+    /// World x of the zone's local (0, 0).
+    pub x: f64,
+    /// World y of the zone's local (0, 0).
+    pub y: f64,
+}
+
+impl Origin {
+    /// Origin at world `(x, y)`.
+    pub fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+
+    /// A world point in this zone's local coordinates.
+    pub fn to_local(self, x: f64, y: f64) -> (f32, f32) {
+        ((x - self.x) as f32, (y - self.y) as f32)
+    }
+
+    /// A zone-local point in world coordinates.
+    pub fn to_world(self, x: f32, y: f32) -> (f64, f64) {
+        (self.x + f64::from(x), self.y + f64::from(y))
+    }
+}
+
 /// Server handshake reply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Welcome {
+    /// Protocol version this Welcome is encoded in: the client's Hello
+    /// version (not itself on the wire; decoders take it from the mirror,
+    /// [`EntityKinds::protocol_version`]).
+    pub protocol_version: u32,
     /// Opaque session id (stable across reconnects of the same player).
     pub session_id: String,
     /// Zone joined.
@@ -275,6 +330,11 @@ pub struct Welcome {
     pub content_version: String,
     /// Replicated entity schema.
     pub schema: EntitySchema,
+    /// v2: runtime features of the server ([`feature`]); 0 in v1.
+    pub features: u32,
+    /// v2: where the zone sits in the world, when it says
+    /// (`Zone::origin`); always `None` in v1.
+    pub origin: Option<Origin>,
 }
 
 /// Full entity state for a create.
@@ -381,8 +441,14 @@ pub enum ServerMessage {
     },
 }
 
-/// What a Delta decoder/encoder needs to know about the client's view.
+/// What a decoder/encoder needs to know about the client's view: the
+/// negotiated protocol version (Welcome), the schema and the known ids
+/// (Deltas).
 pub trait EntityKinds {
+    /// Protocol version the server answers in (default: the newest).
+    fn protocol_version(&self) -> u32 {
+        PROTOCOL_VERSION
+    }
     /// Schema from the Welcome.
     fn schema(&self) -> Option<&EntitySchema>;
     /// Kind of a known entity id.
@@ -429,6 +495,12 @@ impl ServerMessage {
                     .string(&m.reconnect_token)
                     .string(&m.content_version);
                 m.schema.encode(&mut w);
+                if m.protocol_version >= 2 {
+                    w.varuint(m.features).bool(m.origin.is_some());
+                    if let Some(origin) = m.origin {
+                        w.f64(origin.x).f64(origin.y);
+                    }
+                }
             }
             Self::Delta(d) => encode_delta(&mut w, d, kinds)?,
             Self::Event { type_id, payload } => {
@@ -476,22 +548,7 @@ impl ServerMessage {
     pub fn decode(bytes: &[u8], kinds: &dyn EntityKinds) -> Result<Self, DecodeError> {
         let mut r = Reader::new(bytes);
         let message = match r.u8()? {
-            tag::WELCOME => Self::Welcome(Welcome {
-                session_id: r.string()?,
-                zone_id: r.string()?,
-                role: match r.u8()? {
-                    0 => Role::Player,
-                    1 => Role::Observer,
-                    _ => return Err(DecodeError::Invalid("role")),
-                },
-                tick_rate: r.varuint()?,
-                patch_rate: r.varuint()?,
-                server_tick: r.varuint()?,
-                server_time: r.f64()?,
-                reconnect_token: r.string()?,
-                content_version: r.string()?,
-                schema: EntitySchema::decode(&mut r)?,
-            }),
+            tag::WELCOME => Self::Welcome(decode_welcome(&mut r, kinds.protocol_version())?),
             tag::DELTA => Self::Delta(decode_delta(&mut r, kinds)?),
             tag::EVENT => Self::Event {
                 type_id: r.varuint()?,
@@ -534,6 +591,38 @@ impl ServerMessage {
         r.finish()?;
         Ok(message)
     }
+}
+
+fn decode_welcome(r: &mut Reader<'_>, protocol_version: u32) -> Result<Welcome, DecodeError> {
+    let mut welcome = Welcome {
+        protocol_version,
+        session_id: r.string()?,
+        zone_id: r.string()?,
+        role: match r.u8()? {
+            0 => Role::Player,
+            1 => Role::Observer,
+            _ => return Err(DecodeError::Invalid("role")),
+        },
+        tick_rate: r.varuint()?,
+        patch_rate: r.varuint()?,
+        server_tick: r.varuint()?,
+        server_time: r.f64()?,
+        reconnect_token: r.string()?,
+        content_version: r.string()?,
+        schema: EntitySchema::decode(r)?,
+        features: 0,
+        origin: None,
+    };
+    if protocol_version >= 2 {
+        welcome.features = r.varuint()?;
+        if r.bool()? {
+            welcome.origin = Some(Origin {
+                x: r.f64()?,
+                y: r.f64()?,
+            });
+        }
+    }
+    Ok(welcome)
 }
 
 fn kind_lookup(
@@ -651,8 +740,11 @@ pub struct MirrorEntity {
 ///
 /// This is the normative behaviour a client implementation (e.g. JS) must
 /// match; it is also what the crate's own tests use.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ClientMirror {
+    /// Protocol version the client offered in Hello (Welcomes decode in
+    /// it); [`PROTOCOL_VERSION`] by default.
+    pub protocol_version: u32,
     /// Last Welcome.
     pub welcome: Option<Welcome>,
     /// Known entities.
@@ -663,7 +755,22 @@ pub struct ClientMirror {
     pub ack_seq: u32,
 }
 
+impl Default for ClientMirror {
+    fn default() -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            welcome: None,
+            entities: BTreeMap::new(),
+            server_tick: 0,
+            ack_seq: 0,
+        }
+    }
+}
+
 impl EntityKinds for ClientMirror {
+    fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
     fn schema(&self) -> Option<&EntitySchema> {
         self.welcome.as_ref().map(|w| &w.schema)
     }
@@ -676,6 +783,14 @@ impl ClientMirror {
     /// Empty mirror.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Empty mirror of a client that offered `protocol_version` in Hello.
+    pub fn speaking(protocol_version: u32) -> Self {
+        Self {
+            protocol_version,
+            ..Self::default()
+        }
     }
 
     /// Decode a frame and apply it. Welcome resets all entities.
