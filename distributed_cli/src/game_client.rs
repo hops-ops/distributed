@@ -152,6 +152,8 @@ enum Correction {
     Ease {
         #[serde(rename = "durationMs")]
         duration_ms: u32,
+        #[serde(rename = "snapAbove", default)]
+        snap_above: Option<f32>,
     },
     Snap,
     Replace,
@@ -1056,9 +1058,17 @@ impl<'a> Gen<'a> {
             let _ = writeln!(out, "\t{}: {{", key(&kind.name));
             for (field, correction) in corrected {
                 let policy = match correction {
-                    Correction::Ease { duration_ms } => {
-                        format!("{{ mode: 'ease', durationMs: {duration_ms} }}")
-                    }
+                    Correction::Ease {
+                        duration_ms,
+                        snap_above: None,
+                    } => format!("{{ mode: 'ease', durationMs: {duration_ms} }}"),
+                    Correction::Ease {
+                        duration_ms,
+                        snap_above: Some(above),
+                    } => format!(
+                        "{{ mode: 'ease', durationMs: {duration_ms}, snapAbove: {} }}",
+                        f32_literal(*above)
+                    ),
                     Correction::Snap => "{ mode: 'snap' }".into(),
                     Correction::Replace => "{ mode: 'replace' }".into(),
                 };

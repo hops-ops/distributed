@@ -15,7 +15,9 @@
 #   tests/e2e-ui/crates/*-domain, examples/game/server/crawler,
 #   game_services/crates/*-domain, game_services/crates/kernel
 # plus the framework crates domains depend on: distributed (no features) and
-# distributed_game (no features; the FactCommand derive).
+# distributed_game (no features; the FactCommand derive), and distributed_game
+# with `celld-zone` (the celld zone host: zones as Durable Objects), plus the
+# game zones hosted that way (examples/game/server/rooms).
 #
 # Excluded, with the reason (a crate here never runs in a cell):
 #   tests/e2e-ui/crates/blob-domain  e2e-ui blob game host: its `domain`
@@ -34,6 +36,7 @@ manifests() {
   echo distributed_game/Cargo.toml
   for manifest in tests/e2e-ui/crates/*-domain/Cargo.toml \
     examples/game/server/crawler/Cargo.toml \
+    examples/game/server/rooms/Cargo.toml \
     game_services/crates/*-domain/Cargo.toml \
     game_services/crates/kernel/Cargo.toml; do
     case "$manifest" in
@@ -64,6 +67,14 @@ for manifest in $(manifests); do
     failed=1
   fi
 done
+
+# The celld zone host is wasm32 code by design.
+printf '==> wasm32 distributed_game/Cargo.toml --features celld-zone\n'
+if ! "$cargo" build --quiet --lib --target "$target" --manifest-path distributed_game/Cargo.toml \
+  --target-dir "$target_dir" --no-default-features --features celld-zone; then
+  printf 'FAIL: distributed_game with celld-zone does not build for %s\n' "$target" >&2
+  failed=1
+fi
 
 fixture=tests/fixtures/wasm32-native-domain/Cargo.toml
 printf '==> negative fixture %s (must fail)\n' "$fixture"

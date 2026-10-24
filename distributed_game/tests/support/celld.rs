@@ -26,13 +26,23 @@ pub struct Celld {
 
 impl Celld {
     pub fn start_new() -> Option<Self> {
-        let build = worker_dir().join("build");
+        Self::start_worker(&worker_dir(), "CELLD_FACTS_REQUIRED")
+    }
+
+    /// `celld dev` serving the built worker in `dir`; skips (None) when it
+    /// is not built or celld cannot start, unless env `required` is set.
+    pub fn start_worker(dir: &Path, required: &str) -> Option<Self> {
+        let build = dir.join("build");
         if !build.join("worker/shim.mjs").exists() {
             assert!(
-                std::env::var_os("CELLD_FACTS_REQUIRED").is_none(),
-                "CELLD_FACTS_REQUIRED is set but the fact worker is not built"
+                std::env::var_os(required).is_none(),
+                "{required} is set but {} is not built",
+                dir.display()
             );
-            eprintln!("skipping celld fact routing: build tests/celld/fact-worker first");
+            eprintln!(
+                "skipping: build {} first (worker-build --release)",
+                dir.display()
+            );
             return None;
         }
         let project = std::env::temp_dir().join(format!(
@@ -44,11 +54,7 @@ impl Celld {
                 .as_nanos()
         ));
         copy_dir(&build, &project.join("build"));
-        std::fs::copy(
-            worker_dir().join("wrangler.jsonc"),
-            project.join("wrangler.jsonc"),
-        )
-        .unwrap();
+        std::fs::copy(dir.join("wrangler.jsonc"), project.join("wrangler.jsonc")).unwrap();
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -62,10 +68,10 @@ impl Celld {
         };
         if let Err(reason) = celld.start() {
             assert!(
-                std::env::var_os("CELLD_FACTS_REQUIRED").is_none(),
+                std::env::var_os(required).is_none(),
                 "celld dev is required but did not start: {reason}"
             );
-            eprintln!("skipping celld fact routing: {reason}");
+            eprintln!("skipping: {reason}");
             return None;
         }
         Some(celld)
@@ -100,7 +106,10 @@ impl Celld {
         let log = std::fs::File::create(&log_path).unwrap();
         let child = Command::new(&binary)
             .args(&args)
-            .env("RUST_LOG", "warn")
+            .env(
+                "RUST_LOG",
+                std::env::var("CELLD_RUST_LOG").unwrap_or_else(|_| "warn".into()),
+            )
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log)
@@ -200,7 +209,7 @@ impl Drop for Celld {
     }
 }
 
-fn copy_dir(from: &Path, to: &Path) {
+pub fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
@@ -213,7 +222,7 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-fn blocking_get(url: &str) -> Option<u16> {
+pub fn blocking_get(url: &str) -> Option<u16> {
     let url = url.strip_prefix("http://")?;
     let (host, path) = url.split_once('/')?;
     let mut stream = std::net::TcpStream::connect(host).ok()?;

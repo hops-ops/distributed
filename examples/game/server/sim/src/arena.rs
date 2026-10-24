@@ -1,10 +1,11 @@
-//! The Arena's deterministic movement step, shared by every demo with an
-//! Arena capsule (Arena, Mob Pit, The Freeze, Boss Ripple).
+//! The planar capsule movement (stick, dash, round obstacles) under Mob
+//! Pit's predicted step ([`crate::mobpit::pit_step`]), with the 40 m floor
+//! it was born on (the first Arena demo's; [`step`] keeps its closed walls
+//! for the unit tests here).
 //!
-//! The server runs [`step`] in `on_tick`; the browser predicts its own
-//! capsule with the **same code** compiled to WebAssembly ([`arena_step`]
-//! is the `#[predict]` declaration; `distributed game-wasm` builds it).
-//! Prediction is exact because:
+//! The server runs it in `on_tick`; the browser predicts its own capsule
+//! with the **same code** compiled to WebAssembly. Prediction is exact
+//! because:
 //!
 //! - one input = one command frame of exactly [`DT`] seconds, independent
 //!   of the server's measured tick length (the frame's `dt` is ignored);
@@ -17,7 +18,7 @@
 //!   `tests/prediction-wasm.test.mjs` proves it against the native build
 //!   over recorded input streams.
 
-use distributed_game::{predict, FieldType, GameInput, GameRecord};
+use distributed_game::{FieldType, GameInput, GameRecord};
 
 /// Command frame length (s): the 30 Hz tick.
 pub const DT: f32 = 1.0 / 30.0;
@@ -62,8 +63,7 @@ pub struct Pillar {
     pub r: f32,
 }
 
-/// What the pages draw of the Arena floor (generated `ARENA_FLOOR`, shared by
-/// every page with an Arena capsule): the simulation's own constants.
+/// The floor's constants (Mob Pit's `pit_world` carries its pillars).
 #[derive(Debug, Clone, PartialEq, GameRecord)]
 pub struct ArenaFloor {
     /// Floor half extent (m).
@@ -76,7 +76,7 @@ pub struct ArenaFloor {
     pub pillars: Vec<Pillar>,
 }
 
-/// The `ARENA_FLOOR` constant.
+/// The floor.
 pub fn arena_floor() -> ArenaFloor {
     ArenaFloor {
         half: HALF,
@@ -131,15 +131,21 @@ pub struct MoveState {
     pub cd: u8,
 }
 
-/// The client-predicted step of every Arena capsule (`player` kinds whose
-/// zone takes a plain [`MoveInput`]: Arena, The Freeze).
-#[predict(ArenaStep, kind = "player")]
-pub fn arena_step(state: &MoveState, input: &MoveInput, _context: &(), _dt: f32) -> MoveState {
-    step(*state, *input)
-}
-
 /// Advance one command frame.
 pub fn step(s: MoveState, input: MoveInput) -> MoveState {
+    canonicalize(clamp_walls(advance(s, input)))
+}
+
+/// One command frame of stick, dash and pillars, without the walls and
+/// unsnapped.
+pub fn advance(s: MoveState, input: MoveInput) -> MoveState {
+    advance_among(s, input, &PILLARS)
+}
+
+/// [`advance`] among round obstacles `(x, y, radius)`: the part Mob Pit
+/// shares (its rooms have seeded obstacles and doorways in the walls, see
+/// `mobpit::pit_step`).
+pub fn advance_among(s: MoveState, input: MoveInput, obstacles: &[(f32, f32, f32)]) -> MoveState {
     let mut s = s;
     // Stick direction, length clamped to 1.
     let mut dx = f32::from(input.mx) / 127.0;
@@ -192,7 +198,7 @@ pub fn step(s: MoveState, input: MoveInput) -> MoveState {
     s.x += s.vx * DT;
     s.y += s.vy * DT;
 
-    for (px, py, pr) in PILLARS {
+    for &(px, py, pr) in obstacles {
         let ox = s.x - px;
         let oy = s.y - py;
         let d2 = ox * ox + oy * oy;
@@ -213,7 +219,12 @@ pub fn step(s: MoveState, input: MoveInput) -> MoveState {
             }
         }
     }
+    s
+}
 
+/// The Arena's closed walls.
+fn clamp_walls(s: MoveState) -> MoveState {
+    let mut s = s;
     let lim = HALF - PLAYER_RADIUS;
     if s.x < -lim {
         s.x = -lim;
@@ -229,10 +240,11 @@ pub fn step(s: MoveState, input: MoveInput) -> MoveState {
         s.y = lim;
         s.vy = s.vy.min(0.0);
     }
-    canonicalize(s)
+    s
 }
 
-fn snap(ty: FieldType, v: f32) -> f32 {
+/// Snap `v` to the precision of wire type `ty`.
+pub fn snap(ty: FieldType, v: f32) -> f32 {
     match ty {
         FieldType::QuantF32 { min, max, bits } => FieldType::dequantize_linear(
             FieldType::quantize_linear(v, min, max, bits),

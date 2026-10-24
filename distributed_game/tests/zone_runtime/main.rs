@@ -26,6 +26,7 @@ fn claims(principal: &str, zone: &str) -> TicketClaims {
         role: Role::Player,
         name: None,
         extensions: Default::default(),
+        wake: false,
     }
 }
 
@@ -115,9 +116,16 @@ fn fixed_timestep_caps_catch_up_and_patches_independently() {
 
     // A 2s stall runs at most 5 steps and drops the rest.
     clock.advance(Duration::from_secs(2));
+    let seen = h.zone().dropped_seen.len();
     let report = h.advance();
     assert_eq!(report.ticks, 5);
     assert!(report.dropped >= Duration::from_millis(1_900));
+    // The first tick after the stall sees the dropped ticks, the rest none.
+    assert_eq!(
+        h.zone().dropped_seen[seen..],
+        [report.dropped_ticks, 0, 0, 0, 0]
+    );
+    assert_eq!(report.dropped_ticks, 95);
 
     // Steady state: 1s in 2 ms frames = 50 ticks, 10 patches.
     let (mut ticks, mut patches) = (0, 0);
@@ -563,6 +571,78 @@ fn observers_receive_deltas_without_owning_a_player() {
     );
     h.disconnect(o.client, false);
     assert!(h.zone().log.contains(&"unobserve:watcher".to_string()));
+}
+
+/// An observer's mirror after a few patches (entity count).
+fn observed(h: &mut ZoneHost<Arena>, clock: &ManualClock, mirror: &mut ClientMirror, o: ClientId) {
+    for _ in 0..4 {
+        clock.advance(MS(100));
+        h.advance();
+        for frame in frames_for(&h.drain_outbound(), o) {
+            mirror.apply(&frame).unwrap();
+        }
+    }
+}
+
+#[test]
+fn focus_gives_an_observer_the_zones_view_radius() {
+    for (view_radius, seen) in [(None, 1), (Some(5.0), 0)] {
+        let clock = ManualClock::new();
+        let cfg = ArenaConfig {
+            view_radius,
+            ..ArenaConfig::default()
+        };
+        let mut h = host(HostConfig::default(), &clock, cfg);
+        h.join(&claims("alice", "z1"), 0, "").unwrap();
+        let mut obs = claims("watcher", "z1");
+        obs.role = Role::Observer;
+        let o = h.join(&obs, 0, "").unwrap();
+        let mut mirror = ClientMirror::new();
+        observed(&mut h, &clock, &mut mirror, o.client);
+        assert_eq!(mirror.entities.len(), 1, "the whole arena before Focus");
+        // Alice is 10..90 on both axes: 20 m beyond the corner is out of a
+        // 5 m view, inside the observer's own 1000 m one.
+        h.observer_focus(o.client, -20.0, -20.0);
+        observed(&mut h, &clock, &mut mirror, o.client);
+        assert_eq!(mirror.entities.len(), seen, "view radius {view_radius:?}");
+    }
+}
+
+#[test]
+fn welcome_is_encoded_in_the_clients_protocol_version() {
+    use distributed_game::protocol::feature;
+    use distributed_game::Origin;
+    let clock = ManualClock::new();
+    let cfg = ArenaConfig {
+        origin: Some(Origin::new(120.0, -40.0)),
+        ..ArenaConfig::default()
+    };
+    let mut h = host(HostConfig::default(), &clock, cfg);
+    let welcome = |h: &mut ZoneHost<Arena>, version: Option<u32>, who: &str| {
+        let joined = match version {
+            Some(v) => h.speaking(v).join(&claims(who, "z1"), 0, ""),
+            None => h.join(&claims(who, "z1"), 0, ""),
+        }
+        .unwrap();
+        let frame = frames_for(&h.drain_outbound(), joined.client).remove(0);
+        let mut mirror = ClientMirror::speaking(version.unwrap_or(2));
+        match mirror.apply(&frame).unwrap() {
+            ServerMessage::Welcome(w) => w,
+            other => panic!("{other:?}"),
+        }
+    };
+    let v1 = welcome(&mut h, Some(1), "ana");
+    assert_eq!((v1.protocol_version, v1.features, v1.origin), (1, 0, None));
+    let v2 = welcome(&mut h, None, "bo");
+    assert_eq!(v2.protocol_version, 2);
+    assert_eq!(v2.features & feature::FOCUS, feature::FOCUS);
+    assert_eq!(v2.origin, Some(Origin::new(120.0, -40.0)));
+    // `speaking` applies to one admission: a failed one consumes it too.
+    assert!(h
+        .speaking(1)
+        .join(&claims("cy", "elsewhere"), 0, "")
+        .is_err());
+    assert_eq!(welcome(&mut h, None, "cy").protocol_version, 2);
 }
 
 #[test]

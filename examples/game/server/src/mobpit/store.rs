@@ -1,46 +1,38 @@
-//! Mob Pit's durable state lives in celld cells (`examples/game/cells`);
-//! this module is the zone server's side of them.
+//! Mob Pit's durable state lives in celld cells (`examples/game/cells`),
+//! next to the rooms that feed them: a room's kill and lifecycle facts go
+//! to the killer's `crawler/{principal}` and `presence/{principal}` cells
+//! object to object (`mobpit_rooms`, `distributed_game::celld_zone`).
 //!
-//! - [`MobPitFactSink`] is the game's `FactSink`: optional artificial
-//!   latency (the "slow storage" toggle), then
-//!   `distributed_game::celld::CelldFactSink` (the command fact sink over a
-//!   remote-only celld command host) sends the fact over the internal path
-//!   to its cell — `crawler.record_kill` to `crawler/{principal}`
-//!   (`FactRoute::by_principal`), the runtime's
-//!   player lifecycle facts to `presence/{principal}` (`lifecycle_route`) —
-//!   then a fire-and-forget leaderboard update. The command id comes from
-//!   the fact key, so a retry replays through the cell's command ledger
-//!   instead of crediting twice; celld slow or down keeps facts in the
-//!   zone's queue (`RetryPolicy::until_settled`), never in a local store.
-//! - Each kill commit also writes the `crawler.mob_killed` domain event to
-//!   the cell's outbox in the same cell transaction. celld drains it to the
-//!   `game-demo-outbox` Queue; the worker's consumer relays every message to
-//!   this server's authenticated `/internal/celld-queue/relay`
-//!   (`crate::common::relay`), which publishes it onto the projection bus.
-//!   `mobpit-service` and this server's [`super::directory`] project it
-//!   (the crawler list). [`CrawlerCells`] reads one cell by principal
-//!   (profiles, the board rebuild's kill histories).
+//! Each kill commit writes the `crawler.mob_killed` domain event to the
+//! cell's outbox in the same cell transaction. celld drains it to the
+//! `game-demo-outbox` Queue; the worker's consumer relays every message to
+//! this server's authenticated `/internal/celld-queue/relay`
+//! (`crate::common::relay`), which publishes it onto the projection bus.
+//! `mobpit-service` and this server's [`super::directory`] project it (the
+//! crawler list, which feeds the leaderboard). [`CrawlerCells`] reads one
+//! cell by principal (the board rebuild's kill histories, presence).
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
-use distributed_game::celld::{CelldFactSink, FactRoute};
-use distributed_game::lifecycle::Lifecycle;
-use distributed_game::{BoxFuture, Fact, FactError, FactReceipt, FactSink};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::board::Leaderboards;
-use super::crawler::{KillReceipt, RecordKillInput, CRAWLER_KIND, PRESENCE_KIND, RECORD_KILL};
-use super::presence::Presence;
+use super::crawler::{RecordKillInput, CRAWLER_KIND, PRESENCE_KIND};
+use distributed_game::celld::{CelldFactSink, FactRoute};
 
-/// Command-ledger service id for game facts.
-pub const SERVICE_ID: &str = "mobpit";
-/// Principal for facts without a player (none are emitted today).
-pub const SYSTEM_PRINCIPAL: &str = "mobpit-zone";
+/// Kill facts into the Crawler cells over celld's internal HTTP path, the
+/// route a room uses object to object (tests and tools; rooms send theirs
+/// from inside celld). Command-ledger service `mobpit-tools`.
+pub fn kill_sink(celld: &CelldOptions) -> Result<CelldFactSink, String> {
+    Ok(CelldFactSink::celld(
+        celld.url.clone(),
+        celld.secret.clone(),
+        "mobpit-tools",
+        "mobpit-tools",
+    )?
+    .route(FactRoute::by_principal::<RecordKillInput>(CRAWLER_KIND)))
+}
 
 pub use crate::common::CelldOptions;
 
@@ -134,6 +126,98 @@ impl CrawlerCells {
         Ok(body)
     }
 
+    /// The rooms' dev settings under `shard` (`distributed_game::celld_zone`'s
+    /// `zone-dev` object; `{}` when unset).
+    pub async fn dev_settings(&self, shard: &str) -> Result<Value, String> {
+        self.get(distributed_game::netsim::ZONE_DEV_KIND, shard)
+            .await
+    }
+
+    /// Replace the rooms' dev settings under `shard` (every room reads them
+    /// within a second).
+    pub async fn set_dev_settings(&self, shard: &str, value: &Value) -> Result<Value, String> {
+        let url = format!(
+            "{}/{}/{}",
+            self.base,
+            distributed_game::netsim::ZONE_DEV_KIND,
+            encode_segment(shard)
+        );
+        let response = self
+            .client
+            .put(&url)
+            .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
+            .json(value)
+            .send()
+            .await
+            .map_err(|error| format!("celld unreachable at {url}: {error}"))?;
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            return Err(format!("PUT {url}: HTTP {status}: {body}"));
+        }
+        Ok(body)
+    }
+
+    /// A tier cell's state (`kind` = hood / borough / city; `null` before
+    /// its first event).
+    pub async fn tier(&self, kind: &str, shard: &str) -> Result<Value, String> {
+        Ok(self.get(kind, shard).await?["state"].take())
+    }
+
+    /// The world's content rollout (`content-rollout/{world}`: live
+    /// version, phase, notes; `null` before the first rollout).
+    pub async fn content(&self, world: &str) -> Result<Value, String> {
+        Ok(self
+            .get(
+                distributed_game::world::content_rollout::CONTENT_ROLLOUT_KIND,
+                world,
+            )
+            .await?["state"]
+            .take())
+    }
+
+    /// Run `command` on the cell `kind/shard` as `principal` (an internal
+    /// session the caller vouches for, e.g. an admin it authenticated).
+    /// Returns the HTTP status and the cell's answer.
+    pub async fn command(
+        &self,
+        kind: &str,
+        shard: &str,
+        command: &str,
+        principal: &str,
+        input: &Value,
+    ) -> Result<(u16, Value), String> {
+        let url = format!(
+            "{}/{}/{}/{}",
+            self.base,
+            kind,
+            encode_segment(shard),
+            command
+        );
+        let command_id =
+            distributed_game::cell::command_id_for("mobpit-admin", &crate::common::random_hex(16));
+        let response = self
+            .client
+            .post(&url)
+            .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
+            .header(
+                distributed::cell_host::CELL_SERVICE_ID_HEADER,
+                "mobpit-admin",
+            )
+            .header(
+                distributed::cell_host::CELL_PRINCIPAL_PARTITION_HEADER,
+                principal,
+            )
+            .header(distributed::USER_ID_KEY, principal)
+            .json(&serde_json::json!({ "commandId": command_id, "input": input }))
+            .send()
+            .await
+            .map_err(|error| format!("celld unreachable at {url}: {error}"))?;
+        let status = response.status().as_u16();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
     /// The durable presence entry of `principal` (`null` when none).
     pub async fn presence(&self, principal: &str) -> Result<Value, String> {
         Ok(self.get(PRESENCE_KIND, principal).await?["current"].take())
@@ -157,193 +241,4 @@ fn encode_segment(segment: &str) -> String {
         }
     }
     encoded
-}
-
-/// A committed kill as the dev routes report it.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommittedFact {
-    /// Fact idempotency key.
-    pub key: String,
-    /// Command input as committed (needed to replay the exact command).
-    pub input: serde_json::Value,
-    /// Receipt.
-    pub receipt: KillReceipt,
-    /// True when the ledger replayed an earlier commit.
-    pub replayed: bool,
-}
-
-/// Counters of the fact sink.
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SinkStats {
-    /// Commit attempts started.
-    pub attempts: u64,
-    /// First-time commits.
-    pub committed: u64,
-    /// Ledger replays (same key seen again).
-    pub replayed: u64,
-    /// Failed attempts (retryable or permanent).
-    pub errors: u64,
-    /// Facts currently inside `commit` (incl. the artificial latency).
-    pub in_sink: u64,
-    /// Lifecycle facts settled in presence cells (not counted above).
-    pub presence: u64,
-}
-
-/// Shared sink state (lives in the world).
-#[derive(Default)]
-pub struct SinkState {
-    latency_ms: AtomicU64,
-    stats: Mutex<SinkStats>,
-    recent: Mutex<VecDeque<CommittedFact>>,
-}
-
-impl SinkState {
-    /// Artificial storage latency.
-    pub fn latency(&self) -> Duration {
-        Duration::from_millis(self.latency_ms.load(Ordering::Relaxed))
-    }
-
-    /// Set the artificial storage latency (clamped to 5 s).
-    pub fn set_latency(&self, latency: Duration) -> Duration {
-        let ms = latency.as_millis().min(5_000) as u64;
-        self.latency_ms.store(ms, Ordering::Relaxed);
-        Duration::from_millis(ms)
-    }
-
-    /// Counter snapshot.
-    pub fn stats(&self) -> SinkStats {
-        self.stats.lock().expect("stats").clone()
-    }
-
-    /// Most recent commits, newest last (at most 64).
-    pub fn recent(&self) -> Vec<CommittedFact> {
-        self.recent
-            .lock()
-            .expect("recent")
-            .iter()
-            .cloned()
-            .collect()
-    }
-
-    fn update(&self, f: impl FnOnce(&mut SinkStats)) {
-        f(&mut self.stats.lock().expect("stats"));
-    }
-}
-
-/// The game's fact sink (cloned into every zone's fact worker).
-#[derive(Clone)]
-pub struct MobPitFactSink {
-    celld: CelldFactSink,
-    state: Arc<SinkState>,
-    board: Arc<Leaderboards>,
-    presence: Arc<Presence>,
-}
-
-impl MobPitFactSink {
-    /// Sink into the cells at `celld`, reporting into `state`, feeding
-    /// `board`, mirroring settled lifecycle facts into `presence`.
-    pub fn new(
-        celld: &CelldOptions,
-        state: Arc<SinkState>,
-        board: Arc<Leaderboards>,
-        presence: Arc<Presence>,
-    ) -> Result<Self, String> {
-        let sink = CelldFactSink::celld(
-            celld.url.clone(),
-            celld.secret.clone(),
-            SERVICE_ID,
-            SYSTEM_PRINCIPAL,
-        )?
-        .route(FactRoute::by_principal::<RecordKillInput>(CRAWLER_KIND))
-        .lifecycle_route(PRESENCE_KIND);
-        Ok(Self {
-            celld: sink,
-            state,
-            board,
-            presence,
-        })
-    }
-
-    async fn commit_kill(&self, fact: &Fact) -> Result<FactReceipt, FactError> {
-        let latency = self.state.latency();
-        if !latency.is_zero() {
-            tokio::time::sleep(latency).await;
-        }
-        if fact.principal().is_none() {
-            return Err(FactError::Permanent(
-                "kill facts need a player principal".into(),
-            ));
-        }
-        let receipt = self.celld.commit(fact).await?;
-        if fact.command() == RECORD_KILL {
-            if let Ok(kill) = serde_json::from_value::<KillReceipt>(receipt.payload.clone()) {
-                // Fire-and-forget: never awaits the leaderboard store.
-                self.board.submit_kill(&kill);
-                let mut recent = self.state.recent.lock().expect("recent");
-                if recent.len() == 64 {
-                    recent.pop_front();
-                }
-                recent.push_back(CommittedFact {
-                    key: fact.key().to_string(),
-                    input: fact.input().clone(),
-                    receipt: kill,
-                    replayed: receipt.replayed,
-                });
-            }
-        }
-        Ok(receipt)
-    }
-}
-
-impl FactSink for MobPitFactSink {
-    fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
-        Box::pin(async move {
-            // Runtime lifecycle facts go to the player's presence cell, not
-            // a Crawler cell (and not the kill counters); the settled ones
-            // are mirrored into the in-process presence view.
-            if let (Some(event), Some(principal)) = (Lifecycle::of(fact), fact.principal()) {
-                let receipt = self.celld.commit(fact).await?;
-                self.presence.apply(principal, fact.stamp(), &event);
-                self.state.update(|s| s.presence += 1);
-                return Ok(receipt);
-            }
-            self.state.update(|s| {
-                s.attempts += 1;
-                s.in_sink += 1;
-            });
-            let result = self.commit_kill(fact).await;
-            self.state.update(|s| {
-                s.in_sink -= 1;
-                match &result {
-                    Ok(r) if r.replayed => s.replayed += 1,
-                    Ok(_) => s.committed += 1,
-                    Err(_) => s.errors += 1,
-                }
-            });
-            result
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shards_cannot_add_path_segments() {
-        assert_eq!(encode_segment("guest-0a1b"), "guest-0a1b");
-        assert_eq!(encode_segment("odd:name"), "odd:name");
-        assert_eq!(encode_segment("a/b c"), "a%2Fb%20c");
-    }
-
-    #[test]
-    fn options_require_http_and_a_strong_secret() {
-        assert!(CelldOptions::new("ftp://x", "test-only-secret-0123456789abcdef").is_err());
-        assert!(CelldOptions::new("http://127.0.0.1:1", "short").is_err());
-        let ok =
-            CelldOptions::new("http://127.0.0.1:1/", "test-only-secret-0123456789abcdef").unwrap();
-        assert_eq!(ok.url, "http://127.0.0.1:1");
-    }
 }

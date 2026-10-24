@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+	GAME_CLOSE_RESTARTED,
 	GAME_PROTOCOL_VERSION,
 	GameClient,
 	GameConnection,
 	GameErrorCode,
+	GameFeature,
 	GameKickCode
 } from '@hops-ops/distributed/game';
 
@@ -19,7 +21,7 @@ import {
 } from './fixtures/game-harness.mjs';
 
 /** A scripted zone: tickets `t:<zone>:<n>` admit; tokens rotate per Welcome. */
-function scriptedServer(network, { graceTokens = true } = {}) {
+function scriptedServer(network, { graceTokens = true, closeOnError = true } = {}) {
 	const tokens = new Set();
 	let issued = 0;
 	network.onMessage = (conn, message) => {
@@ -27,12 +29,12 @@ function scriptedServer(network, { graceTokens = true } = {}) {
 			if (message.reconnectToken !== '') {
 				if (!graceTokens || !tokens.delete(message.reconnectToken)) {
 					conn.send({ type: 'Error', code: GameErrorCode.RECONNECT_FAILED, message: 'expired' });
-					conn.close(1008);
+					if (closeOnError) conn.close(1008);
 					return;
 				}
 			} else if (!message.ticket.startsWith(`t:${conn.zoneId}`) && !message.ticket.startsWith('transfer:')) {
 				conn.send({ type: 'Error', code: GameErrorCode.UNAUTHORIZED, message: 'bad ticket' });
-				conn.close(1008);
+				if (closeOnError) conn.close(1008);
 				return;
 			}
 			issued += 1;
@@ -80,7 +82,8 @@ test('handshake sends Hello with versions, capabilities and the app ticket', asy
 		contentVersion: 'c1',
 		capabilities: 5,
 		ticket: 't:z1:1',
-		reconnectToken: ''
+		reconnectToken: '',
+		near: false
 	});
 	assert.deepEqual(tickets, [{ zoneId: 'z1', role: 'player', reason: 'join' }]);
 	assert.deepEqual(states, ['connecting', 'open']);
@@ -89,6 +92,212 @@ test('handshake sends Hello with versions, capabilities and the app ticket', asy
 	await flush();
 	assert.deepEqual(network.last().inbox.at(-1), { type: 'Leave' }, 'clean close sends Leave');
 	assert.equal(conn.state, 'closed');
+});
+
+test('an observer says it is near in Hello and with Near, without reconnecting', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	network.onMessage = (conn, message) => {
+		if (message.type === 'Hello') conn.send(welcome({ zoneId: conn.zoneId, role: 'observer', serverTime: 10_000 }));
+	};
+	const { conn } = connection(network, scheduler, { role: 'observer', near: true });
+	await conn.connect();
+	const server = network.last();
+	assert.equal(server.lastHello.near, true);
+	assert.equal(conn.near, true);
+	conn.setNear(false);
+	conn.setNear(false);
+	conn.setNear(true);
+	assert.deepEqual(
+		server.inbox.filter((m) => m.type === 'Near'),
+		[
+			{ type: 'Near', near: false },
+			{ type: 'Near', near: true }
+		]
+	);
+	assert.equal(network.connections.length, 1, 'same socket');
+	conn.close();
+	// A player's nearness is never sent.
+	network.onMessage = (c, message) => {
+		if (message.type === 'Hello') c.send(welcome({ zoneId: c.zoneId, serverTime: 10_000 }));
+	};
+	const player = connection(network, scheduler).conn;
+	await player.connect();
+	player.setNear(true);
+	assert.deepEqual(network.last().inbox.filter((m) => m.type === 'Near'), []);
+	player.close();
+});
+
+test('an observer sends Focus throttled, and again after a reconnect', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	network.onMessage = (conn, message) => {
+		if (message.type === 'Hello') conn.send(welcome({ zoneId: conn.zoneId, role: 'observer', serverTime: 10_000 }));
+	};
+	const { conn } = connection(network, scheduler, { role: 'observer' });
+	await conn.connect();
+	const focus = () => network.last().inbox.filter((m) => m.type === 'Focus');
+	conn.setFocus(-25, 0);
+	// Within the interval, or moved too little: not sent.
+	conn.setFocus(-24, 0);
+	await scheduler.advance(250);
+	conn.setFocus(-25.125, 0);
+	conn.setFocus(-23, 1);
+	assert.deepEqual(focus(), [
+		{ type: 'Focus', x: -25, y: 0 },
+		{ type: 'Focus', x: -23, y: 1 }
+	]);
+	conn.setFocus(Number.NaN, 0);
+	assert.equal(focus().length, 2, 'non-finite focus is ignored');
+	// A new connection hears the last focus right after its Welcome.
+	network.last().close(1006, "lost");
+	await scheduler.advance(5_000);
+	assert.ok(network.connections.length >= 2, 'reconnected');
+	assert.deepEqual(focus(), [{ type: 'Focus', x: -23, y: 1 }]);
+	conn.close();
+	// A player's focus is never sent.
+	network.onMessage = (c, message) => {
+		if (message.type === 'Hello') c.send(welcome({ zoneId: c.zoneId, serverTime: 10_000 }));
+	};
+	const player = connection(network, scheduler).conn;
+	await player.connect();
+	player.setFocus(1, 2);
+	assert.deepEqual(network.last().inbox.filter((m) => m.type === 'Focus'), []);
+	player.close();
+});
+
+/**
+ * A server built before protocol 2 (what `distributed_game` answered then):
+ * any Hello but version 1 gets `Error(VERSION_MISMATCH)` and a close,
+ * before the ticket is looked at (`message`: native "protocol 2 != 1",
+ * celld "protocol version"). Records the tickets it admitted.
+ */
+function v1OnlyServer(network, { message = 'protocol version', closeCode = 1008, role = 'player' } = {}) {
+	const admitted = [];
+	network.onMessage = (conn, m) => {
+		if (m.type !== 'Hello') {
+			// An old celld zone refuses unknown messages (e.g. Focus) and closes.
+			if (m.type === 'Focus') {
+				conn.send({ type: 'Error', code: GameErrorCode.BAD_MESSAGE, message: 'bad message' });
+				conn.close(1008);
+			}
+			return;
+		}
+		if (m.protocolVersion !== 1) {
+			conn.send({ type: 'Error', code: GameErrorCode.VERSION_MISMATCH, message });
+			conn.close(closeCode);
+			return;
+		}
+		admitted.push(m.ticket || m.reconnectToken);
+		conn.send(
+			welcome({ zoneId: conn.zoneId, role, protocolVersion: 1, features: 0, reconnectToken: `rt-${admitted.length}`, serverTime: 10_000 })
+		);
+	};
+	return admitted;
+}
+
+test('offers protocol 2 and falls back once to 1 against a v1-only server', async () => {
+	for (const [message, closeCode] of [
+		['protocol version', 1008],
+		['protocol 2 != 1', 1005]
+	]) {
+		const network = new FakeNetwork();
+		const scheduler = new FakeScheduler();
+		const admitted = v1OnlyServer(network, { message, closeCode, role: 'observer' });
+		const url = `ws://old-${closeCode}.test/zones/z1`;
+		const { conn, tickets } = connection(network, scheduler, { url, role: 'observer' });
+		const errors = [];
+		const disconnects = [];
+		conn.on('error', (e) => errors.push(e));
+		conn.on('disconnect', (d) => disconnects.push(d));
+		const w = await conn.connect();
+		assert.equal(w.protocolVersion, 1);
+		assert.equal(conn.protocolVersion, 1);
+		assert.deepEqual(
+			network.connections.map((c) => c.lastHello.protocolVersion),
+			[2, 1],
+			'the same Hello again with 1'
+		);
+		assert.equal(network.connections[1].lastHello.ticket, network.connections[0].lastHello.ticket, 'same ticket');
+		assert.equal(tickets.length, 1, 'no new ticket fetched');
+		assert.deepEqual(admitted, ['t:z1:1']);
+		assert.deepEqual(errors, [], 'the refusal is not surfaced');
+		assert.deepEqual(disconnects, []);
+		assert.equal(conn.state, 'open');
+		// A v1 server has no FOCUS feature: Focus is never sent (an old
+		// celld zone would close the connection on it).
+		conn.setFocus(3, 4);
+		await scheduler.advance(300);
+		assert.deepEqual(network.last().inbox.filter((m) => m.type === 'Focus'), []);
+		assert.equal(conn.hasFeature(GameFeature.FOCUS), false);
+		// Remembered per host: a reconnect offers 1 at once.
+		network.last().close(1006, 'lost');
+		await scheduler.advance(5_000);
+		assert.equal(conn.state, 'open');
+		assert.deepEqual(
+			network.connections.slice(2).map((c) => c.lastHello.protocolVersion),
+			[1]
+		);
+		conn.close();
+	}
+});
+
+test('a content VERSION_MISMATCH still asks for a reload, without a protocol fallback', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	network.onMessage = (conn, m) => {
+		if (m.type === 'Hello') {
+			conn.send({ type: 'Error', code: GameErrorCode.VERSION_MISMATCH, message: 'content version c1 != c2: reload' });
+			conn.close(1008);
+		}
+	};
+	const { conn } = connection(network, scheduler, { url: 'ws://new.test/zones/z1' });
+	const reloads = [];
+	conn.on('reloadRequired', (r) => reloads.push(r.reason));
+	void conn.connect().catch(() => undefined);
+	await scheduler.advance(10);
+	assert.deepEqual(reloads, ['version-mismatch']);
+	assert.deepEqual(network.connections.map((c) => c.lastHello.protocolVersion), [2]);
+	conn.close();
+});
+
+test('setPosition focuses every observed zone that declares its origin', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	// Rooms 48 m wide: pit.<x>.<y> centred at (x, y) × 48; pit.9.9 is unplaced.
+	const origin = (zone) => {
+		const m = /^pit\.(-?\d+)\.(-?\d+)$/.exec(zone);
+		return m === null || zone === 'pit.9.9' ? undefined : { x: Number(m[1]) * 48, y: Number(m[2]) * 48 };
+	};
+	network.onMessage = (conn, m) => {
+		if (m.type !== 'Hello') return;
+		const role = m.ticket.endsWith(':observer') ? 'observer' : 'player';
+		const at = origin(conn.zoneId);
+		conn.send(welcome({ zoneId: conn.zoneId, role, serverTime: 10_000, ...(at ? { origin: at } : {}) }));
+	};
+	const client = gameClient(network, scheduler);
+	const focus = (zone) => network.last(zone).inbox.filter((m) => m.type === 'Focus').map(({ x, y }) => [x, y]);
+	await client.connect('pit.0.0');
+	await client.observe('pit.1.0');
+	await client.observe('pit.9.9');
+	// Local to the player's own room: (5, 3) there is (-43, 3) east.
+	client.setPosition(5, 3, 'pit.0.0');
+	assert.deepEqual(client.position, { x: 5, y: 3 });
+	assert.deepEqual(focus('pit.1.0'), [[-43, 3]]);
+	assert.deepEqual(focus('pit.9.9'), [], 'an unplaced zone is focused by hand only');
+	assert.deepEqual(focus('pit.0.0'), [], 'the own zone is not an observer');
+	// A zone observed later is focused right after its Welcome.
+	await client.observe('pit.0.-1');
+	assert.deepEqual(focus('pit.0.-1'), [[5, 51]]);
+	// World coordinates work too.
+	await scheduler.advance(250);
+	client.setPosition(40, -10);
+	assert.deepEqual(focus('pit.1.0').at(-1), [-8, -10]);
+	assert.deepEqual(focus('pit.0.-1').at(-1), [40, 38]);
+	// A zone whose origin is unknown cannot place a local position.
+	client.setPosition(1, 1, 'pit.7.7');
+	assert.deepEqual(client.position, { x: 40, y: -10 });
+	client.close();
 });
 
 test('ping/pong estimates offset, rtt and jitter', async () => {
@@ -214,6 +423,57 @@ test('reconnects with the token inside the grace window, then falls back to a fr
 	conn.close();
 });
 
+test('a refused Hello ends the attempt even when the server never closes the socket', async () => {
+	// E.g. a restarted zone refusing the old session's token: the error
+	// arrives, the close may not (seen with celld room objects).
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	const tokens = scriptedServer(network, { closeOnError: false });
+	const { conn, tickets } = connection(network, scheduler);
+	await conn.connect();
+	tokens.clear();
+	network.last().close(1006);
+	await scheduler.advance(10);
+	assert.equal(network.last().lastHello.reconnectToken, 'rt-1', 'tried the token');
+	await scheduler.advance(1000);
+	const hello = network.last().lastHello;
+	assert.equal(hello.reconnectToken, '', 'then a fresh ticket');
+	assert.equal(hello.ticket, `t:z1:${tickets.length}`);
+	assert.equal(conn.state, 'open');
+	conn.close();
+
+	// A refused first Hello rejects connect() instead of hanging.
+	const refused = new GameConnection({
+		url: 'ws://game.test/zones/z1',
+		zoneId: 'z1',
+		ticket: () => 'forged',
+		socket: network.factory,
+		scheduler,
+		reconnect: false
+	});
+	await assert.rejects(refused.connect(), /bad ticket|rejected/);
+	assert.equal(refused.state, 'closed');
+});
+
+test('a zone that restarted (close 1012) is rejoined at once with a fresh ticket', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	scriptedServer(network);
+	const { conn, tickets } = connection(network, scheduler, {
+		reconnect: { graceMs: 15_000, maxAttempts: 100, backoffMs: () => 1000 }
+	});
+	await conn.connect();
+	assert.equal(conn.reconnectToken, 'rt-1');
+	network.last().close(GAME_CLOSE_RESTARTED);
+	await scheduler.advance(10);
+	const hello = network.last().lastHello;
+	assert.equal(hello.reconnectToken, '', 'the old session is gone: no token');
+	assert.equal(hello.ticket, 't:z1:2');
+	assert.deepEqual(tickets.at(-1), { zoneId: 'z1', role: 'player', reason: 'rejoin' });
+	assert.equal(conn.state, 'open');
+	conn.close();
+});
+
 test('kick and handshake rejection close without reconnecting', async () => {
 	const network = new FakeNetwork();
 	const scheduler = new FakeScheduler();
@@ -272,7 +532,9 @@ function gameClient(network, scheduler, extra = {}) {
 			encodeInput: (dx) => new Uint8Array([dx & 0xff, 0]),
 			predict: (s, dx, dt) => ({ x: s.x + (dx * 10 * dt) / 1000 }),
 			corrections: { avatar: { x: { mode: 'ease', durationMs: 100 }, hp: { mode: 'replace' } } },
-			controlledEntity: ({ zoneId }) => (zoneId === 'z1' ? 7 : 70)
+			controlledEntity: ({ zoneId }) => (zoneId === 'z1' ? 7 : 70),
+			// These tests check predicted values the instant they are made.
+			smoothSteps: false
 		},
 		...extra
 	});

@@ -230,3 +230,155 @@ async fn cell_events_project_into_zone_status_rows() {
     assert_eq!(of(status("z-never").await), ZoneStatus::Cold);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A celld-hosted zone's lifecycle reports (`zone_activity.record` facts)
+/// project into `zone_activities`; a report emitted earlier but settled
+/// later never overwrites a newer one; only the zone itself may report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zone_activity_reports_project_into_zone_status() {
+    use distributed_game::cell::trusted_session;
+    use distributed_game::world::zone_activity::{
+        mount_zone_activity, zone_principal, RecordActivity, ZoneActivity, RECORD,
+    };
+    use distributed_game::world::zone_status::{
+        activity_projector_for, ZoneActivities, ZONE_ACTIVITIES,
+    };
+    use distributed_game::{Fact, FactStamp};
+
+    let clock = ManualClock::new(SystemTime::UNIX_EPOCH + Duration::from_millis(T0));
+    let cell = mount_zone_activity(cell::<ZoneActivity>("ZoneActivity", "pit.0.1", &clock));
+    let report = |status: &str, seq: u64, principal: &str| {
+        let fact = Fact::trusted(
+            format!("zone_activity.record:pit.0.1:9:{seq}"),
+            RECORD,
+            serde_json::to_value(RecordActivity {
+                status: status.into(),
+                activation: "act-1".into(),
+                restored: status == "active" && seq > 1,
+                players: u32::from(status == "active"),
+                node: "node-b".into(),
+                isolate: "iso".into(),
+            })
+            .unwrap(),
+            Some(principal.to_string()),
+            FactStamp {
+                zone_id: "pit.0.1".into(),
+                activation: 9,
+                seq,
+                emitted_at_ms: T0 + seq,
+                ..FactStamp::default()
+            },
+        );
+        (fact.clone(), trusted_session(principal, &fact))
+    };
+    let send = |status: &'static str, seq: u64, principal: &'static str| {
+        let cell = &cell;
+        async move {
+            let (fact, session) = report(status, seq, principal);
+            let identity = CellCommandIdentity::new(
+                "celld-zone",
+                principal,
+                command_id_for("celld-zone", fact.key()),
+            )
+            .unwrap();
+            cell.dispatch_idempotent(RECORD, &identity, fact.input().clone(), session)
+                .await
+        }
+    };
+    let me = Box::leak(zone_principal("pit.0.1").into_boxed_str());
+    assert_eq!(
+        send("active", 1, me).await.unwrap().payload()["applied"],
+        true
+    );
+    assert_eq!(
+        send("hibernated", 3, me).await.unwrap().payload()["applied"],
+        true
+    );
+    // Emitted before `hibernated`, settled after it: ignored.
+    let late = send("dormant", 2, me).await.unwrap();
+    assert_eq!(late.payload()["applied"], false);
+    assert_eq!(late.payload()["status"], "hibernated");
+    assert!(
+        send("active", 4, "guest-x").await.is_err(),
+        "only the zone reports"
+    );
+    assert_eq!(cell.load().await.unwrap().unwrap().status(), "hibernated");
+
+    let dir = std::env::temp_dir().join(format!(
+        "zone-activity-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bus_url = format!("sqlite:{}?mode=rwc", dir.join("bus.db").display());
+    let pool = sqlx::SqlitePool::connect(&bus_url).await.unwrap();
+    let bus = SqliteBus::new(pool.clone());
+    bus.ensure_tables().await.unwrap();
+    let publisher = BusPublisher::new(Arc::new(bus));
+    let mut messages = cell.durable_outbox().unwrap();
+    messages.sort_by_key(|m| m.created_at);
+    assert_eq!(messages.len(), 2, "one event per applied report");
+    for message in messages {
+        publisher.publish(Message::from(message)).await.unwrap();
+    }
+    let read_url = format!("sqlite:{}?mode=rwc", dir.join("read.db").display());
+    let repo = SqliteRepository::connect_and_migrate(&read_url)
+        .await
+        .unwrap();
+    repo.bootstrap_table_schema_for_dev(&read_model_catalog().table_registry().unwrap())
+        .await
+        .unwrap();
+    let read_models = repo.clone();
+    async fn project(
+        context: CausalProjectorContext,
+        projection: ModeledProjection,
+    ) -> Result<(), HandlerError> {
+        projection.apply(ZONE_ACTIVITIES, &context).await
+    }
+    // A consumer of its own (a minimap service would be one too).
+    spawn_service_consumer_loop(move || {
+        Service::new()
+            .named("zone-minimap")
+            .routes(
+                Routes::new()
+                    .with_read_model_store(read_models.clone())
+                    .modeled_projector(activity_projector_for("zone-minimap"))
+                    .handle(project),
+            )
+            .with_bus(SqliteBus::new(pool.clone()).with_idle_poll(CONSUMER_IDLE_POLL))
+    });
+    let start = Instant::now();
+    let row = loop {
+        let row = sqlx::query_as::<_, (String, String, String, i64)>(
+            "SELECT zone_id, status, node, activations FROM zone_activities WHERE zone_id = ?",
+        )
+        .bind("pit.0.1")
+        .fetch_optional(repo.pool())
+        .await
+        .unwrap();
+        if let Some(row) = row.filter(|row| row.1 == "hibernated") {
+            break row;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "projection timed out"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(row.2, "node-b");
+    assert_eq!(row.3, 1);
+    let activity = ZoneActivities {
+        zone_id: row.0,
+        status: row.1,
+        node: row.2,
+        ..ZoneActivities::default()
+    };
+    assert_eq!(
+        ZoneStatus::of_activity(Some(&activity)),
+        ZoneStatus::Hibernated { bytes: 0 }
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

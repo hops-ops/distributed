@@ -1,7 +1,30 @@
-//! The game demos' durable cells on celld. Mob Pit's are fed by the zone
-//! server's `distributed_game::celld::CelldFactSink` over the internal HTTP
-//! path; every multi-host demo keeps its zone ownership and hibernation
-//! snapshots here.
+//! The game demos' durable cells on celld, and Mob Pit's rooms.
+//!
+//! - `GET /zones/{room}` (WebSocket) and `/zones/{room}/info`: `PitRoom`,
+//!   one Durable Object per Mob Pit room (`pit.<x>.<y>`), hosted by
+//!   `distributed_game::celld_zone` (`mobpit_rooms::MobPit`). celld places
+//!   each room; its kill and lifecycle facts reach the Crawler and presence
+//!   cells below object to object, exactly once.
+//! - `zone-dev/{shard}` (`ZoneDevObject`, dev only): settings every room
+//!   reads (`ZONE_DEV_SETTINGS=1`): the network simulation of the HUD's
+//!   sliders.
+//! - `zone-activity/{room}` (`ZoneActivityObject`): each room's lifecycle
+//!   (active / dormant / hibernated); its `zone.activity_changed` events
+//!   leave through the outbox Queue for the zone status read model.
+//!
+//! - `hood/{hx.hy}`, `borough/{bx.by}`, `city/city` (`HoodCell`,
+//!   `BoroughCell`, `CityCell`): Mob Pit's world tiers (`mobpit_tiers`). A
+//!   boss room's zone fact raises its hood; the Queue consumer below runs
+//!   the saga that ripples hood events into the borough and borough events
+//!   into the city (idempotent commands, ids derived from the event ids).
+//!   Rooms watch them (`CellWatchers`): each change is pushed to the rooms
+//!   holding a watch lease, which re-read every ~45 s (no polling).
+//!
+//! - `content-rollout/world` (`ContentRolloutObject`): the world's live
+//!   content (`distributed_game::world::content_rollout`). The services'
+//!   admin route starts a rollout (an `admin:*` session it built after
+//!   checking the admin secret); the cell freezes, applies and resumes on
+//!   its own schedule and every room follows it (`ZONE_CONTENT_ROLLOUT`).
 //!
 //! - `crawler/{principal}` (`CrawlerCell`): the `mobpit_crawler::Crawler`
 //!   aggregate with its `#[command]` `crawler.record_kill` (XP decided here
@@ -12,23 +35,12 @@
 //!   facts (`zone.*`). A fact emitted before the one that set the current
 //!   entry (`FactStamp::emission_order`) is ignored, so a late "left pit-1"
 //!   cannot mark a player who already joined pit-2 offline.
-//! - `gem-pouch/{principal}` (`GemPouchCell`): The Freeze's
-//!   `freeze.gem_collected` facts (which gem spot, at which content
-//!   version; the zone reports no amount).
-//! - `content-log/{zone}` (`ContentLogCell`): The Freeze's
-//!   `freeze.content_applied` zone facts (every content switch of a zone).
-//! - `zone-lease/{zone}` (`ZoneLeaseCell`): zone ownership
-//!   (`distributed_game::world::zone_lease`, `CellZoneOwnership`); its
-//!   alarm declares `zone.lease_expired`.
-//! - `zone-state/{zone}` (`ZoneStateCell`): hibernation snapshots
-//!   (`distributed_game::world::zone_state`, `CellZoneStateStore`); large
-//!   ones in the `ZONE_SNAPSHOTS` R2 bucket.
 //!
 //! Every route requires `DISTRIBUTED_INTERNAL_SECRET`. Mob Pit commands also
 //! require the trusted fact session (principal + `FactStamp` headers,
 //! rebuilt with `fact_session_from_headers`), so nothing but a zone server's
-//! fact worker can run them; zone lease and state commands require the
-//! `zone-host` role.
+//! fact worker can run them; tier saga steps require the worker's own saga
+//! session (`mobpit_tiers::SAGA_PRINCIPAL`).
 //!
 //! The Queue consumer relays each outbox message to `CELLD_QUEUE_RELAY_URL`
 //! (the zone server's authenticated `/internal/celld-queue/relay`), which
@@ -37,9 +49,8 @@
 
 use distributed::bus::{CelldQueueEnvelope, CelldQueueHttpPublisher, CelldQueueRelay};
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CellDispatchError, CellWaitPathRequest, CelldOutbox,
-    InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
-    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
+    AggregateCell, CellDispatchError, CelldOutbox, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,
+    CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::microsvc::{
@@ -47,14 +58,22 @@ use distributed::microsvc::{
 };
 use distributed::{sourced, Aggregate, Entity};
 use distributed_game::cell::{fact_session_from_headers, session_stamp};
+use distributed_game::celld_zone::{
+    forward_to_zone, serve_cell, CellWatchers, ContentRolloutCell, ZoneActivityCell,
+    ZoneDevSettings,
+};
 use distributed_game::lifecycle::{
     Lifecycle, CONNECTION_LOST, PLAYER_DISCONNECTED, PLAYER_JOINED, PLAYER_LEFT, PLAYER_RECONNECTED,
 };
-use distributed_game::world::zone_lease::{mount_zone_lease, ZoneLease};
-use distributed_game::world::zone_state::{celld_worker, mount_zone_state, ZoneState};
+use distributed_game::world::content_rollout::{CONTENT_ADMIN_ROLE, CONTENT_ROLLOUT_KIND};
+use distributed_game::world::zone_activity::ZONE_ACTIVITY_KIND;
 use distributed_game::FactStamp;
 use mobpit_crawler::{
     Crawler, MobKilledArgs, RecordKill, CRAWLER_KIND, MOB_KILLED_EVENT, PRESENCE_KIND,
+};
+use mobpit_tiers::{
+    mount_borough, mount_city, mount_hood, Borough, BoroughRead, City, CityRead, Hood, HoodRead,
+    BOROUGH_KIND, CITY_KIND, HOOD_KIND, SAGA_PRINCIPAL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -220,321 +239,12 @@ async fn handle_lifecycle(
         .succeeded(PresenceApplied { applied: newer })
 }
 
-// ---------------------------------------------------------------- The Freeze
-
-/// `freeze.gem_collected`.
-pub const GEM_COLLECTED: &str = "freeze.gem_collected";
-/// `freeze.content_applied`.
-pub const CONTENT_APPLIED: &str = "freeze.content_applied";
-
-/// One collected gem.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Gem {
-    pub zone: String,
-    pub spot: u32,
-    pub content_version: String,
-}
-
-#[derive(Clone, Default, Serialize, Deserialize, distributed::Snapshot)]
-pub struct GemPouch {
-    entity: Entity,
-    gems: u32,
-    last: Option<Gem>,
-}
-
-#[sourced(entity, aggregate_type = "GemPouch", events = "GemPouchEvent")]
-impl GemPouch {
-    #[event("freeze.gem_recorded", version = 1)]
-    fn recorded(&mut self, principal: String, gem: Gem) {
-        if self.entity.id().is_empty() {
-            self.entity.set_id(principal);
-        }
-        self.gems += 1;
-        self.last = Some(gem);
-    }
-}
-
-#[derive(Debug, Deserialize, distributed::CommandInput)]
-pub struct GemInput {
-    pub spot: u32,
-}
-
-#[derive(Debug, Serialize, distributed::CommandOutput)]
-pub struct Counted {
-    pub count: u32,
-}
-
-struct CollectGem;
-impl<D> PortableCommand<D> for CollectGem
-where
-    D: CausalRouteDependencies<Aggregate = GemPouch> + Send + Sync + 'static,
-{
-    fn install(self, routes: Routes<D>) -> Routes<D> {
-        routes
-            .typed_command(typed_command::<GemInput, Succeeded<Counted>>(GEM_COLLECTED))
-            .handle(handle_gem)
-    }
-}
-
-async fn handle_gem(
-    ctx: &CausalCommandContext<'_, GemPouch>,
-    input: GemInput,
-) -> std::result::Result<PreparedCommand<Succeeded<Counted>>, HandlerError> {
-    let principal = ctx.user_id()?.to_string();
-    let stamp =
-        session_stamp(ctx.session()).ok_or_else(|| rejected("gem facts need a fact stamp"))?;
-    let repo = ctx.repo();
-    let mut pouch = match repo.get(&principal).await? {
-        Some(pouch) => pouch,
-        None => repo.create(),
-    };
-    pouch
-        .recorded(
-            principal,
-            Gem {
-                zone: stamp.zone_id,
-                spot: input.spot,
-                content_version: stamp.content_version,
-            },
-        )
-        .map_err(rejected)?;
-    let count = pouch.gems;
-    repo.commit(pouch)?.succeeded(Counted { count })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContentSwitch {
-    pub from: String,
-    pub to: String,
-    pub tick: u64,
-}
-
-#[derive(Clone, Default, Serialize, Deserialize, distributed::Snapshot)]
-pub struct ContentLog {
-    entity: Entity,
-    switches: Vec<ContentSwitch>,
-}
-
-#[sourced(entity, aggregate_type = "ContentLog", events = "ContentLogEvent")]
-impl ContentLog {
-    #[event("freeze.content_recorded", version = 1)]
-    fn recorded(&mut self, zone: String, switch: ContentSwitch) {
-        if self.entity.id().is_empty() {
-            self.entity.set_id(zone);
-        }
-        self.switches.push(switch);
-    }
-}
-
-#[derive(Debug, Deserialize, distributed::CommandInput)]
-pub struct ContentInput {
-    pub from: String,
-    pub to: String,
-}
-
-struct ApplyContent;
-impl<D> PortableCommand<D> for ApplyContent
-where
-    D: CausalRouteDependencies<Aggregate = ContentLog> + Send + Sync + 'static,
-{
-    fn install(self, routes: Routes<D>) -> Routes<D> {
-        routes
-            .typed_command(typed_command::<ContentInput, Succeeded<Counted>>(
-                CONTENT_APPLIED,
-            ))
-            .handle(handle_content)
-    }
-}
-
-async fn handle_content(
-    ctx: &CausalCommandContext<'_, ContentLog>,
-    input: ContentInput,
-) -> std::result::Result<PreparedCommand<Succeeded<Counted>>, HandlerError> {
-    let stamp =
-        session_stamp(ctx.session()).ok_or_else(|| rejected("content facts need a fact stamp"))?;
-    let repo = ctx.repo();
-    // The zone's own log: the shard is the stamped zone.
-    let mut log = match repo.get(&stamp.zone_id).await? {
-        Some(log) => log,
-        None => repo.create(),
-    };
-    log.recorded(
-        stamp.zone_id.clone(),
-        ContentSwitch {
-            from: input.from,
-            to: input.to,
-            tick: stamp.tick,
-        },
-    )
-    .map_err(rejected)?;
-    let count = log.switches.len() as u32;
-    repo.commit(log)?.succeeded(Counted { count })
-}
-
-async fn read_pouch(cell: &AggregateCell<GemPouch>) -> std::result::Result<Value, String> {
-    let pouch = cell.load().await.map_err(|error| error.to_string())?;
-    Ok(json!({
-        "gems": pouch.as_ref().map_or(0, |p| p.gems),
-        "last": pouch.and_then(|p| p.last),
-    }))
-}
-
-async fn read_content_log(cell: &AggregateCell<ContentLog>) -> std::result::Result<Value, String> {
-    let log = cell.load().await.map_err(|error| error.to_string())?;
-    Ok(json!({ "switches": log.map(|l| l.switches).unwrap_or_default() }))
-}
-
-#[durable_object]
-pub struct GemPouchCell {
-    cell: AggregateCell<GemPouch>,
-    env: Env,
-}
-
-impl DurableObject for GemPouchCell {
-    fn new(state: State, env: Env) -> Self {
-        console_error_panic_hook::set_once();
-        let cell = AggregateCell::<GemPouch>::from_state_with_snapshots(state, 50)
-            .expect("gem pouch cell identity")
-            .mount(CollectGem)
-            .with_celld_outbox(outbox(&env));
-        Self { cell, env }
-    }
-
-    async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_pouch, fact_session).await
-    }
-
-    async fn alarm(&self) -> Result<Response> {
-        alarm(&self.env, &self.cell).await
-    }
-}
-
-#[durable_object]
-pub struct ContentLogCell {
-    cell: AggregateCell<ContentLog>,
-    env: Env,
-}
-
-impl DurableObject for ContentLogCell {
-    fn new(state: State, env: Env) -> Self {
-        console_error_panic_hook::set_once();
-        let cell = AggregateCell::<ContentLog>::from_state_with_snapshots(state, 50)
-            .expect("content log cell identity")
-            .mount(ApplyContent)
-            .with_celld_outbox(outbox(&env));
-        Self { cell, env }
-    }
-
-    async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_content_log, fact_session).await
-    }
-
-    async fn alarm(&self) -> Result<Response> {
-        alarm(&self.env, &self.cell).await
-    }
-}
-
 // ---------------------------------------------------------------- Hosting
 
 /// Mob Pit cells run only facts: the principal and the stamp, from the
 /// trusted headers of the authenticated internal path.
 fn fact_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
     fact_session_from_headers(header)
-}
-
-/// Zone lease cells: the zone server's identity and role (the handlers
-/// require `zone-host`).
-fn zone_host_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
-    let mut session = Session::new();
-    for key in [distributed::USER_ID_KEY, distributed::microsvc::ROLE_KEY] {
-        if let Some(value) = header(key) {
-            session.set(key, value);
-        }
-    }
-    Some(session)
-}
-
-type Sessions = fn(&dyn Fn(&str) -> Option<String>) -> Option<Session>;
-
-async fn dispatch<A>(
-    env: &Env,
-    cell: &AggregateCell<A>,
-    command: &str,
-    req: &mut Request,
-    sessions: Sessions,
-) -> Result<Response>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
-    let body: Value = match req.json().await {
-        Ok(body) => body,
-        Err(_) => return error_response(CellDispatchError::BadRequest("invalid JSON".into())),
-    };
-    let parsed = match CellWaitPathRequest::parse(body) {
-        Ok(parsed) => parsed,
-        Err(error) => return error_response(CellDispatchError::BadRequest(error)),
-    };
-    let header = |name: &str| req.headers().get(name).ok().flatten();
-    let identity = match (
-        header(CELL_SERVICE_ID_HEADER),
-        header(CELL_PRINCIPAL_PARTITION_HEADER),
-    ) {
-        (Some(service), Some(partition)) => {
-            match CellCommandIdentity::new(service, partition, &parsed.command_id) {
-                Ok(identity) => identity,
-                Err(error) => return error_response(error),
-            }
-        }
-        _ => return error_response(CellDispatchError::Unauthorized),
-    };
-    let Some(session) = sessions(&header) else {
-        return error_response(CellDispatchError::Forbidden);
-    };
-    let result = cell
-        .dispatch_idempotent(command, &identity, parsed.input, session)
-        .await;
-    if let Err(error) = cell.drain_outbox(env).await {
-        worker::console_error!("post-commit drain deferred: {error}");
-    }
-    match result {
-        Ok(dispatch) => json_status(dispatch.wait_path_wire(), 200),
-        Err(error) => error_response(error),
-    }
-}
-
-/// `GET /{kind}/{shard}` → `read(cell)`; `POST /{kind}/{shard}/{command}`.
-async fn route<A, F>(
-    env: &Env,
-    cell: &AggregateCell<A>,
-    mut req: Request,
-    read: F,
-    sessions: Sessions,
-) -> Result<Response>
-where
-    A: Aggregate + Send + Sync + 'static,
-    F: AsyncFnOnce(&AggregateCell<A>) -> std::result::Result<Value, String>,
-{
-    if let Err(error) = authenticate(&req, env) {
-        return error_response(error);
-    }
-    let url = req.url()?;
-    let parts: Vec<String> = url
-        .path()
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .map(str::to_string)
-        .collect();
-    match (req.method(), parts.get(2)) {
-        (Method::Get, None) => match read(cell).await {
-            Ok(body) => json_status(body, 200),
-            Err(error) => error_response(CellDispatchError::Internal(error)),
-        },
-        (Method::Post, Some(command)) => {
-            let command = command.clone();
-            dispatch(env, cell, &command, &mut req, sessions).await
-        }
-        _ => json_status(json!({ "error": "not found" }), 404),
-    }
 }
 
 async fn read_crawler(cell: &AggregateCell<Crawler>) -> std::result::Result<Value, String> {
@@ -590,7 +300,7 @@ impl DurableObject for CrawlerCell {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_crawler, fact_session).await
+        serve_cell(&self.env, &self.cell, req, read_crawler, fact_session).await
     }
 
     async fn alarm(&self) -> Result<Response> {
@@ -619,7 +329,7 @@ impl DurableObject for PresenceCell {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_presence, fact_session).await
+        serve_cell(&self.env, &self.cell, req, read_presence, fact_session).await
     }
 
     async fn alarm(&self) -> Result<Response> {
@@ -641,77 +351,296 @@ where
     Response::ok("ok")
 }
 
-#[durable_object]
-pub struct ZoneLeaseCell {
-    cell: AggregateCell<ZoneLease>,
-    env: Env,
+// ---------------------------------------------------------------- Rooms
+
+distributed_game::celld_zone_object!(PitRoom, mobpit_rooms::MobPit);
+
+// ---------------------------------------------------------------- Tiers
+
+/// Tier saga steps run only for the worker's own session.
+fn saga_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
+    let principal = header(distributed::USER_ID_KEY)?;
+    (principal == SAGA_PRINCIPAL).then(|| {
+        let mut session = Session::new();
+        session.set(distributed::USER_ID_KEY, principal);
+        session
+    })
 }
 
-impl DurableObject for ZoneLeaseCell {
+/// A borough hears the saga (its hoods) and its rooms' own facts (a room
+/// woke: the world event cycle); each command checks which it accepts.
+fn borough_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
+    saga_session(header).or_else(|| fact_session(header))
+}
+
+async fn read_hood(cell: &AggregateCell<Hood>) -> std::result::Result<Value, String> {
+    let hood = cell.load().await.map_err(|error| error.to_string())?;
+    serde_json::to_value(HoodRead::of(hood.as_ref())).map_err(|error| error.to_string())
+}
+
+async fn read_borough(cell: &AggregateCell<Borough>) -> std::result::Result<Value, String> {
+    let borough = cell.load().await.map_err(|error| error.to_string())?;
+    serde_json::to_value(BoroughRead::of(borough.as_ref())).map_err(|error| error.to_string())
+}
+
+async fn read_city(cell: &AggregateCell<City>) -> std::result::Result<Value, String> {
+    let city = cell.load().await.map_err(|error| error.to_string())?;
+    serde_json::to_value(CityRead::of(city.as_ref())).map_err(|error| error.to_string())
+}
+
+/// A hood: its boss rooms' facts and its own respawn schedule.
+#[durable_object]
+pub struct HoodCell {
+    cell: AggregateCell<Hood>,
+    env: Env,
+    /// Rooms watching it (pushed after every change).
+    watchers: CellWatchers,
+}
+
+impl DurableObject for HoodCell {
     fn new(state: State, env: Env) -> Self {
         console_error_panic_hook::set_once();
-        // Renewals are internal events: snapshots keep loads short.
-        let cell = mount_zone_lease(
-            AggregateCell::<ZoneLease>::from_state_with_snapshots(state, 50)
-                .expect("zone lease cell identity"),
+        let watchers = CellWatchers::new(HOOD_KIND, &state);
+        let cell = mount_hood(
+            AggregateCell::<Hood>::from_state_with_snapshots(state, 50)
+                .expect("hood cell identity"),
         )
         .with_celld_outbox(outbox(&env));
-        Self { cell, env }
+        Self {
+            cell,
+            env,
+            watchers,
+        }
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        route(&self.env, &self.cell, req, read_lease, zone_host_session).await
-    }
-
-    async fn alarm(&self) -> Result<Response> {
-        let wake = self
-            .cell
-            .alarm(&self.env)
+        self.watchers
+            .serve(&self.env, &self.cell, req, read_hood, fact_session)
             .await
-            .map_err(|error| Error::RustError(error.to_string()))?;
-        for failed in wake.schedules.failed.iter().chain(&wake.schedules.retried) {
-            worker::console_error!("lease alarm failed: {} {}", failed.code, failed.message);
-        }
-        Response::ok("ok")
-    }
-}
-
-async fn read_lease(cell: &AggregateCell<ZoneLease>) -> std::result::Result<Value, String> {
-    let lease = cell.load().await.map_err(|error| error.to_string())?;
-    Ok(json!({
-        "holder": lease.as_ref().and_then(|l| l.holder().map(str::to_string)),
-        "token": lease.as_ref().map(|l| l.token()),
-    }))
-}
-
-#[durable_object]
-pub struct ZoneStateCell {
-    cell: AggregateCell<ZoneState>,
-    env: Env,
-}
-
-impl DurableObject for ZoneStateCell {
-    fn new(state: State, env: Env) -> Self {
-        console_error_panic_hook::set_once();
-        // Every save replaces the value: snapshot each commit.
-        let cell = mount_zone_state(
-            AggregateCell::<ZoneState>::from_state_with_snapshots(state, 1)
-                .expect("zone state cell identity"),
-        )
-        .with_celld_outbox(outbox(&env));
-        Self { cell, env }
-    }
-
-    async fn fetch(&self, req: Request) -> Result<Response> {
-        if let Err(error) = authenticate(&req, &self.env) {
-            return error_response(error);
-        }
-        let bucket = celld_worker::bucket(&self.env, "ZONE_SNAPSHOTS")?;
-        celld_worker::fetch(&self.cell, &bucket, req).await
     }
 
     async fn alarm(&self) -> Result<Response> {
-        alarm(&self.env, &self.cell).await
+        self.watchers.alarm(&self.env, &self.cell, read_hood).await
+    }
+}
+
+/// A borough: its hoods as the saga reports them.
+#[durable_object]
+pub struct BoroughCell {
+    cell: AggregateCell<Borough>,
+    env: Env,
+    /// Rooms watching it (pushed after every change).
+    watchers: CellWatchers,
+}
+
+impl DurableObject for BoroughCell {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        let watchers = CellWatchers::new(BOROUGH_KIND, &state);
+        let cell = mount_borough(
+            AggregateCell::<Borough>::from_state_with_snapshots(state, 50)
+                .expect("borough cell identity"),
+        )
+        .with_celld_outbox(outbox(&env));
+        Self {
+            cell,
+            env,
+            watchers,
+        }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        self.watchers
+            .serve(&self.env, &self.cell, req, read_borough, borough_session)
+            .await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        self.watchers
+            .alarm(&self.env, &self.cell, read_borough)
+            .await
+    }
+}
+
+/// The city: its boroughs as the saga reports them.
+#[durable_object]
+pub struct CityCell {
+    cell: AggregateCell<City>,
+    env: Env,
+    /// Rooms watching it (pushed after every change).
+    watchers: CellWatchers,
+}
+
+impl DurableObject for CityCell {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        let watchers = CellWatchers::new(CITY_KIND, &state);
+        let cell = mount_city(
+            AggregateCell::<City>::from_state_with_snapshots(state, 50)
+                .expect("city cell identity"),
+        )
+        .with_celld_outbox(outbox(&env));
+        Self {
+            cell,
+            env,
+            watchers,
+        }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        self.watchers
+            .serve(&self.env, &self.cell, req, read_city, saga_session)
+            .await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        self.watchers.alarm(&self.env, &self.cell, read_city).await
+    }
+}
+
+/// The tier saga's next step for an outbox message (hood → borough →
+/// city), dispatched object to object as an idempotent command whose id
+/// derives from the message id.
+async fn saga(env: &Env, envelope: &CelldQueueEnvelope) -> std::result::Result<(), String> {
+    let message = &envelope.message;
+    let Some(step) = mobpit_tiers::saga_step(message.name(), message.payload()) else {
+        return Ok(());
+    };
+    let id = message.id().ok_or("tier event without an id")?;
+    let secret = env
+        .secret(CELL_INTERNAL_SECRET_ENV)
+        .map(|v| v.to_string())
+        .or_else(|_| env.var(CELL_INTERNAL_SECRET_ENV).map(|v| v.to_string()))
+        .map_err(|_| "internal secret is required".to_string())?;
+    let headers = Headers::new();
+    let set = |name: &str, value: &str| headers.set(name, value).map_err(|e| e.to_string());
+    set(CELL_INTERNAL_SECRET_HEADER, &secret)?;
+    set(CELL_SERVICE_ID_HEADER, "mobpit-tiers")?;
+    set(CELL_PRINCIPAL_PARTITION_HEADER, SAGA_PRINCIPAL)?;
+    set(distributed::USER_ID_KEY, SAGA_PRINCIPAL)?;
+    set("content-type", "application/json")?;
+    let body = json!({
+        "commandId": distributed_game::cell::command_id_for("mobpit-tiers", id),
+        "input": step.input,
+    });
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(body.to_string().into()));
+    let url = format!("https://cell/{}/{}/{}", step.kind, step.shard, step.command);
+    let request = Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
+    let binding = match step.kind {
+        BOROUGH_KIND => "BOROUGH",
+        _ => "CITY",
+    };
+    let namespace = env.durable_object(binding).map_err(|e| e.to_string())?;
+    let stub = namespace
+        .id_from_name(&step.shard)
+        .and_then(|id| id.get_stub())
+        .map_err(|e| e.to_string())?;
+    let mut response = stub
+        .fetch_with_request(request)
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = response.status_code();
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        let body = response.text().await.unwrap_or_default();
+        // A refused step (bad input) never succeeds on retry: drop it.
+        if status == 400 || status == 403 || status == 422 {
+            worker::console_error!("tier saga step {} refused: {status} {body}", step.command);
+            Ok(())
+        } else {
+            Err(format!("{} → HTTP {status}: {body}", step.command))
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Content
+
+/// Principal prefix of the services' admin sessions.
+pub const ADMIN_PREFIX: &str = "admin:";
+
+/// A rollout starts only for an admin session the services built after
+/// checking the admin's credential (an `admin:*` principal over the
+/// internal path); it gets the content-admin role here. The rollout's own
+/// schedule needs no session.
+fn admin_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
+    let principal = header(distributed::USER_ID_KEY)?;
+    principal.starts_with(ADMIN_PREFIX).then(|| {
+        let mut session = Session::new();
+        session.set(distributed::USER_ID_KEY, principal);
+        session.set(distributed::ROLE_KEY, CONTENT_ADMIN_ROLE);
+        session
+    })
+}
+
+/// The world's live content (`content-rollout/world`): every room follows
+/// it (`ZONE_CONTENT_ROLLOUT`).
+#[durable_object]
+pub struct ContentRolloutObject {
+    cell: ContentRolloutCell,
+}
+
+impl DurableObject for ContentRolloutObject {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        let outbox = outbox(&env);
+        Self {
+            cell: ContentRolloutCell::new(state, env, outbox, admin_session),
+        }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        self.cell.fetch(req).await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        self.cell.alarm().await
+    }
+}
+
+/// The rooms' dev settings (`zone-dev/{shard}`: the network simulation the
+/// rooms apply, written by the services' `/dev/netsim`).
+#[durable_object]
+pub struct ZoneDevObject {
+    dev: ZoneDevSettings,
+}
+
+impl DurableObject for ZoneDevObject {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        Self {
+            dev: ZoneDevSettings::new(state, env),
+        }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        self.dev.fetch(req).await
+    }
+}
+
+#[durable_object]
+pub struct ZoneActivityObject {
+    cell: ZoneActivityCell,
+}
+
+impl DurableObject for ZoneActivityObject {
+    fn new(state: State, env: Env) -> Self {
+        console_error_panic_hook::set_once();
+        let outbox = outbox(&env);
+        Self {
+            cell: ZoneActivityCell::new(state, env, outbox),
+        }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        self.cell.fetch(req).await
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        self.cell.alarm().await
     }
 }
 
@@ -719,9 +648,16 @@ impl DurableObject for ZoneStateCell {
 async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_error_panic_hook::set_once();
     let url = req.url()?;
-    let path = url.path();
+    let path = url.path().to_string();
     if path == "/" || path == "/health" {
         return Response::ok("mobpit cells\n");
+    }
+    // A room is public: its WebSocket admits signed tickets only.
+    if path.starts_with("/zones/") {
+        return match forward_to_zone(req, &env, "PIT_ROOM", "/zones/").await? {
+            Some(response) => Ok(response),
+            None => json_status(json!({ "error": "no such room" }), 404),
+        };
     }
     if let Err(error) = authenticate(&req, &env) {
         return error_response(error);
@@ -730,10 +666,12 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let binding = match parts.first().copied() {
         Some(CRAWLER_KIND) => "CRAWLER",
         Some(PRESENCE_KIND) => "PRESENCE",
-        Some("gem-pouch") => "GEM_POUCH",
-        Some("content-log") => "CONTENT_LOG",
-        Some("zone-lease") => "ZONE_LEASE",
-        Some("zone-state") => "ZONE_STATE",
+        Some(ZONE_ACTIVITY_KIND) => "ZONE_ACTIVITY",
+        Some(distributed_game::netsim::ZONE_DEV_KIND) => "ZONE_DEV",
+        Some(HOOD_KIND) => "HOOD",
+        Some(BOROUGH_KIND) => "BOROUGH",
+        Some(CITY_KIND) => "CITY",
+        Some(CONTENT_ROLLOUT_KIND) => "CONTENT_ROLLOUT",
         _ => return json_status(json!({ "error": "unknown cell kind" }), 404),
     };
     let Some(shard) = parts.get(1) else {
@@ -761,6 +699,13 @@ pub async fn queue(batch: MessageBatch<CelldQueueEnvelope>, env: Env, _ctx: Cont
         }
     };
     for delivery in batch.messages()? {
+        // The tier saga first: a failed step retries the whole delivery
+        // (each step is idempotent).
+        if let Err(error) = saga(&env, delivery.body()).await {
+            worker::console_error!("tier saga for {} deferred: {error}", delivery.id());
+            delivery.retry();
+            continue;
+        }
         match relay.relay(delivery.body().clone()).await {
             Ok(()) => delivery.ack(),
             Err(error) => {
@@ -785,11 +730,18 @@ fn relay(env: &Env) -> std::result::Result<CelldQueueRelay<CelldQueueHttpPublish
     };
     let endpoint = var("CELLD_QUEUE_RELAY_URL")?;
     let secret = var(CELL_INTERNAL_SECRET_ENV)?;
-    // `http://127.0.0.1` relays are dev-only; anything else must be HTTPS.
+    // `http://127.0.0.1` relays are dev-only. `CELLD_QUEUE_RELAY_MESH=1`
+    // (Hops local: celld and Mob Pit with Istio sidecars) allows HTTP to a
+    // cluster Service. Anything else must be HTTPS.
     let local =
         endpoint.starts_with("http://127.0.0.1") || endpoint.starts_with("http://localhost");
+    let mesh = env
+        .var("CELLD_QUEUE_RELAY_MESH")
+        .is_ok_and(|value| value.to_string() == "1");
     let publisher = if local {
         CelldQueueHttpPublisher::new_local_test(endpoint, &secret)
+    } else if mesh {
+        CelldQueueHttpPublisher::new_mesh(endpoint)
     } else {
         CelldQueueHttpPublisher::new(endpoint)
     }

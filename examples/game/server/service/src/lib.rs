@@ -15,6 +15,10 @@
 //! - [`PlayerStats`] is the table: one row per principal, the Crawler's
 //!   post-kill state ([`mobpit_crawler::CrawlerState`]). The leaderboard is a
 //!   query over it (`order_by: xp desc`).
+//! - [`ZoneActivities`] (`zone_activities`): every room's lifecycle as its
+//!   zone-activity cell published it (`distributed_game::world::zone_status`):
+//!   active / dormant / hibernated, players, restored, and — a debug
+//!   detail — the celld node. The pages' minimap is a `@live` query over it.
 //! - [`PLAYER_STATS`] maps `CrawlerMobKilledDomainEvent` to the
 //!   [`SavePlayerStats`] upsert. The projector runtime keeps the cursor,
 //!   skips redelivered messages and commits each projection atomically.
@@ -46,11 +50,45 @@ use distributed::{
     Application, ApplicationManifest, RelationalReadModel, SqliteRepository, SurfaceSpec,
 };
 
+/// The rooms' status rows and their projection.
+pub use distributed_game::world::zone_status::{ZoneActivities, ZONE_ACTIVITIES};
 /// The read model and its projection (shared with the zone server).
 pub use mobpit_crawler::stats::{
-    projector, read_model_catalog, PlayerStats, SavePlayerStats, APPLICATION, EPOCH, PLAYER_STATS,
-    PROJECTOR,
+    projector, PlayerStats, SavePlayerStats, APPLICATION, EPOCH, PLAYER_STATS, PROJECTOR,
 };
+
+/// The boroughs (bosses down, weather, the world event running) and their
+/// projection, from the borough cells' domain events.
+pub use mobpit_tiers::events::{Boroughs, BOROUGHS};
+
+/// The tables: `player_stats`, `zone_activities` and `boroughs`.
+pub fn read_model_catalog() -> distributed::ReadModelCatalog {
+    mobpit_crawler::stats::read_model_catalog()
+        .table_schema(ZoneActivities::schema().clone())
+        .table_schema(Boroughs::schema().clone())
+}
+
+/// The projector of `boroughs`, owned by this application.
+pub fn boroughs_projector() -> distributed::graphql::SurfaceProjector {
+    mobpit_tiers::events::projector(APPLICATION)
+}
+
+/// The boroughs (and their world events) are public to signed-in players.
+pub fn borough_permissions() -> ModelPermissions<Boroughs> {
+    ModelPermissions::new().grant(ROLE, read().all_columns())
+}
+
+async fn project_boroughs(
+    context: CausalProjectorContext,
+    projection: ModeledProjection,
+) -> Result<(), HandlerError> {
+    projection.apply(BOROUGHS, &context).await
+}
+
+/// The projector of `zone_activities`, owned by this application.
+pub fn rooms_projector() -> distributed::graphql::SurfaceProjector {
+    distributed_game::world::zone_status::activity_projector_for(APPLICATION)
+}
 /// The one engine role. Every signed-in player reads the whole board.
 pub const ROLE: &str = "user";
 /// Bus consumer group of this process's board change notices (every
@@ -81,11 +119,23 @@ pub fn permissions() -> ModelPermissions<PlayerStats> {
     ModelPermissions::new().grant(ROLE, read().all_columns())
 }
 
+/// The rooms' status is public to signed-in players too.
+pub fn room_permissions() -> ModelPermissions<ZoneActivities> {
+    ModelPermissions::new().grant(ROLE, read().all_columns())
+}
+
 async fn project(
     context: CausalProjectorContext,
     projection: ModeledProjection,
 ) -> Result<(), HandlerError> {
     projection.apply(PLAYER_STATS, &context).await
+}
+
+async fn project_rooms(
+    context: CausalProjectorContext,
+    projection: ModeledProjection,
+) -> Result<(), HandlerError> {
+    projection.apply(ZONE_ACTIVITIES, &context).await
 }
 
 /// The consumer service (bus consumer identity = [`APPLICATION`]): the
@@ -95,7 +145,11 @@ pub fn projection_service(read_models: SqliteRepository) -> Service {
         Routes::new()
             .with_read_model_store(read_models)
             .modeled_projector(projector())
-            .handle(project),
+            .handle(project)
+            .modeled_projector(rooms_projector())
+            .handle(project_rooms)
+            .modeled_projector(boroughs_projector())
+            .handle(project_boroughs),
     )
 }
 
@@ -116,6 +170,18 @@ fn grants() -> BTreeMap<String, BTreeMap<String, RoleGrant>> {
             .or_default()
             .insert(PlayerStats::schema().model_name.clone(), grant);
     }
+    for (role, grant) in room_permissions().surface_grants() {
+        grants
+            .entry(role)
+            .or_default()
+            .insert(ZoneActivities::schema().model_name.clone(), grant);
+    }
+    for (role, grant) in borough_permissions().surface_grants() {
+        grants
+            .entry(role)
+            .or_default()
+            .insert(Boroughs::schema().model_name.clone(), grant);
+    }
     grants
 }
 
@@ -124,8 +190,12 @@ fn full_surface() -> Surface {
         .expect("mobpit Surface should build")
         .with_leaderboards(leaderboard_surfaces())
         .expect("mobpit boards should attach")
-        .with_projection_owners([projector().into()])
-        .expect("mobpit projector should bind")
+        .with_projection_owners([
+            projector().into(),
+            rooms_projector().into(),
+            boroughs_projector().into(),
+        ])
+        .expect("mobpit projectors should bind")
 }
 
 /// Logical application artifact (`distributed describe`, the lifecycle).
@@ -191,7 +261,13 @@ pub fn build_engine(
         .roles(&[ROLE])
         .client_application_surface(APPLICATION, [ROLE], [ROLE])
         .model::<PlayerStats>(permissions())
-        .client_projection_owners([projector().into()])
+        .model::<ZoneActivities>(room_permissions())
+        .model::<Boroughs>(borough_permissions())
+        .client_projection_owners([
+            projector().into(),
+            rooms_projector().into(),
+            boroughs_projector().into(),
+        ])
         .identity(identity.config())
         .graphiql(false)
         .change_stream(repo.read_model_changes())

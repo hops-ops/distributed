@@ -15,9 +15,9 @@ export type KindName = keyof typeof KIND;
 
 /** `player` (kind 1, priority 2). */
 export interface PlayerFields {
-	/** `quant [-20, 19.999847] / 18 bits` */
+	/** `quant [-22, 21.999832] / 18 bits` */
 	readonly x: number;
-	/** `quant [-20, 19.999847] / 18 bits` */
+	/** `quant [-22, 21.999832] / 18 bits` */
 	readonly y: number;
 	/** `quant [-16, 15.9921875] / 12 bits` */
 	readonly vx: number;
@@ -27,6 +27,10 @@ export interface PlayerFields {
 	readonly dash: number;
 	/** `u8` */
 	readonly cd: number;
+	/** `quant [-4, 3.9995117] / 14 bits` */
+	readonly z: number;
+	/** `quant [-16, 15.9921875] / 12 bits` */
+	readonly vz: number;
 	/** `short_str`, priority 0.2 */
 	readonly name: string;
 	/** `u8` */
@@ -39,6 +43,8 @@ export interface PlayerFields {
 	readonly level: number;
 	/** `bool` */
 	readonly dead: boolean;
+	/** `u8` */
+	readonly shot: number;
 }
 
 /** True for a `player` entity. */
@@ -56,12 +62,15 @@ export function playerFields(entity: { readonly fields: EntityFields }): PlayerF
 		vy: fieldNumber(f, 'vy'),
 		dash: fieldNumber(f, 'dash'),
 		cd: fieldNumber(f, 'cd'),
+		z: fieldNumber(f, 'z'),
+		vz: fieldNumber(f, 'vz'),
 		name: fieldString(f, 'name'),
 		hp: fieldNumber(f, 'hp'),
 		face: fieldNumber(f, 'face'),
 		swing: fieldNumber(f, 'swing'),
 		level: fieldNumber(f, 'level'),
 		dead: fieldBool(f, 'dead'),
+		shot: fieldNumber(f, 'shot'),
 	};
 }
 
@@ -131,18 +140,16 @@ export function pillarFields(entity: { readonly fields: EntityFields }): PillarF
 export interface PitFields {
 	/** `u16` */
 	readonly pending: number;
+	/** `u32` */
+	readonly committed: number;
 	/** `u16` */
-	readonly slowMs: number;
+	readonly backlog: number;
 	/** `f32` */
 	readonly tickMs: number;
 	/** `f32` */
 	readonly tickMaxMs: number;
 	/** `u32` */
-	readonly workUs: number;
-	/** `u32` */
-	readonly committed: number;
-	/** `u16` */
-	readonly backlog: number;
+	readonly kills: number;
 }
 
 /** True for a `pit` entity. */
@@ -155,30 +162,32 @@ export function pitFields(entity: { readonly fields: EntityFields }): PitFields 
 	const f = entity.fields;
 	return {
 		pending: fieldNumber(f, 'pending'),
-		slowMs: fieldNumber(f, 'slow_ms'),
-		tickMs: fieldNumber(f, 'tick_ms'),
-		tickMaxMs: fieldNumber(f, 'tick_max_ms'),
-		workUs: fieldNumber(f, 'work_us'),
 		committed: fieldNumber(f, 'committed'),
 		backlog: fieldNumber(f, 'backlog'),
+		tickMs: fieldNumber(f, 'tick_ms'),
+		tickMaxMs: fieldNumber(f, 'tick_max_ms'),
+		kills: fieldNumber(f, 'kills'),
 	};
 }
 
 /** Wire type of every replicated field, by kind and wire field name. */
 export const FIELD_TYPES = {
 	player: {
-		x: { type: 'quant', min: -20, max: 19.999847412109375, bits: 18 },
-		y: { type: 'quant', min: -20, max: 19.999847412109375, bits: 18 },
+		x: { type: 'quant', min: -22, max: 21.999832153320313, bits: 18 },
+		y: { type: 'quant', min: -22, max: 21.999832153320313, bits: 18 },
 		vx: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		vy: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		dash: { type: 'u8' },
 		cd: { type: 'u8' },
+		z: { type: 'quant', min: -4, max: 3.99951171875, bits: 14 },
+		vz: { type: 'quant', min: -16, max: 15.9921875, bits: 12 },
 		name: { type: 'short_str' },
 		hp: { type: 'u8' },
 		face: { type: 'angle', bits: 8 },
 		swing: { type: 'u8' },
 		level: { type: 'u16' },
 		dead: { type: 'bool' },
+		shot: { type: 'u8' },
 	},
 	mob: {
 		x: { type: 'quant', min: -20, max: 20, bits: 14 },
@@ -196,29 +205,31 @@ export const FIELD_TYPES = {
 	},
 	pit: {
 		pending: { type: 'u16' },
-		slow_ms: { type: 'u16' },
-		tick_ms: { type: 'f32' },
-		tick_max_ms: { type: 'f32' },
-		work_us: { type: 'u32' },
 		committed: { type: 'u32' },
 		backlog: { type: 'u16' },
+		tick_ms: { type: 'f32' },
+		tick_max_ms: { type: 'f32' },
+		kills: { type: 'u32' },
 	},
 } as const satisfies Record<string, Record<string, WireType>>;
 
 /** Client correction defaults (`#[correct(..)]`), by kind and wire field name. */
 export const CORRECTIONS: CorrectionPolicies = {
 	player: {
-		x: { mode: 'ease', durationMs: 150 },
-		y: { mode: 'ease', durationMs: 150 },
+		x: { mode: 'ease', durationMs: 150, snapAbove: 2 },
+		y: { mode: 'ease', durationMs: 150, snapAbove: 2 },
 		vx: { mode: 'snap' },
 		vy: { mode: 'snap' },
 		dash: { mode: 'snap' },
 		cd: { mode: 'snap' },
+		z: { mode: 'ease', durationMs: 100 },
+		vz: { mode: 'snap' },
 		name: { mode: 'replace' },
 		hp: { mode: 'replace' },
 		face: { mode: 'replace' },
 		swing: { mode: 'replace' },
 		level: { mode: 'replace' },
 		dead: { mode: 'replace' },
+		shot: { mode: 'replace' },
 	},
 };

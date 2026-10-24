@@ -3,123 +3,15 @@
 // Do not edit: change the Rust definitions and regenerate.
 import { decodeGameEvent, decodePayload, decodeValue, encodePayload, encodeValue, onGameEvent, type DecodedGameEvent, type GameEventCodecs, type GameEventSource, type PayloadLayout, type WireType } from '@hops-ops/distributed/game';
 
-/** Record `BackgroundStats` (`#[derive(GameRecord)]`). */
-export interface BackgroundStats {
-	readonly enqueued: number;
-	readonly applied: number;
-	readonly dropped: number;
-	readonly failed: number;
-}
-
-const BACKGROUND_STATS_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['enqueued', { type: 'u64' }],
-		['applied', { type: 'u64' }],
-		['dropped', { type: 'u64' }],
-		['failed', { type: 'u64' }],
-	]
-};
-
-/** Record `BoardRow` (`#[derive(GameRecord)]`). */
-export interface BoardRow {
-	readonly rank: number;
-	readonly member: string;
+/** Record `ContentPack` (`#[derive(GameRecord)]`). */
+export interface ContentPack {
+	readonly version: string;
 	readonly name: string;
-	readonly score: number;
+	readonly mobPace: number;
+	readonly mobHpPct: number;
+	readonly tint: number;
+	readonly notes: string;
 }
-
-const BOARD_ROW_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['rank', { type: 'u32' }],
-		['member', { type: 'short_str' }],
-		['name', { type: 'short_str' }],
-		['score', { type: 'f64' }],
-	]
-};
-
-/** Record `Scores` (`#[derive(GameRecord)]`). */
-export interface Scores {
-	readonly kills: number;
-	readonly xp: number;
-}
-
-const SCORES_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['kills', { type: 'f64' }],
-		['xp', { type: 'f64' }],
-	]
-};
-
-/** Record `Mismatch` (`#[derive(GameRecord)]`). */
-export interface Mismatch {
-	readonly member: string;
-	readonly cell: Scores;
-	readonly board: Scores;
-}
-
-const MISMATCH_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['member', { type: 'short_str' }],
-		['cell', SCORES_TYPE],
-		['board', SCORES_TYPE],
-	]
-};
-
-/** Record `RebuildReport` (`#[derive(GameRecord)]`). */
-export interface RebuildReport {
-	readonly backend: string;
-	readonly crawlers: number;
-	readonly events: number;
-	readonly applied: number;
-	readonly duplicates: number;
-	readonly identicalTop: boolean;
-	readonly matchesCells: boolean;
-	readonly mismatches: readonly Mismatch[];
-	readonly tookMs: number;
-}
-
-const REBUILD_REPORT_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['backend', { type: 'short_str' }],
-		['crawlers', { type: 'u32' }],
-		['events', { type: 'u32' }],
-		['applied', { type: 'u32' }],
-		['duplicates', { type: 'u32' }],
-		['identicalTop', { type: 'bool' }],
-		['matchesCells', { type: 'bool' }],
-		['mismatches', { type: 'list', item: MISMATCH_TYPE }],
-		['tookMs', { type: 'f64' }],
-	]
-};
-
-/** Record `BoardSnapshot` (`#[derive(GameRecord)]`). */
-export interface BoardSnapshot {
-	readonly version: number;
-	readonly backend: string;
-	readonly members: number;
-	readonly kills: readonly BoardRow[];
-	readonly xp: readonly BoardRow[];
-	readonly background: BackgroundStats;
-	readonly lastRebuild: RebuildReport | undefined;
-}
-
-const BOARD_SNAPSHOT_TYPE: WireType = {
-	type: 'record',
-	fields: [
-		['version', { type: 'u64' }],
-		['backend', { type: 'short_str' }],
-		['members', { type: 'u64' }],
-		['kills', { type: 'list', item: BOARD_ROW_TYPE }],
-		['xp', { type: 'list', item: BOARD_ROW_TYPE }],
-		['background', BACKGROUND_STATS_TYPE],
-		['lastRebuild', { type: 'optional', item: REBUILD_REPORT_TYPE }],
-	]
-};
 
 /** Record `MobTier` (`#[derive(GameRecord)]`). */
 export interface MobTier {
@@ -128,14 +20,46 @@ export interface MobTier {
 	readonly tele: number;
 }
 
-/** Record `MoveState` (`#[derive(GameRecord)]`). */
-export interface MoveState {
+/** Record `Obstacle` (`#[derive(GameRecord)]`). */
+export interface Obstacle {
 	readonly x: number;
 	readonly y: number;
-	readonly vx: number;
-	readonly vy: number;
-	readonly dash: number;
-	readonly cd: number;
+	readonly r: number;
+	readonly look: number;
+}
+
+/** Record `Pillar` (`#[derive(GameRecord)]`). */
+export interface Pillar {
+	readonly x: number;
+	readonly y: number;
+	readonly r: number;
+}
+
+/** Record `PitRoomContext` (`#[derive(GameRecord)]`). */
+export interface PitRoomContext {
+	readonly seed: number;
+	readonly x: number;
+	readonly y: number;
+}
+
+/** Record `RoomMob` (`#[derive(GameRecord)]`). */
+export interface RoomMob {
+	readonly tier: number;
+	readonly x: number;
+	readonly y: number;
+}
+
+/** Record `PitRoomLayout` (`#[derive(GameRecord)]`). */
+export interface PitRoomLayout {
+	readonly biome: number;
+	readonly danger: number;
+	readonly mobs: readonly RoomMob[];
+	readonly boss: boolean;
+	readonly hoodX: number;
+	readonly hoodY: number;
+	readonly bossDistance: number;
+	readonly pattern: number;
+	readonly obstacles: readonly Obstacle[];
 }
 
 /** Record `PitRules` (`#[derive(GameRecord)]`). */
@@ -145,6 +69,41 @@ export interface PitRules {
 	readonly attackRange: number;
 	readonly attackHalfAngle: number;
 	readonly swingFrames: number;
+	readonly range: number;
+	readonly fireCooldown: number;
+	readonly eyeHeight: number;
+	readonly hipHeight: number;
+	readonly maxRewindMs: number;
+	readonly mobHeights: readonly number[];
+}
+
+/** Record `PitState` (`#[derive(GameRecord)]`). */
+export interface PitState {
+	readonly x: number;
+	readonly y: number;
+	readonly vx: number;
+	readonly vy: number;
+	readonly dash: number;
+	readonly cd: number;
+	readonly z: number;
+	readonly vz: number;
+}
+
+/** Record `PitWorld` (`#[derive(GameRecord)]`). */
+export interface PitWorld {
+	readonly defaultSeed: number;
+	readonly half: number;
+	readonly playerRadius: number;
+	readonly dashCooldown: number;
+	readonly pillars: readonly Pillar[];
+	readonly doorHalf: number;
+	readonly roomSize: number;
+	readonly passage: number;
+	readonly hysteresis: number;
+	readonly maxRoom: number;
+	readonly biomes: readonly string[];
+	readonly wakeReach: number;
+	readonly wakeRelease: number;
 }
 
 /** Record `Profile` (`#[derive(GameRecord)]`). */
@@ -169,21 +128,81 @@ const PROFILE_TYPE: WireType = {
 	]
 };
 
+/** Record `Reach` (`#[derive(GameRecord)]`). */
+export interface Reach {
+	readonly near: number;
+}
+
+/** Record `ReachContext` (`#[derive(GameRecord)]`). */
+export interface ReachContext {
+	readonly x: number;
+	readonly y: number;
+	readonly near: number;
+}
+
+/** Record `WorldTiers` (`#[derive(GameRecord)]`). */
+export interface WorldTiers {
+	readonly hoodX: number;
+	readonly hoodY: number;
+	readonly hoodTier: number;
+	readonly bossDown: boolean;
+	readonly lastBy: string;
+	readonly boroughX: number;
+	readonly boroughY: number;
+	readonly boroughBossesDown: number;
+	readonly weather: number;
+	readonly hoodsDown: readonly string[];
+	readonly event: string;
+	readonly eventUntilMs: number;
+	readonly cityBossesDown: number;
+	readonly banner: string;
+}
+
+const WORLD_TIERS_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['hoodX', { type: 'i32' }],
+		['hoodY', { type: 'i32' }],
+		['hoodTier', { type: 'u32' }],
+		['bossDown', { type: 'bool' }],
+		['lastBy', { type: 'short_str' }],
+		['boroughX', { type: 'i32' }],
+		['boroughY', { type: 'i32' }],
+		['boroughBossesDown', { type: 'u32' }],
+		['weather', { type: 'u8' }],
+		['hoodsDown', { type: 'list', item: { type: 'short_str' } }],
+		['event', { type: 'short_str' }],
+		['eventUntilMs', { type: 'u64' }],
+		['cityBossesDown', { type: 'u32' }],
+		['banner', { type: 'short_str' }],
+	]
+};
+
 /** Event `hello` (id 1). */
 export interface HelloEvent {
 	readonly entity: number;
 	readonly half: number;
-	readonly boot: string;
 	readonly attackRange: number;
 	readonly attackArcCos: number;
+	readonly roomX: number;
+	readonly roomY: number;
+	readonly seed: number;
+	readonly restored: boolean;
+	readonly roomKills: number;
+	readonly viewRadius: number;
 }
 
 const HELLO_LAYOUT: PayloadLayout = [
 	['entity', { type: 'u32' }],
 	['half', { type: 'f32' }],
-	['boot', { type: 'short_str' }],
 	['attackRange', { type: 'f32' }],
 	['attackArcCos', { type: 'f32' }],
+	['roomX', { type: 'i32' }],
+	['roomY', { type: 'i32' }],
+	['seed', { type: 'u32' }],
+	['restored', { type: 'bool' }],
+	['roomKills', { type: 'u32' }],
+	['viewRadius', { type: 'f32' }],
 ];
 
 /** Event `profile` (id 2). */
@@ -243,11 +262,6 @@ const SAVED_LAYOUT: PayloadLayout = [
 	['attempts', { type: 'u32' }],
 ];
 
-/** Event `board` (id 5). */
-export type BoardEvent = BoardSnapshot;
-
-const BOARD_PAYLOAD: WireType = BOARD_SNAPSHOT_TYPE;
-
 /** Event `died` (id 6). */
 export interface DiedEvent {
 	readonly respawnMs: number;
@@ -257,14 +271,135 @@ const DIED_LAYOUT: PayloadLayout = [
 	['respawnMs', { type: 'u32' }],
 ];
 
+/** Event `world` (id 7). */
+export type WorldEvent = WorldTiers;
+
+const WORLD_PAYLOAD: WireType = WORLD_TIERS_TYPE;
+
+/** Event `boss_down` (id 8). */
+export interface BossDownEvent {
+	readonly by: string;
+	readonly hoodTier: number;
+}
+
+const BOSS_DOWN_LAYOUT: PayloadLayout = [
+	['by', { type: 'short_str' }],
+	['hoodTier', { type: 'u32' }],
+];
+
+/** Event `shot` (id 9). */
+export interface ShotEvent {
+	readonly shot: number;
+	readonly hit: number | undefined;
+	readonly compensated: boolean;
+	readonly ageMs: number;
+	readonly requestedAgeMs: number;
+	readonly clamped: boolean;
+	readonly x: number;
+	readonly y: number;
+	readonly z: number;
+}
+
+const SHOT_LAYOUT: PayloadLayout = [
+	['shot', { type: 'u16' }],
+	['hit', { type: 'optional', item: { type: 'u32' } }],
+	['compensated', { type: 'bool' }],
+	['ageMs', { type: 'f32' }],
+	['requestedAgeMs', { type: 'f32' }],
+	['clamped', { type: 'bool' }],
+	['x', { type: 'f32' }],
+	['y', { type: 'f32' }],
+	['z', { type: 'f32' }],
+];
+
+/** Event `stale` (id 10). */
+export interface StaleEvent {
+	readonly gate: string;
+	readonly version: string;
+}
+
+const STALE_LAYOUT: PayloadLayout = [
+	['gate', { type: 'short_str' }],
+	['version', { type: 'short_str' }],
+];
+
+/** Message `loaded` (id 1). */
+export interface LoadedMessage {
+	readonly principal: string;
+	readonly xp: number;
+	readonly level: number;
+	readonly kills: number;
+}
+
+const MESSAGE_LOADED_LAYOUT: PayloadLayout = [
+	['principal', { type: 'short_str' }],
+	['xp', { type: 'u64' }],
+	['level', { type: 'u32' }],
+	['kills', { type: 'u32' }],
+];
+
+/** Message `world` (id 2). */
+export type WorldMessage = WorldTiers;
+
+const MESSAGE_WORLD_PAYLOAD: WireType = WORLD_TIERS_TYPE;
+
+/** Message `world_keep_city` (id 3). */
+export type WorldKeepCityMessage = WorldTiers;
+
+const MESSAGE_WORLD_KEEP_CITY_PAYLOAD: WireType = WORLD_TIERS_TYPE;
+
+/** Message `hood` (id 4). */
+export interface HoodMessage {
+	readonly tier: number;
+	readonly bossDown: boolean;
+	readonly lastBy: string;
+}
+
+const MESSAGE_HOOD_LAYOUT: PayloadLayout = [
+	['tier', { type: 'u32' }],
+	['bossDown', { type: 'bool' }],
+	['lastBy', { type: 'short_str' }],
+];
+
+/** Message `borough` (id 5). */
+export interface BoroughMessage {
+	readonly bossesDown: number;
+	readonly weather: number;
+	readonly event: string;
+	readonly eventUntilMs: number;
+	readonly hoodsDown: readonly string[];
+}
+
+const MESSAGE_BOROUGH_LAYOUT: PayloadLayout = [
+	['bossesDown', { type: 'u32' }],
+	['weather', { type: 'u8' }],
+	['event', { type: 'short_str' }],
+	['eventUntilMs', { type: 'u64' }],
+	['hoodsDown', { type: 'list', item: { type: 'short_str' } }],
+];
+
+/** Message `city` (id 6). */
+export interface CityMessage {
+	readonly bossesDown: number;
+	readonly banner: string;
+}
+
+const MESSAGE_CITY_LAYOUT: PayloadLayout = [
+	['bossesDown', { type: 'u32' }],
+	['banner', { type: 'short_str' }],
+];
+
 /** Event type ids by name. */
 export const EVENT = {
 	hello: 1,
 	profile: 2,
 	kill: 3,
 	saved: 4,
-	board: 5,
 	died: 6,
+	world: 7,
+	bossDown: 8,
+	shot: 9,
+	stale: 10,
 } as const;
 
 /** Event payload types by name. */
@@ -273,8 +408,11 @@ export interface Events {
 	profile: ProfileEvent;
 	kill: KillEvent;
 	saved: SavedEvent;
-	board: BoardEvent;
 	died: DiedEvent;
+	world: WorldEvent;
+	bossDown: BossDownEvent;
+	shot: ShotEvent;
+	stale: StaleEvent;
 }
 
 /** Codecs of every event. */
@@ -303,17 +441,35 @@ export const EVENTS: GameEventCodecs<Events> = {
 		encode: (value) => encodePayload(SAVED_LAYOUT, value),
 		decode: (payload) => decodePayload(SAVED_LAYOUT, payload) as unknown as SavedEvent
 	},
-	board: {
-		id: 5,
-		name: 'board',
-		encode: (value) => encodeValue(BOARD_PAYLOAD, value),
-		decode: (payload) => decodeValue(BOARD_PAYLOAD, payload) as BoardEvent
-	},
 	died: {
 		id: 6,
 		name: 'died',
 		encode: (value) => encodePayload(DIED_LAYOUT, value),
 		decode: (payload) => decodePayload(DIED_LAYOUT, payload) as unknown as DiedEvent
+	},
+	world: {
+		id: 7,
+		name: 'world',
+		encode: (value) => encodeValue(WORLD_PAYLOAD, value),
+		decode: (payload) => decodeValue(WORLD_PAYLOAD, payload) as WorldEvent
+	},
+	bossDown: {
+		id: 8,
+		name: 'boss_down',
+		encode: (value) => encodePayload(BOSS_DOWN_LAYOUT, value),
+		decode: (payload) => decodePayload(BOSS_DOWN_LAYOUT, payload) as unknown as BossDownEvent
+	},
+	shot: {
+		id: 9,
+		name: 'shot',
+		encode: (value) => encodePayload(SHOT_LAYOUT, value),
+		decode: (payload) => decodePayload(SHOT_LAYOUT, payload) as unknown as ShotEvent
+	},
+	stale: {
+		id: 10,
+		name: 'stale',
+		encode: (value) => encodePayload(STALE_LAYOUT, value),
+		decode: (payload) => decodePayload(STALE_LAYOUT, payload) as unknown as StaleEvent
 	},
 };
 
@@ -332,4 +488,73 @@ export function onEvent<K extends keyof Events>(
 	handler: (value: Events[K], zoneId: string) => void
 ): () => void {
 	return onGameEvent(client, EVENTS, name, handler);
+}
+
+/** Zone inbox message type ids by name. */
+export const MESSAGE = {
+	loaded: 1,
+	world: 2,
+	worldKeepCity: 3,
+	hood: 4,
+	borough: 5,
+	city: 6,
+} as const;
+
+/** Zone inbox message payload types by name. */
+export interface Messages {
+	loaded: LoadedMessage;
+	world: WorldMessage;
+	worldKeepCity: WorldKeepCityMessage;
+	hood: HoodMessage;
+	borough: BoroughMessage;
+	city: CityMessage;
+}
+
+/** Codecs of every zone inbox message. */
+export const MESSAGES: GameEventCodecs<Messages> = {
+	loaded: {
+		id: 1,
+		name: 'loaded',
+		encode: (value) => encodePayload(MESSAGE_LOADED_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_LOADED_LAYOUT, payload) as unknown as LoadedMessage
+	},
+	world: {
+		id: 2,
+		name: 'world',
+		encode: (value) => encodeValue(MESSAGE_WORLD_PAYLOAD, value),
+		decode: (payload) => decodeValue(MESSAGE_WORLD_PAYLOAD, payload) as WorldMessage
+	},
+	worldKeepCity: {
+		id: 3,
+		name: 'world_keep_city',
+		encode: (value) => encodeValue(MESSAGE_WORLD_KEEP_CITY_PAYLOAD, value),
+		decode: (payload) => decodeValue(MESSAGE_WORLD_KEEP_CITY_PAYLOAD, payload) as WorldKeepCityMessage
+	},
+	hood: {
+		id: 4,
+		name: 'hood',
+		encode: (value) => encodePayload(MESSAGE_HOOD_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_HOOD_LAYOUT, payload) as unknown as HoodMessage
+	},
+	borough: {
+		id: 5,
+		name: 'borough',
+		encode: (value) => encodePayload(MESSAGE_BOROUGH_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_BOROUGH_LAYOUT, payload) as unknown as BoroughMessage
+	},
+	city: {
+		id: 6,
+		name: 'city',
+		encode: (value) => encodePayload(MESSAGE_CITY_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_CITY_LAYOUT, payload) as unknown as CityMessage
+	},
+};
+
+/** Encode a zone inbox message: `typeId` and `payload` of a `/admin/zone-message` body (base64url the payload). */
+export function encodeMessage<K extends keyof Messages>(
+	name: K,
+	value: Messages[K]
+): { readonly typeId: number; readonly payload: Uint8Array } {
+	const codec = MESSAGES[name];
+	return { typeId: codec.id, payload: codec.encode(value) };
 }

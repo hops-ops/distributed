@@ -400,7 +400,8 @@
           {
             "correction": {
               "durationMs": 150,
-              "mode": "ease"
+              "mode": "ease",
+              "snapAbove": 2.5
             },
             "name": "y",
             "priority": 1.0,

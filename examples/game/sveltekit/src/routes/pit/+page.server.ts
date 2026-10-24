@@ -1,8 +1,7 @@
 import { redirect } from '@sveltejs/kit';
-import { env } from '$env/dynamic/private';
 import { loadDistributedLeaderboard } from '@hops-ops/distributed/sveltekit';
 import { XpLeaderboardLeaderboard, type XpLeaderboardData } from '$distributed';
-import { tickets } from '$lib/server/game';
+import { liveContent, roomsUrls, tickets } from '$lib/server/game';
 import { graphqlUrl } from '$lib/server/distributed';
 
 export const load = async (event) => {
@@ -21,9 +20,12 @@ export const load = async (event) => {
 	} catch (error) {
 		console.error(`leaderboard SSR: ${error}`);
 	}
+	// The client starts on the world's live content (its packs are built in).
+	const content = await liveContent();
 	return {
 		zone: joined.zone,
-		zonesUrl: env.GAME_ZONES_URL ?? 'ws://127.0.0.1:2967',
+		contentVersion: content?.version ?? '',
+		roomsUrls: roomsUrls(),
 		principal: joined.principal,
 		board
 	};

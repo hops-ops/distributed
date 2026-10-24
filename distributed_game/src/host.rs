@@ -41,7 +41,9 @@ use crate::lifecycle::{
     ConnectionLost, JoinVia, LeftReason, LostCause, PlayerDisconnected, PlayerJoined, PlayerLeft,
     PlayerReconnected,
 };
-use crate::protocol::{error, kick, Notice, Role, ServerMessage, Welcome};
+use crate::protocol::{
+    error, feature, kick, Notice, Role, ServerMessage, Welcome, PROTOCOL_VERSION,
+};
 use crate::replication::{ClientReplica, DeltaStats, EncodedWorld, WorldView};
 use crate::rewind::{Rewind, RewindConfig, RewindFrame};
 use crate::rng::ZoneRng;
@@ -174,6 +176,9 @@ pub struct AdvanceReport {
     pub entities: Option<usize>,
     /// One entry per Delta frame built.
     pub frames: Vec<FrameStats>,
+    /// Entity records encoded by the patches
+    /// ([`EncodedWorld::encodes`]: shared across clients).
+    pub encodes: usize,
     /// Settlements delivered to the zone, with the tick they were delivered on.
     pub settled: Vec<(u64, FactSettlement)>,
     /// `(tick, state hash)` after each tick, when
@@ -253,6 +258,9 @@ pub(crate) struct Core<Z: Zone> {
     tick: u64,
     sim_time: Duration,
     dt: Duration,
+    /// Ticks dropped (catch-up cap) since the last simulated tick; seen by
+    /// the next `on_tick` through `Ctx::dropped_ticks`, then reset.
+    dropped_ticks: u32,
     tier: Tier,
     players: BTreeMap<PlayerId, PlayerSlot<Z::Input>>,
     observers: BTreeMap<ObserverId, ObserverSlot>,
@@ -414,6 +422,15 @@ impl<Z: Zone> Ctx<'_, Z> {
         self.core.dt
     }
 
+    /// Ticks the host dropped right before this one: the clock ran further
+    /// ahead than `max_catch_up` steps, so the rest of the backlog was not
+    /// simulated (0 normally). Simulated ticks then lag wall-clock time; a
+    /// zone that paces players' inputs per tick credits these so inputs
+    /// sent in real time do not queue up for good.
+    pub fn dropped_ticks(&self) -> u32 {
+        self.core.dropped_ticks
+    }
+
     /// Step length in seconds.
     pub fn dt_secs(&self) -> f32 {
         self.core.dt.as_secs_f32()
@@ -437,6 +454,31 @@ impl<Z: Zone> Ctx<'_, Z> {
     /// Content version.
     pub fn content_version(&self) -> &str {
         &self.core.config.content_version
+    }
+
+    /// Content version `player`'s client runs (what it presented on its
+    /// last Hello; differs from [`content_version`](Self::content_version)
+    /// for a stale client kept under [`StalePolicy::SafeRoom`]).
+    pub fn player_content_version(&self, player: PlayerId) -> Option<&str> {
+        self.core
+            .players
+            .get(&player)
+            .map(|slot| slot.content_version.as_str())
+    }
+
+    /// True when `player`'s client runs older content than the zone (it
+    /// may only be handed off into a gate zone, unless the policy roams).
+    pub fn is_stale(&self, player: PlayerId) -> bool {
+        let expected = &self.core.config.content_version;
+        !expected.is_empty()
+            && self
+                .player_content_version(player)
+                .is_some_and(|version| version != expected)
+    }
+
+    /// The host's [`StalePolicy`].
+    pub fn stale_policy(&self) -> StalePolicy {
+        self.core.config.stale_policy
     }
 
     /// Remote config version ([`HostConfig::config_version`]).
@@ -675,6 +717,14 @@ impl<Z: Zone> Ctx<'_, Z> {
         self.broadcast_event(event.event_id(), event.to_payload());
     }
 
+    /// A viewer's area of interest (None for an unknown viewer).
+    pub fn view_of(&self, viewer: impl Into<Viewer>) -> Option<View> {
+        match viewer.into() {
+            Viewer::Player(p) => self.core.players.get(&p).map(|slot| slot.view),
+            Viewer::Observer(o) => self.core.observers.get(&o).map(|slot| slot.view),
+        }
+    }
+
     /// Set a viewer's area of interest.
     pub fn set_view(&mut self, viewer: impl Into<Viewer>, view: View) {
         match viewer.into() {
@@ -804,6 +854,11 @@ pub struct ZoneHost<Z: Zone> {
     token_source: Box<dyn FnMut() -> String + Send>,
     pending: AdvanceReport,
     hash_ticks: bool,
+    /// The last patch's world: the next one shares its unchanged entities
+    /// and encodes each change once for every client.
+    last_world: Option<EncodedWorld>,
+    /// Protocol version of the next admission's client ([`ZoneHost::speaking`]).
+    next_protocol: Option<u32>,
 }
 
 macro_rules! hook {
@@ -834,6 +889,7 @@ impl<Z: Zone> ZoneHost<Z> {
             tick: 0,
             sim_time: Duration::ZERO,
             dt: rate_to_step(config.tick_rate),
+            dropped_ticks: 0,
             tier: Tier::Hot,
             players: BTreeMap::new(),
             observers: BTreeMap::new(),
@@ -879,6 +935,8 @@ impl<Z: Zone> ZoneHost<Z> {
             token_source: Box::new(default_token),
             pending: AdvanceReport::default(),
             hash_ticks: false,
+            last_world: None,
+            next_protocol: None,
         };
         host.process_kicks();
         host
@@ -1014,6 +1072,16 @@ impl<Z: Zone> ZoneHost<Z> {
         self.core.in_flight()
     }
 
+    /// Facts emitted since the last call, when the fact queue keeps a
+    /// journal ([`FactQueue::with_journal`]); empty otherwise.
+    pub fn take_emitted_facts(&mut self) -> Vec<Fact> {
+        self.core
+            .facts
+            .as_mut()
+            .map(FactQueue::take_journal)
+            .unwrap_or_default()
+    }
+
     /// True after [`dispose`](Self::dispose).
     pub fn is_disposed(&self) -> bool {
         self.disposed
@@ -1029,9 +1097,34 @@ impl<Z: Zone> ZoneHost<Z> {
         self.core.server_time_ms()
     }
 
+    /// Send every client the current state now, without ticking (a host
+    /// that is not ticking — a celld zone with only passive observers —
+    /// greets a new observer with it).
+    pub fn patch_now(&mut self) {
+        if !self.core.clients.is_empty() {
+            self.patch();
+        }
+    }
+
     /// Frames and closes produced since the last call, in order.
     pub fn drain_outbound(&mut self) -> Vec<Outbound> {
         std::mem::take(&mut self.core.outbound)
+    }
+
+    /// The protocol version of the client the next
+    /// [`join`](Self::join) / [`join_transfer`](Self::join_transfer) /
+    /// [`reconnect`](Self::reconnect) admits (its Hello's
+    /// `protocol_version`, already checked with
+    /// [`supports_protocol`](crate::protocol::supports_protocol)): its
+    /// Welcome is encoded in it. Applies to that one call; without it the
+    /// client speaks [`PROTOCOL_VERSION`].
+    ///
+    /// ```ignore
+    /// host.speaking(hello.protocol_version).join(&claims, hello.capabilities, &hello.content_version)
+    /// ```
+    pub fn speaking(&mut self, protocol_version: u32) -> &mut Self {
+        self.next_protocol = Some(protocol_version);
+        self
     }
 
     /// Admit a verified ticket holder.
@@ -1082,6 +1175,7 @@ impl<Z: Zone> ZoneHost<Z> {
         content_version: &str,
         handoff: Option<(&str, Vec<u8>)>,
     ) -> Result<Joined, JoinError> {
+        let protocol = self.next_protocol.take().unwrap_or(PROTOCOL_VERSION);
         if self.disposed {
             return Err(JoinError::new(error::NOT_FOUND, "zone disposed"));
         }
@@ -1144,7 +1238,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     }
                     slot.info.extensions = claims.extensions.clone();
                 }
-                self.bind_player(player, client, capabilities);
+                self.bind_player(player, client, capabilities, protocol);
                 let zone = self.core.zone_id.clone();
                 if let Some((from, carried)) = handoff.take() {
                     self.core.emit_lifecycle(
@@ -1197,7 +1291,7 @@ impl<Z: Zone> ZoneHost<Z> {
                         transitions: 0,
                     },
                 );
-                self.bind_player(player, client, capabilities);
+                self.bind_player(player, client, capabilities, protocol);
                 let zone = self.core.zone_id.clone();
                 match handoff.take() {
                     Some((from, carried)) => {
@@ -1246,7 +1340,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     },
                 );
                 self.attach_client(client, Viewer::Observer(observer));
-                self.welcome(client, session_id, String::new(), Role::Observer);
+                self.welcome(client, session_id, String::new(), Role::Observer, protocol);
                 hook!(self.on_observe(observer));
                 Joined {
                     client,
@@ -1291,6 +1385,7 @@ impl<Z: Zone> ZoneHost<Z> {
         capabilities: u32,
         content_version: Option<&str>,
     ) -> Result<Joined, JoinError> {
+        let protocol = self.next_protocol.take().unwrap_or(PROTOCOL_VERSION);
         let player = (!token.is_empty() && !self.disposed)
             .then(|| {
                 self.core
@@ -1316,7 +1411,7 @@ impl<Z: Zone> ZoneHost<Z> {
         }
         self.wake();
         let client = ClientId(self.core.next_id());
-        self.bind_player(player, client, capabilities);
+        self.bind_player(player, client, capabilities, protocol);
         if let Some(version) = content_version {
             if let Some(slot) = self.core.players.get_mut(&player) {
                 slot.content_version = version.to_string();
@@ -1392,6 +1487,34 @@ impl<Z: Zone> ZoneHost<Z> {
         stale.len()
     }
 
+    /// A client patched its content live and now runs `version`
+    /// (`ClientMessage::Content`): recorded for its player only when it is
+    /// the zone's current version (a client can catch up, never get
+    /// ahead). Returns whether it was recorded.
+    pub fn content_patched(&mut self, client: ClientId, version: &str) -> bool {
+        if version != self.core.config.content_version {
+            return false;
+        }
+        let Some(Viewer::Player(player)) = self.viewer_of(client) else {
+            return false;
+        };
+        match self.core.players.get_mut(&player) {
+            Some(slot) => {
+                slot.content_version = version.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// An observer's `Focus` (zone-local): [`Zone::on_observer_focus`].
+    /// Ignored for players and unknown clients.
+    pub fn observer_focus(&mut self, client: ClientId, x: f32, y: f32) {
+        if let Some(Viewer::Observer(observer)) = self.viewer_of(client) {
+            hook!(self.on_observer_focus(observer, x, y));
+        }
+    }
+
     /// Content version a player's client reported.
     pub fn player_content_version(&self, player: PlayerId) -> Option<&str> {
         self.core
@@ -1447,7 +1570,13 @@ impl<Z: Zone> ZoneHost<Z> {
         );
     }
 
-    fn bind_player(&mut self, player: PlayerId, client: ClientId, capabilities: u32) {
+    fn bind_player(
+        &mut self,
+        player: PlayerId,
+        client: ClientId,
+        capabilities: u32,
+        protocol: u32,
+    ) {
         let token = (self.token_source)();
         let slot = self.core.players.get_mut(&player).expect("player exists");
         let previous = slot.client.replace(client);
@@ -1471,11 +1600,19 @@ impl<Z: Zone> ZoneHost<Z> {
             self.core.outbound.push(Outbound::Close { client: old });
         }
         self.attach_client(client, Viewer::Player(player));
-        self.welcome(client, session_id, token, Role::Player);
+        self.welcome(client, session_id, token, Role::Player, protocol);
     }
 
-    fn welcome(&mut self, client: ClientId, session_id: String, token: String, role: Role) {
+    fn welcome(
+        &mut self,
+        client: ClientId,
+        session_id: String,
+        token: String,
+        role: Role,
+        protocol_version: u32,
+    ) {
         let welcome = ServerMessage::Welcome(Welcome {
+            protocol_version,
             session_id,
             zone_id: self.core.zone_id.clone(),
             role,
@@ -1486,6 +1623,8 @@ impl<Z: Zone> ZoneHost<Z> {
             reconnect_token: token,
             content_version: self.core.config.content_version.clone(),
             schema: self.schema.clone(),
+            features: feature::ALL,
+            origin: self.zone.origin(),
         });
         self.core.server_message(client, &welcome);
     }
@@ -1847,7 +1986,12 @@ impl<Z: Zone> ZoneHost<Z> {
     }
 
     fn tick_once(&mut self, dt: Duration) {
+        // wasm32-unknown-unknown (celld) has no `Instant`: measure with the
+        // host clock there (the celld zone host).
+        #[cfg(not(target_arch = "wasm32"))]
         let started = std::time::Instant::now();
+        #[cfg(target_arch = "wasm32")]
+        let started = self.core.clock.now();
         self.core.tick += 1;
         self.core.sim_time += dt;
         self.core.dt = dt;
@@ -1858,6 +2002,7 @@ impl<Z: Zone> ZoneHost<Z> {
             hook!(self.on_timer(id, timer));
         }
         hook!(self.on_tick());
+        self.core.dropped_ticks = 0;
         self.process_kicks();
         let mut frame = RewindFrame::default();
         self.zone.record_rewind(&mut frame);
@@ -1867,7 +2012,12 @@ impl<Z: Zone> ZoneHost<Z> {
                 .rewind
                 .record(self.core.tick, self.core.sim_time, entities);
         }
+        #[cfg(not(target_arch = "wasm32"))]
         self.pending.tick_durations.push(started.elapsed());
+        #[cfg(target_arch = "wasm32")]
+        self.pending
+            .tick_durations
+            .push(self.core.clock.now().saturating_sub(started));
         if self.hash_ticks {
             let hash = self.state_hash();
             self.pending.tick_hashes.push((self.core.tick, hash));
@@ -1887,7 +2037,11 @@ impl<Z: Zone> ZoneHost<Z> {
         let view = self.world_view();
         let core = &mut self.core;
         self.pending.entities = Some(view.entities().len());
-        let world = EncodedWorld::build(&self.schema, view, &core.config.interest);
+        let interest = &core.config.interest;
+        let world = match self.last_world.take() {
+            Some(last) => last.next(&self.schema, view, interest),
+            None => EncodedWorld::build(&self.schema, view, interest),
+        };
         let tick = core.tick as u32;
         let budget = core.config.byte_budget;
         let mut frames = Vec::with_capacity(core.clients.len());
@@ -1922,6 +2076,8 @@ impl<Z: Zone> ZoneHost<Z> {
             });
         }
         core.outbound.extend(frames);
+        self.pending.encodes += world.encodes();
+        self.last_world = Some(world);
     }
 
     /// Run due ticks and patches for the time elapsed on the clock.
@@ -1960,6 +2116,7 @@ impl<Z: Zone> ZoneHost<Z> {
         if !dt.is_zero() {
             report.dropped_ticks = (steps.dropped.as_nanos() / dt.as_nanos()) as u32;
         }
+        self.core.dropped_ticks = self.core.dropped_ticks.saturating_add(report.dropped_ticks);
         if !self.frozen {
             for _ in 0..steps.steps {
                 self.tick_once(dt);
@@ -2009,6 +2166,7 @@ impl<Z: Zone> ZoneHost<Z> {
         report.tick_durations.extend(pending.tick_durations);
         report.entities = pending.entities;
         report.frames.extend(pending.frames);
+        report.encodes += pending.encodes;
         report.settled.extend(pending.settled);
         report.tick_hashes.extend(pending.tick_hashes);
         report

@@ -24,7 +24,8 @@ import type {
 	HandoffMessage,
 	KickMessage,
 	ResumeMessage,
-	WelcomeMessage
+	WelcomeMessage,
+	WorldPoint
 } from './messages.js';
 import { AdaptiveDelay, type AdaptiveDelayOptions } from './pacing.js';
 import { Predictor, type Correction, type PredictorOptions } from './prediction.js';
@@ -78,6 +79,26 @@ export type GamePredictionOptions<TInput> = PredictorOptions<TInput> &
 		 * overrides it (e.g. from a game Event).
 		 */
 		controlledEntity?: ControlledEntityResolver;
+		/**
+		 * Continue the controlled entity's prediction through a handoff: its
+		 * predicted fields re-expressed in the target zone's frame (e.g. a
+		 * cell offset when positions are zone-local), or undefined to hold
+		 * it still as before. When given, inputs sampled while the handoff
+		 * is in flight are predicted (with the target's frame) and sent to
+		 * the target once it welcomes the player, and the switch to the
+		 * target's own state is eased instead of snapped: the handoff's
+		 * latency is hidden.
+		 */
+		handoffFrame?: (fields: EntityFields, from: string, to: string) => EntityFields | undefined;
+		/**
+		 * Draw each predicted step as motion over its input interval
+		 * (fixed-timestep interpolation; default true). The controlled
+		 * entity is then drawn up to one input interval behind its
+		 * prediction, but moves smoothly on a display faster than the tick
+		 * rate instead of in tick-sized hops against a smooth camera. False
+		 * draws the prediction itself, the instant it is made.
+		 */
+		smoothSteps?: boolean;
 	}>;
 
 /** What the player sees when an input is sampled (lag compensation). */
@@ -179,7 +200,16 @@ export class GameClient<TInput = unknown> {
 	#handoffBridge: RenderedEntity | undefined;
 	/** The source zone's copy of the handed-off entity: never drawn again. */
 	#handedOff: Readonly<{ zoneId: string; id: number }> | undefined;
+	/**
+	 * Handoff in flight with `handoffFrame`: the controlled entity predicted
+	 * on in the target's frame, and the inputs not yet sent to the target.
+	 */
+	#carry:
+		| { zoneId: string; base: RenderedEntity; fields: EntityFields; unsent: { input: TInput; dtMs: number }[] }
+		| undefined;
 	#closed = false;
+	/** The player's world position (`setPosition`): observed zones focus on it. */
+	#position: WorldPoint | undefined;
 	#contentVersion: string;
 	#predictionEnabled: boolean;
 	/** Adaptive delay per zone, keyed by the replica (shared across a zone's connections). */
@@ -268,12 +298,75 @@ export class GameClient<TInput = unknown> {
 		return zone.connection.connect();
 	}
 
-	/** Observe a neighbouring zone (read-only; merged into `render`). */
-	observe(zoneId: string): Promise<WelcomeMessage> {
+	/**
+	 * Observe a neighbouring zone (read-only; merged into `render`). With
+	 * `near` the observer says it is near the zone (celld zones: with a
+	 * ticket that grants `wake` it wakes the zone and keeps it awake; see
+	 * `setNear`).
+	 */
+	observe(zoneId: string, options: { near?: boolean } = {}): Promise<WelcomeMessage> {
 		this.#assertOpen();
 		const existing = this.#zones.get(zoneId);
-		if (existing !== undefined) return existing.connection.connect();
-		return this.#adopt(zoneId, 'observer').connection.connect();
+		if (existing !== undefined) {
+			if (options.near !== undefined && existing.role === 'observer') existing.connection.setNear(options.near);
+			return existing.connection.connect();
+		}
+		return this.#adopt(zoneId, 'observer', undefined, options.near).connection.connect();
+	}
+
+	/**
+	 * Say whether an observed zone is near (keep it awake) or not (a passive
+	 * watcher), without reconnecting. No-op for zones not observed.
+	 */
+	setNear(zoneId: string, near: boolean): void {
+		const zone = this.#zones.get(zoneId);
+		if (zone?.role === 'observer') zone.connection.setNear(near);
+	}
+
+	/**
+	 * Where the player is: world coordinates, or local to `zoneId` (its own
+	 * zone, converted with that zone's Welcome `origin`). Every observed
+	 * zone that declares its origin (`Zone::origin`) is then told where the
+	 * player is in its own coordinates (`Focus`), now and after each
+	 * (re)connect, so each neighbour sends what the player's view covers
+	 * there. Call it every frame or tick; connections throttle it. Ignored
+	 * while `zoneId`'s origin is unknown. Zones without an origin are
+	 * focused by hand (`setFocus`).
+	 */
+	setPosition(x: number, y: number, zoneId?: string): void {
+		if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+		let at: WorldPoint = { x, y };
+		if (zoneId !== undefined) {
+			const origin = this.zone(zoneId)?.connection.welcome?.origin;
+			if (origin === undefined) return;
+			at = { x: origin.x + x, y: origin.y + y };
+		}
+		this.#position = at;
+		for (const zone of this.#zones.values()) this.#focus(zone);
+	}
+
+	/** The player's last world position (`setPosition`). */
+	get position(): WorldPoint | undefined {
+		return this.#position;
+	}
+
+	/** An observed, placed zone looks at the player's position. */
+	#focus(zone: Zone): void {
+		const at = this.#position;
+		const origin = zone.connection.welcome?.origin;
+		if (zone.role !== 'observer' || at === undefined || origin === undefined) return;
+		zone.connection.setFocus(at.x - origin.x, at.y - origin.y);
+	}
+
+	/**
+	 * Tell an observed zone where this client is looking, in that zone's
+	 * local coordinates (`GameConnection.setFocus`), for zones that do not
+	 * declare an origin or odd cases (prefer `setPosition`). No-op for zones
+	 * not observed.
+	 */
+	setFocus(zoneId: string, x: number, y: number): void {
+		const zone = this.#zones.get(zoneId);
+		if (zone?.role === 'observer') zone.connection.setFocus(x, y);
 	}
 
 	/** Stop observing a zone. */
@@ -298,12 +391,28 @@ export class GameClient<TInput = unknown> {
 		const prediction = this.#options.prediction;
 		if (authority === undefined || prediction === undefined) return undefined;
 		const connection = authority.connection;
+		const tickRate = connection.welcome?.tickRate || 30;
+		const dt = dtMs ?? this.#options.inputDtMs ?? 1000 / tickRate;
+		const carry = this.#carry;
+		if (carry !== undefined) {
+			// Handoff in flight: keep predicting what is drawn.
+			carry.fields = this.#predictor!.step(carry.fields, input, dt);
+			if (!connection.canSendInput()) {
+				carry.unsent.push({ input, dtMs: dt });
+				return undefined;
+			}
+		}
+		return this.#send(authority, input, dt);
+	}
+
+	#send(authority: Zone, input: TInput, dtMs: number): number | undefined {
+		const connection = authority.connection;
 		if (!connection.canSendInput()) return undefined;
 		const context = this.inputContext(authority)!;
-		const seq = connection.sendInput(prediction.encodeInput(input, context), context.clientTick);
+		const seq = connection.sendInput(this.#options.prediction!.encodeInput(input, context), context.clientTick);
 		if (seq === undefined) return undefined;
-		const tickRate = connection.welcome?.tickRate || 30;
-		this.#predictor!.record(seq, input, dtMs ?? this.#options.inputDtMs ?? 1000 / tickRate);
+		const smooth = this.#options.prediction!.smoothSteps !== false;
+		this.#predictor!.record(seq, input, dtMs, smooth ? this.#scheduler.now() : undefined);
 		return seq;
 	}
 
@@ -351,7 +460,8 @@ export class GameClient<TInput = unknown> {
 	/**
 	 * The merged world to draw now: every zone sampled at its own
 	 * `serverNow - interpolationDelay`, the controlled entity at its predicted
-	 * (present) state with correction smoothing.
+	 * (present) state with correction smoothing (and, with `smoothSteps`,
+	 * partway through its last step).
 	 */
 	render(): RenderedEntity[] {
 		const out: RenderedEntity[] = [];
@@ -361,7 +471,24 @@ export class GameClient<TInput = unknown> {
 			this.#predictionEnabled && predictor?.active === true && this.#authority !== undefined
 				? predictor.entityId
 				: undefined;
-		if (controlled !== undefined) this.#handoffBridge = undefined;
+		let carry = this.#carry;
+		if (controlled !== undefined) {
+			this.#handoffBridge = undefined;
+			if (carry !== undefined && carry.zoneId === this.#authority?.zoneId) {
+				// The target bound the entity: ease from what was drawn.
+				predictor!.easeFrom(carry.fields, now);
+				this.#carry = carry = undefined;
+			}
+		}
+		if (carry !== undefined) {
+			this.#handoffBridge = {
+				...carry.base,
+				key: `${carry.zoneId}:${carry.base.id}`,
+				zoneId: carry.zoneId,
+				fields: { ...carry.base.fields, ...carry.fields },
+				stale: false
+			};
+		}
 		const gone = this.#handedOff;
 		let goneSeen = false;
 		let mine: RenderedEntity | undefined;
@@ -413,7 +540,12 @@ export class GameClient<TInput = unknown> {
 		if (this.#closed) throw new Error('GameClient is closed');
 	}
 
-	#connectionOptions(zoneId: string, role: 'authority' | 'observer', initialTicket?: string): GameConnectionOptions {
+	#connectionOptions(
+		zoneId: string,
+		role: 'authority' | 'observer',
+		initialTicket?: string,
+		near?: boolean
+	): GameConnectionOptions {
 		const o = this.#options;
 		const observerTicket: GameTicketSource =
 			o.observerTicket ?? ((request) => o.ticket({ ...request, role: 'observer' }));
@@ -421,6 +553,7 @@ export class GameClient<TInput = unknown> {
 			url: o.url(zoneId),
 			zoneId,
 			role: role === 'authority' ? 'player' : 'observer',
+			near: role === 'observer' && near === true,
 			ticket: role === 'authority' ? o.ticket : observerTicket,
 			initialTicket,
 			contentVersion: this.#contentVersion,
@@ -439,7 +572,7 @@ export class GameClient<TInput = unknown> {
 	 * same zone (observer, or retired after a handoff) hands its replica over
 	 * so already-rendered entities continue without a gap.
 	 */
-	#adopt(zoneId: string, role: 'authority' | 'observer', initialTicket?: string): Zone {
+	#adopt(zoneId: string, role: 'authority' | 'observer', initialTicket?: string, near?: boolean): Zone {
 		const prior = this.#zones.get(zoneId) ?? this.#retired.get(zoneId);
 		const replica =
 			prior?.replica ??
@@ -448,7 +581,7 @@ export class GameClient<TInput = unknown> {
 				staleGraceMs: this.#options.staleGraceMs,
 				historyMs: this.#options.historyMs
 			});
-		const connection = new GameConnection(this.#connectionOptions(zoneId, role, initialTicket));
+		const connection = new GameConnection(this.#connectionOptions(zoneId, role, initialTicket, near));
 		const zone: Zone = { zoneId, role, connection, replica, offs: [], firstDeltaSeen: false };
 		if (prior !== undefined) {
 			// The prior connection keeps feeding the shared replica until the
@@ -485,6 +618,7 @@ export class GameClient<TInput = unknown> {
 					this.#bindControlled(true);
 					this.#emitter.emit('authority', zone.zoneId, welcome);
 				}
+				this.#focus(zone);
 				this.#emitter.emit('welcome', zone.zoneId, welcome);
 			}),
 			c.on('delta', (delta) => this.#onDelta(zone, delta)),
@@ -513,7 +647,7 @@ export class GameClient<TInput = unknown> {
 			if (id !== undefined) {
 				const entity = zone.replica.get(id);
 				if (entity !== undefined && !this.#predictor.active) {
-					this.#predictor.bind(id, zone.replica.schema?.byId.get(entity.kind), entity.fields);
+					this.#predictor.bind(id, zone.replica.schema?.byId.get(entity.kind), entity.fields, delta.ackSeq);
 				}
 				const correction = this.#predictor.reconcile(
 					delta.ackSeq,
@@ -556,9 +690,13 @@ export class GameClient<TInput = unknown> {
 		const to = message.targetZone;
 		this.#emitter.emit('handoff', { from, to, message });
 		const last = this.#lastControlled;
+		this.#carry = undefined;
 		if (last !== undefined && last.zoneId === from) {
 			this.#handoffBridge = { ...last, stale: false };
 			this.#handedOff = { zoneId: from, id: last.id };
+			const predicted = this.#predictor?.predicted();
+			const fields = predicted === undefined ? undefined : this.#options.prediction?.handoffFrame?.(predicted, from, to);
+			if (fields !== undefined) this.#carry = { zoneId: to, base: last, fields, unsent: [] };
 		}
 		this.#controlledOverride = undefined;
 		this.#predictor?.bind(undefined);
@@ -591,6 +729,7 @@ export class GameClient<TInput = unknown> {
 			if (this.#closed || this.#authority !== target) return;
 			this.#emitter.emit('handoffFailed', { from, to, stage, reason });
 			this.#handoffBridge = undefined;
+			this.#carry = undefined;
 			connection.close({ leave: false });
 			// Keep the zone's replica rendering while the next attempt runs.
 			this.#retire(target, true);
@@ -609,6 +748,12 @@ export class GameClient<TInput = unknown> {
 			connection.on('welcome', () => {
 				if (done) return;
 				finish();
+				// Inputs predicted while the handoff was in flight go to the
+				// target (recorded, so the target's state replays them).
+				const carry = this.#carry;
+				if (carry !== undefined && carry.zoneId === zoneId) {
+					for (const { input, dtMs } of carry.unsent.splice(0)) this.#send(target, input, dtMs);
+				}
 				const off = connection.on('delta', () => {
 					off();
 					this.#emitter.emit('handoffComplete', { from, to: zoneId });

@@ -7,9 +7,11 @@ name: Game demos smoke
 # headless tests, and the SvelteKit demo end to end: `distributed build
 # examples/game/server` (GraphQL client, svelte-check, vite build), then
 # Playwright against the production build, a real Mob Pit server and the real
-# mobpit-service read model. Mob Pit's durable cells run on celld: the tests
-# start their own `celld dev` (CELLD_BIN, pinned in /.celld-version; no Docker) serving
-# examples/game/cells, built with worker-build.
+# mobpit-service read model. Mob Pit's rooms and durable cells run on celld:
+# the tests start their own `celld dev` (CELLD_BIN, pinned in
+# /.celld-version) serving examples/game/cells, built with worker-build; the
+# SvelteKit Playwright test runs the rooms on a 3-node fleet (RustFS via
+# docker compose and the aws CLI, both on the runner; required here).
 on:
   workflow_call:
 
@@ -64,6 +66,7 @@ jobs:
         env:
           # The SvelteKit leaderboard is the Redis board (GraphQL board roots).
           REDIS_URL: redis://127.0.0.1:6379
+          MOBPIT_FLEET_REQUIRED: "1"
         run: examples/game/run.sh smoke
       - name: Leaderboard conformance and GraphQL boards against real Redis
         env:

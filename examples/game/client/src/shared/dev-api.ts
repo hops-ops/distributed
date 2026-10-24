@@ -4,8 +4,11 @@
  *
  * A real game gets admission tickets from its authenticated lobby; the dev
  * route mints one for a server-generated guest. We keep the server-signed
- * guest token per tab (sessionStorage when available): a reload stays the
- * same player, and each tab is its own player. Works in browsers (relative URLs) and in Node tests (`base`).
+ * guest token per browser (localStorage when available): a reload, a new
+ * tab or a reopened browser is the same player (a second tab takes the
+ * player over). `?player=<label>` in the page URL keeps a separate guest
+ * per label, to play several players from one browser. Works in browsers
+ * (relative URLs) and in Node tests (`base`).
  */
 import type { GameTicketSource } from '@hops-ops/distributed/game';
 
@@ -25,15 +28,25 @@ export type DevApiOptions = Readonly<{
 	base?: string;
 	/** Display name for new tickets (read on every request). */
 	name?: () => string | undefined;
-	/** Where the guest token lives between reloads (default sessionStorage when present: one guest per tab). */
+	/** Where the guest token lives between visits (default localStorage when present: one guest per browser). */
 	storage?: Pick<Storage, 'getItem' | 'setItem'>;
+	/** Guest label (default the page's `?player=`): one guest per label. */
+	player?: string;
 }>;
 
 const GUEST_KEY = 'game-demos.guest';
 
 function defaultStorage(): Pick<Storage, 'getItem' | 'setItem'> | undefined {
 	try {
-		return globalThis.sessionStorage ?? undefined;
+		return globalThis.localStorage ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function pagePlayer(): string | undefined {
+	try {
+		return new URLSearchParams(globalThis.location?.search ?? '').get('player') ?? undefined;
 	} catch {
 		return undefined;
 	}
@@ -43,6 +56,7 @@ export class DevApi {
 	readonly base: string;
 	readonly #name: () => string | undefined;
 	readonly #storage: Pick<Storage, 'getItem' | 'setItem'> | undefined;
+	readonly #key: string;
 	#guest: string | undefined;
 	/** Last ticket response (principal and display name in effect). */
 	last: DevTicket | undefined;
@@ -51,7 +65,22 @@ export class DevApi {
 		this.base = options.base ?? '';
 		this.#name = options.name ?? (() => undefined);
 		this.#storage = options.storage ?? defaultStorage();
-		this.#guest = this.#storage?.getItem(GUEST_KEY) ?? undefined;
+		const player = options.player ?? pagePlayer();
+		this.#key = player === undefined || player === '' ? GUEST_KEY : `${GUEST_KEY}.${player}`;
+		this.#guest = this.#read() ?? undefined;
+	}
+
+	/** The server-signed guest token (undefined before the first ticket). */
+	get guest(): string | undefined {
+		return this.#guest;
+	}
+
+	#read(): string | null | undefined {
+		try {
+			return this.#storage?.getItem(this.#key);
+		} catch {
+			return undefined;
+		}
 	}
 
 	/** Mint a single-use admission ticket for `zone`. */
@@ -64,7 +93,11 @@ export class DevApi {
 		});
 		const ticket = response as DevTicket;
 		this.#guest = ticket.guest;
-		this.#storage?.setItem(GUEST_KEY, ticket.guest);
+		try {
+			this.#storage?.setItem(this.#key, ticket.guest);
+		} catch {
+			// Storage full or blocked: this page keeps the guest anyway.
+		}
 		this.last = ticket;
 		return ticket;
 	}

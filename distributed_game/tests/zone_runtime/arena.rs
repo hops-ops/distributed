@@ -23,6 +23,10 @@ pub struct ArenaConfig {
     pub spawn_every: Option<Duration>,
     /// Allocation payload handed over by the zone factory.
     pub allocation: Option<serde_json::Value>,
+    /// `Zone::origin` (Welcome v2).
+    pub origin: Option<distributed_game::Origin>,
+    /// `Zone::view_radius` (the default observer focus).
+    pub view_radius: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +57,8 @@ pub struct Arena {
     pub auth_extensions: Vec<distributed_game::TicketExtensions>,
     /// `lost:{player}` / `back:{player}` from the connection hooks.
     pub connection_events: Vec<String>,
+    /// `Ctx::dropped_ticks` seen by each `on_tick`.
+    pub dropped_seen: Vec<u32>,
 }
 
 impl Arena {
@@ -123,6 +129,7 @@ impl Zone for Arena {
             tiers: Vec::new(),
             auth_extensions: Vec::new(),
             connection_events: Vec::new(),
+            dropped_seen: Vec::new(),
         }
     }
 
@@ -186,6 +193,14 @@ impl Zone for Arena {
             .push(format!("unobserve:{}", principal.as_deref().unwrap_or("?")));
     }
 
+    fn origin(&self) -> Option<distributed_game::Origin> {
+        self.cfg.origin
+    }
+
+    fn view_radius(&self) -> Option<f32> {
+        self.cfg.view_radius
+    }
+
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<(i8, i8)> {
         match payload {
             [dx, dy] => Some((*dx as i8, *dy as i8)),
@@ -202,6 +217,7 @@ impl Zone for Arena {
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
         self.ticks += 1;
+        self.dropped_seen.push(ctx.dropped_ticks());
         let dt = ctx.dt_secs();
         let players: Vec<PlayerId> = self.avatars.keys().copied().collect();
         for player in players {
