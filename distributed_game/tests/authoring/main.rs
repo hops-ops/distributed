@@ -64,7 +64,7 @@ pub struct MarkerView {
 }
 
 #[derive(Debug, Clone, PartialEq, Replicated)]
-#[replicated(kind = "stats", id = 4, global)]
+#[replicated(kind = "stats", id = 4, global, every_patch)]
 pub struct StatsView {
     pub slow_ms: u16,
     pub tick_ms: f32,
@@ -363,6 +363,7 @@ fn replicated_kind_def_and_values_share_one_field_order() {
         (kind.id, kind.name.as_str(), kind.priority),
         (1, "player", 2.0)
     );
+    assert!(!kind.every_patch && StatsView::kind_def().every_patch);
     let names: Vec<_> = kind.fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(
         names,

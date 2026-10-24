@@ -19,7 +19,7 @@
 	const game = useGame(
 		() => {
 			const typed = createMobpitClient({
-				url: (zone) => `${data.roomsUrls[entry++ % data.roomsUrls.length]}/rooms/${encodeURIComponent(zone)}`,
+				url: (zone) => `${data.roomsUrls[entry++ % data.roomsUrls.length]}/zones/${encodeURIComponent(zone)}`,
 				ticket: gameTicketSource(),
 				pingIntervalMs: 500,
 				inputDtMs: 1000 / 30,
@@ -153,7 +153,7 @@
 		const poll = async () => {
 			while (!stop) {
 				try {
-					info = await (await fetch(`${http}/rooms/${encodeURIComponent(zone)}/info`)).json();
+					info = await (await fetch(`${http}/zones/${encodeURIComponent(zone)}/info`)).json();
 				} catch {
 					// the room's node is moving; keep the last view
 				}

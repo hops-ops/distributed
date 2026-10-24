@@ -116,9 +116,9 @@ pub struct BotConfig {
     /// Server base URL, e.g. `ws://127.0.0.1:2567` (`{path}/{zone}` is
     /// appended).
     pub url: String,
-    /// Path the zone id is appended to: `/zones` on the `net` server,
-    /// whatever the worker routes to its zone objects on celld (e.g.
-    /// `/rooms`).
+    /// Path the zone id is appended to: `/zones` on the `net` server and
+    /// whatever the worker routes to its zone objects on celld (Mob Pit:
+    /// `/zones` too).
     pub path: String,
     /// Zone to join.
     pub zone: String,
@@ -173,6 +173,8 @@ pub struct BotStats {
     pub index: usize,
     /// Welcome received.
     pub joined: bool,
+    /// Time from the start of the connect to the Welcome.
+    pub joined_after: Option<Duration>,
     /// Why it stopped early.
     pub error: Option<String>,
     /// Deltas applied.
@@ -371,6 +373,7 @@ async fn drive(
         extensions: Default::default(),
         wake: false,
     });
+    let started = Instant::now();
     let url = format!(
         "{}/{}/{}",
         config.url.trim_end_matches('/'),
@@ -421,7 +424,10 @@ async fn drive(
             msg = ws.next() => {
                 let bytes = match msg {
                     Some(Ok(Message::Binary(b))) => b,
-                    Some(Ok(Message::Close(_))) | None => return Err("closed by server".into()),
+                    Some(Ok(Message::Close(Some(frame)))) => {
+                        return Err(format!("closed by server ({} {})", u16::from(frame.code), frame.reason))
+                    }
+                    Some(Ok(Message::Close(None))) | None => return Err("closed by server".into()),
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => return Err(format!("recv: {e}")),
                 };
@@ -429,6 +435,7 @@ async fn drive(
                     ServerMessage::Welcome(_) => {
                         stats.joined = true;
                         let now = Instant::now();
+                        stats.joined_after = Some(now - started);
                         joined_at = Some(now);
                         next_input = now;
                         next_ping = now;

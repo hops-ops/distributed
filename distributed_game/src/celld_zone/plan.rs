@@ -19,8 +19,16 @@ pub const TICKET_SECRET_VAR: &str = "GAME_TICKET_SECRET";
 pub const TICK_HZ_VAR: &str = "ZONE_TICK_HZ";
 /// Env var: patch rate (Hz, default 20, at most the tick rate).
 pub const PATCH_HZ_VAR: &str = "ZONE_PATCH_HZ";
-/// Env var: snapshot interval while occupied (ms, default 5000).
+/// Env var: snapshot interval while occupied (ms, default 60000). Each
+/// snapshot is a durable write celld keeps (an LTX file per write), so a
+/// short interval grows the store and the cost of every later write.
 pub const PERSIST_MS_VAR: &str = "ZONE_PERSIST_MS";
+/// Env var: how long an emptied room keeps ticking before it goes dormant
+/// (ms, default 10000). Going dormant reports the room's activity and writes
+/// its snapshot, so a room whose last player or near watcher comes and goes
+/// (a player by a doorway wakes and releases the room behind it every few
+/// seconds) would otherwise pay those writes on every swing.
+pub const DORMANT_AFTER_MS_VAR: &str = "ZONE_DORMANT_AFTER_MS";
 /// Env var: how long an empty room stays dormant before it hibernates (ms,
 /// default 10000).
 pub const HIBERNATE_AFTER_MS_VAR: &str = "ZONE_HIBERNATE_AFTER_MS";
@@ -29,6 +37,10 @@ pub const RECONNECT_GRACE_MS_VAR: &str = "ZONE_RECONNECT_GRACE_MS";
 /// Env var: command-ledger service id of the zone's facts (default
 /// `celld-zone`).
 pub const FACT_SERVICE_VAR: &str = "ZONE_FACT_SERVICE";
+/// Env var: facts of a lane settled in one cell request at most (default
+/// [`DEFAULT_MAX_BATCH`](crate::facts::DEFAULT_MAX_BATCH), 1..=256; 1
+/// sends each fact alone).
+pub const FACT_BATCH_VAR: &str = "ZONE_FACT_BATCH";
 /// Env var (debug only, off by default): `name=host:port,…` celld operator
 /// listeners asked which node holds the room (celld does not tell
 /// application code its node id).
@@ -43,6 +55,14 @@ pub const DEV_SETTINGS_VAR: &str = "ZONE_DEV_SETTINGS";
 /// the worker's `content-rollout` cell, e.g. `world`; unset: no live
 /// content updates).
 pub const CONTENT_ROLLOUT_VAR: &str = "ZONE_CONTENT_ROLLOUT";
+/// Env var (A/B switch): `0` makes zones poll their watched cells every
+/// second instead of taking pushes (default `1`: pushed, reconciled every
+/// ~45 s).
+pub const WORLD_PUSH_VAR: &str = "ZONE_WORLD_PUSH";
+/// Env var (A/B switch): `0` turns the distance-based update rates off
+/// (every visible change every patch, [`UpdateRates::every_patch`](crate::UpdateRates::every_patch));
+/// default `1`: the zone's [`HostConfig`](crate::HostConfig) rates.
+pub const UPDATE_RATES_VAR: &str = "ZONE_UPDATE_RATES";
 pub use crate::netsim::{NETSIM_SHARD, ZONE_DEV_KIND};
 
 /// Request header naming the zone (set by [`super::forward_to_zone`]; the
@@ -66,12 +86,16 @@ pub struct ObjectOptions {
     pub patch_hz: u32,
     /// Snapshot interval while occupied.
     pub persist_every: Duration,
+    /// Emptied → dormant.
+    pub dormant_after: Duration,
     /// Dormant → hibernated.
     pub hibernate_after: Duration,
     /// Reconnect grace window.
     pub reconnect_grace: Duration,
     /// Fact command-ledger service id.
     pub fact_service: String,
+    /// Facts per cell batch at most ([`FACT_BATCH_VAR`]).
+    pub fact_batch: usize,
     /// Debug node lookup: `(name, operator host:port)`.
     pub nodes: Vec<(String, String)>,
     /// Debug fixed node name.
@@ -81,6 +105,15 @@ pub struct ObjectOptions {
     /// The world (`content-rollout` shard) whose live content version and
     /// rollout the zone follows.
     pub content_rollout: Option<String>,
+    /// Watched cells push to the zone ([`WORLD_PUSH_VAR`]).
+    pub world_push: bool,
+    /// Distance-based update rates on ([`UPDATE_RATES_VAR`]).
+    pub update_rates: bool,
+}
+
+/// A switch var: on unless set to `0`, `false` or `no`.
+fn on_unless_off(get: &impl Fn(&str) -> Option<String>, name: &str) -> bool {
+    get(name).is_none_or(|v| !matches!(v.trim(), "0" | "false" | "no"))
 }
 
 fn parse<T: std::str::FromStr>(
@@ -108,6 +141,10 @@ impl ObjectOptions {
             return Err(format!("{TICK_HZ_VAR} must be within 1..=120"));
         }
         let patch_hz: u32 = parse(&get, PATCH_HZ_VAR, 20)?;
+        let fact_batch: usize = parse(&get, FACT_BATCH_VAR, crate::facts::DEFAULT_MAX_BATCH)?;
+        if !(1..=256).contains(&fact_batch) {
+            return Err(format!("{FACT_BATCH_VAR} must be within 1..=256"));
+        }
         let nodes = get(NODES_VAR)
             .unwrap_or_default()
             .split(',')
@@ -122,12 +159,14 @@ impl ObjectOptions {
                 .filter(|secret| !secret.is_empty()),
             tick_hz,
             patch_hz: patch_hz.clamp(1, tick_hz),
-            persist_every: Duration::from_millis(parse(&get, PERSIST_MS_VAR, 5_000)?),
+            persist_every: Duration::from_millis(parse(&get, PERSIST_MS_VAR, 60_000)?),
+            dormant_after: Duration::from_millis(parse(&get, DORMANT_AFTER_MS_VAR, 10_000)?),
             hibernate_after: Duration::from_millis(parse(&get, HIBERNATE_AFTER_MS_VAR, 10_000)?),
             reconnect_grace: Duration::from_millis(parse(&get, RECONNECT_GRACE_MS_VAR, 5_000)?),
             fact_service: get(FACT_SERVICE_VAR)
                 .filter(|service| !service.trim().is_empty())
                 .unwrap_or_else(|| "celld-zone".into()),
+            fact_batch,
             nodes,
             node: get(NODE_VAR).filter(|node| !node.is_empty()),
             dev_settings: get(DEV_SETTINGS_VAR)
@@ -135,6 +174,8 @@ impl ObjectOptions {
             content_rollout: get(CONTENT_ROLLOUT_VAR)
                 .map(|world| world.trim().to_string())
                 .filter(|world| !world.is_empty()),
+            world_push: on_unless_off(&get, WORLD_PUSH_VAR),
+            update_rates: on_unless_off(&get, UPDATE_RATES_VAR),
         })
     }
 }
@@ -367,17 +408,25 @@ mod tests {
         let options =
             ObjectOptions::from_vars(vars(&[(TICKET_SECRET_VAR, "0123456789abcdef")])).unwrap();
         assert_eq!((options.tick_hz, options.patch_hz), (30, 20));
+        assert_eq!(options.dormant_after, Duration::from_secs(10));
         assert_eq!(options.hibernate_after, Duration::from_secs(10));
         assert!(options.nodes.is_empty(), "node lookup is off by default");
         assert_eq!(options.fact_service, "celld-zone");
+        assert!(
+            options.world_push && options.update_rates,
+            "switches default on"
+        );
         let options = ObjectOptions::from_vars(vars(&[
             (TICKET_SECRET_VAR, "0123456789abcdef"),
             (TICK_HZ_VAR, "10"),
             (PATCH_HZ_VAR, "20"),
             (NODES_VAR, "node-a=127.0.0.1:1, bad ,node-b=127.0.0.1:2"),
             ("DISTRIBUTED_INTERNAL_SECRET", "s"),
+            (WORLD_PUSH_VAR, "0"),
+            (UPDATE_RATES_VAR, "false"),
         ]))
         .unwrap();
+        assert!(!options.world_push && !options.update_rates);
         assert_eq!(options.patch_hz, 10, "patches never outpace ticks");
         assert_eq!(options.nodes.len(), 2);
         assert_eq!(options.internal_secret.as_deref(), Some("s"));
@@ -466,16 +515,16 @@ mod tests {
         assert_eq!(cell_binding("zone-activity"), "ZONE_ACTIVITY");
         assert_eq!(cell_binding("crawler"), "CRAWLER");
         assert_eq!(
-            zone_from_path("/rooms/", "/rooms/pit.1.-2/info"),
+            zone_from_path("/zones/", "/zones/pit.1.-2/info"),
             Some(("pit.1.-2".to_string(), "info"))
         );
         assert_eq!(
-            zone_from_path("/rooms/", "/rooms/a%20b"),
+            zone_from_path("/zones/", "/zones/a%20b"),
             None,
             "zones are printable ASCII without spaces"
         );
-        assert_eq!(zone_from_path("/rooms/", "/rooms/"), None);
-        assert_eq!(zone_from_path("/rooms/", "/other/x"), None);
+        assert_eq!(zone_from_path("/zones/", "/zones/"), None);
+        assert_eq!(zone_from_path("/zones/", "/other/x"), None);
     }
 
     #[test]

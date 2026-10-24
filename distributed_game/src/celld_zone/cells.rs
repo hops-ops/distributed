@@ -1,5 +1,8 @@
 //! Serving fact cells next to celld zones (wasm32): the internal wait-path
-//! route every fact cell of a game worker needs, and the zone-activity cell.
+//! route every fact cell of a game worker needs, watched world cells
+//! ([`CellWatchers`]), and the zone-activity cell.
+
+use std::cell::RefCell;
 
 use distributed::cell_host::{
     AggregateCell, CellCommandIdentity, CellDispatchError, CellWaitPathRequest, CelldOutbox,
@@ -9,10 +12,14 @@ use distributed::cell_host::{
 use distributed::microsvc::Session;
 use distributed::Aggregate;
 use serde_json::{json, Value};
-use worker::{Env, Method, Request, Response, Result, State};
+use worker::{Delay, Env, Headers, Method, Request, RequestInit, Response, Result, State};
 
-use crate::cell::fact_session_from_headers;
+use crate::cell::{fact_session_from_headers, run_fact_batch};
 use crate::world::content_rollout::{mount_content_rollout, ContentRollout};
+use crate::world::watch::{
+    parse_watcher_address, push_retryable, topic, watch_query, WatchUpdate, Watchers,
+    PUSH_CONCURRENCY, PUSH_RETRY_MS, PUSH_ROUTE, STATS_ROUTE,
+};
 use crate::world::zone_activity::{mount_zone_activity, ZoneActivity};
 
 /// Builds the handler session from trusted request headers (after the
@@ -57,17 +64,27 @@ pub fn json_status(body: Value, status: u16) -> Result<Response> {
 
 /// The wire form of a dispatch error.
 pub fn error_response(error: CellDispatchError) -> Result<Response> {
-    json_status(
-        json!({ "error": error.client_message(), "code": error.code() }),
-        error.status_code(),
-    )
+    let status = error.status_code();
+    json_status(error_body(&error), status)
 }
+
+fn error_body(error: &CellDispatchError) -> Value {
+    json!({ "error": error.client_message(), "code": error.code() })
+}
+
+/// The route of a fact batch: `POST /{kind}/{shard}/__batch` (see
+/// [`serve_cell`]).
+pub const BATCH_ROUTE: &str = "__batch";
 
 /// One cell's internal routes: `GET /{kind}/{shard}` → `read(cell)`, `POST
 /// /{kind}/{shard}/{command}` → the idempotent wait-path dispatch (identity
 /// from the service-id and principal-partition headers, the session from
-/// `sessions`), then a best-effort outbox drain. Every request must carry
-/// the internal secret.
+/// `sessions`), then a best-effort outbox drain. `POST
+/// /{kind}/{shard}/__batch` ([`BATCH_ROUTE`]) runs a zone's consecutive
+/// facts for this cell in one request ([`run_fact_batch`]: each entry as
+/// its own wait-path command, with its own ledger id and session, in order,
+/// stopping after the first retryable result), then one outbox drain.
+/// Every request must carry the internal secret.
 pub async fn serve_cell<A, F>(
     env: &Env,
     cell: &AggregateCell<A>,
@@ -94,6 +111,9 @@ where
             Ok(body) => json_status(body, 200),
             Err(error) => error_response(CellDispatchError::Internal(error)),
         },
+        (Method::Post, Some(route)) if route == BATCH_ROUTE => {
+            serve_batch(env, cell, req, sessions).await
+        }
         (Method::Post, Some(command)) => {
             let command = command.clone();
             let body: Value = match req.json().await {
@@ -135,6 +155,257 @@ where
         }
         _ => json_status(json!({ "error": "not found" }), 404),
     }
+}
+
+async fn serve_batch<A>(
+    env: &Env,
+    cell: &AggregateCell<A>,
+    mut req: Request,
+    sessions: Sessions,
+) -> Result<Response>
+where
+    A: Aggregate + Send + Sync + 'static,
+{
+    let Some(service) = req.headers().get(CELL_SERVICE_ID_HEADER).ok().flatten() else {
+        return error_response(CellDispatchError::Unauthorized);
+    };
+    let body: Value = match req.json().await {
+        Ok(body) => body,
+        Err(_) => return error_response(CellDispatchError::BadRequest("invalid JSON".into())),
+    };
+    let results = run_fact_batch(cell, &service, &body, sessions).await;
+    if let Err(error) = cell.drain_outbox(env).await {
+        worker::console_error!("post-commit drain deferred: {error}");
+    }
+    match results {
+        Ok(results) => json_status(results, 200),
+        Err(error) => error_response(error),
+    }
+}
+
+/// A watched world cell's watchers ([`crate::world::watch`]): zones that
+/// read the cell with `?watch=` get its view pushed after every commit (and
+/// every alarm) that moves its version. Memory only.
+///
+/// ```ignore
+/// pub struct HoodCell { cell: AggregateCell<Hood>, env: Env, watchers: CellWatchers }
+/// // fetch:  self.watchers.serve(&self.env, &self.cell, req, read_hood, sessions).await
+/// // alarm:  self.watchers.alarm(&self.env, &self.cell, read_hood).await
+/// ```
+pub struct CellWatchers {
+    topic: String,
+    watchers: RefCell<Watchers>,
+}
+
+impl CellWatchers {
+    /// The watchers of cell `kind` whose Durable Object is `state` (its
+    /// name is the shard).
+    pub fn new(kind: &str, state: &State) -> Self {
+        Self::of(kind, &state.id().name().unwrap_or_default())
+    }
+
+    /// The watchers of cell `kind/shard`.
+    pub fn of(kind: &str, shard: &str) -> Self {
+        Self {
+            topic: topic(kind, shard),
+            watchers: RefCell::new(Watchers::new()),
+        }
+    }
+
+    /// [`serve_cell`], plus: a read with `?watch=` leaves a lease and its
+    /// body carries the cell's `version`; a command that changed the view
+    /// is pushed to the live watchers; `GET /{kind}/{shard}/__watchers`
+    /// ([`STATS_ROUTE`]) answers the live watchers and
+    /// [`WatcherStats`](crate::world::watch::WatcherStats).
+    pub async fn serve<A, F>(
+        &self,
+        env: &Env,
+        cell: &AggregateCell<A>,
+        req: Request,
+        read: F,
+        sessions: Sessions,
+    ) -> Result<Response>
+    where
+        A: Aggregate + Send + Sync + 'static,
+        F: AsyncFn(&AggregateCell<A>) -> std::result::Result<Value, String>,
+    {
+        if req.method() == Method::Get {
+            if let Err(error) = authenticate(&req, env) {
+                return error_response(error);
+            }
+            let url = req.url()?;
+            if url.path().ends_with(&format!("/{STATS_ROUTE}")) {
+                return json_status(self.stats(), 200);
+            }
+            if let Some((watcher, lease)) = url.query().and_then(watch_query) {
+                self.watchers.borrow_mut().watch(&watcher, now_ms(), lease);
+            }
+        }
+        let is_command = req.method() == Method::Post;
+        let response = if req.method() == Method::Get {
+            match versioned(cell, &read).await {
+                Ok(body) => json_status(body, 200),
+                Err(error) => error_response(CellDispatchError::Internal(error)),
+            }
+        } else {
+            serve_cell(env, cell, req, &read, sessions).await
+        };
+        if is_command {
+            self.publish(env, cell, &read).await;
+        }
+        response
+    }
+
+    /// The live watchers and what the cell did for them.
+    fn stats(&self) -> Value {
+        stats_body(&self.topic, &mut self.watchers.borrow_mut())
+    }
+
+    /// [`cell_alarm`], then a push if a schedule moved the version.
+    pub async fn alarm<A, F>(&self, env: &Env, cell: &AggregateCell<A>, read: F) -> Result<Response>
+    where
+        A: Aggregate + Send + Sync + 'static,
+        F: AsyncFn(&AggregateCell<A>) -> std::result::Result<Value, String>,
+    {
+        let response = cell_alarm(env, cell).await;
+        self.publish(env, cell, &read).await;
+        response
+    }
+
+    /// Push the cell's view to its live watchers when it changed (best
+    /// effort, off the request; a lost push is repaired by the
+    /// watcher's next reconcile read).
+    async fn publish<A, F>(&self, env: &Env, cell: &AggregateCell<A>, read: &F)
+    where
+        A: Aggregate + Send + Sync + 'static,
+        F: AsyncFn(&AggregateCell<A>) -> std::result::Result<Value, String>,
+    {
+        let live = self.watchers.borrow_mut().live(now_ms());
+        if live.is_empty() {
+            return;
+        }
+        let Ok(view) = versioned(cell, read).await else {
+            return;
+        };
+        let version = crate::world::watch::view_version(&view);
+        {
+            let mut watchers = self.watchers.borrow_mut();
+            if !watchers.publish(version, &view) {
+                return;
+            }
+            watchers.pushed(live.len());
+        }
+        let update = WatchUpdate {
+            topic: self.topic.clone(),
+            version,
+            view,
+        };
+        push_all(env.clone(), live, update);
+    }
+}
+
+/// `{topic, live, ...WatcherStats}`.
+fn stats_body(topic: &str, watchers: &mut Watchers) -> Value {
+    let mut body = serde_json::to_value(watchers.stats()).unwrap_or_else(|_| json!({}));
+    if let Value::Object(fields) = &mut body {
+        fields.insert("topic".into(), json!(topic));
+        fields.insert("live".into(), json!(watchers.live(now_ms()).len()));
+    }
+    body
+}
+
+/// `read(cell)` with the aggregate's version in its `version` field.
+async fn versioned<A, F>(cell: &AggregateCell<A>, read: &F) -> std::result::Result<Value, String>
+where
+    A: Aggregate + Send + Sync + 'static,
+    F: AsyncFn(&AggregateCell<A>) -> std::result::Result<Value, String>,
+{
+    let version = cell
+        .load()
+        .await
+        .map_err(|error| error.to_string())?
+        .map_or(0, |aggregate| aggregate.entity().version());
+    let mut body = read(cell).await?;
+    if let Value::Object(fields) = &mut body {
+        fields.insert("version".into(), json!(version));
+    }
+    Ok(body)
+}
+
+/// Push `update` to `watchers`, [`PUSH_CONCURRENCY`] at a time, off the
+/// caller.
+pub(crate) fn push_all(env: Env, watchers: Vec<String>, update: WatchUpdate) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let Some(secret) = internal_secret(&env) else {
+            return;
+        };
+        let Ok(body) = serde_json::to_string(&update) else {
+            return;
+        };
+        for chunk in watchers.chunks(PUSH_CONCURRENCY) {
+            let pushes = chunk
+                .iter()
+                .map(|watcher| push(&env, watcher, &secret, &body));
+            futures_util::future::join_all(pushes).await;
+        }
+    });
+}
+
+/// One push, retried after [`PUSH_RETRY_MS`] while it fails in transport or
+/// the zone is too busy to take it ([`push_retryable`]).
+async fn push(env: &Env, watcher: &str, secret: &str, body: &str) {
+    let Some((binding, name)) = parse_watcher_address(watcher) else {
+        return;
+    };
+    let mut waits = PUSH_RETRY_MS.iter();
+    loop {
+        let error = match push_once(env, binding, name, secret, body).await {
+            Ok(status) if !push_retryable(status) => return,
+            Ok(status) => format!("HTTP {status}"),
+            Err(error) => error.to_string(),
+        };
+        let Some(wait) = waits.next() else {
+            worker::console_warn!(
+                "world push to {watcher}: {error}; giving up until its reconcile"
+            );
+            return;
+        };
+        Delay::from(std::time::Duration::from_millis(*wait)).await;
+    }
+}
+
+async fn push_once(env: &Env, binding: &str, name: &str, secret: &str, body: &str) -> Result<u16> {
+    let stub = env
+        .durable_object(binding)?
+        .id_from_name(name)?
+        .get_stub()?;
+    let headers = Headers::new();
+    headers.set(CELL_INTERNAL_SECRET_HEADER, secret)?;
+    headers.set(super::ZONE_HEADER, name)?;
+    headers.set("content-type", "application/json")?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(body.into()));
+    let url = format!("https://zone/{name}/{PUSH_ROUTE}");
+    let response = stub
+        .fetch_with_request(Request::new_with_init(&url, &init)?)
+        .await?;
+    Ok(response.status_code())
+}
+
+fn internal_secret(env: &Env) -> Option<String> {
+    env.secret(CELL_INTERNAL_SECRET_ENV)
+        .map(|value| value.to_string())
+        .or_else(|_| {
+            env.var(CELL_INTERNAL_SECRET_ENV)
+                .map(|value| value.to_string())
+        })
+        .ok()
+}
+
+fn now_ms() -> u64 {
+    js_sys::Date::now() as u64
 }
 
 /// A cell's alarm: due schedules, then the outbox drain.
@@ -194,16 +465,25 @@ async fn read_activity(cell: &AggregateCell<ZoneActivity>) -> std::result::Resul
 /// network simulation under shard [`NETSIM_SHARD`](super::NETSIM_SHARD).
 /// `GET /zone-dev/{shard}` returns the stored JSON (`{}` when unset), `PUT`
 /// (or `POST`) replaces it. Every request needs the internal secret. Zone
-/// objects read it only when `ZONE_DEV_SETTINGS=1`.
+/// objects watch it only when `ZONE_DEV_SETTINGS=1` (a `GET` with `?watch=`;
+/// each write is pushed to the watchers with the next `version`).
 pub struct ZoneDevSettings {
     state: State,
     env: Env,
+    watchers: RefCell<Watchers>,
+    topic: String,
 }
 
 impl ZoneDevSettings {
     /// The settings object of `state`.
     pub fn new(state: State, env: Env) -> Self {
-        Self { state, env }
+        let topic = topic(super::ZONE_DEV_KIND, &state.id().name().unwrap_or_default());
+        Self {
+            state,
+            env,
+            watchers: RefCell::new(Watchers::new()),
+            topic,
+        }
     }
 
     /// Durable Object `fetch`.
@@ -212,10 +492,33 @@ impl ZoneDevSettings {
             return error_response(error);
         }
         const KEY: &str = "settings";
+        const VERSION: &str = "version";
         match req.method() {
             Method::Get => {
+                let url = req.url()?;
+                if url.path().ends_with(&format!("/{STATS_ROUTE}")) {
+                    return json_status(
+                        stats_body(&self.topic, &mut self.watchers.borrow_mut()),
+                        200,
+                    );
+                }
+                if let Some((watcher, lease)) = url.query().and_then(watch_query) {
+                    self.watchers.borrow_mut().watch(&watcher, now_ms(), lease);
+                }
                 let stored: Option<Value> = self.state.storage().get(KEY).await.ok().flatten();
-                json_status(stored.unwrap_or_else(|| json!({})), 200)
+                let version: u64 = self
+                    .state
+                    .storage()
+                    .get(VERSION)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                let mut body = stored.unwrap_or_else(|| json!({}));
+                if let Value::Object(fields) = &mut body {
+                    fields.insert(VERSION.into(), json!(version));
+                }
+                json_status(body, 200)
             }
             Method::Put | Method::Post => {
                 let body: Value = match req.json().await {
@@ -226,7 +529,34 @@ impl ZoneDevSettings {
                         ))
                     }
                 };
+                let version: u64 = self
+                    .state
+                    .storage()
+                    .get(VERSION)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0)
+                    + 1;
                 self.state.storage().put(KEY, &body).await?;
+                self.state.storage().put(VERSION, version).await?;
+                let live = self.watchers.borrow_mut().live(now_ms());
+                let mut view = body.clone();
+                if let Value::Object(fields) = &mut view {
+                    fields.insert(VERSION.into(), json!(version));
+                }
+                if !live.is_empty() && self.watchers.borrow_mut().publish(version, &view) {
+                    self.watchers.borrow_mut().pushed(live.len());
+                    push_all(
+                        self.env.clone(),
+                        live,
+                        WatchUpdate {
+                            topic: self.topic.clone(),
+                            version,
+                            view,
+                        },
+                    );
+                }
                 json_status(body, 200)
             }
             _ => json_status(json!({ "error": "not found" }), 404),
@@ -241,16 +571,20 @@ impl ZoneDevSettings {
 /// `sessions` decides who may start a rollout: it must give the admin's
 /// session the [`CONTENT_ADMIN_ROLE`](crate::world::content_rollout::CONTENT_ADMIN_ROLE)
 /// (the cell's own schedules need no session). `GET` returns
-/// `{"state": ContentState | null}`.
+/// `{"state": ContentState | null, "version": n}`; zones watch it
+/// ([`CellWatchers`]).
 pub struct ContentRolloutCell {
     cell: AggregateCell<ContentRollout>,
     env: Env,
     sessions: Sessions,
+    watchers: CellWatchers,
 }
 
 impl ContentRolloutCell {
     /// Open the cell of `state`, publishing its events to `outbox`.
     pub fn new(state: State, env: Env, outbox: CelldOutbox, sessions: Sessions) -> Self {
+        let watchers =
+            CellWatchers::new(crate::world::content_rollout::CONTENT_ROLLOUT_KIND, &state);
         let cell = mount_content_rollout(
             AggregateCell::<ContentRollout>::from_state_with_snapshots(state, 20)
                 .expect("content rollout cell identity"),
@@ -260,17 +594,22 @@ impl ContentRolloutCell {
             cell,
             env,
             sessions,
+            watchers,
         }
     }
 
-    /// Durable Object `fetch`.
+    /// Durable Object `fetch` (zones watch it: every phase is pushed).
     pub async fn fetch(&self, req: Request) -> Result<Response> {
-        serve_cell(&self.env, &self.cell, req, read_rollout, self.sessions).await
+        self.watchers
+            .serve(&self.env, &self.cell, req, read_rollout, self.sessions)
+            .await
     }
 
     /// Durable Object `alarm` (the rollout's own schedule).
     pub async fn alarm(&self) -> Result<Response> {
-        cell_alarm(&self.env, &self.cell).await
+        self.watchers
+            .alarm(&self.env, &self.cell, read_rollout)
+            .await
     }
 }
 

@@ -26,17 +26,23 @@ use super::plan::{
     cell_binding, classify_wait_path, zone_from_path, ObjectOptions, RoomState, StoredFact,
     TickSchedule, Window, CLOSE_RESTARTED, NETSIM_SHARD, OUTBOX_PREFIX, ZONE_DEV_KIND, ZONE_HEADER,
 };
-use crate::command_sink::{CommandFactSink, FactCall, FactHost, FactRoute};
+use crate::command_sink::{CommandFactSink, FactBatchHost, FactCall, FactHost, FactRoute};
 use crate::facts::{
-    fact_channel, BoxFuture, Fact, FactError, FactQueue, FactReceipt, FactSink, RetryPolicy,
+    fact_channel, BoxFuture, Fact, FactBatchSink, FactError, FactQueue, FactReceipt, FactSink,
+    RetryPolicy,
 };
 use crate::handoff::{HandoffRequest, Transfer};
 use crate::inbox::ZoneInbound;
 use crate::netsim::{DelayLine, NetSim, NetSimJson};
-use crate::protocol::{error, ClientMessage, Notice, Role, ServerMessage, PROTOCOL_VERSION};
+use crate::protocol::{error, supports_protocol, ClientMessage, Notice, Role, ServerMessage};
 use crate::stamp::FactStamp;
 use crate::ticket::{NonceCache, TicketKey, VerifiedTicket};
+use crate::work::WorkCounters;
 use crate::world::content_rollout::{zone_step, ContentState, ZoneStep, CONTENT_ROLLOUT_KIND};
+use crate::world::watch::{
+    topic, view_version, watch_query_string, watcher_address, WatchUpdate, Watches, WorldSync,
+    PUSH_ROUTE, WATCH_LEASE_MS,
+};
 use crate::world::zone_activity::{
     zone_principal, RecordActivity, ACTIVITY_ACTIVE, ACTIVITY_DORMANT, ACTIVITY_HIBERNATED,
     ZONE_ACTIVITY_KIND,
@@ -60,8 +66,8 @@ const TRANSFER_TTL_SECS: u64 = 30;
 const FACT_CAPACITY: usize = 512;
 /// Retry stored facts this often while any is unsettled (ms).
 const OUTBOX_RETRY_MS: f64 = 10_000.0;
-/// Read the dev settings this often while ticking (ms).
-const DEV_SETTINGS_EVERY_MS: f64 = 1_000.0;
+/// Shortest crash watchdog period (each re-arm is a durable alarm write).
+const WATCHDOG_MIN_MS: f64 = 60_000.0;
 
 /// Server → client, through the socket's simulated network.
 enum OutItem {
@@ -110,8 +116,23 @@ pub trait CelldZone: Zone {
         None
     }
 
+    /// The world cells the zone watches ([`Watches`]): each is read on
+    /// wake, pushed by its cell after every change and re-read every ~45 s;
+    /// its view becomes a message ([`Zone::on_message`]). Eventually
+    /// consistent: world flavour, never reward settlement.
+    ///
+    /// ```ignore
+    /// fn watch(zone_id: &str) -> Watches<PitMessage> {
+    ///     Watches::new().cell(HOOD_KIND, &hood_of(zone_id), |read: HoodRead| read.state.map(PitMessage::Hood))
+    /// }
+    /// ```
+    fn watch(_zone_id: &str) -> Watches<Self::Message> {
+        Watches::new()
+    }
+
     /// How often [`refresh`](Self::refresh) runs while the zone ticks
-    /// (`None`: never). It also runs once on every wake.
+    /// (`None`: never). It also runs once on every wake. For cell state,
+    /// prefer [`watch`](Self::watch) (pushed, no polling).
     fn refresh_every() -> Option<Duration> {
         None
     }
@@ -161,6 +182,18 @@ impl ObjectEnv {
     /// `GET /{kind}/{shard}` on a cell of this worker (its read route),
     /// object to object, with the internal secret.
     pub async fn read_cell(&self, kind: &str, shard: &str) -> std::result::Result<Value, String> {
+        self.read_cell_watching(kind, shard, None).await
+    }
+
+    /// [`read_cell`](Self::read_cell) that also watches the cell for
+    /// `watcher` ([`crate::world::watch`]): the cell pushes its next
+    /// versions until the lease ends.
+    pub async fn read_cell_watching(
+        &self,
+        kind: &str,
+        shard: &str,
+        watcher: Option<&str>,
+    ) -> std::result::Result<Value, String> {
         let secret = self
             .var(CELL_INTERNAL_SECRET_ENV)
             .ok_or_else(|| format!("{CELL_INTERNAL_SECRET_ENV} is required"))?;
@@ -170,7 +203,11 @@ impl ObjectEnv {
             .map_err(|e| e.to_string())?;
         let mut init = RequestInit::new();
         init.with_method(Method::Get).with_headers(headers);
-        let url = format!("https://cell/{kind}/{}", encode_segment(shard));
+        let mut url = format!("https://cell/{kind}/{}", encode_segment(shard));
+        if let Some(watcher) = watcher {
+            url.push('?');
+            url.push_str(&watch_query_string(watcher, WATCH_LEASE_MS));
+        }
         let request = Request::new_with_init(&url, &init).map_err(|e| e.to_string())?;
         let stub = stub_for(&self.env, kind, shard).map_err(|e| e.to_string())?;
         let mut response = stub
@@ -217,6 +254,7 @@ pub struct CelldObjectHost {
     env: SendWrapper<Env>,
     secret: String,
     service_id: String,
+    work: SendWrapper<Rc<RefCell<WorkCounters>>>,
 }
 
 impl CelldObjectHost {
@@ -226,11 +264,17 @@ impl CelldObjectHost {
             env: SendWrapper::new(env),
             secret: secret.into(),
             service_id: service_id.into(),
+            work: SendWrapper::new(Rc::default()),
         }
     }
 
+    /// Count the facts and requests it sends into `work`.
+    fn counting(mut self, work: Rc<RefCell<WorkCounters>>) -> Self {
+        self.work = SendWrapper::new(work);
+        self
+    }
+
     async fn post(&self, call: &FactCall<'_>) -> std::result::Result<FactReceipt, FactError> {
-        let retry = |e: worker::Error| FactError::Retryable(e.to_string());
         let headers = Headers::new();
         let set = |name: &str, value: &str| {
             headers
@@ -247,24 +291,138 @@ impl CelldObjectHost {
                 set(name, value)?;
             }
         }
-        let body = json!({ "commandId": call.command_id, "input": call.input }).to_string();
+        let body = json!({ "commandId": call.command_id, "input": call.input });
+        {
+            let mut work = self.work.borrow_mut();
+            work.fact_commands += 1;
+            work.fact_requests += 1;
+        }
+        let (status, body) = self
+            .send(call.kind, &call.shard, call.command, headers, body)
+            .await?;
+        classify_wait_path(status, &body)
+    }
+
+    /// `calls` (one aggregate) in one `POST /{kind}/{shard}/__batch`
+    /// ([`super::cells::serve_cell`]); each entry carries its own command
+    /// id, principal and stamp. A cell without the route, or one refusing
+    /// the batch request as a whole (4xx), gets them one by one.
+    async fn post_batch(
+        &self,
+        calls: Vec<FactCall<'_>>,
+    ) -> Vec<std::result::Result<FactReceipt, FactError>> {
+        let Some(first) = calls.first() else {
+            return Vec::new();
+        };
+        let (kind, shard) = (first.kind, first.shard.clone());
+        let entries: Vec<Value> = calls
+            .iter()
+            .map(|call| {
+                let mut session = serde_json::Map::new();
+                session.insert(USER_ID_KEY.into(), json!(call.principal));
+                for (name, value) in call.session.variables() {
+                    if name.starts_with(crate::stamp::SESSION_PREFIX) {
+                        session.insert(name.clone(), json!(value));
+                    }
+                }
+                json!({
+                    "command": call.command,
+                    "commandId": call.command_id,
+                    "input": call.input,
+                    "partition": call.principal,
+                    "session": session,
+                })
+            })
+            .collect();
+        let headers = Headers::new();
+        let set = |name: &str, value: &str| headers.set(name, value).is_ok();
+        if !(set(CELL_INTERNAL_SECRET_HEADER, &self.secret)
+            && set(CELL_SERVICE_ID_HEADER, &self.service_id)
+            && set("content-type", "application/json"))
+        {
+            return vec![Err(FactError::Permanent("batch headers".into()))];
+        }
+        {
+            let mut work = self.work.borrow_mut();
+            work.fact_commands += calls.len() as u64;
+            work.fact_requests += 1;
+            work.fact_batches += 1;
+        }
+        let sent = self
+            .send(
+                kind,
+                &shard,
+                super::cells::BATCH_ROUTE,
+                headers,
+                json!({ "entries": entries }),
+            )
+            .await;
+        match sent {
+            // No batch route (404; a cell serving only commands answers
+            // `__batch` 400), or the batch itself refused: each fact gets
+            // its own answer, never the first fact the batch's.
+            Ok((status, _)) if (400..500).contains(&status) && !matches!(status, 408 | 429) => {
+                let mut results = Vec::with_capacity(calls.len());
+                for call in &calls {
+                    let result = self.post(call).await;
+                    let stop = matches!(result, Err(FactError::Retryable(_)));
+                    results.push(result);
+                    if stop {
+                        break;
+                    }
+                }
+                results
+            }
+            Ok((status, body)) if (200..300).contains(&status) => body
+                .get("results")
+                .and_then(Value::as_array)
+                .map(|results| {
+                    results
+                        .iter()
+                        .map(|result| {
+                            let status = result
+                                .get("status")
+                                .and_then(Value::as_u64)
+                                .and_then(|status| u16::try_from(status).ok())
+                                .unwrap_or(500);
+                            classify_wait_path(status, result.get("body").unwrap_or(&Value::Null))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Ok((status, body)) => vec![classify_wait_path(status, &body)],
+            Err(error) => vec![Err(error)],
+        }
+    }
+
+    /// `POST https://cell/{kind}/{shard}/{route}` to the cell's stub:
+    /// `(status, JSON body)`.
+    async fn send(
+        &self,
+        kind: &str,
+        shard: &str,
+        route: &str,
+        headers: Headers,
+        body: Value,
+    ) -> std::result::Result<(u16, Value), FactError> {
+        let retry = |e: worker::Error| FactError::Retryable(e.to_string());
         let mut init = RequestInit::new();
         init.with_method(Method::Post)
             .with_headers(headers)
-            .with_body(Some(body.into()));
+            .with_body(Some(body.to_string().into()));
         let url = format!(
             "https://cell/{}/{}/{}",
-            encode_segment(call.kind),
-            encode_segment(&call.shard),
-            encode_segment(call.command)
+            encode_segment(kind),
+            encode_segment(shard),
+            encode_segment(route)
         );
         let request = Request::new_with_init(&url, &init).map_err(retry)?;
-        let stub = stub_for(&self.env, call.kind, &call.shard)
-            .map_err(|e| FactError::Permanent(format!("cell `{}`: {e}", call.kind)))?;
+        let stub = stub_for(&self.env, kind, shard)
+            .map_err(|e| FactError::Permanent(format!("cell `{kind}`: {e}")))?;
         let mut response = stub.fetch_with_request(request).await.map_err(retry)?;
         let status = response.status_code();
         let body: Value = response.json().await.unwrap_or(Value::Null);
-        classify_wait_path(status, &body)
+        Ok((status, body))
     }
 }
 
@@ -274,6 +432,27 @@ impl FactHost for CelldObjectHost {
         call: FactCall<'a>,
     ) -> BoxFuture<'a, std::result::Result<FactReceipt, FactError>> {
         Box::pin(SendFuture::new(async move { self.post(&call).await }))
+    }
+
+    /// One `__batch` request per cell (the feed's `ZONE_FACT_BATCH` bounds
+    /// it).
+    fn fact_batches(&self) -> Option<&dyn FactBatchHost> {
+        Some(self)
+    }
+}
+
+impl FactBatchHost for CelldObjectHost {
+    fn dispatch_fact_batch<'a>(
+        &'a self,
+        calls: Vec<FactCall<'a>>,
+    ) -> BoxFuture<'a, Vec<std::result::Result<FactReceipt, FactError>>> {
+        Box::pin(SendFuture::new(async move {
+            if calls.len() == 1 {
+                let call = calls.into_iter().next().expect("one call");
+                return vec![self.post(&call).await];
+            }
+            self.post_batch(calls).await
+        }))
     }
 }
 
@@ -287,6 +466,7 @@ impl FactHost for CelldObjectHost {
 struct DurableFacts {
     sink: ObjectFactSink,
     storage: SendWrapper<Rc<Storage>>,
+    work: SendWrapper<Rc<RefCell<WorkCounters>>>,
 }
 
 impl FactSink for DurableFacts {
@@ -306,6 +486,7 @@ impl FactSink for DurableFacts {
                 Ok(_) => {}
             }
             if !matches!(result, Err(FactError::Retryable(_))) {
+                self.work.borrow_mut().outbox_deletes += 1;
                 let _ = self
                     .storage
                     .delete(&StoredFact::storage_key(fact.key()))
@@ -314,6 +495,51 @@ impl FactSink for DurableFacts {
             result
         }))
     }
+
+    /// Batches when the cells take them.
+    fn batches(&self) -> Option<&dyn FactBatchSink> {
+        self.sink.batches().map(|_| self as &dyn FactBatchSink)
+    }
+}
+
+impl FactBatchSink for DurableFacts {
+    /// One batched delete for the facts the batch settled.
+    fn commit_batch<'a>(
+        &'a self,
+        facts: &'a [Fact],
+    ) -> BoxFuture<'a, Vec<std::result::Result<FactReceipt, FactError>>> {
+        Box::pin(SendFuture::new(async move {
+            let results = self.sink.commit_batch(facts).await;
+            let mut settled = Vec::new();
+            for (fact, result) in facts.iter().zip(&results) {
+                match result {
+                    Err(FactError::Permanent(e)) => {
+                        worker::console_error!("fact {} refused: {e}", fact.key())
+                    }
+                    Err(FactError::Retryable(e)) => {
+                        worker::console_warn!("fact {} will be retried: {e}", fact.key());
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
+                settled.push(StoredFact::storage_key(fact.key()));
+            }
+            if !settled.is_empty() {
+                self.work.borrow_mut().outbox_deletes += 1;
+                let _ = self.storage.delete_multiple(settled).await;
+            }
+            results
+        }))
+    }
+}
+
+/// Facts per cell batch from the zone's options.
+fn fact_batch(options: &Option<ObjectOptions>) -> usize {
+    options
+        .as_ref()
+        .map_or(crate::facts::DEFAULT_MAX_BATCH, |options| {
+            options.fact_batch
+        })
 }
 
 // ------------------------------------------------------------------ time
@@ -392,13 +618,36 @@ struct Snapshot {
     state: String,
 }
 
+/// When this activation woke and where its first join spent its time
+/// (`Date.now()` ms; celld advances it at I/O boundaries, so the spans are
+/// the awaited storage calls). Debug info for recovery timing.
+#[derive(Default, Clone, Copy)]
+struct WakeTrace {
+    /// The object was constructed (celld claimed and opened the cell).
+    constructed_at: f64,
+    /// First request of any kind (fetch, socket message, alarm).
+    first_call_at: Option<f64>,
+    /// What woke it: 1 fetch, 2 socket message, 3 alarm.
+    first_call: u8,
+    /// [`ZoneObject::start_facts`] (zone id write + outbox listing).
+    facts_ms: Option<f64>,
+    /// Facts resent from the outbox on wake.
+    outbox_resent: usize,
+    /// Snapshot read.
+    snapshot_read_ms: Option<f64>,
+    /// Restore (and, before the join writes moved after the Welcome, the
+    /// wake's status write).
+    restore_ms: Option<f64>,
+    /// The join's own status write and start of the loop, after the wake.
+    join_ms: Option<f64>,
+    /// First Welcome handed to celld (the output gate may hold it).
+    welcome_at: Option<f64>,
+}
+
 #[derive(Default)]
 struct TickStats {
     late: Window,
     work: Window,
-    /// Object storage writes (outbox, snapshot): one node acks a write when
-    /// its bucket upload lands.
-    write: Window,
     dropped: u64,
     iterations: u64,
 }
@@ -425,11 +674,21 @@ struct Inner<Z: CelldZone> {
     activity_seq: u64,
     outbox_loaded: bool,
     last_status: String,
+    /// The status last written (`None`: not read yet this activation).
+    stored_status: Option<String>,
     node: String,
     stats: TickStats,
     last_persist_ms: f64,
     /// A snapshot write is in flight (see [`ZoneObject::persist_later`]).
     persisting: bool,
+    /// Players at the last tick; a drop (leave, handoff, grace expired)
+    /// snapshots on that tick, not at the next interval.
+    players_seen: usize,
+    /// When the ticking room last became empty (it goes dormant after
+    /// `dormant_after` of that).
+    empty_since_ms: Option<f64>,
+    /// A player left since the last snapshot.
+    persist_soon: bool,
     spooled: u64,
     /// Dev network simulation in effect (from the dev settings object).
     net_sim: Option<NetSim>,
@@ -440,12 +699,18 @@ struct Inner<Z: CelldZone> {
     drain_at: Option<f64>,
     /// Spawns a drain task waking at the given time (set by the object).
     drainer: Option<Rc<dyn Fn(f64)>>,
-    last_dev_read_ms: f64,
-    /// Last read of the world's content rollout cell.
-    last_content_read_ms: f64,
+    /// Watched world cells ([`CelldZone::watch`] plus the dev settings and
+    /// content rollout), built on the first wake.
+    watches: Option<Rc<Watches<Z::Message>>>,
+    /// Highest version applied per watched topic (this activation) and
+    /// when each is read next.
+    world: WorldSync,
+    /// Work done by this object (all its activations).
+    work: Rc<RefCell<WorkCounters>>,
     /// [`CelldZone::refresh`] calls of this activation, and the last one.
     refresh_round: u64,
     last_refresh_ms: f64,
+    trace: WakeTrace,
 }
 
 impl<Z: CelldZone> Inner<Z> {
@@ -699,10 +964,24 @@ pub struct ZoneObject<Z: CelldZone> {
     state: Rc<State>,
     env: ObjectEnv,
     inner: Rc<RefCell<Inner<Z>>>,
+    /// Namespace binding of the object's class (`PIT_ROOM`): where watched
+    /// cells push. Empty: no pushes, watched cells are polled.
+    binding: Rc<str>,
 }
 
 impl<Z: CelldZone> ZoneObject<Z> {
-    /// The object for `state` (constructor of the Durable Object).
+    /// The object of Durable Object class `class` (bound, by convention, as
+    /// [`class_binding`](crate::world::watch::class_binding)`(class)`, e.g.
+    /// `PitRoom` → `PIT_ROOM`); [`crate::celld_zone_object!`] calls it.
+    pub fn of_class(state: State, env: Env, class: &str) -> Self {
+        let mut object = Self::new(state, env);
+        object.binding = crate::world::watch::class_binding(class).into();
+        object
+    }
+
+    /// The object for `state` (constructor of the Durable Object). Watched
+    /// cells push to it only if `ZONE_BINDING` names its class binding;
+    /// prefer [`of_class`](Self::of_class).
     pub fn new(state: State, env: Env) -> Self {
         let zone_id = state.id().name().unwrap_or_default();
         let env = ObjectEnv::new(env);
@@ -738,30 +1017,41 @@ impl<Z: CelldZone> ZoneObject<Z> {
             activity_seq: 0,
             outbox_loaded: false,
             last_status: String::new(),
+            stored_status: None,
             node,
             stats: TickStats::default(),
             last_persist_ms: 0.0,
             persisting: false,
+            players_seen: 0,
+            empty_since_ms: None,
+            persist_soon: false,
             spooled: 0,
             net_sim: None,
             out_lines: HashMap::new(),
             in_lines: HashMap::new(),
             drain_at: None,
             drainer: None,
-            last_dev_read_ms: 0.0,
-            last_content_read_ms: 0.0,
+            watches: None,
+            world: WorldSync::new(),
+            work: Rc::default(),
             refresh_round: 0,
             last_refresh_ms: 0.0,
+            trace: WakeTrace {
+                constructed_at: now_ms(),
+                ..WakeTrace::default()
+            },
         };
         let inner = Rc::new(RefCell::new(inner));
         let weak = Rc::downgrade(&inner);
         inner.borrow_mut().drainer = Some(Rc::new(move |due: f64| {
             wasm_bindgen_futures::spawn_local(drain_task(weak.clone(), due));
         }));
+        let binding = env.var("ZONE_BINDING").unwrap_or_default().into();
         Self {
             state: Rc::new(state),
             env,
             inner,
+            binding,
         }
     }
 
@@ -772,6 +1062,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
 
     /// Durable Object `fetch`.
     pub async fn fetch(&self, req: Request) -> Result<Response> {
+        self.first_call(1);
         if let Some(zone) = req.headers().get(ZONE_HEADER)? {
             let mut inner = self.inner.borrow_mut();
             if inner.zone_id.is_empty() {
@@ -782,6 +1073,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             return Response::error("zone id required", 400);
         }
         let path = req.url()?.path().to_string();
+        if req.method() == Method::Post && path.ends_with(&format!("/{PUSH_ROUTE}")) {
+            return self.take_push(req).await;
+        }
         if path.ends_with("/info") {
             // Debug JSON without secrets; pages on other origins may read it.
             let response = Response::from_json(&self.info())?;
@@ -806,6 +1100,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         ws: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
+        self.first_call(2);
         let WebSocketIncomingMessage::Binary(bytes) = message else {
             let _ = ws.close(Some(1003), Some("binary frames only"));
             return Ok(());
@@ -880,6 +1175,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     self.keep_awake().await;
                 }
             }
+            (Some(client), ClientMessage::Focus { x, y }) => {
+                let mut inner = self.inner.borrow_mut();
+                if let Some(host) = inner.host.as_mut() {
+                    host.observer_focus(ClientId(client), x, y);
+                }
+            }
             (Some(client), ClientMessage::Content { content_version }) => {
                 let mut inner = self.inner.borrow_mut();
                 if let Some(host) = inner.host.as_mut() {
@@ -925,6 +1226,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
     /// Durable Object `alarm`: hibernate a room that stayed empty, resend
     /// unsettled facts, and after a crash mark the room asleep.
     pub async fn alarm(&self) -> Result<Response> {
+        self.first_call(3);
         if self.inner.borrow().options.is_none() {
             return Response::ok("unconfigured");
         }
@@ -960,6 +1262,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             if let Some(since) = since {
                 let wait = since + hibernate_after.as_millis() as f64 - now_ms();
                 self.arm(wait.max(10.0)).await;
+            } else if let Some(watchdog) = self.watchdog_ms() {
+                // Still ticking: keep the crash watchdog (see `tick_loop`).
+                self.arm(watchdog).await;
             }
         }
         self.arm_outbox().await;
@@ -967,6 +1272,14 @@ impl<Z: CelldZone> ZoneObject<Z> {
     }
 
     // -------------------------------------------------------------- internals
+
+    fn first_call(&self, kind: u8) {
+        let mut inner = self.inner.borrow_mut();
+        if inner.trace.first_call_at.is_none() {
+            inner.trace.first_call_at = Some(now_ms());
+            inner.trace.first_call = kind;
+        }
+    }
 
     /// Sockets accepted before an eviction reach a new instance without a
     /// zone id from a request; the id is kept in storage.
@@ -1005,7 +1318,10 @@ impl<Z: CelldZone> ZoneObject<Z> {
             );
             return;
         };
-        let host = CelldObjectHost::new(self.env.env().clone(), secret, &service);
+        let started = now_ms();
+        let work = self.inner.borrow().work.clone();
+        let host =
+            CelldObjectHost::new(self.env.env().clone(), secret, &service).counting(work.clone());
         let sink = match ObjectFactSink::new(host, service, zone_principal(&zone_id)) {
             Ok(sink) => {
                 Z::fact_routes(sink.route(FactRoute::by_zone::<RecordActivity>(ZONE_ACTIVITY_KIND)))
@@ -1018,11 +1334,14 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let durable = DurableFacts {
             sink,
             storage: SendWrapper::new(Rc::new(self.state.storage())),
+            work: SendWrapper::new(work),
         };
         let (queue, feed) = fact_channel(FACT_CAPACITY, retry_policy());
         let queue = queue.with_journal();
+        let batch = fact_batch(&self.inner.borrow().options);
         wasm_bindgen_futures::spawn_local(
             feed.with_max_concurrent_commits(4)
+                .with_max_batch(batch)
                 .run(durable.clone(), sleep),
         );
         {
@@ -1033,7 +1352,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
             inner.sink = Some(durable);
             inner.activity = Some(queue);
         }
-        let _ = self.state.storage().put("zone:id", &zone_id).await;
+        // Written once per zone, not per activation: a wake after a crash
+        // writes nothing before its first player is in.
+        let stored_id: Option<String> = self.state.storage().get("zone:id").await.ok().flatten();
+        if stored_id.as_deref() != Some(zone_id.as_str()) {
+            let _ = self.state.storage().put("zone:id", &zone_id).await;
+        }
         // Resend the previous activations' unsettled facts.
         let stored = self
             .state
@@ -1042,7 +1366,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             .await;
         let mut inner = self.inner.borrow_mut();
         inner.outbox_loaded = true;
+        inner.trace.facts_ms.get_or_insert(now_ms() - started);
         if let Ok(map) = stored {
+            let mut resent = 0;
             let Some(queue) = inner.activity.as_mut() else {
                 return;
             };
@@ -1055,24 +1381,31 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 };
                 if let Some(fact) = stored.into_fact() {
                     let _ = queue.try_send(fact);
+                    resent += 1;
                 }
             }
             // Already stored.
             queue.take_journal();
+            inner.trace.outbox_resent += resent;
         }
     }
 
-    /// Make sure the zone is in memory (restoring its snapshot).
-    async fn wake(&self) -> Result<()> {
+    /// Make sure the zone is in memory (restoring its snapshot); true when
+    /// it was not. Reads only: the caller stores the zone's status (and the
+    /// facts of the wake) once its frames are out, so celld's output gate
+    /// does not hold a joining player's Welcome for writes of the wake.
+    async fn wake(&self) -> Result<bool> {
         self.start_facts().await;
         if self.inner.borrow().host.is_some() {
-            return Ok(());
+            return Ok(false);
         }
+        let read_at = now_ms();
         let stored: Option<Snapshot> = self.state.storage().get(SNAPSHOT_KEY).await.ok().flatten();
+        let restore_at = now_ms();
         let host = {
             let inner = self.inner.borrow();
             if inner.host.is_some() {
-                return Ok(());
+                return Ok(false);
             }
             let options = inner
                 .options
@@ -1087,8 +1420,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
             host_config.idle_tick_rate = None;
             host_config.reconnect_grace = options.reconnect_grace;
             host_config.boot_epoch = (now_ms() * 1000.0) as u64;
+            if !options.update_rates {
+                host_config.interest.update_rates = crate::UpdateRates::every_patch();
+            }
             // The content version the zone slept on (a rollout it missed is
-            // caught up by `read_content`).
+            // caught up by its first content rollout read).
             if let Some(snapshot) = &stored {
                 host_config.content_version = snapshot.version.clone();
             }
@@ -1121,7 +1457,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
             let (queue, feed) = fact_channel(FACT_CAPACITY, retry_policy());
             if let Some(sink) = inner.sink.clone() {
                 wasm_bindgen_futures::spawn_local(
-                    feed.with_max_concurrent_commits(4).run(sink, sleep),
+                    feed.with_max_concurrent_commits(4)
+                        .with_max_batch(fact_batch(&inner.options))
+                        .run(sink, sleep),
                 );
                 host = host.with_facts(queue.with_journal());
             }
@@ -1144,7 +1482,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         {
             let mut inner = self.inner.borrow_mut();
             if inner.host.is_some() {
-                return Ok(());
+                return Ok(false);
             }
             inner.host = Some(host);
             inner.restored = restored;
@@ -1158,20 +1496,21 @@ impl<Z: CelldZone> ZoneObject<Z> {
             inner.state = RoomState::Active;
             inner.last_persist_ms = now_ms();
             inner.report(ACTIVITY_ACTIVE);
+            let trace = &mut inner.trace;
+            trace.snapshot_read_ms.get_or_insert(restore_at - read_at);
+            trace.restore_ms.get_or_insert(now_ms() - restore_at);
         }
-        self.store_status().await;
         self.find_node();
-        // Off the join path: a wake (often a doorway into a sleeping zone,
-        // with the player's inputs waiting) does not wait for dev settings.
-        let this = self.handle();
-        wasm_bindgen_futures::spawn_local(async move { this.read_dev_settings().await });
-        // The snapshot restored the zone's last content version; catch up
-        // with a rollout it slept through (off the join path too: a Hello
-        // on another version waits for its own read, see `hello`).
-        let this = self.handle();
-        wasm_bindgen_futures::spawn_local(async move { this.read_content().await });
+        // Hydrate every watched cell, off the join path: a wake (often a
+        // doorway into a sleeping zone, with the player's inputs waiting)
+        // does not wait for them. The snapshot restored the zone's last
+        // content version; the rollout read catches up with one it slept
+        // through (a Hello on another version waits for its own read, see
+        // `hello`).
+        self.inner.borrow_mut().world.clear();
+        self.reconcile_world(true);
         self.refresh();
-        Ok(())
+        Ok(true)
     }
 
     /// Run [`CelldZone::refresh`] off the tick and deliver its message.
@@ -1209,68 +1548,151 @@ impl<Z: CelldZone> ZoneObject<Z> {
         }
     }
 
-    /// Dev only (`ZONE_DEV_SETTINGS=1`): read the network simulation from
-    /// the worker's dev settings object.
-    async fn read_dev_settings(&self) {
-        let enabled = {
-            let mut inner = self.inner.borrow_mut();
-            inner.last_dev_read_ms = now_ms();
-            inner.options.as_ref().is_some_and(|o| o.dev_settings)
-        };
-        if !enabled {
-            return;
-        }
-        match self.env.read_cell(ZONE_DEV_KIND, NETSIM_SHARD).await {
-            Ok(value) => {
-                let sim = serde_json::from_value::<NetSimJson>(value)
-                    .unwrap_or_default()
-                    .to_sim();
-                self.inner.borrow_mut().net_sim = sim;
-            }
-            Err(e) => worker::console_warn!("zone dev settings: {e}"),
-        }
+    /// The world whose content rollout the zone follows, if any.
+    fn content_world(&self) -> Option<String> {
+        let inner = self.inner.borrow();
+        inner
+            .options
+            .as_ref()
+            .and_then(|o| o.content_rollout.clone())
     }
 
-    /// [`read_dev_settings`](Self::read_dev_settings) off the tick, at most
-    /// every [`DEV_SETTINGS_EVERY_MS`].
-    fn refresh_dev_settings(&self) {
-        let due = {
+    /// Every watched topic: the dev settings (`ZONE_DEV_SETTINGS=1`), the
+    /// content rollout (`ZONE_CONTENT_ROLLOUT`) and the game's
+    /// [`CelldZone::watch`].
+    fn world_topics(&self) -> Vec<String> {
+        let (dev, zone_id) = {
             let inner = self.inner.borrow();
-            inner.options.as_ref().is_some_and(|o| o.dev_settings)
-                && now_ms() - inner.last_dev_read_ms >= DEV_SETTINGS_EVERY_MS
+            let dev = inner.options.as_ref().is_some_and(|o| o.dev_settings);
+            (dev, inner.zone_id.clone())
         };
-        if due {
-            self.inner.borrow_mut().last_dev_read_ms = now_ms();
-            let this = self.handle();
-            wasm_bindgen_futures::spawn_local(async move { this.read_dev_settings().await });
+        let watches = self
+            .inner
+            .borrow_mut()
+            .watches
+            .get_or_insert_with(|| Rc::new(Z::watch(&zone_id)))
+            .clone();
+        let mut topics = Vec::with_capacity(watches.len() + 2);
+        if dev {
+            topics.push(topic(ZONE_DEV_KIND, NETSIM_SHARD));
         }
+        if let Some(world) = self.content_world() {
+            topics.push(topic(CONTENT_ROLLOUT_KIND, &world));
+        }
+        topics.extend(watches.iter().map(|w| w.topic()));
+        topics
     }
 
-    /// Read the world's content rollout cell and follow it
-    /// ([`zone_step`]: freeze, apply + resume).
-    async fn read_content(&self) {
-        let world = {
-            let mut inner = self.inner.borrow_mut();
-            inner.last_content_read_ms = now_ms();
-            inner
+    /// Whether watched cells push to this object: it has a class binding
+    /// and `ZONE_WORLD_PUSH` is not `0`.
+    fn pushed(&self) -> bool {
+        !self.binding.is_empty()
+            && self
+                .inner
+                .borrow()
                 .options
                 .as_ref()
-                .and_then(|o| o.content_rollout.clone())
-        };
-        let Some(world) = world else {
+                .is_some_and(|o| o.world_push)
+    }
+
+    /// Read the watched topics that are due (all of them with `all`, on
+    /// wake) off the tick ([`WorldSync::due`]). When pushed, each read
+    /// renews the zone's watch and the next comes ~45 s later (pushes
+    /// carry the changes); otherwise the cells are polled every second.
+    fn reconcile_world(&self, all: bool) {
+        let topics = self.world_topics();
+        let pushed = self.pushed();
+        let due = self.inner.borrow_mut().world.due(
+            topics,
+            now_ms() as u64,
+            all,
+            pushed,
+            js_sys::Math::random,
+        );
+        for topic in due {
+            let this = self.handle();
+            wasm_bindgen_futures::spawn_local(async move { this.reconcile(&topic).await });
+        }
+    }
+
+    /// Read watched `topic` (`kind/shard`), watching it when the object
+    /// can take pushes, and apply its view.
+    async fn reconcile(&self, topic: &str) {
+        let Some((kind, shard)) = topic.split_once('/') else {
             return;
         };
-        match self.env.read_cell(CONTENT_ROLLOUT_KIND, &world).await {
-            Ok(value) => {
-                let state = value
-                    .get("state")
-                    .cloned()
-                    .and_then(|state| serde_json::from_value::<ContentState>(state).ok());
-                if let Some(state) = state {
-                    self.apply_content(&state);
-                }
+        let watcher = self.pushed().then(|| {
+            let zone_id = self.inner.borrow().zone_id.clone();
+            watcher_address(&self.binding, &zone_id)
+        });
+        self.inner.borrow().work.borrow_mut().world_reads += 1;
+        match self
+            .env
+            .read_cell_watching(kind, shard, watcher.as_deref())
+            .await
+        {
+            Ok(view) => self.apply_view(topic, view),
+            Err(e) => worker::console_warn!("world view {topic}: {e}"),
+        }
+    }
+
+    /// A pushed update (`POST …/__world`, internal secret): applied when
+    /// the zone is in memory and watches the topic; a sleeping zone
+    /// hydrates on wake instead (a push never wakes it).
+    async fn take_push(&self, mut req: Request) -> Result<Response> {
+        if let Err(error) = super::cells::authenticate(&req, self.env.env()) {
+            return super::cells::error_response(error);
+        }
+        let Ok(update) = req.json::<WatchUpdate>().await else {
+            return Response::error("a world update is required", 400);
+        };
+        let awake = {
+            let inner = self.inner.borrow();
+            inner.work.borrow_mut().world_pushes += 1;
+            inner.host.is_some()
+        };
+        if awake && self.world_topics().contains(&update.topic) {
+            self.apply_view(&update.topic, update.view);
+        }
+        Response::empty().map(|r| r.with_status(204))
+    }
+
+    /// Apply `view` of `topic` if it is newer than what the zone has.
+    fn apply_view(&self, topic: &str, view: Value) {
+        let version = view_version(&view);
+        if !self.inner.borrow_mut().world.accept(topic, version) {
+            return;
+        }
+        let (kind, shard) = topic.split_once('/').unwrap_or((topic, ""));
+        if kind == ZONE_DEV_KIND && shard == NETSIM_SHARD {
+            let sim = serde_json::from_value::<NetSimJson>(view)
+                .unwrap_or_default()
+                .to_sim();
+            self.inner.borrow_mut().net_sim = sim;
+            return;
+        }
+        if kind == CONTENT_ROLLOUT_KIND && self.content_world().as_deref() == Some(shard) {
+            let state = view
+                .get("state")
+                .cloned()
+                .and_then(|state| serde_json::from_value::<ContentState>(state).ok());
+            if let Some(state) = state {
+                self.apply_content(&state);
             }
-            Err(e) => worker::console_warn!("content rollout: {e}"),
+            return;
+        }
+        let watches = self.inner.borrow().watches.clone();
+        let Some(message) = watches
+            .as_ref()
+            .and_then(|w| w.get(topic))
+            .and_then(|watch| watch.message(view))
+        else {
+            return;
+        };
+        let mut inner = self.inner.borrow_mut();
+        if let Some(host) = inner.host.as_mut() {
+            host.deliver(ZoneInbound::Message(message));
+            inner.flush();
         }
     }
 
@@ -1307,27 +1729,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
         inner.flush();
     }
 
-    /// [`read_content`](Self::read_content) off the tick, at most every
-    /// [`DEV_SETTINGS_EVERY_MS`].
-    fn refresh_content(&self) {
-        let due = {
-            let inner = self.inner.borrow();
-            inner
-                .options
-                .as_ref()
-                .is_some_and(|o| o.content_rollout.is_some())
-                && now_ms() - inner.last_content_read_ms >= DEV_SETTINGS_EVERY_MS
-        };
-        if due {
-            self.inner.borrow_mut().last_content_read_ms = now_ms();
-            let this = self.handle();
-            wasm_bindgen_futures::spawn_local(async move { this.read_content().await });
-        }
-    }
-
     async fn hello(&self, ws: &WebSocket, hello: crate::protocol::Hello) -> Result<()> {
-        if hello.protocol_version != PROTOCOL_VERSION {
-            reject(ws, error::VERSION_MISMATCH, "protocol version");
+        // Answer in the client's version; refuse others before the ticket
+        // is touched, so the client can retry with an older one (§6.0).
+        if !supports_protocol(hello.protocol_version) {
+            let message = format!("protocol {} unsupported", hello.protocol_version);
+            reject(ws, error::VERSION_MISMATCH, &message);
             return Ok(());
         }
         let cold = self.inner.borrow().host.is_none();
@@ -1341,6 +1748,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
         // Transfer tickets are single use across activations too.
         let mut principal = None;
         let mut wake_grant = false;
+        let mut woke = false;
         let joined = if hello.reconnect_token.is_empty() {
             let verified = {
                 let inner = self.inner.borrow();
@@ -1398,10 +1806,13 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     .put(&nonce_key, claims.expires_at)
                     .await;
             }
-            if let Err(e) = self.wake().await {
-                reject(ws, error::NOT_FOUND, &e.to_string());
-                return Ok(());
-            }
+            woke = match self.wake().await {
+                Ok(woke) => woke,
+                Err(e) => {
+                    reject(ws, error::NOT_FOUND, &e.to_string());
+                    return Ok(());
+                }
+            };
             if claims.role == Role::Player {
                 principal = Some(claims.principal.clone());
             }
@@ -1420,7 +1831,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
                         .is_some_and(|h| h.config().content_version != hello.content_version)
             };
             if behind {
-                self.read_content().await;
+                if let Some(world) = self.content_world() {
+                    self.reconcile(&topic(CONTENT_ROLLOUT_KIND, &world)).await;
+                }
             }
             let mut inner = self.inner.borrow_mut();
             let Some(host) = inner.host.as_mut() else {
@@ -1428,6 +1841,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 reject(ws, error::ZONE_UNAVAILABLE, "zone asleep");
                 return Ok(());
             };
+            let host = host.speaking(hello.protocol_version);
             match &transfer {
                 Some(transfer) => {
                     host.join_transfer(transfer, hello.capabilities, &hello.content_version)
@@ -1441,11 +1855,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 reject(ws, error::RECONNECT_FAILED, "zone restarted; rejoin");
                 return Ok(());
             };
-            host.reconnect_with_version(
-                &hello.reconnect_token,
-                hello.capabilities,
-                &hello.content_version,
-            )
+            host.speaking(hello.protocol_version)
+                .reconnect_with_version(
+                    &hello.reconnect_token,
+                    hello.capabilities,
+                    &hello.content_version,
+                )
         };
         match joined {
             Ok(joined) => {
@@ -1483,15 +1898,32 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     }
                 }
                 if observer {
+                    if woke {
+                        self.store_status().await;
+                    }
                     return Ok(());
                 }
+                let joined_at = now_ms();
                 self.store_status().await;
                 self.start_loop();
+                {
+                    let mut inner = self.inner.borrow_mut();
+                    let trace = &mut inner.trace;
+                    if trace.welcome_at.is_none() {
+                        trace.welcome_at = Some(joined_at);
+                        trace.join_ms = Some(now_ms() - joined_at);
+                    }
+                }
                 if let Some(principal) = principal {
                     self.after_join(principal);
                 }
             }
-            Err(e) => reject(ws, e.code, &e.message),
+            Err(e) => {
+                reject(ws, e.code, &e.message);
+                if woke {
+                    self.store_status().await;
+                }
+            }
         }
         Ok(())
     }
@@ -1562,17 +1994,29 @@ impl<Z: CelldZone> ZoneObject<Z> {
             state: self.state.clone(),
             env: self.env.clone(),
             inner: self.inner.clone(),
+            binding: self.binding.clone(),
         }
     }
 
     async fn tick_loop(&self) {
-        let (hz, persist_every) = {
-            let inner = self.inner.borrow();
+        let (hz, persist_every, dormant_after) = {
+            let mut inner = self.inner.borrow_mut();
+            inner.empty_since_ms = None;
             let options = inner.options.as_ref().expect("configured");
-            (options.tick_hz, options.persist_every.as_millis() as f64)
+            (
+                options.tick_hz,
+                options.persist_every.as_millis() as f64,
+                options.dormant_after.as_millis() as f64,
+            )
         };
         let mut schedule = TickSchedule::new(now_ms(), hz);
-        self.arm_later(persist_every * 3.0);
+        // Crash watchdog: if this activation dies while awake, the alarm
+        // wakes a fresh one that reports the room asleep. Armed once here and
+        // again from `alarm` while ticking — never per snapshot: each
+        // `set_alarm` leaves a wake entry celld scans when it starts.
+        if let Some(watchdog) = self.watchdog_ms() {
+            self.arm_later(watchdog);
+        }
         loop {
             Delay::from(Duration::from_micros(
                 (schedule.wait_ms(now_ms()) * 1000.0) as u64,
@@ -1587,6 +2031,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     return;
                 };
                 let report = host.advance();
+                let players = host.player_count();
+                inner.work.borrow_mut().record_advance(&report);
+                if players < inner.players_seen {
+                    inner.persist_soon = true;
+                }
+                inner.players_seen = players;
                 inner.flush();
                 let stats = &mut inner.stats;
                 stats.iterations += 1;
@@ -1596,8 +2046,14 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 if let Some(queue) = inner.activity.as_mut() {
                     queue.drain();
                 }
-                let stop = !inner.occupied();
-                let persist = stop || woke - inner.last_persist_ms >= persist_every;
+                let stop = if inner.occupied() {
+                    inner.empty_since_ms = None;
+                    false
+                } else {
+                    woke - *inner.empty_since_ms.get_or_insert(woke) >= dormant_after
+                };
+                let persist =
+                    stop || inner.persist_soon || woke - inner.last_persist_ms >= persist_every;
                 if stop {
                     inner.ticking = false;
                 }
@@ -1606,8 +2062,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             // Storage stays off the loop: the simulation keeps its pace
             // while a write waits on the bucket.
             self.spool_later();
-            self.refresh_dev_settings();
-            self.refresh_content();
+            self.reconcile_world(false);
             self.refresh_if_due();
             if stop {
                 self.persist().await;
@@ -1615,7 +2070,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 return;
             }
             if persist {
-                self.persist_later(persist_every * 3.0);
+                self.persist_later();
             }
         }
     }
@@ -1627,23 +2082,21 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let snapshot = {
             let mut inner = self.inner.borrow_mut();
             inner.last_persist_ms = now_ms();
+            inner.persist_soon = false;
             inner.snapshot()
         };
         if let Some(snapshot) = snapshot {
-            let started = now_ms();
             if let Err(e) = self.state.storage().put(SNAPSHOT_KEY, snapshot).await {
                 worker::console_error!("zone snapshot write failed: {e}");
             }
-            self.inner.borrow_mut().stats.write.push(now_ms() - started);
         }
     }
 
-    /// [`persist`](Self::persist) and re-arm the alarm `arm_ms` from now,
-    /// off the tick loop. One snapshot write at a time: while one is in
-    /// flight a due tick leaves it to a later tick. Spawned after the
-    /// tick's [`spool_later`](Self::spool_later), so the outbox write is
-    /// issued before the snapshot that reflects it.
-    fn persist_later(&self, arm_ms: f64) {
+    /// [`persist`](Self::persist) off the tick loop. One snapshot write at
+    /// a time: while one is in flight a due tick leaves it to a later tick.
+    /// Spawned after the tick's [`spool_later`](Self::spool_later), so the
+    /// outbox write is issued before the snapshot that reflects it.
+    fn persist_later(&self) {
         {
             let mut inner = self.inner.borrow_mut();
             if inner.persisting {
@@ -1654,7 +2107,6 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let this = self.handle();
         wasm_bindgen_futures::spawn_local(async move {
             this.persist().await;
-            this.arm(arm_ms).await;
             this.inner.borrow_mut().persisting = false;
         });
     }
@@ -1703,33 +2155,50 @@ impl<Z: CelldZone> ZoneObject<Z> {
 
     /// Write the facts emitted since the last call to the outbox.
     async fn spool(&self) {
+        self.spool_with(None).await;
+    }
+
+    /// [`spool`](Self::spool), with the zone's `status` in the same batch.
+    async fn spool_with(&self, status: Option<String>) {
         let facts = self.inner.borrow_mut().emitted();
-        if facts.is_empty() {
+        if facts.is_empty() && status.is_none() {
             return;
         }
-        let storage = self.state.storage();
-        let started = now_ms();
         // One batched write (the storage API takes at most 128 keys).
-        for chunk in facts.chunks(128) {
-            let batch = js_sys::Object::new();
-            for fact in chunk {
-                let text = serde_json::to_string(&StoredFact::of(fact)).unwrap_or_default();
-                let _ = js_sys::Reflect::set(
-                    &batch,
-                    &StoredFact::storage_key(fact.key()).into(),
-                    &text.into(),
-                );
+        let mut batches: Vec<(js_sys::Object, usize)> = facts
+            .chunks(128)
+            .map(|chunk| {
+                let batch = js_sys::Object::new();
+                for fact in chunk {
+                    let text = serde_json::to_string(&StoredFact::of(fact)).unwrap_or_default();
+                    let _ = js_sys::Reflect::set(
+                        &batch,
+                        &StoredFact::storage_key(fact.key()).into(),
+                        &text.into(),
+                    );
+                }
+                (batch, chunk.len())
+            })
+            .collect();
+        if let Some(status) = status {
+            if batches.last().is_none_or(|(_, keys)| *keys >= 128) {
+                batches.push((js_sys::Object::new(), 0));
             }
+            if let Some((batch, keys)) = batches.last_mut() {
+                let _ = js_sys::Reflect::set(batch, &STATUS_KEY.into(), &status.into());
+                *keys += 1;
+            }
+        }
+        let storage = self.state.storage();
+        for (batch, _) in batches {
             if let Err(e) = storage.put_multiple_raw(batch).await {
                 worker::console_error!("fact outbox write failed: {e}");
             }
         }
-        {
-            let mut inner = self.inner.borrow_mut();
-            inner.spooled += facts.len() as u64;
-            inner.stats.write.push(now_ms() - started);
+        if !facts.is_empty() {
+            self.inner.borrow_mut().spooled += facts.len() as u64;
+            self.arm_outbox().await;
         }
-        self.arm_outbox().await;
     }
 
     /// [`spool`](Self::spool) from a synchronous handler.
@@ -1738,12 +2207,30 @@ impl<Z: CelldZone> ZoneObject<Z> {
         wasm_bindgen_futures::spawn_local(async move { this.spool().await });
     }
 
+    /// Spool the pending facts and write the zone's status with them when
+    /// it changed (one batch; an unchanged status writes nothing).
     async fn store_status(&self) {
-        self.spool().await;
-        let status = self.inner.borrow().last_status.clone();
-        if !status.is_empty() {
-            let _ = self.state.storage().put(STATUS_KEY, status).await;
-        }
+        let (status, known) = {
+            let inner = self.inner.borrow();
+            (inner.last_status.clone(), inner.stored_status.clone())
+        };
+        let stored = match known {
+            Some(stored) => Some(stored),
+            None => self
+                .state
+                .storage()
+                .get::<String>(STATUS_KEY)
+                .await
+                .ok()
+                .flatten(),
+        };
+        let changed = !status.is_empty() && stored.as_deref() != Some(status.as_str());
+        self.inner.borrow_mut().stored_status = Some(if changed {
+            status.clone()
+        } else {
+            stored.unwrap_or_default()
+        });
+        self.spool_with(changed.then_some(status)).await;
     }
 
     /// Set the object's alarm `in_ms` from now.
@@ -1758,6 +2245,15 @@ impl<Z: CelldZone> ZoneObject<Z> {
         }
     }
 
+    /// The crash watchdog's period while ticking (three snapshot
+    /// intervals, at least a minute), when configured and ticking.
+    fn watchdog_ms(&self) -> Option<f64> {
+        let inner = self.inner.borrow();
+        let options = inner.options.as_ref()?;
+        (inner.ticking && inner.host.is_some())
+            .then(|| (options.persist_every.as_millis() as f64 * 3.0).max(WATCHDOG_MIN_MS))
+    }
+
     /// [`arm`](Self::arm) off the caller's path.
     fn arm_later(&self, in_ms: f64) {
         let this = self.handle();
@@ -1767,7 +2263,13 @@ impl<Z: CelldZone> ZoneObject<Z> {
     /// Keep an alarm while unsettled facts wait in the outbox.
     async fn arm_outbox(&self) {
         let pending = {
-            let inner = self.inner.borrow();
+            let mut inner = self.inner.borrow_mut();
+            // Settlements only leave the queue on `drain`; a hibernated
+            // room has no tick loop to drain it, and would otherwise re-arm
+            // this alarm forever on a report that settled long ago.
+            if let Some(queue) = inner.activity.as_mut() {
+                queue.drain();
+            }
             inner.activity.as_ref().map_or(0, |q| q.in_flight())
                 + inner.host.as_ref().map_or(0, |h| h.facts_in_flight())
         };
@@ -1848,11 +2350,23 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 "freeze": format!("{:?}", h.freeze_state()).to_lowercase(),
             })),
             "workMs": { "p50": stats.work.percentile(0.5), "p99": stats.work.percentile(0.99) },
-            "writeMs": {
-                "p50": stats.write.percentile(0.5),
-                "p99": stats.write.percentile(0.99),
-                "max": stats.write.percentile(1.0),
+            "wake": {
+                "constructedAt": inner.trace.constructed_at,
+                "firstCallAt": inner.trace.first_call_at,
+                "firstCall": inner.trace.first_call,
+                "factsMs": inner.trace.facts_ms,
+                "outboxResent": inner.trace.outbox_resent,
+                "snapshotReadMs": inner.trace.snapshot_read_ms,
+                "restoreMs": inner.trace.restore_ms,
+                "joinMs": inner.trace.join_ms,
+                "welcomeAt": inner.trace.welcome_at,
             },
+            "work": *inner.work.borrow(),
+            "switches": inner.options.as_ref().map(|o| json!({
+                "factBatch": o.fact_batch,
+                "updateRates": o.update_rates,
+                "worldPush": o.world_push && !self.binding.is_empty(),
+            })),
         })
     }
 }
@@ -1951,7 +2465,11 @@ macro_rules! celld_zone_object {
         impl ::worker::DurableObject for $name {
             fn new(state: ::worker::State, env: ::worker::Env) -> Self {
                 Self {
-                    zone: $crate::celld_zone::ZoneObject::new(state, env),
+                    zone: $crate::celld_zone::ZoneObject::of_class(
+                        state,
+                        env,
+                        ::core::stringify!($name),
+                    ),
                 }
             }
 

@@ -160,6 +160,7 @@ pub struct CelldQueueHttpPublisher {
 enum CelldQueueHttpEndpointPolicy {
     HttpsOnly,
     LocalTestHttp,
+    MeshHttp,
 }
 
 #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
@@ -193,6 +194,17 @@ fn validate_celld_queue_http_endpoint(
             if !test_credential.starts_with("test-only-") || test_credential.len() < 24 {
                 return Err(TransportError::permanent(
                     "local-test Queue relay requires an explicit test-only credential",
+                ));
+            }
+            Ok(())
+        }
+        CelldQueueHttpEndpointPolicy::MeshHttp if url.scheme() == "https" => Ok(()),
+        CelldQueueHttpEndpointPolicy::MeshHttp => {
+            let host = url.host_str().unwrap_or_default();
+            let cluster_service = host.ends_with(".svc.cluster.local") || host.ends_with(".svc");
+            if url.scheme() != "http" || !cluster_service {
+                return Err(TransportError::permanent(
+                    "mesh Queue relay URL must use HTTPS or HTTP to a cluster Service (*.svc)",
                 ));
             }
             Ok(())
@@ -236,6 +248,26 @@ impl CelldQueueHttpPublisher {
             &endpoint,
             CelldQueueHttpEndpointPolicy::LocalTestHttp,
             Some(test_credential),
+        )?;
+        Ok(Self {
+            endpoint,
+            headers: Vec::new(),
+        })
+    }
+
+    /// Build a publisher for a relay inside a service mesh that encrypts
+    /// pod-to-pod traffic (for example Istio sidecar or ambient mTLS).
+    ///
+    /// Cleartext is allowed only to a cluster Service host
+    /// (`*.svc.cluster.local` or `*.svc`); anything else must be HTTPS. The
+    /// worker cannot see the mesh: choosing this asserts that the celld pod
+    /// and the relay's pods are both enrolled in it.
+    pub fn new_mesh(endpoint: impl Into<String>) -> Result<Self, TransportError> {
+        let endpoint = endpoint.into();
+        validate_celld_queue_http_endpoint(
+            &endpoint,
+            CelldQueueHttpEndpointPolicy::MeshHttp,
+            None,
         )?;
         Ok(Self {
             endpoint,
@@ -399,6 +431,25 @@ mod tests {
             Some("production-secret"),
         )
         .is_err());
+    }
+
+    #[cfg(feature = "workers-rs")]
+    #[test]
+    fn mesh_relay_allows_http_only_to_cluster_services() {
+        let mesh = |endpoint| {
+            validate_celld_queue_http_endpoint(
+                endpoint,
+                CelldQueueHttpEndpointPolicy::MeshHttp,
+                None,
+            )
+        };
+        assert!(mesh("http://relay.ns.svc.cluster.local:2567/internal/celld-queue/relay").is_ok());
+        assert!(mesh("http://relay.ns.svc:2567/internal/celld-queue/relay").is_ok());
+        assert!(mesh("https://relay.example.test/internal/celld-queue/relay").is_ok());
+        assert!(mesh("http://relay.example.test/internal/celld-queue/relay").is_err());
+        assert!(mesh("http://127.0.0.1:2567/internal/celld-queue/relay").is_err());
+        assert!(mesh("http://svc.cluster.local.example.test/relay").is_err());
+        assert!(mesh("http://user:pw@relay.ns.svc/relay").is_err());
     }
 
     #[derive(Clone, Default)]
