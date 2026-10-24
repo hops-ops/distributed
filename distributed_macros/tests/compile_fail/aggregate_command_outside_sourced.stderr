@@ -1,0 +1,5 @@
+error: `#[command("aggregate.verb", ..)]` on an aggregate method must be inside a `#[sourced]` impl (the handler-function form is `#[command(id = "..", ..)]`)
+ --> tests/compile_fail/aggregate_command_outside_sourced.rs:5:11
+  |
+5 | #[command("hero.equip", shard = hero_id, load = required, outcome = succeeded)]
+  |           ^^^^^^^^^^^^

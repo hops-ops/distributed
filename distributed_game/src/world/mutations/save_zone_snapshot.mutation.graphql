@@ -1,0 +1,5 @@
+# Syntax-only read-model mutation → MutationProgram IR (not a public field).
+# The row is the hibernation slot's post-command `ZoneSnapshotStatus`.
+mutation SaveZoneSnapshot {
+  upsert_zone_snapshots(object: $input.snapshot)
+}

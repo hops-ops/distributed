@@ -20,6 +20,8 @@ fn claims(principal: &str, zone: &str) -> TicketClaims {
         nonce: format!("n-{principal}"),
         role: Role::Player,
         name: None,
+        extensions: Default::default(),
+        wake: false,
     }
 }
 
@@ -58,6 +60,7 @@ fn transfer(principal: &str, from: &str, to: &str) -> Transfer {
         issuer: "h1".into(),
         generation: 1,
         carried: b"gold=7".to_vec(),
+        departed_at_ms: 0,
     }
 }
 
@@ -409,6 +412,7 @@ fn world_entry_points_record_and_replay_deterministically() {
     clock.advance(Duration::from_millis(40));
     rec.advance();
     rec.set_content_version("v2");
+    rec.set_config_version("combat@2");
     rec.resume(notice);
     rec.reload_stale_players();
     let out = rec.drain_outbound();
@@ -421,10 +425,133 @@ fn world_entry_points_record_and_replay_deterministically() {
     clock.advance(Duration::from_millis(40));
     rec.advance();
     assert_eq!(rec.host().zone().counter, 6);
+    assert_eq!(rec.host().config().config_version, "combat@2");
     assert_eq!(rec.host().zone().child_events.len(), 1);
     assert_eq!(rec.host().player_count(), 1, "bo handed off");
 
     let recording = Recording::decode(&rec.finish().encode()).unwrap();
     let summary = replay::<Realm>(&recording, cfg).unwrap();
     assert!(summary.ticks >= 2, "{summary:?}");
+}
+
+#[test]
+fn handoff_target_stamps_after_source_departure_despite_clock_skew() {
+    // One virtual time, two hosts whose wall clocks disagree: the target's
+    // reads 9 000 s *behind* the source's.
+    let time = ManualClock::new();
+    let source_clock = time.clone().with_unix_origin_ms(10_000_000);
+    let target_clock = time.clone().with_unix_origin_ms(1_000_000);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let (source_queue, source_feed) = fact_channel(16, RetryPolicy::default());
+    let mut source = ZoneHost::<Realm>::new(
+        "realm.east",
+        HostConfig {
+            boot_epoch: 3,
+            config_version: "combat@12".into(),
+            ..HostConfig::default()
+        },
+        Arc::new(source_clock),
+        RealmConfig {
+            neighbour: Some("realm.west".into()),
+            move_facts: true,
+            ..RealmConfig::new()
+        },
+    )
+    .with_facts(source_queue)
+    .with_transfer_issuer(move |r: &HandoffRequest| {
+        seen.lock().unwrap().push(r.clone());
+        Some("signed".into())
+    });
+    let (target_queue, target_feed) = fact_channel(16, RetryPolicy::default());
+    let mut target = ZoneHost::<Realm>::new(
+        "realm.west",
+        HostConfig {
+            boot_epoch: 8,
+            ..HostConfig::default()
+        },
+        Arc::new(target_clock),
+        RealmConfig {
+            move_facts: true,
+            ..RealmConfig::new()
+        },
+    )
+    .with_facts(target_queue);
+
+    let ana = source.join(&claims("ana", "realm.east"), 0, "").unwrap();
+    source.push_input(ana.client, 1, 0, &[CMD_HANDOFF]);
+    time.advance(Duration::from_millis(40));
+    source.advance();
+    let request = requests.lock().unwrap().pop().expect("handoff issued");
+    // The ManualClock decides the stamp time: origin + virtual time.
+    assert_eq!(request.departed_at_ms, 10_000_040);
+
+    // The source's leave runs later on its clock, still stamped with the
+    // departure time the ticket carries.
+    time.advance(Duration::from_millis(5));
+    let transfer = Transfer {
+        claims: claims("ana", "realm.west"),
+        source_zone: request.source_zone.clone(),
+        issuer: "h1".into(),
+        generation: 3,
+        carried: request.carried.clone(),
+        departed_at_ms: request.departed_at_ms,
+    };
+    target.join_transfer(&transfer, 0, "").unwrap();
+    drop(source);
+    drop(target);
+
+    // The target commits first.
+    let sink = MemoryFactSink::new();
+    futures_executor(target_feed.run(sink.clone(), |_| async {}));
+    futures_executor(source_feed.run(sink.clone(), |_| async {}));
+    let committed = sink.committed();
+    let commands: Vec<_> = committed.iter().map(Fact::command).collect();
+    assert_eq!(commands, ["realm.arrived", "realm.left"]);
+    let (arrived, left) = (committed[0].stamp(), committed[1].stamp());
+
+    assert_eq!(left.emitted_at_ms, 10_000_040);
+    assert_eq!(
+        (left.activation, left.config_version.as_str()),
+        (3, "combat@12")
+    );
+    // The target's own clock says 1 000 045; the stamp starts after the
+    // departure instead.
+    assert_eq!(arrived.emitted_at_ms, 10_000_041);
+    assert_eq!(arrived.activation, 8);
+    assert!(arrived.emitted_after(left));
+    let mut ordered = committed.clone();
+    ordered.sort_by(|a, b| a.stamp().emission_order(b.stamp()));
+    let ordered: Vec<_> = ordered.iter().map(Fact::command).collect();
+    assert_eq!(ordered, ["realm.left", "realm.arrived"]);
+}
+
+#[test]
+fn stamps_follow_the_manual_clock_and_config_version() {
+    let clock = ManualClock::new().with_unix_origin_ms(500);
+    let h = host(
+        "z",
+        HostConfig {
+            boot_epoch: 42,
+            ..HostConfig::default()
+        },
+        &clock,
+        RealmConfig::new(),
+    );
+    clock.advance(Duration::from_millis(250));
+    let (queue, feed) = fact_channel(16, RetryPolicy::default());
+    let mut h = h.with_facts(queue);
+    let joined = h.join(&claims("bo", "z"), 0, "").unwrap();
+    h.push_input(joined.client, 1, 0, &[CMD_COUNT]);
+    h.set_config_version("combat@13");
+    clock.advance(Duration::from_millis(40));
+    h.advance();
+    drop(h);
+    let sink = MemoryFactSink::new();
+    futures_executor(feed.run(sink.clone(), |_| async {}));
+    let stamp = sink.committed()[0].stamp().clone();
+    assert_eq!(stamp.emitted_at_ms, 790);
+    assert_eq!(stamp.activation, 42);
+    assert_eq!(stamp.config_version, "combat@13");
+    assert_eq!(stamp.zone_id, "z");
 }

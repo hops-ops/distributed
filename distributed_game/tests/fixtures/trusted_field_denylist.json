@@ -1,0 +1,6 @@
+{
+  "comment": "Names a zone fact (FactCommand) or a ticket extension claim (TicketExtension, createGameTicketHandler claims) must never use. Matching ignores '_', '-' and case. Checked against distributed_game_macros/src/trusted.rs and js/src/sveltekit/game/ticket.ts by their tests.",
+  "identity": ["principal", "user", "user_id", "owner", "owner_id", "account", "account_id", "subject", "sub"],
+  "reward": ["xp", "experience", "reward", "rewards"],
+  "economy": ["amount", "coins", "gold", "currency", "price", "cost", "balance", "grant", "payout", "credit", "debit"]
+}

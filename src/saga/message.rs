@@ -23,6 +23,8 @@ pub const META_STEP: &str = "saga-step";
 pub const META_PHASE: &str = "saga-phase";
 /// Metadata key: dispatch attempt (1-based).
 pub const META_ATTEMPT: &str = "saga-attempt";
+/// Metadata key: fan-out member index (absent on single-command steps).
+pub const META_MEMBER: &str = "saga-member";
 /// Metadata key: where replies must be sent.
 pub const META_REPLY_TO: &str = "saga-reply-to";
 /// Metadata key: id of the command a reply/timeout belongs to.
@@ -80,6 +82,8 @@ pub struct SagaMessage {
     pub step: String,
     pub phase: SagaPhase,
     pub attempt: u32,
+    /// Fan-out member index; `None` for single-command steps.
+    pub member: Option<u32>,
     pub signal: SagaSignal,
 }
 
@@ -130,6 +134,14 @@ impl SagaMessage {
         let attempt = get(META_ATTEMPT)?
             .parse::<u32>()
             .map_err(|_| SagaError::Malformed("invalid saga attempt".into()))?;
+        let member = metadata
+            .get(META_MEMBER)
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|_| SagaError::Malformed("invalid saga member".into()))
+            })
+            .transpose()?;
         Ok(Self {
             message_id: message_id.to_string(),
             saga_type: get(META_SAGA_TYPE)?.to_string(),
@@ -137,6 +149,7 @@ impl SagaMessage {
             step: get(META_STEP)?.to_string(),
             phase: SagaPhase::parse(get(META_PHASE)?)?,
             attempt,
+            member,
             signal,
         })
     }
@@ -198,6 +211,7 @@ impl SagaReply {
                 META_STEP,
                 META_PHASE,
                 META_ATTEMPT,
+                META_MEMBER,
                 META_REPLY_TO,
             ]
             .contains(&key)

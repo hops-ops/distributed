@@ -267,6 +267,60 @@ where
     }
 }
 
+/// Behaviour every [`ZoneOwnership`] must show (exclusive claims, `Held`,
+/// idempotent re-acquire, `Lost` after release, strictly increasing
+/// fencing tokens). `zone_id` must be unused. Panics on a violation.
+#[doc(hidden)]
+pub async fn ownership_conformance(ownership: &dyn ZoneOwnership, zone_id: &str) {
+    let ttl = Duration::from_secs(30);
+    let first = ownership
+        .acquire(zone_id, "h1#1", ttl)
+        .await
+        .expect("first acquire");
+    assert_eq!(first.zone_id, zone_id);
+    assert_eq!(first.holder, "h1#1");
+    assert_eq!(
+        ownership.acquire(zone_id, "h2#1", ttl).await,
+        Err(OwnershipError::Held {
+            holder: "h1#1".into()
+        }),
+        "a live claim is exclusive"
+    );
+    let again = ownership
+        .acquire(zone_id, "h1#1", ttl)
+        .await
+        .expect("re-acquire");
+    assert_eq!(
+        again.token, first.token,
+        "the holder gets its own claim back"
+    );
+    let renewed = ownership.renew(&first, ttl).await.expect("renew");
+    assert_eq!(renewed.token, first.token, "renewal keeps the token");
+    ownership.release(&first).await;
+    assert_eq!(
+        ownership.renew(&first, ttl).await,
+        Err(OwnershipError::Lost),
+        "a released claim is lost"
+    );
+    let second = ownership
+        .acquire(zone_id, "h2#1", ttl)
+        .await
+        .expect("second acquire");
+    assert!(second.token > first.token, "tokens strictly increase");
+    assert_eq!(
+        ownership.renew(&first, ttl).await,
+        Err(OwnershipError::Lost),
+        "an old claim stays lost"
+    );
+    ownership.release(&second).await;
+    let third = ownership
+        .acquire(zone_id, "h1#2", ttl)
+        .await
+        .expect("third acquire");
+    assert!(third.token > second.token, "tokens survive release");
+    ownership.release(&third).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +352,11 @@ mod tests {
         assert_eq!(block(own.renew(&a, ttl)), Err(OwnershipError::Lost));
         let b = block(own.acquire("z", "h2#1", ttl)).unwrap();
         assert!(b.token > a.token);
+    }
+
+    #[test]
+    fn local_ownership_passes_the_conformance_suite() {
+        block(ownership_conformance(&LocalOwnership::new(), "conformance"));
     }
 
     #[test]

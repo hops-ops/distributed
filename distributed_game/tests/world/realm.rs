@@ -20,6 +20,8 @@ pub struct RealmConfig {
     pub freeze_ready: bool,
     pub neighbour: Option<String>,
     pub reject_all: bool,
+    /// Emit `realm.left` / `realm.arrived` facts for handoffs.
+    pub move_facts: bool,
 }
 
 impl RealmConfig {
@@ -53,6 +55,7 @@ impl Zone for Realm {
     type Config = RealmConfig;
     type Input = u8;
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         EntitySchema::new().kind(KindDef::new(1, "realm").field("counter", FieldType::U32))
@@ -94,6 +97,15 @@ impl Zone for Realm {
             .player(player)
             .map(|p| p.principal.clone())
             .unwrap_or_default();
+        if self.cfg.move_facts {
+            let key = format!("arrived:{}:{principal}", ctx.zone_id());
+            let fact = Fact::new(
+                key,
+                "realm.arrived",
+                serde_json::json!({ "from": from_zone }),
+            );
+            let _ = ctx.emit_fact_for(player, fact);
+        }
         let mut payload = carried.clone();
         payload.extend_from_slice(b"|");
         payload.extend_from_slice(from_zone.as_bytes());
@@ -105,7 +117,11 @@ impl Zone for Realm {
         });
     }
 
-    fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId, reason: LeaveReason) {
+    fn on_leave(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId, reason: LeaveReason) {
+        if self.cfg.move_facts && reason == LeaveReason::Handoff {
+            let key = format!("left:{}:{}", ctx.zone_id(), player.0);
+            let _ = ctx.emit_fact(Fact::new(key, "realm.left", serde_json::json!({})));
+        }
         self.left.push((player, reason));
     }
 

@@ -1,6 +1,6 @@
 [workspace]
 members = ["distributed_macros", "distributed_cli", "distributed_game", "distributed_game_macros"]
-exclude = ["tests/e2e-ui", "tests/celld/worker", "tests/celld/relay-worker", "examples/game/server"]
+exclude = ["tests/e2e-ui", "tests/celld/worker", "tests/celld/relay-worker", "tests/celld/alarm-worker", "tests/celld/fact-worker", "tests/celld/zone-worker", "tests/fixtures/wasm32-native-domain", "examples/game/server"]
 resolver = "2"
 
 [workspace.package]
@@ -62,10 +62,6 @@ redis = ["dep:redis", "dep:tokio", "leaderboard-background"]
 # task) without Redis, e.g. over `InMemoryLeaderboard`.
 leaderboard-background = ["dep:tokio"]
 workers-rs = ["dep:worker"]
-# Native durable aggregate cells: one synchronous SQLite file per cell, same
-# SQL store and one-transaction-per-command contract as Durable Object cells.
-# Separate from `sqlite` (async SQLx pool + tokio); no-op on wasm32.
-cell-sqlite = ["dep:rusqlite"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing", "dep:tracing-opentelemetry"]
 graphql = ["dep:async-graphql", "dep:async-graphql-axum", "dep:hmac", "dep:jsonwebtoken", "http", "axum?/ws"]
 
@@ -108,11 +104,6 @@ tracing-opentelemetry = { version = "0.33", default-features = false, optional =
 uuid = { version = "1", features = ["v7"] }
 url = { version = "2", optional = true }
 worker = { version = "0.8", features = ["queue"], optional = true }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# libsqlite3-sys 0.37 stays inside SQLx 0.9's accepted range, so `sqlite` and
-# `cell-sqlite` link one bundled SQLite when enabled together.
-rusqlite = { version = "0.39", features = ["bundled"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 js-sys = "0.3"

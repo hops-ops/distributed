@@ -1,9 +1,11 @@
 //! Mob Pit's business-side read model (dev demo).
 //!
 //! ```text
-//! zone ──fact──▶ Crawler cell (RecordKill: XP decided there; event + outbox
-//!                row in one SQLite transaction)
-//!        └─ zone server drains the cell outbox ──▶ SQLite bus (`bus_log`)
+//! zone ──fact──▶ Crawler cell on celld (RecordKill: XP decided there; event
+//!                + outbox row in one cell SQLite transaction)
+//!        └─ celld drains the outbox ──▶ `game-demo-outbox` Queue ──▶ consumer
+//!           relays to the zone server's /internal/celld-queue/relay
+//!           ──▶ SQLite bus (`bus_log`)
 //!                                                   │ ordered, at-least-once
 //!   mobpit-service: modeled projector `project_player_stats` ◀──┘
 //!        └─ upsert `player_stats` (checkpointed, deduplicated) ──▶ GraphQL
@@ -13,6 +15,10 @@
 //! - [`PlayerStats`] is the table: one row per principal, the Crawler's
 //!   post-kill state ([`mobpit_crawler::CrawlerState`]). The leaderboard is a
 //!   query over it (`order_by: xp desc`).
+//! - [`ZoneActivities`] (`zone_activities`): every room's lifecycle as its
+//!   zone-activity cell published it (`distributed_game::world::zone_status`):
+//!   active / dormant / hibernated, players, restored, and — a debug
+//!   detail — the celld node. The pages' minimap is a `@live` query over it.
 //! - [`PLAYER_STATS`] maps `CrawlerMobKilledDomainEvent` to the
 //!   [`SavePlayerStats`] upsert. The projector runtime keeps the cursor,
 //!   skips redelivered messages and commits each projection atomically.
@@ -28,93 +34,94 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use distributed::bus::SqliteBus;
+use distributed::bus::{BusConsumer, RunOptions, SqliteBus};
+use distributed::graphql::surface::{LeaderboardGrant, LeaderboardSurface};
 use distributed::graphql::{
     build_surface, read, surface_for_application_contract, DistributedClientSurfaceExport,
     GraphqlEngine, IdentityConfig, ModelPermissions, OidcConfig, RoleGrant, Surface,
-    SurfaceOptions, SurfaceProjector,
+    SurfaceOptions,
 };
+use distributed::leaderboard::{Board, LeaderboardStore, RedisLeaderboard};
 use distributed::microsvc::{
     spawn_service_consumer_loop, CausalProjectorContext, HandlerError, ModeledProjection, Routes,
     Service, CONSUMER_IDLE_POLL,
 };
-use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
 use distributed::{
-    mutation_file, Application, ApplicationManifest, LocalProjectionMountsBuilder, Mutation,
-    ReadModel, ReadModelCatalog, RelationalReadModel, SqliteRepository, SurfaceSpec,
+    Application, ApplicationManifest, RelationalReadModel, SqliteRepository, SurfaceSpec,
 };
-use mobpit_crawler::CrawlerMobKilledDomainEvent;
-use serde::{Deserialize, Serialize};
 
-/// Application, GraphQL service id and client surface name.
-pub const APPLICATION: &str = "mobpit";
-/// Projection name.
-pub const PROJECTOR: &str = "project_player_stats";
-/// Projection epoch: bump to rebuild the table from the bus log.
-pub const EPOCH: &str = "mobpit-player-stats-v1";
+/// The rooms' status rows and their projection.
+pub use distributed_game::world::zone_status::{ZoneActivities, ZONE_ACTIVITIES};
+/// The read model and its projection (shared with the zone server).
+pub use mobpit_crawler::stats::{
+    projector, PlayerStats, SavePlayerStats, APPLICATION, EPOCH, PLAYER_STATS, PROJECTOR,
+};
+
+/// The boroughs (bosses down, weather, the world event running) and their
+/// projection, from the borough cells' domain events.
+pub use mobpit_tiers::events::{Boroughs, BOROUGHS};
+
+/// The tables: `player_stats`, `zone_activities` and `boroughs`.
+pub fn read_model_catalog() -> distributed::ReadModelCatalog {
+    mobpit_crawler::stats::read_model_catalog()
+        .table_schema(ZoneActivities::schema().clone())
+        .table_schema(Boroughs::schema().clone())
+}
+
+/// The projector of `boroughs`, owned by this application.
+pub fn boroughs_projector() -> distributed::graphql::SurfaceProjector {
+    mobpit_tiers::events::projector(APPLICATION)
+}
+
+/// The boroughs (and their world events) are public to signed-in players.
+pub fn borough_permissions() -> ModelPermissions<Boroughs> {
+    ModelPermissions::new().grant(ROLE, read().all_columns())
+}
+
+async fn project_boroughs(
+    context: CausalProjectorContext,
+    projection: ModeledProjection,
+) -> Result<(), HandlerError> {
+    projection.apply(BOROUGHS, &context).await
+}
+
+/// The projector of `zone_activities`, owned by this application.
+pub fn rooms_projector() -> distributed::graphql::SurfaceProjector {
+    distributed_game::world::zone_status::activity_projector_for(APPLICATION)
+}
 /// The one engine role. Every signed-in player reads the whole board.
 pub const ROLE: &str = "user";
+/// Bus consumer group of this process's board change notices (every
+/// GraphQL process subscribes under its own group).
+pub const BOARD_NOTICE_GROUP: &str = "mobpit-service-boards";
 
-/// One player's settled progress (a projection of their Crawler cell).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ReadModel)]
-#[table("player_stats")]
-pub struct PlayerStats {
-    /// Principal (the verified session's user id).
-    #[id("player_id")]
-    pub player_id: String,
-    /// Display name at the last kill.
-    pub name: String,
-    /// Total XP (decided by the Crawler cell, never by a caller).
-    pub xp: i64,
-    /// Mobs killed.
-    pub kills: i64,
-    /// Level for `xp`.
-    pub level: i64,
+/// The Redis boards the zone server projects kills into, as GraphQL roots:
+/// `xpLeaderboard(first)`, `xpLeaderboardAround(radius)`, `xpMyRank` and
+/// the `kills…` twins, all `@live`. `…MyRank` and `…Around` rank the viewer
+/// (the session's user id); no root ranks an arbitrary member.
+pub fn leaderboard_surfaces() -> Vec<LeaderboardSurface> {
+    [
+        ("xp", mobpit_crawler::XP_BOARD),
+        ("kills", mobpit_crawler::KILLS_BOARD),
+    ]
+    .into_iter()
+    .map(|(name, board)| {
+        LeaderboardSurface::single(name, &Board::high_first(board).expect("board name"))
+            .limits(5, 20, 5)
+            .grant(ROLE, LeaderboardGrant::read())
+    })
+    .collect()
 }
 
-impl PlayerStats {
-    /// Read authorization: the leaderboard is public to signed-in players;
-    /// there is nothing to write (no commands, no mutations).
-    pub fn permissions() -> ModelPermissions<Self> {
-        ModelPermissions::new().grant(ROLE, read().all_columns())
-    }
+/// Read authorization: the leaderboard is public to signed-in players;
+/// there is nothing to write (no commands, no mutations).
+pub fn permissions() -> ModelPermissions<PlayerStats> {
+    ModelPermissions::new().grant(ROLE, read().all_columns())
 }
 
-/// Upsert one `player_stats` row from the domain event's state body.
-#[allow(non_snake_case)]
-pub fn SavePlayerStats() -> Mutation<()> {
-    mutation_file!("src/mutations/save_player_stats.mutation.graphql")
-}
-
-distributed::projection! {
-    pub const PLAYER_STATS: ProjectionDescriptor<EventualOnly> = {
-        name: "project_player_stats",
-        version: 1,
-        epoch: "mobpit-player-stats-v1",
-        model: PlayerStats,
-        on {
-            events: [CrawlerMobKilledDomainEvent],
-            mutation: SavePlayerStats,
-            input: { player: body },
-        },
-    };
-}
-
-/// Physical read-model catalog (`player_stats`).
-pub fn read_model_catalog() -> ReadModelCatalog {
-    ReadModelCatalog::new(APPLICATION).table_schema(PlayerStats::schema().clone())
-}
-
-/// The modeled projector mount for [`PLAYER_STATS`].
-pub fn projector() -> SurfaceProjector {
-    LocalProjectionMountsBuilder::new(APPLICATION, "ordered-domain-events")
-        .expect("projection source")
-        .eventual_model::<PlayerStats, _>(PROJECTOR, PLAYER_STATS, EPOCH)
-        .expect("player stats mount")
-        .build()
-        .expect("projection catalog")
-        .projector(PROJECTOR)
-        .expect("player stats projector")
+/// The rooms' status is public to signed-in players too.
+pub fn room_permissions() -> ModelPermissions<ZoneActivities> {
+    ModelPermissions::new().grant(ROLE, read().all_columns())
 }
 
 async fn project(
@@ -124,6 +131,13 @@ async fn project(
     projection.apply(PLAYER_STATS, &context).await
 }
 
+async fn project_rooms(
+    context: CausalProjectorContext,
+    projection: ModeledProjection,
+) -> Result<(), HandlerError> {
+    projection.apply(ZONE_ACTIVITIES, &context).await
+}
+
 /// The consumer service (bus consumer identity = [`APPLICATION`]): the
 /// modeled projector over `read_models`.
 pub fn projection_service(read_models: SqliteRepository) -> Service {
@@ -131,7 +145,11 @@ pub fn projection_service(read_models: SqliteRepository) -> Service {
         Routes::new()
             .with_read_model_store(read_models)
             .modeled_projector(projector())
-            .handle(project),
+            .handle(project)
+            .modeled_projector(rooms_projector())
+            .handle(project_rooms)
+            .modeled_projector(boroughs_projector())
+            .handle(project_boroughs),
     )
 }
 
@@ -146,11 +164,23 @@ pub fn spawn_projector(read_models: SqliteRepository, bus: sqlx::SqlitePool) {
 
 fn grants() -> BTreeMap<String, BTreeMap<String, RoleGrant>> {
     let mut grants: BTreeMap<String, BTreeMap<String, RoleGrant>> = BTreeMap::new();
-    for (role, grant) in PlayerStats::permissions().surface_grants() {
+    for (role, grant) in permissions().surface_grants() {
         grants
             .entry(role)
             .or_default()
             .insert(PlayerStats::schema().model_name.clone(), grant);
+    }
+    for (role, grant) in room_permissions().surface_grants() {
+        grants
+            .entry(role)
+            .or_default()
+            .insert(ZoneActivities::schema().model_name.clone(), grant);
+    }
+    for (role, grant) in borough_permissions().surface_grants() {
+        grants
+            .entry(role)
+            .or_default()
+            .insert(Boroughs::schema().model_name.clone(), grant);
     }
     grants
 }
@@ -158,8 +188,14 @@ fn grants() -> BTreeMap<String, BTreeMap<String, RoleGrant>> {
 fn full_surface() -> Surface {
     build_surface(&read_model_catalog().tables, &SurfaceOptions::sqlite())
         .expect("mobpit Surface should build")
-        .with_projection_owners([projector().into()])
-        .expect("mobpit projector should bind")
+        .with_leaderboards(leaderboard_surfaces())
+        .expect("mobpit boards should attach")
+        .with_projection_owners([
+            projector().into(),
+            rooms_projector().into(),
+            boroughs_projector().into(),
+        ])
+        .expect("mobpit projectors should bind")
 }
 
 /// Logical application artifact (`distributed describe`, the lifecycle).
@@ -206,19 +242,32 @@ impl BearerIdentity {
     }
 }
 
-/// The GraphQL engine over `repo` with `@live` pushes from its change stream.
+/// The GraphQL engine over `repo` (`player_stats`, `@live` from its change
+/// stream) and `boards` (the Redis leaderboards, `@live` from the zone
+/// server's change notices: [`spawn_board_notices`]).
 pub fn build_engine(
     repo: &SqliteRepository,
+    boards: Arc<dyn LeaderboardStore>,
     identity: &BearerIdentity,
     protocol_key: [u8; 32],
 ) -> Result<GraphqlEngine, String> {
-    GraphqlEngine::builder(repo.pool().clone())
+    let mut builder = GraphqlEngine::builder(repo.pool().clone());
+    for surface in leaderboard_surfaces() {
+        builder = builder.leaderboard(surface, boards.clone());
+    }
+    builder
         .service_id(APPLICATION)
         .protocol_token_key(protocol_key)
         .roles(&[ROLE])
         .client_application_surface(APPLICATION, [ROLE], [ROLE])
-        .model::<PlayerStats>(PlayerStats::permissions())
-        .client_projection_owners([projector().into()])
+        .model::<PlayerStats>(permissions())
+        .model::<ZoneActivities>(room_permissions())
+        .model::<Boroughs>(borough_permissions())
+        .client_projection_owners([
+            projector().into(),
+            rooms_projector().into(),
+            boroughs_projector().into(),
+        ])
         .identity(identity.config())
         .graphiql(false)
         .change_stream(repo.read_model_changes())
@@ -241,6 +290,30 @@ pub async fn open_shared_sqlite(url: &str) -> Result<sqlx::SqlitePool, sqlx::Err
         .await
 }
 
+/// Follow the zone server's `distributed.leaderboard.changed` notices on
+/// the bus and refresh `engine`'s `@live` boards (restarted on errors).
+pub fn spawn_board_notices(engine: Arc<GraphqlEngine>, bus: sqlx::SqlitePool) {
+    tokio::spawn(async move {
+        loop {
+            let handlers = Arc::new(engine.leaderboard_change_handlers(BOARD_NOTICE_GROUP));
+            let bus = SqliteBus::new(bus.clone()).with_idle_poll(CONSUMER_IDLE_POLL);
+            if let Err(error) = bus.subscribe(handlers, RunOptions::default()).await {
+                eprintln!("mobpit-service: board notices: {error}");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+/// The Redis boards at `url` under `prefix` (the zone server's).
+pub fn open_boards(url: &str, prefix: &str) -> Result<Arc<dyn LeaderboardStore>, String> {
+    Ok(Arc::new(
+        RedisLeaderboard::connect(url)
+            .map_err(|error| format!("REDIS_URL {url}: {error}"))?
+            .with_prefix(prefix),
+    ))
+}
+
 /// Runtime configuration.
 #[derive(Debug, Clone)]
 pub struct ServiceOptions {
@@ -248,6 +321,10 @@ pub struct ServiceOptions {
     pub database_url: String,
     /// `sqlite:` URL of the bus the zone server publishes to.
     pub bus_url: String,
+    /// `redis://…` of the leaderboards the zone server writes.
+    pub redis_url: String,
+    /// Their key prefix (the zone server's `--redis-prefix`).
+    pub redis_prefix: String,
     /// Listen address.
     pub bind: String,
     /// Bearer verification.
@@ -266,12 +343,15 @@ pub async fn run(options: ServiceOptions) -> Result<(), Box<dyn std::error::Erro
     let bus_pool = open_shared_sqlite(&options.bus_url).await?;
     SqliteBus::new(bus_pool.clone()).ensure_tables().await?;
 
+    let boards = open_boards(&options.redis_url, &options.redis_prefix)?;
     let engine = Arc::new(build_engine(
         &repo,
+        boards,
         &options.identity,
         options.protocol_key,
     )?);
-    spawn_projector(repo.clone(), bus_pool);
+    spawn_projector(repo.clone(), bus_pool.clone());
+    spawn_board_notices(engine.clone(), bus_pool);
     let app = http::router(engine, &options.allowed_origins);
     let listener = tokio::net::TcpListener::bind(&options.bind).await?;
     eprintln!(

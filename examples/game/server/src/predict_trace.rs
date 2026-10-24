@@ -15,13 +15,8 @@
 use distributed_game::prediction::{step_bytes, PredictContext, PredictStep};
 use distributed_game::pure::{call_bytes, GamePure};
 use distributed_game::Wire;
-use game_sim::arena::{self, ArenaStep, MoveState};
-use game_sim::grid::{
-    self, GridCellFn, GridContext, GridPoint, GridSampleFn, GridStep, WalkerState, BUTTON_SPRINT,
-    CELL, DEFAULT_SEED,
-};
+use game_sim::arena;
 use game_sim::mobpit::PitStep;
-use game_sim::ripple::HoodStep;
 use serde_json::{json, Value};
 
 /// Deterministic xorshift32 (streams must be identical on every run).
@@ -132,114 +127,94 @@ fn random(seed: u32, frames: usize, extra_bytes: usize) -> Vec<Vec<u8>> {
     out
 }
 
-fn capsule_streams(extra_bytes: usize) -> Vec<Stream> {
-    let start = |x: f32, y: f32| {
-        state_bytes(&arena::canonicalize(MoveState {
+/// Mob Pit's step in the entrance (the classic pillars) and in rooms of
+/// other seeded patterns (the context names the room; its obstacles are
+/// generated inside the step).
+/// Mob Pit frames from `[mx, my, buttons]` frames: the aim and shot
+/// fields (varint-encoded) filled from a seeded generator, every button bit
+/// kept (unknown ones are cleared by the decoder).
+fn pit_frames(frames: Vec<Vec<u8>>, seed: u32) -> Vec<Vec<u8>> {
+    use distributed_game::GameInput;
+    use game_sim::mobpit::PitInput;
+    let mut rng = Rng(0x7a11_0000 ^ seed.max(1));
+    frames
+        .into_iter()
+        .map(|f| {
+            let unit = |r: &mut Rng| (r.next() >> 8) as f32 / 16_777_216.0;
+            PitInput {
+                mx: f[0] as i8,
+                my: f[1] as i8,
+                buttons: f[2],
+                yaw: (unit(&mut rng) - 0.5) * 6.2,
+                pitch: unit(&mut rng) * 3.0 - 1.5,
+                shot: rng.next() as u16,
+                delay_ms: (rng.next() % 900) as u16,
+            }
+            .to_payload()
+        })
+        .collect()
+}
+
+fn pit_streams() -> Vec<Stream> {
+    use game_sim::mobpit::{canonicalize, room_obstacles, PitRoomContext, PitState, DEFAULT_SEED};
+    let context = |x: i32, y: i32| {
+        PitRoomContext {
+            seed: DEFAULT_SEED,
             x,
             y,
-            ..MoveState::default()
+        }
+        .encode_context()
+    };
+    let start = |x: f32, y: f32| {
+        state_bytes(&canonicalize(PitState {
+            x,
+            y,
+            ..PitState::default()
         }))
     };
-    let extra = move |i: usize| vec![(i as u8).wrapping_mul(37); extra_bytes];
-    vec![
+    // The capsule script with a jump every 37 frames (the jump bit is 0x04).
+    let scripted_jumps: Vec<Vec<u8>> = scripted(&|_| Vec::new())
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut f)| {
+            if i % 37 < 3 {
+                f[2] |= 0x04;
+            }
+            f
+        })
+        .collect();
+    let scripted_jumps = pit_frames(scripted_jumps, 7);
+    let mut streams = vec![
         Stream {
-            name: "scripted".into(),
+            name: "scripted + jumps".into(),
             start: start(-5.0, -5.0),
-            context: Vec::new(),
-            inputs: scripted(&extra),
+            context: context(0, 0),
+            inputs: scripted_jumps,
         },
         Stream {
             name: "random".into(),
             start: start(8.0, 3.0),
-            context: Vec::new(),
-            inputs: random(0x1234_5678, 3000, extra_bytes),
+            context: context(0, 0),
+            inputs: pit_frames(random(0x1234_5678, 3000, 0), 1),
         },
         Stream {
             name: "corner".into(),
             start: start(18.5, -18.5),
-            context: Vec::new(),
-            inputs: random(0x0bad_cafe, 600, extra_bytes),
+            context: context(0, 0),
+            inputs: pit_frames(random(0x0bad_cafe, 600, 0), 2),
         },
-    ]
-}
-
-/// The densest of a few cells, so a walk bumps into props.
-fn busy_cell(seed: u32) -> (i32, i32) {
-    (0..12)
-        .map(|i| (i, 2))
-        .max_by_key(|c| {
-            grid::cell_props(seed, *c)
-                .iter()
-                .filter(|p| p.solid)
-                .count()
-        })
-        .expect("cells")
-}
-
-fn grid_context(cell: (i32, i32)) -> GridContext {
-    GridContext {
-        seed: DEFAULT_SEED,
-        cx: cell.0,
-        cy: cell.1,
-    }
-}
-
-/// Head for each solid prop of the busiest cell in turn (pushing into it),
-/// then walk off two borders.
-fn prop_walk() -> Stream {
-    let cell = busy_cell(DEFAULT_SEED);
-    let context = grid_context(cell);
-    let props = grid::cell_props(DEFAULT_SEED, cell);
-    let mut state = WalkerState { x: 16.0, y: 16.0 };
-    let targets: Vec<(f32, f32)> = props
-        .iter()
-        .filter(|p| p.solid)
-        .map(|p| (p.x, p.y))
-        .chain([(40.0, 16.0), (16.0, -5.0)])
-        .collect();
-    let mut inputs = Vec::new();
-    for (k, (tx, ty)) in targets.iter().enumerate() {
-        for _ in 0..60 {
-            let (dx, dy) = (tx - state.x, ty - state.y);
-            let l = (dx * dx + dy * dy).sqrt().max(1e-3);
-            let input = [
-                (dx / l * 127.0) as i8 as u8,
-                if k % 3 == 0 {
-                    0x80
-                } else {
-                    (dy / l * 127.0) as i8 as u8
-                },
-                if k % 2 == 0 { BUTTON_SPRINT } else { 0 },
-            ];
-            state = grid::grid_step(
-                &state,
-                &<grid::MoveInput as distributed_game::GameInput>::from_payload(&input)
-                    .expect("valid"),
-                &context,
-                arena::DT,
-            );
-            inputs.push(input.to_vec());
+    ];
+    let mut patterns = std::collections::BTreeSet::new();
+    for x in 1..60 {
+        let (pattern, _) = room_obstacles(DEFAULT_SEED, (x, 2));
+        if pattern == 0 || !patterns.insert(pattern) {
+            continue;
         }
-    }
-    Stream {
-        name: format!("props {},{}", cell.0, cell.1),
-        start: state_bytes(&WalkerState { x: 16.0, y: 16.0 }),
-        context: context.encode_context(),
-        inputs,
-    }
-}
-
-fn grid_streams() -> Vec<Stream> {
-    let mut streams = vec![prop_walk()];
-    for (i, cell) in [(0, 0), (3, -7), (999_999, -1_000_000)]
-        .into_iter()
-        .enumerate()
-    {
         streams.push(Stream {
-            name: format!("random {},{}", cell.0, cell.1),
-            start: state_bytes(&WalkerState { x: 16.0, y: 16.0 }),
-            context: grid_context(cell).encode_context(),
-            inputs: random(0x9e37_79b9 ^ i as u32, 1500, 0),
+            name: format!("pit.{x}.2 pattern {pattern}"),
+            start: start(4.5, 4.5),
+            context: context(x, 2),
+            inputs: pit_frames(random(0x51ed ^ x as u32, 1200, 0), x as u32),
         });
     }
     streams
@@ -256,8 +231,8 @@ fn pure_trace<F: GamePure>(args: Vec<Vec<u8>>) -> Value {
     json!({ "export": F::EXPORT, "calls": calls })
 }
 
-/// Cells for the content traces: around the origin, far away, the
-/// coordinate limits (lattice wrap-around) and the random walk's cells.
+/// Rooms for the content traces: around the origin, far away, the
+/// coordinate limits and random ones.
 fn content_cells() -> Vec<(i32, i32)> {
     let mut cells = vec![
         (0, 0),
@@ -267,7 +242,6 @@ fn content_cells() -> Vec<(i32, i32)> {
         (-12, 5),
         (999_999, -1_000_000),
         (-1_000_000, 1_000_000),
-        busy_cell(DEFAULT_SEED),
     ];
     let mut rng = Rng(0x5eed_cafe);
     for _ in 0..24 {
@@ -277,45 +251,47 @@ fn content_cells() -> Vec<(i32, i32)> {
     cells
 }
 
-/// `grid_cell` for every content cell, under two seeds.
-fn grid_cell_args() -> Vec<Vec<u8>> {
+/// `pit_room` for the content cells (as rooms), under two seeds.
+fn pit_room_args() -> Vec<Vec<u8>> {
     let mut args = Vec::new();
-    for seed in [DEFAULT_SEED, 0xdead_beef] {
-        for (cx, cy) in content_cells() {
-            args.push(GridContext { seed, cx, cy }.encode_context());
+    for seed in [game_sim::mobpit::DEFAULT_SEED, 0xdead_beef] {
+        for (x, y) in content_cells() {
+            args.push(game_sim::mobpit::PitRoomContext { seed, x, y }.encode_context());
         }
     }
     args
 }
 
-/// `grid_sample` on lattice points, borders, arbitrary floats and points
-/// outside the cell (clamped).
-fn grid_sample_args() -> Vec<Vec<u8>> {
-    let mut rng = Rng(0x0dd_ba11);
+/// Proximity wake: positions over the room and its doorway passages (a
+/// lattice plus seeded random points, edge values included), with every
+/// prior near set.
+fn rooms_in_reach_args() -> Vec<Vec<u8>> {
     let mut args = Vec::new();
-    for (cx, cy) in content_cells() {
-        let mut points: Vec<(f32, f32)> = vec![
+    let mut rng = 0x00c0_ffeeu32;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        rng
+    };
+    for near in 0..16u8 {
+        for &(x, y) in &[
             (0.0, 0.0),
-            (CELL, CELL),
-            (CELL, 7.25),
-            (16.0, 0.0),
-            (-3.0, 40.0),
-        ];
-        for _ in 0..40 {
-            let f = |r: &mut Rng| (r.next() >> 8) as f32 / 16_777_216.0 * (CELL + 4.0) - 2.0;
-            points.push((f(&mut rng), f(&mut rng)));
+            (9.0, 0.0),
+            (-9.0, 0.0),
+            (0.0, 9.0),
+            (0.0, -9.0),
+            (1.0, 0.0),
+            (21.5, 0.0),
+            (18.0, 18.0),
+            (-6.0, 11.0),
+        ] {
+            args.push(game_sim::mobpit::ReachContext { x, y, near }.encode_context());
         }
-        for (x, y) in points {
-            args.push(
-                GridPoint {
-                    seed: DEFAULT_SEED,
-                    cx,
-                    cy,
-                    x,
-                    y,
-                }
-                .encode_context(),
-            );
+        for _ in 0..4 {
+            let x = (next() % 4400) as f32 / 100.0 - 22.0;
+            let y = (next() % 4400) as f32 / 100.0 - 22.0;
+            args.push(game_sim::mobpit::ReachContext { x, y, near }.encode_context());
         }
     }
     args
@@ -326,14 +302,11 @@ pub fn traces() -> Value {
     json!({
         "abi": distributed_game::prediction::ABI_VERSION,
         "pures": [
-            pure_trace::<GridCellFn>(grid_cell_args()),
-            pure_trace::<GridSampleFn>(grid_sample_args()),
+            pure_trace::<game_sim::mobpit::PitRoomFn>(pit_room_args()),
+            pure_trace::<game_sim::mobpit::RoomsInReachFn>(rooms_in_reach_args()),
         ],
         "steps": [
-            trace::<ArenaStep>(capsule_streams(0)),
-            trace::<PitStep>(capsule_streams(0)),
-            trace::<HoodStep>(capsule_streams(1)),
-            trace::<GridStep>(grid_streams()),
+            trace::<PitStep>(pit_streams()),
         ],
     })
 }
@@ -343,52 +316,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grid_step_is_the_zone_step_against_the_cell_props() {
-        let cell = busy_cell(DEFAULT_SEED);
-        let props = grid::cell_props(DEFAULT_SEED, cell);
-        let mut zone = (16.0f32, 16.0f32);
-        let mut predicted = WalkerState { x: 16.0, y: 16.0 };
-        for input in random(7, 400, 0) {
-            let input = <grid::MoveInput as distributed_game::GameInput>::from_payload(&input)
-                .expect("valid");
-            zone = grid::step(zone.0, zone.1, input, &props);
-            predicted = grid::grid_step(&predicted, &input, &grid_context(cell), arena::DT);
-            assert_eq!((predicted.x, predicted.y), zone);
-        }
-    }
-
-    #[test]
-    fn grid_cell_is_the_world_generation() {
-        let cell = busy_cell(DEFAULT_SEED);
-        let content = grid::grid_cell(&grid_context(cell));
-        assert_eq!(content.props, grid::cell_props(DEFAULT_SEED, cell));
-        assert_eq!(content.heights.len(), grid::SAMPLES * grid::SAMPLES);
-        let (i, j) = (5, 11);
-        let l = (
-            i as f32 * grid::SAMPLE_SPACING,
-            j as f32 * grid::SAMPLE_SPACING,
-        );
-        let k = j * grid::SAMPLES + i;
-        assert_eq!(content.heights[k], grid::height(DEFAULT_SEED, cell, l));
-        assert_eq!(content.biomes[k], grid::biome(DEFAULT_SEED, cell, l));
-        let sample = grid::grid_sample(&GridPoint {
-            seed: DEFAULT_SEED,
-            cx: cell.0,
-            cy: cell.1,
-            x: l.0,
-            y: l.1,
-        });
-        assert_eq!(
-            (sample.height, sample.moisture, sample.biome),
-            (content.heights[k], content.moisture[k], content.biomes[k])
-        );
-    }
-
-    #[test]
     fn traces_cover_every_step_and_collide() {
         let traces = traces();
         let steps = traces["steps"].as_array().unwrap();
-        assert_eq!(steps.len(), 4);
+        assert_eq!(steps.len(), 1);
         for step in steps {
             for stream in step["streams"].as_array().unwrap() {
                 assert_eq!(

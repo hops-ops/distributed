@@ -107,6 +107,26 @@
       "viewTick": 123456
     }
   },
+  "messages": [
+    {
+      "hex": "13736572766572207265737461727420696e203501",
+      "id": 1,
+      "name": "announce",
+      "value": {
+        "text": "server restart in 5",
+        "urgent": true
+      }
+    },
+    {
+      "hex": "0000204007",
+      "id": 2,
+      "name": "set_wind",
+      "value": {
+        "gusts": 7,
+        "speed": 2.5
+      }
+    }
+  ],
   "pures": [
     {
       "arg": "0000c03fffff03",
@@ -380,7 +400,8 @@
           {
             "correction": {
               "durationMs": 150,
-              "mode": "ease"
+              "mode": "ease",
+              "snapAbove": 2.5
             },
             "name": "y",
             "priority": 1.0,
@@ -545,6 +566,40 @@
         "id": 4,
         "name": "stats",
         "priority": 1.0
+      }
+    ],
+    "messages": [
+      {
+        "id": 1,
+        "name": "announce",
+        "payload": {
+          "fields": [
+            {
+              "name": "text",
+              "type": {
+                "type": "str"
+              }
+            },
+            {
+              "name": "urgent",
+              "type": {
+                "type": "bool"
+              }
+            }
+          ],
+          "kind": "fields"
+        }
+      },
+      {
+        "id": 2,
+        "name": "set_wind",
+        "payload": {
+          "kind": "value",
+          "type": {
+            "name": "SampleWind",
+            "type": "record"
+          }
+        }
       }
     ],
     "name": "sample",

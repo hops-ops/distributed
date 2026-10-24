@@ -39,8 +39,10 @@ export type Stage = Readonly<{
 	setView(view: CameraView): void;
 	/** Ground-plane direction the camera looks along (game x/y), for camera-relative input. */
 	cameraForward(): { x: number; y: number };
+	/** Where the view looks, in game terms: yaw (radians from +x on the floor) and pitch (up positive; 0 in third person). */
+	aim(): { yaw: number; pitch: number };
 	/** Ease the camera target toward a game position (first person: place the eye there). */
-	follow(x: number, y: number, dtMs: number): void;
+	follow(x: number, y: number, dtMs: number, height?: number): void;
 	/** Register a per-frame callback (after input, before render). */
 	onFrame(callback: (now: number, dtMs: number) => void): void;
 }>;
@@ -169,9 +171,13 @@ export function createStage(canvas: HTMLCanvasElement, options: StageOptions): S
 			}
 		},
 		cameraForward: forward,
-		follow(x, y, dtMs) {
+		aim() {
+			const f = forward();
+			return { yaw: Math.atan2(f.y, f.x), pitch: view === 'first' ? -pitch : 0 };
+		},
+		follow(x, y, dtMs, height = 0) {
 			if (view === 'first') {
-				eye.position.set(x, EYE_HEIGHT, y);
+				eye.position.set(x, EYE_HEIGHT + height, y);
 				// Keep the orbit camera centred so switching back is seamless.
 				camera.setTarget(new Vector3(x, 0, y), false, false, true);
 				return;

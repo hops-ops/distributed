@@ -25,12 +25,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Run contracts check
-        run: |
-          if [ -f contracts/catalog.json ]; then
-            cargo run -p distributed_cli --quiet -- contracts check --root . --catalog contracts/catalog.json --output json
-          else
-            echo "No contracts/catalog.json yet; gate is present and ready for producers."
-          fi
+        run: cargo run -p distributed_cli --quiet -- contracts check --root . --catalog distributed.contracts.json --output json
 
   # Framework monorepo keeps its existing quality provider. The reusable
   # quality.yaml in this directory is the contract for *consumers* (domain
@@ -82,3 +77,6 @@ jobs:
 
   celld:
     uses: ./.github/workflows/integration-celld.yaml
+
+  wasm32-domains:
+    uses: ./.github/workflows/integration-wasm32-domains.yaml

@@ -259,7 +259,8 @@
         {
           "correction": {
             "durationMs": 150,
-            "mode": "ease"
+            "mode": "ease",
+            "snapAbove": 2.5
           },
           "name": "y",
           "priority": 1.0,
@@ -424,6 +425,40 @@
       "id": 4,
       "name": "stats",
       "priority": 1.0
+    }
+  ],
+  "messages": [
+    {
+      "id": 1,
+      "name": "announce",
+      "payload": {
+        "fields": [
+          {
+            "name": "text",
+            "type": {
+              "type": "str"
+            }
+          },
+          {
+            "name": "urgent",
+            "type": {
+              "type": "bool"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 2,
+      "name": "set_wind",
+      "payload": {
+        "kind": "value",
+        "type": {
+          "name": "SampleWind",
+          "type": "record"
+        }
+      }
     }
   ],
   "name": "sample",

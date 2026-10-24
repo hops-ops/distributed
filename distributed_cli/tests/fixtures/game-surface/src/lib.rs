@@ -62,6 +62,7 @@ impl Zone for Orbs {
     type Config = ();
     type Input = Steer;
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         schema![OrbView]

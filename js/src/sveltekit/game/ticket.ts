@@ -1,7 +1,7 @@
 /**
  * `distributed_game` admission tickets minted on the web server
  * (`distributed_game/PROTOCOL.md` §8): a compact HS256 JWT over
- * `{sub, zone, exp, nonce, role, name?}`, verified by the zone server's
+ * `{sub, zone, exp, nonce, role, name?, ext?}`, verified by the zone server's
  * `TicketKey`. WebCrypto only, so it runs in Node 20+, Deno, Bun and Workers;
  * it must only ever run where the shared secret lives (a server route).
  */
@@ -14,6 +14,39 @@ export const MAX_GAME_TICKET_TTL_SECONDS = 300;
 const MAX_PRINCIPAL_BYTES = 256;
 const MAX_ZONE_BYTES = 128;
 const MAX_NAME_CHARS = 64;
+/** Largest accepted `ext` object as compact JSON (the Rust `MAX_EXTENSION_BYTES`). */
+export const MAX_GAME_TICKET_EXTENSION_BYTES = 2048;
+const EXTENSION_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+/**
+ * Names an extension claim must never use (identity, rewards, economy):
+ * the same list as the Rust `FactCommand` / `TicketExtension` derives
+ * (`distributed_game/tests/fixtures/trusted_field_denylist.json`). Matching
+ * ignores `_`, `-` and case.
+ */
+export const TRUSTED_FIELD_DENYLIST: readonly string[] = Object.freeze([
+	'principal', 'user', 'user_id', 'owner', 'owner_id', 'account', 'account_id', 'subject', 'sub',
+	'xp', 'experience', 'reward', 'rewards',
+	'amount', 'coins', 'gold', 'currency', 'price', 'cost', 'balance', 'grant', 'payout', 'credit', 'debit'
+]);
+const normalizeName = (name: string) => name.replaceAll(/[_-]/g, '').toLowerCase();
+const DENIED = new Set(TRUSTED_FIELD_DENYLIST.map(normalizeName));
+
+/** JSON value of an extension claim. */
+export type GameTicketClaimValue =
+	| string
+	| number
+	| boolean
+	| null
+	| readonly GameTicketClaimValue[]
+	| { readonly [key: string]: GameTicketClaimValue };
+
+/**
+ * Game-declared extension claims (match id, team, party…) signed under the
+ * ticket's `ext`. The zone server admits them only when they match its
+ * declared `#[derive(TicketExtension)]` schema.
+ */
+export type GameTicketExtensions = Readonly<Record<string, GameTicketClaimValue>>;
 const CONTROL = /[\u0000-\u001f\u007f]/;
 const CONTROLS = /[\u0000-\u001f\u007f]/g;
 const encoder = new TextEncoder();
@@ -33,6 +66,17 @@ export type MintGameTicketOptions = Readonly<{
 	role?: GameTicketRole;
 	/** Display name vouched for by this issuer (never identity). */
 	name?: string;
+	/**
+	 * Extension claims decided **on the server** (never from the browser).
+	 * Identity-, reward- and economy-looking names are refused.
+	 */
+	extensions?: GameTicketExtensions;
+	/**
+	 * Observers only: let this watcher wake the zone and keep it awake while
+	 * it says it is near (claim `wake`; celld zones). Decided on the server
+	 * (e.g. only rooms next to the principal's own). Default false.
+	 */
+	wake?: boolean;
 	/** Lifetime in seconds (1..=300, default 60). */
 	ttlSeconds?: number;
 	/** Clock in Unix milliseconds (tests). Default `Date.now()`. */
@@ -71,6 +115,45 @@ function boundedText(value: unknown, label: string, maxBytes: number): string {
 		throw new TypeError(`game ticket ${label} must be 1..=${maxBytes} bytes of trimmed text`);
 	}
 	return value;
+}
+
+function plainJson(value: unknown, depth: number): boolean {
+	if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+	if (typeof value === 'number') return Number.isFinite(value);
+	if (depth > 8 || typeof value !== 'object') return false;
+	if (Array.isArray(value)) return value.every((item) => plainJson(item, depth + 1));
+	const proto = Object.getPrototypeOf(value);
+	if (proto !== Object.prototype && proto !== null) return false;
+	return Object.values(value).every((item) => plainJson(item, depth + 1));
+}
+
+/**
+ * Validate extension claims: a plain object of identifier names (not on
+ * the deny list) to JSON values, at most `MAX_GAME_TICKET_EXTENSION_BYTES`.
+ * Returns undefined for none. Throws `TypeError`.
+ */
+export function checkGameTicketExtensions(value: unknown): GameTicketExtensions | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== 'object' || Array.isArray(value) || !plainJson(value, 0)) {
+		throw new TypeError('game ticket extensions must be a plain JSON object');
+	}
+	const names = Object.keys(value);
+	if (names.length === 0) return undefined;
+	for (const name of names) {
+		if (DENIED.has(normalizeName(name))) {
+			throw new TypeError(
+				`game ticket extension \`${name}\` looks like identity, a reward or an economy value; the zone binds identity from \`sub\` and handlers decide amounts`
+			);
+		}
+		if (!EXTENSION_NAME.test(name)) {
+			throw new TypeError(`game ticket extension name \`${name}\` must be an identifier`);
+		}
+	}
+	const json = JSON.stringify(value);
+	if (encoder.encode(json).byteLength > MAX_GAME_TICKET_EXTENSION_BYTES) {
+		throw new TypeError(`game ticket extensions exceed ${MAX_GAME_TICKET_EXTENSION_BYTES} bytes`);
+	}
+	return JSON.parse(json) as GameTicketExtensions;
 }
 
 /** Unpadded base64url (RFC 7515 §2). */
@@ -143,6 +226,10 @@ export async function mintGameTicket(options: MintGameTicketOptions): Promise<Mi
 		const trimmed = [...options.name.replace(CONTROLS, '').trim()].slice(0, MAX_NAME_CHARS).join('');
 		name = trimmed.length === 0 ? undefined : trimmed;
 	}
+	const ext = checkGameTicketExtensions(options.extensions);
+	if (options.wake === true && role !== 'observer') {
+		throw new TypeError('only observer tickets can grant wake');
+	}
 	const exp = Math.floor(now / 1000) + ttl;
 	const ticket = await signHs256(options.secret, {
 		sub: principal,
@@ -150,7 +237,9 @@ export async function mintGameTicket(options: MintGameTicketOptions): Promise<Mi
 		exp,
 		nonce,
 		role,
-		...(name === undefined ? {} : { name })
+		...(name === undefined ? {} : { name }),
+		...(ext === undefined ? {} : { ext }),
+		...(options.wake === true ? { wake: true } : {})
 	});
 	return Object.freeze({ ticket, zone, role, expiresAt: exp * 1000, nonce });
 }

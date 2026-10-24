@@ -26,7 +26,8 @@ the browser, but the client SDK has no rendering dependency.
 - [Build a zone](#build-a-zone)
 - [Guides](#guides): game loop · input · what clients see · the client SDK ·
   generated clients · SvelteKit apps · client prediction (Rust → WebAssembly) · shared
-  logic and data (no TypeScript twins) · saving progress · scaling out ·
+  logic and data (no TypeScript twins) · saving progress · scaling out
+  (zones as celld objects, the native multi-host server) ·
   live updates · lag compensation · testing and operations · security
 - [Design decisions](#design-decisions)
 - [Status and limits](#status-and-limits)
@@ -64,7 +65,8 @@ The words used throughout:
 | **GameServer** | (`net` feature) A WebSocket server hosting many zones, creating them on demand, routing players, and serving `/metrics` and admin routes. |
 | **Tick** | One fixed simulation step (30 Hz by default). Separate from the **patch** rate (20 Hz by default), how often clients get updates. |
 | **Player / Observer** | A *player* controls something and sends inputs. An *observer* only watches: a spectator, a leaderboard page, or a client looking into the zone next door. |
-| **Entity** | Something clients can see. The zone describes its entities each patch; the engine works out what changed for each client. |
+| **Entity** | A thing inside a zone with its own `EntityId`: a player, a mob, a pillar. It holds server state, some of which no client may see. |
+| **View** | What clients see of an entity: a `#[derive(Replicated)]` struct *projected* from it each patch (converted, derived, or left out). The engine works out what changed for each client. |
 | **Schema** | The kinds of entity and their fields (with quantization), usually from `#[derive(Replicated)]` views. Sent to clients on connect, so a generic client needs no generated code; a generated one adds types. |
 | **Fact** | An outcome worth keeping ("Alice killed the elite"). The zone emits it (typically the cell command's own input) and moves on; a background worker commits it to storage, where the command decides the reward, and reports back later. |
 | **Cell** | Durable, event-sourced state in `distributed`, for example one player's profile. Facts usually end up as commands on a cell. |
@@ -93,18 +95,15 @@ The words used throughout:
 
 ## Try it
 
-Seven runnable demos live in [`examples/game`](../examples/game/README.md),
-each built to show one part of the engine:
+The runnable demos live in [`examples/game`](../examples/game/README.md).
+They are being folded into one game, Mob Pit (the others are deleted as
+their mechanic moves in):
 
 | Demo | Run | Shows |
 |---|---|---|
-| Arena | `examples/game/run.sh arena` | ticks, deltas, prediction on/off, interest radius vs. global entities, simulated latency |
-| Mob Pit | `run.sh mobpit` | combat whose rewards are saved without stalling; "slow storage"; `kill -9` crash recovery |
+| Mob Pit | `examples/game/run.sh mobpit` (`--fleet` for several celld nodes) | rooms as celld objects joined by doorways, sleeping when empty and restored on return; combat whose rewards are saved exactly once without stalling; a network panel (simulated latency / jitter / loss on every room, prediction on/off with a server ghost, the interest ring); the rooms next door seen through passive watchers (the doorway rooms in reach woken by near watchers); hoods › boroughs › city as tier cells (boss kills ripple up through a saga, weather lifts as bosses fall); world events scheduled by boroughs; jumping; a bow with lag-compensated hits and first person |
 | Leaderboard | `run.sh leaderboard` | a live ranking fed from saved kills, rebuilt from history |
-| Shooting Gallery | `run.sh gallery` | lag compensation on/off under latency |
 | The Freeze | `run.sh freeze` | pausing every zone on two servers, updating content, resuming; safe-room reloads |
-| Endless Grid | `run.sh grid` | a generated world split into zones across two servers, seamless border crossings, zones sleeping and waking |
-| Boss Ripple | `run.sh ripple` | nested zones (realm › city › borough › neighbourhood) with events travelling up |
 
 Then open `http://localhost:5173/<demo>/`. Each page explains what to try.
 
@@ -169,6 +168,7 @@ impl Zone for Room {
     type Config = ();
     type Input = Push;
     type Timer = ();
+    type Message = NoMessages; // or a #[derive(GameEvent)] type (zone inbox)
 
     fn schema() -> EntitySchema { schema![DotView] }
 
@@ -193,7 +193,9 @@ impl Zone for Room {
         }
     }
 
-    // Describe the world; the engine diffs it per client.
+    // Describe the world; the engine diffs it per client. (Zones with
+    // entity collections register them in `entities()` instead and
+    // project views from them: see "What each client sees".)
     fn replicate(&self, out: &mut WorldView) {
         out.add(1, &DotView { x: self.x });
     }
@@ -218,13 +220,14 @@ for out in host.drain_outbound() { /* Outbound::Frame bytes go to the client */ 
 assert_eq!(game_surface().kinds[0].name, "dot");
 ```
 
-Serve it over WebSockets (`net` feature). The closure decides which zone
-ids this server hosts and with what config:
+Serve it over WebSockets (`net` feature). The zone factory decides which
+zone ids this server hosts and with what config:
 
 ```rust,ignore
-let server = GameServer::<Room>::new(ServerConfig::new(TicketKey::new(secret)), |zone_id| {
-    zone_id.starts_with("room-").then_some(())
-});
+let server = GameServer::<Room>::new(
+    ServerConfig::new(TicketKey::new(secret)),
+    ZoneFactory::sync(|activation| activation.zone_id.starts_with("room-").then_some(())),
+);
 server.serve(tokio::net::TcpListener::bind("0.0.0.0:2567").await?, shutdown_signal).await?;
 ```
 
@@ -260,7 +263,8 @@ requestAnimationFrame(function frame(now) {
 ```
 
 The rest of `Zone` is optional hooks: `on_auth`, `on_join`, `on_leave`,
-`on_rejoin`, `on_observe`, `on_timer`, `on_fact_settled`,
+`on_rejoin`, `on_connection_lost` (grace started), `on_reconnected`,
+`on_observe`, `on_timer`, `on_fact_settled`,
 `on_tier_changed`, `on_dispose`, `hibernate` / `on_restore`,
 `on_handoff_join`, `on_child_event`, `is_gate`, `freeze_ready`,
 `on_content_version_changed`, `record_rewind`, `state_hash`. Each is
@@ -285,7 +289,7 @@ A zone is in one of three **tiers**:
   Idle forever (a city clock, say) or from `has_pending_work` to stay Hot.
 - **Dormant**: idle for `dormant_after` (30 s); no ticks. With
   hibernation on, a Dormant zone is saved and unloaded (see
-  [Scaling out](#scaling-out-many-zones-many-servers)).
+  [Scaling out](#scaling-out-zones-as-celld-objects)).
 
 `on_tier_changed` tells you about transitions. Timers
 (`ctx.set_timeout(after, value)`, `ctx.set_interval(every, value)`,
@@ -322,15 +326,81 @@ that to drop inputs the server has already applied when it reconciles.
 
 ### What each client sees
 
-Each patch, `replicate` describes every entity once: `out.add(id, &view)`
-with a `#[derive(Replicated)]` view (or a hand-built `EntityState`). The
-view's struct is the kind: `#[replicated(kind = "mob", id = 2, priority =
+**Zones, entities, views and facts.** The same split as on the business
+side of `distributed`:
+
+| game runtime | business side | here |
+|---|---|---|
+| zone | aggregate root | one consistency boundary, changed only on its own tick |
+| zone entity (`Entity`, `EntityId`) | entity inside the aggregate | `Mob { id, home, target, hp, .. }`, server-only state included |
+| view (`Replicated` + `Project`) | read model / projection | `MobView { x, y, hp% , tele }`, recomputed each patch |
+| fact | domain event | `crawler.record_kill`, committed by a cell |
+
+Views are projections, not copies: a view converts (`hp` as a percent),
+derives (a telegraph ring from a windup timer), flattens (a nested move
+state), clamps, or returns `None` to leave the entity out (a dead mob),
+and server-only fields (`target`, `home`, `principal`) simply have no
+view field. Declare the entity type with `of` and mark straight copies
+`#[from]` (same name) or `#[from(path.to.field)]`; the derive generates
+`MobView::project(&mob, MobViewRest { .. })` with only the hand-filled
+fields left in `MobViewRest` (a missing or mistyped `#[from]` field is a
+compile error at the attribute), and when every field is `#[from]` it
+also implements `Project` for you:
+
+```rust,ignore
+#[derive(Replicated)]
+#[replicated(kind = "mob", id = 2, of = Mob)]
+pub struct MobView {
+    #[quant(min = -40.0, max = 40.0, bits = 14)] #[from(body.x)] pub x: f32,
+    #[quant(min = -40.0, max = 40.0, bits = 14)] #[from(body.y)] pub y: f32,
+    pub hp: u8, // percent: filled by hand
+}
+
+impl Entity for Mob {
+    fn entity_id(&self) -> EntityId { self.id }
+}
+
+impl Project<MobView> for Mob {
+    fn view(&self) -> Option<MobView> {
+        (self.hp > 0).then(|| MobView::project(self, MobViewRest {
+            hp: (self.hp * 100 / self.max_hp) as u8,
+        }))
+    }
+}
+```
+
+The zone registers its collections once (`Zone::entities`, like
+`schema()`); each patch the host projects every entity in registration
+order (`Vec`, slices, `VecDeque`, `BTreeMap` values, `Option`, or one
+entity such as the zone itself for a HUD view) and then calls
+`Zone::replicate` for anything else:
+
+```rust,ignore
+fn entities() -> Entities<Self> {
+    Entities::new()
+        .each(|z: &Self| &z.players)
+        .each(|z: &Self| &z.mobs)
+        .one(|z: &Self| z) // impl Project<HudView> for the zone
+}
+```
+
+`replicate` now defaults to nothing and stays for unusual zones: there,
+`out.project::<MobView, _>(&mob)` pushes one entity's view, and
+`out.add(id, &view)` any `#[derive(Replicated)]` view (with or without
+`of`; or push a hand-built `EntityState`). `ZoneHost::world_view()`
+returns the patch's projected world (tests, tooling). Mob Pit
+(`examples/game/server/src/mobpit/zone.rs`) has no `replicate` at all,
+and a golden test there checks the projected world and the Delta bytes
+against its former hand-written loop.
+
+**Kinds.** The view's struct is the kind: `#[replicated(kind = "mob", id = 2, priority =
 2.0, global)]`, one field per replicated field in wire order (`bool`, `u8`,
 `u16`, `u32`, `i32`, `f32`, `String` as a short string, `Vec<u8>` as
 bytes), `#[quant(min, max, bits)]` / `#[quant(centered = R, bits)]` (zero
 exact) / `#[angle(bits)]` / `#[field_type(EXPR)]` for floats,
 `#[priority(p)]`, and `#[correct(ease = ms | snap | replace)]` client
-defaults. The interest position is the `x` / `y` fields (or
+defaults (`ease = ms, snap_above = m`: an error larger than `m` cuts the whole
+entity — a respawn or another server-side teleport is a cut, not a slide). The interest position is the `x` / `y` fields (or
 `#[replicated(x = .., y = ..)]`); a kind without one must be `global`.
 `out.add(..)` returns a handle for `.global()`, `.local()`, `.priority(p)`.
 For each client the engine then sends only the difference from what that
@@ -344,10 +414,37 @@ client already has:
   the client when they leave it. A spatial grid makes this cheap. Mark
   entities that everyone must always see (players in a small room, a boss,
   pillars) with `.global()`.
+- **Across borders.** A zone says where it sits in the world once
+  (`fn origin(&self) -> Option<Origin>`, e.g. from the room in its zone
+  id) and how far its players see (`fn view_radius(&self) -> Option<f32>`).
+  The origin travels in Welcome; the game tells the JS client where the
+  player is with one call (`client.setPosition(x, y, zoneId)`, local to
+  the player's zone, or world coordinates without `zoneId`), and the SDK
+  focuses every zone it watches next door on the player in that zone's
+  coordinates (`Focus`, throttled). The default
+  `Zone::on_observer_focus` gives that observer the zone's player view
+  radius around the player, so interest and update rates carry on past
+  the wall instead of the neighbour sending all it has. Zones without an
+  origin are focused by hand (`watchZones(...).setFocus(at)`).
 - **Bandwidth budget.** Each client has `byte_budget` bytes per Delta
   (4 KiB). Creates and updates compete by priority (kind × entity ×
   field × nearness). Anything deferred builds up priority, so it is always
   sent eventually.
+- **Update rates.** Far entities are updated less often: within half the
+  view radius every patch, up to 0.8 of it every 2nd patch, beyond that
+  every 4th (`HostConfig::interest.update_rates`, staggered by entity id,
+  so a far entity's latest state is at most 3 patches late). Creates,
+  removes and global entities are never held, nor are kinds marked
+  `#[replicated(.., every_patch)]`; keep your own entity near the view
+  centre (it is when the view follows the player) or mark its kind.
+  `UpdateRates::every_patch()` turns the rates off.
+- **Encoded once.** Each changed entity's update is encoded once per patch
+  and copied into every Delta of a client that was current; clients
+  further behind (budget or update rates) share one encoding per
+  baseline. The bytes are exactly those of a per-client encoding (a
+  randomized test checks it), so a dense room's cost per client is
+  selection and copying: 128 mutually visible players build a patch
+  about 5× faster than encoding per client.
 - **Events** carry one-off messages such as "kill", "saved" or "weather
   changed" next to the Deltas. Declare them as a `#[derive(GameEvent)]`
   enum (each variant `#[game_event(id = N)]`: unit, named fields, or one
@@ -451,7 +548,9 @@ runnable: [`examples/game/sveltekit`](../examples/game/sveltekit)
    role }`; any other body field is refused, so identity, ownership and
    rewards never come from the request. Same-origin, a per-principal rate
    limit and `cache-control: no-store` are built in; the zone server still
-   enforces signature, zone, expiry and single use. `js/tests` reproduce
+   enforces signature, zone, expiry and single use. Extension claims (match
+   id, team…) come only from the server-side `claims(context)` callback and
+   are signed under `ext`. `js/tests` reproduce
    `tests/fixtures/sveltekit_tickets.json` byte for byte and `net_e2e`
    admits those tickets on a real `GameServer` (and refuses tampered,
    expired, wrong-zone and replayed ones).
@@ -663,25 +762,160 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
 - The host attaches the killer's **verified identity** from their ticket.
   The zone cannot claim to be someone else, and the payload names no
   reward amount; the command handler decides the XP from what it trusts.
-  The derive refuses identity- or reward-looking fields (`principal`,
-  `user_id`, `owner`, `xp`, `reward`, … including serde renames) at
-  compile time.
+  The derive refuses identity-, reward- and economy-looking fields
+  (`principal`, `user_id`, `owner`, `xp`, `reward`, `amount`, `coins`,
+  `gold`, `currency`, `price`, `cost`, `balance`, `grant`, `payout`,
+  `credit`, `debit`; `_`/`-`/case ignored, serde renames and aliases
+  included) at compile time, one error per field.
 - Keys are restart-safe automatically: `ctx.emit(player, input)` uses the
   input's `#[fact(key(field, ..))]` parts, or the tick and emission order;
   `ctx.emit_keyed` takes explicit parts; `ctx.emit_zone` emits a zone
   fact with no principal; `ctx.fact(&input)` builds the `Fact` for a retry
   backlog. `Fact::new(key, command, json)` still works.
 - A background worker commits facts with retries.
-  `cell::CellFactSink` turns each one into a command on that player's
-  cell, with a command id derived from the fact key. A retry or a
-  duplicate is therefore a harmless replay, never a double reward.
+  `command_sink::CommandFactSink<H: CommandHost>` dispatches each one as a
+  command through a command host — `celld::CelldFactSink` to its celld cell
+  (that player's cell, a match cell, ...) over the internal path, or a
+  `LocalCommandHost` to a service over any repository — with a command id
+  derived from the fact key. A retry or a duplicate is
+  therefore a harmless replay, never a double reward. (`cell::CellFactSink`
+  does the same into an in-process reference cell, for unit tests.)
 - `on_fact_settled` reports the outcome on a later tick.
 - Keys must be unique across restarts; `ctx.fact_key` includes the
   activation's boot epoch for you (see [Durable facts](#durable-facts)).
 - If the process crashes, each in-flight fact is either fully saved or
-  not saved at all. Mob Pit shows this with `kill -9`.
+  not saved at all. A zone hosted on celld (`celld_zone`) also keeps its
+  emitted facts in an outbox in object storage, so they are resent after
+  a crash: exactly once (Mob Pit's rooms).
+- **Player lifecycle facts.** With `HostConfig::lifecycle_facts = true`
+  the host itself emits `lifecycle::PlayerJoined` (ticket, rejoin or
+  handoff), `ConnectionLost` (grace started; dropped or told to reload),
+  `PlayerReconnected`, `PlayerDisconnected` (grace expired) and
+  `PlayerLeft { reason }` as facts bound to the verified principal, so
+  presence, match admission and abandon need no hand-written facts. Keys
+  are `{command}:{zone}:{boot_epoch}:p{slot}:{n}` (stable across retries,
+  new after a restart); they share the principal's commit lane (order kept
+  with `max_concurrent_commits > 1`) and wait in a host backlog rather
+  than being dropped when the queue is full. `lifecycle::Lifecycle::of(&fact)`
+  decodes them in a sink. Mob Pit routes them to per-player celld presence
+  cells (`CommandFactSink::lifecycle_route`), ordered by stamp.
+- Every fact carries a `FactStamp`: zone, activation (boot epoch), tick,
+  host wall time `emitted_at_ms` (`Clock::unix_ms`; `ManualClock` in
+  tests), content version, config version (`HostConfig::config_version`,
+  `ctx.set_config_version`) and `seq`, the host's per-activation emission
+  sequence (every stamped fact gets the next number). The cell sink passes it to handlers as
+  trusted `x-game-*` session variables (`cell::session_stamp`), and
+  `stamp_metadata` / `FactStamp::from_metadata` copy it onto events.
+- **Commit order is not emission order.** Order facts with
+  `FactStamp::emission_order` (same zone: activation, then `seq`, so two
+  facts of one tick and millisecond still order strictly; across
+  zones: wall time). After a handoff the target's stamps start after the
+  source's departure time, which the transfer ticket carries, so "joined
+  B" sorts after "left A" even when it commits first or the two hosts'
+  clocks disagree.
 
-### Scaling out: many zones, many servers
+### Scaling out: zones as celld objects
+
+On celld every zone is a Durable Object (feature `celld-zone`,
+[`celld_zone`](src/celld_zone/mod.rs)): one object per zone id, so a room
+*is* a cell. Game code implements `CelldZone` for its `Zone` and declares
+the class; nothing in the game or its API names a server.
+
+```rust,ignore
+impl CelldZone for MobPit {
+    fn object_config(zone: &str, env: &ObjectEnv) -> Result<PitConfig, String> { /* … */ }
+    fn fact_routes(sink: ObjectFactSink) -> ObjectFactSink {
+        sink.route(FactRoute::by_principal::<RecordKillInput>("crawler"))
+    }
+}
+distributed_game::celld_zone_object!(PitRoom, MobPit);
+
+// worker entry: /zones/{zone} → the zone's object (WebSocket or …/info)
+if let Some(response) = forward_to_zone(req, &env, "PIT_ROOM", "/zones/").await? { … }
+```
+
+**What celld handles:** where a zone runs (first touch; overflow to the
+least-loaded node with `CELLD_MAX_RESIDENT_CELLS`), forwarding a WebSocket
+from any node to the owner, one live instance per zone (fenced by its own
+epochs), evicting idle objects, moving idle ones to balance load, draining
+a stopping node and recovering a crashed node's objects elsewhere.
+
+**What the framework handles:** the WebSocket join (signed ticket, transfer
+ticket of a doorway handoff — single use across activations — or reconnect
+token), a self-correcting tick loop that runs only while someone is
+connected (and `ZONE_DORMANT_AFTER_MS`, default 10 s, after it empties,
+so a room whose last player or near watcher comes and goes does not report
+and snapshot every swing), the zone's snapshot in object storage (every
+`ZONE_PERSIST_MS`, default 60 s, while occupied, when a player leaves and
+when it goes dormant: each snapshot is a durable write celld keeps, so a short
+interval grows the store and slows every later write), dormancy and
+hibernation (`ZONE_HIBERNATE_AFTER_MS` later, by object alarm, so it also
+happens after an eviction), restore on the next join, facts to the cells
+of the same worker object to object (`CelldObjectHost` under the usual
+`CommandFactSink` routes; a durable outbox in the object's storage makes
+them exactly once across crashes; a lane's waiting facts for one cell go
+as one `POST …/__batch` and leave the outbox in one delete, see
+[Durable facts](#durable-facts)), and the zone's lifecycle reports
+(`active` / `dormant` / `hibernated`) into its
+[`zone_activity`](src/world/zone_activity.rs) cell, which the
+`zone_status` read model projects for minimaps.
+
+**The world around: watched cells (CQRS).** World cells (a hood, a
+borough, the content rollout, the dev settings) are the write model; each
+zone keeps a small read model of the ones it cares about. The zone
+declares them; each cell's view decodes into a plain struct and becomes a
+normal zone message:
+
+```rust,ignore
+impl CelldZone for MobPit {
+    fn watch(zone: &str) -> Watches<PitMessage> {
+        Watches::new()
+            .cell(HOOD_KIND, &hood_of(zone), |read: HoodRead| read.state.map(PitMessage::hood))
+            .cell(CITY_KIND, CITY_SHARD, |read: CityRead| read.state.map(PitMessage::city))
+    }
+}
+
+// the cell: one field and two calls (reads leave a lease, commits push)
+self.watchers.serve(&self.env, &self.cell, req, read_hood, sessions).await
+self.watchers.alarm(&self.env, &self.cell, read_hood).await
+```
+
+The zone reads each cell on wake (`GET …?watch=PIT_ROOM/pit.0.0`, which
+leaves a lease in the cell's memory — no write); after every commit or
+alarm that moves the aggregate's version the cell pushes `{topic,
+version, view}` to the live watchers ([`CellWatchers`](src/celld_zone/cells.rs));
+the zone applies only newer versions and re-reads every 45 ± 15 s, renewing
+its lease and repairing a lost push. A command that moves the aggregate but
+not its view (a heartbeat such as Mob Pit's `room_awake`) pushes nothing,
+so N rooms waking do not cost N² pushes. A push never wakes a sleeping zone
+(it hydrates on wake). Load is O(view changes × watchers + zones / 45 s),
+not every zone reading every cell every second: on one laptop node the
+refusals of saturated world cells (celld's 64-in-flight cap) fell from 85
+to 25 with 128 one-player Mob Pit rooms and from 12 to 3 with 64 fighting
+ones (numbers in the `mobpit-zone-load-test` task). Read models are for
+display and world flavour; rewards stay on the fact → command path.
+`CelldZone::refresh` remains for other async reads.
+
+**Limits.** A live zone never moves (only idle objects are rebalanced), so
+load spreads by first touch and node caps. Objects of one class share V8
+isolates: a slow zone delays its neighbours. A node crash takes about the
+node lease TTL (`CELLD_TTL_MS`, 10 s) to recover and loses at most the
+snapshot interval of zone state; facts survive in the outbox. A socket
+that outlives its activation closes with 1012 and the SDK rejoins with a
+fresh ticket. celld does not tell code which node it runs on: the node
+shown in debug views comes from an opt-in operator lookup
+(`CELLD_ZONE_NODES`), never used for routing.
+
+Measured on celld 0.6.2 (gr-p42 spike, a loaded 18-core laptop): about 150
+one-player rooms or 4–5 fifty-player rooms per core at 30 Hz; forwarding
+through another node adds under a millisecond; a hibernated room wakes in
+35–130 ms (p50).
+
+### Scaling out: the native multi-host server
+
+The `net` server can also spread zones over several processes itself
+(Endless Grid and Boss Ripple use it): placement, ownership and
+hibernation are then the framework's job.
 
 - **Placement.** A `ZoneDirectory` (`HashRing`) maps each zone id to a
   host. A client that connects to the wrong host is told where to go
@@ -692,6 +926,8 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
 - **On demand and asleep.** Zones start on first use. With
   `hibernate_after`, an empty zone is saved (`Zone::hibernate`) and
   unloaded, and restored (`on_restore`) the next time someone arrives.
+  On celld the snapshot is the zone's own `ZoneState` cell: a sleeping
+  zone is a sleeping Durable Object.
 - **Handoff.** `ctx.handoff(player, "next-zone", carried_bytes)` moves a
   player to another zone, on any server, with a signed transfer ticket.
   The target receives `on_handoff_join` with the carried state. When the
@@ -738,6 +974,11 @@ unlimited rewind.
   inputs by outcome, bytes per Delta, facts pending and settled.
 - **Load bots**: `game-bots` connects N WebSocket clients and reports
   round-trip time and bandwidth.
+- **Work counters**: `WorkCounters` counts what a zone did (records
+  encoded, updates sent and held back, Delta bytes, fact commands and
+  cell requests, outbox deletes, world reads and pushes). Counts do not
+  move with machine load, so they compare runs exactly where timings
+  cannot.
 - **Network simulation**: `NetSim` adds latency, jitter and loss in
   development, and can be changed at runtime.
 
@@ -765,10 +1006,13 @@ unlimited rewind.
 - **Facts, not per-tick persistence.** Movement and combat ticks are never
   stored, only meaningful outcomes. The tick enqueues and moves on, so
   storage speed never shows up as lag.
-- **Idempotency through keys, not a zone-side outbox.** A fact key plus
-  the cell's command ledger make retries safe. An outbox on the zone
-  would add a second write per outcome for little gain, since the zone
-  state lost in a crash is lost either way.
+- **Idempotency through keys; the outbox is a log consumed in batches.**
+  A fact key plus the cell's command ledger make retries safe. A native
+  zone keeps facts in its bounded queue only (the zone state lost in a
+  crash is lost either way). A celld zone also journals them in object
+  storage, written with the tick's other writes and settled in batches
+  (one cell request and one delete per batch), so the outbox costs one
+  batched write per tick, not two writes and a request per outcome.
 - **Static world from a seed.** Terrain and props are a pure function of
   seed and content version, generated identically on server and client.
   Only things that change are replicated.
@@ -780,11 +1024,19 @@ unlimited rewind.
   every float bit and costs about a microsecond per step.
 - **Binary protocol with the schema sent on connect.** Small,
   diff-friendly frames, and any client can decode them without generated
-  code.
+  code. The version is negotiated in the handshake (`PROTOCOL.md` §6.0):
+  servers answer v1 and v2 clients, the JS SDK falls back to v1 against
+  an old server and sends feature-gated messages (`Focus`) only to
+  servers that announce them, so servers and clients deploy in any order.
 - **Reliable, ordered WebSockets.** Deltas are computed against what each
   client last received, which only works because nothing is lost or
   reordered. Loss shows up as delay, which the adaptive interpolation
   absorbs.
+- **Shared encodings, per-client baselines.** Deltas stay per client
+  (each knows only what it was sent), but each distinct entity state and
+  each update between two states is encoded once and shared, so dense
+  rooms pay for copying, not encoding. Lowering far update rates on top
+  is a server choice: the wire and the client are unchanged.
 
 ## Status and limits
 
@@ -812,7 +1064,7 @@ errors for unsupported types and attributes.
 
 | Derive | On | Container attribute | Field attributes | Implements |
 |---|---|---|---|---|
-| `Replicated` | struct | `#[replicated(kind = "name", id = N, priority = P, global, x = f, y = f)]` | `quant`, `angle`, `field_type`, `priority`, `correct` | `Replicated` (`kind_def`, `field_values`, `position`) |
+| `Replicated` | struct | `#[replicated(kind = "name", id = N, priority = P, global, x = f, y = f, of = Entity)]` | `quant`, `angle`, `field_type`, `priority`, `correct`, `from` / `from(a.b)` (with `of`) | `Replicated` (`kind_def`, `field_values`, `position`); with `of`: `View::project` + `ViewRest` (or, all `#[from]`, `impl Project<View> for Entity`) |
 | `GameInput` | struct | – | `range`, `buttons`, `quant`, `angle`, `field_type` | `GameInput` (`from_payload`, `to_payload`, `sanitize`) + button consts |
 | `GameEvent` | enum / struct | `#[game_event(id = N, name = "..")]` per variant / on the struct | `quant`, `angle`, `field_type`, `long` | `GameEvent` (`decode_event`, `to_payload`) + id consts |
 | `GameRecord` | struct | – | `quant`, `angle`, `field_type`, `long` | `Wire` (nested payload record) |
@@ -834,12 +1086,17 @@ trait and its ABI (`run_abi`, `call_bytes`).
 |---|---|---|
 | *(default)* | Zone/host runtime, facts queue, protocol, schema, replication, authoring derives, game surface, predicted steps (compiles to `wasm32-unknown-unknown`, where `#[predict]` exports its steps) | `serde`, `serde_json`, `distributed_game_macros` |
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
-| `cell` | `cell::CellFactSink` → `AggregateCell::dispatch_idempotent`, `stamp_event_record` | `distributed`, `sha2` |
+| `cell` | `cell::CellFactSink` → in-process `AggregateCell::dispatch_idempotent` (native, unit tests); `cell::fact_session_from_headers` / `session_stamp` for cells (also wasm32); `stamp_event_record`; the `world::zone_lease` and `world::zone_state` cell aggregates | `distributed`, `sha2`, `base64` |
+| `cell` (also) | `command_sink::CommandFactSink<H: FactHost>`: facts → commands through any fact host, routed by command (`FactRoute`); `world::zone_activity` | |
+| `command-host` | `FactHost` for `CelldCommandHost` / `LocalCommandHost` (`CelldFactSink`) | `cell` + `distributed/graphql` |
+| `celld-zone` | `celld_zone`: any `Zone` as a celld Durable Object (`ZoneObject`, `celld_zone_object!`, `forward_to_zone`), facts object to object (`CelldObjectHost`), `serve_cell` / `ZoneActivityCell` for the worker's cells (wasm32) | `cell`, `ticket`, `workers-rs` + `js-sys`, `wasm-bindgen(-futures)` |
+| `ticket` | `ticket`: HS256 admission and transfer tickets without the axum server | `hmac`, `sha2`, `base64` |
+| `celld` | `celld::CelldFactSink` (the command sink over a remote-only `CelldCommandHost`): facts → celld cells over the internal HTTP path; `celld::CellZoneOwnership`: zone leases in celld `ZoneLease` cells; `celld::CellZoneStateStore`: hibernation snapshots in celld `ZoneState` cells | `command-host` + `reqwest`, `uuid` |
+| `workers-rs` | `world::zone_state::celld_worker`: the `zone-state/{zone}` route of a celld worker (cell + R2 bucket binding for large snapshots) | `cell` + `worker` |
 | `metrics` | `metrics::GameMetrics` per-zone Prometheus text | – |
 | `net` | `net::GameServer` (axum WebSocket), HMAC tickets, `GET /metrics` (implies `metrics`), handoff, admin peer routes, `WorldCoordinator` | `axum`, `hmac`, `sha2`, `base64`, `tokio` |
 | `bots` | `bots` load-test client library + `game-bots` binary | `net` + `tokio-tungstenite` |
 | `lease` | `world::FencedLeaseOwnership` over `distributed::lease` | `distributed` |
-| `sqlite` | `world::SqliteZoneStateStore` (hibernation snapshots) | `rusqlite` (bundled) |
 
 ## Durable facts
 
@@ -869,7 +1126,7 @@ Settlements: `settlement.is::<SlayInput>()`, and
 > do it for you.
 
 The host binds the principal from the player's **verified ticket** and
-stamps zone/tick/content version. A `FactSink` commits facts on a worker
+stamps zone, activation, tick, wall time, content and config version and emission sequence. A `FactSink` commits facts on a worker
 with bounded retries/backoff; `Zone::on_fact_settled` receives the outcome
 on a later tick. `cell::CellFactSink` dispatches into an `AggregateCell`
 with a deterministic command id per fact key, so retries replay instead of
@@ -878,6 +1135,46 @@ double-crediting. A custom sink needs only crate-root imports:
 (`BoxFuture` is also re-exported from `world` and `net` for
 `ZoneOwnership` / `BarrierParticipant` impls).
 
+**Facts as commands.** A zone server sends its facts to the durable
+aggregates as commands through a `CommandHost`, with one
+`command_sink::CommandFactSink` (feature `command-host`), routing each fact
+by its command to an aggregate kind and shard (`FactRoute`: by principal,
+by input field, by zone, or a function of the input and trusted session).
+The same routes serve every host: `celld::CelldFactSink` (feature `celld`)
+addresses celld cells by kind and shard; over a `LocalCommandHost` a
+service routes by command and its handler picks the stream
+(`tests/command_facts` runs the celld test's routes against an in-memory
+repository):
+
+```rust,ignore
+let sink = CelldFactSink::celld(celld_url, InternalHttpSecret::new(secret)?, "zone-server", "zone:pit-1")?
+    .route(FactRoute::by_principal::<RecordKillInput>("crawler"))            // Crawler:{principal}
+    .route(FactRoute::by_input_field::<MatchResultInput>("match", "match_id"))
+    .lifecycle_route("presence");                                            // zone.* → Presence:{account}
+// or: CommandFactSink::new(LocalCommandHost::new(service), "zone-server", "zone:pit-1")?.route(..)
+let (queue, feed) = fact_channel(capacity, RetryPolicy::until_settled(base, max));
+spawn_fact_worker(feed.with_max_concurrent_commits(n), sink);
+```
+
+Over celld each fact is `POST {CELLD_URL}/{kind}/{shard}/{command}` with
+`{commandId, input}` (the remote-only `CelldCommandHost`); the command id is
+`cell::command_id_for(service, key)`, so a retry after a timeout replays the
+cell's ledger receipt (`replayed`) instead of committing twice. Cells answer
+the standard wait-path body (`CellDispatchResult::wait_path_wire`). The
+principal travels as `x-user-id` and the command-ledger principal partition,
+the stamp as `x-game-*` headers (`CelldCommandHost::forward_session_prefix`),
+and every request carries
+`DISTRIBUTED_INTERNAL_SECRET`; the cell rebuilds the trusted session with
+`cell::fact_session_from_headers` after checking the secret. Player
+lifecycle facts route to presence, never to gameplay cells. celld slow,
+unreachable or answering 5xx/`COMMAND_IN_PROGRESS` is `Retryable`: with
+`RetryPolicy::until_settled` the fact stays in the queue (no local durable
+fallback), the zone keeps ticking, a full queue answers `Backpressure`,
+and after celld returns the backlog drains in per-principal order. An
+unrouted command, a rejected command or a bad shard is `Permanent`.
+`tests/celld_facts` proves this on `celld dev` against
+`tests/celld/fact-worker`, including a crash and restart of celld.
+
 **Throughput.** One worker per zone commits facts in emission order, one at
 a time (a slow commit delays every later fact). Set
 `ServerConfig::max_concurrent_commits` (or
@@ -885,6 +1182,31 @@ a time (a slow commit delays every later fact). Set
 **per-principal lanes**: a principal's facts (and, separately, zone facts
 without a principal) stay sequential in emission order; different
 principals commit concurrently; settlements arrive in completion order.
+
+**Batches.** A sink that settles many facts in one round trip opts in
+with one override that also supplies the batch commit:
+`fn batches(&self) -> Option<&dyn FactBatchSink> { Some(self) }` plus
+`impl FactBatchSink for MySink { fn commit_batch(…) }` (a host:
+`FactHost::fact_batches` → `FactBatchHost::dispatch_fact_batch`; the
+celld object host does). The feed then hands it up to
+`FactFeed::with_max_batch` (default 16; celld zones: `ZONE_FACT_BATCH`)
+waiting facts of a lane at once. Other sinks (`batches` is `None` by
+default) get one fact at a time and each settlement as soon as it
+commits. Game code is unchanged (`ctx.emit`, `#[derive(FactCommand)]`,
+`#[command]` handlers). `CommandFactSink` groups consecutive facts for
+the same aggregate and hands them to the host's batch dispatch, which the
+celld object host sends as one `POST {kind}/{shard}/__batch` (each entry
+with its own command id, principal and stamp; `serve_cell` runs them in
+order through the same idempotent wait path and drains the cell outbox
+once). A batch stops at its first retryable failure and is retried from
+there; attempts count per fact, so order, exactly-once and
+`RetryPolicy` mean what they mean for single facts. A cell without the
+batch route, or one refusing the batch request as a whole (a 4xx other
+than 408/429), gets the facts one by one. Serve fact cells with
+`serve_cell` (or `CellWatchers::serve`), whose `__batch` runs the batch
+under one command guard and one alarm reschedule
+(`AggregateCell::dispatch_idempotent_batch`); each entry is still its own
+ledger reservation and commit.
 
 ## Netcode and operations
 
@@ -899,6 +1221,20 @@ principals commit concurrently; settlements arrive in completion order.
   enforces route zone, expiry and single use; `TicketClaims::name` becomes
   `PlayerInfo::name` / `ObserverInfo::name` and travels with handoffs.
   Transfer tickets always use `ticket_key`.
+- **Extension claims**: game-declared claims the issuer vouches for (match
+  id, team, party) travel in the ticket's `ext` object. Declare them once —
+  `#[derive(Serialize, Deserialize, TicketExtension)] struct MatchClaims {
+  match_id: String, team: u8 }` — and admit them with
+  `ServerConfig::with_ticket_extensions::<MatchClaims>()`. The derive
+  refuses identity-, reward- and economy-looking names (the `FactCommand`
+  deny list, shared with the JS handler through
+  `tests/fixtures/trusted_field_denylist.json`); the server refuses tickets
+  whose `ext` has undeclared names or wrong types, and any `ext` when no
+  schema is declared (join tickets from any verifier and transfer tickets
+  alike). Zones read them typed in `on_auth`
+  (`req.claims.extensions.typed::<MatchClaims>()`) and afterwards from
+  `PlayerInfo::extensions`; a rejoin replaces them with the fresh ticket's
+  and handoffs carry them to the next zone.
 - **Input pacing**: `InputCredits::new(max)` gives each player one input
   credit per tick (banking up to `max` for jitter bursts);
   `credits.take(ctx, player)` consumes queued inputs while credits last, so
@@ -918,7 +1254,7 @@ principals commit concurrently; settlements arrive in completion order.
   stored history. The interpolation delay travels in the game's input
   payload (no wire change).
 - **Record/replay** (`replay`): drive a host through `Recorder` (same
-  methods as `ZoneHost`), save the compact `Recording` (`DGR2`), and
+  methods as `ZoneHost`), save the compact `Recording` (`DGR3`), and
   `replay::<Z>(&recording, config)` re-runs it on a `ManualClock`,
   checking a per-tick state hash (`Zone::state_hash`, or the replicated
   `WorldView`). A mismatch returns a `Divergence` naming the tick and the
@@ -935,6 +1271,24 @@ principals commit concurrently; settlements arrive in completion order.
   Only the first `ServerConfig::metrics_zone_labels` (default 64) live
   zones get a `zone` label; the rest aggregate into `zone="_other"`.
   `AdvanceReport` carries the raw numbers for custom drivers.
+- **Work counters** (`work::WorkCounters`, always on, plain integers):
+  `record_advance(&report)` adds a patch's records encoded
+  (`AdvanceReport::encodes`, shared by every client), frames, Delta bytes,
+  creates, updates, updates held back by update rates
+  (`DeltaStats::held`) and budget deferrals. A celld zone object keeps one
+  per object and adds its fact commands, cell requests and `__batch`
+  requests, outbox deletes, watched-cell reads and pushes received; `GET
+  /zones/{zone}/info` reports it as `work`, with the A/B switches in effect
+  (`switches`). A watched cell answers `GET /{kind}/{shard}/__watchers`
+  (internal secret) with its live watchers and `WatcherStats` (watching
+  reads, views published, views skipped as unchanged, pushes sent).
+  Switches (worker vars, default on): `ZONE_FACT_BATCH=1` (one fact per
+  request), `ZONE_UPDATE_RATES=0` (every visible change every patch),
+  `ZONE_WORLD_PUSH=0` (zones poll watched cells every second instead of
+  taking pushes). Mob Pit's `mobpit-load` prints the counters per step,
+  normalised per room patch, room-second or room-minute, and runs
+  interleaved A/B (`--ab ZONE_UPDATE_RATES=0 --pairs 3`: A,B then B,A …,
+  medians per side and of the per-pair change).
 - **Bots** (`bots`): `run_bots(BotConfig, |i| behaviour)` connects N
   WebSocket clients with signed tickets, sends inputs (random walk,
   circle, or your own `Behaviour`), measures RTT and Delta bytes/s:
@@ -947,6 +1301,12 @@ principals commit concurrently; settlements arrive in completion order.
   `DG_NET_LATENCY_MS`, `DG_NET_JITTER_MS`, `DG_NET_LOSS`,
   `DG_NET_RETRANSMIT_MS`. `GameServer::set_net_sim(Some(sim) | None)`
   changes it at runtime for every connection (order is preserved).
+  `distributed_game::netsim` is portable: zones hosted as celld objects
+  (`celld-zone`) apply the same simulation to each socket when the worker
+  sets `ZONE_DEV_SETTINGS=1`; the setting lives in the worker's dev
+  settings object (`celld_zone::ZoneDevSettings`, `PUT /zone-dev/netsim`
+  `{latencyMs, jitterMs, loss}` with the internal secret), pushed to every
+  zone object watching it (`world::watch`).
 
 ## World structure
 
@@ -955,14 +1315,51 @@ principals commit concurrently; settlements arrive in completion order.
 | Piece | Purpose |
 |---|---|
 | `ZoneDirectory` (`StaticDirectory`, `HashRing`) | zone → owning `HostAddr`. `HashRing` uses virtual nodes; adding/removing one of N hosts moves ~1/N of the zones. A Hello for a zone owned elsewhere gets `Redirect(zone, url)`; `url` is the owner's `HostAddr::ws_url` (advertise a proxied public URL with `HostAddr::with_ws_url`) or `ServerConfig::with_redirect_url(\|host, zone\| …)`. |
-| `ZoneOwnership` (`LocalOwnership`, `FencedLeaseOwnership<S: LeaseStore>`) | every activation acquires a fenced claim (`host#activation`) and renews it; a failed renewal disposes the zone **without** saving. Two hosts never run the same zone. |
-| `ZoneStateStore` (`MemoryZoneStateStore`, `SqliteZoneStateStore`) | hibernation snapshots, written under the claim's fencing token (stale writers get `StateError::Stale`, counted in `distributed_game_hibernation_saves_total{outcome="stale"}` and logged to stderr, never silently dropped). `LocalOwnership` seeds its tokens from the Unix time (µs) at creation, so a restarted host still outranks the snapshots its previous run saved. |
+| `ZoneOwnership` (`LocalOwnership`, `FencedLeaseOwnership<S: LeaseStore>`, `celld::CellZoneOwnership`) | every activation acquires a fenced claim (`host#activation`) and renews it; a failed renewal disposes the zone **without** saving. Two hosts never run the same zone. `CellZoneOwnership` keeps each claim in a celld `ZoneLease:{zone}` cell (`world::zone_lease`, mount with `mount_zone_lease`): acquire and release publish `zone.activated` / `zone.released`, renewals are internal (no outward events), and the lease's expiry schedule (`ctx.schedule`; the routes require `Capability::Scheduling` and `Clock`) publishes `zone.lease_expired` when a holder stops renewing, so services see a crashed zone server; each event carries the lease's `ZoneLeaseStatus { zone_id, holder, token, status }`. `world::ownership_conformance` is the behaviour every implementation passes. |
+| `ZoneStateStore` (`celld::CellZoneStateStore`; `MemoryZoneStateStore` for unit tests) | hibernation snapshots (async `load` / `save` / `delete`), written under the claim's fencing token (stale writers get `StateError::Stale`, counted in `distributed_game_hibernation_saves_total{outcome="stale"}` and logged to stderr, never silently dropped). On celld each zone's snapshot is its own `ZoneState:{zone}` cell (`world::zone_state`): inline up to 64 KiB, larger ones in the worker's R2 bucket with the digest in the cell; saves and deletes publish `zone_state.saved` / `zone_state.deleted` with a `ZoneSnapshotStatus { zone_id, token, stored, content_version, bytes }` (no bytes). `LocalOwnership` seeds its tokens from the Unix time (µs) at creation, so a restarted host still outranks the snapshots its previous run saved. |
+| `world::zone_status` (feature `cell`) | the read model of those events: `zone_leases` and `zone_snapshots` rows (`projection!` upserts of the state bodies), `projectors()` to mount on any consumer service and read-model store, and `ZoneStatus::of` → `Active { holder }` / `Hibernated { bytes }` / `Cold`. For views (world maps, minimaps): it answers "which zones are active or asleep?" without opening a cell per zone (on celld a read of a never-used cell creates it). Eventually consistent; ownership and restore always go to the cells. |
+| `world::watch` (`Watches`, `Watchers`, `TopicVersions`) | watched world views: a zone's typed list of the cells it watches; a cell's in-memory watcher leases; the zone's per-topic version guard (a late push or read never rolls back). On celld: `CelldZone::watch` + `celld_zone::CellWatchers`. |
 | `ZoneTopology` (`DottedTopology` default: `eldoria.port.docks` → `eldoria.port` → `eldoria`) | parent links for tier-up events. |
 
 **Per-zone host settings.** `GameServer::with_host_config(|zone_id, host|
 …)` adjusts the `HostConfig` of each activation (e.g. a province ticking at
 2 Hz while its neighborhoods run at 30 Hz); the world content version is
 applied afterwards.
+
+**Zone inbox.** Services talk to a running zone through typed messages:
+`type Message = MyMessage` on the zone (a `#[derive(GameEvent)]` struct or
+enum, so it has stable ids and the event payload codec; `NoMessages` for
+none) and `Zone::on_message(ctx, message)`, which runs on the zone's task
+between ticks, never during one. Deliver with `GameServer::send(zone,
+ZoneInbound::Message(m))` locally, `POST /admin/zone-message` (admin
+secret; `{zone, message: {type_id, payload}}` or `{zone, kick:
+{principal, reason}}`) from peers, or `net::ZoneInboxClient` from a
+service: it finds the owner through the `ZoneDirectory` and follows `421
+wrong_owner` answers. The built-in `ZoneInbound::Kick { principal, reason
+}` removes every connection of the principal (`LeaveReason::Kicked`, and a
+`PlayerLeft` lifecycle fact). A message for a zone that is not running is
+refused (`404 inactive` / `InboxError::Inactive`) and never activates it.
+Messages appear in the game surface under `messages`; the generated
+TypeScript has `MESSAGE`, `MESSAGES` and `encodeMessage` for TS services.
+Recorded and replayed like the other entry points (`Recorder::deliver`).
+
+**Zone factory and allocation.** `ZoneFactory::new(|activation| async move
+{ … })` may await storage: it runs on the activation task after the
+ownership claim and snapshot load, before the zone exists. It receives a
+`ZoneActivation { zone_id, activation, allocation }` — `activation` is the
+fencing token (= `boot_epoch` = the facts' stamp activation), `allocation`
+the `ZoneAllocation` record (roster, mode, config version) that the service
+which allocated the zone wrote into the store passed to
+`GameServer::with_allocation_store` (`MemoryZoneAllocationStore`, or your
+own `ZoneAllocationStore`). Return `Ok(Some(config))` to create the zone
+(`on_create` gets it), `Ok(None)` for "no such zone" (`Error(NOT_FOUND)`),
+`Err(ZoneCreateError)` when something it needs failed
+(`Error(ZONE_UNAVAILABLE)`). Store failures and a factory that outlives
+`ServerConfig::activation_timeout` also answer `ZONE_UNAVAILABLE`, never a
+hang. Joins that arrive during creation wait and are admitted afterwards;
+the tick never awaits. `ZoneFactory::sync(|activation| …)` covers factories
+without I/O. `GameServer::activate(zone).await` waits for a zone to run;
+`begin_activation(zone)` only starts it.
 
 **Activate on demand / hibernate.** `GameServer` creates a zone on first
 join (or tier-up event). With `ServerConfig::hibernate_after = Some(d)` a

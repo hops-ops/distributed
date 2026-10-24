@@ -1,0 +1,5 @@
+error: #[from] needs the entity type: #[replicated(.., of = Entity)]
+ --> tests/compile_fail/replicated_from_needs_of.rs:6:5
+  |
+6 |     #[from]
+  |     ^

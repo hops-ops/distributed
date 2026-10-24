@@ -24,6 +24,8 @@ fn claims(principal: &str, zone: &str) -> TicketClaims {
         nonce: format!("n-{principal}"),
         role: Role::Player,
         name: None,
+        extensions: Default::default(),
+        wake: false,
     }
 }
 
@@ -52,6 +54,7 @@ impl Zone for Range {
     type Config = ();
     type Input = (f32, u16);
     type Timer = ();
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         EntitySchema::new().kind(KindDef::new(1, "target").field("x", FieldType::F32))

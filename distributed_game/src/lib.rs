@@ -13,6 +13,9 @@
 //!   priority accumulation. Wire format: [`protocol`] / `PROTOCOL.md`.
 //! - Transport (`net` feature): axum WebSocket server hosting many zones
 //!   with HMAC-signed ticket admission ([`net`]).
+//! - celld (`celld-zone` feature, wasm32): each zone is a celld Durable
+//!   Object; celld places, forwards, hibernates and recovers it
+//!   ([`celld_zone`]).
 //!
 //! - Authoring derives (re-exported from `distributed_game_macros`):
 //!   `#[derive(Replicated)]` views generate a kind's schema and field
@@ -41,7 +44,8 @@
 //!   barrier / safe-room policy.
 //!
 //! # Extension seams (later phases)
-//! Metrics hook [`AdvanceReport`] and [`replication::DeltaStats`].
+//! Metrics hook [`AdvanceReport`] and [`replication::DeltaStats`]; plain
+//! work counts in [`WorkCounters`] ([`work`]).
 
 #![warn(missing_docs)]
 
@@ -54,17 +58,28 @@ pub mod authoring;
 pub mod bots;
 #[cfg(feature = "cell")]
 pub mod cell;
+#[cfg(feature = "celld")]
+pub mod celld;
+#[cfg(feature = "celld-zone")]
+pub mod celld_zone;
+pub mod claims;
 pub mod clock;
 pub mod codec;
+#[cfg(feature = "cell")]
+pub mod command_sink;
+pub mod entity;
 pub mod facts;
 pub mod handoff;
 pub mod host;
+pub mod inbox;
 pub mod input;
 pub mod interest;
+pub mod lifecycle;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 #[cfg(feature = "net")]
 pub mod net;
+pub mod netsim;
 pub mod prediction;
 pub mod protocol;
 pub mod pure;
@@ -75,31 +90,40 @@ pub mod rng;
 pub mod schema;
 pub mod stamp;
 pub mod surface;
+/// Signed admission tickets (also `net::ticket`); usable without the axum
+/// server, e.g. by a celld zone host on wasm32.
+#[cfg(feature = "ticket")]
+#[path = "net/ticket.rs"]
+pub mod ticket;
 pub mod timers;
 pub mod timestep;
+pub mod work;
 pub mod world;
 pub mod zone;
 
 pub use authoring::{GameEvent, GameInput, Pushed, Replicated};
+pub use claims::{ExtensionError, ExtensionSchema, TicketExtension, TicketExtensions};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use codec::{Wire, WireType};
 /// Authoring derives (see the crate docs and README).
 pub use distributed_game_macros::{
-    game_pure, predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated,
+    game_pure, predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated, TicketExtension,
 };
+pub use entity::{Entities, Entity, EntityCollection, EntityId, Project};
 #[cfg(feature = "runtime")]
 pub use facts::spawn_fact_worker;
 pub use facts::{
-    fact_channel, fact_key, BoxFuture, EmitError, Fact, FactCommand, FactError, FactFeed,
-    FactOutcome, FactQueue, FactReceipt, FactSettlement, FactSink, MemoryFactSink, RetryPolicy,
-    SettlementScript,
+    fact_channel, fact_key, BoxFuture, EmitError, Fact, FactBatchSink, FactCommand, FactError,
+    FactFeed, FactOutcome, FactQueue, FactReceipt, FactSettlement, FactSink, MemoryFactSink,
+    RetryPolicy, SettlementScript,
 };
 pub use handoff::{HandoffError, HandoffRequest, Transfer};
 pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};
+pub use inbox::{Delivered, NoMessages, ZoneInbound};
 pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, SequencedInput};
-pub use interest::{InterestConfig, View};
+pub use interest::{InterestConfig, UpdateRates, View};
 pub use prediction::{PredictContext, PredictStep};
-pub use protocol::{ClientMessage, ClientMirror, Role, ServerMessage, PROTOCOL_VERSION};
+pub use protocol::{ClientMessage, ClientMirror, Origin, Role, ServerMessage, PROTOCOL_VERSION};
 pub use pure::GamePure;
 pub use replay::{replay, Recorder, Recording};
 pub use replication::{EntityState, WorldView};
@@ -110,6 +134,7 @@ pub use stamp::{stamp_metadata, FactStamp};
 pub use surface::GameSurface;
 pub use timers::TimerId;
 pub use timestep::FixedTimestep;
+pub use work::WorkCounters;
 pub use world::{BarrierMode, ChildEvent, FreezeState, StalePolicy};
 pub use zone::{
     Admission, ClientId, JoinRequest, LeaveReason, ObserverId, ObserverInfo, PlayerId, PlayerInfo,

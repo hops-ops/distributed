@@ -57,6 +57,7 @@ pub mod projection_protocol;
 pub mod queued_repo;
 pub mod read_model;
 pub mod saga;
+pub mod schedule;
 pub mod snapshot;
 #[cfg(feature = "sqlite")]
 pub mod sqlite_repo;
@@ -69,8 +70,8 @@ pub mod trace_context;
 // Re-export entity types at crate root for convenience
 pub use entity::{
     upcast_events, upcast_events_for_replay, upcast_payload, BitcodePayloadCodec, Entity,
-    EventRecord, EventRecordError, EventUpcaster, PayloadCodec, UpcastError, BITCODE_PAYLOAD_CODEC,
-    BITCODE_PAYLOAD_CODEC_VERSION,
+    EventRecord, EventRecordError, EventUpcaster, PayloadCodec, Recorded, UpcastError,
+    BITCODE_PAYLOAD_CODEC, BITCODE_PAYLOAD_CODEC_VERSION,
 };
 
 // Placement-independent application composition. The module path remains the
@@ -374,9 +375,10 @@ pub use lease::PostgresLeaseStore;
 pub use lease::SqliteLeaseStore;
 pub use lease::{Fence, FencingToken, InMemoryLeaseStore, Lease, LeaseError, LeaseStore};
 pub use saga::{
-    Saga, SagaCommand, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaReply, SagaRunner,
-    SagaStatus, SagaStep,
+    Saga, SagaAction, SagaCommand, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaReply,
+    SagaRunner, SagaStatus, SagaStep,
 };
+pub use schedule::{Capabilities, Capability, Schedule, ScheduleWrite};
 
 // Outbox: commit concerns (aggregate + outbox in one commit).
 //

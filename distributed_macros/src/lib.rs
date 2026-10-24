@@ -1,4 +1,5 @@
 mod aggregate;
+mod aggregate_command;
 mod application;
 mod command;
 mod command_input_defaults;
@@ -20,7 +21,14 @@ use proc_macro::TokenStream;
 use syn::DeriveInput;
 
 /// Generate one typed command's portable contract and optional executable
-/// mount from the same handler declaration.
+/// mount from the same handler declaration (`#[command(id = "..", ..)]` on
+/// an async handler function).
+///
+/// The aggregate-method form, `#[command("aggregate.verb", shard = ..,
+/// load = .., outcome = ..)]` on a method inside a `#[sourced]` impl, is
+/// handled by `#[sourced]` (see the `aggregate_command` module docs): it
+/// generates the handler, binding the `#[principal]` parameter from the
+/// verified session, and the portable mount.
 #[proc_macro_attribute]
 pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
     command::expand(attr.into(), item.into())

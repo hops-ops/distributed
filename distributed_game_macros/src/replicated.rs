@@ -2,8 +2,9 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned};
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::{DeriveInput, Expr, Ident, LitInt, LitStr};
+use syn::{DeriveInput, Expr, Field, Ident, LitInt, LitStr, Member, Token, Type};
 
 use crate::shared::{
     check_name, field_name, find_attr, named_fields, no_generics, parse_field_attrs, reject,
@@ -17,8 +18,10 @@ struct KindAttrs {
     id: u16,
     priority: Option<Expr>,
     global: bool,
+    every_patch: bool,
     x: Option<Ident>,
     y: Option<Ident>,
+    of: Option<Type>,
 }
 
 fn parse_kind_attrs(input: &DeriveInput) -> syn::Result<KindAttrs> {
@@ -28,8 +31,8 @@ fn parse_kind_attrs(input: &DeriveInput) -> syn::Result<KindAttrs> {
             "#[derive(Replicated)] needs #[replicated(kind = \"name\", id = N)]",
         ));
     };
-    let (mut kind, mut id, mut priority, mut global, mut x, mut y) =
-        (None, None, None, false, None, None);
+    let (mut kind, mut id, mut priority, mut global, mut every_patch, mut x, mut y, mut of) =
+        (None, None, None, false, false, None, None, None);
     attr.parse_nested_meta(|meta| {
         let key = meta
             .path
@@ -44,11 +47,13 @@ fn parse_kind_attrs(input: &DeriveInput) -> syn::Result<KindAttrs> {
             }
             "priority" => priority = Some(meta.value()?.parse::<Expr>()?),
             "global" => global = true,
+            "every_patch" => every_patch = true,
             "x" => x = Some(meta.value()?.parse::<Ident>()?),
             "y" => y = Some(meta.value()?.parse::<Ident>()?),
+            "of" => of = Some(meta.value()?.parse::<Type>()?),
             _ => {
                 return Err(meta.error(
-                    "expected `kind`, `id`, `priority`, `global`, `x` or `y` in #[replicated(..)]",
+                    "expected `kind`, `id`, `priority`, `global`, `every_patch`, `x`, `y` or `of` in #[replicated(..)]",
                 ))
             }
         }
@@ -63,8 +68,96 @@ fn parse_kind_attrs(input: &DeriveInput) -> syn::Result<KindAttrs> {
         })?,
         priority,
         global,
+        every_patch,
         x,
         y,
+        of,
+    })
+}
+
+/// `#[from]` (same field name) or `#[from(a.b)]` (a field path on the
+/// entity): the field path to copy, spanned at the attribute.
+fn from_path(field: &Field) -> syn::Result<Option<(Vec<Member>, Span)>> {
+    let Some(attr) = find_attr(&field.attrs, "from") else {
+        return Ok(None);
+    };
+    let span = attr.span();
+    if matches!(attr.meta, syn::Meta::Path(_)) {
+        let ident = field.ident.clone().expect("named");
+        return Ok(Some((vec![Member::Named(ident)], span)));
+    }
+    let path = attr.parse_args_with(Punctuated::<Member, Token![.]>::parse_separated_nonempty)?;
+    Ok(Some((path.into_iter().collect(), span)))
+}
+
+/// With `of = T`: `View::project(&T, ViewRest)` (or, when every field is
+/// `#[from]`, `View::project(&T)` plus `impl Project<View> for T`).
+fn expand_of(
+    input: &DeriveInput,
+    of: &Type,
+    fields: &[&Field],
+    rt: &TokenStream,
+) -> syn::Result<TokenStream> {
+    let ident = &input.ident;
+    let vis = &input.vis;
+    // Zone entities are usually private to their module while views are
+    // public: a crate-visible constructor never leaks the entity type.
+    let fn_vis = quote!(pub(crate));
+    let rest_ident = Ident::new(&format!("{ident}Rest"), ident.span());
+    let mut inits = Vec::new();
+    let mut rest_fields = Vec::new();
+    for field in fields {
+        let name = field.ident.as_ref().expect("named");
+        match from_path(field)? {
+            Some((path, span)) => {
+                // A missing path is "no field", a different type
+                // "mismatched types", both at the `#[from]`.
+                inits.push(quote_spanned! {span=>
+                    #name: (src #(. #path)*).clone()
+                });
+            }
+            None => {
+                let docs = field.attrs.iter().filter(|a| a.path().is_ident("doc"));
+                let (fvis, ty) = (&field.vis, &field.ty);
+                rest_fields.push(quote! { #(#docs)* #fvis #name: #ty });
+                inits.push(quote! { #name: rest.#name });
+            }
+        }
+    }
+    if rest_fields.is_empty() {
+        return Ok(quote! {
+            impl #ident {
+                /// Project the entity: every field is `#[from]`.
+                #[allow(clippy::clone_on_copy)]
+                #fn_vis fn project(src: &#of) -> Self {
+                    Self { #(#inits),* }
+                }
+            }
+
+            impl #rt::Project<#ident> for #of {
+                fn view(&self) -> ::core::option::Option<#ident> {
+                    ::core::option::Option::Some(#ident::project(self))
+                }
+            }
+        });
+    }
+    let doc =
+        format!("The hand-filled (non-`#[from]`) fields of [`{ident}`], for [`{ident}::project`].");
+    Ok(quote! {
+        #[doc = #doc]
+        #[derive(Debug, Clone, PartialEq)]
+        #vis struct #rest_ident {
+            #(#rest_fields),*
+        }
+
+        impl #ident {
+            /// Project the entity: `#[from]` fields are copied from `src`,
+            /// the others taken from `rest`.
+            #[allow(clippy::clone_on_copy)]
+            #fn_vis fn project(src: &#of, rest: #rest_ident) -> Self {
+                Self { #(#inits),* }
+            }
+        }
     })
 }
 
@@ -164,11 +257,32 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
     let kind = &attrs.kind;
     let id = attrs.id;
     let global = attrs.global;
+    let projection = match &attrs.of {
+        Some(of) => expand_of(&input, of, &fields, &rt)?,
+        None => {
+            if let Some(field) = fields
+                .iter()
+                .find(|f| find_attr(&f.attrs, "from").is_some())
+            {
+                let attr = find_attr(&field.attrs, "from").expect("found");
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "#[from] needs the entity type: #[replicated(.., of = Entity)]",
+                ));
+            }
+            TokenStream::new()
+        }
+    };
     let kind_priority = attrs
         .priority
         .as_ref()
         .map(|e| quote!(.priority((#e) as f32)))
         .unwrap_or_default();
+    let every_patch = if attrs.every_patch {
+        quote!(.every_patch())
+    } else {
+        TokenStream::new()
+    };
     Ok(quote! {
         impl #rt::Replicated for #ident {
             const KIND_ID: u16 = #id;
@@ -179,6 +293,7 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 #p::KindDef::new(#id, #kind)
                     #(#defs)*
                     #kind_priority
+                    #every_patch
             }
 
             #[allow(clippy::unnecessary_cast)]
@@ -190,5 +305,7 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 #p::std::vec![#(#values),*]
             }
         }
+
+        #projection
     })
 }

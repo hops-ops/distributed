@@ -2,18 +2,22 @@
 //!
 //! - Store: `InMemoryLeaderboard`, or `RedisLeaderboard` when `REDIS_URL`
 //!   is set (sorted sets; every idempotent write is one Lua script).
-//! - Live path (fire-and-forget): after a kill commits, the fact sink calls
-//!   [`Leaderboards::submit_kill`], which enqueues one occurrence on a
-//!   `BackgroundLeaderboard` and returns immediately. A full queue or a Redis
-//!   outage drops the update (counted); a rebuild heals it.
-//! - Idempotency: every kill becomes a `DomainEventOccurrence` whose id is
-//!   derived from `(producer, "Crawler:{principal}", event sequence,
-//!   "mob_killed")` — the same id whether it comes from the live receipt, a
-//!   ledger replay of the same fact, or the cell's event history. The
-//!   projector's apply keys (`"{id}#{change}"`) make every repeat a no-op.
-//! - Rebuild ([`Leaderboards::rebuild`]): read every cell's durable event
-//!   history, project it into the *staging* boards and atomically promote
-//!   them. Runs at startup too (the in-memory board starts empty).
+//! - Live path (fire-and-forget): kills commit in the Crawler cells, next to
+//!   the rooms on celld; their `crawler.mob_killed` events reach this server
+//!   through the outbox Queue relay and the crawler directory
+//!   (`super::directory`). Every change of a crawler's totals there becomes
+//!   one [`CrawlerTotals`] occurrence ([`Leaderboards::submit_totals`]) on a
+//!   `BackgroundLeaderboard`: `Max` of kills and XP, so repeats, replays and
+//!   reordering are no-ops. A full queue or a Redis outage drops the update
+//!   (counted); the next change or a rebuild heals it.
+//! - Idempotency of the rebuild: every kill in a cell's history becomes a
+//!   `DomainEventOccurrence` whose id is derived from `(producer,
+//!   "Crawler:{principal}", event sequence, "mob_killed")`; the projector's
+//!   apply keys (`"{id}#{change}"`) make every repeat a no-op.
+//! - Rebuild ([`Leaderboards::rebuild`]): read the durable event history
+//!   of every crawler in the directory (`super::directory`) from its cell,
+//!   project it into the *staging* boards and atomically promote them.
+//!   Runs at startup too (the in-memory board starts empty).
 //! - Snapshot ([`BoardSnapshot`]): a `#[derive(GameRecord)]` struct, pushed
 //!   to clients as the zone's typed `board` event and served as camelCase
 //!   JSON by `/dev/mobpit/leaderboard`; the generated TypeScript type
@@ -26,21 +30,19 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use distributed::leaderboard::{
     BackgroundLeaderboard, BackgroundLeaderboardOptions, Board, InMemoryLeaderboard,
-    LeaderboardChange, LeaderboardEntry, LeaderboardError, LeaderboardProjection,
-    LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy, ScoreSubmission,
+    LeaderboardChange, LeaderboardChangeListener, LeaderboardEntry, LeaderboardError,
+    LeaderboardProjection, LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy,
+    ScoreSubmission,
 };
 use distributed::{DomainEventOccurrence, ExternalEventSource};
 use distributed_game::GameRecord;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::crawler::{KillReceipt, MobKilledArgs, AGGREGATE_TYPE, MOB_KILLED_EVENT};
+use super::crawler::AGGREGATE_TYPE;
 use super::store::CrawlerCells;
 
-/// Kills board.
-pub const KILLS_BOARD: &str = "mobpit.kills";
-/// XP board.
-pub const XP_BOARD: &str = "mobpit.xp";
+pub use mobpit_crawler::{KILLS_BOARD, XP_BOARD};
 /// Producer of kill occurrences.
 pub const PRODUCER: &str = "mobpit.crawler-cell";
 /// Rows pushed to clients.
@@ -176,7 +178,37 @@ pub fn kill_occurrence(
     .map_err(|e| format!("capture kill occurrence: {e:?}"))
 }
 
-/// kills += 1, xp += xp.
+/// Live projection input: a crawler's totals after a kill (the post-kill
+/// state its cell published), monotonic in `kills`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, distributed::DomainEvent)]
+#[domain_event(name = "mobpit.crawler_totals", version = 1)]
+pub struct CrawlerTotals {
+    /// Principal.
+    pub crawler: String,
+    /// Mobs killed.
+    pub kills: u32,
+    /// Total XP.
+    pub xp: u64,
+}
+
+/// The occurrence of `principal` reaching `kills` kills (one id per total).
+pub fn totals_occurrence(totals: &CrawlerTotals) -> Result<DomainEventOccurrence, String> {
+    DomainEventOccurrence::capture_external(
+        ExternalEventSource {
+            producer: PRODUCER.into(),
+            stream: format!("{AGGREGATE_TYPE}:{}", totals.crawler),
+            position: u64::from(totals.kills),
+            key: "totals".into(),
+        },
+        UNIX_EPOCH,
+        Default::default(),
+        totals,
+    )
+    .map_err(|e| format!("capture totals occurrence: {e:?}"))
+}
+
+/// Rebuild: kills += 1, xp += xp per recorded kill. Live: the greater of
+/// the stored and the reported totals.
 pub struct KillProjection {
     kills: Board,
     xp: Board,
@@ -194,12 +226,32 @@ impl KillProjection {
 impl LeaderboardProjection for KillProjection {
     fn handles(&self, event_name: &str) -> bool {
         event_name == <MobKilled as distributed::DomainEvent>::DESCRIPTOR.name
+            || event_name == <CrawlerTotals as distributed::DomainEvent>::DESCRIPTOR.name
     }
 
     fn project(
         &self,
         event: &DomainEventOccurrence,
     ) -> Result<Vec<LeaderboardChange>, LeaderboardError> {
+        if event.descriptor().name == <CrawlerTotals as distributed::DomainEvent>::DESCRIPTOR.name {
+            let totals: CrawlerTotals = event
+                .decode_body()
+                .map_err(|e| LeaderboardError::invalid(format!("crawler_totals body: {e:?}")))?;
+            return Ok(vec![
+                LeaderboardChange::new(
+                    self.kills.clone(),
+                    ScoreSubmission::new(
+                        &totals.crawler,
+                        f64::from(totals.kills),
+                        ScorePolicy::Max,
+                    ),
+                ),
+                LeaderboardChange::new(
+                    self.xp.clone(),
+                    ScoreSubmission::new(&totals.crawler, totals.xp as f64, ScorePolicy::Max),
+                ),
+            ]);
+        }
         let kill: MobKilled = event
             .decode_body()
             .map_err(|e| LeaderboardError::invalid(format!("mob_killed body: {e:?}")))?;
@@ -237,7 +289,15 @@ pub struct Leaderboards {
 impl Leaderboards {
     /// Redis when `redis_url` is given, else in memory. Must run inside a
     /// Tokio runtime (spawns the background applier and the refresher).
-    pub fn open(redis_url: Option<&str>, redis_prefix: &str) -> Result<Arc<Self>, String> {
+    /// `on_change` is told every board whose scores changed (applied kills
+    /// and rebuild promotions): the zone server publishes it on the
+    /// projection bus as `distributed.leaderboard.changed`, which drives
+    /// `@live` boards in `mobpit-service`.
+    pub fn open(
+        redis_url: Option<&str>,
+        redis_prefix: &str,
+        on_change: Option<LeaderboardChangeListener>,
+    ) -> Result<Arc<Self>, String> {
         let (store, backend): (Arc<dyn LeaderboardStore>, _) = match redis_url {
             Some(url) => (
                 Arc::new(
@@ -250,7 +310,10 @@ impl Leaderboards {
             None => (Arc::new(InMemoryLeaderboard::new()), "memory"),
         };
         let projection = Arc::new(KillProjection::new());
-        let projector: Projector = LeaderboardProjector::new(store.clone(), projection);
+        let mut projector: Projector = LeaderboardProjector::new(store.clone(), projection);
+        if let Some(listener) = on_change {
+            projector = projector.with_change_listener(listener);
+        }
         let background = BackgroundLeaderboard::spawn(
             projector.clone(),
             BackgroundLeaderboardOptions::default(),
@@ -301,20 +364,15 @@ impl Leaderboards {
         (&self.kills, &self.xp)
     }
 
-    /// Fire-and-forget live update for a committed (or replayed) kill.
-    pub fn submit_kill(&self, kill: &KillReceipt) {
-        self.remember_name(&kill.crawler, &kill.name);
-        match kill_occurrence(
-            &kill.crawler,
-            kill.sequence,
-            kill.at_ms,
-            &MobKilled {
-                crawler: kill.crawler.clone(),
-                mob: kill.mob.clone(),
-                tier: kill.tier,
-                xp: kill.xp,
-            },
-        ) {
+    /// Fire-and-forget live update: `principal` (shown as `name`) now has
+    /// these totals.
+    pub fn submit_totals(&self, principal: &str, name: &str, kills: u32, xp: u64) {
+        self.remember_name(principal, name);
+        match totals_occurrence(&CrawlerTotals {
+            crawler: principal.to_string(),
+            kills,
+            xp,
+        }) {
             Ok(occurrence) => {
                 self.background.submit(occurrence);
             }
@@ -428,41 +486,35 @@ impl Leaderboards {
         ))
     }
 
-    /// Rebuild both boards from every cell's durable event history and check
-    /// the result against the cells' current state.
-    pub async fn rebuild(&self, cells: &CrawlerCells) -> Result<RebuildReport, String> {
+    /// Rebuild both boards from the durable event history of `principals`'
+    /// cells and check the result against the cells' current state.
+    pub async fn rebuild(
+        &self,
+        principals: Vec<String>,
+        cells: &CrawlerCells,
+    ) -> Result<RebuildReport, String> {
         let _one_at_a_time = self.rebuilding.lock().await;
         let started = Instant::now();
         let before = self.top_rows().await.map_err(|e| e.to_string())?;
         let mut occurrences = Vec::new();
         let mut expected: BTreeMap<String, (u32, u64)> = BTreeMap::new();
-        let principals = cells.principals();
         for principal in &principals {
-            let cell = cells.get(principal).map_err(|e| e.to_string())?;
-            for record in cell.history().await.map_err(|e| e.to_string())? {
-                if record.event_name != MOB_KILLED_EVENT {
-                    continue;
-                }
-                let (crawler, name, mob, tier, xp): MobKilledArgs =
-                    record.decode().map_err(|e| e.to_string())?;
-                self.remember_name(&crawler, &name);
-                let at_ms = record
-                    .timestamp
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as u64);
+            let view = cells.crawler(principal).await?;
+            for kill in view.kills {
+                self.remember_name(&kill.crawler, &kill.name);
                 occurrences.push(kill_occurrence(
                     principal,
-                    record.sequence,
-                    at_ms,
+                    kill.sequence,
+                    kill.at_ms,
                     &MobKilled {
-                        crawler,
-                        mob,
-                        tier,
-                        xp,
+                        crawler: kill.crawler,
+                        mob: kill.mob,
+                        tier: kill.tier,
+                        xp: kill.xp,
                     },
                 )?);
             }
-            if let Some(state) = cell.load().await.map_err(|e| e.to_string())? {
+            if let Some(state) = view.state {
                 expected.insert(principal.clone(), (state.kills, state.xp));
             }
         }

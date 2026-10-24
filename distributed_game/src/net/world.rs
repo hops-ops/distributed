@@ -8,6 +8,7 @@
 //! |---|---|---|
 //! | `/admin/transfer` | `{op: reserve\|confirm\|release\|return, nonce}` | transfer record at the issuing host |
 //! | `/admin/child-event` | `{zone, event}` | deliver a tier-up event to a local zone |
+//! | `/admin/zone-message` | `{zone, kick: {principal, reason}}` or `{zone, message: {type_id, payload}}` | zone inbox ([`super::inbox`]): 404 inactive, 421 wrong owner |
 //! | `/admin/barrier/prepare` | `{barrier, reason, version, notes, timeout_ms}` | freeze all zones, wait for acks (409 + `missing`) |
 //! | `/admin/barrier/commit` | `{barrier, version, notes, mode: rolling\|hard}` | apply version, resume |
 //! | `/admin/barrier/abort` | `{barrier, notes}` | resume on the old version |
@@ -46,6 +47,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde_json::{json, Value};
 
+use super::inbox::{delivered_json, InboxError, WireInbound};
 use super::peer::{post_json, secret_eq, ADMIN_SECRET_HEADER};
 use super::{activate_local, transfer_op, unix_now, GameServer, Inner, TransferOp, ZoneCmd};
 use crate::facts::BoxFuture;
@@ -130,6 +132,41 @@ where
     match transfer_op(&inner, &host_id, op, &text(&body, "nonce")).await {
         Ok(()) => reply(StatusCode::OK, json!({"ok": true})),
         Err(e) => reply(StatusCode::CONFLICT, json!({"ok": false, "error": e})),
+    }
+}
+
+pub(super) async fn admin_zone_message<Z>(
+    State(inner): State<Arc<Inner<Z>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Reply
+where
+    Z: Zone,
+    Z::Config: Send,
+{
+    let body = match authorize(&inner, &headers, &body) {
+        Ok(body) => body,
+        Err(r) => return r,
+    };
+    let (zone, inbound) = match WireInbound::from_json(&body) {
+        Ok(parsed) => parsed,
+        Err(e) => return reply(StatusCode::BAD_REQUEST, json!({"ok": false, "error": e})),
+    };
+    let server = GameServer { inner };
+    match server.deliver_wire(&zone, inbound).await {
+        Ok(delivered) => reply(StatusCode::OK, delivered_json(delivered)),
+        Err(InboxError::WrongOwner(owner)) => reply(
+            StatusCode::MISDIRECTED_REQUEST,
+            json!({"ok": false, "error": "wrong_owner", "owner": owner.id, "admin_url": owner.admin_url}),
+        ),
+        Err(InboxError::Inactive) => reply(
+            StatusCode::NOT_FOUND,
+            json!({"ok": false, "error": "inactive"}),
+        ),
+        Err(e) => reply(
+            StatusCode::BAD_REQUEST,
+            json!({"ok": false, "error": e.to_string()}),
+        ),
     }
 }
 

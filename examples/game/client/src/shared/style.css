@@ -78,10 +78,27 @@ body {
 	margin: 0;
 	text-align: right;
 }
+.hud .controls {
+	margin: 0 0 8px;
+	padding-bottom: 6px;
+	border-bottom: 1px solid #2a3240;
+}
 .hud .toggle {
-	display: block;
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
 	margin: 4px 0;
 	cursor: pointer;
+}
+.hud .toggle kbd {
+	margin-left: auto;
+	flex-shrink: 0;
+	white-space: nowrap;
+	padding: 0 5px;
+	border: 1px solid #3a4558;
+	border-radius: 3px;
+	color: var(--muted);
+	font: 11px monospace;
 }
 .hud fieldset {
 	margin: 8px 0 0;

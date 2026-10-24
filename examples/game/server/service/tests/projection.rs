@@ -1,13 +1,18 @@
-//! Kill settlements → Crawler cell → outbox → SQLite bus → `player_stats`
-//! → GraphQL `@live`, with the real zone-server world (cells + fact sink +
-//! drain) and the service's projector and engine:
+//! Kill settlements → celld Crawler cell → outbox → celld Queue → the zone
+//! server's relay route → SQLite bus → `player_stats` → GraphQL `@live`,
+//! with a real `celld dev` serving `examples/game/cells`, the real
+//! zone-server world (fact sink + relay route) and the service's projector
+//! and engine:
 //!
 //! 1. settled kills project into one row per player with the cell's totals
 //!    (XP decided by the cell; a replayed fact changes nothing);
 //! 2. a live leaderboard subscription pushes the next settled kill;
 //! 3. the rows equal the cells after a restart of the projector (cursor
 //!    resumes, redelivery is deduplicated);
-//! 4. the surface has no mutations and the HTTP endpoint refuses a request
+//! 4. the leaderboard roots (`xpLeaderboard`, `@live`) read the zone
+//!    server's board, and its change notices travel over the bus to push
+//!    them (the engine shares no listener with the zone server's projector);
+//! 5. the surface has no mutations and the HTTP endpoint refuses a request
 //!    without a verified Bearer token.
 
 use std::path::PathBuf;
@@ -19,10 +24,12 @@ use distributed::SqliteRepository;
 use distributed_game::{Fact, FactSink, FactStamp};
 use futures_util::StreamExt;
 use game_demos::common::random_hex;
+use game_demos::devcelld::DevCelld;
 use game_demos::mobpit::crawler::RECORD_KILL;
 use game_demos::mobpit::{MobPitWorld, WorldOptions};
 use mobpit_service::{
-    build_engine, open_shared_sqlite, read_model_catalog, spawn_projector, BearerIdentity,
+    build_engine, open_shared_sqlite, read_model_catalog, spawn_board_notices, spawn_projector,
+    BearerIdentity,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -74,7 +81,7 @@ async fn eventually<F: std::future::Future<Output = bool>>(
     let start = Instant::now();
     while !check().await {
         assert!(
-            start.elapsed() < Duration::from_secs(20),
+            start.elapsed() < Duration::from_secs(45),
             "timed out waiting for {what}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -88,16 +95,26 @@ async fn settled_kills_project_into_live_player_stats() {
     let bus_url = format!("sqlite:{}", dir.join("bus.db").display());
     let db_url = format!("sqlite:{}?mode=rwc", dir.join("service.db").display());
 
-    // Zone-server side: cells + sink, events drained to the bus.
-    let world = MobPitWorld::open(WorldOptions::new(dir.join("cells"))).unwrap();
-    let sink = world.fact_sink();
-    // A kill settled before the bus existed waits in the cell's outbox.
+    // Zone-server side: the relay route on a known port, celld relaying its
+    // outbox Queue there, the world's fact sink into the cells.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay = format!(
+        "http://{}{}",
+        listener.local_addr().unwrap(),
+        distributed::bus::CELLD_QUEUE_RELAY_PATH
+    );
+    let celld = DevCelld::start(Some(relay)).unwrap_or_else(|error| panic!("celld dev: {error}"));
+    let mut options = WorldOptions::new(dir.join("local"), celld.options());
+    options.projection_bus = Some(bus_url.clone());
+    let world = MobPitWorld::open(options).unwrap();
+    let routes =
+        game_demos::common::relay::relay_routes(world.celld().secret.clone(), world.projection());
+    tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+    let sink = game_demos::mobpit::store::kill_sink(world.celld()).unwrap();
+    // A kill settled before the bus is attached waits in the Queue (the
+    // relay answers 503 and the consumer retries).
     sink.commit(&kill("k0", "dev-ana", 2, "ana")).await.unwrap();
-    let pending = world
-        .attach_projection_bus(&bus_url, Duration::from_millis(200))
-        .await
-        .unwrap();
-    assert_eq!(pending, 1, "startup drain publishes the waiting event");
+    world.attach_projection().await.unwrap();
 
     // Service side.
     let repo = SqliteRepository::connect_and_migrate(&db_url)
@@ -108,7 +125,13 @@ async fn settled_kills_project_into_live_player_stats() {
         .unwrap();
     let bus = open_shared_sqlite(&bus_url).await.unwrap();
     spawn_projector(repo.clone(), bus.clone());
-    let engine = build_engine(&repo, &identity(), [7; 32]).unwrap();
+    // The boards are the zone server's store (Redis in the demo; the same
+    // in-memory store here). Their `@live` pushes come only from the
+    // change notices on the bus.
+    let engine = std::sync::Arc::new(
+        build_engine(&repo, world.board().store().clone(), &identity(), [7; 32]).unwrap(),
+    );
+    spawn_board_notices(engine.clone(), bus.clone());
 
     sink.commit(&kill("k1", "dev-ana", 3, "ana")).await.unwrap();
     sink.commit(&kill("k2", "dev-bo", 1, "bo")).await.unwrap();
@@ -169,6 +192,53 @@ async fn settled_kills_project_into_live_player_stats() {
         json!({ "player_stats": [{ "xp": 70 }] })
     );
 
+    // The XP board through the GraphQL roots, live over the bus notices.
+    let mut board = Box::pin(engine.execute_stream(
+        &user("dev-bo"),
+        Request::new("subscription { xpLeaderboard(first: 3) { member score } }"),
+    ));
+    eventually("the board to catch up", || async {
+        let now = engine
+            .execute(
+                &user("dev-bo"),
+                Request::new("{ xpLeaderboard(first: 3) { member score } }"),
+            )
+            .await;
+        serde_json::to_value(&now.data).unwrap()["xpLeaderboard"]
+            == json!([{ "member": "dev-ana", "score": 85.0 }, { "member": "dev-bo", "score": 70.0 }])
+    })
+    .await;
+    let first = tokio::time::timeout(Duration::from_secs(5), board.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    sink.commit(&kill("k5", "dev-bo", 3, "bo")).await.unwrap();
+    let pushed = loop {
+        let next = tokio::time::timeout(Duration::from_secs(15), board.next())
+            .await
+            .expect("board push after the settled kill (notice over the bus)")
+            .unwrap();
+        let data = serde_json::to_value(&next.data).unwrap();
+        if data["xpLeaderboard"][0]["member"] == "dev-bo" {
+            break data;
+        }
+    };
+    assert_eq!(
+        pushed["xpLeaderboard"],
+        json!([{ "member": "dev-bo", "score": 130.0 }, { "member": "dev-ana", "score": 85.0 }])
+    );
+    let mine = engine
+        .execute(
+            &user("dev-bo"),
+            Request::new("{ xpMyRank { rank member score } }"),
+        )
+        .await;
+    assert_eq!(
+        serde_json::to_value(&mine.data).unwrap()["xpMyRank"],
+        json!({ "rank": 0, "member": "dev-bo", "score": 130.0 })
+    );
+
     // Read-only surface: there is no mutation to credit XP with.
     let forged = engine
         .execute(
@@ -184,14 +254,7 @@ async fn settled_kills_project_into_live_player_stats() {
     sink.commit(&kill("k4", "dev-cy", 2, "cy")).await.unwrap();
     eventually("third player", || async { rows(&repo).await.len() == 3 }).await;
     for (player, _, xp, kills, level) in rows(&repo).await {
-        let cell = world
-            .cells()
-            .get(&player)
-            .unwrap()
-            .load()
-            .await
-            .unwrap()
-            .unwrap();
+        let cell = world.cells().crawler(&player).await.unwrap().state.unwrap();
         assert_eq!(
             (xp, kills, level),
             (cell.xp as i64, i64::from(cell.kills), i64::from(cell.level))
@@ -199,7 +262,7 @@ async fn settled_kills_project_into_live_player_stats() {
     }
 
     // HTTP: no Bearer → refused (no header-trust identity mode).
-    let app = mobpit_service::http::router(std::sync::Arc::new(engine), &["http://ui.test".into()]);
+    let app = mobpit_service::http::router(engine, &["http://ui.test".into()]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });

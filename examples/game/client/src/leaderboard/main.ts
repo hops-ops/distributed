@@ -1,31 +1,45 @@
 /**
- * Leaderboard page: observes the pit zone (no avatar), renders the pushed
- * top-10 snapshots, reads your rank and neighbours on every push, and
- * triggers a rebuild from the cells' event history.
+ * Leaderboard page: renders the services' top-10 snapshots (a projection of
+ * the Crawler cells, polled), reads your rank and neighbours on every
+ * change, triggers a rebuild from the cells' event history, and observes
+ * the entrance room (no avatar) for a live mini map.
  */
-import { ARENA_FLOOR } from '../generated/arena/constants.ts';
 import {
+	createMobpitClient,
 	isMob,
 	isPillar,
 	isPlayer,
 	mobFields,
 	pillarFields,
 	playerFields,
+	PIT_WORLD
+} from '../generated/mobpit/index.ts';
+import {
+	createBoardWatcher,
+	DEFAULT_ZONE,
+	MobPitApi,
+	roomUrl,
+	TIERS,
+	type BoardPosition,
 	type BoardRow,
 	type BoardSnapshot
-} from '../generated/mobpit/index.ts';
-import { createBoardWatcher, DEFAULT_ZONE, MobPitApi, TIERS, type BoardPosition } from '../mobpit/client.ts';
+} from '../mobpit/client.ts';
 import { DevApi } from '../shared/dev-api.ts';
 
-/** The Arena floor, generated from the simulation's constants (`game_sim::arena::arena_floor`). */
-const { half: HALF } = ARENA_FLOOR;
+/** A room's floor, generated from the simulation's constants (`game_sim::mobpit::pit_world`). */
+const { half: HALF } = PIT_WORLD;
 
 const params = new URLSearchParams(location.search);
 const zone = params.get('zone') ?? DEFAULT_ZONE;
 const api = new DevApi();
 const pitApi = new MobPitApi();
-const watcher = createBoardWatcher({ api });
-const { client } = watcher;
+const watcher = createBoardWatcher(pitApi);
+const { client } = createMobpitClient({
+	url: (room) => roomUrl(room),
+	ticket: api.ticketSource(),
+	pingIntervalMs: 1000,
+	prediction: false
+});
 
 const $ = (k: string) => document.querySelector(`[data-k="${k}"]`) as HTMLElement;
 const status = $('status');
@@ -74,7 +88,7 @@ async function render(board: BoardSnapshot): Promise<void> {
 	table($('xp'), board.xp, 'XP', me);
 	const bg = board.background;
 	status.textContent =
-		`push #${pushes} · version ${board.version} · store ${board.backend} · ${board.members} ranked` +
+		`update #${pushes} · version ${board.version} · store ${board.backend} · ${board.members} ranked` +
 		` · background updates: ${bg.applied} applied, ${bg.dropped} dropped, ${bg.failed} failed`;
 	status.classList.add('flash');
 	setTimeout(() => status.classList.remove('flash'), 120);
@@ -148,4 +162,21 @@ declare global {
 }
 window.leaderboard = { client, api, pitApi, watcher };
 
-client.observe(zone).catch((error: unknown) => (status.textContent = `failed: ${String(error)}`));
+// A passive watcher: it never wakes the entrance; while it sleeps, retry.
+const watchEntrance = () => {
+	client.unobserve(zone);
+	client.observe(zone).then(
+		() => {
+			if (status.textContent?.startsWith('the entrance')) status.textContent = '';
+		},
+		() => {
+			status.textContent = 'the entrance is asleep (nobody playing) — watching for it…';
+			client.unobserve(zone);
+			setTimeout(watchEntrance, 3000);
+		}
+	);
+};
+client.on('zoneClosed', (closed) => {
+	if (closed === zone) setTimeout(watchEntrance, 3000);
+});
+watchEntrance();

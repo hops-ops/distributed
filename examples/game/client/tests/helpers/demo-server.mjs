@@ -1,5 +1,6 @@
 /**
- * Start a `game-demos <demo>` server for a Node test (port 0, dev routes on)
+ * Start a `game-demos <demo>` server for a Node test (port 0 unless given,
+ * dev routes on)
  * and stop it afterwards. Uses GAME_DEMOS_BIN when set (run.sh builds it),
  * else `cargo run` in ../server (compiles on first use).
  */
@@ -8,9 +9,9 @@ import { fileURLToPath } from 'node:url';
 
 const SERVER_DIR = fileURLToPath(new URL('../../../server/', import.meta.url));
 
-export async function startDemo(demo, { env = {} } = {}) {
+export async function startDemo(demo, { env = {}, port = 0 } = {}) {
 	const bin = process.env.GAME_DEMOS_BIN;
-	const args = [demo, '--port', '0', '--dev'];
+	const args = [demo, '--port', String(port), '--dev'];
 	const child = bin
 		? spawn(bin, args, { env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'inherit'] })
 		: spawn('cargo', ['run', '-q', '--', ...args], {
@@ -45,6 +46,17 @@ export async function until(predicate, timeoutMs = 10_000, what = 'condition') {
 	while (!predicate()) {
 		if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${what}`);
 		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+/** Poll an async `probe` until it returns a truthy value (returned). */
+export async function eventually(probe, timeoutMs = 10_000, what = 'condition') {
+	const start = Date.now();
+	for (;;) {
+		const value = await probe();
+		if (value) return value;
+		if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${what}`);
+		await new Promise((resolve) => setTimeout(resolve, 50));
 	}
 }
 

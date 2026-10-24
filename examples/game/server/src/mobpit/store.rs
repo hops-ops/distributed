@@ -1,412 +1,244 @@
-//! Per-player durable cells and the fact sink that routes into them.
+//! Mob Pit's durable state lives in celld cells (`examples/game/cells`),
+//! next to the rooms that feed them: a room's kill and lifecycle facts go
+//! to the killer's `crawler/{principal}` and `presence/{principal}` cells
+//! object to object (`mobpit_rooms`, `distributed_game::celld_zone`).
 //!
-//! [`CrawlerCells`] keeps one native SQLite cell per principal under a data
-//! directory (`Crawler%3A{principal}.sqlite3`, see `CellSqlitePath`). Every
-//! command commits its event, the command-ledger receipt and snapshot rows in
-//! one SQLite transaction with `synchronous=FULL`, so an acknowledged fact
-//! survives `kill -9` (and power loss), and a half-applied one cannot exist.
-//!
-//! [`CrawlerFactSink`] is the game's `FactSink`: optional artificial latency
-//! (the "slow storage" toggle), then `CellFactSink::commit` into the killer's
-//! cell, then a fire-and-forget leaderboard update.
-//!
-//! Each commit also writes the `crawler.mob_killed` domain event into the
-//! cell's outbox (same transaction). With a [`ProjectionBus`] attached
-//! (`--projection-bus`), the sink drains that outbox onto the SQLite bus
-//! after the commit, and a sweep drains every cell at startup and
-//! periodically (a crash between commit and drain, a bus outage). Delivery
-//! is at-least-once with stable message ids; the read-model service's
-//! projector deduplicates. Without a bus the rows wait in the cells.
+//! Each kill commit writes the `crawler.mob_killed` domain event to the
+//! cell's outbox in the same cell transaction. celld drains it to the
+//! `game-demo-outbox` Queue; the worker's consumer relays every message to
+//! this server's authenticated `/internal/celld-queue/relay`
+//! (`crate::common::relay`), which publishes it onto the projection bus.
+//! `mobpit-service` and this server's [`super::directory`] project it (the
+//! crawler list, which feeds the leaderboard). [`CrawlerCells`] reads one
+//! cell by principal (the board rebuild's kill histories, presence).
 
-use std::collections::{BTreeMap, VecDeque};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use distributed::bus::SqliteBus;
-use distributed::cell_host::{AggregateCell, CellSqlitePath, CellStreamStore};
-use distributed::entity::EventRecord;
-use distributed::BusPublisher;
-use distributed::{RepositoryError, StreamIdentity};
-use distributed_game::cell::CellFactSink;
-use distributed_game::{BoxFuture, Fact, FactError, FactReceipt, FactSink};
-use serde::Serialize;
+use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use super::board::Leaderboards;
-use super::crawler::{Crawler, KillReceipt, RecordKill, AGGREGATE_TYPE, RECORD_KILL};
+use super::crawler::{RecordKillInput, CRAWLER_KIND, PRESENCE_KIND};
+use distributed_game::celld::{CelldFactSink, FactRoute};
 
-/// Command-ledger service id for game facts.
-pub const SERVICE_ID: &str = "mobpit";
-/// Principal for facts without a player (none are emitted today).
-pub const SYSTEM_PRINCIPAL: &str = "mobpit-zone";
-const FILE_PREFIX: &str = "Crawler%3A";
-
-/// One player's open cell.
-pub struct CrawlerCell {
-    cell: Arc<AggregateCell<Crawler>>,
-    sink: CellFactSink<Crawler>,
-    /// One drain at a time per cell keeps the published order = commit order.
-    draining: tokio::sync::Mutex<()>,
+/// Kill facts into the Crawler cells over celld's internal HTTP path, the
+/// route a room uses object to object (tests and tools; rooms send theirs
+/// from inside celld). Command-ledger service `mobpit-tools`.
+pub fn kill_sink(celld: &CelldOptions) -> Result<CelldFactSink, String> {
+    Ok(CelldFactSink::celld(
+        celld.url.clone(),
+        celld.secret.clone(),
+        "mobpit-tools",
+        "mobpit-tools",
+    )?
+    .route(FactRoute::by_principal::<RecordKillInput>(CRAWLER_KIND)))
 }
 
-impl CrawlerCell {
-    /// Current state (`None` before the first kill).
-    pub async fn load(&self) -> Result<Option<Crawler>, RepositoryError> {
-        self.cell.load().await
-    }
+pub use crate::common::CelldOptions;
 
-    /// The full durable event history of this cell, oldest first.
-    pub async fn history(&self) -> Result<Vec<EventRecord>, RepositoryError> {
-        self.cell.history().await
-    }
-
-    /// The cell (tests dispatch into it directly).
-    pub fn cell(&self) -> &Arc<AggregateCell<Crawler>> {
-        &self.cell
-    }
-
-    /// Publish this cell's pending outbox rows (its domain events) to `bus`,
-    /// oldest first; returns how many were published.
-    pub async fn drain_to(&self, bus: &ProjectionBus) -> Result<usize, String> {
-        let _turn = self.draining.lock().await;
-        let mut published = 0;
-        loop {
-            let outcome = self
-                .cell
-                .drain_outbox_with(
-                    bus.publisher.clone(),
-                    Duration::from_secs(30),
-                    DRAIN_MAX_ATTEMPTS,
-                    DRAIN_BATCH,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
-            published += outcome.published;
-            if outcome.released > 0 || outcome.failed > 0 {
-                return Err(format!(
-                    "projection bus publish failed ({} released, {} failed)",
-                    outcome.released, outcome.failed
-                ));
-            }
-            if outcome.claimed < DRAIN_BATCH {
-                return Ok(published);
-            }
-        }
-    }
+/// A Crawler cell's state as the cells worker reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct CrawlerSummary {
+    /// Display name at the last kill.
+    pub name: String,
+    /// Total XP.
+    pub xp: u64,
+    /// Mobs killed.
+    pub kills: u32,
+    /// Level for `xp`.
+    pub level: u32,
+    /// Committed stream version.
+    pub version: u64,
 }
 
-const DRAIN_BATCH: usize = 32;
-/// Rows are retried by later drains rather than dropped.
-const DRAIN_MAX_ATTEMPTS: u32 = 10_000;
+/// One `crawler.mob_killed` event of a Crawler cell's history.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KillRecord {
+    /// Stream position (the leaderboard occurrence).
+    pub sequence: u64,
+    /// Cell time of the commit (Unix ms).
+    pub at_ms: u64,
+    /// Principal.
+    pub crawler: String,
+    /// Display name at the kill.
+    pub name: String,
+    /// Mob instance.
+    pub mob: String,
+    /// Mob tier.
+    pub tier: u8,
+    /// XP credited.
+    pub xp: u32,
+}
 
-/// The SQLite bus Crawler domain events are published to (consumed by
-/// `mobpit-service`'s projector).
+/// `GET crawler/{principal}`: state (None before the first kill) and the
+/// kill history, oldest first.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CrawlerView {
+    /// Current state.
+    pub state: Option<CrawlerSummary>,
+    /// Kill events.
+    pub kills: Vec<KillRecord>,
+}
+
+/// Read side of one Crawler or presence cell, over the internal path.
 #[derive(Clone)]
-pub struct ProjectionBus {
-    publisher: BusPublisher<SqliteBus>,
-}
-
-impl ProjectionBus {
-    /// Open (creating) the bus at a `sqlite:` URL shared with the service.
-    pub async fn open(url: &str) -> Result<Self, String> {
-        use std::str::FromStr;
-        let options = sqlx::sqlite::SqliteConnectOptions::from_str(url)
-            .map_err(|e| format!("projection bus {url}: {e}"))?
-            .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(10));
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect_with(options)
-            .await
-            .map_err(|e| format!("projection bus {url}: {e}"))?;
-        let bus = SqliteBus::new(pool);
-        bus.ensure_tables()
-            .await
-            .map_err(|e| format!("projection bus tables: {e}"))?;
-        Ok(Self {
-            publisher: BusPublisher::new(Arc::new(bus)),
-        })
-    }
-}
-
-/// Lazily opened `Crawler` cells under one directory.
 pub struct CrawlerCells {
-    root: PathBuf,
-    open: Mutex<BTreeMap<String, Arc<CrawlerCell>>>,
+    client: reqwest::Client,
+    base: String,
+    secret: InternalHttpSecret,
 }
 
 impl CrawlerCells {
-    /// Cells under `root` (created on first write).
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            open: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    /// Data directory.
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
-    /// Open (once per process) the cell of `principal`. Opening the same file
-    /// twice in one process would give two connections; the cache prevents it.
-    pub fn get(&self, principal: &str) -> Result<Arc<CrawlerCell>, RepositoryError> {
-        let mut open = self.open.lock().expect("cells lock");
-        if let Some(cell) = open.get(principal) {
-            return Ok(cell.clone());
-        }
-        let identity = StreamIdentity::new(AGGREGATE_TYPE, principal.to_string())?;
-        let store = CellStreamStore::open_sqlite(&CellSqlitePath::root(&self.root), identity)?;
-        let cell = Arc::new(AggregateCell::from_store(store)?.mount(RecordKill));
-        let entry = Arc::new(CrawlerCell {
-            sink: CellFactSink::new(cell.clone(), SERVICE_ID, SYSTEM_PRINCIPAL),
-            cell,
-            draining: tokio::sync::Mutex::new(()),
-        });
-        open.insert(principal.to_string(), entry.clone());
-        Ok(entry)
-    }
-
-    /// Whether `principal` already has a cell file (reads never create one).
-    pub fn exists(&self, principal: &str) -> bool {
-        CellSqlitePath::root(&self.root)
-            .resolve(&format!("{AGGREGATE_TYPE}:{principal}"))
-            .exists()
-    }
-
-    /// Principals with a cell file on disk (sorted).
-    pub fn principals(&self) -> Vec<String> {
-        let Ok(dir) = std::fs::read_dir(&self.root) else {
-            return Vec::new();
-        };
-        let suffix = format!(".{}", distributed::cell_host::NATIVE_CELL_SQLITE_EXTENSION);
-        let mut out: Vec<String> = dir
-            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .filter_map(|name| {
-                let stem = name.strip_prefix(FILE_PREFIX)?.strip_suffix(&suffix)?;
-                // Long names are hashed (`~`) and cannot be inverted; guest
-                // and bot principals never are.
-                percent_decode(stem)
-            })
-            .collect();
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    /// Drain every cell on disk to `bus` (startup recovery and the periodic
-    /// sweep). Returns rows published; per-cell errors are reported and
-    /// retried by the next sweep.
-    pub async fn drain_all(&self, bus: &ProjectionBus) -> usize {
-        let mut published = 0;
-        for principal in self.principals() {
-            match self.get(&principal) {
-                Ok(cell) => match cell.drain_to(bus).await {
-                    Ok(n) => published += n,
-                    Err(error) => eprintln!("mobpit: drain {principal}: {error}"),
-                },
-                Err(error) => eprintln!("mobpit: open {principal}: {error}"),
-            }
-        }
-        published
-    }
-}
-
-fn percent_decode(stem: &str) -> Option<String> {
-    let bytes = stem.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = stem.get(i + 1..i + 3)?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
-        } else if bytes[i] == b'~' {
-            return None;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-/// A committed kill as the dev routes report it.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CommittedFact {
-    /// Fact idempotency key.
-    pub key: String,
-    /// Command input as committed (needed to replay the exact command).
-    pub input: serde_json::Value,
-    /// Receipt.
-    pub receipt: KillReceipt,
-    /// True when the ledger replayed an earlier commit.
-    pub replayed: bool,
-}
-
-/// Counters of the fact sink.
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SinkStats {
-    /// Commit attempts started.
-    pub attempts: u64,
-    /// First-time commits.
-    pub committed: u64,
-    /// Ledger replays (same key seen again).
-    pub replayed: u64,
-    /// Failed attempts (retryable or permanent).
-    pub errors: u64,
-    /// Facts currently inside `commit` (incl. the artificial latency).
-    pub in_sink: u64,
-}
-
-/// Shared sink state (lives in the world).
-#[derive(Default)]
-pub struct SinkState {
-    latency_ms: AtomicU64,
-    stats: Mutex<SinkStats>,
-    recent: Mutex<VecDeque<CommittedFact>>,
-}
-
-impl SinkState {
-    /// Artificial storage latency.
-    pub fn latency(&self) -> Duration {
-        Duration::from_millis(self.latency_ms.load(Ordering::Relaxed))
-    }
-
-    /// Set the artificial storage latency (clamped to 5 s).
-    pub fn set_latency(&self, latency: Duration) -> Duration {
-        let ms = latency.as_millis().min(5_000) as u64;
-        self.latency_ms.store(ms, Ordering::Relaxed);
-        Duration::from_millis(ms)
-    }
-
-    /// Counter snapshot.
-    pub fn stats(&self) -> SinkStats {
-        self.stats.lock().expect("stats").clone()
-    }
-
-    /// Most recent commits, newest last (at most 64).
-    pub fn recent(&self) -> Vec<CommittedFact> {
-        self.recent
-            .lock()
-            .expect("recent")
-            .iter()
-            .cloned()
-            .collect()
-    }
-
-    fn update(&self, f: impl FnOnce(&mut SinkStats)) {
-        f(&mut self.stats.lock().expect("stats"));
-    }
-}
-
-/// The game's fact sink (cloned into every zone's fact worker).
-#[derive(Clone)]
-pub struct CrawlerFactSink {
-    cells: Arc<CrawlerCells>,
-    state: Arc<SinkState>,
-    board: Arc<Leaderboards>,
-    projection: Arc<std::sync::OnceLock<ProjectionBus>>,
-}
-
-impl CrawlerFactSink {
-    /// Sink over `cells`, reporting into `state`, feeding `board`.
-    pub fn new(
-        cells: Arc<CrawlerCells>,
-        state: Arc<SinkState>,
-        board: Arc<Leaderboards>,
-        projection: Arc<std::sync::OnceLock<ProjectionBus>>,
-    ) -> Self {
-        Self {
-            cells,
-            state,
-            board,
-            projection,
-        }
-    }
-
-    async fn commit_inner(&self, fact: &Fact) -> Result<FactReceipt, FactError> {
-        let latency = self.state.latency();
-        if !latency.is_zero() {
-            tokio::time::sleep(latency).await;
-        }
-        let principal = fact
-            .principal()
-            .ok_or_else(|| FactError::Permanent("kill facts need a player principal".into()))?;
-        let cell = self
-            .cells
-            .get(principal)
-            .map_err(|e| FactError::Retryable(format!("open cell: {e}")))?;
-        let receipt = cell.sink.commit(fact).await?;
-        if let Some(bus) = self.projection.get().cloned() {
-            // Off the settlement path: the zone hears "saved" when the cell
-            // commits; the read model follows from the outbox.
-            let cell = cell.clone();
-            tokio::spawn(async move {
-                if let Err(error) = cell.drain_to(&bus).await {
-                    eprintln!("mobpit: projection drain (retried by the sweep): {error}");
-                }
-            });
-        }
-        if fact.command() == RECORD_KILL {
-            if let Ok(kill) = serde_json::from_value::<KillReceipt>(receipt.payload.clone()) {
-                // Fire-and-forget: never awaits the leaderboard store.
-                self.board.submit_kill(&kill);
-                let mut recent = self.state.recent.lock().expect("recent");
-                if recent.len() == 64 {
-                    recent.pop_front();
-                }
-                recent.push_back(CommittedFact {
-                    key: fact.key().to_string(),
-                    input: fact.input().clone(),
-                    receipt: kill,
-                    replayed: receipt.replayed,
-                });
-            }
-        }
-        Ok(receipt)
-    }
-}
-
-impl FactSink for CrawlerFactSink {
-    fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
-        Box::pin(async move {
-            self.state.update(|s| {
-                s.attempts += 1;
-                s.in_sink += 1;
-            });
-            let result = self.commit_inner(fact).await;
-            self.state.update(|s| {
-                s.in_sink -= 1;
-                match &result {
-                    Ok(r) if r.replayed => s.replayed += 1,
-                    Ok(_) => s.committed += 1,
-                    Err(_) => s.errors += 1,
-                }
-            });
-            result
+    /// Reader for the cells at `celld`.
+    pub fn new(celld: &CelldOptions) -> Result<Self, String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| format!("celld client: {error}"))?;
+        Ok(Self {
+            client,
+            base: celld.url.clone(),
+            secret: celld.secret.clone(),
         })
     }
+
+    /// celld base URL.
+    pub fn url(&self) -> &str {
+        &self.base
+    }
+
+    async fn get(&self, kind: &str, shard: &str) -> Result<Value, String> {
+        let url = format!("{}/{}/{}", self.base, kind, encode_segment(shard));
+        let response = self
+            .client
+            .get(&url)
+            .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
+            .send()
+            .await
+            .map_err(|error| format!("celld unreachable at {url}: {error}"))?;
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            return Err(format!("GET {url}: HTTP {status}: {body}"));
+        }
+        Ok(body)
+    }
+
+    /// The rooms' dev settings under `shard` (`distributed_game::celld_zone`'s
+    /// `zone-dev` object; `{}` when unset).
+    pub async fn dev_settings(&self, shard: &str) -> Result<Value, String> {
+        self.get(distributed_game::netsim::ZONE_DEV_KIND, shard)
+            .await
+    }
+
+    /// Replace the rooms' dev settings under `shard` (every room reads them
+    /// within a second).
+    pub async fn set_dev_settings(&self, shard: &str, value: &Value) -> Result<Value, String> {
+        let url = format!(
+            "{}/{}/{}",
+            self.base,
+            distributed_game::netsim::ZONE_DEV_KIND,
+            encode_segment(shard)
+        );
+        let response = self
+            .client
+            .put(&url)
+            .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
+            .json(value)
+            .send()
+            .await
+            .map_err(|error| format!("celld unreachable at {url}: {error}"))?;
+        let status = response.status();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            return Err(format!("PUT {url}: HTTP {status}: {body}"));
+        }
+        Ok(body)
+    }
+
+    /// A tier cell's state (`kind` = hood / borough / city; `null` before
+    /// its first event).
+    pub async fn tier(&self, kind: &str, shard: &str) -> Result<Value, String> {
+        Ok(self.get(kind, shard).await?["state"].take())
+    }
+
+    /// The world's content rollout (`content-rollout/{world}`: live
+    /// version, phase, notes; `null` before the first rollout).
+    pub async fn content(&self, world: &str) -> Result<Value, String> {
+        Ok(self
+            .get(
+                distributed_game::world::content_rollout::CONTENT_ROLLOUT_KIND,
+                world,
+            )
+            .await?["state"]
+            .take())
+    }
+
+    /// Run `command` on the cell `kind/shard` as `principal` (an internal
+    /// session the caller vouches for, e.g. an admin it authenticated).
+    /// Returns the HTTP status and the cell's answer.
+    pub async fn command(
+        &self,
+        kind: &str,
+        shard: &str,
+        command: &str,
+        principal: &str,
+        input: &Value,
+    ) -> Result<(u16, Value), String> {
+        let url = format!(
+            "{}/{}/{}/{}",
+            self.base,
+            kind,
+            encode_segment(shard),
+            command
+        );
+        let command_id =
+            distributed_game::cell::command_id_for("mobpit-admin", &crate::common::random_hex(16));
+        let response = self
+            .client
+            .post(&url)
+            .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
+            .header(
+                distributed::cell_host::CELL_SERVICE_ID_HEADER,
+                "mobpit-admin",
+            )
+            .header(
+                distributed::cell_host::CELL_PRINCIPAL_PARTITION_HEADER,
+                principal,
+            )
+            .header(distributed::USER_ID_KEY, principal)
+            .json(&serde_json::json!({ "commandId": command_id, "input": input }))
+            .send()
+            .await
+            .map_err(|error| format!("celld unreachable at {url}: {error}"))?;
+        let status = response.status().as_u16();
+        let body: Value = response.json().await.unwrap_or(Value::Null);
+        Ok((status, body))
+    }
+
+    /// The durable presence entry of `principal` (`null` when none).
+    pub async fn presence(&self, principal: &str) -> Result<Value, String> {
+        Ok(self.get(PRESENCE_KIND, principal).await?["current"].take())
+    }
+
+    /// State and kill history of `principal`'s cell.
+    pub async fn crawler(&self, principal: &str) -> Result<CrawlerView, String> {
+        let body = self.get(CRAWLER_KIND, principal).await?;
+        serde_json::from_value(body).map_err(|error| format!("crawler {principal}: {error}"))
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn file_names_round_trip_to_principals() {
-        let dir =
-            std::env::temp_dir().join(format!("mobpit-cells-{}", crate::common::random_hex(12)));
-        let cells = CrawlerCells::new(&dir);
-        for p in ["guest-0a1b", "bot-3", "odd:name"] {
-            cells.get(p).unwrap();
+/// Like `distributed_game::celld`: a shard cannot add path segments.
+fn encode_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b':') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
         }
-        assert_eq!(cells.principals(), vec!["bot-3", "guest-0a1b", "odd:name"]);
-        let _ = std::fs::remove_dir_all(dir);
     }
+    encoded
 }

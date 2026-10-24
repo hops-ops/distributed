@@ -26,10 +26,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::WireType;
 use crate::prediction::{PredictContext, PredictStep};
-use crate::protocol::PROTOCOL_VERSION;
 use crate::pure::GamePure;
 use crate::schema::{Correction, EntitySchema};
 use crate::{GameEvent, GameInput, Wire, Zone};
+
+/// Wire protocol version whose payload encodings (fields, inputs, events)
+/// a surface describes. They have not changed since 1: protocol 2 only
+/// added handshake negotiation (Welcome `features` and `origin`), which the
+/// SDK handles, so generated clients stay valid for both.
+pub const SURFACE_PROTOCOL_VERSION: u32 = 1;
 
 /// Version of the [`GameSurface`] JSON shape.
 pub const GAME_SURFACE_SCHEMA_VERSION: u32 = 3;
@@ -42,7 +47,8 @@ pub struct GameSurface {
     pub schema_version: u32,
     /// Surface name (generated TypeScript prefixes exports with it).
     pub name: String,
-    /// Zone wire protocol version (`PROTOCOL_VERSION`).
+    /// Zone wire protocol version of the payload encodings
+    /// ([`SURFACE_PROTOCOL_VERSION`]).
     pub protocol_version: u32,
     /// Replicated kinds in schema order.
     pub kinds: Vec<KindSurface>,
@@ -67,6 +73,11 @@ pub struct GameSurface {
     /// (`encode<Record>` / `decode<Record>`), by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codecs: Vec<String>,
+    /// Zone inbox messages ([`Zone::Message`], [`crate::inbox`]) by id:
+    /// what services may send into a running zone. Same payload encoding
+    /// as events.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<EventSurface>,
 }
 
 /// A pure function compiled to WebAssembly ([`crate::pure::GamePure`]).
@@ -233,7 +244,7 @@ impl GameSurface {
         Self {
             schema_version: GAME_SURFACE_SCHEMA_VERSION,
             name: name.into(),
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: SURFACE_PROTOCOL_VERSION,
             kinds: Vec::new(),
             input: None,
             events: Vec::new(),
@@ -242,16 +253,42 @@ impl GameSurface {
             pures: Vec::new(),
             constants: Vec::new(),
             codecs: Vec::new(),
+            messages: Vec::new(),
         }
     }
 
-    /// Kinds from the zone's [`Zone::schema`] and its typed input.
+    /// Kinds from the zone's [`Zone::schema`], its typed input and its
+    /// inbox messages ([`Zone::Message`]).
     pub fn for_zone<Z>(name: impl Into<String>) -> Self
     where
         Z: Zone,
         Z::Input: GameInput,
     {
-        Self::new(name).schema(&Z::schema()).input::<Z::Input>()
+        Self::new(name)
+            .schema(&Z::schema())
+            .input::<Z::Input>()
+            .messages::<Z::Message>()
+    }
+
+    /// Add the zone inbox message type (done by [`for_zone`](Self::for_zone)).
+    /// Message ids and names must be unique among messages.
+    pub fn messages<M: GameEvent>(mut self) -> Self {
+        let mut records = Vec::new();
+        for message in M::event_surfaces(&mut records) {
+            assert!(
+                self.messages
+                    .iter()
+                    .all(|m| m.id != message.id && m.name != message.name),
+                "duplicate message id {} / name {} in game surface {}",
+                message.id,
+                message.name,
+                self.name
+            );
+            self.messages.push(message);
+        }
+        self.messages.sort_by_key(|m| m.id);
+        self.add_records(records);
+        self
     }
 
     /// Add every kind of `schema` (derived or hand-written).
