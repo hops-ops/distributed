@@ -60,7 +60,7 @@ import {
 } from '../generated/mobpit/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
-import { cameraRelative, InputSampler, toAxis } from '../shared/input.ts';
+import { cameraRelative, InputSampler, PAD, toAxis } from '../shared/input.ts';
 import { createRing, createStage, material } from '../shared/scene.ts';
 import {
 	createBoardWatcher,
@@ -186,15 +186,15 @@ function applySky(dtMs: number): void {
 
 const hud = new Hud({
 	title: 'Mob Pit',
-	hint: 'WASD move · Space attack · R / click shoot · E dash · Q jump (over a slam) · V first person · C lag compensation · walk through a doorway to the next room · N wake rooms in reach · O debug overlay · P prediction · G server ghost. Rooms run on celld; kills are durable facts.',
+	hint: 'WASD move · Space attack · R / click shoot · E dash · Q jump (over a slam) · V first person · C lag compensation · walk through a doorway to the next room · N wake rooms in reach · O debug overlay · P prediction · G server ghost. Controller: left stick move · right stick look · A / RB attack · RT shoot · B / LB dash · Y jump · R3 first person · View lag compensation. Rooms run on celld; kills are durable facts.',
 	client,
 	devApi: api
 });
 let debug = params.get('debug') !== '0';
 hud.toggle('Debug overlay (celld node per room)', debug, (on) => (debug = on), 'o');
 hud.toggle('Client prediction', true, (on) => client.setPredictionEnabled(on), 'p');
-hud.toggle('First-person view (click to look, R / click fires)', false, (on) => stage.setView(on ? 'first' : 'third'), 'v');
-hud.toggle('Lag compensation (ranged)', true, (on) => (compensated = on), 'c');
+hud.toggle('First-person view (click to look, R / click / RT fires)', false, (on) => stage.setView(on ? 'first' : 'third'), 'v', PAD.r3);
+hud.toggle('Lag compensation (ranged)', true, (on) => (compensated = on), 'c', PAD.view);
 let ghostOn = true;
 hud.toggle('Server ghost', true, (on) => (ghostOn = on), 'g');
 hud.toggle(
@@ -1020,7 +1020,7 @@ function drawGraph(): void {
 const sampler = new InputSampler();
 const commandFrames = new InputPacer({ tickRate: () => client.authority?.connection.welcome?.tickRate });
 
-// Ranged: R or a click fires along the view (first person: where you
+// Ranged: R, a click or RT fires along the view (first person: where you
 // look; third person: the camera's heading). The room resolves the arrow
 // lag-compensated (C toggles it per shot).
 let fireQueued = false;
@@ -1038,6 +1038,8 @@ canvas.addEventListener('mousedown', (e) => {
 
 function sendCommandFrame(): void {
 	const s = sampler.sample();
+	// RT held fires at the fire cooldown.
+	if (s.fire) fireQueued = true;
 	const move = cameraRelative(s, stage.cameraForward());
 	const aim = stage.aim();
 	const first = stage.view() === 'first';

@@ -84,12 +84,16 @@ body {
 	border-bottom: 1px solid #2a3240;
 }
 .hud .toggle {
-	display: block;
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
 	margin: 4px 0;
 	cursor: pointer;
 }
 .hud .toggle kbd {
-	float: right;
+	margin-left: auto;
+	flex-shrink: 0;
+	white-space: nowrap;
 	padding: 0 5px;
 	border: 1px solid #3a4558;
 	border-radius: 3px;

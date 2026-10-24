@@ -13,6 +13,7 @@
 import type { GameClient } from '@hops-ops/distributed/game';
 
 import type { DevApi, NetSimSettings } from './dev-api.ts';
+import { padButtonName, padPressed } from './input.ts';
 
 export type HudOptions = Readonly<{
 	title: string;
@@ -34,6 +35,8 @@ export class Hud {
 	readonly #table: HTMLElement;
 	/** Toggles sit right under the hint, above the stats (always in view). */
 	readonly #controls: HTMLElement;
+	/** Toggles a gamepad button flips (on its press). */
+	readonly #padToggles: { button: number; flip: () => void; down: boolean }[] = [];
 	#lastSample: { at: number; deltaBytes: number; connection: unknown } | undefined;
 	#deltaRate = 0;
 	#lastStatAt = 0;
@@ -66,8 +69,8 @@ export class Hud {
 		if (dd.textContent !== value) dd.textContent = value;
 	}
 
-	/** Add a checkbox toggle. */
-	toggle(label: string, initial: boolean, onChange: (on: boolean) => void, key?: string): void {
+	/** Add a checkbox toggle, flipped by `key` and (`standard` layout) gamepad button `pad`. */
+	toggle(label: string, initial: boolean, onChange: (on: boolean) => void, key?: string, pad?: number): void {
 		const wrap = el('label', 'toggle');
 		const input = document.createElement('input');
 		input.type = 'checkbox';
@@ -76,9 +79,19 @@ export class Hud {
 		wrap.append(input, document.createTextNode(` ${label}`));
 		if (key !== undefined) {
 			wrap.title = `key: ${key}`;
-			wrap.append(el('kbd', '', key.toUpperCase()));
+			wrap.append(el('kbd', '', pad === undefined ? key.toUpperCase() : `${key.toUpperCase()} · ${padButtonName(pad)}`));
 		}
 		this.#controls.append(wrap);
+		if (pad !== undefined) {
+			this.#padToggles.push({
+				button: pad,
+				down: false,
+				flip: () => {
+					input.checked = !input.checked;
+					onChange(input.checked);
+				}
+			});
+		}
 		if (key !== undefined) {
 			window.addEventListener('keydown', (e) => {
 				if (e.key.toLowerCase() === key.toLowerCase() && !e.repeat) {
@@ -91,6 +104,11 @@ export class Hud {
 
 	/** Call every frame; refreshes the standard rows a few times a second. */
 	frame(extra: Readonly<{ entities?: number }> = {}): void {
+		for (const t of this.#padToggles) {
+			const down = padPressed(t.button);
+			if (down && !t.down) t.flip();
+			t.down = down;
+		}
 		const now = performance.now();
 		if (now - this.#lastStatAt < STAT_INTERVAL_MS) return;
 		this.#lastStatAt = now;
