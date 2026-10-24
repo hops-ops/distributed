@@ -7,7 +7,7 @@
  * and the `/dev/mobpit/*` routes.
  *
  * Every room (`pit.<x>.<y>`) is a celld Durable Object reached at
- * `/rooms/{room}`; celld forwards the socket to whichever node runs it.
+ * `/zones/{room}`; celld forwards the socket to whichever node runs it.
  * Walking through a doorway, the room hands the player to the next room
  * (`Handoff`), and the SDK reconnects there with the transfer ticket.
  *
@@ -126,12 +126,12 @@ export function neighbourRooms(zone: string): string[] {
 
 /**
  * WebSocket URL of a room. `base` is the http(s) origin rooms are reached
- * at (celld, in Node tests); in the browser the page's own origin (Vite
- * proxies `/rooms` to celld).
+ * at (the services' gateway, or celld itself in Node tests); in the browser
+ * the page's own origin (Vite proxies `/zones` to the gateway).
  */
 export function roomUrl(zone: string, base?: string): string {
 	const origin = base ?? globalThis.location.origin;
-	return `${origin.replace(/^http/, 'ws')}/rooms/${encodeURIComponent(zone)}`;
+	return `${origin.replace(/^http/, 'ws')}/zones/${encodeURIComponent(zone)}`;
 }
 /** `state` names of the `mob` kind, by value (generated from the Rust `MOB_STATES`). */
 export const MOB_STATE = pit.PIT_RULES.states;
@@ -252,7 +252,7 @@ export type TiersAround = Readonly<{
 	city: { bosses_down: number; boroughs_cleared: number; banner: string } | null;
 }>;
 
-/** A room object's debug JSON (`/rooms/{room}/info`). */
+/** A room object's debug JSON (`/zones/{room}/info`). */
 export type RoomInfo = Readonly<{
 	zone: string;
 	status: string;
@@ -658,7 +658,7 @@ export class MobPitApi {
 
 	/** A room object's debug JSON, straight from the room on celld (does not wake it). */
 	async roomInfo(zone: string): Promise<RoomInfo> {
-		const response = await fetch(`${this.roomsBase}/rooms/${encodeURIComponent(zone)}/info`);
+		const response = await fetch(`${this.roomsBase}/zones/${encodeURIComponent(zone)}/info`);
 		if (!response.ok) throw new Error(`room info ${zone}: HTTP ${response.status}`);
 		return (await response.json()) as RoomInfo;
 	}

@@ -12,6 +12,11 @@ use crate::{DEFAULT_SEED, SEED_VAR};
 use game_sim::mobpit::pair_shard;
 use mobpit_tiers::{BossDefeatedInput, BOROUGH_KIND, CITY_KIND, CITY_SHARD, HOOD_KIND};
 
+/// Players a room admits (the game's cap).
+pub const MAX_PLAYERS: usize = 32;
+/// Worker var overriding [`MAX_PLAYERS`] (load tests).
+pub const MAX_PLAYERS_VAR: &str = "ZONE_MAX_PLAYERS";
+
 impl CelldZone for MobPit {
     fn object_config(zone_id: &str, env: &ObjectEnv) -> Result<RoomConfig, String> {
         let seed = env
@@ -21,11 +26,17 @@ impl CelldZone for MobPit {
         RoomConfig::for_zone(zone_id, seed).ok_or_else(|| format!("no room `{zone_id}`"))
     }
 
-    fn host_config(_zone_id: &str, _env: &ObjectEnv) -> HostConfig {
+    fn host_config(_zone_id: &str, env: &ObjectEnv) -> HostConfig {
+        // Load tests raise the cap with `ZONE_MAX_PLAYERS`; the game's is 32.
+        let max_players = env
+            .var(MAX_PLAYERS_VAR)
+            .and_then(|n| n.trim().parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(MAX_PLAYERS);
         HostConfig {
             // Joined / lost / reconnected / left facts for the presence cells.
             lifecycle_facts: true,
-            max_players: 32,
+            max_players,
             // A doorway into a sleeping room waits for it to wake while the
             // client keeps predicting: keep up to 3 s of its inputs.
             input_capacity: 90,

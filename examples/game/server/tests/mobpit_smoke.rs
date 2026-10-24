@@ -314,6 +314,7 @@ async fn start(
         true,
         ADMIN_SECRET.to_string(),
         world,
+        None,
         async move {
             let _ = stopped.await;
         },
@@ -322,11 +323,11 @@ async fn start(
     (running, stop)
 }
 
-/// Bots in room `room` on celld (`/rooms/{room}`), with tickets the rooms
+/// Bots in room `room` on celld (`/zones/{room}`), with tickets the rooms
 /// accept.
 fn bot_config(celld: &DevCelld, room: &str, bots: usize, duration: Duration) -> BotConfig {
     let mut config = BotConfig::new(celld.ws_url(), room, TicketKey::new(celld.ticket_secret()));
-    config.path = "/rooms".into();
+    config.path = "/zones".into();
     config.bots = bots;
     config.input_rate = 30.0;
     config.duration = duration;
@@ -341,9 +342,9 @@ fn spin(i: usize) -> Box<dyn Behaviour> {
     })
 }
 
-/// `GET {celld}/rooms/{room}/info` (the room object's debug JSON).
+/// `GET {celld}/zones/{room}/info` (the room object's debug JSON).
 async fn room_info(celld: &DevCelld, room: &str) -> Value {
-    reqwest_get(&format!("{}/rooms/{room}/info", celld.url())).await
+    reqwest_get(&format!("{}/zones/{room}/info", celld.url())).await
 }
 
 async fn reqwest_get(url: &str) -> Value {
@@ -585,7 +586,7 @@ async fn presence_is_settled_in_presence_cells_from_the_rooms_lifecycle_facts() 
     let (services, stop) = start(listener, &celld, world.clone()).await;
     let room = "pit.0.2";
     let join = |principal: &'static str| {
-        let url = format!("{}/rooms/{room}", celld.ws_url());
+        let url = format!("{}/zones/{room}", celld.ws_url());
         let key = TicketKey::new(celld.ticket_secret());
         async move {
             let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();

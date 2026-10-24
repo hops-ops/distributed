@@ -116,9 +116,9 @@ pub struct BotConfig {
     /// Server base URL, e.g. `ws://127.0.0.1:2567` (`{path}/{zone}` is
     /// appended).
     pub url: String,
-    /// Path the zone id is appended to: `/zones` on the `net` server,
-    /// whatever the worker routes to its zone objects on celld (e.g.
-    /// `/rooms`).
+    /// Path the zone id is appended to: `/zones` on the `net` server and
+    /// whatever the worker routes to its zone objects on celld (Mob Pit:
+    /// `/zones` too).
     pub path: String,
     /// Zone to join.
     pub zone: String,
@@ -421,7 +421,10 @@ async fn drive(
             msg = ws.next() => {
                 let bytes = match msg {
                     Some(Ok(Message::Binary(b))) => b,
-                    Some(Ok(Message::Close(_))) | None => return Err("closed by server".into()),
+                    Some(Ok(Message::Close(Some(frame)))) => {
+                        return Err(format!("closed by server ({} {})", u16::from(frame.code), frame.reason))
+                    }
+                    Some(Ok(Message::Close(None))) | None => return Err("closed by server".into()),
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => return Err(format!("recv: {e}")),
                 };

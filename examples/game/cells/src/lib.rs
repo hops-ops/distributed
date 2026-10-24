@@ -1,6 +1,6 @@
 //! The game demos' durable cells on celld, and Mob Pit's rooms.
 //!
-//! - `GET /rooms/{room}` (WebSocket) and `/rooms/{room}/info`: `PitRoom`,
+//! - `GET /zones/{room}` (WebSocket) and `/zones/{room}/info`: `PitRoom`,
 //!   one Durable Object per Mob Pit room (`pit.<x>.<y>`), hosted by
 //!   `distributed_game::celld_zone` (`mobpit_rooms::MobPit`). celld places
 //!   each room; its kill and lifecycle facts reach the Crawler and presence
@@ -708,8 +708,8 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Response::ok("mobpit cells\n");
     }
     // A room is public: its WebSocket admits signed tickets only.
-    if path.starts_with("/rooms/") {
-        return match forward_to_zone(req, &env, "PIT_ROOM", "/rooms/").await? {
+    if path.starts_with("/zones/") {
+        return match forward_to_zone(req, &env, "PIT_ROOM", "/zones/").await? {
             Some(response) => Ok(response),
             None => json_status(json!({ "error": "no such room" }), 404),
         };
@@ -785,11 +785,18 @@ fn relay(env: &Env) -> std::result::Result<CelldQueueRelay<CelldQueueHttpPublish
     };
     let endpoint = var("CELLD_QUEUE_RELAY_URL")?;
     let secret = var(CELL_INTERNAL_SECRET_ENV)?;
-    // `http://127.0.0.1` relays are dev-only; anything else must be HTTPS.
+    // `http://127.0.0.1` relays are dev-only. `CELLD_QUEUE_RELAY_MESH=1`
+    // (Hops local: celld and Mob Pit with Istio sidecars) allows HTTP to a
+    // cluster Service. Anything else must be HTTPS.
     let local =
         endpoint.starts_with("http://127.0.0.1") || endpoint.starts_with("http://localhost");
+    let mesh = env
+        .var("CELLD_QUEUE_RELAY_MESH")
+        .is_ok_and(|value| value.to_string() == "1");
     let publisher = if local {
         CelldQueueHttpPublisher::new_local_test(endpoint, &secret)
+    } else if mesh {
+        CelldQueueHttpPublisher::new_mesh(endpoint)
     } else {
         CelldQueueHttpPublisher::new(endpoint)
     }
