@@ -1073,24 +1073,43 @@ const markerMats = {
 	miss: material(scene, 'marker-miss', '#ff5252')
 };
 for (const m of Object.values(markerMats)) m.emissiveColor = m.diffuseColor.clone();
-const tracerMat = material(scene, 'shot-tracer', '#ffd166');
-tracerMat.emissiveColor = tracerMat.diffuseColor.clone();
+const boltMat = material(scene, 'shot-bolt', '#ffd166');
+boltMat.emissiveColor = boltMat.diffuseColor.clone();
+/** How fast the drawn bolt flies (the room resolves the shot at once). */
+const BOLT_SPEED = 60;
+const BOLT_MAX_MS = 400;
 function marker(record: ShotRecord): void {
-	// The arrow's flight, briefly: from just below the aim (in first person
-	// a line from the eye itself would be a dot) to where it lands.
+	// The arrow's flight: a bolt from just below the aim (in first person one
+	// from the eye itself would sit on the crosshair) to where it lands.
 	const [ox, oy, oz] = record.origin;
 	const [px, py, pz] = record.point;
-	const tracer = MeshBuilder.CreateTube(
-		`tracer-${record.id}`,
-		{ path: [placeIn(record.zone, ox, oy, oz - 0.3), placeIn(record.zone, px, py, pz)], radius: 0.03, tessellation: 6 },
-		scene
-	);
-	tracer.material = tracerMat;
-	tracer.isPickable = false;
-	setTimeout(() => tracer.dispose(), 300);
+	const from = placeIn(record.zone, ox, oy, oz - 0.3);
+	const to = placeIn(record.zone, px, py, pz);
+	const flightMs = Math.min(BOLT_MAX_MS, (Vector3.Distance(from, to) / BOLT_SPEED) * 1000);
+	const bolt = MeshBuilder.CreateCylinder(`bolt-${record.id}`, { height: 0.9, diameter: 0.12, tessellation: 6 }, scene);
+	// Lay the cylinder along +z so lookAt points it down the flight.
+	bolt.rotation.x = Math.PI / 2;
+	bolt.bakeCurrentTransformIntoVertices();
+	bolt.material = boltMat;
+	bolt.isPickable = false;
+	bolt.position.copyFrom(from);
+	bolt.lookAt(to);
+	const launched = performance.now();
+	let landed = false;
+	const flight = scene.onBeforeRenderObservable.add(() => {
+		const t = Math.min(1, (performance.now() - launched) / Math.max(flightMs, 1));
+		Vector3.LerpToRef(from, to, t, bolt.position);
+		if (t < 1) return;
+		landed = true;
+		ball.isVisible = true;
+		scene.onBeforeRenderObservable.remove(flight);
+		bolt.dispose();
+	});
 	const ball = MeshBuilder.CreateSphere(`shot-${record.id}`, { diameter: 0.35, segments: 6 }, scene);
 	ball.material = markerMats.pending;
 	ball.isPickable = false;
+	// Shown when the bolt gets there.
+	ball.isVisible = landed;
 	ball.position.copyFrom(placeIn(record.zone, record.point[0], record.point[1], record.point[2]));
 	const done = () => setTimeout(() => ball.dispose(), 1200);
 	pit.verdict(record.id).then((v) => {
