@@ -32,6 +32,8 @@ export class Hud {
 	readonly #client: GameClient<any>;
 	readonly #rows = new Map<string, HTMLElement>();
 	readonly #table: HTMLElement;
+	/** Toggles sit right under the hint, above the stats (always in view). */
+	readonly #controls: HTMLElement;
 	#lastSample: { at: number; deltaBytes: number; connection: unknown } | undefined;
 	#deltaRate = 0;
 	#lastStatAt = 0;
@@ -42,8 +44,9 @@ export class Hud {
 		const title = el('h1', '', options.title);
 		this.root.append(title);
 		if (options.hint !== undefined) this.root.append(el('p', 'hint', options.hint));
+		this.#controls = el('div', 'controls');
 		this.#table = el('dl', 'stats');
-		this.root.append(this.#table);
+		this.root.append(this.#controls, this.#table);
 		for (const name of ['Status', 'Zone', 'RTT', 'Jitter', 'Server tick', 'Delta in', 'Entities']) {
 			this.row(name, '—');
 		}
@@ -71,8 +74,11 @@ export class Hud {
 		input.checked = initial;
 		input.addEventListener('change', () => onChange(input.checked));
 		wrap.append(input, document.createTextNode(` ${label}`));
-		if (key !== undefined) wrap.title = `key: ${key}`;
-		this.root.append(wrap);
+		if (key !== undefined) {
+			wrap.title = `key: ${key}`;
+			wrap.append(el('kbd', '', key.toUpperCase()));
+		}
+		this.#controls.append(wrap);
 		if (key !== undefined) {
 			window.addEventListener('keydown', (e) => {
 				if (e.key.toLowerCase() === key.toLowerCase() && !e.repeat) {

@@ -1071,7 +1071,21 @@ const markerMats = {
 	miss: material(scene, 'marker-miss', '#ff5252')
 };
 for (const m of Object.values(markerMats)) m.emissiveColor = m.diffuseColor.clone();
+const tracerMat = material(scene, 'shot-tracer', '#ffd166');
+tracerMat.emissiveColor = tracerMat.diffuseColor.clone();
 function marker(record: ShotRecord): void {
+	// The arrow's flight, briefly: from just below the aim (in first person
+	// a line from the eye itself would be a dot) to where it lands.
+	const [ox, oy, oz] = record.origin;
+	const [px, py, pz] = record.point;
+	const tracer = MeshBuilder.CreateTube(
+		`tracer-${record.id}`,
+		{ path: [placeIn(record.zone, ox, oy, oz - 0.3), placeIn(record.zone, px, py, pz)], radius: 0.03, tessellation: 6 },
+		scene
+	);
+	tracer.material = tracerMat;
+	tracer.isPickable = false;
+	setTimeout(() => tracer.dispose(), 300);
 	const ball = MeshBuilder.CreateSphere(`shot-${record.id}`, { diameter: 0.35, segments: 6 }, scene);
 	ball.material = markerMats.pending;
 	ball.isPickable = false;
