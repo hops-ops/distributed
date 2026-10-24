@@ -4,14 +4,33 @@
 //! base64url(header) "." base64url(claims)))`, unpadded base64url. The header
 //! must be `{"alg":"HS256",...}`; claims are
 //! `{"sub","zone","exp","nonce","role"?}` where `exp` is Unix seconds and
-//! `role` is `"player"` (default) or `"observer"`. Any HS256 JWT library can
-//! mint them. The principal is taken **only** from a verified `sub`.
+//! `role` is `"player"` (default) or `"observer"`; an optional `wake: true`
+//! lets an observer wake the zone when near (celld zones,
+//! [`TicketClaims::wake`]). Any HS256 JWT library can mint them. The
+//! principal is taken **only** from a verified `sub`.
 //!
 //! **Transfer tickets** (zone handoff) are the same format with
 //! `"kind":"transfer"` plus `src` (source zone), `iss` (issuing host id),
-//! `gen` (source ownership token) and `carry` (base64url carried state).
+//! `gen` (source ownership token), `left` (source departure stamp time,
+//! Unix ms) and `carry` (base64url carried state).
 //! [`TicketKey::verify`] rejects them ([`TicketError::WrongKind`]); use
 //! [`TicketKey::verify_ticket`] to accept either kind.
+//!
+//! **Extension claims.** An optional `ext` object carries game-declared
+//! claims ([`TicketExtensions`]: match id, team…). Join and transfer
+//! tickets sign them alike; the server admits them only when they match
+//! `ServerConfig::ticket_extensions` (see [`crate::claims`]).
+//!
+//! **Custom admission tickets.** Join tickets go through a
+//! [`TicketVerifier`] (`ServerConfig::ticket_verifier`); the default is the
+//! `TicketKey` itself. A game whose web backend already mints its own tickets
+//! (different claim names, issuer/audience checks, no `zone`/`nonce`)
+//! implements `TicketVerifier` (or passes a closure) and maps them onto
+//! [`TicketClaims`]: `zone` is the route zone the client asked for, `nonce`
+//! the replay key (e.g. the `jti`). The server still enforces
+//! `claims.zone == route zone`, expiry and single use. Transfer tickets are
+//! always minted and verified by the server's own `TicketKey`.
+//! [`decode_hs256`] helps verifiers of other HS256 JWTs.
 
 use std::collections::HashMap;
 
@@ -21,6 +40,7 @@ use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
 
+use crate::claims::TicketExtensions;
 use crate::handoff::Transfer;
 use crate::protocol::Role;
 use crate::zone::TicketClaims;
@@ -44,6 +64,68 @@ pub enum TicketError {
     Replayed,
     /// A transfer ticket where a join ticket was expected (or vice versa).
     WrongKind,
+    /// Signed for another zone than the one requested.
+    WrongZone,
+    /// Refused by a custom [`TicketVerifier`] (issuer, audience, ...).
+    Invalid(String),
+}
+
+/// Verifies **join** tickets presented in Hello.
+///
+/// `zone` is the zone id of the route the client connected to and `now_unix`
+/// the current Unix time in seconds. Return the verified claims (principal
+/// only ever from the verified token); the server then checks
+/// `claims.zone == zone`, `claims.expires_at > now_unix` and that
+/// [`TicketClaims::replay_key`] was not used before.
+///
+/// Implemented by [`TicketKey`] (the built-in HS256 format) and by any
+/// `Fn(&str, &str, u64) -> Result<TicketClaims, TicketError>` closure.
+pub trait TicketVerifier: Send + Sync + 'static {
+    /// Verify `token` for `zone` at `now_unix`.
+    fn verify(&self, token: &str, zone: &str, now_unix: u64) -> Result<TicketClaims, TicketError>;
+}
+
+impl TicketVerifier for TicketKey {
+    fn verify(&self, token: &str, zone: &str, now_unix: u64) -> Result<TicketClaims, TicketError> {
+        let claims = TicketKey::verify(self, token, now_unix)?;
+        if claims.zone != zone {
+            return Err(TicketError::WrongZone);
+        }
+        Ok(claims)
+    }
+}
+
+impl<F> TicketVerifier for F
+where
+    F: Fn(&str, &str, u64) -> Result<TicketClaims, TicketError> + Send + Sync + 'static,
+{
+    fn verify(&self, token: &str, zone: &str, now_unix: u64) -> Result<TicketClaims, TicketError> {
+        self(token, zone, now_unix)
+    }
+}
+
+/// A shared [`TicketVerifier`] (`ServerConfig::ticket_verifier`).
+#[derive(Clone)]
+pub struct SharedTicketVerifier(pub std::sync::Arc<dyn TicketVerifier>);
+
+impl SharedTicketVerifier {
+    /// Wrap a verifier.
+    pub fn new(verifier: impl TicketVerifier) -> Self {
+        Self(std::sync::Arc::new(verifier))
+    }
+}
+
+impl std::fmt::Debug for SharedTicketVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedTicketVerifier(..)")
+    }
+}
+
+/// Verify the signature of a compact HS256 JWT with `secret` and return its
+/// claims object (no claim is interpreted, not even `exp`). For custom
+/// [`TicketVerifier`]s over tickets minted elsewhere.
+pub fn decode_hs256(token: &str, secret: &[u8]) -> Result<Value, TicketError> {
+    TicketKey::new(secret).decode(token)
 }
 
 /// A verified ticket of either kind.
@@ -96,7 +178,7 @@ impl TicketKey {
             "nonce": claims.nonce,
             "role": match claims.role { Role::Player => "player", Role::Observer => "observer" },
         });
-        self.sign_body(&body)
+        self.sign_body(&with_name(body, claims))
     }
 
     /// Mint a transfer ticket for a handoff.
@@ -112,9 +194,16 @@ impl TicketKey {
             "src": transfer.source_zone,
             "iss": transfer.issuer,
             "gen": transfer.generation,
+            "left": transfer.departed_at_ms,
             "carry": URL_SAFE_NO_PAD.encode(&transfer.carried),
         });
-        self.sign_body(&body)
+        self.sign_body(&with_name(body, claims))
+    }
+
+    /// Sign an arbitrary JSON claims object as an HS256 JWT (tests and dev
+    /// tooling for custom [`TicketVerifier`] formats).
+    pub fn sign_json(&self, claims: &Value) -> String {
+        self.sign_body(claims)
     }
 
     fn sign_body(&self, body: &Value) -> String {
@@ -159,6 +248,10 @@ impl TicketKey {
                         .get("gen")
                         .and_then(Value::as_u64)
                         .ok_or(TicketError::MissingClaim("gen"))?,
+                    departed_at_ms: body
+                        .get("left")
+                        .and_then(Value::as_u64)
+                        .ok_or(TicketError::MissingClaim("left"))?,
                     carried,
                     claims,
                 }))
@@ -176,11 +269,8 @@ impl TicketKey {
         }
     }
 
-    fn verify_inner(
-        &self,
-        ticket: &str,
-        now_unix: u64,
-    ) -> Result<(TicketClaims, Value), TicketError> {
+    /// Signature check only; returns the claims object.
+    fn decode(&self, ticket: &str) -> Result<Value, TicketError> {
         let mut parts = ticket.split('.');
         let (Some(h), Some(p), Some(s), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -200,7 +290,15 @@ impl TicketKey {
         mac.update(p.as_bytes());
         mac.verify_slice(&sig)
             .map_err(|_| TicketError::BadSignature)?;
-        let claims: Value = decode_json(p)?;
+        decode_json(p)
+    }
+
+    fn verify_inner(
+        &self,
+        ticket: &str,
+        now_unix: u64,
+    ) -> Result<(TicketClaims, Value), TicketError> {
+        let claims = self.decode(ticket)?;
         let text = |name: &'static str| {
             claims
                 .get(name)
@@ -228,10 +326,36 @@ impl TicketKey {
                 expires_at,
                 nonce: text("nonce")?,
                 role,
+                name: claims
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string),
+                extensions: match claims.get("ext") {
+                    None => TicketExtensions::new(),
+                    Some(ext) => TicketExtensions::from_json(ext.clone())
+                        .map_err(|e| TicketError::Invalid(e.to_string()))?,
+                },
+                wake: claims.get("wake").and_then(Value::as_bool) == Some(true),
             },
             claims,
         ))
     }
+}
+
+fn with_name(mut body: Value, claims: &TicketClaims) -> Value {
+    if let Some(object) = body.as_object_mut() {
+        if let Some(name) = &claims.name {
+            object.insert("name".into(), Value::String(name.clone()));
+        }
+        if !claims.extensions.is_empty() {
+            object.insert("ext".into(), claims.extensions.to_json());
+        }
+        if claims.wake {
+            object.insert("wake".into(), Value::Bool(true));
+        }
+    }
+    body
 }
 
 fn decode_json(segment: &str) -> Result<Value, TicketError> {
@@ -279,6 +403,9 @@ mod tests {
             expires_at: 2_000,
             nonce: "n1".into(),
             role: Role::Player,
+            name: None,
+            extensions: Default::default(),
+            wake: false,
         }
     }
 
@@ -292,6 +419,20 @@ mod tests {
             TicketKey::new("other").verify(&ticket, 1_000),
             Err(TicketError::BadSignature)
         );
+    }
+
+    #[test]
+    fn the_wake_grant_round_trips_and_defaults_to_off() {
+        let key = TicketKey::new("secret");
+        let mut watcher = claims().with_wake(true);
+        watcher.role = Role::Observer;
+        let ticket = key.sign(&watcher);
+        assert!(key.verify(&ticket, 1_000).unwrap().wake);
+        let passive = key.sign(&TicketClaims {
+            role: Role::Observer,
+            ..claims()
+        });
+        assert!(!key.verify(&passive, 1_000).unwrap().wake);
     }
 
     #[test]
@@ -314,6 +455,7 @@ mod tests {
             issuer: "h1".into(),
             generation: 9,
             carried: vec![1, 2, 3],
+            departed_at_ms: 1_700_000_000_123,
         };
         let ticket = key.sign_transfer(&transfer);
         assert_eq!(
@@ -325,6 +467,26 @@ mod tests {
         assert_eq!(
             key.verify_ticket(&join, 1_000).unwrap(),
             VerifiedTicket::Join(claims())
+        );
+    }
+
+    #[test]
+    fn names_round_trip_and_default_verifier_checks_zone() {
+        let key = TicketKey::new("secret");
+        let named = claims().with_name("Ana");
+        let ticket = key.sign(&named);
+        assert_eq!(
+            TicketVerifier::verify(&key, &ticket, "z1", 1_000),
+            Ok(named)
+        );
+        assert_eq!(
+            TicketVerifier::verify(&key, &ticket, "z2", 1_000),
+            Err(TicketError::WrongZone)
+        );
+        assert!(decode_hs256(&ticket, b"secret").is_ok());
+        assert_eq!(
+            decode_hs256(&ticket, b"other"),
+            Err(TicketError::BadSignature)
         );
     }
 

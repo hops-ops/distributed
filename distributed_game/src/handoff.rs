@@ -9,6 +9,7 @@
 //! calls [`Zone::on_handoff_join`](crate::Zone::on_handoff_join) with the
 //! carried bytes.
 
+use crate::claims::TicketExtensions;
 use crate::zone::TicketClaims;
 
 /// Largest carried state accepted in a handoff (it travels inside the
@@ -20,12 +21,20 @@ pub const MAX_CARRIED_BYTES: usize = 16 * 1024;
 pub struct HandoffRequest {
     /// Verified principal of the moving player.
     pub principal: String,
+    /// The player's display name (from its admission ticket), carried over.
+    pub name: Option<String>,
+    /// The player's ticket extension claims, carried over.
+    pub extensions: TicketExtensions,
     /// Zone the player leaves.
     pub source_zone: String,
     /// Zone the player goes to.
     pub target_zone: String,
     /// Game state carried along (inventory, buffs, position hint...).
     pub carried: Vec<u8>,
+    /// Source stamp time of the departure (Unix ms): the facts the source
+    /// emits while the player leaves carry it, and the target stamps
+    /// everything after it ([`FactStamp`](crate::FactStamp) ordering).
+    pub departed_at_ms: u64,
 }
 
 /// Verified transfer ticket contents.
@@ -41,6 +50,9 @@ pub struct Transfer {
     pub generation: u64,
     /// Carried state.
     pub carried: Vec<u8>,
+    /// Source stamp time of the departure (Unix ms, see
+    /// [`HandoffRequest::departed_at_ms`]).
+    pub departed_at_ms: u64,
 }
 
 /// Why [`Ctx::handoff`](crate::Ctx::handoff) refused.

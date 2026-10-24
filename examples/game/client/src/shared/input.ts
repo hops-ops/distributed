@@ -1,11 +1,11 @@
 /**
- * Keyboard + gamepad sampling and a fixed-rate input loop.
+ * Keyboard + gamepad sampling.
  *
  * `InputSampler.sample()` returns a stick in [-1, 1]² (+x right, +y forward,
- * length ≤ 1) and named buttons. `FixedRate` turns render frames into
- * command frames at the server tick rate: each command frame is one input
- * the server simulates for exactly one tick, which is what makes client
- * prediction line up with the authoritative simulation.
+ * length ≤ 1) and named buttons. The SDK's `InputPacer` turns render frames
+ * into command frames at the server tick rate: each command frame is one
+ * input the server simulates for exactly one tick (`InputCredits`), which is
+ * what makes client prediction line up with the authoritative simulation.
  */
 
 export type Sample = Readonly<{
@@ -15,6 +15,10 @@ export type Sample = Readonly<{
 	action: boolean;
 	/** Secondary action: E / F / gamepad B or LB. */
 	alt: boolean;
+	/** Jump: Q / gamepad Y. */
+	jump: boolean;
+	/** Fire (ranged): gamepad RT, held. Keyboard / mouse firing is per game. */
+	fire: boolean;
 }>;
 
 const UP = ['KeyW', 'ArrowUp'];
@@ -23,6 +27,7 @@ const LEFT = ['KeyA', 'ArrowLeft'];
 const RIGHT = ['KeyD', 'ArrowRight'];
 const ACTION = ['Space', 'ShiftLeft', 'ShiftRight'];
 const ALT = ['KeyE', 'KeyF'];
+const JUMP = ['KeyQ'];
 const DEADZONE = 0.15;
 
 export class InputSampler {
@@ -56,6 +61,8 @@ export class InputSampler {
 		let y = (this.#any(UP) ? 1 : 0) - (this.#any(DOWN) ? 1 : 0);
 		let action = this.#any(ACTION);
 		let alt = this.#any(ALT);
+		let jump = this.#any(JUMP);
+		let fire = false;
 		const pad = firstGamepad();
 		if (pad !== undefined) {
 			const gx = pad.axes[0] ?? 0;
@@ -66,13 +73,15 @@ export class InputSampler {
 			}
 			action ||= pad.buttons[0]?.pressed === true || pad.buttons[5]?.pressed === true;
 			alt ||= pad.buttons[1]?.pressed === true || pad.buttons[4]?.pressed === true;
+			jump ||= pad.buttons[3]?.pressed === true;
+			fire = (pad.buttons[7]?.value ?? 0) > 0.5;
 		}
 		const length = Math.hypot(x, y);
 		if (length > 1) {
 			x /= length;
 			y /= length;
 		}
-		return { x, y, action, alt };
+		return { x, y, action, alt, jump, fire };
 	}
 
 	dispose(): void {
@@ -80,10 +89,69 @@ export class InputSampler {
 	}
 }
 
-function firstGamepad(): Gamepad | undefined {
+/**
+ * The gamepad to read: the first connected pad with the W3C `standard`
+ * layout, else the first connected pad (whose left stick is still axes 0/1
+ * on every layout we know). Slots can be sparse, so scan them all.
+ */
+export function activeGamepad(): Gamepad | undefined {
 	const pads = globalThis.navigator?.getGamepads?.() ?? [];
-	for (const pad of pads) if (pad?.connected) return pad;
-	return undefined;
+	let fallback: Gamepad | undefined;
+	for (const pad of pads) {
+		if (!pad?.connected) continue;
+		if (pad.mapping === 'standard') return pad;
+		fallback ??= pad;
+	}
+	return fallback;
+}
+
+function firstGamepad(): Gamepad | undefined {
+	return activeGamepad();
+}
+
+/**
+ * Pads whose right stick has been seen at rest, by `index:id`. Browsers return
+ * a fresh snapshot object from every `getGamepads()` call, so the pad object
+ * itself cannot be the key.
+ */
+const neutralSeen = new Set<string>();
+
+/**
+ * Right stick (+x right, +y up) of a `standard` pad, with deadzone. Other
+ * layouts return zero: their axes 2/3 may be triggers that rest at -1 and
+ * would read as a stick held hard over. The stick is also ignored until it
+ * has been seen at rest once.
+ */
+export function rightStick(deadzone = DEADZONE): { x: number; y: number } {
+	const pad = activeGamepad();
+	if (pad === undefined || pad.mapping !== 'standard') return { x: 0, y: 0 };
+	const x = pad.axes[2] ?? 0;
+	const y = -(pad.axes[3] ?? 0);
+	const key = `${pad.index}:${pad.id}`;
+	if (!neutralSeen.has(key)) {
+		if (Math.hypot(x, y) > deadzone) return { x: 0, y: 0 };
+		neutralSeen.add(key);
+	}
+	return { x: Math.abs(x) > deadzone ? x : 0, y: Math.abs(y) > deadzone ? y : 0 };
+}
+
+/** `standard` layout buttons the HUD's toggles can take. */
+export const PAD = { view: 8, menu: 9, l3: 10, r3: 11 } as const;
+const PAD_NAME: Record<number, string> = { 8: 'View', 9: 'Menu', 10: 'L3', 11: 'R3' };
+export const padButtonName = (index: number): string => PAD_NAME[index] ?? `pad ${index}`;
+
+/** Is button `index` of the active pad down? */
+export function padPressed(index: number): boolean {
+	return activeGamepad()?.buttons[index]?.pressed === true;
+}
+
+/** One-line description of the active pad for HUD diagnostics. */
+export function describeGamepad(): string {
+	const pad = activeGamepad();
+	if (pad === undefined) return 'none (press a button)';
+	const f = (v: number | undefined) => (v ?? 0).toFixed(2);
+	const name = pad.id.length > 28 ? `${pad.id.slice(0, 28)}…` : pad.id;
+	return `${name} · ${pad.mapping || 'non-standard'} · L ${f(pad.axes[0])},${f(pad.axes[1])} R ${f(pad.axes[2])},${f(pad.axes[3])}`;
 }
 
 function isTyping(e: KeyboardEvent): boolean {
@@ -106,35 +174,4 @@ export function cameraRelative(
 /** Map [-1, 1] to an i8 axis in [-127, 127]. */
 export function toAxis(v: number): number {
 	return Math.round(Math.max(-1, Math.min(1, v)) * 127);
-}
-
-/**
- * Accumulates frame time and fires `step` once per `1000 / hz` ms. Backlog
- * is capped (a hidden tab must not burst dozens of inputs on return).
- */
-export class FixedRate {
-	readonly intervalMs: number;
-	readonly #maxSteps: number;
-	#acc = 0;
-	#last: number | undefined;
-
-	constructor(hz: number, maxStepsPerFrame = 4) {
-		this.intervalMs = 1000 / hz;
-		this.#maxSteps = maxStepsPerFrame;
-	}
-
-	/** Call every frame with a monotonic time; returns steps fired. */
-	advance(now: number, step: () => void): number {
-		if (this.#last === undefined) this.#last = now;
-		this.#acc += now - this.#last;
-		this.#last = now;
-		let steps = 0;
-		while (this.#acc >= this.intervalMs && steps < this.#maxSteps) {
-			this.#acc -= this.intervalMs;
-			step();
-			steps += 1;
-		}
-		if (steps === this.#maxSteps) this.#acc = Math.min(this.#acc, this.intervalMs);
-		return steps;
-	}
 }

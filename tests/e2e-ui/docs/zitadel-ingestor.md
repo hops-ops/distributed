@@ -95,18 +95,22 @@ query DirectoryJoins {
     owner_id
     owner { display_name email }
   }
-  auth_users {
-    user_id
-    display_name
-    chat_messages { body }
-    blob_games { score }
+  todos {
+    title
+    owner { display_name }
   }
 }
 ```
 
-`auth_users.user_id` is the Zitadel subject. Chat `author_id` and Blob Game
-`owner_id` are the OIDC `sub`, so the relationships resolve after that subject
-has been ingested.
+`auth_users.user_id` is the Zitadel subject. Chat `author_id`, Blob Game
+`owner_id` and Todo `owner_id` are the OIDC `sub`, so the joins resolve after
+that subject has been ingested.
+
+The relationships are one way: `ChatMessages.author`, `BlobGames.owner` and
+`Todos.owner` point at `AuthUsers`, and `AuthUsers` declares none back (see
+`crates/readmodels/src/lib.rs`), so `auth_users { chat_messages { … } }` is not
+part of the schema. Query the referencing model and filter by its foreign key
+instead.
 
 ## Tests
 

@@ -1,11 +1,12 @@
 // Multi-page Vite app: `/` lists the demos, `/<demo>/` is one demo.
 // Add a demo: create `<demo>/index.html` + `src/<demo>/main.ts` and list it
 // in DEMOS. In dev, game traffic is proxied to the Rust `game-demos` server
-// (GAME_DEMOS_SERVER, default http://127.0.0.1:2567).
+// (GAME_DEMOS_SERVER, default http://127.0.0.1:2567), whose gateway routes
+// Mob Pit's rooms (`/zones/{room}`) on to celld.
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 
-const DEMOS = ['arena', 'mobpit', 'leaderboard', 'gallery', 'freeze', 'grid', 'ripple'];
+const DEMOS = ['mobpit', 'leaderboard'];
 const server = process.env.GAME_DEMOS_SERVER ?? 'http://127.0.0.1:2567';
 
 export default defineConfig({

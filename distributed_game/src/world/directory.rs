@@ -17,8 +17,9 @@ use crate::rng::Fnv64;
 pub struct HostAddr {
     /// Stable host id (also the ownership holder prefix).
     pub id: String,
-    /// WebSocket base URL, e.g. `ws://10.0.0.2:2567` (clients connect to
-    /// `{ws_url}/zones/{zone_id}`).
+    /// WebSocket base URL clients are redirected to, e.g.
+    /// `ws://10.0.0.2:2567` or, behind a proxy, `wss://game.example/h/a`
+    /// (clients connect to `{ws_url}/zones/{zone_id}`). Peers never use it.
     pub ws_url: String,
     /// Admin HTTP base URL, e.g. `http://10.0.0.2:2567` (peer calls).
     pub admin_url: String,
@@ -33,6 +34,13 @@ impl HostAddr {
             ws_url: format!("ws://{addr}"),
             admin_url: format!("http://{addr}"),
         }
+    }
+
+    /// Advertise `ws_url` (e.g. the proxied public URL) instead of the raw
+    /// `ws://{addr}`; admin/peer calls keep using `admin_url`.
+    pub fn with_ws_url(mut self, ws_url: impl Into<String>) -> Self {
+        self.ws_url = ws_url.into().trim_end_matches('/').to_string();
+        self
     }
 
     /// Client URL of `zone_id` on this host.

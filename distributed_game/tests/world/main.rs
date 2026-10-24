@@ -1,7 +1,12 @@
 //! Two GameServers in one process on different ports: cross-host handoff
 //! with a real WebSocket client, tier-up events across hosts, hibernation,
-//! fenced ownership and the world content barrier.
+//! fenced ownership and the world content barrier. Hibernation runs on
+//! celld (`CellZoneOwnership` + `CellZoneStateStore` against
+//! `tests/celld/fact-worker`; skipped unless the worker is built and celld
+//! starts, required with `CELLD_FACTS_REQUIRED=1`).
 
+#[path = "../support/celld.rs"]
+mod celld_support;
 mod realm;
 
 use std::sync::{Arc, Mutex};
@@ -9,12 +14,13 @@ use std::time::Duration;
 
 use distributed::lease::InMemoryLeaseStore;
 use distributed_game::net::{
-    GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey, WorldCoordinator,
+    AbortNotes, GameServer, RemoteHost, RolloutError, ServerConfig, TicketKey, WorldCoordinator,
+    ZoneFactory,
 };
 use distributed_game::protocol::{error, kick, Hello, Notice};
 use distributed_game::world::{
-    FencedLeaseOwnership, HostAddr, LocalOwnership, SqliteZoneStateStore, StaticDirectory,
-    ZoneDirectory, ZoneOwnership, ZoneStateStore,
+    FencedLeaseOwnership, HostAddr, LocalOwnership, StaticDirectory, ZoneDirectory, ZoneOwnership,
+    ZoneStateStore,
 };
 use distributed_game::*;
 use futures_util::{SinkExt, StreamExt};
@@ -35,6 +41,9 @@ fn ticket(principal: &str, zone: &str, nonce: &str) -> String {
         expires_at: 4_000_000_000,
         nonce: nonce.into(),
         role: Role::Player,
+        name: None,
+        extensions: Default::default(),
+        wake: false,
     })
 }
 
@@ -91,7 +100,7 @@ async fn two_hosts(
     for (host, listener) in [(a, la), (b, lb)] {
         let sink = MemoryFactSink::new();
         let f = factory.clone();
-        let server = GameServer::<Realm>::new(config(), move |zone| f(zone))
+        let server = GameServer::<Realm>::new(config(), ZoneFactory::sync(move |a| f(&a.zone_id)))
             .with_fact_sink(sink.clone(), 64, RetryPolicy::default())
             .with_host_id(host.id.clone())
             .with_directory(dir.clone())
@@ -121,6 +130,7 @@ async fn hello(ws: &mut Ws, ticket: &str, token: &str, version: &str) {
             capabilities: 0,
             ticket: ticket.into(),
             reconnect_token: token.into(),
+            near: false,
         }),
     )
     .await;
@@ -242,6 +252,7 @@ fn realm_factory(
             reject_all: rejecting.contains(&zone),
             gate: zone.ends_with(".inn"),
             freeze_ready: !zone.ends_with(".stuck"),
+            move_facts: false,
         })
     })
 }
@@ -324,10 +335,42 @@ async fn cross_host_handoff_follows_redirect_and_ticket_is_single_use() {
         expires_at: 4_000_000_000,
         nonce: "x".into(),
         role: Role::Player,
+        name: None,
+        extensions: Default::default(),
+        wake: false,
     });
     assert!(join_url(&b.addr.zone_url("realm.west"), &forged, "")
         .await
         .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redirects_use_the_configured_public_url() {
+    let (_a, b, _dir) = two_hosts(
+        || {
+            base_config().with_redirect_url(|host, zone| {
+                format!("wss://game.example/hosts/{}/zones/{zone}", host.id)
+            })
+        },
+        &[("realm.east", "A")],
+        realm_factory(&[], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut ws = connect(&b.addr.zone_url("realm.east")).await;
+    hello(&mut ws, &ticket("ana", "realm.east", "pub-1"), "", "").await;
+    let mut mirror = ClientMirror::new();
+    match next_control(&mut ws, &mut mirror).await {
+        Some(ServerMessage::Redirect { zone_id, url }) => {
+            assert_eq!(zone_id, "realm.east");
+            assert_eq!(url, "wss://game.example/hosts/A/zones/realm.east");
+        }
+        other => panic!("expected Redirect, got {other:?}"),
+    }
+    // Per-host advertised URL in the directory (no mapping configured).
+    let proxied = HostAddr::new("A", "10.0.0.2:2567").with_ws_url("wss://game.example/a/");
+    assert_eq!(proxied.zone_url("z"), "wss://game.example/a/zones/z");
+    assert_eq!(proxied.admin_url, "http://10.0.0.2:2567");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -468,16 +511,11 @@ async fn boss_defeat_tiers_up_to_parent_and_grandparent_across_hosts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dormant_zone_hibernates_to_sqlite_and_restores() {
-    let path = std::env::temp_dir().join(format!(
-        "dg-world-hibernate-{}-{}.sqlite3",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let store = Arc::new(SqliteZoneStateStore::open(&path).unwrap());
+async fn dormant_zone_hibernates_to_celld_and_restores() {
+    let Some(celld) = celld_support::Celld::start_new() else {
+        return;
+    };
+    let (ownership, store) = on_celld(&celld, "host-a");
     let mut config = base_config();
     config.host.idle_tick_rate = None;
     config.host.dormant_after = Duration::from_millis(50);
@@ -485,8 +523,9 @@ async fn dormant_zone_hibernates_to_sqlite_and_restores() {
     let sink = MemoryFactSink::new();
     let (listener, addr) = listen().await;
     let factory = realm_factory(&[], &[]);
-    let server = GameServer::<Realm>::new(config, move |z| factory(z))
+    let server = GameServer::<Realm>::new(config, ZoneFactory::sync(move |a| factory(&a.zone_id)))
         .with_fact_sink(sink.clone(), 64, RetryPolicy::default())
+        .with_ownership(ownership)
         .with_state_store(store.clone());
     serve(&server, listener);
     let url = format!("ws://{addr}/zones/realm.vault");
@@ -503,12 +542,18 @@ async fn dormant_zone_hibernates_to_sqlite_and_restores() {
     })
     .await;
     send(&mut ana.ws, ClientMessage::Leave).await;
-    eventually("hibernation", || {
+    // The zone leaves the active set before its snapshot is written, so wait
+    // for the save itself.
+    eventually("hibernation save", || {
         let server = server.clone();
-        async move { !server.is_active("realm.vault") }
+        async move { !server.is_active("realm.vault") && hibernation_outcomes(&server) >= 1 }
     })
     .await;
-    let saved = store.load("realm.vault").unwrap().expect("snapshot stored");
+    let saved = store
+        .load("realm.vault")
+        .await
+        .unwrap()
+        .expect("snapshot stored");
     assert_eq!(saved.state, 3u32.to_le_bytes());
     // Facts emitted while disposing were still committed.
     eventually("dispose fact", || {
@@ -541,10 +586,111 @@ async fn dormant_zone_hibernates_to_sqlite_and_restores() {
         }
     };
     assert_eq!(counter, 3);
-    drop(store);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+}
+
+/// Zone ownership and hibernation snapshots in celld cells.
+fn on_celld(
+    celld: &celld_support::Celld,
+    host: &str,
+) -> (
+    Arc<distributed_game::celld::CellZoneOwnership>,
+    Arc<distributed_game::celld::CellZoneStateStore>,
+) {
+    let secret = || distributed::cell_host::InternalHttpSecret::new(celld_support::SECRET).unwrap();
+    (
+        Arc::new(
+            distributed_game::celld::CellZoneOwnership::new(
+                celld.base(),
+                secret(),
+                "world-test",
+                host,
+            )
+            .unwrap(),
+        ),
+        Arc::new(
+            distributed_game::celld::CellZoneStateStore::new(
+                celld.base(),
+                secret(),
+                "world-test",
+                host,
+            )
+            .unwrap(),
+        ),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
+    let Some(celld) = celld_support::Celld::start_new() else {
+        return;
+    };
+    let url_of = |addr: &str| format!("ws://{addr}/zones/realm.keep");
+    let mut epochs = Vec::new();
+    let mut count = 0u32;
+    for run in 1..=2 {
+        // A fresh process: new store and ownership handles (the fencing
+        // tokens live in the celld lease cell, so they keep growing).
+        let (ownership, store) = on_celld(&celld, &format!("host-{run}"));
+        let mut config = base_config();
+        config.host.idle_tick_rate = None;
+        config.host.dormant_after = Duration::from_millis(50);
+        config.hibernate_after = Some(Duration::from_millis(100));
+        let (listener, addr) = listen().await;
+        let factory = realm_factory(&[], &[]);
+        let server =
+            GameServer::<Realm>::new(config, ZoneFactory::sync(move |a| factory(&a.zone_id)))
+                .with_ownership(ownership)
+                .with_state_store(store.clone());
+        serve(&server, listener);
+        // Two activations per run, so the first run's last token exceeds
+        // the restarted run's first token unless tokens survive restarts.
+        for cycle in 1..=2u64 {
+            let nonce = format!("r{run}-{cycle}");
+            let mut ana = join_url(&url_of(&addr), &ticket("ana", "realm.keep", &nonce), "")
+                .await
+                .unwrap();
+            input(&mut ana, 1, CMD_COUNT).await;
+            count += 1;
+            let expected = count;
+            eventually("count", || {
+                let server = server.clone();
+                async move {
+                    server.inspect("realm.keep", |h| h.zone().counter).await == Some(expected)
+                }
+            })
+            .await;
+            epochs.push(
+                server
+                    .inspect("realm.keep", |h| h.config().boot_epoch)
+                    .await
+                    .unwrap(),
+            );
+            send(&mut ana.ws, ClientMessage::Leave).await;
+            // Saved, stale or error: the assertions below say which.
+            eventually("hibernation save", || {
+                let server = server.clone();
+                async move { !server.is_active("realm.keep") && hibernation_outcomes(&server) >= cycle }
+            })
+            .await;
+            assert_eq!(server.metrics().hibernation_saves("stale"), 0, "run {run}");
+            assert_eq!(
+                server.metrics().hibernation_saves("saved"),
+                cycle,
+                "run {run}"
+            );
+            let saved = store.load("realm.keep").await.unwrap().expect("snapshot");
+            assert_eq!(saved.state, count.to_le_bytes(), "run {run} saved");
+        }
+        assert!(server
+            .metrics()
+            .render()
+            .contains("distributed_game_hibernation_saves_total{outcome=\"saved\"} 2"));
+        server.shutdown();
     }
+    assert!(
+        epochs.windows(2).all(|w| w[1] > w[0]),
+        "epochs grow: {epochs:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -564,7 +710,7 @@ async fn fenced_lease_keeps_zone_on_one_host_and_loss_stops_it() {
     for id in ["A", "B"] {
         let (listener, addr) = listen().await;
         let f = realm_factory(&[], &[]);
-        let server = GameServer::<Realm>::new(config(), move |z| f(z))
+        let server = GameServer::<Realm>::new(config(), ZoneFactory::sync(move |a| f(&a.zone_id)))
             .with_host_id(id)
             .with_ownership(ownership.clone());
         serve(&server, listener);
@@ -613,6 +759,109 @@ fn versioned(version: &'static str) -> impl Fn() -> ServerConfig {
         c.host.content_version = version.into();
         c
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rolling_commit_reloads_stale_clients_in_gates_and_apply_may_await() {
+    let safe_room = || {
+        let mut c = base_config();
+        c.host.content_version = "v1".into();
+        c.host.stale_policy = StalePolicy::SafeRoom { roam: false };
+        c
+    };
+    let (a, _b, _dir) = two_hosts(
+        safe_room,
+        &[("realm.inn", "A"), ("realm.field", "A")],
+        realm_factory(&[], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut inn = join_url(
+        &a.addr.zone_url("realm.inn"),
+        &ticket("ina", "realm.inn", "g1"),
+        "v1",
+    )
+    .await
+    .unwrap();
+    let mut field = join_url(
+        &a.addr.zone_url("realm.field"),
+        &ticket("fey", "realm.field", "g2"),
+        "v1",
+    )
+    .await
+    .unwrap();
+    let server = a.server.clone();
+    let coordinator = WorldCoordinator::new(Duration::from_secs(2))
+        .participant(Arc::new(a.server.clone()))
+        .with_abort_notes(AbortNotes {
+            not_acked: "the ritual held the world".into(),
+            apply_failed: "CDN said: {error}".into(),
+        });
+
+    // Async apply that fails: everyone resumes on v1 with the custom note.
+    let failed = coordinator
+        .rollout_async("v2", "", BarrierMode::Rolling, |_v| async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err("pack missing".to_string())
+        })
+        .await;
+    assert_eq!(
+        failed,
+        Err(RolloutError::ApplyFailed("pack missing".into()))
+    );
+    for c in [&mut inn, &mut field] {
+        assert!(matches!(
+            next_notice(c).await,
+            Some(ServerMessage::Freeze(_))
+        ));
+        let resumed = next_notice(c).await;
+        assert!(
+            matches!(&resumed, Some(ServerMessage::Resume(n))
+                if n.version == "v1" && n.notes == "CDN said: pack missing"),
+            "{resumed:?}"
+        );
+    }
+
+    // Async apply observed while every zone is frozen, then a rolling commit.
+    let report = coordinator
+        .rollout_async("v2", "ice", BarrierMode::Rolling, |v| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let frozen = server.inspect("realm.inn", |h| h.is_frozen()).await;
+            assert_eq!(frozen, Some(true), "zones stay frozen while applying {v}");
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.version, "v2");
+    for c in [&mut inn, &mut field] {
+        assert!(matches!(
+            next_notice(c).await,
+            Some(ServerMessage::Freeze(_))
+        ));
+        assert!(matches!(
+            next_notice(c).await,
+            Some(ServerMessage::Resume(n)) if n.version == "v2"
+        ));
+    }
+    // The stale client already inside the gate reloads there ...
+    match next_notice(&mut inn).await {
+        Some(ServerMessage::Kick { code, .. }) => assert_eq!(code, kick::RELOAD),
+        other => panic!("expected Kick(RELOAD), got {other:?}"),
+    }
+    // ... the one in the field keeps playing its old version.
+    let field_connected = a
+        .server
+        .inspect("realm.field", |h| h.players().all(|p| p.connected))
+        .await;
+    assert_eq!(field_connected, Some(true));
+    // The reloaded client reconnects with its token on v2.
+    let mut back = connect(&a.addr.zone_url("realm.inn")).await;
+    hello(&mut back, "", &inn.welcome.reconnect_token, "v2").await;
+    let mut mirror = ClientMirror::new();
+    assert!(matches!(
+        next_control(&mut back, &mut mirror).await,
+        Some(ServerMessage::Welcome(w)) if w.content_version == "v2"
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -832,4 +1081,76 @@ async fn barrier_aborts_and_resumes_old_version_when_a_zone_never_acks() {
 fn directory_types_are_object_safe() {
     let dir: Arc<dyn ZoneDirectory> = Arc::new(StaticDirectory::new());
     assert!(dir.locate("x").is_none());
+}
+
+/// Hibernation snapshot saves finished so far, whatever their outcome.
+fn hibernation_outcomes(server: &GameServer<Realm>) -> u64 {
+    let m = server.metrics();
+    m.hibernation_saves("saved") + m.hibernation_saves("stale") + m.hibernation_saves("error")
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, TicketExtension)]
+struct PartyClaims {
+    party: String,
+    team: u8,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_tickets_carry_extension_claims_across_hosts() {
+    let (a, b, _dir) = two_hosts(
+        || base_config().with_ticket_extensions::<PartyClaims>(),
+        &[("realm.east", "A"), ("realm.west", "B")],
+        realm_factory(&[("realm.east", "realm.west")], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let party = PartyClaims {
+        party: "p-9".into(),
+        team: 1,
+    };
+    let t = TicketKey::new(SECRET).sign(
+        &TicketClaims::new("ana", "realm.east", 4_000_000_000, "ext-1", Role::Player)
+            .with_extensions(TicketExtensions::from_typed(&party).unwrap()),
+    );
+    let mut ana = join_url(&a.addr.zone_url("realm.east"), &t, "")
+        .await
+        .unwrap();
+    input(&mut ana, 1, CMD_HANDOFF).await;
+    let transfer = loop {
+        match control(&mut ana).await {
+            Some(ServerMessage::Handoff {
+                transfer_ticket, ..
+            }) => break transfer_ticket,
+            Some(_) => continue,
+            None => panic!("closed before Handoff"),
+        }
+    };
+    // The server-minted transfer ticket signs the claims...
+    let distributed_game::net::VerifiedTicket::Transfer(verified) = TicketKey::new(SECRET)
+        .verify_ticket(&transfer, 1_700_000_000)
+        .unwrap()
+    else {
+        panic!("transfer ticket")
+    };
+    assert_eq!(
+        verified.claims.extensions.typed::<PartyClaims>().unwrap(),
+        party
+    );
+    // ...and the target zone on the other host sees them.
+    let _west = join_url(&a.addr.zone_url("realm.west"), &transfer, "")
+        .await
+        .unwrap();
+    let players = b
+        .server
+        .inspect("realm.west", |h| h.players().cloned().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert_eq!(players[0].principal, "ana");
+    assert_eq!(players[0].extensions.typed::<PartyClaims>().unwrap(), party);
+}
+
+#[tokio::test]
+async fn fenced_lease_ownership_passes_the_conformance_suite() {
+    let ownership = FencedLeaseOwnership::new(InMemoryLeaseStore::new());
+    distributed_game::world::ownership_conformance(&ownership, "conformance").await;
 }

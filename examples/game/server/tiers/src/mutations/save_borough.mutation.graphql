@@ -1,0 +1,5 @@
+# Syntax-only read-model mutation → MutationProgram IR (not a public field).
+# The row is the borough's state carried by its domain events.
+mutation SaveBorough {
+  upsert_boroughs(object: $input.borough)
+}

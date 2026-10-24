@@ -66,6 +66,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
          EXTRACT(EPOCH FROM retention_expires_at)::double precision AS retention_expires_at, \
          EXTRACT(EPOCH FROM compacted_at)::double precision AS compacted_at";
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str = " FOR UPDATE";
+    const SCHEDULE_CLAIM_LOCK_SUFFIX: &'static str = " FOR UPDATE SKIP LOCKED";
     const COMMAND_LEDGER_COMPACTION_LOCK_SUFFIX: &'static str = " FOR UPDATE SKIP LOCKED";
     const EVENT_SELECT: &'static str = "event_name, \
          event_version, \

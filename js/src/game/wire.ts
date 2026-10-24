@@ -110,6 +110,27 @@ export class WireWriter {
 		}
 	}
 
+	/**
+	 * Unsigned LEB128 of an integer up to `2^53 - 1` (typed game payloads'
+	 * `u64`; no protocol message uses it).
+	 */
+	varuint53(value: number): this {
+		if (!Number.isSafeInteger(value) || value < 0) {
+			throw new RangeError(`varuint53 must be a safe unsigned integer, got ${value}`);
+		}
+		let v = value;
+		this.#reserve(8);
+		for (;;) {
+			const byte = v % 128;
+			v = Math.floor(v / 128);
+			if (v === 0) {
+				this.#buf[this.#len++] = byte;
+				return this;
+			}
+			this.#buf[this.#len++] = byte | 0x80;
+		}
+	}
+
 	/** Zigzag-mapped signed varint. */
 	varint(value: number): this {
 		const v = assertI32(value, 'varint');
@@ -201,6 +222,22 @@ export class WireReader {
 			if ((byte & 0x80) === 0) return value;
 		}
 		throw new GameDecodeError('VARINT_OVERFLOW', 'varuint exceeds 32 bits');
+	}
+
+	/** Unsigned LEB128 up to `2^53 - 1` (see `WireWriter.varuint53`). */
+	varuint53(): number {
+		let value = 0;
+		for (let index = 0; index < 8; index += 1) {
+			const byte = this.u8();
+			value += (byte & 0x7f) * 2 ** (7 * index);
+			if ((byte & 0x80) === 0) {
+				if (value > Number.MAX_SAFE_INTEGER) {
+					throw new GameDecodeError('VARINT_OVERFLOW', 'varuint exceeds 2^53 - 1');
+				}
+				return value;
+			}
+		}
+		throw new GameDecodeError('VARINT_OVERFLOW', 'varuint exceeds 2^53 - 1');
 	}
 
 	varint(): number {

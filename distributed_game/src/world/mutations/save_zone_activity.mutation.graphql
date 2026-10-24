@@ -1,0 +1,5 @@
+# Syntax-only read-model mutation → MutationProgram IR (not a public field).
+# The row is the zone's post-transition `ZoneActivityStatus`.
+mutation SaveZoneActivity {
+  upsert_zone_activities(object: $input.activity)
+}

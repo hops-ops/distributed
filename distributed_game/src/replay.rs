@@ -50,7 +50,7 @@ use crate::schema::FieldValue;
 use crate::world::{ChildEvent, StalePolicy};
 use crate::zone::{ClientId, PlayerId, TicketClaims, Zone};
 
-const MAGIC: &[u8; 4] = b"DGR1";
+const MAGIC: &[u8; 4] = b"DGR3";
 
 /// FNV digest of a replicated world (entity order, ids, kinds, positions,
 /// priorities and field values).
@@ -216,6 +216,31 @@ pub enum Event {
         /// New version.
         version: String,
     },
+    /// [`ZoneHost::set_config_version`].
+    SetConfigVersion {
+        /// Clock.
+        at: Duration,
+        /// New version.
+        version: String,
+    },
+    /// [`ZoneHost::deliver`]: a kick of `principal`.
+    DeliverKick {
+        /// Clock.
+        at: Duration,
+        /// Principal kicked.
+        principal: String,
+        /// Reason.
+        reason: String,
+    },
+    /// [`ZoneHost::deliver`]: a game message (encoded `Z::Message`).
+    DeliverMessage {
+        /// Clock.
+        at: Duration,
+        /// Message type id.
+        type_id: u32,
+        /// Encoded payload.
+        payload: Vec<u8>,
+    },
     /// [`ZoneHost::request_freeze`].
     RequestFreeze {
         /// Clock.
@@ -269,6 +294,9 @@ impl Event {
             | Self::JoinTransfer { at, .. }
             | Self::ReconnectVersion { at, .. }
             | Self::SetContentVersion { at, .. }
+            | Self::SetConfigVersion { at, .. }
+            | Self::DeliverKick { at, .. }
+            | Self::DeliverMessage { at, .. }
             | Self::RequestFreeze { at, .. }
             | Self::CancelFreeze { at, .. }
             | Self::ReloadStale { at }
@@ -336,6 +364,15 @@ impl fmt::Display for Event {
             Self::SetContentVersion { version, .. } => {
                 write!(f, "@{ms:.1}ms content version {version}")
             }
+            Self::SetConfigVersion { version, .. } => {
+                write!(f, "@{ms:.1}ms config version {version}")
+            }
+            Self::DeliverKick { principal, .. } => {
+                write!(f, "@{ms:.1}ms inbox kick {principal}")
+            }
+            Self::DeliverMessage { type_id, .. } => {
+                write!(f, "@{ms:.1}ms inbox message {type_id}")
+            }
             Self::RequestFreeze { notice, .. } => {
                 write!(f, "@{ms:.1}ms request freeze {}", notice.reason)
             }
@@ -375,7 +412,7 @@ pub struct Recording {
 /// File decode failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingError {
-    /// Not a `DGR1` file.
+    /// Not a `DGR3` file.
     BadMagic,
     /// Malformed content.
     Decode(String),
@@ -551,6 +588,9 @@ fn put_config(w: &mut Writer, c: &HostConfig) {
         StalePolicy::SafeRoom { roam: false } => 1,
         StalePolicy::SafeRoom { roam: true } => 2,
     });
+    put_u64(w, c.boot_epoch);
+    w.string(&c.config_version);
+    w.bool(c.lifecycle_facts);
 }
 
 fn put_claims(w: &mut Writer, claims: &TicketClaims) {
@@ -562,6 +602,11 @@ fn put_claims(w: &mut Writer, claims: &TicketClaims) {
         Role::Player => 0,
         Role::Observer => 1,
     });
+    match &claims.name {
+        Some(name) => w.u8(1).string(name),
+        None => w.u8(0),
+    };
+    w.string(&claims.extensions.to_json().to_string());
 }
 
 fn get_claims(r: &mut Reader<'_>) -> Result<TicketClaims, RecordingError> {
@@ -573,12 +618,23 @@ fn get_claims(r: &mut Reader<'_>) -> Result<TicketClaims, RecordingError> {
         0 => Role::Player,
         _ => Role::Observer,
     };
+    let name = match r.u8()? {
+        0 => None,
+        _ => Some(r.string()?),
+    };
+    let extensions = serde_json::from_str(&r.string()?)
+        .ok()
+        .and_then(|value| crate::claims::TicketExtensions::from_json(value).ok())
+        .ok_or_else(|| bad("extension claims"))?;
     Ok(TicketClaims {
         principal,
         zone,
         expires_at,
         nonce,
         role,
+        name,
+        extensions,
+        wake: false,
     })
 }
 
@@ -598,9 +654,11 @@ fn get_config(r: &mut Reader<'_>) -> Result<HostConfig, RecordingError> {
         reconnect_grace: get_dur(r)?,
         byte_budget: get_u64(r)? as usize,
         default_view_radius: r.f32()?,
+        // Update rates only shape Deltas, never the replayed world.
         interest: InterestConfig {
             cell_size: r.f32()?,
             leave_margin: r.f32()?,
+            ..InterestConfig::default()
         },
         content_version: r.string()?,
         world_seed: get_u64(r)?,
@@ -613,12 +671,15 @@ fn get_config(r: &mut Reader<'_>) -> Result<HostConfig, RecordingError> {
             1 => StalePolicy::SafeRoom { roam: false },
             _ => StalePolicy::SafeRoom { roam: true },
         },
+        boot_epoch: get_u64(r)?,
+        config_version: r.string()?,
+        lifecycle_facts: r.bool()?,
     })
 }
 
 impl Recording {
     /// Compact binary encoding:
-    /// `"DGR1" ‖ zone_id ‖ config ‖ created_at ‖ fact_capacity? ‖ zone_config ‖
+    /// `"DGR3" ‖ zone_id ‖ config ‖ created_at ‖ fact_capacity? ‖ zone_config ‖
     /// varuint(event count) ‖ events`. Integers are LEB128 varints,
     /// durations are nanosecond varints, clock readings are delta-coded
     /// against the previous event, hashes are 8 raw bytes.
@@ -652,17 +713,9 @@ impl Recording {
                     result,
                     ..
                 } => {
-                    w.u8(0)
-                        .string(&claims.principal)
-                        .string(&claims.zone)
-                        .string(&claims.nonce);
-                    put_u64(&mut w, claims.expires_at);
-                    w.u8(match claims.role {
-                        Role::Player => 0,
-                        Role::Observer => 1,
-                    })
-                    .varuint(*capabilities)
-                    .string(content_version);
+                    w.u8(0);
+                    put_claims(&mut w, claims);
+                    w.varuint(*capabilities).string(content_version);
                     put_join_result(&mut w, result);
                 }
                 Event::Reconnect {
@@ -738,6 +791,7 @@ impl Recording {
                     put_claims(&mut w, &transfer.claims);
                     w.string(&transfer.source_zone).string(&transfer.issuer);
                     put_u64(&mut w, transfer.generation);
+                    put_u64(&mut w, transfer.departed_at_ms);
                     w.bytes(&transfer.carried)
                         .varuint(*capabilities)
                         .string(content_version);
@@ -786,6 +840,19 @@ impl Recording {
                 } => {
                     w.u8(16).bytes(state).string(saved_version);
                 }
+                Event::DeliverKick {
+                    principal, reason, ..
+                } => {
+                    w.u8(18).string(principal).string(reason);
+                }
+                Event::DeliverMessage {
+                    type_id, payload, ..
+                } => {
+                    w.u8(19).varuint(*type_id).bytes(payload);
+                }
+                Event::SetConfigVersion { version, .. } => {
+                    w.u8(17).string(version);
+                }
             }
         }
         w.into_bytes()
@@ -813,23 +880,10 @@ impl Recording {
             at += get_dur(&mut r)?;
             let event = match r.u8()? {
                 0 => {
-                    let principal = r.string()?;
-                    let zone = r.string()?;
-                    let nonce = r.string()?;
-                    let expires_at = get_u64(&mut r)?;
-                    let role = match r.u8()? {
-                        0 => Role::Player,
-                        _ => Role::Observer,
-                    };
+                    let claims = get_claims(&mut r)?;
                     Event::Join {
                         at,
-                        claims: TicketClaims {
-                            principal,
-                            zone,
-                            expires_at,
-                            nonce,
-                            role,
-                        },
+                        claims,
                         capabilities: r.varuint()?,
                         content_version: r.string()?,
                         result: get_join_result(&mut r)?,
@@ -895,6 +949,7 @@ impl Recording {
                     let source_zone = r.string()?;
                     let issuer = r.string()?;
                     let generation = get_u64(&mut r)?;
+                    let departed_at_ms = get_u64(&mut r)?;
                     let carried = r.bytes()?.to_vec();
                     Event::JoinTransfer {
                         at,
@@ -904,6 +959,7 @@ impl Recording {
                             issuer,
                             generation,
                             carried,
+                            departed_at_ms,
                         },
                         capabilities: r.varuint()?,
                         content_version: r.string()?,
@@ -946,6 +1002,20 @@ impl Recording {
                     at,
                     state: r.bytes()?.to_vec(),
                     saved_version: r.string()?,
+                },
+                17 => Event::SetConfigVersion {
+                    at,
+                    version: r.string()?,
+                },
+                18 => Event::DeliverKick {
+                    at,
+                    principal: r.string()?,
+                    reason: r.string()?,
+                },
+                19 => Event::DeliverMessage {
+                    at,
+                    type_id: r.varuint()?,
+                    payload: r.bytes()?.to_vec(),
                 },
                 _ => return Err(bad("event tag")),
             };
@@ -1015,6 +1085,8 @@ impl<Z: Zone> Recorder<Z> {
                 token
             });
         host.set_tick_hashing(true);
+        // The resolved boot epoch, so replayed fact keys match.
+        let config = host.config().clone();
         Self {
             host,
             clock,
@@ -1247,6 +1319,39 @@ impl<Z: Zone> Recorder<Z> {
             at,
             version: version.into(),
         });
+    }
+
+    /// [`ZoneHost::set_config_version`].
+    pub fn set_config_version(&mut self, version: &str) {
+        let at = self.now();
+        self.host.set_config_version(version);
+        self.recording.events.push(Event::SetConfigVersion {
+            at,
+            version: version.into(),
+        });
+    }
+
+    /// [`ZoneHost::deliver`].
+    pub fn deliver(
+        &mut self,
+        inbound: crate::inbox::ZoneInbound<Z::Message>,
+    ) -> crate::inbox::Delivered {
+        let at = self.now();
+        let event = match &inbound {
+            crate::inbox::ZoneInbound::Kick { principal, reason } => Event::DeliverKick {
+                at,
+                principal: principal.clone(),
+                reason: reason.clone(),
+            },
+            crate::inbox::ZoneInbound::Message(message) => Event::DeliverMessage {
+                at,
+                type_id: crate::GameEvent::event_id(message),
+                payload: crate::GameEvent::to_payload(message),
+            },
+        };
+        let delivered = self.host.deliver(inbound);
+        self.recording.events.push(event);
+        delivered
     }
 
     /// [`ZoneHost::request_freeze`].
@@ -1579,6 +1684,24 @@ pub fn replay_with<Z: Zone>(
                 }
             }
             Event::SetContentVersion { version, .. } => host.set_content_version(version.clone()),
+            Event::SetConfigVersion { version, .. } => host.set_config_version(version.clone()),
+            Event::DeliverKick {
+                principal, reason, ..
+            } => {
+                host.deliver(crate::inbox::ZoneInbound::Kick {
+                    principal: principal.clone(),
+                    reason: reason.clone(),
+                });
+            }
+            Event::DeliverMessage {
+                type_id, payload, ..
+            } => {
+                if let Ok(Some(message)) =
+                    <Z::Message as crate::GameEvent>::decode_event(*type_id, payload)
+                {
+                    host.deliver(crate::inbox::ZoneInbound::Message(message));
+                }
+            }
             Event::RequestFreeze { notice, .. } => {
                 host.request_freeze(notice.clone());
             }

@@ -5,21 +5,20 @@
 //! the zone's ownership token; the next activation (on any host) loads it
 //! and hands it to [`Zone::on_restore`](crate::Zone::on_restore).
 //!
-//! Writes are **fenced**: `save` with a token older than the stored one
-//! fails with [`StateError::Stale`], so a host that lost ownership while
-//! paused can never overwrite the state written by its successor.
+//! Writes are **fenced**: `save` (and `delete`) with a token older than the
+//! stored one fails with [`StateError::Stale`], so a host that lost
+//! ownership while paused can never overwrite the state written by its
+//! successor. An equal token is accepted (the same owner saving again).
 //!
-//! The trait is synchronous (snapshots are small and rare); async drivers
-//! call it on a blocking thread.
-//!
-//! Why not an `AggregateCell`: a hibernation snapshot is a whole-value
-//! overwrite keyed by zone, not a stream of domain events; storing it as
-//! events would grow without bound and buy nothing. Durable *outcomes* (XP,
-//! loot) go through facts into cells; the snapshot only holds ephemeral
-//! simulation state worth keeping across a cold start.
+//! Durable snapshots live in celld: one `ZoneState:{zone_id}` cell per zone
+//! ([`super::zone_state`], `celld::CellZoneStateStore`), so a sleeping zone
+//! is a sleeping Durable Object. [`MemoryZoneStateStore`] is the in-process
+//! store for unit tests. There is no native file store.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+use crate::facts::BoxFuture;
 
 /// A stored snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,17 +60,29 @@ impl std::error::Error for StateError {}
 
 /// Fenced snapshot store.
 pub trait ZoneStateStore: Send + Sync + 'static {
-    /// Latest snapshot of `zone_id`.
-    fn load(&self, zone_id: &str) -> Result<Option<StoredZoneState>, StateError>;
+    /// Latest snapshot of `zone_id` (`None` when none, or deleted).
+    fn load<'a>(
+        &'a self,
+        zone_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<StoredZoneState>, StateError>>;
 
     /// Store a snapshot if `state.token` >= the stored token.
-    fn save(&self, zone_id: &str, state: &StoredZoneState) -> Result<(), StateError>;
+    fn save<'a>(
+        &'a self,
+        zone_id: &'a str,
+        state: &'a StoredZoneState,
+    ) -> BoxFuture<'a, Result<(), StateError>>;
+
+    /// Drop the snapshot if `token` >= the stored token. The token stays
+    /// (a later save under an older token is still stale).
+    fn delete<'a>(&'a self, zone_id: &'a str, token: u64) -> BoxFuture<'a, Result<(), StateError>>;
 }
 
-/// In-memory store (tests / single process).
+/// In-memory store (unit tests / single process).
 #[derive(Debug, Default)]
 pub struct MemoryZoneStateStore {
-    states: Mutex<HashMap<String, StoredZoneState>>,
+    /// zone -> (highest token seen, snapshot).
+    states: Mutex<HashMap<String, (u64, Option<StoredZoneState>)>>,
 }
 
 impl MemoryZoneStateStore {
@@ -79,183 +90,123 @@ impl MemoryZoneStateStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    fn fenced(
+        &self,
+        zone_id: &str,
+        token: u64,
+        value: Option<StoredZoneState>,
+    ) -> Result<(), StateError> {
+        let mut states = self.states.lock().expect("states");
+        let entry = states.entry(zone_id.to_string()).or_insert((0, None));
+        if entry.0 > token {
+            return Err(StateError::Stale {
+                presented: token,
+                current: entry.0,
+            });
+        }
+        *entry = (token, value);
+        Ok(())
+    }
 }
 
 impl ZoneStateStore for MemoryZoneStateStore {
-    fn load(&self, zone_id: &str) -> Result<Option<StoredZoneState>, StateError> {
-        Ok(self.states.lock().expect("states").get(zone_id).cloned())
+    fn load<'a>(
+        &'a self,
+        zone_id: &'a str,
+    ) -> BoxFuture<'a, Result<Option<StoredZoneState>, StateError>> {
+        let state = self
+            .states
+            .lock()
+            .expect("states")
+            .get(zone_id)
+            .and_then(|(_, state)| state.clone());
+        Box::pin(async move { Ok(state) })
     }
 
-    fn save(&self, zone_id: &str, state: &StoredZoneState) -> Result<(), StateError> {
-        let mut states = self.states.lock().expect("states");
-        if let Some(current) = states.get(zone_id) {
-            if current.token > state.token {
-                return Err(StateError::Stale {
-                    presented: state.token,
-                    current: current.token,
-                });
-            }
-        }
-        states.insert(zone_id.to_string(), state.clone());
-        Ok(())
+    fn save<'a>(
+        &'a self,
+        zone_id: &'a str,
+        state: &'a StoredZoneState,
+    ) -> BoxFuture<'a, Result<(), StateError>> {
+        let result = self.fenced(zone_id, state.token, Some(state.clone()));
+        Box::pin(async move { result })
     }
-}
 
-/// Native SQLite store (feature `sqlite`): one table, one fenced upsert.
-#[cfg(feature = "sqlite")]
-pub struct SqliteZoneStateStore {
-    conn: Mutex<rusqlite::Connection>,
-}
-
-#[cfg(feature = "sqlite")]
-impl std::fmt::Debug for SqliteZoneStateStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SqliteZoneStateStore")
+    fn delete<'a>(&'a self, zone_id: &'a str, token: u64) -> BoxFuture<'a, Result<(), StateError>> {
+        let result = self.fenced(zone_id, token, None);
+        Box::pin(async move { result })
     }
 }
 
-#[cfg(feature = "sqlite")]
-fn backend(e: rusqlite::Error) -> StateError {
-    StateError::Backend(e.to_string())
-}
-
-#[cfg(feature = "sqlite")]
-impl SqliteZoneStateStore {
-    /// Open (or create) the database file.
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, StateError> {
-        Self::from_connection(rusqlite::Connection::open(path).map_err(backend)?)
-    }
-
-    /// In-memory database.
-    pub fn open_in_memory() -> Result<Self, StateError> {
-        Self::from_connection(rusqlite::Connection::open_in_memory().map_err(backend)?)
-    }
-
-    fn from_connection(conn: rusqlite::Connection) -> Result<Self, StateError> {
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS game_zone_state (
-               zone_id TEXT PRIMARY KEY,
-               token INTEGER NOT NULL,
-               content_version TEXT NOT NULL,
-               state BLOB NOT NULL
-             );",
-        )
-        .map_err(backend)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
+/// The fencing contract every [`ZoneStateStore`] must meet (memory, celld).
+#[doc(hidden)]
+pub async fn state_store_conformance(store: &dyn ZoneStateStore, zone: &str, payload: Vec<u8>) {
+    let snap = |token: u64, bytes: Vec<u8>| StoredZoneState {
+        token,
+        content_version: "c1".into(),
+        state: bytes,
+    };
+    assert_eq!(store.load(zone).await.unwrap(), None);
+    store.save(zone, &snap(2, b"a".to_vec())).await.unwrap();
+    store.save(zone, &snap(2, payload.clone())).await.unwrap();
+    assert_eq!(
+        store.load(zone).await.unwrap(),
+        Some(snap(2, payload.clone()))
+    );
+    assert_eq!(
+        store.save(zone, &snap(1, b"old".to_vec())).await,
+        Err(StateError::Stale {
+            presented: 1,
+            current: 2
         })
-    }
-}
-
-#[cfg(feature = "sqlite")]
-impl ZoneStateStore for SqliteZoneStateStore {
-    fn load(&self, zone_id: &str) -> Result<Option<StoredZoneState>, StateError> {
-        use rusqlite::OptionalExtension;
-        let conn = self.conn.lock().expect("sqlite");
-        conn.query_row(
-            "SELECT token, content_version, state FROM game_zone_state WHERE zone_id = ?1",
-            [zone_id],
-            |row| {
-                Ok(StoredZoneState {
-                    token: row.get::<_, i64>(0)? as u64,
-                    content_version: row.get(1)?,
-                    state: row.get(2)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(backend)
-    }
-
-    fn save(&self, zone_id: &str, state: &StoredZoneState) -> Result<(), StateError> {
-        let conn = self.conn.lock().expect("sqlite");
-        let token = i64::try_from(state.token).map_err(|_| StateError::Backend("token".into()))?;
-        let changed = conn
-            .execute(
-                "INSERT INTO game_zone_state (zone_id, token, content_version, state)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(zone_id) DO UPDATE SET
-                   token = excluded.token,
-                   content_version = excluded.content_version,
-                   state = excluded.state
-                 WHERE excluded.token >= game_zone_state.token",
-                rusqlite::params![zone_id, token, state.content_version, state.state],
-            )
-            .map_err(backend)?;
-        if changed == 0 {
-            let current: i64 = conn
-                .query_row(
-                    "SELECT token FROM game_zone_state WHERE zone_id = ?1",
-                    [zone_id],
-                    |row| row.get(0),
-                )
-                .map_err(backend)?;
-            return Err(StateError::Stale {
-                presented: state.token,
-                current: current as u64,
-            });
-        }
-        Ok(())
-    }
+    );
+    assert_eq!(
+        store.delete(zone, 1).await,
+        Err(StateError::Stale {
+            presented: 1,
+            current: 2
+        })
+    );
+    store.save(zone, &snap(3, b"c".to_vec())).await.unwrap();
+    assert_eq!(
+        store.load(zone).await.unwrap(),
+        Some(snap(3, b"c".to_vec()))
+    );
+    store.save(zone, &snap(4, payload.clone())).await.unwrap();
+    store.delete(zone, 4).await.unwrap();
+    assert_eq!(store.load(zone).await.unwrap(), None);
+    assert_eq!(
+        store.save(zone, &snap(3, b"late".to_vec())).await,
+        Err(StateError::Stale {
+            presented: 3,
+            current: 4
+        }),
+        "the token survives a delete"
+    );
+    store.save(zone, &snap(5, payload.clone())).await.unwrap();
+    assert_eq!(store.load(zone).await.unwrap(), Some(snap(5, payload)));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn snap(token: u64, bytes: &[u8]) -> StoredZoneState {
-        StoredZoneState {
-            token,
-            content_version: "c1".into(),
-            state: bytes.to_vec(),
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut future = std::pin::pin!(future);
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("memory store futures are ready"),
         }
-    }
-
-    fn exercise(store: &dyn ZoneStateStore) {
-        assert_eq!(store.load("z").unwrap(), None);
-        store.save("z", &snap(2, b"a")).unwrap();
-        store.save("z", &snap(2, b"b")).unwrap();
-        assert_eq!(
-            store.save("z", &snap(1, b"old")),
-            Err(StateError::Stale {
-                presented: 1,
-                current: 2
-            })
-        );
-        store.save("z", &snap(3, b"c")).unwrap();
-        assert_eq!(store.load("z").unwrap(), Some(snap(3, b"c")));
     }
 
     #[test]
     fn memory_store_is_fenced() {
-        exercise(&MemoryZoneStateStore::new());
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[test]
-    fn sqlite_store_is_fenced_and_durable() {
-        exercise(&SqliteZoneStateStore::open_in_memory().unwrap());
-        let path = std::env::temp_dir().join(format!(
-            "dg-zone-state-{}-{}.sqlite3",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        {
-            let store = SqliteZoneStateStore::open(&path).unwrap();
-            store.save("realm.east", &snap(7, b"boss:dead")).unwrap();
-        }
-        let reopened = SqliteZoneStateStore::open(&path).unwrap();
-        assert_eq!(
-            reopened.load("realm.east").unwrap(),
-            Some(snap(7, b"boss:dead"))
-        );
-        drop(reopened);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
+        let store = MemoryZoneStateStore::new();
+        block_on(state_store_conformance(&store, "z", vec![7; 300_000]));
     }
 }

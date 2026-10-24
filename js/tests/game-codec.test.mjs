@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
 	GameClientMirror,
 	GameDecodeError,
+	GameFeature,
 	WireReader,
 	WireWriter,
 	decodeClientMessage,
@@ -131,7 +132,8 @@ function messageFromJson(decoded, schema) {
 				contentVersion: decoded.content_version,
 				capabilities: decoded.capabilities,
 				ticket: decoded.ticket,
-				reconnectToken: decoded.reconnect_token
+				reconnectToken: decoded.reconnect_token,
+				near: decoded.near
 			};
 		case 'Input':
 			return {
@@ -144,6 +146,12 @@ function messageFromJson(decoded, schema) {
 			return { type: 'Ping', clientTime: decoded.client_time };
 		case 'Leave':
 			return { type: 'Leave' };
+		case 'Content':
+			return { type: 'Content', contentVersion: decoded.content_version };
+		case 'Near':
+			return { type: 'Near', near: decoded.near };
+		case 'Focus':
+			return { type: 'Focus', x: decoded.x, y: decoded.y };
 		case 'Welcome':
 			return {
 				type: 'Welcome',
@@ -156,7 +164,10 @@ function messageFromJson(decoded, schema) {
 				serverTime: decoded.server_time,
 				reconnectToken: decoded.reconnect_token,
 				contentVersion: decoded.content_version,
-				schema: schemaFromJson(decoded.schema)
+				schema: schemaFromJson(decoded.schema),
+				protocolVersion: decoded.protocol_version,
+				features: decoded.features ?? 0,
+				...(decoded.origin ? { origin: decoded.origin } : {})
 			};
 		case 'Delta':
 			return {
@@ -208,6 +219,7 @@ function messageToJson(message, kinds) {
 			return {
 				capabilities: message.capabilities,
 				content_version: message.contentVersion,
+				near: message.near,
 				protocol_version: message.protocolVersion,
 				reconnect_token: message.reconnectToken,
 				ticket: message.ticket,
@@ -224,6 +236,12 @@ function messageToJson(message, kinds) {
 			return { client_time: message.clientTime, type: 'Ping' };
 		case 'Leave':
 			return { type: 'Leave' };
+		case 'Content':
+			return { content_version: message.contentVersion, type: 'Content' };
+		case 'Near':
+			return { near: message.near, type: 'Near' };
+		case 'Focus':
+			return { type: 'Focus', x: message.x, y: message.y };
 		case 'Welcome':
 			return {
 				content_version: message.contentVersion,
@@ -236,7 +254,11 @@ function messageToJson(message, kinds) {
 				session_id: message.sessionId,
 				tick_rate: message.tickRate,
 				type: 'Welcome',
-				zone_id: message.zoneId
+				zone_id: message.zoneId,
+				protocol_version: message.protocolVersion,
+				...(message.protocolVersion >= 2
+					? { features: message.features, origin: message.origin === undefined ? null : message.origin }
+					: {})
 			};
 		case 'Delta': {
 			const created = new Map(message.creates.map((c) => [c.id, c.kind]));
@@ -373,11 +395,15 @@ function allMessages() {
 test('every message fixture encodes and decodes byte-exactly', () => {
 	const messages = allMessages();
 	const names = messages.map((m) => m.name);
-	for (const required of ['hello', 'hello_reconnect', 'input', 'ping', 'leave', 'welcome', 'delta', 'delta_empty', 'event', 'pong', 'freeze', 'resume', 'handoff', 'kick', 'error', 'kick_reload', 'redirect']) {
+	for (const required of ['hello', 'hello_v2', 'hello_reconnect', 'input', 'ping', 'leave', 'welcome', 'welcome_v2', 'welcome_v2_unplaced', 'delta', 'delta_empty', 'event', 'pong', 'freeze', 'resume', 'handoff', 'kick', 'error', 'kick_reload', 'redirect', 'hello_near', 'near', 'passive', 'focus']) {
 		assert.ok(names.includes(required), `fixture ${required}`);
 	}
 	for (const entry of messages) {
-		const kinds = entry.schema === undefined ? undefined : kindsFor(entry);
+		// Welcomes decode in the version the client offered.
+		const kinds =
+			entry.schema === undefined
+				? { schema: undefined, kindOf: () => undefined, protocolVersion: entry.decoded.protocol_version }
+				: kindsFor(entry);
 		const message = messageFromJson(entry.decoded);
 		const bytes =
 			entry.direction === 'client_to_server'
@@ -402,6 +428,7 @@ test('client mirror applies the golden delta like Rust ClientMirror', () => {
 	const welcome = messages.find((m) => m.name === 'welcome');
 	const delta = messages.find((m) => m.name === 'delta');
 	const mirror = new GameClientMirror();
+	mirror.protocolVersion = welcome.decoded.protocol_version;
 	const hello = mirror.apply(fromHex(welcome.hex));
 	assert.equal(hello.type, 'Welcome');
 	// Seed the entities the delta fixture assumes are known.
@@ -419,6 +446,24 @@ test('client mirror applies the golden delta like Rust ClientMirror', () => {
 	assert.equal(mirror.entities.get(301).fields[0], 0);
 });
 
+test('a Welcome decodes only in the protocol version the client offered', () => {
+	const hex = (name) => fixture('messages.json').messages.find((m) => m.name === name).hex;
+	const v1 = { schema: undefined, kindOf: () => undefined, protocolVersion: 1 };
+	const v2 = { ...v1, protocolVersion: 2 };
+	assert.throws(() => decodeServerMessage(fromHex(hex('welcome_v2')), v1), /TRAILING_BYTES/);
+	assert.throws(() => decodeServerMessage(fromHex(hex('welcome')), v2), /UNEXPECTED_EOF/);
+	const old = new GameClientMirror();
+	old.protocolVersion = 1;
+	const w1 = old.apply(fromHex(hex('welcome')));
+	assert.equal(w1.protocolVersion, 1);
+	assert.equal(w1.features, 0);
+	assert.equal(w1.origin, undefined);
+	const w2 = new GameClientMirror().apply(fromHex(hex('welcome_v2')));
+	assert.equal(w2.features & GameFeature.FOCUS, GameFeature.FOCUS);
+	assert.deepEqual(w2.origin, { x: -48, y: 1_000_000.5 });
+	assert.equal(new GameClientMirror().apply(fromHex(hex('welcome_v2_unplaced'))).origin, undefined);
+});
+
 test('decoders reject malformed input like the Rust reference', () => {
 	const reject = (hex, code, kinds) =>
 		assert.throws(
@@ -432,7 +477,7 @@ test('decoders reject malformed input like the Rust reference', () => {
 	assert.throws(() => new WireReader(fromHex('ffffffff10')).varuint(), /VARINT_OVERFLOW/);
 	assert.throws(() => new WireReader(fromHex('02')).bool(), /INVALID/);
 	assert.throws(() => new WireReader(fromHex('02c328')).string(), /INVALID_UTF8/);
-	assert.throws(() => decodeClientMessage(fromHex('05')), /UNKNOWN_MESSAGE/);
+	assert.throws(() => decodeClientMessage(fromHex('08')), /UNKNOWN_MESSAGE/);
 	// A delta update for an unknown entity id.
 	const { messages } = fixture('messages.json');
 	const delta = messages.find((m) => m.name === 'delta');

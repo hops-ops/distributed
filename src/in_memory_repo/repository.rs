@@ -62,6 +62,14 @@ pub struct InMemoryRepository {
     pub(super) projection_change_retention: ProjectionChangeRetention,
     #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
     causal_storage_identity: CausalStorageIdentity,
+    /// Schedule rows per owning stream (`storage_key`), committed with the
+    /// owner's events. Dispatched only once a schedule worker is attached
+    /// (`with_schedule_worker`).
+    schedules: Arc<RwLock<HashMap<String, (StreamIdentity, crate::schedule::MemorySchedules)>>>,
+    /// A schedule worker was attached: [`Capability::Scheduling`](crate::schedule::Capability::Scheduling).
+    schedule_dispatch: bool,
+    /// The store clock: `ctx.now()` and relative schedules.
+    clock: Arc<dyn crate::Clock>,
 }
 
 /// In-memory outbox table handle.
@@ -93,7 +101,31 @@ impl InMemoryRepository {
             causal_tables,
             projection_change_retention: ProjectionChangeRetention::default(),
             causal_storage_identity: CausalStorageIdentity::new(),
+            schedules: Arc::new(RwLock::new(HashMap::new())),
+            schedule_dispatch: false,
+            clock: Arc::new(crate::SystemClock),
         }
+    }
+
+    /// Use `clock` as the store clock (`ctx.now()`, relative schedules),
+    /// e.g. a [`ManualClock`](crate::ManualClock) in tests.
+    pub fn with_clock(mut self, clock: impl crate::Clock + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    /// Armed schedules of the aggregate stream `owner`, earliest first.
+    pub fn armed_schedules(
+        &self,
+        owner: &StreamIdentity,
+    ) -> Result<Vec<crate::schedule::ArmedSchedule>, RepositoryError> {
+        Ok(self
+            .schedules
+            .read()
+            .map_err(|_| RepositoryError::LockPoisoned("schedule read"))?
+            .get(&owner.storage_key())
+            .map(|(_, table)| table.armed())
+            .unwrap_or_default())
     }
 
     /// Configure the maximum newest projection changes retained per partition.
@@ -296,6 +328,9 @@ impl InMemoryRepository {
         mut completion: Option<CommandCompletion>,
         direct_projection: Option<SameTransactionProjectionBatch>,
     ) -> Result<(), InMemoryCommitError> {
+        let mut batch = batch;
+        let schedule_owner = crate::schedule::schedule_owner(&batch)?;
+        crate::schedule::resolve_schedule_writes(&mut batch.schedules, self.clock.now())?;
         let prepared = validate_commit_batch(&batch)?;
         if let Some(direct_projection) = &direct_projection {
             direct_projection.validate()?;
@@ -495,7 +530,32 @@ impl InMemoryRepository {
             })
             .transpose()?;
 
+        // Schedules: plan on a copy of the owner's table (may fail), install
+        // with the other writes below.
+        let mut schedule_storage = self
+            .schedules
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("schedule write"))?;
+        let planned_schedules = match &schedule_owner {
+            Some(owner) => Some((
+                owner.storage_key(),
+                (
+                    owner.clone(),
+                    schedule_storage
+                        .get(&owner.storage_key())
+                        .map(|(_, table)| table.clone())
+                        .unwrap_or_default()
+                        .plan(&batch.schedules)?,
+                ),
+            )),
+            None => None,
+        };
+
         // Nothing below can fail: mutate the live stores.
+        if let Some((owner, planned)) = planned_schedules {
+            schedule_storage.insert(owner, planned);
+        }
+        drop(schedule_storage);
         for append in prepared {
             storage
                 .entry(append.identity.storage_key())
@@ -847,8 +907,11 @@ impl ReadModelWritePlanStore for InMemoryRepository {
 }
 
 impl RelationalReadModelQueryStore for InMemoryRepository {
-    fn scan_read_model(&self, request: crate::read_model::ReadModelScanRequest)
-        -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_ {
+    fn scan_read_model(
+        &self,
+        request: crate::read_model::ReadModelScanRequest,
+    ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_
+    {
         self.model_store.scan_read_model(request)
     }
 
@@ -1086,5 +1149,98 @@ mod tests {
         assert!(!repo.inbox_contains("proj", "m1"));
         assert!(!repo.inbox_contains("proj", "m2"));
         assert_eq!(repo.clear_inbox(), 0);
+    }
+}
+
+/// Stores schedules; dispatches them once a schedule worker is attached
+/// (`with_schedule_worker`). The store clock is the injected
+/// [`Clock`](crate::Clock).
+impl crate::microsvc::BackendHost for InMemoryRepository {
+    fn capabilities(&self) -> crate::schedule::Capabilities {
+        crate::schedule::Capabilities {
+            scheduling: self.schedule_dispatch,
+            clock: true,
+        }
+    }
+
+    fn host_now(
+        &self,
+    ) -> impl Future<Output = Result<std::time::SystemTime, RepositoryError>> + Send + '_ {
+        std::future::ready(Ok(self.clock.now()))
+    }
+}
+
+#[cfg(feature = "graphql")]
+#[async_trait::async_trait]
+impl crate::schedule::worker::ScheduleSource for InMemoryRepository {
+    async fn schedule_now(&self) -> Result<std::time::SystemTime, RepositoryError> {
+        Ok(self.clock.now())
+    }
+
+    async fn claim_due_schedules(
+        &self,
+        now_ms: i64,
+        claim_until_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(StreamIdentity, crate::schedule::ArmedSchedule)>, RepositoryError> {
+        let mut storage = self
+            .schedules
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("schedule write"))?;
+        let mut claimed = Vec::new();
+        for (owner, table) in storage.values_mut() {
+            for schedule in table.claim_due(now_ms, claim_until_ms, limit) {
+                claimed.push((owner.clone(), schedule));
+            }
+        }
+        claimed.sort_by(|(a_owner, a), (b_owner, b)| {
+            (a.due_at_ms, a_owner.storage_key(), &a.name).cmp(&(
+                b.due_at_ms,
+                b_owner.storage_key(),
+                &b.name,
+            ))
+        });
+        // Claims beyond `limit` across owners go back unclaimed.
+        for (owner, schedule) in claimed.drain(limit.min(claimed.len())..) {
+            if let Some((_, table)) = storage.get_mut(&owner.storage_key()) {
+                table.release_claim(&schedule.name, schedule.generation);
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn settle_schedule(
+        &self,
+        owner: &StreamIdentity,
+        name: &str,
+        generation: u64,
+        settlement: &crate::schedule::ScheduleSettlement,
+    ) -> Result<(), RepositoryError> {
+        if let Some((_, table)) = self
+            .schedules
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("schedule write"))?
+            .get_mut(&owner.storage_key())
+        {
+            table.settle(name, generation, settlement);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "graphql")]
+impl InMemoryRepository {
+    /// Attach a schedule worker: the returned repository declares
+    /// [`Capability::Scheduling`](crate::schedule::Capability::Scheduling),
+    /// and the returned [`ScheduleWorker`](crate::schedule::worker::ScheduleWorker)
+    /// fires due schedules by the store clock once started with the
+    /// service's command host. Clones share the schedule table.
+    pub fn with_schedule_worker(
+        mut self,
+        config: crate::schedule::worker::ScheduleWorkerConfig,
+    ) -> (Self, crate::schedule::worker::ScheduleWorker) {
+        self.schedule_dispatch = true;
+        let worker = crate::schedule::worker::ScheduleWorker::new(self.clone(), config);
+        (self, worker)
     }
 }

@@ -1,11 +1,10 @@
 //! Cell-local execution of the ordinary SQL event/snapshot/receipt repository.
 //! No in-memory working copy and no whole-cell export are used here.
 //!
-//! Shared by both cell executors: Durable Object `storage.sql` on
-//! `workers-rs`/wasm32 and a synchronous rusqlite file on native
-//! `cell-sqlite`. Each executor supplies only `read` and a synchronous
-//! all-or-nothing `transaction`; schema bootstrap, the command commit, ledger
-//! fencing and outbox leases below are identical on both targets.
+//! Runs over Durable Object `storage.sql` (celld, `workers-rs`/wasm32): the
+//! executor supplies only `read` and a synchronous all-or-nothing
+//! `transaction`; schema bootstrap, the command commit, ledger fencing and
+//! outbox leases are below.
 
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
@@ -32,6 +31,8 @@ use crate::repository::{
 };
 use crate::snapshot::SnapshotRecord;
 
+use super::alarm::{ArmedSchedule, ScheduleSettlement};
+
 // Durable Object SQL limits bindings per statement, not per transaction.
 // Both shared insert planners split large commands within the same transaction.
 const MAX_SQL_BIND_PARAMS: usize = 100;
@@ -55,15 +56,10 @@ pub(super) fn finish_sql<T, E: From<RepositoryError>>(
     }
 }
 
-#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-use super::store::SealedRowReducer;
-
 #[derive(Clone)]
 pub(super) struct CellSqlRepository {
     connection: CellSqlConnection,
     identity: CausalStorageIdentity,
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    sealed_row_reducer: Option<SealedRowReducer>,
 }
 
 impl CellSqlRepository {
@@ -75,38 +71,6 @@ impl CellSqlRepository {
             connection,
             identity: CausalStorageIdentity::new(),
         })
-    }
-
-    /// Open one native cell file. The file is bound to `instance_name` on
-    /// first open; reopening it as another cell fails closed.
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    pub fn open(path: &std::path::Path, instance_name: &str) -> Result<Self, RepositoryError> {
-        let connection = CellSqlConnection::open(path)?;
-        Self::initialize(&connection)?;
-        connection
-            .transaction(|executor| finish_sql(native::bind_instance(executor, instance_name)))?;
-        Ok(Self {
-            connection,
-            identity: CausalStorageIdentity::new(),
-            sealed_row_reducer: None,
-        })
-    }
-
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    pub fn set_sealed_row_reducer(&mut self, reducer: SealedRowReducer) {
-        self.sealed_row_reducer = Some(reducer);
-    }
-
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    pub fn sealed_row(&self) -> Result<Option<serde_json::Value>, RepositoryError> {
-        self.connection
-            .read(|executor| finish_sql(native::sealed_row(executor)))
-    }
-
-    #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-    pub fn replace_sealed_row(&self, row: &serde_json::Value) -> Result<(), RepositoryError> {
-        self.connection
-            .transaction(|executor| finish_sql(native::write_sealed_row(executor, row)))
     }
 
     fn initialize(connection: &CellSqlConnection) -> Result<(), RepositoryError> {
@@ -156,6 +120,7 @@ impl CellSqlRepository {
             ));
         }
         let prepared = validate_commit_batch(&batch)?;
+        super::alarm::validate_schedule_writes(&batch.schedules)?;
         self.connection.transaction(|executor| {
             finish_sql(async {
                 if let Some(completion) = &completion {
@@ -201,19 +166,13 @@ impl CellSqlRepository {
                     let SnapshotWrite::Save { identity, record } = snapshot;
                     sql::save_snapshot(executor, identity, record).await?;
                 }
+                // Alarm rows join the same transaction: a failed command (or a
+                // lost ledger lease below) leaves no alarm armed.
+                if !batch.schedules.is_empty() {
+                    alarms::apply(executor, &batch.schedules).await?;
+                }
                 // Native sealed read-model row: same transaction, so a reducer
                 // error or lost ledger lease rolls the row back with the events.
-                #[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-                if let Some(reducer) = &self.sealed_row_reducer {
-                    if prepared.iter().any(|append| !append.events.is_empty()) {
-                        let current = native::sealed_row(executor).await?;
-                        if let Some(next) = reducer(current.as_ref(), &prepared)? {
-                            if current.as_ref() != Some(&next) {
-                                native::write_sealed_row(executor, &next).await?;
-                            }
-                        }
-                    }
-                }
                 // Same final fenced write as SQLx. A lost lease rolls back every
                 // participant, and entities are marked committed only afterwards.
                 if let Some(completion) = &completion {
@@ -226,6 +185,42 @@ impl CellSqlRepository {
             stream.entity.mark_committed();
         }
         Ok(())
+    }
+}
+
+impl CellSqlRepository {
+    /// Armed alarms, earliest first.
+    pub(super) fn armed_alarms(&self) -> Result<Vec<ArmedSchedule>, RepositoryError> {
+        self.connection
+            .read(|executor| finish_sql(alarms::armed(executor, None, usize::MAX)))
+    }
+
+    /// Armed alarms due at or before `now_ms`, earliest first.
+    pub(super) fn due_alarms(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ArmedSchedule>, RepositoryError> {
+        self.connection
+            .read(|executor| finish_sql(alarms::armed(executor, Some(now_ms), limit)))
+    }
+
+    /// Due time of the earliest armed alarm.
+    pub(super) fn next_alarm_due_ms(&self) -> Result<Option<i64>, RepositoryError> {
+        self.connection
+            .read(|executor| finish_sql(alarms::next_due(executor)))
+    }
+
+    /// Settle the fired generation of `name`; a newer arm is left untouched.
+    pub(super) fn settle_alarm(
+        &self,
+        name: &str,
+        generation: u64,
+        settlement: &ScheduleSettlement,
+    ) -> Result<(), RepositoryError> {
+        self.connection.transaction(|executor| {
+            finish_sql(alarms::settle(executor, name, generation, settlement))
+        })
     }
 }
 
@@ -429,89 +424,142 @@ impl CellSqlOutboxStore {
     }
 }
 
-/// Native-only cell metadata: the instance binding and the sealed row. Kept
-/// out of the shared migration inventory so Durable Object schemas (and their
-/// checksummed history) are unchanged by the native store.
-#[cfg(all(feature = "cell-sqlite", not(target_arch = "wasm32")))]
-mod native {
+/// Cell alarm rows (`cell_alarms`, migration 11). Shared by Durable Object and
+/// native SQLite cells; the reference host mirrors these semantics in memory.
+mod alarms {
     use super::*;
-    use serde_json::Value;
+    use crate::microsvc::cell_host::alarm::{ScheduleError, ScheduleWrite, MAX_ARMED_SCHEDULES};
 
-    const CREATE: &str = "CREATE TABLE IF NOT EXISTS __distributed_native_cell (id INTEGER PRIMARY KEY CHECK (id = 1), instance_name TEXT NOT NULL, sealed_row TEXT)";
+    const SELECT: &str =
+        "SELECT name, command, input, due_at_ms, generation, attempts FROM cell_alarms WHERE armed = 1";
 
-    pub(super) async fn bind_instance(
+    pub(super) async fn apply(
         executor: &mut impl SqlExecutor,
-        instance_name: &str,
+        writes: &[ScheduleWrite],
     ) -> Result<(), RepositoryError> {
-        executor.execute(Statement::new(CREATE)).await?;
-        let rows = executor
-            .query(Statement::new(
-                "SELECT instance_name FROM __distributed_native_cell WHERE id = 1",
-            ))
-            .await?;
-        match rows.first() {
-            Some(row) => {
-                let bound = row.text("instance_name")?;
-                if bound != instance_name {
-                    return Err(RepositoryError::Model(format!(
-                        "cell SQLite file belongs to `{bound}`, not `{instance_name}`"
-                    )));
+        for write in writes {
+            match write {
+                ScheduleWrite::Arm(alarm) => {
+                    let input = alarm.input_json()?;
+                    executor
+                        .execute(
+                            Statement::new("INSERT INTO cell_alarms (name, command, input, due_at_ms, generation, attempts, armed) VALUES (")
+                                .bind(alarm.name().into())
+                                .sql(", ")
+                                .bind(alarm.command().into())
+                                .sql(", ")
+                                .bind(input.as_str().into())
+                                .sql(", ")
+                                .bind(alarm.due_at_ms()?.into())
+                                .sql(", 1, 0, 1) ON CONFLICT (name) DO UPDATE SET command = excluded.command, input = excluded.input, due_at_ms = excluded.due_at_ms, generation = cell_alarms.generation + 1, attempts = 0, armed = 1"),
+                        )
+                        .await?;
+                }
+                ScheduleWrite::Cancel(name) => {
+                    executor
+                        .execute(
+                            Statement::new(
+                                "UPDATE cell_alarms SET armed = 0, attempts = 0 WHERE name = ",
+                            )
+                            .bind(name.as_str().into()),
+                        )
+                        .await?;
                 }
             }
-            None => {
-                executor
-                    .execute(
-                        Statement::new(
-                            "INSERT INTO __distributed_native_cell (id, instance_name) VALUES (1, ",
-                        )
-                        .bind(instance_name.into())
-                        .sql(")"),
-                    )
-                    .await?;
-            }
+        }
+        let rows = executor
+            .query(Statement::new(
+                "SELECT COUNT(*) AS armed FROM cell_alarms WHERE armed = 1",
+            ))
+            .await?;
+        let armed = rows
+            .first()
+            .map(|row| row.integer("armed"))
+            .transpose()?
+            .unwrap_or(0);
+        if armed > MAX_ARMED_SCHEDULES as i64 {
+            return Err(ScheduleError::TooManyArmed.into());
         }
         Ok(())
     }
 
-    pub(super) async fn sealed_row(
+    pub(super) async fn armed(
         executor: &mut impl SqlExecutor,
-    ) -> Result<Option<Value>, RepositoryError> {
-        let rows = executor
-            .query(Statement::new(
-                "SELECT sealed_row FROM __distributed_native_cell WHERE id = 1",
-            ))
-            .await?;
-        match rows
-            .first()
-            .map(|row| row.optional_text("sealed_row"))
-            .transpose()?
-            .flatten()
-        {
-            Some(json) => serde_json::from_str(&json).map(Some).map_err(|error| {
-                RepositoryError::Model(format!("cell sealed row is invalid JSON: {error}"))
-            }),
-            None => Ok(None),
+        due_by_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ArmedSchedule>, RepositoryError> {
+        let limit = (limit as u64).min(9_007_199_254_740_991) as i64;
+        let mut statement = Statement::new(SELECT);
+        if let Some(due_by_ms) = due_by_ms {
+            statement = statement.sql(" AND due_at_ms <= ").bind(due_by_ms.into());
         }
-    }
-
-    pub(super) async fn write_sealed_row(
-        executor: &mut impl SqlExecutor,
-        row: &Value,
-    ) -> Result<(), RepositoryError> {
-        let json = serde_json::to_string(row)
-            .map_err(|error| RepositoryError::Model(format!("cell sealed row: {error}")))?;
-        let written = executor
-            .execute(
-                Statement::new("UPDATE __distributed_native_cell SET sealed_row = ")
-                    .bind(json.as_str().into())
-                    .sql(" WHERE id = 1"),
+        let rows = executor
+            .query(
+                statement
+                    .sql(" ORDER BY due_at_ms, name LIMIT ")
+                    .bind(limit.into()),
             )
             .await?;
-        if written != 1 {
-            return Err(RepositoryError::Model(
-                "cell SQLite file has no instance binding".into(),
-            ));
-        }
+        rows.iter()
+            .map(|row| {
+                let input = row.text("input")?;
+                Ok(ArmedSchedule {
+                    name: row.text("name")?,
+                    command: row.text("command")?,
+                    input: serde_json::from_str(&input).map_err(|error| {
+                        RepositoryError::Model(format!("cell alarm input is invalid JSON: {error}"))
+                    })?,
+                    due_at_ms: row.integer("due_at_ms")?,
+                    generation: u64::try_from(row.integer("generation")?).map_err(|_| {
+                        RepositoryError::Model("cell alarm generation is negative".into())
+                    })?,
+                    attempts: u32::try_from(row.integer("attempts")?).unwrap_or(u32::MAX),
+                })
+            })
+            .collect()
+    }
+
+    pub(super) async fn next_due(
+        executor: &mut impl SqlExecutor,
+    ) -> Result<Option<i64>, RepositoryError> {
+        let rows = executor
+            .query(Statement::new(
+                "SELECT MIN(due_at_ms) AS due FROM cell_alarms WHERE armed = 1",
+            ))
+            .await?;
+        Ok(rows
+            .first()
+            .map(|row| row.optional_integer("due"))
+            .transpose()?
+            .flatten())
+    }
+
+    pub(super) async fn settle(
+        executor: &mut impl SqlExecutor,
+        name: &str,
+        generation: u64,
+        settlement: &ScheduleSettlement,
+    ) -> Result<(), RepositoryError> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| RepositoryError::Model("cell alarm generation overflow".into()))?;
+        let statement = match settlement {
+            ScheduleSettlement::Done => {
+                Statement::new("UPDATE cell_alarms SET armed = 0, attempts = 0 WHERE name = ")
+            }
+            ScheduleSettlement::Retry { due_at_ms } => {
+                Statement::new("UPDATE cell_alarms SET attempts = attempts + 1, due_at_ms = ")
+                    .bind((*due_at_ms).into())
+                    .sql(" WHERE name = ")
+            }
+        };
+        executor
+            .execute(
+                statement
+                    .bind(name.into())
+                    .sql(" AND armed = 1 AND generation = ")
+                    .bind(generation.into()),
+            )
+            .await?;
         Ok(())
     }
 }

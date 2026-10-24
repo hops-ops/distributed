@@ -85,6 +85,8 @@ function inspectPackageContract(packageJson) {
 		'./replica',
 		'./replica/lazy',
 		'./sveltekit',
+		'./sveltekit/game',
+		'./sveltekit/game/server',
 		'./sveltekit/vite'
 	]);
 	assert.equal(
@@ -582,6 +584,7 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
   'authFromPageData',
   'bindSveltekitOperation',
   'constant',
+  'createDistributedLeaderboardStore',
   'createDistributedSvelteKit',
   'createDistributedSvelteKitServer',
   'createPageDataSessionSource',
@@ -591,6 +594,7 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
   'defineGraphqlIslandBindings',
   'distributedReloadLifecycle',
   'forwardedProp',
+  'loadDistributedLeaderboard',
   'omitVariable',
   'parseDistributedGenerationEnvelope',
   'provideDistributedSvelteKitClient',
@@ -601,6 +605,7 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
   'searchParam',
   'sessionClaim',
   'sessionSourceFromPageData',
+  'useDistributedLeaderboard',
   'useDistributedSvelteKitClient',
   'useDistributedSvelteKitCommands',
   'validateDistributedReloadLocation',
@@ -608,12 +613,35 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
 ]);
 assert.deepEqual(Object.keys(sveltekitViteSurface).sort(), [
   'analyzeDistributedSvelteKitBoundaries',
+  'checkDistributedGames',
   'distributedGraphqlProxy',
   'distributedSvelteKit',
   'distributedSvelteKitAliases',
+  'generateDistributedGames',
   'validateDistributedSvelteKitBoundaryPlan'
 ]);
 assert.equal(typeof sveltekitViteSurface.distributedSvelteKit, 'function');
+const sveltekitGameSurface = await import('@hops-ops/distributed/sveltekit/game');
+assert.deepEqual(Object.keys(sveltekitGameSurface).sort(), [
+  'GameState',
+  'createGameState',
+  'gameTicketSource',
+  'useGame'
+]);
+const sveltekitGameServerSurface = await import('@hops-ops/distributed/sveltekit/game/server');
+assert.deepEqual(Object.keys(sveltekitGameServerSurface).sort(), [
+  'GAME_TICKET_RATE_LIMIT_SCRIPT',
+  'GameTicketRateLimiterUnavailable',
+  'MAX_GAME_TICKET_EXTENSION_BYTES',
+  'MAX_GAME_TICKET_TTL_SECONDS',
+  'MIN_GAME_TICKET_SECRET_BYTES',
+  'TRUSTED_FIELD_DENYLIST',
+  'checkGameTicketExtensions',
+  'createGameTicketHandler',
+  'createGameTicketRateLimiter',
+  'createRedisGameTicketRateLimiter',
+  'mintGameTicket'
+]);
 
 const pageData = createPageDataSessionSource({
   session: null,

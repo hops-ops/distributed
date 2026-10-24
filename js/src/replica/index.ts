@@ -38,6 +38,7 @@ export type {
 export { createReplicaGraphqlTransport } from './graphql-transport.js';
 export { createReplicaUuidV7 } from './command-id.js';
 export type {
+	ReplicaDocumentTransport,
 	ReplicaGraphqlTransport,
 	ReplicaGraphqlTransportOptions
 } from './graphql-transport.js';

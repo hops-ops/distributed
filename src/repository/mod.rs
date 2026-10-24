@@ -4,8 +4,7 @@ mod inbox;
 #[cfg(any(
     feature = "sqlite",
     feature = "postgres",
-    all(feature = "workers-rs", target_arch = "wasm32"),
-    all(feature = "cell-sqlite", not(target_arch = "wasm32"))
+    all(feature = "workers-rs", target_arch = "wasm32")
 ))]
 pub(crate) mod migrations;
 pub(crate) mod sql;

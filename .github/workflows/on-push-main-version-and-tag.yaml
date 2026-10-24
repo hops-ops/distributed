@@ -52,11 +52,14 @@ jobs:
   celld:
     uses: ./.github/workflows/integration-celld.yaml
 
+  wasm32-domains:
+    uses: ./.github/workflows/integration-wasm32-domains.yaml
+
   # This uses commit logs and tags from git to determine the next version number and create a tag for the release.
   # Some commits such as chore: will not trigger a version bump and tag; this is by design.
   version-and-tag:
     name: Version and Tag
-    needs: [quality, all-features, postgres, nats, rabbitmq, kafka, distributed-cli, observability, graphql, e2e-ui, js-client, celld]
+    needs: [quality, all-features, postgres, nats, rabbitmq, kafka, distributed-cli, observability, graphql, e2e-ui, js-client, celld, wasm32-domains]
     uses: unbounded-tech/workflow-vnext-tag/.github/workflows/workflow.yaml@v1.22.2
     secrets:
       DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}

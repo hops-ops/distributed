@@ -15,19 +15,35 @@ default = []
 # Tokio-driven fact worker (`spawn_fact_worker`). Core stays runtime-agnostic.
 runtime = ["dep:tokio"]
 # Adapter that commits facts into a `distributed` AggregateCell.
-cell = ["dep:distributed", "dep:sha2"]
+cell = ["dep:distributed", "dep:sha2", "dep:base64"]
+# `command_sink::CommandFactSink` over `CelldCommandHost` /
+# `LocalCommandHost` (a local service over any repository, or celld cells
+# over HTTP). The sink itself is portable (`cell`).
+command-host = ["cell", "distributed/graphql"]
+# celld clients: `CelldFactSink` (the command sink over a remote-only
+# `CelldCommandHost`), `CellZoneOwnership`, `CellZoneStateStore`.
+celld = ["cell", "command-host", "dep:reqwest", "dep:uuid"]
+# celld worker glue (wasm32 Durable Objects): `world::zone_state::celld_worker`,
+# the zone-state HTTP surface over a cell and an R2 bucket binding.
+workers-rs = ["cell", "dep:worker", "distributed/workers-rs"]
+# Zones as celld Durable Objects (wasm32): `celld_zone::ZoneObject`,
+# `CelldObjectHost` (facts object to object), `celld_zone_object!`.
+celld-zone = ["cell", "ticket", "workers-rs", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:futures-util"]
 # Per-zone Prometheus metrics (dependency-free text exposition).
 metrics = []
 # Load-test bots (library + `game-bots` binary).
 bots = ["net", "dep:tokio-tungstenite", "dep:futures-util", "tokio/rt-multi-thread"]
 # axum WebSocket zone server with signed-ticket admission (+ /metrics).
-net = ["runtime", "metrics", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros", "tokio/io-util"]
+# HMAC-signed admission tickets (`ticket`) without the axum server (the
+# celld zone host admits players with it).
+ticket = ["dep:hmac", "dep:sha2", "dep:base64"]
+net = ["runtime", "metrics", "ticket", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros", "tokio/io-util"]
 # `world::FencedLeaseOwnership`: zone ownership over `distributed::lease`.
 lease = ["dep:distributed"]
-# `world::SqliteZoneStateStore`: native SQLite hibernation snapshots.
-sqlite = ["dep:rusqlite"]
 
 [dependencies]
+distributed_game_macros = { version = "0.1.0", path = "../distributed_game_macros" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"], optional = true }
 distributed = { path = "..", default-features = false, optional = true }
@@ -37,9 +53,20 @@ sha2 = { version = "0.10", optional = true }
 base64 = { version = "0.23", optional = true }
 tokio-tungstenite = { version = "0.30", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
-rusqlite = { version = "0.39", features = ["bundled"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+uuid = { version = "1", features = ["v7"], optional = true }
+worker = { version = "0.8", optional = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [dev-dependencies]
+base64 = "0.23"
+# `tests/zone_status`: the read model projected by a consumer service over
+# a SQLite bus and read-model store.
+distributed = { path = "..", default-features = false, features = ["sqlite", "graphql"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+trybuild = "=1.0.120"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.30"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
@@ -66,6 +93,61 @@ path = "tests/net_e2e/main.rs"
 required-features = ["net"]
 
 [[test]]
+name = "zone_lease"
+path = "tests/zone_lease/main.rs"
+required-features = ["cell"]
+
+[[test]]
+name = "content_rollout"
+path = "tests/content_rollout/main.rs"
+required-features = ["cell"]
+
+[[test]]
+name = "zone_state"
+path = "tests/zone_state/main.rs"
+required-features = ["cell"]
+
+[[test]]
+name = "command_facts"
+path = "tests/command_facts/main.rs"
+required-features = ["command-host"]
+
+[[test]]
+name = "zone_status"
+path = "tests/zone_status/main.rs"
+required-features = ["cell"]
+
+[[test]]
+name = "celld_zone_lease"
+path = "tests/celld_zone_lease/main.rs"
+required-features = ["celld", "runtime", "net"]
+
+[[test]]
+name = "celld_zone_state"
+path = "tests/celld_zone_state/main.rs"
+required-features = ["celld", "runtime"]
+
+[[test]]
+name = "celld_facts"
+path = "tests/celld_facts/main.rs"
+required-features = ["celld", "runtime"]
+
+[[test]]
+name = "celld_zone"
+path = "tests/celld_zone/main.rs"
+required-features = ["celld", "net"]
+
+[[test]]
+name = "inbox"
+path = "tests/inbox/main.rs"
+required-features = ["net"]
+
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle/main.rs"
+required-features = ["runtime"]
+
+[[test]]
 name = "cell_sink"
 path = "tests/cell_sink/main.rs"
 required-features = ["cell", "runtime"]
@@ -73,7 +155,7 @@ required-features = ["cell", "runtime"]
 [[test]]
 name = "world"
 path = "tests/world/main.rs"
-required-features = ["net", "lease", "sqlite"]
+required-features = ["net", "lease", "celld"]
 
 [[example]]
 name = "echo_arena"

@@ -11,6 +11,10 @@ use std::fmt;
 /// Largest `string`/`bytes` length accepted by decoders (1 MiB).
 pub const MAX_BLOB_LEN: usize = 1 << 20;
 
+/// Largest value [`Writer::varuint64`] / [`Reader::varuint64`] carry:
+/// `2^53 - 1`, the largest integer a JavaScript `number` holds exactly.
+pub const MAX_SAFE_U64: u64 = (1 << 53) - 1;
+
 /// Decoding failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
@@ -96,6 +100,22 @@ impl Writer {
 
     /// Unsigned LEB128 (max 5 bytes).
     pub fn varuint(&mut self, mut v: u32) -> &mut Self {
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                self.buf.push(byte);
+                return self;
+            }
+            self.buf.push(byte | 0x80);
+        }
+    }
+
+    /// Unsigned LEB128 of a `u64`, saturated to [`MAX_SAFE_U64`] so a
+    /// JavaScript `number` decodes it exactly. Only typed game payloads
+    /// ([`codec`](crate::codec)) use it; no protocol message does.
+    pub fn varuint64(&mut self, v: u64) -> &mut Self {
+        let mut v = v.min(MAX_SAFE_U64);
         loop {
             let byte = (v & 0x7f) as u8;
             v >>= 7;
@@ -202,6 +222,23 @@ impl<'a> Reader<'a> {
             }
             value |= u32::from(byte & 0x7f) << (7 * index);
             if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(DecodeError::VarintOverflow)
+    }
+
+    /// Unsigned LEB128 up to [`MAX_SAFE_U64`] (`2^53 - 1`, exact in a
+    /// JavaScript `number`); longer or non-minimal-overflowing input is an error.
+    pub fn varuint64(&mut self) -> Result<u64, DecodeError> {
+        let mut value: u64 = 0;
+        for index in 0..8 {
+            let byte = self.u8()?;
+            value |= u64::from(byte & 0x7f) << (7 * index);
+            if byte & 0x80 == 0 {
+                if value > MAX_SAFE_U64 {
+                    return Err(DecodeError::VarintOverflow);
+                }
                 return Ok(value);
             }
         }

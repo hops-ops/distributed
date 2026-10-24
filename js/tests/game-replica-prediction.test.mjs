@@ -102,6 +102,20 @@ test('prediction replays unacked inputs over authoritative state', () => {
 	assert.deepEqual(predictor.pending.map((p) => p.seq), [4, 5]);
 });
 
+test('inputs recorded before the entity is known are replayed when it binds', () => {
+	const predictor = new Predictor({ predict: moverPredict });
+	predictor.bind(7);
+	predictor.record(1, 10, 100);
+	predictor.record(2, 10, 100);
+	assert.equal(predictor.active, false);
+	predictor.bind(7, ARENA_SCHEMA.byId.get(1), { x: 0, y: 0, yaw: 0, hp: 100, name: 'p' });
+	close(predictor.predicted().x, 2, 1e-9, 'both replayed');
+	// Another entity: the inputs were not its.
+	predictor.bind(8, ARENA_SCHEMA.byId.get(1), { x: 0, y: 0, yaw: 0, hp: 100, name: 'p' });
+	close(predictor.predicted().x, 0, 1e-9);
+	assert.deepEqual(predictor.pending, []);
+});
+
 test('ease blends the divergence out over time while snap jumps', () => {
 	const authoritative = { x: 1, y: 0, yaw: 0, hp: 80, name: 'p' }; // server hit a wall
 	const eased = boundPredictor({ mode: 'ease', durationMs: 200 });
@@ -128,6 +142,25 @@ test('ease blends the divergence out over time while snap jumps', () => {
 	assert.equal(ce.resolved.hp, 'replace');
 });
 
+test('ease with snapAbove: a small error eases, a teleport cuts', () => {
+	const near = boundPredictor({ mode: 'ease', durationMs: 200, snapAbove: 3 });
+	const far = boundPredictor({ mode: 'ease', durationMs: 200, snapAbove: 3 });
+	for (const p of [near, far]) {
+		for (let seq = 1; seq <= 4; seq += 1) p.record(seq, 10, 100);
+	}
+	// Shown 4. A wall (rebased 2: error 2) eases; a respawn at -10 (rebased
+	// -9: error 13) cuts at once.
+	const cn = near.reconcile(3, { x: 1, y: 0, yaw: 0, hp: 100, name: 'p' }, 1000);
+	const cf = far.reconcile(3, { x: -10, y: 0, yaw: 0, hp: 100, name: 'p' }, 1000);
+	assert.equal(cn.resolved.x, 'ease');
+	close(near.current(1000).x, 4, 1e-9, 'small: eased from what was shown');
+	assert.equal(cf.resolved.x, 'snap');
+	close(cf.errors.x, 13, 1e-9);
+	close(far.current(1000).x, -9, 1e-9, 'teleport: shown at once, no slide');
+	assert.equal(far.current(1000).hp, 100);
+	assert.deepEqual(far.visualError(1000), {});
+});
+
 test('a new correction while easing starts from the currently displayed value', () => {
 	const p = boundPredictor({ mode: 'ease', durationMs: 100 });
 	p.record(1, 10, 1000); // predicted x = 10
@@ -137,4 +170,44 @@ test('a new correction while easing starts from the currently displayed value', 
 	p.reconcile(1, { x: 0, y: 0, yaw: 0, hp: 100, name: 'p' }, 50); // server corrects again
 	close(p.current(50).x, 7, 1e-9, 'no visual pop');
 	close(p.current(150).x, 0, 1e-9);
+});
+
+test('a step recorded with its time is drawn as motion over its interval', () => {
+	const p = boundPredictor({ mode: 'ease', durationMs: 100 });
+	p.record(1, 10, 100, 0); // predicted x = 1, drawn from 0 over 100 ms
+	close(p.predicted().x, 1, 1e-9);
+	close(p.current(0).x, 0, 1e-9);
+	close(p.current(50).x, 0.5, 1e-9);
+	close(p.current(100).x, 1, 1e-9);
+	close(p.current(500).x, 1, 1e-9, 'holds the prediction past the interval');
+	p.record(2, 10, 100, 100);
+	close(p.current(100).x, 1, 1e-9, 'no pop at the next step');
+	close(p.current(150).x, 1.5, 1e-9);
+	// Without a time the prediction is drawn as is (no blend).
+	const plain = boundPredictor({ mode: 'ease', durationMs: 100 });
+	plain.record(1, 10, 100);
+	close(plain.current(0).x, 1, 1e-9);
+});
+
+test('a Delta mid-step keeps the motion going', () => {
+	const p = boundPredictor({ mode: 'ease', durationMs: 100 });
+	p.record(1, 10, 100, 0);
+	p.record(2, 10, 100, 100); // predicted 2, drawn from 1 over 100..200
+	const agree = p.reconcile(1, { x: 1, y: 0, yaw: 0, hp: 100, name: 'p' }, 150);
+	assert.deepEqual(agree.errors, {});
+	close(p.current(150).x, 1.5, 1e-9, 'no stall or pop');
+	close(p.current(175).x, 1.75, 1e-9, 'still moving at the step rate');
+	close(p.current(200).x, 2, 1e-9);
+});
+
+test('a correction mid-step eases only the error, not the motion', () => {
+	const p = boundPredictor({ mode: 'ease', durationMs: 100 });
+	p.record(1, 10, 100, 0);
+	p.record(2, 10, 100, 100);
+	// Server: x 0.8 after input 1, so the prediction becomes 1.8.
+	const c = p.reconcile(1, { x: 0.8, y: 0, yaw: 0, hp: 100, name: 'p' }, 150);
+	close(c.errors.x, 0.2, 1e-9);
+	close(p.current(150).x, 1.5, 1e-9, 'no visual pop');
+	close(p.current(200).x, 1.9, 1e-9, 'motion done, half the error left');
+	close(p.current(250).x, 1.8, 1e-9);
 });

@@ -102,3 +102,47 @@ projection stopped or provide a server ordering signal.
 This is a breaking v5 protocol change: `mode` replaces the ambiguous `supported`
 boolean. Upgrade server and generated-client runtime together. Old or unknown
 wire forms fail closed; applications do not need a polling or reload workaround.
+
+## Leaderboard roots
+
+Sorted-set leaderboards (`distributed::leaderboard`, Redis with the `redis`
+feature) are exposed through the same surface by
+`GraphqlEngineBuilder::leaderboard(LeaderboardSurface, store)`. For a surface
+named `xp`, a role's grant (`LeaderboardGrant`) selects the roots:
+`xpLeaderboard(first)`, `xpLeaderboardAround(radius)`, `xpMyRank` and, only
+with `rank_any_member`, `xpRank(member)`. A board family
+(`LeaderboardSurface::family`) adds `board: String!` to each. The viewer
+roots take the member from the verified session claim (default `x-user-id`,
+`LeaderboardSurface::member_claim`), never from an argument, and fail with
+`FORBIDDEN` when the claim is absent. The same declaration feeds the static
+SDL, the client manifest (`leaderboards`, omitted when empty so other
+manifests and fingerprints are unchanged) and the generated
+`leaderboards.ts` (typed documents and `@live` subscription documents).
+
+`xpLeaderboard`, `xpLeaderboardAround` and `xpMyRank` are also subscription
+roots. They re-execute when the board's change key
+(`leaderboard:{board}`) is published, which
+`GraphqlEngine::leaderboard_change_listener` does when registered on the
+`LeaderboardProjector` that writes the board (applied changes and rebuild
+promotions; duplicates are silent). Pushes are hash-gated like SQL live
+queries, and a failed execution is terminal. With the causal protocol on,
+a leaderboard result carries an incomplete snapshot
+(`recordsComplete: false`, `indexesComparable: false`) and live frames use
+`snapshot` mode with `reset: true`: leaderboard rows are never normalized
+into the replica cache or resumed from cursors.
+
+The listener is in-process. When the projector runs in another process
+(a zone server projecting kills into Redis while a GraphQL service serves
+the same boards), the change goes over the application's bus:
+
+- the projector's process registers `LeaderboardChangePublisher::listener()`
+  (feature `leaderboard-background`), which publishes a
+  `distributed.leaderboard.changed` event (`{ "board": "<name>" }`) per
+  changed board, coalescing bursts and retrying until the bus accepts it;
+- the GraphQL process runs `engine.leaderboard_change_handlers(group)` with
+  `bus.subscribe(..)` under a consumer group of its own, so every GraphQL
+  process receives every notice and republishes `leaderboard:{board}` on
+  its `ChangeHub`.
+
+A notice only names the board; the subscriber re-reads its store, so
+duplicate or replayed notices push nothing new.

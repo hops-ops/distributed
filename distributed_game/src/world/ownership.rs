@@ -67,16 +67,44 @@ pub trait ZoneOwnership: Send + Sync + 'static {
 }
 
 /// Process-local ownership without TTLs (single host / tests). Tokens are
-/// monotonic per zone and survive release.
-#[derive(Debug, Default)]
+/// monotonic per zone, survive release and **keep increasing across process
+/// restarts**: the first token of every zone is the instance's epoch (Unix
+/// time in microseconds at creation), so a restarted host's claims outrank
+/// snapshots its previous run saved in a durable
+/// [`ZoneStateStore`](super::ZoneStateStore).
+#[derive(Debug)]
 pub struct LocalOwnership {
+    epoch: u64,
     claims: Mutex<HashMap<String, (Option<String>, u64)>>,
 }
 
+impl Default for LocalOwnership {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalOwnership {
-    /// Empty.
+    /// Empty, epoch = now (Unix microseconds).
     pub fn new() -> Self {
-        Self::default()
+        let micros = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(1, |d| d.as_micros() as u64);
+        Self::with_epoch(micros)
+    }
+
+    /// Empty with an explicit epoch (first token of every zone; must exceed
+    /// every token a previous run used with the same state store).
+    pub fn with_epoch(epoch: u64) -> Self {
+        Self {
+            epoch: epoch.max(1),
+            claims: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// First token handed out for each zone.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 }
 
@@ -97,7 +125,7 @@ impl ZoneOwnership for LocalOwnership {
                 Some(_) => Ok(entry.1),
                 None => {
                     entry.0 = Some(holder.to_string());
-                    entry.1 += 1;
+                    entry.1 = (entry.1 + 1).max(self.epoch);
                     Ok(entry.1)
                 }
             }
@@ -239,6 +267,60 @@ where
     }
 }
 
+/// Behaviour every [`ZoneOwnership`] must show (exclusive claims, `Held`,
+/// idempotent re-acquire, `Lost` after release, strictly increasing
+/// fencing tokens). `zone_id` must be unused. Panics on a violation.
+#[doc(hidden)]
+pub async fn ownership_conformance(ownership: &dyn ZoneOwnership, zone_id: &str) {
+    let ttl = Duration::from_secs(30);
+    let first = ownership
+        .acquire(zone_id, "h1#1", ttl)
+        .await
+        .expect("first acquire");
+    assert_eq!(first.zone_id, zone_id);
+    assert_eq!(first.holder, "h1#1");
+    assert_eq!(
+        ownership.acquire(zone_id, "h2#1", ttl).await,
+        Err(OwnershipError::Held {
+            holder: "h1#1".into()
+        }),
+        "a live claim is exclusive"
+    );
+    let again = ownership
+        .acquire(zone_id, "h1#1", ttl)
+        .await
+        .expect("re-acquire");
+    assert_eq!(
+        again.token, first.token,
+        "the holder gets its own claim back"
+    );
+    let renewed = ownership.renew(&first, ttl).await.expect("renew");
+    assert_eq!(renewed.token, first.token, "renewal keeps the token");
+    ownership.release(&first).await;
+    assert_eq!(
+        ownership.renew(&first, ttl).await,
+        Err(OwnershipError::Lost),
+        "a released claim is lost"
+    );
+    let second = ownership
+        .acquire(zone_id, "h2#1", ttl)
+        .await
+        .expect("second acquire");
+    assert!(second.token > first.token, "tokens strictly increase");
+    assert_eq!(
+        ownership.renew(&first, ttl).await,
+        Err(OwnershipError::Lost),
+        "an old claim stays lost"
+    );
+    ownership.release(&second).await;
+    let third = ownership
+        .acquire(zone_id, "h1#2", ttl)
+        .await
+        .expect("third acquire");
+    assert!(third.token > second.token, "tokens survive release");
+    ownership.release(&third).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +352,23 @@ mod tests {
         assert_eq!(block(own.renew(&a, ttl)), Err(OwnershipError::Lost));
         let b = block(own.acquire("z", "h2#1", ttl)).unwrap();
         assert!(b.token > a.token);
+    }
+
+    #[test]
+    fn local_ownership_passes_the_conformance_suite() {
+        block(ownership_conformance(&LocalOwnership::new(), "conformance"));
+    }
+
+    #[test]
+    fn local_tokens_outrank_a_previous_process() {
+        let ttl = Duration::from_secs(1);
+        let before = LocalOwnership::with_epoch(100);
+        let old = block(before.acquire("z", "h#1", ttl)).unwrap();
+        assert_eq!(old.token, 100);
+        // A restarted process starts from a later epoch.
+        let after = LocalOwnership::new();
+        let new = block(after.acquire("z", "h#1", ttl)).unwrap();
+        assert!(new.token > old.token);
+        assert_eq!(new.token, after.epoch());
     }
 }

@@ -373,9 +373,28 @@ perform online shadow swaps, or make several independent projections one
 transaction. Keep services stopped if a multi-projection maintenance run fails;
 capture fresh inventories and rerun before resuming them.
 
-Handlers stay thin: most Todo commands are `portable_command!` — shard,
-invoke one domain method, commit Eventual. `todo.create` keeps a `handle:`
-escape hatch when the body needs extra checks.
+Handlers stay thin. The shortest form is the command on the aggregate
+method itself: `#[command]` inside the `#[sourced]` impl generates the
+handler and the portable mount (see [Command contracts](#command-contracts)):
+
+```rust,ignore
+#[command(
+    "todo.complete",
+    shard = todo_id,
+    load = required,
+    input = TodoCompleteInput,
+    outcome = Eventual<TodoStatusPayload>,
+    payload = TodoStatusPayload::from_todo,
+    roles = ["user", "admin"],
+    field = "todos_complete",
+)]
+pub fn complete(&mut self, #[principal] owner_id: &str) -> Result<(), TodoError> { .. }
+```
+
+The Todo playground spells the same registration out with
+`portable_command!` — shard, invoke one domain method, commit Eventual.
+`todo.create` keeps a `handle:` escape hatch when the body needs extra
+checks.
 
 ```rust,ignore
 portable_command! {
@@ -544,6 +563,18 @@ that scope the client replica.
 
 ---
 
+## Multiplayer games
+
+`distributed_game` adds a server-authoritative realtime engine on top of
+this framework: zones that tick at a fixed rate, binary delta replication
+with interest management, client prediction (`@hops-ops/distributed/game`),
+outcomes saved as idempotent commands on cells without ever pausing the
+game, and zones spread across servers with handoff, hibernation and live
+content updates. Start with **[`distributed_game/README.md`](distributed_game/README.md)**;
+eight runnable demos are in [`examples/game`](examples/game/README.md).
+
+---
+
 ## See it run
 
 ### e2e-ui playground (`tests/e2e-ui`)
@@ -593,7 +624,7 @@ Start here in the code:
 | [`ui/src/lib/components/blob/SelectedBlobGame.graphql`](tests/e2e-ui/ui/src/lib/components/blob/SelectedBlobGame.graphql) | Reusable component island promoted to the nearest static route boundary; one route-param binding drives SSR and component reads. |
 | [`ui/src/routes/blob/[[gameId]]/+page.svelte`](tests/e2e-ui/ui/src/routes/blob/[[gameId]]/+page.svelte) | Arrow keys → `commands.blob.move`; board from `BlobGames.use()`. |
 | [`crates/service/src/modules/compose.rs`](tests/e2e-ui/crates/service/src/modules/compose.rs) | One `Service` lists modules. No `Runtime::role`. |
-| [`crates/service/src/handlers/commands/blob_move.rs`](tests/e2e-ui/crates/service/src/handlers/commands/blob_move.rs) | `PreparedCommand<Atomic<BlobGameView>>` — map/score written with the event. |
+| [`crates/blob-domain/src/commands/move_dir.rs`](tests/e2e-ui/crates/blob-domain/src/commands/move_dir.rs) | `portable_command!` returning `Atomic<BlobGames>`: the map/score row commits with the event, and a WASM pure previews the move. |
 | [`crates/todo-domain/src/models/todo.rs`](tests/e2e-ui/crates/todo-domain/src/models/todo.rs) | Plain aggregate — no GraphQL in the domain. |
 | [`ui/src/auth.ts`](tests/e2e-ui/ui/src/auth.ts) | Auth.js + Zitadel scopes/groups → engine roles. |
 
@@ -704,7 +735,18 @@ network servers.
 | `nats` | No | `NatsBus` (NATS JetStream source/publisher). |
 | `rabbitmq` | No | `RabbitBus` (RabbitMQ source/publisher). |
 | `kafka` | No | `KafkaBus` (Kafka source/publisher). |
-| `redis` | No | `leaderboard::RedisLeaderboard` (sorted-set leaderboards, `BackgroundLeaderboard`) and `bus::RedisStreamPublisher` (Redis Streams `XADD`, id dedupe). The `leaderboard` module and `InMemoryLeaderboard` are always available. |
+| `redis` | No | `leaderboard::RedisLeaderboard` (sorted-set leaderboards) and `bus::RedisStreamPublisher` (Redis Streams `XADD`, id dedupe); implies `leaderboard-background`. The `leaderboard` module and `InMemoryLeaderboard` are always available. |
+| `leaderboard-background` | No | `leaderboard::BackgroundLeaderboard` (fire-and-forget updates on a Tokio task) over any `LeaderboardStore`, e.g. `InMemoryLeaderboard`, without pulling in Redis. |
+| `metrics` | No | `distributed::metrics`: framework counters and gauges with Prometheus text exposition (no SDK dependency); with `http`, a scrape handler. Bus receive loops record into it. |
+| `otel` | No | OpenTelemetry tracing spans for bus receive loops and `microsvc` dispatch/handlers (`opentelemetry`, `tracing-opentelemetry`). |
+| `workers-rs` | No | Cloudflare `worker` crate bindings for celld cells: the aggregate cell host and the celld Queue publisher/relay (`bus::CelldQueue*`) on `wasm32`. |
+| `application-runtime` (alias `runtime`) | No | Checked by `#[command]`/`portable_command!` output in the **declaring** crate: enable it in that crate's features to emit the runtime mounts (`*_mount`, `register_*`, `CommandDefinition`). Contract-only packages leave it off. |
+| `gateway` | No | `distributed::gateway`: portable gateway declarations (bindings, routes, dispatch). Starts no listeners. |
+| `gateway-native` | No | Native HTTP gateway adapter (hyper/tower), independent of GraphQL and SQL. |
+| `gateway-graphql` | No | Whole-operation GraphQL selection for the gateway (parser only). |
+| `gateway-delivery` | No | Portable identity, freshness and delivery contracts (snapshots, coalescing, live sharing). |
+| `gateway-graphql-native` | No | Native GraphQL execution behind the gateway, including WebSocket `@live` (implies `gateway-native`, `gateway-graphql`, `graphql`). |
+| `gateway-worker` | No | workers-rs gateway ingress and delivery contracts, without native executors. |
 
 > The `InMemoryBus`, `PostgresBus`, and `SqliteBus` need no separate broker
 > feature. SQL-backed bus support comes from the matching `postgres` or `sqlite`
@@ -784,7 +826,7 @@ Every infrastructure concern in `distributed` follows the same pattern: a **trai
 | Read model rows | `ReadModelWritePlanStore` + `RelationalReadModelQueryStore` | `InMemoryReadModelStore` | Postgres, SQLite |
 | Snapshot store | `SnapshotStore` | `InMemorySnapshotStore` | Postgres, SQLite, … |
 | Outbox publishing | `OutboxStore` + async `MessagePublisher` | `InMemoryRepository` outbox store (dev/test) | Any `MessagePublisher` (e.g. `BusPublisher` over a real `Bus`) |
-| Locking | `Lock` + `LockManager` | `InMemoryLockManager` | `PostgresLockManager`, `SqliteLockManager` (durable leases), Redis, … |
+| Locking | `Lock` + `LockManager` | `InMemoryLockManager` | `PostgresLockManager`, `SqliteLockManager` (durable leases); implement the traits for anything else |
 
 All in-memory defaults are `Clone` and `Send + Sync`, so they work in single-task tests and multi-task servers alike. When you're ready for production, implement the trait for your infrastructure and plug it in — handler code does not change.
 
@@ -1590,7 +1632,64 @@ run_source(service, source, RunOptions::idempotent()).await?;
 
 ## Command contracts
 
-Command semantics live in `distributed::command`, independently of the query
+**Commands on the aggregate.** Most commands are one aggregate method:
+take the actor from the session, load (or create) the aggregate, call the
+method, reject on its error, commit with a payload. Write the method and
+mark it `#[command]` inside the `#[sourced]` impl; the macro generates the
+handler and the portable mount (`pub struct RecordKill`, mounted with
+`routes.mount(RecordKill)` or `AggregateCell::mount(RecordKill)`):
+
+```rust,ignore
+#[sourced(entity, aggregate_type = "Crawler", events = "CrawlerEvent", domain_state = CrawlerState)]
+impl Crawler {
+    #[command("crawler.record_kill", shard = principal, load = or_create, outcome = succeeded)]
+    pub fn record_kill(
+        &mut self,
+        #[principal] principal: &str,
+        input: RecordKillInput,
+    ) -> Result<KillReceipt, String> {
+        let xp = xp_for_tier(input.tier).ok_or("unknown tier")?;
+        self.mob_killed(principal.into(), input.name, input.mob, input.tier, xp)
+            .map_err(|e| e.to_string())?;
+        // Receipt helper: the recorded event's stream position and time.
+        let recorded = self.entity.last_recorded().ok_or("nothing recorded")?;
+        Ok(KillReceipt { sequence: recorded.sequence, at_ms: recorded.unix_ms(), .. })
+    }
+
+    #[event("crawler.mob_killed", version = 1, domain)]
+    fn mob_killed(&mut self, id: String, name: String, mob: String, tier: u8, xp: u32) { .. }
+}
+```
+
+- **Principal.** Exactly one parameter is `#[principal]` (`&str` or
+  `String`); the generated handler fills it from the verified session
+  (`x-user-id`, else `Unauthorized`), never from the input. It is
+  mandatory, and an input whose field (Rust or serialized name) is named
+  like it does not compile.
+- **Input.** The other parameter is the `CommandInput` type; or, with
+  `input = Type`, the other parameters are that input's fields by name
+  (`&str` parameters borrow), so a domain method keeps plain arguments.
+- **`shard`** is an input field (also exposed as `RecordKill::shard`) or
+  the principal parameter; **`load`** is `required` (`NotFound` when
+  missing), `or_create` or `create`.
+- **`outcome`** is `succeeded` / `eventual` (the method's `Ok` value is
+  the payload) or `Succeeded<P>` / `Eventual<P>` with `payload = f`
+  (`fn(&Aggregate) -> P`). The method's error (`Display`) becomes
+  `Rejected`. Captured domain events are always published with the commit.
+- Optional: `roles = ["player"]`, `guard = f`, `field = "graphql_field"`,
+  `transition = path` (the emitted-event witness; by default the
+  `domain_commands::*` type `#[sourced]` derives for the method),
+  `mount = Name` (the struct name, default from the command name's last
+  segment).
+
+The generated registration is exactly the hand-written one
+(`command_transition::<domain_commands::X, I, K>(name)` + `field_name`,
+`roles`, `guarded`/`handle`): the command specs, GraphQL SDL and client
+manifest are identical (`tests/aggregate_command`). For unusual bodies write
+the handler and register it with `portable_command! { .., handle: f }` or
+the builder below.
+
+**Contracts.** Command semantics live in `distributed::command`, independently of the query
 transport. Use `CommandInput` and `CommandOutput` to describe Serde input/output
 shapes, and `command::{typed_command, Succeeded, Eventual, Atomic, PreparedCommand}`
 to declare and prepare commands. The GraphQL adapter derives its surface from
@@ -2691,30 +2790,59 @@ reference: [`distributed_cli/README.md`](distributed_cli/README.md).
 
 ```text
 src/
-  aggregate/      # Aggregate trait, hydration, async aggregate repository helpers
-  bus/            # Bus facade + adapters (in-memory, sqlite, postgres, nats, rabbitmq, kafka, knative)
-  commit_builder/ # Transactional batches for aggregates, outbox, and read models
-  emitter/        # In-process event emitter helpers (feature = "emitter")
-  entity/         # Entity, event records, metadata, upcasting codecs
-  graphql/        # Query service: engine, permissions, identity, SDL, HTTP/WS (feature = "graphql")
-  in_memory_repo/   # In-memory repository (implements every async trait)
-  lock/           # Lock + lock manager traits, in-memory locks
-  microsvc/       # Command/event handler framework: service, context, session
-  outbox/         # Durable outbox message + commit extension
-  outbox_worker/  # Outbox claiming, publishing, workers
-  postgres_repo/  # Postgres async SQL repository (feature = "postgres")
-  queued_repo/    # Queue-based locking repository wrapper
-  read_model/     # Read model store traits, in-memory store, schema metadata
-  snapshot/       # Snapshot store traits, in-memory store, snapshot repository
-  sqlite_repo/    # SQLite async SQL repository (feature = "sqlite")
-  table/          # Neutral table/row primitives shared by read models and ops tables
-  lib.rs          # Public exports
-distributed_macros/
-  src/            # Proc macros: sourced, digest, aggregate, enqueue, ReadModel, Snapshot
-js/               # @hops-ops/distributed JS/TS client, command runtime, and SvelteKit adapter
-tests/e2e-ui/     # Full-stack CQRS + GraphQL + SvelteKit template (nested workspace)
-migrations/       # Explicit SQLite and Postgres migrations
-compose.yaml      # Local postgres / rabbitmq / kafka / nats for integration tests
+  aggregate/          # Aggregate trait, hydration, async aggregate repository helpers
+  application/        # Placement-independent application composition (modules, mounts, plans)
+  bus/                # Bus facade + adapters (in-memory, sqlite, postgres, nats, rabbitmq,
+                      #   kafka, knative, redis streams, celld Queue relay)
+  clock.rs            # Injectable wall clock for coordination primitives
+  command/            # Typed commands: Eventual/Atomic/Succeeded, prepared completions, client effects
+  command_dispatch/   # CommandHost: local, HTTP and remote dispatch boundary
+  command_ledger/     # Durable command identity and fenced commit primitives (crate-private)
+  commit_builder/     # Transactional batches for aggregates, outbox, and read models
+  domain_event/       # Typed outward domain events, separate from replay bytes
+  emitter/            # In-process event emitter helpers (feature = "emitter")
+  entity/             # Entity, event records, metadata, upcasting codecs
+  gateway/            # Portable application gateway contracts (feature = "gateway*")
+  graphql/            # Query service: engine, permissions, identity, SDL, HTTP/WS (feature = "graphql")
+  in_memory_repo/     # In-memory repository (implements every async trait)
+  leaderboard/        # Sorted-set leaderboards as a rebuildable projection target (memory, Redis)
+  lease/              # TTL leases with monotonic fencing tokens
+  lock/               # Lock + lock manager traits, in-memory locks
+  metrics/            # Prometheus-compatible framework metrics (feature = "metrics")
+  microsvc/           # Command/event handler framework: service, context, session, cell_host (celld)
+  mutation/           # Event-independent read-model mutation IR and interpreters
+  outbox/             # Durable outbox message + commit extension
+  outbox_worker/      # Outbox claiming, publishing, workers
+  postgres_repo/      # Postgres async SQL repository (feature = "postgres")
+  projection/         # Deterministic domain-event projection programs and runtime
+  projection_protocol/ # Projection identities, ordering vocabulary, codecs (+ projection_protocol.rs)
+  queued_repo/        # Queue-based locking repository wrapper
+  read_model/         # Read model store traits, in-memory store, schema metadata, keyset scans
+  repository/         # Repository traits (GetStream, TransactionalCommit, …)
+  saga/               # Event-sourced process managers for cross-cell workflows (incl. fan-out)
+  schedule.rs         # Portable aggregate schedules, host clock, backend capabilities
+  snapshot/           # Snapshot store traits, in-memory store, snapshot repository
+  sqlite_repo/        # SQLite async SQL repository (feature = "sqlite")
+  sqlx_repo/          # SQL code shared by the Postgres and SQLite repositories
+  table/              # Neutral table/row primitives shared by read models and ops tables
+  telemetry.rs        # Telemetry vocabulary shared by metrics and tracing
+  time.rs             # Wall clock that also works on wasm32
+  trace_context.rs    # W3C trace-context metadata helpers
+  lib.rs              # Public exports
+distributed_macros/   # Proc macros: sourced, digest, aggregate, enqueue, command, portable_command,
+                      #   module, application, mutation!, ReadModel, Snapshot, DomainState,
+                      #   DomainEvent, CommandInput, CommandOutput (projection! is in src/lib.rs)
+distributed_cli/      # The `distributed` CLI (build/dev lifecycle, client codegen, contracts
+                      #   check/accept, game-manifest/game-client/game-wasm); also a library
+distributed_game/     # Authoritative multiplayer zone runtime: fixed tick, facts, replication,
+                      #   WebSocket net, celld cells (zone lease/state, fact sink)
+distributed_game_macros/ # Derives for distributed_game: Replicated, GameInput, GameEvent, …
+js/                   # @hops-ops/distributed JS/TS client, command runtime, SvelteKit adapter, game SDK
+examples/             # graphiql.rs, and examples/game (game demos + SvelteKit Mob Pit; own workspace)
+tests/e2e-ui/         # Full-stack CQRS + GraphQL + SvelteKit template (nested workspace)
+tests/e2e-celld/      # The same UI with commands on celld cells and NATS (nested workspace)
+migrations/           # Explicit SQLite and Postgres migrations
+compose.yaml          # Local postgres / rabbitmq / kafka / nats / redis for integration tests
 ```
 
 ## Running Tests
@@ -2779,7 +2907,7 @@ e2e-celld (`tests/e2e-celld`), Blob game, live chat, GraphiQL.
 | `tests/graphql_*` | Engine, HTTP/WS, harden, identity, multi-IdP OIDC |
 | `tests/typed_commands/` | Eventual / `Atomic` / `Succeeded` command registration |
 | `tests/microsvc/` | Handlers on HTTP, gRPC, bus, session |
-| `tests/read_models/`, `tests/distributed_read_model/` | Atomic vs eventual projections |
+| `tests/read_model_*/`, `tests/distributed_read_model/` | Read models: commit bridge, keyset scans, relationships, sessions, Atomic vs eventual projections |
 | `tests/sourced*` / `tests/snapshots/` / `tests/upcasting/` | Macros, snapshots, event versioning |
 | `tests/sagas/` | Orchestration + choreography with the outbox |
 | `tests/*_transport/`, `tests/knative_cloudevents/` | Broker adapters + conformance |

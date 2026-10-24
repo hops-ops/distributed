@@ -208,6 +208,93 @@ test('refused handoff returns to the source with the same Hello, then falls back
 	client2.close();
 });
 
+test('handoff holds the predicted entity until the target binds it (no source copy)', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	network.onMessage = (conn, m) => {
+		if (m.type === 'Hello') conn.send(welcome({ zoneId: conn.zoneId }));
+	};
+	const client = handoffClient(network, scheduler);
+	await client.connect('z1');
+	network.last('z1').send(delta({ creates: [avatar(1, 5)] }));
+	const own = () => client.render().filter((e) => e.id === 1);
+	assert.deepEqual(own().map((e) => [e.key, e.predicted]), [['z1:1', true]]);
+
+	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1' });
+	await scheduler.advance(10);
+	assert.equal(client.authority.zoneId, 'z2');
+	// Welcomed by z2 but no Delta yet: one frozen predicted copy, not the
+	// source's interpolated (older) one.
+	const held = own();
+	assert.deepEqual(held.map((e) => [e.key, e.predicted, e.stale]), [['z1:1', true, false]]);
+	assert.ok(Math.abs(held[0].fields.x - 5) < 1e-3, 'held at the last predicted position');
+
+	network.last('z2').send(delta({ creates: [avatar(1, 5.5)] }));
+	network.last('z1').send(delta({ serverTick: 101, updates: [] }));
+	assert.deepEqual(own().map((e) => [e.key, e.predicted]), [['z2:1', true]]);
+	client.close();
+});
+
+test('handoffFrame: the prediction continues through a handoff in the target frame, inputs reach the target, the switch eases', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	const inputs = { z1: [], z2: [] };
+	let welcomeZ2 = false;
+	network.onMessage = (conn, m) => {
+		if (m.type === 'Hello' && (conn.zoneId !== 'z2' || welcomeZ2)) conn.send(welcome({ zoneId: conn.zoneId }));
+		if (m.type === 'Input') inputs[conn.zoneId].push(m.seq);
+	};
+	// Zone-local x; z2 starts 10 m further on (its x = world x − 10).
+	const client = new GameClient({
+		url: (zone) => `ws://game.test/zones/${zone}`,
+		ticket: ({ zoneId }) => `fresh:${zoneId}`,
+		socket: network.factory,
+		scheduler,
+		pingIntervalMs: 60_000,
+		handoffRetainMs: 100,
+		handoffTimeoutMs: 2000,
+		prediction: {
+			encodeInput: (dx) => new Uint8Array([dx & 0xff]),
+			predict: (s, dx, dt) => ({ x: s.x + (dx * dt) / 1000 }),
+			controlledEntity: () => 1,
+			handoffFrame: (fields, from, to) => (from === 'z1' && to === 'z2' ? { ...fields, x: fields.x - 10 } : undefined),
+			smoothSteps: false
+		}
+	});
+	const world = (e) => (e.zoneId === 'z2' ? 10 : 0) + e.fields.x;
+	const own = () => client.render().filter((e) => e.id === 1);
+	await client.connect('z1');
+	network.last('z1').send(delta({ creates: [avatar(1, 9.5)] }));
+	client.sendInput(10, 100); // +1 → 10.5 (lost: z1 hands off before applying it)
+	assert.ok(Math.abs(world(own()[0]) - 10.5) < 1e-3, `predicted: ${JSON.stringify(own())}`);
+
+	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1' });
+	await scheduler.advance(10);
+	// Not welcomed yet: predicted on in z2's frame, the inputs kept.
+	client.sendInput(10, 100);
+	client.sendInput(10, 100);
+	let shown = own();
+	assert.deepEqual(shown.map((e) => [e.key, e.predicted]), [['z2:1', true]]);
+	assert.ok(Math.abs(world(shown[0]) - 12.5) < 1e-3, `continued: ${world(shown[0])}`);
+	assert.deepEqual(inputs.z2, []);
+
+	// Welcomed: the kept inputs go to the target.
+	welcomeZ2 = true;
+	network.last('z2').close();
+	await scheduler.advance(2000);
+	assert.equal(inputs.z2.length >= 2, true, `sent to z2: ${inputs.z2}`);
+	// The target admitted the entity where z1 last had it (9.5 → z2's −0.5),
+	// without the lost input; it has not applied the two kept ones yet.
+	network.last('z2').send(delta({ ackSeq: 0, creates: [avatar(1, -0.5)] }));
+	network.last('z1').send(delta({ serverTick: 101, updates: [] }));
+	shown = own();
+	assert.deepEqual(shown.map((e) => [e.key, e.predicted]), [['z2:1', true]]);
+	assert.ok(Math.abs(world(shown[0]) - 12.5) < 1e-3, `eases from what was shown: ${world(shown[0])}`);
+	await scheduler.advance(1000);
+	assert.ok(Math.abs(world(own()[0]) - 11.5) < 1e-3, `converged on the target's prediction: ${world(own()[0])}`);
+	client.close();
+});
+
 test('a silent handoff target times out into the return path', async () => {
 	const network = new FakeNetwork();
 	const scheduler = new FakeScheduler();

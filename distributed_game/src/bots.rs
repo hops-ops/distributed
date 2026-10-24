@@ -113,8 +113,13 @@ pub fn encode_i8_pair(dir: [f32; 2]) -> Vec<u8> {
 /// Bot run settings.
 #[derive(Clone)]
 pub struct BotConfig {
-    /// Server base URL, e.g. `ws://127.0.0.1:2567` (`/zones/{zone}` is appended).
+    /// Server base URL, e.g. `ws://127.0.0.1:2567` (`{path}/{zone}` is
+    /// appended).
     pub url: String,
+    /// Path the zone id is appended to: `/zones` on the `net` server and
+    /// whatever the worker routes to its zone objects on celld (Mob Pit:
+    /// `/zones` too).
+    pub path: String,
     /// Zone to join.
     pub zone: String,
     /// Number of bots.
@@ -145,6 +150,7 @@ impl BotConfig {
     pub fn new(url: impl Into<String>, zone: impl Into<String>, ticket_key: TicketKey) -> Self {
         Self {
             url: url.into(),
+            path: "/zones".into(),
             zone: zone.into(),
             bots: 10,
             input_rate: 20.0,
@@ -167,6 +173,8 @@ pub struct BotStats {
     pub index: usize,
     /// Welcome received.
     pub joined: bool,
+    /// Time from the start of the connect to the Welcome.
+    pub joined_after: Option<Duration>,
     /// Why it stopped early.
     pub error: Option<String>,
     /// Deltas applied.
@@ -361,8 +369,17 @@ async fn drive(
         expires_at: unix + 3600,
         nonce: format!("{principal}-{}-{}", config.seed, unix),
         role: Role::Player,
+        name: None,
+        extensions: Default::default(),
+        wake: false,
     });
-    let url = format!("{}/zones/{}", config.url.trim_end_matches('/'), config.zone);
+    let started = Instant::now();
+    let url = format!(
+        "{}/{}/{}",
+        config.url.trim_end_matches('/'),
+        config.path.trim_matches('/'),
+        config.zone
+    );
     let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
         .await
         .map_err(|e| format!("connect: {e}"))?;
@@ -372,6 +389,7 @@ async fn drive(
         capabilities: 0,
         ticket,
         reconnect_token: String::new(),
+        near: false,
     });
     ws.send(Message::Binary(hello.encode().into()))
         .await
@@ -406,7 +424,10 @@ async fn drive(
             msg = ws.next() => {
                 let bytes = match msg {
                     Some(Ok(Message::Binary(b))) => b,
-                    Some(Ok(Message::Close(_))) | None => return Err("closed by server".into()),
+                    Some(Ok(Message::Close(Some(frame)))) => {
+                        return Err(format!("closed by server ({} {})", u16::from(frame.code), frame.reason))
+                    }
+                    Some(Ok(Message::Close(None))) | None => return Err("closed by server".into()),
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => return Err(format!("recv: {e}")),
                 };
@@ -414,6 +435,7 @@ async fn drive(
                     ServerMessage::Welcome(_) => {
                         stats.joined = true;
                         let now = Instant::now();
+                        stats.joined_after = Some(now - started);
                         joined_at = Some(now);
                         next_input = now;
                         next_ping = now;

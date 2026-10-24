@@ -10,9 +10,11 @@
 //! `on_tick`/`on_timer`/`on_fact_settled` interleaved → `on_leave` /
 //! `on_unobserve` → `on_dispose`.
 
+use crate::claims::TicketExtensions;
 use crate::facts::FactSettlement;
 use crate::host::Ctx;
-use crate::protocol::Role;
+use crate::interest::View;
+use crate::protocol::{Origin, Role};
 use crate::replication::WorldView;
 use crate::rewind::RewindFrame;
 use crate::schema::EntitySchema;
@@ -54,6 +56,9 @@ impl From<ObserverId> for Viewer {
 
 /// Claims from a **verified** admission ticket. The principal is the only
 /// identity the runtime trusts; nothing in client payloads can change it.
+///
+/// Built by a `net::TicketVerifier` (the default HS256 `net::TicketKey`, or a
+/// game's own verifier for tickets minted by its web backend).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TicketClaims {
     /// Verified principal (`sub`).
@@ -62,10 +67,71 @@ pub struct TicketClaims {
     pub zone: String,
     /// Expiry, Unix seconds.
     pub expires_at: u64,
-    /// Single-use nonce.
+    /// Single-use replay key (`nonce`, or a JWT `jti`): the server refuses
+    /// a second admission with the same key until `expires_at`.
     pub nonce: String,
     /// Player or observer.
     pub role: Role,
+    /// Optional display name vouched for by the ticket issuer (never
+    /// identity: use `principal` for that). Exposed as
+    /// [`PlayerInfo::name`] / [`ObserverInfo::name`].
+    pub name: Option<String>,
+    /// Game-declared claims the issuer vouches for (match id, team…; the
+    /// ticket's `ext`), checked by the `net` server against
+    /// `ServerConfig::ticket_extensions`. Never identity or rewards.
+    pub extensions: TicketExtensions,
+    /// The issuer lets this **observer** wake the zone and keep it awake
+    /// while it declares itself near ([`Hello::near`](crate::protocol::Hello::near),
+    /// zones hosted as celld objects); the ticket's `wake` claim. The
+    /// issuer decides who may (e.g. only rooms next to the principal's
+    /// own). Ignored for players.
+    pub wake: bool,
+}
+
+impl TicketClaims {
+    /// Claims without a display name.
+    pub fn new(
+        principal: impl Into<String>,
+        zone: impl Into<String>,
+        expires_at: u64,
+        nonce: impl Into<String>,
+        role: Role,
+    ) -> Self {
+        Self {
+            principal: principal.into(),
+            zone: zone.into(),
+            expires_at,
+            nonce: nonce.into(),
+            role,
+            name: None,
+            extensions: TicketExtensions::new(),
+            wake: false,
+        }
+    }
+
+    /// Grant an observer ticket the right to wake the zone when near
+    /// ([`wake`](Self::wake)).
+    pub fn with_wake(mut self, wake: bool) -> Self {
+        self.wake = wake;
+        self
+    }
+
+    /// Attach extension claims.
+    pub fn with_extensions(mut self, extensions: TicketExtensions) -> Self {
+        self.extensions = extensions;
+        self
+    }
+
+    /// Attach a display name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Key the server's replay cache records (the nonce / `jti`).
+    pub fn replay_key(&self) -> &str {
+        &self.nonce
+    }
 }
 
 /// Admission request seen by [`Zone::on_auth`].
@@ -101,6 +167,9 @@ pub enum LeaveReason {
     Handoff,
     /// Zone disposed.
     Disposed,
+    /// A fresh ticket for the same principal started a new client session in
+    /// this slot (e.g. a page reload); see [`Zone::on_rejoin`].
+    Rejoined,
 }
 
 /// Player as seen by the zone.
@@ -110,10 +179,30 @@ pub struct PlayerInfo {
     pub id: PlayerId,
     /// Verified principal from the ticket.
     pub principal: String,
+    /// Display name from the ticket ([`TicketClaims::name`]), if any.
+    pub name: Option<String>,
+    /// Extension claims from the ticket ([`TicketClaims::extensions`]);
+    /// replaced by a fresh ticket's on rejoin, carried across handoffs.
+    pub extensions: TicketExtensions,
     /// Hello capabilities.
     pub capabilities: u32,
     /// False while inside the reconnect grace window.
     pub connected: bool,
+}
+
+/// Observer as seen by the zone ([`Ctx::observer`](crate::Ctx::observer)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserverInfo {
+    /// Observer id (address events with [`Ctx::send_event`](crate::Ctx::send_event)).
+    pub id: ObserverId,
+    /// Verified principal from the observer ticket.
+    pub principal: String,
+    /// Display name from the ticket, if any.
+    pub name: Option<String>,
+    /// Extension claims from the ticket.
+    pub extensions: TicketExtensions,
+    /// Hello capabilities.
+    pub capabilities: u32,
 }
 
 /// Activity tier of a zone.
@@ -135,6 +224,10 @@ pub trait Zone: Sized + Send + 'static {
     type Input: Send + 'static;
     /// Timer payload.
     type Timer: Clone + Send + 'static;
+    /// Messages services deliver into the running zone
+    /// ([`on_message`](Self::on_message), [`crate::inbox`]): a
+    /// `#[derive(GameEvent)]` struct or enum, or [`NoMessages`](crate::NoMessages).
+    type Message: crate::GameEvent + Send + 'static;
 
     /// Replicated entity schema (called once at creation).
     fn schema() -> EntitySchema;
@@ -150,14 +243,82 @@ pub trait Zone: Sized + Send + 'static {
     /// A player joined (not called on reconnect).
     fn on_join(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId) {}
 
-    /// A player left for `reason` (not called on a disconnect still inside the grace window).
+    /// A player left for `reason` (not called on a disconnect still inside
+    /// the grace window: see [`on_connection_lost`](Self::on_connection_lost)).
     fn on_leave(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId, _reason: LeaveReason) {}
 
-    /// An observer subscribed.
+    /// A player's connection dropped (or it was told to reload) and its
+    /// reconnect grace window started; the slot and its entity stay.
+    /// `on_leave(Disconnected)` follows if it does not come back in time.
+    fn on_connection_lost(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId) {}
+
+    /// A player resumed its slot with a reconnect token within the grace
+    /// window.
+    fn on_reconnected(&mut self, _ctx: &mut Ctx<'_, Self>, _player: PlayerId) {}
+
+    /// A fresh ticket (not a reconnect token) arrived for a principal that
+    /// already holds a player slot here, e.g. the page was reloaded or opened
+    /// in another tab with the same identity. The old connection was
+    /// replaced (`Kick(REPLACED)`) and the new one is a new client session:
+    /// its input sequence starts again and it knows nothing about per-player
+    /// state the zone sent on join (own entity id, hello events…).
+    ///
+    /// Defaults to `on_leave(Rejoined)` then `on_join`, i.e. a fresh join in
+    /// the same [`PlayerId`]: the body is respawned. Override to keep
+    /// in-zone state and only resend what the client needs, so a reloaded
+    /// page takes over the same body (what players expect; the examples'
+    /// Mob Pit, Arena and Endless Grid do).
+    fn on_rejoin(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        self.on_leave(ctx, player, LeaveReason::Rejoined);
+        self.on_join(ctx, player);
+    }
+
+    /// An observer subscribed. Its principal and name are available from
+    /// [`Ctx::observer`](crate::Ctx::observer); address it with
+    /// [`Ctx::send_event`](crate::Ctx::send_event)`(observer, ..)`.
     fn on_observe(&mut self, _ctx: &mut Ctx<'_, Self>, _observer: ObserverId) {}
 
-    /// An observer left.
+    /// An observer left. [`Ctx::observer`](crate::Ctx::observer) still
+    /// returns it during this hook (it can no longer receive events).
     fn on_unobserve(&mut self, _ctx: &mut Ctx<'_, Self>, _observer: ObserverId) {}
+
+    /// An observer says where it is looking, in this zone's local
+    /// coordinates (`Focus`; e.g. a player next door, so this zone's
+    /// interest management follows that player across the border). The
+    /// default centres the observer's view there with the zone's
+    /// [`view_radius`](Self::view_radius) (the player sees this zone as it
+    /// sees its own), else keeps the observer's radius; override to clamp,
+    /// resize or ignore it. Untrusted: it only steers what the observer
+    /// sees.
+    fn on_observer_focus(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId, x: f32, y: f32) {
+        if !(x.is_finite() && y.is_finite()) {
+            return;
+        }
+        if let Some(view) = ctx.view_of(observer) {
+            let radius = self.view_radius().unwrap_or(view.radius);
+            ctx.set_view(observer, View::new(x, y, radius));
+        }
+    }
+
+    /// Where this zone sits in the world: the world position of its local
+    /// (0, 0), for zones whose positions are local to a place in one
+    /// continuous world (a grid of rooms, map tiles). Sent in Welcome, so a
+    /// client that knows where its player is focuses every neighbour it
+    /// watches by itself (JS: `GameClient.setPosition`). Derive it from the
+    /// zone's config (e.g. the room parsed from its zone id). `None`
+    /// (default): the zone is not placed and clients focus it only by hand.
+    fn origin(&self) -> Option<Origin> {
+        None
+    }
+
+    /// How far a player sees in this zone (the radius the zone gives player
+    /// views), when it is one radius. The default
+    /// [`on_observer_focus`](Self::on_observer_focus) gives a player next
+    /// door the same view here. `None` (default): focused observers keep
+    /// their radius.
+    fn view_radius(&self) -> Option<f32> {
+        None
+    }
 
     /// Decode raw input bytes from the wire; `None` drops the input.
     fn decode_input(&self, player: PlayerId, payload: &[u8]) -> Option<Self::Input>;
@@ -169,6 +330,11 @@ pub trait Zone: Sized + Send + 'static {
 
     /// One fixed simulation step (`ctx.dt()` is the step length of the tier).
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>);
+
+    /// A message from a service ([`crate::inbox`]), delivered on the zone's
+    /// task between ticks (never during one). The built-in kick is handled
+    /// by the host and never reaches this hook.
+    fn on_message(&mut self, _ctx: &mut Ctx<'_, Self>, _message: Self::Message) {}
 
     /// A timer fired (before `on_tick` of the same tick).
     fn on_timer(&mut self, _ctx: &mut Ctx<'_, Self>, _id: TimerId, _timer: Self::Timer) {}
@@ -189,8 +355,18 @@ pub trait Zone: Sized + Send + 'static {
         false
     }
 
-    /// Describe replicated entities for this patch.
-    fn replicate(&self, out: &mut WorldView);
+    /// The zone's entity collections, registered once at creation
+    /// ([`entity`](crate::entity)): every patch the host pushes each
+    /// entity's [`Project`](crate::Project)ed view (in registration order),
+    /// then calls [`replicate`](Self::replicate). Default: none.
+    fn entities() -> crate::Entities<Self> {
+        crate::Entities::new()
+    }
+
+    /// Describe replicated entities for this patch that are not projected
+    /// from a registered collection ([`entities`](Self::entities)).
+    /// Default: nothing.
+    fn replicate(&self, _out: &mut WorldView) {}
 
     /// Record hit volumes for lag compensation after each tick
     /// ([`Ctx::rewind`](crate::Ctx::rewind)). Default: nothing recorded.

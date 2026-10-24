@@ -77,10 +77,17 @@ impl ProjectionReport {
     }
 }
 
+/// Called with each live board whose scores changed: after an applied (not
+/// duplicate) change, and after a rebuild promotes a board. A GraphQL engine
+/// turns this into `@live` invalidation
+/// (`GraphqlEngine::leaderboard_change_listener`).
+pub type LeaderboardChangeListener = Arc<dyn Fn(&Board) + Send + Sync>;
+
 /// Applies a [`LeaderboardProjection`] to a [`LeaderboardStore`].
 pub struct LeaderboardProjector<S: ?Sized, P: ?Sized> {
     store: Arc<S>,
     projection: Arc<P>,
+    listeners: Vec<LeaderboardChangeListener>,
 }
 
 impl<S: ?Sized, P: ?Sized> Clone for LeaderboardProjector<S, P> {
@@ -88,6 +95,7 @@ impl<S: ?Sized, P: ?Sized> Clone for LeaderboardProjector<S, P> {
         Self {
             store: Arc::clone(&self.store),
             projection: Arc::clone(&self.projection),
+            listeners: self.listeners.clone(),
         }
     }
 }
@@ -99,7 +107,23 @@ where
 {
     /// A projector over a store and projection.
     pub fn new(store: Arc<S>, projection: Arc<P>) -> Self {
-        Self { store, projection }
+        Self {
+            store,
+            projection,
+            listeners: Vec::new(),
+        }
+    }
+
+    /// Notify `listener` whenever a live board's scores change.
+    pub fn with_change_listener(mut self, listener: LeaderboardChangeListener) -> Self {
+        self.listeners.push(listener);
+        self
+    }
+
+    fn notify(&self, board: &Board) {
+        for listener in &self.listeners {
+            listener(board);
+        }
     }
 
     /// The store.
@@ -148,7 +172,12 @@ where
                 event.occurred_at_unix_ms(),
             );
             match self.store.apply(&board, &change.submission, &key).await? {
-                ApplyOutcome::Applied { .. } => report.applied += 1,
+                ApplyOutcome::Applied { .. } => {
+                    report.applied += 1;
+                    if !staging {
+                        self.notify(&board);
+                    }
+                }
                 ApplyOutcome::Duplicate { .. } => report.duplicates += 1,
             }
         }
@@ -266,6 +295,7 @@ where
     pub async fn commit(self) -> Result<ProjectionReport, LeaderboardError> {
         for board in self.boards.values() {
             self.projector.store.promote(board).await?;
+            self.projector.notify(board);
         }
         Ok(self.report)
     }
@@ -500,5 +530,34 @@ mod tests {
             projector.store().score(&board, "zone").await.unwrap(),
             Some(2_000.0)
         );
+    }
+
+    #[tokio::test]
+    async fn listeners_hear_applied_changes_and_promotions_but_not_duplicates() {
+        let heard = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = heard.clone();
+        let projector = projector().with_change_listener(Arc::new(move |board: &Board| {
+            log.lock().unwrap().push(board.name().to_string());
+        }));
+        projector.apply_event(&slain(1, "ann", 10)).await.unwrap();
+        projector.apply_event(&slain(1, "ann", 10)).await.unwrap();
+        assert_eq!(
+            *heard.lock().unwrap(),
+            ["xp", "best-kill"],
+            "one per applied change; the duplicate is silent"
+        );
+        let boards = [Board::high_first("xp").unwrap()];
+        projector
+            .rebuild(&boards, [slain(1, "ann", 10), slain(2, "bob", 5)])
+            .await
+            .unwrap();
+        let heard = heard.lock().unwrap();
+        assert_eq!(
+            heard.len(),
+            4,
+            "one per promoted board, none for staging writes"
+        );
+        assert!(heard[2..].contains(&"xp".to_string()));
+        assert!(heard[2..].contains(&"best-kill".to_string()));
     }
 }

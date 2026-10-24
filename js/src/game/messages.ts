@@ -12,8 +12,20 @@ import {
 } from './schema.js';
 import { GameDecodeError, WireReader, WireWriter } from './wire.js';
 
-/** Wire protocol version spoken by this client. */
-export const GAME_PROTOCOL_VERSION = 1;
+/**
+ * Newest wire protocol version this client speaks (offered in Hello; a
+ * server that only speaks 1 is retried once with 1, see `GameConnection`).
+ */
+export const GAME_PROTOCOL_VERSION = 2;
+
+/**
+ * Runtime feature bits a server announces in Welcome v2 (`features`): the
+ * client sends a message a feature covers only when its bit is set.
+ */
+export const GameFeature = Object.freeze({
+	/** The server handles `Focus` (observers steer their view). */
+	FOCUS: 1 << 0
+});
 
 /** Message type bytes (§6.1). */
 export const GameMessageTag = Object.freeze({
@@ -21,6 +33,11 @@ export const GameMessageTag = Object.freeze({
 	INPUT: 0x02,
 	PING: 0x03,
 	LEAVE: 0x04,
+	CONTENT: 0x05,
+	/** Client → server: an observer is near (keep the zone awake) or passive again. */
+	NEAR: 0x06,
+	/** Client → server: where an observer is looking (zone-local `x`, `y`). */
+	FOCUS: 0x07,
 	WELCOME: 0x80,
 	DELTA: 0x81,
 	EVENT: 0x82,
@@ -45,6 +62,13 @@ export const GameKickCode = Object.freeze({
 	RELOAD: 7
 });
 
+/**
+ * WebSocket close code of a zone that restarted or moved (a celld zone
+ * object woke up again, its node stopped or crashed): the reconnect token is
+ * void, the client rejoins at once with a fresh ticket.
+ */
+export const GAME_CLOSE_RESTARTED = 1012;
+
 /** Error codes. */
 export const GameErrorCode = Object.freeze({
 	BAD_MESSAGE: 1,
@@ -54,7 +78,13 @@ export const GameErrorCode = Object.freeze({
 	VERSION_MISMATCH: 5,
 	RATE_LIMITED: 6,
 	NOT_FOUND: 7,
-	RECONNECT_FAILED: 8
+	RECONNECT_FAILED: 8,
+	/** The zone could not be created right now (factory or allocation failure); retry later. */
+	ZONE_UNAVAILABLE: 9,
+	/** The zone is asleep and an observer does not wake it (celld zones: observers are passive watchers); try later. */
+	ASLEEP: 10,
+	/** A near observer's ticket does not grant `wake`: it stays a passive watcher (a fresh ticket may grant it). */
+	WAKE_DENIED: 11
 });
 
 export type HelloMessage = Readonly<{
@@ -64,6 +94,11 @@ export type HelloMessage = Readonly<{
 	capabilities: number;
 	ticket: string;
 	reconnectToken: string;
+	/**
+	 * Observers: near the zone (celld zones: with a ticket that grants
+	 * `wake`, wakes it and keeps it awake). Default false.
+	 */
+	near?: boolean;
 }>;
 export type InputMessage = Readonly<{
 	type: 'Input';
@@ -73,12 +108,26 @@ export type InputMessage = Readonly<{
 }>;
 export type PingMessage = Readonly<{ type: 'Ping'; clientTime: number }>;
 export type LeaveMessage = Readonly<{ type: 'Leave' }>;
-export type GameClientMessage = HelloMessage | InputMessage | PingMessage | LeaveMessage;
+/** The client patched its content live and now runs `contentVersion`. */
+export type ContentMessage = Readonly<{ type: 'Content'; contentVersion: string }>;
+/** An observer is near the zone (keep it awake, with a `wake` ticket) or passive again. */
+export type NearMessage = Readonly<{ type: 'Near'; near: boolean }>;
+/** Where an observer is looking, in the zone's local coordinates (the zone decides what it means; by default its view follows). */
+export type FocusMessage = Readonly<{ type: 'Focus'; x: number; y: number }>;
+export type GameClientMessage = HelloMessage | InputMessage | PingMessage | LeaveMessage | ContentMessage | NearMessage | FocusMessage;
 
 export type GameRole = 'player' | 'observer';
 
+/** A point in world coordinates (or a zone's origin in them). */
+export type WorldPoint = Readonly<{ x: number; y: number }>;
+
 export type WelcomeMessage = Readonly<{
 	type: 'Welcome';
+	/**
+	 * Protocol version the Welcome is encoded in: the version the client
+	 * offered (not itself on the wire). 1: `features` 0, no `origin`.
+	 */
+	protocolVersion: number;
 	sessionId: string;
 	zoneId: string;
 	role: GameRole;
@@ -89,6 +138,14 @@ export type WelcomeMessage = Readonly<{
 	reconnectToken: string;
 	contentVersion: string;
 	schema: GameSchema;
+	/** v2: runtime features of the server (`GameFeature` bits); 0 in v1. */
+	features: number;
+	/**
+	 * v2: where the zone sits in the world (world = origin + zone-local),
+	 * when it says (`Zone::origin`); `GameClient.setPosition` focuses the
+	 * zone from it.
+	 */
+	origin?: WorldPoint;
 }>;
 export type EntityCreate = Readonly<{
 	id: number;
@@ -134,8 +191,12 @@ export type GameServerMessage =
 	| ErrorMessage
 	| RedirectMessage;
 
-/** What the Delta codec needs: the Welcome schema and the kind of each known id. */
+/**
+ * What the codecs need: the negotiated protocol version (Welcome; default
+ * the newest), the Welcome schema and the kind of each known id (Deltas).
+ */
 export type EntityKinds = Readonly<{
+	protocolVersion?: number;
 	schema: GameSchema | undefined;
 	kindOf(id: number): number | undefined;
 }>;
@@ -152,7 +213,8 @@ export function encodeClientMessage(message: GameClientMessage): Uint8Array {
 				.string(message.contentVersion)
 				.varuint(message.capabilities)
 				.string(message.ticket)
-				.string(message.reconnectToken);
+				.string(message.reconnectToken)
+				.bool(message.near ?? false);
 			break;
 		case 'Input':
 			w.u8(GameMessageTag.INPUT)
@@ -165,6 +227,15 @@ export function encodeClientMessage(message: GameClientMessage): Uint8Array {
 			break;
 		case 'Leave':
 			w.u8(GameMessageTag.LEAVE);
+			break;
+		case 'Content':
+			w.u8(GameMessageTag.CONTENT).string(message.contentVersion);
+			break;
+		case 'Near':
+			w.u8(GameMessageTag.NEAR).bool(message.near);
+			break;
+		case 'Focus':
+			w.u8(GameMessageTag.FOCUS).f32(message.x).f32(message.y);
 			break;
 	}
 	return w.finish();
@@ -183,7 +254,8 @@ export function decodeClientMessage(bytes: Uint8Array): GameClientMessage {
 				contentVersion: r.string(),
 				capabilities: r.varuint(),
 				ticket: r.string(),
-				reconnectToken: r.string()
+				reconnectToken: r.string(),
+				near: r.bool()
 			};
 			break;
 		case GameMessageTag.INPUT:
@@ -194,6 +266,15 @@ export function decodeClientMessage(bytes: Uint8Array): GameClientMessage {
 			break;
 		case GameMessageTag.LEAVE:
 			message = { type: 'Leave' };
+			break;
+		case GameMessageTag.CONTENT:
+			message = { type: 'Content', contentVersion: r.string() };
+			break;
+		case GameMessageTag.NEAR:
+			message = { type: 'Near', near: r.bool() };
+			break;
+		case GameMessageTag.FOCUS:
+			message = { type: 'Focus', x: r.f32(), y: r.f32() };
 			break;
 		default:
 			throw new GameDecodeError('UNKNOWN_MESSAGE', `message type 0x${tag.toString(16)}`);
@@ -221,6 +302,11 @@ export function encodeServerMessage(
 				.string(message.reconnectToken)
 				.string(message.contentVersion);
 			encodeSchema(w, message.schema);
+			if ((message.protocolVersion ?? GAME_PROTOCOL_VERSION) >= 2) {
+				const origin = message.origin;
+				w.varuint(message.features ?? 0).bool(origin !== undefined);
+				if (origin !== undefined) w.f64(origin.x).f64(origin.y);
+			}
 			break;
 		case 'Delta':
 			encodeDelta(w, message, kinds);
@@ -268,11 +354,13 @@ export function decodeServerMessage(
 			const zoneId = r.string();
 			const roleByte = r.u8();
 			if (roleByte > 1) throw new GameDecodeError('INVALID', 'role');
-			message = {
-				type: 'Welcome',
+			const protocolVersion = kinds.protocolVersion ?? GAME_PROTOCOL_VERSION;
+			const welcome = {
+				type: 'Welcome' as const,
+				protocolVersion,
 				sessionId,
 				zoneId,
-				role: roleByte === 0 ? 'player' : 'observer',
+				role: (roleByte === 0 ? 'player' : 'observer') as GameRole,
 				tickRate: r.varuint(),
 				patchRate: r.varuint(),
 				serverTick: r.varuint(),
@@ -281,6 +369,13 @@ export function decodeServerMessage(
 				contentVersion: r.string(),
 				schema: decodeSchema(r)
 			};
+			if (protocolVersion >= 2) {
+				const features = r.varuint();
+				const origin = r.bool() ? { x: r.f64(), y: r.f64() } : undefined;
+				message = origin === undefined ? { ...welcome, features } : { ...welcome, features, origin };
+			} else {
+				message = { ...welcome, features: 0 };
+			}
 			break;
 		}
 		case GameMessageTag.DELTA:
@@ -414,6 +509,8 @@ export type MirrorEntity = { kind: number; fields: FieldValue[] };
  * the decoded messages it returns.
  */
 export class GameClientMirror implements EntityKinds {
+	/** Protocol version offered in Hello (Welcomes decode in it). */
+	protocolVersion = GAME_PROTOCOL_VERSION;
 	welcome: WelcomeMessage | undefined;
 	readonly entities = new Map<number, MirrorEntity>();
 	serverTick = 0;

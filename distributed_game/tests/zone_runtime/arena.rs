@@ -21,6 +21,12 @@ pub struct ArenaConfig {
     pub reject_principal: Option<String>,
     pub background: bool,
     pub spawn_every: Option<Duration>,
+    /// Allocation payload handed over by the zone factory.
+    pub allocation: Option<serde_json::Value>,
+    /// `Zone::origin` (Welcome v2).
+    pub origin: Option<distributed_game::Origin>,
+    /// `Zone::view_radius` (the default observer focus).
+    pub view_radius: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +53,12 @@ pub struct Arena {
     pub ticks: u64,
     pub timer_fires: u64,
     pub tiers: Vec<(Tier, Tier)>,
+    /// Extension claims seen by `on_auth`.
+    pub auth_extensions: Vec<distributed_game::TicketExtensions>,
+    /// `lost:{player}` / `back:{player}` from the connection hooks.
+    pub connection_events: Vec<String>,
+    /// `Ctx::dropped_ticks` seen by each `on_tick`.
+    pub dropped_seen: Vec<u32>,
 }
 
 impl Arena {
@@ -77,6 +89,7 @@ impl Zone for Arena {
     type Config = ArenaConfig;
     type Input = (i8, i8);
     type Timer = ArenaTimer;
+    type Message = distributed_game::NoMessages;
 
     fn schema() -> EntitySchema {
         let pos = FieldType::QuantF32 {
@@ -114,10 +127,14 @@ impl Zone for Arena {
             ticks: 0,
             timer_fires: 0,
             tiers: Vec::new(),
+            auth_extensions: Vec::new(),
+            connection_events: Vec::new(),
+            dropped_seen: Vec::new(),
         }
     }
 
     fn on_auth(&mut self, _ctx: &mut Ctx<'_, Self>, req: &JoinRequest<'_>) -> Admission {
+        self.auth_extensions.push(req.claims.extensions.clone());
         if self.cfg.reject_principal.as_deref() == Some(req.claims.principal.as_str()) {
             return Admission::Reject("banned".into());
         }
@@ -146,13 +163,42 @@ impl Zone for Arena {
         self.log.push(format!("leave:{reason:?}"));
     }
 
-    fn on_observe(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {
-        ctx.set_view(observer, View::new(50.0, 50.0, 1000.0));
-        self.log.push("observe".into());
+    fn on_connection_lost(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        self.connection_events.push(format!("lost:{}", player.0));
     }
 
-    fn on_unobserve(&mut self, _ctx: &mut Ctx<'_, Self>, _observer: ObserverId) {
-        self.log.push("unobserve".into());
+    fn on_reconnected(&mut self, _ctx: &mut Ctx<'_, Self>, player: PlayerId) {
+        self.connection_events.push(format!("back:{}", player.0));
+    }
+
+    fn on_observe(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {
+        ctx.set_view(observer, View::new(50.0, 50.0, 1000.0));
+        let info = ctx
+            .observer(observer)
+            .expect("observer known in on_observe");
+        let line = format!(
+            "observe:{}:{}",
+            info.principal,
+            info.name.as_deref().unwrap_or("-")
+        );
+        let mine: Vec<_> = ctx.observers_of(&info.principal.clone()).collect();
+        assert_eq!(mine, vec![observer]);
+        ctx.send_event(observer, 7, line.clone().into_bytes());
+        self.log.push(line);
+    }
+
+    fn on_unobserve(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {
+        let principal = ctx.observer(observer).map(|o| o.principal.clone());
+        self.log
+            .push(format!("unobserve:{}", principal.as_deref().unwrap_or("?")));
+    }
+
+    fn origin(&self) -> Option<distributed_game::Origin> {
+        self.cfg.origin
+    }
+
+    fn view_radius(&self) -> Option<f32> {
+        self.cfg.view_radius
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<(i8, i8)> {
@@ -171,6 +217,7 @@ impl Zone for Arena {
 
     fn on_tick(&mut self, ctx: &mut Ctx<'_, Self>) {
         self.ticks += 1;
+        self.dropped_seen.push(ctx.dropped_ticks());
         let dt = ctx.dt_secs();
         let players: Vec<PlayerId> = self.avatars.keys().copied().collect();
         for player in players {

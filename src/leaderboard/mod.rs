@@ -26,6 +26,18 @@
 //!   in-process queue in front of a projector, so a Redis outage never blocks
 //!   gameplay.
 //!
+//! # GraphQL
+//!
+//! With the `graphql` feature, `GraphqlEngineBuilder::leaderboard` exposes a
+//! store through the generated surface (top-N, around-me and my-rank roots,
+//! `@live` subscriptions, the client manifest and `leaderboards.ts`), and
+//! [`LeaderboardProjector::with_change_listener`] +
+//! `GraphqlEngine::leaderboard_change_listener` refresh live queries after an
+//! applied change. Across processes, `LeaderboardChangePublisher` publishes
+//! [`LEADERBOARD_CHANGED_EVENT`] notices on the bus and
+//! `GraphqlEngine::leaderboard_change_handlers` consumes them. See
+//! `docs/live-query-delivery.md`.
+//!
 //! # How it plugs into projections
 //!
 //! A leaderboard is an *eventual* projection: the source of truth stays the
@@ -40,9 +52,11 @@
 //!    permanent. Because gameplay commands only commit to the event store and
 //!    outbox, a Redis blip delays the board but never blocks a command.
 //! 2. **In-process (best effort).** Hand committed occurrences to a
-//!    `BackgroundLeaderboard`, which applies them on a background task and
-//!    drops (and counts) updates when its queue is full or Redis stays down.
-//!    Dropped updates are healed by the next rebuild.
+//!    `BackgroundLeaderboard` (feature `leaderboard-background`, implied by
+//!    `redis`; needs Tokio, works over any store, e.g. the in-memory one),
+//!    which applies them on a background task and drops (and counts)
+//!    updates when its queue is full or the store stays down. Dropped
+//!    updates are healed by the next rebuild.
 //!
 //! # Idempotency
 //!
@@ -73,9 +87,10 @@
 //! makes overlapping replay safe.
 
 mod in_memory;
+mod notify;
 mod projector;
 
-#[cfg(feature = "redis")]
+#[cfg(feature = "leaderboard-background")]
 mod background;
 #[cfg(feature = "redis")]
 mod redis;
@@ -85,12 +100,15 @@ use std::fmt;
 use async_trait::async_trait;
 
 pub use in_memory::InMemoryLeaderboard;
+#[cfg(feature = "leaderboard-background")]
+pub use notify::LeaderboardChangePublisher;
+pub use notify::{LeaderboardChanged, LEADERBOARD_CHANGED_EVENT};
 pub use projector::{
-    LeaderboardChange, LeaderboardProjection, LeaderboardProjector, LeaderboardRebuild,
-    ProjectionReport,
+    LeaderboardChange, LeaderboardChangeListener, LeaderboardProjection, LeaderboardProjector,
+    LeaderboardRebuild, ProjectionReport,
 };
 
-#[cfg(feature = "redis")]
+#[cfg(feature = "leaderboard-background")]
 pub use background::{BackgroundLeaderboard, BackgroundLeaderboardOptions, BackgroundStats};
 #[cfg(feature = "redis")]
 pub use redis::{RedisLeaderboard, DEFAULT_REDIS_LEADERBOARD_PREFIX};

@@ -36,6 +36,8 @@
 //! | `distributed_game_zone_delta_deferred_total` | counter | zone |
 //! | `distributed_game_zone_facts_pending` | gauge | zone |
 //! | `distributed_game_zone_facts_settled_total` | counter | zone, outcome |
+//! | `distributed_game_hibernation_saves_total` | counter | outcome (`saved`, `stale`, `error`) |
+//! | `distributed_game_activations_refused_total` | counter | reason (`not_found`, `unavailable`) |
 
 use crate::facts::FactOutcome;
 use crate::host::{AdvanceReport, ZoneHost};
@@ -160,7 +162,17 @@ struct State {
     zones: BTreeMap<String, ZoneSeries>,
     labeled: usize,
     other: Counters,
+    /// Server-wide (zones are forgotten when they hibernate).
+    hibernation_saves: BTreeMap<&'static str, u64>,
+    /// Server-wide activations refused before the zone ran.
+    activations_refused: BTreeMap<&'static str, u64>,
 }
+
+/// Hibernation snapshot save outcome label values (fixed set).
+pub const HIBERNATION_OUTCOMES: [&str; 3] = ["saved", "stale", "error"];
+
+/// Refused activation reason label values (fixed set).
+pub const ACTIVATION_REFUSALS: [&str; 2] = ["not_found", "unavailable"];
 
 impl State {
     fn zone(&mut self, zone: &str, max: usize) -> &mut ZoneSeries {
@@ -277,6 +289,44 @@ impl GameMetrics {
             .inputs
             .entry(label)
             .or_insert(0) += 1;
+    }
+
+    /// Record a hibernation snapshot save: `"saved"`, `"stale"` (rejected by
+    /// the fenced store: a newer owner saved, or tokens went backwards) or
+    /// `"error"` (backend failure). Other labels are ignored.
+    pub fn record_hibernation_save(&self, outcome: &str) {
+        if let Some(label) = HIBERNATION_OUTCOMES.iter().find(|l| **l == outcome) {
+            *self.lock().hibernation_saves.entry(label).or_insert(0) += 1;
+        }
+    }
+
+    /// A zone activation refused before the zone ran, by protocol error
+    /// code (`NOT_FOUND` → `not_found`, anything else → `unavailable`).
+    pub fn record_activation_refused(&self, code: u32) {
+        let label = if code == crate::protocol::error::NOT_FOUND {
+            "not_found"
+        } else {
+            "unavailable"
+        };
+        *self.lock().activations_refused.entry(label).or_insert(0) += 1;
+    }
+
+    /// Refused activations recorded with `reason`.
+    pub fn activations_refused(&self, reason: &str) -> u64 {
+        self.lock()
+            .activations_refused
+            .get(reason)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Hibernation saves recorded with `outcome`.
+    pub fn hibernation_saves(&self, outcome: &str) -> u64 {
+        self.lock()
+            .hibernation_saves
+            .get(outcome)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// A zone stopped: drop its series and free its label slot.
@@ -465,6 +515,32 @@ impl GameMetrics {
                 );
             }
         }
+        header(
+            &mut out,
+            "hibernation_saves_total",
+            "counter",
+            "Hibernation snapshot saves by outcome (stale = rejected by the fenced store).",
+        );
+        for label in HIBERNATION_OUTCOMES {
+            let v = state.hibernation_saves.get(label).copied().unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "distributed_game_hibernation_saves_total{{outcome=\"{label}\"}} {v}"
+            );
+        }
+        header(
+            &mut out,
+            "activations_refused_total",
+            "counter",
+            "Zone activations refused before the zone ran (unknown zone, factory or allocation failure).",
+        );
+        for label in ACTIVATION_REFUSALS {
+            let v = state.activations_refused.get(label).copied().unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "distributed_game_activations_refused_total{{reason=\"{label}\"}} {v}"
+            );
+        }
         out
     }
 }
@@ -566,6 +642,7 @@ mod tests {
         type Config = ();
         type Input = u8;
         type Timer = ();
+        type Message = distributed_game::NoMessages;
 
         fn schema() -> EntitySchema {
             EntitySchema::new().kind(KindDef::new(1, "dot").field("v", FieldType::U8))
@@ -603,6 +680,9 @@ mod tests {
             expires_at: u64::MAX,
             nonce: "n".into(),
             role: Role::Player,
+            name: None,
+            extensions: Default::default(),
+            wake: false,
         };
         let joined = h.join(&claims, 0, "").unwrap();
         metrics.record_input("z1", h.push_input(joined.client, 1, 0, &[1]));

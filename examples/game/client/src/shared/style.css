@@ -78,10 +78,27 @@ body {
 	margin: 0;
 	text-align: right;
 }
+.hud .controls {
+	margin: 0 0 8px;
+	padding-bottom: 6px;
+	border-bottom: 1px solid #2a3240;
+}
 .hud .toggle {
-	display: block;
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
 	margin: 4px 0;
 	cursor: pointer;
+}
+.hud .toggle kbd {
+	margin-left: auto;
+	flex-shrink: 0;
+	white-space: nowrap;
+	padding: 0 5px;
+	border: 1px solid #3a4558;
+	border-radius: 3px;
+	color: var(--muted);
+	font: 11px monospace;
 }
 .hud fieldset {
 	margin: 8px 0 0;
@@ -113,4 +130,33 @@ body {
 		width: calc(100% - 24px);
 		max-height: 45%;
 	}
+}
+.minimap {
+	position: fixed;
+	top: 12px;
+	right: 12px;
+	padding: 8px;
+	border-radius: 8px;
+	background: var(--panel);
+	font-size: 11px;
+}
+.minimap canvas {
+	display: block;
+	border-radius: 4px;
+}
+.minimap ul {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 10px;
+	max-width: 180px;
+	margin: 6px 0 0;
+	padding: 0;
+	list-style: none;
+}
+.minimap li span {
+	display: inline-block;
+	width: 8px;
+	height: 8px;
+	margin-right: 4px;
+	border-radius: 50%;
 }
