@@ -320,6 +320,16 @@ export class GameClient<TInput = unknown> {
 		if (zone?.role === 'observer') zone.connection.setNear(near);
 	}
 
+	/**
+	 * Tell an observed zone where this client is looking, in that zone's
+	 * local coordinates (`GameConnection.setFocus`). No-op for zones not
+	 * observed.
+	 */
+	setFocus(zoneId: string, x: number, y: number): void {
+		const zone = this.#zones.get(zoneId);
+		if (zone?.role === 'observer') zone.connection.setFocus(x, y);
+	}
+
 	/** Stop observing a zone. */
 	unobserve(zoneId: string): void {
 		const zone = this.#zones.get(zoneId);

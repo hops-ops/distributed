@@ -712,6 +712,14 @@ impl<Z: Zone> Ctx<'_, Z> {
         self.broadcast_event(event.event_id(), event.to_payload());
     }
 
+    /// A viewer's area of interest (None for an unknown viewer).
+    pub fn view_of(&self, viewer: impl Into<Viewer>) -> Option<View> {
+        match viewer.into() {
+            Viewer::Player(p) => self.core.players.get(&p).map(|slot| slot.view),
+            Viewer::Observer(o) => self.core.observers.get(&o).map(|slot| slot.view),
+        }
+    }
+
     /// Set a viewer's area of interest.
     pub fn set_view(&mut self, viewer: impl Into<Viewer>, view: View) {
         match viewer.into() {
@@ -1470,6 +1478,14 @@ impl<Z: Zone> ZoneHost<Z> {
                 true
             }
             None => false,
+        }
+    }
+
+    /// An observer's `Focus` (zone-local): [`Zone::on_observer_focus`].
+    /// Ignored for players and unknown clients.
+    pub fn observer_focus(&mut self, client: ClientId, x: f32, y: f32) {
+        if let Some(Viewer::Observer(observer)) = self.viewer_of(client) {
+            hook!(self.on_observer_focus(observer, x, y));
         }
     }
 

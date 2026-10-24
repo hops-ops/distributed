@@ -104,6 +104,7 @@ fn client_json(m: &ClientMessage) -> Value {
             json!({ "type": "Content", "content_version": content_version })
         }
         ClientMessage::Near { near } => json!({ "type": "Near", "near": near }),
+        ClientMessage::Focus { x, y } => json!({ "type": "Focus", "x": x, "y": y }),
     }
 }
 
@@ -373,6 +374,7 @@ fn messages() {
         ),
         ("near", ClientMessage::Near { near: true }),
         ("passive", ClientMessage::Near { near: false }),
+        ("focus", ClientMessage::Focus { x: -25.5, y: 3.25 }),
     ];
     for (name, msg) in client {
         let bytes = msg.encode();

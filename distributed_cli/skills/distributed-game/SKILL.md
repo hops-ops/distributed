@@ -77,6 +77,10 @@ Results come back on a later tick in `on_fact_settled`.
   
   Creates and removes are never held. `UpdateRates::every_patch()` turns
   the rates off.
+- A client watching the zone next door tells it where the player is
+  (`watchZones(...).setFocus(at)`, zone-local coordinates). The
+  neighbour's `Zone::on_observer_focus` then centres that observer's view
+  on the player, so interest continues across the border.
 - Each changed entity is encoded once per patch and shared by every client
   that was up to date. A dense room costs selection plus copying, not one
   encode per client.

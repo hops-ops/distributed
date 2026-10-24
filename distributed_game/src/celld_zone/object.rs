@@ -1109,6 +1109,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     self.keep_awake().await;
                 }
             }
+            (Some(client), ClientMessage::Focus { x, y }) => {
+                let mut inner = self.inner.borrow_mut();
+                if let Some(host) = inner.host.as_mut() {
+                    host.observer_focus(ClientId(client), x, y);
+                }
+            }
             (Some(client), ClientMessage::Content { content_version }) => {
                 let mut inner = self.inner.borrow_mut();
                 if let Some(host) = inner.host.as_mut() {

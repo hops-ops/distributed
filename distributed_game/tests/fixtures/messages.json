@@ -99,6 +99,16 @@
     },
     {
       "decoded": {
+        "type": "Focus",
+        "x": -25.5,
+        "y": 3.25
+      },
+      "direction": "client_to_server",
+      "hex": "070000ccc100005040",
+      "name": "focus"
+    },
+    {
+      "decoded": {
         "content_version": "c1",
         "patch_rate": 20,
         "reconnect_token": "rt",

@@ -23,6 +23,8 @@ pub mod tag {
     /// Client → server Near (an observer asks to keep the zone awake, or
     /// lets go).
     pub const NEAR: u8 = 0x06;
+    /// Client → server Focus (where an observer is looking, zone-local).
+    pub const FOCUS: u8 = 0x07;
     /// Server → client Welcome.
     pub const WELCOME: u8 = 0x80;
     /// Server → client Delta.
@@ -149,6 +151,17 @@ pub enum ClientMessage {
         /// Near (true) or passive (false).
         near: bool,
     },
+    /// Where an observer is looking, in the zone's local coordinates (a
+    /// player next door: its position seen from this zone). The zone
+    /// decides what it means ([`Zone::on_observer_focus`](crate::Zone::on_observer_focus);
+    /// by default the observer's view centre follows). Ignored for
+    /// players.
+    Focus {
+        /// x (zone-local).
+        x: f32,
+        /// y (zone-local).
+        y: f32,
+    },
 }
 
 impl ClientMessage {
@@ -187,6 +200,9 @@ impl ClientMessage {
             Self::Near { near } => {
                 w.u8(tag::NEAR).bool(*near);
             }
+            Self::Focus { x, y } => {
+                w.u8(tag::FOCUS).f32(*x).f32(*y);
+            }
         }
         w.into_bytes()
     }
@@ -216,6 +232,10 @@ impl ClientMessage {
                 content_version: r.string()?,
             },
             tag::NEAR => Self::Near { near: r.bool()? },
+            tag::FOCUS => Self::Focus {
+                x: r.f32()?,
+                y: r.f32()?,
+            },
             other => return Err(DecodeError::UnknownMessage(other)),
         };
         r.finish()?;

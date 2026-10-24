@@ -127,6 +127,44 @@ test('an observer says it is near in Hello and with Near, without reconnecting',
 	player.close();
 });
 
+test('an observer sends Focus throttled, and again after a reconnect', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	network.onMessage = (conn, message) => {
+		if (message.type === 'Hello') conn.send(welcome({ zoneId: conn.zoneId, role: 'observer', serverTime: 10_000 }));
+	};
+	const { conn } = connection(network, scheduler, { role: 'observer' });
+	await conn.connect();
+	const focus = () => network.last().inbox.filter((m) => m.type === 'Focus');
+	conn.setFocus(-25, 0);
+	// Within the interval, or moved too little: not sent.
+	conn.setFocus(-24, 0);
+	await scheduler.advance(250);
+	conn.setFocus(-25.125, 0);
+	conn.setFocus(-23, 1);
+	assert.deepEqual(focus(), [
+		{ type: 'Focus', x: -25, y: 0 },
+		{ type: 'Focus', x: -23, y: 1 }
+	]);
+	conn.setFocus(Number.NaN, 0);
+	assert.equal(focus().length, 2, 'non-finite focus is ignored');
+	// A new connection hears the last focus right after its Welcome.
+	network.last().close(1006, "lost");
+	await scheduler.advance(5_000);
+	assert.ok(network.connections.length >= 2, 'reconnected');
+	assert.deepEqual(focus(), [{ type: 'Focus', x: -23, y: 1 }]);
+	conn.close();
+	// A player's focus is never sent.
+	network.onMessage = (c, message) => {
+		if (message.type === 'Hello') c.send(welcome({ zoneId: c.zoneId, serverTime: 10_000 }));
+	};
+	const player = connection(network, scheduler).conn;
+	await player.connect();
+	player.setFocus(1, 2);
+	assert.deepEqual(network.last().inbox.filter((m) => m.type === 'Focus'), []);
+	player.close();
+});
+
 test('ping/pong estimates offset, rtt and jitter', async () => {
 	const network = new FakeNetwork();
 	const scheduler = new FakeScheduler();

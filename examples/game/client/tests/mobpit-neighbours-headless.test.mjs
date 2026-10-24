@@ -5,16 +5,18 @@
  * sleeping room is not woken (it answers `ASLEEP`, nothing is drawn), an
  * awake one streams its mobs, and the watcher does not keep it awake — when
  * its last player leaves it goes dormant and then hibernates as if nobody
- * looked, and the watcher shows nothing again.
+ * looked, and the watcher shows nothing again. A neighbour applies the
+ * player's own view radius around the player (`Focus`): only its mobs
+ * within reach of the player are sent, also after the player moves.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { isMob } from '../src/generated/mobpit/index.ts';
+import { isMob, mobFields } from '../src/generated/mobpit/index.ts';
 import { createMobPitClient, MobPitApi, neighbourRooms } from '../src/mobpit/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
 import { eventually, memoryStorage, until } from './helpers/demo-server.mjs';
-import { startPit } from './helpers/mobpit.mjs';
+import { startPit, walkTo } from './helpers/mobpit.mjs';
 
 test('neighbour rooms: passive watchers see mobs, never wake or keep a room awake', { timeout: 600_000 }, async () => {
 	const server = await startPit('mobpit');
@@ -25,7 +27,9 @@ test('neighbour rooms: passive watchers see mobs, never wake or keep a room awak
 			const pit = createMobPitClient({
 				api: new DevApi({ base: server.httpUrl, name: () => name, storage: memoryStorage() }),
 				roomsBase: server.roomsUrl,
-				neighbours
+				neighbours,
+				// Passive watchers only (proximity wake has its own test).
+				wake: false
 			});
 			clients.push(pit);
 			return pit;
@@ -49,8 +53,37 @@ test('neighbour rooms: passive watchers see mobs, never wake or keep a room awak
 		await other.ready;
 		const layout = watcher.pures.pitRoom({ seed: hello.seed, x: 1, y: 0 });
 		await until(() => watcher.neighbours().get('pit.1.0') === 'watching', 15_000, 'watching pit.1.0');
-		await until(() => mobsIn('pit.1.0') === layout.mobs.length, 10_000, 'every mob of pit.1.0');
-		console.error(`watching pit.1.0: ${mobsIn('pit.1.0')} mobs`);
+		// Only what the player's own view covers, measured from the player
+		// (pit.1.0's frame: world x − 40), leaving at +10 %.
+		const leave = hello.viewRadius * 1.1;
+		const eastMobs = () =>
+			watcher.client
+				.render()
+				.filter((e) => isMob(e) && !e.stale && e.zoneId === 'pit.1.0')
+				.map((e) => mobFields(e));
+		const focus = () => {
+			const at = watcher.position();
+			return { x: at.x - 40, y: at.y };
+		};
+		const withinView = (slack) => {
+			const f = focus();
+			return eastMobs().every((m) => Math.hypot(m.x - f.x, m.y - f.y) <= leave + slack);
+		};
+		const farMobs = () => {
+			const f = focus();
+			return layout.mobs.filter((m) => Math.hypot(m.x - f.x, m.y - f.y) > leave + 6).length;
+		};
+		await until(() => withinView(0.5), 10_000, 'pit.1.0 sends only what the player sees');
+		if (farMobs() > 0) assert.ok(eastMobs().length < layout.mobs.length, 'far mobs of pit.1.0 are not sent');
+		console.error(`watching pit.1.0 from the room's middle: ${mobsIn('pit.1.0')} of ${layout.mobs.length} mobs`);
+
+		// Walking up to the shared wall brings pit.1.0's west half into view.
+		const obstacles = watcher.pures.pitRoom({ seed: hello.seed, x: 0, y: 0 }).obstacles;
+		const middle = mobsIn('pit.1.0');
+		await walkTo(watcher, obstacles, [15, 3]);
+		await until(() => withinView(0.5) && mobsIn('pit.1.0') > middle, 10_000, 'more of pit.1.0 near its wall');
+		console.error(`watching pit.1.0 from beside its wall: ${mobsIn('pit.1.0')} of ${layout.mobs.length} mobs`);
+		await walkTo(watcher, obstacles, [-3, 3]);
 
 		// Its player leaves: the room sleeps although it is watched.
 		other.close();

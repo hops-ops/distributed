@@ -109,6 +109,8 @@ export {
 } from './typed.js';
 export { ClockSync, type ClockSample, type ClockSyncOptions } from './clock.js';
 export {
+	FOCUS_INTERVAL_MS,
+	FOCUS_MIN_MOVE,
 	GameConnection,
 	GameConnectionClosedError,
 	defaultScheduler,

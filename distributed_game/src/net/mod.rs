@@ -271,6 +271,12 @@ enum ZoneCmd {
         client: ClientId,
         version: String,
     },
+    /// An observer's `Focus`.
+    Focus {
+        client: ClientId,
+        x: f32,
+        y: f32,
+    },
     /// A zone inbox message (decoded into `Z::Message` on the zone task).
     Deliver {
         inbound: inbox::WireInbound,
@@ -1452,6 +1458,7 @@ fn handle_cmd<Z: Zone>(
         ZoneCmd::Content { client, version } => {
             host.content_patched(client, &version);
         }
+        ZoneCmd::Focus { client, x, y } => host.observer_focus(client, x, y),
         ZoneCmd::ChildEvent(event) => host.deliver_child_event(event),
         ZoneCmd::Deliver { inbound, reply } => {
             let _ = reply.send(inbound.decode::<Z::Message>().map(|m| host.deliver(m)));
@@ -1634,6 +1641,7 @@ enum Inbound {
     },
     Ping(f64),
     Content(String),
+    Focus(f32, f32),
 }
 
 async fn connection<Z>(inner: Arc<Inner<Z>>, zone_id: String, mut socket: WebSocket)
@@ -1895,6 +1903,7 @@ where
                     // Native zones keep observers' zones running already;
                     // nearness only matters to celld zones.
                     Ok(ClientMessage::Near { .. }) => continue,
+                    Ok(ClientMessage::Focus { x, y }) => Inbound::Focus(x, y),
                     Ok(ClientMessage::Leave) => { graceful = true; break; }
                     Ok(ClientMessage::Hello(_)) => {
                         let _ = socket.send(Message::Binary(error_frame(error::BAD_MESSAGE, "already joined").into())).await;
@@ -1993,6 +2002,7 @@ async fn forward_in<Z: Zone>(
             .send(ZoneCmd::Content { client, version })
             .await
             .is_ok(),
+        Inbound::Focus(x, y) => zone.send(ZoneCmd::Focus { client, x, y }).await.is_ok(),
         Inbound::Ping(client_time) => {
             let pong = ServerMessage::Pong {
                 client_time,

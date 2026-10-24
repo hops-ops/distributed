@@ -196,6 +196,7 @@ replication priorities are not transmitted.
 | `0x04` | C→S | Leave |
 | `0x05` | C→S | Content |
 | `0x06` | C→S | Near |
+| `0x07` | C→S | Focus |
 | `0x80` | S→C | Welcome |
 | `0x81` | S→C | Delta |
 | `0x82` | S→C | Event |
@@ -221,6 +222,7 @@ Ping   := 0x03, f64 client_time
 Leave  := 0x04
 Content := 0x05, string content_version
 Near   := 0x06, bool near
+Focus  := 0x07, f32 x, f32 y
 ```
 
 - **Hello** MUST be the first message, sent within the server's hello
@@ -261,6 +263,13 @@ Near   := 0x06, bool near
   `Error(WAKE_DENIED)` (the connection stays open).
   Servers that keep observed zones running anyway (the native `net`
   server) ignore it; players' are ignored.
+- **Focus**: where an observer is looking, in the zone's local
+  coordinates (e.g. its player next door, seen from this zone). The zone
+  decides what it means; by default the observer's view centre moves
+  there and keeps its radius. It only steers what that observer is sent.
+  Clients SHOULD throttle it (the JS SDK: at most every 200 ms, after a
+  move of 0.25 or more) and send it again after each Welcome. Players'
+  are ignored; non-finite values are ignored.
 
 Worked example — Hello (`version 1, content "c1", caps 5, ticket "t.k.n"`):
 
@@ -601,6 +610,9 @@ error codes and treat them as "session over" / "request failed"):
 - Error code `10` ASLEEP.
 - Error code `11` WAKE_DENIED.
 - `0x06 Near` (client → server) and the ticket claim `wake`.
+- `0x07 Focus` (client → server). A server built before it answers
+  `Error(BAD_MESSAGE)` (the native server keeps the connection; a celld
+  zone closes it), so deploy servers before clients that send it.
 
 Not additive (made before the first release, so the version stays 1):
 Hello's trailing `bool near` — clients built before it send one byte

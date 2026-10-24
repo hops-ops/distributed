@@ -414,6 +414,13 @@ client already has:
   the client when they leave it. A spatial grid makes this cheap. Mark
   entities that everyone must always see (players in a small room, a boss,
   pillars) with `.global()`.
+- **Across borders.** A client watching the zone next door (an observer)
+  tells it where the player is in that zone's coordinates (`Focus`; JS:
+  `watchZones(...).setFocus(at)`, throttled for you). By default the
+  observer's view centre follows (`Zone::on_observer_focus`; override it
+  to resize or clamp, as Mob Pit does with the player's own radius), so
+  interest and update rates carry on past the wall instead of the
+  neighbour sending all it has.
 - **Bandwidth budget.** Each client has `byte_budget` bytes per Delta
   (4 KiB). Creates and updates compete by priority (kind × entity ×
   field × nearness). Anything deferred builds up priority, so it is always

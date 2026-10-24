@@ -8,7 +8,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BUTTON, isMob, isPlayer, mobFields, playerFields } from '../../src/generated/mobpit/index.ts';
+import { BUTTON, isMob, isPlayer, mobFields, PIT_WORLD, playerFields } from '../../src/generated/mobpit/index.ts';
 import { freePort, startCelld } from './celld.mjs';
 import { sleep, startDemo } from './demo-server.mjs';
 import { startFleet } from './fleet.mjs';
@@ -95,6 +95,50 @@ export async function startPitFleet(demo = 'mobpit', vars = {}, nodes = 3) {
 			await fleet.stop();
 		}
 	};
+}
+
+/**
+ * Walk to room-local `(tx, ty)` (one command frame per tick), steering
+ * around the room's obstacles, and record in `seen.max` how many rooms
+ * were near at most.
+ */
+export async function walkTo(pit, obstacles, [tx, ty], seen = { max: 0 }, timeoutMs = 20_000) {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const me = pit.me();
+		const p = me && me.zoneId === pit.room() ? playerFields(me) : undefined;
+		seen.max = Math.max(seen.max, pit.near().size);
+		if (p !== undefined && Math.hypot(tx - p.x, ty - p.y) < 0.4) break;
+		if (Date.now() > deadline) throw new Error(`walk to ${tx},${ty} timed out at ${p?.x},${p?.y}`);
+		let input = { mx: 0, my: 0, buttons: 0 };
+		if (p !== undefined && !p.dead) {
+			let dx = tx - p.x;
+			let dy = ty - p.y;
+			const len = Math.max(Math.hypot(dx, dy), 1e-3);
+			dx /= len;
+			dy /= len;
+			// Push away from obstacles close ahead (slide around them).
+			for (const o of obstacles) {
+				const ox = p.x - o.x;
+				const oy = p.y - o.y;
+				const d = Math.hypot(ox, oy);
+				const clear = d - o.r - PIT_WORLD.playerRadius;
+				if (clear < 1.5 && ox * dx + oy * dy < 0) {
+					const k = 0.8 / Math.max(clear, 0.15);
+					// Sideways around it, on the side the target is.
+					const side = Math.sign(-oy * (tx - o.x) + ox * (ty - o.y)) || 1;
+					dx += ((side * -oy) / d) * k + (ox / d) * k * 0.3;
+					dy += ((side * ox) / d) * k + (oy / d) * k * 0.3;
+				}
+			}
+			const n = Math.max(Math.hypot(dx, dy), 1e-3);
+			const slow = Math.min(1, len / 1.5);
+			input = { mx: Math.round((dx / n) * 127 * Math.max(slow, 0.35)), my: Math.round((dy / n) * 127 * Math.max(slow, 0.35)), buttons: 0 };
+		}
+		pit.client.sendInput(input);
+		await sleep(1000 / 30);
+	}
+	pit.client.sendInput({ mx: 0, my: 0, buttons: 0 });
 }
 
 /**

@@ -13,6 +13,7 @@
 use crate::claims::TicketExtensions;
 use crate::facts::FactSettlement;
 use crate::host::Ctx;
+use crate::interest::View;
 use crate::protocol::Role;
 use crate::replication::WorldView;
 use crate::rewind::RewindFrame;
@@ -280,6 +281,21 @@ pub trait Zone: Sized + Send + 'static {
     /// An observer left. [`Ctx::observer`](crate::Ctx::observer) still
     /// returns it during this hook (it can no longer receive events).
     fn on_unobserve(&mut self, _ctx: &mut Ctx<'_, Self>, _observer: ObserverId) {}
+
+    /// An observer says where it is looking, in this zone's local
+    /// coordinates (`Focus`; e.g. a player next door, so this zone's
+    /// interest management follows that player across the border). The
+    /// default moves the observer's view centre there and keeps its
+    /// radius; override to clamp, resize or ignore it. Untrusted: it only
+    /// steers what the observer sees.
+    fn on_observer_focus(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId, x: f32, y: f32) {
+        if !(x.is_finite() && y.is_finite()) {
+            return;
+        }
+        if let Some(view) = ctx.view_of(observer) {
+            ctx.set_view(observer, View::new(x, y, view.radius));
+        }
+    }
 
     /// Decode raw input bytes from the wire; `None` drops the input.
     fn decode_input(&self, player: PlayerId, payload: &[u8]) -> Option<Self::Input>;

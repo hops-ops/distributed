@@ -24,6 +24,8 @@ export const GameMessageTag = Object.freeze({
 	CONTENT: 0x05,
 	/** Client → server: an observer is near (keep the zone awake) or passive again. */
 	NEAR: 0x06,
+	/** Client → server: where an observer is looking (zone-local `x`, `y`). */
+	FOCUS: 0x07,
 	WELCOME: 0x80,
 	DELTA: 0x81,
 	EVENT: 0x82,
@@ -98,7 +100,9 @@ export type LeaveMessage = Readonly<{ type: 'Leave' }>;
 export type ContentMessage = Readonly<{ type: 'Content'; contentVersion: string }>;
 /** An observer is near the zone (keep it awake, with a `wake` ticket) or passive again. */
 export type NearMessage = Readonly<{ type: 'Near'; near: boolean }>;
-export type GameClientMessage = HelloMessage | InputMessage | PingMessage | LeaveMessage | ContentMessage | NearMessage;
+/** Where an observer is looking, in the zone's local coordinates (the zone decides what it means; by default its view follows). */
+export type FocusMessage = Readonly<{ type: 'Focus'; x: number; y: number }>;
+export type GameClientMessage = HelloMessage | InputMessage | PingMessage | LeaveMessage | ContentMessage | NearMessage | FocusMessage;
 
 export type GameRole = 'player' | 'observer';
 
@@ -198,6 +202,9 @@ export function encodeClientMessage(message: GameClientMessage): Uint8Array {
 		case 'Near':
 			w.u8(GameMessageTag.NEAR).bool(message.near);
 			break;
+		case 'Focus':
+			w.u8(GameMessageTag.FOCUS).f32(message.x).f32(message.y);
+			break;
 	}
 	return w.finish();
 }
@@ -233,6 +240,9 @@ export function decodeClientMessage(bytes: Uint8Array): GameClientMessage {
 			break;
 		case GameMessageTag.NEAR:
 			message = { type: 'Near', near: r.bool() };
+			break;
+		case GameMessageTag.FOCUS:
+			message = { type: 'Focus', x: r.f32(), y: r.f32() };
 			break;
 		default:
 			throw new GameDecodeError('UNKNOWN_MESSAGE', `message type 0x${tag.toString(16)}`);

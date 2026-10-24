@@ -847,3 +847,69 @@ fn inputs_sent_through_a_stall_drain_but_a_fast_client_is_still_paced() {
         "{ack} inputs in {wall_ticks} ticks of wall time"
     );
 }
+
+/// Mob positions an observer's mirror holds (kind 2 = mob).
+fn mob_positions(mirror: &distributed_game::ClientMirror) -> Vec<(f32, f32)> {
+    use distributed_game::FieldValue;
+    mirror
+        .entities
+        .values()
+        .filter(|e| e.kind == 2)
+        .filter_map(|e| match (&e.fields[0], &e.fields[1]) {
+            (FieldValue::F(x), FieldValue::F(y)) => Some((*x, *y)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn observe(
+    room: &mut ZoneHost<MobPit>,
+    clock: &ManualClock,
+    client: ClientId,
+    mirror: &mut distributed_game::ClientMirror,
+) {
+    for _ in 0..6 {
+        for o in tick(room, clock) {
+            if let Outbound::Frame { client: c, frame } = o {
+                if c == client {
+                    mirror.apply(&frame).expect("frame");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_player_next_door_sees_this_room_from_where_it_stands() {
+    let clock = ManualClock::new();
+    let mut room = host("pit.0.0", &clock);
+    let claims = TicketClaims::new("ana", room.zone_id(), u64::MAX, "ana-w", Role::Observer);
+    let watcher = room.join(&claims, 0, "").expect("observe").client;
+    let mut mirror = distributed_game::ClientMirror::new();
+    observe(&mut room, &clock, watcher, &mut mirror);
+    let whole = mob_positions(&mirror);
+    assert!(
+        whole.iter().any(|&(x, _)| x > 5.0),
+        "before Focus a watcher sees the whole room: {whole:?}"
+    );
+
+    // Ana stands in the west room, 5 m from the shared wall: (-25, 0) here.
+    let focus = (-25.0_f32, 0.0_f32);
+    room.observer_focus(watcher, focus.0, focus.1);
+    observe(&mut room, &clock, watcher, &mut mirror);
+    let seen = mob_positions(&mirror);
+    // Her own view radius (24 m, leaving at +10 %), as in her own room.
+    let leave = mobpit_rooms::VIEW_RADIUS * 1.1;
+    for &(x, y) in &seen {
+        assert!(
+            (x - focus.0).hypot(y - focus.1) <= leave,
+            "mob at ({x}, {y}) is beyond her view: {seen:?}"
+        );
+    }
+    let near = whole
+        .iter()
+        .filter(|&&(x, y)| (x - focus.0).hypot(y - focus.1) < mobpit_rooms::VIEW_RADIUS - 2.0)
+        .count();
+    assert!(seen.len() >= near.min(1), "mobs near the wall stay visible");
+    assert!(seen.len() < whole.len(), "far mobs are no longer sent");
+}

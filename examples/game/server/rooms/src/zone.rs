@@ -1860,9 +1860,23 @@ impl Zone for MobPit {
         }
     }
 
-    /// A watcher (a player next door, a board page): the whole room.
+    /// A watcher (a player next door, a board page): the whole room, until
+    /// it says where it stands (`on_observer_focus`).
     fn on_observe(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId) {
         ctx.set_view(observer, View::new(0.0, 0.0, WATCH_RADIUS));
+    }
+
+    /// A player next door, at `(x, y)` in this room's coordinates, sees this
+    /// room as it sees its own: [`VIEW_RADIUS`] around it, so interest and
+    /// update rates carry on across the wall.
+    fn on_observer_focus(&mut self, ctx: &mut Ctx<'_, Self>, observer: ObserverId, x: f32, y: f32) {
+        if !(x.is_finite() && y.is_finite()) {
+            return;
+        }
+        // A watcher stands at most one room away.
+        let reach = 3.0 * movement::HALF;
+        let view = View::new(x.clamp(-reach, reach), y.clamp(-reach, reach), VIEW_RADIUS);
+        ctx.set_view(observer, view);
     }
 
     fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<PitInput> {

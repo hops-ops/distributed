@@ -67,7 +67,10 @@ export function reachRooms(room: readonly [number, number], near: number): strin
  * beyond `wakeRelease`, at most the two of a corner, corner rooms never)
  * are made near on `watch` — the rooms wake and stay live (the ticket
  * route grants `wake` only for rooms within two doorways of the player's
- * last room). `enabled()` false: none (passive watchers). Returns stop.
+ * last room). `enabled()` false: none (passive watchers). Every tick also
+ * tells each watched neighbour where the player stands in its coordinates
+ * (`setFocus`), so it sends only what the player's own view covers.
+ * Returns stop.
  */
 export function startProximityWake(
 	client: GameClient<PitInput>,
@@ -87,6 +90,14 @@ export function startProximityWake(
 			bits = 0;
 		}
 		const me = client.render().find((e) => e.predicted && e.zoneId === zone && isPlayer(e));
+		if (at !== undefined && me !== undefined) {
+			// Each neighbour applies the player's own view around it.
+			const p = playerFields(me);
+			watch.setFocus((neighbour) => {
+				const r = parseRoom(neighbour);
+				return r === undefined ? undefined : { x: p.x + (at[0] - r[0]) * ROOM, y: p.y + (at[1] - r[1]) * ROOM };
+			});
+		}
 		let next = 0;
 		if (enabled() && at !== undefined && me !== undefined && pures.loaded()) {
 			const p = playerFields(me);

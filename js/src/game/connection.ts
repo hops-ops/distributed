@@ -200,6 +200,11 @@ type Attempt = {
 
 const defaultBackoff = (attempt: number): number => Math.min(5000, 250 * 2 ** (attempt - 1));
 
+/** Observers: at most one `Focus` per this many ms (see `setFocus`). */
+export const FOCUS_INTERVAL_MS = 200;
+/** Observers: a `Focus` is sent only after a move of this many metres. */
+export const FOCUS_MIN_MOVE = 0.25;
+
 export class GameConnection {
 	readonly zoneId: string;
 	readonly clock: ClockSync;
@@ -217,6 +222,9 @@ export class GameConnection {
 	#url: string;
 	#contentVersion: string;
 	#near: boolean;
+	/** Observers: the focus asked for, and the last one sent (and when). */
+	#focus: { x: number; y: number } | undefined;
+	#focusSent: { x: number; y: number; at: number } | undefined;
 	#redirects = 0;
 	#lastResumeVersion: string | undefined;
 	#attempt: Attempt | undefined;
@@ -444,6 +452,30 @@ export class GameConnection {
 	}
 
 	/**
+	 * Observers: where this watcher is looking, in the zone's local
+	 * coordinates (a player next door: its position seen from this zone, so
+	 * the zone's interest management follows it). Call it as often as you
+	 * like (e.g. every frame): it is sent at most every
+	 * {@link FOCUS_INTERVAL_MS} and only after a move of
+	 * {@link FOCUS_MIN_MOVE} or more, and again after every (re)connect.
+	 */
+	setFocus(x: number, y: number): void {
+		if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+		this.#focus = { x, y };
+		this.#sendFocus();
+	}
+
+	#sendFocus(): void {
+		const focus = this.#focus;
+		if (focus === undefined || this.#state !== 'open' || this.mirror.welcome?.role !== 'observer') return;
+		const now = this.#scheduler.now();
+		const last = this.#focusSent;
+		if (last !== undefined && (now - last.at < FOCUS_INTERVAL_MS || Math.hypot(focus.x - last.x, focus.y - last.y) < FOCUS_MIN_MOVE)) return;
+		this.#focusSent = { ...focus, at: now };
+		this.#send({ type: 'Focus', x: focus.x, y: focus.y });
+	}
+
+	/**
 	 * Continue after a content reload (state `reload-required`): sends the
 	 * new `contentVersion` in Hello, with the reconnect token while the grace
 	 * window lasts, else with a fresh ticket.
@@ -645,6 +677,8 @@ export class GameConnection {
 		this.clock.reset();
 		this.clock.seed(welcome.serverTime, this.#scheduler.now());
 		this.#setState('open');
+		this.#focusSent = undefined;
+		this.#sendFocus();
 		this.#startPing();
 		this.#emitter.emit('welcome', welcome, { resumed: attempt.mode === 'resume', reconnected });
 		const waiters = this.#connectWaiters;
