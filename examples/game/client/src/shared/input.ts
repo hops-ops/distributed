@@ -15,8 +15,10 @@ export type Sample = Readonly<{
 	action: boolean;
 	/** Secondary action: E / F / gamepad B or LB. */
 	alt: boolean;
-	/** Jump: Q / C / gamepad Y. */
+	/** Jump: Q / gamepad Y. */
 	jump: boolean;
+	/** Fire (ranged): gamepad RT, held. Keyboard / mouse firing is per game. */
+	fire: boolean;
 }>;
 
 const UP = ['KeyW', 'ArrowUp'];
@@ -25,7 +27,7 @@ const LEFT = ['KeyA', 'ArrowLeft'];
 const RIGHT = ['KeyD', 'ArrowRight'];
 const ACTION = ['Space', 'ShiftLeft', 'ShiftRight'];
 const ALT = ['KeyE', 'KeyF'];
-const JUMP = ['KeyQ', 'KeyC'];
+const JUMP = ['KeyQ'];
 const DEADZONE = 0.15;
 
 export class InputSampler {
@@ -60,6 +62,7 @@ export class InputSampler {
 		let action = this.#any(ACTION);
 		let alt = this.#any(ALT);
 		let jump = this.#any(JUMP);
+		let fire = false;
 		const pad = firstGamepad();
 		if (pad !== undefined) {
 			const gx = pad.axes[0] ?? 0;
@@ -71,13 +74,14 @@ export class InputSampler {
 			action ||= pad.buttons[0]?.pressed === true || pad.buttons[5]?.pressed === true;
 			alt ||= pad.buttons[1]?.pressed === true || pad.buttons[4]?.pressed === true;
 			jump ||= pad.buttons[3]?.pressed === true;
+			fire = (pad.buttons[7]?.value ?? 0) > 0.5;
 		}
 		const length = Math.hypot(x, y);
 		if (length > 1) {
 			x /= length;
 			y /= length;
 		}
-		return { x, y, action, alt, jump };
+		return { x, y, action, alt, jump, fire };
 	}
 
 	dispose(): void {
@@ -129,6 +133,16 @@ export function rightStick(deadzone = DEADZONE): { x: number; y: number } {
 		neutralSeen.add(key);
 	}
 	return { x: Math.abs(x) > deadzone ? x : 0, y: Math.abs(y) > deadzone ? y : 0 };
+}
+
+/** `standard` layout buttons the HUD's toggles can take. */
+export const PAD = { view: 8, menu: 9, l3: 10, r3: 11 } as const;
+const PAD_NAME: Record<number, string> = { 8: 'View', 9: 'Menu', 10: 'L3', 11: 'R3' };
+export const padButtonName = (index: number): string => PAD_NAME[index] ?? `pad ${index}`;
+
+/** Is button `index` of the active pad down? */
+export function padPressed(index: number): boolean {
+	return activeGamepad()?.buttons[index]?.pressed === true;
 }
 
 /** One-line description of the active pad for HUD diagnostics. */

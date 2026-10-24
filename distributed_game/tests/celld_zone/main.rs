@@ -34,7 +34,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use distributed_game::protocol::{error, ClientMessage, Hello, ServerMessage, PROTOCOL_VERSION};
+use distributed_game::protocol::{
+    error, feature, ClientMessage, ClientMirror, Hello, ServerMessage, Welcome, PROTOCOL_VERSION,
+};
 use distributed_game::ticket::TicketKey;
 use distributed_game::{Role, TicketClaims};
 use futures_util::{SinkExt, StreamExt};
@@ -118,6 +120,8 @@ enum Got {
 struct Player {
     ws: Ws,
     seq: u32,
+    /// Protocol version offered in Hello (Welcomes decode in it).
+    protocol: u32,
 }
 
 impl Player {
@@ -126,11 +130,15 @@ impl Player {
     }
 
     async fn try_connect(base: &str, zone: &str) -> Result<Self, String> {
-        let url = format!("{}/rooms/{zone}", base.replacen("http://", "ws://", 1));
+        let url = format!("{}/zones/{zone}", base.replacen("http://", "ws://", 1));
         let (ws, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(Self { ws, seq: 0 })
+        Ok(Self {
+            ws,
+            seq: 0,
+            protocol: PROTOCOL_VERSION,
+        })
     }
 
     async fn send(&mut self, message: ClientMessage) {
@@ -146,7 +154,7 @@ impl Player {
 
     async fn hello_near(&mut self, ticket: &str, near: bool) {
         self.send(ClientMessage::Hello(Hello {
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: self.protocol,
             content_version: String::new(),
             capabilities: 0,
             ticket: ticket.into(),
@@ -172,11 +180,13 @@ impl Player {
             let left = deadline.saturating_duration_since(Instant::now());
             let frame = tokio::time::timeout(left, self.ws.next()).await.ok()?;
             match frame {
-                Some(Ok(Message::Binary(bytes))) => match ServerMessage::decode(&bytes, &()) {
-                    Ok(message) => return Some(Got::Server(message)),
-                    // Deltas need the Welcome's schema; these tests skip them.
-                    Err(_) => continue,
-                },
+                Some(Ok(Message::Binary(bytes))) => {
+                    match ServerMessage::decode(&bytes, &ClientMirror::speaking(self.protocol)) {
+                        Ok(message) => return Some(Got::Server(message)),
+                        // Deltas need the Welcome's schema; these tests skip them.
+                        Err(_) => continue,
+                    }
+                }
                 Some(Ok(Message::Close(frame))) => {
                     return Some(Got::Closed(frame.map(|f| u16::from(f.code))))
                 }
@@ -209,8 +219,12 @@ impl Player {
     }
 
     async fn welcome(&mut self) {
+        self.welcome_message().await;
+    }
+
+    async fn welcome_message(&mut self) -> Welcome {
         self.expect(Duration::from_secs(20), "Welcome", |got| match got {
-            Got::Server(ServerMessage::Welcome(_)) => Some(()),
+            Got::Server(ServerMessage::Welcome(w)) => Some(w.clone()),
             Got::Server(ServerMessage::Error { code, message }) => {
                 panic!("join refused: {code} {message}")
             }
@@ -312,6 +326,30 @@ async fn single_node() {
     assert_eq!(ana.total(2).await, 5);
     until(&base, "/tally/ana", long, |v| exactly_once(v, 5)).await;
 
+    // The zone answers in the client's protocol version: v1 Welcome for a
+    // v1 client, v2 (runtime features) for v2; a version it does not speak
+    // is refused before the ticket is used, so the same ticket then joins.
+    let mut old = Player::connect(&base, "room-a").await;
+    old.protocol = 1;
+    old.hello(&ticket_as("old", "room-a", Role::Observer)).await;
+    let w = old.welcome_message().await;
+    assert_eq!((w.protocol_version, w.features, w.origin), (1, 0, None));
+    let mut new = Player::connect(&base, "room-a").await;
+    new.hello(&ticket_as("new", "room-a", Role::Observer)).await;
+    let w = new.welcome_message().await;
+    assert_eq!(w.protocol_version, 2);
+    assert_eq!(w.features & feature::FOCUS, feature::FOCUS);
+    new.send(ClientMessage::Focus { x: 1.0, y: 2.0 }).await;
+    let mut future = Player::connect(&base, "room-a").await;
+    future.protocol = PROTOCOL_VERSION + 1;
+    let same = ticket_as("future", "room-a", Role::Observer);
+    future.hello(&same).await;
+    assert_eq!(future.refused().await, error::VERSION_MISMATCH);
+    let mut future = Player::connect(&base, "room-a").await;
+    future.hello(&same).await;
+    future.welcome().await;
+    drop((old, new, future));
+
     // A used ticket is refused.
     let mut replay = Player::connect(&base, "room-a").await;
     replay.hello(&first).await;
@@ -327,7 +365,7 @@ async fn single_node() {
         status(v) == "hibernated"
     })
     .await;
-    let info = get(&base, "/rooms/room-a/info").await;
+    let info = get(&base, "/zones/room-a/info").await;
     assert_eq!(info["awake"], false, "{info}");
 
     // Wake with state.
@@ -380,7 +418,7 @@ async fn watchers() {
     let mut eve = Player::connect(&base, "room-w").await;
     eve.hello(&ticket_as("eve", "room-w", Role::Observer)).await;
     assert_eq!(eve.refused().await, error::ASLEEP);
-    let info = get(&base, "/rooms/room-w/info").await;
+    let info = get(&base, "/zones/room-w/info").await;
     assert_eq!(info["awake"], false, "{info}");
     assert_eq!(info["wakes"], 0, "{info}");
 
@@ -415,14 +453,14 @@ async fn watchers() {
         })
         .await;
     assert_eq!(closed, Some(1000));
-    let info = get(&base, "/rooms/room-w/info").await;
+    let info = get(&base, "/zones/room-w/info").await;
     assert_eq!(info["awake"], false, "{info}");
 
     // Asleep: a watcher is refused again, the zone stays asleep.
     let mut eve = Player::connect(&base, "room-w").await;
     eve.hello(&ticket_as("eve", "room-w", Role::Observer)).await;
     assert_eq!(eve.refused().await, error::ASLEEP);
-    let info = get(&base, "/rooms/room-w/info").await;
+    let info = get(&base, "/zones/room-w/info").await;
     assert_eq!(info["awake"], false, "{info}");
     assert_eq!(info["wakes"], 1, "woken once, by the player: {info}");
 }
@@ -446,7 +484,7 @@ async fn near_watchers() {
     let mut eve = Player::connect(&base, zone).await;
     eve.hello_near(&wake_ticket("eve", zone), false).await;
     assert_eq!(eve.refused().await, error::ASLEEP);
-    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
     assert_eq!(info["awake"], false, "{info}");
     assert_eq!(info["wakes"], 0, "{info}");
 
@@ -460,7 +498,7 @@ async fn near_watchers() {
     .await;
     // Kept awake past the hibernation delay (2 s here).
     tokio::time::sleep(Duration::from_secs(4)).await;
-    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
     assert_eq!(info["ticking"], true, "{info}");
     assert_eq!(info["players"], 0, "{info}");
     assert_eq!(info["near"], 1, "{info}");
@@ -481,7 +519,7 @@ async fn near_watchers() {
         })
         .await;
     assert_eq!(denied, error::WAKE_DENIED);
-    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
     assert_eq!(info["near"], 1, "{info}");
 
     // Passive again: dormant; near again: active (no reconnect).
@@ -495,7 +533,7 @@ async fn near_watchers() {
         status(v) == "active"
     })
     .await;
-    let info = until(&base, &format!("/rooms/{zone}/info"), long, |v| {
+    let info = until(&base, &format!("/zones/{zone}/info"), long, |v| {
         v["ticking"] == true
     })
     .await;
@@ -516,7 +554,7 @@ async fn near_watchers() {
             .await;
         assert_eq!(closed, Some(1000));
     }
-    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
     assert_eq!(info["awake"], false, "{info}");
 
     // A near watcher that disconnects releases the zone too.
@@ -532,7 +570,7 @@ async fn near_watchers() {
         status(v) == "hibernated"
     })
     .await;
-    let info = get(&base, &format!("/rooms/{zone}/info")).await;
+    let info = get(&base, &format!("/zones/{zone}/info")).await;
     assert_eq!(info["wakes"], 2, "{info}");
 }
 
@@ -550,7 +588,7 @@ async fn fleet() {
     let mut probe = Player::connect(&a, "room-x").await;
     probe.hello(&ticket("probe", "room-x")).await;
     probe.welcome().await;
-    let info = until(&a, "/rooms/room-x/info", long, |v| {
+    let info = until(&a, "/zones/room-x/info", long, |v| {
         v["node"].as_str().is_some_and(|n| !n.is_empty())
     })
     .await;
@@ -575,7 +613,7 @@ async fn fleet() {
     // Crash the owner once the 200 facts are in the zone's outbox (written
     // right after the tick that emitted them); some may already be
     // committed, most are in flight.
-    until(&a, "/rooms/room-x/info", long, |v| {
+    until(&a, "/zones/room-x/info", long, |v| {
         v["spooledFacts"].as_u64().unwrap_or(0) >= 200
     })
     .await;

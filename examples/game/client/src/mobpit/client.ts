@@ -7,7 +7,7 @@
  * and the `/dev/mobpit/*` routes.
  *
  * Every room (`pit.<x>.<y>`) is a celld Durable Object reached at
- * `/rooms/{room}`; celld forwards the socket to whichever node runs it.
+ * `/zones/{room}`; celld forwards the socket to whichever node runs it.
  * Walking through a doorway, the room hands the player to the next room
  * (`Handoff`), and the SDK reconnects there with the transfer ticket.
  *
@@ -17,7 +17,11 @@
  * `game_sim::mobpit`).
  *
  * Neighbours: the client also watches the 8 rooms around its own as an
- * observer (`watchZones` over `neighbourRooms`), so their mobs are drawn where they are. On
+ * observer (`watchZones` over `neighbourRooms`), so their mobs are drawn where they are.
+ * The client tells the SDK where the player is (`setPosition`); every room
+ * says where it sits in the world (Welcome origin), so each watcher is
+ * focused on the player in that room's coordinates, and the room
+ * replicates only what is within the player's own view radius around it. On
  * celld an observer is a passive watcher: it keeps no room awake and wakes
  * none (a sleeping room answers `ASLEEP`; it is tried again every few
  * seconds and shows nothing meanwhile).
@@ -126,12 +130,12 @@ export function neighbourRooms(zone: string): string[] {
 
 /**
  * WebSocket URL of a room. `base` is the http(s) origin rooms are reached
- * at (celld, in Node tests); in the browser the page's own origin (Vite
- * proxies `/rooms` to celld).
+ * at (the services' gateway, or celld itself in Node tests); in the browser
+ * the page's own origin (Vite proxies `/zones` to the gateway).
  */
 export function roomUrl(zone: string, base?: string): string {
 	const origin = base ?? globalThis.location.origin;
-	return `${origin.replace(/^http/, 'ws')}/rooms/${encodeURIComponent(zone)}`;
+	return `${origin.replace(/^http/, 'ws')}/zones/${encodeURIComponent(zone)}`;
 }
 /** `state` names of the `mob` kind, by value (generated from the Rust `MOB_STATES`). */
 export const MOB_STATE = pit.PIT_RULES.states;
@@ -252,7 +256,7 @@ export type TiersAround = Readonly<{
 	city: { bosses_down: number; boroughs_cleared: number; banner: string } | null;
 }>;
 
-/** A room object's debug JSON (`/rooms/{room}/info`). */
+/** A room object's debug JSON (`/zones/{room}/info`). */
 export type RoomInfo = Readonly<{
 	zone: string;
 	status: string;
@@ -538,6 +542,13 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 			reachBits = 0;
 		}
 		const meNow = me();
+		// Each watched room (placed in the world by its Welcome origin)
+		// applies the player's own view around it: its interest radius
+		// carries on across the wall.
+		if (meNow !== undefined) {
+			const p = pit.playerFields(meNow);
+			typed.client.setPosition(p.x, p.y, meNow.zoneId);
+		}
 		let bits = 0;
 		if (wake && at !== undefined && meNow !== undefined && meNow.zoneId === room && pures.loaded()) {
 			const p = pit.playerFields(meNow);
@@ -658,7 +669,7 @@ export class MobPitApi {
 
 	/** A room object's debug JSON, straight from the room on celld (does not wake it). */
 	async roomInfo(zone: string): Promise<RoomInfo> {
-		const response = await fetch(`${this.roomsBase}/rooms/${encodeURIComponent(zone)}/info`);
+		const response = await fetch(`${this.roomsBase}/zones/${encodeURIComponent(zone)}/info`);
 		if (!response.ok) throw new Error(`room info ${zone}: HTTP ${response.status}`);
 		return (await response.json()) as RoomInfo;
 	}

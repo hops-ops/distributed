@@ -12,7 +12,9 @@ use distributed::microsvc::{
 use distributed::{sourced, Entity};
 use std::collections::HashMap;
 
-use distributed_game::cell::{command_id_for, session_stamp, CellFactSink};
+use distributed_game::cell::{
+    command_id_for, fact_session_from_headers, run_fact_batch, session_stamp, CellFactSink,
+};
 use distributed_game::{
     fact_channel, spawn_fact_worker, stamp_metadata, Fact, FactOutcome, FactStamp, RetryPolicy,
 };
@@ -176,6 +178,81 @@ async fn facts_dispatch_idempotently_with_trusted_principal() {
 
     drop(queue);
     worker.await.unwrap();
+}
+
+/// A `__batch` body of `amounts` for alice, one entry per amount; `None`
+/// is an entry without a partition.
+fn batch_body(amounts: &[Option<u32>]) -> serde_json::Value {
+    let entries: Vec<_> = amounts
+        .iter()
+        .enumerate()
+        .map(|(i, amount)| {
+            let mut session = serde_json::Map::new();
+            session.insert("x-user-id".into(), json!("alice"));
+            let stamp = FactStamp {
+                zone_id: "z1".into(),
+                tick: i as u64,
+                ..FactStamp::default()
+            };
+            for (name, value) in stamp.session_vars() {
+                session.insert(name, json!(value));
+            }
+            let mut entry = json!({
+                "command": "hero.credit_xp",
+                "commandId": command_id_for("game-svc", &format!("kill:z1:{i}")),
+                "input": { "amount": amount.unwrap_or(1) },
+                "session": session,
+            });
+            if amount.is_some() {
+                entry["partition"] = json!("alice");
+            }
+            entry
+        })
+        .collect();
+    json!({ "entries": entries })
+}
+
+#[tokio::test]
+async fn a_replayed_batch_answers_only_replays() {
+    let cell = AggregateCell::<Hero>::new("alice").unwrap().mount(CreditXp);
+    let sessions = |header: &dyn Fn(&str) -> Option<String>| fact_session_from_headers(header);
+    let body = batch_body(&[Some(10), Some(20), None, Some(30)]);
+
+    let first = run_fact_batch(&cell, "game-svc", &body, sessions)
+        .await
+        .unwrap();
+    let first = first["results"].as_array().unwrap().clone();
+    let statuses: Vec<_> = first
+        .iter()
+        .map(|r| r["status"].as_u64().unwrap())
+        .collect();
+    // The entry without a partition is refused in its place; the rest commit.
+    assert_eq!(statuses, [200, 200, 400, 200]);
+    let xp: Vec<_> = first
+        .iter()
+        .map(|r| r["body"]["payload"]["xp"].clone())
+        .collect();
+    assert_eq!(xp, [json!(10), json!(30), json!(null), json!(60)]);
+    assert!(first
+        .iter()
+        .all(|r| r["body"]["receipt"]["replayed"] != json!(true)));
+
+    // The whole batch again, same command ids: replays only, nothing new.
+    let replay = run_fact_batch(&cell, "game-svc", &body, sessions)
+        .await
+        .unwrap();
+    let replay = replay["results"].as_array().unwrap().clone();
+    assert_eq!(replay.len(), 4);
+    for (i, (replayed, original)) in replay.iter().zip(&first).enumerate() {
+        assert_eq!(replayed["status"], original["status"]);
+        if i == 2 {
+            continue;
+        }
+        assert_eq!(replayed["body"]["receipt"]["replayed"], json!(true));
+        assert_eq!(replayed["body"]["payload"], original["body"]["payload"]);
+    }
+    assert_eq!(cell.load().await.unwrap().unwrap().xp, 60, "credited once");
+    assert_eq!(cell.history().await.unwrap().len(), 3);
 }
 
 async fn wait_one(queue: &mut distributed_game::FactQueue) -> distributed_game::FactSettlement {

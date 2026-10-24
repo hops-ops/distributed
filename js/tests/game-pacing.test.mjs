@@ -69,7 +69,8 @@ test('GameClient: adaptive delay by default, fixed when configured, prediction t
 		prediction: {
 			encodeInput: (dx) => new Uint8Array([dx & 0xff]),
 			predict: (s, dx, dt) => ({ x: s.x + (dx * dt) / 1000 }),
-			controlledEntity: () => 1
+			controlledEntity: () => 1,
+			smoothSteps: false
 		}
 	});
 	await client.connect('z1');
@@ -109,4 +110,36 @@ test('GameClient: adaptive delay by default, fixed when configured, prediction t
 	assert.equal(fixed.interpolationDelay(fixed.authority), 70);
 	assert.equal(fixed.adaptiveDelay(fixed.authority), undefined);
 	fixed.close();
+});
+
+test('GameClient: the controlled entity moves smoothly through each predicted step (smoothSteps)', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	network.onMessage = (conn, m) => {
+		if (m.type === 'Hello') conn.send(welcome({ serverTime: 10_000 }));
+	};
+	const client = new GameClient({
+		url: (zone) => `ws://game.test/zones/${zone}`,
+		ticket: () => 't',
+		socket: network.factory,
+		scheduler,
+		pingIntervalMs: 60_000,
+		prediction: {
+			encodeInput: (dx) => new Uint8Array([dx & 0xff]),
+			predict: (s, dx, dt) => ({ x: s.x + (dx * dt) / 1000 }),
+			controlledEntity: () => 1
+		}
+	});
+	await client.connect('z1');
+	network.last('z1').send(delta({ creates: [avatar(1, 0)] }));
+	await scheduler.advance(1);
+	const start = scheduler.time;
+	client.sendInput(50, 1000); // +50 over the next 1000 ms
+	const x = () => client.render().find((e) => e.id === 1).fields.x;
+	assert.ok(Math.abs(x()) < 0.01, `drawn from where it was: ${x()}`);
+	scheduler.time = start + 500;
+	assert.ok(Math.abs(x() - 25) < 0.01, `halfway through the step: ${x()}`);
+	scheduler.time = start + 1000;
+	assert.ok(Math.abs(x() - 50) < 0.01, `the prediction at the end of the step: ${x()}`);
+	client.close();
 });

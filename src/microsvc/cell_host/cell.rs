@@ -252,6 +252,51 @@ where
         result
     }
 
+    /// Dispatch `commands` in order, each exactly as
+    /// [`dispatch_idempotent`](Self::dispatch_idempotent) (its own ledger
+    /// entry, identity and session), under one command guard and one alarm
+    /// reschedule. A rejected command leaves the earlier ones committed and
+    /// the later ones still run; the first retryable result (in progress,
+    /// 408, 429, 5xx) ends the batch. One result per command attempted.
+    ///
+    /// Each command is still its own transaction: a handler runs between
+    /// its ledger reservation and its commit, outside the synchronous cell
+    /// SQL transaction, and must see the commands before it committed.
+    pub async fn dispatch_idempotent_batch(
+        &self,
+        commands: Vec<CellBatchCommand>,
+    ) -> Vec<Result<CellDispatchResult, CellDispatchError>> {
+        if commands.is_empty() {
+            return Vec::new();
+        }
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        let _command = match self.begin_command().await {
+            Ok(guard) => guard,
+            Err(error) => return vec![Err(CellDispatchError::Internal(error.to_string()))],
+        };
+        let mut results = Vec::with_capacity(commands.len());
+        for command in commands {
+            let result = self
+                .routes
+                .dispatch_cell_causal(
+                    &command.command,
+                    &command.identity,
+                    command.input,
+                    command.session,
+                    &self.shard,
+                )
+                .await;
+            let stop = result.as_ref().is_err_and(ends_batch);
+            results.push(result);
+            if stop {
+                break;
+            }
+        }
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        self.reschedule_after_command().await;
+        results
+    }
+
     /// Armed alarms of this cell, earliest first.
     pub fn armed_schedules(&self) -> Result<Vec<ArmedSchedule>, RepositoryError> {
         self.routes.repo().repo().armed_schedules()
@@ -684,6 +729,26 @@ where
             activity: Default::default(),
         })
     }
+}
+
+/// One command of [`AggregateCell::dispatch_idempotent_batch`].
+#[derive(Debug, Clone)]
+pub struct CellBatchCommand {
+    /// Mounted command name.
+    pub command: String,
+    /// Its ledger identity (service, principal partition, command id).
+    pub identity: CellCommandIdentity,
+    /// Command input.
+    pub input: Value,
+    /// Its trusted session.
+    pub session: Session,
+}
+
+/// A batch stops at a result worth retrying: the command is in progress,
+/// timed out, throttled or failed inside the cell.
+fn ends_batch(error: &CellDispatchError) -> bool {
+    let status = error.status_code();
+    status >= 500 || matches!(status, 408 | 429) || error.code() == "COMMAND_IN_PROGRESS"
 }
 
 /// Worker-side namespace: `getByName(format!("{}:{}", type, shard))`.

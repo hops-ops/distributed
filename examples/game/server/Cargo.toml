@@ -39,7 +39,7 @@ distributed_game = { path = "../../../distributed_game", features = ["net", "cel
 # projection bus and the modeled projector of the crawler directory
 # (`graphql` gates modeled projections). Its durable cells run on celld
 # (`examples/game/cells`), reached with `distributed_game`'s `celld` feature.
-distributed = { path = "../../..", features = ["redis", "sqlite", "graphql"] }
+distributed = { path = "../../..", features = ["redis", "sqlite", "graphql", "gateway-native"] }
 # Reads of the celld cells over the internal path.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # The SQLite bus the cells' domain events are relayed onto (`--projection-bus`).

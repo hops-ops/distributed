@@ -171,3 +171,43 @@ test('a new correction while easing starts from the currently displayed value', 
 	close(p.current(50).x, 7, 1e-9, 'no visual pop');
 	close(p.current(150).x, 0, 1e-9);
 });
+
+test('a step recorded with its time is drawn as motion over its interval', () => {
+	const p = boundPredictor({ mode: 'ease', durationMs: 100 });
+	p.record(1, 10, 100, 0); // predicted x = 1, drawn from 0 over 100 ms
+	close(p.predicted().x, 1, 1e-9);
+	close(p.current(0).x, 0, 1e-9);
+	close(p.current(50).x, 0.5, 1e-9);
+	close(p.current(100).x, 1, 1e-9);
+	close(p.current(500).x, 1, 1e-9, 'holds the prediction past the interval');
+	p.record(2, 10, 100, 100);
+	close(p.current(100).x, 1, 1e-9, 'no pop at the next step');
+	close(p.current(150).x, 1.5, 1e-9);
+	// Without a time the prediction is drawn as is (no blend).
+	const plain = boundPredictor({ mode: 'ease', durationMs: 100 });
+	plain.record(1, 10, 100);
+	close(plain.current(0).x, 1, 1e-9);
+});
+
+test('a Delta mid-step keeps the motion going', () => {
+	const p = boundPredictor({ mode: 'ease', durationMs: 100 });
+	p.record(1, 10, 100, 0);
+	p.record(2, 10, 100, 100); // predicted 2, drawn from 1 over 100..200
+	const agree = p.reconcile(1, { x: 1, y: 0, yaw: 0, hp: 100, name: 'p' }, 150);
+	assert.deepEqual(agree.errors, {});
+	close(p.current(150).x, 1.5, 1e-9, 'no stall or pop');
+	close(p.current(175).x, 1.75, 1e-9, 'still moving at the step rate');
+	close(p.current(200).x, 2, 1e-9);
+});
+
+test('a correction mid-step eases only the error, not the motion', () => {
+	const p = boundPredictor({ mode: 'ease', durationMs: 100 });
+	p.record(1, 10, 100, 0);
+	p.record(2, 10, 100, 100);
+	// Server: x 0.8 after input 1, so the prediction becomes 1.8.
+	const c = p.reconcile(1, { x: 0.8, y: 0, yaw: 0, hp: 100, name: 'p' }, 150);
+	close(c.errors.x, 0.2, 1e-9);
+	close(p.current(150).x, 1.5, 1e-9, 'no visual pop');
+	close(p.current(200).x, 1.9, 1e-9, 'motion done, half the error left');
+	close(p.current(250).x, 1.8, 1e-9);
+});

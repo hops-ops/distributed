@@ -24,6 +24,9 @@
 #                           the Vite plugin, Svelte HUD, and the settled
 #                           read model from mobpit-service over GraphQL @live
 #                           (`distributed dev server/` runs the service + UI)
+#   ./run.sh build          build what Mob Pit on Hops local loads from this
+#                           checkout (JS SDK, WebAssembly, cells worker);
+#                           the Environment's setup runs it (.gitops/local)
 #   ./run.sh smoke          every demo's smoke tests (Rust bots + headless JS,
 #                           generated clients checked, SvelteKit headless)
 #   ./run.sh list           demos this script knows
@@ -140,6 +143,22 @@ kill_tree() {
 	kill -KILL "${pids[@]}" 2>/dev/null || true
 }
 
+# warn_celld_state <state dir>: a `celld dev` state only grows (celld keeps
+# every write; epoch GC stalls rooms while it runs). Past a few hundred
+# cells or ~100 MB, rooms drop ticks and a restart takes minutes (a
+# 255-cell, 216 MB state never became ready) to answer (client/tests/mobpit-soak-headless.test.mjs). Say so and how
+# to reset; never reset on its own.
+warn_celld_state() {
+	local state="$1" cells=0 mb=0
+	[[ -d "$state/runtime" ]] && cells=$(find "$state/runtime" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')
+	[[ -f "$state/objects.sqlite3" ]] && mb=$(($(wc -c <"$state/objects.sqlite3") / 1048576))
+	if ((cells > ${CELLD_STATE_WARN_CELLS:-500} || mb > ${CELLD_STATE_WARN_MB:-100})); then
+		printf '\033[1;33m[demos]\033[0m celld dev state is large (%s cells, %s MB): rooms may stutter and a restart\n' "$cells" "$mb"
+		printf '        can take minutes. Reset it (local rooms, players and progress on celld are lost):\n'
+		printf '        rm -rf %q\n' "$state"
+	fi
+}
+
 # start_celld <project> <port> <relay port>: `celld dev` with the cells
 # worker in <project> (its state persists in <project>/.celld/dev), relaying
 # the outbox Queue to the game server on <relay port>. Sets CELLD_PID,
@@ -149,6 +168,7 @@ start_celld() {
 	local project="$1" port="$2" relay_port="$3"
 	ensure_celld
 	ensure_cells
+	warn_celld_state "$project/.celld/dev"
 	mkdir -p "$project"
 	rm -rf "$project/build"
 	cp -R "$CELLS/build" "$project/build"
@@ -160,7 +180,8 @@ start_celld() {
 	printf 'DISTRIBUTED_INTERNAL_SECRET=%s\nCELLD_QUEUE_RELAY_URL=http://127.0.0.1:%s/internal/celld-queue/relay\n%s' \
 		"$DISTRIBUTED_INTERNAL_SECRET" "$relay_port" "${CELLD_EXTRA_VARS:-}" >"$project/.dev.vars"
 	log "starting celld dev on :$port ($("$CELLD_BIN" --version 2>/dev/null | grep '^celld ' | head -1); state in $project/.celld/dev)"
-	RUST_LOG=warn "$CELLD_BIN" dev "$project" --host 127.0.0.1 --port "$port" --no-watch --logs >"$project/celld.log" 2>&1 &
+	# One node: no ownership balancing (its sampler walks every cell).
+	CELLD_REBALANCE_INTERVAL_MS="${CELLD_REBALANCE_INTERVAL_MS:-0}" RUST_LOG=warn "$CELLD_BIN" dev "$project" --host 127.0.0.1 --port "$port" --no-watch --logs >"$project/celld.log" 2>&1 &
 	CELLD_PID=$!
 	CELLD_URL="http://127.0.0.1:$port"
 	for _ in $(seq 1 300); do
@@ -384,19 +405,20 @@ run_mobpit() {
 	log_file="$(mktemp -t game-demos.XXXXXX)"
 	local admin
 	admin="$(dev_secret "$MOBPIT_DATA_DIR" admin-secret)"
+	# The services' gateway routes `/zones/{room}` to the rooms (celld, or
+	# the fleet's load balancer); Vite proxies game traffic to it only.
 	DISTRIBUTED_GAME_SECRET="$secret" DG_DEMO_ADMIN_SECRET="$admin" "$BIN" mobpit --dev --port "$port" \
-		--data-dir "$MOBPIT_DATA_DIR" --celld-url "$CELLD_URL" >"$log_file" 2>&1 &
+		--data-dir "$MOBPIT_DATA_DIR" --celld-url "$CELLD_URL" --zones-origin "$ROOMS_URLS" >"$log_file" 2>&1 &
 	local server_pid=$!
 	trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true; [[ -z "$CELLD_PID" ]] || kill_tree "$CELLD_PID"; stop_fleet; rm -f "$log_file"' EXIT INT TERM
 	wait_listening "$log_file" "$server_pid" "game-demos mobpit"
 	sed -n '2p' "$log_file"
 	echo
-	log "open  http://localhost:$client_port/$demo/   (services :$port, rooms on celld ${ROOMS_URLS}; dev routes ON — local only)"
+	log "open  http://localhost:$client_port/$demo/   (gateway + services :$port, rooms on celld ${ROOMS_URLS}; dev routes ON — local only)"
 	log "admin http://localhost:$client_port/mobpit/?admin=$admin   (live content updates; add &old=1 in another tab for an old client)"
 	echo
 	cd "$CLIENT"
-	GAME_DEMOS_SERVER="http://127.0.0.1:$port" GAME_DEMOS_ROOMS="$ROOMS_URLS" \
-		GAME_DEMOS_CLIENT_PORT="$client_port" npx vite
+	GAME_DEMOS_SERVER="http://127.0.0.1:$port" GAME_DEMOS_CLIENT_PORT="$client_port" npx vite
 }
 
 wait_listening() {
@@ -531,6 +553,12 @@ smoke() {
 }
 
 case "${1:-}" in
+	build)
+		ensure_sdk
+		ensure_client
+		ensure_wasm
+		ensure_cells
+		;;
 	smoke) smoke ;;
 	gen) gen "${2:-}" ;;
 	sveltekit) run_sveltekit "${2:-}" "${3:-3}" ;;

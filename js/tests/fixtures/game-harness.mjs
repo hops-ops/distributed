@@ -3,6 +3,8 @@
  * The fake server side speaks the real binary protocol through the SDK codec.
  */
 import {
+	GAME_PROTOCOL_VERSION,
+	GameFeature,
 	decodeClientMessage,
 	defineGameSchema,
 	encodeServerMessage
@@ -197,10 +199,12 @@ export class FakeNetwork {
 	}
 }
 
-/** A Welcome for the arena schema. */
+/** A Welcome for the arena schema (protocol 2, every runtime feature). */
 export function welcome(overrides = {}) {
 	return {
 		type: 'Welcome',
+		protocolVersion: GAME_PROTOCOL_VERSION,
+		features: GameFeature.FOCUS,
 		sessionId: 's1',
 		zoneId: 'z1',
 		role: 'player',

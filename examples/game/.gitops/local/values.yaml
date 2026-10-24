@@ -1,0 +1,24 @@
+# Hops injects: local, localDomain, environment.{name,namespace},
+# source.{localPath,path,type} (localPath = examples/game in this checkout).
+
+# The mobpit-system celld fleet.
+celld:
+  url: http://celld.mobpit-celld.svc.cluster.local:8080
+  bucket: s3://celld
+  image: ghcr.io/denoland/celld:0.6.3
+
+# Players a room admits; empty keeps the game's 32 (load tests raise it).
+rooms:
+  maxPlayers: ""
+
+images:
+  rust: rust:1.99-bookworm
+  node: node:24-bookworm
+
+# Cargo target dir, registry cache and the services' data dir.
+cache:
+  size: 20Gi
+  storageClassName: ""
+
+# esbuild for `celld deploy` (the worker bundle).
+esbuildVersion: 0.25.5

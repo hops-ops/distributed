@@ -14,7 +14,7 @@
  * - `replace` – the field is server-owned: show the authoritative value as
  *               is, never replaying inputs over it (hp, score, …).
  */
-import { angleDelta, wrapAngle, type EntityFields } from './replica.js';
+import { angleDelta, defaultInterpolationMode, interpolateValue, wrapAngle, type EntityFields } from './replica.js';
 import { canonicalizeField, type FieldValue, type GameKindDef } from './schema.js';
 
 export type CorrectionPolicy =
@@ -74,6 +74,8 @@ export type Correction = Readonly<{
 }>;
 
 type Offset = { value: number; start: number; durationMs: number; angle: boolean };
+/** The last step drawn as motion: from what was shown at `at` to the prediction over `durationMs`. */
+type Blend = { from: Record<string, FieldValue>; at: number; durationMs: number };
 
 const DEFAULT_CORRECTION: CorrectionPolicy = Object.freeze({ mode: 'ease', durationMs: 100 });
 
@@ -85,6 +87,7 @@ export class Predictor<TInput> {
 	#authoritative: Record<string, FieldValue> | undefined;
 	#predicted: Record<string, FieldValue> | undefined;
 	#offsets = new Map<string, Offset>();
+	#blend: Blend | undefined;
 	#lastAck = 0;
 
 	constructor(options: PredictorOptions<TInput>) {
@@ -129,6 +132,7 @@ export class Predictor<TInput> {
 		this.#entityId = entityId;
 		this.#kind = entityId === undefined ? undefined : kind;
 		this.#offsets.clear();
+		this.#blend = undefined;
 		this.#authoritative = authoritative === undefined ? undefined : { ...authoritative };
 		let predicted: Record<string, FieldValue> | undefined = authoritative === undefined ? undefined : { ...authoritative };
 		if (predicted !== undefined) for (const p of this.#pending) predicted = this.#step(predicted, p.input, p.dtMs);
@@ -195,13 +199,21 @@ export class Predictor<TInput> {
 	 * Record an input that was sent with `seq` and apply it to the
 	 * prediction. Inputs recorded before authoritative state is known are
 	 * kept and replayed once it arrives.
+	 *
+	 * With `now`, `current` draws the step as motion: from what it showed at
+	 * `now` to the new prediction over `dtMs` (fixed-timestep interpolation;
+	 * the entity is drawn up to one input interval behind its prediction, so
+	 * a 30 Hz step reads smooth on a faster display). Without it the
+	 * prediction is drawn as is.
 	 */
-	record(seq: number, input: TInput, dtMs: number): void {
+	record(seq: number, input: TInput, dtMs: number, now?: number): void {
 		this.#pending.push({ seq, input, dtMs });
 		const max = this.#options.maxPending ?? 256;
 		if (this.#pending.length > max) this.#pending.splice(0, this.#pending.length - max);
 		if (this.#predicted !== undefined) {
+			const shown = now === undefined ? undefined : this.#blended(now);
 			this.#predicted = this.#step(this.#predicted, input, dtMs);
+			this.#blend = shown === undefined ? undefined : { from: shown, at: now!, durationMs: dtMs };
 		}
 	}
 
@@ -215,6 +227,7 @@ export class Predictor<TInput> {
 		if (authoritative === undefined || this.#kind === undefined) return undefined;
 		const before = this.#predicted === undefined ? undefined : this.current(now);
 		const previous = this.#predicted;
+		const blend = this.#blend;
 		this.#authoritative = { ...authoritative };
 
 		let rebased: Record<string, FieldValue> = { ...authoritative };
@@ -225,6 +238,23 @@ export class Predictor<TInput> {
 		const epsilon = this.#options.epsilon ?? 1e-6;
 		// A teleport is a cut, not a misprediction to slide over.
 		const cut = before !== undefined && this.#teleported(before, rebased);
+		// Keep the step's motion: shift its start by the correction, so only
+		// the error itself is eased (dropping the blend would stall the entity
+		// for the rest of the step on every Delta).
+		if (blend !== undefined && previous !== undefined && !cut) {
+			const from: Record<string, FieldValue> = { ...rebased };
+			for (const [name, value] of Object.entries(blend.from)) {
+				const was = previous[name];
+				const next = rebased[name];
+				if (typeof value !== 'number' || typeof was !== 'number' || typeof next !== 'number') continue;
+				const angle = this.#kind.fields.some((f) => f.name === name && f.type === 'angle');
+				from[name] = angle ? wrapAngle(value + angleDelta(was, next)) : value + (next - was);
+			}
+			this.#blend = { ...blend, from };
+		} else {
+			this.#blend = undefined;
+		}
+		const after = this.#blendedFrom(rebased, now);
 		for (const field of this.#kind.fields) {
 			const name = field.name;
 			const policy = this.#policy(name);
@@ -239,11 +269,13 @@ export class Predictor<TInput> {
 			if (typeof oldValue === 'number' && typeof newValue === 'number') {
 				const error = angle ? -angleDelta(oldValue, newValue) : oldValue - newValue;
 				const shown = before[name];
+				const target = after[name];
+				const drawn = typeof target === 'number' ? target : newValue;
 				const visual =
 					typeof shown === 'number'
 						? angle
-							? -angleDelta(shown, newValue)
-							: shown - newValue
+							? -angleDelta(shown, drawn)
+							: shown - drawn
 						: 0;
 				if (Math.abs(error) > epsilon) {
 					errors[name] = error;
@@ -277,9 +309,9 @@ export class Predictor<TInput> {
 		return this.#predicted;
 	}
 
-	/** Prediction with decaying correction offsets applied (what to render). */
+	/** Prediction with the step blend and decaying correction offsets applied (what to render). */
 	current(now: number): EntityFields | undefined {
-		const predicted = this.#predicted;
+		const predicted = this.#blended(now);
 		if (predicted === undefined) return undefined;
 		if (this.#offsets.size === 0) return predicted;
 		const out: Record<string, FieldValue> = { ...predicted };
@@ -292,6 +324,28 @@ export class Predictor<TInput> {
 			}
 			const shifted = value + offset.value * Math.min(1, k);
 			out[name] = offset.angle ? wrapAngle(shifted) : shifted;
+		}
+		return out;
+	}
+
+	/** The prediction partway through its last step at `now` (no offsets). */
+	#blended(now: number): Record<string, FieldValue> | undefined {
+		const predicted = this.#predicted;
+		return predicted === undefined ? undefined : this.#blendedFrom(predicted, now);
+	}
+
+	#blendedFrom(target: Record<string, FieldValue>, now: number): Record<string, FieldValue> {
+		const blend = this.#blend;
+		const kind = this.#kind;
+		if (blend === undefined || kind === undefined) return target;
+		const t = blend.durationMs > 0 ? (now - blend.at) / blend.durationMs : 1;
+		if (t >= 1) return target;
+		const out: Record<string, FieldValue> = { ...target };
+		for (const field of kind.fields) {
+			const from = blend.from[field.name];
+			const to = target[field.name];
+			if (from === undefined || to === undefined) continue;
+			out[field.name] = interpolateValue(defaultInterpolationMode(field.type), from, to, Math.max(0, t));
 		}
 		return out;
 	}

@@ -1017,6 +1017,96 @@
           "type": "record"
         }
       }
+    },
+    {
+      "id": 4,
+      "name": "hood",
+      "payload": {
+        "fields": [
+          {
+            "name": "tier",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "boss_down",
+            "type": {
+              "type": "bool"
+            }
+          },
+          {
+            "name": "last_by",
+            "type": {
+              "type": "short_str"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 5,
+      "name": "borough",
+      "payload": {
+        "fields": [
+          {
+            "name": "bosses_down",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "weather",
+            "type": {
+              "type": "u8"
+            }
+          },
+          {
+            "name": "event",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "event_until_ms",
+            "type": {
+              "type": "u64"
+            }
+          },
+          {
+            "name": "hoods_down",
+            "type": {
+              "item": {
+                "type": "short_str"
+              },
+              "type": "list"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 6,
+      "name": "city",
+      "payload": {
+        "fields": [
+          {
+            "name": "bosses_down",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "banner",
+            "type": {
+              "type": "short_str"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
     }
   ],
   "name": "mobpit",
