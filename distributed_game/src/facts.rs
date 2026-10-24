@@ -30,10 +30,10 @@
 //! in completion order.
 //!
 //! Batching: a sink that settles many facts in one round trip (the
-//! celld object host: one `__batch` request per cell) says so with
-//! [`FactSink::max_batch`]; the feed then hands it up to that many (and
-//! at most [`FactFeed::with_max_batch`], default [`DEFAULT_MAX_BATCH`])
-//! consecutive facts of one lane at once ([`FactSink::commit_batch`]).
+//! celld object host: one `__batch` request per cell) returns its
+//! [`FactBatchSink`] from [`FactSink::batches`]; the feed then hands it up
+//! to [`FactFeed::with_max_batch`] (default [`DEFAULT_MAX_BATCH`])
+//! consecutive facts of one lane at once ([`FactBatchSink::commit_batch`]).
 //! Other sinks keep getting one fact at a time, so their settlements flow
 //! back per fact. A batch commits in order and stops at its first
 //! retryable failure, which is retried from there, so order and
@@ -247,38 +247,46 @@ pub trait FactSink: Send + Sync + 'static {
     /// Commit one fact. Must be idempotent per [`Fact::key`].
     fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>>;
 
-    /// Facts this sink settles per [`commit_batch`](Self::commit_batch)
-    /// round trip at most (default 1: one fact at a time, each settlement
-    /// delivered as soon as it commits). Override when a batch is cheaper
-    /// than its facts one by one.
-    fn max_batch(&self) -> usize {
-        1
-    }
-
-    /// Commit `facts` in order: one result per fact attempted. The
-    /// results end at the first [`FactError::Retryable`] (included), or
-    /// earlier; facts past the end were not attempted and are retried.
-    /// The default commits them one by one.
-    fn commit_batch<'a>(
-        &'a self,
-        facts: &'a [Fact],
-    ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
-        Box::pin(async move {
-            let mut results = Vec::with_capacity(facts.len());
-            for fact in facts {
-                let result = self.commit(fact).await;
-                let stop = matches!(result, Err(FactError::Retryable(_)));
-                results.push(result);
-                if stop {
-                    break;
-                }
-            }
-            results
-        })
+    /// The sink's batch committer, if a batch is cheaper than its facts
+    /// one by one (default none: one fact at a time, each settlement
+    /// delivered as soon as it commits). Opting in and supplying the
+    /// batch commit are the same override, usually `Some(self)`.
+    fn batches(&self) -> Option<&dyn FactBatchSink> {
+        None
     }
 }
 
-/// Facts per [`FactSink::commit_batch`] unless the feed says otherwise.
+/// A [`FactSink`] that settles many facts per round trip, handed to the
+/// feed by [`FactSink::batches`].
+pub trait FactBatchSink: Send + Sync {
+    /// Commit `facts` in order: one result per fact attempted. The
+    /// results end at the first [`FactError::Retryable`] (included), or
+    /// earlier; facts past the end were not attempted and are retried.
+    fn commit_batch<'a>(
+        &'a self,
+        facts: &'a [Fact],
+    ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>>;
+}
+
+/// [`FactBatchSink::commit_batch`] for a sink without batches: its facts
+/// one by one, stopping after the first retryable result.
+pub(crate) async fn commit_each<S: FactSink + ?Sized>(
+    sink: &S,
+    facts: &[Fact],
+) -> Vec<Result<FactReceipt, FactError>> {
+    let mut results = Vec::with_capacity(facts.len());
+    for fact in facts {
+        let result = sink.commit(fact).await;
+        let stop = matches!(result, Err(FactError::Retryable(_)));
+        results.push(result);
+        if stop {
+            break;
+        }
+    }
+    results
+}
+
+/// Facts per [`FactBatchSink::commit_batch`] unless the feed says otherwise.
 pub const DEFAULT_MAX_BATCH: usize = 16;
 
 /// Retry/backoff policy.
@@ -551,7 +559,7 @@ impl FactFeed {
         self.max_concurrent
     }
 
-    /// Hand a batching sink ([`FactSink::max_batch`] > 1) up to `n` facts
+    /// Hand a batching sink ([`FactSink::batches`]) up to `n` facts
     /// of a lane at once (default [`DEFAULT_MAX_BATCH`]; 1 commits fact by
     /// fact).
     pub fn with_max_batch(mut self, n: usize) -> Self {
@@ -575,7 +583,11 @@ impl FactFeed {
         Fut: Future<Output = ()>,
     {
         let policy = self.policy;
-        let max_batch = self.max_batch.min(sink.max_batch()).max(1);
+        let max_batch = if sink.batches().is_some() {
+            self.max_batch
+        } else {
+            1
+        };
         if self.max_concurrent <= 1 {
             while let Some(facts) = NextFact(&self.shared, max_batch).await {
                 for settlement in commit_with_retries(&sink, facts, policy, &sleep).await {
@@ -598,7 +610,8 @@ impl FactFeed {
     }
 }
 
-/// Commit `facts` in order through [`FactSink::commit_batch`], retrying
+/// Commit `facts` in order (through [`FactSink::batches`] if more than
+/// one), retrying
 /// from the first unsettled fact; `policy` bounds the attempts at each
 /// fact as if it were committed alone.
 async fn commit_with_retries<S, F, Fut>(
@@ -619,7 +632,10 @@ where
     let mut attempts = 0;
     while !pending.is_empty() {
         attempts += 1;
-        let results = sink.commit_batch(pending.make_contiguous()).await;
+        let results = match sink.batches() {
+            Some(batches) => batches.commit_batch(pending.make_contiguous()).await,
+            None => commit_each(sink, pending.make_contiguous()).await,
+        };
         let answered = results.len().min(pending.len());
         // A sink that answered for nothing is retried like a retryable head.
         let mut retry = answered == 0;
@@ -791,15 +807,8 @@ impl<S: FactSink> FactSink for Arc<S> {
         (**self).commit(fact)
     }
 
-    fn max_batch(&self) -> usize {
-        (**self).max_batch()
-    }
-
-    fn commit_batch<'a>(
-        &'a self,
-        facts: &'a [Fact],
-    ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
-        (**self).commit_batch(facts)
+    fn batches(&self) -> Option<&dyn FactBatchSink> {
+        (**self).batches()
     }
 }
 
@@ -821,10 +830,12 @@ mod batch_tests {
             unreachable!("batches only")
         }
 
-        fn max_batch(&self) -> usize {
-            usize::MAX
+        fn batches(&self) -> Option<&dyn FactBatchSink> {
+            Some(self)
         }
+    }
 
+    impl FactBatchSink for BatchSink {
         fn commit_batch<'a>(
             &'a self,
             facts: &'a [Fact],
@@ -917,6 +928,45 @@ mod batch_tests {
         assert!(settled
             .iter()
             .all(|s| matches!(s.outcome, FactOutcome::Committed(_))));
+    }
+
+    /// Holds `f1` until released.
+    struct Gated(tokio::sync::Notify);
+
+    impl FactSink for Gated {
+        fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+            Box::pin(async move {
+                if fact.key() == "f1" {
+                    self.0.notified().await;
+                }
+                Ok(FactReceipt {
+                    payload: Value::Null,
+                    replayed: false,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sink_without_batches_settles_each_fact_as_it_commits() {
+        let (mut queue, feed) = fact_channel(64, policy(3));
+        for i in 0..2 {
+            queue.try_send(fact(&format!("f{i}"), None)).unwrap();
+        }
+        let sink = Arc::new(Gated(tokio::sync::Notify::new()));
+        let worker = tokio::spawn(
+            feed.with_max_batch(16)
+                .run(sink.clone(), tokio::time::sleep),
+        );
+        // f0 settles while f1 is still committing.
+        let first = tokio::time::timeout(Duration::from_secs(5), settle(&mut queue, 1))
+            .await
+            .expect("f0 settles before f1 commits");
+        assert_eq!(keys(&first), ["f0"]);
+        sink.0.notify_one();
+        assert_eq!(keys(&settle(&mut queue, 1).await), ["f1"]);
+        drop(queue);
+        worker.await.unwrap();
     }
 
     #[tokio::test]

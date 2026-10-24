@@ -44,7 +44,9 @@ use distributed::microsvc::Session;
 use serde_json::Value;
 
 use crate::cell::{command_id_for, session_stamp, trusted_session};
-use crate::facts::{BoxFuture, Fact, FactCommand, FactError, FactReceipt, FactSink};
+use crate::facts::{
+    commit_each, BoxFuture, Fact, FactBatchSink, FactCommand, FactError, FactReceipt, FactSink,
+};
 use crate::lifecycle::LIFECYCLE_COMMANDS;
 #[cfg(feature = "command-host")]
 use crate::stamp::SESSION_PREFIX;
@@ -153,34 +155,25 @@ pub trait FactHost: Send + Sync + 'static {
         call: FactCall<'a>,
     ) -> BoxFuture<'a, Result<FactReceipt, FactError>>;
 
-    /// Facts this host runs per [`dispatch_fact_batch`](Self::dispatch_fact_batch)
-    /// at most (default 1). A host with a batch route returns more, and
-    /// the sink's [`FactSink::max_batch`] follows it.
-    fn max_fact_batch(&self) -> usize {
-        1
+    /// The host's batch route, if it runs many facts for one aggregate in
+    /// one request (default none: one by one). Opting in and supplying the
+    /// batch dispatch are the same override, usually `Some(self)`; the
+    /// sink's [`FactSink::batches`] follows it.
+    fn fact_batches(&self) -> Option<&dyn FactBatchHost> {
+        None
     }
+}
 
+/// A [`FactHost`] with a batch route, handed out by
+/// [`FactHost::fact_batches`].
+pub trait FactBatchHost: Send + Sync {
     /// Run `calls` (consecutive facts for one aggregate: same kind and
-    /// shard) in order, under [`FactSink::commit_batch`]'s contract: the
-    /// results end at the first retryable failure. The default runs them
-    /// one by one; a host with a batch route sends them in one request.
+    /// shard) in order, under [`FactBatchSink::commit_batch`]'s contract:
+    /// the results end at the first retryable failure.
     fn dispatch_fact_batch<'a>(
         &'a self,
         calls: Vec<FactCall<'a>>,
-    ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
-        Box::pin(async move {
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                let result = self.dispatch_fact(call).await;
-                let stop = matches!(result, Err(FactError::Retryable(_)));
-                results.push(result);
-                if stop {
-                    break;
-                }
-            }
-            results
-        })
-    }
+    ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>>;
 }
 
 /// See the module docs.
@@ -327,17 +320,22 @@ impl<H: FactHost> FactSink for CommandFactSink<H> {
         Box::pin(async move { self.host.dispatch_fact(self.call_for(fact)?).await })
     }
 
-    fn max_batch(&self) -> usize {
-        self.host.max_fact_batch()
+    fn batches(&self) -> Option<&dyn FactBatchSink> {
+        self.host.fact_batches().map(|_| self as &dyn FactBatchSink)
     }
+}
 
+impl<H: FactHost> FactBatchSink for CommandFactSink<H> {
     /// Consecutive facts for the same aggregate go to the host together
-    /// ([`FactHost::dispatch_fact_batch`]).
+    /// ([`FactBatchHost::dispatch_fact_batch`]).
     fn commit_batch<'a>(
         &'a self,
         facts: &'a [Fact],
     ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
         Box::pin(async move {
+            let Some(host) = self.host.fact_batches() else {
+                return commit_each(self, facts).await;
+            };
             let mut results = Vec::with_capacity(facts.len());
             let mut i = 0;
             while i < facts.len() {
@@ -361,8 +359,7 @@ impl<H: FactHost> FactSink for CommandFactSink<H> {
                     }
                 }
                 let n = run.len();
-                let batch: Vec<_> = self
-                    .host
+                let batch: Vec<_> = host
                     .dispatch_fact_batch(run)
                     .await
                     .into_iter()
@@ -680,6 +677,12 @@ mod batch_tests {
             unreachable!("batches only")
         }
 
+        fn fact_batches(&self) -> Option<&dyn FactBatchHost> {
+            Some(self)
+        }
+    }
+
+    impl FactBatchHost for RecordingHost {
         fn dispatch_fact_batch<'a>(
             &'a self,
             calls: Vec<FactCall<'a>>,

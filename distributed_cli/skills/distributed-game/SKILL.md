@@ -52,9 +52,10 @@ You get:
   as one `POST …/__batch` (`ZONE_FACT_BATCH`, default 16), and the zone
   outbox clears them with one delete. A batch stops at its first retryable
   failure and resumes from there, so order and exactly-once hold. A custom
-  sink opts in by overriding `FactSink::max_batch` and `commit_batch`, or
-  `FactHost::max_fact_batch` and `dispatch_fact_batch`. Otherwise it gets
-  one fact at a time.
+  sink opts in with one override, `FactSink::batches` returning
+  `Some(self)` as a `&dyn FactBatchSink` (its `commit_batch`); a host,
+  `FactHost::fact_batches` returning a `&dyn FactBatchHost`. Otherwise it
+  gets one fact at a time.
 
 Results come back on a later tick in `on_fact_settled`.
 
