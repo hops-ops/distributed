@@ -7,6 +7,10 @@ celld:
   bucket: s3://celld
   image: ghcr.io/denoland/celld:0.6.3
 
+# Players a room admits; empty keeps the game's 32 (load tests raise it).
+rooms:
+  maxPlayers: ""
+
 images:
   rust: rust:1.99-bookworm
   node: node:24-bookworm

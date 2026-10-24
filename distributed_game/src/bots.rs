@@ -421,7 +421,10 @@ async fn drive(
             msg = ws.next() => {
                 let bytes = match msg {
                     Some(Ok(Message::Binary(b))) => b,
-                    Some(Ok(Message::Close(_))) | None => return Err("closed by server".into()),
+                    Some(Ok(Message::Close(Some(frame)))) => {
+                        return Err(format!("closed by server ({} {})", u16::from(frame.code), frame.reason))
+                    }
+                    Some(Ok(Message::Close(None))) | None => return Err("closed by server".into()),
                     Some(Ok(_)) => continue,
                     Some(Err(e)) => return Err(format!("recv: {e}")),
                 };

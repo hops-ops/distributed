@@ -51,6 +51,11 @@ spec:
             # HTTP to the relay's Service, mTLS between Istio sidecars.
             - name: CELLD_QUEUE_RELAY_MESH
               value: "1"
+            {{- with .Values.rooms.maxPlayers }}
+            # Raised room cap (load tests); unset, the game's 32.
+            - name: ZONE_MAX_PLAYERS
+              value: {{ . | quote }}
+            {{- end }}
             - name: GAME_TICKET_SECRET
               valueFrom: {secretKeyRef: {name: mobpit, key: GAME_TICKET_SECRET}}
             - name: DISTRIBUTED_INTERNAL_SECRET

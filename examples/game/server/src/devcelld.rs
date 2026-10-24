@@ -143,6 +143,11 @@ impl DevCelld {
         format!("ws://127.0.0.1:{}", self.port)
     }
 
+    /// Process id of the running `celld dev` (the root of its tree).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
     /// Project directory (holds `.celld/dev` and the logs).
     pub fn project(&self) -> &Path {
         &self.project

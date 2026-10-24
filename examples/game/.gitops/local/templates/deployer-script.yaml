@@ -48,7 +48,7 @@ data:
       .filter((line) => !line.trimStart().startsWith('//'))
       .join('\n');
     const config = JSON.parse(text);
-    for (const key of ['DISTRIBUTED_INTERNAL_SECRET', 'GAME_TICKET_SECRET', 'CELLD_QUEUE_RELAY_URL', 'CELLD_QUEUE_RELAY_MESH']) {
-      config.vars[key] = process.env[key];
+    for (const key of ['DISTRIBUTED_INTERNAL_SECRET', 'GAME_TICKET_SECRET', 'CELLD_QUEUE_RELAY_URL', 'CELLD_QUEUE_RELAY_MESH', 'ZONE_MAX_PLAYERS']) {
+      if (process.env[key]) config.vars[key] = process.env[key];
     }
     writeFileSync(target, JSON.stringify(config));

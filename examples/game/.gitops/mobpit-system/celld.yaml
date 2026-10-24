@@ -23,6 +23,16 @@ spec:
     enabled: true
     credentialsSecretRef:
       name: mobpit-rustfs-credentials
+    values:
+      resources:
+        # The chart's 1Gi OOMs under ~256 busy rooms, and again while
+        # celld reclaims them after a restart (lease renewals then miss
+        # their TTL and celld self-fences).
+        limits:
+          memory: 4Gi
+        requests:
+          cpu: 50m
+          memory: 128Mi
   values:
     podLabels:
       sidecar.istio.io/inject: "true"
