@@ -83,7 +83,9 @@ test('a boss falls: its hood rises, the saga ripples it up, the hood gets toughe
 
 		// Up the hierarchy: the hood's cell, then the saga into borough and city.
 		const tiers = await eventually(async () => {
-			const t = await pitApi.tiers(bossZone);
+			// A polled read may fail while celld is busy; the next one retries.
+			const t = await pitApi.tiers(bossZone).catch(() => undefined);
+			if (t === undefined) return false;
 			const hood = t.hoods.find((h) => h.hood === '0.0');
 			return hood?.bossDown && hood.tier === 1 && t.boroughs.find((b) => b.borough === '0.0')?.bossesDown === 1 && t.city?.bosses_down === 1 && t;
 		}, 30_000, 'hood → borough → city');
@@ -94,9 +96,11 @@ test('a boss falls: its hood rises, the saga ripples it up, the hood gets toughe
 		const visitor = player('Visitor');
 		await visitor.client.connect(`pit.${other[0]}.${other[1]}`);
 		await visitor.ready;
+		// Hood, borough and city are separate watched cells: their views
+		// arrive independently, so wait for each.
 		await until(() => visitor.world()?.hoodTier === 1 && visitor.world()?.bossDown === true, 15_000, 'the hood tier reaches its other rooms');
-		assert.equal(visitor.world().boroughBossesDown, 1);
-		assert.ok(visitor.world().banner.length > 0, 'the city banner');
+		await until(() => visitor.world()?.boroughBossesDown === 1, 15_000, 'the borough count reaches its other rooms');
+		await until(() => visitor.world()?.banner.length > 0, 15_000, 'the city banner');
 		// The boss stays down in its room meanwhile.
 		await sleep(5000);
 		assert.equal(boss(), undefined, 'still down');
