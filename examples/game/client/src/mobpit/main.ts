@@ -850,8 +850,9 @@ const interestRing = createRing(scene, 1, '#6cc4ff');
 interestRing.isPickable = false;
 interestRing.setEnabled(false);
 
-type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh; hpBack: Mesh; hpFill: Mesh };
-type MobVisual = { kind: 'mob'; body: Mesh; hpBack: Mesh; hpFill: Mesh; ring: Mesh; fill: Mesh; tier: number };
+type HpBar = { hpBack: Mesh; hpFill: Mesh; /** The fill drawn (eases to the health). */ hpShown: number };
+type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh } & HpBar;
+type MobVisual = { kind: 'mob'; body: Mesh; ring: Mesh; fill: Mesh; tier: number } & HpBar;
 type Visual = PlayerVisual | MobVisual;
 const visuals = new Map<string, Visual>();
 
@@ -872,13 +873,7 @@ function createPlayer(entity: RenderedEntity, mine: boolean): PlayerVisual {
 	blade.material = mats.blade;
 	// Swing wedge: 120° (the server's cone), flat on the floor.
 	const arc = flatDisc(`${entity.key}-arc`, ATTACK_REACH, mats.swing, SWING_HALF / Math.PI);
-	const hpBack = MeshBuilder.CreatePlane(`${entity.key}-hpb`, { width: 1.2, height: 0.14 }, scene);
-	hpBack.material = mats.hpBack;
-	hpBack.billboardMode = Mesh.BILLBOARDMODE_ALL;
-	const hpFill = MeshBuilder.CreatePlane(`${entity.key}-hpf`, { width: 1.16, height: 0.1 }, scene);
-	hpFill.material = mats.playerHpFill;
-	hpFill.billboardMode = Mesh.BILLBOARDMODE_ALL;
-	return { kind: 'player', body, blade, arc, nose, hpBack, hpFill };
+	return { kind: 'player', body, blade, arc, nose, ...hpBar(entity.key, mats.playerHpFill) };
 }
 
 function createMob(entity: RenderedEntity): MobVisual {
@@ -891,15 +886,9 @@ function createMob(entity: RenderedEntity): MobVisual {
 			? MeshBuilder.CreateCylinder(entity.key, { diameterTop: 0, diameterBottom: t.radius * 2, height: 2, tessellation: 6 }, scene)
 			: MeshBuilder.CreateBox(entity.key, { width: t.radius * 2, depth: t.radius * 2, height: tier === 2 ? 1.5 : 0.9 }, scene);
 	body.material = tierMats.get(tier) ?? mats.other;
-	const hpBack = MeshBuilder.CreatePlane(`${entity.key}-hpb`, { width: 1.2, height: 0.14 }, scene);
-	hpBack.material = mats.hpBack;
-	hpBack.billboardMode = Mesh.BILLBOARDMODE_ALL;
-	const hpFill = MeshBuilder.CreatePlane(`${entity.key}-hpf`, { width: 1.16, height: 0.1 }, scene);
-	hpFill.material = mats.hpFill;
-	hpFill.billboardMode = Mesh.BILLBOARDMODE_ALL;
 	const ring = flatDisc(`${entity.key}-tele`, t.tele, mats.tele);
 	const fill = flatDisc(`${entity.key}-tele-fill`, t.tele, mats.teleFill);
-	return { kind: 'mob', body, hpBack, hpFill, ring, fill, tier };
+	return { kind: 'mob', body, ring, fill, tier, ...hpBar(entity.key, mats.hpFill) };
 }
 
 function visualFor(entity: RenderedEntity, mine: boolean): Visual {
@@ -915,7 +904,42 @@ function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 }
 
 function dispose(visual: Visual): void {
-	for (const mesh of Object.values(visual)) if (mesh instanceof Mesh) mesh.dispose();
+	// (The bar's fill goes with its back.)
+	for (const mesh of Object.values(visual)) if (mesh instanceof Mesh && !mesh.isDisposed()) mesh.dispose();
+}
+
+const HP_W = 1.2;
+const HP_FILL_W = 1.16;
+/**
+ * A health bar over a head: a billboarded back with the fill as its child,
+ * just in front of it (never z-fighting with it) and anchored at its left
+ * edge, so it drains right to left.
+ */
+function hpBar(key: string, fillMat: StandardMaterial): HpBar {
+	const hpBack = MeshBuilder.CreatePlane(`${key}-hpb`, { width: HP_W, height: 0.14 }, scene);
+	hpBack.material = mats.hpBack;
+	hpBack.billboardMode = Mesh.BILLBOARDMODE_ALL;
+	hpBack.isPickable = false;
+	const hpFill = MeshBuilder.CreatePlane(`${key}-hpf`, { width: HP_FILL_W, height: 0.1 }, scene);
+	// Origin at the left edge: scaling x shortens it from the right.
+	hpFill.position.x = HP_FILL_W / 2;
+	hpFill.bakeCurrentTransformIntoVertices();
+	hpFill.material = fillMat;
+	hpFill.isPickable = false;
+	hpFill.parent = hpBack;
+	// A plane faces -z; the billboard turns that toward the camera.
+	hpFill.position.set(-HP_FILL_W / 2, 0, -0.01);
+	return { hpBack, hpFill, hpShown: Number.NaN };
+}
+
+/** Place the bar at `at` and ease its fill toward `share` (0..1). */
+function showHp(bar: HpBar, at: Vector3, share: number, dtMs: number): void {
+	bar.hpBack.position.copyFrom(at);
+	const target = Math.max(0, Math.min(1, share));
+	bar.hpShown = Number.isNaN(bar.hpShown) ? target : bar.hpShown + (target - bar.hpShown) * (1 - Math.exp(-dtMs / 90));
+	if (Math.abs(target - bar.hpShown) < 1e-3) bar.hpShown = target;
+	bar.hpFill.scaling.x = Math.max(1e-3, bar.hpShown);
+	bar.hpFill.isVisible = bar.hpShown > 2e-3;
 }
 
 // ---- kill / saved popups (DOM labels anchored to invisible meshes) ----
@@ -1186,9 +1210,7 @@ stage.onFrame((now, dtMs) => {
 			visual.body.rotation.y = -mob.face;
 			const hp = mob.hp / 100;
 			const top = height * 2 + 0.35;
-			visual.hpBack.position.copyFrom(at(x, y, top));
-			visual.hpFill.position.copyFrom(at(x, y, top));
-			visual.hpFill.scaling.x = Math.max(0.001, hp);
+			showHp(visual, at(x, y, top), hp, dtMs);
 			const tele = mob.tele / 255;
 			const winding = mob.state === 2;
 			visual.ring.setEnabled(visible && winding);
@@ -1199,7 +1221,7 @@ stage.onFrame((now, dtMs) => {
 				visual.fill.scaling.setAll(Math.max(0.05, tele));
 			}
 			visual.body.scaling.setAll(winding ? 1 + 0.15 * tele : 1);
-			for (const m of [visual.body, visual.hpBack, visual.hpFill]) m.setEnabled(visible);
+			for (const m of [visual.body, visual.hpBack]) m.setEnabled(visible);
 		} else {
 			const player = playerFields(entity);
 			const { x, y, z, dead, face, swing } = player;
@@ -1225,10 +1247,8 @@ stage.onFrame((now, dtMs) => {
 			if (hidden) stage.labels.delete(entity.key);
 			else stage.labels.set(entity.key, visual.body, mine ? `${label} (you)` : label, 1.4, mine ? 'me' : '');
 			const top = 2.05 + z;
-			visual.hpBack.position.copyFrom(at(x, y, top));
-			visual.hpFill.position.copyFrom(at(x, y, top));
-			visual.hpFill.scaling.x = Math.max(0.001, dead ? 0 : player.hp / PLAYER_HP);
-			for (const m of [visual.hpBack, visual.hpFill]) m.setEnabled(visible && !hidden);
+			showHp(visual, at(x, y, top), dead ? 0 : player.hp / PLAYER_HP, dtMs);
+			visual.hpBack.setEnabled(visible && !hidden);
 			visual.body.setEnabled(visible && !hidden);
 			visual.nose.setEnabled(visible && !dead && !hidden);
 			if (mine) me = { at: visual.body.position, hp: player.hp, dead };
