@@ -135,6 +135,16 @@ How it behaves:
   - `--steps 32,64` for one room;
   - `--steps 64x1,128x1` for many rooms;
   - `--no-attack` for movement only;
-  - `--var ZONE_FACT_BATCH=1` to A/B fact batching.
-
-  Compare runs only on a quiet machine.
+  - `--var KEY=VALUE` for a worker var on every run.
+- Compare work, not wall clock. Each step prints a `work` line from the
+  rooms' `WorkCounters` (`GET /zones/{zone}/info` → `work`) and the
+  watched cells' `__watchers` counts: records encoded and sent per patch,
+  updates held by rates, bytes per frame, fact commands, cell requests and
+  outbox deletes per room-second, world reads and pushes per room-minute.
+  Counts do not depend on machine load; timings do.
+- A/B one switch with interleaved runs of the same build:
+  `--ab VAR=VAL --pairs 3` runs A,B then B,A … (fresh celld each) and
+  prints the median of each side and of the per-pair change. Switches:
+  `ZONE_FACT_BATCH=1` (fact batches off), `ZONE_UPDATE_RATES=0` (update
+  rates off), `ZONE_WORLD_PUSH=0` (watched cells polled every second
+  instead of pushed). Read timings only as these interleaved medians.
