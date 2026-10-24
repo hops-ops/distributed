@@ -88,6 +88,8 @@ const WALL_H = 0.6;
 /** Swing cone, from the server's rules: reach to a mob's edge, plus the body. */
 const { attackRange, attackHalfAngle: SWING_HALF, swingFrames: SWING_FRAMES } = PIT_RULES;
 const ATTACK_REACH = attackRange + PLAYER_RADIUS;
+/** A player's full health (`PLAYER_HP` in the room, `server/rooms/src/zone.rs`). */
+const PLAYER_HP = 100;
 
 const params = new URLSearchParams(location.search);
 /** `?zone=` forces a room; otherwise you start where you last were (`/dev/mobpit/start`). */
@@ -219,6 +221,11 @@ client.on('correction', (c) => {
 
 // ---- side panels: XP bar, durable facts graph, mini leaderboard ----
 const xpPanel = div('pit-xp', document.body);
+// First person: your health in the HUD (your own head and its bar are hidden).
+const hpRow = div('pit-hp', xpPanel);
+const hpLabel = div('pit-hp-label', hpRow);
+const hpFillBar = div('pit-hp-fill', div('pit-hp-bar', hpRow));
+hpRow.style.display = 'none';
 const xpLabel = div('pit-xp-label', xpPanel);
 const xpBar = div('pit-xp-bar', xpPanel);
 const xpFill = div('pit-xp-fill', xpBar);
@@ -601,12 +608,13 @@ const mats = {
 	swing: material(scene, 'swing', '#4da3ff', 0.3),
 	hpBack: material(scene, 'hp-back', '#1b1b1b'),
 	hpFill: material(scene, 'hp-fill', '#e04848'),
+	playerHpFill: material(scene, 'player-hp-fill', '#4caf50'),
 	tele: material(scene, 'tele', '#ff3b3b', 0.25),
 	teleFill: material(scene, 'tele-fill', '#ff3b3b', 0.45),
 	ghost: material(scene, 'ghost', '#ffffff', 0.25)
 };
 mats.ghost.wireframe = true;
-for (const m of [mats.swing, mats.tele, mats.teleFill, mats.hpFill]) m.emissiveColor = m.diffuseColor.clone();
+for (const m of [mats.swing, mats.tele, mats.teleFill, mats.hpFill, mats.playerHpFill]) m.emissiveColor = m.diffuseColor.clone();
 mats.blade.emissiveColor = new Color3(0.6, 0.6, 0.7);
 const tierMats = new Map<number, StandardMaterial>();
 for (const [tier, t] of Object.entries(TIERS)) tierMats.set(Number(tier), material(scene, `mob-${tier}`, t.color));
@@ -842,7 +850,7 @@ const interestRing = createRing(scene, 1, '#6cc4ff');
 interestRing.isPickable = false;
 interestRing.setEnabled(false);
 
-type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh };
+type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh; hpBack: Mesh; hpFill: Mesh };
 type MobVisual = { kind: 'mob'; body: Mesh; hpBack: Mesh; hpFill: Mesh; ring: Mesh; fill: Mesh; tier: number };
 type Visual = PlayerVisual | MobVisual;
 const visuals = new Map<string, Visual>();
@@ -864,7 +872,13 @@ function createPlayer(entity: RenderedEntity, mine: boolean): PlayerVisual {
 	blade.material = mats.blade;
 	// Swing wedge: 120° (the server's cone), flat on the floor.
 	const arc = flatDisc(`${entity.key}-arc`, ATTACK_REACH, mats.swing, SWING_HALF / Math.PI);
-	return { kind: 'player', body, blade, arc, nose };
+	const hpBack = MeshBuilder.CreatePlane(`${entity.key}-hpb`, { width: 1.2, height: 0.14 }, scene);
+	hpBack.material = mats.hpBack;
+	hpBack.billboardMode = Mesh.BILLBOARDMODE_ALL;
+	const hpFill = MeshBuilder.CreatePlane(`${entity.key}-hpf`, { width: 1.16, height: 0.1 }, scene);
+	hpFill.material = mats.playerHpFill;
+	hpFill.billboardMode = Mesh.BILLBOARDMODE_ALL;
+	return { kind: 'player', body, blade, arc, nose, hpBack, hpFill };
 }
 
 function createMob(entity: RenderedEntity): MobVisual {
@@ -1205,11 +1219,16 @@ stage.onFrame((now, dtMs) => {
 				// Disc arcs start at +x and run counter-clockwise; centre it on `face`.
 				visual.arc.rotation.y = -(face - SWING_HALF);
 			}
-			const label = `${player.name} · L${player.level} · ${player.hp} HP`;
-			// First person: you are the camera (no body, no label of your own).
+			const label = `${player.name} · L${player.level}`;
+			// First person: you are the camera (no body, no label or bar of your own).
 			const hidden = mine && stage.view() === 'first';
 			if (hidden) stage.labels.delete(entity.key);
 			else stage.labels.set(entity.key, visual.body, mine ? `${label} (you)` : label, 1.4, mine ? 'me' : '');
+			const top = 2.05 + z;
+			visual.hpBack.position.copyFrom(at(x, y, top));
+			visual.hpFill.position.copyFrom(at(x, y, top));
+			visual.hpFill.scaling.x = Math.max(0.001, dead ? 0 : player.hp / PLAYER_HP);
+			for (const m of [visual.hpBack, visual.hpFill]) m.setEnabled(visible && !hidden);
 			visual.body.setEnabled(visible && !hidden);
 			visual.nose.setEnabled(visible && !dead && !hidden);
 			if (mine) me = { at: visual.body.position, hp: player.hp, dead };
@@ -1230,6 +1249,13 @@ stage.onFrame((now, dtMs) => {
 	}
 	if (me !== undefined) stage.follow(me.at.x, me.at.z, dtMs, me.at.y - 0.9);
 	crosshair.style.display = stage.view() === 'first' ? '' : 'none';
+	hpRow.style.display = stage.view() === 'first' && me !== undefined ? '' : 'none';
+	if (me !== undefined) {
+		const share = me.dead ? 0 : Math.max(0, Math.min(1, me.hp / PLAYER_HP));
+		hpLabel.textContent = me.dead ? 'HP — dead' : `HP ${me.hp} / ${PLAYER_HP}`;
+		hpFillBar.style.width = `${share * 100}%`;
+		hpFillBar.className = `pit-hp-fill${share < 0.3 ? ' low' : share < 0.6 ? ' mid' : ''}`;
+	}
 
 	// The server's own copy of you (authoritative, behind by the round
 	// trip): a wireframe ghost in the room that owns you.

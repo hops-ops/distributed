@@ -10,6 +10,31 @@
 	background: var(--panel);
 	box-sizing: border-box;
 }
+.pit-hp {
+	margin-bottom: 8px;
+}
+.pit-hp-label {
+	margin-bottom: 4px;
+	font-weight: 600;
+}
+.pit-hp-bar {
+	height: 12px;
+	border-radius: 6px;
+	background: #2a3240;
+	overflow: hidden;
+}
+.pit-hp-fill {
+	height: 100%;
+	width: 100%;
+	background: #4caf50;
+	transition: width 0.15s ease;
+}
+.pit-hp-fill.mid {
+	background: #f2c94c;
+}
+.pit-hp-fill.low {
+	background: #e04848;
+}
 .pit-xp-label {
 	margin-bottom: 4px;
 	color: var(--muted);
