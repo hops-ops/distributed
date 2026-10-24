@@ -41,6 +41,16 @@ pub const RECONCILE_JITTER_MS: u64 = 15_000;
 pub const POLL_MS: u64 = 1_000;
 /// Watchers pushed to at once by one cell.
 pub const PUSH_CONCURRENCY: usize = 16;
+/// Waits (ms) before each retry of a push that failed in transport or was
+/// refused for load (5xx, 429): a busy zone still gets a rollout's freeze
+/// within seconds instead of at its next reconcile.
+pub const PUSH_RETRY_MS: [u64; 3] = [250, 1_000, 3_000];
+
+/// Whether a push answered with `status` is worth retrying. A zone takes
+/// every push it can parse with 204, asleep or not; other 4xx stay wrong.
+pub fn push_retryable(status: u16) -> bool {
+    status == 429 || status >= 500
+}
 /// Query parameter naming the watcher (`<binding>/<zone>`).
 pub const WATCH_PARAM: &str = "watch";
 /// Query parameter with the lease (ms).
@@ -694,5 +704,15 @@ mod tests {
         assert_eq!(watch.message(json!("garbage")), None);
         assert_eq!(view_version(&json!({"version": 7})), 7);
         assert_eq!(view_version(&json!({})), 0);
+    }
+
+    #[test]
+    fn a_push_is_retried_only_when_the_zone_could_not_take_it() {
+        for status in [429, 500, 502, 503] {
+            assert!(push_retryable(status), "{status}");
+        }
+        for status in [200, 204, 400, 401, 404] {
+            assert!(!push_retryable(status), "{status}");
+        }
     }
 }

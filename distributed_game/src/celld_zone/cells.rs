@@ -12,13 +12,13 @@ use distributed::cell_host::{
 use distributed::microsvc::Session;
 use distributed::Aggregate;
 use serde_json::{json, Value};
-use worker::{Env, Headers, Method, Request, RequestInit, Response, Result, State};
+use worker::{Delay, Env, Headers, Method, Request, RequestInit, Response, Result, State};
 
 use crate::cell::{fact_session_from_headers, run_fact_batch};
 use crate::world::content_rollout::{mount_content_rollout, ContentRollout};
 use crate::world::watch::{
-    parse_watcher_address, topic, watch_query, WatchUpdate, Watchers, PUSH_CONCURRENCY, PUSH_ROUTE,
-    STATS_ROUTE,
+    parse_watcher_address, push_retryable, topic, watch_query, WatchUpdate, Watchers,
+    PUSH_CONCURRENCY, PUSH_RETRY_MS, PUSH_ROUTE, STATS_ROUTE,
 };
 use crate::world::zone_activity::{mount_zone_activity, ZoneActivity};
 
@@ -351,32 +351,47 @@ pub(crate) fn push_all(env: Env, watchers: Vec<String>, update: WatchUpdate) {
     });
 }
 
+/// One push, retried after [`PUSH_RETRY_MS`] while it fails in transport or
+/// the zone is too busy to take it ([`push_retryable`]).
 async fn push(env: &Env, watcher: &str, secret: &str, body: &str) {
     let Some((binding, name)) = parse_watcher_address(watcher) else {
         return;
     };
-    let result: Result<()> = async {
-        let stub = env
-            .durable_object(binding)?
-            .id_from_name(name)?
-            .get_stub()?;
-        let headers = Headers::new();
-        headers.set(CELL_INTERNAL_SECRET_HEADER, secret)?;
-        headers.set(super::ZONE_HEADER, name)?;
-        headers.set("content-type", "application/json")?;
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post)
-            .with_headers(headers)
-            .with_body(Some(body.into()));
-        let url = format!("https://zone/{name}/{PUSH_ROUTE}");
-        stub.fetch_with_request(Request::new_with_init(&url, &init)?)
-            .await?;
-        Ok(())
+    let mut waits = PUSH_RETRY_MS.iter();
+    loop {
+        let error = match push_once(env, binding, name, secret, body).await {
+            Ok(status) if !push_retryable(status) => return,
+            Ok(status) => format!("HTTP {status}"),
+            Err(error) => error.to_string(),
+        };
+        let Some(wait) = waits.next() else {
+            worker::console_warn!(
+                "world push to {watcher}: {error}; giving up until its reconcile"
+            );
+            return;
+        };
+        Delay::from(std::time::Duration::from_millis(*wait)).await;
     }
-    .await;
-    if let Err(error) = result {
-        worker::console_warn!("world push to {watcher}: {error}");
-    }
+}
+
+async fn push_once(env: &Env, binding: &str, name: &str, secret: &str, body: &str) -> Result<u16> {
+    let stub = env
+        .durable_object(binding)?
+        .id_from_name(name)?
+        .get_stub()?;
+    let headers = Headers::new();
+    headers.set(CELL_INTERNAL_SECRET_HEADER, secret)?;
+    headers.set(super::ZONE_HEADER, name)?;
+    headers.set("content-type", "application/json")?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(body.into()));
+    let url = format!("https://zone/{name}/{PUSH_ROUTE}");
+    let response = stub
+        .fetch_with_request(Request::new_with_init(&url, &init)?)
+        .await?;
+    Ok(response.status_code())
 }
 
 fn internal_secret(env: &Env) -> Option<String> {
