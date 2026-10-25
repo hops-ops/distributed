@@ -178,6 +178,25 @@ check_workspace() {
 check_workspace alice true
 check_workspace bob false
 
+# Chart default must not emit instance Features. A new lane that forgets the
+# flag would otherwise clobber the primary lane's login host.
+default_out="$(helm template e2e-ui-test-users-carol "$IDENTITY_CHART" \
+  --namespace carol \
+  --set local=true \
+  --set preview=false \
+  --set environment.name=carol \
+  --set environment.namespace=carol \
+  --set identity.enabled=true \
+  --set identity.projectName=e2e-ui \
+  --set identity.projectNamespace=default \
+  --set identity.humansNamespace=default \
+  --set identity.providerConfigRef.name=default \
+  --set identity.providerConfigRef.kind=ClusterProviderConfig)"
+assert_not_contains "$default_out" "kind: Features" \
+  "omitted instanceLoginV2 does not render global Features"
+assert_contains "$default_out" "baseUri: \"http://e2e-ui-ui.carol.svc.cluster.local:5180\"" \
+  "omitted instanceLoginV2 still sets the app-level Login V2 baseUri"
+
 # Distinct OIDC names across workspaces
 alice_out="$(render alice true)"
 bob_out="$(render bob false)"
