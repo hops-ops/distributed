@@ -108,6 +108,54 @@
         "path": "migrations/postgres/0009_projection_delivery_aliases.sql",
         "sha256": "19845d4bfcb30d1bf43cb485a6bb9f765a6c1db7abf74fb004046457af83a2b9"
       }
+    },
+    {
+      "version": 10,
+      "description": "coordination leases",
+      "sqlite": {
+        "path": "migrations/sqlite/0010_coordination_leases.sql",
+        "sha256": "ec39b6bc567b2cbe06a8ba162b3b330735a67d83d8c19044f3e39e84df4119d7"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0010_coordination_leases.sql",
+        "sha256": "f5494517f00ba6f4a00ca140fcb77ac49444d6d7bdf3ac575d00e043f8c01072"
+      }
+    },
+    {
+      "version": 11,
+      "description": "cell alarms",
+      "sqlite": {
+        "path": "migrations/sqlite/0011_cell_alarms.sql",
+        "sha256": "5d581afcf6238c3a251acb85f28d045d71cce1ca09b98649c180d7caeb228bc7"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0011_cell_alarms.sql",
+        "sha256": "572da24fac96e56263b5dfdf17be26d99f7a330de5585325ba091a4fe3e6caf8"
+      }
+    },
+    {
+      "version": 12,
+      "description": "aggregate schedules",
+      "sqlite": {
+        "path": "migrations/sqlite/0012_aggregate_schedules.sql",
+        "sha256": "7b95a6a81e9595916b65170c22404f78da3639bce5f51bdf4f2693677629848d"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0012_aggregate_schedules.sql",
+        "sha256": "e56147e54924aadac88619ab722f005bbf127f3c009d0cdf80f7ee69b1c2823f"
+      }
+    },
+    {
+      "version": 13,
+      "description": "schedule claims",
+      "sqlite": {
+        "path": "migrations/sqlite/0013_schedule_claims.sql",
+        "sha256": "fb6f15299dad6dde0e98333c11f8cc4f9d13bbee793e856741a5c43fb6d8d48b"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0013_schedule_claims.sql",
+        "sha256": "fb6f15299dad6dde0e98333c11f8cc4f9d13bbee793e856741a5c43fb6d8d48b"
+      }
     }
   ]
 }

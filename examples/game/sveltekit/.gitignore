@@ -1,0 +1,5 @@
+node_modules/
+.svelte-kit/
+build/
+# Compiled predicted step (`distributed game-wasm`, built by the Vite plugin)
+src/lib/generated/*/wasm/

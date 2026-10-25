@@ -1,0 +1,14 @@
+error[E0277]: `i8` cannot be a replicated entity field
+ --> tests/compile_fail/replicated_unsupported_type.rs:8:13
+  |
+8 |     charge: i8,
+  |             ^^ unsupported entity field type
+  |
+  = help: the trait `EntityField` is not implemented for `i8`
+  = note: supported: bool, u8, u16, u32, i32, f32 (optionally #[quant]/#[angle]), String (short_str) and Vec<u8> (bytes)
+  = help: the following other types implement trait `EntityField`:
+            f32
+            i32
+            u16
+            u32
+            u8

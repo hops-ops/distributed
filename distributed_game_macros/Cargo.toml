@@ -1,0 +1,24 @@
+[package]
+name = "distributed_game_macros"
+version.workspace = true
+edition.workspace = true
+description = "Authoring derives for distributed_game: Replicated, GameInput, GameEvent, GameRecord, FactCommand"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro-crate = "3.5"
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
+
+[dev-dependencies]
+# Compile-fail snapshots depend on trybuild's compiler-diagnostic normalization.
+trybuild = "=1.0.120"
+# Dev-only cycle (as in distributed_macros): fixtures need the runtime crate.
+distributed_game = { path = "../distributed_game" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

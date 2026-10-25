@@ -1,0 +1,839 @@
+//! Message types and their codecs (`PROTOCOL.md` §6–§7).
+
+use std::collections::BTreeMap;
+
+use super::wire::{DecodeError, Reader, Writer};
+use crate::schema::{EntitySchema, FieldValue};
+
+/// Newest wire protocol version spoken by this crate (what its clients
+/// offer in Hello).
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Oldest protocol version this crate's servers still answer
+/// (`PROTOCOL.md` §6.0): a v1 client gets a v1 Welcome.
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
+
+/// Whether this crate's servers answer a Hello offering `version`.
+pub fn supports_protocol(version: u32) -> bool {
+    (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
+}
+
+/// Runtime feature bits a server announces in Welcome v2 (`features`).
+/// Unlike Hello's game-defined `capabilities`, the runtime defines these: a
+/// client sends a message a feature covers only when the bit is set.
+pub mod feature {
+    /// The server handles `Focus` (observers steer their view).
+    pub const FOCUS: u32 = 1 << 0;
+    /// Every feature this crate's runtime implements.
+    pub const ALL: u32 = FOCUS;
+}
+
+/// Message type bytes.
+pub mod tag {
+    /// Client → server Hello.
+    pub const HELLO: u8 = 0x01;
+    /// Client → server Input.
+    pub const INPUT: u8 = 0x02;
+    /// Client → server Ping.
+    pub const PING: u8 = 0x03;
+    /// Client → server Leave.
+    pub const LEAVE: u8 = 0x04;
+    /// Client → server Content (patched live to a content version).
+    pub const CONTENT: u8 = 0x05;
+    /// Client → server Near (an observer asks to keep the zone awake, or
+    /// lets go).
+    pub const NEAR: u8 = 0x06;
+    /// Client → server Focus (where an observer is looking, zone-local).
+    pub const FOCUS: u8 = 0x07;
+    /// Server → client Welcome.
+    pub const WELCOME: u8 = 0x80;
+    /// Server → client Delta.
+    pub const DELTA: u8 = 0x81;
+    /// Server → client Event.
+    pub const EVENT: u8 = 0x82;
+    /// Server → client Pong.
+    pub const PONG: u8 = 0x83;
+    /// Server → client Freeze.
+    pub const FREEZE: u8 = 0x84;
+    /// Server → client Resume.
+    pub const RESUME: u8 = 0x85;
+    /// Server → client Handoff.
+    pub const HANDOFF: u8 = 0x86;
+    /// Server → client Kick.
+    pub const KICK: u8 = 0x87;
+    /// Server → client Error.
+    pub const ERROR: u8 = 0x88;
+    /// Server → client Redirect (zone owned by another host).
+    pub const REDIRECT: u8 = 0x89;
+}
+
+/// Kick reason codes.
+pub mod kick {
+    /// Removed by zone logic.
+    pub const BY_ZONE: u32 = 1;
+    /// Same principal connected again; this connection was replaced.
+    pub const REPLACED: u32 = 2;
+    /// Server shutting down.
+    pub const SHUTDOWN: u32 = 3;
+    /// Input rate limit abuse.
+    pub const RATE_LIMITED: u32 = 4;
+    /// Zone disposed.
+    pub const ZONE_DISPOSED: u32 = 5;
+    /// Outbound queue overflow (client too slow).
+    pub const SLOW_CONSUMER: u32 = 6;
+    /// Client content is stale: reload, then reconnect with the last
+    /// Welcome's reconnect token inside the grace window.
+    pub const RELOAD: u32 = 7;
+}
+
+/// Error codes.
+pub mod error {
+    /// Malformed or unexpected message.
+    pub const BAD_MESSAGE: u32 = 1;
+    /// Ticket missing, invalid, expired or replayed.
+    pub const UNAUTHORIZED: u32 = 2;
+    /// Zone `on_auth` rejected the join.
+    pub const REJECTED: u32 = 3;
+    /// Zone at capacity.
+    pub const ZONE_FULL: u32 = 4;
+    /// Protocol or content version mismatch.
+    pub const VERSION_MISMATCH: u32 = 5;
+    /// Input dropped by rate limiting (sent at most once per second).
+    pub const RATE_LIMITED: u32 = 6;
+    /// Unknown zone.
+    pub const NOT_FOUND: u32 = 7;
+    /// Reconnect token unknown or grace window elapsed.
+    pub const RECONNECT_FAILED: u32 = 8;
+    /// The zone could not be created right now (its factory or allocation
+    /// store failed or timed out); retry later.
+    pub const ZONE_UNAVAILABLE: u32 = 9;
+    /// The zone is asleep and an observer does not wake it (zones hosted as
+    /// celld objects: observers are passive watchers); try again later.
+    pub const ASLEEP: u32 = 10;
+    /// An observer said it is near (Hello `near` / `Near`) but its ticket
+    /// does not grant `wake`: it stays a passive watcher. Sent after the
+    /// join, without closing; a fresh ticket may grant it.
+    pub const WAKE_DENIED: u32 = 11;
+}
+
+/// Client handshake.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Hello {
+    /// The newest protocol version the client speaks; the server answers
+    /// in it or refuses with `Error(VERSION_MISMATCH)` (message starting
+    /// `protocol`) before touching the ticket, and the client may retry
+    /// with an older one. See [`supports_protocol`].
+    pub protocol_version: u32,
+    /// Game content version the client was built against.
+    pub content_version: String,
+    /// Game-defined capability bits (opaque to the runtime).
+    pub capabilities: u32,
+    /// Signed admission ticket (empty when reconnecting).
+    pub ticket: String,
+    /// Reconnect token from a previous Welcome (empty for a fresh join).
+    pub reconnect_token: String,
+    /// An observer that is *near* (e.g. its player is close to this zone):
+    /// on zones hosted as celld objects a near observer whose ticket grants
+    /// `wake` wakes a sleeping zone and keeps it awake like a player;
+    /// otherwise it is a passive watcher. Changed later with
+    /// [`ClientMessage::Near`]. Ignored for players.
+    pub near: bool,
+}
+
+/// Messages a client sends.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientMessage {
+    /// Handshake; must be the first message.
+    Hello(Hello),
+    /// Sequenced input.
+    Input {
+        /// Strictly increasing per connection lifetime, starting at 1.
+        seq: u32,
+        /// Client's predicted tick when sampled.
+        client_tick: u32,
+        /// Game-defined input bytes.
+        payload: Vec<u8>,
+    },
+    /// Clock sync probe.
+    Ping {
+        /// Client clock in ms (echoed).
+        client_time: f64,
+    },
+    /// Graceful leave (no reconnect grace).
+    Leave,
+    /// The client patched its content live (after a `Resume` with a new
+    /// version) and now runs `content_version`. Only the zone's current
+    /// version is accepted; anything else is ignored.
+    Content {
+        /// The version the client runs now.
+        content_version: String,
+    },
+    /// An observer is near the zone (keep it awake) or no longer is
+    /// (passive watcher again); see [`Hello::near`].
+    Near {
+        /// Near (true) or passive (false).
+        near: bool,
+    },
+    /// Where an observer is looking, in the zone's local coordinates (a
+    /// player next door: its position seen from this zone). The zone
+    /// decides what it means ([`Zone::on_observer_focus`](crate::Zone::on_observer_focus);
+    /// by default the observer's view centre follows). Ignored for
+    /// players.
+    Focus {
+        /// x (zone-local).
+        x: f32,
+        /// y (zone-local).
+        y: f32,
+    },
+}
+
+impl ClientMessage {
+    /// Encode one message (one WebSocket binary frame).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        match self {
+            Self::Hello(h) => {
+                w.u8(tag::HELLO)
+                    .varuint(h.protocol_version)
+                    .string(&h.content_version)
+                    .varuint(h.capabilities)
+                    .string(&h.ticket)
+                    .string(&h.reconnect_token)
+                    .bool(h.near);
+            }
+            Self::Input {
+                seq,
+                client_tick,
+                payload,
+            } => {
+                w.u8(tag::INPUT)
+                    .varuint(*seq)
+                    .varuint(*client_tick)
+                    .bytes(payload);
+            }
+            Self::Ping { client_time } => {
+                w.u8(tag::PING).f64(*client_time);
+            }
+            Self::Leave => {
+                w.u8(tag::LEAVE);
+            }
+            Self::Content { content_version } => {
+                w.u8(tag::CONTENT).string(content_version);
+            }
+            Self::Near { near } => {
+                w.u8(tag::NEAR).bool(*near);
+            }
+            Self::Focus { x, y } => {
+                w.u8(tag::FOCUS).f32(*x).f32(*y);
+            }
+        }
+        w.into_bytes()
+    }
+
+    /// Decode one message.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(bytes);
+        let message = match r.u8()? {
+            tag::HELLO => Self::Hello(Hello {
+                protocol_version: r.varuint()?,
+                content_version: r.string()?,
+                capabilities: r.varuint()?,
+                ticket: r.string()?,
+                reconnect_token: r.string()?,
+                near: r.bool()?,
+            }),
+            tag::INPUT => Self::Input {
+                seq: r.varuint()?,
+                client_tick: r.varuint()?,
+                payload: r.bytes()?.to_vec(),
+            },
+            tag::PING => Self::Ping {
+                client_time: r.f64()?,
+            },
+            tag::LEAVE => Self::Leave,
+            tag::CONTENT => Self::Content {
+                content_version: r.string()?,
+            },
+            tag::NEAR => Self::Near { near: r.bool()? },
+            tag::FOCUS => Self::Focus {
+                x: r.f32()?,
+                y: r.f32()?,
+            },
+            other => return Err(DecodeError::UnknownMessage(other)),
+        };
+        r.finish()?;
+        Ok(message)
+    }
+}
+
+/// Connection role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Owns a player in the zone. Wire `0`.
+    Player,
+    /// Read-only observer. Wire `1`.
+    Observer,
+}
+
+/// Where a zone sits in the world: its origin in world coordinates, so
+/// world = origin + zone-local (`Zone::origin`). Clients use it to say
+/// where their player is in a neighbour's coordinates (`Focus`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Origin {
+    /// World x of the zone's local (0, 0).
+    pub x: f64,
+    /// World y of the zone's local (0, 0).
+    pub y: f64,
+}
+
+impl Origin {
+    /// Origin at world `(x, y)`.
+    pub fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+
+    /// A world point in this zone's local coordinates.
+    pub fn to_local(self, x: f64, y: f64) -> (f32, f32) {
+        ((x - self.x) as f32, (y - self.y) as f32)
+    }
+
+    /// A zone-local point in world coordinates.
+    pub fn to_world(self, x: f32, y: f32) -> (f64, f64) {
+        (self.x + f64::from(x), self.y + f64::from(y))
+    }
+}
+
+/// Server handshake reply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Welcome {
+    /// Protocol version this Welcome is encoded in: the client's Hello
+    /// version (not itself on the wire; decoders take it from the mirror,
+    /// [`EntityKinds::protocol_version`]).
+    pub protocol_version: u32,
+    /// Opaque session id (stable across reconnects of the same player).
+    pub session_id: String,
+    /// Zone joined.
+    pub zone_id: String,
+    /// Admitted role.
+    pub role: Role,
+    /// Simulation ticks per second (Hot tier).
+    pub tick_rate: u32,
+    /// Deltas per second.
+    pub patch_rate: u32,
+    /// Current server tick.
+    pub server_tick: u32,
+    /// Server clock in ms.
+    pub server_time: f64,
+    /// Token for Hello.reconnect_token after a drop.
+    pub reconnect_token: String,
+    /// Server content version.
+    pub content_version: String,
+    /// Replicated entity schema.
+    pub schema: EntitySchema,
+    /// v2: runtime features of the server ([`feature`]); 0 in v1.
+    pub features: u32,
+    /// v2: where the zone sits in the world, when it says
+    /// (`Zone::origin`); always `None` in v1.
+    pub origin: Option<Origin>,
+}
+
+/// Full entity state for a create.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityCreate {
+    /// Entity id.
+    pub id: u32,
+    /// Kind id.
+    pub kind: u16,
+    /// Every field, schema order.
+    pub fields: Vec<FieldValue>,
+}
+
+/// Changed fields of a known entity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityUpdate {
+    /// Entity id.
+    pub id: u32,
+    /// Bit `i` set = field `i` present.
+    pub mask: u32,
+    /// Present fields in ascending index order.
+    pub fields: Vec<FieldValue>,
+}
+
+/// One replication patch.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Delta {
+    /// Server tick the state belongs to.
+    pub server_tick: u32,
+    /// Highest processed input sequence of this client (0 = none).
+    pub ack_seq: u32,
+    /// Ids to forget (applied first).
+    pub removes: Vec<u32>,
+    /// New entities (applied second).
+    pub creates: Vec<EntityCreate>,
+    /// Field changes (applied last).
+    pub updates: Vec<EntityUpdate>,
+}
+
+/// Freeze/Resume notice.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Notice {
+    /// Machine-readable reason.
+    pub reason: String,
+    /// Version involved (e.g. content version being rolled out).
+    pub version: String,
+    /// Human-readable notes.
+    pub notes: String,
+}
+
+/// Messages the server sends.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerMessage {
+    /// Handshake accepted.
+    Welcome(Welcome),
+    /// Replication patch.
+    Delta(Delta),
+    /// Reliable game event.
+    Event {
+        /// Game-defined event type.
+        type_id: u32,
+        /// Game-defined payload.
+        payload: Vec<u8>,
+    },
+    /// Clock sync reply.
+    Pong {
+        /// Echoed client time (ms).
+        client_time: f64,
+        /// Server clock (ms).
+        server_time: f64,
+    },
+    /// Simulation frozen (inputs ignored until Resume).
+    Freeze(Notice),
+    /// Simulation resumed.
+    Resume(Notice),
+    /// Move to another zone.
+    Handoff {
+        /// Destination zone id.
+        target_zone: String,
+        /// Ticket to present in the next Hello.
+        transfer_ticket: String,
+    },
+    /// Removed from the zone; the server closes the socket.
+    Kick {
+        /// See [`kick`].
+        code: u32,
+        /// Text.
+        message: String,
+    },
+    /// Request-level error; handshake errors are followed by close.
+    Error {
+        /// See [`error`].
+        code: u32,
+        /// Text.
+        message: String,
+    },
+    /// This host does not own `zone_id`: reconnect to `url` and send the
+    /// same Hello again (the ticket was not consumed). Followed by close.
+    Redirect {
+        /// Zone the client asked for.
+        zone_id: String,
+        /// Full WebSocket URL of the owning host's zone endpoint.
+        url: String,
+    },
+}
+
+/// What a decoder/encoder needs to know about the client's view: the
+/// negotiated protocol version (Welcome), the schema and the known ids
+/// (Deltas).
+pub trait EntityKinds {
+    /// Protocol version the server answers in (default: the newest).
+    fn protocol_version(&self) -> u32 {
+        PROTOCOL_VERSION
+    }
+    /// Schema from the Welcome.
+    fn schema(&self) -> Option<&EntitySchema>;
+    /// Kind of a known entity id.
+    fn kind_of(&self, id: u32) -> Option<u16>;
+}
+
+/// No schema: Deltas cannot be decoded.
+impl EntityKinds for () {
+    fn schema(&self) -> Option<&EntitySchema> {
+        None
+    }
+    fn kind_of(&self, _: u32) -> Option<u16> {
+        None
+    }
+}
+
+/// Schema plus an explicit id→kind table (fixtures/tests).
+impl EntityKinds for (EntitySchema, BTreeMap<u32, u16>) {
+    fn schema(&self) -> Option<&EntitySchema> {
+        Some(&self.0)
+    }
+    fn kind_of(&self, id: u32) -> Option<u16> {
+        self.1.get(&id).copied()
+    }
+}
+
+impl ServerMessage {
+    /// Encode one message. Deltas need `kinds` (schema + known ids).
+    pub fn encode(&self, kinds: &dyn EntityKinds) -> Result<Vec<u8>, DecodeError> {
+        let mut w = Writer::new();
+        match self {
+            Self::Welcome(m) => {
+                w.u8(tag::WELCOME)
+                    .string(&m.session_id)
+                    .string(&m.zone_id)
+                    .u8(match m.role {
+                        Role::Player => 0,
+                        Role::Observer => 1,
+                    })
+                    .varuint(m.tick_rate)
+                    .varuint(m.patch_rate)
+                    .varuint(m.server_tick)
+                    .f64(m.server_time)
+                    .string(&m.reconnect_token)
+                    .string(&m.content_version);
+                m.schema.encode(&mut w);
+                if m.protocol_version >= 2 {
+                    w.varuint(m.features).bool(m.origin.is_some());
+                    if let Some(origin) = m.origin {
+                        w.f64(origin.x).f64(origin.y);
+                    }
+                }
+            }
+            Self::Delta(d) => encode_delta(&mut w, d, kinds)?,
+            Self::Event { type_id, payload } => {
+                w.u8(tag::EVENT).varuint(*type_id).bytes(payload);
+            }
+            Self::Pong {
+                client_time,
+                server_time,
+            } => {
+                w.u8(tag::PONG).f64(*client_time).f64(*server_time);
+            }
+            Self::Freeze(n) | Self::Resume(n) => {
+                let t = if matches!(self, Self::Freeze(_)) {
+                    tag::FREEZE
+                } else {
+                    tag::RESUME
+                };
+                w.u8(t)
+                    .string(&n.reason)
+                    .string(&n.version)
+                    .string(&n.notes);
+            }
+            Self::Handoff {
+                target_zone,
+                transfer_ticket,
+            } => {
+                w.u8(tag::HANDOFF)
+                    .string(target_zone)
+                    .string(transfer_ticket);
+            }
+            Self::Kick { code, message } => {
+                w.u8(tag::KICK).varuint(*code).string(message);
+            }
+            Self::Error { code, message } => {
+                w.u8(tag::ERROR).varuint(*code).string(message);
+            }
+            Self::Redirect { zone_id, url } => {
+                w.u8(tag::REDIRECT).string(zone_id).string(url);
+            }
+        }
+        Ok(w.into_bytes())
+    }
+
+    /// Decode one message. Deltas need `kinds`.
+    pub fn decode(bytes: &[u8], kinds: &dyn EntityKinds) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(bytes);
+        let message = match r.u8()? {
+            tag::WELCOME => Self::Welcome(decode_welcome(&mut r, kinds.protocol_version())?),
+            tag::DELTA => Self::Delta(decode_delta(&mut r, kinds)?),
+            tag::EVENT => Self::Event {
+                type_id: r.varuint()?,
+                payload: r.bytes()?.to_vec(),
+            },
+            tag::PONG => Self::Pong {
+                client_time: r.f64()?,
+                server_time: r.f64()?,
+            },
+            t @ (tag::FREEZE | tag::RESUME) => {
+                let notice = Notice {
+                    reason: r.string()?,
+                    version: r.string()?,
+                    notes: r.string()?,
+                };
+                if t == tag::FREEZE {
+                    Self::Freeze(notice)
+                } else {
+                    Self::Resume(notice)
+                }
+            }
+            tag::HANDOFF => Self::Handoff {
+                target_zone: r.string()?,
+                transfer_ticket: r.string()?,
+            },
+            tag::KICK => Self::Kick {
+                code: r.varuint()?,
+                message: r.string()?,
+            },
+            tag::ERROR => Self::Error {
+                code: r.varuint()?,
+                message: r.string()?,
+            },
+            tag::REDIRECT => Self::Redirect {
+                zone_id: r.string()?,
+                url: r.string()?,
+            },
+            other => return Err(DecodeError::UnknownMessage(other)),
+        };
+        r.finish()?;
+        Ok(message)
+    }
+}
+
+fn decode_welcome(r: &mut Reader<'_>, protocol_version: u32) -> Result<Welcome, DecodeError> {
+    let mut welcome = Welcome {
+        protocol_version,
+        session_id: r.string()?,
+        zone_id: r.string()?,
+        role: match r.u8()? {
+            0 => Role::Player,
+            1 => Role::Observer,
+            _ => return Err(DecodeError::Invalid("role")),
+        },
+        tick_rate: r.varuint()?,
+        patch_rate: r.varuint()?,
+        server_tick: r.varuint()?,
+        server_time: r.f64()?,
+        reconnect_token: r.string()?,
+        content_version: r.string()?,
+        schema: EntitySchema::decode(r)?,
+        features: 0,
+        origin: None,
+    };
+    if protocol_version >= 2 {
+        welcome.features = r.varuint()?;
+        if r.bool()? {
+            welcome.origin = Some(Origin {
+                x: r.f64()?,
+                y: r.f64()?,
+            });
+        }
+    }
+    Ok(welcome)
+}
+
+fn kind_lookup(
+    id: u32,
+    created: &BTreeMap<u32, u16>,
+    kinds: &dyn EntityKinds,
+) -> Result<u16, DecodeError> {
+    created
+        .get(&id)
+        .copied()
+        .or_else(|| kinds.kind_of(id))
+        .ok_or(DecodeError::UnknownEntity(id))
+}
+
+fn encode_delta(w: &mut Writer, d: &Delta, kinds: &dyn EntityKinds) -> Result<(), DecodeError> {
+    let schema = kinds
+        .schema()
+        .ok_or(DecodeError::Invalid("delta needs a schema"))?;
+    w.u8(tag::DELTA).varuint(d.server_tick).varuint(d.ack_seq);
+    w.varuint(d.removes.len() as u32);
+    for id in &d.removes {
+        w.varuint(*id);
+    }
+    let mut created = BTreeMap::new();
+    w.varuint(d.creates.len() as u32);
+    for c in &d.creates {
+        let kind = schema.get(c.kind).ok_or(DecodeError::UnknownEntity(c.id))?;
+        if kind.fields.len() != c.fields.len() {
+            return Err(DecodeError::Invalid("create must carry every field"));
+        }
+        w.varuint(c.id).varuint(u32::from(c.kind));
+        for (def, value) in kind.fields.iter().zip(&c.fields) {
+            def.ty.encode(w, value);
+        }
+        created.insert(c.id, c.kind);
+    }
+    w.varuint(d.updates.len() as u32);
+    for u in &d.updates {
+        let kind_id = kind_lookup(u.id, &created, kinds)?;
+        let kind = schema
+            .get(kind_id)
+            .ok_or(DecodeError::UnknownEntity(u.id))?;
+        w.varuint(u.id).varuint(u.mask);
+        let mut values = u.fields.iter();
+        for (index, def) in kind.fields.iter().enumerate() {
+            if u.mask & (1 << index) != 0 {
+                let value = values
+                    .next()
+                    .ok_or(DecodeError::Invalid("mask/field count mismatch"))?;
+                def.ty.encode(w, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_delta(r: &mut Reader<'_>, kinds: &dyn EntityKinds) -> Result<Delta, DecodeError> {
+    let schema = kinds
+        .schema()
+        .ok_or(DecodeError::Invalid("delta needs a schema"))?;
+    let mut delta = Delta {
+        server_tick: r.varuint()?,
+        ack_seq: r.varuint()?,
+        ..Delta::default()
+    };
+    for _ in 0..r.varuint()? {
+        delta.removes.push(r.varuint()?);
+    }
+    let mut created = BTreeMap::new();
+    for _ in 0..r.varuint()? {
+        let id = r.varuint()?;
+        let kind_id = u16::try_from(r.varuint()?).map_err(|_| DecodeError::Invalid("kind"))?;
+        let kind = schema.get(kind_id).ok_or(DecodeError::UnknownEntity(id))?;
+        let mut fields = Vec::with_capacity(kind.fields.len());
+        for def in &kind.fields {
+            fields.push(def.ty.decode(r)?);
+        }
+        created.insert(id, kind_id);
+        delta.creates.push(EntityCreate {
+            id,
+            kind: kind_id,
+            fields,
+        });
+    }
+    for _ in 0..r.varuint()? {
+        let id = r.varuint()?;
+        let kind = schema
+            .get(kind_lookup(id, &created, kinds)?)
+            .ok_or(DecodeError::UnknownEntity(id))?;
+        let mask = r.varuint()?;
+        if kind.fields.len() < 32 && mask >> kind.fields.len() != 0 {
+            return Err(DecodeError::Invalid("mask names a field the kind lacks"));
+        }
+        let mut fields = Vec::new();
+        for (index, def) in kind.fields.iter().enumerate() {
+            if mask & (1 << index) != 0 {
+                fields.push(def.ty.decode(r)?);
+            }
+        }
+        delta.updates.push(EntityUpdate { id, mask, fields });
+    }
+    Ok(delta)
+}
+
+/// Mirrored entity on a client.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MirrorEntity {
+    /// Kind id.
+    pub kind: u16,
+    /// Current decoded field values.
+    pub fields: Vec<FieldValue>,
+}
+
+/// Reference client-side state: decodes server frames and applies Deltas.
+///
+/// This is the normative behaviour a client implementation (e.g. JS) must
+/// match; it is also what the crate's own tests use.
+#[derive(Debug, Clone)]
+pub struct ClientMirror {
+    /// Protocol version the client offered in Hello (Welcomes decode in
+    /// it); [`PROTOCOL_VERSION`] by default.
+    pub protocol_version: u32,
+    /// Last Welcome.
+    pub welcome: Option<Welcome>,
+    /// Known entities.
+    pub entities: BTreeMap<u32, MirrorEntity>,
+    /// Last Delta tick.
+    pub server_tick: u32,
+    /// Last acked input sequence.
+    pub ack_seq: u32,
+}
+
+impl Default for ClientMirror {
+    fn default() -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            welcome: None,
+            entities: BTreeMap::new(),
+            server_tick: 0,
+            ack_seq: 0,
+        }
+    }
+}
+
+impl EntityKinds for ClientMirror {
+    fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+    fn schema(&self) -> Option<&EntitySchema> {
+        self.welcome.as_ref().map(|w| &w.schema)
+    }
+    fn kind_of(&self, id: u32) -> Option<u16> {
+        self.entities.get(&id).map(|e| e.kind)
+    }
+}
+
+impl ClientMirror {
+    /// Empty mirror.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Empty mirror of a client that offered `protocol_version` in Hello.
+    pub fn speaking(protocol_version: u32) -> Self {
+        Self {
+            protocol_version,
+            ..Self::default()
+        }
+    }
+
+    /// Decode a frame and apply it. Welcome resets all entities.
+    pub fn apply(&mut self, frame: &[u8]) -> Result<ServerMessage, DecodeError> {
+        let message = ServerMessage::decode(frame, self)?;
+        match &message {
+            ServerMessage::Welcome(w) => {
+                self.welcome = Some(w.clone());
+                self.entities.clear();
+                self.server_tick = w.server_tick;
+            }
+            ServerMessage::Delta(d) => {
+                for id in &d.removes {
+                    self.entities.remove(id);
+                }
+                for c in &d.creates {
+                    self.entities.insert(
+                        c.id,
+                        MirrorEntity {
+                            kind: c.kind,
+                            fields: c.fields.clone(),
+                        },
+                    );
+                }
+                for u in &d.updates {
+                    let entity = self
+                        .entities
+                        .get_mut(&u.id)
+                        .ok_or(DecodeError::UnknownEntity(u.id))?;
+                    let mut values = u.fields.iter();
+                    for (index, slot) in entity.fields.iter_mut().enumerate() {
+                        if u.mask & (1 << index) != 0 {
+                            if let Some(v) = values.next() {
+                                *slot = v.clone();
+                            }
+                        }
+                    }
+                }
+                self.server_tick = d.server_tick;
+                self.ack_seq = d.ack_seq;
+            }
+            _ => {}
+        }
+        Ok(message)
+    }
+}

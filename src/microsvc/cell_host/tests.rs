@@ -1,6 +1,6 @@
 use super::{
-    instance_name, parent_cell_name, AggregateCell, CellCommandIdentity, CellDispatchError,
-    CellNamespace, CellStreamStore, DURABLE_AGGREGATE_CELL_STATE_VERSION,
+    instance_name, parent_cell_name, AggregateCell, CellBatchCommand, CellCommandIdentity,
+    CellDispatchError, CellNamespace, CellStreamStore, DURABLE_AGGREGATE_CELL_STATE_VERSION,
 };
 use crate::aggregate::{Aggregate, AggregateRepository};
 use crate::command::{typed_command, PreparedCommand, Succeeded};
@@ -223,6 +223,11 @@ async fn command_replay_retains_confirmation_evidence_without_outbox_history() {
         "replay must not republish"
     );
     assert_eq!(reopened.durable_events().unwrap()[0].events.len(), 1);
+    // History reads the same log through the store.
+    let history = reopened.history().await.unwrap();
+    assert_eq!(history, cell.durable_events().unwrap()[0].events);
+    let foreign = StreamIdentity::new("CellItem", "someone-else").unwrap();
+    assert!(reopened.stream_events(&foreign).await.is_err());
 }
 
 fn fn_send_sync<T: Send + Sync>(_: &T) {}
@@ -450,6 +455,98 @@ async fn cell_wait_path_replays_the_same_command_without_new_domain_effects() {
     );
 }
 
+fn batch_command(command: &str, id: &str, input: serde_json::Value) -> CellBatchCommand {
+    CellBatchCommand {
+        command: command.into(),
+        identity: CellCommandIdentity::new("cell-test-service", "principal-alice", id).unwrap(),
+        input,
+        session: owner_session(),
+    }
+}
+
+fn event_count(cell: &AggregateCell<CellItem>) -> usize {
+    cell.durable_events()
+        .unwrap()
+        .iter()
+        .map(|stream| stream.events.len())
+        .sum()
+}
+
+#[tokio::test]
+async fn a_batch_runs_in_order_and_replays_as_a_whole() {
+    let cell = AggregateCell::<CellItem>::new("item-batch")
+        .unwrap()
+        .mount(Create)
+        .mount(Complete);
+    let batch = || {
+        vec![
+            batch_command(
+                "cell_item.create",
+                "0190a000-0000-7000-8000-000000000410",
+                json!({ "id": "item-batch", "title": "once" }),
+            ),
+            // Sees the create before it.
+            batch_command(
+                "cell_item.complete",
+                "0190a000-0000-7000-8000-000000000411",
+                json!({ "id": "item-batch" }),
+            ),
+        ]
+    };
+    let first = cell.dispatch_idempotent_batch(batch()).await;
+    assert_eq!(first.len(), 2);
+    assert!(first.iter().all(|r| !r.as_ref().unwrap().replayed()));
+    assert_eq!(first[1].as_ref().unwrap().payload()["done"], json!(true));
+    assert_eq!(event_count(&cell), 2);
+
+    let replay = cell.dispatch_idempotent_batch(batch()).await;
+    assert_eq!(replay.len(), 2);
+    for (replayed, original) in replay.iter().zip(&first) {
+        let (replayed, original) = (replayed.as_ref().unwrap(), original.as_ref().unwrap());
+        assert!(replayed.replayed());
+        assert_eq!(replayed.payload(), original.payload());
+        assert_eq!(replayed.causation_id(), original.causation_id());
+    }
+    assert_eq!(event_count(&cell), 2, "a replayed batch appends nothing");
+}
+
+#[tokio::test]
+async fn a_rejected_batch_entry_leaves_the_others_committed() {
+    let cell = AggregateCell::<CellItem>::new("item-batch-reject")
+        .unwrap()
+        .mount(Create)
+        .mount(Complete);
+    let create = json!({ "id": "item-batch-reject", "title": "once" });
+    let results = cell
+        .dispatch_idempotent_batch(vec![
+            batch_command(
+                "cell_item.create",
+                "0190a000-0000-7000-8000-000000000420",
+                create.clone(),
+            ),
+            // Already exists: rejected by the handler.
+            batch_command(
+                "cell_item.create",
+                "0190a000-0000-7000-8000-000000000421",
+                create,
+            ),
+            batch_command(
+                "cell_item.complete",
+                "0190a000-0000-7000-8000-000000000422",
+                json!({ "id": "item-batch-reject" }),
+            ),
+        ])
+        .await;
+    assert_eq!(results.len(), 3);
+    assert!(results[0].is_ok());
+    assert!(matches!(
+        results[1],
+        Err(CellDispatchError::Rejected { .. })
+    ));
+    assert!(results[2].is_ok());
+    assert_eq!(event_count(&cell), 2);
+}
+
 #[tokio::test]
 async fn cell_wait_path_rejects_command_id_reuse_with_different_input() {
     let cell = AggregateCell::<CellItem>::new("item-conflict")
@@ -626,3 +723,42 @@ fn cargo_features_keep_sqlite_and_do_not_add_celld() {
         "PCH-DEC-005: do not add a celld Cargo feature beside sqlite/postgres"
     );
 }
+
+#[tokio::test]
+async fn reference_host_applies_the_sealed_row_reducer_on_commit() {
+    let store = CellStreamStore::new("CellItem", "item-s")
+        .unwrap()
+        .with_sealed_row_reducer(|current, appends| {
+            let seen = current.and_then(|row| row["events"].as_u64()).unwrap_or(0);
+            let added = appends
+                .iter()
+                .map(|append| append.events.len() as u64)
+                .sum::<u64>();
+            Ok(Some(json!({ "events": seen + added })))
+        });
+    let cell = AggregateCell::<CellItem>::from_store(store)
+        .unwrap()
+        .mount(Create)
+        .mount(Complete);
+    cell.dispatch(
+        "cell_item.create",
+        json!({ "id": "item-s", "title": "seal" }),
+        owner_session(),
+    )
+    .await
+    .unwrap();
+    cell.dispatch(
+        "cell_item.complete",
+        json!({ "id": "item-s" }),
+        owner_session(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cell.sealed_row().unwrap(), Some(json!({ "events": 2 })));
+    assert!(AggregateCell::<CellItem>::from_store(
+        CellStreamStore::for_parent_shard("game", "g1", |_| true).unwrap()
+    )
+    .is_err());
+}
+
+mod alarms;

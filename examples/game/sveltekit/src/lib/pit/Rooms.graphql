@@ -1,0 +1,15 @@
+# Every room the zone status read model knows (mobpit-service's
+# zone_activities, projected from the rooms' zone-activity cells): the
+# minimap. SSR seeds it, `@live` keeps it current as rooms wake, empty and
+# sleep. `node` is a debug detail (which celld node ran the activation).
+query Rooms @load @live {
+  zone_activities(order_by: [{ zone_id: asc }]) {
+    zone_id
+    status
+    players
+    restored
+    activations
+    node
+    changed_at_ms
+  }
+}

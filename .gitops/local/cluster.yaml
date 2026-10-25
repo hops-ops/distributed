@@ -1,0 +1,18 @@
+# The machine's one Hops Cluster (kind-hops). Mob Pit never provisions a
+# cluster; identity (name, mountRoot, localDomain) is machine-owned and must
+# match ~/.gitops/local/cluster.yaml. `cluster/` holds the packages Mob Pit
+# needs on it (overlaid by `hops local up`).
+apiVersion: hops.local/v1alpha1
+kind: Cluster
+metadata:
+  name: hops
+spec:
+  clusterProvider: kind
+  dockerProvider: dory
+  mountRoot: $HOME
+  localDomain: gitkb.localhost
+  browserIngress:
+    namespaces:
+      - auth
+  manifests:
+    path: .gitops/local/cluster

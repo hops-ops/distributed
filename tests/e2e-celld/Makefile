@@ -1,12 +1,12 @@
 # Celld GraphQL example — sibling of tests/e2e-ui, not make run there.
 #
-#   make -C tests/e2e-ui up-celld-nats   # celld 0.4 local store + Queue + NATS
+#   make -C tests/e2e-ui up-celld-nats   # celld local store + Queue + NATS
 #   make run                             # this GraphQL host + the e2e-ui Svelte app
 #
 # Distributed owns the GraphQL + sibling UI lifecycle. The independent celld
 # worker watcher remains infrastructure until celld exposes a lifecycle probe.
 
-.PHONY: run stop test help ensure-watch
+.PHONY: run stop test test-browser help ensure-watch
 
 BIND         ?= 127.0.0.1:8791
 API_PORT     ?= 8791
@@ -16,7 +16,7 @@ PUBLIC_ORIGIN ?= http://localhost:8791
 UI_INTERNAL_ORIGIN ?= http://localhost:$(UI_PORT)
 UI_URL       ?= $(PUBLIC_ORIGIN)
 ENV_FILE     ?= ../e2e-ui/e2e-ui.env
-CELLD_HTTP_PORT ?= 18080
+CELLD_HTTP_PORT ?= 18880
 CELLD_URL    ?= http://127.0.0.1:$(CELLD_HTTP_PORT)
 NATS_PORT    ?= 14222
 NATS_URL     ?= nats://127.0.0.1:$(NATS_PORT)
@@ -46,13 +46,9 @@ run: $(if $(filter 1,$(WATCH_WORKER)),ensure-watch)
 	_celld="$(CELLD_URL)"; \
 	code=$$(curl -s -o /dev/null -w '%{http_code}' "$${_celld}/health" 2>/dev/null || echo 000); \
 	if [ "$$code" != "200" ]; then \
-	  if curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18880/health" 2>/dev/null | grep -q 200; then \
-	    _celld="http://127.0.0.1:18880"; \
-	  else \
-	    echo "celld not healthy at $$_celld — start: make -C ../e2e-ui up-celld-nats"; \
-	    echo "or: CELLD_HTTP_PORT=18880 make run"; \
-	    exit 1; \
-	  fi; \
+	  echo "celld not healthy at $$_celld — start: make -C ../e2e-ui up-celld-nats"; \
+	  echo "(a non-default port: CELLD_HTTP_PORT=<port> make run)"; \
+	  exit 1; \
 	fi; \
 	export CELLD_URL="$$_celld"; \
 	_nats="$(NATS_URL)"; \
@@ -97,6 +93,15 @@ run: $(if $(filter 1,$(WATCH_WORKER)),ensure-watch)
 test:
 	cargo test --workspace -- --nocapture
 
+## The full e2e-ui Playwright suite (every project: setup, user, admin, anon)
+## against this celld-backed app. Needs make -C ../e2e-ui up,
+## make -C ../e2e-ui up-celld-nats and make run (this directory).
+test-browser:
+	@code=$$(curl -s -o /dev/null -w '%{http_code}' "$(UI_URL)/" 2>/dev/null || echo 000); \
+	if [ "$$code" = "000" ]; then echo "e2e-celld not reachable at $(UI_URL) — start: make run"; exit 1; fi
+	cd ../e2e-ui && npm install --no-audit --no-fund && npx playwright install chromium
+	cd ../e2e-ui && E2E_UI_ORIGIN="$(UI_URL)" E2E_API_ORIGIN="http://$(BIND)" npx playwright test
+
 stop:
 	@stop_pidfile() { \
 		[ -f "$$1" ] || return 0; \
@@ -118,6 +123,7 @@ help:
 	@echo "  make test  cargo test --workspace (CI)"
 	@echo "  make run   distributed dev owns GraphQL + sibling UI; worker reload runs alongside"
 	@echo "  WATCH_WORKER=0  skip worker-build + celld deploy watch"
+	@echo "  make test-browser  full e2e-ui Playwright suite against this app (after make run)"
 	@echo "  make stop  stop API + UI + worker watch"
 	@echo "  infra:     make -C ../e2e-ui up && make -C ../e2e-ui up-celld-nats"
 	@echo "  Postgres read models from e2e-ui.env DATABASE_URL (not sqlite)"

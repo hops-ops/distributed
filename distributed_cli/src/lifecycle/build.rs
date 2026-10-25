@@ -1384,8 +1384,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lifecycle_executor_receives_exact_cli_path_including_spaces() {
-        use std::os::unix::fs::PermissionsExt;
-
         let fixture = tempfile::tempdir().expect("create executor fixture");
         let stage = fixture.path().join("stage");
         fs::create_dir_all(&stage).expect("create executor stage");
@@ -1395,9 +1393,6 @@ mod tests {
             "#!/bin/sh\nprintf '%s' \"$DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE\"\n",
         )
         .expect("write executor script");
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).expect("make executor executable");
         let cli = fixture.path().join("cli with spaces").join("distributed");
         let mut outputs = BTreeSet::new();
         outputs.insert("cli-path.txt".to_string());
@@ -1409,8 +1404,11 @@ mod tests {
             &outputs,
             &LifecycleExecutor {
                 identity: "sha256:executor".to_string(),
-                program: script.to_string_lossy().into_owned(),
-                args: Vec::new(),
+                // Run the script through `sh` instead of exec-ing it: a
+                // freshly written executable can fail with ETXTBSY while a
+                // concurrently forked test child still holds its write fd.
+                program: "/bin/sh".to_string(),
+                args: vec![script.to_string_lossy().into_owned()],
                 stdout: Some("cli-path.txt".to_string()),
             },
             false,

@@ -329,20 +329,33 @@ pub struct HttpCommandHost {
 impl HttpCommandHost {
     const MAX_JSON_BYTES: usize = 2 * 1024 * 1024;
 
+    /// Default per-request timeout.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
     pub fn new(base: impl AsRef<str>) -> Result<Self, CausalDispatchError> {
-        Self::build(base.as_ref(), None)
+        Self::build(base.as_ref(), None, Self::DEFAULT_TIMEOUT)
     }
 
     pub fn new_internal(
         base: impl AsRef<str>,
         secret: InternalHttpSecret,
     ) -> Result<Self, CausalDispatchError> {
-        Self::build(base.as_ref(), Some(secret))
+        Self::build(base.as_ref(), Some(secret), Self::DEFAULT_TIMEOUT)
+    }
+
+    /// As [`new_internal`](Self::new_internal) with a per-request timeout.
+    pub fn new_internal_with_timeout(
+        base: impl AsRef<str>,
+        secret: InternalHttpSecret,
+        timeout: Duration,
+    ) -> Result<Self, CausalDispatchError> {
+        Self::build(base.as_ref(), Some(secret), timeout)
     }
 
     fn build(
         base: &str,
         internal_secret: Option<InternalHttpSecret>,
+        timeout: Duration,
     ) -> Result<Self, CausalDispatchError> {
         let base = reqwest::Url::parse(base.trim_end_matches('/')).map_err(|error| {
             CausalDispatchError::Internal(format!("invalid wait-path base URL: {error}"))
@@ -359,8 +372,8 @@ impl HttpCommandHost {
             ));
         }
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(2).min(timeout))
+            .timeout(timeout)
             .redirect(Policy::none())
             .build()
             .map_err(|error| {

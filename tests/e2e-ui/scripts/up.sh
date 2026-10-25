@@ -59,8 +59,11 @@ for i in $(seq 1 60); do
   fi
 done
 
-echo "==> Wait for Zitadel (API via proxy; first boot can take ~30–90s)"
-for i in $(seq 1 90); do
+# First boot runs every Zitadel migration; on a cold Docker VM that can take
+# well over three minutes. ZITADEL_WAIT_TRIES × 2s bounds the wait.
+ZITADEL_WAIT_TRIES="${ZITADEL_WAIT_TRIES:-180}"
+echo "==> Wait for Zitadel (API via proxy; first boot can take minutes)"
+for i in $(seq 1 "$ZITADEL_WAIT_TRIES"); do
   if curl -fsS --max-time 2 "$ZITADEL_HOST/debug/healthz" >/dev/null 2>&1 \
     || curl -fsS --max-time 2 "$ZITADEL_HOST/debug/ready" >/dev/null 2>&1; then
     echo "    zitadel probe ok (${i} tries)"
@@ -73,7 +76,7 @@ for i in $(seq 1 90); do
   fi
   wait_tick "zitadel health" "$i" 5
   sleep 2
-  if [[ $i -eq 90 ]]; then
+  if [[ $i -eq $ZITADEL_WAIT_TRIES ]]; then
     echo "ERROR: Zitadel unreachable"
     docker compose -f "$COMPOSE" logs --tail=100 zitadel || true
     exit 1
@@ -553,7 +556,7 @@ ADMIN_M_UID=$(create_machine "e2e-ui-admin-m" "admin" "$ADMIN_M_KEY")
 echo "    e2e-ui-admin-m → $ADMIN_M_UID"
 
 # OIDC audience for JWT validation: project id (Zitadel project-scoped aud)
-DATABASE_URL="postgres://e2e:e2e@127.0.0.1:5433/e2e_ui"
+DATABASE_URL="postgres://e2e:e2e@127.0.0.1:${E2E_APP_DB_PORT:-5433}/e2e_ui"
 # Keep Auth.js session cookie decryption stable across re-bootstrap.
 # Rotating AUTH_SECRET → JWTSessionError: no matching decryption secret.
 if [[ -z "${AUTH_SECRET:-}" && -f "$OUT" ]]; then

@@ -1,0 +1,29 @@
+// The celld zone host test worker. Test-only secrets (the harness may
+// override them in .dev.vars or a generated copy of this file).
+{
+  "name": "celld-zone-test",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "ROOM", "class_name": "TallyRoom" },
+      { "name": "TALLY", "class_name": "TallyCell" },
+      { "name": "ZONE_ACTIVITY", "class_name": "ZoneActivityObject" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["TallyRoom", "TallyCell", "ZoneActivityObject"] }
+  ],
+  // The zone-activity cell publishes `zone.activity_changed` to this Queue
+  // (no consumer here; the tests read the cell).
+  "queues": {
+    "producers": [{ "binding": "OUTBOX", "queue": "celld-zone-test-outbox" }]
+  },
+  "vars": {
+    "DISTRIBUTED_INTERNAL_SECRET": "test-only-internal-secret-change-me-2026",
+    "GAME_TICKET_SECRET": "test-only-ticket-secret-change-me-2026",
+    "ZONE_PERSIST_MS": "1000",
+    "ZONE_HIBERNATE_AFTER_MS": "2000",
+    "ZONE_RECONNECT_GRACE_MS": "1000"
+  }
+}
