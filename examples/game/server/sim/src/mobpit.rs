@@ -1163,6 +1163,9 @@ pub fn room_terrain(seed: u32, room: (i32, i32)) -> Heightfield {
             let (hx, hy) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
             (x0 + hx, y0 + hy, (hx * hx + hy * hy).sqrt())
         })
+        // Obstacles stand on level ground at their full height (a hill
+        // round a column would leave a stub that looks like a platform).
+        .chain(room_obstacles(seed, room).1.iter().map(|o| (o.x, o.y, o.r + 1.0)))
         .collect();
     if hills.is_empty() {
         flat.clear();
@@ -2440,6 +2443,22 @@ mod tests {
                 }),
                 LAYER_FLOOR,
             )
+    }
+
+    #[test]
+    fn obstacles_stand_on_level_ground_at_full_height() {
+        for x in -6..6 {
+            for y in -6..6 {
+                let terrain = room_terrain(DEFAULT_SEED, (x, y));
+                for o in room_obstacles(DEFAULT_SEED, (x, y)).1 {
+                    for (dx, dy) in RING8 {
+                        let (px, py) = (o.x + dx * (o.r + 0.3), o.y + dy * (o.r + 0.3));
+                        let h = terrain.height_at([px, py]).map_or(0.0, |(h, _)| h);
+                        assert!(h.abs() < 1e-3, "pit.{x}.{y}: {h} beside {o:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
