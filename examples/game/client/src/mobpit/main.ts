@@ -1149,6 +1149,11 @@ function popup(key: string, zoneId: string, x: number, y: number, text: string, 
 	stage.labels.set(`popup:${key}`, p.mesh, text, 0.6, `pit-pop ${className}`);
 }
 
+// A laser that came through from the room next door: that room's leg of it.
+pit.on('beam', (b, zoneId) => {
+	const points = [placeIn(zoneId, b.x, b.y, b.z), ...b.path.map((h) => placeIn(zoneId, h.x, h.y, h.z)), placeIn(zoneId, b.endX, b.endY, b.endZ)];
+	beam(`laser-next-${zoneId}-${b.shot}`, points, b.hit !== undefined ? beamMats.hit : beamMats.miss, 0.04, BEAM_MS * 2);
+});
 pit.on('kill', (kill, zoneId) => {
 	// Entity ids are per room: a kill next door is never yours.
 	const mine = zoneId === pit.room() && kill.killer === pit.hello()?.entity;

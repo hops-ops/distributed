@@ -407,6 +407,33 @@ const STALE_LAYOUT: PayloadLayout = [
 	['version', { type: 'short_str' }],
 ];
 
+/** Event `beam` (id 11). */
+export interface BeamEvent {
+	readonly shot: number;
+	readonly by: string;
+	readonly x: number;
+	readonly y: number;
+	readonly z: number;
+	readonly path: readonly LaserHit[];
+	readonly endX: number;
+	readonly endY: number;
+	readonly endZ: number;
+	readonly hit: number | undefined;
+}
+
+const BEAM_LAYOUT: PayloadLayout = [
+	['shot', { type: 'u16' }],
+	['by', { type: 'short_str' }],
+	['x', { type: 'f32' }],
+	['y', { type: 'f32' }],
+	['z', { type: 'f32' }],
+	['path', { type: 'list', item: LASER_HIT_TYPE }],
+	['endX', { type: 'f32' }],
+	['endY', { type: 'f32' }],
+	['endZ', { type: 'f32' }],
+	['hit', { type: 'optional', item: { type: 'u32' } }],
+];
+
 /** Message `loaded` (id 1). */
 export interface LoadedMessage {
 	readonly principal: string;
@@ -473,6 +500,105 @@ const MESSAGE_CITY_LAYOUT: PayloadLayout = [
 	['banner', { type: 'short_str' }],
 ];
 
+/** Message `laser_leg` (id 7). */
+export interface LaserLegMessage {
+	readonly shot: number;
+	readonly by: string;
+	readonly x: number;
+	readonly y: number;
+	readonly z: number;
+	readonly dx: number;
+	readonly dy: number;
+	readonly dz: number;
+	readonly dist: number;
+	readonly bounces: number;
+	readonly ageMs: number;
+}
+
+const MESSAGE_LASER_LEG_LAYOUT: PayloadLayout = [
+	['shot', { type: 'u16' }],
+	['by', { type: 'short_str' }],
+	['x', { type: 'f32' }],
+	['y', { type: 'f32' }],
+	['z', { type: 'f32' }],
+	['dx', { type: 'f32' }],
+	['dy', { type: 'f32' }],
+	['dz', { type: 'f32' }],
+	['dist', { type: 'f32' }],
+	['bounces', { type: 'u8' }],
+	['ageMs', { type: 'u16' }],
+];
+
+/** Message `mob_arrive` (id 8). */
+export interface MobArriveMessage {
+	readonly transfer: number;
+	readonly homeId: number;
+	readonly generation: number;
+	readonly tier: number;
+	readonly hp: number;
+	readonly x: number;
+	readonly y: number;
+	readonly chase: string;
+}
+
+const MESSAGE_MOB_ARRIVE_LAYOUT: PayloadLayout = [
+	['transfer', { type: 'u64' }],
+	['homeId', { type: 'u32' }],
+	['generation', { type: 'u32' }],
+	['tier', { type: 'u8' }],
+	['hp', { type: 'u32' }],
+	['x', { type: 'f32' }],
+	['y', { type: 'f32' }],
+	['chase', { type: 'short_str' }],
+];
+
+/** Message `mob_beat` (id 9). */
+export interface MobBeatMessage {
+	readonly transfer: number;
+}
+
+const MESSAGE_MOB_BEAT_LAYOUT: PayloadLayout = [
+	['transfer', { type: 'u64' }],
+];
+
+/** Message `mob_lease` (id 10). */
+export interface MobLeaseMessage {
+	readonly transfer: number;
+}
+
+const MESSAGE_MOB_LEASE_LAYOUT: PayloadLayout = [
+	['transfer', { type: 'u64' }],
+];
+
+/** Message `mob_recall` (id 11). */
+export interface MobRecallMessage {
+	readonly transfer: number;
+}
+
+const MESSAGE_MOB_RECALL_LAYOUT: PayloadLayout = [
+	['transfer', { type: 'u64' }],
+];
+
+/** Message `mob_home` (id 12). */
+export interface MobHomeMessage {
+	readonly transfer: number;
+	readonly hp: number;
+}
+
+const MESSAGE_MOB_HOME_LAYOUT: PayloadLayout = [
+	['transfer', { type: 'u64' }],
+	['hp', { type: 'u32' }],
+];
+
+/** Message `mob_fell` (id 13). */
+export interface MobFellMessage {
+	readonly transfer: number;
+}
+
+const MESSAGE_MOB_FELL_LAYOUT: PayloadLayout = [
+	['transfer', { type: 'u64' }],
+];
+
 /** Event type ids by name. */
 export const EVENT = {
 	hello: 1,
@@ -484,6 +610,7 @@ export const EVENT = {
 	bossDown: 8,
 	shot: 9,
 	stale: 10,
+	beam: 11,
 } as const;
 
 /** Event payload types by name. */
@@ -497,6 +624,7 @@ export interface Events {
 	bossDown: BossDownEvent;
 	shot: ShotEvent;
 	stale: StaleEvent;
+	beam: BeamEvent;
 }
 
 /** Codecs of every event. */
@@ -555,6 +683,12 @@ export const EVENTS: GameEventCodecs<Events> = {
 		encode: (value) => encodePayload(STALE_LAYOUT, value),
 		decode: (payload) => decodePayload(STALE_LAYOUT, payload) as unknown as StaleEvent
 	},
+	beam: {
+		id: 11,
+		name: 'beam',
+		encode: (value) => encodePayload(BEAM_LAYOUT, value),
+		decode: (payload) => decodePayload(BEAM_LAYOUT, payload) as unknown as BeamEvent
+	},
 };
 
 /** A decoded event, discriminated by `name`. */
@@ -582,6 +716,13 @@ export const MESSAGE = {
 	hood: 4,
 	borough: 5,
 	city: 6,
+	laserLeg: 7,
+	mobArrive: 8,
+	mobBeat: 9,
+	mobLease: 10,
+	mobRecall: 11,
+	mobHome: 12,
+	mobFell: 13,
 } as const;
 
 /** Zone inbox message payload types by name. */
@@ -592,6 +733,13 @@ export interface Messages {
 	hood: HoodMessage;
 	borough: BoroughMessage;
 	city: CityMessage;
+	laserLeg: LaserLegMessage;
+	mobArrive: MobArriveMessage;
+	mobBeat: MobBeatMessage;
+	mobLease: MobLeaseMessage;
+	mobRecall: MobRecallMessage;
+	mobHome: MobHomeMessage;
+	mobFell: MobFellMessage;
 }
 
 /** Codecs of every zone inbox message. */
@@ -631,6 +779,48 @@ export const MESSAGES: GameEventCodecs<Messages> = {
 		name: 'city',
 		encode: (value) => encodePayload(MESSAGE_CITY_LAYOUT, value),
 		decode: (payload) => decodePayload(MESSAGE_CITY_LAYOUT, payload) as unknown as CityMessage
+	},
+	laserLeg: {
+		id: 7,
+		name: 'laser_leg',
+		encode: (value) => encodePayload(MESSAGE_LASER_LEG_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_LASER_LEG_LAYOUT, payload) as unknown as LaserLegMessage
+	},
+	mobArrive: {
+		id: 8,
+		name: 'mob_arrive',
+		encode: (value) => encodePayload(MESSAGE_MOB_ARRIVE_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_MOB_ARRIVE_LAYOUT, payload) as unknown as MobArriveMessage
+	},
+	mobBeat: {
+		id: 9,
+		name: 'mob_beat',
+		encode: (value) => encodePayload(MESSAGE_MOB_BEAT_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_MOB_BEAT_LAYOUT, payload) as unknown as MobBeatMessage
+	},
+	mobLease: {
+		id: 10,
+		name: 'mob_lease',
+		encode: (value) => encodePayload(MESSAGE_MOB_LEASE_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_MOB_LEASE_LAYOUT, payload) as unknown as MobLeaseMessage
+	},
+	mobRecall: {
+		id: 11,
+		name: 'mob_recall',
+		encode: (value) => encodePayload(MESSAGE_MOB_RECALL_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_MOB_RECALL_LAYOUT, payload) as unknown as MobRecallMessage
+	},
+	mobHome: {
+		id: 12,
+		name: 'mob_home',
+		encode: (value) => encodePayload(MESSAGE_MOB_HOME_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_MOB_HOME_LAYOUT, payload) as unknown as MobHomeMessage
+	},
+	mobFell: {
+		id: 13,
+		name: 'mob_fell',
+		encode: (value) => encodePayload(MESSAGE_MOB_FELL_LAYOUT, value),
+		decode: (payload) => decodePayload(MESSAGE_MOB_FELL_LAYOUT, payload) as unknown as MobFellMessage
 	},
 };
 

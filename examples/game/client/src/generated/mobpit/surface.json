@@ -566,6 +566,82 @@
         ],
         "kind": "fields"
       }
+    },
+    {
+      "id": 11,
+      "name": "beam",
+      "payload": {
+        "fields": [
+          {
+            "name": "shot",
+            "type": {
+              "type": "u16"
+            }
+          },
+          {
+            "name": "by",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "x",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "y",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "z",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "path",
+            "type": {
+              "item": {
+                "name": "LaserHit",
+                "type": "record"
+              },
+              "type": "list"
+            }
+          },
+          {
+            "name": "end_x",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "end_y",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "end_z",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "hit",
+            "type": {
+              "item": {
+                "type": "u32"
+              },
+              "type": "optional"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
     }
   ],
   "input": {
@@ -1116,6 +1192,219 @@
             "name": "banner",
             "type": {
               "type": "short_str"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 7,
+      "name": "laser_leg",
+      "payload": {
+        "fields": [
+          {
+            "name": "shot",
+            "type": {
+              "type": "u16"
+            }
+          },
+          {
+            "name": "by",
+            "type": {
+              "type": "short_str"
+            }
+          },
+          {
+            "name": "x",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "y",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "z",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "dx",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "dy",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "dz",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "dist",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "bounces",
+            "type": {
+              "type": "u8"
+            }
+          },
+          {
+            "name": "age_ms",
+            "type": {
+              "type": "u16"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 8,
+      "name": "mob_arrive",
+      "payload": {
+        "fields": [
+          {
+            "name": "transfer",
+            "type": {
+              "type": "u64"
+            }
+          },
+          {
+            "name": "home_id",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "generation",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "tier",
+            "type": {
+              "type": "u8"
+            }
+          },
+          {
+            "name": "hp",
+            "type": {
+              "type": "u32"
+            }
+          },
+          {
+            "name": "x",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "y",
+            "type": {
+              "type": "f32"
+            }
+          },
+          {
+            "name": "chase",
+            "type": {
+              "type": "short_str"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 9,
+      "name": "mob_beat",
+      "payload": {
+        "fields": [
+          {
+            "name": "transfer",
+            "type": {
+              "type": "u64"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 10,
+      "name": "mob_lease",
+      "payload": {
+        "fields": [
+          {
+            "name": "transfer",
+            "type": {
+              "type": "u64"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 11,
+      "name": "mob_recall",
+      "payload": {
+        "fields": [
+          {
+            "name": "transfer",
+            "type": {
+              "type": "u64"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 12,
+      "name": "mob_home",
+      "payload": {
+        "fields": [
+          {
+            "name": "transfer",
+            "type": {
+              "type": "u64"
+            }
+          },
+          {
+            "name": "hp",
+            "type": {
+              "type": "u32"
+            }
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "id": 13,
+      "name": "mob_fell",
+      "payload": {
+        "fields": [
+          {
+            "name": "transfer",
+            "type": {
+              "type": "u64"
             }
           }
         ],
