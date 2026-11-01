@@ -21,6 +21,7 @@
 
 use std::cell::RefCell;
 
+use distributed_game::collide::{self, layer, Collider, Colliders, Ray, Uphill};
 use distributed_game::{game_pure, predict, FieldType, GameInput, GameRecord};
 
 use crate::arena::{self, MoveInput, MoveState};
@@ -160,14 +161,14 @@ impl PitState {
         }
     }
 
-    /// Standing on the floor.
+    /// Standing on the room's floor (`z = 0`; a ramp is above it).
     pub fn grounded(self) -> bool {
         self.z <= 0.0
     }
 }
 
-/// `(seed, x, y)` → that room's obstacles as `(x, y, radius)`.
-type ObstacleCache = Option<((u32, i32, i32), Vec<(f32, f32, f32)>)>;
+/// `(seed, x, y)` → that room's obstacles as `(x, y, radius)` and its ramps.
+type ObstacleCache = Option<((u32, i32, i32), (Vec<(f32, f32, f32)>, Colliders))>;
 
 thread_local! {
     /// Obstacles of the last room stepped in (a player stays in a room for
@@ -190,15 +191,19 @@ pub fn pit_step(
     OBSTACLES.with(|cache| {
         let mut cache = cache.borrow_mut();
         if cache.as_ref().map(|(k, _)| *k) != Some(key) {
-            let circles = room_obstacles(context.seed, (context.x, context.y))
+            let at = (context.x, context.y);
+            let circles = room_obstacles(context.seed, at)
                 .1
                 .iter()
                 .map(|o| (o.x, o.y, o.r))
                 .collect();
-            *cache = Some((key, circles));
+            *cache = Some((
+                key,
+                (circles, ramp_colliders(&room_ramps(context.seed, at))),
+            ));
         }
-        let obstacles = &cache.as_ref().expect("filled above").1;
-        step_among(*state, *input, obstacles)
+        let (obstacles, ramps) = &cache.as_ref().expect("filled above").1;
+        step_among(*state, *input, obstacles, ramps)
     })
 }
 
@@ -214,30 +219,133 @@ const SLACK: f32 = 0.01;
 /// Wire type of player `x`/`y`: the room plus its passages, ≈ 0.17 mm steps.
 pub const POS: FieldType = FieldType::quant_centered(22.0, 18);
 
-/// One command frame in a room with the classic pillars (the entrance).
+/// One command frame on flat floor with the classic pillars (no ramps).
 pub fn step(s: PitState, input: PitInput) -> PitState {
-    step_among(s, input, &arena::PILLARS)
+    step_among(s, input, &arena::PILLARS, &Colliders::new())
+}
+
+/// How high a player steps up onto walkable ground without jumping (m),
+/// over what it already stands on. A walkable slope rises less than this
+/// in a frame; the side of a tall ramp does not.
+pub const STEP_UP: f32 = 0.3;
+/// Walking down a slope, ground this far below the feet still holds them
+/// (m); past an edge they fall.
+const SNAP_DOWN: f32 = 0.35;
+/// Touching the ground: feet within this of it (m), above the wire step.
+const TOUCH: f32 = 0.02;
+/// How fast a player slides off a slope too steep to stand on (m/s).
+pub const SLIDE_SPEED: f32 = 6.0;
+/// Speed kept along the normal when bouncing off a steep slope.
+pub const BOUNCE_RESTITUTION: f32 = 0.5;
+/// Slower than this into a steep slope (m/s), a player slides instead.
+const BOUNCE_MIN: f32 = 2.0;
+
+/// Ground height and unit normal at `[x, y]`: the highest ramp there, else
+/// the floor.
+fn ground(ramps: &Colliders, x: f32, y: f32) -> (f32, [f32; 3]) {
+    ramps
+        .ground_at([x, y], layer::ALL)
+        .map_or((0.0, [0.0, 0.0, 1.0]), |g| (g.height, g.normal))
+}
+
+/// Whether a capsule with feet at `z` may move to `[x, y]`: no point of
+/// its footprint (centre and four rims) is on ground it can't climb —
+/// walkable ground more than [`STEP_UP`] (plus the rim's own rise) above
+/// the feet, or steep ground above them at all.
+fn blocked(ramps: &Colliders, x: f32, y: f32, z: f32) -> bool {
+    let r = arena::PLAYER_RADIUS;
+    [(0.0, 0.0), (r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)]
+        .into_iter()
+        .any(|(dx, dy)| {
+            let (g, n) = ground(ramps, x + dx, y + dy);
+            if collide::walkable(n) {
+                g > z + STEP_UP + if dx == 0.0 && dy == 0.0 { 0.0 } else { r }
+            } else {
+                g > z + TOUCH
+            }
+        })
 }
 
 /// One command frame: [`arena::advance_among`] (stick, dash, the room's
-/// obstacles), then the walls with their doorway passages, then the jump
-/// (take off from the floor, gravity, land), snapped to the wire precision.
-pub fn step_among(s: PitState, input: PitInput, obstacles: &[(f32, f32, f32)]) -> PitState {
+/// obstacles), then the walls with their doorway passages, then the
+/// ramps and the jump, snapped to the wire precision.
+///
+/// The ramps: a move onto ground the player can't climb is refused (it
+/// slides along the other axis if that one is free). Ground counts as
+/// floor only when [`collide::walkable`] (normal up component above 0.7,
+/// about 45°): on it the feet follow the surface and the player can jump.
+/// On a steeper slope it slides downhill at [`SLIDE_SPEED`]; landing on
+/// one fast, its velocity is reflected about the slope's normal (keeping
+/// [`BOUNCE_RESTITUTION`] of the part along it): it bounces off.
+pub fn step_among(
+    s: PitState,
+    input: PitInput,
+    obstacles: &[(f32, f32, f32)],
+    ramps: &Colliders,
+) -> PitState {
     let planar = s.planar();
-    let next = walls(
+    let (g0, n0) = ground(ramps, s.x, s.y);
+    let touching = s.z <= g0 + TOUCH && s.vz <= 0.0;
+    let on_floor = touching && collide::walkable(n0);
+    let mut next = walls(
         planar,
         arena::advance_among(planar, input.movement(), obstacles),
     );
+    if !ramps.is_empty() && blocked(ramps, next.x, next.y, s.z) {
+        if !blocked(ramps, next.x, s.y, s.z) {
+            (next.y, next.vy) = (s.y, 0.0);
+        } else if !blocked(ramps, s.x, next.y, s.z) {
+            (next.x, next.vx) = (s.x, 0.0);
+        } else {
+            (next.x, next.y, next.vx, next.vy) = (s.x, s.y, 0.0, 0.0);
+        }
+    }
     let (mut z, mut vz) = (s.z, s.vz);
-    if input.jump() && s.grounded() {
+    if touching && !on_floor {
+        // Too steep to stand on: slide down it.
+        let (dx, dy) = (n0[0], n0[1]);
+        let l = (dx * dx + dy * dy).sqrt();
+        if l > 1e-6 {
+            let k = SLIDE_SPEED * arena::DT / l;
+            next = walls(
+                planar,
+                MoveState {
+                    x: next.x + dx * k,
+                    y: next.y + dy * k,
+                    ..next
+                },
+            );
+        }
+        vz = 0.0;
+    }
+    let (g1, n1) = ground(ramps, next.x, next.y);
+    if input.jump() && on_floor {
         vz = JUMP_SPEED;
     }
-    if z > 0.0 || vz > 0.0 {
+    if touching && vz <= 0.0 && g1 >= z - SNAP_DOWN {
+        // Walking (or sliding): the feet follow the ground.
+        z = g1;
+        vz = 0.0;
+    } else {
         z += vz * arena::DT;
         vz -= GRAVITY * arena::DT;
-        if z <= 0.0 {
-            z = 0.0;
-            vz = 0.0;
+        if z <= g1 {
+            z = g1;
+            if collide::walkable(n1) {
+                vz = 0.0;
+            } else {
+                // A steep slope: bounce off it (or slide, if slow).
+                let v = [next.vx, next.vy, vz];
+                let along = v[0] * n1[0] + v[1] * n1[1] + v[2] * n1[2];
+                let out = if along < -BOUNCE_MIN {
+                    let r = collide::reflect(v, n1);
+                    let k = (1.0 - BOUNCE_RESTITUTION) * along;
+                    [r[0] + k * n1[0], r[1] + k * n1[1], r[2] + k * n1[2]]
+                } else {
+                    [v[0] - along * n1[0], v[1] - along * n1[1], 0.0]
+                };
+                (next.vx, next.vy, vz) = (out[0], out[1], out[2]);
+            }
         }
     }
     canonicalize(PitState { z, vz, ..s }.with_planar(next))
@@ -442,6 +550,10 @@ pub fn room_obstacles(seed: u32, room: (i32, i32)) -> (u8, Vec<Obstacle>) {
     for m in mob_slots(seed, room) {
         keep.push((m.x, m.y, 0.8 + GAP));
     }
+    for r in room_ramps(seed, room) {
+        let (hx, hy) = ((r.x1 - r.x0) / 2.0, (r.y1 - r.y0) / 2.0);
+        keep.push((r.x0 + hx, r.y0 + hy, (hx * hx + hy * hy).sqrt() + GAP));
+    }
     let mut placed: Vec<Obstacle> = Vec::new();
     let place = |x: f32, y: f32, r: f32, look: u8, placed: &mut Vec<Obstacle>| {
         if placed.len() < MAX_OBSTACLES && fits(x, y, r, &keep, placed) {
@@ -500,6 +612,259 @@ pub fn room_obstacles(seed: u32, room: (i32, i32)) -> (u8, Vec<Obstacle>) {
     (pattern, placed)
 }
 
+/// A sloped ramp of a room (room-local): a wedge over an axis-aligned
+/// rectangle whose top climbs from the floor at one edge to `height` at the
+/// opposite one ([`collide::Collider::ramp`]).
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct Ramp {
+    /// Lowest x (m, room-local).
+    pub x0: f32,
+    /// Lowest y.
+    pub y0: f32,
+    /// Highest x.
+    pub x1: f32,
+    /// Highest y.
+    pub y1: f32,
+    /// Height of the high edge (m).
+    pub height: f32,
+    /// Which way it climbs: 0 +x · 1 −x · 2 +y · 3 −y.
+    pub uphill: u8,
+    /// Slope (whole degrees, [`RAMP_DEGREES`]).
+    pub degrees: u8,
+}
+
+impl Ramp {
+    /// Its collider.
+    pub fn collider(&self) -> Collider {
+        let uphill = match self.uphill {
+            0 => Uphill::PosX,
+            1 => Uphill::NegX,
+            2 => Uphill::PosY,
+            _ => Uphill::NegY,
+        };
+        Collider::ramp([self.x0, self.y0], [self.x1, self.y1], self.height, uphill)
+            .on_layers(LAYER_RAMP)
+    }
+
+    /// Whether a player can walk up it ([`collide::walkable`]).
+    pub fn walkable(&self) -> bool {
+        self.degrees <= 45
+    }
+}
+
+/// The slopes a ramp may have (degrees, inclusive): some walkable, some
+/// too steep to stand on (over about 45°).
+pub const RAMP_DEGREES: (u8, u8) = (10, 60);
+/// `tan` of 10°..=60°, as literals (no trig: native and WebAssembly agree
+/// bit for bit).
+const TAN: [f32; 51] = [
+    0.17632698, 0.19438031, 0.21255656, 0.23086819, 0.249328, 0.2679492, 0.2867454, 0.30573067,
+    0.3249197, 0.3443276, 0.36397022, 0.38386405, 0.40402624, 0.4244748, 0.4452287, 0.46630767,
+    0.4877326, 0.5095255, 0.53170943, 0.55430907, 0.57735026, 0.6008606, 0.62486935, 0.64940757,
+    0.6745085, 0.70020753, 0.72654253, 0.75355405, 0.78128564, 0.80978405, 0.83909965, 0.8692867,
+    0.90040404, 0.9325151, 0.96568877, 1.0, 1.0355303, 1.0723687, 1.1106125, 1.1503685, 1.1917536,
+    1.2348971, 1.2799417, 1.3270448, 1.3763819, 1.428148, 1.482561, 1.539865, 1.6003345, 1.6642795,
+    1.7320508,
+];
+/// Most ramps a room has.
+pub const MAX_RAMPS: usize = 3;
+/// Hash salt of the room ramps.
+const SALT_RAMP: u32 = 903;
+/// Layer bits of the room geometry ([`room_colliders`]).
+pub const LAYER_SOLID: u32 = layer::DEFAULT;
+/// Ramps.
+pub const LAYER_RAMP: u32 = 1 << 1;
+/// The floor (lasers bounce off it; movers ignore it).
+pub const LAYER_FLOOR: u32 = 1 << 2;
+/// Height of the room walls and obstacles a laser meets (m).
+pub const WALL_HEIGHT: f32 = 1.6;
+/// Obstacles stop shots below this height (m).
+pub const OBSTACLE_HEIGHT: f32 = 2.4;
+/// Wall thickness (m), just outside the floor.
+pub const WALL_THICKNESS: f32 = 0.4;
+
+/// The 1–[`MAX_RAMPS`] ramps of room `room`: random whole-degree slopes in
+/// [`RAMP_DEGREES`], each clear (by its bounding circle) of the door
+/// corridors, walls, spawn points, mob homes, the classic pillars (in a
+/// classic room) and each other. Placed before the room's other
+/// obstacles, which keep clear of them. Pure and deterministic.
+pub fn room_ramps(seed: u32, room: (i32, i32)) -> Vec<Ramp> {
+    let h = grid::mix(seed, SALT_RAMP, room.0, room.1);
+    let pattern = if room == (0, 0) {
+        0
+    } else {
+        grid::mix(seed, SALT_OBSTACLE, room.0, room.1) % PATTERNS.len() as u32
+    };
+    let mut keep: Vec<(f32, f32, f32)> = KEEP.to_vec();
+    for m in mob_slots(seed, room) {
+        keep.push((m.x, m.y, 0.8 + GAP));
+    }
+    let mut placed: Vec<Obstacle> = if pattern == 0 {
+        arena::PILLARS
+            .iter()
+            .map(|&(x, y, r)| Obstacle { x, y, r, look: 0 })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let count = 1 + (h % MAX_RAMPS as u32) as usize;
+    let roll = |i: u32| grid::unit(grid::hash32(h ^ i.wrapping_mul(0x9e37_79b9)));
+    let mut ramps = Vec::new();
+    for i in 0..64u32 {
+        if ramps.len() == count {
+            break;
+        }
+        let k = 8 * i;
+        let span = u32::from(RAMP_DEGREES.1 - RAMP_DEGREES.0) + 1;
+        let degrees = RAMP_DEGREES.0 + (grid::hash32(h ^ (k + 1)) % span) as u8;
+        let tan = TAN[usize::from(degrees - RAMP_DEGREES.0)];
+        let uphill = (grid::hash32(h ^ (k + 2)) % 4) as u8;
+        let mut height = 0.8 + 1.4 * roll(k + 3);
+        let mut run = height / tan;
+        if run > 9.0 {
+            run = 9.0;
+            height = run * tan;
+        }
+        let across = 2.5 + 1.5 * roll(k + 4);
+        let (hx, hy) = if uphill < 2 {
+            (run / 2.0, across / 2.0)
+        } else {
+            (across / 2.0, run / 2.0)
+        };
+        let x = -14.0 + 28.0 * roll(k + 5);
+        let y = -14.0 + 28.0 * roll(k + 6);
+        let r = (hx * hx + hy * hy).sqrt();
+        if !fits(x, y, r, &keep, &placed) {
+            continue;
+        }
+        placed.push(Obstacle { x, y, r, look: 0 });
+        ramps.push(Ramp {
+            x0: x - hx,
+            y0: y - hy,
+            x1: x + hx,
+            y1: y + hy,
+            height,
+            uphill,
+            degrees,
+        });
+    }
+    ramps
+}
+
+/// The ramps as colliders (what the predicted step stands on).
+pub fn ramp_colliders(ramps: &[Ramp]) -> Colliders {
+    ramps
+        .iter()
+        .map(Ramp::collider)
+        .fold(Colliders::new(), Colliders::with)
+}
+
+/// Everything a shot meets in room `room` (room-local): the obstacles
+/// ([`OBSTACLE_HEIGHT`]) and walls with their doorway gaps
+/// ([`WALL_HEIGHT`]) on [`LAYER_SOLID`], the ramps on [`LAYER_RAMP`] and
+/// the floor (and the passages' floors) on [`LAYER_FLOOR`].
+pub fn room_colliders(seed: u32, room: (i32, i32)) -> Colliders {
+    let mut colliders = room_obstacles(seed, room)
+        .1
+        .iter()
+        .map(|o| Collider::cylinder([o.x, o.y], o.r, OBSTACLE_HEIGHT).on_layers(LAYER_SOLID))
+        .fold(ramp_colliders(&room_ramps(seed, room)), Colliders::with);
+    let (h, t, d) = (arena::HALF, WALL_THICKNESS, DOOR_HALF);
+    for sign in [-1.0f32, 1.0] {
+        let (near, far) = (sign * h, sign * (h + t));
+        for (a, b) in [([-h - t, near], [-d, far]), ([d, near], [h + t, far])] {
+            // A wall along x (north/south), then the same along y (east/west).
+            colliders.push(Collider::aabb(a, b, WALL_HEIGHT).on_layers(LAYER_SOLID));
+            colliders.push(
+                Collider::aabb([a[1], a[0]], [b[1], b[0]], WALL_HEIGHT).on_layers(LAYER_SOLID),
+            );
+        }
+    }
+    let edge = h + PASSAGE;
+    colliders.push(Collider::aabb([-edge, -edge], [edge, edge], 0.0).on_layers(LAYER_FLOOR));
+    colliders
+}
+
+/// Total path a laser shot travels (m), bounces included.
+pub const LASER_RANGE: f32 = 100.0;
+/// Most times a laser shot bounces before it stops.
+pub const LASER_BOUNCES: usize = 4;
+
+/// A laser shot through a room's static geometry ([`laser_path`]'s input).
+#[derive(Debug, Clone, Copy, Default, PartialEq, GameRecord)]
+pub struct LaserShot {
+    /// World seed.
+    pub seed: u32,
+    /// Room x.
+    pub room_x: i32,
+    /// Room y.
+    pub room_y: i32,
+    /// Muzzle (room-local).
+    pub x: f32,
+    /// Muzzle y.
+    pub y: f32,
+    /// Muzzle height.
+    pub z: f32,
+    /// Aim (need not be unit).
+    pub dx: f32,
+    /// Aim y.
+    pub dy: f32,
+    /// Aim z.
+    pub dz: f32,
+}
+
+/// One surface a laser met.
+#[derive(Debug, Clone, Copy, Default, PartialEq, GameRecord)]
+pub struct LaserHit {
+    /// Where (room-local).
+    pub x: f32,
+    /// Where y.
+    pub y: f32,
+    /// Where z.
+    pub z: f32,
+    /// Surface normal there.
+    pub nx: f32,
+    /// Normal y.
+    pub ny: f32,
+    /// Normal z.
+    pub nz: f32,
+}
+
+/// Where a laser goes through a room's walls, obstacles, ramps and floor
+/// with no one in the way: each bounce, then where it stops (normal zero).
+/// The page draws its shot with this before the room's verdict.
+#[game_pure(LaserPathFn)]
+pub fn laser_path(shot: &LaserShot) -> Vec<LaserHit> {
+    let colliders = room_colliders(shot.seed, (shot.room_x, shot.room_y));
+    let ray = Ray::new(
+        [shot.x, shot.y, shot.z],
+        [shot.dx, shot.dy, shot.dz],
+        LASER_RANGE,
+    );
+    let trace = collide::bounce(ray, LASER_BOUNCES, |r| colliders.raycast(r));
+    let mut path: Vec<LaserHit> = trace
+        .hits
+        .iter()
+        .map(|h| LaserHit {
+            x: h.point[0],
+            y: h.point[1],
+            z: h.point[2],
+            nx: h.normal[0],
+            ny: h.normal[1],
+            nz: h.normal[2],
+        })
+        .collect();
+    if path.len() <= LASER_BOUNCES {
+        path.push(LaserHit {
+            x: trace.end[0],
+            y: trace.end[1],
+            z: trace.end[2],
+            ..LaserHit::default()
+        });
+    }
+    path
+}
+
 /// Which room ([`pit_room`]'s input).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, GameRecord)]
 pub struct PitRoomContext {
@@ -545,6 +910,8 @@ pub struct PitRoomLayout {
     pub pattern: u8,
     /// The room's obstacles (collision in the step, drawn by the pages).
     pub obstacles: Vec<Obstacle>,
+    /// Its sloped ramps ([`room_ramps`]).
+    pub ramps: Vec<Ramp>,
 }
 
 /// The farthest [`PitRoomLayout::boss_distance`] reported.
@@ -657,6 +1024,7 @@ pub fn pit_room(room: &PitRoomContext) -> PitRoomLayout {
         boss_distance: boss_distance(room.seed, at),
         pattern,
         obstacles,
+        ramps: room_ramps(room.seed, at),
     }
 }
 
@@ -718,6 +1086,12 @@ pub struct PitWorld {
     pub wake_reach: f32,
     /// … and is released beyond this one ([`WAKE_RELEASE`], m).
     pub wake_release: f32,
+    /// Room wall height (m): what a laser bounces off.
+    pub wall_height: f32,
+    /// Wall thickness (m), just outside the floor.
+    pub wall_thickness: f32,
+    /// Obstacle height a shot meets (m).
+    pub obstacle_height: f32,
 }
 
 /// The `PIT_WORLD` constant.
@@ -736,6 +1110,9 @@ pub fn pit_world() -> PitWorld {
         biomes: grid::BIOMES.map(String::from).to_vec(),
         wake_reach: WAKE_REACH,
         wake_release: WAKE_RELEASE,
+        wall_height: WALL_HEIGHT,
+        wall_thickness: WALL_THICKNESS,
+        obstacle_height: OBSTACLE_HEIGHT,
     }
 }
 
@@ -1007,17 +1384,23 @@ mod tests {
     }
 
     /// Free floor points reachable from a spawn point (0.5 m lattice).
-    fn reachable(obstacles: &[Obstacle]) -> Vec<Vec<bool>> {
+    /// Floor cells reachable from a spawn point, every ramp counted as a
+    /// wall (the strictest case: a steep one can't be climbed).
+    fn reachable(obstacles: &[Obstacle], ramps: &[Ramp]) -> Vec<Vec<bool>> {
         let n = 79usize; // -19.5 ..= 19.5
         let at = |i: usize| -19.5 + i as f32 * 0.5;
+        let r = arena::PLAYER_RADIUS;
         let free = |x: f32, y: f32| {
-            let lim = arena::HALF - arena::PLAYER_RADIUS;
+            let lim = arena::HALF - r;
             x.abs() <= lim
                 && y.abs() <= lim
                 && obstacles.iter().all(|o| {
                     let (dx, dy) = (x - o.x, y - o.y);
-                    dx * dx + dy * dy >= (o.r + arena::PLAYER_RADIUS).powi(2)
+                    dx * dx + dy * dy >= (o.r + r).powi(2)
                 })
+                && ramps
+                    .iter()
+                    .all(|q| x < q.x0 - r || x > q.x1 + r || y < q.y0 - r || y > q.y1 + r)
         };
         let mut seen = vec![vec![false; n]; n];
         let start = ((4.5 + 19.5) / 0.5) as usize;
@@ -1056,7 +1439,12 @@ mod tests {
                 });
                 patterns.insert(layout.pattern);
                 assert!(layout.obstacles.len() <= MAX_OBSTACLES);
-                let seen = reachable(&layout.obstacles);
+                assert!(
+                    (1..=MAX_RAMPS).contains(&layout.ramps.len()),
+                    "pit.{x}.{y}: {} ramps",
+                    layout.ramps.len()
+                );
+                let seen = reachable(&layout.obstacles, &layout.ramps);
                 // Every doorway, spawn point and mob home is reachable.
                 for (px, py) in [(18.5, 0.0), (-18.5, 0.0), (0.0, 18.5), (0.0, -18.5)]
                     .into_iter()
@@ -1107,6 +1495,7 @@ mod tests {
                     ..PitInput::default()
                 },
                 &circles,
+                &Colliders::new(),
             );
             let (dx, dy) = (s.x - o.x, s.y - o.y);
             assert!(
@@ -1151,6 +1540,237 @@ mod tests {
         });
         let n = into_neighbour((1, 0), air);
         assert_eq!((n.z, n.vz), (air.z, air.vz));
+    }
+
+    #[test]
+    fn ramps_are_seeded_slopes_of_random_whole_degrees() {
+        let mut degrees = std::collections::BTreeSet::new();
+        let (mut walkable, mut steep) = (0, 0);
+        for y in -8..=8 {
+            for x in -8..=8 {
+                let ramps = room_ramps(DEFAULT_SEED, (x, y));
+                assert_eq!(ramps, room_ramps(DEFAULT_SEED, (x, y)));
+                for r in &ramps {
+                    assert!(
+                        (RAMP_DEGREES.0..=RAMP_DEGREES.1).contains(&r.degrees),
+                        "{r:?}"
+                    );
+                    // Its height over its run is the slope it says.
+                    let run = if r.uphill < 2 {
+                        r.x1 - r.x0
+                    } else {
+                        r.y1 - r.y0
+                    };
+                    let tan = TAN[usize::from(r.degrees - RAMP_DEGREES.0)];
+                    assert!((r.height / run - tan).abs() < 1e-3, "{r:?}");
+                    assert!(r.height > 0.0 && r.height <= 2.2 + 1e-3, "{r:?}");
+                    // The collider's normal agrees with walkable().
+                    let (_, n) = r
+                        .collider()
+                        .top_at([(r.x0 + r.x1) / 2.0, (r.y0 + r.y1) / 2.0])
+                        .unwrap();
+                    assert_eq!(collide::walkable(n), r.walkable(), "{r:?} {n:?}");
+                    if r.walkable() {
+                        walkable += 1;
+                    } else {
+                        steep += 1;
+                    }
+                    degrees.insert(r.degrees);
+                }
+            }
+        }
+        assert!(degrees.len() > 30, "{degrees:?}");
+        assert!(
+            walkable > 50 && steep > 20,
+            "{walkable} walkable, {steep} steep"
+        );
+        assert_ne!(
+            room_ramps(DEFAULT_SEED, (0, 0)),
+            room_ramps(DEFAULT_SEED, (1, 0))
+        );
+    }
+
+    /// A room with one ramp climbing +x from x = 0, `degrees` steep, 2 m
+    /// high, 4 m wide.
+    fn one_ramp(degrees: u8) -> (Ramp, Colliders) {
+        let run = 2.0 / TAN[usize::from(degrees - RAMP_DEGREES.0)];
+        let ramp = Ramp {
+            x0: 0.0,
+            y0: -2.0,
+            x1: run,
+            y1: 2.0,
+            height: 2.0,
+            uphill: 0,
+            degrees,
+        };
+        (ramp, ramp_colliders(&[ramp]))
+    }
+
+    fn on_ramps(s: PitState, mx: i8, my: i8, buttons: u8, ramps: &Colliders) -> PitState {
+        step_among(
+            s,
+            PitInput {
+                mx,
+                my,
+                buttons,
+                ..PitInput::default()
+            },
+            &[],
+            ramps,
+        )
+    }
+
+    #[test]
+    fn a_walkable_ramp_is_climbed_and_walked_down() {
+        let (ramp, ramps) = one_ramp(30);
+        let mut s = canonicalize(PitState {
+            x: -2.0,
+            ..PitState::default()
+        });
+        let mut top = 0.0f32;
+        for _ in 0..90 {
+            s = on_ramps(s, 127, 0, 0, &ramps);
+            if s.x < ramp.x1 - 0.1 {
+                // On the slope the feet are on its surface.
+                let (g, _) = ground(&ramps, s.x, s.y);
+                assert!((s.z - g).abs() < 0.01, "{s:?} ground {g}");
+            }
+            top = top.max(s.z);
+        }
+        assert!(top > 1.9, "climbed to {top}");
+        // Off the high end: a fall to the floor.
+        assert!(s.x > ramp.x1 && s.z == 0.0, "{s:?}");
+        // And back: the high end is a wall from behind.
+        for _ in 0..60 {
+            s = on_ramps(s, -127, 0, 0, &ramps);
+        }
+        assert!(
+            s.x >= ramp.x1 + arena::PLAYER_RADIUS - 0.01 && s.z == 0.0,
+            "{s:?}"
+        );
+        // A jump from the slope.
+        let mut on = canonicalize(PitState {
+            x: ramp.x1 / 2.0,
+            z: 1.0,
+            ..PitState::default()
+        });
+        on = on_ramps(on, 0, 0, 0, &ramps);
+        let rest = on.z;
+        on = on_ramps(on, 0, 0, PitInput::JUMP, &ramps);
+        assert!(on.z > rest && on.vz > 0.0, "{on:?}");
+    }
+
+    #[test]
+    fn a_steep_ramp_is_a_wall_you_slide_off_and_bounce_off() {
+        let (ramp, ramps) = one_ramp(55);
+        let mut s = canonicalize(PitState {
+            x: -2.0,
+            ..PitState::default()
+        });
+        for _ in 0..90 {
+            s = on_ramps(s, 127, 0, 0, &ramps);
+        }
+        // Stopped at its low edge, still on the floor.
+        assert!(s.x < ramp.x0 + 0.05 && s.z < 0.2, "{s:?}");
+        // Dropped onto its middle, slowly: slides down and off, no jump.
+        let mut on = canonicalize(PitState {
+            x: (ramp.x0 + ramp.x1) / 2.0,
+            z: 1.05,
+            ..PitState::default()
+        });
+        let mut frames = 0;
+        while on.x >= ramp.x0 {
+            let jumped = on_ramps(on, 0, 0, PitInput::JUMP, &ramps);
+            assert!(jumped.vz <= 0.0, "no jump off a steep slope: {jumped:?}");
+            on = on_ramps(on, 0, 0, 0, &ramps);
+            frames += 1;
+            assert!(frames < 30, "slides off: {on:?}");
+        }
+        assert!(on.z < 0.3, "{on:?}");
+        // Falling onto it fast: the velocity is reflected about its normal
+        // (half kept along it), so it is thrown off downhill, away from it.
+        let falling = canonicalize(PitState {
+            x: (ramp.x0 + ramp.x1) / 2.0,
+            z: 1.1,
+            vz: -9.0,
+            ..PitState::default()
+        });
+        let bounced = on_ramps(falling, 0, 0, 0, &ramps);
+        let (_, n) = ground(&ramps, falling.x, falling.y);
+        let away = bounced.vx * n[0] + bounced.vy * n[1] + bounced.vz * n[2];
+        // Gravity acts for the frame before it lands.
+        let into = -(9.0 + GRAVITY * arena::DT) * n[2];
+        assert!(bounced.vx < -3.0, "{bounced:?}");
+        assert!(
+            (away + BOUNCE_RESTITUTION * into).abs() < 0.05,
+            "{away} vs {into}: {bounced:?}"
+        );
+    }
+
+    #[test]
+    fn steps_are_the_same_with_and_without_the_ramp_far_away() {
+        // Flat floor far from any ramp: ramps change nothing.
+        let (_, ramps) = one_ramp(20);
+        let mut a = canonicalize(PitState {
+            x: -10.0,
+            y: 10.0,
+            ..PitState::default()
+        });
+        let mut b = a;
+        for i in 0..120u32 {
+            let input = PitInput {
+                mx: if i % 40 < 20 { 90 } else { -90 },
+                my: 30,
+                buttons: if i % 33 == 0 { PitInput::JUMP } else { 0 },
+                ..PitInput::default()
+            };
+            a = step_among(a, input, &[], &Colliders::new());
+            b = step_among(b, input, &[], &ramps);
+            assert_eq!(a, b, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn a_laser_path_bounces_off_the_walls() {
+        // From the entrance's centre east, a little down: off the floor,
+        // then on until the walls (or the doorway) end it.
+        let path = laser_path(&LaserShot {
+            seed: DEFAULT_SEED,
+            room_x: 0,
+            room_y: 0,
+            x: 0.0,
+            y: 3.0,
+            z: 0.6,
+            dx: 1.0,
+            dy: 0.3,
+            dz: -0.05,
+        });
+        assert!(
+            !path.is_empty() && path.len() <= LASER_BOUNCES + 1,
+            "{path:?}"
+        );
+        let first = path[0];
+        assert!(
+            first.nz > 0.99 || first.nx.abs() > 0.0 || first.ny.abs() > 0.0,
+            "{path:?}"
+        );
+        // Normals of the bounces are unit; the stop has none.
+        for h in &path {
+            let n = (h.nx * h.nx + h.ny * h.ny + h.nz * h.nz).sqrt();
+            assert!((n - 1.0).abs() < 1e-3 || n == 0.0, "{h:?}");
+        }
+        // A shot straight at the floor comes straight back up.
+        let down = laser_path(&LaserShot {
+            seed: DEFAULT_SEED,
+            room_x: 0,
+            room_y: 0,
+            x: 4.5,
+            y: 4.5,
+            z: 1.5,
+            dz: -1.0,
+            ..LaserShot::default()
+        });
+        assert!((down[0].z).abs() < 1e-4 && down[0].nz > 0.99, "{down:?}");
     }
 
     #[test]

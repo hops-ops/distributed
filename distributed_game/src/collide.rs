@@ -25,6 +25,17 @@
 //! }
 //! ```
 //!
+//! **Slopes and bounces.** [`Collider::ramp`] is a wedge rising along one
+//! axis. [`Colliders::ground_at`] gives the top surface under a point (its
+//! height and normal), and [`walkable`] says whether that normal is floor:
+//! up component above [`WALKABLE_MIN_NZ`], about 45°. [`bounce`] follows a
+//! ray, reflecting it ([`reflect`]) off each static surface it meets:
+//!
+//! ```ignore
+//! let trace = bounce(Ray::new(muzzle, aim, 100.0), 4, |r| ctx.raycast_shot(timing, r));
+//! for hit in &trace.hits { spark(hit.point, hit.normal); }
+//! ```
+//!
 //! **Layers.** Every entity and collider sits on a set of layer bits
 //! ([`Historic::on_layers`], [`Collider::on_layers`]; [`layer::DEFAULT`]
 //! unless set) and a ray only meets those its [`Ray::mask`] shares; a
@@ -138,15 +149,120 @@ pub struct RayHit {
     pub normal: Vec3,
 }
 
+/// A surface counts as walkable floor when its normal's up component is
+/// above this (`cos 45.57°`).
+pub const WALKABLE_MIN_NZ: f32 = 0.7;
+
+/// Whether a surface with this unit normal is floor to walk on.
+pub fn walkable(normal: Vec3) -> bool {
+    normal[2] > WALKABLE_MIN_NZ
+}
+
+/// `v` mirrored about the plane with unit normal `n`: `v − 2(v·n)n`.
+pub fn reflect(v: Vec3, n: Vec3) -> Vec3 {
+    let d = v[0] * n[0] + v[1] * n[1] + v[2] * n[2];
+    sub(v, scale(n, 2.0 * d))
+}
+
 /// One piece of level geometry, from the floor (`z = 0`) up to `height`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Collider {
     /// Footprint.
     pub shape: Footprint,
-    /// Top (`z`).
+    /// Top (`z`); a ramp's high edge.
     pub height: f32,
+    /// A ramp ([`Collider::ramp`]): the way its top climbs from `0` to
+    /// `height`. `None`: a flat top.
+    pub uphill: Option<Uphill>,
     /// Layer bits ([`layer::DEFAULT`] unless set).
     pub layers: u32,
+}
+
+/// The way a ramp climbs (over its rectangle, from one edge to the other).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uphill {
+    /// Low at `min.x`, high at `max.x`.
+    PosX,
+    /// Low at `max.x`, high at `min.x`.
+    NegX,
+    /// Low at `min.y`, high at `max.y`.
+    PosY,
+    /// Low at `max.y`, high at `min.y`.
+    NegY,
+}
+
+impl Uphill {
+    /// The horizontal unit vector it climbs along.
+    pub fn dir(self) -> [f32; 2] {
+        match self {
+            Uphill::PosX => [1.0, 0.0],
+            Uphill::NegX => [-1.0, 0.0],
+            Uphill::PosY => [0.0, 1.0],
+            Uphill::NegY => [0.0, -1.0],
+        }
+    }
+}
+
+/// The top surface under a point ([`Colliders::ground_at`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ground {
+    /// The collider ([`Target::Static`] index).
+    pub index: usize,
+    /// Height of the surface there.
+    pub height: f32,
+    /// Its unit normal (up for a flat top).
+    pub normal: Vec3,
+}
+
+/// Where a [`bounce`] went.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Trace {
+    /// Each surface met, in order; the last is an entity when one was hit.
+    pub hits: Vec<RayHit>,
+    /// Where it stopped.
+    pub end: Vec3,
+}
+
+impl Trace {
+    /// The entity it stopped at.
+    pub fn entity(&self) -> Option<u32> {
+        match self.hits.last()?.target {
+            Target::Entity(id) => Some(id),
+            Target::Static(_) => None,
+        }
+    }
+}
+
+/// How far off a surface a bounced ray restarts.
+const BOUNCE_LIFT: f32 = 1e-3;
+
+/// Follow `ray` for its whole `max_dist`, reflecting it off each static
+/// surface [`cast`] reports (up to `max_bounces` times) and stopping at the
+/// first entity. Each leg keeps the ray's mask and ignore.
+pub fn bounce(ray: Ray, max_bounces: usize, mut cast: impl FnMut(&Ray) -> Option<RayHit>) -> Trace {
+    let mut trace = Trace::default();
+    let mut leg = ray;
+    loop {
+        let Some(hit) = cast(&leg) else {
+            trace.end = leg.at(leg.max_dist);
+            return trace;
+        };
+        trace.hits.push(hit);
+        trace.end = hit.point;
+        if matches!(hit.target, Target::Entity(_)) || trace.hits.len() > max_bounces {
+            return trace;
+        }
+        let left = leg.max_dist - hit.distance;
+        if left <= BOUNCE_LIFT {
+            return trace;
+        }
+        leg = Ray {
+            origin: add(hit.point, scale(hit.normal, BOUNCE_LIFT)),
+            ..Ray::new(hit.point, reflect(leg.dir, hit.normal), left)
+        }
+        .mask(ray.mask);
+        leg.ignore = ray.ignore;
+    }
 }
 
 /// A collider's footprint on the floor.
@@ -174,6 +290,7 @@ impl Collider {
         Self {
             shape: Footprint::Circle { center, radius },
             height,
+            uphill: None,
             layers: layer::DEFAULT,
         }
     }
@@ -186,8 +303,67 @@ impl Collider {
                 max: [a[0].max(b[0]), a[1].max(b[1])],
             },
             height,
+            uphill: None,
             layers: layer::DEFAULT,
         }
+    }
+
+    /// A ramp over the rectangle between two floor corners: its top climbs
+    /// from the floor at one edge to `height` at the opposite one
+    /// (`uphill`), with vertical sides and a vertical high end.
+    pub fn ramp(a: [f32; 2], b: [f32; 2], height: f32, uphill: Uphill) -> Self {
+        Self {
+            uphill: Some(uphill),
+            ..Self::aabb(a, b, height)
+        }
+    }
+
+    /// Height and unit normal of the top at `[x, y]`, if over the footprint.
+    pub fn top_at(&self, at: [f32; 2]) -> Option<(f32, Vec3)> {
+        match self.shape {
+            Footprint::Circle { center, radius } => {
+                let (dx, dy) = (at[0] - center[0], at[1] - center[1]);
+                (dx * dx + dy * dy <= radius * radius).then_some((self.height, [0.0, 0.0, 1.0]))
+            }
+            Footprint::Rect { min, max } => {
+                if at[0] < min[0] || at[0] > max[0] || at[1] < min[1] || at[1] > max[1] {
+                    return None;
+                }
+                match self.ramp_plane(min, max) {
+                    None => Some((self.height, [0.0, 0.0, 1.0])),
+                    Some((normal, d)) => {
+                        // n·(x, y, z) = d on the top.
+                        let z = (d - normal[0] * at[0] - normal[1] * at[1]) / normal[2];
+                        Some((z.clamp(0.0, self.height), normal))
+                    }
+                }
+            }
+        }
+    }
+
+    /// A ramp's top as the plane `n·p = d` (unit `n`, pointing up and
+    /// downhill).
+    fn ramp_plane(&self, min: [f32; 2], max: [f32; 2]) -> Option<(Vec3, f32)> {
+        let uphill = self.uphill?;
+        let (low, run) = match uphill {
+            Uphill::PosX => (min[0], max[0] - min[0]),
+            Uphill::NegX => (max[0], max[0] - min[0]),
+            Uphill::PosY => (min[1], max[1] - min[1]),
+            Uphill::NegY => (max[1], max[1] - min[1]),
+        };
+        if run <= 0.0 {
+            return None;
+        }
+        let k = self.height / run;
+        let [ux, uy] = uphill.dir();
+        // z = k·(u·p − u·low_edge)  ⇔  −k·u·p + z = −k·(u·low_edge).
+        let low_along = match uphill {
+            Uphill::PosX | Uphill::PosY => low,
+            Uphill::NegX | Uphill::NegY => -low,
+        };
+        let raw = [-k * ux, -k * uy, 1.0];
+        let n = norm(raw);
+        Some((scale(raw, 1.0 / n), -k * low_along / n))
     }
 
     /// Put it on these layers.
@@ -205,12 +381,13 @@ impl Collider {
             Footprint::Circle { center, radius } => {
                 ray_cylinder(ray.origin, ray.dir, center, radius, self.height)?
             }
-            Footprint::Rect { min, max } => ray_box(
-                ray.origin,
-                ray.dir,
-                [min[0], min[1], 0.0],
-                [max[0], max[1], self.height],
-            )?,
+            Footprint::Rect { min, max } => {
+                let (lo, hi) = ([min[0], min[1], 0.0], [max[0], max[1], self.height]);
+                match self.ramp_plane(min, max) {
+                    None => ray_box(ray.origin, ray.dir, lo, hi)?,
+                    Some(top) => ray_wedge(ray.origin, ray.dir, lo, hi, top)?,
+                }
+            }
         };
         (t <= ray.max_dist).then_some((t, normal))
     }
@@ -319,6 +496,26 @@ impl Colliders {
                         target: Target::Static(index),
                         distance,
                         point: ray.at(distance),
+                        normal,
+                    });
+                }
+            }
+        }
+        best
+    }
+
+    /// The highest top surface on `mask` under `[x, y]`.
+    pub fn ground_at(&self, at: [f32; 2], mask: u32) -> Option<Ground> {
+        let mut best: Option<Ground> = None;
+        for (index, collider) in self.shapes.iter().enumerate() {
+            if mask & collider.layers == 0 {
+                continue;
+            }
+            if let Some((height, normal)) = collider.top_at(at) {
+                if best.is_none_or(|b| height > b.height) {
+                    best = Some(Ground {
+                        index,
+                        height,
                         normal,
                     });
                 }
@@ -458,7 +655,8 @@ fn ray_box(ro: Vec3, rd: Vec3, lo: Vec3, hi: Vec3) -> Option<(f32, Vec3)> {
         }
         let (mut t0, mut t1) = ((lo[i] - ro[i]) / rd[i], (hi[i] - ro[i]) / rd[i]);
         let mut side = -1.0;
-        if t0 > t1 {
+        // By direction, not by order: a flat box (a floor) has t0 == t1.
+        if rd[i] < 0.0 {
             std::mem::swap(&mut t0, &mut t1);
             side = 1.0;
         }
@@ -468,6 +666,50 @@ fn ray_box(ro: Vec3, rd: Vec3, lo: Vec3, hi: Vec3) -> Option<(f32, Vec3)> {
             normal[i] = side;
         }
         t_exit = t_exit.min(t1);
+        if t_enter > t_exit {
+            return None;
+        }
+    }
+    (t_enter >= 0.0).then_some((t_enter, normal))
+}
+
+/// Entry of `ro + t·rd` into a box `lo..hi` whose top is cut by the plane
+/// `n·p ≤ d` (a ramp): clip the ray by each half-space; inside = 0.
+fn ray_wedge(ro: Vec3, rd: Vec3, lo: Vec3, hi: Vec3, top: (Vec3, f32)) -> Option<(f32, Vec3)> {
+    let planes = [
+        ([-1.0, 0.0, 0.0], -lo[0]),
+        ([1.0, 0.0, 0.0], hi[0]),
+        ([0.0, -1.0, 0.0], -lo[1]),
+        ([0.0, 1.0, 0.0], hi[1]),
+        ([0.0, 0.0, -1.0], -lo[2]),
+        ([0.0, 0.0, 1.0], hi[2]),
+        top,
+    ];
+    let dot = |a: Vec3, b: Vec3| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    if planes.iter().all(|&(n, d)| dot(n, ro) <= d) {
+        return Some((0.0, scale(rd, -1.0)));
+    }
+    let mut t_enter = f32::NEG_INFINITY;
+    let mut t_exit = f32::INFINITY;
+    let mut normal = [0.0; 3];
+    for (n, d) in planes {
+        let along = dot(n, rd);
+        let over = dot(n, ro) - d;
+        if along.abs() < 1e-12 {
+            if over > 0.0 {
+                return None;
+            }
+            continue;
+        }
+        let t = -over / along;
+        if along < 0.0 {
+            if t > t_enter {
+                t_enter = t;
+                normal = n;
+            }
+        } else {
+            t_exit = t_exit.min(t);
+        }
         if t_enter > t_exit {
             return None;
         }
@@ -543,6 +785,23 @@ mod tests {
     }
 
     #[test]
+    fn a_flat_box_is_a_floor_from_either_side() {
+        let floor = Colliders::new().with(Collider::aabb([-5.0, -5.0], [5.0, 5.0], 0.0));
+        let down = floor
+            .raycast(&Ray::new([0.0, 0.0, 2.0], [1.0, 0.0, -1.0], 100.0))
+            .unwrap();
+        assert!(close(down.point[2], 0.0) && close(down.point[0], 2.0), "{down:?}");
+        assert!(close3(down.normal, [0.0, 0.0, 1.0]));
+        let up = floor
+            .raycast(&Ray::new([0.0, 0.0, -1.0], [0.0, 0.0, 1.0], 100.0))
+            .unwrap();
+        assert!(close3(up.normal, [0.0, 0.0, -1.0]));
+        assert!(floor
+            .raycast(&Ray::new([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], 100.0))
+            .is_none());
+    }
+
+    #[test]
     fn a_ray_starting_inside_hits_at_once() {
         let wall = Colliders::new().with(Collider::aabb([-1.0, -1.0], [1.0, 1.0], 3.0));
         let hit = wall
@@ -609,6 +868,153 @@ mod tests {
             |_| true
         )
         .is_none());
+    }
+
+    /// A 30° ramp climbing +x over x 0..√3·2, 2 m high.
+    fn ramp30() -> Collider {
+        Collider::ramp([0.0, -1.0], [2.0 * 3f32.sqrt(), 1.0], 2.0, Uphill::PosX)
+    }
+
+    #[test]
+    fn a_ray_meets_a_ramp_on_its_slope_its_side_and_its_high_end() {
+        let ramp = Colliders::new().with(ramp30());
+        let (s, c) = (0.5f32, 3f32.sqrt() / 2.0);
+        // Straight down onto the middle of the slope.
+        let down = ramp
+            .raycast(&Ray::new([3f32.sqrt(), 0.0, 5.0], [0.0, 0.0, -1.0], 100.0))
+            .unwrap();
+        assert!(close(down.distance, 4.0), "{down:?}");
+        assert!(close3(down.normal, [-s, 0.0, c]), "{down:?}");
+        // Along +x, low: into the slope near the low edge.
+        let along = ramp
+            .raycast(&Ray::new([-1.0, 0.0, 0.5], [1.0, 0.0, 0.0], 100.0))
+            .unwrap();
+        assert!(close(along.point[0], 0.5 * 3f32.sqrt()), "{along:?}");
+        assert!(close3(along.normal, [-s, 0.0, c]));
+        // From the side: the vertical face.
+        let side = ramp
+            .raycast(&Ray::new([3.0, -5.0, 0.5], [0.0, 1.0, 0.0], 100.0))
+            .unwrap();
+        assert!(close3(side.normal, [0.0, -1.0, 0.0]), "{side:?}");
+        // From behind: the vertical high end.
+        let back = ramp
+            .raycast(&Ray::new([9.0, 0.0, 1.0], [-1.0, 0.0, 0.0], 100.0))
+            .unwrap();
+        assert!(close3(back.normal, [1.0, 0.0, 0.0]), "{back:?}");
+        // Over it, and past its low edge.
+        assert!(ramp
+            .raycast(&Ray::new([-1.0, 0.0, 2.5], [1.0, 0.0, 0.0], 100.0))
+            .is_none());
+        assert!(ramp
+            .raycast(&Ray::new([-0.5, 0.0, 5.0], [0.0, 0.0, -1.0], 100.0))
+            .is_none());
+    }
+
+    #[test]
+    fn every_way_up_has_its_own_slope() {
+        for (uphill, n) in [
+            (Uphill::PosX, [-1.0, 0.0]),
+            (Uphill::NegX, [1.0, 0.0]),
+            (Uphill::PosY, [0.0, -1.0]),
+            (Uphill::NegY, [0.0, 1.0]),
+        ] {
+            let ramp = Collider::ramp([0.0, 0.0], [4.0, 4.0], 4.0, uphill);
+            let (h, normal) = ramp.top_at([1.0, 1.0]).unwrap();
+            let low = match uphill {
+                Uphill::PosX | Uphill::PosY => 1.0,
+                Uphill::NegX | Uphill::NegY => 3.0,
+            };
+            assert!(close(h, low), "{uphill:?} {h}");
+            let r = std::f32::consts::FRAC_1_SQRT_2;
+            assert!(
+                close3(normal, [n[0] * r, n[1] * r, r]),
+                "{uphill:?} {normal:?}"
+            );
+            // The ray straight down agrees with the surface.
+            let (t, _) = ramp
+                .raycast(&Ray::new([1.0, 1.0, 9.0], [0.0, 0.0, -1.0], 100.0))
+                .unwrap();
+            assert!(close(9.0 - t, low), "{uphill:?} {t}");
+        }
+    }
+
+    #[test]
+    fn ground_is_the_highest_top_and_walkable_means_under_about_45_degrees() {
+        let steep = Collider::ramp([5.0, -1.0], [6.0, 1.0], 2.0, Uphill::PosX); // 63°
+        let world = Colliders::new()
+            .with(ramp30())
+            .with(steep)
+            .with(Collider::cylinder([3.0, 0.0], 0.2, 2.5));
+        let on_ramp = world.ground_at([1.0, 0.5], layer::ALL).unwrap();
+        assert_eq!(on_ramp.index, 0);
+        assert!(close(on_ramp.height, 1.0 / 3f32.sqrt()), "{on_ramp:?}");
+        assert!(walkable(on_ramp.normal));
+        let column = world.ground_at([3.0, 0.0], layer::ALL).unwrap();
+        assert_eq!((column.index, column.height), (2, 2.5));
+        assert!(walkable(column.normal));
+        assert!(!walkable(
+            world.ground_at([5.5, 0.0], layer::ALL).unwrap().normal
+        ));
+        assert!(world.ground_at([9.0, 0.0], layer::ALL).is_none());
+        assert!(world.ground_at([1.0, 0.5], layer::NONE).is_none());
+        // 45.0° is walkable, 46° is not.
+        let at = |deg: f32| {
+            let t = deg.to_radians().tan();
+            Collider::ramp([0.0, 0.0], [1.0, 1.0], t, Uphill::PosY)
+                .top_at([0.5, 0.5])
+                .unwrap()
+                .1
+        };
+        assert!(walkable(at(45.0)));
+        assert!(!walkable(at(46.0)));
+    }
+
+    #[test]
+    fn reflect_mirrors_about_the_normal() {
+        assert!(close3(
+            reflect([1.0, -1.0, 0.0], [0.0, 1.0, 0.0]),
+            [1.0, 1.0, 0.0]
+        ));
+        assert!(close3(
+            reflect([0.0, 0.0, -2.0], [0.0, 0.0, 1.0]),
+            [0.0, 0.0, 2.0]
+        ));
+    }
+
+    #[test]
+    fn a_bounce_reflects_off_walls_and_stops_at_an_entity() {
+        // A wall at x = 5 facing -x; a mob on the mirrored line.
+        let walls = Colliders::new().with(Collider::aabb([5.0, -50.0], [6.0, 50.0], 3.0));
+        let mob = [Historic::sphere(9, [0.0, 10.0, 1.0], 0.5)];
+        let ray = Ray::new([0.0, 0.0, 1.0], [1.0, 1.0, 0.0], 100.0);
+        let trace = bounce(ray, 4, |r| raycast(&mob, &walls, r, |_| true));
+        assert_eq!(trace.hits.len(), 2, "{trace:?}");
+        assert_eq!(trace.hits[0].target, Target::Static(0));
+        assert!(close3(trace.hits[0].point, [5.0, 5.0, 1.0]));
+        assert!(close3(trace.hits[0].normal, [-1.0, 0.0, 0.0]));
+        assert_eq!(trace.entity(), Some(9));
+        // Nothing but the wall: it flies off for the rest of its length.
+        let alone = bounce(ray, 4, |r| walls.raycast(r));
+        assert_eq!(alone.hits.len(), 1);
+        let left = 100.0 - 50f32.sqrt();
+        let far = [5.0 - left * 0.70710677, 5.0 + left * 0.70710677, 1.0];
+        assert!(
+            (0..3).all(|i| (alone.end[i] - far[i]).abs() < 1e-2),
+            "{alone:?}"
+        );
+        // No bounces allowed: it stops at the wall.
+        let once = bounce(ray, 0, |r| walls.raycast(r));
+        assert_eq!(once.hits.len(), 1);
+        assert!(close3(once.end, [5.0, 5.0, 1.0]));
+        // Between two walls it runs out of bounces.
+        let corridor = Colliders::new()
+            .with(Collider::aabb([5.0, -50.0], [6.0, 50.0], 3.0))
+            .with(Collider::aabb([-6.0, -50.0], [-5.0, 50.0], 3.0));
+        let pinball = bounce(Ray::new([0.0, 0.0, 1.0], [1.0, 0.1, 0.0], 100.0), 3, |r| {
+            corridor.raycast(r)
+        });
+        assert_eq!(pinball.hits.len(), 4);
+        assert_eq!(pinball.end, pinball.hits[3].point);
     }
 
     #[test]

@@ -50,7 +50,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
-use distributed_game::collide::{layer, Collider, Colliders, Ray, Target};
+use distributed_game::collide::{bounce, layer, Ray};
 use distributed_game::rewind::{Historic, RewindFrame, ShotTiming};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EmitError, Entities, Entity, EntityId, EntitySchema, Fact,
@@ -61,8 +61,8 @@ use game_sim::arena::{self as movement, PLAYER_RADIUS};
 use game_sim::mobpit::PitState as MoveState;
 use game_sim::mobpit::{
     self as rooms, admissible, borough_of, crossing, hood_of, into_neighbour, pair_shard,
-    parse_room, pit_room, pit_world, room_zone, PitRoomContext, PitRoomFn, RoomsInReachFn,
-    BOSS_TIER,
+    parse_room, pit_room, pit_world, room_colliders, room_zone, LaserHit, LaserPathFn,
+    PitRoomContext, PitRoomFn, RoomsInReachFn, BOSS_TIER, LASER_BOUNCES, LASER_RANGE, LAYER_FLOOR,
 };
 use mobpit_crawler::{level_floor, KillReceipt, RecordKillInput};
 use mobpit_tiers::{BossDefeatedInput, WEATHER};
@@ -359,12 +359,15 @@ pub enum PitEvent {
         requested_age_ms: f32,
         /// Limited by the clamp or the stored history.
         clamped: bool,
-        /// Where the arrow stopped (room-local).
+        /// Where the laser stopped (room-local).
         x: f32,
-        /// Where the arrow stopped.
+        /// Where the laser stopped.
         y: f32,
-        /// Where the arrow stopped (height).
+        /// Where the laser stopped (height).
         z: f32,
+        /// Each surface it met in order, with its normal (the last one is
+        /// the mob it hit, if any), for the beam and the impact marks.
+        path: Vec<LaserHit>,
     },
     /// To a player whose client runs older content than the room (a live
     /// content update happened): only the entrance (a gate) lets it through,
@@ -483,6 +486,7 @@ pub fn game_surface() -> GameSurface {
         .predict::<PitStep>()
         .pure::<PitRoomFn>()
         .pure::<RoomsInReachFn>()
+        .pure::<LaserPathFn>()
         .constant("pit_rules", &pit_rules())
         .constant("weather", &WEATHER.map(String::from).to_vec())
         .constant(
@@ -527,22 +531,22 @@ const RECOVER_TICKS: u16 = 18;
 const RESPAWN_TICKS: u64 = 120;
 /// A player at least this high (m) jumps over a mob's slam.
 pub const SLAM_CLEARANCE: f32 = 0.9;
-/// Ranged reach (m).
-pub const RANGE: f32 = 30.0;
-/// Damage per arrow.
+/// Laser reach (m): the whole path, bounces included.
+pub const RANGE: f32 = LASER_RANGE;
+/// Most bounces of a laser shot (off walls, obstacles, ramps, the floor).
+pub const BOUNCES: usize = LASER_BOUNCES;
+/// Damage per laser hit.
 pub const RANGED_DAMAGE: i32 = 12;
 /// Ticks between shots.
 pub const FIRE_COOLDOWN: u8 = 12;
-/// Bow animation frames.
+/// Shot animation frames.
 const SHOT_FRAMES: u8 = 6;
-/// Eye height above the feet (m): where first-person arrows leave from.
+/// Eye height above the feet (m): where first-person shots leave from.
 pub const EYE_HEIGHT: f32 = 1.5;
-/// Where third-person (and top-down) arrows leave from, flying level (m).
+/// Where third-person (and top-down) shots leave from, flying level (m).
 pub const HIP_HEIGHT: f32 = 0.6;
 /// Furthest a shot is rewound (ms): the anti-cheat clamp.
 pub const MAX_REWIND_MS: u64 = 600;
-/// Obstacles stop arrows below this height (m).
-const OBSTACLE_HEIGHT: f32 = 2.4;
 /// Mob body height by tier (m): their hit capsule.
 fn mob_height(tier: u8) -> f32 {
     match tier {
@@ -680,13 +684,15 @@ pub struct PitRules {
     pub attack_half_angle: f32,
     /// Swing animation length (ticks; the player's `swing` counts down from it).
     pub swing_frames: u8,
-    /// Ranged reach (m).
+    /// Laser reach (m, the whole path).
     pub range: f32,
+    /// Most bounces of a laser shot.
+    pub bounces: u8,
     /// Ticks between shots.
     pub fire_cooldown: u8,
-    /// Eye height above the feet (m): first-person arrows.
+    /// Eye height above the feet (m): first-person shots.
     pub eye_height: f32,
-    /// Hip height (m): level third-person arrows.
+    /// Hip height (m): level third-person shots.
     pub hip_height: f32,
     /// Furthest a shot is rewound (ms).
     pub max_rewind_ms: u32,
@@ -709,6 +715,7 @@ pub fn pit_rules() -> PitRules {
         attack_half_angle: ATTACK_ARC_COS.acos(),
         swing_frames: SWING_FRAMES,
         range: RANGE,
+        bounces: BOUNCES as u8,
         fire_cooldown: FIRE_COOLDOWN,
         eye_height: EYE_HEIGHT,
         hip_height: HIP_HEIGHT,
@@ -1354,22 +1361,32 @@ impl MobPit {
                         false,
                     ),
                 };
-                // A mob killed since the shooter's view time lets the arrow
-                // through.
+                // The beam reflects off the room's geometry (its normals) and
+                // stops at the first mob. A mob killed since the shooter's
+                // view time lets it through.
                 let mobs = &self.mobs;
-                let hit = ctx.raycast_where(time, &ray, |id| {
-                    mobs.get(id as usize - 1)
-                        .is_some_and(|m| m.state != MobState::Dead)
+                let trace = bounce(ray, BOUNCES, |leg| {
+                    ctx.raycast_where(time, leg, |id| {
+                        mobs.get(id as usize - 1)
+                            .is_some_and(|m| m.state != MobState::Dead)
+                    })
                 });
-                let at = hit.map_or_else(|| ray.at(ray.max_dist), |h| h.point);
-                let mob = hit.and_then(|h| match h.target {
-                    Target::Entity(id) => Some(id),
-                    Target::Static(_) => None,
-                });
-                verdicts.push((mob, at, age, requested, clamped));
+                let path = trace
+                    .hits
+                    .iter()
+                    .map(|h| LaserHit {
+                        x: h.point[0],
+                        y: h.point[1],
+                        z: h.point[2],
+                        nx: h.normal[0],
+                        ny: h.normal[1],
+                        nz: h.normal[2],
+                    })
+                    .collect::<Vec<_>>();
+                verdicts.push((trace.entity(), trace.end, path, age, requested, clamped));
             }
         }
-        for (fire, (mob, at, age, requested, clamped)) in fires.into_iter().zip(verdicts) {
+        for (fire, (mob, at, path, age, requested, clamped)) in fires.into_iter().zip(verdicts) {
             if let Some(id) = mob {
                 self.hurt_mob(ctx, fire.player, id as usize - 1, RANGED_DAMAGE);
             }
@@ -1385,6 +1402,7 @@ impl MobPit {
                     x: at[0],
                     y: at[1],
                     z: at[2],
+                    path,
                 },
             );
         }
@@ -1512,7 +1530,9 @@ impl MobPit {
                 }
             }
             let m = &mut self.mobs[i];
-            [m.x, m.y] = ctx.colliders().push_out([m.x, m.y], radius, layer::ALL);
+            [m.x, m.y] = ctx
+                .colliders()
+                .push_out([m.x, m.y], radius, layer::ALL & !LAYER_FLOOR);
         }
         // Light separation so a pack does not stack on one spot.
         for i in 0..self.mobs.len() {
@@ -1676,14 +1696,10 @@ impl Zone for MobPit {
             x: room.room.0,
             y: room.room.1,
         });
-        // Columns, boulders and trees: arrows stop at them, mobs walk round.
+        // Columns, boulders, trees, ramps, walls and the floor: lasers
+        // bounce off them; mobs walk round all but the floor.
         let pillars = Pillar::of(&layout.obstacles);
-        ctx.set_colliders(
-            pillars
-                .iter()
-                .map(|o| Collider::cylinder([o.x, o.y], o.r, OBSTACLE_HEIGHT))
-                .fold(Colliders::new(), Colliders::with),
-        );
+        ctx.set_colliders(room_colliders(room.seed, room.room));
         let mobs = layout
             .mobs
             .iter()
