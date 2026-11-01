@@ -806,7 +806,8 @@ function terrainMesh(name: string, t: RoomTerrain, biome: number): Mesh {
 			const a = j * t.nx + i;
 			const corners = [a, a + 1, a + t.nx, a + t.nx + 1];
 			if (corners.some((k) => isHole(t.heights[k]!))) continue;
-			indices.push(a, a + t.nx, a + 1, a + 1, a + t.nx, a + t.nx + 1);
+			// Same winding as the ramps' top (front faces up, normals up).
+			indices.push(a, a + 1, a + t.nx + 1, a, a + t.nx + 1, a + t.nx);
 		}
 	}
 	const data = new VertexData();
