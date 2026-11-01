@@ -217,6 +217,18 @@ fn pit_streams() -> Vec<Stream> {
             inputs: pit_frames(random(0x51ed ^ x as u32, 1200, 0), x as u32),
         });
     }
+    // Rooms with holes: walkers fall in, jumps cross them.
+    let holed = (2..60)
+        .filter(|&x| !game_sim::mobpit::room_holes(DEFAULT_SEED, (x, 3)).is_empty())
+        .take(3);
+    for x in holed {
+        streams.push(Stream {
+            name: format!("pit.{x}.3 holes"),
+            start: start(4.5, 4.5),
+            context: context(x, 3),
+            inputs: pit_frames(random(0x401e ^ x as u32, 1200, 0), x as u32),
+        });
+    }
     streams
 }
 
@@ -327,6 +339,30 @@ fn laser_path_args() -> Vec<Vec<u8>> {
     args
 }
 
+/// Room terrain: every content room plus a ring of rooms with hills and
+/// holes.
+fn terrain_args() -> Vec<Vec<u8>> {
+    let mut rooms = content_cells();
+    for x in -3..=3 {
+        for y in -3..=3 {
+            if !rooms.contains(&(x, y)) {
+                rooms.push((x, y));
+            }
+        }
+    }
+    rooms
+        .into_iter()
+        .map(|(x, y)| {
+            game_sim::mobpit::PitRoomContext {
+                seed: game_sim::mobpit::DEFAULT_SEED,
+                x,
+                y,
+            }
+            .encode_context()
+        })
+        .collect()
+}
+
 /// Every demo step's and pure function's native trace (see the module docs).
 pub fn traces() -> Value {
     json!({
@@ -335,6 +371,7 @@ pub fn traces() -> Value {
             pure_trace::<game_sim::mobpit::PitRoomFn>(pit_room_args()),
             pure_trace::<game_sim::mobpit::RoomsInReachFn>(rooms_in_reach_args()),
             pure_trace::<game_sim::mobpit::LaserPathFn>(laser_path_args()),
+            pure_trace::<game_sim::mobpit::RoomTerrainFn>(terrain_args()),
         ],
         "steps": [
             trace::<PitStep>(pit_streams()),

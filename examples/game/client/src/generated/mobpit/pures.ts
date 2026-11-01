@@ -3,7 +3,17 @@
 // Do not edit: change the Rust definitions and regenerate.
 import { createWasmPures, type WasmPures, type WasmSource, type WireType } from '@hops-ops/distributed/game';
 
-import type { LaserHit, LaserShot, PitRoomContext, PitRoomLayout, Reach, ReachContext } from './events.ts';
+import type { LaserHit, LaserShot, PitRoomContext, PitRoomLayout, Reach, ReachContext, RoomTerrain } from './events.ts';
+
+const HOLE_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['x0', { type: 'f32' }],
+		['y0', { type: 'f32' }],
+		['x1', { type: 'f32' }],
+		['y1', { type: 'f32' }],
+	]
+};
 
 const LASER_HIT_TYPE: WireType = {
 	type: 'record',
@@ -73,6 +83,17 @@ const RAMP_TYPE: WireType = {
 	]
 };
 
+const PLATFORM_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['x0', { type: 'f32' }],
+		['y0', { type: 'f32' }],
+		['x1', { type: 'f32' }],
+		['y1', { type: 'f32' }],
+		['height', { type: 'f32' }],
+	]
+};
+
 const PIT_ROOM_LAYOUT_TYPE: WireType = {
 	type: 'record',
 	fields: [
@@ -86,6 +107,8 @@ const PIT_ROOM_LAYOUT_TYPE: WireType = {
 		['pattern', { type: 'u8' }],
 		['obstacles', { type: 'list', item: OBSTACLE_TYPE }],
 		['ramps', { type: 'list', item: RAMP_TYPE }],
+		['holes', { type: 'list', item: HOLE_TYPE }],
+		['platforms', { type: 'list', item: PLATFORM_TYPE }],
 	]
 };
 
@@ -105,11 +128,24 @@ const REACH_CONTEXT_TYPE: WireType = {
 	]
 };
 
+const ROOM_TERRAIN_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['minX', { type: 'f32' }],
+		['minY', { type: 'f32' }],
+		['cell', { type: 'f32' }],
+		['nx', { type: 'u16' }],
+		['ny', { type: 'u16' }],
+		['heights', { type: 'list', item: { type: 'f32' } }],
+	]
+};
+
 /** The pure functions (`#[game_pure]`) of Cargo package `game_sim`: wrapper name → module export. */
 export const PURES = {
 	laserPath: { export: 'laser_path', abi: 1 },
 	pitRoom: { export: 'pit_room', abi: 1 },
 	roomsInReach: { export: 'rooms_in_reach', abi: 1 },
+	terrain: { export: 'terrain', abi: 1 },
 } as const;
 
 /** The compiled module (`distributed game-wasm`; shared with the predicted step); bundlers emit it as an asset. */
@@ -123,6 +159,8 @@ export interface MobpitPureFns {
 	pitRoom(arg: PitRoomContext): PitRoomLayout;
 	/** `rooms_in_reach` (`dg_pure_rooms_in_reach`). */
 	roomsInReach(arg: ReachContext): Reach;
+	/** `terrain` (`dg_pure_terrain`). */
+	terrain(arg: PitRoomContext): RoomTerrain;
 }
 
 /** The `mobpit` pure functions plus `ready` / `loaded()` / `module()`. */
@@ -137,5 +175,6 @@ export function createMobpitPures(source: WasmSource = PURES_WASM_URL): MobpitPu
 		laserPath: { exportName: 'laser_path', arg: LASER_SHOT_TYPE, output: { type: 'list', item: LASER_HIT_TYPE } },
 		pitRoom: { exportName: 'pit_room', arg: PIT_ROOM_CONTEXT_TYPE, output: PIT_ROOM_LAYOUT_TYPE },
 		roomsInReach: { exportName: 'rooms_in_reach', arg: REACH_CONTEXT_TYPE, output: REACH_TYPE },
+		terrain: { exportName: 'terrain', arg: PIT_ROOM_CONTEXT_TYPE, output: ROOM_TERRAIN_TYPE },
 	});
 }

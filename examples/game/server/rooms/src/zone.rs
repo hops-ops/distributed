@@ -50,7 +50,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
-use distributed_game::collide::{bounce, layer, Ray};
+use distributed_game::collide::{bounce, layer, Colliders, Ray};
 use distributed_game::rewind::{Historic, RewindFrame, ShotTiming};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EmitError, Entities, Entity, EntityId, EntitySchema, Fact,
@@ -61,8 +61,9 @@ use game_sim::arena::{self as movement, PLAYER_RADIUS};
 use game_sim::mobpit::PitState as MoveState;
 use game_sim::mobpit::{
     self as rooms, admissible, borough_of, crossing, hood_of, into_neighbour, pair_shard,
-    parse_room, pit_room, pit_world, room_colliders, room_zone, LaserHit, LaserPathFn,
-    PitRoomContext, PitRoomFn, RoomsInReachFn, BOSS_TIER, LASER_BOUNCES, LASER_RANGE, LAYER_FLOOR,
+    parse_room, pit_room, pit_world, room_colliders, room_ground, room_zone, LaserHit, LaserPathFn,
+    PitRoomContext, PitRoomFn, RoomTerrainFn, RoomsInReachFn, BOSS_TIER, LASER_BOUNCES, LASER_MASK,
+    LASER_RANGE, LAYER_FLOOR,
 };
 use mobpit_crawler::{level_floor, KillReceipt, RecordKillInput};
 use mobpit_tiers::{BossDefeatedInput, WEATHER};
@@ -487,6 +488,7 @@ pub fn game_surface() -> GameSurface {
         .pure::<PitRoomFn>()
         .pure::<RoomsInReachFn>()
         .pure::<LaserPathFn>()
+        .pure::<RoomTerrainFn>()
         .constant("pit_rules", &pit_rules())
         .constant("weather", &WEATHER.map(String::from).to_vec())
         .constant(
@@ -529,8 +531,10 @@ const LEASH: f32 = 15.0;
 const WINDUP_TICKS: u16 = 24;
 const RECOVER_TICKS: u16 = 18;
 const RESPAWN_TICKS: u64 = 120;
-/// A player at least this high (m) jumps over a mob's slam.
+/// A player at least this high (m) over the ground jumps over a mob's slam.
 pub const SLAM_CLEARANCE: f32 = 0.9;
+/// Feet this far down a hole (m): the player fell to its death.
+pub const FALL_DEATH: f32 = -2.0;
 /// Laser reach (m): the whole path, bounces included.
 pub const RANGE: f32 = LASER_RANGE;
 /// Most bounces of a laser shot (off walls, obstacles, ramps, the floor).
@@ -698,6 +702,14 @@ pub struct PitRules {
     pub max_rewind_ms: u32,
     /// Mob body height by tier (index = tier).
     pub mob_heights: Vec<f32>,
+}
+
+/// Ground height under `(x, y)`: the terrain, a ramp or a platform; 0
+/// over a hole (the fall is the player's step's business).
+fn floor_at(ground: &Colliders, x: f32, y: f32) -> f32 {
+    ground
+        .ground_at([x, y], layer::ALL)
+        .map_or(0.0, |g| g.height)
 }
 
 /// The `PIT_RULES` constant.
@@ -870,6 +882,9 @@ pub struct MobPit {
     fires: Vec<Fire>,
     /// The content pack of the room's content version.
     pack: ContentPack,
+    /// What players and mobs stand on: ramps, platforms and the terrain
+    /// (`game_sim::mobpit::room_ground`).
+    ground: Colliders,
 }
 
 /// A ranged shot to resolve.
@@ -1129,6 +1144,7 @@ impl MobPit {
         let tick = ctx.tick();
         let mut swings = Vec::new();
         let mut fires = Vec::new();
+        let mut fallen: Vec<PlayerId> = Vec::new();
         // The predicted step's context: this room (its seeded obstacles).
         let context = PitRoomContext {
             seed: self.room.seed,
@@ -1230,7 +1246,25 @@ impl MobPit {
             if p.regen % every == 0 && p.hp < PLAYER_HP {
                 p.hp += 1;
             }
+            if p.state.z <= FALL_DEATH {
+                // Down a hole.
+                p.hp = 0;
+                (p.state.vx, p.state.vy) = (0.0, 0.0);
+                p.dead_until = Some(tick + PLAYER_RESPAWN_TICKS);
+                fallen.push(*id);
+                ctx.send(
+                    *id,
+                    &PitEvent::Died {
+                        respawn_ms: (PLAYER_RESPAWN_TICKS * 1000 / 30) as u32,
+                    },
+                );
+            }
             ctx.set_view(*id, View::new(p.state.x, p.state.y, VIEW_RADIUS));
+        }
+        for m in &mut self.mobs {
+            if m.target.is_some_and(|t| fallen.contains(&t)) {
+                m.target = None;
+            }
         }
         self.fires = fires;
         swings
@@ -1346,7 +1380,7 @@ impl MobPit {
                 return;
             };
             for fire in &fires {
-                let ray = Ray::new(fire.origin, fire.dir, RANGE);
+                let ray = Ray::new(fire.origin, fire.dir, RANGE).mask(LASER_MASK);
                 let timing = ShotTiming {
                     client_tick: fire.client_tick,
                     interp_delay: Duration::from_millis(fire.delay_ms.into()),
@@ -1421,7 +1455,9 @@ impl MobPit {
         let low: Vec<PlayerId> = self
             .players
             .iter()
-            .filter(|(_, p)| p.state.z < SLAM_CLEARANCE)
+            .filter(|(_, p)| {
+                p.state.z - floor_at(&self.ground, p.state.x, p.state.y) < SLAM_CLEARANCE
+            })
             .map(|(id, _)| *id)
             .collect();
         let mut hits: Vec<(PlayerId, i32)> = Vec::new();
@@ -1700,6 +1736,7 @@ impl Zone for MobPit {
         // bounce off them; mobs walk round all but the floor.
         let pillars = Pillar::of(&layout.obstacles);
         ctx.set_colliders(room_colliders(room.seed, room.room));
+        let ground = room_ground(room.seed, room.room);
         let mobs = layout
             .mobs
             .iter()
@@ -1730,6 +1767,7 @@ impl Zone for MobPit {
             players: BTreeMap::new(),
             mobs,
             pillars,
+            ground,
             pending: HashMap::new(),
             backlog: VecDeque::new(),
             last_tick: None,
@@ -2049,9 +2087,11 @@ impl Zone for MobPit {
     fn record_rewind(&self, frame: &mut RewindFrame) {
         for m in self.mobs.iter().filter(|m| m.state != MobState::Dead) {
             let half = mob_height(m.tier) / 2.0;
+            // Standing on the terrain (mobs keep off ramps and platforms).
+            let base = floor_at(&self.ground, m.x, m.y);
             frame.push(Historic::capsule(
                 m.id.get(),
-                [m.x, m.y, half],
+                [m.x, m.y, base + half],
                 half,
                 tier_stats(m.tier).3,
             ));

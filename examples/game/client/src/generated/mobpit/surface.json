@@ -1175,6 +1175,19 @@
         "type": "record"
       },
       "package": "game_sim"
+    },
+    {
+      "abi": 1,
+      "arg": {
+        "name": "PitRoomContext",
+        "type": "record"
+      },
+      "export": "terrain",
+      "output": {
+        "name": "RoomTerrain",
+        "type": "record"
+      },
+      "package": "game_sim"
     }
   ],
   "records": [
@@ -1218,6 +1231,35 @@
         }
       ],
       "name": "ContentPack"
+    },
+    {
+      "fields": [
+        {
+          "name": "x0",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y0",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "x1",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y1",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "Hole"
     },
     {
       "fields": [
@@ -1490,6 +1532,26 @@
             },
             "type": "list"
           }
+        },
+        {
+          "name": "holes",
+          "type": {
+            "item": {
+              "name": "Hole",
+              "type": "record"
+            },
+            "type": "list"
+          }
+        },
+        {
+          "name": "platforms",
+          "type": {
+            "item": {
+              "name": "Platform",
+              "type": "record"
+            },
+            "type": "list"
+          }
         }
       ],
       "name": "PitRoomLayout"
@@ -1745,6 +1807,41 @@
     {
       "fields": [
         {
+          "name": "x0",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y0",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "x1",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y1",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "height",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "Platform"
+    },
+    {
+      "fields": [
+        {
           "name": "xp",
           "type": {
             "type": "u64"
@@ -1886,6 +1983,50 @@
         }
       ],
       "name": "RoomMob"
+    },
+    {
+      "fields": [
+        {
+          "name": "min_x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "min_y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "cell",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "nx",
+          "type": {
+            "type": "u16"
+          }
+        },
+        {
+          "name": "ny",
+          "type": {
+            "type": "u16"
+          }
+        },
+        {
+          "name": "heights",
+          "type": {
+            "item": {
+              "type": "f32"
+            },
+            "type": "list"
+          }
+        }
+      ],
+      "name": "RoomTerrain"
     },
     {
       "fields": [

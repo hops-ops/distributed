@@ -21,7 +21,7 @@
 
 use std::cell::RefCell;
 
-use distributed_game::collide::{self, layer, Collider, Colliders, Ray, Uphill};
+use distributed_game::collide::{self, layer, Collider, Colliders, Heightfield, Ray, Uphill, HOLE};
 use distributed_game::{game_pure, predict, FieldType, GameInput, GameRecord};
 
 use crate::arena::{self, MoveInput, MoveState};
@@ -167,7 +167,8 @@ impl PitState {
     }
 }
 
-/// `(seed, x, y)` → that room's obstacles as `(x, y, radius)` and its ramps.
+/// `(seed, x, y)` → that room's obstacles as `(x, y, radius)` and its
+/// ground ([`room_ground`]).
 type ObstacleCache = Option<((u32, i32, i32), (Vec<(f32, f32, f32)>, Colliders))>;
 
 thread_local! {
@@ -197,13 +198,10 @@ pub fn pit_step(
                 .iter()
                 .map(|o| (o.x, o.y, o.r))
                 .collect();
-            *cache = Some((
-                key,
-                (circles, ramp_colliders(&room_ramps(context.seed, at))),
-            ));
+            *cache = Some((key, (circles, room_ground(context.seed, at))));
         }
-        let (obstacles, ramps) = &cache.as_ref().expect("filled above").1;
-        step_among(*state, *input, obstacles, ramps)
+        let (obstacles, ground) = &cache.as_ref().expect("filled above").1;
+        step_among(*state, *input, obstacles, ground)
     })
 }
 
@@ -240,12 +238,20 @@ pub const BOUNCE_RESTITUTION: f32 = 0.5;
 /// Slower than this into a steep slope (m/s), a player slides instead.
 const BOUNCE_MIN: f32 = 2.0;
 
-/// Ground height and unit normal at `[x, y]`: the highest ramp there, else
-/// the floor.
-fn ground(ramps: &Colliders, x: f32, y: f32) -> (f32, [f32; 3]) {
-    ramps
-        .ground_at([x, y], layer::ALL)
-        .map_or((0.0, [0.0, 0.0, 1.0]), |g| (g.height, g.normal))
+/// Feet this low (m) have fallen into a hole: the step holds them here
+/// (inside the wire range) and the room counts the player dead.
+pub const FALL_FLOOR: f32 = -3.9;
+
+/// Ground height and unit normal at `[x, y]`: the highest ramp, platform
+/// or terrain there. Without terrain the floor is flat at 0; with it, no
+/// ground is a hole ([`HOLE`]).
+fn ground(ground: &Colliders, x: f32, y: f32) -> (f32, [f32; 3]) {
+    let up = [0.0, 0.0, 1.0];
+    match ground.ground_at([x, y], layer::ALL) {
+        Some(g) => (g.height, g.normal),
+        None if ground.terrain().is_some() => (HOLE, up),
+        None => (0.0, up),
+    }
 }
 
 /// Whether a capsule with feet at `z` may move to `[x, y]`: no point of
@@ -291,7 +297,7 @@ pub fn step_among(
         planar,
         arena::advance_among(planar, input.movement(), obstacles),
     );
-    if !ramps.is_empty() && blocked(ramps, next.x, next.y, s.z) {
+    if (!ramps.is_empty() || ramps.terrain().is_some()) && blocked(ramps, next.x, next.y, s.z) {
         if !blocked(ramps, next.x, s.y, s.z) {
             (next.y, next.vy) = (s.y, 0.0);
         } else if !blocked(ramps, s.x, next.y, s.z) {
@@ -347,6 +353,11 @@ pub fn step_among(
                 (next.vx, next.vy, vz) = (out[0], out[1], out[2]);
             }
         }
+        if z < FALL_FLOOR {
+            // Down a hole: held at the bottom until the room respawns it.
+            (z, vz) = (FALL_FLOOR, 0.0);
+            (next.vx, next.vy) = (0.0, 0.0);
+        }
     }
     canonicalize(PitState { z, vz, ..s }.with_planar(next))
 }
@@ -358,7 +369,7 @@ pub fn canonicalize(s: PitState) -> PitState {
         y: arena::snap(POS, s.y),
         vx: arena::snap(arena::VEL, s.vx),
         vy: arena::snap(arena::VEL, s.vy),
-        z: arena::snap(HEIGHT, s.z).max(0.0),
+        z: arena::snap(HEIGHT, s.z),
         vz: arena::snap(arena::VEL, s.vz),
         ..s
     }
@@ -553,13 +564,26 @@ pub fn room_obstacles(seed: u32, room: (i32, i32)) -> (u8, Vec<Obstacle>) {
     for m in mob_slots(seed, room) {
         keep.push((m.x, m.y, 0.8 + GAP));
     }
-    for r in room_ramps(seed, room) {
-        let (hx, hy) = ((r.x1 - r.x0) / 2.0, (r.y1 - r.y0) / 2.0);
-        keep.push((r.x0 + hx, r.y0 + hy, (hx * hx + hy * hy).sqrt() + GAP));
+    let footprints = room_ramps(seed, room)
+        .iter()
+        .map(|r| (r.x0, r.y0, r.x1, r.y1))
+        .chain(
+            room_platforms(seed, room)
+                .iter()
+                .map(|p| (p.x0, p.y0, p.x1, p.y1)),
+        )
+        .collect::<Vec<_>>();
+    for (x0, y0, x1, y1) in footprints {
+        let (hx, hy) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+        keep.push((x0 + hx, y0 + hy, (hx * hx + hy * hy).sqrt() + GAP));
     }
+    let holes = room_holes(seed, room);
     let mut placed: Vec<Obstacle> = Vec::new();
     let place = |x: f32, y: f32, r: f32, look: u8, placed: &mut Vec<Obstacle>| {
-        if placed.len() < MAX_OBSTACLES && fits(x, y, r, &keep, placed) {
+        if placed.len() < MAX_OBSTACLES
+            && fits(x, y, r, &keep, placed)
+            && clear_of_holes(x, y, r, &holes)
+        {
             placed.push(Obstacle { x, y, r, look });
         }
     };
@@ -679,6 +703,10 @@ pub const LAYER_SOLID: u32 = layer::DEFAULT;
 pub const LAYER_RAMP: u32 = 1 << 1;
 /// The floor (lasers bounce off it; movers ignore it).
 pub const LAYER_FLOOR: u32 = 1 << 2;
+/// Holes, for mobs to keep out of (shots and players pass).
+pub const LAYER_HOLE: u32 = 1 << 3;
+/// What a laser meets: everything but the holes' footprints.
+pub const LASER_MASK: u32 = !LAYER_HOLE;
 /// Height of the room walls and obstacles a laser meets (m).
 pub const WALL_HEIGHT: f32 = 1.6;
 /// Obstacles stop shots below this height (m).
@@ -710,10 +738,11 @@ pub fn room_ramps(seed: u32, room: (i32, i32)) -> Vec<Ramp> {
     } else {
         Vec::new()
     };
+    let holes = room_holes(seed, room);
     let count = 1 + (h % MAX_RAMPS as u32) as usize;
     let roll = |i: u32| grid::unit(grid::hash32(h ^ i.wrapping_mul(0x9e37_79b9)));
     let mut ramps = Vec::new();
-    for i in 0..64u32 {
+    for i in 0..256u32 {
         if ramps.len() == count {
             break;
         }
@@ -737,7 +766,11 @@ pub fn room_ramps(seed: u32, room: (i32, i32)) -> Vec<Ramp> {
         let x = -14.0 + 28.0 * roll(k + 5);
         let y = -14.0 + 28.0 * roll(k + 6);
         let r = (hx * hx + hy * hy).sqrt();
-        if !fits(x, y, r, &keep, &placed) {
+        if !fits(x, y, r, &keep, &placed)
+            || !clear_of_holes(x, y, r, &holes)
+            || x.abs() < CROSS + hx
+            || y.abs() < CROSS + hy
+        {
             continue;
         }
         placed.push(Obstacle { x, y, r, look: 0 });
@@ -754,6 +787,363 @@ pub fn room_ramps(seed: u32, room: (i32, i32)) -> Vec<Ramp> {
     ramps
 }
 
+/// A hole of a room (room-local): a trench across it with no floor. A
+/// player who falls in dies.
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct Hole {
+    /// Lowest x (m, room-local).
+    pub x0: f32,
+    /// Lowest y.
+    pub y0: f32,
+    /// Highest x.
+    pub x1: f32,
+    /// Highest y.
+    pub y1: f32,
+}
+
+impl Hole {
+    /// Whether `[x, y]` is over it.
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
+    }
+}
+
+/// A platform of a room (room-local): a box to jump onto, or (`height`
+/// 0) a stepping stone across a hole.
+#[derive(Debug, Clone, Copy, PartialEq, GameRecord)]
+pub struct Platform {
+    /// Lowest x (m, room-local).
+    pub x0: f32,
+    /// Lowest y.
+    pub y0: f32,
+    /// Highest x.
+    pub x1: f32,
+    /// Highest y.
+    pub y1: f32,
+    /// Top (m).
+    pub height: f32,
+}
+
+impl Platform {
+    /// Its collider.
+    pub fn collider(&self) -> Collider {
+        Collider::aabb([self.x0, self.y0], [self.x1, self.y1], self.height).on_layers(LAYER_SOLID)
+    }
+}
+
+/// A rolling hill: a smooth bump `amp · (1 − d²/r²)²` within `r`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Hill {
+    x: f32,
+    y: f32,
+    r: f32,
+    amp: f32,
+}
+
+/// Hash salts of the holes, platforms and hills.
+const SALT_HOLE: u32 = 904;
+const SALT_PLATFORM: u32 = 905;
+const SALT_HILL: u32 = 906;
+/// How wide a trench is (m): a running jump clears about 3 m, a jump-dash
+/// 4 m and more. Edges sit on the terrain grid, so the hole is exact.
+pub const HOLE_WIDTH: (f32, f32) = (2.0, 4.0);
+/// Highest the terrain rises (m): with a jump on top, inside the wire's
+/// height range.
+pub const TERRAIN_TOP: f32 = 2.2;
+/// Terrain sample spacing (m).
+pub const TERRAIN_CELL: f32 = 0.5;
+
+/// Whether a circle keeps [`GAP`] clear of every hole.
+fn clear_of_holes(x: f32, y: f32, r: f32, holes: &[Hole]) -> bool {
+    holes.iter().all(|h| {
+        let (cx, cy) = (x.clamp(h.x0, h.x1), y.clamp(h.y0, h.y1));
+        let (dx, dy) = (x - cx, y - cy);
+        dx * dx + dy * dy >= (r + GAP) * (r + GAP) && !h.contains(x, y)
+    })
+}
+
+/// Half width of the clear cross along the door axes (m): ramps and
+/// platforms keep off it, so each doorway has a straight walk to the others
+/// (holes may still cut it).
+const CROSS: f32 = 2.6;
+
+/// Whether a circle keeps off the door-axis cross.
+fn clear_of_cross(x: f32, y: f32, r: f32) -> bool {
+    x.abs() >= CROSS + r && y.abs() >= CROSS + r
+}
+
+/// The holes of room `room`: in about three rooms in ten (never the
+/// entrance or its neighbours), one trench — sometimes two — across the room, 2–4.2 m
+/// wide, far enough out to keep clear of the spawn points and the boss's
+/// home. Crossing the room means jumping it. Pure and deterministic.
+pub fn room_holes(seed: u32, room: (i32, i32)) -> Vec<Hole> {
+    if room.0.unsigned_abs() + room.1.unsigned_abs() < 2 {
+        return Vec::new();
+    }
+    let h = grid::mix(seed, SALT_HOLE, room.0, room.1);
+    if h % 10 >= 3 {
+        return Vec::new();
+    }
+    let roll = |i: u32| grid::unit(grid::hash32(h ^ i.wrapping_mul(0x9e37_79b9)));
+    let trenches = if h & 0x100 != 0 { 2 } else { 1 };
+    let mut holes = Vec::new();
+    for t in 0..trenches {
+        let k = 4 * t;
+        let w = HOLE_WIDTH.0 + (HOLE_WIDTH.1 - HOLE_WIDTH.0) * roll(k + 1);
+        let c = 10.5 + w / 2.0 + (7.0 - w) * roll(k + 2);
+        // The second trench is on the other side of the same axis.
+        let sign = if (h >> 9) & 1 == t { 1.0 } else { -1.0 };
+        let along_x = (h >> 10) & 1 == 0;
+        // On the terrain grid: the cells inside are exactly the trench.
+        let snap = |v: f32| (v / TERRAIN_CELL).round() * TERRAIN_CELL;
+        let (lo, hi) = (snap(sign * c - w / 2.0), snap(sign * c + w / 2.0));
+        let half = arena::HALF;
+        holes.push(if along_x {
+            Hole {
+                x0: -half,
+                y0: lo,
+                x1: half,
+                y1: hi,
+            }
+        } else {
+            Hole {
+                x0: lo,
+                y0: -half,
+                x1: hi,
+                y1: half,
+            }
+        });
+    }
+    holes
+}
+
+/// The platforms of room `room`: 1–3 boxes 0.6–1.3 m high (a jump up),
+/// clear like the ramps; and in a trench wider than 3 m, one or two
+/// stepping stones at floor level to hop across on. Pure and
+/// deterministic.
+pub fn room_platforms(seed: u32, room: (i32, i32)) -> Vec<Platform> {
+    let h = grid::mix(seed, SALT_PLATFORM, room.0, room.1);
+    let holes = room_holes(seed, room);
+    let roll = |i: u32| grid::unit(grid::hash32(h ^ i.wrapping_mul(0x9e37_79b9)));
+    let mut platforms = Vec::new();
+    for (n, hole) in holes.iter().enumerate() {
+        let (w, along_x) = if hole.x1 - hole.x0 > hole.y1 - hole.y0 {
+            (hole.y1 - hole.y0, true)
+        } else {
+            (hole.x1 - hole.x0, false)
+        };
+        if w <= 3.0 {
+            continue;
+        }
+        let stones = 1 + (roll(50 + n as u32) * 2.0) as u32;
+        for k in 0..stones {
+            let t = -14.0 + 28.0 * roll(60 + 4 * n as u32 + k);
+            let (cx, cy) = if along_x {
+                (t, (hole.y0 + hole.y1) / 2.0)
+            } else {
+                ((hole.x0 + hole.x1) / 2.0, t)
+            };
+            platforms.push(Platform {
+                x0: cx - 0.6,
+                y0: cy - 0.6,
+                x1: cx + 0.6,
+                y1: cy + 0.6,
+                height: 0.0,
+            });
+        }
+    }
+    let mut keep: Vec<(f32, f32, f32)> = KEEP.to_vec();
+    for m in mob_slots(seed, room) {
+        keep.push((m.x, m.y, 0.8 + GAP));
+    }
+    let pattern = if room == (0, 0) {
+        0
+    } else {
+        grid::mix(seed, SALT_OBSTACLE, room.0, room.1) % PATTERNS.len() as u32
+    };
+    let mut placed: Vec<Obstacle> = if pattern == 0 {
+        arena::PILLARS
+            .iter()
+            .map(|&(x, y, r)| Obstacle { x, y, r, look: 0 })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for r in room_ramps(seed, room) {
+        let (hx, hy) = ((r.x1 - r.x0) / 2.0, (r.y1 - r.y0) / 2.0);
+        placed.push(Obstacle {
+            x: r.x0 + hx,
+            y: r.y0 + hy,
+            r: (hx * hx + hy * hy).sqrt(),
+            look: 0,
+        });
+    }
+    let count = 1 + (h % 3) as usize;
+    let mut boxes = 0;
+    for i in 0..48u32 {
+        if boxes == count {
+            break;
+        }
+        let k = 8 * i;
+        let (hx, hy) = (0.8 + 0.8 * roll(k + 1), 0.8 + 0.8 * roll(k + 2));
+        let height = 0.6 + 0.7 * roll(k + 3);
+        let x = -14.0 + 28.0 * roll(k + 4);
+        let y = -14.0 + 28.0 * roll(k + 5);
+        let r = (hx * hx + hy * hy).sqrt();
+        if !fits(x, y, r, &keep, &placed)
+            || !clear_of_holes(x, y, r, &holes)
+            || !clear_of_cross(x, y, r)
+        {
+            continue;
+        }
+        placed.push(Obstacle { x, y, r, look: 0 });
+        platforms.push(Platform {
+            x0: x - hx,
+            y0: y - hy,
+            x1: x + hx,
+            y1: y + hy,
+            height,
+        });
+        boxes += 1;
+    }
+    platforms
+}
+
+/// The rolling hills of room `room`: none in the entrance; in seven rooms
+/// in ten, two to five bumps 0.5–1.8 m high and 4–9 m across.
+fn room_hills(seed: u32, room: (i32, i32)) -> Vec<Hill> {
+    if room == (0, 0) {
+        return Vec::new();
+    }
+    let h = grid::mix(seed, SALT_HILL, room.0, room.1);
+    if h % 10 >= 7 {
+        return Vec::new();
+    }
+    let roll = |i: u32| grid::unit(grid::hash32(h ^ i.wrapping_mul(0x9e37_79b9)));
+    let count = 2 + (grid::hash32(h ^ 0x51) % 4);
+    (0..count)
+        .map(|i| Hill {
+            x: -15.0 + 30.0 * roll(4 * i + 1),
+            y: -15.0 + 30.0 * roll(4 * i + 2),
+            r: 4.0 + 5.0 * roll(4 * i + 3),
+            // At most 0.35 r high: the steepest flank stays walkable.
+            amp: (0.5 + 1.3 * roll(4 * i + 4)).min(0.35 * (4.0 + 5.0 * roll(4 * i + 3))),
+        })
+        .collect()
+}
+
+/// `t` eased from 0 to 1 over `0..=1` (smoothstep).
+fn ease(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Room `room`'s terrain over the floor and its passages: the hills
+/// (summed), eased to level by 0.5 m from the walls (rooms meet flat) and 2 m
+/// round each ramp and platform (which stand on the floor), and [`HOLE`]
+/// over the holes. Polynomials only, so the browser's WebAssembly
+/// computes the same samples. Pure and deterministic.
+pub fn room_terrain(seed: u32, room: (i32, i32)) -> Heightfield {
+    let hills = room_hills(seed, room);
+    let holes = room_holes(seed, room);
+    let mut flat: Vec<(f32, f32, f32)> = room_ramps(seed, room)
+        .iter()
+        .map(|r| (r.x0, r.y0, r.x1, r.y1))
+        .chain(
+            room_platforms(seed, room)
+                .iter()
+                .map(|p| (p.x0, p.y0, p.x1, p.y1)),
+        )
+        .map(|(x0, y0, x1, y1)| {
+            let (hx, hy) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+            (x0 + hx, y0 + hy, (hx * hx + hy * hy).sqrt())
+        })
+        .collect();
+    if hills.is_empty() {
+        flat.clear();
+    }
+    let edge = arena::HALF + PASSAGE;
+    let n = (2.0 * edge / TERRAIN_CELL) as usize + 1;
+    Heightfield::new([-edge, -edge], TERRAIN_CELL, n, n, |x, y| {
+        // Strictly inside: the edge samples are ground, so a cell is open
+        // exactly when it lies in the trench.
+        if holes
+            .iter()
+            .any(|h| x > h.x0 && x < h.x1 && y > h.y0 && y < h.y1)
+        {
+            return HOLE;
+        }
+        if hills.is_empty() {
+            return 0.0;
+        }
+        let mut z = 0.0f32;
+        for hill in &hills {
+            let (dx, dy) = (x - hill.x, y - hill.y);
+            let u = (dx * dx + dy * dy) / (hill.r * hill.r);
+            if u < 1.0 {
+                z += hill.amp * (1.0 - u) * (1.0 - u);
+            }
+        }
+        let wall = arena::HALF - x.abs().max(y.abs());
+        let mut fade = ease((wall - 0.5) / 3.5);
+        for &(fx, fy, fr) in &flat {
+            let (dx, dy) = (x - fx, y - fy);
+            fade *= ease(((dx * dx + dy * dy).sqrt() - fr) / 2.0);
+        }
+        (z * fade).min(TERRAIN_TOP)
+    })
+}
+
+/// What a player stands on in room `room`: its ramps and platforms over
+/// its terrain (the predicted step's ground).
+pub fn room_ground(seed: u32, room: (i32, i32)) -> Colliders {
+    room_platforms(seed, room)
+        .iter()
+        .map(Platform::collider)
+        .fold(ramp_colliders(&room_ramps(seed, room)), Colliders::with)
+        .with_terrain(room_terrain(seed, room), LAYER_FLOOR)
+}
+
+/// Room `room`'s terrain samples, for the page to draw ([`room_terrain`]).
+#[derive(Debug, Clone, PartialEq, GameRecord)]
+pub struct RoomTerrain {
+    /// First sample x (m, room-local).
+    pub min_x: f32,
+    /// First sample y.
+    pub min_y: f32,
+    /// Sample spacing (m).
+    pub cell: f32,
+    /// Samples along x.
+    pub nx: u16,
+    /// Samples along y.
+    pub ny: u16,
+    /// Heights row by row (`y` outer); [`TERRAIN_HOLE`] over a hole.
+    pub heights: Vec<f32>,
+}
+
+/// [`RoomTerrain`] height of a hole sample.
+pub const TERRAIN_HOLE: f32 = -1000.0;
+
+/// Room `(x, y)`'s terrain (the page draws the ground with it and stands
+/// mobs on it).
+#[game_pure(RoomTerrainFn)]
+pub fn terrain(room: &PitRoomContext) -> RoomTerrain {
+    let field = room_terrain(room.seed, (room.x, room.y));
+    let (nx, ny) = field.size();
+    RoomTerrain {
+        min_x: field.min()[0],
+        min_y: field.min()[1],
+        cell: field.cell(),
+        nx: nx as u16,
+        ny: ny as u16,
+        heights: field
+            .samples()
+            .iter()
+            .map(|&h| if h == HOLE { TERRAIN_HOLE } else { h })
+            .collect(),
+    }
+}
+
 /// The ramps as colliders (what the predicted step stands on).
 pub fn ramp_colliders(ramps: &[Ramp]) -> Colliders {
     ramps
@@ -762,16 +1152,23 @@ pub fn ramp_colliders(ramps: &[Ramp]) -> Colliders {
         .fold(Colliders::new(), Colliders::with)
 }
 
-/// Everything a shot meets in room `room` (room-local): the obstacles
-/// ([`OBSTACLE_HEIGHT`]) and walls with their doorway gaps
-/// ([`WALL_HEIGHT`]) on [`LAYER_SOLID`], the ramps on [`LAYER_RAMP`] and
-/// the floor (and the passages' floors) on [`LAYER_FLOOR`].
+/// Room `room`'s level geometry (room-local): the obstacles
+/// ([`OBSTACLE_HEIGHT`]), platforms and walls with their doorway gaps
+/// ([`WALL_HEIGHT`]) on [`LAYER_SOLID`], the ramps on [`LAYER_RAMP`], the
+/// terrain (floor and passages, hills, holes) on [`LAYER_FLOOR`], and the
+/// holes' footprints on [`LAYER_HOLE`] (mobs keep out; shots use
+/// [`LASER_MASK`]).
 pub fn room_colliders(seed: u32, room: (i32, i32)) -> Colliders {
     let mut colliders = room_obstacles(seed, room)
         .1
         .iter()
         .map(|o| Collider::cylinder([o.x, o.y], o.r, OBSTACLE_HEIGHT).on_layers(LAYER_SOLID))
-        .fold(ramp_colliders(&room_ramps(seed, room)), Colliders::with);
+        .fold(room_ground(seed, room), Colliders::with);
+    for hole in room_holes(seed, room) {
+        colliders.push(
+            Collider::aabb([hole.x0, hole.y0], [hole.x1, hole.y1], 0.0).on_layers(LAYER_HOLE),
+        );
+    }
     let (h, t, d) = (arena::HALF, WALL_THICKNESS, DOOR_HALF);
     for sign in [-1.0f32, 1.0] {
         let (near, far) = (sign * h, sign * (h + t));
@@ -783,8 +1180,6 @@ pub fn room_colliders(seed: u32, room: (i32, i32)) -> Colliders {
             );
         }
     }
-    let edge = h + PASSAGE;
-    colliders.push(Collider::aabb([-edge, -edge], [edge, edge], 0.0).on_layers(LAYER_FLOOR));
     colliders
 }
 
@@ -843,7 +1238,8 @@ pub fn laser_path(shot: &LaserShot) -> Vec<LaserHit> {
         [shot.x, shot.y, shot.z],
         [shot.dx, shot.dy, shot.dz],
         LASER_RANGE,
-    );
+    )
+    .mask(LASER_MASK);
     let trace = collide::bounce(ray, LASER_BOUNCES, |r| colliders.raycast(r));
     let mut path: Vec<LaserHit> = trace
         .hits
@@ -915,6 +1311,10 @@ pub struct PitRoomLayout {
     pub obstacles: Vec<Obstacle>,
     /// Its sloped ramps ([`room_ramps`]).
     pub ramps: Vec<Ramp>,
+    /// Its holes ([`room_holes`]): fall in and die.
+    pub holes: Vec<Hole>,
+    /// Its platforms ([`room_platforms`]).
+    pub platforms: Vec<Platform>,
 }
 
 /// The farthest [`PitRoomLayout::boss_distance`] reported.
@@ -1017,6 +1417,41 @@ pub fn pit_room(room: &PitRoomContext) -> PitRoomLayout {
         });
     }
     let (pattern, obstacles) = room_obstacles(room.seed, at);
+    let holes = room_holes(room.seed, at);
+    // Mob homes in a trench move to its nearer edge.
+    for m in &mut mobs {
+        for hole in &holes {
+            let margin = 1.4;
+            let grown = Hole {
+                x0: hole.x0 - margin,
+                y0: hole.y0 - margin,
+                x1: hole.x1 + margin,
+                y1: hole.y1 + margin,
+            };
+            if !grown.contains(m.x, m.y) {
+                continue;
+            }
+            // Toward the room's centre if it was on that side, else out.
+            let (v, lo, hi) = if hole.x1 - hole.x0 > hole.y1 - hole.y0 {
+                (&mut m.y, grown.y0, grown.y1)
+            } else {
+                (&mut m.x, grown.x0, grown.x1)
+            };
+            let mid = (lo + hi) / 2.0;
+            let lim = arena::HALF - 1.0;
+            *v = if v.abs() < mid.abs() {
+                if mid > 0.0 {
+                    lo
+                } else {
+                    hi
+                }
+            } else if mid > 0.0 {
+                hi.min(lim)
+            } else {
+                lo.max(-lim)
+            };
+        }
+    }
     PitRoomLayout {
         biome,
         danger,
@@ -1028,6 +1463,8 @@ pub fn pit_room(room: &PitRoomContext) -> PitRoomLayout {
         pattern,
         obstacles,
         ramps: room_ramps(room.seed, at),
+        holes,
+        platforms: room_platforms(room.seed, at),
     }
 }
 
@@ -1774,6 +2211,219 @@ mod tests {
             ..LaserShot::default()
         });
         assert!((down[0].z).abs() < 1e-4 && down[0].nz > 0.99, "{down:?}");
+    }
+
+    #[test]
+    fn terrain_rolls_meets_level_at_the_walls_and_has_holes_in_some_rooms() {
+        let (mut hilly, mut holed, mut platforms) = (0, 0, 0);
+        for y in -6..=6 {
+            for x in -6..=6 {
+                let at = (x, y);
+                let field = room_terrain(DEFAULT_SEED, at);
+                assert_eq!(field, room_terrain(DEFAULT_SEED, at));
+                let top = field
+                    .samples()
+                    .iter()
+                    .copied()
+                    .filter(|&h| h != HOLE)
+                    .fold(0.0f32, f32::max);
+                if top > 0.3 {
+                    hilly += 1;
+                }
+                assert!(top < 3.0, "pit.{x}.{y}: {top}");
+                // Level along every wall and in the passages.
+                for t in [-19.5f32, -10.0, 0.0, 7.5, 19.5] {
+                    for (px, py) in [(t, 19.9), (t, -19.9), (19.9, t), (-19.9, t), (21.0, 0.0)] {
+                        if let Some((h, _)) = field.height_at([px, py]) {
+                            assert!(h.abs() < 1e-3, "pit.{x}.{y} ({px}, {py}): {h}");
+                        }
+                    }
+                }
+                let holes = room_holes(DEFAULT_SEED, at);
+                if !holes.is_empty() {
+                    holed += 1;
+                }
+                // Spawn points and the boss's home stand on ground.
+                for k in KEEP {
+                    assert!(
+                        field.height_at([k.0, k.1]).is_some(),
+                        "pit.{x}.{y}: {k:?} over a hole"
+                    );
+                }
+                let layout = pit_room(&PitRoomContext {
+                    seed: DEFAULT_SEED,
+                    x,
+                    y,
+                });
+                for m in &layout.mobs {
+                    assert!(
+                        holes.iter().all(|h| !h.contains(m.x, m.y)),
+                        "pit.{x}.{y}: mob home {m:?} in a hole"
+                    );
+                }
+                for h in &holes {
+                    let w = (h.x1 - h.x0).min(h.y1 - h.y0);
+                    assert!((HOLE_WIDTH.0..=HOLE_WIDTH.1 + 1e-3).contains(&w), "{h:?}");
+                }
+                platforms += layout.platforms.iter().filter(|p| p.height > 0.0).count();
+            }
+        }
+        assert!(hilly > 60 && hilly < 160, "{hilly} hilly rooms");
+        assert!(holed > 25 && holed < 90, "{holed} rooms with holes");
+        assert!(platforms > 169, "{platforms} platforms");
+        assert!(room_holes(DEFAULT_SEED, (0, 0)).is_empty());
+    }
+
+    /// A flat test room with a 3 m trench across y 6..9, a 1 m platform at
+    /// x 6..8 and a 1 m hill at (-8, -8).
+    fn test_ground() -> Colliders {
+        Colliders::new()
+            .with(Collider::aabb([6.0, -2.0], [8.0, 0.0], 1.0))
+            .with_terrain(
+                Heightfield::new([-22.0, -22.0], TERRAIN_CELL, 89, 89, |x, y| {
+                    if y > 6.0 && y < 9.0 {
+                        return HOLE;
+                    }
+                    let (dx, dy) = (x + 8.0, y + 8.0);
+                    let u = (dx * dx + dy * dy) / 25.0;
+                    if u < 1.0 {
+                        (1.0 - u) * (1.0 - u)
+                    } else {
+                        0.0
+                    }
+                }),
+                LAYER_FLOOR,
+            )
+    }
+
+    #[test]
+    fn the_step_walks_over_a_hill_smoothly() {
+        let ground = test_ground();
+        let mut s = canonicalize(PitState {
+            x: -14.0,
+            y: -8.0,
+            ..PitState::default()
+        });
+        let (mut top, mut last) = (0.0f32, 0.0f32);
+        for _ in 0..80 {
+            s = on_ramps(s, 127, 0, 0, &ground);
+            let (g, _) = ground_of(&ground, s.x, s.y);
+            assert!((s.z - g).abs() < 0.01, "on the surface: {s:?} vs {g}");
+            assert!((s.z - last).abs() < 0.12, "no jolt: {last} → {}", s.z);
+            last = s.z;
+            top = top.max(s.z);
+        }
+        assert!(top > 0.95, "over the top: {top}");
+        assert!(s.x > -3.0, "kept walking: {s:?}");
+    }
+
+    fn ground_of(g: &Colliders, x: f32, y: f32) -> (f32, [f32; 3]) {
+        ground(g, x, y)
+    }
+
+    #[test]
+    fn a_hole_swallows_a_walker_and_a_running_jump_clears_it() {
+        let ground = test_ground();
+        // Walking in: down to the bottom, and no climbing out.
+        let mut s = canonicalize(PitState {
+            x: 0.0,
+            y: 3.0,
+            ..PitState::default()
+        });
+        for _ in 0..60 {
+            s = on_ramps(s, 0, 127, 0, &ground);
+        }
+        assert_eq!(s.z, arena::snap(HEIGHT, FALL_FLOOR), "{s:?}");
+        let stuck = s;
+        for _ in 0..30 {
+            s = on_ramps(s, 0, -127, 0, &ground);
+        }
+        // Along its floor, but never up its rim.
+        assert!(
+            s.y > 5.5 && s.z < -3.0,
+            "trapped: {s:?} (fell at {stuck:?})"
+        );
+        // A running jump from the edge clears 3 m.
+        let mut s = canonicalize(PitState {
+            x: 0.0,
+            y: 0.0,
+            ..PitState::default()
+        });
+        for _ in 0..60 {
+            let near_edge = s.y > 5.6;
+            s = on_ramps(
+                s,
+                0,
+                127,
+                if near_edge { PitInput::JUMP } else { 0 },
+                &ground,
+            );
+            if s.z > 0.0 {
+                break;
+            }
+        }
+        for _ in 0..40 {
+            s = on_ramps(s, 0, 127, 0, &ground);
+        }
+        assert!(s.y > 9.0 && s.z == 0.0, "made it across: {s:?}");
+        // From further back (about 1.5 m short), only a jump-dash makes it.
+        let run_up = |dash: bool| {
+            let mut s = canonicalize(PitState {
+                x: 0.0,
+                y: 0.0,
+                ..PitState::default()
+            });
+            let mut jumped = false;
+            for _ in 0..80 {
+                let jump = !jumped && s.y > 4.5;
+                jumped |= jump;
+                let buttons = if jump {
+                    PitInput::JUMP
+                } else if dash && jumped && s.z > 0.5 {
+                    arena::BUTTON_DASH
+                } else {
+                    0
+                };
+                s = on_ramps(s, 0, 127, buttons, &ground);
+            }
+            s
+        };
+        assert!(run_up(false).z < -3.0, "a plain jump falls short");
+        let dashed = run_up(true);
+        assert!(
+            dashed.z >= 0.0 && dashed.y > 9.0,
+            "a jump-dash clears it: {dashed:?}"
+        );
+    }
+
+    #[test]
+    fn a_jump_lands_on_a_platform_and_its_side_blocks_a_walker() {
+        let ground = test_ground();
+        // Walking into it: stopped at its side.
+        let mut s = canonicalize(PitState {
+            x: 3.0,
+            y: -1.0,
+            ..PitState::default()
+        });
+        for _ in 0..40 {
+            s = on_ramps(s, 127, 0, 0, &ground);
+        }
+        assert!(
+            s.x <= 6.0 - arena::PLAYER_RADIUS + 0.01 && s.z == 0.0,
+            "{s:?}"
+        );
+        // Jumping onto it.
+        let mut frames = 0;
+        s = on_ramps(s, 127, 0, PitInput::JUMP, &ground);
+        while s.z > 1.0 + 1e-3 || s.vz != 0.0 {
+            s = on_ramps(s, 64, 0, 0, &ground);
+            frames += 1;
+            assert!(frames < 60, "{s:?}");
+        }
+        assert!(
+            (s.z - 1.0).abs() < 1e-3 && (6.0..=8.0).contains(&s.x),
+            "on top: {s:?}"
+        );
     }
 
     #[test]

@@ -13,6 +13,14 @@ export interface ContentPack {
 	readonly notes: string;
 }
 
+/** Record `Hole` (`#[derive(GameRecord)]`). */
+export interface Hole {
+	readonly x0: number;
+	readonly y0: number;
+	readonly x1: number;
+	readonly y1: number;
+}
+
 /** Record `LaserHit` (`#[derive(GameRecord)]`). */
 export interface LaserHit {
 	readonly x: number;
@@ -95,6 +103,15 @@ export interface Ramp {
 	readonly degrees: number;
 }
 
+/** Record `Platform` (`#[derive(GameRecord)]`). */
+export interface Platform {
+	readonly x0: number;
+	readonly y0: number;
+	readonly x1: number;
+	readonly y1: number;
+	readonly height: number;
+}
+
 /** Record `PitRoomLayout` (`#[derive(GameRecord)]`). */
 export interface PitRoomLayout {
 	readonly biome: number;
@@ -107,6 +124,8 @@ export interface PitRoomLayout {
 	readonly pattern: number;
 	readonly obstacles: readonly Obstacle[];
 	readonly ramps: readonly Ramp[];
+	readonly holes: readonly Hole[];
+	readonly platforms: readonly Platform[];
 }
 
 /** Record `PitRules` (`#[derive(GameRecord)]`). */
@@ -189,6 +208,16 @@ export interface ReachContext {
 	readonly x: number;
 	readonly y: number;
 	readonly near: number;
+}
+
+/** Record `RoomTerrain` (`#[derive(GameRecord)]`). */
+export interface RoomTerrain {
+	readonly minX: number;
+	readonly minY: number;
+	readonly cell: number;
+	readonly nx: number;
+	readonly ny: number;
+	readonly heights: readonly number[];
 }
 
 /** Record `WorldTiers` (`#[derive(GameRecord)]`). */
