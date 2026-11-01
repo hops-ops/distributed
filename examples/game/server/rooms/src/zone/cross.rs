@@ -50,11 +50,16 @@ pub(super) const AWAY_GRACE: u64 = 120;
 const FOLLOW_TICKS: u64 = 150;
 /// ... and only if it was this close to where the player crossed (m).
 const FOLLOW_REACH: f32 = 10.0;
+/// A mob shot from the room next door goes after the shooter for at most
+/// this long (ticks, 10 s: it may have the whole room to cross).
+const AGGRO_TICKS: u64 = 300;
 /// A visitor waits this long for the player it came after (ticks, 2 s;
 /// the player's own handoff may land after the mob).
 const FIND_TICKS: u64 = 60;
 /// Visitors a room holds at once.
 const MAX_GUESTS: usize = 4;
+/// The largest integer the message codec carries exactly (2^53 − 1).
+const SAFE_INT: u64 = (1 << 53) - 1;
 
 /// A player who left through a side this activation (recent ones only).
 pub(super) struct Departed {
@@ -303,7 +308,9 @@ impl MobPit {
             return;
         };
         self.crossings += 1;
-        let transfer = ctx.boot_epoch().rotate_left(20) ^ self.crossings;
+        // Unique per activation, and within 53 bits: the message codec
+        // saturates integers past JavaScript's safe range.
+        let transfer = ((ctx.boot_epoch() << 20) ^ self.crossings) & SAFE_INT;
         let (rx, ry) = self.room.room;
         let to = room_zone((rx + f.step.0, ry + f.step.1));
         let m = &mut self.mobs[i];
@@ -444,6 +451,7 @@ impl MobPit {
                 self.resolve_leg(
                     ctx,
                     principal,
+                    (fx - rx, fy - ry),
                     shot,
                     by,
                     [x, y, z],
@@ -595,6 +603,7 @@ impl MobPit {
         &mut self,
         ctx: &mut Ctx<'_, Self>,
         principal: VerifiedPrincipal,
+        back: (i32, i32),
         shot: u16,
         by: String,
         at: [f32; 3],
@@ -671,6 +680,7 @@ impl MobPit {
                 id as usize - 1,
                 RANGED_DAMAGE,
             );
+            self.aggro_across(id as usize - 1, back, principal.as_str(), at, ctx.tick());
         }
         if let Some(leg) = leaves {
             let (rx, ry) = self.room.room;
@@ -678,6 +688,60 @@ impl MobPit {
             let age = Duration::from_millis(age_ms.into());
             ctx.send_zone_as(&principal, &to, &leg.message(shot, by, age));
         }
+    }
+}
+
+impl MobPit {
+    /// Mob `i` was shot from the room toward `step` (the beam came in at
+    /// `at`): unless it is busy with a player here, it goes after the
+    /// shooter, out where the beam came in and across. Bosses and
+    /// visitors stay.
+    fn aggro_across(
+        &mut self,
+        i: usize,
+        step: (i32, i32),
+        principal: &str,
+        at: [f32; 3],
+        tick: u64,
+    ) {
+        let open = self.open;
+        let players = &self.players;
+        let Some(m) = self.mobs.get_mut(i) else {
+            return;
+        };
+        let busy = m
+            .target
+            .is_some_and(|t| players.get(&t).is_some_and(|p| p.dead_until.is_none()));
+        if busy
+            || m.tier == BOSS_TIER
+            || m.state == MobState::Dead
+            || m.visit.is_some()
+            || m.away.is_some()
+            || m.follow.is_some()
+        {
+            return;
+        }
+        let radius = super::tier_stats(m.tier).3;
+        let lim = HALF - radius;
+        let mut along = if step.0 != 0 { at[1] } else { at[0] }.clamp(-lim, lim);
+        if !passable(open, step, along, radius) {
+            let gap = (DOOR_HALF - radius).max(0.0);
+            along = along.clamp(-gap, gap);
+        }
+        let exit = if step.0 != 0 {
+            (step.0 as f32 * lim, along)
+        } else {
+            (along, step.1 as f32 * lim)
+        };
+        m.follow = Some(Follow {
+            step,
+            exit,
+            principal: principal.to_string(),
+            until: tick + AGGRO_TICKS,
+        });
+        m.state = MobState::Chase;
+        m.target = None;
+        m.timer = 0;
     }
 }
 

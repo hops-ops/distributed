@@ -22,7 +22,8 @@ fn host(zone: &str, clock: &ManualClock) -> ZoneHost<MobPit> {
     ZoneHost::<MobPit>::new(
         zone,
         HostConfig {
-            boot_epoch: 7,
+            // A celld activation's: microseconds since 1970 (past 2^53 once shifted).
+            boot_epoch: 1_793_000_000_000_000,
             ..HostConfig::default()
         },
         Arc::new(clock.clone()),
@@ -280,4 +281,103 @@ fn a_chasing_mob_follows_through_a_doorway_and_is_never_in_two_rooms() {
     let t = back.expect("home again after the grace");
     eprintln!("messages stopped: home again after {t} ticks");
     assert!((60..=130).contains(&t), "back after {t} ticks");
+}
+
+#[test]
+fn the_largest_crossing_id_survives_the_message_codec() {
+    use distributed_game::GameEvent;
+    use mobpit_rooms::PitMessage;
+    // A celld activation's boot epoch is microseconds since 1970.
+    let transfer = (1u64 << 53) - 1;
+    let beat = PitMessage::MobBeat { transfer };
+    let back = PitMessage::decode_event(beat.event_id(), &beat.to_payload())
+        .expect("decode")
+        .expect("a message");
+    assert!(
+        matches!(back, PitMessage::MobBeat { transfer: t } if t == transfer),
+        "{back:?}"
+    );
+}
+
+#[test]
+fn a_mob_shot_from_next_door_comes_after_the_shooter() {
+    let clock = ManualClock::new();
+    let mut a = host("pit.0.0", &clock);
+    let mut b = host("pit.1.0", &clock);
+    let own_a = a.zone().mob_positions().len();
+    let (client, ana) = join(&mut a, "ana");
+    let (_, bo) = join(&mut b, "bo");
+    for _ in 0..3 {
+        tick(&mut a, &mut b, &clock);
+    }
+    // Bo far off in pit.1.0's east (the mob is not busy with him); ana by
+    // the east doorway of pit.0.0, a grunt across it.
+    b.zone_mut().place_player(bo, 17.0, 15.0);
+    a.zone_mut().place_player(ana, 17.0, 0.0);
+    let (id, _) = b
+        .zone()
+        .mob_tiers()
+        .into_iter()
+        .find(|t| t.1 == 1)
+        .expect("a grunt");
+    b.zone_mut().place_mob(id, -16.0, 0.0);
+    let ground = room_ground(DEFAULT_SEED, (1, 0))
+        .ground_at([-16.0, 0.0], layer::ALL)
+        .map_or(0.0, |g| g.height);
+    let dist = (40.0 - 16.0) - 17.0;
+    let pitch = ((ground + 0.45 - EYE_HEIGHT) / dist).atan();
+    // Shoot until one beam hits (a grunt takes three).
+    let mut hit = false;
+    for n in 1..=20u16 {
+        a.push_input(
+            client,
+            u32::from(n),
+            a.tick() as u32,
+            &PitInput {
+                buttons: PitInput::FIRE | PitInput::NO_COMP,
+                yaw: 0.0,
+                pitch,
+                shot: n,
+                ..PitInput::default()
+            }
+            .to_payload(),
+        );
+        for _ in 0..14 {
+            for e in tick(&mut a, &mut b, &clock) {
+                if let PitEvent::Beam { hit: Some(h), .. } = e {
+                    hit |= h == id;
+                }
+            }
+            pump(&mut a, &mut b);
+            if !hit {
+                b.zone_mut().place_mob(id, -16.0, 0.0);
+            }
+        }
+        if hit {
+            break;
+        }
+    }
+    assert!(hit, "a beam hit the grunt");
+    assert!(alive(&b, id), "one hit does not kill a grunt");
+    // It comes through the doorway after ana, and closes in on her.
+    let mut closest = f32::MAX;
+    let mut arrived = None;
+    for t in 0..300u32 {
+        tick(&mut a, &mut b, &clock);
+        pump(&mut a, &mut b);
+        assert!(
+            !(alive(&b, id) && visitors(&a, own_a) > 0),
+            "tick {t}: in both rooms"
+        );
+        let (ax, ay) = a.zone().player_position(ana).expect("ana");
+        for m in a.zone().mob_positions() {
+            if m.0 as usize > own_a && m.3 {
+                arrived.get_or_insert(t);
+                closest = closest.min(((m.1 - ax).powi(2) + (m.2 - ay).powi(2)).sqrt());
+            }
+        }
+    }
+    let t = arrived.expect("the grunt came into pit.0.0");
+    eprintln!("shot grunt came through after {t} ticks; closest {closest:.2} m");
+    assert!(closest < 2.0, "it reached ana: {closest} m");
 }

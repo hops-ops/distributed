@@ -87,7 +87,11 @@ test('a doorway into a sleeping room after a bow fight: no correction, no jump',
 			const west = await walkThroughDoor(pit, [-1, 0]);
 			assert.equal(west.room, 'pit.0.0');
 			await sleep(500);
-			const fresh = corrections.slice(before).filter((c) => c.m > 0.05);
+			// A hit or a death (a mob may follow through the doorway) is the
+			// room's call, not a prediction error.
+			const hurt = corrections.slice(before).filter((c) => (c.errors.hp ?? 0) !== 0);
+			const fresh = corrections.slice(before).filter((c) => c.m > 0.05 && (c.errors.hp ?? 0) === 0);
+			if (hurt.length > 0) console.error(`round ${round}: ${hurt.length} hit or death corrections (not counted)`);
 			console.error(
 				`round ${round}: ${shots} arrows; east step ${largestStep(east.trace).toFixed(3)} m, west step ${largestStep(west.trace).toFixed(3)} m; corrections ${JSON.stringify(fresh.map((c) => ({ room: c.room, m: +c.m.toFixed(3) })))}`
 			);

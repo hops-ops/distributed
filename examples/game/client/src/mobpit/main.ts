@@ -1042,7 +1042,13 @@ type HpBar = { hpBack: Mesh; hpFill: Mesh; /** The fill drawn (eases to the heal
 /** `culled`: off screen, every mesh disabled and nothing updated. */
 type Culled = { culled: boolean };
 type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh } & HpBar & Culled;
-type MobVisual = { kind: 'mob'; body: Mesh; ring: Mesh; fill: Mesh; tier: number } & HpBar & Culled;
+/**
+ * `edge`: last seen near its room's side (it may be crossing); `slide`: it
+ * just came across from the room next door and glides from where its old
+ * room last drew it.
+ */
+type MobVisual = { kind: 'mob'; body: Mesh; ring: Mesh; fill: Mesh; tier: number; edge: boolean; slide?: { from: Vector3; start: number } } & HpBar &
+	Culled;
 type Visual = PlayerVisual | MobVisual;
 const visuals = new Map<string, Visual>();
 
@@ -1078,14 +1084,39 @@ function createMob(entity: RenderedEntity): MobVisual {
 	body.material = tierMats.get(tier) ?? mats.other;
 	const ring = flatDisc(`${entity.key}-tele`, t.tele, mats.tele);
 	const fill = flatDisc(`${entity.key}-tele-fill`, t.tele, mats.teleFill);
-	return { kind: 'mob', body, ring, fill, tier, culled: false, ...hpBar(entity.key, mats.hpFill) };
+	return { kind: 'mob', body, ring, fill, tier, edge: false, culled: false, ...hpBar(entity.key, mats.hpFill) };
+}
+
+// ---- mobs crossing between rooms ----
+// A mob that follows a player across leaves its room (its entity goes) and
+// arrives next door as a new entity a message later. Its mesh is held a
+// moment where it vanished at a side; the newcomer of the same tier beside
+// it takes the mesh over and glides into place: no blink, no hop.
+const CROSS_HOLD_MS = 500;
+const CROSS_SLIDE_MS = 150;
+/** How near (m) a newcomer must be to a held mob to be it. */
+const CROSS_MATCH = 3;
+const crossing = new Map<string, { visual: MobVisual; until: number }>();
+/** Mobs just killed (their entity goes too, but they are not crossing). */
+const killedAt = new Map<string, number>();
+function adoptCrossing(entity: RenderedEntity): MobVisual | undefined {
+	const m = mobFields(entity);
+	const arriving = placeIn(entity.zoneId, m.x, m.y, 0);
+	for (const [key, held] of crossing) {
+		const at = held.visual.body.position;
+		if (held.visual.tier !== (m.tier || 1) || Math.hypot(at.x - arriving.x, at.z - arriving.z) > CROSS_MATCH) continue;
+		crossing.delete(key);
+		held.visual.slide = { from: at.clone(), start: performance.now() };
+		return held.visual;
+	}
+	return undefined;
 }
 
 function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 	let visual = visuals.get(entity.key);
 	if (visual !== undefined) return visual;
 	if (isMob(entity)) {
-		visual = createMob(entity);
+		visual = adoptCrossing(entity) ?? createMob(entity);
 	} else {
 		visual = createPlayer(entity, mine);
 	}
@@ -1161,6 +1192,14 @@ pit.on('beam', (b, zoneId) => {
 	beam(`laser-next-${zoneId}-${b.shot}`, points, b.hit !== undefined ? beamMats.hit : beamMats.miss, 0.04, BEAM_MS * 2);
 });
 pit.on('kill', (kill, zoneId) => {
+	// Killed, not crossing: never held at the side.
+	const key = `${zoneId}:${kill.mob}`;
+	killedAt.set(key, performance.now());
+	const held = crossing.get(key);
+	if (held !== undefined) {
+		dispose(held.visual);
+		crossing.delete(key);
+	}
 	// Entity ids are per room: a kill next door is never yours.
 	const mine = zoneId === pit.room() && kill.killer === pit.hello()?.entity;
 	const tier = TIERS[kill.tier]?.name ?? 'Mob';
@@ -1478,7 +1517,14 @@ stage.onFrame((now, dtMs) => {
 			const { x, y } = mob;
 			const ground = groundAt(entity.zoneId, x, y);
 			const height = ground + (visual.tier === 4 ? 1.4 : visual.tier === 3 ? 1 : visual.tier === 2 ? 0.75 : 0.45);
-			visual.body.position.copyFrom(at(x, y, height));
+			visual.edge = Math.max(Math.abs(x), Math.abs(y)) > ROOM_SIZE / 2 - CROSS_MATCH;
+			const slide = visual.slide;
+			const k = slide === undefined ? 1 : (now - slide.start) / CROSS_SLIDE_MS;
+			if (slide !== undefined && k < 1) visual.body.position.copyFrom(Vector3.Lerp(slide.from, at(x, y, height), k * (2 - k)));
+			else {
+				visual.slide = undefined;
+				visual.body.position.copyFrom(at(x, y, height));
+			}
 			visual.body.rotation.y = -mob.face;
 			const hp = mob.hp / 100;
 			const top = height * 2 - ground + 0.35;
@@ -1531,10 +1577,22 @@ stage.onFrame((now, dtMs) => {
 	cullStats.loopMs = smooth(cullStats.loopMs, performance.now() - loopStart);
 	for (const [key, visual] of visuals) {
 		if (seen.has(key)) continue;
+		// Gone at a side, not killed: it may be crossing (held a moment).
+		if (visual.kind === 'mob' && visual.edge && !visual.culled && !killedAt.has(key)) {
+			crossing.set(key, { visual, until: now + CROSS_HOLD_MS });
+			visuals.delete(key);
+			continue;
+		}
 		dispose(visual);
 		stage.labels.delete(key);
 		visuals.delete(key);
 	}
+	for (const [key, held] of crossing) {
+		if (now < held.until) continue;
+		dispose(held.visual);
+		crossing.delete(key);
+	}
+	for (const [key, at] of killedAt) if (now - at > 2000) killedAt.delete(key);
 	for (const [key, p] of popups) {
 		p.mesh.position.copyFrom(placeIn(p.zone, p.x, p.y, 1.2));
 		if (now < p.until) continue;
