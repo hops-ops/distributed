@@ -58,7 +58,9 @@ import {
 	type PitFields,
 	type ContentPack,
 	type PitInput,
-	type Ramp
+	type Platform,
+	type Ramp,
+	type RoomTerrain
 } from '../generated/mobpit/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
@@ -390,7 +392,8 @@ roomsMap.addEventListener(
 	},
 	{ passive: false }
 );
-type MiniLayout = { biome: number; obstacles: { x: number; y: number; r: number }[]; ramps: readonly Ramp[] };
+type Box = { x0: number; y0: number; x1: number; y1: number };
+type MiniLayout = { biome: number; obstacles: { x: number; y: number; r: number }[]; ramps: readonly Ramp[]; holes: readonly Box[]; platforms: readonly Platform[] };
 const roomLayouts = new Map<string, MiniLayout>();
 function roomLayout(seed: number, x: number, y: number): MiniLayout | undefined {
 	if (!pit.pures.loaded()) return undefined;
@@ -398,7 +401,7 @@ function roomLayout(seed: number, x: number, y: number): MiniLayout | undefined 
 	let layout = roomLayouts.get(key);
 	if (layout === undefined) {
 		const room = pit.pures.pitRoom({ seed, x, y });
-		layout = { biome: room.biome, obstacles: room.obstacles.map(({ x, y, r }) => ({ x, y, r })), ramps: room.ramps };
+		layout = { biome: room.biome, obstacles: room.obstacles.map(({ x, y, r }) => ({ x, y, r })), ramps: room.ramps, holes: room.holes, platforms: room.platforms };
 		if (roomLayouts.size > 400) roomLayouts.clear();
 		roomLayouts.set(key, layout);
 	}
@@ -461,6 +464,14 @@ function drawRooms(): void {
 					ctx.fillStyle = r.degrees <= 45 ? '#c9c2b088' : '#d0703f99';
 					ctx.fillRect(ax, ay, (r.x1 - r.x0) * s, (r.y1 - r.y0) * s);
 				}
+				// Holes black, then platforms and stepping stones over them.
+				const box = (b: Box, fill: string) => {
+					const [ax, ay] = toMap(rx * ROOM_SIZE + b.x0, ry * ROOM_SIZE + b.y1);
+					ctx.fillStyle = fill;
+					ctx.fillRect(ax, ay, (b.x1 - b.x0) * s, (b.y1 - b.y0) * s);
+				};
+				for (const h of layout.holes) box(h, '#000000ee');
+				for (const p of layout.platforms) box(p, p.height > 0 ? '#b8a88caa' : '#8c7f6acc');
 			}
 			// Walls with a doorway gap in the middle of each.
 			ctx.strokeStyle = '#9aa3b2';
@@ -738,8 +749,79 @@ const templates = (() => {
 		m.backFaceCulling = false;
 		m.specularColor = Color3.Black();
 	}
-	return { floors, wall, walls, segment, gate, pillar, boulder, tree, crystal, rampMats };
+	// Holes: an open-topped dark shaft (inside faces only), scaled per hole.
+	const shaft = MeshBuilder.CreateBox('room-hole', { size: 1, sideOrientation: Mesh.BACKSIDE }, scene);
+	const shaftMat = material(scene, 'room-hole', '#07050a');
+	shaftMat.specularColor = Color3.Black();
+	shaft.material = shaftMat;
+	shaft.isPickable = false;
+	shaft.setEnabled(false);
+	// Platforms: boxes to jump onto; stepping stones are columns rising out of a hole.
+	const platform = MeshBuilder.CreateBox('room-platform', { size: 1 }, scene);
+	platform.material = material(scene, 'room-platform', '#8c7f6a');
+	platform.isPickable = false;
+	platform.setEnabled(false);
+	return { floors, wall, walls, segment, gate, pillar, boulder, tree, crystal, rampMats, shaft, platform };
 })();
+
+/** Each built room's terrain, for standing mobs on it. */
+const terrains = new Map<string, RoomTerrain>();
+
+/** Whether terrain sample `h` lies over a hole (`TERRAIN_HOLE`, -1000). */
+const isHole = (h: number) => h < -100;
+
+/** Terrain height at room-local `(x, y)` of zone `zoneId` (bilinear; 0 off the terrain or over a hole). */
+function groundAt(zoneId: string, x: number, y: number): number {
+	const t = terrains.get(zoneId);
+	if (t === undefined) return 0;
+	const fx = (x - t.minX) / t.cell;
+	const fy = (y - t.minY) / t.cell;
+	const i = Math.floor(fx);
+	const j = Math.floor(fy);
+	if (i < 0 || j < 0 || i + 1 >= t.nx || j + 1 >= t.ny) return 0;
+	const at = (a: number, b: number) => t.heights[b * t.nx + a]!;
+	const c = [at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1)];
+	if (c.some(isHole)) return 0;
+	const u = fx - i;
+	const v = fy - j;
+	return (c[0]! * (1 - u) + c[1]! * u) * (1 - v) + (c[2]! * (1 - u) + c[3]! * u) * v;
+}
+
+/** A room's ground as one mesh (room-local, scene axes: x, up, y): cells touching a hole are left open. */
+function terrainMesh(name: string, t: RoomTerrain, biome: number): Mesh {
+	const positions: number[] = [];
+	const uvs: number[] = [];
+	const indices: number[] = [];
+	for (let j = 0; j < t.ny; j += 1) {
+		for (let i = 0; i < t.nx; i += 1) {
+			const x = t.minX + i * t.cell;
+			const y = t.minY + j * t.cell;
+			const h = t.heights[j * t.nx + i]!;
+			positions.push(x, isHole(h) ? 0 : h, y);
+			uvs.push(x / (HALF * 2) + 0.5, y / (HALF * 2) + 0.5);
+		}
+	}
+	for (let j = 0; j + 1 < t.ny; j += 1) {
+		for (let i = 0; i + 1 < t.nx; i += 1) {
+			const a = j * t.nx + i;
+			const corners = [a, a + 1, a + t.nx, a + t.nx + 1];
+			if (corners.some((k) => isHole(t.heights[k]!))) continue;
+			indices.push(a, a + t.nx, a + 1, a + 1, a + t.nx, a + t.nx + 1);
+		}
+	}
+	const data = new VertexData();
+	data.positions = positions;
+	data.indices = indices;
+	data.uvs = uvs;
+	const normals: number[] = [];
+	VertexData.ComputeNormals(positions, indices, normals);
+	data.normals = normals;
+	const mesh = new Mesh(name, scene);
+	data.applyToMesh(mesh);
+	mesh.material = templates.floors[biome]?.material ?? null;
+	mesh.isPickable = false;
+	return mesh;
+}
 
 /** One ramp of a room as a wedge mesh (room-local, scene axes: x, up, y). */
 function rampMesh(name: string, r: Ramp): Mesh {
@@ -798,7 +880,27 @@ function createChunk(room: Room): Chunk {
 		instance.isPickable = false;
 		return instance;
 	};
-	add(templates.floors[biome ?? 0]!, 'floor', 0, 0, 0);
+	const layout = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }) : undefined;
+	if (layout !== undefined && biome !== undefined) {
+		const terrain = pit.pures.terrain({ seed, x: room[0], y: room[1] });
+		terrains.set(key, terrain);
+		terrainMesh(`${key}-terrain`, terrain, biome).parent = node;
+		// Each hole: a shaft 4 m deep (falling past 2 m kills).
+		layout.holes.forEach((h, i) => {
+			const instance = add(templates.shaft, `hole-${i}`, (h.x0 + h.x1) / 2, (h.y0 + h.y1) / 2, -2);
+			instance.scaling.set(h.x1 - h.x0, 4, h.y1 - h.y0);
+		});
+		// Platforms; a stepping stone (height 0) is a column from the bottom of its hole up to the floor.
+		layout.platforms.forEach((p, i) => {
+			const bottom = p.height > 0 ? 0 : -4;
+			const top = p.height > 0 ? p.height : 0;
+			const instance = add(templates.platform, `platform-${i}`, (p.x0 + p.x1) / 2, (p.y0 + p.y1) / 2, (bottom + top) / 2);
+			instance.scaling.set(p.x1 - p.x0, top - bottom, p.y1 - p.y0);
+		});
+	} else {
+		terrains.delete(key);
+		add(templates.floors[biome ?? 0]!, 'floor', 0, 0, 0);
+	}
 	// Each wall: two segments either side of its doorway gap, just outside
 	// the floor (the neighbour's wall stands right behind it).
 	const off = PIT_WORLD.doorHalf + templates.segment / 2;
@@ -858,6 +960,7 @@ function syncChunks(): void {
 		if (!wanted.has(key)) {
 			chunk.node.dispose();
 			chunks.delete(key);
+			terrains.delete(key);
 			continue;
 		}
 		chunk.node.position.copyFrom(place(chunk.room, 0, 0));
@@ -1295,19 +1398,20 @@ stage.onFrame((now, dtMs) => {
 		if (visual.kind === 'mob') {
 			const mob = mobFields(entity);
 			const { x, y } = mob;
-			const height = visual.tier === 4 ? 1.4 : visual.tier === 3 ? 1 : visual.tier === 2 ? 0.75 : 0.45;
+			const ground = groundAt(entity.zoneId, x, y);
+			const height = ground + (visual.tier === 4 ? 1.4 : visual.tier === 3 ? 1 : visual.tier === 2 ? 0.75 : 0.45);
 			visual.body.position.copyFrom(at(x, y, height));
 			visual.body.rotation.y = -mob.face;
 			const hp = mob.hp / 100;
-			const top = height * 2 + 0.35;
+			const top = height * 2 - ground + 0.35;
 			showHp(visual, at(x, y, top), hp, dtMs);
 			const tele = mob.tele / 255;
 			const winding = mob.state === 2;
 			visual.ring.setEnabled(visible && winding);
 			visual.fill.setEnabled(visible && winding);
 			if (winding) {
-				visual.ring.position.copyFrom(at(x, y, 0.03));
-				visual.fill.position.copyFrom(at(x, y, 0.04));
+				visual.ring.position.copyFrom(at(x, y, ground + 0.03));
+				visual.fill.position.copyFrom(at(x, y, ground + 0.04));
 				visual.fill.scaling.setAll(Math.max(0.05, tele));
 			}
 			visual.body.scaling.setAll(winding ? 1 + 0.15 * tele : 1);

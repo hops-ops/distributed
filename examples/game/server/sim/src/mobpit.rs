@@ -272,6 +272,39 @@ fn blocked(ramps: &Colliders, x: f32, y: f32, z: f32) -> bool {
         })
 }
 
+/// Whether the move from `(x0, y0)` to `(x1, y1)` with feet at `z` hits
+/// ground it can't climb anywhere along the way, not just at the end, so a
+/// fast move (a dash plus a slide) can't tunnel through geometry between
+/// one frame and the next. Thick ground (hills, ramps) is sampled along
+/// the path at most a quarter of the player's width apart; thin solids
+/// (platform edges) are swept with three horizontal rays (centre and both
+/// rims) just above step-up height, reaching the leading rim — a hit
+/// on a face too steep to stand on blocks.
+fn swept_blocked(ramps: &Colliders, (x0, y0): (f32, f32), (x1, y1): (f32, f32), z: f32) -> bool {
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let dist = (dx * dx + dy * dy).sqrt();
+    let steps = (dist / (arena::PLAYER_RADIUS / 2.0)).ceil().max(1.0) as u32;
+    if (1..=steps).any(|i| {
+        let t = i as f32 / steps as f32;
+        blocked(ramps, x0 + dx * t, y0 + dy * t, z)
+    }) {
+        return true;
+    }
+    if dist <= 1e-6 {
+        return false;
+    }
+    let (ux, uy) = (dx / dist, dy / dist);
+    let r = arena::PLAYER_RADIUS;
+    let height = z + STEP_UP + TOUCH;
+    [0.0, r, -r].into_iter().any(|side| {
+        let origin = [x0 - uy * side, y0 + ux * side, height];
+        let ray = Ray::new(origin, [ux, uy, 0.0], dist + r).mask(LAYER_SOLID);
+        ramps
+            .raycast(&ray)
+            .is_some_and(|hit| !collide::walkable(hit.normal))
+    })
+}
+
 /// One command frame: [`arena::advance_among`] (stick, dash, the room's
 /// obstacles), then the walls with their doorway passages, then the
 /// ramps and the jump, snapped to the wire precision.
@@ -297,10 +330,13 @@ pub fn step_among(
         planar,
         arena::advance_among(planar, input.movement(), obstacles),
     );
-    if (!ramps.is_empty() || ramps.terrain().is_some()) && blocked(ramps, next.x, next.y, s.z) {
-        if !blocked(ramps, next.x, s.y, s.z) {
+    let from = (s.x, s.y);
+    if (!ramps.is_empty() || ramps.terrain().is_some())
+        && swept_blocked(ramps, from, (next.x, next.y), s.z)
+    {
+        if !swept_blocked(ramps, from, (next.x, s.y), s.z) {
             (next.y, next.vy) = (s.y, 0.0);
-        } else if !blocked(ramps, s.x, next.y, s.z) {
+        } else if !swept_blocked(ramps, from, (s.x, next.y), s.z) {
             (next.x, next.vx) = (s.x, 0.0);
         } else {
             (next.x, next.y, next.vx, next.vy) = (s.x, s.y, 0.0, 0.0);
@@ -2394,6 +2430,26 @@ mod tests {
             dashed.z >= 0.0 && dashed.y > 9.0,
             "a jump-dash clears it: {dashed:?}"
         );
+    }
+
+    #[test]
+    fn a_fast_move_cannot_tunnel_through_a_thin_wall() {
+        // A 0.1 m slab 2 m tall between two points 1.2 m apart: the
+        // end-point test alone misses it; the swept test sees it.
+        let wall = Colliders::new()
+            .with(Collider::aabb([-0.05, -3.0], [0.05, 3.0], 2.0).on_layers(LAYER_SOLID));
+        let (from, to) = (
+            (-0.6 - arena::PLAYER_RADIUS, 0.0),
+            (0.6 + arena::PLAYER_RADIUS, 0.0),
+        );
+        assert!(!blocked(&wall, to.0, to.1, 0.0));
+        assert!(swept_blocked(&wall, from, to, 0.0));
+        assert!(!swept_blocked(
+            &wall,
+            from,
+            (-0.1 - arena::PLAYER_RADIUS, 0.0),
+            0.0
+        ));
     }
 
     #[test]
