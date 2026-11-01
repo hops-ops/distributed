@@ -34,7 +34,9 @@ import type { StandardMaterial } from '@babylonjs/core/Materials/standardMateria
 import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture';
 import { Color3, Color4 } from '@babylonjs/core/Maths/math.color';
 import { Scene } from '@babylonjs/core/scene';
-import { Vector3 } from '@babylonjs/core/Maths/math.vector';
+import { Frustum } from '@babylonjs/core/Maths/math.frustum';
+import { Matrix, Vector3 } from '@babylonjs/core/Maths/math.vector';
+import type { Plane } from '@babylonjs/core/Maths/math.plane';
 import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
@@ -204,6 +206,8 @@ hud.toggle('First-person view (click to look, R / click / RT fires)', false, (on
 hud.toggle('Lag compensation (ranged)', true, (on) => (compensated = on), 'c', PAD.view);
 let ghostOn = true;
 hud.toggle('Server ghost', true, (on) => (ghostOn = on), 'g');
+let cullOn = true;
+hud.toggle('Skip off-screen entities', true, (on) => (cullOn = on), 'k');
 hud.toggle(
 	'Wake rooms in reach (doorway neighbours you walk up to)',
 	wakeInitial,
@@ -1035,8 +1039,10 @@ interestRing.isPickable = false;
 interestRing.setEnabled(false);
 
 type HpBar = { hpBack: Mesh; hpFill: Mesh; /** The fill drawn (eases to the health). */ hpShown: number };
-type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh } & HpBar;
-type MobVisual = { kind: 'mob'; body: Mesh; ring: Mesh; fill: Mesh; tier: number } & HpBar;
+/** `culled`: off screen, every mesh disabled and nothing updated. */
+type Culled = { culled: boolean };
+type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh } & HpBar & Culled;
+type MobVisual = { kind: 'mob'; body: Mesh; ring: Mesh; fill: Mesh; tier: number } & HpBar & Culled;
 type Visual = PlayerVisual | MobVisual;
 const visuals = new Map<string, Visual>();
 
@@ -1057,7 +1063,7 @@ function createPlayer(entity: RenderedEntity, mine: boolean): PlayerVisual {
 	blade.material = mats.blade;
 	// Swing wedge: 120° (the server's cone), flat on the floor.
 	const arc = flatDisc(`${entity.key}-arc`, ATTACK_REACH, mats.swing, SWING_HALF / Math.PI);
-	return { kind: 'player', body, blade, arc, nose, ...hpBar(entity.key, mats.playerHpFill) };
+	return { kind: 'player', body, blade, arc, nose, culled: false, ...hpBar(entity.key, mats.playerHpFill) };
 }
 
 function createMob(entity: RenderedEntity): MobVisual {
@@ -1072,7 +1078,7 @@ function createMob(entity: RenderedEntity): MobVisual {
 	body.material = tierMats.get(tier) ?? mats.other;
 	const ring = flatDisc(`${entity.key}-tele`, t.tele, mats.tele);
 	const fill = flatDisc(`${entity.key}-tele-fill`, t.tele, mats.teleFill);
-	return { kind: 'mob', body, ring, fill, tier, ...hpBar(entity.key, mats.hpFill) };
+	return { kind: 'mob', body, ring, fill, tier, culled: false, ...hpBar(entity.key, mats.hpFill) };
 }
 
 function visualFor(entity: RenderedEntity, mine: boolean): Visual {
@@ -1369,6 +1375,42 @@ function marker(record: ShotRecord): void {
 	});
 	setTimeout(() => ball.dispose(), 4000);
 }
+// ---- off-screen culling ----
+// Babylon skips drawing what is off screen, but still computes the world
+// matrix and bounds of every enabled mesh, and the frame loop would still
+// place and animate it. An entity wholly outside the view (with a margin)
+// has every mesh disabled and is not updated at all; it snaps to its
+// current state when it comes back.
+const CULL_MARGIN = 1;
+const viewProjection = new Matrix();
+const frustumPlanes: Plane[] = Frustum.GetPlanes(Matrix.IdentityReadOnly);
+/** This frame's view (the eye's rotation is already this frame's; its position lags a frame, which the margin covers). */
+function updateFrustum(): void {
+	const camera = scene.activeCamera;
+	if (camera === null) return;
+	camera.getViewMatrix(true).multiplyToRef(camera.getProjectionMatrix(true), viewProjection);
+	Frustum.GetPlanesToRef(viewProjection, frustumPlanes);
+}
+function onScreen(centre: Vector3, radius: number): boolean {
+	const r = radius + CULL_MARGIN;
+	return frustumPlanes.every((plane) => plane.dotCoordinate(centre) > -r);
+}
+function setCulled(visual: Visual, culled: boolean): void {
+	if (visual.culled === culled) return;
+	visual.culled = culled;
+	// Disabled: off Babylon's active-mesh pass. The bar's fill goes with its
+	// back (the frame re-enables only top-level meshes).
+	if (culled) for (const mesh of Object.values(visual)) if (mesh instanceof Mesh && mesh.parent === null) mesh.setEnabled(false);
+	// Back on screen: the bar snaps to the health instead of easing from the old one.
+	else visual.hpShown = Number.NaN;
+}
+/** Per-frame cost of the entity loop and of Babylon's render (CPU), smoothed. */
+const cullStats = { drawn: 0, culled: 0, loopMs: 0, renderMs: 0 };
+const smooth = (avg: number, sample: number) => avg + (sample - avg) * 0.05;
+let renderStart = 0;
+scene.onBeforeRenderObservable.add(() => (renderStart = performance.now()));
+scene.onAfterRenderObservable.add(() => (cullStats.renderMs = smooth(cullStats.renderMs, performance.now() - renderStart)));
+
 // A crosshair in first person.
 const crosshair = div('pit-crosshair', document.body);
 crosshair.textContent = '+';
@@ -1387,6 +1429,10 @@ stage.onFrame((now, dtMs) => {
 	const seen = new Set<string>();
 	let me: { at: Vector3; hp: number; dead: boolean } | undefined;
 	let stats: PitFields | undefined;
+	const loopStart = performance.now();
+	updateFrustum();
+	let drawn = 0;
+	let culled = 0;
 	for (const entity of rendered) {
 		if (isPit(entity)) {
 			if (entity.zoneId === here) stats = pitFields(entity);
@@ -1414,6 +1460,19 @@ stage.onFrame((now, dtMs) => {
 				else miniDots.push(dot);
 			}
 		}
+		// Off screen (never your own): nothing to place or animate.
+		if (cullOn && !mine && visible) {
+			const f = visual.kind === 'mob' ? mobFields(entity) : playerFields(entity);
+			const lift = visual.kind === 'mob' ? groundAt(entity.zoneId, f.x, f.y) : 'z' in f ? f.z : 0;
+			const radius = visual.kind === 'mob' ? Math.max(TIERS[visual.tier]?.tele ?? 1, 1.5) : ATTACK_REACH;
+			const out = !onScreen(at(f.x, f.y, lift + 1), radius);
+			setCulled(visual, out);
+			if (out) {
+				culled += 1;
+				continue;
+			}
+		} else setCulled(visual, false);
+		drawn += 1;
 		if (visual.kind === 'mob') {
 			const mob = mobFields(entity);
 			const { x, y } = mob;
@@ -1467,6 +1526,9 @@ stage.onFrame((now, dtMs) => {
 			if (mine) me = { at: visual.body.position, hp: player.hp, dead };
 		}
 	}
+	cullStats.drawn = drawn;
+	cullStats.culled = culled;
+	cullStats.loopMs = smooth(cullStats.loopMs, performance.now() - loopStart);
 	for (const [key, visual] of visuals) {
 		if (seen.has(key)) continue;
 		dispose(visual);
@@ -1523,6 +1585,8 @@ stage.onFrame((now, dtMs) => {
 	hud.row('Pending inputs', String(predictor?.pending.length ?? 0));
 	hud.row('Ack seq', String(predictor?.lastAck ?? 0));
 	hud.row('Corrections', `${corrections} (last ${lastCorrection.toFixed(3)} m)`);
+	hud.row('Entities drawn / off screen', `${cullStats.drawn} / ${cullStats.culled}`);
+	hud.row('Frame CPU', `entities ${cullStats.loopMs.toFixed(2)} ms · render ${cullStats.renderMs.toFixed(2)} ms`);
 	hud.row('Ghost gap', ghostGap === undefined ? '—' : `${ghostGap.toFixed(2)} m`);
 	const around = [...pit.neighbours().values()];
 	hud.row('Next door', `${around.filter((s) => s === 'watching').length} rooms watched · ${around.filter((s) => s === 'asleep').length} asleep (not woken)`);

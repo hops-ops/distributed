@@ -292,9 +292,14 @@ export class LabelLayer {
 		const viewport = camera.viewport.toGlobal(width, height);
 		const transform = this.#scene.getTransformMatrix();
 		for (const { el, mesh, offset } of this.#labels.values()) {
+			// Disabled (off screen or hidden): no projection.
+			if (!mesh.isEnabled()) {
+				if (el.style.display !== 'none') el.style.display = 'none';
+				continue;
+			}
 			const world = mesh.getAbsolutePosition().add(new Vector3(0, offset, 0));
 			const p = Vector3.Project(world, Matrix.IdentityReadOnly, transform, viewport);
-			const visible = p.z > 0 && p.z < 1 && mesh.isEnabled();
+			const visible = p.z > 0 && p.z < 1;
 			el.style.display = visible ? '' : 'none';
 			if (visible) el.style.transform = `translate(${p.x * scale}px, ${p.y * scale}px) translate(-50%, -100%)`;
 		}
