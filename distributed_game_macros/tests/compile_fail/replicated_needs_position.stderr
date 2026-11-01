@@ -1,0 +1,5 @@
+error: a non-global kind needs a position: name fields `x` and `y`, point at them with #[replicated(x = .., y = ..)], or mark the kind `global`
+ --> tests/compile_fail/replicated_needs_position.rs:5:8
+  |
+5 | struct ScoreView {
+  |        ^^^^^^^^^

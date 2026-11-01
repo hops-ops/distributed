@@ -16,7 +16,7 @@ Optional profile:
 
 ```sh
 cd tests/e2e-ui
-make up-celld-nats     # celld 0.4 local store + Queue relay + NATS
+make up-celld-nats     # celld local store + Queue relay + NATS
 make test-celld        # live --test celld + GraphQL wait-path smoke (CI)
 make test-celld-nats   # GraphQL wait-path smoke + SQL list only
 make down-celld-nats   # NATS only
@@ -45,7 +45,7 @@ GraphQL, `@live`, and Eventual projectors are **not** cell class methods
 
 ## Bring-up (local only)
 
-celld 0.4 runs through its CLI and keeps the object store under
+celld runs through its CLI and keeps the object store under
 `tests/celld/worker/.celld/dev`. The Make target first registers the separate
 Queue consumer in that store, then serves the aggregate Worker. NATS is the
 only Docker service in this optional profile.
@@ -56,7 +56,13 @@ make up-celld-nats
 make test-celld-nats
 ```
 
-Override ports if busy: `CELLD_HTTP_PORT=18880 NATS_PORT=14223 make up-celld-nats`.
+celld listens on 18880 by default; 18080 belongs to Zitadel's edge from
+`make up`, so both stacks run side by side. Override ports if busy:
+`CELLD_HTTP_PORT=18881 NATS_PORT=14223 make up-celld-nats`.
+
+The celld version is pinned in `/.celld-version` (currently 0.6.2) and
+checked by `scripts/celld.sh`. To keep an older `celld` on PATH, point the
+profile at the pinned binary: `CELLD_BIN=/path/to/celld make up-celld-nats`.
 If `14222` is already taken by a leftover `docker run` NATS, `make down-celld-nats` removes that container too.
 
 The relevant manual commands are:
@@ -70,13 +76,13 @@ The relevant manual commands are:
 # Register the Queue-only deployment, stop that dev listener, then serve the
 # aggregate project from the same local store. Use make up-celld-nats for the
 # complete, guarded lifecycle.
-celld dev tests/celld/worker/relay.wrangler.jsonc --port 18080 --logs
-celld dev tests/celld/worker --port 18080 --logs
+celld dev tests/celld/worker/relay.wrangler.jsonc --port 18880 --logs
+celld dev tests/celld/worker --port 18880 --logs
 
 # NATS for this optional profile only
 docker compose -f tests/e2e-ui/celld-nats-profile/docker-compose.yml up -d
 
-export CELLD_URL=http://127.0.0.1:${CELLD_HTTP_PORT:-18080}
+export CELLD_URL=http://127.0.0.1:${CELLD_HTTP_PORT:-18880}
 export NATS_URL=nats://127.0.0.1:${NATS_PORT:-14222}
 
 cargo test --test e2e_ui_celld_nats_profile --features graphql,http,sqlite

@@ -1,0 +1,5 @@
+error: every event variant needs #[game_event(id = N)] (a stable u32 type id)
+ --> tests/compile_fail/event_missing_id.rs:7:5
+  |
+7 |     Bye,
+  |     ^^^

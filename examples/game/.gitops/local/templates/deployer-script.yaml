@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mobpit-worker-deployer
+  namespace: {{ .Values.environment.namespace }}
+  labels:
+    {{- include "mobpit.labels" . | nindent 4 }}
+data:
+  deploy.sh: |
+    set -euo pipefail
+    export PATH="/tools:$PATH"
+    npm install --silent --no-audit --no-fund --prefix /tmp/esbuild "esbuild@$ESBUILD_VERSION"
+    export CELLD_ESBUILD=/tmp/esbuild/node_modules/.bin/esbuild
+    last=""
+    while true; do
+      # The build's outputs and the worker config; empty until built.
+      # A failed read (missing build, host share I/O error) skips the round.
+      if ! stamp="$(stat -c '%n %Y %s' "$CELLS/wrangler.jsonc" "$CELLS"/build/worker/* "$CELLS"/build/*.wasm "$CELLS"/build/*.js | sha256sum)"; then
+        sleep 3
+        continue
+      fi
+      if [ -f "$CELLS/build/worker/shim.mjs" ] && [ "$stamp" != "$last" ]; then
+        rm -rf /tmp/worker && mkdir -p /tmp/worker
+        if ! cp -R "$CELLS/build" /tmp/worker/build ||
+          ! node /deployer/wrangler.mjs "$CELLS/wrangler.jsonc" /tmp/worker/wrangler.json; then
+          echo "reading the build failed; retrying" >&2
+          sleep 3
+          continue
+        fi
+        echo "deploying the cells worker to $BUCKET"
+        if celld deploy /tmp/worker --bucket "$BUCKET"; then
+          last="$stamp"
+        else
+          echo "deploy failed; retrying" >&2
+          sleep 10
+          continue
+        fi
+      fi
+      sleep 3
+    done
+  wrangler.mjs: |
+    // The worker config with this Environment's vars (secrets stay out of
+    // the checkout: they are inlined only into the deployed copy).
+    import { readFileSync, writeFileSync } from 'node:fs';
+    const [source, target] = process.argv.slice(2);
+    const text = readFileSync(source, 'utf8')
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('//'))
+      .join('\n');
+    const config = JSON.parse(text);
+    for (const key of ['DISTRIBUTED_INTERNAL_SECRET', 'GAME_TICKET_SECRET', 'CELLD_QUEUE_RELAY_URL', 'CELLD_QUEUE_RELAY_MESH', 'ZONE_MAX_PLAYERS']) {
+      if (process.env[key]) config.vars[key] = process.env[key];
+    }
+    writeFileSync(target, JSON.stringify(config));

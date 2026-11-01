@@ -1,0 +1,5 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/replicated_from_wrong_type.rs:20:5
+   |
+20 |     #[from]
+   |     ^ expected `u8`, found `i32`

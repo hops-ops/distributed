@@ -1,10 +1,19 @@
 //! Cell-local execution of the ordinary SQL event/snapshot/receipt repository.
 //! No in-memory working copy and no whole-cell export are used here.
+//!
+//! Runs over Durable Object `storage.sql` (celld, `workers-rs`/wasm32): the
+//! executor supplies only `read` and a synchronous all-or-nothing
+//! `transaction`; schema bootstrap, the command commit, ledger fencing and
+//! outbox leases are below.
+
+use std::future::Future;
+use std::task::{Context, Poll, Waker};
 
 use sha2::{Digest, Sha256};
+#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
 use worker::State;
 
-use super::sql_executor::{finish_sql, CellSqlConnection};
+use super::sql_executor::CellSqlConnection;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalStorageIdentity, CausalTransactionalCommit, CommandCompletion, CommandLedgerError,
@@ -22,9 +31,30 @@ use crate::repository::{
 };
 use crate::snapshot::SnapshotRecord;
 
+use super::alarm::{ArmedSchedule, ScheduleSettlement};
+
 // Durable Object SQL limits bindings per statement, not per transaction.
 // Both shared insert planners split large commands within the same transaction.
 const MAX_SQL_BIND_PARAMS: usize = 100;
+
+/// Shared SQL operations are async for SQLx, but every call through a cell
+/// executor completes synchronously. Refuse accidental async work; never spin
+/// or let a pending future outlive the transaction callback.
+pub(super) fn finish_sql<T, E: From<RepositoryError>>(
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let mut future = std::pin::pin!(future);
+    match future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    {
+        Poll::Ready(result) => result,
+        Poll::Pending => Err(RepositoryError::Model(
+            "cell SQL transaction attempted to await asynchronous work".into(),
+        )
+        .into()),
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct CellSqlRepository {
@@ -33,8 +63,17 @@ pub(super) struct CellSqlRepository {
 }
 
 impl CellSqlRepository {
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
     pub fn from_state(state: State) -> Result<Self, RepositoryError> {
         let connection = CellSqlConnection::from_state(state)?;
+        Self::initialize(&connection)?;
+        Ok(Self {
+            connection,
+            identity: CausalStorageIdentity::new(),
+        })
+    }
+
+    fn initialize(connection: &CellSqlConnection) -> Result<(), RepositoryError> {
         connection.transaction(|executor| finish_sql(async {
             let tables = executor.query(Statement::new("SELECT name FROM sqlite_master WHERE type = 'table'")).await?;
             let tables = tables.iter().map(|row| row.text("name")).collect::<Result<Vec<_>, _>>()?;
@@ -66,11 +105,7 @@ impl CellSqlRepository {
                     .bind(migration.version.into()).sql(", ").bind(checksum.as_str().into()).sql(")")).await?;
             }
             Ok::<_, RepositoryError>(())
-        }))?;
-        Ok(Self {
-            connection,
-            identity: CausalStorageIdentity::new(),
-        })
+        }))
     }
 
     fn commit(
@@ -85,6 +120,7 @@ impl CellSqlRepository {
             ));
         }
         let prepared = validate_commit_batch(&batch)?;
+        super::alarm::validate_schedule_writes(&batch.schedules)?;
         self.connection.transaction(|executor| {
             finish_sql(async {
                 if let Some(completion) = &completion {
@@ -130,6 +166,13 @@ impl CellSqlRepository {
                     let SnapshotWrite::Save { identity, record } = snapshot;
                     sql::save_snapshot(executor, identity, record).await?;
                 }
+                // Alarm rows join the same transaction: a failed command (or a
+                // lost ledger lease below) leaves no alarm armed.
+                if !batch.schedules.is_empty() {
+                    alarms::apply(executor, &batch.schedules).await?;
+                }
+                // Native sealed read-model row: same transaction, so a reducer
+                // error or lost ledger lease rolls the row back with the events.
                 // Same final fenced write as SQLx. A lost lease rolls back every
                 // participant, and entities are marked committed only afterwards.
                 if let Some(completion) = &completion {
@@ -145,27 +188,57 @@ impl CellSqlRepository {
     }
 }
 
+impl CellSqlRepository {
+    /// Armed alarms, earliest first.
+    pub(super) fn armed_alarms(&self) -> Result<Vec<ArmedSchedule>, RepositoryError> {
+        self.connection
+            .read(|executor| finish_sql(alarms::armed(executor, None, usize::MAX)))
+    }
+
+    /// Armed alarms due at or before `now_ms`, earliest first.
+    pub(super) fn due_alarms(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<ArmedSchedule>, RepositoryError> {
+        self.connection
+            .read(|executor| finish_sql(alarms::armed(executor, Some(now_ms), limit)))
+    }
+
+    /// Due time of the earliest armed alarm.
+    pub(super) fn next_alarm_due_ms(&self) -> Result<Option<i64>, RepositoryError> {
+        self.connection
+            .read(|executor| finish_sql(alarms::next_due(executor)))
+    }
+
+    /// Settle the fired generation of `name`; a newer arm is left untouched.
+    pub(super) fn settle_alarm(
+        &self,
+        name: &str,
+        generation: u64,
+        settlement: &ScheduleSettlement,
+    ) -> Result<(), RepositoryError> {
+        self.connection.transaction(|executor| {
+            finish_sql(alarms::settle(executor, name, generation, settlement))
+        })
+    }
+}
+
 impl GetStream for CellSqlRepository {
     async fn get_stream(
         &self,
         identity: &StreamIdentity,
     ) -> Result<Option<Entity>, RepositoryError> {
-        finish_sql(sql::load_stream(
-            &mut self.connection.executor(),
-            identity,
-            None,
-        ))
+        self.connection
+            .read(|executor| finish_sql(sql::load_stream(executor, identity, None)))
     }
     async fn get_stream_tail(
         &self,
         identity: &StreamIdentity,
         after_version: u64,
     ) -> Result<Option<Entity>, RepositoryError> {
-        finish_sql(sql::load_stream(
-            &mut self.connection.executor(),
-            identity,
-            Some(after_version),
-        ))
+        self.connection
+            .read(|executor| finish_sql(sql::load_stream(executor, identity, Some(after_version))))
     }
 }
 impl CausalGetStream for CellSqlRepository {
@@ -189,10 +262,8 @@ impl SnapshotStore for CellSqlRepository {
         &self,
         identity: &StreamIdentity,
     ) -> Result<Option<SnapshotRecord>, RepositoryError> {
-        finish_sql(sql::load_snapshot(
-            &mut self.connection.executor(),
-            identity,
-        ))
+        self.connection
+            .read(|executor| finish_sql(sql::load_snapshot(executor, identity)))
     }
     async fn save_snapshot(
         &self,
@@ -293,20 +364,22 @@ impl OutboxStore for CellSqlOutboxStore {
         // Match the native no-practical-bound convention within JS's exact
         // integer range; never round a bound crossing the runtime binding.
         let limit = (limit as u64).min(9_007_199_254_740_991) as i64;
-        let rows = finish_sql(
-            self.connection.executor().query(
-                Statement::new("SELECT ")
-                    .sql(crate::repository::sqlite_codec::OUTBOX_SELECT)
-                    .sql(" FROM outbox_messages WHERE status = ")
-                    .bind(status.as_str().into())
-                    .sql(" ORDER BY CAST(created_at AS REAL), message_id LIMIT ")
-                    .bind(limit.into()),
-            ),
-        )?;
+        let rows = self.connection.read(|executor| {
+            finish_sql(
+                executor.query(
+                    Statement::new("SELECT ")
+                        .sql(crate::repository::sqlite_codec::OUTBOX_SELECT)
+                        .sql(" FROM outbox_messages WHERE status = ")
+                        .bind(status.as_str().into())
+                        .sql(" ORDER BY CAST(created_at AS REAL), message_id LIMIT ")
+                        .bind(limit.into()),
+                ),
+            )
+        })?;
         rows.into_iter().map(outbox::from_row).collect()
     }
     async fn backlog_stats(&self) -> Result<OutboxBacklogStats, RepositoryError> {
-        let rows = finish_sql(self.connection.executor().query(Statement::new("SELECT COUNT(*) AS pending, MIN(CAST(created_at AS REAL)) AS oldest FROM outbox_messages WHERE status = 'pending'")))?;
+        let rows = self.connection.read(|executor| finish_sql(executor.query(Statement::new("SELECT COUNT(*) AS pending, MIN(CAST(created_at AS REAL)) AS oldest FROM outbox_messages WHERE status = 'pending'"))))?;
         let row = rows
             .first()
             .ok_or_else(|| RepositoryError::Model("outbox count returned no row".into()))?;
@@ -348,5 +421,145 @@ impl CellSqlOutboxStore {
                 crate::time::now(),
             ))
         })
+    }
+}
+
+/// Cell alarm rows (`cell_alarms`, migration 11). Shared by Durable Object and
+/// native SQLite cells; the reference host mirrors these semantics in memory.
+mod alarms {
+    use super::*;
+    use crate::microsvc::cell_host::alarm::{ScheduleError, ScheduleWrite, MAX_ARMED_SCHEDULES};
+
+    const SELECT: &str =
+        "SELECT name, command, input, due_at_ms, generation, attempts FROM cell_alarms WHERE armed = 1";
+
+    pub(super) async fn apply(
+        executor: &mut impl SqlExecutor,
+        writes: &[ScheduleWrite],
+    ) -> Result<(), RepositoryError> {
+        for write in writes {
+            match write {
+                ScheduleWrite::Arm(alarm) => {
+                    let input = alarm.input_json()?;
+                    executor
+                        .execute(
+                            Statement::new("INSERT INTO cell_alarms (name, command, input, due_at_ms, generation, attempts, armed) VALUES (")
+                                .bind(alarm.name().into())
+                                .sql(", ")
+                                .bind(alarm.command().into())
+                                .sql(", ")
+                                .bind(input.as_str().into())
+                                .sql(", ")
+                                .bind(alarm.due_at_ms()?.into())
+                                .sql(", 1, 0, 1) ON CONFLICT (name) DO UPDATE SET command = excluded.command, input = excluded.input, due_at_ms = excluded.due_at_ms, generation = cell_alarms.generation + 1, attempts = 0, armed = 1"),
+                        )
+                        .await?;
+                }
+                ScheduleWrite::Cancel(name) => {
+                    executor
+                        .execute(
+                            Statement::new(
+                                "UPDATE cell_alarms SET armed = 0, attempts = 0 WHERE name = ",
+                            )
+                            .bind(name.as_str().into()),
+                        )
+                        .await?;
+                }
+            }
+        }
+        let rows = executor
+            .query(Statement::new(
+                "SELECT COUNT(*) AS armed FROM cell_alarms WHERE armed = 1",
+            ))
+            .await?;
+        let armed = rows
+            .first()
+            .map(|row| row.integer("armed"))
+            .transpose()?
+            .unwrap_or(0);
+        if armed > MAX_ARMED_SCHEDULES as i64 {
+            return Err(ScheduleError::TooManyArmed.into());
+        }
+        Ok(())
+    }
+
+    pub(super) async fn armed(
+        executor: &mut impl SqlExecutor,
+        due_by_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ArmedSchedule>, RepositoryError> {
+        let limit = (limit as u64).min(9_007_199_254_740_991) as i64;
+        let mut statement = Statement::new(SELECT);
+        if let Some(due_by_ms) = due_by_ms {
+            statement = statement.sql(" AND due_at_ms <= ").bind(due_by_ms.into());
+        }
+        let rows = executor
+            .query(
+                statement
+                    .sql(" ORDER BY due_at_ms, name LIMIT ")
+                    .bind(limit.into()),
+            )
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let input = row.text("input")?;
+                Ok(ArmedSchedule {
+                    name: row.text("name")?,
+                    command: row.text("command")?,
+                    input: serde_json::from_str(&input).map_err(|error| {
+                        RepositoryError::Model(format!("cell alarm input is invalid JSON: {error}"))
+                    })?,
+                    due_at_ms: row.integer("due_at_ms")?,
+                    generation: u64::try_from(row.integer("generation")?).map_err(|_| {
+                        RepositoryError::Model("cell alarm generation is negative".into())
+                    })?,
+                    attempts: u32::try_from(row.integer("attempts")?).unwrap_or(u32::MAX),
+                })
+            })
+            .collect()
+    }
+
+    pub(super) async fn next_due(
+        executor: &mut impl SqlExecutor,
+    ) -> Result<Option<i64>, RepositoryError> {
+        let rows = executor
+            .query(Statement::new(
+                "SELECT MIN(due_at_ms) AS due FROM cell_alarms WHERE armed = 1",
+            ))
+            .await?;
+        Ok(rows
+            .first()
+            .map(|row| row.optional_integer("due"))
+            .transpose()?
+            .flatten())
+    }
+
+    pub(super) async fn settle(
+        executor: &mut impl SqlExecutor,
+        name: &str,
+        generation: u64,
+        settlement: &ScheduleSettlement,
+    ) -> Result<(), RepositoryError> {
+        let generation = i64::try_from(generation)
+            .map_err(|_| RepositoryError::Model("cell alarm generation overflow".into()))?;
+        let statement = match settlement {
+            ScheduleSettlement::Done => {
+                Statement::new("UPDATE cell_alarms SET armed = 0, attempts = 0 WHERE name = ")
+            }
+            ScheduleSettlement::Retry { due_at_ms } => {
+                Statement::new("UPDATE cell_alarms SET attempts = attempts + 1, due_at_ms = ")
+                    .bind((*due_at_ms).into())
+                    .sql(" WHERE name = ")
+            }
+        };
+        executor
+            .execute(
+                statement
+                    .bind(name.into())
+                    .sql(" AND armed = 1 AND generation = ")
+                    .bind(generation.into()),
+            )
+            .await?;
+        Ok(())
     }
 }

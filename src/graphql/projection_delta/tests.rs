@@ -1097,6 +1097,7 @@ fn wait_path_sealing_retains_event_obligations_and_status_stays_pending_without_
 
     let (protocol, contract, event) = wait_path_fixture();
     let result = CausalDispatchResult {
+        replayed: false,
         payload: json!({"accepted": true}),
         receipt: CausalCommandReceiptSource {
             command_id: "wait-path-command".into(),
@@ -1170,6 +1171,7 @@ fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity(
 
     let (protocol, contract, event) = wait_path_fixture();
     let result = CausalDispatchResult {
+        replayed: false,
         payload: json!({"accepted": true}),
         receipt: CausalCommandReceiptSource {
             command_id: "wait-path-identity-command".into(),
@@ -1448,6 +1450,7 @@ fn wait_path_sealing_keeps_atomic_and_unselected_commands_without_metadata() {
                       events: Vec<crate::OutboxMessage>|
      -> CausalDispatchResult {
         CausalDispatchResult {
+            replayed: false,
             payload: json!({"accepted": true}),
             receipt: CausalCommandReceiptSource {
                 command_id: "wait-path-bypass".into(),

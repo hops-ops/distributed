@@ -1,0 +1,5 @@
+# Syntax-only read-model mutation → MutationProgram IR (not a public field).
+# The row is the lease's post-transition `ZoneLeaseStatus`.
+mutation SaveZoneLease {
+  upsert_zone_leases(object: $input.lease)
+}

@@ -14,6 +14,10 @@ pub struct SqlxRepository<DB: sqlx::Database> {
     pub(super) notify_enabled: bool,
     pub(super) projection_change_retention: ProjectionChangeRetention,
     pub(super) causal_storage_identity: CausalStorageIdentity,
+    /// A [`ScheduleWorker`](crate::schedule::worker::ScheduleWorker) was
+    /// attached (`with_schedule_worker`): routes may require
+    /// [`Capability::Scheduling`](crate::schedule::Capability::Scheduling).
+    pub(super) schedule_dispatch: bool,
 }
 
 impl<DB: sqlx::Database> Clone for SqlxRepository<DB> {
@@ -25,6 +29,7 @@ impl<DB: sqlx::Database> Clone for SqlxRepository<DB> {
             notify_enabled: self.notify_enabled,
             projection_change_retention: self.projection_change_retention,
             causal_storage_identity: self.causal_storage_identity,
+            schedule_dispatch: self.schedule_dispatch,
         }
     }
 }
@@ -62,6 +67,7 @@ where
             notify_enabled: true,
             projection_change_retention: ProjectionChangeRetention::default(),
             causal_storage_identity: CausalStorageIdentity::new(),
+            schedule_dispatch: false,
         }
     }
 

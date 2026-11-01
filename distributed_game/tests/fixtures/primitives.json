@@ -1,0 +1,138 @@
+{
+  "cases": [
+    {
+      "hex": "00",
+      "kind": "varuint",
+      "value": 0
+    },
+    {
+      "hex": "01",
+      "kind": "varuint",
+      "value": 1
+    },
+    {
+      "hex": "7f",
+      "kind": "varuint",
+      "value": 127
+    },
+    {
+      "hex": "8001",
+      "kind": "varuint",
+      "value": 128
+    },
+    {
+      "hex": "ac02",
+      "kind": "varuint",
+      "value": 300
+    },
+    {
+      "hex": "808001",
+      "kind": "varuint",
+      "value": 16384
+    },
+    {
+      "hex": "ffffffff0f",
+      "kind": "varuint",
+      "value": 4294967295
+    },
+    {
+      "hex": "00",
+      "kind": "varint",
+      "value": 0
+    },
+    {
+      "hex": "01",
+      "kind": "varint",
+      "value": -1
+    },
+    {
+      "hex": "02",
+      "kind": "varint",
+      "value": 1
+    },
+    {
+      "hex": "7f",
+      "kind": "varint",
+      "value": -64
+    },
+    {
+      "hex": "8001",
+      "kind": "varint",
+      "value": 64
+    },
+    {
+      "hex": "ffffffff0f",
+      "kind": "varint",
+      "value": -2147483648
+    },
+    {
+      "hex": "feffffff0f",
+      "kind": "varint",
+      "value": 2147483647
+    },
+    {
+      "hex": "0000c03f",
+      "kind": "f32",
+      "value": {
+        "bits": "3fc00000",
+        "f32": 1.5
+      }
+    },
+    {
+      "hex": "00000080",
+      "kind": "f32",
+      "value": {
+        "bits": "80000000",
+        "f32": -0.0
+      }
+    },
+    {
+      "hex": "db0f4940",
+      "kind": "f32",
+      "value": {
+        "bits": "40490fdb",
+        "f32": 3.1415927410125732
+      }
+    },
+    {
+      "hex": "00000000004a9340",
+      "kind": "f64",
+      "value": 1234.5
+    },
+    {
+      "hex": "9a9999999999b93f",
+      "kind": "f64",
+      "value": 0.1
+    },
+    {
+      "hex": "00",
+      "kind": "string",
+      "value": ""
+    },
+    {
+      "hex": "00",
+      "kind": "short_string",
+      "value": ""
+    },
+    {
+      "hex": "026869",
+      "kind": "string",
+      "value": "hi"
+    },
+    {
+      "hex": "026869",
+      "kind": "short_string",
+      "value": "hi"
+    },
+    {
+      "hex": "0668c3a9726f73",
+      "kind": "string",
+      "value": "héros"
+    },
+    {
+      "hex": "0668c3a9726f73",
+      "kind": "short_string",
+      "value": "héros"
+    }
+  ]
+}

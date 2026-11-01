@@ -1,9 +1,0 @@
-apiVersion: pkg.crossplane.io/v1
-kind: Provider
-metadata:
-  name: crossplane-contrib-provider-kubernetes
-spec:
-  # Renovate: github-releases crossplane-contrib/provider-kubernetes (cli/renovate.json)
-  package: xpkg.crossplane.io/crossplane-contrib/provider-kubernetes:v1.2.1
-  runtimeConfigRef:
-    name: local-dev-kubernetes

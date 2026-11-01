@@ -1,0 +1,5 @@
+apiVersion: v2
+name: mobpit-local
+description: Mob Pit on Hops local (source-mounted dev workload); rooms on the mobpit-system celld fleet.
+type: application
+version: 0.1.0

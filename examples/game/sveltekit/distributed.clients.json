@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "clients": [
+    {
+      "module": "$distributed",
+      "surface": "mobpit",
+      "documents": ["src/lib/pit/*.graphql"],
+      "output": "src/lib/generated/distributed"
+    }
+  ]
+}

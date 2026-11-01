@@ -1,0 +1,80 @@
+name: Game demos smoke
+
+# Reusable workflow: referenced via `uses: ./.github/workflows/integration-game-demos.yaml`.
+# `examples/game` is outside the root workspace, so nothing else runs its tests:
+# generated clients current (`gen --check`), demo server fmt/clippy/tests
+# (incl. the mobpit_service projection test), client type-check, build and
+# headless tests, and the SvelteKit demo end to end: `distributed build
+# examples/game/server` (GraphQL client, svelte-check, vite build), then
+# Playwright against the production build, a real Mob Pit server and the real
+# mobpit-service read model. Mob Pit's rooms and durable cells run on celld:
+# the tests start their own `celld dev` (CELLD_BIN, pinned in
+# /.celld-version) serving examples/game/cells, built with worker-build; the
+# SvelteKit Playwright test runs the rooms on a 3-node fleet (RustFS via
+# docker compose and the aws CLI, both on the runner; required here).
+on:
+  workflow_call:
+
+jobs:
+  game-demos:
+    name: Game demos smoke (examples/game)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    # The shared ticket rate limiter's Lua script and the leaderboard store
+    # (conformance suite, projector, GraphQL boards) run against a real Redis.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+          # Predicted steps and pure functions compile to WebAssembly.
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: |
+            js/package-lock.json
+            examples/game/client/package-lock.json
+            examples/game/sveltekit/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            examples/game/server -> target
+            examples/game/cells -> target
+          shared-key: game-demos
+      - name: Install celld (pinned) and worker-build
+        run: |
+          scripts/celld.sh install
+          echo "CELLD_BIN=$HOME/.local/bin/celld" >> "$GITHUB_ENV"
+          cargo install worker-build --locked
+      - name: Install SvelteKit demo dependencies and Chromium
+        working-directory: examples/game/sveltekit
+        run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
+      - name: Run examples/game smoke
+        env:
+          # The SvelteKit leaderboard is the Redis board (GraphQL board roots).
+          REDIS_URL: redis://127.0.0.1:6379
+          MOBPIT_FLEET_REQUIRED: "1"
+        run: examples/game/run.sh smoke
+      - name: Leaderboard conformance and GraphQL boards against real Redis
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+        run: cargo test --features redis,graphql,sqlite --test redis_leaderboard -- --nocapture
+      - name: Ticket rate limiter against real Redis
+        working-directory: js
+        env:
+          DISTRIBUTED_REDIS_E2E: "1"
+          REDIS_URL: redis://127.0.0.1:6379
+        run: node --test tests/sveltekit-game-rate-limit.test.mjs

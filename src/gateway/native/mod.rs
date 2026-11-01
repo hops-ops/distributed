@@ -126,6 +126,8 @@ pub enum NativeBinding {
         /// Whether this target may negotiate a WebSocket upgrade.
         websocket: bool,
     },
+    /// Configured zone host; WebSocket upgrades are always allowed.
+    Zones,
     /// Bounded, preloaded static inventory; no request-selected filesystem I/O.
     Assets(StaticAssets),
     /// Named route admission policy.
@@ -186,6 +188,7 @@ impl NativeGateway {
                 (&declaration.kind, &binding),
                 (BindingKind::Handler, NativeBinding::Handler(_))
                     | (BindingKind::UiProxy { .. }, NativeBinding::UiProxy { .. })
+                    | (BindingKind::Zones { .. }, NativeBinding::Zones)
                     | (BindingKind::Assets, NativeBinding::Assets(_))
                     | (BindingKind::Admission, NativeBinding::Admission(_))
             );
@@ -235,7 +238,9 @@ impl NativeGateway {
             if !compatible {
                 return Err(GatewayError("incompatible native binding"));
             }
-            if let BindingKind::UiProxy { origin: upstream } = &declaration.kind {
+            if let BindingKind::UiProxy { origin: upstream }
+            | BindingKind::Zones { origin: upstream } = &declaration.kind
+            {
                 let upstream =
                     Url::parse(upstream).map_err(|_| GatewayError("invalid upstream"))?;
                 if upstream.origin() == origin.origin() {
@@ -418,6 +423,12 @@ impl GatewayAdapter for NativeGateway {
                     return response(StatusCode::SERVICE_UNAVAILABLE);
                 };
                 proxy::forward(&self.0, origin, *websocket, context, request).await
+            }
+            NativeBinding::Zones => {
+                let BindingKind::Zones { origin } = &selected.binding().kind else {
+                    return response(StatusCode::SERVICE_UNAVAILABLE);
+                };
+                proxy::forward(&self.0, origin, true, context, request).await
             }
             #[cfg(feature = "gateway-graphql-native")]
             NativeBinding::Graphql(binding) => {

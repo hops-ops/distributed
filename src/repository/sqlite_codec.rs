@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) const EVENT_SELECT: &str = "event_name, event_version, payload, payload_codec, payload_codec_version, metadata, sequence, recorded_at";
 pub(crate) const SNAPSHOT_SELECT: &str = "aggregate_type, aggregate_id, version, snapshot_version, payload, payload_codec, payload_codec_version, metadata, recorded_at";
-pub(crate) const OUTBOX_SELECT: &str = "message_id, event_type, payload, payload_codec, payload_codec_version, metadata, status, created_at, claimed_by, claimed_until, attempts, last_error, destination, source_aggregate_type, source_aggregate_id, source_sequence, correlation_id, causation_id";
+pub(crate) const OUTBOX_SELECT: &str = "message_id, event_type, payload, payload_codec, payload_codec_version, metadata, status, created_at, claimed_by, claimed_until, attempts, last_error, destination, source_aggregate_type, source_aggregate_id, source_sequence, correlation_id, causation_id, next_available_at";
 
 pub(crate) fn encode(timestamp: SystemTime) -> Result<String, RepositoryError> {
     let duration = timestamp.duration_since(UNIX_EPOCH).map_err(|error| {

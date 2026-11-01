@@ -55,4 +55,4 @@ compose-down:
 
 ## Read-only aggregate contract lifecycle check (never writes tracked files).
 contracts-check:
-	$(CARGO) run -p distributed_cli --quiet -- contracts check --root . --catalog contracts/catalog.json --output human
+	$(CARGO) run -p distributed_cli --quiet -- contracts check --root . --catalog distributed.contracts.json --output human

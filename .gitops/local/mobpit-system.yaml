@@ -1,0 +1,19 @@
+apiVersion: hops.local/v1alpha1
+kind: Environment
+metadata:
+  name: mobpit-system
+spec:
+  # Shared by the Mob Pit Environments on the machine Cluster: the celld
+  # fleet (CelldStack with RustFS, namespace mobpit-celld) and the CA the
+  # fleet trusts for its HTTPS outbox relay. Off until
+  # `hops local env enable mobpit-system`.
+  scope: cluster
+  clusterRef:
+    name: hops
+  namespace: mobpit-system
+  root: examples/game
+  setup:
+    - path: examples/game/scripts/hops/mobpit-system-setup.sh
+  deploys:
+    - path: .gitops/mobpit-system
+      type: k8s

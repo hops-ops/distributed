@@ -10,16 +10,31 @@
     "noEmit": true,
     "outDir": "./dist-type-tests",
     "paths": {
-      "@hops-ops/distributed/replica": ["./src/replica/index.ts"],
-      "@hops-ops/distributed/replica/lazy": ["./src/replica/lazy.ts"],
-      "@hops-ops/distributed/react": ["./src/react/index.ts"],
-      "@hops-ops/distributed/sveltekit": ["./src/sveltekit/index.ts"],
-      "@hops-ops/distributed/sveltekit/vite": ["./src/sveltekit/vite.ts"]
+      "@hops-ops/distributed/replica": [
+        "./src/replica/index.ts"
+      ],
+      "@hops-ops/distributed/replica/lazy": [
+        "./src/replica/lazy.ts"
+      ],
+      "@hops-ops/distributed/react": [
+        "./src/react/index.ts"
+      ],
+      "@hops-ops/distributed/sveltekit": [
+        "./src/sveltekit/index.ts"
+      ],
+      "@hops-ops/distributed/sveltekit/vite": [
+        "./src/sveltekit/vite.ts"
+      ],
+      "@hops-ops/distributed/game": [
+        "./src/game/index.ts"
+      ]
     },
-    "rootDir": ".."
+    "rootDir": "..",
+    "allowImportingTsExtensions": true
   },
   "include": [
     "../distributed_cli/tests/fixtures/generated-*.ts",
+    "../distributed_cli/tests/fixtures/game-client/**/*.ts",
     "type-tests/**/*.ts"
   ]
 }

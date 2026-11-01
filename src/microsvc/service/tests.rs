@@ -13,6 +13,8 @@ use crate::command::{typed_command, PreparedCommand, Succeeded};
 use crate::command::{Atomic, CommandConsistency};
 use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
 #[cfg(feature = "graphql")]
+use crate::command_dispatch::SharedCommandHost;
+#[cfg(feature = "graphql")]
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey, CommandLedgerState,
@@ -20,15 +22,13 @@ use crate::command_ledger::{
     ExternalCommandCompletion, ReservationOutcome,
 };
 #[cfg(feature = "graphql")]
-use crate::command_dispatch::SharedCommandHost;
-#[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
 #[cfg(feature = "graphql")]
 use crate::graphql::{SurfaceDirectProjection, SurfaceProjector};
 #[cfg(feature = "graphql")]
-use crate::microsvc::HasOutboxStore;
-#[cfg(feature = "graphql")]
 use crate::microsvc::cell_host::{CelldCommandHost, InternalHttpSecret};
+#[cfg(feature = "graphql")]
+use crate::microsvc::HasOutboxStore;
 use crate::microsvc::{
     CommandRequest, Context, HandlerError, RepoReadModelDependencies, Routes, Service, Session,
 };
@@ -1056,6 +1056,21 @@ impl CommandLedgerStore for AmbiguousCommitRepository {
 }
 
 #[cfg(feature = "graphql")]
+impl crate::microsvc::BackendHost for AmbiguousCommitRepository {
+    fn capabilities(&self) -> crate::schedule::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn host_now(
+        &self,
+    ) -> impl std::future::Future<Output = Result<std::time::SystemTime, crate::RepositoryError>>
+           + Send
+           + '_ {
+        self.inner.host_now()
+    }
+}
+
+#[cfg(feature = "graphql")]
 impl crate::repository::TransactionalCommit for AmbiguousCommitRepository {
     fn commit_batch<'a>(
         &'a self,
@@ -1467,7 +1482,9 @@ async fn causal_dispatch_receipt_and_status_use_the_exact_durable_replay() {
         .await
         .expect("response-loss retry should recover the same receipt source");
 
-    assert_eq!(first, replay);
+    assert!(!first.replayed(), "the first dispatch ran the handler");
+    assert!(replay.replayed(), "the retry replays the durable receipt");
+    assert_eq!(first, replay.clone().fresh());
     assert_eq!(first.payload, json!({ "id": "todo-receipt" }));
     assert_eq!(first.receipt.command_id, command_id);
     assert_eq!(first.receipt.state, CommandLedgerState::Succeeded);
@@ -2880,7 +2897,9 @@ async fn graphql_succeeded_status_evaluates_retained_projection_evidence() {
             .len(),
         1
     );
-    assert!(before_celld_envelope["command"].get("observations").is_none());
+    assert!(before_celld_envelope["command"]
+        .get("observations")
+        .is_none());
 
     let pending = repository
         .outbox_store()

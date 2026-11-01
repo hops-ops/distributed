@@ -4,7 +4,7 @@
 **Goal:** Make the same packages easy to run as a monolith or as microservices, with persistence/locks/transports as a separate, boring plane.  
 **Non-goal:** Back-compat aliases or dual public APIs for the same concept.
 
-Related pain today: `tests/e2e-ui/crates/service/src/service.rs` (~projection catalog, surfaces, command walls) and `tests/e2e-ui/crates/runner/src/main.rs` (SQLite/Postgres × API/outbox/consumer wiring).
+Motivating pain (now resolved): e2e-ui once had a single `service.rs` holding the projection catalog, surfaces and command walls, and a runner that hand-wired SQLite/Postgres × API/outbox/consumer. Today the composition root is `tests/e2e-ui/crates/service/src/application.rs` (surfaces, module inventory), infrastructure is `host.rs`, each bounded context is a module under `modules/` (listed by `modules/compose.rs`), and `crates/runner/src/main.rs` is a short entrypoint.
 
 ---
 
@@ -187,7 +187,7 @@ Rough size: **~100–150 lines of product wiring** for logical app + a tiny depl
 3. **Runtime::{sqlite, postgres, in_memory}** — pair repo + locks + bus.  
 4. **ProcessRole** — Full / CommandWriter / EventualProjector / QueryApi spawn policy.  
 5. **Atomic mount checks** — fail closed if Atomic is mounted without write path.  
-6. **Collapse e2e-ui `service.rs` + `runner`** onto the new APIs (no dual/legacy surface).
+6. **Collapse e2e-ui `service.rs` + `runner`** onto the new APIs (no dual/legacy surface). Done: see `application.rs`, `host.rs` and `modules/` in `tests/e2e-ui/crates/service/src/`.
 
 No second application-owned optimism map: projection mutation IR is the source
 of cache effects.

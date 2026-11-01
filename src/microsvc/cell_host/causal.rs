@@ -87,10 +87,9 @@ impl CellCommandIdentity {
         mut self,
         causation_id: impl AsRef<str>,
     ) -> Result<Self, CellDispatchError> {
-        let causation_id = crate::command_ledger::CausationId::parse_stored(
-            causation_id.as_ref().to_string(),
-        )
-        .map_err(internal_ledger_error)?;
+        let causation_id =
+            crate::command_ledger::CausationId::parse_stored(causation_id.as_ref().to_string())
+                .map_err(internal_ledger_error)?;
         self.causation_id = Some(causation_id);
         Ok(self)
     }
@@ -139,6 +138,22 @@ impl CellDispatchResult {
 
     pub fn replayed(&self) -> bool {
         self.replayed
+    }
+
+    /// The standard wait-path response body (`{payload, receipt: {commandId,
+    /// causationId, state, replayed}, events}`) every command host decodes
+    /// (`CausalDispatchResult::from_wait_path_wire`).
+    pub fn wait_path_wire(&self) -> Value {
+        serde_json::json!({
+            "payload": self.payload,
+            "receipt": {
+                "commandId": self.command_id,
+                "causationId": self.causation_id,
+                "state": self.state,
+                "replayed": self.replayed,
+            },
+            "events": self.events,
+        })
     }
 }
 

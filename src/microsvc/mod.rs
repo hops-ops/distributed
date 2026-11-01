@@ -59,7 +59,7 @@ mod causal;
 pub mod cell_host;
 mod context;
 mod dependencies;
-pub(crate) use dependencies::CausalHostProjections;
+pub(crate) use dependencies::{BackendHost, CausalHostProjections};
 mod descriptor;
 mod error;
 pub(crate) mod lifecycle;
@@ -105,9 +105,9 @@ pub use runtime::{DEFAULT_MAX_PUBLISH_ATTEMPTS, DEFAULT_PUBLISH_LEASE};
 #[cfg(all(feature = "graphql", test))]
 pub(crate) use service::CausalCommandProjectionEvidence;
 #[cfg(feature = "graphql")]
-pub use service::GraphqlServiceBindError;
-#[cfg(feature = "graphql")]
 pub(crate) use service::ExternalCausalReservation;
+#[cfg(feature = "graphql")]
+pub use service::GraphqlServiceBindError;
 pub use service::{
     direct_read_model, invoke_transition, require_loaded, CausalCommandContext,
     CausalCommitBuilder, CausalRepository, CommandRequest, CommandResponse, DeliveryKind,

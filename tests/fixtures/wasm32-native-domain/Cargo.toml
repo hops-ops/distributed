@@ -1,0 +1,20 @@
+# Negative fixture for scripts/check-wasm32-domains.sh: a "domain" crate that
+# pulls a native-only dependency (Tokio's `net`). Building it for
+# wasm32-unknown-unknown must fail, which proves the domain check catches
+# native-only dependencies. Never depend on this crate.
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "wasm32-native-domain"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+distributed = { path = "../../..", default-features = false }
+tokio = { version = "1", default-features = false, features = ["net"] }

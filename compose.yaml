@@ -14,6 +14,8 @@
 #     cargo test --test kafka_transport --features kafka
 #   NATS_URL=nats://localhost:4222 \
 #     cargo test --test nats_transport --features nats
+#   REDIS_URL=redis://127.0.0.1:6379 \
+#     cargo test --test redis_leaderboard --features redis
 services:
   postgres:
     image: postgres:18
@@ -71,5 +73,15 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://localhost:8222/healthz || exit 1"]
       interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:8.2-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
       timeout: 5s
       retries: 20

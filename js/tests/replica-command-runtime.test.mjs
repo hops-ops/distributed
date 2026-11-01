@@ -27,6 +27,8 @@ import {
 	TodoModel,
 	todoFrame
 } from './fixtures/adapter-conformance.mjs';
+import { createReplicaIndexedDbPersistence } from '../dist/replica/persistence.js';
+import { FakeIndexedDb } from './fixtures/fake-indexeddb.mjs';
 
 const HASH_A = `sha256:${'a'.repeat(64)}`;
 const HASH_B = `sha256:${'b'.repeat(64)}`;
@@ -3384,4 +3386,67 @@ test('calls made after preload cannot overtake earlier commands waiting for the 
 	await Promise.all([first, second, warm]);
 	assert.deepEqual(requests, [COMMAND_A, COMMAND_B, COMMAND_C]);
 	runtime.dispose();
+});
+
+test('offline outbox: optimistic command waits offline, drains in order and surfaces rejection', async () => {
+	const replica = new TestReplica();
+	const factory = new FakeIndexedDb();
+	const persistence = createReplicaIndexedDbPersistence({
+		indexedDB: factory,
+		databaseName: 'runtime-outbox'
+	});
+	let online = false;
+	const sent = [];
+	const network = {
+		dispatch(request) {
+			sent.push(request.commandId);
+			if (!online) return Promise.reject(new TypeError('Failed to fetch'));
+			return Promise.resolve(
+				request.commandId === COMMAND_B
+					? envelope(request, { state: 'rejected', projection: false, obligations: 0 })
+					: envelope(request, { actualTitle: 'actual-a' })
+			);
+		}
+	};
+	const settled = [];
+	const outbox = persistence.commandOutbox({
+		transport: network,
+		scope: () => replica.scope,
+		policy: { commands: { 'todo.upsert': { durable: true, sensitive: false } } },
+		isOnline: () => online,
+		onSettled: (s) => settled.push([s.commandId, s.outcome])
+	});
+	const runtime = createReplicaCommandRuntime(replica, outbox.transport, {
+		change: artifact()
+	});
+
+	const a = runtime.commands.change({ id: 'todo-1', title: 'preview-a' }, { commandId: COMMAND_A });
+	const b = runtime.commands.change({ id: 'todo-1', title: 'preview-b' }, { commandId: COMMAND_B });
+	const bRejected = assert.rejects(b, { code: 'REPLICA_COMMAND_REJECTED' });
+	assert.equal(replica.record('todo-1').fields.title, 'preview-b', 'optimism applies offline');
+	await tick();
+	await tick();
+	assert.deepEqual(sent, [], 'nothing was sent while offline');
+	assert.deepEqual(
+		(await outbox.pending()).map((p) => p.commandId),
+		[COMMAND_A],
+		'same-record dispatch order: B waits behind A inside the runtime'
+	);
+
+	online = true;
+	const first = await outbox.drain();
+	assert.deepEqual(first.settled.map((s) => [s.commandId, s.outcome]), [[COMMAND_A, 'accepted']]);
+	const receipt = await a;
+	assert.equal(receipt.commandId, COMMAND_A);
+	// B is enqueued once A settles and drains automatically while online.
+	await bRejected;
+	assert.deepEqual(sent, [COMMAND_A, COMMAND_B]);
+	assert.deepEqual(settled, [
+		[COMMAND_A, 'accepted'],
+		[COMMAND_B, 'rejected']
+	]);
+	assert.equal(replica.record('todo-1').fields.title, 'actual-a', 'rejected layer rolled back');
+	assert.equal(factory.store('runtime-outbox', 'command-outbox').size, 0);
+	runtime.dispose();
+	persistence.close();
 });

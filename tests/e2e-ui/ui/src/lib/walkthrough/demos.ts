@@ -38,18 +38,22 @@ const hostAndRunnerSamples: WalkthroughSample[] = [
 		code: `// host.rs — library API used by the runner binary
 pub async fn run(
   database_url: &str,
-  options: HostOptions, // bind + IdentityConfig
+  options: HostOptions, // bind, identity, origins, gateway delivery
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-  // Connect SQLite or Postgres. Create tables. Open the bus.
-  let service = build_service(repo, locks, read_models).with_bus(bus);
-  let gql = build_graphql_engine(&repo, &service, identity, Some(change_rx))?;
+  // postgres:// → run_postgres, else run_sqlite. Each one:
+  // connect, create tables, open the bus.
+  let service = build_service(repo.clone(), locks.clone(), repo.clone())
+    .with_bus(bus);
+  let gql = build_graphql_engine_with_delivery(
+    &repo, &service, options.identity.clone(), Some(change_rx), versions,
+  )?;
   let service = Arc::new(service.try_with_graphql(gql)?);
 
-  spawn_outbox_publish_loop(/* … */);
-  spawn_service_consumer_loop(|| build_service(/* … */).with_bus(bus));
-  // Optional Zitadel scrape loop.
+  spawn_outbox_publish_loop(/* outbox → bus */);
+  spawn_service_consumer_loop(move || build_service(/* … */).with_bus(bus));
+  spawn_zitadel_scrape(repo.clone()); // only when Zitadel env is set
 
-  serve_with_oidc(service, identity, &options.bind).await
+  serve(service, &options).await
 }`
 	},
 	{
@@ -66,6 +70,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     HostOptions {
       bind,
       identity: identity_from_env(), // OidcBearer or DevHeaders
+      public_origin: env::var("PUBLIC_ORIGIN")
+        .unwrap_or_else(|_| "http://localhost:8791".into()),
+      ui_origin: env::var("UI_INTERNAL_ORIGIN")
+        .unwrap_or_else(|_| "http://localhost:5180".into()),
+      delivery, // GATEWAY_DELIVERY=none|all
     },
   )
   .await
@@ -79,7 +88,7 @@ export const todosWalkthrough: DemoWalkthrough = {
 	title: 'Todos',
 	kicker: 'Query, then command, then domain, then projection',
 	summary:
-		'This page loads one GraphQL query into the client replica. Todo commands are Eventual. The client shows a safe preview from the command input and the domain transition. The event handler applies the same mutation program later. The client waits for projection obligations. The client does not wait for a response row. The same portable_command! declarations mount on a local Service (tests/e2e-ui) or wait-dispatch create and complete to a cell (tests/e2e-celld).',
+		'This page loads one GraphQL query into the client replica. Todo commands are Eventual. The client shows a safe preview from the command input and the domain transition. The event handler applies the same mutation program later. The client waits for projection obligations. The client does not wait for a response row. The same portable_command! declarations mount on a local Service (tests/e2e-ui) or wait-dispatch every Todo transition to a cell (tests/e2e-celld).',
 	tabs: [
 {
 			id: 'query',
@@ -157,7 +166,7 @@ await commands.todo.create({ title: text });
 await commands.todo.complete({ todo_id });`
 				},
 				{
-					file: 'todo-domain/src/commands.rs · complete',
+					file: 'todo-domain/src/commands/complete.rs',
 					caption: 'A thin portable command is shard + invoke + Eventual. The host does not write a handler body.',
 					code: `portable_command! {
   name: "todo.complete",
@@ -190,7 +199,7 @@ await commands.todo.complete({ todo_id });`
 			principle: 'A command changes the write model. A table is only for reads.',
 			samples: [
 				{
-					file: 'todo-domain/src/commands.rs · complete (thin)',
+					file: 'todo-domain/src/commands/complete.rs · thin',
 					caption: 'No CausalCommandContext body. The mount loads by shard, invokes the domain, and commits Eventual.',
 					code: `portable_command! {
   name: "todo.complete",
@@ -201,7 +210,7 @@ await commands.todo.complete({ todo_id });`
 }`
 				},
 				{
-					file: 'todo-domain/src/commands.rs · handle_create',
+					file: 'todo-domain/src/commands/create.rs · handle_create',
 					caption: 'Escape hatch: get the principal, create the aggregate, call the domain, commit Eventual.',
 					code: `portable_command! {
   name: "todo.create",
@@ -237,8 +246,10 @@ pub async fn handle_create(
 				{
 					file: 'todo-domain · Todo',
 					caption: 'This aggregate is the consistency boundary for one todo.',
-					code: `#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+					code: `#[derive(Debug, Clone, Default, Serialize, Deserialize, Snapshot)]
+#[snapshot(id = "todo_id")]
 pub struct Todo {
+  #[serde(skip, default)]
   pub entity: Entity,
   pub todo_id: String,
   pub owner_id: String,
@@ -345,7 +356,7 @@ mutation DeleteTodo {
 {
 			id: 'service',
 			label: '6 · Service + host',
-			lede: 'The domain crate is the same on both hosts. `tests/e2e-ui` is one process: SQLite or Postgres, a bus, GraphQL, and Eventual projectors. `tests/e2e-celld` is the same UI and GraphQL process, but Todo create and complete wait-dispatch to a cell (one private SQLite per todo id). GraphQL, `@live`, and projectors are not cell methods. Chat posts also wait-dispatch to a Chat cell on that path; Blob stays in-process.',
+			lede: 'The domain crate is the same on both hosts. `tests/e2e-ui` is one process: SQLite or Postgres, a bus, GraphQL, and Eventual projectors. `tests/e2e-celld` is the same UI and GraphQL process, but every Todo transition wait-dispatches to a cell (one private SQLite per todo id). GraphQL, `@live`, and projectors are not cell methods. Chat posts also wait-dispatch to a Chat cell on that path; Blob stays in-process.',
 			principle: 'Compose modules into one Service. Let the host start the process. Keep the runner small.',
 			samples: [
 				{
@@ -384,26 +395,24 @@ pub const E2E_UI_MODULE_IDS: &[&str] = compose::MODULE_IDS;
 				},
 				...hostAndRunnerSamples,
 				{
-					file: 'e2e-celld · CelldTodoCommandHost',
-					caption: 'The celld example GraphQL process wait-dispatches todo.create and todo.complete to POST {CELLD_URL}/todo/{id}/{command}. Other commands stay local. SQL lists dual-write after the cell wait-path so the page can render.',
-					code: `// tests/e2e-celld — not make run
-impl CommandHost for CelldTodoCommandHost {
-  async fn invoke(&self, command, command_id, input, …) {
-    if command == "todo.create" || command == "todo.complete" {
-      let id = input["todo_id"];
-      HttpCommandHost::new(format!("{celld}/todo/{id}"))
-        .invoke(command, command_id, input, …)
-        .await?;
-      // then local dual-write so Eventual SQL lists fill
-    }
-    self.local.invoke(command, command_id, input, …).await
-  }
+					file: 'e2e-celld · graphql-service/host.rs · celld_command_host',
+					caption: 'The celld example GraphQL process uses the framework `CelldCommandHost`. Each aggregate crate supplies a `CelldRoute`: its commands, the cell kind, the shard, and the GraphQL payload. Every Todo transition goes to POST {CELLD_URL}/todo/{todo_id}/{command}. Commands with no route run on the local Service. The cell outbox reaches the projectors through the celld Queue relay and NATS. There is no dual write.',
+					code: `// tests/e2e-celld/crates/graphql-service/src/host.rs
+CelldCommandHost::new(celld_url, service, internal_secret)?
+  .route(e2e_celld_todo::celld_route())
+  .route(e2e_celld_chat::celld_route())
+
+// tests/e2e-celld/crates/todo-service/src/host.rs
+pub fn celld_route() -> CelldRoute {
+  CelldRoute::new(TODO_CELL_COMMANDS, "todo", todo_shard, graphql_todo_payload)
 }
+// TODO_CELL_COMMANDS: create, rename, complete, reopen,
+// archive, force_archive, purge
 
 // cell class (tests/celld/worker): command HTTP + sealed GET only
 POST /todo/:id/todo.create   { commandId, input }
-POST /todo/:id/todo.complete
-GET  /todo/:id               // sealed row`
+GET  /todo/:id               // sealed row
+// cell outbox → celld Queue → /internal/celld-queue/relay → NATS → projectors`
 				}
 			]
 		}
@@ -524,9 +533,9 @@ export type GeneratedCommands = Readonly<Record<never, never>>;`
 			principle: 'Use the signed-in principal. Do not trust the author field in the request body.',
 			samples: [
 				{
-					file: 'chat-domain/src/commands.rs · handle_post',
+					file: 'chat-domain/src/commands/post.rs · handle_post',
 					caption: 'Get the principal. Reject a duplicate id. Create the aggregate. Call `post`. Commit Eventual.',
-					code: `pub async fn handle(
+					code: `pub async fn handle_post(
   ctx: &CausalCommandContext<'_, ChatMessage>,
   input: ChatPostInput,
 ) -> Result<PreparedCommand<Eventual<ChatPostPayload>>, HandlerError> {
@@ -676,7 +685,7 @@ mutation SaveChatMessage {
 {
 			id: 'service',
 			label: '6 · Service + host',
-			lede: 'The chat module mounts lobby posts. On the one-process playground it also mounts identity ingress. The module mounts the chat projector. `build_service` adds these routes to one Service. On `tests/e2e-celld`, `chat.post` wait-dispatches to a Chat cell; the local host dual-writes so this projector and `@live` still run. The host starts the process. The runner only reads the environment.',
+			lede: 'The chat module mounts lobby posts. On the one-process playground it also mounts identity ingress. The module mounts the chat projector. `build_service` adds these routes to one Service. On `tests/e2e-celld`, `chat.post` wait-dispatches to a Chat cell; the cell outbox reaches this projector through the celld Queue relay and NATS, so `@live` still runs. The host starts the process. The runner only reads the environment.',
 			principle: 'Compose modules into one Service. Let the host start the process. Keep the runner small.',
 			samples: [
 				{
@@ -711,25 +720,17 @@ Service::new()
 				},
 				...hostAndRunnerSamples,
 				{
-					file: 'e2e-celld · CelldChatCommandHost',
-					caption: 'The celld example wait-dispatches chat.post to POST {CELLD_URL}/chat/{message_id}/chat.post. Then it dual-writes the local Chat service so Eventual projectors update SQL and GraphQL @live still fires. GraphQL is not a cell method.',
-					code: `// tests/e2e-celld — not make run
-impl CommandHost for CelldChatCommandHost {
-  async fn invoke(&self, command, command_id, input, …) {
-    if command == "chat.post" {
-      let id = input["message_id"];
-      HttpCommandHost::new(format!("{celld}/chat/{id}"))
-        .invoke(command, command_id, input, …)
-        .await?;
-      // then local dual-write so the projector + @live fill
-    }
-    self.local.invoke(command, command_id, input, …).await
-  }
+					file: 'e2e-celld · chat-service/host.rs · celld_route',
+					caption: 'The celld example routes chat.post to POST {CELLD_URL}/chat/{message_id}/chat.post through the same `CelldCommandHost`. The cell outbox reaches the chat projector through the celld Queue relay and NATS, so SQL updates and GraphQL @live fires. GraphQL is not a cell method.',
+					code: `// tests/e2e-celld/crates/chat-service/src/host.rs
+pub fn celld_route() -> CelldRoute {
+  CelldRoute::new(&["chat.post"], "chat", chat_shard, graphql_chat_payload)
 }
 
 // cell class (tests/celld/worker): command HTTP + sealed GET only
 POST /chat/:id/chat.post   { commandId, input }
-GET  /chat/:id             // sealed row`
+GET  /chat/:id             // sealed row
+// cell outbox → celld Queue → relay → NATS → chat projector → @live`
 				}
 			]
 		}
@@ -852,7 +853,7 @@ await commands.blob.move({ game_id, direction });
 // Atomic seal confirms or corrects`
 				},
 				{
-					file: 'blob-domain/src/commands.rs · move_dir',
+					file: 'blob-domain/src/commands/move_dir.rs · mount',
 					caption: 'The domain mount names the pure function, the WASM package, the keys, the args, and the assign fields.',
 					code: `.mount(blob_domain::commands::move_dir())
 // preview: blob.simulate_move → blobSimulateMove WASM`
@@ -891,9 +892,9 @@ export async function ensurePureFunctionsReady() {
 			principle: 'A command changes the write model. A table is only for reads.',
 			samples: [
 				{
-					file: 'blob-domain/src/commands.rs · handle_move',
+					file: 'blob-domain/src/commands/move_dir.rs · handle_move',
 					caption: 'Load the game. Call `move_dir`. Stage `SaveBlobGame`. Commit Atomic. The Atomic row is replica authority.',
-					code: `pub async fn handle(
+					code: `pub async fn handle_move(
   ctx: &CausalCommandContext<'_, BlobGame>,
   input: BlobMoveInput,
 ) -> Result<PreparedCommand<Atomic<BlobGames>>, HandlerError> {
@@ -913,13 +914,10 @@ export async function ensurePureFunctionsReady() {
   // move_dir → core::simulate_move (same pure as client WASM)
   game.move_dir(&owner, dir).map_err(rejected)?;
 
-  let row = SaveBlobGame()
-    .from_state(&BlobGameState::from(&*game))
-    .map_err(|error| HandlerError::Other(Box::new(error)))?;
-  repo.readmodel(row)
-    .publish_events()
-    .commit(game)?
-    .atomic()  // sealed row → replica authority
+  // sealed_row = SaveBlobGame().from_state(&BlobGameState::from(game))
+  let row = sealed_row(&*game)?;
+  repo.readmodel(row).publish_events().commit(game)?.atomic()
+  // sealed row → replica authority
 }`
 				}
 			]
@@ -974,11 +972,14 @@ pub fn blob_simulate_move(record_json: &str, args_json: &str)
 }`
 				},
 				{
-					file: 'blob-domain · features + make wasm',
-					caption: 'The server builds the default `domain` feature. The client pure function builds with `--features wasm`.',
+					file: 'blob-domain · features + distributed build',
+					caption: 'The server builds the default `domain` feature. `distributed build` (and `distributed dev`) compiles the declared pure with wasm-pack and `--features wasm` into `$lib/blob/pkg`. There is no separate make target.',
 					code: `// Cargo.toml
 // default = ["domain"]  → aggregate + levels + distributed
-// wasm                 → blobSimulateMove (make wasm → $lib/blob/pkg)`
+// wasm                 → blobSimulateMove
+//
+// move_dir.rs declares the package path:
+// CommandProjectionPureReduce::wasm("blob.simulate_move", "blob/pkg/blob_wasm", …)`
 				}
 			]
 		},
@@ -1124,15 +1125,19 @@ pub struct Todos {
 }`
 				},
 				{
-					file: 'service.rs · dual surfaces',
-					caption: 'One engine opens three surfaces: user, admin, and public.',
+					file: 'modules/graphql.rs · build_engine surfaces',
+					caption: 'One engine opens three surfaces: user, admin, and public. Each surface names its eligible roles and its privilege pack.',
 					code: `.client_application_surface_with_schema_roles(
-  "e2e-ui",
-  ["admin", "user"], // eligible
-  ["user"],          // portable privilege pack
+  DISTRIBUTED_CLIENT_SURFACE,         // "e2e-ui"
+  ["admin", "user"],                  // eligible
+  ["user"],                           // portable privilege pack
 )
-.client_application_surface("e2e-ui-admin", ["admin"])
-.client_application_surface("e2e-ui-public", ["anonymous"])`
+.client_application_surface(DISTRIBUTED_ADMIN_CLIENT_SURFACE, ["admin"], ["admin"])
+.client_application_surface(
+  DISTRIBUTED_PUBLIC_CLIENT_SURFACE,  // "e2e-ui-public"
+  ["anonymous"],
+  ["anonymous"],
+)`
 				}
 			]
 		},
@@ -1179,9 +1184,9 @@ pub struct Todos {
 			principle: 'Use the signed-in principal. Do not trust the request body for identity.',
 			samples: [
 				{
-					file: 'todo-domain/src/commands.rs · handle_force_archive',
+					file: 'todo-domain/src/commands/force_archive.rs · handle_force_archive',
 					caption: 'Get the admin principal. Load the todo. Call the domain. Commit Eventual.',
-					code: `pub async fn handle(
+					code: `pub async fn handle_force_archive(
   ctx: &CausalCommandContext<'_, Todo>,
   input: TodoForceArchiveInput,
 ) -> Result<PreparedCommand<Eventual<TodoForceArchivePayload>>, HandlerError> {
@@ -1215,8 +1220,10 @@ pub struct Todos {
 				{
 					file: 'todo-domain · Todo',
 					caption: 'This is the same aggregate shape as the user surface.',
-					code: `#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+					code: `#[derive(Debug, Clone, Default, Serialize, Deserialize, Snapshot)]
+#[snapshot(id = "todo_id")]
 pub struct Todo {
+  #[serde(skip, default)]
   pub entity: Entity,
   pub todo_id: String,
   pub owner_id: String,
@@ -1409,7 +1416,7 @@ const client = provideDistributed({
 });`
 				},
 				{
-					file: 'service.rs · oidc_bearer_config',
+					file: 'modules/graphql.rs · oidc_bearer_config',
 					caption: 'This claim map sets the allowed engine roles on the session.',
 					code: `oidc.claim_map.engine_roles = vec![
   "user".into(),
@@ -1588,15 +1595,3 @@ pub async fn handle<R, L, S>(
 		}
 	]
 };
-
-export const allWalkthroughs: DemoWalkthrough[] = [
-	todosWalkthrough,
-	chatWalkthrough,
-	blobWalkthrough,
-	adminWalkthrough,
-	sessionWalkthrough
-];
-
-export function walkthroughById(id: string): DemoWalkthrough | undefined {
-	return allWalkthroughs.find((d) => d.id === id);
-}

@@ -1,4 +1,5 @@
 mod commands;
+mod leaderboards;
 mod model_validation;
 mod parse;
 mod projections;
@@ -9,6 +10,7 @@ mod util;
 
 pub(crate) use super::{is_graphql_name, ClientCompileError, ClientSurfaceSelector};
 pub(crate) use commands::*;
+pub(crate) use leaderboards::*;
 pub(crate) use model_validation::*;
 pub(crate) use projections::*;
 pub(crate) use projectors::*;

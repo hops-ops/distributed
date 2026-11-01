@@ -1,0 +1,22 @@
+# Mob Pit's durable domain: the per-player `Crawler` aggregate, its one
+# command (`crawler.record_kill`) and the outward `CrawlerState` domain
+# event. Shared by the zone server (`game_demos`, which commits kills into
+# Crawler cells) and the read-model service (`mobpit_service`, which
+# projects the published events into SQL).
+[package]
+name = "mobpit_crawler"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Mob Pit Crawler aggregate, RecordKill command and domain events (dev demo)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+distributed = { path = "../../../.." }
+distributed_game = { path = "../../../../distributed_game" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

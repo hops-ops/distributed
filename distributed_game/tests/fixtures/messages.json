@@ -1,0 +1,796 @@
+{
+  "messages": [
+    {
+      "decoded": {
+        "capabilities": 5,
+        "content_version": "c1",
+        "near": false,
+        "protocol_version": 1,
+        "reconnect_token": "",
+        "ticket": "t.k.n",
+        "type": "Hello"
+      },
+      "direction": "client_to_server",
+      "hex": "01010263310505742e6b2e6e0000",
+      "name": "hello"
+    },
+    {
+      "decoded": {
+        "capabilities": 0,
+        "content_version": "c1",
+        "near": false,
+        "protocol_version": 1,
+        "reconnect_token": "abcd",
+        "ticket": "",
+        "type": "Hello"
+      },
+      "direction": "client_to_server",
+      "hex": "01010263310000046162636400",
+      "name": "hello_reconnect"
+    },
+    {
+      "decoded": {
+        "client_tick": 1000,
+        "payload": "01ff",
+        "seq": 300,
+        "type": "Input"
+      },
+      "direction": "client_to_server",
+      "hex": "02ac02e8070201ff",
+      "name": "input"
+    },
+    {
+      "decoded": {
+        "client_time": 1234.5,
+        "type": "Ping"
+      },
+      "direction": "client_to_server",
+      "hex": "0300000000004a9340",
+      "name": "ping"
+    },
+    {
+      "decoded": {
+        "type": "Leave"
+      },
+      "direction": "client_to_server",
+      "hex": "04",
+      "name": "leave"
+    },
+    {
+      "decoded": {
+        "content_version": "c2",
+        "type": "Content"
+      },
+      "direction": "client_to_server",
+      "hex": "05026332",
+      "name": "content"
+    },
+    {
+      "decoded": {
+        "capabilities": 0,
+        "content_version": "c1",
+        "near": true,
+        "protocol_version": 1,
+        "reconnect_token": "",
+        "ticket": "t.k.n",
+        "type": "Hello"
+      },
+      "direction": "client_to_server",
+      "hex": "01010263310005742e6b2e6e0001",
+      "name": "hello_near"
+    },
+    {
+      "decoded": {
+        "near": true,
+        "type": "Near"
+      },
+      "direction": "client_to_server",
+      "hex": "0601",
+      "name": "near"
+    },
+    {
+      "decoded": {
+        "near": false,
+        "type": "Near"
+      },
+      "direction": "client_to_server",
+      "hex": "0600",
+      "name": "passive"
+    },
+    {
+      "decoded": {
+        "type": "Focus",
+        "x": -25.5,
+        "y": 3.25
+      },
+      "direction": "client_to_server",
+      "hex": "070000ccc100005040",
+      "name": "focus"
+    },
+    {
+      "decoded": {
+        "capabilities": 5,
+        "content_version": "c1",
+        "near": false,
+        "protocol_version": 2,
+        "reconnect_token": "",
+        "ticket": "t.k.n",
+        "type": "Hello"
+      },
+      "direction": "client_to_server",
+      "hex": "01020263310505742e6b2e6e0000",
+      "name": "hello_v2"
+    },
+    {
+      "decoded": {
+        "content_version": "c1",
+        "patch_rate": 20,
+        "protocol_version": 1,
+        "reconnect_token": "rt",
+        "role": "player",
+        "schema": [
+          {
+            "fields": [
+              {
+                "name": "alive",
+                "type": "bool"
+              },
+              {
+                "name": "level",
+                "type": "u8"
+              },
+              {
+                "name": "hp",
+                "type": "u16"
+              },
+              {
+                "name": "gold",
+                "type": "u32"
+              },
+              {
+                "name": "dz",
+                "type": "i32"
+              },
+              {
+                "name": "speed",
+                "type": "f32"
+              },
+              {
+                "bits": 16,
+                "max": {
+                  "bits": "42c80000",
+                  "f32": 100.0
+                },
+                "min": {
+                  "bits": "c2c80000",
+                  "f32": -100.0
+                },
+                "name": "x",
+                "type": "quant_f32"
+              },
+              {
+                "bits": 10,
+                "name": "yaw",
+                "type": "angle"
+              },
+              {
+                "name": "name",
+                "type": "short_str"
+              },
+              {
+                "name": "tag",
+                "type": "bytes"
+              }
+            ],
+            "id": 1,
+            "name": "hero"
+          },
+          {
+            "fields": [
+              {
+                "bits": 12,
+                "max": {
+                  "bits": "42800000",
+                  "f32": 64.0
+                },
+                "min": {
+                  "bits": "00000000",
+                  "f32": 0.0
+                },
+                "name": "x",
+                "type": "quant_f32"
+              }
+            ],
+            "id": 2,
+            "name": "orb"
+          }
+        ],
+        "server_tick": 42,
+        "server_time": 1000.25,
+        "session_id": "s1",
+        "tick_rate": 30,
+        "type": "Welcome",
+        "zone_id": "z1"
+      },
+      "direction": "server_to_client",
+      "hex": "80027331027a31001e142a0000000000428f400272740263310201046865726f0a05616c69766500056c6576656c010268700204676f6c640302647a04057370656564050178060000c8c20000c8421003796177070a046e616d6508037461670902036f72620101780600000000000080420c",
+      "name": "welcome"
+    },
+    {
+      "decoded": {
+        "content_version": "c1",
+        "features": 1,
+        "origin": {
+          "x": -48.0,
+          "y": 1000000.5
+        },
+        "patch_rate": 20,
+        "protocol_version": 2,
+        "reconnect_token": "rt",
+        "role": "observer",
+        "schema": [
+          {
+            "fields": [
+              {
+                "name": "alive",
+                "type": "bool"
+              },
+              {
+                "name": "level",
+                "type": "u8"
+              },
+              {
+                "name": "hp",
+                "type": "u16"
+              },
+              {
+                "name": "gold",
+                "type": "u32"
+              },
+              {
+                "name": "dz",
+                "type": "i32"
+              },
+              {
+                "name": "speed",
+                "type": "f32"
+              },
+              {
+                "bits": 16,
+                "max": {
+                  "bits": "42c80000",
+                  "f32": 100.0
+                },
+                "min": {
+                  "bits": "c2c80000",
+                  "f32": -100.0
+                },
+                "name": "x",
+                "type": "quant_f32"
+              },
+              {
+                "bits": 10,
+                "name": "yaw",
+                "type": "angle"
+              },
+              {
+                "name": "name",
+                "type": "short_str"
+              },
+              {
+                "name": "tag",
+                "type": "bytes"
+              }
+            ],
+            "id": 1,
+            "name": "hero"
+          },
+          {
+            "fields": [
+              {
+                "bits": 12,
+                "max": {
+                  "bits": "42800000",
+                  "f32": 64.0
+                },
+                "min": {
+                  "bits": "00000000",
+                  "f32": 0.0
+                },
+                "name": "x",
+                "type": "quant_f32"
+              }
+            ],
+            "id": 2,
+            "name": "orb"
+          }
+        ],
+        "server_tick": 42,
+        "server_time": 1000.25,
+        "session_id": "s1",
+        "tick_rate": 30,
+        "type": "Welcome",
+        "zone_id": "z1"
+      },
+      "direction": "server_to_client",
+      "hex": "80027331027a31011e142a0000000000428f400272740263310201046865726f0a05616c69766500056c6576656c010268700204676f6c640302647a04057370656564050178060000c8c20000c8421003796177070a046e616d6508037461670902036f72620101780600000000000080420c010100000000000048c00000000081842e41",
+      "name": "welcome_v2"
+    },
+    {
+      "decoded": {
+        "content_version": "c1",
+        "features": 1,
+        "origin": null,
+        "patch_rate": 20,
+        "protocol_version": 2,
+        "reconnect_token": "rt",
+        "role": "player",
+        "schema": [
+          {
+            "fields": [
+              {
+                "name": "alive",
+                "type": "bool"
+              },
+              {
+                "name": "level",
+                "type": "u8"
+              },
+              {
+                "name": "hp",
+                "type": "u16"
+              },
+              {
+                "name": "gold",
+                "type": "u32"
+              },
+              {
+                "name": "dz",
+                "type": "i32"
+              },
+              {
+                "name": "speed",
+                "type": "f32"
+              },
+              {
+                "bits": 16,
+                "max": {
+                  "bits": "42c80000",
+                  "f32": 100.0
+                },
+                "min": {
+                  "bits": "c2c80000",
+                  "f32": -100.0
+                },
+                "name": "x",
+                "type": "quant_f32"
+              },
+              {
+                "bits": 10,
+                "name": "yaw",
+                "type": "angle"
+              },
+              {
+                "name": "name",
+                "type": "short_str"
+              },
+              {
+                "name": "tag",
+                "type": "bytes"
+              }
+            ],
+            "id": 1,
+            "name": "hero"
+          },
+          {
+            "fields": [
+              {
+                "bits": 12,
+                "max": {
+                  "bits": "42800000",
+                  "f32": 64.0
+                },
+                "min": {
+                  "bits": "00000000",
+                  "f32": 0.0
+                },
+                "name": "x",
+                "type": "quant_f32"
+              }
+            ],
+            "id": 2,
+            "name": "orb"
+          }
+        ],
+        "server_tick": 42,
+        "server_time": 1000.25,
+        "session_id": "s1",
+        "tick_rate": 30,
+        "type": "Welcome",
+        "zone_id": "z1"
+      },
+      "direction": "server_to_client",
+      "hex": "80027331027a31001e142a0000000000428f400272740263310201046865726f0a05616c69766500056c6576656c010268700204676f6c640302647a04057370656564050178060000c8c20000c8421003796177070a046e616d6508037461670902036f72620101780600000000000080420c0100",
+      "name": "welcome_v2_unplaced"
+    },
+    {
+      "decoded": {
+        "ack_seq": 0,
+        "creates": [],
+        "removes": [],
+        "server_tick": 43,
+        "type": "Delta",
+        "updates": []
+      },
+      "direction": "server_to_client",
+      "hex": "812b00000000",
+      "known_entities": [
+        {
+          "id": 5,
+          "kind": 1
+        },
+        {
+          "id": 6,
+          "kind": 2
+        }
+      ],
+      "name": "delta_empty",
+      "schema": [
+        {
+          "fields": [
+            {
+              "name": "alive",
+              "type": "bool"
+            },
+            {
+              "name": "level",
+              "type": "u8"
+            },
+            {
+              "name": "hp",
+              "type": "u16"
+            },
+            {
+              "name": "gold",
+              "type": "u32"
+            },
+            {
+              "name": "dz",
+              "type": "i32"
+            },
+            {
+              "name": "speed",
+              "type": "f32"
+            },
+            {
+              "bits": 16,
+              "max": {
+                "bits": "42c80000",
+                "f32": 100.0
+              },
+              "min": {
+                "bits": "c2c80000",
+                "f32": -100.0
+              },
+              "name": "x",
+              "type": "quant_f32"
+            },
+            {
+              "bits": 10,
+              "name": "yaw",
+              "type": "angle"
+            },
+            {
+              "name": "name",
+              "type": "short_str"
+            },
+            {
+              "name": "tag",
+              "type": "bytes"
+            }
+          ],
+          "id": 1,
+          "name": "hero"
+        },
+        {
+          "fields": [
+            {
+              "bits": 12,
+              "max": {
+                "bits": "42800000",
+                "f32": 64.0
+              },
+              "min": {
+                "bits": "00000000",
+                "f32": 0.0
+              },
+              "name": "x",
+              "type": "quant_f32"
+            }
+          ],
+          "id": 2,
+          "name": "orb"
+        }
+      ]
+    },
+    {
+      "decoded": {
+        "ack_seq": 17,
+        "creates": [
+          {
+            "fields": [
+              {
+                "bool": true
+              },
+              {
+                "u": 7
+              },
+              {
+                "u": 300
+              },
+              {
+                "u": 70000
+              },
+              {
+                "i": -2
+              },
+              {
+                "bits": "3fc00000",
+                "f32": 1.5
+              },
+              {
+                "bits": "c2c80000",
+                "f32": -100.0
+              },
+              {
+                "bits": "00000000",
+                "f32": 0.0
+              },
+              {
+                "str": "Ana"
+              },
+              {
+                "bytes": "dead"
+              }
+            ],
+            "id": 300,
+            "kind": 1
+          },
+          {
+            "fields": [
+              {
+                "bits": "42000801",
+                "f32": 32.007816314697266
+              }
+            ],
+            "id": 301,
+            "kind": 2
+          }
+        ],
+        "removes": [
+          9,
+          130
+        ],
+        "server_tick": 200,
+        "type": "Delta",
+        "updates": [
+          {
+            "fields": [
+              {
+                "u": 299
+              },
+              {
+                "bits": "3ac800c8",
+                "f32": 0.0015259021893143654
+              }
+            ],
+            "id": 5,
+            "mask": 68
+          },
+          {
+            "fields": [
+              {
+                "bits": "42800000",
+                "f32": 64.0
+              }
+            ],
+            "id": 6,
+            "mask": 1
+          },
+          {
+            "fields": [
+              {
+                "bits": "00000000",
+                "f32": 0.0
+              }
+            ],
+            "id": 301,
+            "mask": 1
+          }
+        ]
+      },
+      "direction": "server_to_client",
+      "hex": "81c801110209820102ac02010107ac02f0a204030000c03f000003416e6102deadad02028010030544ab028080020601ff1fad020100",
+      "known_entities": [
+        {
+          "id": 5,
+          "kind": 1
+        },
+        {
+          "id": 6,
+          "kind": 2
+        }
+      ],
+      "name": "delta",
+      "schema": [
+        {
+          "fields": [
+            {
+              "name": "alive",
+              "type": "bool"
+            },
+            {
+              "name": "level",
+              "type": "u8"
+            },
+            {
+              "name": "hp",
+              "type": "u16"
+            },
+            {
+              "name": "gold",
+              "type": "u32"
+            },
+            {
+              "name": "dz",
+              "type": "i32"
+            },
+            {
+              "name": "speed",
+              "type": "f32"
+            },
+            {
+              "bits": 16,
+              "max": {
+                "bits": "42c80000",
+                "f32": 100.0
+              },
+              "min": {
+                "bits": "c2c80000",
+                "f32": -100.0
+              },
+              "name": "x",
+              "type": "quant_f32"
+            },
+            {
+              "bits": 10,
+              "name": "yaw",
+              "type": "angle"
+            },
+            {
+              "name": "name",
+              "type": "short_str"
+            },
+            {
+              "name": "tag",
+              "type": "bytes"
+            }
+          ],
+          "id": 1,
+          "name": "hero"
+        },
+        {
+          "fields": [
+            {
+              "bits": 12,
+              "max": {
+                "bits": "42800000",
+                "f32": 64.0
+              },
+              "min": {
+                "bits": "00000000",
+                "f32": 0.0
+              },
+              "name": "x",
+              "type": "quant_f32"
+            }
+          ],
+          "id": 2,
+          "name": "orb"
+        }
+      ]
+    },
+    {
+      "decoded": {
+        "payload": "7870",
+        "type": "Event",
+        "type_id": 3
+      },
+      "direction": "server_to_client",
+      "hex": "8203027870",
+      "name": "event"
+    },
+    {
+      "decoded": {
+        "client_time": 1234.5,
+        "server_time": 99.0,
+        "type": "Pong"
+      },
+      "direction": "server_to_client",
+      "hex": "8300000000004a93400000000000c05840",
+      "name": "pong"
+    },
+    {
+      "decoded": {
+        "notes": "brb",
+        "reason": "content_update",
+        "type": "Freeze",
+        "version": "c2"
+      },
+      "direction": "server_to_client",
+      "hex": "840e636f6e74656e745f75706461746502633203627262",
+      "name": "freeze"
+    },
+    {
+      "decoded": {
+        "notes": "",
+        "reason": "content_update",
+        "type": "Resume",
+        "version": "c2"
+      },
+      "direction": "server_to_client",
+      "hex": "850e636f6e74656e745f75706461746502633200",
+      "name": "resume"
+    },
+    {
+      "decoded": {
+        "target_zone": "z2",
+        "transfer_ticket": "tt",
+        "type": "Handoff"
+      },
+      "direction": "server_to_client",
+      "hex": "86027a32027474",
+      "name": "handoff"
+    },
+    {
+      "decoded": {
+        "code": 3,
+        "message": "bye",
+        "type": "Kick"
+      },
+      "direction": "server_to_client",
+      "hex": "870303627965",
+      "name": "kick"
+    },
+    {
+      "decoded": {
+        "code": 2,
+        "message": "Expired",
+        "type": "Error"
+      },
+      "direction": "server_to_client",
+      "hex": "88020745787069726564",
+      "name": "error"
+    },
+    {
+      "decoded": {
+        "code": 7,
+        "message": "content c2 required",
+        "type": "Kick"
+      },
+      "direction": "server_to_client",
+      "hex": "870713636f6e74656e74206332207265717569726564",
+      "name": "kick_reload"
+    },
+    {
+      "decoded": {
+        "type": "Redirect",
+        "url": "ws://10.0.0.2:2567/zones/realm.west",
+        "zone_id": "realm.west"
+      },
+      "direction": "server_to_client",
+      "hex": "890a7265616c6d2e776573742377733a2f2f31302e302e302e323a323536372f7a6f6e65732f7265616c6d2e77657374",
+      "name": "redirect"
+    }
+  ]
+}

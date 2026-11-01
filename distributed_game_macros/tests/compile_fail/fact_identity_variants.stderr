@@ -1,0 +1,23 @@
+error: fact input field `UserId` looks like identity: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+ --> tests/compile_fail/fact_identity_variants.rs:7:5
+  |
+7 |     UserId: String,
+  |     ^^^^^^
+
+error: fact input field `owner-id` looks like identity: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+ --> tests/compile_fail/fact_identity_variants.rs:8:22
+  |
+8 |     #[serde(rename = "owner-id")]
+  |                      ^^^^^^^^^^
+
+error: fact input field `ACCOUNT_ID` looks like identity: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_identity_variants.rs:10:5
+   |
+10 |     ACCOUNT_ID: String,
+   |     ^^^^^^^^^^
+
+error: fact input field `Experience` looks like a reward: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_identity_variants.rs:11:22
+   |
+11 |     #[serde(rename = "Experience")]
+   |                      ^^^^^^^^^^^^

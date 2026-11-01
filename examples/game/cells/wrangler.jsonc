@@ -1,0 +1,66 @@
+// The game demos' cells and Mob Pit's rooms for `celld dev` (and `celld
+// deploy`). The launcher (`examples/game/run.sh`, the test harnesses) writes
+// `.dev.vars` beside a copy of this file with DISTRIBUTED_INTERNAL_SECRET,
+// GAME_TICKET_SECRET (shared with whoever mints room tickets) and
+// CELLD_QUEUE_RELAY_URL (the services' `/internal/celld-queue/relay`).
+{
+  "name": "game-demo-cells",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "CRAWLER", "class_name": "CrawlerCell" },
+      { "name": "PRESENCE", "class_name": "PresenceCell" },
+      { "name": "PIT_ROOM", "class_name": "PitRoom" },
+      { "name": "ZONE_ACTIVITY", "class_name": "ZoneActivityObject" },
+      { "name": "ZONE_DEV", "class_name": "ZoneDevObject" },
+      { "name": "HOOD", "class_name": "HoodCell" },
+      { "name": "BOROUGH", "class_name": "BoroughCell" },
+      { "name": "CITY", "class_name": "CityCell" },
+      { "name": "CONTENT_ROLLOUT", "class_name": "ContentRolloutObject" }
+    ]
+  },
+  // v2's ZoneLeaseCell / ZoneStateCell and v3's GemPouchCell /
+  // ContentLogCell (the deleted multi-host demos and The Freeze) are no
+  // longer exported; celld has no `deleted_classes` migration key.
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["CrawlerCell", "PresenceCell"] },
+    { "tag": "v2", "new_sqlite_classes": ["ZoneLeaseCell", "ZoneStateCell"] },
+    { "tag": "v3", "new_sqlite_classes": ["GemPouchCell", "ContentLogCell"] },
+    { "tag": "v4", "new_sqlite_classes": ["PitRoom", "ZoneActivityObject"] },
+    { "tag": "v5", "new_sqlite_classes": ["ZoneDevObject"] },
+    { "tag": "v6", "new_sqlite_classes": ["HoodCell", "BoroughCell", "CityCell"] },
+    { "tag": "v7", "new_sqlite_classes": ["ContentRolloutObject"] }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "OUTBOX", "queue": "game-demo-outbox" }
+    ],
+    "consumers": [
+      {
+        "queue": "game-demo-outbox",
+        "max_batch_size": 10,
+        "max_batch_timeout": 1,
+        "max_retries": 100,
+        "dead_letter_queue": "game-demo-outbox-dlq",
+        "retry_delay": 2
+      }
+    ]
+  },
+  "vars": {
+    "OUTBOX_DRAIN_INTERVAL_MS": "5000",
+    // Mob Pit rooms (distributed_game::celld_zone). GAME_TICKET_SECRET comes
+    // from .dev.vars (the launcher shares it with the ticket issuer).
+    "ZONE_TICK_HZ": "30",
+    "ZONE_PATCH_HZ": "20",
+    "ZONE_PERSIST_MS": "60000",
+    "ZONE_DORMANT_AFTER_MS": "10000",
+    "ZONE_HIBERNATE_AFTER_MS": "10000",
+    "ZONE_FACT_SERVICE": "mobpit-rooms",
+    // Dev demo: rooms apply the network simulation of the HUD sliders
+    // (`zone-dev/netsim`, written by the services' `/dev/netsim`).
+    "ZONE_DEV_SETTINGS": "1",
+    // Live content updates: rooms follow `content-rollout/world`.
+    "ZONE_CONTENT_ROLLOUT": "world"
+  }
+}

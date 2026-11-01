@@ -1,17 +1,10 @@
 #[cfg(feature = "graphql")]
-use std::collections::BTreeMap;
-use std::collections::{BTreeSet, HashMap};
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
-#[cfg(feature = "graphql")]
 use super::causal::{
     abandon_causal_attempt, causal_handler_error_code, commit_causal_rejection,
     ensure_causal_grant, evaluate_causal_command_status, internal_ledger_error,
     load_committed_dispatch_result, recover_causal_commit_error, replay_result,
-    CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult,
-    ExternalCausalAttempt, ExternalCausalReservation,
+    CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult, ExternalCausalAttempt,
+    ExternalCausalReservation,
 };
 use super::handlers::{
     boxed_causal_guard, boxed_handler, boxed_prepared_handler, CausalCommandContext, CausalGuardFn,
@@ -75,6 +68,13 @@ use crate::outbox_worker::{
 use crate::projection_protocol::{CompiledProjectionTopology, ProjectorTopologyId};
 use crate::repository::{StreamIdentity, TransactionalCommit};
 use serde_json::Value;
+#[cfg(feature = "graphql")]
+use std::collections::BTreeMap;
+use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// How a handler expects the transport to deliver matching messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +300,12 @@ where
     contract: TypedCommandContract,
     guard: Option<Arc<CausalGuardFn<A>>>,
     handle: Arc<PreparedHandlerFn<A, I, K>>,
+    /// The route declared [`Capability::Clock`](crate::schedule::Capability):
+    /// the dispatcher stamps the host clock into its session (`ctx.now()`).
+    requires_clock: bool,
+    /// The route declared [`Capability::Scheduling`](crate::schedule::Capability):
+    /// only then may its handler stage schedule writes.
+    requires_scheduling: bool,
     /// Retryable, fail-closed bootstrap for the bound projector's complete
     /// model/table ownership inventory. `get_or_try_init` leaves the cell empty
     /// after a transient registration failure.
@@ -317,16 +323,40 @@ where
         contract: TypedCommandContract,
         guard: Option<Arc<CausalGuardFn<A>>>,
         handle: Arc<PreparedHandlerFn<A, I, K>>,
+        requires_clock: bool,
+        requires_scheduling: bool,
     ) -> Self {
         Self {
             contract,
             guard,
             handle,
+            requires_clock,
+            requires_scheduling,
             #[cfg(feature = "graphql")]
             direct_projection_bootstrap: tokio::sync::OnceCell::new(),
             _types: std::marker::PhantomData,
         }
     }
+}
+
+/// The session a command runs with: any caller-supplied host-clock claim
+/// removed, the backend's clock stamped when the route declared
+/// [`Capability::Clock`](crate::schedule::Capability::Clock).
+async fn stamped_session<R>(
+    requires_clock: bool,
+    repository: &R,
+    mut session: Session,
+) -> Result<Session, crate::RepositoryError>
+where
+    R: crate::microsvc::dependencies::BackendHost,
+{
+    let now = if requires_clock {
+        Some(repository.host_now().await?)
+    } else {
+        None
+    };
+    crate::schedule::stamp_host_now(&mut session, now);
+    Ok(session)
 }
 
 pub(super) type OutboxConfigurator<D> =
@@ -596,6 +626,7 @@ pub struct TypedRouteBuilder<D, I, K: CommandOutcome> {
     route_name: &'static str,
     contract: TypedCommandContract,
     mount: Option<CommandMount>,
+    requires: Vec<crate::schedule::Capability>,
     _types: std::marker::PhantomData<fn(I) -> K>,
 }
 
@@ -685,6 +716,20 @@ where
         self.mount = Some(mount);
         self
     }
+
+    /// Declare a host capability this command needs
+    /// ([`Capability::Scheduling`](crate::schedule::Capability::Scheduling)
+    /// for `ctx.schedule`, [`Capability::Clock`](crate::schedule::Capability::Clock)
+    /// for `ctx.now()`). Registering the route on a backend without it panics
+    /// with the missing capabilities, at service construction rather than at
+    /// the first commit.
+    #[must_use]
+    pub fn requires(mut self, capability: crate::schedule::Capability) -> Self {
+        if !self.requires.contains(&capability) {
+            self.requires.push(capability);
+        }
+        self
+    }
 }
 
 impl<D, I, K> TypedRouteBuilder<D, I, K>
@@ -705,6 +750,7 @@ where
             self.mount,
             None,
             boxed_prepared_handler(handler),
+            self.requires,
         )
     }
 
@@ -721,6 +767,7 @@ where
             self.mount,
             Some(guard),
             boxed_prepared_handler(handler),
+            self.requires,
         )
     }
 
@@ -1143,6 +1190,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
             route_name,
             contract,
             mount: None,
+            requires: Vec::new(),
             _types: std::marker::PhantomData,
         }
     }
@@ -1357,6 +1405,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
         declared_mount: Option<CommandMount>,
         guard: Option<Arc<CausalGuardFn<D::Aggregate>>>,
         handle: Arc<PreparedHandlerFn<D::Aggregate, I, K>>,
+        requires: Vec<crate::schedule::Capability>,
     ) -> Self
     where
         D: CausalRouteDependencies,
@@ -1368,6 +1417,21 @@ impl<D: Send + Sync + 'static> Routes<D> {
             route_name, contract.name,
             "typed command route and contract ids must match"
         );
+        let capabilities = crate::microsvc::dependencies::BackendHost::capabilities(
+            self.dependencies.__causal_aggregate_repository().repo(),
+        );
+        let missing = capabilities.missing(&requires);
+        assert!(
+            missing.is_empty(),
+            "command `{route_name}` requires {} that its backend does not provide \
+             (backend capabilities: {capabilities:?})",
+            missing
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" and "),
+        );
+        let requires_clock = requires.contains(&crate::schedule::Capability::Clock);
         let by_name = self.handlers.entry(MessageKind::Command).or_default();
         assert!(
             !by_name.contains_key(route_name),
@@ -1392,7 +1456,13 @@ impl<D: Send + Sync + 'static> Routes<D> {
         by_name.insert(
             route_name.to_string(),
             RegisteredHandler::Causal(Box::new(
-                RegisteredCausalHandler::<D::Aggregate, I, K>::new(contract, guard, handle),
+                RegisteredCausalHandler::<D::Aggregate, I, K>::new(
+                    contract,
+                    guard,
+                    handle,
+                    requires_clock,
+                    requires.contains(&crate::schedule::Capability::Scheduling),
+                ),
             )),
         );
         mount
@@ -1644,6 +1714,9 @@ where
 
             let aggregate_repository = dependencies.__causal_aggregate_repository();
             let repository = aggregate_repository.repo();
+            let session = stamped_session(self.requires_clock, repository, session)
+                .await
+                .map_err(|error| CellDispatchError::Internal(error.to_string()))?;
             let attempt = match repository
                 .reserve_command(reservation)
                 .await
@@ -1684,7 +1757,8 @@ where
                 metadata,
             };
 
-            let workspace = CausalWorkspace::new(aggregate_repository);
+            let workspace = CausalWorkspace::new(aggregate_repository)
+                .with_scheduling_declared(self.requires_scheduling);
             let context = CausalCommandContext::new(&message, &session, &workspace);
             if self.guard.as_ref().is_some_and(|guard| !guard(&context)) {
                 return crate::microsvc::cell_host::causal::commit_rejection(
@@ -1903,6 +1977,9 @@ where
 
             let aggregate_repository = dependencies.__causal_aggregate_repository();
             let repository = aggregate_repository.repo();
+            let session = stamped_session(self.requires_clock, repository, session)
+                .await
+                .map_err(|error| CausalDispatchError::Internal(error.to_string()))?;
             if let Some(target) = direct_projection_target.as_ref() {
                 let (topology, ownership) = target.registration();
                 self.direct_projection_bootstrap
@@ -1958,7 +2035,8 @@ where
                 metadata,
             };
 
-            let workspace = CausalWorkspace::new(aggregate_repository);
+            let workspace = CausalWorkspace::new(aggregate_repository)
+                .with_scheduling_declared(self.requires_scheduling);
             let context = CausalCommandContext::new(&message, &session, &workspace);
             if self.guard.as_ref().is_some_and(|guard| !guard(&context)) {
                 return commit_causal_rejection(
@@ -2172,7 +2250,7 @@ where
                 for message in &mut batch.outbox_messages {
                     message.overwrite_causation_id(attempt.causation_id().as_str());
                     outbox_ids.push(message.id().to_string());
-                    if let Some(now) = claim_now {
+                    if let Some(now) = claim_now.filter(|now| message.is_due_at(*now)) {
                         if let Err(error) = message.claim_at(&config.worker_id, config.lease, now) {
                             claim_error = Some(error.to_string());
                             break;
@@ -2190,7 +2268,13 @@ where
                     .await;
                 }
                 if config.schedule.is_none() {
-                    fallback_rows = batch.outbox_messages.clone();
+                    // Scheduled rows were left pending (unclaimed) above.
+                    fallback_rows = batch
+                        .outbox_messages
+                        .iter()
+                        .filter(|message| message.is_in_flight())
+                        .cloned()
+                        .collect();
                 }
             }
 
@@ -2469,7 +2553,12 @@ where
                 .map_err(|error| HandlerError::DecodeFailed(error.to_string()))?;
             let message = Message::new(self.contract.name.clone(), MessageKind::Command, payload);
             let aggregate_repository = dependencies.__causal_aggregate_repository();
-            let workspace = CausalWorkspace::new(aggregate_repository);
+            let session =
+                stamped_session(self.requires_clock, aggregate_repository.repo(), session)
+                    .await
+                    .map_err(HandlerError::Repository)?;
+            let workspace = CausalWorkspace::new(aggregate_repository)
+                .with_scheduling_declared(self.requires_scheduling);
             let context = CausalCommandContext::new(&message, &session, &workspace);
             if self.guard.as_ref().is_some_and(|guard| !guard(&context)) {
                 return Err(HandlerError::GuardRejected(self.contract.name.clone()));

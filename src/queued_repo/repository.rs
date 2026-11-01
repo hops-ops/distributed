@@ -603,8 +603,11 @@ where
     R: RelationalReadModelQueryStore,
     L: LockManager,
 {
-    fn scan_read_model(&self, request: crate::read_model::ReadModelScanRequest)
-        -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_ {
+    fn scan_read_model(
+        &self,
+        request: crate::read_model::ReadModelScanRequest,
+    ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_
+    {
         self.inner.scan_read_model(request)
     }
 
@@ -830,5 +833,22 @@ mod tests {
             "causal commit must not release a lock owned by a legacy load"
         );
         repository.abort(&identity).await.unwrap();
+    }
+}
+
+impl<R, L> crate::microsvc::BackendHost for QueuedRepository<R, L>
+where
+    R: crate::microsvc::BackendHost,
+    L: LockManager,
+{
+    fn capabilities(&self) -> crate::schedule::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn host_now(
+        &self,
+    ) -> impl Future<Output = Result<std::time::SystemTime, crate::RepositoryError>> + Send + '_
+    {
+        self.inner.host_now()
     }
 }

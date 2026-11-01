@@ -268,5 +268,6 @@ pub fn build_surface(tables: &[TableSchema], options: &SurfaceOptions) -> Result
         projectors: Vec::new(),
         projectors_attached: false,
         service_binding: None,
+        leaderboards: Vec::new(),
     })
 }

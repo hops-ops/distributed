@@ -1,5 +1,7 @@
 //! One cell's private command-side repository, with enforced stream ownership.
-//! Workers use runtime-owned SQLite; native tests use the in-process reference host.
+//! Workers (celld) use runtime-owned SQLite. Native builds have only the
+//! in-process reference host, for unit tests; durable cells run on celld.
+//! Ownership checks below apply to both.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -23,6 +25,8 @@ use crate::entity::EventRecord;
 use crate::microsvc::HasOutboxStore;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 use crate::outbox::OutboxMessage;
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+use crate::repository::{validate_commit_batch, PreparedEventAppend};
 use crate::repository::{
     CommitBatch, GetStream, RepositoryError, SnapshotStore, SnapshotWrite, StreamIdentity,
     TransactionalCommit,
@@ -79,6 +83,17 @@ pub struct DurableCellCommand {
     pub body: String,
 }
 
+/// Sealed read-model row reducer run in the same transaction as a command's
+/// events (native hosts). Receives the current row and the event appends of
+/// the commit; `Ok(Some(row))` replaces the row, `Ok(None)` keeps it, and an
+/// error rolls the whole command back.
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+pub type SealedRowReducer = Arc<
+    dyn Fn(Option<&Value>, &[PreparedEventAppend<'_>]) -> Result<Option<Value>, RepositoryError>
+        + Send
+        + Sync,
+>;
+
 /// Current native restart-test export version.
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 pub const DURABLE_AGGREGATE_CELL_STATE_VERSION: u16 = 1;
@@ -95,6 +110,9 @@ pub struct DurableAggregateCellState {
     pub commands: Vec<DurableCellCommand>,
     pub outbox: Vec<OutboxMessage>,
     pub sealed_row: Option<Value>,
+    /// Alarm rows, including disarmed ones so generations never repeat.
+    #[serde(default)]
+    pub alarms: Vec<super::alarm::DurableSchedule>,
 }
 
 /// Private command-side repository for one cell instance (`{aggregate_type}:{shard}`).
@@ -115,8 +133,15 @@ pub struct DurableAggregateCellState {
 pub struct CellStreamStore {
     ownership: CellOwnership,
     inner: CellRepository,
+    /// Resolves relative alarm due times at commit and drives alarm firing.
+    clock: Arc<dyn crate::Clock>,
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     sealed_row: Arc<Mutex<Option<Value>>>,
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    sealed_row_reducer: Option<SealedRowReducer>,
+    /// Reference-host alarm table (SQL cells keep alarms in their database).
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    alarms: Arc<Mutex<super::alarm::MemorySchedules>>,
 }
 
 impl CellStreamStore {
@@ -129,6 +154,7 @@ impl CellStreamStore {
         Ok(Self {
             ownership: CellOwnership::Exclusive(identity),
             inner: CellSqlRepository::from_state(state)?,
+            clock: Arc::new(crate::SystemClock),
         })
     }
 
@@ -147,17 +173,14 @@ impl CellStreamStore {
                 owns: Arc::new(owns),
             },
             inner: CellSqlRepository::from_state(state)?,
+            clock: Arc::new(crate::SystemClock),
         })
     }
 
     /// Bind a store to one exact stream identity.
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn for_identity(identity: StreamIdentity) -> Self {
-        Self {
-            ownership: CellOwnership::Exclusive(identity),
-            inner: InMemoryRepository::new(),
-            sealed_row: Arc::new(Mutex::new(None)),
-        }
+        Self::native(CellOwnership::Exclusive(identity), memory_repository())
     }
 
     /// Parent-shard cell: `"{parent_type}:{parent_id}"` (bomberman `game:{id}`).
@@ -170,14 +193,68 @@ impl CellStreamStore {
         parent_id: impl Into<String>,
         owns: impl Fn(&StreamIdentity) -> bool + Send + Sync + 'static,
     ) -> Result<Self, RepositoryError> {
-        Ok(Self {
-            ownership: CellOwnership::Parent {
+        Ok(Self::native(
+            CellOwnership::Parent {
                 name: StreamIdentity::new(parent_type, parent_id)?,
                 owns: Arc::new(owns),
             },
-            inner: InMemoryRepository::new(),
+            memory_repository(),
+        ))
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn native(ownership: CellOwnership, inner: CellRepository) -> Self {
+        Self {
+            ownership,
+            inner,
+            clock: Arc::new(crate::SystemClock),
             sealed_row: Arc::new(Mutex::new(None)),
-        })
+            sealed_row_reducer: None,
+            alarms: Arc::new(Mutex::new(Default::default())),
+        }
+    }
+
+    /// Maintain the sealed read-model row from each commit's events, inside
+    /// the command's transaction (SQLite cells) or alongside its in-memory
+    /// commit (reference host). A reducer error rejects the command.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub fn with_sealed_row_reducer(
+        mut self,
+        reducer: impl Fn(Option<&Value>, &[PreparedEventAppend<'_>]) -> Result<Option<Value>, RepositoryError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        let reducer: SealedRowReducer = Arc::new(reducer);
+        self.sealed_row_reducer = Some(reducer);
+        self
+    }
+
+    /// The in-process reference repository backing whole-state export.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn memory(&self) -> Result<&InMemoryRepository, RepositoryError> {
+        Ok(&self.inner)
+    }
+
+    /// Reference-host sealed-row reduction. SQLite cells reduce inside their
+    /// commit transaction instead, so this returns `None` for them.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn reduce_memory_sealed_row(
+        &self,
+        batch: &CommitBatch<'_>,
+    ) -> Result<Option<Value>, RepositoryError> {
+        let Some(reducer) = &self.sealed_row_reducer else {
+            return Ok(None);
+        };
+        if self.memory().is_err() {
+            return Ok(None);
+        }
+        let prepared = validate_commit_batch(batch)?;
+        if prepared.iter().all(|append| append.events.is_empty()) {
+            return Ok(None);
+        }
+        let current = self.sealed_row()?;
+        reducer(current.as_ref(), &prepared)
     }
 
     /// Named exclusive-cell constructor used by [`super::AggregateCell`].
@@ -190,6 +267,22 @@ impl CellStreamStore {
             aggregate_type,
             shard_id,
         )?))
+    }
+
+    /// Replace the cell clock (default: the system clock). The reference host
+    /// takes a [`ManualClock`](crate::ManualClock) so alarm tests are
+    /// deterministic; it resolves [`Schedule::after`](super::Schedule::after)
+    /// at commit and is what [`AggregateCell::fire_due_schedules`] reads.
+    ///
+    /// [`AggregateCell::fire_due_schedules`]: super::AggregateCell::fire_due_schedules
+    pub fn with_clock(mut self, clock: impl crate::Clock + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    /// The cell clock's current time.
+    pub fn now(&self) -> std::time::SystemTime {
+        self.clock.now()
     }
 
     /// Cell instance name (`type:id`).
@@ -246,7 +339,7 @@ impl CellStreamStore {
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_events(&self) -> Result<Vec<DurableCellEvents>, RepositoryError> {
         Ok(self
-            .inner
+            .memory()?
             .clone_events()?
             .into_iter()
             .map(|(stream, events)| DurableCellEvents { stream, events })
@@ -256,7 +349,7 @@ impl CellStreamStore {
     /// Outbox rows committed with this cell's events (same private SQLite).
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_outbox(&self) -> Result<Vec<OutboxMessage>, RepositoryError> {
-        self.inner.clone_outbox()
+        self.memory()?.clone_outbox()
     }
 
     /// Restore outbox rows from Durable Object SQLite.
@@ -265,7 +358,7 @@ impl CellStreamStore {
         &self,
         messages: Vec<OutboxMessage>,
     ) -> Result<(), RepositoryError> {
-        self.inner.replace_outbox(messages)
+        self.memory()?.replace_outbox(messages)
     }
 
     /// Replace the working event log from Durable Object SQLite.
@@ -274,7 +367,7 @@ impl CellStreamStore {
         &self,
         events: Vec<DurableCellEvents>,
     ) -> Result<(), RepositoryError> {
-        self.inner.replace_events(
+        self.memory()?.replace_events(
             events
                 .into_iter()
                 .map(|row| (row.stream, row.events))
@@ -286,7 +379,7 @@ impl CellStreamStore {
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_snapshots(&self) -> Result<Vec<DurableCellSnapshot>, RepositoryError> {
         Ok(self
-            .inner
+            .memory()?
             .clone_snapshots()?
             .into_iter()
             .map(|(stream, record)| DurableCellSnapshot {
@@ -308,7 +401,7 @@ impl CellStreamStore {
         &self,
         snapshots: Vec<DurableCellSnapshot>,
     ) -> Result<(), RepositoryError> {
-        self.inner.replace_snapshots(
+        self.memory()?.replace_snapshots(
             snapshots
                 .into_iter()
                 .map(|row| {
@@ -334,7 +427,7 @@ impl CellStreamStore {
     /// Fenced command rows committed with this cell's domain effects.
     #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_commands(&self) -> Result<Vec<DurableCellCommand>, RepositoryError> {
-        self.inner
+        self.memory()?
             .clone_command_ledger()?
             .into_iter()
             .map(|record| {
@@ -365,7 +458,7 @@ impl CellStreamStore {
             }
             records.push(record);
         }
-        self.inner.replace_command_ledger(records)
+        self.memory()?.replace_command_ledger(records)
     }
 
     /// Export every durable concern as one versioned persistence envelope.
@@ -378,6 +471,7 @@ impl CellStreamStore {
             commands: self.durable_commands()?,
             outbox: self.durable_outbox()?,
             sealed_row: self.sealed_row()?,
+            alarms: self.lock_alarms()?.export(),
         })
     }
 
@@ -405,6 +499,109 @@ impl CellStreamStore {
             .lock()
             .map_err(|_| RepositoryError::Model("cell sealed row lock poisoned".into()))?;
         *sealed = state.sealed_row;
+        *self.lock_alarms()? = super::alarm::MemorySchedules::restore(state.alarms);
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn lock_alarms(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, super::alarm::MemorySchedules>, RepositoryError> {
+        self.alarms
+            .lock()
+            .map_err(|_| RepositoryError::Model("cell alarm table lock poisoned".into()))
+    }
+
+    /// The SQL database holding alarms (the Durable Object's); `None` on
+    /// the reference host, which keeps them in memory.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    fn alarm_sql(&self) -> Option<&super::sql_store::CellSqlRepository> {
+        Some(&self.inner)
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn alarm_sql(&self) -> Option<&std::convert::Infallible> {
+        None
+    }
+
+    /// Armed alarms, earliest first.
+    pub fn armed_schedules(&self) -> Result<Vec<super::ArmedSchedule>, RepositoryError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        if let Some(sql) = self.alarm_sql() {
+            return sql.armed_alarms();
+        }
+        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        return Ok(self.lock_alarms()?.armed());
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        Ok(Vec::new())
+    }
+
+    /// Armed alarms due at or before `now_ms`, earliest first, at most `limit`.
+    pub(super) fn due_alarms(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<super::ArmedSchedule>, RepositoryError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        if let Some(sql) = self.alarm_sql() {
+            return sql.due_alarms(now_ms, limit);
+        }
+        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        return Ok(self.lock_alarms()?.due(now_ms, limit));
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        Ok(Vec::new())
+    }
+
+    /// Due time (epoch ms) of the earliest armed alarm.
+    pub(super) fn next_alarm_due_ms(&self) -> Result<Option<i64>, RepositoryError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        if let Some(sql) = self.alarm_sql() {
+            return sql.next_alarm_due_ms();
+        }
+        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        return Ok(self.lock_alarms()?.next_due_ms());
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        Ok(None)
+    }
+
+    pub(super) fn settle_alarm(
+        &self,
+        name: &str,
+        generation: u64,
+        settlement: &super::alarm::ScheduleSettlement,
+    ) -> Result<(), RepositoryError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        if let Some(sql) = self.alarm_sql() {
+            return sql.settle_alarm(name, generation, settlement);
+        }
+        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        self.lock_alarms()?.settle(name, generation, settlement);
+        Ok(())
+    }
+
+    /// Reference host: validate and plan alarm writes before the commit so a
+    /// rejected plan aborts it; install the plan only after the commit.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn plan_memory_alarms(
+        &self,
+        batch: &mut CommitBatch<'_>,
+    ) -> Result<Option<super::alarm::MemorySchedules>, RepositoryError> {
+        if self.alarm_sql().is_some() || batch.schedules.is_empty() {
+            return Ok(None);
+        }
+        let writes = std::mem::take(&mut batch.schedules);
+        super::alarm::validate_schedule_writes(&writes)?;
+        self.lock_alarms()?.plan(&writes).map(Some)
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn install_memory_alarms(
+        &self,
+        planned: Option<super::alarm::MemorySchedules>,
+    ) -> Result<(), RepositoryError> {
+        if let Some(planned) = planned {
+            *self.lock_alarms()? = planned;
+        }
         Ok(())
     }
 
@@ -558,14 +755,43 @@ impl CommandLedgerStore for CellStreamStore {
     }
 }
 
+/// A cell dispatches its due schedules (the Durable Object alarm on celld,
+/// `AggregateCell::fire_due_schedules` on the reference host) and stamps the
+/// cell clock.
+impl crate::microsvc::BackendHost for CellStreamStore {
+    fn capabilities(&self) -> crate::schedule::Capabilities {
+        crate::schedule::Capabilities::ALL
+    }
+
+    fn host_now(
+        &self,
+    ) -> impl Future<Output = Result<std::time::SystemTime, RepositoryError>> + Send + '_ {
+        std::future::ready(Ok(self.now()))
+    }
+}
+
 impl TransactionalCommit for CellStreamStore {
     fn commit_batch<'a>(
         &'a self,
         batch: CommitBatch<'a>,
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
+        let mut batch = batch;
         async move {
             self.ensure_batch(&batch)?;
-            TransactionalCommit::commit_batch(&self.inner, batch).await
+            crate::schedule::schedule_owner(&batch)?;
+            super::alarm::resolve_schedule_writes(&mut batch.schedules, self.clock.now())?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            let sealed = self.reduce_memory_sealed_row(&batch)?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            let alarms = self.plan_memory_alarms(&mut batch)?;
+            TransactionalCommit::commit_batch(&self.inner, batch).await?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            if let Some(row) = sealed {
+                self.replace_sealed_row(row)?;
+            }
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            self.install_memory_alarms(alarms)?;
+            Ok(())
         }
     }
 }
@@ -575,10 +801,31 @@ impl CausalTransactionalCommit for CellStreamStore {
         &'a self,
         batch: CausalCommitBatch<'a>,
     ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + 'a {
+        let mut batch = batch;
         async move {
             self.ensure_batch(&batch.domain)
                 .map_err(CommandLedgerError::Storage)?;
-            CausalTransactionalCommit::commit_causal_batch(&self.inner, batch).await
+            crate::schedule::schedule_owner(&batch.domain).map_err(CommandLedgerError::Storage)?;
+            super::alarm::resolve_schedule_writes(&mut batch.domain.schedules, self.clock.now())
+                .map_err(CommandLedgerError::Storage)?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            let sealed = self
+                .reduce_memory_sealed_row(&batch.domain)
+                .map_err(CommandLedgerError::Storage)?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            let alarms = self
+                .plan_memory_alarms(&mut batch.domain)
+                .map_err(CommandLedgerError::Storage)?;
+            CausalTransactionalCommit::commit_causal_batch(&self.inner, batch).await?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            if let Some(row) = sealed {
+                self.replace_sealed_row(row)
+                    .map_err(CommandLedgerError::Storage)?;
+            }
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            self.install_memory_alarms(alarms)
+                .map_err(CommandLedgerError::Storage)?;
+            Ok(())
         }
     }
 }
@@ -607,4 +854,9 @@ impl crate::microsvc::dependencies::CausalHostProjections for CellStreamStore {
             ),
         )
     }
+}
+
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+fn memory_repository() -> CellRepository {
+    InMemoryRepository::new()
 }

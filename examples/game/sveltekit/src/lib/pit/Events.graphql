@@ -1,0 +1,13 @@
+# The world events running now (mobpit-service's `boroughs`, projected from
+# the borough cells' domain events: each borough schedules its own events
+# with `ctx.schedule`). SSR seeds it, `@live` keeps it current as events
+# start and end anywhere in the city.
+query Events @load @live {
+  boroughs(where: { event: { _neq: "" } }, order_by: [{ borough: asc }]) {
+    borough
+    event
+    event_until_ms
+    bosses_down
+    weather
+  }
+}

@@ -1,0 +1,15 @@
+# Standalone fixture compiled by `distributed game-manifest` in integration tests.
+# Its own `[workspace]` decouples it from the repo workspace.
+[package]
+name = "game-surface-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+distributed_game = { path = "../../../../distributed_game" }

@@ -1,6 +1,7 @@
 mod artifact;
 mod commands;
 mod common;
+mod leaderboards;
 mod operation;
 mod project;
 mod typescript;
