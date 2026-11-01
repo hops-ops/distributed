@@ -964,6 +964,31 @@ shot arrives. `record_rewind` stores hit volumes each tick, and
 moment, capped at `max_rewind` (500 ms by default) so lag cannot buy
 unlimited rewind.
 
+### Walls and raycasts
+
+A zone declares its level geometry once in `on_create`: vertical
+cylinders and axis-aligned boxes, each extruded up from the floor. One
+query then finds the closest hit among entities and walls, so a shot
+stops at a pillar instead of passing through it:
+
+```rust
+ctx.set_colliders(Colliders::new()
+    .with(Collider::cylinder([4.0, 2.0], 0.8, 2.4))
+    .with(Collider::aabb([-20.0, 19.5], [20.0, 20.0], 3.0)));
+
+let ray = Ray::new(muzzle, aim, 100.0).ignoring(shooter);
+if let Some(hit) = ctx.raycast_shot(timing, &ray) {   // lag-compensated
+    impact(hit.point, hit.normal);
+    if let Target::Entity(id) = hit.target { damage(id); }
+}
+```
+
+Each hit carries its distance, point and surface normal. Entities and
+colliders sit on layer bits (`on_layers`), and a ray meets only the
+layers in its `mask`. `colliders().push_out(at, radius, mask)` keeps a
+moving body out of the walls. Queries are a linear scan, which suits
+rooms with tens of shapes; there is no spatial index yet.
+
 ### Testing and operations
 
 - **Deterministic tests**: drive `ZoneHost` with `ManualClock`; the RNG
@@ -1253,6 +1278,14 @@ ledger reservation and commit.
   evaluates at the shooter's view time, clamped to `max_rewind` and the
   stored history. The interpolation delay travels in the game's input
   payload (no wire change).
+- **Static colliders** (`collide`): `ctx.set_colliders(Colliders)` in
+  `on_create` (cylinders and boxes extruded from `z = 0`, each on layer
+  bits). `ctx.raycast(&Ray)`, `raycast_at(time, ..)`, `raycast_where(time,
+  .., accept)` and `raycast_shot(timing, ..)` return the closest
+  `RayHit { target: Entity(id) | Static(index), distance, point, normal }`
+  among the recorded rewind entities and the colliders. A `Ray` has
+  `max_dist`, a layer `mask` and an `ignoring(id)`; it is not a
+  client-side query, and the predicted movement in `sim` does not use it.
 - **Record/replay** (`replay`): drive a host through `Recorder` (same
   methods as `ZoneHost`), save the compact `Recording` (`DGR3`), and
   `replay::<Z>(&recording, config)` re-runs it on a `ManualClock`,

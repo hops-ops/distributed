@@ -75,7 +75,7 @@ impl Shape {
         }
     }
 
-    fn segment(&self, pos: Vec3) -> (Vec3, Vec3) {
+    pub(crate) fn segment(&self, pos: Vec3) -> (Vec3, Vec3) {
         match *self {
             Self::Sphere { .. } => (pos, pos),
             Self::Capsule { half_height, .. } => (
@@ -97,6 +97,9 @@ pub struct Historic {
     pub shape: Shape,
     /// Arbitrary numeric fields (interpolated linearly by [`Rewind::at_time`]).
     pub fields: Vec<f32>,
+    /// Layer bits a [`Ray`](crate::collide::Ray) mask selects
+    /// ([`layer::DEFAULT`](crate::collide::layer::DEFAULT); `0` is never hit).
+    pub layers: u32,
 }
 
 impl Historic {
@@ -107,6 +110,7 @@ impl Historic {
             pos,
             shape: Shape::Sphere { radius },
             fields: Vec::new(),
+            layers: crate::collide::layer::DEFAULT,
         }
     }
 
@@ -120,12 +124,19 @@ impl Historic {
                 radius,
             },
             fields: Vec::new(),
+            layers: crate::collide::layer::DEFAULT,
         }
     }
 
     /// Attach numeric fields.
     pub fn with_fields(mut self, fields: Vec<f32>) -> Self {
         self.fields = fields;
+        self
+    }
+
+    /// Put it on these layers (`0`: rays pass through, e.g. a dead mob).
+    pub fn on_layers(mut self, layers: u32) -> Self {
+        self.layers = layers;
         self
     }
 }
@@ -475,6 +486,20 @@ impl Rewind {
         self.hit_test(resolved.time, query, filter)
             .map(|hit| (hit, resolved))
     }
+
+    /// Closest hit of `ray` among the entities as they were at `time` that
+    /// `accept` takes, and the static `colliders` (only the colliders before
+    /// any history).
+    pub fn raycast_at(
+        &self,
+        time: Duration,
+        ray: &crate::collide::Ray,
+        colliders: &crate::collide::Colliders,
+        accept: impl FnMut(u32) -> bool,
+    ) -> Option<crate::collide::RayHit> {
+        let entities = self.at_time(time).unwrap_or_default();
+        crate::collide::raycast(&entities, colliders, ray, accept)
+    }
 }
 
 fn lerp_entity(a: &Historic, b: &Historic, t: f32) -> Historic {
@@ -486,6 +511,7 @@ fn lerp_entity(a: &Historic, b: &Historic, t: f32) -> Historic {
             lerp(a.pos[2], b.pos[2], t),
         ],
         shape: a.shape,
+        layers: a.layers,
         fields: a
             .fields
             .iter()
@@ -499,28 +525,28 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-fn add(a: Vec3, b: Vec3) -> Vec3 {
+pub(crate) fn add(a: Vec3, b: Vec3) -> Vec3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-fn sub(a: Vec3, b: Vec3) -> Vec3 {
+pub(crate) fn sub(a: Vec3, b: Vec3) -> Vec3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn scale(a: Vec3, s: f32) -> Vec3 {
+pub(crate) fn scale(a: Vec3, s: f32) -> Vec3 {
     [a[0] * s, a[1] * s, a[2] * s]
 }
 
-fn dot(a: Vec3, b: Vec3) -> f32 {
+pub(crate) fn dot(a: Vec3, b: Vec3) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn norm(a: Vec3) -> f32 {
+pub(crate) fn norm(a: Vec3) -> f32 {
     dot(a, a).sqrt()
 }
 
 /// Closest point to `p` on segment `a → b`.
-fn closest_on_segment(p: Vec3, a: Vec3, b: Vec3) -> Vec3 {
+pub(crate) fn closest_on_segment(p: Vec3, a: Vec3, b: Vec3) -> Vec3 {
     let ab = sub(b, a);
     let len2 = dot(ab, ab);
     if len2 <= f32::EPSILON {
@@ -581,7 +607,7 @@ fn ray_capsule(ro: Vec3, rd: Vec3, pa: Vec3, pb: Vec3, r: f32) -> Option<f32> {
     best
 }
 
-fn intersect(query: &HitQuery, e: &Historic) -> Option<f32> {
+pub(crate) fn intersect(query: &HitQuery, e: &Historic) -> Option<f32> {
     let r = e.shape.radius();
     let (pa, pb) = e.shape.segment(e.pos);
     match *query {
