@@ -1,6 +1,10 @@
 # Hops injects: local, localDomain, environment.{name,namespace},
 # source.{localPath,path,type} (localPath = examples/game in this checkout).
 
+# Browser hostname (HTTPRoute, PUBLIC_ORIGIN). Empty gives
+# <environment>.<localDomain>.
+host: mobpit.localhost
+
 # The mobpit-system celld fleet.
 celld:
   url: http://celld.mobpit-celld.svc.cluster.local:8080
