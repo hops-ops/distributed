@@ -834,9 +834,14 @@ impl<Z: CelldZone> Inner<Z> {
 
     /// Players keep a zone awake (also inside their reconnect grace), and
     /// so do near observers; other observers are passive watchers.
+    /// Players here or near, or work the zone says must finish first
+    /// ([`Zone::has_pending_work`], e.g. a crossing between zones), keep it
+    /// ticking (as the native host's tiers do).
     fn occupied(&self) -> bool {
         self.host.as_ref().is_some_and(|h| {
-            h.player_count() > 0 || self.near.iter().any(|c| self.sockets.contains_key(c))
+            h.player_count() > 0
+                || self.near.iter().any(|c| self.sockets.contains_key(c))
+                || h.zone().has_pending_work()
         })
     }
 
