@@ -577,6 +577,8 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 	let reachRoom: string | undefined;
 	let reachBits = 0;
 	let near: ReadonlySet<string> = new Set();
+	let openKey = '';
+	let openBits = 0;
 	const updateReach = () => {
 		if (watcher === undefined) return;
 		const room = typed.client.authority?.zoneId;
@@ -597,7 +599,14 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		let bits = 0;
 		if (wake && at !== undefined && meNow !== undefined && meNow.zoneId === room && pures.loaded()) {
 			const p = pit.playerFields(meNow);
-			bits = pures.roomsInReach({ x: p.x, y: p.y, near: reachBits }).near;
+			// Reach runs to the whole of an open side (its layout, once per room).
+			const seed = hello.get()?.seed ?? pit.PIT_WORLD.defaultSeed;
+			const key = `${seed}:${room}`;
+			if (openKey !== key && at !== undefined) {
+				openKey = key;
+				openBits = pures.pitRoom({ seed, x: at[0], y: at[1] }).open;
+			}
+			bits = pures.roomsInReach({ x: p.x, y: p.y, near: reachBits, open: openBits }).near;
 		}
 		reachBits = bits;
 		const rooms = at === undefined ? [] : reachRooms(at, bits);

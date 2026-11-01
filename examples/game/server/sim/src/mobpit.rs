@@ -167,9 +167,9 @@ impl PitState {
     }
 }
 
-/// `(seed, x, y)` → that room's obstacles as `(x, y, radius)` and its
-/// ground ([`room_ground`]).
-type ObstacleCache = Option<((u32, i32, i32), (Vec<(f32, f32, f32)>, Colliders))>;
+/// `(seed, x, y)` → that room's obstacles as `(x, y, radius)`, its
+/// ground ([`room_ground`]) and its [`open_sides`].
+type ObstacleCache = Option<((u32, i32, i32), (Vec<(f32, f32, f32)>, Colliders, u8))>;
 
 thread_local! {
     /// Obstacles of the last room stepped in (a player stays in a room for
@@ -198,10 +198,11 @@ pub fn pit_step(
                 .iter()
                 .map(|o| (o.x, o.y, o.r))
                 .collect();
-            *cache = Some((key, (circles, room_ground(context.seed, at))));
+            let open = open_sides(context.seed, at);
+            *cache = Some((key, (circles, room_ground(context.seed, at), open)));
         }
-        let (obstacles, ground) = &cache.as_ref().expect("filled above").1;
-        step_among(*state, *input, obstacles, ground)
+        let (obstacles, ground, open) = &cache.as_ref().expect("filled above").1;
+        step_among(*state, *input, obstacles, ground, *open)
     })
 }
 
@@ -219,7 +220,7 @@ pub const POS: FieldType = FieldType::quant_centered(22.0, 18);
 
 /// One command frame on flat floor with the classic pillars (no ramps).
 pub fn step(s: PitState, input: PitInput) -> PitState {
-    step_among(s, input, &arena::PILLARS, &Colliders::new())
+    step_among(s, input, &arena::PILLARS, &Colliders::new(), 0)
 }
 
 /// How high a player steps up onto walkable ground without jumping (m),
@@ -321,6 +322,7 @@ pub fn step_among(
     input: PitInput,
     obstacles: &[(f32, f32, f32)],
     ramps: &Colliders,
+    open: u8,
 ) -> PitState {
     let planar = s.planar();
     let (g0, n0) = ground(ramps, s.x, s.y);
@@ -329,6 +331,7 @@ pub fn step_among(
     let mut next = walls(
         planar,
         arena::advance_among(planar, input.movement(), obstacles),
+        open,
     );
     let from = (s.x, s.y);
     if (!ramps.is_empty() || ramps.terrain().is_some())
@@ -356,6 +359,7 @@ pub fn step_among(
                     y: next.y + dy * k,
                     ..next
                 },
+                open,
             );
         }
         vz = 0.0;
@@ -422,28 +426,55 @@ fn clamp_axis(p: f32, v: f32, lim: f32) -> (f32, f32) {
     }
 }
 
-/// Keep `s` (one frame after `prev`) inside the room square or a doorway
-/// passage. A player already in a passage stays between its jambs; one in
-/// the room may enter a passage only through the gap.
-fn walls(prev: MoveState, s: MoveState) -> MoveState {
+/// Keep `s` (one frame after `prev`) inside the room square or a passage:
+/// a doorway's, or along the whole of an open side ([`open_sides`] bits
+/// in `open`). A player already in a passage stays within it; one in the
+/// room may enter a passage only through its gap. The corner squares
+/// (past two sides at once) stay walled even where both sides are open.
+fn walls(prev: MoveState, s: MoveState, open: u8) -> MoveState {
     let lim = arena::HALF - arena::PLAYER_RADIUS;
     // Snapped to the wire, a player held at the wall may sit a hair past it.
     let inside = lim + SLACK;
-    let gap = DOOR_HALF - arena::PLAYER_RADIUS;
     let far = arena::HALF + PASSAGE;
+    // Half width of the passage through the side facing `v` on that axis.
+    let gap = |v: f32, (pos, neg): (u8, u8)| {
+        let bit = if v > 0.0 { pos } else { neg };
+        if open & bit != 0 {
+            lim
+        } else {
+            DOOR_HALF - arena::PLAYER_RADIUS
+        }
+    };
+    let (sides_x, sides_y) = ((1, 2), (4, 8));
     let mut s = s;
     let (lim_x, lim_y) = if prev.x.abs() > inside {
-        (far, gap)
+        (far, gap(prev.x, sides_x))
     } else if prev.y.abs() > inside {
-        (gap, far)
+        (gap(prev.y, sides_y), far)
     } else {
         (
-            if s.y.abs() <= gap { far } else { lim },
-            if s.x.abs() <= gap { far } else { lim },
+            if s.y.abs() <= gap(s.x, sides_x) {
+                far
+            } else {
+                lim
+            },
+            if s.x.abs() <= gap(s.y, sides_y) {
+                far
+            } else {
+                lim
+            },
         )
     };
     (s.x, s.vx) = clamp_axis(s.x, s.vx, lim_x);
     (s.y, s.vy) = clamp_axis(s.y, s.vy, lim_y);
+    if s.x.abs() > inside && s.y.abs() > inside {
+        // Into a corner through two open sides: keep the deeper one.
+        if s.x.abs() >= s.y.abs() {
+            (s.y, s.vy) = clamp_axis(s.y, s.vy, lim);
+        } else {
+            (s.x, s.vx) = clamp_axis(s.x, s.vx, lim);
+        }
+    }
     s
 }
 
@@ -953,6 +984,44 @@ pub fn room_holes(seed: u32, room: (i32, i32)) -> Vec<Hole> {
     holes
 }
 
+/// Seed salt of the shared edges ([`open_sides`]).
+const SALT_EDGE: u32 = 907;
+/// Chance an edge is open (percent).
+const OPEN_PERCENT: u32 = 35;
+
+/// Whether the edge between `room` and its neighbour at offset `step` is
+/// open (no wall: the whole side is a passage). Seeded from the edge's
+/// own coordinates (twice its midpoint), so both rooms agree. Never next
+/// to the entrance, and never where a trench of either room ends on it
+/// (that would be a way round the trench).
+fn edge_open(seed: u32, room: (i32, i32), step: (i32, i32)) -> bool {
+    let other = (room.0 + step.0, room.1 + step.1);
+    let near_entrance = |r: (i32, i32)| r.0.unsigned_abs() + r.1.unsigned_abs() < 2;
+    let trench_ends = |r: (i32, i32), along_x: bool| {
+        room_holes(seed, r).iter().any(|h| {
+            if along_x {
+                h.x1 - h.x0 >= ROOM_SIZE - SLACK
+            } else {
+                h.y1 - h.y0 >= ROOM_SIZE - SLACK
+            }
+        })
+    };
+    let (ex, ey) = (2 * room.0 + step.0, 2 * room.1 + step.1);
+    !near_entrance(room)
+        && !near_entrance(other)
+        && grid::mix(seed, SALT_EDGE, ex, ey) % 100 < OPEN_PERCENT
+        && !trench_ends(room, step.0 != 0)
+        && !trench_ends(other, step.0 != 0)
+}
+
+/// The open sides of room `room`, as [`DOORWAYS`] bits.
+pub fn open_sides(seed: u32, room: (i32, i32)) -> u8 {
+    DOORWAYS
+        .iter()
+        .filter(|&&(_, step)| edge_open(seed, room, step))
+        .fold(0, |bits, &(bit, _)| bits | bit)
+}
+
 /// The platforms of room `room`: 1–3 boxes 0.6–1.3 m high (a jump up),
 /// clear like the ramps; and in a trench wider than 3 m, one or two
 /// stepping stones at floor level to hop across on. Pure and
@@ -1206,13 +1275,32 @@ pub fn room_colliders(seed: u32, room: (i32, i32)) -> Colliders {
         );
     }
     let (h, t, d) = (arena::HALF, WALL_THICKNESS, DOOR_HALF);
+    let open = open_sides(seed, room);
     for sign in [-1.0f32, 1.0] {
         let (near, far) = (sign * h, sign * (h + t));
+        let (north_south, east_west) = if sign > 0.0 { (4, 1) } else { (8, 2) };
         for (a, b) in [([-h - t, near], [-d, far]), ([d, near], [h + t, far])] {
             // A wall along x (north/south), then the same along y (east/west).
-            colliders.push(Collider::aabb(a, b, WALL_HEIGHT).on_layers(LAYER_SOLID));
+            if open & north_south == 0 {
+                colliders.push(Collider::aabb(a, b, WALL_HEIGHT).on_layers(LAYER_SOLID));
+            }
+            if open & east_west == 0 {
+                colliders.push(
+                    Collider::aabb([a[1], a[0]], [b[1], b[0]], WALL_HEIGHT).on_layers(LAYER_SOLID),
+                );
+            }
+        }
+        // Corner posts stand even between open sides.
+        for other in [-1.0f32, 1.0] {
+            let (x0, x1) = (sign * h, sign * (h + t));
+            let (y0, y1) = (other * h, other * (h + t));
             colliders.push(
-                Collider::aabb([a[1], a[0]], [b[1], b[0]], WALL_HEIGHT).on_layers(LAYER_SOLID),
+                Collider::aabb(
+                    [x0.min(x1), y0.min(y1)],
+                    [x0.max(x1), y0.max(y1)],
+                    WALL_HEIGHT,
+                )
+                .on_layers(LAYER_SOLID),
             );
         }
     }
@@ -1351,6 +1439,9 @@ pub struct PitRoomLayout {
     pub holes: Vec<Hole>,
     /// Its platforms ([`room_platforms`]).
     pub platforms: Vec<Platform>,
+    /// Open sides ([`open_sides`]: [`DOORWAYS`] bits): no wall, the whole
+    /// side is a passage.
+    pub open: u8,
 }
 
 /// The farthest [`PitRoomLayout::boss_distance`] reported.
@@ -1501,6 +1592,7 @@ pub fn pit_room(room: &PitRoomContext) -> PitRoomLayout {
         ramps: room_ramps(room.seed, at),
         holes,
         platforms: room_platforms(room.seed, at),
+        open: open_sides(room.seed, at),
     }
 }
 
@@ -1687,6 +1779,9 @@ pub struct ReachContext {
     pub y: f32,
     /// [`DOORWAYS`] bits near so far (the hysteresis).
     pub near: u8,
+    /// The room's open sides ([`PitRoomLayout::open`]): reach is measured
+    /// to the whole side, not its doorway.
+    pub open: u8,
 }
 
 /// The doorway neighbours near now.
@@ -1698,7 +1793,7 @@ pub struct Reach {
 
 /// Proximity wake: which of the four doorway neighbours a player at
 /// room-local `(x, y)` keeps awake. A neighbour becomes near within
-/// [`WAKE_REACH`] of its doorway and stays near until beyond
+/// [`WAKE_REACH`] of its doorway (of the shared side, if it is open) and stays near until beyond
 /// [`WAKE_RELEASE`]; at most [`WAKE_MAX`] (the nearest). Pure, so both
 /// pages run this code as WebAssembly.
 #[game_pure(RoomsInReachFn)]
@@ -1706,8 +1801,13 @@ pub fn rooms_in_reach(at: &ReachContext) -> Reach {
     let mut near: Vec<(f32, u8)> = DOORWAYS
         .iter()
         .filter_map(|&(bit, (dx, dy))| {
-            let door = (dx as f32 * arena::HALF, dy as f32 * arena::HALF);
-            let d = ((at.x - door.0).powi(2) + (at.y - door.1).powi(2)).sqrt();
+            let d = if at.open & bit != 0 {
+                // Open side: the distance to its line.
+                arena::HALF - (dx as f32 * at.x + dy as f32 * at.y)
+            } else {
+                let door = (dx as f32 * arena::HALF, dy as f32 * arena::HALF);
+                ((at.x - door.0).powi(2) + (at.y - door.1).powi(2)).sqrt()
+            };
             let limit = if at.near & bit != 0 {
                 WAKE_RELEASE
             } else {
@@ -1748,7 +1848,15 @@ mod tests {
 
     #[test]
     fn proximity_wake_reaches_doorways_only_two_at_most_with_hysteresis() {
-        let reach = |x: f32, y: f32, near: u8| rooms_in_reach(&ReachContext { x, y, near }).near;
+        let reach = |x: f32, y: f32, near: u8| {
+            rooms_in_reach(&ReachContext {
+                x,
+                y,
+                near,
+                open: 0,
+            })
+            .near
+        };
         // The middle of the room: nothing, and it releases everything.
         assert_eq!(reach(0.0, 0.0, 0), 0);
         assert_eq!(reach(0.0, 0.0, 15), 0);
@@ -1972,6 +2080,7 @@ mod tests {
                 },
                 &circles,
                 &Colliders::new(),
+                0,
             );
             let (dx, dy) = (s.x - o.x, s.y - o.y);
             assert!(
@@ -2093,6 +2202,7 @@ mod tests {
             },
             &[],
             ramps,
+            0,
         )
     }
 
@@ -2200,8 +2310,8 @@ mod tests {
                 buttons: if i % 33 == 0 { PitInput::JUMP } else { 0 },
                 ..PitInput::default()
             };
-            a = step_among(a, input, &[], &Colliders::new());
-            b = step_among(b, input, &[], &ramps);
+            a = step_among(a, input, &[], &Colliders::new(), 0);
+            b = step_among(b, input, &[], &ramps, 0);
             assert_eq!(a, b, "frame {i}");
         }
     }
@@ -2430,6 +2540,133 @@ mod tests {
             dashed.z >= 0.0 && dashed.y > 9.0,
             "a jump-dash clears it: {dashed:?}"
         );
+    }
+
+    #[test]
+    fn open_sides_are_shared_by_both_rooms_and_some_rooms_have_them() {
+        let mut rooms_with_open = 0;
+        for x in -8..8 {
+            for y in -8..8 {
+                let open = open_sides(DEFAULT_SEED, (x, y));
+                // East of (x, y) is west of (x + 1, y); north is south of (x, y + 1).
+                assert_eq!(open & 1 != 0, open_sides(DEFAULT_SEED, (x + 1, y)) & 2 != 0);
+                assert_eq!(open & 4 != 0, open_sides(DEFAULT_SEED, (x, y + 1)) & 8 != 0);
+                // The entrance and its neighbours keep their walls.
+                if x.abs() + y.abs() < 2 {
+                    assert_eq!(open, 0, "pit.{x}.{y}");
+                }
+                rooms_with_open += usize::from(open != 0);
+                assert_eq!(
+                    open,
+                    pit_room(&PitRoomContext {
+                        seed: DEFAULT_SEED,
+                        x,
+                        y
+                    })
+                    .open
+                );
+            }
+        }
+        assert!((60..200).contains(&rooms_with_open), "{rooms_with_open}");
+    }
+
+    #[test]
+    fn an_open_side_is_crossed_anywhere_but_a_closed_one_only_at_its_door() {
+        let walk = |open: u8, y: f32| {
+            let mut s = canonicalize(PitState {
+                x: 15.0,
+                y,
+                ..PitState::default()
+            });
+            for _ in 0..60 {
+                s = step_among(
+                    s,
+                    PitInput {
+                        mx: 127,
+                        ..PitInput::default()
+                    },
+                    &[],
+                    &Colliders::new(),
+                    open,
+                );
+            }
+            s
+        };
+        // Closed east side, 12 m off the doorway: held at the wall.
+        let held = walk(0, 12.0);
+        assert!(
+            held.x <= arena::HALF - arena::PLAYER_RADIUS + SLACK,
+            "{held:?}"
+        );
+        assert_eq!(crossing(held.x, held.y), None);
+        // Open east side: through anywhere along it, into the neighbour.
+        for y in [-19.0, -12.0, 0.0, 12.0, 19.0] {
+            let through = walk(1, y);
+            assert_eq!(
+                crossing(through.x, through.y),
+                Some((1, 0)),
+                "y {y}: {through:?}"
+            );
+            assert!((through.y - y).abs() < 0.6, "{through:?}");
+        }
+        // A corner stays walled even with both sides open.
+        let mut s = canonicalize(PitState {
+            x: 15.0,
+            y: 15.0,
+            ..PitState::default()
+        });
+        for _ in 0..60 {
+            s = step_among(
+                s,
+                PitInput {
+                    mx: 127,
+                    my: 127,
+                    ..PitInput::default()
+                },
+                &[],
+                &Colliders::new(),
+                1 | 4,
+            );
+            let lim = arena::HALF - arena::PLAYER_RADIUS + SLACK;
+            assert!(s.x.abs() <= lim || s.y.abs() <= lim, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn reach_wakes_a_neighbour_anywhere_along_an_open_side() {
+        let reach = |x: f32, y: f32, open: u8| {
+            rooms_in_reach(&ReachContext {
+                x,
+                y,
+                near: 0,
+                open,
+            })
+            .near
+        };
+        // 12 m along the east wall, 3 m from it: too far from the doorway,
+        // in reach of the open side.
+        assert_eq!(reach(17.0, 12.0, 0) & 1, 0);
+        assert_eq!(reach(17.0, 12.0, 1) & 1, 1);
+        assert_eq!(reach(0.0, 0.0, 15), 0);
+    }
+
+    #[test]
+    fn room_colliders_leave_out_the_walls_of_open_sides() {
+        let room = (-8..8)
+            .flat_map(|x| (-8..8).map(move |y| (x, y)))
+            .find(|&r| open_sides(DEFAULT_SEED, r) & 1 != 0)
+            .expect("a room open to the east");
+        let colliders = room_colliders(DEFAULT_SEED, room);
+        let ray = |y: f32| {
+            colliders
+                .raycast(&Ray::new([15.0, y, 1.0], [1.0, 0.0, 0.0], 10.0).mask(LAYER_SOLID))
+                .map(|hit| hit.point[0])
+        };
+        // Through the open side at any height of the wall line; the corner
+        // posts stand.
+        assert_eq!(ray(12.0), None);
+        assert_eq!(ray(-12.0), None);
+        assert!(ray(arena::HALF + 0.2).is_some());
     }
 
     #[test]

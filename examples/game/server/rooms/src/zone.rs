@@ -1569,6 +1569,10 @@ impl MobPit {
             [m.x, m.y] = ctx
                 .colliders()
                 .push_out([m.x, m.y], radius, layer::ALL & !LAYER_FLOOR);
+            // Mobs stay in their room (open sides have no wall to stop them).
+            let lim = movement::HALF - radius;
+            m.x = m.x.clamp(-lim, lim);
+            m.y = m.y.clamp(-lim, lim);
         }
         // Light separation so a pack does not stack on one spot.
         for i in 0..self.mobs.len() {

@@ -109,6 +109,7 @@ const PIT_ROOM_LAYOUT_TYPE: WireType = {
 		['ramps', { type: 'list', item: RAMP_TYPE }],
 		['holes', { type: 'list', item: HOLE_TYPE }],
 		['platforms', { type: 'list', item: PLATFORM_TYPE }],
+		['open', { type: 'u8' }],
 	]
 };
 
@@ -125,6 +126,7 @@ const REACH_CONTEXT_TYPE: WireType = {
 		['x', { type: 'f32' }],
 		['y', { type: 'f32' }],
 		['near', { type: 'u8' }],
+		['open', { type: 'u8' }],
 	]
 };
 

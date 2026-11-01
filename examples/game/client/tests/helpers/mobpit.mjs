@@ -145,9 +145,10 @@ export async function walkTo(pit, obstacles, [tx, ty], seen = { max: 0 }, timeou
  * Walk to the doorway on side `[dx, dy]` and through it (one command frame
  * per tick) until the client's authority is the next room and the own
  * player is predicted there again. Returns the new room and the own world
- * position sampled every frame on the way (`{ t, room, x, y }`).
+ * position sampled every frame on the way (`{ t, room, x, y }`). `along`
+ * is how far off the side's middle to cross (an open side: anywhere).
  */
-export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000) {
+export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000, along = 1.7) {
 	const { client } = pit;
 	const from = pit.room();
 	const deadline = Date.now() + timeoutMs;
@@ -164,8 +165,8 @@ export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000) {
 			// into the next room (world coordinates: the rooms are one world).
 			const [rx, ry] = from.split('.').slice(1).map(Number);
 			const size = 2 * 20;
-			const tx = rx * size + (dx !== 0 ? dx * 24 : 1.7);
-			const ty = ry * size + (dy !== 0 ? dy * 24 : 1.7);
+			const tx = rx * size + (dx !== 0 ? dx * 24 : along);
+			const ty = ry * size + (dy !== 0 ? dy * 24 : along);
 			const ddx = tx - at.x;
 			const ddy = ty - at.y;
 			const len = Math.max(Math.hypot(ddx, ddy), 1e-3);

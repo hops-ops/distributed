@@ -393,7 +393,7 @@ roomsMap.addEventListener(
 	{ passive: false }
 );
 type Box = { x0: number; y0: number; x1: number; y1: number };
-type MiniLayout = { biome: number; obstacles: { x: number; y: number; r: number }[]; ramps: readonly Ramp[]; holes: readonly Box[]; platforms: readonly Platform[] };
+type MiniLayout = { biome: number; obstacles: { x: number; y: number; r: number }[]; ramps: readonly Ramp[]; holes: readonly Box[]; platforms: readonly Platform[]; open: number };
 const roomLayouts = new Map<string, MiniLayout>();
 function roomLayout(seed: number, x: number, y: number): MiniLayout | undefined {
 	if (!pit.pures.loaded()) return undefined;
@@ -401,7 +401,7 @@ function roomLayout(seed: number, x: number, y: number): MiniLayout | undefined 
 	let layout = roomLayouts.get(key);
 	if (layout === undefined) {
 		const room = pit.pures.pitRoom({ seed, x, y });
-		layout = { biome: room.biome, obstacles: room.obstacles.map(({ x, y, r }) => ({ x, y, r })), ramps: room.ramps, holes: room.holes, platforms: room.platforms };
+		layout = { biome: room.biome, obstacles: room.obstacles.map(({ x, y, r }) => ({ x, y, r })), ramps: room.ramps, holes: room.holes, platforms: room.platforms, open: room.open };
 		if (roomLayouts.size > 400) roomLayouts.clear();
 		roomLayouts.set(key, layout);
 	}
@@ -482,11 +482,17 @@ function drawRooms(): void {
 				ctx.lineTo(...toMap(rx * ROOM_SIZE + bx, ry * ROOM_SIZE + by));
 				ctx.stroke();
 			};
+			// Open sides (no wall) are left out.
+			const open = layout?.open ?? 0;
 			for (const sign of [-1, 1]) {
-				wall(-HALF, sign * HALF, -door, sign * HALF);
-				wall(door, sign * HALF, HALF, sign * HALF);
-				wall(sign * HALF, -HALF, sign * HALF, -door);
-				wall(sign * HALF, door, sign * HALF, HALF);
+				if ((open & (sign > 0 ? 4 : 8)) === 0) {
+					wall(-HALF, sign * HALF, -door, sign * HALF);
+					wall(door, sign * HALF, HALF, sign * HALF);
+				}
+				if ((open & (sign > 0 ? 1 : 2)) === 0) {
+					wall(sign * HALF, -HALF, sign * HALF, -door);
+					wall(sign * HALF, door, sign * HALF, HALF);
+				}
 			}
 			// Room state as the tile's inner border.
 			const status = row === undefined ? undefined : STATUS_COLOR[row.status];
@@ -907,13 +913,20 @@ function createChunk(room: Room): Chunk {
 	const off = PIT_WORLD.doorHalf + templates.segment / 2;
 	const out = HALF + WALL_T / 2;
 	const wall = templates.walls[biome ?? 0] ?? templates.wall;
+	// An open side (no wall, crossed anywhere) has neither wall nor door
+	// gate; the corner posts always stand.
+	const open = layout?.open ?? 0;
 	for (const side of [-1, 1]) {
+		const openH = (open & (side > 0 ? 4 : 8)) !== 0;
+		const openV = (open & (side > 0 ? 1 : 2)) !== 0;
 		for (const along of [-1, 1]) {
-			add(wall, `wall-h${side}${along}`, along * off, side * out, WALL_H / 2);
-			add(wall, `wall-v${side}${along}`, side * out, along * off, WALL_H / 2, Math.PI / 2);
+			if (!openH) add(wall, `wall-h${side}${along}`, along * off, side * out, WALL_H / 2);
+			if (!openV) add(wall, `wall-v${side}${along}`, side * out, along * off, WALL_H / 2, Math.PI / 2);
+			const post = add(wall, `post-${side}${along}`, side * out, along * out, WALL_H / 2);
+			post.scaling.set(WALL_T / templates.segment, 1, 1);
 		}
-		add(templates.gate, `door-h${side}`, 0, side * HALF, 0.04);
-		add(templates.gate, `door-v${side}`, side * HALF, 0, 0.04, Math.PI / 2);
+		if (!openH) add(templates.gate, `door-h${side}`, 0, side * HALF, 0.04);
+		if (!openV) add(templates.gate, `door-v${side}`, side * HALF, 0, 0.04, Math.PI / 2);
 	}
 	// The room's seeded obstacles (what the step collides with).
 	const obstacles = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }).obstacles : PILLARS.map((p) => ({ ...p, look: 0 }));

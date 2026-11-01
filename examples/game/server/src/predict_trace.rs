@@ -217,6 +217,33 @@ fn pit_streams() -> Vec<Stream> {
             inputs: pit_frames(random(0x51ed ^ x as u32, 1200, 0), x as u32),
         });
     }
+    // Rooms with open sides: along a side, into it (out to the passage's
+    // end), into a corner and back, with dashes.
+    let open_rooms = (2..60)
+        .map(|x| (x, 4))
+        .filter(|&r| game_sim::mobpit::open_sides(DEFAULT_SEED, r) != 0)
+        .take(3);
+    for (x, y) in open_rooms {
+        let dash = game_sim::arena::BUTTON_DASH;
+        let mut frames = Vec::new();
+        for (mx, my, buttons, n) in [
+            (127i8, 30i8, 0u8, 90usize),
+            (127, 0, dash, 20),
+            (-127, 127, 0, 90),
+            (0, 127, dash, 60),
+            (127, 127, 0, 60),
+            (-127, -127, dash, 120),
+            (0, -127, 0, 120),
+        ] {
+            frames.extend(std::iter::repeat_n(vec![mx as u8, my as u8, buttons], n));
+        }
+        streams.push(Stream {
+            name: format!("pit.{x}.{y} open sides"),
+            start: start(12.0, 8.0),
+            context: context(x, y),
+            inputs: pit_frames(frames, x as u32),
+        });
+    }
     // Rooms with holes: walkers fall in, jumps cross them.
     let holed = (2..60)
         .filter(|&x| !game_sim::mobpit::room_holes(DEFAULT_SEED, (x, 3)).is_empty())
@@ -286,7 +313,7 @@ fn rooms_in_reach_args() -> Vec<Vec<u8>> {
         rng ^= rng << 5;
         rng
     };
-    for near in 0..16u8 {
+    for (near, open) in (0..16u8).flat_map(|near| [(near, 0u8), (near, near ^ 0b0101)]) {
         for &(x, y) in &[
             (0.0, 0.0),
             (9.0, 0.0),
@@ -298,12 +325,12 @@ fn rooms_in_reach_args() -> Vec<Vec<u8>> {
             (18.0, 18.0),
             (-6.0, 11.0),
         ] {
-            args.push(game_sim::mobpit::ReachContext { x, y, near }.encode_context());
+            args.push(game_sim::mobpit::ReachContext { x, y, near, open }.encode_context());
         }
         for _ in 0..4 {
             let x = (next() % 4400) as f32 / 100.0 - 22.0;
             let y = (next() % 4400) as f32 / 100.0 - 22.0;
-            args.push(game_sim::mobpit::ReachContext { x, y, near }.encode_context());
+            args.push(game_sim::mobpit::ReachContext { x, y, near, open }.encode_context());
         }
     }
     args

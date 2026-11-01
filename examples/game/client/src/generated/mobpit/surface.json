@@ -1552,6 +1552,12 @@
             },
             "type": "list"
           }
+        },
+        {
+          "name": "open",
+          "type": {
+            "type": "u8"
+          }
         }
       ],
       "name": "PitRoomLayout"
@@ -1954,6 +1960,12 @@
         },
         {
           "name": "near",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "open",
           "type": {
             "type": "u8"
           }

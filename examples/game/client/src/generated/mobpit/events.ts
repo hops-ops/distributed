@@ -126,6 +126,7 @@ export interface PitRoomLayout {
 	readonly ramps: readonly Ramp[];
 	readonly holes: readonly Hole[];
 	readonly platforms: readonly Platform[];
+	readonly open: number;
 }
 
 /** Record `PitRules` (`#[derive(GameRecord)]`). */
@@ -208,6 +209,7 @@ export interface ReachContext {
 	readonly x: number;
 	readonly y: number;
 	readonly near: number;
+	readonly open: number;
 }
 
 /** Record `RoomTerrain` (`#[derive(GameRecord)]`). */
