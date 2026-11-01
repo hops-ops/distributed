@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use crate::authoring::GameEvent;
 use crate::clock::Clock;
+use crate::collide::{Colliders, Ray, RayHit};
 use crate::facts::{EmitError, Fact, FactCommand, FactQueue, FactSettlement};
 use crate::handoff::{HandoffError, HandoffRequest, Transfer, TransferIssuer, MAX_CARRIED_BYTES};
 use crate::inbox::{Delivered, ZoneInbound};
@@ -45,7 +46,7 @@ use crate::protocol::{
     error, feature, kick, Notice, Role, ServerMessage, Welcome, PROTOCOL_VERSION,
 };
 use crate::replication::{ClientReplica, DeltaStats, EncodedWorld, WorldView};
-use crate::rewind::{Rewind, RewindConfig, RewindFrame};
+use crate::rewind::{Rewind, RewindConfig, RewindFrame, ShotTiming};
 use crate::rng::ZoneRng;
 use crate::schema::EntitySchema;
 use crate::stamp::FactStamp;
@@ -272,6 +273,7 @@ pub(crate) struct Core<Z: Zone> {
     facts: Option<FactQueue>,
     pending_kicks: Vec<(PlayerId, String)>,
     rewind: Rewind,
+    colliders: Colliders,
     transfer_issuer: Option<Box<TransferIssuer>>,
     /// Handoffs to finish after the hook: player, `Handoff` message and the
     /// departure stamp time signed into the transfer ticket.
@@ -687,6 +689,58 @@ impl<Z: Zone> Ctx<'_, Z> {
         &self.core.rewind
     }
 
+    /// Set the zone's static level geometry (replaces any before). Call it
+    /// from [`Zone::on_create`], which runs on every wake.
+    pub fn set_colliders(&mut self, colliders: Colliders) {
+        self.core.colliders = colliders;
+    }
+
+    /// The zone's static level geometry.
+    pub fn colliders(&self) -> &Colliders {
+        &self.core.colliders
+    }
+
+    /// Closest hit of `ray` now: the latest recorded entities
+    /// ([`Zone::record_rewind`]) and the colliders.
+    pub fn raycast(&self, ray: &Ray) -> Option<RayHit> {
+        let rewind = &self.core.rewind;
+        match rewind.latest() {
+            Some(frame) => rewind.raycast_at(frame.time(), ray, &self.core.colliders, |_| true),
+            None => self.core.colliders.raycast(ray),
+        }
+    }
+
+    /// Closest hit of `ray` with the entities as they were at `time` (from
+    /// [`Rewind::resolve`]) and the colliders.
+    pub fn raycast_at(&self, time: Duration, ray: &Ray) -> Option<RayHit> {
+        self.raycast_where(time, ray, |_| true)
+    }
+
+    /// [`raycast_at`](Self::raycast_at) passing through the entities
+    /// `accept` refuses (game state a layer cannot say, e.g. a mob killed
+    /// since the shooter's view time).
+    pub fn raycast_where(
+        &self,
+        time: Duration,
+        ray: &Ray,
+        accept: impl FnMut(u32) -> bool,
+    ) -> Option<RayHit> {
+        self.core
+            .rewind
+            .raycast_at(time, ray, &self.core.colliders, accept)
+    }
+
+    /// Lag-compensated shot: closest hit of `ray` with the entities as the
+    /// shooter saw them (`timing`, clamped by [`RewindConfig::max_rewind`])
+    /// and the colliders; the latest state when the view time cannot be
+    /// resolved.
+    pub fn raycast_shot(&self, timing: ShotTiming, ray: &Ray) -> Option<RayHit> {
+        match self.core.rewind.resolve(timing) {
+            Some(resolved) => self.raycast_at(resolved.time, ray),
+            None => self.raycast(ray),
+        }
+    }
+
     /// Reliable event to one viewer (dropped if it has no live connection).
     pub fn send_event(&mut self, to: impl Into<Viewer>, type_id: u32, payload: Vec<u8>) {
         if let Some(client) = self.core.client_of(to.into()) {
@@ -900,6 +954,7 @@ impl<Z: Zone> ZoneHost<Z> {
             facts: None,
             pending_kicks: Vec::new(),
             rewind: Rewind::new(config.rewind, config.tick_rate),
+            colliders: Colliders::new(),
             transfer_issuer: None,
             pending_handoffs: Vec::new(),
             upward: Vec::new(),

@@ -65,6 +65,7 @@ pub mod celld_zone;
 pub mod claims;
 pub mod clock;
 pub mod codec;
+pub mod collide;
 #[cfg(feature = "cell")]
 pub mod command_sink;
 pub mod entity;
@@ -105,6 +106,7 @@ pub use authoring::{GameEvent, GameInput, Pushed, Replicated};
 pub use claims::{ExtensionError, ExtensionSchema, TicketExtension, TicketExtensions};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use codec::{Wire, WireType};
+pub use collide::{Collider, Colliders, Ray, RayHit, Target};
 /// Authoring derives (see the crate docs and README).
 pub use distributed_game_macros::{
     game_pure, predict, FactCommand, GameEvent, GameInput, GameRecord, Replicated, TicketExtension,

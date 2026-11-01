@@ -141,6 +141,31 @@ How it behaves:
 - **Other reads.** `refresh`/`refresh_every` remain for async reads that
   are not cell views.
 
+## Hits and walls: one raycast
+
+Declare level geometry once in `on_create`, then ask one question per
+shot. The answer is the closest entity or wall, so walls block shots
+without game-side geometry code:
+
+```rust
+ctx.set_colliders(pillars.iter()
+    .map(|p| Collider::cylinder([p.x, p.y], p.r, PILLAR_HEIGHT))
+    .fold(Colliders::new(), Colliders::with));
+
+let ray = Ray::new(origin, dir, RANGE).ignoring(shooter);
+let hit = ctx.raycast_where(time, &ray, |id| alive(id)); // or raycast_shot(timing, ..)
+let at = hit.map_or_else(|| ray.at(ray.max_dist), |h| h.point);
+```
+
+- `RayHit` holds `target` (`Entity(id)` or `Static(index)`), `distance`,
+  `point` and `normal`; use the point and normal to place the impact.
+- A ray's layer `mask` and `ignoring(id)` skip the shooter and
+  transparent things. Use an `accept` filter for game state the layers
+  don't hold.
+- `ctx.colliders().push_out(at, radius, mask)` keeps server-moved bodies
+  out of walls.
+- Client prediction is not affected: `sim` does its own movement.
+
 ## Checking your work
 
 - `cargo test -p distributed_game --all-features` runs the native host, the

@@ -50,7 +50,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
-use distributed_game::rewind::{Historic, HitQuery, RewindFrame, ShotTiming};
+use distributed_game::collide::{layer, Collider, Colliders, Ray, Target};
+use distributed_game::rewind::{Historic, RewindFrame, ShotTiming};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EmitError, Entities, Entity, EntityId, EntitySchema, Fact,
     FactOutcome, FactSettlement, GameEvent, GameInput, GameRecord, GameSurface, LeaveReason,
@@ -896,28 +897,6 @@ fn spawn_point(player: PlayerId) -> (f32, f32) {
     SPOTS[player.0 as usize % SPOTS.len()]
 }
 
-fn push_out_of_pillars(x: &mut f32, y: &mut f32, radius: f32, pillars: &[Pillar]) {
-    for &Pillar {
-        x: px,
-        y: py,
-        r: pr,
-        ..
-    } in pillars
-    {
-        let (ox, oy) = (*x - px, *y - py);
-        let d2 = ox * ox + oy * oy;
-        let min = radius + pr;
-        if d2 < min * min {
-            let d = d2.sqrt().max(1e-4);
-            *x = px + ox / d * min;
-            *y = py + oy / d * min;
-        }
-    }
-    let lim = movement::HALF - radius;
-    *x = x.clamp(-lim, lim);
-    *y = y.clamp(-lim, lim);
-}
-
 fn step_toward(x: &mut f32, y: &mut f32, tx: f32, ty: f32, stride: f32) -> f32 {
     let (dx, dy) = (tx - *x, ty - *y);
     let d = (dx * dx + dy * dy).sqrt();
@@ -1348,8 +1327,9 @@ impl MobPit {
     /// tested against the mobs as they were at the shooter's view time
     /// (`client_tick` minus the interpolation delay the shot carries,
     /// `ctx.rewind()`, clamped to `MAX_REWIND_MS`), or against the latest
-    /// state with compensation off. Obstacles stop arrows. Each shooter
-    /// gets a verdict ([`PitEvent::Shot`]).
+    /// state with compensation off. Obstacles stop arrows (the room's
+    /// colliders, [`Ctx::raycast_where`]). Each shooter gets a verdict
+    /// ([`PitEvent::Shot`]).
     fn resolve_fires(&mut self, ctx: &mut Ctx<'_, Self>) {
         let fires = std::mem::take(&mut self.fires);
         let mut verdicts = Vec::with_capacity(fires.len());
@@ -1359,7 +1339,7 @@ impl MobPit {
                 return;
             };
             for fire in &fires {
-                let query = HitQuery::ray(fire.origin, fire.dir, RANGE);
+                let ray = Ray::new(fire.origin, fire.dir, RANGE);
                 let timing = ShotTiming {
                     client_tick: fire.client_tick,
                     interp_delay: Duration::from_millis(fire.delay_ms.into()),
@@ -1374,32 +1354,30 @@ impl MobPit {
                         false,
                     ),
                 };
+                // A mob killed since the shooter's view time lets the arrow
+                // through.
                 let mobs = &self.mobs;
-                let hit = rewind
-                    .hit_test(time, &query, |id| {
-                        mobs.get(id as usize - 1)
-                            .is_some_and(|m| m.state != MobState::Dead)
-                    })
-                    .map(|h| (h.id, h.distance))
-                    .filter(|&(_, d)| d < self.blocked_at(fire.origin, fire.dir));
-                verdicts.push((hit, time, age, requested, clamped));
+                let hit = ctx.raycast_where(time, &ray, |id| {
+                    mobs.get(id as usize - 1)
+                        .is_some_and(|m| m.state != MobState::Dead)
+                });
+                let at = hit.map_or_else(|| ray.at(ray.max_dist), |h| h.point);
+                let mob = hit.and_then(|h| match h.target {
+                    Target::Entity(id) => Some(id),
+                    Target::Static(_) => None,
+                });
+                verdicts.push((mob, at, age, requested, clamped));
             }
         }
-        for (fire, (hit, _, age, requested, clamped)) in fires.into_iter().zip(verdicts) {
-            let distance = hit.map_or(RANGE.min(self.blocked_at(fire.origin, fire.dir)), |h| h.1);
-            let at = [
-                fire.origin[0] + fire.dir[0] * distance,
-                fire.origin[1] + fire.dir[1] * distance,
-                fire.origin[2] + fire.dir[2] * distance,
-            ];
-            if let Some((id, _)) = hit {
+        for (fire, (mob, at, age, requested, clamped)) in fires.into_iter().zip(verdicts) {
+            if let Some(id) = mob {
                 self.hurt_mob(ctx, fire.player, id as usize - 1, RANGED_DAMAGE);
             }
             ctx.send(
                 fire.player,
                 &PitEvent::Shot {
                     shot: fire.shot,
-                    hit: hit.map(|h| h.0),
+                    hit: mob,
                     compensated: fire.compensated,
                     age_ms: age.as_secs_f32() * 1000.0,
                     requested_age_ms: requested.as_secs_f32() * 1000.0,
@@ -1410,31 +1388,6 @@ impl MobPit {
                 },
             );
         }
-    }
-
-    /// Distance along a ray to the first obstacle it meets below its top
-    /// (a column, boulder or tree), or the range.
-    fn blocked_at(&self, origin: [f32; 3], dir: [f32; 3]) -> f32 {
-        let flat = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
-        if flat < 1e-4 {
-            return RANGE;
-        }
-        let (ux, uy) = (dir[0] / flat, dir[1] / flat);
-        let mut best = RANGE;
-        for o in &self.pillars {
-            let (ox, oy) = (o.x - origin[0], o.y - origin[1]);
-            let along = ox * ux + oy * uy;
-            let off2 = ox * ox + oy * oy - along * along;
-            if along <= 0.0 || off2 > o.r * o.r {
-                continue;
-            }
-            // Horizontal distance to the entry, then along the 3D ray.
-            let entry = (along - (o.r * o.r - off2).sqrt()) / flat;
-            if (0.0..best).contains(&entry) && origin[2] + dir[2] * entry < OBSTACLE_HEIGHT {
-                best = entry;
-            }
-        }
-        best
     }
 
     fn step_mobs(&mut self, ctx: &mut Ctx<'_, Self>) {
@@ -1559,7 +1512,7 @@ impl MobPit {
                 }
             }
             let m = &mut self.mobs[i];
-            push_out_of_pillars(&mut m.x, &mut m.y, radius, &self.pillars);
+            [m.x, m.y] = ctx.colliders().push_out([m.x, m.y], radius, layer::ALL);
         }
         // Light separation so a pack does not stack on one spot.
         for i in 0..self.mobs.len() {
@@ -1723,6 +1676,14 @@ impl Zone for MobPit {
             x: room.room.0,
             y: room.room.1,
         });
+        // Columns, boulders and trees: arrows stop at them, mobs walk round.
+        let pillars = Pillar::of(&layout.obstacles);
+        ctx.set_colliders(
+            pillars
+                .iter()
+                .map(|o| Collider::cylinder([o.x, o.y], o.r, OBSTACLE_HEIGHT))
+                .fold(Colliders::new(), Colliders::with),
+        );
         let mobs = layout
             .mobs
             .iter()
@@ -1752,7 +1713,7 @@ impl Zone for MobPit {
             room,
             players: BTreeMap::new(),
             mobs,
-            pillars: Pillar::of(&layout.obstacles),
+            pillars,
             pending: HashMap::new(),
             backlog: VecDeque::new(),
             last_tick: None,
