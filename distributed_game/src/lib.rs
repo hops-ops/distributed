@@ -101,6 +101,7 @@ pub mod timestep;
 pub mod work;
 pub mod world;
 pub mod zone;
+pub mod zone_message;
 
 pub use authoring::{GameEvent, GameInput, Pushed, Replicated};
 pub use claims::{ExtensionError, ExtensionSchema, TicketExtension, TicketExtensions};
@@ -142,6 +143,7 @@ pub use zone::{
     Admission, ClientId, JoinRequest, LeaveReason, ObserverId, ObserverInfo, PlayerId, PlayerInfo,
     TicketClaims, Tier, Viewer, Zone,
 };
+pub use zone_message::{VerifiedPrincipal, ZoneEnvelope, ZoneMessageError, ZoneSender};
 
 /// Paths used by derive-generated code. Not public API.
 #[doc(hidden)]

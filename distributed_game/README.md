@@ -911,6 +911,39 @@ one-player rooms or 4–5 fifty-player rooms per core at 30 Hz; forwarding
 through another node adds under a millisecond; a hibernated room wakes in
 35–130 ms (p50).
 
+### Zone-to-zone messages
+
+A running zone can tell another running zone something: a shot that
+carries on through a doorway, a mob that follows a player across. It
+sends its own `Zone::Message` type; the target handles it in
+`on_zone_message`:
+
+```rust,ignore
+// Sender: bind the shooter's verified principal into the message.
+ctx.send_zone_for(player, "pit.1.0", &PitMessage::LaserLeg { .. });
+
+// Target:
+fn on_zone_message(&mut self, ctx: &mut Ctx<Self>, from: &ZoneSender, msg: PitMessage) {
+    if let Some(who) = &from.principal {
+        ctx.emit_fact_as(who, kill_fact);   // reward the remote shooter
+    }
+}
+```
+
+Each [`ZoneEnvelope`](src/zone_message.rs) has an id unique to the
+sending activation (`zone/boot_epoch/seq`); `deliver_zone` drops a repeat.
+The receiver sees the sender's principal only as a `VerifiedPrincipal`,
+which game code cannot make: it came from a verified ticket in the sending
+zone, and facts on behalf of it go through `emit_fact_as`. Drivers move
+envelopes with `ZoneHost::take_zone_messages` and `deliver_zone`; on celld
+the object posts them to `POST /{zone}/__zone` on its own class with the
+internal secret (never a public route). A message for a sleeping zone is
+refused (409): messages never wake zones. Delivery is best effort, so a
+transfer that must not lose or duplicate state needs its own protocol:
+Mob Pit's crossing mob is leased (the visitor renews with its home room;
+it lapses before the home room reclaims it), so the mob is never live in
+two rooms and a lost message only brings it home.
+
 ### Scaling out: the native multi-host server
 
 The `net` server can also spread zones over several processes itself
@@ -971,7 +1004,7 @@ cylinders and axis-aligned boxes, each extruded up from the floor. One
 query then finds the closest hit among entities and walls, so a shot
 stops at a pillar instead of passing through it:
 
-```rust
+```rust,ignore
 ctx.set_colliders(Colliders::new()
     .with(Collider::cylinder([4.0, 2.0], 0.8, 2.4))
     .with(Collider::aabb([-20.0, 19.5], [20.0, 20.0], 3.0)));
