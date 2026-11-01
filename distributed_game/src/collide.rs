@@ -134,6 +134,8 @@ pub enum Target {
     Entity(u32),
     /// A static collider (its index in [`Colliders`]).
     Static(usize),
+    /// The terrain ([`Colliders::with_terrain`]).
+    Terrain,
 }
 
 /// The closest hit of a [`Ray`].
@@ -206,8 +208,8 @@ impl Uphill {
 /// The top surface under a point ([`Colliders::ground_at`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ground {
-    /// The collider ([`Target::Static`] index).
-    pub index: usize,
+    /// What it stands on: a collider ([`Target::Static`]) or the terrain.
+    pub target: Target,
     /// Height of the surface there.
     pub height: f32,
     /// Its unit normal (up for a flat top).
@@ -228,7 +230,147 @@ impl Trace {
     pub fn entity(&self) -> Option<u32> {
         match self.hits.last()?.target {
             Target::Entity(id) => Some(id),
-            Target::Static(_) => None,
+            Target::Static(_) | Target::Terrain => None,
+        }
+    }
+}
+
+/// [`Heightfield`] sample with no ground: a hole.
+pub const HOLE: f32 = f32::NEG_INFINITY;
+
+/// Terrain: heights sampled on a regular grid and bilinear between the
+/// samples (rolling hills), with [`HOLE`] samples where there is no
+/// ground. A cell with a hole corner is open: rays pass and movers fall.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Heightfield {
+    min: [f32; 2],
+    cell: f32,
+    nx: usize,
+    ny: usize,
+    heights: Vec<f32>,
+    top: f32,
+}
+
+impl Heightfield {
+    /// `nx × ny` samples (each ≥ 2), the first at `min`, `cell` apart, of
+    /// `height(x, y)`.
+    pub fn new(
+        min: [f32; 2],
+        cell: f32,
+        nx: usize,
+        ny: usize,
+        mut height: impl FnMut(f32, f32) -> f32,
+    ) -> Self {
+        let mut heights = Vec::with_capacity(nx * ny);
+        for j in 0..ny {
+            for i in 0..nx {
+                heights.push(height(min[0] + i as f32 * cell, min[1] + j as f32 * cell));
+            }
+        }
+        Self::from_samples(min, cell, nx, ny, heights)
+    }
+
+    /// From samples, row by row (`y` outer, `x` inner).
+    pub fn from_samples(min: [f32; 2], cell: f32, nx: usize, ny: usize, heights: Vec<f32>) -> Self {
+        assert!(nx >= 2 && ny >= 2 && heights.len() == nx * ny && cell > 0.0);
+        let top = heights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        Self {
+            min,
+            cell,
+            nx,
+            ny,
+            heights,
+            top,
+        }
+    }
+
+    /// The first sample's position.
+    pub fn min(&self) -> [f32; 2] {
+        self.min
+    }
+
+    /// Sample spacing.
+    pub fn cell(&self) -> f32 {
+        self.cell
+    }
+
+    /// Samples along x and y.
+    pub fn size(&self) -> (usize, usize) {
+        (self.nx, self.ny)
+    }
+
+    /// Every sample, row by row.
+    pub fn samples(&self) -> &[f32] {
+        &self.heights
+    }
+
+    /// Highest sample.
+    pub fn top(&self) -> f32 {
+        self.top
+    }
+
+    /// Height and unit normal at `[x, y]`; `None` off the grid or over a
+    /// hole.
+    pub fn height_at(&self, at: [f32; 2]) -> Option<(f32, Vec3)> {
+        let fx = (at[0] - self.min[0]) / self.cell;
+        let fy = (at[1] - self.min[1]) / self.cell;
+        let (lx, ly) = ((self.nx - 1) as f32, (self.ny - 1) as f32);
+        if !(0.0..=lx).contains(&fx) || !(0.0..=ly).contains(&fy) {
+            return None;
+        }
+        let i = (fx.floor() as usize).min(self.nx - 2);
+        let j = (fy.floor() as usize).min(self.ny - 2);
+        let (tx, ty) = (fx - i as f32, fy - j as f32);
+        let h = |a: usize, b: usize| self.heights[b * self.nx + a];
+        let (h00, h10, h01, h11) = (h(i, j), h(i + 1, j), h(i, j + 1), h(i + 1, j + 1));
+        if [h00, h10, h01, h11].contains(&HOLE) {
+            return None;
+        }
+        let height =
+            (h00 * (1.0 - tx) + h10 * tx) * (1.0 - ty) + (h01 * (1.0 - tx) + h11 * tx) * ty;
+        let dx = ((h10 - h00) * (1.0 - ty) + (h11 - h01) * ty) / self.cell;
+        let dy = ((h01 - h00) * (1.0 - tx) + (h11 - h10) * tx) / self.cell;
+        let raw = [-dx, -dy, 1.0];
+        Some((height, scale(raw, 1.0 / norm(raw))))
+    }
+
+    /// Where `ray` first meets the surface (marched half a cell at a time,
+    /// then bisected); starting under it = 0.
+    pub fn raycast(&self, ray: &Ray) -> Option<(f32, Vec3)> {
+        if ray.max_dist <= 0.0 || (ray.dir[2] >= 0.0 && ray.origin[2] > self.top) {
+            return None;
+        }
+        let under = |t: f32| {
+            let p = ray.at(t);
+            self.height_at([p[0], p[1]]).is_some_and(|(h, _)| p[2] <= h)
+        };
+        if under(0.0) {
+            return Some((0.0, scale(ray.dir, -1.0)));
+        }
+        let step = self.cell * 0.5;
+        let (mut lo, mut t) = (0.0f32, step.min(ray.max_dist));
+        loop {
+            if under(t) {
+                let mut hi = t;
+                for _ in 0..14 {
+                    let mid = 0.5 * (lo + hi);
+                    if under(mid) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                let p = ray.at(hi);
+                let normal = self
+                    .height_at([p[0], p[1]])
+                    .map_or([0.0, 0.0, 1.0], |(_, n)| n);
+                return Some((hi, normal));
+            }
+            if t >= ray.max_dist {
+                return None;
+            }
+            lo = t;
+            t = (t + step).min(ray.max_dist);
         }
     }
 }
@@ -443,6 +585,7 @@ impl Collider {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Colliders {
     shapes: Vec<Collider>,
+    terrain: Option<(Heightfield, u32)>,
 }
 
 impl Colliders {
@@ -461,6 +604,17 @@ impl Colliders {
     pub fn push(&mut self, collider: Collider) -> usize {
         self.shapes.push(collider);
         self.shapes.len() - 1
+    }
+
+    /// Terrain under everything, on `layers` (builder).
+    pub fn with_terrain(mut self, field: Heightfield, layers: u32) -> Self {
+        self.terrain = Some((field, layers));
+        self
+    }
+
+    /// The terrain, if any.
+    pub fn terrain(&self) -> Option<&Heightfield> {
+        self.terrain.as_ref().map(|(field, _)| field)
     }
 
     /// The collider at `index`.
@@ -501,6 +655,25 @@ impl Colliders {
                 }
             }
         }
+        if let Some((field, layers)) = &self.terrain {
+            if ray.meets(*layers) {
+                // Only nearer than the best so far.
+                let near = Ray {
+                    max_dist: best.map_or(ray.max_dist, |b| b.distance),
+                    ..*ray
+                };
+                if let Some((distance, normal)) = field.raycast(&near) {
+                    if best.is_none_or(|b| distance < b.distance) {
+                        best = Some(RayHit {
+                            target: Target::Terrain,
+                            distance,
+                            point: ray.at(distance),
+                            normal,
+                        });
+                    }
+                }
+            }
+        }
         best
     }
 
@@ -514,10 +687,23 @@ impl Colliders {
             if let Some((height, normal)) = collider.top_at(at) {
                 if best.is_none_or(|b| height > b.height) {
                     best = Some(Ground {
-                        index,
+                        target: Target::Static(index),
                         height,
                         normal,
                     });
+                }
+            }
+        }
+        if let Some((field, layers)) = &self.terrain {
+            if mask & layers != 0 {
+                if let Some((height, normal)) = field.height_at(at) {
+                    if best.is_none_or(|b| height > b.height) {
+                        best = Some(Ground {
+                            target: Target::Terrain,
+                            height,
+                            normal,
+                        });
+                    }
                 }
             }
         }
@@ -790,7 +976,10 @@ mod tests {
         let down = floor
             .raycast(&Ray::new([0.0, 0.0, 2.0], [1.0, 0.0, -1.0], 100.0))
             .unwrap();
-        assert!(close(down.point[2], 0.0) && close(down.point[0], 2.0), "{down:?}");
+        assert!(
+            close(down.point[2], 0.0) && close(down.point[0], 2.0),
+            "{down:?}"
+        );
         assert!(close3(down.normal, [0.0, 0.0, 1.0]));
         let up = floor
             .raycast(&Ray::new([0.0, 0.0, -1.0], [0.0, 0.0, 1.0], 100.0))
@@ -946,11 +1135,11 @@ mod tests {
             .with(steep)
             .with(Collider::cylinder([3.0, 0.0], 0.2, 2.5));
         let on_ramp = world.ground_at([1.0, 0.5], layer::ALL).unwrap();
-        assert_eq!(on_ramp.index, 0);
+        assert_eq!(on_ramp.target, Target::Static(0));
         assert!(close(on_ramp.height, 1.0 / 3f32.sqrt()), "{on_ramp:?}");
         assert!(walkable(on_ramp.normal));
         let column = world.ground_at([3.0, 0.0], layer::ALL).unwrap();
-        assert_eq!((column.index, column.height), (2, 2.5));
+        assert_eq!((column.target, column.height), (Target::Static(2), 2.5));
         assert!(walkable(column.normal));
         assert!(!walkable(
             world.ground_at([5.5, 0.0], layer::ALL).unwrap().normal
@@ -1015,6 +1204,76 @@ mod tests {
         });
         assert_eq!(pinball.hits.len(), 4);
         assert_eq!(pinball.end, pinball.hits[3].point);
+    }
+
+    /// A hill `1 − (x² + y²)/16` (r 4) on a 20 m grid, a hole at x > 6.
+    fn hill() -> Heightfield {
+        Heightfield::new([-10.0, -10.0], 0.5, 41, 41, |x, y| {
+            if x > 6.0 {
+                HOLE
+            } else {
+                (1.0 - (x * x + y * y) / 16.0).max(0.0)
+            }
+        })
+    }
+
+    #[test]
+    fn terrain_has_heights_normals_and_holes() {
+        let field = hill();
+        let (h, n) = field.height_at([0.0, 0.0]).unwrap();
+        assert!(close(h, 1.0) && n[2] > 0.99, "{h} {n:?}");
+        // On its flank the normal leans away from the top.
+        let (h, n) = field.height_at([2.0, 0.0]).unwrap();
+        assert!((h - 0.75).abs() < 0.02, "{h}");
+        assert!(n[0] > 0.2 && n[1].abs() < 0.05 && n[2] > 0.9, "{n:?}");
+        assert!(walkable(n));
+        assert!(field.height_at([8.0, 0.0]).is_none(), "a hole");
+        assert!(field.height_at([11.0, 0.0]).is_none(), "off the grid");
+        let world = Colliders::new()
+            .with(Collider::aabb([-1.0, 5.0], [1.0, 7.0], 1.5))
+            .with_terrain(field, layer::DEFAULT);
+        assert_eq!(
+            world.ground_at([0.0, 0.0], layer::ALL).unwrap().target,
+            Target::Terrain
+        );
+        let platform = world.ground_at([0.0, 6.0], layer::ALL).unwrap();
+        assert_eq!((platform.target, platform.height), (Target::Static(0), 1.5));
+        assert!(world.ground_at([8.0, 0.0], layer::ALL).is_none());
+    }
+
+    #[test]
+    fn a_ray_lands_on_a_hill_and_bounces_off_its_flank() {
+        let world = Colliders::new().with_terrain(hill(), layer::DEFAULT);
+        let down = world
+            .raycast(&Ray::new([2.0, 0.0, 5.0], [0.0, 0.0, -1.0], 100.0))
+            .unwrap();
+        assert_eq!(down.target, Target::Terrain);
+        assert!((down.point[2] - 0.75).abs() < 0.02, "{down:?}");
+        // Level, low: into the hill's side, thrown up and back.
+        let level = world
+            .raycast(&Ray::new([-9.0, 0.0, 0.5], [1.0, 0.0, 0.0], 100.0))
+            .unwrap();
+        assert!(level.point[0] < -2.0 && level.point[0] > -3.2, "{level:?}");
+        let out = reflect([1.0, 0.0, 0.0], level.normal);
+        assert!(out[0] < 1.0 && out[2] > 0.0, "{out:?}");
+        // Over the top, and down the hole.
+        assert!(world
+            .raycast(&Ray::new([-9.0, 0.0, 1.2], [1.0, 0.0, 0.0], 100.0))
+            .is_none());
+        assert!(world
+            .raycast(&Ray::new([8.0, 0.0, 5.0], [0.0, 0.0, -1.0], 100.0))
+            .is_none());
+        // A nearer wall still wins.
+        let walled = Colliders::new()
+            .with(Collider::aabb([-6.0, -1.0], [-5.5, 1.0], 3.0))
+            .with_terrain(hill(), layer::DEFAULT);
+        assert_eq!(
+            walled
+                .raycast(&Ray::new([-9.0, 0.0, 0.5], [1.0, 0.0, 0.0], 100.0))
+                .unwrap()
+                .target,
+            Target::Static(0)
+        );
     }
 
     #[test]

@@ -502,6 +502,9 @@ fn fits(x: f32, y: f32, r: f32, keep: &[(f32, f32, f32)], placed: &[Obstacle]) -
     })
 }
 
+/// [`RING8`], for traces and tests.
+pub const RING8_DIRS: [(f32, f32); 8] = RING8;
+
 /// Unit vectors at `(k + 0.5) / 8 · τ`, as literals (no trig: native and
 /// WebAssembly agree bit for bit).
 const RING8: [(f32, f32); 8] = [

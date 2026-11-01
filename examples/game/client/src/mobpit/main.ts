@@ -36,6 +36,7 @@ import { Color3, Color4 } from '@babylonjs/core/Maths/math.color';
 import { Scene } from '@babylonjs/core/scene';
 import { Vector3 } from '@babylonjs/core/Maths/math.vector';
 import { Mesh } from '@babylonjs/core/Meshes/mesh';
+import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
@@ -56,7 +57,8 @@ import {
 	playerFields,
 	type PitFields,
 	type ContentPack,
-	type PitInput
+	type PitInput,
+	type Ramp
 } from '../generated/mobpit/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
@@ -82,9 +84,10 @@ import {
 const { half: HALF, playerRadius: PLAYER_RADIUS, pillars: PILLARS } = PIT_WORLD;
 /** Rooms drawn around yours (2 → 5×5). */
 const ROOM_VIEW = 2;
-/** Wall thickness and height (m), drawn just outside each room's floor. */
-const WALL_T = 0.3;
-const WALL_H = 0.6;
+/** Wall thickness and height (m), drawn just outside each room's floor:
+ * the box a laser bounces off (`game_sim::mobpit::room_colliders`). */
+const WALL_T = PIT_WORLD.wallThickness;
+const WALL_H = PIT_WORLD.wallHeight;
 /** Swing cone, from the server's rules: reach to a mob's edge, plus the body. */
 const { attackRange, attackHalfAngle: SWING_HALF, swingFrames: SWING_FRAMES } = PIT_RULES;
 const ATTACK_REACH = attackRange + PLAYER_RADIUS;
@@ -188,7 +191,7 @@ function applySky(dtMs: number): void {
 
 const hud = new Hud({
 	title: 'Mob Pit',
-	hint: 'WASD move · Space attack · R / click shoot · E dash · Q jump (over a slam) · V first person · C lag compensation · walk through a doorway to the next room · N wake rooms in reach · O debug overlay · P prediction · G server ghost. Controller: left stick move · right stick look · A / RB attack · RT shoot · B / LB dash · Y jump · R3 first person · View lag compensation. Rooms run on celld; kills are durable facts.',
+	hint: 'WASD move · Space attack · R / click laser (bounces off walls, ramps, the floor) · E dash · Q jump (over a slam, onto ramps) · V first person · C lag compensation · walk through a doorway to the next room · N wake rooms in reach · O debug overlay · P prediction · G server ghost. Controller: left stick move · right stick look · X / RB attack · RT laser · B / LB dash · A jump · R3 first person · View lag compensation. Rooms run on celld; kills are durable facts.',
 	client,
 	devApi: api
 });
@@ -387,14 +390,15 @@ roomsMap.addEventListener(
 	},
 	{ passive: false }
 );
-const roomLayouts = new Map<string, { biome: number; obstacles: { x: number; y: number; r: number }[] }>();
-function roomLayout(seed: number, x: number, y: number): { biome: number; obstacles: { x: number; y: number; r: number }[] } | undefined {
+type MiniLayout = { biome: number; obstacles: { x: number; y: number; r: number }[]; ramps: readonly Ramp[] };
+const roomLayouts = new Map<string, MiniLayout>();
+function roomLayout(seed: number, x: number, y: number): MiniLayout | undefined {
 	if (!pit.pures.loaded()) return undefined;
 	const key = `${seed}:${x}:${y}`;
 	let layout = roomLayouts.get(key);
 	if (layout === undefined) {
 		const room = pit.pures.pitRoom({ seed, x, y });
-		layout = { biome: room.biome, obstacles: room.obstacles.map(({ x, y, r }) => ({ x, y, r })) };
+		layout = { biome: room.biome, obstacles: room.obstacles.map(({ x, y, r }) => ({ x, y, r })), ramps: room.ramps };
 		if (roomLayouts.size > 400) roomLayouts.clear();
 		roomLayouts.set(key, layout);
 	}
@@ -448,6 +452,14 @@ function drawRooms(): void {
 					ctx.beginPath();
 					ctx.arc(ox, oy, Math.max(1, o.r * s), 0, Math.PI * 2);
 					ctx.fill();
+				}
+			}
+			// Ramps: their footprint, red when too steep to walk.
+			if (layout !== undefined && s > 0.6) {
+				for (const r of layout.ramps) {
+					const [ax, ay] = toMap(rx * ROOM_SIZE + r.x0, ry * ROOM_SIZE + r.y1);
+					ctx.fillStyle = r.degrees <= 45 ? '#c9c2b088' : '#d0703f99';
+					ctx.fillRect(ax, ay, (r.x1 - r.x0) * s, (r.y1 - r.y0) * s);
 				}
 			}
 			// Walls with a doorway gap in the middle of each.
@@ -716,8 +728,58 @@ const templates = (() => {
 		w.setEnabled(false);
 		return w;
 	});
-	return { floors, wall, walls, segment, gate, pillar, boulder, tree, crystal };
+	// Ramps: stone you can walk up; rust-red where it is too steep (over
+	// about 45°, `walkable` in the room) and you slide off.
+	const rampMats = {
+		walk: material(scene, 'ramp-walk', '#9a9384'),
+		steep: material(scene, 'ramp-steep', '#b5653b')
+	};
+	for (const m of Object.values(rampMats)) {
+		m.backFaceCulling = false;
+		m.specularColor = Color3.Black();
+	}
+	return { floors, wall, walls, segment, gate, pillar, boulder, tree, crystal, rampMats };
 })();
+
+/** One ramp of a room as a wedge mesh (room-local, scene axes: x, up, y). */
+function rampMesh(name: string, r: Ramp): Mesh {
+	// Corner heights: 0 on the low edge, `height` on the high one.
+	const corners: [number, number][] = [
+		[r.x0, r.y0],
+		[r.x1, r.y0],
+		[r.x1, r.y1],
+		[r.x0, r.y1]
+	];
+	const top = ([x, y]: [number, number]) => {
+		const high = r.uphill === 0 ? x === r.x1 : r.uphill === 1 ? x === r.x0 : r.uphill === 2 ? y === r.y1 : y === r.y0;
+		return high ? r.height : 0;
+	};
+	const positions: number[] = [];
+	const indices: number[] = [];
+	const quad = (a: number[], b: number[], c: number[], d: number[]) => {
+		const base = positions.length / 3;
+		positions.push(...a, ...b, ...c, ...d);
+		indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+	};
+	const up = corners.map((c) => [c[0], top(c), c[1]]);
+	const down = corners.map((c) => [c[0], 0, c[1]]);
+	quad(up[0]!, up[1]!, up[2]!, up[3]!);
+	for (let i = 0; i < 4; i += 1) {
+		const j = (i + 1) % 4;
+		quad(down[i]!, down[j]!, up[j]!, up[i]!);
+	}
+	const data = new VertexData();
+	data.positions = positions;
+	data.indices = indices;
+	const normals: number[] = [];
+	VertexData.ComputeNormals(positions, indices, normals);
+	data.normals = normals;
+	const mesh = new Mesh(name, scene);
+	data.applyToMesh(mesh);
+	mesh.material = r.degrees <= 45 ? templates.rampMats.walk : templates.rampMats.steep;
+	mesh.isPickable = false;
+	return mesh;
+}
 
 type Chunk = { room: Room; node: TransformNode; biome: number | undefined; seed: number };
 const chunks = new Map<string, Chunk>();
@@ -767,6 +829,11 @@ function createChunk(room: Room): Chunk {
 			const instance = add(templates.pillar, `pillar-${i}`, x, y, 1.2);
 			instance.scaling.set(r * 2, 1, r * 2);
 		}
+	});
+	// Its sloped ramps (what the step walks on and the laser bounces off).
+	const ramps = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }).ramps : [];
+	ramps.forEach((r, i) => {
+		rampMesh(`${key}-ramp-${i}`, r).parent = node;
 	});
 	return { room, node, biome, seed };
 }
@@ -1059,8 +1126,9 @@ const sampler = new InputSampler();
 const commandFrames = new InputPacer({ tickRate: () => client.authority?.connection.welcome?.tickRate });
 
 // Ranged: R, a click or RT fires along the view (first person: where you
-// look; third person: the camera's heading). The room resolves the arrow
-// lag-compensated (C toggles it per shot).
+// look; third person: the camera's heading). The laser bounces off walls,
+// obstacles, ramps and the floor; the room resolves it lag-compensated
+// (C toggles it per shot).
 let fireQueued = false;
 let lastFireAt = 0;
 let compensated = true;
@@ -1111,48 +1179,70 @@ const markerMats = {
 	miss: material(scene, 'marker-miss', '#ff5252')
 };
 for (const m of Object.values(markerMats)) m.emissiveColor = m.diffuseColor.clone();
-const boltMat = material(scene, 'shot-bolt', '#ffd166');
-boltMat.emissiveColor = boltMat.diffuseColor.clone();
-/** How fast the drawn bolt flies (the room resolves the shot at once). */
-const BOLT_SPEED = 60;
-const BOLT_MAX_MS = 400;
-function marker(record: ShotRecord): void {
-	// The arrow's flight: a bolt from just below the aim (in first person one
-	// from the eye itself would sit on the crosshair) to where it lands.
-	const [ox, oy, oz] = record.origin;
-	const [px, py, pz] = record.point;
-	const from = placeIn(record.zone, ox, oy, oz - 0.3);
-	const to = placeIn(record.zone, px, py, pz);
-	const flightMs = Math.min(BOLT_MAX_MS, (Vector3.Distance(from, to) / BOLT_SPEED) * 1000);
-	const bolt = MeshBuilder.CreateCylinder(`bolt-${record.id}`, { height: 0.9, diameter: 0.12, tessellation: 6 }, scene);
-	// Lay the cylinder along +z so lookAt points it down the flight.
-	bolt.rotation.x = Math.PI / 2;
-	bolt.bakeCurrentTransformIntoVertices();
-	bolt.material = boltMat;
-	bolt.isPickable = false;
-	bolt.position.copyFrom(from);
-	bolt.lookAt(to);
-	const launched = performance.now();
-	let landed = false;
-	const flight = scene.onBeforeRenderObservable.add(() => {
-		const t = Math.min(1, (performance.now() - launched) / Math.max(flightMs, 1));
-		Vector3.LerpToRef(from, to, t, bolt.position);
+const beamMats = {
+	shot: material(scene, 'laser-beam', '#ff3b5c'),
+	hit: material(scene, 'laser-hit', '#3ddc84'),
+	miss: material(scene, 'laser-miss', '#ff8a8a')
+};
+for (const m of Object.values(beamMats)) {
+	m.emissiveColor = m.diffuseColor.clone();
+	m.disableLighting = true;
+}
+const sparkMat = material(scene, 'laser-spark', '#ffe28a');
+sparkMat.emissiveColor = sparkMat.diffuseColor.clone();
+sparkMat.disableLighting = true;
+sparkMat.backFaceCulling = false;
+/** How long a beam and its impact marks stay (ms). */
+const BEAM_MS = 220;
+const SPARK_MS = 700;
+/** Draw a beam through `points` (scene space) that fades out. */
+function beam(name: string, points: Vector3[], mat: StandardMaterial, radius: number, ms: number): void {
+	if (points.length < 2) return;
+	const tube = MeshBuilder.CreateTube(name, { path: points, radius, tessellation: 6, cap: Mesh.CAP_ALL }, scene);
+	tube.material = mat;
+	tube.isPickable = false;
+	const born = performance.now();
+	const fade = scene.onBeforeRenderObservable.add(() => {
+		const t = (performance.now() - born) / ms;
+		tube.visibility = Math.max(0, 1 - t);
 		if (t < 1) return;
-		landed = true;
-		ball.isVisible = true;
-		scene.onBeforeRenderObservable.remove(flight);
-		bolt.dispose();
+		scene.onBeforeRenderObservable.remove(fade);
+		tube.dispose();
+	});
+}
+/** An impact mark at a bounce, lying on the surface (facing its normal). */
+function spark(name: string, at: Vector3, normal: Vector3): void {
+	const disc = MeshBuilder.CreateDisc(name, { radius: 0.22, tessellation: 10 }, scene);
+	disc.material = sparkMat;
+	disc.isPickable = false;
+	disc.position.copyFrom(at.add(normal.scale(0.02)));
+	disc.lookAt(at.add(normal));
+	setTimeout(() => disc.dispose(), SPARK_MS);
+}
+/** A room-local normal in scene axes. */
+const sceneNormal = (n: readonly [number, number, number]) => new Vector3(n[0], n[2], n[1]);
+function marker(record: ShotRecord): void {
+	// The beam leaves from just below the aim (in first person one from the
+	// eye itself would sit on the crosshair) and follows the predicted
+	// bounces, one impact mark per surface it met.
+	const [ox, oy, oz] = record.origin;
+	const points = [placeIn(record.zone, ox, oy, oz - 0.3), ...record.path.map((p) => placeIn(record.zone, p.point[0], p.point[1], p.point[2]))];
+	beam(`laser-${record.id}`, points, beamMats.shot, 0.05, BEAM_MS);
+	record.path.forEach((p, i) => {
+		if (p.normal !== undefined) spark(`spark-${record.id}-${i}`, points[i + 1]!, sceneNormal(p.normal));
 	});
 	const ball = MeshBuilder.CreateSphere(`shot-${record.id}`, { diameter: 0.35, segments: 6 }, scene);
 	ball.material = markerMats.pending;
 	ball.isPickable = false;
-	// Shown when the bolt gets there.
-	ball.isVisible = landed;
-	ball.position.copyFrom(placeIn(record.zone, record.point[0], record.point[1], record.point[2]));
+	ball.position.copyFrom(points[points.length - 1]!);
 	const done = () => setTimeout(() => ball.dispose(), 1200);
 	pit.verdict(record.id).then((v) => {
 		ball.material = v.hit !== undefined ? markerMats.hit : markerMats.miss;
 		ball.position.copyFrom(placeIn(record.zone, v.x, v.y, v.z));
+		// The room's own beam, thin: green if it hit.
+		const room = [placeIn(record.zone, ox, oy, oz - 0.3), ...v.path.map((h) => placeIn(record.zone, h.x, h.y, h.z))];
+		if (v.path.length === 0) room.push(placeIn(record.zone, v.x, v.y, v.z));
+		beam(`laser-room-${record.id}`, room, v.hit !== undefined ? beamMats.hit : beamMats.miss, 0.02, BEAM_MS * 2);
 		done();
 	});
 	setTimeout(() => ball.dispose(), 4000);

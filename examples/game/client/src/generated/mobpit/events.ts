@@ -13,6 +13,41 @@ export interface ContentPack {
 	readonly notes: string;
 }
 
+/** Record `LaserHit` (`#[derive(GameRecord)]`). */
+export interface LaserHit {
+	readonly x: number;
+	readonly y: number;
+	readonly z: number;
+	readonly nx: number;
+	readonly ny: number;
+	readonly nz: number;
+}
+
+const LASER_HIT_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['x', { type: 'f32' }],
+		['y', { type: 'f32' }],
+		['z', { type: 'f32' }],
+		['nx', { type: 'f32' }],
+		['ny', { type: 'f32' }],
+		['nz', { type: 'f32' }],
+	]
+};
+
+/** Record `LaserShot` (`#[derive(GameRecord)]`). */
+export interface LaserShot {
+	readonly seed: number;
+	readonly roomX: number;
+	readonly roomY: number;
+	readonly x: number;
+	readonly y: number;
+	readonly z: number;
+	readonly dx: number;
+	readonly dy: number;
+	readonly dz: number;
+}
+
 /** Record `MobTier` (`#[derive(GameRecord)]`). */
 export interface MobTier {
 	readonly tier: number;
@@ -49,6 +84,17 @@ export interface RoomMob {
 	readonly y: number;
 }
 
+/** Record `Ramp` (`#[derive(GameRecord)]`). */
+export interface Ramp {
+	readonly x0: number;
+	readonly y0: number;
+	readonly x1: number;
+	readonly y1: number;
+	readonly height: number;
+	readonly uphill: number;
+	readonly degrees: number;
+}
+
 /** Record `PitRoomLayout` (`#[derive(GameRecord)]`). */
 export interface PitRoomLayout {
 	readonly biome: number;
@@ -60,6 +106,7 @@ export interface PitRoomLayout {
 	readonly bossDistance: number;
 	readonly pattern: number;
 	readonly obstacles: readonly Obstacle[];
+	readonly ramps: readonly Ramp[];
 }
 
 /** Record `PitRules` (`#[derive(GameRecord)]`). */
@@ -70,6 +117,7 @@ export interface PitRules {
 	readonly attackHalfAngle: number;
 	readonly swingFrames: number;
 	readonly range: number;
+	readonly bounces: number;
 	readonly fireCooldown: number;
 	readonly eyeHeight: number;
 	readonly hipHeight: number;
@@ -104,6 +152,9 @@ export interface PitWorld {
 	readonly biomes: readonly string[];
 	readonly wakeReach: number;
 	readonly wakeRelease: number;
+	readonly wallHeight: number;
+	readonly wallThickness: number;
+	readonly obstacleHeight: number;
 }
 
 /** Record `Profile` (`#[derive(GameRecord)]`). */
@@ -298,6 +349,7 @@ export interface ShotEvent {
 	readonly x: number;
 	readonly y: number;
 	readonly z: number;
+	readonly path: readonly LaserHit[];
 }
 
 const SHOT_LAYOUT: PayloadLayout = [
@@ -310,6 +362,7 @@ const SHOT_LAYOUT: PayloadLayout = [
 	['x', { type: 'f32' }],
 	['y', { type: 'f32' }],
 	['z', { type: 'f32' }],
+	['path', { type: 'list', item: LASER_HIT_TYPE }],
 ];
 
 /** Event `stale` (id 10). */

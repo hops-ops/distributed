@@ -69,6 +69,7 @@
       "value": {
         "attack_half_angle": 1.0471975803375244,
         "attack_range": 2.200000047683716,
+        "bounces": 4,
         "eye_height": 1.5,
         "fire_cooldown": 12,
         "hip_height": 0.6000000238418579,
@@ -80,7 +81,7 @@
           2.0,
           2.799999952316284
         ],
-        "range": 30.0,
+        "range": 100.0,
         "states": [
           "idle",
           "chase",
@@ -133,6 +134,7 @@
         "half": 20.0,
         "hysteresis": 0.5,
         "max_room": 1000000,
+        "obstacle_height": 2.4000000953674316,
         "passage": 2.0,
         "pillars": [
           {
@@ -184,7 +186,9 @@
         "player_radius": 0.5,
         "room_size": 40.0,
         "wake_reach": 11.0,
-        "wake_release": 19.0
+        "wake_release": 19.0,
+        "wall_height": 1.600000023841858,
+        "wall_thickness": 0.4000000059604645
       }
     },
     {
@@ -526,6 +530,16 @@
             "name": "z",
             "type": {
               "type": "f32"
+            }
+          },
+          {
+            "name": "path",
+            "type": {
+              "item": {
+                "name": "LaserHit",
+                "type": "record"
+              },
+              "type": "list"
             }
           }
         ],
@@ -1123,6 +1137,22 @@
     {
       "abi": 1,
       "arg": {
+        "name": "LaserShot",
+        "type": "record"
+      },
+      "export": "laser_path",
+      "output": {
+        "item": {
+          "name": "LaserHit",
+          "type": "record"
+        },
+        "type": "list"
+      },
+      "package": "game_sim"
+    },
+    {
+      "abi": 1,
+      "arg": {
         "name": "PitRoomContext",
         "type": "record"
       },
@@ -1188,6 +1218,106 @@
         }
       ],
       "name": "ContentPack"
+    },
+    {
+      "fields": [
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "z",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "nx",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "ny",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "nz",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "LaserHit"
+    },
+    {
+      "fields": [
+        {
+          "name": "seed",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "room_x",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "room_y",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "z",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "dx",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "dy",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "dz",
+          "type": {
+            "type": "f32"
+          }
+        }
+      ],
+      "name": "LaserShot"
     },
     {
       "fields": [
@@ -1350,6 +1480,16 @@
             },
             "type": "list"
           }
+        },
+        {
+          "name": "ramps",
+          "type": {
+            "item": {
+              "name": "Ramp",
+              "type": "record"
+            },
+            "type": "list"
+          }
         }
       ],
       "name": "PitRoomLayout"
@@ -1397,6 +1537,12 @@
           "name": "range",
           "type": {
             "type": "f32"
+          }
+        },
+        {
+          "name": "bounces",
+          "type": {
+            "type": "u8"
           }
         },
         {
@@ -1574,6 +1720,24 @@
           "type": {
             "type": "f32"
           }
+        },
+        {
+          "name": "wall_height",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "wall_thickness",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "obstacle_height",
+          "type": {
+            "type": "f32"
+          }
         }
       ],
       "name": "PitWorld"
@@ -1618,6 +1782,53 @@
         }
       ],
       "name": "Profile"
+    },
+    {
+      "fields": [
+        {
+          "name": "x0",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y0",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "x1",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y1",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "height",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "uphill",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "degrees",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "Ramp"
     },
     {
       "fields": [

@@ -297,6 +297,36 @@ fn rooms_in_reach_args() -> Vec<Vec<u8>> {
     args
 }
 
+/// Laser shots: from spawn points and the room's centre, in rooms of every
+/// pattern, aimed round the compass, level, up and down (off the floor).
+fn laser_path_args() -> Vec<Vec<u8>> {
+    let mut args = Vec::new();
+    for (room_x, room_y) in content_cells() {
+        for &(x, y) in &[(4.5f32, 4.5f32), (-4.5, -4.5), (0.0, 5.5), (12.0, -3.0)] {
+            for k in 0..8 {
+                let (dx, dy) = game_sim::mobpit::RING8_DIRS[k];
+                for dz in [0.0f32, 0.25, -0.15] {
+                    args.push(
+                        game_sim::mobpit::LaserShot {
+                            seed: game_sim::mobpit::DEFAULT_SEED,
+                            room_x,
+                            room_y,
+                            x,
+                            y,
+                            z: 0.6,
+                            dx,
+                            dy,
+                            dz,
+                        }
+                        .encode_context(),
+                    );
+                }
+            }
+        }
+    }
+    args
+}
+
 /// Every demo step's and pure function's native trace (see the module docs).
 pub fn traces() -> Value {
     json!({
@@ -304,6 +334,7 @@ pub fn traces() -> Value {
         "pures": [
             pure_trace::<game_sim::mobpit::PitRoomFn>(pit_room_args()),
             pure_trace::<game_sim::mobpit::RoomsInReachFn>(rooms_in_reach_args()),
+            pure_trace::<game_sim::mobpit::LaserPathFn>(laser_path_args()),
         ],
         "steps": [
             trace::<PitStep>(pit_streams()),

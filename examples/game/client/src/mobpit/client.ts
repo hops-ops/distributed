@@ -164,10 +164,13 @@ export type ShotRecord = {
 	dir: Vec3;
 	zone: string;
 	compensated: boolean;
-	/** The mob the client saw the arrow hit (undefined: a predicted miss). */
+	/** The mob the client saw the laser hit (undefined: a predicted miss). */
 	predicted: number | undefined;
 	/** Where it met the predicted mob, or where it stops. */
 	point: Vec3;
+	/** The predicted beam: each surface it bounced off (with its normal),
+	 * then where it stops (normal undefined). */
+	path: { point: Vec3; normal: Vec3 | undefined }[];
 	delayMs: number;
 	verdict?: pit.ShotEvent;
 };
@@ -488,17 +491,58 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 		const context = typed.client.inputContext(zone)!;
 		const renderTime = zone.connection.serverNow() - context.interpolationDelayMs;
 		const delayMs = Math.max(0, zone.connection.tickTime(context.clientTick) - renderTime);
+		// The beam through the room's geometry (the room's own pure), then
+		// the first drawn mob along any of its legs.
+		const room = parseRoom(zone.zoneId);
+		const bounces: { point: Vec3; normal: Vec3 | undefined }[] =
+			pures.loaded() && room !== undefined
+				? pures
+						.laserPath({
+							seed: hello.get()?.seed ?? pit.PIT_WORLD.defaultSeed,
+							roomX: room[0],
+							roomY: room[1],
+							x: origin[0],
+							y: origin[1],
+							z: origin[2],
+							dx: dir[0],
+							dy: dir[1],
+							dz: dir[2]
+						})
+						.map((h) => ({
+							point: [h.x, h.y, h.z] as Vec3,
+							normal: h.nx === 0 && h.ny === 0 && h.nz === 0 ? undefined : ([h.nx, h.ny, h.nz] as Vec3)
+						}))
+				: [{ point: [origin[0] + dir[0] * range, origin[1] + dir[1] * range, origin[2] + dir[2] * range], normal: undefined }];
+		const mobs = typed.client
+			.render()
+			.filter((e) => pit.isMob(e) && !e.stale && e.zoneId === zone.zoneId)
+			.map((e) => ({ id: e.id, m: pit.mobFields(e) }));
 		let predicted: number | undefined;
-		let best = range;
-		for (const e of typed.client.render()) {
-			if (!pit.isMob(e) || e.stale || e.zoneId !== zone.zoneId) continue;
-			const m = pit.mobFields(e);
-			const t = TIERS[m.tier];
-			const d = rayCapsule(origin, dir, m.x, m.y, t?.radius ?? 0.5, heights[m.tier] ?? 1);
-			if (d !== undefined && d < best) {
-				best = d;
-				predicted = e.id;
+		let point: Vec3 = bounces[bounces.length - 1]!.point;
+		const path: { point: Vec3; normal: Vec3 | undefined }[] = [];
+		let from = origin;
+		for (const leg of bounces) {
+			const [ax, ay, az] = from;
+			const span = Math.hypot(leg.point[0] - ax, leg.point[1] - ay, leg.point[2] - az);
+			if (span > 1e-6) {
+				const unit: Vec3 = [(leg.point[0] - ax) / span, (leg.point[1] - ay) / span, (leg.point[2] - az) / span];
+				let best = span;
+				for (const { id, m } of mobs) {
+					const t = TIERS[m.tier];
+					const d = rayCapsule(from, unit, m.x, m.y, t?.radius ?? 0.5, heights[m.tier] ?? 1);
+					if (d !== undefined && d < best) {
+						best = d;
+						predicted = id;
+					}
+				}
+				if (predicted !== undefined) {
+					point = [ax + unit[0] * best, ay + unit[1] * best, az + unit[2] * best];
+					path.push({ point, normal: undefined });
+					break;
+				}
 			}
+			path.push(leg);
+			from = leg.point;
 		}
 		nextShot = (nextShot % 0xffff) + 1;
 		const record: ShotRecord = {
@@ -508,7 +552,8 @@ export function createMobPitClient(options: MobPitClientOptions): MobPitClient {
 			zone: zone.zoneId,
 			compensated,
 			predicted,
-			point: [origin[0] + dir[0] * best, origin[1] + dir[1] * best, origin[2] + dir[2] * best],
+			point,
+			path,
 			delayMs
 		};
 		shots.set(record.id, record);

@@ -3,7 +3,34 @@
 // Do not edit: change the Rust definitions and regenerate.
 import { createWasmPures, type WasmPures, type WasmSource, type WireType } from '@hops-ops/distributed/game';
 
-import type { PitRoomContext, PitRoomLayout, Reach, ReachContext } from './events.ts';
+import type { LaserHit, LaserShot, PitRoomContext, PitRoomLayout, Reach, ReachContext } from './events.ts';
+
+const LASER_HIT_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['x', { type: 'f32' }],
+		['y', { type: 'f32' }],
+		['z', { type: 'f32' }],
+		['nx', { type: 'f32' }],
+		['ny', { type: 'f32' }],
+		['nz', { type: 'f32' }],
+	]
+};
+
+const LASER_SHOT_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['seed', { type: 'u32' }],
+		['roomX', { type: 'i32' }],
+		['roomY', { type: 'i32' }],
+		['x', { type: 'f32' }],
+		['y', { type: 'f32' }],
+		['z', { type: 'f32' }],
+		['dx', { type: 'f32' }],
+		['dy', { type: 'f32' }],
+		['dz', { type: 'f32' }],
+	]
+};
 
 const OBSTACLE_TYPE: WireType = {
 	type: 'record',
@@ -33,6 +60,19 @@ const ROOM_MOB_TYPE: WireType = {
 	]
 };
 
+const RAMP_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['x0', { type: 'f32' }],
+		['y0', { type: 'f32' }],
+		['x1', { type: 'f32' }],
+		['y1', { type: 'f32' }],
+		['height', { type: 'f32' }],
+		['uphill', { type: 'u8' }],
+		['degrees', { type: 'u8' }],
+	]
+};
+
 const PIT_ROOM_LAYOUT_TYPE: WireType = {
 	type: 'record',
 	fields: [
@@ -45,6 +85,7 @@ const PIT_ROOM_LAYOUT_TYPE: WireType = {
 		['bossDistance', { type: 'u8' }],
 		['pattern', { type: 'u8' }],
 		['obstacles', { type: 'list', item: OBSTACLE_TYPE }],
+		['ramps', { type: 'list', item: RAMP_TYPE }],
 	]
 };
 
@@ -66,6 +107,7 @@ const REACH_CONTEXT_TYPE: WireType = {
 
 /** The pure functions (`#[game_pure]`) of Cargo package `game_sim`: wrapper name → module export. */
 export const PURES = {
+	laserPath: { export: 'laser_path', abi: 1 },
 	pitRoom: { export: 'pit_room', abi: 1 },
 	roomsInReach: { export: 'rooms_in_reach', abi: 1 },
 } as const;
@@ -75,6 +117,8 @@ export const PURES_WASM_URL: URL = new URL('./wasm/mobpit.wasm', import.meta.url
 
 /** Typed calls of the compiled functions (synchronous; they throw until `ready` resolves). */
 export interface MobpitPureFns {
+	/** `laser_path` (`dg_pure_laser_path`). */
+	laserPath(arg: LaserShot): readonly LaserHit[];
 	/** `pit_room` (`dg_pure_pit_room`). */
 	pitRoom(arg: PitRoomContext): PitRoomLayout;
 	/** `rooms_in_reach` (`dg_pure_rooms_in_reach`). */
@@ -90,6 +134,7 @@ export type MobpitPures = WasmPures<MobpitPureFns>;
  */
 export function createMobpitPures(source: WasmSource = PURES_WASM_URL): MobpitPures {
 	return createWasmPures<MobpitPureFns>(source, {
+		laserPath: { exportName: 'laser_path', arg: LASER_SHOT_TYPE, output: { type: 'list', item: LASER_HIT_TYPE } },
 		pitRoom: { exportName: 'pit_room', arg: PIT_ROOM_CONTEXT_TYPE, output: PIT_ROOM_LAYOUT_TYPE },
 		roomsInReach: { exportName: 'rooms_in_reach', arg: REACH_CONTEXT_TYPE, output: REACH_TYPE },
 	});

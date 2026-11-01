@@ -42,7 +42,8 @@ export const PIT_RULES: PitRules = {
 	attackRange: 2.200000047683716,
 	attackHalfAngle: 1.0471975803375244,
 	swingFrames: 6,
-	range: 30,
+	range: 100,
+	bounces: 4,
 	fireCooldown: 12,
 	eyeHeight: 1.5,
 	hipHeight: 0.6000000238418579,
@@ -74,7 +75,10 @@ export const PIT_WORLD: PitWorld = {
 	maxRoom: 1000000,
 	biomes: ['highlands', 'steppe', 'forest', 'meadow'],
 	wakeReach: 11,
-	wakeRelease: 19
+	wakeRelease: 19,
+	wallHeight: 1.600000023841858,
+	wallThickness: 0.4000000059604645,
+	obstacleHeight: 2.4000000953674316
 };
 
 /** `weather`, as the client decodes it. */
