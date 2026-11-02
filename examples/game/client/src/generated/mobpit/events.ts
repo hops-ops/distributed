@@ -167,6 +167,9 @@ export interface PitState {
 	readonly cd: number;
 	readonly z: number;
 	readonly vz: number;
+	readonly air: number;
+	readonly buf: number;
+	readonly held: boolean;
 }
 
 /** Record `PitWorld` (`#[derive(GameRecord)]`). */

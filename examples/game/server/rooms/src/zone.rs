@@ -120,6 +120,18 @@ pub struct PlayerView {
     #[correct(snap)]
     #[from(state.vz)]
     pub vz: f32,
+    /// Ticks off walkable ground (coyote time).
+    #[correct(snap)]
+    #[from(state.air)]
+    pub air: u8,
+    /// Jump buffer ticks left.
+    #[correct(snap)]
+    #[from(state.buf)]
+    pub buf: u8,
+    /// Jump held last tick.
+    #[correct(snap)]
+    #[from(state.held)]
+    pub held: bool,
     /// Display name.
     #[priority(0.2)]
     #[correct(replace)]
@@ -1077,19 +1089,21 @@ fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
 /// Carried through a doorway: the player's [`MoveState`] in the
 /// neighbour's frame (x y vx vy z vz as f32 LE, dash, cd): a jump carries on.
 fn encode_carried(s: &MoveState) -> Vec<u8> {
-    let mut out = Vec::with_capacity(26);
+    let mut out = Vec::with_capacity(29);
     for v in [s.x, s.y, s.vx, s.vy, s.z, s.vz] {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out.extend_from_slice(&[s.dash, s.cd]);
+    out.extend_from_slice(&[s.dash, s.cd, s.air, s.buf, u8::from(s.held)]);
     out
 }
 
 /// Inverse of [`encode_carried`]; None unless it is a place a player can be.
 fn decode_carried(bytes: &[u8]) -> Option<MoveState> {
-    if bytes.len() != 26 {
+    // 26 bytes: from a room before coyote time and the jump buffer.
+    if bytes.len() != 29 && bytes.len() != 26 {
         return None;
     }
+    let tail = |i: usize| bytes.get(i).copied().unwrap_or(0);
     let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
     let state = MoveState {
         x: f(0),
@@ -1100,6 +1114,9 @@ fn decode_carried(bytes: &[u8]) -> Option<MoveState> {
         vz: f(5),
         dash: bytes[24],
         cd: bytes[25],
+        air: tail(26),
+        buf: tail(27).min(rooms::JUMP_BUFFER),
+        held: tail(28) != 0,
     };
     admissible(&state).then(|| rooms::canonicalize(state))
 }

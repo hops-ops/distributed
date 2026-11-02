@@ -72,7 +72,11 @@ test('a doorway into a sleeping room after a bow fight: no correction, no jump',
 		const pit = createMobPitClient({ api, roomsBase: server.roomsUrl, wake: false });
 		clients.push(pit);
 		const corrections = [];
-		pit.client.on('correction', (c) => corrections.push({ room: pit.room(), at: Date.now(), m: Math.hypot(c.errors.x ?? 0, c.errors.y ?? 0), errors: c.errors }));
+		pit.client.on('correction', (c) => {
+			const me = pit.me();
+			const dead = me !== undefined && playerFields(me).dead;
+			corrections.push({ room: pit.room(), at: Date.now(), m: Math.hypot(c.errors.x ?? 0, c.errors.y ?? 0), errors: c.errors, dead });
+		});
 		await pit.client.connect('pit.0.0');
 		await pit.ready;
 		await until(() => pit.client.predictor?.active, 5_000, 'bound');
@@ -88,10 +92,12 @@ test('a doorway into a sleeping room after a bow fight: no correction, no jump',
 			assert.equal(west.room, 'pit.0.0');
 			await sleep(500);
 			// A hit or a death (a mob may follow through the doorway) is the
-			// room's call, not a prediction error.
-			const hurt = corrections.slice(before).filter((c) => (c.errors.hp ?? 0) !== 0);
-			const fresh = corrections.slice(before).filter((c) => c.m > 0.05 && (c.errors.hp ?? 0) === 0);
-			if (hurt.length > 0) console.error(`round ${round}: ${hurt.length} hit or death corrections (not counted)`);
+			// room's call, not a prediction error: a dead player's inputs are
+			// ignored while the page still walks it.
+			const hurt = (c) => (c.errors.hp ?? 0) !== 0 || c.dead;
+			const fresh = corrections.slice(before).filter((c) => c.m > 0.05 && !hurt(c));
+			const hits = corrections.slice(before).filter(hurt).length;
+			if (hits > 0) console.error(`round ${round}: ${hits} hit or death corrections (not counted)`);
 			console.error(
 				`round ${round}: ${shots} arrows; east step ${largestStep(east.trace).toFixed(3)} m, west step ${largestStep(west.trace).toFixed(3)} m; corrections ${JSON.stringify(fresh.map((c) => ({ room: c.room, m: +c.m.toFixed(3) })))}`
 			);

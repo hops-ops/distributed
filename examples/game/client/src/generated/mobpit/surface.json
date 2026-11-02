@@ -821,6 +821,36 @@
         },
         {
           "correction": {
+            "mode": "snap"
+          },
+          "name": "air",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "buf",
+          "priority": 1.0,
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "correction": {
+            "mode": "snap"
+          },
+          "name": "held",
+          "priority": 1.0,
+          "type": {
+            "type": "bool"
+          }
+        },
+        {
+          "correction": {
             "mode": "replace"
           },
           "name": "name",
@@ -2054,6 +2084,24 @@
           "name": "vz",
           "type": {
             "type": "f32"
+          }
+        },
+        {
+          "name": "air",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "buf",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "held",
+          "type": {
+            "type": "bool"
           }
         }
       ],

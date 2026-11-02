@@ -105,6 +105,23 @@ impl PitInput {
     }
 }
 
+/// Coyote time: a jump still works this many ticks after walking off
+/// walkable ground (0.1 s: the most whole ticks under 0.12 s).
+pub const COYOTE: u8 = 3;
+/// A jump press is remembered this many ticks (0.1 s) and fires on the
+/// first tick the player can jump.
+pub const JUMP_BUFFER: u8 = 3;
+/// [`PitState::air`] after a jump: the coyote window is used up.
+pub const JUMPED: u8 = u8::MAX;
+/// Ground movement (m/s²): to full speed ([`arena::MAX_SPEED`]) in 0.15 s,
+/// to a stop in 0.1 s with no direction held, twice that turning against
+/// the current velocity. Half each in the air.
+pub const RATES: arena::Rates = arena::Rates {
+    accel: arena::MAX_SPEED / 0.15,
+    decel: arena::MAX_SPEED / 0.1,
+    reverse: 2.0 * arena::MAX_SPEED / 0.1,
+};
+
 /// Gravity (m/s²).
 pub const GRAVITY: f32 = 24.0;
 /// Take-off speed of a jump (m/s): about 1.5 m up, 0.7 s in the air.
@@ -133,6 +150,13 @@ pub struct PitState {
     pub z: f32,
     /// Vertical velocity (m/s).
     pub vz: f32,
+    /// Ticks since the feet last stood on walkable ground (saturating;
+    /// [`JUMPED`] once a jump used the coyote window).
+    pub air: u8,
+    /// Jump buffer: ticks a jump press stays wanted ([`JUMP_BUFFER`]).
+    pub buf: u8,
+    /// The jump button was held last tick (a press is its first tick).
+    pub held: bool,
 }
 
 impl PitState {
@@ -328,9 +352,19 @@ pub fn step_among(
     let (g0, n0) = ground(ramps, s.x, s.y);
     let touching = s.z <= g0 + TOUCH && s.vz <= 0.0;
     let on_floor = touching && collide::walkable(n0);
+    // Half the grip off the ground.
+    let rates = if touching {
+        RATES
+    } else {
+        arena::Rates {
+            accel: RATES.accel * 0.5,
+            decel: RATES.decel * 0.5,
+            reverse: RATES.reverse * 0.5,
+        }
+    };
     let mut next = walls(
         planar,
-        arena::advance_among(planar, input.movement(), obstacles),
+        arena::advance_with(planar, input.movement(), obstacles, rates),
         open,
     );
     let from = (s.x, s.y);
@@ -365,9 +399,28 @@ pub fn step_among(
         vz = 0.0;
     }
     let (g1, n1) = ground(ramps, next.x, next.y);
-    if input.jump() && on_floor {
+    // Coyote time and the jump buffer (whole ticks: the step is fixed at
+    // DT). A press (the button's first tick) is wanted for JUMP_BUFFER
+    // ticks; it fires on the first tick on the floor or within COYOTE
+    // ticks of leaving it, and firing spends both (one press, one jump).
+    // Ground too steep to stand on is no floor to jump from, then or after.
+    let mut air = if on_floor {
+        0
+    } else if touching {
+        JUMPED
+    } else {
+        s.air.saturating_add(1)
+    };
+    let pressed = input.jump() && !s.held;
+    let mut buf = if pressed { JUMP_BUFFER } else { s.buf };
+    if buf > 0 && air <= COYOTE {
         vz = JUMP_SPEED;
+        buf = 0;
+        air = JUMPED;
+    } else {
+        buf = buf.saturating_sub(1);
     }
+    let held = input.jump();
     if touching && vz <= 0.0 && g1 >= z - SNAP_DOWN {
         // Walking (or sliding): the feet follow the ground.
         z = g1;
@@ -399,7 +452,17 @@ pub fn step_among(
             (next.vx, next.vy) = (0.0, 0.0);
         }
     }
-    canonicalize(PitState { z, vz, ..s }.with_planar(next))
+    canonicalize(
+        PitState {
+            z,
+            vz,
+            air,
+            buf,
+            held,
+            ..s
+        }
+        .with_planar(next),
+    )
 }
 
 /// Snap to the replicated precision of a Mob Pit player.
@@ -2411,6 +2474,156 @@ mod tests {
         )
     }
 
+    /// A 1 m platform over `x0..x1` (y −3..3).
+    fn ledge(x0: f32, x1: f32) -> Colliders {
+        Colliders::new().with(
+            Platform {
+                x0,
+                y0: -3.0,
+                x1,
+                y1: 3.0,
+                height: 1.0,
+            }
+            .collider(),
+        )
+    }
+
+    #[test]
+    fn coyote_time_allows_a_jump_three_ticks_off_a_ledge_once() {
+        let ground = ledge(-6.0, 0.0);
+        // Walk east off the platform; stop at `off` ticks in the air.
+        let walk_off = |off: u8| {
+            let mut s = canonicalize(PitState {
+                x: -1.0,
+                z: 1.0,
+                vx: arena::MAX_SPEED,
+                ..PitState::default()
+            });
+            for _ in 0..60 {
+                if s.air == off && s.x > 0.0 {
+                    return s;
+                }
+                s = on_ramps(s, 127, 0, 0, &ground);
+            }
+            panic!("never {off} ticks off: {s:?}")
+        };
+        // Its 3rd tick off the ledge still jumps (air counts this tick).
+        let late = on_ramps(walk_off(2), 127, 0, PitInput::JUMP, &ground);
+        assert!(late.vz > 0.0 && late.air == JUMPED, "coyote jump: {late:?}");
+        // The window was spent: a second press in the air does nothing.
+        let released = on_ramps(late, 127, 0, 0, &ground);
+        let again = on_ramps(released, 127, 0, PitInput::JUMP, &ground);
+        assert!(again.vz < released.vz, "no second jump: {again:?}");
+        // Its 4th tick off is too late.
+        let too_late = on_ramps(walk_off(3), 127, 0, PitInput::JUMP, &ground);
+        assert!(too_late.vz <= 0.0, "past coyote time: {too_late:?}");
+    }
+
+    #[test]
+    fn a_jump_press_is_buffered_and_one_press_gives_one_jump() {
+        let flat = Colliders::new();
+        // Falling: press, release, and land within the buffer.
+        let fall = |ticks_before: u32| {
+            let mut s = canonicalize(PitState {
+                z: 0.5,
+                ..PitState::default()
+            });
+            // Ticks until landing from here (no press).
+            let mut probe = s;
+            let mut land = 0;
+            while probe.z > 0.0 {
+                probe = on_ramps(probe, 0, 0, 0, &flat);
+                land += 1;
+            }
+            let press_at = land - ticks_before;
+            let mut jumped = false;
+            for t in 0..land + 6 {
+                let b = if t == press_at { PitInput::JUMP } else { 0 };
+                s = on_ramps(s, 0, 0, b, &flat);
+                jumped |= s.vz > 0.0;
+            }
+            jumped
+        };
+        assert!(fall(1), "pressed a tick before landing");
+        assert!(fall(2), "pressed two ticks before landing");
+        assert!(!fall(4), "pressed too early");
+        // Holding jump from standing: one jump, not one per landing.
+        let mut s = PitState::default();
+        let mut takeoffs = 0;
+        for _ in 0..90 {
+            let before = s.vz;
+            s = on_ramps(s, 0, 0, PitInput::JUMP, &flat);
+            takeoffs += u32::from(s.vz > 0.0 && before <= 0.0 && s.z <= 0.5);
+        }
+        assert_eq!(takeoffs, 1, "held: one jump");
+    }
+
+    #[test]
+    fn ground_speed_accelerates_stops_and_turns_with_less_grip_in_the_air() {
+        let flat = Colliders::new();
+        let ticks = |mut s: PitState, mx: i8, until: &dyn Fn(&PitState) -> bool| {
+            for t in 1..=30 {
+                s = on_ramps(s, mx, 0, 0, &flat);
+                if until(&s) {
+                    return t;
+                }
+            }
+            99
+        };
+        let full = arena::MAX_SPEED - 0.01;
+        // To full speed in 0.15 s (4.5 ticks).
+        assert_eq!(ticks(PitState::default(), 127, &|s| s.vx >= full), 5);
+        let running = canonicalize(PitState {
+            vx: arena::MAX_SPEED,
+            ..PitState::default()
+        });
+        // To a stop in 0.1 s with the stick let go.
+        assert_eq!(ticks(running, 0, &|s| s.vx.abs() < 0.05), 3);
+        // Twice as fast turning against it.
+        assert_eq!(ticks(running, -127, &|s| s.vx < 0.05), 2);
+        // Half the grip in the air.
+        let one = on_ramps(PitState::default(), 127, 0, 0, &flat).vx;
+        let airborne = on_ramps(
+            canonicalize(PitState {
+                z: 1.0,
+                ..PitState::default()
+            }),
+            127,
+            0,
+            0,
+            &flat,
+        )
+        .vx;
+        assert!((airborne - one / 2.0).abs() < 0.01, "{airborne} vs {one}");
+    }
+
+    #[test]
+    fn a_jump_just_short_of_a_ledge_is_lifted_onto_it() {
+        let ground = ledge(0.0, 4.0);
+        // Feet `under` below the 1 m top, rising a little, running at it.
+        let run = |under: f32| {
+            let mut s = canonicalize(PitState {
+                x: -0.7,
+                z: 1.0 - under,
+                vz: 1.0,
+                vx: arena::MAX_SPEED,
+                air: JUMPED,
+                ..PitState::default()
+            });
+            for _ in 0..12 {
+                s = on_ramps(s, 127, 0, 0, &ground);
+            }
+            s
+        };
+        let close = run(0.25);
+        assert!(
+            close.x > 0.5 && (close.z - 1.0).abs() < 0.01,
+            "lifted on: {close:?}"
+        );
+        let short = run(0.5);
+        assert!(short.x <= 0.0 && short.z < 1.0, "too low: {short:?}");
+    }
+
     #[test]
     fn a_walkable_ramp_is_climbed_and_walked_down() {
         let (ramp, ramps) = one_ramp(30);
@@ -2463,10 +2676,12 @@ mod tests {
         }
         // Stopped at its low edge, still on the floor.
         assert!(s.x < ramp.x0 + 0.05 && s.z < 0.2, "{s:?}");
-        // Dropped onto its middle, slowly: slides down and off, no jump.
+        // Dropped onto its middle, slowly: slides down and off, no jump
+        // (long off any floor: no coyote time either).
         let mut on = canonicalize(PitState {
             x: (ramp.x0 + ramp.x1) / 2.0,
             z: 1.05,
+            air: JUMPED,
             ..PitState::default()
         });
         let mut frames = 0;
