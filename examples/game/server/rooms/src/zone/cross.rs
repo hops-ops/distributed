@@ -31,7 +31,7 @@ use std::time::Duration;
 use distributed_game::collide::{bounce, Trace};
 use distributed_game::{Ctx, EntityId, PlayerId, Ray, VerifiedPrincipal, ZoneSender};
 use game_sim::arena::HALF;
-use game_sim::mobpit::{parse_room, room_zone, DOOR_HALF, LASER_MASK, ROOM_SIZE};
+use game_sim::mobpit::{parse_room, room_zone, stop_at_barrier, DOOR_HALF, LASER_MASK, ROOM_SIZE};
 
 use super::{
     dist, pack_hp, step_toward, Killer, LaserHit, Mob, MobPit, MobState, PitEvent, PitMessage,
@@ -141,6 +141,10 @@ impl Leg {
     }
 }
 
+/// How far short of a leg's end the wall line must be for the leg to
+/// count as leaving through it (m).
+const LINE_EPS: f32 = 1e-3;
+
 /// The first place the beam `origin` → `trace` crosses one of the room's
 /// side lines going out, as a leg for the room beyond (`None`: it stayed
 /// inside, or has nothing left).
@@ -171,7 +175,9 @@ pub(super) fn leaving_leg(
                 continue;
             }
             let t = (HALF - from[axis] * sign) / v;
-            if t > len {
+            // Past the wall line, not just reaching it: a leg that ends on
+            // the line stopped at a wall (or its barrier) there.
+            if t > len - LINE_EPS {
                 continue;
             }
             let other = from[1 - axis] + dir[1 - axis] * t;
@@ -631,7 +637,7 @@ impl MobPit {
             at[2] + dir[2] * 0.01,
         ];
         let ray = Ray::new(start, dir, dist).mask(LASER_MASK);
-        let trace = {
+        let mut trace = {
             let mobs = &self.mobs;
             bounce(ray, usize::from(bounces), |leg| {
                 ctx.raycast_where(time, leg, |id| {
@@ -640,6 +646,7 @@ impl MobPit {
                 })
             })
         };
+        stop_at_barrier(&mut trace, ctx.colliders());
         let hit = trace.entity();
         let leaves = if hit.is_none() {
             leaving_leg(start, &trace, dist, usize::from(bounces))
@@ -787,5 +794,44 @@ fn come_back(m: &mut Mob) {
         m.respawn_at = 0;
         m.target = None;
         m.follow = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use distributed_game::collide::{RayHit, Target};
+
+    fn trace(hits: &[[f32; 3]], end: [f32; 3]) -> Trace {
+        Trace {
+            hits: hits
+                .iter()
+                .map(|&point| RayHit {
+                    target: Target::Static(0),
+                    distance: 0.0,
+                    point,
+                    normal: [-1.0, 0.0, 0.0],
+                })
+                .collect(),
+            end,
+        }
+    }
+
+    #[test]
+    fn a_leg_that_ends_on_the_wall_line_does_not_leave() {
+        // Stopped at the east wall (or its barrier): stays in the room.
+        let stopped = trace(&[[HALF, 8.0, 3.0]], [HALF, 8.0, 3.0]);
+        assert!(leaving_leg([0.0, 8.0, 1.5], &stopped, 100.0, 4).is_none());
+        // A hair short of the line still in floating point: stays too.
+        let short = trace(&[[HALF - 1e-5, 8.0, 3.0]], [HALF - 1e-5, 8.0, 3.0]);
+        assert!(leaving_leg([0.0, 8.0, 1.5], &short, 100.0, 4).is_none());
+        // Through the doorway and on: the room beyond takes the rest.
+        let through = trace(&[], [60.0, 0.0, 1.5]);
+        let leg = leaving_leg([0.0, 0.0, 1.5], &through, 100.0, 4).expect("leaves east");
+        assert_eq!(leg.step, (1, 0));
+        assert!(
+            (leg.at[0] + HALF).abs() < 1e-3,
+            "enters at the west line next door"
+        );
     }
 }

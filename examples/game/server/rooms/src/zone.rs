@@ -61,9 +61,9 @@ use game_sim::arena::{self as movement, PLAYER_RADIUS};
 use game_sim::mobpit::PitState as MoveState;
 use game_sim::mobpit::{
     self as rooms, admissible, borough_of, crossing, hood_of, into_neighbour, pair_shard,
-    parse_room, pit_room, pit_world, room_colliders, room_ground, room_zone, FloorPatchFn,
-    LaserHit, LaserPathFn, PitRoomContext, PitRoomFn, RoomTerrainFn, RoomsInReachFn, BOSS_TIER,
-    GROUND_MASK, LASER_BOUNCES, LASER_MASK, LASER_RANGE, LAYER_FLOOR,
+    parse_room, pit_room, pit_world, room_colliders, room_ground, room_zone, stop_at_barrier,
+    FloorPatchFn, LaserHit, LaserPathFn, PitRoomContext, PitRoomFn, RoomTerrainFn, RoomsInReachFn,
+    BOSS_TIER, GROUND_MASK, LASER_BOUNCES, LASER_MASK, LASER_RANGE, LAYER_FLOOR,
 };
 use mobpit_crawler::{level_floor, KillReceipt, RecordKillInput};
 use mobpit_tiers::{BossDefeatedInput, WEATHER};
@@ -1592,12 +1592,13 @@ impl MobPit {
                 // stops at the first mob. A mob killed since the shooter's
                 // view time lets it through.
                 let mobs = &self.mobs;
-                let trace = bounce(ray, BOUNCES, |leg| {
+                let mut trace = bounce(ray, BOUNCES, |leg| {
                     ctx.raycast_where(time, leg, |id| {
                         mobs.get(id as usize - 1)
                             .is_some_and(|m| m.state != MobState::Dead)
                     })
                 });
+                stop_at_barrier(&mut trace, ctx.colliders());
                 let path = trace
                     .hits
                     .iter()

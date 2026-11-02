@@ -1622,7 +1622,8 @@ pub fn laser_path(shot: &LaserShot) -> Vec<LaserHit> {
         LASER_RANGE,
     )
     .mask(LASER_MASK);
-    let trace = collide::bounce(ray, LASER_BOUNCES, |r| colliders.raycast(r));
+    let mut trace = collide::bounce(ray, LASER_BOUNCES, |r| colliders.raycast(r));
+    stop_at_barrier(&mut trace, &colliders);
     let mut path: Vec<LaserHit> = trace
         .hits
         .iter()
@@ -1635,7 +1636,10 @@ pub fn laser_path(shot: &LaserShot) -> Vec<LaserHit> {
             nz: h.normal[2],
         })
         .collect();
-    if path.len() <= LASER_BOUNCES {
+    // Where it stopped, unless that was its last surface (out of bounces,
+    // or a wall barrier).
+    let stopped_on_hit = trace.hits.last().is_some_and(|h| h.point == trace.end);
+    if !stopped_on_hit {
         path.push(LaserHit {
             x: trace.end[0],
             y: trace.end[1],
@@ -1644,6 +1648,22 @@ pub fn laser_path(shot: &LaserShot) -> Vec<LaserHit> {
         });
     }
     path
+}
+
+/// Cut a laser's trace at the first wall barrier it met: a shot reaching a
+/// wall line above the wall ends there (anything it met after a bounce off
+/// thin air never happened).
+pub fn stop_at_barrier(trace: &mut collide::Trace, colliders: &Colliders) {
+    let barrier = trace.hits.iter().position(|h| match h.target {
+        collide::Target::Static(i) => colliders
+            .get(i)
+            .is_some_and(|c| c.layers & LAYER_BARRIER != 0),
+        _ => false,
+    });
+    if let Some(i) = barrier {
+        trace.hits.truncate(i + 1);
+        trace.end = trace.hits[i].point;
+    }
 }
 
 /// Which room ([`pit_room`]'s input).
@@ -3147,6 +3167,23 @@ mod tests {
             assert!((at - h).abs() < 1e-3, "stopped at the wall line, not {at}");
             assert_eq!(shot(0.0, z), None, "the doorway lets it through");
         }
+        // A shot that meets the barrier ends there: no bounce off thin air.
+        let path = laser_path(&LaserShot {
+            seed: DEFAULT_SEED,
+            room_x: room.0,
+            room_y: room.1,
+            x: h - 1.0,
+            y: DOOR_HALF + 2.0,
+            z: 8.0,
+            dx: 1.0,
+            dy: 0.0,
+            dz: 0.05,
+        });
+        assert_eq!(path.len(), 1, "{path:?}");
+        assert!(
+            (path[0].x - h).abs() < 1e-3 && path[0].nx < -0.9,
+            "{path:?}"
+        );
         // The barrier is never ground: the wall top stands where it was.
         let top = colliders.ground_at([h + 0.2, DOOR_HALF + 2.0], GROUND_MASK);
         assert_eq!(top.map(|g| g.height), Some(WALL_HEIGHT));
