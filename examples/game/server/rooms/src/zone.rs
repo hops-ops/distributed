@@ -50,7 +50,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
-use distributed_game::collide::{bounce, layer, Colliders, Ray};
+use distributed_game::collide::{bounce, Colliders, Ray};
 use distributed_game::rewind::{Historic, RewindFrame, ShotTiming};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EmitError, Entities, Entity, EntityId, EntitySchema, Fact,
@@ -63,7 +63,7 @@ use game_sim::mobpit::{
     self as rooms, admissible, borough_of, crossing, hood_of, into_neighbour, pair_shard,
     parse_room, pit_room, pit_world, room_colliders, room_ground, room_zone, FloorPatchFn,
     LaserHit, LaserPathFn, PitRoomContext, PitRoomFn, RoomTerrainFn, RoomsInReachFn, BOSS_TIER,
-    LASER_BOUNCES, LASER_MASK, LASER_RANGE, LAYER_FLOOR,
+    GROUND_MASK, LASER_BOUNCES, LASER_MASK, LASER_RANGE, LAYER_FLOOR,
 };
 use mobpit_crawler::{level_floor, KillReceipt, RecordKillInput};
 use mobpit_tiers::{BossDefeatedInput, WEATHER};
@@ -832,7 +832,7 @@ pub struct PitRules {
 /// over a hole (the fall is the player's step's business).
 fn floor_at(ground: &Colliders, x: f32, y: f32) -> f32 {
     ground
-        .ground_at([x, y], layer::ALL)
+        .ground_at([x, y], GROUND_MASK)
         .map_or(0.0, |g| g.height)
 }
 
@@ -1810,7 +1810,7 @@ impl MobPit {
             let m = &mut self.mobs[i];
             [m.x, m.y] = ctx
                 .colliders()
-                .push_out([m.x, m.y], radius, layer::ALL & !LAYER_FLOOR);
+                .push_out([m.x, m.y], radius, GROUND_MASK & !LAYER_FLOOR);
             // Mobs stay in their room (open sides have no wall to stop them).
             let lim = movement::HALF - radius;
             m.x = m.x.clamp(-lim, lim);

@@ -272,7 +272,7 @@ pub const FALL_FLOOR: f32 = -3.9;
 /// ground is a hole ([`HOLE`]).
 fn ground(ground: &Colliders, x: f32, y: f32) -> (f32, [f32; 3]) {
     let up = [0.0, 0.0, 1.0];
-    match ground.ground_at([x, y], layer::ALL) {
+    match ground.ground_at([x, y], GROUND_MASK) {
         Some(g) => (g.height, g.normal),
         None if ground.terrain().is_some() => (HOLE, up),
         None => (0.0, up),
@@ -835,8 +835,15 @@ pub const LAYER_RAMP: u32 = 1 << 1;
 pub const LAYER_FLOOR: u32 = 1 << 2;
 /// Holes, for mobs to keep out of (shots and players pass).
 pub const LAYER_HOLE: u32 = 1 << 3;
+/// The wall lines above the walls, for lasers only: a shot leaves a room
+/// through a doorway or an open side, never over a wall.
+pub const LAYER_BARRIER: u32 = 1 << 4;
 /// What a laser meets: everything but the holes' footprints.
 pub const LASER_MASK: u32 = !LAYER_HOLE;
+/// What can be stood on: everything but the laser barrier.
+pub const GROUND_MASK: u32 = !LAYER_BARRIER;
+/// How high the laser barrier reaches (m): above any shot's whole range.
+const BARRIER_HEIGHT: f32 = 1000.0;
 /// Height of the room walls and obstacles a laser meets (m).
 pub const WALL_HEIGHT: f32 = 1.6;
 /// Obstacles stop shots below this height (m).
@@ -1455,7 +1462,7 @@ pub fn floor_patch(patch: &FloorPatch) -> Vec<f32> {
         let ground = &grounds[i].1;
         let height = |x: f32, y: f32| {
             ground
-                .ground_at([x, y], layer::ALL)
+                .ground_at([x, y], GROUND_MASK)
                 .map_or(TERRAIN_HOLE, |g| g.height)
         };
         let rings = usize::from(patch.rings.clamp(1, 16));
@@ -1506,7 +1513,8 @@ pub fn ramp_colliders(ramps: &[Ramp]) -> Colliders {
 /// ([`WALL_HEIGHT`]) on [`LAYER_SOLID`], the ramps on [`LAYER_RAMP`], the
 /// terrain (floor and passages, hills, holes) on [`LAYER_FLOOR`], and the
 /// holes' footprints on [`LAYER_HOLE`] (mobs keep out; shots use
-/// [`LASER_MASK`]).
+/// [`LASER_MASK`]), and above each wall its laser barrier on
+/// [`LAYER_BARRIER`] (standing uses [`GROUND_MASK`]).
 pub fn room_colliders(seed: u32, room: (i32, i32)) -> Colliders {
     let mut colliders = room_obstacles(seed, room)
         .1
@@ -1529,13 +1537,15 @@ pub fn room_colliders(seed: u32, room: (i32, i32)) -> Colliders {
         let (north_south, east_west) = if sign > 0.0 { (4, 1) } else { (8, 2) };
         for (a, b) in [([-h - t, near], [-d, far]), ([d, near], [h + t, far])] {
             // A wall along x (north/south), then the same along y (east/west).
+            // Each wall has its laser barrier on the same footprint.
             if open & north_south == 0 {
                 colliders.push(Collider::aabb(a, b, WALL_HEIGHT).on_layers(LAYER_SOLID));
+                colliders.push(Collider::aabb(a, b, BARRIER_HEIGHT).on_layers(LAYER_BARRIER));
             }
             if open & east_west == 0 {
-                colliders.push(
-                    Collider::aabb([a[1], a[0]], [b[1], b[0]], WALL_HEIGHT).on_layers(LAYER_SOLID),
-                );
+                let (a, b) = ([a[1], a[0]], [b[1], b[0]]);
+                colliders.push(Collider::aabb(a, b, WALL_HEIGHT).on_layers(LAYER_SOLID));
+                colliders.push(Collider::aabb(a, b, BARRIER_HEIGHT).on_layers(LAYER_BARRIER));
             }
         }
         // Corner posts stand even between open sides.
@@ -3116,6 +3126,30 @@ mod tests {
         assert_eq!(reach(17.0, 12.0, 0) & 1, 0);
         assert_eq!(reach(17.0, 12.0, 1) & 1, 1);
         assert_eq!(reach(0.0, 0.0, 15), 0);
+    }
+
+    #[test]
+    fn lasers_leave_through_doorways_never_over_a_wall() {
+        let room = (-8..8)
+            .flat_map(|x| (-8..8).map(move |y| (x, y)))
+            .find(|&r| open_sides(DEFAULT_SEED, r) & 1 == 0)
+            .expect("a room walled to the east");
+        let colliders = room_colliders(DEFAULT_SEED, room);
+        let h = arena::HALF;
+        // Well above the wall and every obstacle, toward the east wall.
+        let shot = |y: f32, z: f32| {
+            colliders
+                .raycast(&Ray::new([h - 1.0, y, z], [1.0, 0.0, 0.05], 10.0).mask(LASER_MASK))
+                .map(|hit| hit.point[0])
+        };
+        for z in [WALL_HEIGHT + 0.1, 5.0, 40.0] {
+            let at = shot(DOOR_HALF + 2.0, z).expect("the barrier stops it");
+            assert!((at - h).abs() < 1e-3, "stopped at the wall line, not {at}");
+            assert_eq!(shot(0.0, z), None, "the doorway lets it through");
+        }
+        // The barrier is never ground: the wall top stands where it was.
+        let top = colliders.ground_at([h + 0.2, DOOR_HALF + 2.0], GROUND_MASK);
+        assert_eq!(top.map(|g| g.height), Some(WALL_HEIGHT));
     }
 
     #[test]
