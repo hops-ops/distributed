@@ -41,6 +41,7 @@ import { Mesh } from '@babylonjs/core/Meshes/mesh';
 import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode';
+import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
 import {
@@ -208,6 +209,8 @@ let ghostOn = true;
 hud.toggle('Server ghost', true, (on) => (ghostOn = on), 'g');
 let cullOn = true;
 hud.toggle('Skip off-screen entities', true, (on) => (cullOn = on), 'k');
+let lodOn = true;
+hud.toggle('Level of detail (props and mobs)', true, (on) => (lodOn = on), 'l');
 hud.toggle(
 	'Wake rooms in reach (doorway neighbours you walk up to)',
 	wakeInitial,
@@ -686,6 +689,55 @@ function placeIn(zoneId: string, x: number, y: number, height = 0): Vector3 {
 	return place(parseRoom(zoneId) ?? origin, x, y, height);
 }
 
+// ---- level of detail ----
+// Round props and the bigger mobs come in three levels, about 100 %, 30 %
+// and 10 % of the full level's triangles; an object's level follows its
+// distance from the camera, past LOD_AT[0] the middle one, past LOD_AT[1]
+// the coarsest. Around each threshold a 10 % band (±5 %): a coarser level
+// only past T × 1.05, a finer one only inside T × 0.95, so an object
+// standing near a threshold does not flicker between levels.
+const LOD_AT = [18, 45];
+const LOD_BAND = 0.05;
+type Lod = { node: TransformNode; levels: readonly AbstractMesh[]; level: number };
+/** Three template meshes of one shape (level 0 the finest), hidden: objects are instances of them. */
+function lodTemplates(name: string, mat: StandardMaterial, make: (name: string, level: 0 | 1 | 2) => Mesh): Mesh[] {
+	return ([0, 1, 2] as const).map((l) => {
+		const mesh = make(`${name}-lod${l}`, l);
+		mesh.material = mat;
+		mesh.isPickable = false;
+		mesh.setEnabled(false);
+		return mesh;
+	});
+}
+/** An object of `templates` (one instance per level under `node`; the finest shown). */
+function lodOf(node: TransformNode, templates: readonly Mesh[]): Lod {
+	const levels = templates.map((t, l) => {
+		const instance = t.createInstance(`${node.name}-lod${l}`);
+		instance.parent = node;
+		instance.isPickable = false;
+		instance.setEnabled(l === 0);
+		return instance;
+	});
+	return { node, levels, level: 0 };
+}
+/** The level for distance `d` (m) from `level`, with the band round each threshold. */
+function lodLevel(level: number, d: number, count: number): number {
+	let l = level;
+	while (l < count - 1 && d > LOD_AT[l]! * (1 + LOD_BAND)) l += 1;
+	while (l > 0 && d < LOD_AT[l - 1]! * (1 - LOD_BAND)) l -= 1;
+	return l;
+}
+/** Objects per level this frame (for the HUD). */
+const lodCounts = [0, 0, 0];
+function applyLod(lod: Lod, eye: Vector3): void {
+	const want = lodOn ? lodLevel(lod.level, Vector3.Distance(eye, lod.node.getAbsolutePosition()), lod.levels.length) : 0;
+	lodCounts[want] = (lodCounts[want] ?? 0) + 1;
+	if (want === lod.level) return;
+	lod.levels[lod.level]!.setEnabled(false);
+	lod.levels[want]!.setEnabled(true);
+	lod.level = want;
+}
+
 /** Room templates, instanced per room: floor per biome, wall segment, doorway gate, pillar. */
 const templates = (() => {
 	const px = 1024;
@@ -729,19 +781,17 @@ const templates = (() => {
 	gate.material = doorMat;
 	gate.isPickable = false;
 	gate.setEnabled(false);
-	const pillar = MeshBuilder.CreateCylinder('room-pillar', { diameter: 1, height: 2.4, tessellation: 24 }, scene);
-	pillar.material = mats.pillar;
-	pillar.isPickable = false;
-	pillar.setEnabled(false);
+	// Columns, boulders and trees have three levels of detail (LOD_DETAIL).
+	const pillar = lodTemplates('room-pillar', mats.pillar, (name, l) =>
+		MeshBuilder.CreateCylinder(name, { diameter: 1, height: 2.4, tessellation: [40, 12, 4][l] }, scene)
+	);
 	// Obstacle looks of the seeded layouts: 0 column · 1 boulder · 2 tree · 3 crystal.
-	const boulder = MeshBuilder.CreateSphere('room-boulder', { diameter: 1, segments: 6 }, scene);
-	boulder.material = material(scene, 'boulder', '#6e6a62');
-	boulder.isPickable = false;
-	boulder.setEnabled(false);
-	const tree = MeshBuilder.CreateCylinder('room-tree', { diameterTop: 0, diameterBottom: 1.6, height: 3.2, tessellation: 7 }, scene);
-	tree.material = material(scene, 'tree', '#2f6b3a');
-	tree.isPickable = false;
-	tree.setEnabled(false);
+	const boulder = lodTemplates('room-boulder', material(scene, 'boulder', '#6e6a62'), (name, l) =>
+		MeshBuilder.CreateSphere(name, { diameter: 1, segments: [16, 8, 4][l] }, scene)
+	);
+	const tree = lodTemplates('room-tree', material(scene, 'tree', '#2f6b3a'), (name, l) =>
+		MeshBuilder.CreateCylinder(name, { diameterTop: 0, diameterBottom: 1.6, height: 3.2, tessellation: [40, 12, 4][l] }, scene)
+	);
 	const crystalMat = material(scene, 'crystal', '#7fe3ff', 0.85);
 	crystalMat.emissiveColor = Color3.FromHexString('#2a6f88');
 	const crystal = MeshBuilder.CreateBox('room-crystal', { size: 1 }, scene);
@@ -880,7 +930,7 @@ function rampMesh(name: string, r: Ramp): Mesh {
 	return mesh;
 }
 
-type Chunk = { room: Room; node: TransformNode; biome: number | undefined; seed: number };
+type Chunk = { room: Room; node: TransformNode; biome: number | undefined; seed: number; lods: Lod[] };
 const chunks = new Map<string, Chunk>();
 
 /** One room's static geometry under a node at the room's centre. */
@@ -939,24 +989,33 @@ function createChunk(room: Room): Chunk {
 		if (!openH) add(templates.gate, `door-h${side}`, 0, side * HALF, 0.04);
 		if (!openV) add(templates.gate, `door-v${side}`, side * HALF, 0, 0.04, Math.PI / 2);
 	}
+	const lods: Lod[] = [];
 	// The room's seeded obstacles (what the step collides with).
 	const obstacles = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }).obstacles : PILLARS.map((p) => ({ ...p, look: 0 }));
 	obstacles.forEach(({ x, y, r, look }, i) => {
 		// Each stands on the level patch the terrain leaves it (on a hill, not in it).
 		const base = groundAt(key, x, y);
 		const add = (mesh: Mesh, name: string, x: number, y: number, height: number) => addAt(mesh, name, x, y, base + height);
+		// A three-level prop: a node at its place, its levels under it.
+		const addLod = (levels: readonly Mesh[], name: string, x: number, y: number, height: number) => {
+			const prop = new TransformNode(`${key}-${name}`, scene);
+			prop.parent = node;
+			prop.position.set(x, base + height, y);
+			lods.push(lodOf(prop, levels));
+			return prop;
+		};
 		if (look === 1) {
-			const instance = add(templates.boulder, `obstacle-${i}`, x, y, r * 0.55);
+			const instance = addLod(templates.boulder, `obstacle-${i}`, x, y, r * 0.55);
 			instance.scaling.set(r * 2, r * 1.3, r * 2);
 		} else if (look === 2) {
-			const instance = add(templates.tree, `obstacle-${i}`, x, y, 1.6);
+			const instance = addLod(templates.tree, `obstacle-${i}`, x, y, 1.6);
 			instance.scaling.set(r * 1.25, 1, r * 1.25);
 		} else if (look === 3) {
 			const instance = add(templates.crystal, `obstacle-${i}`, x, y, r);
 			instance.scaling.set(r * 1.4, r * 2, r * 1.4);
 			instance.rotation.y = 0.6;
 		} else {
-			const instance = add(templates.pillar, `pillar-${i}`, x, y, 1.2);
+			const instance = addLod(templates.pillar, `pillar-${i}`, x, y, 1.2);
 			instance.scaling.set(r * 2, 1, r * 2);
 		}
 	});
@@ -965,7 +1024,7 @@ function createChunk(room: Room): Chunk {
 	ramps.forEach((r, i) => {
 		rampMesh(`${key}-ramp-${i}`, r).parent = node;
 	});
-	return { room, node, biome, seed };
+	return { room, node, biome, seed, lods };
 }
 
 /** Keep the rooms within `ROOM_VIEW` of the origin built and placed. */
@@ -1059,7 +1118,9 @@ type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: 
  */
 type MobVisual = {
 	kind: 'mob';
-	body: Mesh;
+	/** A mesh, or (the round tiers) a node over its levels of detail. */
+	body: TransformNode;
+	lod?: Lod;
 	ring: Mesh;
 	fill: Mesh;
 	tier: number;
@@ -1168,19 +1229,41 @@ function drape(mesh: Mesh, area: SlamArea, scale: number): void {
 	mesh.updateVerticesData('position', positions);
 }
 
+/** Three-level bodies of the round tiers (3: a spike, 4: the boss), made on first use. */
+const mobLods = new Map<number, Mesh[]>();
+function mobLodTemplates(tier: number): Mesh[] | undefined {
+	if (tier !== 3 && tier !== 4) return undefined;
+	let levels = mobLods.get(tier);
+	if (levels === undefined) {
+		const t = TIERS[tier]!;
+		const top = tier === 4 ? t.radius * 0.8 : 0;
+		const height = tier === 4 ? 2.8 : 2;
+		levels = lodTemplates(`mob-tier${tier}`, tierMats.get(tier) ?? mats.other, (name, l) =>
+			MeshBuilder.CreateCylinder(name, { diameterTop: top, diameterBottom: t.radius * 2, height, tessellation: [40, 12, 4][l] }, scene)
+		);
+		mobLods.set(tier, levels);
+	}
+	return levels;
+}
+
 function createMob(entity: RenderedEntity): MobVisual {
 	const tier = mobFields(entity).tier || 1;
 	const t = TIERS[tier] ?? TIERS[1]!;
-	const body =
-		tier === 4
-			? MeshBuilder.CreateCylinder(entity.key, { diameterTop: t.radius * 0.8, diameterBottom: t.radius * 2, height: 2.8, tessellation: 8 }, scene)
-			: tier === 3
-			? MeshBuilder.CreateCylinder(entity.key, { diameterTop: 0, diameterBottom: t.radius * 2, height: 2, tessellation: 6 }, scene)
-			: MeshBuilder.CreateBox(entity.key, { width: t.radius * 2, depth: t.radius * 2, height: tier === 2 ? 1.5 : 0.9 }, scene);
-	body.material = tierMats.get(tier) ?? mats.other;
+	// The round tiers in three levels; a box (grunt, brute) cannot go lower.
+	const levels = mobLodTemplates(tier);
+	let body: TransformNode;
+	let lod: Lod | undefined;
+	if (levels !== undefined) {
+		body = new TransformNode(entity.key, scene);
+		lod = lodOf(body, levels);
+	} else {
+		const box = MeshBuilder.CreateBox(entity.key, { width: t.radius * 2, depth: t.radius * 2, height: tier === 2 ? 1.5 : 0.9 }, scene);
+		box.material = tierMats.get(tier) ?? mats.other;
+		body = box;
+	}
 	const ring = drapedDisc(`${entity.key}-tele`, mats.tele);
 	const fill = drapedDisc(`${entity.key}-tele-fill`, mats.teleFill);
-	return { kind: 'mob', body, ring, fill, tier, edge: false, culled: false, ...hpBar(entity.key, mats.hpFill) };
+	return { kind: 'mob', body, lod, ring, fill, tier, edge: false, culled: false, ...hpBar(entity.key, mats.hpFill) };
 }
 
 // ---- mobs crossing between rooms ----
@@ -1221,8 +1304,8 @@ function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 }
 
 function dispose(visual: Visual): void {
-	// (The bar's fill goes with its back.)
-	for (const mesh of Object.values(visual)) if (mesh instanceof Mesh && !mesh.isDisposed()) mesh.dispose();
+	// (The bar's fill goes with its back, a body's levels with their node.)
+	for (const node of Object.values(visual)) if (node instanceof TransformNode && !node.isDisposed()) node.dispose();
 }
 
 const HP_W = 1.2;
@@ -1535,7 +1618,7 @@ function setCulled(visual: Visual, culled: boolean): void {
 	visual.culled = culled;
 	// Disabled: off Babylon's active-mesh pass. The bar's fill goes with its
 	// back (the frame re-enables only top-level meshes).
-	if (culled) for (const mesh of Object.values(visual)) if (mesh instanceof Mesh && mesh.parent === null) mesh.setEnabled(false);
+	if (culled) for (const node of Object.values(visual)) if (node instanceof TransformNode && node.parent === null) node.setEnabled(false);
 	// Back on screen: the bar snaps to the health instead of easing from the old one.
 	else visual.hpShown = Number.NaN;
 }
@@ -1566,6 +1649,10 @@ stage.onFrame((now, dtMs) => {
 	let stats: PitFields | undefined;
 	const loopStart = performance.now();
 	updateFrustum();
+	// Levels of detail from the camera (its last rendered spot; the band absorbs a frame's move).
+	const eye = scene.activeCamera?.globalPosition ?? Vector3.ZeroReadOnly;
+	lodCounts.fill(0);
+	for (const chunk of chunks.values()) for (const lod of chunk.lods) applyLod(lod, eye);
 	let drawn = 0;
 	let culled = 0;
 	for (const entity of rendered) {
@@ -1622,6 +1709,7 @@ stage.onFrame((now, dtMs) => {
 				visual.body.position.copyFrom(at(x, y, height));
 			}
 			visual.body.rotation.y = -mob.face;
+			if (visual.lod !== undefined) applyLod(visual.lod, eye);
 			const hp = mob.hp / 100;
 			const top = height * 2 - ground + 0.35;
 			showHp(visual, at(x, y, top), hp, dtMs);
@@ -1741,6 +1829,8 @@ stage.onFrame((now, dtMs) => {
 	hud.row('Ack seq', String(predictor?.lastAck ?? 0));
 	hud.row('Corrections', `${corrections} (last ${lastCorrection.toFixed(3)} m)`);
 	hud.row('Entities drawn / off screen', `${cullStats.drawn} / ${cullStats.culled}`);
+	hud.row('LOD near / mid / far', `${lodCounts[0]} / ${lodCounts[1]} / ${lodCounts[2]}${lodOn ? '' : ' (off: all full)'}`);
+	hud.row('Triangles drawn', String(Math.round(scene.getActiveIndices() / 3)));
 	hud.row('Frame CPU', `entities ${cullStats.loopMs.toFixed(2)} ms · render ${cullStats.renderMs.toFixed(2)} ms`);
 	hud.row('Ghost gap', ghostGap === undefined ? '—' : `${ghostGap.toFixed(2)} m`);
 	const around = [...pit.neighbours().values()];

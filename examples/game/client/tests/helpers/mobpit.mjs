@@ -158,7 +158,7 @@ export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000, along =
 		if (Date.now() > deadline) throw new Error(`walk through door ${dx},${dy} timed out`);
 		const me = pit.me();
 		const at = pit.position();
-		if (at !== undefined) trace.push({ t: Date.now(), room: me.zoneId, predicted: me.predicted, ...at });
+		if (at !== undefined) trace.push({ t: Date.now(), room: me.zoneId, predicted: me.predicted, dead: playerFields(me).dead, ...at });
 		let input = { mx: 0, my: 0, buttons: 0 };
 		if (at !== undefined) {
 			// Beside the pillar on the door's axis, through the gap, and on
@@ -178,10 +178,11 @@ export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000, along =
 	return { room: pit.room(), trace };
 }
 
-/** Largest move (m) between consecutive samples of a `walkThroughDoor` trace. */
+/** Largest move (m) between consecutive samples of a `walkThroughDoor` trace (a death's respawn is no step). */
 export function largestStep(trace) {
 	let max = 0;
 	for (let i = 1; i < trace.length; i += 1) {
+		if (trace[i].dead || trace[i - 1].dead) continue;
 		max = Math.max(max, Math.hypot(trace[i].x - trace[i - 1].x, trace[i].y - trace[i - 1].y));
 	}
 	return max;
