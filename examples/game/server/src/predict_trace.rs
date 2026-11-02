@@ -368,6 +368,32 @@ fn laser_path_args() -> Vec<Vec<u8>> {
 
 /// Room terrain: every content room plus a ring of rooms with hills and
 /// holes.
+fn floor_patch_args() -> Vec<Vec<u8>> {
+    let mut args = Vec::new();
+    for (room_x, room_y) in content_cells() {
+        for &(x, y, radius) in &[
+            (0.0f32, 0.0f32, 2.6f32),
+            (12.0, -7.5, 3.2),
+            (-16.0, 9.0, 1.8),
+        ] {
+            args.push(
+                game_sim::mobpit::FloorPatch {
+                    seed: game_sim::mobpit::DEFAULT_SEED,
+                    room_x,
+                    room_y,
+                    x,
+                    y,
+                    radius,
+                    rings: 6,
+                    segments: 32,
+                }
+                .encode_context(),
+            );
+        }
+    }
+    args
+}
+
 fn terrain_args() -> Vec<Vec<u8>> {
     let mut rooms = content_cells();
     for x in -3..=3 {
@@ -399,6 +425,7 @@ pub fn traces() -> Value {
             pure_trace::<game_sim::mobpit::RoomsInReachFn>(rooms_in_reach_args()),
             pure_trace::<game_sim::mobpit::LaserPathFn>(laser_path_args()),
             pure_trace::<game_sim::mobpit::RoomTerrainFn>(terrain_args()),
+            pure_trace::<game_sim::mobpit::FloorPatchFn>(floor_patch_args()),
         ],
         "steps": [
             trace::<PitStep>(pit_streams()),

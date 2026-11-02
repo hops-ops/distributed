@@ -1426,6 +1426,21 @@
     {
       "abi": 1,
       "arg": {
+        "name": "FloorPatch",
+        "type": "record"
+      },
+      "export": "floor_patch",
+      "output": {
+        "item": {
+          "type": "f32"
+        },
+        "type": "list"
+      },
+      "package": "game_sim"
+    },
+    {
+      "abi": 1,
+      "arg": {
         "name": "LaserShot",
         "type": "record"
       },
@@ -1520,6 +1535,59 @@
         }
       ],
       "name": "ContentPack"
+    },
+    {
+      "fields": [
+        {
+          "name": "seed",
+          "type": {
+            "type": "u32"
+          }
+        },
+        {
+          "name": "room_x",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "room_y",
+          "type": {
+            "type": "i32"
+          }
+        },
+        {
+          "name": "x",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "y",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "radius",
+          "type": {
+            "type": "f32"
+          }
+        },
+        {
+          "name": "rings",
+          "type": {
+            "type": "u8"
+          }
+        },
+        {
+          "name": "segments",
+          "type": {
+            "type": "u8"
+          }
+        }
+      ],
+      "name": "FloorPatch"
     },
     {
       "fields": [

@@ -648,6 +648,12 @@ const mats = {
 };
 mats.ghost.wireframe = true;
 for (const m of [mats.swing, mats.tele, mats.teleFill, mats.hpFill, mats.playerHpFill]) m.emissiveColor = m.diffuseColor.clone();
+// Slam warnings lie on the floor: both faces, drawn over it where they meet
+// (the floor's triangles and the room's bilinear ground differ by a few cm).
+for (const m of [mats.tele, mats.teleFill]) {
+	m.backFaceCulling = false;
+	m.zOffset = -2;
+}
 mats.blade.emissiveColor = new Color3(0.6, 0.6, 0.7);
 const tierMats = new Map<number, StandardMaterial>();
 for (const [tier, t] of Object.entries(TIERS)) tierMats.set(Number(tier), material(scene, `mob-${tier}`, t.color));
@@ -883,7 +889,7 @@ function createChunk(room: Room): Chunk {
 	const node = new TransformNode(`room-${key}`, scene);
 	const seed = pit.hello()?.seed ?? PIT_WORLD.defaultSeed;
 	const biome = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }).biome : undefined;
-	const add = (mesh: Mesh, name: string, x: number, y: number, height: number, turn = 0) => {
+	const addAt = (mesh: Mesh, name: string, x: number, y: number, height: number, turn = 0) => {
 		const instance = mesh.createInstance(`${key}-${name}`);
 		instance.parent = node;
 		instance.position.set(x, height, y);
@@ -891,6 +897,7 @@ function createChunk(room: Room): Chunk {
 		instance.isPickable = false;
 		return instance;
 	};
+	const add = addAt;
 	const layout = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }) : undefined;
 	if (layout !== undefined && biome !== undefined) {
 		const terrain = pit.pures.terrain({ seed, x: room[0], y: room[1] });
@@ -935,6 +942,9 @@ function createChunk(room: Room): Chunk {
 	// The room's seeded obstacles (what the step collides with).
 	const obstacles = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }).obstacles : PILLARS.map((p) => ({ ...p, look: 0 }));
 	obstacles.forEach(({ x, y, r, look }, i) => {
+		// Each stands on the level patch the terrain leaves it (on a hill, not in it).
+		const base = groundAt(key, x, y);
+		const add = (mesh: Mesh, name: string, x: number, y: number, height: number) => addAt(mesh, name, x, y, base + height);
 		if (look === 1) {
 			const instance = add(templates.boulder, `obstacle-${i}`, x, y, r * 0.55);
 			instance.scaling.set(r * 2, r * 1.3, r * 2);
@@ -1047,7 +1057,17 @@ type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: 
  * just came across from the room next door and glides from where its old
  * room last drew it.
  */
-type MobVisual = { kind: 'mob'; body: Mesh; ring: Mesh; fill: Mesh; tier: number; edge: boolean; slide?: { from: Vector3; start: number } } & HpBar &
+type MobVisual = {
+	kind: 'mob';
+	body: Mesh;
+	ring: Mesh;
+	fill: Mesh;
+	tier: number;
+	edge: boolean;
+	slide?: { from: Vector3; start: number };
+	/** The floor its slam warning lies on (fetched when a windup starts there). */
+	area?: SlamArea;
+} & HpBar &
 	Culled;
 type Visual = PlayerVisual | MobVisual;
 const visuals = new Map<string, Visual>();
@@ -1072,6 +1092,82 @@ function createPlayer(entity: RenderedEntity, mine: boolean): PlayerVisual {
 	return { kind: 'player', body, blade, arc, nose, culled: false, ...hpBar(entity.key, mats.playerHpFill) };
 }
 
+// ---- slam warnings, draped on the floor ----
+// A mob's slam hits anyone within its reach standing on whatever floor is
+// under them (terrain, ramp or platform top), as the room's `floor_at`
+// says; the warning lies on that floor (the `floor_patch` pure, the room's
+// own ground) instead of a flat disc that hills and ramps cut off.
+const SLAM_RINGS = 6;
+const SLAM_SEGMENTS = 32;
+const SLAM_LIFT = 0.05;
+type SlamArea = { zone: string; x: number; y: number; radius: number; heights: readonly number[] };
+function drapedDisc(id: string, mat: StandardMaterial): Mesh {
+	const mesh = new Mesh(id, scene);
+	const n = 1 + SLAM_RINGS * SLAM_SEGMENTS;
+	const index = (r: number, k: number) => (r === 0 ? 0 : 1 + (r - 1) * SLAM_SEGMENTS + (k % SLAM_SEGMENTS));
+	const indices: number[] = [];
+	for (let k = 0; k < SLAM_SEGMENTS; k += 1) indices.push(0, index(1, k + 1), index(1, k));
+	for (let r = 1; r < SLAM_RINGS; r += 1) {
+		for (let k = 0; k < SLAM_SEGMENTS; k += 1) {
+			indices.push(index(r, k), index(r, k + 1), index(r + 1, k + 1), index(r, k), index(r + 1, k + 1), index(r + 1, k));
+		}
+	}
+	const data = new VertexData();
+	data.positions = new Array<number>(n * 3).fill(0);
+	data.normals = Array.from({ length: n * 3 }, (_, i) => (i % 3 === 1 ? 1 : 0));
+	data.indices = indices;
+	data.applyToMesh(mesh, true);
+	mesh.material = mat;
+	mesh.isPickable = false;
+	// Its bounds change as it is draped: always considered for drawing.
+	mesh.alwaysSelectAsActiveMesh = true;
+	return mesh;
+}
+/** The floor under a slam of `radius` at room-local `(x, y)`: fetched once per spot. */
+function slamArea(visual: MobVisual, zone: string, x: number, y: number, radius: number): SlamArea {
+	const old = visual.area;
+	if (old !== undefined && old.zone === zone && old.radius === radius && Math.hypot(old.x - x, old.y - y) < 0.05) return old;
+	const room = parseRoom(zone);
+	const heights =
+		room !== undefined && pit.pures.loaded()
+			? pit.pures.floorPatch({ seed: pit.hello()?.seed ?? PIT_WORLD.defaultSeed, roomX: room[0], roomY: room[1], x, y, radius, rings: SLAM_RINGS, segments: SLAM_SEGMENTS })
+			: new Array<number>(1 + SLAM_RINGS * SLAM_SEGMENTS).fill(groundAt(zone, x, y));
+	visual.area = { zone, x, y, radius, heights };
+	drape(visual.ring, visual.area, 1);
+	return visual.area;
+}
+/**
+ * Lay `mesh` (a `drapedDisc`) on `area` at `scale` of its radius: each
+ * ring's height is read along its ray from the area's rings. Over a hole
+ * it sinks in.
+ */
+function drape(mesh: Mesh, area: SlamArea, scale: number): void {
+	const at = (r: number, k: number) => area.heights[r === 0 ? 0 : 1 + (r - 1) * SLAM_SEGMENTS + k]!;
+	const height = (f: number, k: number) => {
+		const r = Math.min(Math.floor(f), SLAM_RINGS - 1);
+		const t = Math.min(f - r, 1);
+		const a = at(r, k);
+		const b = at(r + 1, k);
+		const ha = isHole(a) ? at(0, k) - 3 : a;
+		const hb = isHole(b) ? at(0, k) - 3 : b;
+		return ha + (hb - ha) * t + SLAM_LIFT;
+	};
+	const positions = new Float32Array((1 + SLAM_RINGS * SLAM_SEGMENTS) * 3);
+	positions[1] = height(0, 0);
+	for (let r = 1; r <= SLAM_RINGS; r += 1) {
+		const f = r * scale;
+		const d = (area.radius * r * scale) / SLAM_RINGS;
+		for (let k = 0; k < SLAM_SEGMENTS; k += 1) {
+			const a = (Math.PI * 2 * k) / SLAM_SEGMENTS;
+			const i = (1 + (r - 1) * SLAM_SEGMENTS + k) * 3;
+			positions[i] = d * Math.cos(a);
+			positions[i + 1] = height(f, k);
+			positions[i + 2] = d * Math.sin(a);
+		}
+	}
+	mesh.updateVerticesData('position', positions);
+}
+
 function createMob(entity: RenderedEntity): MobVisual {
 	const tier = mobFields(entity).tier || 1;
 	const t = TIERS[tier] ?? TIERS[1]!;
@@ -1082,8 +1178,8 @@ function createMob(entity: RenderedEntity): MobVisual {
 			? MeshBuilder.CreateCylinder(entity.key, { diameterTop: 0, diameterBottom: t.radius * 2, height: 2, tessellation: 6 }, scene)
 			: MeshBuilder.CreateBox(entity.key, { width: t.radius * 2, depth: t.radius * 2, height: tier === 2 ? 1.5 : 0.9 }, scene);
 	body.material = tierMats.get(tier) ?? mats.other;
-	const ring = flatDisc(`${entity.key}-tele`, t.tele, mats.tele);
-	const fill = flatDisc(`${entity.key}-tele-fill`, t.tele, mats.teleFill);
+	const ring = drapedDisc(`${entity.key}-tele`, mats.tele);
+	const fill = drapedDisc(`${entity.key}-tele-fill`, mats.teleFill);
 	return { kind: 'mob', body, ring, fill, tier, edge: false, culled: false, ...hpBar(entity.key, mats.hpFill) };
 }
 
@@ -1534,9 +1630,10 @@ stage.onFrame((now, dtMs) => {
 			visual.ring.setEnabled(visible && winding);
 			visual.fill.setEnabled(visible && winding);
 			if (winding) {
-				visual.ring.position.copyFrom(at(x, y, ground + 0.03));
-				visual.fill.position.copyFrom(at(x, y, ground + 0.04));
-				visual.fill.scaling.setAll(Math.max(0.05, tele));
+				const area = slamArea(visual, entity.zoneId, x, y, TIERS[visual.tier]?.tele ?? 1);
+				visual.ring.position.copyFrom(at(x, y, 0));
+				visual.fill.position.copyFrom(at(x, y, 0.01));
+				drape(visual.fill, area, Math.max(0.05, tele));
 			}
 			visual.body.scaling.setAll(winding ? 1 + 0.15 * tele : 1);
 			for (const m of [visual.body, visual.hpBack]) m.setEnabled(visible);

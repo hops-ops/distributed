@@ -3,7 +3,21 @@
 // Do not edit: change the Rust definitions and regenerate.
 import { createWasmPures, type WasmPures, type WasmSource, type WireType } from '@hops-ops/distributed/game';
 
-import type { LaserHit, LaserShot, PitRoomContext, PitRoomLayout, Reach, ReachContext, RoomTerrain } from './events.ts';
+import type { FloorPatch, LaserHit, LaserShot, PitRoomContext, PitRoomLayout, Reach, ReachContext, RoomTerrain } from './events.ts';
+
+const FLOOR_PATCH_TYPE: WireType = {
+	type: 'record',
+	fields: [
+		['seed', { type: 'u32' }],
+		['roomX', { type: 'i32' }],
+		['roomY', { type: 'i32' }],
+		['x', { type: 'f32' }],
+		['y', { type: 'f32' }],
+		['radius', { type: 'f32' }],
+		['rings', { type: 'u8' }],
+		['segments', { type: 'u8' }],
+	]
+};
 
 const HOLE_TYPE: WireType = {
 	type: 'record',
@@ -144,6 +158,7 @@ const ROOM_TERRAIN_TYPE: WireType = {
 
 /** The pure functions (`#[game_pure]`) of Cargo package `game_sim`: wrapper name → module export. */
 export const PURES = {
+	floorPatch: { export: 'floor_patch', abi: 1 },
 	laserPath: { export: 'laser_path', abi: 1 },
 	pitRoom: { export: 'pit_room', abi: 1 },
 	roomsInReach: { export: 'rooms_in_reach', abi: 1 },
@@ -155,6 +170,8 @@ export const PURES_WASM_URL: URL = new URL('./wasm/mobpit.wasm', import.meta.url
 
 /** Typed calls of the compiled functions (synchronous; they throw until `ready` resolves). */
 export interface MobpitPureFns {
+	/** `floor_patch` (`dg_pure_floor_patch`). */
+	floorPatch(arg: FloorPatch): readonly number[];
 	/** `laser_path` (`dg_pure_laser_path`). */
 	laserPath(arg: LaserShot): readonly LaserHit[];
 	/** `pit_room` (`dg_pure_pit_room`). */
@@ -174,6 +191,7 @@ export type MobpitPures = WasmPures<MobpitPureFns>;
  */
 export function createMobpitPures(source: WasmSource = PURES_WASM_URL): MobpitPures {
 	return createWasmPures<MobpitPureFns>(source, {
+		floorPatch: { exportName: 'floor_patch', arg: FLOOR_PATCH_TYPE, output: { type: 'list', item: { type: 'f32' } } },
 		laserPath: { exportName: 'laser_path', arg: LASER_SHOT_TYPE, output: { type: 'list', item: LASER_HIT_TYPE } },
 		pitRoom: { exportName: 'pit_room', arg: PIT_ROOM_CONTEXT_TYPE, output: PIT_ROOM_LAYOUT_TYPE },
 		roomsInReach: { exportName: 'rooms_in_reach', arg: REACH_CONTEXT_TYPE, output: REACH_TYPE },

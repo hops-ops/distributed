@@ -1143,15 +1143,35 @@ fn ease(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Room `room`'s terrain over the floor and its passages: the hills
-/// (summed), eased to level by 0.5 m from the walls (rooms meet flat) and 2 m
-/// round each ramp and platform (which stand on the floor), and [`HOLE`]
-/// over the holes. Polynomials only, so the browser's WebAssembly
-/// computes the same samples. Pure and deterministic.
-pub fn room_terrain(seed: u32, room: (i32, i32)) -> Heightfield {
-    let hills = room_hills(seed, room);
-    let holes = room_holes(seed, room);
-    let mut flat: Vec<(f32, f32, f32)> = room_ramps(seed, room)
+/// The hills of room `room` (summed), eased to level 2 m round each ramp
+/// and platform (which stand on the floor): its terrain before the walls,
+/// holes and obstacles.
+fn hill_height(hills: &[Hill], flat: &[(f32, f32, f32)], x: f32, y: f32) -> f32 {
+    let mut z = 0.0f32;
+    for hill in hills {
+        let (dx, dy) = (x - hill.x, y - hill.y);
+        let u = (dx * dx + dy * dy) / (hill.r * hill.r);
+        if u < 1.0 {
+            z += hill.amp * (1.0 - u) * (1.0 - u);
+        }
+    }
+    let mut fade = 1.0;
+    for &(fx, fy, fr) in flat {
+        let (dx, dy) = (x - fx, y - fy);
+        fade *= ease(((dx * dx + dy * dy).sqrt() - fr) / 2.0);
+    }
+    (z * fade).min(TERRAIN_TOP)
+}
+
+/// Eased to level by 0.5 m from the walls: rooms meet flat.
+fn wall_fade(x: f32, y: f32) -> f32 {
+    ease((arena::HALF - x.abs().max(y.abs()) - 0.5) / 3.5)
+}
+
+/// Room `room`'s ramps and platforms as circles `(x, y, r)` the hills
+/// ease to level round.
+fn ramp_and_platform_circles(seed: u32, room: (i32, i32)) -> Vec<(f32, f32, f32)> {
+    room_ramps(seed, room)
         .iter()
         .map(|r| (r.x0, r.y0, r.x1, r.y1))
         .chain(
@@ -1163,13 +1183,75 @@ pub fn room_terrain(seed: u32, room: (i32, i32)) -> Heightfield {
             let (hx, hy) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
             (x0 + hx, y0 + hy, (hx * hx + hy * hy).sqrt())
         })
-        // Obstacles stand on level ground at their full height (a hill
-        // round a column would leave a stub that looks like a platform).
-        .chain(room_obstacles(seed, room).1.iter().map(|o| (o.x, o.y, o.r + 1.0)))
+        .collect()
+}
+
+/// The ground level each of room `room`'s obstacles stands on (in
+/// [`room_obstacles`] order): the hill under its centre. The terrain is
+/// level at that height out to 1 m past it (sloping with the walls' fade
+/// near a wall), so it stands on a hill at its full height, never sunk in
+/// one (nor left a stub that looks like a platform).
+pub fn obstacle_levels(seed: u32, room: (i32, i32)) -> Vec<f32> {
+    let hills = room_hills(seed, room);
+    let flat = ramp_and_platform_circles(seed, room);
+    let obstacles = room_obstacles(seed, room).1;
+    let mut levels: Vec<f32> = obstacles
+        .iter()
+        .map(|o| {
+            if hills.is_empty() {
+                0.0
+            } else {
+                hill_height(&hills, &flat, o.x, o.y) * wall_fade(o.x, o.y)
+            }
+        })
         .collect();
-    if hills.is_empty() {
-        flat.clear();
+    // Obstacles whose patches (or the 2 m eases round them) meet share one
+    // level, the highest: each stands level, none sunk.
+    let n = obstacles.len();
+    let mut group: Vec<usize> = (0..n).collect();
+    let root = |group: &[usize], mut i: usize| {
+        while group[i] != i {
+            i = group[i];
+        }
+        i
+    };
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (a, b) = (&obstacles[i], &obstacles[j]);
+            let reach = a.r + b.r + 2.0 + 2.0 * 2.0;
+            if (a.x - b.x).powi(2) + (a.y - b.y).powi(2) < reach * reach {
+                let (ri, rj) = (root(&group, i), root(&group, j));
+                group[ri.max(rj)] = ri.min(rj);
+            }
+        }
     }
+    let mut top = vec![f32::MIN; n];
+    for (i, &level) in levels.iter().enumerate() {
+        let r = root(&group, i);
+        top[r] = top[r].max(level);
+    }
+    for (i, level) in levels.iter_mut().enumerate() {
+        *level = top[root(&group, i)];
+    }
+    levels
+}
+
+/// Room `room`'s terrain over the floor and its passages: the hills
+/// ([`hill_height`]), level round each obstacle at its
+/// [`obstacle_levels`] height, eased to level near the walls, and
+/// [`HOLE`] over the holes. Polynomials
+/// only, so the browser's WebAssembly computes the same samples. Pure and
+/// deterministic.
+pub fn room_terrain(seed: u32, room: (i32, i32)) -> Heightfield {
+    let hills = room_hills(seed, room);
+    let holes = room_holes(seed, room);
+    let flat = ramp_and_platform_circles(seed, room);
+    let levels: Vec<(f32, f32, f32, f32)> = room_obstacles(seed, room)
+        .1
+        .iter()
+        .zip(obstacle_levels(seed, room))
+        .map(|(o, level)| (o.x, o.y, o.r + 1.0, level))
+        .collect();
     let edge = arena::HALF + PASSAGE;
     let n = (2.0 * edge / TERRAIN_CELL) as usize + 1;
     Heightfield::new([-edge, -edge], TERRAIN_CELL, n, n, |x, y| {
@@ -1184,21 +1266,22 @@ pub fn room_terrain(seed: u32, room: (i32, i32)) -> Heightfield {
         if hills.is_empty() {
             return 0.0;
         }
-        let mut z = 0.0f32;
-        for hill in &hills {
-            let (dx, dy) = (x - hill.x, y - hill.y);
-            let u = (dx * dx + dy * dy) / (hill.r * hill.r);
-            if u < 1.0 {
-                z += hill.amp * (1.0 - u) * (1.0 - u);
+        let z = hill_height(&hills, &flat, x, y);
+        // Toward the level of the obstacle that pulls hardest here (each
+        // patch keeps its own level where two meet).
+        let mut pull = (1.0f32, 0.0f32);
+        for &(ox, oy, r, level) in &levels {
+            let (dx, dy) = (x - ox, y - oy);
+            let w = ease(((dx * dx + dy * dy).sqrt() - r) / 2.0);
+            if w < pull.0 {
+                pull = (w, level);
             }
         }
+        let (w, level) = pull;
+        let z = level + (z * wall_fade(x, y) - level) * w;
+        // Rooms meet flat, even past an obstacle's patch near a wall.
         let wall = arena::HALF - x.abs().max(y.abs());
-        let mut fade = ease((wall - 0.5) / 3.5);
-        for &(fx, fy, fr) in &flat {
-            let (dx, dy) = (x - fx, y - fy);
-            fade *= ease(((dx * dx + dy * dy).sqrt() - fr) / 2.0);
-        }
-        (z * fade).min(TERRAIN_TOP)
+        z * ease((wall - 0.5) / 1.0)
     })
 }
 
@@ -1252,6 +1335,101 @@ pub fn terrain(room: &PitRoomContext) -> RoomTerrain {
     }
 }
 
+/// A patch of floor around a point ([`floor_patch`]'s input): the polar
+/// grid a mob's slam warning is draped on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, GameRecord)]
+pub struct FloorPatch {
+    /// World seed.
+    pub seed: u32,
+    /// Room x.
+    pub room_x: i32,
+    /// Room y.
+    pub room_y: i32,
+    /// Centre (room-local).
+    pub x: f32,
+    /// Centre y.
+    pub y: f32,
+    /// Out to this far (m).
+    pub radius: f32,
+    /// Rings of points out to `radius`.
+    pub rings: u8,
+    /// Points per ring (a power of two, 4 to 64; others round up).
+    pub segments: u8,
+}
+
+/// `(seed, x, y)` → that room's ground ([`room_ground`]).
+type GroundCache = Vec<((u32, i32, i32), Colliders)>;
+
+thread_local! {
+    /// Grounds of the rooms drawn lately (a few rooms are in view).
+    static GROUNDS: RefCell<GroundCache> = const { RefCell::new(Vec::new()) };
+}
+
+/// Rooms whose ground [`floor_patch`] keeps.
+const GROUNDS_KEPT: usize = 9;
+
+/// The floor around a point, as the room judges a slam (`floor_at`: the
+/// terrain, a ramp or a platform top, whichever is under it): the centre's
+/// height, then ring by ring (`radius × r / rings`, r = 1..=rings) each
+/// point at angle `2π s / segments` from +x. [`TERRAIN_HOLE`] over a hole.
+/// The directions come from [`ring_dirs`] (no `sin`/`cos`: the page's
+/// WASM copy must match the native one bit for bit).
+#[game_pure(FloorPatchFn)]
+pub fn floor_patch(patch: &FloorPatch) -> Vec<f32> {
+    let key = (patch.seed, patch.room_x, patch.room_y);
+    GROUNDS.with(|grounds| {
+        let mut grounds = grounds.borrow_mut();
+        let i = match grounds.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                if grounds.len() >= GROUNDS_KEPT {
+                    grounds.remove(0);
+                }
+                grounds.push((key, room_ground(key.0, (key.1, key.2))));
+                grounds.len() - 1
+            }
+        };
+        let ground = &grounds[i].1;
+        let height = |x: f32, y: f32| {
+            ground
+                .ground_at([x, y], layer::ALL)
+                .map_or(TERRAIN_HOLE, |g| g.height)
+        };
+        let rings = usize::from(patch.rings.clamp(1, 16));
+        let dirs = ring_dirs(usize::from(patch.segments));
+        let mut heights = Vec::with_capacity(1 + rings * dirs.len());
+        heights.push(height(patch.x, patch.y));
+        for r in 1..=rings {
+            let d = patch.radius * r as f32 / rings as f32;
+            for &(cx, cy) in &dirs {
+                heights.push(height(patch.x + d * cx, patch.y + d * cy));
+            }
+        }
+        heights
+    })
+}
+
+/// `n` unit directions evenly round the circle from +x (`n` rounded up to
+/// a power of two, 4 to 64), in plain arithmetic: the step angle by
+/// half-angle square roots from a quarter turn, then turned by complex
+/// multiplication. Bit-identical on every target, unlike `sin`/`cos`.
+pub fn ring_dirs(n: usize) -> Vec<(f32, f32)> {
+    let n = n.clamp(4, 64).next_power_of_two();
+    let (mut c, mut s) = (0.0f32, 1.0f32);
+    let mut quarter = 4;
+    while quarter < n {
+        (c, s) = (((1.0 + c) * 0.5).sqrt(), ((1.0 - c) * 0.5).sqrt());
+        quarter *= 2;
+    }
+    let mut dirs = Vec::with_capacity(n);
+    let (mut x, mut y) = (1.0f32, 0.0f32);
+    for _ in 0..n {
+        dirs.push((x, y));
+        (x, y) = (x * c - y * s, x * s + y * c);
+    }
+    dirs
+}
+
 /// The ramps as colliders (what the predicted step stands on).
 pub fn ramp_colliders(ramps: &[Ramp]) -> Colliders {
     ramps
@@ -1270,7 +1448,11 @@ pub fn room_colliders(seed: u32, room: (i32, i32)) -> Colliders {
     let mut colliders = room_obstacles(seed, room)
         .1
         .iter()
-        .map(|o| Collider::cylinder([o.x, o.y], o.r, OBSTACLE_HEIGHT).on_layers(LAYER_SOLID))
+        .zip(obstacle_levels(seed, room))
+        .map(|(o, level)| {
+            // From the floor up to its full height above its ground.
+            Collider::cylinder([o.x, o.y], o.r, level + OBSTACLE_HEIGHT).on_layers(LAYER_SOLID)
+        })
         .fold(room_ground(seed, room), Colliders::with);
     for hole in room_holes(seed, room) {
         colliders.push(
@@ -1847,6 +2029,26 @@ pub fn wake_allowed(from: (i32, i32), to: (i32, i32)) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ring_dirs_go_evenly_round_the_circle() {
+        for n in [4, 8, 16, 32, 64] {
+            let dirs = super::ring_dirs(n);
+            assert_eq!(dirs.len(), n);
+            for (k, &(x, y)) in dirs.iter().enumerate() {
+                let a = std::f32::consts::TAU * k as f32 / n as f32;
+                assert!(
+                    (x - a.cos()).abs() < 1e-5 && (y - a.sin()).abs() < 1e-5,
+                    "{n}/{k}: {x},{y}"
+                );
+            }
+        }
+        assert_eq!(
+            super::ring_dirs(20).len(),
+            32,
+            "rounded up to a power of two"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -2450,12 +2652,44 @@ mod tests {
         for x in -6..6 {
             for y in -6..6 {
                 let terrain = room_terrain(DEFAULT_SEED, (x, y));
-                for o in room_obstacles(DEFAULT_SEED, (x, y)).1 {
+                let levels = obstacle_levels(DEFAULT_SEED, (x, y));
+                let colliders = room_colliders(DEFAULT_SEED, (x, y));
+                for (o, level) in room_obstacles(DEFAULT_SEED, (x, y)).1.iter().zip(levels) {
                     for (dx, dy) in RING8 {
                         let (px, py) = (o.x + dx * (o.r + 0.3), o.y + dy * (o.r + 0.3));
-                        let h = terrain.height_at([px, py]).map_or(0.0, |(h, _)| h);
-                        assert!(h.abs() < 1e-3, "pit.{x}.{y}: {h} beside {o:?}");
+                        let h = terrain.height_at([px, py]).map_or(level, |(h, _)| h);
+                        // Level (where two patches meet, a few cm between them;
+                        // near a wall it slopes with the walls' fade).
+                        let near_wall = arena::HALF - o.x.abs().max(o.y.abs()) < o.r + 5.0;
+                        let tolerance = if near_wall { 0.25 } else { 0.1 };
+                        assert!(
+                            (h - level).abs() < tolerance,
+                            "pit.{x}.{y}: {h} beside {o:?} at {level}"
+                        );
                     }
+                    // On a hill, not sunk in one: on a slope the ground
+                    // rises one side and falls the other, but a few metres
+                    // round it is not higher all round.
+                    let ring: Vec<f32> = RING8
+                        .iter()
+                        .filter_map(|(dx, dy)| {
+                            let (px, py) = (o.x + dx * (o.r + 3.0), o.y + dy * (o.r + 3.0));
+                            terrain.height_at([px, py]).map(|(h, _)| h)
+                        })
+                        .collect();
+                    let around = ring.iter().sum::<f32>() / ring.len().max(1) as f32;
+                    assert!(
+                        around - level < 0.5,
+                        "pit.{x}.{y}: {o:?} at {level} sunk in a {around} m hill"
+                    );
+                    // Its top stands its full height over its ground.
+                    let top = colliders
+                        .ground_at([o.x, o.y], LAYER_SOLID)
+                        .map_or(0.0, |g| g.height);
+                    assert!(
+                        (top - level - OBSTACLE_HEIGHT).abs() < 1e-3,
+                        "pit.{x}.{y}: top {top}"
+                    );
                 }
             }
         }

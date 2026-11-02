@@ -13,6 +13,18 @@ export interface ContentPack {
 	readonly notes: string;
 }
 
+/** Record `FloorPatch` (`#[derive(GameRecord)]`). */
+export interface FloorPatch {
+	readonly seed: number;
+	readonly roomX: number;
+	readonly roomY: number;
+	readonly x: number;
+	readonly y: number;
+	readonly radius: number;
+	readonly rings: number;
+	readonly segments: number;
+}
+
 /** Record `Hole` (`#[derive(GameRecord)]`). */
 export interface Hole {
 	readonly x0: number;
