@@ -1623,7 +1623,7 @@ pub fn laser_path(shot: &LaserShot) -> Vec<LaserHit> {
     )
     .mask(LASER_MASK);
     let mut trace = collide::bounce(ray, LASER_BOUNCES, |r| colliders.raycast(r));
-    stop_at_barrier(&mut trace, &colliders);
+    trace.stop_at(&colliders, LAYER_BARRIER);
     let mut path: Vec<LaserHit> = trace
         .hits
         .iter()
@@ -1648,22 +1648,6 @@ pub fn laser_path(shot: &LaserShot) -> Vec<LaserHit> {
         });
     }
     path
-}
-
-/// Cut a laser's trace at the first wall barrier it met: a shot reaching a
-/// wall line above the wall ends there (anything it met after a bounce off
-/// thin air never happened).
-pub fn stop_at_barrier(trace: &mut collide::Trace, colliders: &Colliders) {
-    let barrier = trace.hits.iter().position(|h| match h.target {
-        collide::Target::Static(i) => colliders
-            .get(i)
-            .is_some_and(|c| c.layers & LAYER_BARRIER != 0),
-        _ => false,
-    });
-    if let Some(i) = barrier {
-        trace.hits.truncate(i + 1);
-        trace.end = trace.hits[i].point;
-    }
 }
 
 /// Which room ([`pit_room`]'s input).

@@ -55,15 +55,16 @@ use distributed_game::rewind::{Historic, RewindFrame, ShotTiming};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EmitError, Entities, Entity, EntityId, EntitySchema, Fact,
     FactOutcome, FactSettlement, GameEvent, GameInput, GameRecord, GameSurface, LeaveReason,
-    ObserverId, Origin, PlayerId, Project, Replicated, VerifiedPrincipal, View, Zone, ZoneSender,
+    ObserverId, Origin, PlayerId, Project, Replicated, TransferIds, VerifiedPrincipal, View, Zone,
+    ZoneSender,
 };
 use game_sim::arena::{self as movement, PLAYER_RADIUS};
 use game_sim::mobpit::PitState as MoveState;
 use game_sim::mobpit::{
     self as rooms, admissible, borough_of, crossing, hood_of, into_neighbour, pair_shard,
-    parse_room, pit_room, pit_world, room_colliders, room_ground, room_zone, stop_at_barrier,
-    FloorPatchFn, LaserHit, LaserPathFn, PitRoomContext, PitRoomFn, RoomTerrainFn, RoomsInReachFn,
-    BOSS_TIER, GROUND_MASK, LASER_BOUNCES, LASER_MASK, LASER_RANGE, LAYER_FLOOR,
+    parse_room, pit_room, pit_world, room_colliders, room_ground, room_zone, FloorPatchFn,
+    LaserHit, LaserPathFn, PitRoomContext, PitRoomFn, RoomTerrainFn, RoomsInReachFn, BOSS_TIER,
+    GROUND_MASK, LASER_BOUNCES, LASER_MASK, LASER_RANGE, LAYER_BARRIER, LAYER_FLOOR,
 };
 use mobpit_crawler::{level_floor, KillReceipt, RecordKillInput};
 use mobpit_tiers::{BossDefeatedInput, WEATHER};
@@ -1023,7 +1024,7 @@ pub struct MobPit {
     /// Players who just left through a side, for mobs to follow ([`cross`]).
     departed: Vec<cross::Departed>,
     /// Crossings started by this activation.
-    crossings: u64,
+    transfers: TransferIds,
     /// The room's open sides (`game_sim::mobpit::open_sides`).
     open: u8,
 }
@@ -1192,7 +1193,7 @@ impl MobPit {
         // What died, by its home identity: a visitor's kill is keyed by its
         // home room's id and life, so it settles once whichever room saw it.
         let (home, home_id, generation) = match &m.visit {
-            Some(v) => (v.from.clone(), v.home_id, v.generation),
+            Some(v) => (v.held.from().to_string(), v.home_id, v.generation),
             None => (ctx.zone_id().to_string(), id, m.generation),
         };
         let (name, killer_id) = match &killer {
@@ -1598,7 +1599,7 @@ impl MobPit {
                             .is_some_and(|m| m.state != MobState::Dead)
                     })
                 });
-                stop_at_barrier(&mut trace, ctx.colliders());
+                trace.stop_at(ctx.colliders(), LAYER_BARRIER);
                 let path = trace
                     .hits
                     .iter()
@@ -2028,7 +2029,7 @@ impl Zone for MobPit {
             pillars,
             ground,
             departed: Vec::new(),
-            crossings: 0,
+            transfers: TransferIds::default(),
             open: game_sim::mobpit::open_sides(room.seed, room.room),
             pending: HashMap::new(),
             backlog: VecDeque::new(),
@@ -2408,7 +2409,10 @@ impl Zone for MobPit {
                     dead: m.state == MobState::Dead,
                     generation: m.generation,
                     respawn_in: m.respawn_at.saturating_sub(tick),
-                    away: m.away.as_ref().map(|a| (a.to.clone(), a.transfer)),
+                    away: m
+                        .away
+                        .as_ref()
+                        .map(|a| (a.lent.to().to_string(), a.lent.transfer())),
                 })
                 .collect(),
             parked: {
@@ -2448,9 +2452,7 @@ impl Zone for MobPit {
                 m.hp = saved.hp.max(1);
                 m.respawn_at = u64::MAX;
                 m.away = Some(cross::Away {
-                    to,
-                    transfer,
-                    beat: tick,
+                    lent: cross::LEASE.lend(to, transfer, tick),
                     at: (saved.x, saved.y),
                 });
             } else if saved.dead {

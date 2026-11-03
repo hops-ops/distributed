@@ -11,16 +11,16 @@
 //! share clocks), and credits a kill to the shooter's verified principal.
 //! Everyone watching it sees the beam ([`PitEvent::Beam`]).
 //!
-//! **Mob crossings: a lease.** The home room keeps the mob's slot *away*
-//! (hidden, [`Away`]); the room it crossed into holds it as a *visitor*
-//! ([`Visit`]) while its lease holds. The visitor beats every second
+//! **Mob crossings: a lease** ([`distributed_game::lease`], timings
+//! [`LEASE`]). The home room keeps the mob's slot *away* (hidden,
+//! [`Away`]); the room it crossed into holds it as a *visitor* ([`Visit`])
+//! while its lease holds. The visitor beats every second
 //! ([`PitMessage::MobBeat`]); the home room answers with a renewal
-//! ([`PitMessage::MobLease`]) or a recall. A visitor whose lease lapses
-//! ([`VISIT_LEASE`], 2 s since the last renewal) is dropped; an away slot
-//! with no beat for [`AWAY_GRACE`] (4 s) comes back home. The visitor
-//! always lapses first, so the mob is never live in two rooms; a lost
-//! message or a crashed or sleeping room costs it at most the grace, never
-//! the mob. A visitor that loses its target walks back to where it came in
+//! ([`PitMessage::MobLease`]) or a recall. A visitor not renewed for 2 s
+//! is dropped; an away slot with no beat for 4 s comes back home. The
+//! visitor always lapses first, so the mob is never live in two rooms; a
+//! lost message or a crashed or sleeping room costs it at most the grace,
+//! never the mob. A visitor that loses its target walks back to where it came in
 //! and goes home ([`PitMessage::MobHome`]); one that is killed tells its
 //! home ([`PitMessage::MobFell`]). Its kill fact is keyed by its home
 //! room's id and life, so the reward settles once wherever it died.
@@ -29,23 +29,19 @@
 use std::time::Duration;
 
 use distributed_game::collide::{bounce, Trace};
-use distributed_game::{Ctx, EntityId, PlayerId, Ray, VerifiedPrincipal, ZoneSender};
+use distributed_game::lease::{Hold, LeaseTimings};
+use distributed_game::{Ctx, EntityId, Held, Lent, PlayerId, Ray, VerifiedPrincipal, ZoneSender};
 use game_sim::arena::HALF;
-use game_sim::mobpit::{parse_room, room_zone, stop_at_barrier, DOOR_HALF, LASER_MASK, ROOM_SIZE};
+use game_sim::mobpit::{parse_room, room_zone, DOOR_HALF, LASER_MASK, LAYER_BARRIER, ROOM_SIZE};
 
 use super::{
     dist, pack_hp, step_toward, Killer, LaserHit, Mob, MobPit, MobState, PitEvent, PitMessage,
     BOSS_TIER, BOUNCES, RANGED_DAMAGE, RESPAWN_TICKS,
 };
 
-/// A visitor beats this often (ticks, 1 s).
-const BEAT_TICKS: u64 = 30;
-/// A visitor stays this long past its last renewal (ticks, 2 s).
-pub(super) const VISIT_LEASE: u64 = 60;
-/// An away slot comes back this long after its last beat (ticks, 4 s):
-/// longer than [`VISIT_LEASE`] plus a message's way, so the visitor is
-/// always gone first.
-pub(super) const AWAY_GRACE: u64 = 120;
+/// A visitor beats every second and stays 2 s past its last renewal; an
+/// away slot comes back 4 s after its last beat (ticks).
+pub(super) const LEASE: LeaseTimings = LeaseTimings::new(30, 60, 120);
 /// A mob follows a player who left at most this long (ticks, 5 s).
 const FOLLOW_TICKS: u64 = 150;
 /// ... and only if it was this close to where the player crossed (m).
@@ -58,8 +54,6 @@ const AGGRO_TICKS: u64 = 300;
 const FIND_TICKS: u64 = 60;
 /// Visitors a room holds at once.
 const MAX_GUESTS: usize = 4;
-/// The largest integer the message codec carries exactly (2^53 − 1).
-const SAFE_INT: u64 = (1 << 53) - 1;
 
 /// A player who left through a side this activation (recent ones only).
 pub(super) struct Departed {
@@ -83,23 +77,17 @@ pub(super) struct Follow {
 
 /// This room's mob, away in `to` (hidden here).
 pub(super) struct Away {
-    pub to: String,
-    pub transfer: u64,
-    /// Last beat from its visitor (tick).
-    pub beat: u64,
+    pub lent: Lent,
     /// Where it left (room-local): it comes back there.
     pub at: (f32, f32),
 }
 
 /// A visitor from room `from`.
 pub(super) struct Visit {
-    pub from: String,
-    pub transfer: u64,
+    pub held: Held,
     /// Its id and life in its home room (its kill is keyed by them).
     pub home_id: u32,
     pub generation: u32,
-    lease_until: u64,
-    next_beat: u64,
     chase: String,
     arrived: u64,
 }
@@ -141,10 +129,6 @@ impl Leg {
     }
 }
 
-/// How far short of a leg's end the wall line must be for the leg to
-/// count as leaving through it (m).
-const LINE_EPS: f32 = 1e-3;
-
 /// The first place the beam `origin` → `trace` crosses one of the room's
 /// side lines going out, as a leg for the room beyond (`None`: it stayed
 /// inside, or has nothing left).
@@ -154,64 +138,23 @@ pub(super) fn leaving_leg(
     range: f32,
     bounces: usize,
 ) -> Option<Leg> {
-    let points: Vec<[f32; 3]> = std::iter::once(origin)
-        .chain(trace.hits.iter().map(|h| h.point))
-        .chain(std::iter::once(trace.end))
-        .collect();
-    let mut used = 0.0f32;
-    for (k, pair) in points.windows(2).enumerate() {
-        let (from, to) = (pair[0], pair[1]);
-        let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        if len < 1e-4 {
-            continue;
-        }
-        let dir = [d[0] / len, d[1] / len, d[2] / len];
-        let mut best: Option<(f32, (i32, i32))> = None;
-        for (axis, sign) in [(0usize, 1.0f32), (0, -1.0), (1, 1.0), (1, -1.0)] {
-            let v = dir[axis] * sign;
-            // Going out through this side, from inside the room.
-            if v <= 1e-6 || from[axis] * sign > HALF {
-                continue;
-            }
-            let t = (HALF - from[axis] * sign) / v;
-            // Past the wall line, not just reaching it: a leg that ends on
-            // the line stopped at a wall (or its barrier) there.
-            if t > len - LINE_EPS {
-                continue;
-            }
-            let other = from[1 - axis] + dir[1 - axis] * t;
-            if other.abs() > HALF || best.is_some_and(|b| b.0 <= t) {
-                continue;
-            }
-            let step = if axis == 0 {
-                (sign as i32, 0)
-            } else {
-                (0, sign as i32)
-            };
-            best = Some((t, step));
-        }
-        if let Some((t, step)) = best {
-            let left = range - used - t;
-            if left < 0.5 {
-                return None;
-            }
-            let at = [
-                from[0] + dir[0] * t - step.0 as f32 * ROOM_SIZE,
-                from[1] + dir[1] * t - step.1 as f32 * ROOM_SIZE,
-                from[2] + dir[2] * t,
-            ];
-            return Some(Leg {
-                step,
-                at,
-                dir,
-                dist: left,
-                bounces: bounces.saturating_sub(k).min(usize::from(u8::MAX)) as u8,
-            });
-        }
-        used += len;
+    let exit = trace.exit_box(origin, HALF)?;
+    let left = range - exit.travelled;
+    if left < 0.5 {
+        return None;
     }
-    None
+    let step = (exit.side[0], exit.side[1]);
+    Some(Leg {
+        step,
+        at: [
+            exit.point[0] - step.0 as f32 * ROOM_SIZE,
+            exit.point[1] - step.1 as f32 * ROOM_SIZE,
+            exit.point[2],
+        ],
+        dir: exit.dir,
+        dist: left,
+        bounces: bounces.saturating_sub(exit.leg).min(usize::from(u8::MAX)) as u8,
+    })
 }
 
 /// Whether a mob of `radius` gets through the side toward `step` at
@@ -313,10 +256,7 @@ impl MobPit {
         let Some(f) = self.mobs[i].follow.take() else {
             return;
         };
-        self.crossings += 1;
-        // Unique per activation, and within 53 bits: the message codec
-        // saturates integers past JavaScript's safe range.
-        let transfer = ((ctx.boot_epoch() << 20) ^ self.crossings) & SAFE_INT;
+        let transfer = self.transfers.next(ctx.boot_epoch());
         let (rx, ry) = self.room.room;
         let to = room_zone((rx + f.step.0, ry + f.step.1));
         let m = &mut self.mobs[i];
@@ -336,9 +276,7 @@ impl MobPit {
             chase: f.principal,
         };
         m.away = Some(Away {
-            to: to.clone(),
-            transfer,
-            beat: ctx.tick(),
+            lent: LEASE.lend(to.clone(), transfer, ctx.tick()),
             at: (m.x, m.y),
         });
         m.state = MobState::Dead;
@@ -356,9 +294,9 @@ impl MobPit {
         let hp = m.hp.max(1) as u32;
         free(m);
         ctx.send_zone(
-            &v.from,
+            v.held.from(),
             &PitMessage::MobHome {
-                transfer: v.transfer,
+                transfer: v.held.transfer(),
                 hp,
             },
         );
@@ -372,9 +310,9 @@ impl MobPit {
         };
         free(m);
         ctx.send_zone(
-            &v.from,
+            v.held.from(),
             &PitMessage::MobFell {
-                transfer: v.transfer,
+                transfer: v.held.transfer(),
             },
         );
     }
@@ -387,18 +325,18 @@ impl MobPit {
         let mut beats = Vec::new();
         for m in &mut self.mobs {
             if let Some(v) = &mut m.visit {
-                if tick > v.lease_until {
-                    // Its home did not renew it: it may have taken it back.
-                    m.visit = None;
-                    free(m);
-                    continue;
-                }
-                if tick >= v.next_beat {
-                    v.next_beat = tick + BEAT_TICKS;
-                    beats.push((v.from.clone(), v.transfer));
+                match v.held.poll(tick) {
+                    Hold::Held => {}
+                    Hold::Beat => beats.push((v.held.from().to_string(), v.held.transfer())),
+                    Hold::Lapsed => {
+                        // Its home did not renew it: it may have taken it back.
+                        m.visit = None;
+                        free(m);
+                        continue;
+                    }
                 }
             }
-            if m.away.as_ref().is_some_and(|a| tick > a.beat + AWAY_GRACE) {
+            if m.away.as_ref().is_some_and(|a| a.lent.overdue(tick)) {
                 come_back(m);
             }
         }
@@ -477,11 +415,7 @@ impl MobPit {
                 y,
                 chase,
             } => {
-                if self.mobs.iter().any(|m| {
-                    m.visit
-                        .as_ref()
-                        .is_some_and(|v| v.from == from.zone && v.transfer == transfer)
-                }) {
+                if self.visitor(&from.zone, transfer).is_some() {
                     return;
                 }
                 let slot = self
@@ -521,25 +455,19 @@ impl MobPit {
                 m.target = target;
                 m.timer = 0;
                 m.visit = Some(Visit {
-                    from: from.zone.clone(),
-                    transfer,
+                    held: LEASE.hold(from.zone.clone(), transfer, tick),
                     home_id,
                     generation,
-                    lease_until: tick + VISIT_LEASE,
-                    next_beat: tick + BEAT_TICKS,
                     chase,
                     arrived: tick,
                 });
             }
             PitMessage::MobBeat { transfer } => {
-                let away = self.mobs.iter_mut().find_map(|m| {
-                    m.away
-                        .as_mut()
-                        .filter(|a| a.to == from.zone && a.transfer == transfer)
-                });
-                let reply = match away {
-                    Some(a) => {
-                        a.beat = tick;
+                let reply = match self.away_mob(&from.zone, transfer) {
+                    Some(m) => {
+                        if let Some(a) = &mut m.away {
+                            a.lent.heard(tick);
+                        }
                         PitMessage::MobLease { transfer }
                     }
                     None => PitMessage::MobRecall { transfer },
@@ -548,21 +476,21 @@ impl MobPit {
             }
             PitMessage::MobLease { transfer } => {
                 if let Some(v) = self.visitor(&from.zone, transfer) {
-                    v.lease_until = tick + VISIT_LEASE;
+                    v.held.renew(tick);
                 }
             }
             PitMessage::MobRecall { transfer } => {
                 for m in &mut self.mobs {
                     if m.visit
                         .as_ref()
-                        .is_some_and(|v| v.from == from.zone && v.transfer == transfer)
+                        .is_some_and(|v| v.held.is(&from.zone, transfer))
                     {
                         m.visit = None;
                         free(m);
                     }
                     if m.away
                         .as_ref()
-                        .is_some_and(|a| a.to == from.zone && a.transfer == transfer)
+                        .is_some_and(|a| a.lent.is(&from.zone, transfer))
                     {
                         come_back(m);
                     }
@@ -587,19 +515,15 @@ impl MobPit {
     }
 
     fn visitor(&mut self, from: &str, transfer: u64) -> Option<&mut Visit> {
-        self.mobs.iter_mut().find_map(|m| {
-            m.visit
-                .as_mut()
-                .filter(|v| v.from == from && v.transfer == transfer)
-        })
+        self.mobs
+            .iter_mut()
+            .find_map(|m| m.visit.as_mut().filter(|v| v.held.is(from, transfer)))
     }
 
     fn away_mob(&mut self, to: &str, transfer: u64) -> Option<&mut Mob> {
-        self.mobs.iter_mut().find(|m| {
-            m.away
-                .as_ref()
-                .is_some_and(|a| a.to == to && a.transfer == transfer)
-        })
+        self.mobs
+            .iter_mut()
+            .find(|m| m.away.as_ref().is_some_and(|a| a.lent.is(to, transfer)))
     }
 
     /// The rest of a shot from next door, as old as the shooter's view: it
@@ -646,7 +570,7 @@ impl MobPit {
                 })
             })
         };
-        stop_at_barrier(&mut trace, ctx.colliders());
+        trace.stop_at(ctx.colliders(), LAYER_BARRIER);
         let hit = trace.entity();
         let leaves = if hit.is_none() {
             leaving_leg(start, &trace, dist, usize::from(bounces))
