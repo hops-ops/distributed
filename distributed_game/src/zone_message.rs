@@ -19,7 +19,8 @@
 //! target's object with the internal secret (like a cell's push), never on
 //! a public route. A message for a zone that is not running is refused: it
 //! never wakes a zone. Delivery is best effort; a protocol that must not
-//! lose state (a mob crossing over) needs its own acks and timeouts.
+//! lose state (a mob crossing over) needs its own acks and timeouts:
+//! [`lease`](crate::lease) keeps them for an entity lent to another zone.
 //!
 //! **Identity.** The receiving zone sees the sender's principal only as a
 //! [`VerifiedPrincipal`], which game code cannot construct: it came from a

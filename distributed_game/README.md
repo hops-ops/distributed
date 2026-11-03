@@ -939,10 +939,39 @@ envelopes with `ZoneHost::take_zone_messages` and `deliver_zone`; on celld
 the object posts them to `POST /{zone}/__zone` on its own class with the
 internal secret (never a public route). A message for a sleeping zone is
 refused (409): messages never wake zones. Delivery is best effort, so a
-transfer that must not lose or duplicate state needs its own protocol:
-Mob Pit's crossing mob is leased (the visitor renews with its home room;
-it lapses before the home room reclaims it), so the mob is never live in
-two rooms and a lost message only brings it home.
+transfer that must not lose or duplicate state needs a protocol on top.
+
+**Lending an entity** ([`lease`](src/lease.rs)). To move an entity into
+the zone next door (a mob chasing a player through a doorway), the home
+zone keeps it `Lent` (hidden, slot reserved) and the other zone keeps it
+`Held`. The holder beats; the home answers with a renewal, or a recall
+when it no longer lends that transfer. `LeaseTimings::new(beat, lease,
+grace)` only accepts `beat < lease < grace`, so the holder always lets go
+before the home takes the entity back: the entity is never live in two
+zones, and a lost message or a stopped zone only brings it home. The
+module keeps the state and the clock; the messages are the game's own:
+
+```rust,ignore
+const LEASE: LeaseTimings = LeaseTimings::new(30, 60, 120); // ticks
+
+// Home: lend it, answer beats, take it back when overdue.
+let transfer = self.transfers.next(ctx.boot_epoch());
+mob.away = Some(LEASE.lend(to, transfer, ctx.tick()));
+ctx.send_zone(to, &Msg::Arrive { transfer, hp, x, y });
+// on Msg::Beat: lent.heard(tick) and reply Msg::Renew, or Msg::Recall
+if lent.overdue(tick) { bring_back(mob) }
+
+// Holder: hold it, renew it, beat or drop it each tick.
+visitor.lease = LEASE.hold(&from.zone, transfer, tick);
+match visitor.lease.poll(tick) {
+    Hold::Beat => ctx.send_zone(visitor.lease.from(), &Msg::Beat { transfer }),
+    Hold::Lapsed => drop_visitor(),
+    Hold::Held => {}
+}
+```
+
+Mob Pit's crossings (`examples/game/server/rooms/src/zone/cross.rs`) are the
+full protocol: arrive, beat, renew, recall, home and fell.
 
 ### Scaling out: the native multi-host server
 

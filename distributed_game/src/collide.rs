@@ -36,6 +36,10 @@
 //! for hit in &trace.hits { spark(hit.point, hit.normal); }
 //! ```
 //!
+//! [`Trace::stop_at`] cuts a trace at the first collider on some layers
+//! (walls a shot never bounces past), and [`Trace::exit_box`] finds where
+//! it leaves the zone's square, for a shot that carries on next door.
+//!
 //! **Layers.** Every entity and collider sits on a set of layer bits
 //! ([`Historic::on_layers`], [`Collider::on_layers`]; [`layer::DEFAULT`]
 //! unless set) and a ray only meets those its [`Ray::mask`] shares; a
@@ -233,6 +237,89 @@ impl Trace {
             Target::Static(_) | Target::Terrain => None,
         }
     }
+
+    /// Cut it at the first static hit on a collider sharing `layers` (it
+    /// ends there; anything it met after that never happened). For a ray
+    /// that bounces off some surfaces but is stopped by others.
+    pub fn stop_at(&mut self, colliders: &Colliders, layers: u32) {
+        let stop = self.hits.iter().position(|h| match h.target {
+            Target::Static(i) => colliders.get(i).is_some_and(|c| c.layers & layers != 0),
+            Target::Entity(_) | Target::Terrain => false,
+        });
+        if let Some(i) = stop {
+            self.hits.truncate(i + 1);
+            self.end = self.hits[i].point;
+        }
+    }
+
+    /// Where the path from `origin` through each hit to the end first
+    /// leaves the square of half-size `half` centred on the floor origin
+    /// (the zone's bounds, for a shot that carries on next door). A leg
+    /// that only reaches a side (it stopped at a wall there) does not leave.
+    pub fn exit_box(&self, origin: Vec3, half: f32) -> Option<Exit> {
+        let points: Vec<Vec3> = std::iter::once(origin)
+            .chain(self.hits.iter().map(|h| h.point))
+            .chain(std::iter::once(self.end))
+            .collect();
+        let mut travelled = 0.0f32;
+        for (leg, pair) in points.windows(2).enumerate() {
+            let (from, to) = (pair[0], pair[1]);
+            let len = norm(sub(to, from));
+            if len < 1e-4 {
+                continue;
+            }
+            let dir = scale(sub(to, from), 1.0 / len);
+            let mut best: Option<(f32, [i32; 2])> = None;
+            for (axis, sign) in [(0usize, 1.0f32), (0, -1.0), (1, 1.0), (1, -1.0)] {
+                let v = dir[axis] * sign;
+                // Going out through this side, from inside.
+                if v <= 1e-6 || from[axis] * sign > half {
+                    continue;
+                }
+                let t = (half - from[axis] * sign) / v;
+                if t > len - EXIT_EPS {
+                    continue;
+                }
+                let other = from[1 - axis] + dir[1 - axis] * t;
+                if other.abs() > half || best.is_some_and(|b| b.0 <= t) {
+                    continue;
+                }
+                let mut side = [0, 0];
+                side[axis] = sign as i32;
+                best = Some((t, side));
+            }
+            if let Some((t, side)) = best {
+                return Some(Exit {
+                    side,
+                    point: add(from, scale(dir, t)),
+                    dir,
+                    travelled: travelled + t,
+                    leg,
+                });
+            }
+            travelled += len;
+        }
+        None
+    }
+}
+
+/// How far short of a leg's end a side must be for the leg to leave
+/// through it ([`Trace::exit_box`]): a leg ending on the side stopped there.
+const EXIT_EPS: f32 = 1e-3;
+
+/// Where a [`Trace`] leaves a box ([`Trace::exit_box`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Exit {
+    /// The side it leaves by: `[1, 0]` is +x, `[0, -1]` is −y.
+    pub side: [i32; 2],
+    /// The point on that side.
+    pub point: Vec3,
+    /// Its unit direction there.
+    pub dir: Vec3,
+    /// Path length from the origin to `point`.
+    pub travelled: f32,
+    /// Which leg leaves (0: before any bounce; also the bounces used).
+    pub leg: usize,
 }
 
 /// [`Heightfield`] sample with no ground: a hole.
@@ -1290,5 +1377,68 @@ mod tests {
         let clear = walls.push_out([3.0, 3.0], 0.5, layer::ALL);
         assert_eq!(clear, [3.0, 3.0]);
         assert_eq!(walls.push_out([0.5, 0.0], 0.5, layer::NONE), [0.5, 0.0]);
+    }
+
+    fn statics(points: &[Vec3], end: Vec3) -> Trace {
+        Trace {
+            hits: points
+                .iter()
+                .enumerate()
+                .map(|(i, &point)| RayHit {
+                    target: Target::Static(i),
+                    distance: 0.0,
+                    point,
+                    normal: [-1.0, 0.0, 0.0],
+                })
+                .collect(),
+            end,
+        }
+    }
+
+    #[test]
+    fn a_trace_stops_at_the_first_collider_on_the_stop_layers() {
+        let colliders = Colliders::new()
+            .with(Collider::aabb([0.0, 0.0], [1.0, 1.0], 1.0))
+            .with(Collider::aabb([2.0, 0.0], [3.0, 1.0], 1.0).on_layers(1 << 4))
+            .with(Collider::aabb([4.0, 0.0], [5.0, 1.0], 1.0));
+        let mut trace = statics(&[[1.0, 0.0, 0.5], [2.0, 0.0, 0.5], [4.0, 0.0, 0.5]], [9.0; 3]);
+        trace.stop_at(&colliders, 1 << 4);
+        assert_eq!(trace.hits.len(), 2);
+        assert_eq!(trace.end, [2.0, 0.0, 0.5]);
+        // Nothing on those layers: unchanged.
+        let mut other = statics(&[[1.0, 0.0, 0.5]], [9.0; 3]);
+        other.stop_at(&colliders, 1 << 5);
+        assert_eq!(other.end, [9.0; 3]);
+    }
+
+    #[test]
+    fn a_leg_that_ends_on_a_side_does_not_leave_the_box() {
+        let half = 10.0;
+        let stopped = statics(&[[half, 8.0, 3.0]], [half, 8.0, 3.0]);
+        assert!(stopped.exit_box([0.0, 8.0, 1.5], half).is_none());
+        // A hair short of the side in floating point: stays too.
+        let short = statics(&[[half - 1e-5, 8.0, 3.0]], [half - 1e-5, 8.0, 3.0]);
+        assert!(short.exit_box([0.0, 8.0, 1.5], half).is_none());
+    }
+
+    #[test]
+    fn a_trace_leaves_by_the_first_side_it_crosses() {
+        let half = 10.0;
+        let through = statics(&[], [60.0, 0.0, 1.5]);
+        let exit = through.exit_box([0.0, 0.0, 1.5], half).expect("leaves +x");
+        assert_eq!(exit.side, [1, 0]);
+        assert!(close3(exit.point, [half, 0.0, 1.5]));
+        assert!(close(exit.travelled, half));
+        assert_eq!(exit.leg, 0);
+        // Off a wall at x = 5, back out through −x on the second leg.
+        let bounced = statics(&[[5.0, 0.0, 1.0]], [-30.0, 0.0, 1.0]);
+        let exit = bounced.exit_box([0.0, 0.0, 1.0], half).expect("leaves −x");
+        assert_eq!(exit.side, [-1, 0]);
+        assert_eq!(exit.leg, 1);
+        assert!(close(exit.travelled, 5.0 + 15.0));
+        assert!(close3(exit.dir, [-1.0, 0.0, 0.0]));
+        // Diagonal through a corner region: the nearer side wins.
+        let diagonal = statics(&[], [30.0, 15.0, 0.0]);
+        assert_eq!(diagonal.exit_box([0.0, 0.0, 0.0], half).unwrap().side, [1, 0]);
     }
 }
