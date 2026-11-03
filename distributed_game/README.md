@@ -1051,6 +1051,29 @@ layers in its `mask`. `colliders().push_out(at, radius, mask)` keeps a
 moving body out of the walls. Queries are a linear scan, which suits
 rooms with tens of shapes; there is no spatial index yet.
 
+**Slopes, ground and bounces.** `Collider::ramp(a, b, height, uphill)` is
+a wedge rising along one axis, and `Colliders::with_terrain` adds a
+`Heightfield` (rolling ground; a `HOLE` sample is no ground at all).
+`ground_at(at, mask)` gives the top surface under a point, with its
+height and normal, and `walkable(normal)` says whether that is floor
+(about 45° or flatter). That is enough for a game's own step to climb
+ramps, slide off steep ones and fall into holes; the movement itself
+stays the game's, as physics does. `bounce(ray, max_bounces, cast)`
+follows a ray, reflecting it off each static surface it meets and
+stopping at the first entity:
+
+```rust,ignore
+let mut trace = bounce(ray.mask(LASER_MASK), 4, |r| ctx.raycast_shot(timing, r));
+trace.stop_at(ctx.colliders(), LAYER_BARRIER); // walls it never bounces past
+if let Some(exit) = trace.exit_box(muzzle, HALF) {
+    // It left the room by `exit.side` at `exit.point`: hand the rest of the
+    // path (`range - exit.travelled`) to the zone next door.
+}
+```
+
+`exit_box` does not count a leg that only reaches a side (a shot that
+stopped at a wall on the room's edge) as leaving.
+
 ### Testing and operations
 
 - **Deterministic tests**: drive `ZoneHost` with `ManualClock`; the RNG

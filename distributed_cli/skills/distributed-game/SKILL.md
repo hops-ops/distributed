@@ -165,6 +165,36 @@ let at = hit.map_or_else(|| ray.at(ray.max_dist), |h| h.point);
 - `ctx.colliders().push_out(at, radius, mask)` keeps server-moved bodies
   out of walls.
 - Client prediction is not affected: `sim` does its own movement.
+- Ramps (`Collider::ramp`), terrain (`Colliders::with_terrain`, a
+  `Heightfield`) and `ground_at(at, mask)` + `walkable(normal)` give a
+  step what it needs to climb, slide and fall; the step itself is yours.
+- `bounce(ray, n, cast)` reflects a ray off static surfaces;
+  `trace.stop_at(colliders, layers)` cuts it at walls it must not pass;
+  `trace.exit_box(origin, half)` says where it leaves the zone's square.
+
+## Zone to zone: messages and leases
+
+A running zone can tell another one something with its own message type:
+`ctx.send_zone(to, &msg)`, or `ctx.send_zone_for(player, to, &msg)` to
+bind that player's verified principal (the target gets it as
+`ZoneSender::principal` and may `ctx.emit_fact_as(principal, fact)`).
+Handle them in `Zone::on_zone_message`.
+
+- Delivery is best effort and never wakes a sleeping zone; repeats of one
+  envelope are dropped. Don't trust a sender's coordinates: check that the
+  sender is a neighbour and the values are finite and in range.
+- To move an entity into the zone next door without losing or doubling
+  it, lease it (`distributed_game::lease`):
+  `const LEASE: LeaseTimings = LeaseTimings::new(beat, lease, grace)`
+  (rejects anything but `beat < lease < grace`). Home: `LEASE.lend(..)`,
+  `lent.heard(tick)` on each beat (reply renew, or recall if not lent),
+  bring it back when `lent.overdue(tick)`. Holder: `LEASE.hold(..)`,
+  `held.renew(tick)` on a renewal, and each tick `held.poll(tick)`:
+  `Beat` (send one), `Lapsed` (drop it) or `Held`.
+- Keep the lent entity's zone and transfer in the home zone's snapshot
+  and lend it again on restore; ids come from `TransferIds::next(boot_epoch)`.
+- Example: `examples/game/server/rooms/src/zone/cross.rs` (lasers and
+  chasing mobs crossing Mob Pit rooms).
 
 ## Checking your work
 

@@ -442,8 +442,9 @@ crashes. The game never names a node; the debug overlay only *shows* the
 one celld chose.
 
 Controls: WASD / stick move (predicted by `pit_step`, the Rust step as
-WASM), **Space** attack (120° cone, 2.2 m), **E** dash, **Q** jump, **O**
-debug overlay, **P** prediction, **G** server ghost (see the network panel
+WASM), **Space** attack (120° cone, 2.2 m), **R** / click / RT fire the
+laser, **E** dash, **Q** jump, **V** first-person view, **O** debug
+overlay, **P** prediction, **G** server ghost (see the network panel
 under [Run](#run)).
 
 **Jumping** is part of the predicted step: Mob Pit's state is the Arena
@@ -462,6 +463,39 @@ going through a doorway just carries on walking — no scene swap, no jump. Mobs
 show a red **telegraph ring** that fills for 0.8 s, then hit everyone
 inside it. Grunts (green, 10 XP), brutes (purple, 25 XP) and elites (red,
 60 XP) respawn 4 s after dying. Level `n` starts at `40·(n−1)²` XP.
+
+**Ground.** Every room has rolling hills (a `Heightfield`), one to three
+seeded **ramps** of 10–60° (45° or flatter you walk up; steeper ones are
+walls you slide off, or bounce off if you hit them fast), jumpable
+**platforms**, and some rooms have **holes**: fall in and you die. All of
+it is in the predicted step (`step_among` in `game_sim::mobpit`) against
+the room's colliders, so prediction matches the server bit for bit. About
+a third of room sides are **open** (no wall: cross anywhere along them);
+the others have a doorway in the middle.
+
+**The laser** (R / click / RT) fires from the eye along your view: 100 m,
+up to four bounces off walls, pillars and ramps, 12 damage, lag
+compensated up to 600 ms (the room rewinds the mobs to what you saw).
+Walls stop it at any height (an invisible barrier on each wall line, so
+it never clears a wall into the next room); through a doorway or an open
+side it carries on into the next room (`PitMessage::LaserLeg`), which
+resolves the rest against its own mobs and credits you for a kill.
+
+**Crossing rooms** (`server/rooms/src/zone/cross.rs`). A mob chasing you
+when you leave follows you through the same side, and a mob you shoot
+from the next room comes after you. The mob is *lent* to the room it
+enters, on a lease (`distributed_game::lease`): the visitor renews it
+every second, its home takes it back 4 s after the last renewal, and the
+visitor lets go at 2 s, so a mob is never in two rooms and a lost message
+or a crashed room only sends it home. Bosses stay home.
+
+**Feel.** Movement has coyote time and a jump buffer (3 ticks each), ground
+grip with half the acceleration in the air, and a lift over corners you
+clip. Drawing adds hit stop (50–100 ms on a hit), trauma screen shake,
+eased popups and pooled beams and sparks (`client/src/shared/feel.ts`);
+none of it touches the predicted step. Props and mobs have three levels
+of detail with hysteresis, and entities off screen skip their per-frame
+updates. `window.mobpit.feel()` reports the trauma, hit stops and pool use.
 
 **Coming back.** The same browser is the same player (the dev guest token
 is kept in `localStorage`; `?player=<label>` gives one browser several

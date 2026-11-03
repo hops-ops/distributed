@@ -2417,6 +2417,7 @@ mod tests {
             for x in -8..=8 {
                 let ramps = room_ramps(DEFAULT_SEED, (x, y));
                 assert_eq!(ramps, room_ramps(DEFAULT_SEED, (x, y)));
+                assert!(!ramps.is_empty(), "room ({x}, {y}) has no ramp");
                 for r in &ramps {
                     assert!(
                         (RAMP_DEGREES.0..=RAMP_DEGREES.1).contains(&r.degrees),
