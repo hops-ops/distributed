@@ -952,7 +952,7 @@ zones, and a lost message or a stopped zone only brings it home. The
 module keeps the state and the clock; the messages are the game's own:
 
 ```rust,ignore
-const LEASE: LeaseTimings = LeaseTimings::new(30, 60, 120); // ticks
+const LEASE: LeaseTimings = LeaseTimings::new(20, 60, 120); // ticks: lease ≥ 3 beats
 
 // Home: lend it, answer beats, take it back when overdue.
 let transfer = self.transfers.next(ctx.boot_epoch());

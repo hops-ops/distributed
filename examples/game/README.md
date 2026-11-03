@@ -485,8 +485,9 @@ resolves the rest against its own mobs and credits you for a kill.
 when you leave follows you through the same side, and a mob you shoot
 from the next room comes after you. The mob is *lent* to the room it
 enters, on a lease (`distributed_game::lease`): the visitor renews it
-every second, its home takes it back 4 s after the last renewal, and the
-visitor lets go at 2 s, so a mob is never in two rooms and a lost message
+every 2/3 s, its home takes it back 4 s after the last renewal, and the
+visitor lets go at 2 s (so one lost renewal or a short restart of its
+home room does not drop it), so a mob is never in two rooms and a lost message
 or a crashed room only sends it home. Bosses stay home.
 
 **Feel.** Movement has coyote time and a jump buffer (3 ticks each), ground

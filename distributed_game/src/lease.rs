@@ -73,7 +73,9 @@ impl LeaseTimings {
     /// its last renewal; the home takes it back `grace` ticks after the last
     /// beat it heard. `lease - beat` is the time a renewal has to arrive,
     /// and `grace - lease` the time a renewal may take on the way (plus any
-    /// difference in the zones' tick rates).
+    /// difference in the zones' tick rates). Make `lease` at least three
+    /// beats: with two, one lost beat (or a home restarting) lapses the
+    /// lease, since the next renewal lands a round trip after the beat.
     ///
     /// # Panics
     /// Unless `0 < beat < lease < grace` (a compile error in a `const`).

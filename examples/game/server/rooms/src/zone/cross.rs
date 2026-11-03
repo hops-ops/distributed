@@ -14,7 +14,7 @@
 //! **Mob crossings: a lease** ([`distributed_game::lease`], timings
 //! [`LEASE`]). The home room keeps the mob's slot *away* (hidden,
 //! [`Away`]); the room it crossed into holds it as a *visitor* ([`Visit`])
-//! while its lease holds. The visitor beats every second
+//! while its lease holds. The visitor beats every 2/3 s
 //! ([`PitMessage::MobBeat`]); the home room answers with a renewal
 //! ([`PitMessage::MobLease`]) or a recall. A visitor not renewed for 2 s
 //! is dropped; an away slot with no beat for 4 s comes back home. The
@@ -39,9 +39,10 @@ use super::{
     BOSS_TIER, BOUNCES, RANGED_DAMAGE, RESPAWN_TICKS,
 };
 
-/// A visitor beats every second and stays 2 s past its last renewal; an
-/// away slot comes back 4 s after its last beat (ticks).
-pub(super) const LEASE: LeaseTimings = LeaseTimings::new(30, 60, 120);
+/// A visitor beats every 2/3 s and stays 2 s past its last renewal (one
+/// lost beat or a short restart of its home does not drop it); an away
+/// slot comes back 4 s after its last beat (ticks).
+pub(super) const LEASE: LeaseTimings = LeaseTimings::new(20, 60, 120);
 /// A mob follows a player who left at most this long (ticks, 5 s).
 const FOLLOW_TICKS: u64 = 150;
 /// ... and only if it was this close to where the player crossed (m).

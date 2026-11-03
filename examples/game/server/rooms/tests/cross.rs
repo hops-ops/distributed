@@ -16,14 +16,22 @@ use distributed_game::{
 use game_sim::mobpit::room_ground;
 use mobpit_rooms::{MobPit, PitEvent, PitInput, RoomConfig, DEFAULT_SEED, EYE_HEIGHT};
 
+/// A celld activation's boot epoch: microseconds since 1970 (past 2^53
+/// once shifted).
+const BOOT: u64 = 1_793_000_000_000_000;
+
 fn host(zone: &str, clock: &ManualClock) -> ZoneHost<MobPit> {
+    host_at(zone, clock, BOOT)
+}
+
+/// A room activation booted at `boot_epoch` (a restart boots a later one).
+fn host_at(zone: &str, clock: &ManualClock, boot_epoch: u64) -> ZoneHost<MobPit> {
     let (facts, _script) = FactQueue::scripted(64);
     let issued: Arc<Mutex<Option<HandoffRequest>>> = Arc::default();
     ZoneHost::<MobPit>::new(
         zone,
         HostConfig {
-            // A celld activation's: microseconds since 1970 (past 2^53 once shifted).
-            boot_epoch: 1_793_000_000_000_000,
+            boot_epoch,
             ..HostConfig::default()
         },
         Arc::new(clock.clone()),
@@ -192,15 +200,17 @@ fn a_laser_through_a_doorway_kills_a_mob_next_door_for_the_shooter() {
     assert!(kill.key().contains("pit.1.0"), "{}", kill.key());
 }
 
-#[test]
-fn a_chasing_mob_follows_through_a_doorway_and_is_never_in_two_rooms() {
-    let clock = ManualClock::new();
-    let mut a = host("pit.0.0", &clock);
-    let mut b = host("pit.1.0", &clock);
+/// A grunt of `a` (pit.0.0) chases ana east through the doorway into `b`
+/// (pit.1.0): returns its id and `b`'s own mob count.
+fn follow_across(
+    a: &mut ZoneHost<MobPit>,
+    b: &mut ZoneHost<MobPit>,
+    clock: &ManualClock,
+) -> (u32, usize) {
     let own_b = b.zone().mob_positions().len();
-    let (client, ana) = join(&mut a, "ana");
+    let (client, ana) = join(a, "ana");
     for _ in 0..3 {
-        tick(&mut a, &mut b, &clock);
+        tick(a, b, clock);
     }
     // A grunt (tier 1) by the east doorway, ana just ahead of it.
     let (id, _) = a
@@ -212,7 +222,7 @@ fn a_chasing_mob_follows_through_a_doorway_and_is_never_in_two_rooms() {
     a.zone_mut().place_mob(id, 15.0, 0.5);
     a.zone_mut().place_player(ana, 18.5, 0.0);
     for _ in 0..5 {
-        tick(&mut a, &mut b, &clock);
+        tick(a, b, clock);
     }
     // Ana walks east through the doorway; her client would rejoin next door.
     let mut in_b = false;
@@ -229,24 +239,29 @@ fn a_chasing_mob_follows_through_a_doorway_and_is_never_in_two_rooms() {
                 .to_payload(),
             );
         } else if !in_b {
-            let (_, bo) = join(&mut b, "ana");
+            let (_, bo) = join(b, "ana");
             b.zone_mut().place_player(bo, -15.0, 0.0);
             in_b = true;
         }
-        tick(&mut a, &mut b, &clock);
-        pump(&mut a, &mut b);
-        let (home, away) = (alive(&a, id), visitors(&b, own_b));
+        tick(a, b, clock);
+        pump(a, b);
+        let (home, away) = (alive(a, id), visitors(b, own_b));
         assert!(!(home && away > 0), "tick {seq}: in both rooms");
         if away > 0 {
             break;
         }
     }
-    assert_eq!(
-        visitors(&b, own_b),
-        1,
-        "the grunt followed ana into pit.1.0"
-    );
-    assert!(!alive(&a, id), "away from pit.0.0");
+    assert_eq!(visitors(b, own_b), 1, "the grunt followed ana into pit.1.0");
+    assert!(!alive(a, id), "away from pit.0.0");
+    (id, own_b)
+}
+
+#[test]
+fn a_chasing_mob_follows_through_a_doorway_and_is_never_in_two_rooms() {
+    let clock = ManualClock::new();
+    let mut a = host("pit.0.0", &clock);
+    let mut b = host("pit.1.0", &clock);
+    let (id, own_b) = follow_across(&mut a, &mut b, &clock);
     // The lease holds while both rooms talk.
     for _ in 0..200 {
         tick(&mut a, &mut b, &clock);
@@ -281,6 +296,81 @@ fn a_chasing_mob_follows_through_a_doorway_and_is_never_in_two_rooms() {
     let t = back.expect("home again after the grace");
     eprintln!("messages stopped: home again after {t} ticks");
     assert!((60..=130).contains(&t), "back after {t} ticks");
+}
+
+#[test]
+fn the_home_room_restarts_while_its_mob_is_away_and_keeps_the_lease() {
+    let clock = ManualClock::new();
+    let mut a = host("pit.0.0", &clock);
+    let mut b = host("pit.1.0", &clock);
+    let (id, own_b) = follow_across(&mut a, &mut b, &clock);
+    for _ in 0..10 {
+        tick(&mut a, &mut b, &clock);
+        pump(&mut a, &mut b);
+    }
+    // pit.0.0 saves and stops (evicted, or its node went down); messages
+    // for it are lost while it is gone. A new activation restores it.
+    let snapshot = a.hibernate_state().expect("a snapshot");
+    drop(a);
+    for _ in 0..20 {
+        clock.advance(Duration::from_micros(33_334));
+        b.advance();
+        b.drain_outbound();
+        b.take_zone_messages();
+    }
+    let mut a = host_at("pit.0.0", &clock, BOOT + 1);
+    a.restore(&snapshot, "");
+    assert!(!alive(&a, id), "still away after the restart");
+    // The visitor's next beat finds the restored lease and renews it.
+    for t in 0..300u32 {
+        tick(&mut a, &mut b, &clock);
+        pump(&mut a, &mut b);
+        assert!(
+            !(alive(&a, id) && visitors(&b, own_b) > 0),
+            "tick {t}: in both rooms"
+        );
+    }
+    assert_eq!(visitors(&b, own_b), 1, "the lease survived the restart");
+    assert!(!alive(&a, id));
+}
+
+#[test]
+fn the_room_holding_a_visitor_restarts_and_the_mob_goes_home() {
+    let clock = ManualClock::new();
+    let mut a = host("pit.0.0", &clock);
+    let mut b = host("pit.1.0", &clock);
+    let (id, own_b) = follow_across(&mut a, &mut b, &clock);
+    for _ in 0..10 {
+        tick(&mut a, &mut b, &clock);
+        pump(&mut a, &mut b);
+    }
+    // pit.1.0 restarts from its snapshot: visitors are not saved there.
+    let snapshot = b.hibernate_state().expect("a snapshot");
+    drop(b);
+    let mut b = host_at("pit.1.0", &clock, BOOT + 1);
+    b.restore(&snapshot, "");
+    assert_eq!(visitors(&b, own_b), 0, "a restarted room holds no visitor");
+    // No more beats: the grunt is home after the grace, and only there.
+    let mut back = None;
+    for t in 0..200u32 {
+        tick(&mut a, &mut b, &clock);
+        pump(&mut a, &mut b);
+        assert!(
+            !(alive(&a, id) && visitors(&b, own_b) > 0),
+            "tick {t}: in both rooms"
+        );
+        if alive(&a, id) {
+            back = Some(t);
+            break;
+        }
+    }
+    let t = back.expect("home again after the grace");
+    assert!(t <= 130, "back after {t} ticks");
+    for _ in 0..100 {
+        tick(&mut a, &mut b, &clock);
+        pump(&mut a, &mut b);
+    }
+    assert_eq!(visitors(&b, own_b), 0, "and never back in pit.1.0");
 }
 
 #[test]
