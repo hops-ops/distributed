@@ -51,4 +51,7 @@ data:
     for (const key of ['DISTRIBUTED_INTERNAL_SECRET', 'GAME_TICKET_SECRET', 'CELLD_QUEUE_RELAY_URL', 'CELLD_QUEUE_RELAY_MESH', 'ZONE_MAX_PLAYERS']) {
       if (process.env[key]) config.vars[key] = process.env[key];
     }
+    for (const [key, value] of Object.entries(JSON.parse(process.env.WORKER_VARS || '{}'))) {
+      config.vars[key] = String(value);
+    }
     writeFileSync(target, JSON.stringify(config));
