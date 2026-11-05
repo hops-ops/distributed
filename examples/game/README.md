@@ -147,7 +147,8 @@ faster, brittle, glowing) out to **every live room**:
 
 ## Hops local (Kubernetes)
 
-Mob Pit also runs in the machine's Hops cluster (kind-hops), through the same
+Mob Pit also runs in the machine's Hops cluster (OrbStack k3s, context
+`orbstack`; kind-hops until 2026-11-05), through the same
 gateway, at a portless HTTPS address per checkout:
 `https://<checkout>.gitkb.localhost/mobpit/` (this checkout:
 `https://distributed-mobpit-world.gitkb.localhost/mobpit/`).
