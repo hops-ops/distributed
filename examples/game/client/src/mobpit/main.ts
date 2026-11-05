@@ -1491,11 +1491,24 @@ let compensated = true;
 window.addEventListener('keydown', (e) => {
 	if (e.code === 'KeyR' && !e.repeat) fireQueued = true;
 });
-canvas.addEventListener('mousedown', (e) => {
+// Third person, a left drag orbits the camera: fire on release, and only
+// if the mouse stayed put. Pointer events, not mouse events: Babylon
+// cancels pointerdown, so Chromium sends no mousedown/mouseup.
+const CLICK_SLOP_PX = 5;
+let clickFrom: { x: number; y: number } | undefined;
+canvas.addEventListener('pointerdown', (e) => {
 	if (e.button !== 0) return;
-	// First person: the first click only captures the mouse.
-	if (stage.view() === 'first' && document.pointerLockElement !== canvas) return;
-	fireQueued = true;
+	if (stage.view() === 'first') {
+		// The first click only captures the mouse.
+		if (document.pointerLockElement === canvas) fireQueued = true;
+		return;
+	}
+	clickFrom = { x: e.clientX, y: e.clientY };
+});
+window.addEventListener('pointerup', (e) => {
+	if (e.button !== 0 || clickFrom === undefined) return;
+	if (Math.hypot(e.clientX - clickFrom.x, e.clientY - clickFrom.y) <= CLICK_SLOP_PX) fireQueued = true;
+	clickFrom = undefined;
 });
 
 function sendCommandFrame(): void {

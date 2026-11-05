@@ -476,7 +476,8 @@ the others have a doorway in the middle.
 **The laser** (R / click / RT) fires from the eye along your view: 100 m,
 up to four bounces off walls, pillars and ramps, 12 damage, lag
 compensated up to 600 ms (the room rewinds the mobs to what you saw).
-Walls stop it at any height (an invisible barrier on each wall line, so
+In third person a click fires on release and only if the mouse did not
+move, so a left drag turns the camera without shooting. Walls stop it at any height (an invisible barrier on each wall line, so
 it never clears a wall into the next room); through a doorway or an open
 side it carries on into the next room (`PitMessage::LaserLeg`), which
 resolves the rest against its own mobs and credits you for a kill.
