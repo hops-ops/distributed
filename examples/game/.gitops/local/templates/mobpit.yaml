@@ -140,7 +140,7 @@ spec:
   parentRefs:
     - name: platform
       namespace: istio-ingress
-      sectionName: http
+      # No sectionName: attach to HTTP and, where the Gateway has it, HTTPS.
   hostnames:
     - {{ include "mobpit.host" . | quote }}
   rules:
