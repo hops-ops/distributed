@@ -217,6 +217,45 @@ fn pit_streams() -> Vec<Stream> {
             inputs: pit_frames(random(0x51ed ^ x as u32, 1200, 0), x as u32),
         });
     }
+    // Rooms with open sides: along a side, into it (out to the passage's
+    // end), into a corner and back, with dashes.
+    let open_rooms = (2..60)
+        .map(|x| (x, 4))
+        .filter(|&r| game_sim::mobpit::open_sides(DEFAULT_SEED, r) != 0)
+        .take(3);
+    for (x, y) in open_rooms {
+        let dash = game_sim::arena::BUTTON_DASH;
+        let mut frames = Vec::new();
+        for (mx, my, buttons, n) in [
+            (127i8, 30i8, 0u8, 90usize),
+            (127, 0, dash, 20),
+            (-127, 127, 0, 90),
+            (0, 127, dash, 60),
+            (127, 127, 0, 60),
+            (-127, -127, dash, 120),
+            (0, -127, 0, 120),
+        ] {
+            frames.extend(std::iter::repeat_n(vec![mx as u8, my as u8, buttons], n));
+        }
+        streams.push(Stream {
+            name: format!("pit.{x}.{y} open sides"),
+            start: start(12.0, 8.0),
+            context: context(x, y),
+            inputs: pit_frames(frames, x as u32),
+        });
+    }
+    // Rooms with holes: walkers fall in, jumps cross them.
+    let holed = (2..60)
+        .filter(|&x| !game_sim::mobpit::room_holes(DEFAULT_SEED, (x, 3)).is_empty())
+        .take(3);
+    for x in holed {
+        streams.push(Stream {
+            name: format!("pit.{x}.3 holes"),
+            start: start(4.5, 4.5),
+            context: context(x, 3),
+            inputs: pit_frames(random(0x401e ^ x as u32, 1200, 0), x as u32),
+        });
+    }
     streams
 }
 
@@ -274,7 +313,7 @@ fn rooms_in_reach_args() -> Vec<Vec<u8>> {
         rng ^= rng << 5;
         rng
     };
-    for near in 0..16u8 {
+    for (near, open) in (0..16u8).flat_map(|near| [(near, 0u8), (near, near ^ 0b0101)]) {
         for &(x, y) in &[
             (0.0, 0.0),
             (9.0, 0.0),
@@ -286,15 +325,95 @@ fn rooms_in_reach_args() -> Vec<Vec<u8>> {
             (18.0, 18.0),
             (-6.0, 11.0),
         ] {
-            args.push(game_sim::mobpit::ReachContext { x, y, near }.encode_context());
+            args.push(game_sim::mobpit::ReachContext { x, y, near, open }.encode_context());
         }
         for _ in 0..4 {
             let x = (next() % 4400) as f32 / 100.0 - 22.0;
             let y = (next() % 4400) as f32 / 100.0 - 22.0;
-            args.push(game_sim::mobpit::ReachContext { x, y, near }.encode_context());
+            args.push(game_sim::mobpit::ReachContext { x, y, near, open }.encode_context());
         }
     }
     args
+}
+
+/// Laser shots: from spawn points and the room's centre, in rooms of every
+/// pattern, aimed round the compass, level, up and down (off the floor).
+fn laser_path_args() -> Vec<Vec<u8>> {
+    let mut args = Vec::new();
+    for (room_x, room_y) in content_cells() {
+        for &(x, y) in &[(4.5f32, 4.5f32), (-4.5, -4.5), (0.0, 5.5), (12.0, -3.0)] {
+            for k in 0..8 {
+                let (dx, dy) = game_sim::mobpit::RING8_DIRS[k];
+                for dz in [0.0f32, 0.25, -0.15] {
+                    args.push(
+                        game_sim::mobpit::LaserShot {
+                            seed: game_sim::mobpit::DEFAULT_SEED,
+                            room_x,
+                            room_y,
+                            x,
+                            y,
+                            z: 0.6,
+                            dx,
+                            dy,
+                            dz,
+                        }
+                        .encode_context(),
+                    );
+                }
+            }
+        }
+    }
+    args
+}
+
+/// Room terrain: every content room plus a ring of rooms with hills and
+/// holes.
+fn floor_patch_args() -> Vec<Vec<u8>> {
+    let mut args = Vec::new();
+    for (room_x, room_y) in content_cells() {
+        for &(x, y, radius) in &[
+            (0.0f32, 0.0f32, 2.6f32),
+            (12.0, -7.5, 3.2),
+            (-16.0, 9.0, 1.8),
+        ] {
+            args.push(
+                game_sim::mobpit::FloorPatch {
+                    seed: game_sim::mobpit::DEFAULT_SEED,
+                    room_x,
+                    room_y,
+                    x,
+                    y,
+                    radius,
+                    rings: 6,
+                    segments: 32,
+                }
+                .encode_context(),
+            );
+        }
+    }
+    args
+}
+
+fn terrain_args() -> Vec<Vec<u8>> {
+    let mut rooms = content_cells();
+    for x in -3..=3 {
+        for y in -3..=3 {
+            if !rooms.contains(&(x, y)) {
+                rooms.push((x, y));
+            }
+        }
+    }
+    rooms
+        .into_iter()
+        .map(|(x, y)| {
+            game_sim::mobpit::PitRoomContext {
+                seed: game_sim::mobpit::DEFAULT_SEED,
+                x,
+                y,
+            }
+            .encode_context()
+        })
+        .collect()
 }
 
 /// Every demo step's and pure function's native trace (see the module docs).
@@ -304,6 +423,9 @@ pub fn traces() -> Value {
         "pures": [
             pure_trace::<game_sim::mobpit::PitRoomFn>(pit_room_args()),
             pure_trace::<game_sim::mobpit::RoomsInReachFn>(rooms_in_reach_args()),
+            pure_trace::<game_sim::mobpit::LaserPathFn>(laser_path_args()),
+            pure_trace::<game_sim::mobpit::RoomTerrainFn>(terrain_args()),
+            pure_trace::<game_sim::mobpit::FloorPatchFn>(floor_patch_args()),
         ],
         "steps": [
             trace::<PitStep>(pit_streams()),

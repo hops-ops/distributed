@@ -25,6 +25,9 @@ export const PREDICT_STATE: PredictStateLayout = [
 	['cd', { type: 'u8' }],
 	['z', { type: 'f32' }],
 	['vz', { type: 'f32' }],
+	['air', { type: 'u8' }],
+	['buf', { type: 'u8' }],
+	['held', { type: 'bool' }],
 ];
 
 /** What the step reads besides state and input (`prediction.setContext`). */

@@ -911,6 +911,68 @@ one-player rooms or 4–5 fifty-player rooms per core at 30 Hz; forwarding
 through another node adds under a millisecond; a hibernated room wakes in
 35–130 ms (p50).
 
+### Zone-to-zone messages
+
+A running zone can tell another running zone something: a shot that
+carries on through a doorway, a mob that follows a player across. It
+sends its own `Zone::Message` type; the target handles it in
+`on_zone_message`:
+
+```rust,ignore
+// Sender: bind the shooter's verified principal into the message.
+ctx.send_zone_for(player, "pit.1.0", &PitMessage::LaserLeg { .. });
+
+// Target:
+fn on_zone_message(&mut self, ctx: &mut Ctx<Self>, from: &ZoneSender, msg: PitMessage) {
+    if let Some(who) = &from.principal {
+        ctx.emit_fact_as(who, kill_fact);   // reward the remote shooter
+    }
+}
+```
+
+Each [`ZoneEnvelope`](src/zone_message.rs) has an id unique to the
+sending activation (`zone/boot_epoch/seq`); `deliver_zone` drops a repeat.
+The receiver sees the sender's principal only as a `VerifiedPrincipal`,
+which game code cannot make: it came from a verified ticket in the sending
+zone, and facts on behalf of it go through `emit_fact_as`. Drivers move
+envelopes with `ZoneHost::take_zone_messages` and `deliver_zone`; on celld
+the object posts them to `POST /{zone}/__zone` on its own class with the
+internal secret (never a public route). A message for a sleeping zone is
+refused (409): messages never wake zones. Delivery is best effort, so a
+transfer that must not lose or duplicate state needs a protocol on top.
+
+**Lending an entity** ([`lease`](src/lease.rs)). To move an entity into
+the zone next door (a mob chasing a player through a doorway), the home
+zone keeps it `Lent` (hidden, slot reserved) and the other zone keeps it
+`Held`. The holder beats; the home answers with a renewal, or a recall
+when it no longer lends that transfer. `LeaseTimings::new(beat, lease,
+grace)` only accepts `beat < lease < grace`, so the holder always lets go
+before the home takes the entity back: the entity is never live in two
+zones, and a lost message or a stopped zone only brings it home. The
+module keeps the state and the clock; the messages are the game's own:
+
+```rust,ignore
+const LEASE: LeaseTimings = LeaseTimings::new(20, 60, 120); // ticks: lease ≥ 3 beats
+
+// Home: lend it, answer beats, take it back when overdue.
+let transfer = self.transfers.next(ctx.boot_epoch());
+mob.away = Some(LEASE.lend(to, transfer, ctx.tick()));
+ctx.send_zone(to, &Msg::Arrive { transfer, hp, x, y });
+// on Msg::Beat: lent.heard(tick) and reply Msg::Renew, or Msg::Recall
+if lent.overdue(tick) { bring_back(mob) }
+
+// Holder: hold it, renew it, beat or drop it each tick.
+visitor.lease = LEASE.hold(&from.zone, transfer, tick);
+match visitor.lease.poll(tick) {
+    Hold::Beat => ctx.send_zone(visitor.lease.from(), &Msg::Beat { transfer }),
+    Hold::Lapsed => drop_visitor(),
+    Hold::Held => {}
+}
+```
+
+Mob Pit's crossings (`examples/game/server/rooms/src/zone/cross.rs`) are the
+full protocol: arrive, beat, renew, recall, home and fell.
+
 ### Scaling out: the native multi-host server
 
 The `net` server can also spread zones over several processes itself
@@ -971,7 +1033,7 @@ cylinders and axis-aligned boxes, each extruded up from the floor. One
 query then finds the closest hit among entities and walls, so a shot
 stops at a pillar instead of passing through it:
 
-```rust
+```rust,ignore
 ctx.set_colliders(Colliders::new()
     .with(Collider::cylinder([4.0, 2.0], 0.8, 2.4))
     .with(Collider::aabb([-20.0, 19.5], [20.0, 20.0], 3.0)));
@@ -988,6 +1050,29 @@ colliders sit on layer bits (`on_layers`), and a ray meets only the
 layers in its `mask`. `colliders().push_out(at, radius, mask)` keeps a
 moving body out of the walls. Queries are a linear scan, which suits
 rooms with tens of shapes; there is no spatial index yet.
+
+**Slopes, ground and bounces.** `Collider::ramp(a, b, height, uphill)` is
+a wedge rising along one axis, and `Colliders::with_terrain` adds a
+`Heightfield` (rolling ground; a `HOLE` sample is no ground at all).
+`ground_at(at, mask)` gives the top surface under a point, with its
+height and normal, and `walkable(normal)` says whether that is floor
+(about 45° or flatter). That is enough for a game's own step to climb
+ramps, slide off steep ones and fall into holes; the movement itself
+stays the game's, as physics does. `bounce(ray, max_bounces, cast)`
+follows a ray, reflecting it off each static surface it meets and
+stopping at the first entity:
+
+```rust,ignore
+let mut trace = bounce(ray.mask(LASER_MASK), 4, |r| ctx.raycast_shot(timing, r));
+trace.stop_at(ctx.colliders(), LAYER_BARRIER); // walls it never bounces past
+if let Some(exit) = trace.exit_box(muzzle, HALF) {
+    // It left the room by `exit.side` at `exit.point`: hand the rest of the
+    // path (`range - exit.travelled`) to the zone next door.
+}
+```
+
+`exit_box` does not count a leg that only reaches a side (a shot that
+stopped at a wall on the room's edge) as leaving.
 
 ### Testing and operations
 

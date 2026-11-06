@@ -15,6 +15,12 @@ celld:
 rooms:
   maxPlayers: ""
 
+# Extra cells-worker vars, e.g. the load test's A/B switches
+# (`ZONE_WORLD_PUSH: "0"`, `ZONE_FACT_BATCH: "1"`, `ZONE_UPDATE_RATES: "0"`).
+# Empty keeps the game's defaults.
+worker:
+  vars: {}
+
 images:
   rust: rust:1.99-bookworm
   node: node:24-bookworm

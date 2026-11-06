@@ -25,9 +25,7 @@ spec:
       labels:
         {{- include "mobpit.labels" . | nindent 8 }}
         app.kubernetes.io/name: mobpit
-        sidecar.istio.io/inject: "true"
-      annotations:
-        proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
+        istio.io/dataplane-mode: ambient
     spec:
       containers:
         - name: services
@@ -140,7 +138,7 @@ spec:
   parentRefs:
     - name: platform
       namespace: istio-ingress
-      sectionName: http
+      # No sectionName: attach to HTTP and, where the Gateway has it, HTTPS.
   hostnames:
     - {{ include "mobpit.host" . | quote }}
   rules:

@@ -56,6 +56,10 @@ spec:
             - name: ZONE_MAX_PLAYERS
               value: {{ . | quote }}
             {{- end }}
+            # `worker.vars`, as JSON (a change restarts this pod, which
+            # redeploys the worker).
+            - name: WORKER_VARS
+              value: {{ .Values.worker.vars | toJson | quote }}
             - name: GAME_TICKET_SECRET
               valueFrom: {secretKeyRef: {name: mobpit, key: GAME_TICKET_SECRET}}
             - name: DISTRIBUTED_INTERNAL_SECRET

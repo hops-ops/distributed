@@ -50,19 +50,21 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
-use distributed_game::collide::{layer, Collider, Colliders, Ray, Target};
+use distributed_game::collide::{bounce, Colliders, Ray};
 use distributed_game::rewind::{Historic, RewindFrame, ShotTiming};
 use distributed_game::{
     schema, ConsumePolicy, Ctx, EmitError, Entities, Entity, EntityId, EntitySchema, Fact,
     FactOutcome, FactSettlement, GameEvent, GameInput, GameRecord, GameSurface, LeaveReason,
-    ObserverId, Origin, PlayerId, Project, Replicated, View, Zone,
+    ObserverId, Origin, PlayerId, Project, Replicated, TransferIds, VerifiedPrincipal, View, Zone,
+    ZoneSender,
 };
 use game_sim::arena::{self as movement, PLAYER_RADIUS};
 use game_sim::mobpit::PitState as MoveState;
 use game_sim::mobpit::{
     self as rooms, admissible, borough_of, crossing, hood_of, into_neighbour, pair_shard,
-    parse_room, pit_room, pit_world, room_zone, PitRoomContext, PitRoomFn, RoomsInReachFn,
-    BOSS_TIER,
+    parse_room, pit_room, pit_world, room_colliders, room_ground, room_zone, FloorPatchFn,
+    LaserHit, LaserPathFn, PitRoomContext, PitRoomFn, RoomTerrainFn, RoomsInReachFn, BOSS_TIER,
+    GROUND_MASK, LASER_BOUNCES, LASER_MASK, LASER_RANGE, LAYER_BARRIER, LAYER_FLOOR,
 };
 use mobpit_crawler::{level_floor, KillReceipt, RecordKillInput};
 use mobpit_tiers::{BossDefeatedInput, WEATHER};
@@ -119,6 +121,18 @@ pub struct PlayerView {
     #[correct(snap)]
     #[from(state.vz)]
     pub vz: f32,
+    /// Ticks off walkable ground (coyote time).
+    #[correct(snap)]
+    #[from(state.air)]
+    pub air: u8,
+    /// Jump buffer ticks left.
+    #[correct(snap)]
+    #[from(state.buf)]
+    pub buf: u8,
+    /// Jump held last tick.
+    #[correct(snap)]
+    #[from(state.held)]
+    pub held: bool,
     /// Display name.
     #[priority(0.2)]
     #[correct(replace)]
@@ -359,12 +373,41 @@ pub enum PitEvent {
         requested_age_ms: f32,
         /// Limited by the clamp or the stored history.
         clamped: bool,
-        /// Where the arrow stopped (room-local).
+        /// Where the laser stopped (room-local).
         x: f32,
-        /// Where the arrow stopped.
+        /// Where the laser stopped.
         y: f32,
-        /// Where the arrow stopped (height).
+        /// Where the laser stopped (height).
         z: f32,
+        /// Each surface it met in order, with its normal (the last one is
+        /// the mob it hit, if any), for the beam and the impact marks.
+        path: Vec<LaserHit>,
+    },
+    /// A laser beam that came in from the room next door (a shot through
+    /// an open side or a doorway), to everyone watching this room: where it
+    /// entered, what it met, where it stopped.
+    #[game_event(id = 11)]
+    Beam {
+        /// The shooter's shot id (its own room's [`PitEvent::Shot`]).
+        shot: u16,
+        /// The shooter's name.
+        by: String,
+        /// Where it came in (room-local).
+        x: f32,
+        /// Where it came in.
+        y: f32,
+        /// Where it came in (height).
+        z: f32,
+        /// Surfaces it met, as in [`PitEvent::Shot::path`].
+        path: Vec<LaserHit>,
+        /// Where it stopped (room-local).
+        end_x: f32,
+        /// Where it stopped.
+        end_y: f32,
+        /// Where it stopped (height).
+        end_z: f32,
+        /// Mob hit (this room's entity id).
+        hit: Option<u32>,
     },
     /// To a player whose client runs older content than the room (a live
     /// content update happened): only the entrance (a gate) lets it through,
@@ -474,6 +517,91 @@ pub enum PitMessage {
         /// The city's banner.
         banner: String,
     },
+    // ---- from the rooms next door (zone messages, `cross`) ----
+    /// The rest of a laser shot that left the sending room through the side
+    /// it shares with this one (sent on behalf of the shooter).
+    #[game_event(id = 7)]
+    LaserLeg {
+        /// The shooter's shot id.
+        shot: u16,
+        /// The shooter's name (display only).
+        by: String,
+        /// Where it crosses the shared side (this room's coordinates).
+        x: f32,
+        /// Where it crosses.
+        y: f32,
+        /// Where it crosses (height).
+        z: f32,
+        /// Direction (unit).
+        dx: f32,
+        /// Direction.
+        dy: f32,
+        /// Direction.
+        dz: f32,
+        /// Path left (m).
+        dist: f32,
+        /// Bounces left.
+        bounces: u8,
+        /// How long before the shot the shooter's view was (ms): the same
+        /// lag compensation here.
+        age_ms: u16,
+    },
+    /// A mob following a player across: this room holds it as a visitor
+    /// on a lease ([`PitMessage::MobLease`]) while its home room keeps its
+    /// slot away.
+    #[game_event(id = 8)]
+    MobArrive {
+        /// The crossing (unique to the home room's activation).
+        transfer: u64,
+        /// Its id in its home room.
+        home_id: u32,
+        /// Its life in its home room (kill facts are keyed by it).
+        generation: u32,
+        /// Tier.
+        tier: u8,
+        /// Hit points.
+        hp: u32,
+        /// Where it comes in (this room's coordinates).
+        x: f32,
+        /// Where it comes in.
+        y: f32,
+        /// The principal it chases (a player crossing at the same time).
+        chase: String,
+    },
+    /// Visitor → home room, every second: "still here".
+    #[game_event(id = 9)]
+    MobBeat {
+        /// The crossing.
+        transfer: u64,
+    },
+    /// Home room → visitor's room: the lease goes on.
+    #[game_event(id = 10)]
+    MobLease {
+        /// The crossing.
+        transfer: u64,
+    },
+    /// Either way: the crossing is over (unknown, refused or taken back);
+    /// a visitor holding it is dropped, an away slot comes back.
+    #[game_event(id = 11)]
+    MobRecall {
+        /// The crossing.
+        transfer: u64,
+    },
+    /// Visitor → home room: it gave up and walked back to where it came in.
+    #[game_event(id = 12)]
+    MobHome {
+        /// The crossing.
+        transfer: u64,
+        /// Hit points left.
+        hp: u32,
+    },
+    /// Visitor → home room: it was killed there (the kill fact was emitted
+    /// there, keyed by its home identity).
+    #[game_event(id = 13)]
+    MobFell {
+        /// The crossing.
+        transfer: u64,
+    },
 }
 
 /// Mob Pit's client surface (also used by the leaderboard page).
@@ -483,6 +611,9 @@ pub fn game_surface() -> GameSurface {
         .predict::<PitStep>()
         .pure::<PitRoomFn>()
         .pure::<RoomsInReachFn>()
+        .pure::<LaserPathFn>()
+        .pure::<RoomTerrainFn>()
+        .pure::<FloorPatchFn>()
         .constant("pit_rules", &pit_rules())
         .constant("weather", &WEATHER.map(String::from).to_vec())
         .constant(
@@ -525,24 +656,26 @@ const LEASH: f32 = 15.0;
 const WINDUP_TICKS: u16 = 24;
 const RECOVER_TICKS: u16 = 18;
 const RESPAWN_TICKS: u64 = 120;
-/// A player at least this high (m) jumps over a mob's slam.
+/// A player at least this high (m) over the ground jumps over a mob's slam.
 pub const SLAM_CLEARANCE: f32 = 0.9;
-/// Ranged reach (m).
-pub const RANGE: f32 = 30.0;
-/// Damage per arrow.
+/// Feet this far down a hole (m): the player fell to its death.
+pub const FALL_DEATH: f32 = -2.0;
+/// Laser reach (m): the whole path, bounces included.
+pub const RANGE: f32 = LASER_RANGE;
+/// Most bounces of a laser shot (off walls, obstacles, ramps, the floor).
+pub const BOUNCES: usize = LASER_BOUNCES;
+/// Damage per laser hit.
 pub const RANGED_DAMAGE: i32 = 12;
 /// Ticks between shots.
 pub const FIRE_COOLDOWN: u8 = 12;
-/// Bow animation frames.
+/// Shot animation frames.
 const SHOT_FRAMES: u8 = 6;
-/// Eye height above the feet (m): where first-person arrows leave from.
+/// Eye height above the feet (m): where first-person shots leave from.
 pub const EYE_HEIGHT: f32 = 1.5;
-/// Where third-person (and top-down) arrows leave from, flying level (m).
+/// Where third-person (and top-down) shots leave from, flying level (m).
 pub const HIP_HEIGHT: f32 = 0.6;
 /// Furthest a shot is rewound (ms): the anti-cheat clamp.
 pub const MAX_REWIND_MS: u64 = 600;
-/// Obstacles stop arrows below this height (m).
-const OBSTACLE_HEIGHT: f32 = 2.4;
 /// Mob body height by tier (m): their hit capsule.
 fn mob_height(tier: u8) -> f32 {
     match tier {
@@ -680,18 +813,28 @@ pub struct PitRules {
     pub attack_half_angle: f32,
     /// Swing animation length (ticks; the player's `swing` counts down from it).
     pub swing_frames: u8,
-    /// Ranged reach (m).
+    /// Laser reach (m, the whole path).
     pub range: f32,
+    /// Most bounces of a laser shot.
+    pub bounces: u8,
     /// Ticks between shots.
     pub fire_cooldown: u8,
-    /// Eye height above the feet (m): first-person arrows.
+    /// Eye height above the feet (m): first-person shots.
     pub eye_height: f32,
-    /// Hip height (m): level third-person arrows.
+    /// Hip height (m): level third-person shots.
     pub hip_height: f32,
     /// Furthest a shot is rewound (ms).
     pub max_rewind_ms: u32,
     /// Mob body height by tier (index = tier).
     pub mob_heights: Vec<f32>,
+}
+
+/// Ground height under `(x, y)`: the terrain, a ramp or a platform; 0
+/// over a hole (the fall is the player's step's business).
+fn floor_at(ground: &Colliders, x: f32, y: f32) -> f32 {
+    ground
+        .ground_at([x, y], GROUND_MASK)
+        .map_or(0.0, |g| g.height)
 }
 
 /// The `PIT_RULES` constant.
@@ -709,6 +852,7 @@ pub fn pit_rules() -> PitRules {
         attack_half_angle: ATTACK_ARC_COS.acos(),
         swing_frames: SWING_FRAMES,
         range: RANGE,
+        bounces: BOUNCES as u8,
         fire_cooldown: FIRE_COOLDOWN,
         eye_height: EYE_HEIGHT,
         hip_height: HIP_HEIGHT,
@@ -745,6 +889,14 @@ struct Mob {
     difficulty: u32,
     /// The content pack's hit points (percent, for the HP bar).
     hp_pct: u16,
+    /// A guest slot (beyond the room's own mobs): holds visitors only.
+    guest: bool,
+    /// Visiting from another room ([`cross`]).
+    visit: Option<cross::Visit>,
+    /// This room's mob, away in another room ([`cross`]): hidden here.
+    away: Option<cross::Away>,
+    /// Following a player who left through a side ([`cross`]).
+    follow: Option<cross::Follow>,
 }
 
 struct Player {
@@ -832,6 +984,9 @@ struct SavedMob {
     generation: u32,
     /// Ticks until a dead mob respawns.
     respawn_in: u64,
+    /// Away in another room: `(room, crossing)` ([`cross`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    away: Option<(String, u64)>,
 }
 
 /// The Mob Pit room zone.
@@ -842,7 +997,7 @@ pub struct MobPit {
     pillars: Vec<Pillar>,
     pending: HashMap<String, PendingKill>,
     /// Facts refused by backpressure, retried each tick (oldest first).
-    backlog: VecDeque<(PlayerId, Fact, f32, f32)>,
+    backlog: VecDeque<(Killer, Fact, f32, f32)>,
     last_tick: Option<Duration>,
     tick_ms: f32,
     tick_max_ms: f32,
@@ -863,6 +1018,26 @@ pub struct MobPit {
     fires: Vec<Fire>,
     /// The content pack of the room's content version.
     pack: ContentPack,
+    /// What players and mobs stand on: ramps, platforms and the terrain
+    /// (`game_sim::mobpit::room_ground`).
+    ground: Colliders,
+    /// Players who just left through a side, for mobs to follow ([`cross`]).
+    departed: Vec<cross::Departed>,
+    /// Crossings started by this activation.
+    transfers: TransferIds,
+    /// The room's open sides (`game_sim::mobpit::open_sides`).
+    open: u8,
+}
+
+/// Who killed a mob: a player in this room, or a shooter next door whose
+/// laser came through (its principal verified there).
+#[derive(Clone)]
+enum Killer {
+    Here(PlayerId),
+    Next {
+        principal: VerifiedPrincipal,
+        name: String,
+    },
 }
 
 /// A ranged shot to resolve.
@@ -915,19 +1090,21 @@ fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
 /// Carried through a doorway: the player's [`MoveState`] in the
 /// neighbour's frame (x y vx vy z vz as f32 LE, dash, cd): a jump carries on.
 fn encode_carried(s: &MoveState) -> Vec<u8> {
-    let mut out = Vec::with_capacity(26);
+    let mut out = Vec::with_capacity(29);
     for v in [s.x, s.y, s.vx, s.vy, s.z, s.vz] {
         out.extend_from_slice(&v.to_le_bytes());
     }
-    out.extend_from_slice(&[s.dash, s.cd]);
+    out.extend_from_slice(&[s.dash, s.cd, s.air, s.buf, u8::from(s.held)]);
     out
 }
 
 /// Inverse of [`encode_carried`]; None unless it is a place a player can be.
 fn decode_carried(bytes: &[u8]) -> Option<MoveState> {
-    if bytes.len() != 26 {
+    // 26 bytes: from a room before coyote time and the jump buffer.
+    if bytes.len() != 29 && bytes.len() != 26 {
         return None;
     }
+    let tail = |i: usize| bytes.get(i).copied().unwrap_or(0);
     let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
     let state = MoveState {
         x: f(0),
@@ -938,6 +1115,9 @@ fn decode_carried(bytes: &[u8]) -> Option<MoveState> {
         vz: f(5),
         dash: bytes[24],
         cd: bytes[25],
+        air: tail(26),
+        buf: tail(27).min(rooms::JUMP_BUFFER),
+        held: tail(28) != 0,
     };
     admissible(&state).then(|| rooms::canonicalize(state))
 }
@@ -1007,21 +1187,37 @@ impl MobPit {
         })
     }
 
-    fn emit_kill(&mut self, ctx: &mut Ctx<'_, Self>, killer: PlayerId, mob: usize) {
+    fn emit_kill(&mut self, ctx: &mut Ctx<'_, Self>, killer: Killer, mob: usize) {
         let m = &self.mobs[mob];
-        let (x, y, tier, id, generation) = (m.x, m.y, m.tier, m.id.get(), m.generation);
-        let Some(player) = self.players.get(&killer) else {
-            return;
+        let (x, y, tier, id) = (m.x, m.y, m.tier, m.id.get());
+        // What died, by its home identity: a visitor's kill is keyed by its
+        // home room's id and life, so it settles once whichever room saw it.
+        let (home, home_id, generation) = match &m.visit {
+            Some(v) => (v.held.from().to_string(), v.home_id, v.generation),
+            None => (ctx.zone_id().to_string(), id, m.generation),
         };
-        let player_name = player.name.clone();
+        let (name, killer_id) = match &killer {
+            Killer::Here(player) => {
+                let Some(p) = self.players.get(player) else {
+                    return;
+                };
+                (p.name.clone(), p.id.get())
+            }
+            Killer::Next { name, .. } => (name.clone(), 0),
+        };
         self.kills += 1;
         // The cell command's own input: what died, never who or how much XP.
         let input = RecordKillInput {
-            mob: format!("{}/m{id}", ctx.zone_id()),
+            mob: format!("{home}/m{home_id}"),
             tier,
-            name: player.name.clone(),
+            name: name.clone(),
         };
-        let Ok(fact) = ctx.fact_with_key(&input, &[&format_args!("m{id}"), &generation]) else {
+        let fact = if m.visit.is_some() {
+            ctx.fact_with_key(&input, &[&home, &format_args!("m{home_id}"), &generation])
+        } else {
+            ctx.fact_with_key(&input, &[&format_args!("m{id}"), &generation])
+        };
+        let Ok(fact) = fact else {
             return;
         };
         let key = fact.key().to_string();
@@ -1031,13 +1227,13 @@ impl MobPit {
             tier,
             x,
             y,
-            killer: player.id.get(),
-            killer_name: player.name.clone(),
+            killer: killer_id,
+            killer_name: name.clone(),
         });
         self.backlog.push_back((killer, fact, x, y));
         self.flush_backlog(ctx);
         if tier == BOSS_TIER {
-            self.boss_fell(ctx, generation, player_name);
+            self.boss_fell(ctx, generation, name);
         }
     }
 
@@ -1088,15 +1284,23 @@ impl MobPit {
     /// Hand queued facts to the host; never blocks. Backpressure keeps the
     /// rest for the next tick.
     fn flush_backlog(&mut self, ctx: &mut Ctx<'_, Self>) {
-        while let Some((player, fact, x, y)) = self.backlog.pop_front() {
+        while let Some((killer, fact, x, y)) = self.backlog.pop_front() {
             let key = fact.key().to_string();
-            match ctx.emit_fact_for(player, fact.clone()) {
-                Ok(()) => {
-                    let principal = self
-                        .players
-                        .get(&player)
+            let (emitted, principal) = match &killer {
+                Killer::Here(player) => (
+                    ctx.emit_fact_for(*player, fact.clone()),
+                    self.players
+                        .get(player)
                         .map(|p| p.principal.clone())
-                        .unwrap_or_default();
+                        .unwrap_or_default(),
+                ),
+                Killer::Next { principal, .. } => (
+                    ctx.emit_fact_as(principal, fact.clone()),
+                    principal.as_str().to_string(),
+                ),
+            };
+            match emitted {
+                Ok(()) => {
                     self.pending.insert(
                         key,
                         PendingKill {
@@ -1108,7 +1312,7 @@ impl MobPit {
                     );
                 }
                 Err(EmitError::Backpressure) => {
-                    self.backlog.push_front((player, fact, x, y));
+                    self.backlog.push_front((killer, fact, x, y));
                     return;
                 }
                 // The killer left before the fact could be queued, or the key
@@ -1122,6 +1326,7 @@ impl MobPit {
         let tick = ctx.tick();
         let mut swings = Vec::new();
         let mut fires = Vec::new();
+        let mut fallen: Vec<PlayerId> = Vec::new();
         // The predicted step's context: this room (its seeded obstacles).
         let context = PitRoomContext {
             seed: self.room.seed,
@@ -1223,7 +1428,25 @@ impl MobPit {
             if p.regen % every == 0 && p.hp < PLAYER_HP {
                 p.hp += 1;
             }
+            if p.state.z <= FALL_DEATH {
+                // Down a hole.
+                p.hp = 0;
+                (p.state.vx, p.state.vy) = (0.0, 0.0);
+                p.dead_until = Some(tick + PLAYER_RESPAWN_TICKS);
+                fallen.push(*id);
+                ctx.send(
+                    *id,
+                    &PitEvent::Died {
+                        respawn_ms: (PLAYER_RESPAWN_TICKS * 1000 / 30) as u32,
+                    },
+                );
+            }
             ctx.set_view(*id, View::new(p.state.x, p.state.y, VIEW_RADIUS));
+        }
+        for m in &mut self.mobs {
+            if m.target.is_some_and(|t| fallen.contains(&t)) {
+                m.target = None;
+            }
         }
         self.fires = fires;
         swings
@@ -1261,6 +1484,14 @@ impl MobPit {
                 && ctx.handoff(player, &target, carried).is_ok()
             {
                 p.leaving = true;
+                // Mobs chasing it may follow it across.
+                self.departed.push(cross::Departed {
+                    player,
+                    principal: p.principal.clone(),
+                    step: (dx, dy),
+                    at: (p.state.x, p.state.y),
+                    tick: ctx.tick(),
+                });
             } else {
                 // The edge of the world: back inside the wall line.
                 let line = movement::HALF - PLAYER_RADIUS;
@@ -1294,19 +1525,21 @@ impl MobPit {
                 if cos < ATTACK_ARC_COS && d > radius + PLAYER_RADIUS {
                     continue;
                 }
-                self.hurt_mob(ctx, player, i, ATTACK_DAMAGE);
+                self.hurt_mob(ctx, Killer::Here(player), i, ATTACK_DAMAGE);
             }
         }
     }
 
     /// `player` deals `damage` to mob `i` (it turns on them; at 0 HP it
     /// dies and the kill is a fact).
-    fn hurt_mob(&mut self, ctx: &mut Ctx<'_, Self>, player: PlayerId, i: usize, damage: i32) {
+    fn hurt_mob(&mut self, ctx: &mut Ctx<'_, Self>, killer: Killer, i: usize, damage: i32) {
         let m = &mut self.mobs[i];
         m.hp -= damage;
-        if matches!(m.state, MobState::Idle | MobState::Return) {
-            m.state = MobState::Chase;
-            m.target = Some(player);
+        if let Killer::Here(player) = killer {
+            if matches!(m.state, MobState::Idle | MobState::Return) {
+                m.state = MobState::Chase;
+                m.target = Some(player);
+            }
         }
         if m.hp <= 0 {
             m.hp = 0;
@@ -1318,7 +1551,9 @@ impl MobPit {
                     RESPAWN_TICKS
                 };
             m.target = None;
-            self.emit_kill(ctx, player, i);
+            m.follow = None;
+            self.emit_kill(ctx, killer, i);
+            self.visitor_fell(ctx, i);
         }
     }
 
@@ -1339,7 +1574,7 @@ impl MobPit {
                 return;
             };
             for fire in &fires {
-                let ray = Ray::new(fire.origin, fire.dir, RANGE);
+                let ray = Ray::new(fire.origin, fire.dir, RANGE).mask(LASER_MASK);
                 let timing = ShotTiming {
                     client_tick: fire.client_tick,
                     interp_delay: Duration::from_millis(fire.delay_ms.into()),
@@ -1354,24 +1589,66 @@ impl MobPit {
                         false,
                     ),
                 };
-                // A mob killed since the shooter's view time lets the arrow
-                // through.
+                // The beam reflects off the room's geometry (its normals) and
+                // stops at the first mob. A mob killed since the shooter's
+                // view time lets it through.
                 let mobs = &self.mobs;
-                let hit = ctx.raycast_where(time, &ray, |id| {
-                    mobs.get(id as usize - 1)
-                        .is_some_and(|m| m.state != MobState::Dead)
+                let mut trace = bounce(ray, BOUNCES, |leg| {
+                    ctx.raycast_where(time, leg, |id| {
+                        mobs.get(id as usize - 1)
+                            .is_some_and(|m| m.state != MobState::Dead)
+                    })
                 });
-                let at = hit.map_or_else(|| ray.at(ray.max_dist), |h| h.point);
-                let mob = hit.and_then(|h| match h.target {
-                    Target::Entity(id) => Some(id),
-                    Target::Static(_) => None,
-                });
-                verdicts.push((mob, at, age, requested, clamped));
+                trace.stop_at(ctx.colliders(), LAYER_BARRIER);
+                let path = trace
+                    .hits
+                    .iter()
+                    .map(|h| LaserHit {
+                        x: h.point[0],
+                        y: h.point[1],
+                        z: h.point[2],
+                        nx: h.normal[0],
+                        ny: h.normal[1],
+                        nz: h.normal[2],
+                    })
+                    .collect::<Vec<_>>();
+                let leaves = if trace.entity().is_none() {
+                    cross::leaving_leg(fire.origin, &trace, RANGE, BOUNCES)
+                } else {
+                    None
+                };
+                verdicts.push((
+                    trace.entity(),
+                    trace.end,
+                    path,
+                    age,
+                    requested,
+                    clamped,
+                    leaves,
+                ));
             }
         }
-        for (fire, (mob, at, age, requested, clamped)) in fires.into_iter().zip(verdicts) {
+        for (fire, (mob, at, path, age, requested, clamped, leaves)) in
+            fires.into_iter().zip(verdicts)
+        {
             if let Some(id) = mob {
-                self.hurt_mob(ctx, fire.player, id as usize - 1, RANGED_DAMAGE);
+                self.hurt_mob(
+                    ctx,
+                    Killer::Here(fire.player),
+                    id as usize - 1,
+                    RANGED_DAMAGE,
+                );
+            }
+            if let Some(leg) = leaves {
+                // Past this room's side: the room beyond resolves the rest.
+                let by = self
+                    .players
+                    .get(&fire.player)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                let (rx, ry) = self.room.room;
+                let to = room_zone((rx + leg.step.0, ry + leg.step.1));
+                ctx.send_zone_for(fire.player, &to, &leg.message(fire.shot, by, age));
             }
             ctx.send(
                 fire.player,
@@ -1385,6 +1662,7 @@ impl MobPit {
                     x: at[0],
                     y: at[1],
                     z: at[2],
+                    path,
                 },
             );
         }
@@ -1403,7 +1681,9 @@ impl MobPit {
         let low: Vec<PlayerId> = self
             .players
             .iter()
-            .filter(|(_, p)| p.state.z < SLAM_CLEARANCE)
+            .filter(|(_, p)| {
+                p.state.z - floor_at(&self.ground, p.state.x, p.state.y) < SLAM_CLEARANCE
+            })
             .map(|(id, _)| *id)
             .collect();
         let mut hits: Vec<(PlayerId, i32)> = Vec::new();
@@ -1414,7 +1694,15 @@ impl MobPit {
         let invasion = self.event() == "invasion";
         let pace = if self.event() == "frenzy" { 1.4 } else { 1.0 } * self.pack.mob_pace;
         let aggro = if invasion { AGGRO * 2.0 } else { AGGRO };
+        // Mobs whose target just left through a side follow it; visitors
+        // find the player they came after (it crosses at the same time).
+        self.pick_follows(tick, &living);
+        let mut crossing_now = Vec::new();
+        let mut home_now = Vec::new();
         for i in 0..self.mobs.len() {
+            if self.mobs[i].away.is_some() {
+                continue;
+            }
             let tier = self.mobs[i].tier;
             let (_, speed, _, radius, tele) = tier_stats(tier);
             let (max_hp, damage) = (
@@ -1429,6 +1717,7 @@ impl MobPit {
             m.difficulty = difficulty;
             m.hp_pct = self.pack.mob_hp_pct;
             match m.state {
+                MobState::Dead if m.guest => continue,
                 MobState::Dead => {
                     // A boss returns only once its hood says so.
                     // An invasion brings the fallen back after a second.
@@ -1444,6 +1733,7 @@ impl MobPit {
                     }
                     continue;
                 }
+                MobState::Idle if m.visit.is_some() => m.state = MobState::Return,
                 MobState::Idle => {
                     let nearest = living
                         .iter()
@@ -1474,10 +1764,14 @@ impl MobPit {
                             m.face = step_toward(&mut m.x, &mut m.y, tx, ty, speed * pace * dt);
                         }
                     }
-                    _ => {
-                        m.state = MobState::Return;
-                        m.target = None;
-                    }
+                    _ => match cross::follow_step(m, radius, speed * pace * dt, tick) {
+                        cross::Followed::Moving => {}
+                        cross::Followed::AtExit => crossing_now.push(i),
+                        cross::Followed::GaveUp => {
+                            m.state = MobState::Return;
+                            m.target = None;
+                        }
+                    },
                 },
                 MobState::Windup => {
                     m.timer = m.timer.saturating_sub(1);
@@ -1506,13 +1800,23 @@ impl MobPit {
                         m.hp = (m.hp + 1).min(max_hp);
                     }
                     if dist((m.x, m.y), m.home) < 0.3 {
+                        if m.visit.is_some() {
+                            // A visitor back where it came in: it goes home.
+                            home_now.push(i);
+                        }
                         m.state = MobState::Idle;
                         m.wander = m.home;
                     }
                 }
             }
             let m = &mut self.mobs[i];
-            [m.x, m.y] = ctx.colliders().push_out([m.x, m.y], radius, layer::ALL);
+            [m.x, m.y] = ctx
+                .colliders()
+                .push_out([m.x, m.y], radius, GROUND_MASK & !LAYER_FLOOR);
+            // Mobs stay in their room (open sides have no wall to stop them).
+            let lim = movement::HALF - radius;
+            m.x = m.x.clamp(-lim, lim);
+            m.y = m.y.clamp(-lim, lim);
         }
         // Light separation so a pack does not stack on one spot.
         for i in 0..self.mobs.len() {
@@ -1533,6 +1837,12 @@ impl MobPit {
                     self.mobs[j].y += ny;
                 }
             }
+        }
+        for i in crossing_now {
+            self.start_crossing(ctx, i);
+        }
+        for i in home_now {
+            self.visitor_home(ctx, i);
         }
         for (id, damage) in hits {
             let Some(p) = self.players.get_mut(&id) else {
@@ -1652,6 +1962,8 @@ impl MobPit {
     }
 }
 
+mod cross;
+
 impl Zone for MobPit {
     type Config = RoomConfig;
     type Input = PitInput;
@@ -1676,14 +1988,11 @@ impl Zone for MobPit {
             x: room.room.0,
             y: room.room.1,
         });
-        // Columns, boulders and trees: arrows stop at them, mobs walk round.
+        // Columns, boulders, trees, ramps, walls and the floor: lasers
+        // bounce off them; mobs walk round all but the floor.
         let pillars = Pillar::of(&layout.obstacles);
-        ctx.set_colliders(
-            pillars
-                .iter()
-                .map(|o| Collider::cylinder([o.x, o.y], o.r, OBSTACLE_HEIGHT))
-                .fold(Colliders::new(), Colliders::with),
-        );
+        ctx.set_colliders(room_colliders(room.seed, room.room));
+        let ground = room_ground(room.seed, room.room);
         let mobs = layout
             .mobs
             .iter()
@@ -1706,6 +2015,10 @@ impl Zone for MobPit {
                     wander: home,
                     difficulty: 0,
                     hp_pct: content_pack(ctx.content_version()).mob_hp_pct,
+                    guest: false,
+                    visit: None,
+                    away: None,
+                    follow: None,
                 }
             })
             .collect();
@@ -1714,6 +2027,10 @@ impl Zone for MobPit {
             players: BTreeMap::new(),
             mobs,
             pillars,
+            ground,
+            departed: Vec::new(),
+            transfers: TransferIds::default(),
+            open: game_sim::mobpit::open_sides(room.seed, room.room),
             pending: HashMap::new(),
             backlog: VecDeque::new(),
             last_tick: None,
@@ -1799,6 +2116,11 @@ impl Zone for MobPit {
                 self.park(parked);
             }
         }
+        // Through a side, its chasers keep it as their target for a tick:
+        // they may follow it across (`cross`). Player ids are not reused.
+        if reason == LeaveReason::Handoff {
+            return;
+        }
         for m in &mut self.mobs {
             if m.target == Some(player) {
                 m.target = None;
@@ -1857,7 +2179,12 @@ impl Zone for MobPit {
         self.resolve_swings(ctx, swings);
         self.step_mobs(ctx);
         self.walk_through_doorways(ctx);
+        self.keep_crossings(ctx);
         self.flush_backlog(ctx);
+    }
+
+    fn on_zone_message(&mut self, ctx: &mut Ctx<'_, Self>, from: &ZoneSender, message: PitMessage) {
+        self.take_next_door(ctx, from, message);
     }
 
     fn on_message(&mut self, ctx: &mut Ctx<'_, Self>, message: PitMessage) {
@@ -1951,6 +2278,15 @@ impl Zone for MobPit {
                     ctx.broadcast(&PitEvent::World(self.world.clone()));
                 }
             }
+            // Only from the rooms next door (`on_zone_message`), never a
+            // service.
+            PitMessage::LaserLeg { .. }
+            | PitMessage::MobArrive { .. }
+            | PitMessage::MobBeat { .. }
+            | PitMessage::MobLease { .. }
+            | PitMessage::MobRecall { .. }
+            | PitMessage::MobHome { .. }
+            | PitMessage::MobFell { .. } => {}
         }
     }
 
@@ -2033,9 +2369,11 @@ impl Zone for MobPit {
     fn record_rewind(&self, frame: &mut RewindFrame) {
         for m in self.mobs.iter().filter(|m| m.state != MobState::Dead) {
             let half = mob_height(m.tier) / 2.0;
+            // Standing on the terrain (mobs keep off ramps and platforms).
+            let base = floor_at(&self.ground, m.x, m.y);
             frame.push(Historic::capsule(
                 m.id.get(),
-                [m.x, m.y, half],
+                [m.x, m.y, base + half],
                 half,
                 tier_stats(m.tier).3,
             ));
@@ -2043,7 +2381,14 @@ impl Zone for MobPit {
     }
 
     fn has_pending_work(&self) -> bool {
+        // A crossing in flight (a mob following, away or visiting) keeps the
+        // room ticking: beats, leases and graces run on its clock.
         !self.backlog.is_empty()
+            || !self.departed.is_empty()
+            || self
+                .mobs
+                .iter()
+                .any(|m| m.follow.is_some() || m.away.is_some() || m.visit.is_some())
     }
 
     fn hibernate(&self) -> Option<Vec<u8>> {
@@ -2054,6 +2399,7 @@ impl Zone for MobPit {
             mobs: self
                 .mobs
                 .iter()
+                .filter(|m| !m.guest)
                 .map(|m| SavedMob {
                     id: m.id.get(),
                     x: m.x,
@@ -2063,6 +2409,10 @@ impl Zone for MobPit {
                     dead: m.state == MobState::Dead,
                     generation: m.generation,
                     respawn_in: m.respawn_at.saturating_sub(tick),
+                    away: m
+                        .away
+                        .as_ref()
+                        .map(|a| (a.lent.to().to_string(), a.lent.transfer())),
                 })
                 .collect(),
             parked: {
@@ -2095,7 +2445,17 @@ impl Zone for MobPit {
             };
             m.generation = saved.generation;
             m.face = saved.face;
-            if saved.dead {
+            if let Some((to, transfer)) = saved.away {
+                // Still away: its visitor's next beat renews it, or it comes
+                // back after the grace (a fresh one from now).
+                m.state = MobState::Dead;
+                m.hp = saved.hp.max(1);
+                m.respawn_at = u64::MAX;
+                m.away = Some(cross::Away {
+                    lent: cross::LEASE.lend(to, transfer, tick),
+                    at: (saved.x, saved.y),
+                });
+            } else if saved.dead {
                 m.state = MobState::Dead;
                 m.hp = 0;
                 m.respawn_at = tick + saved.respawn_in;
@@ -2230,6 +2590,36 @@ impl MobPit {
     }
 
     /// Mob positions `(id, x, y, alive)` (tests and bots).
+    /// Test hook: put a player at room-local `(x, y)`, on the ground, still.
+    #[doc(hidden)]
+    pub fn place_player(&mut self, player: PlayerId, x: f32, y: f32) {
+        let z = floor_at(&self.ground, x, y);
+        if let Some(p) = self.players.get_mut(&player) {
+            p.state = MoveState {
+                x,
+                y,
+                z,
+                ..MoveState::default()
+            };
+        }
+    }
+
+    /// Test hook: move mob `id` (and its home) to room-local `(x, y)`.
+    #[doc(hidden)]
+    pub fn place_mob(&mut self, id: u32, x: f32, y: f32) {
+        if let Some(m) = self.mobs.get_mut(id as usize - 1) {
+            (m.x, m.y) = (x, y);
+            m.home = (x, y);
+            m.wander = (x, y);
+        }
+    }
+
+    /// Test hook: each mob's tier.
+    #[doc(hidden)]
+    pub fn mob_tiers(&self) -> Vec<(u32, u8)> {
+        self.mobs.iter().map(|m| (m.id.get(), m.tier)).collect()
+    }
+
     pub fn mob_positions(&self) -> Vec<(u32, f32, f32, bool)> {
         self.mobs
             .iter()

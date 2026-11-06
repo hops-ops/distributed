@@ -143,6 +143,10 @@ path = "tests/inbox/main.rs"
 required-features = ["net"]
 
 [[test]]
+name = "zone_message"
+path = "tests/zone_message/main.rs"
+
+[[test]]
 name = "lifecycle"
 path = "tests/lifecycle/main.rs"
 required-features = ["runtime"]

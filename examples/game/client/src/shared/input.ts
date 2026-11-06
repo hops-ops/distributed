@@ -11,11 +11,11 @@
 export type Sample = Readonly<{
 	x: number;
 	y: number;
-	/** Primary action (dash, fire …): Space / Shift / gamepad A or RB. */
+	/** Primary action (attack, fire …): Space / Shift / gamepad X (PS: Square) or RB. */
 	action: boolean;
-	/** Secondary action: E / F / gamepad B or LB. */
+	/** Secondary action (dash): E / F / gamepad B (PS: Circle) or LB. */
 	alt: boolean;
-	/** Jump: Q / gamepad Y. */
+	/** Jump: Q / gamepad A (PS: Cross). */
 	jump: boolean;
 	/** Fire (ranged): gamepad RT, held. Keyboard / mouse firing is per game. */
 	fire: boolean;
@@ -71,9 +71,11 @@ export class InputSampler {
 				x = gx;
 				y = gy;
 			}
-			action ||= pad.buttons[0]?.pressed === true || pad.buttons[5]?.pressed === true;
+			// Standard mapping (Xbox and PlayStation alike): 0 A/Cross, 1 B/Circle,
+			// 2 X/Square, 3 Y/Triangle, 4 LB, 5 RB.
+			action ||= pad.buttons[2]?.pressed === true || pad.buttons[5]?.pressed === true;
 			alt ||= pad.buttons[1]?.pressed === true || pad.buttons[4]?.pressed === true;
-			jump ||= pad.buttons[3]?.pressed === true;
+			jump ||= pad.buttons[0]?.pressed === true;
 			fire = (pad.buttons[7]?.value ?? 0) > 0.5;
 		}
 		const length = Math.hypot(x, y);

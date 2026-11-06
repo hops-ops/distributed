@@ -34,10 +34,14 @@ import type { StandardMaterial } from '@babylonjs/core/Materials/standardMateria
 import { DynamicTexture } from '@babylonjs/core/Materials/Textures/dynamicTexture';
 import { Color3, Color4 } from '@babylonjs/core/Maths/math.color';
 import { Scene } from '@babylonjs/core/scene';
-import { Vector3 } from '@babylonjs/core/Maths/math.vector';
+import { Frustum } from '@babylonjs/core/Maths/math.frustum';
+import { Matrix, Vector3 } from '@babylonjs/core/Maths/math.vector';
+import type { Plane } from '@babylonjs/core/Maths/math.plane';
 import { Mesh } from '@babylonjs/core/Meshes/mesh';
+import { VertexData } from '@babylonjs/core/Meshes/mesh.vertexData';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { TransformNode } from '@babylonjs/core/Meshes/transformNode';
+import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh';
 import { InputPacer, type RenderedEntity } from '@hops-ops/distributed/game';
 
 import {
@@ -56,11 +60,15 @@ import {
 	playerFields,
 	type PitFields,
 	type ContentPack,
-	type PitInput
+	type PitInput,
+	type Platform,
+	type Ramp,
+	type RoomTerrain
 } from '../generated/mobpit/index.ts';
 import { DevApi } from '../shared/dev-api.ts';
 import { Hud } from '../shared/hud.ts';
 import { cameraRelative, InputSampler, PAD, toAxis } from '../shared/input.ts';
+import { easeOutCubic, Pool, Trauma, tween } from '../shared/feel.ts';
 import { createRing, createStage, material } from '../shared/scene.ts';
 import {
 	createBoardWatcher,
@@ -82,9 +90,10 @@ import {
 const { half: HALF, playerRadius: PLAYER_RADIUS, pillars: PILLARS } = PIT_WORLD;
 /** Rooms drawn around yours (2 → 5×5). */
 const ROOM_VIEW = 2;
-/** Wall thickness and height (m), drawn just outside each room's floor. */
-const WALL_T = 0.3;
-const WALL_H = 0.6;
+/** Wall thickness and height (m), drawn just outside each room's floor:
+ * the box a laser bounces off (`game_sim::mobpit::room_colliders`). */
+const WALL_T = PIT_WORLD.wallThickness;
+const WALL_H = PIT_WORLD.wallHeight;
 /** Swing cone, from the server's rules: reach to a mob's edge, plus the body. */
 const { attackRange, attackHalfAngle: SWING_HALF, swingFrames: SWING_FRAMES } = PIT_RULES;
 const ATTACK_REACH = attackRange + PLAYER_RADIUS;
@@ -188,7 +197,7 @@ function applySky(dtMs: number): void {
 
 const hud = new Hud({
 	title: 'Mob Pit',
-	hint: 'WASD move · Space attack · R / click shoot · E dash · Q jump (over a slam) · V first person · C lag compensation · walk through a doorway to the next room · N wake rooms in reach · O debug overlay · P prediction · G server ghost. Controller: left stick move · right stick look · A / RB attack · RT shoot · B / LB dash · Y jump · R3 first person · View lag compensation. Rooms run on celld; kills are durable facts.',
+	hint: 'WASD move · Space attack · R / click laser (bounces off walls, ramps, the floor) · E dash · Q jump (over a slam, onto ramps) · V first person · C lag compensation · walk through a doorway to the next room · N wake rooms in reach · O debug overlay · P prediction · G server ghost. Controller: left stick move · right stick look · X / RB attack · RT laser · B / LB dash · A jump · R3 first person · View lag compensation. Rooms run on celld; kills are durable facts.',
 	client,
 	devApi: api
 });
@@ -199,6 +208,10 @@ hud.toggle('First-person view (click to look, R / click / RT fires)', false, (on
 hud.toggle('Lag compensation (ranged)', true, (on) => (compensated = on), 'c', PAD.view);
 let ghostOn = true;
 hud.toggle('Server ghost', true, (on) => (ghostOn = on), 'g');
+let cullOn = true;
+hud.toggle('Skip off-screen entities', true, (on) => (cullOn = on), 'k');
+let lodOn = true;
+hud.toggle('Level of detail (props and mobs)', true, (on) => (lodOn = on), 'l');
 hud.toggle(
 	'Wake rooms in reach (doorway neighbours you walk up to)',
 	wakeInitial,
@@ -387,14 +400,16 @@ roomsMap.addEventListener(
 	},
 	{ passive: false }
 );
-const roomLayouts = new Map<string, { biome: number; obstacles: { x: number; y: number; r: number }[] }>();
-function roomLayout(seed: number, x: number, y: number): { biome: number; obstacles: { x: number; y: number; r: number }[] } | undefined {
+type Box = { x0: number; y0: number; x1: number; y1: number };
+type MiniLayout = { biome: number; obstacles: { x: number; y: number; r: number }[]; ramps: readonly Ramp[]; holes: readonly Box[]; platforms: readonly Platform[]; open: number };
+const roomLayouts = new Map<string, MiniLayout>();
+function roomLayout(seed: number, x: number, y: number): MiniLayout | undefined {
 	if (!pit.pures.loaded()) return undefined;
 	const key = `${seed}:${x}:${y}`;
 	let layout = roomLayouts.get(key);
 	if (layout === undefined) {
 		const room = pit.pures.pitRoom({ seed, x, y });
-		layout = { biome: room.biome, obstacles: room.obstacles.map(({ x, y, r }) => ({ x, y, r })) };
+		layout = { biome: room.biome, obstacles: room.obstacles.map(({ x, y, r }) => ({ x, y, r })), ramps: room.ramps, holes: room.holes, platforms: room.platforms, open: room.open };
 		if (roomLayouts.size > 400) roomLayouts.clear();
 		roomLayouts.set(key, layout);
 	}
@@ -450,6 +465,22 @@ function drawRooms(): void {
 					ctx.fill();
 				}
 			}
+			// Ramps: their footprint, red when too steep to walk.
+			if (layout !== undefined && s > 0.6) {
+				for (const r of layout.ramps) {
+					const [ax, ay] = toMap(rx * ROOM_SIZE + r.x0, ry * ROOM_SIZE + r.y1);
+					ctx.fillStyle = r.degrees <= 45 ? '#c9c2b088' : '#d0703f99';
+					ctx.fillRect(ax, ay, (r.x1 - r.x0) * s, (r.y1 - r.y0) * s);
+				}
+				// Holes black, then platforms and stepping stones over them.
+				const box = (b: Box, fill: string) => {
+					const [ax, ay] = toMap(rx * ROOM_SIZE + b.x0, ry * ROOM_SIZE + b.y1);
+					ctx.fillStyle = fill;
+					ctx.fillRect(ax, ay, (b.x1 - b.x0) * s, (b.y1 - b.y0) * s);
+				};
+				for (const h of layout.holes) box(h, '#000000ee');
+				for (const p of layout.platforms) box(p, p.height > 0 ? '#b8a88caa' : '#8c7f6acc');
+			}
 			// Walls with a doorway gap in the middle of each.
 			ctx.strokeStyle = '#9aa3b2';
 			ctx.lineWidth = 1;
@@ -459,11 +490,17 @@ function drawRooms(): void {
 				ctx.lineTo(...toMap(rx * ROOM_SIZE + bx, ry * ROOM_SIZE + by));
 				ctx.stroke();
 			};
+			// Open sides (no wall) are left out.
+			const open = layout?.open ?? 0;
 			for (const sign of [-1, 1]) {
-				wall(-HALF, sign * HALF, -door, sign * HALF);
-				wall(door, sign * HALF, HALF, sign * HALF);
-				wall(sign * HALF, -HALF, sign * HALF, -door);
-				wall(sign * HALF, door, sign * HALF, HALF);
+				if ((open & (sign > 0 ? 4 : 8)) === 0) {
+					wall(-HALF, sign * HALF, -door, sign * HALF);
+					wall(door, sign * HALF, HALF, sign * HALF);
+				}
+				if ((open & (sign > 0 ? 1 : 2)) === 0) {
+					wall(sign * HALF, -HALF, sign * HALF, -door);
+					wall(sign * HALF, door, sign * HALF, HALF);
+				}
 			}
 			// Room state as the tile's inner border.
 			const status = row === undefined ? undefined : STATUS_COLOR[row.status];
@@ -615,6 +652,12 @@ const mats = {
 };
 mats.ghost.wireframe = true;
 for (const m of [mats.swing, mats.tele, mats.teleFill, mats.hpFill, mats.playerHpFill]) m.emissiveColor = m.diffuseColor.clone();
+// Slam warnings lie on the floor: both faces, drawn over it where they meet
+// (the floor's triangles and the room's bilinear ground differ by a few cm).
+for (const m of [mats.tele, mats.teleFill]) {
+	m.backFaceCulling = false;
+	m.zOffset = -2;
+}
 mats.blade.emissiveColor = new Color3(0.6, 0.6, 0.7);
 const tierMats = new Map<number, StandardMaterial>();
 for (const [tier, t] of Object.entries(TIERS)) tierMats.set(Number(tier), material(scene, `mob-${tier}`, t.color));
@@ -645,6 +688,55 @@ function place(room: Room, x: number, y: number, height = 0): Vector3 {
 /** Scene position of a room-local point of zone `zoneId` (the origin room if it is not a room). */
 function placeIn(zoneId: string, x: number, y: number, height = 0): Vector3 {
 	return place(parseRoom(zoneId) ?? origin, x, y, height);
+}
+
+// ---- level of detail ----
+// Round props and the bigger mobs come in three levels, about 100 %, 30 %
+// and 10 % of the full level's triangles; an object's level follows its
+// distance from the camera, past LOD_AT[0] the middle one, past LOD_AT[1]
+// the coarsest. Around each threshold a 10 % band (±5 %): a coarser level
+// only past T × 1.05, a finer one only inside T × 0.95, so an object
+// standing near a threshold does not flicker between levels.
+const LOD_AT = [18, 45];
+const LOD_BAND = 0.05;
+type Lod = { node: TransformNode; levels: readonly AbstractMesh[]; level: number };
+/** Three template meshes of one shape (level 0 the finest), hidden: objects are instances of them. */
+function lodTemplates(name: string, mat: StandardMaterial, make: (name: string, level: 0 | 1 | 2) => Mesh): Mesh[] {
+	return ([0, 1, 2] as const).map((l) => {
+		const mesh = make(`${name}-lod${l}`, l);
+		mesh.material = mat;
+		mesh.isPickable = false;
+		mesh.setEnabled(false);
+		return mesh;
+	});
+}
+/** An object of `templates` (one instance per level under `node`; the finest shown). */
+function lodOf(node: TransformNode, templates: readonly Mesh[]): Lod {
+	const levels = templates.map((t, l) => {
+		const instance = t.createInstance(`${node.name}-lod${l}`);
+		instance.parent = node;
+		instance.isPickable = false;
+		instance.setEnabled(l === 0);
+		return instance;
+	});
+	return { node, levels, level: 0 };
+}
+/** The level for distance `d` (m) from `level`, with the band round each threshold. */
+function lodLevel(level: number, d: number, count: number): number {
+	let l = level;
+	while (l < count - 1 && d > LOD_AT[l]! * (1 + LOD_BAND)) l += 1;
+	while (l > 0 && d < LOD_AT[l - 1]! * (1 - LOD_BAND)) l -= 1;
+	return l;
+}
+/** Objects per level this frame (for the HUD). */
+const lodCounts = [0, 0, 0];
+function applyLod(lod: Lod, eye: Vector3): void {
+	const want = lodOn ? lodLevel(lod.level, Vector3.Distance(eye, lod.node.getAbsolutePosition()), lod.levels.length) : 0;
+	lodCounts[want] = (lodCounts[want] ?? 0) + 1;
+	if (want === lod.level) return;
+	lod.levels[lod.level]!.setEnabled(false);
+	lod.levels[want]!.setEnabled(true);
+	lod.level = want;
 }
 
 /** Room templates, instanced per room: floor per biome, wall segment, doorway gate, pillar. */
@@ -690,19 +782,17 @@ const templates = (() => {
 	gate.material = doorMat;
 	gate.isPickable = false;
 	gate.setEnabled(false);
-	const pillar = MeshBuilder.CreateCylinder('room-pillar', { diameter: 1, height: 2.4, tessellation: 24 }, scene);
-	pillar.material = mats.pillar;
-	pillar.isPickable = false;
-	pillar.setEnabled(false);
+	// Columns, boulders and trees have three levels of detail (LOD_DETAIL).
+	const pillar = lodTemplates('room-pillar', mats.pillar, (name, l) =>
+		MeshBuilder.CreateCylinder(name, { diameter: 1, height: 2.4, tessellation: [40, 12, 4][l] }, scene)
+	);
 	// Obstacle looks of the seeded layouts: 0 column · 1 boulder · 2 tree · 3 crystal.
-	const boulder = MeshBuilder.CreateSphere('room-boulder', { diameter: 1, segments: 6 }, scene);
-	boulder.material = material(scene, 'boulder', '#6e6a62');
-	boulder.isPickable = false;
-	boulder.setEnabled(false);
-	const tree = MeshBuilder.CreateCylinder('room-tree', { diameterTop: 0, diameterBottom: 1.6, height: 3.2, tessellation: 7 }, scene);
-	tree.material = material(scene, 'tree', '#2f6b3a');
-	tree.isPickable = false;
-	tree.setEnabled(false);
+	const boulder = lodTemplates('room-boulder', material(scene, 'boulder', '#6e6a62'), (name, l) =>
+		MeshBuilder.CreateSphere(name, { diameter: 1, segments: [16, 8, 4][l] }, scene)
+	);
+	const tree = lodTemplates('room-tree', material(scene, 'tree', '#2f6b3a'), (name, l) =>
+		MeshBuilder.CreateCylinder(name, { diameterTop: 0, diameterBottom: 1.6, height: 3.2, tessellation: [40, 12, 4][l] }, scene)
+	);
 	const crystalMat = material(scene, 'crystal', '#7fe3ff', 0.85);
 	crystalMat.emissiveColor = Color3.FromHexString('#2a6f88');
 	const crystal = MeshBuilder.CreateBox('room-crystal', { size: 1 }, scene);
@@ -716,10 +806,132 @@ const templates = (() => {
 		w.setEnabled(false);
 		return w;
 	});
-	return { floors, wall, walls, segment, gate, pillar, boulder, tree, crystal };
+	// Ramps: stone you can walk up; rust-red where it is too steep (over
+	// about 45°, `walkable` in the room) and you slide off.
+	const rampMats = {
+		walk: material(scene, 'ramp-walk', '#9a9384'),
+		steep: material(scene, 'ramp-steep', '#b5653b')
+	};
+	for (const m of Object.values(rampMats)) {
+		m.backFaceCulling = false;
+		m.specularColor = Color3.Black();
+	}
+	// Holes: an open-topped dark shaft (inside faces only), scaled per hole.
+	const shaft = MeshBuilder.CreateBox('room-hole', { size: 1, sideOrientation: Mesh.BACKSIDE }, scene);
+	const shaftMat = material(scene, 'room-hole', '#07050a');
+	shaftMat.specularColor = Color3.Black();
+	shaft.material = shaftMat;
+	shaft.isPickable = false;
+	shaft.setEnabled(false);
+	// Platforms: boxes to jump onto; stepping stones are columns rising out of a hole.
+	const platform = MeshBuilder.CreateBox('room-platform', { size: 1 }, scene);
+	platform.material = material(scene, 'room-platform', '#8c7f6a');
+	platform.isPickable = false;
+	platform.setEnabled(false);
+	return { floors, wall, walls, segment, gate, pillar, boulder, tree, crystal, rampMats, shaft, platform };
 })();
 
-type Chunk = { room: Room; node: TransformNode; biome: number | undefined; seed: number };
+/** Each built room's terrain, for standing mobs on it. */
+const terrains = new Map<string, RoomTerrain>();
+
+/** Whether terrain sample `h` lies over a hole (`TERRAIN_HOLE`, -1000). */
+const isHole = (h: number) => h < -100;
+
+/** Terrain height at room-local `(x, y)` of zone `zoneId` (bilinear; 0 off the terrain or over a hole). */
+function groundAt(zoneId: string, x: number, y: number): number {
+	const t = terrains.get(zoneId);
+	if (t === undefined) return 0;
+	const fx = (x - t.minX) / t.cell;
+	const fy = (y - t.minY) / t.cell;
+	const i = Math.floor(fx);
+	const j = Math.floor(fy);
+	if (i < 0 || j < 0 || i + 1 >= t.nx || j + 1 >= t.ny) return 0;
+	const at = (a: number, b: number) => t.heights[b * t.nx + a]!;
+	const c = [at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1)];
+	if (c.some(isHole)) return 0;
+	const u = fx - i;
+	const v = fy - j;
+	return (c[0]! * (1 - u) + c[1]! * u) * (1 - v) + (c[2]! * (1 - u) + c[3]! * u) * v;
+}
+
+/** A room's ground as one mesh (room-local, scene axes: x, up, y): cells touching a hole are left open. */
+function terrainMesh(name: string, t: RoomTerrain, biome: number): Mesh {
+	const positions: number[] = [];
+	const uvs: number[] = [];
+	const indices: number[] = [];
+	for (let j = 0; j < t.ny; j += 1) {
+		for (let i = 0; i < t.nx; i += 1) {
+			const x = t.minX + i * t.cell;
+			const y = t.minY + j * t.cell;
+			const h = t.heights[j * t.nx + i]!;
+			positions.push(x, isHole(h) ? 0 : h, y);
+			uvs.push(x / (HALF * 2) + 0.5, y / (HALF * 2) + 0.5);
+		}
+	}
+	for (let j = 0; j + 1 < t.ny; j += 1) {
+		for (let i = 0; i + 1 < t.nx; i += 1) {
+			const a = j * t.nx + i;
+			const corners = [a, a + 1, a + t.nx, a + t.nx + 1];
+			if (corners.some((k) => isHole(t.heights[k]!))) continue;
+			// Same winding as the ramps' top (front faces up, normals up).
+			indices.push(a, a + 1, a + t.nx + 1, a, a + t.nx + 1, a + t.nx);
+		}
+	}
+	const data = new VertexData();
+	data.positions = positions;
+	data.indices = indices;
+	data.uvs = uvs;
+	const normals: number[] = [];
+	VertexData.ComputeNormals(positions, indices, normals);
+	data.normals = normals;
+	const mesh = new Mesh(name, scene);
+	data.applyToMesh(mesh);
+	mesh.material = templates.floors[biome]?.material ?? null;
+	mesh.isPickable = false;
+	return mesh;
+}
+
+/** One ramp of a room as a wedge mesh (room-local, scene axes: x, up, y). */
+function rampMesh(name: string, r: Ramp): Mesh {
+	// Corner heights: 0 on the low edge, `height` on the high one.
+	const corners: [number, number][] = [
+		[r.x0, r.y0],
+		[r.x1, r.y0],
+		[r.x1, r.y1],
+		[r.x0, r.y1]
+	];
+	const top = ([x, y]: [number, number]) => {
+		const high = r.uphill === 0 ? x === r.x1 : r.uphill === 1 ? x === r.x0 : r.uphill === 2 ? y === r.y1 : y === r.y0;
+		return high ? r.height : 0;
+	};
+	const positions: number[] = [];
+	const indices: number[] = [];
+	const quad = (a: number[], b: number[], c: number[], d: number[]) => {
+		const base = positions.length / 3;
+		positions.push(...a, ...b, ...c, ...d);
+		indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+	};
+	const up = corners.map((c) => [c[0], top(c), c[1]]);
+	const down = corners.map((c) => [c[0], 0, c[1]]);
+	quad(up[0]!, up[1]!, up[2]!, up[3]!);
+	for (let i = 0; i < 4; i += 1) {
+		const j = (i + 1) % 4;
+		quad(down[i]!, down[j]!, up[j]!, up[i]!);
+	}
+	const data = new VertexData();
+	data.positions = positions;
+	data.indices = indices;
+	const normals: number[] = [];
+	VertexData.ComputeNormals(positions, indices, normals);
+	data.normals = normals;
+	const mesh = new Mesh(name, scene);
+	data.applyToMesh(mesh);
+	mesh.material = r.degrees <= 45 ? templates.rampMats.walk : templates.rampMats.steep;
+	mesh.isPickable = false;
+	return mesh;
+}
+
+type Chunk = { room: Room; node: TransformNode; biome: number | undefined; seed: number; lods: Lod[] };
 const chunks = new Map<string, Chunk>();
 
 /** One room's static geometry under a node at the room's centre. */
@@ -728,7 +940,7 @@ function createChunk(room: Room): Chunk {
 	const node = new TransformNode(`room-${key}`, scene);
 	const seed = pit.hello()?.seed ?? PIT_WORLD.defaultSeed;
 	const biome = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }).biome : undefined;
-	const add = (mesh: Mesh, name: string, x: number, y: number, height: number, turn = 0) => {
+	const addAt = (mesh: Mesh, name: string, x: number, y: number, height: number, turn = 0) => {
 		const instance = mesh.createInstance(`${key}-${name}`);
 		instance.parent = node;
 		instance.position.set(x, height, y);
@@ -736,39 +948,84 @@ function createChunk(room: Room): Chunk {
 		instance.isPickable = false;
 		return instance;
 	};
-	add(templates.floors[biome ?? 0]!, 'floor', 0, 0, 0);
+	const add = addAt;
+	const layout = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }) : undefined;
+	if (layout !== undefined && biome !== undefined) {
+		const terrain = pit.pures.terrain({ seed, x: room[0], y: room[1] });
+		terrains.set(key, terrain);
+		terrainMesh(`${key}-terrain`, terrain, biome).parent = node;
+		// Each hole: a shaft 4 m deep (falling past 2 m kills).
+		layout.holes.forEach((h, i) => {
+			const instance = add(templates.shaft, `hole-${i}`, (h.x0 + h.x1) / 2, (h.y0 + h.y1) / 2, -2);
+			instance.scaling.set(h.x1 - h.x0, 4, h.y1 - h.y0);
+		});
+		// Platforms; a stepping stone (height 0) is a column from the bottom of its hole up to the floor.
+		layout.platforms.forEach((p, i) => {
+			const bottom = p.height > 0 ? 0 : -4;
+			const top = p.height > 0 ? p.height : 0;
+			const instance = add(templates.platform, `platform-${i}`, (p.x0 + p.x1) / 2, (p.y0 + p.y1) / 2, (bottom + top) / 2);
+			instance.scaling.set(p.x1 - p.x0, top - bottom, p.y1 - p.y0);
+		});
+	} else {
+		terrains.delete(key);
+		add(templates.floors[biome ?? 0]!, 'floor', 0, 0, 0);
+	}
 	// Each wall: two segments either side of its doorway gap, just outside
 	// the floor (the neighbour's wall stands right behind it).
 	const off = PIT_WORLD.doorHalf + templates.segment / 2;
 	const out = HALF + WALL_T / 2;
 	const wall = templates.walls[biome ?? 0] ?? templates.wall;
+	// An open side (no wall, crossed anywhere) has neither wall nor door
+	// gate; the corner posts always stand.
+	const open = layout?.open ?? 0;
 	for (const side of [-1, 1]) {
+		const openH = (open & (side > 0 ? 4 : 8)) !== 0;
+		const openV = (open & (side > 0 ? 1 : 2)) !== 0;
 		for (const along of [-1, 1]) {
-			add(wall, `wall-h${side}${along}`, along * off, side * out, WALL_H / 2);
-			add(wall, `wall-v${side}${along}`, side * out, along * off, WALL_H / 2, Math.PI / 2);
+			if (!openH) add(wall, `wall-h${side}${along}`, along * off, side * out, WALL_H / 2);
+			if (!openV) add(wall, `wall-v${side}${along}`, side * out, along * off, WALL_H / 2, Math.PI / 2);
+			const post = add(wall, `post-${side}${along}`, side * out, along * out, WALL_H / 2);
+			post.scaling.set(WALL_T / templates.segment, 1, 1);
 		}
-		add(templates.gate, `door-h${side}`, 0, side * HALF, 0.04);
-		add(templates.gate, `door-v${side}`, side * HALF, 0, 0.04, Math.PI / 2);
+		if (!openH) add(templates.gate, `door-h${side}`, 0, side * HALF, 0.04);
+		if (!openV) add(templates.gate, `door-v${side}`, side * HALF, 0, 0.04, Math.PI / 2);
 	}
+	const lods: Lod[] = [];
 	// The room's seeded obstacles (what the step collides with).
 	const obstacles = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }).obstacles : PILLARS.map((p) => ({ ...p, look: 0 }));
 	obstacles.forEach(({ x, y, r, look }, i) => {
+		// Each stands on the level patch the terrain leaves it (on a hill, not in it).
+		const base = groundAt(key, x, y);
+		const add = (mesh: Mesh, name: string, x: number, y: number, height: number) => addAt(mesh, name, x, y, base + height);
+		// A three-level prop: a node at its place, its levels under it.
+		const addLod = (levels: readonly Mesh[], name: string, x: number, y: number, height: number) => {
+			const prop = new TransformNode(`${key}-${name}`, scene);
+			prop.parent = node;
+			prop.position.set(x, base + height, y);
+			lods.push(lodOf(prop, levels));
+			return prop;
+		};
 		if (look === 1) {
-			const instance = add(templates.boulder, `obstacle-${i}`, x, y, r * 0.55);
+			const instance = addLod(templates.boulder, `obstacle-${i}`, x, y, r * 0.55);
 			instance.scaling.set(r * 2, r * 1.3, r * 2);
 		} else if (look === 2) {
-			const instance = add(templates.tree, `obstacle-${i}`, x, y, 1.6);
+			const instance = addLod(templates.tree, `obstacle-${i}`, x, y, 1.6);
 			instance.scaling.set(r * 1.25, 1, r * 1.25);
 		} else if (look === 3) {
 			const instance = add(templates.crystal, `obstacle-${i}`, x, y, r);
 			instance.scaling.set(r * 1.4, r * 2, r * 1.4);
 			instance.rotation.y = 0.6;
 		} else {
-			const instance = add(templates.pillar, `pillar-${i}`, x, y, 1.2);
+			const instance = addLod(templates.pillar, `pillar-${i}`, x, y, 1.2);
 			instance.scaling.set(r * 2, 1, r * 2);
 		}
 	});
-	return { room, node, biome, seed };
+	// Its sloped ramps (what the step walks on and the laser bounces off).
+	const ramps = pit.pures.loaded() ? pit.pures.pitRoom({ seed, x: room[0], y: room[1] }).ramps : [];
+	ramps.forEach((r, i) => {
+		rampMesh(`${key}-ramp-${i}`, r).parent = node;
+	});
+	return { room, node, biome, seed, lods };
 }
 
 /** Keep the rooms within `ROOM_VIEW` of the origin built and placed. */
@@ -791,6 +1048,7 @@ function syncChunks(): void {
 		if (!wanted.has(key)) {
 			chunk.node.dispose();
 			chunks.delete(key);
+			terrains.delete(key);
 			continue;
 		}
 		chunk.node.position.copyFrom(place(chunk.room, 0, 0));
@@ -851,8 +1109,34 @@ interestRing.isPickable = false;
 interestRing.setEnabled(false);
 
 type HpBar = { hpBack: Mesh; hpFill: Mesh; /** The fill drawn (eases to the health). */ hpShown: number };
-type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh } & HpBar;
-type MobVisual = { kind: 'mob'; body: Mesh; ring: Mesh; fill: Mesh; tier: number } & HpBar;
+/** `culled`: off screen, every mesh disabled and nothing updated. */
+type Culled = {
+	culled: boolean;
+	/** Health share last frame (a drop is a hit); NaN until seen. */
+	lastHp: number;
+	/** Hit stop: drawn frozen until then (performance.now ms). */
+	stopUntil: number;
+};
+type PlayerVisual = { kind: 'player'; body: Mesh; blade: Mesh; arc: Mesh; nose: Mesh } & HpBar & Culled;
+/**
+ * `edge`: last seen near its room's side (it may be crossing); `slide`: it
+ * just came across from the room next door and glides from where its old
+ * room last drew it.
+ */
+type MobVisual = {
+	kind: 'mob';
+	/** A mesh, or (the round tiers) a node over its levels of detail. */
+	body: TransformNode;
+	lod?: Lod;
+	ring: Mesh;
+	fill: Mesh;
+	tier: number;
+	edge: boolean;
+	slide?: { from: Vector3; start: number };
+	/** The floor its slam warning lies on (fetched when a windup starts there). */
+	area?: SlamArea;
+} & HpBar &
+	Culled;
 type Visual = PlayerVisual | MobVisual;
 const visuals = new Map<string, Visual>();
 
@@ -873,29 +1157,152 @@ function createPlayer(entity: RenderedEntity, mine: boolean): PlayerVisual {
 	blade.material = mats.blade;
 	// Swing wedge: 120° (the server's cone), flat on the floor.
 	const arc = flatDisc(`${entity.key}-arc`, ATTACK_REACH, mats.swing, SWING_HALF / Math.PI);
-	return { kind: 'player', body, blade, arc, nose, ...hpBar(entity.key, mats.playerHpFill) };
+	return { kind: 'player', body, blade, arc, nose, culled: false, lastHp: Number.NaN, stopUntil: 0, ...hpBar(entity.key, mats.playerHpFill) };
+}
+
+// ---- slam warnings, draped on the floor ----
+// A mob's slam hits anyone within its reach standing on whatever floor is
+// under them (terrain, ramp or platform top), as the room's `floor_at`
+// says; the warning lies on that floor (the `floor_patch` pure, the room's
+// own ground) instead of a flat disc that hills and ramps cut off.
+const SLAM_RINGS = 6;
+const SLAM_SEGMENTS = 32;
+const SLAM_LIFT = 0.05;
+type SlamArea = { zone: string; x: number; y: number; radius: number; heights: readonly number[] };
+function drapedDisc(id: string, mat: StandardMaterial): Mesh {
+	const mesh = new Mesh(id, scene);
+	const n = 1 + SLAM_RINGS * SLAM_SEGMENTS;
+	const index = (r: number, k: number) => (r === 0 ? 0 : 1 + (r - 1) * SLAM_SEGMENTS + (k % SLAM_SEGMENTS));
+	const indices: number[] = [];
+	for (let k = 0; k < SLAM_SEGMENTS; k += 1) indices.push(0, index(1, k + 1), index(1, k));
+	for (let r = 1; r < SLAM_RINGS; r += 1) {
+		for (let k = 0; k < SLAM_SEGMENTS; k += 1) {
+			indices.push(index(r, k), index(r, k + 1), index(r + 1, k + 1), index(r, k), index(r + 1, k + 1), index(r + 1, k));
+		}
+	}
+	const data = new VertexData();
+	data.positions = new Array<number>(n * 3).fill(0);
+	data.normals = Array.from({ length: n * 3 }, (_, i) => (i % 3 === 1 ? 1 : 0));
+	data.indices = indices;
+	data.applyToMesh(mesh, true);
+	mesh.material = mat;
+	mesh.isPickable = false;
+	// Its bounds change as it is draped: always considered for drawing.
+	mesh.alwaysSelectAsActiveMesh = true;
+	return mesh;
+}
+/** The floor under a slam of `radius` at room-local `(x, y)`: fetched once per spot. */
+function slamArea(visual: MobVisual, zone: string, x: number, y: number, radius: number): SlamArea {
+	const old = visual.area;
+	if (old !== undefined && old.zone === zone && old.radius === radius && Math.hypot(old.x - x, old.y - y) < 0.05) return old;
+	const room = parseRoom(zone);
+	const heights =
+		room !== undefined && pit.pures.loaded()
+			? pit.pures.floorPatch({ seed: pit.hello()?.seed ?? PIT_WORLD.defaultSeed, roomX: room[0], roomY: room[1], x, y, radius, rings: SLAM_RINGS, segments: SLAM_SEGMENTS })
+			: new Array<number>(1 + SLAM_RINGS * SLAM_SEGMENTS).fill(groundAt(zone, x, y));
+	visual.area = { zone, x, y, radius, heights };
+	drape(visual.ring, visual.area, 1);
+	return visual.area;
+}
+/**
+ * Lay `mesh` (a `drapedDisc`) on `area` at `scale` of its radius: each
+ * ring's height is read along its ray from the area's rings. Over a hole
+ * it sinks in.
+ */
+function drape(mesh: Mesh, area: SlamArea, scale: number): void {
+	const at = (r: number, k: number) => area.heights[r === 0 ? 0 : 1 + (r - 1) * SLAM_SEGMENTS + k]!;
+	const height = (f: number, k: number) => {
+		const r = Math.min(Math.floor(f), SLAM_RINGS - 1);
+		const t = Math.min(f - r, 1);
+		const a = at(r, k);
+		const b = at(r + 1, k);
+		const ha = isHole(a) ? at(0, k) - 3 : a;
+		const hb = isHole(b) ? at(0, k) - 3 : b;
+		return ha + (hb - ha) * t + SLAM_LIFT;
+	};
+	const positions = new Float32Array((1 + SLAM_RINGS * SLAM_SEGMENTS) * 3);
+	positions[1] = height(0, 0);
+	for (let r = 1; r <= SLAM_RINGS; r += 1) {
+		const f = r * scale;
+		const d = (area.radius * r * scale) / SLAM_RINGS;
+		for (let k = 0; k < SLAM_SEGMENTS; k += 1) {
+			const a = (Math.PI * 2 * k) / SLAM_SEGMENTS;
+			const i = (1 + (r - 1) * SLAM_SEGMENTS + k) * 3;
+			positions[i] = d * Math.cos(a);
+			positions[i + 1] = height(f, k);
+			positions[i + 2] = d * Math.sin(a);
+		}
+	}
+	mesh.updateVerticesData('position', positions);
+}
+
+/** Three-level bodies of the round tiers (3: a spike, 4: the boss), made on first use. */
+const mobLods = new Map<number, Mesh[]>();
+function mobLodTemplates(tier: number): Mesh[] | undefined {
+	if (tier !== 3 && tier !== 4) return undefined;
+	let levels = mobLods.get(tier);
+	if (levels === undefined) {
+		const t = TIERS[tier]!;
+		const top = tier === 4 ? t.radius * 0.8 : 0;
+		const height = tier === 4 ? 2.8 : 2;
+		levels = lodTemplates(`mob-tier${tier}`, tierMats.get(tier) ?? mats.other, (name, l) =>
+			MeshBuilder.CreateCylinder(name, { diameterTop: top, diameterBottom: t.radius * 2, height, tessellation: [40, 12, 4][l] }, scene)
+		);
+		mobLods.set(tier, levels);
+	}
+	return levels;
 }
 
 function createMob(entity: RenderedEntity): MobVisual {
 	const tier = mobFields(entity).tier || 1;
 	const t = TIERS[tier] ?? TIERS[1]!;
-	const body =
-		tier === 4
-			? MeshBuilder.CreateCylinder(entity.key, { diameterTop: t.radius * 0.8, diameterBottom: t.radius * 2, height: 2.8, tessellation: 8 }, scene)
-			: tier === 3
-			? MeshBuilder.CreateCylinder(entity.key, { diameterTop: 0, diameterBottom: t.radius * 2, height: 2, tessellation: 6 }, scene)
-			: MeshBuilder.CreateBox(entity.key, { width: t.radius * 2, depth: t.radius * 2, height: tier === 2 ? 1.5 : 0.9 }, scene);
-	body.material = tierMats.get(tier) ?? mats.other;
-	const ring = flatDisc(`${entity.key}-tele`, t.tele, mats.tele);
-	const fill = flatDisc(`${entity.key}-tele-fill`, t.tele, mats.teleFill);
-	return { kind: 'mob', body, ring, fill, tier, ...hpBar(entity.key, mats.hpFill) };
+	// The round tiers in three levels; a box (grunt, brute) cannot go lower.
+	const levels = mobLodTemplates(tier);
+	let body: TransformNode;
+	let lod: Lod | undefined;
+	if (levels !== undefined) {
+		body = new TransformNode(entity.key, scene);
+		lod = lodOf(body, levels);
+	} else {
+		const box = MeshBuilder.CreateBox(entity.key, { width: t.radius * 2, depth: t.radius * 2, height: tier === 2 ? 1.5 : 0.9 }, scene);
+		box.material = tierMats.get(tier) ?? mats.other;
+		body = box;
+	}
+	const ring = drapedDisc(`${entity.key}-tele`, mats.tele);
+	const fill = drapedDisc(`${entity.key}-tele-fill`, mats.teleFill);
+	return { kind: 'mob', body, lod, ring, fill, tier, edge: false, culled: false, lastHp: Number.NaN, stopUntil: 0, ...hpBar(entity.key, mats.hpFill) };
+}
+
+// ---- mobs crossing between rooms ----
+// A mob that follows a player across leaves its room (its entity goes) and
+// arrives next door as a new entity a message later. Its mesh is held a
+// moment where it vanished at a side; the newcomer of the same tier beside
+// it takes the mesh over and glides into place: no blink, no hop.
+const CROSS_HOLD_MS = 500;
+const CROSS_SLIDE_MS = 150;
+/** How near (m) a newcomer must be to a held mob to be it. */
+const CROSS_MATCH = 3;
+const crossing = new Map<string, { visual: MobVisual; until: number }>();
+/** Mobs just killed (their entity goes too, but they are not crossing). */
+const killedAt = new Map<string, number>();
+function adoptCrossing(entity: RenderedEntity): MobVisual | undefined {
+	const m = mobFields(entity);
+	const arriving = placeIn(entity.zoneId, m.x, m.y, 0);
+	for (const [key, held] of crossing) {
+		const at = held.visual.body.position;
+		if (held.visual.tier !== (m.tier || 1) || Math.hypot(at.x - arriving.x, at.z - arriving.z) > CROSS_MATCH) continue;
+		crossing.delete(key);
+		held.visual.slide = { from: at.clone(), start: performance.now() };
+		return held.visual;
+	}
+	return undefined;
 }
 
 function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 	let visual = visuals.get(entity.key);
 	if (visual !== undefined) return visual;
 	if (isMob(entity)) {
-		visual = createMob(entity);
+		visual = adoptCrossing(entity) ?? createMob(entity);
 	} else {
 		visual = createPlayer(entity, mine);
 	}
@@ -904,8 +1311,8 @@ function visualFor(entity: RenderedEntity, mine: boolean): Visual {
 }
 
 function dispose(visual: Visual): void {
-	// (The bar's fill goes with its back.)
-	for (const mesh of Object.values(visual)) if (mesh instanceof Mesh && !mesh.isDisposed()) mesh.dispose();
+	// (The bar's fill goes with its back, a body's levels with their node.)
+	for (const node of Object.values(visual)) if (node instanceof TransformNode && !node.isDisposed()) node.dispose();
 }
 
 const HP_W = 1.2;
@@ -943,7 +1350,10 @@ function showHp(bar: HpBar, at: Vector3, share: number, dtMs: number): void {
 }
 
 // ---- kill / saved popups (DOM labels anchored to invisible meshes) ----
-type Popup = { mesh: Mesh; until: number; zone: string; x: number; y: number };
+type Popup = { mesh: Mesh; until: number; zone: string; x: number; y: number; born: number };
+/** A popup rises this far (m) over POPUP_RISE_MS as it appears. */
+const POPUP_RISE = 0.5;
+const POPUP_RISE_MS = 300;
 const popups = new Map<string, Popup>();
 let popupSeq = 0;
 
@@ -957,7 +1367,7 @@ function popup(key: string, zoneId: string, x: number, y: number, text: string, 
 	if (p === undefined) {
 		const mesh = MeshBuilder.CreateBox(`popup-${popupSeq++}`, { size: 0.01 }, scene);
 		mesh.isVisible = false;
-		p = { mesh, until: 0, zone: killRoom(key, zoneId), x, y };
+		p = { mesh, until: 0, zone: killRoom(key, zoneId), x, y, born: performance.now() };
 		mesh.position.copyFrom(placeIn(p.zone, x, y, 1.2));
 		popups.set(key, p);
 	}
@@ -965,7 +1375,20 @@ function popup(key: string, zoneId: string, x: number, y: number, text: string, 
 	stage.labels.set(`popup:${key}`, p.mesh, text, 0.6, `pit-pop ${className}`);
 }
 
+// A laser that came through from the room next door: that room's leg of it.
+pit.on('beam', (b, zoneId) => {
+	const points = [placeIn(zoneId, b.x, b.y, b.z), ...b.path.map((h) => placeIn(zoneId, h.x, h.y, h.z)), placeIn(zoneId, b.endX, b.endY, b.endZ)];
+	beam(points, b.hit !== undefined ? beamMats.hit : beamMats.miss, 0.04, BEAM_MS * 2);
+});
 pit.on('kill', (kill, zoneId) => {
+	// Killed, not crossing: never held at the side.
+	const key = `${zoneId}:${kill.mob}`;
+	killedAt.set(key, performance.now());
+	const held = crossing.get(key);
+	if (held !== undefined) {
+		dispose(held.visual);
+		crossing.delete(key);
+	}
 	// Entity ids are per room: a kill next door is never yours.
 	const mine = zoneId === pit.room() && kill.killer === pit.hello()?.entity;
 	const tier = TIERS[kill.tier]?.name ?? 'Mob';
@@ -1059,19 +1482,33 @@ const sampler = new InputSampler();
 const commandFrames = new InputPacer({ tickRate: () => client.authority?.connection.welcome?.tickRate });
 
 // Ranged: R, a click or RT fires along the view (first person: where you
-// look; third person: the camera's heading). The room resolves the arrow
-// lag-compensated (C toggles it per shot).
+// look; third person: the camera's heading). The laser bounces off walls,
+// obstacles, ramps and the floor; the room resolves it lag-compensated
+// (C toggles it per shot).
 let fireQueued = false;
 let lastFireAt = 0;
 let compensated = true;
 window.addEventListener('keydown', (e) => {
 	if (e.code === 'KeyR' && !e.repeat) fireQueued = true;
 });
-canvas.addEventListener('mousedown', (e) => {
+// Third person, a left drag orbits the camera: fire on release, and only
+// if the mouse stayed put. Pointer events, not mouse events: Babylon
+// cancels pointerdown, so Chromium sends no mousedown/mouseup.
+const CLICK_SLOP_PX = 5;
+let clickFrom: { x: number; y: number } | undefined;
+canvas.addEventListener('pointerdown', (e) => {
 	if (e.button !== 0) return;
-	// First person: the first click only captures the mouse.
-	if (stage.view() === 'first' && document.pointerLockElement !== canvas) return;
-	fireQueued = true;
+	if (stage.view() === 'first') {
+		// The first click only captures the mouse.
+		if (document.pointerLockElement === canvas) fireQueued = true;
+		return;
+	}
+	clickFrom = { x: e.clientX, y: e.clientY };
+});
+window.addEventListener('pointerup', (e) => {
+	if (e.button !== 0 || clickFrom === undefined) return;
+	if (Math.hypot(e.clientX - clickFrom.x, e.clientY - clickFrom.y) <= CLICK_SLOP_PX) fireQueued = true;
+	clickFrom = undefined;
 });
 
 function sendCommandFrame(): void {
@@ -1111,52 +1548,235 @@ const markerMats = {
 	miss: material(scene, 'marker-miss', '#ff5252')
 };
 for (const m of Object.values(markerMats)) m.emissiveColor = m.diffuseColor.clone();
-const boltMat = material(scene, 'shot-bolt', '#ffd166');
-boltMat.emissiveColor = boltMat.diffuseColor.clone();
-/** How fast the drawn bolt flies (the room resolves the shot at once). */
-const BOLT_SPEED = 60;
-const BOLT_MAX_MS = 400;
+const beamMats = {
+	shot: material(scene, 'laser-beam', '#ff3b5c'),
+	hit: material(scene, 'laser-hit', '#3ddc84'),
+	miss: material(scene, 'laser-miss', '#ff8a8a')
+};
+for (const m of Object.values(beamMats)) {
+	m.emissiveColor = m.diffuseColor.clone();
+	m.disableLighting = true;
+}
+const sparkMat = material(scene, 'laser-spark', '#ffe28a');
+sparkMat.emissiveColor = sparkMat.diffuseColor.clone();
+sparkMat.disableLighting = true;
+sparkMat.backFaceCulling = false;
+/** How long a beam and its impact marks stay (ms). */
+const BEAM_MS = 220;
+const SPARK_MS = 700;
+// Beams, impact marks and shot balls come from pools sized for the peak
+// (a shot every 0.4 s: about three in flight, each with a predicted and a
+// room beam, up to four marks and a ball that waits for its verdict).
+/** Points in every pooled beam: the longest path (origin, LASER_BOUNCES + 1 hits, an end). */
+const BEAM_POINTS = 8;
+type Beam = { tube: Mesh; born: number; ms: number };
+const liveBeams = new Set<Beam>();
+let beamSeq = 0;
+const beamPool = new Pool<Beam>(
+	'beams',
+	16,
+	() => {
+		const path = Array.from({ length: BEAM_POINTS }, (_, i) => new Vector3(i, 0, 0));
+		const tube = MeshBuilder.CreateTube(`laser-${beamSeq++}`, { path, radius: 0.05, tessellation: 6, cap: Mesh.CAP_ALL, updatable: true }, scene);
+		tube.isPickable = false;
+		return { tube, born: 0, ms: 1 };
+	},
+	(b) => b.tube.setEnabled(false)
+);
+/** `points` stretched to BEAM_POINTS by splitting its last leg evenly (no zero-length legs). */
+function beamPath(points: Vector3[]): Vector3[] {
+	const path = points.slice(0, BEAM_POINTS);
+	const to = path.pop()!;
+	const from = path[path.length - 1]!;
+	const parts = BEAM_POINTS - path.length;
+	for (let i = 1; i <= parts; i += 1) path.push(Vector3.Lerp(from, to, i / parts));
+	return path;
+}
+/** Draw a beam through `points` (scene space) that fades out. */
+function beam(points: Vector3[], mat: StandardMaterial, radius: number, ms: number): void {
+	if (points.length < 2) return;
+	const b = beamPool.take();
+	MeshBuilder.CreateTube('', { path: beamPath(points), radius, instance: b.tube });
+	b.tube.refreshBoundingInfo();
+	b.tube.material = mat;
+	b.tube.visibility = 1;
+	b.tube.setEnabled(true);
+	b.born = performance.now();
+	b.ms = ms;
+	liveBeams.add(b);
+}
+scene.onBeforeRenderObservable.add(() => {
+	const now = performance.now();
+	for (const b of liveBeams) {
+		const t = (now - b.born) / b.ms;
+		b.tube.visibility = Math.max(0, 1 - t);
+		if (t < 1) continue;
+		liveBeams.delete(b);
+		beamPool.release(b);
+	}
+});
+let sparkSeq = 0;
+const sparkPool = new Pool<Mesh>(
+	'sparks',
+	24,
+	() => {
+		const disc = MeshBuilder.CreateDisc(`spark-${sparkSeq++}`, { radius: 0.22, tessellation: 10 }, scene);
+		disc.material = sparkMat;
+		disc.isPickable = false;
+		return disc;
+	},
+	(disc) => disc.setEnabled(false)
+);
+/** An impact mark at a bounce, lying on the surface (facing its normal). */
+function spark(at: Vector3, normal: Vector3): void {
+	const disc = sparkPool.take();
+	disc.position.copyFrom(at.add(normal.scale(0.02)));
+	disc.lookAt(at.add(normal));
+	disc.setEnabled(true);
+	setTimeout(() => sparkPool.release(disc), SPARK_MS);
+}
+let ballSeq = 0;
+const ballPool = new Pool<Mesh>(
+	'shot-balls',
+	12,
+	() => {
+		const ball = MeshBuilder.CreateSphere(`shot-${ballSeq++}`, { diameter: 0.35, segments: 6 }, scene);
+		ball.isPickable = false;
+		return ball;
+	},
+	(ball) => ball.setEnabled(false)
+);
+/** A room-local normal in scene axes. */
+const sceneNormal = (n: readonly [number, number, number]) => new Vector3(n[0], n[2], n[1]);
 function marker(record: ShotRecord): void {
-	// The arrow's flight: a bolt from just below the aim (in first person one
-	// from the eye itself would sit on the crosshair) to where it lands.
+	// The beam leaves from just below the aim (in first person one from the
+	// eye itself would sit on the crosshair) and follows the predicted
+	// bounces, one impact mark per surface it met.
 	const [ox, oy, oz] = record.origin;
-	const [px, py, pz] = record.point;
-	const from = placeIn(record.zone, ox, oy, oz - 0.3);
-	const to = placeIn(record.zone, px, py, pz);
-	const flightMs = Math.min(BOLT_MAX_MS, (Vector3.Distance(from, to) / BOLT_SPEED) * 1000);
-	const bolt = MeshBuilder.CreateCylinder(`bolt-${record.id}`, { height: 0.9, diameter: 0.12, tessellation: 6 }, scene);
-	// Lay the cylinder along +z so lookAt points it down the flight.
-	bolt.rotation.x = Math.PI / 2;
-	bolt.bakeCurrentTransformIntoVertices();
-	bolt.material = boltMat;
-	bolt.isPickable = false;
-	bolt.position.copyFrom(from);
-	bolt.lookAt(to);
-	const launched = performance.now();
-	let landed = false;
-	const flight = scene.onBeforeRenderObservable.add(() => {
-		const t = Math.min(1, (performance.now() - launched) / Math.max(flightMs, 1));
-		Vector3.LerpToRef(from, to, t, bolt.position);
-		if (t < 1) return;
-		landed = true;
-		ball.isVisible = true;
-		scene.onBeforeRenderObservable.remove(flight);
-		bolt.dispose();
+	const points = [placeIn(record.zone, ox, oy, oz - 0.3), ...record.path.map((p) => placeIn(record.zone, p.point[0], p.point[1], p.point[2]))];
+	beam(points, beamMats.shot, 0.05, BEAM_MS);
+	record.path.forEach((p, i) => {
+		if (p.normal !== undefined) spark(points[i + 1]!, sceneNormal(p.normal));
 	});
-	const ball = MeshBuilder.CreateSphere(`shot-${record.id}`, { diameter: 0.35, segments: 6 }, scene);
+	const ball = ballPool.take();
 	ball.material = markerMats.pending;
-	ball.isPickable = false;
-	// Shown when the bolt gets there.
-	ball.isVisible = landed;
-	ball.position.copyFrom(placeIn(record.zone, record.point[0], record.point[1], record.point[2]));
-	const done = () => setTimeout(() => ball.dispose(), 1200);
+	ball.position.copyFrom(points[points.length - 1]!);
+	ball.setEnabled(true);
+	// The verdict and the give-up timer both put it back (only the first counts).
+	let back = false;
+	const release = () => {
+		if (back) return;
+		back = true;
+		ballPool.release(ball);
+	};
+	const done = () => setTimeout(release, 1200);
 	pit.verdict(record.id).then((v) => {
-		ball.material = v.hit !== undefined ? markerMats.hit : markerMats.miss;
-		ball.position.copyFrom(placeIn(record.zone, v.x, v.y, v.z));
+		if (!back) {
+			ball.material = v.hit !== undefined ? markerMats.hit : markerMats.miss;
+			ball.position.copyFrom(placeIn(record.zone, v.x, v.y, v.z));
+		}
+		// The room's own beam, thin: green if it hit.
+		const room = [placeIn(record.zone, ox, oy, oz - 0.3), ...v.path.map((h) => placeIn(record.zone, h.x, h.y, h.z))];
+		if (v.path.length === 0) room.push(placeIn(record.zone, v.x, v.y, v.z));
+		beam(room, v.hit !== undefined ? beamMats.hit : beamMats.miss, 0.02, BEAM_MS * 2);
+		if (v.hit !== undefined) landed(0.3);
 		done();
 	});
-	setTimeout(() => ball.dispose(), 4000);
+	setTimeout(release, 4000);
 }
+// ---- off-screen culling ----
+// Babylon skips drawing what is off screen, but still computes the world
+// matrix and bounds of every enabled mesh, and the frame loop would still
+// place and animate it. An entity wholly outside the view (with a margin)
+// has every mesh disabled and is not updated at all; it snaps to its
+// current state when it comes back.
+const CULL_MARGIN = 1;
+const viewProjection = new Matrix();
+const frustumPlanes: Plane[] = Frustum.GetPlanes(Matrix.IdentityReadOnly);
+/** This frame's view (the eye's rotation is already this frame's; its position lags a frame, which the margin covers). */
+function updateFrustum(): void {
+	const camera = scene.activeCamera;
+	if (camera === null) return;
+	camera.getViewMatrix(true).multiplyToRef(camera.getProjectionMatrix(true), viewProjection);
+	Frustum.GetPlanesToRef(viewProjection, frustumPlanes);
+}
+function onScreen(centre: Vector3, radius: number): boolean {
+	const r = radius + CULL_MARGIN;
+	return frustumPlanes.every((plane) => plane.dotCoordinate(centre) > -r);
+}
+function setCulled(visual: Visual, culled: boolean): void {
+	if (visual.culled === culled) return;
+	visual.culled = culled;
+	// Disabled: off Babylon's active-mesh pass. The bar's fill goes with its
+	// back (the frame re-enables only top-level meshes).
+	if (culled) for (const node of Object.values(visual)) if (node instanceof TransformNode && node.parent === null) node.setEnabled(false);
+	// Back on screen: the bar snaps to the health instead of easing from the old one.
+	else visual.hpShown = Number.NaN;
+}
+/** Per-frame cost of the entity loop and of Babylon's render (CPU), smoothed. */
+const cullStats = { drawn: 0, culled: 0, loopMs: 0, renderMs: 0 };
+const smooth = (avg: number, sample: number) => avg + (sample - avg) * 0.05;
+let renderStart = 0;
+scene.onBeforeRenderObservable.add(() => (renderStart = performance.now()));
+scene.onAfterRenderObservable.add(() => (cullStats.renderMs = smooth(cullStats.renderMs, performance.now() - renderStart)));
+
+// ---- hit feel: hit stop and screen shake ----
+// Drawing only: the rooms simulate everyone at one pace, so a stop freezes
+// the drawn attacker and target and they catch up after it. Input is read
+// and sent throughout; bars, beams and marks keep moving.
+/** How long a hit freezes them (ms): the least, and the most for a big hit. */
+const STOP_MS = [50, 100] as const;
+/** A hit taking this share of health (or more) stops longest and shakes hardest. */
+const BIG_HIT = 0.25;
+const trauma = new Trauma({ x: 0.2, y: 0.14, roll: 0.05 });
+/** A mob this close to you when you are hit is taken as the one that hit you (m). */
+const ATTACKER_NEAR = 5;
+const hitSize = (drop: number) => Math.min(1, drop / BIG_HIT);
+/** Hit stops so far (for tests and the console). */
+let hitStops = 0;
+function hitStop(visual: Visual, size: number): void {
+	hitStops += 1;
+	visual.stopUntil = Math.max(visual.stopUntil, performance.now() + STOP_MS[0] + (STOP_MS[1] - STOP_MS[0]) * size);
+}
+/** Your drawn self (set by the frame loop). */
+let myVisual: PlayerVisual | undefined;
+let mySwing = 0;
+/** One of your hits landed (`size` 0..1): you pause and the view jolts a little. */
+function landed(size: number): void {
+	if (myVisual !== undefined) hitStop(myVisual, size);
+	trauma.add(0.3);
+}
+type Hit = { visual: Visual; size: number };
+/** Hits seen this frame (health drops), attributed once every entity is placed. */
+const hits: Hit[] = [];
+function attributeHits(): void {
+	for (const { visual, size } of hits) {
+		hitStop(visual, size);
+		if (visual === myVisual) {
+			trauma.add(0.3 + 0.3 * size);
+			// The nearest mob is taken as the one that hit you.
+			let nearest: Visual | undefined;
+			let best = ATTACKER_NEAR;
+			for (const other of visuals.values()) {
+				if (other.kind !== 'mob' || other.culled) continue;
+				const d = Vector3.Distance(other.body.position, visual.body.position);
+				if (d < best) [nearest, best] = [other, d];
+			}
+			if (nearest !== undefined) hitStop(nearest, size);
+		} else if (visual.kind === 'mob' && myVisual !== undefined && mySwing > 0) {
+			// Struck while your blade is out and within its reach: yours.
+			if (Vector3.Distance(visual.body.position, myVisual.body.position) < ATTACK_REACH + 1) landed(size);
+		}
+	}
+	hits.length = 0;
+}
+/** Note a hit when `visual`'s health share fell since last frame. */
+function watchHealth(visual: Visual, share: number): void {
+	const drop = visual.lastHp - share;
+	if (drop > 1e-6) hits.push({ visual, size: hitSize(drop) });
+	visual.lastHp = share;
+}
+
 // A crosshair in first person.
 const crosshair = div('pit-crosshair', document.body);
 crosshair.textContent = '+';
@@ -1175,6 +1795,14 @@ stage.onFrame((now, dtMs) => {
 	const seen = new Set<string>();
 	let me: { at: Vector3; hp: number; dead: boolean } | undefined;
 	let stats: PitFields | undefined;
+	const loopStart = performance.now();
+	updateFrustum();
+	// Levels of detail from the camera (its last rendered spot; the band absorbs a frame's move).
+	const eye = scene.activeCamera?.globalPosition ?? Vector3.ZeroReadOnly;
+	lodCounts.fill(0);
+	for (const chunk of chunks.values()) for (const lod of chunk.lods) applyLod(lod, eye);
+	let drawn = 0;
+	let culled = 0;
 	for (const entity of rendered) {
 		if (isPit(entity)) {
 			if (entity.zoneId === here) stats = pitFields(entity);
@@ -1202,29 +1830,71 @@ stage.onFrame((now, dtMs) => {
 				else miniDots.push(dot);
 			}
 		}
+		if (visual.kind === 'mob') watchHealth(visual, mobFields(entity).hp / 100);
+		else {
+			const p = playerFields(entity);
+			watchHealth(visual, p.dead ? 0 : p.hp / PLAYER_HP);
+			if (mine) {
+				myVisual = visual;
+				mySwing = p.swing;
+			}
+		}
+		// Off screen (never your own): nothing to place or animate.
+		if (cullOn && !mine && visible) {
+			const f = visual.kind === 'mob' ? mobFields(entity) : playerFields(entity);
+			const lift = visual.kind === 'mob' ? groundAt(entity.zoneId, f.x, f.y) : 'z' in f ? f.z : 0;
+			const radius = visual.kind === 'mob' ? Math.max(TIERS[visual.tier]?.tele ?? 1, 1.5) : ATTACK_REACH;
+			const out = !onScreen(at(f.x, f.y, lift + 1), radius);
+			setCulled(visual, out);
+			if (out) {
+				culled += 1;
+				continue;
+			}
+		} else setCulled(visual, false);
+		drawn += 1;
 		if (visual.kind === 'mob') {
 			const mob = mobFields(entity);
+			// Hit stop: held where it was (the bar still drains).
+			if (now < visual.stopUntil) {
+				showHp(visual, visual.hpBack.position, mob.hp / 100, dtMs);
+				continue;
+			}
 			const { x, y } = mob;
-			const height = visual.tier === 4 ? 1.4 : visual.tier === 3 ? 1 : visual.tier === 2 ? 0.75 : 0.45;
-			visual.body.position.copyFrom(at(x, y, height));
+			const ground = groundAt(entity.zoneId, x, y);
+			const height = ground + (visual.tier === 4 ? 1.4 : visual.tier === 3 ? 1 : visual.tier === 2 ? 0.75 : 0.45);
+			visual.edge = Math.max(Math.abs(x), Math.abs(y)) > ROOM_SIZE / 2 - CROSS_MATCH;
+			const slide = visual.slide;
+			const k = slide === undefined ? 1 : (now - slide.start) / CROSS_SLIDE_MS;
+			if (slide !== undefined && k < 1) visual.body.position.copyFrom(Vector3.Lerp(slide.from, at(x, y, height), easeOutCubic(k)));
+			else {
+				visual.slide = undefined;
+				visual.body.position.copyFrom(at(x, y, height));
+			}
 			visual.body.rotation.y = -mob.face;
+			if (visual.lod !== undefined) applyLod(visual.lod, eye);
 			const hp = mob.hp / 100;
-			const top = height * 2 + 0.35;
+			const top = height * 2 - ground + 0.35;
 			showHp(visual, at(x, y, top), hp, dtMs);
 			const tele = mob.tele / 255;
 			const winding = mob.state === 2;
 			visual.ring.setEnabled(visible && winding);
 			visual.fill.setEnabled(visible && winding);
 			if (winding) {
-				visual.ring.position.copyFrom(at(x, y, 0.03));
-				visual.fill.position.copyFrom(at(x, y, 0.04));
-				visual.fill.scaling.setAll(Math.max(0.05, tele));
+				const area = slamArea(visual, entity.zoneId, x, y, TIERS[visual.tier]?.tele ?? 1);
+				visual.ring.position.copyFrom(at(x, y, 0));
+				visual.fill.position.copyFrom(at(x, y, 0.01));
+				drape(visual.fill, area, Math.max(0.05, tele));
 			}
 			visual.body.scaling.setAll(winding ? 1 + 0.15 * tele : 1);
 			for (const m of [visual.body, visual.hpBack]) m.setEnabled(visible);
 		} else {
 			const player = playerFields(entity);
 			const { x, y, z, dead, face, swing } = player;
+			if (now < visual.stopUntil) {
+				showHp(visual, visual.hpBack.position, dead ? 0 : player.hp / PLAYER_HP, dtMs);
+				if (mine) me = { at: visual.body.position, hp: player.hp, dead };
+				continue;
+			}
 			visual.body.position.copyFrom(at(x, y, 0.9 + z));
 			visual.body.material = dead ? mats.dead : mine ? mats.me : mats.other;
 			visual.nose.position.copyFrom(at(x + Math.cos(face) * 0.5, y + Math.sin(face) * 0.5, 1.3 + z));
@@ -1254,20 +1924,37 @@ stage.onFrame((now, dtMs) => {
 			if (mine) me = { at: visual.body.position, hp: player.hp, dead };
 		}
 	}
+	attributeHits();
+	cullStats.drawn = drawn;
+	cullStats.culled = culled;
+	cullStats.loopMs = smooth(cullStats.loopMs, performance.now() - loopStart);
 	for (const [key, visual] of visuals) {
 		if (seen.has(key)) continue;
+		// Gone at a side, not killed: it may be crossing (held a moment).
+		if (visual.kind === 'mob' && visual.edge && !visual.culled && !killedAt.has(key)) {
+			crossing.set(key, { visual, until: now + CROSS_HOLD_MS });
+			visuals.delete(key);
+			continue;
+		}
 		dispose(visual);
 		stage.labels.delete(key);
 		visuals.delete(key);
 	}
+	for (const [key, held] of crossing) {
+		if (now < held.until) continue;
+		dispose(held.visual);
+		crossing.delete(key);
+	}
+	for (const [key, at] of killedAt) if (now - at > 2000) killedAt.delete(key);
 	for (const [key, p] of popups) {
-		p.mesh.position.copyFrom(placeIn(p.zone, p.x, p.y, 1.2));
+		p.mesh.position.copyFrom(placeIn(p.zone, p.x, p.y, 1.2 + tween(0, POPUP_RISE, now - p.born, POPUP_RISE_MS)));
 		if (now < p.until) continue;
 		p.mesh.dispose();
 		stage.labels.delete(`popup:${key}`);
 		popups.delete(key);
 	}
 	if (me !== undefined) stage.follow(me.at.x, me.at.z, dtMs, me.at.y - 0.9);
+	stage.shake(trauma.update(dtMs / 1000));
 	crosshair.style.display = stage.view() === 'first' ? '' : 'none';
 	hpRow.style.display = stage.view() === 'first' && me !== undefined ? '' : 'none';
 	if (me !== undefined) {
@@ -1310,6 +1997,10 @@ stage.onFrame((now, dtMs) => {
 	hud.row('Pending inputs', String(predictor?.pending.length ?? 0));
 	hud.row('Ack seq', String(predictor?.lastAck ?? 0));
 	hud.row('Corrections', `${corrections} (last ${lastCorrection.toFixed(3)} m)`);
+	hud.row('Entities drawn / off screen', `${cullStats.drawn} / ${cullStats.culled}`);
+	hud.row('LOD near / mid / far', `${lodCounts[0]} / ${lodCounts[1]} / ${lodCounts[2]}${lodOn ? '' : ' (off: all full)'}`);
+	hud.row('Triangles drawn', String(Math.round(scene.getActiveIndices() / 3)));
+	hud.row('Frame CPU', `entities ${cullStats.loopMs.toFixed(2)} ms · render ${cullStats.renderMs.toFixed(2)} ms`);
 	hud.row('Ghost gap', ghostGap === undefined ? '—' : `${ghostGap.toFixed(2)} m`);
 	const around = [...pit.neighbours().values()];
 	hud.row('Next door', `${around.filter((s) => s === 'watching').length} rooms watched · ${around.filter((s) => s === 'asleep').length} asleep (not woken)`);
@@ -1366,7 +2057,22 @@ declare global {
 		mobpit?: unknown;
 	}
 }
-window.mobpit = { client, api, pitApi, pit, scene, rooms, boards, camera: stage.camera, origin: () => origin };
+window.mobpit = {
+	client,
+	api,
+	pitApi,
+	pit,
+	scene,
+	rooms,
+	boards,
+	camera: stage.camera,
+	origin: () => origin,
+	feel: () => ({
+		trauma: trauma.value,
+		hitStops,
+		pools: Object.fromEntries([beamPool, sparkPool, ballPool].map((p) => [p.name, { size: p.size, active: p.active }]))
+	})
+};
 
 // The same browser is the same player: back in the room you were last in.
 (async () => {

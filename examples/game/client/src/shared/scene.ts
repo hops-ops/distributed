@@ -22,6 +22,7 @@ import type { AbstractMesh } from '@babylonjs/core/Meshes/abstractMesh';
 import type { LinesMesh } from '@babylonjs/core/Meshes/linesMesh';
 import { MeshBuilder } from '@babylonjs/core/Meshes/meshBuilder';
 import { Scene } from '@babylonjs/core/scene';
+import type { Shake } from './feel.ts';
 import { rightStick } from './input.ts';
 // Side effect: scene picking (pointer events) needs Ray.
 import '@babylonjs/core/Culling/ray';
@@ -45,6 +46,8 @@ export type Stage = Readonly<{
 	follow(x: number, y: number, dtMs: number, height?: number): void;
 	/** Register a per-frame callback (after input, before render). */
 	onFrame(callback: (now: number, dtMs: number) => void): void;
+	/** Shake the view this frame: metres sideways and up, radians of roll (screen space). */
+	shake(offset: Shake): void;
 }>;
 
 export type CameraView = 'third' | 'first';
@@ -55,6 +58,9 @@ const LOOK_SPEED = 0.0025;
 /** Gamepad right-stick look rates (rad/s) and deadzone. */
 const STICK_YAW = 2.6;
 const STICK_PITCH = 1.6;
+
+/** The longest frame step animations take (ms). */
+const MAX_FRAME_MS = 50;
 
 export type StageOptions = Readonly<{
 	/** Floor half extent (m). */
@@ -121,15 +127,27 @@ export function createStage(canvas: HTMLCanvasElement, options: StageOptions): S
 
 	const labels = new LabelLayer(canvas, scene);
 	const frameCallbacks: ((now: number, dtMs: number) => void)[] = [];
+	// The shake goes on the view Babylon is about to draw with (after its
+	// camera update), and the clean view is rebuilt after the frame.
+	let shake: Shake = { x: 0, y: 0, roll: 0 };
+	const shaken = new Matrix();
+	scene.onBeforeCameraRenderObservable.add((cam) => {
+		if (shake.x === 0 && shake.y === 0 && shake.roll === 0) return;
+		const view = cam.getViewMatrix();
+		Matrix.RotationZ(shake.roll).multiplyToRef(Matrix.Translation(shake.x, shake.y, 0), shaken);
+		view.multiplyToRef(shaken, view);
+		scene.setTransformMatrix(view, cam.getProjectionMatrix());
+	});
 	let last = performance.now();
 	engine.runRenderLoop(() => {
 		const now = performance.now();
-		const dt = now - last;
+		// Clamped: a stalled tab or a debugger pause never jumps animations.
+		const dt = Math.min(now - last, MAX_FRAME_MS);
 		last = now;
 		// Right stick looks around: turns the eye in first person, orbits in third.
 		const stick = rightStick();
 		if (stick.x !== 0 || stick.y !== 0) {
-			const s = Math.min(dt, 100) / 1000;
+			const s = dt / 1000;
 			if (view === 'first') {
 				yaw += stick.x * STICK_YAW * s;
 				pitch = Math.max(-1.3, Math.min(1.3, pitch - stick.y * STICK_PITCH * s));
@@ -143,7 +161,9 @@ export function createStage(canvas: HTMLCanvasElement, options: StageOptions): S
 		}
 		for (const callback of frameCallbacks) callback(now, dt);
 		scene.render();
+		// Labels project with the shaken view, so they move with the world.
 		labels.update();
+		if (shake.x !== 0 || shake.y !== 0 || shake.roll !== 0) scene.activeCamera?.getViewMatrix(true);
 	});
 	window.addEventListener('resize', () => engine.resize());
 
@@ -190,6 +210,9 @@ export function createStage(canvas: HTMLCanvasElement, options: StageOptions): S
 		},
 		onFrame(callback) {
 			frameCallbacks.push(callback);
+		},
+		shake(offset) {
+			shake = offset;
 		}
 	};
 }
@@ -292,9 +315,14 @@ export class LabelLayer {
 		const viewport = camera.viewport.toGlobal(width, height);
 		const transform = this.#scene.getTransformMatrix();
 		for (const { el, mesh, offset } of this.#labels.values()) {
+			// Disabled (off screen or hidden): no projection.
+			if (!mesh.isEnabled()) {
+				if (el.style.display !== 'none') el.style.display = 'none';
+				continue;
+			}
 			const world = mesh.getAbsolutePosition().add(new Vector3(0, offset, 0));
 			const p = Vector3.Project(world, Matrix.IdentityReadOnly, transform, viewport);
-			const visible = p.z > 0 && p.z < 1 && mesh.isEnabled();
+			const visible = p.z > 0 && p.z < 1;
 			el.style.display = visible ? '' : 'none';
 			if (visible) el.style.transform = `translate(${p.x * scale}px, ${p.y * scale}px) translate(-50%, -100%)`;
 		}

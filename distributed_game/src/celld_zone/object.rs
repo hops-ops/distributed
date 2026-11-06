@@ -834,9 +834,14 @@ impl<Z: CelldZone> Inner<Z> {
 
     /// Players keep a zone awake (also inside their reconnect grace), and
     /// so do near observers; other observers are passive watchers.
+    /// Players here or near, or work the zone says must finish first
+    /// ([`Zone::has_pending_work`], e.g. a crossing between zones), keep it
+    /// ticking (as the native host's tiers do).
     fn occupied(&self) -> bool {
         self.host.as_ref().is_some_and(|h| {
-            h.player_count() > 0 || self.near.iter().any(|c| self.sockets.contains_key(c))
+            h.player_count() > 0
+                || self.near.iter().any(|c| self.sockets.contains_key(c))
+                || h.zone().has_pending_work()
         })
     }
 
@@ -1075,6 +1080,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let path = req.url()?.path().to_string();
         if req.method() == Method::Post && path.ends_with(&format!("/{PUSH_ROUTE}")) {
             return self.take_push(req).await;
+        }
+        if req.method() == Method::Post
+            && path.ends_with(&format!("/{}", super::ZONE_MESSAGE_ROUTE))
+        {
+            return self.take_zone_message(req).await;
         }
         if path.ends_with("/info") {
             // Debug JSON without secrets; pages on other origins may read it.
@@ -1639,6 +1649,59 @@ impl<Z: CelldZone> ZoneObject<Z> {
     /// A pushed update (`POST …/__world`, internal secret): applied when
     /// the zone is in memory and watches the topic; a sleeping zone
     /// hydrates on wake instead (a push never wakes it).
+    /// A message from another zone object ([`crate::zone_message`]):
+    /// internal secret only; refused (409) while the zone is not running,
+    /// so it never wakes one.
+    async fn take_zone_message(&self, mut req: Request) -> Result<Response> {
+        if let Err(error) = super::cells::authenticate(&req, self.env.env()) {
+            return super::cells::error_response(error);
+        }
+        let Ok(envelope) = req.json::<crate::zone_message::ZoneEnvelope>().await else {
+            return Response::error("a zone message is required", 400);
+        };
+        let mut inner = self.inner.borrow_mut();
+        let Some(host) = inner.host.as_mut() else {
+            return Response::error("zone asleep", 409);
+        };
+        let delivered = host.deliver_zone(envelope);
+        inner.flush();
+        match delivered {
+            Ok(()) => Response::empty().map(|r| r.with_status(204)),
+            Err(crate::zone_message::ZoneMessageError::Duplicate) => {
+                Response::empty().map(|r| r.with_status(204))
+            }
+            Err(e) => Response::error(e.to_string(), 409),
+        }
+    }
+
+    /// Post the zone messages the tick sent to their target objects (same
+    /// class), off the tick. Best effort: a refused or failed one is
+    /// dropped (protocols that must not lose state carry their own acks).
+    fn send_zone_messages(&self, messages: Vec<crate::zone_message::ZoneEnvelope>) {
+        if messages.is_empty() {
+            return;
+        }
+        if self.binding.is_empty() {
+            worker::console_error!("zone messages need the object's class binding (of_class)");
+            return;
+        }
+        for envelope in messages {
+            let env = self.env.env().clone();
+            let binding = self.binding.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match super::cells::send_zone_message(&env, &binding, &envelope).await {
+                    Ok(204) => {}
+                    Ok(status) => worker::console_log!(
+                        "zone message {} to {} refused: {status}",
+                        envelope.id,
+                        envelope.to
+                    ),
+                    Err(e) => worker::console_error!("zone message to {}: {e}", envelope.to),
+                }
+            });
+        }
+    }
+
     async fn take_push(&self, mut req: Request) -> Result<Response> {
         if let Err(error) = super::cells::authenticate(&req, self.env.env()) {
             return super::cells::error_response(error);
@@ -2024,7 +2087,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             .await;
             let woke = now_ms();
             let late = schedule.woke(woke);
-            let (stop, persist) = {
+            let (stop, persist, mail) = {
                 let mut inner = self.inner.borrow_mut();
                 let Some(host) = inner.host.as_mut() else {
                     inner.ticking = false;
@@ -2038,6 +2101,11 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 }
                 inner.players_seen = players;
                 inner.flush();
+                let mail = inner
+                    .host
+                    .as_mut()
+                    .map(ZoneHost::take_zone_messages)
+                    .unwrap_or_default();
                 let stats = &mut inner.stats;
                 stats.iterations += 1;
                 stats.late.push(late);
@@ -2057,8 +2125,9 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 if stop {
                     inner.ticking = false;
                 }
-                (stop, persist)
+                (stop, persist, mail)
             };
+            self.send_zone_messages(mail);
             // Storage stays off the loop: the simulation keeps its pace
             // while a write waits on the bucket.
             self.spool_later();

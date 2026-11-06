@@ -142,10 +142,40 @@ pub fn advance(s: MoveState, input: MoveInput) -> MoveState {
     advance_among(s, input, &PILLARS)
 }
 
+/// How fast velocity moves toward the stick's (m/s²): speeding up along
+/// it, stopping with the stick let go, and turning against the current
+/// velocity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rates {
+    /// Toward the stick's velocity.
+    pub accel: f32,
+    /// To a stop, no direction held.
+    pub decel: f32,
+    /// The stick against the current velocity.
+    pub reverse: f32,
+}
+
+/// The Arena's: one rate for all three.
+pub const ARENA_RATES: Rates = Rates {
+    accel: ACCEL,
+    decel: ACCEL,
+    reverse: ACCEL,
+};
+
 /// [`advance`] among round obstacles `(x, y, radius)`: the part Mob Pit
 /// shares (its rooms have seeded obstacles and doorways in the walls, see
 /// `mobpit::pit_step`).
 pub fn advance_among(s: MoveState, input: MoveInput, obstacles: &[(f32, f32, f32)]) -> MoveState {
+    advance_with(s, input, obstacles, ARENA_RATES)
+}
+
+/// [`advance_among`] with velocity moving toward the stick's at `rates`.
+pub fn advance_with(
+    s: MoveState,
+    input: MoveInput,
+    obstacles: &[(f32, f32, f32)],
+    rates: Rates,
+) -> MoveState {
     let mut s = s;
     // Stick direction, length clamped to 1.
     let mut dx = f32::from(input.mx) / 127.0;
@@ -184,7 +214,14 @@ pub fn advance_among(s: MoveState, input: MoveInput, obstacles: &[(f32, f32, f32
         let ex = dx * MAX_SPEED - s.vx;
         let ey = dy * MAX_SPEED - s.vy;
         let e2 = ex * ex + ey * ey;
-        let max_dv = ACCEL * DT;
+        let rate = if l2 <= 0.0001 {
+            rates.decel
+        } else if dx * s.vx + dy * s.vy < 0.0 {
+            rates.reverse
+        } else {
+            rates.accel
+        };
+        let max_dv = rate * DT;
         if e2 > max_dv * max_dv {
             let k = max_dv / e2.sqrt();
             s.vx += ex * k;

@@ -35,7 +35,6 @@ spec:
           memory: 128Mi
   values:
     podLabels:
-      sidecar.istio.io/inject: "true"
-    podAnnotations:
-      # celld reaches RustFS as it starts.
-      proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
+      # Ambient mesh: istio-cni redirects traffic before containers start,
+      # so celld can reach RustFS immediately; no sidecar to wait for.
+      istio.io/dataplane-mode: ambient
