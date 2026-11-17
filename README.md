@@ -2,75 +2,7 @@
 
 **Distributed** is an end-to-end fullstack framework for building distributed systems and realtime applications with CQRS and Event Sourcing, with generated GraphQL query APIs over rust defined Read Models with RBAC, and automatic client side optimism via generated command clients and client side replica cache.
 
-## How it works
-
-Write the domain once, compose it into one `Service` or several, then
-generate the client. Each stage below uses real code from
-[`tests/e2e-ui`](tests/e2e-ui).
-
-```mermaid
-sequenceDiagram
-    actor Author
-    participant Build as distributed build + Vite
-    participant Kit as SvelteKit
-    participant API as GraphQL gateway
-    participant Domain as Command handler + aggregate
-    participant Projector as Projection worker
-    participant DB as Read-model database
-    participant Replica as Browser replica
-
-    rect rgb(245, 247, 255)
-        Note over Author,Replica: Generate one application from authored Rust and page GraphQL
-        Author->>Build: Domain crates: commands, events, command RBAC
-        Author->>Build: Read-model crates: query shapes, relationships, read RBAC
-        Author->>Build: Projections: event → internal read-model mutation
-        Author->>Build: Page, layout, or component .graphql: @load and optional @live
-        Build-->>API: Command + query/subscription surfaces with RBAC
-        Build-->>Projector: Server projection programs
-        Build-->>Kit: Island boundaries, live operations, typed commands, replica plans
-        Build-->>Replica: Optimistic projection programs + declared Rust/WASM pures
-    end
-
-    rect rgb(245, 255, 247)
-        Note over Kit,Replica: Initial page render — @load
-        Kit->>API: Authorized @load query (SSR or navigation)
-        API->>DB: Read the authorized model slice
-        DB-->>API: Rows + identities + revisions
-        API-->>Kit: Query result
-        Kit->>Replica: Normalize, dehydrate, hydrate + server authority
-        Note right of Replica: Browser does not repeat the first query
-        Replica-->>Kit: Reactive confirmed snapshot
-    end
-
-    rect rgb(255, 251, 240)
-        Note over Kit,Replica: Ongoing page updates — @live
-        Kit->>Replica: Generated operation attaches live automatically
-        Replica->>API: Subscribe with the same query + variables
-    end
-
-    rect rgb(255, 245, 250)
-        Note over Kit,Replica: Write path — public domain command, never public model mutation
-        Kit->>Replica: Generated typed command + input
-        Replica-->>Kit: Apply predicted projection immediately
-        Replica->>API: Authorized domain command
-        API->>Domain: Execute command
-        Domain-->>Projector: Commit domain event
-        Projector->>DB: Apply internal projection mutation
-        DB-->>API: Publish committed read-model change
-        API-->>Replica: @live records + causal clocks
-        Replica-->>Kit: Confirm or reconcile the optimistic snapshot
-        Note over Projector,Replica: The generated projection protocol drives both server updates and browser optimism
-    end
-```
-
-Co-located GraphQL documents are part of the application contract. An `@load`
-operation may belong to a page, a layout, or a reusable component. The compiler
-promotes it to the nearest static SvelteKit boundary, emits one variable-binding
-plan, and uses that plan for SSR, hydration, navigation, prefetch, and component
-reads. `@live` retains the same operation as a subscription for the lifetime of
-that boundary. Public writes still use domain commands. Projection mutation
-programs stay internal and provide the shared server-update and
-optimistic-replica protocol.
+## Principles
 
 ### 01 · Unidirectional
 
