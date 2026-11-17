@@ -297,6 +297,11 @@ pub trait SqlxRepoBackend: SqlxReadModelBackend {
         5
     }
 
+    /// Backend-specific settings for a pool opened from a database URL.
+    fn pool_options(options: sqlx::pool::PoolOptions<Self>) -> sqlx::pool::PoolOptions<Self> {
+        options
+    }
+
     /// Whether a `sqlx::Error` is this backend's unique-violation error.
     fn is_unique_violation(err: &sqlx::Error) -> bool;
 

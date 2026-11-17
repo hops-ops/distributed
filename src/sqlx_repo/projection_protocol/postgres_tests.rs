@@ -25,6 +25,32 @@ mod postgres_tests {
     static POSTGRES_PROJECTION_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
 
+    /// A request dropped while `begin` waits for the server must not hand
+    /// the next read snapshot a connection that is already in a transaction.
+    #[tokio::test]
+    async fn postgres_cancelled_begin_does_not_poison_the_next_read_snapshot() {
+        let Ok(url) = std::env::var("DISTRIBUTED_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = <sqlx::Postgres as crate::sqlx_repo::repo::SqlxRepoBackend>::pool_options(
+            sqlx::postgres::PgPoolOptions::new().max_connections(1),
+        )
+        .connect(&url)
+        .await
+        .unwrap();
+        for micros in (0..3000).step_by(10) {
+            let cancelled = std::time::Duration::from_micros(micros);
+            let _ = tokio::time::timeout(cancelled, pool.begin()).await;
+            sqlx::query("SELECT 1").execute(&pool).await.unwrap();
+            let mut snapshot = pool.begin().await.unwrap();
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *snapshot)
+                .await
+                .unwrap_or_else(|error| panic!("begin cancelled at {micros}us: {error}"));
+            snapshot.rollback().await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn postgres_redelivery_identity_is_atomic_across_partition_and_cursor_races() {
         let Ok(url) = std::env::var("DISTRIBUTED_TEST_POSTGRES_URL") else {
