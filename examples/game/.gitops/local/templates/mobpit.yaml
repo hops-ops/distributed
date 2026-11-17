@@ -36,6 +36,17 @@ spec:
             - -c
             - |
               set -euo pipefail
+              # The typed game client is a build output (gitignored): generate
+              # it from the Rust surface before serving. The ui container's
+              # Node image has no cargo, so its Vite plugin leaves this to us.
+              distributed() {
+                cargo run --locked --quiet --manifest-path {{ $repo }}/Cargo.toml \
+                  -p distributed_cli --bin distributed -- "$@"
+              }
+              distributed game-manifest --manifest-path Cargo.toml \
+                --entrypoint game_demos::mobpit::game_surface --out /tmp/mobpit.json
+              distributed game-client --manifest /tmp/mobpit.json \
+                --out {{ $game }}/client/src/generated/mobpit
               exec cargo run --locked --bin game-demos -- mobpit --dev --host 0.0.0.0 --port 2567
           env:
             - name: CARGO_TARGET_DIR
@@ -79,6 +90,9 @@ spec:
             # Edits arrive through the host mount; inotify does not see them.
             - name: CHOKIDAR_USEPOLLING
               value: "true"
+            # No cargo here: the services container generates the game client.
+            - name: GAME_CODEGEN
+              value: external
           volumeMounts:
             - {name: source, mountPath: {{ $repo }}}
             # Linux packages, not the host's.

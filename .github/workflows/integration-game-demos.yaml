@@ -2,7 +2,8 @@ name: Game demos smoke
 
 # Reusable workflow: referenced via `uses: ./.github/workflows/integration-game-demos.yaml`.
 # `examples/game` is outside the root workspace, so nothing else runs its tests:
-# generated clients current (`gen --check`), demo server fmt/clippy/tests
+# game clients generated from the Rust surfaces (build outputs, never
+# checked in; `gen --check` verifies determinism), demo server fmt/clippy/tests
 # (incl. the mobpit_service projection test), client type-check, build and
 # headless tests, and the SvelteKit demo end to end: `distributed build
 # examples/game/server` (GraphQL client, svelte-check, vite build), then

@@ -1,5 +1,6 @@
 node_modules/
 .svelte-kit/
 build/
-# Compiled predicted step (`distributed game-wasm`, built by the Vite plugin)
-src/lib/generated/*/wasm/
+# Generated game clients + WASM (`distributed game-client`/`game-wasm`), built
+# from the Rust surfaces by the Vite plugin and scripts/games.mjs.
+src/lib/generated/
