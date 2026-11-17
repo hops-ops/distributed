@@ -271,7 +271,8 @@
 			client,
 			watch,
 			() => wakeRooms,
-			(near) => (nearRooms = [...near])
+			(near) => (nearRooms = [...near]),
+			() => hello.current?.seed
 		);
 		return () => {
 			stopWake();

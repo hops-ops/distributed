@@ -76,11 +76,15 @@ export function startProximityWake(
 	client: GameClient<PitInput>,
 	watch: ZoneWatch,
 	enabled: () => boolean,
-	onChange: (near: readonly string[]) => void
+	onChange: (near: readonly string[]) => void,
+	seed: () => number | undefined = () => undefined
 ): () => void {
 	const pures = createMobpitPures();
 	let room: string | undefined;
 	let bits = 0;
+	// The current room's open sides (`pit_room`), once per seed and room.
+	let openKey = '';
+	let open = 0;
 	let near: string[] = [];
 	const timer = setInterval(() => {
 		const zone = client.authority?.zoneId;
@@ -99,7 +103,14 @@ export function startProximityWake(
 		let next = 0;
 		if (enabled() && at !== undefined && me !== undefined && pures.loaded()) {
 			const p = playerFields(me);
-			next = pures.roomsInReach({ x: p.x, y: p.y, near: bits }).near;
+			// Reach runs to the whole of an open side (its layout, once per room).
+			const worldSeed = seed() ?? PIT_WORLD.defaultSeed;
+			const key = `${worldSeed}:${zone}`;
+			if (openKey !== key) {
+				openKey = key;
+				open = pures.pitRoom({ seed: worldSeed, x: at[0], y: at[1] }).open;
+			}
+			next = pures.roomsInReach({ x: p.x, y: p.y, near: bits, open }).near;
 		}
 		bits = next;
 		const rooms = at === undefined ? [] : reachRooms(at, next);
