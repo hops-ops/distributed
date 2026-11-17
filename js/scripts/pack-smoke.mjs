@@ -80,6 +80,7 @@ function inspectPackageContract(packageJson) {
 		'.',
 		'./diagnostics',
 		'./game',
+		'./game/vite',
 		'./package.json',
 		'./react',
 		'./replica',

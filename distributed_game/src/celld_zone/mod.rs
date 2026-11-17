@@ -134,7 +134,7 @@ mod object;
 pub use plan::{
     cell_binding, ObjectOptions, RoomState, StoredFact, TickSchedule, CLOSE_RESTARTED,
     CONTENT_ROLLOUT_VAR, DEV_SETTINGS_VAR, NETSIM_SHARD, UPDATE_RATES_VAR, WORLD_PUSH_VAR,
-    ZONE_DEV_KIND, ZONE_HEADER,
+    ZONE_DEV_KIND, ZONE_HEADER, ZONE_MESSAGE_ROUTE,
 };
 
 #[cfg(target_arch = "wasm32")]

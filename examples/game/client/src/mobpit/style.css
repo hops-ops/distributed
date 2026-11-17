@@ -1,3 +1,9 @@
+/* Easing (shared/feel.ts has the same curves for code). */
+:root {
+	--ease-out-cubic: cubic-bezier(0.33, 1, 0.68, 1);
+	--ease-out-back: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
 /* Mob Pit panels (layered over the shared HUD/stage styles). */
 .pit-xp {
 	position: fixed;
@@ -27,7 +33,7 @@
 	height: 100%;
 	width: 100%;
 	background: #4caf50;
-	transition: width 0.15s ease;
+	transition: width 0.3s var(--ease-out-cubic);
 }
 .pit-hp-fill.mid {
 	background: #f2c94c;
@@ -49,7 +55,7 @@
 	height: 100%;
 	width: 0;
 	background: linear-gradient(90deg, #f2c94c, #f2a65a);
-	transition: width 0.3s ease;
+	transition: width 0.3s var(--ease-out-cubic);
 }
 .pit-facts {
 	position: fixed;
@@ -118,9 +124,17 @@
 	border-radius: 8px;
 	background: rgba(120, 20, 20, 0.85);
 	font-size: 18px;
+	animation: pit-pop-in 0.3s var(--ease-out-back);
 }
 .label.pit-pop {
 	font-weight: bold;
+	/* `scale`, not `transform`: the label layer owns transform. */
+	animation: pit-pop-in 0.3s var(--ease-out-back);
+}
+@keyframes pit-pop-in {
+	from {
+		scale: 0.4;
+	}
 }
 .label.pit-pop.pending {
 	color: #b9c0cc;
@@ -211,6 +225,13 @@
 	background: #1f3a4d;
 	color: #e8f4ff;
 	box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+	animation: pit-toast-in 0.3s var(--ease-out-cubic);
+}
+@keyframes pit-toast-in {
+	from {
+		translate: 0 -16px;
+		opacity: 0;
+	}
 }
 .label.door {
 	color: #4dd0e1;

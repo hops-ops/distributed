@@ -455,11 +455,27 @@ export const distributedViteOptions = {
 // vite.config.ts: plugins: [distributedSvelteKit(distributedViteOptions), sveltekit()]
 ```
 
-Commit the generated TypeScript (keep `wasm/` ignored) and check it in CI
-with `checkDistributedGames(distributedViteOptions)` from
-`@hops-ops/distributed/sveltekit/vite` (`game-client --check`, never writes;
-`generateDistributedGames` runs the full pipeline once). `command` /
-`commandArgs` choose the CLI exactly as for GraphQL clients.
+Generated game clients are build outputs, like the GraphQL clients: gitignore
+the whole `out` directory (TypeScript and `wasm/`) and never commit it, so it
+cannot drift from the Rust surface. Anything that type-checks before Vite
+runs (`svelte-check`, `tsc`) generates first with
+`generateDistributedGames(distributedViteOptions)` from
+`@hops-ops/distributed/sveltekit/vite` (the full pipeline once), e.g. a
+`scripts/games.mjs` run by your `check` script. `checkDistributedGames`
+(`game-client --check`, never writes) after a generation verifies it is
+deterministic. `command` / `commandArgs` choose the CLI exactly as for
+GraphQL clients.
+
+Outside SvelteKit, any Vite app uses `@hops-ops/distributed/game/vite`:
+`distributedGames({ cwd, command, commandArgs, games })` is the same
+games-only plugin, with `generateDistributedGames` / `checkDistributedGames`
+taking the same options:
+
+```ts
+// vite.config.ts
+import { distributedGames } from '@hops-ops/distributed/game/vite';
+export default defineConfig({ plugins: [distributedGames({ games: [/* … */] })] });
+```
 
 **2. Session-bound tickets** (`@hops-ops/distributed/sveltekit/game/server`,
 server-only). The route mints the zone server's HS256 admission ticket

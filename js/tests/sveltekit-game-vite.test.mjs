@@ -17,6 +17,7 @@ import {
 	distributedSvelteKit as distributedSvelteKitPublic,
 	generateDistributedGames
 } from '../dist/sveltekit/public-vite.js';
+import * as gameVite from '../dist/game/vite.js';
 
 const FAKE = String.raw`
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -295,5 +296,27 @@ test('games-free configuration still requires the lifecycle and a surface', asyn
 		await assert.rejects(plugin.configResolved({ root: tmpdir() }), /at least one client or game surface/);
 	} finally {
 		if (previous !== undefined) process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE = previous;
+	}
+});
+
+test('@hops-ops/distributed/game/vite: games-only plugin for any Vite app, no lifecycle', async () => {
+	const f = await fixture();
+	const owned = process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE;
+	delete process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE;
+	try {
+		const options = f.options();
+		assert.throws(() => gameVite.distributedGames({ ...options, games: [] }), /at least one game surface/);
+		assert.throws(() => gameVite.distributedGames({ cwd: f.app }), /requires a `games` array/);
+		// GraphQL clients are not accepted here, so the lifecycle is never required.
+		const plugin = gameVite.distributedGames({ ...options, clients: [{ module: '$distributed' }] });
+		assert.equal(typeof plugin.name, 'string');
+
+		assert.equal(await gameVite.generateDistributedGames(options), true);
+		assert.match(await readFile(join(f.out, 'index.ts'), 'utf8'), /zone v1/);
+		// Determinism check right after a generation passes and never writes.
+		await gameVite.checkDistributedGames(options);
+	} finally {
+		if (owned !== undefined) process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE = owned;
+		await rm(f.root, { recursive: true, force: true });
 	}
 });

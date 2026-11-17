@@ -42,6 +42,10 @@
 //!   fenced ownership, hibernation snapshots, zone hierarchy with tier-up
 //!   events, handoff with carried state ([`handoff`]) and the content
 //!   barrier / safe-room policy.
+//! - Zone to zone ([`zone_message`], [`lease`]): typed messages between
+//!   running zones with verified principals, and leases for lending an
+//!   entity (a chasing mob) to the zone next door without losing or
+//!   duplicating it.
 //!
 //! # Extension seams (later phases)
 //! Metrics hook [`AdvanceReport`] and [`replication::DeltaStats`]; plain
@@ -75,6 +79,7 @@ pub mod host;
 pub mod inbox;
 pub mod input;
 pub mod interest;
+pub mod lease;
 pub mod lifecycle;
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -101,6 +106,7 @@ pub mod timestep;
 pub mod work;
 pub mod world;
 pub mod zone;
+pub mod zone_message;
 
 pub use authoring::{GameEvent, GameInput, Pushed, Replicated};
 pub use claims::{ExtensionError, ExtensionSchema, TicketExtension, TicketExtensions};
@@ -120,6 +126,7 @@ pub use facts::{
     RetryPolicy, SettlementScript,
 };
 pub use handoff::{HandoffError, HandoffRequest, Transfer};
+pub use lease::{Held, LeaseTimings, Lent, TransferId, TransferIds};
 pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};
 pub use inbox::{Delivered, NoMessages, ZoneInbound};
 pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, SequencedInput};
@@ -142,6 +149,7 @@ pub use zone::{
     Admission, ClientId, JoinRequest, LeaveReason, ObserverId, ObserverInfo, PlayerId, PlayerInfo,
     TicketClaims, Tier, Viewer, Zone,
 };
+pub use zone_message::{VerifiedPrincipal, ZoneEnvelope, ZoneMessageError, ZoneSender};
 
 /// Paths used by derive-generated code. Not public API.
 #[doc(hidden)]

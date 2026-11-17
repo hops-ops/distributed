@@ -50,6 +50,27 @@ function parseRoom(zone: string | undefined): [number, number] | undefined {
 }
 
 /** The doorway neighbours of `room` behind `near` bits (`rooms_in_reach`: east, west, north, south). */
+/** Side (`MobView.from >> 16`) → step from a visitor's room to its home room. */
+const HOME_STEP: Readonly<Record<number, readonly [number, number]>> = { 1: [1, 0], 2: [-1, 0], 3: [0, 1], 4: [0, -1] };
+
+/**
+ * Rooms stream independently, so while a mob crosses, a viewer watching
+ * both rooms can briefly still hold its home copy after the visitor shows
+ * up. A visitor names that copy (`from`): draw the visitor, drop the copy.
+ */
+export function withoutHomeCopies<T extends RenderedEntity>(rendered: readonly T[]): T[] {
+	const hidden = new Set<string>();
+	for (const e of rendered) {
+		if (!isMob(e) || e.stale) continue;
+		const from = mobFields(e).from;
+		const step = HOME_STEP[from >>> 16];
+		const room = parseRoom(e.zoneId);
+		if (step === undefined || room === undefined) continue;
+		hidden.add(`pit.${room[0] + step[0]}.${room[1] + step[1]}:${from & 0xffff}`);
+	}
+	return hidden.size === 0 ? [...rendered] : rendered.filter((e) => !(isMob(e) && hidden.has(e.key)));
+}
+
 export function reachRooms(room: readonly [number, number], near: number): string[] {
 	const doors: [number, [number, number]][] = [
 		[1, [1, 0]],
@@ -76,11 +97,15 @@ export function startProximityWake(
 	client: GameClient<PitInput>,
 	watch: ZoneWatch,
 	enabled: () => boolean,
-	onChange: (near: readonly string[]) => void
+	onChange: (near: readonly string[]) => void,
+	seed: () => number | undefined = () => undefined
 ): () => void {
 	const pures = createMobpitPures();
 	let room: string | undefined;
 	let bits = 0;
+	// The current room's open sides (`pit_room`), once per seed and room.
+	let openKey = '';
+	let open = 0;
 	let near: string[] = [];
 	const timer = setInterval(() => {
 		const zone = client.authority?.zoneId;
@@ -99,7 +124,14 @@ export function startProximityWake(
 		let next = 0;
 		if (enabled() && at !== undefined && me !== undefined && pures.loaded()) {
 			const p = playerFields(me);
-			next = pures.roomsInReach({ x: p.x, y: p.y, near: bits }).near;
+			// Reach runs to the whole of an open side (its layout, once per room).
+			const worldSeed = seed() ?? PIT_WORLD.defaultSeed;
+			const key = `${worldSeed}:${zone}`;
+			if (openKey !== key) {
+				openKey = key;
+				open = pures.pitRoom({ seed: worldSeed, x: at[0], y: at[1] }).open;
+			}
+			next = pures.roomsInReach({ x: p.x, y: p.y, near: bits, open }).near;
 		}
 		bits = next;
 		const rooms = at === undefined ? [] : reachRooms(at, next);
@@ -381,7 +413,8 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 		const room = client.authority?.zoneId;
 		if (room !== undefined) canvas.dataset.room = room;
 		const here = parseRoom(room);
-		const rendered = client.render();
+		// One copy of a mob crossing between two watched rooms.
+		const rendered = withoutHomeCopies(client.render());
 		// Yours: predicted, or the SDK's hold of it during a doorway handoff.
 		const mine = (e: RenderedEntity) => isPlayer(e) && (e.predicted || (e.id === hello?.entity && e.zoneId === room));
 		const meEntity = rendered.find((e) => mine(e) && e.predicted) ?? rendered.find(mine);

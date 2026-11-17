@@ -224,12 +224,20 @@ try {
     assert.equal(before.armed.length, 1);
     await crash();
     await delay(4_000);
+    const restartedAt = Date.now();
     await start();
     const fired = await until("overdue alarm after restart", async () => {
       const current = await state(id);
       return current.ticks >= 1 && current;
     }, 30_000);
-    assert.equal(fired.ticks, 1);
+    // The first read after the restart can come late (celld warming up on
+    // a slow runner): the overdue fire and its re-arm a period (3 s) later
+    // may both be in. Two ticks sooner than a period is a duplicate.
+    const sinceRestart = Date.now() - restartedAt;
+    assert.ok(
+      fired.ticks === 1 || (fired.ticks === 2 && sinceRestart >= 3_000),
+      `first read after restart: ${fired.ticks} ticks ${sinceRestart} ms after it`,
+    );
     const second = await until("re-armed alarm after restart", async () => {
       const current = await state(id);
       return current.ticks >= 2 && current;

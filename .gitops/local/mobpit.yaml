@@ -2,7 +2,8 @@ apiVersion: hops.local/v1alpha1
 kind: Environment
 metadata:
   # Template name; the runtime name and namespace come from the checkout
-  # (e.g. distributed-mobpit-world → https://distributed-mobpit-world.gitkb.localhost).
+  # (e.g. distributed-mobpit-world). The browser host is the chart's `host`
+  # value (https://mobpit.localhost).
   name: mobpit
 spec:
   clusterRef:

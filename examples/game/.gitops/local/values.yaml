@@ -1,6 +1,10 @@
 # Hops injects: local, localDomain, environment.{name,namespace},
 # source.{localPath,path,type} (localPath = examples/game in this checkout).
 
+# Browser hostname (HTTPRoute, PUBLIC_ORIGIN). Empty gives
+# <environment>.<localDomain>.
+host: mobpit.localhost
+
 # The mobpit-system celld fleet.
 celld:
   url: http://celld.mobpit-celld.svc.cluster.local:8080
@@ -10,6 +14,12 @@ celld:
 # Players a room admits; empty keeps the game's 32 (load tests raise it).
 rooms:
   maxPlayers: ""
+
+# Extra cells-worker vars, e.g. the load test's A/B switches
+# (`ZONE_WORLD_PUSH: "0"`, `ZONE_FACT_BATCH: "1"`, `ZONE_UPDATE_RATES: "0"`).
+# Empty keeps the game's defaults.
+worker:
+  vars: {}
 
 images:
   rust: rust:1.99-bookworm

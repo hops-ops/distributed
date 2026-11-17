@@ -336,6 +336,19 @@ pub trait Zone: Sized + Send + 'static {
     /// by the host and never reaches this hook.
     fn on_message(&mut self, _ctx: &mut Ctx<'_, Self>, _message: Self::Message) {}
 
+    /// A message from another zone ([`crate::zone_message`]), delivered on
+    /// the zone's task between ticks, at most once. `from` names the zone
+    /// and, for a message sent on behalf of a player, its verified
+    /// principal. Trusted internal input, but check what it claims against
+    /// your own state (a neighbour, a position on the shared boundary).
+    fn on_zone_message(
+        &mut self,
+        _ctx: &mut Ctx<'_, Self>,
+        _from: &crate::zone_message::ZoneSender,
+        _message: Self::Message,
+    ) {
+    }
+
     /// A timer fired (before `on_tick` of the same tick).
     fn on_timer(&mut self, _ctx: &mut Ctx<'_, Self>, _id: TimerId, _timer: Self::Timer) {}
 

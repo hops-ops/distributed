@@ -32,6 +32,19 @@ const FAST_ROOMS = { ZONE_DORMANT_AFTER_MS: '1000', ZONE_HIBERNATE_AFTER_MS: '15
  * and starts it again on its state (rooms, cells); `stop()` stops both.
  */
 export async function startPit(demo = 'mobpit', vars = {}) {
+	// `freePort` releases the port before the services bind it, so a test
+	// file running alongside can take it first: start again on a new one.
+	for (let attempt = 1; ; attempt += 1) {
+		try {
+			return await startPitOnce(demo, vars);
+		} catch (error) {
+			if (attempt >= 3 || !/exited with/.test(String(error?.message))) throw error;
+			console.error(`startPit: ${error.message} (attempt ${attempt}); retrying on a new port`);
+		}
+	}
+}
+
+async function startPitOnce(demo, vars) {
 	const port = await freePort();
 	const celld = await startCelld({ relayPort: port, vars: { ...FAST_ROOMS, ...vars } });
 	const env = { ...celld.env, MOBPIT_DATA_DIR: tempDataDir(), DG_DEMO_ADMIN_SECRET: ADMIN_SECRET };
@@ -145,9 +158,10 @@ export async function walkTo(pit, obstacles, [tx, ty], seen = { max: 0 }, timeou
  * Walk to the doorway on side `[dx, dy]` and through it (one command frame
  * per tick) until the client's authority is the next room and the own
  * player is predicted there again. Returns the new room and the own world
- * position sampled every frame on the way (`{ t, room, x, y }`).
+ * position sampled every frame on the way (`{ t, room, x, y }`). `along`
+ * is how far off the side's middle to cross (an open side: anywhere).
  */
-export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000) {
+export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000, along = 1.7) {
 	const { client } = pit;
 	const from = pit.room();
 	const deadline = Date.now() + timeoutMs;
@@ -157,15 +171,15 @@ export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000) {
 		if (Date.now() > deadline) throw new Error(`walk through door ${dx},${dy} timed out`);
 		const me = pit.me();
 		const at = pit.position();
-		if (at !== undefined) trace.push({ t: Date.now(), room: me.zoneId, predicted: me.predicted, ...at });
+		if (at !== undefined) trace.push({ t: Date.now(), room: me.zoneId, predicted: me.predicted, dead: playerFields(me).dead, ...at });
 		let input = { mx: 0, my: 0, buttons: 0 };
 		if (at !== undefined) {
 			// Beside the pillar on the door's axis, through the gap, and on
 			// into the next room (world coordinates: the rooms are one world).
 			const [rx, ry] = from.split('.').slice(1).map(Number);
 			const size = 2 * 20;
-			const tx = rx * size + (dx !== 0 ? dx * 24 : 1.7);
-			const ty = ry * size + (dy !== 0 ? dy * 24 : 1.7);
+			const tx = rx * size + (dx !== 0 ? dx * 24 : along);
+			const ty = ry * size + (dy !== 0 ? dy * 24 : along);
 			const ddx = tx - at.x;
 			const ddy = ty - at.y;
 			const len = Math.max(Math.hypot(ddx, ddy), 1e-3);
@@ -177,10 +191,11 @@ export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000) {
 	return { room: pit.room(), trace };
 }
 
-/** Largest move (m) between consecutive samples of a `walkThroughDoor` trace. */
+/** Largest move (m) between consecutive samples of a `walkThroughDoor` trace (a death's respawn is no step). */
 export function largestStep(trace) {
 	let max = 0;
 	for (let i = 1; i < trace.length; i += 1) {
+		if (trace[i].dead || trace[i - 1].dead) continue;
 		max = Math.max(max, Math.hypot(trace[i].x - trace[i - 1].x, trace[i].y - trace[i - 1].y));
 	}
 	return max;

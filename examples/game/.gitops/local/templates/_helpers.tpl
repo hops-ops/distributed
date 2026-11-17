@@ -8,7 +8,7 @@
 {{- end -}}
 
 {{- define "mobpit.host" -}}
-{{- printf "%s.%s" .Values.environment.name .Values.localDomain -}}
+{{- .Values.host | default (printf "%s.%s" .Values.environment.name .Values.localDomain) -}}
 {{- end -}}
 
 {{- define "mobpit.relayUrl" -}}

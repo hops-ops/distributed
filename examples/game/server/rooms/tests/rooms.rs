@@ -531,7 +531,7 @@ fn a_jump_clears_a_mobs_slam() {
 }
 
 #[test]
-fn an_arrow_hits_the_mob_it_was_aimed_at_and_obstacles_stop_it() {
+fn a_laser_hits_the_mob_it_was_aimed_at_and_bounces_off_obstacles() {
     let clock = ManualClock::new();
     let mut room = host("pit.0.0", &clock);
     let (client, player) = join(&mut room, "ana");
@@ -594,38 +594,92 @@ fn an_arrow_hits_the_mob_it_was_aimed_at_and_obstacles_stop_it() {
         !verdicts[1].2 && verdicts[1].3 == 0.0,
         "uncompensated: no rewind"
     );
-    // Straight into the central pillar (0, 0, r 2.5): stopped short.
-    let into_pillar = PitInput {
-        buttons: PitInput::FIRE,
-        yaw: (0.0 - me.y).atan2(0.0 - me.x),
-        pitch: 0.0,
-        shot: 9,
-        ..PitInput::default()
-    };
-    room.push_input(
-        client,
-        3,
-        room.tick() as u32,
-        &distributed_game::GameInput::to_payload(&into_pillar),
-    );
-    let mut stopped = None;
-    for _ in 0..3 {
-        let out = tick(&mut room, &clock);
-        for e in events(&out) {
-            if let PitEvent::Shot {
-                shot: 9, hit, x, y, ..
-            } = e
-            {
-                stopped = Some((hit, (x * x + y * y).sqrt()));
+    // Straight into the central pillar (0, 0, r 2.5): it bounces straight
+    // back off its surface, the normal facing the shooter.
+    let fire = |room: &mut ZoneHost<MobPit>, seq: u32, n: u16, yaw: f32| {
+        room.push_input(
+            client,
+            seq,
+            room.tick() as u32,
+            &distributed_game::GameInput::to_payload(&PitInput {
+                buttons: PitInput::FIRE | PitInput::NO_COMP,
+                yaw,
+                pitch: 0.0,
+                shot: n,
+                ..PitInput::default()
+            }),
+        );
+        let mut verdict = None;
+        for _ in 0..14 {
+            let out = tick(room, &clock);
+            for e in events(&out) {
+                if let PitEvent::Shot {
+                    shot, hit, path, ..
+                } = e
+                {
+                    if shot == n {
+                        verdict = Some((hit, path));
+                    }
+                }
             }
         }
-    }
-    let (hit, from_centre) = stopped.expect("verdict");
-    assert_eq!(hit, None);
+        verdict.expect("verdict")
+    };
+    let to_centre = (0.0 - me.y).atan2(0.0 - me.x);
+    let (_, path) = fire(&mut room, 3, 9, to_centre);
+    let first = path.first().expect("met the pillar");
+    let from_centre = (first.x * first.x + first.y * first.y).sqrt();
     assert!(
         (from_centre - 2.5).abs() < 0.2,
-        "stopped at the pillar: {from_centre}"
+        "met the pillar: {from_centre} {path:?}"
     );
+    let back = [me.x - first.x, me.y - first.y];
+    let len = (back[0] * back[0] + back[1] * back[1]).sqrt();
+    assert!(
+        (first.nx * back[0] + first.ny * back[1]) / len > 0.99,
+        "the normal faces the shooter: {first:?}"
+    );
+    // A bank shot: off the pillar into a mob it could not see straight
+    // on. Find the aim with the room's own static path (the page's pure).
+    let me = room.zone().player_state(player).expect("in").0;
+    let mobs: Vec<(u32, f32, f32)> = room
+        .zone()
+        .mob_positions()
+        .into_iter()
+        .filter(|m| m.3)
+        .map(|m| (m.0, m.1, m.2))
+        .collect();
+    let near = |ax: f32, ay: f32, bx: f32, by: f32, (_, mx, my): (u32, f32, f32)| {
+        let (dx, dy) = (bx - ax, by - ay);
+        let t = (((mx - ax) * dx + (my - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        ((ax + t * dx - mx).powi(2) + (ay + t * dy - my).powi(2)).sqrt()
+    };
+    let bank = (-400..=400)
+        .map(|i| to_centre + i as f32 * 0.001)
+        .find_map(|yaw| {
+            let path = game_sim::mobpit::laser_path(&game_sim::mobpit::LaserShot {
+                seed: DEFAULT_SEED,
+                x: me.x,
+                y: me.y,
+                z: me.z + mobpit_rooms::HIP_HEIGHT,
+                dx: yaw.cos(),
+                dy: yaw.sin(),
+                ..Default::default()
+            });
+            let (p0, p1) = (path.first()?, path.get(1)?);
+            let on_pillar = ((p0.x * p0.x + p0.y * p0.y).sqrt() - 2.5).abs() < 0.2;
+            // Clear on the way in, dead on the way out.
+            let target = mobs
+                .iter()
+                .copied()
+                .find(|&m| near(p0.x, p0.y, p1.x, p1.y, m) < 0.15)?;
+            let clear_in = mobs.iter().all(|&m| near(me.x, me.y, p0.x, p0.y, m) > 1.5);
+            (on_pillar && clear_in).then_some((yaw, target.0))
+        });
+    let (yaw, target) = bank.expect("an aim that banks off the pillar into a mob");
+    let (hit, path) = fire(&mut room, 4, 10, yaw);
+    assert_eq!(hit, Some(target), "bank shot: {path:?}");
+    assert_eq!(path.len(), 2, "pillar, then the mob: {path:?}");
 }
 
 /// Walk `player` towards `(tx, ty)` (room-local) until the room hands it

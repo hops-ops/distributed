@@ -57,6 +57,7 @@ use crate::zone::{
     Admission, ClientId, JoinRequest, LeaveReason, ObserverId, ObserverInfo, PlayerId, PlayerInfo,
     TicketClaims, Tier, Viewer, Zone,
 };
+use crate::zone_message::{SeenIds, VerifiedPrincipal, ZoneEnvelope, ZoneMessageError, ZoneSender};
 
 /// Host tuning.
 #[derive(Debug, Clone, PartialEq)]
@@ -293,6 +294,12 @@ pub(crate) struct Core<Z: Zone> {
     pinned_stamp_ms: Option<u64>,
     /// Lifecycle facts waiting for queue capacity, in emission order.
     lifecycle_backlog: VecDeque<Fact>,
+    /// Zone messages sent since the driver last took them.
+    zone_out: Vec<ZoneEnvelope>,
+    /// Zone messages sent this activation (their ids).
+    zone_seq: u64,
+    /// Zone message ids delivered lately (repeats are dropped).
+    zone_seen: SeenIds,
 }
 
 impl<Z: Zone> Core<Z> {
@@ -658,6 +665,64 @@ impl<Z: Zone> Ctx<'_, Z> {
         self.emit_bound(fact, None)
     }
 
+    /// Emit a fact on behalf of a principal verified elsewhere: one carried
+    /// by a zone message ([`ZoneSender::principal`]), e.g. the shooter of a
+    /// shot that crossed into this zone. Never blocks.
+    pub fn emit_fact_as(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        fact: Fact,
+    ) -> Result<(), EmitError> {
+        self.emit_bound(fact, Some(principal.as_str().to_string()))
+    }
+
+    /// `player`'s principal, bound from its verified ticket (for carrying
+    /// in game state; facts bind it themselves).
+    pub fn verified_principal(&self, player: PlayerId) -> Option<VerifiedPrincipal> {
+        self.core
+            .players
+            .get(&player)
+            .map(|slot| VerifiedPrincipal::new(slot.info.principal.clone()))
+    }
+
+    /// Send `message` to the running zone `to` ([`crate::zone_message`]):
+    /// it arrives in [`Zone::on_zone_message`] there, at most once, or not
+    /// at all (a zone that is not running refuses it).
+    pub fn send_zone(&mut self, to: &str, message: &Z::Message) {
+        self.queue_zone(to, None, message);
+    }
+
+    /// [`send_zone`](Self::send_zone) on behalf of `player`: its verified
+    /// principal travels with the message (the receiver may emit facts as
+    /// it). Nothing is sent for an unknown player.
+    pub fn send_zone_for(&mut self, player: PlayerId, to: &str, message: &Z::Message) {
+        if let Some(principal) = self.verified_principal(player) {
+            self.queue_zone(to, Some(principal), message);
+        }
+    }
+
+    /// Send `message` on behalf of a principal this zone was itself sent
+    /// ([`ZoneSender::principal`]): e.g. passing a shot on again.
+    pub fn send_zone_as(&mut self, principal: &VerifiedPrincipal, to: &str, message: &Z::Message) {
+        self.queue_zone(to, Some(principal.clone()), message);
+    }
+
+    fn queue_zone(&mut self, to: &str, principal: Option<VerifiedPrincipal>, message: &Z::Message) {
+        self.core.zone_seq += 1;
+        let id = format!(
+            "{}/{}/{}",
+            self.core.zone_id, self.core.config.boot_epoch, self.core.zone_seq
+        );
+        self.core.zone_out.push(ZoneEnvelope {
+            id,
+            from: self.core.zone_id.clone(),
+            to: to.to_string(),
+            principal: principal.map(|p| p.as_str().to_string()),
+            type_id: message.event_id(),
+            payload: message.to_payload(),
+        });
+    }
+
     /// Emit a fact on behalf of `player`; the principal is bound from the
     /// player's verified ticket. Never blocks.
     pub fn emit_fact_for(&mut self, player: PlayerId, fact: Fact) -> Result<(), EmitError> {
@@ -965,6 +1030,9 @@ impl<Z: Zone> ZoneHost<Z> {
             stamp_floor_ms: 0,
             pinned_stamp_ms: None,
             lifecycle_backlog: VecDeque::new(),
+            zone_out: Vec::new(),
+            zone_seq: 0,
+            zone_seen: SeenIds::default(),
             config,
         };
         let zone = Z::on_create(&mut Ctx { core: &mut core }, zone_config);
@@ -1602,6 +1670,35 @@ impl<Z: Zone> ZoneHost<Z> {
     /// the zone is not ticking), never while frozen.
     pub fn deliver_child_event(&mut self, event: ChildEvent) {
         self.core.child_inbox.push(event);
+    }
+
+    /// Zone messages sent since the last call ([`crate::zone_message`]);
+    /// the driver hands each to its target's
+    /// [`deliver_zone`](Self::deliver_zone).
+    pub fn take_zone_messages(&mut self) -> Vec<ZoneEnvelope> {
+        std::mem::take(&mut self.core.zone_out)
+    }
+
+    /// Deliver a message from another zone: runs
+    /// [`Zone::on_zone_message`] unless the id was seen lately. Call
+    /// between ticks.
+    pub fn deliver_zone(&mut self, envelope: ZoneEnvelope) -> Result<(), ZoneMessageError> {
+        if envelope.to != self.core.zone_id {
+            return Err(ZoneMessageError::WrongZone);
+        }
+        let message = Z::Message::decode_event(envelope.type_id, &envelope.payload)
+            .map_err(|e| ZoneMessageError::Decode(e.to_string()))?
+            .ok_or_else(|| ZoneMessageError::Decode(format!("type {}", envelope.type_id)))?;
+        if !self.core.zone_seen.first(&envelope.id) {
+            return Err(ZoneMessageError::Duplicate);
+        }
+        let sender = ZoneSender {
+            zone: envelope.from,
+            principal: envelope.principal.map(VerifiedPrincipal::new),
+        };
+        hook!(self.on_zone_message(&sender, message));
+        self.process_kicks();
+        Ok(())
     }
 
     /// Tier-up events emitted (or forwarded) by this zone since the last
