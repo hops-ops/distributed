@@ -281,7 +281,7 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		assert.equal(anonymous.status, 401);
 		assert.equal(anonymous.headers.get('cache-control'), 'no-store');
 
-		browser = await chromium.launch();
+		browser = await chromium.launch({ args: ["--mute-audio"] });
 		const errors = [];
 		const signIn = async (username) => {
 			const context = await browser.newContext();
@@ -485,7 +485,16 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		}
 		// Both step away from the doorways they came through (standing in one
 		// keeps the room behind it awake: "wake rooms in reach").
-		assert.deepEqual(await nearRooms(page), ['pit.0.0'], 'Ana at the doorway keeps the entrance awake');
+		// Ana stood next door while Bob reloaded: a mob may have killed her,
+		// and a respawn puts her mid-room, out of reach of the doorway.
+		await page.waitForFunction(() => document.querySelector('canvas')?.dataset.dead === 'false', null, { timeout: 15_000 });
+		const anaAt = await here(page);
+		if (Math.hypot(anaAt[0] + 17, anaAt[1]) > 4) {
+			console.error(`ana at ${anaAt}, away from the doorway (died?): back to it`);
+			await walkTo(page, [-17, 0]);
+		}
+		await page.waitForFunction(() => document.querySelector('[data-testid=near]')?.dataset.rooms === 'pit.0.0', null, { timeout: 5_000 }).catch(() => {});
+		assert.deepEqual(await nearRooms(page), ['pit.0.0'], `Ana at the doorway keeps the entrance awake (at ${await here(page)})`);
 		await walkTo(page, [3, 3]);
 		await walkTo(bob, [2, 1]);
 		await page.waitForFunction(() => document.querySelector('[data-testid=near]')?.dataset.rooms === '', null, { timeout: 10_000 });

@@ -4,7 +4,9 @@
  *
  * The player hunts with arrows in first person (every frame carries the
  * aim, some loose an arrow), walks into the next room, waits until the room
- * it left is asleep, and walks back into it. Prediction must stay exact
+ * it left is asleep, and walks back into it. A mob that chased it through
+ * the doorway keeps its home room awake (a crossing in flight), so it is
+ * hunted down first. Prediction must stay exact
  * the whole way: no correction of the own player, and the drawn position
  * never moves more than one tick's walk between frames — across both
  * doorways too.
@@ -13,7 +15,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { BUTTON, isMob, mobFields, PIT_RULES, playerFields } from '../src/generated/mobpit/index.ts';
-import { createMobPitClient, MobPitApi } from '../src/mobpit/client.ts';
+import { createMobPitClient, MobPitApi, roomZone } from '../src/mobpit/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
 import { eventually, memoryStorage, sleep, until } from './helpers/demo-server.mjs';
 import { largestStep, startPit, walkThroughDoor } from './helpers/mobpit.mjs';
@@ -21,8 +23,16 @@ import { largestStep, startPit, walkThroughDoor } from './helpers/mobpit.mjs';
 /** One tick's walk (5 m/s at 30 Hz) plus a dash frame's worth of slack. */
 const STEP = 0.5;
 
-/** Hunt with the bow for `ms`: chase the nearest mob, aim at it in first person, loose arrows. */
-async function bowFight(pit, ms) {
+/** The home room a visitor names (`MobView.from`), or undefined for a room's own mob. */
+function homeRoom(zone, from) {
+	const step = { 1: [1, 0], 2: [-1, 0], 3: [0, 1], 4: [0, -1] }[from >>> 16];
+	if (step === undefined) return undefined;
+	const [x, y] = zone.split('.').slice(1).map(Number);
+	return roomZone(x + step[0], y + step[1]);
+}
+
+/** Hunt with the bow for `ms`: chase the nearest mob (of those `pick` keeps), aim at it in first person, loose arrows. */
+async function bowFight(pit, ms, pick = () => true) {
 	const deadline = Date.now() + ms;
 	let shots = 0;
 	while (Date.now() < deadline) {
@@ -34,6 +44,7 @@ async function bowFight(pit, ms) {
 			.render()
 			.filter((e) => isMob(e) && !e.stale && e.zoneId === pit.room())
 			.map(mobFields)
+			.filter((m) => m.hp > 0 && pick(m))
 			.sort((a, b) => Math.hypot(a.x - at.x, a.y - at.y) - Math.hypot(b.x - at.x, b.y - at.y))[0];
 		if (mob === undefined || at.dead) {
 			pit.client.sendInput({ mx: 0, my: 0, buttons: 0 });
@@ -61,6 +72,25 @@ async function bowFight(pit, ms) {
 	return shots;
 }
 
+/** Mobs of `home` that followed into the current room. */
+function followersOf(pit, home) {
+	const room = pit.room();
+	return pit.client
+		.render()
+		.filter((e) => isMob(e) && !e.stale && e.zoneId === room)
+		.map(mobFields)
+		.filter((m) => m.hp > 0 && homeRoom(room, m.from) === home);
+}
+
+/** Shoot down every mob of `home` that followed into this room: until then its crossing keeps `home` awake. */
+async function huntFollowers(pit, home, ms) {
+	const deadline = Date.now() + ms;
+	while (followersOf(pit, home).length > 0) {
+		if (Date.now() > deadline) throw new Error(`a follower from ${home} still alive after ${ms} ms`);
+		await bowFight(pit, 1_000, (m) => homeRoom(pit.room(), m.from) === home);
+	}
+}
+
 test('a doorway into a sleeping room after a bow fight: no correction, no jump', { timeout: 600_000 }, async () => {
 	const server = await startPit('mobpit');
 	const clients = [];
@@ -72,7 +102,11 @@ test('a doorway into a sleeping room after a bow fight: no correction, no jump',
 		const pit = createMobPitClient({ api, roomsBase: server.roomsUrl, wake: false });
 		clients.push(pit);
 		const corrections = [];
-		pit.client.on('correction', (c) => corrections.push({ room: pit.room(), at: Date.now(), m: Math.hypot(c.errors.x ?? 0, c.errors.y ?? 0), errors: c.errors }));
+		pit.client.on('correction', (c) => {
+			const me = pit.me();
+			const dead = me !== undefined && playerFields(me).dead;
+			corrections.push({ room: pit.room(), at: Date.now(), m: Math.hypot(c.errors.x ?? 0, c.errors.y ?? 0), errors: c.errors, dead });
+		});
 		await pit.client.connect('pit.0.0');
 		await pit.ready;
 		await until(() => pit.client.predictor?.active, 5_000, 'bound');
@@ -82,12 +116,21 @@ test('a doorway into a sleeping room after a bow fight: no correction, no jump',
 			const before = corrections.length;
 			const east = await walkThroughDoor(pit, [1, 0]);
 			assert.equal(east.room, 'pit.1.0');
+			const followed = followersOf(pit, 'pit.0.0').length;
+			if (followed > 0) console.error(`round ${round}: ${followed} mob(s) followed from pit.0.0; hunting them`);
+			await huntFollowers(pit, 'pit.0.0', 60_000);
 			// The room left goes to sleep (the watcher does not keep it awake).
 			await eventually(async () => (await pitApi.roomInfo('pit.0.0')).awake === false, 30_000, 'pit.0.0 asleep');
 			const west = await walkThroughDoor(pit, [-1, 0]);
 			assert.equal(west.room, 'pit.0.0');
 			await sleep(500);
-			const fresh = corrections.slice(before).filter((c) => c.m > 0.05);
+			// A hit or a death (a mob may follow through the doorway) is the
+			// room's call, not a prediction error: a dead player's inputs are
+			// ignored while the page still walks it.
+			const hurt = (c) => (c.errors.hp ?? 0) !== 0 || c.dead;
+			const fresh = corrections.slice(before).filter((c) => c.m > 0.05 && !hurt(c));
+			const hits = corrections.slice(before).filter(hurt).length;
+			if (hits > 0) console.error(`round ${round}: ${hits} hit or death corrections (not counted)`);
 			console.error(
 				`round ${round}: ${shots} arrows; east step ${largestStep(east.trace).toFixed(3)} m, west step ${largestStep(west.trace).toFixed(3)} m; corrections ${JSON.stringify(fresh.map((c) => ({ room: c.room, m: +c.m.toFixed(3) })))}`
 			);

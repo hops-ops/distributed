@@ -69,6 +69,10 @@ pub use crate::netsim::{NETSIM_SHARD, ZONE_DEV_KIND};
 /// object's id has no name on some celld paths).
 pub const ZONE_HEADER: &str = "x-celld-zone";
 
+/// Route of a message from another zone object
+/// ([`crate::zone_message`]): `POST /{zone}/__zone`, internal secret only.
+pub const ZONE_MESSAGE_ROUTE: &str = "__zone";
+
 /// Close code for sockets of an earlier activation (the room restarted or
 /// moved): the client rejoins with a fresh ticket.
 pub const CLOSE_RESTARTED: u16 = 1012;

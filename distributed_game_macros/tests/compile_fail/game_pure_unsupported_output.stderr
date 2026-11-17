@@ -23,5 +23,7 @@ help: the trait `Wire` is not implemented for `Opaque`
 note: required by a bound in `distributed_game::GamePure::Output`
  --> $WORKSPACE/distributed_game/src/pure.rs
   |
+  | pub trait GamePure {
+...
   |     type Output: Wire;
   |                  ^^^^ required by this bound in `GamePure::Output`

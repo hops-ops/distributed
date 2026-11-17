@@ -6,9 +6,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
-    "check": "tsc --noEmit",
-    "test": "node --test tests/*.test.mjs"
+    "games": "node scripts/games.mjs",
+    "build": "node scripts/games.mjs && tsc --noEmit && vite build",
+    "check": "node scripts/games.mjs && tsc --noEmit",
+    "test": "node --test --test-concurrency=4 tests/*.test.mjs"
   },
   "dependencies": {
     "@babylonjs/core": "9.30.0",

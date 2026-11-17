@@ -394,6 +394,38 @@ async fn push_once(env: &Env, binding: &str, name: &str, secret: &str, body: &st
     Ok(response.status_code())
 }
 
+/// Post a zone message ([`crate::zone_message`]) to the zone object of
+/// class `binding` it is addressed to, with the internal secret. Returns
+/// the target's status: 204 delivered, 409 asleep or refused.
+pub(super) async fn send_zone_message(
+    env: &Env,
+    binding: &str,
+    envelope: &crate::zone_message::ZoneEnvelope,
+) -> Result<u16> {
+    let secret = internal_secret(env).ok_or_else(|| {
+        worker::Error::RustError(format!("{CELL_INTERNAL_SECRET_ENV} is required"))
+    })?;
+    let stub = env
+        .durable_object(binding)?
+        .id_from_name(&envelope.to)?
+        .get_stub()?;
+    let headers = Headers::new();
+    headers.set(CELL_INTERNAL_SECRET_HEADER, &secret)?;
+    headers.set(super::ZONE_HEADER, &envelope.to)?;
+    headers.set("content-type", "application/json")?;
+    let body =
+        serde_json::to_string(envelope).map_err(|e| worker::Error::RustError(e.to_string()))?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(body.into()));
+    let url = format!("https://zone/{}/{}", envelope.to, super::ZONE_MESSAGE_ROUTE);
+    let response = stub
+        .fetch_with_request(Request::new_with_init(&url, &init)?)
+        .await?;
+    Ok(response.status_code())
+}
+
 fn internal_secret(env: &Env) -> Option<String> {
     env.secret(CELL_INTERNAL_SECRET_ENV)
         .map(|value| value.to_string())
