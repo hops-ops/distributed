@@ -54,7 +54,7 @@
 # scripts/celld.sh), CELLD_PORT its port (default
 # GAME_DEMOS_PORT + 3),
 # CELLD_ESBUILD its bundler (default: the client's esbuild). The worker is
-# built with worker-build (`cargo install worker-build --locked`).
+# built with worker-build (`cargo install worker-build --version 0.8.7 --locked`).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -121,7 +121,7 @@ ensure_cells() {
 	if [[ ! -f "$marker" ]] || [[ -n "$(find "$CELLS/src" "$CELLS/Cargo.toml" "$SERVER/crawler" "$SERVER/rooms" "$SERVER/sim" "$SERVER/tiers" "$REPO/src" "$REPO/distributed_game/src" -newer "$marker" -name '*.rs' -print -quit 2>/dev/null)" ]] ||
 		[[ "$CELLS/Cargo.toml" -nt "$marker" ]]; then
 		command -v worker-build >/dev/null || {
-			echo "worker-build not found: cargo install worker-build --locked" >&2
+			echo "worker-build not found: cargo install worker-build --version 0.8.7 --locked" >&2
 			exit 1
 		}
 		log "building the demos' cells worker (worker-build)"

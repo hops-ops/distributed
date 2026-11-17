@@ -59,7 +59,7 @@ jobs:
         run: |
           scripts/celld.sh install
           echo "CELLD_BIN=$HOME/.local/bin/celld" >> "$GITHUB_ENV"
-          cargo install worker-build --locked
+          cargo install worker-build --version 0.8.7 --locked
       - name: Install SvelteKit demo dependencies and Chromium
         working-directory: examples/game/sveltekit
         run: npm ci --no-audit --no-fund && npx playwright install --with-deps chromium

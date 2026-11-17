@@ -51,7 +51,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y sqlite3
           npm install -g esbuild
-          cargo install worker-build --locked
+          cargo install worker-build --version 0.8.7 --locked
           # The pinned celld (/.celld-version) is the one the zone-state R2
           # path, fact routing and every profile below are proven on.
           scripts/celld.sh install
@@ -160,7 +160,7 @@ jobs:
         run: npm install -g esbuild
 
       - name: Install worker-build
-        run: cargo install worker-build --locked || cargo install worker-build
+        run: cargo install worker-build --version 0.8.7 --locked || cargo install worker-build --version 0.8.7
 
       - name: Install celld CLI (pinned in /.celld-version)
         run: |
