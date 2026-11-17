@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { isMob, mobFields, PIT_RULES, PIT_WORLD, playerFields } from '../src/generated/mobpit/index.ts';
-import { createMobPitClient } from '../src/mobpit/client.ts';
+import { createMobPitClient, roomZone, withoutHomeCopies } from '../src/mobpit/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
 import { memoryStorage, sleep, until } from './helpers/demo-server.mjs';
 import { startPit, walkThroughDoor, walkTo } from './helpers/mobpit.mjs';
@@ -21,10 +21,17 @@ function guestsIn(pit, zone) {
 	return mobsIn(pit, zone).filter((m) => Number(m.key.split(':').at(-1)) > own);
 }
 
-/** Live mobs of `zone` as `{ key, x, y, state, tier }`. */
+/** The home copy a visitor in `zone` names (`MobView.from`), or undefined. */
+function homeKey(zone, from) {
+	const step = { 1: [1, 0], 2: [-1, 0], 3: [0, 1], 4: [0, -1] }[from >>> 16];
+	if (step === undefined) return undefined;
+	const [x, y] = zone.split('.').slice(1).map(Number);
+	return `${roomZone(x + step[0], y + step[1])}:${from & 0xffff}`;
+}
+
+/** Live mobs of `zone` as drawn (one copy of a crossing mob) as `{ key, x, y, state, tier, from }`. */
 function mobsIn(pit, zone) {
-	return pit.client
-		.render()
+	return withoutHomeCopies(pit.client.render())
 		.filter((e) => isMob(e) && !e.stale && e.zoneId === zone)
 		.map((e) => ({ key: e.key, ...mobFields(e) }))
 		.filter((m) => m.hp > 0);
@@ -58,11 +65,13 @@ test('a chasing mob follows through a doorway and keeps chasing', { timeout: 300
 		assert.equal(east.room, 'pit.1.0');
 		// In pit.1.0: keep moving about near the doorway for 15 s.
 		const log = [];
+		const named = new Set();
 		const start = Date.now();
 		while (Date.now() - start < 15_000) {
 			const t = Date.now() - start;
 			const visitors = guestsIn(pit, 'pit.1.0');
 			const home = mobsIn(pit, 'pit.0.0').find((m) => m.key === chaser.key);
+			for (const v of visitors) named.add(homeKey('pit.1.0', v.from));
 			log.push({ t, visitors: visitors.map((m) => `${m.key}@${m.x.toFixed(1)},${m.y.toFixed(1)} s${m.state}`), home: home ? `s${home.state}@${home.x.toFixed(1)},${home.y.toFixed(1)}` : '-' });
 			// Kite: a slow loop through the room's middle, the mob behind.
 			const at = pit.position();
@@ -84,6 +93,7 @@ test('a chasing mob follows through a doorway and keeps chasing', { timeout: 300
 		assert.ok(!log.some((l) => l.visitors.length > 0 && l.home !== '-'), 'never in two rooms');
 		const seen = log.filter((l) => l.visitors.length > 0);
 		assert.ok(seen.length > 0, 'the chaser followed into pit.1.0');
+		assert.ok(named.has(chaser.key), `the visitor names its home copy ${chaser.key}: ${[...named]}`);
 		assert.ok(log.at(-1).visitors.length > 0, 'still chasing after 15 s');
 	} finally {
 		pit.close();

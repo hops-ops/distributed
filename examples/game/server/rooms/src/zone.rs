@@ -185,6 +185,12 @@ pub struct MobView {
     pub state: u8,
     /// Telegraph progress 0..=255 during a windup.
     pub tele: u8,
+    /// A visitor's home copy: `side << 16 | home id` (side 1 east · 2 west
+    /// · 3 north · 4 south of this room); 0 for the room's own mobs. Rooms
+    /// stream independently, so a viewer watching both rooms can briefly
+    /// hold the home copy after the visitor appears: it draws the visitor
+    /// and hides the copy this names.
+    pub from: u32,
 }
 
 /// A pillar of the floor (visible everywhere).
@@ -2516,6 +2522,10 @@ impl Project<MobView> for Mob {
                 hp: (self.hp.max(0) * 100 / max_hp).min(100) as u8,
                 state: self.state as u8,
                 tele: tele as u8,
+                from: self
+                    .visit
+                    .as_ref()
+                    .map_or(0, |v| u32::from(v.side) << 16 | (v.home_id & 0xffff)),
             },
         ))
     }

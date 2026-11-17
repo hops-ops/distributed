@@ -89,8 +89,23 @@ pub(super) struct Visit {
     /// Its id and life in its home room (its kill is keyed by them).
     pub home_id: u32,
     pub generation: u32,
+    /// The side it came in through, towards its home room
+    /// ([`home_side`]): with `home_id` it names the home room's copy.
+    pub side: u8,
     chase: String,
     arrived: u64,
+}
+
+/// The side of this room facing the room next door at `step` (that room
+/// minus this one): 1 east · 2 west · 3 north · 4 south · 0 not adjacent.
+pub(super) fn home_side(step: (i32, i32)) -> u8 {
+    match step {
+        (1, 0) => 1,
+        (-1, 0) => 2,
+        (0, 1) => 3,
+        (0, -1) => 4,
+        _ => 0,
+    }
 }
 
 /// What a following mob did this tick.
@@ -459,6 +474,7 @@ impl MobPit {
                     held: LEASE.hold(from.zone.clone(), transfer, tick),
                     home_id,
                     generation,
+                    side: home_side((fx - rx, fy - ry)),
                     chase,
                     arrived: tick,
                 });

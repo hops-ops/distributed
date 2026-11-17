@@ -50,6 +50,27 @@ function parseRoom(zone: string | undefined): [number, number] | undefined {
 }
 
 /** The doorway neighbours of `room` behind `near` bits (`rooms_in_reach`: east, west, north, south). */
+/** Side (`MobView.from >> 16`) → step from a visitor's room to its home room. */
+const HOME_STEP: Readonly<Record<number, readonly [number, number]>> = { 1: [1, 0], 2: [-1, 0], 3: [0, 1], 4: [0, -1] };
+
+/**
+ * Rooms stream independently, so while a mob crosses, a viewer watching
+ * both rooms can briefly still hold its home copy after the visitor shows
+ * up. A visitor names that copy (`from`): draw the visitor, drop the copy.
+ */
+export function withoutHomeCopies<T extends RenderedEntity>(rendered: readonly T[]): T[] {
+	const hidden = new Set<string>();
+	for (const e of rendered) {
+		if (!isMob(e) || e.stale) continue;
+		const from = mobFields(e).from;
+		const step = HOME_STEP[from >>> 16];
+		const room = parseRoom(e.zoneId);
+		if (step === undefined || room === undefined) continue;
+		hidden.add(`pit.${room[0] + step[0]}.${room[1] + step[1]}:${from & 0xffff}`);
+	}
+	return hidden.size === 0 ? [...rendered] : rendered.filter((e) => !(isMob(e) && hidden.has(e.key)));
+}
+
 export function reachRooms(room: readonly [number, number], near: number): string[] {
 	const doors: [number, [number, number]][] = [
 		[1, [1, 0]],
@@ -392,7 +413,8 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 		const room = client.authority?.zoneId;
 		if (room !== undefined) canvas.dataset.room = room;
 		const here = parseRoom(room);
-		const rendered = client.render();
+		// One copy of a mob crossing between two watched rooms.
+		const rendered = withoutHomeCopies(client.render());
 		// Yours: predicted, or the SDK's hold of it during a doorway handoff.
 		const mine = (e: RenderedEntity) => isPlayer(e) && (e.predicted || (e.id === hello?.entity && e.zoneId === room));
 		const meEntity = rendered.find((e) => mine(e) && e.predicted) ?? rendered.find(mine);

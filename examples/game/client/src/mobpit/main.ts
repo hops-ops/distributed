@@ -79,6 +79,7 @@ import {
 	ROOM_SIZE,
 	roomZone,
 	TIERS,
+	withoutHomeCopies,
 	type BoardSnapshot,
 	type ShotRecord,
 	type RoomInfo,
@@ -1790,7 +1791,8 @@ stage.onFrame((now, dtMs) => {
 	if (hereRoom !== undefined) moveOrigin(hereRoom);
 	const hello = pit.hello();
 	const authority = client.authority;
-	const rendered = client.render();
+	// One copy of a mob crossing between two watched rooms.
+	const rendered = withoutHomeCopies(client.render());
 	miniDots.length = 0;
 	const seen = new Set<string>();
 	let me: { at: Vector3; hp: number; dead: boolean } | undefined;
