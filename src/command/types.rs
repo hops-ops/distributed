@@ -121,7 +121,35 @@ impl CommandTypeDef {
 /// Serde's deserialization direction. Transport-specific naming restrictions
 /// are checked when an adapter exposes the declaration.
 pub trait CommandInputType {
+    /// Rust and serialized names of the input's top-level fields
+    /// (`#[derive(CommandInput)]` fills it). Aggregate `#[command]` methods
+    /// check at compile time that none of them is named like the principal
+    /// parameter, which only the verified session may supply.
+    const FIELD_NAMES: &'static [&'static str] = &[];
+
     fn command_type() -> CommandTypeDef;
+}
+
+/// True when `fields` contains `name` (usable in `const` items; the
+/// aggregate `#[command]` principal check).
+#[doc(hidden)]
+pub const fn __input_has_field(fields: &[&str], name: &str) -> bool {
+    let name = name.as_bytes();
+    let mut i = 0;
+    while i < fields.len() {
+        let field = fields[i].as_bytes();
+        if field.len() == name.len() {
+            let mut j = 0;
+            while j < name.len() && field[j] == name[j] {
+                j += 1;
+            }
+            if j == name.len() {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Structural description of a command result, following Serde serialization.

@@ -1,0 +1,5 @@
+error: the argument must be a shared reference (`&T`, T: Wire)
+ --> tests/compile_fail/game_pure_by_value.rs:5:14
+  |
+5 | fn double(a: u32) -> u32 {
+  |              ^^^

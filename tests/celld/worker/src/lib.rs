@@ -8,8 +8,8 @@
 use chat_domain::{post, ChatMessage, ChatMessageState};
 use distributed::cell_host::{
     AggregateCell, CellCommandIdentity, CellDispatchError, CellDispatchResult, CellWaitPathRequest,
-    CelldOutbox, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
-    CELL_CAUSATION_ID_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
+    CelldOutbox, InternalHttpSecret, CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_ENV,
+    CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use serde::de::DeserializeOwned;
@@ -35,6 +35,35 @@ where
     for error in outcome.deferred {
         worker::console_error!(
             "celld outbox immediate drain deferred for {}: {}",
+            cell.instance_name(),
+            error
+        );
+    }
+    Ok(())
+}
+
+/// Durable Object alarm: fire due cell alarms, then drain the outbox. The one
+/// alarm slot is shared by both, always set to the earliest due time.
+async fn alarm_cell<A>(env: &Env, cell: &AggregateCell<A>) -> Result<()>
+where
+    A: distributed::Aggregate + Send + Sync + 'static,
+{
+    let wake = cell
+        .alarm(env)
+        .await
+        .map_err(|error| Error::RustError(error.to_string()))?;
+    for failed in wake.schedules.failed.iter().chain(&wake.schedules.retried) {
+        worker::console_error!(
+            "cell alarm {} on {} failed: {} {}",
+            failed.name,
+            cell.instance_name(),
+            failed.code,
+            failed.message
+        );
+    }
+    for error in wake.drain.deferred {
+        worker::console_error!(
+            "celld outbox alarm drain deferred for {}: {}",
             cell.instance_name(),
             error
         );
@@ -151,7 +180,7 @@ impl DurableObject for TodoCell {
     }
 
     async fn alarm(&self) -> Result<Response> {
-        drain_cell(&self.env, &self.cell).await?;
+        alarm_cell(&self.env, &self.cell).await?;
         Response::ok("ok")
     }
 }
@@ -199,7 +228,7 @@ impl DurableObject for ChatCell {
     }
 
     async fn alarm(&self) -> Result<Response> {
-        drain_cell(&self.env, &self.cell).await?;
+        alarm_cell(&self.env, &self.cell).await?;
         Response::ok("ok")
     }
 }
@@ -402,7 +431,11 @@ fn optional_internal_header(
         .map_err(|error| {
             CellDispatchError::Internal(format!("could not read internal cell header: {error}"))
         })
-        .map(|value| value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()))
+        .map(|value| {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn wait_path_ok(

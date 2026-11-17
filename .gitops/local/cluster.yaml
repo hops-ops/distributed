@@ -1,0 +1,17 @@
+# The machine's one Hops Cluster (OrbStack k3s). Mob Pit never provisions a
+# cluster; identity (name, mountRoot, localDomain) is machine-owned and must
+# match ~/.gitops/local/cluster.yaml. `cluster/` holds the packages Mob Pit
+# needs on it (overlaid by `hops local up`).
+apiVersion: hops.local/v1alpha1
+kind: Cluster
+metadata:
+  name: hops
+spec:
+  clusterProvider: orbstack
+  dockerProvider: orbstack
+  mountRoot: $HOME
+  browserIngress:
+    namespaces:
+      - auth
+  manifests:
+    path: .gitops/local/cluster

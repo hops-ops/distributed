@@ -104,7 +104,11 @@ pub fn outbox_message_row_values(message: &OutboxMessage) -> Result<RowValues, T
     row.insert("status", RowValue::String(message.status.as_str().into()));
     let created_at = system_time_epoch_secs(message.created_at)?;
     row.insert("created_at", RowValue::U64(created_at));
-    row.insert("next_available_at", RowValue::U64(created_at));
+    let next_available_at = match message.deliver_at {
+        Some(at) => system_time_epoch_secs(at)?.max(created_at),
+        None => created_at,
+    };
+    row.insert("next_available_at", RowValue::U64(next_available_at));
     row.insert("claimed_by", optional_string(&message.worker_id));
     row.insert(
         "claimed_until",

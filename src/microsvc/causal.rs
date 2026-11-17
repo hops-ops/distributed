@@ -24,6 +24,7 @@ use crate::command::{
 };
 use crate::command_ledger::CausalGetStream;
 use crate::domain_event::{DomainEventCaptureError, DomainEventCommitGuardError};
+use crate::microsvc::cell_host::ScheduleWrite;
 use crate::outbox::{OutboxMessage, PreparedDomainEvent};
 use crate::projection::lower::{
     DirectCandidate, LoweredProjectionPlan, ProjectionDescriptor,
@@ -155,11 +156,13 @@ pub(crate) enum CausalWorkspaceError {
     DomainPublicationsAlreadyPrepared,
     DomainPublicationsNotPrepared,
     CommitBatchAlreadyPrepared,
+    Schedule(crate::schedule::ScheduleError),
 }
 
 impl std::fmt::Display for CausalWorkspaceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Schedule(error) => write!(formatter, "schedule staging failed: {error}"),
             Self::Repository(error) => write!(formatter, "causal aggregate load failed: {error}"),
             Self::Table(error) => write!(formatter, "causal read-model staging failed: {error}"),
             Self::DomainEventCapture(error) => {
@@ -216,6 +219,7 @@ impl std::error::Error for CausalWorkspaceError {
             Self::DomainEventCapture(error) => Some(error),
             Self::DomainEventGuard(error) => Some(error),
             Self::Prepare(error) => Some(error),
+            Self::Schedule(error) => Some(error),
             Self::Poisoned
             | Self::IdentityChanged { .. }
             | Self::CommittedVersionChanged { .. }
@@ -280,6 +284,7 @@ struct WorkspaceState<A> {
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
+    schedules: Vec<ScheduleWrite>,
     projection_staged: bool,
     modeled_direct_projection: Option<ProjectionServerExecutorDescriptor>,
 }
@@ -292,6 +297,7 @@ impl<A> Default for WorkspaceState<A> {
             outbox_messages: Vec::new(),
             read_model_plans: Vec::new(),
             snapshots: Vec::new(),
+            schedules: Vec::new(),
             projection_staged: false,
             modeled_direct_projection: None,
         }
@@ -306,6 +312,7 @@ where
 {
     store: Box<dyn CausalAggregateStore<A> + 'repo>,
     state: Mutex<WorkspaceState<A>>,
+    scheduling_declared: bool,
 }
 
 impl<'repo, A> CausalWorkspace<'repo, A>
@@ -319,7 +326,16 @@ where
         Self {
             store: Box::new(AggregateStoreRef { repository }),
             state: Mutex::new(WorkspaceState::default()),
+            scheduling_declared: false,
         }
+    }
+
+    /// Whether the route declared `Capability::Scheduling` (schedule writes
+    /// are refused otherwise, so a host that cannot dispatch them is caught
+    /// at registration).
+    pub(crate) fn with_scheduling_declared(mut self, declared: bool) -> Self {
+        self.scheduling_declared = declared;
+        self
     }
 
     /// Load a full stream through the explicit causal/non-locking capability.
@@ -411,6 +427,27 @@ where
             .map_err(|_| CausalWorkspaceError::Poisoned)?
             .outbox_messages
             .push(message);
+        Ok(())
+    }
+
+    /// Stage a schedule write. It commits with the command's events or not at
+    /// all; the batch is bounded by `MAX_SCHEDULE_WRITES_PER_COMMAND`.
+    pub(crate) fn stage_schedule(&self, write: ScheduleWrite) -> Result<(), CausalWorkspaceError> {
+        if !self.scheduling_declared {
+            return Err(CausalWorkspaceError::Schedule(
+                crate::schedule::ScheduleError::NotDeclared,
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CausalWorkspaceError::Poisoned)?;
+        if state.schedules.len() >= crate::schedule::MAX_SCHEDULE_WRITES_PER_COMMAND {
+            return Err(CausalWorkspaceError::Schedule(
+                crate::schedule::ScheduleError::TooManyWrites,
+            ));
+        }
+        state.schedules.push(write);
         Ok(())
     }
 
@@ -545,6 +582,7 @@ where
             outbox_messages: state.outbox_messages,
             read_model_plans: state.read_model_plans,
             snapshots: state.snapshots,
+            schedules: state.schedules,
             domain_event_occurrences: Vec::new(),
             unpublished_direct_occurrences: HashSet::new(),
             modeled_direct_projection: state.modeled_direct_projection,
@@ -562,6 +600,7 @@ pub(crate) struct CausalWorkspaceParts<A> {
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
+    schedules: Vec<ScheduleWrite>,
     /// Exact ledger-causation-stamped outward occurrences in publication order.
     domain_event_occurrences: Vec<crate::DomainEventOccurrence>,
     /// Captured occurrences consumed only by a direct modeled projection.
@@ -783,6 +822,7 @@ where
         batch.outbox_messages = std::mem::take(&mut self.outbox_messages);
         batch.read_model_plans = std::mem::take(&mut self.read_model_plans);
         batch.snapshots = std::mem::take(&mut self.snapshots);
+        batch.schedules = std::mem::take(&mut self.schedules);
         Ok(batch)
     }
 

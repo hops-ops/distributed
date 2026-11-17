@@ -149,6 +149,7 @@ fn expand(
 
     let mut field_tokens = Vec::new();
     let mut effect_input_markers = Vec::new();
+    let mut field_names: Vec<String> = Vec::new();
     for field in &fields.named {
         validate_serde_field_shape(&field.attrs, serde_direction)?;
         let field_name = field
@@ -165,6 +166,11 @@ fn expand(
                     .map(|rule| rule.apply(rust_field_name))
                     .unwrap_or_else(|| rust_field_name.to_string())
             });
+        for name in [rust_field_name.to_string(), field_name_str.clone()] {
+            if !field_names.contains(&name) {
+                field_names.push(name);
+            }
+        }
         let (type_name, nullable, list, item_nullable, nested) =
             map_type(&field.ty, field, &nested_trait, &method)?;
         let unsigned_integer = unsigned_integer_tokens(&field.ty, &framework);
@@ -221,8 +227,13 @@ fn expand(
     }
 
     let type_name_str = name.to_string();
+    let field_names_const = matches!(serde_direction, SerdeDirection::Deserialize).then(|| {
+        quote! { const FIELD_NAMES: &'static [&'static str] = &[#(#field_names),*]; }
+    });
     Ok(quote! {
         impl #trait_path for #name {
+            #field_names_const
+
             fn #method() -> #type_def {
                 #type_def::new(
                     #type_name_str,

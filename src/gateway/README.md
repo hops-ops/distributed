@@ -52,6 +52,12 @@ upgrades require an explicit target opt-in and close on disconnect, identity
 expiry or configured lifetime. Exact public-origin loops fail construction;
 a bounded hop chain also detects loops through aliases at runtime.
 
+`BindingKind::Zones` (`NativeBinding::Zones`) routes a prefix such as
+`/zones` to a zone host, e.g. celld's public listener. The path is forwarded
+unchanged and WebSocket upgrades are always allowed; zones verify their own
+join tickets, so the gateway forwards no credential. Mount it on the zone
+prefix only, so other routes of the zone host stay private.
+
 `StaticAssets` validates an immutable preloaded path/byte inventory and memory
 budget. Protected assets run normal admission before lookup. It performs no
 caller-selected filesystem access. Native construction starts no listener,

@@ -17,7 +17,8 @@ import type {
 	ReplicaPersistencePolicy
 } from './types.js';
 
-export const DATABASE_VERSION = 1;
+/** v2 adds the durable command outbox store. */
+export const DATABASE_VERSION = 2;
 export const ENTRY_FORMAT_VERSION = 1;
 export const STORE_NAME = 'confirmed-replicas';
 export const DEFAULT_DATABASE_NAME = '@hops-ops/distributed:replica';

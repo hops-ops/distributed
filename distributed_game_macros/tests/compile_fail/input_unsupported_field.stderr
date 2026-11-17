@@ -1,0 +1,20 @@
+error[E0277]: `String` cannot be a game input field
+ --> tests/compile_fail/input_unsupported_field.rs:5:11
+  |
+5 |     text: String,
+  |     ------^^^^^^
+  |     |     |
+  |     |     unsupported input field type
+  |     `String` doesn't satisfy the trait bound
+  |
+  = help: the trait `InputField` is not implemented for `String`
+  = note: inputs are small fixed scalars: bool, u8, i8, u16, i16, u32, i32 or f32 (optionally #[quant]/#[angle])
+  = help: the following other types implement trait `InputField`:
+            bool
+            f32
+            i16
+            i32
+            i8
+            u16
+            u32
+            u8

@@ -356,6 +356,11 @@ pub fn surface_for_role(
         projectors,
         projectors_attached: surface.projectors_attached,
         service_binding: surface.service_binding.clone(),
+        leaderboards: surface
+            .leaderboards
+            .iter()
+            .filter_map(|leaderboard| leaderboard.for_role(role))
+            .collect(),
     })
 }
 
@@ -725,6 +730,13 @@ pub fn surface_for_application_contract(
     selected
         .commands
         .sort_by(|a, b| a.command_name.cmp(&b.command_name));
+    // Leaderboard operations on the client contract are those every schema
+    // role is granted.
+    selected.leaderboards = surface
+        .leaderboards
+        .iter()
+        .filter_map(|leaderboard| leaderboard.for_roles(application, &schema_roles))
+        .collect();
     selected.selection = SurfaceSelection::Application {
         name: application.to_string(),
         eligible_roles,

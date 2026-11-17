@@ -277,11 +277,16 @@ exit 1
     let path = root.join("distributed.lifecycle.json");
     let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     config["dev"]["prepare_ms"] = serde_json::json!(100);
+    // The probe rejects a replacement by never passing, so this budget is
+    // also how long a rejection takes. It must still leave headroom for the
+    // initial generation's probe (a `/bin/sh` spawn) under a loaded
+    // `cargo test --workspace`: at 100 ms that probe timed out and the
+    // supervisor failed before the test's first assertion.
     config["dev"]["processes"]["api"]["ready"] = serde_json::json!({
         "program": "/bin/sh",
         "args": ["{root}/generation-probe.sh", "{root}"],
         "interval_ms": 10,
-        "timeout_ms": 100
+        "timeout_ms": 1500
     });
     fs::write(path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 }

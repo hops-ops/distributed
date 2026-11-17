@@ -39,6 +39,7 @@ impl GraphqlEngineBuilder {
             // DevHeaders keeps ambient header tests/green; public scaffolds set OidcBearer (D6).
             identity: IdentityConfig::dev_headers(),
             read_stores: BTreeMap::new(),
+            leaderboards: Vec::new(),
         }
     }
 
@@ -597,6 +598,21 @@ impl GraphqlEngineBuilder {
         self.identity = config;
         self
     }
+    /// Expose a sorted-set leaderboard through GraphQL (roots, `@live`
+    /// subscriptions, the client manifest and the generated TS client); see
+    /// [`LeaderboardSurface`](crate::graphql::surface::LeaderboardSurface).
+    /// Feed `@live` by registering
+    /// [`GraphqlEngine::leaderboard_change_listener`] on the projector that
+    /// writes `store`.
+    pub fn leaderboard(
+        mut self,
+        surface: crate::graphql::surface::LeaderboardSurface,
+        store: Arc<dyn crate::leaderboard::LeaderboardStore>,
+    ) -> Self {
+        self.leaderboards.push((surface, store));
+        self
+    }
+
     pub fn change_stream(mut self, rx: tokio::sync::broadcast::Receiver<ReadModelChange>) -> Self {
         self.change_rx = Some(rx);
         self
@@ -652,6 +668,18 @@ impl GraphqlEngineBuilder {
 
         // Validate permissions.
         let declared_roles = self.roles.clone();
+        for (leaderboard, _) in &self.leaderboards {
+            for role in leaderboard.grants().keys() {
+                if let Some(roles) = &declared_roles {
+                    if !roles.contains(role) && role != &self.anonymous_role {
+                        return Err(GraphqlBuildError(format!(
+                            "leaderboard `{}` grants undeclared role `{role}`",
+                            leaderboard.name()
+                        )));
+                    }
+                }
+            }
+        }
         let anonymous = self.anonymous_role.clone();
         let perm_keys: Vec<_> = self.permissions.keys().cloned().collect();
         for (model, role) in &perm_keys {
@@ -771,6 +799,8 @@ impl GraphqlEngineBuilder {
                 .map_err(GraphqlBuildError)?
                 .with_service_binding(self.command_binding.clone())
                 .with_projection_owners(self.projectors.clone())
+                .map_err(GraphqlBuildError)?
+                .with_leaderboards(self.leaderboards.iter().map(|(surface, _)| surface.clone()))
                 .map_err(GraphqlBuildError)?,
         );
         let query_protocol = if self.protocol_token_key.is_some() {
@@ -791,6 +821,11 @@ impl GraphqlEngineBuilder {
             .transpose()?;
 
         let mut roles: BTreeSet<String> = self.permissions.keys().map(|(_, r)| r.clone()).collect();
+        roles.extend(
+            self.leaderboards
+                .iter()
+                .flat_map(|(leaderboard, _)| leaderboard.grants().keys().cloned()),
+        );
         if let Some(declared) = &declared_roles {
             roles.extend(declared.iter().cloned());
         }
@@ -835,7 +870,7 @@ impl GraphqlEngineBuilder {
                     .as_deref()
                     .expect("protocol configuration validated a service ID");
                 let (authorization_fingerprint, claim_keys) =
-                    role_authorization_info(role, &self.permissions)?;
+                    role_authorization_info(role, &self.permissions, &full_surface.leaderboards)?;
                 let export = DistributedClientSurfaceExport::from_selected_with_execution(
                     service_id,
                     Arc::clone(&role_surface),
@@ -950,7 +985,11 @@ impl GraphqlEngineBuilder {
                 };
                 let (authorization_fingerprint, claim_keys) =
                     if registration.schema_roles.len() == 1 {
-                        role_authorization_info(&registration.schema_roles[0], &self.permissions)?
+                        role_authorization_info(
+                            &registration.schema_roles[0],
+                            &self.permissions,
+                            &full_surface.leaderboards,
+                        )?
                     } else {
                         // Multi-privilege: fingerprint the application surface grant
                         // intersection under the synthetic privilege key.
@@ -958,6 +997,7 @@ impl GraphqlEngineBuilder {
                             &privilege_key,
                             &registration.schema_roles,
                             &self.permissions,
+                            &full_surface.leaderboards,
                         )?
                     };
                 // Ensure the privilege key has a role surface for projection
@@ -1079,6 +1119,11 @@ impl GraphqlEngineBuilder {
             query_protocol,
             read_stores: read_store_kinds,
             cell_getters,
+            leaderboard_stores: self
+                .leaderboards
+                .into_iter()
+                .map(|(surface, store)| (surface.name().to_string(), store))
+                .collect(),
         });
 
         Ok(GraphqlEngine { inner })

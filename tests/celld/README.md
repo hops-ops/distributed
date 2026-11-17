@@ -1,4 +1,4 @@
-# celld 0.4 aggregate cells, Queue, and bus relay
+# celld aggregate cells, Queue, and bus relay
 
 This fixture exercises the write side of the Distributed flow:
 
@@ -34,7 +34,18 @@ match cell.drain_outbox(&env).await {
     Err(error) => worker::console_error!("outbox drain deferred: {error}"),
 }
 
-// The Durable Object alarm handler also calls drain_outbox(&env).
+// The Durable Object alarm handler calls cell.alarm(&env): it fires due cell
+// alarms (see docs/coordination-primitives.md) and then drains the outbox.
+```
+
+Domain cell alarms share the one Durable Object alarm with the outbox
+watchdog; every wake is set to the earliest of the two. `alarm-worker/` is a
+Ticker cell that arms, re-arms and cancels alarms, and `alarms.mjs` proves it
+on an isolated `celld dev` (including a crash and restart):
+
+```sh
+(cd tests/celld/alarm-worker && worker-build --release)
+CELLD_BIN=celld node tests/celld/alarms.mjs
 ```
 
 The Queue lives in another cell: its acceptance is **not** part of the
@@ -61,6 +72,17 @@ Workers now open cells with `AggregateCell::from_state` or
 The whole-state export/restore and `persist_and_drain_outbox` APIs are not
 available on the Worker host. Native in-process conformance fixtures are not a
 production persistence adapter.
+
+### No native durable cells
+
+Durable cells run on celld only, for local development (`celld dev`) and
+deployment alike. The native `cell-sqlite` backend (one rusqlite file per
+cell) was removed in v5: a native build has only the in-process reference
+host, for unit tests (`CellStreamStore::for_identity`, whole-state
+export/restore, `ManualClock` alarms). A native process that needs durable
+aggregates talks to celld over the internal path (`CelldCommandHost`,
+`distributed_game::celld::CelldFactSink`); see `examples/game/cells` for a
+zone server's cells.
 
 Existing `cell_state` databases are rejected with an explicit migration-required
 error. They are not silently reset or opened through a legacy adapter. Back up
@@ -132,7 +154,8 @@ correctness.
 
 ## Local celld
 
-Prerequisites: Docker (for NATS), celld 0.4, `worker-build`, and the
+Prerequisites: Docker (for NATS), celld (the version in `/.celld-version`,
+checked by `scripts/celld.sh`; `CELLD_BIN` selects the binary), `worker-build`, and the
 `wasm32-unknown-unknown` Rust target.
 
 ```sh
@@ -141,7 +164,7 @@ make -C tests/celld test
 make -C tests/celld down
 ```
 
-celld 0.4 development mode supplies its own local object store; Azurite, MinIO,
+celld development mode supplies its own local object store; Azurite, MinIO,
 and an external S3 endpoint are not used. The canonical profile stores cell and
 Queue data in `tests/celld/worker/.celld/dev`. `make down` and `make reload`
 preserve that directory.
@@ -188,3 +211,20 @@ from the full Queue/NATS/browser profile.
 Every non-health aggregate route requires `DISTRIBUTED_INTERNAL_SECRET`. The
 checked-in value is loopback test data only; production requires a separately
 provisioned secret plus the normal network policy.
+
+## Zones as celld objects
+
+`zone-worker/` hosts a small tally zone with `distributed_game`'s
+`celld-zone` feature (one Durable Object per zone, `celld_zone_object!`),
+its `Tally` cells and the `ZoneActivity` cell. `distributed_game`'s
+`celld_zone` test drives it over WebSockets: on `celld dev` (join, input,
+facts, dormant → hibernated, wake with state, single-use tickets, a
+doorway handoff) and on a three-node production-mode fleet on one RustFS
+bucket started with docker compose (a forwarded socket closes with 1012
+when the owner node is killed, the zone recovers on another node, and 200
+in-flight facts reach the cell exactly once):
+
+```sh
+(cd tests/celld/zone-worker && worker-build --release)
+CELLD_BIN=… CELLD_ESBUILD=… cargo test -p distributed_game --features celld,net --test celld_zone
+```

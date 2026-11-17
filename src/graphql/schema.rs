@@ -143,6 +143,17 @@ pub fn build_role_schema(
         }
     }
 
+    // Leaderboard roots granted to this role (resolved by their stores).
+    let (with_leaderboards, leaderboard_entry) =
+        super::leaderboard_roots::add_query_roots(query, role_surface);
+    query = with_leaderboards;
+    if leaderboard_entry {
+        registered_objects.insert(
+            super::surface::LEADERBOARD_ENTRY_TYPE.to_string(),
+            super::leaderboard_roots::entry_object(),
+        );
+    }
+
     // Comparison input types come from this exact role Surface instance.
     // Only register when IR lists ops — never emit empty input objects.
     for scalar in &scalars_needed {
@@ -178,7 +189,7 @@ pub fn build_role_schema(
 
     // Empty-role Query must still define ≥1 field (async-graphql requirement).
     // Spec: empty role → FORBIDDEN with extensions.code (no query surface).
-    if role_surface.query_fields.is_empty() && !has_causal_commands {
+    if role_surface.query_fields.is_empty() && !leaderboard_entry && !has_causal_commands {
         query = query.field(Field::new(
             "_empty",
             TypeRef::named_nn(TypeRef::BOOLEAN),
@@ -320,6 +331,13 @@ pub fn build_role_schema(
         );
         subscription = subscription.field(field);
         has_subscription = true;
+    }
+
+    if role_surface.subscriptions {
+        let (with_leaderboards, added) =
+            super::leaderboard_roots::add_subscription_roots(subscription, role_surface);
+        subscription = with_leaderboards;
+        has_subscription |= added > 0;
     }
 
     let mut builder = if let Some(m) = mutation {
@@ -918,7 +936,7 @@ fn sanitize_compile_error(e: &str) -> String {
     }
 }
 
-fn client_error(code: &str, message: impl Into<String>) -> async_graphql::Error {
+pub(crate) fn client_error(code: &str, message: impl Into<String>) -> async_graphql::Error {
     use async_graphql::ErrorExtensions;
     let code = code.to_string();
     async_graphql::Error::new(message.into()).extend_with(move |_, ext| {
@@ -1255,6 +1273,7 @@ mod causal_command_schema_tests {
             projectors: Vec::new(),
             projectors_attached: false,
             service_binding: None,
+            leaderboards: Vec::new(),
         }
     }
 

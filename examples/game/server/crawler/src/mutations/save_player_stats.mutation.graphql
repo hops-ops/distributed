@@ -1,0 +1,5 @@
+# Syntax-only read-model mutation → MutationProgram IR (not a public field).
+# The row is the Crawler's post-kill state carried by the domain event.
+mutation SavePlayerStats {
+  upsert_player_stats(object: $input.player)
+}

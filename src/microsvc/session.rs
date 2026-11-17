@@ -136,7 +136,12 @@ impl Session {
         self.variables.insert(key.into(), value.into());
     }
 
-    /// Check if a session variable exists.
+    /// Remove a variable, returning its value.
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        self.variables.remove(key)
+    }
+
+    /// Whether `key` is set.
     pub fn has(&self, key: &str) -> bool {
         self.variables.contains_key(key)
     }

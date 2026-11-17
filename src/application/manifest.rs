@@ -1832,7 +1832,7 @@ fn surface_contract_from_spec(surface: &SurfaceSpec) -> ApplicationResult<serde_
             })
         })
         .collect::<Vec<_>>();
-    Ok(canonical_json(&serde_json::json!({
+    let mut contract = serde_json::json!({
         "version": 1,
         "selection": selection,
         "dialect": surface.dialect,
@@ -1847,7 +1847,12 @@ fn surface_contract_from_spec(surface: &SurfaceSpec) -> ApplicationResult<serde_
         "commands_attached": surface.commands_attached,
         "projectors": projectors,
         "projectors_attached": surface.projectors_attached,
-    })))
+    });
+    // Absent without leaderboards, like the Surface IR contract.
+    if !surface.leaderboards.is_empty() {
+        contract["leaderboards"] = serde_json::Value::Array(surface.leaderboards.clone());
+    }
+    Ok(canonical_json(&contract))
 }
 
 fn surface_command_type_value(

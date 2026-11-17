@@ -1,0 +1,92 @@
+/* Leaderboard page (DOM only). */
+.lb {
+	max-width: 1100px;
+	margin: 0 auto;
+	padding: 16px;
+	box-sizing: border-box;
+}
+.lb h1 {
+	margin: 0 0 4px;
+	font-size: 18px;
+}
+.lb h2 {
+	margin: 0 0 6px;
+	font-size: 14px;
+}
+.lb a {
+	color: var(--accent);
+}
+.lb-hint {
+	color: var(--muted);
+}
+.lb-status {
+	margin: 10px 0;
+	padding: 6px 10px;
+	border-radius: 6px;
+	background: var(--panel);
+	transition: background 0.4s ease;
+}
+.lb-status.flash {
+	background: #1f3a2a;
+	transition: none;
+}
+.lb-grid {
+	display: grid;
+	grid-template-columns: 1fr 1fr 260px;
+	gap: 12px;
+}
+.lb-grid section {
+	padding: 10px 12px;
+	border-radius: 8px;
+	background: var(--panel);
+}
+.lb table {
+	width: 100%;
+	border-collapse: collapse;
+}
+.lb td {
+	padding: 3px 4px;
+	border-bottom: 1px solid #222a35;
+}
+.lb td.num {
+	text-align: right;
+}
+.lb tr.me td {
+	color: var(--accent);
+	font-weight: bold;
+}
+.lb-me canvas {
+	width: 100%;
+	max-width: 240px;
+	aspect-ratio: 1;
+	background: #0b0d12;
+	border-radius: 6px;
+}
+.lb-me .pos {
+	margin-bottom: 8px;
+}
+.lb-rebuild {
+	margin-top: 12px;
+	padding: 10px 12px;
+	border-radius: 8px;
+	background: var(--panel);
+}
+.lb-rebuild button {
+	font: inherit;
+	padding: 6px 12px;
+	margin-right: 8px;
+	border: 1px solid #3a4556;
+	border-radius: 6px;
+	background: #1a2230;
+	color: var(--text);
+	cursor: pointer;
+}
+.lb-rebuild pre {
+	margin: 8px 0 0;
+	white-space: pre-wrap;
+}
+@media (max-width: 860px) {
+	.lb-grid {
+		grid-template-columns: 1fr;
+	}
+}

@@ -25,6 +25,7 @@ pub(crate) struct ClientManifest {
     pub(crate) projectors: Vec<ManifestProjector>,
     pub(crate) projection_programs: Vec<ManifestProjectionProgram>,
     pub(crate) projection_bindings: Vec<ManifestProjectionBinding>,
+    pub(crate) leaderboards: Vec<super::ManifestLeaderboard>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

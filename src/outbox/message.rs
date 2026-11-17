@@ -125,6 +125,13 @@ pub struct OutboxMessage {
     pub source_aggregate_type: Option<String>,
     pub source_aggregate_id: Option<String>,
     pub source_sequence: Option<u64>,
+    /// Earliest time a worker may claim this message (a durable timer /
+    /// scheduled command). `None` means immediately deliverable. SQL stores
+    /// persist it in the existing `next_available_at` column, so a scheduled
+    /// message survives restart and is skipped by every claim query until it
+    /// is due. See [`OutboxMessage::deliver_at()`].
+    #[serde(default)]
+    pub deliver_at: Option<SystemTime>,
 }
 
 impl Default for OutboxMessage {
@@ -146,6 +153,7 @@ impl Default for OutboxMessage {
             source_aggregate_type: None,
             source_aggregate_id: None,
             source_sequence: None,
+            deliver_at: None,
         }
     }
 }
@@ -374,8 +382,37 @@ impl OutboxMessage {
         self.is_in_flight() && self.leased_until.map(|until| until <= now).unwrap_or(true)
     }
 
+    /// Whether the message is claimable at `now`: pending and due (see
+    /// [`deliver_at`](Self::deliver_at())), or in flight with an expired lease.
     pub fn is_claimable_at(&self, now: SystemTime) -> bool {
-        self.is_pending() || self.has_expired_lease_at(now)
+        (self.is_pending() && self.is_due_at(now)) || self.has_expired_lease_at(now)
+    }
+
+    /// Whether the scheduled delivery time (if any) has been reached.
+    pub fn is_due_at(&self, now: SystemTime) -> bool {
+        self.deliver_at.is_none_or(|at| at <= now)
+    }
+
+    /// Schedule this message: no worker claims it before `at`. This is the
+    /// durable-timer primitive — commit the message with the aggregate change
+    /// that arms the timer, and it survives restarts like any outbox row.
+    /// Times in the past (or `None` via [`deliver_now`](Self::deliver_now))
+    /// are immediately deliverable.
+    pub fn deliver_at(mut self, at: SystemTime) -> Self {
+        self.deliver_at = Some(at);
+        self
+    }
+
+    /// Schedule this message `delay` after `now` (see [`deliver_at`](Self::deliver_at())).
+    pub fn deliver_after(self, now: SystemTime, delay: Duration) -> Self {
+        let at = now.checked_add(delay).unwrap_or(now);
+        self.deliver_at(at)
+    }
+
+    /// Clear any schedule so the message is immediately deliverable.
+    pub fn deliver_now(mut self) -> Self {
+        self.deliver_at = None;
+        self
     }
 
     pub fn is_claimed_by(&self, worker_id: &str) -> bool {
@@ -441,6 +478,7 @@ impl OutboxMessage {
         self.source_aggregate_type = None;
         self.source_aggregate_id = None;
         self.source_sequence = None;
+        self.deliver_at = None;
         Ok(())
     }
 

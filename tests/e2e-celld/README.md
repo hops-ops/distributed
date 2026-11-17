@@ -51,11 +51,18 @@ make test               # cargo test --workspace (CI)
 ```sh
 cd tests/e2e-ui
 make up                 # Zitadel + Postgres (read models + login)
-make up-celld-nats      # celld 0.4 local store + NATS
+make up-celld-nats      # celld local store + Queue relay + NATS
 
 cd ../e2e-celld
 make run                # public gateway :8791 + internal UI :5180 (watches sources)
+make test-browser       # the full e2e-ui Playwright suite against this app
 ```
+
+`make test-browser` runs every Playwright project (setup, user, admin, anon)
+of `tests/e2e-ui` against this app; CI's live celld job does the same. On a
+cold checkout, build once first (`cargo run -p distributed_cli -- build
+tests/e2e-celld` from the repository root): `distributed dev` gives the API
+five minutes to become ready, and a cold compile can take longer.
 
 Eventual projectors and `@live` use **Postgres** from `e2e-ui.env`
 (`DATABASE_URL`). There is no SQLite read-model path. Cells still keep
@@ -82,4 +89,5 @@ Open `http://localhost:8791`. The navbar shows a **celld** badge. Sign in
 (`alice` / `Password1!` when Zitadel is up). Todos create/complete and
 lobby posts go to cells; open Chat in two tabs to see `@live` still fire.
 
-Override a busy celld port: `CELLD_HTTP_PORT=18880 make run`.
+celld listens on 18880 by default (Zitadel owns 18080). Override a busy port
+with `CELLD_HTTP_PORT=<port>` on both `make up-celld-nats` and `make run`.

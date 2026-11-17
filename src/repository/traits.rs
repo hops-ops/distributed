@@ -39,6 +39,9 @@ pub struct CommitBatch<'a> {
     /// Consumer inbox receipts to record in the same transaction (the optional
     /// effectively-once effect fence). Empty for the default idempotent path.
     pub inbox_receipts: Vec<InboxReceipt>,
+    /// Schedule writes ([`crate::schedule`]), owned by the batch's one
+    /// stream and stored in the same transaction on every backend.
+    pub schedules: Vec<crate::schedule::ScheduleWrite>,
 }
 
 impl<'a> CommitBatch<'a> {
@@ -49,6 +52,7 @@ impl<'a> CommitBatch<'a> {
             read_model_plans: Vec::new(),
             snapshots: Vec::new(),
             inbox_receipts: Vec::new(),
+            schedules: Vec::new(),
         }
     }
 
@@ -201,8 +205,13 @@ pub trait RelationalReadModelQueryStore: Send + Sync {
     fn scan_read_model(
         &self,
         _request: crate::read_model::ReadModelScanRequest,
-    ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_ {
-        async { Err(TableStoreError::Metadata("bounded read-model scan is unsupported by this adapter".into())) }
+    ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_
+    {
+        async {
+            Err(TableStoreError::Metadata(
+                "bounded read-model scan is unsupported by this adapter".into(),
+            ))
+        }
     }
 
     fn load_graph(

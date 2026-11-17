@@ -1,0 +1,162 @@
+:root {
+	color-scheme: dark;
+	--bg: #0e1116;
+	--panel: rgba(16, 20, 27, 0.86);
+	--text: #d7dde8;
+	--muted: #8793a6;
+	--accent: #6cc4ff;
+	font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+html,
+body {
+	margin: 0;
+	height: 100%;
+	background: var(--bg);
+	color: var(--text);
+	overflow: hidden;
+}
+.stage {
+	position: fixed;
+	inset: 0;
+}
+.stage canvas {
+	width: 100%;
+	height: 100%;
+	display: block;
+	outline: none;
+	touch-action: none;
+}
+.labels {
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+	overflow: hidden;
+}
+.label {
+	position: absolute;
+	left: 0;
+	top: 0;
+	padding: 1px 6px;
+	border-radius: 4px;
+	background: rgba(0, 0, 0, 0.55);
+	white-space: nowrap;
+	font-size: 12px;
+}
+.label.me {
+	color: var(--accent);
+}
+.hud {
+	position: fixed;
+	top: 12px;
+	left: 12px;
+	width: 300px;
+	max-height: calc(100% - 24px);
+	overflow: auto;
+	padding: 10px 12px;
+	border-radius: 8px;
+	background: var(--panel);
+	box-sizing: border-box;
+}
+.hud h1 {
+	margin: 0 0 4px;
+	font-size: 15px;
+}
+.hud .hint {
+	margin: 0 0 8px;
+	color: var(--muted);
+}
+.hud dl {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: 2px 10px;
+	margin: 0 0 8px;
+}
+.hud dt {
+	color: var(--muted);
+}
+.hud dd {
+	margin: 0;
+	text-align: right;
+}
+.hud .controls {
+	margin: 0 0 8px;
+	padding-bottom: 6px;
+	border-bottom: 1px solid #2a3240;
+}
+.hud .toggle {
+	display: flex;
+	align-items: baseline;
+	gap: 6px;
+	margin: 4px 0;
+	cursor: pointer;
+}
+.hud .toggle kbd {
+	margin-left: auto;
+	flex-shrink: 0;
+	white-space: nowrap;
+	padding: 0 5px;
+	border: 1px solid #3a4558;
+	border-radius: 3px;
+	color: var(--muted);
+	font: 11px monospace;
+}
+.hud fieldset {
+	margin: 8px 0 0;
+	border: 1px solid #2a3240;
+	border-radius: 6px;
+}
+.hud .slider {
+	display: grid;
+	grid-template-columns: 1fr;
+	margin: 4px 0;
+}
+.hud .slider output {
+	color: var(--accent);
+}
+.hud small {
+	color: var(--muted);
+}
+.index {
+	max-width: 760px;
+	margin: 40px auto;
+	padding: 0 16px;
+	overflow: auto;
+}
+.index a {
+	color: var(--accent);
+}
+@media (max-width: 640px) {
+	.hud {
+		width: calc(100% - 24px);
+		max-height: 45%;
+	}
+}
+.minimap {
+	position: fixed;
+	top: 12px;
+	right: 12px;
+	padding: 8px;
+	border-radius: 8px;
+	background: var(--panel);
+	font-size: 11px;
+}
+.minimap canvas {
+	display: block;
+	border-radius: 4px;
+}
+.minimap ul {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px 10px;
+	max-width: 180px;
+	margin: 6px 0 0;
+	padding: 0;
+	list-style: none;
+}
+.minimap li span {
+	display: inline-block;
+	width: 8px;
+	height: 8px;
+	margin-right: 4px;
+	border-radius: 50%;
+}

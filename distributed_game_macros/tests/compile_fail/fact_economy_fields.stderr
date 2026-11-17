@@ -1,0 +1,77 @@
+error: fact input field `amount` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+ --> tests/compile_fail/fact_economy_fields.rs:9:5
+  |
+9 |     amount: u32,
+  |     ^^^^^^
+
+error: fact input field `Coins` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:10:5
+   |
+10 |     Coins: u32,
+   |     ^^^^^
+
+error: fact input field `GOLD` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:11:5
+   |
+11 |     GOLD: u32,
+   |     ^^^^
+
+error: fact input field `currency_` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:12:5
+   |
+12 |     currency_: String,
+   |     ^^^^^^^^^
+
+error: fact input field `price` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:13:5
+   |
+13 |     price: u32,
+   |     ^^^^^
+
+error: fact input field `cost` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:14:5
+   |
+14 |     cost: u32,
+   |     ^^^^
+
+error: fact input field `bal_ance` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:15:5
+   |
+15 |     bal_ance: u64,
+   |     ^^^^^^^^
+
+error: fact input field `grant` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:16:5
+   |
+16 |     grant: u32,
+   |     ^^^^^
+
+error: fact input field `pay_out` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:17:5
+   |
+17 |     pay_out: u32,
+   |     ^^^^^^^
+
+error: fact input field `CREDIT` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:18:5
+   |
+18 |     CREDIT: u32,
+   |     ^^^^^^
+
+error: fact input field `debit` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:19:5
+   |
+19 |     debit: u32,
+   |     ^^^^^
+
+error: fact input field `Pay-Out` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:20:22
+   |
+20 |     #[serde(rename = "Pay-Out")]
+   |                      ^^^^^^^^^
+
+error: fact input field `gold-` looks like an economy value: a zone fact reports what happened; the host binds the principal from the verified ticket and the command handler decides rewards and economy values
+  --> tests/compile_fail/fact_economy_fields.rs:22:43
+   |
+22 |     #[serde(alias = "goldAmount", alias = "gold-")]
+   |                                           ^^^^^^^

@@ -715,8 +715,13 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
     let mut seen_variants: std::collections::HashMap<String, LitStr> =
         std::collections::HashMap::new();
 
+    let mut commands = Vec::new();
     for item in &mut impl_block.items {
         if let syn::ImplItem::Fn(method) = item {
+            if let Some(command) = crate::aggregate_command::take(method)? {
+                commands.push(command);
+                continue;
+            }
             match find_and_remove_event_attr(&mut method.attrs) {
                 Ok(Some(event_attr)) => {
                     // Event methods are replayed as `self.method(...)`, so they
@@ -863,8 +868,26 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
         }
     }
 
+    let command_methods: std::collections::BTreeSet<String> = commands
+        .iter()
+        .map(|command| command.method().to_string())
+        .collect();
     let domain_command_transitions =
-        discover_domain_command_transitions(&impl_block, &event_methods);
+        discover_domain_command_transitions(&impl_block, &event_methods, &command_methods);
+    let self_ty = (*impl_block.self_ty).clone();
+    let command_mounts = commands
+        .iter()
+        .map(|command| {
+            let witness = domain_command_transitions
+                .iter()
+                .find(|transition| transition.method_name == *command.method())
+                .map(|transition| {
+                    let ty = method_name_to_type_ident(&transition.method_name);
+                    quote!(domain_commands::#ty)
+                });
+            crate::aggregate_command::expand(command, &self_ty, witness, &framework)
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
 
     let deletion_identity = if uses_deletion_identity {
         let identity = format_ident!("{struct_name}DomainIdentity");
@@ -1065,6 +1088,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
         #(#generated_domain_types)*
         #deletion_identity
         #domain_commands_module
+        #(#command_mounts)*
         #upcaster_wrappers
         #aggregate_impl
     };
@@ -1166,6 +1190,7 @@ fn ungroup_expr(expression: &Expr) -> &Expr {
 fn discover_domain_command_transitions(
     impl_block: &ItemImpl,
     event_methods: &[EventMethodInfo],
+    command_methods: &std::collections::BTreeSet<String>,
 ) -> Vec<DomainCommandTransition> {
     let recorders: std::collections::BTreeMap<String, DomainCommandEvent> = event_methods
         .iter()
@@ -1198,7 +1223,9 @@ fn discover_domain_command_transitions(
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut transitions = Vec::new();
     for (name, method) in &methods {
-        if !matches!(method.vis, syn::Visibility::Public(_)) {
+        // Public methods are transitions; so is every `#[command]` method
+        // (its generated mount needs the witness whatever its visibility).
+        if !matches!(method.vis, syn::Visibility::Public(_)) && !command_methods.contains(name) {
             continue;
         }
 

@@ -59,6 +59,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Sqlite {
     const COMMAND_LEDGER_SELECT: &'static str =
         crate::repository::sqlite_codec::COMMAND_LEDGER_SELECT;
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str = "";
+    const SCHEDULE_CLAIM_LOCK_SUFFIX: &'static str = "";
     const COMMAND_LEDGER_COMPACTION_LOCK_SUFFIX: &'static str = "";
     const EVENT_SELECT: &'static str = crate::repository::sqlite_codec::EVENT_SELECT;
     const SNAPSHOT_SELECT: &'static str = crate::repository::sqlite_codec::SNAPSHOT_SELECT;

@@ -542,6 +542,9 @@ pub struct Surface {
     /// Non-serializable provenance proving typed commands came from one
     /// executable Service inventory rather than a lookalike command list.
     pub(crate) service_binding: Option<crate::command::TypedServiceCommandBinding>,
+    /// Leaderboard surfaces ([`super::LeaderboardSurface`]). On a role or
+    /// application surface each one carries only that selection's grant.
+    pub(crate) leaderboards: Vec<super::LeaderboardSurface>,
 }
 
 /// Debug output is intentionally limited to already-authorized public IDs.
@@ -719,7 +722,7 @@ impl Surface {
             })
             .collect::<Result<Vec<_>, _>>()?;
         projectors.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "version": 1,
             "selection": selection,
             "dialect": format!("{:?}", self.dialect).to_ascii_lowercase(),
@@ -735,6 +738,16 @@ impl Surface {
             "projectors": projectors,
             "projectors_attached": self.projectors_attached,
         });
+        // Absent (not empty) without leaderboards, so existing contract
+        // identities and fingerprints are unchanged.
+        if !self.leaderboards.is_empty() {
+            value["leaderboards"] = serde_json::Value::Array(
+                self.leaderboards
+                    .iter()
+                    .map(super::LeaderboardSurface::canonical_value)
+                    .collect(),
+            );
+        }
         Ok(crate::application::canonical_json(&value))
     }
 
@@ -882,6 +895,45 @@ impl Surface {
 
     /// Attach and validate a mixed registry of asynchronous projectors and
     /// same-transaction-only projection owners.
+    /// Attach leaderboard surfaces to the unselected catalog Surface. Role and
+    /// application selection keep each one only where it is granted.
+    pub fn with_leaderboards(
+        mut self,
+        leaderboards: impl IntoIterator<Item = super::LeaderboardSurface>,
+    ) -> Result<Self, String> {
+        if !matches!(self.selection, SurfaceSelection::Catalog) {
+            return Err(
+                "leaderboards can only be attached to the unselected catalog Surface before authorization selection"
+                    .into(),
+            );
+        }
+        let leaderboards = leaderboards.into_iter().collect::<Vec<_>>();
+        let roots = self
+            .query_fields
+            .iter()
+            .chain(&self.subscription_fields)
+            .map(|root| root.name.as_str())
+            .chain(
+                self.commands
+                    .iter()
+                    .map(|command| command.field_name.as_str()),
+            )
+            .collect::<Vec<_>>();
+        let types = self
+            .models
+            .values()
+            .map(|model| model.object_name.as_str())
+            .collect::<Vec<_>>();
+        super::leaderboard::validate_leaderboards(&leaderboards, &roots, &types)?;
+        self.leaderboards = leaderboards;
+        Ok(self)
+    }
+
+    /// Leaderboard surfaces visible on this selection.
+    pub fn leaderboards(&self) -> &[super::LeaderboardSurface] {
+        &self.leaderboards
+    }
+
     pub fn with_projection_owners(
         mut self,
         projectors: impl IntoIterator<Item = SurfaceProjectionOwner>,

@@ -54,6 +54,14 @@ pub(crate) fn render_project(
             contents: pures,
         });
     }
+    let leaderboards = super::leaderboards::render_leaderboards(manifest)?;
+    let has_leaderboards = leaderboards.is_some();
+    if let Some(leaderboards) = leaderboards {
+        files.push(GeneratedClientFile {
+            path: "leaderboards.ts".into(),
+            contents: leaderboards,
+        });
+    }
     files.push(GeneratedClientFile {
         path: "protocol.ts".into(),
         contents: render_protocol(manifest)?,
@@ -72,7 +80,7 @@ pub(crate) fn render_project(
     });
     files.push(GeneratedClientFile {
         path: "index.ts".into(),
-        contents: render_index(&operations, has_pures),
+        contents: render_index(&operations, has_pures, has_leaderboards),
     });
     files.push(GeneratedClientFile {
         path: "manifest.json".into(),
@@ -285,7 +293,11 @@ fn render_islands(
     ))
 }
 
-fn render_index(operations: &[CompiledOperation], has_pures: bool) -> String {
+fn render_index(
+    operations: &[CompiledOperation],
+    has_pures: bool,
+    has_leaderboards: bool,
+) -> String {
     let mut lines = vec![
         "/** GENERATED public entrypoint. */".to_string(),
         "export * from './commands.js';".into(),
@@ -294,6 +306,9 @@ fn render_index(operations: &[CompiledOperation], has_pures: bool) -> String {
     ];
     if has_pures {
         lines.push("export * from './pures.js';".into());
+    }
+    if has_leaderboards {
+        lines.push("export * from './leaderboards.js';".into());
     }
     for operation in operations {
         let module = operation

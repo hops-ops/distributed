@@ -18,11 +18,14 @@ worker-build as described in [worker.md](worker.md):
 cargo test --no-default-features --features gateway-graphql-native,gateway-delivery,sqlite --test graphql_query_protocol separate_origin_and_client_savings -- --ignored --nocapture
 ```
 
-`tests/gateway-worker/artifacts/load-report.json` records the source revision and
+`tests/gateway-worker/load-runtime.mjs` writes its report to
+`tests/gateway-worker/artifacts/load-report.json` (uploaded by CI, not
+checked in); [`load-report.json`](load-report.json) beside this page is a
+recorded run. The report records the source revision and
 whether it was dirty, runtime/platform, repetitions, payload size and resource
 limits. Native and workerd each run disabled, coalescing-only, snapshot-only and
-live-only modes. A barrier holds actual SQL until100 coalesced consumers join.
-Snapshots report warmup separately before100 hits. Every mode holds100 live
+live-only modes. A barrier holds actual SQL until 100 coalesced consumers join.
+Snapshots report warmup separately before 100 hits. Every mode holds 100 live
 consumers during a real projection commit; result SQL, origin validation, steady
 producers and all ongoing/temporary origin WebSocket connections are measured.
 Different-subject controls prove private isolation. External writes, explicit

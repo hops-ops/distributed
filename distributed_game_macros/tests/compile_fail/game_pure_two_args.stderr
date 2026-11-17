@@ -1,0 +1,5 @@
+error: a game pure function takes nothing or one argument `&T` (bundle several values in a #[derive(GameRecord)] struct)
+ --> tests/compile_fail/game_pure_two_args.rs:5:8
+  |
+5 | fn sum(a: &u32, b: &u32) -> u32 {
+  |        ^

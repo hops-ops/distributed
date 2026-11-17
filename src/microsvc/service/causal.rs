@@ -219,6 +219,9 @@ pub struct CausalDispatchResult {
     /// Domain-event evidence used to seal wait-path projection metadata.
     /// Transport delivery remains owned by the aggregate cell and Queue.
     pub(crate) projection_events: Vec<crate::OutboxMessage>,
+    /// The command ledger replayed an earlier receipt (the command id was
+    /// already settled); the handler did not run again.
+    pub(crate) replayed: bool,
 }
 
 /// Gateway-side capability for one externally dispatched command. The attempt
@@ -357,6 +360,18 @@ impl CausalDispatchResult {
     /// Client-supplied durable command id.
     pub fn command_id(&self) -> &str {
         &self.receipt.command_id
+    }
+
+    /// Whether this result replays an earlier settled receipt.
+    pub fn replayed(&self) -> bool {
+        self.replayed
+    }
+
+    /// The receipt of the attempt that just committed it (read back from
+    /// the ledger), not a replay.
+    pub(crate) fn fresh(mut self) -> Self {
+        self.replayed = false;
+        self
     }
 
     /// Ledger causation id assigned on accept.
@@ -510,7 +525,7 @@ impl CausalDispatchResult {
         let state = crate::command_ledger::CommandLedgerState::parse(&wire.receipt.state).map_err(
             |err| CausalDispatchError::Internal(format!("wait-path receipt state: {err}")),
         )?;
-        let _ = wire.receipt.replayed;
+        let replayed = wire.receipt.replayed.unwrap_or(false);
         let projection_events =
             crate::microsvc::cell_host::parse_cell_projection_events(&serde_json::json!({
                 "events": wire.events
@@ -523,6 +538,7 @@ impl CausalDispatchResult {
         Ok(Self {
             payload: wire.payload,
             projection_events,
+            replayed,
             receipt: CausalCommandReceiptSource {
                 command_id: wire.receipt.command_id,
                 command_name: String::new(),
@@ -740,6 +756,7 @@ pub(super) fn replay_result(
                 payload: receipt.outcome.clone(),
                 receipt,
                 projection_events: Vec::new(),
+                replayed: true,
             })
         }
         CommandLedgerState::Rejected => replay_rejection(replay.outcome),
@@ -844,7 +861,10 @@ where
         .await
         .map_err(internal_ledger_error)?
     {
-        CommandLookup::Replay(replay) => replay_result(consistency, replay),
+        // The receipt this attempt just wrote: not a replay.
+        CommandLookup::Replay(replay) => {
+            replay_result(consistency, replay).map(CausalDispatchResult::fresh)
+        }
         CommandLookup::Expired => Err(CausalDispatchError::Expired),
         CommandLookup::InProgress { .. }
         | CommandLookup::RetryableUnknown { .. }
@@ -903,7 +923,9 @@ where
         .lookup_command(fence.key(), CommandLookupScope::Attempt(&fence))
         .await
     {
-        Ok(CommandLookup::Replay(replay)) => replay_result(consistency, replay),
+        Ok(CommandLookup::Replay(replay)) => {
+            replay_result(consistency, replay).map(CausalDispatchResult::fresh)
+        }
         Ok(CommandLookup::Expired) => Err(CausalDispatchError::Expired),
         Ok(CommandLookup::RetryableUnknown { .. }) => Err(CausalDispatchError::Internal(detail)),
         Ok(CommandLookup::InProgress { .. }) => {

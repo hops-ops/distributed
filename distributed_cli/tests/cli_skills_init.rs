@@ -78,7 +78,7 @@ fn init_bootstraps_a_fresh_project_and_reruns_are_noops() {
     let agents_md = read(&dir, "AGENTS.md");
     assert!(agents_md.contains(BEGIN) && agents_md.contains(END));
     assert!(stdout.contains("created .distributed/skills/distributed-ci/SKILL.md"));
-    assert!(stdout.contains("Initialized 4 skills at .distributed/skills (wired: claude, agents)"));
+    assert!(stdout.contains("Initialized 5 skills at .distributed/skills (wired: claude, agents)"));
 
     // No strays at the harness skill roots (only skill folders).
     for root in [".agents/skills", ".claude/skills"] {

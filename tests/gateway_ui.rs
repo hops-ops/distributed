@@ -590,3 +590,134 @@ async fn capacity_cancellation_timeout_and_alias_loop_are_bounded() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::LOOP_DETECTED);
 }
+
+#[tokio::test]
+async fn zones_forward_sockets_and_info_under_their_prefix_only() {
+    let state = Upstream {
+        finish: Arc::new(Notify::new()),
+        dropped: Arc::new(AtomicUsize::new(0)),
+        ws_closed: Arc::new(Notify::new()),
+    };
+    let zones = serve(
+        Router::new()
+            .route("/zones/{zone}", get(websocket))
+            .route("/zones/{zone}/info", get(echo))
+            .route("/internal", get(|| async { "secret" }))
+            .with_state(state.clone()),
+    )
+    .await;
+    let ui = serve(Router::new().fallback(|| async { "ui" })).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let public = format!("http://{}", listener.local_addr().unwrap());
+    let config = GatewayConfig {
+        bindings: vec![
+            Binding::new(
+                "zones",
+                BindingKind::Zones {
+                    origin: zones.origin.clone(),
+                },
+            ),
+            Binding::new(
+                "ui",
+                BindingKind::UiProxy {
+                    origin: ui.origin.clone(),
+                },
+            ),
+        ],
+        routes: vec![
+            Route::new("zones", RoutePath::prefix("/zones"), "zones"),
+            Route::new("ui", RoutePath::prefix("/"), "ui"),
+        ],
+    }
+    .build()
+    .unwrap();
+    let router = NativeGateway::new(
+        config,
+        NativeOptions::new(&public),
+        vec![
+            ("zones".into(), NativeBinding::Zones),
+            ("ui".into(), NativeBinding::UiProxy { websocket: false }),
+        ],
+        auth(),
+    )
+    .unwrap()
+    .router();
+    let _ingress = Server {
+        origin: public.clone(),
+        task: tokio::spawn(async move { axum::serve(listener, router).await.unwrap() }),
+    };
+
+    // The zone sees its own path; no credential is forwarded to it.
+    let client = reqwest::Client::new();
+    let info: serde_json::Value = client
+        .get(format!("{public}/zones/pit.0.0/info"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["target"], "/zones/pit.0.0/info");
+    assert!(info["headers"].get("authorization").is_none());
+    // Paths outside the prefix never reach the zone host.
+    let other = client
+        .get(format!("{public}/internal"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.text().await.unwrap(), "ui");
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "{}/zones/pit.0.0",
+        public.replace("http:", "ws:")
+    ))
+    .await
+    .unwrap();
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        vec![1, 2, 3].into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        ws.next().await.unwrap().unwrap().into_data().as_ref(),
+        [1, 2, 3]
+    );
+    ws.close(None).await.unwrap();
+    drop(ws);
+    tokio::time::timeout(Duration::from_secs(2), state.ws_closed.notified())
+        .await
+        .unwrap();
+}
+
+#[test]
+fn zones_origin_cannot_be_the_gateway() {
+    let public = "http://gateway.test";
+    let config = GatewayConfig {
+        bindings: vec![Binding::new(
+            "zones",
+            BindingKind::Zones {
+                origin: public.into(),
+            },
+        )],
+        routes: vec![Route::new("zones", RoutePath::prefix("/zones"), "zones")],
+    }
+    .build()
+    .unwrap();
+    let built = NativeGateway::new(
+        config,
+        NativeOptions::new(public),
+        vec![("zones".into(), NativeBinding::Zones)],
+        auth(),
+    );
+    assert!(built.is_err());
+    let invalid = GatewayConfig {
+        bindings: vec![Binding::new(
+            "zones",
+            BindingKind::Zones {
+                origin: "http://zones.test/rooms".into(),
+            },
+        )],
+        routes: vec![Route::new("zones", RoutePath::prefix("/zones"), "zones")],
+    };
+    assert!(invalid.build().is_err());
+}

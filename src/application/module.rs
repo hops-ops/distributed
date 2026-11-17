@@ -318,6 +318,11 @@ pub struct SurfaceSpec {
     pub comparison_ops: BTreeMap<String, Vec<String>>,
     pub commands_attached: bool,
     pub projectors_attached: bool,
+    /// Canonical leaderboard sections (`LeaderboardSurface`), in contract
+    /// order. Absent when empty, so manifests without leaderboards keep
+    /// their bytes and fingerprints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leaderboards: Vec<serde_json::Value>,
     /// Canonical lossless Surface IR snapshot. It is the identity authority
     /// for SDL/client compilation and must never be reconstructed from tables.
     pub contract: serde_json::Value,
@@ -344,6 +349,7 @@ impl SurfaceSpec {
             comparison_ops: BTreeMap::new(),
             commands_attached: false,
             projectors_attached: false,
+            leaderboards: Vec::new(),
             contract: serde_json::json!({
                 "version": 1,
                 "selection": {"kind": "catalog"},
@@ -492,6 +498,11 @@ impl SurfaceSpec {
             comparison_ops: surface.comparison_ops.clone(),
             commands_attached: surface.commands_attached,
             projectors_attached: surface.projectors_attached,
+            leaderboards: surface
+                .leaderboards
+                .iter()
+                .map(crate::graphql::surface::LeaderboardSurface::canonical_value)
+                .collect(),
             contract: surface
                 .canonical_contract_value()
                 .map_err(ApplicationError::InvalidSpec)?,

@@ -29,13 +29,41 @@ export type ReplicaGraphqlTransportOptions = Readonly<{
 }>;
 
 /**
+ * Documents that never enter the replica cache (server-ranked leaderboards):
+ * the same endpoint, credentials and WebSocket as replica work, without a
+ * replica artifact.
+ */
+export type ReplicaDocumentTransport = {
+	/** Run one query document. */
+	query<
+		TData = Record<string, unknown>,
+		TVariables extends GraphqlVariables = GraphqlVariables
+	>(
+		document: string,
+		variables: TVariables,
+		signal?: AbortSignal
+	): Promise<ReplicaResultEnvelope<TData>>;
+	/** Run one subscription document; returns its close function. */
+	live<
+		TData = Record<string, unknown>,
+		TVariables extends GraphqlVariables = GraphqlVariables
+	>(
+		document: string,
+		variables: TVariables,
+		observer: ReplicaLiveObserver<TData>
+	): () => void;
+};
+
+/**
  * One concrete GraphQL transport for generated replica reads, live operations,
- * command dispatch, and command-status recovery.
+ * command dispatch, command-status recovery, and replica-free documents.
  *
  * The transport is intentionally framework-neutral. Framework adapters inject
  * their request/session lifecycle but never duplicate GraphQL protocol logic.
  */
-export type ReplicaGraphqlTransport = ReplicaTransport & ReplicaCommandTransport;
+export type ReplicaGraphqlTransport = ReplicaTransport &
+	ReplicaCommandTransport &
+	ReplicaDocumentTransport;
 
 export function createReplicaGraphqlTransport(
 	options: ReplicaGraphqlTransportOptions
@@ -117,6 +145,49 @@ export function createReplicaGraphqlTransport(
 			return subscribeReplicaOperation(options, request, observer);
 		},
 
+		async query<
+			TData = Record<string, unknown>,
+			TVariables extends GraphqlVariables = GraphqlVariables
+		>(
+			document: string,
+			variables: TVariables,
+			signal?: AbortSignal
+		): Promise<ReplicaResultEnvelope<TData>> {
+			const auth = await options.getAuth();
+			const result = await requestGraphql<TData, TVariables>(
+				options.getUrl(),
+				document,
+				auth,
+				variables,
+				{
+					...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+					...(signal === undefined ? {} : { signal })
+				}
+			);
+			return Object.freeze({
+				...(result.data === undefined ? {} : { data: result.data }),
+				...(result.errors === undefined ? {} : { errors: result.errors }),
+				...(result.extensions === undefined
+					? {}
+					: { extensions: result.extensions })
+			});
+		},
+
+		live<
+			TData = Record<string, unknown>,
+			TVariables extends GraphqlVariables = GraphqlVariables
+		>(
+			document: string,
+			variables: TVariables,
+			observer: ReplicaLiveObserver<TData>
+		): () => void {
+			return subscribeReplicaOperation<TData, TVariables>(
+				options,
+				{ document, variables },
+				observer
+			);
+		},
+
 		dispatch(
 			request: ReplicaCommandTransportRequest
 		): Promise<ReplicaCommandTransportResult> {
@@ -141,12 +212,20 @@ export function createReplicaGraphqlTransport(
 	});
 }
 
+type LiveRequest<TVariables extends GraphqlVariables> = {
+	readonly document: string;
+	readonly variables: TVariables;
+	readonly extensions?: ReplicaTransportRequest<unknown, TVariables>['extensions'];
+	readonly resume?: ReplicaTransportRequest<unknown, TVariables>['resume'];
+	readonly signal?: AbortSignal;
+};
+
 function subscribeReplicaOperation<
 	TData,
 	TVariables extends GraphqlVariables
 >(
 	options: ReplicaGraphqlTransportOptions,
-	request: ReplicaTransportRequest<TData, TVariables>,
+	request: LiveRequest<TVariables>,
 	observer: ReplicaLiveObserver<TData>
 ): () => void {
 	let unsubscribe = (): void => undefined;

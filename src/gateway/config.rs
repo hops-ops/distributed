@@ -89,6 +89,14 @@ pub enum BindingKind {
         /// Absolute HTTP(S) origin without userinfo, path, query or fragment.
         origin: String,
     },
+    /// Zone host (e.g. celld's public listener) at a configured origin. The
+    /// route's path is forwarded unchanged (`/zones/{zone}`) and WebSocket
+    /// upgrades are always allowed; zones verify their own join tickets, so
+    /// the gateway forwards no credential.
+    Zones {
+        /// Absolute HTTP(S) origin without userinfo, path, query or fragment.
+        origin: String,
+    },
     /// GraphQL executor and its explicitly selected capabilities.
     Graphql {
         /// Local or complete remote execution.
@@ -253,7 +261,7 @@ impl Gateway {
 
 fn validate_binding(kind: &BindingKind) -> Result<(), GatewayError> {
     match kind {
-        BindingKind::UiProxy { origin } => validate_origin(origin)?,
+        BindingKind::UiProxy { origin } | BindingKind::Zones { origin } => validate_origin(origin)?,
         BindingKind::Graphql {
             executor,
             capabilities,

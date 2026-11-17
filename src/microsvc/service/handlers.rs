@@ -686,6 +686,52 @@ where
         CausalCommitBuilder::empty(self).outbox(message)
     }
 
+    /// Schedule (or re-schedule) work for the aggregate this command
+    /// commits ([`crate::schedule`]).
+    ///
+    /// The schedule row commits in the same transaction as the command's
+    /// events and receipt, on every backend; if the command fails, nothing is
+    /// scheduled. The command must commit exactly one aggregate, which owns
+    /// it. At the due time a host with [`Capability::Scheduling`] dispatches
+    /// its command into that aggregate with the trusted
+    /// [`schedule_session`](crate::schedule::schedule_session); declare the
+    /// route with `.requires(Capability::Scheduling)` so a host that cannot
+    /// dispatch refuses it at service construction.
+    ///
+    /// [`Capability::Scheduling`]: crate::schedule::Capability::Scheduling
+    pub fn schedule(&self, schedule: crate::schedule::Schedule) -> Result<(), HandlerError> {
+        self.workspace
+            .stage_schedule(crate::schedule::ScheduleWrite::Arm(schedule))
+            .map_err(workspace_handler_error)
+    }
+
+    /// Cancel a schedule of this command's aggregate with its effects (no-op
+    /// when it is not armed).
+    pub fn cancel_schedule(&self, name: impl Into<String>) -> Result<(), HandlerError> {
+        self.workspace
+            .stage_schedule(crate::schedule::ScheduleWrite::Cancel(name.into()))
+            .map_err(workspace_handler_error)
+    }
+
+    /// The host clock when this command was dispatched: the Durable Object
+    /// clock on celld, the store clock on the reference host and the
+    /// in-memory repository (e.g. a `ManualClock`), the database clock on
+    /// SQL. Never a caller's time. Requires the route to declare
+    /// `.requires(Capability::Clock)`; otherwise an error says so.
+    pub fn now(&self) -> Result<std::time::SystemTime, HandlerError> {
+        crate::schedule::host_now(self.session).ok_or_else(|| {
+            HandlerError::Rejected(
+                "ctx.now() needs a route declared with .requires(Capability::Clock)".into(),
+            )
+        })
+    }
+
+    /// Due time of the schedule that fired this command; `None` for any
+    /// command not dispatched by a schedule.
+    pub fn scheduled_due(&self) -> Option<std::time::SystemTime> {
+        crate::schedule::scheduled_due(self.session)
+    }
+
     /// Low-level outbox staging retained for framework internals.
     #[cfg(all(test, feature = "graphql", feature = "sqlite"))]
     pub(crate) fn stage_outbox(&self, message: OutboxMessage) -> Result<(), HandlerError> {
