@@ -46,6 +46,10 @@
       "types": "./dist/game/index.d.ts",
       "import": "./dist/game/index.js"
     },
+    "./game/vite": {
+      "types": "./dist/game/vite.d.ts",
+      "import": "./dist/game/vite.js"
+    },
     "./package.json": "./package.json",
     "./replica/lazy": {
       "types": "./dist/replica/lazy.d.ts",
