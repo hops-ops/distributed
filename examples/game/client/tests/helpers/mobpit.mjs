@@ -32,6 +32,19 @@ const FAST_ROOMS = { ZONE_DORMANT_AFTER_MS: '1000', ZONE_HIBERNATE_AFTER_MS: '15
  * and starts it again on its state (rooms, cells); `stop()` stops both.
  */
 export async function startPit(demo = 'mobpit', vars = {}) {
+	// `freePort` releases the port before the services bind it, so a test
+	// file running alongside can take it first: start again on a new one.
+	for (let attempt = 1; ; attempt += 1) {
+		try {
+			return await startPitOnce(demo, vars);
+		} catch (error) {
+			if (attempt >= 3 || !/exited with/.test(String(error?.message))) throw error;
+			console.error(`startPit: ${error.message} (attempt ${attempt}); retrying on a new port`);
+		}
+	}
+}
+
+async function startPitOnce(demo, vars) {
 	const port = await freePort();
 	const celld = await startCelld({ relayPort: port, vars: { ...FAST_ROOMS, ...vars } });
 	const env = { ...celld.env, MOBPIT_DATA_DIR: tempDataDir(), DG_DEMO_ADMIN_SECRET: ADMIN_SECRET };
