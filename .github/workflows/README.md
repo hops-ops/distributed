@@ -10,8 +10,11 @@ existing unbounded-tech quality provider plus the integration/* jobs below —
 | Workflow | `workflow_call` | Audience |
 |----------|-----------------|----------|
 | [`quality.yaml`](./quality.yaml) | yes | **Consumers:** fmt → clippy → build → test + coverage (sticky PR comment) |
-| [`test-all-features.yaml`](./test-all-features.yaml) | yes | **This repo:** workspace `--all-features` |
-| [`integration-*.yaml`](./) | yes | **This repo:** broker / DB / CLI / observability / GraphQL identity+OIDC |
+| [`test-all-features.yaml`](./test-all-features.yaml) | yes | **This repo:** `cargo hack --each-feature` compile check |
+| [`integration-services.yaml`](./integration-services.yaml) | yes | **This repo:** whole workspace, all features, against `compose.yaml` services via `make test-local`; a test that cannot reach its service fails (`DISTRIBUTED_REQUIRE_SERVICES`) |
+| [`integration-gateway.yaml`](./integration-gateway.yaml) | yes | **This repo:** application gateway contracts, native and Worker adapters |
+| [`integration-game-demos.yaml`](./integration-game-demos.yaml) | yes | **This repo:** `examples/game` smoke |
+| [`integration-*.yaml`](./) | yes | **This repo:** CLI / observability / GraphQL identity+OIDC |
 | [`integration-e2e-ui.yaml`](./integration-e2e-ui.yaml) | yes | **This repo:** `tests/e2e-ui` offline suite, compose Playwright e2e, and kind local-GitOps Playwright e2e |
 | [`integration-celld.yaml`](./integration-celld.yaml) | yes | **This repo:** `tests/e2e-celld` workspace tests, celld storage and cell-alarm proofs (`celld dev`), live celld+NATS |
 | [`integration-wasm32-domains.yaml`](./integration-wasm32-domains.yaml) | yes | **This repo:** every domain crate builds for `wasm32-unknown-unknown` (`scripts/check-wasm32-domains.sh`), and a native-only fixture must fail |

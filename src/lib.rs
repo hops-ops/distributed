@@ -19,6 +19,13 @@ pub mod __private {
     pub use serde;
 }
 
+/// Service guard shared with the integration tests.
+#[cfg(test)]
+#[path = "../tests/support/env.rs"]
+pub(crate) mod test_env;
+#[cfg(test)]
+mod test_env_tests;
+
 mod time;
 
 pub mod aggregate;

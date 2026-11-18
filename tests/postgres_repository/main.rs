@@ -93,11 +93,9 @@ struct RelationalCounterView {
 }
 
 async fn repository() -> Option<(postgres::PostgresTestSchema, PostgresRepository)> {
-    let schema = postgres::PostgresTestSchema::create_from_env(
-        "postgres_repo",
-        "skipping Postgres integration test",
-    )
-    .await?;
+    let schema =
+        postgres::PostgresTestSchema::create_from_env("postgres_repo", "Postgres integration test")
+            .await?;
     let repo = schema.repository().await;
     Some((schema, repo))
 }
@@ -191,7 +189,7 @@ async fn migration_is_idempotent_and_uses_postgres_column_types() {
 async fn projected_command_ledger_rows_upgrade_to_atomic_and_preserve_checks() {
     let Some(schema) = postgres::PostgresTestSchema::create_from_env(
         "postgres_ledger_upgrade",
-        "skipping Postgres command-ledger upgrade test",
+        "Postgres command-ledger upgrade test",
     )
     .await
     else {

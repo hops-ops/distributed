@@ -1,7 +1,10 @@
 //! Env-gated Postgres GraphQL smoke suite.
-//! Skips cleanly when DATABASE_URL is unset (CI without Postgres).
+//! Needs DATABASE_URL; see `tests/support/env.rs` for what happens without it.
 
 #![cfg(all(feature = "graphql", feature = "postgres"))]
+
+#[path = "../support/env.rs"]
+mod env_support;
 
 use async_graphql::Request;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
@@ -19,12 +22,9 @@ struct SmokeView {
 
 #[tokio::test]
 async fn postgres_list_query_when_database_url_set() {
-    let url = match std::env::var("DATABASE_URL") {
-        Ok(u) if !u.is_empty() => u,
-        _ => {
-            eprintln!("skip: DATABASE_URL unset");
-            return;
-        }
+    let Some(url) = env_support::require_service("DATABASE_URL", "Postgres GraphQL list query")
+    else {
+        return;
     };
 
     let pool = sqlx::postgres::PgPoolOptions::new()

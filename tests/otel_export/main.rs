@@ -38,14 +38,14 @@ const REMOTE_PARENT_SPAN_ID: &str = "00f067aa0ba902b7";
 
 #[tokio::test]
 async fn dispatch_span_reaches_collector_with_propagated_parent() {
-    let Some(endpoint) = env_support::broker_env(
+    let Some(endpoint) = env_support::require_service(
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         "otel collector export test",
     ) else {
         return;
     };
     let Some(traces_file) =
-        env_support::broker_env("OTEL_COLLECTOR_TRACES_FILE", "otel collector export test")
+        env_support::require_service("OTEL_COLLECTOR_TRACES_FILE", "otel collector export test")
     else {
         return;
     };

@@ -2001,8 +2001,9 @@ fn postgres_command_ledger_adapter_conformance_typechecks() {
 async fn postgres_command_ledger_adapter_conformance_when_database_available() {
     use crate::PostgresRepository;
 
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
-        eprintln!("skipping Postgres command-ledger conformance test without DATABASE_URL");
+    let Some(database_url) =
+        crate::test_env::require_service("DATABASE_URL", "Postgres command-ledger conformance")
+    else {
         return;
     };
     let repo = PostgresRepository::connect_and_migrate(&database_url)

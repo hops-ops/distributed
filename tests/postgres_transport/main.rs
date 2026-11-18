@@ -32,7 +32,7 @@ use distributed::{
 use serde_json::json;
 use tokio::sync::Notify;
 
-const SKIP: &str = "skipping postgres transport test";
+const SKIP: &str = "postgres transport test";
 
 async fn enqueue(repo: &PostgresRepository, id: &str, name: &str) {
     let mut batch = CommitBatch::empty();

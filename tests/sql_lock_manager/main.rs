@@ -426,7 +426,7 @@ mod postgres_backend {
     use crate::postgres_support::PostgresTestSchema;
     use distributed::PostgresLockManager;
 
-    const SKIP: &str = "skipping postgres lock test";
+    const SKIP: &str = "postgres lock test";
 
     async fn schema() -> Option<PostgresTestSchema> {
         PostgresTestSchema::create_from_env("locks", SKIP).await

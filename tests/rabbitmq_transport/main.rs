@@ -27,7 +27,7 @@ use conformance::{named_recording_for, recording_for, unique};
 mod env_support;
 
 fn amqp_url() -> Option<String> {
-    env_support::broker_env("AMQP_URL", "rabbitmq transport test")
+    env_support::require_service("AMQP_URL", "rabbitmq transport test")
 }
 
 #[tokio::test]

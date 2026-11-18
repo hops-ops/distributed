@@ -232,10 +232,12 @@ mod live {
 
     #[tokio::test]
     async fn optional_profile_smoke_graphql_wait_path_and_sql_list() {
-        let Some(celld) = env_support::broker_env("CELLD_URL", "optional celld+NATS smoke") else {
+        let Some(celld) = env_support::require_service("CELLD_URL", "optional celld+NATS smoke")
+        else {
             return;
         };
-        let Some(nats) = env_support::broker_env("NATS_URL", "optional celld+NATS smoke") else {
+        let Some(nats) = env_support::require_service("NATS_URL", "optional celld+NATS smoke")
+        else {
             return;
         };
 

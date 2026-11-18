@@ -416,10 +416,14 @@ mod archive_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires DISTRIBUTED_ARCHIVE_TEST_NATS_URL with JetStream"]
     async fn durable_filter_updates_preserve_progress_and_broker_tuning() {
         use futures::StreamExt;
-        let url = std::env::var("DISTRIBUTED_ARCHIVE_TEST_NATS_URL").expect("test JetStream URL");
+        let Some(url) = crate::test_env::require_service(
+            "DISTRIBUTED_ARCHIVE_TEST_NATS_URL",
+            "JetStream durable filter test",
+        ) else {
+            return;
+        };
         let namespace = format!("filter-test-{}", uuid::Uuid::now_v7().simple());
         let bus = NatsBus::connect(&url).namespace(&namespace).await.unwrap();
         let stream = bus.ensure_stream().await.unwrap();
@@ -553,7 +557,10 @@ mod archive_tests {
 
     #[tokio::test]
     async fn retained_archive_is_non_consuming_and_rejects_missing_history() {
-        let Ok(url) = std::env::var("DISTRIBUTED_ARCHIVE_TEST_NATS_URL") else {
+        let Some(url) = crate::test_env::require_service(
+            "DISTRIBUTED_ARCHIVE_TEST_NATS_URL",
+            "JetStream retained archive test",
+        ) else {
             return;
         };
         let namespace = format!("archive-test-{}", uuid::Uuid::now_v7().simple());

@@ -1,30 +1,9 @@
 name: Application gateway
 
+# Reusable workflow: wired from on-pr-quality and on-push-main, so it gates
+# every PR, main and the release tag.
 on:
-  pull_request:
-    paths:
-      - 'src/**'
-      - 'distributed_macros/**'
-      - 'Cargo.toml'
-      - 'build.rs'
-      - 'migrations/**'
-      - 'docs/gateway/**'
-      - 'tests/e2e-ui/**'
-      - 'distributed_cli/src/lifecycle/**'
-      - 'tests/e2e-ui/ui/src/auth.ts'
-      - 'tests/e2e-ui/ui/src/lib/server/**'
-      - 'tests/e2e-ui/ui/src/routes/api/auth/**'
-      - 'tests/graphql_identity/**'
-      - 'tests/graphql_causal_transport/**'
-      - 'tests/graphql_query_protocol/**'
-      - 'tests/edge_query_delivery*'
-      - 'js/src/replica/**'
-      - 'js/tests/replica*'
-      - 'js/src/sveltekit/**'
-      - 'js/tests/sveltekit*'
-      - 'tests/gateway*'
-      - 'tests/gateway*/**'
-      - '.github/workflows/integration-gateway.yaml'
+  workflow_call:
   workflow_dispatch:
 
 permissions:

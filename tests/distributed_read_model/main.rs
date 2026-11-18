@@ -1,5 +1,7 @@
 mod checkout;
 mod checkout_saga_service;
+#[path = "../support/env.rs"]
+mod env_support;
 #[path = "../support/ids.rs"]
 mod ids;
 #[cfg(feature = "postgres")]
@@ -612,7 +614,7 @@ async fn sqlite_checkout_flow_projects_relational_read_models() {
 async fn postgres_checkout_flow_projects_relational_read_models() {
     let Some(schema) = postgres::PostgresTestSchema::create_from_env(
         "distributed_read",
-        "skipping Postgres distributed read-model test",
+        "Postgres distributed read-model test",
     )
     .await
     else {
@@ -982,7 +984,7 @@ async fn matrix_sqlite_persistence_over_knative() {
 
 #[cfg(feature = "nats")]
 fn nats_url() -> Option<String> {
-    std::env::var("NATS_URL").ok()
+    env_support::require_service("NATS_URL", "NATS read-model matrix cell")
 }
 
 #[cfg(feature = "nats")]
@@ -1030,7 +1032,7 @@ async fn matrix_sqlite_persistence_over_nats_bus() {
 
 #[cfg(feature = "rabbitmq")]
 fn amqp_url() -> Option<String> {
-    std::env::var("AMQP_URL").ok()
+    env_support::require_service("AMQP_URL", "RabbitMQ read-model matrix cell")
 }
 
 #[cfg(feature = "rabbitmq")]
@@ -1088,7 +1090,7 @@ async fn matrix_sqlite_persistence_over_rabbit_bus() {
 
 #[cfg(feature = "kafka")]
 fn kafka_brokers() -> Option<String> {
-    std::env::var("KAFKA_BROKERS").ok()
+    env_support::require_service("KAFKA_BROKERS", "Kafka read-model matrix cell")
 }
 
 #[cfg(feature = "kafka")]
@@ -1136,11 +1138,9 @@ async fn matrix_sqlite_persistence_over_kafka_bus() {
 #[tokio::test]
 async fn matrix_in_memory_persistence_over_postgres_bus() {
     use distributed::bus::PostgresBus;
-    let Some(schema) = postgres::PostgresTestSchema::create_from_env(
-        "matrix_pgbus",
-        "skipping Postgres-bus matrix cell",
-    )
-    .await
+    let Some(schema) =
+        postgres::PostgresTestSchema::create_from_env("matrix_pgbus", "Postgres-bus matrix cell")
+            .await
     else {
         return;
     };
@@ -1156,7 +1156,7 @@ async fn matrix_postgres_persistence_over_in_memory_bus() {
     use distributed::bus::InMemoryBus;
     let Some(schema) = postgres::PostgresTestSchema::create_from_env(
         "matrix_pg",
-        "skipping Postgres-persistence matrix cell",
+        "Postgres-persistence matrix cell",
     )
     .await
     else {
@@ -1177,7 +1177,7 @@ async fn postgres_matrix_repo() -> Option<(
 )> {
     let schema = postgres::PostgresTestSchema::create_from_env(
         "matrix_pg",
-        "skipping Postgres-persistence matrix cell",
+        "Postgres-persistence matrix cell",
     )
     .await?;
     let repo = schema.repository().await;
@@ -1191,11 +1191,9 @@ async fn postgres_matrix_repo() -> Option<(
 #[cfg(feature = "postgres")]
 async fn postgres_matrix_bus() -> Option<distributed::bus::PostgresBus> {
     use distributed::bus::PostgresBus;
-    let schema = postgres::PostgresTestSchema::create_from_env(
-        "matrix_pgbus",
-        "skipping Postgres-bus matrix cell",
-    )
-    .await?;
+    let schema =
+        postgres::PostgresTestSchema::create_from_env("matrix_pgbus", "Postgres-bus matrix cell")
+            .await?;
     let bus = PostgresBus::new(schema.repository().await.pool().clone()).group("matrix");
     bus.ensure_tables().await.expect("postgres bus tables");
     // The schema has no Drop, so the bus's tables outlive this fixture.

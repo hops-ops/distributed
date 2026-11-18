@@ -156,7 +156,8 @@ async fn exposition_covers_framework_families_and_passes_promtool() {
 /// real compatibility gate: it applies Prometheus's own parser and lint rules
 /// (HELP/TYPE consistency, histogram bucket ordering, label escaping).
 fn promtool_check(body: &str) {
-    let Some(promtool) = env_support::broker_env("PROMTOOL", "promtool exposition lint") else {
+    let Some(promtool) = env_support::require_service("PROMTOOL", "promtool exposition lint")
+    else {
         return;
     };
 

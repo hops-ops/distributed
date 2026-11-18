@@ -25,7 +25,7 @@ use conformance::{recording_for, unique};
 mod env_support;
 
 fn nats_url() -> Option<String> {
-    env_support::broker_env("NATS_URL", "nats transport test")
+    env_support::require_service("NATS_URL", "nats transport test")
 }
 
 #[derive(serde::Serialize, distributed::DomainEvent)]

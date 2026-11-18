@@ -29,7 +29,10 @@ mod postgres_tests {
     /// the next read snapshot a connection that is already in a transaction.
     #[tokio::test]
     async fn postgres_cancelled_begin_does_not_poison_the_next_read_snapshot() {
-        let Ok(url) = std::env::var("DISTRIBUTED_TEST_POSTGRES_URL") else {
+        let Some(url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
             return;
         };
         let pool = <sqlx::Postgres as crate::sqlx_repo::repo::SqlxRepoBackend>::pool_options(
@@ -53,7 +56,10 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn postgres_redelivery_identity_is_atomic_across_partition_and_cursor_races() {
-        let Ok(url) = std::env::var("DISTRIBUTED_TEST_POSTGRES_URL") else {
+        let Some(url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
             return;
         };
         let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
@@ -642,7 +648,10 @@ mod postgres_tests {
     #[tokio::test]
     async fn postgres_coherent_execution_and_graph_snapshots_use_fk_references_and_unique_budgets()
     {
-        let Ok(database_url) = std::env::var("DISTRIBUTED_TEST_POSTGRES_URL") else {
+        let Some(database_url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
             return;
         };
         let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
@@ -753,7 +762,10 @@ mod postgres_tests {
     async fn four_position_postgres_projection_commit_failure_matrix_rolls_back_every_side_effect()
     {
         const PHYSICAL_MUTATION_POSITIONS: usize = 4;
-        let Ok(database_url) = std::env::var("DISTRIBUTED_TEST_POSTGRES_URL") else {
+        let Some(database_url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
             return;
         };
         let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
@@ -1014,7 +1026,10 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn postgres_projection_protocol_runtime_conforms() {
-        let Ok(database_url) = std::env::var("DISTRIBUTED_TEST_POSTGRES_URL") else {
+        let Some(database_url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
             return;
         };
         let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
