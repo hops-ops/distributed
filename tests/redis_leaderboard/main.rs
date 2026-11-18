@@ -23,7 +23,7 @@ mod env_support;
 type StreamEntry = (String, Vec<(String, Vec<u8>)>);
 
 fn redis_url() -> Option<String> {
-    env_support::broker_env("REDIS_URL", "redis leaderboard test")
+    env_support::require_service("REDIS_URL", "redis leaderboard test")
 }
 
 fn unique(prefix: &str) -> String {

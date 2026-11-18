@@ -1,7 +1,6 @@
 //! Env-gated Postgres coverage for the causal GraphQL query envelope.
 //!
-//! The test compiles on every Postgres GraphQL build and skips cleanly when
-//! `DATABASE_URL` is unavailable.
+//! Needs `DATABASE_URL`; see `tests/support/env.rs` for what happens without it.
 
 #![cfg(all(feature = "graphql", feature = "postgres"))]
 
@@ -165,7 +164,7 @@ fn request_with_resume(cursors: Value) -> Request {
 async fn postgres_emits_exact_revisions_and_accepts_an_exact_live_resume() {
     let Some(schema) = postgres::PostgresTestSchema::create_from_env(
         "gql_query_protocol",
-        "skipping Postgres GraphQL query-protocol test",
+        "Postgres GraphQL query-protocol test",
     )
     .await
     else {

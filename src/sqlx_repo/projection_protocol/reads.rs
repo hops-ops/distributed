@@ -14,10 +14,13 @@ async fn candidate_key_snapshot_lookup_selects_surrogate_keys_in_sql() {
 
 #[cfg(all(test, feature = "postgres"))]
 #[tokio::test]
-#[ignore = "requires dedicated DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL; explicitly run in CI"]
 async fn candidate_key_snapshot_lookup_postgres() {
-    let url = std::env::var("DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL")
-        .expect("dedicated test database URL");
+    let Some(url) = crate::test_env::require_service(
+        "DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL",
+        "Postgres unique-key test (dedicated database)",
+    ) else {
+        return;
+    };
     let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
     assert!(options
         .get_database()

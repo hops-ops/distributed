@@ -1,6 +1,9 @@
 //! Real-database coverage for literal search through the generated GraphQL API.
 #![cfg(all(feature = "graphql", any(feature = "sqlite", feature = "postgres")))]
 
+#[path = "../support/env.rs"]
+mod env_support;
+
 use async_graphql::{Request, Variables};
 use distributed::{
     graphql::{claim, col, read, GraphqlEngine, ModelPermissions},
@@ -131,8 +134,8 @@ async fn sqlite_literal_text() {
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn postgres_literal_text() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        eprintln!("skip: DATABASE_URL unset");
+    let Some(url) = env_support::require_service("DATABASE_URL", "Postgres literal text test")
+    else {
         return;
     };
     // Session-local table and a single connection: no retained tables changed.

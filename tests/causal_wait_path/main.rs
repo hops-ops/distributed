@@ -967,7 +967,7 @@ async fn celld_host_reclaims_an_ambiguous_receipt_with_the_same_causation() {
     use std::sync::Mutex;
 
     async fn command(
-        State(state): State<Arc<(AtomicUsize, Mutex<Option<String>>) >>,
+        State(state): State<Arc<(AtomicUsize, Mutex<Option<String>>)>>,
         headers: HeaderMap,
         Json(body): Json<Value>,
     ) -> (StatusCode, Json<Value>) {
@@ -1161,14 +1161,7 @@ async fn celld_host_replays_external_completion_after_sqlite_reopen() {
         |_command, _input, remote, _session| remote.clone(),
     ));
     let replay = reopened_host
-        .invoke(
-            "todo.create",
-            command_id,
-            input,
-            session,
-            principal,
-            None,
-        )
+        .invoke("todo.create", command_id, input, session, principal, None)
         .await
         .expect("reopened gateway should replay the durable cell receipt");
     assert_eq!(replay.state(), "succeeded");

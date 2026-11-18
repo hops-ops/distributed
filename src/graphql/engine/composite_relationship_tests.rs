@@ -278,10 +278,13 @@ async fn unique_key_join_preserves_namespace_nulls_and_surrogate_identity() {
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
-#[ignore = "requires dedicated DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL; run explicitly in PostgreSQL CI"]
 async fn unique_key_join_postgres_authorization_and_manifest() {
-    let url = std::env::var("DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL")
-        .expect("dedicated test database URL");
+    let Some(url) = crate::test_env::require_service(
+        "DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL",
+        "Postgres unique-key test (dedicated database)",
+    ) else {
+        return;
+    };
     let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
     assert!(options
         .get_database()

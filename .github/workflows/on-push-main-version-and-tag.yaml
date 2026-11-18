@@ -22,17 +22,11 @@ jobs:
   all-features:
     uses: ./.github/workflows/test-all-features.yaml
 
-  postgres:
-    uses: ./.github/workflows/integration-postgres.yaml
+  services:
+    uses: ./.github/workflows/integration-services.yaml
 
-  nats:
-    uses: ./.github/workflows/integration-nats.yaml
-
-  rabbitmq:
-    uses: ./.github/workflows/integration-rabbitmq.yaml
-
-  kafka:
-    uses: ./.github/workflows/integration-kafka.yaml
+  gateway:
+    uses: ./.github/workflows/integration-gateway.yaml
 
   distributed-cli:
     uses: ./.github/workflows/integration-distributed-cli.yaml
@@ -49,6 +43,9 @@ jobs:
   js-client:
     uses: ./.github/workflows/integration-js.yaml
 
+  game-demos:
+    uses: ./.github/workflows/integration-game-demos.yaml
+
   celld:
     uses: ./.github/workflows/integration-celld.yaml
 
@@ -59,7 +56,7 @@ jobs:
   # Some commits such as chore: will not trigger a version bump and tag; this is by design.
   version-and-tag:
     name: Version and Tag
-    needs: [quality, all-features, postgres, nats, rabbitmq, kafka, distributed-cli, observability, graphql, e2e-ui, js-client, celld, wasm32-domains]
+    needs: [quality, all-features, services, gateway, distributed-cli, observability, graphql, e2e-ui, js-client, game-demos, celld, wasm32-domains]
     uses: unbounded-tech/workflow-vnext-tag/.github/workflows/workflow.yaml@v1.22.3
     secrets:
       DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}

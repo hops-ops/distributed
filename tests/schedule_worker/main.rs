@@ -553,7 +553,7 @@ mod postgres_backend {
     }
 
     async fn fresh() -> Option<Db> {
-        PostgresTestSchema::create_from_env("schedule_worker", "skipping Postgres schedule worker")
+        PostgresTestSchema::create_from_env("schedule_worker", "Postgres schedule worker")
             .await
             .map(Db)
     }

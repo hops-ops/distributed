@@ -40,17 +40,11 @@ jobs:
   all-features:
     uses: ./.github/workflows/test-all-features.yaml
 
-  postgres:
-    uses: ./.github/workflows/integration-postgres.yaml
+  services:
+    uses: ./.github/workflows/integration-services.yaml
 
-  nats:
-    uses: ./.github/workflows/integration-nats.yaml
-
-  rabbitmq:
-    uses: ./.github/workflows/integration-rabbitmq.yaml
-
-  kafka:
-    uses: ./.github/workflows/integration-kafka.yaml
+  gateway:
+    uses: ./.github/workflows/integration-gateway.yaml
 
   distributed-cli:
     needs: [contracts]

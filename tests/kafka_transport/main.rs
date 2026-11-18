@@ -27,7 +27,7 @@ use conformance::{recording_for, unique};
 mod env_support;
 
 fn brokers() -> Option<String> {
-    env_support::broker_env("KAFKA_BROKERS", "kafka transport test")
+    env_support::require_service("KAFKA_BROKERS", "kafka transport test")
 }
 
 #[tokio::test]

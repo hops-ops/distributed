@@ -10,7 +10,7 @@ use distributed::PostgresRepository;
 async fn repository() -> Option<PostgresRepository> {
     let schema = postgres::PostgresTestSchema::create_from_env(
         "pg_conformance",
-        "skipping Postgres conformance test",
+        "Postgres conformance test",
     )
     .await?;
     let repo = schema.repository().await;

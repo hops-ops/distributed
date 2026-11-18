@@ -184,7 +184,8 @@ fn local_entrypoint_delegates_to_the_single_persistent_profile() {
 
 #[tokio::test]
 async fn live_cell_private_routes_reject_missing_forged_and_malformed_authority() {
-    let Some(base) = env_support::broker_env("CELLD_URL", "celld live security boundary") else {
+    let Some(base) = env_support::require_service("CELLD_URL", "celld live security boundary")
+    else {
         return;
     };
     let base = base.trim_end_matches('/').to_string();
@@ -248,7 +249,7 @@ async fn live_cell_private_routes_reject_missing_forged_and_malformed_authority(
 
 #[tokio::test]
 async fn live_todo_cell_create_complete_reopen_archive_and_isolate() {
-    let Some(base) = env_support::broker_env("CELLD_URL", "celld live Todo cell") else {
+    let Some(base) = env_support::require_service("CELLD_URL", "celld live Todo cell") else {
         return;
     };
     let base = base.trim_end_matches('/').to_string();
@@ -410,7 +411,7 @@ async fn live_todo_cell_create_complete_reopen_archive_and_isolate() {
 
 #[tokio::test]
 async fn live_independent_todo_cells_accept_bursts_while_queue_drain_is_busy() {
-    let Some(base) = env_support::broker_env("CELLD_URL", "celld live Todo burst") else {
+    let Some(base) = env_support::require_service("CELLD_URL", "celld live Todo burst") else {
         return;
     };
     let base = base.trim_end_matches('/').to_string();
@@ -509,7 +510,7 @@ async fn live_independent_todo_cells_accept_bursts_while_queue_drain_is_busy() {
 
 #[tokio::test]
 async fn live_chat_cell_post_and_isolate() {
-    let Some(base) = env_support::broker_env("CELLD_URL", "celld live Chat cell") else {
+    let Some(base) = env_support::require_service("CELLD_URL", "celld live Chat cell") else {
         return;
     };
     let base = base.trim_end_matches('/').to_string();

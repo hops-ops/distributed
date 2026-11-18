@@ -185,7 +185,7 @@ mod postgres_backend {
     #[tokio::test]
     async fn postgres_store_honours_deliver_at() {
         let Some(schema) =
-            PostgresTestSchema::create_from_env("sched", "skipping postgres schedule test").await
+            PostgresTestSchema::create_from_env("sched", "postgres schedule test").await
         else {
             return;
         };

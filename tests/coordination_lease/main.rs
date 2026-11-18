@@ -312,8 +312,7 @@ mod postgres_backend {
     use distributed::PostgresLeaseStore;
 
     async fn store() -> Option<(PostgresTestSchema, PostgresLeaseStore)> {
-        let schema =
-            PostgresTestSchema::create_from_env("leases", "skipping postgres lease test").await?;
+        let schema = PostgresTestSchema::create_from_env("leases", "postgres lease test").await?;
         let store = PostgresLeaseStore::new(schema.repository().await.pool().clone());
         Some((schema, store))
     }

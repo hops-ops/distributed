@@ -175,9 +175,9 @@ pub(super) fn compile_relationship_aggregate_subquery(
                 };
                 pairs.push((
                     aggregate_member.response_key.clone(),
-                    format!(
+                    inner.dialect.ops().nested_json(format!(
                         "coalesce((SELECT {json_agg}(n) FROM (SELECT {nodes_proj} AS n FROM {from_sql} WHERE {join_pred} AND ({where_for_nodes}) {order_sql} LIMIT {lim} OFFSET {off}) nested_agg_rows), {coalesce_empty})"
-                    ),
+                    )),
                 ));
                 evidence_fields.push(QueryEvidenceFieldPlan {
                     storage_key: aggregate_member.response_key.clone(),
