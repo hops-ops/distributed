@@ -5,7 +5,7 @@ use distributed::application::{
     ApplicationExtension, ApplicationManifest, ContractCompiler, Module, SurfaceSpec,
 };
 use distributed::graphql::{
-    build_surface, col, surface_for_application_contract, RoleGrant, Surface, SurfaceOptions,
+    build_surface, col, surface_for_application_contract, ReadPermission, Surface, SurfaceOptions,
 };
 #[cfg(feature = "application-runtime")]
 use distributed::microsvc::{CausalCommandContext, HandlerError};
@@ -110,8 +110,9 @@ fn todo_surface() -> Surface {
         "user".to_string(),
         BTreeMap::from([(
             "TodoView".to_string(),
-            RoleGrant::all_columns()
-                .with_aggregations()
+            read()
+                .all_columns()
+                .aggregations()
                 .rows(col("status").eq("open")),
         )]),
     )]);

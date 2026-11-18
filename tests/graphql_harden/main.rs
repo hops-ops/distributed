@@ -5,6 +5,7 @@
 //!
 //! | Module | Coverage |
 //! |---|---|
+//! | `access_paths` | Row + column policy on every read access path (one table of cases) |
 //! | `authz` | A* AuthZ (claim list/by_pk/aggregate, column allowlists, nested deny) |
 //! | `inject` | S* injection / key safety |
 //! | `dos` | D* depth, in-list, bool-width, concurrency |
@@ -16,6 +17,7 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
+mod access_paths;
 mod authz;
 mod common;
 mod dialect;

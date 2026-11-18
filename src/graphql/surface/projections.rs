@@ -1036,7 +1036,7 @@ fn validate_direct_program(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graphql::{build_surface, surface_for_role, RoleGrant, SurfaceOptions};
+    use crate::graphql::{build_surface, read, surface_for_role, ReadPermission, SurfaceOptions};
     use crate::table::{
         ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
         TableSchema,
@@ -1071,7 +1071,7 @@ mod tests {
         }
     }
 
-    fn models(grants: BTreeMap<String, RoleGrant>) -> BTreeMap<String, SurfaceModel> {
+    fn models(grants: BTreeMap<String, ReadPermission>) -> BTreeMap<String, SurfaceModel> {
         let todo = schema(
             "TodoView",
             "todos",
@@ -1144,11 +1144,8 @@ mod tests {
         let selected = select_operation(
             &operation("title", vec![owner_link("todo_id", "user_id")]),
             &models(BTreeMap::from([
-                (
-                    "TodoView".into(),
-                    RoleGrant::columns(["todo_id", "owner_id"]),
-                ),
-                ("UserView".into(), RoleGrant::columns(["user_id"])),
+                ("TodoView".into(), read().columns(["todo_id", "owner_id"])),
+                ("UserView".into(), read().columns(["user_id"])),
             ])),
         )
         .unwrap();
@@ -1165,10 +1162,7 @@ mod tests {
     fn denied_relationship_consequence_is_omitted_without_broad_recovery() {
         let selected = select_operation(
             &operation("title", vec![owner_link("todo_id", "user_id")]),
-            &models(BTreeMap::from([(
-                "TodoView".into(),
-                RoleGrant::all_columns(),
-            )])),
+            &models(BTreeMap::from([("TodoView".into(), read().all_columns())])),
         )
         .unwrap();
 
@@ -1183,8 +1177,8 @@ mod tests {
         let narrow = select_operation(
             &operation("title", vec![owner_link("todo_id", "user_id")]),
             &models(BTreeMap::from([
-                ("TodoView".into(), RoleGrant::all_columns()),
-                ("UserView".into(), RoleGrant::columns(["name"])),
+                ("TodoView".into(), read().all_columns()),
+                ("UserView".into(), read().columns(["name"])),
             ])),
         )
         .unwrap();
@@ -1200,11 +1194,8 @@ mod tests {
         let source_recovery = select_operation(
             &operation("owner_id", vec![owner_link("title", "user_id")]),
             &models(BTreeMap::from([
-                (
-                    "TodoView".into(),
-                    RoleGrant::columns(["todo_id", "owner_id"]),
-                ),
-                ("UserView".into(), RoleGrant::columns(["user_id"])),
+                ("TodoView".into(), read().columns(["todo_id", "owner_id"])),
+                ("UserView".into(), read().columns(["user_id"])),
             ])),
         )
         .unwrap();
@@ -1218,10 +1209,7 @@ mod tests {
 
     #[test]
     fn partial_multi_model_selection_keeps_authorized_operations_only() {
-        let selected_models = models(BTreeMap::from([(
-            "TodoView".into(),
-            RoleGrant::all_columns(),
-        )]));
+        let selected_models = models(BTreeMap::from([("TodoView".into(), read().all_columns())]));
         let todo = operation("title", Vec::new());
         let user = ProjectionOperation::try_new(
             "patch-user",

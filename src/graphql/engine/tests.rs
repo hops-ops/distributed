@@ -16,7 +16,7 @@ mod client_surface_parity_tests {
     #[cfg(feature = "sqlite")]
     use crate::graphql::ModelNormalization;
     use crate::graphql::{
-        claim, col, ClientRootOperation, DistributedClientSurfaceExport, RoleGrant,
+        claim, col, ClientRootOperation, DistributedClientSurfaceExport, ReadPermission,
     };
     use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
     #[cfg(feature = "sqlite")]
@@ -218,9 +218,9 @@ mod client_surface_parity_tests {
             .grant_all("user");
         builder
             .permissions
-            .get_mut(&("OrderView".into(), "user".into()))
+            .get_mut("user")
+            .and_then(|grants| grants.get_mut("OrderView"))
             .unwrap()
-            .permission
             .row_filter = Some(col("status").eq(claim(claim_key)));
         builder
             .protocol_token_key([7; 32])
@@ -711,9 +711,9 @@ mod client_surface_parity_tests {
         // user-only so the application contract keeps a portable claim preset.
         builder
             .permissions
-            .get_mut(&("OrderView".into(), "user".into()))
+            .get_mut("user")
+            .and_then(|grants| grants.get_mut("OrderView"))
             .unwrap()
-            .permission
             .row_filter = Some(col("status").eq(claim("x-user-id")));
         let engine = builder
             .client_application_surface_with_schema_roles("console", ["admin", "user"], ["user"])
@@ -1682,7 +1682,9 @@ mod client_surface_parity_tests {
     ) {
         assert!(builder
             .permissions
-            .insert((model.into(), role.into()), RoleModelPerm { permission },)
+            .entry(role.into())
+            .or_default()
+            .insert(model.into(), permission)
             .is_none());
     }
 
@@ -1733,19 +1735,14 @@ mod client_surface_parity_tests {
         let grants = match role {
             "restricted" => BTreeMap::from([(
                 "OrderView".into(),
-                RoleGrant::columns(["order_id", "status"])
+                read()
+                    .columns(["order_id", "status"])
                     .rows(col("status").eq("OPEN"))
                     .limit(5),
             )]),
             "admin" => BTreeMap::from([
-                (
-                    "OrderView".into(),
-                    RoleGrant::all_columns().with_aggregations(),
-                ),
-                (
-                    "CustomerView".into(),
-                    RoleGrant::all_columns().with_aggregations(),
-                ),
+                ("OrderView".into(), read().all_columns().aggregations()),
+                ("CustomerView".into(), read().all_columns().aggregations()),
             ]),
             other => panic!("unexpected matrix role `{other}`"),
         };
@@ -2456,9 +2453,9 @@ mod client_surface_parity_tests {
                 FilterExpr::Cmp {
                     column: "metric_id".into(),
                     op: crate::graphql::filter::CmpOp::Eq,
-                    rhs: Operand::Lit(crate::graphql::LitValue::Json(serde_json::json!(
-                        "metric-1"
-                    ))),
+                    rhs: crate::graphql::Operand::Lit(crate::graphql::LitValue::Json(
+                        serde_json::json!("metric-1"),
+                    )),
                 },
                 "literal kind `json`",
             ),
@@ -2466,8 +2463,10 @@ mod client_surface_parity_tests {
                 FilterExpr::In {
                     column: "value".into(),
                     values: vec![
-                        Operand::from(1.0),
-                        Operand::Lit(crate::graphql::LitValue::Json(serde_json::json!(2.0))),
+                        crate::graphql::Operand::from(1.0),
+                        crate::graphql::Operand::Lit(crate::graphql::LitValue::Json(
+                            serde_json::json!(2.0),
+                        )),
                     ],
                     negated: false,
                 },
@@ -2477,7 +2476,7 @@ mod client_surface_parity_tests {
                 FilterExpr::Cmp {
                     column: "metric_id".into(),
                     op: crate::graphql::filter::CmpOp::HasKey,
-                    rhs: Operand::from("tenant"),
+                    rhs: crate::graphql::Operand::from("tenant"),
                 },
                 "operator `HasKey`",
             ),

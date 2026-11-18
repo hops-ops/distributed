@@ -157,7 +157,7 @@ impl<'a> SelectedSurfacePolicyVisibility<'a> {
             }
             Some(
                 crate::graphql::surface::SurfaceRowPolicy::Predicate(_)
-                | crate::graphql::surface::SurfaceRowPolicy::ServerOnly,
+                | crate::graphql::surface::SurfaceRowPolicy::ServerOnly(_),
             ) => ProjectionDeltaVisibility::Unknown,
             None => ProjectionDeltaVisibility::Denied,
         }

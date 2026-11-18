@@ -406,9 +406,9 @@ async fn unique_key_join_fixture(pool: GraphqlPool) {
         .change_stream(change_rx);
     builder
         .permissions
-        .get_mut(&("CompositeRecord".into(), "reader".into()))
+        .get_mut("reader")
+        .and_then(|grants| grants.get_mut("CompositeRecord"))
         .unwrap()
-        .permission
         .row_filter = Some(crate::graphql::col("value").eq("first"));
     let restricted = builder.build().unwrap();
     let manifest = restricted.client_manifest_for_role("reader").unwrap();

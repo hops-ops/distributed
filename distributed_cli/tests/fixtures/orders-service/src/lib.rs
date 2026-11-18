@@ -8,8 +8,8 @@ use distributed::command::{
     PreparedCommand,
 };
 use distributed::graphql::{
-    build_surface, surface_for_role, DistributedClientSurfaceExport, RoleGrant, SurfaceOptions,
-    SurfaceProjector,
+    build_surface, surface_for_role, DistributedClientSurfaceExport, ReadPermission,
+    SurfaceOptions, SurfaceProjector,
 };
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
 use distributed::{
@@ -159,7 +159,7 @@ pub fn distributed_client_surface() -> DistributedClientSurfaceExport {
         .expect("fixture projector should bind");
     let grants = std::collections::BTreeMap::from([(
         "OrderView".to_string(),
-        RoleGrant::all_columns().with_aggregations(),
+        read().all_columns().aggregations(),
     )]);
     let user =
         surface_for_role(&full, "user", &grants).expect("fixture role policy should be valid");

@@ -8,12 +8,12 @@ use distributed::application::{
 };
 use distributed::command::{typed_command, CommandConsistency, Succeeded};
 use distributed::graphql::{
-    build_surface, col, prune_client_manifest, surface_for_application_contract, surface_for_role,
-    ClientCommandPureReduce, ClientProjectionArm, ClientProjectionEventRef,
+    build_surface, col, prune_client_manifest, read, surface_for_application_contract,
+    surface_for_role, ClientCommandPureReduce, ClientProjectionArm, ClientProjectionEventRef,
     ClientProjectionFallback, ClientProjectionMutationKind, ClientProjectionOperation,
     ClientProjectionPartition, ClientProjectionProgram, ClientSurfaceIdentity,
     CommandProjectionArmRef, CommandProjectionExtension, CommandProjectionPreviewOccurrence,
-    DistributedClientSurfaceExport, RoleGrant, Surface, SurfaceOptions,
+    DistributedClientSurfaceExport, ReadPermission, Surface, SurfaceOptions,
 };
 use distributed::projection::{
     PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
@@ -74,10 +74,10 @@ fn command_catalog() -> Surface {
         .expect("module contracts should bind before authorization")
 }
 
-fn grants_for(role: &str) -> BTreeMap<String, RoleGrant> {
+fn grants_for(role: &str) -> BTreeMap<String, ReadPermission> {
     BTreeMap::from([(
         "TodoView".into(),
-        RoleGrant::all_columns().rows(col("status").eq(role)),
+        read().all_columns().rows(col("status").eq(role)),
     )])
 }
 
@@ -333,8 +333,9 @@ fn selected_surface() -> Surface {
         "user".to_string(),
         BTreeMap::from([(
             "TodoView".to_string(),
-            RoleGrant::all_columns()
-                .with_aggregations()
+            read()
+                .all_columns()
+                .aggregations()
                 .rows(col("status").eq("open")),
         )]),
     )]);
@@ -972,8 +973,8 @@ fn contract_export_prunes_unselected_read_models() {
     let grants = BTreeMap::from([(
         "user".to_string(),
         BTreeMap::from([
-            ("TodoView".to_string(), RoleGrant::all_columns()),
-            ("ChatView".to_string(), RoleGrant::all_columns()),
+            ("TodoView".to_string(), read().all_columns()),
+            ("ChatView".to_string(), read().all_columns()),
         ]),
     )]);
     let selected =
@@ -1007,8 +1008,8 @@ fn prune_drops_unselected_command_optimism_and_causal_slots() {
     let grants = BTreeMap::from([(
         "user".to_string(),
         BTreeMap::from([
-            ("TodoView".to_string(), RoleGrant::all_columns()),
-            ("ChatView".to_string(), RoleGrant::all_columns()),
+            ("TodoView".to_string(), read().all_columns()),
+            ("ChatView".to_string(), read().all_columns()),
         ]),
     )]);
     let catalog = full.with_module(&command_module()).unwrap();

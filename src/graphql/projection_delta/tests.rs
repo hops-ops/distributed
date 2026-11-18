@@ -19,8 +19,8 @@ use super::types::{
 use super::*;
 
 use crate::graphql::{
-    build_surface, surface_for_role, DistributedClientSurfaceExport, RoleGrant,
-    SurfaceDirectProjection, SurfaceOptions, SurfaceProjector,
+    build_surface, read, surface_for_role, DistributedClientSurfaceExport, SurfaceDirectProjection,
+    SurfaceOptions, SurfaceProjector,
 };
 use crate::projection::catalog::ProjectionBindingActivation;
 use crate::projection::placement::{
@@ -601,14 +601,15 @@ fn application_wire_surface_uses_authenticated_role_policy_for_actual_rows() {
     let user_grants = BTreeMap::from([
         (
             "TodoView".into(),
-            RoleGrant::all_columns()
+            read()
+                .all_columns()
                 .rows(crate::graphql::col("owner_id").eq(crate::graphql::claim("x-user-id"))),
         ),
-        ("UserView".into(), RoleGrant::all_columns()),
+        ("UserView".into(), read().all_columns()),
     ]);
     let admin_grants = BTreeMap::from([
-        ("TodoView".into(), RoleGrant::all_columns()),
-        ("UserView".into(), RoleGrant::all_columns()),
+        ("TodoView".into(), read().all_columns()),
+        ("UserView".into(), read().all_columns()),
     ]);
     let grants_by_role = BTreeMap::from([
         ("delta-admin".into(), admin_grants),
@@ -625,7 +626,7 @@ fn application_wire_surface_uses_authenticated_role_policy_for_actual_rows() {
     .unwrap();
     assert!(matches!(
         application_surface.models["TodoView"].row_policy,
-        crate::graphql::surface::SurfaceRowPolicy::ServerOnly
+        crate::graphql::surface::SurfaceRowPolicy::ServerOnly(_)
     ));
     let export =
         DistributedClientSurfaceExport::from_selected("delta-service", application_surface)
@@ -3241,8 +3242,8 @@ fn lowerer_rejects_wrong_program_binding_arm_occurrence_and_duplicate_program_so
         &fixture.surface,
         "delta-user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -3907,8 +3908,8 @@ fn selected_export(surface: &crate::graphql::Surface) -> DistributedClientSurfac
         &surface,
         "delta-user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -3926,10 +3927,11 @@ fn selected_export_with_owner_policy(
         &BTreeMap::from([
             (
                 "TodoView".into(),
-                RoleGrant::all_columns()
+                read()
+                    .all_columns()
                     .rows(crate::graphql::col("owner_id").eq(crate::graphql::claim("x-user-id"))),
             ),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -3944,8 +3946,8 @@ fn selected_export_with_embedded_target(
         &surface,
         "delta-user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::columns(["display_name"])),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().columns(["display_name"])),
         ]),
     )
     .unwrap();
@@ -3962,9 +3964,9 @@ fn selected_export_with_embedded_source(
         &BTreeMap::from([
             (
                 "TodoView".into(),
-                RoleGrant::columns(["owner_id", "status", "title"]),
+                read().columns(["owner_id", "status", "title"]),
             ),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -3977,9 +3979,9 @@ fn selected_export_join(surface: &crate::graphql::Surface) -> DistributedClientS
         &surface,
         "delta-user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
-            ("TodoOwnerLink".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
+            ("TodoOwnerLink".into(), read().all_columns()),
         ]),
     )
     .unwrap();

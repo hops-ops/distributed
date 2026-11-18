@@ -18,8 +18,8 @@ use distributed::graphql::{
     ClientProjectionExecutionClass, ClientProjectionExpression, ClientProjectionFallback,
     ClientProjectionInvalidation, ClientProjectionMutationKind, ClientProjectionPartition,
     ClientProjectionPreviewSource, ClientProjectionValue, ClientProjectionValueType,
-    DistributedClientSurfaceExport, GraphqlEngine, ModelPermissions, RoleGrant,
-    SurfaceDirectProjection, SurfaceModeledProjection, SurfaceOptions, SurfaceProjector,
+    DistributedClientSurfaceExport, GraphqlEngine, ModelPermissions, SurfaceDirectProjection,
+    SurfaceModeledProjection, SurfaceOptions, SurfaceProjector,
 };
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
 use distributed::microsvc::{Context, Session};
@@ -1625,7 +1625,7 @@ fn pool_free_typed_export_preserves_service_provenance_and_rejects_relabeling() 
     let selected = surface_for_role(
         &catalog,
         "anonymous",
-        &std::collections::BTreeMap::from([("PlanView".into(), RoleGrant::all_columns())]),
+        &std::collections::BTreeMap::from([("PlanView".into(), read().all_columns())]),
     )
     .unwrap();
     let manifest = DistributedClientSurfaceExport::from_selected("plans", selected.clone())

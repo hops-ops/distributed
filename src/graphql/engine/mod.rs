@@ -16,8 +16,7 @@ use crate::microsvc::{Service, Session, ROLE_KEY, USER_ID_KEY};
 use crate::read_model::{ReadModelChange, RelationalReadModelIncludes};
 use crate::table::ReadModelCatalog;
 use crate::table::{
-    resolve_direct_join_keys, resolve_m2m_join_keys, ColumnType, RelationshipKind, TableKind,
-    TableSchema,
+    resolve_direct_join_keys, resolve_m2m_join_keys, RelationshipKind, TableKind, TableSchema,
 };
 
 use super::client_manifest::{
@@ -27,14 +26,12 @@ use super::client_manifest::{
 use super::commands::TypedCommandInventory;
 use super::compile::{SqlDialect, SqlPlan};
 use super::execute;
-use super::filter::{validate_row_policy_operand_literal, FilterExpr, Operand};
+use super::filter::FilterExpr;
 use super::identity::{IdentityConfig, IdentityMode, OidcValidator, VerifiedPrincipal};
 use super::naming::{
     by_pk_field, is_valid_graphql_name, object_type_name, reserved_type_names, root_list_field,
 };
-use super::permissions::{
-    read, role_grants_from_model_role_perms, ModelPermissions, ReadPermission,
-};
+use super::permissions::{read, ModelPermissions, ReadPermission};
 use super::protocol::{
     DistributedEnvelopeV1, DistributedLiveCursor, DistributedTrustedPreset, OpaqueProtocolToken,
     ProtocolResponseAccumulator, ProtocolTokenCodec, ProtocolTokenPurpose, RequestedLiveResume,
@@ -77,12 +74,11 @@ pub use core::{
 pub use introspection::{graphiql_enabled_from_env, graphiql_enabled_from_env_vars};
 
 pub(crate) use auth::{
-    identity_mode_label, insert_synthetic_privilege_permissions, role_authorization_info,
-    role_authorization_info_for_roles,
+    identity_mode_label, role_authorization_info, role_authorization_info_for_roles,
 };
 pub(crate) use core::{
     CatalogEntry, ClientApplicationRegistration, EngineInner, ProtocolApplicationInfo,
-    ProtocolRoleInfo, ProtocolRuntime, ProtocolSurfaceInfo, RoleModelPerm,
+    ProtocolRoleInfo, ProtocolRuntime, ProtocolSurfaceInfo,
 };
 pub(crate) use introspection::is_pure_introspection_request;
 pub(crate) use live_resume::parse_requested_live_resume;
@@ -95,7 +91,7 @@ pub(crate) use protocol::{
     protocol_trusted_presets, resolve_execution_authority, resolve_protocol_preset,
     select_protocol_surface,
 };
-pub(crate) use validation::{execute_plan, validate_filter, validate_generated_names};
+pub(crate) use validation::{execute_plan, validate_generated_names};
 
 /// Public helper for tests: compile + naming surface.
 #[allow(dead_code)]

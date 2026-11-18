@@ -6,7 +6,7 @@ pub(super) fn row_policy_manifest(policy: &SurfaceRowPolicy) -> ClientRowPolicy 
         SurfaceRowPolicy::Predicate(predicate) => ClientRowPolicy::Predicate {
             expression: predicate.clone(),
         },
-        SurfaceRowPolicy::ServerOnly => ClientRowPolicy::ServerOnly,
+        SurfaceRowPolicy::ServerOnly(_) => ClientRowPolicy::ServerOnly,
     }
 }
 

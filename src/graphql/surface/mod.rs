@@ -48,8 +48,7 @@ mod validation;
 mod tests;
 
 pub use application::{
-    role_grants_for_role, surface_for_application, surface_for_application_contract,
-    surface_for_role, RoleGrant,
+    surface_for_application, surface_for_application_contract, surface_for_role,
 };
 pub use build::build_surface;
 pub use leaderboard::{

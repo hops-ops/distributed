@@ -342,3 +342,77 @@ async fn json_looking_string_column_stays_string() {
     );
     assert_eq!(data["orders_by_pk"]["note"], "{\"looks\":\"json\"}");
 }
+
+/// A multi-role application surface executes with the intersection of its
+/// schema roles' row policies: every opener is held to the most restrictive
+/// combination, never to whichever role sorts first.
+#[tokio::test]
+async fn application_surface_with_differing_row_policies_applies_all_of_them() {
+    let pool = seed_orders().await;
+    let roles = ["admin".to_string(), "user".to_string()];
+    let engine = GraphqlEngine::builder(pool)
+        .service_id("orders-service")
+        .roles(&["admin", "user"])
+        .model::<OrderView>(
+            ModelPermissions::new()
+                .grant("admin", read().all_columns().aggregations())
+                .grant(
+                    "user",
+                    read()
+                        .all_columns()
+                        .aggregations()
+                        .rows(col("customer_id").eq(claim("x-user-id"))),
+                ),
+        )
+        .client_application_surface("console", roles.clone(), roles.clone())
+        .protocol_token_key([7; 32])
+        .build()
+        .unwrap();
+    let manifest = engine
+        .client_manifest_for_application("console", &["admin", "user"], &["admin", "user"])
+        .unwrap();
+    let request = |query: &str| -> Request {
+        serde_json::from_value(serde_json::json!({
+            "query": query,
+            "extensions": { "distributed": { "client": {
+                "surface": {
+                    "kind": "application",
+                    "name": "console",
+                    "eligible_roles": roles,
+                    "schema_roles": roles,
+                },
+                "schemaHash": manifest.schema_fingerprint,
+            }}}
+        }))
+        .unwrap()
+    };
+
+    for role in ["user", "admin"] {
+        let principal = session(role, "tenant-b");
+        for (query, expected) in [
+            (
+                "{ orders { order_id customer_id } }",
+                serde_json::json!({ "orders": [{ "order_id": "o3", "customer_id": "tenant-b" }] }),
+            ),
+            (
+                r#"{ orders_by_pk(order_id: "o1") { order_id } }"#,
+                serde_json::json!({ "orders_by_pk": null }),
+            ),
+            (
+                "{ orders_aggregate { aggregate { count } nodes { order_id } } }",
+                serde_json::json!({ "orders_aggregate": {
+                    "aggregate": { "count": 1 },
+                    "nodes": [{ "order_id": "o3" }],
+                }}),
+            ),
+        ] {
+            let resp = engine.execute(&principal, request(query)).await;
+            assert!(resp.errors.is_empty(), "{role} {query}: {:?}", resp.errors);
+            assert_eq!(
+                serde_json::to_value(&resp.data).unwrap(),
+                expected,
+                "{role} {query}"
+            );
+        }
+    }
+}

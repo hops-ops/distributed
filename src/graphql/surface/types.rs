@@ -47,17 +47,29 @@ impl SurfaceOptions {
     }
 }
 
-/// Row-authorization semantics retained on the role/application surface.
+/// Row authorization for one model on a selected role/application surface.
 ///
-/// `ServerOnly` is the fail-closed representation when a predicate differs
-/// across application roles or references a field that is not authorized on
-/// the selected surface. Clients may revalidate such collections but must not
-/// evaluate membership locally.
+/// The server executes [`filter`](Self::filter) on every access path. The
+/// variant says what the client contract may learn: a `Predicate` is exported
+/// and evaluated locally; a `ServerOnly` predicate is never exported, because
+/// it differs across the application's schema roles or references something
+/// the selected surface does not authorize. Clients may revalidate such
+/// collections but must not evaluate membership locally.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SurfaceRowPolicy {
     Unrestricted,
     Predicate(FilterExpr),
-    ServerOnly,
+    ServerOnly(FilterExpr),
+}
+
+impl SurfaceRowPolicy {
+    /// The predicate the server enforces, whether or not it is exported.
+    pub fn filter(&self) -> Option<&FilterExpr> {
+        match self {
+            Self::Unrestricted => None,
+            Self::Predicate(filter) | Self::ServerOnly(filter) => Some(filter),
+        }
+    }
 }
 
 /// Semantic category for one GraphQL field argument.
@@ -479,6 +491,20 @@ pub struct SurfaceModel {
     pub aggregations: bool,
     /// Filtered schema clone (columns limited for role surfaces).
     pub(crate) schema: TableSchema,
+}
+
+impl SurfaceModel {
+    /// Stop exporting the row predicate; the server keeps enforcing it.
+    pub(crate) fn keep_row_policy_server_only(&mut self) {
+        if let SurfaceRowPolicy::Predicate(filter) = &self.row_policy {
+            self.row_policy = SurfaceRowPolicy::ServerOnly(filter.clone());
+        }
+    }
+
+    /// Whether this privilege may read `column`.
+    pub(crate) fn allows_column(&self, column: &str) -> bool {
+        self.columns.iter().any(|field| field.name == column)
+    }
 }
 
 /// Whether this selected Surface exposes a complete client-safe normalized
@@ -1141,7 +1167,7 @@ fn row_policy_value(policy: &SurfaceRowPolicy) -> serde_json::Value {
         SurfaceRowPolicy::Predicate(predicate) => {
             serde_json::json!({"kind": "predicate", "expression": predicate})
         }
-        SurfaceRowPolicy::ServerOnly => serde_json::json!({"kind": "server_only"}),
+        SurfaceRowPolicy::ServerOnly(_) => serde_json::json!({"kind": "server_only"}),
     }
 }
 

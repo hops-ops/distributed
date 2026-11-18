@@ -286,8 +286,8 @@ mod client_contract {
     use super::*;
     use distributed::command::{typed_command, Eventual, PreparedCommand};
     use distributed::graphql::{
-        build_surface, surface_for_role, ClientProjectionPreviewSource, ClientProjectionValue,
-        DistributedClientSurfaceExport, RoleGrant, SurfaceOptions,
+        build_surface, read, surface_for_role, ClientProjectionPreviewSource,
+        ClientProjectionValue, DistributedClientSurfaceExport, SurfaceOptions,
     };
     use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
     use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
@@ -414,10 +414,7 @@ mod client_contract {
             let selected = surface_for_role(
                 &surface,
                 "user",
-                &std::collections::BTreeMap::from([(
-                    "FlatMembers".into(),
-                    RoleGrant::all_columns(),
-                )]),
+                &std::collections::BTreeMap::from([("FlatMembers".into(), read().all_columns())]),
             )
             .unwrap();
             let manifest = DistributedClientSurfaceExport::from_selected("members", selected)
@@ -514,7 +511,7 @@ mod client_contract {
         let selected = surface_for_role(
             &surface,
             "anonymous",
-            &std::collections::BTreeMap::from([("FlatReviews".into(), RoleGrant::all_columns())]),
+            &std::collections::BTreeMap::from([("FlatReviews".into(), read().all_columns())]),
         )
         .unwrap();
         let manifest = DistributedClientSurfaceExport::from_selected("reviews", selected)

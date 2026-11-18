@@ -340,9 +340,8 @@ fn format_response_path(path: &[QueryResponsePathSegment]) -> String {
 #[cfg(test)]
 mod query_evidence_tests {
     use super::super::dialect::SqlDialect;
-    use super::super::projection::{chunked_json_object, compile_record_evidence_projection};
+    use super::super::projection::{chunked_json_object, record_identity_projection};
     use super::*;
-    use crate::graphql::permissions::read;
     use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
 
     fn hidden(ordinal: usize) -> String {
@@ -648,13 +647,11 @@ mod query_evidence_tests {
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
         };
-        let permission = read().all_columns();
         let mut binds = Vec::new();
         let mut bytes_paths = Vec::new();
-        let (pairs, record) = compile_record_evidence_projection(
+        let (pairs, record) = record_identity_projection(
             SqlDialect::Sqlite,
             &schema,
-            &permission,
             "t7",
             &mut binds,
             &mut bytes_paths,
@@ -675,10 +672,9 @@ mod query_evidence_tests {
         assert!(sql.contains(QUERY_EVIDENCE_HIDDEN_PREFIX), "{sql}");
         assert!(!sql.contains("'visible'"), "{sql}");
 
-        let (postgres_pairs, _) = compile_record_evidence_projection(
+        let (postgres_pairs, _) = record_identity_projection(
             SqlDialect::Postgres,
             &schema,
-            &permission,
             "t7",
             &mut Vec::new(),
             &mut Vec::new(),
@@ -713,20 +709,18 @@ mod query_evidence_tests {
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
         };
-        let permission = read().all_columns();
 
-        let (pairs, record) = compile_record_evidence_projection(
-            SqlDialect::Sqlite,
-            &schema,
-            &permission,
-            "t0",
-            &mut Vec::new(),
-            &mut Vec::new(),
-            "",
+        // The compiler emits record evidence only for a model the selected
+        // surface gives a client-addressable identity (`ModelScan`).
+        let surface = crate::graphql::build_surface(
+            std::slice::from_ref(&schema),
+            &crate::graphql::SurfaceOptions::sqlite(),
         )
         .unwrap();
-
-        assert!(pairs.is_empty());
-        assert!(record.is_none());
+        assert!(
+            !crate::graphql::surface::model_has_client_normalized_identity(
+                &surface.models["BigIntRecord"]
+            )
+        );
     }
 }
