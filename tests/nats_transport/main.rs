@@ -192,6 +192,59 @@ async fn bus_subscribe_uses_named_service_as_consumer_group() {
     .await;
 }
 
+#[tokio::test]
+async fn waiting_subscriber_receives_a_publish_after_becoming_idle() {
+    let Some(url) = nats_url() else { return };
+    let subject = unique("event.after_idle");
+    let stream = unique("STREAM");
+    let durable = unique("consumer");
+    let source = NatsJetStreamSource::connect(&url, &stream, vec![subject.clone()], &durable)
+        .await
+        .expect("connect source")
+        .with_fetch_timeout(Duration::from_millis(100));
+
+    let handled = Arc::new(AtomicUsize::new(0));
+    let handlers = Arc::new({
+        let handled = Arc::clone(&handled);
+        Handlers::new().on_event(subject.clone(), move |_: &Message| {
+            let handled = Arc::clone(&handled);
+            async move {
+                handled.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+    });
+    let consumer = tokio::spawn(run_source(
+        handlers,
+        source,
+        RunOptions::idempotent().wait_when_idle(),
+    ));
+
+    // Cross more than one empty fetch boundary before publishing. A
+    // long-running host must remain subscribed rather than drain and exit.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    NatsPublisher::connect(&url)
+        .await
+        .expect("connect publisher")
+        .publish(Message::new(
+            &subject,
+            MessageKind::Event,
+            b"{}".to_vec(),
+        ))
+        .await
+        .expect("publish after idle");
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while handled.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("waiting subscriber should handle the publish");
+    assert_eq!(handled.load(Ordering::SeqCst), 1);
+    consumer.abort();
+}
+
 // ---- failure paths: redelivery, termination (dead-letter), undecodable payloads ----
 
 /// Connect a fresh stream + durable pull source for `subject`.

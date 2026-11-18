@@ -14,6 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use super::source::{MessageSource, ReceivedMessage};
+use super::wake::Notify;
 use super::{run_source, Bus, BusConsumer, MessageRouter, RunOptions, TransportError};
 use super::{Message, OrderedDelivery};
 use crate::projection_protocol::{ProjectionEpoch, ProjectionSource};
@@ -35,6 +36,7 @@ pub struct InMemoryBus {
     queues: Queues,
     topics: Topics,
     source_epoch: ProjectionEpoch,
+    wake: Arc<Notify>,
 }
 
 impl Default for InMemoryBus {
@@ -44,6 +46,7 @@ impl Default for InMemoryBus {
             topics: Topics::default(),
             source_epoch: ProjectionEpoch::new(format!("instance-{}", uuid::Uuid::now_v7()))
                 .expect("an in-memory bus UUID is a valid projection source epoch"),
+            wake: Arc::new(Notify::new()),
         }
     }
 }
@@ -60,6 +63,7 @@ impl InMemoryBus {
             .entry(message.name().to_string())
             .or_default()
             .push_back(message);
+        self.wake.notify_waiters();
         Ok(())
     }
 
@@ -79,6 +83,7 @@ impl InMemoryBus {
             .entry(message.name().to_string())
             .or_default()
             .push(message);
+        self.wake.notify_waiters();
         Ok(())
     }
 
@@ -138,6 +143,7 @@ impl BusConsumer for InMemoryBus {
         let source = QueueSource {
             queues: self.queues.clone(),
             names,
+            wake: Arc::clone(&self.wake),
         };
         run_source(router, source, options).await
     }
@@ -153,6 +159,7 @@ impl BusConsumer for InMemoryBus {
             names,
             cursors: TopicCursors::default(),
             source_epoch: self.source_epoch.clone(),
+            wake: Arc::clone(&self.wake),
         };
         run_source(router, source, options).await
     }
@@ -162,6 +169,17 @@ impl BusConsumer for InMemoryBus {
 struct QueueSource {
     queues: Queues,
     names: Vec<String>,
+    wake: Arc<Notify>,
+}
+
+impl QueueSource {
+    fn has_available(&self) -> Result<bool, TransportError> {
+        let queues = self.queues.lock().map_err(|_| lock_poisoned("queue"))?;
+        Ok(self
+            .names
+            .iter()
+            .any(|name| queues.get(name).is_some_and(|queue| !queue.is_empty())))
+    }
 }
 
 impl MessageSource for QueueSource {
@@ -184,6 +202,15 @@ impl MessageSource for QueueSource {
         }
         Ok(None)
     }
+
+    async fn wait(&mut self) -> Result<(), TransportError> {
+        let notified = self.wake.notified();
+        if self.has_available()? {
+            return Ok(());
+        }
+        notified.await;
+        Ok(())
+    }
 }
 
 /// Fan-out source over the named retained logs: each `TopicSource` has its own
@@ -193,6 +220,22 @@ struct TopicSource {
     names: Vec<String>,
     cursors: TopicCursors,
     source_epoch: ProjectionEpoch,
+    wake: Arc<Notify>,
+}
+
+impl TopicSource {
+    fn has_available(&self) -> Result<bool, TransportError> {
+        let topics = self.topics.lock().map_err(|_| lock_poisoned("topic"))?;
+        let cursors = self
+            .cursors
+            .lock()
+            .map_err(|_| lock_poisoned("topic cursor"))?;
+        Ok(self.names.iter().any(|name| {
+            topics
+                .get(name)
+                .is_some_and(|log| cursors.get(name).copied().unwrap_or_default() < log.len())
+        }))
+    }
 }
 
 impl MessageSource for TopicSource {
@@ -237,6 +280,15 @@ impl MessageSource for TopicSource {
             }
         }
         Ok(None)
+    }
+
+    async fn wait(&mut self) -> Result<(), TransportError> {
+        let notified = self.wake.notified();
+        if self.has_available()? {
+            return Ok(());
+        }
+        notified.await;
+        Ok(())
     }
 }
 
@@ -301,6 +353,7 @@ mod tests {
     use crate::bus::{Handlers, MessageKind};
     use crate::trace_context::{CAUSATION_ID, TRACEPARENT};
     use std::future::Future;
+    use std::time::Duration;
 
     fn block_on<F: Future>(future: F) -> F::Output {
         use std::ptr;
@@ -375,10 +428,12 @@ mod tests {
         let mut a = QueueSource {
             queues: bus.queues.clone(),
             names: vec!["work".to_string()],
+            wake: Arc::clone(&bus.wake),
         };
         let mut b = QueueSource {
             queues: bus.queues.clone(),
             names: vec!["work".to_string()],
+            wake: Arc::clone(&bus.wake),
         };
         let mut got = Vec::new();
         // Alternate; each pop removes the message (competing).
@@ -423,6 +478,54 @@ mod tests {
         assert_eq!(b_ids, vec!["e0", "e1", "e2"]);
     }
 
+    #[tokio::test]
+    async fn one_publish_wakes_every_waiting_topic_subscriber() {
+        let bus = InMemoryBus::new();
+        let first = recorder();
+        let second = recorder();
+        let first_task = {
+            let bus = bus.clone();
+            let service = event_service(first.clone());
+            tokio::spawn(async move {
+                bus.subscribe(service, RunOptions::idempotent().wait_when_idle())
+                    .await
+            })
+        };
+        let second_task = {
+            let bus = bus.clone();
+            let service = event_service(second.clone());
+            tokio::spawn(async move {
+                bus.subscribe(service, RunOptions::idempotent().wait_when_idle())
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bus.wake.waiter_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both subscribers registered their idle waiters");
+
+        bus.publish_message(
+            Message::new("evt", MessageKind::Event, b"{}".to_vec()).with_id("broadcast"),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while first.lock().unwrap().is_empty() || second.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both waiting subscribers handled the publish");
+
+        assert_eq!(first.lock().unwrap().as_slice(), ["broadcast"]);
+        assert_eq!(second.lock().unwrap().as_slice(), ["broadcast"]);
+        first_task.abort();
+        second_task.abort();
+    }
+
     #[test]
     fn topic_nack_redelivers_exact_gap_free_position_and_ack_advances() {
         let bus = InMemoryBus::new();
@@ -437,6 +540,7 @@ mod tests {
             names: vec!["evt".into()],
             cursors: TopicCursors::default(),
             source_epoch: bus.source_epoch.clone(),
+            wake: Arc::clone(&bus.wake),
         };
 
         let first = block_on(source.recv()).unwrap().unwrap();
@@ -482,6 +586,7 @@ mod tests {
             names: vec!["evt".into()],
             cursors: TopicCursors::default(),
             source_epoch: bus.source_epoch.clone(),
+            wake: Arc::clone(&bus.wake),
         };
         let received = block_on(source.recv()).unwrap().unwrap();
         assert_eq!(received.message().id(), Some("e0"));

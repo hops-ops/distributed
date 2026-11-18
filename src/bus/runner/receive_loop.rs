@@ -2,7 +2,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::bus::source::{MessageSource, ReceivedMessage};
-use crate::bus::{FailureAction, MessageRouter, RunOptions, TransportError, TransportErrorKind};
+use crate::bus::{
+    FailureAction, IdlePolicy, MessageRouter, RunOptions, TransportError, TransportErrorKind,
+};
 use crate::bus::{Message, MessageKind};
 
 /// Run the receive loop for a direct transport source.
@@ -49,8 +51,14 @@ where
     let transport = source.transport_name();
 
     loop {
-        let Some(received) = recv_next(&mut source, service, transport).await? else {
-            break;
+        let Some(received) = recv_next(&mut source, service, transport, options.idle).await? else {
+            match options.idle {
+                IdlePolicy::Drain => break,
+                IdlePolicy::Wait => {
+                    source.wait().await?;
+                    continue;
+                }
+            }
         };
 
         // A delivery the transport could not decode is a permanent failure: it
@@ -273,17 +281,27 @@ async fn recv_next<S: MessageSource>(
     source: &mut S,
     service: Option<&str>,
     transport: &str,
+    idle: IdlePolicy,
 ) -> Result<Option<S::Received>, TransportError> {
-    match source.recv().await {
-        Ok(received) => Ok(received),
-        Err(error) => {
-            record_transport_failure(
-                service,
-                transport,
-                error.kind(),
-                crate::telemetry::failure_action::RECV_ERROR,
-            );
-            Err(error)
+    loop {
+        match source.recv().await {
+            Ok(received) => return Ok(received),
+            Err(error) => {
+                record_transport_failure(
+                    service,
+                    transport,
+                    error.kind(),
+                    crate::telemetry::failure_action::RECV_ERROR,
+                );
+                // A long-lived consumer treats a transient recv (SQLite BUSY,
+                // brief broker blip) as idle: wait and try again. Drain keeps
+                // the historical contract that recv errors end the run.
+                if idle == IdlePolicy::Wait && error.kind().is_retryable() {
+                    source.wait().await?;
+                    continue;
+                }
+                return Err(error);
+            }
         }
     }
 }
