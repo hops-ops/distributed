@@ -5,7 +5,7 @@ use distributed::application::{
     ApplicationExtension, ApplicationManifest, ContractCompiler, Module, SurfaceSpec,
 };
 use distributed::graphql::{
-    build_surface, col, surface_for_application_contract, ReadPermission, Surface, SurfaceOptions,
+    build_surface, col, read, surface_for_application_contract, Surface, SurfaceOptions,
 };
 #[cfg(feature = "application-runtime")]
 use distributed::microsvc::{CausalCommandContext, HandlerError};

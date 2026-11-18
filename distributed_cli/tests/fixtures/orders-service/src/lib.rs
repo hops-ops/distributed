@@ -8,7 +8,7 @@ use distributed::command::{
     PreparedCommand,
 };
 use distributed::graphql::{
-    build_surface, surface_for_role, DistributedClientSurfaceExport, ReadPermission,
+    build_surface, read, surface_for_role, DistributedClientSurfaceExport,
     SurfaceOptions, SurfaceProjector,
 };
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
