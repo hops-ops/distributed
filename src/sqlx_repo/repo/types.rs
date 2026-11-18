@@ -124,11 +124,12 @@ where
 
     /// Open a pool without applying migrations.
     pub async fn connect(database_url: &str) -> Result<Self, RepositoryError> {
-        let pool = PoolOptions::<DB>::new()
-            .max_connections(DB::default_pool_size(database_url))
-            .connect(database_url)
-            .await
-            .map_err(|err| repository_storage_error::<DB>("connect", err))?;
+        let pool = DB::pool_options(
+            PoolOptions::<DB>::new().max_connections(DB::default_pool_size(database_url)),
+        )
+        .connect(database_url)
+        .await
+        .map_err(|err| repository_storage_error::<DB>("connect", err))?;
         Ok(Self::new(pool))
     }
 

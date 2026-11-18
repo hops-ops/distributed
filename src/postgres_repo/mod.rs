@@ -112,6 +112,31 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
     /// Epoch seconds; stored via `to_timestamp(...)` into `timestamptz`.
     type TimestampValue = f64;
 
+    /// sqlx 0.9.0 does not undo a `BEGIN` whose future is dropped before the
+    /// server answers: `transaction_depth` is still zero, so its drop guard
+    /// queues no `ROLLBACK`, and the connection returns to the pool inside an
+    /// open transaction. Statements that follow run in that transaction, and
+    /// the next `SET TRANSACTION ISOLATION LEVEL` on it is refused ("must be
+    /// called before any query"). A connection released in that state is
+    /// closed instead of reused.
+    fn pool_options(options: sqlx::pool::PoolOptions<Self>) -> sqlx::pool::PoolOptions<Self> {
+        options.after_release(|connection, _| {
+            Box::pin(async move {
+                // Outside a transaction block a simple query starts its own
+                // transaction, so the two timestamps are equal.
+                let open: bool = sqlx::raw_sql("SELECT now() <> statement_timestamp()")
+                    .fetch_one(&mut *connection)
+                    .await?
+                    .get(0);
+                #[cfg(feature = "otel")]
+                if open {
+                    tracing::warn!("closed a Postgres connection released inside a transaction");
+                }
+                Ok(!open)
+            })
+        })
+    }
+
     fn is_unique_violation(err: &sqlx::Error) -> bool {
         is_postgres_unique_violation(err)
     }
