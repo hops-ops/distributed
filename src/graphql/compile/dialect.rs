@@ -48,6 +48,22 @@ impl SqlDialect {
     }
 }
 
+impl DialectOps {
+    /// A JSON-valued subquery embedded as a member of an enclosing object.
+    ///
+    /// SQLite marks JSON with a value subtype that a scalar subquery does not
+    /// reliably carry out (it depends on the SQLite version and on how the
+    /// subquery is evaluated). Without the subtype the enclosing
+    /// `json_object` stores the nested JSON as a string. `json()` restores
+    /// it, and maps SQL NULL to NULL, so an absent row stays `null`.
+    pub(super) fn nested_json(&self, subquery: String) -> String {
+        match self.json_cast_fn {
+            None => subquery,
+            Some(cast) => format!("{cast}({subquery})"),
+        }
+    }
+}
+
 pub(super) fn placeholder(dialect: SqlDialect, n: usize) -> String {
     match dialect {
         SqlDialect::Postgres => format!("${n}"),

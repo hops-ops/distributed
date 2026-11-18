@@ -753,9 +753,9 @@ pub fn compile_root(
                         };
                         pairs.push((
                             aggregate_member.response_key.clone(),
-                            format!(
+                            inner.dialect.ops().nested_json(format!(
                                 "coalesce((SELECT {json_agg}(n) FROM (SELECT {nodes_proj} AS n FROM \"{table}\" {alias} WHERE {where_for_nodes} {order_sql} LIMIT {lim} OFFSET {off}) x), {coalesce_empty})"
-                            ),
+                            )),
                         ));
                         evidence_fields.push(QueryEvidenceFieldPlan {
                             storage_key: aggregate_member.response_key.clone(),
@@ -922,7 +922,10 @@ pub(super) fn compile_object_projection(
                         depth + 1,
                     )?;
                     validate_response_key(&child.response_key)?;
-                    pairs.push((child.response_key.clone(), sub));
+                    pairs.push((
+                        child.response_key.clone(),
+                        inner.dialect.ops().nested_json(sub),
+                    ));
                     evidence_fields.push(QueryEvidenceFieldPlan {
                         storage_key: child.response_key.clone(),
                         response_key: child.response_key.clone(),
@@ -993,7 +996,10 @@ pub(super) fn compile_object_projection(
                     depth + 1,
                 )?;
                 validate_response_key(&child.response_key)?;
-                pairs.push((child.response_key.clone(), sub));
+                pairs.push((
+                    child.response_key.clone(),
+                    inner.dialect.ops().nested_json(sub),
+                ));
                 evidence_fields.push(QueryEvidenceFieldPlan {
                     storage_key: child.response_key.clone(),
                     response_key: child.response_key.clone(),
