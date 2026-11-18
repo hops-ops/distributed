@@ -38,9 +38,9 @@ jobs:
             tests/e2e-ui -> target
           shared-key: e2e-ui-offline
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           cache: npm
           cache-dependency-path: |
             js/package-lock.json
@@ -77,9 +77,9 @@ jobs:
             tests/e2e-ui -> target
           shared-key: e2e-ui-browser
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           cache: npm
           cache-dependency-path: |
             js/package-lock.json
@@ -161,7 +161,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-ui-playwright-report
           # Only the explicit paths below; never include e2e/.auth or env files.
@@ -230,9 +230,9 @@ jobs:
             tests/e2e-ui -> target
           shared-key: e2e-ui-local-gitops
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
           cache: npm
           cache-dependency-path: |
             js/package-lock.json
@@ -248,13 +248,13 @@ jobs:
           # external domain advertised in the OIDC authorize redirect.
           sudo apt-get install -y jq openssl curl nginx ripgrep
 
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@v5
         with:
-          version: v1.32.0
+          version: v1.37.1
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
-          version: v3.17.3
+          version: v4.3.0
 
       - name: Verify coherent local GitOps chart contracts
         run: ./scripts/helm-contract-test.sh
@@ -792,7 +792,7 @@ jobs:
 
       - name: Upload Kubernetes Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-ui-k8s-playwright-report
           path: |
@@ -825,7 +825,7 @@ jobs:
 
       - name: Upload Kubernetes diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-ui-k8s-diagnostics
           path: |

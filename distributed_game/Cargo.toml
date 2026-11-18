@@ -66,7 +66,7 @@ base64 = "0.23"
 # a SQLite bus and read-model store.
 distributed = { path = "..", default-features = false, features = ["sqlite", "graphql"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
-trybuild = "=1.0.120"
+trybuild = "=1.0.121"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.30"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }

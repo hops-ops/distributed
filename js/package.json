@@ -71,7 +71,7 @@
   },
   "dependencies": {
     "@graphql-typed-document-node/core": "^3.2.0",
-    "graphql": "^16.14.0",
+    "graphql": "^17.0.0",
     "wasm-pack": "0.15.0"
   },
   "peerDependencies": {
@@ -88,14 +88,14 @@
   },
   "devDependencies": {
     "@apollo/client": "^4.2.7",
-    "@types/node": "^20.0.0",
-    "@types/react": "19.2.18",
+    "@types/node": "^24.0.0",
+    "@types/react": "19.3.0",
     "esbuild": "^0.28.0",
     "publint": "^0.3.22",
-    "react": "19.2.8",
-    "react-dom": "19.2.8",
-    "react-test-renderer": "19.2.8",
-    "svelte": "5.56.9",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-test-renderer": "19.3.0",
+    "svelte": "5.57.1",
     "typescript": "5.9.3"
   },
   "engines": {
