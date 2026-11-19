@@ -1,6 +1,7 @@
 //! HTTP/gRPC causal wait-path and Bus send-has-no-reply.
 #![cfg(all(feature = "graphql", feature = "http"))]
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -863,7 +864,7 @@ async fn celld_host_completes_remote_commit_once_and_rejects_changed_shard() {
     let mut session = distributed::microsvc::Session::new();
     session.set(USER_ID_KEY, "alice");
     session.set(ROLE_KEY, "user");
-    let principal = VerifiedPrincipal::from_trusted_transport("alice");
+    let principal = VerifiedPrincipal::internal("alice").unwrap();
     let command_id = "0190a000-0000-7000-8000-000000000109";
 
     let first = host
@@ -948,7 +949,7 @@ async fn celld_host_completes_remote_commit_once_and_rejects_changed_shard() {
             command_id,
             json!({ "id": "todo-cell-once" }),
             binding_session,
-            VerifiedPrincipal::from_trusted_transport("alice"),
+            VerifiedPrincipal::internal("alice").unwrap(),
             None,
         )
         .await
@@ -1027,7 +1028,7 @@ async fn celld_host_reclaims_an_ambiguous_receipt_with_the_same_causation() {
     let mut session = distributed::microsvc::Session::new();
     session.set(USER_ID_KEY, "alice");
     session.set(ROLE_KEY, "user");
-    let principal = VerifiedPrincipal::from_trusted_transport("alice");
+    let principal = VerifiedPrincipal::internal("alice").unwrap();
     let command_id = "0190a000-0000-7000-8000-000000000110";
 
     let first = host
@@ -1126,7 +1127,7 @@ async fn celld_host_replays_external_completion_after_sqlite_reopen() {
     let mut session = distributed::microsvc::Session::new();
     session.set(USER_ID_KEY, "alice");
     session.set(ROLE_KEY, "user");
-    let principal = VerifiedPrincipal::from_trusted_transport("alice");
+    let principal = VerifiedPrincipal::internal("alice").unwrap();
     let command_id = "0190a000-0000-7000-8000-000000000111";
     let input = json!({ "id": "todo-sqlite-reopen" });
 
@@ -1222,7 +1223,7 @@ async fn graphql_only_http_host_wait_dispatches_to_writer() {
     let mut session = distributed::microsvc::Session::new();
     session.set(USER_ID_KEY, "alice");
     session.set(ROLE_KEY, "user");
-    let principal = VerifiedPrincipal::from_trusted_transport("alice");
+    let principal = VerifiedPrincipal::internal("alice").unwrap();
     let command_id = "0190a000-0000-7000-8000-000000000105";
     let result = host
         .invoke(
@@ -1252,6 +1253,7 @@ async fn graphql_only_engine_wait_dispatches_to_loopback_writer() {
     let writer = wait_service();
     let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .protocol_token_key(PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
         .service(writer.as_ref())
@@ -1273,7 +1275,7 @@ async fn graphql_only_engine_wait_dispatches_to_loopback_writer() {
     let mut session = Session::new();
     session.set(USER_ID_KEY, "alice");
     session.set(ROLE_KEY, "user");
-    let principal = VerifiedPrincipal::from_trusted_transport("alice");
+    let principal = VerifiedPrincipal::internal("alice").unwrap();
     let command_id = "0190a000-0000-7000-8000-000000000106";
     let mutation = engine
         .execute(

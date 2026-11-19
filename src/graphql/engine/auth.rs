@@ -88,15 +88,6 @@ pub(crate) fn role_authorization_info(
     ))
 }
 
-pub(crate) fn identity_mode_label(mode: IdentityMode) -> &'static str {
-    match mode {
-        IdentityMode::TrustedProxy => "trusted_proxy",
-        IdentityMode::OidcBearer => "oidc_bearer",
-        IdentityMode::Hybrid => "hybrid",
-        IdentityMode::DevHeaders => "dev_headers",
-    }
-}
-
 /// Authorization fingerprint for a multi-privilege application pack.
 pub(crate) fn role_authorization_info_for_roles(
     privilege_key: &str,

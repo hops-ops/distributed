@@ -27,7 +27,7 @@ use super::commands::TypedCommandInventory;
 use super::compile::{SqlDialect, SqlPlan};
 use super::execute;
 use super::filter::FilterExpr;
-use super::identity::{IdentityConfig, IdentityMode, OidcValidator, VerifiedPrincipal};
+use super::identity::{IdentityConfig, IdentityResolver, VerifiedPrincipal};
 use super::naming::{
     by_pk_field, is_valid_graphql_name, object_type_name, reserved_type_names, root_list_field,
 };
@@ -69,13 +69,11 @@ mod tests;
 
 pub use core::{
     ExecutionAuthority, GraphqlBuildError, GraphqlEngine, GraphqlEngineBuilder, GraphqlPool,
-    GraphqlPoolSource,
+    GraphqlPoolSource, WebsocketLimits,
 };
 pub use introspection::{graphiql_enabled_from_env, graphiql_enabled_from_env_vars};
 
-pub(crate) use auth::{
-    identity_mode_label, role_authorization_info, role_authorization_info_for_roles,
-};
+pub(crate) use auth::{role_authorization_info, role_authorization_info_for_roles};
 pub(crate) use core::{
     CatalogEntry, ClientApplicationRegistration, EngineInner, ProtocolApplicationInfo,
     ProtocolRoleInfo, ProtocolRuntime, ProtocolSurfaceInfo,

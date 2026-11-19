@@ -1,5 +1,6 @@
 //! T* Transport / surface red-team (engine + HTTP).
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 
 use async_graphql::Request;
@@ -69,6 +70,7 @@ async fn t4_command_handler(
 async fn anonymous_introspection_disabled_when_flag_false() {
     let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .introspection_for_anonymous(false)
@@ -104,6 +106,7 @@ async fn anonymous_introspection_disabled_when_flag_false() {
 async fn anonymous_introspection_allowed_when_flag_true() {
     let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .introspection_for_anonymous(true)
@@ -123,6 +126,7 @@ async fn anonymous_introspection_allowed_when_flag_true() {
 async fn t3_introspection_over_http_respects_role() {
     let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .service_id("rt-http")
         .roles(&["user", "anonymous"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
@@ -218,6 +222,7 @@ async fn t4_mutation_absent_without_command_grant() {
     let service = Service::new().named("graphql-harden-t4").routes(routes);
 
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .service(&service)
         .protocol_token_key([0x44; 32])
         .roles(&["user", "admin"])
@@ -267,6 +272,7 @@ async fn production_env_policy_disables_graphiql_http_get() {
 
     let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .service_id("prod-gql")
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
@@ -293,6 +299,7 @@ async fn production_env_policy_disables_graphiql_http_get() {
 async fn graphql_metrics_increment_on_execute() {
     let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .build()
@@ -318,6 +325,7 @@ async fn graphql_metrics_increment_on_execute() {
 async fn graphql_metrics_bad_request_status_label() {
     let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_bool_width(2)

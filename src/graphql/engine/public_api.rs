@@ -189,11 +189,16 @@ impl GraphqlEngine {
 
     /// Identity configuration used by GraphQL HTTP handlers.
     pub fn identity_config(&self) -> &IdentityConfig {
+        self.inner.identity.config()
+    }
+
+    pub(crate) fn identity(&self) -> &IdentityResolver {
         &self.inner.identity
     }
 
-    pub(crate) fn identity_validator(&self) -> Option<&OidcValidator> {
-        self.inner.identity_validator.as_ref()
+    /// Bounds applied to each origin WebSocket connection.
+    pub fn websocket_limits(&self) -> WebsocketLimits {
+        self.inner.websocket
     }
 
     /// Whether unknown/ungranted client `where` and `order_by` keys fail closed.

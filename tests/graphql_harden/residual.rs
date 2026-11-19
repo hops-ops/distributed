@@ -1,6 +1,7 @@
 //! Residual red-team cases from post-quality-1 review (A8/A12/S9/E4/E6).
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{claim, col, read, GraphqlEngine, ModelPermissions};
 use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
 
@@ -33,6 +34,7 @@ pub async fn a8_nested_has_many_without_child_grant_is_unknown_field(db: Db) {
     // Parent granted; child model has **no** permission for this role.
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .permission::<ParentView>("user", read().all_columns())
         .build()
@@ -88,6 +90,7 @@ pub async fn a12_rel_where_without_target_grant_is_unknown_field(db: Db) {
 
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .permission::<ParentView>("user", read().all_columns())
         // no ChildView permission
@@ -155,6 +158,7 @@ pub async fn s9_json_contains_on_a_text_column_is_rejected_without_sql_leak(db: 
 pub async fn e4_missing_claim_header_is_stable_without_sql_leak(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(
             ModelPermissions::new().grant(

@@ -1,6 +1,7 @@
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 #![allow(dead_code)]
 
+use distributed::graphql::IdentityConfig;
 use std::any::TypeId;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1290,6 +1291,7 @@ async fn service_id_mismatch_fails_in_both_builder_call_orders() {
     let service = service_a("todos");
 
     let before = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service_id("wrong")
         .service(&service)
         .build()
@@ -1300,6 +1302,7 @@ async fn service_id_mismatch_fails_in_both_builder_call_orders() {
         .contains("does not match executable service ID"));
 
     let after = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service(&service)
         .service_id("wrong")
         .build()
@@ -1314,6 +1317,7 @@ async fn service_id_mismatch_fails_in_both_builder_call_orders() {
 async fn attachment_checks_exact_rust_types_after_structural_parity() {
     let engine_source = service_a("todos");
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service(&engine_source)
         .build()
         .unwrap();
@@ -1330,6 +1334,7 @@ async fn attachment_checks_exact_rust_types_after_structural_parity() {
 async fn attachment_checks_full_structure_and_service_identity() {
     let engine_source = service_a("todos");
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service(&engine_source)
         .build()
         .unwrap();
@@ -1351,6 +1356,7 @@ async fn attachment_checks_full_structure_and_service_identity() {
 
     let engine_source = service_a("todos-a");
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service(&engine_source)
         .build()
         .unwrap();
@@ -1368,6 +1374,7 @@ async fn projected_command_binding_rejects_a_raw_pool_source() {
     let route_repository = SqliteRepository::new(shared_pool.clone());
     let service = projected_service("plans", route_repository);
     let engine = GraphqlEngine::builder(shared_pool)
+        .identity(IdentityConfig::dev_headers())
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .model::<PlanView>(plan_permissions("anonymous"))
         .service(&service)
@@ -1394,6 +1401,7 @@ async fn projected_command_binding_rejects_an_independent_repository_over_the_sa
     let graphql_repository = SqliteRepository::new(shared_pool);
     let service = projected_service("plans", route_repository);
     let engine = GraphqlEngine::builder(&graphql_repository)
+        .identity(IdentityConfig::dev_headers())
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .model::<PlanView>(plan_permissions("anonymous"))
         .service(&service)
@@ -1419,6 +1427,7 @@ async fn projected_command_binding_accepts_a_clone_of_the_same_repository_handle
     let repository = SqliteRepository::new(shared_pool);
     let service = projected_service("plans", repository.clone());
     let engine = GraphqlEngine::builder(&repository)
+        .identity(IdentityConfig::dev_headers())
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .model::<PlanView>(plan_permissions("anonymous"))
         .service(&service)
@@ -1444,6 +1453,7 @@ async fn projector_topology_identity_drift_changes_service_binding_fingerprint()
             .handle(succeeded_plan_handler),
     );
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<PlanView>(plan_permissions("anonymous"))
         .service(&engine_source)
         .client_projectors([modeled_projector::<PlanView, _>(PLAN_PROJECTION)])
@@ -1471,6 +1481,7 @@ async fn projector_topology_identity_drift_changes_service_binding_fingerprint()
 async fn matched_typed_inventory_rejects_attachment_without_protocol_tokens() {
     let service = service_a("todos");
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service(&service)
         .build()
         .expect("typed inventory can be compiled before deployment protocol configuration");
@@ -1491,6 +1502,7 @@ async fn matched_typed_inventory_rejects_attachment_without_protocol_tokens() {
 async fn matched_typed_inventory_attaches_while_unverified_mutations_fail_closed() {
     let service = service_a("todos");
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .service(&service)
         .build()
@@ -1531,6 +1543,7 @@ async fn every_graphql_dispatch_path_fences_before_typed_guards_and_handlers() {
     let service = Arc::new(guarded_service_a("todos"));
     let engine = Arc::new(
         GraphqlEngine::builder(pool())
+            .identity(IdentityConfig::dev_headers())
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .service(&service)
             .build()
@@ -1572,6 +1585,7 @@ async fn router_construction_runs_full_binding_validation() {
     let engine_source = service_a("todos");
     let engine = Arc::new(
         GraphqlEngine::builder(pool())
+            .identity(IdentityConfig::dev_headers())
             .service(&engine_source)
             .build()
             .unwrap(),
@@ -1597,6 +1611,7 @@ async fn router_construction_runs_full_binding_validation() {
 async fn query_only_service_binding_executes_without_a_command_committer() {
     let service = Service::new().named("query-only");
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service(&service)
         .build()
         .unwrap();
@@ -1645,6 +1660,7 @@ fn pool_free_typed_export_preserves_service_provenance_and_rejects_relabeling() 
 async fn execute_stream_cannot_dispatch_through_an_injected_legacy_service() {
     let typed = service_a("todos");
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service(&typed)
         .build()
         .unwrap();
@@ -1690,6 +1706,7 @@ async fn succeeded_command_without_preview_exports_modeled_revalidation_contract
             .handle(succeeded_plan_handler),
     );
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<PlanView>(plan_permissions("anonymous"))
         .service(&service)
         .client_projectors([modeled_projector::<PlanView, _>(PLAN_PROJECTION)])
@@ -1744,6 +1761,7 @@ async fn generated_input_default_is_reused_as_the_effect_key_and_fingerprinted()
             .handle(succeeded_plan_handler),
     );
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<PlanView>(plan_permissions("anonymous"))
         .service(&service_with_default)
         .client_projectors([modeled_projector::<PlanView, _>(PLAN_PROJECTION)])
@@ -1817,6 +1835,7 @@ async fn generated_input_default_is_reused_as_the_effect_key_and_fingerprinted()
             .handle(succeeded_plan_handler),
     );
     let manifest_without_default = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<PlanView>(plan_permissions("anonymous"))
         .service(&without_default)
         .client_projectors([modeled_projector::<PlanView, _>(PLAN_PROJECTION)])
@@ -1848,6 +1867,7 @@ async fn forged_input_default_marker_is_revalidated_against_wire_shape() {
             .handle(succeeded_plan_handler),
     );
     let error = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service(&service)
         .build()
         .err()
@@ -1871,6 +1891,7 @@ async fn generated_input_default_uses_the_canonical_renamed_wire_path() {
             .handle(renamed_default_handler),
     );
     let manifest = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service(&service)
         .build()
         .unwrap()
@@ -1901,6 +1922,7 @@ async fn json_container_leaves_reach_the_manifest() {
             .handle(json_patch_handler),
     );
     let manifest = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<JsonView>(ModelPermissions::new().grant("anonymous", read().all_columns()))
         .service(&json_service)
         .client_projectors([modeled_projector::<JsonView, _>(JSON_PROJECTION)])
@@ -1946,6 +1968,7 @@ async fn embedded_primary_keys_reject_keyed_effects_while_composite_keys_remain_
     // Keyed optimistic command_effects! authoring is removed. Embedded BigInt models
     // still revalidate through modeled mutation lowering; composite keys stay normalized.
     let bigint_manifest = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service_id("bigint-read")
         .model::<BigIntKeyView>(ModelPermissions::new().grant("anonymous", read().all_columns()))
         .build()
@@ -1980,6 +2003,7 @@ async fn embedded_primary_keys_reject_keyed_effects_while_composite_keys_remain_
             .handle(composite_key_handler),
     );
     let composite_manifest = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<CompositeKeyView>(ModelPermissions::new().grant("anonymous", read().all_columns()))
         .service(&composite_service)
         .client_projectors([modeled_projector::<CompositeKeyView, _>(
@@ -2043,6 +2067,7 @@ async fn embedded_models_retain_global_revalidation_for_modeled_projections() {
             .handle(bigint_key_handler),
     );
     let manifest = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<BigIntKeyView>(
             ModelPermissions::new().grant("anonymous", read().columns(["title"])),
         )
@@ -2109,6 +2134,7 @@ async fn succeeded_emitted_event_exports_a_modeled_causal_projection() {
             .handle(succeeded_plan_handler),
     );
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<PlanView>(plan_permissions("anonymous"))
         .service(&service)
         .client_projectors([modeled_projector::<PlanView, _>(PLAN_PROJECTION)])
@@ -2146,6 +2172,7 @@ async fn text_backed_enum_constant_reaches_a_valid_client_manifest() {
             .handle(succeeded_plan_handler),
     );
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<PlanView>(plan_permissions("anonymous"))
         .service(&service)
         .client_projectors([modeled_projector::<PlanView, _>(PLAN_CLOSE_PROJECTION)])
@@ -2186,6 +2213,7 @@ async fn nonfinite_float_constant_is_rejected_but_explicit_null_is_portable() {
             .handle(float_effect_handler),
     );
     let manifest = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<FloatEffectView>(ModelPermissions::new().grant("anonymous", read().all_columns()))
         .service(&explicit_null)
         .client_projectors([modeled_projector::<FloatEffectView, _>(
@@ -2228,6 +2256,7 @@ async fn json_backed_constants_reject_nonfinite_floats_but_preserve_json_null() 
             .handle(float_effect_handler),
     );
     let manifest = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<JsonFloatEffectView>(
             ModelPermissions::new().grant("anonymous", read().all_columns()),
         )
@@ -2271,6 +2300,7 @@ async fn consistency_confirmation_matrix_fails_closed() {
             .handle(fact_plan_handler),
     );
     let error = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .service(&missing_fact)
         .build()
         .err()
@@ -2298,6 +2328,7 @@ async fn role_redaction_replaces_an_unsafe_modeled_projection_with_revalidation(
             .handle(succeeded_plan_handler),
     );
     let engine = GraphqlEngine::builder(pool())
+        .identity(IdentityConfig::dev_headers())
         .model::<PlanView>(ModelPermissions::new().grant("user", read().columns(["title"])))
         .service(&service)
         .client_projectors([modeled_projector::<PlanView, _>(PLAN_TITLE_PROJECTION)])

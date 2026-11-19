@@ -405,13 +405,15 @@ fn invoke_command_host<'a, H: CommandHost>(
     call: FactCall<'a>,
 ) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
     Box::pin(async move {
+        let principal = VerifiedPrincipal::internal(&call.principal)
+            .map_err(|error| FactError::Permanent(error.to_string()))?;
         let result = host
             .invoke(
                 call.command,
                 &call.command_id,
                 call.input.clone(),
                 call.session,
-                VerifiedPrincipal::from_trusted_transport(&call.principal),
+                principal,
                 None,
             )
             .await

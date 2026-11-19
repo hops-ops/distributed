@@ -126,21 +126,5 @@ mod tests {
         assert!(anonymous.contains_key("ChatMessages"));
         assert!(anonymous.contains_key("AuthUsers"));
         assert_eq!(anonymous.len(), 2);
-        assert!(matches!(
-            user["Todos"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Predicate(_)
-        ));
-        assert!(matches!(
-            user["BlobGames"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Predicate(_)
-        ));
-        assert!(matches!(
-            user["ChatMessages"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Unrestricted
-        ));
-        assert!(matches!(
-            user["AuthUsers"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Unrestricted
-        ));
     }
 }

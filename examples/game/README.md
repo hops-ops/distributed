@@ -282,7 +282,7 @@ and `vite dev` on `SVELTEKIT_PORT` (default 5573). What each piece replaces:
   entry points, not placement: celld forwards each socket to the room's
   node.
 - **API identity.** `mobpit-service` trusts no identity header
-  (`IdentityMode::OidcBearer`). Auth.js's `session` callback puts a Bearer
+  (`IdentityConfig::OidcBearer`). Auth.js's `session` callback puts a Bearer
   in `session.accessToken`: an ES256 JWT this server signs for the session's
   verified `sub` (15 min, `src/lib/server/api-token.ts`;
   `MOBPIT_API_SIGNING_JWK`), or, with OIDC and no signing key, the

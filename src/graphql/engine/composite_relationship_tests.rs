@@ -253,6 +253,7 @@ async fn belongs_to_with_a_partial_composite_foreign_key_is_rejected() {
         .table_schema(simple);
     let error = GraphqlEngine::from_schema_catalog(&project, pool)
         .unwrap()
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .roles(&["admin"])
         .grant_all("admin")
         .build()
@@ -363,6 +364,7 @@ async fn unique_key_join_fixture(pool: GraphqlPool) {
         .table_schema(source);
     let engine = GraphqlEngine::from_schema_catalog(&project, pool.clone())
         .unwrap()
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .roles(&["admin"])
         .grant_all("admin")
         .build()
@@ -401,6 +403,7 @@ async fn unique_key_join_fixture(pool: GraphqlPool) {
     let (changes, change_rx) = tokio::sync::broadcast::channel(8);
     let mut builder = GraphqlEngine::from_schema_catalog(&project, pool.clone())
         .unwrap()
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .roles(&["reader"])
         .grant_all("reader")
         .change_stream(change_rx);
@@ -565,6 +568,7 @@ async fn belongs_to_loads_composite_target_rows() {
         .table_schema(simple_records_with_composite_fk());
     let engine = GraphqlEngine::from_schema_catalog(&project, pool)
         .unwrap()
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .roles(&["admin"])
         .grant_all("admin")
         .build()
@@ -655,6 +659,7 @@ async fn has_many_lists_child_rows_on_a_composite_parent() {
         .table_schema(project_files());
     let engine = GraphqlEngine::from_schema_catalog(&project, pool)
         .unwrap()
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .roles(&["admin"])
         .grant_all("admin")
         .build()
@@ -761,6 +766,7 @@ async fn has_many_lists_composite_child_rows_on_a_single_column_parent() {
         .table_schema(projects());
     let engine = GraphqlEngine::from_schema_catalog(&project, pool)
         .unwrap()
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .roles(&["admin"])
         .grant_all("admin")
         .build()
@@ -894,6 +900,7 @@ async fn m2m_joins_composite_parent_key_through_the_join_table() {
         .table_schema(project_labels());
     let engine = GraphqlEngine::from_schema_catalog(&catalog, pool)
         .unwrap()
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .roles(&["admin"])
         .grant_all("admin")
         .build()

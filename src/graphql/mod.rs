@@ -69,7 +69,7 @@ pub mod subscribe;
 #[cfg(feature = "graphql")]
 pub use engine::{
     graphiql_enabled_from_env, graphiql_enabled_from_env_vars, GraphqlBuildError, GraphqlEngine,
-    GraphqlEngineBuilder, GraphqlPool, GraphqlPoolSource,
+    GraphqlEngineBuilder, GraphqlPool, GraphqlPoolSource, WebsocketLimits,
 };
 #[cfg(feature = "graphql")]
 pub use http::{
@@ -79,10 +79,9 @@ pub use http::{
 #[cfg(feature = "graphql")]
 pub use identity::{
     extract_bearer, map_claims_to_session, public_oidc_identity_from_env,
-    public_oidc_identity_from_env_vars, resolve_session, resolve_session_sync,
-    strip_identity_headers, AuthError, ClaimMapConfig, IdentityConfig, IdentityMode,
-    IdentityResolver, OidcConfig, OidcValidator, TrustedProxyConfig, ValidationError,
-    VerifiedPrincipal, DEFAULT_IDENTITY_STRIP_HEADERS, UNSET_OIDC_AUDIENCE, UNSET_OIDC_ISSUER,
+    public_oidc_identity_from_env_vars, AuthError, ClaimMapConfig, GatewaySecret, IdentityConfig,
+    IdentityConfigError, IdentityResolver, InvalidPrincipal, OidcConfig, OidcValidator,
+    ValidationError, VerifiedPrincipal, UNSET_OIDC_AUDIENCE, UNSET_OIDC_ISSUER,
 };
 #[cfg(feature = "graphql")]
 pub use read_store::{CellByKeyGetter, HttpCellByKey, MapCellByKey, ReadStore};

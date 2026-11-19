@@ -1443,17 +1443,15 @@ IdentityConfig::oidc_bearer(oidc)`
 				{
 					file: 'src/graphql/identity/resolve.rs',
 					caption: 'If there is no bearer token and `require_auth` is false, the session is anonymous. That path is for `e2e-ui-public`.',
-					code: `IdentityMode::OidcBearer => {
-  let oidc = config.oidc.as_ref().ok_or(AuthError::Unauthorized)?;
+					code: `(IdentityConfig::OidcBearer(oidc), Some(validator)) => {
   match extract_bearer(headers)? {
-    None => {
-      if oidc.require_auth {
-        Err(AuthError::Unauthorized)
-      } else {
-        Ok(ResolvedIdentity::unverified(Session::new()))
-      }
+    Some(token) => {
+      let (session, principal) =
+        validator.validate_and_map_principal_async(&token).await?;
+      Ok(ResolvedIdentity::verified(session, principal))
     }
-    Some(token) => oidc_identity(&token, oidc),
+    None if oidc.require_auth => Err(AuthError::Unauthorized),
+    None => Ok(ResolvedIdentity::unverified(Session::new())),
   }
 }`
 				},

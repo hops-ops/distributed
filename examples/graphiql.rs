@@ -14,6 +14,7 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 
 use distributed::graphql::GraphqlEngine;
@@ -77,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let manifest = ReadModelCatalog::new("graphiql-demo").table_schema(orders_schema());
 
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)?
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .grant_all("user")
         .graphiql(true)

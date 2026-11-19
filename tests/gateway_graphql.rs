@@ -9,6 +9,7 @@ use axum::{
     Router,
 };
 use distributed::gateway::{native::*, *};
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -193,6 +194,7 @@ async fn query_only_schema_is_built_without_command_or_subscription_roots() {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
     let engine = Arc::new(
         GraphqlEngine::builder(pool)
+            .identity(IdentityConfig::dev_headers())
             .roles(&["user"])
             .anonymous_role("user")
             .subscriptions(false)

@@ -214,7 +214,7 @@ pub async fn serve(
     }
     .build()
     .map_err(std::io::Error::other)?;
-    let auth = if let Some(config) = engine.identity_config().oidc.clone() {
+    let auth = if let Some(config) = engine.identity_config().oidc().cloned() {
         let provider = Arc::new(OidcGatewayProvider::new(config, "e2e-celld-oidc-v1"));
         NativeAuth::new(move |credentials| {
             let provider = provider.clone();

@@ -189,7 +189,8 @@ impl ScheduleWorker {
                     &command_id,
                     schedule.input.clone(),
                     schedule_session(&schedule),
-                    VerifiedPrincipal::from_trusted_transport(SCHEDULE_USER_ID),
+                    VerifiedPrincipal::internal(SCHEDULE_USER_ID)
+                        .expect("the schedule subject is a non-empty constant"),
                     None,
                 )
                 .await;
