@@ -58,16 +58,14 @@ pub(crate) async fn dispatch_wait_path(
     input: Value,
     session: Session,
 ) -> Result<CausalDispatchResult, CausalDispatchError> {
-    let subject = session
+    let principal = session
         .user_id()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .and_then(|subject| VerifiedPrincipal::internal(subject).ok())
         .ok_or_else(|| CausalDispatchError::Rejected {
             code: "UNAUTHORIZED",
             status: 401,
             message: "durable commands require a verified transport identity".into(),
         })?;
-    let principal = VerifiedPrincipal::from_trusted_transport(subject);
     service
         .dispatch_causal_with_receipt(command, command_id, input, session, principal)
         .await

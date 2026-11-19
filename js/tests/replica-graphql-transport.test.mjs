@@ -176,7 +176,7 @@ test('replica GraphQL live work merges surface binding with resume and closes on
 	const socket = FakeWebSocket.instances[0];
 	assert.equal(socket.protocol, 'graphql-transport-ws');
 	assert.match(socket.url, /graphql\/ws/);
-	assert.match(socket.url, /x-user-id=alice/);
+	assert.doesNotMatch(socket.url, /x-user-id|x-roles/, 'identity never travels in the URL');
 	socket.open();
 	assert.deepEqual(socket.sent[0], {
 		type: 'connection_init',

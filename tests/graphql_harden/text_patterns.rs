@@ -3,6 +3,7 @@
 //! characters exactly and the other two fold ASCII letters only.
 
 use async_graphql::{Request, Variables};
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{col, read, GraphqlEngine, ModelPermissions};
 use distributed::ReadModel;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,7 @@ const WORDS: [&str; 12] = [
 async fn engine(db: &Db) -> GraphqlEngine {
     db.seed(WORDS.map(|word| Word { word: word.into() })).await;
     GraphqlEngine::builder(db.pool())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "capital_o", "any_open"])
         .model::<Word>(
             ModelPermissions::new()

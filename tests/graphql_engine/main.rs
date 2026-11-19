@@ -2,6 +2,7 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
+use distributed::graphql::IdentityConfig;
 use distributed::{
     graphql::GraphqlEngine, ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn,
     TableKind, TableSchema,
@@ -117,6 +118,7 @@ async fn isolated_multi_column_primary_key_builds_with_full_by_pk_tuple() {
     let manifest = distributed::ReadModelCatalog::new("t").table_schema(schema);
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool().await)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .build()
@@ -134,6 +136,7 @@ async fn grant_all_builds_and_sdl_for_role() {
     let manifest = distributed::ReadModelCatalog::new("t").table_schema(schema);
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool().await)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .grant_all("user")
         .build()
@@ -147,6 +150,7 @@ async fn duplicate_table_name_errors() {
     let a = simple_schema("A", "items");
     let b = simple_schema("B", "items");
     let result = GraphqlEngine::builder(pool().await)
+        .identity(IdentityConfig::dev_headers())
         .table_schema(a)
         .table_schema(b)
         .build();
@@ -167,6 +171,7 @@ async fn unknown_column_in_permission_via_grant_ok() {
     let manifest = distributed::ReadModelCatalog::new("t").table_schema(schema);
     GraphqlEngine::from_schema_catalog(&manifest, pool().await)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .grant_all("user")
         .build()
         .unwrap();
@@ -179,6 +184,7 @@ async fn build_handles_bidirectional_relationship_schemas() {
         .table_schema(bidirectional_child_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool().await)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .grant_all("user")
         .build()
         .unwrap();

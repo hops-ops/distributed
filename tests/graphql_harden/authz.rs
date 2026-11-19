@@ -2,6 +2,7 @@
 //! Drives shipped `GraphqlEngine::execute`.
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{claim, col, read, GraphqlEngine, GraphqlPoolSource, ModelPermissions};
 use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
 
@@ -14,6 +15,7 @@ use super::common::{
 pub async fn claim_row_filter_isolates_tenants(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .model::<OrderView>(
             ModelPermissions::new().grant(
@@ -55,6 +57,7 @@ pub async fn claim_row_filter_isolates_tenants(db: Db) {
 pub async fn a2_claim_filter_on_by_pk_isolates_tenants(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(
             ModelPermissions::new().grant(
@@ -94,6 +97,7 @@ pub async fn a2_claim_filter_on_by_pk_isolates_tenants(db: Db) {
 pub async fn a3_claim_filter_on_aggregate_count(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(
             ModelPermissions::new().grant(
@@ -126,6 +130,7 @@ pub async fn a3_claim_filter_on_aggregate_count(db: Db) {
 pub async fn column_allowlist_denies_ungranted_fields(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["restricted", "user"])
         .model::<OrderView>(
             ModelPermissions::new()
@@ -184,6 +189,7 @@ pub async fn a5_nested_relationship_column_allowlist_denies(db: Db) {
     // Parent: all columns; child: only child_id (not name).
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .permission::<ParentView>("user", read().all_columns())
         .permission::<ChildView>("user", read().columns(["child_id", "parent_id"]))
@@ -239,6 +245,7 @@ fn parent_child_engine(pool: GraphqlPoolSource) -> GraphqlEngine {
 
     GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .build()
@@ -314,6 +321,7 @@ pub async fn application_surface_with_differing_row_policies_applies_all_of_them
     let pool = seed_orders(&db).await;
     let roles = ["admin".to_string(), "user".to_string()];
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .service_id("orders-service")
         .roles(&["admin", "user"])
         .model::<OrderView>(

@@ -31,12 +31,3 @@ export function wsConnectionInitPayload(auth: GqlAuth = {}): Record<string, stri
 
 	return payload;
 }
-
-/** Add DevHeaders to a WebSocket URL when bearer authentication is absent. */
-export function applyWsDevHeaderParams(url: URL, auth: GqlAuth = {}): void {
-	const token = auth.accessToken?.trim() ?? '';
-	if (token || !auth.userId) return;
-
-	url.searchParams.set('x-user-id', auth.userId);
-	url.searchParams.set('x-roles', auth.role ?? 'user');
-}

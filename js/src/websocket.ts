@@ -1,8 +1,5 @@
 /** Minimal `graphql-transport-ws` client with injectable browser primitives. */
-import {
-	applyWsDevHeaderParams,
-	wsConnectionInitPayload
-} from './auth-headers.js';
+import { wsConnectionInitPayload } from './auth-headers.js';
 import { documentToString, type GqlDocument } from './document.js';
 import {
 	DistributedProtocolError,
@@ -118,7 +115,6 @@ export function subscribe<
 		? httpUrlToWsUrl(options.httpUrl)
 		: graphqlWsUrl('/graphql/ws');
 	const url = new URL(href, location?.href ?? 'ws://127.0.0.1/');
-	applyWsDevHeaderParams(url, auth);
 
 	const socket = new WebSocketImpl(url.toString(), 'graphql-transport-ws');
 	const operationId = '1';

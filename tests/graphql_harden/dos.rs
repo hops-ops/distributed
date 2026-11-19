@@ -1,5 +1,6 @@
 //! D* Resource-exhaustion red-team suite.
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use super::common::{
 pub async fn where_max_depth_rejected(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_depth(2)
@@ -38,12 +40,14 @@ pub async fn where_max_depth_rejected(db: Db) {
 pub async fn graphql_depth_counts_root_and_leaf_fields(db: Db) {
     let pool = seed_orders(&db).await;
     let too_shallow = GraphqlEngine::builder(pool.clone())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_depth(1)
         .build()
         .unwrap();
     let exact = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_depth(2)
@@ -65,6 +69,7 @@ pub async fn graphql_depth_counts_root_and_leaf_fields(db: Db) {
 pub async fn max_in_list_rejected(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_in_list(3)
@@ -83,6 +88,7 @@ pub async fn max_in_list_rejected(db: Db) {
 pub async fn limit_clamped_by_max_limit(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_limit(1)
@@ -102,6 +108,7 @@ pub async fn limit_clamped_by_max_limit(db: Db) {
 pub async fn d5_wide_or_list_rejected_by_max_bool_width(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_bool_width(3)
@@ -134,6 +141,7 @@ pub async fn d5_wide_or_list_rejected_by_max_bool_width(db: Db) {
 pub async fn d5_wide_and_list_rejected_by_max_bool_width(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_bool_width(2)
@@ -183,6 +191,7 @@ pub async fn d7_concurrent_with_timeout_bound_terminates(db: Db) {
 
     let engine = Arc::new(
         GraphqlEngine::builder(pool)
+            .identity(IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
             .statement_timeout(Duration::from_secs(2))
@@ -283,6 +292,7 @@ pub async fn d8_nested_has_many_exceeds_complexity_budget(db: Db) {
     // Default max_complexity (500) + max_depth high enough that depth is not the limit.
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .max_depth(8)
         .permission::<ParentView>("user", read().all_columns())
@@ -362,6 +372,7 @@ pub async fn d8_shallow_nested_has_many_within_budget(db: Db) {
         .table_schema(child);
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .permission::<ParentView>("user", read().all_columns())
         .permission::<ChildView>("user", read().all_columns())
@@ -425,6 +436,7 @@ pub async fn d8_low_max_complexity_rejects_single_nest(db: Db) {
         .table_schema(child);
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .max_complexity(20)
         .max_depth(8)

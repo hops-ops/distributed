@@ -1,6 +1,7 @@
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
 use distributed::bus::{Bus, InMemoryBus, Message, MessageKind, RunOptions};
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions, SurfaceProjector};
 use distributed::microsvc::{CausalProjectorContext, HandlerError, Routes, Service};
 use distributed::{ReadModel, ReadModelCatalog, SqliteRepository};
@@ -122,6 +123,7 @@ async fn fixture() -> (
     let bus = InMemoryBus::new();
     publish(&repository, &bus, "one").await;
     let engine = GraphqlEngine::builder(&repository)
+        .identity(IdentityConfig::dev_headers())
         .service_id("unique-key-live")
         .protocol_token_key([0x37; 32])
         .roles(&["user"])

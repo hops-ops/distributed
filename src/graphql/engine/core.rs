@@ -260,9 +260,9 @@ pub(crate) struct EngineInner {
     pub graphiql_schemas: HashMap<String, async_graphql::dynamic::Schema>,
     pub change_hub: crate::graphql::subscribe::ChangeHub,
     pub dialect: SqlDialect,
-    /// Identity mode for HTTP session construction (see `identity` module).
-    pub identity: IdentityConfig,
-    pub(crate) identity_validator: Option<OidcValidator>,
+    /// How HTTP and WebSocket requests become sessions (see `identity` module).
+    pub(crate) identity: IdentityResolver,
+    pub(crate) websocket: WebsocketLimits,
     pub(crate) protocol: Option<ProtocolRuntime>,
     pub(crate) query_protocol: QueryProtocolRuntime,
     pub(crate) read_stores: BTreeMap<String, crate::graphql::read_store::ReadStoreKind>,
@@ -270,6 +270,29 @@ pub(crate) struct EngineInner {
         BTreeMap<String, std::sync::Arc<dyn crate::graphql::read_store::CellByKeyGetter>>,
     /// Leaderboard stores by surface name ([`GraphqlEngineBuilder::leaderboard`]).
     pub(crate) leaderboard_stores: BTreeMap<String, Arc<dyn crate::leaderboard::LeaderboardStore>>,
+}
+
+/// Bounds on one origin GraphQL WebSocket connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebsocketLimits {
+    /// A connection is closed after this long, or when the bearer token it
+    /// authenticated with expires, whichever comes first.
+    pub max_lifetime: Duration,
+    /// A connection that sends nothing (not even a pong to the server's
+    /// pings) for this long is closed.
+    pub idle_timeout: Duration,
+    /// Subscriptions one connection may hold open at once.
+    pub max_live_queries: usize,
+}
+
+impl Default for WebsocketLimits {
+    fn default() -> Self {
+        Self {
+            max_lifetime: Duration::from_secs(12 * 60 * 60),
+            idle_timeout: Duration::from_secs(60),
+            max_live_queries: 100,
+        }
+    }
 }
 
 pub struct GraphqlEngine {
@@ -320,7 +343,8 @@ pub struct GraphqlEngineBuilder {
     pub(crate) projectors: Vec<SurfaceProjectionOwner>,
     pub(crate) change_rx: Option<tokio::sync::broadcast::Receiver<ReadModelChange>>,
     pub(crate) pending_errors: Vec<String>,
-    pub(crate) identity: IdentityConfig,
+    pub(crate) identity: Option<IdentityConfig>,
+    pub(crate) websocket: WebsocketLimits,
     pub(crate) read_stores: BTreeMap<String, crate::graphql::read_store::ReadStore>,
     pub(crate) leaderboards: Vec<(
         crate::graphql::surface::LeaderboardSurface,

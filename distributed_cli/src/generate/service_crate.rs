@@ -804,7 +804,7 @@ pub fn build_engine(
     // Public GraphQL identity (D6/D7): always OidcBearer + require_auth=true.
     // Set OIDC_ISSUER + OIDC_AUDIENCE (or OIDC_CLIENT_ID). Unset → placeholder
     // issuer (still OidcBearer; ambient headers never trusted). For local
-    // GraphiQL ambient headers only, pass IdentityMode::DevHeaders explicitly.
+    // GraphiQL ambient headers only, pass `IdentityConfig::DevHeaders` explicitly.
     let identity = distributed::graphql::public_oidc_identity_from_env();
     GraphqlEngine::from_schema_catalog(&crate::read_model_catalog(), source)?
         .service(service){protocol_key_builder}

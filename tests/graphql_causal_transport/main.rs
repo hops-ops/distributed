@@ -222,7 +222,7 @@ async fn spawn_server_mode(service: Arc<Service>, mode: GatewayMode) -> TestServ
             use distributed::gateway::{native::*, *};
             let engine = service.graphql_engine().unwrap();
             let provider = Arc::new(distributed::graphql::identity::OidcGatewayProvider::new(
-                engine.identity_config().oidc.clone().unwrap(),
+                engine.identity_config().oidc().cloned().unwrap(),
                 "causal-fixture-v1",
             ));
             let auth = NativeAuth::new(move |credentials| {
@@ -651,6 +651,7 @@ async fn query_only_keyless_service_remains_envelope_free_over_http_and_ws() {
         .connect_lazy("sqlite::memory:")
         .expect("GraphQL SQLite pool");
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .service(&service)
         .build()

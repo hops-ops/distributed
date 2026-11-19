@@ -6,6 +6,7 @@
 //! seeded rows, once for the row policy and once for the column policy.
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{claim, col, read, GraphqlEngine, ReadPermission};
 use distributed::{
     ReadModel, ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
@@ -163,6 +164,7 @@ async fn engine(db: &Db) -> GraphqlEngine {
     let tag_columns = ["tag_id", "tenant", "label"];
     GraphqlEngine::from_schema_catalog(&catalog, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["reader", "capped", "narrow", "counter"])
         // reader: the policy under test on all three models.
         .permission::<AuthorView>("reader", tenant(&author_columns))

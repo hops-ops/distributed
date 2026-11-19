@@ -18,9 +18,7 @@ use crate::command_dispatch::{LocalCommandDispatcher, LocalCommandHost, SharedCo
 use crate::microsvc::{Service, Session, MAX_HTTP_BODY_BYTES, USER_ID_KEY};
 
 use super::engine::GraphqlEngine;
-use super::identity::{
-    resolve_identity_with_validator, AuthError, IdentityMode, ResolvedIdentity, VerifiedPrincipal,
-};
+use super::identity::{AuthError, IdentityConfig, ResolvedIdentity, VerifiedPrincipal};
 
 /// DevHeaders baked into GraphiQL for local exploration (not production security).
 const GRAPHIQL_DEV_USER: &str = "demo";
@@ -35,10 +33,8 @@ const GRAPHIQL_DEV_ROLE: &str = "user";
 ///
 /// **Subscriptions:** GraphiQL runs them over WebSocket at `/graphql/ws`.
 /// Browsers cannot set custom WS headers; identity is supplied via
-/// `wsConnectionParams` → `connection_init` (and DevHeaders defaults if empty).
-///
-/// Note: do **not** put `?x-user-id=` query params in `subscription_endpoint` —
-/// GraphiQLSource HTML-escapes `=` / `&` (`&#x3D;`, `&amp;`), which breaks the URL.
+/// `wsConnectionParams` → `connection_init`. Identity is never read from the
+/// URL query string, in any mode.
 pub fn graphiql_page() -> Html<String> {
     Html(
         GraphiQLSource::build()
@@ -78,43 +74,29 @@ struct GraphqlWsOptions {
     guard: Option<Arc<GraphqlConnectionGuard>>,
 }
 
-/// [`Executor`] for WebSocket subscriptions.
+/// [`Executor`] for one WebSocket connection.
 ///
-/// Prefers a [`Session`] injected via `connection_init` / `session_data` (GraphiQL
-/// wsConnectionParams), then falls back to the session from the HTTP upgrade.
+/// Operations run as the [`Session`] resolved at `connection_init`; until
+/// then (and for a caller that supplies no session data) as `session`.
 #[derive(Clone)]
 pub struct GraphqlSessionExecutor {
     engine: Arc<GraphqlEngine>,
     session: Session,
-    principal: Option<VerifiedPrincipal>,
     host: Option<SharedCommandHost>,
     filter: Option<GraphqlOperationFilter>,
+    /// One permit per open subscription on this connection.
+    live_queries: Arc<tokio::sync::Semaphore>,
 }
 
 impl GraphqlSessionExecutor {
     pub fn new(engine: Arc<GraphqlEngine>, session: Session) -> Self {
+        let live_queries = engine.websocket_limits().max_live_queries;
         Self {
             engine,
             session,
-            principal: None,
             host: None,
             filter: None,
-        }
-    }
-
-    fn with_identity(
-        engine: Arc<GraphqlEngine>,
-        session: Session,
-        principal: Option<VerifiedPrincipal>,
-        host: Option<SharedCommandHost>,
-        filter: Option<GraphqlOperationFilter>,
-    ) -> Self {
-        Self {
-            engine,
-            session,
-            principal,
-            host,
-            filter,
+            live_queries: Arc::new(tokio::sync::Semaphore::new(live_queries)),
         }
     }
 }
@@ -129,11 +111,7 @@ impl Executor for GraphqlSessionExecutor {
         self.engine
             .execute(
                 &self.session,
-                request_with_context(
-                    request,
-                    self.principal.clone(),
-                    self.host.as_ref().map(Arc::clone),
-                ),
+                request_with_context(request, None, self.host.as_ref().map(Arc::clone)),
             )
             .await
     }
@@ -159,8 +137,7 @@ impl Executor for GraphqlSessionExecutor {
             .as_ref()
             .and_then(|data| data.get(&TypeId::of::<VerifiedPrincipal>()))
             .and_then(|principal| principal.downcast_ref::<VerifiedPrincipal>())
-            .cloned()
-            .or_else(|| self.principal.clone());
+            .cloned();
         let operation_type = match websocket_operation_type(&request) {
             Ok(operation_type) => operation_type,
             Err(message) => {
@@ -171,9 +148,23 @@ impl Executor for GraphqlSessionExecutor {
         };
         let host = self.host.as_ref().map(Arc::clone);
         if operation_type == OperationType::Subscription {
-            return self
+            let Ok(permit) = Arc::clone(&self.live_queries).try_acquire_owned() else {
+                return Box::pin(futures_util::stream::once(async {
+                    GqlResponse::from_errors(vec![ServerError::new(
+                        "too many live queries on this connection",
+                        None,
+                    )])
+                }));
+            };
+            let stream = self
                 .engine
                 .execute_stream(&session, request_with_context(request, principal, host));
+            // The permit is released when the client stops the subscription
+            // or the connection ends, whichever drops the stream.
+            return Box::pin(futures_util::StreamExt::map(stream, move |response| {
+                let _held = &permit;
+                response
+            }));
         }
 
         let engine = Arc::clone(&self.engine);
@@ -326,8 +317,8 @@ fn lifecycle_reloading_response() -> Response {
 }
 
 // Gateway-delivered WS operations carry the original connection_init payload.
-// Only the origin's existing credential parser/validator resolves authority;
-// the gateway neither decodes roles nor fabricates a provider identity.
+// Only the origin's own identity resolver decides authority; the gateway
+// neither decodes roles nor fabricates a provider identity.
 async fn resolve_http_identity(
     engine: &GraphqlEngine,
     headers: &HeaderMap,
@@ -340,39 +331,10 @@ async fn resolve_http_identity(
         .and_then(|value| serde_json::to_value(value).ok())
         .and_then(|value| value.get("connectionInit").cloned())
     {
-        return resolve_gateway_ws_identity(engine, headers, &init)
-            .await
-            .map_err(|_| AuthError::Unauthorized);
+        return resolve_ws_identity(engine, headers, &init).await;
     }
     let _ = request;
-    resolve_identity_with_validator(
-        headers,
-        engine.identity_config(),
-        engine.identity_validator(),
-    )
-    .await
-}
-#[cfg(feature = "gateway-delivery")]
-pub(crate) async fn resolve_gateway_ws_identity(
-    engine: &GraphqlEngine,
-    headers: &HeaderMap,
-    init: &serde_json::Value,
-) -> Result<ResolvedIdentity, String> {
-    let base = match engine.identity_config().mode {
-        IdentityMode::OidcBearer | IdentityMode::Hybrid => Session::new(),
-        _ => {
-            resolve_identity_with_validator(
-                headers,
-                engine.identity_config(),
-                engine.identity_validator(),
-            )
-            .await
-            .map_err(|_| "unauthorized".to_owned())?
-            .into_parts()
-            .0
-        }
-    };
-    resolve_ws_identity(engine, headers, base, init).await
+    engine.identity().resolve_identity(headers).await
 }
 
 async fn graphql_handler(
@@ -394,8 +356,6 @@ async fn graphql_handler(
         Err(AuthError::Unauthorized) => return unauthorized_response(),
     };
     let (session, principal) = identity.into_parts();
-    // GraphiQL demo headers only apply under DevHeaders; other modes ignore them for AuthZ.
-    let _ = engine.identity_config().mode == IdentityMode::DevHeaders;
     let request = request_with_principal(request, principal);
     let response = engine.execute(&session, request).await;
     GraphQLResponse::from(response).into_response()
@@ -480,13 +440,17 @@ pub async fn microsvc_graphql_get(State(service): State<Arc<Service>>) -> Respon
 /// `connection_init` (payload `authorization` / `accessToken` / nested
 /// `headers.Authorization`). Validate with the same OidcBearer path as HTTP.
 ///
-/// **DevHeaders (local):** identity from upgrade headers, query params, or
-/// GraphiQL `wsConnectionParams` (`x-user-id` / `x-roles`). Empty clients remain
+/// **Gateway:** the upgrade request must carry the gateway secret; the
+/// `connection_init` payload is the client's and is ignored.
+///
+/// **DevHeaders (local):** identity from upgrade headers or GraphiQL
+/// `wsConnectionParams` (`x-user-id` / `x-roles`). Empty clients remain
 /// anonymous; the GraphiQL page sends its demo identity explicitly.
+///
+/// Every connection is bounded by the engine's [`WebsocketLimits`].
 pub async fn microsvc_graphql_ws(
     State(service): State<Arc<Service>>,
     headers: HeaderMap,
-    uri: axum::http::Uri,
     protocol: GraphQLProtocol,
     guard: Option<axum::Extension<Arc<GraphqlConnectionGuard>>>,
     upgrade: WebSocketUpgrade,
@@ -504,7 +468,6 @@ pub async fn microsvc_graphql_ws(
             guard: guard.map(|guard| guard.0),
         },
         headers,
-        uri,
         protocol,
         upgrade,
     )
@@ -514,7 +477,6 @@ pub async fn microsvc_graphql_ws(
 async fn graphql_ws_with_host(
     State(state): State<GraphqlHttpState>,
     headers: HeaderMap,
-    uri: axum::http::Uri,
     protocol: GraphQLProtocol,
     guard: Option<axum::Extension<Arc<GraphqlConnectionGuard>>>,
     upgrade: WebSocketUpgrade,
@@ -527,7 +489,6 @@ async fn graphql_ws_with_host(
             guard: guard.map(|guard| guard.0),
         },
         headers,
-        uri,
         protocol,
         upgrade,
     )
@@ -539,111 +500,174 @@ async fn graphql_ws_upgrade(
     host: Option<SharedCommandHost>,
     options: GraphqlWsOptions,
     headers: HeaderMap,
-    uri: axum::http::Uri,
     protocol: GraphQLProtocol,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let mut upgrade_headers = headers;
-    merge_identity_query_params(&mut upgrade_headers, uri.query());
-    let mode = engine.identity_config().mode;
-
-    // OidcBearer: do not fail the upgrade without a token — auth happens in
-    // connection_init (graphql-ws best practice). DevHeaders: resolve now.
-    let upgrade_identity = if mode == IdentityMode::OidcBearer || mode == IdentityMode::Hybrid {
-        ResolvedIdentity::unverified(Session::new())
-    } else {
-        match resolve_identity_with_validator(
-            &upgrade_headers,
-            engine.identity_config(),
-            engine.identity_validator(),
-        )
-        .await
-        {
-            Ok(identity) => identity,
-            Err(AuthError::Unauthorized) => return unauthorized_response(),
-        }
-    };
-
-    let (upgrade_session, upgrade_principal) = upgrade_identity.into_parts();
-    let executor = GraphqlSessionExecutor::with_identity(
-        Arc::clone(&engine),
-        upgrade_session.clone(),
-        upgrade_principal,
-        host,
-        options.filter,
-    );
-    let engine_for_init = Arc::clone(&engine);
+    // A gateway proves itself on the upgrade request, so refuse before
+    // upgrading. The other modes authenticate at `connection_init`.
+    if matches!(engine.identity_config(), IdentityConfig::Gateway(_))
+        && engine.identity().resolve_identity(&headers).await.is_err()
+    {
+        return unauthorized_response();
+    }
+    let limits = engine.websocket_limits();
+    let lifetime = options.guard.as_ref().map_or(limits.max_lifetime, |guard| {
+        guard.lifetime.min(limits.max_lifetime)
+    });
+    let mut executor = GraphqlSessionExecutor::new(Arc::clone(&engine), Session::new());
+    executor.host = host;
+    executor.filter = options.filter;
+    let guard = options.guard;
     upgrade
         .protocols(ALL_WEBSOCKET_PROTOCOLS)
-        .on_upgrade(move |socket| {
-            let base = upgrade_session;
-            let upgrade_headers = upgrade_headers;
-            let serve = GraphQLWebSocket::new(socket, executor, protocol)
-                .on_connection_init(move |payload| {
-                    let base = base.clone();
-                    let engine = engine_for_init;
-                    let upgrade_headers = upgrade_headers;
-                    async move {
-                        let identity =
-                            match resolve_ws_identity(&engine, &upgrade_headers, base, &payload)
-                                .await
-                            {
-                                Ok(identity) => identity,
-                                Err(msg) => {
-                                    return Err(async_graphql::Error::new(msg));
-                                }
-                            };
-                        let (session, principal) = identity.into_parts();
-                        let mut data = Data::default();
-                        data.insert(session);
-                        if let Some(principal) = principal {
-                            data.insert(principal);
-                        }
-                        Ok(data)
+        .on_upgrade(move |socket| async move {
+            let _guard = guard;
+            let (expiry, token_expiry) = tokio::sync::oneshot::channel();
+            let (sink, stream) = futures_util::StreamExt::split(socket);
+            let (outbound, queued) = futures_channel::mpsc::channel(16);
+            let last_heard = Arc::new(std::sync::Mutex::new(tokio::time::Instant::now()));
+            let heard = Arc::clone(&last_heard);
+            let stream = futures_util::StreamExt::inspect(stream, move |_| {
+                *heard
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = tokio::time::Instant::now();
+            });
+            let serve = GraphQLWebSocket::new_with_pair(outbound, stream, executor, protocol)
+                .on_connection_init(move |payload| async move {
+                    let identity = resolve_ws_identity(&engine, &headers, &payload)
+                        .await
+                        .map_err(|_| async_graphql::Error::new("unauthorized"))?;
+                    let (session, principal) = identity.into_parts();
+                    let _ = expiry.send(principal.as_ref().and_then(VerifiedPrincipal::expires_at));
+                    let mut data = Data::default();
+                    data.insert(session);
+                    if let Some(principal) = principal {
+                        data.insert(principal);
                     }
+                    Ok(data)
                 })
                 .serve();
-            async move {
-                if let Some(guard) = options.guard {
-                    let _ = tokio::time::timeout(guard.lifetime, serve).await;
-                    drop(guard);
-                } else {
-                    serve.await;
-                }
-            }
+            serve_bounded(
+                serve,
+                sink,
+                queued,
+                last_heard,
+                token_expiry,
+                lifetime,
+                limits.idle_timeout,
+            )
+            .await;
         })
         .into_response()
 }
 
-/// Resolve session for a GraphQL WS connection after `connection_init`.
-async fn resolve_ws_identity(
-    engine: &GraphqlEngine,
-    upgrade_headers: &HeaderMap,
-    base: Session,
-    payload: &serde_json::Value,
-) -> Result<ResolvedIdentity, String> {
-    let mode = engine.identity_config().mode;
-    match mode {
-        IdentityMode::OidcBearer | IdentityMode::Hybrid => {
-            let mut headers = upgrade_headers.clone();
-            if let Some(auth) = bearer_from_connection_init(payload) {
-                if let Ok(val) = axum::http::HeaderValue::from_str(&auth) {
-                    headers.insert(axum::http::header::AUTHORIZATION, val);
-                }
+/// Drive one WebSocket until the GraphQL session ends, the connection
+/// lifetime or the authenticating token runs out, or the peer goes quiet.
+///
+/// GraphQL frames are relayed through `queued` so this loop owns the socket's
+/// write half and can interleave WebSocket pings. A live query whose result
+/// never changes writes nothing, so without the pings a vanished client would
+/// keep its producers alive indefinitely.
+async fn serve_bounded<S>(
+    serve: impl std::future::Future<Output = ()>,
+    mut sink: S,
+    mut queued: futures_channel::mpsc::Receiver<axum::extract::ws::Message>,
+    last_heard: Arc<std::sync::Mutex<tokio::time::Instant>>,
+    token_expiry: tokio::sync::oneshot::Receiver<Option<u64>>,
+    lifetime: std::time::Duration,
+    idle_timeout: std::time::Duration,
+) where
+    S: futures_util::Sink<axum::extract::ws::Message> + Unpin,
+{
+    use axum::extract::ws::{CloseFrame, Message};
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
+
+    let token_expiry = async {
+        match token_expiry.await {
+            Ok(Some(expires_at)) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |elapsed| elapsed.as_secs());
+                tokio::time::sleep(Duration::from_secs(expires_at.saturating_sub(now))).await;
             }
-            resolve_identity_with_validator(
-                &headers,
-                engine.identity_config(),
-                engine.identity_validator(),
-            )
-            .await
-            .map_err(|_| {
-                "unauthorized: provide Authorization Bearer access_token in connection_init".into()
-            })
+            // No expiring credential, or the connection ended before init.
+            _ => std::future::pending().await,
         }
-        IdentityMode::DevHeaders | IdentityMode::TrustedProxy => Ok(ResolvedIdentity::unverified(
-            session_from_connection_init(base, payload, mode),
-        )),
+    };
+    let lifetime = tokio::time::sleep(lifetime);
+    let ping_every = idle_timeout / 3;
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + ping_every, ping_every);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::pin!(serve, token_expiry, lifetime);
+
+    // A send that cannot complete within the idle timeout is a dead peer too.
+    let mut serving = true;
+    let close = loop {
+        let outgoing = tokio::select! {
+            _ = &mut serve, if serving => {
+                serving = false;
+                continue;
+            }
+            message = queued.next() => match message {
+                Some(message) => message,
+                None => break None,
+            },
+            _ = ping.tick() => {
+                let heard = *last_heard.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if heard.elapsed() >= idle_timeout {
+                    break None;
+                }
+                Message::Ping(Default::default())
+            }
+            _ = &mut lifetime => break Some((1000, "connection lifetime reached")),
+            _ = &mut token_expiry => break Some((4401, "token expired")),
+        };
+        if !matches!(
+            tokio::time::timeout(idle_timeout, sink.send(outgoing)).await,
+            Ok(Ok(()))
+        ) {
+            break None;
+        }
+    };
+    if let Some((code, reason)) = close {
+        let frame = Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        }));
+        let _ = tokio::time::timeout(Duration::from_secs(1), sink.send(frame)).await;
+    }
+}
+
+/// Resolve the identity of a WebSocket connection once `connection_init` has
+/// arrived. `headers` are the upgrade request's.
+pub(crate) async fn resolve_ws_identity(
+    engine: &GraphqlEngine,
+    headers: &HeaderMap,
+    payload: &serde_json::Value,
+) -> Result<ResolvedIdentity, AuthError> {
+    let resolver = engine.identity();
+    match resolver.config() {
+        // Browsers cannot set `Authorization` on an upgrade, so the bearer
+        // token travels in the init payload.
+        IdentityConfig::OidcBearer(_) => {
+            let mut headers = headers.clone();
+            if let Some(bearer) = bearer_from_connection_init(payload)
+                .and_then(|bearer| axum::http::HeaderValue::from_str(&bearer).ok())
+            {
+                headers.insert(axum::http::header::AUTHORIZATION, bearer);
+            }
+            resolver.resolve_identity(&headers).await
+        }
+        // Only what the gateway put on the upgrade is trusted; the payload
+        // is written by the client.
+        IdentityConfig::Gateway(_) => resolver.resolve_identity(headers).await,
+        IdentityConfig::DevHeaders => {
+            let (session, _) = resolver.resolve_identity(headers).await?.into_parts();
+            Ok(ResolvedIdentity::unverified(
+                dev_session_from_connection_init(session, payload),
+            ))
+        }
     }
 }
 
@@ -688,34 +712,8 @@ fn bearer_from_connection_init(payload: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// Merge `connection_init` / GraphiQL wsConnectionParams into the upgrade session.
-fn session_from_connection_init(
-    mut session: Session,
-    payload: &serde_json::Value,
-    mode: IdentityMode,
-) -> Session {
-    if mode != IdentityMode::DevHeaders {
-        // OIDC: allow Authorization in connection_init for WS clients that put the
-        // Bearer token there (GraphiQL Headers panel may not reach the upgrade).
-        if let Some(auth) = payload
-            .get("Authorization")
-            .or_else(|| payload.get("authorization"))
-            .and_then(|v| v.as_str())
-        {
-            session.set("authorization", auth);
-        }
-        if let Some(headers) = payload.get("headers").and_then(|h| h.as_object()) {
-            if let Some(auth) = headers
-                .get("Authorization")
-                .or_else(|| headers.get("authorization"))
-                .and_then(|v| v.as_str())
-            {
-                session.set("authorization", auth);
-            }
-        }
-        return session;
-    }
-
+/// DevHeaders only: merge GraphiQL `wsConnectionParams` into the session.
+fn dev_session_from_connection_init(mut session: Session, payload: &serde_json::Value) -> Session {
     let apply = |session: &mut Session, key: &str, val: &str| {
         if key.eq_ignore_ascii_case(USER_ID_KEY) || key.eq_ignore_ascii_case("x-user-id") {
             session.set(USER_ID_KEY, val);
@@ -742,70 +740,9 @@ fn session_from_connection_init(
     session
 }
 
-fn merge_identity_query_params(headers: &mut HeaderMap, query: Option<&str>) {
-    let Some(q) = query else {
-        return;
-    };
-    for pair in q.split('&') {
-        let mut it = pair.splitn(2, '=');
-        let k = it.next().unwrap_or("");
-        let v = urlencoding_decode(it.next().unwrap_or(""));
-        match k {
-            "x-user-id" if !headers.contains_key("x-user-id") => {
-                if let Ok(val) = axum::http::HeaderValue::from_str(&v) {
-                    headers.insert("x-user-id", val);
-                }
-            }
-            "x-roles" if !headers.contains_key("x-roles") => {
-                if let Ok(val) = axum::http::HeaderValue::from_str(&v) {
-                    headers.insert("x-roles", val);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn urlencoding_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'+' => {
-                out.push(' ');
-                i += 1;
-            }
-            b'%' if i + 2 < b.len() => {
-                let h = |c: u8| -> Option<u8> {
-                    match c {
-                        b'0'..=b'9' => Some(c - b'0'),
-                        b'a'..=b'f' => Some(c - b'a' + 10),
-                        b'A'..=b'F' => Some(c - b'A' + 10),
-                        _ => None,
-                    }
-                };
-                if let (Some(hi), Some(lo)) = (h(b[i + 1]), h(b[i + 2])) {
-                    out.push((hi << 4 | lo) as char);
-                    i += 3;
-                } else {
-                    out.push('%');
-                    i += 1;
-                }
-            }
-            c => {
-                out.push(c as char);
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod connection_init_tests {
     use super::*;
-    use crate::graphql::IdentityMode;
     use serde_json::json;
     use std::any::TypeId;
 
@@ -881,10 +818,9 @@ mod connection_init_tests {
 
     #[test]
     fn connection_init_sets_dev_headers() {
-        let session = session_from_connection_init(
+        let session = dev_session_from_connection_init(
             Session::new(),
             &json!({"x-user-id": "alice", "x-roles": "user"}),
-            IdentityMode::DevHeaders,
         );
         assert_eq!(session.user_id(), Some("alice"));
         assert_eq!(session.get("x-roles"), Some("user"));
@@ -892,10 +828,9 @@ mod connection_init_tests {
 
     #[test]
     fn connection_init_nested_headers() {
-        let session = session_from_connection_init(
+        let session = dev_session_from_connection_init(
             Session::new(),
             &json!({"headers": {"x-user-id": "bob", "x-roles": "admin"}}),
-            IdentityMode::DevHeaders,
         );
         assert_eq!(session.user_id(), Some("bob"));
         assert_eq!(session.get("x-roles"), Some("admin"));
@@ -903,8 +838,7 @@ mod connection_init_tests {
 
     #[test]
     fn empty_init_remains_anonymous_in_dev() {
-        let session =
-            session_from_connection_init(Session::new(), &json!({}), IdentityMode::DevHeaders);
+        let session = dev_session_from_connection_init(Session::new(), &json!({}));
         assert_eq!(session.user_id(), None);
         assert!(session.roles().is_empty());
     }

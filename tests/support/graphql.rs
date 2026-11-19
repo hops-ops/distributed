@@ -5,6 +5,7 @@
 #![allow(dead_code)] // each including target uses a subset
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, GraphqlPool, GraphqlPoolSource, ModelPermissions};
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use distributed::projection_protocol::ProjectionChangeRetention;
@@ -359,6 +360,7 @@ pub async fn seed_orders(db: &Db) -> GraphqlPoolSource {
 
 pub fn engine_all_columns(pool: impl Into<GraphqlPoolSource>) -> GraphqlEngine {
     GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .build()

@@ -4,6 +4,7 @@
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 use distributed::microsvc::{Session, ROLE_KEY};
 use distributed::ReadModel;
@@ -36,6 +37,7 @@ async fn engine(db: &Db) -> GraphqlEngine {
     db.seed([item("1", "a"), item("2", "b"), item("3", "c")])
         .await;
     GraphqlEngine::builder(db.pool())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<ItemView>(ModelPermissions::new().grant("user", read().all_columns()))
         .build()
@@ -154,6 +156,7 @@ pub async fn portable_query_plan_corpus_matches_server_semantics(db: Db) {
             .expect("parse shared client query-plan corpus");
     db.seed(corpus.records).await;
     let engine = GraphqlEngine::builder(db.pool())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<ClientPlanRow>(ModelPermissions::new().grant("user", read().all_columns()))
         .build()

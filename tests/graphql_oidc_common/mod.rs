@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use base64::Engine as _;
 use distributed::graphql::{
-    graphql_router, read, resolve_session, AuthError, GraphqlEngine, GraphqlPoolSource,
-    IdentityConfig, IdentityMode, ModelPermissions, OidcConfig, OidcValidator, ValidationError,
+    graphql_router, read, AuthError, GraphqlEngine, GraphqlPoolSource, IdentityConfig,
+    IdentityResolver, ModelPermissions, OidcConfig, OidcValidator, ValidationError,
 };
 use distributed::ReadModel;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -241,7 +241,8 @@ pub async fn run_e1_through_e8(
         let mut h = bearer_headers(&token_a);
         h.insert("x-user-id", HeaderValue::from_static("evil-spoof"));
         h.insert("x-roles", HeaderValue::from_static("admin"));
-        let session = resolve_session(&h, engine.identity_config())
+        let session = IdentityResolver::new(engine.identity_config().clone())
+            .resolve_session(&h)
             .await
             .expect("E2 resolve");
         assert_eq!(session.user_id(), Some(sub_a.as_str()), "E2 spoof ignored");
@@ -392,7 +393,6 @@ pub async fn run_e1_through_e8(
         eprintln!("E8 ok");
     }
 
-    let _ = IdentityMode::OidcBearer;
     let _ = AuthError::Unauthorized;
 }
 

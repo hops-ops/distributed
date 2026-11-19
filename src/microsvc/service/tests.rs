@@ -2406,6 +2406,7 @@ async fn causal_dispatch_replay_contains_resolved_projection_obligation() {
             ),
     );
     let engine = crate::graphql::GraphqlEngine::builder(&repository)
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .model::<CausalProjectionObligationView>(
             crate::graphql::ModelPermissions::new()
@@ -2503,6 +2504,7 @@ async fn graphql_terminal_replay_revalidates_after_active_projection_starts_drai
             .facts(["causal.lifecycle-recorded"])
             .models(["CausalProjectionSiblingView"]);
         let engine = crate::graphql::GraphqlEngine::builder(&repository)
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .model::<CausalLifecycleView>(
                 crate::graphql::ModelPermissions::new()
@@ -2775,6 +2777,7 @@ async fn graphql_succeeded_status_evaluates_retained_projection_evidence() {
             .consume_projection(projector.clone()),
     );
     let engine = crate::graphql::GraphqlEngine::builder(&repository)
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .model::<CausalLifecycleView>(
             crate::graphql::ModelPermissions::new()
@@ -3077,6 +3080,7 @@ async fn engine_rejects_incompatible_direct_owner_before_typed_command_binding()
         // command partition would produce a different error.
         .partition_by(["must-not-bind"]);
     let result = crate::graphql::GraphqlEngine::builder(&repository)
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .model::<CausalProjectionObligationView>(
             crate::graphql::ModelPermissions::new()
                 .grant("anonymous", crate::graphql::read().all_columns()),
@@ -3211,6 +3215,7 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     .unwrap();
     let projection = SurfaceDirectProjection::new("project_causal_direct").modeled(modeled);
     let engine = crate::graphql::GraphqlEngine::builder(&repository)
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .model::<CausalProjectionObligationView>(
             crate::graphql::ModelPermissions::new()
