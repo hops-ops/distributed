@@ -655,7 +655,7 @@ fn surface_row_policy(
             "kind": "predicate",
             "expression": predicate,
         }),
-        crate::graphql::surface::SurfaceRowPolicy::ServerOnly => {
+        crate::graphql::surface::SurfaceRowPolicy::ServerOnly(_) => {
             serde_json::json!({"kind": "server_only"})
         }
     })

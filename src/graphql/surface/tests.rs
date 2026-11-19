@@ -3,6 +3,7 @@ use std::any::TypeId;
 use super::*;
 use crate::command::{CommandEffects, TypedCommandContract};
 use crate::graphql::commands::TypedCommandInventory;
+use crate::graphql::permissions::read;
 
 use crate::command::{CommandTypeDef, CommandTypeField};
 use crate::table::{
@@ -830,7 +831,7 @@ fn query_protocol_preserves_one_semantic_identity_for_each_fanout_model() {
 #[test]
 fn selected_surfaces_reject_command_and_projector_reattachment() {
     let full = build_surface(&[orders()], &SurfaceOptions::sqlite()).unwrap();
-    let grants = BTreeMap::from([("OrderView".into(), RoleGrant::all_columns())]);
+    let grants = BTreeMap::from([("OrderView".into(), read().all_columns())]);
     let selected = surface_for_role(&full, "user", &grants).unwrap();
     assert!(selected
         .clone()
@@ -868,7 +869,9 @@ fn role_policy_rejects_non_finite_and_hides_js_unsafe_integers() {
     for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let grants = BTreeMap::from([(
             "OrderView".into(),
-            RoleGrant::all_columns().rows(super::super::col("status").eq(value)),
+            read()
+                .all_columns()
+                .rows(super::super::col("status").eq(value)),
         )]);
         assert!(surface_for_role(&full, "user", &grants)
             .unwrap_err()
@@ -884,13 +887,15 @@ fn role_policy_rejects_non_finite_and_hides_js_unsafe_integers() {
     let full = build_surface(&[integer_orders], &SurfaceOptions::sqlite()).unwrap();
     let grants = BTreeMap::from([(
         "OrderView".into(),
-        RoleGrant::all_columns().rows(super::super::col("sequence").eq(9_007_199_254_740_992_i64)),
+        read()
+            .all_columns()
+            .rows(super::super::col("sequence").eq(9_007_199_254_740_992_i64)),
     )]);
     let selected = surface_for_role(&full, "user", &grants).unwrap();
-    assert_eq!(
+    assert!(matches!(
         selected.models["OrderView"].row_policy,
-        SurfaceRowPolicy::ServerOnly
-    );
+        SurfaceRowPolicy::ServerOnly(_)
+    ));
 }
 
 #[test]
@@ -1050,7 +1055,7 @@ fn surface_for_role_drops_ungranted_columns_and_models() {
     let mut grants = BTreeMap::new();
     grants.insert(
         "OrderView".to_string(),
-        RoleGrant::columns(["order_id", "status"]),
+        read().columns(["order_id", "status"]),
     );
     let role_surface = surface_for_role(&full, "user", &grants).unwrap();
     let model = role_surface.models.get("OrderView").expect("granted");
@@ -1175,10 +1180,7 @@ fn role_surface_legacy_effects_never_become_v2_client_authority() {
     let selected = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([(
-            "OrderView".into(),
-            RoleGrant::columns(["order_id", "status"]),
-        )]),
+        &BTreeMap::from([("OrderView".into(), read().columns(["order_id", "status"]))]),
     )
     .unwrap();
     let denied = selected
@@ -1247,7 +1249,7 @@ fn pool_free_role_selection_rejects_invalid_grants_and_policy_references() {
     let unknown_model = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([("TypoView".into(), RoleGrant::all_columns())]),
+        &BTreeMap::from([("TypoView".into(), read().all_columns())]),
     )
     .unwrap_err();
     assert!(unknown_model.contains("unknown model `TypoView`"));
@@ -1255,10 +1257,7 @@ fn pool_free_role_selection_rejects_invalid_grants_and_policy_references() {
     let unknown_column = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([(
-            "OrderView".into(),
-            RoleGrant::columns(["order_id", "statuz"]),
-        )]),
+        &BTreeMap::from([("OrderView".into(), read().columns(["order_id", "statuz"]))]),
     )
     .unwrap_err();
     assert!(unknown_column.contains("unknown column `statuz` in permission"));
@@ -1268,7 +1267,9 @@ fn pool_free_role_selection_rejects_invalid_grants_and_policy_references() {
         "user",
         &BTreeMap::from([(
             "OrderView".into(),
-            RoleGrant::all_columns().rows(super::super::col("statuz").eq("open")),
+            read()
+                .all_columns()
+                .rows(super::super::col("statuz").eq("open")),
         )]),
     )
     .unwrap_err();
@@ -1279,7 +1280,7 @@ fn pool_free_role_selection_rejects_invalid_grants_and_policy_references() {
         "user",
         &BTreeMap::from([(
             "OrderView".into(),
-            RoleGrant::all_columns().rows(super::super::rel(
+            read().all_columns().rows(super::super::rel(
                 "customer",
                 super::super::col("id").eq("c1"),
             )),
@@ -1297,7 +1298,7 @@ fn pool_free_role_selection_rejects_mistyped_row_policy_literals() {
         "user",
         &BTreeMap::from([(
             "OrderView".into(),
-            RoleGrant::all_columns().rows(FilterExpr::Cmp {
+            read().all_columns().rows(FilterExpr::Cmp {
                 column: "status".into(),
                 op: super::super::filter::CmpOp::Eq,
                 rhs: Operand::Lit(super::super::LitValue::Json(serde_json::json!("open"))),
@@ -1313,7 +1314,7 @@ fn pool_free_role_selection_rejects_mistyped_row_policy_literals() {
         "user",
         &BTreeMap::from([(
             "OrderView".into(),
-            RoleGrant::all_columns().rows(FilterExpr::In {
+            read().all_columns().rows(FilterExpr::In {
                 column: "status".into(),
                 values: vec![
                     Operand::from("open"),
@@ -1333,10 +1334,7 @@ fn selected_surface_debug_does_not_leak_denied_schema_metadata() {
     let selected = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([(
-            "OrderView".into(),
-            RoleGrant::columns(["order_id", "status"]),
-        )]),
+        &BTreeMap::from([("OrderView".into(), read().columns(["order_id", "status"]))]),
     )
     .unwrap();
 
@@ -1350,17 +1348,14 @@ fn selected_surface_debug_does_not_leak_denied_schema_metadata() {
 fn surface_for_role_omits_aggregate_without_grant() {
     let full = build_surface(&[orders()], &SurfaceOptions::sqlite()).unwrap();
     let mut grants = BTreeMap::new();
-    grants.insert("OrderView".to_string(), RoleGrant::all_columns());
+    grants.insert("OrderView".to_string(), read().all_columns());
     let role_surface = surface_for_role(&full, "user", &grants).unwrap();
     let names = role_surface.query_root_names();
     assert!(names.contains(&"orders"));
     assert!(!names.contains(&"orders_aggregate"));
 
     let mut admin = BTreeMap::new();
-    admin.insert(
-        "OrderView".to_string(),
-        RoleGrant::all_columns().with_aggregations(),
-    );
+    admin.insert("OrderView".to_string(), read().all_columns().aggregations());
     let admin_surface = surface_for_role(&full, "admin", &admin).unwrap();
     assert!(admin_surface
         .query_root_names()
@@ -1654,7 +1649,7 @@ fn row_policy_rejects_a_partial_composite_m2m_mapping() {
         "user",
         &BTreeMap::from([(
             "ProjectView".into(),
-            RoleGrant::all_columns().rows(super::super::rel(
+            read().all_columns().rows(super::super::rel(
                 "labels",
                 super::super::col("label_id").eq("rust"),
             )),
@@ -1719,7 +1714,7 @@ fn belongs_to_onto_composite_identity_is_selected_when_keys_are_paired() {
     let source_only = surface_for_role(
         &full,
         "source-only",
-        &BTreeMap::from([("SimpleView".into(), RoleGrant::all_columns())]),
+        &BTreeMap::from([("SimpleView".into(), read().all_columns())]),
     )
     .unwrap();
     assert!(source_only.models["SimpleView"].relationships.is_empty());
@@ -1728,8 +1723,8 @@ fn belongs_to_onto_composite_identity_is_selected_when_keys_are_paired() {
         &full,
         "both",
         &BTreeMap::from([
-            ("CompositeView".into(), RoleGrant::all_columns()),
-            ("SimpleView".into(), RoleGrant::all_columns()),
+            ("CompositeView".into(), read().all_columns()),
+            ("SimpleView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -1793,8 +1788,8 @@ fn has_many_onto_composite_child_is_selected_on_the_parent() {
         &full,
         "user",
         &BTreeMap::from([
-            ("WorkspaceView".into(), RoleGrant::all_columns()),
-            ("ProjectView".into(), RoleGrant::all_columns()),
+            ("WorkspaceView".into(), read().all_columns()),
+            ("ProjectView".into(), read().all_columns()),
         ]),
     )
     .expect("single-column parent has_many onto composite child");
@@ -1872,8 +1867,8 @@ fn has_many_from_composite_parent_is_selected() {
         &full,
         "user",
         &BTreeMap::from([
-            ("ProjectView".into(), RoleGrant::all_columns()),
-            ("ProjectFileView".into(), RoleGrant::all_columns()),
+            ("ProjectView".into(), read().all_columns()),
+            ("ProjectFileView".into(), read().all_columns()),
         ]),
     )
     .expect("composite parent has_many onto child");
@@ -1895,7 +1890,7 @@ fn role_sdl_production_path_omits_ungranted_columns() {
     let mut grants = BTreeMap::new();
     grants.insert(
         "OrderView".to_string(),
-        RoleGrant::columns(["order_id", "status"]),
+        read().columns(["order_id", "status"]),
     );
     let sdl = graphql_sdl_for_role(&[orders()], &SdlOptions::sqlite(), "user", &grants)
         .expect("role sdl");
@@ -2064,7 +2059,7 @@ fn a7_role_dialect_parity_inventory_and_sdl_ops() {
     let mut grants = BTreeMap::new();
     grants.insert(
         "OrderView".to_string(),
-        RoleGrant::columns(["order_id", "status"]),
+        read().columns(["order_id", "status"]),
     );
 
     for (opts, dialect_label) in [

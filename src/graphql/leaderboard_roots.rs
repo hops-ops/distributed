@@ -22,7 +22,7 @@ use super::protocol::{
     DistributedLiveMetadata, DistributedLiveMode, DistributedQuerySnapshot,
     ProtocolResponseAccumulator,
 };
-use super::schema::client_error;
+use super::schema::{client_error, execution_privilege};
 use super::surface::{
     leaderboard_change_key, LeaderboardOperation, LeaderboardRoot, LeaderboardSurface, Surface,
     LEADERBOARD_ENTRY_TYPE,
@@ -149,7 +149,7 @@ impl Request {
             .data_opt::<Session>()
             .cloned()
             .unwrap_or_else(Session::new);
-        let role = privilege_role(ctx.data_opt::<ExecutionAuthority>(), &session, &inner);
+        let role = execution_privilege(ctx.data_opt::<ExecutionAuthority>())?;
         // Re-check the grant against the role surface the request runs under.
         let surface = inner
             .role_surfaces
@@ -349,21 +349,6 @@ fn bounded_arg(
         ));
     }
     Ok(value as u32)
-}
-
-fn privilege_role(
-    authority: Option<&ExecutionAuthority>,
-    session: &Session,
-    inner: &EngineInner,
-) -> String {
-    if let Some(authority) = authority {
-        return authority.privilege_role.clone();
-    }
-    session
-        .roles()
-        .first()
-        .map(|role| (*role).to_string())
-        .unwrap_or_else(|| inner.anonymous_role.clone())
 }
 
 async fn resolve(

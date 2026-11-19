@@ -99,10 +99,14 @@ impl GraphqlEngineBuilder {
             }
         }
         for (role, perm) in perms.entries {
-            let key = (schema.model_name.clone(), role.clone());
-            match self.permissions.entry(key) {
+            match self
+                .permissions
+                .entry(role.clone())
+                .or_default()
+                .entry(schema.model_name.clone())
+            {
                 Entry::Vacant(entry) => {
-                    entry.insert(RoleModelPerm { permission: perm });
+                    entry.insert(perm);
                 }
                 Entry::Occupied(_) => {
                     self.pending_errors.push(format!(
@@ -138,10 +142,14 @@ impl GraphqlEngineBuilder {
             return self;
         }
         for (role, permission) in perms.entries {
-            let key = (schema.model_name.clone(), role.clone());
-            match self.permissions.entry(key) {
+            match self
+                .permissions
+                .entry(role.clone())
+                .or_default()
+                .entry(schema.model_name.clone())
+            {
                 Entry::Vacant(entry) => {
-                    entry.insert(RoleModelPerm { permission });
+                    entry.insert(permission);
                 }
                 Entry::Occupied(_) => {
                     self.pending_errors.push(format!(
@@ -223,12 +231,14 @@ impl GraphqlEngineBuilder {
             .map(|(n, _)| n.clone())
             .collect();
         for model in exposed {
-            let key = (model.clone(), role.to_string());
-            match self.permissions.entry(key) {
+            match self
+                .permissions
+                .entry(role.to_string())
+                .or_default()
+                .entry(model.clone())
+            {
                 Entry::Vacant(entry) => {
-                    entry.insert(RoleModelPerm {
-                        permission: read().all_columns().aggregations(),
-                    });
+                    entry.insert(read().all_columns().aggregations());
                 }
                 Entry::Occupied(_) => {
                     self.pending_errors.push(format!(
@@ -252,10 +262,14 @@ impl GraphqlEngineBuilder {
             ));
             return self;
         }
-        let key = (model.clone(), role.to_string());
-        match self.permissions.entry(key) {
+        match self
+            .permissions
+            .entry(role.to_string())
+            .or_default()
+            .entry(model.clone())
+        {
             Entry::Vacant(entry) => {
-                entry.insert(RoleModelPerm { permission: p });
+                entry.insert(p);
             }
             Entry::Occupied(_) => {
                 self.pending_errors.push(format!(
@@ -681,47 +695,32 @@ impl GraphqlEngineBuilder {
             }
         }
         let anonymous = self.anonymous_role.clone();
-        let perm_keys: Vec<_> = self.permissions.keys().cloned().collect();
-        for (model, role) in &perm_keys {
+        for (role, grants) in &self.permissions {
             if let Some(roles) = &declared_roles {
                 if !roles.contains(role) && role != &anonymous {
+                    let model = grants.keys().next().map(String::as_str).unwrap_or("");
                     return Err(GraphqlBuildError(format!(
                         "permission for undeclared role `{role}` (model `{model}`)"
                     )));
                 }
             }
-            let entry = self.catalog.get(model).ok_or_else(|| {
-                GraphqlBuildError(format!("permission for unknown model `{model}`"))
-            })?;
-            let perm = &self.permissions[&(model.clone(), role.clone())].permission;
-
-            // Column allowlist validation.
-            if !perm.all_columns {
-                if let Some(cols) = &perm.columns {
-                    for col in cols {
-                        if !entry
-                            .schema
-                            .columns
-                            .iter()
-                            .any(|c| c.column_name == *col && !c.skipped)
-                        {
-                            return Err(GraphqlBuildError(format!(
-                                "unknown column `{col}` in permission for `{model}` role `{role}`"
-                            )));
-                        }
-                    }
-                }
+            if role != &anonymous {
+                continue;
             }
-
-            if let Some(filter) = &perm.row_filter {
-                validate_filter(
-                    filter,
-                    &entry.schema,
-                    &self.catalog,
-                    role == &anonymous,
-                    model,
-                    role,
-                )?;
+            // Columns, literals and relationship paths are validated once, by
+            // the surface selection below. Only the engine knows which role
+            // is anonymous, and an anonymous session carries no claims.
+            for (model, grant) in grants {
+                let mut claims = Vec::new();
+                if let Some(filter) = &grant.row_filter {
+                    filter.visit_claims(|claim| claims.push(claim.to_string()));
+                }
+                if !claims.is_empty() {
+                    return Err(GraphqlBuildError(format!(
+                        "claim() is not allowed in anonymous role filters (model `{model}`, claims: {})",
+                        claims.join(", ")
+                    )));
+                }
             }
         }
 
@@ -820,7 +819,7 @@ impl GraphqlEngineBuilder {
             })
             .transpose()?;
 
-        let mut roles: BTreeSet<String> = self.permissions.keys().map(|(_, r)| r.clone()).collect();
+        let mut roles: BTreeSet<String> = self.permissions.keys().cloned().collect();
         roles.extend(
             self.leaderboards
                 .iter()
@@ -837,15 +836,10 @@ impl GraphqlEngineBuilder {
         let mut role_surfaces = BTreeMap::new();
         let mut protocol_roles = BTreeMap::new();
         for role in &roles {
-            let grants = role_grants_from_model_role_perms(
-                role,
-                self.permissions
-                    .iter()
-                    .map(|(key, value)| (key, &value.permission)),
-            );
-            let role_surface = Arc::new(
-                surface_for_role(&full_surface, role, &grants).map_err(GraphqlBuildError)?,
-            );
+            let no_grants = BTreeMap::new();
+            let grants = self.permissions.get(role).unwrap_or(&no_grants);
+            let role_surface =
+                Arc::new(surface_for_role(&full_surface, role, grants).map_err(GraphqlBuildError)?);
             let schema = dyn_schema::build_role_schema(
                 &role_surface,
                 self.max_depth,
@@ -916,22 +910,13 @@ impl GraphqlEngineBuilder {
         for (application, registration) in &self.client_applications {
             // Schema privilege set drives grant intersection (portable policies).
             // Eligible set is stamped on the surface identity for protocol open.
-            let mut grants_by_role = BTreeMap::new();
             for role in &registration.schema_roles {
                 if !role_surfaces.contains_key(role) {
                     return Err(GraphqlBuildError(format!(
                         "client application surface `{application}` schema role `{role}` is not configured"
                     )));
                 }
-                grants_by_role.insert(
-                    role.clone(),
-                    role_grants_from_model_role_perms(
-                        role,
-                        self.permissions
-                            .iter()
-                            .map(|(key, value)| (key, &value.permission)),
-                    ),
-                );
+                self.permissions.entry(role.clone()).or_default();
             }
             for role in &registration.eligible_roles {
                 if !role_surfaces.contains_key(role) {
@@ -946,7 +931,7 @@ impl GraphqlEngineBuilder {
                     application,
                     &registration.eligible_roles,
                     &registration.schema_roles,
-                    &grants_by_role,
+                    &self.permissions,
                 )
                 .map_err(GraphqlBuildError)?,
             );
@@ -1023,13 +1008,6 @@ impl GraphqlEngineBuilder {
                         graphiql_schemas.insert(privilege_key.clone(), graphiql_schema);
                     }
                     role_surfaces.insert(privilege_key.clone(), Arc::clone(&application_surface));
-                    // Intersected grants as ReadPermission under the synthetic key
-                    // so compile_root finds privilege packs.
-                    insert_synthetic_privilege_permissions(
-                        &privilege_key,
-                        &registration.schema_roles,
-                        &mut self.permissions,
-                    );
                 }
                 protocol_applications.insert(
                     application.clone(),
@@ -1093,7 +1071,6 @@ impl GraphqlEngineBuilder {
             gateway_versions: self.gateway_versions,
             catalog: self.catalog,
             by_table: self.by_table,
-            permissions: self.permissions,
             roles,
             anonymous_role: anonymous,
             default_limit: self.default_limit,

@@ -38,7 +38,7 @@ use distributed::bus::{BusConsumer, RunOptions, SqliteBus};
 use distributed::graphql::surface::{LeaderboardGrant, LeaderboardSurface};
 use distributed::graphql::{
     build_surface, read, surface_for_application_contract, DistributedClientSurfaceExport,
-    GraphqlEngine, IdentityConfig, ModelPermissions, OidcConfig, RoleGrant, Surface,
+    GraphqlEngine, IdentityConfig, ModelPermissions, OidcConfig, ReadPermission, Surface,
     SurfaceOptions,
 };
 use distributed::leaderboard::{Board, LeaderboardStore, RedisLeaderboard};
@@ -162,21 +162,21 @@ pub fn spawn_projector(read_models: SqliteRepository, bus: sqlx::SqlitePool) {
     });
 }
 
-fn grants() -> BTreeMap<String, BTreeMap<String, RoleGrant>> {
-    let mut grants: BTreeMap<String, BTreeMap<String, RoleGrant>> = BTreeMap::new();
-    for (role, grant) in permissions().surface_grants() {
+fn grants() -> BTreeMap<String, BTreeMap<String, ReadPermission>> {
+    let mut grants: BTreeMap<String, BTreeMap<String, ReadPermission>> = BTreeMap::new();
+    for (role, grant) in permissions().by_role() {
         grants
             .entry(role)
             .or_default()
             .insert(PlayerStats::schema().model_name.clone(), grant);
     }
-    for (role, grant) in room_permissions().surface_grants() {
+    for (role, grant) in room_permissions().by_role() {
         grants
             .entry(role)
             .or_default()
             .insert(ZoneActivities::schema().model_name.clone(), grant);
     }
-    for (role, grant) in borough_permissions().surface_grants() {
+    for (role, grant) in borough_permissions().by_role() {
         grants
             .entry(role)
             .or_default()

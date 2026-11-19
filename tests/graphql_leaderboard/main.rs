@@ -419,7 +419,7 @@ async fn protocol_envelopes_mark_leaderboards_as_snapshot_only() {
 /// recomputes the same schema fingerprint and generates `leaderboards.ts`.
 #[test]
 fn the_cli_compiles_a_framework_leaderboard_manifest_into_the_ts_client() {
-    use distributed::graphql::surface::RoleGrant;
+    use distributed::graphql::read;
     use distributed_cli::{
         compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector,
     };
@@ -452,8 +452,7 @@ fn the_cli_compiles_a_framework_leaderboard_manifest_into_the_ts_client() {
         .unwrap()
         .with_leaderboards([xp_surface()])
         .unwrap();
-    let grants =
-        std::collections::BTreeMap::from([("ItemView".to_string(), RoleGrant::all_columns())]);
+    let grants = std::collections::BTreeMap::from([("ItemView".to_string(), read().all_columns())]);
     let selected = surface_for_role(&surface, "user", &grants).unwrap();
     let manifest = DistributedClientSurfaceExport::from_selected("leaderboards", selected)
         .unwrap()

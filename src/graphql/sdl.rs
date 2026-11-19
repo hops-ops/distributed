@@ -95,12 +95,12 @@ pub fn graphql_sdl_from_surface(surface: &super::surface::Surface) -> Result<Str
 /// ```
 ///
 /// Prefer this over filtering full SDL as text. `grants` maps model_name →
-/// [`RoleGrant`](super::surface::RoleGrant) for the role.
+/// [`ReadPermission`](super::permissions::ReadPermission) for the role.
 pub fn graphql_sdl_for_role(
     tables: &[TableSchema],
     options: &SdlOptions,
     role: &str,
-    grants: &std::collections::BTreeMap<String, super::surface::RoleGrant>,
+    grants: &std::collections::BTreeMap<String, super::permissions::ReadPermission>,
 ) -> Result<String, String> {
     let surface_opts = super::surface::SurfaceOptions {
         dialect: if options.jsonb_operators {

@@ -164,11 +164,6 @@ pub(crate) struct CatalogEntry {
 }
 
 #[derive(Clone)]
-pub(crate) struct RoleModelPerm {
-    pub permission: ReadPermission,
-}
-
-#[derive(Clone)]
 pub(crate) struct ProtocolSurfaceInfo {
     pub(crate) export: DistributedClientSurfaceExport,
     pub(crate) schema_fingerprint: String,
@@ -205,7 +200,7 @@ pub(crate) struct ProtocolApplicationInfo {
 /// opened surface's privilege pack rather than a session primary role.
 #[derive(Clone, Debug)]
 pub struct ExecutionAuthority {
-    /// Role pack key for `permissions` / `schemas` / `role_surfaces`.
+    /// Role pack key for `schemas` / `role_surfaces`.
     pub privilege_role: String,
     /// Asserted identity set (`x-roles`).
     pub asserted_roles: Vec<String>,
@@ -238,7 +233,6 @@ pub(crate) struct EngineInner {
     pub gateway_versions: Option<crate::graphql::delivery::GatewayVersionStore>,
     pub catalog: BTreeMap<String, CatalogEntry>,
     pub by_table: BTreeMap<String, String>,
-    pub permissions: BTreeMap<(String, String), RoleModelPerm>,
     pub roles: BTreeSet<String>,
     pub anonymous_role: String,
     pub default_limit: u64,
@@ -307,7 +301,8 @@ pub struct GraphqlEngineBuilder {
     pub(crate) gateway_versions: Option<crate::graphql::delivery::GatewayVersionStore>,
     pub(crate) catalog: BTreeMap<String, CatalogEntry>,
     pub(crate) by_table: BTreeMap<String, String>,
-    pub(crate) permissions: BTreeMap<(String, String), RoleModelPerm>,
+    /// Authored grants: role → model → permission.
+    pub(crate) permissions: BTreeMap<String, BTreeMap<String, ReadPermission>>,
     pub(crate) roles: Option<BTreeSet<String>>,
     pub(crate) anonymous_role: String,
     pub(crate) default_limit: u64,

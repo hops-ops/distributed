@@ -2,8 +2,8 @@ use super::*;
 use crate::command::{typed_command, Eventual, PreparedCommand, Succeeded};
 use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
 use crate::graphql::{
-    build_surface, claim, col, rel, surface_for_application, surface_for_role, RoleGrant,
-    SurfaceCommand, SurfaceOptions, SurfaceProjector, SurfaceTypeField,
+    build_surface, claim, col, read, rel, surface_for_application, surface_for_role,
+    ReadPermission, SurfaceCommand, SurfaceOptions, SurfaceProjector, SurfaceTypeField,
 };
 use crate::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
 use crate::table::{
@@ -556,7 +556,7 @@ fn projected_command_exports_opaque_role_safe_direct_target() {
     let selected = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([("TodoView".into(), RoleGrant::all_columns())]),
+        &BTreeMap::from([("TodoView".into(), read().all_columns())]),
     )
     .expect("role selection");
     assert!(
@@ -633,8 +633,8 @@ fn legacy_effect_presets_are_not_v2_client_authority() {
         &full,
         "user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .expect("role selection");
@@ -664,8 +664,8 @@ fn projected_command_export_rejects_absent_or_wrong_direct_target() {
         &full,
         "user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .expect("role selection");
@@ -685,8 +685,8 @@ fn projected_command_export_rejects_absent_or_wrong_direct_target() {
         &full,
         "user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .expect("role selection");
@@ -704,20 +704,14 @@ fn projected_command_export_rejects_absent_or_wrong_direct_target() {
     assert!(error.0.contains("differs from retained model"));
 }
 
-fn grants() -> BTreeMap<String, BTreeMap<String, RoleGrant>> {
+fn grants() -> BTreeMap<String, BTreeMap<String, ReadPermission>> {
     BTreeMap::from([
         (
             "admin".into(),
             BTreeMap::from([
-                (
-                    "TodoView".into(),
-                    RoleGrant::all_columns().with_aggregations(),
-                ),
-                (
-                    "UserView".into(),
-                    RoleGrant::all_columns().with_aggregations(),
-                ),
-                ("MembershipView".into(), RoleGrant::all_columns()),
+                ("TodoView".into(), read().all_columns().aggregations()),
+                ("UserView".into(), read().all_columns().aggregations()),
+                ("MembershipView".into(), read().all_columns()),
             ]),
         ),
         (
@@ -725,14 +719,15 @@ fn grants() -> BTreeMap<String, BTreeMap<String, RoleGrant>> {
             BTreeMap::from([
                 (
                     "TodoView".into(),
-                    RoleGrant::all_columns()
+                    read()
+                        .all_columns()
                         .rows(col("owner_id").eq(claim("x-user-id")))
                         .limit(25),
                 ),
-                ("UserView".into(), RoleGrant::columns(["display_name"])),
+                ("UserView".into(), read().columns(["display_name"])),
                 (
                     "MembershipView".into(),
-                    RoleGrant::columns(["tenant_id", "role"]),
+                    read().columns(["tenant_id", "role"]),
                 ),
             ]),
         ),
@@ -747,7 +742,7 @@ fn manifest_for_all_models(
     let grants = full
         .models
         .keys()
-        .map(|model| (model.clone(), RoleGrant::all_columns().with_aggregations()))
+        .map(|model| (model.clone(), read().all_columns().aggregations()))
         .collect();
     let selected = surface_for_role(full, role, &grants).expect("role surface");
     client_manifest_from_surface(service_id, ClientSurfaceIdentity::role(role), &selected)
@@ -1519,7 +1514,7 @@ fn denied_modeled_projection_exports_no_program_event_slot_or_preset_identity() 
     let selected = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([("UserView".into(), RoleGrant::all_columns())]),
+        &BTreeMap::from([("UserView".into(), read().all_columns())]),
     )
     .unwrap();
     let manifest = client_manifest_from_surface(
@@ -1607,8 +1602,8 @@ fn belongs_to_relationships_stay_nullable_independent_of_fk_storage() {
             &full,
             "user",
             &BTreeMap::from([
-                ("TodoView".into(), RoleGrant::all_columns()),
-                ("UserView".into(), RoleGrant::all_columns()),
+                ("TodoView".into(), read().all_columns()),
+                ("UserView".into(), read().all_columns()),
             ]),
         )
         .unwrap();
@@ -1702,7 +1697,7 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         "user",
         &BTreeMap::from([(
             "UserView".into(),
-            RoleGrant::all_columns().rows(col("user_id").eq("visible-user")),
+            read().all_columns().rows(col("user_id").eq("visible-user")),
         )]),
     )
     .unwrap();
@@ -1901,9 +1896,11 @@ fn bigint_keys_embed_until_decimal_string_identity_is_available() {
         &BTreeMap::from([
             (
                 "AccountView".into(),
-                RoleGrant::all_columns().rows(col("account_id").eq(9_007_199_254_740_992_i64)),
+                read()
+                    .all_columns()
+                    .rows(col("account_id").eq(9_007_199_254_740_992_i64)),
             ),
-            ("InvoiceView".into(), RoleGrant::all_columns()),
+            ("InvoiceView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -2010,13 +2007,13 @@ fn mixed_target_projectors_are_omitted_for_role_and_application_surfaces() {
         ])
         .unwrap();
     let restricted = BTreeMap::from([
-        ("TodoView".into(), RoleGrant::all_columns()),
-        ("UserView".into(), RoleGrant::all_columns()),
+        ("TodoView".into(), read().all_columns()),
+        ("UserView".into(), read().all_columns()),
     ]);
     let admin = BTreeMap::from([
-        ("TodoView".into(), RoleGrant::all_columns()),
-        ("UserView".into(), RoleGrant::all_columns()),
-        ("TeamView".into(), RoleGrant::all_columns()),
+        ("TodoView".into(), read().all_columns()),
+        ("UserView".into(), read().all_columns()),
+        ("TeamView".into(), read().all_columns()),
     ]);
 
     let role = surface_for_role(&full, "restricted", &restricted).unwrap();
@@ -2088,10 +2085,10 @@ fn aggregate_nodes_export_exact_role_bounded_window_semantics() {
         &full,
         "admin",
         &BTreeMap::from([
-            ("TeamView".into(), RoleGrant::all_columns()),
+            ("TeamView".into(), read().all_columns()),
             (
                 "UserView".into(),
-                RoleGrant::all_columns().with_aggregations().limit(13),
+                read().all_columns().aggregations().limit(13),
             ),
         ]),
     )
@@ -2174,11 +2171,8 @@ fn opaque_m2m_plan_preserves_invalidation_without_leaking_join_internals() {
         &full,
         "admin",
         &BTreeMap::from([
-            ("TeamView".into(), RoleGrant::all_columns()),
-            (
-                "UserView".into(),
-                RoleGrant::all_columns().with_aggregations(),
-            ),
+            ("TeamView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns().aggregations()),
         ]),
     )
     .unwrap();
@@ -2264,11 +2258,8 @@ fn opaque_m2m_plan_preserves_invalidation_without_leaking_join_internals() {
         &renamed_full,
         "admin",
         &BTreeMap::from([
-            ("TeamView".into(), RoleGrant::all_columns()),
-            (
-                "UserView".into(),
-                RoleGrant::all_columns().with_aggregations(),
-            ),
+            ("TeamView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns().aggregations()),
         ]),
     )
     .unwrap();
@@ -2300,8 +2291,8 @@ fn opaque_m2m_plan_preserves_invalidation_without_leaking_join_internals() {
         &full,
         "limited",
         &BTreeMap::from([
-            ("TeamView".into(), RoleGrant::columns(["name"])),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TeamView".into(), read().columns(["name"])),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -2343,9 +2334,9 @@ fn visible_read_model_join_emits_explicit_local_m2m_plan() {
         &full,
         "admin",
         &BTreeMap::from([
-            ("TeamView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
-            ("TeamMemberView".into(), RoleGrant::all_columns()),
+            ("TeamView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
+            ("TeamMemberView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -2388,10 +2379,11 @@ fn relational_row_policy_is_server_only_when_relationship_key_is_hidden() {
         &BTreeMap::from([
             (
                 "TodoView".into(),
-                RoleGrant::columns(["todo_id", "title", "completed"])
+                read()
+                    .columns(["todo_id", "title", "completed"])
                     .rows(rel("owner", col("display_name").eq("Patrick"))),
             ),
-            ("UserView".into(), RoleGrant::columns(["display_name"])),
+            ("UserView".into(), read().columns(["display_name"])),
         ]),
     )
     .unwrap();

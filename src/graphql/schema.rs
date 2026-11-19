@@ -288,11 +288,7 @@ pub fn build_role_schema(
                         let inner = inner.ok_or_else(|| {
                             async_graphql::Error::new("GraphqlEngine not in request data")
                         })?;
-                        let role = privilege_role_for_request(
-                            authority.as_ref(),
-                            &session,
-                            &inner.anonymous_role,
-                        );
+                        let role = execution_privilege(authority.as_ref())?;
                         #[cfg(feature = "gateway-delivery")]
                         if let Some(captured) = captured {
                             let plan = compile::compile_query(
@@ -796,11 +792,11 @@ async fn resolve_root(
         .cloned()
         .unwrap_or_else(Session::new);
     let authority = ctx.data_opt::<ExecutionAuthority>();
-    let role = privilege_role_for_request(authority, &session, &inner.anonymous_role);
+    let role = execution_privilege(authority)?;
 
     let selection = compile::selection_from_field(ctx.field());
     let plan = compile::compile_query(&inner, &session, &role, model, kind, &selection)
-        .map_err(|e| client_error("BAD_REQUEST", sanitize_compile_error(&e)))?;
+        .map_err(|e| compile_client_error(&e))?;
     #[cfg(feature = "gateway-delivery")]
     if let Some(captured) = ctx.data_opt::<super::delivery::PlanCapture>() {
         if let QueryPlan::Sql(plan) = plan {
@@ -864,21 +860,16 @@ async fn resolve_root(
     }
 }
 
-/// Privilege pack for SQL grants: surface execution authority, else anonymous.
-fn privilege_role_for_request(
+/// The privilege pack the engine authorized this request to execute under.
+///
+/// `GraphqlEngine` injects it on every entry point. A request without one was
+/// never authorized, so it does not run under a guessed role.
+pub(crate) fn execution_privilege(
     authority: Option<&ExecutionAuthority>,
-    session: &Session,
-    anonymous_role: &str,
-) -> String {
-    if let Some(authority) = authority {
-        return authority.privilege_role.clone();
-    }
-    // Fallback for schema unit tests that execute without engine request data.
-    session
-        .roles()
-        .first()
-        .map(|role| (*role).to_string())
-        .unwrap_or_else(|| anonymous_role.to_string())
+) -> Result<String, async_graphql::Error> {
+    authority
+        .map(|authority| authority.privilege_role.clone())
+        .ok_or_else(|| client_error("INTERNAL", "request has no execution authority"))
 }
 
 /// Closed set of engine-authored GraphQL `extensions.code` values (v1 freeze).
@@ -903,6 +894,16 @@ pub(crate) fn client_error_for_execute_err(e: &str) -> async_graphql::Error {
         client_error("TIMEOUT", "statement timeout")
     } else {
         client_error("INTERNAL", "internal error")
+    }
+}
+
+/// A compile failure as the client sees it: a schema/compiler disagreement
+/// is the server's fault, anything else the request's.
+fn compile_client_error(e: &str) -> async_graphql::Error {
+    if e.starts_with("internal:") {
+        client_error("INTERNAL", "internal error")
+    } else {
+        client_error("BAD_REQUEST", sanitize_compile_error(e))
     }
 }
 

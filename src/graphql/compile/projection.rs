@@ -9,8 +9,7 @@ use crate::table::{ColumnType, TableSchema};
 
 use super::super::engine::EngineInner;
 use super::super::filter::{CmpOp, FilterExpr, LitValue, Operand};
-use super::super::naming::{is_valid_graphql_name, scalar_type_name};
-use super::super::permissions::ReadPermission;
+use super::super::naming::is_valid_graphql_name;
 use super::binds::{operand_to_bind, value_to_bind, BindValue};
 use super::dialect::{placeholder, SqlDialect};
 use super::evidence::{
@@ -18,8 +17,8 @@ use super::evidence::{
     QueryEvidenceObjectPlan, QueryEvidencePlan, QueryEvidenceRecordPlan,
     QUERY_EVIDENCE_HIDDEN_PREFIX,
 };
-use super::filter::compile_where;
 use super::relationship::{compile_relationship_aggregate_subquery, compile_relationship_subquery};
+use super::scan::{value_as_u64, ModelScan, ScanLink};
 
 #[derive(Clone, Debug)]
 pub struct SqlPlan {
@@ -102,15 +101,8 @@ fn compile_cell_by_key(
     kind: RootKind,
     selection: &SelectionNode,
 ) -> Result<QueryPlan, String> {
-    let entry = inner
-        .catalog
-        .get(model_name)
-        .ok_or_else(|| format!("unknown model `{model_name}`"))?;
-    let permission = inner
-        .permissions
-        .get(&(model_name.to_string(), role.to_string()))
-        .map(|entry| &entry.permission)
-        .ok_or_else(|| format!("role `{role}` has no permission on `{model_name}`"))?;
+    let scan = ModelScan::open(inner, session, role, model_name)?;
+    let schema = scan.schema;
     match kind {
         RootKind::List => {
             return Err(
@@ -133,7 +125,7 @@ fn compile_cell_by_key(
         return Err("cell-by-key store does not support sort".into());
     }
     for child in &selection.children {
-        let is_join = entry.schema.relationships.iter().any(|rel| {
+        let is_join = schema.relationships.iter().any(|rel| {
             rel.field_name == child.field_name
                 || child.field_name == format!("{}_aggregate", rel.field_name)
         });
@@ -143,14 +135,23 @@ fn compile_cell_by_key(
                     .into(),
             );
         }
+        // The cell resolver returns stored fields by name: nothing else
+        // stands between a selection and an ungranted column.
+        if child.field_name != "__typename" && !scan.allows_column(&child.field_name) {
+            return Err(format!(
+                "internal: selection reached ungranted field `{}` on `{model_name}`",
+                child.field_name
+            ));
+        }
     }
-    let row_filter = permission
-        .row_filter
-        .as_ref()
-        .map(|filter| resolve_cell_row_filter(&entry.schema, session, filter))
+    let row_filter = scan
+        .grant
+        .row_policy
+        .filter()
+        .map(|filter| resolve_cell_row_filter(schema, session, filter))
         .transpose()?;
     let mut pk = BTreeMap::new();
-    for column in &entry.schema.primary_key.columns {
+    for column in &schema.primary_key.columns {
         let value = selection
             .args
             .get(column)
@@ -515,105 +516,37 @@ pub fn compile_root(
         ));
     }
 
-    let entry = inner
-        .catalog
-        .get(model_name)
-        .ok_or_else(|| format!("unknown model `{model_name}`"))?;
-    let perm = inner
-        .permissions
-        .get(&(model_name.to_string(), role.to_string()))
-        .map(|p| &p.permission)
-        .ok_or_else(|| format!("role `{role}` has no permission on `{model_name}`"))?;
-
+    let scan = ModelScan::open(inner, session, role, model_name)?;
     let mut binds = Vec::new();
     let mut bytes_paths = Vec::new();
-    let mut tables = vec![entry.schema.table_name.clone()];
+    let mut tables = vec![scan.schema.table_name.clone()];
     let alias = "t0";
-
-    let limit = resolve_limit(
-        selection.args.get("limit"),
-        perm.limit,
-        inner.default_limit,
-        inner.max_limit,
-    );
-    let offset = selection
-        .args
-        .get("offset")
-        .and_then(value_as_u64)
-        .unwrap_or(0);
-
-    let order_sql = compile_order_by(
-        &entry.schema,
-        selection.args.get("order_by"),
-        alias,
-        perm,
-        inner.strict_where,
-        inner.dialect,
-    )?;
-
-    let ops = inner.dialect.ops();
+    let root = ScanLink::default();
 
     let (sql, evidence_root) = match kind {
         RootKind::List => {
-            let (projection, object_evidence) = compile_object_projection(
-                inner,
-                session,
-                role,
-                &entry.schema,
-                perm,
+            let (page, evidence) = compile_page(
+                scan,
                 selection,
+                &selection.args,
                 alias,
+                &root,
                 &mut binds,
                 &mut bytes_paths,
                 &mut tables,
                 "",
                 0,
             )?;
-            let where_sql = compile_where(
-                inner,
-                session,
-                role,
-                &entry.schema,
-                perm,
-                selection.args.get("where"),
-                alias,
-                &mut binds,
-                &mut tables,
-                0,
-            )?;
-            let json_agg = ops.json_agg;
-            let coalesce_empty = ops.empty_array;
-            let agg_arg = match ops.json_cast_fn {
-                None => "root".to_string(),
-                Some(f) => format!("{f}(root)"),
-            };
             (
-                format!(
-                    "SELECT coalesce({json_agg}({agg_arg}), {coalesce_empty}) FROM (\n  SELECT {projection} AS root\n  FROM \"{}\" {alias}\n  WHERE {where_sql}\n  {order_sql}\n  LIMIT {} OFFSET {}\n) sub",
-                    entry.schema.table_name,
-                    {
-                        binds.push(BindValue::I64(limit as i64));
-                        placeholder(inner.dialect, binds.len())
-                    },
-                    {
-                        binds.push(BindValue::I64(offset as i64));
-                        placeholder(inner.dialect, binds.len())
-                    }
-                ),
-                QueryEvidenceNode::List(Box::new(QueryEvidenceNode::Object(object_evidence))),
+                page,
+                QueryEvidenceNode::List(Box::new(QueryEvidenceNode::Object(evidence))),
             )
         }
         RootKind::ByPk => {
-            // Projection first: nested has_many/m2m subqueries emit LIMIT/OFFSET
-            // `?` binds that appear in the SELECT text *before* the outer WHERE.
-            // SQLite binds are positional, so PK + filter binds must be pushed
-            // after projection binds (same order as `?` appearance in SQL).
-            let (projection, object_evidence) = compile_object_projection(
-                inner,
-                session,
-                role,
-                &entry.schema,
-                perm,
+            // Binds are positional: the projection's (nested LIMIT/OFFSET)
+            // come first in the statement text, then the key, then the WHERE.
+            let (projection, evidence) = compile_object_projection(
+                scan,
                 selection,
                 alias,
                 &mut binds,
@@ -622,162 +555,52 @@ pub fn compile_root(
                 "",
                 0,
             )?;
-            let mut pk_preds = Vec::new();
-            for pk in &entry.schema.primary_key.columns {
-                let v = selection
+            let mut key = Vec::new();
+            for pk in &scan.schema.primary_key.columns {
+                let value = selection
                     .args
                     .get(pk)
                     .ok_or_else(|| format!("missing primary key argument `{pk}`"))?;
-                let col = entry
+                let column = scan
                     .schema
                     .columns
                     .iter()
                     .find(|c| c.column_name == *pk)
                     .ok_or_else(|| format!("pk column `{pk}` missing"))?;
-                let bind = value_to_bind(v, &col.column_type)?;
-                binds.push(bind);
+                binds.push(value_to_bind(value, &column.column_type)?);
                 let ph = placeholder(inner.dialect, binds.len());
-                pk_preds.push(format!("{alias}.\"{pk}\" = {ph}"));
+                key.push(format!("{alias}.\"{pk}\" = {ph}"));
             }
-            let where_sql = compile_where(
-                inner,
-                session,
-                role,
-                &entry.schema,
-                perm,
-                selection.args.get("where"),
+            let one_row = ScanLink {
+                join: String::new(),
+                on: format!("({})", key.join(" AND ")),
+            };
+            let rows = scan.visible_rows(
                 alias,
+                &one_row,
+                selection.args.get("where"),
                 &mut binds,
                 &mut tables,
                 0,
             )?;
-            let pk_where = pk_preds.join(" AND ");
-            let full_where = if where_sql == "TRUE" || where_sql == "true" {
-                pk_where
-            } else {
-                format!("({pk_where}) AND ({where_sql})")
-            };
             (
-                format!(
-                    "SELECT {projection} FROM \"{}\" {alias} WHERE {full_where} LIMIT 1",
-                    entry.schema.table_name
-                ),
-                QueryEvidenceNode::Object(object_evidence),
+                format!("SELECT {projection} {rows} LIMIT 1"),
+                QueryEvidenceNode::Object(evidence),
             )
         }
         RootKind::Aggregate => {
-            let json_agg = ops.json_agg;
-            let coalesce_empty = ops.empty_array;
-            let table = entry.schema.table_name.as_str();
-            let mut pairs = Vec::new();
-            let mut evidence_fields = Vec::new();
-            for aggregate_member in &selection.children {
-                match aggregate_member.field_name.as_str() {
-                    "__typename" => {}
-                    "aggregate" => {
-                        validate_response_key(&aggregate_member.response_key)?;
-                        let mut aggregate_pairs = Vec::new();
-                        for metric in &aggregate_member.children {
-                            match metric.field_name.as_str() {
-                                "__typename" => {}
-                                "count" => {
-                                    validate_response_key(&metric.response_key)?;
-                                    let where_for_count = compile_where(
-                                        inner,
-                                        session,
-                                        role,
-                                        &entry.schema,
-                                        perm,
-                                        selection.args.get("where"),
-                                        alias,
-                                        &mut binds,
-                                        &mut tables,
-                                        0,
-                                    )?;
-                                    aggregate_pairs.push((
-                                        metric.response_key.clone(),
-                                        format!(
-                                            "(SELECT count(*) FROM \"{table}\" {alias} WHERE {where_for_count})"
-                                        ),
-                                    ));
-                                }
-                                _ => {
-                                    return Err(
-                                        "aggregate fields selection contains an unsupported member"
-                                            .into(),
-                                    );
-                                }
-                            }
-                        }
-                        pairs.push((
-                            aggregate_member.response_key.clone(),
-                            chunked_json_object(inner.dialect, &aggregate_pairs),
-                        ));
-                    }
-                    "nodes" => {
-                        validate_response_key(&aggregate_member.response_key)?;
-                        let nodes_path = aggregate_member.response_key.as_str();
-                        let (nodes_proj, nodes_evidence) = compile_object_projection(
-                            inner,
-                            session,
-                            role,
-                            &entry.schema,
-                            perm,
-                            aggregate_member,
-                            alias,
-                            &mut binds,
-                            &mut bytes_paths,
-                            &mut tables,
-                            nodes_path,
-                            0,
-                        )?;
-                        let where_for_nodes = compile_where(
-                            inner,
-                            session,
-                            role,
-                            &entry.schema,
-                            perm,
-                            selection.args.get("where"),
-                            alias,
-                            &mut binds,
-                            &mut tables,
-                            0,
-                        )?;
-                        let lim = {
-                            binds.push(BindValue::I64(limit as i64));
-                            placeholder(inner.dialect, binds.len())
-                        };
-                        let off = {
-                            binds.push(BindValue::I64(offset as i64));
-                            placeholder(inner.dialect, binds.len())
-                        };
-                        pairs.push((
-                            aggregate_member.response_key.clone(),
-                            inner.dialect.ops().nested_json(format!(
-                                "coalesce((SELECT {json_agg}(n) FROM (SELECT {nodes_proj} AS n FROM \"{table}\" {alias} WHERE {where_for_nodes} {order_sql} LIMIT {lim} OFFSET {off}) x), {coalesce_empty})"
-                            )),
-                        ));
-                        evidence_fields.push(QueryEvidenceFieldPlan {
-                            storage_key: aggregate_member.response_key.clone(),
-                            response_key: aggregate_member.response_key.clone(),
-                            node: Box::new(QueryEvidenceNode::List(Box::new(
-                                QueryEvidenceNode::Object(nodes_evidence),
-                            ))),
-                        });
-                    }
-                    _ => {
-                        return Err("aggregate selection contains an unsupported member".into());
-                    }
-                }
-            }
-
-            (
-                format!("SELECT {}", chunked_json_object(inner.dialect, &pairs)),
-                QueryEvidenceNode::Object(QueryEvidenceObjectPlan {
-                    record: None,
-                    fields: evidence_fields,
-                }),
-            )
+            let (object, evidence) = compile_aggregate(
+                scan,
+                selection,
+                alias,
+                &root,
+                &mut binds,
+                &mut bytes_paths,
+                &mut tables,
+                "",
+                0,
+            )?;
+            (format!("SELECT {object}"), evidence)
         }
     };
     let evidence = QueryEvidencePlan::new(selection.response_key.clone(), evidence_root)?;
@@ -806,32 +629,159 @@ pub(super) fn validate_response_key(key: &str) -> Result<(), String> {
     }
 }
 
-pub(super) fn resolve_limit(
-    client: Option<&Value>,
-    role_limit: Option<u64>,
-    default_limit: u64,
-    max_limit: u64,
-) -> u64 {
-    let client = client.and_then(value_as_u64).unwrap_or(default_limit);
-    let with_role = role_limit.map(|r| client.min(r)).unwrap_or(client);
-    with_role.min(max_limit)
+/// One page of a scan as a JSON array: `fields` projected from the rows the
+/// privilege may read, filtered, ordered and limited by `args`.
+pub(super) fn compile_page(
+    scan: ModelScan<'_>,
+    fields: &SelectionNode,
+    args: &BTreeMap<String, Value>,
+    alias: &str,
+    link: &ScanLink,
+    binds: &mut Vec<BindValue>,
+    bytes_paths: &mut Vec<String>,
+    tables: &mut Vec<String>,
+    path_prefix: &str,
+    depth: usize,
+) -> Result<(String, QueryEvidenceObjectPlan), String> {
+    let dialect = scan.inner.dialect;
+    let ops = dialect.ops();
+    let order_sql = scan.order_by(args.get("order_by"), alias)?;
+    let (projection, evidence) = compile_object_projection(
+        scan,
+        fields,
+        alias,
+        binds,
+        bytes_paths,
+        tables,
+        path_prefix,
+        depth,
+    )?;
+    let rows = scan.visible_rows(alias, link, args.get("where"), binds, tables, depth)?;
+    binds.push(BindValue::I64(scan.limit(args.get("limit")) as i64));
+    let limit = placeholder(dialect, binds.len());
+    binds.push(BindValue::I64(
+        args.get("offset").and_then(value_as_u64).unwrap_or(0) as i64,
+    ));
+    let offset = placeholder(dialect, binds.len());
+    let row = match ops.json_cast_fn {
+        None => "r".to_string(),
+        Some(cast) => format!("{cast}(r)"),
+    };
+    Ok((
+        format!(
+            "SELECT coalesce({}({row}), {}) FROM (\n  SELECT {projection} AS r\n  {rows}\n  {order_sql}\n  LIMIT {limit} OFFSET {offset}\n) page",
+            ops.json_agg, ops.empty_array
+        ),
+        evidence,
+    ))
 }
 
-pub(super) fn value_as_u64(v: &Value) -> Option<u64> {
-    match v {
-        Value::Number(n) => n
-            .as_u64()
-            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok())),
-        _ => None,
+/// `{ aggregate { count } nodes { … } }` over a scan, as a JSON object.
+pub(super) fn compile_aggregate(
+    scan: ModelScan<'_>,
+    selection: &SelectionNode,
+    alias: &str,
+    link: &ScanLink,
+    binds: &mut Vec<BindValue>,
+    bytes_paths: &mut Vec<String>,
+    tables: &mut Vec<String>,
+    path_prefix: &str,
+    depth: usize,
+) -> Result<(String, QueryEvidenceNode), String> {
+    if !scan.aggregations() {
+        return Err(format!(
+            "internal: aggregate reached `{}` without an aggregations grant",
+            scan.schema.model_name
+        ));
     }
+    let dialect = scan.inner.dialect;
+    let mut pairs = Vec::new();
+    let mut evidence_fields = Vec::new();
+    for member in &selection.children {
+        match member.field_name.as_str() {
+            "__typename" => {}
+            "aggregate" => {
+                validate_response_key(&member.response_key)?;
+                let mut metrics = Vec::new();
+                for metric in &member.children {
+                    match metric.field_name.as_str() {
+                        "__typename" => {}
+                        "count" => {
+                            validate_response_key(&metric.response_key)?;
+                            let rows = scan.visible_rows(
+                                alias,
+                                link,
+                                selection.args.get("where"),
+                                binds,
+                                tables,
+                                depth,
+                            )?;
+                            metrics.push((
+                                metric.response_key.clone(),
+                                format!("(SELECT count(*) {rows})"),
+                            ));
+                        }
+                        _ => {
+                            return Err(
+                                "aggregate fields selection contains an unsupported member".into(),
+                            );
+                        }
+                    }
+                }
+                pairs.push((
+                    member.response_key.clone(),
+                    chunked_json_object(dialect, &metrics),
+                ));
+            }
+            "nodes" => {
+                validate_response_key(&member.response_key)?;
+                let nodes_path = if path_prefix.is_empty() {
+                    member.response_key.clone()
+                } else {
+                    format!("{path_prefix}.{}", member.response_key)
+                };
+                let (page, evidence) = compile_page(
+                    scan,
+                    member,
+                    &selection.args,
+                    alias,
+                    link,
+                    binds,
+                    bytes_paths,
+                    tables,
+                    &nodes_path,
+                    depth,
+                )?;
+                pairs.push((
+                    member.response_key.clone(),
+                    dialect.ops().nested_json(format!("({page})")),
+                ));
+                evidence_fields.push(QueryEvidenceFieldPlan {
+                    storage_key: member.response_key.clone(),
+                    response_key: member.response_key.clone(),
+                    node: Box::new(QueryEvidenceNode::List(Box::new(
+                        QueryEvidenceNode::Object(evidence),
+                    ))),
+                });
+            }
+            _ => {
+                return Err("aggregate selection contains an unsupported member".into());
+            }
+        }
+    }
+    Ok((
+        chunked_json_object(dialect, &pairs),
+        QueryEvidenceNode::Object(QueryEvidenceObjectPlan {
+            record: None,
+            fields: evidence_fields,
+        }),
+    ))
 }
 
+/// The JSON object for one row of `scan`: its selected columns and nested
+/// relationships, plus the hidden identity the causal evidence needs.
 pub(super) fn compile_object_projection(
-    inner: &EngineInner,
-    session: &Session,
-    role: &str,
-    schema: &TableSchema,
-    perm: &ReadPermission,
+    scan: ModelScan<'_>,
     selection: &SelectionNode,
     alias: &str,
     binds: &mut Vec<BindValue>,
@@ -840,173 +790,117 @@ pub(super) fn compile_object_projection(
     path_prefix: &str,
     depth: usize,
 ) -> Result<(String, QueryEvidenceObjectPlan), String> {
+    let (inner, schema) = (scan.inner, scan.schema);
     if depth > inner.max_depth {
         return Err("max depth exceeded".into());
     }
-    let (mut pairs, record) = compile_record_evidence_projection(
-        inner.dialect,
-        schema,
-        perm,
-        alias,
-        binds,
-        bytes_paths,
-        path_prefix,
-    )?;
+    let (mut pairs, record) =
+        compile_record_evidence_projection(scan, alias, binds, bytes_paths, path_prefix)?;
     let mut evidence_fields = Vec::new();
-
-    // If no children, project all allowed columns.
-    let fields: Vec<&SelectionNode> = if selection.children.is_empty() {
-        Vec::new()
-    } else {
-        selection.children.iter().collect()
+    let path = |response_key: &str| {
+        if path_prefix.is_empty() {
+            response_key.to_string()
+        } else {
+            format!("{path_prefix}.{response_key}")
+        }
+    };
+    let column_pair = |column: &crate::table::TableColumn,
+                       response_key: &str,
+                       binds: &mut Vec<BindValue>,
+                       bytes_paths: &mut Vec<String>|
+     -> Result<(String, String), String> {
+        let expr = column_json_expr(inner.dialect, alias, column, binds)?;
+        if matches!(column.column_type, ColumnType::Bytes)
+            && matches!(inner.dialect, SqlDialect::Sqlite)
+        {
+            bytes_paths.push(path(response_key));
+        }
+        validate_response_key(response_key)?;
+        Ok((response_key.to_string(), expr))
     };
 
-    if fields.is_empty() {
-        for col in schema.columns.iter().filter(|c| !c.skipped) {
-            if !perm.allows_column(&col.column_name) {
-                continue;
-            }
-            let expr = column_json_expr(inner.dialect, alias, col, binds)?;
-            if matches!(col.column_type, ColumnType::Bytes)
-                && matches!(inner.dialect, SqlDialect::Sqlite)
-            {
-                let p = if path_prefix.is_empty() {
-                    col.column_name.clone()
-                } else {
-                    format!("{path_prefix}.{}", col.column_name)
-                };
-                bytes_paths.push(p);
-            }
-            validate_response_key(&col.column_name)?;
-            pairs.push((col.column_name.clone(), expr));
-        }
-    } else {
-        for child in fields {
-            if let Some(rel_name) = child.field_name.strip_suffix("_aggregate") {
-                if let Some(rel) = schema
-                    .relationships
-                    .iter()
-                    .find(|r| r.field_name == rel_name)
-                {
-                    let target_entry = match inner.catalog.get(&rel.target_model) {
-                        Some(e) => e,
-                        None => continue,
-                    };
-                    let target_perm = match inner
-                        .permissions
-                        .get(&(rel.target_model.clone(), role.to_string()))
-                    {
-                        Some(p) if p.permission.aggregations => &p.permission,
-                        _ => continue,
-                    };
-                    tables.push(target_entry.schema.table_name.clone());
-                    let child_path = if path_prefix.is_empty() {
-                        child.response_key.clone()
-                    } else {
-                        format!("{path_prefix}.{}", child.response_key)
-                    };
-                    let (sub, evidence_node) = compile_relationship_aggregate_subquery(
-                        inner,
-                        session,
-                        role,
-                        schema,
-                        alias,
-                        rel,
-                        target_entry,
-                        target_perm,
-                        child,
-                        binds,
-                        bytes_paths,
-                        tables,
-                        &child_path,
-                        depth + 1,
-                    )?;
-                    validate_response_key(&child.response_key)?;
-                    pairs.push((
-                        child.response_key.clone(),
-                        inner.dialect.ops().nested_json(sub),
-                    ));
-                    evidence_fields.push(QueryEvidenceFieldPlan {
-                        storage_key: child.response_key.clone(),
-                        response_key: child.response_key.clone(),
-                        node: Box::new(evidence_node),
-                    });
-                }
-                continue;
-            }
-            if let Some(col) = schema
-                .columns
-                .iter()
-                .find(|c| c.column_name == child.field_name && !c.skipped)
-            {
-                if !perm.allows_column(&col.column_name) {
-                    continue;
-                }
-                let expr = column_json_expr(inner.dialect, alias, col, binds)?;
-                if matches!(col.column_type, ColumnType::Bytes)
-                    && matches!(inner.dialect, SqlDialect::Sqlite)
-                {
-                    let p = if path_prefix.is_empty() {
-                        child.response_key.clone()
-                    } else {
-                        format!("{path_prefix}.{}", child.response_key)
-                    };
-                    bytes_paths.push(p);
-                }
-                validate_response_key(&child.response_key)?;
-                pairs.push((child.response_key.clone(), expr));
-                continue;
-            }
-            if let Some(rel) = schema
-                .relationships
-                .iter()
-                .find(|r| r.field_name == child.field_name)
-            {
-                let target_entry = match inner.catalog.get(&rel.target_model) {
-                    Some(e) => e,
-                    None => continue,
-                };
-                let target_perm = match inner
-                    .permissions
-                    .get(&(rel.target_model.clone(), role.to_string()))
-                {
-                    Some(p) => &p.permission,
-                    None => continue, // untracked for role
-                };
-                tables.push(target_entry.schema.table_name.clone());
-                let child_path = if path_prefix.is_empty() {
-                    child.response_key.clone()
-                } else {
-                    format!("{path_prefix}.{}", child.response_key)
-                };
-                let (sub, evidence_node) = compile_relationship_subquery(
-                    inner,
-                    session,
-                    role,
-                    schema,
-                    alias,
-                    rel,
-                    target_entry,
-                    target_perm,
-                    child,
+    // No selection set: every column the privilege may read.
+    if selection.children.is_empty() {
+        for column in schema.columns.iter().filter(|c| !c.skipped) {
+            if scan.allows_column(&column.column_name) {
+                pairs.push(column_pair(
+                    column,
+                    &column.column_name,
                     binds,
                     bytes_paths,
-                    tables,
-                    &child_path,
-                    depth + 1,
-                )?;
-                validate_response_key(&child.response_key)?;
-                pairs.push((
-                    child.response_key.clone(),
-                    inner.dialect.ops().nested_json(sub),
-                ));
-                evidence_fields.push(QueryEvidenceFieldPlan {
-                    storage_key: child.response_key.clone(),
-                    response_key: child.response_key.clone(),
-                    node: Box::new(evidence_node),
-                });
+                )?);
             }
         }
+    }
+    for child in &selection.children {
+        if child.field_name == "__typename" {
+            continue;
+        }
+        if let Some(column) = schema
+            .columns
+            .iter()
+            .find(|c| c.column_name == child.field_name && !c.skipped)
+        {
+            // The per-privilege schema never offers an ungranted column.
+            if !scan.allows_column(&column.column_name) {
+                return Err(format!(
+                    "internal: selection reached ungranted column `{}` on `{}`",
+                    column.column_name, schema.model_name
+                ));
+            }
+            pairs.push(column_pair(
+                column,
+                &child.response_key,
+                binds,
+                bytes_paths,
+            )?);
+            continue;
+        }
+        let relationship = |name: &str| schema.relationships.iter().find(|r| r.field_name == name);
+        let (sub, evidence) = if let Some(rel) = relationship(&child.field_name) {
+            compile_relationship_subquery(
+                scan,
+                alias,
+                rel,
+                child,
+                binds,
+                bytes_paths,
+                tables,
+                &path(&child.response_key),
+                depth + 1,
+            )?
+        } else if let Some(rel) = child
+            .field_name
+            .strip_suffix("_aggregate")
+            .and_then(relationship)
+        {
+            compile_relationship_aggregate_subquery(
+                scan,
+                alias,
+                rel,
+                child,
+                binds,
+                bytes_paths,
+                tables,
+                &path(&child.response_key),
+                depth + 1,
+            )?
+        } else {
+            return Err(format!(
+                "internal: selection reached unknown field `{}` on `{}`",
+                child.field_name, schema.model_name
+            ));
+        };
+        validate_response_key(&child.response_key)?;
+        pairs.push((
+            child.response_key.clone(),
+            inner.dialect.ops().nested_json(sub),
+        ));
+        evidence_fields.push(QueryEvidenceFieldPlan {
+            storage_key: child.response_key.clone(),
+            response_key: child.response_key.clone(),
+            node: Box::new(evidence),
+        });
     }
 
     Ok((
@@ -1019,9 +913,7 @@ pub(super) fn compile_object_projection(
 }
 
 pub(super) fn compile_record_evidence_projection(
-    dialect: SqlDialect,
-    schema: &TableSchema,
-    perm: &ReadPermission,
+    scan: ModelScan<'_>,
     alias: &str,
     binds: &mut Vec<BindValue>,
     bytes_paths: &mut Vec<String>,
@@ -1031,10 +923,28 @@ pub(super) fn compile_record_evidence_projection(
     // Do not manufacture per-record evidence that the client cannot address;
     // table/projector dependencies still flow through `tables_touched` and
     // produce conservative index evidence.
-    if !has_client_normalized_identity(schema, perm) {
+    if !scan.has_client_normalized_identity() {
         return Ok((Vec::new(), None));
     }
+    record_identity_projection(
+        scan.inner.dialect,
+        scan.schema,
+        alias,
+        binds,
+        bytes_paths,
+        path_prefix,
+    )
+}
 
+/// The hidden primary-key copy that names one row in causal evidence.
+pub(super) fn record_identity_projection(
+    dialect: SqlDialect,
+    schema: &TableSchema,
+    alias: &str,
+    binds: &mut Vec<BindValue>,
+    bytes_paths: &mut Vec<String>,
+    path_prefix: &str,
+) -> Result<RecordEvidenceProjection, String> {
     let mut pairs = Vec::with_capacity(schema.primary_key.columns.len());
     let mut key_fields = Vec::with_capacity(schema.primary_key.columns.len());
 
@@ -1094,23 +1004,6 @@ pub(super) fn compile_record_evidence_projection(
             key_fields,
         }),
     ))
-}
-
-fn has_client_normalized_identity(schema: &TableSchema, perm: &ReadPermission) -> bool {
-    !schema.primary_key.columns.is_empty()
-        && schema.primary_key.columns.iter().all(|key| {
-            schema
-                .columns
-                .iter()
-                .find(|column| column.column_name == *key)
-                .is_some_and(|column| {
-                    !column.skipped
-                        && !column.nullable
-                        && perm.allows_column(key)
-                        && scalar_type_name(&column.column_type)
-                            .is_some_and(|scalar| scalar != "BigInt")
-                })
-        })
 }
 
 pub(super) fn column_json_expr(
@@ -1185,81 +1078,6 @@ pub(super) fn chunked_json_object(dialect: SqlDialect, pairs: &[(String, String)
     }
 }
 
-pub(super) fn compile_order_by(
-    schema: &TableSchema,
-    order_arg: Option<&Value>,
-    alias: &str,
-    perm: &ReadPermission,
-    strict: bool,
-    dialect: SqlDialect,
-) -> Result<String, String> {
-    let mut parts = Vec::new();
-    if let Some(Value::List(items)) = order_arg {
-        for item in items {
-            if let Value::Object(map) = item {
-                if map.len() > 1 {
-                    return Err(
-                        "ambiguous order_by entry: use one field per list entry to declare priority"
-                            .into(),
-                    );
-                }
-                for (col, dir) in map {
-                    if !schema.columns.iter().any(|c| c.column_name == *col) {
-                        if strict {
-                            return Err(format!("unknown order_by column `{col}`"));
-                        }
-                        continue;
-                    }
-                    if !perm.allows_column(col) {
-                        if strict {
-                            return Err(format!("ungranted order_by column `{col}`"));
-                        }
-                        continue;
-                    }
-                    let dir_s = match dir {
-                        Value::Enum(e) => e.as_str(),
-                        Value::String(s) => s.as_str(),
-                        _ => "asc",
-                    };
-                    let sql_dir = match dir_s {
-                        "desc" | "desc_nulls_first" | "desc_nulls_last" => "DESC",
-                        _ => "ASC",
-                    };
-                    let nulls = match dir_s {
-                        "asc_nulls_first" | "desc_nulls_first" => " NULLS FIRST",
-                        "asc_nulls_last" | "desc_nulls_last" => " NULLS LAST",
-                        _ => "",
-                    };
-                    let collation = schema
-                        .columns
-                        .iter()
-                        .find(|column| column.column_name == *col)
-                        .filter(|column| column.column_type == ColumnType::Text)
-                        .map(|_| format!(" COLLATE {}", dialect.ops().binary_collation))
-                        .unwrap_or_default();
-                    parts.push(format!("{alias}.\"{col}\"{collation} {sql_dir}{nulls}"));
-                }
-            }
-        }
-    }
-    // Always append PK asc tiebreaker.
-    for pk in &schema.primary_key.columns {
-        let collation = schema
-            .columns
-            .iter()
-            .find(|column| column.column_name == *pk)
-            .filter(|column| column.column_type == ColumnType::Text)
-            .map(|_| format!(" COLLATE {}", dialect.ops().binary_collation))
-            .unwrap_or_default();
-        parts.push(format!("{alias}.\"{pk}\"{collation} ASC"));
-    }
-    if parts.is_empty() {
-        Ok(String::new())
-    } else {
-        Ok(format!("ORDER BY {}", parts.join(", ")))
-    }
-}
-
 /// Walk async-graphql selection field into our SelectionNode tree.
 pub fn selection_from_field(field: async_graphql::SelectionField<'_>) -> SelectionNode {
     let mut args = BTreeMap::new();
@@ -1280,40 +1098,9 @@ pub fn selection_from_field(field: async_graphql::SelectionField<'_>) -> Selecti
     }
 }
 
-/// Helper for pure unit tests without an engine.
-#[allow(dead_code)]
-pub fn compile_list_sql_for_test(
-    dialect: SqlDialect,
-    schema: &TableSchema,
-    where_sql: &str,
-    limit: u64,
-) -> String {
-    let ops = dialect.ops();
-    let json_agg = ops.json_agg;
-    let coalesce_empty = ops.empty_array;
-    let build = ops.build_object;
-    let pairs: Vec<String> = schema
-        .columns
-        .iter()
-        .filter(|c| !c.skipped)
-        .map(|c| format!("'{}', t0.\"{}\"", c.column_name, c.column_name))
-        .collect();
-    format!(
-        "SELECT coalesce({json_agg}(root), {coalesce_empty}) FROM (\n  SELECT {build}({}) AS root\n  FROM \"{}\" t0\n  WHERE {where_sql}\n  ORDER BY {}\n  LIMIT {limit} OFFSET 0\n) sub",
-        pairs.join(", "),
-        schema.table_name,
-        schema
-            .primary_key
-            .columns
-            .iter()
-            .map(|c| format!("t0.\"{c}\" ASC"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-}
-
 #[cfg(test)]
 mod security_tests {
+    use super::super::scan::resolve_limit;
     use super::*;
     use crate::graphql::naming::is_valid_graphql_name;
 
@@ -1350,135 +1137,5 @@ mod security_tests {
     fn resolve_limit_ignores_negative_values() {
         assert_eq!(resolve_limit(Some(&Value::from(-1)), None, 100, 1000), 100);
         assert_eq!(value_as_u64(&Value::from(-1)), None);
-    }
-}
-
-#[cfg(test)]
-mod strict_order_by_tests {
-    use super::*;
-    use crate::graphql::permissions::read;
-    use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
-    use async_graphql::indexmap::IndexMap;
-    use async_graphql::Value as GqlValue;
-
-    fn item_schema() -> TableSchema {
-        TableSchema {
-            model_name: "Item".into(),
-            table_name: "items".into(),
-            columns: vec![
-                TableColumn {
-                    primary_key: true,
-                    ..TableColumn::new("id", "id", ColumnType::Text)
-                },
-                TableColumn::new("name", "name", ColumnType::Text),
-                TableColumn::new("secret", "secret", ColumnType::Text),
-            ],
-            primary_key: PrimaryKey::new(["id"]),
-            version_column: None,
-            foreign_keys: Vec::new(),
-            indexes: Vec::new(),
-            relationships: Vec::new(),
-            kind: TableKind::ReadModel,
-        }
-    }
-
-    fn order_list(entries: Vec<(&str, &str)>) -> GqlValue {
-        let mut items = Vec::new();
-        for (col, dir) in entries {
-            let mut map = IndexMap::new();
-            map.insert(
-                async_graphql::Name::new(col),
-                GqlValue::Enum(async_graphql::Name::new(dir)),
-            );
-            items.push(GqlValue::Object(map));
-        }
-        GqlValue::List(items)
-    }
-
-    #[test]
-    fn strict_rejects_unknown_order_column() {
-        let schema = item_schema();
-        let perm = read().all_columns();
-        let arg = order_list(vec![("nope", "asc")]);
-        let err = compile_order_by(&schema, Some(&arg), "t0", &perm, true, SqlDialect::Sqlite)
-            .unwrap_err();
-        assert!(err.contains("unknown order_by"), "{err}");
-    }
-
-    #[test]
-    fn strict_rejects_ungranted_order_column() {
-        let schema = item_schema();
-        let perm = read().columns(["id", "name"]);
-        let arg = order_list(vec![("secret", "asc")]);
-        let err = compile_order_by(&schema, Some(&arg), "t0", &perm, true, SqlDialect::Sqlite)
-            .unwrap_err();
-        assert!(err.contains("ungranted order_by"), "{err}");
-    }
-
-    #[test]
-    fn soft_skip_ignores_unknown_and_ungranted_order() {
-        let schema = item_schema();
-        let perm = read().columns(["id", "name"]);
-        let arg = order_list(vec![("secret", "asc"), ("nope", "desc"), ("name", "desc")]);
-        let sql =
-            compile_order_by(&schema, Some(&arg), "t0", &perm, false, SqlDialect::Sqlite).unwrap();
-        assert!(sql.contains(r#"t0."name" COLLATE BINARY DESC"#), "{sql}");
-        assert!(!sql.contains("secret"), "{sql}");
-        assert!(!sql.contains("nope"), "{sql}");
-        assert!(
-            sql.contains(r#"t0."id" COLLATE BINARY ASC"#),
-            "pk tiebreak: {sql}"
-        );
-    }
-
-    #[test]
-    fn strict_accepts_granted_order_with_pk_tiebreak() {
-        let schema = item_schema();
-        let perm = read().all_columns();
-        let arg = order_list(vec![("name", "desc")]);
-        let sql =
-            compile_order_by(&schema, Some(&arg), "t0", &perm, true, SqlDialect::Sqlite).unwrap();
-        assert!(sql.contains(r#"t0."name" COLLATE BINARY DESC"#), "{sql}");
-        assert!(sql.contains(r#"t0."id" COLLATE BINARY ASC"#), "{sql}");
-    }
-
-    #[test]
-    fn multi_field_order_object_is_rejected_even_in_soft_mode() {
-        let schema = item_schema();
-        let perm = read().all_columns();
-        let mut entry = IndexMap::new();
-        entry.insert(
-            async_graphql::Name::new("name"),
-            GqlValue::Enum(async_graphql::Name::new("desc")),
-        );
-        entry.insert(
-            async_graphql::Name::new("id"),
-            GqlValue::Enum(async_graphql::Name::new("asc")),
-        );
-        let arg = GqlValue::List(vec![GqlValue::Object(entry)]);
-
-        let error = compile_order_by(&schema, Some(&arg), "t0", &perm, false, SqlDialect::Sqlite)
-            .unwrap_err();
-        assert!(error.contains("ambiguous order_by"), "{error}");
-        assert!(error.contains("one field per list entry"), "{error}");
-    }
-
-    #[test]
-    fn separate_order_entries_preserve_declared_priority() {
-        let schema = item_schema();
-        let perm = read().all_columns();
-        let arg = order_list(vec![("name", "desc"), ("secret", "asc")]);
-
-        let sql =
-            compile_order_by(&schema, Some(&arg), "t0", &perm, true, SqlDialect::Postgres).unwrap();
-        assert!(sql.contains(r#"t0."name" COLLATE "C" DESC"#), "{sql}");
-        assert!(sql.contains(r#"t0."secret" COLLATE "C" ASC"#), "{sql}");
-        let name_position = sql
-            .find(r#"t0."name" COLLATE "C" DESC"#)
-            .expect("name ordering");
-        let secret_position = sql
-            .find(r#"t0."secret" COLLATE "C" ASC"#)
-            .expect("secret ordering");
-        assert!(name_position < secret_position, "{sql}");
     }
 }

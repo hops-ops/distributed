@@ -31,19 +31,16 @@ pub use sdl::{
     graphql_sdl_from_surface, SdlOptions,
 };
 pub use surface::{
-    build_surface, role_grants_for_role, surface_for_application, surface_for_application_contract,
-    surface_for_role, RoleGrant, RootField, RootKind, Surface, SurfaceArgument,
-    SurfaceArgumentKind, SurfaceCommand, SurfaceCommandShape, SurfaceDialect,
-    SurfaceDirectProjection, SurfaceModel, SurfaceModeledProjection, SurfaceOptions,
-    SurfaceProjectionOwner, SurfaceProjector, SurfaceRelationshipAggregate,
-    SurfaceRelationshipKeys, SurfaceRowPolicy, SurfaceTypeDef, SurfaceTypeField,
+    build_surface, surface_for_application, surface_for_application_contract, surface_for_role,
+    RootField, RootKind, Surface, SurfaceArgument, SurfaceArgumentKind, SurfaceCommand,
+    SurfaceCommandShape, SurfaceDialect, SurfaceDirectProjection, SurfaceModel,
+    SurfaceModeledProjection, SurfaceOptions, SurfaceProjectionOwner, SurfaceProjector,
+    SurfaceRelationshipAggregate, SurfaceRelationshipKeys, SurfaceRowPolicy, SurfaceTypeDef,
+    SurfaceTypeField,
 };
 
 pub use filter::{claim, col, lit, rel, ClaimRef, ColRef, FilterExpr, LitValue, Operand};
-pub use permissions::{
-    read, role_grant_from_read_permission, role_grants_from_model_role_perms, ModelPermissions,
-    ReadPermission,
-};
+pub use permissions::{read, ModelPermissions, ReadPermission};
 
 #[cfg(feature = "graphql")]
 mod compile;

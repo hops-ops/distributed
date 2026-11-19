@@ -22,14 +22,14 @@ mod evidence;
 mod filter;
 mod projection;
 mod relationship;
+mod scan;
 
 pub use binds::BindValue;
 #[allow(unused_imports)]
 pub use dialect::{DialectOps, SqlDialect};
 #[allow(unused_imports)]
 pub use projection::{
-    compile_list_sql_for_test, compile_query, compile_root, selection_from_field, QueryPlan,
-    RootKind, SelectionNode, SqlPlan,
+    compile_query, compile_root, selection_from_field, QueryPlan, RootKind, SelectionNode, SqlPlan,
 };
 
 #[allow(unused_imports)]
