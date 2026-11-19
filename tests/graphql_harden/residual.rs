@@ -115,8 +115,8 @@ pub async fn a12_rel_where_without_target_grant_is_unknown_field(db: Db) {
     );
 }
 
-/// S9 / E6: PG JSON ops on SQLite → BAD_REQUEST / invalid filter, no SQL leak.
-pub async fn s9_json_contains_on_sqlite_is_bad_request_without_sql_leak(db: Db) {
+/// S9 / E6: a JSON operator on a text column is rejected on both dialects, no SQL leak.
+pub async fn s9_json_contains_on_a_text_column_is_rejected_without_sql_leak(db: Db) {
     let pool = seed_orders(&db).await;
     // note is a String column; _contains still hits client op path if typed as object
     // Use a Json column if available — OrderView note is Text. Build engine with all columns
@@ -130,7 +130,7 @@ pub async fn s9_json_contains_on_sqlite_is_bad_request_without_sql_leak(db: Db) 
             Request::new(r#"{ orders(where: { note: { _contains: { a: 1 } } }) { order_id } }"#),
         )
         .await;
-    assert!(!resp.errors.is_empty(), "sqlite must reject _contains");
+    assert!(!resp.errors.is_empty(), "_contains on a text column must be rejected");
     assert_no_sql_leak(&resp);
     let msgs = error_messages(&resp);
     // sanitize → invalid filter or bad request — never raw SQL operators in client message

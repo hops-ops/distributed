@@ -5,19 +5,83 @@
 #![allow(dead_code)] // each including target uses a subset
 
 use async_graphql::Request;
-use distributed::graphql::{read, GraphqlEngine, GraphqlPoolSource, ModelPermissions};
+use distributed::graphql::{read, GraphqlEngine, GraphqlPool, GraphqlPoolSource, ModelPermissions};
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
+use distributed::projection_protocol::ProjectionChangeRetention;
 use distributed::read_model::ReadModelWritePlanBuilder;
-use distributed::{ReadModel, RelationalReadModel, SqliteRepository, TableSchemaRegistry};
+use distributed::{
+    ReadModel, ReadModelChange, RelationalReadModel, SqliteRepository, TableSchemaRegistry,
+};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "postgres")]
 #[path = "postgres.rs"]
 mod postgres;
 
+/// Run `$body` with `$repository` bound to the concrete repository in `$db`.
+macro_rules! with_repository {
+    ($db:expr, $repository:ident => $body:expr) => {
+        match $db {
+            Db::Sqlite($repository) => $body,
+            #[cfg(feature = "postgres")]
+            Db::Postgres($repository) => $body,
+        }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use with_repository;
+
+/// One case list, instantiated per dialect as `sqlite::<case>` and
+/// `postgres::<case>`. A case is an `async fn(Db)`; `module::{..}` groups
+/// name cases in `crate::module`, bare names are cases at the crate root.
+macro_rules! on_each_dialect {
+    (@cases $($(#[$meta:meta])* $case:ident),* $(,)?) => {
+        $($(#[$meta])*
+        #[tokio::test]
+        async fn $case() {
+            let Some(db) = super::db(stringify!($case)).await else {
+                return;
+            };
+            scenarios::$case(db).await;
+        })*
+    };
+    (@dialect $($module:ident::{ $($cases:tt)* })* ; $($root:tt)*) => {
+        $(mod $module {
+            #[allow(unused_imports)]
+            use super::db;
+            use crate::$module as scenarios;
+            $crate::common::on_each_dialect!(@cases $($cases)*);
+        })*
+        #[allow(unused_imports)]
+        mod root {
+            use super::db;
+            use crate as scenarios;
+            $crate::common::on_each_dialect!(@cases $($root)*);
+        }
+    };
+    ($($module:ident::{ $($cases:tt)* })* $(; $($root:tt)*)?) => {
+        mod sqlite {
+            async fn db(_case: &str) -> Option<$crate::common::Db> {
+                Some($crate::common::Db::sqlite().await)
+            }
+            $crate::common::on_each_dialect!(@dialect $($module::{ $($cases)* })* ; $($($root)*)?);
+        }
+
+        #[cfg(feature = "postgres")]
+        mod postgres {
+            async fn db(case: &str) -> Option<$crate::common::Db> {
+                $crate::common::Db::postgres(case).await
+            }
+            $crate::common::on_each_dialect!(@dialect $($module::{ $($cases)* })* ; $($($root)*)?);
+        }
+    };
+}
+pub(crate) use on_each_dialect;
+
 /// The database a GraphQL scenario runs against. Scenarios take a `Db` and
 /// are instantiated once per dialect, so they prove the same behaviour on
 /// SQLite and Postgres.
+#[derive(Clone)]
 pub enum Db {
     Sqlite(SqliteRepository),
     #[cfg(feature = "postgres")]
@@ -52,25 +116,71 @@ impl Db {
 
     /// What `GraphqlEngine::builder` and `from_schema_catalog` read from.
     pub fn pool(&self) -> GraphqlPoolSource {
-        match self {
-            Db::Sqlite(repository) => repository.into(),
-            #[cfg(feature = "postgres")]
-            Db::Postgres(repository) => repository.into(),
-        }
+        with_repository!(self, repository => repository.into())
     }
 
-    /// Raw SQL for fault injection (dropping a table, holding a lock); rows
-    /// and tables come from [`Db::seed`].
-    pub async fn execute(&self, sql: &'static str) {
+    pub fn graphql_pool(&self) -> GraphqlPool {
+        with_repository!(self, repository => repository.pool().clone().into())
+    }
+
+    pub fn read_model_changes(&self) -> tokio::sync::broadcast::Receiver<ReadModelChange> {
+        with_repository!(self, repository => repository.read_model_changes())
+    }
+
+    pub fn publish_read_model_change(&self, change: ReadModelChange) {
+        with_repository!(self, repository => repository.publish_read_model_change(change))
+    }
+
+    pub fn with_projection_change_retention(self, retention: ProjectionChangeRetention) -> Self {
         match self {
             Db::Sqlite(repository) => {
-                sqlx::query(sql).execute(repository.pool()).await.expect(sql);
+                Db::Sqlite(repository.with_projection_change_retention(retention))
             }
             #[cfg(feature = "postgres")]
             Db::Postgres(repository) => {
-                sqlx::query(sql).execute(repository.pool()).await.expect(sql);
+                Db::Postgres(repository.with_projection_change_retention(retention))
             }
         }
+    }
+
+    /// Create the tables `registry` declares.
+    pub async fn bootstrap(&self, registry: &TableSchemaRegistry) {
+        with_repository!(self, repository => {
+            repository
+                .bootstrap_table_schema_for_dev(registry)
+                .await
+                .expect("bootstrap read-model tables");
+        })
+    }
+
+    /// Raw SQL for fault injection and for standing in for an external
+    /// writer; fixture rows and tables come from [`Db::seed`].
+    pub async fn execute(&self, sql: impl Into<String>) {
+        let sql = sql.into();
+        with_repository!(self, repository => {
+            sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .execute(repository.pool())
+                .await
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        })
+    }
+
+    /// Run `sql` in a transaction that is rolled back.
+    pub async fn execute_rolled_back(&self, sql: &'static str) {
+        with_repository!(self, repository => {
+            let mut transaction = repository.pool().begin().await.expect("begin");
+            sqlx::query(sql).execute(&mut *transaction).await.expect(sql);
+            transaction.rollback().await.expect("rollback");
+        })
+    }
+
+    pub async fn scalar_i64(&self, sql: &'static str) -> i64 {
+        with_repository!(self, repository => {
+            sqlx::query_scalar(sql)
+                .fetch_one(repository.pool())
+                .await
+                .expect(sql)
+        })
     }
 
     /// Create `M`'s table from its read-model declaration and write `rows`
@@ -79,27 +189,19 @@ impl Db {
     pub async fn seed<M: RelationalReadModel>(&self, rows: impl IntoIterator<Item = M>) {
         let mut registry = TableSchemaRegistry::new();
         registry.register::<M>().expect("read-model schema");
+        self.bootstrap(&registry).await;
         let mut plan = ReadModelWritePlanBuilder::new();
+        let mut staged = false;
         for row in rows {
             plan.upsert(&row).expect("read-model row");
+            staged = true;
         }
-        match self {
-            Db::Sqlite(repository) => {
-                repository
-                    .bootstrap_table_schema_for_dev(&registry)
-                    .await
-                    .expect("bootstrap read-model table");
-                plan.commit(repository).await.expect("seed read-model rows");
-            }
-            #[cfg(feature = "postgres")]
-            Db::Postgres(repository) => {
-                repository
-                    .bootstrap_table_schema_for_dev(&registry)
-                    .await
-                    .expect("bootstrap read-model table");
-                plan.commit(repository).await.expect("seed read-model rows");
-            }
+        if !staged {
+            return;
         }
+        with_repository!(self, repository => {
+            plan.commit(repository).await.expect("seed read-model rows");
+        })
     }
 }
 

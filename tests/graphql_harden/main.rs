@@ -32,33 +32,7 @@ mod residual;
 mod softskip;
 mod transport;
 
-/// One case list, instantiated per dialect as `sqlite::<module>::<case>` and
-/// `postgres::<module>::<case>`.
-macro_rules! on_each_dialect {
-    ($($module:ident::{ $($case:ident),* $(,)? })*) => {
-        mod sqlite {
-            $(mod $module {
-                $(#[tokio::test]
-                async fn $case() {
-                    crate::$module::$case(crate::common::Db::sqlite().await).await;
-                })*
-            })*
-        }
-
-        #[cfg(feature = "postgres")]
-        mod postgres {
-            $(mod $module {
-                $(#[tokio::test]
-                async fn $case() {
-                    let Some(db) = crate::common::Db::postgres(stringify!($case)).await else {
-                        return;
-                    };
-                    crate::$module::$case(db).await;
-                })*
-            })*
-        }
-    };
-}
+use common::on_each_dialect;
 
 on_each_dialect! {
     access_paths::{
@@ -105,7 +79,7 @@ on_each_dialect! {
     residual::{
         a8_nested_has_many_without_child_grant_is_unknown_field,
         a12_rel_where_without_target_grant_is_unknown_field,
-        s9_json_contains_on_sqlite_is_bad_request_without_sql_leak,
+        s9_json_contains_on_a_text_column_is_rejected_without_sql_leak,
         e4_missing_claim_header_is_stable_without_sql_leak,
     }
     softskip::{
