@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_graphql::Request;
-use common::{on_each_dialect, with_repository, Db};
 use base64::Engine as _;
+use common::{on_each_dialect, with_repository, Db};
 use distributed::bus::{Bus, InMemoryBus, Message, MessageKind, RunOptions};
 use distributed::graphql::{
     col, read, GraphqlEngine, ModelNormalization, ModelPermissions, SurfaceProjector,
@@ -173,12 +173,7 @@ fn embedded_projection_service(repository: &Db, bus: &InMemoryBus) -> Service {
     })
 }
 
-async fn project_item(
-    repository: &Db,
-    bus: &InMemoryBus,
-    sequence: u64,
-    title: &str,
-) {
+async fn project_item(repository: &Db, bus: &InMemoryBus, sequence: u64, title: &str) {
     project_item_with_id(repository, bus, sequence, ROW_ID, title).await;
 }
 
@@ -217,12 +212,7 @@ async fn delete_item(repository: &Db, bus: &InMemoryBus, sequence: u64) {
     delete_item_with_id(repository, bus, sequence, ROW_ID).await;
 }
 
-async fn delete_item_with_id(
-    repository: &Db,
-    bus: &InMemoryBus,
-    sequence: u64,
-    id: &str,
-) {
+async fn delete_item_with_id(repository: &Db, bus: &InMemoryBus, sequence: u64, id: &str) {
     bus.publish_message(
         Message::new(
             FACT_NAME,
@@ -248,12 +238,7 @@ async fn delete_item_with_id(
         .expect("delete query protocol row");
 }
 
-async fn recreate_item(
-    repository: &Db,
-    bus: &InMemoryBus,
-    sequence: u64,
-    title: &str,
-) {
+async fn recreate_item(repository: &Db, bus: &InMemoryBus, sequence: u64, title: &str) {
     bus.publish_message(
         Message::new(
             FACT_NAME,
@@ -1967,7 +1952,10 @@ pub async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql(
         );
         // No invalidation feed is connected: transactional dependency validation
         // must still discover a supported external SQL producer's update.
-        fixture.repository.execute("UPDATE causal_query_views SET title=title || '-external'").await;
+        fixture
+            .repository
+            .execute("UPDATE causal_query_views SET title=title || '-external'")
+            .await;
         let changed = run(document).await.1;
         assert_ne!(changed["data"], first["data"]);
         assert_eq!(store.metrics().result_executions, hit.result_executions + 1);
@@ -2019,7 +2007,10 @@ pub async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql(
         run(filtered).await;
         run(count).await;
         assert_eq!(store.metrics().result_executions, filled.result_executions);
-        fixture.repository.execute("UPDATE causal_query_views SET title='matching'").await;
+        fixture
+            .repository
+            .execute("UPDATE causal_query_views SET title='matching'")
+            .await;
         assert_eq!(
             run(filtered).await.1["data"]["causal_query_views"][0]["title"],
             "matching"

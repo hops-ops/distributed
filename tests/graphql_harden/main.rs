@@ -17,6 +17,8 @@
 //! | `transport` | T* introspection HTTP, mutation grants, GraphiQL policy |
 //! | `softskip` | Fail-closed where/order contracts (strict_where default) |
 //! | `residual` | A8/A12/S9/E4 residual post-quality-1 review |
+//! | `json_columns` | A `Json` column is JSON, not a string, on every read path |
+//! | `text_patterns` | `_like` / `_ilike` / `_icontains` mean the same on both dialects |
 //! | `dialect` | Dialect-honest comparison ops (no PG JSON ops on SQLite) |
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
@@ -28,8 +30,10 @@ mod dialect;
 mod dos;
 mod errors;
 mod inject;
+mod json_columns;
 mod residual;
 mod softskip;
+mod text_patterns;
 mod transport;
 
 use common::on_each_dialect;
@@ -76,6 +80,10 @@ on_each_dialect! {
         s6_pk_type_confusion_does_not_leak_sql,
         s2_denied_where_column_fails_closed,
     }
+    json_columns::{
+        json_columns_are_json_on_every_read_path,
+        json_column_in_a_wide_row_is_json,
+    }
     residual::{
         a8_nested_has_many_without_child_grant_is_unknown_field,
         a12_rel_where_without_target_grant_is_unknown_field,
@@ -89,5 +97,10 @@ on_each_dialect! {
         strict_junk_order_by_column_errors,
         strict_valid_where_and_order_still_work,
         soft_skip_mode_is_opt_in_only,
+    }
+    text_patterns::{
+        string_operators_match_the_same_rows_on_every_dialect,
+        row_policy_patterns_match_the_same_rows_on_every_dialect,
+        pattern_ending_in_its_escape_is_a_bad_request,
     }
 }

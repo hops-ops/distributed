@@ -6,8 +6,8 @@ use async_graphql::Request;
 use distributed::{
     graphql::{col, read, rel, GraphqlEngine, GraphqlPoolSource, ModelPermissions},
     microsvc::Session,
-    ColumnType, ForeignKey, PrimaryKey, ReadModel, RelationalReadModel, RelationshipDef, RelationshipKind, TableColumn,
-    TableKind, TableSchema, ROLE_KEY, USER_ID_KEY,
+    ColumnType, ForeignKey, PrimaryKey, ReadModel, RelationalReadModel, RelationshipDef,
+    RelationshipKind, TableColumn, TableKind, TableSchema, ROLE_KEY, USER_ID_KEY,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -36,8 +36,13 @@ struct BoxedProfile {
 #[tokio::test]
 async fn boxed_singular_cycles_preserve_nested_graphql_permissions() {
     let db = Db::sqlite().await;
-    db.table(BoxedAccount::schema(), json!([["a"], ["b"]])).await;
-    db.table(BoxedProfile::schema(), json!([["a", "alice"], ["b", "bob"]])).await;
+    db.table(BoxedAccount::schema(), json!([["a"], ["b"]]))
+        .await;
+    db.table(
+        BoxedProfile::schema(),
+        json!([["a", "alice"], ["b", "bob"]]),
+    )
+    .await;
     let pool = db.pool();
     let engine = GraphqlEngine::builder(pool)
         .model::<BoxedAccount>(ModelPermissions::new().grant("user", read().all_columns()))
@@ -209,8 +214,13 @@ async fn m2m_permission_filter_resolves_through_field_names_to_columns() {
     let links = m2m_link_schema();
     db.create_tables([M2mPlayer::schema(), M2mWeapon::schema(), &links])
         .await;
-    db.rows(M2mPlayer::schema(), json!([["p1", "Ada"], ["p2", "Grace"]])).await;
-    db.rows(M2mWeapon::schema(), json!([["w1", "Compiler"], ["w2", "Debugger"]])).await;
+    db.rows(M2mPlayer::schema(), json!([["p1", "Ada"], ["p2", "Grace"]]))
+        .await;
+    db.rows(
+        M2mWeapon::schema(),
+        json!([["w1", "Compiler"], ["w2", "Debugger"]]),
+    )
+    .await;
     db.rows(&links, json!([["p1", "w1"], ["p2", "w2"]])).await;
     let pool = db.pool();
 
@@ -248,9 +258,21 @@ async fn m2m_client_where_relationship_predicate() {
     let links = m2m_link_schema();
     db.create_tables([M2mPlayer::schema(), M2mWeapon::schema(), &links])
         .await;
-    db.rows(M2mPlayer::schema(), json!([["p1", "Ada"], ["p2", "Grace"], ["p3", "Both"]])).await;
-    db.rows(M2mWeapon::schema(), json!([["w1", "Compiler"], ["w2", "Debugger"]])).await;
-    db.rows(&links, json!([["p1", "w1"], ["p2", "w2"], ["p3", "w1"], ["p3", "w2"]])).await;
+    db.rows(
+        M2mPlayer::schema(),
+        json!([["p1", "Ada"], ["p2", "Grace"], ["p3", "Both"]]),
+    )
+    .await;
+    db.rows(
+        M2mWeapon::schema(),
+        json!([["w1", "Compiler"], ["w2", "Debugger"]]),
+    )
+    .await;
+    db.rows(
+        &links,
+        json!([["p1", "w1"], ["p2", "w2"], ["p3", "w1"], ["p3", "w2"]]),
+    )
+    .await;
     let pool = db.pool();
 
     let engine = GraphqlEngine::builder(pool)
@@ -335,8 +357,13 @@ fn child_schema() -> TableSchema {
 #[tokio::test]
 async fn sqlite_binds_follow_projection_then_where_order_for_relationships() {
     let db = Db::sqlite().await;
-    db.table(&parent_schema(), json!([["p1", "P"], ["p2", "Other"]])).await;
-    db.table(&child_schema(), json!([["c1", "p1", "C1"], ["c2", "p1", "C2"], ["c3", "p2", "C2"]])).await;
+    db.table(&parent_schema(), json!([["p1", "P"], ["p2", "Other"]]))
+        .await;
+    db.table(
+        &child_schema(),
+        json!([["c1", "p1", "C1"], ["c2", "p1", "C2"], ["c3", "p2", "C2"]]),
+    )
+    .await;
     let pool = db.pool();
 
     let manifest = distributed::ReadModelCatalog::new("rel")
@@ -536,7 +563,8 @@ fn post_schema() -> TableSchema {
 async fn belongs_to_joins_source_fk_to_target_primary_key() {
     let db = Db::sqlite().await;
     db.table(&author_schema(), json!([["a1", "Ada"]])).await;
-    db.table(&post_schema(), json!([["p1", "a1", "GraphQL"]])).await;
+    db.table(&post_schema(), json!([["p1", "a1", "GraphQL"]]))
+        .await;
     let pool = db.pool();
 
     let manifest = distributed::ReadModelCatalog::new("posts")
@@ -666,7 +694,8 @@ async fn gateway_dependency_inventory_includes_empty_relationship_filters() {
     db.create_tables([M2mPlayer::schema(), M2mWeapon::schema(), &links])
         .await;
     db.rows(M2mPlayer::schema(), json!([["p1", "Ada"]])).await;
-    db.rows(M2mWeapon::schema(), json!([["w1", "Compiler"]])).await;
+    db.rows(M2mWeapon::schema(), json!([["w1", "Compiler"]]))
+        .await;
     db.rows(&links, json!([])).await;
     let pool = db.pool();
     let store = GatewayVersionStore::install(

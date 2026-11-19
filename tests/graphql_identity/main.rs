@@ -481,10 +481,12 @@ struct IdItem {
 
 async fn engine_with_identity(identity: IdentityConfig) -> Arc<GraphqlEngine> {
     let db = Db::sqlite().await;
-    db.seed([("1", "user-a-001"), ("2", "other")].map(|(id, owner)| IdItem {
-        id: id.into(),
-        owner: owner.into(),
-    }))
+    db.seed(
+        [("1", "user-a-001"), ("2", "other")].map(|(id, owner)| IdItem {
+            id: id.into(),
+            owner: owner.into(),
+        }),
+    )
     .await;
     let pool = db.pool();
     let engine = GraphqlEngine::builder(pool)

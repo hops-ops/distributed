@@ -4,7 +4,7 @@ use async_graphql::Request;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 
 use super::common::{
-    Db, assert_no_sql_leak, engine_all_columns, exec_json, seed_orders, session, OrderView,
+    assert_no_sql_leak, engine_all_columns, exec_json, seed_orders, session, Db, OrderView,
 };
 
 /// S1: response keys are GraphQL Names; free-form injection cannot reach SQL keys.

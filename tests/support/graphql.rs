@@ -178,7 +178,7 @@ impl Db {
     }
 
     /// Insert `rows` into an existing table: a JSON array of arrays giving
-    /// scalar values in declared column order.
+    /// values in declared column order (objects and arrays bind as JSON).
     pub async fn rows(&self, schema: &TableSchema, rows: serde_json::Value) {
         let columns: Vec<&str> = schema
             .columns
@@ -218,7 +218,7 @@ impl Db {
                             query.bind(number.as_i64().expect("integer"))
                         }
                         serde_json::Value::Null => query.bind(None::<String>),
-                        other => panic!("unsupported fixture value {other}"),
+                        json => query.bind(sqlx::types::Json(json.clone())),
                     };
                 }
                 query
@@ -315,7 +315,13 @@ pub fn session(role: &str, user: &str) -> Session {
     s
 }
 
-pub fn order(order_id: &str, customer_id: &str, status: &str, total_cents: i64, note: &str) -> OrderView {
+pub fn order(
+    order_id: &str,
+    customer_id: &str,
+    status: &str,
+    total_cents: i64,
+    note: &str,
+) -> OrderView {
     OrderView {
         order_id: order_id.into(),
         customer_id: customer_id.into(),

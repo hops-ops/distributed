@@ -10,8 +10,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use base64::Engine as _;
 use distributed::graphql::{
     graphql_router, read, resolve_session, AuthError, GraphqlEngine, GraphqlPoolSource,
-    IdentityConfig, IdentityMode,
-    ModelPermissions, OidcConfig, OidcValidator, ValidationError,
+    IdentityConfig, IdentityMode, ModelPermissions, OidcConfig, OidcValidator, ValidationError,
 };
 use distributed::ReadModel;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};

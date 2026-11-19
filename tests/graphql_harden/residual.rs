@@ -5,8 +5,8 @@ use distributed::graphql::{claim, col, read, GraphqlEngine, ModelPermissions};
 use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
 
 use super::common::{
-    child, parent, Db, assert_no_sql_leak, engine_all_columns, error_messages, extension_code, seed_orders, session,
-    ChildView, OrderView, ParentView,
+    assert_no_sql_leak, child, engine_all_columns, error_messages, extension_code, parent,
+    seed_orders, session, ChildView, Db, OrderView, ParentView,
 };
 
 /// A8: nested has_many without grant on child model → relationship field absent.
@@ -130,7 +130,10 @@ pub async fn s9_json_contains_on_a_text_column_is_rejected_without_sql_leak(db: 
             Request::new(r#"{ orders(where: { note: { _contains: { a: 1 } } }) { order_id } }"#),
         )
         .await;
-    assert!(!resp.errors.is_empty(), "_contains on a text column must be rejected");
+    assert!(
+        !resp.errors.is_empty(),
+        "_contains on a text column must be rejected"
+    );
     assert_no_sql_leak(&resp);
     let msgs = error_messages(&resp);
     // sanitize → invalid filter or bad request — never raw SQL operators in client message

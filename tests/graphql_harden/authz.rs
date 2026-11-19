@@ -2,12 +2,12 @@
 //! Drives shipped `GraphqlEngine::execute`.
 
 use async_graphql::Request;
-use distributed::graphql::{GraphqlPoolSource, claim, col, read, GraphqlEngine, ModelPermissions};
+use distributed::graphql::{claim, col, read, GraphqlEngine, GraphqlPoolSource, ModelPermissions};
 use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
 
 use super::common::{
-    child, parent, Db, engine_all_columns, error_messages, exec_json, seed_orders, session, ChildView, OrderView,
-    ParentView,
+    child, engine_all_columns, error_messages, exec_json, parent, seed_orders, session, ChildView,
+    Db, OrderView, ParentView,
 };
 
 /// A1: claim row filter on list (existing harden case).
@@ -247,7 +247,8 @@ fn parent_child_engine(pool: GraphqlPoolSource) -> GraphqlEngine {
 
 async fn seed_parents_children(db: &Db) -> GraphqlPoolSource {
     db.seed([parent("p1", "P")]).await;
-    db.seed([child("c1", "p1", "C1"), child("c2", "p1", "C2")]).await;
+    db.seed([child("c1", "p1", "C1"), child("c2", "p1", "C2")])
+        .await;
     db.pool()
 }
 

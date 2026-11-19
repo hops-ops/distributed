@@ -7,8 +7,8 @@ use async_graphql::Request;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 
 use super::common::{
-    order, Db, assert_no_sql_leak, engine_all_columns, error_messages, extension_code, seed_orders, session,
-    OrderView,
+    assert_no_sql_leak, engine_all_columns, error_messages, extension_code, order, seed_orders,
+    session, Db, OrderView,
 };
 
 /// Compile errors must not leak SQL.
