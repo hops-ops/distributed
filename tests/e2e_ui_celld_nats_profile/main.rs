@@ -3,7 +3,6 @@
 //! Fixture checks always run (default host stays one-process). Live smoke
 //! runs only when `CELLD_URL` and `NATS_URL` are set.
 
-use distributed::graphql::IdentityConfig;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -285,7 +284,7 @@ mod live {
                 )),
         );
         let engine = GraphqlEngine::builder(pool)
-            .identity(IdentityConfig::dev_headers())
+            .identity(distributed::graphql::IdentityConfig::dev_headers())
             .protocol_token_key([0x5a; 32])
             .roles(&["user"])
             .model::<Todos>(ModelPermissions::new().grant("user", read().all_columns()))

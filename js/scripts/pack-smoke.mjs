@@ -409,7 +409,6 @@ assert.equal(result.data.health, 'ok');
 assert.deepEqual(Object.keys(rootSurface).sort(), [
   'DISTRIBUTED_PROTOCOL_VERSION',
   'DistributedProtocolError',
-  'applyWsDevHeaderParams',
   'authIdentityKey',
   'buildAuthHeaders',
   'compareDistributedDecimal',
