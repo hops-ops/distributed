@@ -1,10 +1,14 @@
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
+#[path = "../support/graphql.rs"]
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_graphql::Request;
 use base64::Engine as _;
+use common::{on_each_dialect, with_repository, Db};
 use distributed::bus::{Bus, InMemoryBus, Message, MessageKind, RunOptions};
 use distributed::graphql::{
     col, read, GraphqlEngine, ModelNormalization, ModelPermissions, SurfaceProjector,
@@ -13,7 +17,7 @@ use distributed::microsvc::{
     CausalProjectorContext, HandlerError, Routes, Service, Session, ROLE_KEY,
 };
 use distributed::projection_protocol::ProjectionChangeRetention;
-use distributed::{ReadModel, ReadModelCatalog, RelationalReadModel, SqliteRepository};
+use distributed::{ReadModel, RelationalReadModel};
 use futures_util::{stream::BoxStream, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -99,14 +103,15 @@ fn user_session() -> Session {
 }
 
 struct ProtocolFixture {
-    repository: SqliteRepository,
+    repository: Db,
     bus: InMemoryBus,
     engine: GraphqlEngine,
 }
 
-fn projection_service(repository: &SqliteRepository, bus: &InMemoryBus) -> Service {
+fn projection_service(repository: &Db, bus: &InMemoryBus) -> Service {
     let declaration = projector();
-    let routes = Routes::new()
+    with_repository!(repository, repository => {
+        let routes = Routes::new()
         .with_read_model_store(repository.clone())
         .causal_projector::<ItemChanged>(declaration)
         .model::<CausalQueryView>()
@@ -135,15 +140,17 @@ fn projection_service(repository: &SqliteRepository, bus: &InMemoryBus) -> Servi
                 Ok::<(), HandlerError>(())
             },
         );
-    Service::new()
-        .named(SERVICE_ID)
-        .routes(routes)
-        .with_bus(bus.clone())
+        Service::new()
+            .named(SERVICE_ID)
+            .routes(routes)
+            .with_bus(bus.clone())
+    })
 }
 
-fn embedded_projection_service(repository: &SqliteRepository, bus: &InMemoryBus) -> Service {
+fn embedded_projection_service(repository: &Db, bus: &InMemoryBus) -> Service {
     let declaration = embedded_projector();
-    let routes = Routes::new()
+    with_repository!(repository, repository => {
+        let routes = Routes::new()
         .with_read_model_store(repository.clone())
         .causal_projector::<EmbeddedItemChanged>(declaration)
         .model::<EmbeddedQueryView>()
@@ -159,23 +166,19 @@ fn embedded_projection_service(repository: &SqliteRepository, bus: &InMemoryBus)
                 Ok::<(), HandlerError>(())
             },
         );
-    Service::new()
-        .named(EMBEDDED_SERVICE_ID)
-        .routes(routes)
-        .with_bus(bus.clone())
+        Service::new()
+            .named(EMBEDDED_SERVICE_ID)
+            .routes(routes)
+            .with_bus(bus.clone())
+    })
 }
 
-async fn project_item(
-    repository: &SqliteRepository,
-    bus: &InMemoryBus,
-    sequence: u64,
-    title: &str,
-) {
+async fn project_item(repository: &Db, bus: &InMemoryBus, sequence: u64, title: &str) {
     project_item_with_id(repository, bus, sequence, ROW_ID, title).await;
 }
 
 async fn project_item_with_id(
-    repository: &SqliteRepository,
+    repository: &Db,
     bus: &InMemoryBus,
     sequence: u64,
     id: &str,
@@ -205,16 +208,11 @@ async fn project_item_with_id(
         .expect("project query protocol fact");
 }
 
-async fn delete_item(repository: &SqliteRepository, bus: &InMemoryBus, sequence: u64) {
+async fn delete_item(repository: &Db, bus: &InMemoryBus, sequence: u64) {
     delete_item_with_id(repository, bus, sequence, ROW_ID).await;
 }
 
-async fn delete_item_with_id(
-    repository: &SqliteRepository,
-    bus: &InMemoryBus,
-    sequence: u64,
-    id: &str,
-) {
+async fn delete_item_with_id(repository: &Db, bus: &InMemoryBus, sequence: u64, id: &str) {
     bus.publish_message(
         Message::new(
             FACT_NAME,
@@ -240,12 +238,7 @@ async fn delete_item_with_id(
         .expect("delete query protocol row");
 }
 
-async fn recreate_item(
-    repository: &SqliteRepository,
-    bus: &InMemoryBus,
-    sequence: u64,
-    title: &str,
-) {
+async fn recreate_item(repository: &Db, bus: &InMemoryBus, sequence: u64, title: &str) {
     bus.publish_message(
         Message::new(
             FACT_NAME,
@@ -271,42 +264,28 @@ async fn recreate_item(
         .expect("recreate query protocol row");
 }
 
-async fn protocol_fixture_with_rows() -> ProtocolFixture {
-    protocol_fixture_with_retention(1).await
+async fn protocol_fixture_with_rows(db: Db) -> ProtocolFixture {
+    protocol_fixture_with_retention(db, 1).await
 }
 
-async fn protocol_fixture_with_retention(retention: u64) -> ProtocolFixture {
-    let repository = SqliteRepository::connect_and_migrate("sqlite::memory:")
-        .await
-        .expect("migrated SQLite repository")
-        .with_projection_change_retention(
-            ProjectionChangeRetention::new(retention)
-                .expect("positive retained projection change count"),
-        );
-    let manifest = ReadModelCatalog::new(SERVICE_ID)
-        .read_model::<CausalQueryView>()
-        .read_model::<LegacyQueryView>();
+async fn protocol_fixture_with_retention(db: Db, retention: u64) -> ProtocolFixture {
+    let repository = db.with_projection_change_retention(
+        ProjectionChangeRetention::new(retention)
+            .expect("positive retained projection change count"),
+    );
+    repository.seed::<CausalQueryView>([]).await;
     repository
-        .bootstrap_table_schema_for_dev(
-            &manifest
-                .table_registry()
-                .expect("query protocol table registry"),
-        )
-        .await
-        .expect("query protocol read-model tables");
-
-    sqlx::query("INSERT INTO legacy_query_views (id, title) VALUES (?, ?)")
-        .bind(LEGACY_ROW_ID)
-        .bind("legacy row")
-        .execute(repository.pool())
-        .await
-        .expect("legacy row");
+        .seed([LegacyQueryView {
+            id: LEGACY_ROW_ID.into(),
+            title: "legacy row".into(),
+        }])
+        .await;
 
     let bus = InMemoryBus::new();
     let declaration = projector();
     project_item(&repository, &bus, 1, "causal row").await;
 
-    let engine = GraphqlEngine::builder(&repository)
+    let engine = GraphqlEngine::builder(repository.pool())
         .service_id(SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
@@ -325,8 +304,8 @@ async fn protocol_fixture_with_retention(retention: u64) -> ProtocolFixture {
     }
 }
 
-async fn protocol_engine_with_rows() -> GraphqlEngine {
-    protocol_fixture_with_rows().await.engine
+async fn protocol_engine_with_rows(db: Db) -> GraphqlEngine {
+    protocol_fixture_with_rows(db).await.engine
 }
 
 fn wire_response(response: async_graphql::Response) -> Value {
@@ -442,9 +421,8 @@ fn tamper_first_cursor_token(mut cursors: Value) -> Value {
     cursors
 }
 
-#[tokio::test]
-async fn projected_query_emits_exact_record_and_index_revisions_without_key_leaks() {
-    let engine = protocol_engine_with_rows().await;
+pub async fn projected_query_emits_exact_record_and_index_revisions_without_key_leaks(db: Db) {
+    let engine = protocol_engine_with_rows(db).await;
     let response = wire_response(
         engine
             .execute(
@@ -515,9 +493,8 @@ async fn projected_query_emits_exact_record_and_index_revisions_without_key_leak
     }
 }
 
-#[tokio::test]
-async fn count_only_aggregate_emits_no_unselected_node_record_evidence() {
-    let engine = protocol_engine_with_rows().await;
+pub async fn count_only_aggregate_emits_no_unselected_node_record_evidence(db: Db) {
+    let engine = protocol_engine_with_rows(db).await;
     let response = wire_response(
         engine
             .execute(
@@ -558,9 +535,8 @@ async fn count_only_aggregate_emits_no_unselected_node_record_evidence() {
     assert_eq!(snapshot["indexes"][0]["projection"], PROJECTOR_NAME);
 }
 
-#[tokio::test]
-async fn aggregate_node_aliases_drive_data_and_exact_record_paths() {
-    let engine = protocol_engine_with_rows().await;
+pub async fn aggregate_node_aliases_drive_data_and_exact_record_paths(db: Db) {
+    let engine = protocol_engine_with_rows(db).await;
     let response = wire_response(
         engine
             .execute(
@@ -600,20 +576,9 @@ async fn aggregate_node_aliases_drive_data_and_exact_record_paths() {
     assert_eq!(records[1]["model"], "CausalQueryView");
 }
 
-#[tokio::test]
-async fn embedded_models_emit_index_evidence_without_record_evidence() {
-    let repository = SqliteRepository::connect_and_migrate("sqlite::memory:")
-        .await
-        .expect("migrated embedded SQLite repository");
-    let manifest = ReadModelCatalog::new(EMBEDDED_SERVICE_ID).read_model::<EmbeddedQueryView>();
-    repository
-        .bootstrap_table_schema_for_dev(
-            &manifest
-                .table_registry()
-                .expect("embedded query protocol table registry"),
-        )
-        .await
-        .expect("embedded query protocol read-model table");
+pub async fn embedded_models_emit_index_evidence_without_record_evidence(db: Db) {
+    let repository = db;
+    repository.seed::<EmbeddedQueryView>([]).await;
 
     let bus = InMemoryBus::new();
     bus.publish_message(
@@ -639,7 +604,7 @@ async fn embedded_models_emit_index_evidence_without_record_evidence() {
         .await
         .expect("project embedded query protocol fact");
 
-    let engine = GraphqlEngine::builder(&repository)
+    let engine = GraphqlEngine::builder(repository.pool())
         .service_id(EMBEDDED_SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
@@ -687,9 +652,8 @@ async fn embedded_models_emit_index_evidence_without_record_evidence() {
     assert_eq!(snapshot["indexes"][0]["position"], "1");
 }
 
-#[tokio::test]
-async fn query_evidence_chunks_129_unique_rows_inside_one_snapshot() {
-    let fixture = protocol_fixture_with_retention(10).await;
+pub async fn query_evidence_chunks_129_unique_rows_inside_one_snapshot(db: Db) {
+    let fixture = protocol_fixture_with_retention(db, 10).await;
     for sequence in 2_u64..=129 {
         fixture
             .bus
@@ -741,9 +705,8 @@ async fn query_evidence_chunks_129_unique_rows_inside_one_snapshot() {
     assert_eq!(snapshot["records"].as_array().map(Vec::len), Some(129));
 }
 
-#[tokio::test]
-async fn matching_query_and_live_plans_share_snapshot_scope_not_operation_hash() {
-    let fixture = protocol_fixture_with_rows().await;
+pub async fn matching_query_and_live_plans_share_snapshot_scope_not_operation_hash(db: Db) {
+    let fixture = protocol_fixture_with_rows(db).await;
     let query = wire_response(
         fixture
             .engine
@@ -774,9 +737,8 @@ async fn matching_query_and_live_plans_share_snapshot_scope_not_operation_hash()
     );
 }
 
-#[tokio::test]
-async fn live_subscription_accepts_an_exact_resume_without_reset() {
-    let fixture = protocol_fixture_with_rows().await;
+pub async fn live_subscription_accepts_an_exact_resume_without_reset(db: Db) {
+    let fixture = protocol_fixture_with_rows(db).await;
     let mut initial_stream = fixture
         .engine
         .execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
@@ -798,9 +760,8 @@ async fn live_subscription_accepts_an_exact_resume_without_reset() {
     );
 }
 
-#[tokio::test]
-async fn live_subscription_tampering_and_wrong_scope_reset_without_errors() {
-    let fixture = protocol_fixture_with_rows().await;
+pub async fn live_subscription_tampering_and_wrong_scope_reset_without_errors(db: Db) {
+    let fixture = protocol_fixture_with_rows(db).await;
     let mut initial_stream = fixture
         .engine
         .execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
@@ -843,9 +804,8 @@ async fn live_subscription_tampering_and_wrong_scope_reset_without_errors() {
     );
 }
 
-#[tokio::test]
-async fn live_subscription_out_of_window_resume_resets_to_current_snapshot() {
-    let fixture = protocol_fixture_with_rows().await;
+pub async fn live_subscription_out_of_window_resume_resets_to_current_snapshot(db: Db) {
+    let fixture = protocol_fixture_with_rows(db).await;
     let mut initial_stream = fixture
         .engine
         .execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
@@ -855,11 +815,10 @@ async fn live_subscription_out_of_window_resume_resets_to_current_snapshot() {
 
     project_item(&fixture.repository, &fixture.bus, 2, "causal row 2").await;
     project_item(&fixture.repository, &fixture.bus, 3, "causal row 3").await;
-    let compacted_through: i64 =
-        sqlx::query_scalar("SELECT compacted_through FROM projection_partitions")
-            .fetch_one(fixture.repository.pool())
-            .await
-            .expect("projection compaction watermark");
+    let compacted_through = fixture
+        .repository
+        .scalar_i64("SELECT compacted_through FROM projection_partitions")
+        .await;
     assert_eq!(
         compacted_through, 2,
         "position 1 must be strictly outside the retained resume window"
@@ -878,9 +837,8 @@ async fn live_subscription_out_of_window_resume_resets_to_current_snapshot() {
     );
 }
 
-#[tokio::test]
-async fn live_subscription_frames_keep_data_and_metadata_in_fifo_order() {
-    let fixture = protocol_fixture_with_rows().await;
+pub async fn live_subscription_frames_keep_data_and_metadata_in_fifo_order(db: Db) {
+    let fixture = protocol_fixture_with_rows(db).await;
     let mut stream = fixture
         .engine
         .execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
@@ -949,13 +907,10 @@ async fn live_subscription_frames_keep_data_and_metadata_in_fifo_order() {
     );
 }
 
-async fn rename_causal_table(repository: &SqliteRepository, from: &str, to: &str) {
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER TABLE {from} RENAME TO {to}"
-    )))
-    .execute(repository.pool())
-    .await
-    .expect("rename live read-model table");
+async fn rename_causal_table(repository: &Db, from: &str, to: &str) {
+    repository
+        .execute(format!("ALTER TABLE {from} RENAME TO {to}"))
+        .await;
 }
 
 /// A failure frame is error-only, carries the valid base envelope, and has no
@@ -1015,9 +970,8 @@ async fn assert_stream_ended(stream: &mut BoxStream<'static, async_graphql::Resp
     );
 }
 
-#[tokio::test]
-async fn live_subscription_initial_failure_is_one_terminal_error_only_frame() {
-    let fixture = protocol_fixture_with_rows().await;
+pub async fn live_subscription_initial_failure_is_one_terminal_error_only_frame(db: Db) {
+    let fixture = protocol_fixture_with_rows(db).await;
     rename_causal_table(
         &fixture.repository,
         "causal_query_views",
@@ -1036,9 +990,8 @@ async fn live_subscription_initial_failure_is_one_terminal_error_only_frame() {
     assert_stream_ended(&mut stream).await;
 }
 
-#[tokio::test]
-async fn live_subscription_refresh_failure_is_terminal_and_never_takes_later_metadata() {
-    let fixture = protocol_fixture_with_rows().await;
+pub async fn live_subscription_refresh_failure_is_terminal_and_never_takes_later_metadata(db: Db) {
+    let fixture = protocol_fixture_with_rows(db).await;
     let mut stream = fixture
         .engine
         .execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
@@ -1075,9 +1028,8 @@ async fn live_subscription_refresh_failure_is_terminal_and_never_takes_later_met
     assert_stream_ended(&mut stream).await;
 }
 
-#[tokio::test]
-async fn live_subscription_replays_delete_tombstone_and_observation() {
-    let fixture = protocol_fixture_with_rows().await;
+pub async fn live_subscription_replays_delete_tombstone_and_observation(db: Db) {
+    let fixture = protocol_fixture_with_rows(db).await;
     let mut stream = fixture
         .engine
         .execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
@@ -1116,9 +1068,8 @@ async fn live_subscription_replays_delete_tombstone_and_observation() {
     assert_opaque_token(&observation["scopeToken"], "projection-obligation");
 }
 
-#[tokio::test]
-async fn live_subscription_emits_pathless_fence_when_a_record_leaves_the_result() {
-    let fixture = protocol_fixture_with_retention(10).await;
+pub async fn live_subscription_emits_pathless_fence_when_a_record_leaves_the_result(db: Db) {
+    let fixture = protocol_fixture_with_retention(db, 10).await;
     let mut stream = fixture
         .engine
         .execute_stream(&user_session(), Request::new(FILTERED_LIVE_SUBSCRIPTION));
@@ -1148,9 +1099,8 @@ async fn live_subscription_emits_pathless_fence_when_a_record_leaves_the_result(
     );
 }
 
-#[tokio::test]
-async fn resumed_suffix_coalesces_delete_recreate_and_repeated_upserts() {
-    let fixture = protocol_fixture_with_retention(10).await;
+pub async fn resumed_suffix_coalesces_delete_recreate_and_repeated_upserts(db: Db) {
+    let fixture = protocol_fixture_with_retention(db, 10).await;
     let mut initial_stream = fixture
         .engine
         .execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
@@ -1195,9 +1145,8 @@ async fn resumed_suffix_coalesces_delete_recreate_and_repeated_upserts() {
     );
 }
 
-#[tokio::test]
-async fn multi_root_causal_query_fails_before_merging_independent_snapshots() {
-    let engine = protocol_engine_with_rows().await;
+pub async fn multi_root_causal_query_fails_before_merging_independent_snapshots(db: Db) {
+    let engine = protocol_engine_with_rows(db).await;
     let response = engine
         .execute(
             &user_session(),
@@ -1219,10 +1168,9 @@ async fn multi_root_causal_query_fails_before_merging_independent_snapshots() {
     );
 }
 
-#[tokio::test]
-async fn row_filtered_surface_never_exposes_partition_wide_live_activity() {
-    let fixture = protocol_fixture_with_rows().await;
-    let engine = GraphqlEngine::builder(&fixture.repository)
+pub async fn row_filtered_surface_never_exposes_partition_wide_live_activity(db: Db) {
+    let fixture = protocol_fixture_with_rows(db).await;
+    let engine = GraphqlEngine::builder(fixture.repository.pool())
         .service_id(SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
@@ -1407,26 +1355,23 @@ enum QueryGatewayMode {
     Remote,
 }
 
-#[tokio::test]
-async fn http_and_graphql_ws_serialize_the_same_query_revision_envelope() {
-    exercise_query_transport(QueryGatewayMode::Direct).await;
+pub async fn http_and_graphql_ws_serialize_the_same_query_revision_envelope(db: Db) {
+    exercise_query_transport(db, QueryGatewayMode::Direct).await;
 }
 
 #[cfg(feature = "gateway-graphql-native")]
-#[tokio::test]
-async fn gateway_embedded_query_revision_parity() {
-    exercise_query_transport(QueryGatewayMode::Embedded).await;
+pub async fn gateway_embedded_query_revision_parity(db: Db) {
+    exercise_query_transport(db, QueryGatewayMode::Embedded).await;
 }
 
 #[cfg(feature = "gateway-graphql-native")]
-#[tokio::test]
-async fn gateway_remote_query_revision_parity() {
-    exercise_query_transport(QueryGatewayMode::Remote).await;
+pub async fn gateway_remote_query_revision_parity(db: Db) {
+    exercise_query_transport(db, QueryGatewayMode::Remote).await;
 }
 
-async fn exercise_query_transport(mode: QueryGatewayMode) {
-    let fixture = protocol_fixture_with_retention(10).await;
-    let builder = GraphqlEngine::builder(&fixture.repository)
+async fn exercise_query_transport(db: Db, mode: QueryGatewayMode) {
+    let fixture = protocol_fixture_with_retention(db, 10).await;
+    let builder = GraphqlEngine::builder(fixture.repository.pool())
         .service_id(SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
@@ -1644,9 +1589,8 @@ async fn exercise_query_transport(mode: QueryGatewayMode) {
     }
 }
 
-#[tokio::test]
-async fn unowned_legacy_query_is_explicitly_incomplete_and_still_strips_keys() {
-    let engine = protocol_engine_with_rows().await;
+pub async fn unowned_legacy_query_is_explicitly_incomplete_and_still_strips_keys(db: Db) {
+    let engine = protocol_engine_with_rows(db).await;
     let response = wire_response(
         engine
             .execute(
@@ -1677,10 +1621,9 @@ async fn unowned_legacy_query_is_explicitly_incomplete_and_still_strips_keys() {
 }
 
 #[cfg(feature = "gateway-delivery")]
-#[tokio::test]
-async fn freshness_context_binds_origin_and_rejects_unproven_minima() {
+pub async fn freshness_context_binds_origin_and_rejects_unproven_minima(db: Db) {
     use distributed::gateway::delivery::{FreshnessContext, Minimum};
-    let fixture = protocol_fixture_with_retention(10).await;
+    let fixture = protocol_fixture_with_retention(db, 10).await;
     let document = "query ReadFreshness { causal_query_views { title } }";
     let request = || Request::new(document);
     let identity = fixture
@@ -1770,16 +1713,15 @@ async fn freshness_context_binds_origin_and_rejects_unproven_minima() {
 }
 
 #[cfg(feature = "gateway-delivery")]
-#[tokio::test]
-async fn gateway_validator_tracks_projection_commit_in_the_result_snapshot() {
+pub async fn gateway_validator_tracks_projection_commit_in_the_result_snapshot(db: Db) {
     use distributed::graphql::delivery::GatewayVersionStore;
-    let fixture = protocol_fixture_with_retention(10).await;
-    let pool = distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone());
+    let fixture = protocol_fixture_with_retention(db, 10).await;
+    let pool = fixture.repository.graphql_pool();
     let store =
         GatewayVersionStore::install(&pool, "query-protocol-cache", ["causal_query_views".into()])
             .await
             .unwrap();
-    let engine = GraphqlEngine::builder(&fixture.repository)
+    let engine = GraphqlEngine::builder(fixture.repository.pool())
         .service_id(SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
@@ -1835,12 +1777,10 @@ async fn gateway_validator_tracks_projection_commit_in_the_result_snapshot() {
         second["extensions"]["gatewayDelivery"]["validator"]
     );
     // A failed write transaction cannot advance the cache dependency version.
-    let mut tx = fixture.repository.pool().begin().await.unwrap();
-    sqlx::query("UPDATE causal_query_views SET title='rolled back'")
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    tx.rollback().await.unwrap();
+    fixture
+        .repository
+        .execute_rolled_back("UPDATE causal_query_views SET title='rolled back'")
+        .await;
     let rolled_back = wire_response(engine.execute(&user_session(), request("validate")).await);
     assert_eq!(
         rolled_back["extensions"]["gatewayDelivery"]["admission"]["validator"],
@@ -1849,20 +1789,19 @@ async fn gateway_validator_tracks_projection_commit_in_the_result_snapshot() {
 }
 
 #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
-#[tokio::test]
-async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql() {
+pub async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql(db: Db) {
     use axum::{routing::post, Router};
     use distributed::gateway::{delivery::SnapshotLimits, native::*, *};
     use distributed::graphql::delivery::GatewayVersionStore;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tower::ServiceExt;
-    let fixture = protocol_fixture_with_retention(10).await;
-    let pool = distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone());
+    let fixture = protocol_fixture_with_retention(db, 10).await;
+    let pool = fixture.repository.graphql_pool();
     let store = GatewayVersionStore::install(&pool, "native-cache", ["causal_query_views".into()])
         .await
         .unwrap();
     let engine = Arc::new(
-        GraphqlEngine::builder(&fixture.repository)
+        GraphqlEngine::builder(fixture.repository.pool())
             .service_id(SERVICE_ID)
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .roles(&["user"])
@@ -2013,10 +1952,10 @@ async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql() {
         );
         // No invalidation feed is connected: transactional dependency validation
         // must still discover a supported external SQL producer's update.
-        sqlx::query("UPDATE causal_query_views SET title=title || '-external'")
-            .execute(fixture.repository.pool())
-            .await
-            .unwrap();
+        fixture
+            .repository
+            .execute("UPDATE causal_query_views SET title=title || '-external'")
+            .await;
         let changed = run(document).await.1;
         assert_ne!(changed["data"], first["data"]);
         assert_eq!(store.metrics().result_executions, hit.result_executions + 1);
@@ -2068,10 +2007,10 @@ async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql() {
         run(filtered).await;
         run(count).await;
         assert_eq!(store.metrics().result_executions, filled.result_executions);
-        sqlx::query("UPDATE causal_query_views SET title='matching'")
-            .execute(fixture.repository.pool())
-            .await
-            .unwrap();
+        fixture
+            .repository
+            .execute("UPDATE causal_query_views SET title='matching'")
+            .await;
         assert_eq!(
             run(filtered).await.1["data"]["causal_query_views"][0]["title"],
             "matching"
@@ -2084,22 +2023,21 @@ async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql() {
 }
 
 #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
-#[tokio::test]
-async fn hundred_reads_one_execution_with_cache_disabled() {
+pub async fn hundred_reads_one_execution_with_cache_disabled(db: Db) {
     use axum::{routing::post, Router};
     use distributed::gateway::{delivery::FlightLimits, native::*, *};
     use distributed::graphql::delivery::GatewayVersionStore;
     use tower::ServiceExt;
-    let fixture = protocol_fixture_with_retention(10).await;
+    let fixture = protocol_fixture_with_retention(db, 10).await;
     let store = GatewayVersionStore::install(
-        &distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone()),
+        &fixture.repository.graphql_pool(),
         "flight-test",
         ["causal_query_views".into()],
     )
     .await
     .unwrap();
     let engine = Arc::new(
-        GraphqlEngine::builder(&fixture.repository)
+        GraphqlEngine::builder(fixture.repository.pool())
             .service_id(SERVICE_ID)
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .roles(&["user"])
@@ -2282,8 +2220,17 @@ async fn hundred_reads_one_execution_with_cache_disabled() {
 }
 
 #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
-#[tokio::test]
-async fn hundred_subscribers_one_upstream_over_embedded_and_remote_websockets() {
+pub async fn hundred_subscribers_one_upstream_over_embedded_websockets(db: Db) {
+    hundred_subscribers_one_upstream(db, false).await;
+}
+
+#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+pub async fn hundred_subscribers_one_upstream_over_remote_websockets(db: Db) {
+    hundred_subscribers_one_upstream(db, true).await;
+}
+
+#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+async fn hundred_subscribers_one_upstream(db: Db, remote: bool) {
     use axum::Router;
     use distributed::gateway::{delivery::LiveLimits, native::*, *};
     use distributed::graphql::{delivery::GatewayVersionStore, IdentityConfig, OidcConfig};
@@ -2375,14 +2322,14 @@ async fn hundred_subscribers_one_upstream_over_embedded_and_remote_websockets() 
         .await
         .expect("matching full live frame")
     }
-    for remote in [false, true] {
+    {
         eprintln!(
             "shared live transport: {}",
             if remote { "remote" } else { "embedded" }
         );
-        let fixture = protocol_fixture_with_retention(10).await;
+        let fixture = protocol_fixture_with_retention(db, 10).await;
         let versions = GatewayVersionStore::install(
-            &distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone()),
+            &fixture.repository.graphql_pool(),
             "live-fixture",
             ["causal_query_views".into()],
         )
@@ -2392,7 +2339,7 @@ async fn hundred_subscribers_one_upstream_over_embedded_and_remote_websockets() 
             .with_static_jwks(jwks.clone())
             .engine_roles(&["user"]);
         let engine = Arc::new(
-            GraphqlEngine::builder(&fixture.repository)
+            GraphqlEngine::builder(fixture.repository.pool())
                 .service_id(SERVICE_ID)
                 .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
                 .roles(&["user"])
@@ -2586,21 +2533,22 @@ async fn hundred_subscribers_one_upstream_over_embedded_and_remote_websockets() 
 #[tokio::test]
 #[ignore = "requires pinned tests/gateway-worker npm installation and worker-build; run explicitly in Worker CI"]
 async fn worker_coordinator_uses_actual_origin_projection_sql() {
+    let db = Db::sqlite().await;
     use axum::{
         routing::{get, post},
         Router,
     };
     use distributed::graphql::delivery::GatewayVersionStore;
-    let fixture = protocol_fixture_with_retention(10).await;
+    let fixture = protocol_fixture_with_retention(db, 10).await;
     let store = GatewayVersionStore::install(
-        &distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone()),
+        &fixture.repository.graphql_pool(),
         "worker-test",
         ["causal_query_views".into()],
     )
     .await
     .unwrap();
     let engine = Arc::new(
-        GraphqlEngine::builder(&fixture.repository)
+        GraphqlEngine::builder(fixture.repository.pool())
             .service_id(SERVICE_ID)
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .roles(&["user"])
@@ -2615,13 +2563,13 @@ async fn worker_coordinator_uses_actual_origin_projection_sql() {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let handler_gate = gate.clone();
     let blocking_gate = gate.clone();
-    let pool = fixture.repository.pool().clone();
+    let pool = fixture.repository.clone();
     let origin=Router::new().route("/graphql",post(move |axum::Json(value):axum::Json<Value>|{let engine=engine.clone();let gate=handler_gate.clone();async move{
         if value["extensions"]["gatewayDelivery"]["action"]=="snapshot"{gate.acquire().await.unwrap().forget();}
         axum::Json(serde_json::to_value(engine.execute(&user_session(),serde_json::from_value::<Request>(value).unwrap()).await).unwrap())
     }})).route("/__metrics",get(move ||{let store=store.clone();async move{let metrics=store.metrics();axum::Json(json!({"validations":metrics.validations,"resultExecutions":metrics.result_executions}))}}))
     .route("/__release",post(move ||{let gate=gate.clone();async move{gate.add_permits(1000);"released"}}))
-    .route("/__write",post(move ||{let pool=pool.clone();async move{sqlx::query("UPDATE causal_query_views SET title='external write'").execute(&pool).await.unwrap();"written"}}));
+    .route("/__write",post(move ||{let pool=pool.clone();async move{pool.execute("UPDATE causal_query_views SET title='external write'").await;"written"}}));
     let origin = origin.route(
         "/__block",
         post(move || {
@@ -2662,6 +2610,7 @@ async fn worker_coordinator_uses_actual_origin_projection_sql() {
 #[tokio::test]
 #[ignore = "requires pinned local workerd fixture; run explicitly in Worker CI"]
 async fn worker_live_coordinator_uses_actual_oidc_origin() {
+    let db = Db::sqlite().await;
     use axum::Router;
     use distributed::graphql::{delivery::GatewayVersionStore, IdentityConfig, OidcConfig};
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -2687,9 +2636,9 @@ async fn worker_live_coordinator_uses_actual_oidc_origin() {
         encode(&header,&json!({"iss":"https://live-fixture.invalid","aud":"live-fixture","sub":subject,"iat":now-1,"nbf":now-1,"exp":now+3600,"roles":["user"]}),&encoding).unwrap()
     };
 
-    let fixture = protocol_fixture_with_retention(5).await;
+    let fixture = protocol_fixture_with_retention(db, 5).await;
     let versions = GatewayVersionStore::install(
-        &distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone()),
+        &fixture.repository.graphql_pool(),
         "worker-live-fixture",
         ["causal_query_views".into()],
     )
@@ -2699,7 +2648,7 @@ async fn worker_live_coordinator_uses_actual_oidc_origin() {
         .with_static_jwks(jwks)
         .engine_roles(&["user"]);
     let engine = Arc::new(
-        GraphqlEngine::builder(&fixture.repository)
+        GraphqlEngine::builder(fixture.repository.pool())
             .service_id(SERVICE_ID)
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .roles(&["user"])
@@ -2754,4 +2703,42 @@ async fn worker_live_coordinator_uses_actual_oidc_origin() {
 }
 
 #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+on_each_dialect! { ;
+    projected_query_emits_exact_record_and_index_revisions_without_key_leaks,
+    count_only_aggregate_emits_no_unselected_node_record_evidence,
+    aggregate_node_aliases_drive_data_and_exact_record_paths,
+    embedded_models_emit_index_evidence_without_record_evidence,
+    query_evidence_chunks_129_unique_rows_inside_one_snapshot,
+    matching_query_and_live_plans_share_snapshot_scope_not_operation_hash,
+    live_subscription_accepts_an_exact_resume_without_reset,
+    live_subscription_tampering_and_wrong_scope_reset_without_errors,
+    live_subscription_out_of_window_resume_resets_to_current_snapshot,
+    live_subscription_frames_keep_data_and_metadata_in_fifo_order,
+    live_subscription_initial_failure_is_one_terminal_error_only_frame,
+    live_subscription_refresh_failure_is_terminal_and_never_takes_later_metadata,
+    live_subscription_replays_delete_tombstone_and_observation,
+    live_subscription_emits_pathless_fence_when_a_record_leaves_the_result,
+    resumed_suffix_coalesces_delete_recreate_and_repeated_upserts,
+    multi_root_causal_query_fails_before_merging_independent_snapshots,
+    row_filtered_surface_never_exposes_partition_wide_live_activity,
+    http_and_graphql_ws_serialize_the_same_query_revision_envelope,
+    #[cfg(feature = "gateway-graphql-native")]
+    gateway_embedded_query_revision_parity,
+    #[cfg(feature = "gateway-graphql-native")]
+    gateway_remote_query_revision_parity,
+    unowned_legacy_query_is_explicitly_incomplete_and_still_strips_keys,
+    #[cfg(feature = "gateway-delivery")]
+    freshness_context_binds_origin_and_rejects_unproven_minima,
+    #[cfg(feature = "gateway-delivery")]
+    gateway_validator_tracks_projection_commit_in_the_result_snapshot,
+    #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+    native_snapshot_cache_revalidates_each_consumer_without_result_sql,
+    #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+    hundred_reads_one_execution_with_cache_disabled,
+    #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+    hundred_subscribers_one_upstream_over_embedded_websockets,
+    #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+    hundred_subscribers_one_upstream_over_remote_websockets,
+}
+
 mod load;

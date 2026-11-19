@@ -22,7 +22,6 @@ use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::sqlite::SqlitePoolOptions;
 use tower::util::ServiceExt;
 
 // ── RSA fixture helpers ─────────────────────────────────────────────────────
@@ -468,6 +467,10 @@ fn extract_bearer_empty_is_invalid() {
 
 // ── HTTP 401 on real GraphQL router (OidcBearer) ─────────────────────────────
 
+#[path = "../support/graphql.rs"]
+mod graphql_support;
+use graphql_support::Db;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("id_items")]
 struct IdItem {
@@ -477,18 +480,15 @@ struct IdItem {
 }
 
 async fn engine_with_identity(identity: IdentityConfig) -> Arc<GraphqlEngine> {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE id_items (id TEXT PRIMARY KEY, owner TEXT NOT NULL);
-         INSERT INTO id_items VALUES ('1', 'user-a-001');
-         INSERT INTO id_items VALUES ('2', 'other');",
+    let db = Db::sqlite().await;
+    db.seed(
+        [("1", "user-a-001"), ("2", "other")].map(|(id, owner)| IdItem {
+            id: id.into(),
+            owner: owner.into(),
+        }),
     )
-    .execute(&pool)
-    .await
-    .unwrap();
+    .await;
+    let pool = db.pool();
     let engine = GraphqlEngine::builder(pool)
         .roles(&["customer", "admin", "user"])
         .model::<IdItem>(

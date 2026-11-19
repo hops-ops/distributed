@@ -9,7 +9,10 @@ use distributed::microsvc::{Session, ROLE_KEY};
 use distributed::ReadModel;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use sqlx::sqlite::SqlitePoolOptions;
+
+#[path = "../support/graphql.rs"]
+mod common;
+use common::{on_each_dialect, Db};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("items")]
@@ -25,29 +28,22 @@ fn user() -> Session {
     s
 }
 
-async fn engine() -> GraphqlEngine {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query("CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT NOT NULL)")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO items VALUES ('1', 'a'), ('2', 'b'), ('3', 'c')")
-        .execute(&pool)
-        .await
-        .unwrap();
-    GraphqlEngine::builder(pool)
+async fn engine(db: &Db) -> GraphqlEngine {
+    let item = |id: &str, name: &str| ItemView {
+        id: id.into(),
+        name: name.into(),
+    };
+    db.seed([item("1", "a"), item("2", "b"), item("3", "c")])
+        .await;
+    GraphqlEngine::builder(db.pool())
         .roles(&["user"])
         .model::<ItemView>(ModelPermissions::new().grant("user", read().all_columns()))
         .build()
         .unwrap()
 }
 
-#[tokio::test]
-async fn list_and_by_pk_compile_and_execute() {
-    let engine = engine().await;
+pub async fn list_and_by_pk_compile_and_execute(db: Db) {
+    let engine = engine(&db).await;
     let resp = engine
         .execute(&user(), Request::new("{ items { id name } }"))
         .await;
@@ -66,9 +62,8 @@ async fn list_and_by_pk_compile_and_execute() {
     assert_eq!(data["items_by_pk"]["name"], "b");
 }
 
-#[tokio::test]
-async fn where_eq_uses_production_compiler() {
-    let engine = engine().await;
+pub async fn where_eq_uses_production_compiler(db: Db) {
+    let engine = engine(&db).await;
     let resp = engine
         .execute(
             &user(),
@@ -153,31 +148,12 @@ fn graphql_order(value: &JsonValue) -> String {
     )
 }
 
-#[tokio::test]
-async fn portable_query_plan_corpus_matches_sqlite_server_semantics() {
+pub async fn portable_query_plan_corpus_matches_server_semantics(db: Db) {
     let corpus: ClientPlanCorpus =
         serde_json::from_str(include_str!("../fixtures/client-query-plan-corpus.json"))
             .expect("parse shared client query-plan corpus");
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE client_plan_rows (id TEXT PRIMARY KEY, priority INTEGER NOT NULL, completed INTEGER NOT NULL)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    for record in &corpus.records {
-        sqlx::query("INSERT INTO client_plan_rows (id, priority, completed) VALUES (?, ?, ?)")
-            .bind(&record.id)
-            .bind(record.priority)
-            .bind(record.completed)
-            .execute(&pool)
-            .await
-            .unwrap();
-    }
-    let engine = GraphqlEngine::builder(pool)
+    db.seed(corpus.records).await;
+    let engine = GraphqlEngine::builder(db.pool())
         .roles(&["user"])
         .model::<ClientPlanRow>(ModelPermissions::new().grant("user", read().all_columns()))
         .build()
@@ -202,4 +178,10 @@ async fn portable_query_plan_corpus_matches_sqlite_server_semantics() {
             .collect::<Vec<_>>();
         assert_eq!(actual, case.expected, "{}", case.name);
     }
+}
+
+on_each_dialect! { ;
+    list_and_by_pk_compile_and_execute,
+    where_eq_uses_production_compiler,
+    portable_query_plan_corpus_matches_server_semantics,
 }

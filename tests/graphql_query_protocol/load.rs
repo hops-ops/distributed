@@ -3,6 +3,7 @@ use super::*;
 #[tokio::test]
 #[ignore = "runs actual 100-query/100-live native and workerd load matrix; requires pinned Worker fixture"]
 async fn separate_origin_and_client_savings() {
+    let db = Db::sqlite().await;
     use axum::Router;
     use distributed::graphql::{delivery::GatewayVersionStore, IdentityConfig, OidcConfig};
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -28,9 +29,9 @@ async fn separate_origin_and_client_savings() {
         encode(&header,&json!({"iss":"https://live-fixture.invalid","aud":"live-fixture","sub":subject,"iat":now-1,"nbf":now-1,"exp":now+3600,"roles":["user"]}),&encoding).unwrap()
     };
 
-    let fixture = protocol_fixture_with_retention(5).await;
+    let fixture = protocol_fixture_with_retention(db, 5).await;
     let versions = GatewayVersionStore::install(
-        &distributed::graphql::GraphqlPool::from(fixture.repository.pool().clone()),
+        &fixture.repository.graphql_pool(),
         "load-fixture",
         ["causal_query_views".into()],
     )
@@ -40,7 +41,7 @@ async fn separate_origin_and_client_savings() {
         .with_static_jwks(jwks)
         .engine_roles(&["user"]);
     let engine = Arc::new(
-        GraphqlEngine::builder(&fixture.repository)
+        GraphqlEngine::builder(fixture.repository.pool())
             .service_id(SERVICE_ID)
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .roles(&["user"])

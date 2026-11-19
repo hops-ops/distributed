@@ -130,7 +130,6 @@ where
 fn decode_sqlite_value(text: String, plan: &SqlPlan) -> Result<ExecutedSql, String> {
     let mut json: JsonValue =
         serde_json::from_str(&text).map_err(|e| format!("json decode: {e}"))?;
-    deep_parse_json_strings(&mut json);
     rewrite_hex_bytes(&mut json, &plan.bytes_hex_paths);
     finish_executed_value(json, plan)
 }
@@ -174,40 +173,6 @@ mod statement_timeout_tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         let err = handle.await.expect("join").expect_err("inner err");
         assert!(err.contains("boom"), "{err}");
-    }
-}
-
-/// Parse string-encoded JSON only for array elements (SQLite json_group_array
-/// quirk). Object property strings stay GraphQL String scalars (never re-typed).
-fn deep_parse_json_strings(value: &mut JsonValue) {
-    match value {
-        JsonValue::Array(items) => {
-            for item in items {
-                if let JsonValue::String(s) = item {
-                    let trimmed = s.trim();
-                    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
-                        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
-                    {
-                        if let Ok(mut parsed) = serde_json::from_str::<JsonValue>(s) {
-                            deep_parse_json_strings(&mut parsed);
-                            *item = parsed;
-                        }
-                    }
-                } else {
-                    deep_parse_json_strings(item);
-                }
-            }
-        }
-        JsonValue::Object(map) => {
-            for v in map.values_mut() {
-                match v {
-                    JsonValue::Object(_) | JsonValue::Array(_) => deep_parse_json_strings(v),
-                    // Leave scalar strings alone (including JSON-looking text columns).
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
     }
 }
 

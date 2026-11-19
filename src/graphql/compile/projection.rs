@@ -1017,7 +1017,9 @@ pub(super) fn column_json_expr(
         (ColumnType::Timestamp, SqlDialect::Postgres) => format!("{q}::text"),
         (ColumnType::Bytes, SqlDialect::Postgres) => format!("encode({q}, 'base64')"),
         (ColumnType::Bytes, SqlDialect::Sqlite) => format!("hex({q})"),
-        (ColumnType::Json, SqlDialect::Postgres) => q.to_string(),
+        // SQLite stores JSON as text; `json()` gives the value its JSON subtype
+        // so the enclosing object embeds it as JSON, not as a string.
+        (ColumnType::Json, SqlDialect::Sqlite) => format!("json({q})"),
         _ => q,
     })
 }

@@ -707,14 +707,6 @@ fn passthrough_key(
     let Some(value) = ctx.parent_value.as_value() else {
         return Ok(None);
     };
-    // Nested JSON may arrive as a string (SQLite json_group_array quirk).
-    if let Value::String(s) = value {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-            if let Ok(v) = Value::from_json(parsed) {
-                return Ok(lookup_key(&v, key));
-            }
-        }
-    }
     Ok(lookup_key(value, key))
 }
 

@@ -2100,11 +2100,19 @@ are literal text. The query engine binds an escaped pattern on both PostgreSQL
 and SQLite. An empty string matches every non-null string; use a bounded query
 and show results only after a submitted search when building a search form.
 
-Case matching follows the database: PostgreSQL uses its configured ILIKE
-behavior; SQLite's default LIKE folds ASCII, not arbitrary Unicode. The browser
-replica therefore leaves local match evaluation uncertain and relies on the
-authorized server result. `_ilike` still accepts deliberate wildcard patterns;
-`_contains` remains the PostgreSQL JSON containment operator.
+The pattern operators mean the same thing on PostgreSQL and SQLite:
+
+| Operator | Wildcards | Case |
+|---|---|---|
+| `_like` | `%` any run, `_` one character, `\` escapes the next character | exact |
+| `_ilike` | same | ASCII letters fold; every other character is exact |
+| `_icontains` | none: the operand is literal text | same as `_ilike` |
+
+Folding is ASCII-only on both backends, so `é` does not match `É` under
+`_ilike` or `_icontains`; PostgreSQL's collation-dependent `ILIKE` folding is
+not used. A pattern that ends in a lone `\` is a `BAD_REQUEST`. The browser
+replica does not evaluate these operators locally and relies on the authorized
+server result. `_contains` remains the PostgreSQL JSON containment operator.
 
 ### Scope
 

@@ -6,7 +6,7 @@ use crate::table::{ColumnType, TableSchema};
 
 use super::super::engine::EngineInner;
 use super::binds::{operand_to_bind, value_to_bind, BindValue};
-use super::dialect::{placeholder, SqlDialect};
+use super::dialect::{placeholder, text_pattern, SqlDialect};
 use super::scan::{relationship_link, ModelScan, ScanLink};
 
 impl ModelScan<'_> {
@@ -113,9 +113,22 @@ fn compile_filter_expr(
                 .find(|c| c.column_name == *column)
                 .ok_or_else(|| format!("unknown column `{column}`"))?;
             let bind = operand_to_bind(rhs, session, &col.column_type)?;
+            let col_ref = format!("{alias}.\"{column}\"");
+            if matches!(op, CmpOp::Like | CmpOp::Ilike) {
+                let BindValue::Text(pattern) = bind else {
+                    return Err("a pattern comparison requires a string".into());
+                };
+                return compile_text_pattern(
+                    inner.dialect,
+                    &col_ref,
+                    &pattern,
+                    '\\',
+                    *op == CmpOp::Like,
+                    binds,
+                );
+            }
             binds.push(bind);
             let ph = placeholder(inner.dialect, binds.len());
-            let col_ref = format!("{alias}.\"{column}\"");
             let sql_op = match op {
                 CmpOp::Eq => "=",
                 CmpOp::Neq => "<>",
@@ -123,8 +136,7 @@ fn compile_filter_expr(
                 CmpOp::Gte => ">=",
                 CmpOp::Lt => "<",
                 CmpOp::Lte => "<=",
-                CmpOp::Like => "LIKE",
-                CmpOp::Ilike => inner.dialect.ops().ilike_op,
+                CmpOp::Like | CmpOp::Ilike => unreachable!("compiled above"),
                 CmpOp::Contains => {
                     require_postgres_json_op(inner.dialect, "_contains")?;
                     "@>"
@@ -407,10 +419,13 @@ fn compile_client_op(
                 pattern.push(ch);
             }
             pattern.push('%');
-            binds.push(value_to_bind(&Value::String(pattern), column_type)?);
-            let ph = placeholder(inner.dialect, binds.len());
-            let sql_op = inner.dialect.ops().ilike_op;
-            Ok(format!("{col_ref} {sql_op} {ph} ESCAPE '!'"))
+            compile_text_pattern(inner.dialect, &col_ref, &pattern, '!', false, binds)
+        }
+        "_like" | "_ilike" => {
+            let Value::String(pattern) = rhs else {
+                return Err(format!("{op} requires a string"));
+            };
+            compile_text_pattern(inner.dialect, &col_ref, pattern, '\\', op == "_like", binds)
         }
         "_is_null" => {
             let yes = matches!(rhs, Value::Boolean(true));
@@ -454,8 +469,6 @@ fn compile_client_op(
                 "_gte" => ">=",
                 "_lt" => "<",
                 "_lte" => "<=",
-                "_like" => "LIKE",
-                "_ilike" => inner.dialect.ops().ilike_op,
                 "_contains" => {
                     require_postgres_json_op(inner.dialect, "_contains")?;
                     "@>"
@@ -488,6 +501,21 @@ fn require_postgres_json_op(dialect: SqlDialect, op: &str) -> Result<(), String>
             "unknown comparison op `{op}` is not supported on sqlite"
         )),
     }
+}
+
+/// Push the pattern bind and return the predicate; see [`text_pattern`].
+fn compile_text_pattern(
+    dialect: SqlDialect,
+    col_ref: &str,
+    pattern: &str,
+    escape: char,
+    case_sensitive: bool,
+    binds: &mut Vec<BindValue>,
+) -> Result<String, String> {
+    let ph = placeholder(dialect, binds.len() + 1);
+    let (sql, bind) = text_pattern(dialect, col_ref, &ph, pattern, escape, case_sensitive)?;
+    binds.push(BindValue::Text(bind));
+    Ok(sql)
 }
 
 fn cast_placeholder(dialect: SqlDialect, column_type: &ColumnType, ph: &str) -> String {

@@ -10,7 +10,7 @@ pub enum SqlDialect {
 /// Dialect-specific SQL fragment table (dedup-4).
 ///
 /// Prefer `dialect.ops()` over ad-hoc match arms for JSON aggregate / object /
-/// empty-array / ILIKE strings.
+/// empty-array strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DialectOps {
     pub json_agg: &'static str,
@@ -20,8 +20,6 @@ pub struct DialectOps {
     pub binary_collation: &'static str,
     /// SQLite wraps list roots with `json(...)`; Postgres leaves this empty.
     pub json_cast_fn: Option<&'static str>,
-    /// Case-insensitive LIKE operator (`ILIKE` on PG; `LIKE` on SQLite).
-    pub ilike_op: &'static str,
 }
 
 impl SqlDialect {
@@ -33,7 +31,6 @@ impl SqlDialect {
                 build_object: "jsonb_build_object",
                 binary_collation: r#""C""#,
                 json_cast_fn: None,
-                ilike_op: "ILIKE",
             },
             SqlDialect::Sqlite => DialectOps {
                 json_agg: "json_group_array",
@@ -42,7 +39,6 @@ impl SqlDialect {
                 binary_collation: "BINARY",
                 // Ensures json_object TEXT is treated as JSON, not a JSON string.
                 json_cast_fn: Some("json"),
-                ilike_op: "LIKE",
             },
         }
     }
@@ -62,6 +58,68 @@ impl DialectOps {
             Some(cast) => format!("{cast}({subquery})"),
         }
     }
+}
+
+/// `column` matched against a text `pattern`, with one meaning on both
+/// dialects:
+///
+/// - `%` matches any run of characters and `_` exactly one;
+/// - `escape` makes the character after it literal, and may not end the pattern;
+/// - `case_sensitive` compares characters exactly; otherwise ASCII letters
+///   fold and every other character still compares exactly.
+///
+/// Returns the predicate and the value to bind at `placeholder`.
+///
+/// The dialects' own operators disagree, which is why none is used bare:
+/// SQLite `LIKE` folds ASCII and has no default escape, Postgres `LIKE` is
+/// exact with `\` as its default escape, and Postgres `ILIKE` folds by the
+/// database collation. So the case-sensitive form is `GLOB` on SQLite, with
+/// the pattern translated, and the folding form pins `COLLATE "C"` on
+/// Postgres.
+pub(super) fn text_pattern(
+    dialect: SqlDialect,
+    column: &str,
+    placeholder: &str,
+    pattern: &str,
+    escape: char,
+    case_sensitive: bool,
+) -> Result<(String, String), String> {
+    let mut glob = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        let literal = if ch == escape {
+            chars
+                .next()
+                .ok_or("a pattern must not end with its escape character")?
+        } else if ch == '%' {
+            glob.push('*');
+            continue;
+        } else if ch == '_' {
+            glob.push('?');
+            continue;
+        } else {
+            ch
+        };
+        match literal {
+            '*' | '?' | '[' => {
+                glob.push('[');
+                glob.push(literal);
+                glob.push(']');
+            }
+            other => glob.push(other),
+        }
+    }
+    Ok(match (dialect, case_sensitive) {
+        (SqlDialect::Sqlite, true) => (format!("{column} GLOB {placeholder}"), glob),
+        (SqlDialect::Sqlite, false) | (SqlDialect::Postgres, true) => (
+            format!("{column} LIKE {placeholder} ESCAPE '{escape}'"),
+            pattern.to_string(),
+        ),
+        (SqlDialect::Postgres, false) => (
+            format!("{column} COLLATE \"C\" ILIKE {placeholder} ESCAPE '{escape}'"),
+            pattern.to_string(),
+        ),
+    })
 }
 
 pub(super) fn placeholder(dialect: SqlDialect, n: usize) -> String {
@@ -140,7 +198,6 @@ mod dialect_ops_tests {
         assert_eq!(ops.empty_array, "'[]'::jsonb");
         assert_eq!(ops.build_object, "jsonb_build_object");
         assert_eq!(ops.json_cast_fn, None);
-        assert_eq!(ops.ilike_op, "ILIKE");
         assert_eq!(placeholder(SqlDialect::Postgres, 3), "$3");
     }
 
@@ -151,8 +208,23 @@ mod dialect_ops_tests {
         assert_eq!(ops.empty_array, "'[]'");
         assert_eq!(ops.build_object, "json_object");
         assert_eq!(ops.json_cast_fn, Some("json"));
-        assert_eq!(ops.ilike_op, "LIKE");
         assert_eq!(placeholder(SqlDialect::Sqlite, 1), "?");
+    }
+
+    #[test]
+    fn case_sensitive_sqlite_patterns_become_glob() {
+        let glob = |pattern| {
+            text_pattern(SqlDialect::Sqlite, "c", "?", pattern, '\\', true)
+                .unwrap()
+                .1
+        };
+        assert_eq!(glob("a%b_c"), "a*b?c");
+        assert_eq!(glob(r"100\%"), "100%");
+        assert_eq!(glob(r"a\_b"), "a_b");
+        assert_eq!(glob("a*b?c[d]"), "a[*]b[?]c[[]d]");
+        assert_eq!(glob(r"a\\b"), r"a\b");
+        assert!(text_pattern(SqlDialect::Sqlite, "c", "?", r"a\", '\\', true).is_err());
+        assert!(text_pattern(SqlDialect::Postgres, "c", "$1", r"a\", '\\', false).is_err());
     }
 }
 
