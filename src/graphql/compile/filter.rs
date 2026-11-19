@@ -6,7 +6,7 @@ use crate::table::{ColumnType, TableSchema};
 
 use super::super::engine::EngineInner;
 use super::binds::{operand_to_bind, value_to_bind, BindValue};
-use super::dialect::{placeholder, text_pattern, SqlDialect};
+use super::dialect::{comparison_operand, placeholder, text_pattern, SqlDialect};
 use super::scan::{relationship_link, ModelScan, ScanLink};
 
 impl ModelScan<'_> {
@@ -127,8 +127,7 @@ fn compile_filter_expr(
                     binds,
                 );
             }
-            binds.push(bind);
-            let ph = placeholder(inner.dialect, binds.len());
+            let ph = comparand(inner.dialect, bind, binds);
             let sql_op = match op {
                 CmpOp::Eq => "=",
                 CmpOp::Neq => "<>",
@@ -151,6 +150,15 @@ fn compile_filter_expr(
                 }
             };
             let cast_ph = cast_placeholder(inner.dialect, &col.column_type, &ph);
+            let col_ref = match op {
+                CmpOp::Eq | CmpOp::Neq => {
+                    comparison_operand(inner.dialect, &col.column_type, &col_ref, false)
+                }
+                CmpOp::Gt | CmpOp::Gte | CmpOp::Lt | CmpOp::Lte => {
+                    comparison_operand(inner.dialect, &col.column_type, &col_ref, true)
+                }
+                _ => col_ref,
+            };
             Ok(format!("{col_ref} {sql_op} {cast_ph}"))
         }
         FilterExpr::In {
@@ -178,29 +186,14 @@ fn compile_filter_expr(
                 .find(|c| c.column_name == *column)
                 .ok_or_else(|| format!("unknown column `{column}`"))?;
             let col_ref = format!("{alias}.\"{column}\"");
-            match inner.dialect {
-                SqlDialect::Postgres => {
-                    // Expand as IN for simplicity (array bind is dialect-specific).
-                    let mut phs = Vec::new();
-                    for v in values {
-                        let bind = operand_to_bind(v, session, &col.column_type)?;
-                        binds.push(bind);
-                        phs.push(placeholder(inner.dialect, binds.len()));
-                    }
-                    let op = if *negated { "NOT IN" } else { "IN" };
-                    Ok(format!("{col_ref} {op} ({})", phs.join(", ")))
-                }
-                SqlDialect::Sqlite => {
-                    let mut phs = Vec::new();
-                    for v in values {
-                        let bind = operand_to_bind(v, session, &col.column_type)?;
-                        binds.push(bind);
-                        phs.push(placeholder(inner.dialect, binds.len()));
-                    }
-                    let op = if *negated { "NOT IN" } else { "IN" };
-                    Ok(format!("{col_ref} {op} ({})", phs.join(", ")))
-                }
+            let col_ref = comparison_operand(inner.dialect, &col.column_type, &col_ref, false);
+            let mut phs = Vec::new();
+            for v in values {
+                let bind = operand_to_bind(v, session, &col.column_type)?;
+                phs.push(comparand(inner.dialect, bind, binds));
             }
+            let op = if *negated { "NOT IN" } else { "IN" };
+            Ok(format!("{col_ref} {op} ({})", phs.join(", ")))
         }
         FilterExpr::IsNull { column, is_null } => {
             let col_ref = format!("{alias}.\"{column}\"");
@@ -455,10 +448,14 @@ fn compile_client_op(
             }
             let mut phs = Vec::new();
             for item in items {
-                binds.push(value_to_bind(item, column_type)?);
-                phs.push(placeholder(inner.dialect, binds.len()));
+                phs.push(comparand(
+                    inner.dialect,
+                    value_to_bind(item, column_type)?,
+                    binds,
+                ));
             }
             let sql_op = if op == "_in" { "IN" } else { "NOT IN" };
+            let col_ref = comparison_operand(inner.dialect, column_type, &col_ref, false);
             Ok(format!("{col_ref} {sql_op} ({})", phs.join(", ")))
         }
         other => {
@@ -483,9 +480,15 @@ fn compile_client_op(
                 }
                 _ => return Err(format!("unknown comparison op `{other}`")),
             };
-            binds.push(value_to_bind(rhs, column_type)?);
-            let ph = placeholder(inner.dialect, binds.len());
+            let ph = comparand(inner.dialect, value_to_bind(rhs, column_type)?, binds);
             let cast_ph = cast_placeholder(inner.dialect, column_type, &ph);
+            let col_ref = match other {
+                "_eq" | "_neq" => comparison_operand(inner.dialect, column_type, &col_ref, false),
+                "_gt" | "_gte" | "_lt" | "_lte" => {
+                    comparison_operand(inner.dialect, column_type, &col_ref, true)
+                }
+                _ => col_ref,
+            };
             Ok(format!("{col_ref} {sql_op} {cast_ph}"))
         }
     }
@@ -516,6 +519,19 @@ fn compile_text_pattern(
     let (sql, bind) = text_pattern(dialect, col_ref, &ph, pattern, escape, case_sensitive)?;
     binds.push(BindValue::Text(bind));
     Ok(sql)
+}
+
+/// The right side of a comparison: a placeholder for `bind`, or `NULL`.
+///
+/// A NULL is written into the statement rather than bound. A bound NULL has
+/// to be given some type, and Postgres then rejects it against a column of
+/// any other type instead of answering unknown as SQLite does.
+fn comparand(dialect: SqlDialect, bind: BindValue, binds: &mut Vec<BindValue>) -> String {
+    if matches!(bind, BindValue::Null) {
+        return "NULL".into();
+    }
+    binds.push(bind);
+    placeholder(dialect, binds.len())
 }
 
 fn cast_placeholder(dialect: SqlDialect, column_type: &ColumnType, ph: &str) -> String {

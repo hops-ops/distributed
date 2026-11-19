@@ -15,7 +15,6 @@ export type ReplicaQueryPlanReasonCode =
 	| 'ambiguous_order_entry'
 	| 'claim_operand'
 	| 'claim_inventory'
-	| 'collation_not_portable'
 	| 'coverage_mismatch'
 	| 'cursor_not_certified'
 	| 'delete_changes_offset_window'

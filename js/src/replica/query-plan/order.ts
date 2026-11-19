@@ -4,8 +4,9 @@ import type {
 	ReplicaOrderFieldArtifact,
 	ReplicaValue
 } from '../types.js';
-import { ORDER_EQUAL, UTF8_ENCODER } from './constants.js';
+import { ORDER_EQUAL } from './constants.js';
 import { recordField, resolveInput } from './resolve.js';
+import { compareUtf8 } from './util.js';
 import type {
 	OrderDirection,
 	ReplicaOrderComparison,
@@ -242,19 +243,6 @@ export function compareOrderField(
 	}
 	if (comparison === 0) return ORDER_EQUAL;
 	return orderResult(direction.startsWith('desc') ? invert(comparison) : comparison);
-}
-
-export function compareUtf8(left: string, right: string): -1 | 0 | 1 {
-	if (left === right) return 0;
-	const leftBytes = UTF8_ENCODER.encode(left);
-	const rightBytes = UTF8_ENCODER.encode(right);
-	const length = Math.min(leftBytes.length, rightBytes.length);
-	for (let index = 0; index < length; index += 1) {
-		const a = leftBytes[index]!;
-		const b = rightBytes[index]!;
-		if (a !== b) return a < b ? -1 : 1;
-	}
-	return leftBytes.length < rightBytes.length ? -1 : 1;
 }
 
 export function orderUnknown(reasonValue: ReplicaQueryPlanReason): ReplicaOrderComparison {

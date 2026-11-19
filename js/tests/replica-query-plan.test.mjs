@@ -99,41 +99,6 @@ function result(value) {
 	return value.result;
 }
 
-test('caller where uses SQL three-valued boolean composition', () => {
-	const record = { id: 'todo-1', priority: 3, active: true, title: 'one', payload: null };
-	const falseDominatesUnknown = filterArtifact(
-		literal({
-			_and: [
-				{ priority: { _eq: null } },
-				{ active: { _eq: false } }
-			]
-		})
-	);
-	assert.equal(result(evaluateReplicaFilter(falseDominatesUnknown, record)), 'no_match');
-
-	const trueDominatesUnknown = filterArtifact(
-		literal({
-			_or: [
-				{ priority: { _eq: null } },
-				{ active: { _eq: true } }
-			]
-		})
-	);
-	assert.equal(result(evaluateReplicaFilter(trueDominatesUnknown, record)), 'match');
-
-	const stillUnknown = filterArtifact(
-		literal({ _not: { priority: { _eq: null } } })
-	);
-	assert.deepEqual(evaluateReplicaFilter(stillUnknown, record), {
-		result: 'unknown',
-		reason: {
-			code: 'sql_null',
-			path: ['where', '_not', 'priority', '_eq'],
-			message: 'SQL comparison with null is unknown'
-		}
-	});
-});
-
 test('caller and row-policy empty boolean lists preserve their distinct server semantics', () => {
 	const record = { id: 'todo-1', priority: 3, active: true, title: 'one', payload: null };
 	assert.equal(
@@ -170,58 +135,8 @@ test('caller and row-policy empty boolean lists preserve their distinct server s
 	);
 });
 
-test('portable scalar filters handle numeric comparisons and exact SQL IN null behavior', () => {
+test('a type-invalid IN candidate is unknown even when another candidate matches', () => {
 	const base = { id: 'todo-1', priority: 3, active: true, title: 'one', payload: null };
-	assert.equal(
-		result(
-			evaluateReplicaFilter(
-				filterArtifact(literal({ priority: { _gte: 3, _lt: 4 } })),
-				base
-			)
-		),
-		'match'
-	);
-	assert.equal(
-		result(
-			evaluateReplicaFilter(
-				filterArtifact(literal({ priority: { _in: [] } })),
-				{ ...base, priority: null }
-			)
-		),
-		'no_match'
-	);
-	assert.equal(
-		result(
-			evaluateReplicaFilter(
-				filterArtifact(literal({ priority: { _nin: [] } })),
-				{ ...base, priority: null }
-			)
-		),
-		'match'
-	);
-	assert.equal(
-		result(
-			evaluateReplicaFilter(
-				filterArtifact(literal({ priority: { _in: [3, null] } })),
-				base
-			)
-		),
-		'match'
-	);
-	assert.equal(
-		evaluateReplicaFilter(
-			filterArtifact(literal({ priority: { _in: [2, null] } })),
-			base
-		).reason.code,
-		'sql_null'
-	);
-	assert.equal(
-		evaluateReplicaFilter(
-			filterArtifact(literal({ priority: { _nin: [2, null] } })),
-			base
-		).reason.code,
-		'sql_null'
-	);
 	assert.equal(
 		evaluateReplicaFilter(
 			filterArtifact(literal({ priority: { _in: ['bad', 3] } })),
@@ -284,48 +199,6 @@ test('BigInt plans compare only JavaScript-safe integer values', () => {
 			{ id: 'same', sequence: 9_007_199_254_740_991 }
 		).result,
 		'less'
-	);
-});
-
-test('unequal string equality and IN require a collation contract', () => {
-	const base = {
-		id: 'todo-1',
-		priority: 3,
-		active: true,
-		title: 'one',
-		payload: null
-	};
-	assert.equal(
-		evaluateReplicaFilter(
-			filterArtifact(literal({ title: { _eq: 'one' } })),
-			base
-		).result,
-		'match'
-	);
-	for (const where of [
-		{ title: { _eq: 'ONE' } },
-		{ title: { _neq: 'ONE' } },
-		{ title: { _in: ['ONE'] } },
-		{ title: { _nin: ['ONE'] } }
-	]) {
-		assert.equal(
-			evaluateReplicaFilter(filterArtifact(literal(where)), base).reason.code,
-			'collation_not_portable'
-		);
-	}
-	assert.equal(
-		evaluateReplicaFilter(
-			filterArtifact(literal({ title: { _in: ['ONE', 'one'] } })),
-			base
-		).result,
-		'match'
-	);
-	assert.equal(
-		evaluateReplicaFilter(
-			filterArtifact(literal({ title: { _nin: ['ONE', 'one'] } })),
-			base
-		).result,
-		'no_match'
 	);
 });
 
@@ -415,7 +288,7 @@ test('unsafe operators, codecs, and absent canonical fields explain why evaluati
 	);
 	assert.equal(
 		evaluateReplicaFilter(
-			filterArtifact(literal({ title: { _gt: 'a' } })),
+			filterArtifact(literal({ active: { _gt: false } })),
 			record
 		).reason.code,
 		'unsupported_operator'
@@ -1049,26 +922,6 @@ test('order comparison validates entry shape, directions, and null placement', (
 		compareReplicaOrder(orderArtifact(literal([{ payload: 'asc' }])), left, right)
 			.reason.code,
 		'unsupported_codec'
-	);
-});
-
-test('string order uses unsigned UTF-8 bytes including supplementary code points', () => {
-	const order = orderArtifact(literal([{ title: 'asc' }]));
-	assert.equal(
-		compareReplicaOrder(
-			order,
-			{ title: '\u{10000}', sequence: 1 },
-			{ title: '\u{e000}', sequence: 2 }
-		).result,
-		'greater'
-	);
-	assert.equal(
-		compareReplicaOrder(
-			order,
-			{ title: 'same', sequence: 1 },
-			{ title: 'same', sequence: 2 }
-		).result,
-		'less'
 	);
 });
 

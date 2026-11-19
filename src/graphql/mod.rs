@@ -39,7 +39,9 @@ pub use surface::{
     SurfaceTypeField,
 };
 
-pub use filter::{claim, col, lit, rel, ClaimRef, ColRef, FilterExpr, LitValue, Operand};
+pub use filter::{
+    claim, col, lit, rel, ClaimRef, CmpOp, ColRef, FilterExpr, LitValue, Operand, Truth,
+};
 pub use permissions::{read, ModelPermissions, ReadPermission};
 
 #[cfg(feature = "graphql")]
