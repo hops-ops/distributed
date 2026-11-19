@@ -1,5 +1,9 @@
 //! GraphQL harden / red-team suite.
 //!
+//! The modules listed in `on_each_dialect!` hold scenarios that take a `Db`;
+//! each runs once on SQLite and once on Postgres (`DATABASE_URL`). The other
+//! modules are SQLite-only by nature (dialect operators, microsvc HTTP).
+//!
 //! Modules map to threat categories (S/A/D/E/T). Every test drives shipped
 //! `GraphqlEngine::execute` and/or microsvc HTTP — no SQL reimplementation.
 //!
@@ -27,3 +31,89 @@ mod inject;
 mod residual;
 mod softskip;
 mod transport;
+
+/// One case list, instantiated per dialect as `sqlite::<module>::<case>` and
+/// `postgres::<module>::<case>`.
+macro_rules! on_each_dialect {
+    ($($module:ident::{ $($case:ident),* $(,)? })*) => {
+        mod sqlite {
+            $(mod $module {
+                $(#[tokio::test]
+                async fn $case() {
+                    crate::$module::$case(crate::common::Db::sqlite().await).await;
+                })*
+            })*
+        }
+
+        #[cfg(feature = "postgres")]
+        mod postgres {
+            $(mod $module {
+                $(#[tokio::test]
+                async fn $case() {
+                    let Some(db) = crate::common::Db::postgres(stringify!($case)).await else {
+                        return;
+                    };
+                    crate::$module::$case(db).await;
+                })*
+            })*
+        }
+    };
+}
+
+on_each_dialect! {
+    access_paths::{
+        row_policy_holds_on_every_access_path,
+        ungranted_columns_models_and_aggregates_are_refused_on_every_access_path,
+    }
+    authz::{
+        claim_row_filter_isolates_tenants,
+        a2_claim_filter_on_by_pk_isolates_tenants,
+        a3_claim_filter_on_aggregate_count,
+        column_allowlist_denies_ungranted_fields,
+        a5_nested_relationship_column_allowlist_denies,
+        nested_has_many_relationship_e2e,
+        by_pk_with_nested_children_returns_row,
+        json_looking_string_column_stays_string,
+        application_surface_with_differing_row_policies_applies_all_of_them,
+    }
+    dos::{
+        where_max_depth_rejected,
+        graphql_depth_counts_root_and_leaf_fields,
+        max_in_list_rejected,
+        limit_clamped_by_max_limit,
+        d5_wide_or_list_rejected_by_max_bool_width,
+        d5_wide_and_list_rejected_by_max_bool_width,
+        d7_concurrent_queries_complete,
+        d7_concurrent_with_timeout_bound_terminates,
+        d8_nested_has_many_exceeds_complexity_budget,
+        d8_shallow_nested_has_many_within_budget,
+        d8_low_max_complexity_rejects_single_nest,
+    }
+    errors::{
+        compile_errors_do_not_leak_sql,
+        e2_execute_failure_is_internal_without_sql_leak,
+    }
+    inject::{
+        s1_response_key_field_selection_safe_roundtrip,
+        s2_unknown_where_key_fails_closed_without_sql_leak,
+        s3_like_wildcards_are_bound_and_safe,
+        s4_json_looking_string_stays_string,
+        s5_order_by_junk_direction_is_safe,
+        s6_pk_type_confusion_does_not_leak_sql,
+        s2_denied_where_column_fails_closed,
+    }
+    residual::{
+        a8_nested_has_many_without_child_grant_is_unknown_field,
+        a12_rel_where_without_target_grant_is_unknown_field,
+        s9_json_contains_on_sqlite_is_bad_request_without_sql_leak,
+        e4_missing_claim_header_is_stable_without_sql_leak,
+    }
+    softskip::{
+        default_engine_has_strict_where_on,
+        strict_unknown_where_key_errors,
+        strict_denied_where_column_errors,
+        strict_junk_order_by_column_errors,
+        strict_valid_where_and_order_still_work,
+        soft_skip_mode_is_opt_in_only,
+    }
+}

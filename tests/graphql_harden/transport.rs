@@ -10,10 +10,9 @@ use distributed::{
     Aggregate, AggregateRepository, Entity, EventRecord, InMemoryRepository, ReadModel,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePoolOptions;
 use tower::util::ServiceExt;
 
-use super::common::{seed_orders, session, OrderView};
+use super::common::{Db, seed_orders, session, OrderView};
 
 #[derive(Default)]
 struct T4Aggregate {
@@ -68,7 +67,7 @@ async fn t4_command_handler(
 /// T3a: anonymous introspection disabled at engine level (existing harden-12).
 #[tokio::test]
 async fn anonymous_introspection_disabled_when_flag_false() {
-    let pool = seed_orders().await;
+    let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
         .roles(&["user", "anonymous"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
@@ -103,7 +102,7 @@ async fn anonymous_introspection_disabled_when_flag_false() {
 
 #[tokio::test]
 async fn anonymous_introspection_allowed_when_flag_true() {
-    let pool = seed_orders().await;
+    let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
         .roles(&["user", "anonymous"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
@@ -122,7 +121,7 @@ async fn anonymous_introspection_allowed_when_flag_true() {
 /// T3b: introspection over HTTP with role headers.
 #[tokio::test]
 async fn t3_introspection_over_http_respects_role() {
-    let pool = seed_orders().await;
+    let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
         .service_id("rt-http")
         .roles(&["user", "anonymous"])
@@ -200,17 +199,13 @@ async fn t4_mutation_absent_without_command_grant() {
         name: String,
     }
 
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE t4_items (id TEXT PRIMARY KEY, name TEXT NOT NULL);
-         INSERT INTO t4_items VALUES ('1', 'n');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let db = Db::sqlite().await;
+    db.seed([Item {
+        id: "1".into(),
+        name: "n".into(),
+    }])
+    .await;
+    let pool = db.pool();
 
     let routes: Routes<AggregateRepository<InMemoryRepository, T4Aggregate>> = Routes::new()
         .with_repo(AggregateRepository::new(InMemoryRepository::new()))
@@ -270,7 +265,7 @@ async fn production_env_policy_disables_graphiql_http_get() {
     let graphiql = graphiql_enabled_from_env_vars(None, Some("production"), None, None);
     assert!(!graphiql);
 
-    let pool = seed_orders().await;
+    let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
         .service_id("prod-gql")
         .roles(&["user"])
@@ -296,7 +291,7 @@ async fn production_env_policy_disables_graphiql_http_get() {
 #[cfg(feature = "metrics")]
 #[tokio::test]
 async fn graphql_metrics_increment_on_execute() {
-    let pool = seed_orders().await;
+    let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
@@ -321,7 +316,7 @@ async fn graphql_metrics_increment_on_execute() {
 #[cfg(feature = "metrics")]
 #[tokio::test]
 async fn graphql_metrics_bad_request_status_label() {
-    let pool = seed_orders().await;
+    let pool = seed_orders(&Db::sqlite().await).await;
     let engine = GraphqlEngine::builder(pool)
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))

@@ -5,30 +5,15 @@ use distributed::graphql::{claim, col, read, GraphqlEngine, ModelPermissions};
 use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
 
 use super::common::{
-    assert_no_sql_leak, engine_all_columns, error_messages, extension_code, seed_orders, session,
+    child, parent, Db, assert_no_sql_leak, engine_all_columns, error_messages, extension_code, seed_orders, session,
     ChildView, OrderView, ParentView,
 };
 
 /// A8: nested has_many without grant on child model → relationship field absent.
-#[tokio::test]
-async fn a8_nested_has_many_without_child_grant_is_unknown_field() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE parents (parent_id TEXT PRIMARY KEY, name TEXT NOT NULL);
-         CREATE TABLE children (
-            child_id TEXT PRIMARY KEY,
-            parent_id TEXT NOT NULL,
-            name TEXT NOT NULL
-         );
-         INSERT INTO parents VALUES ('p1', 'P');
-         INSERT INTO children VALUES ('c1', 'p1', 'secret');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+pub async fn a8_nested_has_many_without_child_grant_is_unknown_field(db: Db) {
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "secret")]).await;
+    let pool = db.pool();
 
     let mut parent = ParentView::schema().clone();
     parent.relationships = vec![RelationshipDef {
@@ -81,25 +66,10 @@ async fn a8_nested_has_many_without_child_grant_is_unknown_field() {
 
 /// A12: relationship where on ungranted target — schema omits rel key from bool_exp
 /// when target has no permission, so GraphQL rejects unknown field (not silent SQL).
-#[tokio::test]
-async fn a12_rel_where_without_target_grant_is_unknown_field() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE parents (parent_id TEXT PRIMARY KEY, name TEXT NOT NULL);
-         CREATE TABLE children (
-            child_id TEXT PRIMARY KEY,
-            parent_id TEXT NOT NULL,
-            name TEXT NOT NULL
-         );
-         INSERT INTO parents VALUES ('p1', 'P');
-         INSERT INTO children VALUES ('c1', 'p1', 'n');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+pub async fn a12_rel_where_without_target_grant_is_unknown_field(db: Db) {
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "n")]).await;
+    let pool = db.pool();
 
     let mut parent = ParentView::schema().clone();
     parent.relationships = vec![RelationshipDef {
@@ -146,9 +116,8 @@ async fn a12_rel_where_without_target_grant_is_unknown_field() {
 }
 
 /// S9 / E6: PG JSON ops on SQLite → BAD_REQUEST / invalid filter, no SQL leak.
-#[tokio::test]
-async fn s9_json_contains_on_sqlite_is_bad_request_without_sql_leak() {
-    let pool = seed_orders().await;
+pub async fn s9_json_contains_on_sqlite_is_bad_request_without_sql_leak(db: Db) {
+    let pool = seed_orders(&db).await;
     // note is a String column; _contains still hits client op path if typed as object
     // Use a Json column if available — OrderView note is Text. Build engine with all columns
     // and use _has_key which is only valid for jsonb ops on comparison exp for JSON scalars.
@@ -180,9 +149,8 @@ async fn s9_json_contains_on_sqlite_is_bad_request_without_sql_leak() {
 }
 
 /// E4: missing claim header on permission filter → stable client error, no leak.
-#[tokio::test]
-async fn e4_missing_claim_header_is_stable_without_sql_leak() {
-    let pool = seed_orders().await;
+pub async fn e4_missing_claim_header_is_stable_without_sql_leak(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
         .roles(&["user"])
         .model::<OrderView>(

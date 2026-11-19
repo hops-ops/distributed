@@ -13,7 +13,7 @@ use distributed::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::common::{exec_json, session};
+use super::common::{exec_json, session, Db};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("authors")]
@@ -57,20 +57,50 @@ struct PostTagView {
 
 /// Rows the tenant `t1` must never see carry `HIDDEN` in a selectable column,
 /// and every row carries `S3CR3T` in the column no role is granted.
-const SEED: &str = "
-    CREATE TABLE authors (author_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, name TEXT NOT NULL, secret TEXT NOT NULL);
-    CREATE TABLE posts (post_id TEXT PRIMARY KEY, author_id TEXT NOT NULL, tenant TEXT NOT NULL, title TEXT NOT NULL, secret TEXT NOT NULL);
-    CREATE TABLE tags (tag_id TEXT PRIMARY KEY, tenant TEXT NOT NULL, label TEXT NOT NULL, secret TEXT NOT NULL);
-    CREATE TABLE post_tags (link_id TEXT PRIMARY KEY, post_id TEXT NOT NULL, tag_id TEXT NOT NULL);
-    INSERT INTO authors VALUES ('a1', 't1', 'Ann', 'S3CR3T'), ('a2', 't2', 'HIDDEN', 'S3CR3T');
-    INSERT INTO posts VALUES
-        ('p1', 'a1', 't1', 'mine', 'S3CR3T'),
-        ('p2', 'a1', 't2', 'HIDDEN', 'S3CR3T'),
-        ('p3', 'a2', 't2', 'HIDDEN', 'S3CR3T'),
-        ('p4', 'a2', 't1', 'orphan', 'S3CR3T');
-    INSERT INTO tags VALUES ('g1', 't1', 'ours', 'S3CR3T'), ('g2', 't2', 'HIDDEN', 'S3CR3T');
-    INSERT INTO post_tags VALUES ('l1', 'p1', 'g1'), ('l2', 'p1', 'g2'), ('l3', 'p2', 'g1'), ('l4', 'p4', 'g1');
-";
+async fn seed(db: &Db) {
+    let author = |author_id: &str, tenant: &str, name: &str| AuthorView {
+        author_id: author_id.into(),
+        tenant: tenant.into(),
+        name: name.into(),
+        secret: "S3CR3T".into(),
+    };
+    let post = |post_id: &str, author_id: &str, tenant: &str, title: &str| PostView {
+        post_id: post_id.into(),
+        author_id: author_id.into(),
+        tenant: tenant.into(),
+        title: title.into(),
+        secret: "S3CR3T".into(),
+    };
+    let tag = |tag_id: &str, tenant: &str, label: &str| TagView {
+        tag_id: tag_id.into(),
+        tenant: tenant.into(),
+        label: label.into(),
+        secret: "S3CR3T".into(),
+    };
+    let link = |link_id: &str, post_id: &str, tag_id: &str| PostTagView {
+        link_id: link_id.into(),
+        post_id: post_id.into(),
+        tag_id: tag_id.into(),
+    };
+    db.seed([author("a1", "t1", "Ann"), author("a2", "t2", "HIDDEN")])
+        .await;
+    db.seed([
+        post("p1", "a1", "t1", "mine"),
+        post("p2", "a1", "t2", "HIDDEN"),
+        post("p3", "a2", "t2", "HIDDEN"),
+        post("p4", "a2", "t1", "orphan"),
+    ])
+    .await;
+    db.seed([tag("g1", "t1", "ours"), tag("g2", "t2", "HIDDEN")])
+        .await;
+    db.seed([
+        link("l1", "p1", "g1"),
+        link("l2", "p1", "g2"),
+        link("l3", "p2", "g1"),
+        link("l4", "p4", "g1"),
+    ])
+    .await;
+}
 
 fn relationship(
     field: &str,
@@ -97,13 +127,9 @@ fn tenant(columns: &[&str]) -> ReadPermission {
         .rows(col("tenant").eq(claim("x-user-id")))
 }
 
-async fn engine() -> GraphqlEngine {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(SEED).execute(&pool).await.unwrap();
+async fn engine(db: &Db) -> GraphqlEngine {
+    seed(db).await;
+    let pool = db.pool();
 
     let mut authors = AuthorView::schema().clone();
     authors.relationships = vec![relationship(
@@ -153,9 +179,8 @@ async fn engine() -> GraphqlEngine {
         .unwrap()
 }
 
-#[tokio::test]
-async fn row_policy_holds_on_every_access_path() {
-    let engine = engine().await;
+pub async fn row_policy_holds_on_every_access_path(db: Db) {
+    let engine = engine(&db).await;
     let cases = [
         (
             "list",
@@ -260,9 +285,8 @@ async fn row_policy_holds_on_every_access_path() {
     }
 }
 
-#[tokio::test]
-async fn ungranted_columns_models_and_aggregates_are_refused_on_every_access_path() {
-    let engine = engine().await;
+pub async fn ungranted_columns_models_and_aggregates_are_refused_on_every_access_path(db: Db) {
+    let engine = engine(&db).await;
     let cases = [
         ("list", "reader", "{ posts { secret } }"),
         (
