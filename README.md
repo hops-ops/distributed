@@ -2211,15 +2211,22 @@ claim names or values; configure the identity mapping to supply those inputs.
 
 Auth is a **built-in GraphQL concern**, not a separate product you wire after the
 fact. The engine validates tokens, maps claims into a `microsvc::Session`, and
-feeds the same claim map into RLS (`claim("x-user-id")`, roles, …). Modes live
-under [`src/graphql/identity/`](src/graphql/identity/):
+feeds the same claim map into RLS (`claim("x-user-id")`, roles, …). There are
+three modes and **no default**: `GraphqlEngine::build()` fails until
+`.identity(..)` names one. They live under
+[`src/graphql/identity/`](src/graphql/identity/):
 
 | Mode | When to use |
 |---|---|
 | **`OidcBearer`** | **Default for public edges:** JWT access tokens (`Authorization: Bearer …`), JWKS (incl. discovery), iss/aud/exp/nbf, alg allowlist (no `alg=none`), claim → engine roles. Configure with `OIDC_ISSUER` / `OIDC_AUDIENCE` (and related). |
-| **`TrustedProxy`** | Mesh/gateway already authenticated; inject trusted headers, strip client spoofing. |
-| **`Hybrid`** | Bearer when present, else trusted proxy headers. |
+| **`Gateway`** | A gateway in front already authenticated the caller. `IdentityConfig::gateway(header, secret)`: a request is trusted only when it carries the shared secret (compared in constant time); its `x-user-id` / `x-roles` then become the session. Without the secret: 401. |
 | **`DevHeaders`** | Local only: ambient `x-user-id` / `x-roles`. **Never** on a public edge. |
+
+Credentials never enter the `Session` handed to command handlers:
+`authorization`, `cookie` and the gateway secret header are dropped in every
+mode. If the issuer's JWKS endpoint fails, requests keep validating against the
+keys already cached, and the issuer is retried after
+`OidcConfig::jwks_refresh_failure_backoff` (30s by default).
 
 Scaffolds prefer **`OidcBearer`** whenever OIDC env is set — not DevHeaders.
 
@@ -2233,8 +2240,15 @@ Shared assertions (E1–E8): discovery/JWKS, happy path, role isolation, multi-a
 
 **WebSocket subscriptions:** browsers cannot set `Authorization` on the upgrade.
 Clients send the access token in `connection_init` (`authorization` /
-`accessToken` / nested headers). Do not put long-lived tokens in query strings
-for production. e2e-ui chat demonstrates the OIDC path.
+`accessToken` / nested headers). Identity is never read from the URL query
+string. Under `Gateway` the secret must be on the upgrade request and the
+`connection_init` payload is ignored. e2e-ui chat demonstrates the OIDC path.
+
+Each origin WebSocket is bounded by `WebsocketLimits` (set with
+`.websocket_limits(..)`): it closes when the token that opened it expires
+(close code `4401`) or after `max_lifetime` (12h), whichever is first; the
+server pings and drops a peer silent for `idle_timeout` (60s); and one
+connection holds at most `max_live_queries` (100) subscriptions.
 
 > **Note:** Raw microsvc HTTP/gRPC routes still treat `Session` as opaque unless
 > you terminate auth at a proxy **or** put the public API on GraphQL

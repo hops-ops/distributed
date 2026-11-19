@@ -60,7 +60,7 @@ impl Execution {
             match &execution.binding {
                 GraphqlBinding::Embedded(embedded)=>{
                     let engine=embedded.engine.as_ref().ok_or_else(||"custom embedded live source is not eligible".to_owned())?;
-                    let (session,principal)=crate::graphql::http::resolve_gateway_ws_identity(engine,&headers,&init).await?.into_parts();
+                    let (session,principal)=crate::graphql::http::resolve_ws_identity(engine,&headers,&init).await.map_err(|_|"unauthorized".to_owned())?.into_parts();
                     let mut request:async_graphql::Request=serde_json::from_value(request).map_err(|_|"invalid live request".to_owned())?;
                     if let Some(principal)=principal {request=request.data(principal);}
                     Ok(engine.execute_stream(&session,request).map(|response|serde_json::to_value(response).map_err(|_|"invalid origin envelope".into())).boxed())
@@ -327,7 +327,7 @@ pub(super) async fn embedded(
     let Some(engine) = &embedded.engine else {
         return;
     };
-    if crate::graphql::http::resolve_gateway_ws_identity(engine, &parts.headers, &init)
+    if crate::graphql::http::resolve_ws_identity(engine, &parts.headers, &init)
         .await
         .is_err()
     {

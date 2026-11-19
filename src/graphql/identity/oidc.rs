@@ -15,6 +15,7 @@ use crate::microsvc::Session;
 
 const DEFAULT_JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 const DEFAULT_JWKS_FORCED_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+const DEFAULT_JWKS_REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const OIDC_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// OIDC validation configuration (behavior normative; field names free).
@@ -30,6 +31,9 @@ pub struct OidcConfig {
     pub jwks_cache_ttl: Duration,
     /// Minimum interval between refreshes forced by tokens with unknown key IDs.
     pub jwks_forced_refresh_cooldown: Duration,
+    /// After a failed refresh, how long to keep serving the keys already held
+    /// (or keep failing, when there are none) before asking the issuer again.
+    pub jwks_refresh_failure_backoff: Duration,
     pub clock_skew: Duration,
     pub alg_allowlist: Vec<String>,
     /// When true (default), missing Bearer → Unauthorized.
@@ -54,6 +58,7 @@ impl OidcConfig {
             jwks_uri: None,
             jwks_cache_ttl: DEFAULT_JWKS_CACHE_TTL,
             jwks_forced_refresh_cooldown: DEFAULT_JWKS_FORCED_REFRESH_COOLDOWN,
+            jwks_refresh_failure_backoff: DEFAULT_JWKS_REFRESH_FAILURE_BACKOFF,
             clock_skew: Duration::from_secs(60),
             alg_allowlist: vec!["RS256".into(), "ES256".into()],
             require_auth: true,
@@ -111,14 +116,41 @@ struct VerifiedAudience {
     value: String,
 }
 
+/// Where a [`VerifiedPrincipal`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provenance {
+    /// A bearer token validated against the issuer's keys.
+    Oidc,
+    /// Minted by the framework for work it starts itself, or rebuilt by a
+    /// service from a subject its own authenticated transport delivered.
+    Internal,
+}
+
+/// Issuer recorded on internal principals. It is not a URL an identity
+/// provider can be configured with, so it cannot collide with a token issuer.
+const INTERNAL_ISSUER: &str = "distributed:internal";
+const INTERNAL_AUDIENCE: &str = "distributed:internal";
+
+/// A subject that cannot name a principal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidPrincipal;
+
+impl std::fmt::Display for InvalidPrincipal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("principal subject must not be empty")
+    }
+}
+
+impl std::error::Error for InvalidPrincipal {}
+
 /// Authentication proof admitted to durable causal dispatch.
 ///
 /// There is no deserializer and no constructor from a [`Session`] or header
-/// map. Production callers obtain this only from the OIDC/identity adapters.
-/// [`Self::test_oidc`] exists so wait-path tests can invoke causal dispatch
-/// without forging identity headers.
+/// map. It is obtained from a validated bearer token, or from
+/// [`Self::internal`] by code that has already authenticated the subject.
 #[derive(Clone, PartialEq, Eq)]
 pub struct VerifiedPrincipal {
+    provenance: Provenance,
     issuer: String,
     subject: String,
     audiences: Vec<VerifiedAudience>,
@@ -127,15 +159,24 @@ pub struct VerifiedPrincipal {
 }
 
 impl VerifiedPrincipal {
-    /// Reconstruct a wait-path principal from a trusted transport subject
-    /// (HTTP headers / gRPC metadata after the proxy has stripped forgeries).
-    /// Not a constructor from client JSON.
-    pub fn from_trusted_transport(subject: &str) -> Self {
-        Self::test_oidc(
-            "https://distributed.local/wait-path",
-            subject,
-            &["distributed-wait-path"],
-        )
+    /// A principal the framework vouches for itself: a schedule firing, or a
+    /// subject carried by a service-to-service hop the caller has already
+    /// authenticated. Never call this with a value a client can choose.
+    pub fn internal(subject: &str) -> Result<Self, InvalidPrincipal> {
+        if subject.trim().is_empty() {
+            return Err(InvalidPrincipal);
+        }
+        Ok(Self {
+            provenance: Provenance::Internal,
+            issuer: INTERNAL_ISSUER.into(),
+            subject: subject.to_string(),
+            audiences: vec![VerifiedAudience {
+                source: VerifiedAudienceSource::Aud,
+                value: INTERNAL_AUDIENCE.into(),
+            }],
+            tenant_partitions: Vec::new(),
+            expires_at: None,
+        })
     }
 
     /// Test-only OIDC principal. Not a production identity constructor.
@@ -153,6 +194,7 @@ impl VerifiedPrincipal {
             "test OIDC audiences must contain only non-empty values"
         );
         Self {
+            provenance: Provenance::Oidc,
             issuer: normalize_issuer(issuer),
             subject: subject.to_string(),
             audiences: audiences
@@ -214,6 +256,7 @@ impl std::fmt::Debug for VerifiedPrincipal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("VerifiedPrincipal")
+            .field("provenance", &self.provenance)
             .field("issuer", &self.issuer)
             .field("subject", &"[redacted]")
             .field("audiences", &"[redacted]")
@@ -276,19 +319,25 @@ struct JwkKey {
     crv: Option<String>,
     x: Option<String>,
     y: Option<String>,
-    #[allow(dead_code)]
-    #[serde(rename = "use")]
-    use_: Option<String>,
 }
 
 struct JwksCache {
     keys: HashMap<String, DecodingKey>,
     refreshed_at: Option<Instant>,
     last_forced_refresh: Option<Instant>,
+    last_failed_refresh: Option<Instant>,
     generation: u64,
 }
 
 impl JwksCache {
+    fn usable_or_unavailable(&self) -> Result<(), ValidationError> {
+        if self.keys.is_empty() {
+            Err(ValidationError::Jwks)
+        } else {
+            Ok(())
+        }
+    }
+
     fn is_fresh(&self, ttl: Duration) -> bool {
         !self.keys.is_empty()
             && self
@@ -314,6 +363,7 @@ impl OidcValidator {
                 keys: HashMap::new(),
                 refreshed_at: None,
                 last_forced_refresh: None,
+                last_failed_refresh: None,
                 generation: 0,
             }),
             refresh: AsyncMutex::new(()),
@@ -335,6 +385,7 @@ impl OidcValidator {
         let mut cache = self.cache.write().map_err(|_| ValidationError::Jwks)?;
         cache.keys = keys;
         cache.refreshed_at = Some(Instant::now());
+        cache.last_failed_refresh = None;
         cache.generation = cache.generation.wrapping_add(1);
         Ok(())
     }
@@ -423,6 +474,15 @@ impl OidcValidator {
             if cache.generation != observed_generation {
                 return Ok(());
             }
+            // The issuer failed recently: do not queue every request behind
+            // another timeout. Keys already held stay good for signature
+            // checks; with none, fail at once.
+            if cache
+                .last_failed_refresh
+                .is_some_and(|failed| failed.elapsed() < self.config.jwks_refresh_failure_backoff)
+            {
+                return cache.usable_or_unavailable();
+            }
             if unknown_kid {
                 if cache.last_forced_refresh.is_some_and(|last_refresh| {
                     last_refresh.elapsed() < self.config.jwks_forced_refresh_cooldown
@@ -436,6 +496,15 @@ impl OidcValidator {
             }
         }
 
+        if self.fetch_jwks().await.is_ok() {
+            return Ok(());
+        }
+        let mut cache = self.cache.write().map_err(|_| ValidationError::Jwks)?;
+        cache.last_failed_refresh = Some(Instant::now());
+        cache.usable_or_unavailable()
+    }
+
+    async fn fetch_jwks(&self) -> Result<(), ValidationError> {
         if let Some(jwks) = &self.config.static_jwks {
             return self.load_jwks_json(jwks);
         }
@@ -740,6 +809,7 @@ fn verified_principal(
     }
 
     Ok(VerifiedPrincipal {
+        provenance: Provenance::Oidc,
         issuer,
         subject,
         audiences,

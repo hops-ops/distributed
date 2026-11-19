@@ -267,6 +267,7 @@ mod tests {
     #[tokio::test]
     async fn sql_store_compiles_todos_list_filter() {
         let engine = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<Todos>(todo_perms())
             .build()
@@ -286,6 +287,7 @@ mod tests {
     #[tokio::test]
     async fn same_blob_games_type_compiles_as_sql_or_cell() {
         let sql = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())
@@ -307,6 +309,7 @@ mod tests {
 
         let cells = MapCellByKey::new();
         let cell = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())
@@ -331,6 +334,7 @@ mod tests {
     async fn cell_store_rejects_list_filter_join_and_live() {
         let cells = MapCellByKey::new();
         let engine = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())
@@ -384,6 +388,7 @@ mod tests {
             json!({ "game_id": "game-1", "owner_id": "alice", "score": 9 }),
         );
         let engine = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())
@@ -416,6 +421,7 @@ mod tests {
             json!({ "game_id": "game-malformed", "score": 10 }),
         );
         let engine = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())
@@ -442,6 +448,7 @@ mod tests {
     async fn graphql_owner_join_fails_on_cell_store() {
         let cells = MapCellByKey::new();
         let engine = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())

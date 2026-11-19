@@ -9,6 +9,7 @@
 //! reject keys absent from `*_bool_exp` / `*_order_by` before compile runs.
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 
 use super::common::{
@@ -56,6 +57,7 @@ pub async fn strict_unknown_where_key_errors(db: Db) {
 pub async fn strict_denied_where_column_errors(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["restricted"])
         .model::<OrderView>(
             ModelPermissions::new().grant("restricted", read().columns(["order_id", "status"])),
@@ -133,6 +135,7 @@ pub async fn strict_valid_where_and_order_still_work(db: Db) {
 pub async fn soft_skip_mode_is_opt_in_only(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .strict_where(false)

@@ -168,7 +168,7 @@ pub fn gateway_router(
                 .map_err(std::io::Error::other)?;
                 NativeBinding::GraphqlWithDelivery(graphql, Arc::new(delivery))
             };
-            let auth = if let Some(config) = engine.identity_config().oidc.clone() {
+            let auth = if let Some(config) = engine.identity_config().oidc().cloned() {
                 let provider = Arc::new(OidcGatewayProvider::new(config, "e2e-ui-oidc-v1"));
                 NativeAuth::new(move |credentials| {
                     let provider = provider.clone();

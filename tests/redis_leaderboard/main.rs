@@ -6,6 +6,7 @@
 //!   REDIS_URL=redis://127.0.0.1:6379 cargo test --test redis_leaderboard --features redis
 #![cfg(feature = "redis")]
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -241,6 +242,7 @@ async fn redis_boards_serve_graphql_queries_and_live_updates() {
         repo.pool().clone(),
     )
     .unwrap()
+    .identity(IdentityConfig::dev_headers())
     .roles(&["user"])
     .leaderboard(
         LeaderboardSurface::single("gold", &board).grant("user", LeaderboardGrant::read()),

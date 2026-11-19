@@ -3,6 +3,7 @@
 #[path = "../support/graphql.rs"]
 mod common;
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -286,6 +287,7 @@ async fn protocol_fixture_with_retention(db: Db, retention: u64) -> ProtocolFixt
     project_item(&repository, &bus, 1, "causal row").await;
 
     let engine = GraphqlEngine::builder(repository.pool())
+        .identity(IdentityConfig::dev_headers())
         .service_id(SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
@@ -605,6 +607,7 @@ pub async fn embedded_models_emit_index_evidence_without_record_evidence(db: Db)
         .expect("project embedded query protocol fact");
 
     let engine = GraphqlEngine::builder(repository.pool())
+        .identity(IdentityConfig::dev_headers())
         .service_id(EMBEDDED_SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
@@ -1171,6 +1174,7 @@ pub async fn multi_root_causal_query_fails_before_merging_independent_snapshots(
 pub async fn row_filtered_surface_never_exposes_partition_wide_live_activity(db: Db) {
     let fixture = protocol_fixture_with_rows(db).await;
     let engine = GraphqlEngine::builder(fixture.repository.pool())
+        .identity(IdentityConfig::dev_headers())
         .service_id(SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
@@ -1372,6 +1376,7 @@ pub async fn gateway_remote_query_revision_parity(db: Db) {
 async fn exercise_query_transport(db: Db, mode: QueryGatewayMode) {
     let fixture = protocol_fixture_with_retention(db, 10).await;
     let builder = GraphqlEngine::builder(fixture.repository.pool())
+        .identity(IdentityConfig::dev_headers())
         .service_id(SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
@@ -1722,6 +1727,7 @@ pub async fn gateway_validator_tracks_projection_commit_in_the_result_snapshot(d
             .await
             .unwrap();
     let engine = GraphqlEngine::builder(fixture.repository.pool())
+        .identity(IdentityConfig::dev_headers())
         .service_id(SERVICE_ID)
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .roles(&["user"])
@@ -1802,6 +1808,7 @@ pub async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql(
         .unwrap();
     let engine = Arc::new(
         GraphqlEngine::builder(fixture.repository.pool())
+            .identity(IdentityConfig::dev_headers())
             .service_id(SERVICE_ID)
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .roles(&["user"])
@@ -2038,6 +2045,7 @@ pub async fn hundred_reads_one_execution_with_cache_disabled(db: Db) {
     .unwrap();
     let engine = Arc::new(
         GraphqlEngine::builder(fixture.repository.pool())
+            .identity(IdentityConfig::dev_headers())
             .service_id(SERVICE_ID)
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .roles(&["user"])
@@ -2549,6 +2557,7 @@ async fn worker_coordinator_uses_actual_origin_projection_sql() {
     .unwrap();
     let engine = Arc::new(
         GraphqlEngine::builder(fixture.repository.pool())
+            .identity(IdentityConfig::dev_headers())
             .service_id(SERVICE_ID)
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .roles(&["user"])

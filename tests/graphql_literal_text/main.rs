@@ -5,6 +5,7 @@
 mod env_support;
 
 use async_graphql::{Request, Variables};
+use distributed::graphql::IdentityConfig;
 use distributed::{
     graphql::{claim, col, read, GraphqlEngine, ModelPermissions},
     microsvc::Session,
@@ -123,6 +124,7 @@ async fn sqlite_literal_text() {
     }
     verify(
         GraphqlEngine::builder(pool)
+            .identity(IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<SearchRow>(permissions())
             .build()
@@ -156,6 +158,7 @@ async fn postgres_literal_text() {
     }
     verify(
         GraphqlEngine::builder(pool)
+            .identity(IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<SearchRow>(permissions())
             .build()

@@ -2,6 +2,7 @@
 //! JSON, on every read path and on both dialects. A text column whose value
 //! looks like JSON stays a string.
 
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine};
 use distributed::{
     ColumnType, PrimaryKey, ReadModel, ReadModelCatalog, RelationalReadModel, RelationshipDef,
@@ -72,6 +73,7 @@ pub async fn json_columns_are_json_on_every_read_path(db: Db) {
         .table_schema(docs);
     let engine = GraphqlEngine::from_schema_catalog(&catalog, db.pool())
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .permission::<Folder>("user", read().all_columns().aggregations())
         .permission::<Doc>("user", read().all_columns().aggregations())
@@ -152,6 +154,7 @@ pub async fn json_column_in_a_wide_row_is_json(db: Db) {
         db.pool(),
     )
     .unwrap()
+    .identity(IdentityConfig::dev_headers())
     .roles(&["user"])
     .grant_all("user")
     .build()

@@ -2,6 +2,7 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 
 use distributed::graphql::{graphiql_enabled_from_env_vars, read, GraphqlEngine, ModelPermissions};
@@ -31,6 +32,7 @@ async fn service_with_graphiql(on: bool) -> Arc<Service> {
     .await;
     let pool = db.pool();
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .service_id("http-gql")
         .roles(&["user"])
         .model::<HttpItem>(ModelPermissions::new().grant("user", read().all_columns()))

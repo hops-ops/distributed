@@ -134,6 +134,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user")
             .protocol_token_key([7; 32])
@@ -214,6 +215,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user");
         builder
@@ -274,6 +276,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user")
             .max_depth(6)
@@ -299,6 +302,7 @@ mod client_surface_parity_tests {
             let project = ReadModelCatalog::new("orders-service").table_schema(orders());
             GraphqlEngine::from_schema_catalog(&project, pool)
                 .unwrap()
+                .identity(crate::graphql::IdentityConfig::dev_headers())
                 .roles(&["user"])
                 .grant_all("user")
                 .client_application_surface("console", ["user"], ["user"])
@@ -628,6 +632,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["admin", "user"])
             .grant_all("admin")
             .grant_all("user")
@@ -653,6 +658,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["anonymous", "user"])
             .grant_all("anonymous")
             .grant_all("user")
@@ -704,6 +710,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["admin", "user"])
             .grant_all("admin")
             .grant_all("user");
@@ -817,6 +824,7 @@ mod client_surface_parity_tests {
         let project2 = ReadModelCatalog::new("orders-service").table_schema(orders());
         let user_only = GraphqlEngine::from_schema_catalog(&project2, pool2)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["admin", "user"])
             .grant_all("admin")
             .grant_all("user")
@@ -867,6 +875,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["admin", "user"])
             .grant_all("admin")
             .grant_all("user")
@@ -1247,6 +1256,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let raw = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user")
             .build()
@@ -1262,6 +1272,7 @@ mod client_surface_parity_tests {
             .connect_lazy("sqlite::memory:")
             .unwrap();
         let result = GraphqlEngine::builder(pool.clone())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .service_id("orders-service")
             .protocol_token_key([0; 32])
             .build();
@@ -1272,6 +1283,7 @@ mod client_surface_parity_tests {
         assert!(error.to_string().contains("must not be all zero"));
 
         let result = GraphqlEngine::builder(pool)
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .protocol_token_key([7; 32])
             .build();
         let error = match result {
@@ -1299,6 +1311,7 @@ mod client_surface_parity_tests {
         .unwrap();
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user")
             .default_limit(7)
@@ -1424,6 +1437,7 @@ mod client_surface_parity_tests {
             .connect_lazy("sqlite::memory:")
             .unwrap();
         let engine = GraphqlEngine::builder(pool)
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .register_schema_exposed(orders())
             .unwrap()
             .roles(&["user"])
@@ -1446,6 +1460,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["empty"])
             .build()
             .unwrap();
@@ -1474,6 +1489,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user")
             .default_limit(7)
@@ -1692,6 +1708,7 @@ mod client_surface_parity_tests {
         let project = matrix_project();
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["restricted", "admin"])
             .default_limit(11)
             .max_limit(23)
@@ -2138,6 +2155,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("composite-service").table_schema(composite_records());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool.clone())
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["admin"])
             .grant_all("admin")
             .build()
@@ -2336,6 +2354,7 @@ mod client_surface_parity_tests {
             .table_schema(policy_children());
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["restricted"]);
         insert_permission(
             &mut builder,
@@ -2411,6 +2430,7 @@ mod client_surface_parity_tests {
                 let project = ReadModelCatalog::new("metrics-service").table_schema(metrics());
                 let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
                     .unwrap()
+                    .identity(crate::graphql::IdentityConfig::dev_headers())
                     .roles(&["restricted"]);
                 insert_permission(
                     &mut builder,
@@ -2432,6 +2452,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("metrics-service").table_schema(metrics());
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["restricted"]);
         insert_permission(
             &mut builder,
@@ -2488,6 +2509,7 @@ mod client_surface_parity_tests {
             let project = ReadModelCatalog::new("metrics-service").table_schema(metrics());
             let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
                 .unwrap()
+                .identity(crate::graphql::IdentityConfig::dev_headers())
                 .roles(&["restricted"]);
             insert_permission(
                 &mut builder,

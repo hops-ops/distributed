@@ -2,6 +2,7 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
+use distributed::graphql::IdentityConfig;
 use std::time::Duration;
 
 use async_graphql::Request;
@@ -61,6 +62,7 @@ async fn setup_fixed() -> (
     let manifest = distributed::ReadModelCatalog::new("items").table_schema(items_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool.clone())
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .change_stream(change_rx)
@@ -259,6 +261,7 @@ async fn subscription_claim_isolation_across_tenants() {
     let change_rx = repo.read_model_changes();
 
     let engine = GraphqlEngine::builder(pool.clone())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<NoteView>(
             ModelPermissions::new().grant(

@@ -1,5 +1,6 @@
 //! E* Error-leakage red-team suite.
 
+use distributed::graphql::IdentityConfig;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use super::common::{
 pub async fn compile_errors_do_not_leak_sql(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_in_list(1)
@@ -52,6 +54,7 @@ async fn e3_sqlite_statement_timeout_returns_timeout_code() {
         .unwrap();
 
     let engine = GraphqlEngine::builder(db.pool())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .statement_timeout(Duration::from_millis(80))

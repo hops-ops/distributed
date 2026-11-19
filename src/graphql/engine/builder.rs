@@ -36,8 +36,8 @@ impl GraphqlEngineBuilder {
             projectors: Vec::new(),
             change_rx: None,
             pending_errors: Vec::new(),
-            // DevHeaders keeps ambient header tests/green; public scaffolds set OidcBearer (D6).
-            identity: IdentityConfig::dev_headers(),
+            identity: None,
+            websocket: WebsocketLimits::default(),
             read_stores: BTreeMap::new(),
             leaderboards: Vec::new(),
         }
@@ -607,9 +607,15 @@ impl GraphqlEngineBuilder {
         self.graphiql = on;
         self
     }
-    /// Configure GraphQL HTTP identity mode (TrustedProxy / OidcBearer / Hybrid / DevHeaders).
+    /// Choose how requests are authenticated. Required: there is no default,
+    /// so an engine can never silently trust client-supplied identity headers.
     pub fn identity(mut self, config: IdentityConfig) -> Self {
-        self.identity = config;
+        self.identity = Some(config);
+        self
+    }
+    /// Bound origin WebSocket connections (lifetime, idleness, live queries).
+    pub fn websocket_limits(mut self, limits: WebsocketLimits) -> Self {
+        self.websocket = limits;
         self
     }
     /// Expose a sorted-set leaderboard through GraphQL (roots, `@live`
@@ -635,6 +641,20 @@ impl GraphqlEngineBuilder {
     pub fn build(mut self) -> Result<GraphqlEngine, GraphqlBuildError> {
         if !self.pending_errors.is_empty() {
             return Err(GraphqlBuildError(self.pending_errors.join("; ")));
+        }
+        let identity = self.identity.take().ok_or_else(|| {
+            GraphqlBuildError(
+                "GraphQL engine has no identity mode; call .identity(..) with IdentityConfig::oidc_bearer, ::gateway or ::dev_headers"
+                    .into(),
+            )
+        })?;
+        if self.websocket.max_lifetime.is_zero()
+            || self.websocket.idle_timeout.is_zero()
+            || self.websocket.max_live_queries == 0
+        {
+            return Err(GraphqlBuildError(
+                "GraphQL WebSocket limits must all be greater than zero".into(),
+            ));
         }
         if self.protocol_namespace.is_some() && self.protocol_token_key.is_none() {
             return Err(GraphqlBuildError(
@@ -1051,7 +1071,6 @@ impl GraphqlEngineBuilder {
                 applications: protocol_applications,
             }
         });
-        let identity_validator = self.identity.oidc.clone().map(OidcValidator::new);
         let mut read_store_kinds = BTreeMap::new();
         let mut cell_getters = BTreeMap::new();
         for (model, store) in self.read_stores {
@@ -1090,8 +1109,8 @@ impl GraphqlEngineBuilder {
             graphiql_schemas,
             change_hub,
             dialect,
-            identity: self.identity,
-            identity_validator,
+            identity: IdentityResolver::new(identity),
+            websocket: self.websocket,
             protocol,
             query_protocol,
             read_stores: read_store_kinds,

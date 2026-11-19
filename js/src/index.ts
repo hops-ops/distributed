@@ -38,7 +38,6 @@ export {
 } from './protocol.js';
 export { documentToString, type GqlDocument } from './document.js';
 export {
-	applyWsDevHeaderParams,
 	buildAuthHeaders,
 	wsConnectionInitPayload
 } from './auth-headers.js';

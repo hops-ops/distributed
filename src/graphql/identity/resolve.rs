@@ -1,135 +1,128 @@
-//! IdentityMode resolution (D1–D14).
+//! How a GraphQL HTTP or WebSocket request becomes a [`Session`].
+//!
+//! There are three modes and no default: an engine is built with exactly one.
 
-use axum::http::HeaderMap;
+use axum::http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
+use axum::http::{HeaderMap, HeaderName};
+use subtle::ConstantTimeEq;
 
 use super::oidc::{OidcConfig, OidcValidator, ValidationError, VerifiedPrincipal};
-use super::session_from_all_headers;
-use crate::microsvc::{Session, USER_ID_KEY};
+use crate::microsvc::Session;
 
-/// Default identity headers stripped under TrustedProxy (fail-closed).
-pub const DEFAULT_IDENTITY_STRIP_HEADERS: &[&str] = &[
-    "x-user-id",
-    "x-role",
-    "x-roles",
-    "x-hasura-user-id",
-    "x-hasura-role",
-    "x-hasura-allowed-roles",
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum IdentityMode {
-    /// Mesh: strip client identity denylist (process-side defense). Gateway
-    /// inject under network isolation should use Hybrid missing-Bearer path
-    /// or configure gateway secret then trust.
-    TrustedProxy,
-    /// Public edge: Bearer JWT required when require_auth (default).
-    OidcBearer,
-    /// Dual path: missing Bearer → trust headers (gateway inject, F6);
-    /// invalid Bearer → 401 (D2); valid → OIDC (D3).
-    Hybrid,
-    /// Local GraphiQL / unit tests only — ambient header trust.
-    #[default]
-    DevHeaders,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct TrustedProxyConfig {
-    pub strip_headers: Vec<String>,
-    /// Optional (name, expected_value). Missing/wrong → 401 (D9).
-    pub gateway_secret_header: Option<(String, String)>,
-}
-
-impl TrustedProxyConfig {
-    pub fn with_defaults() -> Self {
-        Self {
-            strip_headers: DEFAULT_IDENTITY_STRIP_HEADERS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect(),
-            gateway_secret_header: None,
-        }
-    }
-}
-
+/// Who the GraphQL edge believes about the caller's identity.
+// Built once per engine; boxing the OIDC settings would only complicate matching.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
-pub struct IdentityConfig {
-    pub mode: IdentityMode,
-    pub oidc: Option<OidcConfig>,
-    pub trusted_proxy: TrustedProxyConfig,
-}
-
-impl Default for IdentityConfig {
-    fn default() -> Self {
-        // DevHeaders preserves existing ambient-header tests; scaffolds set OidcBearer (D6).
-        Self {
-            mode: IdentityMode::DevHeaders,
-            oidc: None,
-            trusted_proxy: TrustedProxyConfig::with_defaults(),
-        }
-    }
+pub enum IdentityConfig {
+    /// Public edge. Identity comes only from a bearer JWT validated against
+    /// the issuer; `x-user-id` / `x-roles` sent by the client are ignored.
+    OidcBearer(OidcConfig),
+    /// Behind a gateway that authenticates callers itself. A request is
+    /// trusted only when it carries the shared secret; its remaining headers
+    /// (`x-user-id`, `x-roles`, ...) then become the session.
+    Gateway(GatewaySecret),
+    /// Local development and tests only: every request header is believed.
+    DevHeaders,
 }
 
 impl IdentityConfig {
     pub fn oidc_bearer(oidc: OidcConfig) -> Self {
-        Self {
-            mode: IdentityMode::OidcBearer,
-            oidc: Some(oidc),
-            trusted_proxy: TrustedProxyConfig::with_defaults(),
-        }
+        Self::OidcBearer(oidc)
     }
 
-    pub fn hybrid(oidc: OidcConfig) -> Self {
-        Self {
-            mode: IdentityMode::Hybrid,
-            oidc: Some(oidc),
-            trusted_proxy: TrustedProxyConfig::with_defaults(),
+    /// Trust requests that carry `secret` in `header`. Both are required:
+    /// there is no gateway mode without a secret.
+    pub fn gateway(header: &str, secret: impl Into<String>) -> Result<Self, IdentityConfigError> {
+        let header = HeaderName::try_from(header)
+            .map_err(|_| IdentityConfigError("gateway secret header is not a valid header name"))?;
+        let secret = secret.into();
+        if secret.is_empty() {
+            return Err(IdentityConfigError("gateway secret must not be empty"));
         }
-    }
-
-    pub fn trusted_proxy() -> Self {
-        Self {
-            mode: IdentityMode::TrustedProxy,
-            oidc: None,
-            trusted_proxy: TrustedProxyConfig::with_defaults(),
-        }
+        Ok(Self::Gateway(GatewaySecret { header, secret }))
     }
 
     pub fn dev_headers() -> Self {
-        Self {
-            mode: IdentityMode::DevHeaders,
-            oidc: None,
-            trusted_proxy: TrustedProxyConfig::with_defaults(),
+        Self::DevHeaders
+    }
+
+    /// The OIDC settings, when this is [`IdentityConfig::OidcBearer`].
+    pub fn oidc(&self) -> Option<&OidcConfig> {
+        match self {
+            Self::OidcBearer(oidc) => Some(oidc),
+            Self::Gateway(_) | Self::DevHeaders => None,
+        }
+    }
+
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::OidcBearer(_) => "oidc_bearer",
+            Self::Gateway(_) => "gateway",
+            Self::DevHeaders => "dev_headers",
         }
     }
 }
 
-/// Reusable request identity resolver with one shared OIDC validator and JWKS cache.
-///
-/// Construct one resolver per service or middleware layer and reuse it across
-/// requests so live JWKS discovery, parsing, and refresh state remain cached.
+/// The header and value a trusted gateway presents on every request.
+#[derive(Clone)]
+pub struct GatewaySecret {
+    header: HeaderName,
+    secret: String,
+}
+
+impl GatewaySecret {
+    fn verify(&self, headers: &HeaderMap) -> Result<(), AuthError> {
+        let presented = headers
+            .get(&self.header)
+            .map(|value| value.as_bytes())
+            .unwrap_or_default();
+        if bool::from(presented.ct_eq(self.secret.as_bytes())) {
+            Ok(())
+        } else {
+            Err(AuthError::Unauthorized)
+        }
+    }
+}
+
+impl std::fmt::Debug for GatewaySecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewaySecret")
+            .field("header", &self.header)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityConfigError(&'static str);
+
+impl std::fmt::Display for IdentityConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for IdentityConfigError {}
+
+/// Resolves requests under one [`IdentityConfig`], sharing one OIDC validator
+/// and JWKS cache. Build one per service and reuse it for every request.
 pub struct IdentityResolver {
     config: IdentityConfig,
     validator: Option<OidcValidator>,
 }
 
 impl IdentityResolver {
-    /// Build a resolver and its shared validator from one identity configuration.
     pub fn new(config: IdentityConfig) -> Self {
-        let validator = match config.mode {
-            IdentityMode::OidcBearer | IdentityMode::Hybrid => {
-                config.oidc.clone().map(OidcValidator::new)
-            }
-            IdentityMode::DevHeaders | IdentityMode::TrustedProxy => None,
-        };
+        let validator = config.oidc().cloned().map(OidcValidator::new);
         Self { config, validator }
     }
 
-    /// Return the immutable identity configuration used for every resolution.
     pub fn config(&self) -> &IdentityConfig {
         &self.config
     }
 
-    /// Resolve one request while reusing this resolver's live JWKS cache.
+    /// Resolve the session for one request.
     pub async fn resolve_session(&self, headers: &HeaderMap) -> Result<Session, AuthError> {
         self.resolve_identity(headers)
             .await
@@ -140,8 +133,47 @@ impl IdentityResolver {
         &self,
         headers: &HeaderMap,
     ) -> Result<ResolvedIdentity, AuthError> {
-        resolve_identity_with_validator(headers, &self.config, self.validator.as_ref()).await
+        match (&self.config, &self.validator) {
+            (IdentityConfig::DevHeaders, _) => Ok(ResolvedIdentity::unverified(
+                session_from_headers(headers, None),
+            )),
+            (IdentityConfig::Gateway(gateway), _) => {
+                gateway.verify(headers)?;
+                Ok(ResolvedIdentity::unverified(session_from_headers(
+                    headers,
+                    Some(&gateway.header),
+                )))
+            }
+            (IdentityConfig::OidcBearer(oidc), Some(validator)) => {
+                match extract_bearer(headers)? {
+                    // Client identity headers are never merged into either branch.
+                    Some(token) => {
+                        let (session, principal) =
+                            validator.validate_and_map_principal_async(&token).await?;
+                        Ok(ResolvedIdentity::verified(session, principal))
+                    }
+                    None if oidc.require_auth => Err(AuthError::Unauthorized),
+                    None => Ok(ResolvedIdentity::unverified(Session::new())),
+                }
+            }
+            (IdentityConfig::OidcBearer(_), None) => Err(AuthError::Unauthorized),
+        }
     }
+}
+
+/// Request headers as session variables, without the credentials themselves:
+/// a session is handed on to command dispatch and must not carry them.
+fn session_from_headers(headers: &HeaderMap, secret: Option<&HeaderName>) -> Session {
+    let vars = headers
+        .iter()
+        .filter(|(name, _)| {
+            ![&AUTHORIZATION, &COOKIE, &PROXY_AUTHORIZATION].contains(name) && Some(*name) != secret
+        })
+        .filter_map(|(name, value)| {
+            Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+        })
+        .collect();
+    Session::from_map(vars)
 }
 
 /// Placeholder issuer/audience when OIDC env is unset — fail-closed (401) until configured.
@@ -154,7 +186,7 @@ pub const UNSET_OIDC_AUDIENCE: &str = "unset-audience";
 ///
 /// - When `issuer` and `audience` (or `client_id` as audience fallback) are non-empty → use them.
 /// - When unset → placeholder issuer/audience so requests still require Bearer and reject
-///   ambient `x-user-id` / `x-roles` (never [`IdentityMode::DevHeaders`]).
+///   ambient `x-user-id` / `x-roles` (never [`IdentityConfig::DevHeaders`]).
 pub fn public_oidc_identity_from_env_vars(
     issuer: Option<&str>,
     audience: Option<&str>,
@@ -197,9 +229,7 @@ mod public_default_tests {
     #[test]
     fn d6_unset_env_is_oidc_bearer_not_dev_headers() {
         let cfg = public_oidc_identity_from_env_vars(None, None, None, None);
-        assert_eq!(cfg.mode, IdentityMode::OidcBearer);
-        assert_ne!(cfg.mode, IdentityMode::DevHeaders);
-        let oidc = cfg.oidc.as_ref().expect("oidc config");
+        let oidc = cfg.oidc().expect("oidc config");
         assert!(oidc.require_auth);
         assert_eq!(oidc.issuer, UNSET_OIDC_ISSUER);
         assert_eq!(oidc.audience, UNSET_OIDC_AUDIENCE);
@@ -213,8 +243,7 @@ mod public_default_tests {
             None,
             Some("http://localhost:8080/oauth/v2/keys"),
         );
-        assert_eq!(cfg.mode, IdentityMode::OidcBearer);
-        let oidc = cfg.oidc.as_ref().unwrap();
+        let oidc = cfg.oidc().unwrap();
         assert!(oidc.require_auth);
         assert_eq!(oidc.issuer, "http://localhost:8080");
         assert_eq!(oidc.audience, "graphql-api");
@@ -228,12 +257,11 @@ mod public_default_tests {
     fn d6_client_id_falls_back_as_audience() {
         let cfg =
             public_oidc_identity_from_env_vars(Some("http://iss"), None, Some("client-123"), None);
-        assert_eq!(cfg.mode, IdentityMode::OidcBearer);
-        assert_eq!(cfg.oidc.as_ref().unwrap().audience, "client-123");
+        assert_eq!(cfg.oidc().unwrap().audience, "client-123");
     }
 
-    #[test]
-    fn d6_unset_rejects_ambient_headers_via_resolve() {
+    #[tokio::test]
+    async fn d6_unset_rejects_ambient_headers_via_resolve() {
         use axum::http::{HeaderMap, HeaderValue};
         let cfg = public_oidc_identity_from_env_vars(None, None, None, None);
         let mut headers = HeaderMap::new();
@@ -241,7 +269,10 @@ mod public_default_tests {
         headers.insert("x-roles", HeaderValue::from_static("admin"));
         // No Bearer → require_auth → Unauthorized (not DevHeaders trust)
         assert_eq!(
-            resolve_session_sync(&headers, &cfg).unwrap_err(),
+            IdentityResolver::new(cfg)
+                .resolve_session(&headers)
+                .await
+                .unwrap_err(),
             AuthError::Unauthorized
         );
     }
@@ -309,208 +340,92 @@ pub fn extract_bearer(headers: &HeaderMap) -> Result<Option<String>, AuthError> 
     Ok(Some(token.to_string()))
 }
 
-/// Strip identity denylist headers; keep all others.
-pub fn strip_identity_headers(headers: &HeaderMap, strip: &[String]) -> Session {
-    let mut vars = std::collections::HashMap::new();
-    for (name, value) in headers.iter() {
-        let key = name.as_str();
-        if strip.iter().any(|s| s.eq_ignore_ascii_case(key)) {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            vars.insert(key.to_string(), v.to_string());
-        }
-    }
-    Session::from_map(vars)
-}
-
-fn check_gateway_secret(headers: &HeaderMap, cfg: &TrustedProxyConfig) -> Result<(), AuthError> {
-    if let Some((name, expected)) = &cfg.gateway_secret_header {
-        let got = headers
-            .get(name.as_str())
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if got != expected {
-            return Err(AuthError::Unauthorized);
-        }
-    }
-    Ok(())
-}
-
-fn trusted_proxy_session(
-    headers: &HeaderMap,
-    cfg: &TrustedProxyConfig,
-) -> Result<Session, AuthError> {
-    check_gateway_secret(headers, cfg)?;
-    // Process-side strip of client identity denylist (F10).
-    Ok(strip_identity_headers(headers, &cfg.strip_headers))
-}
-
-/// Hybrid missing-Bearer path: trust headers for gateway inject (F6).
-/// When gateway_secret configured, still enforce it.
-fn hybrid_proxy_session(
-    headers: &HeaderMap,
-    cfg: &TrustedProxyConfig,
-) -> Result<Session, AuthError> {
-    check_gateway_secret(headers, cfg)?;
-    Ok(session_from_all_headers(headers))
-}
-
-fn oidc_identity(token: &str, oidc: &OidcConfig) -> Result<ResolvedIdentity, AuthError> {
-    let validator = OidcValidator::new(oidc.clone());
-    // On OIDC success, never merge client identity headers (caller passes token only).
-    // Static JWKS path (tests). Live JWKS uses resolve_identity async.
-    let (session, principal) = validator
-        .validate_and_map_principal(token)
-        .map_err(AuthError::from)?;
-    Ok(ResolvedIdentity::verified(session, principal))
-}
-
-async fn oidc_identity_async(
-    token: &str,
-    validator: &OidcValidator,
-) -> Result<ResolvedIdentity, AuthError> {
-    let (session, principal) = validator
-        .validate_and_map_principal_async(token)
-        .await
-        .map_err(AuthError::from)?;
-    Ok(ResolvedIdentity::verified(session, principal))
-}
-
-/// Resolve Session from headers + config (sync; uses static JWKS for OIDC).
-///
-/// For live JWKS fetch, prefer [`resolve_session`] after loading JWKS into config.static_jwks
-/// or extending the validator — unit tests always use static JWKS.
-pub fn resolve_session_sync(
-    headers: &HeaderMap,
-    config: &IdentityConfig,
-) -> Result<Session, AuthError> {
-    resolve_identity_sync(headers, config).map(|identity| identity.session)
-}
-
-pub(crate) fn resolve_identity_sync(
-    headers: &HeaderMap,
-    config: &IdentityConfig,
-) -> Result<ResolvedIdentity, AuthError> {
-    match config.mode {
-        IdentityMode::DevHeaders => Ok(ResolvedIdentity::unverified(session_from_all_headers(
-            headers,
-        ))),
-        IdentityMode::TrustedProxy => {
-            trusted_proxy_session(headers, &config.trusted_proxy).map(ResolvedIdentity::unverified)
-        }
-        IdentityMode::OidcBearer => {
-            let oidc = config.oidc.as_ref().ok_or(AuthError::Unauthorized)?;
-            match extract_bearer(headers)? {
-                None => {
-                    if oidc.require_auth {
-                        Err(AuthError::Unauthorized)
-                    } else {
-                        Ok(ResolvedIdentity::unverified(Session::new())) // anonymous F9
-                    }
-                }
-                Some(token) => oidc_identity(&token, oidc),
-            }
-        }
-        IdentityMode::Hybrid => {
-            let oidc = config.oidc.as_ref();
-            match extract_bearer(headers)? {
-                None => hybrid_proxy_session(headers, &config.trusted_proxy)
-                    .map(ResolvedIdentity::unverified), // D1 / F6
-                Some(token) => {
-                    let oidc = oidc.ok_or(AuthError::Unauthorized)?;
-                    // D2: invalid → 401, no proxy fallthrough
-                    oidc_identity(&token, oidc)
-                }
-            }
-        }
-    }
-}
-
-/// Resolve one Session, fetching JWKS when needed.
-///
-/// Services handling repeated requests should reuse [`IdentityResolver`] so
-/// live JWKS remain cached between calls.
-pub async fn resolve_session(
-    headers: &HeaderMap,
-    config: &IdentityConfig,
-) -> Result<Session, AuthError> {
-    IdentityResolver::new(config.clone())
-        .resolve_session(headers)
-        .await
-}
-
-pub(crate) async fn resolve_identity_with_validator(
-    headers: &HeaderMap,
-    config: &IdentityConfig,
-    validator: Option<&OidcValidator>,
-) -> Result<ResolvedIdentity, AuthError> {
-    match config.mode {
-        IdentityMode::OidcBearer => {
-            let oidc = config.oidc.as_ref().ok_or(AuthError::Unauthorized)?;
-            match extract_bearer(headers)? {
-                None => {
-                    if oidc.require_auth {
-                        Err(AuthError::Unauthorized)
-                    } else {
-                        Ok(ResolvedIdentity::unverified(Session::new()))
-                    }
-                }
-                Some(token) => {
-                    let validator = validator.ok_or(AuthError::Unauthorized)?;
-                    oidc_identity_async(&token, validator).await
-                }
-            }
-        }
-        IdentityMode::Hybrid => match extract_bearer(headers)? {
-            None => hybrid_proxy_session(headers, &config.trusted_proxy)
-                .map(ResolvedIdentity::unverified),
-            Some(token) => {
-                let _ = config.oidc.as_ref().ok_or(AuthError::Unauthorized)?;
-                let validator = validator.ok_or(AuthError::Unauthorized)?;
-                oidc_identity_async(&token, validator).await
-            }
-        },
-        _ => resolve_identity_sync(headers, config),
-    }
-}
-
-/// True if session has no elevated identity (no user id / asserted roles).
-#[allow(dead_code)]
-pub fn is_anonymous_identity(session: &Session) -> bool {
-    session.get(USER_ID_KEY).is_none() && session.roles().is_empty()
-}
-
 #[cfg(test)]
-mod causal_identity_tests {
+mod tests {
     use super::*;
-    use axum::http::{HeaderMap, HeaderValue};
+    use crate::microsvc::USER_ID_KEY;
+    use axum::http::HeaderValue;
 
-    #[test]
-    fn ambient_and_proxy_identity_never_mint_a_causal_principal() {
+    fn spoofed() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(USER_ID_KEY, HeaderValue::from_static("spoofed-user"));
         headers.insert("x-roles", HeaderValue::from_static("admin"));
-
-        for config in [
-            IdentityConfig::dev_headers(),
-            IdentityConfig::trusted_proxy(),
-            IdentityConfig::hybrid(OidcConfig::new("https://issuer", "api")),
-        ] {
-            let identity = resolve_identity_sync(&headers, &config).unwrap();
-            let (_, principal) = identity.into_parts();
-            assert!(principal.is_none(), "mode {:?} minted a proof", config.mode);
-        }
+        headers.insert("authorization", HeaderValue::from_static("Basic abc"));
+        headers.insert("cookie", HeaderValue::from_static("sid=1"));
+        headers
     }
 
     #[test]
-    fn anonymous_oidc_mode_has_no_causal_principal_without_a_bearer() {
-        let config = IdentityConfig::oidc_bearer(
-            OidcConfig::new("https://issuer", "api").require_auth(false),
+    fn gateway_mode_cannot_be_built_without_a_secret() {
+        assert!(IdentityConfig::gateway("x-gateway-secret", "").is_err());
+        assert!(IdentityConfig::gateway("not a header", "s3cret").is_err());
+        let config = IdentityConfig::gateway("x-gateway-secret", "s3cret").unwrap();
+        assert!(!format!("{config:?}").contains("s3cret"));
+    }
+
+    #[tokio::test]
+    async fn gateway_mode_trusts_headers_only_with_the_secret() {
+        let resolver =
+            IdentityResolver::new(IdentityConfig::gateway("x-gateway-secret", "s3cret").unwrap());
+        let mut headers = spoofed();
+        assert_eq!(
+            resolver.resolve_session(&headers).await.unwrap_err(),
+            AuthError::Unauthorized
         );
-        let identity = resolve_identity_sync(&HeaderMap::new(), &config).unwrap();
-        let (session, principal) = identity.into_parts();
-        assert!(is_anonymous_identity(&session));
+        for wrong in ["", "s3cre", "s3cret ", "S3CRET"] {
+            headers.insert("x-gateway-secret", HeaderValue::from_static(wrong));
+            assert!(
+                resolver.resolve_session(&headers).await.is_err(),
+                "{wrong:?}"
+            );
+        }
+        headers.insert("x-gateway-secret", HeaderValue::from_static("s3cret"));
+        let (session, principal) = resolver
+            .resolve_identity(&headers)
+            .await
+            .unwrap()
+            .into_parts();
+        assert_eq!(session.get(USER_ID_KEY), Some("spoofed-user"));
+        assert!(principal.is_none(), "header trust never mints a proof");
+        for credential in ["x-gateway-secret", "authorization", "cookie"] {
+            assert!(session.get(credential).is_none(), "{credential} leaked");
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_headers_believes_headers_but_keeps_credentials_out_of_the_session() {
+        let resolver = IdentityResolver::new(IdentityConfig::dev_headers());
+        let (session, principal) = resolver
+            .resolve_identity(&spoofed())
+            .await
+            .unwrap()
+            .into_parts();
+        assert_eq!(session.get(USER_ID_KEY), Some("spoofed-user"));
         assert!(principal.is_none());
+        assert!(session.get("authorization").is_none());
+        assert!(session.get("cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn oidc_mode_ignores_client_identity_headers() {
+        let anonymous = IdentityResolver::new(IdentityConfig::oidc_bearer(
+            OidcConfig::new("https://issuer", "api").require_auth(false),
+        ));
+        let mut headers = spoofed();
+        headers.remove("authorization");
+        let (session, principal) = anonymous
+            .resolve_identity(&headers)
+            .await
+            .unwrap()
+            .into_parts();
+        assert!(session.get(USER_ID_KEY).is_none());
+        assert!(session.roles().is_empty());
+        assert!(principal.is_none());
+
+        let required = IdentityResolver::new(IdentityConfig::oidc_bearer(OidcConfig::new(
+            "https://issuer",
+            "api",
+        )));
+        assert!(required.resolve_session(&headers).await.is_err());
     }
 }

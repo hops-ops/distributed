@@ -4,6 +4,7 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -52,6 +53,7 @@ async fn engine(store: Arc<InMemoryLeaderboard>) -> GraphqlEngine {
     let catalog = distributed::ReadModelCatalog::new("leaderboards");
     GraphqlEngine::from_schema_catalog(&catalog, repo.pool().clone())
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "moderator"])
         .leaderboard(xp_surface(), store.clone())
         .leaderboard(season_surface(), store)
@@ -384,6 +386,7 @@ async fn protocol_envelopes_mark_leaderboards_as_snapshot_only() {
     let catalog = distributed::ReadModelCatalog::new("leaderboards");
     let engine = GraphqlEngine::from_schema_catalog(&catalog, repo.pool().clone())
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "moderator"])
         .protocol_token_key([7; 32])
         .leaderboard(xp_surface(), store.clone())

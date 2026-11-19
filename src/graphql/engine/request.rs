@@ -271,7 +271,7 @@ impl GraphqlEngine {
             schema_fingerprint: &surface_info.schema_fingerprint,
             protocol_fingerprint: &surface_info.protocol_fingerprint,
             authorization_surface_fingerprint: authorization_fingerprint,
-            identity_mode: identity_mode_label(self.inner.identity.mode),
+            identity_mode: self.inner.identity.config().label(),
             verified_principal_partition: principal_partition.as_deref(),
             session_authorization_context,
             trusted_presets: &trusted_presets,

@@ -3,6 +3,7 @@
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::{
     graphql::{col, read, rel, GraphqlEngine, GraphqlPoolSource, ModelPermissions},
     microsvc::Session,
@@ -45,6 +46,7 @@ async fn boxed_singular_cycles_preserve_nested_graphql_permissions() {
     .await;
     let pool = db.pool();
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .model::<BoxedAccount>(ModelPermissions::new().grant("user", read().all_columns()))
         .model::<BoxedProfile>(
             ModelPermissions::new().grant(
@@ -177,6 +179,7 @@ async fn list_filter_and_by_pk() {
     let pool = setup_pool().await;
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .grant_all("user")
         .build()
@@ -225,6 +228,7 @@ async fn m2m_permission_filter_resolves_through_field_names_to_columns() {
     let pool = db.pool();
 
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .table_schema(m2m_link_schema())
         .model::<M2mPlayer>(
             ModelPermissions::new().grant(
@@ -276,6 +280,7 @@ async fn m2m_client_where_relationship_predicate() {
     let pool = db.pool();
 
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .table_schema(m2m_link_schema())
         .model::<M2mPlayer>(ModelPermissions::new().grant("user", read().all_columns()))
         .model::<M2mWeapon>(ModelPermissions::new().grant("user", read().all_columns()))
@@ -371,6 +376,7 @@ async fn sqlite_binds_follow_projection_then_where_order_for_relationships() {
         .table_schema(child_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .build()
@@ -572,6 +578,7 @@ async fn belongs_to_joins_source_fk_to_target_primary_key() {
         .table_schema(post_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .build()
@@ -604,6 +611,7 @@ async fn permissions_filter_by_claim() {
     // For fixture without derive, use grant_all and a second role without grants.
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .grant_all("user")
         .build()
@@ -663,6 +671,7 @@ async fn domain_service_shaped_fixture() {
 
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .build()
@@ -710,6 +719,7 @@ async fn gateway_dependency_inventory_includes_empty_relationship_filters() {
     .await
     .unwrap();
     let engine = GraphqlEngine::builder(pool.clone())
+        .identity(IdentityConfig::dev_headers())
         .service_id("relationship-test")
         .protocol_token_key([17; 32])
         .table_schema(m2m_link_schema())

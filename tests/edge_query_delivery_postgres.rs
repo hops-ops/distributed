@@ -4,6 +4,7 @@
     feature = "postgres"
 ))]
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions, ReadRouting};
 use distributed::microsvc::Session;
 use serde_json::{json, Value};
@@ -19,6 +20,7 @@ const QUERY: &str = "query StaleAllowed { gateway_replica_views { id title } }";
 const CURRENT: &str = "query CurrentState { gateway_replica_views { id title } }";
 fn engine(primary: &sqlx::PgPool, replica: &sqlx::PgPool, namespace: &str) -> GraphqlEngine {
     GraphqlEngine::builder(primary.clone())
+        .identity(IdentityConfig::dev_headers())
         .service_id("replica-fixture")
         .protocol_token_key([57; 32])
         .protocol_namespace(namespace)

@@ -5,6 +5,7 @@
 //! with compile-time reject remaining as defense-in-depth.
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{
     comparison_op_fields, include_postgres_json_comparison_ops, read, GraphqlEngine,
     ModelPermissions, POSTGRES_JSON_COMPARISON_OPS,
@@ -31,6 +32,7 @@ async fn engine() -> GraphqlEngine {
     }])
     .await;
     GraphqlEngine::builder(db.pool())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<DocView>(ModelPermissions::new().grant("user", read().all_columns()))
         .build()
