@@ -10,7 +10,8 @@ use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use distributed::projection_protocol::ProjectionChangeRetention;
 use distributed::read_model::ReadModelWritePlanBuilder;
 use distributed::{
-    ReadModel, ReadModelChange, RelationalReadModel, SqliteRepository, TableSchemaRegistry,
+    ReadModel, ReadModelChange, RelationalReadModel, SqliteRepository, TableSchema,
+    TableSchemaRegistry,
 };
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +35,7 @@ pub(crate) use with_repository;
 /// One case list, instantiated per dialect as `sqlite::<case>` and
 /// `postgres::<case>`. A case is an `async fn(Db)`; `module::{..}` groups
 /// name cases in `crate::module`, bare names are cases at the crate root.
+#[allow(unused_macros)]
 macro_rules! on_each_dialect {
     (@cases $($(#[$meta:meta])* $case:ident),* $(,)?) => {
         $($(#[$meta])*
@@ -76,6 +78,7 @@ macro_rules! on_each_dialect {
         }
     };
 }
+#[allow(unused_imports)]
 pub(crate) use on_each_dialect;
 
 /// The database a GraphQL scenario runs against. Scenarios take a `Db` and
@@ -153,6 +156,79 @@ impl Db {
         })
     }
 
+    /// Create the tables `schemas` declare, together so foreign keys between
+    /// them resolve. Relationships are dropped first: they are read-side
+    /// metadata that adds no DDL and may name models outside this set.
+    pub async fn create_tables<'a>(&self, schemas: impl IntoIterator<Item = &'a TableSchema>) {
+        let mut registry = TableSchemaRegistry::new();
+        for schema in schemas {
+            let mut schema = schema.clone();
+            schema.relationships.clear();
+            registry.register_schema(schema).expect("table schema");
+        }
+        self.bootstrap(&registry).await;
+    }
+
+    /// Create the table `schema` declares and insert `rows` (see [`Db::rows`]).
+    /// For fixtures that are a hand-built `TableSchema` with no model type;
+    /// prefer [`Db::seed`] when there is one.
+    pub async fn table(&self, schema: &TableSchema, rows: serde_json::Value) {
+        self.create_tables([schema]).await;
+        self.rows(schema, rows).await;
+    }
+
+    /// Insert `rows` into an existing table: a JSON array of arrays giving
+    /// scalar values in declared column order.
+    pub async fn rows(&self, schema: &TableSchema, rows: serde_json::Value) {
+        let columns: Vec<&str> = schema
+            .columns
+            .iter()
+            .filter(|column| !column.skipped)
+            .map(|column| column.column_name.as_str())
+            .collect();
+        let placeholders: Vec<String> = (1..=columns.len())
+            .map(|n| {
+                if self.is_postgres() {
+                    format!("${n}")
+                } else {
+                    "?".into()
+                }
+            })
+            .collect();
+        let sql = format!(
+            "INSERT INTO \"{}\" ({}) VALUES ({})",
+            schema.table_name,
+            columns
+                .iter()
+                .map(|column| format!("\"{column}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            placeholders.join(", ")
+        );
+        for row in rows.as_array().expect("rows is an array of arrays") {
+            let values = row.as_array().expect("a row is an array");
+            assert_eq!(values.len(), columns.len(), "{}: {row}", schema.table_name);
+            with_repository!(self, repository => {
+                let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.clone()));
+                for value in values {
+                    query = match value {
+                        serde_json::Value::String(text) => query.bind(text.clone()),
+                        serde_json::Value::Bool(flag) => query.bind(*flag),
+                        serde_json::Value::Number(number) => {
+                            query.bind(number.as_i64().expect("integer"))
+                        }
+                        serde_json::Value::Null => query.bind(None::<String>),
+                        other => panic!("unsupported fixture value {other}"),
+                    };
+                }
+                query
+                    .execute(repository.pool())
+                    .await
+                    .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            })
+        }
+    }
+
     /// Raw SQL for fault injection and for standing in for an external
     /// writer; fixture rows and tables come from [`Db::seed`].
     pub async fn execute(&self, sql: impl Into<String>) {
@@ -187,9 +263,7 @@ impl Db {
     /// through a read-model write plan: the table GraphQL reads is the one
     /// the framework generates, not hand-written DDL.
     pub async fn seed<M: RelationalReadModel>(&self, rows: impl IntoIterator<Item = M>) {
-        let mut registry = TableSchemaRegistry::new();
-        registry.register::<M>().expect("read-model schema");
-        self.bootstrap(&registry).await;
+        self.create_tables([M::schema()]).await;
         let mut plan = ReadModelWritePlanBuilder::new();
         let mut staged = false;
         for row in rows {
