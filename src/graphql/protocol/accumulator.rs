@@ -73,7 +73,7 @@ struct LiveResumeTokenMaterial<'a> {
     snapshot_scope: &'a str,
     projection: &'a str,
     topology: &'a crate::projection_protocol::ProjectorTopologyId,
-    partition: &'a crate::projection_protocol::ProjectionPartition,
+    partition: &'a crate::projection_protocol::PartitionId,
     epoch: &'a str,
     position: String,
 }
@@ -423,7 +423,7 @@ impl ProtocolResponseAccumulator {
         &self,
         snapshot_scope: &OpaqueProtocolToken,
         topology: &crate::projection_protocol::ProjectorTopologyId,
-        partition: &crate::projection_protocol::ProjectionPartition,
+        partition: &crate::projection_protocol::PartitionId,
         epoch: &crate::projection_protocol::ProjectionEpoch,
     ) -> Result<OpaqueProtocolToken, ProtocolAccumulatorError> {
         #[derive(Serialize)]
@@ -434,7 +434,7 @@ impl ProtocolResponseAccumulator {
             schema_hash: &'a str,
             snapshot_scope: &'a str,
             topology: &'a crate::projection_protocol::ProjectorTopologyId,
-            partition: &'a crate::projection_protocol::ProjectionPartition,
+            partition: &'a crate::projection_protocol::PartitionId,
             epoch: &'a str,
         }
 
@@ -480,7 +480,7 @@ impl ProtocolResponseAccumulator {
         projection: &str,
         snapshot_scope: &OpaqueProtocolToken,
         topology: &crate::projection_protocol::ProjectorTopologyId,
-        partition: &crate::projection_protocol::ProjectionPartition,
+        partition: &crate::projection_protocol::PartitionId,
         epoch: &crate::projection_protocol::ProjectionEpoch,
         position: u64,
     ) -> Result<DistributedLiveCursor, ProtocolAccumulatorError> {
@@ -530,7 +530,7 @@ impl ProtocolResponseAccumulator {
         snapshot_scope: &OpaqueProtocolToken,
         projection: &str,
         topology: &crate::projection_protocol::ProjectorTopologyId,
-        partition: &crate::projection_protocol::ProjectionPartition,
+        partition: &crate::projection_protocol::PartitionId,
         epoch: &crate::projection_protocol::ProjectionEpoch,
         position: u64,
     ) -> Result<(), ProtocolTokenError> {
@@ -563,7 +563,7 @@ impl ProtocolResponseAccumulator {
         projection: &str,
         snapshot_scope: &OpaqueProtocolToken,
         topology: &crate::projection_protocol::ProjectorTopologyId,
-        partition: &crate::projection_protocol::ProjectionPartition,
+        partition: &crate::projection_protocol::PartitionId,
         epoch: &crate::projection_protocol::ProjectionEpoch,
         position: u64,
     ) -> Result<OpaqueProtocolToken, ProtocolAccumulatorError> {

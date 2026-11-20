@@ -5,7 +5,7 @@ use super::{
     ProjectionScopeCodecError,
 };
 use crate::projection_protocol::{
-    ProjectionRecordScope, ProjectorTopologyId, ResolvedProjectionKey, ResolvedProjectionKeyField,
+    ProjectionRecordScope, ProjectorTopologyId, RecordKey, RecordKeyField,
     ResolvedProjectionObligation,
 };
 use crate::table::{ColumnType, PrimaryKey, RowKey, RowValue, TableColumn, TableKind, TableSchema};
@@ -78,10 +78,10 @@ fn obligation(
     partition: Option<serde_json::Value>,
     fields: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
 ) -> ResolvedProjectionObligation {
-    let key = ResolvedProjectionKey {
+    let key = RecordKey {
         fields: fields
             .into_iter()
-            .map(|(field, value)| ResolvedProjectionKeyField {
+            .map(|(field, value)| RecordKeyField {
                 field: field.into(),
                 value,
             })

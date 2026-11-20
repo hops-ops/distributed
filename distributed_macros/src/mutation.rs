@@ -32,12 +32,22 @@ pub(crate) fn expand(input: proc_macro::TokenStream) -> proc_macro::TokenStream 
 }
 
 /// Load a `.mutation.graphql` document relative to `CARGO_MANIFEST_DIR`.
+///
+/// The expansion `include_str!`s the file, so the compiler tracks it and an
+/// edit to the document rebuilds the crate.
 pub(crate) fn expand_file(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let path_lit = syn::parse_macro_input!(input as LitStr);
-    match load_graphql_file(&path_lit) {
-        Ok(decl) => expand_declaration(decl)
-            .unwrap_or_else(syn::Error::into_compile_error)
-            .into(),
+    let declaration = load_graphql_file(&path_lit).and_then(expand_declaration);
+    match declaration {
+        Ok(declaration) => quote! {
+            {
+                const _: &str = ::core::include_str!(
+                    ::core::concat!(::core::env!("CARGO_MANIFEST_DIR"), "/", #path_lit)
+                );
+                #declaration
+            }
+        }
+        .into(),
         Err(error) => error.to_compile_error().into(),
     }
 }
@@ -645,29 +655,39 @@ fn expand_declaration(decl: MutationDeclaration) -> Result<TokenStream> {
         .transpose()?
         .unwrap_or(1);
     let input_ty = decl.input_ty.unwrap_or_else(|| syn::parse_quote!(()));
-
-    let mut op_tokens = Vec::new();
-    for (index, operation) in decl.operations.iter().enumerate() {
-        op_tokens.push(expand_operation(index as u32, operation)?);
-    }
-
+    let steps = decl.operations.iter().map(expand_step);
     let name_lit = LitStr::new(&name, proc_macro2::Span::call_site());
+    // The declaration is data. `Mutation::program` builds and validates it and
+    // returns an error; nothing here can panic.
     Ok(quote! {
         {
-            let __operations = vec![
-                #(#op_tokens),*
-            ];
-            let __program = ::distributed::MutationProgram::try_new(
-                #name_lit,
-                #version,
-                __operations,
-            ).unwrap_or_else(|error| ::std::panic!("invalid mutation program: {error}"));
-            ::distributed::Mutation::<#input_ty>::from_program(__program)
+            const __STEPS: &[::distributed::MutationStep] = &[#(#steps),*];
+            ::distributed::Mutation::<#input_ty>::declare(#name_lit, #version, __STEPS)
         }
     })
 }
 
-fn expand_operation(index: u32, operation: &MutationOpSyntax) -> Result<TokenStream> {
+fn path_literals(path: &[Ident]) -> Vec<LitStr> {
+    path.iter()
+        .map(|ident| LitStr::new(&ident.to_string(), ident.span()))
+        .collect()
+}
+
+fn expand_inputs(bindings: &[GraphqlFieldBinding]) -> TokenStream {
+    let inputs = bindings.iter().map(|(column, path)| {
+        let column = LitStr::new(&column.to_string(), column.span());
+        let path = path_literals(path);
+        quote! {
+            ::distributed::MutationInput { column: #column, path: &[#(#path),*] }
+        }
+    });
+    quote! { &[#(#inputs),*] }
+}
+
+fn expand_step(operation: &MutationOpSyntax) -> TokenStream {
+    let schema = |model: &Path| {
+        quote! { <#model as ::distributed::RelationalReadModel>::schema }
+    };
     match operation {
         MutationOpSyntax::SugarUpsert { model, input_root }
         | MutationOpSyntax::ExplicitUpsert {
@@ -675,246 +695,33 @@ fn expand_operation(index: u32, operation: &MutationOpSyntax) -> Result<TokenStr
             object_root: input_root,
             ..
         } => {
-            // Expand to runtime helper that uses ReadModel schema for key/fields.
-            let root_lits = input_root
-                .iter()
-                .map(|ident| LitStr::new(&ident.to_string(), ident.span()))
-                .collect::<Vec<_>>();
-            let op_id = format!("upsert-{index}");
-            let op_id_lit = LitStr::new(&op_id, proc_macro2::Span::call_site());
-            Ok(quote! {
-                {
-                    use ::distributed::{
-                        MutationAssignment, MutationConflictTarget, MutationField, MutationKeyField,
-                        MutationKind, MutationOperation, MutationExpression, ProjectionTarget,
-                        ProjectionValueType, RelationalReadModel,
-                    };
-                    let __schema = <#model as RelationalReadModel>::schema();
-                    let __target = ProjectionTarget::try_new(
-                        __schema.model_name.clone(),
-                        __schema.table_name.clone(),
-                    ).expect("model target");
-                    let __root: &[&str] = &[#(#root_lits),*];
-                    let mut __key = ::std::vec::Vec::new();
-                    for (ordinal, column) in __schema.primary_key.columns.iter().enumerate() {
-                        let mut path = __root.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-                        path.push(column.clone());
-                        __key.push(MutationKeyField::try_new(
-                            ordinal as u32,
-                            column.clone(),
-                            MutationExpression::input_path(ProjectionValueType::String, path)
-                                .expect("key path"),
-                        ).expect("key field"));
-                    }
-                    let mut __fields = ::std::vec::Vec::new();
-                    let mut __ordinal = 0u32;
-                    for column in __schema.columns.iter().filter(|column| !column.skipped) {
-                        let mut path = __root.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-                        path.push(column.field_name.clone());
-                        __fields.push(MutationField::try_new(
-                            __ordinal,
-                            column.field_name.clone(),
-                            MutationAssignment::set(
-                                MutationExpression::input_path(
-                                    ProjectionValueType::String,
-                                    path,
-                                ).expect("field path"),
-                            ),
-                        ).expect("field"));
-                        __ordinal += 1;
-                    }
-                    MutationOperation::try_new(
-                        #op_id_lit,
-                        #index,
-                        MutationKind::Upsert,
-                        __target,
-                        __key,
-                        __fields,
-                        Some(MutationConflictTarget::PrimaryKey),
-                        ::std::vec::Vec::new(),
-                        ::std::vec::Vec::new(),
-                        None,
-                    ).expect("upsert operation")
-                }
-            })
+            let model = schema(model);
+            let object = path_literals(input_root);
+            quote! {
+                ::distributed::MutationStep::Upsert { model: #model, object: &[#(#object),*] }
+            }
         }
         MutationOpSyntax::InsertOne { model, object_root } => {
-            let root_lits = object_root
-                .iter()
-                .map(|ident| LitStr::new(&ident.to_string(), ident.span()))
-                .collect::<Vec<_>>();
-            let op_id = format!("insert-{index}");
-            let op_id_lit = LitStr::new(&op_id, proc_macro2::Span::call_site());
-            Ok(quote! {
-                {
-                    use ::distributed::{
-                        MutationAssignment, MutationField, MutationKeyField, MutationKind,
-                        MutationOperation, MutationExpression, ProjectionTarget,
-                        ProjectionValueType, RelationalReadModel,
-                    };
-                    let __schema = <#model as RelationalReadModel>::schema();
-                    let __target = ProjectionTarget::try_new(
-                        __schema.model_name.clone(),
-                        __schema.table_name.clone(),
-                    ).expect("model target");
-                    let __root: &[&str] = &[#(#root_lits),*];
-                    let mut __key = ::std::vec::Vec::new();
-                    for (ordinal, column) in __schema.primary_key.columns.iter().enumerate() {
-                        let mut path = __root.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-                        path.push(column.clone());
-                        __key.push(MutationKeyField::try_new(
-                            ordinal as u32,
-                            column.clone(),
-                            MutationExpression::input_path(ProjectionValueType::String, path)
-                                .expect("key path"),
-                        ).expect("key field"));
-                    }
-                    let mut __fields = ::std::vec::Vec::new();
-                    let mut __ordinal = 0u32;
-                    for column in __schema.columns.iter().filter(|column| !column.skipped) {
-                        let mut path = __root.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-                        path.push(column.field_name.clone());
-                        __fields.push(MutationField::try_new(
-                            __ordinal,
-                            column.field_name.clone(),
-                            MutationAssignment::set(
-                                MutationExpression::input_path(
-                                    ProjectionValueType::String,
-                                    path,
-                                ).expect("field path"),
-                            ),
-                        ).expect("field"));
-                        __ordinal += 1;
-                    }
-                    MutationOperation::try_new(
-                        #op_id_lit,
-                        #index,
-                        MutationKind::Insert,
-                        __target,
-                        __key,
-                        __fields,
-                        None,
-                        ::std::vec::Vec::new(),
-                        ::std::vec::Vec::new(),
-                        None,
-                    ).expect("insert operation")
-                }
-            })
+            let model = schema(model);
+            let object = path_literals(object_root);
+            quote! {
+                ::distributed::MutationStep::Insert { model: #model, object: &[#(#object),*] }
+            }
         }
         MutationOpSyntax::DeleteByPk { model, keys } => {
-            let op_id = format!("delete-{index}");
-            let op_id_lit = LitStr::new(&op_id, proc_macro2::Span::call_site());
-            let key_tokens = keys.iter().enumerate().map(|(ordinal, (name, path))| {
-                let name_lit = LitStr::new(&name.to_string(), name.span());
-                let path_lits = path
-                    .iter()
-                    .map(|ident| LitStr::new(&ident.to_string(), ident.span()))
-                    .collect::<Vec<_>>();
-                let ordinal = ordinal as u32;
-                quote! {
-                    MutationKeyField::try_new(
-                        #ordinal,
-                        #name_lit,
-                        MutationExpression::input_path(
-                            ProjectionValueType::String,
-                            vec![#(#path_lits.to_owned()),*],
-                        ).expect("key path"),
-                    ).expect("key field")
-                }
-            });
-            Ok(quote! {
-                {
-                    use ::distributed::{
-                        MutationKeyField, MutationKind, MutationOperation, MutationExpression,
-                        ProjectionTarget, ProjectionValueType, RelationalReadModel,
-                    };
-                    let __schema = <#model as RelationalReadModel>::schema();
-                    let __target = ProjectionTarget::try_new(
-                        __schema.model_name.clone(),
-                        __schema.table_name.clone(),
-                    ).expect("model target");
-                    MutationOperation::try_new(
-                        #op_id_lit,
-                        #index,
-                        MutationKind::Delete,
-                        __target,
-                        vec![#(#key_tokens),*],
-                        ::std::vec::Vec::new(),
-                        None,
-                        ::std::vec::Vec::new(),
-                        ::std::vec::Vec::new(),
-                        None,
-                    ).expect("delete operation")
-                }
-            })
+            let model = schema(model);
+            let key = expand_inputs(keys);
+            quote! {
+                ::distributed::MutationStep::Delete { model: #model, key: #key }
+            }
         }
         MutationOpSyntax::UpdateByPk { model, keys, sets } => {
-            let op_id = format!("patch-{index}");
-            let op_id_lit = LitStr::new(&op_id, proc_macro2::Span::call_site());
-            let key_tokens = keys.iter().enumerate().map(|(ordinal, (name, path))| {
-                let name_lit = LitStr::new(&name.to_string(), name.span());
-                let path_lits = path
-                    .iter()
-                    .map(|ident| LitStr::new(&ident.to_string(), ident.span()))
-                    .collect::<Vec<_>>();
-                let ordinal = ordinal as u32;
-                quote! {
-                    MutationKeyField::try_new(
-                        #ordinal,
-                        #name_lit,
-                        MutationExpression::input_path(
-                            ProjectionValueType::String,
-                            vec![#(#path_lits.to_owned()),*],
-                        ).expect("key path"),
-                    ).expect("key field")
-                }
-            });
-            let field_tokens = sets.iter().enumerate().map(|(ordinal, (name, path))| {
-                let name_lit = LitStr::new(&name.to_string(), name.span());
-                let path_lits = path
-                    .iter()
-                    .map(|ident| LitStr::new(&ident.to_string(), ident.span()))
-                    .collect::<Vec<_>>();
-                let ordinal = ordinal as u32;
-                quote! {
-                    MutationField::try_new(
-                        #ordinal,
-                        #name_lit,
-                        MutationAssignment::set(
-                            MutationExpression::input_path(
-                                ProjectionValueType::String,
-                                vec![#(#path_lits.to_owned()),*],
-                            ).expect("field path"),
-                        ),
-                    ).expect("field")
-                }
-            });
-            Ok(quote! {
-                {
-                    use ::distributed::{
-                        MutationAssignment, MutationField, MutationKeyField, MutationKind,
-                        MutationOperation, MutationExpression, ProjectionTarget,
-                        ProjectionValueType, RelationalReadModel,
-                    };
-                    let __schema = <#model as RelationalReadModel>::schema();
-                    let __target = ProjectionTarget::try_new(
-                        __schema.model_name.clone(),
-                        __schema.table_name.clone(),
-                    ).expect("model target");
-                    MutationOperation::try_new(
-                        #op_id_lit,
-                        #index,
-                        MutationKind::Patch,
-                        __target,
-                        vec![#(#key_tokens),*],
-                        vec![#(#field_tokens),*],
-                        None,
-                        ::std::vec::Vec::new(),
-                        ::std::vec::Vec::new(),
-                        None,
-                    ).expect("patch operation")
-                }
-            })
+            let model = schema(model);
+            let key = expand_inputs(keys);
+            let set = expand_inputs(sets);
+            quote! {
+                ::distributed::MutationStep::Patch { model: #model, key: #key, set: #set }
+            }
         }
     }
 }

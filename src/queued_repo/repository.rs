@@ -15,16 +15,17 @@ use crate::command_ledger::{
 use crate::entity::Entity;
 use crate::lock::{InMemoryLockManager, Lock, LockManager};
 use crate::projection_protocol::{
-    ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest, ProjectionChangeCursor,
-    ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch, ProjectionCommitResult,
-    ProjectionFailure, ProjectionFailureBatch, ProjectionFailureLocation, ProjectionGeneration,
-    ProjectionInputCursor, ProjectionInputDisposition, ProjectionLiveRecordBatch,
-    ProjectionLiveRecordBatchRequest, ProjectionModelOwnership, ProjectionObligationEvidenceBatch,
-    ProjectionObligationEvidenceBatchRequest, ProjectionObservation, ProjectionObservationKind,
-    ProjectionPartition, ProjectionPartitionRuntimeState, ProjectionProtocolError,
-    ProjectionProtocolStore, ProjectionQuerySnapshot, ProjectionQuerySnapshotBatch,
-    ProjectionQuerySnapshotBatchRequest, ProjectionQuerySnapshotRequest, ProjectionRecordMetadata,
-    ProjectionRecordScope, ProjectorTopologyId, TrustedProjectionInput,
+    PartitionId, ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
+    ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch,
+    ProjectionCommitResult, ProjectionFailure, ProjectionFailureBatch, ProjectionFailureLocation,
+    ProjectionGeneration, ProjectionInputCursor, ProjectionInputDisposition,
+    ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest, ProjectionModelOwnership,
+    ProjectionObligationEvidenceBatch, ProjectionObligationEvidenceBatchRequest,
+    ProjectionObservation, ProjectionObservationKind, ProjectionPartitionRuntimeState,
+    ProjectionProtocolError, ProjectionProtocolStore, ProjectionQuerySnapshot,
+    ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
+    ProjectionQuerySnapshotRequest, ProjectionRecordMetadata, ProjectionRecordScope,
+    ProjectorTopologyId, TrustedProjectionInput,
 };
 use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities};
 use crate::repository::{
@@ -473,7 +474,7 @@ where
     fn projection_partition_runtime_state<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
     ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>>
            + Send
            + 'a {
@@ -494,7 +495,7 @@ where
     fn projection_changes<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         after: Option<&'a ProjectionChangeCursor>,
         limit: usize,
     ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a
@@ -506,7 +507,7 @@ where
     fn repair_projection<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a
     {
@@ -524,7 +525,7 @@ where
     fn projection_failure<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a
     {

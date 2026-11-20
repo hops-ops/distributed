@@ -5,10 +5,9 @@ use crate::projection::placement::{
 };
 use crate::projection_protocol::MAX_PROJECTION_PARTITION_BYTES;
 use crate::{
-    ProjectionInvalidation, ProjectionMutationKind, ProjectionRelationshipEffectKind,
-    ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPartition,
-    ResolvedProjectionPartitionRef, ResolvedProjectionPlan, ResolvedProjectionRelationshipEffect,
-    ResolvedProjectionValue,
+    MutationKind, ProjectionInvalidation, ProjectionRelationshipEffectKind, ResolvedProjectionKey,
+    ResolvedProjectionMutation, ResolvedProjectionPartition, ResolvedProjectionPartitionRef,
+    ResolvedProjectionPlan, ResolvedProjectionRelationshipEffect, ResolvedProjectionValue,
 };
 
 use super::authorization::{
@@ -665,7 +664,7 @@ fn lower_record_consequence(
             recoveries,
         );
     };
-    if mutation.kind() == ProjectionMutationKind::Delete {
+    if mutation.kind() == MutationKind::Delete {
         return push_operation(
             operations,
             ProjectionDeltaOperation {
@@ -772,14 +771,14 @@ fn lower_record_consequence(
     )
 }
 
-fn complete_write(kind: ProjectionMutationKind) -> bool {
+fn complete_write(kind: MutationKind) -> bool {
     matches!(
         kind,
-        ProjectionMutationKind::Insert
-            | ProjectionMutationKind::Upsert
-            | ProjectionMutationKind::Recreate
-            | ProjectionMutationKind::InsertRelated
-            | ProjectionMutationKind::UpsertRelated
+        MutationKind::Insert
+            | MutationKind::Upsert
+            | MutationKind::Recreate
+            | MutationKind::InsertRelated
+            | MutationKind::UpsertRelated
     )
 }
 

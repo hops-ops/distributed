@@ -12,8 +12,8 @@ use crate::projection::placement::{
     ProjectionBindingState, ProjectionExecutionClass, ProjectionPlacement,
 };
 use crate::projection::{
-    ProjectionAssignmentRef, ProjectionEnvelopeField, ProjectionExpression,
-    ProjectionExpressionRef, ProjectionInvalidation, ProjectionMutationKind, ProjectionPartition,
+    MutationKind, ProjectionAssignmentRef, ProjectionEnvelopeField, ProjectionExpression,
+    ProjectionExpressionRef, ProjectionInvalidation, ProjectionPartition,
     ProjectionRelationshipEffectKind, ProjectionScalarTransform, ProjectionValue,
     ProjectionValueRef, ProjectionValueType,
 };
@@ -1329,16 +1329,16 @@ fn client_envelope(field: ProjectionEnvelopeField) -> ClientProjectionEnvelopeFi
     }
 }
 
-fn mutation_kind(kind: ProjectionMutationKind) -> ClientProjectionMutationKind {
+fn mutation_kind(kind: MutationKind) -> ClientProjectionMutationKind {
     match kind {
-        ProjectionMutationKind::Insert => ClientProjectionMutationKind::Insert,
-        ProjectionMutationKind::Upsert => ClientProjectionMutationKind::Upsert,
-        ProjectionMutationKind::Patch => ClientProjectionMutationKind::Patch,
-        ProjectionMutationKind::UpsertPatch => ClientProjectionMutationKind::UpsertPatch,
-        ProjectionMutationKind::Delete => ClientProjectionMutationKind::Delete,
-        ProjectionMutationKind::Recreate => ClientProjectionMutationKind::Recreate,
-        ProjectionMutationKind::InsertRelated => ClientProjectionMutationKind::InsertRelated,
-        ProjectionMutationKind::UpsertRelated => ClientProjectionMutationKind::UpsertRelated,
+        MutationKind::Insert => ClientProjectionMutationKind::Insert,
+        MutationKind::Upsert => ClientProjectionMutationKind::Upsert,
+        MutationKind::Patch => ClientProjectionMutationKind::Patch,
+        MutationKind::UpsertPatch => ClientProjectionMutationKind::UpsertPatch,
+        MutationKind::Delete => ClientProjectionMutationKind::Delete,
+        MutationKind::Recreate => ClientProjectionMutationKind::Recreate,
+        MutationKind::InsertRelated => ClientProjectionMutationKind::InsertRelated,
+        MutationKind::UpsertRelated => ClientProjectionMutationKind::UpsertRelated,
     }
 }
 
@@ -1464,7 +1464,7 @@ mod tests {
             vec![SurfaceProjectionOperation {
                 operation_id: format!("{name}-delete-{ordinal}"),
                 staging_ordinal: ordinal,
-                kind: ProjectionMutationKind::Delete,
+                kind: MutationKind::Delete,
                 model: "TodoView".into(),
                 storage: "todos".into(),
                 key: vec![ProjectionKeyField::try_new(
@@ -1513,7 +1513,7 @@ mod tests {
                 operations: vec![SurfaceProjectionOperation {
                     operation_id: format!("{name}-delete"),
                     staging_ordinal: 0,
-                    kind: ProjectionMutationKind::Delete,
+                    kind: MutationKind::Delete,
                     model: "TodoView".into(),
                     storage: "todos".into(),
                     key: vec![ProjectionKeyField::try_new(
@@ -1547,7 +1547,7 @@ mod tests {
                 operations: vec![SurfaceProjectionOperation {
                     operation_id: format!("{name}-patch"),
                     staging_ordinal: 0,
-                    kind: ProjectionMutationKind::Patch,
+                    kind: MutationKind::Patch,
                     model: "TodoView".into(),
                     storage: "todos".into(),
                     key: vec![ProjectionKeyField::try_new(
@@ -1678,7 +1678,7 @@ mod tests {
                 operations: vec![SurfaceProjectionOperation {
                     operation_id: "auto-upsert".into(),
                     staging_ordinal: 0,
-                    kind: ProjectionMutationKind::Upsert,
+                    kind: MutationKind::Upsert,
                     model: "TodoView".into(),
                     storage: "todos".into(),
                     key: vec![ProjectionKeyField::try_new(
@@ -2236,7 +2236,7 @@ mod tests {
             operations: vec![SurfaceProjectionOperation {
                 operation_id: "delete-todo".into(),
                 staging_ordinal: 0,
-                kind: ProjectionMutationKind::Delete,
+                kind: MutationKind::Delete,
                 model: "TodoView".into(),
                 storage: "todos".into(),
                 key: vec![

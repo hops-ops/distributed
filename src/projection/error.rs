@@ -69,6 +69,11 @@ pub enum ProjectionProgramError {
     },
     /// Two arms selected the same exact event contract.
     DuplicateSelector,
+    /// A mutation input was bound by no event expression.
+    MissingInput {
+        /// Dotted mutation input path.
+        path: String,
+    },
     /// No arm accepted the supplied event occurrence.
     NoMatchingArm,
     /// More than one arm accepted the supplied event occurrence.
@@ -158,6 +163,12 @@ impl fmt::Display for ProjectionProgramError {
                 write!(formatter, "duplicate {kind} name `{name}`")
             }
             Self::DuplicateSelector => formatter.write_str("duplicate exact event selector"),
+            Self::MissingInput { path } => {
+                write!(
+                    formatter,
+                    "no event expression fills mutation input `{path}`"
+                )
+            }
             Self::NoMatchingArm => formatter.write_str("no projection arm matched the occurrence"),
             Self::MultipleMatchingArms => {
                 formatter.write_str("multiple projection arms matched the occurrence")

@@ -67,7 +67,7 @@ mod tests {
             Some(&RowValue::String("hello".into()))
         );
         assert_eq!(
-            SaveChatMessage().program().operations()[0].kind(),
+            SaveChatMessage().program().unwrap().operations()[0].kind(),
             MutationKind::Upsert
         );
         assert_eq!(ChatMessages::schema().table_name, "chat_messages");
@@ -75,8 +75,11 @@ mod tests {
 
     #[test]
     fn mutation_is_event_free() {
-        assert_eq!(SaveChatMessage().program().name(), "SaveChatMessage");
-        let json = serde_json::to_value(SaveChatMessage().program())
+        assert_eq!(
+            SaveChatMessage().program().unwrap().name(),
+            "SaveChatMessage"
+        );
+        let json = serde_json::to_value(SaveChatMessage().program().unwrap())
             .unwrap()
             .to_string();
         assert!(!json.contains("event_name"));

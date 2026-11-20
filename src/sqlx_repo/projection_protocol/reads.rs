@@ -126,7 +126,7 @@ where
 pub(super) fn decode_change_row<DB>(
     row: &DB::Row,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     expected_epoch: &ProjectionEpoch,
 ) -> Result<ProjectionChange, ProjectionProtocolError>
 where
@@ -358,7 +358,7 @@ where
     let (revision, tombstone) = next_record(
         &staged.scope,
         &expectation,
-        ProjectionMutationKind::Upsert,
+        RecordTransition::Upsert,
         current.as_ref(),
         false,
     )?;
@@ -1717,7 +1717,7 @@ where
         let partition_bytes: Vec<u8> = row.try_get("partition_bytes").map_err(|error| {
             protocol_storage_error::<DB>("decode modeled evidence partition bytes", error)
         })?;
-        let partition = ProjectionPartition::new(partition_bytes)?;
+        let partition = PartitionId::new(partition_bytes)?;
         let partition_hash: Vec<u8> = row.try_get("partition_hash").map_err(|error| {
             protocol_storage_error::<DB>("decode modeled evidence partition hash", error)
         })?;
@@ -2046,7 +2046,7 @@ where
         let partition_bytes: Vec<u8> = row.try_get("live_partition_bytes").map_err(|error| {
             protocol_storage_error::<DB>("decode live-record partition bytes", error)
         })?;
-        let partition = ProjectionPartition::new(partition_bytes)?;
+        let partition = PartitionId::new(partition_bytes)?;
         let stored_partition_hash: Vec<u8> =
             row.try_get("live_partition_hash").map_err(|error| {
                 protocol_storage_error::<DB>("decode live-record partition hash", error)
@@ -2201,7 +2201,7 @@ where
 pub(super) async fn read_projection_changes_in_executor_after_state<DB, AfterState>(
     connection: &mut DB::Connection,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     after: Option<&ProjectionChangeCursor>,
     limit: usize,
     after_state: AfterState,
@@ -2328,7 +2328,7 @@ where
 pub(crate) async fn read_projection_changes_in_executor<DB>(
     connection: &mut DB::Connection,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     after: Option<&ProjectionChangeCursor>,
     limit: usize,
 ) -> Result<ProjectionChangeRead, ProjectionProtocolError>
@@ -2363,7 +2363,7 @@ where
 pub(super) async fn read_projection_changes_in_snapshot<DB, AfterState>(
     pool: &Pool<DB>,
     topology: ProjectorTopologyId,
-    partition: ProjectionPartition,
+    partition: PartitionId,
     after: Option<ProjectionChangeCursor>,
     limit: usize,
     after_state: AfterState,

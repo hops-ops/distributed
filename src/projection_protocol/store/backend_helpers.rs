@@ -1,6 +1,6 @@
 use super::{
     ProjectionChangeKind, ProjectionFailure, ProjectionFailureBatch,
-    ProjectionGraphSnapshotRequest, ProjectionMutationKind, ProjectionProtocolError,
+    ProjectionGraphSnapshotRequest, ProjectionProtocolError, RecordTransition,
     MAX_PROJECTION_QUERY_BATCH_ROWS,
 };
 use crate::projection_protocol::MAX_PROJECTION_POSITION;
@@ -27,11 +27,11 @@ pub(crate) fn table_model_name(mutation: &TableMutation) -> &str {
     }
 }
 
-pub(crate) fn change_kind_for_mutation(kind: ProjectionMutationKind) -> ProjectionChangeKind {
+pub(crate) fn change_kind_for_mutation(kind: RecordTransition) -> ProjectionChangeKind {
     match kind {
-        ProjectionMutationKind::Upsert => ProjectionChangeKind::RecordUpsert,
-        ProjectionMutationKind::Delete => ProjectionChangeKind::RecordDelete,
-        ProjectionMutationKind::Recreate => ProjectionChangeKind::RecordRecreate,
+        RecordTransition::Upsert => ProjectionChangeKind::RecordUpsert,
+        RecordTransition::Delete => ProjectionChangeKind::RecordDelete,
+        RecordTransition::Recreate => ProjectionChangeKind::RecordRecreate,
     }
 }
 
@@ -158,8 +158,8 @@ pub(crate) fn checked_projection_graph_materialization(
 mod tests {
     use super::*;
     use crate::projection_protocol::{
-        ProjectionChangeCursor, ProjectionEpoch, ProjectionGeneration, ProjectionInputCursor,
-        ProjectionInputFingerprint, ProjectionPartition, ProjectionSource, ProjectorTopologyId,
+        PartitionId, ProjectionChangeCursor, ProjectionEpoch, ProjectionGeneration,
+        ProjectionInputCursor, ProjectionInputFingerprint, ProjectionSource, ProjectorTopologyId,
         TrustedProjectionInput,
     };
 
@@ -167,8 +167,8 @@ mod tests {
         ProjectorTopologyId::new(1, "todos", [7; 32]).unwrap()
     }
 
-    fn partition() -> ProjectionPartition {
-        ProjectionPartition::new(b"tenant:a".to_vec()).unwrap()
+    fn partition() -> PartitionId {
+        PartitionId::new(b"tenant:a".to_vec()).unwrap()
     }
 
     fn failure_batch() -> ProjectionFailureBatch {

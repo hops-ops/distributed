@@ -31,9 +31,7 @@ use crate::graphql::surface::{Surface, SurfaceModeledProjection};
 use crate::projection::placement::{ProjectionBinding, ProjectionExecutorRoute};
 use crate::projection_protocol::{
     ProjectionCausationEvidenceBatch, ProjectionObservation, ProjectionObservationKind,
-    ProjectionScopeCodec, ProjectorTopologyId,
-    ResolvedProjectionKey as ProtocolResolvedProjectionKey,
-    ResolvedProjectionKeyField as ProtocolResolvedProjectionKeyField,
+    ProjectionScopeCodec, ProjectorTopologyId, RecordKey, RecordKeyField,
 };
 use crate::table::ColumnType;
 use crate::{
@@ -964,10 +962,7 @@ impl ProtocolProjectionProgramRegistry {
                     "projection registry requires the unselected catalog Surface".into(),
                 ));
             };
-            if program
-                .id()
-                .map_err(|error| ProjectionRuntimeAuthorityError::Registry(error.to_string()))?
-                != modeled.program_id()
+            if program.id() != modeled.program_id()
                 || binding.id() != modeled.binding_id()
                 || binding.program_id() != modeled.program_id()
             {
@@ -1422,13 +1417,13 @@ fn authorized_key_matches(
 
 fn protocol_resolved_key(
     key: &ResolvedProjectionKey,
-) -> Result<ProtocolResolvedProjectionKey, ProjectionRuntimeAuthorityError> {
-    Ok(ProtocolResolvedProjectionKey {
+) -> Result<RecordKey, ProjectionRuntimeAuthorityError> {
+    Ok(RecordKey {
         fields: key
             .fields()
             .iter()
             .map(|field| {
-                Ok(ProtocolResolvedProjectionKeyField {
+                Ok(RecordKeyField {
                     field: field.name().to_owned(),
                     value: projection_value_json(field.value().as_ref())?,
                 })
@@ -1746,7 +1741,7 @@ impl ProtocolProjectionDeltaRequestAuthority {
         self.codec
             .verify(
                 &token,
-                ProtocolTokenPurpose::ProjectionPartition,
+                ProtocolTokenPurpose::PartitionId,
                 &PartitionTokenMaterial {
                     domain: "distributed.graphql.projection-partition",
                     version: 1,
@@ -1808,7 +1803,7 @@ impl ProjectionPartitionScopeEncoder for ProtocolProjectionDeltaRequestAuthority
         let token = self
             .codec
             .issue(
-                ProtocolTokenPurpose::ProjectionPartition,
+                ProtocolTokenPurpose::PartitionId,
                 &PartitionTokenMaterial {
                     domain: "distributed.graphql.projection-partition",
                     version: 1,

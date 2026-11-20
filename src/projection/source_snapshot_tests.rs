@@ -484,8 +484,8 @@ async fn source_snapshots_postgres_reordering_and_restart() {
 #[test]
 fn source_snapshots_policy_is_explicit_hashed_and_rejects_delta_programs() {
     use crate::projection::{
-        ProjectionArm, ProjectionMutationKind as Kind, ProjectionOperation, ProjectionPartition,
-        ProjectionProgram,
+        MutationKind as Kind, ProjectionArm, ProjectionOperation, ProjectionPartition,
+        ProjectionProgram, SourceOrdering,
     };
     let snapshots = SNAPSHOTS.program().unwrap();
     let ordered = ProjectionProgram::try_new(
@@ -497,7 +497,7 @@ fn source_snapshots_policy_is_explicit_hashed_and_rejects_delta_programs() {
     .unwrap();
     assert!(snapshots.source_snapshots());
     assert!(!ordered.source_snapshots());
-    assert_ne!(snapshots.id().unwrap(), ordered.id().unwrap());
+    assert_ne!(snapshots.id(), ordered.id());
     let arm = &snapshots.arms()[0];
     let op = &arm.operations()[0];
     for kind in [Kind::Insert, Kind::Patch, Kind::UpsertPatch, Kind::Recreate] {
@@ -517,7 +517,9 @@ fn source_snapshots_policy_is_explicit_hashed_and_rejects_delta_programs() {
         let program =
             ProjectionProgram::try_new("delta", 1, ProjectionPartition::Unit, vec![arm]).unwrap();
         assert!(
-            program.with_source_snapshots().is_err(),
+            program
+                .with_source_ordering(SourceOrdering::AggregateSnapshot)
+                .is_err(),
             "{kind:?} cannot silently become a snapshot"
         );
     }
@@ -528,7 +530,9 @@ fn source_snapshots_policy_is_explicit_hashed_and_rejects_delta_programs() {
         snapshots.arms().to_vec(),
     )
     .unwrap();
-    assert!(partitioned.with_source_snapshots().is_err());
+    assert!(partitioned
+        .with_source_ordering(SourceOrdering::AggregateSnapshot)
+        .is_err());
 }
 
 #[test]

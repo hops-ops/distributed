@@ -11,7 +11,7 @@ pub(crate) trait ProjectionProtocolScenario {
 
     fn other_topology(&self) -> ProjectorTopologyId;
 
-    fn partition(&self) -> ProjectionPartition;
+    fn partition(&self) -> PartitionId;
 
     fn source(&self, name: &str, key: &[u8]) -> ProjectionSource {
         ProjectionSource::new(name, key.to_vec()).unwrap()
@@ -49,7 +49,7 @@ pub(crate) trait ProjectionProtocolScenario {
 
     fn input_for_partition(
         &self,
-        partition: ProjectionPartition,
+        partition: PartitionId,
         position: u64,
         fingerprint: &[u8],
         message_id: &str,
@@ -80,7 +80,7 @@ pub(crate) trait ProjectionProtocolScenario {
     fn mutation(
         &self,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
     ) -> ProjectionRecordMutation;
 
     fn row_exists<'a>(
@@ -279,7 +279,7 @@ pub(crate) async fn identical_redelivery_advances_only_broker_checkpoint(
     );
     let mutation = scenario.mutation(
         ProjectionRecordExpectation::Missing,
-        ProjectionMutationKind::Upsert,
+        RecordTransition::Upsert,
     );
     let scope = mutation.scope.clone();
     store
@@ -304,7 +304,7 @@ pub(crate) async fn identical_redelivery_advances_only_broker_checkpoint(
             repeat.clone(),
             vec![scenario.mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             Vec::new(),
         ))
@@ -354,7 +354,7 @@ pub(crate) async fn identical_redelivery_advances_only_broker_checkpoint(
     );
     assert!(store.projection_input_disposition(&altered).await.is_err());
     let other_partition = scenario.input_for_partition(
-        ProjectionPartition::new(b"other-partition".to_vec()).unwrap(),
+        PartitionId::new(b"other-partition".to_vec()).unwrap(),
         1,
         b"immutable-input",
         "message-repeat",
@@ -425,7 +425,7 @@ pub(crate) async fn identical_redelivery_advances_only_broker_checkpoint(
             replay,
             vec![scenario.mutation(
                 ProjectionRecordExpectation::Exact(original.revision),
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             Vec::new(),
         ))
@@ -552,7 +552,7 @@ pub(crate) async fn tombstone_requires_explicit_exact_recreation(
             ),
             vec![scenario.mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             Vec::new(),
         ))
@@ -572,7 +572,7 @@ pub(crate) async fn tombstone_requires_explicit_exact_recreation(
             ),
             vec![scenario.mutation(
                 ProjectionRecordExpectation::Exact(created.revision),
-                ProjectionMutationKind::Delete,
+                RecordTransition::Delete,
             )],
             Vec::new(),
         ))
@@ -596,7 +596,7 @@ pub(crate) async fn tombstone_requires_explicit_exact_recreation(
                 ),
                 vec![scenario.mutation(
                     ProjectionRecordExpectation::Exact(deleted.revision.clone()),
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -615,7 +615,7 @@ pub(crate) async fn tombstone_requires_explicit_exact_recreation(
             ),
             vec![scenario.mutation(
                 ProjectionRecordExpectation::Exact(deleted.revision),
-                ProjectionMutationKind::Recreate,
+                RecordTransition::Recreate,
             )],
             Vec::new(),
         ))

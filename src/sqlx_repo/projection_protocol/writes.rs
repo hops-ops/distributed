@@ -13,7 +13,7 @@ pub(super) fn program_id_for_model(
 pub(super) async fn ensure_partition_ownership_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     ownership: &[ProjectionModelOwnership],
 ) -> Result<(), ProjectionProtocolError>
 where
@@ -298,16 +298,16 @@ where
 pub(super) fn next_record(
     scope: &ProjectionRecordScope,
     expectation: &ProjectionRecordExpectation,
-    kind: ProjectionMutationKind,
+    kind: RecordTransition,
     current: Option<&StoredRecord>,
     source_snapshot: bool,
 ) -> Result<(RecordRevision, bool), ProjectionProtocolError> {
     let current = current.map(|record| &record.metadata);
     match (expectation, current, kind) {
-        (ProjectionRecordExpectation::Missing, None, ProjectionMutationKind::Upsert) => {
+        (ProjectionRecordExpectation::Missing, None, RecordTransition::Upsert) => {
             Ok((RecordRevision::new(scope.clone(), 1, 1)?, false))
         }
-        (ProjectionRecordExpectation::Missing, None, ProjectionMutationKind::Delete) => {
+        (ProjectionRecordExpectation::Missing, None, RecordTransition::Delete) => {
             Ok((RecordRevision::new(scope.clone(), 1, 1)?, true))
         }
         (ProjectionRecordExpectation::Missing, Some(metadata), _) if metadata.tombstone => {
@@ -336,12 +336,12 @@ pub(super) fn next_record(
                 });
             }
             match kind {
-                ProjectionMutationKind::Upsert if metadata.tombstone => {
+                RecordTransition::Upsert if metadata.tombstone => {
                     Err(ProjectionProtocolError::RecordTombstoned {
                         model: scope.model().to_string(),
                     })
                 }
-                ProjectionMutationKind::Upsert => Ok((
+                RecordTransition::Upsert => Ok((
                     RecordRevision::new(
                         scope.clone(),
                         metadata.revision.incarnation(),
@@ -349,12 +349,12 @@ pub(super) fn next_record(
                     )?,
                     false,
                 )),
-                ProjectionMutationKind::Delete if metadata.tombstone && !source_snapshot => {
+                RecordTransition::Delete if metadata.tombstone && !source_snapshot => {
                     Err(ProjectionProtocolError::RecordTombstoned {
                         model: scope.model().to_string(),
                     })
                 }
-                ProjectionMutationKind::Delete => Ok((
+                RecordTransition::Delete => Ok((
                     RecordRevision::new(
                         scope.clone(),
                         metadata.revision.incarnation(),
@@ -362,12 +362,12 @@ pub(super) fn next_record(
                     )?,
                     true,
                 )),
-                ProjectionMutationKind::Recreate if !metadata.tombstone => {
+                RecordTransition::Recreate if !metadata.tombstone => {
                     Err(ProjectionProtocolError::RecreateRequiresTombstone {
                         model: scope.model().to_string(),
                     })
                 }
-                ProjectionMutationKind::Recreate => Ok((
+                RecordTransition::Recreate => Ok((
                     RecordRevision::new(
                         scope.clone(),
                         checked_next(metadata.revision.incarnation(), "record incarnation")?,
@@ -377,7 +377,7 @@ pub(super) fn next_record(
                 )),
             }
         }
-        (_, _, ProjectionMutationKind::Recreate) => Err(ProjectionProtocolError::InvalidBatch(
+        (_, _, RecordTransition::Recreate) => Err(ProjectionProtocolError::InvalidBatch(
             "delete/recreate requires an exact record expectation".into(),
         )),
     }
@@ -390,7 +390,7 @@ pub(super) fn next_record(
 pub(super) fn allocate_change(
     state: &mut PartitionState,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     kind: ProjectionChangeKind,
     causation_id: String,
     observation_kind: Option<ProjectionObservationKind>,
@@ -1162,7 +1162,7 @@ where
 pub(super) async fn update_partition_head_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     change_head: u64,
     clear_pending_retry: Option<&str>,
 ) -> Result<(), ProjectionProtocolError>
@@ -1204,7 +1204,7 @@ where
 pub(super) async fn retain_projection_change_suffix_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     state: &PartitionState,
     retention: ProjectionChangeRetention,
 ) -> Result<u64, ProjectionProtocolError>
@@ -1279,7 +1279,7 @@ where
 pub(super) fn decode_failure_row<DB>(
     row: &DB::Row,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     expected_change_epoch: &ProjectionEpoch,
 ) -> Result<StoredFailure, ProjectionProtocolError>
 where
@@ -1409,7 +1409,7 @@ where
 pub(super) async fn failure_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     failure_id: &str,
     expected_change_epoch: &ProjectionEpoch,
 ) -> Result<Option<StoredFailure>, ProjectionProtocolError>

@@ -37,8 +37,8 @@ use crate::table::{
 };
 use crate::{
     DomainEventBodyDescriptor, DomainEventBodyKind, DomainEventDescriptor, DomainEventEnvelope,
-    DomainEventOccurrence, ProjectionAssignment, ProjectionExpression, ProjectionInvalidation,
-    ProjectionKeyField, ProjectionMutationKind, ProjectionProgram, ProjectionRelationship,
+    DomainEventOccurrence, MutationKind, ProjectionAssignment, ProjectionExpression,
+    ProjectionInvalidation, ProjectionKeyField, ProjectionProgram, ProjectionRelationship,
     ProjectionRelationshipEffect, ProjectionValue, ProjectionValueType, ResolvedProjectionMutation,
     ResolvedProjectionRelationshipEffect, DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
     MAX_PROJECTION_EXPRESSION_DEPTH,
@@ -631,7 +631,7 @@ fn production_predicate_authorizes_only_complete_actual_after_rows() {
     let patch = modeled_fixture_with_kind(
         ProjectionBindingState::Active,
         ProjectionExecutionClass::Causal,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
     );
     let delta = lower(
         &patch,
@@ -1383,7 +1383,7 @@ fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity(
     let restarted_fixture = modeled_fixture_deployment(
         ProjectionBindingState::Active,
         ProjectionExecutionClass::Causal,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         false,
         "delta-service",
         "projection-delta-test",
@@ -1438,15 +1438,15 @@ fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity(
     let changed_fixture = modeled_fixture_deployment(
         ProjectionBindingState::Active,
         ProjectionExecutionClass::Causal,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
         false,
         "delta-service",
         "projection-delta-test",
         [0x44; 32],
     );
     assert_ne!(
-        restarted_fixture.program.id().unwrap(),
-        changed_fixture.program.id().unwrap(),
+        restarted_fixture.program.id(),
+        changed_fixture.program.id(),
         "the cold-restarted replacement must have a distinct semantic identity"
     );
     let changed_seed = super::runtime::ProtocolProjectionRequestSeed::new(
@@ -2214,7 +2214,7 @@ fn lifecycle_status_rejects_changed_deployment_identity_and_mixed_fanout_tamperi
         modeled_fixture_deployment(
             ProjectionBindingState::Draining,
             ProjectionExecutionClass::Causal,
-            ProjectionMutationKind::Upsert,
+            MutationKind::Upsert,
             false,
             "changed-route",
             "projection-delta-test",
@@ -2223,7 +2223,7 @@ fn lifecycle_status_rejects_changed_deployment_identity_and_mixed_fanout_tamperi
         modeled_fixture_deployment(
             ProjectionBindingState::Draining,
             ProjectionExecutionClass::Causal,
-            ProjectionMutationKind::Upsert,
+            MutationKind::Upsert,
             false,
             "delta-service",
             "changed-topology",
@@ -2436,7 +2436,7 @@ fn sparse_patch_program_preview_lowers_to_conditional_patch_with_missing_record_
     let fixture = modeled_fixture_with_kind(
         ProjectionBindingState::Active,
         ProjectionExecutionClass::Causal,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
     );
     let selected = selected_export(&fixture.surface);
     let request = TestRequestAuthority::authorized("auth-generation-7");
@@ -2620,8 +2620,7 @@ fn reversed_nonconflicting_fanout_plan_input_produces_identical_delta_bytes() {
             modeled
                 .iter()
                 .find(|modeled| {
-                    modeled.program_id().to_string()
-                        == fixture.todo_program.id().unwrap().to_string()
+                    modeled.program_id().to_string() == fixture.todo_program.id().to_string()
                 })
                 .unwrap(),
         )
@@ -2631,8 +2630,7 @@ fn reversed_nonconflicting_fanout_plan_input_produces_identical_delta_bytes() {
             modeled
                 .iter()
                 .find(|modeled| {
-                    modeled.program_id().to_string()
-                        == fixture.user_program.id().unwrap().to_string()
+                    modeled.program_id().to_string() == fixture.user_program.id().to_string()
                 })
                 .unwrap(),
         )
@@ -3266,7 +3264,7 @@ fn lowerer_rejects_wrong_program_binding_arm_occurrence_and_duplicate_program_so
     let other = modeled_fixture_with_kind(
         ProjectionBindingState::Active,
         ProjectionExecutionClass::Causal,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
     );
     let wrong_program_plan = crate::ResolvedProjectionPlan::resolve(
         &other.program,
@@ -3487,7 +3485,7 @@ fn modeled_direct_fixture() -> ModeledFixture {
     let operation = ProjectionOperation::try_new(
         "upsert-todo-direct",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         ProjectionTarget::try_new("TodoView", "todos").unwrap(),
         vec![projection_key(0, "todo_id", "todo_id")],
         vec![
@@ -3563,7 +3561,7 @@ fn modeled_join_fixture() -> ModeledFixture {
     let operation = ProjectionOperation::try_new(
         "insert-todo-owner-link",
         0,
-        ProjectionMutationKind::InsertRelated,
+        MutationKind::InsertRelated,
         ProjectionTarget::try_new("TodoOwnerLink", "private_todo_owner_links").unwrap(),
         vec![
             projection_key(0, "todo_id", "todo_id"),
@@ -3646,7 +3644,7 @@ fn modeled_fixture(
     state: ProjectionBindingState,
     execution: ProjectionExecutionClass,
 ) -> ModeledFixture {
-    modeled_fixture_config(state, execution, ProjectionMutationKind::Upsert, false)
+    modeled_fixture_config(state, execution, MutationKind::Upsert, false)
 }
 
 #[cfg(feature = "graphql")]
@@ -3676,7 +3674,7 @@ fn modeled_fixture_with_opaque_fallback(state: ProjectionBindingState) -> Modele
 fn modeled_fixture_with_kind(
     state: ProjectionBindingState,
     execution: ProjectionExecutionClass,
-    mutation_kind: ProjectionMutationKind,
+    mutation_kind: MutationKind,
 ) -> ModeledFixture {
     modeled_fixture_config(state, execution, mutation_kind, false)
 }
@@ -3685,13 +3683,13 @@ fn modeled_fixture_with_relationship_invalidation(
     state: ProjectionBindingState,
     execution: ProjectionExecutionClass,
 ) -> ModeledFixture {
-    modeled_fixture_config(state, execution, ProjectionMutationKind::Upsert, true)
+    modeled_fixture_config(state, execution, MutationKind::Upsert, true)
 }
 
 fn modeled_fixture_config(
     state: ProjectionBindingState,
     execution: ProjectionExecutionClass,
-    mutation_kind: ProjectionMutationKind,
+    mutation_kind: MutationKind,
     invalidate_relationship: bool,
 ) -> ModeledFixture {
     modeled_fixture_deployment(
@@ -3708,7 +3706,7 @@ fn modeled_fixture_config(
 fn modeled_fixture_deployment(
     state: ProjectionBindingState,
     execution: ProjectionExecutionClass,
-    mutation_kind: ProjectionMutationKind,
+    mutation_kind: MutationKind,
     invalidate_relationship: bool,
     route: &str,
     topology_name: &str,
@@ -3836,7 +3834,7 @@ fn fanout_fixture_states(
     let todo_operation = ProjectionOperation::try_new(
         "fanout-todo",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         ProjectionTarget::try_new("TodoView", "todos").unwrap(),
         vec![projection_key(0, "todo_id", "todo_id")],
         vec![
@@ -3852,7 +3850,7 @@ fn fanout_fixture_states(
     let user_operation = ProjectionOperation::try_new(
         "fanout-user",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         ProjectionTarget::try_new("UserView", "users").unwrap(),
         vec![projection_key(0, "user_id", "owner_id")],
         vec![

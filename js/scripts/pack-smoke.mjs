@@ -425,8 +425,6 @@ assert.deepEqual(Object.keys(rootSurface).sort(), [
   'wsConnectionInitPayload'
 ]);
 assert.deepEqual(Object.keys(replicaSurface).sort(), [
-  'MUTATION_CACHE_VISIBILITY_FULL',
-  'MUTATION_CACHE_VISIBILITY_UNAUTHORIZED',
   'REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED',
   'ReplicaCommandContractError',
   'ReplicaCommandRuntimeError',
@@ -446,7 +444,6 @@ assert.deepEqual(Object.keys(replicaSurface).sort(), [
   'formatReplicaIndexStaleReason',
   'inspectReplicaCommandArtifact',
   'inspectReplicaOperationArtifact',
-  'lowerMutationCache',
   'prepareReplicaCommand',
   'replicaIndexKey',
   'replicaRecordKey',

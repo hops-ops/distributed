@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ProjectionChangeCursor, ProjectionCheckpoint, ProjectionCommitOutcome, ProjectionEpoch,
-    ProjectionInputCursor, ProjectionPartition, ProjectionProtocolValidationError,
+    PartitionId, ProjectionChangeCursor, ProjectionCheckpoint, ProjectionCommitOutcome,
+    ProjectionEpoch, ProjectionInputCursor, ProjectionProtocolValidationError,
     ProjectionRecordScope, ProjectionScopeCodec, ProjectionSource, ProjectorTopologyId,
     RecordRevision, MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_POSITION,
     MAX_PROJECTION_RECORD_KEY_BYTES,
@@ -70,9 +70,9 @@ pub use identity::{
     ProjectionObservationKind, DEFAULT_MAX_RETAINED_PROJECTION_CHANGES,
 };
 pub(crate) use identity::{
-    ProjectionInputDisposition, ProjectionModelOwnership, ProjectionMutationKind,
-    ProjectionObservationRequest, ProjectionObservationTarget, ProjectionRecordExpectation,
-    ProjectionRecordMutation, TrustedProjectionInput, MAX_PROJECTION_EVIDENCE_BATCH_ITEMS,
+    ProjectionInputDisposition, ProjectionModelOwnership, ProjectionObservationRequest,
+    ProjectionObservationTarget, ProjectionRecordExpectation, ProjectionRecordMutation,
+    RecordTransition, TrustedProjectionInput, MAX_PROJECTION_EVIDENCE_BATCH_ITEMS,
     MAX_PROJECTION_QUERY_BATCH_CHECKPOINT_PROBES, MAX_PROJECTION_QUERY_BATCH_ROWS,
     MAX_PROJECTION_QUERY_CHECKPOINT_PROBES,
 };

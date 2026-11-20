@@ -36,12 +36,12 @@ use crate::microsvc::{
 use crate::outbox::OutboxMessage;
 #[cfg(feature = "graphql")]
 use crate::projection_protocol::{
-    ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch,
-    ProjectionCommitResult, ProjectionFailure, ProjectionFailureBatch, ProjectionFailureLocation,
-    ProjectionGeneration, ProjectionInputCursor, ProjectionInputDisposition,
-    ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest, ProjectionModelOwnership,
-    ProjectionObligationEvidenceBatch, ProjectionObligationEvidenceBatchRequest,
-    ProjectionObservation, ProjectionObservationKind, ProjectionPartition,
+    PartitionId, ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint,
+    ProjectionCommitBatch, ProjectionCommitResult, ProjectionFailure, ProjectionFailureBatch,
+    ProjectionFailureLocation, ProjectionGeneration, ProjectionInputCursor,
+    ProjectionInputDisposition, ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest,
+    ProjectionModelOwnership, ProjectionObligationEvidenceBatch,
+    ProjectionObligationEvidenceBatchRequest, ProjectionObservation, ProjectionObservationKind,
     ProjectionPartitionRuntimeState, ProjectionProtocolError, ProjectionProtocolStore,
     ProjectionQuerySnapshot, ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
     ProjectionQuerySnapshotRequest, ProjectionRecordMetadata, ProjectionRecordScope,
@@ -198,7 +198,7 @@ fn causal_direct_program(
     event_name: &'static str,
 ) -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
     use crate::mutation::{
-        bind_state_body_to_mutation, compile_projection, state_upsert_program_for_model,
+        bind_event_apply_mutation, compile_projection, state_upsert_program_for_model,
     };
 
     let program = state_upsert_program_for_model::<CausalProjectionObligationView>(
@@ -206,24 +206,15 @@ fn causal_direct_program(
         1,
         "upsert-view",
         "view",
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: name.into(),
-        reason: e.to_string(),
-    })?;
+    )?;
     let descriptor = crate::DomainEventDescriptor::state::<CausalDirectState>(event_name, 1);
-    let handler =
-        bind_state_body_to_mutation::<CausalProjectionObligationView>(&descriptor, program, "view")
-            .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                operation: name.into(),
-                reason: e.to_string(),
-            })?;
-    compile_projection(name, version, crate::ProjectionPartition::Unit, [handler]).map_err(|e| {
-        crate::ProjectionProgramError::InvalidOperation {
-            operation: name.into(),
-            reason: e.to_string(),
-        }
-    })
+    let handler = bind_event_apply_mutation(
+        &descriptor,
+        program,
+        "view",
+        crate::ProjectionInputSource::Body,
+    )?;
+    compile_projection(name, version, crate::ProjectionPartition::Unit, [handler])
 }
 
 #[cfg(feature = "graphql")]
@@ -232,42 +223,15 @@ fn causal_direct_v1_program() -> Result<crate::ProjectionProgram, crate::Project
 }
 
 #[cfg(feature = "graphql")]
-fn causal_direct_v1_resolve(
-    occurrence: &crate::DomainEventOccurrence,
-) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-    crate::mutation::resolve_mutation_program(&causal_direct_v1_program()?, occurrence)
+crate::projection! {
+    const CAUSAL_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::DirectCandidate, > = {
+        name: "project_causal_direct",
+        version: 1,
+        epoch: "causal-direct-v1",
+        model: CausalProjectionObligationView,
+        program: causal_direct_v1_program,
+    };
 }
-
-#[cfg(feature = "graphql")]
-fn causal_direct_v1_lower(
-    plan: &crate::ResolvedProjectionPlan,
-) -> Result<
-    crate::projection::lower::LoweredProjectionPlan,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::lower_single_model::<CausalProjectionObligationView>(plan)
-}
-
-#[cfg(feature = "graphql")]
-fn causal_direct_v1_inventory() -> Result<
-    crate::projection::lower::ProjectionOutputInventory,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::inventory_single_model::<CausalProjectionObligationView>()
-}
-
-#[cfg(feature = "graphql")]
-const CAUSAL_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor<
-    crate::projection::lower::DirectCandidate,
-> = crate::mutation::descriptor_from_factories(
-    "project_causal_direct",
-    1,
-    "causal-direct-v1",
-    causal_direct_v1_program,
-    causal_direct_v1_resolve,
-    causal_direct_v1_lower,
-    causal_direct_v1_inventory,
-);
 
 #[cfg(feature = "graphql")]
 fn causal_direct_v2_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
@@ -275,47 +239,20 @@ fn causal_direct_v2_program() -> Result<crate::ProjectionProgram, crate::Project
 }
 
 #[cfg(feature = "graphql")]
-fn causal_direct_v2_resolve(
-    occurrence: &crate::DomainEventOccurrence,
-) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-    crate::mutation::resolve_mutation_program(&causal_direct_v2_program()?, occurrence)
+crate::projection! {
+    const CAUSAL_ROGUE_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::DirectCandidate, > = {
+        name: "project_causal_direct",
+        version: 2,
+        epoch: "causal-direct-v1",
+        model: CausalProjectionObligationView,
+        program: causal_direct_v2_program,
+    };
 }
-
-#[cfg(feature = "graphql")]
-fn causal_direct_v2_lower(
-    plan: &crate::ResolvedProjectionPlan,
-) -> Result<
-    crate::projection::lower::LoweredProjectionPlan,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::lower_single_model::<CausalProjectionObligationView>(plan)
-}
-
-#[cfg(feature = "graphql")]
-fn causal_direct_v2_inventory() -> Result<
-    crate::projection::lower::ProjectionOutputInventory,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::inventory_single_model::<CausalProjectionObligationView>()
-}
-
-#[cfg(feature = "graphql")]
-const CAUSAL_ROGUE_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor<
-    crate::projection::lower::DirectCandidate,
-> = crate::mutation::descriptor_from_factories(
-    "project_causal_direct",
-    2,
-    "causal-direct-v1",
-    causal_direct_v2_program,
-    causal_direct_v2_resolve,
-    causal_direct_v2_lower,
-    causal_direct_v2_inventory,
-);
 
 #[cfg(feature = "graphql")]
 fn causal_sibling_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
     use crate::mutation::{
-        bind_state_body_to_mutation, compile_projection, state_upsert_program_for_model,
+        bind_event_apply_mutation, compile_projection, state_upsert_program_for_model,
     };
 
     let program = state_upsert_program_for_model::<CausalProjectionSiblingView>(
@@ -323,76 +260,41 @@ fn causal_sibling_program() -> Result<crate::ProjectionProgram, crate::Projectio
         1,
         "upsert-view",
         "view",
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "project_causal_direct_sibling".into(),
-        reason: e.to_string(),
-    })?;
+    )?;
     let descriptor = crate::DomainEventDescriptor::state::<CausalDirectState>(
         "causal.direct-sibling-recorded",
         1,
     );
-    let handler =
-        bind_state_body_to_mutation::<CausalProjectionSiblingView>(&descriptor, program, "view")
-            .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                operation: "project_causal_direct_sibling".into(),
-                reason: e.to_string(),
-            })?;
+    let handler = bind_event_apply_mutation(
+        &descriptor,
+        program,
+        "view",
+        crate::ProjectionInputSource::Body,
+    )?;
     compile_projection(
         "project_causal_direct_sibling",
         1,
         crate::ProjectionPartition::Unit,
         [handler],
     )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "project_causal_direct_sibling".into(),
-        reason: e.to_string(),
-    })
 }
 
 #[cfg(feature = "graphql")]
-fn causal_sibling_resolve(
-    occurrence: &crate::DomainEventOccurrence,
-) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-    crate::mutation::resolve_mutation_program(&causal_sibling_program()?, occurrence)
+crate::projection! {
+    const CAUSAL_SIBLING_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::DirectCandidate, > = {
+        name: "project_causal_direct_sibling",
+        version: 1,
+        epoch: "causal-direct-v1",
+        model: CausalProjectionSiblingView,
+        program: causal_sibling_program,
+    };
 }
-
-#[cfg(feature = "graphql")]
-fn causal_sibling_lower(
-    plan: &crate::ResolvedProjectionPlan,
-) -> Result<
-    crate::projection::lower::LoweredProjectionPlan,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::lower_single_model::<CausalProjectionSiblingView>(plan)
-}
-
-#[cfg(feature = "graphql")]
-fn causal_sibling_inventory() -> Result<
-    crate::projection::lower::ProjectionOutputInventory,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::inventory_single_model::<CausalProjectionSiblingView>()
-}
-
-#[cfg(feature = "graphql")]
-const CAUSAL_SIBLING_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor<
-    crate::projection::lower::DirectCandidate,
-> = crate::mutation::descriptor_from_factories(
-    "project_causal_direct_sibling",
-    1,
-    "causal-direct-v1",
-    causal_sibling_program,
-    causal_sibling_resolve,
-    causal_sibling_lower,
-    causal_sibling_inventory,
-);
 
 #[cfg(feature = "graphql")]
 fn causal_lifecycle_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
     use crate::domain_event::DomainEventContract;
     use crate::mutation::{
-        bind_state_body_to_mutation, compile_projection, state_upsert_program_for_model,
+        bind_event_apply_mutation, compile_projection, state_upsert_program_for_model,
     };
 
     let program = state_upsert_program_for_model::<CausalLifecycleView>(
@@ -400,69 +302,31 @@ fn causal_lifecycle_program() -> Result<crate::ProjectionProgram, crate::Project
         1,
         "upsert-view",
         "view",
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "project_causal_lifecycle".into(),
-        reason: e.to_string(),
-    })?;
-    let handler = bind_state_body_to_mutation::<CausalLifecycleView>(
+    )?;
+    let handler = bind_event_apply_mutation(
         &CausalLifecycleRecorded::descriptor(),
         program,
         "view",
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "project_causal_lifecycle".into(),
-        reason: e.to_string(),
-    })?;
+        crate::ProjectionInputSource::Body,
+    )?;
     compile_projection(
         "project_causal_lifecycle",
         1,
         crate::ProjectionPartition::Unit,
         [handler],
     )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "project_causal_lifecycle".into(),
-        reason: e.to_string(),
-    })
 }
 
 #[cfg(feature = "graphql")]
-fn causal_lifecycle_resolve(
-    occurrence: &crate::DomainEventOccurrence,
-) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-    crate::mutation::resolve_mutation_program(&causal_lifecycle_program()?, occurrence)
+crate::projection! {
+    const CAUSAL_LIFECYCLE_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::EventualOnly, > = {
+        name: "project_causal_lifecycle",
+        version: 1,
+        epoch: "causal-lifecycle-v1",
+        model: CausalLifecycleView,
+        program: causal_lifecycle_program,
+    };
 }
-
-#[cfg(feature = "graphql")]
-fn causal_lifecycle_lower(
-    plan: &crate::ResolvedProjectionPlan,
-) -> Result<
-    crate::projection::lower::LoweredProjectionPlan,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::lower_single_model::<CausalLifecycleView>(plan)
-}
-
-#[cfg(feature = "graphql")]
-fn causal_lifecycle_inventory() -> Result<
-    crate::projection::lower::ProjectionOutputInventory,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::inventory_single_model::<CausalLifecycleView>()
-}
-
-#[cfg(feature = "graphql")]
-const CAUSAL_LIFECYCLE_PROJECTION: crate::projection::lower::ProjectionDescriptor<
-    crate::projection::lower::EventualOnly,
-> = crate::mutation::descriptor_from_factories(
-    "project_causal_lifecycle",
-    1,
-    "causal-lifecycle-v1",
-    causal_lifecycle_program,
-    causal_lifecycle_resolve,
-    causal_lifecycle_lower,
-    causal_lifecycle_inventory,
-);
 
 #[cfg(feature = "graphql")]
 fn modeled_direct_registration(
@@ -947,7 +811,7 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
     fn projection_partition_runtime_state<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
     ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>>
            + Send
            + 'a {
@@ -968,7 +832,7 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
     fn projection_changes<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         after: Option<&'a ProjectionChangeCursor>,
         limit: usize,
     ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a
@@ -980,7 +844,7 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
     fn repair_projection<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a
     {
@@ -998,7 +862,7 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
     fn projection_failure<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a
     {

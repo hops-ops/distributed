@@ -18,7 +18,7 @@ pub struct ProjectionRecordMetadata {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ProjectionCheckpointProbe {
     pub(crate) topology: ProjectorTopologyId,
-    pub(crate) partition: ProjectionPartition,
+    pub(crate) partition: PartitionId,
     pub(crate) source: ProjectionSource,
     pub(crate) epoch: ProjectionEpoch,
     pub(crate) generation: ProjectionGeneration,
@@ -27,7 +27,7 @@ pub(crate) struct ProjectionCheckpointProbe {
 impl ProjectionCheckpointProbe {
     pub(crate) fn new(
         topology: ProjectorTopologyId,
-        partition: ProjectionPartition,
+        partition: PartitionId,
         source: ProjectionSource,
         epoch: ProjectionEpoch,
         generation: ProjectionGeneration,
@@ -717,7 +717,7 @@ pub struct ProjectionFailure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectionFailureLocation {
     pub(crate) topology: ProjectorTopologyId,
-    pub(crate) partition: ProjectionPartition,
+    pub(crate) partition: PartitionId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

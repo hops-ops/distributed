@@ -7,10 +7,9 @@ use crate::microsvc::{
     CausalCommandReceiptSource, CausalProjectionEvidenceState,
 };
 use crate::projection_protocol::{
-    ProjectionChange, ProjectionChangeCursor, ProjectionChangeKind, ProjectionEpoch,
-    ProjectionObservation, ProjectionObservationKind, ProjectionPartition,
-    ProjectionRecordMetadata, ProjectionRecordScope, ProjectorTopologyId, RecordRevision,
-    SameTransactionProjectionEvidence,
+    PartitionId, ProjectionChange, ProjectionChangeCursor, ProjectionChangeKind, ProjectionEpoch,
+    ProjectionObservation, ProjectionObservationKind, ProjectionRecordMetadata,
+    ProjectionRecordScope, ProjectorTopologyId, RecordRevision, SameTransactionProjectionEvidence,
 };
 use async_graphql::{Response, Value};
 
@@ -104,7 +103,7 @@ fn command(id: &str) -> DistributedCommandMetadata {
 fn receipt() -> CausalCommandReceiptSource {
     let topology = ProjectorTopologyId::new(1, "todos", [17; 32]).unwrap();
     let partition =
-        ProjectionPartition::new(br#"["tenant-private-900719925474099312345"]"#.to_vec()).unwrap();
+        PartitionId::new(br#"["tenant-private-900719925474099312345"]"#.to_vec()).unwrap();
     let scope = ProjectionRecordScope::new(
         topology,
         partition,
@@ -176,7 +175,7 @@ fn direct_projected_receipt() -> CausalCommandReceiptSource {
 fn change_cursor(position: u64) -> ProjectionChangeCursor {
     ProjectionChangeCursor::new(
         ProjectorTopologyId::new(1, "todos", [17; 32]).unwrap(),
-        ProjectionPartition::new(br#"["tenant-private-900719925474099312345"]"#.to_vec()).unwrap(),
+        PartitionId::new(br#"["tenant-private-900719925474099312345"]"#.to_vec()).unwrap(),
         ProjectionEpoch::new("todos-v1").unwrap(),
         position,
     )

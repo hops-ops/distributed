@@ -69,7 +69,7 @@ const PROJECTION_RECORD_KEY_DIGEST_DOMAIN: &[u8] = b"distributed.projection.reco
 pub(crate) struct ResolvedProjectionObligation {
     pub(crate) projector: String,
     pub(crate) model: String,
-    pub(crate) key: ResolvedProjectionKey,
+    pub(crate) key: RecordKey,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -93,13 +93,13 @@ where
 
 /// Complete projection key in declaration order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ResolvedProjectionKey {
-    pub(crate) fields: Vec<ResolvedProjectionKeyField>,
+pub(crate) struct RecordKey {
+    pub(crate) fields: Vec<RecordKeyField>,
 }
 
 /// One resolved field in a complete projection key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ResolvedProjectionKeyField {
+pub(crate) struct RecordKeyField {
     pub(crate) field: String,
     pub(crate) value: serde_json::Value,
 }
@@ -362,12 +362,12 @@ impl<'de> Deserialize<'de> for ProjectorTopologyId {
 
 /// Canonical projector partition and its domain-separated digest.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ProjectionPartition {
+pub struct PartitionId {
     canonical_bytes: Vec<u8>,
     digest: [u8; 32],
 }
 
-impl ProjectionPartition {
+impl PartitionId {
     pub fn new(
         canonical_bytes: impl Into<Vec<u8>>,
     ) -> Result<Self, ProjectionProtocolValidationError> {
@@ -392,7 +392,7 @@ impl ProjectionPartition {
     }
 }
 
-impl Serialize for ProjectionPartition {
+impl Serialize for PartitionId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -401,7 +401,7 @@ impl Serialize for ProjectionPartition {
     }
 }
 
-impl<'de> Deserialize<'de> for ProjectionPartition {
+impl<'de> Deserialize<'de> for PartitionId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -578,7 +578,7 @@ impl<'de> Deserialize<'de> for ProjectionEpoch {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProjectionInputCursor {
     topology: ProjectorTopologyId,
-    projection_partition: ProjectionPartition,
+    projection_partition: PartitionId,
     source: ProjectionSource,
     epoch: ProjectionEpoch,
     position: u64,
@@ -587,7 +587,7 @@ pub struct ProjectionInputCursor {
 impl ProjectionInputCursor {
     pub fn new(
         topology: ProjectorTopologyId,
-        projection_partition: ProjectionPartition,
+        projection_partition: PartitionId,
         source: ProjectionSource,
         epoch: ProjectionEpoch,
         position: u64,
@@ -606,7 +606,7 @@ impl ProjectionInputCursor {
         &self.topology
     }
 
-    pub fn projection_partition(&self) -> &ProjectionPartition {
+    pub fn projection_partition(&self) -> &PartitionId {
         &self.projection_partition
     }
 
@@ -639,7 +639,7 @@ impl ProjectionInputCursor {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProjectionRecordScope {
     topology: ProjectorTopologyId,
-    projection_partition: ProjectionPartition,
+    projection_partition: PartitionId,
     model: String,
     canonical_key_bytes: Vec<u8>,
     key_digest: [u8; 32],
@@ -648,7 +648,7 @@ pub struct ProjectionRecordScope {
 impl ProjectionRecordScope {
     pub fn new(
         topology: ProjectorTopologyId,
-        projection_partition: ProjectionPartition,
+        projection_partition: PartitionId,
         model: impl Into<String>,
         canonical_key_bytes: impl Into<Vec<u8>>,
     ) -> Result<Self, ProjectionProtocolValidationError> {
@@ -676,7 +676,7 @@ impl ProjectionRecordScope {
         &self.topology
     }
 
-    pub fn projection_partition(&self) -> &ProjectionPartition {
+    pub fn projection_partition(&self) -> &PartitionId {
         &self.projection_partition
     }
 
@@ -705,7 +705,7 @@ impl Serialize for ProjectionRecordScope {
         #[derive(Serialize)]
         struct Wire<'a> {
             topology: &'a ProjectorTopologyId,
-            partition: &'a ProjectionPartition,
+            partition: &'a PartitionId,
             model: &'a str,
             key: &'a [u8],
         }
@@ -727,7 +727,7 @@ impl<'de> Deserialize<'de> for ProjectionRecordScope {
         #[derive(Deserialize)]
         struct Wire {
             topology: ProjectorTopologyId,
-            partition: ProjectionPartition,
+            partition: PartitionId,
             model: String,
             key: Vec<u8>,
         }
@@ -802,7 +802,7 @@ impl RecordRevision {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProjectionChangeCursor {
     topology: ProjectorTopologyId,
-    projection_partition: ProjectionPartition,
+    projection_partition: PartitionId,
     epoch: ProjectionEpoch,
     position: NonZeroU64,
 }
@@ -810,7 +810,7 @@ pub struct ProjectionChangeCursor {
 impl ProjectionChangeCursor {
     pub fn new(
         topology: ProjectorTopologyId,
-        projection_partition: ProjectionPartition,
+        projection_partition: PartitionId,
         epoch: ProjectionEpoch,
         position: u64,
     ) -> Result<Self, ProjectionProtocolValidationError> {
@@ -831,7 +831,7 @@ impl ProjectionChangeCursor {
         &self.topology
     }
 
-    pub fn projection_partition(&self) -> &ProjectionPartition {
+    pub fn projection_partition(&self) -> &PartitionId {
         &self.projection_partition
     }
 
@@ -1044,8 +1044,8 @@ mod tests {
         ProjectorTopologyId::new(1, name, [marker; 32]).unwrap()
     }
 
-    fn partition(value: &[u8]) -> ProjectionPartition {
-        ProjectionPartition::new(value.to_vec()).unwrap()
+    fn partition(value: &[u8]) -> PartitionId {
+        PartitionId::new(value.to_vec()).unwrap()
     }
 
     fn source(name: &str, value: &[u8]) -> ProjectionSource {
@@ -1159,14 +1159,14 @@ mod tests {
     #[test]
     fn canonical_values_are_nonempty_and_bounded() {
         assert_eq!(
-            ProjectionPartition::new(Vec::new()),
+            PartitionId::new(Vec::new()),
             Err(ProjectionProtocolValidationError::Empty {
                 field: "projection partition",
             })
         );
-        assert!(ProjectionPartition::new(vec![1; MAX_PROJECTION_PARTITION_BYTES]).is_ok());
+        assert!(PartitionId::new(vec![1; MAX_PROJECTION_PARTITION_BYTES]).is_ok());
         assert_eq!(
-            ProjectionPartition::new(vec![1; MAX_PROJECTION_PARTITION_BYTES + 1]),
+            PartitionId::new(vec![1; MAX_PROJECTION_PARTITION_BYTES + 1]),
             Err(ProjectionProtocolValidationError::TooLong {
                 field: "projection partition",
                 len: MAX_PROJECTION_PARTITION_BYTES + 1,
@@ -1282,8 +1282,8 @@ mod tests {
     #[test]
     fn digests_are_deterministic_and_domain_separated() {
         let bytes = b"same-canonical-value".to_vec();
-        let first_partition = ProjectionPartition::new(bytes.clone()).unwrap();
-        let second_partition = ProjectionPartition::new(bytes.clone()).unwrap();
+        let first_partition = PartitionId::new(bytes.clone()).unwrap();
+        let second_partition = PartitionId::new(bytes.clone()).unwrap();
         let source = ProjectionSource::new("source", bytes.clone()).unwrap();
         let scope = ProjectionRecordScope::new(
             topology("todos", 1),

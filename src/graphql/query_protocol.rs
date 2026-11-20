@@ -25,8 +25,8 @@ use super::protocol::{
 use super::surface::{Surface, SurfaceProjectionOwner, SurfaceRowPolicy};
 use crate::projection::placement::ProjectionBindingState;
 use crate::projection_protocol::{
-    CompiledProjectionTopology, ProjectionChangeCursor, ProjectionChangeRead, ProjectionEpoch,
-    ProjectionLiveRecordBatchRequest, ProjectionLiveRecordRequest, ProjectionPartition,
+    CompiledProjectionTopology, PartitionId, ProjectionChangeCursor, ProjectionChangeRead,
+    ProjectionEpoch, ProjectionLiveRecordBatchRequest, ProjectionLiveRecordRequest,
     ProjectionPartitionSnapshot, ProjectionPartitionSpec, ProjectionProtocolError,
     ProjectionScopeCodec, ProjectorTopologyId,
 };
@@ -42,7 +42,7 @@ use crate::sqlx_repo::repo::SqlxRepoBackend;
 pub(crate) struct QueryProjectorRuntime {
     pub(crate) name: String,
     pub(crate) codec: Arc<ProjectionScopeCodec>,
-    pub(crate) static_partition: Option<ProjectionPartition>,
+    pub(crate) static_partition: Option<PartitionId>,
     pub(crate) change_epoch: Option<ProjectionEpoch>,
     models: BTreeSet<String>,
     dependencies: BTreeSet<String>,
@@ -1463,10 +1463,10 @@ mod tests {
         use crate::graphql::protocol::{ProtocolTokenCodec, ProtocolTokenPurpose};
         use crate::projection_protocol::{
             ProjectionChangeRead, ProjectionCommitBatch, ProjectionEpoch, ProjectionInputCursor,
-            ProjectionInputFingerprint, ProjectionModelOwnership, ProjectionMutationKind,
-            ProjectionObservationKind, ProjectionObservationRequest, ProjectionObservationTarget,
-            ProjectionProtocolStore, ProjectionRecordExpectation, ProjectionRecordMutation,
-            ProjectionSource, TrustedProjectionInput,
+            ProjectionInputFingerprint, ProjectionModelOwnership, ProjectionObservationKind,
+            ProjectionObservationRequest, ProjectionObservationTarget, ProjectionProtocolStore,
+            ProjectionRecordExpectation, ProjectionRecordMutation, ProjectionSource,
+            RecordTransition, TrustedProjectionInput,
         };
         use crate::sqlite_repo::SqliteRepository;
         use crate::table::{
@@ -1558,7 +1558,7 @@ mod tests {
                     scope.clone(),
                     mutation,
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )
                 .unwrap()],
                 observations: vec![ProjectionObservationRequest {

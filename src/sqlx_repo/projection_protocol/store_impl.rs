@@ -1093,7 +1093,7 @@ where
     fn projection_partition_runtime_state<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
     ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>>
            + Send
            + 'a {
@@ -1123,7 +1123,7 @@ where
     fn projection_changes<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         after: Option<&'a ProjectionChangeCursor>,
         limit: usize,
     ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a
@@ -1147,7 +1147,7 @@ where
     fn repair_projection<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a
     {
@@ -1435,7 +1435,7 @@ where
     fn projection_failure<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a
     {
@@ -1502,7 +1502,7 @@ where
             let partition_bytes: Vec<u8> = row.try_get("partition_bytes").map_err(|error| {
                 protocol_storage_error::<DB>("decode repair partition bytes", error)
             })?;
-            let partition = ProjectionPartition::new(partition_bytes)?;
+            let partition = PartitionId::new(partition_bytes)?;
             let partition_hash: Vec<u8> = row.try_get("partition_hash").map_err(|error| {
                 protocol_storage_error::<DB>("decode repair partition hash", error)
             })?;

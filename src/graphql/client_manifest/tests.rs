@@ -379,7 +379,7 @@ fn modeled_surface_with_base(
     };
     use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
     use crate::{
-        ProjectionAssignment, ProjectionExpression, ProjectionKeyField, ProjectionMutationKind,
+        MutationKind, ProjectionAssignment, ProjectionExpression, ProjectionKeyField,
         ProjectionProgram, ProjectionValueType,
     };
 
@@ -412,7 +412,7 @@ fn modeled_surface_with_base(
     let operation = ProjectionOperation::try_new(
         "project-todo",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         ProjectionTarget::try_new("TodoView", "todos").unwrap(),
         vec![key],
         vec![key_field, field],
@@ -1321,15 +1321,15 @@ fn client_projection_arms_are_canonical_across_declaration_order() {
         PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
     };
     use crate::{
-        ProjectionAssignment, ProjectionExpression, ProjectionField, ProjectionKeyField,
-        ProjectionMutationKind, ProjectionPartition, ProjectionValueType,
+        MutationKind, ProjectionAssignment, ProjectionExpression, ProjectionField,
+        ProjectionKeyField, ProjectionPartition, ProjectionValueType,
     };
 
     let surface = build_surface(&[todos(), users()], &SurfaceOptions::sqlite()).unwrap();
     let operation = || SurfaceProjectionOperation {
         operation_id: "project-todo".into(),
         staging_ordinal: 0,
-        kind: ProjectionMutationKind::Patch,
+        kind: MutationKind::Patch,
         model: "TodoView".into(),
         storage: "todos".into(),
         key: vec![ProjectionKeyField::try_new(

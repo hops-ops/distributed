@@ -932,85 +932,48 @@ mod tests {
         title: String,
     }
 
+    static MODELED_DIRECT_BUILDS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
     fn modeled_direct_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
         use crate::mutation::{
-            body_bindings_for_model, compile_projection, state_upsert_program_for_model,
-            MutationEventBinding, ProjectionHandler,
+            compile_projection, state_upsert_program_for_model, ProjectionHandler,
+            ProjectionInputSource,
         };
         use crate::projection::ProjectionEventSelector;
 
-        let program = state_upsert_program_for_model::<ModeledDirectView>(
-            "save_modeled_direct",
-            1,
-            "upsert-view",
-            "view",
-        )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "modeled-direct".into(),
-            reason: e.to_string(),
-        })?;
+        MODELED_DIRECT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let selector =
             ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor::state::<
                 CausalPublishedState,
             >("causal.created", 1))?;
-        let binding = MutationEventBinding::try_new(
-            selector,
-            body_bindings_for_model::<ModeledDirectView>("view").map_err(|e| {
-                crate::ProjectionProgramError::InvalidOperation {
-                    operation: "modeled-direct".into(),
-                    reason: e.to_string(),
-                }
-            })?,
-            program,
-        )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "modeled-direct".into(),
-            reason: e.to_string(),
-        })?;
         compile_projection(
             "modeled-direct-workspace",
             1,
             crate::ProjectionPartition::Unit,
-            [ProjectionHandler::from_binding("created", binding)],
+            [ProjectionHandler::try_new(
+                "created",
+                selector,
+                vec![ProjectionInputSource::Body.binding("view")?],
+                state_upsert_program_for_model::<ModeledDirectView>(
+                    "save_modeled_direct",
+                    1,
+                    "upsert-view",
+                    "view",
+                )?,
+            )?],
         )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "modeled-direct".into(),
-            reason: e.to_string(),
-        })
     }
 
-    fn modeled_direct_resolve(
-        occurrence: &crate::DomainEventOccurrence,
-    ) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-        crate::mutation::resolve_mutation_program(&modeled_direct_program()?, occurrence)
+    crate::projection! {
+        const MODELED_DIRECT: ProjectionDescriptor<DirectCandidate> = {
+            name: "modeled-direct-workspace",
+            version: 1,
+            epoch: "modeled-direct-workspace-v1",
+            model: ModeledDirectView,
+            program: modeled_direct_program,
+        };
     }
-
-    fn modeled_direct_lower(
-        plan: &crate::ResolvedProjectionPlan,
-    ) -> Result<
-        crate::projection::lower::LoweredProjectionPlan,
-        crate::projection::lower::ProjectionLoweringError,
-    > {
-        crate::mutation::lower_single_model::<ModeledDirectView>(plan)
-    }
-
-    fn modeled_direct_inventory() -> Result<
-        crate::projection::lower::ProjectionOutputInventory,
-        crate::projection::lower::ProjectionLoweringError,
-    > {
-        crate::mutation::inventory_single_model::<ModeledDirectView>()
-    }
-
-    const MODELED_DIRECT: ProjectionDescriptor<DirectCandidate> =
-        crate::mutation::descriptor_from_factories(
-            "modeled-direct-workspace",
-            1,
-            "modeled-direct-workspace-v1",
-            modeled_direct_program,
-            modeled_direct_resolve,
-            modeled_direct_lower,
-            modeled_direct_inventory,
-        );
 
     #[derive(Clone, Debug, Serialize, crate::DomainEvent)]
     #[domain_event(name = "causal.background", version = 1)]
@@ -1455,6 +1418,35 @@ mod tests {
             .validate_prepared(&modeled_direct_contract(), &mut prepared)
             .expect("placement-selected proof validates");
         assert!(parts.resolved_direct_projection.is_some());
+    }
+
+    #[test]
+    fn a_descriptor_builds_its_program_once_and_resolves_by_reference() {
+        let repository = modeled_direct_repository();
+        let workspace = CausalWorkspace::new(&repository);
+        let mut aggregate = workspace.create();
+        aggregate.create("once-1".into(), "first".into()).unwrap();
+        workspace.stage(aggregate).unwrap();
+        let _prepared = workspace
+            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .unwrap();
+        let mut parts = workspace.into_parts().unwrap();
+        parts.prepare_domain_publications("once").unwrap();
+        let occurrence = &parts.domain_event_occurrences[0];
+
+        let first = MODELED_DIRECT.program().unwrap();
+        let executor = MODELED_DIRECT.server_executor().unwrap();
+        for _ in 0..3 {
+            let plan = MODELED_DIRECT.resolve(occurrence).unwrap();
+            assert_eq!(plan.program_id(), first.id());
+            executor.plan(occurrence).unwrap();
+        }
+        assert!(std::ptr::eq(first, MODELED_DIRECT.program().unwrap()));
+        assert_eq!(
+            MODELED_DIRECT_BUILDS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "every resolve in this process read the one compiled program"
+        );
     }
 
     #[test]

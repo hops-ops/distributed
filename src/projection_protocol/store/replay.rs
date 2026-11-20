@@ -373,11 +373,8 @@ fn decode_replay_topology(
     .map_err(|error| replay_validation_error("topology", error))
 }
 
-fn decode_replay_partition(
-    canonical: String,
-    digest: String,
-) -> Result<ProjectionPartition, String> {
-    let partition = ProjectionPartition::new(decode_replay_hex(
+fn decode_replay_partition(canonical: String, digest: String) -> Result<PartitionId, String> {
+    let partition = PartitionId::new(decode_replay_hex(
         "partition",
         &canonical,
         MAX_PROJECTION_PARTITION_BYTES,

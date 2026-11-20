@@ -1,5 +1,5 @@
 use super::*;
-use crate::projection_protocol::{ResolvedProjectionKey, ResolvedProjectionObligation};
+use crate::projection_protocol::{RecordKey, ResolvedProjectionObligation};
 use crate::table::{
     DeleteTableRowMutation, ExpectedVersion, PrimaryKey, RowKey, RowValue, TableSchema,
 };
@@ -8,8 +8,8 @@ fn topology() -> ProjectorTopologyId {
     ProjectorTopologyId::new(1, "todos", [7; 32]).unwrap()
 }
 
-fn partition() -> ProjectionPartition {
-    ProjectionPartition::new(b"tenant:a".to_vec()).unwrap()
+fn partition() -> PartitionId {
+    PartitionId::new(b"tenant:a".to_vec()).unwrap()
 }
 
 fn scope(model: &str, key: &[u8]) -> ProjectionRecordScope {
@@ -194,7 +194,7 @@ fn record_expectations_and_mutation_kinds_fail_closed() {
             first_scope.clone(),
             delete.clone(),
             ProjectionRecordExpectation::Exact(revision),
-            ProjectionMutationKind::Delete,
+            RecordTransition::Delete,
         ),
         Err(ProjectionProtocolError::ScopeMismatch { .. })
     ));
@@ -203,7 +203,7 @@ fn record_expectations_and_mutation_kinds_fail_closed() {
             first_scope,
             delete,
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Delete,
+            RecordTransition::Delete,
         ),
         Err(ProjectionProtocolError::InvalidBatch(_))
     ));
@@ -212,7 +212,7 @@ fn record_expectations_and_mutation_kinds_fail_closed() {
 #[test]
 fn absent_and_explicit_null_obligation_partitions_survive_round_trip() {
     let topology = ProjectorTopologyId::new(1, "todos", [9; 32]).unwrap();
-    let partition = super::super::ProjectionPartition::new(b"unit".to_vec()).unwrap();
+    let partition = super::super::PartitionId::new(b"unit".to_vec()).unwrap();
     let scope = super::super::ProjectionRecordScope::new(
         topology,
         partition,
@@ -223,7 +223,7 @@ fn absent_and_explicit_null_obligation_partitions_survive_round_trip() {
     let absent = ResolvedProjectionObligation {
         projector: "todos".into(),
         model: "TodoView".into(),
-        key: ResolvedProjectionKey { fields: Vec::new() },
+        key: RecordKey { fields: Vec::new() },
         partition: None,
         scope,
     };
