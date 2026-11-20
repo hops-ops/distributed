@@ -482,6 +482,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_commit_that_would_drop_captured_events_is_refused_on_every_path() {
+        let repo = InMemoryRepository::new().aggregate::<PublishedCounter>();
+        let mut counter = PublishedCounter::default();
+        counter.open("counter-plain".into()).unwrap();
+
+        // Plain commit.
+        let plain = repo.commit(&mut counter).await.unwrap_err();
+        assert!(plain.to_string().contains("publish_events"), "{plain}");
+        // The transactional batch builder.
+        let batch = crate::CommitBuilder::new(repo.repo())
+            .aggregate(&mut counter)
+            .commit()
+            .await
+            .unwrap_err();
+        assert!(batch.to_string().contains("publish_events"), "{batch}");
+        // Nothing was stored, and the occurrences are intact for a retry.
+        assert!(repo.get("counter-plain").await.unwrap().is_none());
+        assert_eq!(counter.entity.pending_domain_events().len(), 1);
+
+        repo.publish_events().commit(&mut counter).await.unwrap();
+        assert!(repo.get("counter-plain").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn publish_events_commits_canonical_occurrences_and_clears_them_once() {
         let repo = InMemoryRepository::new().aggregate::<PublishedCounter>();
         let mut counter = PublishedCounter::default();

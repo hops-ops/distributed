@@ -1219,7 +1219,7 @@ This pattern is useful for reactive workflows within the same process. For cross
 
 ## Queued Repository
 
-Per-entity async locking for serialized workflows. `get` acquires the lock, `commit` releases it:
+Per-entity async locking for serialized workflows. `get` waits for the lock and returns an aggregate that owns it. `commit` releases it, and so does dropping the aggregate, so an early return cannot leak a lock:
 
 ```rust,ignore
 use distributed::{AggregateBuilder, InMemoryRepository, Queueable, RepositoryError};
@@ -1233,7 +1233,7 @@ let Some(mut todo) = repo.get("todo-1").await? else {
 repo.commit(&mut todo).await?; // unlocks
 
 // Or release without changes:
-repo.abort(&todo).await?;
+drop(todo);
 
 // Read without locking:
 let _ = repo.peek("todo-1").await?;

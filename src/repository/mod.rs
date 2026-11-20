@@ -20,4 +20,6 @@ pub use traits::{
     RelationalReadModelQueryStore, Repository, SnapshotStore, SnapshotWrite, StreamWrite,
     TransactionalCommit,
 };
-pub(crate) use validation::{validate_commit_batch, validate_snapshot_identity};
+pub(crate) use validation::{
+    require_captured_events_are_published, validate_commit_batch, validate_snapshot_identity,
+};

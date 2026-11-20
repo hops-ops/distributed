@@ -46,6 +46,9 @@ where
     let mut batch = batch;
     let schedule_owner = crate::schedule::schedule_owner(&batch)?;
     let prepared = validate_commit_batch(&batch)?;
+    if completion.is_none() {
+        crate::repository::require_captured_events_are_published(&batch)?;
+    }
     for plan in &batch.read_model_plans {
         validate_sql_write_plan(plan).map_err(RepositoryError::from)?;
     }

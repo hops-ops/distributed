@@ -510,6 +510,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_stale_snapshot_falls_back_to_a_full_load_through_a_queued_repo() {
+        let repo = AggregateRepository::<_, TestAggregate>::new(crate::QueuedRepository::new(
+            crate::InMemoryRepository::new(),
+        ))
+        .with_snapshots(2);
+        let mut aggregate = TestAggregate::default();
+        for _ in 0..3 {
+            aggregate.touch().unwrap();
+            repo.commit(&mut aggregate).await.unwrap();
+        }
+        let identity = StreamIdentity::new(TestAggregate::aggregate_type(), "snap-1").unwrap();
+        let mut snapshot = repo.repo().get_snapshot(&identity).await.unwrap().unwrap();
+        snapshot.payload = vec![255; 9];
+        repo.repo()
+            .save_snapshot(&identity, snapshot)
+            .await
+            .unwrap();
+
+        // The tail read and the fallback full read take the same stream lock.
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(1), repo.get("snap-1"))
+            .await
+            .expect("the fallback load must not wait on the tail load's lock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.value, 3);
+    }
+
     impl TransactionalCommit for FailingSnapshotRepo {
         async fn commit_batch<'a>(&'a self, batch: CommitBatch<'a>) -> Result<(), RepositoryError> {
             {

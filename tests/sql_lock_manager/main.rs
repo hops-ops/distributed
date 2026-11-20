@@ -198,7 +198,7 @@ where
     // `get` acquires and holds the lease.
     let held = repo.get("c1").await.unwrap().unwrap();
     // `abort` releases it.
-    repo.abort(&held).await.unwrap();
+    drop(held);
 
     // A subsequent locking load must not block.
     let reloaded = tokio::time::timeout(Duration::from_secs(5), repo.get("c1"))
@@ -206,7 +206,7 @@ where
         .expect("load after abort must not block")
         .unwrap()
         .expect("counter should exist");
-    repo.abort(&reloaded).await.unwrap();
+    drop(reloaded);
 }
 
 /// Two managers (independent gates) race `try_lock` for the SAME initially-free

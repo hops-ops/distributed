@@ -51,6 +51,38 @@ pub(crate) fn validate_commit_batch<'a>(
     Ok(prepared)
 }
 
+/// A domain event an aggregate captured must leave in the same commit, as an
+/// outbox row with the occurrence's id. Every backend runs this for a commit
+/// that is not a causal command commit, so no builder can persist the replay
+/// events and silently drop the publication. (A causal commit applies its own
+/// guard: it may hand the occurrences to a same-transaction projection.)
+pub(crate) fn require_captured_events_are_published(
+    batch: &CommitBatch<'_>,
+) -> Result<(), RepositoryError> {
+    for stream in &batch.streams {
+        let pending = stream
+            .entity
+            .pending_domain_events_for_commit()
+            .map_err(|error| RepositoryError::Model(error.to_string()))?;
+        for occurrence in pending {
+            let id = occurrence.id().to_string();
+            if !batch
+                .outbox_messages
+                .iter()
+                .any(|message| message.id() == id)
+            {
+                return Err(RepositoryError::Model(format!(
+                    "aggregate `{}` captured domain event `{}` but this commit does not publish \
+                     it; commit with `publish_events()`",
+                    stream.identity,
+                    occurrence.descriptor().name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reject_duplicate_streams(streams: &[StreamWrite<'_>]) -> Result<(), RepositoryError> {
     let mut seen = HashSet::with_capacity(streams.len());
     for stream in streams {

@@ -547,4 +547,20 @@ impl<D: LeaseQueries> Lock for SqlxLock<D> {
     fn unlock(&self) -> impl Future<Output = Result<(), LockError>> + Send + '_ {
         lease_unlock(self)
     }
+
+    fn release_detached(self: Arc<Self>) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _ = lease_unlock(&*self).await;
+                });
+            }
+            // No runtime to delete the lease row on: free this process's
+            // gate now and let the row expire by its TTL.
+            Err(_) => {
+                store_token(self.shared(), None);
+                let _ = self.shared().gate.unlock_core();
+            }
+        }
+    }
 }
