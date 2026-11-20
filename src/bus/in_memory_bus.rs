@@ -3,12 +3,13 @@
 //!
 //! `send`/`listen` use named queues with competing-consumer (point-to-point)
 //! semantics: a message is popped by exactly one consumer. `publish`/`subscribe`
-//! use named **retained logs** with a per-subscriber cursor, so every subscriber
+//! use named **retained logs** with a cursor per consumer group, so every group
 //! sees every event (fan-out) — the same log+offset shape the Postgres fan-out
 //! transport uses, in memory.
 //!
-//! It is intentionally simple (no durability; a nacked command is dropped, a
-//! nacked event is redelivered) — for tests and local development. Use a real transport for production reliability.
+//! It is intentionally simple (no durability) and is for tests and local
+//! development. A nacked command goes back to the head of its queue and a
+//! nacked event is delivered again from the same position.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::poll_fn;
@@ -24,7 +25,10 @@ use super::{
 use super::{Message, OrderedDelivery};
 use crate::projection_protocol::{ProjectionEpoch, ProjectionSource};
 
-type Queues = Arc<Mutex<HashMap<String, VecDeque<Message>>>>;
+/// Each queued command with the number of times it has been delivered.
+type Queues = Arc<Mutex<HashMap<String, VecDeque<(Message, u32)>>>>;
+/// Per topic, the position that was last handed back and how often.
+type TopicRetries = Arc<Mutex<HashMap<String, (usize, u32)>>>;
 type Topics = Arc<Mutex<HashMap<String, Vec<Message>>>>;
 type TopicCursors = Arc<Mutex<HashMap<String, usize>>>;
 
@@ -86,6 +90,8 @@ fn lock_poisoned(what: &str) -> TransportError {
 pub struct InMemoryBus {
     queues: Queues,
     topics: Topics,
+    /// Each named consumer group's position in every topic.
+    group_cursors: Arc<Mutex<HashMap<String, TopicCursors>>>,
     arrivals: Arc<Arrivals>,
     source_epoch: ProjectionEpoch,
 }
@@ -95,6 +101,7 @@ impl Default for InMemoryBus {
         Self {
             queues: Queues::default(),
             topics: Topics::default(),
+            group_cursors: Arc::default(),
             arrivals: Arc::default(),
             source_epoch: ProjectionEpoch::new(format!("instance-{}", uuid::Uuid::now_v7()))
                 .expect("an in-memory bus UUID is a valid projection source epoch"),
@@ -118,7 +125,7 @@ impl InMemoryBus {
             .map_err(|_| lock_poisoned("queue"))?
             .entry(message.name().to_string())
             .or_default()
-            .push_back(message);
+            .push_back((message, 0));
         self.arrivals.notify();
         Ok(())
     }
@@ -223,10 +230,24 @@ impl BusConsumer for InMemoryBus {
         options: RunOptions,
     ) -> Result<(), TransportError> {
         let names = router.subscription_plan().events;
+        // A named group keeps its position between runs, as a durable
+        // consumer does. An unnamed subscriber is a group of its own and
+        // reads every retained event.
+        let cursors = match router.consumer_group() {
+            Some(group) => self
+                .group_cursors
+                .lock()
+                .map_err(|_| lock_poisoned("group cursor"))?
+                .entry(group.to_string())
+                .or_default()
+                .clone(),
+            None => TopicCursors::default(),
+        };
         let source = TopicSource {
             topics: self.topics.clone(),
             names,
-            cursors: TopicCursors::default(),
+            cursors,
+            retries: TopicRetries::default(),
             source_epoch: self.source_epoch.clone(),
             arrivals: Arc::clone(&self.arrivals),
             seen: 0,
@@ -258,11 +279,15 @@ impl MessageSource for QueueSource {
         self.seen = self.arrivals.seen();
         let mut queues = self.queues.lock().map_err(|_| lock_poisoned("queue"))?;
         for name in &self.names {
-            if let Some(message) = queues.get_mut(name).and_then(VecDeque::pop_front) {
+            if let Some((message, delivered)) = queues.get_mut(name).and_then(VecDeque::pop_front) {
                 return Ok(Some(InMemoryReceived {
                     message,
+                    attempts: delivered.saturating_add(1),
                     ordered: None,
-                    topic_settlement: None,
+                    settlement: Settlement::Queue {
+                        queues: Arc::clone(&self.queues),
+                        arrivals: Arc::clone(&self.arrivals),
+                    },
                 }));
             }
         }
@@ -276,6 +301,7 @@ struct TopicSource {
     topics: Topics,
     names: Vec<String>,
     cursors: TopicCursors,
+    retries: TopicRetries,
     source_epoch: ProjectionEpoch,
     arrivals: Arc<Arrivals>,
     seen: u64,
@@ -316,12 +342,21 @@ impl MessageSource for TopicSource {
                 let ordered =
                     OrderedDelivery::new(source, self.source_epoch.clone(), position, true)
                         .map_err(|error| TransportError::permanent(error.to_string()))?;
+                let handed_back = match self.retries.lock() {
+                    Ok(retries) => match retries.get(name) {
+                        Some((at, times)) if at == cursor => *times,
+                        _ => 0,
+                    },
+                    Err(_) => 0,
+                };
                 return Ok(Some(InMemoryReceived {
                     message,
+                    attempts: handed_back.saturating_add(1),
                     ordered: Some(ordered),
-                    topic_settlement: Some(TopicSettlement {
+                    settlement: Settlement::Topic(TopicSettlement {
                         arrivals: Arc::clone(&self.arrivals),
                         cursors: Arc::clone(&self.cursors),
+                        retries: Arc::clone(&self.retries),
                         name: name.clone(),
                         position: *cursor,
                     }),
@@ -335,6 +370,7 @@ impl MessageSource for TopicSource {
 struct TopicSettlement {
     arrivals: Arc<Arrivals>,
     cursors: TopicCursors,
+    retries: TopicRetries,
     name: String,
     position: usize,
 }
@@ -361,31 +397,61 @@ impl TopicSettlement {
     }
 }
 
-/// In-memory delivery. A queue message is popped on receive, so settling it
-/// does nothing and a nacked command is dropped. A topic cursor advances only
-/// on `ack`; `nack` leaves the position to be delivered again at once.
+/// How a delivery is settled: a queue message was popped on receive, a topic
+/// message is still in the log behind its cursor.
+enum Settlement {
+    Queue {
+        queues: Queues,
+        arrivals: Arc<Arrivals>,
+    },
+    Topic(TopicSettlement),
+}
+
+/// In-memory delivery. `nack` puts a queue message back at the head of its
+/// queue; a topic cursor advances only on `ack`, so a nacked event is read
+/// again from the same position. The delay is not honoured.
 pub struct InMemoryReceived {
     message: Message,
+    attempts: u32,
     ordered: Option<OrderedDelivery>,
-    topic_settlement: Option<TopicSettlement>,
+    settlement: Settlement,
 }
 
 impl ReceivedMessage for InMemoryReceived {
     fn message(&self) -> &Message {
         &self.message
     }
+    fn attempts(&self) -> u32 {
+        self.attempts
+    }
     fn ordered_delivery(&self) -> Option<&OrderedDelivery> {
         self.ordered.as_ref()
     }
     async fn ack(self) -> Result<(), TransportError> {
-        match self.topic_settlement {
-            Some(settlement) => settlement.ack(),
-            None => Ok(()),
+        match self.settlement {
+            Settlement::Topic(settlement) => settlement.ack(),
+            Settlement::Queue { .. } => Ok(()),
         }
     }
     async fn nack(self, _delay: Duration) -> Result<(), TransportError> {
-        if let Some(settlement) = self.topic_settlement {
-            settlement.arrivals.notify();
+        match self.settlement {
+            Settlement::Topic(settlement) => {
+                settlement
+                    .retries
+                    .lock()
+                    .map_err(|_| lock_poisoned("topic retry"))?
+                    .insert(settlement.name, (settlement.position, self.attempts));
+                settlement.arrivals.notify();
+            }
+            Settlement::Queue { queues, arrivals } => {
+                queues
+                    .lock()
+                    .map_err(|_| lock_poisoned("queue"))?
+                    .entry(self.message.name().to_string())
+                    .or_default()
+                    .push_front((self.message, self.attempts));
+                arrivals.notify();
+            }
         }
         Ok(())
     }
@@ -536,6 +602,7 @@ mod tests {
             topics: bus.topics.clone(),
             names: vec!["evt".into()],
             cursors: TopicCursors::default(),
+            retries: TopicRetries::default(),
             source_epoch: bus.source_epoch.clone(),
             arrivals: Arc::clone(&bus.arrivals),
             seen: 0,
@@ -583,6 +650,7 @@ mod tests {
             topics: bus.topics.clone(),
             names: vec!["evt".into()],
             cursors: TopicCursors::default(),
+            retries: TopicRetries::default(),
             source_epoch: bus.source_epoch.clone(),
             arrivals: Arc::clone(&bus.arrivals),
             seen: 0,

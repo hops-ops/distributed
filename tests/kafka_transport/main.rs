@@ -5,7 +5,6 @@
 //! `KAFKA_BROKERS` is unset.
 #![cfg(feature = "kafka")]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,7 +13,6 @@ use distributed::bus::{
     MessagePublisher, RunOptions, TransportError,
 };
 use distributed::microsvc::{Context, Message, MessageKind, Routes, Service};
-use distributed::TRACEPARENT;
 use serde_json::json;
 
 // Shared broker-test helpers (recording_for, bus scenarios). `unique` mixes
@@ -100,65 +98,6 @@ async fn publish_then_consume_round_trips_through_kafka() {
     );
 }
 
-#[tokio::test]
-async fn message_id_and_metadata_survive_the_round_trip() {
-    let Some(brokers) = brokers() else { return };
-    let topic = unique("order.initialized");
-    let group = unique("group");
-
-    let publisher = KafkaPublisher::connect(&brokers).await.expect("producer");
-    publisher
-        .publish(
-            Message::new(&topic, MessageKind::Event, br#"{"k":"v"}"#.to_vec())
-                .with_id("evt-1")
-                .with_metadata("correlation_id", "corr-9")
-                .with_metadata(
-                    TRACEPARENT,
-                    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-                ),
-        )
-        .await
-        .expect("publish");
-
-    let source = KafkaSource::connect(&brokers, &group, &[&topic])
-        .await
-        .expect("consumer")
-        .with_fetch_timeout(Duration::from_secs(10));
-
-    let observed = Arc::new(Mutex::new(None));
-    let o = observed.clone();
-    let service = Arc::new(
-        Service::new().routes(
-            Routes::new()
-                .with_dependencies(())
-                .event(Box::leak(topic.clone().into_boxed_str()))
-                .handle(move |ctx: &Context<()>| {
-                    let m = ctx.message();
-                    let recorded = Some((
-                        m.id().map(str::to_string),
-                        m.correlation_id().map(str::to_string),
-                        m.traceparent().map(str::to_string),
-                        m.payload().to_vec(),
-                    ));
-                    *o.lock().unwrap() = recorded;
-                    async move { Ok(json!({})) }
-                }),
-        ),
-    );
-    run_source(service, source, RunOptions::until_idle())
-        .await
-        .unwrap();
-
-    let got = observed.lock().unwrap().clone().expect("handler ran");
-    assert_eq!(got.0.as_deref(), Some("evt-1"));
-    assert_eq!(got.1.as_deref(), Some("corr-9"));
-    assert_eq!(
-        got.2.as_deref(),
-        Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
-    );
-    assert_eq!(got.3, br#"{"k":"v"}"#.to_vec());
-}
-
 // ---- KafkaBus: shared group = listen (point-to-point); group-per-service = subscribe (fan-out) ----
 
 /// `send` + `listen`: a shared consumer group consumes each command once for the
@@ -240,6 +179,29 @@ async fn kafka_bus(brokers: &str, ns: &str, group: &str) -> KafkaBus {
         .with_fetch_timeout(Duration::from_secs(10))
 }
 
+/// One namespace (topic prefix) per test.
+struct Kafka {
+    brokers: String,
+    namespace: String,
+}
+
+impl conformance::bus::BusHarness for Kafka {
+    type Bus = KafkaBus;
+
+    async fn start() -> Option<Self> {
+        Some(Self {
+            brokers: brokers()?,
+            namespace: unique("ns"),
+        })
+    }
+
+    async fn bus(&self, group: &str) -> KafkaBus {
+        kafka_bus(&self.brokers, &self.namespace, group).await
+    }
+}
+
+conformance::bus::bus_conformance_tests!(Kafka);
+
 /// `publish` + `subscribe`: each `group` is a distinct Kafka consumer group, and
 /// Kafka delivers every record to every group — so each group reads every event
 /// (fan-out). A fresh group reads from earliest.
@@ -270,105 +232,6 @@ async fn failure_source(brokers: &str, group: &str, topic: &str, fetch: Duration
         .await
         .expect("consumer")
         .with_fetch_timeout(fetch)
-}
-
-#[tokio::test]
-async fn retryable_failure_is_redelivered_then_succeeds() {
-    let Some(brokers) = brokers() else { return };
-    let topic = unique("delivery.retry");
-    let group = unique("group");
-
-    let publisher = KafkaPublisher::connect(&brokers).await.expect("producer");
-    publisher
-        .publish(Message::new(&topic, MessageKind::Event, b"{}".to_vec()).with_id("m1"))
-        .await
-        .expect("publish");
-
-    let source = failure_source(&brokers, &group, &topic, Duration::from_secs(10)).await;
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let seen = attempts.clone();
-    let handlers = Arc::new(Handlers::new().on_event(topic.clone(), move |_: &Message| {
-        let seen = seen.clone();
-        async move {
-            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(TransportError::retryable("transient"))
-            } else {
-                Ok(())
-            }
-        }
-    }));
-    run_source(handlers, source, RunOptions::until_idle())
-        .await
-        .expect("run drains after the seek-back redelivery succeeds");
-
-    assert_eq!(
-        attempts.load(Ordering::SeqCst),
-        2,
-        "the nacked record was re-read after the seek and then committed"
-    );
-}
-
-/// A poison record is stored as a dead letter, is not redelivered to the group,
-/// and does not hold up later records.
-#[tokio::test]
-async fn permanent_failure_routes_to_dead_letter_destination() {
-    let Some(brokers) = brokers() else { return };
-    let topic = unique("delivery.poison");
-    let group = unique("group");
-
-    let publisher = KafkaPublisher::connect(&brokers).await.expect("producer");
-    for id in ["poison", "ok"] {
-        publisher
-            .publish(Message::new(&topic, MessageKind::Event, b"{}".to_vec()).with_id(id))
-            .await
-            .expect("publish");
-    }
-
-    let source = failure_source(&brokers, &group, &topic, Duration::from_secs(10)).await;
-    let (dead, options) = storing_dead_letters();
-    let rec = Arc::new(Mutex::new(Vec::new()));
-    let seen = rec.clone();
-    let handlers = Arc::new(
-        Handlers::new().on_event(topic.clone(), move |message: &Message| {
-            let id = message.id().unwrap_or_default().to_string();
-            let seen = seen.clone();
-            async move {
-                if id == "poison" {
-                    Err(TransportError::permanent("unprocessable"))
-                } else {
-                    seen.lock().unwrap().push(id);
-                    Ok(())
-                }
-            }
-        }),
-    );
-    run_source(handlers, source, options)
-        .await
-        .expect("run drains past the poison record");
-    assert_eq!(
-        rec.lock().unwrap().clone(),
-        vec!["ok".to_string()],
-        "subsequent records still flow after the dead letter"
-    );
-    let (id, _, reason) = only_dead_letter(&dead);
-    assert_eq!(id.as_deref(), Some("poison"));
-    assert!(reason.contains("unprocessable"), "{reason}");
-
-    // The dead letter was acknowledged, committing past the poison record: a fresh consumer in the
-    // SAME group re-reads nothing.
-    let source = failure_source(&brokers, &group, &topic, Duration::from_secs(6)).await;
-    let redelivered = Arc::new(Mutex::new(Vec::new()));
-    run_source(
-        recording_for(&topic, MessageKind::Event, redelivered.clone()),
-        source,
-        RunOptions::until_idle(),
-    )
-    .await
-    .expect("redelivery-check run drains");
-    assert!(
-        redelivered.lock().unwrap().is_empty(),
-        "a dead-lettered record must not be redelivered to the group"
-    );
 }
 
 #[tokio::test]

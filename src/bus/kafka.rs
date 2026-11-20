@@ -23,7 +23,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{Message as KafkaMessageTrait, Offset, TopicPartitionList};
 
 use super::source::{MessageSource, ReceivedMessage};
-use super::{message_from_wire, strip_address_prefix, Message};
+use super::{message_from_wire, strip_address_prefix, Message, CONTENT_TYPE_HEADER};
 use super::{retryable, MessagePublisher, TransportError};
 
 const MESSAGE_ID_HEADER: &str = "x-sourced-id";
@@ -58,10 +58,15 @@ impl KafkaPublisher {
 }
 
 fn owned_headers(message: &Message) -> OwnedHeaders {
-    let mut headers = OwnedHeaders::new().insert(Header {
-        key: MESSAGE_KIND_HEADER,
-        value: Some(message.kind.as_str()),
-    });
+    let mut headers = OwnedHeaders::new()
+        .insert(Header {
+            key: MESSAGE_KIND_HEADER,
+            value: Some(message.kind.as_str()),
+        })
+        .insert(Header {
+            key: CONTENT_TYPE_HEADER,
+            value: Some(message.content_type.as_str()),
+        });
     if let Some(id) = message.id() {
         headers = headers.insert(Header {
             key: MESSAGE_ID_HEADER,
