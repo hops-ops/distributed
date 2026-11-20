@@ -6,7 +6,7 @@ use crate::outbox::{OutboxMessage, OutboxMessageStatus};
 use crate::outbox_worker::{ensure_active_claim, ClaimOutboxMessages, OutboxClaimRef};
 use crate::repository::{sqlite_codec, RepositoryError};
 use std::borrow::Cow;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 pub(crate) struct OutboxInsert<'a> {
     pub statement: Statement<'a>,
@@ -212,7 +212,8 @@ pub(crate) async fn claim_sqlite(
 
 pub(crate) enum Transition<'a> {
     Complete,
-    Release(&'a str),
+    /// Back to pending, claimable again after the delay.
+    Release(&'a str, Duration),
     Fail(&'a str),
 }
 
@@ -226,8 +227,8 @@ pub(crate) async fn transition<E: SqlExecutor>(
 ) -> Result<(), RepositoryError> {
     let mut statement = match transition {
         Transition::Complete => Statement::new("DELETE FROM outbox_messages"),
-        Transition::Release(error) | Transition::Fail(error) => {
-            let released = matches!(transition, Transition::Release(_));
+        Transition::Release(error, _) | Transition::Fail(error) => {
+            let released = matches!(transition, Transition::Release(..));
             let mut statement = Statement::new("UPDATE outbox_messages SET status = ")
                 .bind(if released { "pending" } else { "failed" }.into())
                 .sql(", claimed_by = NULL, claimed_until = NULL, last_error = ");
@@ -237,7 +238,10 @@ pub(crate) async fn transition<E: SqlExecutor>(
             } else {
                 ", failed_at = "
             });
-            statement.push_bind(SqlBind::Timestamp(now));
+            statement.push_bind(SqlBind::Timestamp(match transition {
+                Transition::Release(_, retry_after) => now + retry_after,
+                _ => now,
+            }));
             statement.push(", updated_at = ");
             statement.push(E::NOW);
             statement
@@ -277,6 +281,46 @@ pub(crate) async fn transition<E: SqlExecutor>(
         id: claim.message_id.clone(),
         expected: "settled outbox claim",
         actual: "conditional settlement changed no row".into(),
+    })
+}
+
+/// Put a failed row back in the queue with a fresh attempt count, claimable
+/// at once.
+pub(crate) async fn requeue_failed<E: SqlExecutor>(
+    executor: &mut E,
+    message_id: &str,
+    now: SystemTime,
+) -> Result<(), RepositoryError> {
+    let mut statement = Statement::new(
+        "UPDATE outbox_messages SET status = 'pending', attempts = 0, failed_at = NULL, \
+         next_available_at = ",
+    );
+    statement.push_bind(SqlBind::Timestamp(now));
+    statement.push(", updated_at = ");
+    statement.push(E::NOW);
+    statement.push(" WHERE status = 'failed' AND message_id = ");
+    statement.push_bind(message_id);
+    if executor.execute(statement).await? > 0 {
+        return Ok(());
+    }
+    let row = executor
+        .query(
+            Statement::new("SELECT ")
+                .sql(E::OUTBOX_SELECT)
+                .sql(" FROM outbox_messages WHERE message_id = ")
+                .bind(message_id.into()),
+        )
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| RepositoryError::NotFound {
+            id: message_id.to_string(),
+        })?;
+    let message = from_row(row)?;
+    Err(RepositoryError::InvalidState {
+        id: message_id.to_string(),
+        expected: "failed",
+        actual: format!("{:?}", message.status),
     })
 }
 
@@ -374,7 +418,7 @@ mod tests {
         let mut executor = ConnectionExecutor::<sqlx::Sqlite>(&mut connection);
         for action in [
             Transition::Complete,
-            Transition::Release("late"),
+            Transition::Release("late", Duration::ZERO),
             Transition::Fail("late"),
         ] {
             assert!(matches!(

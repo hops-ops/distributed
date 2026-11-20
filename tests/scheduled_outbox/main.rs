@@ -152,8 +152,8 @@ mod sqlite_backend {
             .await
             .unwrap();
 
-        // Released (retried) rows are immediately claimable again: the
-        // release bumps `next_available_at` to now, not back to the schedule.
+        // A row released with no delay is claimable again at once: the
+        // release sets `next_available_at` from now, not from the schedule.
         let retry = OutboxMessage::create_to("timer-2", "Timeout", "saga", vec![])
             .unwrap()
             .deliver_at(SystemTime::now() - Duration::from_millis(1));
@@ -163,7 +163,10 @@ mod sqlite_backend {
             .await
             .unwrap();
         let claim = OutboxClaimRef::from_message(&claimed[0]).unwrap();
-        store.release(&claim, "transient").await.unwrap();
+        store
+            .release(&claim, "transient", Duration::ZERO)
+            .await
+            .unwrap();
         let again = store
             .claim(ClaimOutboxMessages::new("w", 10, LEASE))
             .await

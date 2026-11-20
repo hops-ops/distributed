@@ -359,7 +359,7 @@ pub use schedule::{Capabilities, Capability, Schedule, ScheduleWrite};
 // at the crate root — it is an adapter-authoring detail, not part of the quick-start API.
 pub use outbox::{
     outbox_message_key, outbox_message_schema, AggregateCommit, CommitReceipt, OutboxMessage,
-    OutboxMessageStatus, OutboxPublishHook, OutboxPublisherConfig, OUTBOX_MESSAGES_TABLE,
+    OutboxMessageStatus, OutboxPublisherConfig, OUTBOX_MESSAGES_TABLE,
 };
 
 // Outbox Worker: drain and publish concerns.
@@ -383,8 +383,8 @@ pub use outbox_worker::{
     DEFAULT_OUTBOX_HINT_CAPACITY,
 };
 pub use outbox_worker::{
-    BusOutboxPublishHook, BusPublisher, ClaimOutboxMessages, OutboxClaimRef, OutboxDispatchOutcome,
-    OutboxDispatcher, OutboxPublishFailureAction, OutboxSource, OutboxStore, ReceivedOutboxMessage,
+    BusPublisher, ClaimOutboxMessages, OutboxClaimRef, OutboxDispatchOutcome, OutboxDispatcher,
+    OutboxPublishFailureAction, OutboxSource, OutboxStore, ReceivedOutboxMessage, OUTBOX_RETRY,
 };
 
 pub use queued_repo::{

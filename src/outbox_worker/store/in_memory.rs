@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::time::Duration;
 
 use crate::in_memory_repo::InMemoryOutboxStore;
 use crate::outbox::{OutboxMessage, OutboxMessageStatus};
@@ -165,11 +166,32 @@ impl OutboxStore for InMemoryOutboxStore {
         &'a self,
         claim: &'a OutboxClaimRef,
         error: &'a str,
+        retry_after: Duration,
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
         async move {
             self.update_outbox_message(&claim.message_id, |message| {
-                ensure_active_claim(message, Some(claim), crate::time::now())?;
-                message.release(error.to_string())?;
+                let now = crate::time::now();
+                ensure_active_claim(message, Some(claim), now)?;
+                message.release(error.to_string(), now + retry_after)?;
+                Ok(())
+            })
+        }
+    }
+
+    fn requeue_failed<'a>(
+        &'a self,
+        message_id: &'a str,
+    ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
+        async move {
+            self.update_outbox_message(message_id, |message| {
+                if message.status != OutboxMessageStatus::Failed {
+                    return Err(RepositoryError::InvalidState {
+                        id: message.id().to_string(),
+                        expected: "failed",
+                        actual: format!("{:?}", message.status),
+                    });
+                }
+                message.requeue()?;
                 Ok(())
             })
         }

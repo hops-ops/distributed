@@ -35,15 +35,13 @@ exactly as durable as that change. Every claim path skips it until it is due:
   back to `created_at`, so **no schema change was needed** and existing rows
   (and `None`) stay immediately deliverable;
 - explicit-id claims (`ClaimOutboxMessages::for_ids`), so the after-commit
-  immediate publisher cannot bypass the schedule;
-- the in-transaction pre-claim used when a repository has a publish hook but
-  no worker mailbox (aggregate commits and causal routes). Scheduled rows are
-  left pending.
+  immediate publisher cannot bypass the schedule.
 
 The drain worker (`OutboxDrainRunner`) picks a due row up on its next poll,
 so a timer fires within one poll interval of its deadline. `release` (a
-retry) resets availability to now, so a timer that failed to publish is
-retried promptly instead of being re-delayed. `OutboxMessage.deliver_at` is
+retry) sets availability to now plus the retry backoff (250 ms doubling to
+one minute), so a timer that failed to publish is retried soon, without a
+tight loop while the broker is down. `OutboxMessage.deliver_at` is
 `#[serde(default)]`.
 
 ## Schedules: an aggregate schedules its own work

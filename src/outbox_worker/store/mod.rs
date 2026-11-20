@@ -11,7 +11,7 @@ mod tests;
 
 pub use api::{
     ClaimOutboxMessages, OutboxBacklogStats, OutboxClaimRef, OutboxPublishFailureAction,
-    OutboxStore,
+    OutboxStore, OUTBOX_RETRY,
 };
 
 pub(crate) use api::{claim_order_ids, ensure_active_claim, sort_by_claim_order};

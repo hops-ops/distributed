@@ -153,11 +153,10 @@ where
     }
 
     /// Release for retry, or fail once the attempt ceiling is reached.
-    /// Releases the row for the next claim. The outbox has no delayed
-    /// release, so `delay` is not honoured: the row is claimable at once.
-    async fn nack(self, _delay: Duration) -> Result<(), TransportError> {
+    /// Releases the row; it is claimable again after `delay`.
+    async fn nack(self, delay: Duration) -> Result<(), TransportError> {
         self.store
-            .release(&self.claim, "redelivery requested by the consumer")
+            .release(&self.claim, "redelivery requested by the consumer", delay)
             .await?;
         Ok(())
     }

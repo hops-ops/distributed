@@ -1387,12 +1387,17 @@ leases with monotonic fencing tokens (`distributed::lease`). See
 How a committed row reaches the bus depends on whether a bus is attached to the
 service:
 
-- **Bus attached (`service.with_bus(bus)`)** — `repo.outbox(msg).commit(agg)`
-  claims the row in the commit transaction (born `InFlight` under a short lease)
-  and publishes it **immediately** after commit. A crash before the publish, or a
-  publish failure, leaves the row claimed under that lease; when the lease expires
-  the polling worker takes it.
+- **Bus attached (`service.with_bus(bus)`)** — the row is committed `pending`
+  and its id is handed to a bounded background worker, which claims it,
+  publishes it and deletes it. The commit does not wait for the broker. A crash
+  or a full mailbox leaves the row pending for the polling worker.
 - **No bus** — the row is committed `pending` and a worker publishes it.
+
+A publish that fails is retried with a growing delay (250 ms doubling to one
+minute). A retryable failure, such as the broker being down, never marks a row
+`failed`; only a permanent failure does, once the row has been attempted
+`max_attempts` times. `OutboxStore::requeue_failed(id)` puts a failed row back
+in the queue.
 
 The polling worker is the durable backstop in both cases. It is the same
 `OutboxDispatcher` primitive composed with your runtime's timer — run it in the

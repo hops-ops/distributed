@@ -568,13 +568,16 @@ impl OutboxMessage {
         Ok(())
     }
 
-    pub fn release(&mut self, error: String) -> SourcedResult {
+    /// Hand an in-flight message back for another attempt, claimable from
+    /// `available_at` on.
+    pub fn release(&mut self, error: String, available_at: SystemTime) -> SourcedResult {
         if !self.is_in_flight() {
             return Err(EventRecordError {
                 message: format!("outbox message `{}` is not in flight", self.id),
             });
         }
         self.status = OutboxMessageStatus::Pending;
+        self.deliver_at = Some(available_at);
         self.last_error = if error.is_empty() { None } else { Some(error) };
         self.worker_id = None;
         self.leased_until = None;
@@ -591,6 +594,20 @@ impl OutboxMessage {
         self.last_error = if error.is_empty() { None } else { Some(error) };
         self.worker_id = None;
         self.leased_until = None;
+        Ok(())
+    }
+
+    /// Put a failed message back in the queue with a fresh attempt count,
+    /// claimable at once.
+    pub fn requeue(&mut self) -> SourcedResult {
+        if self.status != OutboxMessageStatus::Failed {
+            return Err(EventRecordError {
+                message: format!("outbox message `{}` is not failed", self.id),
+            });
+        }
+        self.status = OutboxMessageStatus::Pending;
+        self.attempts = 0;
+        self.deliver_at = None;
         Ok(())
     }
 
@@ -910,7 +927,9 @@ mod tests {
             .claim_for("worker-1", Duration::from_secs(60))
             .unwrap();
 
-        message.release("timeout".into()).unwrap();
+        message
+            .release("timeout".into(), SystemTime::UNIX_EPOCH)
+            .unwrap();
         assert!(message.is_pending());
         assert_eq!(message.last_error.as_deref(), Some("timeout"));
 
