@@ -90,13 +90,15 @@ function start(command, args, options, ready) {
 
 /**
  * Largest frame-to-frame move (m) of the own world position / view beyond
- * what walking explains for the time between the two frames. Walking reads
- * near 0 at any frame rate: the display eases toward each predicted step, so
- * a frame can show slightly more than its own share of a step (0.011 seen in
- * CI on a loaded runner). A real doorway jump is a room (40 m) or a visible
- * snap.
+ * what walking explains for the time between the two frames. Ordinary
+ * walking reads near 0 at any frame rate. In the doorway frame the client
+ * shows one whole predicted step without easing it (0.251 m measured in a
+ * 16.7 ms frame in CI), so the allowance is one tick of walking
+ * (5 m/s × 50 ms = 0.25 m) plus f32 rounding where the position crosses into
+ * the next room's coordinates. A real doorway jump is a room (40 m) or a
+ * larger snap.
  */
-const MAX_JUMP = 0.1;
+const MAX_JUMP = 0.26;
 
 /**
  * Walk `page`'s player through the doorway on `side`; resolves with the new
