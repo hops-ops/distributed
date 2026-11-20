@@ -3,7 +3,7 @@ use super::{
     live::{LiveSource, LiveSourceFactory},
     proxy, NativeDelivery, NativeInner, RequestContext,
 };
-use crate::gateway::{BindingKind, GraphqlCapabilities, GraphqlExecutor};
+use crate::gateway::{BindingKind, Forwarding, GraphqlCapabilities, GraphqlExecutor};
 use axum::{
     body::Bytes,
     extract::ws::{Message, WebSocket},
@@ -38,12 +38,7 @@ impl Execution {
         };
         *capabilities
     }
-    fn source(
-        &self,
-        headers: HeaderMap,
-        query: Option<String>,
-        init: serde_json::Value,
-    ) -> LiveSourceFactory {
+    fn source(&self, headers: HeaderMap, init: serde_json::Value) -> LiveSourceFactory {
         let execution = self.clone();
         Arc::new(move |mut request: serde_json::Value| {
             if let Some(extensions) = request
@@ -55,7 +50,6 @@ impl Execution {
             let execution = execution.clone();
             let headers = headers.clone();
             let init = init.clone();
-            let query = query.clone();
             async move {
             match &execution.binding {
                 GraphqlBinding::Embedded(embedded)=>{
@@ -67,7 +61,7 @@ impl Execution {
                 }
                 GraphqlBinding::Remote(remote)=>{
                     let GraphqlExecutor::Remote{origin}=execution.executor() else {return Err("invalid origin binding".into())};
-                    let mut socket=connect(&execution.inner,origin,remote,&execution.context,headers,query.as_deref(),&init).await?;
+                    let mut socket=connect(&execution.inner,origin,remote,&execution.context,headers,&init).await?;
                     socket.send(Upstream::Text(serde_json::json!({"id":"upstream","type":"subscribe","payload":request}).to_string().into())).await.map_err(|_|"upstream subscribe failed")?;
                     Ok(origin_stream(socket))
                 }
@@ -82,11 +76,10 @@ async fn connect(
     remote: &RemoteGraphql,
     context: &RequestContext,
     mut headers: HeaderMap,
-    query: Option<&str>,
     init: &serde_json::Value,
 ) -> Result<OriginSocket, String> {
     let path = remote.live_path.as_deref().ok_or("live endpoint missing")?;
-    proxy::prepare_headers(&mut headers, inner, context, true)
+    proxy::prepare_headers(&mut headers, inner, context, Forwarding::Graphql, true)
         .map_err(|_| "invalid live headers")?;
     headers.remove(header::CONTENT_LENGTH);
     headers.remove(header::CONTENT_TYPE);
@@ -104,11 +97,7 @@ async fn connect(
         HeaderValue::from_static("graphql-transport-ws"),
     );
     proxy::add_hop(&mut headers, inner).map_err(|_| "gateway loop")?;
-    let url = format!(
-        "{}{path}{}",
-        origin.trim_end_matches('/'),
-        query.map(|q| format!("?{q}")).unwrap_or_default()
-    );
+    let url = format!("{}{path}", origin.trim_end_matches('/'));
     let response = tokio::time::timeout(
         inner.options.limits.response_header_timeout,
         inner.client.get(url).headers(headers).send(),
@@ -395,11 +384,7 @@ async fn client_loop(
     protocol: &'static str,
     init: serde_json::Value,
 ) {
-    let source = execution.source(
-        parts.headers.clone(),
-        parts.uri.query().map(str::to_owned),
-        init.clone(),
-    );
+    let source = execution.source(parts.headers.clone(), init.clone());
     parts.method = Method::POST;
     proxy::strip_hop_headers(&mut parts.headers);
     let parts = Arc::new(parts);
@@ -483,16 +468,22 @@ async fn operation(
         payload["operationName"].as_str(),
     );
     if kind != Ok(crate::gateway::graphql::OperationKind::Subscription) {
-        let request = super::delivery::request(&parts, payload);
-        let result = execution
-            .binding
-            .execute_operation(
-                &execution.inner,
-                &execution.declaration,
-                execution.context,
-                request,
-            )
-            .await;
+        let result = match execution.inner.permits.clone().try_acquire_owned() {
+            Ok(permit) => {
+                execution
+                    .binding
+                    .execute_value(
+                        &execution.inner,
+                        &execution.declaration,
+                        execution.context,
+                        Parts::clone(&parts),
+                        payload,
+                        permit,
+                    )
+                    .await
+            }
+            Err(_) => super::response(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+        };
         let value = match axum::body::to_bytes(
             result.into_body(),
             execution.inner.options.limits.request_body_bytes,
@@ -535,12 +526,11 @@ async fn operation(
             let Some(live) = &coordinator.live else {
                 return;
             };
-            let mut lease = match live.join(admission, payload, freshness, source) {
+            let mut lease = match live.join(admission, payload.clone(), freshness, source.clone()) {
                 Ok(lease) => lease,
-                Err(_) => {
-                    let _ = out.send(failure(&id, "LIVE_RESET_REQUIRED")).await;
-                    return;
-                }
+                // Sharing is an optimization. A full registry, or a group this
+                // consumer cannot join, means this consumer runs alone.
+                Err(_) => return independent(&id, next, payload, source, &out).await,
             };
             loop {
                 match lease.next().await {
@@ -566,29 +556,9 @@ async fn operation(
                 }
             }
         }
-        super::delivery::AdmissionResult::Bypass => match source(payload).await {
-            Ok(mut stream) => {
-                while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(payload) => {
-                            if out.send(packet(&id, next, payload)).await.is_err() {
-                                return;
-                            }
-                        }
-                        Err(_) => {
-                            let _ = out.send(failure(&id, "LIVE_RESET_REQUIRED")).await;
-                            return;
-                        }
-                    }
-                }
-                let _ = out
-                    .send(serde_json::json!({"id":id,"type":"complete"}))
-                    .await;
-            }
-            Err(_) => {
-                let _ = out.send(failure(&id, "LIVE_RESET_REQUIRED")).await;
-            }
-        },
+        super::delivery::AdmissionResult::Bypass => {
+            independent(&id, next, payload, source, &out).await
+        }
         super::delivery::AdmissionResult::Error(response) => {
             let bytes = axum::body::to_bytes(response.into_body(), 65536)
                 .await
@@ -600,6 +570,39 @@ async fn operation(
             let _ = out
                 .send(serde_json::json!({"id":id,"type":"complete"}))
                 .await;
+        }
+    }
+}
+
+/// One consumer's own upstream execution, shared with nobody.
+async fn independent(
+    id: &str,
+    next: &str,
+    payload: serde_json::Value,
+    source: LiveSourceFactory,
+    out: &mpsc::Sender<serde_json::Value>,
+) {
+    match source(payload).await {
+        Ok(mut stream) => {
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(payload) => {
+                        if out.send(packet(id, next, payload)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = out.send(failure(id, "LIVE_RESET_REQUIRED")).await;
+                        return;
+                    }
+                }
+            }
+            let _ = out
+                .send(serde_json::json!({"id":id,"type":"complete"}))
+                .await;
+        }
+        Err(_) => {
+            let _ = out.send(failure(id, "LIVE_RESET_REQUIRED")).await;
         }
     }
 }
@@ -642,6 +645,7 @@ pub(super) async fn upgrade_embedded(
         &mut parts.headers,
         &execution.inner,
         &execution.context,
+        Forwarding::Graphql,
         false,
     )
     .is_err()

@@ -51,8 +51,8 @@ async function modeRun(host,mode,runtime){
   let downstreamBytes=0;
   const query=async(subject='alice',document='query Load { causal_query_views { title } }')=>{
     const started=performance.now();
-    const body=JSON.stringify({query:document,extensions:{gatewayDelivery:{action:'execute',connectionInit:{authorization:'Bearer '+tokens[subject]}}}});
-    const response=await fetch(url+'/graphql',{method:'POST',headers:{'content-type':'application/json'},body});
+    const body=JSON.stringify({query:document});
+    const response=await fetch(url+'/graphql',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+tokens[subject]},body});
     const text=await response.text();downstreamBytes+=Buffer.byteLength(text);
     assert.equal(response.status,200,'query status');const value=JSON.parse(text);assert.equal(value.errors,undefined,'query errors');
     return {value,ms:performance.now()-started};
@@ -152,7 +152,7 @@ async function modeRun(host,mode,runtime){
 }
 try{
   for(const host of ['native','workerd'])for(const mode of ['none','flights','snapshots','live']){
-    const runtime=host==='native'?{publicOrigin:native[mode],stop:async()=>{}}:await startRuntime({apiOrigin:meterOrigin,mode,artifact:'load-'+mode+'-workerd.log'});
+    const runtime=host==='native'?{publicOrigin:native[mode],stop:async()=>{}}:await startRuntime({apiOrigin:meterOrigin,mode,auth:'bearer',artifact:'load-'+mode+'-workerd.log'});
     try{await modeRun(host,mode,runtime);}finally{await runtime.stop();}
   }
   await mkdir(root+'/artifacts',{recursive:true});await writeFile(root+'/artifacts/load-report.json',JSON.stringify(report,null,2)+'\n');

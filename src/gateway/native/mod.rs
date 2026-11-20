@@ -7,8 +7,8 @@ mod proxy;
 pub use graphql::{EmbeddedGraphql, GraphqlBinding, RemoteGraphql};
 
 use super::{
-    Admission, AuthError, BackendCredential, BindingKind, Credentials, Gateway, GatewayAdapter,
-    GatewayError, Rejection, RequestContext, SelectedRoute,
+    Admission, AuthError, BackendCredential, BindingKind, Credentials, Forwarding, Gateway,
+    GatewayAdapter, GatewayError, Rejection, RequestContext, SelectedRoute,
 };
 pub use assets::{Asset, StaticAssets};
 use axum::{
@@ -406,9 +406,17 @@ impl GatewayAdapter for NativeGateway {
         let Some(binding) = self.0.bindings.get(&selected.binding().id) else {
             return response(StatusCode::SERVICE_UNAVAILABLE);
         };
+        let forwarding = selected.binding().kind.forwarding();
         match binding {
             NativeBinding::Handler(handler) => {
-                if proxy::prepare_headers(request.headers_mut(), &self.0, &context, false).is_err()
+                if proxy::prepare_headers(
+                    request.headers_mut(),
+                    &self.0,
+                    &context,
+                    forwarding,
+                    false,
+                )
+                .is_err()
                 {
                     return response(StatusCode::BAD_REQUEST);
                 }
@@ -422,13 +430,13 @@ impl GatewayAdapter for NativeGateway {
                 let BindingKind::UiProxy { origin } = &selected.binding().kind else {
                     return response(StatusCode::SERVICE_UNAVAILABLE);
                 };
-                proxy::forward(&self.0, origin, *websocket, context, request).await
+                proxy::forward(&self.0, origin, *websocket, forwarding, context, request).await
             }
             NativeBinding::Zones => {
                 let BindingKind::Zones { origin } = &selected.binding().kind else {
                     return response(StatusCode::SERVICE_UNAVAILABLE);
                 };
-                proxy::forward(&self.0, origin, true, context, request).await
+                proxy::forward(&self.0, origin, true, forwarding, context, request).await
             }
             #[cfg(feature = "gateway-graphql-native")]
             NativeBinding::Graphql(binding) => {

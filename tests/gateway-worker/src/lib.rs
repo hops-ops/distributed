@@ -32,6 +32,31 @@ fn delivery_options(env: &Env) -> WorkerDeliveryOptions {
         }),
     }
 }
+/// `AUTH=bearer` (load runs) hands the caller's bearer to the origin, which
+/// verifies it. Every other run admits anonymous callers only.
+fn auth(env: &Env) -> WorkerAuth {
+    if env.var("AUTH").map(|v| v.to_string()).ok().as_deref() != Some("bearer") {
+        return WorkerAuth::anonymous();
+    }
+    WorkerAuth::new(|credentials| async move {
+        let token = credentials
+            .authorization
+            .as_deref()
+            .and_then(|value| value.strip_prefix("Bearer "));
+        let (identity, backend) = match token {
+            Some(token) => (
+                Some(
+                    Identity::verified("fixture", token, vec![], u64::MAX)
+                        .map_err(|_| AuthError::Unauthorized)?,
+                ),
+                BackendCredential::Bearer(token.to_owned()),
+            ),
+            None => (None, BackendCredential::None),
+        };
+        RequestContext::from_provider(identity, "fixture-v1", backend)
+            .map_err(|_| AuthError::Unavailable)
+    })
+}
 fn gateway(env: &Env) -> Result<WorkerGateway> {
     let origin = env.var("UI_ORIGIN")?.to_string();
     let public = env.var("PUBLIC_ORIGIN")?.to_string();
@@ -118,7 +143,7 @@ fn gateway(env: &Env) -> Result<WorkerGateway> {
                 },
             ),
         ],
-        WorkerAuth::anonymous(),
+        auth(env),
     )
     .map_err(|error| ::worker::Error::RustError(error.to_string()))
 }

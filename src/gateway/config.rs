@@ -112,6 +112,20 @@ pub enum BindingKind {
     },
 }
 
+impl BindingKind {
+    /// The header rule every adapter applies before this binding's backend
+    /// sees the request.
+    pub fn forwarding(&self) -> super::Forwarding {
+        match self {
+            Self::Graphql { .. } => super::Forwarding::Graphql,
+            Self::Zones { .. } => super::Forwarding::Zones,
+            Self::Handler | Self::Admission | Self::Assets | Self::UiProxy { .. } => {
+                super::Forwarding::Application
+            }
+        }
+    }
+}
+
 /// Named adapter binding. Identifiers are shared with route targets/admission.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

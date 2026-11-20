@@ -17,15 +17,15 @@ pub(super) async fn handshake(
             headers.append(name, value)?;
         }
     }
-    proxy::prepare_headers(&headers, &input.options, &input.context, true)?;
+    proxy::prepare_headers(
+        &headers,
+        crate::gateway::Forwarding::Graphql,
+        &input.options,
+        &input.context,
+        true,
+    )?;
     headers.set("sec-websocket-protocol", protocol)?;
-    let public = worker::Url::parse(&input.url)?;
-    let url = format!(
-        "{}{}{}",
-        input.origin.trim_end_matches('/'),
-        live_path,
-        public.query().map(|q| format!("?{q}")).unwrap_or_default()
-    );
+    let url = format!("{}{}", input.origin.trim_end_matches('/'), live_path);
     let mut init = RequestInit::new();
     init.headers = headers;
     init.redirect = RequestRedirect::Manual;

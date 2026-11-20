@@ -178,7 +178,25 @@ async fn separate_origin_and_client_savings() {
             config,
             NativeOptions::new("http://load-gateway.invalid"),
             [("api".into(), resource)],
-            NativeAuth::anonymous(),
+            // The origin verifies the bearer; the gateway only hands it on.
+            NativeAuth::new(|credentials| async move {
+                let token = credentials
+                    .authorization
+                    .as_deref()
+                    .and_then(|value| value.strip_prefix("Bearer "));
+                let (identity, backend) = match token {
+                    Some(token) => (
+                        Some(
+                            Identity::verified("fixture", token, vec![], u64::MAX)
+                                .map_err(|_| AuthError::Unauthorized)?,
+                        ),
+                        BackendCredential::Bearer(token.to_owned()),
+                    ),
+                    None => (None, BackendCredential::None),
+                };
+                RequestContext::from_provider(identity, "fixture-v1", backend)
+                    .map_err(|_| AuthError::Unavailable)
+            }),
         )
         .unwrap();
         let counts = delivery.clone();

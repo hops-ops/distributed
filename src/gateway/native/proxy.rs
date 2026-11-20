@@ -1,5 +1,5 @@
 use super::{
-    response, BackendCredential, Body, HeaderMap, HeaderValue, NativeInner, Request,
+    response, BackendCredential, Body, Forwarding, HeaderMap, HeaderValue, NativeInner, Request,
     RequestContext, Response, StatusCode, Url,
 };
 use axum::http::header;
@@ -35,26 +35,22 @@ pub(super) fn prepare_headers(
     headers: &mut HeaderMap,
     inner: &NativeInner,
     context: &RequestContext,
+    forwarding: Forwarding,
     upgrade: bool,
 ) -> Result<(), ()> {
     strip_hop_headers(headers);
     let remove: Vec<_> = headers
         .keys()
-        .filter(|name| {
-            super::super::is_untrusted_identity_header(name.as_str())
-                || inner
-                    .options
-                    .strip_headers
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(name.as_str()))
-        })
+        .filter(|name| !forwarding.forwards(name.as_str(), &inner.options.strip_headers))
         .cloned()
         .collect();
     for name in remove {
         headers.remove(name);
     }
-    headers.remove(header::AUTHORIZATION);
-    if let BackendCredential::Bearer(token) = context.backend_credential() {
+    if let (true, BackendCredential::Bearer(token)) = (
+        forwarding.sends_backend_credential(),
+        context.backend_credential(),
+    ) {
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| ())?,
@@ -79,6 +75,7 @@ pub(super) async fn forward(
     inner: &NativeInner,
     origin: &str,
     allow_websocket: bool,
+    forwarding: Forwarding,
     context: RequestContext,
     request: Request<Body>,
 ) -> Response {
@@ -90,6 +87,7 @@ pub(super) async fn forward(
         inner,
         origin,
         allow_websocket,
+        forwarding,
         context,
         request,
         Some(permit),
@@ -101,6 +99,7 @@ pub(super) async fn forward_with_permit(
     inner: &NativeInner,
     origin: &str,
     allow_websocket: bool,
+    forwarding: Forwarding,
     context: RequestContext,
     mut request: Request<Body>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -128,7 +127,15 @@ pub(super) async fn forward_with_permit(
         return response(StatusCode::BAD_REQUEST);
     }
     let on_upgrade = wants_upgrade.then(|| hyper::upgrade::on(&mut request));
-    if prepare_headers(request.headers_mut(), inner, &context, wants_upgrade).is_err() {
+    if prepare_headers(
+        request.headers_mut(),
+        inner,
+        &context,
+        forwarding,
+        wants_upgrade,
+    )
+    .is_err()
+    {
         return response(StatusCode::BAD_REQUEST);
     }
     if add_hop(request.headers_mut(), inner).is_err() {
