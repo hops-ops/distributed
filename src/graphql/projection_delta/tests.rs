@@ -480,53 +480,116 @@ fn production_authority_binds_partition_and_obligation_tokens_to_request_scope()
     ));
 }
 
-#[test]
+/// Lower one actual occurrence for a caller whose `TodoView` grant carries
+/// `policy`, with `x-user-id` set to `claim`.
 #[cfg(feature = "graphql")]
-fn production_predicate_authorizes_only_complete_actual_after_rows() {
+fn lower_under_row_policy(
+    fixture: &ModeledFixture,
+    occurrence: DomainEventOccurrence,
+    claim: Option<&str>,
+    policy: crate::graphql::FilterExpr,
+) -> ProjectionDelta {
     use super::runtime::ProtocolProjectionDeltaRequestAuthority;
     use crate::graphql::protocol::{
         DistributedTrustedPreset, ProtocolTokenCodec, ProtocolTokenPurpose,
     };
 
-    fn lower(
-        fixture: &ModeledFixture,
-        occurrence: DomainEventOccurrence,
-        claim: Option<&str>,
-    ) -> ProjectionDelta {
-        let selected = selected_export_with_owner_policy(&fixture.surface);
-        let codec = ProtocolTokenCodec::new([0x6a; 32]);
-        let cache_scope = codec
-            .issue(ProtocolTokenPurpose::CacheScope, &("owner-policy", claim))
-            .unwrap();
-        let trusted_presets = claim
-            .map(|value| {
-                vec![DistributedTrustedPreset {
-                    name: "x-user-id".into(),
-                    codec: "string".into(),
-                    value: serde_json::Value::String(value.into()),
-                }]
-            })
-            .unwrap_or_default();
-        let request = ProtocolProjectionDeltaRequestAuthority::try_new(
-            selected,
-            codec,
-            crate::command_ledger::PrincipalPartitionId::new("owner-policy-principal").unwrap(),
-            "owner-policy-generation",
-            &cache_scope,
-            crate::command_ledger::CausationId::parse_stored(TEST_CAUSATION_ID.to_owned()).unwrap(),
-            1_000,
-            1_000,
-            2_000,
+    let selected = selected_export_with_row_policy(&fixture.surface, policy);
+    let codec = ProtocolTokenCodec::new([0x6a; 32]);
+    let cache_scope = codec
+        .issue(ProtocolTokenPurpose::CacheScope, &("owner-policy", claim))
+        .unwrap();
+    let trusted_presets = claim
+        .map(|value| {
+            vec![DistributedTrustedPreset {
+                name: "x-user-id".into(),
+                codec: "string".into(),
+                value: serde_json::Value::String(value.into()),
+            }]
+        })
+        .unwrap_or_default();
+    let request = ProtocolProjectionDeltaRequestAuthority::try_new(
+        selected,
+        codec,
+        crate::command_ledger::PrincipalPartitionId::new("owner-policy-principal").unwrap(),
+        "owner-policy-generation",
+        &cache_scope,
+        crate::command_ledger::CausationId::parse_stored(TEST_CAUSATION_ID.to_owned()).unwrap(),
+        1_000,
+        1_000,
+        2_000,
+    )
+    .unwrap()
+    .with_trusted_presets(trusted_presets);
+    let authority = ProjectionDeltaAuthority::try_new(request.export(), &request).unwrap();
+    let modeled = request.export().surface().projectors[0].modeled[0].clone();
+    let source = authority.source(&modeled).unwrap();
+    let plan = crate::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
+    let occurrence = ProjectionDeltaPlanOccurrence::actual(vec![(&source, &plan)]).unwrap();
+    authority.lower(&[occurrence]).unwrap()
+}
+
+/// The command-delta path decides a row policy as the query's SQL does. An
+/// `Upsert` carries every granted column, so anything short of TRUE must not
+/// produce one.
+#[test]
+#[cfg(feature = "graphql")]
+fn delta_row_policy_follows_sql_three_valued_logic() {
+    use crate::graphql::{claim, col, lit, FilterExpr, LitValue};
+
+    let fixture = modeled_fixture(
+        ProjectionBindingState::Active,
+        ProjectionExecutionClass::Causal,
+    );
+    let upserts = |policy: FilterExpr, caller: &str| {
+        lower_under_row_policy(
+            &fixture,
+            state_occurrence(7, "todo-1", "visible"),
+            Some(caller),
+            policy,
         )
-        .unwrap()
-        .with_trusted_presets(trusted_presets);
-        let authority = ProjectionDeltaAuthority::try_new(request.export(), &request).unwrap();
-        let modeled = request.export().surface().projectors[0].modeled[0].clone();
-        let source = authority.source(&modeled).unwrap();
-        let plan = crate::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
-        let occurrence = ProjectionDeltaPlanOccurrence::actual(vec![(&source, &plan)]).unwrap();
-        authority.lower(&[occurrence]).unwrap()
-    }
+        .operations
+        .iter()
+        .any(|operation| matches!(operation.mutation, ProjectionDeltaMutation::Upsert { .. }))
+    };
+    // The occurrence's row is owned by `owner-secret`.
+    let owner = || col("owner_id");
+    assert!(upserts(owner().neq(claim("x-user-id")), "someone-else"));
+    assert!(!upserts(owner().neq(claim("x-user-id")), "owner-secret"));
+    assert!(upserts(owner().is_in([claim("x-user-id")]), "owner-secret"));
+    assert!(!upserts(
+        owner().is_in([claim("x-user-id")]),
+        "someone-else"
+    ));
+
+    // A comparison with NULL is unknown, and so is its negation.
+    let null = || lit(LitValue::Null);
+    assert!(!upserts(owner().neq(null()), "owner-secret"));
+    assert!(!upserts(
+        FilterExpr::Not(Box::new(owner().eq(null()))),
+        "owner-secret"
+    ));
+    assert!(!upserts(
+        FilterExpr::In {
+            column: "owner_id".into(),
+            values: vec![lit("someone-else").into(), null().into()],
+            negated: true,
+        },
+        "owner-secret"
+    ));
+}
+
+#[test]
+#[cfg(feature = "graphql")]
+fn production_predicate_authorizes_only_complete_actual_after_rows() {
+    let lower = |fixture: &ModeledFixture, occurrence, claim| {
+        lower_under_row_policy(
+            fixture,
+            occurrence,
+            claim,
+            crate::graphql::col("owner_id").eq(crate::graphql::claim("x-user-id")),
+        )
+    };
 
     let complete = modeled_fixture(
         ProjectionBindingState::Active,
@@ -3917,20 +3980,16 @@ fn selected_export(surface: &crate::graphql::Surface) -> DistributedClientSurfac
 }
 
 #[cfg(feature = "graphql")]
-fn selected_export_with_owner_policy(
+fn selected_export_with_row_policy(
     surface: &crate::graphql::Surface,
+    policy: crate::graphql::FilterExpr,
 ) -> DistributedClientSurfaceExport {
     let surface = surface_with_modeled_command(surface);
     let selected = surface_for_role(
         &surface,
         "delta-user",
         &BTreeMap::from([
-            (
-                "TodoView".into(),
-                read()
-                    .all_columns()
-                    .rows(crate::graphql::col("owner_id").eq(crate::graphql::claim("x-user-id"))),
-            ),
+            ("TodoView".into(), read().all_columns().rows(policy)),
             ("UserView".into(), read().all_columns()),
         ]),
     )

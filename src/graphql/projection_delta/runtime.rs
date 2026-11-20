@@ -35,6 +35,7 @@ use crate::projection_protocol::{
     ResolvedProjectionKey as ProtocolResolvedProjectionKey,
     ResolvedProjectionKeyField as ProtocolResolvedProjectionKeyField,
 };
+use crate::table::ColumnType;
 use crate::{
     DomainEventOccurrence, ProjectionEventSelector, ProjectionProgram,
     ProjectionRelationshipEffectKind, ResolvedProjectionKey, ResolvedProjectionMutation,
@@ -1927,7 +1928,9 @@ fn evaluate_complete_after_policy(
     predicate: &crate::graphql::filter::FilterExpr,
     trusted_presets: &[crate::graphql::protocol::DistributedTrustedPreset],
 ) -> ProjectionDeltaVisibility {
-    let mut row = BTreeMap::new();
+    use crate::graphql::filter::Truth;
+
+    let mut row = serde_json::Map::new();
     for column in &model.schema.columns {
         let value = mutation
             .fields()
@@ -1950,120 +1953,38 @@ fn evaluate_complete_after_policy(
                     .and_then(|field| projection_value_json(field.value().as_ref()).ok())
             });
         if let Some(value) = value {
-            row.insert(column.column_name.as_str(), value);
+            row.insert(column.column_name.clone(), value);
         }
     }
-    match evaluate_filter(predicate, &row, trusted_presets) {
-        Some(true) => ProjectionDeltaVisibility::Authorized,
-        Some(false) => ProjectionDeltaVisibility::Denied,
-        None => ProjectionDeltaVisibility::Unknown,
-    }
-}
-
-fn evaluate_filter(
-    predicate: &crate::graphql::filter::FilterExpr,
-    row: &BTreeMap<&str, serde_json::Value>,
-    trusted_presets: &[crate::graphql::protocol::DistributedTrustedPreset],
-) -> Option<bool> {
-    use crate::graphql::filter::{CmpOp, FilterExpr};
-
-    match predicate {
-        FilterExpr::And(items) => {
-            let evaluated = items
-                .iter()
-                .map(|item| evaluate_filter(item, row, trusted_presets))
-                .collect::<Vec<_>>();
-            if evaluated.contains(&Some(false)) {
-                Some(false)
-            } else if evaluated.iter().all(|value| *value == Some(true)) {
-                Some(true)
-            } else {
-                None
-            }
-        }
-        FilterExpr::Or(items) => {
-            let evaluated = items
-                .iter()
-                .map(|item| evaluate_filter(item, row, trusted_presets))
-                .collect::<Vec<_>>();
-            if evaluated.contains(&Some(true)) {
-                Some(true)
-            } else if evaluated.iter().all(|value| *value == Some(false)) {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        FilterExpr::Not(item) => evaluate_filter(item, row, trusted_presets).map(|value| !value),
-        FilterExpr::Cmp { column, op, rhs } => {
-            let left = row.get(column.as_str())?;
-            let right = policy_operand(rhs, trusted_presets)?;
-            match op {
-                CmpOp::Eq => Some(left == &right),
-                CmpOp::Neq => Some(left != &right),
-                CmpOp::Gt
-                | CmpOp::Gte
-                | CmpOp::Lt
-                | CmpOp::Lte
-                | CmpOp::Like
-                | CmpOp::Ilike
-                | CmpOp::Contains
-                | CmpOp::ContainedIn
-                | CmpOp::HasKey => None,
-            }
-        }
-        FilterExpr::In {
-            column,
-            values,
-            negated,
-        } => {
-            let left = row.get(column.as_str())?;
-            let mut unknown = false;
-            let matched =
-                values
-                    .iter()
-                    .any(|operand| match policy_operand(operand, trusted_presets) {
-                        Some(right) => left == &right,
-                        None => {
-                            unknown = true;
-                            false
-                        }
-                    });
-            if matched {
-                Some(!negated)
-            } else if unknown {
-                None
-            } else {
-                Some(*negated)
-            }
-        }
-        FilterExpr::IsNull { column, is_null } => row
-            .get(column.as_str())
-            .map(|value| value.is_null() == *is_null),
-        FilterExpr::Rel { .. } => None,
-    }
-}
-
-fn policy_operand(
-    operand: &crate::graphql::filter::Operand,
-    trusted_presets: &[crate::graphql::protocol::DistributedTrustedPreset],
-) -> Option<serde_json::Value> {
-    use crate::graphql::filter::{LitValue, Operand};
-
-    match operand {
-        Operand::Claim(claim) => trusted_presets
+    let claims = |claim: &crate::graphql::filter::ClaimRef, column_type: &ColumnType| {
+        let preset = trusted_presets
             .iter()
-            .find(|preset| preset.name == claim.header)
-            .map(|preset| preset.value.clone()),
-        Operand::Lit(LitValue::String(value)) => Some(serde_json::Value::String(value.clone())),
-        Operand::Lit(LitValue::I64(value)) => Some(serde_json::Value::Number((*value).into())),
-        Operand::Lit(LitValue::F64(value)) => {
-            serde_json::Number::from_f64(*value).map(serde_json::Value::Number)
-        }
-        Operand::Lit(LitValue::Bool(value)) => Some(serde_json::Value::Bool(*value)),
-        Operand::Lit(LitValue::Json(value)) => Some(value.clone()),
-        Operand::Lit(LitValue::Null) => Some(serde_json::Value::Null),
+            .find(|preset| preset.name == claim.header)?;
+        preset_literal(&preset.value, column_type)
+    };
+    match predicate.evaluate(&model.schema, &row, &claims) {
+        Truth::True => ProjectionDeltaVisibility::Authorized,
+        Truth::False => ProjectionDeltaVisibility::Denied,
+        Truth::Unknown => ProjectionDeltaVisibility::Unknown,
     }
+}
+
+/// A trusted preset as the literal the SQL compiler binds for a claim
+/// compared with a column of `column_type`. `None` when the preset's wire
+/// value is not that type, which leaves the comparison undecided.
+fn preset_literal(
+    value: &serde_json::Value,
+    column_type: &ColumnType,
+) -> Option<crate::graphql::filter::LitValue> {
+    use crate::graphql::filter::LitValue;
+
+    Some(match column_type {
+        ColumnType::Text | ColumnType::Timestamp => LitValue::String(value.as_str()?.to_string()),
+        ColumnType::Boolean => LitValue::Bool(value.as_bool()?),
+        ColumnType::Integer | ColumnType::UnsignedInteger => LitValue::I64(value.as_i64()?),
+        ColumnType::Float => LitValue::F64(value.as_f64()?),
+        ColumnType::Json | ColumnType::Bytes | ColumnType::Unsupported(_) => return None,
+    })
 }
 
 impl ProjectionDeltaRequestAuthority for ProtocolProjectionDeltaRequestAuthority {

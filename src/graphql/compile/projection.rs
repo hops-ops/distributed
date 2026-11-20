@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use async_graphql::Value;
@@ -8,7 +7,7 @@ use crate::microsvc::Session;
 use crate::table::{ColumnType, TableSchema};
 
 use super::super::engine::EngineInner;
-use super::super::filter::{CmpOp, FilterExpr, LitValue, Operand};
+use super::super::filter::{CmpOp, FilterExpr, LitValue, Operand, Truth};
 use super::super::naming::is_valid_graphql_name;
 use super::binds::{operand_to_bind, value_to_bind, BindValue};
 use super::dialect::{placeholder, SqlDialect};
@@ -312,189 +311,8 @@ pub(crate) fn cell_row_matches(schema: &TableSchema, filter: &FilterExpr, row: &
     let JsonValue::Object(row) = row else {
         return false;
     };
-    matches!(evaluate_cell_filter(schema, filter, row), CellTruth::True)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CellTruth {
-    True,
-    False,
-    Unknown,
-}
-
-impl CellTruth {
-    fn not(self) -> Self {
-        match self {
-            Self::True => Self::False,
-            Self::False => Self::True,
-            Self::Unknown => Self::Unknown,
-        }
-    }
-}
-
-fn evaluate_cell_filter(
-    schema: &TableSchema,
-    filter: &FilterExpr,
-    row: &serde_json::Map<String, JsonValue>,
-) -> CellTruth {
-    match filter {
-        FilterExpr::And(items) => {
-            let mut result = CellTruth::True;
-            for item in items {
-                match evaluate_cell_filter(schema, item, row) {
-                    CellTruth::False => return CellTruth::False,
-                    CellTruth::Unknown => result = CellTruth::Unknown,
-                    CellTruth::True => {}
-                }
-            }
-            result
-        }
-        FilterExpr::Or(items) => {
-            let mut result = CellTruth::False;
-            for item in items {
-                match evaluate_cell_filter(schema, item, row) {
-                    CellTruth::True => return CellTruth::True,
-                    CellTruth::Unknown => result = CellTruth::Unknown,
-                    CellTruth::False => {}
-                }
-            }
-            result
-        }
-        FilterExpr::Not(item) => evaluate_cell_filter(schema, item, row).not(),
-        FilterExpr::Cmp { column, op, rhs } => {
-            let Some((column_type, left)) = cell_row_value(schema, row, column) else {
-                return CellTruth::Unknown;
-            };
-            let Operand::Lit(right) = rhs else {
-                return CellTruth::Unknown;
-            };
-            evaluate_cell_comparison(&column_type, left, *op, right)
-        }
-        FilterExpr::In {
-            column,
-            values,
-            negated,
-        } => {
-            if values.is_empty() {
-                return if *negated {
-                    CellTruth::True
-                } else {
-                    CellTruth::False
-                };
-            }
-            let Some((column_type, left)) = cell_row_value(schema, row, column) else {
-                return CellTruth::Unknown;
-            };
-            let mut unknown = false;
-            for value in values {
-                let Operand::Lit(right) = value else {
-                    unknown = true;
-                    continue;
-                };
-                match cell_values_equal(&column_type, left, right) {
-                    Some(true) => {
-                        return if *negated {
-                            CellTruth::False
-                        } else {
-                            CellTruth::True
-                        };
-                    }
-                    Some(false) => {}
-                    None => unknown = true,
-                }
-            }
-            if unknown {
-                CellTruth::Unknown
-            } else if *negated {
-                CellTruth::True
-            } else {
-                CellTruth::False
-            }
-        }
-        FilterExpr::IsNull { column, is_null } => {
-            let Some((_, value)) = cell_row_value(schema, row, column) else {
-                return CellTruth::Unknown;
-            };
-            if value.is_null() == *is_null {
-                CellTruth::True
-            } else {
-                CellTruth::False
-            }
-        }
-        FilterExpr::Rel { .. } => CellTruth::Unknown,
-    }
-}
-
-fn cell_row_value<'a>(
-    schema: &TableSchema,
-    row: &'a serde_json::Map<String, JsonValue>,
-    column: &str,
-) -> Option<(ColumnType, &'a JsonValue)> {
-    let column_schema = schema
-        .columns
-        .iter()
-        .find(|candidate| candidate.column_name == column)?;
-    let value = row
-        .get(&column_schema.field_name)
-        .or_else(|| row.get(&column_schema.column_name))?;
-    Some((column_schema.column_type.clone(), value))
-}
-
-fn evaluate_cell_comparison(
-    column_type: &ColumnType,
-    left: &JsonValue,
-    op: CmpOp,
-    right: &LitValue,
-) -> CellTruth {
-    let matched = match op {
-        CmpOp::Eq => cell_values_equal(column_type, left, right),
-        CmpOp::Neq => cell_values_equal(column_type, left, right).map(|equal| !equal),
-        CmpOp::Gt => cell_values_order(column_type, left, right).map(|order| order.is_gt()),
-        CmpOp::Gte => cell_values_order(column_type, left, right).map(|order| order.is_ge()),
-        CmpOp::Lt => cell_values_order(column_type, left, right).map(|order| order.is_lt()),
-        CmpOp::Lte => cell_values_order(column_type, left, right).map(|order| order.is_le()),
-        CmpOp::Like | CmpOp::Ilike | CmpOp::Contains | CmpOp::ContainedIn | CmpOp::HasKey => None,
-    };
-    match matched {
-        Some(true) => CellTruth::True,
-        Some(false) => CellTruth::False,
-        None => CellTruth::Unknown,
-    }
-}
-
-fn cell_values_equal(column_type: &ColumnType, left: &JsonValue, right: &LitValue) -> Option<bool> {
-    if left.is_null() || matches!(right, LitValue::Null) {
-        return None;
-    }
-    Some(match (column_type, right) {
-        (ColumnType::Text | ColumnType::Timestamp, LitValue::String(right)) => {
-            left.as_str()? == right
-        }
-        (ColumnType::Boolean, LitValue::Bool(right)) => left.as_bool()? == *right,
-        (ColumnType::Integer, LitValue::I64(right)) => left.as_i64()? == *right,
-        (ColumnType::UnsignedInteger, LitValue::I64(right)) if *right >= 0 => {
-            left.as_u64()? == *right as u64
-        }
-        (ColumnType::Float, LitValue::F64(right)) => left.as_f64()? == *right,
-        (ColumnType::Float, LitValue::I64(right)) => left.as_f64()? == *right as f64,
-        _ => return None,
-    })
-}
-
-fn cell_values_order(
-    column_type: &ColumnType,
-    left: &JsonValue,
-    right: &LitValue,
-) -> Option<Ordering> {
-    match (column_type, right) {
-        (ColumnType::Integer, LitValue::I64(right)) => left.as_i64()?.partial_cmp(right),
-        (ColumnType::UnsignedInteger, LitValue::I64(right)) if *right >= 0 => {
-            left.as_u64()?.partial_cmp(&(*right as u64))
-        }
-        (ColumnType::Float, LitValue::F64(right)) => left.as_f64()?.partial_cmp(right),
-        (ColumnType::Float, LitValue::I64(right)) => left.as_f64()?.partial_cmp(&(*right as f64)),
-        _ => None,
-    }
+    // `resolve_cell_row_filter` already replaced every claim with a literal.
+    filter.evaluate(schema, row, &|_, _| None) == Truth::True
 }
 
 /// Compile a root field selection into one SQL statement.

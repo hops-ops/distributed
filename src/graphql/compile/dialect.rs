@@ -313,3 +313,30 @@ mod join_predicate_tests {
             .contains("at least one key column"));
     }
 }
+
+/// The column as the left side of a comparison, compared byte for byte when
+/// it is text, which is how the client replica and
+/// [`FilterExpr::evaluate`](crate::graphql::FilterExpr::evaluate) compare it.
+///
+/// Order (`<`, `>` and friends) depends on the collation everywhere, so the
+/// binary one is always pinned, as it is for `ORDER BY`.
+///
+/// Equality (`=`, `<>`, `IN`) is pinned on SQLite, which compares under the
+/// column's declared collation. Postgres is left alone: its text equality is
+/// already bytewise under every deterministic collation, and pinning one
+/// stops the planner from using the column's index. A Postgres column
+/// declared with a nondeterministic collation or as `citext` is outside this
+/// contract.
+pub(super) fn comparison_operand(
+    dialect: SqlDialect,
+    column_type: &crate::table::ColumnType,
+    col_ref: &str,
+    ordered: bool,
+) -> String {
+    let text = matches!(column_type, crate::table::ColumnType::Text);
+    if text && (ordered || dialect == SqlDialect::Sqlite) {
+        format!("{col_ref} COLLATE {}", dialect.ops().binary_collation)
+    } else {
+        col_ref.to_string()
+    }
+}

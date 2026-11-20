@@ -1,4 +1,5 @@
 import type { ReplicaValue } from '../types.js';
+import { UTF8_ENCODER } from './constants.js';
 import type {
 	ReplicaQueryPlanPath,
 	ReplicaQueryPlanReason,
@@ -86,4 +87,23 @@ export function isReplicaValue(value: unknown, ancestors = new Set<object>()): v
 			Object.values(value).every((entry) => isReplicaValue(entry, ancestors));
 	ancestors.delete(value);
 	return valid;
+}
+
+/**
+ * Text compares by its UTF-8 bytes, for equality, `IN`, `<`/`>` and
+ * `ORDER BY` alike. The GraphQL SQL compiler pins the matching binary
+ * collation, so this answer is the server's on SQLite and on PostgreSQL.
+ * Equal bytes means identical strings, so equality needs only `===`.
+ */
+export function compareUtf8(left: string, right: string): -1 | 0 | 1 {
+	if (left === right) return 0;
+	const leftBytes = UTF8_ENCODER.encode(left);
+	const rightBytes = UTF8_ENCODER.encode(right);
+	const length = Math.min(leftBytes.length, rightBytes.length);
+	for (let index = 0; index < length; index += 1) {
+		const a = leftBytes[index]!;
+		const b = rightBytes[index]!;
+		if (a !== b) return a < b ? -1 : 1;
+	}
+	return leftBytes.length < rightBytes.length ? -1 : 1;
 }

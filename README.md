@@ -2114,6 +2114,21 @@ not used. A pattern that ends in a lone `\` is a `BAD_REQUEST`. The browser
 replica does not evaluate these operators locally and relies on the authorized
 server result. `_contains` remains the PostgreSQL JSON containment operator.
 
+Text comparison is by UTF-8 bytes on both backends, for `_eq`, `_neq`, `_in`,
+`_nin`, `_gt`/`_gte`/`_lt`/`_lte` and `order_by` alike: `"Open"` is not
+`"open"`, and `"Zeta"` sorts before `"alpha"`. The browser replica compares
+the same way, so a list filtered by a text column is maintained locally.
+On PostgreSQL the range operators and `order_by` pin `COLLATE "C"`; an index
+that should serve them must be declared with that collation. Equality uses
+the column's own collation, which must be deterministic (the default is), so
+`citext` and nondeterministic collations are not supported.
+
+A comparison with `null` is neither true nor false, as in SQL, and a row is
+returned or authorized only when its filter is true. A `where`, a row policy,
+the command-delta path and the browser replica all follow that rule, and
+`tests/fixtures/client-query-plan-corpus.json` holds PostgreSQL, SQLite,
+`FilterExpr::evaluate` and the replica to the same answers.
+
 ### Scope
 
 | In | Out |
