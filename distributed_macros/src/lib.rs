@@ -3,10 +3,8 @@ mod aggregate_command;
 mod command;
 mod command_input_defaults;
 mod command_types;
-mod digest;
 mod domain_event;
 mod domain_state;
-mod enqueue;
 mod mutation;
 // Event-owning `projection!` authoring removed (mutation projectors cutover).
 mod read_model;
@@ -27,30 +25,6 @@ use syn::DeriveInput;
 pub fn command(input: TokenStream) -> TokenStream {
     command::expand(input.into())
         .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Attribute macro that automatically queues a local event for emission.
-#[proc_macro_attribute]
-pub fn enqueue(attr: TokenStream, item: TokenStream) -> TokenStream {
-    enqueue::expand_enqueue(attr.into(), item.into())
-        .unwrap_or_else(|e| e.to_compile_error())
-        .into()
-}
-
-/// Attribute macro that automatically inserts a digest call at the beginning of a method.
-#[proc_macro_attribute]
-pub fn digest(attr: TokenStream, item: TokenStream) -> TokenStream {
-    digest::expand_digest(attr.into(), item.into())
-        .unwrap_or_else(|e| e.to_compile_error())
-        .into()
-}
-
-/// Generates the Aggregate trait impl with replay logic.
-#[proc_macro]
-pub fn aggregate(input: TokenStream) -> TokenStream {
-    aggregate::expand_aggregate(input.into())
-        .unwrap_or_else(|e| e.to_compile_error())
         .into()
 }
 

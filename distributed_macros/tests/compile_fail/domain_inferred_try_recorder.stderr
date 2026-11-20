@@ -1,4 +1,4 @@
-error: domain-marked #[event] methods cannot use `?` in version one because it may skip post-transition capture
+error: #[event] methods cannot use `?`: the event is already recorded when the body runs, so the body cannot fail
   --> tests/compile_fail/domain_inferred_try_recorder.rs:18:9
    |
 18 |         self.validate()?;

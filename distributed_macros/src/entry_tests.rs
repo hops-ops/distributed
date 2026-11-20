@@ -1,89 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use crate::{aggregate, digest, enqueue, sourced};
+    use crate::{aggregate, sourced};
     use quote::quote;
     use syn::parse::Parser;
 
     // ---- digest ----------------------------------------------------------
 
-    #[test]
-    fn expand_digest_inserts_digest_call() {
-        let attr = quote! { "initialized" };
-        let item = quote! {
-            fn initialize(&mut self, id: String) {
-                self.id = id;
-            }
-        };
-        let out = digest::expand_digest(attr, item).unwrap().to_string();
-        assert!(out.contains("digest"), "unexpected output: {out}");
-        assert!(out.contains("\"initialized\""), "unexpected output: {out}");
-    }
-
-    #[test]
-    fn parse_digest_args_rejects_unknown_key() {
-        let attr = quote! { "x", versoin = 2 };
-        let err = digest::parse_digest_args
-            .parse2(attr)
-            .err()
-            .expect("unknown key should error");
-        let msg = err.to_string();
-        assert!(msg.contains("unsupported key `versoin`"), "got: {msg}");
-        assert!(msg.contains("version"), "got: {msg}");
-    }
-
-    #[test]
-    fn parse_digest_args_accepts_version_and_when() {
-        let attr = quote! { entity, "renamed", when = true, version = 2 };
-        let args = digest::parse_digest_args.parse2(attr).unwrap();
-        assert_eq!(args.entity_field, "entity");
-        assert!(args.guard.is_some());
-        assert!(args.version.is_some());
-    }
-
     // ---- enqueue ---------------------------------------------------------
-
-    #[test]
-    fn parse_enqueue_args_defaults_entity_field() {
-        let attr = quote! { "order.initialized" };
-        let args = enqueue::parse_enqueue_args.parse2(attr).unwrap();
-        assert_eq!(args.emitter_field, "emitter");
-        assert_eq!(args.entity_field, "entity");
-    }
-
-    #[test]
-    fn parse_enqueue_args_overrides_entity_field() {
-        let attr = quote! { "order.initialized", entity = state };
-        let args = enqueue::parse_enqueue_args.parse2(attr).unwrap();
-        assert_eq!(args.entity_field, "state");
-    }
-
-    #[test]
-    fn expand_enqueue_uses_renamed_entity_field_in_guard() {
-        let attr = quote! { "order.initialized", entity = state };
-        let item = quote! {
-            fn create(&mut self, id: String) {
-                self.id = id;
-            }
-        };
-        let out = enqueue::expand_enqueue(attr, item).unwrap().to_string();
-        assert!(
-            out.contains("self . state . is_replaying"),
-            "expected renamed entity guard, got: {out}"
-        );
-    }
-
-    #[test]
-    fn parse_enqueue_args_rejects_unknown_key() {
-        let attr = quote! { "x", wen = true };
-        let err = enqueue::parse_enqueue_args
-            .parse2(attr)
-            .err()
-            .expect("unknown key should error");
-        assert!(
-            err.to_string().contains("unsupported key `wen`"),
-            "got: {err}"
-        );
-    }
 
     // ---- event (parse) ---------------------------------------------------
 
@@ -457,36 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn expand_digest_rejects_wildcard_parameter_pattern() {
-        let attr = quote! { "initialized" };
-        let item = quote! {
-            fn initialize(&mut self, _: String) {}
-        };
-        let err = digest::expand_digest(attr, item).expect_err("wildcard pattern should error");
-        assert!(
-            err.to_string()
-                .contains("unsupported parameter pattern in #[digest] method"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn expand_enqueue_rejects_struct_parameter_pattern() {
-        let attr = quote! { "order.initialized" };
-        let item = quote! {
-            fn create(&mut self, Payload { id }: Payload) {
-                let _ = id;
-            }
-        };
-        let err = enqueue::expand_enqueue(attr, item).expect_err("struct pattern should error");
-        assert!(
-            err.to_string()
-                .contains("unsupported parameter pattern in #[enqueue] method"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
     fn expand_sourced_rejects_event_without_receiver() {
         let attr = quote! { entity };
         let item = quote! {
@@ -531,40 +424,10 @@ mod tests {
         assert_eq!(args.upcasters.len(), 1);
     }
 
-    #[test]
-    fn expand_aggregate_accepts_upcasters_block() {
-        let input = quote! {
-            Todo, entity {
-                "initialized"(id) => initialize,
-            }
-            upcasters [
-                ("initialized", 1 => 2, OldPayload => NewPayload, upcast_fn),
-            ]
-        };
-        let out = aggregate::expand_aggregate(input).unwrap().to_string();
-        assert!(out.contains("upcasters"), "got: {out}");
-        assert!(out.contains("upcast_fn"), "got: {out}");
-    }
-
     // ---- aggregate -------------------------------------------------------
 
     #[test]
-    fn expand_aggregate_generates_impl() {
-        let input = quote! {
-            Todo, entity {
-                "initialized"(id) => initialize,
-            }
-        };
-        let out = aggregate::expand_aggregate(input).unwrap().to_string();
-        assert!(
-            out.contains("impl distributed :: Aggregate for Todo"),
-            "got: {out}"
-        );
-        assert!(out.contains("replay_event"), "got: {out}");
-    }
-
-    #[test]
-    fn expand_portable_command_emits_thin_mount() {
+    fn expand_command_emits_thin_mount() {
         let input = quote! {
             name: "todo.complete",
             transition: domain_commands::Complete,
@@ -578,9 +441,7 @@ mod tests {
             invoke: |todo, _input, principal| todo.complete(principal),
             payload: |todo| TodoStatusPayload::from_todo(&**todo),
         };
-        let out = crate::command::expand(input)
-            .expect("expand")
-            .to_string();
+        let out = crate::command::expand(input).expect("expand").to_string();
         assert!(out.contains("struct Complete"), "{out}");
         assert!(out.contains("fn complete"), "{out}");
         assert!(out.contains("todo . complete"), "{out}");
@@ -590,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_portable_command_preserves_contract_projection_options() {
+    fn expand_command_preserves_contract_projection_options() {
         let input = quote! {
             name: "chat.post",
             transition: domain_commands::Post,
@@ -610,9 +471,7 @@ mod tests {
             guard: authenticated_user,
             handle: handle_post,
         };
-        let out = crate::command::expand(input)
-            .expect("expand")
-            .to_string();
+        let out = crate::command::expand(input).expect("expand").to_string();
         assert!(out.contains("authenticated_user_field"), "{out}");
         assert!(out.contains("fn post_message"), "{out}");
         assert!(out.contains("ChatMessagePostedDomainEvent"), "{out}");
@@ -625,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_portable_command_allows_constructor_override_for_keyword_name() {
+    fn expand_command_allows_constructor_override_for_keyword_name() {
         let input = quote! {
             name: "blob.move",
             transition: domain_commands::MoveDir,
@@ -639,23 +498,20 @@ mod tests {
             guard: authenticated_user,
             handle: handle_move,
         };
-        let out = crate::command::expand(input)
-            .expect("expand")
-            .to_string();
+        let out = crate::command::expand(input).expect("expand").to_string();
         assert!(out.contains("struct Move"), "{out}");
         assert!(out.contains("fn move_dir"), "{out}");
     }
 
     #[test]
-    fn expand_portable_command_rejects_unknown_key() {
+    fn expand_command_rejects_unknown_key() {
         let input = quote! {
             name: "todo.complete",
             nope: 1,
         };
         let err = crate::command::expand(input).expect_err("unknown key");
         assert!(
-            err.to_string()
-                .contains("unknown command key `nope`"),
+            err.to_string().contains("unknown command key `nope`"),
             "got: {err}"
         );
     }

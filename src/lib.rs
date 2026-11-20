@@ -40,8 +40,6 @@ pub mod repository;
 
 pub(crate) mod command_ledger;
 mod commit_builder;
-#[cfg(feature = "emitter")]
-pub mod emitter;
 #[cfg(feature = "gateway")]
 pub mod gateway;
 pub mod graphql;
@@ -437,23 +435,6 @@ pub use commit_builder::{
 // Snapshot: state snapshot payloads and rebuildable cache records for hydration
 pub use snapshot::{hydrate_from_snapshot, InMemorySnapshotStore, SnapshotRecord, Snapshottable};
 
-// Re-export the EventEmitter from the event_emitter_rs crate (requires "emitter" feature)
-#[cfg(feature = "emitter")]
-pub use event_emitter_rs::EventEmitter;
-
-/// Register read models + permissions on a GraphQL engine builder.
-///
-/// ```ignore
-/// let builder = graphql_models!(builder, orders, players);
-/// // expands to builder.model::<orders::Model>(orders::permissions())...
-/// ```
-#[macro_export]
-macro_rules! graphql_models {
-    ($builder:expr, $($m:ident),+ $(,)?) => {
-        $builder $( .model::<$m::Model>($m::permissions()) )+
-    };
-}
-
 // Session convenience re-exports used by GraphQL permission filters.
 pub use microsvc::{
     MessageEndpointDescriptor, MetricsEndpointDescriptor, ServiceDescriptor,
@@ -466,10 +447,6 @@ pub use microsvc::{
 // Use `mutation!` / `mutation_file!` + declarative `projection!` (event→mutation
 // mount); commands predict events via `.emits`/`.preview`.
 pub use distributed_macros::{
-    aggregate, command, command_input_defaults, digest, mutation, mutation_file, sourced,
-    CommandInput, CommandOutput, DomainEvent, DomainState, ReadModel, Snapshot,
+    command, command_input_defaults, mutation, mutation_file, sourced, CommandInput, CommandOutput,
+    DomainEvent, DomainState, ReadModel, Snapshot,
 };
-
-// Re-export enqueue macro (requires "emitter" feature)
-#[cfg(feature = "emitter")]
-pub use distributed_macros::enqueue;

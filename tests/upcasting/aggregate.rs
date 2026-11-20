@@ -1,4 +1,4 @@
-use distributed::{digest, Entity, Snapshottable};
+use distributed::{sourced, Entity, Snapshottable};
 use serde::{Deserialize, Serialize};
 
 pub type InitializedV1 = (String, String, String);
@@ -18,24 +18,20 @@ pub struct TodoV1 {
     pub completed: bool,
 }
 
+#[sourced(entity, aggregate_type = "Todo")]
 impl TodoV1 {
-    #[digest("initialized")]
+    #[event("initialized")]
     pub fn initialize(&mut self, id: String, user_id: String, task: String) {
         self.entity.set_id(&id);
         self.user_id = user_id;
         self.task = task;
     }
 
-    #[digest("completed", when = !self.completed)]
+    #[event("completed", when = !self.completed)]
     pub fn complete(&mut self) {
         self.completed = true;
     }
 }
-
-distributed::aggregate!(TodoV1, entity, aggregate_type = "Todo" {
-    "initialized"(id, user_id, task) => initialize,
-    "completed"() => complete(),
-});
 
 // =============================================================================
 // V2 aggregate: added priority field + upcaster
@@ -55,8 +51,11 @@ pub struct TodoV2 {
     pub completed: bool,
 }
 
+#[sourced(entity, aggregate_type = "Todo", upcasters(
+    ("initialized", 1 => 2, InitializedV1 => InitializedV2, upcast_initialized_v1_v2),
+))]
 impl TodoV2 {
-    #[digest("initialized", version = 2)]
+    #[event("initialized", version = 2)]
     pub fn initialize(&mut self, id: String, user_id: String, task: String, priority: u8) {
         self.entity.set_id(&id);
         self.user_id = user_id;
@@ -64,18 +63,11 @@ impl TodoV2 {
         self.priority = priority;
     }
 
-    #[digest("completed", when = !self.completed)]
+    #[event("completed", when = !self.completed)]
     pub fn complete(&mut self) {
         self.completed = true;
     }
 }
-
-distributed::aggregate!(TodoV2, entity, aggregate_type = "Todo" {
-    "initialized"(id, user_id, task, priority), version = 2 => initialize,
-    "completed"() => complete(),
-} upcasters [
-    ("initialized", 1 => 2, InitializedV1 => InitializedV2, upcast_initialized_v1_v2),
-]);
 
 // =============================================================================
 // V3 aggregate: added due_date field + chained upcasters
@@ -96,8 +88,12 @@ pub struct TodoV3 {
     pub completed: bool,
 }
 
+#[sourced(entity, aggregate_type = "Todo", upcasters(
+    ("initialized", 1 => 2, InitializedV1 => InitializedV2, upcast_initialized_v1_v2),
+    ("initialized", 2 => 3, InitializedV2 => InitializedV3, upcast_initialized_v2_v3),
+))]
 impl TodoV3 {
-    #[digest("initialized", version = 3)]
+    #[event("initialized", version = 3)]
     pub fn initialize(
         &mut self,
         id: String,
@@ -113,19 +109,11 @@ impl TodoV3 {
         self.due_date = due_date;
     }
 
-    #[digest("completed", when = !self.completed)]
+    #[event("completed", when = !self.completed)]
     pub fn complete(&mut self) {
         self.completed = true;
     }
 }
-
-distributed::aggregate!(TodoV3, entity, aggregate_type = "Todo" {
-    "initialized"(id, user_id, task, priority, due_date), version = 3 => initialize,
-    "completed"() => complete(),
-} upcasters [
-    ("initialized", 1 => 2, InitializedV1 => InitializedV2, upcast_initialized_v1_v2),
-    ("initialized", 2 => 3, InitializedV2 => InitializedV3, upcast_initialized_v2_v3),
-]);
 
 // =============================================================================
 // Snapshottable impl for TodoV2 (needed for snapshot + upcasting tests)

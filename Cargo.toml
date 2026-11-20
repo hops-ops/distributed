@@ -45,7 +45,6 @@ gateway-delivery = ["gateway-graphql"]
 # workers-rs ingress and delivery contracts, without native executors.
 gateway-worker = ["gateway-delivery", "dep:worker", "dep:futures-channel"]
 gateway-graphql-native = ["gateway-native", "gateway-graphql", "graphql", "dep:tokio-tungstenite"]
-emitter = ["dep:event-emitter-rs"]
 metrics = []
 http = ["dep:axum", "dep:reqwest", "dep:tokio"]
 grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:tokio"]
@@ -82,7 +81,6 @@ redis = { version = "1.7.1", default-features = false, features = ["script", "st
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 jsonwebtoken = { version = "9", optional = true }
 bitcode = { version = "0.6.9", features = ["serde"] }
-event-emitter-rs = { version = "0.1.4", optional = true }
 futures-channel = { version = "0.3", features = ["sink"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hmac = { version = "0.12", optional = true }

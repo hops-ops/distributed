@@ -1,0 +1,5 @@
+error: #[event] methods must omit the return type: the event is recorded before the body runs, so the body cannot fail. Validate in the method that calls the recorder
+  --> tests/compile_fail/event_fallible_recorder.rs:14:44
+   |
+14 |     fn rename(&mut self, title: String) -> Result<(), String> {
+   |                                            ^^^^^^^^^^^^^^^^^^

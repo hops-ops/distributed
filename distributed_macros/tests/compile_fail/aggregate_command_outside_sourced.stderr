@@ -1,5 +1,11 @@
-error: `#[command("aggregate.verb", ..)]` on an aggregate method must be inside a `#[sourced]` impl (the handler-function form is `#[command(id = "..", ..)]`)
- --> tests/compile_fail/aggregate_command_outside_sourced.rs:5:11
+error: cannot find attribute `command` in this scope
+ --> tests/compile_fail/aggregate_command_outside_sourced.rs:5:3
   |
 5 | #[command("hero.equip", shard = hero_id, load = required, outcome = succeeded)]
-  |           ^^^^^^^^^^^^
+  |   ^^^^^^^
+  |
+note: `command` is imported here, but it is a function-like macro
+ --> tests/compile_fail/aggregate_command_outside_sourced.rs:1:5
+  |
+1 | use distributed::command;
+  |     ^^^^^^^^^^^^^^^^^^^^

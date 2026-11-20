@@ -11,10 +11,9 @@ use crate::aggregate::{
     validate_aggregate_type_literal, UpcasterDef,
 };
 use crate::shared::{
-    canonical_object_schema, ensure_sourced_result_signature, extract_params_with_types,
-    framework_path, generate_digest_call, generate_enqueue_call, projection_body_metadata_tokens,
-    schema_fingerprint, validate_domain_event_name_literal,
-    wrap_result_body_with_guard_and_postlude,
+    canonical_object_schema, ensure_infallible_recorder_signature, extract_params_with_types,
+    framework_path, generate_digest_call, projection_body_metadata_tokens, schema_fingerprint,
+    validate_domain_event_name_literal, wrap_recorder_body,
 };
 
 pub(crate) struct SourcedArgs {
@@ -22,7 +21,6 @@ pub(crate) struct SourcedArgs {
     enum_name: Option<LitStr>,
     aggregate_type: Option<LitStr>,
     domain_state: Option<Type>,
-    enqueue: Option<Ident>, // Some(emitter_field) if enqueue enabled
     pub(crate) upcasters: Vec<UpcasterDef>,
 }
 
@@ -36,7 +34,6 @@ pub(crate) fn parse_sourced_args(input: ParseStream) -> syn::Result<SourcedArgs>
     let mut enum_name = None;
     let mut aggregate_type = None;
     let mut domain_state = None;
-    let mut enqueue = None;
     let mut upcasters = Vec::new();
 
     while input.peek(Token![,]) {
@@ -63,15 +60,6 @@ pub(crate) fn parse_sourced_args(input: ParseStream) -> syn::Result<SourcedArgs>
             }
             input.parse::<Token![=]>()?;
             domain_state = Some(input.parse::<Type>()?);
-        } else if kw == "enqueue" {
-            // Optional custom emitter field: enqueue(my_emitter)
-            if input.peek(syn::token::Paren) {
-                let inner;
-                syn::parenthesized!(inner in input);
-                enqueue = Some(inner.parse::<Ident>()?);
-            } else {
-                enqueue = Some(format_ident!("emitter"));
-            }
         } else if kw == "upcasters" {
             let upcaster_content;
             syn::parenthesized!(upcaster_content in input);
@@ -80,7 +68,7 @@ pub(crate) fn parse_sourced_args(input: ParseStream) -> syn::Result<SourcedArgs>
             return Err(syn::Error::new_spanned(
                 &kw,
                 format!(
-                    "unsupported key `{kw}` in #[sourced(...)]; expected `events`, `aggregate_type`, `domain_state`, `enqueue`, or `upcasters`"
+                    "unsupported key `{kw}` in #[sourced(...)]; expected `events`, `aggregate_type`, `domain_state`, or `upcasters`"
                 ),
             ));
         }
@@ -91,7 +79,6 @@ pub(crate) fn parse_sourced_args(input: ParseStream) -> syn::Result<SourcedArgs>
         enum_name,
         aggregate_type,
         domain_state,
-        enqueue,
         upcasters,
     })
 }
@@ -254,7 +241,7 @@ struct DomainExpansion {
     uses_deletion_identity: bool,
 }
 
-fn ensure_domain_body_has_no_early_exit(block: &syn::Block) -> syn::Result<()> {
+fn ensure_recorder_body_has_no_early_exit(block: &syn::Block) -> syn::Result<()> {
     #[derive(Default)]
     struct EarlyExitVisitor {
         error: Option<syn::Error>,
@@ -265,7 +252,7 @@ fn ensure_domain_body_has_no_early_exit(block: &syn::Block) -> syn::Result<()> {
             if self.error.is_none() {
                 self.error = Some(syn::Error::new_spanned(
                     expression,
-                    "domain-marked #[event] methods cannot use `?` in version one because it may skip post-transition capture",
+                    "#[event] methods cannot use `?`: the event is already recorded when the body runs, so the body cannot fail",
                 ));
             }
         }
@@ -274,7 +261,7 @@ fn ensure_domain_body_has_no_early_exit(block: &syn::Block) -> syn::Result<()> {
             if self.error.is_none() {
                 self.error = Some(syn::Error::new_spanned(
                     expression,
-                    "domain-marked #[event] methods cannot use `return` in version one because it skips post-transition capture",
+                    "#[event] methods cannot use `return`: it would skip the rest of the recorded transition",
                 ));
             }
         }
@@ -758,17 +745,8 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                     }
                     seen_variants.insert(variant.to_string(), event_attr.event_name.clone());
 
-                    if event_attr.domain.is_some()
-                        && !matches!(method.sig.output, syn::ReturnType::Default)
-                    {
-                        return Err(syn::Error::new_spanned(
-                            &method.sig.output,
-                            "domain-marked #[event] methods must omit the return type in version one; fallible recorders cannot prove post-transition capture safety",
-                        ));
-                    }
-                    if event_attr.domain.is_some() {
-                        ensure_domain_body_has_no_early_exit(&method.block)?;
-                    }
+                    ensure_infallible_recorder_signature(&mut method.sig, &framework)?;
+                    ensure_recorder_body_has_no_early_exit(&method.block)?;
                     let state_domain =
                         matches!(event_attr.domain.as_ref(), Some(DomainMode::State));
                     let known_state_values = if state_domain {
@@ -776,22 +754,10 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                     } else {
                         Vec::new()
                     };
-                    let signature_synthesized =
-                        ensure_sourced_result_signature(&mut method.sig, "event", &framework)?;
-
                     let params = extract_params_with_types(&method.sig, "event")?;
                     let param_name_refs: Vec<&Ident> =
                         params.iter().map(|(name, _)| name).collect();
 
-                    // Build prepend: optional enqueue + digest
-                    let enqueue_call = args.enqueue.as_ref().map(|emitter_field| {
-                        generate_enqueue_call(
-                            &args.entity_field,
-                            emitter_field,
-                            &event_attr.event_name,
-                            &param_name_refs,
-                        )
-                    });
                     let digest_call = generate_digest_call(
                         &args.entity_field,
                         &event_attr.event_name,
@@ -814,17 +780,15 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                     let domain_prepare = domain.prepare;
                     let domain_capture = domain.capture;
                     let prepend = quote! {
-                        #enqueue_call
                         #digest_call
                         #domain_prepare
                     };
 
-                    let new_body = wrap_result_body_with_guard_and_postlude(
+                    let new_body = wrap_recorder_body(
                         event_attr.guard.as_ref(),
                         prepend,
                         &method.block,
                         domain_capture,
-                        signature_synthesized,
                     );
                     method.block = new_body;
 

@@ -154,10 +154,7 @@ impl FieldAttrs {
                     attrs.jsonb = true;
                 } else if meta.path.is_ident("text") {
                     attrs.text = true;
-                } else if meta.path.is_ident("skip_query")
-                    || meta.path.is_ident("skip")
-                    || meta.path.is_ident("private")
-                {
+                } else if meta.path.is_ident("skip_query") {
                     attrs.skip_query = true;
                 } else if meta.path.is_ident("nullable") {
                     attrs.nullable = true;
