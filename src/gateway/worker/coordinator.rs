@@ -234,15 +234,30 @@ impl WorkerCoordinator {
         let admission = origin.validate(&value).await?;
         let lifetime = origin.options.limits.websocket_lifetime_ms;
         let ack_timeout = origin.options.limits.read_timeout_ms;
-        match admission {
+        let lease = match admission {
             Admitted::Eligible(admission) => {
                 let live = self
                     .live
                     .as_ref()
                     .ok_or_else(|| worker::Error::RustError("live coordinator absent".into()))?;
-                let mut lease = live
-                    .join(admission, value, freshness, source)
-                    .map_err(delivery_error)?;
+                // Sharing is an optimization. A full registry, or a group this
+                // consumer cannot join, means this consumer runs alone.
+                live.join(admission, value.clone(), freshness, source.clone())
+                    .ok()
+            }
+            Admitted::Bypass => None,
+            Admitted::Error(mut response) => {
+                let bytes = read_response(&mut response, 65536).await?;
+                let payload = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(
+                    |_| serde_json::json!({"errors":[{"message":"origin admission failed"}]}),
+                );
+                let _ = socket.send(&serde_json::json!({"type":"next","payload":payload}));
+                let _ = socket.send(&serde_json::json!({"type":"complete"}));
+                return Ok(());
+            }
+        };
+        match lease {
+            Some(mut lease) => {
                 worker::wasm_bindgen_futures::spawn_local(async move {
                     let run = async {
                         loop {
@@ -320,7 +335,7 @@ impl WorkerCoordinator {
                         .await;
                 });
             }
-            Admitted::Bypass => {
+            None => {
                 worker::wasm_bindgen_futures::spawn_local(async move {
                     let run = async {
                         let Ok(mut stream) = source(value).await else {
@@ -359,14 +374,6 @@ impl WorkerCoordinator {
                     let _ = super::timer::deadline(std::time::Duration::from_millis(lifetime), run)
                         .await;
                 });
-            }
-            Admitted::Error(mut response) => {
-                let bytes = read_response(&mut response, 65536).await?;
-                let payload = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(
-                    |_| serde_json::json!({"errors":[{"message":"origin admission failed"}]}),
-                );
-                let _ = socket.send(&serde_json::json!({"type":"next","payload":payload}));
-                let _ = socket.send(&serde_json::json!({"type":"complete"}));
             }
         }
         Ok(())
@@ -418,36 +425,37 @@ impl WorkerCoordinator {
             let floor = freshness.clone();
             let expires = admission.expires_at;
             let limit = flights.limits;
-            let lease = flights
-                .join(key, move || {
-                    async move {
-                        let work = async {
-                            let result = owner
-                                .fill(input, request, admitted.clone(), floor.clone(), ticket)
-                                .await?;
-                            let captured = capture(result, limit.response_bytes).await?;
-                            Ok(match captured {
-                                Captured::Bytes(snapshot)
-                                    if snapshot.shareable(&admitted, floor.as_ref()) =>
-                                {
-                                    Outcome::Shared(Rc::new(snapshot))
-                                }
-                                Captured::Bytes(snapshot) => exclusive(render(snapshot)?),
-                                Captured::Streaming(response) => exclusive(response),
-                            })
-                        };
-                        proxy::timeout(limit.deadline_ms, work)
-                            .await
-                            .unwrap_or_else(|_| {
-                                exclusive(
-                                    Response::error("origin unavailable", 502)
-                                        .expect("fixed status"),
-                                )
-                            })
-                    }
-                    .boxed_local()
-                })
-                .map_err(delivery_error)?;
+            let lease = flights.join(key, move || {
+                async move {
+                    let work = async {
+                        let result = owner
+                            .fill(input, request, admitted.clone(), floor.clone(), ticket)
+                            .await?;
+                        let captured = capture(result, limit.response_bytes).await?;
+                        Ok(match captured {
+                            Captured::Bytes(snapshot)
+                                if snapshot.shareable(&admitted, floor.as_ref()) =>
+                            {
+                                Outcome::Shared(Rc::new(snapshot))
+                            }
+                            Captured::Bytes(snapshot) => exclusive(render(snapshot)?),
+                            Captured::Streaming(response) => exclusive(response),
+                        })
+                    };
+                    proxy::timeout(limit.deadline_ms, work)
+                        .await
+                        .unwrap_or_else(|_| {
+                            exclusive(
+                                Response::error("origin unavailable", 502).expect("fixed status"),
+                            )
+                        })
+                }
+                .boxed_local()
+            });
+            // Coalescing is an optimization: with no room to join, run alone.
+            let Ok(lease) = lease else {
+                return origin.execute(value).await;
+            };
             let outcome = proxy::timeout(expires.saturating_sub(super::now()) * 1000, async {
                 Ok(lease.work.clone().await)
             })
@@ -542,6 +550,7 @@ impl OriginRequest {
             &self.origin,
             Some(&self.path),
             false,
+            crate::gateway::Forwarding::Graphql,
             &self.options,
             &self.context,
         )

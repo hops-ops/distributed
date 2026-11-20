@@ -1,6 +1,6 @@
 use super::{
-    graphql::GraphqlBinding, response, Body, GatewayError, NativeInner, Request, RequestContext,
-    Response, StatusCode,
+    graphql::{json_request, GraphqlBinding},
+    response, Body, GatewayError, NativeInner, RequestContext, Response, StatusCode,
 };
 use crate::gateway::{delivery::*, DeliveryCapabilities, GraphqlExecutor};
 use axum::{
@@ -158,7 +158,7 @@ impl NativeDelivery {
                         inner,
                         executor,
                         context,
-                        request(&parts, value),
+                        json_request(&parts, &value),
                         Some(permit),
                     )
                     .await;
@@ -186,7 +186,7 @@ impl NativeDelivery {
             inner: inner.clone(),
             executor: executor.clone(),
             context: context.clone(),
-            parts: request(&parts, value.clone()).into_parts().0,
+            parts: json_request(&parts, &value).into_parts().0,
             value: value.clone(),
             admission: admission.clone(),
             freshness: freshness.clone(),
@@ -212,7 +212,7 @@ impl NativeDelivery {
                             inner,
                             executor,
                             context,
-                            request(&parts, value),
+                            json_request(&parts, &value),
                             Some(permit),
                         )
                         .await
@@ -242,7 +242,7 @@ impl NativeDelivery {
                 &inner,
                 &executor,
                 context.clone(),
-                request(&parts, execution),
+                json_request(&parts, &execution),
                 None,
             )
             .await;
@@ -325,7 +325,7 @@ pub(super) async fn validate(
         inner,
         executor,
         context.clone(),
-        request(parts, validation),
+        json_request(parts, &validation),
         None,
     );
     let result =
@@ -385,20 +385,6 @@ fn mark(value: &mut serde_json::Value, action: &str) {
     if let Some(init) = init {
         value["extensions"]["gatewayDelivery"]["connectionInit"] = init;
     }
-}
-pub(super) fn request(parts: &Parts, value: serde_json::Value) -> Request<Body> {
-    let mut request = Request::new(Body::from(value.to_string()));
-    *request.method_mut() = parts.method.clone();
-    *request.uri_mut() = parts.uri.clone();
-    *request.version_mut() = parts.version;
-    *request.headers_mut() = parts.headers.clone();
-    *request.extensions_mut() = parts.extensions.clone();
-    request.headers_mut().remove(header::CONTENT_LENGTH);
-    request.headers_mut().insert(
-        header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
-    request
 }
 pub(super) fn cached_response(snapshot: SnapshotResponse) -> Response {
     let mut result = snapshot.body.into_response();

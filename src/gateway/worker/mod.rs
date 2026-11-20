@@ -11,8 +11,8 @@ mod timer;
 pub use coordinator::{WorkerCoordinator, WorkerDeliveryBinding, WorkerDeliveryOptions};
 
 use super::{
-    Admission, AuthError, BackendCredential, BindingKind, Credentials, Gateway, GatewayError,
-    GraphqlExecutor, RequestContext,
+    Admission, AuthError, BackendCredential, BindingKind, Credentials, Forwarding, Gateway,
+    GatewayError, GraphqlExecutor, RequestContext,
 };
 use futures_util::future::LocalBoxFuture;
 use std::{collections::BTreeMap, future::Future, rc::Rc};
@@ -298,15 +298,36 @@ impl WorkerGateway {
         }
         let binding = &self.0.bindings[&selected.binding().id];
         match (binding, &selected.binding().kind) {
-            (WorkerBinding::Handler(handler), _) => (handler.0)(request, context, env).await,
-            (WorkerBinding::Assets(binding), _) => {
+            (WorkerBinding::Handler(handler), kind) => {
+                let Ok(request) =
+                    proxy::prepared(request, kind.forwarding(), &self.0.options, &context)
+                else {
+                    return Response::error("invalid request", 400);
+                };
+                (handler.0)(request, context, env).await
+            }
+            (WorkerBinding::Assets(binding), kind) => {
                 if !matches!(request.method(), worker::Method::Get | worker::Method::Head) {
                     return Response::error("method not allowed", 405);
                 }
+                let Ok(request) =
+                    proxy::prepared(request, kind.forwarding(), &self.0.options, &context)
+                else {
+                    return Response::error("invalid request", 400);
+                };
                 env.service(binding)?.fetch_request(request).await
             }
             (WorkerBinding::UiProxy { websocket }, BindingKind::UiProxy { origin }) => {
-                proxy::forward(request, origin, None, *websocket, &self.0.options, &context).await
+                proxy::forward(
+                    request,
+                    origin,
+                    None,
+                    *websocket,
+                    Forwarding::Application,
+                    &self.0.options,
+                    &context,
+                )
+                .await
             }
             (
                 WorkerBinding::Graphql {
@@ -381,9 +402,18 @@ impl WorkerGateway {
                     }
                     Err(_) => return Response::error("invalid or timed out request body", 400),
                 };
-                let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+                let mut value: serde_json::Value = match serde_json::from_slice(&bytes) {
                     Ok(value) => value,
                     Err(_) => return Response::error("invalid GraphQL request", 400),
+                };
+                // Inside the Durable Object the request was written by this
+                // gateway's own ingress; a client's request is one that has no
+                // coordinator yet.
+                let bytes = if coordinator.is_none() {
+                    super::graphql::remove_client_control(&mut value);
+                    value.to_string().into_bytes()
+                } else {
+                    bytes
                 };
                 if let Err(error) = super::graphql::admit_request(&value, *capabilities) {
                     return Response::from_json(&error.envelope());
@@ -424,6 +454,7 @@ impl WorkerGateway {
                     origin,
                     Some(http_path),
                     false,
+                    Forwarding::Graphql,
                     &self.0.options,
                     &context,
                 )

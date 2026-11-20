@@ -30,7 +30,10 @@ pub use config::{
 pub use extension::{GatewayAdapter, Rejection};
 pub use route::{Methods, Route, RoutePath, SelectedRoute, MAX_ADMISSIONS, MAX_PATH_BYTES};
 
-pub use auth::{is_untrusted_identity_header, Admission, AuthError, AuthProvider};
+pub use auth::{
+    is_untrusted_identity_header, Admission, AuthError, AuthProvider, Forwarding,
+    GRAPHQL_REQUEST_HEADERS,
+};
 pub use context::{BackendCredential, Credentials, Identity, RequestContext};
 
 /// Native HTTP routing, streaming proxy and static asset adapter.

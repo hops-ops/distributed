@@ -99,8 +99,9 @@ impl NativeFlights {
             work,
         })
     }
-    // None means a nonshareable (cookie/oversized/partial/error) result already
-    // went to another consumer. This consumer executes normally without joining.
+    // None means this consumer executes normally without joining: the registry
+    // is full, or a nonshareable (cookie/oversized/partial/error) result already
+    // went to another consumer.
     pub(super) async fn execute<F, Fut>(
         self: &Arc<Self>,
         key: FlightKey,
@@ -154,7 +155,8 @@ impl NativeFlights {
             .boxed()
         }) {
             Ok(lease) => lease,
-            Err(_) => return Some(response(StatusCode::SERVICE_UNAVAILABLE)),
+            // Coalescing is an optimization: with no room to join, run alone.
+            Err(_) => return None,
         };
         let remaining = Duration::from_secs(expires.saturating_sub(super::now()));
         if remaining.is_zero() {
@@ -271,6 +273,36 @@ mod tests {
         let _ = second.await;
         assert_eq!(flights.counts(), (0, 0));
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn a_full_registry_declines_to_share_instead_of_failing() {
+        let flights = NativeFlights::new(FlightLimits {
+            consumers: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let (key, admission) = admitted();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let owner = flights.clone();
+        let (first_key, first_admission) = (key.clone(), admission.clone());
+        let first = tokio::spawn(async move {
+            owner
+                .execute(first_key, first_admission, None, move || async move {
+                    let _ = started.send(());
+                    std::future::pending::<Response>().await
+                })
+                .await
+        });
+        ready.await.unwrap();
+        // No room to join: the caller is told to execute on its own.
+        let second = flights
+            .execute(key, admission, None, || async {
+                panic!("a consumer that cannot join starts no shared work")
+            })
+            .await;
+        assert!(second.is_none());
+        assert_eq!(flights.counts(), (1, 1));
+        first.abort();
     }
     #[tokio::test]
     async fn deadline_expiry_and_failure_release_every_group() {

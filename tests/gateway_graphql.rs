@@ -442,3 +442,156 @@ async fn timed_out_mutation_executes_once_and_returns_no_receipt() {
     assert!(response.bytes().await.unwrap().is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+/// What a GraphQL origin sees of a client request: its own path, the headers
+/// the gateway allows, the provider's credential, and no gateway control.
+#[tokio::test]
+async fn graphql_origin_receives_no_client_identity_channel() {
+    type Seen = Arc<std::sync::Mutex<Vec<Value>>>;
+    let seen: Seen = Arc::default();
+    async fn record(
+        axum::extract::State(seen): axum::extract::State<Seen>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::Json<Value> {
+        let (parts, body) = request.into_parts();
+        let body = axum::body::to_bytes(body, 65536).await.unwrap();
+        let headers: std::collections::BTreeMap<_, _> = parts
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned()))
+            .collect();
+        seen.lock().unwrap().push(json!({
+            "target": parts.uri.to_string(),
+            "headers": headers,
+            "body": serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+        }));
+        axum::Json(json!({"data":{"__typename":"Query"}}))
+    }
+    let origin = serve(
+        Router::new()
+            .route("/graphql", post(record))
+            .route("/graphql/ws", get(record))
+            .with_state(seen.clone()),
+    )
+    .await;
+    let caps = GraphqlCapabilities {
+        queries: true,
+        commands: true,
+        live: true,
+    };
+    let config = GatewayConfig {
+        bindings: vec![Binding::new(
+            "graphql",
+            BindingKind::Graphql {
+                executor: GraphqlExecutor::Remote {
+                    origin: origin.origin.clone(),
+                },
+                capabilities: caps,
+                delivery: DeliveryCapabilities::default(),
+                schema_extensions: vec![],
+            },
+        )],
+        routes: vec![Route::new("api", RoutePath::prefix("/graphql"), "graphql")],
+    }
+    .build()
+    .unwrap();
+    let auth = NativeAuth::new(|credentials| async move {
+        assert_eq!(credentials.authorization.as_deref(), Some("Bearer client"));
+        RequestContext::from_provider(
+            Some(Identity::verified("local", "alice", vec!["user".into()], u64::MAX).unwrap()),
+            "test-v1",
+            BackendCredential::Bearer("backend".into()),
+        )
+        .map_err(|_| AuthError::Unavailable)
+    });
+    let gateway = serve(
+        NativeGateway::new(
+            config,
+            NativeOptions::new("https://public.example.invalid"),
+            [(
+                "graphql".into(),
+                NativeBinding::Graphql(GraphqlBinding::Remote(RemoteGraphql::default())),
+            )],
+            auth,
+        )
+        .unwrap()
+        .router(),
+    )
+    .await;
+
+    let forged = [
+        ("authorization", "Bearer client"),
+        ("cookie", "session=1"),
+        ("x-user-id", "mallory"),
+        ("x-roles", "admin"),
+        ("x-application-secret", "guess"),
+    ];
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(format!(
+            "{}/graphql?x-user-id=mallory&x-roles=admin",
+            gateway.origin
+        ))
+        .json(&json!({
+            "query": "{ __typename }",
+            "extensions": {
+                "kept": true,
+                "gatewayDelivery": {
+                    "action": "validate",
+                    "connectionInit": {"x-user-id": "mallory", "x-roles": "admin"},
+                },
+            },
+        }));
+    for (name, value) in forged {
+        request = request.header(name, value);
+    }
+    assert_eq!(request.send().await.unwrap().status(), StatusCode::OK);
+
+    let mut upgrade = client
+        .get(format!(
+            "{}/graphql?x-user-id=mallory&x-roles=admin",
+            gateway.origin
+        ))
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-protocol", "graphql-transport-ws");
+    for (name, value) in forged {
+        upgrade = upgrade.header(name, value);
+    }
+    // The fixture origin answers the handshake with plain JSON; the gateway
+    // relays that refusal.
+    assert_eq!(upgrade.send().await.unwrap().status(), StatusCode::OK);
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0]["target"], "/graphql");
+    assert_eq!(seen[1]["target"], "/graphql/ws");
+    assert_eq!(
+        seen[0]["body"]["extensions"],
+        json!({"kept": true}),
+        "a client cannot write the gateway's control extension"
+    );
+    for request in &seen {
+        let headers = request["headers"].as_object().unwrap();
+        assert_eq!(headers["authorization"], "Bearer backend");
+        for name in headers.keys() {
+            assert!(
+                GRAPHQL_REQUEST_HEADERS.contains(&name.as_str())
+                    || [
+                        "authorization",
+                        "host",
+                        "x-forwarded-host",
+                        "x-forwarded-proto",
+                        "connection",
+                        "upgrade",
+                        // Framing of the gateway's own request to the origin.
+                        "transfer-encoding",
+                    ]
+                    .contains(&name.as_str()),
+                "origin received `{name}`"
+            );
+        }
+    }
+}

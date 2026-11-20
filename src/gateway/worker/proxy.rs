@@ -1,5 +1,5 @@
 use super::{RequestContext, WorkerOptions};
-use crate::gateway::{is_untrusted_identity_header, BackendCredential};
+use crate::gateway::{BackendCredential, Forwarding};
 use futures_util::{
     future::{select, Either},
     StreamExt,
@@ -40,6 +40,7 @@ pub(super) fn is_upgrade(request: &Request) -> Result<bool> {
 }
 pub(super) fn prepare_headers(
     headers: &Headers,
+    forwarding: Forwarding,
     options: &WorkerOptions,
     context: &RequestContext,
     upgrade: bool,
@@ -53,29 +54,14 @@ pub(super) fn prepare_headers(
         headers.delete(name)?;
     }
     for name in headers.keys().collect::<Vec<_>>() {
-        if is_untrusted_identity_header(&name)
-            || options
-                .strip_headers
-                .iter()
-                .any(|s| s.eq_ignore_ascii_case(&name))
-            || matches!(
-                name.as_str(),
-                "connection"
-                    | "keep-alive"
-                    | "proxy-authenticate"
-                    | "proxy-authorization"
-                    | "te"
-                    | "trailer"
-                    | "transfer-encoding"
-                    | "upgrade"
-                    | "authorization"
-                    | "host"
-            )
-        {
+        if !forwarding.forwards(&name, &options.strip_headers) {
             headers.delete(&name)?;
         }
     }
-    if let BackendCredential::Bearer(token) = context.backend_credential() {
+    if let (true, BackendCredential::Bearer(token)) = (
+        forwarding.sends_backend_credential(),
+        context.backend_credential(),
+    ) {
         headers.set("authorization", &format!("Bearer {token}"))?;
     }
     let public = worker::Url::parse(&options.public_origin)?;
@@ -129,10 +115,26 @@ pub(super) async fn read_request(request: &mut Request, max: usize) -> Result<Ve
     }
     Ok(bytes)
 }
+/// The request a local handler or asset binding receives: the client's
+/// request under the same header rule as a proxied one.
+pub(super) fn prepared(
+    request: Request,
+    forwarding: Forwarding,
+    options: &WorkerOptions,
+    context: &RequestContext,
+) -> Result<Request> {
+    let headers = copy_headers(request.headers())?;
+    prepare_headers(&headers, forwarding, options, context, false)?;
+    let init = worker::web_sys::RequestInit::new();
+    init.set_headers(&headers.0);
+    Ok(worker::web_sys::Request::new_with_request_and_init(request.inner(), &init)?.into())
+}
 pub(super) fn with_body(request: &Request, bytes: Vec<u8>) -> Result<Request> {
     let mut init = RequestInit::new();
     init.method = request.method();
     init.headers = copy_headers(request.headers())?;
+    // The body may differ from the client's; the runtime states its length.
+    init.headers.delete("content-length")?;
     init.redirect = RequestRedirect::Manual;
     init.body = Some(worker::js_sys::Uint8Array::from(bytes.as_slice()).into());
     super::cancellation::preserve_signal(
@@ -145,6 +147,7 @@ pub(super) async fn forward(
     origin: &str,
     path: Option<&str>,
     allow_upgrade: bool,
+    forwarding: Forwarding,
     options: &WorkerOptions,
     context: &RequestContext,
 ) -> Result<Response> {
@@ -161,14 +164,20 @@ pub(super) async fn forward(
         return Response::error("request too large", 413);
     }
     let source = request.url()?;
+    // A GraphQL operation carries nothing in the query string, so nothing a
+    // client writes there reaches the executor.
+    let query = match forwarding {
+        Forwarding::Graphql => None,
+        Forwarding::Application | Forwarding::Zones => source.query(),
+    };
     let url = format!(
         "{}{}{}",
         origin.trim_end_matches('/'),
         path.unwrap_or(source.path()),
-        source.query().map(|q| format!("?{q}")).unwrap_or_default()
+        query.map(|q| format!("?{q}")).unwrap_or_default()
     );
     let headers = copy_headers(request.headers())?;
-    if prepare_headers(&headers, options, context, upgrade).is_err() {
+    if prepare_headers(&headers, forwarding, options, context, upgrade).is_err() {
         return Response::error("invalid proxy request", 400);
     }
     let mut init = RequestInit::new();

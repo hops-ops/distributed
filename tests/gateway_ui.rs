@@ -638,7 +638,15 @@ async fn zones_forward_sockets_and_info_under_their_prefix_only() {
             ("zones".into(), NativeBinding::Zones),
             ("ui".into(), NativeBinding::UiProxy { websocket: false }),
         ],
-        auth(),
+        // A provider that would hand every other backend a credential.
+        NativeAuth::new(|_| async {
+            RequestContext::from_provider(
+                Some(Identity::verified("local", "alice", vec![], u64::MAX).unwrap()),
+                "test-v1",
+                BackendCredential::Bearer("backend".into()),
+            )
+            .map_err(|_| AuthError::Unavailable)
+        }),
     )
     .unwrap()
     .router();
@@ -647,10 +655,13 @@ async fn zones_forward_sockets_and_info_under_their_prefix_only() {
         task: tokio::spawn(async move { axum::serve(listener, router).await.unwrap() }),
     };
 
-    // The zone sees its own path; no credential is forwarded to it.
+    // The zone sees its own path; no credential is forwarded to it: not the
+    // caller's, not the provider's, and no cookie.
     let client = reqwest::Client::new();
     let info: serde_json::Value = client
         .get(format!("{public}/zones/pit.0.0/info"))
+        .header("authorization", "Bearer valid")
+        .header("cookie", "session=1")
         .send()
         .await
         .unwrap()
@@ -659,6 +670,7 @@ async fn zones_forward_sockets_and_info_under_their_prefix_only() {
         .unwrap();
     assert_eq!(info["target"], "/zones/pit.0.0/info");
     assert!(info["headers"].get("authorization").is_none());
+    assert!(info["headers"].get("cookie").is_none());
     // Paths outside the prefix never reach the zone host.
     let other = client
         .get(format!("{public}/internal"))

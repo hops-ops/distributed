@@ -63,6 +63,15 @@ impl OperationError {
     }
 }
 
+/// Remove the gateway's own control extension from a client's request.
+/// `extensions.gatewayDelivery` is written by gateway code only: every ingress
+/// calls this before the request reaches an executor or a coordinator.
+pub fn remove_client_control(request: &mut Value) {
+    if let Some(extensions) = request.get_mut("extensions").and_then(Value::as_object_mut) {
+        extensions.remove("gatewayDelivery");
+    }
+}
+
 /// Resolve the exact operation. Reject ambiguous/unknown selection even when
 /// another operation in the same document would be allowed. This is not full
 /// schema validation; that remains the executor's responsibility.

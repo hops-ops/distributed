@@ -4,8 +4,8 @@ use super::{
 };
 use crate::command_dispatch::SharedCommandHost;
 use crate::gateway::{
-    graphql::{admit_operation, admit_request, OperationError},
-    BindingKind, DeliveryCapabilities, GraphqlCapabilities, GraphqlExecutor,
+    graphql::{admit_operation, admit_request, remove_client_control, OperationError},
+    BindingKind, DeliveryCapabilities, Forwarding, GraphqlCapabilities, GraphqlExecutor,
 };
 use crate::graphql::{graphql_router_composed, GraphqlEngine, GraphqlOperationFilter};
 use axum::{
@@ -260,7 +260,14 @@ impl GraphqlBinding {
                             _permit: permit,
                         },
                     ));
-                    if proxy::prepare_headers(request.headers_mut(), inner, &context, true).is_err()
+                    if proxy::prepare_headers(
+                        request.headers_mut(),
+                        inner,
+                        &context,
+                        Forwarding::Graphql,
+                        true,
+                    )
+                    .is_err()
                     {
                         return response(StatusCode::BAD_REQUEST);
                     }
@@ -301,22 +308,15 @@ impl GraphqlBinding {
             .await
     }
 
-    /// Execute an already-selected HTTP operation without an upgrade branch.
-    pub(super) async fn execute_operation(
+    /// Execute a client's HTTP operation. Whatever the client wrote in the
+    /// gateway's own control extension is removed here, at ingress.
+    async fn execute_operation(
         &self,
         inner: &Arc<NativeInner>,
         declaration: &BindingKind,
         context: RequestContext,
         request: Request<Body>,
     ) -> Response {
-        let BindingKind::Graphql {
-            capabilities,
-            executor,
-            ..
-        } = declaration
-        else {
-            return response(StatusCode::SERVICE_UNAVAILABLE);
-        };
         if request.method() != "POST" {
             let mut result = response(StatusCode::METHOD_NOT_ALLOWED);
             result
@@ -339,9 +339,33 @@ impl GraphqlBinding {
             Ok(Err(_)) => return response(StatusCode::PAYLOAD_TOO_LARGE),
             Err(_) => return response(StatusCode::REQUEST_TIMEOUT),
         };
-        let value = match serde_json::from_slice(&body) {
+        let mut value = match serde_json::from_slice(&body) {
             Ok(value) => value,
             Err(_) => return error_response(OperationError::InvalidRequest),
+        };
+        remove_client_control(&mut value);
+        self.execute_value(inner, declaration, context, parts, value, permit)
+            .await
+    }
+
+    /// Execute one operation the gateway holds as a value: a client's, after
+    /// ingress, or one the gateway built for a WebSocket consumer.
+    pub(super) async fn execute_value(
+        &self,
+        inner: &Arc<NativeInner>,
+        declaration: &BindingKind,
+        context: RequestContext,
+        parts: axum::http::request::Parts,
+        value: serde_json::Value,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Response {
+        let BindingKind::Graphql {
+            capabilities,
+            executor,
+            ..
+        } = declaration
+        else {
+            return response(StatusCode::SERVICE_UNAVAILABLE);
         };
         if let Err(error) = admit_request(&value, *capabilities) {
             return error_response(error);
@@ -360,8 +384,6 @@ impl GraphqlBinding {
                 value["query"].as_str().unwrap_or(""),
                 value["operationName"].as_str(),
             ) == Ok(super::super::graphql::OperationKind::Query)
-                && (value["extensions"].get("gatewayDelivery").is_none()
-                    || value["extensions"]["gatewayDelivery"]["action"] == "execute")
             {
                 return coordinator
                     .execute(self, inner, executor, context, parts, value, permit)
@@ -372,7 +394,7 @@ impl GraphqlBinding {
             inner,
             executor,
             context,
-            Request::from_parts(parts, Body::from(body)),
+            json_request(&parts, &value),
             Some(permit),
         )
         .await
@@ -390,7 +412,15 @@ impl GraphqlBinding {
         // Plain remote streaming responses retain their own permit in the body.
         match (self, executor) {
             (Self::Embedded(embedded), _) => {
-                if proxy::prepare_headers(request.headers_mut(), inner, &context, false).is_err() {
+                if proxy::prepare_headers(
+                    request.headers_mut(),
+                    inner,
+                    &context,
+                    Forwarding::Graphql,
+                    false,
+                )
+                .is_err()
+                {
                     return response(StatusCode::BAD_REQUEST);
                 }
                 rewrite_path(&mut request, "/graphql");
@@ -402,19 +432,46 @@ impl GraphqlBinding {
             }
             (Self::Remote(remote), GraphqlExecutor::Remote { origin }) => {
                 rewrite_path(&mut request, &remote.http_path);
-                proxy::forward_with_permit(inner, origin, false, context, request, permit).await
+                proxy::forward_with_permit(
+                    inner,
+                    origin,
+                    false,
+                    Forwarding::Graphql,
+                    context,
+                    request,
+                    permit,
+                )
+                .await
             }
             _ => response(StatusCode::SERVICE_UNAVAILABLE),
         }
     }
 }
 
+/// One JSON operation addressed like the request it came from.
+pub(super) fn json_request(
+    parts: &axum::http::request::Parts,
+    value: &serde_json::Value,
+) -> Request<Body> {
+    let mut request = Request::new(Body::from(value.to_string()));
+    *request.method_mut() = parts.method.clone();
+    *request.uri_mut() = parts.uri.clone();
+    *request.version_mut() = parts.version;
+    *request.headers_mut() = parts.headers.clone();
+    *request.extensions_mut() = parts.extensions.clone();
+    request.headers_mut().remove(header::CONTENT_LENGTH);
+    request.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    request
+}
+
+/// Address the executor's own path. The client's query string is dropped: a
+/// GraphQL operation carries nothing there, so nothing a client writes in it
+/// may reach the executor.
 fn rewrite_path(request: &mut Request<Body>, path: &str) {
-    let target = request
-        .uri()
-        .query()
-        .map_or_else(|| path.to_owned(), |query| format!("{path}?{query}"));
-    *request.uri_mut() = target.parse().expect("validated path and request query");
+    *request.uri_mut() = path.parse().expect("validated path");
 }
 
 async fn remote_websocket(
@@ -453,7 +510,15 @@ async fn remote_websocket(
         Ok(upgrade) => upgrade,
         Err(rejection) => return rejection.into_response(),
     };
-    if proxy::prepare_headers(&mut parts.headers, inner, &context, true).is_err() {
+    if proxy::prepare_headers(
+        &mut parts.headers,
+        inner,
+        &context,
+        Forwarding::Graphql,
+        true,
+    )
+    .is_err()
+    {
         return response(StatusCode::BAD_REQUEST);
     }
     #[cfg(feature = "gateway-delivery")]
@@ -461,9 +526,7 @@ async fn remote_websocket(
         (
             execution,
             coordinator,
-            super::delivery::request(&parts, serde_json::json!({}))
-                .into_parts()
-                .0,
+            json_request(&parts, &serde_json::json!({})).into_parts().0,
         )
     });
     parts.headers.insert(
@@ -479,14 +542,7 @@ async fn remote_websocket(
     }
     let pending = inner
         .client
-        .get(format!(
-            "{}{path}{}",
-            origin.trim_end_matches('/'),
-            parts
-                .uri
-                .query()
-                .map_or(String::new(), |query| format!("?{query}"))
-        ))
+        .get(format!("{}{path}", origin.trim_end_matches('/')))
         .headers(parts.headers)
         .send();
     let upstream =
@@ -601,7 +657,8 @@ async fn bridge(
                 let Some(Ok(message)) = message else { break };
                 match message {
                     Message::Text(text) => {
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        let mut forwarded = text.to_string();
+                        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) {
                             match value["type"].as_str() {
                                 Some("subscribe" | "start") => {
                                     let Some(id) = value["id"].as_str() else { break };
@@ -613,12 +670,14 @@ async fn bridge(
                                         continue;
                                     }
                                     active.insert(id.to_owned());
+                                    remove_client_control(&mut value["payload"]);
+                                    forwarded = value.to_string();
                                 }
                                 Some("complete" | "stop") => { if let Some(id) = value["id"].as_str() { active.remove(id); } }
                                 _ => {}
                             }
                         }
-                        if origin.send(UpstreamMessage::Text(text.to_string().into())).await.is_err() { break; }
+                        if origin.send(UpstreamMessage::Text(forwarded.into())).await.is_err() { break; }
                     }
                     Message::Binary(_) => break, // GraphQL WS uses JSON text; never bypass operation admission.
                     Message::Ping(bytes) => { if origin.send(UpstreamMessage::Ping(bytes)).await.is_err() { break; } }

@@ -443,7 +443,7 @@ async fn independent(
                 Either::Left((value, _)) => (value, true),
                 Either::Right((value, _)) => (value, false),
             };
-        let Ok(value) = value else {
+        let Ok(mut value) = value else {
             return;
         };
         if from_client {
@@ -473,6 +473,7 @@ async fn independent(
                         ids.remove(id);
                         continue;
                     }
+                    super::super::graphql::remove_client_control(&mut value["payload"]);
                 }
                 Some(kind @ ("stop" | "complete"))
                     if kind

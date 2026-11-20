@@ -90,3 +90,117 @@ pub fn is_untrusted_identity_header(name: &str) -> bool {
             | "x-roles"
     ) || name.starts_with("x-hasura-")
 }
+
+/// What a binding's backend receives from the client request. One rule for
+/// every adapter and binding kind: adapters remove what [`Self::forwards`]
+/// rejects, then add only what they vouch for (the provider's backend
+/// credential, the public origin and their hop marker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forwarding {
+    /// Handlers, assets and UI proxies: every header that is not a hop,
+    /// credential or identity header, plus the provider's backend credential.
+    Application,
+    /// Zone hosts verify their own join tickets: no backend credential and no
+    /// cookie.
+    Zones,
+    /// GraphQL executors read only the headers named in
+    /// [`GRAPHQL_REQUEST_HEADERS`], plus the provider's backend credential.
+    Graphql,
+}
+
+/// Client request headers a GraphQL executor receives. Its identity arrives
+/// only as the provider's backend credential.
+pub const GRAPHQL_REQUEST_HEADERS: [&str; 13] = [
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "content-length",
+    "content-type",
+    "origin",
+    "sec-websocket-key",
+    "sec-websocket-protocol",
+    "sec-websocket-version",
+    "traceparent",
+    "tracestate",
+    "user-agent",
+    "x-distributed-gateway-hops",
+];
+
+impl Forwarding {
+    /// Whether the client's header `name` reaches the backend. `strip` is the
+    /// deployment's own list of identity and secret header names.
+    pub fn forwards(self, name: &str, strip: &[String]) -> bool {
+        let name = name.to_ascii_lowercase();
+        let name = name.as_str();
+        if matches!(
+            name,
+            "authorization"
+                | "connection"
+                | "host"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        ) || is_untrusted_identity_header(name)
+            || strip.iter().any(|strip| strip.eq_ignore_ascii_case(name))
+        {
+            return false;
+        }
+        match self {
+            Self::Application => true,
+            Self::Zones => name != "cookie",
+            Self::Graphql => GRAPHQL_REQUEST_HEADERS.contains(&name),
+        }
+    }
+
+    /// Whether the backend receives the provider's backend credential.
+    pub fn sends_backend_credential(self) -> bool {
+        !matches!(self, Self::Zones)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_binding_receives_a_client_credential_or_identity_header() {
+        for rule in [
+            Forwarding::Application,
+            Forwarding::Zones,
+            Forwarding::Graphql,
+        ] {
+            for name in [
+                "Authorization",
+                "X-User-Id",
+                "x-roles",
+                "x-hasura-role",
+                "X-Forwarded-Host",
+                "Host",
+                "Upgrade",
+                "X-Tenant-Secret",
+            ] {
+                assert!(
+                    !rule.forwards(name, &["x-tenant-secret".into()]),
+                    "{rule:?} {name}"
+                );
+            }
+            assert!(rule.forwards("Content-Type", &[]), "{rule:?}");
+            assert!(rule.forwards("x-distributed-gateway-hops", &[]), "{rule:?}");
+        }
+    }
+
+    #[test]
+    fn zones_and_graphql_receive_no_cookie() {
+        assert!(Forwarding::Application.forwards("cookie", &[]));
+        assert!(!Forwarding::Zones.forwards("Cookie", &[]));
+        assert!(!Forwarding::Graphql.forwards("cookie", &[]));
+        assert!(!Forwarding::Graphql.forwards("x-anything-else", &[]));
+        assert!(Forwarding::Application.sends_backend_credential());
+        assert!(Forwarding::Graphql.sends_backend_credential());
+        assert!(!Forwarding::Zones.sends_backend_credential());
+    }
+}
