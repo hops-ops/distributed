@@ -8,6 +8,7 @@
 
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
