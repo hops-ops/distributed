@@ -213,7 +213,7 @@ mod tests {
     #[tokio::test]
     async fn run_without_a_bus_is_a_permanent_error_not_a_panic() {
         let err = Service::new()
-            .run(RunOptions::idempotent())
+            .run(RunOptions::until_idle())
             .await
             .unwrap_err();
 
@@ -336,7 +336,7 @@ mod tests {
         // registered command, drains the message, and the handler publishes.
         // `run` returns once the queue is empty (InMemoryBus yields `None`).
         bus.send("dummy.touch", b"{}".to_vec()).await.unwrap();
-        service.run(RunOptions::idempotent()).await.unwrap();
+        service.run(RunOptions::until_idle()).await.unwrap();
         assert_published_and_drained(&store, &bus, "evt-1").await;
     }
 

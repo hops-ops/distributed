@@ -3,8 +3,8 @@
 //! Maps the canonical [`Message`] onto NATS JetStream: [`NatsPublisher`] publishes
 //! to a subject (waiting for the JetStream publish ack — the durable publish
 //! threshold), and [`NatsJetStreamSource`] pulls from a durable consumer and
-//! settles via JetStream ack semantics (ack→`Ack`, nack→`Nak` with a
-//! delivery-count [`NackBackoff`] delay, dead-letter/park→`Term`). Aggregate message IDs use `Nats-Msg-Id` unchanged. External facts
+//! settles via JetStream ack semantics (ack→`Ack`, nack→`Nak` with the
+//! requested delay). Aggregate message IDs use `Nats-Msg-Id` unchanged. External facts
 //! retain their logical source identity separately; their broker dedup ID also
 //! binds content so altered retries reach the durable conflict fence.
 //!
@@ -260,65 +260,11 @@ impl MessagePublisher for NatsPublisher {
     }
 }
 
-/// Default first delay for a retryable NAK; doubles per delivery attempt.
-pub const DEFAULT_NACK_BACKOFF_BASE: Duration = Duration::from_millis(50);
-/// Default ceiling for a retryable NAK delay.
-pub const DEFAULT_NACK_BACKOFF_MAX: Duration = Duration::from_secs(5);
-
-/// Redelivery delay requested with a retryable NAK.
-///
-/// `base * 2^(delivered - 1)`, capped at `max`. A zero `base` requests
-/// immediate redelivery (the broker's own policy). Retries stay unlimited;
-/// only their spacing changes, so one failing delivery cannot monopolize a
-/// consumer ahead of newer messages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NackBackoff {
-    base: Duration,
-    max: Duration,
-}
-
-impl NackBackoff {
-    /// Backoff starting at `base` and capped at `max` (at least `base`).
-    pub fn new(base: Duration, max: Duration) -> Self {
-        Self {
-            base,
-            max: max.max(base),
-        }
-    }
-
-    /// Immediate NAK without a delay.
-    pub fn immediate() -> Self {
-        Self::new(Duration::ZERO, Duration::ZERO)
-    }
-
-    /// Delay for a delivery that has been delivered `delivered` times (1-based).
-    pub fn delay(&self, delivered: u64) -> Option<Duration> {
-        if self.base.is_zero() {
-            return None;
-        }
-        let doublings = delivered.saturating_sub(1).min(30) as u32;
-        Some(
-            self.base
-                .checked_mul(1u32 << doublings)
-                .unwrap_or(self.max)
-                .min(self.max),
-        )
-    }
-}
-
-impl Default for NackBackoff {
-    fn default() -> Self {
-        Self::new(DEFAULT_NACK_BACKOFF_BASE, DEFAULT_NACK_BACKOFF_MAX)
-    }
-}
-
 /// A pull-based JetStream source bound to a durable consumer.
 pub struct NatsJetStreamSource {
     consumer: Consumer<PullConfig>,
     fetch_timeout: Duration,
     strip_prefix: Option<String>,
-    idle_poll: Duration,
-    nack_backoff: NackBackoff,
 }
 
 impl NatsJetStreamSource {
@@ -328,18 +274,11 @@ impl NatsJetStreamSource {
             consumer,
             fetch_timeout: Duration::from_millis(500),
             strip_prefix: None,
-            idle_poll: Duration::ZERO,
-            nack_backoff: NackBackoff::default(),
         }
     }
 
-    /// Space retryable NAK redeliveries (see [`NackBackoff`]).
-    pub fn with_nack_backoff(mut self, backoff: NackBackoff) -> Self {
-        self.nack_backoff = backoff;
-        self
-    }
-
-    /// How long `recv` waits for a message before returning `Ok(None)`.
+    /// How long `recv` waits for a message before reporting that none is
+    /// available.
     pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.fetch_timeout = timeout;
         self
@@ -353,12 +292,6 @@ impl NatsJetStreamSource {
     /// subject is the name).
     pub fn with_strip_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.strip_prefix = Some(prefix.into());
-        self
-    }
-
-    /// Keep `recv` retrying after an empty fetch instead of draining to idle.
-    pub fn with_idle_poll(mut self, idle_poll: Duration) -> Self {
-        self.idle_poll = idle_poll;
         self
     }
 
@@ -421,38 +354,33 @@ impl MessageSource for NatsJetStreamSource {
     }
 
     async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
-        loop {
-            let mut batch = self
-                .consumer
-                .batch()
-                .max_messages(1)
-                .expires(self.fetch_timeout)
-                .messages()
-                .await
-                .map_err(|err| retryable("nats fetch", err))?;
+        let mut batch = self
+            .consumer
+            .batch()
+            .max_messages(1)
+            .expires(self.fetch_timeout)
+            .messages()
+            .await
+            .map_err(|err| retryable("nats fetch", err))?;
 
-            match batch.next().await {
-                Some(Ok(message)) => {
-                    // Fail closed before dispatch without acknowledging or overriding
-                    // the supervisor's permanent-error policy. The durable delivery is
-                    // retained for operator repair; no later cursor is falsely sealed.
-                    return NatsReceived::from_jetstream(message, self.strip_prefix.as_deref())
-                        .map(|received| Some(received.with_nack_backoff(self.nack_backoff)));
-                }
-                Some(Err(err)) => return Err(retryable("nats batch message", err)),
-                None if self.idle_poll.is_zero() => return Ok(None),
-                None => continue,
+        match batch.next().await {
+            // A delivery that cannot be decoded fails the receive: it is not
+            // acknowledged, so it is retained for repair and no later cursor
+            // is sealed past it.
+            Some(Ok(message)) => {
+                NatsReceived::from_jetstream(message, self.strip_prefix.as_deref()).map(Some)
             }
+            Some(Err(err)) => Err(retryable("nats batch message", err)),
+            None => Ok(None),
         }
     }
 }
 
-/// A JetStream message plus the means to ack/nak/term it.
+/// A JetStream message plus the means to ack or nak it.
 pub struct NatsReceived {
     raw: jetstream::Message,
     message: Message,
     ordered: Option<OrderedDelivery>,
-    nack_backoff: NackBackoff,
 }
 
 impl NatsReceived {
@@ -468,13 +396,7 @@ impl NatsReceived {
             raw,
             message,
             ordered,
-            nack_backoff: NackBackoff::default(),
         })
-    }
-
-    fn with_nack_backoff(mut self, backoff: NackBackoff) -> Self {
-        self.nack_backoff = backoff;
-        self
     }
 
     /// Delivery attempt count reported by JetStream (1 for the first delivery).
@@ -532,6 +454,10 @@ impl ReceivedMessage for NatsReceived {
         &self.message
     }
 
+    fn attempts(&self) -> u32 {
+        u32::try_from(self.delivered()).unwrap_or(u32::MAX)
+    }
+
     fn ordered_delivery(&self) -> Option<&OrderedDelivery> {
         self.ordered.as_ref()
     }
@@ -540,21 +466,9 @@ impl ReceivedMessage for NatsReceived {
         self.settle(AckKind::Ack).await
     }
 
-    async fn nack(self, _reason: &str) -> Result<(), TransportError> {
-        // Redeliver after a delivery-count backoff so a message that keeps
-        // failing cannot be redelivered ahead of newer messages in a hot loop.
-        let delay = self.nack_backoff.delay(self.delivered());
+    async fn nack(self, delay: Duration) -> Result<(), TransportError> {
+        let delay = (!delay.is_zero()).then_some(delay);
         self.settle(AckKind::Nak(delay)).await
-    }
-
-    async fn dead_letter(self, _reason: &str) -> Result<(), TransportError> {
-        // Term: stop redelivery. A real DLQ bridge can subscribe to the stream's
-        // advisory/max-deliver subjects; Term is the "do not redeliver" signal.
-        self.settle(AckKind::Term).await
-    }
-
-    async fn park(self, _reason: &str) -> Result<(), TransportError> {
-        self.settle(AckKind::Term).await
     }
 }
 
@@ -668,21 +582,6 @@ mod tests {
                 &forged
             ));
         }
-    }
-
-    #[test]
-    fn nack_backoff_doubles_from_base_and_caps() {
-        let backoff = NackBackoff::default();
-        assert_eq!(backoff.delay(1), Some(Duration::from_millis(50)));
-        assert_eq!(backoff.delay(2), Some(Duration::from_millis(100)));
-        assert_eq!(backoff.delay(4), Some(Duration::from_millis(400)));
-        assert_eq!(backoff.delay(8), Some(Duration::from_secs(5)));
-        assert_eq!(backoff.delay(u64::MAX), Some(Duration::from_secs(5)));
-        // Delivery counts from a broker that never reports one still back off.
-        assert_eq!(backoff.delay(0), Some(Duration::from_millis(50)));
-        assert_eq!(NackBackoff::immediate().delay(9), None);
-        let custom = NackBackoff::new(Duration::from_millis(10), Duration::from_millis(5));
-        assert_eq!(custom.delay(3), Some(Duration::from_millis(10)));
     }
 
     #[test]

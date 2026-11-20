@@ -58,7 +58,7 @@ async fn dispatches_from_pubsub() {
     }
 
     // Drain the published events into the subscriber (create, then the increments).
-    bus.subscribe(service.clone(), RunOptions::idempotent())
+    bus.subscribe(service.clone(), RunOptions::until_idle())
         .await
         .expect("subscriber should drain the bus");
 

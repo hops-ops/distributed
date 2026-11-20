@@ -211,7 +211,7 @@ let service = Service::new()
     .named("todo-api")
     .with_http_command_routes() // required for POST /{command}; GraphQL stays off by default
     .routes(routes);
-service.with_bus(bus).run(RunOptions::idempotent()).await?;
+service.with_bus(bus).run(RunOptions::default()).await?; // until the process ends
 ```
 
 ## Publication is explicit (outbox)

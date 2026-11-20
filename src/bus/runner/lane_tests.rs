@@ -87,6 +87,18 @@ impl Log {
     }
 }
 
+impl crate::bus::DeadLetterSink for Log {
+    fn dead_letter<'a>(
+        &'a self,
+        dead: crate::bus::DeadLetter,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + 'a>> {
+        Box::pin(async move {
+            self.push(Event::DeadLetter(dead.message.id().unwrap().to_owned()));
+            Ok(())
+        })
+    }
+}
+
 struct Received {
     message: Message,
     log: Arc<Log>,
@@ -112,13 +124,9 @@ impl ReceivedMessage for Received {
         let id = self.id();
         self.settle(Event::Ack(id))
     }
-    async fn nack(self, _reason: &str) -> Result<(), TransportError> {
+    async fn nack(self, _delay: std::time::Duration) -> Result<(), TransportError> {
         let id = self.id();
         self.settle(Event::Nack(id))
-    }
-    async fn dead_letter(self, _reason: &str) -> Result<(), TransportError> {
-        let id = self.id();
-        self.settle(Event::DeadLetter(id))
     }
 }
 
@@ -236,6 +244,7 @@ fn run_lanes(
         unsettled: Arc::new(AtomicUsize::new(0)),
         max_unsettled: max_unsettled.clone(),
     };
+    let options = options.or_dead_letters(|| log.clone());
     let outcome = block_on(run_source(router, source, options));
     Harness {
         log,
@@ -261,7 +270,7 @@ fn slow_projection_lane_does_not_delay_process_lane() {
         message("both", "m2"),
         message("process.only", "m3"),
     ];
-    let harness = run_lanes(messages, true, RunOptions::idempotent(), ok(), |log| {
+    let harness = run_lanes(messages, true, RunOptions::until_idle(), ok(), |log| {
         let log = log.clone();
         Arc::new(move |lane, message| {
             lane != 0 || message.id() != Some("m1") || log.ran(1).len() == 3
@@ -286,7 +295,7 @@ fn retryable_failure_in_one_lane_nacks_after_every_lane_finished() {
     let harness = run_lanes(
         vec![message("both", "m1"), message("both", "m2")],
         true,
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
         Arc::new(|lane, message| {
             if lane == 1 && message.id() == Some("m1") {
                 Err(TransportError::retryable("cell unavailable"))
@@ -310,7 +319,7 @@ fn permanent_failure_applies_failure_policy_once_per_delivery() {
     let harness = run_lanes(
         vec![message("both", "m1")],
         true,
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
         Arc::new(|lane, _| {
             if lane == 0 {
                 Err(TransportError::permanent("rejected"))
@@ -327,7 +336,11 @@ fn permanent_failure_applies_failure_policy_once_per_delivery() {
         .into_iter()
         .filter(|event| matches!(event, Event::Ack(_) | Event::Nack(_) | Event::DeadLetter(_)))
         .collect();
-    assert_eq!(settled, [Event::DeadLetter("m1".into())]);
+    // Stored once, then acknowledged once.
+    assert_eq!(
+        settled,
+        [Event::DeadLetter("m1".into()), Event::Ack("m1".into())]
+    );
 }
 
 #[test]
@@ -335,7 +348,7 @@ fn retryable_wins_over_permanent_so_a_recoverable_delivery_is_retained() {
     let harness = run_lanes(
         vec![message("both", "m1")],
         true,
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
         Arc::new(|lane, _| {
             if lane == 0 {
                 Err(TransportError::permanent("rejected"))
@@ -363,7 +376,7 @@ fn window_bounds_unsettled_deliveries() {
     let harness = run_lanes(
         messages,
         true,
-        RunOptions::idempotent().with_lane_window(2),
+        RunOptions::until_idle().with_lane_window(2),
         ok(),
         move |log| {
             let log = log.clone();
@@ -398,7 +411,7 @@ fn stop_class_failure_halts_only_its_lane_and_retains_queued_deliveries() {
             message("both", "m3"),
         ],
         true,
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
         Arc::new(|lane, message| {
             if lane == 0 && message.id() == Some("m1") {
                 Err(TransportError::permanent("durable projection failure").retain_and_stop())
@@ -437,7 +450,7 @@ fn stop_policy_on_permanent_failure_stops_without_settling_that_delivery() {
     let harness = run_lanes(
         vec![message("both", "m1")],
         true,
-        RunOptions::idempotent().with_failure_policy(FailurePolicy::Stop),
+        RunOptions::until_idle().with_failure_policy(FailurePolicy::Stop),
         Arc::new(|lane, _| {
             if lane == 1 {
                 Err(TransportError::permanent("nope"))
@@ -460,7 +473,7 @@ fn unhandled_messages_are_acked_without_running_lanes() {
     let harness = run_lanes(
         vec![message("unhandled", "m1")],
         true,
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
         ok(),
         open(),
     );
@@ -478,7 +491,7 @@ fn positional_sources_keep_sequential_delivery() {
     let harness = run_lanes(
         vec![message("both", "m1"), message("both", "m2")],
         false,
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
         ok(),
         open(),
     );
@@ -527,14 +540,14 @@ fn redelivery_after_nack_reruns_all_lanes_then_acks() {
     block_on(run_source(
         router.clone(),
         source(vec![message("both", "m1")]),
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
     ))
     .unwrap();
     // The broker redelivers the NAKed message.
     block_on(run_source(
         router,
         source(vec![message("both", "m1")]),
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
     ))
     .unwrap();
     assert_eq!(log.ran(0), ["m1", "m1"]);

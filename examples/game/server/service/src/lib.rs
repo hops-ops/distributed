@@ -44,7 +44,7 @@ use distributed::graphql::{
 use distributed::leaderboard::{Board, LeaderboardStore, RedisLeaderboard};
 use distributed::microsvc::{
     spawn_service_consumer_loop, CausalProjectorContext, HandlerError, ModeledProjection, Routes,
-    Service, CONSUMER_IDLE_POLL,
+    Service,
 };
 use distributed::{
     Application, ApplicationManifest, RelationalReadModel, SqliteRepository, SurfaceSpec,
@@ -157,8 +157,7 @@ pub fn projection_service(read_models: SqliteRepository) -> Service {
 /// cursor lives in the read-model database, so a restart resumes).
 pub fn spawn_projector(read_models: SqliteRepository, bus: sqlx::SqlitePool) {
     spawn_service_consumer_loop(move || {
-        projection_service(read_models.clone())
-            .with_bus(SqliteBus::new(bus.clone()).with_idle_poll(CONSUMER_IDLE_POLL))
+        projection_service(read_models.clone()).with_bus(SqliteBus::new(bus.clone()))
     });
 }
 
@@ -296,7 +295,7 @@ pub fn spawn_board_notices(engine: Arc<GraphqlEngine>, bus: sqlx::SqlitePool) {
     tokio::spawn(async move {
         loop {
             let handlers = Arc::new(engine.leaderboard_change_handlers(BOARD_NOTICE_GROUP));
-            let bus = SqliteBus::new(bus.clone()).with_idle_poll(CONSUMER_IDLE_POLL);
+            let bus = SqliteBus::new(bus.clone());
             if let Err(error) = bus.subscribe(handlers, RunOptions::default()).await {
                 eprintln!("mobpit-service: board notices: {error}");
             }

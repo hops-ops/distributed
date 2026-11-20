@@ -14,7 +14,7 @@
 use distributed::bus::SqliteBus;
 use distributed::microsvc::{
     spawn_service_consumer_loop, CausalProjectorContext, HandlerError, ModeledProjection, Routes,
-    Service, CONSUMER_IDLE_POLL,
+    Service,
 };
 use distributed::SqliteRepository;
 use mobpit_crawler::stats::{
@@ -62,10 +62,7 @@ impl CrawlerDirectory {
                         .modeled_projector(projector())
                         .handle(project),
                 )
-                .with_bus(
-                    SqliteBus::new_with_group(bus.clone(), CONSUMER)
-                        .with_idle_poll(CONSUMER_IDLE_POLL),
-                )
+                .with_bus(SqliteBus::new_with_group(bus.clone(), CONSUMER))
         });
         Ok(Self { repo })
     }

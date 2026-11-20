@@ -44,12 +44,13 @@ use crate::sqlx_repo::is_sqlx_transient;
 
 use super::source::{MessageSource, ReceivedMessage};
 use super::{
-    run_source, Bus, BusConsumer, BusTopologyConfig, MessageRouter, OrderedDelivery, RunOptions,
-    TransportError, TransportErrorKind,
+    run_source, Bus, BusConsumer, BusTopologyConfig, MessageRouter, OrderedDelivery,
+    PublishDeadLetters, RunOptions, TransportError, TransportErrorKind,
 };
 use super::{Message, MessageKind};
 
 pub(crate) const DEFAULT_LEASE: Duration = Duration::from_secs(30);
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Rows fetched per source refill. Buffering amortizes the claim/offset
 /// subquery across a batch instead of re-running it for every message. Kept
@@ -198,7 +199,7 @@ impl ReceivedRow {
     /// Decode a row, capturing a required-column failure as `decode_error`
     /// instead of losing the claim. The placeholder message's name is
     /// deliberately empty — the decode error carries the diagnostic.
-    pub(crate) fn from_row<R>(backend: &str, row: &R) -> Self
+    pub(crate) fn from_row<R>(backend: &str, row: &R) -> Result<Self, TransportError>
     where
         R: Row,
         for<'a> &'a str: ColumnIndex<R>,
@@ -206,7 +207,9 @@ impl ReceivedRow {
         for<'r> Vec<u8>: Decode<'r, R::Database> + Type<R::Database>,
         for<'r> i64: Decode<'r, R::Database> + Type<R::Database>,
     {
-        let seq = row.try_get("seq").unwrap_or_default();
+        let seq = row
+            .try_get("seq")
+            .map_err(|err| decode_err(backend, "seq", err))?;
         let (message, decode_error) = match message_from_row(backend, row) {
             Ok(message) => (message, None),
             Err(error) => (
@@ -214,11 +217,11 @@ impl ReceivedRow {
                 Some(error),
             ),
         };
-        Self {
+        Ok(Self {
             seq,
             message,
             decode_error,
-        }
+        })
     }
 }
 
@@ -227,6 +230,8 @@ impl ReceivedRow {
 pub struct ClaimedRow {
     pub(crate) row: ReceivedRow,
     pub(crate) claim_token: String,
+    /// Deliveries of this row so far, counting this claim.
+    pub(crate) attempts: u32,
 }
 
 /// The dialect-specific SQL a [`SqlBus`] runs. Implemented by the per-backend
@@ -243,15 +248,6 @@ pub trait SqlBusDialect: Clone + Send + Sync + 'static {
         &self,
         statement: &'static str,
     ) -> impl Future<Output = Result<(), TransportError>> + Send;
-
-    /// Upgrade legacy ordered-log state and install the stable message-ID
-    /// uniqueness fence.
-    ///
-    /// Implementations must perform duplicate validation/deduplication and
-    /// unique-index creation atomically. They also migrate offsets to carry the
-    /// cursor epoch, discarding legacy offsets that cannot be attributed to a
-    /// durable generation.
-    fn ensure_ordered_log_schema(&self) -> impl Future<Output = Result<(), TransportError>> + Send;
 
     /// Insert a command into `bus_queue`.
     fn insert_queue(
@@ -335,6 +331,7 @@ pub trait SqlBusDialect: Clone + Send + Sync + 'static {
         &self,
         seq: i64,
         claim_token: &str,
+        delay_secs: f64,
     ) -> impl Future<Output = Result<(), TransportError>> + Send;
 
     /// Advance `consumer`'s log offset to `seq` (monotonic upsert).
@@ -354,9 +351,8 @@ pub struct SqlBus<B> {
     topology: BusTopologyConfig,
     lease: Duration,
     source_epoch: Option<ProjectionEpoch>,
-    /// When non-zero, empty `listen`/`subscribe` polls instead of draining to
-    /// idle. Long-running hosts need this; tests keep the default (zero).
-    idle_poll: Duration,
+    /// How long an idle consumer waits before it looks for work again.
+    poll_interval: Duration,
 }
 
 impl<B: SqlBusDialect> SqlBus<B> {
@@ -366,7 +362,7 @@ impl<B: SqlBusDialect> SqlBus<B> {
             topology: BusTopologyConfig::default(),
             lease: DEFAULT_LEASE,
             source_epoch: None,
-            idle_poll: Duration::ZERO,
+            poll_interval: DEFAULT_POLL_INTERVAL,
         }
     }
 
@@ -396,13 +392,10 @@ impl<B: SqlBusDialect> SqlBus<B> {
         self
     }
 
-    /// Keep `listen`/`subscribe` running when the queue or log is empty.
-    ///
-    /// Drain-to-idle (`Duration::ZERO`, the default) is for tests. A playground
-    /// or worker that rebuilds `Service` after every idle drain pays seconds
-    /// of projector bootstrap on the next Eventual command.
-    pub fn with_idle_poll(mut self, idle_poll: Duration) -> Self {
-        self.idle_poll = idle_poll;
+    /// How long an idle `listen`/`subscribe` waits before it looks for work
+    /// again. Default 25 ms.
+    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
         self
     }
 
@@ -418,7 +411,6 @@ impl<B: SqlBusDialect> SqlBus<B> {
             }
             self.dialect.execute_ddl(statement).await?;
         }
-        self.dialect.ensure_ordered_log_schema().await?;
         // Persist the identity beside the log even for producer-only setups.
         // Backups and explicit resets must treat `bus_log` and
         // `bus_log_identity` as one unit.
@@ -457,6 +449,14 @@ impl<B: SqlBusDialect> SqlBus<B> {
     }
 }
 
+impl<B: SqlBusDialect> SqlBus<B> {
+    /// Dead letters are published to this bus's log unless the run names a
+    /// sink.
+    fn with_dead_letters(&self, options: RunOptions) -> RunOptions {
+        options.or_dead_letters(|| Arc::new(PublishDeadLetters(self.clone())))
+    }
+}
+
 impl<B: SqlBusDialect> Bus for SqlBus<B> {
     async fn send_message(&self, message: Message) -> Result<(), TransportError> {
         self.dialect.insert_queue(&message).await
@@ -485,10 +485,9 @@ impl<B: SqlBusDialect> BusConsumer for SqlBus<B> {
             dialect: self.dialect.clone(),
             names,
             lease_secs: self.lease.as_secs_f64(),
-            buffer: VecDeque::new(),
-            idle_poll: self.idle_poll,
+            poll_interval: self.poll_interval,
         };
-        run_source(router, source, options).await
+        run_source(router, source, self.with_dead_letters(options)).await
     }
 
     async fn subscribe<R: MessageRouter>(
@@ -517,26 +516,22 @@ impl<B: SqlBusDialect> BusConsumer for SqlBus<B> {
             last_delivered: None,
             settled_seq: Arc::new(AtomicI64::new(0)),
             source_epoch,
-            idle_poll: self.idle_poll,
+            poll_interval: self.poll_interval,
         };
-        run_source(router, source, options).await
+        run_source(router, source, self.with_dead_letters(options)).await
     }
 }
 
 /// Competing-consumer source over `bus_queue` (atomic claim under a lease).
 ///
-/// Claims [`SOURCE_BATCH`] rows per query and buffers them, so the claim
-/// subquery is not re-run for every message. Each buffered row carries its own
-/// claim token, so settlement stays per-row: a nacked row is simply re-claimed
-/// on a later refill, and a buffered row whose lease expires while earlier rows
-/// are processed can be reclaimed by another worker (the stale token fences our
-/// settle) — the usual at-least-once trade.
+/// One row is claimed per `recv`, so a row's lease starts when its handler
+/// does. Settlement is fenced by the claim token: a worker whose lease expired
+/// cannot settle a row another worker has since claimed.
 struct SqlQueueSource<B> {
     dialect: B,
     names: Vec<String>,
     lease_secs: f64,
-    buffer: VecDeque<ClaimedRow>,
-    idle_poll: Duration,
+    poll_interval: Duration,
 }
 
 impl<B: SqlBusDialect> MessageSource for SqlQueueSource<B> {
@@ -547,44 +542,36 @@ impl<B: SqlBusDialect> MessageSource for SqlQueueSource<B> {
     }
 
     async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
-        loop {
-            if self.buffer.is_empty() {
-                let mut claimed = self
-                    .dialect
-                    .claim(&self.names, self.lease_secs, SOURCE_BATCH)
-                    .await?;
-                // `UPDATE … RETURNING` row order is unspecified; restore seq order.
-                claimed.sort_by_key(|claim| claim.row.seq);
-                self.buffer.extend(claimed);
-            }
-            if let Some(claimed) = self.buffer.pop_front() {
-                return Ok(Some(SqlQueueReceived {
-                    dialect: self.dialect.clone(),
-                    row: claimed.row,
-                    claim_token: claimed.claim_token,
-                }));
-            }
-            if self.idle_poll.is_zero() {
-                return Ok(None);
-            }
-            tokio::time::sleep(self.idle_poll).await;
-        }
+        let claimed = self.dialect.claim(&self.names, self.lease_secs, 1).await?;
+        Ok(claimed.into_iter().next().map(|claimed| SqlQueueReceived {
+            dialect: self.dialect.clone(),
+            row: claimed.row,
+            claim_token: claimed.claim_token,
+            attempts: claimed.attempts,
+        }))
+    }
+
+    async fn ready(&mut self) {
+        tokio::time::sleep(self.poll_interval).await
     }
 }
 
-/// A claimed `bus_queue` row: `ack` deletes it (done); `nack` makes it available
-/// again (redelivery); `dead_letter`/`park` delete it (stop redelivery). Every
-/// settlement is fenced by the claim token, so a stale worker cannot settle a
-/// row that was reclaimed after its lease expired.
+/// A claimed `bus_queue` row: `ack` deletes it; `nack` makes it claimable
+/// again after the delay.
 pub struct SqlQueueReceived<B> {
     dialect: B,
     row: ReceivedRow,
     claim_token: String,
+    attempts: u32,
 }
 
 impl<B: SqlBusDialect> ReceivedMessage for SqlQueueReceived<B> {
     fn message(&self) -> &Message {
         &self.row.message
+    }
+
+    fn attempts(&self) -> u32 {
+        self.attempts
     }
 
     fn decode_error(&self) -> Option<&TransportError> {
@@ -597,21 +584,9 @@ impl<B: SqlBusDialect> ReceivedMessage for SqlQueueReceived<B> {
             .await
     }
 
-    async fn nack(self, _reason: &str) -> Result<(), TransportError> {
+    async fn nack(self, delay: Duration) -> Result<(), TransportError> {
         self.dialect
-            .release_claim(self.row.seq, &self.claim_token)
-            .await
-    }
-
-    async fn dead_letter(self, _reason: &str) -> Result<(), TransportError> {
-        self.dialect
-            .delete_claimed(self.row.seq, &self.claim_token)
-            .await
-    }
-
-    async fn park(self, _reason: &str) -> Result<(), TransportError> {
-        self.dialect
-            .delete_claimed(self.row.seq, &self.claim_token)
+            .release_claim(self.row.seq, &self.claim_token, delay.as_secs_f64())
             .await
     }
 }
@@ -622,7 +597,7 @@ impl<B: SqlBusDialect> ReceivedMessage for SqlQueueReceived<B> {
 ///
 /// Buffered read-ahead must not break the offset contract: entries advance the
 /// offset **in order**, and a nacked entry is re-read before anything after it.
-/// The handles report forward settlement (ack/dead-letter/park) through the
+/// The handles report forward settlement (ack) through the
 /// shared `settled_seq`; when the previously delivered entry was *not* settled
 /// forward (a nack — offset unmoved), the buffer is discarded so the next read
 /// starts again from the durable offset. The runner settles each message before
@@ -637,7 +612,7 @@ struct SqlLogSource<B> {
     /// Highest `seq` settled forward by this source's handles.
     settled_seq: Arc<AtomicI64>,
     source_epoch: ProjectionEpoch,
-    idle_poll: Duration,
+    poll_interval: Duration,
 }
 
 impl<B: SqlBusDialect> MessageSource for SqlLogSource<B> {
@@ -645,6 +620,10 @@ impl<B: SqlBusDialect> MessageSource for SqlLogSource<B> {
 
     fn transport_name(&self) -> &'static str {
         B::BACKEND
+    }
+
+    async fn ready(&mut self) {
+        tokio::time::sleep(self.poll_interval).await
     }
 
     async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
@@ -659,55 +638,48 @@ impl<B: SqlBusDialect> MessageSource for SqlLogSource<B> {
                 self.buffer.clear();
             }
         }
-        loop {
-            if self.buffer.is_empty() {
-                let rows = self
-                    .dialect
-                    .log_read(
-                        &self.names,
-                        &self.consumer,
-                        SOURCE_BATCH,
-                        &self.source_epoch,
-                    )
-                    .await?;
-                self.buffer.extend(rows);
-            }
-            let Some(row) = self.buffer.pop_front() else {
-                if self.idle_poll.is_zero() {
-                    return Ok(None);
-                }
-                tokio::time::sleep(self.idle_poll).await;
-                continue;
-            };
-            let position = u64::try_from(row.seq).map_err(|_| {
-                corrupt_row(
-                    B::BACKEND,
-                    format!(
-                        "bus_log seq {} is outside the projection cursor domain",
-                        row.seq
-                    ),
+        if self.buffer.is_empty() {
+            let rows = self
+                .dialect
+                .log_read(
+                    &self.names,
+                    &self.consumer,
+                    SOURCE_BATCH,
+                    &self.source_epoch,
                 )
-            })?;
-            let source =
-                ProjectionSource::new(format!("{}.bus_log", B::BACKEND), b"global".to_vec())
-                    .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
-            let ordered = OrderedDelivery::new(source, self.source_epoch.clone(), position, false)
-                .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
-            self.last_delivered = Some(row.seq);
-            return Ok(Some(SqlLogReceived {
-                dialect: self.dialect.clone(),
-                consumer: self.consumer.clone(),
-                settled_seq: self.settled_seq.clone(),
-                row,
-                ordered,
-            }));
+                .await?;
+            self.buffer.extend(rows);
         }
+        let Some(row) = self.buffer.pop_front() else {
+            return Ok(None);
+        };
+        let position = u64::try_from(row.seq).map_err(|_| {
+            corrupt_row(
+                B::BACKEND,
+                format!(
+                    "bus_log seq {} is outside the projection cursor domain",
+                    row.seq
+                ),
+            )
+        })?;
+        let source = ProjectionSource::new(format!("{}.bus_log", B::BACKEND), b"global".to_vec())
+            .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
+        let ordered = OrderedDelivery::new(source, self.source_epoch.clone(), position, false)
+            .map_err(|error| corrupt_row(B::BACKEND, error.to_string()))?;
+        self.last_delivered = Some(row.seq);
+        Ok(Some(SqlLogReceived {
+            dialect: self.dialect.clone(),
+            consumer: self.consumer.clone(),
+            settled_seq: self.settled_seq.clone(),
+            row,
+            ordered,
+        }))
     }
 }
 
 /// A `bus_log` entry: `ack` advances this consumer's offset to its `seq` (the
-/// effectively-once point); `nack` leaves the offset (redelivery);
-/// `dead_letter`/`park` advance past it (skip, don't get stuck).
+/// effectively-once point); `nack` leaves the offset, so the entry is read
+/// again and nothing after it is delivered first.
 pub struct SqlLogReceived<B> {
     dialect: B,
     consumer: String,
@@ -745,16 +717,10 @@ impl<B: SqlBusDialect> ReceivedMessage for SqlLogReceived<B> {
         self.settle_forward().await
     }
 
-    async fn nack(self, _reason: &str) -> Result<(), TransportError> {
-        // Leave the offset unmoved so the entry is re-read on the next poll.
+    async fn nack(self, delay: Duration) -> Result<(), TransportError> {
+        // The offset stays where it is. A log cannot deliver a later entry
+        // first, so the delay is spent here, holding the position.
+        tokio::time::sleep(delay).await;
         Ok(())
-    }
-
-    async fn dead_letter(self, _reason: &str) -> Result<(), TransportError> {
-        self.settle_forward().await
-    }
-
-    async fn park(self, _reason: &str) -> Result<(), TransportError> {
-        self.settle_forward().await
     }
 }

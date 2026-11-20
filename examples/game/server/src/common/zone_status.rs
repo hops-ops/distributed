@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use distributed::bus::SqliteBus;
 use distributed::microsvc::{
     spawn_service_consumer_loop, CausalProjectorContext, HandlerError, ModeledProjection, Routes,
-    Service, CONSUMER_IDLE_POLL,
+    Service,
 };
 use distributed::SqliteRepository;
 use distributed_game::world::zone_status::{
@@ -93,10 +93,7 @@ impl ZoneStatusView {
                         .modeled_projector(activity_projector())
                         .handle(project_activities),
                 )
-                .with_bus(
-                    SqliteBus::new_with_group(bus.clone(), group.clone())
-                        .with_idle_poll(CONSUMER_IDLE_POLL),
-                )
+                .with_bus(SqliteBus::new_with_group(bus.clone(), group.clone()))
         });
         Ok(Self { repo })
     }

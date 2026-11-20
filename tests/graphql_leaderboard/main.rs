@@ -511,7 +511,7 @@ async fn live_boards_follow_a_projector_in_another_process_over_the_bus() {
             )
             .await
             .unwrap();
-        let bus = SqliteBus::new(pool).with_idle_poll(Duration::from_millis(20));
+        let bus = SqliteBus::new(pool);
         bus.ensure_tables().await.unwrap();
         bus
     };

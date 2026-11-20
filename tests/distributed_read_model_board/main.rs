@@ -149,7 +149,7 @@ async fn board_service_feeds_a_normalized_card_read_model() {
     // wins), so the final board reflects every processed event.
     let bus = InMemoryBus::new();
     publish_pending_outbox(&board_outbox, &bus).await;
-    bus.subscribe(projection, RunOptions::idempotent())
+    bus.subscribe(projection, RunOptions::until_idle())
         .await
         .expect("projection should drain the board events");
 

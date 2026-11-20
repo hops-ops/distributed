@@ -14,7 +14,6 @@ use distributed::bus::{
 };
 use distributed::microsvc::{Context, Message, MessageKind, Routes, Service};
 use distributed::TRACEPARENT;
-use futures::StreamExt;
 use serde_json::json;
 
 // Shared broker-test helpers (bus scenarios, unique, ...).
@@ -47,6 +46,29 @@ fn external_balance(position: u64, value: u64) -> distributed::DomainEventOccurr
         &ExternalBalance { value },
     )
     .unwrap()
+}
+
+/// Options that drain to idle and keep dead letters where the test can read
+/// them.
+fn storing_dead_letters() -> (Arc<distributed::bus::InMemoryDeadLetters>, RunOptions) {
+    let dead = Arc::new(distributed::bus::InMemoryDeadLetters::new());
+    let options = RunOptions::until_idle().with_dead_letters(dead.clone());
+    (dead, options)
+}
+
+/// The one stored dead letter: its message id (if any), payload and reason.
+fn only_dead_letter(
+    dead: &distributed::bus::InMemoryDeadLetters,
+) -> (Option<String>, Vec<u8>, String) {
+    let mut all = dead.all();
+    assert_eq!(all.len(), 1, "exactly one message was dead-lettered");
+    let dead = all.remove(0);
+    assert_eq!(dead.attempts, 1);
+    (
+        dead.message.id().map(str::to_owned),
+        dead.message.payload().to_vec(),
+        dead.reason,
+    )
 }
 
 #[tokio::test]
@@ -327,7 +349,7 @@ async fn derived_facts_round_trip_after_interrupted_publish_prefix() {
                 }),
         ),
     );
-    run_source(service, source, RunOptions::idempotent())
+    run_source(service, source, RunOptions::until_idle())
         .await
         .unwrap();
     let seen = seen.lock().unwrap();
@@ -379,7 +401,7 @@ async fn publish_then_consume_round_trips_through_jetstream() {
         ),
     );
 
-    run_source(service, source, RunOptions::idempotent())
+    run_source(service, source, RunOptions::until_idle())
         .await
         .expect("run_source drains the stream");
 
@@ -438,7 +460,7 @@ async fn message_id_and_metadata_survive_the_round_trip() {
                 }),
         ),
     );
-    run_source(service, source, RunOptions::idempotent())
+    run_source(service, source, RunOptions::until_idle())
         .await
         .unwrap();
 
@@ -575,7 +597,7 @@ async fn retryable_failure_is_redelivered_then_succeeds() {
     run_source(
         fail_once_handlers(&subject, attempts.clone()),
         source,
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
     )
     .await
     .expect("run drains after the Nak redelivery succeeds");
@@ -595,18 +617,6 @@ async fn permanent_failure_routes_to_dead_letter_destination() {
     let durable = unique("consumer");
     let source = failure_source(&url, &subject, &stream, &durable).await;
 
-    // JetStream's parking destination for a terminated message is the
-    // MSG_TERMINATED advisory subject — subscribe before terminating.
-    let advisory_client = async_nats::connect(&url)
-        .await
-        .expect("connect advisory client");
-    let mut advisories = advisory_client
-        .subscribe(format!(
-            "$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.{stream}.{durable}"
-        ))
-        .await
-        .expect("subscribe to terminated advisories");
-
     let publisher = NatsPublisher::connect(&url)
         .await
         .expect("connect publisher");
@@ -617,6 +627,7 @@ async fn permanent_failure_routes_to_dead_letter_destination() {
             .expect("publish");
     }
 
+    let (dead, options) = storing_dead_letters();
     let rec = Arc::new(Mutex::new(Vec::new()));
     let seen = rec.clone();
     let handlers = Arc::new(
@@ -633,7 +644,7 @@ async fn permanent_failure_routes_to_dead_letter_destination() {
             }
         }),
     );
-    run_source(handlers, source, RunOptions::idempotent())
+    run_source(handlers, source, options)
         .await
         .expect("run drains past the poison message");
     assert_eq!(
@@ -642,30 +653,24 @@ async fn permanent_failure_routes_to_dead_letter_destination() {
         "subsequent messages still flow after the dead-letter"
     );
 
-    // The parking destination actually received the termination.
-    let advisory = tokio::time::timeout(Duration::from_secs(5), advisories.next())
-        .await
-        .expect("a MSG_TERMINATED advisory should arrive")
-        .expect("advisory subscription should stay open");
-    assert!(
-        advisory.subject.contains("MSG_TERMINATED"),
-        "unexpected advisory subject: {}",
-        advisory.subject
-    );
+    // Stored with the reason before it was acknowledged.
+    let (id, _, reason) = only_dead_letter(&dead);
+    assert_eq!(id.as_deref(), Some("poison"));
+    assert!(reason.contains("unprocessable"), "{reason}");
 
-    // Term stops redelivery: a fresh run over the same durable sees nothing.
+    // It was acknowledged: a fresh run over the same durable sees nothing.
     let source = failure_source(&url, &subject, &stream, &durable).await;
     let redelivered = Arc::new(Mutex::new(Vec::new()));
     run_source(
         recording_for(&subject, MessageKind::Event, redelivered.clone()),
         source,
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
     )
     .await
     .expect("redelivery-check run drains");
     assert!(
         redelivered.lock().unwrap().is_empty(),
-        "a terminated message must not be redelivered"
+        "a dead-lettered message must not be redelivered"
     );
 }
 
@@ -693,13 +698,14 @@ async fn undecodable_payload_dead_letters_without_blocking() {
         .expect("publish ok");
 
     // The decoding handler fails permanently on the garbage, so it is
-    // dead-lettered (Term) instead of blocking the subject with endless
+    // dead-lettered instead of blocking the subject with endless
     // redeliveries.
+    let (dead, options) = storing_dead_letters();
     let rec = Arc::new(Mutex::new(Vec::new()));
     run_source(
         json_decoding_handlers(&subject, rec.clone()),
         source,
-        RunOptions::idempotent(),
+        options,
     )
     .await
     .expect("run drains: the undecodable payload is terminated, not redelivered forever");
@@ -708,6 +714,13 @@ async fn undecodable_payload_dead_letters_without_blocking() {
         vec!["ok".to_string()],
         "the message behind the garbage is still handled"
     );
+    let (_, payload, reason) = only_dead_letter(&dead);
+    assert_eq!(
+        payload,
+        vec![0xff, 0xfe, b'{'],
+        "the garbage itself was stored"
+    );
+    assert!(!reason.is_empty());
 }
 
 // ---- latency: idle delivery, retry backoff, delivery lanes ----
@@ -728,8 +741,7 @@ async fn message_published_after_empty_fetches_is_delivered_promptly() {
     )
     .await
     .expect("connect source")
-    .with_fetch_timeout(Duration::from_millis(500))
-    .with_idle_poll(Duration::from_millis(25));
+    .with_fetch_timeout(Duration::from_millis(500));
     let handled = Arc::new(Mutex::new(None::<std::time::Instant>));
     let record = handled.clone();
     let router = Arc::new(Handlers::new().on_event(&subject, move |_: &Message| {
@@ -739,7 +751,7 @@ async fn message_published_after_empty_fetches_is_delivered_promptly() {
             .get_or_insert_with(std::time::Instant::now);
         async { Ok(()) }
     }));
-    let consumer = tokio::spawn(run_source(router, source, RunOptions::idempotent()));
+    let consumer = tokio::spawn(run_source(router, source, RunOptions::default()));
     // Several empty 500 ms fetches expire first.
     tokio::time::sleep(Duration::from_millis(1_300)).await;
     let publisher = NatsPublisher::connect(&url).await.expect("publisher");
@@ -779,8 +791,7 @@ async fn retryable_nack_backs_off_without_starving_newer_messages() {
     )
     .await
     .expect("connect source")
-    .with_fetch_timeout(Duration::from_millis(500))
-    .with_idle_poll(Duration::from_millis(25));
+    .with_fetch_timeout(Duration::from_millis(500));
     let poison_attempts = Arc::new(AtomicUsize::new(0));
     let fresh_at = Arc::new(Mutex::new(None::<std::time::Instant>));
     let (attempts, fresh) = (poison_attempts.clone(), fresh_at.clone());
@@ -804,7 +815,7 @@ async fn retryable_nack_backs_off_without_starving_newer_messages() {
             }
         }),
     );
-    let consumer = tokio::spawn(run_source(router, source, RunOptions::idempotent()));
+    let consumer = tokio::spawn(run_source(router, source, RunOptions::default()));
     let publisher = NatsPublisher::connect(&url).await.expect("publisher");
     publisher
         .publish(Message::new(&subject, MessageKind::Event, b"{}".to_vec()).with_id("poison"))
@@ -843,9 +854,7 @@ async fn retryable_nack_backs_off_without_starving_newer_messages() {
 async fn slow_default_lane_does_not_delay_process_lane_over_jetstream() {
     let Some(url) = nats_url() else { return };
     let namespace = unique("lanes").to_lowercase();
-    let bus = nats_bus(&url, &namespace, "lanes")
-        .await
-        .with_idle_poll(Duration::from_millis(25));
+    let bus = nats_bus(&url, &namespace, "lanes").await;
     let started = std::time::Instant::now();
     let projection_done = Arc::new(Mutex::new(Vec::<(String, Duration)>::new()));
     let policy_done = Arc::new(Mutex::new(Vec::<(String, Duration)>::new()));
@@ -884,7 +893,7 @@ async fn slow_default_lane_does_not_delay_process_lane_over_jetstream() {
                 }),
         )
         .with_bus(bus.clone());
-    let consumer = tokio::spawn(service.run(RunOptions::idempotent()));
+    let consumer = tokio::spawn(service.run(RunOptions::default()));
     tokio::time::sleep(Duration::from_millis(700)).await;
     use distributed::bus::Bus;
     for id in ["m1", "m2"] {

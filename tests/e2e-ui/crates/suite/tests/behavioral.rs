@@ -67,7 +67,7 @@ async fn ensure_target() -> String {
                 consumer_repo.clone(),
             )
             .with_bus(bus_c.clone());
-            if let Err(error) = service.run(RunOptions::idempotent()).await {
+            if let Err(error) = service.run(RunOptions::until_idle()).await {
                 eprintln!("offline projector loop: {error}");
                 if let Ok(Some((code, detail))) = sqlx::query_as::<_, (String, Vec<u8>)>(
                     "SELECT failure_code, failure_bytes FROM projection_failures LIMIT 1",

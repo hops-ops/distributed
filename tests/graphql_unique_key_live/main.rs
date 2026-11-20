@@ -99,7 +99,7 @@ async fn publish(repository: &SqliteRepository, bus: &InMemoryBus, revision: &st
         .named("unique-key-live")
         .routes(routes)
         .with_bus(bus.clone())
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .unwrap();
 }

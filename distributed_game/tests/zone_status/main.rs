@@ -13,7 +13,7 @@ use distributed::bus::{Message, MessagePublisher, SqliteBus};
 use distributed::cell_host::{AggregateCell, CellCommandIdentity, CellStreamStore};
 use distributed::microsvc::{
     spawn_service_consumer_loop, CausalProjectorContext, HandlerError, ModeledProjection, Routes,
-    Service, Session, CONSUMER_IDLE_POLL, ROLE_KEY, USER_ID_KEY,
+    Service, Session, ROLE_KEY, USER_ID_KEY,
 };
 use distributed::{Aggregate, BusPublisher, ManualClock, SqliteRepository, StreamIdentity};
 use distributed_game::cell::command_id_for;
@@ -156,7 +156,7 @@ async fn cell_events_project_into_zone_status_rows() {
                     .modeled_projector(snapshots)
                     .handle(project_snapshots),
             )
-            .with_bus(SqliteBus::new(pool.clone()).with_idle_poll(CONSUMER_IDLE_POLL))
+            .with_bus(SqliteBus::new(pool.clone()))
     });
 
     let status = |zone: &'static str| {
@@ -348,7 +348,7 @@ async fn zone_activity_reports_project_into_zone_status() {
                     .modeled_projector(activity_projector_for("zone-minimap"))
                     .handle(project),
             )
-            .with_bus(SqliteBus::new(pool.clone()).with_idle_poll(CONSUMER_IDLE_POLL))
+            .with_bus(SqliteBus::new(pool.clone()))
     });
     let start = Instant::now();
     let row = loop {

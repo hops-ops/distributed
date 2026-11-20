@@ -2055,7 +2055,7 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
         .to_string();
 
     service
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect("attached bus should deliver the immediately published fact");
     assert_eq!(

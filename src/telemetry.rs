@@ -68,7 +68,6 @@ pub(crate) mod transport_outcome {
     pub(crate) const ACK: &str = "ack";
     pub(crate) const NACK: &str = "nack";
     pub(crate) const DEAD_LETTER: &str = "dead_letter";
-    pub(crate) const PARK: &str = "park";
     pub(crate) const IGNORED: &str = "ignored";
     pub(crate) const LOG_AND_ACK: &str = "log_and_ack";
 }
@@ -82,14 +81,12 @@ pub(crate) mod failure_class {
 pub(crate) mod failure_action {
     pub(crate) const NACK: &str = "nack";
     pub(crate) const DEAD_LETTER: &str = "dead_letter";
-    pub(crate) const PARK: &str = "park";
     pub(crate) const LOG_AND_ACK: &str = "log_and_ack";
     pub(crate) const STOP: &str = "stop";
     pub(crate) const RECV_ERROR: &str = "recv_error";
     pub(crate) const SETTLE_ACK: &str = "settle_ack";
     pub(crate) const SETTLE_NACK: &str = "settle_nack";
     pub(crate) const SETTLE_DEAD_LETTER: &str = "settle_dead_letter";
-    pub(crate) const SETTLE_PARK: &str = "settle_park";
     pub(crate) const SETTLE_ERROR: &str = "settle_error";
 }
 
@@ -187,7 +184,6 @@ pub(crate) fn failure_action_label(action: FailureAction) -> &'static str {
     match action {
         FailureAction::Nack => failure_action::NACK,
         FailureAction::DeadLetter => failure_action::DEAD_LETTER,
-        FailureAction::Park => failure_action::PARK,
         FailureAction::LogAndAck => failure_action::LOG_AND_ACK,
         FailureAction::Stop => failure_action::STOP,
     }
@@ -198,7 +194,6 @@ pub(crate) fn settle_failure_action(settle_action: &'static str) -> &'static str
         transport_outcome::ACK => failure_action::SETTLE_ACK,
         transport_outcome::NACK => failure_action::SETTLE_NACK,
         transport_outcome::DEAD_LETTER => failure_action::SETTLE_DEAD_LETTER,
-        transport_outcome::PARK => failure_action::SETTLE_PARK,
         _ => failure_action::SETTLE_ERROR,
     }
 }

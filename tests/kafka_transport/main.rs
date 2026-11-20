@@ -30,6 +30,29 @@ fn brokers() -> Option<String> {
     env_support::require_service("KAFKA_BROKERS", "kafka transport test")
 }
 
+/// Options that drain to idle and keep dead letters where the test can read
+/// them.
+fn storing_dead_letters() -> (Arc<distributed::bus::InMemoryDeadLetters>, RunOptions) {
+    let dead = Arc::new(distributed::bus::InMemoryDeadLetters::new());
+    let options = RunOptions::until_idle().with_dead_letters(dead.clone());
+    (dead, options)
+}
+
+/// The one stored dead letter: its message id (if any), payload and reason.
+fn only_dead_letter(
+    dead: &distributed::bus::InMemoryDeadLetters,
+) -> (Option<String>, Vec<u8>, String) {
+    let mut all = dead.all();
+    assert_eq!(all.len(), 1, "exactly one message was dead-lettered");
+    let dead = all.remove(0);
+    assert_eq!(dead.attempts, 1);
+    (
+        dead.message.id().map(str::to_owned),
+        dead.message.payload().to_vec(),
+        dead.reason,
+    )
+}
+
 #[tokio::test]
 async fn publish_then_consume_round_trips_through_kafka() {
     let Some(brokers) = brokers() else { return };
@@ -65,7 +88,7 @@ async fn publish_then_consume_round_trips_through_kafka() {
                 }),
         ),
     );
-    run_source(service, source, RunOptions::idempotent())
+    run_source(service, source, RunOptions::until_idle())
         .await
         .expect("run_source drains the topic");
 
@@ -122,7 +145,7 @@ async fn message_id_and_metadata_survive_the_round_trip() {
                 }),
         ),
     );
-    run_source(service, source, RunOptions::idempotent())
+    run_source(service, source, RunOptions::until_idle())
         .await
         .unwrap();
 
@@ -173,7 +196,7 @@ async fn bus_listen_shared_group_consumes_each_command_once() {
         .with_fetch_timeout(Duration::from_secs(10))
         .listen(
             recording_for("order.initialize", MessageKind::Command, first.clone()),
-            RunOptions::idempotent(),
+            RunOptions::until_idle(),
         )
         .await
         .expect("first listener drains");
@@ -193,7 +216,7 @@ async fn bus_listen_shared_group_consumes_each_command_once() {
         .with_fetch_timeout(Duration::from_secs(6))
         .listen(
             recording_for("order.initialize", MessageKind::Command, second.clone()),
-            RunOptions::idempotent(),
+            RunOptions::until_idle(),
         )
         .await
         .expect("second listener drains");
@@ -274,7 +297,7 @@ async fn retryable_failure_is_redelivered_then_succeeds() {
             }
         }
     }));
-    run_source(handlers, source, RunOptions::idempotent())
+    run_source(handlers, source, RunOptions::until_idle())
         .await
         .expect("run drains after the seek-back redelivery succeeds");
 
@@ -285,11 +308,10 @@ async fn retryable_failure_is_redelivered_then_succeeds() {
     );
 }
 
-/// Kafka's adapter has no native dead-letter destination: `dead_letter` commits
-/// past the record (skip). Prove the two properties that matter: the poison
-/// record is not redelivered to the group, and later records still flow.
+/// A poison record is stored as a dead letter, is not redelivered to the group,
+/// and does not hold up later records.
 #[tokio::test]
-async fn permanent_failure_skips_record_without_redelivery() {
+async fn permanent_failure_routes_to_dead_letter_destination() {
     let Some(brokers) = brokers() else { return };
     let topic = unique("delivery.poison");
     let group = unique("group");
@@ -303,6 +325,7 @@ async fn permanent_failure_skips_record_without_redelivery() {
     }
 
     let source = failure_source(&brokers, &group, &topic, Duration::from_secs(10)).await;
+    let (dead, options) = storing_dead_letters();
     let rec = Arc::new(Mutex::new(Vec::new()));
     let seen = rec.clone();
     let handlers = Arc::new(
@@ -319,23 +342,26 @@ async fn permanent_failure_skips_record_without_redelivery() {
             }
         }),
     );
-    run_source(handlers, source, RunOptions::idempotent())
+    run_source(handlers, source, options)
         .await
         .expect("run drains past the poison record");
     assert_eq!(
         rec.lock().unwrap().clone(),
         vec!["ok".to_string()],
-        "subsequent records still flow after the dead-letter commit"
+        "subsequent records still flow after the dead letter"
     );
+    let (id, _, reason) = only_dead_letter(&dead);
+    assert_eq!(id.as_deref(), Some("poison"));
+    assert!(reason.contains("unprocessable"), "{reason}");
 
-    // The dead-letter committed past the poison record: a fresh consumer in the
+    // The dead letter was acknowledged, committing past the poison record: a fresh consumer in the
     // SAME group re-reads nothing.
     let source = failure_source(&brokers, &group, &topic, Duration::from_secs(6)).await;
     let redelivered = Arc::new(Mutex::new(Vec::new()));
     run_source(
         recording_for(&topic, MessageKind::Event, redelivered.clone()),
         source,
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
     )
     .await
     .expect("redelivery-check run drains");
@@ -369,6 +395,7 @@ async fn undecodable_payload_dead_letters_without_blocking() {
     // non-JSON payloads rather than failing), so the record is skipped via
     // offset commit instead of blocking the partition with endless seek-backs.
     let source = failure_source(&brokers, &group, &topic, Duration::from_secs(10)).await;
+    let (dead, options) = storing_dead_letters();
     let rec = Arc::new(Mutex::new(Vec::new()));
     let seen = rec.clone();
     let handlers = Arc::new(
@@ -385,7 +412,7 @@ async fn undecodable_payload_dead_letters_without_blocking() {
             }
         }),
     );
-    run_source(handlers, source, RunOptions::idempotent())
+    run_source(handlers, source, options)
         .await
         .expect("run drains: the undecodable payload is skipped, not re-read forever");
     assert_eq!(
@@ -393,4 +420,8 @@ async fn undecodable_payload_dead_letters_without_blocking() {
         vec!["ok".to_string()],
         "the record behind the garbage is still handled"
     );
+    let (id, payload, reason) = only_dead_letter(&dead);
+    assert_eq!(id.as_deref(), Some("garbage"));
+    assert_eq!(payload, vec![0xff, 0xfe, b'{']);
+    assert!(reason.contains("undecodable payload"), "{reason}");
 }

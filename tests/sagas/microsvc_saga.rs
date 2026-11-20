@@ -378,16 +378,16 @@ async fn saga_distributed() {
             break;
         }
 
-        bus.subscribe(saga_svc.clone(), RunOptions::idempotent())
+        bus.subscribe(saga_svc.clone(), RunOptions::until_idle())
             .await
             .expect("saga should drain its events");
-        bus.listen(order_svc.clone(), RunOptions::idempotent())
+        bus.listen(order_svc.clone(), RunOptions::until_idle())
             .await
             .expect("order service should drain its commands");
-        bus.listen(inventory_svc.clone(), RunOptions::idempotent())
+        bus.listen(inventory_svc.clone(), RunOptions::until_idle())
             .await
             .expect("inventory service should drain its commands");
-        bus.listen(payment_svc.clone(), RunOptions::idempotent())
+        bus.listen(payment_svc.clone(), RunOptions::until_idle())
             .await
             .expect("payment service should drain its commands");
     }

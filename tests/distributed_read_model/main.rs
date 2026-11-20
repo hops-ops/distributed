@@ -517,23 +517,23 @@ async fn seat_checkout_saga_reserves_seat_and_projects_user_screen() {
 
     publish_pending_outbox(&seat_store.outbox_store(), &bus).await;
     publish_pending_outbox(&checkout_store.outbox_store(), &bus).await;
-    bus.subscribe(projection_svc.clone(), RunOptions::idempotent())
+    bus.subscribe(projection_svc.clone(), RunOptions::until_idle())
         .await
         .expect("projection drains the opening events");
-    bus.subscribe(seat_service.clone(), RunOptions::idempotent())
+    bus.subscribe(seat_service.clone(), RunOptions::until_idle())
         .await
         .expect("seat service reacts to the started checkout");
 
     publish_pending_outbox(&seat_store.outbox_store(), &bus).await;
-    bus.subscribe(projection_svc.clone(), RunOptions::idempotent())
+    bus.subscribe(projection_svc.clone(), RunOptions::until_idle())
         .await
         .expect("projection drains the reservation");
-    bus.subscribe(checkout_service.clone(), RunOptions::idempotent())
+    bus.subscribe(checkout_service.clone(), RunOptions::until_idle())
         .await
         .expect("saga records the seat reservation");
 
     publish_pending_outbox(&checkout_store.outbox_store(), &bus).await;
-    bus.subscribe(projection_svc.clone(), RunOptions::idempotent())
+    bus.subscribe(projection_svc.clone(), RunOptions::until_idle())
         .await
         .expect("projection drains the completion");
 
@@ -811,7 +811,7 @@ async fn run_checkout_over_bus<B, R>(
             .expect("event should publish over the bus");
     }
 
-    bus.subscribe(collector, RunOptions::idempotent())
+    bus.subscribe(collector, RunOptions::until_idle())
         .await
         .expect("subscriber should drain the bus");
 

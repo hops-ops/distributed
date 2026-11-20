@@ -31,10 +31,10 @@ use async_nats::jetstream;
 use async_nats::jetstream::consumer::pull::Config as PullConfig;
 use async_nats::jetstream::stream::{Config as StreamConfig, Stream};
 
-use super::nats::{NackBackoff, NatsJetStreamSource, NatsPublisher};
+use super::nats::{NatsJetStreamSource, NatsPublisher};
 use super::{
     retryable, run_source, Bus, BusConsumer, BusTopologyConfig, MessagePublisher, MessageRouter,
-    RunOptions, TransportError,
+    PublishDeadLetters, RunOptions, TransportError,
 };
 use super::{Message, MessageKind};
 
@@ -48,8 +48,6 @@ pub struct NatsBus {
     evt_publisher: Arc<NatsPublisher>,
     topology: BusTopologyConfig,
     fetch_timeout: Duration,
-    idle_poll: Duration,
-    nack_backoff: NackBackoff,
 }
 
 /// Awaitable builder returned by [`NatsBus::connect`].
@@ -113,8 +111,6 @@ impl NatsBus {
             evt_publisher: Arc::new(evt_publisher),
             topology: BusTopologyConfig::default(),
             fetch_timeout: DEFAULT_FETCH_TIMEOUT,
-            idle_poll: Duration::ZERO,
-            nack_backoff: NackBackoff::default(),
         }
     }
 
@@ -167,19 +163,6 @@ impl NatsBus {
     /// Override how long a `listen`/`subscribe` poll waits before idling.
     pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.fetch_timeout = timeout;
-        self
-    }
-
-    /// Keep `listen`/`subscribe` running after an empty JetStream fetch.
-    /// Drain-to-idle is for tests; long-running hosts must set this.
-    pub fn with_idle_poll(mut self, idle_poll: Duration) -> Self {
-        self.idle_poll = idle_poll;
-        self
-    }
-
-    /// Space retryable NAK redeliveries for `listen`/`subscribe` sources.
-    pub fn with_nack_backoff(mut self, backoff: NackBackoff) -> Self {
-        self.nack_backoff = backoff;
         self
     }
 
@@ -372,9 +355,7 @@ impl NatsBus {
         }
         Ok(NatsJetStreamSource::new(consumer)
             .with_fetch_timeout(self.fetch_timeout)
-            .with_strip_prefix(strip_prefix)
-            .with_idle_poll(self.idle_poll)
-            .with_nack_backoff(self.nack_backoff))
+            .with_strip_prefix(strip_prefix))
     }
 
     /// Shared consume path for `listen` (commands) and `subscribe` (events):
@@ -407,6 +388,7 @@ impl NatsBus {
                 prefix,
             )
             .await?;
+        let options = options.or_dead_letters(|| Arc::new(PublishDeadLetters(self.clone())));
         run_source(router, source, options).await
     }
 }
