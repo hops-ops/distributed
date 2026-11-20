@@ -33,6 +33,8 @@ import {
 /** Minimal WebSocket surface (the browser `WebSocket` satisfies it). */
 export interface GameSocket {
 	binaryType?: string;
+	/** `WebSocket.readyState`, when the socket reports one (1 is open). */
+	readonly readyState?: number;
 	send(data: Uint8Array): void;
 	close(code?: number, reason?: string): void;
 	onopen: ((event?: unknown) => void) | null;
@@ -42,6 +44,8 @@ export interface GameSocket {
 }
 
 export type GameSocketFactory = (url: string) => GameSocket;
+
+const SOCKET_OPEN = 1;
 
 /** Clock and timers (injectable for deterministic tests). */
 export type GameScheduler = Readonly<{
@@ -533,6 +537,9 @@ export class GameConnection {
 	#send(message: GameClientMessage): void {
 		const socket = this.#attempt?.socket;
 		if (socket === undefined) return;
+		// A browser socket that is closing does not throw on send: it logs a
+		// console error and drops the bytes. The close event is on its way.
+		if (socket.readyState !== undefined && socket.readyState !== SOCKET_OPEN) return;
 		try {
 			const bytes = encodeClientMessage(message);
 			socket.send(bytes);
