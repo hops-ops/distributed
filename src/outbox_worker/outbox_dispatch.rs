@@ -386,7 +386,12 @@ where
             Ok(()) => published.push(claim),
             Err(publish_error) => {
                 match store
-                    .record_failure(&claim, &publish_error.to_string(), max_attempts)
+                    .record_failure(
+                        &claim,
+                        &publish_error.to_string(),
+                        publish_error.is_retryable(),
+                        max_attempts,
+                    )
                     .await?
                 {
                     OutboxPublishFailureAction::Released => outcome.released += 1,
@@ -617,10 +622,41 @@ mod tests {
     }
 
     #[test]
-    fn publish_failure_fails_row_at_attempt_ceiling() {
+    fn an_outage_never_fails_a_row_even_at_the_attempt_ceiling() {
         let repo = InMemoryRepository::new();
         let id = store_message(&repo, outbox("evt-1"));
+        // The publisher fails retryably (unknown outcome); the ceiling is 1.
         let dispatcher = dispatcher(&repo, true, 1);
+
+        let outcome = block_on(dispatcher.dispatch_ids(std::slice::from_ref(&id))).unwrap();
+
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.released, 1);
+        let row = load(&repo, &id);
+        assert!(row.is_pending());
+        assert!(
+            row.deliver_at.is_some_and(|at| at > crate::time::now()),
+            "the released row waits before its next attempt"
+        );
+    }
+
+    #[test]
+    fn a_permanent_publish_failure_fails_the_row_at_the_attempt_ceiling() {
+        struct Rejecting;
+        impl MessagePublisher for Rejecting {
+            async fn publish(&self, _message: Message) -> Result<(), TransportError> {
+                Err(TransportError::permanent("message rejected"))
+            }
+        }
+        let repo = InMemoryRepository::new();
+        let id = store_message(&repo, outbox("evt-1"));
+        let dispatcher = OutboxDispatcher::new(
+            repo.outbox_store(),
+            Rejecting,
+            "immediate:test",
+            Duration::from_secs(60),
+            1,
+        );
 
         let outcome = block_on(dispatcher.dispatch_ids(std::slice::from_ref(&id))).unwrap();
 

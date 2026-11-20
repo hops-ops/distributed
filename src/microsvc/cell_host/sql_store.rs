@@ -8,6 +8,7 @@
 
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
@@ -400,8 +401,22 @@ impl OutboxStore for CellSqlOutboxStore {
     async fn complete(&self, claim: &OutboxClaimRef) -> Result<(), RepositoryError> {
         self.settle(claim, outbox::Transition::Complete)
     }
-    async fn release(&self, claim: &OutboxClaimRef, error: &str) -> Result<(), RepositoryError> {
-        self.settle(claim, outbox::Transition::Release(error))
+    async fn release(
+        &self,
+        claim: &OutboxClaimRef,
+        error: &str,
+        retry_after: Duration,
+    ) -> Result<(), RepositoryError> {
+        self.settle(claim, outbox::Transition::Release(error, retry_after))
+    }
+    async fn requeue_failed(&self, message_id: &str) -> Result<(), RepositoryError> {
+        self.connection.transaction(|executor| {
+            finish_sql(outbox::requeue_failed(
+                executor,
+                message_id,
+                crate::time::now(),
+            ))
+        })
     }
     async fn fail(&self, claim: &OutboxClaimRef, error: &str) -> Result<(), RepositoryError> {
         self.settle(claim, outbox::Transition::Fail(error))

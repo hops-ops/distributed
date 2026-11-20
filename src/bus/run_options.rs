@@ -25,11 +25,13 @@ pub struct RetryBackoff {
 
 impl RetryBackoff {
     /// Backoff starting at `base` and capped at `max` (at least `base`).
-    pub fn new(base: Duration, max: Duration) -> Self {
-        Self {
-            base,
-            max: max.max(base),
-        }
+    pub const fn new(base: Duration, max: Duration) -> Self {
+        let max = if max.as_nanos() < base.as_nanos() {
+            base
+        } else {
+            max
+        };
+        Self { base, max }
     }
 
     /// Redeliver at once. A failing dependency then gets a tight retry loop;

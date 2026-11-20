@@ -97,8 +97,20 @@ where
         &'a self,
         claim: &'a OutboxClaimRef,
         error: &'a str,
+        retry_after: Duration,
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
-        transition_claimed_outbox_message(&self.pool, claim, OutboxTransition::Release(error))
+        transition_claimed_outbox_message(
+            &self.pool,
+            claim,
+            OutboxTransition::Release(error, retry_after),
+        )
+    }
+
+    fn requeue_failed<'a>(
+        &'a self,
+        message_id: &'a str,
+    ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
+        requeue_failed_outbox_message(&self.pool, message_id)
     }
 
     fn fail<'a>(
@@ -135,6 +147,34 @@ where
         &mut executor::ConnectionExecutor::<DB>(&mut connection),
         claim,
         transition,
+        SystemTime::now(),
+    )
+    .await
+}
+
+/// Requeue one failed delivery row.
+async fn requeue_failed_outbox_message<'a, DB>(
+    pool: &'a Pool<DB>,
+    message_id: &'a str,
+) -> Result<(), RepositoryError>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(|error| repository_storage_error::<DB>("acquire outbox connection", error))?;
+    crate::repository::sql::outbox::requeue_failed(
+        &mut executor::ConnectionExecutor::<DB>(&mut connection),
+        message_id,
         SystemTime::now(),
     )
     .await

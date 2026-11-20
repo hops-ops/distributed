@@ -597,13 +597,14 @@ fn uuid_v7_shaped(hasher: Sha256) -> String {
     uuid::Uuid::from_bytes(bytes).hyphenated().to_string()
 }
 
-/// Exponential retry delay for the `attempts`-th failure (0-based).
+/// How long a schedule waits after a failed attempt: the same backoff type
+/// the bus and the outbox use, from one second doubling to five minutes.
+pub const SCHEDULE_RETRY: crate::bus::RetryBackoff =
+    crate::bus::RetryBackoff::new(SCHEDULE_RETRY_BASE, SCHEDULE_RETRY_MAX);
+
+/// Retry delay after `attempts` earlier failures (0-based).
 pub(crate) fn retry_delay(attempts: u32) -> Duration {
-    let factor = 1u32.checked_shl(attempts.min(16)).unwrap_or(u32::MAX);
-    SCHEDULE_RETRY_BASE
-        .checked_mul(factor)
-        .unwrap_or(SCHEDULE_RETRY_MAX)
-        .min(SCHEDULE_RETRY_MAX)
+    SCHEDULE_RETRY.delay(attempts.saturating_add(1))
 }
 
 pub(crate) fn system_time_to_ms(time: SystemTime) -> Result<i64, ScheduleError> {

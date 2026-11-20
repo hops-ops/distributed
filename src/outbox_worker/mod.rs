@@ -6,7 +6,6 @@
 //! - `OutboxStore` - Store operations for claiming and completing messages
 //! - `OutboxDispatcher` / `BusPublisher` - the async production drain path
 //! - `OutboxSource` - outbox-backed durable receive
-//! - `BusOutboxPublishHook` - after-commit immediate publish hook
 //!
 //! ## Separation of Concerns
 //!
@@ -39,7 +38,6 @@ mod bus_publisher;
 mod drain;
 mod outbox_dispatch;
 mod outbox_source;
-mod publish_hook;
 mod store;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -48,7 +46,7 @@ pub(crate) mod testing;
 pub(crate) use store::ensure_active_claim;
 pub use store::{
     ClaimOutboxMessages, OutboxBacklogStats, OutboxClaimRef, OutboxPublishFailureAction,
-    OutboxStore,
+    OutboxStore, OUTBOX_RETRY,
 };
 
 // Outbox -> bus bridge (moved out of the bus module; depends up on bus traits).
@@ -72,4 +70,3 @@ pub use outbox_dispatch::{OutboxDispatchOutcome, OutboxDispatcher, SOURCED_METAD
 pub use outbox_source::{
     OutboxSource, ReceivedOutboxMessage, DEFAULT_OUTBOX_SOURCE_BATCH, DEFAULT_OUTBOX_SOURCE_LEASE,
 };
-pub use publish_hook::BusOutboxPublishHook;

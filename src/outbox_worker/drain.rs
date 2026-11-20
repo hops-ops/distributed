@@ -576,8 +576,16 @@ mod tests {
             &'a self,
             claim: &'a OutboxClaimRef,
             error: &'a str,
+            retry_after: Duration,
         ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
-            self.inner.release(claim, error)
+            self.inner.release(claim, error, retry_after)
+        }
+
+        fn requeue_failed<'a>(
+            &'a self,
+            message_id: &'a str,
+        ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
+            self.inner.requeue_failed(message_id)
         }
 
         fn fail<'a>(

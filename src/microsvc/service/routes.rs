@@ -49,7 +49,6 @@ use crate::microsvc::projector::{
 use crate::microsvc::projector::{ModeledProjectorHandlerFn, ModeledProjectorRouteBuilder};
 use crate::microsvc::session::Session;
 use crate::outbox::OutboxPublisherConfig;
-use crate::outbox_worker::BusOutboxPublishHook;
 #[cfg(any(
     feature = "http",
     feature = "grpc",
@@ -536,10 +535,8 @@ pub(super) fn configure_outbox_for<D>(
     D: HasOutboxStore + ConfigurableOutboxPublisher,
     D::OutboxStore: 'static,
 {
-    let hook =
-        BusOutboxPublishHook::new(dependencies.outbox_store(), publisher.clone(), max_attempts)
-            .with_service(service_name.clone());
-
+    // One publish path either way: the commit leaves its rows pending and
+    // the dispatcher claims them by id.
     #[cfg(any(
         feature = "http",
         feature = "grpc",
@@ -551,11 +548,12 @@ pub(super) fn configure_outbox_for<D>(
         test,
     ))]
     let config = {
+        let _ = lease;
         let (mailbox, rx, wake) = OutboxPublishMailbox::channel(DEFAULT_OUTBOX_HINT_CAPACITY);
         let mut dispatcher = OutboxDispatcher::new(
             dependencies.outbox_store(),
             publisher,
-            worker_id.clone(),
+            worker_id,
             DEFAULT_DRAIN_LEASE,
             max_attempts,
         );
@@ -565,10 +563,15 @@ pub(super) fn configure_outbox_for<D>(
         OutboxDrainRunner::new(dispatcher)
             .with_hints(rx, wake)
             .spawn();
-        OutboxPublisherConfig::new(Arc::new(hook), worker_id, lease)
-            .with_schedule(Arc::new(move |ids| mailbox.try_submit(ids)))
+        // Hand the ids to the bounded worker and return at once.
+        OutboxPublisherConfig::new(move |ids| {
+            mailbox.try_submit(ids);
+            Box::pin(async {})
+        })
     };
 
+    // No runtime to run a worker on: publish before the commit returns. A
+    // publish failure leaves the rows pending for a separately run dispatcher.
     #[cfg(not(any(
         feature = "http",
         feature = "grpc",
@@ -580,8 +583,23 @@ pub(super) fn configure_outbox_for<D>(
         test,
     )))]
     let config = {
-        let _ = publisher;
-        OutboxPublisherConfig::new(Arc::new(hook), worker_id, lease)
+        let mut dispatcher = crate::OutboxDispatcher::new(
+            dependencies.outbox_store(),
+            publisher,
+            worker_id,
+            lease,
+            max_attempts,
+        );
+        if let Some(name) = service_name {
+            dispatcher = dispatcher.with_service(name);
+        }
+        let dispatcher = Arc::new(dispatcher);
+        OutboxPublisherConfig::new(move |ids| {
+            let dispatcher = Arc::clone(&dispatcher);
+            Box::pin(async move {
+                let _ = dispatcher.dispatch_ids(&ids).await;
+            })
+        })
     };
 
     dependencies.configure_outbox_publisher(config);
@@ -2240,41 +2258,12 @@ where
                 }
             };
 
-            // Stamp causation, leave rows pending for the bounded worker, and
-            // only claim in-transaction when there is no mailbox (hook fallback).
-            let mut fallback_rows = Vec::new();
+            // Stamp causation. Rows are committed pending; the publisher claims.
             let mut outbox_ids = Vec::new();
-            if let Some(config) = publisher {
-                let claim_now = config.schedule.is_none().then(crate::time::now);
-                let mut claim_error = None;
+            if publisher.is_some() {
                 for message in &mut batch.outbox_messages {
                     message.overwrite_causation_id(attempt.causation_id().as_str());
                     outbox_ids.push(message.id().to_string());
-                    if let Some(now) = claim_now.filter(|now| message.is_due_at(*now)) {
-                        if let Err(error) = message.claim_at(&config.worker_id, config.lease, now) {
-                            claim_error = Some(error.to_string());
-                            break;
-                        }
-                    }
-                }
-                if let Some(error) = claim_error {
-                    drop(batch);
-                    return abandon_causal_attempt(
-                        repository,
-                        attempt,
-                        self.contract.consistency,
-                        format!("causal outbox claim failed before commit: {error}"),
-                    )
-                    .await;
-                }
-                if config.schedule.is_none() {
-                    // Scheduled rows were left pending (unclaimed) above.
-                    fallback_rows = batch
-                        .outbox_messages
-                        .iter()
-                        .filter(|message| message.is_in_flight())
-                        .cloned()
-                        .collect();
                 }
             }
 
@@ -2311,8 +2300,7 @@ where
                         ))
                     })?;
                     if let Some(config) = publisher {
-                        crate::outbox::start_immediate_publish(config, outbox_ids, fallback_rows)
-                            .await;
+                        config.publish_after_commit(outbox_ids).await;
                     }
                     let (_committed, serialized) = prepared.finalize_after_commit();
                     let result = load_committed_dispatch_result(
