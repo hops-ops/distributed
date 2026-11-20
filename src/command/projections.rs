@@ -173,7 +173,7 @@ pub struct CommandProjectionPureReduce {
     pub wasm_package: String,
     /// Named WASM export `(recordJson, argsJson) -> assignJson | undefined`.
     pub wasm_export: String,
-    /// Cargo package that declared this WASM pure. `portable_command!` fills
+    /// Cargo package that declared this WASM pure. `command!` fills
     /// this from `CARGO_PKG_NAME`; application authors do not maintain a
     /// parallel build inventory.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -240,7 +240,7 @@ impl CommandProjectionPureReduce {
 
     /// Attach the Cargo package that owns a declared WASM pure.
     ///
-    /// Normal application code receives this through `portable_command!`.
+    /// Normal application code receives this through `command!`.
     /// It is public only so generated declarations can remain ordinary Rust.
     #[doc(hidden)]
     #[must_use]

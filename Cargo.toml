@@ -34,7 +34,6 @@ required-features = ["graphql", "sqlite"]
 
 [features]
 default = []
-application-runtime = []
 # Portable gateway declarations and dispatch only; runtime adapters are separate.
 gateway = ["dep:url"]
 # Native HTTP adapter remains independent of GraphQL and SQL.
@@ -46,7 +45,6 @@ gateway-delivery = ["gateway-graphql"]
 # workers-rs ingress and delivery contracts, without native executors.
 gateway-worker = ["gateway-delivery", "dep:worker", "dep:futures-channel"]
 gateway-graphql-native = ["gateway-native", "gateway-graphql", "graphql", "dep:tokio-tungstenite"]
-runtime = ["application-runtime"]
 emitter = ["dep:event-emitter-rs"]
 metrics = []
 http = ["dep:axum", "dep:reqwest", "dep:tokio"]

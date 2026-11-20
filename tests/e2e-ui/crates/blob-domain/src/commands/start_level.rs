@@ -1,6 +1,6 @@
 use distributed::command::{Atomic, PreparedCommand};
 use distributed::microsvc::{CausalCommandContext, HandlerError};
-use distributed::portable_command;
+use distributed::command;
 use e2e_readmodels::BlobGames;
 use serde::Deserialize;
 
@@ -27,7 +27,7 @@ pub async fn handle_start_level(
     repo.readmodel(row).publish_events().commit(game)?.atomic()
 }
 
-portable_command! {
+command! {
     name: "blob.start_level",
     transition: domain_commands::StartLevel,
     aggregate: BlobGame,

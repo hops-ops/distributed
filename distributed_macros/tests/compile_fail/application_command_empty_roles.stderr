@@ -1,5 +1,0 @@
-error: unexpected end of input, command roles must declare at least one role; use an explicit anonymous role when intended
- --> tests/compile_fail/application_command_empty_roles.rs:6:11
-  |
-6 |     roles(),
-  |           ^

@@ -466,9 +466,8 @@ pub use microsvc::{
 // Use `mutation!` / `mutation_file!` + declarative `projection!` (event→mutation
 // mount); commands predict events via `.emits`/`.preview`.
 pub use distributed_macros::{
-    aggregate, application, command, command_input_defaults, digest, module, mutation,
-    mutation_file, portable_command, sourced, CommandInput, CommandOutput, DomainEvent,
-    DomainState, ReadModel, Snapshot,
+    aggregate, command, command_input_defaults, digest, mutation, mutation_file, sourced,
+    CommandInput, CommandOutput, DomainEvent, DomainState, ReadModel, Snapshot,
 };
 
 // Re-export enqueue macro (requires "emitter" feature)

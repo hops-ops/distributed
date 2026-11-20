@@ -1,7 +1,7 @@
 use distributed::command::{Eventual, PreparedCommand};
 use distributed::command_input_defaults;
 use distributed::microsvc::{CausalCommandContext, HandlerError};
-use distributed::portable_command;
+use distributed::command;
 use serde::{Deserialize, Serialize};
 
 use super::support::{authenticated_user, principal, rejected};
@@ -47,7 +47,7 @@ pub async fn handle_create(
         })
 }
 
-portable_command! {
+command! {
     name: "todo.create",
     transition: domain_commands::Create,
     aggregate: Todo,

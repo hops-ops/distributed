@@ -1,6 +1,6 @@
 use distributed::command::{Eventual, PreparedCommand};
 use distributed::microsvc::{CausalCommandContext, HandlerError};
-use distributed::portable_command;
+use distributed::command;
 use serde::{Deserialize, Serialize};
 
 use super::support::{admin_user, principal, rejected};
@@ -41,7 +41,7 @@ pub async fn handle_force_archive(
         })
 }
 
-portable_command! {
+command! {
     name: "todo.force_archive",
     transition: domain_commands::ForceArchive,
     aggregate: Todo,

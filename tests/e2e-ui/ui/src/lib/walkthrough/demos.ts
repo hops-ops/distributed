@@ -88,7 +88,7 @@ export const todosWalkthrough: DemoWalkthrough = {
 	title: 'Todos',
 	kicker: 'Query, then command, then domain, then projection',
 	summary:
-		'This page loads one GraphQL query into the client replica. Todo commands are Eventual. The client shows a safe preview from the command input and the domain transition. The event handler applies the same mutation program later. The client waits for projection obligations. The client does not wait for a response row. The same portable_command! declarations mount on a local Service (tests/e2e-ui) or wait-dispatch every Todo transition to a cell (tests/e2e-celld).',
+		'This page loads one GraphQL query into the client replica. Todo commands are Eventual. The client shows a safe preview from the command input and the domain transition. The event handler applies the same mutation program later. The client waits for projection obligations. The client does not wait for a response row. The same command! declarations mount on a local Service (tests/e2e-ui) or wait-dispatch every Todo transition to a cell (tests/e2e-celld).',
 	tabs: [
 {
 			id: 'query',
@@ -168,7 +168,7 @@ await commands.todo.complete({ todo_id });`
 				{
 					file: 'todo-domain/src/commands/complete.rs',
 					caption: 'A thin portable command is shard + invoke + Eventual. The host does not write a handler body.',
-					code: `portable_command! {
+					code: `command! {
   name: "todo.complete",
   transition: domain_commands::Complete,
   aggregate: Todo,
@@ -201,7 +201,7 @@ await commands.todo.complete({ todo_id });`
 				{
 					file: 'todo-domain/src/commands/complete.rs · thin',
 					caption: 'No CausalCommandContext body. The mount loads by shard, invokes the domain, and commits Eventual.',
-					code: `portable_command! {
+					code: `command! {
   name: "todo.complete",
   // …
   load: required,
@@ -212,7 +212,7 @@ await commands.todo.complete({ todo_id });`
 				{
 					file: 'todo-domain/src/commands/create.rs · handle_create',
 					caption: 'Escape hatch: get the principal, create the aggregate, call the domain, commit Eventual.',
-					code: `portable_command! {
+					code: `command! {
   name: "todo.create",
   // …
   guard: authenticated_user,

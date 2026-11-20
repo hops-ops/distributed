@@ -317,12 +317,12 @@ pub fn complete(&mut self, #[principal] owner_id: &str) -> Result<(), TodoError>
 ```
 
 The Todo playground spells the same registration out with
-`portable_command!` — shard, invoke one domain method, commit Eventual.
+`command!` — shard, invoke one domain method, commit Eventual.
 `todo.create` keeps a `handle:` escape hatch when the body needs extra
 checks.
 
 ```rust,ignore
-portable_command! {
+command! {
     name: "todo.complete",
     transition: domain_commands::Complete,
     aggregate: Todo,
@@ -346,7 +346,7 @@ A module mounts one bounded context — commands, guards, projectors. A
 playground is one `Service`, one host, one runner that only reads env and
 calls `run`. You do not set a runtime role flag.
 
-Todo commands are `portable_command!` declarations in `todo-domain`. This
+Todo commands are `command!` declarations in `todo-domain`. This
 playground mounts them on a local Service. The sibling example
 [`tests/e2e-celld`](tests/e2e-celld) mounts the same declarations and
 wait-dispatches create, complete, and `chat.post` to a **cell** (one private
@@ -549,7 +549,7 @@ Start here in the code:
 | [`ui/src/lib/components/blob/SelectedBlobGame.graphql`](tests/e2e-ui/ui/src/lib/components/blob/SelectedBlobGame.graphql) | Reusable component island promoted to the nearest static route boundary; one route-param binding drives SSR and component reads. |
 | [`ui/src/routes/blob/[[gameId]]/+page.svelte`](tests/e2e-ui/ui/src/routes/blob/[[gameId]]/+page.svelte) | Arrow keys → `commands.blob.move`; board from `BlobGames.use()`. |
 | [`crates/service/src/modules/compose.rs`](tests/e2e-ui/crates/service/src/modules/compose.rs) | One `Service` lists modules. No `Runtime::role`. |
-| [`crates/blob-domain/src/commands/move_dir.rs`](tests/e2e-ui/crates/blob-domain/src/commands/move_dir.rs) | `portable_command!` returning `Atomic<BlobGames>`: the map/score row commits with the event, and a WASM pure previews the move. |
+| [`crates/blob-domain/src/commands/move_dir.rs`](tests/e2e-ui/crates/blob-domain/src/commands/move_dir.rs) | `command!` returning `Atomic<BlobGames>`: the map/score row commits with the event, and a WASM pure previews the move. |
 | [`crates/todo-domain/src/models/todo.rs`](tests/e2e-ui/crates/todo-domain/src/models/todo.rs) | Plain aggregate — no GraphQL in the domain. |
 | [`ui/src/auth.ts`](tests/e2e-ui/ui/src/auth.ts) | Auth.js + Zitadel scopes/groups → engine roles. |
 
@@ -665,7 +665,6 @@ network servers.
 | `metrics` | No | `distributed::metrics`: framework counters and gauges with Prometheus text exposition (no SDK dependency); with `http`, a scrape handler. Bus receive loops record into it. |
 | `otel` | No | OpenTelemetry tracing spans for bus receive loops and `microsvc` dispatch/handlers (`opentelemetry`, `tracing-opentelemetry`). |
 | `workers-rs` | No | Cloudflare `worker` crate bindings for celld cells: the aggregate cell host and the celld Queue publisher/relay (`bus::CelldQueue*`) on `wasm32`. |
-| `application-runtime` (alias `runtime`) | No | Checked by `#[command]`/`portable_command!` output in the **declaring** crate: enable it in that crate's features to emit the runtime mounts (`*_mount`, `register_*`, `CommandDefinition`). Contract-only packages leave it off. |
 | `gateway` | No | `distributed::gateway`: portable gateway declarations (bindings, routes, dispatch). Starts no listeners. |
 | `gateway-native` | No | Native HTTP gateway adapter (hyper/tower), independent of GraphQL and SQL. |
 | `gateway-graphql` | No | Whole-operation GraphQL selection for the gateway (parser only). |
@@ -872,7 +871,7 @@ command_transition::<domain_commands::Leave, LeaveInput, Eventual<LeaveOutput>>(
 
 The second type is the exact serialized body. Use the flat event itself for
 `domain = event` or `#[derive(DomainEvent)]`; state-capture events continue to
-use their `DomainState` type. The equivalent `portable_command!` entry is:
+use their `DomainState` type. The equivalent `command!` entry is:
 
 ```rust,ignore
 authenticated_user_field: (
@@ -1640,7 +1639,7 @@ The generated registration is exactly the hand-written one
 (`command_transition::<domain_commands::X, I, K>(name)` + `field_name`,
 `roles`, `guarded`/`handle`): the command specs, GraphQL SDL and client
 manifest are identical (`tests/aggregate_command`). For unusual bodies write
-the handler and register it with `portable_command! { .., handle: f }` or
+the handler and register it with `command! { .., handle: f }` or
 the builder below.
 
 **Contracts.** Command semantics live in `distributed::command`, independently of the query
@@ -2820,7 +2819,7 @@ src/
   time.rs             # Wall clock that also works on wasm32
   trace_context.rs    # W3C trace-context metadata helpers
   lib.rs              # Public exports
-distributed_macros/   # Proc macros: sourced, digest, aggregate, enqueue, command, portable_command,
+distributed_macros/   # Proc macros: sourced, digest, aggregate, enqueue, command, command,
                       #   module, application, mutation!, ReadModel, Snapshot, DomainState,
                       #   DomainEvent, CommandInput, CommandOutput (projection! is in src/lib.rs)
 distributed_cli/      # The `distributed` CLI (build/dev lifecycle, client codegen, contracts

@@ -1,5 +1,0 @@
-error: command declaration requires explicit roles(...)
- --> tests/compile_fail/application_command_missing_roles.rs:9:10
-  |
-9 | async fn missing_roles(
-  |          ^^^^^^^^^^^^^

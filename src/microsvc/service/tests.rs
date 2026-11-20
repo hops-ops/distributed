@@ -515,24 +515,6 @@ async fn typed_handler(
     Ok(PreparedCommand::prepare(TypedOutput { id: input.id }).unwrap())
 }
 
-#[cfg(all(feature = "graphql", feature = "application-runtime"))]
-static GENERATED_MOUNT_HANDLER_INVOKED: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(all(feature = "graphql", feature = "application-runtime"))]
-#[distributed::command(
-    id = "causal.generated_mount",
-    roles(user),
-    input = CausalTestInput,
-    outcome = Succeeded<TypedOutput>
-)]
-async fn generated_mount_handler(
-    _context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
-    input: CausalTestInput,
-) -> Result<PreparedCommand<Succeeded<TypedOutput>>, HandlerError> {
-    GENERATED_MOUNT_HANDLER_INVOKED.fetch_add(1, Ordering::SeqCst);
-    Ok(PreparedCommand::prepare(TypedOutput { id: input.id }).unwrap())
-}
-
 #[derive(Default)]
 struct RouteComboAggregate {
     entity: Entity,
@@ -1191,48 +1173,6 @@ async fn thin_complete_registers_without_a_handler_context_body() {
         .await
         .expect("thin complete should load, invoke, and commit");
     assert_eq!(completed, json!({ "id": "todo-1" }));
-}
-
-#[cfg(all(feature = "graphql", feature = "application-runtime"))]
-#[tokio::test]
-async fn generated_mount_registers_and_executes_original_handler_through_causal_protocol() {
-    GENERATED_MOUNT_HANDLER_INVOKED.store(0, Ordering::SeqCst);
-    let repository = InMemoryRepository::new();
-    let routes = generated_mount_handler_register(
-        Routes::new().with_repo(repository.aggregate::<CausalDispatcherAggregate>()),
-    );
-    let service = Service::new().named("generated-mounts").routes(routes);
-
-    assert_eq!(service.registered_command_mounts().len(), 1);
-    assert_eq!(
-        service.registered_command_mounts()[0].spec().id,
-        GENERATED_MOUNT_HANDLER_MOUNT.spec().id
-    );
-
-    let request = CommandRequest {
-        command: "causal.generated_mount".into(),
-        input: json!({"id": "generated-1", "label": "mounted"}),
-        session_variables: HashMap::new(),
-    };
-    let result = service.registered_command_mounts()[0]
-        .invoke_with(
-            &service,
-            &request,
-            crate::application::CommandMountInvocation::Authenticated {
-                command_id: causal_test_command_id(),
-                session: session_with_role("user"),
-                principal: causal_test_principal(),
-            },
-        )
-        .await;
-    let crate::application::CommandMountExecutionResult::Causal(result) =
-        result.expect("authenticated causal mount dispatch should commit")
-    else {
-        panic!("typed mount must use the causal execution result");
-    };
-    assert_eq!(result.payload, json!({"id": "generated-1"}));
-    assert_eq!(result.receipt.command_name, "causal.generated_mount");
-    assert_eq!(GENERATED_MOUNT_HANDLER_INVOKED.load(Ordering::SeqCst), 1);
 }
 
 #[cfg(feature = "graphql")]

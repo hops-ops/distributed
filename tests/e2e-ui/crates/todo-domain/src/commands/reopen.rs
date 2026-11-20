@@ -1,5 +1,5 @@
 use distributed::command::Eventual;
-use distributed::portable_command;
+use distributed::command;
 use serde::Deserialize;
 
 use super::TodoStatusPayload;
@@ -12,7 +12,7 @@ pub struct TodoReopenInput {
 
 pub type TodoReopenPayload = TodoStatusPayload;
 
-portable_command! {
+command! {
     name: "todo.reopen",
     transition: domain_commands::Reopen,
     aggregate: Todo,

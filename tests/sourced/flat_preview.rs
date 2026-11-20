@@ -351,7 +351,7 @@ mod client_contract {
         };
     }
 
-    distributed::portable_command! {
+    distributed::command! {
         name: "review.leave",
         transition: domain_commands::Leave,
         aggregate: Review,

@@ -1,6 +1,5 @@
 mod aggregate;
 mod aggregate_command;
-mod application;
 mod command;
 mod command_input_defaults;
 mod command_types;
@@ -8,9 +7,7 @@ mod digest;
 mod domain_event;
 mod domain_state;
 mod enqueue;
-mod module;
 mod mutation;
-mod portable_command;
 // Event-owning `projection!` authoring removed (mutation projectors cutover).
 mod read_model;
 mod shared;
@@ -20,46 +17,15 @@ mod sourced;
 use proc_macro::TokenStream;
 use syn::DeriveInput;
 
-/// Generate one typed command's portable contract and optional executable
-/// mount from the same handler declaration (`#[command(id = "..", ..)]` on
-/// an async handler function).
+/// Declare a command on an aggregate transition: name, shard, load, payload
+/// and outcome, with `handle:` for a hand-written handler.
 ///
-/// The aggregate-method form, `#[command("aggregate.verb", shard = ..,
-/// load = .., outcome = ..)]` on a method inside a `#[sourced]` impl, is
-/// handled by `#[sourced]` (see the `aggregate_command` module docs): it
-/// generates the handler, binding the `#[principal]` parameter from the
-/// verified session, and the portable mount.
-#[proc_macro_attribute]
-pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
-    command::expand(attr.into(), item.into())
-        .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Domain-owned portable command mount (`PCH-DEC-001`).
-///
-/// Spec sketches used `command!`; that name is the handler attribute
-/// [`command`]. This is the function-like form for shard + invoke + Eventual
-/// (or a `handle:` escape hatch).
+/// The method form, `#[command("aggregate.verb", ..)]` on a method inside a
+/// `#[sourced]` impl, is read by `#[sourced]` and declares the same thing
+/// next to the transition.
 #[proc_macro]
-pub fn portable_command(input: TokenStream) -> TokenStream {
-    portable_command::expand(input.into())
-        .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Register an explicit logical module.
-#[proc_macro]
-pub fn module(input: TokenStream) -> TokenStream {
-    module::expand(input.into())
-        .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Register an explicit application and its selected modules/surfaces.
-#[proc_macro]
-pub fn application(input: TokenStream) -> TokenStream {
-    application::expand(input.into())
+pub fn command(input: TokenStream) -> TokenStream {
+    command::expand(input.into())
         .unwrap_or_else(|error| error.to_compile_error())
         .into()
 }

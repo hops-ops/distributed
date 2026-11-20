@@ -578,7 +578,7 @@ mod tests {
             invoke: |todo, _input, principal| todo.complete(principal),
             payload: |todo| TodoStatusPayload::from_todo(&**todo),
         };
-        let out = crate::portable_command::expand(input)
+        let out = crate::command::expand(input)
             .expect("expand")
             .to_string();
         assert!(out.contains("struct Complete"), "{out}");
@@ -610,7 +610,7 @@ mod tests {
             guard: authenticated_user,
             handle: handle_post,
         };
-        let out = crate::portable_command::expand(input)
+        let out = crate::command::expand(input)
             .expect("expand")
             .to_string();
         assert!(out.contains("authenticated_user_field"), "{out}");
@@ -639,7 +639,7 @@ mod tests {
             guard: authenticated_user,
             handle: handle_move,
         };
-        let out = crate::portable_command::expand(input)
+        let out = crate::command::expand(input)
             .expect("expand")
             .to_string();
         assert!(out.contains("struct Move"), "{out}");
@@ -652,10 +652,10 @@ mod tests {
             name: "todo.complete",
             nope: 1,
         };
-        let err = crate::portable_command::expand(input).expect_err("unknown key");
+        let err = crate::command::expand(input).expect_err("unknown key");
         assert!(
             err.to_string()
-                .contains("unknown portable_command key `nope`"),
+                .contains("unknown command key `nope`"),
             "got: {err}"
         );
     }

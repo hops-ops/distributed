@@ -1,5 +1,5 @@
 use distributed::command::Eventual;
-use distributed::portable_command;
+use distributed::command;
 use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, Todo};
@@ -15,7 +15,7 @@ pub struct TodoPurgePayload {
     pub purged: bool,
 }
 
-portable_command! {
+command! {
     name: "todo.purge",
     transition: domain_commands::Purge,
     aggregate: Todo,
