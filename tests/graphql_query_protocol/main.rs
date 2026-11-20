@@ -204,7 +204,7 @@ async fn project_item_with_id(
     .await
     .expect("publish query protocol fact");
     projection_service(repository, bus)
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect("project query protocol fact");
 }
@@ -234,7 +234,7 @@ async fn delete_item_with_id(repository: &Db, bus: &InMemoryBus, sequence: u64, 
     .await
     .expect("publish query protocol delete fact");
     projection_service(repository, bus)
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect("delete query protocol row");
 }
@@ -260,7 +260,7 @@ async fn recreate_item(repository: &Db, bus: &InMemoryBus, sequence: u64, title:
     .await
     .expect("publish query protocol recreate fact");
     projection_service(repository, bus)
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect("recreate query protocol row");
 }
@@ -602,7 +602,7 @@ pub async fn embedded_models_emit_index_evidence_without_record_evidence(db: Db)
     .await
     .expect("publish embedded query protocol fact");
     embedded_projection_service(&repository, &bus)
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect("project embedded query protocol fact");
 
@@ -680,7 +680,7 @@ pub async fn query_evidence_chunks_129_unique_rows_inside_one_snapshot(db: Db) {
             .expect("publish bulk query protocol fact");
     }
     projection_service(&fixture.repository, &fixture.bus)
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect("project bulk query protocol facts");
 

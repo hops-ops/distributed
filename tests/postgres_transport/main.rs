@@ -80,8 +80,8 @@ async fn outbox_source_run_drains_and_completes() {
     let service = recording_service(handled.clone());
     run_source(
         service,
-        OutboxSource::new(store.clone(), "pg-drain", 3),
-        RunOptions::idempotent(),
+        OutboxSource::new(store.clone(), "pg-drain"),
+        RunOptions::until_idle(),
     )
     .await
     .unwrap();
@@ -111,8 +111,8 @@ async fn concurrent_sources_process_each_row_once() {
     let run = |worker: &'static str| {
         run_source(
             recording_service(handled.clone()),
-            OutboxSource::new(store.clone(), worker, 3),
-            RunOptions::idempotent(),
+            OutboxSource::new(store.clone(), worker),
+            RunOptions::until_idle(),
         )
     };
     // Two competing consumers drain concurrently; SKIP LOCKED guarantees each
@@ -143,38 +143,19 @@ async fn nack_releases_then_a_later_claim_completes() {
     let store = Arc::new(repo.outbox_store());
 
     // First claim, nack -> released to pending (attempts incremented).
-    let mut source = OutboxSource::new(store.clone(), "pg-retry", 5);
+    let mut source = OutboxSource::new(store.clone(), "pg-retry");
     let received = source.recv().await.unwrap().expect("a claimable row");
-    received.nack("transient").await.unwrap();
+    received.nack(std::time::Duration::ZERO).await.unwrap();
     assert_eq!(
         status(&store, "m1").await,
         Some(OutboxMessageStatus::Pending)
     );
 
     // A later claim completes it.
-    let mut source2 = OutboxSource::new(store.clone(), "pg-retry-2", 5);
+    let mut source2 = OutboxSource::new(store.clone(), "pg-retry-2");
     let received2 = source2.recv().await.unwrap().expect("a re-claimable row");
     received2.ack().await.unwrap();
     assert_eq!(status(&store, "m1").await, None);
-}
-
-#[tokio::test]
-async fn dead_letter_marks_row_failed() {
-    let Some(schema) = postgres::PostgresTestSchema::create_from_env("pg_tx_dlq", SKIP).await
-    else {
-        return;
-    };
-    let repo = schema.repository().await;
-    enqueue(&repo, "m1", "order.initialized").await;
-    let store = Arc::new(repo.outbox_store());
-
-    let mut source = OutboxSource::new(store.clone(), "pg-dlq", 3);
-    let received = source.recv().await.unwrap().expect("a claimable row");
-    received.dead_letter("poison").await.unwrap();
-    assert_eq!(
-        status(&store, "m1").await,
-        Some(OutboxMessageStatus::Failed)
-    );
 }
 
 // ---- PostgresBus: send/listen (work queue) + publish/subscribe (log+offsets) ----
@@ -381,25 +362,11 @@ async fn recreate_permissive_log_table(pool: &sqlx::PgPool) {
     .expect("create stable message ID index");
 }
 
-async fn corrupt_latest_queue_name(pool: &sqlx::PgPool) {
-    sqlx::query("UPDATE bus_queue SET name = NULL WHERE seq = (SELECT max(seq) FROM bus_queue)")
-        .execute(pool)
-        .await
-        .expect("null out queue name");
-}
-
 async fn corrupt_latest_queue_kind(pool: &sqlx::PgPool) {
     sqlx::query("UPDATE bus_queue SET kind = 'bogus' WHERE seq = (SELECT max(seq) FROM bus_queue)")
         .execute(pool)
         .await
         .expect("corrupt queue kind");
-}
-
-async fn corrupt_latest_log_name(pool: &sqlx::PgPool) {
-    sqlx::query("UPDATE bus_log SET name = NULL WHERE seq = (SELECT max(seq) FROM bus_log)")
-        .execute(pool)
-        .await
-        .expect("null out log name");
 }
 
 async fn corrupt_latest_log_kind(pool: &sqlx::PgPool) {
@@ -487,7 +454,7 @@ async fn bus_listen_dead_letters_corrupt_queue_row_not_silently() {
     )
     .await
     .expect("send poison");
-    corrupt_latest_queue_name(&pool).await;
+    corrupt_latest_queue_kind(&pool).await;
     bus.send_message(
         Message::new("order.initialize", MessageKind::Command, b"{}".to_vec())
             .with_id("poison-kind"),
@@ -504,7 +471,7 @@ async fn bus_listen_dead_letters_corrupt_queue_row_not_silently() {
     let rec = Arc::new(Mutex::new(Vec::new()));
     bus.listen(
         recording_for("order.initialize", MessageKind::Command, rec.clone()),
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
     )
     .await
     .expect("listen drains without surfacing the corrupt row as a fatal error");
@@ -529,6 +496,17 @@ async fn bus_listen_dead_letters_corrupt_queue_row_not_silently() {
         remaining, 0,
         "corrupt row routed through policy, not redelivered forever"
     );
+    let dead_letters: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT payload FROM bus_log WHERE name = 'distributed.dead_letter' ORDER BY seq",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read dead letters");
+    assert_eq!(dead_letters.len(), 2, "every corrupt row was stored");
+    let dead: distributed::bus::DeadLetter =
+        serde_json::from_slice(&dead_letters[0]).expect("dead letter payload");
+    assert!(dead.reason.contains("corrupt row"), "{}", dead.reason);
+    assert_eq!(dead.attempts, 1);
 }
 
 /// A corrupt `bus_log` row is routed through the failure policy (dead-letter by
@@ -559,7 +537,7 @@ async fn bus_subscribe_dead_letters_corrupt_log_row_not_silently() {
         )
         .await
         .expect("publish leading poison");
-    corrupt_latest_log_name(&pool).await;
+    corrupt_latest_log_kind(&pool).await;
     producer
         .publish_message(
             Message::new("order.initialized", MessageKind::Event, b"{}".to_vec()).with_id("ok"),
@@ -573,7 +551,7 @@ async fn bus_subscribe_dead_letters_corrupt_log_row_not_silently() {
         )
         .await
         .expect("publish trailing poison");
-    corrupt_latest_log_name(&pool).await;
+    corrupt_latest_log_kind(&pool).await;
     producer
         .publish_message(
             Message::new("order.initialized", MessageKind::Event, b"{}".to_vec())
@@ -604,7 +582,7 @@ async fn bus_subscribe_dead_letters_corrupt_log_row_not_silently() {
         .group("projections")
         .subscribe(
             recording_for("order.initialized", MessageKind::Event, rec.clone()),
-            RunOptions::idempotent(),
+            RunOptions::until_idle(),
         )
         .await
         .expect("subscribe drains past the corrupt entries");
@@ -627,14 +605,24 @@ async fn bus_subscribe_dead_letters_corrupt_log_row_not_silently() {
             .fetch_optional(&pool)
             .await
             .expect("read offset");
-    let max_seq: i64 = sqlx::query_scalar("SELECT max(seq) FROM bus_log")
-        .fetch_one(&pool)
-        .await
-        .expect("max seq");
+    let max_seq: i64 =
+        sqlx::query_scalar("SELECT max(seq) FROM bus_log WHERE name <> 'distributed.dead_letter'")
+            .fetch_one(&pool)
+            .await
+            .expect("max seq");
     assert_eq!(
         offset,
         Some(max_seq),
         "offset advanced past the trailing corrupt entry, not stuck or skipped-silently"
+    );
+    let dead_letters: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM bus_log WHERE name = 'distributed.dead_letter'")
+            .fetch_one(&pool)
+            .await
+            .expect("count dead letters");
+    assert_eq!(
+        dead_letters, 5,
+        "every corrupt entry was stored, not dropped"
     );
 }
 
@@ -765,116 +753,6 @@ async fn concurrent_stable_log_retries_share_one_original_cursor() {
 }
 
 #[tokio::test]
-async fn legacy_equivalent_stable_id_duplicates_retain_the_minimum_cursor() {
-    let Some(schema) =
-        postgres::PostgresTestSchema::create_from_env("bus_log_legacy_ok", SKIP).await
-    else {
-        return;
-    };
-    let repo = schema.repository().await;
-    let pool = repo.pool().clone();
-    let bus = PostgresBus::new(pool.clone());
-    bus.ensure_tables().await.expect("ensure tables");
-    sqlx::query("DROP INDEX bus_log_message_id_unique_idx")
-        .execute(&pool)
-        .await
-        .expect("simulate legacy schema without uniqueness");
-    let first_metadata = serde_json::to_string(&vec![
-        (CAUSATION_ID, "legacy-command"),
-        (TRACEPARENT, "legacy-first"),
-    ])
-    .unwrap();
-    let retry_metadata = serde_json::to_string(&vec![
-        (CAUSATION_ID, "legacy-command"),
-        (TRACEPARENT, "legacy-retry"),
-    ])
-    .unwrap();
-    for metadata in [&first_metadata, &retry_metadata] {
-        sqlx::query(
-            "INSERT INTO bus_log \
-                 (name, message_id, kind, payload, content_type, metadata) \
-             VALUES ('order.initialized', 'legacy-stable', 'event', $1, \
-                     'application/json', $2)",
-        )
-        .bind(b"{}".as_slice())
-        .bind(metadata)
-        .execute(&pool)
-        .await
-        .expect("seed equivalent legacy duplicate");
-    }
-
-    bus.ensure_tables()
-        .await
-        .expect("equivalent duplicates are migrated safely");
-    let retained: (i64, String, i64) = sqlx::query_as(
-        "SELECT MIN(seq), MIN(metadata), COUNT(*) \
-         FROM bus_log WHERE message_id = 'legacy-stable'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("read migrated legacy row");
-    assert_eq!(retained.0, 1, "the minimum legacy cursor is authoritative");
-    assert_eq!(retained.2, 1);
-    assert!(
-        retained.1.contains("legacy-first"),
-        "the first committed envelope is retained"
-    );
-    let unique_index: bool =
-        sqlx::query_scalar("SELECT to_regclass('bus_log_message_id_unique_idx') IS NOT NULL")
-            .fetch_one(&pool)
-            .await
-            .expect("inspect stable ID index");
-    assert!(unique_index);
-}
-
-#[tokio::test]
-async fn legacy_conflicting_stable_id_duplicates_fail_preflight_without_mutation() {
-    let Some(schema) =
-        postgres::PostgresTestSchema::create_from_env("bus_log_legacy_bad", SKIP).await
-    else {
-        return;
-    };
-    let repo = schema.repository().await;
-    let pool = repo.pool().clone();
-    let bus = PostgresBus::new(pool.clone());
-    bus.ensure_tables().await.expect("ensure tables");
-    sqlx::query("DROP INDEX bus_log_message_id_unique_idx")
-        .execute(&pool)
-        .await
-        .expect("simulate legacy schema without uniqueness");
-    for payload in [br#"{}"#.as_slice(), br#"{"different":true}"#.as_slice()] {
-        sqlx::query(
-            "INSERT INTO bus_log \
-                 (name, message_id, kind, payload, content_type, metadata) \
-             VALUES ('order.initialized', 'legacy-conflict', 'event', $1, \
-                     'application/json', '[]')",
-        )
-        .bind(payload)
-        .execute(&pool)
-        .await
-        .expect("seed conflicting legacy duplicate");
-    }
-
-    let error = bus
-        .ensure_tables()
-        .await
-        .expect_err("conflicting legacy duplicates fail closed");
-    assert!(error.is_permanent());
-    let rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM bus_log WHERE message_id = 'legacy-conflict'")
-            .fetch_one(&pool)
-            .await
-            .expect("count untouched conflicting rows");
-    let unique_index: bool =
-        sqlx::query_scalar("SELECT to_regclass('bus_log_message_id_unique_idx') IS NOT NULL")
-            .fetch_one(&pool)
-            .await
-            .expect("inspect absent stable ID index");
-    assert_eq!(rows, 2, "failed preflight rolls back deduplication");
-    assert!(!unique_index, "no unsafe uniqueness fence was installed");
-}
-
-#[tokio::test]
 async fn nonempty_log_identity_adoption_must_be_explicit_and_retires_offsets() {
     let Some(schema) =
         postgres::PostgresTestSchema::create_from_env("bus_identity_loss", SKIP).await
@@ -983,7 +861,7 @@ async fn configured_epoch_initializes_but_cannot_relabel_an_existing_log() {
     .await
     .expect("append under configured epoch");
     let recorder = Arc::new(OrderedEvidenceRecorder::default());
-    bus.subscribe(recorder.clone(), RunOptions::idempotent())
+    bus.subscribe(recorder.clone(), RunOptions::until_idle())
         .await
         .expect("deliver ordered row");
     assert_eq!(
@@ -1175,7 +1053,7 @@ async fn running_subscriber_stops_before_cached_rows_after_epoch_rotation() {
     let subscriber = PostgresBus::new(pool.clone()).group("rotation-observer");
     let running = tokio::spawn({
         let router = router.clone();
-        async move { subscriber.subscribe(router, RunOptions::idempotent()).await }
+        async move { subscriber.subscribe(router, RunOptions::until_idle()).await }
     });
     tokio::time::timeout(Duration::from_secs(2), router.first_started.notified())
         .await
@@ -1280,7 +1158,7 @@ async fn expired_queue_claim_cannot_be_settled_by_stale_worker() {
     let first = tokio::spawn({
         let bus = bus.clone();
         let handlers = handlers.clone();
-        async move { bus.listen(handlers, RunOptions::idempotent()).await }
+        async move { bus.listen(handlers, RunOptions::until_idle()).await }
     });
     tokio::time::timeout(Duration::from_secs(2), first_claimed.notified())
         .await
@@ -1290,7 +1168,7 @@ async fn expired_queue_claim_cannot_be_settled_by_stale_worker() {
     let second = tokio::spawn({
         let bus = bus.clone();
         let handlers = handlers.clone();
-        async move { bus.listen(handlers, RunOptions::idempotent()).await }
+        async move { bus.listen(handlers, RunOptions::until_idle()).await }
     });
     tokio::time::timeout(Duration::from_secs(2), second_claimed.notified())
         .await

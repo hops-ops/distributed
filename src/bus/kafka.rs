@@ -13,7 +13,7 @@
 //! Requires the `kafka` feature (builds `librdkafka` via cmake). Integration-
 //! tested in `tests/kafka_transport` against a broker (see `compose.yaml`).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rdkafka::config::ClientConfig;
@@ -99,7 +99,18 @@ pub struct KafkaSource {
     consumer: Arc<StreamConsumer>,
     fetch_timeout: Duration,
     strip_prefix: Option<String>,
+    /// Receive errors in a row with no record in between.
+    consecutive_errors: u32,
+    redelivery: Redelivery,
 }
+
+/// Receive errors in a row after which `recv` stops retrying and fails.
+const MAX_CONSECUTIVE_RECV_ERRORS: u32 = 10;
+
+/// The record most recently handed back, and how often. Kafka does not count
+/// deliveries, and a partition redelivers its head record until it is
+/// committed, so one slot per source is enough.
+type Redelivery = Arc<Mutex<Option<((String, i32, i64), u32)>>>;
 
 impl KafkaSource {
     /// Wrap an existing subscribed consumer.
@@ -108,10 +119,13 @@ impl KafkaSource {
             consumer,
             fetch_timeout: Duration::from_secs(5),
             strip_prefix: None,
+            consecutive_errors: 0,
+            redelivery: Redelivery::default(),
         }
     }
 
-    /// How long `recv` waits for a record before returning `Ok(None)`.
+    /// How long `recv` waits for a record before reporting that none is
+    /// available.
     pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.fetch_timeout = timeout;
         self
@@ -154,11 +168,10 @@ impl MessageSource for KafkaSource {
     }
 
     async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
-        // Poll within the fetch-timeout budget. Kafka surfaces transient broker
-        // transport/coordination errors (normal during group bootstrap and
-        // rebalances) as recv errors; the client recovers, so we retry until a
-        // message arrives or the budget elapses (drain → None), rather than
-        // ending the run on a transient hiccup.
+        // Wait up to the fetch timeout for a record. Kafka reports transient
+        // coordination errors (group bootstrap, rebalances) as receive errors
+        // and recovers by itself, so a few are retried. Errors that keep
+        // coming (bad credentials, a topic that does not exist) end the run.
         let deadline = Instant::now() + self.fetch_timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -167,17 +180,27 @@ impl MessageSource for KafkaSource {
             }
             match tokio::time::timeout(remaining, self.consumer.recv()).await {
                 Ok(Ok(borrowed)) => {
+                    self.consecutive_errors = 0;
                     return Ok(Some(KafkaReceived::from_borrowed(
                         &borrowed,
                         self.consumer.clone(),
                         self.strip_prefix.as_deref(),
+                        self.redelivery.clone(),
                     )));
                 }
-                Ok(Err(_transient)) => {
-                    // Back off briefly, then retry within the remaining budget.
+                Ok(Err(error)) => {
+                    self.consecutive_errors += 1;
+                    if self.consecutive_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+                        self.consecutive_errors = 0;
+                        return Err(retryable("kafka receive", error));
+                    }
+                    tracing::warn!(%error, "kafka receive failed; retrying");
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
-                Err(_elapsed) => return Ok(None),
+                Err(_elapsed) => {
+                    self.consecutive_errors = 0;
+                    return Ok(None);
+                }
             }
         }
     }
@@ -190,6 +213,8 @@ pub struct KafkaReceived {
     partition: i32,
     offset: i64,
     message: Message,
+    attempts: u32,
+    redelivery: Redelivery,
 }
 
 impl KafkaReceived {
@@ -197,6 +222,7 @@ impl KafkaReceived {
         borrowed: &rdkafka::message::BorrowedMessage<'_>,
         consumer: Arc<StreamConsumer>,
         strip_prefix: Option<&str>,
+        redelivery: Redelivery,
     ) -> Self {
         let payload = borrowed.payload().map(|p| p.to_vec()).unwrap_or_default();
         let topic = borrowed.topic().to_string();
@@ -220,12 +246,22 @@ impl KafkaReceived {
             MESSAGE_KIND_HEADER,
             headers,
         );
+        let key = (topic.clone(), borrowed.partition(), borrowed.offset());
+        let attempts = match redelivery.lock() {
+            Ok(slot) => match slot.as_ref() {
+                Some((handed_back, times)) if *handed_back == key => times.saturating_add(1),
+                _ => 1,
+            },
+            Err(_) => 1,
+        };
         Self {
             consumer,
             topic,
             partition: borrowed.partition(),
             offset: borrowed.offset(),
             message,
+            attempts,
+            redelivery,
         }
     }
 
@@ -253,11 +289,24 @@ impl ReceivedMessage for KafkaReceived {
         &self.message
     }
 
+    fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
     async fn ack(self) -> Result<(), TransportError> {
         self.commit_offset()
     }
 
-    async fn nack(self, _reason: &str) -> Result<(), TransportError> {
+    async fn nack(self, delay: Duration) -> Result<(), TransportError> {
+        if let Ok(mut slot) = self.redelivery.lock() {
+            *slot = Some((
+                (self.topic.clone(), self.partition, self.offset),
+                self.attempts,
+            ));
+        }
+        // A partition cannot deliver a later record first, so the delay is
+        // spent here, holding the position.
+        tokio::time::sleep(delay).await;
         // Do not commit; seek back so this record is re-read (redelivery).
         //
         // `seek` blocks the calling thread until it takes effect (up to the
@@ -280,15 +329,5 @@ impl ReceivedMessage for KafkaReceived {
         .await
         .map_err(|err| retryable("kafka seek task", err))?
         .map_err(|err| retryable("kafka seek", err))
-    }
-
-    async fn dead_letter(self, _reason: &str) -> Result<(), TransportError> {
-        // Skip the poison record by committing past it. A DLQ-topic producer is a
-        // follow-up.
-        self.commit_offset()
-    }
-
-    async fn park(self, _reason: &str) -> Result<(), TransportError> {
-        self.commit_offset()
     }
 }

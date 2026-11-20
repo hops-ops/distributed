@@ -1444,8 +1444,8 @@ let service = Arc::new(build_service().named("order-api"));
 let bus = InMemoryBus::new();
 bus.send("place.bet", payload).await?;          // point-to-point command (1:1)
 bus.publish("seat.reserved", payload).await?;   // fan-out event (1:N)
-bus.listen(service.clone(), RunOptions::idempotent()).await?;     // competing
-bus.subscribe(service.clone(), RunOptions::idempotent()).await?;  // fan-out
+bus.listen(service.clone(), RunOptions::default()).await?;     // competing
+bus.subscribe(service.clone(), RunOptions::default()).await?;  // fan-out
 
 // Production: swap the one constructor line — send/listen/publish/subscribe
 // and the handlers are unchanged. A named Service supplies the consumer group.
@@ -1499,26 +1499,46 @@ in-process consume loop: `KnativeBus::manifests(&plan, &subscriptions)` renders 
 role-based `Broker` + per-name `Trigger` YAML, and the service mounts
 `cloud_events_router` so those Triggers reach `dispatch_message`.
 
-### Idempotency and Failure Policy
+### Running, retries and dead letters
 
-`RunOptions::idempotent()` enables idempotent dispatch by default. `RunOptions` also
-carries a `FailurePolicy` controlling what happens to a **permanent** handler
-failure — `Retry`, `DeadLetter`, `Park`, `LogAndAck`, or `Stop`:
+`RunOptions` decides how a consumer run behaves. The same options mean the
+same thing on every transport, because the runner applies them above the
+adapter.
 
 ```rust,ignore
-use distributed::bus::{FailurePolicy, RunOptions};
+use distributed::bus::{FailurePolicy, RunOptions, Shutdown};
 
+let shutdown = Shutdown::new();
 bus.listen(
     service.clone(),
-    RunOptions::idempotent().with_failure_policy(FailurePolicy::Stop),
+    RunOptions::until_shutdown(shutdown.clone())
+        .with_max_attempts(8)
+        .with_failure_policy(FailurePolicy::DeadLetter),
 ).await?;
+// elsewhere: shutdown.trigger();
 ```
 
-Retryable failures (e.g. transient `NotFound`) are nacked for redelivery; the runner
-never silently acks a handler error. NATS JetStream NAKs back off by delivery count
-(50 ms doubling to 5 s by default) so a repeatedly failing message cannot monopolize
-a consumer; retries stay unlimited. A deterministic, durably recorded rejection is a
-permanent error, not a retryable one.
+- **When a run ends.** `RunOptions::default()` and `until_shutdown(signal)`
+  keep consuming while the source is quiet. The run returns `Ok(())` only when
+  the signal is triggered, after settling the delivery in hand.
+  `RunOptions::until_idle()` returns as soon as nothing is available; it is for
+  tests and one-shot drains.
+- **Retries.** A retryable failure (for example a transient `NotFound`) is
+  redelivered after a backoff that doubles with each delivery (50 ms up to 5 s
+  by default; `with_backoff`). `with_max_attempts(n)` dead-letters a message
+  that still fails on its `n`th delivery. Without it retries are unlimited.
+- **Permanent failures** follow the `FailurePolicy`: `DeadLetter` (default),
+  `Retry`, `LogAndAck`, or `Stop`. A deterministic, durably recorded rejection
+  is a permanent error, not a retryable one.
+- **Dead letters.** The runner stores `{message, reason, consumer, attempts}`
+  and only then acknowledges the delivery. A bus stores dead letters by
+  publishing a `distributed.dead_letter` event to itself; `with_dead_letters`
+  names another `DeadLetterSink`. If the dead letter cannot be stored the
+  delivery is handed back and the run ends with an error.
+
+RabbitMQ reports only whether a delivery is a redelivery, so `max_attempts`
+above 2 never triggers there. Positional sources (Kafka, the SQL log) cannot
+deliver a later message first: they hold their position for the backoff.
 
 A service can place independent route bundles in named delivery lanes
 (`Service::lane(name, routes)`). Each lane keeps broker order and runs
@@ -1535,9 +1555,9 @@ in `bus` (no concrete broker dependency).
 | Type | Purpose |
 | --- | --- |
 | `TransportError` / `TransportErrorKind` | Retryable vs permanent — drives redelivery vs failure policy |
-| `FailurePolicy` / `FailureAction` | Permanent failure: `Retry`, `DeadLetter`, `Park`, `LogAndAck`, `Stop` |
-| `RunOptions` / `ConsumerDeliveryMode` | Idempotent dispatch by default; optional inbox hook |
-| `TransportCapabilities` | Per-transport durability, confirms, retry ownership, ack kind |
+| `FailurePolicy` / `FailureAction` | Permanent failure: `Retry`, `DeadLetter`, `LogAndAck`, `Stop` |
+| `RunOptions` | When a run ends, retry backoff, max attempts, dead-letter sink |
+| `DeadLetterSink` | Where a given-up message is stored before it is acknowledged |
 | `MessageSource` + `run_source` | Pull loop: dispatch then settle only after the handler finishes |
 | `MessagePublisher` + `OutboxDispatcher` | Publish threshold for outbox completion; claim → publish → complete |
 
@@ -1551,8 +1571,9 @@ in `bus` (no concrete broker dependency).
 ```rust,ignore
 use distributed::bus::{run_source, RunOptions};
 
-// Low-level receive loop (facade buses wrap this)
-run_source(service, source, RunOptions::idempotent()).await?;
+// Low-level receive loop (facade buses wrap this). A bare source has no
+// dead-letter sink; name one or choose another failure policy.
+run_source(service, source, RunOptions::default().with_dead_letters(sink)).await?;
 ```
 
 ## Command contracts

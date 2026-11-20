@@ -131,7 +131,9 @@ pub use service::{CausalCommandPublicStatus, CausalDispatchError, CausalDispatch
     feature = "rabbitmq",
     feature = "kafka",
 ))]
-pub use workers::{spawn_outbox_publish_loop, spawn_service_consumer_loop, CONSUMER_IDLE_POLL};
+pub use workers::{
+    spawn_outbox_publish_loop, spawn_service_consumer_loop, spawn_service_consumer_loop_until,
+};
 #[cfg(feature = "graphql")]
 pub(crate) mod wait_path;
 pub use session::{Session, ROLE_KEY, USER_ID_KEY};

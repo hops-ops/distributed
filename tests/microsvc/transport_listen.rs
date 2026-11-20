@@ -48,7 +48,7 @@ async fn dispatches_from_queue() {
     .expect("increment should enqueue");
 
     // Per-command queues drain in registration order (create before increment).
-    bus.listen(service.clone(), RunOptions::idempotent())
+    bus.listen(service.clone(), RunOptions::until_idle())
         .await
         .expect("listen should drain the command queues");
 
@@ -96,7 +96,7 @@ async fn tolerates_handler_failures_and_keeps_processing() {
     .await
     .expect("good increment should enqueue");
 
-    bus.listen(service.clone(), RunOptions::idempotent())
+    bus.listen(service.clone(), RunOptions::until_idle())
         .await
         .expect("listen should drain past the failed message");
 
@@ -122,7 +122,7 @@ async fn coexists_with_direct_dispatch() {
     bus.send_message(command("counter.initialize", "cmd-1", r#"{"id":"c1"}"#))
         .await
         .expect("create should enqueue");
-    bus.listen(service.clone(), RunOptions::idempotent())
+    bus.listen(service.clone(), RunOptions::until_idle())
         .await
         .expect("listen should drain c1's create");
 
@@ -156,7 +156,7 @@ async fn metadata_becomes_session() {
     // `whoami` succeeding proves the metadata became the session.
     bus.listen(
         service.clone(),
-        RunOptions::idempotent().with_failure_policy(FailurePolicy::Stop),
+        RunOptions::until_idle().with_failure_policy(FailurePolicy::Stop),
     )
     .await
     .expect("whoami should succeed because metadata became the session");
@@ -169,7 +169,7 @@ async fn metadata_becomes_session() {
     let result = bus
         .listen(
             service.clone(),
-            RunOptions::idempotent().with_failure_policy(FailurePolicy::Stop),
+            RunOptions::until_idle().with_failure_policy(FailurePolicy::Stop),
         )
         .await;
     assert!(
@@ -198,7 +198,7 @@ async fn multiple_services_on_different_queues() {
     bus.send_message(command("counter.initialize", "cmd-1", r#"{"id":"c1"}"#))
         .await
         .expect("create should enqueue");
-    bus.listen(service_a.clone(), RunOptions::idempotent())
+    bus.listen(service_a.clone(), RunOptions::until_idle())
         .await
         .expect("service A should drain the create queue");
 
@@ -209,7 +209,7 @@ async fn multiple_services_on_different_queues() {
     ))
     .await
     .expect("increment should enqueue");
-    bus.listen(service_b.clone(), RunOptions::idempotent())
+    bus.listen(service_b.clone(), RunOptions::until_idle())
         .await
         .expect("service B should drain the increment queue");
 

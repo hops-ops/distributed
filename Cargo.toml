@@ -62,7 +62,7 @@ redis = ["dep:redis", "dep:tokio", "leaderboard-background"]
 # task) without Redis, e.g. over `InMemoryLeaderboard`.
 leaderboard-background = ["dep:tokio"]
 workers-rs = ["dep:worker"]
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing", "dep:tracing-opentelemetry"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
 graphql = ["dep:async-graphql", "dep:async-graphql-axum", "dep:futures-channel", "dep:hmac", "dep:jsonwebtoken", "dep:subtle", "futures-util/sink", "http", "axum?/ws"]
 
 [dependencies]
@@ -100,7 +100,7 @@ tonic = { version = "0.14", default-features = false, features = ["router", "tra
 tonic-prost = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync"], optional = true }
-tracing = { version = "0.1", optional = true }
+tracing = "0.1"
 tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
 uuid = { version = "1", features = ["v7"] }
 url = { version = "2", optional = true }

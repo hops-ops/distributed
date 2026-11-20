@@ -10,10 +10,12 @@
 //! Requires the `rabbitmq` feature. Integration-tested in
 //! `tests/rabbitmq_transport` against a broker (see `compose.yaml`).
 
+use std::time::Duration;
+
 use lapin::message::Delivery;
 use lapin::options::{
-    BasicAckOptions, BasicGetOptions, BasicNackOptions, BasicPublishOptions, BasicRejectOptions,
-    ConfirmSelectOptions, QueueDeclareOptions,
+    BasicAckOptions, BasicGetOptions, BasicNackOptions, BasicPublishOptions, ConfirmSelectOptions,
+    QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldTable, ShortString};
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
@@ -116,10 +118,12 @@ impl MessagePublisher for RabbitPublisher {
 ///
 /// Polling is *sticky*: each `recv` starts at the queue that last yielded a
 /// message, so draining a busy queue costs one `basic_get` per message instead
-/// of re-polling every just-empty queue each time. A full empty cycle over all
-/// queues is still required before returning `Ok(None)`, preserving the
-/// drain-to-idle contract. (`basic_consume` with prefetch would push messages
-/// with no broker-side "drained" signal, so `basic_get` stays.)
+/// of re-polling every just-empty queue each time. `recv` reports nothing
+/// available after one empty cycle over all queues; an idle consumer then
+/// waits [`POLL_INTERVAL`] before the next cycle.
+/// How long an idle [`RabbitSource`] waits between polls.
+pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 pub struct RabbitSource {
     channel: Channel,
     queues: Vec<String>,
@@ -201,6 +205,10 @@ impl MessageSource for RabbitSource {
         }
         Ok(None)
     }
+
+    async fn ready(&mut self) {
+        tokio::time::sleep(POLL_INTERVAL).await
+    }
 }
 
 /// An AMQP delivery plus its settle handle.
@@ -244,6 +252,16 @@ impl ReceivedMessage for RabbitReceived {
         &self.message
     }
 
+    /// AMQP reports only whether a delivery is a redelivery, so this is 1 or
+    /// 2: a retry limit above 2 never triggers on RabbitMQ.
+    fn attempts(&self) -> u32 {
+        if self.delivery.redelivered {
+            2
+        } else {
+            1
+        }
+    }
+
     async fn ack(self) -> Result<(), TransportError> {
         let settled = self
             .delivery
@@ -253,8 +271,10 @@ impl ReceivedMessage for RabbitReceived {
         settle_result("amqp ack", settled)
     }
 
-    async fn nack(self, _reason: &str) -> Result<(), TransportError> {
-        // Requeue for redelivery.
+    async fn nack(self, delay: Duration) -> Result<(), TransportError> {
+        // The delivery stays unacknowledged for the delay, then is requeued.
+        // If this consumer dies first, the broker requeues it at once.
+        tokio::time::sleep(delay).await;
         let settled = self
             .delivery
             .nack(BasicNackOptions {
@@ -264,26 +284,6 @@ impl ReceivedMessage for RabbitReceived {
             .await
             .map_err(|err| retryable("amqp nack", err))?;
         settle_result("amqp nack", settled)
-    }
-
-    async fn dead_letter(self, _reason: &str) -> Result<(), TransportError> {
-        // Reject without requeue: routes to the queue's dead-letter exchange if
-        // one is configured, otherwise drops.
-        let settled = self
-            .delivery
-            .reject(BasicRejectOptions { requeue: false })
-            .await
-            .map_err(|err| retryable("amqp reject", err))?;
-        settle_result("amqp reject", settled)
-    }
-
-    async fn park(self, _reason: &str) -> Result<(), TransportError> {
-        let settled = self
-            .delivery
-            .reject(BasicRejectOptions { requeue: false })
-            .await
-            .map_err(|err| retryable("amqp reject", err))?;
-        settle_result("amqp reject", settled)
     }
 }
 

@@ -847,6 +847,7 @@ dependencies = [
  "tokio",
  "tonic-build",
  "tower",
+ "tracing",
  "url",
  "uuid",
  "worker",

@@ -288,7 +288,7 @@ async fn explicit_modeled_projector_handler_applies_the_compiled_projection() {
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     assert!(invoked.load(Ordering::Acquire));
     let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
@@ -449,7 +449,7 @@ async fn the_same_catalog_program_executes_in_a_separate_projector_service() {
         .await
         .unwrap();
     projector_service
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .unwrap();
 
@@ -547,7 +547,7 @@ async fn generated_mount_applies_both_modeled_rows_through_one_causal_commit() {
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
     let primary = repository
@@ -617,7 +617,7 @@ async fn same_name_different_version_is_an_empty_unit_checkpoint_not_a_failure()
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
     let snapshot = repository
@@ -702,7 +702,7 @@ async fn public_builder_fans_one_fact_out_and_replays_partial_success_exactly() 
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
     assert_eq!(
         *calls.lock().unwrap(),
         vec!["primary", "secondary", "secondary"],
@@ -812,7 +812,7 @@ async fn service_fans_same_fact_out_across_projector_only_route_bundles() {
     bus.publish_message(fact_message("todo-2", "cross bundle"))
         .await
         .unwrap();
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     assert_eq!(INFERRED_PRIMARY_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
@@ -866,7 +866,7 @@ async fn malformed_ingress_emits_safe_handle_and_repair_restart_stays_terminal()
 
     let first = malformed_service(repository.clone(), Arc::clone(&invoked))
         .with_bus(bus.clone())
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect_err("malformed ingress must retain its exact position and stop");
     let first_handle = repair_handle(&first);
@@ -895,7 +895,7 @@ async fn malformed_ingress_emits_safe_handle_and_repair_restart_stays_terminal()
     );
     let second = repaired
         .with_bus(bus)
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect_err("unchanged malformed bytes must stop the repaired generation again");
     let second_handle = repair_handle(&second);
@@ -946,7 +946,7 @@ async fn unrecorded_permanent_projector_failure_retains_and_stops_under_drop_pol
         .unwrap();
 
         let error = service
-            .run(RunOptions::idempotent().with_failure_policy(policy))
+            .run(RunOptions::until_idle().with_failure_policy(policy))
             .await
             .expect_err("unrecorded permanent projector failure must stop the runner");
         assert!(error.is_permanent());

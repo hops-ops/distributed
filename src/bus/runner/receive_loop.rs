@@ -1,62 +1,50 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
-use std::pin::Pin;
+use std::pin::{pin, Pin};
 use std::sync::Arc;
 use std::task::Poll;
+use std::time::Duration;
 
+use futures_util::future::{select, Either};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use crate::bus::source::{MessageSource, ReceivedMessage};
-use crate::bus::{FailureAction, MessageRouter, RunOptions, TransportError, TransportErrorKind};
-use crate::bus::{Message, MessageKind, OrderedDelivery};
+use crate::bus::{DeadLetter, FailureAction, MessageRouter, RunOptions, RunUntil};
+use crate::bus::{Message, MessageKind, OrderedDelivery, TransportError, TransportErrorKind};
 
-/// Run the receive loop for a direct transport source.
+/// Consume `source` with `router` until [`RunOptions::until`] says to stop.
 ///
-/// For each message the runner:
+/// For each delivery the runner dispatches to the router and then settles:
 ///
-/// 1. enforces the inbox stable-id contract (a no-op in idempotent mode);
-/// 2. dispatches through [`MessageRouter::dispatch`];
-/// 3. on success, acknowledges via the adapter;
-/// 4. on failure, routes through [`RunOptions::failure_policy`] — retryable
-///    failures are nacked for redelivery, permanent failures take the configured
-///    action ([dead-letter](FailureAction::DeadLetter), [park](FailureAction::Park),
-///    [log-and-ack](FailureAction::LogAndAck), or [stop](FailureAction::Stop)).
+/// - success, or a message the router has no handler for: acknowledge;
+/// - a retryable failure: redeliver after [`RunOptions::backoff`], or
+///   dead-letter once [`RunOptions::max_attempts`] deliveries have failed;
+/// - a permanent failure, including a delivery the transport could not
+///   decode: [`RunOptions::failure_policy`].
 ///
-/// A message with no registered handler is **intentionally ignored**: the runner
-/// acks it and moves on rather than dead-lettering it. Fan-out event transports
-/// may deliver events this service does not consume, and acking matches
-/// `microsvc::subscribe`; production transports should use
-/// [`MessageRouter::subscription_plan`] to avoid delivering unrelated messages at all.
+/// Dead-lettering stores the message in [`RunOptions::dead_letters`] and then
+/// acknowledges the delivery. If there is no sink, or the sink fails, the
+/// delivery is handed back to the transport and the run ends with an error:
+/// a message is never acknowledged without being handled or stored.
 ///
-/// The runner **acks only after handler effects have completed**, never before.
-/// It stops gracefully when the source returns `Ok(None)`, having fully settled
-/// the in-flight message first. Receive and settle errors are propagated, not
-/// swallowed: a returned `Err` ends the run and the supervisor may restart it
-/// (already-committed effects make redelivery safe).
+/// The run returns `Ok(())` when its shutdown signal is triggered (after
+/// settling the delivery in hand) or, with [`RunUntil::Idle`], when the source
+/// has nothing to deliver. A receive or settle error ends the run with that
+/// error; effects already committed make the redelivery safe.
 ///
 /// When the router declares several [delivery lanes](MessageRouter::delivery_lanes)
 /// and the source [settles independently](MessageSource::settles_independently),
 /// lanes run concurrently while each keeps receive order, and a delivery is
-/// settled once every lane that received it has finished. The number of
-/// unsettled deliveries is bounded by [`RunOptions::lane_window`]. See
-/// `docs/consumer-delivery-lanes.md`. Otherwise every message runs all of its
-/// routes before the next message is received.
-///
-/// Inbox note: until the consumer-inbox subtask lands, inbox mode enforces the
-/// stable-id requirement and then dispatches like idempotent mode. The
-/// receipt-commit wrapping that makes it effectively-once is added there.
-///
-/// `I: Send` keeps the returned future `Send` so the runner can be spawned on a
-/// multi-threaded executor regardless of the inbox hook type.
-pub async fn run_source<R, S, I>(
+/// settled once every lane that received it has finished. See
+/// `docs/consumer-delivery-lanes.md`.
+pub async fn run_source<R, S>(
     router: Arc<R>,
     source: S,
-    options: RunOptions<I>,
+    options: RunOptions,
 ) -> Result<(), TransportError>
 where
     R: MessageRouter,
     S: MessageSource,
-    I: Send,
 {
     if router.delivery_lanes() > 1 && source.settles_independently() {
         return LaneRun::new(router, source, options).run().await;
@@ -64,116 +52,77 @@ where
     run_sequential(router, source, options).await
 }
 
-async fn run_sequential<R, S, I>(
+async fn run_sequential<R, S>(
     router: Arc<R>,
     mut source: S,
-    options: RunOptions<I>,
+    options: RunOptions,
 ) -> Result<(), TransportError>
 where
     R: MessageRouter,
     S: MessageSource,
-    I: Send,
 {
     let service = router.consumer_group();
     let transport = source.transport_name();
 
-    loop {
-        let Some(received) = recv_next(&mut source, service, transport).await? else {
-            break;
-        };
-        if received.decode_error().is_some() {
-            settle_permanent_decode(service, transport, &options, received).await?;
-            continue;
-        }
-        if !router.handles(received.message().kind, received.message().name()) {
+    while let Some(received) =
+        next_delivery(&mut source, &options.until, service, transport).await?
+    {
+        let result = if let Some(error) = received.decode_error() {
+            Err(TransportError::new(error.kind(), error.message()))
+        } else if !router.handles(received.message().kind, received.message().name()) {
             settle_ignored(service, transport, received).await?;
             continue;
-        }
-        let kind = received.message().kind;
-        let result = dispatch(
-            router.as_ref(),
-            &options,
-            received.message(),
-            received.ordered_delivery(),
-        )
-        .await;
-        settle_result(service, transport, &options, received, kind, result).await?;
+        } else {
+            dispatch(
+                router.as_ref(),
+                received.message(),
+                received.ordered_delivery(),
+            )
+            .await
+        };
+        settle_result(service, transport, &options, received, result).await?;
     }
     Ok(())
 }
 
-/// A delivery the transport could not decode is a permanent failure: it
-/// carries no valid message to dispatch, and it must NOT be treated as an
-/// empty message (which would route to ack-and-ignore and silently drop a
-/// corrupt row). Route it through the failure policy directly, the same as a
-/// permanent dispatch failure, so it is dead-lettered/parked.
-async fn settle_permanent_decode<M: ReceivedMessage, I>(
+/// The next delivery, or `None` when the run should end.
+async fn next_delivery<S: MessageSource>(
+    source: &mut S,
+    until: &RunUntil,
     service: Option<&str>,
     transport: &str,
-    options: &RunOptions<I>,
-    received: M,
-) -> Result<(), TransportError> {
-    let Some(error) = received.decode_error() else {
-        return Ok(());
+) -> Result<Option<S::Received>, TransportError> {
+    let recv_error = |error: TransportError| {
+        record_transport_failure(
+            service,
+            transport,
+            error.kind(),
+            crate::telemetry::failure_action::RECV_ERROR,
+        );
+        error
     };
-    let action = options.failure_policy.resolve(error);
-    record_transport_failure(service, transport, error.kind(), action);
-    let kind = received.message().kind;
-    let reason = error.to_string();
-    match action {
-        FailureAction::Nack => {
-            settle_and_record(
-                service,
-                transport,
-                kind,
-                crate::telemetry::transport_outcome::NACK,
-                crate::telemetry::transport_outcome::NACK,
-                || received.nack(&reason),
-            )
-            .await
+    let shutdown = match until {
+        RunUntil::Idle => return source.recv().await.map_err(recv_error),
+        RunUntil::Shutdown(shutdown) => shutdown,
+    };
+    loop {
+        if shutdown.is_triggered() {
+            return Ok(None);
         }
-        FailureAction::DeadLetter => {
-            settle_and_record(
-                service,
-                transport,
-                kind,
-                crate::telemetry::transport_outcome::DEAD_LETTER,
-                crate::telemetry::transport_outcome::DEAD_LETTER,
-                || received.dead_letter(&reason),
-            )
-            .await
+        match select(pin!(source.recv()), shutdown.triggered()).await {
+            Either::Left((Ok(Some(received)), _)) => return Ok(Some(received)),
+            Either::Left((Ok(None), _)) => {}
+            Either::Left((Err(error), _)) => return Err(recv_error(error)),
+            Either::Right(_) => return Ok(None),
         }
-        FailureAction::Park => {
-            settle_and_record(
-                service,
-                transport,
-                kind,
-                crate::telemetry::transport_outcome::PARK,
-                crate::telemetry::transport_outcome::PARK,
-                || received.park(&reason),
-            )
-            .await
+        if let Either::Right(_) = select(pin!(source.ready()), shutdown.triggered()).await {
+            return Ok(None);
         }
-        FailureAction::LogAndAck => {
-            eprintln!(
-                "[bus::runner] dropping undecodable message after permanent failure: {reason}"
-            );
-            settle_and_record(
-                service,
-                transport,
-                kind,
-                crate::telemetry::transport_outcome::ACK,
-                crate::telemetry::transport_outcome::LOG_AND_ACK,
-                || received.ack(),
-            )
-            .await
-        }
-        FailureAction::Stop => Err(TransportError::permanent(reason)),
     }
 }
 
-/// No handler for this message: intentionally ignore (ack) rather than
-/// dead-letter, so unrelated fan-out events don't pile into the DLQ.
+/// No handler for this message: acknowledge it. A fan-out transport may
+/// deliver events this consumer does not handle, and those are not failures.
 async fn settle_ignored<M: ReceivedMessage>(
     service: Option<&str>,
     transport: &str,
@@ -191,115 +140,83 @@ async fn settle_ignored<M: ReceivedMessage>(
     .await
 }
 
-/// Settle one dispatched delivery exactly as the sequential runner always has.
+/// Settle one delivery according to how handling it went.
 ///
-/// Returns `Err` when the run must end: a retain-and-stop failure (after NAKing
-/// the exact delivery), a `Stop` policy (without settling), or a settle error.
-async fn settle_result<M: ReceivedMessage, I>(
+/// Returns `Err` when the run must end.
+async fn settle_result<M: ReceivedMessage>(
     service: Option<&str>,
     transport: &str,
-    options: &RunOptions<I>,
+    options: &RunOptions,
     received: M,
-    kind: MessageKind,
     result: Result<(), TransportError>,
 ) -> Result<(), TransportError> {
-    match result {
+    use crate::telemetry::transport_outcome::{ACK, DEAD_LETTER, LOG_AND_ACK, NACK};
+
+    let kind = received.message().kind;
+    let error = match result {
         Ok(()) => {
-            settle_and_record(
-                service,
-                transport,
-                kind,
-                crate::telemetry::transport_outcome::ACK,
-                crate::telemetry::transport_outcome::ACK,
-                || received.ack(),
-            )
+            return settle_and_record(service, transport, kind, ACK, ACK, || received.ack()).await
+        }
+        Err(error) => error,
+    };
+    let hand_back = |received: M| {
+        settle_and_record(service, transport, kind, NACK, NACK, || {
+            received.nack(Duration::ZERO)
+        })
+    };
+    if error.should_retain_and_stop() {
+        record_transport_failure(service, transport, error.kind(), NACK);
+        hand_back(received).await?;
+        return Err(error);
+    }
+    let attempts = received.attempts();
+    let action = options
+        .failure_policy
+        .resolve(&error, attempts, options.max_attempts);
+    record_transport_failure(service, transport, error.kind(), action);
+    match action {
+        FailureAction::Nack => {
+            let delay = options.backoff.delay(attempts);
+            settle_and_record(service, transport, kind, NACK, NACK, || {
+                received.nack(delay)
+            })
             .await
         }
-        Err(error) if error.should_retain_and_stop() => {
-            record_transport_failure(
-                service,
-                transport,
-                error.kind(),
-                crate::telemetry::transport_outcome::NACK,
-            );
-            let reason = error.to_string();
-            settle_and_record(
-                service,
-                transport,
-                kind,
-                crate::telemetry::transport_outcome::NACK,
-                crate::telemetry::transport_outcome::NACK,
-                || received.nack(&reason),
-            )
-            .await?;
-            Err(error)
+        FailureAction::DeadLetter => {
+            let Some(sink) = options.dead_letters.as_deref() else {
+                hand_back(received).await?;
+                return Err(TransportError::permanent(format!(
+                    "no dead-letter sink is configured for a failed message: {error}"
+                )));
+            };
+            let dead = DeadLetter {
+                message: received.message().clone(),
+                reason: error.to_string(),
+                consumer: service.unwrap_or_default().to_owned(),
+                attempts,
+            };
+            if let Err(sink_error) = sink.dead_letter(dead).await {
+                hand_back(received).await?;
+                return Err(sink_error);
+            }
+            settle_and_record(service, transport, kind, ACK, DEAD_LETTER, || {
+                received.ack()
+            })
+            .await
         }
-        Err(error) => match options.failure_policy.resolve(&error) {
-            action @ FailureAction::Nack => {
-                record_transport_failure(service, transport, error.kind(), action);
-                let reason = error.to_string();
-                settle_and_record(
-                    service,
-                    transport,
-                    kind,
-                    crate::telemetry::transport_outcome::NACK,
-                    crate::telemetry::transport_outcome::NACK,
-                    || received.nack(&reason),
-                )
-                .await
-            }
-            action @ FailureAction::DeadLetter => {
-                record_transport_failure(service, transport, error.kind(), action);
-                let reason = error.to_string();
-                settle_and_record(
-                    service,
-                    transport,
-                    kind,
-                    crate::telemetry::transport_outcome::DEAD_LETTER,
-                    crate::telemetry::transport_outcome::DEAD_LETTER,
-                    || received.dead_letter(&reason),
-                )
-                .await
-            }
-            action @ FailureAction::Park => {
-                record_transport_failure(service, transport, error.kind(), action);
-                let reason = error.to_string();
-                settle_and_record(
-                    service,
-                    transport,
-                    kind,
-                    crate::telemetry::transport_outcome::PARK,
-                    crate::telemetry::transport_outcome::PARK,
-                    || received.park(&reason),
-                )
-                .await
-            }
-            FailureAction::LogAndAck => {
-                record_transport_failure(
-                    service,
-                    transport,
-                    error.kind(),
-                    FailureAction::LogAndAck,
-                );
-                eprintln!(
-                    "[bus::runner] dropping message '{}' after permanent failure: {error}",
-                    received.message().name()
-                );
-                settle_and_record(
-                    service,
-                    transport,
-                    kind,
-                    crate::telemetry::transport_outcome::ACK,
-                    crate::telemetry::transport_outcome::LOG_AND_ACK,
-                    || received.ack(),
-                )
-                .await
-            }
-            FailureAction::Stop => {
-                record_transport_failure(service, transport, error.kind(), FailureAction::Stop);
-                Err(error)
-            }
-        },
+        FailureAction::LogAndAck => {
+            tracing::warn!(
+                message = received.message().name(),
+                consumer = service.unwrap_or_default(),
+                %error,
+                "dropping a message after a permanent failure"
+            );
+            settle_and_record(service, transport, kind, ACK, LOG_AND_ACK, || {
+                received.ack()
+            })
+            .await
+        }
+        FailureAction::Stop => Err(error),
     }
 }
 
@@ -317,7 +234,6 @@ struct InFlight<M> {
     received: M,
     message: Arc<Message>,
     ordered: Option<OrderedDelivery>,
-    kind: MessageKind,
     remaining: usize,
     stop: Option<TransportError>,
     retryable: Option<TransportError>,
@@ -330,9 +246,9 @@ enum Step<S: MessageSource> {
 }
 
 /// Concurrent lanes over one ordered source. See `docs/consumer-delivery-lanes.md`.
-struct LaneRun<'r, R, S: MessageSource + 'r, I> {
+struct LaneRun<'r, R, S: MessageSource + 'r> {
     router: Arc<R>,
-    options: RunOptions<I>,
+    options: RunOptions,
     transport: &'static str,
     source: Option<S>,
     receiving: Option<RecvFuture<'r, S>>,
@@ -347,13 +263,12 @@ struct LaneRun<'r, R, S: MessageSource + 'r, I> {
     stop_error: Option<TransportError>,
 }
 
-impl<'r, R, S, I> LaneRun<'r, R, S, I>
+impl<'r, R, S> LaneRun<'r, R, S>
 where
     R: MessageRouter + 'r,
     S: MessageSource + 'r,
-    I: Send,
 {
-    fn new(router: Arc<R>, source: S, options: RunOptions<I>) -> Self {
+    fn new(router: Arc<R>, source: S, options: RunOptions) -> Self {
         let lanes = router.delivery_lanes().min(crate::bus::LaneSet::MAX_LANES);
         let transport = source.transport_name();
         Self {
@@ -389,8 +304,12 @@ where
                 && self.in_flight.len() < self.options.lane_window.max(1)
             {
                 if let Some(mut source) = self.source.take() {
+                    let until = self.options.until.clone();
+                    let service = self.service();
+                    let transport = self.transport;
                     self.receiving = Some(Box::pin(async move {
-                        let result = source.recv().await;
+                        let result =
+                            next_delivery(&mut source, &until, service.as_deref(), transport).await;
                         (source, result)
                     }));
                 }
@@ -473,40 +392,22 @@ where
                 return;
             }
             Err(error) => {
-                record_transport_failure(
-                    service,
-                    self.transport,
-                    error.kind(),
-                    crate::telemetry::failure_action::RECV_ERROR,
-                );
                 self.source_finished = Some(Err(error));
                 return;
             }
         };
-        if received.decode_error().is_some() {
+        if let Some(error) = received.decode_error() {
+            let error = TransportError::new(error.kind(), error.message());
             let outcome =
-                settle_permanent_decode(service, self.transport, &self.options, received).await;
+                settle_result(service, self.transport, &self.options, received, Err(error)).await;
             self.record_stop(outcome);
             return;
         }
-        let kind = received.message().kind;
-        let lanes = self.router.lanes_for(kind, received.message().name());
+        let lanes = self
+            .router
+            .lanes_for(received.message().kind, received.message().name());
         if lanes.is_empty() {
             let outcome = settle_ignored(service, self.transport, received).await;
-            self.record_stop(outcome);
-            return;
-        }
-        if let Err(error) = self.options.validate_message_id(received.message()) {
-            let error = TransportError::permanent(error.to_string()).with_source(error);
-            let outcome = settle_result(
-                service,
-                self.transport,
-                &self.options,
-                received,
-                kind,
-                Err(error),
-            )
-            .await;
             self.record_stop(outcome);
             return;
         }
@@ -526,7 +427,6 @@ where
                 received,
                 message,
                 ordered,
-                kind,
                 remaining,
                 stop: None,
                 retryable: None,
@@ -546,9 +446,9 @@ where
         lane: usize,
         result: Result<(), TransportError>,
     ) {
-        let stops = |error: &TransportError, options: &RunOptions<I>| {
+        let stops = |error: &TransportError, options: &RunOptions| {
             error.should_retain_and_stop()
-                || options.failure_policy.resolve(error) == FailureAction::Stop
+                || options.failure_policy.resolve(error, 1, None) == FailureAction::Stop
         };
         let Some(entry) = self.in_flight.get_mut(&sequence) else {
             return;
@@ -583,7 +483,6 @@ where
             self.transport,
             &self.options,
             entry.received,
-            entry.kind,
             error.map_or(Ok(()), Err),
         )
         .await;
@@ -653,35 +552,10 @@ where
     }
 }
 
-async fn recv_next<S: MessageSource>(
-    source: &mut S,
-    service: Option<&str>,
-    transport: &str,
-) -> Result<Option<S::Received>, TransportError> {
-    match source.recv().await {
-        Ok(received) => Ok(received),
-        Err(error) => {
-            record_transport_failure(
-                service,
-                transport,
-                error.kind(),
-                crate::telemetry::failure_action::RECV_ERROR,
-            );
-            Err(error)
-        }
-    }
-}
-
-/// Run consumer execution for one message and classify the outcome.
-///
-/// Enforces the inbox stable-id contract first (idempotent mode yields no key
-/// and skips it), then dispatches. A failed stable-id check is a permanent
-/// failure — redelivery cannot supply a missing or malformed id.
-async fn dispatch<R: MessageRouter, I>(
+async fn dispatch<R: MessageRouter>(
     router: &R,
-    options: &RunOptions<I>,
     message: &Message,
-    ordered: Option<&crate::bus::OrderedDelivery>,
+    ordered: Option<&OrderedDelivery>,
 ) -> Result<(), TransportError> {
     #[cfg(feature = "otel")]
     {
@@ -692,21 +566,14 @@ async fn dispatch<R: MessageRouter, I>(
             &span,
             &message.metadata,
         );
-        return async {
-            options
-                .validate_message_id(message)
-                .map_err(|err| TransportError::permanent(err.to_string()).with_source(err))?;
-            router.dispatch_ordered(message, ordered).await
-        }
-        .instrument(span)
-        .await;
+        return router
+            .dispatch_ordered(message, ordered)
+            .instrument(span)
+            .await;
     }
 
     #[cfg(not(feature = "otel"))]
     {
-        options
-            .validate_message_id(message)
-            .map_err(|err| TransportError::permanent(err.to_string()).with_source(err))?;
         router.dispatch_ordered(message, ordered).await
     }
 }

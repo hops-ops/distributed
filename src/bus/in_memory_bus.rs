@@ -7,20 +7,72 @@
 //! sees every event (fan-out) — the same log+offset shape the Postgres fan-out
 //! transport uses, in memory.
 //!
-//! It is intentionally simple (no durability, no redelivery on nack) — for tests
-//! and local development. Use a real transport for production reliability.
+//! It is intentionally simple (no durability; a nacked command is dropped, a
+//! nacked event is redelivered) — for tests and local development. Use a real transport for production reliability.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::poll_fn;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Poll, Waker};
+use std::time::Duration;
 
 use super::source::{MessageSource, ReceivedMessage};
-use super::{run_source, Bus, BusConsumer, MessageRouter, RunOptions, TransportError};
+use super::{
+    run_source, Bus, BusConsumer, MessageRouter, PublishDeadLetters, RunOptions, TransportError,
+};
 use super::{Message, OrderedDelivery};
 use crate::projection_protocol::{ProjectionEpoch, ProjectionSource};
 
 type Queues = Arc<Mutex<HashMap<String, VecDeque<Message>>>>;
 type Topics = Arc<Mutex<HashMap<String, Vec<Message>>>>;
 type TopicCursors = Arc<Mutex<HashMap<String, usize>>>;
+
+/// Counts everything that could make an empty source non-empty, and wakes the
+/// consumers waiting for it.
+#[derive(Default)]
+struct Arrivals {
+    count: AtomicU64,
+    waiting: Mutex<Vec<Waker>>,
+}
+
+impl Arrivals {
+    fn seen(&self) -> u64 {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    fn notify(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+        let waiting = match self.waiting.lock() {
+            Ok(mut waiting) => std::mem::take(&mut *waiting),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        for waker in waiting {
+            waker.wake();
+        }
+    }
+
+    /// Resolves once something has arrived after `seen` was read.
+    async fn after(&self, seen: u64) {
+        poll_fn(|cx| {
+            if self.seen() != seen {
+                return Poll::Ready(());
+            }
+            let mut waiting = match self.waiting.lock() {
+                Ok(waiting) => waiting,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // `notify` counts before it takes the wakers, so an arrival
+            // between the check above and this lock is seen here.
+            if self.seen() != seen {
+                return Poll::Ready(());
+            }
+            waiting.push(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
+}
 
 fn lock_poisoned(what: &str) -> TransportError {
     TransportError::permanent(format!("in-memory bus {what} lock poisoned"))
@@ -34,6 +86,7 @@ fn lock_poisoned(what: &str) -> TransportError {
 pub struct InMemoryBus {
     queues: Queues,
     topics: Topics,
+    arrivals: Arc<Arrivals>,
     source_epoch: ProjectionEpoch,
 }
 
@@ -42,6 +95,7 @@ impl Default for InMemoryBus {
         Self {
             queues: Queues::default(),
             topics: Topics::default(),
+            arrivals: Arc::default(),
             source_epoch: ProjectionEpoch::new(format!("instance-{}", uuid::Uuid::now_v7()))
                 .expect("an in-memory bus UUID is a valid projection source epoch"),
         }
@@ -53,6 +107,11 @@ impl InMemoryBus {
         Self::default()
     }
 
+    /// Dead letters are published to this bus unless the run names a sink.
+    fn with_dead_letters(&self, options: RunOptions) -> RunOptions {
+        options.or_dead_letters(|| Arc::new(PublishDeadLetters(self.clone())))
+    }
+
     fn enqueue(&self, message: Message) -> Result<(), TransportError> {
         self.queues
             .lock()
@@ -60,6 +119,7 @@ impl InMemoryBus {
             .entry(message.name().to_string())
             .or_default()
             .push_back(message);
+        self.arrivals.notify();
         Ok(())
     }
 
@@ -79,6 +139,8 @@ impl InMemoryBus {
             .entry(message.name().to_string())
             .or_default()
             .push(message);
+        drop(topics);
+        self.arrivals.notify();
         Ok(())
     }
 
@@ -149,8 +211,10 @@ impl BusConsumer for InMemoryBus {
         let source = QueueSource {
             queues: self.queues.clone(),
             names,
+            arrivals: Arc::clone(&self.arrivals),
+            seen: 0,
         };
-        run_source(router, source, options).await
+        run_source(router, source, self.with_dead_letters(options)).await
     }
 
     async fn subscribe<R: MessageRouter>(
@@ -164,8 +228,10 @@ impl BusConsumer for InMemoryBus {
             names,
             cursors: TopicCursors::default(),
             source_epoch: self.source_epoch.clone(),
+            arrivals: Arc::clone(&self.arrivals),
+            seen: 0,
         };
-        run_source(router, source, options).await
+        run_source(router, source, self.with_dead_letters(options)).await
     }
 }
 
@@ -173,6 +239,8 @@ impl BusConsumer for InMemoryBus {
 struct QueueSource {
     queues: Queues,
     names: Vec<String>,
+    arrivals: Arc<Arrivals>,
+    seen: u64,
 }
 
 impl MessageSource for QueueSource {
@@ -182,7 +250,12 @@ impl MessageSource for QueueSource {
         "in_memory"
     }
 
+    async fn ready(&mut self) {
+        self.arrivals.after(self.seen).await
+    }
+
     async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
+        self.seen = self.arrivals.seen();
         let mut queues = self.queues.lock().map_err(|_| lock_poisoned("queue"))?;
         for name in &self.names {
             if let Some(message) = queues.get_mut(name).and_then(VecDeque::pop_front) {
@@ -204,6 +277,8 @@ struct TopicSource {
     names: Vec<String>,
     cursors: TopicCursors,
     source_epoch: ProjectionEpoch,
+    arrivals: Arc<Arrivals>,
+    seen: u64,
 }
 
 impl MessageSource for TopicSource {
@@ -213,7 +288,12 @@ impl MessageSource for TopicSource {
         "in_memory"
     }
 
+    async fn ready(&mut self) {
+        self.arrivals.after(self.seen).await
+    }
+
     async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
+        self.seen = self.arrivals.seen();
         let topics = self.topics.lock().map_err(|_| lock_poisoned("topic"))?;
         let mut cursors = self
             .cursors
@@ -240,6 +320,7 @@ impl MessageSource for TopicSource {
                     message,
                     ordered: Some(ordered),
                     topic_settlement: Some(TopicSettlement {
+                        arrivals: Arc::clone(&self.arrivals),
                         cursors: Arc::clone(&self.cursors),
                         name: name.clone(),
                         position: *cursor,
@@ -252,6 +333,7 @@ impl MessageSource for TopicSource {
 }
 
 struct TopicSettlement {
+    arrivals: Arc<Arrivals>,
     cursors: TopicCursors,
     name: String,
     position: usize,
@@ -279,9 +361,9 @@ impl TopicSettlement {
     }
 }
 
-/// In-memory delivery. Queue settlement remains a no-op because queue messages
-/// are popped on receive. Retained-topic cursors advance only on `ack`; `nack`
-/// leaves the exact gap-free position available for redelivery.
+/// In-memory delivery. A queue message is popped on receive, so settling it
+/// does nothing and a nacked command is dropped. A topic cursor advances only
+/// on `ack`; `nack` leaves the position to be delivered again at once.
 pub struct InMemoryReceived {
     message: Message,
     ordered: Option<OrderedDelivery>,
@@ -301,7 +383,10 @@ impl ReceivedMessage for InMemoryReceived {
             None => Ok(()),
         }
     }
-    async fn nack(self, _reason: &str) -> Result<(), TransportError> {
+    async fn nack(self, _delay: Duration) -> Result<(), TransportError> {
+        if let Some(settlement) = self.topic_settlement {
+            settlement.arrivals.notify();
+        }
         Ok(())
     }
 }
@@ -365,7 +450,7 @@ mod tests {
             block_on(bus.send("work", b"{}".to_vec())).unwrap();
         }
         let rec = recorder();
-        block_on(bus.listen(command_service(rec.clone()), RunOptions::idempotent())).unwrap();
+        block_on(bus.listen(command_service(rec.clone()), RunOptions::until_idle())).unwrap();
         assert_eq!(
             rec.lock().unwrap().len(),
             3,
@@ -386,10 +471,14 @@ mod tests {
         let mut a = QueueSource {
             queues: bus.queues.clone(),
             names: vec!["work".to_string()],
+            arrivals: Arc::clone(&bus.arrivals),
+            seen: 0,
         };
         let mut b = QueueSource {
             queues: bus.queues.clone(),
             names: vec!["work".to_string()],
+            arrivals: Arc::clone(&bus.arrivals),
+            seen: 0,
         };
         let mut got = Vec::new();
         // Alternate; each pop removes the message (competing).
@@ -424,8 +513,8 @@ mod tests {
         // Two independent subscribers; each gets every event (own cursor).
         let a = recorder();
         let b = recorder();
-        block_on(bus.subscribe(event_service(a.clone()), RunOptions::idempotent())).unwrap();
-        block_on(bus.subscribe(event_service(b.clone()), RunOptions::idempotent())).unwrap();
+        block_on(bus.subscribe(event_service(a.clone()), RunOptions::until_idle())).unwrap();
+        block_on(bus.subscribe(event_service(b.clone()), RunOptions::until_idle())).unwrap();
         let mut a_ids = a.lock().unwrap().clone();
         let mut b_ids = b.lock().unwrap().clone();
         a_ids.sort();
@@ -448,13 +537,15 @@ mod tests {
             names: vec!["evt".into()],
             cursors: TopicCursors::default(),
             source_epoch: bus.source_epoch.clone(),
+            arrivals: Arc::clone(&bus.arrivals),
+            seen: 0,
         };
 
         let first = block_on(source.recv()).unwrap().unwrap();
         assert_eq!(first.message().id(), Some("e0"));
         assert_eq!(first.ordered_delivery().unwrap().position(), 0);
         assert!(first.ordered_delivery().unwrap().is_gap_free());
-        block_on(first.nack("transient")).unwrap();
+        block_on(first.nack(Duration::ZERO)).unwrap();
 
         let replay = block_on(source.recv()).unwrap().unwrap();
         assert_eq!(replay.message().id(), Some("e0"));
@@ -493,6 +584,8 @@ mod tests {
             names: vec!["evt".into()],
             cursors: TopicCursors::default(),
             source_epoch: bus.source_epoch.clone(),
+            arrivals: Arc::clone(&bus.arrivals),
+            seen: 0,
         };
         let received = block_on(source.recv()).unwrap().unwrap();
         assert_eq!(received.message().id(), Some("e0"));
@@ -540,7 +633,7 @@ mod tests {
         block_on(bus.send("unrelated", b"{}".to_vec())).unwrap();
         block_on(bus.send("work", b"{}".to_vec())).unwrap();
         let rec = recorder();
-        block_on(bus.listen(command_service(rec.clone()), RunOptions::idempotent())).unwrap();
+        block_on(bus.listen(command_service(rec.clone()), RunOptions::until_idle())).unwrap();
         assert_eq!(rec.lock().unwrap().clone(), vec!["work"]);
     }
 
@@ -555,6 +648,6 @@ mod tests {
         );
         // Default failure policy dead-letters the permanent failure; in-memory
         // dead_letter is a no-op nack, so the run completes cleanly.
-        block_on(bus.listen(handlers, RunOptions::idempotent())).unwrap();
+        block_on(bus.listen(handlers, RunOptions::until_idle())).unwrap();
     }
 }

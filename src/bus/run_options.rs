@@ -1,111 +1,122 @@
-//! Cross-cutting execution options for the async transport runner.
+//! How a consumer run behaves: when it ends and what it does with failures.
 //!
-//! [`RunOptions`] owns the policy that wraps `Service::dispatch_message`:
-//! whether consumer execution is plain idempotent dispatch or wrapped by a
-//! future consumer inbox, and what to do with permanent failures. Transports
-//! stay free of this policy — they only obey the rule "acknowledge after the
-//! runner reports success."
+//! These decisions are made by the runner, above the transport. An adapter
+//! only receives, acknowledges, and redelivers after a delay.
 
-use super::stable_id::{validate_stable_message_id, StableMessageIdError};
-use super::{FailurePolicy, Message};
+use std::sync::Arc;
+use std::time::Duration;
 
-/// Placeholder shape for the future consumer inbox hook.
-///
-/// A consumer inbox (see `specs/consumer-inbox-design`) wraps handler execution
-/// so a message receipt commits atomically with the handler's side effects,
-/// giving effectively-once local database effects on top of at-least-once
-/// delivery. This slice only defines the *shape* of that hook so [`RunOptions`]
-/// can carry one; the storage model and execution wrapper land with the inbox
-/// subtask.
-///
-/// Every inbox scopes receipts by a consumer identity, which is the one piece
-/// of contract that is already settled, so it is the only method defined here.
-/// The trait is provisional: the inbox subtask is expected to add the
-/// (asynchronous) execution-wrapping method, so external implementors should
-/// expect it to grow rather than treat this shape as final.
-pub trait InboxHook {
-    /// The stable consumer name receipts are scoped to.
-    fn consumer_name(&self) -> &str;
+use super::{DeadLetterSink, FailurePolicy, Shutdown};
+
+/// Default first redelivery delay; it doubles with each delivery.
+pub const DEFAULT_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(50);
+/// Default ceiling for a redelivery delay.
+pub const DEFAULT_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// Default bound on unsettled deliveries for a multi-lane run.
+pub const DEFAULT_LANE_WINDOW: usize = 16;
+
+/// The delay before a failed delivery is redelivered:
+/// `base * 2^(attempt - 1)`, capped at `max`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryBackoff {
+    base: Duration,
+    max: Duration,
 }
 
-/// How the runner executes consumers for a run.
-///
-/// Defaults to [`ConsumerDeliveryMode::Idempotent`]: the convention is
-/// idempotent handlers/projections, so a redelivered message is safe.
-#[derive(Clone)]
-pub enum ConsumerDeliveryMode<I> {
-    /// Dispatch directly and acknowledge after handler success. Handlers are
-    /// expected to be idempotent under redelivery.
-    Idempotent,
-    /// Wrap dispatch with a consumer inbox; acknowledge only after the inbox
-    /// receipt and handler side effects commit together. Requires a stable
-    /// message id (see [`RunOptions::validate_message_id`]).
-    Inbox(I),
-}
+impl RetryBackoff {
+    /// Backoff starting at `base` and capped at `max` (at least `base`).
+    pub fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max: max.max(base),
+        }
+    }
 
-// A `#[derive(Default)]` would add an `I: Default` bound, which would forbid
-// `ConsumerDeliveryMode<NoInbox>` (NoInbox is uninhabited). The default variant
-// carries no `I`, so the bound is spurious — implement it by hand instead.
-#[allow(clippy::derivable_impls)]
-impl<I> Default for ConsumerDeliveryMode<I> {
-    fn default() -> Self {
-        ConsumerDeliveryMode::Idempotent
+    /// Redeliver at once. A failing dependency then gets a tight retry loop;
+    /// use it only in tests.
+    pub fn immediate() -> Self {
+        Self::new(Duration::ZERO, Duration::ZERO)
+    }
+
+    /// The delay after the `attempt`th delivery (1-based) failed.
+    pub fn delay(&self, attempt: u32) -> Duration {
+        let doublings = attempt.saturating_sub(1).min(30);
+        self.base
+            .checked_mul(1u32 << doublings)
+            .unwrap_or(self.max)
+            .min(self.max)
     }
 }
 
-/// Uninhabited marker for run options that carry no inbox hook.
-///
-/// Because it can never be constructed, a `RunOptions<NoInbox>` is statically
-/// guaranteed to be in idempotent mode — which is exactly the default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NoInbox {}
+impl Default for RetryBackoff {
+    fn default() -> Self {
+        Self::new(DEFAULT_RETRY_BACKOFF_BASE, DEFAULT_RETRY_BACKOFF_MAX)
+    }
+}
 
-/// Cross-cutting execution policy for a transport run.
-///
-/// Generic over the inbox hook type `I`, defaulting to [`NoInbox`] for the
-/// common idempotent case.
+/// When a consumer run ends without an error.
+#[derive(Clone, Debug)]
+pub enum RunUntil {
+    /// Keep consuming until the signal is triggered. A quiet source is not a
+    /// reason to stop.
+    Shutdown(Shutdown),
+    /// Return as soon as the source has nothing to deliver. For tests and
+    /// one-shot drains.
+    Idle,
+}
+
+/// Policy for one consumer run.
 #[derive(Clone)]
-pub struct RunOptions<I = NoInbox> {
-    /// Whether consumer execution is plain idempotent dispatch or inbox-wrapped.
-    pub delivery_mode: ConsumerDeliveryMode<I>,
-    /// What the runner does with a permanent handler/transport failure.
+pub struct RunOptions {
+    /// When the run ends.
+    pub until: RunUntil,
+    /// What happens to a permanent failure.
     pub failure_policy: FailurePolicy,
+    /// Spacing of redeliveries.
+    pub backoff: RetryBackoff,
+    /// Deliveries after which a still-failing message is dead-lettered.
+    /// `None` retries without limit.
+    pub max_attempts: Option<u32>,
+    /// Where dead letters are stored. A bus fills this with its own sink when
+    /// it is `None`; a bare [`run_source`](super::run_source) with no sink ends
+    /// the run instead of dead-lettering.
+    pub dead_letters: Option<Arc<dyn DeadLetterSink>>,
     /// Maximum received-but-unsettled deliveries when a router runs several
     /// delivery lanes concurrently. Ignored for single-lane routers.
     pub lane_window: usize,
 }
 
-/// Default bound on unsettled deliveries for a multi-lane run.
-pub const DEFAULT_LANE_WINDOW: usize = 16;
-
-impl<I> Default for RunOptions<I> {
-    /// Idempotent delivery with the default [`FailurePolicy`].
+impl Default for RunOptions {
+    /// Run until the process ends, retry transient failures without limit with
+    /// the default backoff, and dead-letter permanent failures.
     fn default() -> Self {
         Self {
-            delivery_mode: ConsumerDeliveryMode::default(),
+            until: RunUntil::Shutdown(Shutdown::new()),
             failure_policy: FailurePolicy::default(),
+            backoff: RetryBackoff::default(),
+            max_attempts: None,
+            dead_letters: None,
             lane_window: DEFAULT_LANE_WINDOW,
         }
     }
 }
 
-impl RunOptions<NoInbox> {
-    /// Idempotent run options: direct dispatch, default failure policy, no
-    /// stable-id requirement.
-    pub fn idempotent() -> Self {
-        Self::default()
-    }
-}
-
-impl<I> RunOptions<I> {
-    /// Inbox-wrapped run options. Acknowledgement waits for the inbox receipt
-    /// and handler side effects to commit, and a stable message id becomes
-    /// required.
-    pub fn inbox(hook: I) -> Self {
+impl RunOptions {
+    /// Run until `shutdown` is triggered.
+    pub fn until_shutdown(shutdown: Shutdown) -> Self {
         Self {
-            delivery_mode: ConsumerDeliveryMode::Inbox(hook),
-            failure_policy: FailurePolicy::default(),
-            lane_window: DEFAULT_LANE_WINDOW,
+            until: RunUntil::Shutdown(shutdown),
+            ..Self::default()
+        }
+    }
+
+    /// Return as soon as the source has nothing to deliver, and redeliver a
+    /// failed message at once. For tests and one-shot drains.
+    pub fn until_idle() -> Self {
+        Self {
+            until: RunUntil::Idle,
+            backoff: RetryBackoff::immediate(),
+            ..Self::default()
         }
     }
 
@@ -115,133 +126,92 @@ impl<I> RunOptions<I> {
         self
     }
 
+    /// Override the redelivery spacing.
+    pub fn with_backoff(mut self, backoff: RetryBackoff) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    /// Dead-letter a message once it has been delivered `max_attempts` times
+    /// and still fails. Values below 1 are raised to 1.
+    pub fn with_max_attempts(mut self, max_attempts: u32) -> Self {
+        self.max_attempts = Some(max_attempts.max(1));
+        self
+    }
+
+    /// Store dead letters in `sink`.
+    pub fn with_dead_letters(mut self, sink: Arc<dyn DeadLetterSink>) -> Self {
+        self.dead_letters = Some(sink);
+        self
+    }
+
+    /// Store dead letters in `sink()` unless a sink is already set.
+    pub fn or_dead_letters(mut self, sink: impl FnOnce() -> Arc<dyn DeadLetterSink>) -> Self {
+        if self.dead_letters.is_none() {
+            self.dead_letters = Some(sink());
+        }
+        self
+    }
+
     /// Bound the received-but-unsettled deliveries of a multi-lane run.
     /// Values below 1 are raised to 1.
     pub fn with_lane_window(mut self, window: usize) -> Self {
         self.lane_window = window.max(1);
         self
     }
-
-    /// Whether this run dispatches directly without an inbox.
-    pub fn is_idempotent(&self) -> bool {
-        matches!(self.delivery_mode, ConsumerDeliveryMode::Idempotent)
-    }
-
-    /// Whether this run requires a stable message id. True in inbox mode,
-    /// because deduplication needs a durable key.
-    pub fn requires_stable_id(&self) -> bool {
-        matches!(self.delivery_mode, ConsumerDeliveryMode::Inbox(_))
-    }
-
-    /// Validate a message's id against this run's requirements, returning the
-    /// dedup key when one is required.
-    ///
-    /// Inbox runs enforce the [stable id rules](validate_stable_message_id) and
-    /// return `Ok(Some(id))` — the borrowed id the inbox should key its receipt
-    /// on, exactly as the transport delivered it. A failure here is a permanent
-    /// condition for the message: redelivery cannot supply a missing or
-    /// malformed id. Idempotent runs need no dedup key and return `Ok(None)`,
-    /// accepting any id including none.
-    pub fn validate_message_id<'m>(
-        &self,
-        message: &'m Message,
-    ) -> Result<Option<&'m str>, StableMessageIdError> {
-        if self.requires_stable_id() {
-            validate_stable_message_id(message.id()).map(Some)
-        } else {
-            Ok(None)
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::MessageKind;
 
-    struct FakeInbox {
-        consumer: &'static str,
-    }
-
-    impl InboxHook for FakeInbox {
-        fn consumer_name(&self) -> &str {
-            self.consumer
-        }
-    }
-
-    fn message_with_id(id: Option<&str>) -> Message {
-        let mut message = Message::new("seat.reserved", MessageKind::Event, b"{}".to_vec());
-        if let Some(id) = id {
-            message = message.with_id(id);
-        }
-        message
+    #[test]
+    fn backoff_doubles_from_base_and_stops_at_max() {
+        let backoff = RetryBackoff::new(Duration::from_millis(50), Duration::from_millis(300));
+        let delays = (1..=5).map(|attempt| backoff.delay(attempt).as_millis());
+        assert_eq!(delays.collect::<Vec<_>>(), [50, 100, 200, 300, 300]);
+        assert_eq!(backoff.delay(0), Duration::from_millis(50));
+        assert_eq!(backoff.delay(u32::MAX), Duration::from_millis(300));
+        assert_eq!(RetryBackoff::immediate().delay(9), Duration::ZERO);
+        // A max below base is raised to base rather than inverting the range.
+        let inverted = RetryBackoff::new(Duration::from_secs(2), Duration::from_secs(1));
+        assert_eq!(inverted.delay(4), Duration::from_secs(2));
     }
 
     #[test]
-    fn default_run_options_are_idempotent_with_default_policy() {
-        let options = RunOptions::<NoInbox>::default();
-        assert!(options.is_idempotent());
-        assert!(!options.requires_stable_id());
-        assert_eq!(options.failure_policy, FailurePolicy::default());
+    fn the_default_run_never_stops_on_its_own_and_never_gives_up_on_a_retry() {
+        let options = RunOptions::default();
+        assert!(matches!(&options.until, RunUntil::Shutdown(s) if !s.is_triggered()));
+        assert_eq!(options.max_attempts, None);
+        assert_eq!(options.failure_policy, FailurePolicy::DeadLetter);
+        assert!(options.dead_letters.is_none());
     }
 
     #[test]
-    fn idempotent_constructor_matches_default() {
-        let options = RunOptions::idempotent();
-        assert!(options.is_idempotent());
-        assert!(!options.requires_stable_id());
-    }
-
-    #[test]
-    fn inbox_mode_requires_a_stable_id_and_keeps_the_hook() {
-        let options = RunOptions::inbox(FakeInbox {
-            consumer: "seat-projection",
-        });
-        assert!(!options.is_idempotent());
-        assert!(options.requires_stable_id());
-        match &options.delivery_mode {
-            ConsumerDeliveryMode::Inbox(hook) => {
-                assert_eq!(hook.consumer_name(), "seat-projection")
-            }
-            ConsumerDeliveryMode::Idempotent => panic!("expected inbox mode"),
-        }
-    }
-
-    #[test]
-    fn with_failure_policy_overrides_the_default() {
-        let options = RunOptions::idempotent().with_failure_policy(FailurePolicy::Stop);
+    fn builders_set_what_they_name() {
+        let shutdown = Shutdown::new();
+        let options = RunOptions::until_shutdown(shutdown.clone())
+            .with_max_attempts(0)
+            .with_lane_window(0)
+            .with_failure_policy(FailurePolicy::Stop);
+        shutdown.trigger();
+        assert!(matches!(&options.until, RunUntil::Shutdown(s) if s.is_triggered()));
+        assert_eq!(options.max_attempts, Some(1));
+        assert_eq!(options.lane_window, 1);
         assert_eq!(options.failure_policy, FailurePolicy::Stop);
-    }
 
-    #[test]
-    fn idempotent_mode_needs_no_dedup_key() {
-        let options = RunOptions::idempotent();
-        // No key is required, so even a present id yields `Ok(None)`.
-        assert_eq!(
-            options.validate_message_id(&message_with_id(None)),
-            Ok(None)
-        );
-        assert_eq!(
-            options.validate_message_id(&message_with_id(Some("evt-1"))),
-            Ok(None)
-        );
-    }
+        let idle = RunOptions::until_idle();
+        assert!(matches!(idle.until, RunUntil::Idle));
+        assert_eq!(idle.backoff, RetryBackoff::immediate());
 
-    #[test]
-    fn inbox_mode_returns_the_validated_dedup_key() {
-        let options = RunOptions::inbox(FakeInbox { consumer: "c" });
-        assert_eq!(
-            options.validate_message_id(&message_with_id(None)),
-            Err(StableMessageIdError::Missing)
-        );
-        assert_eq!(
-            options.validate_message_id(&message_with_id(Some("  "))),
-            Err(StableMessageIdError::Empty)
-        );
-        // A valid id is returned for the inbox to key its receipt on.
-        assert_eq!(
-            options.validate_message_id(&message_with_id(Some("evt-1"))),
-            Ok(Some("evt-1"))
-        );
+        let first = Arc::new(crate::bus::InMemoryDeadLetters::new());
+        let kept = RunOptions::default()
+            .with_dead_letters(first.clone())
+            .or_dead_letters(|| unreachable!("a sink is already set"));
+        assert!(kept.dead_letters.is_some());
+        assert!(RunOptions::default()
+            .or_dead_letters(|| first)
+            .dead_letters
+            .is_some());
     }
 }

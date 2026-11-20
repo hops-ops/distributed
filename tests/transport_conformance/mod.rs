@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use distributed::bus::{
-    run_source, FailurePolicy, Handlers, MessagePublisher, MessageSource, ReceivedMessage,
-    RunOptions, TransportError,
+    run_source, Handlers, MessagePublisher, MessageSource, ReceivedMessage, RunOptions,
+    TransportError,
 };
 use distributed::microsvc::{Context, HandlerError, Message, MessageKind, Routes, Service};
 use distributed::OutboxDispatcher;
@@ -33,9 +33,7 @@ pub enum Event {
     /// A handler ran for the named message.
     Handled(String),
     Ack,
-    Nack(String),
-    DeadLetter(String),
-    Park(String),
+    Nack,
 }
 
 /// Ordered recorder shared by the service handlers and the fake transport.
@@ -60,17 +58,12 @@ impl Recorder {
 pub struct FakeReceived {
     message: Message,
     recorder: Arc<Recorder>,
-    settle_ok: bool,
 }
 
 impl FakeReceived {
     fn settle(self, event: Event) -> Result<(), TransportError> {
         self.recorder.push(event);
-        if self.settle_ok {
-            Ok(())
-        } else {
-            Err(TransportError::retryable("settle failed"))
-        }
+        Ok(())
     }
 }
 
@@ -81,14 +74,8 @@ impl ReceivedMessage for FakeReceived {
     async fn ack(self) -> Result<(), TransportError> {
         self.settle(Event::Ack)
     }
-    async fn nack(self, reason: &str) -> Result<(), TransportError> {
-        self.settle(Event::Nack(reason.to_string()))
-    }
-    async fn dead_letter(self, reason: &str) -> Result<(), TransportError> {
-        self.settle(Event::DeadLetter(reason.to_string()))
-    }
-    async fn park(self, reason: &str) -> Result<(), TransportError> {
-        self.settle(Event::Park(reason.to_string()))
+    async fn nack(self, _delay: std::time::Duration) -> Result<(), TransportError> {
+        self.settle(Event::Nack)
     }
 }
 
@@ -96,8 +83,6 @@ impl ReceivedMessage for FakeReceived {
 pub struct FakeSource {
     queue: VecDeque<Message>,
     recorder: Arc<Recorder>,
-    settle_ok: bool,
-    recv_error: bool,
 }
 
 impl FakeSource {
@@ -105,30 +90,16 @@ impl FakeSource {
         Self {
             queue: messages.into_iter().collect(),
             recorder,
-            settle_ok: true,
-            recv_error: false,
         }
-    }
-    pub fn with_settle_failure(mut self) -> Self {
-        self.settle_ok = false;
-        self
-    }
-    pub fn with_recv_error(mut self) -> Self {
-        self.recv_error = true;
-        self
     }
 }
 
 impl MessageSource for FakeSource {
     type Received = FakeReceived;
     async fn recv(&mut self) -> Result<Option<FakeReceived>, TransportError> {
-        if self.recv_error {
-            return Err(TransportError::retryable("recv failed"));
-        }
         Ok(self.queue.pop_front().map(|message| FakeReceived {
             message,
             recorder: self.recorder.clone(),
-            settle_ok: self.settle_ok,
         }))
     }
 }
@@ -211,139 +182,6 @@ pub fn event_message(name: &str, id: Option<&str>) -> Message {
     }
     message
 }
-
-fn recording_source(messages: Vec<Message>) -> (Arc<Recorder>, Arc<Service>, FakeSource) {
-    let recorder = Recorder::new();
-    let service = recording_service(&recorder);
-    let source = FakeSource::new(recorder.clone(), messages);
-    (recorder, service, source)
-}
-
-// =============================================================================
-// Source-runner contract
-// =============================================================================
-
-pub async fn source_dispatches_before_ack() {
-    let (recorder, service, source) =
-        recording_source(vec![event_message("delivery.succeeded", Some("m1"))]);
-    run_source(service, source, RunOptions::idempotent())
-        .await
-        .unwrap();
-    assert_eq!(
-        recorder.events(),
-        vec![Event::Handled("delivery.succeeded".into()), Event::Ack],
-        "handler must run before ack"
-    );
-}
-
-pub async fn source_retryable_failure_nacks_without_ack() {
-    let (recorder, service, source) =
-        recording_source(vec![event_message("delivery.retry_requested", Some("m1"))]);
-    run_source(service, source, RunOptions::idempotent())
-        .await
-        .unwrap();
-    let events = recorder.events();
-    assert_eq!(
-        events.first(),
-        Some(&Event::Handled("delivery.retry_requested".into()))
-    );
-    assert!(matches!(events.get(1), Some(Event::Nack(_))));
-    assert!(!events.contains(&Event::Ack));
-}
-
-pub async fn source_permanent_failure_dead_letters_by_default() {
-    let (recorder, service, source) = recording_source(vec![event_message(
-        "delivery.permanently_failed",
-        Some("m1"),
-    )]);
-    run_source(service, source, RunOptions::idempotent())
-        .await
-        .unwrap();
-    assert!(matches!(
-        recorder.events().get(1),
-        Some(Event::DeadLetter(_))
-    ));
-}
-
-pub async fn source_permanent_failure_stops_under_stop_policy() {
-    let (recorder, service, source) = recording_source(vec![
-        event_message("delivery.permanently_failed", Some("m1")),
-        event_message("delivery.succeeded", Some("m2")),
-    ]);
-    let outcome = run_source(
-        service,
-        source,
-        RunOptions::idempotent().with_failure_policy(FailurePolicy::Stop),
-    )
-    .await;
-    assert!(outcome.unwrap_err().is_permanent());
-    // Second message never processed; first was not settled.
-    assert_eq!(
-        recorder.events(),
-        vec![Event::Handled("delivery.permanently_failed".into())]
-    );
-}
-
-pub async fn source_unhandled_message_is_acked_and_ignored() {
-    let (recorder, service, source) =
-        recording_source(vec![event_message("unrelated", Some("m1"))]);
-    run_source(service, source, RunOptions::idempotent())
-        .await
-        .unwrap();
-    // Acked without dispatching or dead-lettering.
-    assert_eq!(recorder.events(), vec![Event::Ack]);
-}
-
-pub async fn source_inbox_mode_rejects_missing_stable_id() {
-    // No id on the message; inbox mode requires a stable id.
-    let (recorder, service, source) =
-        recording_source(vec![event_message("delivery.succeeded", None)]);
-    run_source(service, source, RunOptions::inbox(()))
-        .await
-        .unwrap();
-    let events = recorder.events();
-    // Handler never ran; the missing id is a permanent failure (dead-lettered).
-    assert!(!events.iter().any(|e| matches!(e, Event::Handled(_))));
-    assert!(matches!(events.first(), Some(Event::DeadLetter(_))));
-}
-
-pub async fn source_inbox_mode_dispatches_with_stable_id() {
-    let (recorder, service, source) =
-        recording_source(vec![event_message("delivery.succeeded", Some("m1"))]);
-    run_source(service, source, RunOptions::inbox(()))
-        .await
-        .unwrap();
-    assert_eq!(
-        recorder.events(),
-        vec![Event::Handled("delivery.succeeded".into()), Event::Ack]
-    );
-}
-
-pub async fn source_propagates_recv_errors() {
-    let (recorder, service, source) =
-        recording_source(vec![event_message("delivery.succeeded", Some("m1"))]);
-    let source = source.with_recv_error();
-    let outcome = run_source(service, source, RunOptions::idempotent()).await;
-    assert!(outcome.is_err(), "recv errors must not be swallowed");
-    assert!(recorder.events().is_empty());
-}
-
-pub async fn source_propagates_settle_errors() {
-    let (recorder, service, source) =
-        recording_source(vec![event_message("delivery.succeeded", Some("m1"))]);
-    let source = source.with_settle_failure();
-    let outcome = run_source(service, source, RunOptions::idempotent()).await;
-    assert!(outcome.is_err(), "settle errors must not be swallowed");
-    // The ack was attempted before the error surfaced.
-    assert_eq!(
-        recorder.events(),
-        vec![Event::Handled("delivery.succeeded".into()), Event::Ack]
-    );
-}
-
-// =============================================================================
-// Publisher / outbox dispatcher contract
-// =============================================================================
 
 async fn store_outbox(repo: &InMemoryRepository, id: &str) -> String {
     let message = OutboxMessage::create(id, "order.initialized", b"\x01".to_vec()).unwrap();
@@ -633,7 +471,7 @@ pub async fn publish_then_crash_republishes_and_consumer_inbox_dedupes() {
 
     let recorder = Recorder::new();
     let source = FakeSource::new(recorder.clone(), deliveries);
-    run_source(handlers, source, RunOptions::inbox(()))
+    run_source(handlers, source, RunOptions::until_idle())
         .await
         .expect("consumer drains both deliveries");
 
@@ -801,11 +639,11 @@ where
     let (ra, rb) = tokio::join!(
         bus_a.listen(
             recording_for(COMMAND_NAME, MessageKind::Command, rec.clone()),
-            RunOptions::idempotent()
+            RunOptions::until_idle()
         ),
         bus_b.listen(
             recording_for(COMMAND_NAME, MessageKind::Command, rec.clone()),
-            RunOptions::idempotent()
+            RunOptions::until_idle()
         ),
     );
     ra.expect("replica a drains");
@@ -836,7 +674,7 @@ where
         let rec = Arc::new(Mutex::new(Vec::new()));
         bus.subscribe(
             recording_for(EVENT_NAME, MessageKind::Event, rec.clone()),
-            RunOptions::idempotent(),
+            RunOptions::until_idle(),
         )
         .await
         .expect("subscriber drains");
@@ -871,7 +709,7 @@ where
                 MessageKind::Event,
                 rec.clone(),
             ),
-            RunOptions::idempotent(),
+            RunOptions::until_idle(),
         )
         .await
         .expect("subscriber drains");

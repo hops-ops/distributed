@@ -36,8 +36,8 @@ use lapin::{Channel, ExchangeKind};
 
 use super::rabbitmq::{connect_channel, message_properties, RabbitSource};
 use super::{
-    retryable, run_source, Bus, BusConsumer, BusTopologyConfig, MessageRouter, RunOptions,
-    TransportError,
+    retryable, run_source, Bus, BusConsumer, BusTopologyConfig, MessageRouter, PublishDeadLetters,
+    RunOptions, TransportError,
 };
 use super::{validate_message_name, Message};
 
@@ -48,6 +48,19 @@ fn checked_name(name: &str) -> Result<(), TransportError> {
     validate_message_name(name)
         .map(|_| ())
         .map_err(|e| TransportError::permanent(format!("rabbitmq message name {e}")))
+}
+
+impl Clone for RabbitBus {
+    /// The clone shares the channel and starts with an empty declaration
+    /// cache, so it re-declares each name once.
+    fn clone(&self) -> Self {
+        Self {
+            uri: self.uri.clone(),
+            channel: self.channel.clone(),
+            topology: self.topology.clone(),
+            declared: Mutex::new(HashSet::new()),
+        }
+    }
 }
 
 /// RabbitMQ [`Bus`] + [`BusConsumer`].
@@ -351,6 +364,7 @@ impl BusConsumer for RabbitBus {
             queues.push(queue);
         }
         let source = RabbitSource::multi(channel, queues, Some(self.command_prefix()?));
+        let options = options.or_dead_letters(|| Arc::new(PublishDeadLetters(self.clone())));
         run_source(router, source, options).await
     }
 
@@ -369,6 +383,7 @@ impl BusConsumer for RabbitBus {
         let channel = connect_channel(&self.uri).await?;
         // Events are published with routing key == the bare event name.
         let source = RabbitSource::multi(channel, vec![self.group_queue(&group)?], None);
+        let options = options.or_dead_letters(|| Arc::new(PublishDeadLetters(self.clone())));
         run_source(router, source, options).await
     }
 }

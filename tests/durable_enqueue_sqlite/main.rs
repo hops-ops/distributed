@@ -79,7 +79,7 @@ async fn assert_published_and_drained(store: &impl OutboxStore, bus: &InMemoryBu
             .push(message.id().unwrap().to_string());
         async { Ok(()) }
     });
-    bus.subscribe(Arc::new(handlers), RunOptions::idempotent())
+    bus.subscribe(Arc::new(handlers), RunOptions::until_idle())
         .await
         .unwrap();
     assert_eq!(*delivered.lock().unwrap(), vec!["evt-c1".to_string()]);
@@ -130,7 +130,7 @@ async fn run_consumes_command_and_publishes_over_sqlite() {
     // Enqueue a command, then run: listen is derived from the registered command,
     // drains it, and the handler publishes its outbox row through the bus.
     bus.send("counter.touch", b"{}".to_vec()).await.unwrap();
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     assert_published_and_drained(&store, &bus).await;
 }
