@@ -9,7 +9,7 @@ use super::key::{
 };
 use super::ProjectionScopeCodecError;
 use crate::projection_protocol::{
-    ProjectionPartition, ProjectionRecordScope, ProjectorTopologyId, ResolvedProjectionKey,
+    PartitionId, ProjectionRecordScope, ProjectorTopologyId, RecordKey,
     ResolvedProjectionObligation, MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_RECORD_KEY_BYTES,
 };
 use crate::table::{RowKey, TableColumn, TableSchema};
@@ -85,7 +85,7 @@ impl ProjectionScopeCodec {
     pub(crate) fn encode_partition(
         &self,
         partition: Option<&serde_json::Value>,
-    ) -> Result<ProjectionPartition, ProjectionScopeCodecError> {
+    ) -> Result<PartitionId, ProjectionScopeCodecError> {
         let mut encoder = CanonicalEncoder::new(
             "projection partition",
             PARTITION_ENCODING_DOMAIN,
@@ -98,7 +98,7 @@ impl ProjectionScopeCodec {
                 encode_json(&mut encoder, partition)?;
             }
         }
-        ProjectionPartition::new(encoder.finish()).map_err(Into::into)
+        PartitionId::new(encoder.finish()).map_err(Into::into)
     }
 
     /// Lower a command-ledger obligation into its exact durable record scope.
@@ -126,7 +126,7 @@ impl ProjectionScopeCodec {
         &self,
         projector: &str,
         model: &str,
-        key: &ResolvedProjectionKey,
+        key: &RecordKey,
         partition_value: Option<&serde_json::Value>,
     ) -> Result<ProjectionRecordScope, ProjectionScopeCodecError> {
         self.validate_projector(projector)?;
@@ -207,7 +207,7 @@ impl ProjectionScopeCodec {
     pub(crate) fn encode_row_scope_in_partition(
         &self,
         model: &str,
-        partition: ProjectionPartition,
+        partition: PartitionId,
         key: &RowKey,
     ) -> Result<ProjectionRecordScope, ProjectionScopeCodecError> {
         let schema = self.model(model)?;

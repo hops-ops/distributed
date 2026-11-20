@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use super::{
     ProjectionCommitBatch, ProjectionEpoch, ProjectionExecutionSnapshotBatchRequest,
-    ProjectionGraphSnapshotRequest, ProjectionModelOwnership, ProjectionMutationKind,
-    ProjectionObservationKind, ProjectionObservationRequest, ProjectionObservationTarget,
-    ProjectionProtocolError, ProjectionQuerySnapshotRequest, ProjectionRecordExpectation,
-    ProjectionRecordMutation, ProjectionRecordScope, ProjectionScopeCodec, RecordRevision,
+    ProjectionGraphSnapshotRequest, ProjectionModelOwnership, ProjectionObservationKind,
+    ProjectionObservationRequest, ProjectionObservationTarget, ProjectionProtocolError,
+    ProjectionQuerySnapshotRequest, ProjectionRecordExpectation, ProjectionRecordMutation,
+    ProjectionRecordScope, ProjectionScopeCodec, RecordRevision, RecordTransition,
     TrustedProjectionInput,
 };
 use crate::read_model::{RelationalReadModel, RelationalReadModelIncludes};
@@ -105,7 +105,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
     }
 
@@ -137,7 +137,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected.clone()),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
     }
 
@@ -166,7 +166,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected.clone()),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
     }
 
@@ -192,7 +192,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected.clone()),
-            ProjectionMutationKind::Delete,
+            RecordTransition::Delete,
         )
     }
 
@@ -223,7 +223,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected_tombstone.clone()),
-            ProjectionMutationKind::Recreate,
+            RecordTransition::Recreate,
         )
     }
 
@@ -329,7 +329,7 @@ impl ProjectionWorkspace {
         &mut self,
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
         source: Option<super::SourceSnapshotVersion>,
     ) -> Result<&mut Self, ProjectionProtocolError> {
         validate_execution_mutation_shape(&mutation, &expectation, kind)?;
@@ -461,7 +461,7 @@ impl ProjectionWorkspace {
         scope: ProjectionRecordScope,
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
     ) -> Result<&mut Self, ProjectionProtocolError> {
         self.push_staged(
             schema,
@@ -502,33 +502,33 @@ fn mutation_schema_key(mutation: &TableMutation) -> (&'static TableSchema, &RowK
 fn validate_execution_mutation_shape(
     mutation: &TableMutation,
     expectation: &ProjectionRecordExpectation,
-    kind: ProjectionMutationKind,
+    kind: RecordTransition,
 ) -> Result<(), ProjectionProtocolError> {
     let valid = match (mutation, expectation, kind) {
         (
             TableMutation::UpsertRow(row),
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         ) => row.mode == RowWriteMode::Insert && row.expected_version == ExpectedVersion::NotExists,
         (
             TableMutation::UpsertRow(row),
             ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         ) => row.mode == RowWriteMode::Upsert && row.expected_version == ExpectedVersion::Any,
         (
             TableMutation::PatchRow(row),
             ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         ) => row.mode == PatchMode::UpdateExisting && row.expected_version == ExpectedVersion::Any,
         (
             TableMutation::DeleteRow(row),
             ProjectionRecordExpectation::Exact(_) | ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Delete,
+            RecordTransition::Delete,
         ) => row.expected_version == ExpectedVersion::Any,
         (
             TableMutation::UpsertRow(row),
             ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Recreate,
+            RecordTransition::Recreate,
         ) => row.mode == RowWriteMode::Insert && row.expected_version == ExpectedVersion::NotExists,
         _ => false,
     };

@@ -247,21 +247,6 @@ export type {
 	WatchReplicaOptions
 } from './types.js';
 
-export {
-	lowerMutationCache,
-	MUTATION_CACHE_VISIBILITY_FULL,
-	MUTATION_CACHE_VISIBILITY_UNAUTHORIZED,
-} from './mutation-cache.js';
-export type {
-	MutationCacheEffect,
-	MutationCacheProgram,
-	MutationCacheVisibility,
-	MutationField,
-	MutationOperation,
-	MutationProgram,
-	MutationTarget,
-} from './mutation-cache.js';
-
 export type {
 	ReplicaLazyCommandCatalog,
 	ReplicaLazyCommandModule,

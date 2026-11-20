@@ -221,7 +221,7 @@ pub(crate) struct RebuildContext {
 }
 
 impl RebuildContext {
-    pub(crate) fn partition(&self) -> Result<ProjectionPartition, ProjectionProtocolError> {
+    pub(crate) fn partition(&self) -> Result<PartitionId, ProjectionProtocolError> {
         self.compiled
             .codec()
             .encode_partition(None)
@@ -247,11 +247,11 @@ impl RebuildRow {
     pub(crate) fn transition(
         &self,
         current: Option<&ProjectionRecordMetadata>,
-    ) -> (ProjectionMutationKind, ProjectionRecordExpectation) {
+    ) -> (RecordTransition, ProjectionRecordExpectation) {
         let kind = match (&self.mutation, current) {
-            (TableMutation::DeleteRow(_), _) => ProjectionMutationKind::Delete,
-            (_, Some(record)) if record.tombstone => ProjectionMutationKind::Recreate,
-            _ => ProjectionMutationKind::Upsert,
+            (TableMutation::DeleteRow(_), _) => RecordTransition::Delete,
+            (_, Some(record)) if record.tombstone => RecordTransition::Recreate,
+            _ => RecordTransition::Upsert,
         };
         let expectation = current
             .map(|r| ProjectionRecordExpectation::Exact(r.revision.clone()))

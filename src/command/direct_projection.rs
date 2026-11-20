@@ -9,7 +9,7 @@ use super::projection_proof::canonical_json;
 use crate::microsvc::Session;
 use crate::projection::executor::resolved_partition_json;
 use crate::projection_protocol::{
-    ProjectionEpoch, ProjectionModelOwnership, ProjectionPartition, ProjectionPartitionSpec,
+    PartitionId, ProjectionEpoch, ProjectionModelOwnership, ProjectionPartitionSpec,
     ProjectionProtocolError, ProjectionScopeCodec, ProjectorTopologyId,
     SameTransactionProjectionBatch,
 };
@@ -315,7 +315,7 @@ where
 pub(crate) struct ResolvedDirectProjectionTarget {
     codec: Arc<ProjectionScopeCodec>,
     partition_value: Option<serde_json::Value>,
-    partition: ProjectionPartition,
+    partition: PartitionId,
     change_epoch: ProjectionEpoch,
     model: String,
     table: String,

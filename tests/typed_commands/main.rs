@@ -26,9 +26,6 @@ use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service}
 use distributed::microsvc::{Context, Session};
 use distributed::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
 use distributed::projection::lower::{DirectCandidate, EventualOnly, ProjectionDescriptor};
-use distributed::projection::lower::{
-    LoweredProjectionPlan, ProjectionLoweringError, ProjectionOutputInventory,
-};
 use distributed::projection::placement::{
     ProjectionBinding, ProjectionBindingState, ProjectionEpoch, ProjectionExecutorRoute,
     ProjectionOutput, ProjectionOwner, ProjectionPhysicalTopology, ProjectionSourceBinding,
@@ -37,15 +34,12 @@ use distributed::projection::placement::{
 use distributed::projection::ProjectionEventSelector;
 use distributed::projection_protocol::ProjectorTopologyId;
 use distributed::{
-    body_bindings_for_model, body_field_binding, command_input_defaults, compile_projection,
-    descriptor_from_factories, inventory_single_model, lower_single_model,
-    resolve_mutation_program, state_upsert_program_for_model, Aggregate, AggregateRepository,
-    CommandInput, CommandOutput, DomainEventDescriptor, DomainEventOccurrence, Entity, EventRecord,
-    InMemoryRepository, MutationAssignment, MutationEventBinding, MutationExpression,
-    MutationField, MutationKeyField, MutationKind, MutationOperation, MutationProgram,
-    MutationProgramError, ProjectionExpression, ProjectionHandler, ProjectionPartition,
-    ProjectionProgram, ProjectionProgramError, ProjectionValue, ProjectionValueType, ReadModel,
-    ReadModelCatalog, RelationalReadModel, ResolvedProjectionPlan, SqliteRepository,
+    command_input_defaults, compile_projection, state_upsert_program_for_model, Aggregate,
+    AggregateRepository, CommandInput, CommandOutput, DomainEventDescriptor, Entity, EventRecord,
+    InMemoryRepository, MutationKind, ProjectionArm, ProjectionAssignment, ProjectionExpression,
+    ProjectionField, ProjectionHandler, ProjectionInputSource, ProjectionKeyField,
+    ProjectionOperation, ProjectionPartition, ProjectionProgram, ProjectionProgramError,
+    ProjectionValue, ProjectionValueType, ReadModel, RelationalReadModel, SqliteRepository,
 };
 use serde::{Deserialize, Serialize};
 use tower::util::ServiceExt;
@@ -387,13 +381,6 @@ macro_rules! state_event_contract {
 state_event_contract!(PlanChangedDomainEvent, PlanView, "plan.changed");
 state_event_contract!(PlanRenamedDomainEvent, PlanView, "plan.renamed");
 
-fn map_mut_err(operation: &str, err: MutationProgramError) -> ProjectionProgramError {
-    ProjectionProgramError::InvalidOperation {
-        operation: operation.into(),
-        reason: err.to_string(),
-    }
-}
-
 fn state_selector<S: distributed::DomainState>(
     name: &'static str,
     version: u64,
@@ -401,287 +388,159 @@ fn state_selector<S: distributed::DomainState>(
     ProjectionEventSelector::try_from_descriptor(&DomainEventDescriptor::state::<S>(name, version))
 }
 
-fn plan_projection_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    let program = state_upsert_program_for_model::<PlanView>("save_plan", 1, "upsert-plan", "plan")
-        .map_err(|e| map_mut_err("typed_commands_plan", e))?;
-    let binding = MutationEventBinding::try_new(
-        state_selector::<PlanView>("plan.changed", 1)?,
-        body_bindings_for_model::<PlanView>("plan")
-            .map_err(|e| map_mut_err("typed_commands_plan", e))?,
-        program,
+fn body(value_type: ProjectionValueType, field: &str) -> ProjectionExpression {
+    ProjectionExpression::body_path(value_type, [field]).expect("one-segment body path")
+}
+
+/// One arm that patches `fields` of the `model` row keyed by the event body's
+/// `key` members.
+fn patch_program(
+    name: &str,
+    arm_id: &str,
+    selector: ProjectionEventSelector,
+    (model, table): (&str, &str),
+    key: &[&str],
+    fields: Vec<(&str, ProjectionExpression)>,
+) -> Result<ProjectionProgram, ProjectionProgramError> {
+    let key = key
+        .iter()
+        .zip(0u32..)
+        .map(|(name, ordinal)| {
+            ProjectionKeyField::try_new(ordinal, *name, body(ProjectionValueType::String, name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fields = fields
+        .into_iter()
+        .zip(0u32..)
+        .map(|((name, expression), ordinal)| {
+            ProjectionField::try_new(ordinal, name, ProjectionAssignment::Set(expression))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let operation = ProjectionOperation::try_new(
+        format!("patch-{name}"),
+        0,
+        MutationKind::Patch,
+        distributed::ProjectionTarget::try_new(model, table)?,
+        key,
+        fields,
+        Vec::new(),
+        Vec::new(),
+    )?;
+    ProjectionProgram::try_new(
+        name,
+        1,
+        ProjectionPartition::Unit,
+        vec![ProjectionArm::try_new(arm_id, selector, vec![operation])?],
     )
-    .map_err(|e| map_mut_err("typed_commands_plan", e))?;
-    let partition = ProjectionPartition::Expression(ProjectionExpression::body_path(
-        ProjectionValueType::String,
-        ["id"],
-    )?);
+}
+
+/// One arm that upserts the whole `M` row from the event body.
+fn upsert_program<M: RelationalReadModel>(
+    name: &str,
+    selector: ProjectionEventSelector,
+    partition: ProjectionPartition,
+) -> Result<ProjectionProgram, ProjectionProgramError> {
     compile_projection(
-        "typed_commands_plan",
+        name,
         1,
         partition,
-        [ProjectionHandler::from_binding("changed", binding)],
+        [ProjectionHandler::try_new(
+            "changed",
+            selector,
+            vec![ProjectionInputSource::Body.binding("row")?],
+            state_upsert_program_for_model::<M>("save", 1, "upsert-row", "row")?,
+        )?],
     )
 }
 
-fn plan_projection_resolve(
-    occurrence: &DomainEventOccurrence,
-) -> Result<ResolvedProjectionPlan, ProjectionProgramError> {
-    resolve_mutation_program(&plan_projection_program()?, occurrence)
-}
-
-fn plan_projection_lower(
-    plan: &ResolvedProjectionPlan,
-) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
-    lower_single_model::<PlanView>(plan)
-}
-
-fn plan_projection_inventory() -> Result<ProjectionOutputInventory, ProjectionLoweringError> {
-    inventory_single_model::<PlanView>()
-}
-
-const PLAN_PROJECTION: ProjectionDescriptor<DirectCandidate> = descriptor_from_factories(
-    "typed_commands_plan",
-    1,
-    "typed-commands-plan-v1",
-    plan_projection_program,
-    plan_projection_resolve,
-    plan_projection_lower,
-    plan_projection_inventory,
-);
-
-fn patch_key_string(name: &str) -> Result<MutationKeyField, MutationProgramError> {
-    MutationKeyField::try_new(
-        0,
-        name,
-        MutationExpression::input_path(ProjectionValueType::String, [name])?,
+fn plan_projection_program() -> Result<ProjectionProgram, ProjectionProgramError> {
+    upsert_program::<PlanView>(
+        "typed_commands_plan",
+        state_selector::<PlanView>("plan.changed", 1)?,
+        ProjectionPartition::Expression(body(ProjectionValueType::String, "id")),
     )
+}
+
+distributed::projection! {
+    const PLAN_PROJECTION: ProjectionDescriptor<DirectCandidate> = {
+        name: "typed_commands_plan",
+        version: 1,
+        epoch: "typed-commands-plan-v1",
+        model: PlanView,
+        program: plan_projection_program,
+    };
 }
 
 fn plan_title_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    let target = distributed::ProjectionTarget::try_new("PlanView", "plan_views")?;
-    let op = MutationOperation::try_new(
-        "patch-title",
-        0,
-        MutationKind::Patch,
-        target,
-        vec![patch_key_string("id").map_err(|e| map_mut_err("typed_commands_plan_title", e))?],
-        vec![MutationField::try_new(
-            0,
-            "title",
-            MutationAssignment::set(
-                MutationExpression::input_path(ProjectionValueType::String, ["title"])
-                    .map_err(|e| map_mut_err("typed_commands_plan_title", e))?,
-            ),
-        )
-        .map_err(|e| map_mut_err("typed_commands_plan_title", e))?],
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .map_err(|e| map_mut_err("typed_commands_plan_title", e))?;
-    let mutation = MutationProgram::try_new("patch_plan_title", 1, vec![op])
-        .map_err(|e| map_mut_err("typed_commands_plan_title", e))?;
-    let bindings = vec![
-        body_field_binding(["id"], ["id"], ProjectionValueType::String)
-            .map_err(|e| map_mut_err("typed_commands_plan_title", e))?,
-        body_field_binding(["title"], ["title"], ProjectionValueType::String)
-            .map_err(|e| map_mut_err("typed_commands_plan_title", e))?,
-    ];
-    let binding = MutationEventBinding::try_new(
-        state_selector::<PlanView>("plan.changed", 1)?,
-        bindings,
-        mutation,
-    )
-    .map_err(|e| map_mut_err("typed_commands_plan_title", e))?;
-    compile_projection(
+    patch_program(
         "typed_commands_plan_title",
-        1,
-        ProjectionPartition::Unit,
-        [ProjectionHandler::from_binding("changed", binding)],
+        "changed",
+        state_selector::<PlanView>("plan.changed", 1)?,
+        ("PlanView", "plan_views"),
+        &["id"],
+        vec![("title", body(ProjectionValueType::String, "title"))],
     )
 }
 
-fn plan_title_resolve(
-    occurrence: &DomainEventOccurrence,
-) -> Result<ResolvedProjectionPlan, ProjectionProgramError> {
-    resolve_mutation_program(&plan_title_program()?, occurrence)
+distributed::projection! {
+    const PLAN_TITLE_PROJECTION: ProjectionDescriptor<EventualOnly> = {
+        name: "typed_commands_plan_title",
+        version: 1,
+        epoch: "typed-commands-plan-title-v1",
+        model: PlanView,
+        program: plan_title_program,
+    };
 }
-
-fn plan_title_lower(
-    plan: &ResolvedProjectionPlan,
-) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
-    lower_single_model::<PlanView>(plan)
-}
-
-fn plan_title_inventory() -> Result<ProjectionOutputInventory, ProjectionLoweringError> {
-    inventory_single_model::<PlanView>()
-}
-
-const PLAN_TITLE_PROJECTION: ProjectionDescriptor<EventualOnly> = descriptor_from_factories(
-    "typed_commands_plan_title",
-    1,
-    "typed-commands-plan-title-v1",
-    plan_title_program,
-    plan_title_resolve,
-    plan_title_lower,
-    plan_title_inventory,
-);
 
 fn plan_close_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    let target = distributed::ProjectionTarget::try_new("PlanView", "plan_views")?;
-    let op = MutationOperation::try_new(
-        "patch-status",
-        0,
-        MutationKind::Patch,
-        target,
-        vec![patch_key_string("id").map_err(|e| map_mut_err("typed_commands_plan_close", e))?],
-        vec![MutationField::try_new(
-            0,
-            "status",
-            MutationAssignment::set(
-                MutationExpression::enum_variant("PlanStatus", "Closed")
-                    .map_err(|e| map_mut_err("typed_commands_plan_close", e))?,
-            ),
-        )
-        .map_err(|e| map_mut_err("typed_commands_plan_close", e))?],
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .map_err(|e| map_mut_err("typed_commands_plan_close", e))?;
-    let mutation = MutationProgram::try_new("patch_plan_close", 1, vec![op])
-        .map_err(|e| map_mut_err("typed_commands_plan_close", e))?;
-    let bindings = vec![
-        body_field_binding(["id"], ["id"], ProjectionValueType::String)
-            .map_err(|e| map_mut_err("typed_commands_plan_close", e))?,
-    ];
-    let binding = MutationEventBinding::try_new(
-        state_selector::<PlanView>("plan.changed", 1)?,
-        bindings,
-        mutation,
-    )
-    .map_err(|e| map_mut_err("typed_commands_plan_close", e))?;
-    compile_projection(
+    patch_program(
         "typed_commands_plan_close",
-        1,
-        ProjectionPartition::Unit,
-        [ProjectionHandler::from_binding("changed", binding)],
+        "changed",
+        state_selector::<PlanView>("plan.changed", 1)?,
+        ("PlanView", "plan_views"),
+        &["id"],
+        vec![(
+            "status",
+            ProjectionExpression::enum_variant("PlanStatus", "Closed")?,
+        )],
     )
 }
 
-fn plan_close_resolve(
-    occurrence: &DomainEventOccurrence,
-) -> Result<ResolvedProjectionPlan, ProjectionProgramError> {
-    resolve_mutation_program(&plan_close_program()?, occurrence)
+distributed::projection! {
+    const PLAN_CLOSE_PROJECTION: ProjectionDescriptor<EventualOnly> = {
+        name: "typed_commands_plan_close",
+        version: 1,
+        epoch: "typed-commands-plan-close-v1",
+        model: PlanView,
+        program: plan_close_program,
+    };
 }
-
-fn plan_close_lower(
-    plan: &ResolvedProjectionPlan,
-) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
-    lower_single_model::<PlanView>(plan)
-}
-
-fn plan_close_inventory() -> Result<ProjectionOutputInventory, ProjectionLoweringError> {
-    inventory_single_model::<PlanView>()
-}
-
-const PLAN_CLOSE_PROJECTION: ProjectionDescriptor<EventualOnly> = descriptor_from_factories(
-    "typed_commands_plan_close",
-    1,
-    "typed-commands-plan-close-v1",
-    plan_close_program,
-    plan_close_resolve,
-    plan_close_lower,
-    plan_close_inventory,
-);
 
 state_event_contract!(JsonChangedDomainEvent, JsonView, "json.changed");
 
 fn json_projection_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    let target = distributed::ProjectionTarget::try_new("JsonView", "json_views")?;
-    let op = MutationOperation::try_new(
-        "patch-json",
-        0,
-        MutationKind::Patch,
-        target,
-        vec![patch_key_string("id").map_err(|e| map_mut_err("typed_commands_json", e))?],
-        vec![
-            MutationField::try_new(
-                0,
-                "tags",
-                MutationAssignment::set(
-                    MutationExpression::input_path(ProjectionValueType::Json, ["tags"])
-                        .map_err(|e| map_mut_err("typed_commands_json", e))?,
-                ),
-            )
-            .map_err(|e| map_mut_err("typed_commands_json", e))?,
-            MutationField::try_new(
-                1,
-                "details",
-                MutationAssignment::set(
-                    MutationExpression::input_path(ProjectionValueType::Json, ["details"])
-                        .map_err(|e| map_mut_err("typed_commands_json", e))?,
-                ),
-            )
-            .map_err(|e| map_mut_err("typed_commands_json", e))?,
-        ],
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .map_err(|e| map_mut_err("typed_commands_json", e))?;
-    let mutation = MutationProgram::try_new("patch_json", 1, vec![op])
-        .map_err(|e| map_mut_err("typed_commands_json", e))?;
-    let bindings = vec![
-        body_field_binding(["id"], ["id"], ProjectionValueType::String)
-            .map_err(|e| map_mut_err("typed_commands_json", e))?,
-        body_field_binding(["tags"], ["tags"], ProjectionValueType::Json)
-            .map_err(|e| map_mut_err("typed_commands_json", e))?,
-        body_field_binding(["details"], ["details"], ProjectionValueType::Json)
-            .map_err(|e| map_mut_err("typed_commands_json", e))?,
-    ];
-    let binding = MutationEventBinding::try_new(
-        state_selector::<JsonView>("json.changed", 1)?,
-        bindings,
-        mutation,
-    )
-    .map_err(|e| map_mut_err("typed_commands_json", e))?;
-    compile_projection(
+    patch_program(
         "typed_commands_json",
-        1,
-        ProjectionPartition::Unit,
-        [ProjectionHandler::from_binding("changed", binding)],
+        "changed",
+        state_selector::<JsonView>("json.changed", 1)?,
+        ("JsonView", "json_views"),
+        &["id"],
+        vec![
+            ("tags", body(ProjectionValueType::Json, "tags")),
+            ("details", body(ProjectionValueType::Json, "details")),
+        ],
     )
 }
 
-fn json_projection_resolve(
-    occurrence: &DomainEventOccurrence,
-) -> Result<ResolvedProjectionPlan, ProjectionProgramError> {
-    resolve_mutation_program(&json_projection_program()?, occurrence)
+distributed::projection! {
+    const JSON_PROJECTION: ProjectionDescriptor<EventualOnly> = {
+        name: "typed_commands_json",
+        version: 1,
+        epoch: "typed-commands-json-v1",
+        model: JsonView,
+        program: json_projection_program,
+    };
 }
-
-fn json_projection_lower(
-    plan: &ResolvedProjectionPlan,
-) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
-    lower_single_model::<JsonView>(plan)
-}
-
-fn json_projection_inventory() -> Result<ProjectionOutputInventory, ProjectionLoweringError> {
-    inventory_single_model::<JsonView>()
-}
-
-const JSON_PROJECTION: ProjectionDescriptor<EventualOnly> = descriptor_from_factories(
-    "typed_commands_json",
-    1,
-    "typed-commands-json-v1",
-    json_projection_program,
-    json_projection_resolve,
-    json_projection_lower,
-    json_projection_inventory,
-);
 
 state_event_contract!(
     CompositeChangedDomainEvent,
@@ -690,139 +549,45 @@ state_event_contract!(
 );
 
 fn composite_projection_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    let target = distributed::ProjectionTarget::try_new("CompositeKeyView", "composite_key_views")?;
-    let op = MutationOperation::try_new(
-        "patch-composite",
-        0,
-        MutationKind::Patch,
-        target,
-        vec![
-            MutationKeyField::try_new(
-                0,
-                "tenant_id",
-                MutationExpression::input_path(ProjectionValueType::String, ["tenant_id"])
-                    .map_err(|e| map_mut_err("typed_commands_composite", e))?,
-            )
-            .map_err(|e| map_mut_err("typed_commands_composite", e))?,
-            MutationKeyField::try_new(
-                1,
-                "id",
-                MutationExpression::input_path(ProjectionValueType::String, ["id"])
-                    .map_err(|e| map_mut_err("typed_commands_composite", e))?,
-            )
-            .map_err(|e| map_mut_err("typed_commands_composite", e))?,
-        ],
-        vec![MutationField::try_new(
-            0,
-            "title",
-            MutationAssignment::set(
-                MutationExpression::input_path(ProjectionValueType::String, ["title"])
-                    .map_err(|e| map_mut_err("typed_commands_composite", e))?,
-            ),
-        )
-        .map_err(|e| map_mut_err("typed_commands_composite", e))?],
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .map_err(|e| map_mut_err("typed_commands_composite", e))?;
-    let mutation = MutationProgram::try_new("patch_composite", 1, vec![op])
-        .map_err(|e| map_mut_err("typed_commands_composite", e))?;
-    let bindings = vec![
-        body_field_binding(["tenant_id"], ["tenant_id"], ProjectionValueType::String)
-            .map_err(|e| map_mut_err("typed_commands_composite", e))?,
-        body_field_binding(["id"], ["id"], ProjectionValueType::String)
-            .map_err(|e| map_mut_err("typed_commands_composite", e))?,
-        body_field_binding(["title"], ["title"], ProjectionValueType::String)
-            .map_err(|e| map_mut_err("typed_commands_composite", e))?,
-    ];
-    let binding = MutationEventBinding::try_new(
-        state_selector::<CompositeKeyView>("composite.changed", 1)?,
-        bindings,
-        mutation,
-    )
-    .map_err(|e| map_mut_err("typed_commands_composite", e))?;
-    compile_projection(
+    patch_program(
         "typed_commands_composite",
-        1,
-        ProjectionPartition::Unit,
-        [ProjectionHandler::from_binding("changed", binding)],
+        "changed",
+        state_selector::<CompositeKeyView>("composite.changed", 1)?,
+        ("CompositeKeyView", "composite_key_views"),
+        &["tenant_id", "id"],
+        vec![("title", body(ProjectionValueType::String, "title"))],
     )
 }
 
-fn composite_projection_resolve(
-    occurrence: &DomainEventOccurrence,
-) -> Result<ResolvedProjectionPlan, ProjectionProgramError> {
-    resolve_mutation_program(&composite_projection_program()?, occurrence)
+distributed::projection! {
+    const COMPOSITE_PROJECTION: ProjectionDescriptor<EventualOnly> = {
+        name: "typed_commands_composite",
+        version: 1,
+        epoch: "typed-commands-composite-v1",
+        model: CompositeKeyView,
+        program: composite_projection_program,
+    };
 }
-
-fn composite_projection_lower(
-    plan: &ResolvedProjectionPlan,
-) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
-    lower_single_model::<CompositeKeyView>(plan)
-}
-
-fn composite_projection_inventory() -> Result<ProjectionOutputInventory, ProjectionLoweringError> {
-    inventory_single_model::<CompositeKeyView>()
-}
-
-const COMPOSITE_PROJECTION: ProjectionDescriptor<EventualOnly> = descriptor_from_factories(
-    "typed_commands_composite",
-    1,
-    "typed-commands-composite-v1",
-    composite_projection_program,
-    composite_projection_resolve,
-    composite_projection_lower,
-    composite_projection_inventory,
-);
 
 state_event_contract!(BigIntChangedDomainEvent, BigIntKeyView, "bigint.changed");
 
 fn bigint_projection_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    let program =
-        state_upsert_program_for_model::<BigIntKeyView>("save_bigint", 1, "upsert-view", "view")
-            .map_err(|e| map_mut_err("typed_commands_bigint", e))?;
-    let binding = MutationEventBinding::try_new(
-        state_selector::<BigIntKeyView>("bigint.changed", 1)?,
-        body_bindings_for_model::<BigIntKeyView>("view")
-            .map_err(|e| map_mut_err("typed_commands_bigint", e))?,
-        program,
-    )
-    .map_err(|e| map_mut_err("typed_commands_bigint", e))?;
-    compile_projection(
+    upsert_program::<BigIntKeyView>(
         "typed_commands_bigint",
-        1,
+        state_selector::<BigIntKeyView>("bigint.changed", 1)?,
         ProjectionPartition::Unit,
-        [ProjectionHandler::from_binding("changed", binding)],
     )
 }
 
-fn bigint_projection_resolve(
-    occurrence: &DomainEventOccurrence,
-) -> Result<ResolvedProjectionPlan, ProjectionProgramError> {
-    resolve_mutation_program(&bigint_projection_program()?, occurrence)
+distributed::projection! {
+    const BIGINT_PROJECTION: ProjectionDescriptor<DirectCandidate> = {
+        name: "typed_commands_bigint",
+        version: 1,
+        epoch: "typed-commands-bigint-v1",
+        model: BigIntKeyView,
+        program: bigint_projection_program,
+    };
 }
-
-fn bigint_projection_lower(
-    plan: &ResolvedProjectionPlan,
-) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
-    lower_single_model::<BigIntKeyView>(plan)
-}
-
-fn bigint_projection_inventory() -> Result<ProjectionOutputInventory, ProjectionLoweringError> {
-    inventory_single_model::<BigIntKeyView>()
-}
-
-const BIGINT_PROJECTION: ProjectionDescriptor<DirectCandidate> = descriptor_from_factories(
-    "typed_commands_bigint",
-    1,
-    "typed-commands-bigint-v1",
-    bigint_projection_program,
-    bigint_projection_resolve,
-    bigint_projection_lower,
-    bigint_projection_inventory,
-);
 
 #[derive(Clone, Serialize, distributed::DomainState)]
 #[domain_state(version = 1)]
@@ -833,70 +598,28 @@ struct FloatClearState {
 state_event_contract!(FloatClearedDomainEvent, FloatClearState, "float.cleared");
 
 fn float_clear_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    let target = distributed::ProjectionTarget::try_new("FloatEffectView", "float_effect_views")?;
-    let op = MutationOperation::try_new(
-        "patch-float-clear",
-        0,
-        MutationKind::Patch,
-        target,
-        vec![patch_key_string("id").map_err(|e| map_mut_err("typed_commands_float_clear", e))?],
-        vec![MutationField::try_new(
-            0,
-            "value",
-            MutationAssignment::set(MutationExpression::constant(ProjectionValue::null())),
-        )
-        .map_err(|e| map_mut_err("typed_commands_float_clear", e))?],
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .map_err(|e| map_mut_err("typed_commands_float_clear", e))?;
-    let mutation = MutationProgram::try_new("patch_float_clear", 1, vec![op])
-        .map_err(|e| map_mut_err("typed_commands_float_clear", e))?;
-    let bindings = vec![
-        body_field_binding(["id"], ["id"], ProjectionValueType::String)
-            .map_err(|e| map_mut_err("typed_commands_float_clear", e))?,
-    ];
-    let binding = MutationEventBinding::try_new(
-        state_selector::<FloatClearState>("float.cleared", 1)?,
-        bindings,
-        mutation,
-    )
-    .map_err(|e| map_mut_err("typed_commands_float_clear", e))?;
-    compile_projection(
+    patch_program(
         "typed_commands_float_clear",
-        1,
-        ProjectionPartition::Unit,
-        [ProjectionHandler::from_binding("cleared", binding)],
+        "cleared",
+        state_selector::<FloatClearState>("float.cleared", 1)?,
+        ("FloatEffectView", "float_effect_views"),
+        &["id"],
+        vec![(
+            "value",
+            ProjectionExpression::constant(ProjectionValue::null()),
+        )],
     )
 }
 
-fn float_clear_resolve(
-    occurrence: &DomainEventOccurrence,
-) -> Result<ResolvedProjectionPlan, ProjectionProgramError> {
-    resolve_mutation_program(&float_clear_program()?, occurrence)
+distributed::projection! {
+    const FLOAT_CLEAR_PROJECTION: ProjectionDescriptor<EventualOnly> = {
+        name: "typed_commands_float_clear",
+        version: 1,
+        epoch: "typed-commands-float-clear-v1",
+        model: FloatEffectView,
+        program: float_clear_program,
+    };
 }
-
-fn float_clear_lower(
-    plan: &ResolvedProjectionPlan,
-) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
-    lower_single_model::<FloatEffectView>(plan)
-}
-
-fn float_clear_inventory() -> Result<ProjectionOutputInventory, ProjectionLoweringError> {
-    inventory_single_model::<FloatEffectView>()
-}
-
-const FLOAT_CLEAR_PROJECTION: ProjectionDescriptor<EventualOnly> = descriptor_from_factories(
-    "typed_commands_float_clear",
-    1,
-    "typed-commands-float-clear-v1",
-    float_clear_program,
-    float_clear_resolve,
-    float_clear_lower,
-    float_clear_inventory,
-);
 
 state_event_contract!(
     JsonFloatClearedDomainEvent,
@@ -905,72 +628,28 @@ state_event_contract!(
 );
 
 fn json_float_clear_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    let target =
-        distributed::ProjectionTarget::try_new("JsonFloatEffectView", "json_float_effect_views")?;
-    let op = MutationOperation::try_new(
-        "patch-json-float-clear",
-        0,
-        MutationKind::Patch,
-        target,
-        vec![patch_key_string("id")
-            .map_err(|e| map_mut_err("typed_commands_json_float_clear", e))?],
-        vec![MutationField::try_new(
-            0,
-            "document",
-            MutationAssignment::set(MutationExpression::constant(ProjectionValue::null())),
-        )
-        .map_err(|e| map_mut_err("typed_commands_json_float_clear", e))?],
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .map_err(|e| map_mut_err("typed_commands_json_float_clear", e))?;
-    let mutation = MutationProgram::try_new("patch_json_float_clear", 1, vec![op])
-        .map_err(|e| map_mut_err("typed_commands_json_float_clear", e))?;
-    let bindings = vec![
-        body_field_binding(["id"], ["id"], ProjectionValueType::String)
-            .map_err(|e| map_mut_err("typed_commands_json_float_clear", e))?,
-    ];
-    let binding = MutationEventBinding::try_new(
-        state_selector::<FloatClearState>("json-float.cleared", 1)?,
-        bindings,
-        mutation,
-    )
-    .map_err(|e| map_mut_err("typed_commands_json_float_clear", e))?;
-    compile_projection(
+    patch_program(
         "typed_commands_json_float_clear",
-        1,
-        ProjectionPartition::Unit,
-        [ProjectionHandler::from_binding("cleared", binding)],
+        "cleared",
+        state_selector::<FloatClearState>("json-float.cleared", 1)?,
+        ("JsonFloatEffectView", "json_float_effect_views"),
+        &["id"],
+        vec![(
+            "document",
+            ProjectionExpression::constant(ProjectionValue::null()),
+        )],
     )
 }
 
-fn json_float_clear_resolve(
-    occurrence: &DomainEventOccurrence,
-) -> Result<ResolvedProjectionPlan, ProjectionProgramError> {
-    resolve_mutation_program(&json_float_clear_program()?, occurrence)
+distributed::projection! {
+    const JSON_FLOAT_CLEAR_PROJECTION: ProjectionDescriptor<EventualOnly> = {
+        name: "typed_commands_json_float_clear",
+        version: 1,
+        epoch: "typed-commands-json-float-clear-v1",
+        model: JsonFloatEffectView,
+        program: json_float_clear_program,
+    };
 }
-
-fn json_float_clear_lower(
-    plan: &ResolvedProjectionPlan,
-) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
-    lower_single_model::<JsonFloatEffectView>(plan)
-}
-
-fn json_float_clear_inventory() -> Result<ProjectionOutputInventory, ProjectionLoweringError> {
-    inventory_single_model::<JsonFloatEffectView>()
-}
-
-const JSON_FLOAT_CLEAR_PROJECTION: ProjectionDescriptor<EventualOnly> = descriptor_from_factories(
-    "typed_commands_json_float_clear",
-    1,
-    "typed-commands-json-float-clear-v1",
-    json_float_clear_program,
-    json_float_clear_resolve,
-    json_float_clear_lower,
-    json_float_clear_inventory,
-);
 
 struct ForgedTitleMarker;
 

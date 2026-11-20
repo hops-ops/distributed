@@ -2,8 +2,8 @@ use sha2::{Digest, Sha256};
 
 use crate::bus::{Message, OrderedDelivery};
 use crate::projection_protocol::{
-    CompiledProjectionTopology, ProjectionEpoch, ProjectionFailureBatch, ProjectionGeneration,
-    ProjectionInputCursor, ProjectionInputFingerprint, ProjectionPartition,
+    CompiledProjectionTopology, PartitionId, ProjectionEpoch, ProjectionFailureBatch,
+    ProjectionGeneration, ProjectionInputCursor, ProjectionInputFingerprint,
     ProjectionPartitionRuntimeState, ProjectionProtocolError, ProjectionProtocolStore,
     TrustedProjectionInput,
 };
@@ -29,7 +29,7 @@ where
     S: ProjectionProtocolStore,
 {
     let partition =
-        ProjectionPartition::new(b"distributed.projection.ingress-failure-partition.v1\0".to_vec())
+        PartitionId::new(b"distributed.projection.ingress-failure-partition.v1\0".to_vec())
             .map_err(ProjectionProtocolError::from)?;
     let cursor = ProjectionInputCursor::new(
         compiled.topology().clone(),

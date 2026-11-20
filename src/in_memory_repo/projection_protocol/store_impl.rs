@@ -258,7 +258,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
             )?;
             for mutation in &batch.mutations {
                 let row_exists = staged_rows.contains_key(&mutation.mutation.lock_key());
-                let should_exist = !matches!(mutation.kind, ProjectionMutationKind::Delete);
+                let should_exist = !matches!(mutation.kind, RecordTransition::Delete);
                 if row_exists != should_exist {
                     return Err(ProjectionProtocolError::InvalidBatch(format!(
                         "projection table mutation left model `{}` physical row {}",
@@ -940,7 +940,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
     fn projection_partition_runtime_state<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
     ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>>
            + Send
            + 'a {
@@ -1028,7 +1028,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
     fn projection_changes<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         after: Option<&'a ProjectionChangeCursor>,
         limit: usize,
     ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a
@@ -1111,7 +1111,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
     fn repair_projection<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a
     {
@@ -1270,7 +1270,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
     fn projection_failure<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a
     {

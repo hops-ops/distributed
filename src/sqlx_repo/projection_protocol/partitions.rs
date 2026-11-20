@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn decode_partition_row<DB>(
     row: &DB::Row,
     topology: &ProjectorTopologyId,
-    partition: &crate::projection_protocol::ProjectionPartition,
+    partition: &crate::projection_protocol::PartitionId,
 ) -> Result<PartitionState, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -75,7 +75,7 @@ where
 pub(super) async fn lock_partition_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &crate::projection_protocol::ProjectionPartition,
+    partition: &crate::projection_protocol::PartitionId,
     change_epoch: &ProjectionEpoch,
 ) -> Result<PartitionState, ProjectionProtocolError>
 where
@@ -147,7 +147,7 @@ where
 pub(super) async fn lock_existing_partition_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &crate::projection_protocol::ProjectionPartition,
+    partition: &crate::projection_protocol::PartitionId,
 ) -> Result<Option<PartitionState>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -184,7 +184,7 @@ where
 pub(super) async fn load_partition<DB>(
     pool: &Pool<DB>,
     topology: &ProjectorTopologyId,
-    partition: &crate::projection_protocol::ProjectionPartition,
+    partition: &crate::projection_protocol::PartitionId,
 ) -> Result<Option<PartitionState>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -218,7 +218,7 @@ where
 pub(super) async fn load_partition_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
 ) -> Result<Option<PartitionState>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -236,7 +236,7 @@ where
 pub(super) async fn load_partition_in_connection<DB>(
     connection: &mut DB::Connection,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
 ) -> Result<Option<PartitionState>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -271,7 +271,7 @@ where
 pub(crate) async fn read_projection_partition_snapshot_in_executor<DB>(
     connection: &mut DB::Connection,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     declared_epoch: &ProjectionEpoch,
 ) -> Result<ProjectionPartitionSnapshot, ProjectionProtocolError>
 where
@@ -316,7 +316,7 @@ where
 pub(super) async fn load_partition_runtime_state<DB>(
     pool: &Pool<DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
 ) -> Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -526,7 +526,7 @@ where
 pub(super) async fn verify_generation_exists_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &crate::projection_protocol::ProjectionPartition,
+    partition: &crate::projection_protocol::PartitionId,
     generation: ProjectionGeneration,
 ) -> Result<(), ProjectionProtocolError>
 where

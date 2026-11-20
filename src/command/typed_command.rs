@@ -27,8 +27,7 @@ use super::types::{scalar_type_name, CommandInputType, CommandTypeDef};
 use crate::microsvc::Session;
 use crate::outbox::OutboxMessage;
 use crate::projection_protocol::{
-    ProjectionEpoch, ProjectionScopeCodec, ResolvedProjectionKey, ResolvedProjectionKeyField,
-    ResolvedProjectionObligation,
+    ProjectionEpoch, ProjectionScopeCodec, RecordKey, RecordKeyField, ResolvedProjectionObligation,
 };
 use crate::read_model::RelationalReadModel;
 
@@ -166,7 +165,7 @@ impl TypedCommandContract {
                                 })
                                 .and_then(|column| scalar_type_name(&column.column_type)),
                         )
-                        .map(|value| ResolvedProjectionKeyField {
+                        .map(|value| RecordKeyField {
                             field: field.field.clone(),
                             value,
                         })
@@ -186,7 +185,7 @@ impl TypedCommandContract {
                         )
                     })
                     .transpose()?;
-                let key = ResolvedProjectionKey { fields };
+                let key = RecordKey { fields };
                 let topology = confirmation.protocol_topology.clone().ok_or_else(|| {
                     ProjectionObligationResolutionError::InvalidBinding {
                         projector: confirmation.projector.clone(),

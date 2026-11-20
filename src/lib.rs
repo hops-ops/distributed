@@ -118,33 +118,26 @@ pub use domain_event::{
 pub use projection::{
     LocalProjectionMounts, LocalProjectionMountsBuilder, ProjectionArm, ProjectionAssignment,
     ProjectionEnvelopeField, ProjectionEventSelector, ProjectionEventSet, ProjectionExpression,
-    ProjectionField, ProjectionInvalidation, ProjectionKeyField, ProjectionMutationKind,
-    ProjectionMutationProvenance, ProjectionObjectValueField, ProjectionOccurrenceProvenance,
-    ProjectionOperation, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
-    ProjectionProgramError, ProjectionProgramId, ProjectionProgramLimits, ProjectionRelationship,
+    ProjectionField, ProjectionInvalidation, ProjectionKeyField, ProjectionMutationProvenance,
+    ProjectionObjectValueField, ProjectionOccurrenceProvenance, ProjectionOperation,
+    ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram, ProjectionProgramError,
+    ProjectionProgramId, ProjectionProgramLimits, ProjectionRelationship,
     ProjectionRelationshipEffect, ProjectionRelationshipEffectKind, ProjectionScalarTransform,
     ProjectionTarget, ProjectionValue, ProjectionValueRef, ProjectionValueType,
     ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionMutationScope,
     ResolvedProjectionPartition, ResolvedProjectionPartitionRef, ResolvedProjectionPlan,
-    ResolvedProjectionRelationshipEffect, ResolvedProjectionValue, MAX_PROJECTION_EXPRESSION_DEPTH,
-    MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE, MAX_PROJECTION_PATH_SEGMENTS,
+    ResolvedProjectionRelationshipEffect, ResolvedProjectionValue, SourceOrdering,
+    MAX_PROJECTION_EXPRESSION_DEPTH, MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE,
+    MAX_PROJECTION_PATH_SEGMENTS,
 };
 
-// Event-independent mutation IR, event→mutation projections, and interpreters.
+// Event-independent mutations and their binding to events.
 pub use mutation::{
-    bind_delete_to_envelope_id, bind_event_apply_mutation, bind_event_to_mutation,
-    bind_state_body_to_mutation, bind_state_events_to_mutation, body_bindings_for_model,
-    body_field_binding, compile_projection, compose_event_preview, delete_by_pk_program_for_model,
-    descriptor_from_factories, envelope_binding, inventory_single_model, lower_mutation_cache,
-    lower_single_model, portable_binding, resolve_mutation_program, state_upsert_program_for_model,
-    Mutation, MutationAssignment, MutationCacheEffect, MutationCacheProgram,
-    MutationCacheVisibility, MutationConflictTarget, MutationEventBinding, MutationExpression,
-    MutationField, MutationFieldCapability, MutationHandlerCatalog, MutationHandlerPlacement,
-    MutationHandlerRegistration, MutationInputBinding, MutationKeyCapability, MutationKeyField,
-    MutationKind, MutationOperation, MutationProgram, MutationProgramError, MutationProgramId,
-    MutationProgramLimits, MutationReturning, MutationServerInterpreter, ProjectionHandler,
-    ProjectionInputSource, ReadModelMutationCapabilities, ResolvedMutationValue,
-    MAX_MUTATION_OPERATIONS, MUTATION_OPERATION_SEMANTICS_VERSION, MUTATION_PROGRAM_IR_VERSION,
+    bind_event_apply_mutation, bind_event_to_mutation, body_field_binding, compile_projection,
+    delete_by_pk_program_for_model, envelope_binding, inventory_single_model, lower_single_model,
+    state_upsert_program_for_model, Mutation, MutationColumn, MutationInput, MutationInputBinding,
+    MutationKind, MutationOperation, MutationProgram, MutationStep, ProjectionHandler,
+    ProjectionInputSource,
 };
 
 /// Spec-shaped authoring: **mutations** + **event-first projections**.
@@ -200,72 +193,42 @@ macro_rules! projection {
         } $(;)?
     ) => {
         $vis const $id: $desc_ty = {
-            fn __handlers() -> ::core::result::Result<
-                $crate::ProjectionProgram,
+            fn __program() -> ::core::result::Result<
+                &'static $crate::ProjectionProgram,
                 $crate::ProjectionProgramError,
             > {
-                use $crate::domain_event::DomainEventContract;
-                let mut handlers = ::std::vec::Vec::new();
-                $(
-                    {
-                        let mutation = $mutation().program().clone();
-                        let input_source = $crate::__projection_input_source!($input_src);
-                        $(
-                            handlers.push(
-                                $crate::bind_event_apply_mutation::<$model>(
+                static PROGRAM: $crate::projection::lower::ProjectionProgramCell =
+                    $crate::projection::lower::ProjectionProgramCell::new();
+                PROGRAM.get_or_build(|| {
+                    use $crate::domain_event::DomainEventContract;
+                    let mut handlers = ::std::vec::Vec::new();
+                    $(
+                        {
+                            let mutation = $mutation().program()?;
+                            let input_source = $crate::__projection_input_source!($input_src);
+                            $(
+                                handlers.push($crate::bind_event_apply_mutation(
                                     &<$event_ty>::descriptor(),
                                     mutation.clone(),
                                     ::core::stringify!($input_key),
                                     input_source,
-                                )
-                                .map_err(|e| $crate::ProjectionProgramError::InvalidOperation {
-                                    operation: ::std::string::String::from($name),
-                                    reason: e.to_string(),
-                                })?,
-                            );
-                        )+
-                    }
-                )+
-                let program = $crate::compile_projection(
-                    $name,
-                    $version,
-                    $crate::ProjectionPartition::Unit,
-                    handlers,
-                )?;
-                $(let program = $crate::__projection_source_policy!(program, $source)?;)?
-                Ok(program)
+                                )?);
+                            )+
+                        }
+                    )+
+                    let program = $crate::compile_projection(
+                        $name,
+                        $version,
+                        $crate::ProjectionPartition::Unit,
+                        handlers,
+                    )?;
+                    $(let program = program.with_source_ordering(
+                        $crate::__projection_source_ordering!($source),
+                    )?;)?
+                    Ok(program)
+                })
             }
-            fn __resolve(
-                occurrence: &$crate::DomainEventOccurrence,
-            ) -> ::core::result::Result<
-                $crate::ResolvedProjectionPlan,
-                $crate::ProjectionProgramError,
-            > {
-                $crate::resolve_mutation_program(&__handlers()?, occurrence)
-            }
-            fn __lower(
-                plan: &$crate::ResolvedProjectionPlan,
-            ) -> ::core::result::Result<
-                $crate::projection::lower::LoweredProjectionPlan,
-                $crate::projection::lower::ProjectionLoweringError,
-            > {
-                $crate::lower_single_model::<$model>(plan)
-            }
-            fn __inventory() -> ::core::result::Result<
-                $crate::projection::lower::ProjectionOutputInventory,
-                $crate::projection::lower::ProjectionLoweringError,
-            > {
-                $crate::inventory_single_model::<$model>()
-            }
-            $crate::descriptor_from_factories(
-                $name,
-                $version,
-                $epoch,
-                __handlers,
-                __resolve,
-                __lower,
-                __inventory,
-            )
+            $crate::__projection_descriptor!($name, $version, $epoch, $model, __program)
         };
     };
 
@@ -282,55 +245,57 @@ macro_rules! projection {
     ) => {
         $vis const $id: $desc_ty = {
             fn __program() -> ::core::result::Result<
-                $crate::ProjectionProgram,
+                &'static $crate::ProjectionProgram,
                 $crate::ProjectionProgramError,
             > {
-                $program()
+                static PROGRAM: $crate::projection::lower::ProjectionProgramCell =
+                    $crate::projection::lower::ProjectionProgramCell::new();
+                PROGRAM.get_or_build($program)
             }
-            fn __resolve(
-                occurrence: &$crate::DomainEventOccurrence,
-            ) -> ::core::result::Result<
-                $crate::ResolvedProjectionPlan,
-                $crate::ProjectionProgramError,
-            > {
-                $crate::resolve_mutation_program(&__program()?, occurrence)
-            }
-            fn __lower(
-                plan: &$crate::ResolvedProjectionPlan,
-            ) -> ::core::result::Result<
-                $crate::projection::lower::LoweredProjectionPlan,
-                $crate::projection::lower::ProjectionLoweringError,
-            > {
-                $crate::lower_single_model::<$model>(plan)
-            }
-            fn __inventory() -> ::core::result::Result<
-                $crate::projection::lower::ProjectionOutputInventory,
-                $crate::projection::lower::ProjectionLoweringError,
-            > {
-                $crate::inventory_single_model::<$model>()
-            }
-            $crate::descriptor_from_factories(
-                $name,
-                $version,
-                $epoch,
-                __program,
-                __resolve,
-                __lower,
-                __inventory,
-            )
+            $crate::__projection_descriptor!($name, $version, $epoch, $model, __program)
         };
     };
 }
 
-/// Declaration helper for the closed source-ordering policy.
+/// The descriptor of a single-model projection whose program `$program` returns.
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __projection_source_policy {
-    ($program:expr, aggregate_snapshot) => {
-        $program.with_source_snapshots()
+macro_rules! __projection_descriptor {
+    ($name:expr, $version:expr, $epoch:expr, $model:ty, $program:ident) => {{
+        fn __lower(
+            plan: &$crate::ResolvedProjectionPlan,
+        ) -> ::core::result::Result<
+            $crate::projection::lower::LoweredProjectionPlan,
+            $crate::projection::lower::ProjectionLoweringError,
+        > {
+            $crate::lower_single_model::<$model>(plan)
+        }
+        fn __inventory() -> ::core::result::Result<
+            $crate::projection::lower::ProjectionOutputInventory,
+            $crate::projection::lower::ProjectionLoweringError,
+        > {
+            $crate::inventory_single_model::<$model>()
+        }
+        $crate::projection::lower::ProjectionDescriptor::new(
+            $name,
+            $version,
+            $epoch,
+            $program,
+            __lower,
+            __inventory,
+        )
+    }};
+}
+
+/// Map `source: aggregate_snapshot | external_snapshot` for [`projection!`].
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __projection_source_ordering {
+    (aggregate_snapshot) => {
+        $crate::SourceOrdering::AggregateSnapshot
     };
-    ($program:expr, external_snapshot) => {
-        $program.with_external_source_snapshots()
+    (external_snapshot) => {
+        $crate::SourceOrdering::ExternalSnapshot
     };
 }
 

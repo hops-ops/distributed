@@ -233,7 +233,7 @@ pub(crate) enum ProjectionRecordExpectation {
 
 /// Protocol meaning of a staged table mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProjectionMutationKind {
+pub(crate) enum RecordTransition {
     Upsert,
     Delete,
     Recreate,
@@ -245,7 +245,7 @@ pub(crate) struct ProjectionRecordMutation {
     pub(crate) scope: ProjectionRecordScope,
     pub(crate) mutation: TableMutation,
     pub(crate) expectation: ProjectionRecordExpectation,
-    pub(crate) kind: ProjectionMutationKind,
+    pub(crate) kind: RecordTransition,
     pub(crate) source_snapshot: Option<super::super::SourceSnapshotVersion>,
 }
 
@@ -254,7 +254,7 @@ impl ProjectionRecordMutation {
         scope: ProjectionRecordScope,
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
     ) -> Result<Self, ProjectionProtocolError> {
         Self::with_source_snapshot(scope, mutation, expectation, kind, None)
     }
@@ -263,7 +263,7 @@ impl ProjectionRecordMutation {
         scope: ProjectionRecordScope,
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
         source_snapshot: Option<super::super::SourceSnapshotVersion>,
     ) -> Result<Self, ProjectionProtocolError> {
         if let ProjectionRecordExpectation::Exact(revision) = &expectation {
@@ -274,13 +274,13 @@ impl ProjectionRecordMutation {
             }
         }
         let is_delete = matches!(mutation, TableMutation::DeleteRow(_));
-        if is_delete != matches!(kind, ProjectionMutationKind::Delete) {
+        if is_delete != matches!(kind, RecordTransition::Delete) {
             return Err(ProjectionProtocolError::InvalidBatch(
                 "projection delete kind and table mutation disagree".into(),
             ));
         }
-        if (kind == ProjectionMutationKind::Recreate
-            || (kind == ProjectionMutationKind::Delete && source_snapshot.is_none()))
+        if (kind == RecordTransition::Recreate
+            || (kind == RecordTransition::Delete && source_snapshot.is_none()))
             && !matches!(expectation, ProjectionRecordExpectation::Exact(_))
         {
             return Err(ProjectionProtocolError::InvalidBatch(

@@ -165,7 +165,7 @@ fn delete_operation(
     ProjectionOperation::try_new(
         operation_id,
         staging_ordinal,
-        ProjectionMutationKind::Delete,
+        MutationKind::Delete,
         ProjectionTarget::try_new("Todos", "todos")?,
         vec![key(
             0,
@@ -209,7 +209,7 @@ fn golden_program() -> Result<ProjectionProgram, ProjectionProgramError> {
     let upsert = ProjectionOperation::try_new(
         "upsert-todo",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         todos.clone(),
         vec![key(0, "todo_id", body_path(&["todo_id"])?)?],
         vec![
@@ -229,7 +229,7 @@ fn golden_program() -> Result<ProjectionProgram, ProjectionProgramError> {
     let count = ProjectionOperation::try_new(
         "upsert-owner-count",
         1,
-        ProjectionMutationKind::UpsertRelated,
+        MutationKind::UpsertRelated,
         owner_counts,
         vec![key(0, "owner_id", body_path(&["owner_id"])?)?],
         vec![field(0, "count", body_path(&["owner_count"])?)?],
@@ -245,7 +245,7 @@ fn golden_program() -> Result<ProjectionProgram, ProjectionProgramError> {
     let patch = ProjectionOperation::try_new(
         "patch-title",
         0,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
         todos.clone(),
         vec![key(0, "todo_id", body_path(&["todo_id"])?)?],
         vec![
@@ -258,7 +258,7 @@ fn golden_program() -> Result<ProjectionProgram, ProjectionProgramError> {
     let delete = ProjectionOperation::try_new(
         "delete-todo",
         0,
-        ProjectionMutationKind::Delete,
+        MutationKind::Delete,
         todos.clone(),
         vec![
             key(1, "incarnation", body_path(&["incarnation"])?)?,
@@ -276,7 +276,7 @@ fn golden_program() -> Result<ProjectionProgram, ProjectionProgramError> {
     let related = ProjectionOperation::try_new(
         "insert-owner-todo",
         0,
-        ProjectionMutationKind::InsertRelated,
+        MutationKind::InsertRelated,
         ProjectionTarget::try_new("OwnerTodos", "owner_todos")?,
         vec![
             key(1, "todo_id", body_path(&["todo_id"])?)?,
@@ -361,7 +361,7 @@ struct IdentityProgramCase {
     arm_id: &'static str,
     operation_id: &'static str,
     primary_staging_ordinal: u32,
-    kind: ProjectionMutationKind,
+    kind: MutationKind,
     model: &'static str,
     storage: &'static str,
     key_value: &'static str,
@@ -380,7 +380,7 @@ impl IdentityProgramCase {
             arm_id: "event",
             operation_id: "primary",
             primary_staging_ordinal: 0,
-            kind: ProjectionMutationKind::Patch,
+            kind: MutationKind::Patch,
             model: "Todos",
             storage: "todos",
             key_value: "one",
@@ -439,7 +439,7 @@ fn semantic_identity_program(
     let secondary = ProjectionOperation::try_new(
         "secondary",
         1 - case.primary_staging_ordinal,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
         ProjectionTarget::try_new("Todos", "todos")?,
         vec![key(
             0,
@@ -500,7 +500,7 @@ fn program_identity_binds_every_event_wire_contract_field() -> Result<(), Box<dy
         DOMAIN_EVENT_BODY_CODEC,
         DOMAIN_EVENT_BODY_CODEC_VERSION,
     )?;
-    let baseline_id = simple_program(baseline.clone())?.id()?;
+    let baseline_id = simple_program(baseline.clone())?.id();
     let variants = [
         ProjectionEventSelector::try_new(
             2,
@@ -624,7 +624,7 @@ fn program_identity_binds_every_event_wire_contract_field() -> Result<(), Box<dy
         )?,
     ];
     for selector in variants {
-        assert_ne!(simple_program(selector)?.id()?, baseline_id);
+        assert_ne!(simple_program(selector)?.id(), baseline_id);
     }
     let signed_program = ProjectionProgram::try_new(
         "typed-number",
@@ -646,7 +646,7 @@ fn program_identity_binds_every_event_wire_contract_field() -> Result<(), Box<dy
             vec![delete_operation("delete", 0, ProjectionValue::unsigned(1))?],
         )?],
     )?;
-    assert_ne!(signed_program.id()?, unsigned_program.id()?);
+    assert_ne!(signed_program.id(), unsigned_program.id());
     assert_eq!(
         ProjectionProgramId::parse(&baseline_id.to_string())?,
         baseline_id
@@ -657,7 +657,7 @@ fn program_identity_binds_every_event_wire_contract_field() -> Result<(), Box<dy
 #[test]
 fn program_identity_binds_every_program_and_operation_semantic() -> Result<(), Box<dyn Error>> {
     let baseline = IdentityProgramCase::baseline();
-    let baseline_id = semantic_identity_program(&baseline)?.id()?;
+    let baseline_id = semantic_identity_program(&baseline)?.id();
     let mut variants = Vec::new();
 
     let mut variant = baseline.clone();
@@ -681,7 +681,7 @@ fn program_identity_binds_every_program_and_operation_semantic() -> Result<(), B
     variant.primary_staging_ordinal = 1;
     variants.push(("staging ordinal", variant));
     let mut variant = baseline.clone();
-    variant.kind = ProjectionMutationKind::UpsertPatch;
+    variant.kind = MutationKind::UpsertPatch;
     variants.push(("operation kind", variant));
     let mut variant = baseline.clone();
     variant.model = "TodoCards";
@@ -707,7 +707,7 @@ fn program_identity_binds_every_program_and_operation_semantic() -> Result<(), B
 
     for (semantic, variant) in variants {
         assert_ne!(
-            semantic_identity_program(&variant)?.id()?,
+            semantic_identity_program(&variant)?.id(),
             baseline_id,
             "{semantic} was not bound into the program identity"
         );
@@ -727,7 +727,7 @@ fn source_collection_order_does_not_change_canonical_program() -> Result<(), Box
         arms,
     )?;
     assert_eq!(baseline.canonical_bytes()?, reordered.canonical_bytes()?);
-    assert_eq!(baseline.id()?, reordered.id()?);
+    assert_eq!(baseline.id(), reordered.id());
     Ok(())
 }
 
@@ -763,7 +763,7 @@ fn resolution_preserves_state_upsert_scope_and_provenance() -> Result<(), Box<dy
     );
     assert!(invalidation.source_key().is_some());
     assert!(invalidation.target_key().is_none());
-    assert_eq!(todo.kind(), ProjectionMutationKind::Upsert);
+    assert_eq!(todo.kind(), MutationKind::Upsert);
     assert_eq!(todo.scope().model(), "Todos");
     assert_eq!(todo.scope().storage(), "todos");
     assert_eq!(todo.scope().partition(), plan.partition());
@@ -789,7 +789,7 @@ fn patch_keeps_null_absent_and_unset_distinct() -> Result<(), Box<dyn Error>> {
     let operation = ProjectionOperation::try_new(
         "patch",
         0,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
         target,
         vec![key(0, "todo_id", body_path(&["todo_id"])?)?],
         vec![
@@ -839,10 +839,7 @@ fn deletion_and_related_invalidation_are_modeled_without_link_ops() -> Result<()
     )?;
     let delete_plan =
         ProjectionPlanTemplate::<GoldenEvents>::try_new(golden_program()?)?.resolve(&deletion)?;
-    assert_eq!(
-        delete_plan.mutations()[0].kind(),
-        ProjectionMutationKind::Delete
-    );
+    assert_eq!(delete_plan.mutations()[0].kind(), MutationKind::Delete);
     assert_eq!(delete_plan.mutations()[0].key().fields().len(), 2);
     let unlink = &delete_plan.mutations()[0]
         .provenance()
@@ -864,7 +861,7 @@ fn deletion_and_related_invalidation_are_modeled_without_link_ops() -> Result<()
     let related_plan =
         ProjectionPlanTemplate::<GoldenEvents>::try_new(golden_program()?)?.resolve(&related)?;
     let mutation = &related_plan.mutations()[0];
-    assert_eq!(mutation.kind(), ProjectionMutationKind::InsertRelated);
+    assert_eq!(mutation.kind(), MutationKind::InsertRelated);
     assert_eq!(
         mutation.provenance().relationship_effects()[0]
             .relationship()
@@ -887,7 +884,7 @@ fn reassignment_patch_retains_old_unlink_and_new_link_keys() -> Result<(), Box<d
     let operation = ProjectionOperation::try_new(
         "reassign",
         0,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
         ProjectionTarget::try_new("Todos", "todos")?,
         vec![key(0, "todo_id", body_path(&["todo_id"])?)?],
         vec![field(0, "owner_id", body_path(&["owner_id"])?)?],
@@ -957,7 +954,7 @@ fn relationship_invalidation_inventory_is_a_set_but_keyed_roots_remain_ordered(
             ProjectionOperation::try_new(
                 "invalidate-owner-todos",
                 0,
-                ProjectionMutationKind::Patch,
+                MutationKind::Patch,
                 ProjectionTarget::try_new("Todos", "todos")?,
                 vec![key(0, "todo_id", body_path(&["todo_id"])?)?],
                 vec![field(0, "title", body_path(&["title"])?)?],
@@ -1041,7 +1038,7 @@ fn compatible_patches_coalesce_and_conflicts_fail_at_registration() -> Result<()
     let title = ProjectionOperation::try_new(
         "title",
         0,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
         target.clone(),
         key_fields.clone(),
         vec![field(0, "title", body_path(&["title"])?)?],
@@ -1051,7 +1048,7 @@ fn compatible_patches_coalesce_and_conflicts_fail_at_registration() -> Result<()
     let status = ProjectionOperation::try_new(
         "status",
         1,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
         target.clone(),
         key_fields.clone(),
         vec![field(0, "status", body_path(&["status"])?)?],
@@ -1074,7 +1071,7 @@ fn compatible_patches_coalesce_and_conflicts_fail_at_registration() -> Result<()
     let left = ProjectionOperation::try_new(
         "left",
         0,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
         target.clone(),
         key_fields.clone(),
         vec![field(0, "title", body_path(&["title"])?)?],
@@ -1084,7 +1081,7 @@ fn compatible_patches_coalesce_and_conflicts_fail_at_registration() -> Result<()
     let right = ProjectionOperation::try_new(
         "right",
         1,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
         target,
         key_fields,
         vec![field(
@@ -1103,7 +1100,7 @@ fn compatible_patches_coalesce_and_conflicts_fail_at_registration() -> Result<()
     let dynamic_left = ProjectionOperation::try_new(
         "dynamic-left",
         0,
-        ProjectionMutationKind::Delete,
+        MutationKind::Delete,
         ProjectionTarget::try_new("Todos", "todos")?,
         vec![key(0, "todo_id", body_path(&["left_id"])?)?],
         vec![],
@@ -1113,7 +1110,7 @@ fn compatible_patches_coalesce_and_conflicts_fail_at_registration() -> Result<()
     let dynamic_right = ProjectionOperation::try_new(
         "dynamic-right",
         1,
-        ProjectionMutationKind::Delete,
+        MutationKind::Delete,
         ProjectionTarget::try_new("Todos", "todos")?,
         vec![key(0, "todo_id", body_path(&["right_id"])?)?],
         vec![],
@@ -1141,7 +1138,7 @@ fn complete_row_key_assignment_must_match_the_canonical_key_expression(
     ProjectionOperation::try_new(
         "safe-upsert",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         target.clone(),
         key_fields.clone(),
         vec![field(0, "todo_id", key_expression)?],
@@ -1152,7 +1149,7 @@ fn complete_row_key_assignment_must_match_the_canonical_key_expression(
     let error = ProjectionOperation::try_new(
         "unsafe-upsert",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         target,
         key_fields,
         vec![field(
@@ -1335,7 +1332,7 @@ fn key_partition_and_numeric_codecs_cover_exact_boundaries() -> Result<(), Box<d
         let operation = ProjectionOperation::try_new(
             "typed-path",
             0,
-            ProjectionMutationKind::Patch,
+            MutationKind::Patch,
             ProjectionTarget::try_new("Numbers", "numbers")?,
             vec![key(
                 0,
@@ -1358,8 +1355,8 @@ fn key_partition_and_numeric_codecs_cover_exact_boundaries() -> Result<(), Box<d
         )
     };
     assert_ne!(
-        typed_path_program(ProjectionValueType::I64)?.id()?,
-        typed_path_program(ProjectionValueType::U64)?.id()?
+        typed_path_program(ProjectionValueType::I64)?.id(),
+        typed_path_program(ProjectionValueType::U64)?.id()
     );
 
     let key_limit = crate::projection_protocol::MAX_PROJECTION_RECORD_KEY_BYTES;

@@ -34,7 +34,7 @@ impl ProjectionCommitBatch {
         let mut scopes = std::collections::HashSet::new();
         for mutation in &self.mutations {
             validate_scope(topology, partition, &mutation.scope)?;
-            if mutation.kind == ProjectionMutationKind::Delete
+            if mutation.kind == RecordTransition::Delete
                 && matches!(mutation.expectation, ProjectionRecordExpectation::Missing)
                 && mutation.source_snapshot.is_none()
             {
@@ -139,7 +139,7 @@ pub(crate) struct SameTransactionProjectionMutation {
 #[derive(Debug)]
 pub(crate) struct SameTransactionProjectionBatch {
     pub(crate) topology: ProjectorTopologyId,
-    pub(crate) partition: ProjectionPartition,
+    pub(crate) partition: PartitionId,
     pub(crate) change_epoch: ProjectionEpoch,
     pub(crate) ownership: Vec<ProjectionModelOwnership>,
     pub(crate) causation_id: String,
@@ -150,7 +150,7 @@ pub(crate) struct SameTransactionProjectionBatch {
 impl SameTransactionProjectionBatch {
     pub(crate) fn single_upsert(
         topology: ProjectorTopologyId,
-        partition: ProjectionPartition,
+        partition: PartitionId,
         change_epoch: ProjectionEpoch,
         ownership: ProjectionModelOwnership,
         scope: ProjectionRecordScope,

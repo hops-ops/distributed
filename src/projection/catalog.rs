@@ -844,14 +844,13 @@ mod tests {
         ProjectionSourceBinding, ProjectionTopologyError, PROJECTION_PARTITION_CODEC_VERSION,
     };
     use crate::projection::{
-        ProjectionArm, ProjectionAssignment, ProjectionExpression, ProjectionField,
-        ProjectionKeyField, ProjectionMutationKind, ProjectionOperation, ProjectionPartition,
-        ProjectionProgram, ProjectionTarget, ProjectionValue,
-        PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
+        MutationKind, ProjectionArm, ProjectionAssignment, ProjectionExpression, ProjectionField,
+        ProjectionKeyField, ProjectionOperation, ProjectionPartition, ProjectionProgram,
+        ProjectionTarget, ProjectionValue, PROJECTION_OPERATION_SEMANTICS_VERSION,
+        PROJECTION_PROGRAM_IR_VERSION,
     };
     use crate::projection_protocol::{
-        ProjectionInputCursor, ProjectionPartition as ProtocolProjectionPartition,
-        ProjectionSource, ProjectorTopologyId,
+        PartitionId, ProjectionInputCursor, ProjectionSource, ProjectorTopologyId,
     };
     use crate::table::{
         ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
@@ -881,12 +880,6 @@ mod tests {
         Ok(program("project_todos", FINGERPRINT_A))
     }
 
-    fn generated_resolve(
-        _: &crate::DomainEventOccurrence,
-    ) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-        unreachable!("placement selection never resolves an occurrence")
-    }
-
     fn generated_lower(
         _: &crate::ResolvedProjectionPlan,
     ) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
@@ -898,12 +891,15 @@ mod tests {
     }
 
     fn generated_descriptor<D>() -> ProjectionDescriptor<D> {
-        ProjectionDescriptor::__generated(
+        ProjectionDescriptor::new(
             "project_todos",
             1,
             "todos-v1",
-            generated_program,
-            generated_resolve,
+            || {
+                static PROGRAM: crate::projection::lower::ProjectionProgramCell =
+                    crate::projection::lower::ProjectionProgramCell::new();
+                PROGRAM.get_or_build(generated_program)
+            },
             generated_lower,
             generated_inventory,
         )
@@ -939,7 +935,7 @@ mod tests {
             fingerprint,
             model,
             storage,
-            ProjectionMutationKind::Upsert,
+            MutationKind::Upsert,
             partition,
         )
     }
@@ -949,7 +945,7 @@ mod tests {
         fingerprint: &str,
         model: &str,
         storage: &str,
-        mutation_kind: ProjectionMutationKind,
+        mutation_kind: MutationKind,
         partition: ProjectionPartition,
     ) -> ProjectionProgram {
         let selector = crate::projection::ProjectionEventSelector::try_new(
@@ -1139,7 +1135,7 @@ mod tests {
             FINGERPRINT_A,
             "Todos",
             "todos",
-            ProjectionMutationKind::Patch,
+            MutationKind::Patch,
             ProjectionPartition::Unit,
         ));
         let error = ProjectionBinding::materialize_direct(
@@ -1329,7 +1325,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(binding.program_id(), program.id().unwrap());
+        assert_eq!(binding.program_id(), program.id());
         assert_eq!(local.bindings()[0].binding_id(), binding.id());
         assert_eq!(remote.bindings()[0].binding_id(), binding.id());
         assert_eq!(rotated.bindings()[0].binding_id(), binding.id());
@@ -1379,7 +1375,7 @@ mod tests {
 
         assert!(active.is_live(&catalog, binding.id(), binding.program_id(), &epoch));
         assert!(active.is_causally_eligible(&catalog, binding.id(), binding.program_id(), &epoch));
-        assert!(!active.is_live(&catalog, binding.id(), other_program.id().unwrap(), &epoch));
+        assert!(!active.is_live(&catalog, binding.id(), other_program.id(), &epoch));
         assert!(!active.is_live(
             &catalog,
             binding.id(),
@@ -1406,7 +1402,7 @@ mod tests {
             .unwrap();
         let cursor = ProjectionInputCursor::new(
             ProjectorTopologyId::new(1, "project_todos", [0x44; 32]).unwrap(),
-            ProtocolProjectionPartition::new(b"tenant-a".to_vec()).unwrap(),
+            PartitionId::new(b"tenant-a".to_vec()).unwrap(),
             ProjectionSource::new("todo-domain", b"todo-1".to_vec()).unwrap(),
             active.bindings()[0].epoch().clone(),
             1,
@@ -1815,7 +1811,7 @@ mod tests {
             FINGERPRINT_A,
             "Todos",
             "todos",
-            ProjectionMutationKind::Upsert,
+            MutationKind::Upsert,
             ProjectionPartition::Unit,
         );
         let replacement_program = program_with_kind_and_partition(
@@ -1823,12 +1819,12 @@ mod tests {
             FINGERPRINT_A,
             "Todos",
             "todos",
-            ProjectionMutationKind::Patch,
+            MutationKind::Patch,
             ProjectionPartition::Unit,
         );
         assert_ne!(
-            previous_program.id().unwrap(),
-            replacement_program.id().unwrap(),
+            previous_program.id(),
+            replacement_program.id(),
             "different projection behavior must have different semantic identities"
         );
         let previous_binding = eventual(
@@ -1888,10 +1884,7 @@ mod tests {
                 Some((&previous_catalog, &previous_active)),
             )
             .unwrap();
-        assert_eq!(
-            rotated.bindings()[0].program_id(),
-            replacement_program.id().unwrap()
-        );
+        assert_eq!(rotated.bindings()[0].program_id(), replacement_program.id());
         assert_eq!(rotated.bindings()[0].epoch().as_str(), "todos-rebuild-2");
     }
 

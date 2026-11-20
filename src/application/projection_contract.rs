@@ -214,7 +214,7 @@ mod tests {
         }]);
         json!({
             "ir_version": 1, "name": "repository", "version": 2,
-            "source_snapshots": true,
+            "source_ordering": "aggregate_snapshot",
             "arms": (0..32).map(|index| json!({
                 "arm_id": format!("fact-{}", index % 16),
                 "selector": {

@@ -132,8 +132,8 @@ fn modeled_projection_with_outputs(
     };
     use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
     use crate::{
-        DomainEventBodyKind, ProjectionAssignment, ProjectionEventSelector, ProjectionExpression,
-        ProjectionKeyField, ProjectionMutationKind, ProjectionProgram, ProjectionValue,
+        DomainEventBodyKind, MutationKind, ProjectionAssignment, ProjectionEventSelector,
+        ProjectionExpression, ProjectionKeyField, ProjectionProgram, ProjectionValue,
         DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
     };
 
@@ -160,7 +160,7 @@ fn modeled_projection_with_outputs(
             ProjectionOperation::try_new(
                 format!("{program_name}-upsert-{index}"),
                 index.try_into().unwrap(),
-                ProjectionMutationKind::Upsert,
+                MutationKind::Upsert,
                 ProjectionTarget::try_new(&schema.model_name, &schema.table_name).unwrap(),
                 vec![ProjectionKeyField::try_new(0, "id", value.clone()).unwrap()],
                 vec![ProjectionField::try_new(0, "id", ProjectionAssignment::Set(value)).unwrap()],

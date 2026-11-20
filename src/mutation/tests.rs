@@ -1,136 +1,26 @@
-//! Unit and golden tests for the mutation IR and interpreters.
+use serde::{Deserialize, Serialize};
 
 use crate::projection::{
-    ProjectionEventSelector, ProjectionExpression, ProjectionPartition, ProjectionTarget,
-    ProjectionValue, ProjectionValueType,
+    ProjectionEnvelopeField, ProjectionEventSelector, ProjectionExpression, ProjectionPartition,
+    ProjectionProgramError, ProjectionTarget, ProjectionValueType,
+    MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE,
 };
 use crate::{DomainEventBodyKind, DOMAIN_EVENT_OCCURRENCE_VERSION};
 
 use super::*;
 
-const STATE_FP: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+const STATE_FP: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-fn todos_target() -> ProjectionTarget {
-    ProjectionTarget::try_new("Todos", "todos").unwrap()
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, crate::ReadModel)]
+#[readmodel(table = "mutation_todos", primary_key = ["todo_id"])]
+struct Todos {
+    todo_id: String,
+    title: String,
+    done: bool,
+    rank: i64,
 }
 
-fn string_path(segments: &[&str]) -> MutationExpression {
-    MutationExpression::input_path(
-        ProjectionValueType::String,
-        segments.iter().map(|segment| (*segment).to_owned()),
-    )
-    .unwrap()
-}
-
-fn explicit_save_todo() -> MutationProgram {
-    let key =
-        vec![MutationKeyField::try_new(0, "todo_id", string_path(&["todo", "todo_id"])).unwrap()];
-    let fields = vec![
-        MutationField::try_new(
-            0,
-            "todo_id",
-            MutationAssignment::set(string_path(&["todo", "todo_id"])),
-        )
-        .unwrap(),
-        MutationField::try_new(
-            1,
-            "owner_id",
-            MutationAssignment::set(string_path(&["todo", "owner_id"])),
-        )
-        .unwrap(),
-        MutationField::try_new(
-            2,
-            "title",
-            MutationAssignment::set(string_path(&["todo", "title"])),
-        )
-        .unwrap(),
-        MutationField::try_new(
-            3,
-            "status",
-            MutationAssignment::set(string_path(&["todo", "status"])),
-        )
-        .unwrap(),
-    ];
-    let op = MutationOperation::try_new(
-        "upsert-todo",
-        0,
-        MutationKind::Upsert,
-        todos_target(),
-        key,
-        fields,
-        Some(MutationConflictTarget::PrimaryKey),
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .unwrap();
-    MutationProgram::try_new("save_todo", 1, vec![op]).unwrap()
-}
-
-fn sugar_save_todo() -> MutationProgram {
-    let op = MutationOperation::state_upsert(
-        "upsert-todo",
-        0,
-        todos_target(),
-        &[(0, "todo_id")],
-        &[
-            (0, "owner_id", ProjectionValueType::String),
-            (1, "title", ProjectionValueType::String),
-            (2, "status", ProjectionValueType::String),
-        ],
-        &["todo"],
-    )
-    .unwrap();
-    MutationProgram::try_new("save_todo", 1, vec![op]).unwrap()
-}
-
-fn delete_todo() -> MutationProgram {
-    let key = vec![MutationKeyField::try_new(0, "todo_id", string_path(&["todo_id"])).unwrap()];
-    let op = MutationOperation::try_new(
-        "delete-todo",
-        0,
-        MutationKind::Delete,
-        todos_target(),
-        key,
-        Vec::new(),
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .unwrap();
-    MutationProgram::try_new("delete_todo", 1, vec![op]).unwrap()
-}
-
-fn patch_todo_status() -> MutationProgram {
-    let key = vec![MutationKeyField::try_new(0, "todo_id", string_path(&["todo_id"])).unwrap()];
-    let fields = vec![
-        MutationField::try_new(
-            0,
-            "status",
-            MutationAssignment::set(string_path(&["status"])),
-        )
-        .unwrap(),
-        MutationField::try_new(1, "legacy_title", MutationAssignment::unset()).unwrap(),
-        MutationField::try_new(2, "assignee_id", MutationAssignment::unknown()).unwrap(),
-    ];
-    let op = MutationOperation::try_new(
-        "patch-todo",
-        0,
-        MutationKind::Patch,
-        todos_target(),
-        key,
-        fields,
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .unwrap();
-    MutationProgram::try_new("patch_todo", 1, vec![op]).unwrap()
-}
-
-fn state_selector() -> ProjectionEventSelector {
+fn selector() -> ProjectionEventSelector {
     ProjectionEventSelector::try_new(
         DOMAIN_EVENT_OCCURRENCE_VERSION,
         "todo.state-published",
@@ -146,504 +36,296 @@ fn state_selector() -> ProjectionEventSelector {
     .unwrap()
 }
 
-#[test]
-fn sugar_and_explicit_upsert_canonicalize_identically() {
-    let explicit = explicit_save_todo();
-    let sugar = sugar_save_todo();
-    assert_eq!(
-        explicit.canonical_bytes().unwrap(),
-        sugar.canonical_bytes().unwrap()
-    );
-    assert_eq!(
-        explicit.id().unwrap().to_string(),
-        sugar.id().unwrap().to_string()
-    );
-    assert!(explicit
-        .id()
-        .unwrap()
-        .to_string()
-        .starts_with("mp1:sha256:"));
+fn schema() -> &'static crate::table::TableSchema {
+    <Todos as crate::RelationalReadModel>::schema()
 }
 
-#[test]
-fn mutation_from_state_materializes_row_from_known_state_json() {
-    #[derive(serde::Serialize)]
-    struct KnownState {
-        todo_id: String,
-        owner_id: String,
-        title: String,
-        status: String,
-    }
-    #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
-    struct TodoRow {
-        todo_id: String,
-        owner_id: String,
-        title: String,
-        status: String,
-    }
+const SAVE: Mutation<()> = Mutation::declare(
+    "SaveTodo",
+    1,
+    &[MutationStep::Upsert {
+        model: schema,
+        object: &["todo"],
+    }],
+);
 
-    let mutation: Mutation<()> = Mutation::from_program(sugar_save_todo());
-    let row: TodoRow = mutation
-        .from_state(&KnownState {
-            todo_id: "t1".into(),
-            owner_id: "alice".into(),
-            title: "Read".into(),
-            status: "completed".into(),
-        })
-        .expect("from_state should materialize the mutation row shape");
-    assert_eq!(
-        row,
-        TodoRow {
-            todo_id: "t1".into(),
-            owner_id: "alice".into(),
-            title: "Read".into(),
-            status: "completed".into(),
-        }
-    );
-}
+const DELETE: Mutation<()> = Mutation::declare(
+    "DeleteTodo",
+    1,
+    &[MutationStep::Delete {
+        model: schema,
+        key: &[MutationInput {
+            column: "todo_id",
+            path: &["todo_id"],
+        }],
+    }],
+);
 
-#[test]
-fn mutation_program_contains_no_event_selector_fields() {
-    let program = explicit_save_todo();
-    let json = serde_json::to_value(&program).unwrap();
-    let text = json.to_string();
-    assert!(!text.contains("event_name"));
-    assert!(!text.contains("body_fingerprint"));
-    assert!(!text.contains("\"selector\""));
-    assert!(!text.contains("\"placement\""));
-    assert!(!text.contains("\"owner\""));
-    assert!(json.get("arms").is_none());
-    assert_eq!(json["ir_version"], 1);
-    assert_eq!(json["operation_semantics_version"], 1);
-    assert_eq!(json["name"], "save_todo");
-}
-
-#[test]
-fn field_presence_lattice_is_preserved_in_ast() {
-    let program = patch_todo_status();
-    let fields = program.operations()[0].fields();
-    assert!(matches!(fields[0].assignment(), MutationAssignment::Set(_)));
-    assert!(matches!(fields[1].assignment(), MutationAssignment::Unset));
-    assert!(matches!(
-        fields[2].assignment(),
-        MutationAssignment::Unknown
-    ));
-    let json = serde_json::to_value(program.operations()[0].fields()).unwrap();
-    assert_eq!(json[1]["assignment"]["kind"], "unset");
-    assert_eq!(json[2]["assignment"]["kind"], "unknown");
-}
-
-#[test]
-fn delete_and_upsert_round_trip_through_canonical_bytes() {
-    for program in [explicit_save_todo(), delete_todo(), patch_todo_status()] {
-        let bytes = program.canonical_bytes().unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["ir_version"], MUTATION_PROGRAM_IR_VERSION);
-        let id = program.id().unwrap();
-        assert_eq!(MutationProgramId::parse(&id.to_string()).unwrap(), id);
-    }
-}
-
-#[test]
-fn rejects_incomplete_keys_and_ambiguous_same_record_ops() {
-    let incomplete = MutationOperation::try_new(
-        "bad",
-        0,
-        MutationKind::Upsert,
-        todos_target(),
-        Vec::new(),
-        vec![
-            MutationField::try_new(0, "title", MutationAssignment::set(string_path(&["title"])))
-                .unwrap(),
-        ],
-        Some(MutationConflictTarget::PrimaryKey),
-        Vec::new(),
-        Vec::new(),
-        None,
-    );
-    assert!(matches!(
-        incomplete,
-        Err(MutationProgramError::InvalidOperation { .. })
-    ));
-
-    let key = vec![MutationKeyField::try_new(0, "todo_id", string_path(&["todo_id"])).unwrap()];
-    let left = MutationOperation::try_new(
-        "left",
-        0,
-        MutationKind::Upsert,
-        todos_target(),
-        key.clone(),
-        vec![
-            MutationField::try_new(0, "title", MutationAssignment::set(string_path(&["title"])))
-                .unwrap(),
-        ],
-        Some(MutationConflictTarget::PrimaryKey),
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .unwrap();
-    let right = MutationOperation::try_new(
-        "right",
+fn bound(
+    mutation: Mutation<()>,
+    inputs: Vec<MutationInputBinding>,
+) -> Result<crate::ProjectionProgram, ProjectionProgramError> {
+    compile_projection(
+        "todos",
         1,
-        MutationKind::Patch,
-        todos_target(),
-        key,
-        vec![MutationField::try_new(
-            0,
-            "status",
-            MutationAssignment::set(string_path(&["status"])),
-        )
-        .unwrap()],
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
+        ProjectionPartition::Unit,
+        [ProjectionHandler::try_new(
+            "changed",
+            selector(),
+            inputs,
+            mutation.program()?,
+        )?],
     )
-    .unwrap();
-    let ambiguous = MutationProgram::try_new("ambiguous", 1, vec![left, right]);
-    assert!(matches!(
-        ambiguous,
-        Err(MutationProgramError::AmbiguousMutation { .. })
-    ));
+}
+
+fn body(value_type: ProjectionValueType, path: &[&str]) -> ProjectionExpression {
+    ProjectionExpression::body_path(value_type, path.iter().copied()).unwrap()
 }
 
 #[test]
-fn rejects_programs_above_operation_limit() {
-    let mut operations = Vec::new();
-    for index in 0..=MAX_MUTATION_OPERATIONS {
-        let key = vec![MutationKeyField::try_new(
-            0,
-            "todo_id",
-            MutationExpression::constant(ProjectionValue::string(format!("t{index}"))),
-        )
-        .unwrap()];
-        // Different constant keys avoid static ambiguity.
-        operations.push(
-            MutationOperation::try_new(
-                format!("op-{index}"),
-                index as u32,
-                MutationKind::Delete,
-                todos_target(),
-                key,
-                Vec::new(),
-                None,
-                Vec::new(),
-                Vec::new(),
-                None,
+fn a_declared_upsert_writes_every_column_typed_by_the_schema() {
+    let program = SAVE.program().unwrap();
+    let [operation] = program.operations() else {
+        panic!("one statement declares one operation");
+    };
+    assert_eq!(operation.operation_id(), "upsert-0");
+    assert_eq!(operation.kind(), MutationKind::Upsert);
+    assert_eq!(operation.target().storage(), "mutation_todos");
+    assert_eq!(operation.key()[0].input(), ["todo", "todo_id"]);
+    let columns = operation
+        .fields()
+        .iter()
+        .map(MutationColumn::name)
+        .collect::<Vec<_>>();
+    assert_eq!(columns, ["todo_id", "title", "done", "rank"]);
+
+    let bound = bound(
+        SAVE,
+        vec![ProjectionInputSource::Body.binding("todo").unwrap()],
+    )
+    .unwrap();
+    let operation = &bound.arms()[0].operations()[0];
+    let assigned = |name: &str| {
+        let field = operation
+            .fields()
+            .iter()
+            .find(|field| field.name() == name)
+            .unwrap();
+        field.assignment().clone()
+    };
+    assert_eq!(
+        assigned("done"),
+        crate::ProjectionAssignment::Set(body(ProjectionValueType::Boolean, &["done"]))
+    );
+    assert_eq!(
+        assigned("rank"),
+        crate::ProjectionAssignment::Set(body(ProjectionValueType::I64, &["rank"]))
+    );
+    assert_eq!(
+        operation.key()[0].expression(),
+        &body(ProjectionValueType::String, &["todo_id"])
+    );
+}
+
+#[test]
+fn an_input_takes_its_own_binding_before_a_bound_parent_object() {
+    let program = bound(
+        SAVE,
+        vec![
+            MutationInputBinding::try_new(
+                vec!["todo".into()],
+                body(ProjectionValueType::Json, &["after"]),
             )
             .unwrap(),
+            body_field_binding(
+                ["todo", "title"],
+                ["renamed_to"],
+                ProjectionValueType::String,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let operation = &program.arms()[0].operations()[0];
+    let expression = |name: &str| {
+        let field = operation
+            .fields()
+            .iter()
+            .find(|field| field.name() == name)
+            .unwrap();
+        let crate::ProjectionAssignment::Set(expression) = field.assignment() else {
+            panic!("a declared column is always set");
+        };
+        expression.clone()
+    };
+    assert_eq!(
+        expression("title"),
+        body(ProjectionValueType::String, &["renamed_to"])
+    );
+    assert_eq!(
+        expression("rank"),
+        body(ProjectionValueType::I64, &["after", "rank"])
+    );
+}
+
+#[test]
+fn a_delete_key_can_come_from_the_envelope() {
+    let program = bound(
+        DELETE,
+        vec![ProjectionInputSource::AggregateId
+            .binding("todo_id")
+            .unwrap()],
+    )
+    .unwrap();
+    let operation = &program.arms()[0].operations()[0];
+    assert_eq!(operation.kind(), MutationKind::Delete);
+    assert!(operation.fields().is_empty());
+    assert_eq!(
+        operation.key()[0].expression(),
+        &ProjectionExpression::envelope(ProjectionEnvelopeField::AggregateId)
+    );
+}
+
+#[test]
+fn an_input_no_event_expression_fills_is_an_error_not_a_guess() {
+    // `todo_id` is bound, but the mutation reads `todo.*`.
+    let unrelated = bound(
+        SAVE,
+        vec![ProjectionInputSource::AggregateId
+            .binding("todo_id")
+            .unwrap()],
+    );
+    assert_eq!(
+        unrelated,
+        Err(ProjectionProgramError::MissingInput {
+            path: "todo.todo_id".into()
+        })
+    );
+    // An envelope field is not an object: nothing can be read through it.
+    let through_scalar = bound(
+        SAVE,
+        vec![ProjectionInputSource::AggregateId.binding("todo").unwrap()],
+    );
+    assert!(matches!(
+        through_scalar,
+        Err(ProjectionProgramError::MissingInput { .. })
+    ));
+    assert!(bound(SAVE, Vec::new()).is_err());
+}
+
+#[test]
+fn a_mutation_names_no_event() {
+    let json = serde_json::to_string(&SAVE.program().unwrap()).unwrap();
+    for event_word in ["selector", "event", "arm", "body", "envelope", "epoch"] {
+        assert!(
+            !json.contains(event_word),
+            "`{event_word}` in a mutation: {json}"
         );
     }
-    let result = MutationProgram::try_new("too-many", 1, operations);
-    assert!(matches!(
-        result,
-        Err(MutationProgramError::TooManyOperations { .. })
-    ));
 }
 
 #[test]
-fn fingerprint_changes_for_semantic_edits_and_stable_for_irrelevant_order() {
-    let base = explicit_save_todo();
-    let reordered_fields = explicit_save_todo();
-    // Reconstruct with same semantics; program already sorts fields by ordinal.
-    assert_eq!(base.id().unwrap(), reordered_fields.id().unwrap());
-
-    let mutated = {
-        let key = vec![
-            MutationKeyField::try_new(0, "todo_id", string_path(&["todo", "todo_id"])).unwrap(),
-        ];
-        let fields = vec![
-            MutationField::try_new(
-                0,
-                "todo_id",
-                MutationAssignment::set(string_path(&["todo", "todo_id"])),
-            )
-            .unwrap(),
-            MutationField::try_new(
-                1,
-                "owner_id",
-                MutationAssignment::set(string_path(&["todo", "owner_id"])),
-            )
-            .unwrap(),
-            MutationField::try_new(
-                2,
-                "title",
-                MutationAssignment::set(string_path(&["todo", "title"])),
-            )
-            .unwrap(),
-            MutationField::try_new(
-                3,
-                "status",
-                MutationAssignment::set(MutationExpression::constant(ProjectionValue::string(
-                    "completed",
-                ))),
-            )
-            .unwrap(),
-        ];
-        let op = MutationOperation::try_new(
-            "upsert-todo",
-            0,
-            MutationKind::Upsert,
-            todos_target(),
-            key,
-            fields,
-            Some(MutationConflictTarget::PrimaryKey),
-            Vec::new(),
-            Vec::new(),
-            None,
+fn invalid_declarations_are_errors() {
+    let column = |name: &str| MutationColumn::try_new(name, ProjectionValueType::String, [name]);
+    let target = || ProjectionTarget::try_new("Todos", "mutation_todos").unwrap();
+    let operation = |id: &str| {
+        MutationOperation::try_new(
+            id,
+            MutationKind::Patch,
+            target(),
+            vec![column("todo_id").unwrap()],
+            vec![column("title").unwrap()],
         )
-        .unwrap();
-        MutationProgram::try_new("save_todo", 1, vec![op]).unwrap()
-    };
-    assert_ne!(base.id().unwrap(), mutated.id().unwrap());
-    let _ = reordered_fields.canonical_bytes();
-}
-
-#[test]
-fn rewrite_to_projection_operations_uses_body_path_bindings() {
-    let program = explicit_save_todo();
-    let bindings = simple_body_bindings(&[
-        (
-            &["todo", "todo_id"],
-            &["todo_id"],
-            ProjectionValueType::String,
-        ),
-        (
-            &["todo", "owner_id"],
-            &["owner_id"],
-            ProjectionValueType::String,
-        ),
-        (&["todo", "title"], &["title"], ProjectionValueType::String),
-        (
-            &["todo", "status"],
-            &["status"],
-            ProjectionValueType::String,
-        ),
-    ])
-    .unwrap();
-    let binding =
-        MutationEventBinding::try_new(state_selector(), bindings, program.clone()).unwrap();
-    let arm = binding.to_projection_arm("state").unwrap();
-    assert_eq!(arm.operations().len(), 1);
-    assert_eq!(
-        arm.operations()[0].kind(),
-        crate::projection::ProjectionMutationKind::Upsert
-    );
-    assert_eq!(arm.operations()[0].fields().len(), 4);
-
-    let projection = binding
-        .to_projection_program("project_todos", 1, ProjectionPartition::Unit, "state")
-        .unwrap();
-    assert_eq!(projection.arms().len(), 1);
-    assert!(projection
-        .id()
         .unwrap()
-        .to_string()
-        .starts_with("pp1:sha256:"));
-}
+    };
 
-#[test]
-fn cache_lowering_preserves_partial_patch_and_fail_closed_auth() {
-    let program = patch_todo_status();
-    let full = lower_mutation_cache(&program, &MutationCacheVisibility::full()).unwrap();
+    assert!(MutationColumn::try_new("", ProjectionValueType::String, ["a"]).is_err());
+    assert!(
+        MutationColumn::try_new("a", ProjectionValueType::String, Vec::<String>::new()).is_err()
+    );
+    assert!(MutationColumn::try_new("a", ProjectionValueType::String, ["a", ""]).is_err());
+    assert!(
+        MutationOperation::try_new("no-key", MutationKind::Delete, target(), vec![], vec![])
+            .is_err()
+    );
+    assert!(MutationProgram::try_new("", 1, vec![operation("a")]).is_err());
+    assert!(MutationProgram::try_new("m", 0, vec![operation("a")]).is_err());
+    assert!(MutationProgram::try_new("m", 1, Vec::new()).is_err());
     assert!(matches!(
-        &full.effects()[0],
-        MutationCacheEffect::Patch { fields, .. }
-            if fields.contains(&"status".to_owned()) && fields.contains(&"legacy_title".to_owned())
+        MutationProgram::try_new("m", 1, vec![operation("a"), operation("a")]),
+        Err(ProjectionProgramError::DuplicateName { .. })
     ));
-
-    let missing_base = lower_mutation_cache(
-        &program,
-        &MutationCacheVisibility {
-            authorized: true,
-            has_base_record: false,
-            relationship_covered: true,
-        },
+    let too_many = (0..=MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE)
+        .map(|index| operation(&format!("op-{index}")))
+        .collect();
+    assert!(matches!(
+        MutationProgram::try_new("m", 1, too_many),
+        Err(ProjectionProgramError::TooManyOperations { .. })
+    ));
+    assert!(
+        MutationInputBinding::try_new(Vec::new(), body(ProjectionValueType::Json, &[])).is_err()
+    );
+    let twice = vec![
+        ProjectionInputSource::Body.binding("todo").unwrap(),
+        ProjectionInputSource::AggregateId.binding("todo").unwrap(),
+    ];
+    assert!(matches!(
+        ProjectionHandler::try_new("changed", selector(), twice, SAVE.program().unwrap()),
+        Err(ProjectionProgramError::DuplicateName { .. })
+    ));
+    // A patch that declares no column is rejected when it is bound.
+    let empty_patch = MutationOperation::try_new(
+        "patch",
+        MutationKind::Patch,
+        target(),
+        vec![column("todo_id").unwrap()],
+        Vec::new(),
     )
     .unwrap();
-    assert!(matches!(
-        &missing_base.effects()[0],
-        MutationCacheEffect::Invalidate { .. }
-    ));
-
-    let unauthorized =
-        lower_mutation_cache(&program, &MutationCacheVisibility::unauthorized()).unwrap();
-    assert!(matches!(
-        &unauthorized.effects()[0],
-        MutationCacheEffect::Invalidate { .. }
-    ));
-}
-
-#[test]
-fn portable_handler_catalog_rejects_duplicate_owner_event_epoch() {
-    let program = explicit_save_todo();
-    // Catalog uniqueness only needs a valid binding registration.
-    let binding = MutationEventBinding::try_new(
-        state_selector(),
-        vec![body_field_binding(
-            ["todo", "todo_id"],
-            ["todo_id"],
-            ProjectionValueType::String,
-        )
-        .unwrap()],
+    let program = MutationProgram::try_new("m", 1, vec![empty_patch]).unwrap();
+    let handler = ProjectionHandler::try_new(
+        "changed",
+        selector(),
+        vec![body_field_binding(["todo_id"], ["id"], ProjectionValueType::String).unwrap()],
         program,
     )
     .unwrap();
-    let reg = MutationHandlerRegistration::try_new(
-        "todos",
-        1,
-        "todo-reads",
-        "e2e-ui-todos-v2",
-        MutationHandlerPlacement::EventualLocal,
-        ProjectionPartition::Unit,
-        binding.clone(),
-    )
-    .unwrap();
-    let mut catalog = MutationHandlerCatalog::new();
-    catalog.register(reg.clone()).unwrap();
-    let dup = MutationHandlerRegistration::try_new(
-        "todos-dup",
-        1,
-        "todo-reads",
-        "e2e-ui-todos-v2",
-        MutationHandlerPlacement::EventualLocal,
-        ProjectionPartition::Unit,
-        binding,
-    )
-    .unwrap();
-    assert!(catalog.register(dup).is_err());
-    assert_eq!(catalog.registrations().len(), 1);
-    assert!(!reg.digest().unwrap().iter().all(|byte| *byte == 0));
+    assert!(handler.arm().is_err());
 }
 
 #[test]
-fn preview_composition_zero_binding_and_multi_owner() {
-    assert!(!zero_binding_preview().has_optimism());
-    let program = explicit_save_todo();
-    let make_reg = |owner: &str, name: &str| {
-        let binding = MutationEventBinding::try_new(
-            state_selector(),
-            vec![body_field_binding(
-                ["todo", "todo_id"],
-                ["todo_id"],
-                ProjectionValueType::String,
-            )
-            .unwrap()],
-            program.clone(),
-        )
-        .unwrap();
-        MutationHandlerRegistration::try_new(
-            name,
-            1,
-            owner,
-            "epoch-1",
-            MutationHandlerPlacement::EventualLocal,
-            ProjectionPartition::Unit,
-            binding,
-        )
-        .unwrap()
-    };
-    // Different models would be needed for multi-owner same event without dual-writer;
-    // here both use Todos so catalog rejects dual writer. Compose at preview layer
-    // with two handler refs directly (catalog validation is separate).
-    let a = make_reg("owner-a", "handler-a");
-    let b = make_reg("owner-b", "handler-b");
-    let layer = compose_event_preview(
-        &[&a, &b],
-        &state_selector(),
-        &MutationCacheVisibility::full(),
-    )
-    .unwrap();
-    assert_eq!(layer.contributions.len(), 2);
-    assert_eq!(causal_scopes(&layer).len(), 1);
-    assert_eq!(causal_scopes(&layer)[0].model, "Todos");
-}
-
-#[test]
-fn read_model_capabilities_are_internal_metadata() {
-    let caps = ReadModelMutationCapabilities::new(
-        "Todos",
-        "todos",
-        vec![MutationKeyCapability {
-            name: "todo_id".into(),
-            value_type: ProjectionValueType::String,
-            ordinal: 0,
-        }],
-        vec![
-            MutationFieldCapability {
-                name: "todo_id".into(),
-                value_type: ProjectionValueType::String,
-                nullable: false,
-                supports_unset: false,
-            },
-            MutationFieldCapability {
-                name: "title".into(),
-                value_type: ProjectionValueType::String,
-                nullable: false,
-                supports_unset: false,
-            },
-        ],
-        Vec::new(),
-    );
-    assert!(caps.is_key_field("todo_id"));
-    assert_eq!(caps.returning, ["todo_id", "title"]);
-    assert!(!caps.field("title").unwrap().nullable);
-}
-
-#[test]
-fn golden_fixture_round_trip_matches_canonical_program() {
-    let program = explicit_save_todo();
-    let bytes = program.canonical_bytes().unwrap();
-    let fixture_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mutation-program-v1.json"
-    );
-    // Write-once style: if fixture missing, create from program; if present, compare.
-    if !std::path::Path::new(fixture_path).exists() {
-        std::fs::write(fixture_path, &bytes).unwrap();
+fn from_state_materializes_the_row_the_mutation_writes() {
+    #[derive(Serialize)]
+    struct State {
+        todo_id: String,
+        title: String,
+        done: bool,
+        rank: i64,
     }
-    let fixture = std::fs::read(fixture_path).unwrap();
-    let fixture_value: serde_json::Value = serde_json::from_slice(&fixture).unwrap();
-    let program_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(
-        fixture_value, program_value,
-        "mutation-program-v1.json golden vector drifted"
-    );
-    assert_eq!(fixture_value["ir_version"], 1);
-    assert!(fixture_value.get("arms").is_none());
-    assert!(fixture_value.get("selector").is_none());
-}
-
-#[test]
-fn constant_expression_rewrite_without_inputs() {
-    let expr = MutationExpression::constant(ProjectionValue::string("completed"));
-    let rewritten = expr
-        .rewrite_with(&|path, _| {
-            Err(MutationProgramError::MissingInput {
-                path: path.join("."),
-            })
+    let row: Todos = SAVE
+        .from_state(&State {
+            todo_id: "t1".into(),
+            title: "Read".into(),
+            done: true,
+            rank: 3,
         })
         .unwrap();
     assert_eq!(
-        rewritten,
-        ProjectionExpression::constant(ProjectionValue::string("completed"))
+        row,
+        Todos {
+            todo_id: "t1".into(),
+            title: "Read".into(),
+            done: true,
+            rank: 3,
+        }
     );
-}
-
-#[test]
-fn presence_labels_cover_lattice() {
-    assert_eq!(
-        presence_label(&ResolvedMutationValue::Value(ProjectionValue::null())),
-        "null"
-    );
-    assert_eq!(
-        presence_label(&ResolvedMutationValue::Value(ProjectionValue::string("x"))),
-        "value"
-    );
-    assert_eq!(presence_label(&ResolvedMutationValue::Absent), "absent");
-    assert_eq!(presence_label(&ResolvedMutationValue::Unset), "unset");
-    assert_eq!(presence_label(&ResolvedMutationValue::Unknown), "unknown");
-    assert!(!is_cache_writable(&ResolvedMutationValue::Unknown));
-    assert!(is_cache_writable(&ResolvedMutationValue::Unset));
+    #[derive(Serialize)]
+    struct Partial {
+        todo_id: String,
+    }
+    assert!(SAVE
+        .from_state::<_, Todos>(&Partial {
+            todo_id: "t1".into()
+        })
+        .is_err());
 }

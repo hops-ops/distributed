@@ -8,10 +8,10 @@ use crate::DomainEventOccurrence;
 
 use super::canonical::{bounded_key_bytes, bounded_partition_bytes, canonical_json_bytes};
 use super::{
-    ProjectionArm, ProjectionInvalidation, ProjectionKeyField, ProjectionMutationKind,
-    ProjectionOperation, ProjectionPartition, ProjectionProgram, ProjectionProgramError,
-    ProjectionProgramId, ProjectionRelationship, ProjectionRelationshipEffectKind,
-    ProjectionTarget, ProjectionValue, ResolvedProjectionValue,
+    MutationKind, ProjectionArm, ProjectionInvalidation, ProjectionKeyField, ProjectionOperation,
+    ProjectionPartition, ProjectionProgram, ProjectionProgramError, ProjectionProgramId,
+    ProjectionRelationship, ProjectionRelationshipEffectKind, ProjectionTarget, ProjectionValue,
+    ResolvedProjectionValue, SourceOrdering,
 };
 
 /// Resolved logical partition and its bounded canonical encoding.
@@ -319,7 +319,7 @@ impl ProjectionMutationProvenance {
 /// One final authoritative, adapter-neutral record mutation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ResolvedProjectionMutation {
-    kind: ProjectionMutationKind,
+    kind: MutationKind,
     target: ProjectionTarget,
     scope: ResolvedProjectionMutationScope,
     fields: Vec<ResolvedProjectionField>,
@@ -328,7 +328,7 @@ pub struct ResolvedProjectionMutation {
 
 impl ResolvedProjectionMutation {
     /// Return the authoritative mutation kind.
-    pub fn kind(&self) -> ProjectionMutationKind {
+    pub fn kind(&self) -> MutationKind {
         self.kind
     }
 
@@ -387,12 +387,16 @@ impl ResolvedProjectionPlan {
         program: &ProjectionProgram,
         occurrence: &DomainEventOccurrence,
     ) -> Result<Self, ProjectionProgramError> {
+        let external = occurrence.external_source().is_some();
+        let origin_matches = match program.source_ordering() {
+            SourceOrdering::Position => true,
+            SourceOrdering::AggregateSnapshot => !external,
+            SourceOrdering::ExternalSnapshot => external,
+        };
         if program.source_snapshots() && occurrence.derivation().is_some() {
             return Err(ProjectionProgramError::DerivedSourceSnapshot);
         }
-        if program.source_snapshots()
-            && program.external_source_snapshots() != occurrence.external_source().is_some()
-        {
+        if !origin_matches {
             return Err(ProjectionProgramError::InvalidOperation {
                 operation: program.name().into(),
                 reason: "snapshot origin does not match the declared source policy".into(),
@@ -411,7 +415,7 @@ impl ResolvedProjectionPlan {
         let body: Value = occurrence
             .decode_body()
             .map_err(|error| ProjectionProgramError::CanonicalJson(error.to_string()))?;
-        let program_id = program.id()?;
+        let program_id = program.id();
         let partition = resolve_partition(program.partition(), occurrence, &body)?;
         let mut mutations = arm
             .operations()

@@ -3,11 +3,11 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct PartitionKey {
     pub(super) topology: ProjectorTopologyId,
-    pub(super) partition: ProjectionPartition,
+    pub(super) partition: PartitionId,
 }
 
 impl PartitionKey {
-    pub(super) fn new(topology: &ProjectorTopologyId, partition: &ProjectionPartition) -> Self {
+    pub(super) fn new(topology: &ProjectorTopologyId, partition: &PartitionId) -> Self {
         Self {
             topology: topology.clone(),
             partition: partition.clone(),

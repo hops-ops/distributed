@@ -9,11 +9,10 @@ use crate::microsvc::HasOutboxStore;
 use crate::outbox::{OutboxMessage, OutboxMessageStatus};
 use crate::outbox_worker::OutboxStore;
 use crate::projection_protocol::{
-    ProjectionChange, ProjectionChangeCursor, ProjectionChangeKind, ProjectionEpoch,
-    ProjectionObservation, ProjectionObservationKind, ProjectionPartition,
-    ProjectionRecordMetadata, ProjectionRecordScope, ProjectorTopologyId, RecordRevision,
-    ResolvedProjectionKey, ResolvedProjectionKeyField, ResolvedProjectionObligation,
-    SameTransactionProjectionEvidence,
+    PartitionId, ProjectionChange, ProjectionChangeCursor, ProjectionChangeKind, ProjectionEpoch,
+    ProjectionObservation, ProjectionObservationKind, ProjectionRecordMetadata,
+    ProjectionRecordScope, ProjectorTopologyId, RecordKey, RecordKeyField, RecordRevision,
+    ResolvedProjectionObligation, SameTransactionProjectionEvidence,
 };
 use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
 use crate::repository::{
@@ -87,7 +86,7 @@ fn resolved_obligation(marker: &str) -> ResolvedProjectionObligation {
     let topology =
         crate::projection_protocol::ProjectorTopologyId::new(1, &projector, [7; 32]).unwrap();
     let partition =
-        crate::projection_protocol::ProjectionPartition::new(b"test-partition".to_vec()).unwrap();
+        crate::projection_protocol::PartitionId::new(b"test-partition".to_vec()).unwrap();
     let scope = crate::projection_protocol::ProjectionRecordScope::new(
         topology,
         partition,
@@ -98,8 +97,8 @@ fn resolved_obligation(marker: &str) -> ResolvedProjectionObligation {
     ResolvedProjectionObligation {
         projector,
         model: "LedgerConformanceView".into(),
-        key: ResolvedProjectionKey {
-            fields: vec![ResolvedProjectionKeyField {
+        key: RecordKey {
+            fields: vec![RecordKeyField {
                 field: "id".into(),
                 value: serde_json::json!({"wire": marker, "wide": "18446744073709551615"}),
             }],
@@ -111,7 +110,7 @@ fn resolved_obligation(marker: &str) -> ResolvedProjectionObligation {
 
 fn direct_projection_evidence(marker: &str) -> SameTransactionProjectionEvidence {
     let topology = ProjectorTopologyId::new(1, "ledger-direct-projector", [0x42; 32]).unwrap();
-    let partition = ProjectionPartition::new(format!("partition:{marker}")).unwrap();
+    let partition = PartitionId::new(format!("partition:{marker}")).unwrap();
     let epoch = ProjectionEpoch::new("ledger-direct-v1").unwrap();
     let scope = ProjectionRecordScope::new(
         topology.clone(),

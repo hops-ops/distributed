@@ -9,7 +9,7 @@ use crate::table::{
     ExpectedVersion, RowKey, RowValue, RowValues, RowWriteMode, TableMutation, TableStoreError,
     TableWritePlan,
 };
-use crate::{ProjectionMutationKind, ResolvedProjectionValue};
+use crate::{MutationKind, ResolvedProjectionValue};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommandCommitProofError {
@@ -258,7 +258,7 @@ pub(crate) fn validate_resolved_direct_plan(
             "modeled direct projection must resolve exactly one record mutation",
         ));
     };
-    if resolved.kind() != ProjectionMutationKind::Upsert {
+    if resolved.kind() != MutationKind::Upsert {
         return Err(direct_plan_error(
             "modeled direct projection must resolve one complete upsert",
         ));

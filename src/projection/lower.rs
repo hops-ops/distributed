@@ -14,11 +14,11 @@ use super::ResolvedProjectionField;
 use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
 use crate::table::validate_row_values;
 use crate::{
-    ColumnType, DomainEvent, DomainEventOccurrence, DomainState, ExpectedVersion, PatchMode,
-    ProjectionArm, ProjectionAssignment, ProjectionEventSelector, ProjectionEventSet,
+    ColumnType, DomainEvent, DomainEventOccurrence, DomainState, ExpectedVersion, MutationKind,
+    PatchMode, ProjectionArm, ProjectionAssignment, ProjectionEventSelector, ProjectionEventSet,
     ProjectionExpression, ProjectionField, ProjectionInvalidation, ProjectionKeyField,
-    ProjectionMutationKind, ProjectionOperation, ProjectionPartition, ProjectionPlanTemplate,
-    ProjectionProgram, ProjectionProgramError, ProjectionProgramId, ProjectionRelationship,
+    ProjectionOperation, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
+    ProjectionProgramError, ProjectionProgramId, ProjectionRelationship,
     ProjectionRelationshipEffect, ProjectionTarget, ProjectionValue, ProjectionValueRef,
     ProjectionValueType, ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPlan,
     ResolvedProjectionValue, RowKey, RowPatch, RowValue, RowValues, RowWriteMode,
@@ -323,13 +323,43 @@ impl ProjectionOutputInventory {
     }
 }
 
-/// Generated program factory function.
+/// Returns a descriptor's compiled program, building it on first use.
 #[doc(hidden)]
-pub type ProjectionProgramFactory = fn() -> Result<ProjectionProgram, ProjectionProgramError>;
-/// Generated exact occurrence resolver function.
-#[doc(hidden)]
-pub type ProjectionResolver =
-    fn(&DomainEventOccurrence) -> Result<ResolvedProjectionPlan, ProjectionProgramError>;
+pub type ProjectionProgramFactory =
+    fn() -> Result<&'static ProjectionProgram, ProjectionProgramError>;
+
+/// Holds one descriptor's compiled program for the life of the process.
+///
+/// `projection!` declares one of these per descriptor, so a program is built
+/// and identified once and every resolve reads it by reference. A failed build
+/// is kept too: a declaration that is invalid stays invalid.
+pub struct ProjectionProgramCell(OnceLock<Result<ProjectionProgram, ProjectionProgramError>>);
+
+impl ProjectionProgramCell {
+    /// An empty cell.
+    pub const fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    /// Return the program, calling `build` only if no call has finished yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the one build that ran.
+    pub fn get_or_build(
+        &'static self,
+        build: impl FnOnce() -> Result<ProjectionProgram, ProjectionProgramError>,
+    ) -> Result<&'static ProjectionProgram, ProjectionProgramError> {
+        self.0.get_or_init(build).as_ref().map_err(Clone::clone)
+    }
+}
+
+impl Default for ProjectionProgramCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Generated authoritative ORM lowerer function.
 #[doc(hidden)]
 pub type ProjectionLowerer =
@@ -351,7 +381,6 @@ pub struct ProjectionDescriptor<D = EventualOnly> {
     version: u64,
     epoch: &'static str,
     program: ProjectionProgramFactory,
-    resolve: ProjectionResolver,
     lower: ProjectionLowerer,
     inventory: ProjectionInventoryFactory,
     marker: PhantomData<fn() -> D>,
@@ -371,12 +400,11 @@ impl<D> fmt::Debug for ProjectionDescriptor<D> {
 impl<D> ProjectionDescriptor<D> {
     /// Construct a generated descriptor from closed function items.
     #[doc(hidden)]
-    pub const fn __generated(
+    pub const fn new(
         name: &'static str,
         version: u64,
         epoch: &'static str,
         program: ProjectionProgramFactory,
-        resolve: ProjectionResolver,
         lower: ProjectionLowerer,
         inventory: ProjectionInventoryFactory,
     ) -> Self {
@@ -385,7 +413,6 @@ impl<D> ProjectionDescriptor<D> {
             version,
             epoch,
             program,
-            resolve,
             lower,
             inventory,
             marker: PhantomData,
@@ -410,22 +437,23 @@ impl<D> ProjectionDescriptor<D> {
         self.epoch
     }
 
-    /// Build the canonical task-7 portable program.
+    /// Return the compiled program. It is built on the first call and shared
+    /// by every later one.
     ///
     /// # Errors
     ///
     /// Returns declaration or ORM metadata validation failures.
-    pub fn program(&self) -> Result<ProjectionProgram, ProjectionProgramError> {
+    pub fn program(&self) -> Result<&'static ProjectionProgram, ProjectionProgramError> {
         (self.program)()
     }
 
-    /// Compute the canonical task-7 program digest.
+    /// Return the canonical program digest.
     ///
     /// # Errors
     ///
-    /// Returns declaration or canonical encoding failures.
+    /// Returns declaration failures.
     pub fn program_id(&self) -> Result<ProjectionProgramId, ProjectionProgramError> {
-        self.program()?.id()
+        Ok(self.program()?.id())
     }
 
     /// Resolve one exact domain-event occurrence.
@@ -437,7 +465,7 @@ impl<D> ProjectionDescriptor<D> {
         &self,
         occurrence: &DomainEventOccurrence,
     ) -> Result<ResolvedProjectionPlan, ProjectionProgramError> {
-        (self.resolve)(occurrence)
+        ResolvedProjectionPlan::resolve(self.program()?, occurrence)
     }
 
     /// Lower a resolved logical plan through the existing relational ORM.
@@ -475,7 +503,7 @@ impl<D> ProjectionDescriptor<D> {
             name: self.name,
             version: self.version,
             epoch: self.epoch,
-            program_id: program.id()?,
+            program_id: program.id(),
             outputs: self.output_inventory()?,
             selectors: program
                 .arms()
@@ -483,7 +511,7 @@ impl<D> ProjectionDescriptor<D> {
                 .map(|arm| arm.selector().clone())
                 .collect(),
             unit_partition: matches!(program.partition(), ProjectionPartition::Unit),
-            resolve: self.resolve,
+            program,
             lower: self.lower,
         })
     }
@@ -505,7 +533,7 @@ pub struct ProjectionServerExecutorDescriptor {
     selectors: Vec<ProjectionEventSelector>,
     #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
     unit_partition: bool,
-    resolve: ProjectionResolver,
+    program: &'static ProjectionProgram,
     lower: ProjectionLowerer,
 }
 
@@ -530,7 +558,7 @@ impl ProjectionServerExecutorDescriptor {
         &self,
         occurrence: &DomainEventOccurrence,
     ) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
-        let resolved = (self.resolve)(occurrence)?;
+        let resolved = ResolvedProjectionPlan::resolve(self.program, occurrence)?;
         (self.lower)(&resolved)
     }
 }
@@ -822,7 +850,7 @@ where
     ProjectionOperation::try_new(
         operation_id,
         staging_ordinal,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         projection_target::<M>()?,
         key,
         fields,
@@ -841,7 +869,7 @@ where
 pub fn model_operation<M>(
     operation_id: &'static str,
     staging_ordinal: u32,
-    kind: ProjectionMutationKind,
+    kind: MutationKind,
     key: Vec<ProjectionAuthoringField>,
     fields: Vec<ProjectionAuthoringField>,
 ) -> Result<ProjectionOperation, ProjectionProgramError>
@@ -862,7 +890,7 @@ where
 pub fn related_operation<R>(
     operation_id: &'static str,
     staging_ordinal: u32,
-    kind: ProjectionMutationKind,
+    kind: MutationKind,
     parent: &ProjectionOperation,
     key: Vec<ProjectionAuthoringField>,
     fields: Vec<ProjectionAuthoringField>,
@@ -906,7 +934,7 @@ where
                 child.field_name,
                 parent_expression.clone(),
             ));
-        } else if kind != ProjectionMutationKind::Delete {
+        } else if kind != MutationKind::Delete {
             fields.push(ProjectionAuthoringField::set(
                 child.field_name,
                 parent_expression,
@@ -914,10 +942,10 @@ where
         }
     }
     let effect_kind = match kind {
-        ProjectionMutationKind::InsertRelated | ProjectionMutationKind::UpsertRelated => {
+        MutationKind::InsertRelated | MutationKind::UpsertRelated => {
             Some(crate::ProjectionRelationshipEffectKind::Link)
         }
-        ProjectionMutationKind::Delete => Some(crate::ProjectionRelationshipEffectKind::Unlink),
+        MutationKind::Delete => Some(crate::ProjectionRelationshipEffectKind::Unlink),
         _ => None,
     }
     .ok_or_else(|| ProjectionProgramError::InvalidOperation {
@@ -927,8 +955,8 @@ where
     })?;
 
     let row_kind = match kind {
-        ProjectionMutationKind::InsertRelated => ProjectionMutationKind::Insert,
-        ProjectionMutationKind::UpsertRelated => ProjectionMutationKind::Upsert,
+        MutationKind::InsertRelated => MutationKind::Insert,
+        MutationKind::UpsertRelated => MutationKind::Upsert,
         other => other,
     };
     let built = build_model_operation::<R::Target>(
@@ -989,7 +1017,7 @@ where
     validate_target::<M>(mutation)?;
     let key = resolved_key::<M>(mutation.key())?;
     match mutation.kind() {
-        ProjectionMutationKind::Insert => {
+        MutationKind::Insert => {
             let values = resolved_full_row::<M>(mutation.fields())?;
             builder.stage_projection_full_row::<M>(
                 key,
@@ -998,7 +1026,7 @@ where
                 ExpectedVersion::NotExists,
             )?;
         }
-        ProjectionMutationKind::Upsert | ProjectionMutationKind::Recreate => {
+        MutationKind::Upsert | MutationKind::Recreate => {
             let values = resolved_full_row::<M>(mutation.fields())?;
             builder.stage_projection_full_row::<M>(
                 key,
@@ -1007,22 +1035,22 @@ where
                 ExpectedVersion::Any,
             )?;
         }
-        ProjectionMutationKind::Patch => {
+        MutationKind::Patch => {
             builder.stage_projection_patch::<M>(
                 key,
                 resolved_patch::<M>(mutation.fields())?,
                 PatchMode::UpdateExisting,
             )?;
         }
-        ProjectionMutationKind::UpsertPatch => {
+        MutationKind::UpsertPatch => {
             let patch = resolved_patch::<M>(mutation.fields())?;
             validate_insert_missing_patch::<M>(&key, &patch)?;
             builder.stage_projection_patch::<M>(key, patch, PatchMode::InsertMissing)?;
         }
-        ProjectionMutationKind::Delete => {
+        MutationKind::Delete => {
             builder.stage_projection_delete::<M>(key)?;
         }
-        ProjectionMutationKind::InsertRelated | ProjectionMutationKind::UpsertRelated => {
+        MutationKind::InsertRelated | MutationKind::UpsertRelated => {
             return Err(ProjectionLoweringError::Table(TableStoreError::Metadata(
                 format!(
                     "related mutation for `{}` requires generated relationship lowering",
@@ -1070,15 +1098,11 @@ where
     validate_target::<R::Source>(parent)?;
     let parent_row = resolved_full_row::<R::Source>(parent.fields())?;
     match mutation.kind() {
-        ProjectionMutationKind::InsertRelated | ProjectionMutationKind::UpsertRelated => {
+        MutationKind::InsertRelated | MutationKind::UpsertRelated => {
             let child_row = resolved_full_row::<R::Target>(mutation.fields())?;
             let (mode, expected) = match mutation.kind() {
-                ProjectionMutationKind::InsertRelated => {
-                    (RowWriteMode::Insert, ExpectedVersion::NotExists)
-                }
-                ProjectionMutationKind::UpsertRelated => {
-                    (RowWriteMode::Upsert, ExpectedVersion::Any)
-                }
+                MutationKind::InsertRelated => (RowWriteMode::Insert, ExpectedVersion::NotExists),
+                MutationKind::UpsertRelated => (RowWriteMode::Upsert, ExpectedVersion::Any),
                 _ => unreachable!(),
             };
             builder.stage_projection_related_row::<R::Source, R::Target>(
@@ -1089,7 +1113,7 @@ where
                 expected,
             )?;
         }
-        ProjectionMutationKind::Delete => {
+        MutationKind::Delete => {
             let key = resolved_key::<R::Target>(mutation.key())?;
             builder.stage_projection_delete::<R::Target>(key)?;
         }
@@ -1182,7 +1206,7 @@ fn value_type_for_model(model: &ProjectionModelFieldMetadata) -> ProjectionValue
 fn build_model_operation<M>(
     operation_id: &'static str,
     staging_ordinal: u32,
-    kind: ProjectionMutationKind,
+    kind: MutationKind,
     key: Vec<ProjectionAuthoringField>,
     fields: Vec<ProjectionAuthoringField>,
     invalidations: Vec<ProjectionInvalidation>,

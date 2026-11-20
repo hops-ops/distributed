@@ -54,7 +54,7 @@ pub(super) fn checkpoint_from_stored(
 pub(super) fn decode_stored_receipt<DB>(
     row: &DB::Row,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
 ) -> Result<StoredReceipt, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -197,7 +197,7 @@ where
     let partition_hash: Vec<u8> = row.try_get("partition_hash").map_err(|error| {
         protocol_storage_error::<DB>("decode input identity partition hash", error)
     })?;
-    let decoded_partition = ProjectionPartition::new(partition_bytes.clone())?;
+    let decoded_partition = PartitionId::new(partition_bytes.clone())?;
     verify_digest(
         &partition_hash,
         decoded_partition.digest(),

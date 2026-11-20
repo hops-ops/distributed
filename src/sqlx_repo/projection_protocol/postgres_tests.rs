@@ -82,7 +82,7 @@ mod postgres_tests {
             TrustedProjectionInput::mint(
                 ProjectionInputCursor::new(
                     topology.clone(),
-                    ProjectionPartition::new(format!("{unique}-{partition}").into_bytes()).unwrap(),
+                    PartitionId::new(format!("{unique}-{partition}").into_bytes()).unwrap(),
                     ProjectionSource::new("broker", b"retained-stream".to_vec()).unwrap(),
                     ProjectionEpoch::new("broker-v1").unwrap(),
                     position,
@@ -160,7 +160,7 @@ mod postgres_tests {
         ProjectorTopologyId::new(1, "postgres_projection_runtime", [71; 32]).unwrap()
     }
 
-    fn partition() -> ProjectionPartition {
+    fn partition() -> PartitionId {
         ProjectionScopeCodec::new(topology())
             .encode_partition(Some(&serde_json::json!("postgres-runtime-tenant")))
             .unwrap()
@@ -195,7 +195,7 @@ mod postgres_tests {
         ProjectorTopologyId::new(1, "postgres_graph_runtime", [72; 32]).unwrap()
     }
 
-    fn graph_partition() -> ProjectionPartition {
+    fn graph_partition() -> PartitionId {
         ProjectionScopeCodec::new(graph_topology())
             .encode_partition(Some(&serde_json::json!("postgres-graph-tenant")))
             .unwrap()
@@ -331,7 +331,7 @@ mod postgres_tests {
                 mode: RowWriteMode::Upsert,
             }),
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
         .unwrap()
     }
@@ -392,7 +392,7 @@ mod postgres_tests {
         RowKey::new([("id", RowValue::String("runtime-row".into()))])
     }
 
-    fn matrix_partition(scenario: usize) -> ProjectionPartition {
+    fn matrix_partition(scenario: usize) -> PartitionId {
         ProjectionScopeCodec::new(matrix_topology())
             .encode_partition(Some(&serde_json::json!(format!(
                 "postgres-matrix-{scenario}"
@@ -474,7 +474,7 @@ mod postgres_tests {
                 mode: RowWriteMode::Upsert,
             }),
             expectation,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
         .unwrap()
     }
@@ -588,7 +588,7 @@ mod postgres_tests {
     fn upsert_mutation(
         value: &str,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
     ) -> ProjectionRecordMutation {
         ProjectionRecordMutation::new(scope(), upsert_table_mutation(value), expectation, kind)
             .unwrap()
@@ -603,7 +603,7 @@ mod postgres_tests {
                 expected_version: ExpectedVersion::Any,
             }),
             ProjectionRecordExpectation::Exact(expected),
-            ProjectionMutationKind::Delete,
+            RecordTransition::Delete,
         )
         .unwrap()
     }
@@ -1121,7 +1121,7 @@ mod postgres_tests {
             vec![upsert_mutation(
                 "5",
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
         );
         initial.observations = vec![crate::projection_protocol::ProjectionObservationRequest {
@@ -1191,7 +1191,7 @@ mod postgres_tests {
                     vec![upsert_mutation(
                         "ignored-duplicate",
                         ProjectionRecordExpectation::Missing,
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                 ))
                 .await
@@ -1301,7 +1301,7 @@ mod postgres_tests {
                 vec![upsert_mutation(
                     "7",
                     ProjectionRecordExpectation::Exact(deleted.records[0].revision.clone()),
-                    ProjectionMutationKind::Recreate,
+                    RecordTransition::Recreate,
                 )],
             ))
             .await
@@ -1394,7 +1394,7 @@ mod postgres_tests {
                     vec![upsert_mutation(
                         "must-not-run-before-retry",
                         ProjectionRecordExpectation::Exact(recreated.records[0].revision.clone(),),
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                 ))
                 .await,
@@ -1421,7 +1421,7 @@ mod postgres_tests {
                     vec![upsert_mutation(
                         "10",
                         ProjectionRecordExpectation::Exact(recreated.records[0].revision.clone()),
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                 ))
                 .await
@@ -1477,7 +1477,7 @@ mod postgres_tests {
                     ProjectionRecordExpectation::Exact(
                         before_rollback.record.as_ref().unwrap().revision.clone(),
                     ),
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
             ))
             .await
@@ -1535,7 +1535,7 @@ mod postgres_tests {
                     ProjectionRecordExpectation::Exact(
                         before_rollback.record.as_ref().unwrap().revision.clone(),
                     ),
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
             ))
             .await
@@ -1592,7 +1592,7 @@ mod postgres_tests {
                             vec![upsert_mutation(
                                 "12",
                                 ProjectionRecordExpectation::Exact(repeatable_expectation),
-                                ProjectionMutationKind::Upsert,
+                                RecordTransition::Upsert,
                             )],
                         ))
                         .await?;

@@ -34,7 +34,7 @@ mod tests {
         ProjectorTopologyId::new(1, "other_sql_todo_projector", [99; 32]).unwrap()
     }
 
-    fn partition() -> ProjectionPartition {
+    fn partition() -> PartitionId {
         ProjectionScopeCodec::new(topology())
             .encode_partition(Some(&serde_json::json!("tenant-sql")))
             .unwrap()
@@ -273,7 +273,7 @@ mod tests {
                 mode: RowWriteMode::Upsert,
             }),
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
         .unwrap()
     }
@@ -343,7 +343,7 @@ mod tests {
                 mode: RowWriteMode::Upsert,
             }),
             expectation,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
         .unwrap()
     }
@@ -387,7 +387,7 @@ mod tests {
             other_topology()
         }
 
-        fn partition(&self) -> ProjectionPartition {
+        fn partition(&self) -> PartitionId {
             partition()
         }
 
@@ -402,7 +402,7 @@ mod tests {
         fn mutation(
             &self,
             expectation: ProjectionRecordExpectation,
-            kind: ProjectionMutationKind,
+            kind: RecordTransition,
         ) -> ProjectionRecordMutation {
             mutation(expectation, kind)
         }
@@ -582,7 +582,7 @@ mod tests {
                 mode: RowWriteMode::Upsert,
             }),
             expectation,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
         .unwrap()
     }
@@ -606,15 +606,15 @@ mod tests {
 
     fn mutation(
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
     ) -> ProjectionRecordMutation {
         let table = match kind {
-            ProjectionMutationKind::Delete => TableMutation::DeleteRow(DeleteTableRowMutation {
+            RecordTransition::Delete => TableMutation::DeleteRow(DeleteTableRowMutation {
                 schema: schema(),
                 key: RowKey::new([("id", RowValue::String("todo-1".into()))]),
                 expected_version: ExpectedVersion::Any,
             }),
-            ProjectionMutationKind::Upsert | ProjectionMutationKind::Recreate => {
+            RecordTransition::Upsert | RecordTransition::Recreate => {
                 upsert_table_mutation("todo-1")
             }
         };
@@ -787,7 +787,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 vec![ProjectionObservationRequest {
                     kind: ProjectionObservationKind::Record,
@@ -892,7 +892,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -911,7 +911,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Exact(old.revision),
-                    ProjectionMutationKind::Delete,
+                    RecordTransition::Delete,
                 )],
                 Vec::new(),
             ))
@@ -957,7 +957,7 @@ mod tests {
                     new_scope.clone(),
                     upsert_table_mutation("todo-1"),
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )
                 .unwrap()],
                 observations: Vec::new(),
@@ -1025,7 +1025,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -1073,7 +1073,7 @@ mod tests {
                 ownership: vec![ownership().with_program_id(program_a)],
                 mutations: vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 observations: vec![ProjectionObservationRequest {
                     kind: ProjectionObservationKind::Record,
@@ -1187,7 +1187,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -1418,7 +1418,7 @@ mod tests {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Missing,
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
@@ -1452,7 +1452,7 @@ mod tests {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Missing,
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
@@ -1543,7 +1543,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 vec![ProjectionObservationRequest {
                     kind: ProjectionObservationKind::Record,
@@ -1571,7 +1571,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Exact(created.records[0].revision.clone()),
-                    ProjectionMutationKind::Delete,
+                    RecordTransition::Delete,
                 )],
                 vec![ProjectionObservationRequest {
                     kind: ProjectionObservationKind::Record,
@@ -1602,7 +1602,7 @@ mod tests {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Exact(deleted.records[0].revision.clone(),),
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
@@ -1620,7 +1620,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Exact(deleted.records[0].revision.clone()),
-                    ProjectionMutationKind::Recreate,
+                    RecordTransition::Recreate,
                 )],
                 vec![ProjectionObservationRequest {
                     kind: ProjectionObservationKind::Dependency,
@@ -2496,7 +2496,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -2519,7 +2519,7 @@ mod tests {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Exact(created.records[0].revision.clone()),
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
@@ -2567,7 +2567,7 @@ mod tests {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Missing,
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
