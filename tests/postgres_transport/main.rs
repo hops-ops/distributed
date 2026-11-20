@@ -173,6 +173,31 @@ async fn pg_bus(pool: &sqlx::PgPool, group: &str) -> PostgresBus {
     bus
 }
 
+/// One schema per test; every bus shares its pool.
+struct Postgres {
+    _schema: postgres::PostgresTestSchema,
+    pool: sqlx::PgPool,
+}
+
+impl conformance::bus::BusHarness for Postgres {
+    type Bus = PostgresBus;
+
+    async fn start() -> Option<Self> {
+        let schema = postgres::PostgresTestSchema::create_from_env("bus_conformance", SKIP).await?;
+        let pool = schema.repository().await.pool().clone();
+        Some(Self {
+            _schema: schema,
+            pool,
+        })
+    }
+
+    async fn bus(&self, group: &str) -> PostgresBus {
+        pg_bus(&self.pool, group).await
+    }
+}
+
+conformance::bus::bus_conformance_tests!(Postgres);
+
 #[derive(Default)]
 struct OrderedEvidenceRecorder {
     observed: Mutex<Vec<(String, u64)>>,

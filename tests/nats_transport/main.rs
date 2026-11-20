@@ -13,13 +13,12 @@ use distributed::bus::{
     RunOptions, TransportError,
 };
 use distributed::microsvc::{Context, Message, MessageKind, Routes, Service};
-use distributed::TRACEPARENT;
 use serde_json::json;
 
 // Shared broker-test helpers (bus scenarios, unique, ...).
 #[path = "../transport_conformance/mod.rs"]
 mod conformance;
-use conformance::{recording_for, unique};
+use conformance::unique;
 #[path = "../support/env.rs"]
 mod env_support;
 
@@ -413,68 +412,6 @@ async fn publish_then_consume_round_trips_through_jetstream() {
     );
 }
 
-#[tokio::test]
-async fn message_id_and_metadata_survive_the_round_trip() {
-    let Some(url) = nats_url() else { return };
-    let subject = unique("order.initialized");
-    let stream = unique("STREAM");
-    let durable = unique("consumer");
-
-    let source = NatsJetStreamSource::connect(&url, &stream, vec![subject.clone()], &durable)
-        .await
-        .expect("connect source")
-        .with_fetch_timeout(Duration::from_millis(800));
-
-    let publisher = NatsPublisher::connect(&url)
-        .await
-        .expect("connect publisher");
-    let message = Message::new(&subject, MessageKind::Event, br#"{"k":"v"}"#.to_vec())
-        .with_id("evt-1")
-        .with_metadata("correlation_id", "corr-9")
-        .with_metadata(
-            TRACEPARENT,
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-        );
-    let mut message = message;
-    message.content_type = "application/vnd.example+binary".into();
-    publisher.publish(message).await.expect("publish");
-
-    let observed = Arc::new(Mutex::new(None));
-    let o = observed.clone();
-    let service = Arc::new(
-        Service::new().routes(
-            Routes::new()
-                .with_dependencies(())
-                .event(Box::leak(subject.clone().into_boxed_str()))
-                .handle(move |ctx: &Context<()>| {
-                    let m = ctx.message();
-                    let recorded = Some((
-                        m.id().map(str::to_string),
-                        m.correlation_id().map(str::to_string),
-                        m.traceparent().map(str::to_string),
-                        m.payload().to_vec(),
-                        m.content_type.clone(),
-                    ));
-                    *o.lock().unwrap() = recorded;
-                    async move { Ok(json!({})) }
-                }),
-        ),
-    );
-    run_source(service, source, RunOptions::until_idle())
-        .await
-        .unwrap();
-
-    let got = observed.lock().unwrap().clone().expect("handler ran");
-    assert_eq!(got.0.as_deref(), Some("evt-1"));
-    assert_eq!(got.1.as_deref(), Some("corr-9"));
-    assert_eq!(
-        got.2.as_deref(),
-        Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
-    );
-    assert_eq!(got.3, br#"{"k":"v"}"#.to_vec());
-    assert_eq!(got.4, "application/vnd.example+binary");
-}
-
 /// Build a namespaced `NatsBus` for `group` (empty `group` = no group), with
 /// the stream ensured so publishes have a destination.
 async fn nats_bus(url: &str, namespace: &str, group: &str) -> NatsBus {
@@ -491,6 +428,29 @@ async fn nats_bus(url: &str, namespace: &str, group: &str) -> NatsBus {
     bus.ensure_stream().await.expect("ensure stream");
     bus
 }
+
+/// One namespace (stream) per test.
+struct Nats {
+    url: String,
+    namespace: String,
+}
+
+impl conformance::bus::BusHarness for Nats {
+    type Bus = NatsBus;
+
+    async fn start() -> Option<Self> {
+        Some(Self {
+            url: nats_url()?,
+            namespace: unique("ns").to_lowercase(),
+        })
+    }
+
+    async fn bus(&self, group: &str) -> NatsBus {
+        nats_bus(&self.url, &self.namespace, group).await
+    }
+}
+
+conformance::bus::bus_conformance_tests!(Nats);
 
 /// `send` + `listen`: replicas sharing a `group` compete for the command — each
 /// message is handled exactly once across the pool (point-to-point).
@@ -560,118 +520,6 @@ fn json_decoding_handlers(subject: &str, rec: Arc<Mutex<Vec<String>>>) -> Arc<Ha
             Ok(())
         }
     }))
-}
-
-/// A handler set for `subject` that fails retryably on the first attempt and
-/// succeeds on the second, counting attempts.
-fn fail_once_handlers(subject: &str, attempts: Arc<AtomicUsize>) -> Arc<Handlers> {
-    Arc::new(Handlers::new().on_event(subject, move |_: &Message| {
-        let attempts = attempts.clone();
-        async move {
-            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(TransportError::retryable("transient"))
-            } else {
-                Ok(())
-            }
-        }
-    }))
-}
-
-#[tokio::test]
-async fn retryable_failure_is_redelivered_then_succeeds() {
-    let Some(url) = nats_url() else { return };
-    let subject = unique("delivery.retry");
-    let stream = unique("STREAM");
-    let durable = unique("consumer");
-    let source = failure_source(&url, &subject, &stream, &durable).await;
-
-    let publisher = NatsPublisher::connect(&url)
-        .await
-        .expect("connect publisher");
-    publisher
-        .publish(Message::new(&subject, MessageKind::Event, b"{}".to_vec()).with_id("m1"))
-        .await
-        .expect("publish");
-
-    let attempts = Arc::new(AtomicUsize::new(0));
-    run_source(
-        fail_once_handlers(&subject, attempts.clone()),
-        source,
-        RunOptions::until_idle(),
-    )
-    .await
-    .expect("run drains after the Nak redelivery succeeds");
-
-    assert_eq!(
-        attempts.load(Ordering::SeqCst),
-        2,
-        "the nacked message was redelivered exactly once before the ack"
-    );
-}
-
-#[tokio::test]
-async fn permanent_failure_routes_to_dead_letter_destination() {
-    let Some(url) = nats_url() else { return };
-    let subject = unique("delivery.poison");
-    let stream = unique("STREAM");
-    let durable = unique("consumer");
-    let source = failure_source(&url, &subject, &stream, &durable).await;
-
-    let publisher = NatsPublisher::connect(&url)
-        .await
-        .expect("connect publisher");
-    for id in ["poison", "ok"] {
-        publisher
-            .publish(Message::new(&subject, MessageKind::Event, b"{}".to_vec()).with_id(id))
-            .await
-            .expect("publish");
-    }
-
-    let (dead, options) = storing_dead_letters();
-    let rec = Arc::new(Mutex::new(Vec::new()));
-    let seen = rec.clone();
-    let handlers = Arc::new(
-        Handlers::new().on_event(subject.clone(), move |message: &Message| {
-            let id = message.id().unwrap_or_default().to_string();
-            let seen = seen.clone();
-            async move {
-                if id == "poison" {
-                    Err(TransportError::permanent("unprocessable"))
-                } else {
-                    seen.lock().unwrap().push(id);
-                    Ok(())
-                }
-            }
-        }),
-    );
-    run_source(handlers, source, options)
-        .await
-        .expect("run drains past the poison message");
-    assert_eq!(
-        rec.lock().unwrap().clone(),
-        vec!["ok".to_string()],
-        "subsequent messages still flow after the dead-letter"
-    );
-
-    // Stored with the reason before it was acknowledged.
-    let (id, _, reason) = only_dead_letter(&dead);
-    assert_eq!(id.as_deref(), Some("poison"));
-    assert!(reason.contains("unprocessable"), "{reason}");
-
-    // It was acknowledged: a fresh run over the same durable sees nothing.
-    let source = failure_source(&url, &subject, &stream, &durable).await;
-    let redelivered = Arc::new(Mutex::new(Vec::new()));
-    run_source(
-        recording_for(&subject, MessageKind::Event, redelivered.clone()),
-        source,
-        RunOptions::until_idle(),
-    )
-    .await
-    .expect("redelivery-check run drains");
-    assert!(
-        redelivered.lock().unwrap().is_empty(),
-        "a dead-lettered message must not be redelivered"
-    );
 }
 
 #[tokio::test]

@@ -129,7 +129,6 @@ fn decode_headers(
         MESSAGE_KIND_HEADER,
         values,
     );
-    take_content_type(&mut message);
     restore_external_identity(&mut message)?;
     Ok(message)
 }
@@ -423,25 +422,6 @@ impl NatsReceived {
     }
 }
 
-/// Select the first inbound content type and remove every reserved spelling
-/// from user-visible metadata.
-fn take_content_type(message: &mut Message) {
-    let mut content_type = None;
-    message.metadata.retain(|(key, value)| {
-        if key.eq_ignore_ascii_case(CONTENT_TYPE_HEADER) {
-            if content_type.is_none() {
-                content_type = Some(value.clone());
-            }
-            false
-        } else {
-            true
-        }
-    });
-    if let Some(content_type) = content_type {
-        message.content_type = content_type;
-    }
-}
-
 fn jetstream_ordered(raw: &jetstream::Message) -> Option<OrderedDelivery> {
     let info = raw.info().ok()?;
     let source = ProjectionSource::new("nats.jetstream", info.stream.as_bytes()).ok()?;
@@ -586,12 +566,20 @@ mod tests {
 
     #[test]
     fn content_type_selection_removes_every_case_variant() {
-        let mut message = Message::new("example.recorded", MessageKind::Event, Vec::new())
-            .with_metadata("Content-Type", "application/vnd.example+binary")
-            .with_metadata("x-correlation-id", "corr-1")
-            .with_metadata("content-type", "application/json");
-
-        take_content_type(&mut message);
+        let message = message_from_wire(
+            "example.recorded".into(),
+            Vec::new(),
+            Some(MESSAGE_ID_HEADER),
+            MESSAGE_KIND_HEADER,
+            [
+                (
+                    "Content-Type".to_string(),
+                    "application/vnd.example+binary".to_string(),
+                ),
+                ("x-correlation-id".to_string(), "corr-1".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+        );
 
         assert_eq!(message.content_type, "application/vnd.example+binary");
         assert_eq!(

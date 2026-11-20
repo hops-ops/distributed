@@ -1,10 +1,29 @@
 //! In-memory reference run of the async-transport conformance harness.
 //!
-//! Proves the outbox dispatcher contract against adapter-neutral fakes, with no external broker. Concrete adapters
-//! reuse the harness in [`transport_conformance`] for their own targets.
+//! Runs the bus contract against `InMemoryBus` and the outbox dispatcher
+//! contract against adapter-neutral fakes, with no external broker.
 
 #[path = "../transport_conformance/mod.rs"]
 mod conformance;
+
+use distributed::bus::InMemoryBus;
+
+/// Every bus is a clone of one in-memory bus; it has no consumer groups.
+struct InMemory(InMemoryBus);
+
+impl conformance::bus::BusHarness for InMemory {
+    type Bus = InMemoryBus;
+
+    async fn start() -> Option<Self> {
+        Some(Self(InMemoryBus::new()))
+    }
+
+    async fn bus(&self, _group: &str) -> InMemoryBus {
+        self.0.clone()
+    }
+}
+
+conformance::bus::bus_conformance_tests!(InMemory);
 
 // --- publisher / outbox dispatcher contract ---------------------------------
 

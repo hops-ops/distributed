@@ -11,6 +11,8 @@
 //! `#[path = "../transport_conformance/mod.rs"] mod conformance;`.
 #![allow(dead_code)]
 
+pub mod bus;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

@@ -1540,6 +1540,9 @@ RabbitMQ reports only whether a delivery is a redelivery, so `max_attempts`
 above 2 never triggers there. Positional sources (Kafka, the SQL log) cannot
 deliver a later message first: they hold their position for the backoff.
 
+The [bus contract](docs/bus-contract.md) lists what every transport promises
+and where they differ. One conformance suite runs it against every bus.
+
 A service can place independent route bundles in named delivery lanes
 (`Service::lane(name, routes)`). Each lane keeps broker order and runs
 concurrently with the others, and a delivery is settled only after every lane

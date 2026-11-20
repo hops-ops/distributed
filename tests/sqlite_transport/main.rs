@@ -44,6 +44,27 @@ fn sqlite_bus(pool: &SqlitePool, group: &str) -> SqliteBus {
     }
 }
 
+/// One temporary database per test; every bus shares its pool.
+struct Sqlite {
+    _db: TempDb,
+    pool: SqlitePool,
+}
+
+impl conformance::bus::BusHarness for Sqlite {
+    type Bus = SqliteBus;
+
+    async fn start() -> Option<Self> {
+        let (db, pool, _bus) = bus().await;
+        Some(Self { _db: db, pool })
+    }
+
+    async fn bus(&self, group: &str) -> SqliteBus {
+        sqlite_bus(&self.pool, group)
+    }
+}
+
+conformance::bus::bus_conformance_tests!(Sqlite);
+
 #[derive(Default)]
 struct OrderedEvidenceRecorder {
     observed: Mutex<Vec<(String, u64)>>,
@@ -250,43 +271,6 @@ async fn bus_subscribe_uses_named_service_as_consumer_group() {
         async move { bus }
     })
     .await;
-}
-
-#[tokio::test]
-async fn retryable_command_failure_redelivers_then_completes() {
-    let (_db, pool, bus) = bus().await;
-    bus.send_message(command("c1")).await.expect("send command");
-
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let seen = attempts.clone();
-    let handlers = Arc::new(
-        Handlers::new().on_command(COMMAND_NAME, move |_: &Message| {
-            let seen = seen.clone();
-            async move {
-                let previous = seen.fetch_add(1, Ordering::SeqCst);
-                if previous == 0 {
-                    Err(TransportError::retryable("transient"))
-                } else {
-                    Ok(())
-                }
-            }
-        }),
-    );
-
-    bus.listen(handlers, RunOptions::until_idle())
-        .await
-        .expect("listener drains after retry");
-
-    assert_eq!(
-        attempts.load(Ordering::SeqCst),
-        2,
-        "message was retried once after nack"
-    );
-    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM bus_queue")
-        .fetch_one(&pool)
-        .await
-        .expect("count queue");
-    assert_eq!(remaining, 0, "retried command was acked and deleted");
 }
 
 #[tokio::test]

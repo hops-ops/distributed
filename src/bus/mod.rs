@@ -154,7 +154,7 @@ pub use failure_policy::{FailureAction, FailurePolicy};
 pub use handlers::{Handlers, MessageHandler};
 pub use in_memory_bus::{InMemoryBus, InMemoryReceived};
 #[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
-pub(crate) use message::{message_from_wire, strip_address_prefix};
+pub(crate) use message::{message_from_wire, strip_address_prefix, CONTENT_TYPE_HEADER};
 pub use message::{Message, MessageKind, PayloadDecodeError, SubscriptionPlan};
 pub use message_name::{validate_message_name, MessageNameError, MAX_MESSAGE_NAME_LEN};
 pub use ordered_delivery::OrderedDelivery;

@@ -69,11 +69,11 @@ async fn tolerates_handler_failures_and_keeps_processing() {
     let service = counter_service(store.clone());
 
     // A failing message (increment a counter that was never created → NotFound)
-    // must not wedge the consumer: it should drain and still process the rest.
-    // NotFound is retryable → nacked (a no-op for the in-memory bus), so the run
-    // completes. (We deliberately do not re-read the failed id: the sync queued
-    // `get` inside the handler holds that aggregate's lock once the handler
-    // errors before committing, so re-reading it would block.)
+    // must not wedge the consumer. NotFound is retryable, so the run gives up
+    // after the first delivery and dead-letters it. (It is not retried here:
+    // the sync queued `get` inside the handler holds that aggregate's lock
+    // once the handler errors before committing, so a second delivery of the
+    // same id would block.)
     bus.send_message(command(
         "counter.increment",
         "counter.rejected",
@@ -96,9 +96,12 @@ async fn tolerates_handler_failures_and_keeps_processing() {
     .await
     .expect("good increment should enqueue");
 
-    bus.listen(service.clone(), RunOptions::until_idle())
-        .await
-        .expect("listen should drain past the failed message");
+    bus.listen(
+        service.clone(),
+        RunOptions::until_idle().with_max_attempts(1),
+    )
+    .await
+    .expect("listen should drain past the failed message");
 
     // The good aggregate was still created and incremented, proving the failure
     // did not stop the consumer.
