@@ -19,6 +19,8 @@ export default defineConfig({
 	assetsInclude: ['**/*.wasm'],
 	server: {
 		port: uiPort,
+		// The gateway proxies to this exact port: fail instead of moving.
+		strictPort: true,
 		// hops local cluster-DNS mode uses svc.ns.svc.cluster.local Host headers.
 		host: true,
 		allowedHosts: true

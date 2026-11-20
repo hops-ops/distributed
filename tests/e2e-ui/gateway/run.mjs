@@ -13,7 +13,9 @@ import {verifySessionRefreshContinuity} from './refresh.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const devMode=process.env.GATEWAY_DEV==='1';
 const environment={PATH:process.env.PATH,HOME:process.env.HOME,RUSTUP_TOOLCHAIN:process.env.RUSTUP_TOOLCHAIN||'stable',NODE_ENV:'production'};
-async function freePort(){const server=createServer();server.listen(0,'127.0.0.1');await once(server,'listening');const port=server.address().port;await new Promise(r=>server.close(r));return port;}
+// Never the same port twice in one run: a released port can be handed out again.
+const handedOut=new Set();
+async function freePort(){for(;;){const server=createServer();server.listen(0,'127.0.0.1');await once(server,'listening');const port=server.address().port;await new Promise(r=>server.close(r));if(!handedOut.has(port)){handedOut.add(port);return port;}}}
 function launch(program,args,{cwd=root,env=environment}={}){
   let log='';const child=spawn(program,args,{cwd,env,stdio:['ignore','pipe','pipe']});
   child.on('error',error=>log+='process launch failed: '+error.code);

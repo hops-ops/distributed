@@ -8,9 +8,14 @@ import { pathToFileURL } from 'node:url';
 import { chromium } from '@playwright/test';
 import { startProvider } from './provider.mjs';
 
+// Never the same port twice in one run: a released port can be handed out again.
+const handedOut = new Set();
 async function freePort() {
-  const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
-  const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
+  for (;;) {
+    const server = createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
+    const port = server.address().port; await new Promise(resolve => server.close(resolve));
+    if (!handedOut.has(port)) { handedOut.add(port); return port; }
+  }
 }
 export async function startFixture({ secureCookies = false } = {}) {
   const uiPort = await freePort();

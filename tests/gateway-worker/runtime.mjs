@@ -5,7 +5,9 @@ import { mkdir,writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 export const root=path.dirname(fileURLToPath(import.meta.url));
-export async function freePort(){const server=createServer();server.listen(0,'127.0.0.1');await once(server,'listening');const port=server.address().port;await new Promise(resolve=>server.close(resolve));return port;}
+// Never the same port twice in one run: a released port can be handed out again.
+const handedOut=new Set();
+export async function freePort(){for(;;){const server=createServer();server.listen(0,'127.0.0.1');await once(server,'listening');const port=server.address().port;await new Promise(resolve=>server.close(resolve));if(!handedOut.has(port)){handedOut.add(port);return port;}}}
 export async function startRuntime({apiOrigin,uiOrigin=apiOrigin,mode='all',auth='anonymous',port=0,artifact='query-workerd.log',requestBytes=16*1024*1024}={}){
   port ||= await freePort(); const publicOrigin=`http://127.0.0.1:${port}`;let log='';
   const runner=spawn(process.execPath,['node_modules/wrangler/bin/wrangler.js','dev','--local','--ip','127.0.0.1','--port',String(port),'--var',`PUBLIC_ORIGIN:${publicOrigin}`,'--var',`UI_ORIGIN:${uiOrigin}`,'--var',`API_ORIGIN:${apiOrigin}`,'--var',`DELIVERY_MODE:${mode}`,'--var',`AUTH:${auth}`,'--var',`REQUEST_BYTES:${requestBytes}`],{cwd:root,env:{PATH:process.env.PATH,HOME:process.env.HOME,RUSTUP_TOOLCHAIN:process.env.RUSTUP_TOOLCHAIN||'stable',WRANGLER_SEND_METRICS:'false',CI:'1'},stdio:['ignore','pipe','pipe']});

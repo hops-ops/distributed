@@ -89,13 +89,14 @@ function start(command, args, options, ready) {
 }
 
 /**
- * Largest frame-to-frame move (m) of the own world position / view: one
- * tick of walking (5 m/s × 50 ms = 0.25 m, frames are measured up to 50 ms
- * apart) plus f32 rounding where the position crosses into the next room's
- * coordinates (0.251 seen in CI). A real doorway jump is a room (40 m) or a
- * visible snap.
+ * Largest frame-to-frame move (m) of the own world position / view beyond
+ * what walking explains for the time between the two frames. Walking reads
+ * near 0 at any frame rate: the display eases toward each predicted step, so
+ * a frame can show slightly more than its own share of a step (0.011 seen in
+ * CI on a loaded runner). A real doorway jump is a room (40 m) or a visible
+ * snap.
  */
-const MAX_JUMP = 0.26;
+const MAX_JUMP = 0.1;
 
 /**
  * Walk `page`'s player through the doorway on `side`; resolves with the new
@@ -136,7 +137,7 @@ async function walkThrough(page, side) {
 		const jump = Number(await page.evaluate(() => document.querySelector('canvas').dataset.jump));
 		const after = await world();
 		const [dx, dy] = { east: [1, 0], west: [-1, 0], north: [0, 1], south: [0, -1] }[side];
-		console.error(`doorway ${from} → ${arrived}: largest frame move ${jump} m, world ${before} → ${after}`);
+		console.error(`doorway ${from} → ${arrived}: largest unexplained frame move ${jump} m, world ${before} → ${after}`);
 		if (jump > MAX_JUMP) console.error(`JUMP DEBUG ${await page.evaluate(() => JSON.stringify({ jump: document.querySelector('canvas').dataset.jumpDebug, failed: document.querySelector('canvas').dataset.handoffFailed, closed: document.querySelector('canvas').dataset.zoneClosed }))}`);
 		assert.ok(jump <= MAX_JUMP, `${from} → ${arrived}: the view jumped ${jump} m in one frame`);
 		// Moved on in the doorway's direction, a few metres, not a room.
