@@ -130,54 +130,59 @@ mod tests {
     }
 
     #[test]
-    fn expand_sourced_transition_exports_unconditional_known_state_values() {
+    fn known_values_are_declared_not_read_from_the_recorder_body() {
         let attr = quote! {
             entity,
             aggregate_type = "todo",
             domain_state = TodoState,
         };
-        let item = quote! {
-            impl Todo {
-                pub fn complete(&mut self) {
-                    self.record_completed().unwrap();
-                }
+        let expand = |event: proc_macro2::TokenStream| {
+            sourced::expand_sourced(
+                attr.clone(),
+                quote! {
+                    impl Todo {
+                        pub fn complete(&mut self) {
+                            self.record_completed().unwrap();
+                        }
 
-                #[event("todo.completed", version = 1, domain)]
-                fn record_completed(&mut self) {
-                    self.status = TodoStatus::Completed;
-                    self.label = std::string::String::from("done");
-                    self.shadowed_label = String::from("not-known");
-                    self.assignee_id = None;
-                    if self.audit_enabled {
-                        self.audit_label = "conditional";
+                        #event
+                        fn record_completed(&mut self) {
+                            self.status = TodoStatus::Completed;
+                            self.assignee_id = None;
+                        }
                     }
-                }
-            }
+                },
+            )
         };
 
-        let output = sourced::expand_sourced(attr, item).unwrap().to_string();
+        let undeclared = expand(quote!(#[event("todo.completed", version = 1, domain)]))
+            .unwrap()
+            .to_string();
+        assert!(
+            !undeclared.contains("fn command_event_known_values"),
+            "assignments in the body predict nothing: {undeclared}"
+        );
 
+        let declared = expand(quote!(
+            #[event("todo.completed", version = 1, domain, known(status: "completed", assignee_id: null))]
+        ))
+        .unwrap()
+        .to_string();
         assert!(
-            output.contains("fn command_event_known_values"),
-            "got: {output}"
+            declared.contains("fn command_event_known_values"),
+            "got: {declared}"
         );
         assert!(
-            output.contains("__command_projection_state_known_values"),
-            "got: {output}"
+            declared.contains("state_preview ! { TodoCompletedDomainEvent => TodoState { status : \"completed\" , assignee_id : null , } }"),
+            "got: {declared}"
         );
-        assert!(output.contains("\"status\""), "got: {output}");
-        assert!(output.contains("TodoStatus :: Completed"), "got: {output}");
-        assert!(output.contains("\"label\""), "got: {output}");
-        assert!(
-            output.contains("std :: string :: String :: from (\"done\")"),
-            "got: {output}"
-        );
-        assert!(!output.contains("\"shadowed_label\""), "got: {output}");
-        assert!(output.contains("\"assignee_id\""), "got: {output}");
-        assert!(
-            !output.contains("\"audit_label\""),
-            "conditional assignments are not safe preview facts: {output}"
-        );
+
+        let error = expand(quote!(
+            #[event("todo.completed", version = 1, domain = event, known(status: "completed"))]
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("needs `domain` (state mode)"), "{error}");
     }
 
     #[test]

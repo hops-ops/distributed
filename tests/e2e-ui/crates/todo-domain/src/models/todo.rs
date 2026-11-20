@@ -87,7 +87,7 @@ impl Todo {
         Ok(())
     }
 
-    #[event("todo.created", version = 1, domain)]
+    #[event("todo.created", version = 1, domain, known(status: "open", assignee_id: null))]
     fn record_created(&mut self, todo_id: String, owner_id: String, title: String) {
         self.entity.set_id(&todo_id);
         self.todo_id = todo_id;
@@ -130,7 +130,7 @@ impl Todo {
         Ok(())
     }
 
-    #[event("todo.completed", version = 1, domain)]
+    #[event("todo.completed", version = 1, domain, known(status: "completed"))]
     fn record_completed(&mut self) {
         self.status = TodoStatus::Completed;
         self.advance_snapshot_generation();
@@ -146,7 +146,7 @@ impl Todo {
         Ok(())
     }
 
-    #[event("todo.reopened", version = 1, domain)]
+    #[event("todo.reopened", version = 1, domain, known(status: "open"))]
     fn record_reopened(&mut self) {
         self.status = TodoStatus::Open;
         self.advance_snapshot_generation();
@@ -189,7 +189,7 @@ impl Todo {
         Ok(())
     }
 
-    #[event("todo.archived", version = 1, domain)]
+    #[event("todo.archived", version = 1, domain, known(status: "archived"))]
     fn record_archived(&mut self) {
         self.status = TodoStatus::Archived;
         self.advance_snapshot_generation();
@@ -204,7 +204,7 @@ impl Todo {
         Ok(())
     }
 
-    #[event("todo.force_archived", version = 1, domain)]
+    #[event("todo.force_archived", version = 1, domain, known(status: "archived"))]
     fn record_force_archived(&mut self) {
         self.status = TodoStatus::Archived;
         self.advance_snapshot_generation();

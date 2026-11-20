@@ -163,7 +163,7 @@ impl BlobGame {
         Ok(())
     }
 
-    #[event("blob.initialized", version = 1, domain)]
+    #[event("blob.initialized", version = 1, domain, known(player_dead: false, current_level_completed: true))]
     fn record_initialized(&mut self, game_id: String, owner_id: String) {
         self.entity.set_id(&game_id);
         self.game_id = game_id;
@@ -190,7 +190,7 @@ impl BlobGame {
         Ok(())
     }
 
-    #[event("blob.level_started", version = 1, domain)]
+    #[event("blob.level_started", version = 1, domain, known(current_level_completed: false, player_dead: false))]
     fn record_level_started(&mut self, current_level: i64, map: Vec<Vec<u8>>) {
         self.current_level = current_level;
         self.map = map;
@@ -237,7 +237,7 @@ impl BlobGame {
         self.start_level(owner_id, map)
     }
 
-    #[event("blob.started", version = 1, domain)]
+    #[event("blob.started", version = 1, domain, known(player_dead: false, current_level_completed: false))]
     fn record_started(
         &mut self,
         game_id: String,
@@ -317,7 +317,8 @@ mod tests {
     #[test]
     fn simulate_move_matches_move_dir() {
         let mut g = BlobGame::default();
-        g.start_with_map("g1", "alice", test_map_no_holes()).unwrap();
+        g.start_with_map("g1", "alice", test_map_no_holes())
+            .unwrap();
         let preview = simulate_move(&g.map, g.score, Direction::Right).unwrap();
         g.move_dir("alice", Direction::Right).unwrap();
         assert_eq!(g.map, preview.map);

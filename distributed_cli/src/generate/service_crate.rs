@@ -766,7 +766,7 @@ use serde::{{Deserialize, Serialize}};
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "// Tighten grants by replacing grant_all with:\n//   distributed::graphql_models!(builder, {names})\n// after filling permissions() in each model module.\n"
+                "// Tighten grants by replacing grant_all with one\n//   .model::<module::Model>(module::permissions())\n// per model ({names}) after filling permissions() in each model module.\n"
             )
         };
         let protocol_key_parameter = if self.commands.is_empty() {

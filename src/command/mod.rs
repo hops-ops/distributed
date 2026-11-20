@@ -64,9 +64,9 @@ pub(crate) use projection_obligations::{
 pub use projections::{
     __command_projection_event_descriptor, __command_projection_event_preview,
     __command_projection_events, __command_projection_preview_constant,
-    __command_projection_state_known_values, __command_projection_state_preview, CommandEventSet,
-    CommandProjectionBody, CommandProjectionEventSet, CommandProjectionPreview,
-    CommandProjectionPreviewSource, CommandProjectionPureArg, CommandProjectionPureReduce,
+    __command_projection_state_preview, CommandEventSet, CommandProjectionBody,
+    CommandProjectionEventSet, CommandProjectionPreview, CommandProjectionPreviewSource,
+    CommandProjectionPureArg, CommandProjectionPureReduce,
 };
 pub(crate) use projections::{authenticated_user_field_preview, CommandProjectionEvents};
 // Re-exported for unit tests that resolve obligations through this module path.

@@ -99,8 +99,6 @@ async fn helper_custom_bodies_preserve_paths_descriptors_and_replay() {
         repository::domain_commands::Create::command_event_set(),
         distributed::events![facts::BranchCreated, facts::TagCreated],
     );
-    // Adapter output cannot be inferred from recorder arguments, even literals.
-    assert!(repository::domain_commands::Create::command_event_known_values().is_empty());
 
     let mut aggregate = repository::Repository::default();
     aggregate.create("repo-1".into()).unwrap();

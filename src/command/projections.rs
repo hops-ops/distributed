@@ -705,53 +705,6 @@ where
     structured_preview::<S>(__command_projection_events([descriptor]), fields)
 }
 
-/// Build compiler-inferred state values from a sourced transition.
-///
-/// Unlike the application-authored preview helper, aggregate fields absent
-/// from the outward `DomainState` are ignored. This lets the sourced macro
-/// inspect recorder assignments without coupling private aggregate storage to
-/// the public event schema.
-#[doc(hidden)]
-pub fn __command_projection_state_known_values<E, S>(
-    fields: Vec<(&'static str, CommandProjectionPreviewSource)>,
-) -> CommandProjectionPreview
-where
-    E: DomainEventBodyContract<S>,
-    S: DomainState + ProjectionBodyMetadata,
-{
-    let descriptor = __command_projection_event_descriptor::<E>().and_then(|descriptor| {
-        let expected = DomainEventDescriptor::state::<S>(E::EVENT_NAME, E::EVENT_VERSION);
-        if descriptor != expected || descriptor.body.kind != DomainEventBodyKind::State {
-            return Err(format!(
-                "inferred transition event contract `{}` does not exactly describe `{}` state",
-                E::EVENT_NAME,
-                std::any::type_name::<S>()
-            ));
-        }
-        Ok(descriptor)
-    });
-    let mut values =
-        CommandProjectionPreview::new().events(__command_projection_events([descriptor]));
-    for (rust_name, source) in fields {
-        let Some(field) = S::PROJECTION_FIELDS
-            .iter()
-            .find(|field| field.rust_name == rust_name && field.present)
-        else {
-            continue;
-        };
-        values.fields.push(CommandProjectionPreviewField {
-            body_path: vec![field.wire_name.to_owned()],
-            envelope: None,
-            body_type: Some(field.portable_type),
-            body_rust_type: Some(field.rust_type),
-            body_nullable: Some(field.nullable),
-            body_always_present: Some(field.always_present),
-            source,
-        });
-    }
-    values
-}
-
 /// Build a structured sparse-event preview from generated body metadata.
 #[doc(hidden)]
 pub fn __command_projection_event_preview<E, B>(
@@ -978,7 +931,9 @@ macro_rules! __distributed_state_preview_fields {
             $($tail)*
         )
     };
-    (@collect [$($out:expr,)*] ; $field:ident : $constant:path, $($tail:tt)*) => {
+    // Literals first: `true` / `false` are not paths, and a `path` matcher
+    // that fails to parse is a hard error rather than a fall-through.
+    (@collect [$($out:expr,)*] ; $field:ident : $constant:literal, $($tail:tt)*) => {
         $crate::__distributed_state_preview_fields!(
             @collect [
                 $($out,)*
@@ -990,7 +945,7 @@ macro_rules! __distributed_state_preview_fields {
             $($tail)*
         )
     };
-    (@collect [$($out:expr,)*] ; $field:ident : $constant:literal, $($tail:tt)*) => {
+    (@collect [$($out:expr,)*] ; $field:ident : $constant:path, $($tail:tt)*) => {
         $crate::__distributed_state_preview_fields!(
             @collect [
                 $($out,)*
