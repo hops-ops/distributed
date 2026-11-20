@@ -222,7 +222,7 @@ async fn stream_cookies_redirects_and_upgrades() {
     assert_eq!(value["body"], "input");
     assert_eq!(
         value["headers"]["host"],
-        public.trim_start_matches("http://")
+        upstream.origin.trim_start_matches("http://")
     );
     assert_eq!(
         value["headers"]["x-forwarded-host"],
