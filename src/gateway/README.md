@@ -36,8 +36,8 @@ receive `RequestContext` through Axum request extensions. UI proxy targets come
 from the portable declaration; callers cannot select upstream URLs.
 
 Use the real public origin in `NativeOptions::new`. Incoming identity and
-forwarded headers are stripped; Host and forwarded host/protocol are rebuilt
-from this value, while Origin is preserved for CSRF. Add deployment-specific
+forwarded headers are stripped; forwarded host/protocol are rebuilt from this
+value and Host names the backend, while Origin is preserved for CSRF. Add deployment-specific
 identity/secret header names to `strip_headers`. Upstream redirects are returned
 to the browser, with private-origin locations mapped to public origin. The
 proxy disables retries, automatic redirects, environment proxies and automatic
