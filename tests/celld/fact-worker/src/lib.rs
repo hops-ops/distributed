@@ -18,7 +18,7 @@
 //! the principal and the `FactStamp`; handlers refuse anything else.
 
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CellDispatchError, CellWaitPathRequest, CelldOutbox,
+    AggregateCell, CausalDispatchError, CellCommandIdentity, CellWaitPathRequest, CelldOutbox,
     InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
     CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
@@ -262,11 +262,11 @@ where
 {
     let body: Value = match req.json().await {
         Ok(body) => body,
-        Err(_) => return error_response(CellDispatchError::BadRequest("invalid JSON".into())),
+        Err(_) => return error_response(CausalDispatchError::BadRequest("invalid JSON".into())),
     };
     let parsed = match CellWaitPathRequest::parse(body) {
         Ok(parsed) => parsed,
-        Err(error) => return error_response(CellDispatchError::BadRequest(error)),
+        Err(error) => return error_response(CausalDispatchError::BadRequest(error)),
     };
     let header = |name: &str| req.headers().get(name).ok().flatten();
     let identity = match (
@@ -279,7 +279,7 @@ where
                 Err(error) => return error_response(error),
             }
         }
-        _ => return error_response(CellDispatchError::Unauthorized),
+        _ => return error_response(CausalDispatchError::Unauthorized),
     };
     // Facts carry principal + stamp; zone hosts (lease commands) carry a
     // user and role. Both arrive only on the authenticated internal path.
@@ -517,7 +517,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     stub.fetch_with_request(req).await
 }
 
-fn authenticate(req: &Request, env: &Env) -> std::result::Result<(), CellDispatchError> {
+fn authenticate(req: &Request, env: &Env) -> std::result::Result<(), CausalDispatchError> {
     let configured = env
         .secret(CELL_INTERNAL_SECRET_ENV)
         .map(|value| value.to_string())
@@ -525,22 +525,22 @@ fn authenticate(req: &Request, env: &Env) -> std::result::Result<(), CellDispatc
             env.var(CELL_INTERNAL_SECRET_ENV)
                 .map(|value| value.to_string())
         })
-        .map_err(|_| CellDispatchError::Internal("internal secret is required".into()))?;
-    let secret = InternalHttpSecret::new(configured).map_err(CellDispatchError::Internal)?;
+        .map_err(|_| CausalDispatchError::Internal("internal secret is required".into()))?;
+    let secret = InternalHttpSecret::new(configured).map_err(CausalDispatchError::Internal)?;
     let candidate = req
         .headers()
         .get(CELL_INTERNAL_SECRET_HEADER)
         .ok()
         .flatten()
-        .ok_or(CellDispatchError::Unauthorized)?;
+        .ok_or(CausalDispatchError::Unauthorized)?;
     if secret.matches(&candidate) {
         Ok(())
     } else {
-        Err(CellDispatchError::Unauthorized)
+        Err(CausalDispatchError::Unauthorized)
     }
 }
 
-fn error_response(error: CellDispatchError) -> Result<Response> {
+fn error_response(error: CausalDispatchError) -> Result<Response> {
     json_status(
         json!({ "error": error.client_message(), "code": error.code() }),
         error.status_code(),

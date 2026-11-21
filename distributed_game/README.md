@@ -1270,7 +1270,7 @@ Over celld each fact is `POST {CELLD_URL}/{kind}/{shard}/{command}` with
 `{commandId, input}` (the remote-only `CelldCommandHost`); the command id is
 `cell::command_id_for(service, key)`, so a retry after a timeout replays the
 cell's ledger receipt (`replayed`) instead of committing twice. Cells answer
-the standard wait-path body (`CellDispatchResult::wait_path_wire`). The
+the standard wait-path body (`CausalDispatchResult::wait_path_wire`). The
 principal travels as `x-user-id` and the command-ledger principal partition,
 the stamp as `x-game-*` headers (`CelldCommandHost::forward_session_prefix`),
 and every request carries

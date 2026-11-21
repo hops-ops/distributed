@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use base64::Engine as _;
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CellDispatchError, CellStreamStore,
+    AggregateCell, CausalDispatchError, CellCommandIdentity, CellStreamStore,
 };
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use distributed::StreamIdentity;
@@ -57,7 +57,7 @@ impl InProcess {
         command: &str,
         input: Value,
         session: Session,
-    ) -> Result<Value, CellDispatchError> {
+    ) -> Result<Value, CausalDispatchError> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let identity = CellCommandIdentity::new(
             "zone-host",
@@ -90,13 +90,15 @@ impl InProcess {
                     self.blobs.lock().unwrap().remove(&key);
                 }
                 match error {
-                    CellDispatchError::Rejected { message, .. } => match stale_current(&message) {
-                        Some(current) => Err(StateError::Stale {
-                            presented: token,
-                            current,
-                        }),
-                        None => Err(StateError::Backend(message)),
-                    },
+                    CausalDispatchError::Rejected { message, .. } => {
+                        match stale_current(&message) {
+                            Some(current) => Err(StateError::Stale {
+                                presented: token,
+                                current,
+                            }),
+                            None => Err(StateError::Backend(message)),
+                        }
+                    }
                     other => Err(StateError::Backend(format!("{other:?}"))),
                 }
             }
@@ -235,7 +237,7 @@ async fn commands_need_the_zone_host_role_and_one_well_formed_payload() {
     for bad in [both, neither, oversized, bad_digest] {
         assert!(matches!(
             store.dispatch(SAVE, bad, host_session()).await,
-            Err(CellDispatchError::Rejected { .. })
+            Err(CausalDispatchError::Rejected { .. })
         ));
     }
     store.dispatch(SAVE, input, host_session()).await.unwrap();

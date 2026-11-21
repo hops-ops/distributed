@@ -13,7 +13,7 @@
 use std::time::Duration;
 
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CellDispatchError, CellWaitPathRequest, CelldOutbox,
+    AggregateCell, CausalDispatchError, CellCommandIdentity, CellWaitPathRequest, CelldOutbox,
     InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
     CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
@@ -324,7 +324,7 @@ impl TickerCell {
         };
         let parsed = match CellWaitPathRequest::parse(body) {
             Ok(parsed) => parsed,
-            Err(error) => return error_response(CellDispatchError::BadRequest(error)),
+            Err(error) => return error_response(CausalDispatchError::BadRequest(error)),
         };
         let identity = match request_identity(req, &parsed.command_id) {
             Ok(identity) => identity,
@@ -391,7 +391,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 fn authenticate_internal_request(
     req: &Request,
     env: &Env,
-) -> std::result::Result<(), CellDispatchError> {
+) -> std::result::Result<(), CausalDispatchError> {
     let configured = env
         .secret(CELL_INTERNAL_SECRET_ENV)
         .map(|value| value.to_string())
@@ -400,25 +400,25 @@ fn authenticate_internal_request(
                 .map(|value| value.to_string())
         })
         .map_err(|_| {
-            CellDispatchError::Internal(format!("{CELL_INTERNAL_SECRET_ENV} is required"))
+            CausalDispatchError::Internal(format!("{CELL_INTERNAL_SECRET_ENV} is required"))
         })?;
-    let secret = InternalHttpSecret::new(configured).map_err(CellDispatchError::Internal)?;
+    let secret = InternalHttpSecret::new(configured).map_err(CausalDispatchError::Internal)?;
     let candidate = req
         .headers()
         .get(CELL_INTERNAL_SECRET_HEADER)
-        .map_err(|_| CellDispatchError::Unauthorized)?
-        .ok_or(CellDispatchError::Unauthorized)?;
+        .map_err(|_| CausalDispatchError::Unauthorized)?
+        .ok_or(CausalDispatchError::Unauthorized)?;
     if secret.matches(&candidate) {
         Ok(())
     } else {
-        Err(CellDispatchError::Unauthorized)
+        Err(CausalDispatchError::Unauthorized)
     }
 }
 
 fn request_identity(
     req: &Request,
     command_id: &str,
-) -> std::result::Result<CellCommandIdentity, CellDispatchError> {
+) -> std::result::Result<CellCommandIdentity, CausalDispatchError> {
     let header = |name: &str| {
         req.headers()
             .get(name)
@@ -426,7 +426,7 @@ fn request_identity(
             .flatten()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .ok_or(CellDispatchError::Unauthorized)
+            .ok_or(CausalDispatchError::Unauthorized)
     };
     CellCommandIdentity::new(
         header(CELL_SERVICE_ID_HEADER)?,
@@ -449,7 +449,7 @@ fn request_session(req: &Request) -> Session {
     session
 }
 
-fn error_response(error: CellDispatchError) -> Result<Response> {
+fn error_response(error: CausalDispatchError) -> Result<Response> {
     json_status(
         json!({ "error": error.client_message(), "code": error.code() }),
         error.status_code(),

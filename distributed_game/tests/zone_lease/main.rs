@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CellDispatchError, CellStreamStore,
+    AggregateCell, CausalDispatchError, CellCommandIdentity, CellStreamStore,
 };
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use distributed::schedule::schedule_session;
@@ -62,7 +62,7 @@ impl InProcess {
             .await
         {
             Ok(result) => Ok(serde_json::from_value(result.payload().clone()).unwrap()),
-            Err(CellDispatchError::Rejected { message, .. }) => Err(ownership_error(&message)),
+            Err(CausalDispatchError::Rejected { message, .. }) => Err(ownership_error(&message)),
             Err(error) => Err(OwnershipError::Backend(format!("{error:?}"))),
         }
     }

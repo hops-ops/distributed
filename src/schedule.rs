@@ -438,7 +438,7 @@ impl ArmedSchedule {
         &self,
     ) -> Result<
         crate::microsvc::cell_host::CellCommandIdentity,
-        crate::microsvc::cell_host::CellDispatchError,
+        crate::microsvc::cell_host::CausalDispatchError,
     > {
         crate::microsvc::cell_host::CellCommandIdentity::new(
             SCHEDULE_SERVICE_ID,

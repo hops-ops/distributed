@@ -1,6 +1,6 @@
 use super::{
-    instance_name, parent_cell_name, AggregateCell, CellBatchCommand, CellCommandIdentity,
-    CellDispatchError, CellNamespace, CellStreamStore, DURABLE_AGGREGATE_CELL_STATE_VERSION,
+    instance_name, parent_cell_name, AggregateCell, CausalDispatchError, CellBatchCommand,
+    CellCommandIdentity, CellNamespace, CellStreamStore, DURABLE_AGGREGATE_CELL_STATE_VERSION,
 };
 use crate::aggregate::{Aggregate, AggregateRepository};
 use crate::command::{typed_command, PreparedCommand, Succeeded};
@@ -541,7 +541,7 @@ async fn a_rejected_batch_entry_leaves_the_others_committed() {
     assert!(results[0].is_ok());
     assert!(matches!(
         results[1],
-        Err(CellDispatchError::Rejected { .. })
+        Err(CausalDispatchError::Rejected { .. })
     ));
     assert!(results[2].is_ok());
     assert_eq!(event_count(&cell), 2);
@@ -577,7 +577,7 @@ async fn cell_wait_path_rejects_command_id_reuse_with_different_input() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, CellDispatchError::CommandIdReuse));
+    assert!(matches!(error, CausalDispatchError::CommandIdReuse));
     assert_eq!(error.code(), "COMMAND_ID_REUSE");
     assert_eq!(error.status_code(), 409);
 }

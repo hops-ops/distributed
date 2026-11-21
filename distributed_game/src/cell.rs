@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use distributed::cell_host::{
-    AggregateCell, CellBatchCommand, CellCommandIdentity, CellDispatchError, CellWaitPathRequest,
+    AggregateCell, CausalDispatchError, CellBatchCommand, CellCommandIdentity, CellWaitPathRequest,
 };
 use distributed::microsvc::Session;
 use distributed::Aggregate;
@@ -140,14 +140,14 @@ pub async fn run_fact_batch<A>(
     service: &str,
     body: &Value,
     sessions: impl Fn(&dyn Fn(&str) -> Option<String>) -> Option<Session>,
-) -> Result<Value, CellDispatchError>
+) -> Result<Value, CausalDispatchError>
 where
     A: Aggregate + Send + Sync + 'static,
 {
     let entries = body
         .get("entries")
         .and_then(Value::as_array)
-        .ok_or_else(|| CellDispatchError::BadRequest("`entries` is required".into()))?;
+        .ok_or_else(|| CausalDispatchError::BadRequest("`entries` is required".into()))?;
     // An entry that does not parse never reaches the cell; it is answered
     // in its place.
     let mut refused = Vec::with_capacity(entries.len());
@@ -195,10 +195,10 @@ fn batch_command(
     service: &str,
     entry: &Value,
     sessions: &impl Fn(&dyn Fn(&str) -> Option<String>) -> Option<Session>,
-) -> Result<CellBatchCommand, CellDispatchError> {
+) -> Result<CellBatchCommand, CausalDispatchError> {
     let field = |name: &str| entry.get(name).and_then(Value::as_str);
     let (Some(command), Some(partition)) = (field("command"), field("partition")) else {
-        return Err(CellDispatchError::BadRequest(
+        return Err(CausalDispatchError::BadRequest(
             "`command` and `partition` are required".into(),
         ));
     };
@@ -206,7 +206,7 @@ fn batch_command(
         "commandId": entry.get("commandId"),
         "input": entry.get("input"),
     }))
-    .map_err(CellDispatchError::BadRequest)?;
+    .map_err(CausalDispatchError::BadRequest)?;
     let identity = CellCommandIdentity::new(
         service.to_string(),
         partition.to_string(),
@@ -218,7 +218,7 @@ fn batch_command(
             .and_then(Value::as_str)
             .map(str::to_string)
     };
-    let session = sessions(&header).ok_or(CellDispatchError::Forbidden)?;
+    let session = sessions(&header).ok_or(CausalDispatchError::Forbidden)?;
     Ok(CellBatchCommand {
         command: command.to_string(),
         identity,
@@ -228,9 +228,9 @@ fn batch_command(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn classify(error: CellDispatchError) -> FactError {
+fn classify(error: CausalDispatchError) -> FactError {
     match error {
-        CellDispatchError::InProgress | CellDispatchError::Internal(_) => {
+        CausalDispatchError::InProgress | CausalDispatchError::Internal(_) => {
             FactError::Retryable(format!("{error:?}"))
         }
         other => FactError::Permanent(format!("{}: {other:?}", other.code())),

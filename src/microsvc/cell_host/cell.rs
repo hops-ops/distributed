@@ -7,12 +7,13 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use super::alarm::{ArmedSchedule, ScheduleFireReport, ScheduleSettlement};
-use super::causal::{CellCommandIdentity, CellDispatchError, CellDispatchResult};
+use super::causal::CellCommandIdentity;
 use super::store::CellStreamStore;
 #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 use super::store::{
     DurableAggregateCellState, DurableCellCommand, DurableCellEvents, DurableCellSnapshot,
 };
+use super::{CausalDispatchError, CausalDispatchResult};
 use crate::aggregate::{Aggregate, AggregateRepository};
 use crate::entity::EventRecord;
 use crate::microsvc::error::HandlerError;
@@ -237,12 +238,12 @@ where
         identity: &CellCommandIdentity,
         input: Value,
         session: Session,
-    ) -> Result<CellDispatchResult, CellDispatchError> {
+    ) -> Result<CausalDispatchResult, CausalDispatchError> {
         #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         let _command = self
             .begin_command()
             .await
-            .map_err(|error| CellDispatchError::Internal(error.to_string()))?;
+            .map_err(|error| CausalDispatchError::Internal(error.to_string()))?;
         let result = self
             .routes
             .dispatch_cell_causal(command, identity, input, session, &self.shard)
@@ -265,14 +266,14 @@ where
     pub async fn dispatch_idempotent_batch(
         &self,
         commands: Vec<CellBatchCommand>,
-    ) -> Vec<Result<CellDispatchResult, CellDispatchError>> {
+    ) -> Vec<Result<CausalDispatchResult, CausalDispatchError>> {
         if commands.is_empty() {
             return Vec::new();
         }
         #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
         let _command = match self.begin_command().await {
             Ok(guard) => guard,
-            Err(error) => return vec![Err(CellDispatchError::Internal(error.to_string()))],
+            Err(error) => return vec![Err(CausalDispatchError::Internal(error.to_string()))],
         };
         let mut results = Vec::with_capacity(commands.len());
         for command in commands {
@@ -369,7 +370,7 @@ where
                         command: alarm.command.clone(),
                         code: error.code(),
                         message: match &error {
-                            CellDispatchError::Internal(message) => message.clone(),
+                            CausalDispatchError::Internal(message) => message.clone(),
                             other => other.client_message(),
                         },
                     };
@@ -746,7 +747,7 @@ pub struct CellBatchCommand {
 
 /// A batch stops at a result worth retrying: the command is in progress,
 /// timed out, throttled or failed inside the cell.
-fn ends_batch(error: &CellDispatchError) -> bool {
+fn ends_batch(error: &CausalDispatchError) -> bool {
     let status = error.status_code();
     status >= 500 || matches!(status, 408 | 429) || error.code() == "COMMAND_IN_PROGRESS"
 }

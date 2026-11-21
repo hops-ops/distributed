@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CellDispatchError, CellWaitPathRequest, CelldOutbox,
+    AggregateCell, CausalDispatchError, CellCommandIdentity, CellWaitPathRequest, CelldOutbox,
     InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
     CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
@@ -34,7 +34,7 @@ pub fn fact_sessions(header: &dyn Fn(&str) -> Option<String>) -> Option<Session>
 
 /// Check `x-distributed-internal-secret` against
 /// `DISTRIBUTED_INTERNAL_SECRET`.
-pub fn authenticate(req: &Request, env: &Env) -> std::result::Result<(), CellDispatchError> {
+pub fn authenticate(req: &Request, env: &Env) -> std::result::Result<(), CausalDispatchError> {
     let configured = env
         .secret(CELL_INTERNAL_SECRET_ENV)
         .map(|value| value.to_string())
@@ -42,18 +42,18 @@ pub fn authenticate(req: &Request, env: &Env) -> std::result::Result<(), CellDis
             env.var(CELL_INTERNAL_SECRET_ENV)
                 .map(|value| value.to_string())
         })
-        .map_err(|_| CellDispatchError::Internal("internal secret is required".into()))?;
-    let secret = InternalHttpSecret::new(configured).map_err(CellDispatchError::Internal)?;
+        .map_err(|_| CausalDispatchError::Internal("internal secret is required".into()))?;
+    let secret = InternalHttpSecret::new(configured).map_err(CausalDispatchError::Internal)?;
     let candidate = req
         .headers()
         .get(CELL_INTERNAL_SECRET_HEADER)
         .ok()
         .flatten()
-        .ok_or(CellDispatchError::Unauthorized)?;
+        .ok_or(CausalDispatchError::Unauthorized)?;
     if secret.matches(&candidate) {
         Ok(())
     } else {
-        Err(CellDispatchError::Unauthorized)
+        Err(CausalDispatchError::Unauthorized)
     }
 }
 
@@ -63,12 +63,12 @@ pub fn json_status(body: Value, status: u16) -> Result<Response> {
 }
 
 /// The wire form of a dispatch error.
-pub fn error_response(error: CellDispatchError) -> Result<Response> {
+pub fn error_response(error: CausalDispatchError) -> Result<Response> {
     let status = error.status_code();
     json_status(error_body(&error), status)
 }
 
-fn error_body(error: &CellDispatchError) -> Value {
+fn error_body(error: &CausalDispatchError) -> Value {
     json!({ "error": error.client_message(), "code": error.code() })
 }
 
@@ -109,7 +109,7 @@ where
     match (req.method(), parts.get(2)) {
         (Method::Get, None) => match read(cell).await {
             Ok(body) => json_status(body, 200),
-            Err(error) => error_response(CellDispatchError::Internal(error)),
+            Err(error) => error_response(CausalDispatchError::Internal(error)),
         },
         (Method::Post, Some(route)) if route == BATCH_ROUTE => {
             serve_batch(env, cell, req, sessions).await
@@ -119,12 +119,12 @@ where
             let body: Value = match req.json().await {
                 Ok(body) => body,
                 Err(_) => {
-                    return error_response(CellDispatchError::BadRequest("invalid JSON".into()))
+                    return error_response(CausalDispatchError::BadRequest("invalid JSON".into()))
                 }
             };
             let parsed = match CellWaitPathRequest::parse(body) {
                 Ok(parsed) => parsed,
-                Err(error) => return error_response(CellDispatchError::BadRequest(error)),
+                Err(error) => return error_response(CausalDispatchError::BadRequest(error)),
             };
             let header = |name: &str| req.headers().get(name).ok().flatten();
             let identity = match (
@@ -137,10 +137,10 @@ where
                         Err(error) => return error_response(error),
                     }
                 }
-                _ => return error_response(CellDispatchError::Unauthorized),
+                _ => return error_response(CausalDispatchError::Unauthorized),
             };
             let Some(session) = sessions(&header) else {
-                return error_response(CellDispatchError::Forbidden);
+                return error_response(CausalDispatchError::Forbidden);
             };
             let result = cell
                 .dispatch_idempotent(&command, &identity, parsed.input, session)
@@ -167,11 +167,11 @@ where
     A: Aggregate + Send + Sync + 'static,
 {
     let Some(service) = req.headers().get(CELL_SERVICE_ID_HEADER).ok().flatten() else {
-        return error_response(CellDispatchError::Unauthorized);
+        return error_response(CausalDispatchError::Unauthorized);
     };
     let body: Value = match req.json().await {
         Ok(body) => body,
-        Err(_) => return error_response(CellDispatchError::BadRequest("invalid JSON".into())),
+        Err(_) => return error_response(CausalDispatchError::BadRequest("invalid JSON".into())),
     };
     let results = run_fact_batch(cell, &service, &body, sessions).await;
     if let Err(error) = cell.drain_outbox(env).await {
@@ -245,7 +245,7 @@ impl CellWatchers {
         let response = if req.method() == Method::Get {
             match versioned(cell, &read).await {
                 Ok(body) => json_status(body, 200),
-                Err(error) => error_response(CellDispatchError::Internal(error)),
+                Err(error) => error_response(CausalDispatchError::Internal(error)),
             }
         } else {
             serve_cell(env, cell, req, &read, sessions).await
@@ -556,7 +556,7 @@ impl ZoneDevSettings {
                 let body: Value = match req.json().await {
                     Ok(body @ Value::Object(_)) => body,
                     _ => {
-                        return error_response(CellDispatchError::BadRequest(
+                        return error_response(CausalDispatchError::BadRequest(
                             "a JSON object is required".into(),
                         ))
                     }

@@ -102,7 +102,7 @@ native `BusPublisher<B>` changes.
 ## Command retry receipts
 
 The wait-path response gets its projection inputs from
-`CellDispatchResult::projection_events()`, stored atomically with the command's
+`CausalDispatchResult::projection_events()`, stored atomically with the command's
 terminal retry receipt. It does not scan the outbox. A retry therefore returns
 the same result and projection inputs even when delivery has removed the outbox
 rows. Receipt evidence follows the existing command replay retention; event
