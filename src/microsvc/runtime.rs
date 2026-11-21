@@ -54,7 +54,15 @@ impl Service {
             DEFAULT_PUBLISH_LEASE,
             DEFAULT_MAX_PUBLISH_ATTEMPTS,
         );
-        #[cfg(feature = "graphql")]
+        #[cfg(any(
+            feature = "http",
+            feature = "grpc",
+            feature = "postgres",
+            feature = "sqlite",
+            feature = "nats",
+            feature = "rabbitmq",
+            feature = "kafka",
+        ))]
         self.start_ledger_compaction();
 
         self.set_runner(Box::new(

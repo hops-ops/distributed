@@ -1,14 +1,19 @@
 #[cfg(feature = "graphql")]
 use super::causal::collapse_projection_evidence;
-#[cfg(feature = "graphql")]
+#[cfg(any(
+    feature = "http",
+    feature = "grpc",
+    feature = "postgres",
+    feature = "sqlite",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "kafka"
+))]
 use super::routes::LedgerCompaction;
 use super::*;
-#[cfg(feature = "graphql")]
 use crate::aggregate::Aggregate;
-#[cfg(feature = "graphql")]
 use crate::bus::RunOptions;
 use crate::bus::{Message, MessageKind, SubscriptionPlan};
-#[cfg(feature = "graphql")]
 use crate::command::Eventual;
 use crate::command::{typed_command, PreparedCommand, Succeeded};
 #[cfg(feature = "graphql")]
@@ -16,27 +21,32 @@ use crate::command::{Atomic, CommandConsistency};
 use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
 #[cfg(feature = "graphql")]
 use crate::command_dispatch::SharedCommandHost;
-#[cfg(feature = "graphql")]
+use crate::command_dispatch::VerifiedPrincipal;
+#[cfg(any(
+    feature = "http",
+    feature = "grpc",
+    feature = "postgres",
+    feature = "sqlite",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "kafka"
+))]
+use crate::command_ledger::CommandLedgerState;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
-    CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey, CommandLedgerState,
-    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
-    ExternalCommandCompletion, ReservationOutcome,
+    CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey, CommandLedgerStore,
+    CommandLookup, CommandLookupScope, CommandReservation, ExternalCommandCompletion,
+    ReservationOutcome,
 };
-#[cfg(feature = "graphql")]
-use crate::graphql::identity::VerifiedPrincipal;
 #[cfg(feature = "graphql")]
 use crate::graphql::{SurfaceDirectProjection, SurfaceProjector};
 #[cfg(feature = "graphql")]
 use crate::microsvc::cell_host::{CelldCommandHost, InternalHttpSecret};
-#[cfg(feature = "graphql")]
 use crate::microsvc::HasOutboxStore;
 use crate::microsvc::{
     CommandRequest, Context, HandlerError, RepoReadModelDependencies, Routes, Service, Session,
 };
-#[cfg(feature = "graphql")]
 use crate::outbox::OutboxMessage;
-#[cfg(feature = "graphql")]
 use crate::projection_protocol::{
     PartitionId, ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint,
     ProjectionCommitBatch, ProjectionCommitResult, ProjectionFailure, ProjectionFailureBatch,
@@ -52,18 +62,14 @@ use crate::{
     sourced, AggregateBuilder, AggregateRepository, Entity, InMemoryRepository, Queueable,
     QueuedRepository,
 };
-#[cfg(feature = "graphql")]
 use crate::{GetStream, OutboxStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
 use std::collections::HashMap;
-#[cfg(feature = "graphql")]
 use std::future::Future;
-#[cfg(feature = "graphql")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "graphql")]
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "graphql")]
@@ -106,14 +112,12 @@ impl CommandOutputType for TypedOutput {
     }
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Deserialize)]
 struct CausalTestInput {
     id: String,
     label: String,
 }
 
-#[cfg(feature = "graphql")]
 impl CommandInputType for CausalTestInput {
     fn command_type() -> CommandTypeDef {
         CommandTypeDef::new(
@@ -152,7 +156,6 @@ struct CausalProjectionInput {
     partition: String,
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
 #[readmodel(
         table = "causal_projection_obligation_views",
@@ -162,14 +165,12 @@ struct CausalProjectionObligationView {
     id: String,
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
 #[readmodel(table = "causal_projection_sibling_views", primary_key = ["id"])]
 struct CausalProjectionSiblingView {
     id: String,
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Clone, Serialize, crate::DomainEvent)]
 #[domain_event(name = "causal.lifecycle-recorded", version = 1)]
 struct CausalLifecycleRecorded {
@@ -177,7 +178,6 @@ struct CausalLifecycleRecorded {
     label: String,
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
 #[readmodel(table = "causal_lifecycle_views", primary_key = ["id"])]
 struct CausalLifecycleView {
@@ -459,7 +459,6 @@ fn modeled_lifecycle_projector(
     )
 }
 
-#[cfg(feature = "graphql")]
 impl CommandOutputType for CausalProjectionObligationView {
     fn command_type() -> CommandTypeDef {
         one_string_field("CausalProjectionObligationView", "id")
@@ -467,7 +466,6 @@ impl CommandOutputType for CausalProjectionObligationView {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl CommandOutputType for CausalProjectionSiblingView {
     fn command_type() -> CommandTypeDef {
         one_string_field("CausalProjectionSiblingView", "id")
@@ -475,7 +473,6 @@ impl CommandOutputType for CausalProjectionSiblingView {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl CommandOutputType for CausalLifecycleView {
     fn command_type() -> CommandTypeDef {
         CommandTypeDef::new(
@@ -529,19 +526,18 @@ impl RouteComboAggregate {
     }
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Default, crate::Snapshot)]
 struct CausalDispatcherAggregate {
     entity: Entity,
 }
 
-#[cfg(feature = "graphql")]
 impl CausalDispatcherAggregate {
     fn record(&mut self, id: String) -> crate::SourcedResult {
         self.entity.set_id(id);
         self.entity.digest_empty("causal.recorded")
     }
 
+    #[cfg(feature = "graphql")]
     fn record_direct(&mut self, id: String) -> Result<(), HandlerError> {
         self.entity.set_id(id.clone());
         self.entity
@@ -575,7 +571,6 @@ impl CausalDispatcherAggregate {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl Aggregate for CausalDispatcherAggregate {
     type ReplayError = std::convert::Infallible;
 
@@ -596,7 +591,6 @@ impl Aggregate for CausalDispatcherAggregate {
     }
 }
 
-#[cfg(feature = "graphql")]
 fn causal_test_principal() -> VerifiedPrincipal {
     VerifiedPrincipal::test_oidc(
         "https://issuer.example/",
@@ -605,17 +599,14 @@ fn causal_test_principal() -> VerifiedPrincipal {
     )
 }
 
-#[cfg(feature = "graphql")]
 fn causal_test_command_id() -> String {
     uuid::Uuid::now_v7().hyphenated().to_string()
 }
 
-#[cfg(feature = "graphql")]
 fn causal_test_input(id: &str, label: &str) -> Value {
     json!({ "id": id, "label": label })
 }
 
-#[cfg(feature = "graphql")]
 fn session_with_role(role: &str) -> Session {
     let mut session = Session::new();
     session.set(crate::microsvc::ROLE_KEY, role);
@@ -643,7 +634,6 @@ fn celld_status_host(service: &Arc<Service>) -> SharedCommandHost {
     )
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Clone, Copy)]
 enum InjectedCommitBehavior {
     CommitThenErrorOnce,
@@ -651,14 +641,12 @@ enum InjectedCommitBehavior {
     Delegate,
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Clone)]
 struct AmbiguousCommitRepository {
     inner: InMemoryRepository,
     behavior: Arc<Mutex<InjectedCommitBehavior>>,
 }
 
-#[cfg(feature = "graphql")]
 impl AmbiguousCommitRepository {
     fn new(inner: InMemoryRepository, behavior: InjectedCommitBehavior) -> Self {
         Self {
@@ -678,7 +666,6 @@ impl AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl CausalGetStream for AmbiguousCommitRepository {
     fn get_causal_stream_tail<'a>(
         &'a self,
@@ -695,19 +682,16 @@ impl CausalGetStream for AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl CausalRepositoryIdentity for AmbiguousCommitRepository {
     fn causal_storage_identity(&self) -> crate::command_ledger::CausalStorageIdentity {
         CausalRepositoryIdentity::causal_storage_identity(&self.inner)
     }
 }
 
-#[cfg(feature = "graphql")]
 impl crate::microsvc::dependencies::CausalHostProjections for AmbiguousCommitRepository {
     crate::microsvc::dependencies::direct_causal_projection_methods!();
 }
 
-#[cfg(feature = "graphql")]
 impl ProjectionProtocolStore for AmbiguousCommitRepository {
     fn register_projection_models<'a>(
         &'a self,
@@ -854,7 +838,6 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl CommandLedgerStore for AmbiguousCommitRepository {
     fn reserve_command(
         &self,
@@ -893,7 +876,6 @@ impl CommandLedgerStore for AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl crate::microsvc::BackendHost for AmbiguousCommitRepository {
     fn capabilities(&self) -> crate::schedule::Capabilities {
         self.inner.capabilities()
@@ -908,7 +890,6 @@ impl crate::microsvc::BackendHost for AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl crate::repository::TransactionalCommit for AmbiguousCommitRepository {
     fn commit_batch<'a>(
         &'a self,
@@ -918,7 +899,6 @@ impl crate::repository::TransactionalCommit for AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl CausalTransactionalCommit for AmbiguousCommitRepository {
     async fn commit_causal_batch<'a>(
         &'a self,
@@ -945,7 +925,6 @@ impl CausalTransactionalCommit for AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl HasOutboxStore for AmbiguousCommitRepository {
     type OutboxStore = crate::InMemoryOutboxStore;
 
@@ -978,7 +957,6 @@ fn named_service_preserves_identity_with_route_bundles() {
     );
 }
 
-#[cfg(feature = "graphql")]
 #[test]
 fn service_compiles_exact_application_modules_from_command_namespaces() {
     let repository = InMemoryRepository::new();
@@ -1101,7 +1079,6 @@ async fn typed_direct_dispatch_fails_before_invoking_guard_or_handler() {
     assert!(!TYPED_HANDLER_INVOKED.load(Ordering::SeqCst));
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn thin_complete_registers_without_a_handler_context_body() {
     let repository = InMemoryRepository::new();
@@ -1167,7 +1144,6 @@ async fn thin_complete_registers_without_a_handler_context_body() {
     assert_eq!(completed, json!({ "id": "todo-1" }));
 }
 
-#[cfg(feature = "graphql")]
 fn thin_route<D>(
     routes: Routes<D>,
     name: &'static str,
@@ -1183,7 +1159,6 @@ where
     )
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn thin_commands_share_one_load_rule_guard_and_principal() {
     fn record(
@@ -1260,7 +1235,6 @@ async fn thin_commands_share_one_load_rule_guard_and_principal() {
     );
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_replays_canonical_equivalent_input_without_reinvoking_handler() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -1402,7 +1376,6 @@ async fn causal_dispatch_receipt_and_status_use_the_exact_durable_replay() {
 /// the attempt's completion is refused after the reservation was acquired.
 /// That exit must release the attempt: the retry runs the handler again
 /// instead of answering `InProgress` until the attempt lease expires.
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn a_failure_after_the_reservation_releases_the_attempt_for_an_immediate_retry() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -1499,7 +1472,6 @@ fn causal_status_projection_failure_precedes_observed_and_pending_evidence() {
     );
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_rejects_same_command_id_with_different_input() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -1557,7 +1529,6 @@ async fn causal_dispatch_rejects_same_command_id_with_different_input() {
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_guard_rejection_is_replayed_without_guard_or_handler_callback() {
     let guard_calls = Arc::new(AtomicUsize::new(0));
@@ -1624,7 +1595,6 @@ async fn causal_guard_rejection_is_replayed_without_guard_or_handler_callback() 
     assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_handler_rejection_is_replayed_without_reinvoking_handler() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -1682,7 +1652,6 @@ async fn causal_handler_rejection_is_replayed_without_reinvoking_handler() {
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_checks_current_role_before_reservation_guard_and_handler() {
     let guard_calls = Arc::new(AtomicUsize::new(0));
@@ -1889,7 +1858,6 @@ async fn causal_status_lookup_does_not_disclose_another_routes_command() {
     assert_eq!(missing.state, CausalCommandPublicState::Unknown);
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_overwrites_event_and_outbox_causation_with_ledger_identity() {
     let observed_causation = Arc::new(Mutex::new(None::<String>));
@@ -2012,7 +1980,6 @@ async fn causal_dispatch_overwrites_event_and_outbox_causation_with_ledger_ident
     );
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
     let repository = InMemoryRepository::new();
@@ -2159,7 +2126,6 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
     );
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
     use crate::{ReadModelWorkspaceExt, RowKey, RowPatch, RowValue, SnapshotStore};
@@ -3338,7 +3304,6 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     assert_eq!(second_replay.direct_projection, Some(evidence));
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_recovers_committed_replay_after_commit_acknowledgement_loss() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -3411,7 +3376,6 @@ async fn causal_dispatch_recovers_committed_replay_after_commit_acknowledgement_
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_reclaims_retryable_attempt_after_precommit_failure() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -3500,18 +3464,15 @@ async fn causal_dispatch_reclaims_retryable_attempt_after_precommit_failure() {
 
 /// What a contended command's handler does between loading its aggregate and
 /// staging its commit. Keyed by aggregate ID, so tests share nothing.
-#[cfg(feature = "graphql")]
 struct Contention {
     runs: AtomicUsize,
     after_load:
         Box<dyn Fn(usize) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>,
 }
 
-#[cfg(feature = "graphql")]
 static CONTENTION: std::sync::LazyLock<Mutex<HashMap<String, Arc<Contention>>>> =
     std::sync::LazyLock::new(Default::default);
 
-#[cfg(feature = "graphql")]
 fn contend(
     id: &str,
     after_load: impl Fn(usize) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
@@ -3531,7 +3492,6 @@ fn contend(
 }
 
 /// Appends one event to the aggregate it loaded (or creates it).
-#[cfg(feature = "graphql")]
 async fn contended_handler(
     context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
     input: CausalTestInput,
@@ -3550,7 +3510,6 @@ async fn contended_handler(
         .succeeded(TypedOutput { id: input.id })
 }
 
-#[cfg(feature = "graphql")]
 fn contended_route<D>(routes: Routes<D>) -> Routes<D>
 where
     D: crate::microsvc::CausalRouteDependencies<Aggregate = CausalDispatcherAggregate>
@@ -3568,7 +3527,6 @@ where
 /// Typed commands hold no lock across the handler: two of them on one
 /// aggregate race on its stream version, and the loser must be re-run on the
 /// winner's state rather than failed.
-#[cfg(feature = "graphql")]
 macro_rules! concurrent_write_tests {
     ($backend:ident, $repository:expr) => {
         mod $backend {
@@ -3706,10 +3664,9 @@ macro_rules! concurrent_write_tests {
     };
 }
 
-#[cfg(feature = "graphql")]
 concurrent_write_tests!(in_memory, InMemoryRepository::new());
 
-#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[cfg(feature = "sqlite")]
 concurrent_write_tests!(
     sqlite,
     crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
@@ -4456,7 +4413,6 @@ fn default_lane_name_cannot_be_used_as_a_named_lane() {
     let _ = Service::new().lane(DEFAULT_DELIVERY_LANE, lane_recorder(&log, "x"));
 }
 
-#[cfg(feature = "graphql")]
 macro_rules! ledger_compaction_routes {
     ($repository:expr, $command:literal) => {
         Routes::new()
@@ -4478,7 +4434,15 @@ macro_rules! ledger_compaction_routes {
     };
 }
 
-#[cfg(feature = "graphql")]
+#[cfg(any(
+    feature = "http",
+    feature = "grpc",
+    feature = "postgres",
+    feature = "sqlite",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "kafka"
+))]
 macro_rules! ledger_compaction_service {
     ($repository:expr) => {
         Service::new()
@@ -4487,7 +4451,15 @@ macro_rules! ledger_compaction_service {
     };
 }
 
-#[cfg(feature = "graphql")]
+#[cfg(any(
+    feature = "http",
+    feature = "grpc",
+    feature = "postgres",
+    feature = "sqlite",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "kafka"
+))]
 async fn reserve_for_compaction<R: CommandLedgerStore>(
     repository: &R,
 ) -> (CommandLedgerKey, crate::command_ledger::CommandAttempt) {
@@ -4515,12 +4487,20 @@ async fn reserve_for_compaction<R: CommandLedgerStore>(
     }
 }
 
+#[cfg(any(
+    feature = "http",
+    feature = "grpc",
+    feature = "postgres",
+    feature = "sqlite",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "kafka"
+))]
 /// Writes a terminal row whose retention lapses 50 ms after commit, a
 /// terminal row retained for 300 s and an in-progress row, then runs the
 /// worker's pass until the first one is due. The ledger has no injectable
 /// clock (the stores use their own), so the pass is polled instead of the
 /// test sleeping for a fixed time.
-#[cfg(feature = "graphql")]
 async fn worker_pass_compacts_only_expired_rows<R>(service: &Service, repository: &R)
 where
     R: CommandLedgerStore + CausalTransactionalCommit,
@@ -4586,7 +4566,15 @@ where
     ));
 }
 
-#[cfg(feature = "graphql")]
+#[cfg(any(
+    feature = "http",
+    feature = "grpc",
+    feature = "postgres",
+    feature = "sqlite",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "kafka"
+))]
 #[tokio::test]
 async fn ledger_worker_pass_compacts_only_expired_rows_in_memory() {
     let repository = InMemoryRepository::new();
@@ -4594,7 +4582,7 @@ async fn ledger_worker_pass_compacts_only_expired_rows_in_memory() {
     worker_pass_compacts_only_expired_rows(&service, &repository).await;
 }
 
-#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn ledger_worker_pass_compacts_only_expired_rows_in_sqlite() {
     let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
@@ -4604,7 +4592,6 @@ async fn ledger_worker_pass_compacts_only_expired_rows_in_sqlite() {
     worker_pass_compacts_only_expired_rows(&service, &repository).await;
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn service_compacts_each_command_repository_once() {
     let shared = InMemoryRepository::new();
@@ -4619,10 +4606,18 @@ async fn service_compacts_each_command_repository_once() {
     assert_eq!(service.command_ledgers().len(), 2);
 }
 
+#[cfg(any(
+    feature = "http",
+    feature = "grpc",
+    feature = "postgres",
+    feature = "sqlite",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "kafka"
+))]
 /// `with_bus` starts the worker: with no explicit pass, the expired row is
 /// compacted. Tokio time is paused, so the worker's interval elapses as soon
 /// as the runtime is idle; the row's retention is wall-clock time.
-#[cfg(feature = "graphql")]
 #[tokio::test(start_paused = true)]
 async fn with_bus_runs_ledger_compaction() {
     use crate::command_ledger::TerminalCommandState;
@@ -4657,7 +4652,15 @@ async fn with_bus_runs_ledger_compaction() {
     drop(service);
 }
 
-#[cfg(feature = "graphql")]
+#[cfg(any(
+    feature = "http",
+    feature = "grpc",
+    feature = "postgres",
+    feature = "sqlite",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "kafka"
+))]
 #[tokio::test]
 async fn dropping_the_ledger_compaction_worker_stops_it() {
     let ledger: LedgerCompaction = Arc::new(|_| Box::pin(async { Ok(0) }));

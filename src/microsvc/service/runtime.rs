@@ -8,8 +8,12 @@ use serde_json::Value;
 
 #[cfg(feature = "graphql")]
 use super::causal::{
-    internal_ledger_error, CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult,
-    ExternalCausalAttempt, ExternalCausalReservation, GraphqlServiceBindError,
+    internal_ledger_error, CausalCommandPublicStatus, GraphqlServiceBindError,
+    ModeledProjectionMetadata,
+};
+use super::causal::{
+    CausalDispatchError, CausalDispatchResult, ExternalCausalAttempt, ExternalCausalReservation,
+    SealModeledProjection,
 };
 use super::helpers::{
     is_json_content_type, message_to_json_input, message_to_session, names_by_kind,
@@ -26,12 +30,10 @@ use crate::bus::{
     Message, MessageKind, OrderedDelivery, RunOptions, SubscriptionPlan, TransportError,
 };
 use crate::command::{TypedCommandContract, TypedServiceCommandBinding};
+use crate::command_dispatch::VerifiedPrincipal;
 #[cfg(feature = "graphql")]
-use crate::command_ledger::ExternalDispatchBinding;
-#[cfg(feature = "graphql")]
-use crate::command_ledger::{CommandId, CommandLedgerKey, CommandLookup, PrincipalPartitionId};
-#[cfg(feature = "graphql")]
-use crate::graphql::identity::VerifiedPrincipal;
+use crate::command_ledger::{CommandId, CommandLedgerKey, PrincipalPartitionId};
+use crate::command_ledger::{CommandLookup, ExternalDispatchBinding};
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::lifecycle::LifecycleGate;
 use crate::microsvc::projector::{ProjectionRepairHandle, ProjectorRegistration};
@@ -72,7 +74,15 @@ pub struct Service {
     #[cfg(feature = "graphql")]
     graphql: Option<std::sync::Arc<crate::graphql::GraphqlEngine>>,
     /// Started by `with_bus`; stops when the service is dropped.
-    #[cfg(feature = "graphql")]
+    #[cfg(any(
+        feature = "http",
+        feature = "grpc",
+        feature = "postgres",
+        feature = "sqlite",
+        feature = "nats",
+        feature = "rabbitmq",
+        feature = "kafka",
+    ))]
     ledger_compaction: Option<crate::microsvc::workers::LedgerCompactionWorker>,
 }
 
@@ -93,7 +103,15 @@ impl Service {
             http_command_routes: false,
             #[cfg(feature = "graphql")]
             graphql: None,
-            #[cfg(feature = "graphql")]
+            #[cfg(any(
+                feature = "http",
+                feature = "grpc",
+                feature = "postgres",
+                feature = "sqlite",
+                feature = "nats",
+                feature = "rabbitmq",
+                feature = "kafka",
+            ))]
             ledger_compaction: None,
         }
     }
@@ -416,7 +434,6 @@ impl Service {
         mount.invoke(request).await
     }
 
-    #[cfg(feature = "graphql")]
     #[allow(dead_code)]
     pub(crate) async fn dispatch_registered_mount_causally(
         &self,
@@ -499,7 +516,6 @@ impl Service {
         Ok(())
     }
 
-    #[cfg(feature = "graphql")]
     #[allow(dead_code)]
     fn ensure_registered_mount(&self, mount: &CommandMount) -> Result<(), HandlerError> {
         if self.registered_command_mounts.iter().any(|registered| {
@@ -767,7 +783,6 @@ impl Service {
     /// Reserve the gateway ledger row for a command that will be committed by
     /// an aggregate cell. The route performs canonical input and grant checks
     /// before any remote request is made.
-    #[cfg(feature = "graphql")]
     pub(crate) async fn reserve_external_causal(
         &self,
         command: &str,
@@ -807,7 +822,6 @@ impl Service {
     /// Persist a sealed terminal receipt for a command committed by a cell.
     /// This path only updates the gateway ledger and never invokes a local
     /// handler or appends a local event batch.
-    #[cfg(feature = "graphql")]
     pub(crate) async fn complete_external_causal(
         &self,
         command: &str,
@@ -827,7 +841,6 @@ impl Service {
 
     /// Mark a remote attempt retryable after a transport/protocol failure.
     /// The durable fence remains the authority for later replay or reclaim.
-    #[cfg(feature = "graphql")]
     pub(crate) async fn abandon_external_causal(
         &self,
         command: &str,
@@ -853,7 +866,6 @@ impl Service {
 
     /// Execute one authenticated typed causal route through its durable ledger
     /// and framework-owned staged commit boundary.
-    #[cfg(feature = "graphql")]
     pub async fn dispatch_causal(
         &self,
         command: &str,
@@ -869,7 +881,6 @@ impl Service {
 
     /// Execute one authenticated typed causal route and retain the exact
     /// durable replay material needed to construct a causal receipt.
-    #[cfg(feature = "graphql")]
     pub async fn dispatch_causal_with_receipt(
         &self,
         command: &str,
@@ -896,18 +907,37 @@ impl Service {
         principal: VerifiedPrincipal,
         protocol: crate::graphql::protocol::ProtocolResponseAccumulator,
     ) -> Result<CausalDispatchResult, CausalDispatchError> {
+        let seal = move |causation_id: crate::command_ledger::CausationId,
+                         retention: Duration,
+                         occurrences: &[crate::DomainEventOccurrence],
+                         selectors: &[crate::ProjectionEventSelector]|
+              -> Result<ModeledProjectionMetadata, String> {
+            let metadata = protocol
+                .projection_metadata_for_actual(causation_id, retention, occurrences, selectors)
+                .map_err(|error| error.to_string())?;
+            let expires_at = metadata
+                .expires_at()
+                .map_err(|error| format!("modeled projection metadata lifetime failed: {error}"))?;
+            let canonical_bytes = metadata
+                .canonical_bytes()
+                .map_err(|error| format!("modeled projection metadata encoding failed: {error}"))?;
+            Ok(ModeledProjectionMetadata {
+                canonical_bytes,
+                expires_at,
+                pending: !metadata.obligations.is_empty(),
+            })
+        };
         self.dispatch_causal_with_receipt_inner(
             command,
             command_id,
             input,
             session,
             principal,
-            Some(protocol),
+            Some(&seal),
         )
         .await
     }
 
-    #[cfg(feature = "graphql")]
     async fn dispatch_causal_with_receipt_inner(
         &self,
         command: &str,
@@ -915,7 +945,7 @@ impl Service {
         input: Value,
         session: Session,
         principal: VerifiedPrincipal,
-        protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
+        seal_modeled_projection: Option<&SealModeledProjection<'_>>,
     ) -> Result<CausalDispatchResult, CausalDispatchError> {
         self.ensure_mutations_open()
             .map_err(CausalDispatchError::Handler)?;
@@ -939,7 +969,7 @@ impl Service {
                 session,
                 principal,
                 self.causal_command_policy,
-                protocol,
+                seal_modeled_projection,
             )
             .await
     }
@@ -1039,7 +1069,6 @@ impl Service {
     /// Private lookup seam used by replay recovery and the authorized status
     /// envelope. The route rechecks the current role grant before deriving the
     /// bearer-scoped ledger key.
-    #[cfg(feature = "graphql")]
     #[allow(dead_code)]
     pub(crate) async fn lookup_causal_command(
         &self,
@@ -1379,7 +1408,6 @@ impl Service {
 
     /// Compaction of every command ledger this service's typed commands
     /// write, one per repository however many route bundles share it.
-    #[cfg(feature = "graphql")]
     pub(crate) fn command_ledgers(&self) -> Vec<super::routes::LedgerCompaction> {
         let mut identities = Vec::new();
         let mut ledgers = Vec::new();
@@ -1398,7 +1426,15 @@ impl Service {
 
     /// Run command-ledger compaction beside the outbox drain for as long as
     /// this service lives.
-    #[cfg(feature = "graphql")]
+    #[cfg(any(
+        feature = "http",
+        feature = "grpc",
+        feature = "postgres",
+        feature = "sqlite",
+        feature = "nats",
+        feature = "rabbitmq",
+        feature = "kafka",
+    ))]
     pub(crate) fn start_ledger_compaction(&mut self) {
         let ledgers = self.command_ledgers();
         self.ledger_compaction = (!ledgers.is_empty())
@@ -1506,7 +1542,6 @@ impl crate::application::CommandMountExecution for Service {
                     .await
                     .map(crate::application::CommandMountExecutionResult::Transport)
                     .map_err(crate::application::CommandMountExecutionError::Handler),
-                #[cfg(feature = "graphql")]
                 crate::application::CommandMountInvocation::Authenticated {
                     command_id,
                     session,

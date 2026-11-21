@@ -135,7 +135,7 @@ pub use service::{CausalDispatchError, CausalDispatchResult};
 pub use workers::{
     spawn_outbox_publish_loop, spawn_service_consumer_loop, spawn_service_consumer_loop_until,
 };
-#[cfg(feature = "graphql")]
+#[cfg(any(feature = "http", feature = "grpc"))]
 pub(crate) mod wait_path;
 pub use session::{Session, ROLE_KEY, USER_ID_KEY};
 

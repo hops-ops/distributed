@@ -134,7 +134,6 @@ async fn command_handler(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let session = session_from_headers(&headers);
-    #[cfg(feature = "graphql")]
     let wait_path = match super::wait_path::parse_wait_path_body(&body) {
         Ok(wait_path) => wait_path,
         Err(error) => {
@@ -145,7 +144,6 @@ async fn command_handler(
                 .into_response();
         }
     };
-    #[cfg(feature = "graphql")]
     if let Some((command_id, input)) = wait_path {
         return match super::wait_path::dispatch_wait_path(
             service.as_ref(),

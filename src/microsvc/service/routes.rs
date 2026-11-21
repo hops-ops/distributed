@@ -1,13 +1,11 @@
 use super::causal::{
-    abandon_attempt, handler_error_code, internal_ledger_error, rejection_outcome,
-    resolve_ambiguous_lookup, CausalDispatchError, CausalDispatchResult, CommandIngress,
-    ModeledProjectionMetadata,
+    abandon_attempt, ensure_causal_grant, handler_error_code, internal_ledger_error,
+    rejection_outcome, replay_result, resolve_ambiguous_lookup, CausalDispatchError,
+    CausalDispatchResult, CommandIngress, ExternalCausalAttempt, ExternalCausalReservation,
+    ModeledProjectionMetadata, SealModeledProjection,
 };
 #[cfg(feature = "graphql")]
-use super::causal::{
-    ensure_causal_grant, evaluate_causal_command_status, replay_result, CausalCommandPublicStatus,
-    ExternalCausalAttempt, ExternalCausalReservation, SealModeledProjection,
-};
+use super::causal::{evaluate_causal_command_status, CausalCommandPublicStatus};
 use super::handlers::{
     boxed_causal_guard, boxed_handler, boxed_prepared_handler, CausalCommandContext, CausalGuardFn,
     GuardFn, Handler, HandlerFn, HandlerFuture, PreparedCommandHandler, PreparedHandlerFn,
@@ -21,18 +19,16 @@ use crate::command::{
     command_transition, CommandConsistency, CommandEventSet, CommandInputType, CommandOutcome,
     CompiledInputDefaults, TypedCommand, TypedCommandContract,
 };
+use crate::command_dispatch::VerifiedPrincipal;
 use crate::command_ledger::{
     CanonicalInputHash, CausalCommitBatch, CausalTransactionalCommit, CommandAttempt,
     CommandContractFingerprint, CommandLedgerError, CommandLedgerStore, ReservationOutcome,
     TerminalCommandState,
 };
-#[cfg(feature = "graphql")]
 use crate::command_ledger::{
     CausalRepositoryIdentity, CausalStorageIdentity, CommandId, CommandLedgerKey, CommandLookup,
     CommandLookupScope, CommandReservation, ExternalDispatchBinding, PrincipalPartitionId,
 };
-#[cfg(feature = "graphql")]
-use crate::graphql::identity::VerifiedPrincipal;
 use crate::graphql::SurfaceProjector;
 use crate::microsvc::causal::CausalWorkspace;
 use crate::microsvc::cell_host::CellCommandIdentity;
@@ -192,20 +188,16 @@ pub(super) type CausalStatusFuture<'a> = Pin<
 #[cfg(feature = "graphql")]
 pub(super) type CausalStatusRoute<'a> =
     dyn Fn(&str, &[u8; 32]) -> Option<CommandConsistency> + Send + Sync + 'a;
-#[cfg(feature = "graphql")]
 pub(super) type ExternalReservationFuture<'a> = Pin<
     Box<dyn Future<Output = Result<ExternalCausalReservation, CausalDispatchError>> + Send + 'a>,
 >;
-#[cfg(feature = "graphql")]
 pub(super) type ExternalCompletionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), CausalDispatchError>> + Send + 'a>>;
-#[cfg(feature = "graphql")]
 pub(super) type ExternalAbandonFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), CausalDispatchError>> + Send + 'a>>;
 
 /// One bounded compaction pass over a command ledger, owning its repository
 /// handle so a background worker can run it.
-#[cfg(feature = "graphql")]
 pub(crate) type LedgerCompaction = Arc<
     dyn Fn(usize) -> Pin<Box<dyn Future<Output = Result<u64, CommandLedgerError>> + Send>>
         + Send
@@ -227,13 +219,10 @@ pub(super) trait ErasedCausalHandler<D>: Send + Sync {
         direct_projection: Option<crate::command::CommandDirectProjectionTarget>,
     );
 
-    #[cfg(feature = "graphql")]
     fn storage_identity(&self, dependencies: &D) -> CausalStorageIdentity;
 
-    #[cfg(feature = "graphql")]
     fn ledger_compaction(&self, dependencies: &D) -> LedgerCompaction;
 
-    #[cfg(feature = "graphql")]
     #[allow(clippy::too_many_arguments)]
     fn dispatch<'a>(
         &'a self,
@@ -244,7 +233,7 @@ pub(super) trait ErasedCausalHandler<D>: Send + Sync {
         session: Session,
         principal: VerifiedPrincipal,
         policy: CausalCommandPolicy,
-        protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
+        seal_modeled_projection: Option<&'a SealModeledProjection<'a>>,
     ) -> CausalHandlerFuture<'a>;
 
     fn dispatch_cell_causal<'a>(
@@ -256,7 +245,6 @@ pub(super) trait ErasedCausalHandler<D>: Send + Sync {
         shard: &'a StreamIdentity,
     ) -> CausalHandlerFuture<'a>;
 
-    #[cfg(feature = "graphql")]
     #[allow(dead_code)]
     fn lookup<'a>(
         &'a self,
@@ -280,7 +268,6 @@ pub(super) trait ErasedCausalHandler<D>: Send + Sync {
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a>;
 
-    #[cfg(feature = "graphql")]
     fn reserve_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -293,7 +280,6 @@ pub(super) trait ErasedCausalHandler<D>: Send + Sync {
         binding: ExternalDispatchBinding,
     ) -> ExternalReservationFuture<'a>;
 
-    #[cfg(feature = "graphql")]
     fn complete_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -301,7 +287,6 @@ pub(super) trait ErasedCausalHandler<D>: Send + Sync {
         result: &'a CausalDispatchResult,
     ) -> ExternalCompletionFuture<'a>;
 
-    #[cfg(feature = "graphql")]
     fn abandon_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -429,7 +414,6 @@ pub(super) trait ErasedRoutes: Send + Sync {
         ordered: Option<&'a OrderedDelivery>,
     ) -> HandlerFuture<'a>;
 
-    #[cfg(feature = "graphql")]
     #[allow(clippy::too_many_arguments)]
     fn dispatch_causal<'a>(
         &'a self,
@@ -440,10 +424,9 @@ pub(super) trait ErasedRoutes: Send + Sync {
         session: Session,
         principal: VerifiedPrincipal,
         policy: CausalCommandPolicy,
-        protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
+        seal_modeled_projection: Option<&'a SealModeledProjection<'a>>,
     ) -> CausalHandlerFuture<'a>;
 
-    #[cfg(feature = "graphql")]
     #[allow(dead_code)]
     fn lookup_causal<'a>(
         &'a self,
@@ -455,11 +438,9 @@ pub(super) trait ErasedRoutes: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<CommandLookup, CausalDispatchError>> + Send + 'a>>;
 
     /// The repository every typed command of this bundle commits to.
-    #[cfg(feature = "graphql")]
     fn causal_storage_identity(&self) -> Option<CausalStorageIdentity>;
 
     /// Compaction of the ledger in that repository.
-    #[cfg(feature = "graphql")]
     fn ledger_compaction(&self) -> Option<LedgerCompaction>;
 
     /// The consistency of this bundle's `command`, if `session` is still
@@ -482,7 +463,6 @@ pub(super) trait ErasedRoutes: Send + Sync {
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a>;
 
-    #[cfg(feature = "graphql")]
     fn reserve_external<'a>(
         &'a self,
         command: &'a str,
@@ -495,7 +475,6 @@ pub(super) trait ErasedRoutes: Send + Sync {
         binding: ExternalDispatchBinding,
     ) -> ExternalReservationFuture<'a>;
 
-    #[cfg(feature = "graphql")]
     fn complete_external<'a>(
         &'a self,
         command: &'a str,
@@ -503,7 +482,6 @@ pub(super) trait ErasedRoutes: Send + Sync {
         result: &'a CausalDispatchResult,
     ) -> ExternalCompletionFuture<'a>;
 
-    #[cfg(feature = "graphql")]
     fn abandon_external<'a>(
         &'a self,
         command: &'a str,
@@ -2120,8 +2098,13 @@ where
                             .prepared_domain_occurrences()
                             .map_err(Failure::abandon)?;
                         Some(
-                            seal(causation_id.clone(), policy.replay_retention, occurrences)
-                                .map_err(Failure::Abandon)?,
+                            seal(
+                                causation_id.clone(),
+                                policy.replay_retention,
+                                occurrences,
+                                &self.contract.projections.selectors,
+                            )
+                            .map_err(Failure::Abandon)?,
                         )
                     }
                     _ => None,
@@ -2207,7 +2190,6 @@ where
         self.fingerprint = CommandContractFingerprint::new(self.contract.fingerprint_bytes());
     }
 
-    #[cfg(feature = "graphql")]
     fn storage_identity(&self, dependencies: &D) -> CausalStorageIdentity {
         dependencies
             .__causal_aggregate_repository()
@@ -2215,7 +2197,6 @@ where
             .causal_storage_identity()
     }
 
-    #[cfg(feature = "graphql")]
     fn ledger_compaction(&self, dependencies: &D) -> LedgerCompaction {
         let repository = dependencies.__causal_aggregate_repository().repo().clone();
         Arc::new(move |limit| {
@@ -2224,7 +2205,6 @@ where
         })
     }
 
-    #[cfg(feature = "graphql")]
     fn dispatch<'a>(
         &'a self,
         dependencies: &'a D,
@@ -2234,54 +2214,22 @@ where
         session: Session,
         principal: VerifiedPrincipal,
         policy: CausalCommandPolicy,
-        protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
+        seal_modeled_projection: Option<&'a SealModeledProjection<'a>>,
     ) -> CausalHandlerFuture<'a> {
-        Box::pin(async move {
-            let seal_modeled_projection = protocol.as_ref().map(|protocol| {
-                move |causation_id: crate::command_ledger::CausationId,
-                      retention: Duration,
-                      occurrences: &[crate::DomainEventOccurrence]|
-                      -> Result<ModeledProjectionMetadata, String> {
-                    let metadata = protocol
-                        .projection_metadata_for_actual(
-                            causation_id,
-                            retention,
-                            occurrences,
-                            &self.contract.projections.selectors,
-                        )
-                        .map_err(|error| error.to_string())?;
-                    let expires_at = metadata.expires_at().map_err(|error| {
-                        format!("modeled projection metadata lifetime failed: {error}")
-                    })?;
-                    let canonical_bytes = metadata.canonical_bytes().map_err(|error| {
-                        format!("modeled projection metadata encoding failed: {error}")
-                    })?;
-                    Ok(ModeledProjectionMetadata {
-                        canonical_bytes,
-                        expires_at,
-                        pending: !metadata.obligations.is_empty(),
-                    })
-                }
-            });
-            self.execute_typed_command(
-                dependencies,
-                CommandIngress::Service {
-                    service_id,
-                    principal_partition: principal.partition_for_service(service_id),
-                    command_id,
-                    policy,
-                    seal_modeled_projection: seal_modeled_projection
-                        .as_ref()
-                        .map(|seal| seal as &SealModeledProjection<'_>),
-                },
-                input,
-                session,
-            )
-            .await
-        })
+        Box::pin(self.execute_typed_command(
+            dependencies,
+            CommandIngress::Service {
+                service_id,
+                principal_partition: principal.partition_for_service(service_id),
+                command_id,
+                policy,
+                seal_modeled_projection,
+            },
+            input,
+            session,
+        ))
     }
 
-    #[cfg(feature = "graphql")]
     fn lookup<'a>(
         &'a self,
         dependencies: &'a D,
@@ -2344,7 +2292,6 @@ where
         })
     }
 
-    #[cfg(feature = "graphql")]
     fn reserve_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -2408,7 +2355,6 @@ where
         })
     }
 
-    #[cfg(feature = "graphql")]
     fn complete_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -2454,7 +2400,6 @@ where
         })
     }
 
-    #[cfg(feature = "graphql")]
     fn abandon_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -2680,7 +2625,6 @@ where
         Box::pin(self.invoke(message, input, session, ordered))
     }
 
-    #[cfg(feature = "graphql")]
     fn dispatch_causal<'a>(
         &'a self,
         command: &'a str,
@@ -2690,7 +2634,7 @@ where
         session: Session,
         principal: VerifiedPrincipal,
         policy: CausalCommandPolicy,
-        protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
+        seal_modeled_projection: Option<&'a SealModeledProjection<'a>>,
     ) -> CausalHandlerFuture<'a> {
         let handler = self
             .handlers
@@ -2705,7 +2649,7 @@ where
                 session,
                 principal,
                 policy,
-                protocol,
+                seal_modeled_projection,
             ),
             Some(RegisteredHandler::Legacy { .. })
             | Some(RegisteredHandler::Projector(_))
@@ -2717,7 +2661,6 @@ where
         }
     }
 
-    #[cfg(feature = "graphql")]
     fn lookup_causal<'a>(
         &'a self,
         command: &'a str,
@@ -2748,14 +2691,12 @@ where
         }
     }
 
-    #[cfg(feature = "graphql")]
     fn causal_storage_identity(&self) -> Option<CausalStorageIdentity> {
         self.causal_handlers()
             .next()
             .map(|handler| handler.storage_identity(&self.dependencies))
     }
 
-    #[cfg(feature = "graphql")]
     fn ledger_compaction(&self) -> Option<LedgerCompaction> {
         self.causal_handlers()
             .next()
@@ -2800,7 +2741,6 @@ where
         }
     }
 
-    #[cfg(feature = "graphql")]
     fn reserve_external<'a>(
         &'a self,
         command: &'a str,
@@ -2837,7 +2777,6 @@ where
         }
     }
 
-    #[cfg(feature = "graphql")]
     fn complete_external<'a>(
         &'a self,
         command: &'a str,
@@ -2862,7 +2801,6 @@ where
         }
     }
 
-    #[cfg(feature = "graphql")]
     fn abandon_external<'a>(
         &'a self,
         command: &'a str,

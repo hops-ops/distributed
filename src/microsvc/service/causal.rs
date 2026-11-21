@@ -5,12 +5,11 @@ use serde_json::Value;
 use super::routes::CausalCommandPolicy;
 use crate::command::{CommandConsistency, TypedCommandContract};
 use crate::command_ledger::{
-    AttemptFence, CanonicalInputHash, CausationId, CommandContractFingerprint, CommandId,
-    CommandLedgerError, CommandLedgerKey, CommandLedgerState, CommandLedgerStore, CommandLookup,
-    CommandLookupScope, CommandReplay, CommandReservation, PrincipalPartitionId,
+    AttemptFence, CanonicalInputHash, CausationId, CommandAttempt, CommandContractFingerprint,
+    CommandId, CommandLedgerError, CommandLedgerKey, CommandLedgerState, CommandLedgerStore,
+    CommandLookup, CommandLookupScope, CommandReplay, CommandReservation, PrincipalPartitionId,
+    TerminalCommandState,
 };
-#[cfg(feature = "graphql")]
-use crate::command_ledger::{CommandAttempt, TerminalCommandState};
 use crate::microsvc::cell_host::{CellCommandIdentity, CellProjectionEventWireItem};
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::session::Session;
@@ -197,20 +196,17 @@ pub struct CausalDispatchResult {
 /// Gateway-side capability for one externally dispatched command. The attempt
 /// owns the durable reservation and is consumed only by terminal completion or
 /// retryable-unknown recovery; it is never reconstructed from the wire.
-#[cfg(feature = "graphql")]
 pub(crate) struct ExternalCausalAttempt {
     pub(crate) command_name: String,
     pub(crate) attempt: CommandAttempt,
     pub(crate) retention: Duration,
 }
 
-#[cfg(feature = "graphql")]
 pub(crate) enum ExternalCausalReservation {
     Acquired(ExternalCausalAttempt),
     Replay(CausalDispatchResult),
 }
 
-#[cfg(feature = "graphql")]
 impl ExternalCausalAttempt {
     pub(crate) fn command_id(&self) -> &str {
         self.attempt.key().command_id()
@@ -268,6 +264,7 @@ impl ExternalCausalAttempt {
                 "external command attempt lost its immutable route binding".into(),
             )
         })?;
+        #[cfg(feature = "graphql")]
         if let Some(metadata) = result.receipt.projection_metadata.as_ref() {
             let bytes = metadata.canonical_bytes().map_err(|error| {
                 CausalDispatchError::Internal(format!(
@@ -279,7 +276,8 @@ impl ExternalCausalAttempt {
                     "cell projection metadata retention deadline is invalid: {error}"
                 ))
             })?;
-            self.attempt
+            return self
+                .attempt
                 .complete_external_with_projection_metadata_until(
                     binding,
                     state,
@@ -288,12 +286,11 @@ impl ExternalCausalAttempt {
                     self.retention,
                     expires_at,
                 )
-                .map_err(internal_ledger_error)
-        } else {
-            self.attempt
-                .complete_external(binding, state, result.payload().clone(), self.retention)
-                .map_err(internal_ledger_error)
+                .map_err(internal_ledger_error);
         }
+        self.attempt
+            .complete_external(binding, state, result.payload().clone(), self.retention)
+            .map_err(internal_ledger_error)
     }
 }
 
@@ -355,6 +352,69 @@ impl CausalDispatchResult {
                 "replayed": self.replayed,
             },
             "events": self.projection_events,
+        })
+    }
+
+    /// Rebuild a receipt from the HTTP/gRPC wait-path JSON envelope.
+    pub fn from_wait_path_wire(body: Value) -> Result<Self, CausalDispatchError> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct ReceiptWire {
+            command_id: String,
+            causation_id: String,
+            state: String,
+            #[serde(default)]
+            replayed: Option<bool>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct ResponseWire {
+            #[serde(default)]
+            payload: Value,
+            receipt: ReceiptWire,
+            #[serde(default)]
+            events: Vec<CellProjectionEventWireItem>,
+        }
+
+        let wire: ResponseWire = serde_json::from_value(body).map_err(|error| {
+            CausalDispatchError::Internal(format!("invalid wait-path response: {error}"))
+        })?;
+        if wire.receipt.command_id.trim().is_empty()
+            || wire.receipt.command_id.len() > 512
+            || wire.receipt.causation_id.len() > 512
+        {
+            return Err(CausalDispatchError::Internal(
+                "wait-path receipt contains an invalid identifier".into(),
+            ));
+        }
+        let state = crate::command_ledger::CommandLedgerState::parse(&wire.receipt.state).map_err(
+            |err| CausalDispatchError::Internal(format!("wait-path receipt state: {err}")),
+        )?;
+        let replayed = wire.receipt.replayed.unwrap_or(false);
+        crate::microsvc::cell_host::parse_cell_projection_events(&serde_json::json!({
+            "events": wire.events
+        }))
+        .map_err(|error| {
+            CausalDispatchError::Internal(format!(
+                "invalid cell projection event response: {error}"
+            ))
+        })?;
+        Ok(Self {
+            payload: wire.payload,
+            projection_events: wire.events,
+            replayed,
+            receipt: CausalCommandReceiptSource {
+                command_id: wire.receipt.command_id,
+                command_name: String::new(),
+                causation_id: wire.receipt.causation_id,
+                consistency: crate::command::CommandConsistency::Succeeded,
+                state,
+                outcome: Value::Null,
+                #[cfg(feature = "graphql")]
+                projection_metadata: None,
+                direct_projection: None,
+            },
         })
     }
 }
@@ -473,68 +533,6 @@ impl CausalDispatchResult {
             evidence,
             direct_projection: self.receipt.direct_projection.clone(),
         }
-    }
-
-    /// Rebuild a receipt from the HTTP/gRPC wait-path JSON envelope.
-    pub fn from_wait_path_wire(body: Value) -> Result<Self, CausalDispatchError> {
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct ReceiptWire {
-            command_id: String,
-            causation_id: String,
-            state: String,
-            #[serde(default)]
-            replayed: Option<bool>,
-        }
-
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct ResponseWire {
-            #[serde(default)]
-            payload: Value,
-            receipt: ReceiptWire,
-            #[serde(default)]
-            events: Vec<CellProjectionEventWireItem>,
-        }
-
-        let wire: ResponseWire = serde_json::from_value(body).map_err(|error| {
-            CausalDispatchError::Internal(format!("invalid wait-path response: {error}"))
-        })?;
-        if wire.receipt.command_id.trim().is_empty()
-            || wire.receipt.command_id.len() > 512
-            || wire.receipt.causation_id.len() > 512
-        {
-            return Err(CausalDispatchError::Internal(
-                "wait-path receipt contains an invalid identifier".into(),
-            ));
-        }
-        let state = crate::command_ledger::CommandLedgerState::parse(&wire.receipt.state).map_err(
-            |err| CausalDispatchError::Internal(format!("wait-path receipt state: {err}")),
-        )?;
-        let replayed = wire.receipt.replayed.unwrap_or(false);
-        crate::microsvc::cell_host::parse_cell_projection_events(&serde_json::json!({
-            "events": wire.events
-        }))
-        .map_err(|error| {
-            CausalDispatchError::Internal(format!(
-                "invalid cell projection event response: {error}"
-            ))
-        })?;
-        Ok(Self {
-            payload: wire.payload,
-            projection_events: wire.events,
-            replayed,
-            receipt: CausalCommandReceiptSource {
-                command_id: wire.receipt.command_id,
-                command_name: String::new(),
-                causation_id: wire.receipt.causation_id,
-                consistency: crate::command::CommandConsistency::Succeeded,
-                state,
-                outcome: Value::Null,
-                projection_metadata: None,
-                direct_projection: None,
-            },
-        })
     }
 }
 
@@ -686,6 +684,7 @@ pub(super) type SealModeledProjection<'a> = dyn Fn(
         CausationId,
         Duration,
         &[crate::DomainEventOccurrence],
+        &[crate::ProjectionEventSelector],
     ) -> Result<ModeledProjectionMetadata, String>
     + Send
     + Sync
@@ -696,7 +695,6 @@ pub(super) type SealModeledProjection<'a> = dyn Fn(
 /// by this value.
 pub(super) enum CommandIngress<'a> {
     /// A service's GraphQL or wait-path ingress, for a verified principal.
-    #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
     Service {
         service_id: &'a str,
         principal_partition: String,
@@ -816,7 +814,6 @@ pub(super) fn internal_ledger_error(error: CommandLedgerError) -> CausalDispatch
     CausalDispatchError::Internal(error.to_string())
 }
 
-#[cfg(feature = "graphql")]
 pub(super) async fn abandon_external_attempt<R>(
     repository: &R,
     attempt: ExternalCausalAttempt,

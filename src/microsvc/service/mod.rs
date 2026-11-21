@@ -57,7 +57,15 @@ pub use handlers::{
 pub use invoke::{invoke_transition, load_for_command, require_loaded, CommandLoad};
 pub use request::{CommandRequest, CommandResponse};
 pub(crate) use routes::DynBusPublisher;
-#[cfg(feature = "graphql")]
+#[cfg(any(
+    feature = "http",
+    feature = "grpc",
+    feature = "postgres",
+    feature = "sqlite",
+    feature = "nats",
+    feature = "rabbitmq",
+    feature = "kafka",
+))]
 pub(crate) use routes::LedgerCompaction;
 pub use routes::{
     DeliveryKind, HandlerNames, HandlerSpec, PortableCommand, RouteBuilder, Routes,

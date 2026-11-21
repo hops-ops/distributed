@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use super::service::{CausalDispatchError, CausalDispatchResult, Service};
 use super::session::Session;
-use crate::graphql::identity::VerifiedPrincipal;
+use crate::command_dispatch::VerifiedPrincipal;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

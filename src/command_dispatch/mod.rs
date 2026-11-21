@@ -3,6 +3,7 @@
 
 #[cfg(feature = "graphql")]
 mod host;
+pub(crate) mod principal;
 
 #[cfg(feature = "graphql")]
 pub(crate) use host::{validate_principal_session, validate_principal_session_if_present};
@@ -11,3 +12,4 @@ pub use host::{
     CellRequestContext, CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost,
     TrustedRequestMetadata,
 };
+pub use principal::{InvalidPrincipal, VerifiedPrincipal};
