@@ -32,7 +32,6 @@ mod defaults;
 mod handlers;
 mod helpers;
 mod invoke;
-mod request;
 mod routes;
 mod runtime;
 
@@ -55,7 +54,6 @@ pub use handlers::{
     PreparedCommandHandler,
 };
 pub use invoke::{invoke_transition, load_for_command, require_loaded, CommandLoad};
-pub use request::{CommandRequest, CommandResponse};
 pub(crate) use routes::DynBusPublisher;
 #[cfg(background_workers)]
 pub(crate) use routes::LedgerCompaction;

@@ -179,6 +179,10 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
 
     fn typed_command_contracts(&self) -> Vec<&TypedCommandContract>;
 
+    /// The contract of `command`, when this bundle registers it as a typed
+    /// command.
+    fn typed_command_contract(&self, command: &str) -> Option<&TypedCommandContract>;
+
     fn projector_registrations(&self) -> Vec<ProjectorRegistration>;
 
     fn modeled_local_services(&self) -> Vec<&str>;

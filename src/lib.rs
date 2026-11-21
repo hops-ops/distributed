@@ -84,10 +84,10 @@ pub use entity::{
 // crate root for contract-only packages.
 pub use application::{
     admit_command_session, command_roles_require_principal, Application, ApplicationError,
-    ApplicationManifest, CommandMount, CommandMountHandler, CommandMountRegistrar, CommandSpec,
-    ContractCompiler, DeploymentPlan, FrameworkCompatibility, LogicalId, Module, ModuleManifest,
-    MountSelector, ProcessIntent, ProcessPreset, ProjectionSpec, Runtime, RuntimeDialect,
-    SurfaceSpec, APPLICATION_MANIFEST_SCHEMA_VERSION, DEPLOYMENT_PLAN_SCHEMA_VERSION,
+    ApplicationManifest, CommandMount, CommandMountRegistrar, CommandSpec, ContractCompiler,
+    DeploymentPlan, FrameworkCompatibility, LogicalId, Module, ModuleManifest, MountSelector,
+    ProcessIntent, ProcessPreset, ProjectionSpec, Runtime, RuntimeDialect, SurfaceSpec,
+    APPLICATION_MANIFEST_SCHEMA_VERSION, DEPLOYMENT_PLAN_SCHEMA_VERSION,
 };
 #[cfg(feature = "graphql")]
 pub use command_dispatch::{

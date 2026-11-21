@@ -682,6 +682,12 @@ where
         self.typed_contracts()
     }
 
+    fn typed_command_contract(&self, command: &str) -> Option<&TypedCommandContract> {
+        self.causal_handler(command)
+            .ok()
+            .map(|handler| handler.contract())
+    }
+
     fn projector_registrations(&self) -> Vec<ProjectorRegistration> {
         self.projectors
             .iter()

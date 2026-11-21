@@ -208,10 +208,29 @@ saga's own `REPLY_TO` queue, scheduled with `deliver_at = now + step.timeout`.
 A crash between deciding and sending is impossible. A timer for a step that
 already finished arrives later and is `Ignored`.
 
-Participants answer with `SagaReply::from_outbox(&cmd)?.succeeded(..)` or
-`.failed(reason)` and commit the reply with their own state change. Inbound
-replies and timers become `SagaMessage::from_outbox` / `from_bus` and go to
-`SagaRunner::handle`. Inside a `microsvc` handler you can also call
+A participant is a typed command of a `Service`, delivered by the bus. It
+declares the transport role (`.roles([TRANSPORT_ROLE])`); a typed command
+that does not is refused when a bus delivers it. The handler builds the
+reply from its session and stages it in the same commit as its state change:
+
+```rust
+let reply = SagaReply::from_session(ctx.session()).map_err(rejected)?;
+// ... load the aggregate, apply or refuse the step ...
+let reply = reply.succeeded(output).map_err(rejected)?;
+ctx.outbox(reply).commit(aggregate)?.succeeded(payload)
+```
+
+(`rejected` maps a `SagaError` to `HandlerError::Rejected`;
+`tests/saga_transfer/main.rs` is the complete participant.)
+
+`from_session` reads the saga headers, which arrive as session claims, and
+the saga command id, which the transport puts in `TRANSPORT_MESSAGE_ID_CLAIM`.
+A step the participant refuses is still a committed command: stage
+`reply.failed(reason)` and return `Ok`. Returning `Err` records the rejection
+in the ledger but stages no reply, so the saga would wait for its timeout.
+
+Inbound replies and timers become `SagaMessage::from_outbox` / `from_bus` and
+go to `SagaRunner::handle`. Inside a `microsvc` handler you can also call
 `Saga::handle` and commit with `ctx.repo().outbox(..)`.
 
 Guarantees and obligations:
@@ -221,13 +240,26 @@ Guarantees and obligations:
   `Ignored`. Concurrent handlers are fenced by the saga stream's optimistic
   version, and `SagaRunner` reloads and retries on `ConcurrentWrite`.
 - **Deterministic ids.** Command ids are `type:saga:step:phase:attempt` and a
-  reply id is `<command id>:reply`. Participants dedupe on the command id
-  (an inbox receipt or aggregate state) and do not re-emit a reply on
-  redelivery.
+  reply id is `<command id>:reply`.
+- **Redelivery is deduplicated by the command ledger** for a typed
+  participant. The ledger command id is derived from the service name, the
+  command name and the saga command id, so the same saga command delivered
+  again replays the stored receipt: the handler does not run, no state
+  changes and no second reply is staged. The first reply cannot be missing,
+  because it was committed in the transaction that wrote the receipt. This
+  covers one command id only. A retry of a compensation is a new attempt
+  with a new command id, and the handler runs again.
+- **A participant that is not a typed command of a `Service`** (it consumes
+  the outbox row or bus message itself and builds the reply with
+  `SagaReply::from_outbox` / `from_bus`) gets none of that. It must dedupe on
+  the saga command id itself (an inbox receipt or aggregate state) and must
+  not emit a second reply on redelivery.
 - **A timeout means the outcome is unknown,** so the timed-out step is
   compensated as well. Compensations must be idempotent and must tolerate
   arriving *before* their action. The participant records a tombstone for
-  the saga id and rejects a late action.
+  the saga id and rejects a late action. This is the participant's own
+  state on every path: the ledger knows command ids, not which transfer was
+  cancelled.
 - **`on_step_succeeded` is replayed,** so keep it deterministic.
 
 ### Fan-out steps

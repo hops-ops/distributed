@@ -26,7 +26,7 @@ pub(crate) use error::CommandLedgerError;
     allow(unused_imports)
 )]
 pub(crate) use ids::{
-    AttemptToken, CanonicalInputHash, CausalStorageIdentity, CausationId,
+    deterministic_command_id, AttemptToken, CanonicalInputHash, CausalStorageIdentity, CausationId,
     CommandContractFingerprint, CommandId, CommandLedgerKey, PrincipalPartitionId, SHA256_BYTES,
 };
 pub(crate) use record::{CommandLedgerRecord, ReservationDecision};

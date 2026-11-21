@@ -600,12 +600,7 @@ fn manifest_wire_derives_inventories_without_accepting_a_second_authority() {
 #[test]
 fn application_manifest_is_byte_deterministic_and_contains_no_executable_data() {
     let spec = command("todo.create");
-    let mount = CommandMount::from_request_handler(spec.clone(), |request| async move {
-        Ok(distributed::microsvc::CommandResponse {
-            status: 200,
-            body: request.input,
-        })
-    });
+    let mount = CommandMount::from_typed_route(spec.clone(), "todo.create");
     let definition = CommandDefinition::with_mount(spec, mount).unwrap();
     let module = Module::new("todo")
         .command_definition(definition)
