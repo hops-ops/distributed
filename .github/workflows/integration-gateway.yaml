@@ -9,8 +9,19 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+  # File and line in backtraces, without the full debug info that makes up
+  # most of a dev build's link time and cache size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
 jobs:
-  contracts:
+  # The portable and native fixture crates on one runner (they were the
+  # `contracts` and `native` jobs, about two minutes each). Every check runs
+  # even when an earlier one fails, so one run lists every failure.
+  fixtures:
+    name: fixtures (portable contracts, native adapter)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -22,21 +33,43 @@ jobs:
           toolchain: stable
           targets: wasm32-unknown-unknown
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            tests/gateway-portable -> target
+            tests/gateway-native -> target
+          shared-key: gateway-fixtures
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Format contract and fixture sources
+        if: ${{ !cancelled() }}
         run: rustfmt --edition 2021 --check src/gateway/mod.rs tests/gateway_routing.rs tests/gateway_extensions.rs tests/gateway-portable/src/lib.rs
       - name: Test portable routing and adapter contracts
+        if: ${{ !cancelled() }}
         run: cargo test --manifest-path tests/gateway-portable/Cargo.toml --locked
       - name: Check fixture lints
+        if: ${{ !cancelled() }}
         run: cargo clippy --manifest-path tests/gateway-portable/Cargo.toml --locked --all-targets -- -D warnings
       - name: Compile the UI/auth consumer to Wasm
+        if: ${{ !cancelled() }}
         run: cargo check --manifest-path tests/gateway-portable/Cargo.toml --locked --target wasm32-unknown-unknown
       - name: Test and compile portable GraphQL operation policy
+        if: ${{ !cancelled() }}
         run: |
           cargo test --manifest-path tests/gateway-portable/Cargo.toml --locked --features gateway-delivery
           cargo check --manifest-path tests/gateway-portable/Cargo.toml --locked --features gateway-delivery --target wasm32-unknown-unknown
           python3 tests/gateway-portable/check_dependencies.py --features gateway-delivery
       - name: Verify native and Wasm dependency isolation
+        if: ${{ !cancelled() }}
         run: python3 tests/gateway-portable/check_dependencies.py
+      - name: Test real native HTTP streams and upgrades
+        if: ${{ !cancelled() }}
+        run: cargo test --manifest-path tests/gateway-native/Cargo.toml --locked
+      - name: Check native fixture lints
+        if: ${{ !cancelled() }}
+        run: cargo clippy --manifest-path tests/gateway-native/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Verify UI/auth executor dependency isolation
+        if: ${{ !cancelled() }}
+        run: python3 tests/gateway-native/check_dependencies.py
 
   auth:
     runs-on: ubuntu-latest
@@ -51,6 +84,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Same test target as the GraphQL identity job; that job writes the cache.
+          shared-key: graphql
+          save-if: false
       - name: Verify gateway and backend identity
         run: cargo test -p distributed --no-default-features --features gateway,graphql,sqlite --test graphql_identity
       - name: Install pinned auth fixture dependencies
@@ -63,24 +101,6 @@ jobs:
         working-directory: tests/gateway-auth
         run: npm test
 
-  native:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          toolchain: stable
-          components: clippy
-      - name: Test real native HTTP streams and upgrades
-        run: cargo test --manifest-path tests/gateway-native/Cargo.toml --locked
-      - name: Check native fixture lints
-        run: cargo clippy --manifest-path tests/gateway-native/Cargo.toml --locked --all-targets -- -D warnings
-      - name: Verify UI/auth executor dependency isolation
-        run: python3 tests/gateway-native/check_dependencies.py
-
   graphql:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -91,6 +111,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tests/gateway-worker -> target
+          shared-key: gateway-graphql
+          save-if: false
       - name: Verify embedded and remote GraphQL protocols
         run: cargo test -p distributed --no-default-features --features gateway-graphql-native,gateway-delivery,sqlite --test gateway_graphql --test gateway_graphql_operation --test graphql_causal_transport --test graphql_query_protocol --test graphql_identity --test graphql_sqlite --test sqlite_repository
 
@@ -113,6 +140,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The distributed_cli job writes this cache.
+          shared-key: cli
+          save-if: false
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -141,6 +173,13 @@ jobs:
           toolchain: stable
           targets: wasm32-unknown-unknown
           components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tests/gateway-worker -> target
+          shared-key: gateway-graphql
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install pinned local Worker and auth fixtures
         run: |
           cargo install worker-build --version 0.8.5 --locked
@@ -181,9 +220,19 @@ jobs:
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tests/e2e-ui -> target
+          # Same workspaces as the e2e-ui jobs, whose browser job writes the cache.
+          shared-key: e2e-ui
+          save-if: false
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
       - name: Install isolated browser fixture
         run: |
-          cargo install wasm-pack --locked
           npm ci --prefix tests/gateway-auth
           npm ci --prefix tests/e2e-ui
           cd tests/gateway-auth

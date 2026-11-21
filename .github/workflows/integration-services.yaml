@@ -13,13 +13,18 @@ name: Workspace Tests Against Real Services
 on:
   workflow_call:
 
+env:
+  CARGO_TERM_COLOR: always
+  # File and line in backtraces, without the full debug info that makes up
+  # most of a dev build's link time and cache size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   services:
     name: Workspace Tests (all features, real services)
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    env:
-      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -31,6 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-services
+          save-if: ${{ github.event_name != 'pull_request' }}
       # --all-features compiles rdkafka; librdkafka's bundled cmake build needs
       # curl/curl.h (the runner has libcurl's runtime but not its headers).
       - name: Install librdkafka build dependencies

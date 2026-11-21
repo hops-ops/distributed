@@ -14,12 +14,19 @@ name: GraphQL Identity / OIDC Integration Tests
 on:
   workflow_call:
 
+env:
+  CARGO_TERM_COLOR: always
+  # File and line in backtraces, without the full debug info that makes up
+  # most of a dev build's link time and cache size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   identity-always-on:
     name: GraphQL Identity
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
-      CARGO_TERM_COLOR: always
       # Explicitly clear live gates so matrix cannot accidentally run live paths
       ZITADEL_E2E: ""
       KEYCLOAK_E2E: ""
@@ -33,7 +40,8 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: graphql-identity
+          shared-key: graphql
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Always-on identity suite (no IdP)
         run: |
           cargo test --test graphql_identity --features graphql,sqlite,metrics --verbose
@@ -41,8 +49,8 @@ jobs:
   oidc-zitadel-e2e:
     name: GraphQL OIDC Zitadel e2e (live)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
-      CARGO_TERM_COLOR: always
       ZITADEL_HOST: http://localhost:8080
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -53,7 +61,8 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: graphql-oidc-zitadel
+          shared-key: graphql
+          save-if: false
       - name: Install bootstrap tools
         run: sudo apt-get update && sudo apt-get install -y jq openssl curl
       - name: Start Zitadel + bootstrap (docker compose)
@@ -84,8 +93,7 @@ jobs:
   oidc-keycloak-e2e:
     name: GraphQL OIDC Keycloak e2e (live)
     runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -95,7 +103,8 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: graphql-oidc-keycloak
+          shared-key: graphql
+          save-if: false
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y curl python3
       - name: Start Keycloak + bootstrap
@@ -124,8 +133,7 @@ jobs:
   oidc-authentik-e2e:
     name: GraphQL OIDC Authentik e2e (live)
     runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -135,7 +143,8 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: graphql-oidc-authentik
+          shared-key: graphql
+          save-if: false
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y curl python3
       - name: Start Authentik + bootstrap
