@@ -154,7 +154,7 @@ async fn todos() {
     assert!(completed_todo.snapshot().user_id == "user1");
     assert!(completed_todo.snapshot().task == "Buy groceries");
     assert!(completed_todo.snapshot().completed);
-    repo.abort(&completed_todo).await.unwrap();
+    drop(completed_todo);
 
     let (mut todo2, id2) = initialized_todo("user1", "Buy Sauna");
     let (mut todo3, id3) = initialized_todo("user2", "Chew bubblegum");
@@ -289,7 +289,7 @@ async fn abort_releases_lock_after_get() {
     rx_started.recv().unwrap();
     assert!(rx_got.recv_timeout(Duration::from_millis(200)).is_err());
 
-    repo.abort(&locked).await.unwrap();
+    drop(locked);
     assert!(rx_got.recv_timeout(Duration::from_millis(500)).is_ok());
 }
 
@@ -318,9 +318,7 @@ async fn abort_releases_lock_after_get_all() {
     rx_started.recv().unwrap();
     assert!(rx_got.recv_timeout(Duration::from_millis(200)).is_err());
 
-    for todo in &locked {
-        repo.abort(todo).await.unwrap();
-    }
+    drop(locked);
 
     assert!(rx_got.recv_timeout(Duration::from_millis(500)).is_ok());
 }
@@ -360,7 +358,7 @@ async fn queued_repo_blocks_get_until_commit() {
             .block_on(repo_other.get(&other_id_clone))
             .unwrap()
             .unwrap();
-        rt.block_on(repo_other.abort(&todo)).unwrap();
+        drop(todo);
         tx_other_done.send(()).unwrap();
     });
 
@@ -468,14 +466,14 @@ async fn commit_failure_keeps_lock_until_abort() {
         tx_started.send(()).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let todo = rt.block_on(repo_other.get(&id_other)).unwrap().unwrap();
-        rt.block_on(repo_other.abort(&todo)).unwrap();
+        drop(todo);
         tx_got.send(()).unwrap();
     });
 
     rx_started.recv().unwrap();
     assert!(rx_got.recv_timeout(Duration::from_millis(200)).is_err());
 
-    repo.abort(&locked).await.unwrap();
+    drop(locked);
     assert!(rx_got.recv_timeout(Duration::from_millis(500)).is_ok());
 }
 

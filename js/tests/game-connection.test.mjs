@@ -335,6 +335,36 @@ test('ping/pong estimates offset, rtt and jitter', async () => {
 	conn.close();
 });
 
+test('nothing is sent on a socket that is closing', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	scriptedServer(network);
+	let socket;
+	let sends = 0;
+	const { conn } = connection(network, scheduler, {
+		socket: (url) => {
+			socket = network.factory(url);
+			const send = socket.send.bind(socket);
+			socket.send = (data) => {
+				sends += 1;
+				send(data);
+			};
+			return socket;
+		}
+	});
+	await conn.connect();
+	conn.sendInput(new Uint8Array([1, 0]), 7);
+	const before = { sends, out: conn.stats.messagesOut };
+
+	// The page is navigating away: the socket is closing, its close event
+	// has not been delivered yet, and a frame still sends an input.
+	socket.readyState = 2;
+	conn.sendInput(new Uint8Array([1, 1]), 8);
+
+	assert.equal(sends, before.sends, 'a closing browser socket logs a console error on send');
+	assert.equal(conn.stats.messagesOut, before.out);
+});
+
 test('typed events surface Event/Freeze/Resume/Error and inputs are sequenced', async () => {
 	const network = new FakeNetwork();
 	const scheduler = new FakeScheduler();

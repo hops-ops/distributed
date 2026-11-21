@@ -211,7 +211,11 @@ async fn shared_recursive_helpers_preserve_contracts_captures_and_replay() {
     assert_eq!(body.id, "r1");
     assert_eq!(body.user_id, "member-2");
     let repository = distributed::InMemoryRepository::new().aggregate::<Review>();
-    repository.commit(&mut review).await.unwrap();
+    repository
+        .publish_events()
+        .commit(&mut review)
+        .await
+        .unwrap();
     let loaded = repository.get("r1").await.unwrap().unwrap();
     assert_eq!(loaded.status, "member-2");
     assert!(loaded.entity.pending_domain_events().is_empty());

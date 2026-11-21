@@ -406,6 +406,7 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 	let lastMe: { x: number; y: number } | undefined;
 	let lastZone: string | undefined;
 	let lastFrame = 0;
+	let lastSpeed = 0;
 
 	let frame = requestAnimationFrame(function draw(now) {
 		pacer.update(now, () => client.sendInput(steer()));
@@ -423,15 +424,21 @@ export function startPitLoop(canvas: HTMLCanvasElement, options: PitLoopOptions)
 		const centre = me ?? (here === undefined ? { x: 0, y: 0 } : { x: here[0] * ROOM, y: here[1] * ROOM });
 		if (me !== undefined) {
 			canvas.dataset.world = `${me.x.toFixed(3)},${me.y.toFixed(3)}`;
-			// Largest frame-to-frame move of the view (m), frames ≤ 50 ms
-			// apart; the headless test resets it to 0 before a doorway.
+			// Largest frame-to-frame move of the view beyond what walking
+			// explains (m): the move, less the faster of the two frames'
+			// speeds times the time between them. Walking at any frame rate
+			// reads near 0; a doorway snap reads as its size. The headless
+			// test resets it to 0 before a doorway.
+			const speed = Math.hypot(Number(meEntity?.fields.vx ?? 0), Number(meEntity?.fields.vy ?? 0));
 			if (lastMe !== undefined && now - lastFrame <= 50) {
-				const jump = Math.hypot(me.x - lastMe.x, me.y - lastMe.y);
+				const walked = (Math.max(speed, lastSpeed) * (now - lastFrame)) / 1000;
+				const jump = Math.max(0, Math.hypot(me.x - lastMe.x, me.y - lastMe.y) - walked);
 				if (jump > Number(canvas.dataset.jump ?? 0)) {
 					canvas.dataset.jump = jump.toFixed(3);
-					canvas.dataset.jumpDebug = JSON.stringify({ from: lastMe, to: me, zone: meEntity?.zoneId, lastZone, room, predicted: meEntity?.predicted, fields: meEntity?.fields });
+					canvas.dataset.jumpDebug = JSON.stringify({ from: lastMe, to: me, frameMs: now - lastFrame, walked, zone: meEntity?.zoneId, lastZone, room, predicted: meEntity?.predicted, fields: meEntity?.fields });
 				}
 			}
+			lastSpeed = speed;
 			lastMe = me;
 			lastZone = meEntity?.zoneId;
 		}

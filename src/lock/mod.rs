@@ -42,7 +42,7 @@ mod sqlx_common;
 
 pub use error::{LockError, RetryClass};
 pub use in_memory::{InMemoryLock, InMemoryLockFuture, InMemoryLockManager};
-pub use lock::Lock;
+pub use lock::{Lock, LockGuard};
 pub use manager::LockManager;
 #[cfg(feature = "postgres")]
 pub use postgres_lock::{PostgresDialect, PostgresLock, PostgresLockManager};

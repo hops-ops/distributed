@@ -118,7 +118,7 @@ async fn helper_custom_bodies_preserve_paths_descriptors_and_replay() {
     assert_eq!(tag.name, "v1");
 
     let store = distributed::InMemoryRepository::new().aggregate::<repository::Repository>();
-    store.commit(&mut aggregate).await.unwrap();
+    store.publish_events().commit(&mut aggregate).await.unwrap();
     let loaded = store.get("repo-1").await.unwrap().unwrap();
     assert_eq!(loaded.branch, "main");
     assert_eq!(loaded.tag, "v1");

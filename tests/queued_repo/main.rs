@@ -1,7 +1,7 @@
 //! `QueuedRepository` — per-aggregate serialization over the repository
 //! surface. Proves `.queued().aggregate::<T>()` engages the async lock on
 //! `get`/`commit`, plus per-aggregate granularity, the `no_lock` opt-out,
-//! and explicit abort.
+//! and release on drop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -214,21 +214,105 @@ async fn queued_repo_n_writers_commit_in_fifo_order() {
     );
 }
 
+/// A load that must not block, or the test fails instead of hanging.
+async fn load_now(repo: &QueuedCounterRepo, id: &str, why: &str) -> Option<Counter> {
+    tokio::time::timeout(Duration::from_millis(500), repo.get(id))
+        .await
+        .expect(why)
+        .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn abort_releases_a_held_lock() {
+async fn dropping_a_loaded_aggregate_releases_its_lock() {
     let repo = queued_repo();
     seed(&repo, "c1").await;
 
-    // Load (acquire) then abort without committing.
+    // A handler that loads and then returns early (an error, a `?`) drops
+    // the aggregate without committing.
     let held = repo.get("c1").await.unwrap().unwrap();
-    repo.abort(&held).await.unwrap();
+    drop(held);
 
-    // The lock is free again: a subsequent load must not block.
-    let reloaded = tokio::time::timeout(Duration::from_millis(500), repo.get("c1"))
+    assert!(
+        load_now(&repo, "c1", "a dropped load must not leak its lock")
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loading_a_missing_aggregate_holds_no_lock() {
+    let repo = queued_repo();
+
+    assert!(repo.get("absent").await.unwrap().is_none());
+
+    assert!(
+        load_now(&repo, "absent", "a miss must not leave the lock held")
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_commit_releases_only_the_lock_its_own_load_took() {
+    let repo = queued_repo();
+    seed(&repo, "c1").await;
+
+    // Writer A holds the lock.
+    let _held = repo.get("c1").await.unwrap().unwrap();
+
+    // Writer B never took the lock (a peek). Its commit, successful or not,
+    // must not release A's lock.
+    let mut peeked = repo.peek("c1").await.unwrap().unwrap();
+    peeked.increment("c1".into(), 1).unwrap();
+    repo.commit(&mut peeked).await.unwrap();
+
+    let blocked = tokio::time::timeout(Duration::from_millis(100), repo.get("c1")).await;
+    assert!(
+        blocked.is_err(),
+        "the lock is still held by the writer that loaded first"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_commit_keeps_the_lock_until_the_aggregate_is_dropped() {
+    let repo = queued_repo();
+    seed(&repo, "c1").await;
+
+    let mut held = repo.get("c1").await.unwrap().unwrap();
+    held.increment("c1".into(), 1).unwrap();
+    // Someone commits underneath without the lock, so this commit conflicts.
+    let mut other = repo.peek("c1").await.unwrap().unwrap();
+    other.increment("c1".into(), 7).unwrap();
+    repo.commit(&mut other).await.unwrap();
+    repo.commit(&mut held)
         .await
-        .expect("load after abort must not block")
-        .unwrap();
-    assert!(reloaded.is_some());
+        .expect_err("the stale commit conflicts");
+
+    let blocked = tokio::time::timeout(Duration::from_millis(100), repo.get("c1")).await;
+    assert!(blocked.is_err(), "the failed writer still holds the lock");
+    drop(held);
+    assert!(load_now(&repo, "c1", "dropping the failed writer releases")
+        .await
+        .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_all_holds_only_the_streams_it_returned() {
+    let repo = queued_repo();
+    seed(&repo, "a").await;
+
+    let loaded = repo.get_all(&["a", "missing"]).await.unwrap();
+    assert_eq!(loaded.len(), 1);
+
+    assert!(load_now(&repo, "missing", "a missing id holds no lock")
+        .await
+        .is_none());
+    let blocked = tokio::time::timeout(Duration::from_millis(100), repo.get("a")).await;
+    assert!(blocked.is_err(), "the returned aggregate holds its lock");
+    drop(loaded);
+    assert!(load_now(&repo, "a", "dropping the batch releases")
+        .await
+        .is_some());
 }
 
 // ===========================================================================

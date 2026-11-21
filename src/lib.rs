@@ -395,7 +395,6 @@ pub use queued_repo::{
     Queueable,
     QueuedRepository,
     ReadOpts,
-    UnlockableRepository,
 };
 
 // Read models: projections and read-optimized views.

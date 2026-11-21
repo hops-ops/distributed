@@ -19,17 +19,28 @@ import { fileURLToPath } from 'node:url';
 const CELLS = fileURLToPath(new URL('../../../cells/', import.meta.url));
 const RELAY_PATH = '/internal/celld-queue/relay';
 
-/** A free local port (bound, then released). */
-export function freePort() {
-	return new Promise((resolve, reject) => {
-		const server = createServer();
-		server.unref();
-		server.on('error', reject);
-		server.listen(0, '127.0.0.1', () => {
-			const { port } = server.address();
-			server.close(() => resolve(port));
+const handedOut = new Set();
+
+/**
+ * A free local port (bound, then released). Never the same port twice in
+ * one run: a released port can be handed out again.
+ */
+export async function freePort() {
+	for (;;) {
+		const port = await new Promise((resolve, reject) => {
+			const server = createServer();
+			server.unref();
+			server.on('error', reject);
+			server.listen(0, '127.0.0.1', () => {
+				const { port } = server.address();
+				server.close(() => resolve(port));
+			});
 		});
-	});
+		if (!handedOut.has(port)) {
+			handedOut.add(port);
+			return port;
+		}
+	}
 }
 
 /**

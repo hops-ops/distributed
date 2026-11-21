@@ -332,6 +332,9 @@ impl InMemoryRepository {
         let schedule_owner = crate::schedule::schedule_owner(&batch)?;
         crate::schedule::resolve_schedule_writes(&mut batch.schedules, self.clock.now())?;
         let prepared = validate_commit_batch(&batch)?;
+        if completion.is_none() {
+            crate::repository::require_captured_events_are_published(&batch)?;
+        }
         if let Some(direct_projection) = &direct_projection {
             direct_projection.validate()?;
             let completion = completion.as_ref().ok_or_else(|| {

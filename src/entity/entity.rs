@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::SystemTime;
@@ -61,6 +62,11 @@ pub struct Entity {
     pending_domain_events: Vec<DomainEventOccurrence>,
     #[serde(skip, default)]
     domain_event_poison: Option<DomainEventCapturePoison>,
+    /// Something the repository that loaded this entity keeps alive for as
+    /// long as the entity lives, such as the stream lock of a queued
+    /// repository. Dropped with the entity; never cloned or serialized.
+    #[serde(skip, default)]
+    hold: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl Default for Entity {
@@ -77,6 +83,7 @@ impl Default for Entity {
             metadata: HashMap::new(),
             pending_domain_events: Vec::new(),
             domain_event_poison: None,
+            hold: None,
         }
     }
 }
@@ -113,6 +120,8 @@ impl Clone for Entity {
             metadata: self.metadata.clone(),
             pending_domain_events: self.pending_domain_events.clone(),
             domain_event_poison: self.domain_event_poison.clone(),
+            // A copy does not own what the original holds.
+            hold: None,
         }
     }
 }
@@ -160,6 +169,16 @@ impl Entity {
 
     pub fn snapshot_version(&self) -> u64 {
         self.snapshot_version
+    }
+
+    /// Keep `hold` alive for as long as this entity lives.
+    pub(crate) fn hold_with(&mut self, hold: Box<dyn Any + Send + Sync>) {
+        self.hold = Some(hold);
+    }
+
+    /// Take what [`hold_with`](Self::hold_with) attached.
+    pub(crate) fn take_hold(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        self.hold.take()
     }
 
     pub fn set_snapshot_version(&mut self, snapshot_version: u64) {

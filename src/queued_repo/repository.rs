@@ -13,7 +13,7 @@ use crate::command_ledger::{
     ExternalCommandCompletion, ReservationOutcome,
 };
 use crate::entity::Entity;
-use crate::lock::{InMemoryLockManager, Lock, LockManager};
+use crate::lock::{InMemoryLockManager, LockGuard, LockManager};
 use crate::projection_protocol::{
     PartitionId, ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
     ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch,
@@ -30,7 +30,7 @@ use crate::projection_protocol::{
 use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities};
 use crate::repository::{
     CommitBatch, GetStream, InboxStore, ReadModelWritePlanStore, RelationalReadModelQueryStore,
-    RepositoryError, SnapshotStore, StreamIdentity, TransactionalCommit,
+    RepositoryError, SnapshotStore, StreamIdentity, StreamWrite, TransactionalCommit,
 };
 use crate::snapshot::SnapshotRecord;
 use crate::table::{TableAdapterCapabilities, TableCommitOutcome, TableStoreError, TableWritePlan};
@@ -55,17 +55,16 @@ impl ReadOpts {
     }
 }
 
-/// Repository wrapper that serializes access with process-local per-stream locks.
+/// Repository wrapper that serializes read-modify-write per stream.
 ///
-/// Locking reads (`get` and `get_many`) intentionally keep matching locks held
-/// after returning. Call `commit` to release those locks after a successful
-/// write, or call `abort`/`unlock` when the loaded entity is no longer being
-/// written. Dropping a loaded entity without `commit` or `abort` leaves its
-/// in-memory lock held until an explicit unlock.
+/// A locking read (`get`, `get_all`) waits for the stream's lock and returns
+/// an aggregate that owns it. The lock is released when that aggregate is
+/// committed, or when it is dropped: an early return cannot leak it, and a
+/// commit releases only the lock its own load took. A read that finds no
+/// stream holds nothing.
 ///
-/// Commit releases held locks only after the inner repository succeeds. On
-/// commit errors, locks remain held so callers can inspect state, retry, or
-/// explicitly abort.
+/// A failed commit keeps the lock, so the caller can retry; dropping the
+/// aggregate releases it.
 pub struct QueuedRepository<R, L = InMemoryLockManager> {
     inner: R,
     lock_manager: Arc<L>,
@@ -115,23 +114,52 @@ impl<R, L: LockManager> QueuedRepository<R, L> {
         }
     }
 
-    fn ensure_lock(&self, id: &str) -> Result<Arc<L::Lock>, RepositoryError> {
-        Ok(self.lock_manager.get_lock(id)?)
+    async fn hold(&self, key: &str) -> Result<LockGuard<L::Lock>, RepositoryError> {
+        Ok(LockGuard::acquire(self.lock_manager.get_lock(key)?).await?)
     }
 
-    async fn lock_ids_in_order(&self, ids: &[&str]) -> Result<Vec<Arc<L::Lock>>, RepositoryError> {
-        let mut unique: Vec<&str> = ids.to_vec();
-        unique.sort_unstable();
-        unique.dedup();
+    /// Load with the stream lock held, and hand the lock to the entity.
+    async fn locked<'a, F>(
+        &'a self,
+        identity: &'a StreamIdentity,
+        load: F,
+    ) -> Result<Option<Entity>, RepositoryError>
+    where
+        F: Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a,
+    {
+        let guard = self.hold(&identity.storage_key()).await?;
+        // A miss or an error drops the guard here, which releases the lock.
+        Ok(load.await?.map(|mut entity| {
+            entity.hold_with(Box::new(guard));
+            entity
+        }))
+    }
 
-        let mut locks = Vec::with_capacity(unique.len());
-        for id in unique {
-            let lock = self.ensure_lock(id)?;
-            lock.lock().await?;
-            locks.push(lock);
+    /// Load several streams, each returned entity owning its stream's lock.
+    /// Locks are taken in key order so two batches cannot deadlock.
+    async fn locked_many(
+        &self,
+        identities: &[StreamIdentity],
+        load: impl Future<Output = Result<Vec<Entity>, RepositoryError>> + Send,
+    ) -> Result<Vec<Entity>, RepositoryError> {
+        let mut keyed: Vec<(String, &StreamIdentity)> = identities
+            .iter()
+            .map(|identity| (identity.storage_key(), identity))
+            .collect();
+        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        keyed.dedup_by(|a, b| a.0 == b.0);
+
+        let mut guards = Vec::with_capacity(keyed.len());
+        for (key, identity) in keyed {
+            guards.push((identity.aggregate_id(), self.hold(&key).await?));
         }
-
-        Ok(locks)
+        let mut entities = load.await?;
+        for entity in &mut entities {
+            if let Some(at) = guards.iter().position(|(id, _)| *id == entity.id()) {
+                entity.hold_with(Box::new(guards.swap_remove(at).1));
+            }
+        }
+        Ok(entities)
     }
 }
 
@@ -144,27 +172,14 @@ where
         &'a self,
         identity: &'a StreamIdentity,
     ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a {
-        async move {
-            // Acquire and HOLD the per-stream lock across the load, like the
-            // synchronous `GetOne`. It is released by `commit_batch` on
-            // success, or by an explicit `unlock`/`abort`.
-            let lock = self.ensure_lock(&identity.storage_key())?;
-            lock.lock().await?;
-            self.inner.get_stream(identity).await
-        }
+        self.locked(identity, self.inner.get_stream(identity))
     }
 
     fn get_streams<'a>(
         &'a self,
         identities: &'a [StreamIdentity],
     ) -> impl Future<Output = Result<Vec<Entity>, RepositoryError>> + Send + 'a {
-        async move {
-            let keys: Vec<String> = identities.iter().map(StreamIdentity::storage_key).collect();
-            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            // Sorted-order acquire prevents deadlock; locks held after return.
-            let _locks = self.lock_ids_in_order(&key_refs).await?;
-            self.inner.get_streams(identities).await
-        }
+        self.locked_many(identities, self.inner.get_streams(identities))
     }
 
     fn get_stream_tail<'a>(
@@ -172,15 +187,10 @@ where
         identity: &'a StreamIdentity,
         after_version: u64,
     ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a {
-        async move {
-            // Acquire and HOLD the per-stream lock across the load, exactly like
-            // `get_stream` — the snapshot tail load is still a load and must
-            // serialize against concurrent writers. Released by `commit_batch`
-            // on success, or by `unlock`/`abort`.
-            let lock = self.ensure_lock(&identity.storage_key())?;
-            lock.lock().await?;
-            self.inner.get_stream_tail(identity, after_version).await
-        }
+        self.locked(
+            identity,
+            self.inner.get_stream_tail(identity, after_version),
+        )
     }
 }
 
@@ -270,28 +280,40 @@ where
         batch: CommitBatch<'a>,
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
         async move {
-            // Resolve the lock handles for the committed streams. Like the sync
-            // `commit_batch`, this does not acquire (a prior locking load owns
-            // them) and releases only after the inner commit succeeds, leaving
-            // them held on error so callers can retry or `abort`.
-            let mut locks = Vec::with_capacity(batch.streams.len());
-            for stream in &batch.streams {
-                locks.push(self.ensure_lock(&stream.identity.storage_key())?);
-            }
+            let CommitBatch {
+                mut streams,
+                outbox_messages,
+                read_model_plans,
+                snapshots,
+                inbox_receipts,
+                schedules,
+            } = batch;
+            // Lend the entities to the inner commit so the locks they own can
+            // be released afterwards.
+            let lent = CommitBatch {
+                streams: streams
+                    .iter_mut()
+                    .map(|stream| StreamWrite::new(stream.identity.clone(), &mut *stream.entity))
+                    .collect(),
+                outbox_messages,
+                read_model_plans,
+                snapshots,
+                inbox_receipts,
+                schedules,
+            };
+            self.inner.commit_batch(lent).await?;
 
-            let result = self.inner.commit_batch(batch).await;
-
-            if result.is_ok() {
-                // Best-effort release: the inner commit already succeeded, so a
-                // lock-cleanup failure must not fail the committed write (a durable
-                // lease is reclaimed by its TTL regardless). Mirrors the
-                // best-effort release in the lock layer itself.
-                for lock in locks {
-                    let _ = lock.unlock().await;
+            // Release only what these entities' own loads took. The write is
+            // committed, so a release failure must not fail it (a durable
+            // lease expires by its TTL).
+            for stream in streams {
+                if let Some(hold) = stream.entity.take_hold() {
+                    if let Ok(guard) = hold.downcast::<LockGuard<L::Lock>>() {
+                        let _ = guard.release().await;
+                    }
                 }
             }
-
-            result
+            Ok(())
         }
     }
 }
@@ -678,10 +700,10 @@ where
     ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a {
         async move {
             if opts.lock {
-                let lock = self.ensure_lock(&identity.storage_key())?;
-                lock.lock().await?;
+                self.get_stream(identity).await
+            } else {
+                self.inner.get_stream(identity).await
             }
-            self.inner.get_stream(identity).await
         }
     }
 }
@@ -698,52 +720,10 @@ where
     ) -> impl Future<Output = Result<Vec<Entity>, RepositoryError>> + Send + 'a {
         async move {
             if opts.lock {
-                let keys: Vec<String> =
-                    identities.iter().map(StreamIdentity::storage_key).collect();
-                let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-                let _locks = self.lock_ids_in_order(&key_refs).await?;
+                self.get_streams(identities).await
+            } else {
+                self.inner.get_streams(identities).await
             }
-            self.inner.get_streams(identities).await
-        }
-    }
-}
-
-/// Releasing a held lock for an aborted load over the async repository surface.
-///
-/// Release is `async` because a durable [`Lock`] (e.g. the SQLx lease-table
-/// locks) releases by talking to its backing store; the in-memory lock resolves
-/// immediately. It is a separate trait because coherence cannot prove a type is
-/// not both several lock-manager kinds at once.
-pub trait UnlockableRepository: Send + Sync {
-    /// Release the lock held for a stream.
-    ///
-    /// Keyed by [`StreamIdentity`] — the same key the locking `GetStream`
-    /// reads acquire — so an aborted load releases exactly the lock it took.
-    fn unlock<'a>(
-        &'a self,
-        identity: &'a StreamIdentity,
-    ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a;
-
-    /// Release a lock for an aborted load (alias for [`unlock`](Self::unlock)).
-    fn abort<'a>(
-        &'a self,
-        identity: &'a StreamIdentity,
-    ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
-        self.unlock(identity)
-    }
-}
-
-impl<R, L: LockManager> UnlockableRepository for QueuedRepository<R, L>
-where
-    R: Send + Sync,
-{
-    fn unlock<'a>(
-        &'a self,
-        identity: &'a StreamIdentity,
-    ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
-        async move {
-            self.ensure_lock(&identity.storage_key())?.unlock().await?;
-            Ok(())
         }
     }
 }
@@ -777,22 +757,20 @@ mod tests {
         TerminalCommandState,
     };
     use crate::in_memory_repo::InMemoryRepository;
-    use crate::repository::StreamWrite;
+    use crate::lock::Lock;
 
     #[tokio::test]
-    async fn causal_commit_does_not_release_lock_owned_by_legacy_load() {
+    async fn causal_commit_does_not_release_a_lock_it_does_not_own() {
         let repository = QueuedRepository::new(InMemoryRepository::new());
         let aggregate_id = format!("queued-causal-lock-{}", Uuid::now_v7());
         let identity = StreamIdentity::new("queued-causal-test", &aggregate_id).unwrap();
 
-        // The ordinary read API acquires and intentionally retains this lock
-        // until its legacy transaction commits or aborts.
-        assert!(repository.get_stream(&identity).await.unwrap().is_none());
+        // Another writer holds the stream lock while the causal commit runs.
         let held_lock = repository
             .lock_manager()
             .get_lock(&identity.storage_key())
             .unwrap();
-        assert!(!held_lock.try_lock().await.unwrap());
+        let held = LockGuard::acquire(Arc::clone(&held_lock)).await.unwrap();
 
         let command_id = Uuid::now_v7().to_string();
         let reservation = CommandReservation::new(
@@ -831,9 +809,9 @@ mod tests {
 
         assert!(
             !held_lock.try_lock().await.unwrap(),
-            "causal commit must not release a lock owned by a legacy load"
+            "a causal commit must not release a lock another writer holds"
         );
-        repository.abort(&identity).await.unwrap();
+        held.release().await.unwrap();
     }
 }
 

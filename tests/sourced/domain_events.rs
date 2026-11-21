@@ -265,7 +265,7 @@ async fn replay_leaves_pending_occurrences_and_poison_empty() {
     todo.create("todo-1".into(), "First".into()).unwrap();
     todo.complete().unwrap();
     todo.label("replayed".into()).unwrap();
-    repository.commit(&mut todo).await.unwrap();
+    repository.publish_events().commit(&mut todo).await.unwrap();
 
     let loaded = repository.get("todo-1").await.unwrap().unwrap();
 

@@ -5,7 +5,7 @@ use std::pin::Pin;
 use crate::command_ledger::CausalGetStream;
 use crate::entity::Entity;
 use crate::outbox::OutboxPublisherConfig;
-use crate::queued_repo::{GetAllWithOpts, GetWithOpts, ReadOpts, UnlockableRepository};
+use crate::queued_repo::{GetAllWithOpts, GetWithOpts, ReadOpts};
 use crate::repository::{
     CommitBatch, GetStream, RepositoryError, SnapshotWrite, StreamIdentity, StreamWrite,
     TransactionalCommit,
@@ -409,26 +409,5 @@ where
     /// Non-locking multi-read (alias for `get_all_with(ReadOpts::no_lock())`).
     pub async fn peek_all(&self, ids: &[&str]) -> Result<Vec<A>, RepositoryError> {
         self.get_all_with(ids, ReadOpts::no_lock()).await
-    }
-}
-
-impl<R, A> AggregateRepository<R, A>
-where
-    R: UnlockableRepository,
-    A: Aggregate,
-{
-    /// Release the lock held for an aggregate after an aborted load.
-    pub async fn abort(&self, aggregate: &A) -> Result<(), RepositoryError> {
-        let identity = stream_identity_for::<A>(aggregate.entity().id())?;
-        // Forward to the repo's `abort` hook (not `unlock`) so an
-        // `UnlockableRepository` that overrides `abort` for extra cleanup
-        // is honored. The default `abort` delegates to `unlock`.
-        self.repo.abort(&identity).await
-    }
-
-    /// Release the lock held for an aggregate id.
-    pub async fn unlock(&self, id: &str) -> Result<(), RepositoryError> {
-        let identity = stream_identity_for::<A>(id)?;
-        self.repo.unlock(&identity).await
     }
 }
