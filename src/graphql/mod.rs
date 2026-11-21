@@ -75,8 +75,8 @@ pub use engine::{
 };
 #[cfg(feature = "graphql")]
 pub use http::{
-    graphiql_page, graphql_router, graphql_router_composed,
-    graphql_router_with_host, graphql_router_with_service, GraphqlOperationFilter,
+    graphiql_page, graphql_router, graphql_router_composed, graphql_router_with_host,
+    graphql_router_with_service, GraphqlOperationFilter,
 };
 #[cfg(feature = "graphql")]
 pub use identity::{
