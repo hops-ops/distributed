@@ -1883,7 +1883,7 @@ where
                             "committed cell workspace cleanup failed: {error}"
                         ))
                     })?;
-                    let (_committed, serialized) = prepared.finalize_after_commit();
+                    let serialized = prepared.finalize_after_commit();
                     let result = crate::microsvc::cell_host::causal::load_committed_result(
                         repository, &fence, false,
                     )
@@ -2275,7 +2275,7 @@ where
                     if let Some(config) = publisher {
                         config.publish_after_commit(outbox_ids).await;
                     }
-                    let (_committed, serialized) = prepared.finalize_after_commit();
+                    let serialized = prepared.finalize_after_commit();
                     let result = load_committed_dispatch_result(
                         repository,
                         &fence,

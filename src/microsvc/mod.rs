@@ -109,11 +109,10 @@ pub(crate) use service::ExternalCausalReservation;
 #[cfg(feature = "graphql")]
 pub use service::GraphqlServiceBindError;
 pub use service::{
-    direct_read_model, invoke_transition, load_for_command, require_loaded, CausalCommandContext,
-    CausalCommitBuilder, CausalRepository, CommandLoad, CommandRequest, CommandResponse,
-    DeliveryKind, DirectReadModelProjection, HandlerNames, HandlerSpec, PortableCommand,
-    PreparedCausalCommit, PreparedCommandHandler, RouteBuilder, Routes, Service,
-    ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded, TypedRouteBuilder,
+    invoke_transition, load_for_command, require_loaded, CausalCommandContext, CausalCommitBuilder,
+    CausalRepository, CommandLoad, CommandRequest, CommandResponse, DeliveryKind, HandlerNames,
+    HandlerSpec, PortableCommand, PreparedCausalCommit, PreparedCommandHandler, RouteBuilder,
+    Routes, Service, ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded, TypedRouteBuilder,
     DEFAULT_DELIVERY_LANE,
 };
 #[cfg(feature = "graphql")]

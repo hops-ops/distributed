@@ -168,16 +168,14 @@ impl CommandOutputType for Payload {
 }
 
 #[test]
-fn preparation_serializes_and_retains_the_typed_payload_until_commit() {
+fn preparation_serializes_the_payload_once_for_the_commit() {
     let prepared = PreparedCommand::<Eventual<Payload>>::prepare(Payload {
         id: "todo-1".into(),
     })
     .unwrap();
     assert_eq!(prepared.consistency(), CommandConsistency::Eventual);
     assert_eq!(prepared.serialized_payload()["id"], "todo-1");
-    let (committed, serialized) = prepared.finalize_after_commit();
-    assert_eq!(committed.payload().id, "todo-1");
-    assert_eq!(serialized["id"], "todo-1");
+    assert_eq!(prepared.finalize_after_commit()["id"], "todo-1");
 }
 
 #[test]

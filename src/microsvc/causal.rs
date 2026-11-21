@@ -26,10 +26,7 @@ use crate::command_ledger::CausalGetStream;
 use crate::domain_event::{DomainEventCaptureError, DomainEventCommitGuardError};
 use crate::microsvc::cell_host::ScheduleWrite;
 use crate::outbox::{OutboxMessage, PreparedDomainEvent};
-use crate::projection::lower::{
-    DirectCandidate, LoweredProjectionPlan, ProjectionDescriptor,
-    ProjectionServerExecutorDescriptor,
-};
+use crate::projection::lower::{LoweredProjectionPlan, ProjectionServerExecutorDescriptor};
 use crate::projection_protocol::SameTransactionProjectionBatch;
 use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
 use crate::repository::{CommitBatch, RepositoryError, SnapshotWrite, StreamIdentity, StreamWrite};
@@ -499,22 +496,6 @@ where
         Ok(prepared)
     }
 
-    /// Prepare a projected result whose exact row will be resolved from the
-    /// authoritative domain-event occurrence after the dispatcher stamps its
-    /// ledger causation.
-    pub(crate) fn prepare_modeled_atomic<M>(
-        &self,
-        projection: ProjectionDescriptor<DirectCandidate>,
-    ) -> Result<PreparedCommand<Atomic<M>>, CausalWorkspaceError>
-    where
-        M: RelationalReadModel + Serialize + Send + Sync + 'static,
-    {
-        let executor = projection
-            .server_executor()
-            .map_err(|error| CausalWorkspaceError::ModeledDirectProjection(error.to_string()))?;
-        self.prepare_modeled_atomic_from_executor(executor)
-    }
-
     /// Placement-selected direct projection: the service registration chose the
     /// executor; command code names neither a projection nor a selector.
     pub(crate) fn prepare_placement_selected_atomic<M>(
@@ -966,7 +947,9 @@ mod tests {
     }
 
     crate::projection! {
-        const MODELED_DIRECT: ProjectionDescriptor<DirectCandidate> = {
+        const MODELED_DIRECT: crate::projection::lower::ProjectionDescriptor<
+            crate::projection::lower::DirectCandidate,
+        > = {
             name: "modeled-direct-workspace",
             version: 1,
             epoch: "modeled-direct-workspace-v1",
@@ -1428,7 +1411,9 @@ mod tests {
         aggregate.create("once-1".into(), "first".into()).unwrap();
         workspace.stage(aggregate).unwrap();
         let _prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
         parts.prepare_domain_publications("once").unwrap();
@@ -1459,7 +1444,9 @@ mod tests {
             .unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
 
         let mut parts = workspace.into_parts().unwrap();
@@ -1507,7 +1494,9 @@ mod tests {
             .unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut separate = ReadModelWritePlanBuilder::new();
         separate
@@ -1539,7 +1528,9 @@ mod tests {
             .unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
 
         let mut parts = workspace.into_parts().unwrap();
@@ -1567,7 +1558,9 @@ mod tests {
             .unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
         parts
@@ -1590,7 +1583,9 @@ mod tests {
             .unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
         parts
@@ -1614,7 +1609,9 @@ mod tests {
         aggregate.rename("renamed".into()).unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
         parts
@@ -1645,7 +1642,9 @@ mod tests {
             )
             .unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
         parts

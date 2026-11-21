@@ -105,8 +105,7 @@ impl CommandProjectedModel {
 /// Compiler-owned direct target for one `Atomic<M>` command.
 ///
 /// This metadata is deliberately hidden from ordinary handler code. Generated
-/// declarations bind it once; application handlers select the narrow
-/// `direct_read_model::<M>()` proof on their fluent causal commit.
+/// declarations bind it once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommandDirectProjectionTarget {
     pub(crate) projector: String,

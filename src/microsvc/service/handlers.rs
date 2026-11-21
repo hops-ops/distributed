@@ -18,7 +18,6 @@ use crate::microsvc::context::Context;
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::session::Session;
 use crate::outbox::{OutboxMessage, PreparedDomainEvent};
-use crate::projection::lower::{DirectCandidate, ProjectionDescriptor};
 use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
 
 pub(super) type GuardFn<D> = dyn Fn(&Context<D>) -> bool + Send + Sync;
@@ -156,48 +155,6 @@ pub struct WithPublication;
 /// Type-state marker for a unit of work with no direct projection intent.
 #[doc(hidden)]
 pub struct NoDirectProjection;
-
-/// Narrow same-transaction projection token for one exact returned read model.
-///
-/// This preserves the current one-complete-row-upsert proof while allowing the
-/// fluent `project(PROJECTION)` position to be replaced by a modeled projection
-/// adapter later.
-///
-/// Arbitrary application tokens cannot manufacture projection evidence:
-///
-/// ```compile_fail
-/// use distributed::microsvc::PreparedCausalCommit;
-/// use distributed::Aggregate;
-///
-/// struct ForgedProjection;
-///
-/// fn cannot_project<A>(
-///     commit: PreparedCausalCommit<'_, '_, A, (), ForgedProjection>,
-/// ) where
-///     A: Aggregate + Send + Sync + 'static,
-/// {
-///     let _ = commit.atomic(());
-/// }
-/// ```
-pub struct DirectReadModelProjection<M>(PhantomData<fn() -> M>);
-
-impl<M> DirectReadModelProjection<M> {
-    /// Select the existing exact returned-row direct projection proof.
-    pub const fn new() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<M> Default for DirectReadModelProjection<M> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Construct the current narrow direct-projection token for `M`.
-pub const fn direct_read_model<M>() -> DirectReadModelProjection<M> {
-    DirectReadModelProjection::new()
-}
 
 /// Handler-owned exact row staged for a same-transaction `Atomic<M>` result.
 ///
@@ -455,27 +412,6 @@ where
     }
 }
 
-impl<A, Publication, M> PreparedCausalCommit<'_, '_, A, Publication, DirectReadModelProjection<M>>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
-    /// Prepare the exact existing one-row direct projection result.
-    ///
-    /// This method is available only when the preceding `project(...)` token is
-    /// eligible for `M`. Dispatcher proof validation still rejects missing
-    /// ownership, conflicts, partial rows, or a mismatched returned value.
-    pub fn atomic(self, payload: M) -> Result<PreparedCommand<Atomic<M>>, HandlerError>
-    where
-        M: RelationalReadModel + Serialize + Send + Sync + 'static,
-    {
-        let _ = self.projection;
-        self.context
-            .workspace
-            .prepare_atomic(payload)
-            .map_err(workspace_handler_error)
-    }
-}
-
 impl<A, Publication, M> PreparedCausalCommit<'_, '_, A, Publication, StagedProjectedRow<M>>
 where
     A: Aggregate + Send + Sync + 'static,
@@ -493,42 +429,13 @@ where
     }
 }
 
-impl<A, Publication>
-    PreparedCausalCommit<'_, '_, A, Publication, ProjectionDescriptor<DirectCandidate>>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
-    /// Return the row produced by a modeled direct projection.
-    ///
-    /// The dispatcher resolves the descriptor from the authoritative,
-    /// ledger-stamped domain-event occurrence, admits only one complete-row
-    /// direct proof, and materializes `M` from that exact committed upsert.
-    ///
-    /// Return the row produced by a modeled direct projection descriptor token.
-    ///
-    /// Prefer handler-owned [`CausalRepository::readmodel`] +
-    /// [`PreparedCausalCommit::projected`] on [`StagedProjectedRow`] for new
-    /// projected commands.
-    pub fn atomic<M>(self) -> Result<PreparedCommand<Atomic<M>>, HandlerError>
-    where
-        M: RelationalReadModel + Serialize + Send + Sync + 'static,
-    {
-        self.context
-            .workspace
-            .prepare_modeled_atomic(self.projection)
-            .map_err(workspace_handler_error)
-    }
-}
-
 impl<A, Publication> PreparedCausalCommit<'_, '_, A, Publication, NoDirectProjection>
 where
     A: Aggregate + Send + Sync + 'static,
 {
-    /// Placement-selected projected terminal (legacy / registry path).
-    ///
-    /// Prefer [`CausalRepository::readmodel`] with a mutation-derived row for
-    /// new code. This path remains for compatibility when a service registers
-    /// a placement-selected direct executor for the returned model.
+    /// Return the row a placement-selected direct projection writes: the
+    /// service registration chose the executor for `M`, the handler stages
+    /// nothing.
     pub fn atomic<M>(self) -> Result<PreparedCommand<Atomic<M>>, HandlerError>
     where
         M: RelationalReadModel + Serialize + Send + Sync + 'static,

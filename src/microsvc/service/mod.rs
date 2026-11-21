@@ -50,8 +50,8 @@ pub use causal::{CausalCommandPublicStatus, CausalDispatchError, CausalDispatchR
 #[allow(unused_imports)] // public API surface for handler-owned projected commits
 pub use handlers::StagedProjectedRow;
 pub use handlers::{
-    direct_read_model, CausalCommandContext, CausalCommitBuilder, CausalRepository,
-    DirectReadModelProjection, PreparedCausalCommit, PreparedCommandHandler,
+    CausalCommandContext, CausalCommitBuilder, CausalRepository, PreparedCausalCommit,
+    PreparedCommandHandler,
 };
 pub use invoke::{invoke_transition, load_for_command, require_loaded, CommandLoad};
 pub use request::{CommandRequest, CommandResponse};
