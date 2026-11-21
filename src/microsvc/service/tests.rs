@@ -8,7 +8,7 @@ use crate::aggregate::Aggregate;
 #[cfg(feature = "graphql")]
 use crate::bus::RunOptions;
 use crate::bus::{Message, MessageKind, SubscriptionPlan};
-#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[cfg(feature = "graphql")]
 use crate::command::Eventual;
 use crate::command::{typed_command, PreparedCommand, Succeeded};
 #[cfg(feature = "graphql")]
