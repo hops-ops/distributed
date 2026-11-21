@@ -122,40 +122,8 @@ pub(super) struct ObservationKey {
     pub(super) kind: ProjectionObservationKind,
 }
 
-#[derive(Clone)]
-pub(super) struct StoredInput {
-    pub(super) cursor: ProjectionInputCursor,
-    pub(super) fingerprint: ProjectionInputFingerprint,
-    pub(super) message_id: String,
-    pub(super) causation_id: String,
-    pub(super) checkpoint: ProjectionCheckpoint,
-    pub(super) gap_free: bool,
-}
-
-#[derive(Clone)]
-pub(super) struct MessageIdentity {
-    pub(super) cursor: ProjectionInputCursor,
-    pub(super) fingerprint: ProjectionInputFingerprint,
-    pub(super) causation_id: String,
-    pub(super) gap_free: bool,
-}
-
-#[derive(Clone)]
-pub(super) struct InputIdentity {
-    pub(super) fingerprint: ProjectionInputFingerprint,
-    pub(super) message_id: String,
-    pub(super) causation_id: String,
-    pub(super) gap_free: bool,
-}
-
-#[derive(Clone)]
-pub(super) struct AppliedInputReceipt {
-    pub(super) fingerprint: ProjectionInputFingerprint,
-    pub(super) message_id: String,
-    pub(super) causation_id: String,
-    pub(super) gap_free: bool,
-    pub(super) checkpoint: ProjectionCheckpoint,
-}
+/// An input a generation applied, with the change that applying it produced.
+pub(super) type AppliedInput = (TrustedProjectionInput, ProjectionChangeCursor);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct GenerationLineage {
@@ -176,37 +144,6 @@ impl GenerationLineage {
             retry_of_generation: Some(generation),
             retry_of_failure_id: Some(failure_id),
         }
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct FailedInputFence {
-    pub(super) cursor: ProjectionInputCursor,
-    pub(super) fingerprint: ProjectionInputFingerprint,
-    pub(super) message_id: String,
-    pub(super) causation_id: String,
-    pub(super) generation: ProjectionGeneration,
-    pub(super) gap_free: bool,
-}
-
-impl FailedInputFence {
-    pub(super) fn from_input(input: &TrustedProjectionInput) -> Self {
-        Self {
-            cursor: input.cursor.clone(),
-            fingerprint: input.fingerprint,
-            message_id: input.message_id.clone(),
-            causation_id: input.causation_id.clone(),
-            generation: input.generation,
-            gap_free: input.gap_free,
-        }
-    }
-
-    pub(super) fn matches_retry(&self, input: &TrustedProjectionInput) -> bool {
-        self.cursor == input.cursor
-            && self.fingerprint == input.fingerprint
-            && self.message_id == input.message_id
-            && self.causation_id == input.causation_id
-            && self.gap_free == input.gap_free
     }
 }
 
@@ -255,10 +192,13 @@ impl PartitionState {
 pub(in crate::in_memory_repo) struct InMemoryProjectionProtocolState {
     pub(super) partitions: HashMap<PartitionKey, PartitionState>,
     pub(super) generations: HashMap<GenerationKey, GenerationLineage>,
-    pub(super) inputs: HashMap<InputKey, StoredInput>,
-    pub(super) input_identities: HashMap<CursorIdentityKey, InputIdentity>,
-    pub(super) messages: HashMap<MessageKey, MessageIdentity>,
-    pub(super) applied_receipts: HashMap<CursorReceiptKey, AppliedInputReceipt>,
+    /// Newest applied input per source and generation.
+    pub(super) inputs: HashMap<InputKey, AppliedInput>,
+    /// The input first recorded at each cursor, in any generation.
+    pub(super) input_identities: HashMap<CursorIdentityKey, TrustedProjectionInput>,
+    /// The input first recorded under each message ID, in any generation.
+    pub(super) messages: HashMap<MessageKey, TrustedProjectionInput>,
+    pub(super) applied_receipts: HashMap<CursorReceiptKey, AppliedInput>,
     pub(super) registered_topologies: HashSet<ProjectorTopologyId>,
     pub(super) registered_models: HashMap<RegisteredModelKey, String>,
     pub(super) authoritative_table_owners: HashMap<String, RegisteredModelKey>,
@@ -267,7 +207,6 @@ pub(in crate::in_memory_repo) struct InMemoryProjectionProtocolState {
     pub(super) records: HashMap<ProjectionRecordScope, ProjectionRecordMetadata>,
     pub(super) observations: HashMap<ObservationKey, ProjectionObservation>,
     pub(super) failures: HashMap<String, ProjectionFailure>,
-    pub(super) failure_inputs: HashMap<String, FailedInputFence>,
 }
 
 pub(in crate::in_memory_repo) fn reject_causal_owned_plans(
@@ -285,11 +224,4 @@ pub(in crate::in_memory_repo) fn reject_causal_owned_plans(
         });
     }
     Ok(())
-}
-
-pub(super) enum InputDisposition {
-    New,
-    Redelivery,
-    Duplicate(ProjectionCheckpoint),
-    Stale(ProjectionCheckpoint),
 }

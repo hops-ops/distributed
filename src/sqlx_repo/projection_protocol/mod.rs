@@ -19,12 +19,15 @@ use std::sync::Arc;
 use sqlx::{Encode, Executor, IntoArguments, Pool, QueryBuilder, Row, Transaction, Type};
 
 use crate::projection_protocol::{
-    change_kind_for_mutation, checked_next, checked_projection_graph_materialization,
-    projection_relationship_values, table_model_name, validate_projection_graph_snapshot_request,
-    PartitionId, ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
-    ProjectionChange, ProjectionChangeCursor, ProjectionChangeKind, ProjectionChangeRead,
-    ProjectionChangeRetention, ProjectionCheckpoint, ProjectionCommitBatch,
-    ProjectionCommitOutcome, ProjectionCommitResult, ProjectionEpoch,
+    change_kind_for_mutation, change_page, change_read_window, checked_next,
+    checked_projection_graph_materialization, classify_input, corrupt_storage, ensure_active_input,
+    ensure_change_epoch, failure_matches_batch, next_record, plan_repair, program_id_for_model,
+    projection_relationship_values, resolve_observation, same_input, sort_causation_evidence,
+    table_model_name, validate_input_identity, validate_pending_retry, validate_physical_row,
+    validate_projection_graph_snapshot_request, PartitionId, ProjectionCausationEvidenceBatch,
+    ProjectionCausationEvidenceRequest, ProjectionChange, ProjectionChangeCursor,
+    ProjectionChangeKind, ProjectionChangeRead, ProjectionChangeRetention, ProjectionCheckpoint,
+    ProjectionCommitBatch, ProjectionCommitOutcome, ProjectionCommitResult, ProjectionEpoch,
     ProjectionExecutionSnapshotBatch, ProjectionExecutionSnapshotBatchRequest, ProjectionFailure,
     ProjectionFailureBatch, ProjectionFailureLocation, ProjectionGeneration,
     ProjectionGraphIncludeSnapshot, ProjectionGraphSnapshot, ProjectionGraphSnapshotRequest,

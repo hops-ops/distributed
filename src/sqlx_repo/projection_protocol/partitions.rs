@@ -118,9 +118,7 @@ where
         .await
         .map_err(|error| protocol_storage_error::<DB>("lock projection partition", error))?;
     let state = decode_partition_row::<DB>(&row, topology, partition)?;
-    if state.change_epoch != *change_epoch {
-        return Err(ProjectionProtocolError::IncomparableInput);
-    }
+    ensure_change_epoch(&state.change_epoch, change_epoch)?;
 
     let mut generation = QueryBuilder::<DB>::new(
         "INSERT INTO projection_generations \

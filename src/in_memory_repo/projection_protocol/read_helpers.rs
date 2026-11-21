@@ -280,17 +280,22 @@ pub(super) fn read_projection_query_snapshot_from_state(
                         "projection checkpoint exists without partition state".into(),
                     ));
                 };
-                if stored.cursor.epoch() != &probe.epoch {
+                let (input, change) = stored;
+                if input.cursor.epoch() != &probe.epoch {
                     return Err(ProjectionProtocolError::IncomparableInput);
                 }
-                if stored.checkpoint.change().epoch() != &partition.change_epoch
-                    || stored.checkpoint.change().position() > partition.change_head
+                if change.epoch() != &partition.change_epoch
+                    || change.position() > partition.change_head
                 {
                     return Err(ProjectionProtocolError::InvalidBatch(
                         "projection query checkpoint lies outside its partition head".into(),
                     ));
                 }
-                Some(stored.checkpoint.clone())
+                Some(ProjectionCheckpoint::new(
+                    input.cursor.clone(),
+                    change.clone(),
+                    input.gap_free,
+                )?)
             }
             None => None,
         };

@@ -499,4 +499,91 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
     }
+
+    /// A stream append reads the stream version before it inserts, and an
+    /// outbox claim scans before it updates, so both must hold the write
+    /// lock from the start. While another connection holds it they wait; a
+    /// deferred transaction would be refused as busy the moment it wrote.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_stream_append_and_outbox_claim_wait_for_a_concurrent_writer() {
+        use crate::outbox_worker::OutboxStore;
+        use crate::{
+            CommitBatch, Entity, SqliteRepository, StreamIdentity, StreamWrite, TransactionalCommit,
+        };
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+        let directory =
+            std::env::temp_dir().join(format!("sqlite-write-wait-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(3)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(directory.join("app.sqlite"))
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        let repo = SqliteRepository::new(pool.clone());
+        repo.migrate().await.unwrap();
+
+        let append = {
+            let repo = repo.clone();
+            async move {
+                let mut entity = Entity::with_id("one");
+                entity.digest_empty("created").unwrap();
+                let mut batch = CommitBatch::new(vec![StreamWrite::new(
+                    StreamIdentity::new("Item", "one").unwrap(),
+                    &mut entity,
+                )]);
+                batch.outbox_messages.push(
+                    OutboxMessage::create("event-1", "Created", b"payload".to_vec()).unwrap(),
+                );
+                repo.commit_batch(batch)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        };
+        while_another_connection_writes(&pool, append).await;
+        let claim = {
+            let outbox = repo.outbox_store();
+            async move {
+                let claimed = outbox
+                    .claim(ClaimOutboxMessages::new(
+                        "worker",
+                        1,
+                        std::time::Duration::from_secs(60),
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(claimed.len(), 1);
+                Ok(())
+            }
+        };
+        while_another_connection_writes(&pool, claim).await;
+    }
+
+    /// Run `operation` while another connection holds the write lock: it must
+    /// still be waiting after a pause, and succeed once the lock is released.
+    #[cfg(feature = "sqlite")]
+    async fn while_another_connection_writes(
+        pool: &sqlx::SqlitePool,
+        operation: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let mut operation = tokio::spawn(operation);
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut operation).await;
+        assert!(waited.is_err(), "did not wait for the writer: {waited:?}");
+        writer.commit().await.unwrap();
+        operation.await.unwrap().unwrap();
+    }
 }

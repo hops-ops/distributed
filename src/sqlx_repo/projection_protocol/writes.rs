@@ -1,15 +1,5 @@
 use super::*;
 
-pub(super) fn program_id_for_model(
-    ownership: &[ProjectionModelOwnership],
-    model: &str,
-) -> Option<ProjectionProgramId> {
-    ownership
-        .iter()
-        .find(|declaration| declaration.model == model)
-        .and_then(|declaration| declaration.program_id)
-}
-
 pub(super) async fn ensure_partition_ownership_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
@@ -293,94 +283,6 @@ where
             )?,
         },
     }))
-}
-
-pub(super) fn next_record(
-    scope: &ProjectionRecordScope,
-    expectation: &ProjectionRecordExpectation,
-    kind: RecordTransition,
-    current: Option<&StoredRecord>,
-    source_snapshot: bool,
-) -> Result<(RecordRevision, bool), ProjectionProtocolError> {
-    let current = current.map(|record| &record.metadata);
-    match (expectation, current, kind) {
-        (ProjectionRecordExpectation::Missing, None, RecordTransition::Upsert) => {
-            Ok((RecordRevision::new(scope.clone(), 1, 1)?, false))
-        }
-        (ProjectionRecordExpectation::Missing, None, RecordTransition::Delete) => {
-            Ok((RecordRevision::new(scope.clone(), 1, 1)?, true))
-        }
-        (ProjectionRecordExpectation::Missing, Some(metadata), _) if metadata.tombstone => {
-            Err(ProjectionProtocolError::RecordTombstoned {
-                model: scope.model().to_string(),
-            })
-        }
-        (ProjectionRecordExpectation::Missing, Some(_), _) => {
-            Err(ProjectionProtocolError::RecordAlreadyExists {
-                model: scope.model().to_string(),
-            })
-        }
-        (ProjectionRecordExpectation::Exact(_), None, _) => {
-            Err(ProjectionProtocolError::RecordMissing {
-                model: scope.model().to_string(),
-            })
-        }
-        (ProjectionRecordExpectation::Exact(expected), Some(metadata), _) => {
-            if expected != &metadata.revision {
-                return Err(ProjectionProtocolError::RecordRevisionConflict {
-                    model: scope.model().to_string(),
-                    expected_incarnation: expected.incarnation(),
-                    expected_revision: expected.revision(),
-                    actual_incarnation: metadata.revision.incarnation(),
-                    actual_revision: metadata.revision.revision(),
-                });
-            }
-            match kind {
-                RecordTransition::Upsert if metadata.tombstone => {
-                    Err(ProjectionProtocolError::RecordTombstoned {
-                        model: scope.model().to_string(),
-                    })
-                }
-                RecordTransition::Upsert => Ok((
-                    RecordRevision::new(
-                        scope.clone(),
-                        metadata.revision.incarnation(),
-                        checked_next(metadata.revision.revision(), "record revision")?,
-                    )?,
-                    false,
-                )),
-                RecordTransition::Delete if metadata.tombstone && !source_snapshot => {
-                    Err(ProjectionProtocolError::RecordTombstoned {
-                        model: scope.model().to_string(),
-                    })
-                }
-                RecordTransition::Delete => Ok((
-                    RecordRevision::new(
-                        scope.clone(),
-                        metadata.revision.incarnation(),
-                        checked_next(metadata.revision.revision(), "record revision")?,
-                    )?,
-                    true,
-                )),
-                RecordTransition::Recreate if !metadata.tombstone => {
-                    Err(ProjectionProtocolError::RecreateRequiresTombstone {
-                        model: scope.model().to_string(),
-                    })
-                }
-                RecordTransition::Recreate => Ok((
-                    RecordRevision::new(
-                        scope.clone(),
-                        checked_next(metadata.revision.incarnation(), "record incarnation")?,
-                        1,
-                    )?,
-                    false,
-                )),
-            }
-        }
-        (_, _, RecordTransition::Recreate) => Err(ProjectionProtocolError::InvalidBatch(
-            "delete/recreate requires an exact record expectation".into(),
-        )),
-    }
 }
 
 #[expect(
@@ -969,7 +871,7 @@ where
     }
 
     if let Some(existing) = input_identity_by_cursor_in_tx(tx, input).await? {
-        if input_identity_matches(&existing, input) {
+        if same_input(&existing, input) {
             return Ok(());
         }
         return Err(ProjectionProtocolError::InputCorruption);
@@ -1000,7 +902,7 @@ where
         let stored = input_identity_by_cursor_in_tx(tx, input)
             .await?
             .ok_or_else(|| corrupt_storage("projection alias insert has no readable identity"))?;
-        return if input_identity_matches(&stored, input) {
+        return if same_input(&stored, input) {
             Ok(())
         } else {
             Err(ProjectionProtocolError::InputCorruption)
@@ -1444,65 +1346,6 @@ where
         .map_err(|error| protocol_storage_error::<DB>("load projection failure", error))?;
     row.map(|row| decode_failure_row::<DB>(&row, topology, partition, expected_change_epoch))
         .transpose()
-}
-
-pub(super) fn failure_matches_batch(
-    failure: &StoredFailure,
-    batch: &ProjectionFailureBatch,
-) -> bool {
-    crate::projection_protocol::failure_matches_batch(&failure.failure, batch)
-}
-
-pub(super) async fn ensure_pending_retry_input_in_tx<DB>(
-    tx: &mut Transaction<'_, DB>,
-    state: &PartitionState,
-    input: &TrustedProjectionInput,
-) -> Result<(), ProjectionProtocolError>
-where
-    DB: SqlxRepoBackend,
-    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
-    DB::Arguments: IntoArguments<DB>,
-    for<'q> i64: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
-    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
-    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
-{
-    let Some(failure_id) = &state.pending_retry_failure_id else {
-        return Ok(());
-    };
-    let failure = failure_in_tx(
-        tx,
-        input.cursor.topology(),
-        input.cursor.projection_partition(),
-        failure_id,
-        &state.change_epoch,
-    )
-    .await?
-    .ok_or_else(|| {
-        corrupt_storage(format!(
-            "pending projection retry failure `{failure_id}` is missing"
-        ))
-    })?;
-    if failure.failure.generation.checked_next()? != state.active_generation {
-        return Err(corrupt_storage(format!(
-            "pending retry failure generation {} does not precede active generation {}",
-            failure.failure.generation.get(),
-            state.active_generation.get()
-        )));
-    }
-    if failure.failure.input != input.cursor {
-        return Err(ProjectionProtocolError::IncomparableInput);
-    }
-    if failure.failure.input_fingerprint != input.fingerprint
-        || failure.failure.message_id != input.message_id
-        || failure.failure.causation_id != input.causation_id
-        || failure.failure.gap_free != input.gap_free
-    {
-        return Err(ProjectionProtocolError::InputCorruption);
-    }
-    Ok(())
 }
 
 pub(super) async fn insert_failure_in_tx<DB>(

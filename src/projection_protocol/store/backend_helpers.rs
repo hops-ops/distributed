@@ -39,7 +39,8 @@ pub(crate) fn failure_matches_batch(
     failure: &ProjectionFailure,
     batch: &ProjectionFailureBatch,
 ) -> bool {
-    failure.input == batch.input.cursor
+    failure.failure_id == batch.failure_id
+        && failure.input == batch.input.cursor
         && failure.input_fingerprint == batch.input.fingerprint
         && failure.message_id == batch.input.message_id
         && failure.causation_id == batch.input.causation_id

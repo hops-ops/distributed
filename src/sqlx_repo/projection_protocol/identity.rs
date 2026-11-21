@@ -1,23 +1,5 @@
 use super::*;
 
-pub(super) fn ensure_active_input(
-    state: &PartitionState,
-    input: &TrustedProjectionInput,
-) -> Result<(), ProjectionProtocolError> {
-    if state.active_generation != input.generation {
-        return Err(ProjectionProtocolError::GenerationFenced {
-            expected: state.active_generation.get(),
-            actual: input.generation.get(),
-        });
-    }
-    if let Some(failure_id) = &state.stopped_failure_id {
-        return Err(ProjectionProtocolError::PartitionStopped {
-            failure_id: failure_id.clone(),
-        });
-    }
-    Ok(())
-}
-
 pub(super) fn verify_stored_change(
     state: &PartitionState,
     change: &ProjectionChangeCursor,
@@ -164,26 +146,82 @@ where
     })
 }
 
-pub(super) fn receipt_matches_input(
-    receipt: &StoredReceipt,
+/// The input a stored row recorded for `input`'s source, as a protocol value.
+fn recorded_input(
     input: &TrustedProjectionInput,
-) -> bool {
-    let source = input.cursor.source();
-    receipt.source_bytes == source.canonical_name_bytes()
-        && receipt.source_hash == digest_bytes(source.digest())
-        && receipt.source_partition_bytes == source.canonical_partition_bytes()
-        && receipt.source_partition_hash == digest_bytes(source.partition_digest())
-        && receipt.source_epoch == *input.cursor.epoch()
-        && receipt.source_position == input.cursor.position()
-        && receipt.input_fingerprint == input.fingerprint
-        && receipt.message_id == input.message_id
-        && receipt.causation_id == input.causation_id
-        && receipt.gap_free == input.gap_free
+    source_epoch: &ProjectionEpoch,
+    source_position: u64,
+    fingerprint: ProjectionInputFingerprint,
+    message_id: &str,
+    causation_id: &str,
+    gap_free: bool,
+) -> Result<TrustedProjectionInput, ProjectionProtocolError> {
+    Ok(TrustedProjectionInput {
+        cursor: ProjectionInputCursor::new(
+            input.cursor.topology().clone(),
+            input.cursor.projection_partition().clone(),
+            input.cursor.source().clone(),
+            source_epoch.clone(),
+            source_position,
+        )?,
+        fingerprint,
+        message_id: message_id.to_string(),
+        causation_id: causation_id.to_string(),
+        generation: input.generation,
+        gap_free,
+    })
 }
 
+impl StoredReceipt {
+    /// Whether the hash lookup that found this receipt resolved `input`'s
+    /// exact canonical source bytes.
+    fn source_matches(&self, input: &TrustedProjectionInput) -> bool {
+        let source = input.cursor.source();
+        self.source_bytes == source.canonical_name_bytes()
+            && self.source_hash == digest_bytes(source.digest())
+            && self.source_partition_bytes == source.canonical_partition_bytes()
+            && self.source_partition_hash == digest_bytes(source.partition_digest())
+    }
+
+    fn recorded_input(
+        &self,
+        input: &TrustedProjectionInput,
+    ) -> Result<TrustedProjectionInput, ProjectionProtocolError> {
+        recorded_input(
+            input,
+            &self.source_epoch,
+            self.source_position,
+            self.input_fingerprint,
+            &self.message_id,
+            &self.causation_id,
+            self.gap_free,
+        )
+    }
+}
+
+impl StoredCursor {
+    fn recorded_input(
+        &self,
+        input: &TrustedProjectionInput,
+    ) -> Result<TrustedProjectionInput, ProjectionProtocolError> {
+        recorded_input(
+            input,
+            &self.source_epoch,
+            self.source_position,
+            self.input_fingerprint,
+            &self.message_id,
+            &self.causation_id,
+            self.gap_free,
+        )
+    }
+}
+
+/// Decode the input an identity row first recorded. The row was found under
+/// `input`'s topology; an identity has no generation, so it takes `input`'s.
 pub(super) fn decode_stored_input_identity<DB>(
     row: &DB::Row,
-) -> Result<StoredInputIdentity, ProjectionProtocolError>
+    input: &TrustedProjectionInput,
+) -> Result<TrustedProjectionInput, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
     for<'q> i64: Type<DB> + sqlx::Decode<'q, DB>,
@@ -197,10 +235,10 @@ where
     let partition_hash: Vec<u8> = row.try_get("partition_hash").map_err(|error| {
         protocol_storage_error::<DB>("decode input identity partition hash", error)
     })?;
-    let decoded_partition = PartitionId::new(partition_bytes.clone())?;
+    let partition = PartitionId::new(partition_bytes)?;
     verify_digest(
         &partition_hash,
-        decoded_partition.digest(),
+        partition.digest(),
         "projection input identity partition",
     )?;
     let source_bytes: Vec<u8> = row.try_get("source_bytes").map_err(|error| {
@@ -217,7 +255,7 @@ where
         protocol_storage_error::<DB>("decode input identity source partition hash", error)
     })?;
     let source =
-        ProjectionSource::from_canonical_name_bytes(&source_bytes, source_partition_bytes.clone())?;
+        ProjectionSource::from_canonical_name_bytes(&source_bytes, source_partition_bytes)?;
     verify_digest(
         &source_hash,
         source.digest(),
@@ -255,63 +293,30 @@ where
             )))
         }
     };
-    Ok(StoredInputIdentity {
-        partition_bytes,
-        partition_hash,
-        source_bytes,
-        source_hash,
-        source_partition_bytes,
-        source_partition_hash,
-        source_epoch: ProjectionEpoch::new(source_epoch)?,
-        source_position,
-        input_fingerprint: ProjectionInputFingerprint::from_digest(input_hash),
+    Ok(TrustedProjectionInput {
+        cursor: ProjectionInputCursor::new(
+            input.cursor.topology().clone(),
+            partition,
+            source,
+            ProjectionEpoch::new(source_epoch)?,
+            source_position,
+        )?,
+        fingerprint: ProjectionInputFingerprint::from_digest(input_hash),
         message_id: row.try_get("message_id").map_err(|error| {
             protocol_storage_error::<DB>("decode input identity message ID", error)
         })?,
         causation_id: row.try_get("causation_id").map_err(|error| {
             protocol_storage_error::<DB>("decode input identity causation ID", error)
         })?,
+        generation: input.generation,
         gap_free,
     })
-}
-
-pub(super) fn input_identity_cursor_matches(
-    identity: &StoredInputIdentity,
-    input: &TrustedProjectionInput,
-) -> bool {
-    input_identity_scope_matches(identity, input)
-        && identity.source_position == input.cursor.position()
-}
-
-fn input_identity_scope_matches(
-    identity: &StoredInputIdentity,
-    input: &TrustedProjectionInput,
-) -> bool {
-    let source = input.cursor.source();
-    identity.partition_bytes == input.cursor.projection_partition().canonical_bytes()
-        && identity.partition_hash == digest_bytes(input.cursor.projection_partition().digest())
-        && identity.source_bytes == source.canonical_name_bytes()
-        && identity.source_hash == digest_bytes(source.digest())
-        && identity.source_partition_bytes == source.canonical_partition_bytes()
-        && identity.source_partition_hash == digest_bytes(source.partition_digest())
-        && identity.source_epoch == *input.cursor.epoch()
-}
-
-pub(super) fn input_identity_matches(
-    identity: &StoredInputIdentity,
-    input: &TrustedProjectionInput,
-) -> bool {
-    input_identity_cursor_matches(identity, input)
-        && identity.input_fingerprint == input.fingerprint
-        && identity.message_id == input.message_id
-        && identity.causation_id == input.causation_id
-        && identity.gap_free == input.gap_free
 }
 
 pub(super) async fn input_identity_by_cursor_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     input: &TrustedProjectionInput,
-) -> Result<Option<StoredInputIdentity>, ProjectionProtocolError>
+) -> Result<Option<TrustedProjectionInput>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
@@ -365,14 +370,14 @@ where
         .map_err(|error| {
             protocol_storage_error::<DB>("load projection input identity by cursor", error)
         })?;
-    row.map(|row| decode_stored_input_identity::<DB>(&row))
+    row.map(|row| decode_stored_input_identity::<DB>(&row, input))
         .transpose()
 }
 
 pub(super) async fn input_identity_by_message_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     input: &TrustedProjectionInput,
-) -> Result<Option<StoredInputIdentity>, ProjectionProtocolError>
+) -> Result<Option<TrustedProjectionInput>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
@@ -405,7 +410,7 @@ where
         .map_err(|error| {
             protocol_storage_error::<DB>("load projection input identity by message", error)
         })?;
-    row.map(|row| decode_stored_input_identity::<DB>(&row))
+    row.map(|row| decode_stored_input_identity::<DB>(&row, input))
         .transpose()
 }
 
@@ -714,11 +719,13 @@ where
     Ok(true)
 }
 
-pub(super) async fn validate_source_capability_in_tx_mode<DB>(
+/// Load the gap-free capability registered for the input's source,
+/// registering the input's own when none exists and `register_missing`.
+pub(super) async fn source_capability_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     input: &TrustedProjectionInput,
     register_missing: bool,
-) -> Result<(), ProjectionProtocolError>
+) -> Result<Option<bool>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
@@ -753,7 +760,7 @@ where
         })?;
     let Some(row) = row else {
         if !register_missing {
-            return Ok(());
+            return Ok(None);
         }
         let source = input.cursor.source();
         let source_bytes = source.canonical_name_bytes();
@@ -789,7 +796,7 @@ where
                 "projection source capability changed while its partition lock was held",
             ));
         }
-        return Ok(());
+        return Ok(None);
     };
     let source_bytes: Vec<u8> = row
         .try_get("source_bytes")
@@ -836,10 +843,7 @@ where
             )))
         }
     };
-    if gap_free != input.gap_free {
-        return Err(ProjectionProtocolError::InputCorruption);
-    }
-    Ok(())
+    Ok(Some(gap_free))
 }
 
 pub(super) async fn validate_input_identity_in_tx_mode<DB>(
@@ -858,37 +862,28 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
-    validate_source_capability_in_tx_mode(tx, input, register_missing_source_capability).await?;
-    let exact_identity = input_identity_by_cursor_in_tx(tx, input).await?;
-    if let Some(identity) = &exact_identity {
-        if !input_identity_cursor_matches(identity, input) {
-            return Err(corrupt_storage(
-                "projection input identity hash lookup resolved different canonical source bytes",
-            ));
-        }
-        if !input_identity_matches(identity, input) {
-            return Err(ProjectionProtocolError::InputCorruption);
-        }
+    let source_gap_free =
+        source_capability_in_tx(tx, input, register_missing_source_capability).await?;
+    let at_cursor = input_identity_by_cursor_in_tx(tx, input).await?;
+    if at_cursor
+        .as_ref()
+        .is_some_and(|recorded| recorded.cursor != input.cursor)
+    {
+        return Err(corrupt_storage(
+            "projection input identity hash lookup resolved different canonical source bytes",
+        ));
     }
-    if let Some(identity) = input_identity_by_message_in_tx(tx, input).await? {
-        if !input_identity_scope_matches(&identity, input) {
-            return Err(ProjectionProtocolError::MessageIdReuse {
-                message_id: input.message_id.clone(),
-            });
-        }
-        if identity.input_fingerprint != input.fingerprint
-            || identity.causation_id != input.causation_id
-            || identity.gap_free != input.gap_free
-        {
-            return Err(ProjectionProtocolError::MessageIdReuse {
-                message_id: input.message_id.clone(),
-            });
-        }
-        if exact_identity.is_none() && identity.source_position == input.cursor.position() {
-            return Err(corrupt_storage(
-                "projection message identity exists without its exact cursor identity",
-            ));
-        }
+    let for_message = input_identity_by_message_in_tx(tx, input).await?;
+    validate_input_identity(
+        input,
+        source_gap_free,
+        at_cursor.as_ref(),
+        for_message.as_ref(),
+    )?;
+    if at_cursor.is_none() && for_message.is_some_and(|recorded| recorded.cursor == input.cursor) {
+        return Err(corrupt_storage(
+            "projection message identity exists without its exact cursor identity",
+        ));
     }
     Ok(())
 }
@@ -929,11 +924,13 @@ where
     validate_input_identity_in_tx_mode(tx, input, false).await
 }
 
+/// Classify an input that passed its identity and partition fences. An
+/// unapplied input must also be the one a pending repair retries.
 pub(super) async fn classify_validated_input_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     input: &TrustedProjectionInput,
     state: &PartitionState,
-) -> Result<InputDisposition, ProjectionProtocolError>
+) -> Result<ProjectionInputDisposition, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
@@ -947,48 +944,40 @@ where
 {
     if let Some(receipt) = receipt_by_cursor_in_tx(tx, input).await? {
         verify_stored_change(state, &receipt.change)?;
-        if receipt.source_bytes != input.cursor.source().canonical_name_bytes()
-            || receipt.source_hash != digest_bytes(input.cursor.source().digest())
-            || receipt.source_partition_bytes != input.cursor.source().canonical_partition_bytes()
-            || receipt.source_partition_hash
-                != digest_bytes(input.cursor.source().partition_digest())
-        {
+        if !receipt.source_matches(input) {
             return Err(corrupt_storage(
                 "projection cursor receipt hash lookup resolved different canonical bytes",
             ));
         }
-        if receipt.input_fingerprint != input.fingerprint
-            || receipt.message_id != input.message_id
-            || receipt.causation_id != input.causation_id
-            || receipt.gap_free != input.gap_free
-        {
-            return Err(ProjectionProtocolError::InputCorruption);
-        }
+        let disposition = classify_input(
+            input,
+            Some((&receipt.recorded_input(input)?, &receipt.change)),
+            false,
+            None,
+        )?;
         if receipt.outcome_kind != "applied" {
             return Err(corrupt_storage(
                 "failed cursor receipt exists without a stopped partition",
             ));
         }
-        return Ok(InputDisposition::Duplicate(checkpoint_from_stored(
-            &input.cursor,
-            receipt.source_epoch,
-            receipt.source_position,
-            receipt.change,
-            receipt.gap_free,
-        )?));
+        return Ok(disposition);
     }
 
     let repeated_effect = if let Some(receipt) = receipt_by_message_in_tx(tx, input).await? {
         verify_stored_change(state, &receipt.change)?;
-        let mut original_input = input.clone();
-        original_input.cursor = ProjectionInputCursor::new(
+        // The receipt must be this same input as first delivered, possibly at
+        // another position of the same source and epoch.
+        let mut first_delivery = input.clone();
+        first_delivery.cursor = ProjectionInputCursor::new(
             input.cursor.topology().clone(),
             input.cursor.projection_partition().clone(),
             input.cursor.source().clone(),
             input.cursor.epoch().clone(),
             receipt.source_position,
         )?;
-        if !receipt_matches_input(&receipt, &original_input) {
+        if !receipt.source_matches(input)
+            || !same_input(&receipt.recorded_input(input)?, &first_delivery)
+        {
             return Err(ProjectionProtocolError::MessageIdReuse {
                 message_id: input.message_id.clone(),
             });
@@ -1003,59 +992,49 @@ where
         false
     };
 
-    let Some(previous) = current_input_cursor_in_tx(tx, input).await? else {
-        return Ok(if repeated_effect {
-            InputDisposition::Redelivery
-        } else {
-            InputDisposition::New
-        });
-    };
-    verify_stored_change(state, &previous.change)?;
-    if previous.gap_free != input.gap_free {
-        return Err(ProjectionProtocolError::InputCorruption);
+    let previous = current_input_cursor_in_tx(tx, input).await?;
+    if let Some(previous) = &previous {
+        verify_stored_change(state, &previous.change)?;
     }
-    if previous.source_epoch != *input.cursor.epoch() {
-        return Err(ProjectionProtocolError::IncomparableInput);
-    }
-    if input.cursor.position() < previous.source_position {
-        return Ok(InputDisposition::Stale(checkpoint_from_stored(
-            &input.cursor,
-            previous.source_epoch,
-            previous.source_position,
-            previous.change,
-            previous.gap_free,
-        )?));
-    }
-    if input.cursor.position() == previous.source_position {
-        if previous.input_fingerprint != input.fingerprint
-            || previous.message_id != input.message_id
-            || previous.causation_id != input.causation_id
-            || previous.gap_free != input.gap_free
+    let recorded = previous
+        .as_ref()
+        .map(|previous| previous.recorded_input(input))
+        .transpose()?;
+    let disposition = classify_input(
+        input,
+        None,
+        repeated_effect,
+        recorded
+            .as_ref()
+            .zip(previous.as_ref().map(|previous| &previous.change)),
+    )?;
+    match (&disposition, &previous) {
+        (ProjectionInputDisposition::Duplicate(_), Some(previous))
+            if !repeated_effect && !verify_inherited_cursor_in_tx(tx, input, previous).await? =>
         {
-            return Err(ProjectionProtocolError::InputCorruption);
-        }
-        if !repeated_effect && !verify_inherited_cursor_in_tx(tx, input, &previous).await? {
             return Err(corrupt_storage(
                 "projection input cursor has no receipt and was not inherited by repair",
             ));
         }
-        return Ok(InputDisposition::Duplicate(checkpoint_from_stored(
-            &input.cursor,
-            previous.source_epoch,
-            previous.source_position,
-            previous.change,
-            previous.gap_free,
-        )?));
+        (ProjectionInputDisposition::Pending | ProjectionInputDisposition::Redelivery, _) => {
+            if let Some(failure_id) = &state.pending_retry_failure_id {
+                let pending = failure_in_tx(
+                    tx,
+                    input.cursor.topology(),
+                    input.cursor.projection_partition(),
+                    failure_id,
+                    &state.change_epoch,
+                )
+                .await?
+                .ok_or_else(|| {
+                    corrupt_storage(format!(
+                        "pending projection retry failure `{failure_id}` is missing"
+                    ))
+                })?;
+                validate_pending_retry(input, state.active_generation, &pending.failure)?;
+            }
+        }
+        _ => {}
     }
-    if input.gap_free
-        && input.cursor.position()
-            != checked_next(previous.source_position, "gap-free projection input")?
-    {
-        return Err(ProjectionProtocolError::IncomparableInput);
-    }
-    Ok(if repeated_effect {
-        InputDisposition::Redelivery
-    } else {
-        InputDisposition::New
-    })
+    Ok(disposition)
 }

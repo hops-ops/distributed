@@ -56,6 +56,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Sqlite {
     // recovery re-reads stream versions in the same transaction.
     const CONFLICT_REREAD_IN_TX: bool = true;
     const NOW: &'static str = "CURRENT_TIMESTAMP";
+    const BEGIN_READ_THEN_WRITE: &'static str = "BEGIN IMMEDIATE";
     const COMMAND_LEDGER_SELECT: &'static str =
         crate::repository::sqlite_codec::COMMAND_LEDGER_SELECT;
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str = "";
@@ -211,8 +212,9 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Sqlite {
         if request.batch_size == 0 {
             return Ok(Vec::new());
         }
+        // The claim scans candidates before it updates them.
         let mut tx = pool
-            .begin()
+            .begin_with(Self::BEGIN_READ_THEN_WRITE)
             .await
             .map_err(|error| repository_storage_error("begin outbox claim transaction", error))?;
         let claimed = crate::repository::sql::outbox::claim_sqlite(

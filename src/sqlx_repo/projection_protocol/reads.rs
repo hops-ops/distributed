@@ -327,34 +327,20 @@ where
         )));
     }
 
-    let current = record_in_tx(tx, &staged.scope, &state.change_epoch).await?;
-    crate::projection_protocol::validate_snapshot_write(
-        current.as_ref().map(|record| &record.metadata),
-        None,
+    let current = record_in_tx(tx, &staged.scope, &state.change_epoch)
+        .await?
+        .map(|record| record.metadata);
+    crate::projection_protocol::validate_snapshot_write(current.as_ref(), None)?;
+    validate_physical_row(
+        &staged.scope,
+        current.as_ref(),
+        physical_row_exists_in_tx(tx, &staged.mutation).await?,
     )?;
-    let physical_exists = physical_row_exists_in_tx(tx, &staged.mutation).await?;
-    match current.as_ref().map(|record| &record.metadata) {
-        None if physical_exists => {
-            return Err(ProjectionProtocolError::RecordAlreadyExists {
-                model: staged.scope.model().to_string(),
-            });
-        }
-        Some(metadata) if metadata.tombstone => {
-            return Err(ProjectionProtocolError::RecordTombstoned {
-                model: staged.scope.model().to_string(),
-            });
-        }
-        Some(_) if !physical_exists => {
-            return Err(ProjectionProtocolError::RecordMissing {
-                model: staged.scope.model().to_string(),
-            });
-        }
-        _ => {}
-    }
     let expectation = current
         .as_ref()
-        .map(|record| ProjectionRecordExpectation::Exact(record.metadata.revision.clone()))
-        .unwrap_or(ProjectionRecordExpectation::Missing);
+        .map_or(ProjectionRecordExpectation::Missing, |metadata| {
+            ProjectionRecordExpectation::Exact(metadata.revision.clone())
+        });
     let (revision, tombstone) = next_record(
         &staged.scope,
         &expectation,
@@ -373,11 +359,7 @@ where
         Some(staged.scope.clone()),
         Some(revision.clone()),
         None,
-        batch
-            .ownership
-            .iter()
-            .find(|ownership| ownership.model == staged.scope.model())
-            .and_then(|ownership| ownership.program_id),
+        program_id_for_model(&batch.ownership, staged.scope.model()),
     )?;
     let metadata = ProjectionRecordMetadata {
         source_snapshot: None,
@@ -411,11 +393,7 @@ where
         scope: staged.scope.clone(),
         revision: Some(revision),
         change: change.cursor.clone(),
-        program_id: batch
-            .ownership
-            .iter()
-            .find(|ownership| ownership.model == staged.scope.model())
-            .and_then(|ownership| ownership.program_id),
+        program_id: program_id_for_model(&batch.ownership, staged.scope.model()),
     };
 
     apply_read_model_write_plan_in_tx(tx, write_plan).await?;
@@ -1347,11 +1325,7 @@ where
         observation_query.push_bind(topology_hash.as_slice());
     }
     observation_query.push(")");
-    observation_query.push(
-        " ORDER BY observation.topology_hash, observation.partition_hash, \
-         observation.model_name, observation.scope_kind, observation.canonical_key_hash \
-         LIMIT ",
-    );
+    observation_query.push(" LIMIT ");
     observation_query.push(overflow_limit.to_string());
     let rows = observation_query
         .build()
@@ -1480,7 +1454,7 @@ where
         failure_query.push_bind(topology_hash.as_slice());
     }
     failure_query.push(")");
-    failure_query.push(" ORDER BY partition.topology_hash LIMIT ");
+    failure_query.push(" LIMIT ");
     failure_query.push(overflow_limit.to_string());
     let rows = failure_query
         .build()
@@ -1531,10 +1505,12 @@ where
         }
         terminal_failure_topologies.push(topology);
     }
-    Ok(ProjectionCausationEvidenceBatch {
+    let mut evidence = ProjectionCausationEvidenceBatch {
         observations,
         terminal_failure_topologies,
-    })
+    };
+    sort_causation_evidence(&mut evidence);
+    Ok(evidence)
 }
 
 /// Recover exact live record scopes for typed physical-row keys without
@@ -1904,58 +1880,18 @@ where
 {
     let state = load_partition_in_connection(connection, topology, partition).await?;
     after_state.await;
-    let Some(state) = state else {
-        return Ok(match after {
-            Some(_) => ProjectionChangeRead::ResetRequired {
-                head: None,
-                compacted_through: 0,
-            },
-            None => ProjectionChangeRead::Changes {
-                head: None,
-                compacted_through: 0,
-                changes: Vec::new(),
-            },
-        });
-    };
-    let head = if state.change_head == 0 {
-        None
-    } else {
-        Some(ProjectionChangeCursor::new(
-            topology.clone(),
-            partition.clone(),
-            state.change_epoch.clone(),
+    let window = state.as_ref().map(|state| {
+        (
+            &state.change_epoch,
             state.change_head,
-        )?)
+            state.compacted_through,
+        )
+    });
+    let start = match change_read_window(topology, partition, window, after, limit)? {
+        std::ops::ControlFlow::Break(read) => return Ok(read),
+        std::ops::ControlFlow::Continue(start) => start,
     };
-    if after.is_none() && state.compacted_through > 0 {
-        return Ok(ProjectionChangeRead::ResetRequired {
-            head,
-            compacted_through: state.compacted_through,
-        });
-    }
-    let start = match after {
-        Some(cursor)
-            if cursor.topology() != topology
-                || cursor.projection_partition() != partition
-                || cursor.epoch() != &state.change_epoch
-                || cursor.position() > state.change_head
-                || cursor.position() < state.compacted_through =>
-        {
-            return Ok(ProjectionChangeRead::ResetRequired {
-                head,
-                compacted_through: state.compacted_through,
-            });
-        }
-        Some(cursor) => cursor.position(),
-        None => state.compacted_through,
-    };
-    if limit == 0 || start == state.change_head {
-        return Ok(ProjectionChangeRead::Changes {
-            head,
-            compacted_through: state.compacted_through,
-            changes: Vec::new(),
-        });
-    }
+    let window = window.expect("a change read past its window decision has a partition");
     let topology_hash = topology.digest();
     let partition_hash = partition.digest();
     let mut builder = QueryBuilder::<DB>::new(
@@ -1967,44 +1903,20 @@ where
     builder.push(" AND partition_hash = ");
     builder.push_bind(partition_hash.as_slice());
     builder.push(" AND change_epoch = ");
-    builder.push_bind(state.change_epoch.as_str());
+    builder.push_bind(window.0.as_str());
     builder.push(" AND change_position > ");
     builder.push_bind(to_i64::<DB>(start, "projection change read position")?);
     builder.push(" ORDER BY change_position ASC LIMIT ");
     builder.push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
-    let rows = builder
+    let changes = builder
         .build()
         .fetch_all(&mut *connection)
         .await
-        .map_err(|error| protocol_storage_error::<DB>("read projection changes", error))?;
-    let mut changes = Vec::with_capacity(rows.len());
-    let mut expected = checked_next(start, "projection change read")?;
-    for row in rows {
-        let change = decode_change_row::<DB>(&row, topology, partition, &state.change_epoch)?;
-        if change.cursor.position() != expected {
-            return Err(corrupt_storage(format!(
-                "projection change log expected position {expected} but found {}",
-                change.cursor.position()
-            )));
-        }
-        expected = if change.cursor.position() == state.change_head {
-            state.change_head
-        } else {
-            checked_next(change.cursor.position(), "projection change read")?
-        };
-        changes.push(change);
-    }
-    if changes.is_empty() {
-        return Err(corrupt_storage(format!(
-            "projection change log is missing retained position {}",
-            checked_next(start, "projection change read")?
-        )));
-    }
-    Ok(ProjectionChangeRead::Changes {
-        head,
-        compacted_through: state.compacted_through,
-        changes,
-    })
+        .map_err(|error| protocol_storage_error::<DB>("read projection changes", error))?
+        .iter()
+        .map(|row| decode_change_row::<DB>(row, topology, partition, window.0))
+        .collect::<Result<Vec<_>, _>>()?;
+    change_page(topology, partition, window, start, changes)
 }
 
 /// Read one durable resumable projection-change page using an existing

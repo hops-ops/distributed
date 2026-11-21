@@ -31,35 +31,24 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
     protocol.register_same_transaction_ownership(&partition_key, batch)?;
 
     let mutation = &batch.mutations[0];
-    crate::projection_protocol::validate_snapshot_write(
-        protocol.records.get(&mutation.scope),
-        None,
-    )?;
+    let current = protocol.records.get(&mutation.scope);
+    crate::projection_protocol::validate_snapshot_write(current, None)?;
     let lock_key = mutation.mutation.lock_key();
-    let row_exists = staged_rows.contains_key(&lock_key);
-    let revision = match protocol.records.get(&mutation.scope) {
-        None if !row_exists => RecordRevision::new(mutation.scope.clone(), 1, 1)?,
-        None => {
-            return Err(ProjectionProtocolError::RecordAlreadyExists {
-                model: mutation.scope.model().to_string(),
-            });
-        }
-        Some(metadata) if metadata.tombstone => {
-            return Err(ProjectionProtocolError::RecordTombstoned {
-                model: mutation.scope.model().to_string(),
-            });
-        }
-        Some(_) if !row_exists => {
-            return Err(ProjectionProtocolError::RecordMissing {
-                model: mutation.scope.model().to_string(),
-            });
-        }
-        Some(metadata) => RecordRevision::new(
-            mutation.scope.clone(),
-            metadata.revision.incarnation(),
-            checked_next(metadata.revision.revision(), "record revision")?,
-        )?,
-    };
+    validate_physical_row(
+        &mutation.scope,
+        current,
+        staged_rows.contains_key(&lock_key),
+    )?;
+    let expectation = current.map_or(ProjectionRecordExpectation::Missing, |metadata| {
+        ProjectionRecordExpectation::Exact(metadata.revision.clone())
+    });
+    let (revision, _) = next_record(
+        &mutation.scope,
+        &expectation,
+        RecordTransition::Upsert,
+        current,
+        false,
+    )?;
 
     let change = protocol.append_change(
         &partition_key,
@@ -70,11 +59,7 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
             scope: Some(mutation.scope.clone()),
             revision: Some(revision.clone()),
             failure_id: None,
-            program_id: batch
-                .ownership
-                .iter()
-                .find(|ownership| ownership.model == mutation.scope.model())
-                .and_then(|ownership| ownership.program_id),
+            program_id: program_id_for_model(&batch.ownership, mutation.scope.model()),
         },
     )?;
     let metadata = ProjectionRecordMetadata {
