@@ -14,6 +14,13 @@ use syn::{
 /// Proc-macro output is compiled in the caller's crate, so a literal
 /// `::distributed` path is wrong when the dependency is renamed or re-exported.
 /// `FoundCrate::Itself` also keeps framework-internal macro tests hygienic.
+/// [`framework_path`] for a helper below a macro's entry point. The entry
+/// point has already resolved the dependency (and reported a missing one), so
+/// the fallback is never what the user sees.
+pub(crate) fn framework() -> proc_macro2::TokenStream {
+    framework_path().unwrap_or_else(|_| quote!(::distributed))
+}
+
 pub(crate) fn framework_path() -> syn::Result<proc_macro2::TokenStream> {
     match crate_name("distributed") {
         Ok(FoundCrate::Itself) => Ok(quote!(crate)),

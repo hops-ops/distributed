@@ -384,14 +384,18 @@ fn expand_declaration(decl: MutationDeclaration) -> Result<TokenStream> {
         .map(|lit| lit.base10_parse::<u64>())
         .transpose()?
         .unwrap_or(1);
-    let steps = decl.operations.iter().map(expand_step);
+    let framework = crate::shared::framework_path()?;
+    let steps = decl
+        .operations
+        .iter()
+        .map(|operation| expand_step(&framework, operation));
     let name_lit = decl.name;
     // The declaration is data. `Mutation::program` builds and validates it and
     // returns an error; nothing here can panic.
     Ok(quote! {
         {
-            const __STEPS: &[::distributed::MutationStep] = &[#(#steps),*];
-            ::distributed::Mutation::<()>::declare(#name_lit, #version, __STEPS)
+            const __STEPS: &[#framework::MutationStep] = &[#(#steps),*];
+            #framework::Mutation::<()>::declare(#name_lit, #version, __STEPS)
         }
     })
 }
@@ -402,49 +406,49 @@ fn path_literals(path: &[Ident]) -> Vec<LitStr> {
         .collect()
 }
 
-fn expand_inputs(bindings: &[GraphqlFieldBinding]) -> TokenStream {
+fn expand_inputs(framework: &TokenStream, bindings: &[GraphqlFieldBinding]) -> TokenStream {
     let inputs = bindings.iter().map(|(column, path)| {
         let column = LitStr::new(&column.to_string(), column.span());
         let path = path_literals(path);
         quote! {
-            ::distributed::MutationInput { column: #column, path: &[#(#path),*] }
+            #framework::MutationInput { column: #column, path: &[#(#path),*] }
         }
     });
     quote! { &[#(#inputs),*] }
 }
 
-fn expand_step(operation: &MutationOpSyntax) -> TokenStream {
+fn expand_step(framework: &TokenStream, operation: &MutationOpSyntax) -> TokenStream {
     let schema = |model: &Path| {
-        quote! { <#model as ::distributed::RelationalReadModel>::schema }
+        quote! { <#model as #framework::RelationalReadModel>::schema }
     };
     match operation {
         MutationOpSyntax::Upsert { model, input_root } => {
             let model = schema(model);
             let object = path_literals(input_root);
             quote! {
-                ::distributed::MutationStep::Upsert { model: #model, object: &[#(#object),*] }
+                #framework::MutationStep::Upsert { model: #model, object: &[#(#object),*] }
             }
         }
         MutationOpSyntax::InsertOne { model, object_root } => {
             let model = schema(model);
             let object = path_literals(object_root);
             quote! {
-                ::distributed::MutationStep::Insert { model: #model, object: &[#(#object),*] }
+                #framework::MutationStep::Insert { model: #model, object: &[#(#object),*] }
             }
         }
         MutationOpSyntax::DeleteByPk { model, keys } => {
             let model = schema(model);
-            let key = expand_inputs(keys);
+            let key = expand_inputs(framework, keys);
             quote! {
-                ::distributed::MutationStep::Delete { model: #model, key: #key }
+                #framework::MutationStep::Delete { model: #model, key: #key }
             }
         }
         MutationOpSyntax::UpdateByPk { model, keys, sets } => {
             let model = schema(model);
-            let key = expand_inputs(keys);
-            let set = expand_inputs(sets);
+            let key = expand_inputs(framework, keys);
+            let set = expand_inputs(framework, sets);
             quote! {
-                ::distributed::MutationStep::Patch { model: #model, key: #key, set: #set }
+                #framework::MutationStep::Patch { model: #model, key: #key, set: #set }
             }
         }
     }

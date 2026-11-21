@@ -99,16 +99,6 @@ pub fn command_input_defaults(input: TokenStream) -> TokenStream {
 ///     }
 /// }
 /// ```
-///
-/// Classic sugar still works:
-///
-/// ```ignore
-/// mutation! {
-///     name: "SaveTodo";
-///     version: 1;
-///     upsert Todos from input.todo;
-/// }
-/// ```
 #[proc_macro]
 pub fn mutation(input: TokenStream) -> TokenStream {
     mutation::expand(input)

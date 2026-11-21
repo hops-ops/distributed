@@ -93,7 +93,7 @@ mod tests {
         let out = sourced::expand_sourced(attr, item).unwrap().to_string();
         assert!(out.contains("enum TodoEvent"), "got: {out}");
         assert!(
-            out.contains("impl distributed :: Aggregate for Todo"),
+            out.contains("impl :: distributed :: Aggregate for Todo"),
             "got: {out}"
         );
     }
@@ -124,7 +124,7 @@ mod tests {
         assert!(output.contains("is_replaying"));
         assert!(output.contains("pub enum TodoCompletedDomainEvent"));
         assert!(output.contains(
-            "impl distributed :: domain_event :: DomainEventContract for TodoCompletedDomainEvent"
+            "impl :: distributed :: domain_event :: DomainEventContract for TodoCompletedDomainEvent"
         ));
         assert!(output.contains("DomainEventBodyContract < TodoState >"));
     }
@@ -264,7 +264,7 @@ mod tests {
 
         assert!(output.contains("pub struct TodoRenamedDomainEvent"));
         assert!(output.contains(
-            "impl distributed :: domain_event :: DomainEventContract for TodoRenamedDomainEvent"
+            "impl :: distributed :: domain_event :: DomainEventContract for TodoRenamedDomainEvent"
         ));
         assert!(output.contains("DomainEventBodyDescriptor :: distributed_json"));
         assert!(output.contains("capture_domain_event"));
@@ -290,7 +290,7 @@ mod tests {
 
         assert!(output.contains("pub struct TodoDomainIdentity"));
         assert!(output.contains("pub enum TodoPurgedDomainEvent"));
-        assert!(output.contains("DomainEventBodyContract < distributed :: DomainDeletion"));
+        assert!(output.contains("DomainEventBodyContract < :: distributed :: DomainDeletion"));
         assert!(output.contains("self . entity . version ()"));
         assert!(output.contains("capture_domain_deletion"));
         assert!(!output.contains("capture_domain_state"));
@@ -326,7 +326,7 @@ mod tests {
         assert!(output.contains("DomainEventContract > :: EVENT_VERSION"));
         assert!(output.contains("DomainEventBodyContract < T >"));
         assert!(
-            output.contains("!= < TodoCompleted as distributed :: DomainEvent > :: DESCRIPTOR")
+            output.contains("!= < TodoCompleted as :: distributed :: DomainEvent > :: DESCRIPTOR")
         );
     }
 

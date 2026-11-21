@@ -9,43 +9,44 @@ pub(super) fn option_string_tokens(value: Option<&str>) -> proc_macro2::TokenStr
 }
 
 pub(super) fn column_type_tokens(ty: &Type, jsonb: bool, text: bool) -> proc_macro2::TokenStream {
+    let framework = crate::shared::framework();
     if jsonb {
-        return quote! { distributed::ColumnType::Json };
+        return quote! { #framework::ColumnType::Json };
     }
     if text {
-        return quote! { distributed::ColumnType::Text };
+        return quote! { #framework::ColumnType::Text };
     }
 
     let ty = option_inner_type(ty).unwrap_or(ty);
     if let Some(last) = last_type_segment(ty) {
         let ident = last.ident.to_string();
         return match ident.as_str() {
-            "String" | "str" => quote! { distributed::ColumnType::Text },
-            "bool" => quote! { distributed::ColumnType::Boolean },
+            "String" | "str" => quote! { #framework::ColumnType::Text },
+            "bool" => quote! { #framework::ColumnType::Boolean },
             "i8" | "i16" | "i32" | "i64" | "isize" => {
-                quote! { distributed::ColumnType::Integer }
+                quote! { #framework::ColumnType::Integer }
             }
             "u8" | "u16" | "u32" | "u64" | "usize" => {
-                quote! { distributed::ColumnType::UnsignedInteger }
+                quote! { #framework::ColumnType::UnsignedInteger }
             }
-            "f32" | "f64" => quote! { distributed::ColumnType::Float },
+            "f32" | "f64" => quote! { #framework::ColumnType::Float },
             "Vec" => {
                 if vec_inner_is_u8(last) {
-                    quote! { distributed::ColumnType::Bytes }
+                    quote! { #framework::ColumnType::Bytes }
                 } else {
-                    quote! { distributed::ColumnType::Json }
+                    quote! { #framework::ColumnType::Json }
                 }
             }
-            "HashMap" | "BTreeMap" | "Value" => quote! { distributed::ColumnType::Json },
+            "HashMap" | "BTreeMap" | "Value" => quote! { #framework::ColumnType::Json },
             _ => {
                 let type_name = ty.to_token_stream().to_string();
-                quote! { distributed::ColumnType::Unsupported(#type_name.to_string()) }
+                quote! { #framework::ColumnType::Unsupported(#type_name.to_string()) }
             }
         };
     }
 
     let type_name = ty.to_token_stream().to_string();
-    quote! { distributed::ColumnType::Unsupported(#type_name.to_string()) }
+    quote! { #framework::ColumnType::Unsupported(#type_name.to_string()) }
 }
 
 pub(super) fn effect_model_wire_tokens(
@@ -53,28 +54,29 @@ pub(super) fn effect_model_wire_tokens(
     jsonb: bool,
     text: bool,
 ) -> proc_macro2::TokenStream {
+    let framework = crate::shared::framework();
     if jsonb {
-        return quote! { distributed::command::EffectWireJson };
+        return quote! { #framework::command::EffectWireJson };
     }
     if text {
-        return quote! { distributed::command::EffectWireString };
+        return quote! { #framework::command::EffectWireString };
     }
     let ty = option_inner_type(ty).unwrap_or(ty);
     let Some(last) = last_type_segment(ty) else {
-        return quote! { distributed::command::EffectWireUnsupported };
+        return quote! { #framework::command::EffectWireUnsupported };
     };
     match last.ident.to_string().as_str() {
-        "String" | "str" => quote! { distributed::command::EffectWireString },
-        "bool" => quote! { distributed::command::EffectWireBoolean },
+        "String" | "str" => quote! { #framework::command::EffectWireString },
+        "bool" => quote! { #framework::command::EffectWireBoolean },
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
-            quote! { distributed::command::EffectWireBigInt }
+            quote! { #framework::command::EffectWireBigInt }
         }
-        "f32" | "f64" => quote! { distributed::command::EffectWireFloat },
-        "Vec" if vec_inner_is_u8(last) => quote! { distributed::command::EffectWireBytea },
+        "f32" | "f64" => quote! { #framework::command::EffectWireFloat },
+        "Vec" if vec_inner_is_u8(last) => quote! { #framework::command::EffectWireBytea },
         "Vec" | "HashMap" | "BTreeMap" | "Value" => {
-            quote! { distributed::command::EffectWireJson }
+            quote! { #framework::command::EffectWireJson }
         }
-        _ => quote! { distributed::command::EffectWireUnsupported },
+        _ => quote! { #framework::command::EffectWireUnsupported },
     }
 }
 
@@ -82,6 +84,7 @@ pub(super) fn bytes_row_value_tokens(
     ty: &Type,
     value: proc_macro2::TokenStream,
 ) -> Option<proc_macro2::TokenStream> {
+    let framework = crate::shared::framework();
     let option_inner = option_inner_type(ty);
     let ty = option_inner.unwrap_or(ty);
     let segment = last_type_segment(ty)?;
@@ -92,13 +95,13 @@ pub(super) fn bytes_row_value_tokens(
     if option_inner.is_some() {
         Some(quote! {
             match &#value {
-                Some(value) => distributed::RowValue::Bytes(value.clone()),
-                None => distributed::RowValue::Null,
+                Some(value) => #framework::RowValue::Bytes(value.clone()),
+                None => #framework::RowValue::Null,
             }
         })
     } else {
         Some(quote! {
-            distributed::RowValue::Bytes(#value.clone())
+            #framework::RowValue::Bytes(#value.clone())
         })
     }
 }

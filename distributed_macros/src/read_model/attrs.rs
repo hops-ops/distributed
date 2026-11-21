@@ -340,6 +340,7 @@ impl FieldAttrs {
         &self,
         field_name: &str,
     ) -> syn::Result<Option<proc_macro2::TokenStream>> {
+        let framework = crate::shared::framework();
         let Some(relationship) = &self.relationship else {
             return Ok(None);
         };
@@ -354,14 +355,14 @@ impl FieldAttrs {
         let through = option_string_tokens(relationship.through.as_deref());
         let target_foreign_key = option_string_tokens(relationship.target_foreign_key.as_deref());
         let kind = match relationship.kind {
-            RelationshipKindAttr::HasMany => quote! { distributed::RelationshipKind::HasMany },
-            RelationshipKindAttr::BelongsTo => quote! { distributed::RelationshipKind::BelongsTo },
+            RelationshipKindAttr::HasMany => quote! { #framework::RelationshipKind::HasMany },
+            RelationshipKindAttr::BelongsTo => quote! { #framework::RelationshipKind::BelongsTo },
             RelationshipKindAttr::ManyToMany => {
-                quote! { distributed::RelationshipKind::ManyToMany }
+                quote! { #framework::RelationshipKind::ManyToMany }
             }
         };
         Ok(Some(quote! {
-            distributed::RelationshipDef {
+            #framework::RelationshipDef {
                 references: #references,
                 field_name: #field_name.to_string(),
                 kind: #kind,
@@ -382,6 +383,7 @@ impl FieldAttrs {
         proc_macro2::TokenStream,
         proc_macro2::TokenStream,
     )> {
+        let framework = crate::shared::framework();
         let relationship = self.relationship.as_ref().ok_or_else(|| {
             syn::Error::new_spanned(field, "field is not a read-model relationship")
         })?;
@@ -408,8 +410,8 @@ impl FieldAttrs {
                     #field_name => {
                         self.#ident = rows
                             .into_iter()
-                            .map(<#inner as distributed::RelationalReadModel>::from_row)
-                            .collect::<Result<Vec<_>, distributed::TableStoreError>>()?;
+                            .map(<#inner as #framework::RelationalReadModel>::from_row)
+                            .collect::<Result<Vec<_>, #framework::TableStoreError>>()?;
                         Ok(())
                     }
                 };
@@ -417,11 +419,11 @@ impl FieldAttrs {
                     #field_name => self
                         .#ident
                         .iter()
-                        .map(distributed::RelationalReadModel::to_row)
-                        .collect::<Result<Vec<_>, distributed::TableStoreError>>()
+                        .map(#framework::RelationalReadModel::to_row)
+                        .collect::<Result<Vec<_>, #framework::TableStoreError>>()
                 };
                 let include_schema = quote! {
-                    #field_name => Ok(<#inner as distributed::RelationalReadModel>::schema())
+                    #field_name => Ok(<#inner as #framework::RelationalReadModel>::schema())
                 };
                 Ok((hydrate, include_rows, include_schema))
             }
@@ -443,9 +445,9 @@ impl FieldAttrs {
                     field_name,
                 )?;
                 let hydrated_value = if boxed.is_some() {
-                    quote! { ::std::boxed::Box::new(<#inner as distributed::RelationalReadModel>::from_row(row)?) }
+                    quote! { ::std::boxed::Box::new(<#inner as #framework::RelationalReadModel>::from_row(row)?) }
                 } else {
-                    quote! { <#inner as distributed::RelationalReadModel>::from_row(row)? }
+                    quote! { <#inner as #framework::RelationalReadModel>::from_row(row)? }
                 };
                 let included_value = if boxed.is_some() {
                     quote! { value.as_ref() }
@@ -460,7 +462,7 @@ impl FieldAttrs {
                             None => None,
                         };
                         if rows.next().is_some() {
-                            return Err(distributed::TableStoreError::Metadata(format!(
+                            return Err(#framework::TableStoreError::Metadata(format!(
                                 "belongs_to relationship `{}` returned more than one row",
                                 #field_name
                             )));
@@ -472,13 +474,13 @@ impl FieldAttrs {
                     #field_name => {
                         let mut rows = Vec::new();
                         if let Some(value) = &self.#ident {
-                            rows.push(distributed::RelationalReadModel::to_row(#included_value)?);
+                            rows.push(#framework::RelationalReadModel::to_row(#included_value)?);
                         }
                         Ok(rows)
                     }
                 };
                 let include_schema = quote! {
-                    #field_name => Ok(<#inner as distributed::RelationalReadModel>::schema())
+                    #field_name => Ok(<#inner as #framework::RelationalReadModel>::schema())
                 };
                 Ok((hydrate, include_rows, include_schema))
             }
@@ -613,10 +615,11 @@ fn parse_foreign_key(value: &str) -> syn::Result<ForeignKeyParts> {
 }
 
 pub(super) fn foreign_key_tokens(foreign_key: &ForeignKeyParts) -> proc_macro2::TokenStream {
+    let framework = crate::shared::framework();
     let table = &foreign_key.table;
     let column = &foreign_key.column;
     quote! {
-        distributed::ForeignKey {
+        #framework::ForeignKey {
             table: #table.to_string(),
             column: #column.to_string(),
         }

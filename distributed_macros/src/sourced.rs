@@ -298,9 +298,9 @@ fn ensure_recorder_body_has_no_early_exit(block: &syn::Block) -> syn::Result<()>
     }
 }
 
-fn domain_capture_error(expression: TokenStream2) -> TokenStream2 {
+fn domain_capture_error(framework: &TokenStream2, expression: TokenStream2) -> TokenStream2 {
     quote! {
-        #expression.map_err(|error| distributed::EventRecordError {
+        #expression.map_err(|error| #framework::EventRecordError {
             message: format!("domain-event capture failed: {error}"),
         })?;
     }
@@ -366,13 +366,16 @@ fn expand_domain_capture(
                 )
             })?;
             let event_type = identity_domain_event_type(aggregate, event_name)?;
-            let capture = domain_capture_error(quote! {
-                self.#entity_field.capture_domain_state(
-                    #aggregate_type,
-                    distributed::DomainEventDescriptor::state::<#state>(#event_name, #version),
-                    &__distributed_domain_state,
-                )
-            });
+            let capture = domain_capture_error(
+                &framework,
+                quote! {
+                    self.#entity_field.capture_domain_state(
+                        #aggregate_type,
+                        #framework::DomainEventDescriptor::state::<#state>(#event_name, #version),
+                        &__distributed_domain_state,
+                    )
+                },
+            );
             Ok(DomainExpansion {
                 prepare: TokenStream2::new(),
                 capture: quote! {
@@ -386,19 +389,19 @@ fn expand_domain_capture(
                     /// Exact outward event marker for this state-backed transition.
                     pub enum #event_type {}
 
-                    impl distributed::domain_event::DomainEventContract for #event_type {
+                    impl #framework::domain_event::DomainEventContract for #event_type {
                         const EVENT_NAME: &'static str = #event_name;
                         const EVENT_VERSION: u64 = #version;
 
-                        fn descriptor() -> distributed::DomainEventDescriptor {
-                            distributed::DomainEventDescriptor::state::<#state>(
+                        fn descriptor() -> #framework::DomainEventDescriptor {
+                            #framework::DomainEventDescriptor::state::<#state>(
                                 #event_name,
                                 #version,
                             )
                         }
                     }
 
-                    impl distributed::domain_event::DomainEventBodyContract<#state>
+                    impl #framework::domain_event::DomainEventBodyContract<#state>
                         for #event_type
                     {
                     }
@@ -442,13 +445,13 @@ fn expand_domain_capture(
                     #(#field_definitions),*
                 }
 
-                impl distributed::DomainEvent for #body_type {
-                    const DESCRIPTOR: distributed::DomainEventDescriptor =
-                        distributed::DomainEventDescriptor {
+                impl #framework::DomainEvent for #body_type {
+                    const DESCRIPTOR: #framework::DomainEventDescriptor =
+                        #framework::DomainEventDescriptor {
                             name: std::borrow::Cow::Borrowed(#event_name),
                             version: #version,
-                            body: distributed::DomainEventBodyDescriptor::distributed_json(
-                                distributed::DomainEventBodyKind::Event,
+                            body: #framework::DomainEventBodyDescriptor::distributed_json(
+                                #framework::DomainEventBodyKind::Event,
                                 #body_type_name,
                                 #version,
                                 #schema,
@@ -457,36 +460,39 @@ fn expand_domain_capture(
                         };
                 }
 
-                impl distributed::domain_event::DomainEventContract for #body_type {
+                impl #framework::domain_event::DomainEventContract for #body_type {
                     const EVENT_NAME: &'static str = #event_name;
                     const EVENT_VERSION: u64 = #version;
 
-                    fn descriptor() -> distributed::DomainEventDescriptor {
-                        <Self as distributed::DomainEvent>::DESCRIPTOR.clone()
+                    fn descriptor() -> #framework::DomainEventDescriptor {
+                        <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
                     }
                 }
 
-                impl distributed::domain_event::DomainEventBodyContract<Self> for #body_type {}
+                impl #framework::domain_event::DomainEventBodyContract<Self> for #body_type {}
 
-                impl distributed::command::CommandProjectionBody for #body_type {
+                impl #framework::command::CommandProjectionBody for #body_type {
                     fn command_projection_descriptor(
                         _: &'static str,
                         _: u64,
-                    ) -> distributed::DomainEventDescriptor {
-                        <Self as distributed::DomainEvent>::DESCRIPTOR.clone()
+                    ) -> #framework::DomainEventDescriptor {
+                        <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
                     }
                 }
 
-                impl distributed::projection::lower::ProjectionBodyMetadata for #body_type {
+                impl #framework::projection::lower::ProjectionBodyMetadata for #body_type {
                     #projection_metadata
                 }
             };
-            let capture = domain_capture_error(quote! {
-                self.#entity_field.capture_domain_event(
-                    #aggregate_type,
-                    &__distributed_domain_event_body,
-                )
-            });
+            let capture = domain_capture_error(
+                &framework,
+                quote! {
+                    self.#entity_field.capture_domain_event(
+                        #aggregate_type,
+                        &__distributed_domain_event_body,
+                    )
+                },
+            );
             Ok(DomainExpansion {
                 prepare: quote! {
                     let __distributed_domain_event_body =
@@ -531,16 +537,16 @@ fn expand_domain_capture(
                 /// Exact outward event marker for this deletion transition.
                 pub enum #event_type {}
 
-                impl distributed::domain_event::DomainEventContract for #event_type {
+                impl #framework::domain_event::DomainEventContract for #event_type {
                     const EVENT_NAME: &'static str = #event_name;
                     const EVENT_VERSION: u64 = #version;
 
-                    fn descriptor() -> distributed::DomainEventDescriptor {
-                        distributed::DomainEventDescriptor {
+                    fn descriptor() -> #framework::DomainEventDescriptor {
+                        #framework::DomainEventDescriptor {
                             name: std::borrow::Cow::Borrowed(#event_name),
                             version: #version,
-                            body: distributed::DomainEventBodyDescriptor::distributed_json(
-                                distributed::DomainEventBodyKind::Deletion,
+                            body: #framework::DomainEventBodyDescriptor::distributed_json(
+                                #framework::DomainEventBodyKind::Deletion,
                                 #deletion_type_name,
                                 1,
                                 #schema,
@@ -550,41 +556,44 @@ fn expand_domain_capture(
                     }
                 }
 
-                impl distributed::domain_event::DomainEventBodyContract<
-                    distributed::DomainDeletion<#identity>
+                impl #framework::domain_event::DomainEventBodyContract<
+                    #framework::DomainDeletion<#identity>
                 > for #event_type
                 {
                 }
             };
-            let capture = domain_capture_error(quote! {
-                self.#entity_field.capture_domain_deletion(
-                    #aggregate_type,
-                    distributed::DomainEventDescriptor {
-                        name: std::borrow::Cow::Borrowed(#event_name),
-                        version: #version,
-                        body: distributed::DomainEventBodyDescriptor::distributed_json(
-                            distributed::DomainEventBodyKind::Deletion,
-                            #deletion_type_name,
-                            1,
-                            #schema,
-                            #fingerprint,
-                        ),
-                    },
-                    &__distributed_domain_deletion,
-                )
-            });
+            let capture = domain_capture_error(
+                &framework,
+                quote! {
+                    self.#entity_field.capture_domain_deletion(
+                        #aggregate_type,
+                        #framework::DomainEventDescriptor {
+                            name: std::borrow::Cow::Borrowed(#event_name),
+                            version: #version,
+                            body: #framework::DomainEventBodyDescriptor::distributed_json(
+                                #framework::DomainEventBodyKind::Deletion,
+                                #deletion_type_name,
+                                1,
+                                #schema,
+                                #fingerprint,
+                            ),
+                        },
+                        &__distributed_domain_deletion,
+                    )
+                },
+            );
             Ok(DomainExpansion {
                 prepare: TokenStream2::new(),
                 capture: quote! {
                     if !self.#entity_field.is_replaying() {
                         let __distributed_domain_deletion =
-                            distributed::DomainDeletion::new(
+                            #framework::DomainDeletion::new(
                                 #identity {
                                     aggregate_id: self.#entity_field.id().to_owned(),
                                 },
                                 self.#entity_field.version(),
                             )
-                            .map_err(|error| distributed::EventRecordError {
+                            .map_err(|error| #framework::EventRecordError {
                                 message: format!("domain-event capture failed: {error}"),
                             })?;
                         #capture
@@ -602,12 +611,15 @@ fn expand_domain_capture(
                 let fields = params.iter().map(|(name, _)| quote!(#name: #name.clone()));
                 quote!(#event_enum::#variant { #(#fields),* })
             };
-            let capture = domain_capture_error(quote! {
-                self.#entity_field.capture_domain_event(
-                    #aggregate_type,
-                    &__distributed_domain_event_body,
-                )
-            });
+            let capture = domain_capture_error(
+                &framework,
+                quote! {
+                    self.#entity_field.capture_domain_event(
+                        #aggregate_type,
+                        &__distributed_domain_event_body,
+                    )
+                },
+            );
             Ok(DomainExpansion {
                 prepare: quote! {
                     let __distributed_domain_event_source =
@@ -619,8 +631,8 @@ fn expand_domain_capture(
                     {
                         fn __distributed_assert_domain_event_contract<T>()
                         where
-                            T: distributed::DomainEvent
-                                + distributed::domain_event::DomainEventBodyContract<T>,
+                            T: #framework::DomainEvent
+                                + #framework::domain_event::DomainEventBodyContract<T>,
                         {
                         }
                         __distributed_assert_domain_event_contract::<#output>();
@@ -631,10 +643,10 @@ fn expand_domain_capture(
                                 &*self,
                                 __distributed_domain_event_source,
                             );
-                        if <#output as distributed::domain_event::DomainEventContract>::descriptor()
-                            != <#output as distributed::DomainEvent>::DESCRIPTOR
+                        if <#output as #framework::domain_event::DomainEventContract>::descriptor()
+                            != <#output as #framework::DomainEvent>::DESCRIPTOR
                         {
-                            return Err(distributed::EventRecordError {
+                            return Err(#framework::EventRecordError {
                                 message: "domain-event capture failed: adapter output contract differs from its DomainEvent descriptor".to_owned(),
                             });
                         }
@@ -663,12 +675,12 @@ fn expand_domain_capture(
                         }
 
                         if !__distributed_same_str(
-                            <#output as distributed::domain_event::DomainEventContract>::EVENT_NAME,
+                            <#output as #framework::domain_event::DomainEventContract>::EVENT_NAME,
                             #event_name,
                         ) {
                             panic!("domain adapter output event name differs from #[event]");
                         }
-                        if <#output as distributed::domain_event::DomainEventContract>::EVENT_VERSION
+                        if <#output as #framework::domain_event::DomainEventContract>::EVENT_VERSION
                             != #version
                         {
                             panic!("domain adapter output event version differs from #[event]");
@@ -903,7 +915,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                 pub aggregate_id: String,
             }
 
-            impl distributed::projection::lower::ProjectionDeletionMetadata for #identity {
+            impl #framework::projection::lower::ProjectionDeletionMetadata for #identity {
                 const BODY_TYPE_NAME: &'static str = #deletion_type_name;
                 const BODY_SCHEMA: &'static str = #deletion_schema;
                 const BODY_FINGERPRINT: &'static str = #deletion_fingerprint;
@@ -981,9 +993,9 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
     });
 
     let try_from_impl = quote! {
-        impl TryFrom<&distributed::EventRecord> for #enum_name {
+        impl TryFrom<&#framework::EventRecord> for #enum_name {
             type Error = String;
-            fn try_from(event: &distributed::EventRecord) -> Result<Self, Self::Error> {
+            fn try_from(event: &#framework::EventRecord) -> Result<Self, Self::Error> {
                 match event.event_name.as_str() {
                     #(#try_from_arms)*
                     _ => Err(format!("Unknown event: {}", event.event_name)),
@@ -1034,7 +1046,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
         .collect();
 
     let (upcaster_wrappers, upcasters_method) =
-        generate_upcaster_tokens(&struct_name, &args.upcasters);
+        generate_upcaster_tokens(&framework, &struct_name, &args.upcasters);
     let aggregate_type_method = args.aggregate_type.as_ref().map(|aggregate_type| {
         quote! {
             fn aggregate_type() -> &'static str {
@@ -1045,6 +1057,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
 
     // ReplayError stays `String` — see the rationale on `expand_aggregate`.
     let aggregate_impl = aggregate_impl_tokens(
+        &framework,
         &struct_name,
         entity_field,
         &aggregate_type_method,
@@ -1054,7 +1067,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
     );
 
     let domain_commands_module =
-        expand_domain_commands_module(&struct_name, &domain_command_transitions);
+        expand_domain_commands_module(&framework, &struct_name, &domain_command_transitions);
 
     let expanded = quote! {
         #impl_block
@@ -1194,6 +1207,7 @@ fn method_name_to_type_ident(method_name: &Ident) -> Ident {
 }
 
 fn expand_domain_commands_module(
+    framework: &TokenStream2,
     aggregate: &Ident,
     transitions: &[DomainCommandTransition],
 ) -> TokenStream2 {
@@ -1219,14 +1233,14 @@ fn expand_domain_commands_module(
             let (fields, state) = (event.known.as_ref()?, event.domain_state.as_ref()?);
             let event_type = &event.domain_event_type;
             Some(quote! {
-                distributed::state_preview! { #event_type => #state { #fields } }
+                #framework::state_preview! { #event_type => #state { #fields } }
             })
         });
         let has_known_values = transition.events.iter().any(|event| event.known.is_some());
         let known_values_method = has_known_values.then(|| {
             quote! {
                 fn command_event_known_values(
-                ) -> Vec<distributed::command::CommandProjectionPreview> {
+                ) -> Vec<#framework::command::CommandProjectionPreview> {
                     vec![#(#known_value_items),*]
                 }
             }
@@ -1246,11 +1260,11 @@ fn expand_domain_commands_module(
         // would silently change its meaning (and generated aliases do not exist
         // for custom bodies). The public witness still lives in that module.
         transition_impls.push(quote! {
-            impl distributed::command::CommandEventSet for domain_commands::#type_name {
-                fn command_event_set() -> distributed::command::CommandProjectionEventSet {
-                    distributed::command::__command_projection_events([
+            impl #framework::command::CommandEventSet for domain_commands::#type_name {
+                fn command_event_set() -> #framework::command::CommandProjectionEventSet {
+                    #framework::command::__command_projection_events([
                         #(
-                            distributed::command::__command_projection_event_descriptor::<
+                            #framework::command::__command_projection_event_descriptor::<
                                 #event_types,
                             >()
                         ),*

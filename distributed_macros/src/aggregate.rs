@@ -11,6 +11,7 @@ use syn::{
 /// It emits only the `impl` block; callers still place `#upcaster_wrappers`
 /// (the free upcaster fns) where they already do.
 pub(crate) fn aggregate_impl_tokens(
+    framework: &TokenStream2,
     type_name: &Ident,
     entity_field: &Ident,
     aggregate_type_method: &Option<TokenStream2>,
@@ -19,22 +20,22 @@ pub(crate) fn aggregate_impl_tokens(
     upcasters_method: &TokenStream2,
 ) -> TokenStream2 {
     quote! {
-        impl distributed::Aggregate for #type_name {
+        impl #framework::Aggregate for #type_name {
             type ReplayError = String;
 
             #aggregate_type_method
 
-            fn entity(&self) -> &distributed::Entity {
+            fn entity(&self) -> &#framework::Entity {
                 &self.#entity_field
             }
 
-            fn entity_mut(&mut self) -> &mut distributed::Entity {
+            fn entity_mut(&mut self) -> &mut #framework::Entity {
                 &mut self.#entity_field
             }
 
             fn replay_event(
                 &mut self,
-                event: &distributed::EventRecord,
+                event: &#framework::EventRecord,
             ) -> Result<(), Self::ReplayError> {
                 // Hydration runs upcasters first. Payload compatibility alone
                 // cannot establish that an event has the handler's semantics.
@@ -60,9 +61,6 @@ pub(crate) fn aggregate_impl_tokens(
     }
 }
 
-// ============================================================================
-// aggregate! proc-macro
-// ============================================================================
 fn upcaster_wrapper_prefix(owner: &Ident) -> String {
     owner
         .to_string()
@@ -104,6 +102,7 @@ pub(crate) fn event_variant_ident(event_name: &LitStr) -> Ident {
 }
 
 pub(crate) fn generate_upcaster_tokens(
+    framework: &TokenStream2,
     owner: &Ident,
     upcasters: &[UpcasterDef],
 ) -> (proc_macro2::TokenStream, proc_macro2::TokenStream) {
@@ -128,9 +127,9 @@ pub(crate) fn generate_upcaster_tokens(
             let transform_fn = &u.transform_fn;
             quote! {
                 fn #wrapper(
-                    event: &distributed::EventRecord,
-                ) -> Result<Vec<u8>, distributed::UpcastError> {
-                    distributed::upcast_payload::<#source_type, #target_type>(
+                    event: &#framework::EventRecord,
+                ) -> Result<Vec<u8>, #framework::UpcastError> {
+                    #framework::upcast_payload::<#source_type, #target_type>(
                         event,
                         #to_version,
                         #transform_fn,
@@ -147,7 +146,7 @@ pub(crate) fn generate_upcaster_tokens(
             let from_version = &u.from_version;
             let to_version = &u.to_version;
             quote! {
-                distributed::EventUpcaster {
+                #framework::EventUpcaster {
                     event_type: #event_name,
                     from_version: #from_version,
                     to_version: #to_version,
@@ -157,8 +156,8 @@ pub(crate) fn generate_upcaster_tokens(
         });
 
     let upcasters_method = quote! {
-        fn upcasters() -> &'static [distributed::EventUpcaster] {
-            static UPCASTERS: &[distributed::EventUpcaster] = &[
+        fn upcasters() -> &'static [#framework::EventUpcaster] {
+            static UPCASTERS: &[#framework::EventUpcaster] = &[
                 #(#upcaster_entries),*
             ];
             UPCASTERS

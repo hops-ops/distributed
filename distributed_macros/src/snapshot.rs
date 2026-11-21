@@ -11,6 +11,7 @@ pub fn derive_snapshot(input: TokenStream) -> TokenStream {
 }
 
 fn expand_snapshot(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let framework = crate::shared::framework_path()?;
     let name = &input.ident;
     let snapshot_name = format_ident!("{}Snapshot", name);
 
@@ -170,7 +171,7 @@ fn expand_snapshot(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> 
             }
         }
 
-        impl distributed::Snapshottable for #name {
+        impl #framework::Snapshottable for #name {
             type Snapshot = #snapshot_name;
 
             #snapshot_version_const
@@ -297,7 +298,7 @@ mod tests {
         let expanded = expand_snapshot(input).unwrap().to_string();
 
         assert!(expanded.contains("pub struct TodoSnapshot"));
-        assert!(expanded.contains("impl distributed :: Snapshottable for Todo"));
+        assert!(expanded.contains("impl :: distributed :: Snapshottable for Todo"));
     }
 
     #[test]

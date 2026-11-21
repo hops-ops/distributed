@@ -1,1 +1,2 @@
-//! Harness crate for the renamed dependency proc-macro fixture.
+//! Harness crate: `tests/renamed.rs` uses the framework's macros through a
+//! renamed dependency.
