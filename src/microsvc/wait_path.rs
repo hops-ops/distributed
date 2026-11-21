@@ -18,11 +18,12 @@ struct WaitPathBody {
     input: Value,
 }
 
-/// Parse a wait-path body. Identity-shaped JSON fields are rejected rather than
+/// Parse a wait-path body into its command ID and input. Every command
+/// carries a command ID; identity-shaped JSON fields are rejected rather than
 /// ignored so a caller cannot depend on ambiguous authorization behavior.
-pub(crate) fn parse_wait_path_body(value: &Value) -> Result<Option<(String, Value)>, &'static str> {
+pub(crate) fn parse_wait_path_body(value: &Value) -> Result<(String, Value), &'static str> {
     if value.get("commandId").is_none() {
-        return Ok(None);
+        return Err("a command body is `{ \"commandId\", \"input\" }`: commandId is missing");
     }
     let parsed: WaitPathBody =
         serde_json::from_value(value.clone()).map_err(|_| "invalid wait-path envelope")?;
@@ -37,7 +38,7 @@ pub(crate) fn parse_wait_path_body(value: &Value) -> Result<Option<(String, Valu
     } else {
         parsed.input
     };
-    Ok(Some((parsed.command_id, input)))
+    Ok((parsed.command_id, input))
 }
 
 pub(crate) fn wait_path_response(result: &CausalDispatchResult) -> Value {
@@ -122,15 +123,13 @@ mod tests {
 
     #[test]
     fn strict_envelope_does_not_fall_back_or_accept_identity_smuggling() {
-        assert!(parse_wait_path_body(&json!({ "title": "legacy" }))
-            .expect("legacy")
-            .is_none());
+        let bare = parse_wait_path_body(&json!({ "title": "no envelope" })).unwrap_err();
+        assert!(bare.contains("commandId is missing"), "{bare}");
         let parsed = parse_wait_path_body(&json!({
             "commandId": "command-1",
             "input": { "title": "safe" }
         }))
-        .expect("valid")
-        .expect("wait path");
+        .expect("valid");
         assert_eq!(parsed.0, "command-1");
         assert_eq!(parsed.1, json!({ "title": "safe" }));
 

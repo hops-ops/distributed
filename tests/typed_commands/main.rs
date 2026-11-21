@@ -22,8 +22,8 @@ use distributed::graphql::{
     DistributedClientSurfaceExport, GraphqlEngine, ModelPermissions, SurfaceDirectProjection,
     SurfaceModeledProjection, SurfaceOptions, SurfaceProjector,
 };
+use distributed::microsvc::Session;
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
-use distributed::microsvc::{Context, Session};
 use distributed::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
 use distributed::projection::lower::{DirectCandidate, EventualOnly, ProjectionDescriptor};
 use distributed::projection::placement::{
@@ -1336,7 +1336,7 @@ fn pool_free_typed_export_preserves_service_provenance_and_rejects_relabeling() 
 }
 
 #[tokio::test]
-async fn execute_stream_cannot_dispatch_through_an_injected_legacy_service() {
+async fn execute_stream_cannot_dispatch_through_an_injected_service() {
     let typed = service_a("todos");
     let engine = GraphqlEngine::builder(pool())
         .identity(IdentityConfig::dev_headers())
@@ -1346,19 +1346,22 @@ async fn execute_stream_cannot_dispatch_through_an_injected_legacy_service() {
     let invoked = Arc::new(AtomicBool::new(false));
     let handler_flag = Arc::clone(&invoked);
     let raw_service = Arc::new(
-        Service::new()
-            .named("unrelated")
-            .routes(
-                Routes::new()
-                    .command("todo.create")
-                    .handle(move |_: &Context<()>| {
+        Service::new().named("unrelated").routes(
+            causal_routes()
+                .typed_command(typed_command::<InputA, Succeeded<OutputA>>("todo.create"))
+                .handle(
+                    move |_: &CausalCommandContext<'_, FixtureAggregate>, _: InputA| {
                         let handler_flag = Arc::clone(&handler_flag);
                         async move {
                             handler_flag.store(true, Ordering::SeqCst);
-                            Ok(serde_json::json!({ "id": "forged" }))
+                            Ok(PreparedCommand::prepare(OutputA {
+                                id: "forged".into(),
+                            })
+                            .unwrap())
                         }
-                    }),
-            ),
+                    },
+                ),
+        ),
     );
     let request = Request::new(
         "mutation { todo_create(commandId: \"0190a000-0000-7000-8000-000000000003\", input: { id: \"todo-1\" }) { id } }",

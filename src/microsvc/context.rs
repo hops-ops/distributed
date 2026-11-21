@@ -1,4 +1,4 @@
-//! Context passed to handlers.
+//! Context passed to event handlers.
 //!
 //! Carries the message, parsed JSON payload when available, session variables,
 //! and a reference to the service dependencies. Handlers access everything they
@@ -13,7 +13,8 @@ use super::session::Session;
 use crate::bus::Message;
 use crate::Aggregate;
 
-/// The context passed to every handler.
+/// The context passed to every event handler. A typed command handler
+/// receives a [`CausalCommandContext`](super::CausalCommandContext) instead.
 ///
 /// Generic over `D` (the service dependency type) so handlers can access the
 /// repository, read-model store, or custom dependencies the service is
@@ -25,8 +26,7 @@ use crate::Aggregate;
 /// pub async fn handle(
 ///     ctx: &Context<'_, Repo>,
 /// ) -> Result<Value, HandlerError> {
-///     let user_id = ctx.user_id()?;
-///     let input = ctx.input::<CreateOrderInput>()?;
+///     let input = ctx.input::<OrderCreated>()?;
 ///     let repo = ctx.repo();
 ///     // ... commit via repo.commit(&mut agg).await? ...
 /// }
@@ -66,11 +66,6 @@ impl<'a, D> Context<'a, D> {
     /// Get the raw JSON input.
     pub fn raw_input(&self) -> &Value {
         &self.input
-    }
-
-    /// Get the command name.
-    pub fn command_name(&self) -> &str {
-        self.message.name()
     }
 
     /// Get the message name.

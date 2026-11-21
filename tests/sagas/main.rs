@@ -5,6 +5,8 @@
 //! business process across multiple aggregates, with compensation
 //! (rollback) capabilities when steps fail.
 
+#[path = "../support/commands.rs"]
+mod commands;
 mod handlers;
 mod microsvc_saga;
 mod orchestration;

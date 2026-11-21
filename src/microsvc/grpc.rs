@@ -5,7 +5,9 @@
 //!
 //! ## RPCs
 //!
-//! - `Dispatch` — dispatch a command. Input = `GrpcRequest`, output = `GrpcResponse`.
+//! - `Dispatch` — dispatch a typed command. Input = `GrpcRequest` whose `input`
+//!   is the JSON `{ "commandId", "input" }`, output = `GrpcResponse`. An input
+//!   without a `commandId` is a 400.
 //! - `Health` — health check returning available commands.
 //!
 //! ## Example
@@ -15,11 +17,11 @@
 //! use distributed::{microsvc, InMemoryRepository};
 //!
 //! let service = Arc::new(
-//!     microsvc::Service::new().routes(
+//!     microsvc::Service::new().named("counters").routes(
 //!         microsvc::Routes::new()
 //!             .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
-//!             .command("counter.create")
-//!             .handle(|ctx| { /* ... */ })
+//!             .typed_command(counter_create::command())
+//!             .handle(counter_create::handle)
 //!     )
 //! );
 //!
@@ -169,7 +171,7 @@ impl CommandService for GrpcHandler {
         // [`build_session`] and the `Session` trust-boundary docs.
         let session = build_session(&metadata, req.session_variables);
 
-        let wait_path = match super::wait_path::parse_wait_path_body(&input) {
+        let (command_id, input) = match super::wait_path::parse_wait_path_body(&input) {
             Ok(wait_path) => wait_path,
             Err(error) => {
                 return Ok(Response::new(GrpcResponse {
@@ -178,49 +180,29 @@ impl CommandService for GrpcHandler {
                 }));
             }
         };
-        if let Some((command_id, wait_input)) = wait_path {
-            return match super::wait_path::dispatch_wait_path(
-                self.service.as_ref(),
-                &req.command,
-                &command_id,
-                wait_input,
-                session,
-            )
-            .await
-            {
-                Ok(result) => Ok(Response::new(GrpcResponse {
-                    status: 200,
-                    body: super::wait_path::wait_path_response(&result).to_string(),
-                })),
-                Err(e) => {
-                    let status = e.status_code();
-                    if status >= 500 {
-                        eprintln!("microsvc command `{}` failed: {e}", req.command);
-                    }
-                    Ok(Response::new(GrpcResponse {
-                        status: status as u32,
-                        body: super::wait_path::wait_path_error_response(&e).to_string(),
-                    }))
-                }
-            };
-        }
-
-        match self.service.dispatch(&req.command, input, session).await {
-            Ok(value) => Ok(Response::new(GrpcResponse {
+        match super::wait_path::dispatch_wait_path(
+            self.service.as_ref(),
+            &req.command,
+            &command_id,
+            input,
+            session,
+        )
+        .await
+        {
+            Ok(result) => Ok(Response::new(GrpcResponse {
                 status: 200,
-                body: value.to_string(),
+                body: super::wait_path::wait_path_response(&result).to_string(),
             })),
             Err(e) => {
-                // Mirror the HTTP transport: never leak internal error detail
-                // (SQL/driver text) to clients. Server-internal failures are
-                // masked; client-fault errors keep their descriptive message.
+                // Mirror the HTTP transport: the error body never carries
+                // internal error detail (SQL/driver text).
                 let status = e.status_code();
                 if status >= 500 {
                     eprintln!("microsvc command `{}` failed: {e}", req.command);
                 }
                 Ok(Response::new(GrpcResponse {
                     status: status as u32,
-                    body: json!({ "error": e.client_facing_message() }).to_string(),
+                    body: super::wait_path::wait_path_error_response(&e).to_string(),
                 }))
             }
         }

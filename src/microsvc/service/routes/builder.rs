@@ -36,18 +36,17 @@ where
     }
 }
 
-/// Builder returned by [`Routes::command`], [`Routes::event`],
-/// [`Routes::events`], and [`Routes::handler`].
-pub struct RouteBuilder<D> {
+/// Builder returned by [`Routes::event`] and [`Routes::events`].
+pub struct EventRouteBuilder<D> {
     pub(super) routes: Routes<D>,
     pub(super) spec: HandlerSpec,
 }
 
 /// Builder returned by [`Routes::typed_command`].
 ///
-/// Unlike a legacy JSON route, the declaration and executable handler share
-/// one route object, the same input and committed-outcome types, and the route
-/// bundle's single aggregate repository.
+/// The declaration and executable handler share one route object, the same
+/// input and committed-outcome types, and the route bundle's single
+/// aggregate repository.
 pub struct TypedRouteBuilder<D, I, K: CommandOutcome> {
     pub(super) routes: Routes<D>,
     pub(super) route_name: &'static str,
@@ -57,14 +56,14 @@ pub struct TypedRouteBuilder<D, I, K: CommandOutcome> {
     pub(super) _types: std::marker::PhantomData<fn(I) -> K>,
 }
 
-impl<D: Send + Sync + 'static> RouteBuilder<D> {
+impl<D: Send + Sync + 'static> EventRouteBuilder<D> {
     /// Register an async handler without a guard.
     pub fn handle<F>(self, handler: F) -> Routes<D>
     where
         F: for<'a> Handler<'a, D> + 'static,
     {
         self.routes
-            .register_handler(self.spec, None, boxed_handler(handler))
+            .register_event_handler(self.spec, None, boxed_handler(handler))
     }
 
     /// Register an async handler with a (synchronous) guard.
@@ -74,7 +73,7 @@ impl<D: Send + Sync + 'static> RouteBuilder<D> {
         F: for<'a> Handler<'a, D> + 'static,
     {
         self.routes
-            .register_handler(self.spec, Some(Arc::new(guard)), boxed_handler(handler))
+            .register_event_handler(self.spec, Some(Arc::new(guard)), boxed_handler(handler))
     }
 }
 

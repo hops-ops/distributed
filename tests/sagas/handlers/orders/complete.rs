@@ -2,13 +2,20 @@ use super::*;
 
 pub const COMMAND: &str = "order.complete";
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["saga_id", "order_id"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub order_id: String,
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<CompleteOrderMsg>()?;
+/// Delivered by the saga over the bus, so it declares the transport role.
+pub fn command() -> TypedCommand<CompleteOrderMsg, Succeeded<Output>> {
+    typed_command::<CompleteOrderMsg, Succeeded<Output>>(COMMAND).roles([TRANSPORT_ROLE])
+}
 
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Order>,
+    input: CompleteOrderMsg,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
     let mut order = ctx
         .repo()
         .get(&input.order_id)
@@ -28,6 +35,7 @@ pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
         },
     )?;
 
-    ctx.repo().outbox(msg).commit(&mut order).await?;
-    Ok(json!({ "order_id": input.order_id }))
+    ctx.repo().outbox(msg).commit(order)?.succeeded(Output {
+        order_id: input.order_id,
+    })
 }

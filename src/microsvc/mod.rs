@@ -1,57 +1,66 @@
 //! microsvc — Convention-based microservice command handler framework.
 //!
-//! Build microservices by registering command and event handlers on typed
+//! Build microservices by registering typed commands and event handlers on
 //! `Routes<D>` bundles, then adding those bundles to a deployment-level
-//! `Service`. Each handler receives a `Context<D>` with access to the input
+//! `Service`. A command handler receives a `CausalCommandContext` and its
+//! decoded input; an event handler receives a `Context<D>` with access to the
 //! payload, session variables, and its route dependencies.
 //!
 //! ## Quick Start
 //!
-//! Dispatch is **async** — `dispatch`, `handle`, and the commit path all return
-//! futures and are awaited.
+//! Every command is typed, authorized by its declared roles, and recorded in
+//! the command ledger under the caller's command ID. Dispatch is **async**.
 //!
 //! ```ignore
 //! use std::sync::Arc;
+//! use distributed::command::typed_command;
+//! use distributed::command_dispatch::VerifiedPrincipal;
 //! use distributed::{microsvc, InMemoryRepository};
 //! use serde_json::json;
 //!
 //! let routes = microsvc::Routes::new()
 //!     .with_repo(InMemoryRepository::new().queued().aggregate::<Order>())
-//!     .command("order.create")
-//!     .handle(|ctx| {
-//!         let input = ctx.input::<CreateOrderInput>();
-//!         async move { Ok(json!({ "id": input?.id })) }
-//!     });
-//! let service = Arc::new(microsvc::Service::new().routes(routes));
+//!     .typed_command(typed_command::<CreateOrder, Succeeded<OrderCreated>>("order.create"))
+//!     .handle(order_create::handle);
+//! let service = Arc::new(microsvc::Service::new().named("orders").routes(routes));
 //!
-//! // Direct dispatch (async)
+//! // In-process dispatch (async): the caller supplies a UUIDv7 command ID
+//! // and the principal it already verified.
 //! let result = service
-//!     .dispatch("order.create", json!({ "id": "o1" }), microsvc::Session::new())
+//!     .dispatch_causal(
+//!         "order.create",
+//!         "0190a000-0000-7000-8000-000000000001",
+//!         json!({ "id": "o1" }),
+//!         microsvc::Session::new(),
+//!         VerifiedPrincipal::internal("orders-job")?,
+//!     )
 //!     .await?;
 //!
-//! // HTTP transport (requires "http" feature)
+//! // HTTP transport (requires "http" feature): POST /order.create with
+//! // { "commandId": "...", "input": { "id": "o1" } }
 //! // microsvc::serve(service, "0.0.0.0:3000").await?;
 //! ```
 //!
 //! ## Handler Convention
 //!
-//! Each handler file follows this convention. `handle` is **async**:
+//! Each command handler file follows this convention. `handle` is **async**:
 //!
 //! ```ignore
 //! // src/handlers/order_create.rs
 //!
 //! pub const COMMAND: &str = "order.create";
 //!
-//! pub fn guard(ctx: &microsvc::Context<Repo>) -> bool {
-//!     ctx.has_fields(&["id", "product_id"])
+//! pub fn command() -> TypedCommand<CreateOrder, Succeeded<OrderCreated>> {
+//!     typed_command::<CreateOrder, Succeeded<OrderCreated>>(COMMAND).roles(["user"])
 //! }
 //!
-//! pub async fn handle(ctx: &microsvc::Context<'_, Repo>) -> Result<Value, microsvc::HandlerError> {
-//!     let input = ctx.input::<CreateOrderInput>()?;
-//!     let mut order = Order::default();
-//!     order.create(input.id)?;
-//!     ctx.repo().commit(&mut order).await?;
-//!     Ok(json!({ "id": order.entity().id() }))
+//! pub async fn handle(
+//!     ctx: &microsvc::CausalCommandContext<'_, Order>,
+//!     input: CreateOrder,
+//! ) -> Result<PreparedCommand<Succeeded<OrderCreated>>, microsvc::HandlerError> {
+//!     let mut order = ctx.repo().create();
+//!     order.create(input.id.clone())?;
+//!     ctx.repo().commit(order)?.succeeded(OrderCreated { id: input.id })
 //! }
 //! ```
 
@@ -105,8 +114,8 @@ pub(crate) use service::ExternalCausalReservation;
 pub use service::GraphqlServiceBindError;
 pub use service::{
     invoke_transition, load_for_command, require_loaded, CausalCommandContext, CausalCommitBuilder,
-    CausalRepository, CommandLoad, DeliveryKind, HandlerNames, HandlerSpec, PortableCommand,
-    PreparedCausalCommit, PreparedCommandHandler, RouteBuilder, Routes, Service,
+    CausalRepository, CommandLoad, DeliveryKind, EventRouteBuilder, HandlerNames, HandlerSpec,
+    PortableCommand, PreparedCausalCommit, PreparedCommandHandler, Routes, Service,
     ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded, TypedRouteBuilder,
     DEFAULT_DELIVERY_LANE,
 };
@@ -159,14 +168,11 @@ pub mod grpc;
 #[cfg(feature = "grpc")]
 pub use grpc::{grpc_server, serve_grpc, GrpcServeError};
 
-/// Register handler modules with a route bundle using the convention pattern.
+/// Register event handler modules with a route bundle using the convention
+/// pattern.
 ///
-/// Each handler entry must be prefixed with `command`, `event`, or `events`.
-///
-/// Command handler modules must export:
-/// - `COMMAND: &str` — the command name
-/// - `guard(ctx) -> bool` — input validation
-/// - `handle(ctx) -> Result<Value, HandlerError>` — the handler
+/// Each handler entry must be prefixed with `event` or `events`. Commands
+/// are registered on the route bundle with [`Routes::typed_command`].
 ///
 /// Event handler modules must export:
 /// - `EVENT: &str` or `EVENTS: &[&str]` — event names
@@ -176,13 +182,14 @@ pub use grpc::{grpc_server, serve_grpc, GrpcServeError};
 /// # Example
 /// ```ignore
 /// let routes = distributed::routes!(
-///     microsvc::Routes::new().with_repo(repo),
-///     command handlers::counter_create,
-///     command handlers::counter_increment,
+///     microsvc::Routes::new()
+///         .with_repo(repo)
+///         .typed_command(handlers::counter_create::command())
+///         .handle(handlers::counter_create::handle),
 ///     event handlers::counter_rebuilt,
 ///     events handlers::counter_projection,
 /// );
-/// let service = microsvc::Service::new().routes(routes);
+/// let service = microsvc::Service::new().named("counters").routes(routes);
 /// ```
 #[macro_export]
 macro_rules! routes {
@@ -197,15 +204,6 @@ macro_rules! routes {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __routes {
-    ($routes:expr, command $($seg:ident)::+ $(, $($rest:tt)*)?) => {
-        $crate::__routes_continue!(
-            $routes.command($($seg)::+::COMMAND).guarded(
-                $($seg)::+::guard,
-                $($seg)::+::handle,
-            )
-            $(, $($rest)*)?
-        )
-    };
     ($routes:expr, event $($seg:ident)::+ $(, $($rest:tt)*)?) => {
         $crate::__routes_continue!(
             $routes.event($($seg)::+::EVENT).guarded(
@@ -226,7 +224,7 @@ macro_rules! __routes {
     };
     ($routes:expr, $($seg:ident)::+ $(, $($rest:tt)*)?) => {
         compile_error!(
-            "routes! entries must be prefixed with `command`, `event`, or `events`"
+            "routes! entries must be prefixed with `event` or `events`"
         )
     };
 }

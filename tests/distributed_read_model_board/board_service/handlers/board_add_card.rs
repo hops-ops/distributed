@@ -1,19 +1,27 @@
-use distributed::microsvc::{Context, HandlerError};
-use serde_json::{json, Value};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{CausalCommandContext, HandlerError};
+use serde::Serialize;
 
 use crate::board_service::handlers::board_state_message;
-use crate::board_service::{AddCard, Board, BoardRepo};
+use crate::board_service::{AddCard, Board};
 
 pub const COMMAND: &str = "board.add_card";
 
-pub fn guard(ctx: &Context<BoardRepo>) -> bool {
-    ctx.has_fields(&["id", "card_id", "column", "title"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub id: String,
+    pub card_id: String,
 }
 
-pub async fn handle(ctx: &Context<'_, BoardRepo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<AddCard>()?;
+pub fn command() -> TypedCommand<AddCard, Succeeded<Output>> {
+    typed_command::<AddCard, Succeeded<Output>>(COMMAND)
+}
 
-    let mut board: Board = ctx
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Board>,
+    input: AddCard,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
+    let mut board = ctx
         .repo()
         .get(&input.id)
         .await?
@@ -27,7 +35,8 @@ pub async fn handle(ctx: &Context<'_, BoardRepo>) -> Result<Value, HandlerError>
     )?;
 
     let outbox = board_state_message(&board, "board.card_added")?;
-    ctx.repo().outbox(outbox).commit(&mut board).await?;
-
-    Ok(json!({ "id": input.id, "card_id": input.card_id }))
+    ctx.repo().outbox(outbox).commit(board)?.succeeded(Output {
+        id: input.id,
+        card_id: input.card_id,
+    })
 }

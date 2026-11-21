@@ -2,30 +2,36 @@
 //!
 //! Follows the microsvc handler convention:
 //! - `COMMAND` — the command name this handler responds to
-//! - `guard` — input validation (optional but conventional)
+//! - `command()` — the typed declaration: input, outcome and roles
 //! - `handle` — the command handler
 
-use distributed::microsvc::{Context, HandlerError};
-use serde::Deserialize;
-use serde_json::{json, Value};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{CausalCommandContext, HandlerError, TRANSPORT_ROLE};
+use serde::{Deserialize, Serialize};
 
-use super::{counter_state_message, Repo};
+use super::{counter_state_message, USER_ROLE};
 use crate::models::counter::Counter;
 
 pub const COMMAND: &str = "counter.initialize";
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct Input {
     pub id: String,
 }
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["id"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub id: String,
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<Input>()?;
+pub fn command() -> TypedCommand<Input, Succeeded<Output>> {
+    typed_command::<Input, Succeeded<Output>>(COMMAND).roles([USER_ROLE, TRANSPORT_ROLE])
+}
 
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: Input,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
     if ctx.repo().get(&input.id).await?.is_some() {
         return Err(HandlerError::Rejected(format!(
             "counter {} already exists",
@@ -33,12 +39,13 @@ pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
         )));
     }
 
-    let mut counter = Counter::default();
+    let mut counter = ctx.repo().create();
     counter.create(input.id.clone())?;
 
     let message = counter_state_message(&counter, "counter.initialized")?;
 
-    ctx.repo().outbox(message).commit(&mut counter).await?;
-
-    Ok(json!({ "id": input.id }))
+    ctx.repo()
+        .outbox(message)
+        .commit(counter)?
+        .succeeded(Output { id: input.id })
 }

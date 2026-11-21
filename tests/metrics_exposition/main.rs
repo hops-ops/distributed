@@ -19,13 +19,25 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use distributed::bus::{MessagePublisher, TransportError};
-use distributed::microsvc::{self, Context, Message, Routes, Service};
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::{self, CausalCommandContext, HandlerError, Message, Routes, Service};
 use distributed::outbox_worker::OutboxDispatcher;
 use distributed::{CommitBatch, InMemoryRepository, OutboxMessage, TransactionalCommit};
 use serde_json::json;
 
 #[path = "../support/env.rs"]
 mod env_support;
+
+#[derive(Debug, serde::Deserialize, distributed::CommandInput)]
+struct CreateOrder {
+    #[allow(dead_code)] // the request shape; the handler ignores it
+    id: String,
+}
+
+#[derive(Debug, serde::Serialize, distributed::CommandOutput)]
+struct OrderCreated {
+    ok: bool,
+}
 
 /// Publisher that fails ids containing "poison" and accepts the rest.
 struct SelectivePublisher {
@@ -44,15 +56,22 @@ impl MessagePublisher for SelectivePublisher {
 }
 
 async fn spawn_http_service(name: &str) -> String {
+    let ledger = InMemoryRepository::new();
     let service = Arc::new(
         Service::new()
             .named(name)
             .with_http_command_routes()
             .routes(
-                Routes::new()
-                    .with_dependencies(())
-                    .command("orders.create")
-                    .handle(|_ctx: &Context<()>| async move { Ok(json!({"ok": true})) }),
+                Routes::for_stores(ledger.clone(), ledger)
+                    .typed_command(typed_command::<CreateOrder, Succeeded<OrderCreated>>(
+                        "orders.create",
+                    ))
+                    .handle(
+                        |_ctx: &CausalCommandContext<'_, ()>, _input: CreateOrder| async move {
+                            PreparedCommand::prepare(OrderCreated { ok: true })
+                                .map_err(|error| HandlerError::Other(Box::new(error)))
+                        },
+                    ),
             ),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -98,10 +117,15 @@ async fn exposition_covers_framework_families_and_passes_promtool() {
     let client = reqwest::Client::new();
 
     // Successful dispatches populate the counter and duration histogram.
-    for _ in 0..2 {
+    for attempt in 1..=2 {
         let resp = client
             .post(format!("{base}/orders.create"))
-            .json(&json!({"id": "o-1"}))
+            // The identity a trusted proxy injects.
+            .header("x-user-id", "user-1")
+            .json(&json!({
+                "commandId": format!("0190a000-0000-7000-8000-00000000000{attempt}"),
+                "input": { "id": "o-1" },
+            }))
             .send()
             .await
             .unwrap();
@@ -110,7 +134,8 @@ async fn exposition_covers_framework_families_and_passes_promtool() {
     // An unknown command populates the failure status bucket.
     let resp = client
         .post(format!("{base}/orders.unknown"))
-        .json(&json!({}))
+        .header("x-user-id", "user-1")
+        .json(&json!({ "commandId": "0190a000-0000-7000-8000-000000000003", "input": {} }))
         .send()
         .await
         .unwrap();

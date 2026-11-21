@@ -6,10 +6,14 @@
 
 #![cfg(feature = "sqlite")]
 
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
-use distributed::bus::{Bus, BusConsumer, Handlers, InMemoryBus, Message, RunOptions};
-use distributed::microsvc::{Context, HandlerError, HasOutboxStore, Routes, Service, Session};
+use distributed::bus::{Bus, BusConsumer, Handlers, InMemoryBus, Message, MessageKind, RunOptions};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{
+    CausalCommandContext, HandlerError, HasOutboxStore, Routes, Service, Session, TRANSPORT_ROLE,
+};
 use distributed::{
     sourced, AggregateBuilder, AggregateRepository, Entity, OutboxMessage, OutboxMessageStatus,
     OutboxStore, Queueable, QueuedRepository, SqliteRepository,
@@ -33,13 +37,34 @@ impl Counter {
 
 type Repo = AggregateRepository<QueuedRepository<SqliteRepository>, Counter>;
 
-// Named fn (not a closure) so the higher-ranked `Handler` bound resolves.
-async fn handle_touch(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let mut counter = Counter::default();
+#[path = "../support/commands.rs"]
+mod commands;
+
+#[derive(Debug, Deserialize, distributed::CommandInput)]
+struct Touch {}
+
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+struct Touched {
+    value: i64,
+}
+
+/// Dispatched in-process with no role, and delivered by the bus.
+fn touch() -> TypedCommand<Touch, Succeeded<Touched>> {
+    typed_command::<Touch, Succeeded<Touched>>("counter.touch")
+}
+
+async fn handle_touch(
+    ctx: &CausalCommandContext<'_, Counter>,
+    _input: Touch,
+) -> Result<PreparedCommand<Succeeded<Touched>>, HandlerError> {
+    let mut counter = ctx.repo().create();
     counter.touch("c1".to_string())?;
     let message = OutboxMessage::create("evt-c1", "counter.touched", b"{}".to_vec())?;
-    ctx.repo().outbox(message).commit(&mut counter).await?;
-    Ok(json!({ "value": counter.value }))
+    let value = counter.value;
+    ctx.repo()
+        .outbox(message)
+        .commit(counter)?
+        .succeeded(Touched { value })
 }
 
 async fn service() -> Repo {
@@ -91,18 +116,18 @@ async fn commit_publishes_immediately_over_sqlite() {
     let repo = service().await;
     let store = repo.outbox_store();
     let service = Service::new()
+        .named("counters")
         .routes(
             Routes::new()
                 .with_repo(repo)
-                .command("counter.touch")
+                .typed_command(touch())
                 .handle(handle_touch),
         )
         .with_bus(bus.clone());
 
     // Command completion returns at durable commit; the bounded worker
     // claims the pending row and publishes it.
-    service
-        .dispatch("counter.touch", json!({}), Session::new())
+    commands::dispatch(&service, "counter.touch", json!({}), Session::new())
         .await
         .unwrap();
 
@@ -119,17 +144,22 @@ async fn run_consumes_command_and_publishes_over_sqlite() {
     let repo = service().await;
     let store = repo.outbox_store();
     let service = Service::new()
+        .named("counters")
         .routes(
             Routes::new()
                 .with_repo(repo)
-                .command("counter.touch")
+                .typed_command(touch().roles([TRANSPORT_ROLE]))
                 .handle(handle_touch),
         )
         .with_bus(bus.clone());
 
     // Enqueue a command, then run: listen is derived from the registered command,
     // drains it, and the handler publishes its outbox row through the bus.
-    bus.send("counter.touch", b"{}".to_vec()).await.unwrap();
+    bus.send_message(
+        Message::new("counter.touch", MessageKind::Command, b"{}".to_vec()).with_id("cmd-1"),
+    )
+    .await
+    .unwrap();
     service.run(RunOptions::until_idle()).await.unwrap();
 
     assert_published_and_drained(&store, &bus).await;

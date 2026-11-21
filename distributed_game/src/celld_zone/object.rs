@@ -2404,6 +2404,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
             "players": host.map_or(0, |h| h.player_count()),
             "observers": host.map_or(0, |h| h.observer_count()),
             "near": inner.near.len(),
+            "pendingWork": host.is_some_and(|h| h.zone().has_pending_work()),
             "tick": host.map_or(0, |h| h.tick()),
             "hz": inner.options.as_ref().map_or(0, |o| o.tick_hz),
             "ticking": inner.ticking,

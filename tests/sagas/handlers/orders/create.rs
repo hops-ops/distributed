@@ -2,14 +2,21 @@ use super::*;
 
 pub const COMMAND: &str = "order.initialize";
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["saga_id", "order_id", "customer_id", "items"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub order_id: String,
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<CreateOrderMsg>()?;
+/// Delivered by the saga over the bus, so it declares the transport role.
+pub fn command() -> TypedCommand<CreateOrderMsg, Succeeded<Output>> {
+    typed_command::<CreateOrderMsg, Succeeded<Output>>(COMMAND).roles([TRANSPORT_ROLE])
+}
 
-    let mut order = Order::new();
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Order>,
+    input: CreateOrderMsg,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
+    let mut order = ctx.repo().create();
     order.create(input.order_id.clone(), input.customer_id, input.items)?;
 
     let msg = json_outbox_to(
@@ -22,6 +29,7 @@ pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
         },
     )?;
 
-    ctx.repo().outbox(msg).commit(&mut order).await?;
-    Ok(json!({ "order_id": input.order_id }))
+    ctx.repo().outbox(msg).commit(order)?.succeeded(Output {
+        order_id: input.order_id,
+    })
 }

@@ -1,12 +1,15 @@
 //! Microservice Saga Tests
 //!
-//! Demonstrates the `routes!` convention with handler files
-//! organized by service domain under `handlers/`.
+//! Demonstrates handler files organized by service domain under
+//! `handlers/`: typed commands (`command()` + `handle`) and, for the saga,
+//! event handlers registered with `routes!`.
 //!
 //! Each route bundle is typed to a specific aggregate via
 //! `Routes::new().with_repo(repo.queued().aggregate::<T>())`, so handlers access
 //! `ctx.repo().get()`, `ctx.repo().commit()`, etc. directly while `Service`
-//! remains a non-generic deployment router.
+//! remains a non-generic deployment router. The commands the saga sends to
+//! the other services declare the transport role: a bus delivers them, and
+//! the command ledger deduplicates on the message id.
 //!
 //! Two tests:
 //! 1. **Orchestrated** — test runner dispatches commands to each service
@@ -24,8 +27,20 @@ use distributed::{
     OutboxStore, Queueable,
 };
 
+use super::commands::dispatch;
 use super::handlers;
 use super::order::{Inventory, Order, OrderFulfillmentSaga, OrderStatus, Payment, SagaStatus};
+
+/// A command as a bus delivers it: a message with an id, which the command
+/// ledger deduplicates on.
+fn command_message(name: &str, input: serde_json::Value) -> Message {
+    Message::new(
+        name,
+        MessageKind::Command,
+        serde_json::to_vec(&input).unwrap(),
+    )
+    .with_id(format!("{name}:test-runner"))
+}
 
 fn event_message(name: &str, input: serde_json::Value) -> Message {
     Message::new(
@@ -39,7 +54,7 @@ fn event_message(name: &str, input: serde_json::Value) -> Message {
 // Test 1: Orchestrated — test runner dispatches to each service in sequence
 // ============================================================================
 
-/// Test runner plays the role of the message bus, dispatching each command
+/// Test runner plays the role of the message bus, delivering each command
 /// in the correct order.  Outbox messages are created but ignored (no workers).
 ///
 /// ```text
@@ -55,9 +70,11 @@ fn event_message(name: &str, input: serde_json::Value) -> Message {
 #[tokio::test]
 async fn saga_orchestrated() {
     let saga_repo = InMemoryRepository::new();
-    let saga_svc = Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(saga_repo.clone().queued().aggregate::<OrderFulfillmentSaga>()),
-        command handlers::saga::start,
+    let saga_svc = Service::new().named("saga").routes(distributed::routes!(
+        Routes::new()
+            .with_repo(saga_repo.clone().queued().aggregate::<OrderFulfillmentSaga>())
+            .typed_command(handlers::saga::start::command())
+            .handle(handlers::saga::start::handle),
         event handlers::saga::on_order_created,
         event handlers::saga::on_inventory_reserved,
         event handlers::saga::on_payment_succeeded,
@@ -65,56 +82,62 @@ async fn saga_orchestrated() {
     ));
 
     let order_repo = InMemoryRepository::new();
-    let order_svc = Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(order_repo.clone().queued().aggregate::<Order>()),
-        command handlers::orders::create,
-        command handlers::orders::complete,
-    ));
+    let order_svc = Service::new().named("orders").routes(
+        Routes::new()
+            .with_repo(order_repo.clone().queued().aggregate::<Order>())
+            .typed_command(handlers::orders::create::command())
+            .handle(handlers::orders::create::handle)
+            .typed_command(handlers::orders::complete::command())
+            .handle(handlers::orders::complete::handle),
+    );
 
     let inventory_repo = InMemoryRepository::new();
-    let inventory_svc = Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(inventory_repo.clone().queued().aggregate::<Inventory>()),
-        command handlers::inventory::init,
-        command handlers::inventory::reserve,
-    ));
+    let inventory_svc = Service::new().named("inventory").routes(
+        Routes::new()
+            .with_repo(inventory_repo.clone().queued().aggregate::<Inventory>())
+            .typed_command(handlers::inventory::init::command())
+            .handle(handlers::inventory::init::handle)
+            .typed_command(handlers::inventory::reserve::command())
+            .handle(handlers::inventory::reserve::handle),
+    );
 
     let payment_repo = InMemoryRepository::new();
-    let payment_svc = Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(payment_repo.clone().queued().aggregate::<Payment>()),
-        command handlers::payments::process,
-    ));
-
-    let s = Session::new;
+    let payment_svc = Service::new().named("payments").routes(
+        Routes::new()
+            .with_repo(payment_repo.clone().queued().aggregate::<Payment>())
+            .typed_command(handlers::payments::process::command())
+            .handle(handlers::payments::process::handle),
+    );
 
     // 1. Initialize inventory
-    inventory_svc
-        .dispatch(
-            "inventory.initialize",
-            json!({ "sku": "WIDGET-001", "stock": 100 }),
-            s(),
-        )
-        .await
-        .unwrap();
+    dispatch(
+        &inventory_svc,
+        "inventory.initialize",
+        json!({ "sku": "WIDGET-001", "stock": 100 }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
 
     // 2. Start saga → creates saga + outbox(CreateOrder)
-    saga_svc
-        .dispatch(
-            "saga.start",
-            json!({
-                "saga_id": "saga-001",
-                "order_id": "order-001",
-                "customer_id": "customer-001",
-                "items": [{ "sku": "WIDGET-001", "quantity": 5, "price_cents": 1000 }],
-                "total_cents": 5000
-            }),
-            s(),
-        )
-        .await
-        .unwrap();
+    dispatch(
+        &saga_svc,
+        "saga.start",
+        json!({
+            "saga_id": "saga-001",
+            "order_id": "order-001",
+            "customer_id": "customer-001",
+            "items": [{ "sku": "WIDGET-001", "quantity": 5, "price_cents": 1000 }],
+            "total_cents": 5000
+        }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
 
     // 3. Create order -> outbox(order.initialized)
     order_svc
-        .dispatch(
+        .dispatch_message(&command_message(
             "order.initialize",
             json!({
                 "saga_id": "saga-001",
@@ -123,8 +146,7 @@ async fn saga_orchestrated() {
                 "items": [{ "sku": "WIDGET-001", "quantity": 5, "price_cents": 1000 }],
                 "total_cents": 5000
             }),
-            s(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -139,7 +161,7 @@ async fn saga_orchestrated() {
 
     // 5. Reserve inventory → outbox(InventoryReserved)
     inventory_svc
-        .dispatch(
+        .dispatch_message(&command_message(
             "inventory.reserve",
             json!({
                 "saga_id": "saga-001",
@@ -147,8 +169,7 @@ async fn saga_orchestrated() {
                 "sku": "WIDGET-001",
                 "quantity": 5
             }),
-            s(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -163,15 +184,14 @@ async fn saga_orchestrated() {
 
     // 7. Process payment → outbox(PaymentSucceeded)
     payment_svc
-        .dispatch(
+        .dispatch_message(&command_message(
             "payment.process",
             json!({
                 "saga_id": "saga-001",
                 "order_id": "order-001",
                 "amount_cents": 5000
             }),
-            s(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -186,11 +206,10 @@ async fn saga_orchestrated() {
 
     // 9. Complete order → outbox(OrderCompleted)
     order_svc
-        .dispatch(
+        .dispatch_message(&command_message(
             "order.complete",
             json!({ "saga_id": "saga-001", "order_id": "order-001" }),
-            s(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -305,9 +324,11 @@ async fn saga_distributed() {
     // === SAGA SERVICE ===
     let saga_repo = InMemoryRepository::new();
     let saga_outbox = saga_repo.outbox_store();
-    let saga_svc = Arc::new(Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(saga_repo.clone().queued().aggregate::<OrderFulfillmentSaga>()),
-        command handlers::saga::start,
+    let saga_svc = Arc::new(Service::new().named("saga").routes(distributed::routes!(
+        Routes::new()
+            .with_repo(saga_repo.clone().queued().aggregate::<OrderFulfillmentSaga>())
+            .typed_command(handlers::saga::start::command())
+            .handle(handlers::saga::start::handle),
         event handlers::saga::on_order_created,
         event handlers::saga::on_inventory_reserved,
         event handlers::saga::on_payment_succeeded,
@@ -317,11 +338,16 @@ async fn saga_distributed() {
     // === ORDER SERVICE ===
     let order_repo = InMemoryRepository::new();
     let order_outbox = order_repo.outbox_store();
-    let order_svc = Arc::new(Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(order_repo.clone().queued().aggregate::<Order>()),
-        command handlers::orders::create,
-        command handlers::orders::complete,
-    )));
+    let order_svc = Arc::new(
+        Service::new().named("orders").routes(
+            Routes::new()
+                .with_repo(order_repo.clone().queued().aggregate::<Order>())
+                .typed_command(handlers::orders::create::command())
+                .handle(handlers::orders::create::handle)
+                .typed_command(handlers::orders::complete::command())
+                .handle(handlers::orders::complete::handle),
+        ),
+    );
 
     // === INVENTORY SERVICE (pre-seeded) ===
     let inventory_repo = InMemoryRepository::new();
@@ -332,35 +358,44 @@ async fn saga_distributed() {
         inv.initialize("WIDGET-001".to_string(), 100).unwrap();
         tmp.commit(&mut inv).await.unwrap();
     }
-    let inventory_svc = Arc::new(Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(inventory_repo.clone().queued().aggregate::<Inventory>()),
-        command handlers::inventory::init,
-        command handlers::inventory::reserve,
-    )));
+    let inventory_svc = Arc::new(
+        Service::new().named("inventory").routes(
+            Routes::new()
+                .with_repo(inventory_repo.clone().queued().aggregate::<Inventory>())
+                .typed_command(handlers::inventory::init::command())
+                .handle(handlers::inventory::init::handle)
+                .typed_command(handlers::inventory::reserve::command())
+                .handle(handlers::inventory::reserve::handle),
+        ),
+    );
 
     // === PAYMENT SERVICE ===
     let payment_repo = InMemoryRepository::new();
     let payment_outbox = payment_repo.outbox_store();
-    let payment_svc = Arc::new(Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(payment_repo.clone().queued().aggregate::<Payment>()),
-        command handlers::payments::process,
-    )));
+    let payment_svc = Arc::new(
+        Service::new().named("payments").routes(
+            Routes::new()
+                .with_repo(payment_repo.clone().queued().aggregate::<Payment>())
+                .typed_command(handlers::payments::process::command())
+                .handle(handlers::payments::process::handle),
+        ),
+    );
 
     // === START THE SAGA ===
-    saga_svc
-        .dispatch(
-            "saga.start",
-            json!({
-                "saga_id": "saga-001",
-                "order_id": "order-001",
-                "customer_id": "customer-001",
-                "items": [{ "sku": "WIDGET-001", "quantity": 5, "price_cents": 1000 }],
-                "total_cents": 5000
-            }),
-            Session::new(),
-        )
-        .await
-        .unwrap();
+    dispatch(
+        &saga_svc,
+        "saga.start",
+        json!({
+            "saga_id": "saga-001",
+            "order_id": "order-001",
+            "customer_id": "customer-001",
+            "items": [{ "sku": "WIDGET-001", "quantity": 5, "price_cents": 1000 }],
+            "total_cents": 5000
+        }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
 
     // === DRIVE THE CHOREOGRAPHY OVER THE BUS UNTIL QUIESCENT ===
     let mut reached_quiescence = false;

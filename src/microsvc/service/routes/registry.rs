@@ -8,7 +8,7 @@ use super::super::causal::{
 use super::super::handlers::{
     CausalGuardFn, GuardFn, HandlerFn, HandlerFuture, PreparedHandlerFn, ProjectorBootstrapFuture,
 };
-use super::builder::{PortableCommand, RouteBuilder, TypedRouteBuilder};
+use super::builder::{EventRouteBuilder, PortableCommand, TypedRouteBuilder};
 use super::erased::{
     CausalCommandPolicy, CausalHandlerFuture, ErasedCausalHandler, ErasedRoutes,
     ExternalAbandonFuture, ExternalCompletionFuture, ExternalReservationFuture, LedgerCompaction,
@@ -57,7 +57,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 enum RegisteredHandler<D> {
-    Legacy {
+    Event {
         guard: Option<Arc<GuardFn<D>>>,
         handle: Arc<HandlerFn<D>>,
     },
@@ -134,11 +134,6 @@ impl<D: Send + Sync + 'static> Routes<D> {
         D: HasReadModelStore,
     {
         self.dependencies.read_model_store()
-    }
-
-    /// Start registering a command handler that consumes JSON payload input.
-    pub fn command(self, name: &'static str) -> RouteBuilder<D> {
-        self.handler(HandlerSpec::command(name))
     }
 
     /// Install a domain-owned command declaration onto this host bundle.
@@ -346,19 +341,20 @@ impl<D: Send + Sync + 'static> Routes<D> {
     }
 
     /// Start registering an event handler that consumes JSON payload input.
-    pub fn event(self, name: &'static str) -> RouteBuilder<D> {
-        self.handler(HandlerSpec::event(name))
+    pub fn event(self, name: &'static str) -> EventRouteBuilder<D> {
+        EventRouteBuilder {
+            routes: self,
+            spec: HandlerSpec::event(name),
+        }
     }
 
     /// Start registering an event handler for several event names that consume JSON
     /// payload input.
-    pub fn events(self, names: &'static [&'static str]) -> RouteBuilder<D> {
-        self.handler(HandlerSpec::events(names))
-    }
-
-    /// Start registering a handler from a transport-visible spec.
-    pub fn handler(self, spec: HandlerSpec) -> RouteBuilder<D> {
-        RouteBuilder { routes: self, spec }
+    pub fn events(self, names: &'static [&'static str]) -> EventRouteBuilder<D> {
+        EventRouteBuilder {
+            routes: self,
+            spec: HandlerSpec::events(names),
+        }
     }
 
     /// The typed causal handler registered for `command`.
@@ -378,7 +374,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
         }
     }
 
-    pub(super) fn register_handler(
+    pub(super) fn register_event_handler(
         mut self,
         spec: HandlerSpec,
         guard: Option<Arc<GuardFn<D>>>,
@@ -398,7 +394,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
         for name in names {
             by_name.insert(
                 name.to_string(),
-                RegisteredHandler::Legacy {
+                RegisteredHandler::Event {
                     guard: guard.clone(),
                     handle: handle.clone(),
                 },
@@ -509,7 +505,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
                             .then_with(|| left.digest().cmp(&right.digest()))
                     });
                 }
-                Some(RegisteredHandler::Legacy { .. } | RegisteredHandler::Causal(_)) => {
+                Some(RegisteredHandler::Event { .. } | RegisteredHandler::Causal(_)) => {
                     panic!(
                         "causal projector route {:?} `{name}` collides with a non-projector handler",
                         MessageKind::Event
@@ -534,7 +530,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
             .flat_map(HashMap::values)
             .filter_map(|handler| match handler {
                 RegisteredHandler::Causal(handler) => Some(handler.as_ref()),
-                RegisteredHandler::Legacy { .. } | RegisteredHandler::Projector(_) => None,
+                RegisteredHandler::Event { .. } | RegisteredHandler::Projector(_) => None,
             })
     }
 
@@ -567,10 +563,16 @@ impl<D: Send + Sync + 'static> Routes<D> {
                 .and_then(|by_name| by_name.get(message.name.as_str()))
                 .ok_or_else(|| HandlerError::UnknownCommand(message.name.clone()))?;
             match handler {
-                RegisteredHandler::Legacy { guard, handle } => (guard.clone(), handle.clone()),
+                RegisteredHandler::Event { guard, handle } => (guard.clone(), handle.clone()),
                 RegisteredHandler::Causal(_) => {
-                    return Err(HandlerError::Unauthorized(
-                        "typed causal commands require a verified GraphQL bearer envelope".into(),
+                    // The service runs commands through the ledger and
+                    // never routes one here.
+                    return Err(HandlerError::Other(
+                        format!(
+                            "command `{}` runs through the command ledger, not as a message handler",
+                            message.name
+                        )
+                        .into(),
                     ));
                 }
                 RegisteredHandler::Projector(projectors) => {
@@ -982,7 +984,7 @@ where
                     Some(handler.storage_identity(&self.dependencies))
                 }
                 RegisteredHandler::Causal(_)
-                | RegisteredHandler::Legacy { .. }
+                | RegisteredHandler::Event { .. }
                 | RegisteredHandler::Projector(_) => None,
             })
             .collect()

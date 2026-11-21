@@ -484,14 +484,10 @@ impl CommandOutputType for CausalLifecycleView {
     }
 }
 
-static TYPED_HANDLER_INVOKED: AtomicBool = AtomicBool::new(false);
-static TYPED_GUARD_INVOKED: AtomicBool = AtomicBool::new(false);
-
 async fn typed_handler(
     _context: &CausalCommandContext<'_, RouteComboAggregate>,
     input: TypedInput,
 ) -> Result<PreparedCommand<Succeeded<TypedOutput>>, HandlerError> {
-    TYPED_HANDLER_INVOKED.store(true, Ordering::SeqCst);
     Ok(PreparedCommand::prepare(TypedOutput { id: input.id }).unwrap())
 }
 
@@ -927,6 +923,56 @@ fn test_service(routes: Routes<()>) -> Service {
     Service::new().routes(routes)
 }
 
+/// Dependencies of a route bundle whose commands touch no aggregate.
+type StoreDeps =
+    RepoReadModelDependencies<AggregateRepository<InMemoryRepository, ()>, InMemoryRepository>;
+
+fn command_routes() -> Routes<StoreDeps> {
+    let repository = InMemoryRepository::new();
+    Routes::for_stores(repository.clone(), repository)
+}
+
+fn command_service(routes: Routes<StoreDeps>) -> Service {
+    Service::new().named("tests").routes(routes)
+}
+
+#[derive(Deserialize, crate::CommandInput)]
+struct NoInput {}
+
+#[derive(Serialize, crate::CommandOutput)]
+struct Pong {
+    pong: bool,
+}
+
+fn pong_command(name: &'static str) -> crate::command::TypedCommand<NoInput, Succeeded<Pong>> {
+    typed_command::<NoInput, Succeeded<Pong>>(name)
+}
+
+async fn pong(
+    _context: &CausalCommandContext<'_, ()>,
+    _input: NoInput,
+) -> Result<PreparedCommand<Succeeded<Pong>>, HandlerError> {
+    Ok(PreparedCommand::prepare(Pong { pong: true }).unwrap())
+}
+
+/// Dispatch one new command as the test principal.
+async fn dispatch_command(
+    service: &Service,
+    command: &str,
+    input: Value,
+    session: Session,
+) -> Result<Value, CausalDispatchError> {
+    service
+        .dispatch_causal(
+            command,
+            &causal_test_command_id(),
+            input,
+            session,
+            causal_test_principal(),
+        )
+        .await
+}
+
 #[test]
 fn named_service_preserves_identity_with_route_bundles() {
     let routes = Routes::new().with_read_model_store(crate::InMemoryRepository::new());
@@ -997,68 +1043,6 @@ fn service_compiles_exact_application_modules_from_command_namespaces() {
         Service::new().application("catalog", surface).is_err(),
         "a Surface cannot expose commands absent from the owning Service"
     );
-}
-
-#[tokio::test]
-async fn typed_direct_dispatch_fails_before_invoking_handler() {
-    TYPED_HANDLER_INVOKED.store(false, Ordering::SeqCst);
-    let service = Service::new().named("todos").routes(
-        Routes::new()
-            .with_repo(
-                InMemoryRepository::new()
-                    .queued()
-                    .aggregate::<RouteComboAggregate>(),
-            )
-            .typed_command(typed_command::<TypedInput, Succeeded<TypedOutput>>(
-                "todo.create",
-            ))
-            .handle(typed_handler),
-    );
-
-    let error = service
-        .dispatch("todo.create", json!({ "id": "todo-1" }), Session::new())
-        .await
-        .expect_err("typed causal commands must reject direct dispatch");
-
-    assert!(error.to_string().contains("verified GraphQL bearer"));
-    assert!(!TYPED_HANDLER_INVOKED.load(Ordering::SeqCst));
-}
-
-#[tokio::test]
-async fn typed_direct_dispatch_fails_before_invoking_guard_or_handler() {
-    TYPED_GUARD_INVOKED.store(false, Ordering::SeqCst);
-    TYPED_HANDLER_INVOKED.store(false, Ordering::SeqCst);
-    let service = Service::new().named("todos").routes(
-        Routes::new()
-            .with_repo(
-                InMemoryRepository::new()
-                    .queued()
-                    .aggregate::<RouteComboAggregate>(),
-            )
-            .typed_command(typed_command::<TypedInput, Succeeded<TypedOutput>>(
-                "todo.guarded_create",
-            ))
-            .guarded(
-                |_| {
-                    TYPED_GUARD_INVOKED.store(true, Ordering::SeqCst);
-                    true
-                },
-                typed_handler,
-            ),
-    );
-
-    let error = service
-        .dispatch(
-            "todo.guarded_create",
-            json!({ "id": "todo-1" }),
-            Session::new(),
-        )
-        .await
-        .expect_err("typed causal commands must reject before application guards");
-
-    assert!(error.to_string().contains("verified GraphQL bearer"));
-    assert!(!TYPED_GUARD_INVOKED.load(Ordering::SeqCst));
-    assert!(!TYPED_HANDLER_INVOKED.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -3659,10 +3643,16 @@ concurrent_write_tests!(
 #[tokio::test]
 async fn service_collects_route_bundles_with_different_dependencies() {
     let service = Service::new()
+        .named("tests")
+        .routes(
+            command_routes()
+                .typed_command(pong_command("stores.dep"))
+                .handle(pong),
+        )
         .routes(
             Routes::new()
                 .with_dependencies(String::from("orders"))
-                .command("string.dep")
+                .event("string.dep")
                 .handle(|ctx: &Context<String>| {
                     let dep = ctx.dependencies().clone();
                     async move { Ok(json!({ "dependency": dep })) }
@@ -3678,39 +3668,42 @@ async fn service_collects_route_bundles_with_different_dependencies() {
                 }),
         );
 
-    let command = service
-        .dispatch("string.dep", json!({}), Session::new())
+    let command = dispatch_command(&service, "stores.dep", json!({}), Session::new())
         .await
         .unwrap();
-    let event = service
-        .dispatch_message(&Message::new(
-            "number.dep",
-            MessageKind::Event,
-            br#"{}"#.to_vec(),
-        ))
-        .await
-        .unwrap();
+    let event = |name: &'static str| {
+        let service = &service;
+        async move {
+            service
+                .dispatch_message(&Message::new(name, MessageKind::Event, br#"{}"#.to_vec()))
+                .await
+                .unwrap()
+        }
+    };
 
-    assert_eq!(command, json!({ "dependency": "orders" }));
-    assert_eq!(event, json!({ "dependency": 7 }));
+    assert_eq!(command, json!({ "pong": true }));
+    assert_eq!(event("string.dep").await, json!({ "dependency": "orders" }));
+    assert_eq!(event("number.dep").await, json!({ "dependency": 7 }));
     assert_eq!(
         service.subscription_plan(),
         SubscriptionPlan {
-            commands: vec!["string.dep".to_string()],
-            events: vec!["number.dep".to_string()],
+            commands: vec!["stores.dep".to_string()],
+            events: vec!["string.dep".to_string(), "number.dep".to_string()],
         }
     );
 }
 
 #[tokio::test]
 async fn service_dispatches_all_route_dependency_builder_combinations() {
-    let repo_only = InMemoryRepository::new().queued().aggregate();
-    let combo_repo = InMemoryRepository::new().queued().aggregate();
+    let repo_only: RouteComboRepo = InMemoryRepository::new().queued().aggregate();
+    let combo_repo: RouteComboRepo = InMemoryRepository::new().queued().aggregate();
+    let typed = |name| typed_command::<TypedInput, Succeeded<TypedOutput>>(name);
     let service = Service::new()
+        .named("tests")
         .routes(
             Routes::new()
                 .with_dependencies(String::from("custom"))
-                .command("custom.route")
+                .event("custom.route")
                 .handle(|ctx: &Context<String>| {
                     let dependency = ctx.dependencies().clone();
                     async move { Ok(json!({ "route": dependency })) }
@@ -3719,11 +3712,8 @@ async fn service_dispatches_all_route_dependency_builder_combinations() {
         .routes(
             Routes::new()
                 .with_repo(repo_only)
-                .command("repo.route")
-                .handle(|ctx: &Context<RouteComboRepo>| {
-                    let _ = ctx.repo();
-                    async move { Ok(json!({ "route": "repo" })) }
-                }),
+                .typed_command(typed("repo.route"))
+                .handle(typed_handler),
         )
         .routes(
             Routes::new()
@@ -3738,78 +3728,96 @@ async fn service_dispatches_all_route_dependency_builder_combinations() {
             Routes::new()
                 .with_repo(combo_repo)
                 .with_read_model_store(InMemoryRepository::new())
-                .command("repo-read.route")
+                .typed_command(typed("repo-read.route"))
+                .handle(typed_handler)
+                .event("repo-read.event")
                 .handle(|ctx: &Context<RouteComboDeps>| {
                     let _ = ctx.repo();
                     let _ = ctx.read_model_store();
                     async move { Ok(json!({ "route": "repo-read" })) }
                 }),
         );
+    let event = |name: &'static str| {
+        let service = &service;
+        async move {
+            service
+                .dispatch_message(&Message::new(name, MessageKind::Event, br#"{}"#.to_vec()))
+                .await
+                .unwrap()
+        }
+    };
 
-    let custom = service
-        .dispatch("custom.route", json!({}), Session::new())
-        .await
-        .unwrap();
-    let repo = service
-        .dispatch("repo.route", json!({}), Session::new())
-        .await
-        .unwrap();
-    let read = service
-        .dispatch_message(&Message::new(
-            "read.route",
-            MessageKind::Event,
-            br#"{}"#.to_vec(),
-        ))
-        .await
-        .unwrap();
-    let repo_read = service
-        .dispatch("repo-read.route", json!({}), Session::new())
-        .await
-        .unwrap();
+    let repo = dispatch_command(
+        &service,
+        "repo.route",
+        json!({ "id": "repo" }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
+    let repo_read = dispatch_command(
+        &service,
+        "repo-read.route",
+        json!({ "id": "repo-read" }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(custom, json!({ "route": "custom" }));
-    assert_eq!(repo, json!({ "route": "repo" }));
-    assert_eq!(read, json!({ "route": "read" }));
-    assert_eq!(repo_read, json!({ "route": "repo-read" }));
+    assert_eq!(event("custom.route").await, json!({ "route": "custom" }));
+    assert_eq!(repo, json!({ "id": "repo" }));
+    assert_eq!(event("read.route").await, json!({ "route": "read" }));
+    assert_eq!(repo_read, json!({ "id": "repo-read" }));
+    assert_eq!(
+        event("repo-read.event").await,
+        json!({ "route": "repo-read" })
+    );
     assert_eq!(
         service.subscription_plan(),
         SubscriptionPlan {
-            commands: vec![
+            commands: vec!["repo.route".to_string(), "repo-read.route".to_string()],
+            events: vec![
                 "custom.route".to_string(),
-                "repo.route".to_string(),
-                "repo-read.route".to_string(),
+                "read.route".to_string(),
+                "repo-read.event".to_string(),
             ],
-            events: vec!["read.route".to_string()],
         }
     );
 }
 
 #[test]
 fn duplicate_route_names_within_bundle_are_rejected() {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let commands = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _routes = command_routes()
+            .typed_command(pong_command("same"))
+            .handle(pong)
+            .typed_command(pong_command("same"))
+            .handle(pong);
+    }));
+    let events = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _routes = test_routes()
-            .command("same")
+            .event("same")
             .handle(|_: &Context<()>| async move { Ok(json!({})) })
-            .command("same")
+            .event("same")
             .handle(|_: &Context<()>| async move { Ok(json!({})) });
     }));
 
-    assert!(result.is_err());
+    assert!(commands.is_err());
+    assert!(events.is_err());
 }
 
 #[test]
 fn duplicate_route_bundle_add_is_rejected_atomically() {
-    let mut service = Service::new().routes(
-        test_routes()
-            .command("same")
-            .handle(|_: &Context<()>| async move { Ok(json!({})) }),
+    let mut service = command_service(
+        command_routes()
+            .typed_command(pong_command("same"))
+            .handle(pong),
     );
-    let conflicting = Routes::new()
-        .with_dependencies(7_u32)
-        .command("same")
-        .handle(|_: &Context<u32>| async move { Ok(json!({})) })
-        .command("new")
-        .handle(|_: &Context<u32>| async move { Ok(json!({})) });
+    let conflicting = command_routes()
+        .typed_command(pong_command("same"))
+        .handle(pong)
+        .typed_command(pong_command("new"))
+        .handle(pong);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         service.add_routes(conflicting);
@@ -3824,13 +3832,12 @@ fn duplicate_route_bundle_add_is_rejected_atomically() {
 
 #[tokio::test]
 async fn dispatch_returns_handler_result() {
-    let service = test_service(
-        test_routes()
-            .command("ping")
-            .handle(|_ctx: &Context<()>| async move { Ok(json!({ "pong": true })) }),
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("ping"))
+            .handle(pong),
     );
-    let result = service
-        .dispatch("ping", json!({}), Session::new())
+    let result = dispatch_command(&service, "ping", json!({}), Session::new())
         .await
         .unwrap();
     assert_eq!(result, json!({ "pong": true }));
@@ -3838,20 +3845,22 @@ async fn dispatch_returns_handler_result() {
 
 #[tokio::test]
 async fn unknown_command() {
-    // This dispatch records the same {unnamed, unknown, unknown_command}
-    // series into the process-global registry that
-    // `metrics_bucket_unknown_command_under_fixed_message_label` asserts
-    // an exact count on — serialize against it.
+    // This dispatch records an {unknown, unknown_command} series into the
+    // process-global registry that
+    // `metrics_bucket_unknown_command_under_fixed_message_label` resets and
+    // asserts an exact count on — serialize against it.
     #[cfg(feature = "metrics")]
     let _guard = crate::metrics::async_lock_for_tests().await;
 
-    let service = test_service(
-        test_routes()
-            .command("ping")
-            .handle(|_ctx: &Context<()>| async move { Ok(json!({})) }),
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("ping"))
+            .handle(pong),
     );
-    let result = service.dispatch("unknown", json!({}), Session::new()).await;
-    assert!(matches!(result, Err(HandlerError::UnknownCommand(ref s)) if s == "unknown"));
+    let result = dispatch_command(&service, "unknown", json!({}), Session::new()).await;
+    assert!(
+        matches!(result, Err(CausalDispatchError::BadRequest(ref s)) if s == "unknown typed command")
+    );
 }
 
 #[cfg(feature = "metrics")]
@@ -3860,21 +3869,25 @@ async fn metrics_bucket_unknown_command_under_fixed_message_label() {
     let _guard = crate::metrics::async_lock_for_tests().await;
     crate::metrics::reset_for_tests();
 
-    let service = test_service(
-        test_routes()
-            .command("ping")
-            .handle(|_ctx: &Context<()>| async move { Ok(json!({})) }),
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("ping"))
+            .handle(pong),
     );
 
-    let result = service
-        .dispatch("attacker-controlled-path", json!({}), Session::new())
-        .await;
-    assert!(matches!(result, Err(HandlerError::UnknownCommand(_))));
+    let result = dispatch_command(
+        &service,
+        "attacker-controlled-path",
+        json!({}),
+        Session::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(CausalDispatchError::BadRequest(_))));
 
     let text = crate::metrics::prometheus_text();
     assert!(
             text.contains(
-                "distributed_microsvc_dispatch_total{service=\"unnamed\",message_kind=\"command\",message=\"unknown\",status=\"unknown_command\"} 1"
+                "distributed_microsvc_dispatch_total{service=\"tests\",message_kind=\"command\",message=\"unknown\",status=\"unknown_command\"} 1"
             ),
             "unknown commands should use a bounded message label:\n{text}"
         );
@@ -3884,45 +3897,88 @@ async fn metrics_bucket_unknown_command_under_fixed_message_label() {
     );
 }
 
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn metrics_count_each_typed_dispatch_once_by_outcome() {
+    let _guard = crate::metrics::async_lock_for_tests().await;
+    crate::metrics::reset_for_tests();
+
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("ping"))
+            .handle(pong)
+            .typed_command(pong_command("fail"))
+            .handle(|_: &CausalCommandContext<'_, ()>, _: NoInput| async move {
+                Err::<PreparedCommand<Succeeded<Pong>>, _>(HandlerError::Rejected("nope".into()))
+            })
+            .typed_command(pong_command("bus.ping").roles([crate::microsvc::TRANSPORT_ROLE]))
+            .handle(pong),
+    );
+    dispatch_command(&service, "ping", json!({}), Session::new())
+        .await
+        .unwrap();
+    dispatch_command(&service, "fail", json!({}), Session::new())
+        .await
+        .unwrap_err();
+    service
+        .dispatch_message(
+            &Message::new("bus.ping", MessageKind::Command, b"{}".to_vec()).with_id("msg-1"),
+        )
+        .await
+        .unwrap();
+
+    let text = crate::metrics::prometheus_text();
+    for (message, status) in [
+        ("ping", "success"),
+        ("fail", "rejected"),
+        ("bus.ping", "success"),
+    ] {
+        let series = format!(
+            "distributed_microsvc_dispatch_total{{service=\"tests\",message_kind=\"command\",message=\"{message}\",status=\"{status}\"}} 1"
+        );
+        assert!(text.contains(&series), "missing `{series}`:\n{text}");
+    }
+}
+
 #[tokio::test]
 async fn handler_error_propagates() {
-    let service = test_service(
-        test_routes()
-            .command("fail")
-            .handle(|_ctx: &Context<()>| async move { Err(HandlerError::Rejected("nope".into())) }),
-    );
-    let result = service.dispatch("fail", json!({}), Session::new()).await;
-    assert!(matches!(result, Err(HandlerError::Rejected(ref s)) if s == "nope"));
+    let service = command_service(command_routes().typed_command(pong_command("fail")).handle(
+        |_: &CausalCommandContext<'_, ()>, _: NoInput| async move {
+            Err::<PreparedCommand<Succeeded<Pong>>, _>(HandlerError::Rejected("nope".into()))
+        },
+    ));
+    let result = dispatch_command(&service, "fail", json!({}), Session::new()).await;
+    assert!(matches!(
+        result,
+        Err(CausalDispatchError::Rejected { code: "REJECTED", status: 422, ref message })
+            if message.contains("nope")
+    ));
 }
 
 #[tokio::test]
 async fn decode_error_from_bad_payload() {
-    #[derive(serde::Deserialize)]
-    struct Input {
-        _name: String,
-    }
-
-    let service = test_service(test_routes().command("typed").handle(|ctx: &Context<()>| {
-        let input = ctx.input::<Input>();
-        async move {
-            let _input = input?;
-            Ok(json!({}))
-        }
-    }));
-    let result = service
-        .dispatch("typed", json!({ "wrong": 1 }), Session::new())
-        .await;
-    assert!(matches!(result, Err(HandlerError::DecodeFailed(_))));
+    let service = Service::new().named("tests").routes(
+        Routes::new()
+            .with_repo(
+                InMemoryRepository::new()
+                    .queued()
+                    .aggregate::<RouteComboAggregate>(),
+            )
+            .typed_command(typed_command::<TypedInput, Succeeded<TypedOutput>>("typed"))
+            .handle(typed_handler),
+    );
+    let result = dispatch_command(&service, "typed", json!({ "wrong": 1 }), Session::new()).await;
+    assert!(matches!(result, Err(CausalDispatchError::BadRequest(_))));
 }
 
 #[test]
 fn command_names_list() {
-    let service = test_service(
-        test_routes()
-            .command("a")
-            .handle(|_: &Context<()>| async move { Ok(json!({})) })
-            .command("b")
-            .handle(|_: &Context<()>| async move { Ok(json!({})) }),
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("a"))
+            .handle(pong)
+            .typed_command(pong_command("b"))
+            .handle(pong),
     );
     let mut cmds = service.command_names();
     cmds.sort();
@@ -3933,12 +3989,15 @@ fn command_names_list() {
 fn subscription_plan_separates_commands_and_events() {
     const EVENTS: &[&str] = &["checkout.started", "seat.reserved"];
 
-    let service = test_service(
-        test_routes()
-            .command("checkout.start")
-            .handle(|_: &Context<()>| async move { Ok(json!({})) })
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("checkout.start"))
+            .handle(pong)
             .events(EVENTS)
-            .guarded(|_| true, |_: &Context<()>| async move { Ok(json!({})) }),
+            .guarded(
+                |_| true,
+                |_: &Context<StoreDeps>| async move { Ok(json!({})) },
+            ),
     );
 
     assert_eq!(
@@ -3972,15 +4031,12 @@ fn event_conveniences_record_event_names() {
 
 #[tokio::test]
 async fn command_and_event_handlers_can_share_a_name() {
-    let service = test_service(
-        test_routes()
-            .command("shared")
-            .handle(|ctx: &Context<()>| {
-                let kind = format!("{:?}", ctx.message().kind);
-                async move { Ok(json!({ "kind": kind })) }
-            })
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("shared"))
+            .handle(pong)
             .event("shared")
-            .handle(|ctx: &Context<()>| {
+            .handle(|ctx: &Context<StoreDeps>| {
                 let event_id = ctx.message().id().map(|s| s.to_string());
                 async move { Ok(json!({ "event_id": event_id })) }
             }),
@@ -3988,13 +4044,12 @@ async fn command_and_event_handlers_can_share_a_name() {
     let event_message =
         Message::new("shared", MessageKind::Event, br#"{}"#.to_vec()).with_id("evt-1");
 
-    let command_result = service
-        .dispatch("shared", json!({}), Session::new())
+    let command_result = dispatch_command(&service, "shared", json!({}), Session::new())
         .await
         .unwrap();
     let event_result = service.dispatch_message(&event_message).await.unwrap();
 
-    assert_eq!(command_result, json!({ "kind": "Command" }));
+    assert_eq!(command_result, json!({ "pong": true }));
     assert_eq!(event_result, json!({ "event_id": "evt-1" }));
     assert!(service.handles_message(MessageKind::Command, "shared"));
     assert!(service.handles_message(MessageKind::Event, "shared"));
@@ -4128,25 +4183,33 @@ async fn dispatch_message_always_exposes_message_metadata() {
 
 #[tokio::test]
 async fn dispatch_exposes_trace_context_from_session_metadata() {
+    #[derive(Serialize, crate::CommandOutput)]
+    struct Trace {
+        traceparent: Option<String>,
+        tracestate: Option<String>,
+    }
+
     let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-    let service = test_service(test_routes().command("checkout.start").handle(
-        |ctx: &Context<()>| {
-            let trace_context = ctx.message().trace_context();
-            async move {
-                Ok(json!({
-                    "traceparent": trace_context.traceparent,
-                    "tracestate": trace_context.tracestate,
-                }))
-            }
-        },
-    ));
+    let service = command_service(
+        command_routes()
+            .typed_command(typed_command::<NoInput, Succeeded<Trace>>("checkout.start"))
+            .handle(|ctx: &CausalCommandContext<'_, ()>, _: NoInput| {
+                let trace_context = ctx.trace_context();
+                async move {
+                    Ok(PreparedCommand::prepare(Trace {
+                        traceparent: trace_context.traceparent,
+                        tracestate: trace_context.tracestate,
+                    })
+                    .unwrap())
+                }
+            }),
+    );
     let session = Session::from_map(HashMap::from([
         ("traceparent".to_string(), traceparent.to_string()),
         ("tracestate".to_string(), "vendor=value".to_string()),
     ]));
 
-    let result = service
-        .dispatch("checkout.start", json!({}), session)
+    let result = dispatch_command(&service, "checkout.start", json!({}), session)
         .await
         .unwrap();
 
@@ -4158,53 +4221,63 @@ async fn dispatch_exposes_trace_context_from_session_metadata() {
 
 #[tokio::test]
 async fn guard_passes() {
-    let service = test_service(test_routes().command("greet").guarded(
-        |ctx| ctx.has_fields(&["name"]),
-        |ctx: &Context<()>| {
-            let name = ctx.raw_input()["name"].as_str().map(|s| s.to_string());
-            async move { Ok(json!({ "hello": name.unwrap() })) }
-        },
-    ));
-    let result = service
-        .dispatch("greet", json!({ "name": "Pat" }), Session::new())
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("greet"))
+            .guarded(|ctx| ctx.command_name() == "greet", pong),
+    );
+    let result = dispatch_command(&service, "greet", json!({}), Session::new())
         .await
         .unwrap();
-    assert_eq!(result, json!({ "hello": "Pat" }));
+    assert_eq!(result, json!({ "pong": true }));
 }
 
 #[tokio::test]
 async fn guard_rejects() {
-    let service = test_service(test_routes().command("greet").guarded(
-        |ctx| ctx.has_fields(&["name"]),
-        |_ctx: &Context<()>| async move {
-            panic!("handler should not run");
-            #[allow(unreachable_code)]
-            Ok(json!({}))
-        },
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("greet"))
+            .guarded(
+                |_| false,
+                |_: &CausalCommandContext<'_, ()>, _: NoInput| async move {
+                    panic!("handler should not run");
+                    #[allow(unreachable_code)]
+                    Ok(PreparedCommand::<Succeeded<Pong>>::prepare(Pong { pong: true }).unwrap())
+                },
+            ),
+    );
+    let result = dispatch_command(&service, "greet", json!({}), Session::new()).await;
+    assert!(matches!(
+        result,
+        Err(CausalDispatchError::Rejected {
+            code: "REJECTED",
+            status: 422,
+            ..
+        })
     ));
-    let result = service
-        .dispatch("greet", json!({ "wrong": 1 }), Session::new())
-        .await;
-    assert!(matches!(result, Err(HandlerError::GuardRejected(ref s)) if s == "greet"));
 }
 
 #[tokio::test]
 async fn guard_checks_session() {
-    let service = test_service(test_routes().command("admin").guarded(
-        |ctx| ctx.role() == Some("admin"),
-        |_ctx: &Context<()>| async move { Ok(json!({ "ok": true })) },
-    ));
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("admin"))
+            .guarded(|ctx| ctx.role() == Some("admin"), pong),
+    );
 
     // No role
-    assert!(service
-        .dispatch("admin", json!({}), Session::new())
-        .await
-        .is_err());
+    assert!(
+        dispatch_command(&service, "admin", json!({}), Session::new())
+            .await
+            .is_err()
+    );
 
     // Admin role
     let mut session = Session::new();
     session.set(crate::microsvc::ROLE_KEY, "admin");
-    assert!(service.dispatch("admin", json!({}), session).await.is_ok());
+    assert!(dispatch_command(&service, "admin", json!({}), session)
+        .await
+        .is_ok());
 }
 
 type LaneLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
@@ -4640,10 +4713,9 @@ async fn a_closed_lifecycle_gate_refuses_writes_on_every_transport() {
         "code": "APPLICATION_RELOADING",
         "error": "application generation is not active"
     });
-    assert_eq!(
-        post("gate.write", json!({ "id": "todo-1", "label": "x" })).await,
-        (503, reloading.clone())
-    );
+    // A body that is not a command envelope is refused as one, gate or not.
+    let (status, body) = post("gate.write", json!({ "id": "todo-1", "label": "x" })).await;
+    assert_eq!((status, &body["code"]), (400, &json!("BAD_REQUEST")));
     assert_eq!(
         post(
             "gate.write",
