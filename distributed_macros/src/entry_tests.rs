@@ -1,89 +1,12 @@
 #[cfg(test)]
 mod tests {
-    use crate::{aggregate, digest, enqueue, sourced};
+    use crate::{aggregate, sourced};
     use quote::quote;
     use syn::parse::Parser;
 
     // ---- digest ----------------------------------------------------------
 
-    #[test]
-    fn expand_digest_inserts_digest_call() {
-        let attr = quote! { "initialized" };
-        let item = quote! {
-            fn initialize(&mut self, id: String) {
-                self.id = id;
-            }
-        };
-        let out = digest::expand_digest(attr, item).unwrap().to_string();
-        assert!(out.contains("digest"), "unexpected output: {out}");
-        assert!(out.contains("\"initialized\""), "unexpected output: {out}");
-    }
-
-    #[test]
-    fn parse_digest_args_rejects_unknown_key() {
-        let attr = quote! { "x", versoin = 2 };
-        let err = digest::parse_digest_args
-            .parse2(attr)
-            .err()
-            .expect("unknown key should error");
-        let msg = err.to_string();
-        assert!(msg.contains("unsupported key `versoin`"), "got: {msg}");
-        assert!(msg.contains("version"), "got: {msg}");
-    }
-
-    #[test]
-    fn parse_digest_args_accepts_version_and_when() {
-        let attr = quote! { entity, "renamed", when = true, version = 2 };
-        let args = digest::parse_digest_args.parse2(attr).unwrap();
-        assert_eq!(args.entity_field, "entity");
-        assert!(args.guard.is_some());
-        assert!(args.version.is_some());
-    }
-
     // ---- enqueue ---------------------------------------------------------
-
-    #[test]
-    fn parse_enqueue_args_defaults_entity_field() {
-        let attr = quote! { "order.initialized" };
-        let args = enqueue::parse_enqueue_args.parse2(attr).unwrap();
-        assert_eq!(args.emitter_field, "emitter");
-        assert_eq!(args.entity_field, "entity");
-    }
-
-    #[test]
-    fn parse_enqueue_args_overrides_entity_field() {
-        let attr = quote! { "order.initialized", entity = state };
-        let args = enqueue::parse_enqueue_args.parse2(attr).unwrap();
-        assert_eq!(args.entity_field, "state");
-    }
-
-    #[test]
-    fn expand_enqueue_uses_renamed_entity_field_in_guard() {
-        let attr = quote! { "order.initialized", entity = state };
-        let item = quote! {
-            fn create(&mut self, id: String) {
-                self.id = id;
-            }
-        };
-        let out = enqueue::expand_enqueue(attr, item).unwrap().to_string();
-        assert!(
-            out.contains("self . state . is_replaying"),
-            "expected renamed entity guard, got: {out}"
-        );
-    }
-
-    #[test]
-    fn parse_enqueue_args_rejects_unknown_key() {
-        let attr = quote! { "x", wen = true };
-        let err = enqueue::parse_enqueue_args
-            .parse2(attr)
-            .err()
-            .expect("unknown key should error");
-        assert!(
-            err.to_string().contains("unsupported key `wen`"),
-            "got: {err}"
-        );
-    }
 
     // ---- event (parse) ---------------------------------------------------
 
@@ -170,7 +93,7 @@ mod tests {
         let out = sourced::expand_sourced(attr, item).unwrap().to_string();
         assert!(out.contains("enum TodoEvent"), "got: {out}");
         assert!(
-            out.contains("impl distributed :: Aggregate for Todo"),
+            out.contains("impl :: distributed :: Aggregate for Todo"),
             "got: {out}"
         );
     }
@@ -201,60 +124,125 @@ mod tests {
         assert!(output.contains("is_replaying"));
         assert!(output.contains("pub enum TodoCompletedDomainEvent"));
         assert!(output.contains(
-            "impl distributed :: domain_event :: DomainEventContract for TodoCompletedDomainEvent"
+            "impl :: distributed :: domain_event :: DomainEventContract for TodoCompletedDomainEvent"
         ));
         assert!(output.contains("DomainEventBodyContract < TodoState >"));
     }
 
     #[test]
-    fn expand_sourced_transition_exports_unconditional_known_state_values() {
+    fn known_values_are_declared_not_read_from_the_recorder_body() {
         let attr = quote! {
             entity,
             aggregate_type = "todo",
             domain_state = TodoState,
         };
-        let item = quote! {
-            impl Todo {
-                pub fn complete(&mut self) {
-                    self.record_completed().unwrap();
-                }
+        let expand = |event: proc_macro2::TokenStream| {
+            sourced::expand_sourced(
+                attr.clone(),
+                quote! {
+                    impl Todo {
+                        pub fn complete(&mut self) {
+                            self.record_completed().unwrap();
+                        }
 
-                #[event("todo.completed", version = 1, domain)]
-                fn record_completed(&mut self) {
-                    self.status = TodoStatus::Completed;
-                    self.label = std::string::String::from("done");
-                    self.shadowed_label = String::from("not-known");
-                    self.assignee_id = None;
-                    if self.audit_enabled {
-                        self.audit_label = "conditional";
+                        #event
+                        fn record_completed(&mut self) {
+                            self.status = TodoStatus::Completed;
+                            self.assignee_id = None;
+                        }
                     }
-                }
-            }
+                },
+            )
         };
 
-        let output = sourced::expand_sourced(attr, item).unwrap().to_string();
+        let undeclared = expand(quote!(#[event("todo.completed", version = 1, domain)]))
+            .unwrap()
+            .to_string();
+        assert!(
+            !undeclared.contains("fn command_event_known_values"),
+            "assignments in the body predict nothing: {undeclared}"
+        );
 
+        let declared = expand(quote!(
+            #[event("todo.completed", version = 1, domain, known(status: "completed", assignee_id: null))]
+        ))
+        .unwrap()
+        .to_string();
         assert!(
-            output.contains("fn command_event_known_values"),
-            "got: {output}"
+            declared.contains("fn command_event_known_values"),
+            "got: {declared}"
         );
         assert!(
-            output.contains("__command_projection_state_known_values"),
-            "got: {output}"
+            declared.contains("state_preview ! { TodoCompletedDomainEvent => TodoState { status : \"completed\" , assignee_id : null , } }"),
+            "got: {declared}"
         );
-        assert!(output.contains("\"status\""), "got: {output}");
-        assert!(output.contains("TodoStatus :: Completed"), "got: {output}");
-        assert!(output.contains("\"label\""), "got: {output}");
-        assert!(
-            output.contains("std :: string :: String :: from (\"done\")"),
-            "got: {output}"
-        );
-        assert!(!output.contains("\"shadowed_label\""), "got: {output}");
-        assert!(output.contains("\"assignee_id\""), "got: {output}");
-        assert!(
-            !output.contains("\"audit_label\""),
-            "conditional assignments are not safe preview facts: {output}"
-        );
+
+        let error = expand(quote!(
+            #[event("todo.completed", version = 1, domain = event, known(status: "completed"))]
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("needs `domain` (state mode)"), "{error}");
+    }
+
+    #[test]
+    fn sourced_helpers_ignore_other_receivers_and_nested_item_self() {
+        let output = sourced::expand_sourced(
+            quote! { entity, aggregate_type = "todo" },
+            quote! {
+                impl Todo {
+                    pub fn unrelated(&mut self, other: &mut Todo) {
+                        other.record_completed().unwrap();
+                        struct Other;
+                        impl Other {
+                            fn action(&mut self) { self.record_completed(); }
+                        }
+                    }
+                    #[event("todo.completed", domain = event)]
+                    fn record_completed(&mut self) {}
+                }
+            },
+        )
+        .unwrap()
+        .to_string();
+        assert!(!output.contains("pub enum Unrelated"), "{output}");
+        assert!(!output.contains("pub mod domain_commands"), "{output}");
+    }
+
+    #[test]
+    fn sourced_helper_custom_body_uses_declared_type_contract() {
+        for output_type in [
+            quote!(crate::facts::BranchCreated),
+            quote!(super::facts::BranchCreated),
+            quote!(BranchCreated),
+        ] {
+            let output = sourced::expand_sourced(
+                quote! { entity, aggregate_type = "repository" },
+                quote! {
+                    impl Repository {
+                        pub fn create(&mut self) { self.create_refs().unwrap(); }
+                        fn create_refs(&mut self) { self.record_branch().unwrap(); }
+                        #[event(
+                            "repository.branch_created",
+                            domain = with(#output_type, branch_created)
+                        )]
+                        fn record_branch(&mut self) {}
+                    }
+                },
+            )
+            .unwrap()
+            .to_string();
+            let descriptor = quote! {
+                distributed::command::__command_projection_event_descriptor::<#output_type,>()
+            }
+            .to_string();
+            assert!(output.contains(&descriptor), "{output}");
+            assert!(output.contains("for domain_commands :: Create"), "{output}");
+            assert!(
+                !output.contains("RepositoryBranchCreatedDomainEvent"),
+                "{output}"
+            );
+        }
     }
 
     #[test]
@@ -276,7 +264,7 @@ mod tests {
 
         assert!(output.contains("pub struct TodoRenamedDomainEvent"));
         assert!(output.contains(
-            "impl distributed :: domain_event :: DomainEventContract for TodoRenamedDomainEvent"
+            "impl :: distributed :: domain_event :: DomainEventContract for TodoRenamedDomainEvent"
         ));
         assert!(output.contains("DomainEventBodyDescriptor :: distributed_json"));
         assert!(output.contains("capture_domain_event"));
@@ -302,7 +290,7 @@ mod tests {
 
         assert!(output.contains("pub struct TodoDomainIdentity"));
         assert!(output.contains("pub enum TodoPurgedDomainEvent"));
-        assert!(output.contains("DomainEventBodyContract < distributed :: DomainDeletion"));
+        assert!(output.contains("DomainEventBodyContract < :: distributed :: DomainDeletion"));
         assert!(output.contains("self . entity . version ()"));
         assert!(output.contains("capture_domain_deletion"));
         assert!(!output.contains("capture_domain_state"));
@@ -337,7 +325,9 @@ mod tests {
         assert!(output.contains("DomainEventContract > :: EVENT_NAME"));
         assert!(output.contains("DomainEventContract > :: EVENT_VERSION"));
         assert!(output.contains("DomainEventBodyContract < T >"));
-        assert!(output.contains("!= < TodoCompleted as distributed :: DomainEvent > :: DESCRIPTOR"));
+        assert!(
+            output.contains("!= < TodoCompleted as :: distributed :: DomainEvent > :: DESCRIPTOR")
+        );
     }
 
     #[test]
@@ -397,36 +387,6 @@ mod tests {
     }
 
     #[test]
-    fn expand_digest_rejects_wildcard_parameter_pattern() {
-        let attr = quote! { "initialized" };
-        let item = quote! {
-            fn initialize(&mut self, _: String) {}
-        };
-        let err = digest::expand_digest(attr, item).expect_err("wildcard pattern should error");
-        assert!(
-            err.to_string()
-                .contains("unsupported parameter pattern in #[digest] method"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn expand_enqueue_rejects_struct_parameter_pattern() {
-        let attr = quote! { "order.initialized" };
-        let item = quote! {
-            fn create(&mut self, Payload { id }: Payload) {
-                let _ = id;
-            }
-        };
-        let err = enqueue::expand_enqueue(attr, item).expect_err("struct pattern should error");
-        assert!(
-            err.to_string()
-                .contains("unsupported parameter pattern in #[enqueue] method"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
     fn expand_sourced_rejects_event_without_receiver() {
         let attr = quote! { entity };
         let item = quote! {
@@ -471,40 +431,10 @@ mod tests {
         assert_eq!(args.upcasters.len(), 1);
     }
 
-    #[test]
-    fn expand_aggregate_accepts_upcasters_block() {
-        let input = quote! {
-            Todo, entity {
-                "initialized"(id) => initialize,
-            }
-            upcasters [
-                ("initialized", 1 => 2, OldPayload => NewPayload, upcast_fn),
-            ]
-        };
-        let out = aggregate::expand_aggregate(input).unwrap().to_string();
-        assert!(out.contains("upcasters"), "got: {out}");
-        assert!(out.contains("upcast_fn"), "got: {out}");
-    }
-
     // ---- aggregate -------------------------------------------------------
 
     #[test]
-    fn expand_aggregate_generates_impl() {
-        let input = quote! {
-            Todo, entity {
-                "initialized"(id) => initialize,
-            }
-        };
-        let out = aggregate::expand_aggregate(input).unwrap().to_string();
-        assert!(
-            out.contains("impl distributed :: Aggregate for Todo"),
-            "got: {out}"
-        );
-        assert!(out.contains("replay_event"), "got: {out}");
-    }
-
-    #[test]
-    fn expand_portable_command_emits_thin_mount() {
+    fn expand_command_emits_thin_mount() {
         let input = quote! {
             name: "todo.complete",
             transition: domain_commands::Complete,
@@ -516,11 +446,9 @@ mod tests {
             roles: ["user", "admin"],
             field: "todos_complete",
             invoke: |todo, _input, principal| todo.complete(principal),
-            payload: |todo| TodoStatusPayload::from_todo(&**todo),
+            payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
         };
-        let out = crate::portable_command::expand(input)
-            .expect("expand")
-            .to_string();
+        let out = crate::command::expand(input).expect("expand").to_string();
         assert!(out.contains("struct Complete"), "{out}");
         assert!(out.contains("fn complete"), "{out}");
         assert!(out.contains("todo . complete"), "{out}");
@@ -530,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_portable_command_preserves_contract_projection_options() {
+    fn expand_command_preserves_contract_projection_options() {
         let input = quote! {
             name: "chat.post",
             transition: domain_commands::Post,
@@ -550,9 +478,7 @@ mod tests {
             guard: authenticated_user,
             handle: handle_post,
         };
-        let out = crate::portable_command::expand(input)
-            .expect("expand")
-            .to_string();
+        let out = crate::command::expand(input).expect("expand").to_string();
         assert!(out.contains("authenticated_user_field"), "{out}");
         assert!(out.contains("fn post_message"), "{out}");
         assert!(out.contains("ChatMessagePostedDomainEvent"), "{out}");
@@ -565,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn expand_portable_command_allows_constructor_override_for_keyword_name() {
+    fn expand_command_allows_constructor_override_for_keyword_name() {
         let input = quote! {
             name: "blob.move",
             transition: domain_commands::MoveDir,
@@ -579,23 +505,72 @@ mod tests {
             guard: authenticated_user,
             handle: handle_move,
         };
-        let out = crate::portable_command::expand(input)
-            .expect("expand")
-            .to_string();
+        let out = crate::command::expand(input).expect("expand").to_string();
         assert!(out.contains("struct Move"), "{out}");
         assert!(out.contains("fn move_dir"), "{out}");
     }
 
+    fn thin_command(
+        name: &str,
+        load: proc_macro2::TokenStream,
+        roles: proc_macro2::TokenStream,
+    ) -> syn::Result<String> {
+        crate::command::expand(quote! {
+            name: #name,
+            transition: domain_commands::Create,
+            aggregate: Todo,
+            input: TodoCreateInput,
+            outcome: Eventual<TodoCreatePayload>,
+            shard: |input| input.todo_id.clone(),
+            load: #load,
+            roles: #roles,
+            field: "todos_create",
+            guard: authenticated_user,
+            invoke: |todo, input, principal| todo.create(&input.todo_id, principal),
+            payload: |todo, principal| TodoCreatePayload::new(todo, principal),
+        })
+        .map(|tokens| tokens.to_string())
+    }
+
     #[test]
-    fn expand_portable_command_rejects_unknown_key() {
+    fn expand_command_thin_form_takes_every_load_and_a_guard() {
+        for (load, method) in [
+            (quote!(required), "load_by"),
+            (quote!(or_create), "load_or_create_by"),
+            (quote!(create), "create_by"),
+        ] {
+            let out = thin_command("todo.create", load, quote!(["user"])).expect("expand");
+            assert!(out.contains(&format!(". {method} (")), "{method}: {out}");
+            assert!(out.contains(". guard (authenticated_user)"), "{out}");
+        }
+    }
+
+    /// The method form and `command!` reject the same names and roles.
+    #[test]
+    fn expand_command_shares_name_and_role_rules_with_the_method_form() {
+        for name in ["create", "Todo.create", "todo..create", "todo.create-now"] {
+            let err = thin_command(name, quote!(create), quote!(["user"])).expect_err(name);
+            assert!(
+                err.to_string().contains("2+ dot-separated snake_case"),
+                "{name}: {err}"
+            );
+        }
+        for roles in [quote!([]), quote!([""]), quote!([user])] {
+            let err = thin_command("todo.create", quote!(create), roles.clone())
+                .expect_err("invalid roles");
+            assert!(err.to_string().contains("roles"), "{roles}: {err}");
+        }
+    }
+
+    #[test]
+    fn expand_command_rejects_unknown_key() {
         let input = quote! {
             name: "todo.complete",
             nope: 1,
         };
-        let err = crate::portable_command::expand(input).expect_err("unknown key");
+        let err = crate::command::expand(input).expect_err("unknown key");
         assert!(
-            err.to_string()
-                .contains("unknown portable_command key `nope`"),
+            err.to_string().contains("unknown command key `nope`"),
             "got: {err}"
         );
     }

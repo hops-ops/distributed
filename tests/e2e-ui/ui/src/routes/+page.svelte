@@ -711,7 +711,7 @@ Service::new()
 						<code>run</code>. You do not set a runtime role flag.
 					</p>
 					<p class="wf-why">
-						Todo commands are <code>portable_command!</code> declarations in
+						Todo commands are <code>command!</code> declarations in
 						<code>todo-domain</code>. This playground mounts them on a local Service. The sibling
 						example <code>tests/e2e-celld</code> mounts the same declarations and wait-dispatches
 						create, complete, and <code>chat.post</code> to a <strong>cell</strong> (one private

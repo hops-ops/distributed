@@ -30,7 +30,18 @@ export type LiveEntry = {
 	unsubscribe: () => void;
 	active: boolean;
 	protocolGeneration: number;
+	/** Local fence for taking over query snapshots that preceded this stream. */
+	startRevision: string;
 	operationGeneration?: number;
+	/** Consecutive failed live executions; drives the reopen backoff. */
+	failures?: number;
+	/** Pending reopen of this inactive entry after a live failure frame. */
+	retry?: ReturnType<typeof setTimeout>;
+	/**
+	 * Shared indexes whose independent owner disagreed with this stream's last
+	 * frame. Another operation rewriting one of them reopens this stream.
+	 */
+	fencedIndexKeys?: ReadonlySet<string>;
 };
 
 export type ProtocolGeneration = {
@@ -53,6 +64,8 @@ export type SerializedOperationProtocolState = {
 		Readonly<{ scopeToken: string; position: string }>
 	])[];
 	readonly indexRevision?: string;
+	/** Local boundary after which a disposed live owner may be handed off. */
+	readonly retiredAtRevision?: string;
 	readonly indexKeys: readonly string[];
 	readonly pathRecords: readonly (readonly [string, string])[];
 	readonly cursors: readonly DistributedLiveCursor[];
@@ -138,6 +151,8 @@ export type OperationProtocolState = {
 	snapshotScope?: DistributedOpaqueString;
 	indexClocks: Map<string, IndexProtocolClock>;
 	indexRevision?: string;
+	/** Local boundary after which a disposed live owner may be handed off. */
+	retiredAtRevision?: string;
 	indexKeys: Set<string>;
 	pathRecords: Map<string, string>;
 	cursors: readonly DistributedLiveCursor[];
@@ -163,6 +178,13 @@ export type SharedIndexDisposition = {
 	readonly compared: boolean;
 	readonly disposition?: 'equal' | 'higher' | 'lower';
 	readonly indexRevision?: string;
+	readonly restartAfterRetirement?: boolean;
+	/**
+	 * Incoming indexes owned by an independent live stream or later query
+	 * owner. A snapshot frame may be admitted without writing them when its
+	 * membership for each is identical to the owner's.
+	 */
+	readonly fencedIndexKeys?: ReadonlySet<string>;
 };
 
 export type CapturedReplicaOptimisticOperation =

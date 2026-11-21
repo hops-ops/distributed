@@ -6,7 +6,6 @@
 //! - `OutboxStore` - Store operations for claiming and completing messages
 //! - `OutboxDispatcher` / `BusPublisher` - the async production drain path
 //! - `OutboxSource` - outbox-backed durable receive
-//! - `BusOutboxPublishHook` - after-commit immediate publish hook
 //!
 //! ## Separation of Concerns
 //!
@@ -26,44 +25,24 @@
 //! ```
 
 mod bus_publisher;
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka",
-    test,
-))]
+#[cfg(any(background_workers, test))]
 mod drain;
 mod outbox_dispatch;
 mod outbox_source;
-mod publish_hook;
 mod store;
 #[cfg(test)]
 pub(crate) mod testing;
 
 // Repository helpers
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) use store::ensure_active_claim;
 pub use store::{
     ClaimOutboxMessages, OutboxBacklogStats, OutboxClaimRef, OutboxPublishFailureAction,
-    OutboxStore,
+    OutboxStore, OUTBOX_RETRY,
 };
 
 // Outbox -> bus bridge (moved out of the bus module; depends up on bus traits).
 pub use bus_publisher::BusPublisher;
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka",
-    test,
-))]
+#[cfg(any(background_workers, test))]
 pub use drain::{
     drain_worker_id, OutboxDrainHandle, OutboxDrainRunner, OutboxPublishMailbox,
     DEFAULT_DRAIN_BATCH_SIZE, DEFAULT_DRAIN_ERROR_BACKOFF, DEFAULT_DRAIN_LEASE,
@@ -73,4 +52,3 @@ pub use outbox_dispatch::{OutboxDispatchOutcome, OutboxDispatcher, SOURCED_METAD
 pub use outbox_source::{
     OutboxSource, ReceivedOutboxMessage, DEFAULT_OUTBOX_SOURCE_BATCH, DEFAULT_OUTBOX_SOURCE_LEASE,
 };
-pub use publish_hook::BusOutboxPublishHook;

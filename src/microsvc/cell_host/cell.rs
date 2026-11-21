@@ -2,23 +2,26 @@
 //! one instance per shard (`{aggregate_type}:{shard}`).
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use super::causal::{CellCommandIdentity, CellDispatchError, CellDispatchResult};
+use super::alarm::{ArmedSchedule, ScheduleFireReport, ScheduleSettlement};
+use super::causal::CellCommandIdentity;
+use super::store::CellStreamStore;
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 use super::store::{
-    CellStreamStore, DurableAggregateCellState, DurableCellCommand, DurableCellEvents,
-    DurableCellSnapshot,
+    DurableAggregateCellState, DurableCellCommand, DurableCellEvents, DurableCellSnapshot,
 };
+use super::{CausalDispatchError, CausalDispatchResult};
 use crate::aggregate::{Aggregate, AggregateRepository};
-use crate::microsvc::error::HandlerError;
+use crate::entity::EventRecord;
 use crate::microsvc::service::{PortableCommand, Routes};
 use crate::microsvc::session::Session;
 use crate::microsvc::HasOutboxStore;
-use crate::repository::{RepositoryError, SnapshotStore, StreamIdentity};
+use crate::repository::{GetStream, RepositoryError, SnapshotStore, StreamIdentity};
 use crate::snapshot::{SnapshotRecord, Snapshottable};
-use crate::{InMemoryOutboxStore, OutboxDispatcher};
+use crate::OutboxDispatcher;
 
 /// Cell class for aggregate `A`. Equivalent to
 /// `#[distributed::cell(aggregate = A)]`: mount the same domain
@@ -52,6 +55,10 @@ where
     routes: Routes<AggregateRepository<CellStreamStore, A>>,
     #[cfg(feature = "workers-rs")]
     celld_outbox: Option<super::celld_outbox::CelldOutbox>,
+    #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+    activity: super::celld_outbox::CommandActivity,
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    storage: worker::send::SendWrapper<worker::Storage>,
 }
 
 impl<A> AggregateCell<A>
@@ -59,6 +66,7 @@ where
     A: Aggregate + Send + Sync + 'static,
 {
     /// Open a cell instance addressed as `{aggregate_type}:{shard_id}`.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn new(shard_id: impl Into<String>) -> Result<Self, RepositoryError> {
         let shard = StreamIdentity::new(A::aggregate_type(), shard_id.into())?;
         let store = CellStreamStore::for_identity(shard.clone());
@@ -67,6 +75,99 @@ where
             routes: Routes::from_dependencies(AggregateRepository::new(store)),
             #[cfg(feature = "workers-rs")]
             celld_outbox: None,
+            #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+            activity: Default::default(),
+        })
+    }
+
+    /// Host a prepared exclusive store (for example a SQLite cell configured
+    /// with [`CellStreamStore::with_sealed_row_reducer`]).
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub fn from_store(store: CellStreamStore) -> Result<Self, RepositoryError> {
+        let shard = Self::store_shard(&store)?;
+        Ok(Self::from_repository(
+            shard,
+            AggregateRepository::new(store),
+        ))
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn store_shard(store: &CellStreamStore) -> Result<StreamIdentity, RepositoryError> {
+        match store.identity() {
+            Some(identity) if identity.aggregate_type() == A::aggregate_type() => {
+                Ok(identity.clone())
+            }
+            Some(identity) => Err(RepositoryError::Model(format!(
+                "cell store `{identity}` does not hold aggregate type `{}`",
+                A::aggregate_type()
+            ))),
+            None => Err(RepositoryError::Model(
+                "aggregate cells require an exclusive cell store".into(),
+            )),
+        }
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn from_repository(
+        shard: StreamIdentity,
+        repository: AggregateRepository<CellStreamStore, A>,
+    ) -> Self {
+        Self {
+            shard,
+            routes: Routes::from_dependencies(repository),
+            #[cfg(feature = "workers-rs")]
+            celld_outbox: None,
+            #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+            activity: Default::default(),
+        }
+    }
+
+    /// Native equivalent of the celld alarm drain: one claim -> publish ->
+    /// delete pass over this cell's committed outbox (lease-fenced rows).
+    ///
+    /// Call it at startup (rows survive a restart), after dispatch for low
+    /// latency, and periodically; or hand [`Self::outbox_dispatcher`] to an
+    /// `OutboxDrainRunner` on a tokio runtime. Publication failures are
+    /// released (or failed after `max_attempts`) for the next pass. A crash
+    /// between publish and delete re-delivers the same stable message id, so
+    /// delivery is at-least-once and consumers must deduplicate.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub async fn drain_outbox_with<P>(
+        &self,
+        publisher: P,
+        lease: Duration,
+        max_attempts: u32,
+        batch_size: usize,
+    ) -> Result<crate::outbox_worker::OutboxDispatchOutcome, crate::bus::TransportError>
+    where
+        P: crate::bus::MessagePublisher,
+    {
+        self.outbox_dispatcher(
+            publisher,
+            format!("cell-outbox:{}", self.instance_name()),
+            lease,
+            max_attempts,
+        )
+        .dispatch_batch(batch_size)
+        .await
+    }
+
+    /// Open the named runtime-owned SQLite cell. Mount commands and configure
+    /// its Queue binding before dispatch; no in-memory persistence path exists.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    pub fn from_state(state: worker::State) -> Result<Self, RepositoryError> {
+        let name = state.id().name().ok_or_else(|| {
+            RepositoryError::Model("aggregate cells require a named Durable Object".into())
+        })?;
+        let shard = StreamIdentity::new(A::aggregate_type(), name)?;
+        let storage = worker::send::SendWrapper::new(state.storage());
+        let store = CellStreamStore::from_state(state, shard.clone())?;
+        Ok(Self {
+            shard,
+            routes: Routes::from_dependencies(AggregateRepository::new(store)),
+            celld_outbox: None,
+            activity: Default::default(),
+            storage,
         })
     }
 
@@ -104,18 +205,6 @@ where
         self.routes.is_command_only()
     }
 
-    /// Dispatch a mounted command through the cell-local workspace adapter.
-    pub async fn dispatch(
-        &self,
-        command: &str,
-        input: Value,
-        session: Session,
-    ) -> Result<Value, HandlerError> {
-        self.routes
-            .dispatch_cell_command(command, input, session, &self.shard)
-            .await
-    }
-
     /// Dispatch a wait-path command through this cell's fenced command ledger.
     ///
     /// Same principal/command ID plus the same canonical typed input replays
@@ -127,10 +216,158 @@ where
         identity: &CellCommandIdentity,
         input: Value,
         session: Session,
-    ) -> Result<CellDispatchResult, CellDispatchError> {
-        self.routes
-            .dispatch_cell_causal(command, identity, input, session, &self.shard)
+    ) -> Result<CausalDispatchResult, CausalDispatchError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        let _command = self
+            .begin_command()
             .await
+            .map_err(|error| CausalDispatchError::Internal(error.to_string()))?;
+        let result = self
+            .routes
+            .dispatch_cell_causal(command, identity, input, session, &self.shard)
+            .await;
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        self.reschedule_after_command().await;
+        result
+    }
+
+    /// Dispatch `commands` in order, each exactly as
+    /// [`dispatch_idempotent`](Self::dispatch_idempotent) (its own ledger
+    /// entry, identity and session), under one command guard and one alarm
+    /// reschedule. A rejected command leaves the earlier ones committed and
+    /// the later ones still run; the first retryable result (in progress,
+    /// 408, 429, 5xx) ends the batch. One result per command attempted.
+    ///
+    /// Each command is still its own transaction: a handler runs between
+    /// its ledger reservation and its commit, outside the synchronous cell
+    /// SQL transaction, and must see the commands before it committed.
+    pub async fn dispatch_idempotent_batch(
+        &self,
+        commands: Vec<CellBatchCommand>,
+    ) -> Vec<Result<CausalDispatchResult, CausalDispatchError>> {
+        if commands.is_empty() {
+            return Vec::new();
+        }
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        let _command = match self.begin_command().await {
+            Ok(guard) => guard,
+            Err(error) => return vec![Err(CausalDispatchError::Internal(error.to_string()))],
+        };
+        let mut results = Vec::with_capacity(commands.len());
+        for command in commands {
+            let result = self
+                .routes
+                .dispatch_cell_causal(
+                    &command.command,
+                    &command.identity,
+                    command.input,
+                    command.session,
+                    &self.shard,
+                )
+                .await;
+            let stop = result.as_ref().is_err_and(ends_batch);
+            results.push(result);
+            if stop {
+                break;
+            }
+        }
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        self.reschedule_after_command().await;
+        results
+    }
+
+    /// Armed alarms of this cell, earliest first.
+    pub fn armed_schedules(&self) -> Result<Vec<ArmedSchedule>, RepositoryError> {
+        self.routes.repo().repo().armed_schedules()
+    }
+
+    /// Due time of this cell's earliest armed alarm.
+    pub fn next_schedule_due(&self) -> Result<Option<SystemTime>, RepositoryError> {
+        Ok(self
+            .routes
+            .repo()
+            .repo()
+            .next_alarm_due_ms()?
+            .map(super::alarm::ms_to_system_time))
+    }
+
+    /// Fire this cell's alarms that are due now by the cell clock.
+    ///
+    /// The in-process reference host has no timer: tests give the store a
+    /// [`ManualClock`](crate::ManualClock) ([`CellStreamStore::with_clock`]),
+    /// advance it, and call this, exactly as the celld alarm handler does on
+    /// every Durable Object wake.
+    pub async fn fire_due_schedules(&self) -> Result<ScheduleFireReport, RepositoryError> {
+        self.fire_due_schedules_at(self.routes.repo().repo().now())
+            .await
+    }
+
+    /// Fire up to [`SCHEDULE_FIRE_BATCH`](crate::schedule::SCHEDULE_FIRE_BATCH)
+    /// alarms due at or before `now`, earliest first.
+    ///
+    /// Each one dispatches its command through this cell's command ledger with
+    /// a stable `(name, generation)` command id and the trusted alarm session.
+    /// The due set is read once, so a handler that re-arms in the past fires on
+    /// the next wake, not in a loop.
+    pub async fn fire_due_schedules_at(
+        &self,
+        now: SystemTime,
+    ) -> Result<ScheduleFireReport, RepositoryError> {
+        let store = self.routes.repo().repo();
+        let now_ms = super::alarm::system_time_to_ms(now)?;
+        let mut report = ScheduleFireReport::default();
+        for alarm in store.due_alarms(now_ms, crate::schedule::SCHEDULE_FIRE_BATCH)? {
+            let result = match alarm.command_identity() {
+                Ok(identity) => {
+                    self.dispatch_idempotent(
+                        &alarm.command,
+                        &identity,
+                        alarm.input.clone(),
+                        super::schedule_session(&alarm),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            let settlement = match result {
+                Ok(dispatch) => {
+                    report.fired.push(super::FiredSchedule {
+                        name: alarm.name.clone(),
+                        generation: alarm.generation,
+                        command: alarm.command.clone(),
+                        replayed: dispatch.replayed(),
+                        payload: dispatch.payload().clone(),
+                    });
+                    ScheduleSettlement::Done
+                }
+                Err(error) => {
+                    let retry = super::alarm::is_retryable(&error);
+                    let failed = super::FailedSchedule {
+                        name: alarm.name.clone(),
+                        generation: alarm.generation,
+                        command: alarm.command.clone(),
+                        code: error.code(),
+                        message: match &error {
+                            CausalDispatchError::Internal(message) => message.clone(),
+                            other => other.client_message(),
+                        },
+                    };
+                    if retry {
+                        report.retried.push(failed);
+                        ScheduleSettlement::Retry {
+                            due_at_ms: now_ms.saturating_add(
+                                super::alarm::retry_delay(alarm.attempts).as_millis() as i64,
+                            ),
+                        }
+                    } else {
+                        report.failed.push(failed);
+                        ScheduleSettlement::Done
+                    }
+                }
+            };
+            store.settle_alarm(&alarm.name, alarm.generation, &settlement)?;
+        }
+        Ok(report)
     }
 
     /// Load this cell's aggregate from the private stream store.
@@ -141,12 +378,40 @@ where
         self.routes.repo().get(self.shard.aggregate_id()).await
     }
 
-    /// Event log for Durable Object SQLite persistence.
+    /// Durable event history of one stream this cell owns, oldest first
+    /// (empty when the stream has no events). Reads the backing store, so it
+    /// works on the in-process reference host **and** on celld (Durable
+    /// Object SQLite), unlike the whole-state
+    /// [`durable_events`](Self::durable_events) export. A stream the cell
+    /// does not own is rejected.
+    pub async fn stream_events(
+        &self,
+        identity: &StreamIdentity,
+    ) -> Result<Vec<EventRecord>, RepositoryError> {
+        Ok(GetStream::get_stream(self.routes.repo().repo(), identity)
+            .await?
+            .map(|entity| entity.events().to_vec())
+            .unwrap_or_default())
+    }
+
+    /// Durable event history of this cell's own aggregate stream
+    /// (`{aggregate_type}:{shard}`), oldest first. See
+    /// [`stream_events`](Self::stream_events).
+    pub async fn history(&self) -> Result<Vec<EventRecord>, RepositoryError> {
+        self.stream_events(&self.shard).await
+    }
+
+    /// Event log export of the in-process reference host (restart tests).
+    /// SQLite cells persist rows directly and return an error here; read
+    /// history with [`history`](Self::history) /
+    /// [`stream_events`](Self::stream_events) instead.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_events(&self) -> Result<Vec<DurableCellEvents>, RepositoryError> {
         self.routes.repo().repo().durable_events()
     }
 
     /// Restore the working event log from Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_events(
         &self,
         events: Vec<DurableCellEvents>,
@@ -155,6 +420,7 @@ where
     }
 
     /// Outbox rows committed with the aggregate (same cell SQLite).
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_outbox(&self) -> Result<Vec<crate::OutboxMessage>, RepositoryError> {
         self.routes.repo().repo().durable_outbox()
     }
@@ -169,7 +435,7 @@ where
         worker_id: impl Into<String>,
         lease: Duration,
         max_attempts: u32,
-    ) -> OutboxDispatcher<InMemoryOutboxStore, P>
+    ) -> OutboxDispatcher<<CellStreamStore as HasOutboxStore>::OutboxStore, P>
     where
         P: crate::bus::MessagePublisher,
     {
@@ -182,6 +448,19 @@ where
         )
     }
 
+    /// Rows of this cell's outbox still awaiting delivery.
+    pub async fn outbox_backlog(
+        &self,
+    ) -> Result<crate::outbox_worker::OutboxBacklogStats, RepositoryError> {
+        use crate::outbox_worker::OutboxStore;
+        self.routes
+            .repo()
+            .repo()
+            .outbox_store()
+            .backlog_stats()
+            .await
+    }
+
     /// Attach the celld Queue binding and drain policy used by this cell host.
     #[cfg(feature = "workers-rs")]
     pub fn with_celld_outbox(mut self, outbox: super::celld_outbox::CelldOutbox) -> Self {
@@ -189,31 +468,113 @@ where
         self
     }
 
-    /// Persist this cell's complete state, durably arm its Queue watchdog,
-    /// dispatch pending outbox rows, persist settlements, and rearm or clear
-    /// the watchdog according to the remaining backlog. Once the initial state
-    /// and watchdog are durable, later failures are returned as deferred drain
-    /// diagnostics rather than as a rejection of the committed command.
-    #[cfg(feature = "workers-rs")]
-    pub async fn persist_and_drain_outbox<F, E>(
+    /// Drain committed rows to the configured Queue. Call from the alarm handler
+    /// and optionally after dispatch for low latency. No persistence callback is
+    /// needed. A post-commit drain error must not reject an accepted command.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    pub async fn drain_outbox(
         &self,
         env: &worker::Env,
-        storage: &worker::Storage,
-        persist: F,
-    ) -> Result<super::celld_outbox::CelldOutboxDrainOutcome, crate::bus::TransportError>
-    where
-        F: Fn(&DurableAggregateCellState) -> Result<(), E>,
-        E: std::fmt::Display,
-    {
-        let outbox = self.celld_outbox.as_ref().ok_or_else(|| {
+    ) -> Result<super::celld_outbox::CelldOutboxDrainOutcome, crate::bus::TransportError> {
+        let next_alarm = self.next_schedule_due().map_err(alarm_transport_error)?;
+        self.outbox_config()?
+            .drain(self, env, &self.storage, next_alarm)
+            .await
+    }
+
+    /// The Durable Object alarm handler: fire due domain alarms, then drain
+    /// the outbox. The one Durable Object alarm slot is shared: every wake is
+    /// set to the earliest of the next domain alarm and the outbox watchdog,
+    /// so neither starves the other.
+    ///
+    /// ```rust,ignore
+    /// async fn alarm(&self) -> Result<Response> {
+    ///     let wake = self.cell.alarm(&self.env).await?;
+    ///     Response::ok("ok")
+    /// }
+    /// ```
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    pub async fn alarm(
+        &self,
+        env: &worker::Env,
+    ) -> Result<super::celld_outbox::CelldAlarmOutcome, crate::bus::TransportError> {
+        let alarms = self
+            .fire_due_schedules()
+            .await
+            .map_err(alarm_transport_error)?;
+        let drain = self.drain_outbox(env).await?;
+        Ok(super::celld_outbox::CelldAlarmOutcome {
+            schedules: alarms,
+            drain,
+        })
+    }
+
+    /// A command may have armed an alarm due before the prearmed watchdog
+    /// wake; move the one Durable Object alarm earlier if so. Failure is only
+    /// logged: the prearmed watchdog still wakes the cell, which re-plans.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    async fn reschedule_after_command(&self) {
+        let Ok(outbox) = self.outbox_config() else {
+            return;
+        };
+        let next_alarm = match self.next_schedule_due() {
+            Ok(next_alarm) => next_alarm,
+            Err(error) => {
+                worker::console_error!("cell alarm lookup failed after command: {error}");
+                return;
+            }
+        };
+        if let Err(error) = outbox
+            .schedule(
+                &super::celld_outbox::WorkerAlarm(&self.storage),
+                crate::time::now(),
+                true,
+                next_alarm,
+            )
+            .await
+        {
+            worker::console_error!("cell alarm reschedule failed after command: {error}");
+        }
+    }
+
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    fn outbox_config(
+        &self,
+    ) -> Result<&super::celld_outbox::CelldOutbox, crate::bus::TransportError> {
+        self.celld_outbox.as_ref().ok_or_else(|| {
             crate::bus::TransportError::permanent(
                 "aggregate cell has no celld outbox binding configured",
             )
-        })?;
-        outbox.persist_and_drain(self, env, storage, persist).await
+        })
+    }
+
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    async fn begin_command(
+        &self,
+    ) -> Result<super::celld_outbox::CommandGuard, crate::bus::TransportError> {
+        let next_alarm = self.next_schedule_due().map_err(alarm_transport_error)?;
+        self.outbox_config()?
+            .begin_command(
+                &self.activity,
+                &super::celld_outbox::WorkerAlarm(&self.storage),
+                crate::time::now(),
+                next_alarm,
+            )
+            .await
+    }
+
+    #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+    pub(super) fn command_activity(&self) -> &super::celld_outbox::CommandActivity {
+        &self.activity
+    }
+
+    #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+    pub(super) fn outbox_store(&self) -> <CellStreamStore as HasOutboxStore>::OutboxStore {
+        self.routes.repo().repo().outbox_store()
     }
 
     /// Restore outbox rows from Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_outbox(
         &self,
         messages: Vec<crate::OutboxMessage>,
@@ -222,11 +583,13 @@ where
     }
 
     /// Snapshot cache for Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_snapshots(&self) -> Result<Vec<DurableCellSnapshot>, RepositoryError> {
         self.routes.repo().repo().durable_snapshots()
     }
 
     /// Restore the working snapshot cache from Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_snapshots(
         &self,
         snapshots: Vec<DurableCellSnapshot>,
@@ -238,11 +601,13 @@ where
     }
 
     /// Command-ledger rows for Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_commands(&self) -> Result<Vec<DurableCellCommand>, RepositoryError> {
         self.routes.repo().repo().durable_commands()
     }
 
     /// Restore command-ledger rows before accepting another wait-path request.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_commands(
         &self,
         commands: Vec<DurableCellCommand>,
@@ -252,11 +617,13 @@ where
 
     /// Export events, snapshots, command ledger, outbox, and sealed row as one
     /// versioned value suitable for a single durable storage write.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_state(&self) -> Result<DurableAggregateCellState, RepositoryError> {
         self.routes.repo().repo().durable_state()
     }
 
     /// Restore the complete working copy from one durable storage value.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_state(
         &self,
         state: DurableAggregateCellState,
@@ -270,11 +637,13 @@ where
     }
 
     /// Sealed read-model JSON for GET on this instance.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn sealed_row(&self) -> Result<Option<Value>, RepositoryError> {
         self.routes.repo().repo().sealed_row()
     }
 
     /// Persist the sealed read-model row next to events/snapshots.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn replace_sealed_row(&self, row: Value) -> Result<(), RepositoryError> {
         self.routes.repo().repo().replace_sealed_row(row)
     }
@@ -284,7 +653,44 @@ impl<A> AggregateCell<A>
 where
     A: Aggregate + Snapshottable + Send + Sync + 'static,
 {
+    /// Open a SQL cell with the ordinary repository snapshot policy.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    pub fn from_state_with_snapshots(
+        state: worker::State,
+        frequency: u64,
+    ) -> Result<Self, RepositoryError> {
+        let name = state.id().name().ok_or_else(|| {
+            RepositoryError::Model("aggregate cells require a named Durable Object".into())
+        })?;
+        let shard = StreamIdentity::new(A::aggregate_type(), name)?;
+        let storage = worker::send::SendWrapper::new(state.storage());
+        let store = CellStreamStore::from_state(state, shard.clone())?;
+        Ok(Self {
+            shard,
+            routes: Routes::from_dependencies(
+                AggregateRepository::new(store).with_snapshots(frequency),
+            ),
+            celld_outbox: None,
+            activity: Default::default(),
+            storage,
+        })
+    }
+
+    /// Host a prepared exclusive store with repository snapshot caching.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub fn from_store_with_snapshots(
+        store: CellStreamStore,
+        frequency: u64,
+    ) -> Result<Self, RepositoryError> {
+        let shard = Self::store_shard(&store)?;
+        Ok(Self::from_repository(
+            shard,
+            AggregateRepository::new(store).with_snapshots(frequency),
+        ))
+    }
+
     /// Open a cell with repository snapshot caching (`with_snapshots`).
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn new_with_snapshots(
         shard_id: impl Into<String>,
         frequency: u64,
@@ -298,8 +704,30 @@ where
             ),
             #[cfg(feature = "workers-rs")]
             celld_outbox: None,
+            #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+            activity: Default::default(),
         })
     }
+}
+
+/// One command of [`AggregateCell::dispatch_idempotent_batch`].
+#[derive(Debug, Clone)]
+pub struct CellBatchCommand {
+    /// Mounted command name.
+    pub command: String,
+    /// Its ledger identity (service, principal partition, command id).
+    pub identity: CellCommandIdentity,
+    /// Command input.
+    pub input: Value,
+    /// Its trusted session.
+    pub session: Session,
+}
+
+/// A batch stops at a result worth retrying: the command is in progress,
+/// timed out, throttled or failed inside the cell.
+fn ends_batch(error: &CausalDispatchError) -> bool {
+    let status = error.status_code();
+    status >= 500 || matches!(status, 408 | 429) || error.code() == "COMMAND_IN_PROGRESS"
 }
 
 /// Worker-side namespace: `getByName(format!("{}:{}", type, shard))`.
@@ -345,6 +773,7 @@ where
     }
 
     /// Create or return the cell for `shard_id`.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn get_or_create(
         &mut self,
         shard_id: &str,
@@ -357,6 +786,11 @@ where
         }
         Ok(self.cells.get_mut(&name).expect("just inserted"))
     }
+}
+
+#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+fn alarm_transport_error(error: RepositoryError) -> crate::bus::TransportError {
+    crate::bus::TransportError::retryable(format!("cell alarm storage: {error}"))
 }
 
 /// Cell instance name: `{aggregate_type}:{shard_id}`.

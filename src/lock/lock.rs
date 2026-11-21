@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::Arc;
 
 use super::LockError;
 
@@ -29,4 +30,39 @@ pub trait Lock: Send + Sync {
     /// Idempotent: releasing a lock this caller no longer holds (e.g. an
     /// expired distributed lease that was stolen) is a no-op success.
     fn unlock(&self) -> impl Future<Output = Result<(), LockError>> + Send + '_;
+
+    /// Release from a `Drop`, which cannot await. Must not block. A lock
+    /// that releases by I/O hands the release to a background task, or
+    /// leaves it to its own expiry when there is nowhere to run one.
+    fn release_detached(self: Arc<Self>);
+}
+
+/// A held [`Lock`]. It is the only thing that releases the lock: by
+/// [`release`](Self::release), or when it is dropped.
+pub struct LockGuard<L: Lock> {
+    lock: Option<Arc<L>>,
+}
+
+impl<L: Lock> LockGuard<L> {
+    /// Wait for `lock` and hold it.
+    pub async fn acquire(lock: Arc<L>) -> Result<Self, LockError> {
+        lock.lock().await?;
+        Ok(Self { lock: Some(lock) })
+    }
+
+    /// Release and wait for the release to finish.
+    pub async fn release(mut self) -> Result<(), LockError> {
+        match self.lock.take() {
+            Some(lock) => lock.unlock().await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl<L: Lock> Drop for LockGuard<L> {
+    fn drop(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            lock.release_detached();
+        }
+    }
 }

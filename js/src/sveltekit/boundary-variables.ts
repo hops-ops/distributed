@@ -3,8 +3,14 @@ import {
 	type ReplicaOperationArtifact
 } from '../replica/index.js';
 import type { GraphqlVariables } from '../types.js';
+import type { ReplicaVariableInputRef } from '../replica/types.js';
+import {
+	decodeSearchScalar,
+	normalizeSearchParamSource,
+	type DistributedSearchParamSource
+} from './search-variables.js';
 
-const BINDING_VERSION = 1;
+export const DISTRIBUTED_BOUNDARY_BINDING_VERSION = 2;
 const GRAPHQL_NAME = /^[_A-Za-z][_0-9A-Za-z]*$/;
 const MAX_BINDING_VARIABLES = 128;
 const MAX_PATH_SEGMENTS = 16;
@@ -12,13 +18,20 @@ const MAX_LITERAL_DEPTH = 32;
 const MAX_LITERAL_VALUES = 4_096;
 const HOSTILE_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
 
+type SearchScalarFor<TValue> =
+	NonNullable<TValue> extends string ? 'String' | 'ID' :
+	NonNullable<TValue> extends number ? 'Int' | 'Float' :
+	NonNullable<TValue> extends boolean ? 'Boolean' : never;
+
+type SearchSourceFor<TValue> = unknown extends TValue
+	? DistributedSearchParamSource
+	: NonNullable<TValue> extends readonly (infer TItem)[]
+		? DistributedSearchParamSource<SearchScalarFor<TItem>, 'all'> & { mode: 'all' }
+		: DistributedSearchParamSource<SearchScalarFor<TValue>, 'first'>;
+
 export type DistributedBoundaryVariableSource<TValue = unknown> =
 	| Readonly<{ kind: 'route_param'; name: string }>
-	| Readonly<{
-			kind: 'search_param';
-			name: string;
-			mode?: 'first' | 'all';
-	  }>
+	| SearchSourceFor<TValue>
 	| Readonly<{ kind: 'trusted_session'; path: readonly string[] }>
 	| Readonly<{ kind: 'constant'; value: TValue }>
 	| Readonly<{ kind: 'forwarded_prop'; path: readonly string[] }>
@@ -47,7 +60,7 @@ export type DistributedBoundaryBinding<
 	TSession = unknown,
 	TProps = Readonly<Record<string, unknown>>
 > = Readonly<{
-	version: 1;
+	version: 2;
 	id: string;
 	artifactId: string;
 	sources: DistributedBoundaryVariableSources<TVariables>;
@@ -92,7 +105,7 @@ export function defineDistributedBoundaryBinding<
 	sources: DistributedBoundaryVariableSources<TVariables>
 ): DistributedBoundaryBinding<TVariables, TSession, TProps> {
 	const validated = validateSources(artifact, sources);
-	const id = `boundary-v${BINDING_VERSION}:${fnv1a64(
+	const id = `boundary-v${DISTRIBUTED_BOUNDARY_BINDING_VERSION}:${fnv1a64(
 		`${artifact.id}\n${stableJson(validated)}`
 	)}`;
 	const resolve = (
@@ -100,7 +113,7 @@ export function defineDistributedBoundaryBinding<
 	): TVariables =>
 		resolveDistributedBoundaryVariables(artifact, validated, context);
 	return Object.freeze({
-		version: BINDING_VERSION,
+		version: DISTRIBUTED_BOUNDARY_BINDING_VERSION,
 		id,
 		artifactId: artifact.id,
 		sources: validated,
@@ -121,6 +134,9 @@ export function defineDistributedBoundaryOperation<
 	artifact: ReplicaOperationArtifact<TData, TVariables>,
 	binding: DistributedBoundaryBinding<TVariables, TSession, TProps>
 ): DistributedBoundaryOperation<TData, TVariables, TSession, TProps> {
+	if (binding.version !== DISTRIBUTED_BOUNDARY_BINDING_VERSION) {
+		throw new TypeError('Distributed boundary binding version is unsupported; regenerate the boundary plan');
+	}
 	if (binding.artifactId !== artifact.id) {
 		throw new TypeError('Distributed boundary binding belongs to a different operation artifact');
 	}
@@ -184,15 +200,12 @@ function resolveSource<TSession, TProps>(
 		}
 		case 'search_param': {
 			const search = context.search;
-			if (isSearchParams(search)) {
-				if (source.mode === 'all') return search.getAll(source.name);
-				const value = search.get(source.name);
-				return value === null ? OMITTED : value;
-			}
-			const value = ownValue(search, source.name);
-			if (value === undefined) return source.mode === 'all' ? [] : OMITTED;
-			if (source.mode === 'all') return Array.isArray(value) ? [...value] : [value];
-			return Array.isArray(value) ? (value[0] ?? OMITTED) : value;
+			const value = isSearchParams(search) ? search.getAll(source.name) : ownValue(search, source.name);
+			const values = value === undefined ? [] : Array.isArray(value) ? value : [value];
+			if (values.length === 0) return OMITTED;
+			return source.mode === 'all'
+				? values.map((entry) => decodeSearchScalar(entry, source.scalar))
+				: decodeSearchScalar(values[0], source.scalar);
 		}
 		case 'trusted_session': {
 			const value = readPath(context.session, source.path, 'trusted session');
@@ -230,7 +243,7 @@ function validateSources<TData, TVariables extends GraphqlVariables>(
 			throw new TypeError(`Distributed boundary binding names unknown variable ${name}`);
 		}
 		const source = ownValue(sources, name);
-		entries.push([name, validateSource(source, name)]);
+		entries.push([name, validateSource(source, name, definitions[name]!)]);
 	}
 	for (const [name, definition] of Object.entries(definitions)) {
 		const required =
@@ -247,12 +260,22 @@ function validateSources<TData, TVariables extends GraphqlVariables>(
 	return Object.freeze(Object.fromEntries(entries)) as DistributedBoundaryVariableSources<TVariables>;
 }
 
-function validateSource(value: unknown, variable: string): DistributedBoundaryVariableSource {
+function variableGraphqlType(definition: ReplicaVariableInputRef): string {
+	if (definition.kind === 'list') return `[${variableGraphqlType(definition.item)}]`;
+	return definition.kind === 'scalar' ? definition.scalar : '';
+}
+
+function validateSource(
+	value: unknown,
+	variable: string,
+	definition: ReplicaVariableInputRef
+): DistributedBoundaryVariableSource {
 	const source = exactRecord(value, `binding source ${variable}`);
-	if (typeof source.kind !== 'string') {
+	const kind = ownValue(source, 'kind');
+	if (typeof kind !== 'string') {
 		throw new TypeError(`Distributed boundary source ${variable} has no kind`);
 	}
-	switch (source.kind) {
+	switch (kind) {
 		case 'omit':
 			exactKeys(source, ['kind'], variable);
 			return Object.freeze({ kind: 'omit' });
@@ -260,15 +283,7 @@ function validateSource(value: unknown, variable: string): DistributedBoundaryVa
 			exactKeys(source, ['kind', 'name'], variable);
 			return Object.freeze({ kind: 'route_param', name: safeName(source.name, variable) });
 		case 'search_param': {
-			exactKeys(source, ['kind', 'name', 'mode'], variable, ['mode']);
-			if (source.mode !== undefined && source.mode !== 'first' && source.mode !== 'all') {
-				throw new TypeError(`Distributed boundary source ${variable} has invalid search mode`);
-			}
-			return Object.freeze({
-				kind: 'search_param',
-				name: safeName(source.name, variable),
-				...(source.mode === undefined ? {} : { mode: source.mode })
-			});
+			return normalizeSearchParamSource(source, variable, variableGraphqlType(definition));
 		}
 		case 'trusted_session':
 			exactKeys(source, ['kind', 'path'], variable);

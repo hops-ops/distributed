@@ -9,6 +9,8 @@ mod atlas;
 mod cli;
 mod client_compiler;
 pub mod contracts;
+mod game_client;
+mod game_wasm;
 mod generate;
 mod js_framework;
 pub mod lifecycle;
@@ -20,10 +22,10 @@ pub use atlas::{render_atlas_schema, AtlasDatabaseUrl, AtlasSchemaSpec};
 pub use cli::{
     run, run_distributed, AgentHarness, BuildArgs, Bus, ClientArgs, ClientManifestArgs,
     ContractsAcceptArgs, ContractsArgs, ContractsCheckArgs, ContractsCommands, ContractsOutput,
-    DescribeArgs, DevArgs, DistributedArgs, DistributedCommands, Framework, GitopsPromote,
-    JavascriptWatchArgs, LifecycleOutput, ManifestFormat, Metrics, ProbeArgs, ScaffoldArgs,
-    SchemaArgs, SchemaDialect, SchemaFormat, ServiceArgs, ServiceCommands, SkillsArgs,
-    SkillsCommands, SkillsInitArgs, Store, Transport,
+    DescribeArgs, DevArgs, DistributedArgs, DistributedCommands, Framework, GameClientArgs,
+    GameManifestArgs, GameWasmArgs, GitopsPromote, JavascriptWatchArgs, LifecycleOutput,
+    ManifestFormat, Metrics, ProbeArgs, ScaffoldArgs, SchemaArgs, SchemaDialect, SchemaFormat,
+    ServiceArgs, ServiceCommands, SkillsArgs, SkillsCommands, SkillsInitArgs, Store, Transport,
 };
 pub use client_compiler::{
     compile_client, ClientCompileError, ClientCompileInput, ClientDocument, ClientSourceLocation,
@@ -33,31 +35,33 @@ pub use client_compiler::{
 };
 pub use contracts::{
     check_migration_history, check_migration_inventory, check_predecessor_chain,
-    classify_release_programs, classify_snapshot_diff, close_local_contract_chain, contracts_accept,
-    contracts_check, diff_snapshots, snapshot_from_json, ArtifactIdentity, ArtifactPredecessor,
-    ArtifactProvenance, BaselineAvailability, ClassifiedChange, ClientDeclaration, ClientInventory,
-    ClientProgramArtifact, ClientProgramAsset, ClientProgramDescriptor, ClientProgramSurface,
-    ContractAcceptScope, ContractArtifactKind, ContractCatalog, ContractCheckResult,
-    ContractDiagnostic, ContractDiagnosticCode, ContractEntry, ContractError, ContractScope,
-    ContractsAcceptReport, ContractsCheckReport, EnvironmentPolicyReference, LifecycleDecision,
-    MigrationDialect, MigrationEntry, MigrationFile, MigrationHistoryCheck, MigrationInventory,
-    ObservedPredecessor, ProgramCompatibility, SafeDiagnosticValue,
-    SemanticSnapshot, SnapshotChange, SnapshotDiff, SnapshotEntry, MAX_CATALOG_BYTES,
-    MAX_CATALOG_DIRECTORIES, MAX_CATALOG_DIRECTORY_DEPTH, MAX_CATALOG_DIRECTORY_ENTRIES,
-    MAX_CATALOG_ENTRIES, MAX_CATALOG_FILES, MAX_CATALOG_GLOB_MATCHES, MAX_CATALOG_JSON_DEPTH,
-    MAX_MIGRATIONS, MAX_MIGRATION_INVENTORY_BYTES, MAX_MIGRATION_SQL_BYTES, MAX_SNAPSHOT_DEPTH,
-    MAX_SNAPSHOT_PATHS, MAX_SNAPSHOT_VALUE_BYTES, MIGRATION_INVENTORY_PATH,
-    MIGRATION_INVENTORY_SCHEMA_VERSION, MIGRATION_OWNER, MIGRATION_SCOPE,
+    classify_release_programs, classify_snapshot_diff, close_local_contract_chain,
+    contracts_accept, contracts_check, diff_snapshots, snapshot_from_json, ArtifactIdentity,
+    ArtifactPredecessor, ArtifactProvenance, BaselineAvailability, ClassifiedChange,
+    ClientDeclaration, ClientInventory, ClientProgramArtifact, ClientProgramAsset,
+    ClientProgramDescriptor, ClientProgramSurface, ContractAcceptScope, ContractArtifactKind,
+    ContractCatalog, ContractCheckResult, ContractDiagnostic, ContractDiagnosticCode,
+    ContractEntry, ContractError, ContractScope, ContractsAcceptReport, ContractsCheckReport,
+    EnvironmentPolicyReference, LifecycleDecision, MigrationDialect, MigrationEntry, MigrationFile,
+    MigrationHistoryCheck, MigrationInventory, ObservedPredecessor, ProgramCompatibility,
+    SafeDiagnosticValue, SemanticSnapshot, SnapshotChange, SnapshotDiff, SnapshotEntry,
+    MAX_CATALOG_BYTES, MAX_CATALOG_DIRECTORIES, MAX_CATALOG_DIRECTORY_DEPTH,
+    MAX_CATALOG_DIRECTORY_ENTRIES, MAX_CATALOG_ENTRIES, MAX_CATALOG_FILES,
+    MAX_CATALOG_GLOB_MATCHES, MAX_CATALOG_JSON_DEPTH, MAX_MIGRATIONS,
+    MAX_MIGRATION_INVENTORY_BYTES, MAX_MIGRATION_SQL_BYTES, MAX_SNAPSHOT_DEPTH, MAX_SNAPSHOT_PATHS,
+    MAX_SNAPSHOT_VALUE_BYTES, MIGRATION_INVENTORY_PATH, MIGRATION_INVENTORY_SCHEMA_VERSION,
+    MIGRATION_OWNER, MIGRATION_SCOPE,
 };
+pub use game_client::{generate_game_client, validate_game_surface, ImportExtension};
 pub use generate::{generate_service_scaffold, package_name};
 pub use lifecycle::{
-    run_lifecycle_build, run_lifecycle_dev, ArtifactNodeReceipt, BuildDrift, DistributedSourceIdentity,
-    GenerationManifest, LifecycleBuildConfig, LifecycleBuildOptions, LifecycleBuildReport,
-    LifecycleConfig, LifecycleDevConfig, LifecycleDevOptions, LifecycleDevProbe,
-    LifecycleDevProcess, LifecycleDevReport, LifecycleError, LifecycleExecutor, LifecycleGraph, LifecycleNode,
-    ReleaseManifest, ReleaseMember, GENERATION_MANIFEST_SCHEMA_VERSION,
-    LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION, LIFECYCLE_CONFIG_SCHEMA_VERSION,
-    LIFECYCLE_GRAPH_SCHEMA_VERSION, NODE_RECEIPT_SCHEMA_VERSION,
+    run_lifecycle_build, run_lifecycle_dev, ArtifactNodeReceipt, BuildDrift,
+    DistributedSourceIdentity, GenerationManifest, LifecycleBuildConfig, LifecycleBuildOptions,
+    LifecycleBuildReport, LifecycleConfig, LifecycleDevConfig, LifecycleDevOptions,
+    LifecycleDevProbe, LifecycleDevProcess, LifecycleDevReport, LifecycleError, LifecycleExecutor,
+    LifecycleGraph, LifecycleNode, ReleaseManifest, ReleaseMember,
+    GENERATION_MANIFEST_SCHEMA_VERSION, LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION,
+    LIFECYCLE_CONFIG_SCHEMA_VERSION, LIFECYCLE_GRAPH_SCHEMA_VERSION, NODE_RECEIPT_SCHEMA_VERSION,
     RELEASE_MANIFEST_SCHEMA_VERSION,
 };
 pub use skills::{embedded_skills, generate_skills, EmbeddedFile, EmbeddedSkill, SkillsInitSpec};

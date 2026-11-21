@@ -894,7 +894,12 @@ export function relationshipMembership(
 				)
 			};
 		}
-		if (!sameValue(parent.fields[local], target.fields[remote])) {
+		// Direct SQL joins use equality, not IS NOT DISTINCT FROM: null never joins.
+		if (
+			parent.fields[local] === null ||
+			target.fields[remote] === null ||
+			!sameValue(parent.fields[local], target.fields[remote])
+		) {
 			return { related: false };
 		}
 	}

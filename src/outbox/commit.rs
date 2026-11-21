@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::aggregate::{Aggregate, AggregateRepository};
 use crate::domain_event::{DomainEvent, DomainEventCaptureError, DomainEventCommitGuardError};
@@ -12,107 +11,42 @@ use crate::repository::{
 };
 use crate::table::TableWritePlan;
 
-/// Publishes already-committed outbox rows and settles their claims.
-///
-/// Implemented by the outbox → bus bridge. `Service::with_bus` prefers a
-/// bounded worker mailbox over this hook; the hook is the fallback when no
-/// mailbox is installed. It is object-safe so the repository can hold it
-/// without naming the transport/store types.
-pub trait OutboxPublishHook: Send + Sync {
-    /// Publish committed, claimed outbox rows and settle their claims. Publish
-    /// failures are absorbed (the rows stay retryable for the worker); only a
-    /// store error surfaces.
-    fn publish_claimed<'a>(
-        &'a self,
-        claimed: Vec<OutboxMessage>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), RepositoryError>> + Send + 'a>>;
-}
+/// What a commit does with the ids of the outbox rows it just inserted.
+type AfterCommit =
+    Arc<dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-/// Outbox publisher installed on a repository so commits publish immediately.
+/// Installed on a repository so that a commit starts publishing its outbox
+/// rows without waiting for the next poll.
+///
+/// There is one publish path: rows are committed **pending**, and whoever
+/// receives the ids claims, publishes and settles them through
+/// `OutboxDispatcher::dispatch_ids`. `Service::with_bus` hands the ids to a
+/// bounded worker mailbox, so the commit does not wait for the broker.
+#[derive(Clone)]
 pub struct OutboxPublisherConfig {
-    pub(crate) hook: Arc<dyn OutboxPublishHook>,
-    pub(crate) worker_id: String,
-    pub(crate) lease: Duration,
-    /// Bounded worker mailbox. When set, commit `try_send`s ids and returns;
-    /// the worker claims and publishes. When unset, the hook is the fallback
-    /// (tests, no-runtime builds).
-    pub(crate) schedule: Option<Arc<dyn Fn(Vec<String>) + Send + Sync>>,
-}
-
-/// Detach immediate publish from command completion.
-///
-/// Prefer `config.schedule`: enqueue ids onto the bounded worker and return.
-/// Without a mailbox, the hook runs on a spawned task when a Tokio runtime is
-/// current, or inline when it is not, so publish is not dropped.
-pub(crate) async fn start_immediate_publish(
-    config: &OutboxPublisherConfig,
-    ids: Vec<String>,
-    fallback_rows: Vec<OutboxMessage>,
-) {
-    if let Some(schedule) = &config.schedule {
-        if !ids.is_empty() {
-            schedule(ids);
-        }
-        return;
-    }
-    if fallback_rows.is_empty() {
-        return;
-    }
-    let hook = Arc::clone(&config.hook);
-    #[cfg(any(
-        feature = "http",
-        feature = "grpc",
-        feature = "postgres",
-        feature = "sqlite",
-        feature = "nats",
-        feature = "rabbitmq",
-        feature = "kafka",
-        test,
-    ))]
-    {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _ = handle.spawn(async move {
-                let _ = hook.publish_claimed(fallback_rows).await;
-            });
-            return;
-        }
-        let _ = hook.publish_claimed(fallback_rows).await;
-    }
-    #[cfg(not(any(
-        feature = "http",
-        feature = "grpc",
-        feature = "postgres",
-        feature = "sqlite",
-        feature = "nats",
-        feature = "rabbitmq",
-        feature = "kafka",
-        test,
-    )))]
-    {
-        let _ = hook.publish_claimed(fallback_rows).await;
-    }
+    after_commit: AfterCommit,
 }
 
 impl OutboxPublisherConfig {
-    /// Build the config from a publish hook, the worker id used to scope
-    /// claims, and the publish lease.
+    /// `after_commit` receives the ids of the rows each commit inserted. The
+    /// commit awaits the returned future, so it must not wait on the broker
+    /// unless the host has no background task to hand the ids to.
     pub fn new(
-        hook: Arc<dyn OutboxPublishHook>,
-        worker_id: impl Into<String>,
-        lease: Duration,
+        after_commit: impl Fn(Vec<String>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         Self {
-            hook,
-            worker_id: worker_id.into(),
-            lease,
-            schedule: None,
+            after_commit: Arc::new(after_commit),
         }
     }
 
-    /// Install a non-blocking after-commit scheduler (bounded worker mailbox).
-    pub fn with_schedule(mut self, schedule: Arc<dyn Fn(Vec<String>) + Send + Sync>) -> Self {
-        self.schedule = Some(schedule);
-        self
+    /// Hand the ids a commit just inserted to the publisher.
+    pub(crate) async fn publish_after_commit(&self, ids: Vec<String>) {
+        if !ids.is_empty() {
+            (self.after_commit)(ids).await;
+        }
     }
 }
 
@@ -250,16 +184,6 @@ where
             .collect();
 
         let publisher = self.repo.outbox_publisher();
-        let mut fallback_rows = Vec::new();
-        if let Some(config) = publisher {
-            if config.schedule.is_none() {
-                let now = crate::time::now();
-                for message in &mut self.outbox_messages {
-                    message.claim_at(&config.worker_id, config.lease, now)?;
-                }
-                fallback_rows = self.outbox_messages.clone();
-            }
-        }
 
         let (snapshots, snapshot_version) = self.repo.snapshot_writes_for(aggregate)?;
         let identity = StreamIdentity::new(A::aggregate_type(), aggregate.entity().id())?;
@@ -272,6 +196,7 @@ where
                 read_model_plans: self.read_model_plans,
                 snapshots,
                 inbox_receipts: Vec::new(),
+                schedules: Vec::new(),
             })
             .await?;
         if let Some(version) = snapshot_version {
@@ -285,7 +210,9 @@ where
         // Best-effort after-commit publish. Command completion is this commit;
         // publish must not delay the caller.
         if let Some(config) = publisher {
-            start_immediate_publish(config, outbox_message_ids.clone(), fallback_rows).await;
+            config
+                .publish_after_commit(outbox_message_ids.clone())
+                .await;
         }
 
         Ok(CommitReceipt { outbox_message_ids })
@@ -380,6 +307,7 @@ mod tests {
     use super::*;
     use crate::{sourced, AggregateBuilder, Entity, InMemoryRepository, OutboxStore};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct Dummy {
@@ -423,67 +351,36 @@ mod tests {
         }
     }
 
-    struct HoldingHook {
-        started: tokio::sync::Notify,
-        gate: tokio::sync::Notify,
-        finished: Mutex<bool>,
-    }
-
-    impl OutboxPublishHook for HoldingHook {
-        fn publish_claimed<'a>(
-            &'a self,
-            claimed: Vec<OutboxMessage>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), RepositoryError>> + Send + 'a>> {
-            Box::pin(async move {
-                let _ = claimed;
-                self.started.notify_waiters();
-                self.gate.notified().await;
-                *self.finished.lock().unwrap() = true;
-                Ok(())
-            })
-        }
-    }
-
     #[tokio::test]
-    async fn immediate_publish_does_not_delay_commit() {
-        let hook = Arc::new(HoldingHook {
-            started: tokio::sync::Notify::new(),
-            gate: tokio::sync::Notify::new(),
-            finished: Mutex::new(false),
-        });
+    async fn a_commit_hands_over_its_ids_and_leaves_every_row_pending() {
+        let handed_over = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&handed_over);
         let mut repo = InMemoryRepository::new().aggregate::<Dummy>();
-        repo.set_outbox_publisher(OutboxPublisherConfig::new(
-            Arc::clone(&hook) as Arc<dyn OutboxPublishHook>,
-            "immediate:test",
-            Duration::from_secs(5),
-        ));
-
+        repo.set_outbox_publisher(OutboxPublisherConfig::new(move |ids| {
+            seen.lock().unwrap().extend(ids);
+            Box::pin(async {})
+        }));
         let mut aggregate = Dummy::default();
         aggregate.touch().unwrap();
-        let event = OutboxMessage::create("msg-hold", "DummyTouched", b"{}".to_vec()).unwrap();
+        let now = crate::time::now();
+        let due = OutboxMessage::create("due", "T", vec![]).unwrap();
+        let timer = OutboxMessage::create("timer", "T", vec![])
+            .unwrap()
+            .deliver_after(now, Duration::from_secs(3600));
 
-        let started = hook.started.notified();
-        let receipt = repo.outbox(event).commit(&mut aggregate).await.unwrap();
-        assert_eq!(receipt.outbox_message_ids(), ["msg-hold".to_string()]);
-        assert!(
-            !*hook.finished.lock().unwrap(),
-            "commit must return before the holding publish hook finishes"
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), started)
+        repo.outbox(due)
+            .outbox(timer)
+            .commit(&mut aggregate)
             .await
-            .expect("immediate publish should start");
-        hook.gate.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if *hook.finished.lock().unwrap() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("immediate publish should finish after the gate opens");
+            .unwrap();
+
+        assert_eq!(
+            *handed_over.lock().unwrap(),
+            vec!["due".to_string(), "timer".to_string()]
+        );
+        // Nothing is claimed inside the commit: the publisher claims.
+        let pending = repo.repo().outbox_store().pending(10).await.unwrap();
+        assert_eq!(pending.len(), 2);
     }
 
     #[tokio::test]
@@ -582,6 +479,30 @@ mod tests {
     #[domain_event(name = "counter.notified", version = 1)]
     struct CounterNotified {
         public_value: i64,
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_would_drop_captured_events_is_refused_on_every_path() {
+        let repo = InMemoryRepository::new().aggregate::<PublishedCounter>();
+        let mut counter = PublishedCounter::default();
+        counter.open("counter-plain".into()).unwrap();
+
+        // Plain commit.
+        let plain = repo.commit(&mut counter).await.unwrap_err();
+        assert!(plain.to_string().contains("publish_events"), "{plain}");
+        // The transactional batch builder.
+        let batch = crate::CommitBuilder::new(repo.repo())
+            .aggregate(&mut counter)
+            .commit()
+            .await
+            .unwrap_err();
+        assert!(batch.to_string().contains("publish_events"), "{batch}");
+        // Nothing was stored, and the occurrences are intact for a retry.
+        assert!(repo.get("counter-plain").await.unwrap().is_none());
+        assert_eq!(counter.entity.pending_domain_events().len(), 1);
+
+        repo.publish_events().commit(&mut counter).await.unwrap();
+        assert!(repo.get("counter-plain").await.unwrap().is_some());
     }
 
     #[tokio::test]

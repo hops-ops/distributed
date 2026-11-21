@@ -12,7 +12,7 @@ use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
 use distributed::command_dispatch::SharedCommandHost;
 use distributed::graphql::IdentityConfig;
 use distributed::microsvc::{
-    spawn_outbox_publish_loop, spawn_service_consumer_loop, Service, CONSUMER_IDLE_POLL,
+    spawn_outbox_publish_loop, spawn_service_consumer_loop, LifecycleGate, Service,
 };
 use distributed::BusPublisher;
 use distributed::{PostgresLockManager, PostgresRepository};
@@ -27,6 +27,8 @@ const BUS_GROUP: &str = "e2e-celld";
 
 pub struct HostOptions {
     pub bind: String,
+    pub public_origin: String,
+    pub ui_origin: String,
     pub identity: IdentityConfig,
     pub celld_url: String,
     pub nats_url: String,
@@ -62,7 +64,11 @@ async fn run_postgres(
     let nats = connect_nats(&options.nats_url).await?;
 
     let change_rx = repo.read_model_changes();
-    let service = build_service(repo.clone(), locks.clone(), repo.clone()).with_bus(nats.clone());
+    // Under `distributed dev`, only the active generation may write.
+    let lifecycle = LifecycleGate::from_env();
+    let service = build_service(repo.clone(), locks.clone(), repo.clone())
+        .with_lifecycle(lifecycle.clone())
+        .with_bus(nats.clone());
     let gql = build_graphql_engine(&repo, &service, options.identity.clone(), Some(change_rx))?;
     let service = Arc::new(service.try_with_graphql(gql)?);
     let publisher = BusPublisher::new(Arc::new(nats.clone()));
@@ -87,10 +93,11 @@ async fn run_postgres(
         let nats = nats.clone();
         spawn_service_consumer_loop(move || {
             build_service(repo.clone(), locks.clone(), repo.clone())
-                .with_bus(nats.clone().with_idle_poll(CONSUMER_IDLE_POLL))
+                .with_lifecycle(lifecycle.clone())
+                .with_bus(nats.clone())
         });
     }
-    spawn_zitadel_scrape(repo.clone());
+    spawn_zitadel_scrape(service.clone());
 
     eprintln!(
         "e2e-celld (postgres) listening on http://{} — cell wait-path; bus drain; @live stays here",
@@ -100,6 +107,8 @@ async fn run_postgres(
         service,
         host,
         &options.bind,
+        &options.public_origin,
+        &options.ui_origin,
         queue_relay,
         options.internal_secret,
     )
@@ -127,15 +136,7 @@ async fn connect_nats(url: &str) -> Result<NatsBus, Box<dyn std::error::Error + 
     Ok(bus)
 }
 
-fn spawn_zitadel_scrape<R>(repo: R)
-where
-    R: distributed::TransactionalCommit
-        + distributed::ReadModelWritePlanStore
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
+fn spawn_zitadel_scrape(service: Arc<Service>) {
     match ZitadelScrapeConfig::from_env() {
         Some(cfg) if cfg.background_enabled() || cfg.on_start => {
             eprintln!(
@@ -144,7 +145,7 @@ where
                 cfg.interval.as_secs(),
                 cfg.on_start
             );
-            spawn_scrape_loop(repo, cfg);
+            spawn_scrape_loop(service, cfg);
         }
         Some(_) => {
             eprintln!(

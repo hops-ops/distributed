@@ -1,16 +1,5 @@
-use distributed::microsvc::{CausalCommandContext, HandlerError};
+use distributed::microsvc::CausalCommandContext;
 use distributed::Aggregate;
-
-pub(super) fn rejected(err: impl std::fmt::Display) -> HandlerError {
-    HandlerError::Rejected(err.to_string())
-}
-
-pub(super) fn principal<A>(ctx: &CausalCommandContext<'_, A>) -> Result<String, HandlerError>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
-    ctx.user_id().map(str::to_string)
-}
 
 pub(super) fn authenticated_user<A>(ctx: &CausalCommandContext<'_, A>) -> bool
 where

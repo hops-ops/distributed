@@ -5,7 +5,7 @@ use distributed::bus::{Message, MessagePublisher, TransportError};
 use distributed::{
     Aggregate, AggregateBuilder, ClaimOutboxMessages, GetStream, OutboxClaimRef, OutboxDispatcher,
     OutboxMessage, OutboxMessageStatus, OutboxPublishFailureAction, OutboxStore, RepositoryError,
-    StreamIdentity, TransactionalCommit,
+    StreamIdentity, TransactionalCommit, OUTBOX_RETRY,
 };
 
 use super::outbox_support::find_outbox_by_id;
@@ -223,10 +223,9 @@ where
         .complete(&claim)
         .await
         .expect("owning worker should complete the claim");
-    let published = find_outbox_by_id(&outbox, &complete_message_id)
+    assert!(find_outbox_by_id(&outbox, &complete_message_id)
         .await
-        .expect("completed message should still be queryable");
-    assert_eq!(published.status, OutboxMessageStatus::Published);
+        .is_none());
 
     let retry_message_id = unique_id("retry-outbox");
     commit_outbox_for_seat(
@@ -244,7 +243,7 @@ where
     .await;
     let claim = OutboxClaimRef::from_message(&claimed).expect("claim should be valid");
     let action = outbox
-        .record_failure(&claim, "first failure", 2)
+        .record_failure(&claim, "first failure", false, 2)
         .await
         .expect("first failure should be recorded");
     assert_eq!(action, OutboxPublishFailureAction::Released);
@@ -256,6 +255,8 @@ where
     assert_eq!(released.attempts, 1);
     assert_eq!(released.last_error.as_deref(), Some("first failure"));
 
+    // The released row waits out its backoff before it is claimable.
+    tokio::time::sleep(OUTBOX_RETRY.delay(1) + Duration::from_millis(30)).await;
     let claimed = claim_one(
         &outbox,
         ClaimOutboxMessages::new("worker-r", 1, Duration::from_secs(60)),
@@ -268,7 +269,7 @@ where
     assert!(matches!(stale_err, RepositoryError::InvalidState { .. }));
     let claim = OutboxClaimRef::from_message(&claimed).expect("claim should be valid");
     let action = outbox
-        .record_failure(&claim, "second failure", 2)
+        .record_failure(&claim, "second failure", false, 2)
         .await
         .expect("second failure should be recorded");
     assert_eq!(action, OutboxPublishFailureAction::Failed);
@@ -375,20 +376,15 @@ where
         .await
         .expect("batched complete should settle every active claim");
     for message_id in &message_ids {
-        let published = find_outbox_by_id(&outbox, message_id)
-            .await
-            .expect("completed message should still be queryable");
-        assert_eq!(published.status, OutboxMessageStatus::Published);
-        assert_eq!(published.worker_id, None);
+        assert!(find_outbox_by_id(&outbox, message_id).await.is_none());
     }
 
-    // Re-settling the now-published rows is a stale batch: same
-    // InvalidState surface as a serial `complete` of a settled row.
+    // Re-settling deleted delivery rows is NotFound, as with serial completion.
     let stale_err = outbox
         .complete_many(&claims)
         .await
         .expect_err("stale batch should not complete again");
-    assert!(matches!(stale_err, RepositoryError::InvalidState { .. }));
+    assert!(matches!(stale_err, RepositoryError::NotFound { .. }));
 
     // An empty batch is a no-op, not an error.
     outbox
@@ -449,7 +445,7 @@ where
         "stale-worker complete should be InvalidState, got {late_complete:?}"
     );
     let late_release = outbox
-        .release(&stale_claim_a, "A woke up late")
+        .release(&stale_claim_a, "A woke up late", Duration::ZERO)
         .await
         .expect_err("A's late release must be fenced");
     assert!(
@@ -461,14 +457,7 @@ where
         .complete(&claim_b)
         .await
         .expect("the reclaiming worker should complete the row");
-    let published = find_outbox_by_id(&outbox, &message_id)
-        .await
-        .expect("reclaimed message should still be queryable");
-    assert_eq!(
-        published.status,
-        OutboxMessageStatus::Published,
-        "row is published by the worker that reclaimed it, not by the crashed one"
-    );
+    assert!(find_outbox_by_id(&outbox, &message_id).await.is_none());
 }
 
 pub async fn publish_failure_after_commit_retains_outbox_row_until_delivered<R, S>(
@@ -513,6 +502,7 @@ pub async fn publish_failure_after_commit_retains_outbox_row_until_delivered<R, 
     );
     assert_eq!(after_1.attempts, 1);
 
+    tokio::time::sleep(OUTBOX_RETRY.delay(1) + Duration::from_millis(30)).await;
     let pass2 = dispatcher.dispatch_ids(&ids).await.expect("second pass");
     assert_eq!(pass2.published, 0);
     assert_eq!(pass2.released, 1);
@@ -522,18 +512,12 @@ pub async fn publish_failure_after_commit_retains_outbox_row_until_delivered<R, 
     assert_eq!(after_2.status, OutboxMessageStatus::Pending);
     assert_eq!(after_2.attempts, 2);
 
+    tokio::time::sleep(OUTBOX_RETRY.delay(2) + Duration::from_millis(30)).await;
     let pass3 = dispatcher.dispatch_ids(&ids).await.expect("third pass");
     assert_eq!(pass3.published, 1);
     assert_eq!(pass3.released, 0);
     assert_eq!(pass3.failed, 0);
-    let published = find_outbox_by_id(&outbox, &message_id)
-        .await
-        .expect("row is still queryable after publish");
-    assert_eq!(
-        published.status,
-        OutboxMessageStatus::Published,
-        "the row is Published only after a successful delivery"
-    );
+    assert!(find_outbox_by_id(&outbox, &message_id).await.is_none());
 
     assert_eq!(
         dispatcher.publisher().attempts(),
@@ -545,6 +529,116 @@ pub async fn publish_failure_after_commit_retains_outbox_row_until_delivered<R, 
         vec![message_id],
         "the message was delivered exactly once, only on the successful pass"
     );
+}
+
+/// A publisher that is down: every publish fails as retryable.
+struct DownPublisher;
+
+impl MessagePublisher for DownPublisher {
+    async fn publish(&self, _message: Message) -> Result<(), TransportError> {
+        Err(TransportError::retryable("broker unreachable"))
+    }
+}
+
+/// With the broker down, a backlog stays pending however often it is tried,
+/// and each failure pushes the next attempt further out.
+pub async fn broker_outage_keeps_the_backlog_pending_with_growing_delay<R, S>(repo: R, outbox: S)
+where
+    R: GetStream + TransactionalCommit + Clone + Send + Sync + 'static,
+    S: OutboxStore + Send + Sync + Clone,
+{
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let id = unique_id("outage-outbox");
+        commit_outbox_for_seat(&repo, unique_id("outage-seat"), &id, "seat.added").await;
+        ids.push(id);
+    }
+    // A ceiling of one: before this change the first failure was terminal.
+    let dispatcher = OutboxDispatcher::new(
+        outbox.clone(),
+        DownPublisher,
+        "immediate:outage",
+        Duration::from_secs(60),
+        1,
+    );
+
+    let first = dispatcher.dispatch_ids(&ids).await.expect("first pass");
+    assert_eq!((first.released, first.failed), (4, 0));
+
+    // Released rows are not claimable until their backoff has passed, so an
+    // immediate second pass does not spin on them.
+    let at_once = dispatcher.dispatch_ids(&ids).await.expect("immediate pass");
+    assert_eq!(at_once.claimed, 0, "released rows wait before the next try");
+
+    tokio::time::sleep(OUTBOX_RETRY.delay(1) + Duration::from_millis(30)).await;
+    let second = dispatcher.dispatch_ids(&ids).await.expect("second pass");
+    assert_eq!((second.released, second.failed), (4, 0));
+
+    // The second failure waits longer than the first did.
+    tokio::time::sleep(OUTBOX_RETRY.delay(1) + Duration::from_millis(30)).await;
+    let too_soon = dispatcher.dispatch_ids(&ids).await.expect("early pass");
+    assert_eq!(too_soon.claimed, 0, "the delay grows with each failure");
+
+    for id in &ids {
+        let row = find_outbox_by_id(&outbox, id)
+            .await
+            .expect("the row is still owed");
+        assert_eq!(row.status, OutboxMessageStatus::Pending);
+        assert_eq!(row.attempts, 2);
+    }
+}
+
+/// A failed row goes back in the queue with a fresh attempt count, and only
+/// a failed row can be requeued.
+pub async fn failed_row_is_requeued_and_delivered<R, S>(repo: R, outbox: S)
+where
+    R: GetStream + TransactionalCommit + Clone + Send + Sync + 'static,
+    S: OutboxStore + Send + Sync + Clone,
+{
+    let id = unique_id("requeue-outbox");
+    commit_outbox_for_seat(&repo, unique_id("requeue-seat"), &id, "seat.added").await;
+
+    let pending = outbox
+        .requeue_failed(&id)
+        .await
+        .expect_err("a pending row is not requeued");
+    assert!(matches!(pending, RepositoryError::InvalidState { .. }));
+    let missing = outbox
+        .requeue_failed("no-such-outbox-row")
+        .await
+        .expect_err("a missing row is reported");
+    assert!(matches!(missing, RepositoryError::NotFound { .. }));
+
+    let claimed = claim_one(
+        &outbox,
+        ClaimOutboxMessages::for_ids("worker-q", vec![id.clone()], Duration::from_secs(60)),
+    )
+    .await;
+    let claim = OutboxClaimRef::from_message(&claimed).expect("claim");
+    let action = outbox
+        .record_failure(&claim, "rejected by the broker", false, 1)
+        .await
+        .expect("record failure");
+    assert_eq!(action, OutboxPublishFailureAction::Failed);
+
+    outbox.requeue_failed(&id).await.expect("requeue");
+    let row = find_outbox_by_id(&outbox, &id).await.expect("row exists");
+    assert_eq!(row.status, OutboxMessageStatus::Pending);
+    assert_eq!(row.attempts, 0);
+
+    let dispatcher = OutboxDispatcher::new(
+        outbox.clone(),
+        FlakyPublisher::new(0),
+        "immediate:requeue",
+        Duration::from_secs(60),
+        1,
+    );
+    let pass = dispatcher
+        .dispatch_ids(std::slice::from_ref(&id))
+        .await
+        .expect("dispatch");
+    assert_eq!(pass.published, 1);
+    assert!(find_outbox_by_id(&outbox, &id).await.is_none());
 }
 
 async fn commit_outbox_for_seat<R>(repo: &R, seat_id: String, message_id: &str, event_type: &str)

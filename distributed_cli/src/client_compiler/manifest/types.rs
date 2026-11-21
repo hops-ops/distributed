@@ -25,6 +25,7 @@ pub(crate) struct ClientManifest {
     pub(crate) projectors: Vec<ManifestProjector>,
     pub(crate) projection_programs: Vec<ManifestProjectionProgram>,
     pub(crate) projection_bindings: Vec<ManifestProjectionBinding>,
+    pub(crate) leaderboards: Vec<super::ManifestLeaderboard>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,32 +517,10 @@ pub(crate) struct ManifestCommandExtensions {
     pub(crate) direct_projection: Option<ManifestDirectProjection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input_defaults: Option<ManifestInputDefaults>,
-    #[serde(
-        default,
-        skip_serializing,
-        deserialize_with = "reject_legacy_command_authority"
-    )]
-    pub(crate) effects: Option<ManifestEffects>,
-    #[serde(
-        default,
-        skip_serializing,
-        deserialize_with = "reject_legacy_command_authority"
-    )]
-    pub(crate) confirmations: Option<ManifestConfirmations>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) projection: Option<ManifestCommandProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) trusted_presets: Vec<ManifestTrustedPresetDescriptor>,
-}
-
-fn reject_legacy_command_authority<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
-    Err(serde::de::Error::custom(
-        "client manifest v2 rejects legacy command effects/confirmations authority",
-    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -629,98 +608,6 @@ pub(crate) enum ManifestInputDefaultGenerator {
     Ulid,
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManifestEffects {
-    pub(crate) version: u32,
-    pub(crate) operations: Vec<ManifestEffect>,
-    pub(crate) fallback: ManifestRevalidationFallback,
-}
-
-impl Serialize for ManifestEffects {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        #[derive(Serialize)]
-        struct Wire<'a> {
-            version: u32,
-            operations: &'a [JsonValue],
-            fallback: ManifestRevalidationFallback,
-        }
-
-        let operations = self
-            .operations
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(serde::ser::Error::custom)?;
-        Wire {
-            version: self.version,
-            operations: &operations,
-            fallback: self.fallback,
-        }
-        .serialize(serializer)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum ManifestEffect {
-    Upsert {
-        model: String,
-        key: ManifestEffectKey,
-        fields: Vec<ManifestEffectField>,
-    },
-    Patch {
-        model: String,
-        key: ManifestEffectKey,
-        fields: Vec<ManifestEffectField>,
-    },
-    Delete {
-        model: String,
-        key: ManifestEffectKey,
-    },
-    Link {
-        relationship: ManifestEffectRelationship,
-        source: ManifestEffectKey,
-        target: ManifestEffectKey,
-    },
-    Unlink {
-        relationship: ManifestEffectRelationship,
-        source: ManifestEffectKey,
-        target: ManifestEffectKey,
-    },
-    InvalidateModel {
-        model: String,
-    },
-    InvalidateRelationship {
-        relationship: ManifestEffectRelationship,
-        source: ManifestEffectKey,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManifestEffectRelationship {
-    pub(crate) source_model: String,
-    pub(crate) field: String,
-    pub(crate) target_model: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManifestEffectKey {
-    pub(crate) fields: Vec<ManifestEffectField>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManifestEffectField {
-    pub(crate) field: String,
-    pub(crate) value: ManifestEffectExpression,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ManifestEffectExpression {
@@ -728,67 +615,6 @@ pub(crate) enum ManifestEffectExpression {
     TrustedPreset { name: String },
     Constant { value: JsonValue },
     Null,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ManifestRevalidationFallback {
-    Revalidate,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManifestConfirmations {
-    pub(crate) version: u32,
-    pub(crate) kind: ManifestConfirmationKind,
-    pub(crate) expected: Vec<ManifestConfirmation>,
-    pub(crate) fallback: ManifestRevalidationFallback,
-}
-
-impl Serialize for ManifestConfirmations {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        #[derive(Serialize)]
-        struct Wire<'a> {
-            version: u32,
-            kind: ManifestConfirmationKind,
-            expected: &'a [JsonValue],
-            fallback: ManifestRevalidationFallback,
-        }
-
-        let expected = self
-            .expected
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(serde::ser::Error::custom)?;
-        Wire {
-            version: self.version,
-            kind: self.kind,
-            expected: &expected,
-            fallback: self.fallback,
-        }
-        .serialize(serializer)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ManifestConfirmationKind {
-    Finite,
-    Unavailable,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManifestConfirmation {
-    pub(crate) projector: String,
-    pub(crate) model: String,
-    pub(crate) key: ManifestEffectKey,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) partition: Option<ManifestEffectExpression>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -815,7 +641,6 @@ pub(crate) struct ManifestProjector {
     pub(crate) facts: Vec<String>,
     pub(crate) models: Vec<String>,
     pub(crate) dependencies: Vec<String>,
-    pub(crate) causal_confirmation: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

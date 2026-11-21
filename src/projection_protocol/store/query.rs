@@ -6,6 +6,8 @@ pub struct ProjectionRecordMetadata {
     pub revision: RecordRevision,
     pub tombstone: bool,
     pub change: ProjectionChangeCursor,
+    /// Authoritative source fence for explicitly declared snapshot projections.
+    pub source_snapshot: Option<super::super::SourceSnapshotVersion>,
 }
 
 /// One exact input-source checkpoint requested alongside a physical query row.
@@ -16,7 +18,7 @@ pub struct ProjectionRecordMetadata {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ProjectionCheckpointProbe {
     pub(crate) topology: ProjectorTopologyId,
-    pub(crate) partition: ProjectionPartition,
+    pub(crate) partition: PartitionId,
     pub(crate) source: ProjectionSource,
     pub(crate) epoch: ProjectionEpoch,
     pub(crate) generation: ProjectionGeneration,
@@ -25,7 +27,7 @@ pub(crate) struct ProjectionCheckpointProbe {
 impl ProjectionCheckpointProbe {
     pub(crate) fn new(
         topology: ProjectorTopologyId,
-        partition: ProjectionPartition,
+        partition: PartitionId,
         source: ProjectionSource,
         epoch: ProjectionEpoch,
         generation: ProjectionGeneration,
@@ -379,7 +381,7 @@ pub(crate) struct ProjectionGraphSnapshot {
     pub(crate) includes: std::collections::BTreeMap<String, ProjectionGraphIncludeSnapshot>,
 }
 
-/// One exact command obligation evidence probe.
+/// One exact projection observation evidence key.
 ///
 /// The scope is already compiler-bound and canonical. A store must compare all
 /// of topology, partition, causation, model, observation kind, key bytes, and
@@ -418,54 +420,6 @@ impl ProjectionObligationEvidenceRequest {
         )?;
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ProjectionObligationEvidence {
-    Pending,
-    Observed(ProjectionObservation),
-    TerminalFailure(ProjectionFailure),
-}
-
-/// Bounded obligation probes evaluated from one adapter snapshot.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ProjectionObligationEvidenceBatchRequest {
-    pub(crate) requests: Vec<ProjectionObligationEvidenceRequest>,
-}
-
-impl ProjectionObligationEvidenceBatchRequest {
-    pub(crate) fn new(
-        requests: Vec<ProjectionObligationEvidenceRequest>,
-    ) -> Result<Self, ProjectionProtocolError> {
-        let request = Self { requests };
-        request.validate()?;
-        Ok(request)
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), ProjectionProtocolError> {
-        if self.requests.len() > MAX_PROJECTION_EVIDENCE_BATCH_ITEMS {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection obligation evidence batch has {} probes; maximum is {}",
-                self.requests.len(),
-                MAX_PROJECTION_EVIDENCE_BATCH_ITEMS
-            )));
-        }
-        let mut exact = std::collections::HashSet::new();
-        for request in &self.requests {
-            request.validate()?;
-            if !exact.insert((request.causation_id.as_str(), &request.scope, request.kind)) {
-                return Err(ProjectionProtocolError::InvalidBatch(
-                    "projection obligation evidence batch repeats an exact probe".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ProjectionObligationEvidenceBatch {
-    pub(crate) evidence: Vec<ProjectionObligationEvidence>,
 }
 
 /// Bounded durable evidence discovered from one framework-minted causation.
@@ -684,6 +638,10 @@ pub struct ProjectionObservation {
     /// Canonical dependency scope when no record revision exists.
     pub scope: ProjectionRecordScope,
     pub change: ProjectionChangeCursor,
+    /// Semantic program identity recorded by the projector that authored this
+    /// observation. `None` is legacy/unversioned evidence and cannot satisfy a
+    /// modeled causal obligation.
+    pub program_id: Option<crate::ProjectionProgramId>,
 }
 
 /// Durable terminal failure for one exact input and repair generation.
@@ -711,7 +669,7 @@ pub struct ProjectionFailure {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectionFailureLocation {
     pub(crate) topology: ProjectorTopologyId,
-    pub(crate) partition: ProjectionPartition,
+    pub(crate) partition: PartitionId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -751,6 +709,9 @@ pub struct ProjectionChange {
     pub scope: Option<ProjectionRecordScope>,
     pub revision: Option<RecordRevision>,
     pub failure_id: Option<String>,
+    /// Semantic program identity recorded at commit time. It is deliberately
+    /// independent from the currently active projector binding.
+    pub program_id: Option<crate::ProjectionProgramId>,
 }
 
 /// Result and exact evidence produced by an asynchronous projection commit.

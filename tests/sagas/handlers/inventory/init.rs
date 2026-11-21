@@ -2,16 +2,25 @@ use super::*;
 
 pub const COMMAND: &str = "inventory.initialize";
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["sku", "stock"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub sku: String,
+    pub stock: u32,
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<InitInventoryInput>()?;
+pub fn command() -> TypedCommand<InitInventoryInput, Succeeded<Output>> {
+    typed_command::<InitInventoryInput, Succeeded<Output>>(COMMAND)
+}
 
-    let mut inv = Inventory::new();
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Inventory>,
+    input: InitInventoryInput,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
+    let mut inv = ctx.repo().create();
     inv.initialize(input.sku.clone(), input.stock)?;
 
-    ctx.repo().commit(&mut inv).await?;
-    Ok(json!({ "sku": input.sku, "stock": input.stock }))
+    ctx.repo().commit(inv)?.succeeded(Output {
+        sku: input.sku,
+        stock: input.stock,
+    })
 }

@@ -15,6 +15,31 @@ pub enum ProjectionChangeRead {
 
 /// Adapter contract for atomic causal projection persistence.
 pub(crate) trait ProjectionProtocolStore: Send + Sync {
+    #[cfg(feature = "graphql")]
+    fn projection_rebuild_records<'a>(
+        &'a self,
+        _context: &'a crate::projection::rebuild::RebuildContext,
+    ) -> impl Future<Output = Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError>> + Send + 'a
+    {
+        async {
+            Err(ProjectionProtocolError::InvalidBatch(
+                "this store does not support snapshot projection rebuilds".into(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "graphql")]
+    fn commit_projection_rebuild(
+        &self,
+        _plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> impl Future<Output = Result<usize, ProjectionProtocolError>> + Send + '_ {
+        async {
+            Err(ProjectionProtocolError::InvalidBatch(
+                "this store does not support snapshot projection rebuilds".into(),
+            ))
+        }
+    }
+
     /// Install model-wide causal ownership before projector traffic begins.
     /// This bootstrap marker closes the absent-row race with legacy/raw write
     /// plans; per-partition ownership is still verified inside each commit.
@@ -101,13 +126,6 @@ pub(crate) trait ProjectionProtocolStore: Send + Sync {
         }
     }
 
-    fn projection_obligation_evidence_batch<'a>(
-        &'a self,
-        request: &'a ProjectionObligationEvidenceBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>>
-           + Send
-           + 'a;
-
     fn projection_causation_evidence<'a>(
         &'a self,
         _request: &'a ProjectionCausationEvidenceRequest,
@@ -129,7 +147,7 @@ pub(crate) trait ProjectionProtocolStore: Send + Sync {
     fn projection_partition_runtime_state<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
     ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>>
            + Send
            + 'a;
@@ -144,7 +162,7 @@ pub(crate) trait ProjectionProtocolStore: Send + Sync {
     fn projection_changes<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         after: Option<&'a ProjectionChangeCursor>,
         limit: usize,
     ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a;
@@ -156,7 +174,7 @@ pub(crate) trait ProjectionProtocolStore: Send + Sync {
     fn repair_projection<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a;
 
@@ -171,7 +189,7 @@ pub(crate) trait ProjectionProtocolStore: Send + Sync {
     fn projection_failure<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a;
 

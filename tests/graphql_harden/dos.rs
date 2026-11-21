@@ -1,5 +1,6 @@
 //! D* Resource-exhaustion red-team suite.
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,13 +8,14 @@ use async_graphql::Request;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 
 use super::common::{
-    assert_no_sql_leak, engine_all_columns, error_messages, seed_orders, session, OrderView,
+    assert_no_sql_leak, child, engine_all_columns, error_messages, order, parent, seed_orders,
+    session, Db, OrderView,
 };
 
-#[tokio::test]
-async fn where_max_depth_rejected() {
-    let pool = seed_orders().await;
+pub async fn where_max_depth_rejected(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_depth(2)
@@ -35,16 +37,17 @@ async fn where_max_depth_rejected() {
     assert_no_sql_leak(&resp);
 }
 
-#[tokio::test]
-async fn graphql_depth_counts_root_and_leaf_fields() {
-    let pool = seed_orders().await;
+pub async fn graphql_depth_counts_root_and_leaf_fields(db: Db) {
+    let pool = seed_orders(&db).await;
     let too_shallow = GraphqlEngine::builder(pool.clone())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_depth(1)
         .build()
         .unwrap();
     let exact = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_depth(2)
@@ -63,10 +66,10 @@ async fn graphql_depth_counts_root_and_leaf_fields() {
     assert!(accepted.errors.is_empty(), "{accepted:?}");
 }
 
-#[tokio::test]
-async fn max_in_list_rejected() {
-    let pool = seed_orders().await;
+pub async fn max_in_list_rejected(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_in_list(3)
@@ -82,10 +85,10 @@ async fn max_in_list_rejected() {
     assert_no_sql_leak(&resp);
 }
 
-#[tokio::test]
-async fn limit_clamped_by_max_limit() {
-    let pool = seed_orders().await;
+pub async fn limit_clamped_by_max_limit(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_limit(1)
@@ -102,10 +105,10 @@ async fn limit_clamped_by_max_limit() {
 }
 
 /// D5: wide `_or` list rejected by `max_bool_width`.
-#[tokio::test]
-async fn d5_wide_or_list_rejected_by_max_bool_width() {
-    let pool = seed_orders().await;
+pub async fn d5_wide_or_list_rejected_by_max_bool_width(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_bool_width(3)
@@ -135,10 +138,10 @@ async fn d5_wide_or_list_rejected_by_max_bool_width() {
 }
 
 /// D5 complementary: `_and` width bound.
-#[tokio::test]
-async fn d5_wide_and_list_rejected_by_max_bool_width() {
-    let pool = seed_orders().await;
+pub async fn d5_wide_and_list_rejected_by_max_bool_width(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_bool_width(2)
@@ -158,9 +161,8 @@ async fn d5_wide_and_list_rejected_by_max_bool_width() {
 }
 
 /// D7: concurrent executes complete without hang; short timeouts map cleanly.
-#[tokio::test]
-async fn d7_concurrent_queries_complete() {
-    let pool = seed_orders().await;
+pub async fn d7_concurrent_queries_complete(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = Arc::new(engine_all_columns(pool));
     let mut handles = Vec::new();
     for i in 0..8 {
@@ -183,37 +185,13 @@ async fn d7_concurrent_queries_complete() {
 }
 
 /// D7b: concurrent queries under tight statement_timeout still terminate.
-#[tokio::test]
-async fn d7_concurrent_with_timeout_bound_terminates() {
-    use std::path::PathBuf;
-
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("graphql_harden_concurrent_to");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let db = dir.join("orders.db");
-    let url = format!("sqlite:{}?mode=rwc", db.display());
-
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE orders (
-            order_id TEXT PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            status TEXT NOT NULL,
-            total_cents INTEGER NOT NULL,
-            note TEXT NOT NULL
-        );
-        INSERT INTO orders VALUES ('o1', 't', 'open', 1, 'n');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+pub async fn d7_concurrent_with_timeout_bound_terminates(db: Db) {
+    db.seed([order("o1", "t", "open", 1, "n")]).await;
+    let pool = db.pool();
 
     let engine = Arc::new(
         GraphqlEngine::builder(pool)
+            .identity(IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
             .statement_timeout(Duration::from_secs(2))
@@ -245,13 +223,10 @@ async fn d7_concurrent_with_timeout_bound_terminates() {
 
 /// Nested has_many fan-out exceeds relationship-aware complexity budget while
 /// staying under max_depth (proves weights, not only depth).
-#[tokio::test]
-async fn d8_nested_has_many_exceeds_complexity_budget() {
+pub async fn d8_nested_has_many_exceeds_complexity_budget(db: Db) {
     use distributed::graphql::{read, GraphqlEngine};
     use distributed::ReadModel;
-    use distributed::{
-        ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-    };
+    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -278,28 +253,19 @@ async fn d8_nested_has_many_exceeds_complexity_budget() {
         name: String,
     }
 
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE parents (parent_id TEXT PRIMARY KEY, name TEXT NOT NULL);
-         CREATE TABLE children (
-            child_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, name TEXT NOT NULL
-         );
-         CREATE TABLE grandchildren (
-            grand_id TEXT PRIMARY KEY, child_id TEXT NOT NULL, name TEXT NOT NULL
-         );
-         INSERT INTO parents VALUES ('p1', 'P');
-         INSERT INTO children VALUES ('c1', 'p1', 'C');
-         INSERT INTO grandchildren VALUES ('g1', 'c1', 'G');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "C")]).await;
+    db.seed([GrandView {
+        grand_id: "g1".into(),
+        child_id: "c1".into(),
+        name: "G".into(),
+    }])
+    .await;
+    let pool = db.pool();
 
     let mut parent = ParentView::schema().clone();
     parent.relationships = vec![RelationshipDef {
+        references: None,
         field_name: "children".into(),
         kind: RelationshipKind::HasMany,
         target_model: "ChildView".into(),
@@ -309,6 +275,7 @@ async fn d8_nested_has_many_exceeds_complexity_budget() {
     }];
     let mut child = ChildView::schema().clone();
     child.relationships = vec![RelationshipDef {
+        references: None,
         field_name: "grandchildren".into(),
         kind: RelationshipKind::HasMany,
         target_model: "GrandView".into(),
@@ -325,6 +292,7 @@ async fn d8_nested_has_many_exceeds_complexity_budget() {
     // Default max_complexity (500) + max_depth high enough that depth is not the limit.
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .max_depth(8)
         .permission::<ParentView>("user", read().all_columns())
@@ -362,13 +330,10 @@ async fn d8_nested_has_many_exceeds_complexity_budget() {
 }
 
 /// Shallow nest stays under default complexity budget.
-#[tokio::test]
-async fn d8_shallow_nested_has_many_within_budget() {
+pub async fn d8_shallow_nested_has_many_within_budget(db: Db) {
     use distributed::graphql::{read, GraphqlEngine};
     use distributed::ReadModel;
-    use distributed::{
-        ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-    };
+    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -387,24 +352,13 @@ async fn d8_shallow_nested_has_many_within_budget() {
         name: String,
     }
 
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE parents (parent_id TEXT PRIMARY KEY, name TEXT NOT NULL);
-         CREATE TABLE children (
-            child_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, name TEXT NOT NULL
-         );
-         INSERT INTO parents VALUES ('p1', 'P');
-         INSERT INTO children VALUES ('c1', 'p1', 'C');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "C")]).await;
+    let pool = db.pool();
 
     let mut parent = ParentView::schema().clone();
     parent.relationships = vec![RelationshipDef {
+        references: None,
         field_name: "children".into(),
         kind: RelationshipKind::HasMany,
         target_model: "ChildView".into(),
@@ -418,6 +372,7 @@ async fn d8_shallow_nested_has_many_within_budget() {
         .table_schema(child);
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .permission::<ParentView>("user", read().all_columns())
         .permission::<ChildView>("user", read().all_columns())
@@ -439,13 +394,10 @@ async fn d8_shallow_nested_has_many_within_budget() {
 }
 
 /// Explicit low max_complexity rejects modest nests (budget knob works).
-#[tokio::test]
-async fn d8_low_max_complexity_rejects_single_nest() {
+pub async fn d8_low_max_complexity_rejects_single_nest(db: Db) {
     use distributed::graphql::{read, GraphqlEngine};
     use distributed::ReadModel;
-    use distributed::{
-        ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-    };
+    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -464,24 +416,13 @@ async fn d8_low_max_complexity_rejects_single_nest() {
         name: String,
     }
 
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE parents (parent_id TEXT PRIMARY KEY, name TEXT NOT NULL);
-         CREATE TABLE children (
-            child_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, name TEXT NOT NULL
-         );
-         INSERT INTO parents VALUES ('p1', 'P');
-         INSERT INTO children VALUES ('c1', 'p1', 'C');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "C")]).await;
+    let pool = db.pool();
 
     let mut parent = ParentView::schema().clone();
     parent.relationships = vec![RelationshipDef {
+        references: None,
         field_name: "children".into(),
         kind: RelationshipKind::HasMany,
         target_model: "ChildView".into(),
@@ -495,6 +436,7 @@ async fn d8_low_max_complexity_rejects_single_nest() {
         .table_schema(child);
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .max_complexity(20)
         .max_depth(8)

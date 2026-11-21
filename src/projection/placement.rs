@@ -18,7 +18,7 @@ use crate::DomainEventBodyKind;
 
 use super::lower::{DirectCandidate, ProjectionDescriptor};
 use super::{
-    ProjectionEventSelector, ProjectionMutationKind, ProjectionPartition, ProjectionProgram,
+    MutationKind, ProjectionEventSelector, ProjectionPartition, ProjectionProgram,
     ProjectionProgramError, ProjectionProgramId, ProjectionRelationship,
 };
 
@@ -674,7 +674,7 @@ pub trait ProjectionProgramDescriptor {
 
 impl<D> ProjectionProgramDescriptor for ProjectionDescriptor<D> {
     fn projection_program(&self) -> Result<ProjectionProgram, ProjectionProgramError> {
-        self.program()
+        self.program().cloned()
     }
 }
 
@@ -900,7 +900,7 @@ impl ProjectionBinding {
         {
             return Err(ProjectionTopologyError::DirectBackground);
         }
-        let program_id = program.id().map_err(ProjectionTopologyError::program)?;
+        let program_id = program.id();
         let mut events = program
             .arms()
             .iter()
@@ -1358,6 +1358,12 @@ fn validate_direct_eligibility(
     program: &ProjectionProgram,
     outputs: &[ProjectionOutput],
 ) -> Result<(), ProjectionTopologyError> {
+    if program.source_snapshots() {
+        return Err(ProjectionTopologyError::DirectIneligible {
+            reason: "source snapshots require canonical occurrences at the eventual projector"
+                .into(),
+        });
+    }
     let [output] = outputs else {
         return Err(ProjectionTopologyError::DirectIneligible {
             reason: "direct evidence requires exactly one registered output schema".to_owned(),
@@ -1399,7 +1405,7 @@ fn validate_direct_eligibility(
                 ),
             });
         };
-        if operation.kind() != ProjectionMutationKind::Upsert {
+        if operation.kind() != MutationKind::Upsert {
             return Err(ProjectionTopologyError::DirectIneligible {
                 reason: format!(
                     "event arm `{}` must resolve one complete upsert",

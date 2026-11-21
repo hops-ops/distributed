@@ -3,11 +3,11 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct PartitionKey {
     pub(super) topology: ProjectorTopologyId,
-    pub(super) partition: ProjectionPartition,
+    pub(super) partition: PartitionId,
 }
 
 impl PartitionKey {
-    pub(super) fn new(topology: &ProjectorTopologyId, partition: &ProjectionPartition) -> Self {
+    pub(super) fn new(topology: &ProjectorTopologyId, partition: &PartitionId) -> Self {
         Self {
             topology: topology.clone(),
             partition: partition.clone(),
@@ -228,6 +228,7 @@ pub(super) struct PendingChange {
     pub(super) scope: Option<ProjectionRecordScope>,
     pub(super) revision: Option<RecordRevision>,
     pub(super) failure_id: Option<String>,
+    pub(super) program_id: Option<crate::ProjectionProgramId>,
 }
 
 impl PartitionState {
@@ -288,6 +289,7 @@ pub(in crate::in_memory_repo) fn reject_causal_owned_plans(
 
 pub(super) enum InputDisposition {
     New,
+    Redelivery,
     Duplicate(ProjectionCheckpoint),
     Stale(ProjectionCheckpoint),
 }

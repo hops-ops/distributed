@@ -79,10 +79,15 @@ function inspectPackageContract(packageJson) {
 	assert.deepEqual(Object.keys(packageJson.exports).sort(), [
 		'.',
 		'./diagnostics',
+		'./game',
+		'./game/vite',
 		'./package.json',
 		'./react',
 		'./replica',
+		'./replica/lazy',
 		'./sveltekit',
+		'./sveltekit/game',
+		'./sveltekit/game/server',
 		'./sveltekit/vite'
 	]);
 	assert.equal(
@@ -275,6 +280,8 @@ void [
 const consumerRuntimeSource = `
 import assert from 'node:assert/strict';
 import * as rootSurface from '@hops-ops/distributed';
+import * as lazySurface from '@hops-ops/distributed/replica/lazy';
+assert.deepEqual(Object.keys(lazySurface), ['createLazyReplicaCommandRuntime']);
 import * as replicaSurface from '@hops-ops/distributed/replica';
 import * as diagnosticsSurface from '@hops-ops/distributed/diagnostics';
 import {
@@ -402,7 +409,6 @@ assert.equal(result.data.health, 'ok');
 assert.deepEqual(Object.keys(rootSurface).sort(), [
   'DISTRIBUTED_PROTOCOL_VERSION',
   'DistributedProtocolError',
-  'applyWsDevHeaderParams',
   'authIdentityKey',
   'buildAuthHeaders',
   'compareDistributedDecimal',
@@ -419,8 +425,6 @@ assert.deepEqual(Object.keys(rootSurface).sort(), [
   'wsConnectionInitPayload'
 ]);
 assert.deepEqual(Object.keys(replicaSurface).sort(), [
-  'MUTATION_CACHE_VISIBILITY_FULL',
-  'MUTATION_CACHE_VISIBILITY_UNAUTHORIZED',
   'REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED',
   'ReplicaCommandContractError',
   'ReplicaCommandRuntimeError',
@@ -440,7 +444,6 @@ assert.deepEqual(Object.keys(replicaSurface).sort(), [
   'formatReplicaIndexStaleReason',
   'inspectReplicaCommandArtifact',
   'inspectReplicaOperationArtifact',
-  'lowerMutationCache',
   'prepareReplicaCommand',
   'replicaIndexKey',
   'replicaRecordKey',
@@ -578,6 +581,7 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
   'authFromPageData',
   'bindSveltekitOperation',
   'constant',
+  'createDistributedLeaderboardStore',
   'createDistributedSvelteKit',
   'createDistributedSvelteKitServer',
   'createPageDataSessionSource',
@@ -587,6 +591,7 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
   'defineGraphqlIslandBindings',
   'distributedReloadLifecycle',
   'forwardedProp',
+  'loadDistributedLeaderboard',
   'omitVariable',
   'parseDistributedGenerationEnvelope',
   'provideDistributedSvelteKitClient',
@@ -597,6 +602,7 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
   'searchParam',
   'sessionClaim',
   'sessionSourceFromPageData',
+  'useDistributedLeaderboard',
   'useDistributedSvelteKitClient',
   'useDistributedSvelteKitCommands',
   'validateDistributedReloadLocation',
@@ -604,12 +610,35 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
 ]);
 assert.deepEqual(Object.keys(sveltekitViteSurface).sort(), [
   'analyzeDistributedSvelteKitBoundaries',
+  'checkDistributedGames',
   'distributedGraphqlProxy',
   'distributedSvelteKit',
   'distributedSvelteKitAliases',
+  'generateDistributedGames',
   'validateDistributedSvelteKitBoundaryPlan'
 ]);
 assert.equal(typeof sveltekitViteSurface.distributedSvelteKit, 'function');
+const sveltekitGameSurface = await import('@hops-ops/distributed/sveltekit/game');
+assert.deepEqual(Object.keys(sveltekitGameSurface).sort(), [
+  'GameState',
+  'createGameState',
+  'gameTicketSource',
+  'useGame'
+]);
+const sveltekitGameServerSurface = await import('@hops-ops/distributed/sveltekit/game/server');
+assert.deepEqual(Object.keys(sveltekitGameServerSurface).sort(), [
+  'GAME_TICKET_RATE_LIMIT_SCRIPT',
+  'GameTicketRateLimiterUnavailable',
+  'MAX_GAME_TICKET_EXTENSION_BYTES',
+  'MAX_GAME_TICKET_TTL_SECONDS',
+  'MIN_GAME_TICKET_SECRET_BYTES',
+  'TRUSTED_FIELD_DENYLIST',
+  'checkGameTicketExtensions',
+  'createGameTicketHandler',
+  'createGameTicketRateLimiter',
+  'createRedisGameTicketRateLimiter',
+  'mintGameTicket'
+]);
 
 const pageData = createPageDataSessionSource({
   session: null,

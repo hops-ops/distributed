@@ -192,6 +192,10 @@ impl Lock for InMemoryLock {
     async fn unlock(&self) -> Result<(), LockError> {
         self.unlock_core()
     }
+
+    fn release_detached(self: Arc<Self>) {
+        let _ = self.unlock_core();
+    }
 }
 
 /// In-memory [`LockManager`] backed by a `HashMap<String, Arc<InMemoryLock>>`.

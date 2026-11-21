@@ -38,6 +38,7 @@ export type {
 export { createReplicaGraphqlTransport } from './graphql-transport.js';
 export { createReplicaUuidV7 } from './command-id.js';
 export type {
+	ReplicaDocumentTransport,
 	ReplicaGraphqlTransport,
 	ReplicaGraphqlTransportOptions
 } from './graphql-transport.js';
@@ -81,21 +82,23 @@ export type {
 	ReplicaIndexedDbPersistence,
 	ReplicaIndexedDbPersistenceOptions,
 	ReplicaPersistenceModelPolicy,
-	ReplicaPersistencePolicy
+	ReplicaPersistencePolicy,
+	ReplicaCommandOutbox,
+	ReplicaCommandOutboxCommandPolicy,
+	ReplicaCommandOutboxDrainReport,
+	ReplicaCommandOutboxEntrySummary,
+	ReplicaCommandOutboxOptions,
+	ReplicaCommandOutboxOutcome,
+	ReplicaCommandOutboxPolicy,
+	ReplicaCommandOutboxSettlement
 } from './persistence.js';
 export type {
 	PrepareReplicaCommandOptions,
 	ReplicaCommandArtifact,
-	ReplicaCommandConfirmation,
-	ReplicaCommandConfirmations,
 	ReplicaCommandContractErrorCode,
 	ReplicaCommandDirectProjection,
-	ReplicaCommandEffect,
 	ReplicaCommandEffectExpression,
-	ReplicaCommandEffectField,
-	ReplicaCommandEffectKey,
 	ReplicaCommandEffectRelationship,
-	ReplicaCommandEffects,
 	ReplicaCommandGenerators,
 	ReplicaCommandInputDefault,
 	ReplicaCommandInputDefaults,
@@ -107,11 +110,6 @@ export type {
 	ReplicaCommandVariables,
 	ReplicaTrustedPresetDescriptor,
 	ReplicaPreparedCommand,
-	ReplicaPreparedCommandEffect,
-	ReplicaPreparedConfirmation,
-	ReplicaPreparedConfirmations,
-	ReplicaPreparedEffectField,
-	ReplicaPreparedEffectKey,
 	ReplicaReceiptVerification
 } from './commands.js';
 export { createWasmJsonPure } from './projection-delta/index.js';
@@ -238,17 +236,8 @@ export type {
 	WatchReplicaOptions
 } from './types.js';
 
-export {
-	lowerMutationCache,
-	MUTATION_CACHE_VISIBILITY_FULL,
-	MUTATION_CACHE_VISIBILITY_UNAUTHORIZED,
-} from './mutation-cache.js';
 export type {
-	MutationCacheEffect,
-	MutationCacheProgram,
-	MutationCacheVisibility,
-	MutationField,
-	MutationOperation,
-	MutationProgram,
-	MutationTarget,
-} from './mutation-cache.js';
+	ReplicaLazyCommandCatalog,
+	ReplicaLazyCommandModule,
+	ReplicaLazyCommandRuntime
+} from './command-runtime/lazy.js';

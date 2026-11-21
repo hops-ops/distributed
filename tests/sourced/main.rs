@@ -1,5 +1,7 @@
 mod aggregate;
+mod custom_body_helpers;
 mod domain_events;
+mod flat_preview;
 
 use aggregate::{Todo, TodoEvent};
 use distributed::{
@@ -9,7 +11,7 @@ use distributed::{
 use serde::ser::Error as _;
 use serde::Serialize;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 struct FailingSerialize;
 
 impl Serialize for FailingSerialize {
@@ -27,25 +29,17 @@ struct SafeRecorder {
     applied: bool,
 }
 
+#[distributed::sourced(entity)]
 impl SafeRecorder {
-    #[distributed::digest("recorded")]
+    #[event("recorded")]
     fn record(&mut self, _payload: FailingSerialize) {
         self.applied = true;
     }
 
-    #[distributed::digest("recorded", version = 2)]
+    #[event("recorded_ok", version = 2)]
     fn record_ok(&mut self, payload: String) {
         self.applied = true;
         assert_eq!(payload, "ok");
-    }
-
-    #[distributed::digest("tail_checked")]
-    fn record_after_tail_check(&mut self) {
-        self.tail_check()?
-    }
-
-    fn tail_check(&self) -> distributed::SourcedResult {
-        Ok(())
     }
 }
 
@@ -106,7 +100,7 @@ fn enum_variants_exist_and_compile() {
 }
 
 #[test]
-fn digest_macro_returns_payload_errors_without_running_body() {
+fn a_payload_that_fails_to_encode_records_nothing_and_skips_the_body() {
     let mut recorder = SafeRecorder::default();
 
     let err = recorder.record(FailingSerialize).unwrap_err();
@@ -128,25 +122,15 @@ fn explicit_digest_validates_before_recording_events() {
 }
 
 #[test]
-fn digest_macro_records_successful_versioned_events() {
+fn a_recorder_records_its_versioned_event() {
     let mut recorder = SafeRecorder::default();
 
     recorder.record_ok("ok".to_string()).unwrap();
 
     assert!(recorder.applied);
     assert_eq!(recorder.entity.events().len(), 1);
-    assert_eq!(recorder.entity.events()[0].event_name, "recorded");
+    assert_eq!(recorder.entity.events()[0].event_name, "recorded_ok");
     assert_eq!(recorder.entity.events()[0].event_version, 2);
-}
-
-#[test]
-fn digest_macro_accepts_inferred_tail_try_expression() {
-    let mut recorder = SafeRecorder::default();
-
-    recorder.record_after_tail_check().unwrap();
-
-    assert_eq!(recorder.entity.events().len(), 1);
-    assert_eq!(recorder.entity.events()[0].event_name, "tail_checked");
 }
 
 #[test]
@@ -225,16 +209,6 @@ fn guard_condition_works() {
     todo.complete().unwrap();
 
     assert_eq!(todo.entity.version(), 2); // only Initialized + Completed
-}
-
-#[test]
-fn sourced_event_macro_accepts_inferred_tail_try_expression() {
-    let mut todo = Todo::default();
-
-    todo.validate_tail().unwrap();
-
-    assert_eq!(todo.entity.events().len(), 1);
-    assert_eq!(todo.entity.events()[0].event_name, "tail_validated");
 }
 
 #[test]

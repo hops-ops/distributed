@@ -1,7 +1,8 @@
 //! Shared message types for inter-service communication.
 //!
-//! Each message is serialized as JSON via [`json_outbox_to`] so the receiving
-//! service can decode it from the bus message payload (`ctx.input`).
+//! Each message is serialized as JSON via [`json_outbox_to`]: a command is
+//! the receiving service's typed command input, an event is what the saga's
+//! event handler decodes with `ctx.input`.
 
 use distributed::microsvc::HandlerError;
 use distributed::OutboxMessage;
@@ -12,8 +13,8 @@ use crate::order::OrderItem;
 /// Create a JSON-serialized outbox message routed to a destination queue.
 ///
 /// `OutboxMessage::encode_to` uses bitcode internally, but the receiving
-/// handlers decode the bus message payload as JSON (`ctx.input`). This helper
-/// bridges the gap with `serde_json::to_vec` + `OutboxMessage::create_to`.
+/// services decode the bus message payload as JSON. This helper bridges the
+/// gap with `serde_json::to_vec` + `OutboxMessage::create_to`.
 pub fn json_outbox_to<T: Serialize>(
     id: &str,
     event_type: &str,
@@ -27,7 +28,7 @@ pub fn json_outbox_to<T: Serialize>(
 
 // === Saga → Order Service ===
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 pub struct CreateOrderMsg {
     pub saga_id: String,
     pub order_id: String,
@@ -36,7 +37,7 @@ pub struct CreateOrderMsg {
     pub total_cents: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 pub struct CompleteOrderMsg {
     pub saga_id: String,
     pub order_id: String,
@@ -58,7 +59,7 @@ pub struct OrderCompletedMsg {
 
 // === Saga → Inventory Service ===
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 pub struct ReserveInventoryMsg {
     pub saga_id: String,
     pub order_id: String,
@@ -76,7 +77,7 @@ pub struct InventoryReservedMsg {
 
 // === Saga → Payment Service ===
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 pub struct ProcessPaymentMsg {
     pub saga_id: String,
     pub order_id: String,
@@ -93,7 +94,7 @@ pub struct PaymentSucceededMsg {
 
 // === Command Inputs ===
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 pub struct StartSagaInput {
     pub saga_id: String,
     pub order_id: String,
@@ -102,7 +103,7 @@ pub struct StartSagaInput {
     pub total_cents: u32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 pub struct InitInventoryInput {
     pub sku: String,
     pub stock: u32,

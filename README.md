@@ -199,12 +199,132 @@ mutation SaveTodo {
 }
 ```
 
-Handlers stay thin: most Todo commands are `portable_command!` — shard,
-invoke one domain method, commit Eventual. `todo.create` keeps a `handle:`
-escape hatch when the body needs extra checks.
+#### Full-state projections and out-of-order events
+
+Broker delivery order is not necessarily aggregate commit order. For a read
+model whose rows are complete snapshots owned by one aggregate stream, opt in
+to source-version fencing:
 
 ```rust,ignore
-portable_command! {
+distributed::projection! {
+    pub const TODOS: ProjectionDescriptor<EventualOnly> = {
+        name: "project_todos",
+        version: 2,
+        epoch: "todos-source-snapshots-v1",
+        model: Todos,
+        source: aggregate_snapshot,
+        on {
+            events: [TodoCreatedDomainEvent, TodoCompletedDomainEvent],
+            mutation: SaveTodo,
+            input: { todo: body },
+        },
+        on {
+            events: [TodoPurgedDomainEvent],
+            mutation: DeleteTodo,
+            input: { todo_id: aggregate_id },
+        },
+    };
+}
+```
+
+The framework compares canonical `(aggregate_sequence, publication_ordinal)`
+within the owning `(aggregate_type, aggregate_id)` stream. A late snapshot
+cannot overwrite a newer row or resurrect a deleted one. Even deletion before
+creation leaves a durable tombstone. A newer snapshot can recreate the row.
+Source fences, physical rows, row revisions, broker checkpoints and causal
+observations commit atomically in the memory, SQLite and PostgreSQL adapters.
+A stale input confirms the current row revision without generating a fake row
+update; a concurrent change makes that confirmation retry through the normal
+projection conflict path.
+
+Use this only for complete replacement snapshots with stable row keys. Every
+affected key must be owned by one aggregate stream; joins, counters, partial
+patches and relationship side effects need their own ordering/fold semantics.
+This mode rejects delta operations, expression partitions and direct placement.
+Different aggregate streams cannot take over an existing fenced key. Matching
+source versions with conflicting occurrence content fail closed.
+
+Migration `0005_projection_source_snapshots` persists the fence alongside each
+record, including tombstones; compaction does not remove it. Enabling this on
+an existing unversioned projection requires an explicit read-model rebuild
+from retained canonical events. Merely changing the projection version or epoch
+does not infer a source version for existing rows. The normal ordered-delivery
+contract and transport identity checks still apply; this is not a replacement
+for reliable broker delivery or an incremental-event reorder buffer.
+
+Custom program factories can use `ProjectionProgram::with_source_snapshots()`;
+the policy is part of the canonical program identity. Browser optimism continues
+to use the same mutation program, and authoritative confirmation uses committed
+row revisions rather than comparing browser timestamps.
+
+#### Rebuilding existing snapshot projections
+
+Use explicit maintenance, not a startup fallback or republishing loop:
+
+```rust,ignore
+use distributed::projection::rebuild::SnapshotProjectionRebuild;
+
+// Stop producers, drain outboxes, stop consumers, and back up the read model.
+// Reuse the same generated SurfaceProjector mounted by the application.
+let rebuild = SnapshotProjectionRebuild::begin(&repository, &projector).await?;
+// Read history AFTER capturing the target inventory. Another authoritative
+// archive can supply these canonical occurrences; rebuilding is bus-neutral.
+let events = nats_bus.retained_domain_events().await?;
+let plan = rebuild.from_complete_history(&events)?;
+println!("{} records to rebuild", plan.record_count());
+plan.apply(&repository).await?;
+```
+
+Memory, SQLite and PostgreSQL commit complete rows/tombstones, source fences,
+new record revisions and live-query changes atomically. A concurrent update,
+insertion or deletion invalidates the captured inventory. Failure rolls back the
+whole projection. Broker checkpoints, inbox receipts, command ledgers and prior
+causal observations are preserved; maintenance does not claim a domain command
+occurred. No domain handlers, external effects or queue sends run.
+
+The archive must cover every existing record and retain its stored source
+occurrence, where present. Conflicting duplicate occurrences, missing aggregate
+sequence prefixes and stale source heads fail closed. The caller must establish
+history completeness: even a broker stream starting at sequence one may have
+been created after its aggregates. The NATS reader verifies a stable, gap-free
+retained stream without creating consumers or acknowledging messages, but cannot
+prove that unpublished events or earlier deleted streams never existed.
+
+This first API is bounded offline maintenance for one active local,
+unit-partition snapshot binding: at most 10,000 records and 100,000 occurrences /
+64 MiB of canonical history. It intentionally rejects delta folds and histories
+whose publication sequences have gaps. It does not migrate schemas/topologies,
+perform online shadow swaps, or make several independent projections one
+transaction. Keep services stopped if a multi-projection maintenance run fails;
+capture fresh inventories and rerun before resuming them.
+
+Handlers stay thin. The shortest form is the command on the aggregate
+method itself: `#[command]` inside the `#[sourced]` impl generates the
+handler and the portable mount (see [Command contracts](#command-contracts)):
+
+```rust,ignore
+#[command(
+    "todo.complete",
+    shard = todo_id,
+    load = required,
+    input = TodoCompleteInput,
+    outcome = Eventual<TodoStatusPayload>,
+    payload = TodoStatusPayload::from_todo,
+    roles = ["user", "admin"],
+    field = "todos_complete",
+)]
+pub fn complete(&mut self, #[principal] owner_id: &str) -> Result<(), TodoError> { .. }
+```
+
+The Todo playground spells the same registration out with
+`command!` — shard, invoke one domain method, commit Eventual. `load:`
+is `required`, `or_create` or `create` (an id that already has a stream
+is rejected); `guard:` adds a check on top of the roles; the payload
+closure also receives the session principal. `handle:` remains the
+escape hatch for a body that does more than one domain call.
+
+```rust,ignore
+command! {
     name: "todo.complete",
     transition: domain_commands::Complete,
     aggregate: Todo,
@@ -215,7 +335,7 @@ portable_command! {
     roles: ["user", "admin"],
     field: "todos_complete",
     invoke: |todo, _input, principal| todo.complete(principal),
-    payload: |todo| TodoStatusPayload::from_todo(&**todo),
+    payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }
 ```
 
@@ -228,7 +348,7 @@ A module mounts one bounded context — commands, guards, projectors. A
 playground is one `Service`, one host, one runner that only reads env and
 calls `run`. You do not set a runtime role flag.
 
-Todo commands are `portable_command!` declarations in `todo-domain`. This
+Todo commands are `command!` declarations in `todo-domain`. This
 playground mounts them on a local Service. The sibling example
 [`tests/e2e-celld`](tests/e2e-celld) mounts the same declarations and
 wait-dispatches create, complete, and `chat.post` to a **cell** (one private
@@ -370,6 +490,18 @@ that scope the client replica.
 
 ---
 
+## Multiplayer games
+
+`distributed_game` adds a server-authoritative realtime engine on top of
+this framework: zones that tick at a fixed rate, binary delta replication
+with interest management, client prediction (`@hops-ops/distributed/game`),
+outcomes saved as idempotent commands on cells without ever pausing the
+game, and zones spread across servers with handoff, hibernation and live
+content updates. Start with **[`distributed_game/README.md`](distributed_game/README.md)**;
+eight runnable demos are in [`examples/game`](examples/game/README.md).
+
+---
+
 ## See it run
 
 ### e2e-ui playground (`tests/e2e-ui`)
@@ -419,7 +551,7 @@ Start here in the code:
 | [`ui/src/lib/components/blob/SelectedBlobGame.graphql`](tests/e2e-ui/ui/src/lib/components/blob/SelectedBlobGame.graphql) | Reusable component island promoted to the nearest static route boundary; one route-param binding drives SSR and component reads. |
 | [`ui/src/routes/blob/[[gameId]]/+page.svelte`](tests/e2e-ui/ui/src/routes/blob/[[gameId]]/+page.svelte) | Arrow keys → `commands.blob.move`; board from `BlobGames.use()`. |
 | [`crates/service/src/modules/compose.rs`](tests/e2e-ui/crates/service/src/modules/compose.rs) | One `Service` lists modules. No `Runtime::role`. |
-| [`crates/service/src/handlers/commands/blob_move.rs`](tests/e2e-ui/crates/service/src/handlers/commands/blob_move.rs) | `PreparedCommand<Atomic<BlobGameView>>` — map/score written with the event. |
+| [`crates/blob-domain/src/commands/move_dir.rs`](tests/e2e-ui/crates/blob-domain/src/commands/move_dir.rs) | `command!` returning `Atomic<BlobGames>`: the map/score row commits with the event, and a WASM pure previews the move. |
 | [`crates/todo-domain/src/models/todo.rs`](tests/e2e-ui/crates/todo-domain/src/models/todo.rs) | Plain aggregate — no GraphQL in the domain. |
 | [`ui/src/auth.ts`](tests/e2e-ui/ui/src/auth.ts) | Auth.js + Zitadel scopes/groups → engine roles. |
 
@@ -503,7 +635,7 @@ inherit it from member crates. Keep the root dependency feature-light, then
 enable service-specific features only in the service crates.
 
 Most application crates should depend on `distributed` only. The proc
-macros (`#[sourced]`, `#[digest]`, `#[derive(ReadModel)]`,
+macros (`#[sourced]`, `command!`, `#[derive(ReadModel)]`,
 `#[derive(Snapshot)]`) are re-exported from `distributed`; do not add
 `distributed_macros` directly unless you are working on the macro crate
 itself. The `distributed_cli` crate installs the `distributed` tooling
@@ -521,7 +653,6 @@ network servers.
 
 | Feature | Default | Adds |
 |---|---:|---|
-| `emitter` | No | In-process event emission and `#[enqueue]`. |
 | `http` | No | Axum HTTP transport for `microsvc` + the Knative/CloudEvents ingress router. |
 | `grpc` | No | Tonic gRPC transport for `microsvc`. |
 | `graphql` | No | GraphQL query service over read models (pulls in `http` + WebSocket). Pair with `sqlite` and/or `postgres` for a dialect. |
@@ -530,6 +661,17 @@ network servers.
 | `nats` | No | `NatsBus` (NATS JetStream source/publisher). |
 | `rabbitmq` | No | `RabbitBus` (RabbitMQ source/publisher). |
 | `kafka` | No | `KafkaBus` (Kafka source/publisher). |
+| `redis` | No | `leaderboard::RedisLeaderboard` (sorted-set leaderboards) and `bus::RedisStreamPublisher` (Redis Streams `XADD`, id dedupe); implies `leaderboard-background`. The `leaderboard` module and `InMemoryLeaderboard` are always available. |
+| `leaderboard-background` | No | `leaderboard::BackgroundLeaderboard` (fire-and-forget updates on a Tokio task) over any `LeaderboardStore`, e.g. `InMemoryLeaderboard`, without pulling in Redis. |
+| `metrics` | No | `distributed::metrics`: framework counters and gauges with Prometheus text exposition (no SDK dependency); with `http`, a scrape handler. Bus receive loops record into it. |
+| `otel` | No | OpenTelemetry tracing spans for bus receive loops and `microsvc` dispatch/handlers (`opentelemetry`, `tracing-opentelemetry`). |
+| `workers-rs` | No | Cloudflare `worker` crate bindings for celld cells: the aggregate cell host and the celld Queue publisher/relay (`bus::CelldQueue*`) on `wasm32`. |
+| `gateway` | No | `distributed::gateway`: portable gateway declarations (bindings, routes, dispatch). Starts no listeners. |
+| `gateway-native` | No | Native HTTP gateway adapter (hyper/tower), independent of GraphQL and SQL. |
+| `gateway-graphql` | No | Whole-operation GraphQL selection for the gateway (parser only). |
+| `gateway-delivery` | No | Portable identity, freshness and delivery contracts (snapshots, coalescing, live sharing). |
+| `gateway-graphql-native` | No | Native GraphQL execution behind the gateway, including WebSocket `@live` (implies `gateway-native`, `gateway-graphql`, `graphql`). |
+| `gateway-worker` | No | workers-rs gateway ingress and delivery contracts, without native executors. |
 
 > The `InMemoryBus`, `PostgresBus`, and `SqliteBus` need no separate broker
 > feature. SQL-backed bus support comes from the matching `postgres` or `sqlite`
@@ -551,15 +693,50 @@ network servers.
 - **ReadModel**: Query-optimized relational projection state for UI/API reads. Read models may be updated atomically with a command or eventually from published messages.
 - **GraphqlEngine**: Deny-by-default GraphQL surface over registered read-model tables: role-scoped columns/row filters, optional command mutations, live subscriptions via `ChangeHub`, and identity modes (`OidcBearer`, `TrustedProxy`, `Hybrid`, `DevHeaders`).
 - **Bus / BusConsumer**: The service bus facade — `send`/`publish` (produce) and `listen`/`subscribe` (consume), implemented by a per-transport `*Bus` type.
-- **microsvc::Service**: Convention-based async command/event handler framework with pluggable transports (HTTP, gRPC, bus, GraphQL mutations, direct dispatch).
+- **microsvc::Service**: Convention-based async command/event handler framework with pluggable transports (HTTP, gRPC, bus, GraphQL mutations, in-process dispatch).
 
 ## Terminology And CQRS Boundaries
 
-Event sourcing is the model-level persistence strategy: aggregates record replayable `EventRecord`s when command methods such as `#[event]` (within `#[sourced]`) or `#[digest]` methods succeed. Those records are the write-side history used to hydrate the aggregate.
+Event sourcing is the model-level persistence strategy: aggregates record replayable `EventRecord`s when command methods such as `#[event]` (within `#[sourced]`) succeed. Those records are the write-side history used to hydrate the aggregate.
 
 CQRS is the architectural split between write-side aggregates and query-side read models. Repositories load aggregate event streams by ID for command handling; production business queries should read from `ReadModel` projections shaped for that query.
 
 Published messages are a separate boundary. An aggregate event record is not automatically a domain event. When other services, projections, or transports need a fact or command, create an `OutboxMessage` and commit it with the aggregate. The outbox payload can represent a domain event, integration event, command, or any other transport message.
+
+The outbox stores delivery work, not publication history. Successful delivery
+deletes the row under its active lease. Failed or ambiguous sends retain the row
+for retry or inspection. A crash after transport acceptance but before deletion
+can deliver the same event ID again; consumers must remain idempotent. Event
+history belongs in the event store, and command retry results belong in command
+receipts. Neither depends on retaining delivered outbox rows.
+
+Commands dispatched to another aggregate cell use the same command ledger, but
+with an explicit external dispatch binding. The binding records the logical
+route kind and shard alongside the command identity; it is immutable for that
+reservation and survives lease reclaim and terminal replay. External completion
+updates only the ledger after the returned attempt fence and binding match. It
+does not append local events, write the outbox, or treat the cell's commit as
+proof that an asynchronous read-model projection has completed. A local causal
+commit cannot complete an externally bound reservation, and an external
+completion cannot complete a local reservation. Retained cell-only receipts
+without a gateway binding remain explicit unknowns until a matching gateway
+reservation and trusted completion protocol can be established; they are never
+retrofitted into a different route or silently replayed.
+
+The celld command host reserves that gateway intent before making the cell
+request. The reservation's causation ID and logical route binding must be
+echoed by the trusted cell receipt; a changed command ID, input, causation, or
+route is rejected before it can complete the gateway row. A terminal cell
+receipt is durably recorded in the gateway ledger before the response is
+returned. Status checks current authorization and re-evaluates the durable
+receipt's projection evidence, so an in-memory completed-status cache is never
+the source of truth. An ambiguous transport result remains retryable against
+the same reservation and cell; it does not invoke the local domain handler or
+re-publish the cell's events and outbox.
+
+In v5, `OutboxStore::complete` and `complete_many` remove delivered rows instead
+of retaining `Published` records. Repeating settlement of a removed row returns
+`NotFound`; stale claims on existing rows still return `InvalidState`.
 
 The existing names and serialized fields such as `EventRecord::event_name` remain part of the compatibility contract. Terminology cleanup should clarify usage without renaming stored event records unless a migration path is explicitly designed.
 
@@ -574,13 +751,13 @@ Every infrastructure concern in `distributed` follows the same pattern: a **trai
 | Read model rows | `ReadModelWritePlanStore` + `RelationalReadModelQueryStore` | `InMemoryReadModelStore` | Postgres, SQLite |
 | Snapshot store | `SnapshotStore` | `InMemorySnapshotStore` | Postgres, SQLite, … |
 | Outbox publishing | `OutboxStore` + async `MessagePublisher` | `InMemoryRepository` outbox store (dev/test) | Any `MessagePublisher` (e.g. `BusPublisher` over a real `Bus`) |
-| Locking | `Lock` + `LockManager` | `InMemoryLockManager` | `PostgresLockManager`, `SqliteLockManager` (durable leases), Redis, … |
+| Locking | `Lock` + `LockManager` | `InMemoryLockManager` | `PostgresLockManager`, `SqliteLockManager` (durable leases); implement the traits for anything else |
 
 All in-memory defaults are `Clone` and `Send + Sync`, so they work in single-task tests and multi-task servers alike. When you're ready for production, implement the trait for your infrastructure and plug it in — handler code does not change.
 
 ## The `#[sourced]` Macro
 
-The `#[sourced]` attribute macro is the recommended way to define event-sourced aggregates. Place it on an impl block and annotate command methods with lowercase, past-tense aggregate event names such as `#[event("initialized")]`. It replaces both `#[digest]` and `aggregate!()`, and auto-generates a typed event enum plus the `Aggregate` impl.
+The `#[sourced]` attribute macro is the recommended way to define event-sourced aggregates. Place it on an impl block and annotate command methods with lowercase, past-tense aggregate event names such as `#[event("initialized")]`. It generates a typed event enum plus the `Aggregate` impl.
 
 Event methods are rewritten to return `SourcedResult`, even when the source method omits an explicit return type. Call them with `?` in application code so serialization and event-recording failures are propagated.
 
@@ -633,6 +810,86 @@ impl TryFrom<&EventRecord> for TodoEvent { /* ... */ }
 // Full Aggregate trait impl (entity accessors + replay logic)
 impl Aggregate for Todo { /* ... */ }
 ```
+
+### Flat events and optimistic updates
+
+With `domain = event`, recorder parameters are the flat outward event body:
+
+```rust,ignore
+#[sourced(entity, aggregate_type = "review")]
+impl Review {
+    pub fn approve(&mut self, id: String) -> distributed::SourcedResult {
+        // Validate the decision here, before recording it.
+        self.record_status(id, "approved".into())?;
+        Ok(())
+    }
+
+    #[event("review.status_recorded", version = 1, domain = event)]
+    fn record_status(&mut self, id: String, status: String) {
+        self.entity.set_id(id);
+        self.status = status;
+    }
+}
+```
+
+Optimistic projections need to know what a command will leave behind before
+the event exists. That is declared, never read out of a method body. A state
+recorder (`domain`) lists the values it always sets, in the field grammar of
+`state_preview!`:
+
+```rust,ignore
+#[event("todo.completed", version = 1, domain, known(status: "completed"))]
+fn completed(&mut self) { self.status = TodoStatus::Completed; }
+```
+
+A command over a flat event declares its preview on the registration, with
+`.applies(event_preview! { ReviewStatusRecorded => ReviewStatusRecorded {
+id: input.id, status: "approved", ..unknown } })`. Both are checked against the
+body's fields when the command is registered. Neither predicts authorization
+or guarantees that the event will occur.
+
+Public transitions can delegate to shared decision helpers in the same
+`#[sourced]` impl. For example, `leave` and an owner-authorized `remove_member`
+can both call a private `self.remove_member_decision(...)`. Each gets its own
+`domain_commands::Leave` / `domain_commands::RemoveMember` witness containing
+the outward events reachable through those helpers. Discovery follows static
+`self.method(...)` calls, deduplicates events, and terminates on recursive helper
+graphs. It does not follow foreign receivers or helpers outside the impl, and
+does not propagate argument values through helpers. Custom
+`domain = with(Body, adapter)` events use the declared body contract, including
+qualified or relative type paths.
+
+For an event whose body contains the authenticated principal, bind that one
+field using the existing command API:
+
+```rust,ignore
+command_transition::<domain_commands::Leave, LeaveInput, Eventual<LeaveOutput>>("group.leave")
+    .authenticated_user_field::<GroupMemberRemovedDomainEvent, GroupMemberRemovedDomainEvent>(
+        "user_id",
+    )
+```
+
+The second type is the exact serialized body. Use the flat event itself for
+`domain = event` or `#[derive(DomainEvent)]`; state-capture events continue to
+use their `DomainState` type. The equivalent `command!` entry is:
+
+```rust,ignore
+authenticated_user_field: (
+    GroupMemberRemovedDomainEvent,
+    GroupMemberRemovedDomainEvent,
+    "user_id"
+),
+```
+
+This gives a membership-delete projection the trusted `x-user-id` key without
+adding a caller-controlled user ID to the command input. The framework checks
+the exact event/body descriptor and serialized string field, including Serde
+renames. The handler must still obtain the principal from its authenticated
+session and enforce membership rules; this declaration only supplies the
+generated preview's provenance.
+
+See [the executable contract tests](tests/sourced/flat_preview.rs), including
+the generated delete-projection client, helper replay and conflicting/dynamic-value cases.
 
 ### Durable Stream Identity
 
@@ -713,107 +970,15 @@ impl MyAggregate {
 }
 ```
 
-### With `enqueue` for Choreography
+### Replay and event versions
 
-Add `enqueue` to `#[sourced]` to automatically queue events for in-process emission alongside digest. Every `#[event]` method both records to the entity stream and enqueues for emission:
-
-```rust,ignore
-use distributed::{sourced, Entity};
-use distributed::emitter::EntityEmitter;
-
-#[derive(Default)]
-struct Order {
-    entity: Entity,
-    emitter: EntityEmitter,
-    status: String,
-}
-
-#[sourced(entity, enqueue)]
-impl Order {
-    #[event("initialized")]
-    fn create(&mut self, order_id: String, customer: String) {
-        self.entity.set_id(&order_id);
-        self.status = "created".into();
-    }
-
-    #[event("shipped", when = self.status == "created")]
-    fn ship(&mut self) {
-        self.status = "shipped".into();
-    }
-}
-```
-
-**Custom emitter field** — when your emitter field isn't named `emitter`:
-
-```rust,ignore
-#[sourced(entity, enqueue(my_emitter))]
-impl Notifier {
-    #[event("sent")]
-    fn send(&mut self, id: String, message: String) {
-        self.entity.set_id(&id);
-        self.message = message;
-    }
-}
-```
-
-## The `#[digest]` Macro and `aggregate!()` Macro
-
-The `#[digest]` and `aggregate!()` macros are the lower-level building blocks that `#[sourced]` replaces. They're still fully supported and useful when you want more granular control. Like `#[event]` methods, `#[digest]` methods become fallible and should be called with `?`.
-
-### The `#[digest]` Macro
-
-```rust,ignore
-// Basic — captures function parameters
-#[digest("initialized")]
-fn initialize(&mut self, id: String, user_id: String, task: String) {
-    self.entity.set_id(&id);
-    self.user_id = user_id;
-    self.task = task;
-}
-
-// Guard conditions — only emit when the condition is true
-#[digest("completed", when = !self.completed)]
-fn complete(&mut self) {
-    self.completed = true;
-}
-
-// Versioned events
-#[digest("initialized", version = 2)]
-fn initialize(&mut self, id: String, task: String, priority: u8) { /* ... */ }
-
-// Custom entity field
-#[digest(my_entity, "initialized")]
-fn create(&mut self, name: String) { /* uses self.my_entity */ }
-```
-
-### The `aggregate!` Macro
-
-Generates the `Aggregate` trait implementation with replay logic:
-
-```rust,ignore
-aggregate!(Todo, entity, aggregate_type = "todo" {
-    "initialized"(id, user_id, task) => initialize,
-    "completed"() => complete(),
-});
-```
-
-With [upcasters](#event-upcasting--versioning) for event schema evolution:
-
-```rust,ignore
-type InitV1 = (String, String);
-type InitV2 = (String, String, u8);
-
-fn upcast_initialized_v1_v2((id, task): InitV1) -> InitV2 {
-    (id, task, 0)
-}
-
-aggregate!(Todo, entity {
-    "initialized"(id, task, priority) => initialize,
-    "completed"() => complete(),
-} upcasters [
-    ("initialized", 1 => 2, InitV1 => InitV2, upcast_initialized_v1_v2),
-]);
-```
+Replay requires each event's schema version to match its registered handler
+after upcasting. `#[sourced]` reads this version from
+`#[event(..., version = N)]`. Omitted versions default to 1.
+Older events need an explicit upcaster chain to the registered version; future
+versions are rejected. Matching payload layouts do not bypass this check.
+The check runs before payload decoding or handler invocation, including when
+loading only the event tail after a snapshot in a native repository or cell.
 
 ## Event Metadata
 
@@ -821,7 +986,7 @@ Metadata lets you attach cross-cutting context — correlation IDs, causation ID
 
 ### Setting Metadata on an Entity
 
-Set metadata on the entity before calling command methods. Every event produced by `#[event]` or `#[digest]` automatically inherits it:
+Set metadata on the entity before calling command methods. Every event produced by `#[event]` automatically inherits it:
 
 ```rust,ignore
 let mut todo = Todo::default();
@@ -856,7 +1021,7 @@ The metadata flows through the full chain:
 
 ```text
 Entity.set_correlation_id("req-123")
-  → #[event] / #[digest] → EventRecord.metadata
+  → #[event] → EventRecord.metadata
   → encode_for_entity → OutboxMessage.metadata
   → OutboxDispatcher → transport Message.metadata
   → subscriber receives the message with correlation_id() == "req-123"
@@ -877,77 +1042,9 @@ message.correlation_id()
 message.meta("trace_id")
 ```
 
-## In-Process Event Choreography (requires `emitter` feature)
-
-The `emitter` feature adds in-process event-driven choreography — queue local events during commands and emit them after commit for reactive workflows within a single process.
-
-### With `#[sourced(entity, enqueue)]`
-
-Every `#[event]` method automatically records to the entity stream (for replay) and enqueues for in-process emission:
-
-```rust,ignore
-use serde::{Deserialize, Serialize};
-use distributed::{sourced, Entity};
-use distributed::emitter::EntityEmitter;
-
-#[derive(Default, Serialize, Deserialize)]
-struct OrderSaga {
-    entity: Entity,
-    #[serde(skip, default)]
-    emitter: EntityEmitter,
-    order_id: String,
-    status: String,
-}
-
-#[sourced(entity, enqueue)]
-impl OrderSaga {
-    #[event("started")]
-    fn start(&mut self, order_id: String) {
-        self.entity.set_id(&order_id);
-        self.order_id = order_id;
-        self.status = "started".into();
-    }
-
-    #[event("completed", when = self.status == "started")]
-    fn complete_step(&mut self) {
-        self.status = "completed".into();
-    }
-}
-```
-
-### Emitting After Commit
-
-Queued events are held until you explicitly emit them after a successful commit:
-
-```rust,ignore
-let mut saga = OrderSaga::default();
-saga.start("order-1".into())?;
-
-// Commit the aggregate...
-repo.commit(&mut saga).await?;
-
-// Then emit queued events to registered listeners
-saga.emitter.emit_queued();
-```
-
-### Registering Listeners
-
-```rust,ignore
-let shared_state = Arc::new(Mutex::new(Vec::new()));
-let state = Arc::clone(&shared_state);
-
-saga.emitter.on("started", move |payload: String| {
-    if let Ok(mut events) = state.lock() {
-        events.push(payload);
-    }
-});
-```
-
-This pattern is useful for reactive workflows within the same process. For cross-service messaging, use the [Outbox Pattern](#outbox-pattern) and [Service Bus](#service-bus).
-
 ## Queued Repository
 
-Per-entity async locking for serialized workflows. `get` acquires the lock, `commit` releases it:
+Per-entity async locking for serialized workflows. `get` waits for the lock and returns an aggregate that owns it. `commit` releases it, and so does dropping the aggregate, so an early return cannot leak a lock:
 
 ```rust,ignore
 use distributed::{AggregateBuilder, InMemoryRepository, Queueable, RepositoryError};
@@ -961,7 +1058,7 @@ let Some(mut todo) = repo.get("todo-1").await? else {
 repo.commit(&mut todo).await?; // unlocks
 
 // Or release without changes:
-repo.abort(&todo).await?;
+drop(todo);
 
 // Read without locking:
 let _ = repo.peek("todo-1").await?;
@@ -1020,7 +1117,7 @@ the durable transport (`PostgresBus`).
 
 Streams are keyed by full **stream identity** `(aggregate_type, aggregate_id)`,
 not bare IDs. Prefer an explicit durable `aggregate_type` in production
-(`impl_aggregate!(..., aggregate_type = "...")` or the sourced/aggregate macros).
+(`#[sourced(entity, aggregate_type = "...")]`).
 
 | Trait | Role |
 | --- | --- |
@@ -1065,17 +1162,67 @@ let message = OutboxMessage::encode_for_entity(
 )?;
 ```
 
+### Facts derived by event handlers
+
+An event handler may verify an external result without making another aggregate
+decision—for example, extracting document metadata after an upload. Derive a
+typed fact from the incoming canonical occurrence:
+
+```rust,ignore
+#[derive(serde::Serialize, distributed::DomainEvent)]
+#[domain_event(name = "document.indexed", version = 1)]
+struct DocumentIndexed {
+    document_id: String,
+    word_count: u64,
+}
+
+let indexed = source.derive(
+    "document-indexer",
+    "metadata-v1",
+    &DocumentIndexed { document_id, word_count },
+)?;
+```
+
+The same source, producer, output key and body produce identical canonical bytes
+and an identical event ID. Different outputs or changed bodies have different
+IDs. `indexed.derivation()` identifies the immediate source and producer; the
+aggregate fields retain the original transition's provenance, not an invented
+commit. Timestamp, causation, correlation and trace metadata come from the source.
+Ordinary typed projections can consume the derived fact. Aggregate-snapshot
+projections reject it because it does not establish a new aggregate version.
+
+Publish the canonical bytes using the existing bus API and `indexed.id()` as
+the message ID. Propagate its causal metadata. Acknowledge the incoming delivery
+only after every output publish succeeds; a failure retries the source and may
+republish an accepted prefix with the same IDs. This is at-least-once delivery,
+not an atomic external effect plus publish. Aggregate decisions still use a
+transactional outbox. Bound external reads and make effects idempotent before
+using this pattern.
+
+### Scheduled messages, sagas and fenced leases
+
+`OutboxMessage::deliver_at(at)` turns an outbox row into a durable timer that
+no claim path delivers before `at`. Cross-cell workflows use the event-sourced
+`Saga<D>` process manager (`distributed::saga`). Single-owner work uses TTL
+leases with monotonic fencing tokens (`distributed::lease`). See
+[coordination primitives](docs/coordination-primitives.md).
+
 ### Publishing the Outbox
 
 How a committed row reaches the bus depends on whether a bus is attached to the
 service:
 
-- **Bus attached (`service.with_bus(bus)`)** — `repo.outbox(msg).commit(agg)`
-  claims the row in the commit transaction (born `InFlight` under a short lease)
-  and publishes it **immediately** after commit. A crash before the publish, or a
-  publish failure, leaves the row claimed under that lease; when the lease expires
-  the polling worker takes it.
+- **Bus attached (`service.with_bus(bus)`)** — the row is committed `pending`
+  and its id is handed to a bounded background worker, which claims it,
+  publishes it and deletes it. The commit does not wait for the broker. A crash
+  or a full mailbox leaves the row pending for the polling worker.
 - **No bus** — the row is committed `pending` and a worker publishes it.
+
+A publish that fails is retried with a growing delay (250 ms doubling to one
+minute). A retryable failure, such as the broker being down, never marks a row
+`failed`; only a permanent failure does, once the row has been attempted
+`max_attempts` times. `OutboxStore::requeue_failed(id)` puts a failed row back
+in the queue.
 
 The polling worker is the durable backstop in both cases. It is the same
 `OutboxDispatcher` primitive composed with your runtime's timer — run it in the
@@ -1127,8 +1274,8 @@ let service = Arc::new(build_service().named("order-api"));
 let bus = InMemoryBus::new();
 bus.send("place.bet", payload).await?;          // point-to-point command (1:1)
 bus.publish("seat.reserved", payload).await?;   // fan-out event (1:N)
-bus.listen(service.clone(), RunOptions::idempotent()).await?;     // competing
-bus.subscribe(service.clone(), RunOptions::idempotent()).await?;  // fan-out
+bus.listen(service.clone(), RunOptions::default()).await?;     // competing
+bus.subscribe(service.clone(), RunOptions::default()).await?;  // fan-out
 
 // Production: swap the one constructor line — send/listen/publish/subscribe
 // and the handlers are unchanged. A named Service supplies the consumer group.
@@ -1180,25 +1327,59 @@ single-node deployments, not as a high-throughput broker replacement.
 `KnativeBus` implements only `Bus` (produce → broker-ingress POST). It has no
 in-process consume loop: `KnativeBus::manifests(&plan, &subscriptions)` renders the
 role-based `Broker` + per-name `Trigger` YAML, and the service mounts
-`cloud_events_router` so those Triggers reach `dispatch_message`.
+`cloud_events_router` so those Triggers reach `dispatch_message`. A command a
+Trigger delivers runs as the transport identity, so its declaration lists
+`TRANSPORT_ROLE`, and the CloudEvent id is the id its ledger deduplicates on.
 
-### Idempotency and Failure Policy
+### Running, retries and dead letters
 
-`RunOptions::idempotent()` enables idempotent dispatch by default. `RunOptions` also
-carries a `FailurePolicy` controlling what happens to a **permanent** handler
-failure — `Retry`, `DeadLetter`, `Park`, `LogAndAck`, or `Stop`:
+`RunOptions` decides how a consumer run behaves. The same options mean the
+same thing on every transport, because the runner applies them above the
+adapter.
 
 ```rust,ignore
-use distributed::bus::{FailurePolicy, RunOptions};
+use distributed::bus::{FailurePolicy, RunOptions, Shutdown};
 
+let shutdown = Shutdown::new();
 bus.listen(
     service.clone(),
-    RunOptions::idempotent().with_failure_policy(FailurePolicy::Stop),
+    RunOptions::until_shutdown(shutdown.clone())
+        .with_max_attempts(8)
+        .with_failure_policy(FailurePolicy::DeadLetter),
 ).await?;
+// elsewhere: shutdown.trigger();
 ```
 
-Retryable failures (e.g. transient `NotFound`) are nacked for redelivery; the runner
-never silently acks a handler error.
+- **When a run ends.** `RunOptions::default()` and `until_shutdown(signal)`
+  keep consuming while the source is quiet. The run returns `Ok(())` only when
+  the signal is triggered, after settling the delivery in hand.
+  `RunOptions::until_idle()` returns as soon as nothing is available; it is for
+  tests and one-shot drains.
+- **Retries.** A retryable failure (for example a transient `NotFound`) is
+  redelivered after a backoff that doubles with each delivery (50 ms up to 5 s
+  by default; `with_backoff`). `with_max_attempts(n)` dead-letters a message
+  that still fails on its `n`th delivery. Without it retries are unlimited.
+- **Permanent failures** follow the `FailurePolicy`: `DeadLetter` (default),
+  `Retry`, `LogAndAck`, or `Stop`. A deterministic, durably recorded rejection
+  is a permanent error, not a retryable one.
+- **Dead letters.** The runner stores `{message, reason, consumer, attempts}`
+  and only then acknowledges the delivery. A bus stores dead letters by
+  publishing a `distributed.dead_letter` event to itself; `with_dead_letters`
+  names another `DeadLetterSink`. If the dead letter cannot be stored the
+  delivery is handed back and the run ends with an error.
+
+RabbitMQ reports only whether a delivery is a redelivery, so `max_attempts`
+above 2 never triggers there. Positional sources (Kafka, the SQL log) cannot
+deliver a later message first: they hold their position for the backoff.
+
+The [bus contract](docs/bus-contract.md) lists what every transport promises
+and where they differ. One conformance suite runs it against every bus.
+
+A service can place independent route bundles in named delivery lanes
+(`Service::lane(name, routes)`). Each lane keeps broker order and runs
+concurrently with the others, and a delivery is settled only after every lane
+finished it. See [consumer delivery lanes](docs/consumer-delivery-lanes.md) for
+the contract and when a route may leave the default lane.
 
 ### Transport boundaries (producer vs consumer)
 
@@ -1209,15 +1390,15 @@ in `bus` (no concrete broker dependency).
 | Type | Purpose |
 | --- | --- |
 | `TransportError` / `TransportErrorKind` | Retryable vs permanent — drives redelivery vs failure policy |
-| `FailurePolicy` / `FailureAction` | Permanent failure: `Retry`, `DeadLetter`, `Park`, `LogAndAck`, `Stop` |
-| `RunOptions` / `ConsumerDeliveryMode` | Idempotent dispatch by default; optional inbox hook |
-| `TransportCapabilities` | Per-transport durability, confirms, retry ownership, ack kind |
+| `FailurePolicy` / `FailureAction` | Permanent failure: `Retry`, `DeadLetter`, `LogAndAck`, `Stop` |
+| `RunOptions` | When a run ends, retry backoff, max attempts, dead-letter sink |
+| `DeadLetterSink` | Where a given-up message is stored before it is acknowledged |
 | `MessageSource` + `run_source` | Pull loop: dispatch then settle only after the handler finishes |
 | `MessagePublisher` + `OutboxDispatcher` | Publish threshold for outbox completion; claim → publish → complete |
 
 **Two confirmation thresholds** (do not collapse them):
 
-1. **Producer publish** — when an outbox row may be marked published (SQL commit,
+1. **Producer publish** — when an outbox row may be deleted (SQL commit,
    broker confirm/ack, Knative 2xx, in-memory accept). Unknown outcomes stay retryable.
 2. **Consumer ack** — only after the handler (and optional inbox receipt) committed.
    Never silently ack a handler error.
@@ -1225,126 +1406,238 @@ in `bus` (no concrete broker dependency).
 ```rust,ignore
 use distributed::bus::{run_source, RunOptions};
 
-// Low-level receive loop (facade buses wrap this)
-run_source(service, source, RunOptions::idempotent()).await?;
+// Low-level receive loop (facade buses wrap this). A bare source has no
+// dead-letter sink; name one or choose another failure policy.
+run_source(service, source, RunOptions::default().with_dead_letters(sink)).await?;
 ```
+
+## Command contracts
+
+**Commands on the aggregate.** Most commands are one aggregate method:
+take the actor from the session, load (or create) the aggregate, call the
+method, reject on its error, commit with a payload. Write the method and
+mark it `#[command]` inside the `#[sourced]` impl; the macro generates the
+handler and the portable mount (`pub struct RecordKill`, mounted with
+`routes.mount(RecordKill)` or `AggregateCell::mount(RecordKill)`):
+
+```rust,ignore
+#[sourced(entity, aggregate_type = "Crawler", events = "CrawlerEvent", domain_state = CrawlerState)]
+impl Crawler {
+    #[command("crawler.record_kill", shard = principal, load = or_create, outcome = succeeded)]
+    pub fn record_kill(
+        &mut self,
+        #[principal] principal: &str,
+        input: RecordKillInput,
+    ) -> Result<KillReceipt, String> {
+        let xp = xp_for_tier(input.tier).ok_or("unknown tier")?;
+        self.mob_killed(principal.into(), input.name, input.mob, input.tier, xp)
+            .map_err(|e| e.to_string())?;
+        // Receipt helper: the recorded event's stream position and time.
+        let recorded = self.entity.last_recorded().ok_or("nothing recorded")?;
+        Ok(KillReceipt { sequence: recorded.sequence, at_ms: recorded.unix_ms(), .. })
+    }
+
+    #[event("crawler.mob_killed", version = 1, domain)]
+    fn mob_killed(&mut self, id: String, name: String, mob: String, tier: u8, xp: u32) { .. }
+}
+```
+
+- **Principal.** Exactly one parameter is `#[principal]` (`&str` or
+  `String`); the generated handler fills it from the verified session
+  (`x-user-id`, else `Unauthorized`), never from the input. It is
+  mandatory, and an input whose field (Rust or serialized name) is named
+  like it does not compile.
+- **Input.** The other parameter is the `CommandInput` type; or, with
+  `input = Type`, the other parameters are that input's fields by name
+  (`&str` parameters borrow), so a domain method keeps plain arguments.
+- **`shard`** is an input field (also exposed as `RecordKill::shard`) or
+  the principal parameter; **`load`** is `required` (`NotFound` when
+  missing), `or_create` or `create`.
+- **`outcome`** is `succeeded` / `eventual` (the method's `Ok` value is
+  the payload) or `Succeeded<P>` / `Eventual<P>` with `payload = f`
+  (`fn(&Aggregate) -> P`). The method's error (`Display`) becomes
+  `Rejected`. Captured domain events are always published with the commit.
+- Optional: `roles = ["player"]`, `guard = f`, `field = "graphql_field"`,
+  `transition = path` (the emitted-event witness; by default the
+  `domain_commands::*` type `#[sourced]` derives for the method),
+  `mount = Name` (the struct name, default from the command name's last
+  segment).
+
+The generated registration is exactly the hand-written one
+(`command_transition::<domain_commands::X, I, K>(name)` + `field_name`,
+`roles`, `guarded`/`handle`): the command specs, GraphQL SDL and client
+manifest are identical (`tests/aggregate_command`). For unusual bodies write
+the handler and register it with `command! { .., handle: f }` or
+the builder below.
+
+**Contracts.** Command semantics live in `distributed::command`, independently of the query
+transport. Use `CommandInput` and `CommandOutput` to describe Serde input/output
+shapes, and `command::{typed_command, Succeeded, Eventual, Atomic, PreparedCommand}`
+to declare and prepare commands. The GraphQL adapter derives its surface from
+those contracts; GraphQL naming restrictions are checked when exposing them.
+
+```rust
+# use distributed::command;
+use distributed::{CommandInput, CommandOutput};
+use distributed::command::{typed_command, Succeeded};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize, CommandInput)]
+struct RenameInput { id: String, title: String }
+
+#[derive(Serialize, CommandOutput)]
+struct RenameOutput { id: String }
+
+# fn main() {
+let declaration = typed_command::<RenameInput, Succeeded<RenameOutput>>("todo.rename");
+# }
+```
+
+This is a breaking Rust API change. Replace `GraphqlInput`/`GraphqlOutput`
+with `CommandInput`/`CommandOutput` throughout the DTO's nested types and
+move command imports from `distributed::graphql` to `distributed::command`.
+Manual metadata implementations now use `CommandInputType`/`CommandOutputType`,
+`command_type()`, and `CommandTypeDef`/`CommandTypeField`. The old GraphQL
+command re-exports, metadata types, and derives have been removed.
+
+GraphQL remains the application's UI gateway: it exposes the command contract
+alongside queries and subscriptions. Command handlers describe their data and
+consistency through the core API, independently of where that gateway runs.
+
+`Atomic<M>` continues to obtain its response shape from the relational read
+model and requires the existing transaction proof. Moving command ownership
+does not change Eventual projection confirmation or Atomic response sealing.
 
 ## Microservice Framework (`microsvc`)
 
-The `microsvc` module provides a convention-based async command/event handler framework. Register handlers on typed `Routes<D>` bundles, collect them into a non-generic `Service`, then expose that service over HTTP, gRPC, the bus, or direct dispatch.
+The `microsvc` module provides a convention-based async command/event handler framework. Register typed commands and event handlers on `Routes<D>` bundles, collect them into a non-generic `Service`, then expose that service over HTTP, gRPC, the bus, or in-process dispatch. Every command, from every ingress, is typed, authorized by its declared roles, and recorded in the command ledger under its command ID.
 
 ### Defining a Service
 
-A `Routes<D>` bundle is generic over a dependency type `D` that handlers read via `ctx`. Build one fluently from `Routes::new()`: add `.with_repo(repo)` for aggregate command handlers, `.with_read_model_store(store)` for projection handlers (chain both when a handler needs both), or `.with_dependencies(deps)` for custom dependencies. Add one or more route bundles to `Service::new()` with `.routes(routes)`, then use `.with_bus(bus)` to consume from / publish to a transport.
+A `Routes<D>` bundle is generic over a dependency type `D`. Build one fluently from `Routes::new()`: add `.with_repo(repo)` for aggregate command handlers, `.with_read_model_store(store)` for projection handlers (chain both when a handler needs both), or `.with_dependencies(deps)` for event handlers with custom dependencies. Add one or more route bundles to `Service::new().named(..)` with `.routes(routes)`, then use `.with_bus(bus)` to consume from / publish to a transport. A service that runs commands must be named: the name scopes its command ledger.
 
-Handlers are registered with a fluent builder. `.command(name)` / `.event(name)` start a registration; `.handle(closure)` adds an unguarded handler and `.guarded(guard, closure)` adds a guarded one. The handler closure receives `&Context<D>` and returns a future:
+Commands are registered with a fluent builder. `.typed_command(declaration)` starts a registration; `.handle(handler)` adds an unguarded handler and `.guarded(guard, handler)` adds a guarded one. The handler receives `&CausalCommandContext<A>` and the decoded input, and returns the prepared commit:
 
 ```rust,ignore
 use std::sync::Arc;
-use distributed::microsvc::{Context, HandlerError, Routes, Service, Session};
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::command_dispatch::VerifiedPrincipal;
+use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service, Session};
 use distributed::{AggregateBuilder, InMemoryRepository, Queueable};
 use serde_json::json;
 
+async fn initialize(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: CreateCounter,
+) -> Result<PreparedCommand<Succeeded<CounterValue>>, HandlerError> {
+    let mut counter = ctx.repo().create();
+    counter.create(input.id)?;
+    let value = counter.value;
+    ctx.repo().commit(counter)?.succeeded(CounterValue { value })
+}
+
+async fn increment(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: IncrementCounter,
+) -> Result<PreparedCommand<Succeeded<CounterValue>>, HandlerError> {
+    let mut counter = ctx.repo().get(&input.id).await?
+        .ok_or_else(|| HandlerError::NotFound(input.id.clone()))?;
+    counter.increment(input.amount)?;
+    let value = counter.value;
+    ctx.repo().commit(counter)?.succeeded(CounterValue { value })
+}
+
 let routes = Routes::new()
     .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
-    .command("counter.initialize")
-    .handle(|ctx: &Context<Repo>| {
-        let input = ctx.input::<CreateCounter>();
-        async move {
-            let input = input?;
-            let mut counter = Counter::default();
-            counter.create(input.id.clone())?;
-            ctx.repo().commit(&mut counter).await?;
-            Ok(json!({ "id": input.id }))
-        }
-    })
-    .command("counter.increment")
-    .handle(|ctx: &Context<Repo>| {
-        let input = ctx.input::<IncrementCounter>();
-        async move {
-            let input = input?;
-            let mut counter = ctx.repo().get(&input.id).await?
-                .ok_or_else(|| HandlerError::NotFound(input.id.clone()))?;
-            counter.increment(input.amount)?;
-            ctx.repo().commit(&mut counter).await?;
-            Ok(json!({ "value": counter.value }))
-        }
-    });
-let service = Arc::new(Service::new().routes(routes));
+    .typed_command(typed_command::<CreateCounter, Succeeded<CounterValue>>("counter.initialize"))
+    .handle(initialize)
+    .typed_command(typed_command::<IncrementCounter, Succeeded<CounterValue>>("counter.increment"))
+    .handle(increment);
+let service = Arc::new(Service::new().named("counters").routes(routes));
 
-// Direct dispatch
+// In-process dispatch: a UUIDv7 command ID and the principal the caller verified
 let _result = service
-    .dispatch("counter.initialize", json!({ "id": "c1" }), Session::new())
+    .dispatch_causal(
+        "counter.initialize",
+        "0190a000-0000-7000-8000-000000000001",
+        json!({ "id": "c1" }),
+        Session::new(),
+        VerifiedPrincipal::internal("counters-job")?,
+    )
     .await?;
 ```
 
-### Guards
+`CreateCounter` and `IncrementCounter` derive `Deserialize` and `distributed::CommandInput`; `CounterValue` derives `Serialize` and `distributed::CommandOutput`. The handler stages its commit and returns; the framework writes it with the ledger receipt in one transaction, so dispatching the same command ID again replays the receipt instead of running the handler.
 
-`.guarded(guard, handler)` runs the guard before the handler — if it returns `false`, the command is rejected:
+### Roles and Guards
+
+A command declares the roles that may run it with `.roles([..])`; a session without one of them is refused before the handler or guard runs. A command with no declared roles admits any caller. `.guarded(guard, handler)` then runs the guard before the handler — if it returns `false`, the command is rejected:
 
 ```rust,ignore
 let routes = routes
-    .command("admin.reset")
+    .typed_command(typed_command::<ResetInput, Succeeded<ResetOutput>>("admin.reset").roles(["admin"]))
     .guarded(
-        |ctx: &Context<Repo>| ctx.role() == Some("admin"),
-        |_ctx: &Context<Repo>| async { Ok(json!({ "reset": true })) },
+        |ctx: &CausalCommandContext<'_, Counter>| ctx.claim("x-region") == Some("eu"),
+        reset,
     );
 ```
 
 ### Handler File Convention
 
-For larger services, organize handlers into separate files. Each handler module exports a `COMMAND` (or `EVENT` / `EVENTS`) name, a `guard`, and an async `handle`:
+For larger services, organize handlers into separate files. Each command module exports a `COMMAND` name, a `command()` declaration, and an async `handle`:
 
 ```rust,ignore
 // src/handlers/counter_create.rs
-use serde::Deserialize;
-use serde_json::{json, Value};
-use distributed::microsvc::{Context, HandlerError};
-use super::Repo;
+use serde::{Deserialize, Serialize};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{CausalCommandContext, HandlerError};
 use crate::models::counter::Counter;
 
 pub const COMMAND: &str = "counter.initialize";
 
-#[derive(Deserialize)]
-struct Input { id: String }
+#[derive(Debug, Deserialize, distributed::CommandInput)]
+pub struct Input { pub id: String }
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["id"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output { pub id: String }
+
+pub fn command() -> TypedCommand<Input, Succeeded<Output>> {
+    typed_command::<Input, Succeeded<Output>>(COMMAND).roles(["user"])
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<Input>()?;
-
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: Input,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
     if ctx.repo().get(&input.id).await?.is_some() {
         return Err(HandlerError::Rejected(format!("counter {} already exists", input.id)));
     }
 
-    let mut counter = Counter::default();
+    let mut counter = ctx.repo().create();
     counter.create(input.id.clone())?;
 
     // `counter.initialized` is domain-marked on the aggregate.
-    ctx.repo().publish_events().commit(&mut counter).await?;
-
-    Ok(json!({ "id": input.id }))
+    ctx.repo().publish_events().commit(counter)?.succeeded(Output { id: input.id })
 }
 ```
 
-Register them with the `routes!` macro:
+Register them on the route bundle:
 
 ```rust,ignore
-let routes = distributed::routes!(
-    Routes::new().with_repo(InMemoryRepository::new().queued().aggregate::<Counter>()),
-    command handlers::counter_create,
-    command handlers::counter_increment,
-);
-let service = Service::new().routes(routes);
+let routes = Routes::new()
+    .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
+    .typed_command(handlers::counter_create::command())
+    .handle(handlers::counter_create::handle)
+    .typed_command(handlers::counter_increment::command())
+    .handle(handlers::counter_increment::handle);
+let service = Service::new().named("counters").routes(routes);
 ```
 
-Event projection handlers use `EVENT` / `EVENTS` and `event handlers::...` in the same way; inside the handler, `ctx.message()` gives the raw transport `Message` and `ctx.input::<T>()` decodes its payload.
+Event projection handlers export `EVENT` / `EVENTS`, a `guard(ctx) -> bool` and an async `handle(ctx) -> Result<Value, HandlerError>`, and register with the `routes!` macro: `distributed::routes!(routes, event handlers::counter_rebuilt, events handlers::counter_projection)`. Inside an event handler, `ctx.message()` gives the raw transport `Message` and `ctx.input::<T>()` decodes its payload.
 
 ### HTTP Transport (requires `http` feature)
 
-The `http` feature adds an axum-based HTTP transport. Every registered command becomes a `POST /:command` endpoint. Request headers flow into the `Session` verbatim — including identity claims, which the framework does **not** authenticate. Deploy behind a trusted proxy that strips client-supplied identity headers and injects authenticated ones (see [Security / Trust Boundary](#security--trust-boundary)).
+The `http` feature adds an axum-based HTTP transport. With `Service::with_http_command_routes()`, every registered command becomes a `POST /:command` endpoint whose body is `{ "commandId", "input" }`. Request headers flow into the `Session` verbatim — including identity claims, which the framework does **not** authenticate. Deploy behind a trusted proxy that strips client-supplied identity headers and injects authenticated ones (see [Security / Trust Boundary](#security--trust-boundary)).
 
 ```rust,ignore
 use std::sync::Arc;
@@ -1361,22 +1654,64 @@ Routes:
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/:command` | Dispatch a command. Body = JSON input, headers = session variables. |
+| `POST` | `/:command` | Dispatch a command. Body = `{ "commandId", "input" }`, headers = session variables. A body without a `commandId` is a 400. |
 | `GET` | `/health` | Health check: `{ "ok": true, "commands": ["counter.initialize", ...] }` |
 
 ```bash
 curl -X POST http://localhost:3000/counter.initialize \
   -H 'Content-Type: application/json' \
   -H 'x-user-id: user-42' \
-  -d '{"id": "c1"}'
+  -H 'x-roles: user' \
+  -d '{"commandId": "0190a000-0000-7000-8000-000000000001", "input": {"id": "c1"}}'
+# => {"payload": {"id": "c1"}, "receipt": {"commandId": "...", "causationId": "...", "state": "succeeded"}}
 
 curl http://localhost:3000/health
 ```
+
+The command ID is a client-created UUIDv7: retrying a request with the same ID
+replays the committed receipt. A command needs an authenticated user
+(`x-user-id`), and a role its declaration grants.
 
 `x-user-id` / `x-roles` are convenience keys for `Session::user_id()` /
 `Session::roles()` only — not a required protocol. Your gateway can inject any
 claim names; handlers read them with `session.get("…")` or map claims to the
 convenience keys at the edge.
+
+### Authenticated cell wait-path metadata
+
+An internal command host can carry a small, explicit set of already-authenticated
+facts across the private cell HTTP boundary. Do not put producer or operation
+claims in `Session`: ordinary cell calls forward only the authenticated user and
+role keys. `CellRequestContext` requires an internal HTTP secret and reserves
+framework identity and transport-control headers from application metadata.
+
+```rust,ignore
+use distributed::command_dispatch::{
+    CellRequestContext, HttpCommandHost, TrustedRequestMetadata,
+};
+
+let metadata = TrustedRequestMetadata::try_from_pairs([
+    ("x-source-kind", "canonical-fact"),
+])?;
+let context = CellRequestContext::new("writer-service", "principal-partition")
+    .with_causation_id("0190a000-0000-7000-8000-000000000001")
+    .with_trusted_metadata(metadata);
+let host = HttpCommandHost::new_internal("http://cell.internal", secret)?;
+let (_status, body) = host
+    .post_cell_wait_path_with_context(
+        "order.submit",
+        "0190a000-0000-7000-8000-000000000002",
+        serde_json::json!({ "order_id": "order-1" }),
+        &session,
+        &context,
+    )
+    .await?;
+```
+
+Metadata names must be canonical lowercase and values are bounded visible HTTP
+text. Public callers cannot authenticate this path by supplying the reserved
+headers themselves; the cell must validate the shared internal secret before
+constructing its typed command identity.
 
 ### gRPC Transport (requires `grpc` feature)
 
@@ -1392,7 +1727,7 @@ microsvc::serve_grpc(service, "[::1]:50051").await?;
 
 | RPC | Input | Output | Description |
 |---|---|---|---|
-| `Dispatch` | `GrpcRequest` | `GrpcResponse` | Dispatch a command. `input` = JSON string, `session_variables` = metadata map. |
+| `Dispatch` | `GrpcRequest` | `GrpcResponse` | Dispatch a command. `input` = the JSON string `{ "commandId", "input" }`, `session_variables` = metadata map. |
 | `Health` | `HealthRequest` | `HealthResponse` | Health check. |
 
 Session handling mirrors HTTP — gRPC metadata headers are merged with payload `session_variables`. **Transport metadata (trusted, proxy-injected) takes precedence over the client-controlled payload**, so a client cannot spoof identity via the request body. See [Security / Trust Boundary](#security--trust-boundary) below. Errors are returned inside `GrpcResponse.status` (HTTP-style status codes) with internal (5xx) error detail masked to a generic message, keeping client behavior identical across transports.
@@ -1403,27 +1738,30 @@ Attach a bus with `service.with_bus(bus)` and drive it with `run(opts)`: it
 derives `listen` (point-to-point commands) and `subscribe` (fan-out events) from
 the registered handlers, and makes `repo.outbox(msg).commit(agg)` publish on
 commit. The same `Service` can handle commands from multiple transports
-simultaneously — HTTP, gRPC, bus, and direct dispatch all share the same handlers
-and repository. For finer-grained control, call the `listen` / `subscribe` facade
+simultaneously — HTTP, gRPC, bus, and in-process dispatch all share the same handlers,
+repository and command ledger. A bus delivers a command as the transport
+identity: the command must declare `TRANSPORT_ROLE` in its roles and the
+message must carry an id, which the ledger deduplicates redeliveries on. For finer-grained control, call the `listen` / `subscribe` facade
 methods directly. See [Service Bus](#service-bus) above.
 
 ### Error Handling
 
-`HandlerError` maps to HTTP-style status codes:
+A command that does not commit returns a `CausalDispatchError`; the HTTP and
+gRPC transports answer with its status and a `{ "code", "error" }` body. A
+handler's `HandlerError` becomes the recorded rejection of that command ID:
 
-| Variant | Status Code |
-|---|---|
-| `UnknownCommand` | 404 |
-| `DecodeFailed` | 400 |
-| `GuardRejected` | 400 |
-| `Rejected` | 422 |
-| `NotFound` | 404 |
-| `Unauthorized` | 401 |
-| `Repository` | 500 |
-| `Other` | 500 |
+| Cause | Status | `code` |
+|---|---|---|
+| Unknown command, bad envelope, input that does not decode | 400 | `BAD_REQUEST` |
+| No authenticated user (or handler `Unauthorized`) | 401 | `UNAUTHORIZED` |
+| Session lacks a declared role | 403 | `FORBIDDEN` |
+| Handler `NotFound` | 404 | `NOT_FOUND` |
+| Command ID reused for different input, or still in progress | 409 | `COMMAND_ID_REUSE` / `COMMAND_IN_PROGRESS` |
+| Handler `Rejected`, guard returned `false` | 422 | `REJECTED` |
+| Repository or other host failure | 500 | `INTERNAL` |
 
 Internal (5xx) errors are **masked** before being returned to clients — the
-response body carries a generic `"Internal server error"` so SQL text, driver
+response body carries a generic `"internal error"` so SQL text, driver
 detail, or internal paths never leak. The original error is logged
 server-side. Client-fault (4xx) errors keep their descriptive message. This
 applies identically to the HTTP and gRPC transports.
@@ -1546,6 +1884,22 @@ let loaded = repo
   PK (same-named columns, or `foreign_key` / `target_foreign_key` in PK order).
   A one-column `foreign_key` on a composite PK is an error, not a silent
   `.first()`.
+- **Unique-key joins:** direct relationships can set
+  `references = "namespace,revision"` alongside
+  `foreign_key = "object_namespace,object_revision"`. The referenced columns
+  must be a complete declared unique key, such as
+  `#[unique(columns = ["namespace", "revision"])]`, on the target of
+  `belongs_to` or the source of `has_many`. Foreign-key columns pair in the
+  declared reference order. This lets a model retain a surrogate primary key
+  for row identity while relating by a domain key. Missing/null foreign keys
+  produce no match; nested target permissions still apply. Omitting `references`
+  selects the primary key. `references` is not supported on `many_to_many`.
+- **Cyclic singular relationships:** use `Option<Box<T>>` for a `belongs_to`
+  field when two models refer to each other. For example,
+  `#[readmodel(belongs_to = "Profile", foreign_key = "id")]`
+  `profile: Option<Box<Profile>>`. The box only gives Rust a finite-sized type;
+  GraphQL still exposes one nullable `Profile`, not a list or embedded JSON
+  column. Ordinary `Option<T>` remains the same singular relationship.
 - **Writes:** `ReadModelWritePlan` / workspace `upsert` + `commit` (same transaction
   as events when staged on `CommitBatch`).
 - **Internal loads:** PK-anchored includes —
@@ -1606,6 +1960,54 @@ distributed = { version = "0.1", features = ["graphql", "postgres"] }
 `distributed::graphql::{naming,sdl}` compile without the feature so
 `distributed schema --format graphql` works in tooling crates.
 
+### Literal text search
+
+Use `_icontains` for a case-insensitive substring search on a String column:
+
+```graphql
+query SearchTodos($q: String! = "") @load @live {
+  todos(where: { title: { _icontains: $q } }, limit: 20) {
+    todo_id
+    title
+  }
+}
+```
+
+A colocated binding can pass `q: searchParam('q', 'String')` directly. Callers do not
+construct `%patterns%`: `%`, `_`, backslash, quotes and the escape character
+are literal text. The query engine binds an escaped pattern on both PostgreSQL
+and SQLite. An empty string matches every non-null string; use a bounded query
+and show results only after a submitted search when building a search form.
+
+The pattern operators mean the same thing on PostgreSQL and SQLite:
+
+| Operator | Wildcards | Case |
+|---|---|---|
+| `_like` | `%` any run, `_` one character, `\` escapes the next character | exact |
+| `_ilike` | same | ASCII letters fold; every other character is exact |
+| `_icontains` | none: the operand is literal text | same as `_ilike` |
+
+Folding is ASCII-only on both backends, so `é` does not match `É` under
+`_ilike` or `_icontains`; PostgreSQL's collation-dependent `ILIKE` folding is
+not used. A pattern that ends in a lone `\` is a `BAD_REQUEST`. The browser
+replica does not evaluate these operators locally and relies on the authorized
+server result. `_contains` remains the PostgreSQL JSON containment operator.
+
+Text comparison is by UTF-8 bytes on both backends, for `_eq`, `_neq`, `_in`,
+`_nin`, `_gt`/`_gte`/`_lt`/`_lte` and `order_by` alike: `"Open"` is not
+`"open"`, and `"Zeta"` sorts before `"alpha"`. The browser replica compares
+the same way, so a list filtered by a text column is maintained locally.
+On PostgreSQL the range operators and `order_by` pin `COLLATE "C"`; an index
+that should serve them must be declared with that collation. Equality uses
+the column's own collation, which must be deterministic (the default is), so
+`citext` and nondeterministic collations are not supported.
+
+A comparison with `null` is neither true nor false, as in SQL, and a row is
+returned or authorized only when its filter is true. A `where`, a row policy,
+the command-delta path and the browser replica all follow that rule, and
+`tests/fixtures/client-query-plan-corpus.json` holds PostgreSQL, SQLite,
+`FilterExpr::evaluate` and the replica to the same answers.
+
 ### Scope
 
 | In | Out |
@@ -1621,9 +2023,8 @@ distributed = { version = "0.1", features = ["graphql", "postgres"] }
 ### Mount on a service
 
 ```rust,ignore
-use distributed::graphql::{
-    claim, col, read, typed_command, Eventual, GraphqlEngine,
-};
+use distributed::command::{typed_command, Eventual};
+use distributed::graphql::{claim, col, read, GraphqlEngine};
 use distributed::microsvc::{Routes, Service};
 
 let routes = Routes::new()
@@ -1694,19 +2095,32 @@ ModelPermissions::new()
 Row predicates can bind session claims (`claim("x-user-id")`, …) so multi-tenant
 RLS lives in the engine, not ad-hoc handler SQL.
 
+With the causal protocol enabled, required session presets must be present and
+valid for their declared codecs before execution. Missing or malformed values
+return `BAD_REQUEST` for both ordinary and streaming requests, without running
+resolvers or issuing a partial protocol envelope. The error does not disclose
+claim names or values; configure the identity mapping to supply those inputs.
+
 ### Identity (first-class OIDC)
 
 Auth is a **built-in GraphQL concern**, not a separate product you wire after the
 fact. The engine validates tokens, maps claims into a `microsvc::Session`, and
-feeds the same claim map into RLS (`claim("x-user-id")`, roles, …). Modes live
-under [`src/graphql/identity/`](src/graphql/identity/):
+feeds the same claim map into RLS (`claim("x-user-id")`, roles, …). There are
+three modes and **no default**: `GraphqlEngine::build()` fails until
+`.identity(..)` names one. They live under
+[`src/graphql/identity/`](src/graphql/identity/):
 
 | Mode | When to use |
 |---|---|
 | **`OidcBearer`** | **Default for public edges:** JWT access tokens (`Authorization: Bearer …`), JWKS (incl. discovery), iss/aud/exp/nbf, alg allowlist (no `alg=none`), claim → engine roles. Configure with `OIDC_ISSUER` / `OIDC_AUDIENCE` (and related). |
-| **`TrustedProxy`** | Mesh/gateway already authenticated; inject trusted headers, strip client spoofing. |
-| **`Hybrid`** | Bearer when present, else trusted proxy headers. |
+| **`Gateway`** | A gateway in front already authenticated the caller. `IdentityConfig::gateway(header, secret)`: a request is trusted only when it carries the shared secret (compared in constant time); its `x-user-id` / `x-roles` then become the session. Without the secret: 401. |
 | **`DevHeaders`** | Local only: ambient `x-user-id` / `x-roles`. **Never** on a public edge. |
+
+Credentials never enter the `Session` handed to command handlers:
+`authorization`, `cookie` and the gateway secret header are dropped in every
+mode. If the issuer's JWKS endpoint fails, requests keep validating against the
+keys already cached, and the issuer is retried after
+`OidcConfig::jwks_refresh_failure_backoff` (30s by default).
 
 Scaffolds prefer **`OidcBearer`** whenever OIDC env is set — not DevHeaders.
 
@@ -1720,8 +2134,15 @@ Shared assertions (E1–E8): discovery/JWKS, happy path, role isolation, multi-a
 
 **WebSocket subscriptions:** browsers cannot set `Authorization` on the upgrade.
 Clients send the access token in `connection_init` (`authorization` /
-`accessToken` / nested headers). Do not put long-lived tokens in query strings
-for production. e2e-ui chat demonstrates the OIDC path.
+`accessToken` / nested headers). Identity is never read from the URL query
+string. Under `Gateway` the secret must be on the upgrade request and the
+`connection_init` payload is ignored. e2e-ui chat demonstrates the OIDC path.
+
+Each origin WebSocket is bounded by `WebsocketLimits` (set with
+`.websocket_limits(..)`): it closes when the token that opened it expires
+(close code `4401`) or after `max_lifetime` (12h), whichever is first; the
+server pings and drops a peer silent for `idle_timeout` (60s); and one
+connection holds at most `max_live_queries` (100) subscriptions.
 
 > **Note:** Raw microsvc HTTP/gRPC routes still treat `Session` as opaque unless
 > you terminate auth at a proxy **or** put the public API on GraphQL
@@ -1784,6 +2205,13 @@ distributed dev    # same generation lifecycle with supervised API/UI processes
 Application code does not invoke the client compiler directly or commit its
 outputs. `distributed client-manifest` and `distributed client` are internal
 compiler primitives used by the lifecycle, not parallel application workflows.
+
+`distributed dev` tells each supervised process whether it belongs to the
+active generation. A process honours that by composing its services with
+`.with_lifecycle(LifecycleGate::from_env())` (resolved once, cloned into every
+`Service`): outside the active generation, writes fail with
+`ApplicationReloading`. Without the call a service is always open. See
+[`docs/reloading-event-delivery.md`](docs/reloading-event-delivery.md).
 
 See [`js/README.md`](js/README.md) for the package API and
 [`tests/e2e-ui/README.md`](tests/e2e-ui/README.md) for the complete integration
@@ -1883,7 +2311,7 @@ struct Todo {
 }
 ```
 
-Fields with `#[serde(skip)]` (like `emitter: EntityEmitter`) are automatically excluded.
+Fields with `#[serde(skip)]` are automatically excluded.
 
 **Custom ID key** — when the entity ID maps to a domain field like `sku`:
 
@@ -2024,6 +2452,40 @@ a smaller target: model fields, event methods, handler bodies, and projection
 shapes. Boilerplate service setup, manifest discovery, schema output, and GitOps
 artifacts stay deterministic.
 
+For an existing typed `Service`, derive the logical application from its command
+inventory and the same full GraphQL `Surface` used by the runtime:
+
+```rust,ignore
+let surface = distributed::SurfaceSpec::from_surface("catalog", &full_surface)?;
+let application = service.application("catalog", surface)?;
+let manifest = application.manifest();
+```
+
+Command namespaces such as `orders.submit` supply module names; there is no
+second module list to maintain. Assembly rejects commands missing from the
+Surface or exposed by the Surface without a Service owner. Role-selected client
+exports remain authorization views of that full contract. Complete application
+manifests are bounded at 16 MiB; each opaque JSON contract remains bounded at
+1 MiB. A generated Surface contract uses the complete-manifest budget rather
+than the opaque-value cap; its typed contents and the existing collection,
+string and nesting limits are still validated. The complete artifact, including
+all surfaces and module inventories, must fit within 16 MiB, matching the CLI
+manifest ingress budget. Older tooling capped at 4 MiB must be rebuilt before
+consuming larger artifacts; encoding versions and existing fingerprints do not
+change.
+
+An event-driven policy that emits through another aggregate can explicitly carry
+the incoming command's causal identity before recording its events:
+
+```rust,ignore
+ctx.inherit_causation(&mut downstream)?;
+downstream.record(observation)?;
+```
+
+This requires an incoming causation ID and does not manufacture one for external
+events. NATS preserves the message's payload content type and keeps reserved
+transport headers out of user metadata across delivery.
+
 ```bash
 cargo install distributed_cli            # installs `distributed`
 
@@ -2043,6 +2505,17 @@ cargo test
 distributed describe                  # print the ApplicationManifest as JSON
 distributed schema --dialect postgres # render migration SQL from read models
 ```
+
+Application manifest wire version 2 stores module declarations and selected
+Surface contracts without repeating top-level `commands`, `events`, `models`,
+or `projections`. The Rust `ApplicationManifest` decoder reconstructs those
+inventories and validates their ownership; its convenience fields are unchanged.
+Portable application artifacts remain bounded to 16 MiB. Version 1 artifacts must be
+regenerated with the matching CLI; they are not accepted as version 2.
+
+Modeled projection contracts [share repeated operations and selector schemas](docs/compact-projection-contracts.md)
+when smaller, preserving every current and retained event selector within the
+same manifest budget. Runtime program identities and execution are unchanged.
 
 For a full application, run `distributed build` or `distributed dev` from its
 Cargo workspace root. The CLI discovers the typed application, runtime binary,
@@ -2165,37 +2638,63 @@ reference: [`distributed_cli/README.md`](distributed_cli/README.md).
 
 ```text
 src/
-  aggregate/      # Aggregate trait, hydration, async aggregate repository helpers
-  bus/            # Bus facade + adapters (in-memory, sqlite, postgres, nats, rabbitmq, kafka, knative)
-  commit_builder/ # Transactional batches for aggregates, outbox, and read models
-  emitter/        # In-process event emitter helpers (feature = "emitter")
-  entity/         # Entity, event records, metadata, upcasting codecs
-  graphql/        # Query service: engine, permissions, identity, SDL, HTTP/WS (feature = "graphql")
-  in_memory_repo/   # In-memory repository (implements every async trait)
-  lock/           # Lock + lock manager traits, in-memory locks
-  microsvc/       # Command/event handler framework: service, context, session
-  outbox/         # Durable outbox message + commit extension
-  outbox_worker/  # Outbox claiming, publishing, workers
-  postgres_repo/  # Postgres async SQL repository (feature = "postgres")
-  queued_repo/    # Queue-based locking repository wrapper
-  read_model/     # Read model store traits, in-memory store, schema metadata
-  snapshot/       # Snapshot store traits, in-memory store, snapshot repository
-  sqlite_repo/    # SQLite async SQL repository (feature = "sqlite")
-  table/          # Neutral table/row primitives shared by read models and ops tables
-  lib.rs          # Public exports
-distributed_macros/
-  src/            # Proc macros: sourced, digest, aggregate, enqueue, ReadModel, Snapshot
-js/               # @hops-ops/distributed JS/TS client, command runtime, and SvelteKit adapter
-tests/e2e-ui/     # Full-stack CQRS + GraphQL + SvelteKit template (nested workspace)
-migrations/       # Explicit SQLite and Postgres migrations
-compose.yaml      # Local postgres / rabbitmq / kafka / nats for integration tests
+  aggregate/          # Aggregate trait, hydration, async aggregate repository helpers
+  application/        # Placement-independent application composition (modules, mounts, plans)
+  bus/                # Bus facade + adapters (in-memory, sqlite, postgres, nats, rabbitmq,
+                      #   kafka, knative, redis streams, celld Queue relay)
+  clock.rs            # Injectable wall clock for coordination primitives
+  command/            # Typed commands: Eventual/Atomic/Succeeded, prepared completions, client effects
+  command_dispatch/   # CommandHost: local, HTTP and remote dispatch boundary
+  command_ledger/     # Durable command identity and fenced commit primitives (crate-private)
+  commit_builder/     # Transactional batches for aggregates, outbox, and read models
+  domain_event/       # Typed outward domain events, separate from replay bytes
+  entity/             # Entity, event records, metadata, upcasting codecs
+  gateway/            # Portable application gateway contracts (feature = "gateway*")
+  graphql/            # Query service: engine, permissions, identity, SDL, HTTP/WS (feature = "graphql")
+  in_memory_repo/     # In-memory repository (implements every async trait)
+  leaderboard/        # Sorted-set leaderboards as a rebuildable projection target (memory, Redis)
+  lease/              # TTL leases with monotonic fencing tokens
+  lock/               # Lock + lock manager traits, in-memory locks
+  metrics/            # Prometheus-compatible framework metrics (feature = "metrics")
+  microsvc/           # Command/event handler framework: service, context, session, cell_host (celld)
+  mutation/           # Event-independent read-model mutation IR and interpreters
+  outbox/             # Durable outbox message + commit extension
+  outbox_worker/      # Outbox claiming, publishing, workers
+  postgres_repo/      # Postgres async SQL repository (feature = "postgres")
+  projection/         # Deterministic domain-event projection programs and runtime
+  projection_protocol/ # Projection identities, ordering vocabulary, codecs (+ projection_protocol.rs)
+  queued_repo/        # Queue-based locking repository wrapper
+  read_model/         # Read model store traits, in-memory store, schema metadata, keyset scans
+  repository/         # Repository traits (GetStream, TransactionalCommit, …)
+  saga/               # Event-sourced process managers for cross-cell workflows (incl. fan-out)
+  schedule.rs         # Portable aggregate schedules, host clock, backend capabilities
+  snapshot/           # Snapshot store traits, in-memory store, snapshot repository
+  sqlite_repo/        # SQLite async SQL repository (feature = "sqlite")
+  sqlx_repo/          # SQL code shared by the Postgres and SQLite repositories
+  table/              # Neutral table/row primitives shared by read models and ops tables
+  telemetry.rs        # Telemetry vocabulary shared by metrics and tracing
+  time.rs             # Wall clock that also works on wasm32
+  trace_context.rs    # W3C trace-context metadata helpers
+  lib.rs              # Public exports
+distributed_macros/   # Proc macros: sourced, command!, mutation!, ReadModel, Snapshot, DomainState,
+                      #   DomainEvent, CommandInput, CommandOutput (projection! is in src/lib.rs)
+distributed_cli/      # The `distributed` CLI (build/dev lifecycle, client codegen, contracts
+                      #   check/accept, game-manifest/game-client/game-wasm); also a library
+distributed_game/     # Authoritative multiplayer zone runtime: fixed tick, facts, replication,
+                      #   WebSocket net, celld cells (zone lease/state, fact sink)
+distributed_game_macros/ # Derives for distributed_game: Replicated, GameInput, GameEvent, …
+js/                   # @hops-ops/distributed JS/TS client, command runtime, SvelteKit adapter, game SDK
+examples/             # graphiql.rs, and examples/game (game demos + SvelteKit Mob Pit; own workspace)
+tests/e2e-ui/         # Full-stack CQRS + GraphQL + SvelteKit template (nested workspace)
+tests/e2e-celld/      # The same UI with commands on celld cells and NATS (nested workspace)
+migrations/           # Explicit SQLite and Postgres migrations
+compose.yaml          # Local postgres / rabbitmq / kafka / nats / redis for integration tests
 ```
 
 ## Running Tests
 
 ```bash
 cargo test                  # default feature set
-cargo test --features emitter
 cargo test --features http
 cargo test --features grpc
 make test                 # starts compose and runs full local coverage
@@ -2253,7 +2752,7 @@ e2e-celld (`tests/e2e-celld`), Blob game, live chat, GraphiQL.
 | `tests/graphql_*` | Engine, HTTP/WS, harden, identity, multi-IdP OIDC |
 | `tests/typed_commands/` | Eventual / `Atomic` / `Succeeded` command registration |
 | `tests/microsvc/` | Handlers on HTTP, gRPC, bus, session |
-| `tests/read_models/`, `tests/distributed_read_model/` | Atomic vs eventual projections |
+| `tests/read_model_*/`, `tests/distributed_read_model/` | Read models: commit bridge, keyset scans, relationships, sessions, Atomic vs eventual projections |
 | `tests/sourced*` / `tests/snapshots/` / `tests/upcasting/` | Macros, snapshots, event versioning |
 | `tests/sagas/` | Orchestration + choreography with the outbox |
 | `tests/*_transport/`, `tests/knative_cloudevents/` | Broker adapters + conformance |

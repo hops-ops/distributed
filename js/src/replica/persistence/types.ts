@@ -3,7 +3,12 @@ import type {
 	ReplicaDehydratedState
 } from '../types.js';
 
-export const REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED = false as const;
+import type {
+	ReplicaCommandOutbox,
+	ReplicaCommandOutboxOptions
+} from './outbox.js';
+
+export const REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED = true as const;
 
 export type ReplicaPersistenceModelPolicy = {
 	/**
@@ -39,7 +44,16 @@ export type ReplicaIndexedDbPersistenceOptions = {
 };
 
 export interface ReplicaIndexedDbPersistence {
-	readonly supportsOfflineCommandOutbox: false;
+	readonly supportsOfflineCommandOutbox: true;
+
+	/**
+	 * Durable offline command outbox in the same database. Wrap the network
+	 * command transport with it; commands whose policy is explicitly
+	 * `{ durable: true, sensitive: false }` are persisted before send and
+	 * drained in order (same command ids) by `drain()` after reconnect.
+	 * Confirmed-state policy is unaffected: optimistic state is never stored.
+	 */
+	commandOutbox(options: ReplicaCommandOutboxOptions): ReplicaCommandOutbox;
 
 	/**
 	 * Validate, policy-filter, and persist one confirmed dehydration envelope.

@@ -6,14 +6,19 @@
 
 #![cfg(feature = "sqlite")]
 
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
-use distributed::bus::{Bus, InMemoryBus, RunOptions};
-use distributed::microsvc::{Context, HandlerError, HasOutboxStore, Routes, Service, Session};
+use distributed::bus::{Bus, BusConsumer, Handlers, InMemoryBus, Message, MessageKind, RunOptions};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{
+    CausalCommandContext, HandlerError, HasOutboxStore, Routes, Service, Session, TRANSPORT_ROLE,
+};
 use distributed::{
     sourced, AggregateBuilder, AggregateRepository, Entity, OutboxMessage, OutboxMessageStatus,
     OutboxStore, Queueable, QueuedRepository, SqliteRepository,
 };
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 struct Counter {
@@ -32,13 +37,34 @@ impl Counter {
 
 type Repo = AggregateRepository<QueuedRepository<SqliteRepository>, Counter>;
 
-// Named fn (not a closure) so the higher-ranked `Handler` bound resolves.
-async fn handle_touch(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let mut counter = Counter::default();
+#[path = "../support/commands.rs"]
+mod commands;
+
+#[derive(Debug, Deserialize, distributed::CommandInput)]
+struct Touch {}
+
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+struct Touched {
+    value: i64,
+}
+
+/// Dispatched in-process with no role, and delivered by the bus.
+fn touch() -> TypedCommand<Touch, Succeeded<Touched>> {
+    typed_command::<Touch, Succeeded<Touched>>("counter.touch")
+}
+
+async fn handle_touch(
+    ctx: &CausalCommandContext<'_, Counter>,
+    _input: Touch,
+) -> Result<PreparedCommand<Succeeded<Touched>>, HandlerError> {
+    let mut counter = ctx.repo().create();
     counter.touch("c1".to_string())?;
     let message = OutboxMessage::create("evt-c1", "counter.touched", b"{}".to_vec())?;
-    ctx.repo().outbox(message).commit(&mut counter).await?;
-    Ok(json!({ "value": counter.value }))
+    let value = counter.value;
+    ctx.repo()
+        .outbox(message)
+        .commit(counter)?
+        .succeeded(Touched { value })
 }
 
 async fn service() -> Repo {
@@ -49,16 +75,19 @@ async fn service() -> Repo {
         .aggregate::<Counter>()
 }
 
-async fn wait_until_published(store: &impl OutboxStore, count: usize) {
+async fn assert_published_and_drained(store: &impl OutboxStore, bus: &InMemoryBus) {
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
-            if store
-                .messages_by_status(OutboxMessageStatus::Published, usize::MAX)
-                .await
-                .unwrap()
-                .len()
-                >= count
-            {
+            let mut remaining = 0;
+            for status in [
+                OutboxMessageStatus::Pending,
+                OutboxMessageStatus::InFlight,
+                OutboxMessageStatus::Failed,
+                OutboxMessageStatus::Published,
+            ] {
+                remaining += store.messages_by_status(status, 8).await.unwrap().len();
+            }
+            if remaining == 0 {
                 break;
             }
             tokio::task::yield_now().await;
@@ -66,35 +95,43 @@ async fn wait_until_published(store: &impl OutboxStore, count: usize) {
     })
     .await
     .expect("immediate publish should settle outbox rows");
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let record = delivered.clone();
+    let handlers = Handlers::new().on_event("counter.touched", move |message: &Message| {
+        record
+            .lock()
+            .unwrap()
+            .push(message.id().unwrap().to_string());
+        async { Ok(()) }
+    });
+    bus.subscribe(Arc::new(handlers), RunOptions::until_idle())
+        .await
+        .unwrap();
+    assert_eq!(*delivered.lock().unwrap(), vec!["evt-c1".to_string()]);
 }
 
 #[tokio::test]
 async fn commit_publishes_immediately_over_sqlite() {
+    let bus = InMemoryBus::new();
     let repo = service().await;
     let store = repo.outbox_store();
     let service = Service::new()
+        .named("counters")
         .routes(
             Routes::new()
                 .with_repo(repo)
-                .command("counter.touch")
+                .typed_command(touch())
                 .handle(handle_touch),
         )
-        .with_bus(InMemoryBus::new());
+        .with_bus(bus.clone());
 
     // Command completion returns at durable commit; the bounded worker
     // claims the pending row and publishes it.
-    service
-        .dispatch("counter.touch", json!({}), Session::new())
+    commands::dispatch(&service, "counter.touch", json!({}), Session::new())
         .await
         .unwrap();
 
-    wait_until_published(&store, 1).await;
-    let published = store
-        .messages_by_status(OutboxMessageStatus::Published, usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(published.len(), 1, "row should be published immediately");
-    assert_eq!(published[0].id(), "evt-c1");
+    assert_published_and_drained(&store, &bus).await;
     assert!(
         store.pending(usize::MAX).await.unwrap().is_empty(),
         "nothing should be left for the poller"
@@ -107,24 +144,23 @@ async fn run_consumes_command_and_publishes_over_sqlite() {
     let repo = service().await;
     let store = repo.outbox_store();
     let service = Service::new()
+        .named("counters")
         .routes(
             Routes::new()
                 .with_repo(repo)
-                .command("counter.touch")
+                .typed_command(touch().roles([TRANSPORT_ROLE]))
                 .handle(handle_touch),
         )
         .with_bus(bus.clone());
 
     // Enqueue a command, then run: listen is derived from the registered command,
     // drains it, and the handler publishes its outbox row through the bus.
-    bus.send("counter.touch", b"{}".to_vec()).await.unwrap();
-    service.run(RunOptions::idempotent()).await.unwrap();
+    bus.send_message(
+        Message::new("counter.touch", MessageKind::Command, b"{}".to_vec()).with_id("cmd-1"),
+    )
+    .await
+    .unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
-    wait_until_published(&store, 1).await;
-    let published = store
-        .messages_by_status(OutboxMessageStatus::Published, usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].id(), "evt-c1");
+    assert_published_and_drained(&store, &bus).await;
 }

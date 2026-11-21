@@ -11,10 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::{HeaderMap, HeaderValue};
 use base64::Engine;
 use distributed::graphql::{
-    extract_bearer, graphql_router, map_claims_to_session, read, resolve_session_sync,
-    strip_identity_headers, AuthError, ClaimMapConfig, GraphqlEngine, IdentityConfig, IdentityMode,
-    IdentityResolver, ModelPermissions, OidcConfig, OidcValidator, DEFAULT_IDENTITY_STRIP_HEADERS,
+    extract_bearer, graphql_router, graphql_router_composed, map_claims_to_session, read,
+    AuthError, ClaimMapConfig, GraphqlEngine, IdentityConfig, IdentityResolver, ModelPermissions,
+    OidcConfig, OidcValidator, WebsocketLimits,
 };
+use distributed::microsvc::Session;
 use distributed::ReadModel;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rsa::pkcs1::EncodeRsaPrivateKey;
@@ -22,7 +23,6 @@ use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::sqlite::SqlitePoolOptions;
 use tower::util::ServiceExt;
 
 // ── RSA fixture helpers ─────────────────────────────────────────────────────
@@ -97,6 +97,18 @@ kHmPRiazukxPLb6ilpRAewjW8nihRANCAATDskChT+Altkm9X7MI69T3IUmrQU0L
 
 const ES256_X: &str = "w7JAoU_gJbZJvV-zCOvU9yFJq0FNC_edCMRM78P8eQQ";
 const ES256_Y: &str = "wQg1EytcsEmGrM70Gb53oluoDbVhCZ3Uq3hHMslHVb4";
+
+/// Resolve one request as a service would. Every config here uses static
+/// JWKS, so nothing touches the network.
+fn resolve_session_sync(
+    headers: &HeaderMap,
+    config: &IdentityConfig,
+) -> Result<Session, AuthError> {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(IdentityResolver::new(config.clone()).resolve_session(headers))
+}
 
 fn headers_from(pairs: &[(&str, &str)]) -> HeaderMap {
     let mut h = HeaderMap::new();
@@ -341,7 +353,7 @@ fn f1_valid_jwt_maps_session_spoof_headers_ignored() {
         }
     });
     let token = sign_claims(&keys, claims);
-    let mut cfg = IdentityConfig::oidc_bearer(oidc_cfg(&keys));
+    let cfg = IdentityConfig::oidc_bearer(oidc_cfg(&keys));
     let headers = headers_from(&[
         ("authorization", &format!("Bearer {token}")),
         ("x-user-id", "evil"),
@@ -359,34 +371,45 @@ fn f1_valid_jwt_maps_session_spoof_headers_ignored() {
     );
     // Client spoof must not replace sub
     assert_ne!(session.user_id(), Some("evil"));
-    let _ = &mut cfg;
 }
 
-// ── F6 Hybrid missing Bearer → trust gateway headers ────────────────────────
+// ── Gateway: headers are believed only with the shared secret ───────────────
 
 #[test]
-fn f6_hybrid_missing_bearer_trusts_proxy_headers() {
-    let keys = mint_keys();
-    let cfg = IdentityConfig::hybrid(oidc_cfg(&keys));
-    let headers = headers_from(&[("x-user-id", "gateway-user-9"), ("x-roles", "customer")]);
+fn f6_gateway_with_secret_trusts_injected_headers() {
+    let cfg = IdentityConfig::gateway("x-gateway-secret", "s3cret").unwrap();
+    let headers = headers_from(&[
+        ("x-gateway-secret", "s3cret"),
+        ("x-user-id", "gateway-user-9"),
+        ("x-roles", "customer"),
+        ("cookie", "sid=1"),
+    ]);
     let session = resolve_session_sync(&headers, &cfg).unwrap();
     assert_eq!(session.user_id(), Some("gateway-user-9"));
-    assert!(
-        session
-            .get("x-roles")
-            .map(|r| r.split(",").any(|p| p == "customer"))
-            .unwrap_or(false),
-        "expected role customer in x-roles: {:?}",
-        session.get("x-roles")
+    assert_eq!(session.roles(), vec!["customer"]);
+    for credential in ["x-gateway-secret", "cookie", "authorization"] {
+        assert!(session.get(credential).is_none(), "{credential} leaked");
+    }
+}
+
+#[test]
+fn f6_gateway_without_secret_is_unauthorized() {
+    let cfg = IdentityConfig::gateway("x-gateway-secret", "s3cret").unwrap();
+    let headers = headers_from(&[("x-user-id", "attacker"), ("x-roles", "admin")]);
+    assert_eq!(
+        resolve_session_sync(&headers, &cfg).unwrap_err(),
+        AuthError::Unauthorized
     );
 }
 
-// ── F7 Hybrid invalid Bearer → 401, no fallthrough ──────────────────────────
+// ── F7 invalid Bearer → 401, client headers never a fallback ────────────────
 
 #[test]
-fn f7_hybrid_invalid_bearer_no_proxy_fallthrough() {
+fn f7_invalid_bearer_does_not_fall_back_to_client_headers() {
     let keys = mint_keys();
-    let cfg = IdentityConfig::hybrid(oidc_cfg(&keys));
+    let mut oidc = oidc_cfg(&keys);
+    oidc.require_auth = false;
+    let cfg = IdentityConfig::oidc_bearer(oidc);
     let header = b64url(br#"{"alg":"none"}"#);
     let payload = b64url(br#"{}"#);
     let bad = format!("{header}.{payload}.");
@@ -424,37 +447,22 @@ fn f9_oidc_missing_require_auth_false_anonymous() {
     assert!(session.role().is_none());
 }
 
-// ── F10 TrustedProxy strip ──────────────────────────────────────────────────
+// ── F10 client identity headers are never believed outside DevHeaders ───────
 
 #[test]
-fn f10_trusted_proxy_strips_client_identity() {
-    let cfg = IdentityConfig::trusted_proxy();
+fn f10_anonymous_oidc_ignores_client_identity_headers() {
+    let keys = mint_keys();
+    let mut oidc = oidc_cfg(&keys);
+    oidc.require_auth = false;
+    let cfg = IdentityConfig::oidc_bearer(oidc);
     let headers = headers_from(&[
         ("x-user-id", "attacker"),
         ("x-roles", "admin"),
         ("x-request-id", "req-1"),
     ]);
     let session = resolve_session_sync(&headers, &cfg).unwrap();
-    assert!(session.user_id().is_none(), "x-user-id must be stripped");
-    assert!(
-        session.get("x-roles").is_none(),
-        "x-roles must be stripped under TrustedProxy"
-    );
-    assert!(
-        session.roles().is_empty(),
-        "asserted roles empty after strip"
-    );
-    assert_eq!(session.get("x-request-id"), Some("req-1"));
-
-    // Also exercise strip helper directly
-    let stripped = strip_identity_headers(
-        &headers,
-        &DEFAULT_IDENTITY_STRIP_HEADERS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect::<Vec<_>>(),
-    );
-    assert!(stripped.user_id().is_none());
+    assert!(session.user_id().is_none());
+    assert!(session.roles().is_empty());
 }
 
 #[test]
@@ -468,6 +476,10 @@ fn extract_bearer_empty_is_invalid() {
 
 // ── HTTP 401 on real GraphQL router (OidcBearer) ─────────────────────────────
 
+#[path = "../support/graphql.rs"]
+mod graphql_support;
+use graphql_support::Db;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("id_items")]
 struct IdItem {
@@ -477,18 +489,19 @@ struct IdItem {
 }
 
 async fn engine_with_identity(identity: IdentityConfig) -> Arc<GraphqlEngine> {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE id_items (id TEXT PRIMARY KEY, owner TEXT NOT NULL);
-         INSERT INTO id_items VALUES ('1', 'user-a-001');
-         INSERT INTO id_items VALUES ('2', 'other');",
+    engine_with(identity, WebsocketLimits::default()).await
+}
+
+async fn engine_with(identity: IdentityConfig, limits: WebsocketLimits) -> Arc<GraphqlEngine> {
+    let db = Db::sqlite().await;
+    db.seed(
+        [("1", "user-a-001"), ("2", "other")].map(|(id, owner)| IdItem {
+            id: id.into(),
+            owner: owner.into(),
+        }),
     )
-    .execute(&pool)
-    .await
-    .unwrap();
+    .await;
+    let pool = db.pool();
     let engine = GraphqlEngine::builder(pool)
         .roles(&["customer", "admin", "user"])
         .model::<IdItem>(
@@ -504,6 +517,8 @@ async fn engine_with_identity(identity: IdentityConfig) -> Arc<GraphqlEngine> {
                 .grant("user", read().all_columns()),
         )
         .identity(identity)
+        .websocket_limits(limits)
+        .change_stream(db.read_model_changes())
         .graphiql(false)
         .build()
         .unwrap();
@@ -516,11 +531,17 @@ struct RotatingJwks {
     fetches: Arc<AtomicUsize>,
 }
 
+/// Serves the current JWKS body; an empty body stands for an issuer outage.
 async fn serve_rotating_jwks(
     axum::extract::State(state): axum::extract::State<RotatingJwks>,
-) -> String {
+) -> Result<String, axum::http::StatusCode> {
     state.fetches.fetch_add(1, Ordering::SeqCst);
-    state.body.read().expect("read JWKS response").clone()
+    let body = state.body.read().expect("read JWKS response").clone();
+    if body.is_empty() {
+        Err(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+    } else {
+        Ok(body)
+    }
 }
 
 async fn authenticated_graphql_status(app: axum::Router, token: &str) -> axum::http::StatusCode {
@@ -843,9 +864,9 @@ async fn http_oidc_valid_bearer_isolation() {
 }
 
 #[tokio::test]
-async fn http_hybrid_invalid_bearer_401() {
+async fn http_invalid_bearer_401() {
     let keys = mint_keys();
-    let engine = engine_with_identity(IdentityConfig::hybrid(oidc_cfg(&keys))).await;
+    let engine = engine_with_identity(IdentityConfig::oidc_bearer(oidc_cfg(&keys))).await;
     let app = graphql_router(engine);
     let res = app
         .oneshot(
@@ -872,11 +893,10 @@ fn public_scaffold_default_is_oidc_bearer_not_dev() {
     };
 
     let unset = public_oidc_identity_from_env_vars(None, None, None, None);
-    assert_eq!(unset.mode, IdentityMode::OidcBearer);
-    assert_ne!(unset.mode, IdentityMode::DevHeaders);
-    assert!(unset.oidc.as_ref().unwrap().require_auth);
-    assert_eq!(unset.oidc.as_ref().unwrap().issuer, UNSET_OIDC_ISSUER);
-    assert_eq!(unset.oidc.as_ref().unwrap().audience, UNSET_OIDC_AUDIENCE);
+    let oidc = unset.oidc().expect("public default is OidcBearer");
+    assert!(oidc.require_auth);
+    assert_eq!(oidc.issuer, UNSET_OIDC_ISSUER);
+    assert_eq!(oidc.audience, UNSET_OIDC_AUDIENCE);
 
     // Ambient headers alone must not authenticate under public default.
     let headers = headers_from(&[("x-user-id", "attacker"), ("x-roles", "admin")]);
@@ -891,18 +911,14 @@ fn public_scaffold_default_is_oidc_bearer_not_dev() {
         None,
         None,
     );
-    assert_eq!(configured.mode, IdentityMode::OidcBearer);
-    assert!(configured.oidc.as_ref().unwrap().require_auth);
-    assert_eq!(
-        configured.oidc.as_ref().unwrap().issuer,
-        "http://localhost:8080"
-    );
+    let oidc = configured.oidc().expect("configured is OidcBearer");
+    assert!(oidc.require_auth);
+    assert_eq!(oidc.issuer, "http://localhost:8080");
 }
 
 #[test]
 fn gateway_secret_wrong_is_401() {
-    let mut cfg = IdentityConfig::trusted_proxy();
-    cfg.trusted_proxy.gateway_secret_header = Some(("x-gateway-secret".into(), "s3cret".into()));
+    let cfg = IdentityConfig::gateway("x-gateway-secret", "s3cret").unwrap();
     let headers = headers_from(&[
         ("x-gateway-secret", "wrong"),
         ("x-user-id", "u"),
@@ -912,4 +928,403 @@ fn gateway_secret_wrong_is_401() {
         resolve_session_sync(&headers, &cfg).unwrap_err(),
         AuthError::Unauthorized
     );
+}
+
+#[cfg(feature = "gateway")]
+#[tokio::test]
+async fn gateway_oidc_context_keeps_backend_authority() {
+    use distributed::gateway::{Admission, AuthProvider, BackendCredential, Credentials};
+    use distributed::graphql::identity::OidcGatewayProvider;
+    let keys = mint_keys();
+    let claims = json!({ "iss": "http://localhost:8080", "aud": "graphql-api", "sub": "user-a-001", "exp": now() + 3600, "iat": now(), "groups": ["customer", "unmapped"] });
+    let token = sign_claims(&keys, claims.clone());
+    let provider = OidcGatewayProvider::new(oidc_cfg(&keys), "oidc-v1");
+    let credentials = Credentials {
+        authorization: Some(format!("Bearer {token}")),
+        cookie: Some("forged-session".into()),
+    };
+    let context = provider.authenticate(&credentials).await.unwrap();
+    assert_eq!(Admission::Authenticated.check(&context, now()), Ok(()));
+    assert_eq!(context.identity().unwrap().subject(), "user-a-001");
+    assert_eq!(context.identity().unwrap().roles(), &["customer"]);
+    let BackendCredential::Bearer(forwarded) = context.backend_credential() else {
+        panic!("explicit bearer")
+    };
+    assert_eq!(forwarded, &token);
+
+    // A valid gateway assertion does not suppress backend credential checks.
+    let mut backend = oidc_cfg(&keys);
+    backend.audience = "another-api".into();
+    let app = graphql_router(engine_with_identity(IdentityConfig::oidc_bearer(backend)).await);
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/graphql")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {forwarded}"))
+                .header("x-user-id", "admin")
+                .body(axum::body::Body::from(r#"{"query":"{ id_items { id } }"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    for replacement in [
+        "invalid".to_string(),
+        sign_claims(&keys, {
+            let mut expired = claims;
+            expired["exp"] = json!(now() - 3600);
+            expired
+        }),
+    ] {
+        assert!(provider
+            .authenticate(&Credentials {
+                authorization: Some(format!("Bearer {replacement}")),
+                cookie: None
+            })
+            .await
+            .is_err());
+    }
+    let anon = provider
+        .authenticate(&Credentials::default())
+        .await
+        .unwrap();
+    assert!(anon.identity().is_none());
+}
+
+// ── No default mode ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn engine_without_an_identity_mode_does_not_build() {
+    let db = Db::sqlite().await;
+    db.seed::<IdItem>([]).await;
+    let error = GraphqlEngine::builder(db.pool())
+        .roles(&["user"])
+        .model::<IdItem>(ModelPermissions::new().grant("user", read().all_columns()))
+        .build()
+        .err()
+        .expect("an engine with no identity mode must not build");
+    assert!(error.to_string().contains("identity"), "{error}");
+}
+
+// ── JWKS: an issuer outage does not fail requests the cached keys can check ──
+
+async fn jwks_server(jwks: RotatingJwks) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/jwks", axum::routing::get(serve_rotating_jwks))
+                .with_state(jwks),
+        )
+        .await
+        .unwrap();
+    });
+    address
+}
+
+fn customer_token(keys: &TestKeys, expires_in: u64) -> String {
+    sign_claims(
+        keys,
+        json!({
+            "iss": "http://localhost:8080",
+            "aud": "graphql-api",
+            "sub": "user-a-001",
+            "exp": now() + expires_in,
+            "iat": now(),
+            "groups": ["customer"]
+        }),
+    )
+}
+
+#[tokio::test]
+async fn failed_jwks_refresh_serves_cached_keys_and_backs_off() {
+    let keys = mint_keys();
+    let jwks = RotatingJwks {
+        body: Arc::new(RwLock::new(keys.jwks_json.clone())),
+        fetches: Arc::new(AtomicUsize::new(0)),
+    };
+    let address = jwks_server(jwks.clone()).await;
+    let mut oidc =
+        OidcConfig::new("http://localhost:8080", "graphql-api").engine_roles(&["customer"]);
+    oidc.jwks_uri = Some(format!("http://{address}/jwks"));
+    // Every request finds the keys stale, so every request wants a refresh.
+    oidc.jwks_cache_ttl = std::time::Duration::ZERO;
+    let resolver = IdentityResolver::new(IdentityConfig::oidc_bearer(oidc.clone()));
+    let headers = bearer_headers(&customer_token(&keys, 3600));
+
+    resolver.resolve_session(&headers).await.expect("keys load");
+    assert_eq!(jwks.fetches.load(Ordering::SeqCst), 1);
+
+    jwks.body.write().unwrap().clear();
+    resolver
+        .resolve_session(&headers)
+        .await
+        .expect("a failed refresh must keep serving the keys already held");
+    assert_eq!(jwks.fetches.load(Ordering::SeqCst), 2);
+    for _ in 0..5 {
+        resolver.resolve_session(&headers).await.expect("backoff");
+    }
+    assert_eq!(
+        jwks.fetches.load(Ordering::SeqCst),
+        2,
+        "requests inside the backoff must not ask the failing issuer again"
+    );
+
+    // With no keys at all there is nothing to serve: fail, but still back off.
+    jwks.fetches.store(0, Ordering::SeqCst);
+    let cold = IdentityResolver::new(IdentityConfig::oidc_bearer(oidc));
+    for _ in 0..3 {
+        assert_eq!(
+            cold.resolve_session(&headers).await.unwrap_err(),
+            AuthError::Unauthorized
+        );
+    }
+    assert_eq!(jwks.fetches.load(Ordering::SeqCst), 1);
+}
+
+// ── WebSocket: identity, lifetime, idleness, live-query cap ──────────────────
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn ws_server(engine: Arc<GraphqlEngine>) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, graphql_router_composed(engine, None, None))
+            .await
+            .unwrap();
+    });
+    address
+}
+
+/// Open `ws://{address}/graphql/ws{query}` with `headers` on the upgrade.
+async fn ws_connect(
+    address: std::net::SocketAddr,
+    query: &str,
+    headers: &[(&'static str, &str)],
+) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = format!("ws://{address}/graphql/ws{query}")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        HeaderValue::from_static("graphql-transport-ws"),
+    );
+    for (name, value) in headers {
+        request
+            .headers_mut()
+            .insert(*name, HeaderValue::from_str(value).unwrap());
+    }
+    tokio_tungstenite::connect_async(request)
+        .await
+        .map(|(socket, _)| socket)
+}
+
+async fn ws_send(socket: &mut Ws, message: Value) {
+    use futures_util::SinkExt;
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            message.to_string().into(),
+        ))
+        .await
+        .unwrap();
+}
+
+/// The next GraphQL message, or the close code when the server hangs up.
+async fn ws_next(socket: &mut Ws) -> Result<Value, Option<u16>> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("the server must answer or close within 10s");
+        match frame {
+            Some(Ok(Message::Text(text))) => return Ok(serde_json::from_str(&text).unwrap()),
+            Some(Ok(Message::Close(frame))) => return Err(frame.map(|frame| frame.code.into())),
+            Some(Ok(_)) => continue,
+            Some(Err(_)) | None => return Err(None),
+        }
+    }
+}
+
+async fn ws_subscribe(socket: &mut Ws, id: &str) {
+    ws_send(
+        socket,
+        json!({
+            "id": id,
+            "type": "subscribe",
+            "payload": { "query": "subscription { id_items(order_by: [{id: asc}]) { id } }" }
+        }),
+    )
+    .await;
+}
+
+const SPOOF: &str = "?x-user-id=user-a-001&x-roles=admin";
+
+#[tokio::test]
+async fn ws_url_identity_params_are_ignored_under_oidc() {
+    let keys = mint_keys();
+    let mut oidc = oidc_cfg(&keys);
+    oidc.require_auth = false;
+    let address = ws_server(engine_with_identity(IdentityConfig::oidc_bearer(oidc)).await).await;
+    let mut socket = ws_connect(address, SPOOF, &[]).await.unwrap();
+    ws_send(&mut socket, json!({ "type": "connection_init" })).await;
+    assert_eq!(
+        ws_next(&mut socket).await.unwrap()["type"],
+        "connection_ack"
+    );
+    ws_subscribe(&mut socket, "spoof").await;
+    let answer = ws_next(&mut socket).await.unwrap();
+    assert!(
+        answer["payload"]["data"].is_null() && answer["payload"]["errors"].is_array(),
+        "an anonymous session has no grant, whatever the URL says: {answer}"
+    );
+
+    // With authentication required the same connection is refused outright.
+    let address =
+        ws_server(engine_with_identity(IdentityConfig::oidc_bearer(oidc_cfg(&keys))).await).await;
+    let mut socket = ws_connect(address, SPOOF, &[]).await.unwrap();
+    ws_send(&mut socket, json!({ "type": "connection_init" })).await;
+    assert!(ws_next(&mut socket).await.is_err(), "no bearer, no session");
+}
+
+#[tokio::test]
+async fn ws_under_gateway_needs_the_secret_on_the_upgrade() {
+    let identity = IdentityConfig::gateway("x-gateway-secret", "s3cret").unwrap();
+    let address = ws_server(engine_with_identity(identity).await).await;
+
+    let refused = ws_connect(address, SPOOF, &[]).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) if response.status() == 401
+        ),
+        "an upgrade without the secret is a 401, whatever the URL says"
+    );
+
+    // The payload is the client's, so it cannot raise the gateway's roles.
+    let mut socket = ws_connect(
+        address,
+        SPOOF,
+        &[
+            ("x-gateway-secret", "s3cret"),
+            ("x-user-id", "user-a-001"),
+            ("x-roles", "customer"),
+        ],
+    )
+    .await
+    .unwrap();
+    ws_send(
+        &mut socket,
+        json!({ "type": "connection_init", "payload": { "x-roles": "admin", "x-user-id": "other" } }),
+    )
+    .await;
+    assert_eq!(
+        ws_next(&mut socket).await.unwrap()["type"],
+        "connection_ack"
+    );
+    ws_subscribe(&mut socket, "mine").await;
+    let rows = ws_next(&mut socket).await.unwrap();
+    assert_eq!(
+        rows["payload"]["data"]["id_items"],
+        json!([{ "id": "1" }]),
+        "the customer row policy from the gateway's headers applies: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn ws_is_closed_when_its_token_expires() {
+    let keys = mint_keys();
+    let address =
+        ws_server(engine_with_identity(IdentityConfig::oidc_bearer(oidc_cfg(&keys))).await).await;
+    let mut socket = ws_connect(address, "", &[]).await.unwrap();
+    let token = customer_token(&keys, 2);
+    ws_send(
+        &mut socket,
+        json!({ "type": "connection_init", "payload": { "authorization": format!("Bearer {token}") } }),
+    )
+    .await;
+    assert_eq!(
+        ws_next(&mut socket).await.unwrap()["type"],
+        "connection_ack"
+    );
+    ws_subscribe(&mut socket, "live").await;
+    assert_eq!(ws_next(&mut socket).await.unwrap()["type"], "next");
+    assert_eq!(
+        ws_next(&mut socket).await,
+        Err(Some(4401)),
+        "the live query must not outlive the credential that opened it"
+    );
+}
+
+#[tokio::test]
+async fn ws_lifetime_idle_timeout_and_live_query_cap_are_enforced() {
+    let limits = WebsocketLimits {
+        max_lifetime: std::time::Duration::from_secs(2),
+        idle_timeout: std::time::Duration::from_millis(600),
+        max_live_queries: 1,
+    };
+    let engine = engine_with(IdentityConfig::dev_headers(), limits).await;
+    assert_eq!(engine.websocket_limits(), limits);
+    let address = ws_server(engine).await;
+    let init = json!({ "type": "connection_init", "payload": { "x-roles": "admin" } });
+
+    let mut socket = ws_connect(address, "", &[]).await.unwrap();
+    ws_send(&mut socket, init.clone()).await;
+    assert_eq!(
+        ws_next(&mut socket).await.unwrap()["type"],
+        "connection_ack"
+    );
+    ws_subscribe(&mut socket, "first").await;
+    assert_eq!(ws_next(&mut socket).await.unwrap()["id"], "first");
+    ws_subscribe(&mut socket, "second").await;
+    let refused = ws_next(&mut socket).await.unwrap();
+    assert_eq!(refused["id"], "second");
+    assert_eq!(
+        refused["payload"]["errors"][0]["message"], "too many live queries on this connection",
+        "{refused}"
+    );
+    assert_eq!(
+        ws_next(&mut socket).await.unwrap(),
+        json!({ "id": "second", "type": "complete" })
+    );
+    // Stopping the first frees its slot.
+    ws_send(&mut socket, json!({ "id": "first", "type": "complete" })).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    ws_subscribe(&mut socket, "third").await;
+    let mut third = ws_next(&mut socket).await.unwrap();
+    while third["id"] == "first" {
+        // Frames already queued for the stopped subscription.
+        third = ws_next(&mut socket).await.unwrap();
+    }
+    assert_eq!(third["id"], "third");
+    assert_eq!(
+        third["payload"]["data"]["id_items"],
+        json!([{ "id": "1" }, { "id": "2" }])
+    );
+    // A client that keeps reading answers pings, so only the lifetime ends it.
+    let opened = std::time::Instant::now();
+    assert_eq!(ws_next(&mut socket).await, Err(Some(1000)));
+    assert!(opened.elapsed() >= std::time::Duration::from_millis(1200));
+
+    // A client that stops reading never answers a ping and is dropped early.
+    let mut silent = ws_connect(address, "", &[]).await.unwrap();
+    ws_send(&mut silent, init).await;
+    assert_eq!(
+        ws_next(&mut silent).await.unwrap()["type"],
+        "connection_ack"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    let mut frames = 0;
+    while ws_next(&mut silent).await.is_ok() {
+        frames += 1;
+        assert!(frames < 10, "the idle connection should already be closed");
+    }
 }

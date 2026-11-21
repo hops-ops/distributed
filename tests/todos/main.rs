@@ -68,7 +68,7 @@ fn dispatcher(
     )
 }
 
-async fn load_outbox_message(repo: &InMemoryRepository, id: &str) -> OutboxMessage {
+async fn load_outbox_message(repo: &InMemoryRepository, id: &str) -> Option<OutboxMessage> {
     let store = repo.outbox_store();
     for status in [
         OutboxMessageStatus::Pending,
@@ -83,10 +83,10 @@ async fn load_outbox_message(repo: &InMemoryRepository, id: &str) -> OutboxMessa
             .into_iter()
             .find(|message| message.id() == id)
         {
-            return message;
+            return Some(message);
         }
     }
-    panic!("outbox message `{id}` should exist")
+    None
 }
 
 #[tokio::test]
@@ -154,7 +154,7 @@ async fn todos() {
     assert!(completed_todo.snapshot().user_id == "user1");
     assert!(completed_todo.snapshot().task == "Buy groceries");
     assert!(completed_todo.snapshot().completed);
-    repo.abort(&completed_todo).await.unwrap();
+    drop(completed_todo);
 
     let (mut todo2, id2) = initialized_todo("user1", "Buy Sauna");
     let (mut todo3, id3) = initialized_todo("user2", "Chew bubblegum");
@@ -263,9 +263,8 @@ async fn outbox_dispatch_publishes_and_completes_committed_row() {
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].name(), "todo.initialized");
 
-    // Check record is marked as published
-    let published = load_outbox_message(&repo, &message_id).await;
-    assert!(published.is_published());
+    // Delivered work is removed; publication evidence belongs to the bus.
+    assert!(load_outbox_message(&repo, &message_id).await.is_none());
 }
 
 #[tokio::test]
@@ -290,7 +289,7 @@ async fn abort_releases_lock_after_get() {
     rx_started.recv().unwrap();
     assert!(rx_got.recv_timeout(Duration::from_millis(200)).is_err());
 
-    repo.abort(&locked).await.unwrap();
+    drop(locked);
     assert!(rx_got.recv_timeout(Duration::from_millis(500)).is_ok());
 }
 
@@ -319,9 +318,7 @@ async fn abort_releases_lock_after_get_all() {
     rx_started.recv().unwrap();
     assert!(rx_got.recv_timeout(Duration::from_millis(200)).is_err());
 
-    for todo in &locked {
-        repo.abort(todo).await.unwrap();
-    }
+    drop(locked);
 
     assert!(rx_got.recv_timeout(Duration::from_millis(500)).is_ok());
 }
@@ -361,7 +358,7 @@ async fn queued_repo_blocks_get_until_commit() {
             .block_on(repo_other.get(&other_id_clone))
             .unwrap()
             .unwrap();
-        rt.block_on(repo_other.abort(&todo)).unwrap();
+        drop(todo);
         tx_other_done.send(()).unwrap();
     });
 
@@ -469,14 +466,14 @@ async fn commit_failure_keeps_lock_until_abort() {
         tx_started.send(()).unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let todo = rt.block_on(repo_other.get(&id_other)).unwrap().unwrap();
-        rt.block_on(repo_other.abort(&todo)).unwrap();
+        drop(todo);
         tx_got.send(()).unwrap();
     });
 
     rx_started.recv().unwrap();
     assert!(rx_got.recv_timeout(Duration::from_millis(200)).is_err());
 
-    repo.abort(&locked).await.unwrap();
+    drop(locked);
     assert!(rx_got.recv_timeout(Duration::from_millis(500)).is_ok());
 }
 
@@ -519,8 +516,7 @@ async fn outbox_dispatch_drains_one_row_at_a_time() {
 
     assert_eq!(processed, 3);
     for id in &message_ids {
-        let message = load_outbox_message(&repo, id).await;
-        assert!(message.is_published());
+        assert!(load_outbox_message(&repo, id).await.is_none());
     }
     assert_eq!(
         repo.outbox_store().pending(usize::MAX).await.unwrap().len(),

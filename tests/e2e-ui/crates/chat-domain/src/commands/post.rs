@@ -1,6 +1,6 @@
-use distributed::graphql::{Eventual, PreparedCommand};
+use distributed::command::{Eventual, PreparedCommand};
 use distributed::microsvc::{CausalCommandContext, HandlerError};
-use distributed::portable_command;
+use distributed::command;
 use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, ChatMessage, ChatMessagePostedDomainEvent, ChatMessageState};
@@ -17,7 +17,7 @@ fn authenticated_user(ctx: &CausalCommandContext<'_, ChatMessage>) -> bool {
     ctx.session().user_id().is_some_and(|id| !id.is_empty())
 }
 
-#[derive(Debug, Deserialize, distributed::GraphqlInput)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct ChatPostInput {
     pub message_id: String,
     pub body: String,
@@ -27,7 +27,7 @@ pub struct ChatPostInput {
     pub created_at: String,
 }
 
-#[derive(Debug, Serialize, distributed::GraphqlOutput)]
+#[derive(Debug, Serialize, distributed::CommandOutput)]
 pub struct ChatPostPayload {
     pub message_id: String,
     pub room_id: String,
@@ -105,7 +105,7 @@ pub fn canonical_near_unix_millis(value: &str) -> Result<String, HandlerError> {
     Ok(value.to_string())
 }
 
-portable_command! {
+command! {
     name: "chat.post",
     transition: domain_commands::Post,
     aggregate: ChatMessage,

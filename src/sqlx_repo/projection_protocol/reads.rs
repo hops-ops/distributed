@@ -1,9 +1,132 @@
 use super::*;
 
+#[cfg(all(test, feature = "sqlite"))]
+#[tokio::test]
+async fn candidate_key_snapshot_lookup_selects_surrogate_keys_in_sql() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let mut connection = pool.acquire().await.unwrap();
+    candidate_key_snapshot_sql_fixture::<sqlx::Sqlite>(&mut connection).await;
+}
+
+#[cfg(all(test, feature = "postgres"))]
+#[tokio::test]
+async fn candidate_key_snapshot_lookup_postgres() {
+    let Some(url) = crate::test_env::require_service(
+        "DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL",
+        "Postgres unique-key test (dedicated database)",
+    ) else {
+        return;
+    };
+    let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    assert!(options
+        .get_database()
+        .unwrap_or("")
+        .starts_with("distributed_unique_key_test"));
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    let mut connection = pool.acquire().await.unwrap();
+    candidate_key_snapshot_sql_fixture::<sqlx::Postgres>(&mut connection).await;
+}
+
+#[cfg(test)]
+async fn candidate_key_snapshot_sql_fixture<DB>(connection: &mut DB::Connection)
+where
+    DB: SqlxRepoBackend,
+    DB::Arguments: IntoArguments<DB>,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    use crate::table::{
+        ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, RowValue, TableColumn,
+        TableIndex, TableKind,
+    };
+    for statement in [
+        "CREATE TEMP TABLE snapshot_targets (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, candidate TEXT, UNIQUE(tenant,candidate))",
+        "INSERT INTO snapshot_targets VALUES ('opaque-a','a','same'),('opaque-b','b','same'),('null-target','a',NULL)",
+    ] { sqlx::query::<DB>(statement).execute(&mut *connection).await.unwrap(); }
+    let target = TableSchema {
+        model_name: "SnapshotTarget".into(),
+        table_name: "snapshot_targets".into(),
+        columns: vec![
+            TableColumn {
+                primary_key: true,
+                ..TableColumn::new("id", "id", ColumnType::Text)
+            },
+            TableColumn::new("tenant", "tenant", ColumnType::Text),
+            TableColumn {
+                nullable: true,
+                ..TableColumn::new("candidate", "candidate", ColumnType::Text)
+            },
+        ],
+        primary_key: PrimaryKey::new(["id"]),
+        version_column: None,
+        foreign_keys: vec![],
+        indexes: vec![TableIndex {
+            name: None,
+            columns: vec!["tenant".into(), "candidate".into()],
+            unique: true,
+        }],
+        relationships: vec![],
+        kind: TableKind::ReadModel,
+    };
+    let mut source = target.clone();
+    source.model_name = "SnapshotSource".into();
+    source.table_name = "snapshot_sources".into();
+    let relation = RelationshipDef {
+        field_name: "target".into(),
+        kind: RelationshipKind::BelongsTo,
+        target_model: target.model_name.clone(),
+        foreign_key: Some("tenant,candidate".into()),
+        references: Some("tenant,candidate".into()),
+        through: None,
+        target_foreign_key: None,
+    };
+    for (tenant, candidate, expected) in [
+        ("a", Some("same"), Some("opaque-a")),
+        ("b", Some("same"), Some("opaque-b")),
+        ("missing", Some("same"), None),
+        ("a", None, None),
+    ] {
+        let mut values = RowValues::new();
+        values.insert("id", RowValue::String("source-id".into()));
+        values.insert("tenant", RowValue::String(tenant.into()));
+        values.insert(
+            "candidate",
+            candidate
+                .map(|v| RowValue::String(v.into()))
+                .unwrap_or(RowValue::Null),
+        );
+        let keys = read_projection_relationship_keys_in_executor::<DB>(
+            &mut *connection,
+            &source,
+            &values,
+            &relation,
+            &target,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            keys,
+            expected
+                .into_iter()
+                .map(|id| RowKey::new([("id", RowValue::String(id.into()))]))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 pub(super) fn decode_change_row<DB>(
     row: &DB::Row,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     expected_epoch: &ProjectionEpoch,
 ) -> Result<ProjectionChange, ProjectionProtocolError>
 where
@@ -56,6 +179,10 @@ where
     let failure_id: Option<String> = row
         .try_get("failure_id")
         .map_err(|error| protocol_storage_error::<DB>("decode change failure ID", error))?;
+    let program_id =
+        decode_program_id(row.try_get("program_id").map_err(|error| {
+            protocol_storage_error::<DB>("decode change program identity", error)
+        })?)?;
 
     let scope = match (model_name, key_bytes, key_hash) {
         (Some(model), Some(bytes), Some(hash)) => {
@@ -133,6 +260,7 @@ where
         scope,
         revision,
         failure_id,
+        program_id,
     })
 }
 
@@ -200,6 +328,10 @@ where
     }
 
     let current = record_in_tx(tx, &staged.scope, &state.change_epoch).await?;
+    crate::projection_protocol::validate_snapshot_write(
+        current.as_ref().map(|record| &record.metadata),
+        None,
+    )?;
     let physical_exists = physical_row_exists_in_tx(tx, &staged.mutation).await?;
     match current.as_ref().map(|record| &record.metadata) {
         None if physical_exists => {
@@ -226,8 +358,9 @@ where
     let (revision, tombstone) = next_record(
         &staged.scope,
         &expectation,
-        ProjectionMutationKind::Upsert,
+        RecordTransition::Upsert,
         current.as_ref(),
+        false,
     )?;
     debug_assert!(!tombstone);
     let change = allocate_change(
@@ -240,8 +373,14 @@ where
         Some(staged.scope.clone()),
         Some(revision.clone()),
         None,
+        batch
+            .ownership
+            .iter()
+            .find(|ownership| ownership.model == staged.scope.model())
+            .and_then(|ownership| ownership.program_id),
     )?;
     let metadata = ProjectionRecordMetadata {
+        source_snapshot: None,
         revision: revision.clone(),
         tombstone,
         change: change.cursor.clone(),
@@ -272,6 +411,11 @@ where
         scope: staged.scope.clone(),
         revision: Some(revision),
         change: change.cursor.clone(),
+        program_id: batch
+            .ownership
+            .iter()
+            .find(|ownership| ownership.model == staged.scope.model())
+            .and_then(|ownership| ownership.program_id),
     };
 
     apply_read_model_write_plan_in_tx(tx, write_plan).await?;
@@ -358,6 +502,7 @@ where
          record.tombstone AS ps_record_tombstone, \
          record.change_epoch AS ps_record_change_epoch, \
          record.change_position AS ps_record_change_position, \
+         record.source_snapshot AS ps_source_snapshot, \
          checkpoint.source_bytes AS ps_cursor_source_bytes, \
          checkpoint.source_hash AS ps_cursor_source_hash, \
          checkpoint.source_partition_bytes AS ps_cursor_partition_bytes, \
@@ -671,6 +816,11 @@ where
                     )?,
                 )?,
                 tombstone,
+                source_snapshot: decode_source_snapshot(
+                    first.try_get("ps_source_snapshot").map_err(|error| {
+                        protocol_storage_error::<DB>("decode source snapshot", error)
+                    })?,
+                )?,
                 change: ProjectionChangeCursor::new(
                     request.scope.topology().clone(),
                     request.scope.projection_partition().clone(),
@@ -1074,53 +1224,12 @@ where
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
-    let foreign_key = relationship.foreign_key.as_deref().ok_or_else(|| {
-        ProjectionProtocolError::InvalidBatch(format!(
-            "projection graph relationship `{}` has no foreign key",
-            relationship.field_name
-        ))
-    })?;
-    let (target_column, value) = match relationship.kind {
-        RelationshipKind::HasMany => {
-            let (target_column, root_column) =
-                projection_has_many_columns(root_schema, relationship, target_schema)?;
-            let value = root_row.get(&root_column).cloned().ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph root `{}` is missing relationship key `{root_column}`",
-                    root_schema.model_name
-                ))
-            })?;
-            (target_column, value)
-        }
-        RelationshipKind::BelongsTo => {
-            let source_column = column_name_for(root_schema, foreign_key).ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph relationship `{}` foreign key `{foreign_key}` is not a source column",
-                    relationship.field_name
-                ))
-            })?;
-            let [target_column] = target_schema.primary_key.columns.as_slice() else {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph belongs-to target `{}` must have one primary-key column",
-                    target_schema.model_name
-                )));
-            };
-            let value = root_row.get(&source_column).cloned().ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph root `{}` is missing relationship key `{source_column}`",
-                    root_schema.model_name
-                ))
-            })?;
-            (target_column.clone(), value)
-        }
-        RelationshipKind::ManyToMany => {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection graph relationship `{}` is many-to-many; project an explicit join read model instead",
-                relationship.field_name
-            )));
-        }
-    };
-    if value == RowValue::Null {
+    let values =
+        projection_relationship_values(root_schema, root_row, relationship, target_schema)?;
+    if values
+        .iter()
+        .any(|(_, value)| *value == crate::table::RowValue::Null)
+    {
         return Ok(Vec::new());
     }
 
@@ -1134,13 +1243,18 @@ where
     builder.push(" FROM ");
     builder.push(quote_identifier(&target_schema.table_name));
     builder.push(" WHERE ");
-    builder.push(quote_identifier(&target_column));
-    builder.push(" = ");
-    DB::push_row_value_bind(
-        &mut builder,
-        value,
-        column_by_name(target_schema, &target_column)?,
-    )?;
+    for (index, (target_column, value)) in values.into_iter().enumerate() {
+        if index > 0 {
+            builder.push(" AND ");
+        }
+        builder.push(quote_identifier(&target_column));
+        builder.push(" = ");
+        DB::push_row_value_bind(
+            &mut builder,
+            value,
+            column_by_name(target_schema, &target_column)?,
+        )?;
+    }
     push_order_by_primary_key(&mut builder, target_schema);
     builder.push(" LIMIT ");
     builder.push(max_unique.saturating_add(1).to_string());
@@ -1186,321 +1300,6 @@ fn projection_graph_budget_error(
     ))
 }
 
-/// Resolve a bounded command-obligation set from one existing SQL snapshot.
-///
-/// Observations and failures are read in two set queries on the same borrowed
-/// connection. A durable failure is immutable and therefore wins even when an
-/// observation for the same causation also exists or its change entry has been
-/// compacted.
-pub(crate) async fn read_projection_obligation_evidence_batch_in_executor<DB>(
-    connection: &mut DB::Connection,
-    request: &ProjectionObligationEvidenceBatchRequest,
-) -> Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>
-where
-    DB: SqlxRepoBackend,
-    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
-    DB::Arguments: IntoArguments<DB>,
-    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
-    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
-    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
-{
-    request.validate()?;
-    if request.requests.is_empty() {
-        return Ok(ProjectionObligationEvidenceBatch::default());
-    }
-
-    let mut observations = vec![None; request.requests.len()];
-    let mut observation_query = QueryBuilder::<DB>::new(
-        "SELECT observation.topology_hash AS evidence_topology_hash, \
-         observation.partition_hash AS evidence_partition_hash, \
-         observation.causation_id AS evidence_causation_id, \
-         observation.model_name AS evidence_model_name, \
-         observation.scope_kind AS evidence_scope_kind, \
-         observation.canonical_key_bytes, observation.canonical_key_hash, \
-         observation.incarnation, observation.revision, observation.change_epoch, \
-         observation.change_position, partition.topology_bytes AS evidence_topology_bytes, \
-         partition.partition_bytes AS evidence_partition_bytes, \
-         partition.change_epoch AS evidence_partition_epoch, \
-         partition.change_head AS evidence_partition_head \
-         FROM projection_observations AS observation \
-         INNER JOIN projection_partitions AS partition \
-         ON partition.topology_hash = observation.topology_hash \
-         AND partition.partition_hash = observation.partition_hash WHERE ",
-    );
-    for (index, probe) in request.requests.iter().enumerate() {
-        if index > 0 {
-            observation_query.push(" OR ");
-        }
-        let topology_hash = probe.scope.topology().digest();
-        let partition_hash = probe.scope.projection_partition().digest();
-        let key_hash = probe.scope.key_digest();
-        observation_query.push("(observation.topology_hash = ");
-        observation_query.push_bind(topology_hash.as_slice());
-        observation_query.push(" AND observation.partition_hash = ");
-        observation_query.push_bind(partition_hash.as_slice());
-        observation_query.push(" AND observation.causation_id = ");
-        observation_query.push_bind(probe.causation_id.as_str());
-        observation_query.push(" AND observation.model_name = ");
-        observation_query.push_bind(probe.scope.model());
-        observation_query.push(" AND observation.scope_kind = ");
-        observation_query.push_bind(probe.kind.as_storage_str());
-        observation_query.push(" AND observation.canonical_key_hash = ");
-        observation_query.push_bind(key_hash.as_slice());
-        observation_query.push(")");
-    }
-    let observation_rows = observation_query
-        .build()
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| {
-            protocol_storage_error::<DB>("read projection obligation observations", error)
-        })?;
-    for row in observation_rows {
-        let topology_hash = decode_digest(
-            row.try_get("evidence_topology_hash").map_err(|error| {
-                protocol_storage_error::<DB>("decode evidence topology hash", error)
-            })?,
-            "projection evidence topology",
-        )?;
-        let partition_hash = decode_digest(
-            row.try_get("evidence_partition_hash").map_err(|error| {
-                protocol_storage_error::<DB>("decode evidence partition hash", error)
-            })?,
-            "projection evidence partition",
-        )?;
-        let causation_id: String = row
-            .try_get("evidence_causation_id")
-            .map_err(|error| protocol_storage_error::<DB>("decode evidence causation ID", error))?;
-        let model: String = row
-            .try_get("evidence_model_name")
-            .map_err(|error| protocol_storage_error::<DB>("decode evidence model", error))?;
-        let kind_value: String = row.try_get("evidence_scope_kind").map_err(|error| {
-            protocol_storage_error::<DB>("decode evidence observation kind", error)
-        })?;
-        let kind = decode_observation_kind(&kind_value)?;
-        let key_hash = decode_digest(
-            row.try_get("canonical_key_hash")
-                .map_err(|error| protocol_storage_error::<DB>("decode evidence key hash", error))?,
-            "projection evidence key",
-        )?;
-        let key_bytes: Vec<u8> = row
-            .try_get("canonical_key_bytes")
-            .map_err(|error| protocol_storage_error::<DB>("decode evidence key bytes", error))?;
-        let digest_candidates = request
-            .requests
-            .iter()
-            .enumerate()
-            .filter(|(_, probe)| {
-                probe.scope.topology().digest() == topology_hash
-                    && probe.scope.projection_partition().digest() == partition_hash
-                    && probe.causation_id == causation_id
-                    && probe.scope.model() == model
-                    && probe.kind == kind
-                    && probe.scope.key_digest() == key_hash
-            })
-            .collect::<Vec<_>>();
-        let exact = digest_candidates
-            .iter()
-            .filter(|(_, probe)| probe.scope.canonical_key_bytes() == key_bytes.as_slice())
-            .map(|(index, _)| *index)
-            .collect::<Vec<_>>();
-        let [index] = exact.as_slice() else {
-            return Err(corrupt_storage(if digest_candidates.is_empty() {
-                "projection observation escaped its bounded evidence predicate".to_string()
-            } else {
-                "projection observation canonical key does not match its digest lookup".to_string()
-            }));
-        };
-        let probe = &request.requests[*index];
-        let topology_bytes: Vec<u8> = row.try_get("evidence_topology_bytes").map_err(|error| {
-            protocol_storage_error::<DB>("decode evidence topology bytes", error)
-        })?;
-        verify_bytes(
-            &topology_bytes,
-            &probe.scope.topology().canonical_bytes(),
-            "projection evidence topology",
-        )?;
-        let partition_bytes: Vec<u8> =
-            row.try_get("evidence_partition_bytes").map_err(|error| {
-                protocol_storage_error::<DB>("decode evidence partition bytes", error)
-            })?;
-        verify_bytes(
-            &partition_bytes,
-            probe.scope.projection_partition().canonical_bytes(),
-            "projection evidence partition",
-        )?;
-        let partition_epoch = ProjectionEpoch::new(
-            row.try_get::<String, _>("evidence_partition_epoch")
-                .map_err(|error| {
-                    protocol_storage_error::<DB>("decode evidence partition epoch", error)
-                })?,
-        )?;
-        let partition_head = from_i64::<DB>(
-            row.try_get("evidence_partition_head").map_err(|error| {
-                protocol_storage_error::<DB>("decode evidence partition head", error)
-            })?,
-            "projection evidence partition head",
-        )?;
-        let observation = decode_observation_row::<DB>(
-            &row,
-            &probe.causation_id,
-            &probe.scope,
-            probe.kind,
-            &partition_epoch,
-        )?;
-        if observation.change.position() > partition_head {
-            return Err(corrupt_storage(
-                "projection observation change exceeds its partition head",
-            ));
-        }
-        if observations[*index].replace(observation).is_some() {
-            return Err(corrupt_storage(
-                "projection obligation evidence returned duplicate observations",
-            ));
-        }
-    }
-
-    let mut failures = vec![None; request.requests.len()];
-    let mut failure_query = QueryBuilder::<DB>::new(
-        "SELECT failure.topology_hash AS evidence_topology_hash, \
-         failure.partition_hash AS evidence_partition_hash, failure.failure_id, \
-         failure.source_bytes, failure.source_hash, failure.source_partition_bytes, \
-         failure.source_partition_hash, failure.source_epoch, failure.source_position, \
-         failure.input_hash, failure.message_id, failure.causation_id, failure.gap_free, \
-         failure.generation, failure.failure_code, failure.failure_bytes, \
-         failure.failure_hash, failure.change_epoch, failure.change_position, \
-         partition.topology_bytes AS evidence_topology_bytes, \
-         partition.partition_bytes AS evidence_partition_bytes, \
-         partition.change_epoch AS evidence_partition_epoch, \
-         partition.change_head AS evidence_partition_head \
-         FROM projection_failures AS failure \
-         INNER JOIN projection_partitions AS partition \
-         ON partition.topology_hash = failure.topology_hash \
-         AND partition.partition_hash = failure.partition_hash WHERE ",
-    );
-    for (index, probe) in request.requests.iter().enumerate() {
-        if index > 0 {
-            failure_query.push(" OR ");
-        }
-        let topology_hash = probe.scope.topology().digest();
-        let partition_hash = probe.scope.projection_partition().digest();
-        failure_query.push("(failure.topology_hash = ");
-        failure_query.push_bind(topology_hash.as_slice());
-        failure_query.push(" AND failure.partition_hash = ");
-        failure_query.push_bind(partition_hash.as_slice());
-        failure_query.push(" AND failure.causation_id = ");
-        failure_query.push_bind(probe.causation_id.as_str());
-        failure_query.push(")");
-    }
-    failure_query.push(
-        " ORDER BY failure.topology_hash, failure.partition_hash, \
-         failure.causation_id, failure.change_position, failure.failure_id",
-    );
-    let failure_rows = failure_query
-        .build()
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| {
-            protocol_storage_error::<DB>("read projection obligation failures", error)
-        })?;
-    for row in failure_rows {
-        let topology_hash = decode_digest(
-            row.try_get("evidence_topology_hash").map_err(|error| {
-                protocol_storage_error::<DB>("decode failure evidence topology hash", error)
-            })?,
-            "projection failure evidence topology",
-        )?;
-        let partition_hash = decode_digest(
-            row.try_get("evidence_partition_hash").map_err(|error| {
-                protocol_storage_error::<DB>("decode failure evidence partition hash", error)
-            })?,
-            "projection failure evidence partition",
-        )?;
-        let causation_id: String = row.try_get("causation_id").map_err(|error| {
-            protocol_storage_error::<DB>("decode failure evidence causation ID", error)
-        })?;
-        let matching = request
-            .requests
-            .iter()
-            .enumerate()
-            .filter(|(_, probe)| {
-                probe.scope.topology().digest() == topology_hash
-                    && probe.scope.projection_partition().digest() == partition_hash
-                    && probe.causation_id == causation_id
-            })
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        let Some(first_index) = matching.first().copied() else {
-            return Err(corrupt_storage(
-                "projection failure escaped its bounded evidence predicate",
-            ));
-        };
-        let first = &request.requests[first_index];
-        let topology_bytes: Vec<u8> = row.try_get("evidence_topology_bytes").map_err(|error| {
-            protocol_storage_error::<DB>("decode failure evidence topology bytes", error)
-        })?;
-        verify_bytes(
-            &topology_bytes,
-            &first.scope.topology().canonical_bytes(),
-            "projection failure evidence topology",
-        )?;
-        let partition_bytes: Vec<u8> =
-            row.try_get("evidence_partition_bytes").map_err(|error| {
-                protocol_storage_error::<DB>("decode failure evidence partition bytes", error)
-            })?;
-        verify_bytes(
-            &partition_bytes,
-            first.scope.projection_partition().canonical_bytes(),
-            "projection failure evidence partition",
-        )?;
-        let partition_epoch = ProjectionEpoch::new(
-            row.try_get::<String, _>("evidence_partition_epoch")
-                .map_err(|error| {
-                    protocol_storage_error::<DB>("decode failure evidence partition epoch", error)
-                })?,
-        )?;
-        let partition_head = from_i64::<DB>(
-            row.try_get("evidence_partition_head").map_err(|error| {
-                protocol_storage_error::<DB>("decode failure evidence partition head", error)
-            })?,
-            "projection failure evidence partition head",
-        )?;
-        let failure = decode_failure_row::<DB>(
-            &row,
-            first.scope.topology(),
-            first.scope.projection_partition(),
-            &partition_epoch,
-        )?
-        .failure;
-        if failure.causation_id != causation_id || failure.change.position() > partition_head {
-            return Err(corrupt_storage(
-                "projection failure evidence lies outside its exact partition/causation",
-            ));
-        }
-        // Rows are ordered by change position, so retaining the first durable
-        // failure preserves the command promise's original terminal outcome.
-        for index in matching {
-            if failures[index].is_none() {
-                failures[index] = Some(failure.clone());
-            }
-        }
-    }
-
-    let evidence = failures
-        .into_iter()
-        .zip(observations)
-        .map(|(failure, observation)| match (failure, observation) {
-            (Some(failure), _) => ProjectionObligationEvidence::TerminalFailure(failure),
-            (None, Some(observation)) => ProjectionObligationEvidence::Observed(observation),
-            (None, None) => ProjectionObligationEvidence::Pending,
-        })
-        .collect();
-    Ok(ProjectionObligationEvidenceBatch { evidence })
-}
-
 /// Discover the bounded durable evidence for one modeled command causation.
 ///
 /// The command ledger stores only opaque scope tokens. This read returns
@@ -1528,7 +1327,7 @@ where
          observation.causation_id, observation.model_name, observation.scope_kind, \
          observation.canonical_key_bytes, observation.canonical_key_hash, \
          observation.incarnation, observation.revision, observation.change_epoch, \
-         observation.change_position, partition.topology_bytes, \
+         observation.change_position, observation.program_id, partition.topology_bytes, \
          partition.partition_bytes, partition.change_epoch AS partition_change_epoch, \
          partition.change_head AS partition_change_head \
          FROM projection_observations observation \
@@ -1602,7 +1401,7 @@ where
         let partition_bytes: Vec<u8> = row.try_get("partition_bytes").map_err(|error| {
             protocol_storage_error::<DB>("decode modeled evidence partition bytes", error)
         })?;
-        let partition = ProjectionPartition::new(partition_bytes)?;
+        let partition = PartitionId::new(partition_bytes)?;
         let partition_hash: Vec<u8> = row.try_get("partition_hash").map_err(|error| {
             protocol_storage_error::<DB>("decode modeled evidence partition hash", error)
         })?;
@@ -1845,7 +1644,7 @@ where
         "SELECT record.topology_hash AS live_topology_hash, record.partition_hash AS \
          live_partition_hash, record.model_name AS live_model_name, \
          record.canonical_key_bytes, record.canonical_key_hash, record.incarnation, \
-         record.revision, record.tombstone, record.change_epoch, record.change_position, \
+         record.revision, record.tombstone, record.change_epoch, record.change_position, record.source_snapshot, \
          partition.topology_bytes AS live_topology_bytes, \
          partition.partition_bytes AS live_partition_bytes, \
          partition.change_epoch AS live_partition_epoch, \
@@ -1931,7 +1730,7 @@ where
         let partition_bytes: Vec<u8> = row.try_get("live_partition_bytes").map_err(|error| {
             protocol_storage_error::<DB>("decode live-record partition bytes", error)
         })?;
-        let partition = ProjectionPartition::new(partition_bytes)?;
+        let partition = PartitionId::new(partition_bytes)?;
         let stored_partition_hash: Vec<u8> =
             row.try_get("live_partition_hash").map_err(|error| {
                 protocol_storage_error::<DB>("decode live-record partition hash", error)
@@ -1998,16 +1797,20 @@ where
                 "projection live-record change exceeds its partition head",
             ));
         }
-        let metadata = ProjectionRecordMetadata {
-            revision: RecordRevision::new(scope.clone(), incarnation, revision)?,
-            tombstone: false,
-            change: ProjectionChangeCursor::new(
-                scope.topology().clone(),
-                scope.projection_partition().clone(),
-                change_epoch,
-                change_position,
-            )?,
-        };
+        let metadata =
+            ProjectionRecordMetadata {
+                source_snapshot: decode_source_snapshot(row.try_get("source_snapshot").map_err(
+                    |error| protocol_storage_error::<DB>("decode source snapshot", error),
+                )?)?,
+                revision: RecordRevision::new(scope.clone(), incarnation, revision)?,
+                tombstone: false,
+                change: ProjectionChangeCursor::new(
+                    scope.topology().clone(),
+                    scope.projection_partition().clone(),
+                    change_epoch,
+                    change_position,
+                )?,
+            };
         if records[*index].replace(metadata).is_some() {
             return Err(corrupt_storage(format!(
                 "projection live-record identity for model `{}` is ambiguous across partitions",
@@ -2082,7 +1885,7 @@ where
 pub(super) async fn read_projection_changes_in_executor_after_state<DB, AfterState>(
     connection: &mut DB::Connection,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     after: Option<&ProjectionChangeCursor>,
     limit: usize,
     after_state: AfterState,
@@ -2158,7 +1961,7 @@ where
     let mut builder = QueryBuilder::<DB>::new(
         "SELECT change_epoch, change_position, change_kind, causation_id, model_name, \
          scope_kind, canonical_key_bytes, canonical_key_hash, incarnation, revision, \
-         failure_id FROM projection_changes WHERE topology_hash = ",
+         failure_id, program_id FROM projection_changes WHERE topology_hash = ",
     );
     builder.push_bind(topology_hash.as_slice());
     builder.push(" AND partition_hash = ");
@@ -2209,7 +2012,7 @@ where
 pub(crate) async fn read_projection_changes_in_executor<DB>(
     connection: &mut DB::Connection,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     after: Option<&ProjectionChangeCursor>,
     limit: usize,
 ) -> Result<ProjectionChangeRead, ProjectionProtocolError>
@@ -2244,7 +2047,7 @@ where
 pub(super) async fn read_projection_changes_in_snapshot<DB, AfterState>(
     pool: &Pool<DB>,
     topology: ProjectorTopologyId,
-    partition: ProjectionPartition,
+    partition: PartitionId,
     after: Option<ProjectionChangeCursor>,
     limit: usize,
     after_state: AfterState,

@@ -6,8 +6,8 @@ use crate::client_compiler::manifest::{
 };
 use crate::client_compiler::ClientCompileError;
 
-use super::confirmations::{validate_confirmations, validate_projector_inventory};
-use super::effects::{validate_defaults, validate_effect, validate_trusted_preset_inventory};
+use super::effects::{validate_defaults, validate_trusted_preset_inventory};
+use super::projectors::validate_projector_inventory;
 use super::protocol::validate_protocol_operations;
 use super::shape::{
     canonical_command_operation, occupied_surface_types, projected_output_typename, validate_shape,
@@ -32,22 +32,19 @@ pub(crate) fn validate_command_manifest(
         ));
     }
     validate_protocol_operations(protocol_operations, !commands.is_empty())?;
-    let projectors = validate_projector_inventory(projectors, models)?;
+    validate_projector_inventory(projectors, models)?;
     let occupied_types = occupied_surface_types(models, roots, scalar_codecs);
 
     let mut command_names = BTreeSet::new();
     let mut mutation_fields = BTreeSet::new();
     let mut type_definitions = BTreeMap::new();
-    let mut report = CommandManifestValidation::default();
     for command in commands {
         validate_command(
             command,
             models,
             scalar_codecs,
-            &projectors,
             &occupied_types,
             &mut type_definitions,
-            &mut report,
         )?;
         if !command_names.insert(command.name.as_str()) {
             return Err(invalid(
@@ -65,17 +62,15 @@ pub(crate) fn validate_command_manifest(
             ));
         }
     }
-    Ok(report)
+    Ok(CommandManifestValidation::default())
 }
 
 fn validate_command(
     command: &ManifestCommand,
     models: &BTreeMap<String, ManifestModel>,
     scalar_codecs: &BTreeMap<String, String>,
-    projectors: &BTreeMap<&str, &ManifestProjector>,
     occupied_types: &BTreeSet<String>,
     type_definitions: &mut BTreeMap<String, (CommandTypeKind, ManifestTypeDef)>,
-    report: &mut CommandManifestValidation,
 ) -> Result<(), ClientCompileError> {
     if command.version != 1 {
         return Err(command_error(
@@ -145,36 +140,6 @@ fn validate_command(
     }
     if let Some(defaults) = &extensions.input_defaults {
         validate_defaults(command, defaults.version, &defaults.defaults)?;
-    }
-    if extensions.version == 1 {
-        if let Some(effects) = &extensions.effects {
-            if effects.version != 1 {
-                return Err(command_error(
-                    command,
-                    "client.manifest.command_effects",
-                    "effects.version must be 1",
-                ));
-            }
-            if effects.operations.is_empty() {
-                report
-                    .commands_requiring_revalidation
-                    .insert(command.name.clone());
-            }
-            for effect in &effects.operations {
-                validate_effect(command, effect, models, report)?;
-            }
-        } else {
-            report
-                .commands_requiring_revalidation
-                .insert(command.name.clone());
-        }
-        validate_confirmations(command, models, projectors, report)?;
-    } else if extensions.effects.is_some() || extensions.confirmations.is_some() {
-        return Err(command_error(
-            command,
-            "client.manifest.legacy_command_authority",
-            "manifest v2 cannot carry legacy effects or confirmations",
-        ));
     }
     validate_trusted_preset_inventory(command)
 }

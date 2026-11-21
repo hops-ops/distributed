@@ -8,16 +8,41 @@ use distributed::microsvc::{self, Routes, Service};
 use distributed::{AggregateBuilder, InMemoryRepository, Queueable};
 use serde_json::json;
 
+use crate::commands::command_id;
 use crate::handlers;
 use crate::models::counter::Counter;
 
 fn counter_service() -> Arc<Service> {
-    Arc::new(Service::new().with_http_command_routes().routes(distributed::routes!(
-        Routes::new().with_repo(InMemoryRepository::new().queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-        command handlers::counter_increment,
-        command handlers::whoami,
-    )))
+    Arc::new(
+        Service::new()
+            .named("counters")
+            .with_http_command_routes()
+            .routes(
+                Routes::new()
+                    .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
+                    .typed_command(handlers::counter_create::command())
+                    .handle(handlers::counter_create::handle)
+                    .typed_command(handlers::counter_increment::command())
+                    .handle(handlers::counter_increment::handle)
+                    .typed_command(handlers::whoami::command())
+                    .handle(handlers::whoami::handle),
+            ),
+    )
+}
+
+/// `POST /{command}` with the `{ commandId, input }` body, as the signed-in
+/// user a trusted proxy would inject.
+fn post(
+    client: &reqwest::Client,
+    base: &str,
+    command: &str,
+    input: serde_json::Value,
+) -> reqwest::RequestBuilder {
+    client
+        .post(format!("{base}/{command}"))
+        .header("x-user-id", "user-1")
+        .header("x-roles", handlers::USER_ROLE)
+        .json(&json!({ "commandId": command_id(), "input": input }))
 }
 
 /// Bind to port 0 and return the actual address.
@@ -58,16 +83,15 @@ async fn create_counter() {
     let base = start_server(service).await;
     let client = reqwest::Client::new();
 
-    let resp = client
-        .post(format!("{base}/counter.initialize"))
-        .json(&json!({ "id": "c1" }))
+    let resp = post(&client, &base, "counter.initialize", json!({ "id": "c1" }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({ "id": "c1" }));
+    assert_eq!(body["payload"], json!({ "id": "c1" }));
+    assert_eq!(body["receipt"]["state"], "succeeded");
 }
 
 #[cfg(feature = "metrics")]
@@ -77,12 +101,15 @@ async fn metrics_endpoint_exposes_dispatch_counters() {
     let base = start_server(service).await;
     let client = reqwest::Client::new();
 
-    let resp = client
-        .post(format!("{base}/counter.initialize"))
-        .json(&json!({ "id": "metrics-c1" }))
-        .send()
-        .await
-        .unwrap();
+    let resp = post(
+        &client,
+        &base,
+        "counter.initialize",
+        json!({ "id": "metrics-c1" }),
+    )
+    .send()
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 200);
 
     let resp = client.get(format!("{base}/metrics")).send().await.unwrap();
@@ -132,37 +159,41 @@ async fn create_and_increment_counter() {
     let client = reqwest::Client::new();
 
     // Create
-    let resp = client
-        .post(format!("{base}/counter.initialize"))
-        .json(&json!({ "id": "c1" }))
+    let resp = post(&client, &base, "counter.initialize", json!({ "id": "c1" }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
 
     // Increment
-    let resp = client
-        .post(format!("{base}/counter.increment"))
-        .json(&json!({ "id": "c1", "amount": 5 }))
-        .send()
-        .await
-        .unwrap();
+    let resp = post(
+        &client,
+        &base,
+        "counter.increment",
+        json!({ "id": "c1", "amount": 5 }),
+    )
+    .send()
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({ "id": "c1", "value": 5 }));
+    assert_eq!(body["payload"], json!({ "id": "c1", "value": 5 }));
 
     // Increment again
-    let resp = client
-        .post(format!("{base}/counter.increment"))
-        .json(&json!({ "id": "c1", "amount": 3 }))
-        .send()
-        .await
-        .unwrap();
+    let resp = post(
+        &client,
+        &base,
+        "counter.increment",
+        json!({ "id": "c1", "amount": 3 }),
+    )
+    .send()
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({ "id": "c1", "value": 8 }));
+    assert_eq!(body["payload"], json!({ "id": "c1", "value": 8 }));
 }
 
 #[tokio::test]
@@ -171,28 +202,64 @@ async fn increment_nonexistent_returns_404() {
     let base = start_server(service).await;
     let client = reqwest::Client::new();
 
-    let resp = client
-        .post(format!("{base}/counter.increment"))
-        .json(&json!({ "id": "nope", "amount": 1 }))
-        .send()
-        .await
-        .unwrap();
+    let resp = post(
+        &client,
+        &base,
+        "counter.increment",
+        json!({ "id": "nope", "amount": 1 }),
+    )
+    .send()
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 404);
 }
 
 #[tokio::test]
-async fn unknown_command_returns_404() {
+async fn unknown_command_is_a_bad_request() {
+    let service = counter_service();
+    let base = start_server(service).await;
+    let client = reqwest::Client::new();
+
+    let resp = post(&client, &base, "nonexistent", json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert_eq!(body["error"], "unknown typed command");
+}
+
+/// Every command is ledgered: a body that is not the `{ commandId, input }`
+/// envelope names no command id, so it is refused rather than run.
+#[tokio::test]
+async fn a_body_without_a_command_id_is_a_bad_request() {
     let service = counter_service();
     let base = start_server(service).await;
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{base}/nonexistent"))
-        .json(&json!({}))
+        .post(format!("{base}/counter.initialize"))
+        .header("x-user-id", "user-1")
+        .header("x-roles", handlers::USER_ROLE)
+        .json(&json!({ "id": "c1" }))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404);
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert!(
+        body["error"].as_str().unwrap().contains("commandId"),
+        "{body}"
+    );
+
+    // Nothing ran: the counter can still be created.
+    let resp = post(&client, &base, "counter.initialize", json!({ "id": "c1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]
@@ -204,14 +271,14 @@ async fn headers_flow_to_session() {
     let resp = client
         .post(format!("{base}/session.identify"))
         .header("x-user-id", "user-42")
-        .json(&json!({}))
+        .json(&json!({ "commandId": command_id(), "input": {} }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({ "user_id": "user-42" }));
+    assert_eq!(body["payload"], json!({ "user_id": "user-42" }));
 }
 
 /// Documents the HTTP trust boundary: request headers are copied into the
@@ -230,14 +297,14 @@ async fn client_supplied_identity_header_is_trusted_verbatim() {
         // No proxy in front: the client sets its own identity. The framework
         // trusts it as-is. In production a trusted proxy must overwrite this.
         .header("x-user-id", "client-claimed-id")
-        .json(&json!({}))
+        .json(&json!({ "commandId": command_id(), "input": {} }))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body, json!({ "user_id": "client-claimed-id" }));
+    assert_eq!(body["payload"], json!({ "user_id": "client-claimed-id" }));
 }
 
 #[tokio::test]
@@ -248,7 +315,7 @@ async fn missing_session_returns_401() {
 
     let resp = client
         .post(format!("{base}/session.identify"))
-        .json(&json!({}))
+        .json(&json!({ "commandId": command_id(), "input": {} }))
         .send()
         .await
         .unwrap();

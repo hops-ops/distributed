@@ -33,3 +33,9 @@ export type {
 	ReplicaCommandTransportResult,
 	ReplicaResultObservationRegistration
 } from './command-runtime/index.js';
+
+export type {
+	ReplicaLazyCommandCatalog,
+	ReplicaLazyCommandModule,
+	ReplicaLazyCommandRuntime
+} from './command-runtime/lazy.js';

@@ -51,15 +51,6 @@ pub(crate) fn validate_projectors(
                 ),
             ));
         }
-        if projector.facts.is_empty() && projector.causal_confirmation {
-            return Err(ClientCompileError::manifest(
-                "client.manifest.projector_inventory",
-                format!(
-                    "direct-only projection owner `{}` cannot provide asynchronous confirmation",
-                    projector.name
-                ),
-            ));
-        }
         let mut expected_dependencies = BTreeSet::new();
         for model in &projector.models {
             let Some(model_contract) = models.get(model) else {

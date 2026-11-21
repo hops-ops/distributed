@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::table::ColumnType;
+use std::cmp::Ordering;
+
+use crate::table::{ColumnType, TableSchema};
 
 /// Right-hand side of a comparison: literal, claim header, or nested operand.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -802,5 +804,192 @@ mod tests {
             col("owner_id").eq(claim("x-user-id")).is_client_portable(),
             "typed claim operands are portable once the selected surface binds their values"
         );
+    }
+}
+
+/// SQL three-valued truth: a comparison with NULL is neither true nor false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Truth {
+    True,
+    False,
+    Unknown,
+}
+
+impl Truth {
+    fn not(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+
+    fn of(decided: Option<bool>) -> Self {
+        match decided {
+            Some(true) => Self::True,
+            Some(false) => Self::False,
+            None => Self::Unknown,
+        }
+    }
+}
+
+impl FilterExpr {
+    /// Decide this filter for one row without asking the database.
+    ///
+    /// The answer is the one the compiled `WHERE` gives on SQLite and on
+    /// Postgres, or [`Truth::Unknown`]. `Unknown` covers SQL's own unknown (a
+    /// comparison with NULL) and everything that cannot be decided here: a
+    /// column missing from `row`, a claim `claims` does not supply, a
+    /// relationship, patterns, JSON operators, and two different spellings of
+    /// a timestamp. Callers that authorize on the
+    /// result must require `True`.
+    ///
+    /// `row` holds JSON values keyed by field name or column name. `claims`
+    /// resolves a claim to a literal of the compared column's type.
+    pub fn evaluate(
+        &self,
+        schema: &TableSchema,
+        row: &serde_json::Map<String, JsonValue>,
+        claims: &dyn Fn(&ClaimRef, &ColumnType) -> Option<LitValue>,
+    ) -> Truth {
+        let cell = |column: &str| {
+            let column = schema
+                .columns
+                .iter()
+                .find(|candidate| candidate.column_name == column)?;
+            let value = row
+                .get(&column.field_name)
+                .or_else(|| row.get(&column.column_name))?;
+            Some((&column.column_type, value))
+        };
+        let literal = |operand: &Operand, column_type: &ColumnType| match operand {
+            Operand::Lit(literal) => Some(literal.clone()),
+            Operand::Claim(claim) => claims(claim, column_type),
+        };
+        match self {
+            FilterExpr::And(items) => {
+                let mut result = Truth::True;
+                for item in items {
+                    match item.evaluate(schema, row, claims) {
+                        Truth::False => return Truth::False,
+                        Truth::Unknown => result = Truth::Unknown,
+                        Truth::True => {}
+                    }
+                }
+                result
+            }
+            FilterExpr::Or(items) => {
+                let mut result = Truth::False;
+                for item in items {
+                    match item.evaluate(schema, row, claims) {
+                        Truth::True => return Truth::True,
+                        Truth::Unknown => result = Truth::Unknown,
+                        Truth::False => {}
+                    }
+                }
+                result
+            }
+            FilterExpr::Not(item) => item.evaluate(schema, row, claims).not(),
+            FilterExpr::Cmp { column, op, rhs } => {
+                let Some((column_type, left)) = cell(column) else {
+                    return Truth::Unknown;
+                };
+                let Some(right) = literal(rhs, column_type) else {
+                    return Truth::Unknown;
+                };
+                Truth::of(match op {
+                    CmpOp::Eq => values_equal(column_type, left, &right),
+                    CmpOp::Neq => values_equal(column_type, left, &right).map(|equal| !equal),
+                    CmpOp::Gt => values_order(column_type, left, &right).map(Ordering::is_gt),
+                    CmpOp::Gte => values_order(column_type, left, &right).map(Ordering::is_ge),
+                    CmpOp::Lt => values_order(column_type, left, &right).map(Ordering::is_lt),
+                    CmpOp::Lte => values_order(column_type, left, &right).map(Ordering::is_le),
+                    CmpOp::Like
+                    | CmpOp::Ilike
+                    | CmpOp::Contains
+                    | CmpOp::ContainedIn
+                    | CmpOp::HasKey => None,
+                })
+            }
+            FilterExpr::In {
+                column,
+                values,
+                negated,
+            } => {
+                // The compiler answers an empty list before reading the column.
+                if values.is_empty() {
+                    return Truth::of(Some(*negated));
+                }
+                let Some((column_type, left)) = cell(column) else {
+                    return Truth::Unknown;
+                };
+                let mut unknown = false;
+                for value in values {
+                    let equal = literal(value, column_type)
+                        .and_then(|right| values_equal(column_type, left, &right));
+                    match equal {
+                        Some(true) => return Truth::of(Some(!*negated)),
+                        Some(false) => {}
+                        None => unknown = true,
+                    }
+                }
+                if unknown {
+                    Truth::Unknown
+                } else {
+                    Truth::of(Some(*negated))
+                }
+            }
+            FilterExpr::IsNull { column, is_null } => match cell(column) {
+                Some((_, value)) => Truth::of(Some(value.is_null() == *is_null)),
+                None => Truth::Unknown,
+            },
+            FilterExpr::Rel { .. } => Truth::Unknown,
+        }
+    }
+}
+
+/// `left = right` as SQL decides it, or `None` when SQL says NULL or the
+/// pair has no portable equality.
+///
+/// Text is compared byte for byte; the compiler pins the same on SQLite and
+/// Postgres text equality is bytewise under every deterministic collation.
+fn values_equal(column_type: &ColumnType, left: &JsonValue, right: &LitValue) -> Option<bool> {
+    if left.is_null() || matches!(right, LitValue::Null) {
+        return None;
+    }
+    Some(match (column_type, right) {
+        (ColumnType::Text, LitValue::String(right)) => left.as_str()? == right,
+        // Postgres compares instants, so two spellings may still be equal.
+        (ColumnType::Timestamp, LitValue::String(right)) => {
+            if left.as_str()? == right {
+                true
+            } else {
+                return None;
+            }
+        }
+        (ColumnType::Boolean, LitValue::Bool(right)) => left.as_bool()? == *right,
+        (ColumnType::Integer, LitValue::I64(right)) => left.as_i64()? == *right,
+        (ColumnType::UnsignedInteger, LitValue::I64(right)) if *right >= 0 => {
+            left.as_u64()? == *right as u64
+        }
+        (ColumnType::Float, LitValue::F64(right)) => left.as_f64()? == *right,
+        (ColumnType::Float, LitValue::I64(right)) => left.as_f64()? == *right as f64,
+        _ => return None,
+    })
+}
+
+/// `left` against `right` as SQL orders them, or `None` when SQL says NULL or
+/// the pair has no portable order. Text orders by its UTF-8 bytes, the
+/// collation the compiler pins.
+fn values_order(column_type: &ColumnType, left: &JsonValue, right: &LitValue) -> Option<Ordering> {
+    match (column_type, right) {
+        (ColumnType::Text, LitValue::String(right)) => Some(left.as_str()?.cmp(right.as_str())),
+        (ColumnType::Integer, LitValue::I64(right)) => left.as_i64()?.partial_cmp(right),
+        (ColumnType::UnsignedInteger, LitValue::I64(right)) if *right >= 0 => {
+            left.as_u64()?.partial_cmp(&(*right as u64))
+        }
+        (ColumnType::Float, LitValue::F64(right)) => left.as_f64()?.partial_cmp(right),
+        (ColumnType::Float, LitValue::I64(right)) => left.as_f64()?.partial_cmp(&(*right as f64)),
+        _ => None,
     }
 }

@@ -1,0 +1,21 @@
+{
+  "name": "gateway-auth-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare": "node prepare.mjs",
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "@auth/core": "0.41.3",
+    "@auth/sveltekit": "1.11.3",
+    "@playwright/test": "1.61.1",
+    "@sveltejs/adapter-node": "5.2.12",
+    "@sveltejs/kit": "2.70.1",
+    "@sveltejs/vite-plugin-svelte": "5.1.1",
+    "oidc-provider": "9.12.2",
+    "svelte": "5.56.7",
+    "typescript": "5.8.3",
+    "vite": "6.4.3"
+  }
+}

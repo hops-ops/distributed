@@ -9,6 +9,7 @@ import type { FetchLike } from '../request.js';
 import type { GqlAuth, GraphqlVariables } from '../types.js';
 import { authFromPageData, type PageGraphqlData } from './auth.js';
 import {
+	DISTRIBUTED_BOUNDARY_BINDING_VERSION,
 	resolveDistributedBoundaryVariables,
 	type DistributedBoundaryOperation,
 	type DistributedBoundaryVariableContext
@@ -88,12 +89,11 @@ export function createDistributedSvelteKitServer<
 				accessToken,
 				engineRole
 			};
-			if (event.isDataRequest === true) {
-				return {
-					...pageData,
-					gqlError: null
-				};
-			}
+			// Data requests may rotate the cookie again after an auth refresh, or
+			// observe a credential renewed by a concurrent request. A credential
+			// without fresh server authority cannot preserve the browser's scope.
+			// Resolve the same bounded route selections for document and data loads;
+			// warm same-scope hydration merges without replacing newer command state.
 			const auth =
 				options.getAuth?.(pageData, event) ?? authFromPageData(pageData);
 			const routeId = routeIdentity(event);
@@ -293,7 +293,7 @@ function validateBoundaryOperations<TSession>(
 			if (
 				operation === null ||
 				typeof operation !== 'object' ||
-				operation.binding?.version !== 1 ||
+				operation.binding?.version !== DISTRIBUTED_BOUNDARY_BINDING_VERSION ||
 				operation.binding.artifactId !== operation.artifact?.id
 			) {
 				throw new TypeError(`invalid Distributed boundary operation at index ${index}`);

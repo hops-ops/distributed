@@ -2,7 +2,8 @@ use quote::quote;
 use syn::{Attribute, DeriveInput, Expr, ExprArray, ExprLit, Field, Lit, LitStr, Meta, Token};
 
 use super::types::{
-    option_inner_type, option_string_tokens, validate_relationship_target_type, vec_inner_type,
+    box_inner_type, option_inner_type, option_string_tokens, validate_relationship_target_type,
+    vec_inner_type,
 };
 
 #[derive(Default)]
@@ -98,6 +99,7 @@ impl FieldAttrs {
     pub(super) fn from_field(field: &Field) -> syn::Result<Self> {
         let mut attrs = Self::default();
         let mut pending_foreign_key: Option<String> = None;
+        let mut pending_references: Option<String> = None;
         let mut pending_through: Option<String> = None;
         let mut pending_target_foreign_key: Option<String> = None;
         for attr in &field.attrs {
@@ -152,10 +154,7 @@ impl FieldAttrs {
                     attrs.jsonb = true;
                 } else if meta.path.is_ident("text") {
                     attrs.text = true;
-                } else if meta.path.is_ident("skip_query")
-                    || meta.path.is_ident("skip")
-                    || meta.path.is_ident("private")
-                {
+                } else if meta.path.is_ident("skip_query") {
                     attrs.skip_query = true;
                 } else if meta.path.is_ident("nullable") {
                     attrs.nullable = true;
@@ -164,6 +163,11 @@ impl FieldAttrs {
                     if meta.input.peek(Token![=]) {
                         attrs.default = Some(meta.value()?.parse::<LitStr>()?.value());
                     }
+                } else if meta.path.is_ident("references") {
+                    if pending_references.is_some() {
+                        return Err(meta.error("relationship references declared more than once"));
+                    }
+                    pending_references = Some(meta.value()?.parse::<LitStr>()?.value());
                 } else if meta.path.is_ident("foreign_key") {
                     let value = meta.value()?.parse::<LitStr>()?.value();
                     if attrs.relationship.is_some() {
@@ -184,6 +188,7 @@ impl FieldAttrs {
                 } else if meta.path.is_ident("has_many") {
                     let target = meta.value()?.parse::<LitStr>()?.value();
                     attrs.relationship = Some(RelationshipAttr {
+                        references: None,
                         kind: RelationshipKindAttr::HasMany,
                         target_model: target,
                         foreign_key: None,
@@ -193,6 +198,7 @@ impl FieldAttrs {
                 } else if meta.path.is_ident("belongs_to") {
                     let target = meta.value()?.parse::<LitStr>()?.value();
                     attrs.relationship = Some(RelationshipAttr {
+                        references: None,
                         kind: RelationshipKindAttr::BelongsTo,
                         target_model: target,
                         foreign_key: None,
@@ -202,6 +208,7 @@ impl FieldAttrs {
                 } else if meta.path.is_ident("many_to_many") {
                     let target = meta.value()?.parse::<LitStr>()?.value();
                     attrs.relationship = Some(RelationshipAttr {
+                        references: None,
                         kind: RelationshipKindAttr::ManyToMany,
                         target_model: target,
                         foreign_key: None,
@@ -292,6 +299,19 @@ impl FieldAttrs {
             }
         }
 
+        if let Some(references) = pending_references {
+            let relationship = attrs.relationship.as_mut().ok_or_else(|| {
+                syn::Error::new_spanned(field, "`references` requires a direct relationship")
+            })?;
+            if matches!(relationship.kind, RelationshipKindAttr::ManyToMany) {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "`references` requires a direct relationship",
+                ));
+            }
+            relationship.references = Some(references);
+        }
+
         if attrs.jsonb && attrs.text {
             return Err(syn::Error::new_spanned(
                 field,
@@ -320,6 +340,7 @@ impl FieldAttrs {
         &self,
         field_name: &str,
     ) -> syn::Result<Option<proc_macro2::TokenStream>> {
+        let framework = crate::shared::framework();
         let Some(relationship) = &self.relationship else {
             return Ok(None);
         };
@@ -330,17 +351,19 @@ impl FieldAttrs {
             ));
         };
         let target_model = &relationship.target_model;
+        let references = option_string_tokens(relationship.references.as_deref());
         let through = option_string_tokens(relationship.through.as_deref());
         let target_foreign_key = option_string_tokens(relationship.target_foreign_key.as_deref());
         let kind = match relationship.kind {
-            RelationshipKindAttr::HasMany => quote! { distributed::RelationshipKind::HasMany },
-            RelationshipKindAttr::BelongsTo => quote! { distributed::RelationshipKind::BelongsTo },
+            RelationshipKindAttr::HasMany => quote! { #framework::RelationshipKind::HasMany },
+            RelationshipKindAttr::BelongsTo => quote! { #framework::RelationshipKind::BelongsTo },
             RelationshipKindAttr::ManyToMany => {
-                quote! { distributed::RelationshipKind::ManyToMany }
+                quote! { #framework::RelationshipKind::ManyToMany }
             }
         };
         Ok(Some(quote! {
-            distributed::RelationshipDef {
+            #framework::RelationshipDef {
+                references: #references,
                 field_name: #field_name.to_string(),
                 kind: #kind,
                 target_model: #target_model.to_string(),
@@ -360,6 +383,7 @@ impl FieldAttrs {
         proc_macro2::TokenStream,
         proc_macro2::TokenStream,
     )> {
+        let framework = crate::shared::framework();
         let relationship = self.relationship.as_ref().ok_or_else(|| {
             syn::Error::new_spanned(field, "field is not a read-model relationship")
         })?;
@@ -386,8 +410,8 @@ impl FieldAttrs {
                     #field_name => {
                         self.#ident = rows
                             .into_iter()
-                            .map(<#inner as distributed::RelationalReadModel>::from_row)
-                            .collect::<Result<Vec<_>, distributed::TableStoreError>>()?;
+                            .map(<#inner as #framework::RelationalReadModel>::from_row)
+                            .collect::<Result<Vec<_>, #framework::TableStoreError>>()?;
                         Ok(())
                     }
                 };
@@ -395,11 +419,11 @@ impl FieldAttrs {
                     #field_name => self
                         .#ident
                         .iter()
-                        .map(distributed::RelationalReadModel::to_row)
-                        .collect::<Result<Vec<_>, distributed::TableStoreError>>()
+                        .map(#framework::RelationalReadModel::to_row)
+                        .collect::<Result<Vec<_>, #framework::TableStoreError>>()
                 };
                 let include_schema = quote! {
-                    #field_name => Ok(<#inner as distributed::RelationalReadModel>::schema())
+                    #field_name => Ok(<#inner as #framework::RelationalReadModel>::schema())
                 };
                 Ok((hydrate, include_rows, include_schema))
             }
@@ -412,21 +436,33 @@ impl FieldAttrs {
                         ),
                     )
                 })?;
+                let boxed = box_inner_type(inner);
+                let inner = boxed.unwrap_or(inner);
                 validate_relationship_target_type(
                     field,
                     inner,
                     &relationship.target_model,
                     field_name,
                 )?;
+                let hydrated_value = if boxed.is_some() {
+                    quote! { ::std::boxed::Box::new(<#inner as #framework::RelationalReadModel>::from_row(row)?) }
+                } else {
+                    quote! { <#inner as #framework::RelationalReadModel>::from_row(row)? }
+                };
+                let included_value = if boxed.is_some() {
+                    quote! { value.as_ref() }
+                } else {
+                    quote! { value }
+                };
                 let hydrate = quote! {
                     #field_name => {
                         let mut rows = rows.into_iter();
                         self.#ident = match rows.next() {
-                            Some(row) => Some(<#inner as distributed::RelationalReadModel>::from_row(row)?),
+                            Some(row) => Some(#hydrated_value),
                             None => None,
                         };
                         if rows.next().is_some() {
-                            return Err(distributed::TableStoreError::Metadata(format!(
+                            return Err(#framework::TableStoreError::Metadata(format!(
                                 "belongs_to relationship `{}` returned more than one row",
                                 #field_name
                             )));
@@ -438,13 +474,13 @@ impl FieldAttrs {
                     #field_name => {
                         let mut rows = Vec::new();
                         if let Some(value) = &self.#ident {
-                            rows.push(distributed::RelationalReadModel::to_row(value)?);
+                            rows.push(#framework::RelationalReadModel::to_row(#included_value)?);
                         }
                         Ok(rows)
                     }
                 };
                 let include_schema = quote! {
-                    #field_name => Ok(<#inner as distributed::RelationalReadModel>::schema())
+                    #field_name => Ok(<#inner as #framework::RelationalReadModel>::schema())
                 };
                 Ok((hydrate, include_rows, include_schema))
             }
@@ -472,6 +508,7 @@ pub(super) struct ForeignKeyParts {
 
 #[derive(Clone)]
 pub(super) struct RelationshipAttr {
+    pub(super) references: Option<String>,
     pub(super) kind: RelationshipKindAttr,
     pub(super) target_model: String,
     pub(super) foreign_key: Option<String>,
@@ -578,10 +615,11 @@ fn parse_foreign_key(value: &str) -> syn::Result<ForeignKeyParts> {
 }
 
 pub(super) fn foreign_key_tokens(foreign_key: &ForeignKeyParts) -> proc_macro2::TokenStream {
+    let framework = crate::shared::framework();
     let table = &foreign_key.table;
     let column = &foreign_key.column;
     quote! {
-        distributed::ForeignKey {
+        #framework::ForeignKey {
             table: #table.to_string(),
             column: #column.to_string(),
         }

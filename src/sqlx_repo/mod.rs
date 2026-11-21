@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use crate::repository::RepositoryError;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 use crate::table::TableStoreError;
@@ -11,20 +9,7 @@ pub(crate) mod read_model;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod repo;
 
-pub(crate) fn serialize_event_metadata(
-    metadata: &HashMap<String, String>,
-) -> Result<String, RepositoryError> {
-    serde_json::to_string(metadata)
-        .map_err(|err| RepositoryError::Model(format!("serialize event metadata: {err}")))
-}
-
-pub(crate) fn deserialize_event_metadata(
-    metadata_json: &str,
-) -> Result<HashMap<String, String>, RepositoryError> {
-    serde_json::from_str(metadata_json)
-        .map_err(|err| RepositoryError::Model(format!("deserialize event metadata: {err}")))
-}
-
+#[cfg(feature = "postgres")]
 pub(crate) fn repository_i64_from_u64(
     backend: &str,
     value: u64,
@@ -43,16 +28,6 @@ pub(crate) fn repository_u64_from_i64(
 ) -> Result<u64, RepositoryError> {
     u64::try_from(value)
         .map_err(|_| RepositoryError::Model(format!("{backend} {field} value {value} is negative")))
-}
-
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
-pub(crate) fn repository_u16_from_i64(
-    backend: &str,
-    value: i64,
-    field: &str,
-) -> Result<u16, RepositoryError> {
-    u16::try_from(value)
-        .map_err(|_| RepositoryError::Model(format!("{backend} {field} value {value} is invalid")))
 }
 
 #[cfg(any(feature = "postgres", feature = "sqlite"))]

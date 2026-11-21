@@ -14,13 +14,12 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 
 use distributed::graphql::GraphqlEngine;
 use distributed::microsvc::{serve, Service};
-use distributed::{
-    ColumnType, ReadModelCatalog, PrimaryKey, TableColumn, TableKind, TableSchema,
-};
+use distributed::{ColumnType, PrimaryKey, ReadModelCatalog, TableColumn, TableKind, TableSchema};
 use sqlx::sqlite::SqlitePoolOptions;
 
 fn orders_schema() -> TableSchema {
@@ -79,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let manifest = ReadModelCatalog::new("graphiql-demo").table_schema(orders_schema());
 
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)?
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .grant_all("user")
         .graphiql(true)

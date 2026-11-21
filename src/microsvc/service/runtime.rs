@@ -8,38 +8,36 @@ use serde_json::Value;
 
 #[cfg(feature = "graphql")]
 use super::causal::{
-    internal_ledger_error, CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult,
-    GraphqlServiceBindError,
+    internal_ledger_error, CausalCommandPublicStatus, GraphqlServiceBindError,
+    ModeledProjectionMetadata,
+};
+use super::causal::{
+    CausalDispatchError, CausalDispatchResult, ExternalCausalAttempt, ExternalCausalReservation,
+    SealModeledProjection,
 };
 use super::helpers::{
     is_json_content_type, message_to_json_input, message_to_session, names_by_kind,
+    transport_command_error, transport_command_id, transport_session,
 };
 #[cfg(feature = "otel")]
 use super::helpers::{microsvc_dispatch_span, microsvc_handler_span};
-use super::request::{CommandRequest, CommandResponse};
 use super::routes::{CausalCommandPolicy, DynBusPublisher, ErasedRoutes, HandlerSpec, Routes};
-use crate::application::{CommandMount, CommandMountRegistrar, CommandSpec};
+use crate::application::{
+    Application, ApplicationError, ApplicationResult, CommandDefinition, CommandMount,
+    CommandMountRegistrar, CommandSpec, Module, SurfaceSpec,
+};
 use crate::bus::{
     Message, MessageKind, OrderedDelivery, RunOptions, SubscriptionPlan, TransportError,
 };
+use crate::command::{TypedCommandContract, TypedServiceCommandBinding};
+use crate::command_dispatch::VerifiedPrincipal;
 #[cfg(feature = "graphql")]
-use crate::command_ledger::{CommandId, CommandLookup, PrincipalPartitionId};
-use crate::graphql::command_contract::{TypedCommandContract, TypedServiceCommandBinding};
-#[cfg(feature = "graphql")]
-use crate::graphql::identity::VerifiedPrincipal;
+use crate::command_ledger::{CommandId, CommandLedgerKey, PrincipalPartitionId};
+use crate::command_ledger::{CommandLookup, ExternalDispatchBinding};
 use crate::microsvc::error::HandlerError;
+use crate::microsvc::lifecycle::LifecycleGate;
 use crate::microsvc::projector::{ProjectionRepairHandle, ProjectorRegistration};
-use crate::microsvc::session::Session;
-
-fn ensure_lifecycle_mutations_open() -> Result<(), HandlerError> {
-    if crate::microsvc::lifecycle_mutations_open() {
-        Ok(())
-    } else {
-        Err(HandlerError::Rejected(
-            "application generation is reloading".into(),
-        ))
-    }
-}
+use crate::microsvc::session::{Session, TRANSPORT_ROLE, TRANSPORT_USER_ID};
 
 /// The bus run behavior captured by [`Service::with_bus`](crate::microsvc::Service::with_bus).
 pub(crate) type ServiceRunner = Box<
@@ -52,20 +50,32 @@ pub(crate) type ServiceRunner = Box<
         + Sync,
 >;
 
+/// Name of the delivery lane that plain [`Service::routes`] registers into.
+pub const DEFAULT_DELIVERY_LANE: &str = "default";
+
 /// A microservice deployment that routes messages to one or more route bundles.
 pub struct Service {
     name: Option<String>,
     pub(super) routes: Vec<Box<dyn ErasedRoutes>>,
     index: HashMap<MessageKind, HashMap<String, Vec<usize>>>,
+    /// Delivery lane of each route bundle (parallel to `routes`); 0 is default.
+    route_lanes: Vec<usize>,
+    /// Lane names by index; index 0 is the unnamed default lane.
+    lane_names: Vec<&'static str>,
     handler_specs: Vec<HandlerSpec>,
     causal_command_policy: CausalCommandPolicy,
     runner: Option<ServiceRunner>,
     registered_command_mounts: Vec<CommandMount>,
+    /// Admits or refuses every write this service is asked to run.
+    lifecycle: LifecycleGate,
     /// When true, HTTP mounts `POST /{command}`. Off by default — GraphQL,
     /// health, and in-process `dispatch` stay available without this.
     http_command_routes: bool,
     #[cfg(feature = "graphql")]
     graphql: Option<std::sync::Arc<crate::graphql::GraphqlEngine>>,
+    /// Started by `with_bus`; stops when the service is dropped.
+    #[cfg(background_workers)]
+    ledger_compaction: Option<crate::microsvc::workers::LedgerCompactionWorker>,
 }
 
 impl Service {
@@ -75,13 +85,44 @@ impl Service {
             name: None,
             routes: Vec::new(),
             index: HashMap::new(),
+            route_lanes: Vec::new(),
+            lane_names: vec![DEFAULT_DELIVERY_LANE],
             handler_specs: Vec::new(),
             causal_command_policy: CausalCommandPolicy::default(),
             runner: None,
             registered_command_mounts: Vec::new(),
+            lifecycle: LifecycleGate::always_open(),
             http_command_routes: false,
             #[cfg(feature = "graphql")]
             graphql: None,
+            #[cfg(background_workers)]
+            ledger_compaction: None,
+        }
+    }
+
+    /// Refuse writes while `lifecycle` is closed: commands, typed commands
+    /// and bus deliveries fail with [`HandlerError::ApplicationReloading`].
+    ///
+    /// A service is always open unless given a gate. A process that
+    /// `distributed dev` may run passes [`LifecycleGate::from_env`], resolved
+    /// once and cloned into every service it builds. Set it before building a
+    /// GraphQL engine from this service: the engine takes the service's gate.
+    pub fn with_lifecycle(mut self, lifecycle: LifecycleGate) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    /// The gate set by [`Self::with_lifecycle`].
+    #[cfg(feature = "graphql")]
+    pub(crate) fn lifecycle(&self) -> &LifecycleGate {
+        &self.lifecycle
+    }
+
+    fn ensure_mutations_open(&self) -> Result<(), HandlerError> {
+        if self.lifecycle.mutations_open() {
+            Ok(())
+        } else {
+            Err(HandlerError::ApplicationReloading)
         }
     }
 
@@ -196,6 +237,11 @@ impl Service {
         match (typed_commands.is_empty(), engine.typed_command_binding()) {
             (true, None) => {}
             (_, Some(engine_binding)) => {
+                if !engine.lifecycle().is(&self.lifecycle) {
+                    return Err(GraphqlServiceBindError(
+                        "GraphQL engine and service have different lifecycle gates; call Service::with_lifecycle before building the engine from the service".into(),
+                    ));
+                }
                 let service_binding = self
                     .typed_command_binding()
                     .map_err(GraphqlServiceBindError)?;
@@ -322,92 +368,11 @@ impl Service {
     /// Register one explicit command mount against the already-installed
     /// typed route inventory. The route's canonical command spec is the only
     /// authority; a stale or lookalike mount is rejected before dispatch.
-    pub fn register_command_mount(
-        &mut self,
-        mount: CommandMount,
-    ) -> Result<(), HandlerError> {
+    pub fn register_command_mount(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         self.register_command_mount_inner(mount)
     }
 
-    /// Invoke a registered mount through the service adapter. The request
-    /// still enters the normal transport boundary, so typed causal routes
-    /// retain their authentication/receipt/projection-proof requirements.
-    pub async fn dispatch_mount(
-        &self,
-        mount: &CommandMount,
-        request: &CommandRequest,
-    ) -> CommandResponse {
-        match self.dispatch_mount_result(mount, request).await {
-            Ok(response) => response,
-            Err(error) => CommandResponse {
-                status: error.status_code(),
-                body: serde_json::json!({ "error": error.to_string() }),
-            },
-        }
-    }
-
-    pub(crate) async fn dispatch_mount_result(
-        &self,
-        mount: &CommandMount,
-        request: &CommandRequest,
-    ) -> Result<CommandResponse, HandlerError> {
-        ensure_lifecycle_mutations_open()?;
-        if request.command != mount.spec().id {
-            return Err(HandlerError::Rejected(format!(
-                "command request `{}` does not match mount `{}`",
-                request.command,
-                mount.spec().id
-            )));
-        }
-        if !self
-            .registered_command_mounts
-            .iter()
-            .any(|registered| registered.spec().id == mount.spec().id
-                && registered.spec().fingerprint == mount.spec().fingerprint)
-        {
-            return Err(HandlerError::Rejected(
-                "command mount was not registered against this service".into(),
-            ));
-        }
-        if mount.typed_route_name().is_some() {
-            return Err(HandlerError::Unauthorized(
-                "typed command mounts require the authenticated causal dispatch adapter".into(),
-            ));
-        }
-        mount.invoke(request).await
-    }
-
-    #[cfg(feature = "graphql")]
-    #[allow(dead_code)]
-    pub(crate) async fn dispatch_registered_mount_causally(
-        &self,
-        mount: &CommandMount,
-        request: &CommandRequest,
-        command_id: &str,
-        session: Session,
-        principal: VerifiedPrincipal,
-    ) -> Result<CausalDispatchResult, CausalDispatchError> {
-        self.ensure_registered_mount(mount)
-            .map_err(CausalDispatchError::Handler)?;
-        if mount.typed_route_name() != Some(request.command.as_str()) {
-            return Err(CausalDispatchError::BadRequest(
-                "typed command mount route identity does not match the request".into(),
-            ));
-        }
-        self.dispatch_causal_with_receipt(
-            &request.command,
-            command_id,
-            request.input.clone(),
-            session,
-            principal,
-        )
-        .await
-    }
-
-    fn register_command_mount_inner(
-        &mut self,
-        mount: CommandMount,
-    ) -> Result<(), HandlerError> {
+    fn register_command_mount_inner(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         let Some(indices) = self
             .index
             .get(&MessageKind::Command)
@@ -449,9 +414,11 @@ impl Service {
                 mount.spec().id
             )));
         }
-        if self.registered_command_mounts.iter().any(|registered| {
-            registered.spec().id == mount.spec().id
-        }) {
+        if self
+            .registered_command_mounts
+            .iter()
+            .any(|registered| registered.spec().id == mount.spec().id)
+        {
             return Err(HandlerError::Rejected(format!(
                 "command mount `{}` is registered more than once",
                 mount.spec().id
@@ -459,21 +426,6 @@ impl Service {
         }
         self.registered_command_mounts.push(mount);
         Ok(())
-    }
-
-    #[cfg(feature = "graphql")]
-    #[allow(dead_code)]
-    fn ensure_registered_mount(&self, mount: &CommandMount) -> Result<(), HandlerError> {
-        if self.registered_command_mounts.iter().any(|registered| {
-            registered.spec().id == mount.spec().id
-                && registered.spec().fingerprint == mount.spec().fingerprint
-        }) {
-            Ok(())
-        } else {
-            Err(HandlerError::Rejected(
-                "command mount was not registered against this service".into(),
-            ))
-        }
     }
 
     /// Install the bus run behavior (used by `with_bus`).
@@ -493,6 +445,60 @@ impl Service {
     {
         self.add_routes(routes);
         self
+    }
+
+    /// Add a route bundle to a named delivery lane.
+    ///
+    /// Lanes of one consumer run concurrently when the transport settles each
+    /// delivery independently; each lane keeps delivery order and a delivery is
+    /// settled only after all of its lanes finished. Use a lane only for routes
+    /// that neither depend on nor are depended on by routes of other lanes
+    /// within the same delivery (see `docs/consumer-delivery-lanes.md`).
+    ///
+    /// # Panics
+    /// When `lane` is empty, names the default lane, or exceeds the lane limit.
+    pub fn lane<D>(mut self, lane: &'static str, routes: Routes<D>) -> Self
+    where
+        D: Send + Sync + 'static,
+    {
+        assert!(
+            !lane.trim().is_empty() && lane != DEFAULT_DELIVERY_LANE,
+            "a named delivery lane must be non-empty and not `{DEFAULT_DELIVERY_LANE}`"
+        );
+        let index = match self.lane_names.iter().position(|name| *name == lane) {
+            Some(index) => index,
+            None => {
+                assert!(
+                    self.lane_names.len() < crate::bus::LaneSet::MAX_LANES,
+                    "too many delivery lanes"
+                );
+                self.lane_names.push(lane);
+                self.lane_names.len() - 1
+            }
+        };
+        self.add_routes(routes);
+        *self
+            .route_lanes
+            .last_mut()
+            .expect("add_routes registers one bundle") = index;
+        self
+    }
+
+    /// Delivery lane names by index; index 0 is the default lane.
+    pub fn delivery_lane_names(&self) -> &[&'static str] {
+        &self.lane_names
+    }
+
+    /// Lanes with a route for `(kind, name)`.
+    pub fn lanes_for_message(&self, kind: MessageKind, name: &str) -> crate::bus::LaneSet {
+        self.index
+            .get(&kind)
+            .and_then(|by_name| by_name.get(name))
+            .into_iter()
+            .flatten()
+            .fold(crate::bus::LaneSet::EMPTY, |lanes, route| {
+                lanes.with(self.route_lanes[*route])
+            })
     }
 
     pub(super) fn add_routes<D>(&mut self, routes: Routes<D>)
@@ -570,6 +576,7 @@ impl Service {
         self.handler_specs.extend_from_slice(routes.handler_specs());
         self.registered_command_mounts.extend(command_mounts);
         self.routes.push(Box::new(routes));
+        self.route_lanes.push(0);
     }
 
     pub(crate) fn typed_command_contracts(&self) -> Vec<TypedCommandContract> {
@@ -590,6 +597,60 @@ impl Service {
             .collect::<crate::application::ApplicationResult<Vec<_>>>()?;
         specs.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(specs)
+    }
+
+    /// Compile this Service's typed command inventory and an authorized Surface
+    /// into one logical application.
+    ///
+    /// Command namespaces (the segment before the first `.`) become modules.
+    /// Every Service command must exist in the Surface so its authorization and
+    /// projection contract can be bound, and application validation rejects any
+    /// Surface command that is not owned by the Service.
+    pub fn application(
+        &self,
+        name: impl Into<String>,
+        surface: SurfaceSpec,
+    ) -> ApplicationResult<Application> {
+        let mut modules = BTreeMap::<String, Vec<CommandDefinition>>::new();
+        for command in self.command_specs()? {
+            let namespace = command
+                .id
+                .split_once('.')
+                .map(|(namespace, _)| namespace)
+                .filter(|namespace| !namespace.is_empty())
+                .ok_or_else(|| {
+                    ApplicationError::InvalidSpec(format!(
+                        "typed command `{}` has no module namespace; expected `<module>.<action>`",
+                        command.id
+                    ))
+                })?
+                .to_string();
+            let exposed = surface
+                .commands
+                .iter()
+                .find(|exposed| exposed.id == command.id)
+                .ok_or_else(|| ApplicationError::Missing {
+                    kind: "surface command",
+                    identity: command.id.clone(),
+                })?;
+            let command = command.with_surface_binding(exposed)?;
+            modules
+                .entry(namespace)
+                .or_default()
+                .push(CommandDefinition::contract(command));
+        }
+
+        let modules = modules
+            .into_iter()
+            .map(|(namespace, commands)| {
+                Module::new(namespace).command_definitions(commands).build()
+            })
+            .collect::<ApplicationResult<Vec<_>>>()?;
+
+        Application::new(name)
+            .modules(modules)
+            .surface(surface)
+            .build()
     }
 
     /// Attach Eventual projection metadata to a cell wait-path result using this
@@ -617,6 +678,78 @@ impl Service {
         )
     }
 
+    /// Reserve the gateway ledger row for a command that will be committed by
+    /// an aggregate cell. The route performs canonical input and grant checks
+    /// before any remote request is made.
+    pub(crate) async fn reserve_external_causal(
+        &self,
+        command: &str,
+        command_id: &str,
+        input: Value,
+        session: Session,
+        principal: VerifiedPrincipal,
+        binding: ExternalDispatchBinding,
+    ) -> Result<ExternalCausalReservation, CausalDispatchError> {
+        self.ensure_mutations_open()
+            .map_err(CausalDispatchError::Handler)?;
+        let service_id = self.name().ok_or_else(|| {
+            CausalDispatchError::Internal(
+                "external typed causal dispatch requires Service::named identity".into(),
+            )
+        })?;
+        self.typed_command_routes(command)?
+            .reserve_external(
+                command,
+                service_id,
+                command_id,
+                input,
+                session,
+                principal,
+                self.causal_command_policy,
+                binding,
+            )
+            .await
+    }
+
+    /// Persist a sealed terminal receipt for a command committed by a cell.
+    /// This path only updates the gateway ledger and never invokes a local
+    /// handler or appends a local event batch.
+    pub(crate) async fn complete_external_causal(
+        &self,
+        command: &str,
+        attempt: ExternalCausalAttempt,
+        result: &CausalDispatchResult,
+    ) -> Result<(), CausalDispatchError> {
+        self.typed_command_routes(command)?
+            .complete_external(command, attempt, result)
+            .await
+    }
+
+    /// The one route bundle that registers `command`.
+    fn typed_command_routes(
+        &self,
+        command: &str,
+    ) -> Result<&dyn ErasedRoutes, CausalDispatchError> {
+        self.index
+            .get(&MessageKind::Command)
+            .and_then(|commands| commands.get(command))
+            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
+            .map(|route_index| self.routes[route_index].as_ref())
+            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))
+    }
+
+    /// Mark a remote attempt retryable after a transport/protocol failure.
+    /// The durable fence remains the authority for later replay or reclaim.
+    pub(crate) async fn abandon_external_causal(
+        &self,
+        command: &str,
+        attempt: ExternalCausalAttempt,
+    ) -> Result<(), CausalDispatchError> {
+        self.typed_command_routes(command)?
+            .abandon_external(command, attempt)
+            .await
+    }
+
     pub(crate) fn typed_command_binding(&self) -> Result<TypedServiceCommandBinding, String> {
         let service_id = self
             .name()
@@ -626,7 +759,6 @@ impl Service {
 
     /// Execute one authenticated typed causal route through its durable ledger
     /// and framework-owned staged commit boundary.
-    #[cfg(feature = "graphql")]
     pub async fn dispatch_causal(
         &self,
         command: &str,
@@ -642,7 +774,6 @@ impl Service {
 
     /// Execute one authenticated typed causal route and retain the exact
     /// durable replay material needed to construct a causal receipt.
-    #[cfg(feature = "graphql")]
     pub async fn dispatch_causal_with_receipt(
         &self,
         command: &str,
@@ -669,18 +800,40 @@ impl Service {
         principal: VerifiedPrincipal,
         protocol: crate::graphql::protocol::ProtocolResponseAccumulator,
     ) -> Result<CausalDispatchResult, CausalDispatchError> {
+        let seal = move |causation_id: crate::command_ledger::CausationId,
+                         retention: Duration,
+                         occurrences: &[crate::DomainEventOccurrence],
+                         selectors: &[crate::ProjectionEventSelector]|
+              -> Result<ModeledProjectionMetadata, String> {
+            let metadata = protocol
+                .projection_metadata_for_actual(causation_id, retention, occurrences, selectors)
+                .map_err(|error| error.to_string())?;
+            let expires_at = metadata
+                .expires_at()
+                .map_err(|error| format!("modeled projection metadata lifetime failed: {error}"))?;
+            let canonical_bytes = metadata
+                .canonical_bytes()
+                .map_err(|error| format!("modeled projection metadata encoding failed: {error}"))?;
+            Ok(ModeledProjectionMetadata {
+                canonical_bytes,
+                expires_at,
+                pending: !metadata.obligations.is_empty(),
+            })
+        };
         self.dispatch_causal_with_receipt_inner(
             command,
             command_id,
             input,
             session,
             principal,
-            Some(protocol),
+            Some(&seal),
         )
         .await
     }
 
-    #[cfg(feature = "graphql")]
+    /// Every typed dispatch that is not a transport delivery: it records the
+    /// dispatch metric and runs inside the dispatch span. A transport
+    /// delivery is measured by [`dispatch_lane_message`](Self::dispatch_lane_message).
     async fn dispatch_causal_with_receipt_inner(
         &self,
         command: &str,
@@ -688,21 +841,75 @@ impl Service {
         input: Value,
         session: Session,
         principal: VerifiedPrincipal,
-        protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
+        seal_modeled_projection: Option<&SealModeledProjection<'_>>,
     ) -> Result<CausalDispatchResult, CausalDispatchError> {
-        ensure_lifecycle_mutations_open().map_err(CausalDispatchError::Handler)?;
+        #[cfg(feature = "metrics")]
+        let started = Instant::now();
+        #[cfg(feature = "otel")]
+        let span_message = Message {
+            id: Some(command_id.to_string()),
+            name: command.to_string(),
+            kind: MessageKind::Command,
+            payload: Vec::new(),
+            content_type: "application/json".to_string(),
+            metadata: session
+                .variables()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        };
+        let work = self.execute_causal(
+            command,
+            command_id,
+            input,
+            session,
+            principal,
+            seal_modeled_projection,
+        );
+        #[cfg(feature = "otel")]
+        let result = self.in_dispatch_span(&span_message, work).await;
+        #[cfg(not(feature = "otel"))]
+        let result = work.await;
+        #[cfg(feature = "metrics")]
+        {
+            // An unregistered name is a caller's string: one fixed label.
+            let known = self.typed_command_routes(command).is_ok();
+            crate::metrics::record_microsvc_dispatch(
+                self.name(),
+                MessageKind::Command,
+                if known {
+                    command
+                } else {
+                    crate::telemetry::metric_values::UNKNOWN_MESSAGE
+                },
+                match &result {
+                    Ok(_) => crate::telemetry::dispatch_status::SUCCESS,
+                    Err(_) if !known => crate::telemetry::dispatch_status::UNKNOWN_COMMAND,
+                    Err(error) => crate::telemetry::causal_error_status(error),
+                },
+                started.elapsed(),
+            );
+        }
+        result
+    }
+
+    async fn execute_causal(
+        &self,
+        command: &str,
+        command_id: &str,
+        input: Value,
+        session: Session,
+        principal: VerifiedPrincipal,
+        seal_modeled_projection: Option<&SealModeledProjection<'_>>,
+    ) -> Result<CausalDispatchResult, CausalDispatchError> {
+        self.ensure_mutations_open()
+            .map_err(CausalDispatchError::Handler)?;
         let service_id = self.name().ok_or_else(|| {
             CausalDispatchError::Internal(
                 "typed causal dispatch requires Service::named identity".into(),
             )
         })?;
-        let route_index = self
-            .index
-            .get(&MessageKind::Command)
-            .and_then(|commands| commands.get(command))
-            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
-            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
-        self.routes[route_index]
+        self.typed_command_routes(command)?
             .dispatch_causal(
                 command,
                 service_id,
@@ -711,15 +918,16 @@ impl Service {
                 session,
                 principal,
                 self.causal_command_policy,
-                protocol,
+                seal_modeled_projection,
             )
             .await
     }
 
     /// Resolve one client-created command ID without accepting a command name.
     ///
-    /// The verified principal determines the private ledger partition and each
-    /// finite causal handler rechecks its current role grant and contract
+    /// The verified principal determines the private ledger partition. The
+    /// row is looked up once per repository and answered only through the
+    /// route that wrote it, under its current role grant and contract
     /// fingerprint. Malformed, absent, wrong-principal, revoked, drifted, and
     /// ambiguous IDs all collapse to `unknown`.
     #[cfg(feature = "graphql")]
@@ -765,16 +973,32 @@ impl Service {
             PrincipalPartitionId::new(principal.partition_for_service(service_id))
                 .map_err(internal_ledger_error)?;
 
+        let key = CommandLedgerKey::new(service_id, principal_partition, parsed_command_id.clone())
+            .map_err(internal_ledger_error)?;
+
+        // One ledger lookup per repository. The row names the command that
+        // wrote it; only a bundle committing to that repository can own it.
+        let mut repositories = Vec::new();
         let mut found = None;
         for routes in &self.routes {
+            let Some(repository) = routes.causal_storage_identity() else {
+                continue;
+            };
+            if repositories.contains(&repository) {
+                continue;
+            }
+            repositories.push(repository);
+            let route = |command: &str, fingerprint: &[u8; 32]| {
+                let mut owners = self
+                    .routes
+                    .iter()
+                    .filter(|routes| routes.causal_storage_identity() == Some(repository))
+                    .filter_map(|routes| routes.causal_status_route(command, fingerprint, session));
+                let owner = owners.next()?;
+                owners.next().is_none().then_some(owner)
+            };
             let status = routes
-                .causal_command_status(
-                    service_id,
-                    &parsed_command_id,
-                    &principal_partition,
-                    session,
-                    protocol.clone(),
-                )
+                .causal_command_status(&key, &parsed_command_id, &route, protocol.clone())
                 .await?;
             if status.is_unknown() {
                 continue;
@@ -794,7 +1018,6 @@ impl Service {
     /// Private lookup seam used by replay recovery and the authorized status
     /// envelope. The route rechecks the current role grant before deriving the
     /// bearer-scoped ledger key.
-    #[cfg(feature = "graphql")]
     #[allow(dead_code)]
     pub(crate) async fn lookup_causal_command(
         &self,
@@ -808,97 +1031,16 @@ impl Service {
                 "typed causal lookup requires Service::named identity".into(),
             )
         })?;
-        let route_index = self
-            .index
-            .get(&MessageKind::Command)
-            .and_then(|commands| commands.get(command))
-            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
-            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
-        self.routes[route_index]
+        self.typed_command_routes(command)?
             .lookup_causal(command, service_id, command_id, session, principal)
             .await
     }
 
-    /// Dispatch a command by name.
-    ///
-    /// Builds a `Context` from the input and session, looks up the handler,
-    /// runs the guard (if any), then calls the handler.
-    pub async fn dispatch(
-        &self,
-        command: &str,
-        input: Value,
-        session: Session,
-    ) -> Result<Value, HandlerError> {
-        #[cfg(feature = "metrics")]
-        let started = Instant::now();
-        let result = self.dispatch_command_inner(command, input, session).await;
-        #[cfg(feature = "metrics")]
-        {
-            let error = result.as_ref().err();
-            crate::metrics::record_microsvc_dispatch(
-                self.name(),
-                MessageKind::Command,
-                crate::telemetry::handler_message_label(command, error),
-                error
-                    .map(crate::telemetry::handler_error_status)
-                    .unwrap_or(crate::telemetry::dispatch_status::SUCCESS),
-                started.elapsed(),
-            );
-        }
-        result
-    }
-
-    async fn dispatch_command_inner(
-        &self,
-        command: &str,
-        input: Value,
-        session: Session,
-    ) -> Result<Value, HandlerError> {
-        ensure_lifecycle_mutations_open()?;
-        if !self.handles_message(MessageKind::Command, command) {
-            return Err(HandlerError::UnknownCommand(command.to_string()));
-        }
-
-        let payload = serde_json::to_vec(&input).map_err(|e| {
-            HandlerError::DecodeFailed(format!("invalid JSON input for command '{command}': {e}"))
-        })?;
-        let metadata = session
-            .variables()
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let message = Message {
-            id: None,
-            name: command.to_string(),
-            kind: MessageKind::Command,
-            payload,
-            content_type: "application/json".to_string(),
-            metadata,
-        };
-
-        self.invoke_with_dispatch_span(&message, input, session, None)
-            .await
-    }
-
-    /// Dispatch a `CommandRequest`, returning a `CommandResponse`.
-    pub async fn dispatch_request(&self, request: &CommandRequest) -> CommandResponse {
-        let session = Session::from_map(request.session_variables.clone());
-        match self
-            .dispatch(&request.command, request.input.clone(), session)
-            .await
-        {
-            Ok(value) => CommandResponse {
-                status: 200,
-                body: value,
-            },
-            Err(e) => CommandResponse {
-                status: e.status_code(),
-                body: serde_json::json!({ "error": e.to_string() }),
-            },
-        }
-    }
-
     /// Dispatch a transport message.
+    ///
+    /// An event runs its event handlers. A command runs its typed command
+    /// through the ledger as the transport identity: the command must
+    /// declare [`TRANSPORT_ROLE`] and the message must carry an id.
     pub async fn dispatch_message(&self, message: &Message) -> Result<Value, HandlerError> {
         self.dispatch_ordered_message(message, None).await
     }
@@ -908,9 +1050,20 @@ impl Service {
         message: &Message,
         ordered: Option<&OrderedDelivery>,
     ) -> Result<Value, HandlerError> {
+        self.dispatch_lane_message(message, ordered, None).await
+    }
+
+    /// Dispatch only the routes of one delivery lane (`None` runs every lane
+    /// in registration order).
+    pub(crate) async fn dispatch_lane_message(
+        &self,
+        message: &Message,
+        ordered: Option<&OrderedDelivery>,
+        lane: Option<usize>,
+    ) -> Result<Value, HandlerError> {
         #[cfg(feature = "metrics")]
         let started = Instant::now();
-        let result = self.dispatch_message_inner(message, ordered).await;
+        let result = self.dispatch_message_inner(message, ordered, lane).await;
         #[cfg(feature = "metrics")]
         {
             let error = result.as_ref().err();
@@ -931,21 +1084,17 @@ impl Service {
         &self,
         message: &Message,
         ordered: Option<&OrderedDelivery>,
+        lane: Option<usize>,
     ) -> Result<Value, HandlerError> {
-        if !crate::microsvc::lifecycle_mutations_open() {
-            return Err(HandlerError::Rejected(
-                "application generation is reloading".into(),
-            ));
-        }
+        self.ensure_mutations_open()?;
         if !self.handles_message(message.kind, &message.name) {
             return Err(HandlerError::UnknownCommand(message.name.clone()));
         }
 
-        let route_indices = self
-            .index
-            .get(&message.kind)
-            .and_then(|by_name| by_name.get(message.name()))
-            .ok_or_else(|| HandlerError::UnknownCommand(message.name.clone()))?;
+        let route_indices = self.lane_route_indices(message, lane)?;
+        if route_indices.is_empty() {
+            return Err(HandlerError::UnknownCommand(message.name.clone()));
+        }
         let projector_only = route_indices
             .iter()
             .all(|index| self.routes[*index].is_causal_projector(message));
@@ -966,18 +1115,90 @@ impl Service {
                 Err(err) => return Err(err),
             }
         };
+        // A command name has one route, and it runs through the ledger.
+        if message.kind == MessageKind::Command {
+            let declared = self.routes[route_indices[0]]
+                .typed_command_contract(&message.name)
+                .is_some_and(|contract| contract.roles.iter().any(|role| role == TRANSPORT_ROLE));
+            return self
+                .in_dispatch_span(
+                    message,
+                    self.dispatch_transport_command(message, input, declared),
+                )
+                .await
+                .map_err(transport_command_error);
+        }
         let session = message_to_session(message);
-        self.invoke_with_dispatch_span(message, input, session, ordered)
-            .await
+        self.in_dispatch_span(
+            message,
+            self.invoke(message, input, session, ordered, route_indices),
+        )
+        .await
     }
 
-    async fn invoke_with_dispatch_span(
+    /// Run a typed command a transport delivered, as the transport identity.
+    ///
+    /// The command ID derives from the message ID, so a redelivery replays
+    /// the committed receipt and the handler does not run again.
+    async fn dispatch_transport_command(
         &self,
         message: &Message,
         input: Value,
-        session: Session,
-        ordered: Option<&OrderedDelivery>,
-    ) -> Result<Value, HandlerError> {
+        declared: bool,
+    ) -> Result<Value, CausalDispatchError> {
+        // An undeclared role list admits any session, so the opt-in is
+        // checked here rather than left to the role grant.
+        if !declared {
+            return Err(CausalDispatchError::Forbidden);
+        }
+        let message_id = message.id().filter(|id| !id.is_empty()).ok_or_else(|| {
+            CausalDispatchError::BadRequest(format!(
+                "command message `{}` has no id, so it cannot be deduplicated",
+                message.name
+            ))
+        })?;
+        let service_id = self.name().ok_or_else(|| {
+            CausalDispatchError::Internal(
+                "typed causal dispatch requires Service::named identity".into(),
+            )
+        })?;
+        self.execute_causal(
+            &message.name,
+            &transport_command_id(service_id, &message.name, message_id),
+            input,
+            transport_session(message, message_id),
+            VerifiedPrincipal::internal(TRANSPORT_USER_ID)
+                .expect("the transport subject is a non-empty constant"),
+            None,
+        )
+        .await
+        .map(|result| result.payload)
+    }
+
+    fn lane_route_indices(
+        &self,
+        message: &Message,
+        lane: Option<usize>,
+    ) -> Result<Vec<usize>, HandlerError> {
+        let all = self
+            .index
+            .get(&message.kind)
+            .and_then(|by_name| by_name.get(message.name()))
+            .ok_or_else(|| HandlerError::UnknownCommand(message.name.clone()))?;
+        Ok(all
+            .iter()
+            .copied()
+            .filter(|route| lane.is_none_or(|lane| self.route_lanes[*route] == lane))
+            .collect())
+    }
+
+    /// Run `work` inside the dispatch span of `message`, parented on the
+    /// trace context its metadata carries.
+    async fn in_dispatch_span<T>(
+        &self,
+        message: &Message,
+        work: impl std::future::Future<Output = T>,
+    ) -> T {
         #[cfg(feature = "otel")]
         {
             use tracing::Instrument as _;
@@ -987,15 +1208,13 @@ impl Service {
                 &span,
                 &message.metadata,
             );
-            return self
-                .invoke(message, input, session, ordered)
-                .instrument(span)
-                .await;
+            return work.instrument(span).await;
         }
 
         #[cfg(not(feature = "otel"))]
         {
-            self.invoke(message, input, session, ordered).await
+            let _ = message;
+            work.await
         }
     }
 
@@ -1005,13 +1224,8 @@ impl Service {
         input: Value,
         session: Session,
         ordered: Option<&OrderedDelivery>,
+        route_indices: Vec<usize>,
     ) -> Result<Value, HandlerError> {
-        let route_indices = self
-            .index
-            .get(&message.kind)
-            .and_then(|by_name| by_name.get(message.name.as_str()))
-            .cloned()
-            .ok_or_else(|| HandlerError::UnknownCommand(message.name.clone()))?;
         #[cfg(feature = "otel")]
         let handler_span = microsvc_handler_span(message);
         let dispatch = async move {
@@ -1110,6 +1324,33 @@ impl Service {
         }
     }
 
+    /// Compaction of every command ledger this service's typed commands
+    /// write, one per repository however many route bundles share it.
+    pub(crate) fn command_ledgers(&self) -> Vec<super::routes::LedgerCompaction> {
+        let mut identities = Vec::new();
+        let mut ledgers = Vec::new();
+        for routes in &self.routes {
+            let Some(identity) = routes.causal_storage_identity() else {
+                continue;
+            };
+            if identities.contains(&identity) {
+                continue;
+            }
+            identities.push(identity);
+            ledgers.extend(routes.ledger_compaction());
+        }
+        ledgers
+    }
+
+    /// Run command-ledger compaction beside the outbox drain for as long as
+    /// this service lives.
+    #[cfg(background_workers)]
+    pub(crate) fn start_ledger_compaction(&mut self) {
+        let ledgers = self.command_ledgers();
+        self.ledger_compaction = (!ledgers.is_empty())
+            .then(|| crate::microsvc::workers::LedgerCompactionWorker::spawn(ledgers));
+    }
+
     pub(crate) async fn bootstrap_projectors(&self) -> Result<(), HandlerError> {
         let modeled_local_services = self
             .routes
@@ -1192,46 +1433,8 @@ impl Service {
 }
 
 impl CommandMountRegistrar for Service {
-    fn register_command_mount(
-        &mut self,
-        mount: CommandMount,
-    ) -> Result<(), HandlerError> {
+    fn register_command_mount(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         self.register_command_mount_inner(mount)
-    }
-}
-
-impl crate::application::CommandMountExecution for Service {
-    fn invoke_mount<'a>(
-        &'a self,
-        mount: &'a CommandMount,
-        request: CommandRequest,
-        invocation: crate::application::CommandMountInvocation,
-    ) -> crate::application::CommandMountExecutionFuture<'a> {
-        Box::pin(async move {
-            match invocation {
-                crate::application::CommandMountInvocation::Transport => self
-                    .dispatch_mount_result(mount, &request)
-                    .await
-                    .map(crate::application::CommandMountExecutionResult::Transport)
-                    .map_err(crate::application::CommandMountExecutionError::Handler),
-                #[cfg(feature = "graphql")]
-                crate::application::CommandMountInvocation::Authenticated {
-                    command_id,
-                    session,
-                    principal,
-                } => self
-                    .dispatch_registered_mount_causally(
-                        mount,
-                        &request,
-                        &command_id,
-                        session,
-                        principal,
-                    )
-                    .await
-                    .map(crate::application::CommandMountExecutionResult::Causal)
-                    .map_err(crate::application::CommandMountExecutionError::Causal),
-            }
-        })
     }
 }
 

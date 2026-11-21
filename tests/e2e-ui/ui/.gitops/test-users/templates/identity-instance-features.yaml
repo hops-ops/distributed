@@ -1,12 +1,13 @@
 {{- /* Test-user chart ownership.
   Instance Login V2 features (gitops).
 
-  Zitadel honors instance loginV2.baseUri when required=true. That is what
-  redirects authorize → custom e2e-ui /login (not stock zitadel-login).
+  Zitadel honors instance loginV2.baseUri when required=true. That redirects
+  authorize to this UI's /login. The OIDC app already sets loginVersion.baseUri
+  per worktree, which is enough for lanes to coexist.
 
-  baseUri tracks the UI release namespace (hops --name / helm --namespace).
-  Note: Features is instance-global in Zitadel — last applied worktree wins if
-  several UIs enable this on one AuthStack.
+  This resource is instance-global. The chart default is off. One primary
+  lane may set identity.instanceLoginV2 true. A second lane must leave it
+  false or the last apply replaces the first lane's login host.
 */ -}}
 {{- if and .Values.identity.enabled (ne .Values.identity.instanceLoginV2 false) }}
 {{- $uiBase := include "e2e-ui-ui.uiBaseURL" . -}}

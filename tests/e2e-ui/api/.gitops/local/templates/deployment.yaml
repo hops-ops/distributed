@@ -69,7 +69,7 @@ spec:
           ports:
             - containerPort: {{ .Values.service.targetPort }}
               name: api
-            - containerPort: {{ .Values.uiService.targetPort }}
+            - containerPort: {{ .Values.env.UI_PORT | int }}
               name: ui
           env:
             {{- include "e2e-ui-api.oidcClientEnv" . | nindent 12 }}
@@ -77,8 +77,8 @@ spec:
             {{- if eq $k "AUTH_URL" }}
             - name: AUTH_URL
               value: {{ printf "http://e2e-ui-ui.%s.svc.cluster.local:5180" (include "e2e-ui-api.releaseNamespace" $) | quote }}
-            {{- else if eq $k "UI_URL" }}
-            - name: UI_URL
+            {{- else if or (eq $k "UI_URL") (eq $k "PUBLIC_ORIGIN") }}
+            - name: {{ $k }}
               value: {{ printf "http://e2e-ui-ui.%s.svc.cluster.local:5180" (include "e2e-ui-api.releaseNamespace" $) | quote }}
             {{- else if and $v (ne $v "") }}
             - name: {{ $k }}

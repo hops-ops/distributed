@@ -1,13 +1,13 @@
-use distributed::graphql::{Atomic, CommandProjectionPureReduce, PreparedCommand};
+use distributed::command::{Atomic, CommandProjectionPureReduce, PreparedCommand};
 use distributed::microsvc::{CausalCommandContext, HandlerError};
-use distributed::portable_command;
+use distributed::command;
 use e2e_readmodels::BlobGames;
 use serde::Deserialize;
 
 use super::support::{authenticated_user, principal, rejected, sealed_row};
 use crate::{domain_commands, BlobGame, Direction};
 
-#[derive(Debug, Deserialize, distributed::GraphqlInput)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct BlobMoveInput {
     pub game_id: String,
     pub direction: String,
@@ -52,7 +52,7 @@ fn blob_preview() -> CommandProjectionPureReduce {
     ])
 }
 
-portable_command! {
+command! {
     name: "blob.move",
     transition: domain_commands::MoveDir,
     aggregate: BlobGame,

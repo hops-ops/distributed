@@ -273,10 +273,12 @@ pub(crate) fn validate_derived_capabilities(
     capabilities: &ManifestCapabilities,
     roots: &BTreeMap<(RootOperation, String), ManifestRoot>,
     commands: &[ManifestCommand],
+    live_leaderboards: bool,
 ) -> Result<(), ClientCompileError> {
-    let has_live_roots = roots
-        .keys()
-        .any(|(operation, _)| *operation == RootOperation::Subscription);
+    let has_live_roots = live_leaderboards
+        || roots
+            .keys()
+            .any(|(operation, _)| *operation == RootOperation::Subscription);
     if capabilities.live_queries != has_live_roots {
         return Err(ClientCompileError::manifest(
             "client.manifest.live_capability",
@@ -1134,6 +1136,7 @@ pub(crate) fn validate_filter_fields(
                     | "_is_null"
                     | "_like"
                     | "_ilike"
+                    | "_icontains"
                     | "_contains"
                     | "_contained_in"
                     | "_has_key"

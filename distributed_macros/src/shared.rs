@@ -14,6 +14,13 @@ use syn::{
 /// Proc-macro output is compiled in the caller's crate, so a literal
 /// `::distributed` path is wrong when the dependency is renamed or re-exported.
 /// `FoundCrate::Itself` also keeps framework-internal macro tests hygienic.
+/// [`framework_path`] for a helper below a macro's entry point. The entry
+/// point has already resolved the dependency (and reported a missing one), so
+/// the fallback is never what the user sees.
+pub(crate) fn framework() -> proc_macro2::TokenStream {
+    framework_path().unwrap_or_else(|_| quote!(::distributed))
+}
+
 pub(crate) fn framework_path() -> syn::Result<proc_macro2::TokenStream> {
     match crate_name("distributed") {
         Ok(FoundCrate::Itself) => Ok(quote!(crate)),
@@ -61,37 +68,22 @@ pub(crate) fn extract_params_with_types(
         .collect()
 }
 
-fn returns_result(sig: &syn::Signature) -> bool {
-    match &sig.output {
-        ReturnType::Default => false,
-        ReturnType::Type(_, ty) => match ty.as_ref() {
-            Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
-                segment.ident == "Result" || segment.ident == "SourcedResult"
-            }),
-            _ => false,
-        },
-    }
-}
-
-pub(crate) fn ensure_sourced_result_signature(
+/// A recorder returns nothing: the macro gives it `SourcedResult<()>` for the
+/// digest. A recorder that could fail after the event is recorded would leave
+/// an event whose state change never happened, so validation belongs in the
+/// method that calls the recorder.
+pub(crate) fn ensure_infallible_recorder_signature(
     sig: &mut syn::Signature,
-    attr_name: &str,
     framework: &proc_macro2::TokenStream,
-) -> Result<bool, syn::Error> {
-    match &sig.output {
-        ReturnType::Default => {
-            sig.output = syn::parse_quote!(-> #framework::SourcedResult<()>);
-            Ok(true)
-        }
-        ReturnType::Type(_, _) if returns_result(sig) => Ok(false),
-        ReturnType::Type(_, ty) => Err(syn::Error::new_spanned(
+) -> syn::Result<()> {
+    if let ReturnType::Type(_, ty) = &sig.output {
+        return Err(syn::Error::new_spanned(
             ty,
-            format!(
-                "#[{}] methods must return Result<(), E>, SourcedResult, or omit the return type",
-                attr_name
-            ),
-        )),
+            "#[event] methods must omit the return type: the event is recorded before the body runs, so the body cannot fail. Validate in the method that calls the recorder",
+        ));
     }
+    sig.output = syn::parse_quote!(-> #framework::SourcedResult<()>);
+    Ok(())
 }
 
 /// Generate a digest call token stream.
@@ -125,97 +117,33 @@ pub(crate) fn generate_digest_call(
     }
 }
 
-/// Wrap a `Result<(), E>` command method with an optional guard and fallible prelude.
-pub(crate) fn wrap_result_body_with_guard(
-    guard: Option<&Expr>,
-    prepend: proc_macro2::TokenStream,
-    original_block: &syn::Block,
-    signature_synthesized: bool,
-) -> syn::Block {
-    wrap_result_body_with_guard_and_postlude(
-        guard,
-        prepend,
-        original_block,
-        proc_macro2::TokenStream::new(),
-        signature_synthesized,
-    )
-}
-
-/// Wrap a sourced method with an optional guard and successful postlude.
-pub(crate) fn wrap_result_body_with_guard_and_postlude(
+/// Wrap a recorder body: the prelude (digest), the body, then the postlude,
+/// all behind the optional `when` guard.
+pub(crate) fn wrap_recorder_body(
     guard: Option<&Expr>,
     prepend: proc_macro2::TokenStream,
     original_block: &syn::Block,
     append: proc_macro2::TokenStream,
-    signature_synthesized: bool,
 ) -> syn::Block {
-    match (guard, signature_synthesized) {
-        (Some(guard), true) => {
-            syn::parse_quote! {
-                {
-                    if #guard {
-                        #prepend
-                        #original_block;
-                        #append
-                    }
-                    Ok(())
-                }
-            }
-        }
-        (Some(guard), false) => {
-            syn::parse_quote! {
-                {
-                    if #guard {
-                        #prepend
-                        (|| #original_block)()?;
-                        #append
-                    }
-                    Ok(())
-                }
-            }
-        }
-        (None, true) => {
-            syn::parse_quote! {
-                {
+    match guard {
+        Some(guard) => syn::parse_quote! {
+            {
+                if #guard {
                     #prepend
                     #original_block;
                     #append
-                    Ok(())
                 }
+                Ok(())
             }
-        }
-        (None, false) => {
-            syn::parse_quote! {
-                {
-                    #prepend
-                    (|| #original_block)()?;
-                    #append
-                    Ok(())
-                }
+        },
+        None => syn::parse_quote! {
+            {
+                #prepend
+                #original_block;
+                #append
+                Ok(())
             }
-        }
-    }
-}
-
-/// Generate an enqueue call token stream (for use within `#[sourced]`).
-pub(crate) fn generate_enqueue_call(
-    entity_field: &Ident,
-    emitter_field: &Ident,
-    event_name: &LitStr,
-    param_names: &[&Ident],
-) -> proc_macro2::TokenStream {
-    let enqueue_expr = if param_names.is_empty() {
-        quote! { self.#emitter_field.enqueue(#event_name, ""); }
-    } else if param_names.len() == 1 {
-        let param = param_names[0];
-        quote! { self.#emitter_field.enqueue_with(#event_name, &(#param.clone(),))?; }
-    } else {
-        quote! { self.#emitter_field.enqueue_with(#event_name, &(#(#param_names.clone()),*))?; }
-    };
-    quote! {
-        if !self.#entity_field.is_replaying() {
-            #enqueue_expr
-        };
+        },
     }
 }
 

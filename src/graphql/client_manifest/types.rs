@@ -145,6 +145,51 @@ pub struct DistributedClientManifest {
     pub projectors: Vec<ClientProjector>,
     pub projection_programs: Vec<ClientProjectionProgram>,
     pub projection_bindings: Vec<ClientProjectionBinding>,
+    /// Leaderboard queries. Omitted when empty, so a manifest without
+    /// leaderboards (and its fingerprint) is unchanged; a compiler that does
+    /// not know this field refuses a manifest that has one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leaderboards: Vec<ClientLeaderboard>,
+}
+
+/// One leaderboard surface on the client contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientLeaderboard {
+    /// GraphQL base name (`xp` → `xpLeaderboard`, …).
+    pub name: String,
+    /// Object type of each row (`LeaderboardEntry`: `rank`, `member`, `score`).
+    pub entry_typename: String,
+    /// `high_first` or `low_first`.
+    pub order: String,
+    /// `single` (no `board` argument) or `family` (`board: String!`).
+    pub boards: String,
+    pub default_first: u32,
+    pub max_first: u32,
+    pub max_radius: u32,
+    pub roots: Vec<ClientLeaderboardRoot>,
+}
+
+/// One leaderboard root the selected roles may run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientLeaderboardRoot {
+    pub name: String,
+    /// `top`, `around_me`, `my_rank` or `rank`.
+    pub operation: String,
+    /// `true`: `[LeaderboardEntry!]!`; `false`: nullable `LeaderboardEntry`.
+    pub list: bool,
+    /// Whether a same-named subscription root exists (`@live`).
+    pub live: bool,
+    pub arguments: Vec<ClientLeaderboardArgument>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientLeaderboardArgument {
+    pub name: String,
+    pub type_name: String,
+    pub nullable: bool,
 }
 
 /// Framework-owned operations generated alongside application operations.
@@ -470,34 +515,12 @@ pub struct ClientCommandExtensionSlots {
     pub direct_projection: Option<CommandDirectProjectionExtension>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_defaults: Option<CommandInputDefaultsExtension>,
-    #[serde(
-        default,
-        skip_serializing,
-        deserialize_with = "reject_legacy_command_authority"
-    )]
-    pub effects: Option<CommandEffectsExtension>,
-    #[serde(
-        default,
-        skip_serializing,
-        deserialize_with = "reject_legacy_command_authority"
-    )]
-    pub confirmations: Option<CommandConfirmationsExtension>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projection: Option<CommandProjectionExtension>,
     /// Names and wire codecs only. Values are server-derived for the current
     /// verified Session and are never frozen into a generated artifact.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_presets: Vec<ClientTrustedPresetDescriptor>,
-}
-
-fn reject_legacy_command_authority<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
-    Err(serde::de::Error::custom(
-        "client manifest v2 rejects legacy command effects/confirmations authority",
-    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -542,32 +565,12 @@ pub struct CommandInputDefaultsExtension {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandEffectsExtension {
-    pub version: u32,
-    pub operations: Vec<serde_json::Value>,
-    pub fallback: String,
-}
-
-/// Declaration-owned projector progress expected after a fact commit.
-/// Entries use the same closed input-expression/key IR as optimistic effects.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandConfirmationsExtension {
-    pub version: u32,
-    /// `finite` contains the complete authorized edge set; `unavailable`
-    /// intentionally carries no topology and requires revalidation.
-    pub kind: String,
-    pub expected: Vec<serde_json::Value>,
-    pub fallback: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientProjector {
     pub version: u32,
     pub name: String,
     pub facts: Vec<String>,
     pub models: Vec<String>,
     pub dependencies: Vec<String>,
-    pub causal_confirmation: bool,
 }
 
 /// Opaque exact outward-event reference.

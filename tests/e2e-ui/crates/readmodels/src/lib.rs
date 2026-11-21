@@ -22,7 +22,7 @@ pub fn distributed_manifest() -> distributed::ReadModelCatalog {
 /// Role grants compiled from the authorization attached to each read model.
 pub fn application_grants() -> std::collections::BTreeMap<
     String,
-    std::collections::BTreeMap<String, distributed::graphql::RoleGrant>,
+    std::collections::BTreeMap<String, distributed::graphql::ReadPermission>,
 > {
     use distributed::graphql::ModelPermissions;
     use distributed::RelationalReadModel;
@@ -30,11 +30,11 @@ pub fn application_grants() -> std::collections::BTreeMap<
     fn add<M: RelationalReadModel>(
         grants: &mut std::collections::BTreeMap<
             String,
-            std::collections::BTreeMap<String, distributed::graphql::RoleGrant>,
+            std::collections::BTreeMap<String, distributed::graphql::ReadPermission>,
         >,
         permissions: ModelPermissions<M>,
     ) {
-        for (role, grant) in permissions.surface_grants() {
+        for (role, grant) in permissions.by_role() {
             grants
                 .entry(role)
                 .or_default()
@@ -97,7 +97,11 @@ mod tests {
         // brace, so match without requiring a trailing newline.)
         for name in ["Todos", "BlobGames", "ChatMessages"] {
             let body = object(name);
-            let join = if name == "ChatMessages" { "author" } else { "owner" };
+            let join = if name == "ChatMessages" {
+                "author"
+            } else {
+                "owner"
+            };
             assert!(
                 body.contains(&format!("\n  {join}: AuthUsers")),
                 "{name} missing nullable AuthUsers join:\n{body}"
@@ -122,21 +126,5 @@ mod tests {
         assert!(anonymous.contains_key("ChatMessages"));
         assert!(anonymous.contains_key("AuthUsers"));
         assert_eq!(anonymous.len(), 2);
-        assert!(matches!(
-            user["Todos"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Predicate(_)
-        ));
-        assert!(matches!(
-            user["BlobGames"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Predicate(_)
-        ));
-        assert!(matches!(
-            user["ChatMessages"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Unrestricted
-        ));
-        assert!(matches!(
-            user["AuthUsers"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Unrestricted
-        ));
     }
 }

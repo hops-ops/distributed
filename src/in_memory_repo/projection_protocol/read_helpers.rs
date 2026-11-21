@@ -122,60 +122,23 @@ fn relationship_keys_from_state(
     target_schema: &TableSchema,
     max_unique: usize,
 ) -> Result<Vec<RowKey>, ProjectionProtocolError> {
-    let foreign_key = relationship.foreign_key.as_deref().ok_or_else(|| {
-        ProjectionProtocolError::InvalidBatch(format!(
-            "projection graph relationship `{}` has no foreign key",
-            relationship.field_name
-        ))
-    })?;
-    let (target_column, value) = match relationship.kind {
-        RelationshipKind::HasMany => {
-            let (target_column, root_column) =
-                projection_has_many_columns(root_schema, relationship, target_schema)?;
-            let value = root_row.get(&root_column).cloned().ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph root `{}` is missing relationship key `{root_column}`",
-                    root_schema.model_name
-                ))
-            })?;
-            (target_column, value)
-        }
-        RelationshipKind::BelongsTo => {
-            let source_column = column_name_for(root_schema, foreign_key).ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph relationship `{}` foreign key `{foreign_key}` is not a source column",
-                    relationship.field_name
-                ))
-            })?;
-            let [target_column] = target_schema.primary_key.columns.as_slice() else {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph belongs-to target `{}` must have one primary-key column",
-                    target_schema.model_name
-                )));
-            };
-            let value = root_row.get(&source_column).cloned().ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph root `{}` is missing relationship key `{source_column}`",
-                    root_schema.model_name
-                ))
-            })?;
-            (target_column.clone(), value)
-        }
-        RelationshipKind::ManyToMany => {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection graph relationship `{}` is many-to-many; project an explicit join read model instead",
-                relationship.field_name
-            )));
-        }
-    };
-    if value == crate::table::RowValue::Null {
+    let values =
+        projection_relationship_values(root_schema, root_row, relationship, target_schema)?;
+    if values
+        .iter()
+        .any(|(_, value)| *value == crate::table::RowValue::Null)
+    {
         return Ok(Vec::new());
     }
 
     let prefix = format!("{}:", target_schema.table_name);
     let mut keys = Vec::new();
     for (storage_key, stored) in rows {
-        if storage_key.starts_with(&prefix) && stored.values.get(&target_column) == Some(&value) {
+        if storage_key.starts_with(&prefix)
+            && values
+                .iter()
+                .all(|(column, value)| stored.values.get(column) == Some(value))
+        {
             if keys.len() == max_unique {
                 return Err(graph_budget_error_from_parts(
                     root_schema,
@@ -385,79 +348,6 @@ pub(super) fn validate_observation_from_state(
         ));
     }
     Ok(())
-}
-
-pub(super) fn validate_failure_from_state(
-    protocol: &InMemoryProjectionProtocolState,
-    request: &crate::projection_protocol::ProjectionObligationEvidenceRequest,
-    failure: &ProjectionFailure,
-) -> Result<(), ProjectionProtocolError> {
-    if failure.causation_id != request.causation_id
-        || failure.input.topology() != request.scope.topology()
-        || failure.input.projection_partition() != request.scope.projection_partition()
-        || failure.change.topology() != request.scope.topology()
-        || failure.change.projection_partition() != request.scope.projection_partition()
-    {
-        return Err(ProjectionProtocolError::InvalidBatch(
-            "stored projection failure does not match its evidence scope".into(),
-        ));
-    }
-    let partition = protocol
-        .partitions
-        .get(&PartitionKey::new(
-            request.scope.topology(),
-            request.scope.projection_partition(),
-        ))
-        .ok_or_else(|| {
-            ProjectionProtocolError::InvalidBatch(
-                "stored projection failure has no partition state".into(),
-            )
-        })?;
-    if failure.change.epoch() != &partition.change_epoch
-        || failure.change.position() > partition.change_head
-    {
-        return Err(ProjectionProtocolError::InvalidBatch(
-            "stored projection failure change lies outside its partition".into(),
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn read_projection_obligation_evidence_from_state(
-    protocol: &InMemoryProjectionProtocolState,
-    request: &crate::projection_protocol::ProjectionObligationEvidenceRequest,
-) -> Result<ProjectionObligationEvidence, ProjectionProtocolError> {
-    request.validate()?;
-    let failure = protocol
-        .failures
-        .values()
-        .filter(|failure| {
-            failure.causation_id == request.causation_id
-                && failure.input.topology() == request.scope.topology()
-                && failure.input.projection_partition() == request.scope.projection_partition()
-        })
-        .min_by_key(|failure| failure.change.position())
-        .cloned();
-    if let Some(failure) = failure {
-        validate_failure_from_state(protocol, request, &failure)?;
-        return Ok(ProjectionObligationEvidence::TerminalFailure(failure));
-    }
-
-    let observation = protocol
-        .observations
-        .get(&ObservationKey {
-            causation_id: request.causation_id.clone(),
-            scope: request.scope.clone(),
-            kind: request.kind,
-        })
-        .cloned();
-    match observation {
-        Some(observation) => {
-            validate_observation_from_state(protocol, request, &observation)?;
-            Ok(ProjectionObligationEvidence::Observed(observation))
-        }
-        None => Ok(ProjectionObligationEvidence::Pending),
-    }
 }
 
 #[allow(dead_code)]

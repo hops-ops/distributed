@@ -60,7 +60,9 @@ distributed::projection! {
 mod tests {
     use distributed::domain_event::DomainEventContract;
     use distributed::projection::placement::ProjectionExecutionClass;
-    use distributed::{DomainEventBodyKind, MutationKind, RelationalReadModel, RowValue, TableMutation};
+    use distributed::{
+        DomainEventBodyKind, MutationKind, RelationalReadModel, RowValue, TableMutation,
+    };
 
     use super::*;
     use todo_domain::{Todo, TodoPurgedDomainEvent};
@@ -69,8 +71,14 @@ mod tests {
     fn todo_handlers_apply_save_and_delete_mutations() {
         let program = TODOS.program().unwrap();
         assert_eq!(program.arms().len(), 8);
-        assert_eq!(SaveTodo().program().operations()[0].kind(), MutationKind::Upsert);
-        assert_eq!(DeleteTodo().program().operations()[0].kind(), MutationKind::Delete);
+        assert_eq!(
+            SaveTodo().program().unwrap().operations()[0].kind(),
+            MutationKind::Upsert
+        );
+        assert_eq!(
+            DeleteTodo().program().unwrap().operations()[0].kind(),
+            MutationKind::Delete
+        );
     }
 
     #[test]
@@ -84,7 +92,10 @@ mod tests {
         let TableMutation::UpsertRow(row) = &lowered.write_plan.mutations[0] else {
             panic!("expected upsert");
         };
-        assert_eq!(row.values.get("status"), Some(&RowValue::String("completed".into())));
+        assert_eq!(
+            row.values.get("status"),
+            Some(&RowValue::String("completed".into()))
+        );
         assert_eq!(Todos::schema().table_name, "todos");
         assert_eq!(
             TODOS.eventual().execution_class(),
@@ -98,27 +109,38 @@ mod tests {
         todo.create("todo-1", "alice", "Read").unwrap();
         todo.purge("alice").unwrap();
         let occurrence = todo.entity.pending_domain_events().last().unwrap();
-        assert_eq!(occurrence.descriptor().body.kind, DomainEventBodyKind::Deletion);
-        assert_eq!(occurrence.descriptor(), &TodoPurgedDomainEvent::descriptor());
+        assert_eq!(
+            occurrence.descriptor().body.kind,
+            DomainEventBodyKind::Deletion
+        );
+        assert_eq!(
+            occurrence.descriptor(),
+            &TodoPurgedDomainEvent::descriptor()
+        );
         let lowered = TODOS.server_executor().unwrap().plan(occurrence).unwrap();
         let TableMutation::DeleteRow(delete) = &lowered.write_plan.mutations[0] else {
             panic!("expected delete");
         };
-        assert_eq!(delete.key.get("todo_id"), Some(&RowValue::String("todo-1".into())));
+        assert_eq!(
+            delete.key.get("todo_id"),
+            Some(&RowValue::String("todo-1".into()))
+        );
     }
 
     #[test]
     fn mutations_are_event_free() {
-        let json = serde_json::to_value(SaveTodo().program()).unwrap().to_string();
+        let json = serde_json::to_value(SaveTodo().program().unwrap())
+            .unwrap()
+            .to_string();
         assert!(!json.contains("event_name"));
     }
 
     #[test]
     fn graphql_file_matches_inline_graphql_looking_form() {
         use distributed::mutation;
-        assert_eq!(SaveTodo().program().name(), "SaveTodo");
-        assert_eq!(DeleteTodo().program().name(), "DeleteTodo");
-        let from_file = SaveTodo().program().canonical_bytes().unwrap();
+        assert_eq!(SaveTodo().program().unwrap().name(), "SaveTodo");
+        assert_eq!(DeleteTodo().program().unwrap().name(), "DeleteTodo");
+        let from_file = SaveTodo().program().unwrap();
         let inline = mutation! {
             mutation SaveTodo {
                 upsert_todos(object: $input.todo)
@@ -126,18 +148,8 @@ mod tests {
         };
         assert_eq!(
             from_file,
-            inline.program().canonical_bytes().unwrap(),
+            inline.program().unwrap(),
             "mutation_file! and inline GraphQL-looking mutation! must share IR"
-        );
-        let classic = mutation! {
-            name: "SaveTodo";
-            version: 1;
-            upsert Todos from input.todo;
-        };
-        assert_eq!(
-            from_file,
-            classic.program().canonical_bytes().unwrap(),
-            "GraphQL-looking and classic sugar must share IR"
         );
     }
 }

@@ -57,7 +57,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
     const CONFLICT_REREAD_IN_TX: bool = false;
     const NOW: &'static str = "now()";
     const COMMAND_LEDGER_SELECT: &'static str = "command_name, command_contract_hash, \
-         input_hash, state, causation_id, attempt_token, attempt_number, \
+         input_hash, state, causation_id, attempt_token, attempt_number, external_binding, \
          EXTRACT(EPOCH FROM lease_expires_at)::double precision AS lease_expires_at, \
          outcome::text AS outcome, \
          EXTRACT(EPOCH FROM created_at)::double precision AS created_at, \
@@ -66,6 +66,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
          EXTRACT(EPOCH FROM retention_expires_at)::double precision AS retention_expires_at, \
          EXTRACT(EPOCH FROM compacted_at)::double precision AS compacted_at";
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str = " FOR UPDATE";
+    const SCHEDULE_CLAIM_LOCK_SUFFIX: &'static str = " FOR UPDATE SKIP LOCKED";
     const COMMAND_LEDGER_COMPACTION_LOCK_SUFFIX: &'static str = " FOR UPDATE SKIP LOCKED";
     const EVENT_SELECT: &'static str = "event_name, \
          event_version, \
@@ -101,7 +102,8 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
          source_aggregate_id, \
          source_sequence, \
          correlation_id, \
-         causation_id";
+         causation_id, \
+         EXTRACT(EPOCH FROM next_available_at)::double precision AS next_available_at";
     const ORDER_BY_CREATED_AT: &'static str = "created_at";
     const OUTBOX_OLDEST_CREATED_AT_SELECT: &'static str =
         "EXTRACT(EPOCH FROM MIN(created_at))::double precision AS oldest_created_at";
@@ -109,6 +111,31 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
 
     /// Epoch seconds; stored via `to_timestamp(...)` into `timestamptz`.
     type TimestampValue = f64;
+
+    /// sqlx 0.9.0 does not undo a `BEGIN` whose future is dropped before the
+    /// server answers: `transaction_depth` is still zero, so its drop guard
+    /// queues no `ROLLBACK`, and the connection returns to the pool inside an
+    /// open transaction. Statements that follow run in that transaction, and
+    /// the next `SET TRANSACTION ISOLATION LEVEL` on it is refused ("must be
+    /// called before any query"). A connection released in that state is
+    /// closed instead of reused.
+    fn pool_options(options: sqlx::pool::PoolOptions<Self>) -> sqlx::pool::PoolOptions<Self> {
+        options.after_release(|connection, _| {
+            Box::pin(async move {
+                // Outside a transaction block a simple query starts its own
+                // transaction, so the two timestamps are equal.
+                let open: bool = sqlx::raw_sql("SELECT now() <> statement_timestamp()")
+                    .fetch_one(&mut *connection)
+                    .await?
+                    .get(0);
+                #[cfg(feature = "otel")]
+                if open {
+                    tracing::warn!("closed a Postgres connection released inside a transaction");
+                }
+                Ok(!open)
+            })
+        })
+    }
 
     fn is_unique_violation(err: &sqlx::Error) -> bool {
         is_postgres_unique_violation(err)
@@ -287,7 +314,8 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
                           message.source_aggregate_id,
                           message.source_sequence,
                           message.correlation_id,
-                          message.causation_id
+                          message.causation_id,
+                          EXTRACT(EPOCH FROM message.next_available_at)::double precision AS next_available_at
                 "#,
             )
             .bind(OutboxMessageStatus::Pending.as_str())

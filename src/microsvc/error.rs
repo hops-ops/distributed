@@ -14,6 +14,9 @@ use crate::{repository::RepositoryError, EventRecordError};
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum HandlerError {
+    /// Supervisor generation admission is temporarily closed. Retain the exact
+    /// delivery and stop the receive loop until the host retries after reload.
+    ApplicationReloading,
     /// No handler registered for this command name.
     UnknownCommand(String),
     /// Payload decode / deserialization failed.
@@ -51,6 +54,7 @@ pub enum HandlerError {
 impl fmt::Display for HandlerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            HandlerError::ApplicationReloading => f.write_str("application generation is reloading"),
             HandlerError::UnknownCommand(name) => write!(f, "unknown command: {}", name),
             HandlerError::DecodeFailed(msg) => write!(f, "decode failed: {}", msg),
             HandlerError::Rejected(msg) => write!(f, "rejected: {}", msg),
@@ -142,6 +146,7 @@ impl HandlerError {
     /// Map this error to an HTTP-style status code.
     pub fn status_code(&self) -> u16 {
         match self {
+            HandlerError::ApplicationReloading => 503,
             HandlerError::UnknownCommand(_) => 404,
             HandlerError::DecodeFailed(_) => 400,
             HandlerError::Rejected(_) => 422,
@@ -201,7 +206,8 @@ impl HandlerError {
                     TransportErrorKind::Permanent
                 }
             }
-            HandlerError::ProjectionRepairPending { .. }
+            HandlerError::ApplicationReloading
+            | HandlerError::ProjectionRepairPending { .. }
             | HandlerError::NotFound(_)
             | HandlerError::Other(_) => TransportErrorKind::Retryable,
             HandlerError::ProjectionTerminalRecorded { .. }
@@ -228,7 +234,8 @@ impl From<HandlerError> for TransportError {
         let kind = error.transport_error_kind();
         let retain_and_stop = matches!(
             error,
-            HandlerError::ProjectionTerminalRecorded { .. }
+            HandlerError::ApplicationReloading
+                | HandlerError::ProjectionTerminalRecorded { .. }
                 | HandlerError::ProjectionDeliveryHalted { .. }
         );
         let transport = TransportError::new(kind, error.to_string()).with_source(error);
@@ -243,6 +250,16 @@ impl From<HandlerError> for TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_reloading_retains_delivery_without_reclassifying_business_errors() {
+        let reload = TransportError::from(HandlerError::ApplicationReloading);
+        assert!(reload.is_retryable());
+        assert!(reload.should_retain_and_stop());
+        let rejection = TransportError::from(HandlerError::Rejected("invalid slug".into()));
+        assert!(rejection.is_permanent());
+        assert!(!rejection.should_retain_and_stop());
+    }
 
     #[test]
     fn transient_handler_errors_are_retryable() {

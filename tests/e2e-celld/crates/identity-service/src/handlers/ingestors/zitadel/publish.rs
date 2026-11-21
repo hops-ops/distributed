@@ -1,22 +1,18 @@
-//! Shared outbox publish for provider messages (ingress + scrape).
+//! Provider message encoding shared by ingress and scrape.
 
-use distributed::{CommitBuilderExt, OutboxMessage, TransactionalCommit};
+use distributed::microsvc::HandlerError;
+use distributed::OutboxMessage;
 
 use super::map::MappedDelivery;
 
-/// Encode + leaf-outbox commit a mapped provider delivery.
-pub async fn publish_mapped_delivery<R: TransactionalCommit>(
-    repo: &R,
+/// Encode a mapped provider delivery as the outbox message `id`.
+///
+/// Callers derive `id` from their command id, so one command never stages an
+/// id another command committed.
+pub fn provider_message(
+    id: String,
     mapped: &MappedDelivery,
-) -> Result<(), String> {
-    let outbox = OutboxMessage::encode(
-        mapped.delivery_id.clone(),
-        mapped.message_name.as_str(),
-        &mapped.payload,
-    )
-    .map_err(|e| e.to_string())?;
-    CommitBuilderExt::outbox(repo, outbox)
-        .commit_all()
-        .await
-        .map_err(|e| e.to_string())
+) -> Result<OutboxMessage, HandlerError> {
+    OutboxMessage::encode(id, mapped.message_name.as_str(), &mapped.payload)
+        .map_err(|error| HandlerError::Other(Box::new(error)))
 }

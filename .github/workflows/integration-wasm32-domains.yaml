@@ -1,0 +1,33 @@
+name: wasm32 domain crates
+
+# Reusable workflow: referenced via `uses: ./.github/workflows/integration-wasm32-domains.yaml`.
+# Domain crates run inside celld cells (wasm32 Durable Objects), so each must
+# build for wasm32-unknown-unknown without Tokio sockets, native SQLite or
+# other native-only dependencies (game-services decision D4). The script also
+# proves the check bites: tests/fixtures/wasm32-native-domain must fail.
+#
+# Local parity: scripts/check-wasm32-domains.sh
+on:
+  workflow_call:
+
+jobs:
+  wasm32-domains:
+    name: Domain crates build for wasm32-unknown-unknown
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm32-domains
+          cache-directories: target/wasm32-domains
+      - name: Build every domain crate for wasm32 (and reject the native fixture)
+        run: scripts/check-wasm32-domains.sh

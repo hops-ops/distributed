@@ -1,5 +1,15 @@
 export { authFromPageData, type PageGraphqlData } from './auth.js';
 export {
+	createDistributedLeaderboardStore,
+	loadDistributedLeaderboard,
+	useDistributedLeaderboard,
+	type DistributedLeaderboardLive,
+	type DistributedLeaderboardOperation,
+	type DistributedLeaderboardSnapshot,
+	type DistributedLeaderboardStore,
+	type UseDistributedLeaderboardOptions
+} from './leaderboard.js';
+export {
 	distributedReloadLifecycle,
 	registerDistributedReloadClient,
 	validateDistributedReloadLocation,
@@ -24,6 +34,7 @@ export {
 	type DistributedBoundaryVariableSource,
 	type DistributedBoundaryVariableSources
 } from './boundary-variables.js';
+export type { DistributedSearchParamSource, DistributedSearchScalar } from './search-variables.js';
 export {
 	constant,
 	defineGraphqlIslandBindings,

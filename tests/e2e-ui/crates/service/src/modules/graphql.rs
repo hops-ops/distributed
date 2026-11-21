@@ -16,7 +16,7 @@ use crate::application::{
     DISTRIBUTED_ADMIN_CLIENT_SURFACE, DISTRIBUTED_CLIENT_SURFACE,
     DISTRIBUTED_PUBLIC_CLIENT_SURFACE, E2E_UI_APPLICATION, E2E_UI_MODULE_IDS,
 };
-use crate::modules::projections;
+use crate::modules::{identity, projections};
 
 // Stable only for this local copyable fixture. Real deployments must inject
 // their own per-deployment key rather than copying this development value.
@@ -50,6 +50,34 @@ pub(crate) fn build_graphql_engine_with_graphiql(
     change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
     graphiql: bool,
 ) -> Result<GraphqlEngine, String> {
+    build_engine(pool, service, identity, change_rx, graphiql, None)
+}
+
+pub(crate) fn build_graphql_engine_with_delivery(
+    pool: impl Into<GraphqlPoolSource>,
+    service: &Service,
+    identity: IdentityConfig,
+    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
+    versions: Option<distributed::graphql::delivery::GatewayVersionStore>,
+) -> Result<GraphqlEngine, String> {
+    build_engine(
+        pool,
+        service,
+        identity,
+        change_rx,
+        graphiql_enabled(),
+        versions,
+    )
+}
+
+fn build_engine(
+    pool: impl Into<GraphqlPoolSource>,
+    service: &Service,
+    identity: IdentityConfig,
+    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
+    graphiql: bool,
+    versions: Option<distributed::graphql::delivery::GatewayVersionStore>,
+) -> Result<GraphqlEngine, String> {
     let projections = projections::projection_owners();
     let mut b = GraphqlEngine::builder(pool)
         .protocol_token_key(E2E_PROTOCOL_TOKEN_KEY)
@@ -79,6 +107,9 @@ pub(crate) fn build_graphql_engine_with_graphiql(
         .graphiql(graphiql);
     if let Some(rx) = change_rx {
         b = b.change_stream(rx);
+    }
+    if let Some(versions) = versions {
+        b = b.gateway_versions(versions);
     }
     b.build().map_err(|e| e.to_string())
 }
@@ -158,7 +189,12 @@ pub fn application_manifest() -> ApplicationManifest {
     let modules = E2E_UI_MODULE_IDS
         .iter()
         .map(|module_id| {
-            let prefix = format!("{module_id}.");
+            // A module's commands are named `{module}.…`; the identity
+            // module's are named for their provider.
+            let prefix = match *module_id {
+                identity::MODULE_ID => identity::COMMAND_PREFIX.to_string(),
+                module_id => format!("{module_id}."),
+            };
             let definitions = commands
                 .iter()
                 .filter(|command| command.id.starts_with(&prefix))
@@ -589,7 +625,6 @@ mod client_surface_tests {
             .find(|projector| projector.name == "project_blob")
             .expect("Blob direct owner should be exported");
         assert!(owner.facts.is_empty());
-        assert!(!owner.causal_confirmation);
 
         let repository = InMemoryRepository::new();
         let service = build_service(

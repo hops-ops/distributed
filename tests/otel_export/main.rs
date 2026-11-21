@@ -21,11 +21,26 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use distributed::microsvc::{Context, Message, MessageKind, Routes, Service};
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::{
+    CausalCommandContext, HandlerError, Message, MessageKind, Routes, Service, TRANSPORT_ROLE,
+};
+use distributed::InMemoryRepository;
 use opentelemetry::propagation::{Extractor, TextMapPropagator as _};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
-use serde_json::{json, Value};
+use serde_json::Value;
+
+#[derive(Debug, serde::Deserialize, distributed::CommandInput)]
+struct CreateOrder {
+    #[allow(dead_code)] // the payload shape; the handler ignores it
+    id: String,
+}
+
+#[derive(Debug, serde::Serialize, distributed::CommandOutput)]
+struct OrderCreated {
+    ok: bool,
+}
 use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -38,14 +53,14 @@ const REMOTE_PARENT_SPAN_ID: &str = "00f067aa0ba902b7";
 
 #[tokio::test]
 async fn dispatch_span_reaches_collector_with_propagated_parent() {
-    let Some(endpoint) = env_support::broker_env(
+    let Some(endpoint) = env_support::require_service(
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         "otel collector export test",
     ) else {
         return;
     };
     let Some(traces_file) =
-        env_support::broker_env("OTEL_COLLECTOR_TRACES_FILE", "otel collector export test")
+        env_support::require_service("OTEL_COLLECTOR_TRACES_FILE", "otel collector export test")
     else {
         return;
     };
@@ -69,12 +84,21 @@ async fn dispatch_span_reaches_collector_with_propagated_parent() {
         tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
     let _guard = tracing::subscriber::set_default(subscriber);
 
+    let ledger = InMemoryRepository::new();
     let service = Arc::new(
         Service::new().named("otel-export").routes(
-            Routes::new()
-                .with_dependencies(())
-                .command("orders.create")
-                .handle(|_ctx: &Context<()>| async move { Ok(json!({"ok": true})) }),
+            // A bus-delivered command: it declares the transport role.
+            Routes::for_stores(ledger.clone(), ledger)
+                .typed_command(
+                    typed_command::<CreateOrder, Succeeded<OrderCreated>>("orders.create")
+                        .roles([TRANSPORT_ROLE]),
+                )
+                .handle(
+                    |_ctx: &CausalCommandContext<'_, ()>, _input: CreateOrder| async move {
+                        PreparedCommand::prepare(OrderCreated { ok: true })
+                            .map_err(|error| HandlerError::Other(Box::new(error)))
+                    },
+                ),
         ),
     );
     let message = Message::new(

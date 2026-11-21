@@ -17,7 +17,7 @@ const ROLE_MANIFEST: &str = r#"{
     "name": "user"
   },
   "schema_fingerprint": "sha256:758a97e4f7e1e538e8be86d24abd3d50a8da2d5813d29abd7a04bfa092d05189",
-  "protocol_fingerprint": "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782",
+  "protocol_fingerprint": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
   "execution": {
     "max_depth": 8,
     "max_complexity": 500,
@@ -383,6 +383,53 @@ fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
+fn literal_text_search_generates_a_typed_load_island() {
+    let project = project_dir("client-literal-text");
+    fs::write(
+        project.join("client-manifest.json"),
+        ROLE_MANIFEST
+            .replace("\"_ilike\"", "\"_ilike\", \"_icontains\"")
+            // Adding a filter changes the selected schema contract.
+            .replace(
+                "sha256:758a97e4f7e1e538e8be86d24abd3d50a8da2d5813d29abd7a04bfa092d05189",
+                "sha256:9143345e62737d38ed28e997fd76f434b18ae6b9c794b2c06477d1879fcfc136",
+            ),
+    )
+    .unwrap();
+    write_document(
+        &project,
+        "queries/search.graphql",
+        r#"
+        query SearchTodos($q: String! = "") @load {
+            todos(where: {title: {_icontains: $q}}, limit: 20) { id title }
+        }
+    "#,
+    );
+    assert_success(
+        &generate(&project, "queries/*.graphql", &[]),
+        "literal search generation",
+    );
+    assert_success(
+        &generate(&project, "queries/*.graphql", &["--check"]),
+        "literal search drift check",
+    );
+    let inventory = fs::read_to_string(project.join("generated/islands.json")).unwrap();
+    assert!(inventory.contains("SearchTodos"));
+    assert!(inventory.contains("\"load\": true"));
+    assert!(inventory.contains("String!"));
+    write_document(
+        &project,
+        "queries/search.graphql",
+        r#"
+        query SearchTodos { todos(where: {title: {_icontains: 1}}) { id } }
+    "#,
+    );
+    assert!(!generate(&project, "queries/*.graphql", &[])
+        .status
+        .success());
+}
+
+#[test]
 fn generate_then_check_accepts_the_exact_artifact_tree() {
     let project = project_dir("client-generate-check");
     write_document(&project, "queries/todos.graphql", TODOS_QUERY);
@@ -584,7 +631,7 @@ fn unmatched_document_glob_fails_before_creating_output() {
 
 #[test]
 fn component_load_intent_remains_framework_neutral_outside_route_conventions() {
-	let project = project_dir("client-component-load");
+    let project = project_dir("client-component-load");
     write_document(&project, "queries/todos.graphql", LOAD_TODOS_QUERY);
 
     let unplaced = generate(&project, "queries/*.graphql", &[]);
@@ -596,10 +643,10 @@ fn component_load_intent_remains_framework_neutral_outside_route_conventions() {
         "unplaced component island must retain its load intent for the adapter"
     );
 
-	assert!(
-		!project.join("generated/routes.ts").exists(),
-		"the framework-neutral compiler must not invent adapter route ownership"
-	);
+    assert!(
+        !project.join("generated/routes.ts").exists(),
+        "the framework-neutral compiler must not invent adapter route ownership"
+    );
 }
 
 #[test]

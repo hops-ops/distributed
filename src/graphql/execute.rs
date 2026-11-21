@@ -11,15 +11,27 @@ use super::compile::{BindValue, ExtractedQueryEvidence, SqlDialect, SqlPlan};
 use super::engine::{EngineInner, GraphqlPool};
 
 pub async fn execute_sql(inner: &EngineInner, plan: &SqlPlan) -> Result<Value, String> {
-    match &inner.pool {
+    execute_sql_on_pool(inner, &inner.pool, true, plan).await
+}
+
+pub(crate) async fn execute_sql_on_pool(
+    inner: &EngineInner,
+    pool: &GraphqlPool,
+    primary: bool,
+    plan: &SqlPlan,
+) -> Result<Value, String> {
+    let _ = primary;
+    match pool {
         #[cfg(feature = "sqlite")]
         GraphqlPool::Sqlite(pool) => execute_sqlite(pool, plan, inner.statement_timeout)
             .await
             .map(|executed| executed.value),
         #[cfg(feature = "postgres")]
-        GraphqlPool::Postgres(pool) => execute_postgres(pool, plan, inner.statement_timeout)
-            .await
-            .map(|executed| executed.value),
+        GraphqlPool::Postgres(pool) => {
+            execute_postgres(pool, plan, inner.statement_timeout, primary)
+                .await
+                .map(|executed| executed.value)
+        }
         #[allow(unreachable_patterns)]
         _ => Err("no database pool available for GraphQL execution".into()),
     }
@@ -118,7 +130,6 @@ where
 fn decode_sqlite_value(text: String, plan: &SqlPlan) -> Result<ExecutedSql, String> {
     let mut json: JsonValue =
         serde_json::from_str(&text).map_err(|e| format!("json decode: {e}"))?;
-    deep_parse_json_strings(&mut json);
     rewrite_hex_bytes(&mut json, &plan.bytes_hex_paths);
     finish_executed_value(json, plan)
 }
@@ -165,45 +176,12 @@ mod statement_timeout_tests {
     }
 }
 
-/// Parse string-encoded JSON only for array elements (SQLite json_group_array
-/// quirk). Object property strings stay GraphQL String scalars (never re-typed).
-fn deep_parse_json_strings(value: &mut JsonValue) {
-    match value {
-        JsonValue::Array(items) => {
-            for item in items {
-                if let JsonValue::String(s) = item {
-                    let trimmed = s.trim();
-                    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
-                        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
-                    {
-                        if let Ok(mut parsed) = serde_json::from_str::<JsonValue>(s) {
-                            deep_parse_json_strings(&mut parsed);
-                            *item = parsed;
-                        }
-                    }
-                } else {
-                    deep_parse_json_strings(item);
-                }
-            }
-        }
-        JsonValue::Object(map) => {
-            for v in map.values_mut() {
-                match v {
-                    JsonValue::Object(_) | JsonValue::Array(_) => deep_parse_json_strings(v),
-                    // Leave scalar strings alone (including JSON-looking text columns).
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
 #[cfg(feature = "postgres")]
 async fn execute_postgres(
     pool: &sqlx::PgPool,
     plan: &SqlPlan,
     timeout: std::time::Duration,
+    primary: bool,
 ) -> Result<ExecutedSql, String> {
     let mut tx = pool
         .begin()
@@ -217,6 +195,7 @@ async fn execute_postgres(
     .await
     .map_err(|e| format!("statement_timeout: {e}"))?;
 
+    ensure_primary_backend(&mut tx, primary).await?;
     let value = fetch_postgres_value(&mut *tx, plan).await?;
     tx.commit()
         .await
@@ -330,4 +309,25 @@ pub fn dialect_name(d: SqlDialect) -> &'static str {
         SqlDialect::Postgres => "postgres",
         SqlDialect::Sqlite => "sqlite",
     }
+}
+
+/// Check the actual transaction connection, not another pool checkout. This
+/// detects a physical standby misbound/switched into the primary slot; it does
+/// not claim a general timeline or WAL replay routing implementation.
+#[cfg(feature = "postgres")]
+pub(crate) async fn ensure_primary_backend(
+    connection: &mut sqlx::PgConnection,
+    primary: bool,
+) -> Result<(), String> {
+    #[cfg(feature = "gateway-delivery")]
+    if primary
+        && sqlx::query_scalar::<_, bool>("SELECT pg_is_in_recovery()")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|e| format!("primary validation: {e}"))?
+    {
+        return Err("authoritative primary is unavailable".into());
+    }
+    let _ = (connection, primary);
+    Ok(())
 }

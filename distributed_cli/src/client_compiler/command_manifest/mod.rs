@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-mod confirmations;
 mod effects;
+mod projectors;
 mod protocol;
 mod shape;
 mod support;

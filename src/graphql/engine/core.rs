@@ -164,12 +164,8 @@ pub(crate) struct CatalogEntry {
 }
 
 #[derive(Clone)]
-pub(crate) struct RoleModelPerm {
-    pub permission: ReadPermission,
-}
-
-#[derive(Clone)]
 pub(crate) struct ProtocolSurfaceInfo {
+    pub(crate) export: DistributedClientSurfaceExport,
     pub(crate) schema_fingerprint: String,
     pub(crate) protocol_fingerprint: String,
     pub(crate) trusted_presets: Vec<ClientTrustedPresetDescriptor>,
@@ -204,7 +200,7 @@ pub(crate) struct ProtocolApplicationInfo {
 /// opened surface's privilege pack rather than a session primary role.
 #[derive(Clone, Debug)]
 pub struct ExecutionAuthority {
-    /// Role pack key for `permissions` / `schemas` / `role_surfaces`.
+    /// Role pack key for `schemas` / `role_surfaces`.
     pub privilege_role: String,
     /// Asserted identity set (`x-roles`).
     pub asserted_roles: Vec<String>,
@@ -229,11 +225,16 @@ pub(crate) struct EngineInner {
     /// opt in with [`GraphqlEngineBuilder::service_id`].
     pub service_id: Option<String>,
     pub command_binding: Option<TypedServiceCommandBinding>,
+    /// The bound service's gate: closed, the engine refuses mutations.
+    pub lifecycle: crate::microsvc::LifecycleGate,
     pub causal_storage_identity: Option<crate::command_ledger::CausalStorageIdentity>,
     pub pool: GraphqlPool,
+    #[cfg(feature = "gateway-delivery")]
+    pub read_routing: Option<super::ReadRouting>,
+    #[cfg(feature = "gateway-delivery")]
+    pub gateway_versions: Option<crate::graphql::delivery::GatewayVersionStore>,
     pub catalog: BTreeMap<String, CatalogEntry>,
     pub by_table: BTreeMap<String, String>,
-    pub permissions: BTreeMap<(String, String), RoleModelPerm>,
     pub roles: BTreeSet<String>,
     pub anonymous_role: String,
     pub default_limit: u64,
@@ -261,14 +262,39 @@ pub(crate) struct EngineInner {
     pub graphiql_schemas: HashMap<String, async_graphql::dynamic::Schema>,
     pub change_hub: crate::graphql::subscribe::ChangeHub,
     pub dialect: SqlDialect,
-    /// Identity mode for HTTP session construction (see `identity` module).
-    pub identity: IdentityConfig,
-    pub(crate) identity_validator: Option<OidcValidator>,
+    /// How HTTP and WebSocket requests become sessions (see `identity` module).
+    pub(crate) identity: IdentityResolver,
+    pub(crate) websocket: WebsocketLimits,
     pub(crate) protocol: Option<ProtocolRuntime>,
     pub(crate) query_protocol: QueryProtocolRuntime,
     pub(crate) read_stores: BTreeMap<String, crate::graphql::read_store::ReadStoreKind>,
     pub(crate) cell_getters:
         BTreeMap<String, std::sync::Arc<dyn crate::graphql::read_store::CellByKeyGetter>>,
+    /// Leaderboard stores by surface name ([`GraphqlEngineBuilder::leaderboard`]).
+    pub(crate) leaderboard_stores: BTreeMap<String, Arc<dyn crate::leaderboard::LeaderboardStore>>,
+}
+
+/// Bounds on one origin GraphQL WebSocket connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebsocketLimits {
+    /// A connection is closed after this long, or when the bearer token it
+    /// authenticated with expires, whichever comes first.
+    pub max_lifetime: Duration,
+    /// A connection that sends nothing (not even a pong to the server's
+    /// pings) for this long is closed.
+    pub idle_timeout: Duration,
+    /// Subscriptions one connection may hold open at once.
+    pub max_live_queries: usize,
+}
+
+impl Default for WebsocketLimits {
+    fn default() -> Self {
+        Self {
+            max_lifetime: Duration::from_secs(12 * 60 * 60),
+            idle_timeout: Duration::from_secs(60),
+            max_live_queries: 100,
+        }
+    }
 }
 
 pub struct GraphqlEngine {
@@ -292,11 +318,17 @@ pub struct GraphqlEngineBuilder {
     pub(crate) protocol_namespace: Option<String>,
     pub(crate) client_applications: BTreeMap<String, ClientApplicationRegistration>,
     pub(crate) command_binding: Option<TypedServiceCommandBinding>,
+    pub(crate) lifecycle: crate::microsvc::LifecycleGate,
     pub(crate) causal_storage_identity: Option<crate::command_ledger::CausalStorageIdentity>,
     pub(crate) pool: GraphqlPool,
+    #[cfg(feature = "gateway-delivery")]
+    pub(crate) read_routing: Option<super::ReadRouting>,
+    #[cfg(feature = "gateway-delivery")]
+    pub(crate) gateway_versions: Option<crate::graphql::delivery::GatewayVersionStore>,
     pub(crate) catalog: BTreeMap<String, CatalogEntry>,
     pub(crate) by_table: BTreeMap<String, String>,
-    pub(crate) permissions: BTreeMap<(String, String), RoleModelPerm>,
+    /// Authored grants: role → model → permission.
+    pub(crate) permissions: BTreeMap<String, BTreeMap<String, ReadPermission>>,
     pub(crate) roles: Option<BTreeSet<String>>,
     pub(crate) anonymous_role: String,
     pub(crate) default_limit: u64,
@@ -309,10 +341,16 @@ pub struct GraphqlEngineBuilder {
     pub(crate) introspection_for_anonymous: bool,
     pub(crate) statement_timeout: Duration,
     pub(crate) graphiql: bool,
+    pub(crate) subscriptions: bool,
     pub(crate) typed_commands: TypedCommandInventory,
     pub(crate) projectors: Vec<SurfaceProjectionOwner>,
     pub(crate) change_rx: Option<tokio::sync::broadcast::Receiver<ReadModelChange>>,
     pub(crate) pending_errors: Vec<String>,
-    pub(crate) identity: IdentityConfig,
+    pub(crate) identity: Option<IdentityConfig>,
+    pub(crate) websocket: WebsocketLimits,
     pub(crate) read_stores: BTreeMap<String, crate::graphql::read_store::ReadStore>,
+    pub(crate) leaderboards: Vec<(
+        crate::graphql::surface::LeaderboardSurface,
+        Arc<dyn crate::leaderboard::LeaderboardStore>,
+    )>,
 }

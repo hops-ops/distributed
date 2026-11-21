@@ -161,10 +161,7 @@ fn flatten_value(
         Value::String(text) if text.len() > MAX_SNAPSHOT_VALUE_BYTES => {
             out.insert(
                 prefix.to_string(),
-                Value::String(format!(
-                    "<redacted:string:len={}>",
-                    text.len()
-                )),
+                Value::String(format!("<redacted:string:len={}>", text.len())),
             );
         }
         other => {
@@ -243,10 +240,7 @@ mod tests {
         .unwrap();
         let changes = diff_snapshots(&left, &drifted).changes;
         assert_eq!(changes.len(), 1);
-        assert_eq!(
-            changes[0].path,
-            "models.TodoView.fields.title.nullable"
-        );
+        assert_eq!(changes[0].path, "models.TodoView.fields.title.nullable");
         assert_eq!(changes[0].before, Some(json!(false)));
         assert_eq!(changes[0].after, Some(json!(true)));
     }

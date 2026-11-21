@@ -143,6 +143,17 @@ pub fn build_role_schema(
         }
     }
 
+    // Leaderboard roots granted to this role (resolved by their stores).
+    let (with_leaderboards, leaderboard_entry) =
+        super::leaderboard_roots::add_query_roots(query, role_surface);
+    query = with_leaderboards;
+    if leaderboard_entry {
+        registered_objects.insert(
+            super::surface::LEADERBOARD_ENTRY_TYPE.to_string(),
+            super::leaderboard_roots::entry_object(),
+        );
+    }
+
     // Comparison input types come from this exact role Surface instance.
     // Only register when IR lists ops — never emit empty input objects.
     for scalar in &scalars_needed {
@@ -178,7 +189,7 @@ pub fn build_role_schema(
 
     // Empty-role Query must still define ≥1 field (async-graphql requirement).
     // Spec: empty role → FORBIDDEN with extensions.code (no query surface).
-    if role_surface.query_fields.is_empty() && !has_causal_commands {
+    if role_surface.query_fields.is_empty() && !leaderboard_entry && !has_causal_commands {
         query = query.field(Field::new(
             "_empty",
             TypeRef::named_nn(TypeRef::BOOLEAN),
@@ -270,16 +281,39 @@ pub fn build_role_schema(
                         .unwrap_or_else(Session::new);
                     let authority = ctx.data_opt::<ExecutionAuthority>().cloned();
                     let protocol = ctx.data_opt::<ProtocolResponseAccumulator>().cloned();
+                    #[cfg(feature = "gateway-delivery")]
+                    let captured = ctx.data_opt::<super::delivery::PlanCapture>().cloned();
                     let selection = compile::selection_from_field(ctx.field());
                     SubscriptionFieldFuture::new(async move {
                         let inner = inner.ok_or_else(|| {
                             async_graphql::Error::new("GraphqlEngine not in request data")
                         })?;
-                        let role = privilege_role_for_request(
-                            authority.as_ref(),
-                            &session,
-                            &inner.anonymous_role,
-                        );
+                        let role = execution_privilege(authority.as_ref())?;
+                        #[cfg(feature = "gateway-delivery")]
+                        if let Some(captured) = captured {
+                            let plan = compile::compile_query(
+                                &inner,
+                                &session,
+                                &role,
+                                &model,
+                                compile::RootKind::List,
+                                &selection,
+                            )
+                            .map_err(async_graphql::Error::new)?;
+                            if let compile::QueryPlan::Sql(plan) = plan {
+                                captured
+                                    .0
+                                    .lock()
+                                    .map_err(|_| {
+                                        async_graphql::Error::new("plan capture unavailable")
+                                    })?
+                                    .push(plan);
+                                return Err(async_graphql::Error::new(super::delivery::CAPTURED));
+                            }
+                            return Err(async_graphql::Error::new(
+                                "query is ineligible for delivery reuse",
+                            ));
+                        }
                         let stream = super::subscribe::live_query_stream(
                             inner, session, role, model, selection, protocol,
                         )
@@ -293,6 +327,13 @@ pub fn build_role_schema(
         );
         subscription = subscription.field(field);
         has_subscription = true;
+    }
+
+    if role_surface.subscriptions {
+        let (with_leaderboards, added) =
+            super::leaderboard_roots::add_subscription_roots(subscription, role_surface);
+        subscription = with_leaderboards;
+        has_subscription |= added > 0;
     }
 
     let mut builder = if let Some(m) = mutation {
@@ -666,14 +707,6 @@ fn passthrough_key(
     let Some(value) = ctx.parent_value.as_value() else {
         return Ok(None);
     };
-    // Nested JSON may arrive as a string (SQLite json_group_array quirk).
-    if let Value::String(s) = value {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-            if let Ok(v) = Value::from_json(parsed) {
-                return Ok(lookup_key(&v, key));
-            }
-        }
-    }
     Ok(lookup_key(value, key))
 }
 
@@ -751,11 +784,25 @@ async fn resolve_root(
         .cloned()
         .unwrap_or_else(Session::new);
     let authority = ctx.data_opt::<ExecutionAuthority>();
-    let role = privilege_role_for_request(authority, &session, &inner.anonymous_role);
+    let role = execution_privilege(authority)?;
 
     let selection = compile::selection_from_field(ctx.field());
     let plan = compile::compile_query(&inner, &session, &role, model, kind, &selection)
-        .map_err(|e| client_error("BAD_REQUEST", sanitize_compile_error(&e)))?;
+        .map_err(|e| compile_client_error(&e))?;
+    #[cfg(feature = "gateway-delivery")]
+    if let Some(captured) = ctx.data_opt::<super::delivery::PlanCapture>() {
+        if let QueryPlan::Sql(plan) = plan {
+            let mut plans = captured
+                .0
+                .lock()
+                .map_err(|_| client_error("INTERNAL", "plan capture unavailable"))?;
+            plans.push(plan);
+            return Err(async_graphql::Error::new(super::delivery::CAPTURED));
+        }
+        return Err(async_graphql::Error::new(
+            "query is ineligible for delivery reuse",
+        ));
+    }
     let value = match plan {
         QueryPlan::CellByKey {
             model,
@@ -765,12 +812,19 @@ async fn resolve_root(
             .await
             .map_err(|_| client_error("INTERNAL", "cell read dependency failed"))?,
         QueryPlan::Sql(plan) => {
+            let (pool, primary) = (&inner.pool, true);
+            #[cfg(feature = "gateway-delivery")]
+            let (pool, primary) = ctx
+                .data_opt::<super::engine::read_routing::ReadRequest>()
+                .map_or((pool, primary), |read| read.pool(&inner, &plan));
             if let Some(protocol) = ctx.data_opt::<ProtocolResponseAccumulator>().cloned() {
                 let role_surface = inner.role_surfaces.get(&role).cloned().ok_or_else(|| {
                     client_error("INTERNAL", "authorized GraphQL role surface is unavailable")
                 })?;
                 let executed = super::query_protocol::execute_query_with_protocol(
                     &inner,
+                    pool,
+                    primary,
                     role_surface,
                     protocol.clone(),
                     &plan,
@@ -783,7 +837,7 @@ async fn resolve_root(
                     .map_err(|_| client_error("INTERNAL", "query evidence encoding failed"))?;
                 executed.value
             } else {
-                super::engine::execute_plan(&inner, &plan)
+                super::execute::execute_sql_on_pool(&inner, pool, primary, &plan)
                     .await
                     .map_err(|e| client_error_for_execute_err(&e))?
             }
@@ -798,21 +852,16 @@ async fn resolve_root(
     }
 }
 
-/// Privilege pack for SQL grants: surface execution authority, else anonymous.
-fn privilege_role_for_request(
+/// The privilege pack the engine authorized this request to execute under.
+///
+/// `GraphqlEngine` injects it on every entry point. A request without one was
+/// never authorized, so it does not run under a guessed role.
+pub(crate) fn execution_privilege(
     authority: Option<&ExecutionAuthority>,
-    session: &Session,
-    anonymous_role: &str,
-) -> String {
-    if let Some(authority) = authority {
-        return authority.privilege_role.clone();
-    }
-    // Fallback for schema unit tests that execute without engine request data.
-    session
-        .roles()
-        .first()
-        .map(|role| (*role).to_string())
-        .unwrap_or_else(|| anonymous_role.to_string())
+) -> Result<String, async_graphql::Error> {
+    authority
+        .map(|authority| authority.privilege_role.clone())
+        .ok_or_else(|| client_error("INTERNAL", "request has no execution authority"))
 }
 
 /// Closed set of engine-authored GraphQL `extensions.code` values (v1 freeze).
@@ -829,6 +878,7 @@ pub const ENGINE_ERROR_CODES: &[&str] = &[
     "COMMAND_ID_REUSE",
     "COMMAND_IN_PROGRESS",
     "COMMAND_EXPIRED",
+    "CONCURRENT_WRITE", // command mutations; nothing committed, retry
 ];
 
 /// Map executor error strings to stable client errors (`extensions.code`).
@@ -837,6 +887,16 @@ pub(crate) fn client_error_for_execute_err(e: &str) -> async_graphql::Error {
         client_error("TIMEOUT", "statement timeout")
     } else {
         client_error("INTERNAL", "internal error")
+    }
+}
+
+/// A compile failure as the client sees it: a schema/compiler disagreement
+/// is the server's fault, anything else the request's.
+fn compile_client_error(e: &str) -> async_graphql::Error {
+    if e.starts_with("internal:") {
+        client_error("INTERNAL", "internal error")
+    } else {
+        client_error("BAD_REQUEST", sanitize_compile_error(e))
     }
 }
 
@@ -870,7 +930,7 @@ fn sanitize_compile_error(e: &str) -> String {
     }
 }
 
-fn client_error(code: &str, message: impl Into<String>) -> async_graphql::Error {
+pub(crate) fn client_error(code: &str, message: impl Into<String>) -> async_graphql::Error {
     use async_graphql::ErrorExtensions;
     let code = code.to_string();
     async_graphql::Error::new(message.into()).extend_with(move |_, ext| {
@@ -912,6 +972,7 @@ mod execute_err_mapping_tests {
                 "COMMAND_ID_REUSE",
                 "COMMAND_IN_PROGRESS",
                 "COMMAND_EXPIRED",
+                "CONCURRENT_WRITE",
             ]
         );
     }
@@ -1139,8 +1200,8 @@ mod causal_command_schema_tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::command::CommandConsistency;
     use crate::command_dispatch::{LocalCommandHost, SharedCommandHost};
-    use crate::graphql::command_contract::{CommandConsistency, CommandEffects};
     use crate::graphql::protocol::{
         DistributedEnvelopeV1, ProtocolResponseAccumulator, ProtocolTokenCodec,
         ProtocolTokenPurpose,
@@ -1173,6 +1234,7 @@ mod causal_command_schema_tests {
                 input: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoInput".into(),
                     fields: vec![SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -1184,6 +1246,7 @@ mod causal_command_schema_tests {
                 output: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoPayload".into(),
                     fields: vec![SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -1194,17 +1257,15 @@ mod causal_command_schema_tests {
                 }),
                 consistency: CommandConsistency::Succeeded,
                 input_defaults: Vec::new(),
-                effects: Some(CommandEffects::revalidate()),
-                confirmations: Vec::new(),
                 projected_model: None,
                 direct_projection: None,
                 projections: Default::default(),
-                confirmation_unavailable: false,
             }],
             commands_attached: true,
             projectors: Vec::new(),
             projectors_attached: false,
             service_binding: None,
+            leaderboards: Vec::new(),
         }
     }
 

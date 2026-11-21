@@ -81,7 +81,7 @@ function distributedEnvelope() {
 			observations: []
 		},
 		live: {
-			supported: true,
+			mode: "resumable",
 			reset: false,
 			cursors: [
 				{
@@ -102,6 +102,22 @@ function responseExtensions() {
 		distributed: distributedEnvelope()
 	};
 }
+
+test('unsigned trusted presets accept only exact bounded integers', () => {
+	for (const [codec, maximum] of [['uint8', 255], ['uint16', 65_535],
+		['uint32', 4_294_967_295], ['uint64_safe_integer', Number.MAX_SAFE_INTEGER]]) {
+		for (const value of [0, 1, maximum]) {
+			const envelope = distributedEnvelope();
+			envelope.trustedPresets = [{ name: 'revision', codec, value }];
+			assert.equal(parseDistributedProtocolEnvelope(envelope).trustedPresets[0].value, value);
+		}
+		for (const value of [-1, -0, 1.5, NaN, Infinity, maximum + 1, '1', 1n]) {
+			const envelope = distributedEnvelope();
+			envelope.trustedPresets = [{ name: 'revision', codec, value }];
+			assert.throws(() => parseDistributedProtocolEnvelope(envelope), DistributedProtocolError);
+		}
+	}
+});
 
 test('protocol parser validates receipts while retaining future metadata opaquely', () => {
 	assert.deepEqual(COMMAND_CONSISTENCY, {
@@ -237,7 +253,7 @@ test('protocol parser requires exact live snapshot alignment', () => {
 			parseDistributedProtocolEnvelope({
 				...envelope,
 				snapshot: undefined,
-				live: { supported: false, reset: true, cursors: [] }
+				live: { mode: "snapshot", reset: true, cursors: [] }
 			}),
 		(error) =>
 			error instanceof DistributedProtocolError &&
@@ -253,7 +269,7 @@ test('protocol parser requires exact live snapshot alignment', () => {
 					indexes: [],
 					observations: []
 				},
-				live: { supported: true, reset: true, cursors: [] }
+				live: { mode: "resumable", reset: true, cursors: [] }
 			}),
 		(error) =>
 			error instanceof DistributedProtocolError &&
@@ -333,6 +349,28 @@ test('protocol parser requires exact live snapshot alignment', () => {
 	}
 });
 
+test('snapshot delivery requires an explicit cursorless reset and fails closed on old modes', () => {
+	const base = distributedEnvelope();
+	const envelope = {
+		...base,
+		snapshot: { ...base.snapshot, indexesComparable: false, indexes: [], observations: [] },
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	};
+	assert.equal(parseDistributedProtocolEnvelope(envelope).live.mode, 'snapshot');
+	for (const live of [
+		{ supported: false, reset: true, cursors: [] },
+		{ ...envelope.live, supported: false },
+		{ ...envelope.live, mode: 'unknown' },
+		{ ...envelope.live, reset: false },
+		{ ...envelope.live, cursors: base.live.cursors }
+	]) {
+		assert.throws(() => parseDistributedProtocolEnvelope({ ...envelope, live }), DistributedProtocolError);
+	}
+	assert.throws(() => parseDistributedProtocolEnvelope({
+		...envelope, snapshot: base.snapshot
+	}), DistributedProtocolError);
+});
+
 test('protocol parser accepts 64 resume cursors and rejects 65', () => {
 	const cursors = Array.from({ length: 65 }, (_, index) => ({
 		projection: `projection-${index}`,
@@ -349,7 +387,7 @@ test('protocol parser accepts 64 resume cursors and rejects 65', () => {
 	const accepted = parseDistributedProtocolEnvelope({
 		...envelope,
 		snapshot: { ...envelope.snapshot, indexes: indexes.slice(0, 64) },
-		live: { supported: true, reset: false, cursors: cursors.slice(0, 64) }
+		live: { mode: "resumable", reset: false, cursors: cursors.slice(0, 64) }
 	});
 	assert.equal(accepted.live.cursors.length, 64);
 	assert.equal(accepted.snapshot.indexes.length, 64);
@@ -358,7 +396,7 @@ test('protocol parser accepts 64 resume cursors and rejects 65', () => {
 		() =>
 			parseDistributedProtocolEnvelope({
 				...envelope,
-				live: { supported: true, reset: false, cursors }
+				live: { mode: "resumable", reset: false, cursors }
 			}),
 		(error) =>
 			error instanceof DistributedProtocolError &&
@@ -369,7 +407,7 @@ test('protocol parser accepts 64 resume cursors and rejects 65', () => {
 			parseDistributedProtocolEnvelope({
 				...envelope,
 				snapshot: { ...envelope.snapshot, indexes },
-				live: { supported: false, reset: true, cursors: [] }
+				live: { mode: "snapshot", reset: true, cursors: [] }
 			}),
 		(error) =>
 			error instanceof DistributedProtocolError &&

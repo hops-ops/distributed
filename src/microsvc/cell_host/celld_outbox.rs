@@ -1,15 +1,25 @@
 //! High-level celld Queue drain lifecycle for aggregate-cell outboxes.
 
-use std::fmt;
+#[cfg(any(target_arch = "wasm32", test))]
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
+#[cfg(any(target_arch = "wasm32", test))]
+use std::time::SystemTime;
 
-use worker::{Env, Storage};
+use worker::Env;
+#[cfg(target_arch = "wasm32")]
+use worker::Storage;
 
+#[cfg(any(target_arch = "wasm32", test))]
 use super::cell::AggregateCell;
-use super::store::DurableAggregateCellState;
+#[cfg(any(target_arch = "wasm32", test))]
 use crate::bus::MessagePublisher;
 use crate::bus::{CelldQueuePublisher, TransportError};
 use crate::outbox_worker::OutboxDispatchOutcome;
+#[cfg(any(target_arch = "wasm32", test))]
 use crate::Aggregate;
 
 /// Conventional celld Queue producer binding for aggregate outboxes.
@@ -25,8 +35,7 @@ pub const CELLD_OUTBOX_DEFAULT_LEASE: Duration = Duration::from_secs(30);
 /// Default publish-failure ceiling before an outbox row is terminal.
 pub const CELLD_OUTBOX_DEFAULT_MAX_ATTEMPTS: u32 = 10_000;
 
-/// Result of persisting an aggregate-cell commit and attempting its immediate
-/// celld Queue drain.
+/// Result of attempting the Queue drain after an aggregate-cell commit.
 ///
 /// Once the aggregate state, outbox rows, and watchdog alarm are durable, the
 /// command is accepted. Failures after that boundary are reported in
@@ -42,6 +51,18 @@ pub struct CelldOutboxDrainOutcome {
     pub deferred: Vec<TransportError>,
 }
 
+/// Result of one Durable Object alarm wake ([`AggregateCell::alarm`]).
+///
+/// [`AggregateCell::alarm`]: super::AggregateCell
+#[must_use = "inspect fired alarms and deferred drain diagnostics"]
+#[derive(Debug, Default)]
+pub struct CelldAlarmOutcome {
+    /// Domain alarms fired, retried or failed by this wake.
+    pub schedules: crate::schedule::ScheduleFireReport,
+    /// The outbox drain that followed.
+    pub drain: CelldOutboxDrainOutcome,
+}
+
 impl CelldOutboxDrainOutcome {
     /// Whether the durable watchdog still owns work from this drain attempt.
     pub fn is_deferred(&self) -> bool {
@@ -52,8 +73,8 @@ impl CelldOutboxDrainOutcome {
 /// celld Queue binding and drain policy attached to an [`AggregateCell`].
 ///
 /// Domain aggregates remain transport-independent. The infrastructure-facing
-/// cell host selects this binding once, then [`AggregateCell::persist_and_drain_outbox`]
-/// owns the persist → watchdog → publish → settle → persist lifecycle.
+/// cell host selects this binding once. Dispatch arms the watchdog before
+/// invoking a command; draining publishes and deletes leased SQLite rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CelldOutbox {
     binding: String,
@@ -160,67 +181,102 @@ impl CelldOutbox {
         self.max_attempts
     }
 
-    pub(crate) async fn persist_and_drain<A, F, E>(
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn drain<A>(
         &self,
         cell: &AggregateCell<A>,
         env: &Env,
         storage: &Storage,
-        persist: F,
+        next_alarm: Option<SystemTime>,
     ) -> Result<CelldOutboxDrainOutcome, TransportError>
     where
         A: Aggregate + Send + Sync + 'static,
-        F: Fn(&DurableAggregateCellState) -> Result<(), E>,
-        E: fmt::Display,
     {
-        let alarm = WorkerAlarm(storage);
-        self.persist_and_drain_with(
+        self.drain_with(
             cell,
             || CelldQueuePublisher::from_env(env, &self.binding),
-            &alarm,
-            persist,
+            &WorkerAlarm(storage),
+            crate::time::now(),
+            next_alarm,
         )
         .await
     }
 
-    async fn persist_and_drain_with<A, P, PF, F, E, W>(
+    /// The one Durable Object alarm slot is shared by this watchdog and the
+    /// cell's domain alarms. Every write targets the earliest due time, so a
+    /// watchdog rearm never postpones a domain alarm and a far domain alarm
+    /// never postpones a drain. Returns `false` (and leaves the slot alone:
+    /// never delete an alarm) when neither wants a wake.
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(super) async fn schedule<W: CelldOutboxAlarm>(
+        &self,
+        alarm: &W,
+        now: SystemTime,
+        watchdog: bool,
+        next_alarm: Option<SystemTime>,
+    ) -> Result<bool, TransportError> {
+        let watchdog = watchdog.then(|| now + self.drain_interval);
+        let target = match (watchdog, next_alarm) {
+            (Some(watchdog), Some(domain)) => Some(watchdog.min(domain)),
+            (watchdog, domain) => watchdog.or(domain),
+        };
+        match target {
+            Some(target) => {
+                alarm.set(target, now).await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(super) async fn begin_command<W: CelldOutboxAlarm>(
+        &self,
+        activity: &CommandActivity,
+        alarm: &W,
+        now: SystemTime,
+        next_alarm: Option<SystemTime>,
+    ) -> Result<CommandGuard, TransportError> {
+        // Count the command before yielding to setAlarm. An alarm firing while
+        // this command is suspended must keep the next wake scheduled.
+        let guard = activity.enter()?;
+        self.schedule(alarm, now, true, next_alarm).await?;
+        Ok(guard)
+    }
+
+    #[cfg(any(target_arch = "wasm32", test))]
+    async fn drain_with<A, P, PF, W>(
         &self,
         cell: &AggregateCell<A>,
         publisher: PF,
         alarm: &W,
-        persist: F,
+        now: SystemTime,
+        next_alarm: Option<SystemTime>,
     ) -> Result<CelldOutboxDrainOutcome, TransportError>
     where
         A: Aggregate + Send + Sync + 'static,
         P: MessagePublisher,
         PF: FnOnce() -> Result<P, TransportError>,
-        F: Fn(&DurableAggregateCellState) -> Result<(), E>,
-        E: fmt::Display,
         W: CelldOutboxAlarm,
     {
-        persist_current_state(cell, &persist)?;
-
-        if !has_pending(cell)? {
-            let deferred = alarm.clear().await.err().into_iter().collect();
-            return Ok(CelldOutboxDrainOutcome {
-                dispatch: OutboxDispatchOutcome::default(),
-                deferred,
-            });
+        let pending = has_pending(cell).await?;
+        let watchdog = pending || cell.command_activity().is_active();
+        // Arm before Queue I/O, including during an alarm invocation. A crash
+        // after Queue acceptance but before deletion retries the stable event
+        // ID. With no outbox work and no domain alarm, never delete an alarm:
+        // doing so can erase a concurrent command's prearmed wake. The last
+        // scheduled alarm simply finds no work.
+        self.schedule(alarm, now, watchdog, next_alarm).await?;
+        if !pending {
+            return Ok(CelldOutboxDrainOutcome::default());
         }
-
-        // The watchdog is durable before Queue egress. If Queue accepts but
-        // settlement persistence is interrupted, the stable id is retried.
-        alarm.arm(self.drain_interval).await?;
-
-        // Binding resolution is deliberately after the state commit and armed
-        // watchdog. A missing/misconfigured Queue cannot make the aggregate
-        // mutation disappear; the alarm retries after the deployment is fixed.
         let publisher = match publisher() {
             Ok(publisher) => publisher,
             Err(error) => {
                 return Ok(CelldOutboxDrainOutcome {
                     dispatch: OutboxDispatchOutcome::default(),
                     deferred: vec![error],
-                });
+                })
             }
         };
         let dispatcher = cell.outbox_dispatcher(
@@ -229,198 +285,181 @@ impl CelldOutbox {
             self.lease,
             self.max_attempts,
         );
-        let (dispatch, mut deferred) = match dispatcher.dispatch_batch(self.batch_size).await {
-            Ok(dispatch) => (dispatch, Vec::new()),
-            Err(error) => (OutboxDispatchOutcome::default(), vec![error]),
-        };
-
-        // Persist even when the dispatcher reports a store error: earlier rows
-        // in the pass may already have settled. The armed alarm remains the
-        // recovery path if exporting or persisting this state fails.
-        if let Err(error) = persist_current_state(cell, &persist) {
-            deferred.push(error);
-            return Ok(CelldOutboxDrainOutcome { dispatch, deferred });
+        match dispatcher.dispatch_batch(self.batch_size).await {
+            Ok(dispatch) => Ok(CelldOutboxDrainOutcome {
+                dispatch,
+                deferred: Vec::new(),
+            }),
+            Err(error) => Ok(CelldOutboxDrainOutcome {
+                dispatch: OutboxDispatchOutcome::default(),
+                deferred: vec![error],
+            }),
         }
-
-        let pending = match has_pending(cell) {
-            Ok(pending) => pending,
-            Err(error) => {
-                deferred.push(error);
-                return Ok(CelldOutboxDrainOutcome { dispatch, deferred });
-            }
-        };
-        let watchdog = if pending {
-            alarm.arm(self.drain_interval).await
-        } else {
-            alarm.clear().await
-        };
-        if let Err(error) = watchdog {
-            deferred.push(error);
-        }
-
-        Ok(CelldOutboxDrainOutcome { dispatch, deferred })
     }
 }
 
-#[async_trait::async_trait(?Send)]
-trait CelldOutboxAlarm {
-    async fn arm(&self, interval: Duration) -> Result<(), TransportError>;
-    async fn clear(&self) -> Result<(), TransportError>;
+/// Tracks only currently executing commands, not durable data. The prearmed
+/// alarm and pending SQL rows carry recovery across process loss.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Default)]
+pub(super) struct CommandActivity(Arc<AtomicUsize>);
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl CommandActivity {
+    fn enter(&self) -> Result<CommandGuard, TransportError> {
+        self.0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| TransportError::retryable("cell command concurrency limit exceeded"))?;
+        Ok(CommandGuard(Arc::clone(&self.0)))
+    }
+    fn is_active(&self) -> bool {
+        self.0.load(Ordering::SeqCst) != 0
+    }
 }
 
-struct WorkerAlarm<'a>(&'a Storage);
+#[cfg(any(target_arch = "wasm32", test))]
+pub(super) struct CommandGuard(Arc<AtomicUsize>);
+#[cfg(any(target_arch = "wasm32", test))]
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
+#[cfg(any(target_arch = "wasm32", test))]
+#[async_trait::async_trait(?Send)]
+pub(super) trait CelldOutboxAlarm {
+    /// Set the single Durable Object alarm to `at` (`now` is the caller's
+    /// clock reading; a past `at` fires as soon as possible).
+    async fn set(&self, at: SystemTime, now: SystemTime) -> Result<(), TransportError>;
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(super) struct WorkerAlarm<'a>(pub &'a Storage);
+#[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 impl CelldOutboxAlarm for WorkerAlarm<'_> {
-    async fn arm(&self, interval: Duration) -> Result<(), TransportError> {
-        self.0.set_alarm(interval).await.map_err(|error| {
-            TransportError::retryable(format!("cannot arm celld outbox watchdog: {error}"))
-        })
-    }
-
-    async fn clear(&self) -> Result<(), TransportError> {
-        self.0.delete_alarm().await.map_err(|error| {
-            TransportError::retryable(format!("cannot clear celld outbox watchdog: {error}"))
+    async fn set(&self, at: SystemTime, now: SystemTime) -> Result<(), TransportError> {
+        let offset = at.duration_since(now).unwrap_or(Duration::ZERO);
+        self.0.set_alarm(offset).await.map_err(|error| {
+            TransportError::retryable(format!("cannot arm celld cell alarm: {error}"))
         })
     }
 }
 
-fn persist_current_state<A, F, E>(
-    cell: &AggregateCell<A>,
-    persist: &F,
-) -> Result<(), TransportError>
-where
-    A: Aggregate + Send + Sync + 'static,
-    F: Fn(&DurableAggregateCellState) -> Result<(), E>,
-    E: fmt::Display,
-{
-    let state = cell.durable_state().map_err(|error| {
-        TransportError::permanent(format!("cannot export aggregate cell state: {error}"))
-    })?;
-    persist(&state).map_err(|error| {
-        TransportError::retryable(format!("cannot persist aggregate cell state: {error}"))
-    })
-}
-
-fn has_pending<A>(cell: &AggregateCell<A>) -> Result<bool, TransportError>
+#[cfg(any(target_arch = "wasm32", test))]
+async fn has_pending<A>(cell: &AggregateCell<A>) -> Result<bool, TransportError>
 where
     A: Aggregate + Send + Sync + 'static,
 {
-    cell.durable_outbox()
-        .map(|rows| {
-            rows.iter()
-                .any(|row| !row.is_published() && !row.is_failed())
-        })
-        .map_err(|error| {
-            TransportError::permanent(format!("cannot inspect aggregate cell outbox: {error}"))
-        })
+    use crate::outbox_worker::OutboxStore;
+    use crate::OutboxMessageStatus;
+    let store = cell.outbox_store();
+    for status in [OutboxMessageStatus::Pending, OutboxMessageStatus::InFlight] {
+        if !store
+            .messages_by_status(status, 1)
+            .await
+            .map_err(|error| {
+                TransportError::retryable(format!("cannot inspect aggregate cell outbox: {error}"))
+            })?
+            .is_empty()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::entity::{Entity, EventRecord};
-    use crate::outbox_worker::testing::block_on;
+    use crate::outbox_worker::{testing::block_on, OutboxStore};
     use crate::{OutboxMessage, OutboxMessageStatus};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct TestAggregate {
         entity: Entity,
     }
-
     impl Aggregate for TestAggregate {
         type ReplayError = String;
-
         fn aggregate_type() -> &'static str {
             "celld_outbox_test"
         }
-
         fn entity(&self) -> &Entity {
             &self.entity
         }
-
         fn entity_mut(&mut self) -> &mut Entity {
             &mut self.entity
         }
-
-        fn replay_event(&mut self, _event: &EventRecord) -> Result<(), Self::ReplayError> {
+        fn replay_event(&mut self, _: &EventRecord) -> Result<(), String> {
             Err("test aggregate has no replay events".into())
         }
     }
-
     #[derive(Clone)]
     struct RecordingPublisher {
         log: Arc<Mutex<Vec<&'static str>>>,
         fail: bool,
     }
-
     impl MessagePublisher for RecordingPublisher {
-        fn publish(
-            &self,
-            _message: crate::bus::Message,
-        ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send + '_ {
-            let log = Arc::clone(&self.log);
-            let fail = self.fail;
-            async move {
-                log.lock().unwrap().push("publish");
-                if fail {
-                    Err(TransportError::retryable("Queue unavailable"))
-                } else {
-                    Ok(())
-                }
+        async fn publish(&self, _: crate::bus::Message) -> Result<(), TransportError> {
+            self.log.lock().unwrap().push("publish");
+            if self.fail {
+                Err(TransportError::retryable("Queue unavailable"))
+            } else {
+                Ok(())
             }
         }
     }
-
     struct RecordingAlarm {
         log: Arc<Mutex<Vec<&'static str>>>,
+        targets: Mutex<Vec<Duration>>,
+        fail: bool,
     }
-
     #[async_trait::async_trait(?Send)]
     impl CelldOutboxAlarm for RecordingAlarm {
-        async fn arm(&self, _interval: Duration) -> Result<(), TransportError> {
+        async fn set(&self, at: SystemTime, now: SystemTime) -> Result<(), TransportError> {
             self.log.lock().unwrap().push("arm");
-            Ok(())
-        }
-
-        async fn clear(&self) -> Result<(), TransportError> {
-            self.log.lock().unwrap().push("clear");
-            Ok(())
-        }
-    }
-
-    struct FailingArmAlarm {
-        log: Arc<Mutex<Vec<&'static str>>>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl CelldOutboxAlarm for FailingArmAlarm {
-        async fn arm(&self, _interval: Duration) -> Result<(), TransportError> {
-            self.log.lock().unwrap().push("arm");
-            Err(TransportError::retryable("alarm unavailable"))
-        }
-
-        async fn clear(&self) -> Result<(), TransportError> {
-            self.log.lock().unwrap().push("clear");
-            Ok(())
+            self.targets
+                .lock()
+                .unwrap()
+                .push(at.duration_since(now).unwrap_or(Duration::ZERO));
+            if self.fail {
+                Err(TransportError::retryable("alarm unavailable"))
+            } else {
+                Ok(())
+            }
         }
     }
+    const NOW: SystemTime = SystemTime::UNIX_EPOCH;
 
-    fn pending_cell() -> AggregateCell<TestAggregate> {
-        let cell = AggregateCell::<TestAggregate>::new("aggregate-1").unwrap();
-        let message = OutboxMessage::create("evt-1", "test.created", vec![1]).unwrap();
-        cell.restore_durable_state(DurableAggregateCellState {
-            version: super::super::store::DURABLE_AGGREGATE_CELL_STATE_VERSION,
-            events: Vec::new(),
-            snapshots: Vec::new(),
-            commands: Vec::new(),
-            outbox: vec![message],
-            sealed_row: None,
-        })
-        .unwrap();
+    fn cell(pending: bool) -> AggregateCell<TestAggregate> {
+        let cell = AggregateCell::new("aggregate-1").unwrap();
+        if pending {
+            cell.restore_durable_outbox(vec![OutboxMessage::create(
+                "evt-1",
+                "test.created",
+                vec![1],
+            )
+            .unwrap()])
+                .unwrap();
+        }
         cell
+    }
+    fn fixtures() -> (CelldOutbox, RecordingAlarm, RecordingPublisher) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        (
+            CelldOutbox::new("OUTBOX").unwrap(),
+            RecordingAlarm {
+                log: log.clone(),
+                targets: Mutex::new(Vec::new()),
+                fail: false,
+            },
+            RecordingPublisher { log, fail: false },
+        )
     }
 
     #[test]
@@ -435,7 +474,6 @@ mod tests {
         assert_eq!(outbox.batch_size(), CELLD_OUTBOX_DEFAULT_BATCH_SIZE);
         assert_eq!(outbox.max_attempts(), CELLD_OUTBOX_DEFAULT_MAX_ATTEMPTS);
     }
-
     #[test]
     fn invalid_policy_values_are_rejected() {
         assert!(CelldOutbox::new(" ").is_err());
@@ -448,248 +486,231 @@ mod tests {
         assert!(base.clone().with_batch_size(0).is_err());
         assert!(base.with_max_attempts(0).is_err());
     }
-
     #[test]
-    fn persists_and_arms_before_publish_then_persists_and_clears() {
+    fn arms_before_dispatch_and_publish_then_deletes_delivered_rows() {
         block_on(async {
-            let cell = pending_cell();
-            let outbox = CelldOutbox::new("OUTBOX").unwrap();
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let states = Arc::new(Mutex::new(Vec::new()));
-            let publisher = RecordingPublisher {
-                log: Arc::clone(&log),
-                fail: false,
-            };
-            let alarm = RecordingAlarm {
-                log: Arc::clone(&log),
-            };
-            let persist_log = Arc::clone(&log);
-            let persisted_states = Arc::clone(&states);
-
-            let outcome = outbox
-                .persist_and_drain_with(
-                    &cell,
-                    || Ok(publisher),
-                    &alarm,
-                    move |state| {
-                        persist_log.lock().unwrap().push("persist");
-                        persisted_states.lock().unwrap().push(state.clone());
-                        Ok::<_, String>(())
-                    },
-                )
+            let cell = cell(true);
+            let (outbox, alarm, publisher) = fixtures();
+            let guard = outbox
+                .begin_command(cell.command_activity(), &alarm, NOW, None)
                 .await
                 .unwrap();
-
-            assert_eq!(outcome.dispatch.published, 1);
-            assert!(!outcome.is_deferred());
+            alarm.log.lock().unwrap().push("command");
+            drop(guard);
+            let result = outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
+                .await
+                .unwrap();
+            assert_eq!(result.dispatch.published, 1);
+            assert!(!result.is_deferred());
+            assert!(cell.durable_outbox().unwrap().is_empty());
             assert_eq!(
-                *log.lock().unwrap(),
-                ["persist", "arm", "publish", "persist", "clear"]
+                *alarm.log.lock().unwrap(),
+                ["arm", "command", "arm", "publish"]
             );
-            let states = states.lock().unwrap();
-            assert_eq!(states[0].outbox[0].status, OutboxMessageStatus::Pending);
-            assert_eq!(states[1].outbox[0].status, OutboxMessageStatus::Published);
-        });
-    }
-
-    #[test]
-    fn retryable_publish_stays_pending_and_rearms_without_error() {
-        block_on(async {
-            let cell = pending_cell();
-            let outbox = CelldOutbox::new("OUTBOX").unwrap();
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let states = Arc::new(Mutex::new(Vec::new()));
-            let publisher = RecordingPublisher {
-                log: Arc::clone(&log),
-                fail: true,
-            };
-            let alarm = RecordingAlarm {
-                log: Arc::clone(&log),
-            };
-            let persist_log = Arc::clone(&log);
-            let persisted_states = Arc::clone(&states);
-
-            let outcome = outbox
-                .persist_and_drain_with(
-                    &cell,
-                    || Ok(publisher),
-                    &alarm,
-                    move |state| {
-                        persist_log.lock().unwrap().push("persist");
-                        persisted_states.lock().unwrap().push(state.clone());
-                        Ok::<_, String>(())
-                    },
-                )
+            let (_, _, publisher) = fixtures();
+            assert!(!outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
                 .await
-                .unwrap();
-
-            assert_eq!(outcome.dispatch.released, 1);
-            assert!(!outcome.is_deferred());
+                .unwrap()
+                .is_deferred());
             assert_eq!(
-                *log.lock().unwrap(),
-                ["persist", "arm", "publish", "persist", "arm"]
+                alarm.log.lock().unwrap().len(),
+                4,
+                "idle wake neither rearms nor deletes another wake"
             );
-            let states = states.lock().unwrap();
-            assert_eq!(states[1].outbox[0].status, OutboxMessageStatus::Pending);
-            assert_eq!(states[1].outbox[0].attempts, 1);
         });
     }
-
     #[test]
-    fn persistence_failure_prevents_alarm_and_publish() {
+    fn retryable_publish_keeps_pending_work_and_already_armed_wake() {
         block_on(async {
-            let cell = pending_cell();
-            let outbox = CelldOutbox::new("OUTBOX").unwrap();
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let alarm = RecordingAlarm {
-                log: Arc::clone(&log),
-            };
-            let resolve_log = Arc::clone(&log);
-            let persist_log = Arc::clone(&log);
-
-            let error = outbox
-                .persist_and_drain_with(
-                    &cell,
-                    move || {
-                        resolve_log.lock().unwrap().push("resolve");
-                        Ok(RecordingPublisher {
-                            log: Arc::clone(&resolve_log),
-                            fail: false,
-                        })
-                    },
-                    &alarm,
-                    move |_state| {
-                        persist_log.lock().unwrap().push("persist");
-                        Err::<(), _>("storage unavailable")
-                    },
-                )
+            let cell = cell(true);
+            let (outbox, alarm, mut publisher) = fixtures();
+            publisher.fail = true;
+            let result = outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
                 .await
-                .unwrap_err();
-
-            assert!(error.is_retryable());
-            assert_eq!(*log.lock().unwrap(), ["persist"]);
+                .unwrap();
+            assert_eq!(result.dispatch.released, 1);
+            let rows = cell.durable_outbox().unwrap();
+            assert_eq!(rows[0].status, OutboxMessageStatus::Pending);
+            assert_eq!(rows[0].attempts, 1);
+            assert_eq!(*alarm.log.lock().unwrap(), ["arm", "publish"]);
         });
     }
-
     #[test]
-    fn watchdog_failure_before_durable_acceptance_prevents_publish() {
+    fn failed_prearm_does_not_admit_command_and_releases_activity_guard() {
         block_on(async {
-            let cell = pending_cell();
-            let outbox = CelldOutbox::new("OUTBOX").unwrap();
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let alarm = FailingArmAlarm {
-                log: Arc::clone(&log),
-            };
-            let resolve_log = Arc::clone(&log);
-            let persist_log = Arc::clone(&log);
-
-            let error = outbox
-                .persist_and_drain_with(
-                    &cell,
-                    move || {
-                        resolve_log.lock().unwrap().push("resolve");
-                        Ok(RecordingPublisher {
-                            log: Arc::clone(&resolve_log),
-                            fail: false,
-                        })
-                    },
-                    &alarm,
-                    move |_state| {
-                        persist_log.lock().unwrap().push("persist");
-                        Ok::<_, String>(())
-                    },
-                )
+            let cell = cell(false);
+            let (outbox, mut alarm, _) = fixtures();
+            alarm.fail = true;
+            assert!(outbox
+                .begin_command(cell.command_activity(), &alarm, NOW, None)
                 .await
-                .unwrap_err();
-
-            assert!(error.is_retryable());
-            assert_eq!(*log.lock().unwrap(), ["persist", "arm"]);
+                .is_err());
+            assert!(!cell.command_activity().is_active());
+            assert_eq!(*alarm.log.lock().unwrap(), ["arm"]);
         });
     }
-
     #[test]
-    fn binding_failure_is_deferred_after_persistence_and_watchdog() {
+    fn alarm_keeps_waking_while_a_command_is_suspended_before_commit() {
         block_on(async {
-            let cell = pending_cell();
-            let outbox = CelldOutbox::new("OUTBOX").unwrap();
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let alarm = RecordingAlarm {
-                log: Arc::clone(&log),
-            };
-            let resolve_log = Arc::clone(&log);
-            let persist_log = Arc::clone(&log);
-
-            let outcome = outbox
-                .persist_and_drain_with(
+            let cell = cell(false);
+            let (outbox, alarm, publisher) = fixtures();
+            let first = outbox
+                .begin_command(cell.command_activity(), &alarm, NOW, None)
+                .await
+                .unwrap();
+            assert!(!outbox
+                .drain_with(&cell, || Ok(publisher.clone()), &alarm, NOW, None)
+                .await
+                .unwrap()
+                .is_deferred());
+            let second = outbox
+                .begin_command(cell.command_activity(), &alarm, NOW, None)
+                .await
+                .unwrap();
+            drop(first);
+            assert!(!outbox
+                .drain_with(&cell, || Ok(publisher.clone()), &alarm, NOW, None)
+                .await
+                .unwrap()
+                .is_deferred());
+            assert_eq!(*alarm.log.lock().unwrap(), ["arm", "arm", "arm", "arm"]);
+            drop(second);
+            assert!(!outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
+                .await
+                .unwrap()
+                .is_deferred());
+            assert_eq!(alarm.log.lock().unwrap().len(), 4);
+        });
+    }
+    #[test]
+    fn binding_failure_is_deferred_with_work_and_wake_retained() {
+        block_on(async {
+            let cell = cell(true);
+            let (outbox, alarm, _) = fixtures();
+            let result = outbox
+                .drain_with(
                     &cell,
-                    move || {
-                        resolve_log.lock().unwrap().push("resolve");
-                        Err::<RecordingPublisher, _>(TransportError::permanent(
-                            "binding unavailable",
-                        ))
-                    },
+                    || Err::<RecordingPublisher, _>(TransportError::permanent("missing Queue")),
                     &alarm,
-                    move |_state| {
-                        persist_log.lock().unwrap().push("persist");
-                        Ok::<_, String>(())
-                    },
+                    NOW,
+                    None,
                 )
                 .await
                 .unwrap();
-
-            assert_eq!(outcome.deferred.len(), 1);
-            assert!(outcome.deferred[0].is_permanent());
-            assert_eq!(*log.lock().unwrap(), ["persist", "arm", "resolve"]);
+            assert_eq!(result.deferred.len(), 1);
+            assert_eq!(cell.durable_outbox().unwrap().len(), 1);
+            assert_eq!(*alarm.log.lock().unwrap(), ["arm"]);
         });
     }
-
     #[test]
-    fn settlement_persistence_failure_is_deferred_after_durable_acceptance() {
+    fn alarm_failure_prevents_egress_without_losing_committed_rows() {
         block_on(async {
-            let cell = pending_cell();
-            let outbox = CelldOutbox::new("OUTBOX").unwrap();
-            let log = Arc::new(Mutex::new(Vec::new()));
-            let persisted_states = Arc::new(Mutex::new(Vec::new()));
-            let persist_calls = Arc::new(AtomicUsize::new(0));
-            let publisher = RecordingPublisher {
-                log: Arc::clone(&log),
-                fail: false,
-            };
-            let alarm = RecordingAlarm {
-                log: Arc::clone(&log),
-            };
-            let persist_log = Arc::clone(&log);
-            let states = Arc::clone(&persisted_states);
-            let calls = Arc::clone(&persist_calls);
-
-            let outcome = outbox
-                .persist_and_drain_with(
-                    &cell,
-                    || Ok(publisher),
-                    &alarm,
-                    move |state| {
-                        persist_log.lock().unwrap().push("persist");
-                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                            states.lock().unwrap().push(state.clone());
-                            Ok(())
-                        } else {
-                            Err("storage unavailable")
-                        }
-                    },
-                )
+            let cell = cell(true);
+            let (outbox, mut alarm, publisher) = fixtures();
+            alarm.fail = true;
+            assert!(outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
+                .await
+                .is_err());
+            assert_eq!(cell.durable_outbox().unwrap().len(), 1);
+            assert_eq!(*alarm.log.lock().unwrap(), ["arm"]);
+        });
+    }
+    #[test]
+    fn live_claim_rearms_without_publishing_until_lease_expires() {
+        block_on(async {
+            let cell = cell(true);
+            let (outbox, alarm, publisher) = fixtures();
+            cell.outbox_store()
+                .claim(crate::outbox_worker::ClaimOutboxMessages::new(
+                    "busy",
+                    1,
+                    Duration::from_secs(60),
+                ))
                 .await
                 .unwrap();
-
-            assert_eq!(outcome.dispatch.published, 1);
-            assert_eq!(outcome.deferred.len(), 1);
-            assert!(outcome.deferred[0].is_retryable());
+            let result = outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
+                .await
+                .unwrap();
+            assert_eq!(result.dispatch.published, 0);
+            assert_eq!(*alarm.log.lock().unwrap(), ["arm"]);
             assert_eq!(
-                *log.lock().unwrap(),
-                ["persist", "arm", "publish", "persist"]
+                cell.durable_outbox().unwrap()[0].status,
+                OutboxMessageStatus::InFlight
             );
-            let states = persisted_states.lock().unwrap();
-            assert_eq!(states.len(), 1);
-            assert_eq!(states[0].outbox[0].status, OutboxMessageStatus::Pending);
+        });
+    }
+
+    #[test]
+    fn domain_alarm_earlier_than_watchdog_wins_the_slot() {
+        block_on(async {
+            let cell = cell(true);
+            let (outbox, alarm, publisher) = fixtures();
+            let soon = NOW + Duration::from_millis(250);
+            let guard = outbox
+                .begin_command(cell.command_activity(), &alarm, NOW, Some(soon))
+                .await
+                .unwrap();
+            drop(guard);
+            let result = outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, Some(soon))
+                .await
+                .unwrap();
+            assert_eq!(result.dispatch.published, 1);
+            assert_eq!(
+                *alarm.targets.lock().unwrap(),
+                [Duration::from_millis(250), Duration::from_millis(250)],
+                "a watchdog rearm must never postpone an earlier domain alarm"
+            );
+        });
+    }
+
+    #[test]
+    fn watchdog_earlier_than_domain_alarm_keeps_draining() {
+        block_on(async {
+            let cell = cell(true);
+            let (outbox, alarm, publisher) = fixtures();
+            let later = NOW + Duration::from_secs(3_600);
+            let result = outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, Some(later))
+                .await
+                .unwrap();
+            assert_eq!(result.dispatch.published, 1);
+            assert_eq!(
+                *alarm.targets.lock().unwrap(),
+                [outbox.drain_interval()],
+                "a far domain alarm must not starve the outbox watchdog"
+            );
+        });
+    }
+
+    #[test]
+    fn idle_cell_arms_only_its_next_domain_alarm() {
+        block_on(async {
+            let cell = cell(false);
+            let (outbox, alarm, publisher) = fixtures();
+            let later = NOW + Duration::from_secs(60);
+            assert!(!outbox
+                .drain_with(&cell, || Ok(publisher.clone()), &alarm, NOW, Some(later))
+                .await
+                .unwrap()
+                .is_deferred());
+            assert_eq!(*alarm.targets.lock().unwrap(), [Duration::from_secs(60)]);
+            assert!(!outbox
+                .drain_with(&cell, || Ok(publisher), &alarm, NOW, None)
+                .await
+                .unwrap()
+                .is_deferred());
+            assert_eq!(
+                alarm.targets.lock().unwrap().len(),
+                1,
+                "with no work and no domain alarm the slot is left alone"
+            );
         });
     }
 }

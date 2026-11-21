@@ -3,7 +3,9 @@ use distributed::{sourced, Entity};
 use serde::{Deserialize, Serialize};
 
 /// Represents a line item in an order
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Encode, Decode)]
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, Encode, Decode, distributed::CommandInput,
+)]
 pub struct OrderItem {
     pub sku: String,
     pub quantity: u32,

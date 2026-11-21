@@ -1,9 +1,11 @@
 use std::any::TypeId;
 
 use super::*;
-use crate::graphql::command_contract::{CommandEffects, TypedCommandContract};
+use crate::command::TypedCommandContract;
 use crate::graphql::commands::TypedCommandInventory;
-use crate::graphql::{GraphqlTypeDef, GraphqlTypeField};
+use crate::graphql::permissions::read;
+
+use crate::command::{CommandTypeDef, CommandTypeField};
 use crate::table::{
     ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
 };
@@ -109,6 +111,16 @@ fn modeled_direct_projection(
     schema: TableSchema,
     options: DirectModeledBinding<'_>,
 ) -> SurfaceModeledProjection {
+    modeled_projection_with_outputs(owner, program_name, epoch, vec![schema], options)
+}
+
+fn modeled_projection_with_outputs(
+    owner: &str,
+    program_name: &str,
+    epoch: &str,
+    schemas: Vec<TableSchema>,
+    options: DirectModeledBinding<'_>,
+) -> SurfaceModeledProjection {
     use crate::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
     use crate::projection::placement::{
         DirectProjectionPlacement, ProjectionBinding, ProjectionExecutionClass,
@@ -120,13 +132,11 @@ fn modeled_direct_projection(
     };
     use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
     use crate::{
-        DomainEventBodyKind, ProjectionAssignment, ProjectionEventSelector, ProjectionExpression,
-        ProjectionKeyField, ProjectionMutationKind, ProjectionProgram, ProjectionValue,
+        DomainEventBodyKind, MutationKind, ProjectionAssignment, ProjectionEventSelector,
+        ProjectionExpression, ProjectionKeyField, ProjectionProgram, ProjectionValue,
         DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
     };
 
-    let model_name = schema.model_name.clone();
-    let table_name = schema.table_name.clone();
     let selector = ProjectionEventSelector::try_new(
         1,
         format!("{program_name}.changed"),
@@ -140,18 +150,26 @@ fn modeled_direct_projection(
         DOMAIN_EVENT_BODY_CODEC_VERSION,
     )
     .unwrap();
-    let value = ProjectionExpression::constant(ProjectionValue::string("row-1"));
-    let operation = ProjectionOperation::try_new(
-        format!("{program_name}-upsert"),
-        0,
-        ProjectionMutationKind::Upsert,
-        ProjectionTarget::try_new(&model_name, &table_name).unwrap(),
-        vec![ProjectionKeyField::try_new(0, "id", value.clone()).unwrap()],
-        vec![ProjectionField::try_new(0, "id", ProjectionAssignment::Set(value)).unwrap()],
-        Vec::new(),
-        Vec::new(),
-    )
-    .unwrap();
+    assert!(!schemas.is_empty(), "modeled projection requires an output");
+    let operations = schemas
+        .iter()
+        .enumerate()
+        .map(|(index, schema)| {
+            let value =
+                ProjectionExpression::constant(ProjectionValue::string(format!("row-{index}")));
+            ProjectionOperation::try_new(
+                format!("{program_name}-upsert-{index}"),
+                index.try_into().unwrap(),
+                MutationKind::Upsert,
+                ProjectionTarget::try_new(&schema.model_name, &schema.table_name).unwrap(),
+                vec![ProjectionKeyField::try_new(0, "id", value.clone()).unwrap()],
+                vec![ProjectionField::try_new(0, "id", ProjectionAssignment::Set(value)).unwrap()],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
     let partition = if options.dynamic_partition {
         ProjectionPartition::Expression(ProjectionExpression::constant(ProjectionValue::string(
             "tenant-1",
@@ -163,10 +181,7 @@ fn modeled_direct_projection(
         program_name,
         1,
         partition,
-        vec![
-            ProjectionArm::try_new(format!("{program_name}-arm"), selector, vec![operation])
-                .unwrap(),
-        ],
+        vec![ProjectionArm::try_new(format!("{program_name}-arm"), selector, operations).unwrap()],
     )
     .unwrap();
     let descriptor = TestProjectionDescriptor(program.clone());
@@ -179,7 +194,13 @@ fn modeled_direct_projection(
     let source =
         ProjectionSourceBinding::try_new("test-domain", "ordered-domain-events", 1).unwrap();
     let owner = ProjectionOwner::try_new(owner).unwrap();
-    let outputs = vec![ProjectionOutput::try_new(model_name, table_name, schema).unwrap()];
+    let outputs = schemas
+        .into_iter()
+        .map(|schema| {
+            ProjectionOutput::try_new(schema.model_name.clone(), schema.table_name.clone(), schema)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
     let binding = if options.eventual {
         ProjectionBinding::from_eventual_program(
             &program,
@@ -224,7 +245,7 @@ fn modeled_direct_projection(
 fn test_command(
     command_name: &str,
     field_name: &str,
-    output: GraphqlTypeDef,
+    output: CommandTypeDef,
 ) -> TypedCommandContract {
     let input_type_id = TypeId::of::<String>();
     let output_type_id = TypeId::of::<()>();
@@ -232,9 +253,10 @@ fn test_command(
         name: command_name.into(),
         field_name: field_name.into(),
         roles: Vec::new(),
-        input: GraphqlTypeDef::new(
+        input: CommandTypeDef::new(
             "TestCommandInput",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -249,8 +271,6 @@ fn test_command(
         output_type_id,
         consistency: CommandConsistency::Succeeded,
         input_defaults: Vec::new(),
-        effects: CommandEffects::revalidate(),
-        confirmations: Vec::new(),
         projected_model: None,
         direct_projection: None,
         projections: Default::default(),
@@ -266,9 +286,10 @@ fn test_inventory(
 #[test]
 fn causal_surface_commands_accept_modeled_event_selectors_but_not_empty_authority() {
     let output = || {
-        GraphqlTypeDef::new(
+        CommandTypeDef::new(
             "CausalPayload",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -635,6 +656,7 @@ fn query_protocol_uses_exact_modeled_physical_topology() {
             ..DirectModeledBinding::active("exact-physical-topology")
         },
     );
+    let semantic_program_id = modeled.program_id().to_string();
     let surface = build_surface(&[model], &SurfaceOptions::sqlite())
         .unwrap()
         .with_projection_owners([SurfaceDirectProjection::new("exact-modeled-owner")
@@ -651,6 +673,11 @@ fn query_protocol_uses_exact_modeled_physical_topology() {
     assert_eq!(
         runtime.model_has_static_partition("ExactTopology"),
         Some(true)
+    );
+    assert_eq!(
+        runtime.public_projection_for_model("ExactTopology"),
+        Some(semantic_program_id.as_str()),
+        "causal observations use the active semantic program identity"
     );
 }
 
@@ -763,10 +790,46 @@ fn query_protocol_merges_compatible_active_models_without_inventing_static_parti
     }
 }
 
+#[cfg(feature = "graphql")]
+#[test]
+fn query_protocol_preserves_one_semantic_identity_for_each_fanout_model() {
+    let first = direct_model("FirstFanout", "first_fanout");
+    let second = direct_model("SecondFanout", "second_fanout");
+    let modeled = modeled_projection_with_outputs(
+        "fanout-owner",
+        "fanout-program",
+        "fanout-v1",
+        vec![first.clone(), second.clone()],
+        DirectModeledBinding {
+            eventual: true,
+            ..DirectModeledBinding::active("fanout-physical-owner")
+        },
+    );
+    let semantic_program_id = modeled.program_id().to_string();
+    let surface = build_surface(&[first, second], &SurfaceOptions::sqlite())
+        .unwrap()
+        .with_projectors([SurfaceProjector::new("fanout-owner").modeled(modeled)])
+        .unwrap();
+
+    let runtime = crate::graphql::query_protocol::QueryProtocolRuntime::compile(&surface).unwrap();
+    for model in ["FirstFanout", "SecondFanout"] {
+        assert_eq!(
+            runtime.public_projection_for_model(model),
+            Some(semantic_program_id.as_str()),
+            "each fan-out model must retain the program identity that authored it"
+        );
+    }
+    assert_eq!(
+        runtime.public_projection_for_model("UnknownModel"),
+        None,
+        "unknown models cannot mint a causal proof identity"
+    );
+}
+
 #[test]
 fn selected_surfaces_reject_command_and_projector_reattachment() {
     let full = build_surface(&[orders()], &SurfaceOptions::sqlite()).unwrap();
-    let grants = BTreeMap::from([("OrderView".into(), RoleGrant::all_columns())]);
+    let grants = BTreeMap::from([("OrderView".into(), read().all_columns())]);
     let selected = surface_for_role(&full, "user", &grants).unwrap();
     assert!(selected
         .clone()
@@ -779,8 +842,14 @@ fn selected_surfaces_reject_command_and_projector_reattachment() {
         .contains("before authorization selection"));
 
     let grants_by_role = BTreeMap::from([("user".into(), grants)]);
-    let application =
-        surface_for_application(&full, "web", &["user".into()], &["user".into()], &grants_by_role).unwrap();
+    let application = surface_for_application(
+        &full,
+        "web",
+        &["user".into()],
+        &["user".into()],
+        &grants_by_role,
+    )
+    .unwrap();
     assert!(application
         .clone()
         .with_typed_commands(&TypedCommandInventory::empty())
@@ -798,7 +867,9 @@ fn role_policy_rejects_non_finite_and_hides_js_unsafe_integers() {
     for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let grants = BTreeMap::from([(
             "OrderView".into(),
-            RoleGrant::all_columns().rows(super::super::col("status").eq(value)),
+            read()
+                .all_columns()
+                .rows(super::super::col("status").eq(value)),
         )]);
         assert!(surface_for_role(&full, "user", &grants)
             .unwrap_err()
@@ -814,20 +885,23 @@ fn role_policy_rejects_non_finite_and_hides_js_unsafe_integers() {
     let full = build_surface(&[integer_orders], &SurfaceOptions::sqlite()).unwrap();
     let grants = BTreeMap::from([(
         "OrderView".into(),
-        RoleGrant::all_columns().rows(super::super::col("sequence").eq(9_007_199_254_740_992_i64)),
+        read()
+            .all_columns()
+            .rows(super::super::col("sequence").eq(9_007_199_254_740_992_i64)),
     )]);
     let selected = surface_for_role(&full, "user", &grants).unwrap();
-    assert_eq!(
+    assert!(matches!(
         selected.models["OrderView"].row_policy,
-        SurfaceRowPolicy::ServerOnly
-    );
+        SurfaceRowPolicy::ServerOnly(_)
+    ));
 }
 
 #[test]
 fn command_surface_rejects_duplicate_mutation_field_ids() {
-    let output = GraphqlTypeDef::new(
+    let output = CommandTypeDef::new(
         "TestCommandPayload",
-        vec![GraphqlTypeField {
+        vec![CommandTypeField {
+            unsigned_integer: None,
             name: "id".into(),
             type_name: "String".into(),
             nullable: false,
@@ -852,7 +926,7 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
     let empty = test_inventory([test_command(
         "order.empty",
         "order_empty",
-        GraphqlTypeDef::new("EmptyPayload", Vec::new()),
+        CommandTypeDef::new("EmptyPayload", Vec::new()),
     )]);
     let error = build_surface(&[orders()], &SurfaceOptions::sqlite())
         .unwrap()
@@ -863,15 +937,16 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
     let nested = test_inventory([test_command(
         "order.nested_empty",
         "order_nested_empty",
-        GraphqlTypeDef::new(
+        CommandTypeDef::new(
             "OuterPayload",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "inner".into(),
                 type_name: "InnerPayload".into(),
                 nullable: false,
                 list: false,
                 item_nullable: false,
-                nested: Some(Box::new(GraphqlTypeDef::new("InnerPayload", Vec::new()))),
+                nested: Some(Box::new(CommandTypeDef::new("InnerPayload", Vec::new()))),
             }],
         ),
     )]);
@@ -884,9 +959,10 @@ fn command_surface_rejects_empty_nested_and_surface_colliding_types() {
     let collision = test_inventory([test_command(
         "order.collision",
         "order_collision",
-        GraphqlTypeDef::new(
+        CommandTypeDef::new(
             "OrderView",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -921,16 +997,14 @@ fn projected_output_reuse_and_sdl_emission_use_the_same_exact_predicate() {
         output: SurfaceCommandShape::Typed(output),
         consistency: CommandConsistency::Atomic,
         input_defaults: Vec::new(),
-        effects: Some(CommandEffects::revalidate()),
-        confirmations: Vec::new(),
         projected_model: Some(projected_model.clone()),
         direct_projection: None,
         projections: Default::default(),
-        confirmation_unavailable: false,
     };
     let one_string_field = |name: &str| SurfaceTypeDef {
         name: name.into(),
         fields: vec![SurfaceTypeField {
+            unsigned_integer: None,
             name: "order_id".into(),
             type_name: "String".into(),
             nullable: false,
@@ -976,7 +1050,7 @@ fn surface_for_role_drops_ungranted_columns_and_models() {
     let mut grants = BTreeMap::new();
     grants.insert(
         "OrderView".to_string(),
-        RoleGrant::columns(["order_id", "status"]),
+        read().columns(["order_id", "status"]),
     );
     let role_surface = surface_for_role(&full, "user", &grants).unwrap();
     let model = role_surface.models.get("OrderView").expect("granted");
@@ -991,185 +1065,13 @@ fn surface_for_role_drops_ungranted_columns_and_models() {
 }
 
 #[test]
-fn role_surface_legacy_effects_never_become_v2_client_authority() {
-    let mut full = build_surface(&[orders()], &SurfaceOptions::sqlite()).unwrap();
-    let input = SurfaceTypeDef {
-        name: "UpdateOrderInput".into(),
-        fields: vec![
-            SurfaceTypeField {
-                name: "order_id".into(),
-                type_name: "String".into(),
-                nullable: false,
-                list: false,
-                item_nullable: false,
-                nested: None,
-            },
-            SurfaceTypeField {
-                name: "customer_id".into(),
-                type_name: "String".into(),
-                nullable: false,
-                list: false,
-                item_nullable: false,
-                nested: None,
-            },
-        ],
-    };
-    let key = EffectKey {
-        fields: vec![EffectFieldValue {
-            field: "order_id".into(),
-            value: EffectExpression::Input {
-                path: vec!["order_id".into()],
-            },
-        }],
-    };
-    let denied_field_command = SurfaceCommand {
-        command_name: "order.assign_customer".into(),
-        field_name: "order_assign_customer".into(),
-        roles: Vec::new(),
-        input: SurfaceCommandShape::Typed(input.clone()),
-        output: SurfaceCommandShape::Typed(SurfaceTypeDef {
-            name: "AssignCustomerPayload".into(),
-            fields: vec![SurfaceTypeField {
-                name: "order_id".into(),
-                type_name: "String".into(),
-                nullable: false,
-                list: false,
-                item_nullable: false,
-                nested: None,
-            }],
-        }),
-        consistency: CommandConsistency::Succeeded,
-        input_defaults: Vec::new(),
-        effects: Some(CommandEffects::new([CommandEffect::Patch {
-            model: "OrderView".into(),
-            key: key.clone(),
-            fields: vec![EffectFieldValue {
-                field: "customer_id".into(),
-                value: EffectExpression::Input {
-                    path: vec!["customer_id".into()],
-                },
-            }],
-        }])),
-        confirmations: Vec::new(),
-        projected_model: None,
-        direct_projection: None,
-        projections: Default::default(),
-        confirmation_unavailable: false,
-    };
-    let trusted_preset_command = SurfaceCommand {
-        command_name: "order.apply_preset".into(),
-        field_name: "order_apply_preset".into(),
-        roles: Vec::new(),
-        input: SurfaceCommandShape::Typed(input),
-        output: SurfaceCommandShape::Typed(SurfaceTypeDef {
-            name: "ApplyPresetPayload".into(),
-            fields: vec![SurfaceTypeField {
-                name: "order_id".into(),
-                type_name: "String".into(),
-                nullable: false,
-                list: false,
-                item_nullable: false,
-                nested: None,
-            }],
-        }),
-        consistency: CommandConsistency::Succeeded,
-        input_defaults: Vec::new(),
-        effects: Some(CommandEffects::new([CommandEffect::Patch {
-            model: "OrderView".into(),
-            key,
-            fields: vec![EffectFieldValue {
-                field: "status".into(),
-                value: EffectExpression::TrustedPreset {
-                    name: "tenant-secret".into(),
-                },
-            }],
-        }])),
-        confirmations: Vec::new(),
-        projected_model: None,
-        direct_projection: None,
-        projections: Default::default(),
-        confirmation_unavailable: false,
-    };
-    full.commands = vec![denied_field_command, trusted_preset_command];
-    validate_and_canonicalize_commands(&full.models, &full.comparison_ops, &mut full.commands)
-        .unwrap();
-
-    let selected = surface_for_role(
-        &full,
-        "user",
-        &BTreeMap::from([(
-            "OrderView".into(),
-            RoleGrant::columns(["order_id", "status"]),
-        )]),
-    )
-    .unwrap();
-    let denied = selected
-        .commands
-        .iter()
-        .find(|command| command.command_name == "order.assign_customer")
-        .expect("denied-field command");
-    assert!(denied
-        .effects
-        .as_ref()
-        .is_some_and(|effects| effects.operations.is_empty()));
-    let trusted = selected
-        .commands
-        .iter()
-        .find(|command| command.command_name == "order.apply_preset")
-        .expect("trusted-preset command");
-    assert!(trusted
-        .effects
-        .as_ref()
-        .is_some_and(|effects| !effects.operations.is_empty()));
-
-    let manifest = super::super::client_manifest_from_surface(
-        "orders",
-        super::super::ClientSurfaceIdentity::role("user"),
-        &selected,
-    )
-    .unwrap();
-    let denied = manifest
-        .commands
-        .iter()
-        .find(|command| command.name == "order.assign_customer")
-        .expect("denied-field manifest command");
-    assert!(denied.extensions.effects.is_none());
-    assert!(denied.extensions.trusted_presets.is_empty());
-    let denied_effects_json = serde_json::to_string(&denied.extensions.effects).unwrap();
-    assert!(
-        !denied_effects_json.contains("customer_id"),
-        "{denied_effects_json}"
-    );
-    assert!(
-        !denied_effects_json.contains("tenant-secret"),
-        "{denied_effects_json}"
-    );
-
-    let trusted = manifest
-        .commands
-        .iter()
-        .find(|command| command.name == "order.apply_preset")
-        .expect("trusted-preset manifest command");
-    assert!(trusted.extensions.effects.is_none());
-    assert!(trusted.extensions.trusted_presets.is_empty());
-    let trusted_json = serde_json::to_string(trusted).unwrap();
-    assert!(!trusted_json.contains("tenant-secret"), "{trusted_json}");
-    let preset_descriptors_json =
-        serde_json::to_string(&trusted.extensions.trusted_presets).unwrap();
-    assert!(
-        !preset_descriptors_json.contains("\"value\":"),
-        "{preset_descriptors_json}"
-    );
-}
-
-#[test]
 fn pool_free_role_selection_rejects_invalid_grants_and_policy_references() {
     let full = build_surface(&[orders()], &SurfaceOptions::sqlite()).unwrap();
 
     let unknown_model = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([("TypoView".into(), RoleGrant::all_columns())]),
+        &BTreeMap::from([("TypoView".into(), read().all_columns())]),
     )
     .unwrap_err();
     assert!(unknown_model.contains("unknown model `TypoView`"));
@@ -1177,10 +1079,7 @@ fn pool_free_role_selection_rejects_invalid_grants_and_policy_references() {
     let unknown_column = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([(
-            "OrderView".into(),
-            RoleGrant::columns(["order_id", "statuz"]),
-        )]),
+        &BTreeMap::from([("OrderView".into(), read().columns(["order_id", "statuz"]))]),
     )
     .unwrap_err();
     assert!(unknown_column.contains("unknown column `statuz` in permission"));
@@ -1190,7 +1089,9 @@ fn pool_free_role_selection_rejects_invalid_grants_and_policy_references() {
         "user",
         &BTreeMap::from([(
             "OrderView".into(),
-            RoleGrant::all_columns().rows(super::super::col("statuz").eq("open")),
+            read()
+                .all_columns()
+                .rows(super::super::col("statuz").eq("open")),
         )]),
     )
     .unwrap_err();
@@ -1201,7 +1102,7 @@ fn pool_free_role_selection_rejects_invalid_grants_and_policy_references() {
         "user",
         &BTreeMap::from([(
             "OrderView".into(),
-            RoleGrant::all_columns().rows(super::super::rel(
+            read().all_columns().rows(super::super::rel(
                 "customer",
                 super::super::col("id").eq("c1"),
             )),
@@ -1219,7 +1120,7 @@ fn pool_free_role_selection_rejects_mistyped_row_policy_literals() {
         "user",
         &BTreeMap::from([(
             "OrderView".into(),
-            RoleGrant::all_columns().rows(FilterExpr::Cmp {
+            read().all_columns().rows(FilterExpr::Cmp {
                 column: "status".into(),
                 op: super::super::filter::CmpOp::Eq,
                 rhs: Operand::Lit(super::super::LitValue::Json(serde_json::json!("open"))),
@@ -1235,7 +1136,7 @@ fn pool_free_role_selection_rejects_mistyped_row_policy_literals() {
         "user",
         &BTreeMap::from([(
             "OrderView".into(),
-            RoleGrant::all_columns().rows(FilterExpr::In {
+            read().all_columns().rows(FilterExpr::In {
                 column: "status".into(),
                 values: vec![
                     Operand::from("open"),
@@ -1255,10 +1156,7 @@ fn selected_surface_debug_does_not_leak_denied_schema_metadata() {
     let selected = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([(
-            "OrderView".into(),
-            RoleGrant::columns(["order_id", "status"]),
-        )]),
+        &BTreeMap::from([("OrderView".into(), read().columns(["order_id", "status"]))]),
     )
     .unwrap();
 
@@ -1272,17 +1170,14 @@ fn selected_surface_debug_does_not_leak_denied_schema_metadata() {
 fn surface_for_role_omits_aggregate_without_grant() {
     let full = build_surface(&[orders()], &SurfaceOptions::sqlite()).unwrap();
     let mut grants = BTreeMap::new();
-    grants.insert("OrderView".to_string(), RoleGrant::all_columns());
+    grants.insert("OrderView".to_string(), read().all_columns());
     let role_surface = surface_for_role(&full, "user", &grants).unwrap();
     let names = role_surface.query_root_names();
     assert!(names.contains(&"orders"));
     assert!(!names.contains(&"orders_aggregate"));
 
     let mut admin = BTreeMap::new();
-    admin.insert(
-        "OrderView".to_string(),
-        RoleGrant::all_columns().with_aggregations(),
-    );
+    admin.insert("OrderView".to_string(), read().all_columns().aggregations());
     let admin_surface = surface_for_role(&full, "admin", &admin).unwrap();
     assert!(admin_surface
         .query_root_names()
@@ -1303,6 +1198,7 @@ fn relationship_only_when_target_on_surface() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "children".into(),
             kind: RelationshipKind::HasMany,
             target_model: "ChildView".into(),
@@ -1381,6 +1277,7 @@ fn surface_rejects_relationship_and_generated_aggregate_field_collisions() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "children".into(),
             kind: RelationshipKind::HasMany,
             target_model: "CollisionChild".into(),
@@ -1425,6 +1322,7 @@ fn relationship_keys_canonicalize_rust_field_names_to_graphql_columns() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "account".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "AccountView".into(),
@@ -1482,6 +1380,7 @@ fn pool_free_surface_rejects_a_partial_composite_belongs_to_key() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "composite".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "CompositeView".into(),
@@ -1518,6 +1417,7 @@ fn row_policy_rejects_a_partial_composite_m2m_mapping() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "labels".into(),
             kind: RelationshipKind::ManyToMany,
             target_model: "OperationalLabel".into(),
@@ -1571,7 +1471,7 @@ fn row_policy_rejects_a_partial_composite_m2m_mapping() {
         "user",
         &BTreeMap::from([(
             "ProjectView".into(),
-            RoleGrant::all_columns().rows(super::super::rel(
+            read().all_columns().rows(super::super::rel(
                 "labels",
                 super::super::col("label_id").eq("rust"),
             )),
@@ -1622,6 +1522,7 @@ fn belongs_to_onto_composite_identity_is_selected_when_keys_are_paired() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "composite".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "CompositeView".into(),
@@ -1635,7 +1536,7 @@ fn belongs_to_onto_composite_identity_is_selected_when_keys_are_paired() {
     let source_only = surface_for_role(
         &full,
         "source-only",
-        &BTreeMap::from([("SimpleView".into(), RoleGrant::all_columns())]),
+        &BTreeMap::from([("SimpleView".into(), read().all_columns())]),
     )
     .unwrap();
     assert!(source_only.models["SimpleView"].relationships.is_empty());
@@ -1644,8 +1545,8 @@ fn belongs_to_onto_composite_identity_is_selected_when_keys_are_paired() {
         &full,
         "both",
         &BTreeMap::from([
-            ("CompositeView".into(), RoleGrant::all_columns()),
-            ("SimpleView".into(), RoleGrant::all_columns()),
+            ("CompositeView".into(), read().all_columns()),
+            ("SimpleView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -1673,6 +1574,7 @@ fn has_many_onto_composite_child_is_selected_on_the_parent() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "projects".into(),
             kind: RelationshipKind::HasMany,
             target_model: "ProjectView".into(),
@@ -1708,8 +1610,8 @@ fn has_many_onto_composite_child_is_selected_on_the_parent() {
         &full,
         "user",
         &BTreeMap::from([
-            ("WorkspaceView".into(), RoleGrant::all_columns()),
-            ("ProjectView".into(), RoleGrant::all_columns()),
+            ("WorkspaceView".into(), read().all_columns()),
+            ("ProjectView".into(), read().all_columns()),
         ]),
     )
     .expect("single-column parent has_many onto composite child");
@@ -1748,6 +1650,7 @@ fn has_many_from_composite_parent_is_selected() {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "files".into(),
             kind: RelationshipKind::HasMany,
             target_model: "ProjectFileView".into(),
@@ -1786,8 +1689,8 @@ fn has_many_from_composite_parent_is_selected() {
         &full,
         "user",
         &BTreeMap::from([
-            ("ProjectView".into(), RoleGrant::all_columns()),
-            ("ProjectFileView".into(), RoleGrant::all_columns()),
+            ("ProjectView".into(), read().all_columns()),
+            ("ProjectFileView".into(), read().all_columns()),
         ]),
     )
     .expect("composite parent has_many onto child");
@@ -1809,7 +1712,7 @@ fn role_sdl_production_path_omits_ungranted_columns() {
     let mut grants = BTreeMap::new();
     grants.insert(
         "OrderView".to_string(),
-        RoleGrant::columns(["order_id", "status"]),
+        read().columns(["order_id", "status"]),
     );
     let sdl = graphql_sdl_for_role(&[orders()], &SdlOptions::sqlite(), "user", &grants)
         .expect("role sdl");
@@ -1862,6 +1765,7 @@ fn constant_validation_uses_exact_wire_scalar_domains() {
         output: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "ConstantPayload".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "ok".into(),
                 type_name: "Boolean".into(),
                 nullable: false,
@@ -1872,12 +1776,9 @@ fn constant_validation_uses_exact_wire_scalar_domains() {
         }),
         consistency: CommandConsistency::Succeeded,
         input_defaults: Vec::new(),
-        effects: Some(CommandEffects::revalidate()),
-        confirmations: Vec::new(),
         projected_model: None,
         direct_projection: None,
         projections: Default::default(),
-        confirmation_unavailable: false,
     };
     let constant = |value| EffectExpression::Constant { value };
     let column = |name: &str, scalar: &str| ColumnField {
@@ -1911,55 +1812,6 @@ fn constant_validation_uses_exact_wire_scalar_domains() {
 }
 
 #[test]
-fn missing_surface_primary_key_column_is_a_configuration_error_not_a_panic() {
-    let surface = build_surface(&[orders()], &SurfaceOptions::sqlite()).unwrap();
-    let mut model = surface.models["OrderView"].clone();
-    model.columns.retain(|column| column.name != "order_id");
-    let models = BTreeMap::from([("OrderView".into(), model)]);
-    let command = SurfaceCommand {
-        command_name: "order.patch".into(),
-        field_name: "order_patch".into(),
-        roles: Vec::new(),
-        input: SurfaceCommandShape::None,
-        output: SurfaceCommandShape::Typed(SurfaceTypeDef {
-            name: "PatchOrderPayload".into(),
-            fields: vec![SurfaceTypeField {
-                name: "order_id".into(),
-                type_name: "String".into(),
-                nullable: false,
-                list: false,
-                item_nullable: false,
-                nested: None,
-            }],
-        }),
-        consistency: CommandConsistency::Succeeded,
-        input_defaults: Vec::new(),
-        effects: Some(CommandEffects::revalidate()),
-        confirmations: Vec::new(),
-        projected_model: None,
-        direct_projection: None,
-        projections: Default::default(),
-        confirmation_unavailable: false,
-    };
-    let key = EffectKey {
-        fields: vec![EffectFieldValue {
-            field: "order_id".into(),
-            value: EffectExpression::Constant {
-                value: serde_json::json!("order-1"),
-            },
-        }],
-    };
-
-    let result =
-        std::panic::catch_unwind(|| validate_effect_key(&models, &command, "OrderView", &key));
-    let error = result
-        .expect("malformed Surface metadata must not panic")
-        .expect_err("missing primary-key column must fail closed");
-    assert!(error.contains("missing or hidden on the selected Surface"));
-}
-
-/// A7: role×dialect inventory + IR→SDL ops stay aligned (portable fixture).
-#[test]
 fn a7_role_dialect_parity_inventory_and_sdl_ops() {
     use super::super::sdl::{graphql_sdl_for_role, SdlOptions};
 
@@ -1976,7 +1828,7 @@ fn a7_role_dialect_parity_inventory_and_sdl_ops() {
     let mut grants = BTreeMap::new();
     grants.insert(
         "OrderView".to_string(),
-        RoleGrant::columns(["order_id", "status"]),
+        read().columns(["order_id", "status"]),
     );
 
     for (opts, dialect_label) in [

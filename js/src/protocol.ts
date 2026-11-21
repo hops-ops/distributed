@@ -14,6 +14,7 @@ import {
 	parseDistributedGenerationEnvelope,
 	type DistributedGenerationEnvelope
 } from './generation.js';
+import { isUnsignedInteger, unsignedIntegerMaximum, type UnsignedIntegerCodec } from './unsigned-integer.js';
 
 /** The only Distributed GraphQL protocol version understood by this package. */
 export const DISTRIBUTED_PROTOCOL_VERSION = 1 as const;
@@ -51,6 +52,7 @@ export type DistributedProjectionDisposition = 'revalidate';
 
 /** Closed wire codecs for server-derived, client-visible trusted presets. */
 export type DistributedTrustedPresetCodec =
+	| UnsignedIntegerCodec
 	| 'string'
 	| 'string_unvalidated_timestamp'
 	| 'base64'
@@ -149,10 +151,10 @@ export type DistributedQuerySnapshot = Readonly<
 	}
 >;
 
-/** Per-frame decision about live support, reset, and resumable cursors. */
+/** Per-frame delivery mode, reset decision, and resumable cursors. */
 export type DistributedLiveMetadata = Readonly<
 	Record<string, unknown> & {
-		supported: boolean;
+		mode: 'snapshot' | 'resumable';
 		reset: boolean;
 		cursors: readonly DistributedLiveCursor[];
 	}
@@ -596,7 +598,8 @@ function parseSnapshot(value: unknown): DistributedQuerySnapshot {
 function parseLive(value: unknown): DistributedLiveMetadata {
 	const path = 'extensions.distributed.live';
 	const live = record(value, path);
-	if (typeof live.supported !== 'boolean') invalid(`${path}.supported`);
+	if (live.mode !== 'snapshot' && live.mode !== 'resumable') invalid(`${path}.mode`);
+	if ('supported' in live) invalid(`${path}.supported`);
 	if (typeof live.reset !== 'boolean') invalid(`${path}.reset`);
 	if (
 		!Array.isArray(live.cursors) ||
@@ -613,12 +616,12 @@ function parseLive(value: unknown): DistributedLiveMetadata {
 		cursors.map((cursor) => cursor.projection),
 		`${path}.cursors`
 	);
-	if (!live.supported && (!live.reset || cursors.length !== 0)) {
+	if (live.mode === 'snapshot' && (!live.reset || cursors.length !== 0)) {
 		invalid(path);
 	}
 	return Object.freeze({
 		...live,
-		supported: live.supported,
+		mode: live.mode,
 		reset: live.reset,
 		cursors
 	}) as DistributedLiveMetadata;
@@ -630,7 +633,10 @@ function validateLiveSnapshot(
 ): void {
 	if (live === undefined) return;
 	if (snapshot === undefined) invalid('extensions.distributed.snapshot');
-	if (!live.supported) return;
+	if (live.mode === 'snapshot') {
+		if (snapshot.indexesComparable) invalid('extensions.distributed.snapshot.indexesComparable');
+		return;
+	}
 	if (!snapshot.indexesComparable) {
 		invalid('extensions.distributed.snapshot.indexesComparable');
 	}
@@ -824,6 +830,7 @@ export function isDistributedTrustedPresetCodec(
 		value === 'int32' ||
 		value === 'float64' ||
 		value === 'json_number_precision_limited' ||
+		(typeof value === 'string' && unsignedIntegerMaximum(value) !== undefined) ||
 		value === 'json'
 	);
 }
@@ -841,6 +848,11 @@ function parseTrustedPresetValue(
 	codec: DistributedTrustedPresetCodec,
 	path: string
 ): DistributedProtocolValue {
+	const unsignedMaximum = unsignedIntegerMaximum(codec);
+	if (unsignedMaximum !== undefined) {
+		if (!isUnsignedInteger(value, unsignedMaximum)) invalid(path);
+		return value;
+	}
 	switch (codec) {
 		case 'string':
 		case 'string_unvalidated_timestamp':
@@ -883,6 +895,8 @@ function parseTrustedPresetValue(
 			return Object.is(value, -0) ? 0 : value;
 		case 'json':
 			return cloneProtocolValue(value, path);
+		default:
+			return invalid(path);
 	}
 }
 

@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) fn validate_scope(
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     scope: &ProjectionRecordScope,
 ) -> Result<(), ProjectionProtocolError> {
     if scope.topology() != topology {

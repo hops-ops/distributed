@@ -23,9 +23,11 @@ struct WasmPure {
 }
 
 #[derive(Debug, Deserialize)]
-struct CargoMetadata {
-    workspace_root: PathBuf,
-    packages: Vec<CargoPackage>,
+pub(crate) struct CargoMetadata {
+    pub(crate) workspace_root: PathBuf,
+    #[serde(default)]
+    pub(crate) target_directory: PathBuf,
+    pub(crate) packages: Vec<CargoPackage>,
     resolve: Option<CargoResolve>,
     #[serde(default)]
     metadata: Value,
@@ -44,22 +46,24 @@ struct CargoResolveNode {
 }
 
 #[derive(Debug, Deserialize)]
-struct CargoPackage {
-    id: String,
-    name: String,
-    manifest_path: PathBuf,
-    source: Option<String>,
+pub(crate) struct CargoPackage {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) manifest_path: PathBuf,
+    pub(crate) source: Option<String>,
     #[serde(default)]
     features: BTreeMap<String, Vec<String>>,
     #[serde(default)]
-    targets: Vec<CargoTarget>,
+    pub(crate) targets: Vec<CargoTarget>,
 }
 
 #[derive(Debug, Deserialize)]
-struct CargoTarget {
+pub(crate) struct CargoTarget {
+    #[serde(default)]
+    pub(crate) name: String,
     src_path: PathBuf,
     #[serde(default)]
-    kind: Vec<String>,
+    pub(crate) kind: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -86,9 +90,8 @@ pub(crate) fn build_declared_wasm_pures(
         return Ok(0);
     };
     let ui_lib = ui_root.join("src/lib");
-    let wasm_pack_launcher = wasm_pack_launcher.ok_or(
-        "browser WASM pures require @hops-ops/distributed in the application UI",
-    )?;
+    let wasm_pack_launcher = wasm_pack_launcher
+        .ok_or("browser WASM pures require @hops-ops/distributed in the application UI")?;
     let compiler_identity = compiler_identity(wasm_pack_launcher)?;
     let mut outputs = BTreeMap::<PathBuf, &WasmPure>::new();
     for pure in &pures {
@@ -198,7 +201,7 @@ fn collect_wasm_pures(manifest: &Value) -> Result<BTreeSet<WasmPure>, Box<dyn Er
                             .filter(|package| !package.is_empty())
                             .ok_or_else(|| {
                                 format!(
-                                    "WASM pure `{import}` does not identify its declaring Cargo package; declare it through `portable_command!`"
+                                    "WASM pure `{import}` does not identify its declaring Cargo package; declare it through `command!`"
                                 )
                             })?;
                         found.insert(WasmPure {
@@ -254,7 +257,7 @@ fn portable_import_path(import: &str) -> Result<PathBuf, Box<dyn Error>> {
     Ok(path.to_path_buf())
 }
 
-fn cargo_metadata(manifest: &Path) -> Result<CargoMetadata, Box<dyn Error>> {
+pub(crate) fn cargo_metadata(manifest: &Path) -> Result<CargoMetadata, Box<dyn Error>> {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version", "1", "--manifest-path"])
         .arg(manifest)
@@ -270,7 +273,7 @@ fn cargo_metadata(manifest: &Path) -> Result<CargoMetadata, Box<dyn Error>> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn package_source_identity(
+pub(crate) fn package_source_identity(
     metadata: &CargoMetadata,
     root_package_id: &str,
 ) -> Result<String, Box<dyn Error>> {
@@ -437,7 +440,11 @@ fn compiler_identity(launcher: &Path) -> Result<String, Box<dyn Error>> {
             )
             .into());
         }
-        hash.update(file.strip_prefix(package_root)?.to_string_lossy().as_bytes());
+        hash.update(
+            file.strip_prefix(package_root)?
+                .to_string_lossy()
+                .as_bytes(),
+        );
         hash.update([0]);
         hash.update(&content);
         hash.update([0]);
@@ -615,7 +622,10 @@ fn build_wasm_pure(
     Ok(())
 }
 
-fn ensure_real_directory_path(root: &Path, directory: &Path) -> Result<(), Box<dyn Error>> {
+pub(crate) fn ensure_real_directory_path(
+    root: &Path,
+    directory: &Path,
+) -> Result<(), Box<dyn Error>> {
     let relative = directory.strip_prefix(root).map_err(|_| {
         format!(
             "generated directory `{}` escapes project `{}`",
@@ -718,12 +728,14 @@ mod tests {
                 source: None,
                 features: BTreeMap::new(),
                 targets: vec![CargoTarget {
+                    name: String::new(),
                     src_path: directory.join("src/lib.rs"),
                     kind: vec!["lib".to_string()],
                 }],
             }
         };
         let metadata = CargoMetadata {
+            target_directory: PathBuf::new(),
             workspace_root: root.to_path_buf(),
             packages: vec![
                 package("pure", "pure"),
@@ -766,6 +778,7 @@ mod tests {
         fs::write(package_dir.join("lib.rs"), "mod sibling;\n").unwrap();
         fs::write(package_dir.join("sibling.rs"), "pub const VALUE: u8 = 1;\n").unwrap();
         let metadata = CargoMetadata {
+            target_directory: PathBuf::new(),
             workspace_root: workspace.to_path_buf(),
             packages: vec![CargoPackage {
                 id: "pure".to_string(),
@@ -774,6 +787,7 @@ mod tests {
                 source: None,
                 features: BTreeMap::new(),
                 targets: vec![CargoTarget {
+                    name: String::new(),
                     src_path: package_dir.join("lib.rs"),
                     kind: vec!["lib".to_string()],
                 }],
@@ -813,12 +827,14 @@ mod tests {
                 source: None,
                 features: BTreeMap::new(),
                 targets: vec![CargoTarget {
+                    name: String::new(),
                     src_path: directory.join("src/lib.rs"),
                     kind: vec![kind.to_string()],
                 }],
             }
         };
         let metadata = CargoMetadata {
+            target_directory: PathBuf::new(),
             workspace_root: root.to_path_buf(),
             packages: vec![
                 package("pure", "cdylib"),
@@ -863,6 +879,7 @@ mod tests {
             targets: Vec::new(),
         };
         let metadata = CargoMetadata {
+            target_directory: PathBuf::new(),
             workspace_root: PathBuf::from("/repo/application"),
             packages: vec![package],
             resolve: None,
@@ -882,6 +899,7 @@ mod tests {
             import: "domain/pkg/domain_wasm".to_string(),
         };
         let metadata = CargoMetadata {
+            target_directory: PathBuf::new(),
             workspace_root: PathBuf::from("/repo/application"),
             packages: vec![CargoPackage {
                 id: "registry+https://example.invalid#domain@0.1.0".to_string(),
@@ -916,6 +934,7 @@ mod tests {
             targets: Vec::new(),
         };
         let metadata = CargoMetadata {
+            target_directory: PathBuf::new(),
             workspace_root: PathBuf::from("/repo/application"),
             packages: vec![package("domain-one"), package("domain-two")],
             resolve: None,
@@ -927,5 +946,4 @@ mod tests {
             .to_string()
             .contains("more than one local Cargo package"));
     }
-
 }

@@ -28,8 +28,7 @@ plane — not open-coded per dialect in `main`.
 **Always reach for the highest-level API first.** The macros and one-call
 conveniences are the recommended surface, not sugar:
 
-- `#[sourced]` — not `#[digest]` + `aggregate!()` (its lower-level building
-  blocks, still supported but only for granular control you actually need)
+- `#[sourced]` — not a hand-written `Aggregate` impl and replay match
 - `#[derive(Snapshot)]` / `#[derive(ReadModel)]` — not hand-written snapshot
   payloads or table plumbing
 - `routes!` + `Service::routes(..)` — not manual handler registration
@@ -149,8 +148,10 @@ Rules that prevent real bugs:
 - **Always set an explicit `aggregate_type`** — the default is the Rust type
   name, which silently changes the durable stream identity if the type is
   renamed.
-- **Event methods become fallible.** `#[event]`/`#[digest]` methods return
-  `SourcedResult` even without a declared return type — call them with `?`.
+- **Event methods become fallible.** An `#[event]` method declares no return
+  type and may not use `?` or `return`; the macro makes it return
+  `SourcedResult`, so call it with `?`. Validate in the public method that
+  calls it.
 - Event names are lowercase past-tense facts (`"initialized"`, `"completed"`).
   Use `when = <expr>` for intentional idempotent/no-op transitions so they
   record nothing; use explicit validation when the API promises a rejection.
@@ -160,59 +161,70 @@ Rules that prevent real bugs:
 
 ## Command handlers
 
-For a browser-facing GraphQL service, use the typed causal command path instead
-of exposing a raw `Context`/`serde_json::Value` handler as the mutation contract:
+Every command is typed, authorized by its declared roles, and recorded in the
+command ledger under its command ID, whichever ingress delivers it:
 
 - declare `.typed_command(typed_command::<Input, Succeeded<Payload> | Eventual<Payload> | Atomic<Model>>(...))`
   on the executable route;
 - implement the handler with `CausalCommandContext` and return a
   `PreparedCommand<_>` so the framework owns commit, ledger, outbox, and
   projection atomicity;
-- bind that exact `Service` through `GraphqlEngineBuilder::service`, configure
-  public OIDC. HTTP command routes stay off; browser writes use
-  only the GraphQL command proxy. Call `.with_http_command_routes()` only for
-  an intentional non-GraphQL ingress;
+- for a browser-facing GraphQL service, bind that exact `Service` through
+  `GraphqlEngineBuilder::service` and configure public OIDC. HTTP command
+  routes stay off; browser writes use only the GraphQL command proxy. Call
+  `.with_http_command_routes()` only for an intentional non-GraphQL ingress;
 - generate the strictly typed client with `distributed client`.
 
 Use the `distributed-graphql` skill for the complete route, consistency,
-authorization, and client-generation contract. The raw handler form below
-remains valid for intentional non-GraphQL transports.
+authorization, and client-generation contract.
 
-One module per handler, exporting `COMMAND` (or `EVENT`/`EVENTS`), a `guard`,
-and an async `handle`:
+One module per command, exporting `COMMAND`, a `command()` declaration, and an
+async `handle`:
 
 ```rust
 pub const COMMAND: &str = "todo.initialize";
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["id", "task"])
+pub fn command() -> TypedCommand<CreateTodo, Succeeded<TodoCreated>> {
+    typed_command::<CreateTodo, Succeeded<TodoCreated>>(COMMAND).roles(["user"])
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<CreateTodo>()?;
-    let mut todo = Todo::default();
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Todo>,
+    input: CreateTodo,
+) -> Result<PreparedCommand<Succeeded<TodoCreated>>, HandlerError> {
+    let mut todo = ctx.repo().create();
     todo.initialize(input.id.clone(), input.task)?;
-    ctx.repo().publish_events().commit(&mut todo).await?;
-    Ok(json!({ "id": input.id }))
+    ctx.repo()
+        .publish_events()
+        .commit(todo)?
+        .succeeded(TodoCreated { id: input.id })
 }
 ```
 
-Register with `routes!` and serve — the same handlers work over direct
-dispatch, HTTP (`microsvc::serve`, feature `http`), gRPC (feature `grpc`), and
-the bus:
+`CreateTodo` derives `Deserialize` + `distributed::CommandInput`; `TodoCreated`
+derives `Serialize` + `distributed::CommandOutput`. Register on the route
+bundle and serve — the same handlers work over in-process dispatch
+(`Service::dispatch_causal`), HTTP (`microsvc::serve`, feature `http`; body
+`{ "commandId", "input" }`), gRPC (feature `grpc`), and the bus (the command
+declares `TRANSPORT_ROLE` and the message carries an id):
 
 ```rust
-let routes = distributed::routes!(
-    Routes::new().with_repo(repo.queued().aggregate::<Todo>()),
-    command handlers::todo_create,
-    command handlers::todo_complete,
-);
+let routes = Routes::new()
+    .with_repo(repo.queued().aggregate::<Todo>())
+    .typed_command(handlers::todo_create::command())
+    .handle(handlers::todo_create::handle)
+    .typed_command(handlers::todo_complete::command())
+    .handle(handlers::todo_complete::handle);
 let service = Service::new()
     .named("todo-api")
     .with_http_command_routes() // required for POST /{command}; GraphQL stays off by default
     .routes(routes);
-service.with_bus(bus).run(RunOptions::idempotent()).await?;
+service.with_bus(bus).run(RunOptions::default()).await?; // until the process ends
 ```
+
+Event handlers export `EVENT`/`EVENTS`, a `guard`, and an async
+`handle(ctx: &Context<'_, D>) -> Result<Value, HandlerError>`, and register
+with `distributed::routes!(routes, event handlers::todo_projection)`.
 
 ## Publication is explicit (outbox)
 

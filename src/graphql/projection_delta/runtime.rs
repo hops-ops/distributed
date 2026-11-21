@@ -31,10 +31,9 @@ use crate::graphql::surface::{Surface, SurfaceModeledProjection};
 use crate::projection::placement::{ProjectionBinding, ProjectionExecutorRoute};
 use crate::projection_protocol::{
     ProjectionCausationEvidenceBatch, ProjectionObservation, ProjectionObservationKind,
-    ProjectionScopeCodec, ProjectorTopologyId,
-    ResolvedProjectionKey as ProtocolResolvedProjectionKey,
-    ResolvedProjectionKeyField as ProtocolResolvedProjectionKeyField,
+    ProjectionScopeCodec, ProjectorTopologyId, RecordKey, RecordKeyField,
 };
+use crate::table::ColumnType;
 use crate::{
     DomainEventOccurrence, ProjectionEventSelector, ProjectionProgram,
     ProjectionRelationshipEffectKind, ResolvedProjectionKey, ResolvedProjectionMutation,
@@ -105,9 +104,9 @@ impl ProtocolProjectionRequestSeed {
             return Err(ProjectionRuntimeAuthorityError::InvalidAuthority);
         }
         let manifest = export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
-        let expected = crate::graphql::client_manifest::trusted_preset_descriptors(&manifest)
+        let expected = crate::graphql::client_manifest::trusted_preset_descriptors(manifest)
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         let mut preset_names = BTreeSet::new();
         if trusted_presets.len() != expected.len()
@@ -259,6 +258,14 @@ impl ProtocolProjectionRequestSeed {
                 if candidate.causation_id != causation_id
                     || candidate.scope.topology() != entry.codec.topology()
                     || candidate.scope.model() != obligation.model
+                    // A modeled observation is proof for the exact semantic
+                    // program that authored it. Physical projector names are
+                    // shared across deployments and cannot establish this
+                    // identity after an upgrade or cold restart. Legacy
+                    // observations have no program ID and remain readable,
+                    // but cannot satisfy a modeled obligation.
+                    || candidate.program_id.map(|id| id.to_string())
+                        != Some(identity.program_id.clone())
                     || !entry
                         .binding
                         .outputs()
@@ -802,6 +809,15 @@ fn trusted_preset_value_matches(codec: &str, value: &serde_json::Value) -> bool 
         "json_number_precision_limited" => value
             .as_i64()
             .is_some_and(|value| (-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&value)),
+        codec if crate::command::CommandUnsignedInteger::from_client_codec(codec).is_some() => {
+            crate::command::CommandUnsignedInteger::from_client_codec(codec).is_some_and(
+                |unsigned| {
+                    value
+                        .as_u64()
+                        .is_some_and(|value| value <= unsigned.client_max_value())
+                },
+            )
+        }
         "float64" => value.as_f64().is_some_and(f64::is_finite),
         "json" => true,
         _ => false,
@@ -811,6 +827,27 @@ fn trusted_preset_value_matches(codec: &str, value: &serde_json::Value) -> bool 
 #[cfg(test)]
 mod trusted_preset_tests {
     use super::trusted_preset_value_matches;
+
+    #[test]
+    fn unsigned_presets_require_exact_bounded_integers() {
+        for (codec, max) in [
+            ("uint8", 255_u64),
+            ("uint16", 65_535),
+            ("uint32", 4_294_967_295),
+            ("uint64_safe_integer", 9_007_199_254_740_991),
+        ] {
+            assert!(trusted_preset_value_matches(codec, &serde_json::json!(0)));
+            assert!(trusted_preset_value_matches(codec, &serde_json::json!(max)));
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!(max + 1),
+                serde_json::json!("1"),
+            ] {
+                assert!(!trusted_preset_value_matches(codec, &invalid));
+            }
+        }
+    }
 
     #[test]
     fn base64_preset_inventory_requires_canonical_standard_encoding() {
@@ -925,10 +962,7 @@ impl ProtocolProjectionProgramRegistry {
                     "projection registry requires the unselected catalog Surface".into(),
                 ));
             };
-            if program
-                .id()
-                .map_err(|error| ProjectionRuntimeAuthorityError::Registry(error.to_string()))?
-                != modeled.program_id()
+            if program.id() != modeled.program_id()
                 || binding.id() != modeled.binding_id()
                 || binding.program_id() != modeled.program_id()
             {
@@ -1383,13 +1417,13 @@ fn authorized_key_matches(
 
 fn protocol_resolved_key(
     key: &ResolvedProjectionKey,
-) -> Result<ProtocolResolvedProjectionKey, ProjectionRuntimeAuthorityError> {
-    Ok(ProtocolResolvedProjectionKey {
+) -> Result<RecordKey, ProjectionRuntimeAuthorityError> {
+    Ok(RecordKey {
         fields: key
             .fields()
             .iter()
             .map(|field| {
-                Ok(ProtocolResolvedProjectionKeyField {
+                Ok(RecordKeyField {
                     field: field.name().to_owned(),
                     value: projection_value_json(field.value().as_ref())?,
                 })
@@ -1707,7 +1741,7 @@ impl ProtocolProjectionDeltaRequestAuthority {
         self.codec
             .verify(
                 &token,
-                ProtocolTokenPurpose::ProjectionPartition,
+                ProtocolTokenPurpose::PartitionId,
                 &PartitionTokenMaterial {
                     domain: "distributed.graphql.projection-partition",
                     version: 1,
@@ -1769,7 +1803,7 @@ impl ProjectionPartitionScopeEncoder for ProtocolProjectionDeltaRequestAuthority
         let token = self
             .codec
             .issue(
-                ProtocolTokenPurpose::ProjectionPartition,
+                ProtocolTokenPurpose::PartitionId,
                 &PartitionTokenMaterial {
                     domain: "distributed.graphql.projection-partition",
                     version: 1,
@@ -1830,7 +1864,7 @@ impl ProjectionVisibilityEvaluator for ProtocolProjectionDeltaRequestAuthority {
                 })
             }
             crate::graphql::surface::SurfaceRowPolicy::Predicate(_)
-            | crate::graphql::surface::SurfaceRowPolicy::ServerOnly => {
+            | crate::graphql::surface::SurfaceRowPolicy::ServerOnly(_) => {
                 Ok(AuthorizationTransition {
                     before: ProjectionDeltaVisibility::Unknown,
                     after: ProjectionDeltaVisibility::Unknown,
@@ -1889,7 +1923,9 @@ fn evaluate_complete_after_policy(
     predicate: &crate::graphql::filter::FilterExpr,
     trusted_presets: &[crate::graphql::protocol::DistributedTrustedPreset],
 ) -> ProjectionDeltaVisibility {
-    let mut row = BTreeMap::new();
+    use crate::graphql::filter::Truth;
+
+    let mut row = serde_json::Map::new();
     for column in &model.schema.columns {
         let value = mutation
             .fields()
@@ -1912,120 +1948,38 @@ fn evaluate_complete_after_policy(
                     .and_then(|field| projection_value_json(field.value().as_ref()).ok())
             });
         if let Some(value) = value {
-            row.insert(column.column_name.as_str(), value);
+            row.insert(column.column_name.clone(), value);
         }
     }
-    match evaluate_filter(predicate, &row, trusted_presets) {
-        Some(true) => ProjectionDeltaVisibility::Authorized,
-        Some(false) => ProjectionDeltaVisibility::Denied,
-        None => ProjectionDeltaVisibility::Unknown,
-    }
-}
-
-fn evaluate_filter(
-    predicate: &crate::graphql::filter::FilterExpr,
-    row: &BTreeMap<&str, serde_json::Value>,
-    trusted_presets: &[crate::graphql::protocol::DistributedTrustedPreset],
-) -> Option<bool> {
-    use crate::graphql::filter::{CmpOp, FilterExpr};
-
-    match predicate {
-        FilterExpr::And(items) => {
-            let evaluated = items
-                .iter()
-                .map(|item| evaluate_filter(item, row, trusted_presets))
-                .collect::<Vec<_>>();
-            if evaluated.contains(&Some(false)) {
-                Some(false)
-            } else if evaluated.iter().all(|value| *value == Some(true)) {
-                Some(true)
-            } else {
-                None
-            }
-        }
-        FilterExpr::Or(items) => {
-            let evaluated = items
-                .iter()
-                .map(|item| evaluate_filter(item, row, trusted_presets))
-                .collect::<Vec<_>>();
-            if evaluated.contains(&Some(true)) {
-                Some(true)
-            } else if evaluated.iter().all(|value| *value == Some(false)) {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        FilterExpr::Not(item) => evaluate_filter(item, row, trusted_presets).map(|value| !value),
-        FilterExpr::Cmp { column, op, rhs } => {
-            let left = row.get(column.as_str())?;
-            let right = policy_operand(rhs, trusted_presets)?;
-            match op {
-                CmpOp::Eq => Some(left == &right),
-                CmpOp::Neq => Some(left != &right),
-                CmpOp::Gt
-                | CmpOp::Gte
-                | CmpOp::Lt
-                | CmpOp::Lte
-                | CmpOp::Like
-                | CmpOp::Ilike
-                | CmpOp::Contains
-                | CmpOp::ContainedIn
-                | CmpOp::HasKey => None,
-            }
-        }
-        FilterExpr::In {
-            column,
-            values,
-            negated,
-        } => {
-            let left = row.get(column.as_str())?;
-            let mut unknown = false;
-            let matched =
-                values
-                    .iter()
-                    .any(|operand| match policy_operand(operand, trusted_presets) {
-                        Some(right) => left == &right,
-                        None => {
-                            unknown = true;
-                            false
-                        }
-                    });
-            if matched {
-                Some(!negated)
-            } else if unknown {
-                None
-            } else {
-                Some(*negated)
-            }
-        }
-        FilterExpr::IsNull { column, is_null } => row
-            .get(column.as_str())
-            .map(|value| value.is_null() == *is_null),
-        FilterExpr::Rel { .. } => None,
-    }
-}
-
-fn policy_operand(
-    operand: &crate::graphql::filter::Operand,
-    trusted_presets: &[crate::graphql::protocol::DistributedTrustedPreset],
-) -> Option<serde_json::Value> {
-    use crate::graphql::filter::{LitValue, Operand};
-
-    match operand {
-        Operand::Claim(claim) => trusted_presets
+    let claims = |claim: &crate::graphql::filter::ClaimRef, column_type: &ColumnType| {
+        let preset = trusted_presets
             .iter()
-            .find(|preset| preset.name == claim.header)
-            .map(|preset| preset.value.clone()),
-        Operand::Lit(LitValue::String(value)) => Some(serde_json::Value::String(value.clone())),
-        Operand::Lit(LitValue::I64(value)) => Some(serde_json::Value::Number((*value).into())),
-        Operand::Lit(LitValue::F64(value)) => {
-            serde_json::Number::from_f64(*value).map(serde_json::Value::Number)
-        }
-        Operand::Lit(LitValue::Bool(value)) => Some(serde_json::Value::Bool(*value)),
-        Operand::Lit(LitValue::Json(value)) => Some(value.clone()),
-        Operand::Lit(LitValue::Null) => Some(serde_json::Value::Null),
+            .find(|preset| preset.name == claim.header)?;
+        preset_literal(&preset.value, column_type)
+    };
+    match predicate.evaluate(&model.schema, &row, &claims) {
+        Truth::True => ProjectionDeltaVisibility::Authorized,
+        Truth::False => ProjectionDeltaVisibility::Denied,
+        Truth::Unknown => ProjectionDeltaVisibility::Unknown,
     }
+}
+
+/// A trusted preset as the literal the SQL compiler binds for a claim
+/// compared with a column of `column_type`. `None` when the preset's wire
+/// value is not that type, which leaves the comparison undecided.
+fn preset_literal(
+    value: &serde_json::Value,
+    column_type: &ColumnType,
+) -> Option<crate::graphql::filter::LitValue> {
+    use crate::graphql::filter::LitValue;
+
+    Some(match column_type {
+        ColumnType::Text | ColumnType::Timestamp => LitValue::String(value.as_str()?.to_string()),
+        ColumnType::Boolean => LitValue::Bool(value.as_bool()?),
+        ColumnType::Integer | ColumnType::UnsignedInteger => LitValue::I64(value.as_i64()?),
+        ColumnType::Float => LitValue::F64(value.as_f64()?),
+        ColumnType::Json | ColumnType::Bytes | ColumnType::Unsupported(_) => return None,
+    })
 }
 
 impl ProjectionDeltaRequestAuthority for ProtocolProjectionDeltaRequestAuthority {

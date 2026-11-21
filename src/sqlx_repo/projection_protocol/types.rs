@@ -64,6 +64,7 @@ pub(super) struct StoredFailure {
 
 pub(super) enum InputDisposition {
     New,
+    Redelivery,
     Duplicate(ProjectionCheckpoint),
     Stale(ProjectionCheckpoint),
 }

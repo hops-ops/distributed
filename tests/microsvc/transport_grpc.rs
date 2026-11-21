@@ -13,16 +13,45 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 
+use crate::commands::command_id;
 use crate::handlers;
 use crate::models::counter::Counter;
 
 fn counter_service() -> Arc<Service> {
-    Arc::new(Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(InMemoryRepository::new().queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-        command handlers::counter_increment,
-        command handlers::whoami,
-    )))
+    Arc::new(
+        Service::new().named("counters").routes(
+            Routes::new()
+                .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
+                .typed_command(handlers::counter_create::command())
+                .handle(handlers::counter_create::handle)
+                .typed_command(handlers::counter_increment::command())
+                .handle(handlers::counter_increment::handle)
+                .typed_command(handlers::whoami::command())
+                .handle(handlers::whoami::handle),
+        ),
+    )
+}
+
+/// The `{ commandId, input }` body every command request carries.
+fn envelope(input: serde_json::Value) -> String {
+    json!({ "commandId": command_id(), "input": input }).to_string()
+}
+
+/// A counter command as the signed-in user a trusted proxy would inject
+/// into the transport metadata.
+fn counter_request(command: &str, input: serde_json::Value) -> tonic::Request<GrpcRequest> {
+    let mut request = tonic::Request::new(GrpcRequest {
+        command: command.into(),
+        input: envelope(input),
+        session_variables: Default::default(),
+    });
+    request
+        .metadata_mut()
+        .insert("x-user-id", "user-1".parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("x-roles", handlers::USER_ROLE.parse().unwrap());
+    request
 }
 
 /// Bind to port 0, spawn the gRPC server, and return a connected client.
@@ -76,18 +105,14 @@ async fn create_counter() {
     let mut client = start_server(service).await;
 
     let resp = client
-        .dispatch(GrpcRequest {
-            command: "counter.initialize".into(),
-            input: json!({ "id": "c1" }).to_string(),
-            session_variables: Default::default(),
-        })
+        .dispatch(counter_request("counter.initialize", json!({ "id": "c1" })))
         .await
         .unwrap()
         .into_inner();
 
     assert_eq!(resp.status, 200);
     let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-    assert_eq!(body, json!({ "id": "c1" }));
+    assert_eq!(body["payload"], json!({ "id": "c1" }));
 }
 
 #[tokio::test]
@@ -97,11 +122,7 @@ async fn create_and_increment_counter() {
 
     // Create
     let resp = client
-        .dispatch(GrpcRequest {
-            command: "counter.initialize".into(),
-            input: json!({ "id": "c1" }).to_string(),
-            session_variables: Default::default(),
-        })
+        .dispatch(counter_request("counter.initialize", json!({ "id": "c1" })))
         .await
         .unwrap()
         .into_inner();
@@ -109,49 +130,66 @@ async fn create_and_increment_counter() {
 
     // Increment
     let resp = client
-        .dispatch(GrpcRequest {
-            command: "counter.increment".into(),
-            input: json!({ "id": "c1", "amount": 5 }).to_string(),
-            session_variables: Default::default(),
-        })
+        .dispatch(counter_request(
+            "counter.increment",
+            json!({ "id": "c1", "amount": 5 }),
+        ))
         .await
         .unwrap()
         .into_inner();
     assert_eq!(resp.status, 200);
     let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-    assert_eq!(body, json!({ "id": "c1", "value": 5 }));
+    assert_eq!(body["payload"], json!({ "id": "c1", "value": 5 }));
 
     // Increment again
     let resp = client
-        .dispatch(GrpcRequest {
-            command: "counter.increment".into(),
-            input: json!({ "id": "c1", "amount": 3 }).to_string(),
-            session_variables: Default::default(),
-        })
+        .dispatch(counter_request(
+            "counter.increment",
+            json!({ "id": "c1", "amount": 3 }),
+        ))
         .await
         .unwrap()
         .into_inner();
     assert_eq!(resp.status, 200);
     let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-    assert_eq!(body, json!({ "id": "c1", "value": 8 }));
+    assert_eq!(body["payload"], json!({ "id": "c1", "value": 8 }));
 }
 
 #[tokio::test]
-async fn unknown_command_returns_404_status() {
+async fn unknown_command_is_a_bad_request() {
     let service = counter_service();
     let mut client = start_server(service).await;
 
     let resp = client
-        .dispatch(GrpcRequest {
-            command: "nonexistent".into(),
-            input: json!({}).to_string(),
-            session_variables: Default::default(),
-        })
+        .dispatch(counter_request("nonexistent", json!({})))
         .await
         .unwrap()
         .into_inner();
 
-    assert_eq!(resp.status, 404);
+    assert_eq!(resp.status, 400);
+    let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert_eq!(body["error"], "unknown typed command");
+}
+
+/// Every command is ledgered: input that is not the `{ commandId, input }`
+/// envelope names no command id, so it is refused rather than run.
+#[tokio::test]
+async fn input_without_a_command_id_is_a_bad_request() {
+    let service = counter_service();
+    let mut client = start_server(service).await;
+
+    let mut request = counter_request("counter.initialize", json!({}));
+    request.get_mut().input = json!({ "id": "c1" }).to_string();
+    let resp = client.dispatch(request).await.unwrap().into_inner();
+
+    assert_eq!(resp.status, 400);
+    let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
+    assert_eq!(body["code"], "BAD_REQUEST");
+    assert!(
+        body["error"].as_str().unwrap().contains("commandId"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
@@ -161,7 +199,7 @@ async fn metadata_flows_to_session() {
 
     let mut request = tonic::Request::new(GrpcRequest {
         command: "session.identify".into(),
-        input: json!({}).to_string(),
+        input: envelope(json!({})),
         session_variables: Default::default(),
     });
     request
@@ -172,7 +210,7 @@ async fn metadata_flows_to_session() {
 
     assert_eq!(resp.status, 200);
     let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-    assert_eq!(body, json!({ "user_id": "user-42" }));
+    assert_eq!(body["payload"], json!({ "user_id": "user-42" }));
 }
 
 /// Security: a client must not be able to spoof identity via the payload.
@@ -190,7 +228,7 @@ async fn grpc_payload_session_variables_do_not_override_metadata() {
 
     let mut request = tonic::Request::new(GrpcRequest {
         command: "session.identify".into(),
-        input: json!({}).to_string(),
+        input: envelope(json!({})),
         session_variables: payload_vars,
     });
     request
@@ -202,7 +240,7 @@ async fn grpc_payload_session_variables_do_not_override_metadata() {
     assert_eq!(resp.status, 200);
     let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
     // Trusted metadata wins; the payload-supplied identity is ignored.
-    assert_eq!(body, json!({ "user_id": "trusted-user" }));
+    assert_eq!(body["payload"], json!({ "user_id": "trusted-user" }));
 }
 
 /// Payload-only session variables (no colliding metadata) still flow through,
@@ -219,7 +257,7 @@ async fn grpc_payload_session_variables_apply_when_metadata_absent() {
     let resp = client
         .dispatch(GrpcRequest {
             command: "session.identify".into(),
-            input: json!({}).to_string(),
+            input: envelope(json!({})),
             session_variables: payload_vars,
         })
         .await
@@ -228,7 +266,7 @@ async fn grpc_payload_session_variables_apply_when_metadata_absent() {
 
     assert_eq!(resp.status, 200);
     let body: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
-    assert_eq!(body, json!({ "user_id": "user-from-payload" }));
+    assert_eq!(body["payload"], json!({ "user_id": "user-from-payload" }));
 }
 
 #[tokio::test]
@@ -239,7 +277,7 @@ async fn missing_session_returns_401_status() {
     let resp = client
         .dispatch(GrpcRequest {
             command: "session.identify".into(),
-            input: json!({}).to_string(),
+            input: envelope(json!({})),
             session_variables: Default::default(),
         })
         .await

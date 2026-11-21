@@ -1,38 +1,14 @@
-name: All-Features Tests
+name: Each-Feature Check
 
 # Reusable workflow: referenced via `uses: ./.github/workflows/test-all-features.yaml`
 # from both the PR-quality and push-to-main pipelines.
 #
-# The shared quality job runs `cargo test` with default features (= none), so
-# every `#![cfg(feature = ...)]` test target compiles to empty there. This job
-# closes that gap: it compiles and runs the whole workspace with all features
-# (sqlite, emitter, http, grpc, ...). Broker/database tests self-skip when
-# their service env vars (DATABASE_URL, NATS_URL, ...) are unset, so no
-# service containers are needed here — the integration-* workflows cover those.
+# The all-features test run lives in integration-services.yaml, where the
+# services its tests need are running.
 on:
   workflow_call:
 
 jobs:
-  all-features:
-    name: All-Features Tests
-    runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          toolchain: stable
-          components: rust-src
-      # --all-features compiles rdkafka; librdkafka's bundled cmake build needs
-      # curl/curl.h (the runner has libcurl's runtime but not its headers).
-      - name: Install librdkafka build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
-      - name: Run workspace tests with all features
-        run: cargo test --workspace --all-features --all-targets --verbose
-
   each-feature:
     name: Each-Feature Check
     runs-on: ubuntu-latest

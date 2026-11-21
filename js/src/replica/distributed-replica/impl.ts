@@ -1,3 +1,4 @@
+import { replicaCommandFreshness } from '../command-runtime/symbols.js';
 import {
 	CacheRevisionConflictError,
 	createCacheEngine,
@@ -127,6 +128,7 @@ import {
 	latestCursors,
 	protocolInvalid,
 	recordKeyMatchesModel,
+	modelFromRecordKey,
 	responsePathKey,
 	sameRecordClock,
 	sameRecordRevision
@@ -138,10 +140,12 @@ import {
 	indexKeyFromTarget,
 	indexMaintenanceSnapshot,
 	indexSemanticLayer,
+	isGraphqlFailurePayload,
 	operationKey,
 	prepareRecordEvidence,
 	protocolOperationSource,
 	replicaResultIndexKeys,
+	type ReplicaIndexMemberships,
 	reportSafely,
 	reportUnhandledObserverError,
 	snapshotFrom,
@@ -228,6 +232,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		DistributedOpaqueString,
 		AnonymousRecordProtocolClock
 	>();
+	readonly #freshnessPlans = new Map<string, { generation: number; plan: ReplicaRevalidationPlan }>();
 	readonly #optimisticReceipts = new Map<string, OptimisticReceiptState>();
 	readonly #renderedOperations = new Map<string, RenderedOperation>();
 	readonly #readOperationKeys = new Set<string>();
@@ -344,7 +349,8 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					responseProjectionGeneration
 				),
 			diagnosticEvent: (event) => self.#diagnosticEvent(event),
-			resumeCursors: (key) => self.#resumeCursors(key)
+			resumeCursors: (key) => self.#resumeCursors(key),
+			freshness: (artifact, key) => self.#freshness(artifact, key)
 		};
 		return this.#fetchLiveHostCache;
 	}
@@ -552,6 +558,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			closeActiveTransports: () => self.#closeActiveTransports(),
 			closeAuthorizationGeneration: () => self.#closeAuthorizationGeneration(),
 			resumeLiveWatches: () => self.#resumeLiveWatches(),
+			refreshWatches: () => {
+				for (const key of self.#watches.keys()) self.#emitState(key, true);
+			},
 			syncDiagnostics: () => self.#syncDiagnostics(),
 			diagnosticEvent: (event) => self.#diagnosticEvent(event),
 			refreshIndexMaintenance: () => self.#refreshIndexMaintenance(),
@@ -657,6 +666,53 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				active = false;
 			}
 		});
+	}
+
+	[replicaCommandFreshness](commandId: string, plan: ReplicaRevalidationPlan): void {
+		// Validate before dispatch, using the existing generated dependency matcher.
+		createReplicaRevalidationMatcher(plan);
+		for (const [id, entry] of this.#freshnessPlans) {
+			if (entry.generation !== this.#protocolGenerationSequence || this.#engine.optimisticLayerState(id) === undefined) this.#freshnessPlans.delete(id);
+		}
+		if (!this.#freshnessPlans.has(commandId) && this.#freshnessPlans.size >= 256) throw new Error('too many pending causal commands');
+		this.#freshnessPlans.set(commandId, { generation: this.#protocolGenerationSequence, plan });
+	}
+
+	#freshness(artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>, key: string): Readonly<Record<string, unknown>> | undefined {
+		const scope = this.#protocolGeneration;
+		const protocolHash = artifact.protocol.protocolHash ?? this.#commandAuthorityContract?.protocolHash;
+		if (scope === undefined || protocolHash === undefined) return undefined;
+		const pending: unknown[] = [];
+		for (const [id, entry] of this.#freshnessPlans) {
+			if (entry.generation !== this.#protocolGenerationSequence || this.#engine.optimisticLayerState(id) === undefined) {
+				this.#freshnessPlans.delete(id);
+				continue;
+			}
+			if (!createReplicaRevalidationMatcher(entry.plan)(artifact)) continue;
+			// Overlap already uses full generated list/filter/count/relationship
+			// dependencies. An overlapping request must use primary even when an
+			// incomplete producer only supplied an opaque dependency name.
+			pending.push({ complete: false, models: [...entry.plan.models], relationships: [] });
+		}
+		const minimum: unknown[] = [];
+		// Retained clocks live independently of pending layer state. Index scopes
+		// belong to this query/live plan; never compare a different query's clock.
+		const group = this.#operationProtocols.get(key);
+		for (const state of [group?.query, group?.live]) {
+			for (const [projection, clock] of state?.indexClocks ?? []) {
+				minimum.push({ kind: 'index', projection, scopeToken: clock.scopeToken, position: clock.position });
+			}
+		}
+		// Direct Atomic effects have not yet acquired a query index checkpoint.
+		// Once a proving query retires this fence, its retained index clock covers
+		// membership (including later deletion) without requiring an absent row.
+		for (const [recordKey, { clock }] of this.#projectedRecordFences) {
+			const model = modelFromRecordKey(recordKey);
+			if (model === undefined || !createReplicaRevalidationMatcher({ dependencies: [], models: [model], relationships: [] })(artifact)) continue;
+			minimum.push({ kind: 'record', model, scopeToken: clock.scopeToken, incarnation: clock.incarnation, revision: clock.revision });
+		}
+		if (pending.length + minimum.length > 256) throw new Error('causal delivery context exceeds bounded evidence budget');
+		return Object.freeze({ version: 1, schemaHash: scope.schemaHash, protocolHash, authorizationGeneration: scope.authorizationGeneration, cacheScope: scope.cacheScope, pending, minimum });
 	}
 
 	[replicaResultObservation](
@@ -959,6 +1015,13 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		return hydrateReplica(this.#hydrationHost(), state, authoritativeScope);
 	}
 
+	reauthorize(
+		state: ReplicaDehydratedState,
+		authoritativeScope: ReplicaAuthoritativeScope
+	): boolean {
+		return hydrateReplica(this.#hydrationHost(), state, authoritativeScope, 'reauthorize');
+	}
+
 	#bindArtifact<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>
 	): void {
@@ -1092,8 +1155,20 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		if (live !== undefined && snapshot === undefined) {
 			protocolInvalid('extensions.distributed.snapshot');
 		}
+		// A failed live execution has no result: an error-only frame with only
+		// the base envelope. It is receipt-only, like an HTTP error response,
+		// and must not carry a command receipt or create stream state.
+		const liveFailure =
+			source === 'live' &&
+			snapshot === undefined &&
+			live === undefined &&
+			isGraphqlFailurePayload(envelope);
+		if (liveFailure && distributed.command !== undefined) {
+			protocolInvalid('extensions.distributed.command');
+		}
 		if (
 			source === 'live' &&
+			!liveFailure &&
 			(envelope.data !== undefined || envelope.errors !== undefined) &&
 			(snapshot === undefined || live === undefined)
 		) {
@@ -1106,7 +1181,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		}
 		const operationSource = protocolOperationSource(source);
 		const operationState =
-			operation === undefined
+			operation === undefined || liveFailure
 				? undefined
 				: this.#operationProtocol(key, operation, operationSource);
 			if (snapshot === undefined || operationState === undefined) {
@@ -1123,21 +1198,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		}
 
 		this.#validateLiveSnapshot(snapshot, live);
-		const unsupportedLive =
-			source === 'live' && live?.supported === false;
+		const snapshotLive = source === 'live' && live?.mode === 'snapshot';
 		const reset = live?.reset === true;
 		const group = this.#operationProtocols.get(key)!;
-		/*
-		 * An unsupported subscription response is an authorized fallback
-		 * snapshot, not a live source. In particular, a row-filtered snapshot
-		 * has no comparable index vector, so retaining live ownership here
-		 * would reject every later query handoff. Relinquish any prior live
-		 * ownership without advancing the generation; the forced HTTP fallback
-		 * starts against the generation that remains after this frame.
-		 */
-		if (unsupportedLive && group.active === 'live') {
-			group.active = undefined;
-		}
 		const previousActiveSource = group.active;
 		const handoff =
 			previousActiveSource !== undefined &&
@@ -1153,20 +1216,51 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			handoff && activeState !== undefined
 				? compareSnapshotToOperationState(activeState, snapshot)
 				: 'fresh';
-		const sharedDisposition = this.#sharedIndexDisposition(
+		const incomingMemberships: ReplicaIndexMemberships = new Map();
+		const fencedSharedDisposition = this.#sharedIndexDisposition(
 			key,
 			replicaResultIndexKeys(
 				artifact,
 				stableVariables,
 				envelope,
-				snapshot
+				snapshot,
+				incomingMemberships
 			),
 			snapshot,
 			requestRevision,
 			source
 		);
+		/*
+		 * A snapshot frame that agrees with an independent owner on every
+		 * index they share is exactly its server result once admitted: the
+		 * owner keeps those indexes and this frame writes only the rest
+		 * (docs/live-query-delivery.md). Disagreement keeps the atomic fence.
+		 */
+		const fencedIndexKeys =
+			snapshotLive ? fencedSharedDisposition.fencedIndexKeys : undefined;
+		const sharedMembershipAdmitted =
+			fencedIndexKeys !== undefined &&
+			(envelope.errors ?? []).length === 0 &&
+			this.#fencedMembershipsMatch(fencedIndexKeys, incomingMemberships);
+		const sharedDisposition: SharedIndexDisposition = sharedMembershipAdmitted
+			? { compared: false }
+			: fencedSharedDisposition;
+		// A non-resumable stream has no causal vector to compare. An HTTP
+		// refresh may replace it only if the request began after its last
+		// accepted membership. fetchWatch also fences intervening live frames.
+		// Taking query ownership restarts the stream, fencing queued callbacks.
+		const snapshotRefresh =
+			source === 'network' &&
+			previousActiveSource === 'live' &&
+			!snapshot.indexesComparable &&
+			activeState?.snapshotScope === undefined &&
+			activeState?.indexRevision !== undefined &&
+			requestRevision !== undefined &&
+			compareCanonicalDecimalStrings(requestRevision, activeState.indexRevision) > 0;
 		const handoffBlocked =
 			handoff &&
+			!snapshotLive &&
+			!snapshotRefresh &&
 			(
 				!snapshot.indexesComparable ||
 				!isComparableHandoffDisposition(ownDisposition) ||
@@ -1190,7 +1284,6 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					: sharedDisposition.disposition ?? disposition;
 		}
 		const sourceSwitched =
-			!unsupportedLive &&
 			!handoffBlocked &&
 			isComparableHandoffDisposition(disposition) &&
 			this.#activateOperationSource(
@@ -1255,24 +1348,16 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			!rejectedHandoff &&
 			disposition !== 'lower' &&
 			disposition !== 'incomparable';
-		/*
-		 * Revision zero is the cache engine's lowest legal checkpoint. It lets
-		 * an unsupported live response fill an empty cache immediately while
-		 * guaranteeing that any HTTP request revision can replace it.
-		 */
+		// Snapshot frames receive local membership revisions, not fabricated
+		// projection clocks. Live ownership fences older overlapping HTTP work.
 		const indexRevision =
-			unsupportedLive
-				? '0'
+			writeIndexes &&
+			(sourceSwitched || sharedDisposition.disposition === 'higher')
+				? this.#allocateIndexRevision()
 				: writeIndexes &&
-					  (
-							sourceSwitched ||
-							sharedDisposition.disposition === 'higher'
-						)
-					? this.#allocateIndexRevision()
-					: writeIndexes &&
-						  sharedDisposition.disposition === 'equal' &&
-						  sharedDisposition.indexRevision !== undefined
-						? sharedDisposition.indexRevision
+					  sharedDisposition.disposition === 'equal' &&
+					  sharedDisposition.indexRevision !== undefined
+					? sharedDisposition.indexRevision
 				: snapshot.indexesComparable &&
 					  disposition === 'equal' &&
 					  operationState.indexRevision !== undefined
@@ -1419,7 +1504,10 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		let summary: ReturnType<typeof normalizeReplicaResult>;
 		try {
 			const update = (writer: BaseCacheWriter) => {
-				const guarded = this.#guardIndexWriter(writer);
+				const guarded = this.#guardIndexWriter(
+					writer,
+					sharedMembershipAdmitted ? fencedIndexKeys : undefined
+				);
 				this.#applyTombstoneEvidence(
 					guarded,
 					recordEvidence.tombstones,
@@ -1554,12 +1642,36 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		} else if (live?.reset === true || !snapshot.indexesComparable) {
 			operationState.cursors = Object.freeze([]);
 		}
-		if (source === 'live' && !unsupportedLive) {
+		if (source === 'live') {
 			this.#advanceOperationGeneration(key);
 		}
 			if (source !== 'live' && sourceSwitched) {
 				this.#restartLive(key);
 			}
+		if (source === 'live') {
+			const liveEntry = this.#lives.get(key);
+			if (liveEntry !== undefined) {
+				liveEntry.fencedIndexKeys =
+					fencedIndexKeys !== undefined && !sharedMembershipAdmitted
+						? fencedIndexKeys
+						: undefined;
+			}
+		}
+		if (writeIndexes) {
+			this.#reopenStreamsFencedBy(
+				key,
+				summary.indexKeys.filter(
+					(indexKey) =>
+						!(sharedMembershipAdmitted && fencedIndexKeys!.has(indexKey))
+				)
+			);
+		}
+		if (source === 'live' && sharedDisposition.restartAfterRetirement) {
+			// This receiver began before a shared owner retired. Its buffered
+			// frame stays fenced, but a fresh receiver starts after that boundary
+			// and can obtain an authoritative replacement without polling.
+			this.#restartLive(key);
+		}
 			this.#trustedPresets = nextTrustedPresets;
 			this.#protocolGeneration = nextProtocolGeneration;
 		this.#resumeLiveWatches();
@@ -1752,7 +1864,12 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		}
 	}
 
-	#guardIndexWriter(writer: BaseCacheWriter): BaseCacheWriter {
+	#guardIndexWriter(
+		writer: BaseCacheWriter,
+		ownedElsewhere?: ReadonlySet<string>
+	): BaseCacheWriter {
+		// Equal shared memberships stay with their independent owner.
+		const skip = (key: string): boolean => ownedElsewhere?.has(key) === true;
 		return {
 			recordClock: (key) => writer.recordClock(key),
 			writeRecord: (write) => writer.writeRecord(write),
@@ -1760,6 +1877,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				writer.tombstoneRecord(key, revision, incarnation),
 			discardRecord: (key) => writer.discardRecord(key),
 			writeIndex: (write) => {
+				if (skip(write.key)) return false;
 				const recordsForIndex = this.#membershipFences.get(write.key);
 				if (write.complete === true && recordsForIndex !== undefined) {
 					const visible =
@@ -1787,9 +1905,57 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				return wrote;
 			},
 			markIndexStale: (key, reason, revision) =>
-				writer.markIndexStale(key, reason, revision),
-			deleteIndex: (key, revision) => writer.deleteIndex(key, revision)
+				!skip(key) && writer.markIndexStale(key, reason, revision),
+			deleteIndex: (key, revision) =>
+				!skip(key) && writer.deleteIndex(key, revision)
 		};
+	}
+
+	#fencedMembershipsMatch(
+		fencedIndexKeys: ReadonlySet<string>,
+		incoming: ReplicaIndexMemberships
+	): boolean {
+		return this.#engine.readConfirmed((reader) => {
+			for (const indexKey of fencedIndexKeys) {
+				const membership = incoming.get(indexKey);
+				const current = reader.index(indexKey);
+				if (
+					membership === undefined ||
+					membership === null ||
+					current === undefined ||
+					!current.complete ||
+					(current.staleRevision !== undefined &&
+						compareCanonicalDecimalStrings(current.staleRevision, current.revision) > 0) ||
+					(current.metadata?.nullValue === true) !== membership.nullValue ||
+					current.records.length !== membership.records.length ||
+					current.records.some(
+						(record, ordinal) => record !== membership.records[ordinal]
+					)
+				) {
+					return false;
+				}
+			}
+			return true;
+		});
+	}
+
+	/**
+	 * Reopen live streams whose last frame was fenced by a shared index that
+	 * another operation has now rewritten, so a fresh authoritative result is
+	 * compared against the new owner membership.
+	 */
+	#reopenStreamsFencedBy(writerKey: string, writtenKeys: readonly string[]): void {
+		if (writtenKeys.length === 0) return;
+		const reopen: string[] = [];
+		for (const [liveKey, entry] of this.#lives) {
+			if (liveKey === writerKey || !entry.active) continue;
+			const fenced = entry.fencedIndexKeys;
+			if (fenced === undefined) continue;
+			if (writtenKeys.some((indexKey) => fenced.has(indexKey))) {
+				reopen.push(liveKey);
+			}
+		}
+		for (const liveKey of reopen) this.#restartLive(liveKey);
 	}
 
 	#flushDeferredMembershipConfirms(): void {
@@ -2266,27 +2432,48 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		if (incomingIndexKeys.size === 0) return { compared: false };
 		const confirmedRevisions =
 			this.#confirmedIndexFences(incomingIndexKeys);
+		const liveStart = source === 'live' && !snapshot.indexesComparable
+			? this.#lives.get(currentKey)?.startRevision
+			: undefined;
 		let compared = false;
 		let lower = false;
 		let higher = false;
 		let incomparable = false;
+		let restartAfterRetirement = false;
+		const fencedIndexKeys = new Set<string>();
 		let equalRevision: string | undefined;
 		let latestOwnerRevision: string | undefined;
 		for (const [key, group] of this.#operationProtocols) {
 			if (key === currentKey) continue;
 			for (const state of [group.query, group.live]) {
 				if (state?.indexRevision === undefined) continue;
-				let ownsIncomingIndex = false;
+				const ownedIncomingKeys: string[] = [];
 				for (const indexKey of state.indexKeys) {
 					if (
 						incomingIndexKeys.has(indexKey) &&
 						confirmedRevisions.get(indexKey) === state.indexRevision
 					) {
-						ownsIncomingIndex = true;
-						break;
+						ownedIncomingKeys.push(indexKey);
 					}
 				}
-				if (!ownsIncomingIndex) continue;
+				if (ownedIncomingKeys.length === 0) continue;
+				if (
+					!snapshot.indexesComparable &&
+					state === group.live &&
+					state.retiredAtRevision !== undefined &&
+					liveStart !== undefined
+				) {
+					// A disposed stream is no longer an owner. Its boundary is
+					// still retained so a stream that started before disposal
+					// cannot win merely because the old transport later closed.
+					if (compareCanonicalDecimalStrings(liveStart, state.retiredAtRevision) > 0) {
+						continue;
+					}
+					// Reopen at most once per observed retirement boundary: the
+					// replacement's allocated start is strictly newer. Active
+					// siblings never trigger this recovery and remain fenced.
+					restartAfterRetirement = true;
+				}
 				latestOwnerRevision =
 					latestOwnerRevision === undefined ||
 					compareCanonicalDecimalStrings(
@@ -2316,7 +2503,15 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					disposition === 'fresh' ||
 					disposition === 'incomparable'
 				) {
+					// A registered stream starts after the query seeds already in
+					// this replica. It can take over those seeds, but not another
+					// live stream or query ownership acquired after it started.
+					if (
+						liveStart !== undefined && state === group.query &&
+						compareCanonicalDecimalStrings(liveStart, state.indexRevision) > 0
+					) continue;
 					incomparable = true;
+					for (const indexKey of ownedIncomingKeys) fencedIndexKeys.add(indexKey);
 					continue;
 				}
 				compared = true;
@@ -2350,7 +2545,12 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			 * explicit synchronous ingress retains its caller-defined order.
 			 */
 			if (requestRevision === undefined && source === 'live') {
-				return { compared: true, disposition: 'lower' };
+				return {
+					compared: true,
+					disposition: 'lower',
+					...(restartAfterRetirement ? { restartAfterRetirement: true } : {}),
+					...(!snapshot.indexesComparable ? { fencedIndexKeys } : {})
+				};
 			}
 			if (requestRevision === undefined) return { compared: false };
 			return latestOwnerRevision !== undefined &&
@@ -2777,7 +2977,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		snapshot: DistributedQuerySnapshot,
 		live: DistributedProtocolEnvelope['live']
 	): void {
-		if (live === undefined || !live.supported) return;
+		if (live === undefined || live.mode === 'snapshot') return;
 		if (!snapshot.indexesComparable) {
 			protocolInvalid(
 				'extensions.distributed.snapshot.indexesComparable'

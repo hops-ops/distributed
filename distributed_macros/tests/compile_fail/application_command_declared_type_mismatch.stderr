@@ -1,5 +1,0 @@
-error: handler input parameter does not match the declared `input = ...` type
-  --> tests/compile_fail/application_command_declared_type_mismatch.rs:13:13
-   |
-13 |     _input: ActualInput,
-   |             ^^^^^^^^^^^

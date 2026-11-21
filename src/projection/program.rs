@@ -170,7 +170,7 @@ impl ProjectionField {
 /// Closed authoritative logical mutation set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProjectionMutationKind {
+pub enum MutationKind {
     /// Create a row and conflict if it already exists.
     Insert,
     /// Replace or create a complete row.
@@ -189,7 +189,7 @@ pub enum ProjectionMutationKind {
     UpsertRelated,
 }
 
-impl ProjectionMutationKind {
+impl MutationKind {
     pub(crate) fn is_complete_write(self) -> bool {
         matches!(
             self,
@@ -375,7 +375,7 @@ impl ProjectionRelationshipEffect {
 pub struct ProjectionOperation {
     operation_id: String,
     staging_ordinal: u32,
-    kind: ProjectionMutationKind,
+    kind: MutationKind,
     target: ProjectionTarget,
     key: Vec<ProjectionKeyField>,
     fields: Vec<ProjectionField>,
@@ -394,7 +394,7 @@ impl ProjectionOperation {
     pub fn try_new(
         operation_id: impl Into<String>,
         staging_ordinal: u32,
-        kind: ProjectionMutationKind,
+        kind: MutationKind,
         target: ProjectionTarget,
         mut key: Vec<ProjectionKeyField>,
         mut fields: Vec<ProjectionField>,
@@ -422,13 +422,13 @@ impl ProjectionOperation {
                 reason: "a complete logical key is required".to_owned(),
             });
         }
-        if kind == ProjectionMutationKind::Delete && !fields.is_empty() {
+        if kind == MutationKind::Delete && !fields.is_empty() {
             return Err(ProjectionProgramError::InvalidOperation {
                 operation: operation_id,
                 reason: "delete cannot declare fields".to_owned(),
             });
         }
-        if kind != ProjectionMutationKind::Delete && fields.is_empty() {
+        if kind != MutationKind::Delete && fields.is_empty() {
             return Err(ProjectionProgramError::InvalidOperation {
                 operation: operation_id,
                 reason: "a write operation requires at least one field".to_owned(),
@@ -503,7 +503,7 @@ impl ProjectionOperation {
     }
 
     /// Return the authoritative logical mutation kind.
-    pub fn kind(&self) -> ProjectionMutationKind {
+    pub fn kind(&self) -> MutationKind {
         self.kind
     }
 
@@ -643,6 +643,31 @@ pub struct ProjectionProgram {
     version: u64,
     partition: ProjectionPartition,
     arms: Vec<ProjectionArm>,
+    #[serde(skip_serializing_if = "SourceOrdering::is_position")]
+    source_ordering: SourceOrdering,
+    #[serde(skip)]
+    id: ProjectionProgramId,
+}
+
+/// What orders the facts a program applies to one row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceOrdering {
+    /// Delivery position: facts apply in the order they arrive.
+    #[default]
+    Position,
+    /// Each fact is a full snapshot of a local aggregate; its version fences
+    /// older snapshots out.
+    AggregateSnapshot,
+    /// Each fact is a full snapshot from an external source; the source's own
+    /// version fences older snapshots out.
+    ExternalSnapshot,
+}
+
+impl SourceOrdering {
+    fn is_position(&self) -> bool {
+        *self == Self::Position
+    }
 }
 
 impl ProjectionProgram {
@@ -683,7 +708,7 @@ impl ProjectionProgram {
                 return Err(ProjectionProgramError::DuplicateSelector);
             }
         }
-        Ok(Self {
+        Self {
             ir_version: PROJECTION_PROGRAM_IR_VERSION,
             operation_semantics_version: PROJECTION_OPERATION_SEMANTICS_VERSION,
             limits: ProjectionProgramLimits::version_one(),
@@ -691,7 +716,58 @@ impl ProjectionProgram {
             version,
             partition,
             arms,
-        })
+            source_ordering: SourceOrdering::Position,
+            id: ProjectionProgramId([0; 32]),
+        }
+        .identified()
+    }
+
+    /// Fix the identity of the finished program. Every constructor ends here,
+    /// so a program in hand always carries the digest of its own bytes.
+    fn identified(mut self) -> Result<Self, ProjectionProgramError> {
+        self.id = ProjectionProgramId(digest_program(&self.canonical_bytes()?));
+        Ok(self)
+    }
+
+    /// Order this program's facts by `ordering` instead of delivery position.
+    ///
+    /// Snapshot ordering drops a fact older than the row it would write, which
+    /// loses work for a delta fold. So a snapshot program must use the unit
+    /// partition and only full-row upserts or deletes, with no relationship
+    /// effects. Aggregate and external snapshot programs reject each other's
+    /// facts.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a snapshot ordering on a program that is not full-row.
+    pub fn with_source_ordering(
+        mut self,
+        ordering: SourceOrdering,
+    ) -> Result<Self, ProjectionProgramError> {
+        let full_row = matches!(self.partition, ProjectionPartition::Unit)
+            && self.arms.iter().flat_map(|arm| arm.operations()).all(|op| {
+                matches!(op.kind(), MutationKind::Upsert | MutationKind::Delete)
+                    && op.relationship_effects().is_empty()
+                    && op.invalidations().is_empty()
+            });
+        if ordering != SourceOrdering::Position && !full_row {
+            return Err(ProjectionProgramError::InvalidOperation {
+                operation: self.name.clone(),
+                reason: "source snapshots require unit-partition full-row upserts/deletes without relationship effects".into(),
+            });
+        }
+        self.source_ordering = ordering;
+        self.identified()
+    }
+
+    /// Return what orders this program's facts.
+    pub fn source_ordering(&self) -> SourceOrdering {
+        self.source_ordering
+    }
+
+    /// Whether facts are full snapshots fenced by their source version.
+    pub fn source_snapshots(&self) -> bool {
+        self.source_ordering != SourceOrdering::Position
     }
 
     /// Return the stable program name.
@@ -738,15 +814,9 @@ impl ProjectionProgram {
         canonical_json_bytes(self)
     }
 
-    /// Compute the domain-separated identity of the complete program semantics.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed error if canonical serialization fails.
-    pub fn id(&self) -> Result<ProjectionProgramId, ProjectionProgramError> {
-        Ok(ProjectionProgramId(digest_program(
-            &self.canonical_bytes()?,
-        )))
+    /// Return the domain-separated identity of the complete program semantics.
+    pub fn id(&self) -> ProjectionProgramId {
+        self.id
     }
 }
 

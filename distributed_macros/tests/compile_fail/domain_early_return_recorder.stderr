@@ -1,4 +1,4 @@
-error: domain-marked #[event] methods cannot use `return` in version one because it skips post-transition capture
+error: #[event] methods cannot use `return`: it would skip the rest of the recorded transition
   --> tests/compile_fail/domain_early_return_recorder.rs:12:9
    |
 12 |         return;

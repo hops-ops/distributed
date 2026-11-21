@@ -3,9 +3,10 @@
 //! Maps the canonical [`Message`] onto NATS JetStream: [`NatsPublisher`] publishes
 //! to a subject (waiting for the JetStream publish ack — the durable publish
 //! threshold), and [`NatsJetStreamSource`] pulls from a durable consumer and
-//! settles via JetStream ack semantics (ack→`Ack`, nack→`Nak`, dead-letter/park→
-//! `Term`). The stable message id rides as the `Nats-Msg-Id` header so JetStream
-//! dedup and downstream `Message.id` agree.
+//! settles via JetStream ack semantics (ack→`Ack`, nack→`Nak` with the
+//! requested delay). Aggregate message IDs use `Nats-Msg-Id` unchanged. External facts
+//! retain their logical source identity separately; their broker dedup ID also
+//! binds content so altered retries reach the durable conflict fence.
 //!
 //! Requires the `nats` feature. Integration-tested in `tests/nats_transport`
 //! against a JetStream-enabled server (see `compose.yaml`).
@@ -28,6 +29,149 @@ use super::{retryable, MessagePublisher, TransportError};
 const MESSAGE_ID_HEADER: &str = "Nats-Msg-Id";
 /// Header carrying the canonical message kind.
 const MESSAGE_KIND_HEADER: &str = "X-Sourced-Kind";
+/// Header carrying the canonical payload media type.
+const CONTENT_TYPE_HEADER: &str = "Content-Type";
+/// External occurrences separate immutable fact identity from broker dedup.
+const LOGICAL_ID_HEADER: &str = "X-Distributed-Occurrence-Id";
+
+fn external_dedup_id(payload: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"distributed.nats.external-occurrence.v1\0");
+    // Canonical occurrence bytes include the immutable logical source identity.
+    digest.update(payload);
+    format!("external:sha256:{:x}", digest.finalize())
+}
+
+fn external_occurrence(
+    message: &Message,
+) -> Result<Option<crate::DomainEventOccurrence>, TransportError> {
+    let Ok(event) = crate::DomainEventOccurrence::from_canonical_bytes(&message.payload) else {
+        return Ok(None);
+    };
+    if event.external_source().is_none() {
+        return Ok(None);
+    }
+    if message.kind != super::MessageKind::Event
+        || message.id() != Some(event.id())
+        || message.name() != event.descriptor().name
+    {
+        return Err(TransportError::permanent(
+            "external occurrence differs from transport identity",
+        ));
+    }
+    Ok(Some(event))
+}
+
+pub(super) fn archived_identity_matches(
+    event: &crate::DomainEventOccurrence,
+    payload: &[u8],
+    headers: &async_nats::HeaderMap,
+) -> bool {
+    decode_headers(
+        event.descriptor().name.to_string(),
+        payload.to_vec(),
+        Some(headers),
+    )
+    .is_ok_and(|message| {
+        message.kind == super::MessageKind::Event && message.id() == Some(event.id())
+    })
+}
+
+fn unambiguous_identity_headers(headers: &async_nats::HeaderMap) -> bool {
+    [LOGICAL_ID_HEADER, MESSAGE_ID_HEADER, MESSAGE_KIND_HEADER]
+        .iter()
+        .all(|reserved| {
+            headers
+                .iter()
+                .filter(|(key, _)| key.to_string().eq_ignore_ascii_case(reserved))
+                .map(|(_, values)| values.len())
+                .sum::<usize>()
+                <= 1
+        })
+}
+
+fn decode_headers(
+    name: String,
+    payload: Vec<u8>,
+    headers: Option<&async_nats::HeaderMap>,
+) -> Result<Message, TransportError> {
+    if headers.is_some_and(|headers| !unambiguous_identity_headers(headers)) {
+        return Err(TransportError::permanent(
+            "ambiguous occurrence identity header",
+        ));
+    }
+    let values: Vec<_> = headers
+        .into_iter()
+        .flat_map(|headers| headers.iter())
+        .flat_map(|(key, values)| {
+            values
+                .iter()
+                .map(move |value| (key.to_string(), value.to_string()))
+        })
+        .collect();
+    // External publishers always emit the exact kind. Do not let the generic
+    // transport's permissive unknown-kind default turn poison into an event.
+    if crate::DomainEventOccurrence::from_canonical_bytes(&payload)
+        .is_ok_and(|event| event.external_source().is_some())
+        && !values
+            .iter()
+            .any(|(key, value)| key.eq_ignore_ascii_case(MESSAGE_KIND_HEADER) && value == "event")
+    {
+        return Err(TransportError::permanent(
+            "external occurrence event kind is missing or invalid",
+        ));
+    }
+    let mut message = message_from_wire(
+        name,
+        payload,
+        Some(MESSAGE_ID_HEADER),
+        MESSAGE_KIND_HEADER,
+        values,
+    );
+    restore_external_identity(&mut message)?;
+    Ok(message)
+}
+
+fn restore_external_identity(message: &mut Message) -> Result<(), TransportError> {
+    let ids: Vec<_> = message
+        .metadata
+        .iter()
+        .filter(|(key, _)| key.eq_ignore_ascii_case(LOGICAL_ID_HEADER))
+        .map(|(_, value)| value.clone())
+        .collect();
+    message
+        .metadata
+        .retain(|(key, _)| !key.eq_ignore_ascii_case(LOGICAL_ID_HEADER));
+    if ids.is_empty() {
+        if crate::DomainEventOccurrence::from_canonical_bytes(&message.payload)
+            .is_ok_and(|event| event.external_source().is_some())
+        {
+            return Err(TransportError::permanent(
+                "external occurrence logical identity is missing",
+            ));
+        }
+        return Ok(());
+    }
+    if ids.len() != 1 || message.id() != Some(external_dedup_id(&message.payload).as_str()) {
+        return Err(TransportError::permanent(
+            "invalid external occurrence transport identity",
+        ));
+    }
+    let event = crate::DomainEventOccurrence::from_canonical_bytes(&message.payload)
+        .map_err(|_| TransportError::permanent("invalid external occurrence payload"))?;
+    if event.external_source().is_none()
+        || event.id() != ids[0]
+        || event.descriptor().name != message.name()
+        || message.kind != super::MessageKind::Event
+    {
+        return Err(TransportError::permanent(
+            "external occurrence differs from transport identity",
+        ));
+    }
+    message.id = Some(ids[0].clone());
+    Ok(())
+}
 
 /// Publishes canonical messages to a NATS JetStream subject.
 ///
@@ -75,13 +219,28 @@ impl MessagePublisher for NatsPublisher {
     async fn publish(&self, mut message: Message) -> Result<(), TransportError> {
         let subject = self.subject(&message);
         let mut headers = async_nats::HeaderMap::new();
-        if let Some(id) = message.id() {
+        for (key, value) in &message.metadata {
+            if [
+                MESSAGE_ID_HEADER,
+                MESSAGE_KIND_HEADER,
+                CONTENT_TYPE_HEADER,
+                LOGICAL_ID_HEADER,
+            ]
+            .iter()
+            .any(|reserved| key.eq_ignore_ascii_case(reserved))
+            {
+                continue;
+            }
+            headers.insert(key.as_str(), value.as_str());
+        }
+        if let Some(event) = external_occurrence(&message)? {
+            headers.insert(MESSAGE_ID_HEADER, external_dedup_id(&message.payload));
+            headers.insert(LOGICAL_ID_HEADER, event.id());
+        } else if let Some(id) = message.id() {
             headers.insert(MESSAGE_ID_HEADER, id);
         }
         headers.insert(MESSAGE_KIND_HEADER, message.kind.as_str());
-        for (key, value) in &message.metadata {
-            headers.insert(key.as_str(), value.as_str());
-        }
+        headers.insert(CONTENT_TYPE_HEADER, message.content_type.as_str());
 
         // `message` is owned and dropped here, so move its payload out instead of
         // cloning. `Bytes::from(Vec<u8>)` takes ownership of the buffer (no copy).
@@ -105,7 +264,6 @@ pub struct NatsJetStreamSource {
     consumer: Consumer<PullConfig>,
     fetch_timeout: Duration,
     strip_prefix: Option<String>,
-    idle_poll: Duration,
 }
 
 impl NatsJetStreamSource {
@@ -115,11 +273,11 @@ impl NatsJetStreamSource {
             consumer,
             fetch_timeout: Duration::from_millis(500),
             strip_prefix: None,
-            idle_poll: Duration::ZERO,
         }
     }
 
-    /// How long `recv` waits for a message before returning `Ok(None)`.
+    /// How long `recv` waits for a message before reporting that none is
+    /// available.
     pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.fetch_timeout = timeout;
         self
@@ -133,12 +291,6 @@ impl NatsJetStreamSource {
     /// subject is the name).
     pub fn with_strip_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.strip_prefix = Some(prefix.into());
-        self
-    }
-
-    /// Keep `recv` retrying after an empty fetch instead of draining to idle.
-    pub fn with_idle_poll(mut self, idle_poll: Duration) -> Self {
-        self.idle_poll = idle_poll;
         self
     }
 
@@ -195,33 +347,35 @@ impl MessageSource for NatsJetStreamSource {
         "nats"
     }
 
-    async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
-        loop {
-            let mut batch = self
-                .consumer
-                .batch()
-                .max_messages(1)
-                .expires(self.fetch_timeout)
-                .messages()
-                .await
-                .map_err(|err| retryable("nats fetch", err))?;
+    fn settles_independently(&self) -> bool {
+        // JetStream explicit acks settle each delivery by its own reply subject.
+        true
+    }
 
-            match batch.next().await {
-                Some(Ok(message)) => {
-                    return Ok(Some(NatsReceived::from_jetstream(
-                        message,
-                        self.strip_prefix.as_deref(),
-                    )))
-                }
-                Some(Err(err)) => return Err(retryable("nats batch message", err)),
-                None if self.idle_poll.is_zero() => return Ok(None),
-                None => continue,
+    async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
+        let mut batch = self
+            .consumer
+            .batch()
+            .max_messages(1)
+            .expires(self.fetch_timeout)
+            .messages()
+            .await
+            .map_err(|err| retryable("nats fetch", err))?;
+
+        match batch.next().await {
+            // A delivery that cannot be decoded fails the receive: it is not
+            // acknowledged, so it is retained for repair and no later cursor
+            // is sealed past it.
+            Some(Ok(message)) => {
+                NatsReceived::from_jetstream(message, self.strip_prefix.as_deref()).map(Some)
             }
+            Some(Err(err)) => Err(retryable("nats batch message", err)),
+            None => Ok(None),
         }
     }
 }
 
-/// A JetStream message plus the means to ack/nak/term it.
+/// A JetStream message plus the means to ack or nak it.
 pub struct NatsReceived {
     raw: jetstream::Message,
     message: Message,
@@ -229,33 +383,27 @@ pub struct NatsReceived {
 }
 
 impl NatsReceived {
-    fn from_jetstream(raw: jetstream::Message, strip_prefix: Option<&str>) -> Self {
+    fn from_jetstream(
+        raw: jetstream::Message,
+        strip_prefix: Option<&str>,
+    ) -> Result<Self, TransportError> {
         let name = strip_address_prefix(raw.subject.to_string(), strip_prefix);
         let payload = raw.payload.to_vec();
-        let headers: Vec<(String, String)> = raw
-            .headers
-            .as_ref()
-            .into_iter()
-            .flat_map(|headers| headers.iter())
-            .filter_map(|(key, values)| {
-                values
-                    .last()
-                    .map(|value| (key.to_string(), value.to_string()))
-            })
-            .collect();
-        let message = message_from_wire(
-            name,
-            payload,
-            Some(MESSAGE_ID_HEADER),
-            MESSAGE_KIND_HEADER,
-            headers,
-        );
+        let message = decode_headers(name, payload, raw.headers.as_ref())?;
         let ordered = jetstream_ordered(&raw);
-        Self {
+        Ok(Self {
             raw,
             message,
             ordered,
-        }
+        })
+    }
+
+    /// Delivery attempt count reported by JetStream (1 for the first delivery).
+    fn delivered(&self) -> u64 {
+        self.raw
+            .info()
+            .map(|info| u64::try_from(info.delivered).unwrap_or(1))
+            .unwrap_or(1)
     }
 
     async fn settle(self, kind: AckKind) -> Result<(), TransportError> {
@@ -286,6 +434,10 @@ impl ReceivedMessage for NatsReceived {
         &self.message
     }
 
+    fn attempts(&self) -> u32 {
+        u32::try_from(self.delivered()).unwrap_or(u32::MAX)
+    }
+
     fn ordered_delivery(&self) -> Option<&OrderedDelivery> {
         self.ordered.as_ref()
     }
@@ -294,18 +446,145 @@ impl ReceivedMessage for NatsReceived {
         self.settle(AckKind::Ack).await
     }
 
-    async fn nack(self, _reason: &str) -> Result<(), TransportError> {
-        // Nak with no delay: JetStream redelivers per the consumer policy.
-        self.settle(AckKind::Nak(None)).await
+    async fn nack(self, delay: Duration) -> Result<(), TransportError> {
+        let delay = (!delay.is_zero()).then_some(delay);
+        self.settle(AckKind::Nak(delay)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::MessageKind;
+
+    #[derive(serde::Serialize, serde::Deserialize, crate::DomainEvent)]
+    #[domain_event(name = "external.balance_recorded", version = 1)]
+    struct Balance {
+        value: u64,
     }
 
-    async fn dead_letter(self, _reason: &str) -> Result<(), TransportError> {
-        // Term: stop redelivery. A real DLQ bridge can subscribe to the stream's
-        // advisory/max-deliver subjects; Term is the "do not redeliver" signal.
-        self.settle(AckKind::Term).await
+    fn external_message(position: u64, value: u64) -> Message {
+        let event = crate::DomainEventOccurrence::capture_external(
+            crate::ExternalEventSource {
+                producer: "ledger.adapter".into(),
+                stream: "account-one".into(),
+                position,
+                key: "balance".into(),
+            },
+            std::time::UNIX_EPOCH,
+            Default::default(),
+            &Balance { value },
+        )
+        .unwrap();
+        Message::new(
+            event.descriptor().name.to_string(),
+            MessageKind::Event,
+            event.canonical_bytes().unwrap(),
+        )
+        .with_id(event.id())
     }
 
-    async fn park(self, _reason: &str) -> Result<(), TransportError> {
-        self.settle(AckKind::Term).await
+    #[test]
+    fn external_nats_identity_binds_logical_fact_and_content_without_changing_aggregate_ids() {
+        let first = external_message(1, 10);
+        let altered = external_message(1, 11);
+        let next = external_message(2, 10);
+        assert_eq!(first.id(), altered.id());
+        assert_ne!(
+            external_dedup_id(&first.payload),
+            external_dedup_id(&altered.payload)
+        );
+        assert_ne!(
+            external_dedup_id(&first.payload),
+            external_dedup_id(&next.payload)
+        );
+        let mut wire = first.clone();
+        wire.id = Some(external_dedup_id(&wire.payload));
+        wire.metadata
+            .push((LOGICAL_ID_HEADER.into(), first.id().unwrap().into()));
+        restore_external_identity(&mut wire).unwrap();
+        assert_eq!(wire.id, first.id);
+        assert_eq!(wire.payload, first.payload);
+        assert_eq!(wire.metadata, first.metadata);
+        let mut ordinary = Message::new("record.changed", MessageKind::Event, b"{}".to_vec())
+            .with_id("aggregate-message");
+        assert!(external_occurrence(&ordinary).unwrap().is_none());
+        restore_external_identity(&mut ordinary).unwrap();
+        assert_eq!(ordinary.id(), Some("aggregate-message"));
+    }
+
+    #[test]
+    fn external_nats_forged_or_ambiguous_logical_headers_fail_closed() {
+        let first = external_message(1, 10);
+        for (logical, broker) in [
+            ("forged".to_string(), external_dedup_id(&first.payload)),
+            (first.id().unwrap().to_string(), "forged-broker".to_string()),
+        ] {
+            let mut wire = first.clone();
+            wire.id = Some(broker);
+            wire.metadata.push((LOGICAL_ID_HEADER.into(), logical));
+            assert!(restore_external_identity(&mut wire).is_err());
+        }
+        let mut repeated = first.clone();
+        repeated.id = Some(external_dedup_id(&first.payload));
+        repeated.metadata = vec![
+            (LOGICAL_ID_HEADER.into(), first.id().unwrap().into()),
+            (LOGICAL_ID_HEADER.to_lowercase(), first.id().unwrap().into()),
+        ];
+        assert!(restore_external_identity(&mut repeated).is_err());
+    }
+
+    #[test]
+    fn retained_archive_rejects_same_ambiguity_as_live_delivery() {
+        let message = external_message(1, 10);
+        let event = crate::DomainEventOccurrence::from_canonical_bytes(&message.payload).unwrap();
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(MESSAGE_ID_HEADER, external_dedup_id(&message.payload));
+        headers.insert(LOGICAL_ID_HEADER, event.id());
+        headers.insert(MESSAGE_KIND_HEADER, "event");
+        assert!(archived_identity_matches(
+            &event,
+            &message.payload,
+            &headers
+        ));
+        for name in [
+            LOGICAL_ID_HEADER.to_string(),
+            LOGICAL_ID_HEADER.to_lowercase(),
+            MESSAGE_ID_HEADER.to_string(),
+            MESSAGE_ID_HEADER.to_lowercase(),
+        ] {
+            let mut forged = headers.clone();
+            forged.append(name, "conflicting-extra-value");
+            assert!(!unambiguous_identity_headers(&forged));
+            assert!(!archived_identity_matches(
+                &event,
+                &message.payload,
+                &forged
+            ));
+        }
+    }
+
+    #[test]
+    fn content_type_selection_removes_every_case_variant() {
+        let message = message_from_wire(
+            "example.recorded".into(),
+            Vec::new(),
+            Some(MESSAGE_ID_HEADER),
+            MESSAGE_KIND_HEADER,
+            [
+                (
+                    "Content-Type".to_string(),
+                    "application/vnd.example+binary".to_string(),
+                ),
+                ("x-correlation-id".to_string(), "corr-1".to_string()),
+                ("content-type".to_string(), "application/json".to_string()),
+            ],
+        );
+
+        assert_eq!(message.content_type, "application/vnd.example+binary");
+        assert_eq!(
+            message.metadata,
+            vec![("x-correlation-id".into(), "corr-1".into())]
+        );
     }
 }

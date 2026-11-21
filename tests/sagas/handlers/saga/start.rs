@@ -2,14 +2,20 @@ use super::*;
 
 pub const COMMAND: &str = "saga.start";
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["saga_id", "order_id", "customer_id", "items", "total_cents"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub saga_id: String,
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<StartSagaInput>()?;
+pub fn command() -> TypedCommand<StartSagaInput, Succeeded<Output>> {
+    typed_command::<StartSagaInput, Succeeded<Output>>(COMMAND)
+}
 
-    let mut saga = OrderFulfillmentSaga::new();
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, OrderFulfillmentSaga>,
+    input: StartSagaInput,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
+    let mut saga = ctx.repo().create();
     saga.start(
         input.saga_id.clone(),
         input.order_id.clone(),
@@ -31,6 +37,7 @@ pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
         },
     )?;
 
-    ctx.repo().outbox(msg).commit(&mut saga).await?;
-    Ok(json!({ "saga_id": input.saga_id }))
+    ctx.repo().outbox(msg).commit(saga)?.succeeded(Output {
+        saga_id: input.saga_id,
+    })
 }

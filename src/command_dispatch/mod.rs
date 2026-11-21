@@ -1,46 +1,34 @@
-//! Versioned command dispatch boundary for local and remote execution.
-//!
-//! GraphQL mutation execution and process hosts depend on
-//! [`CommandDispatcher`] rather than a concrete `Service`. Schema and client
-//! compilation never construct a dispatcher.
+//! The command host: the one boundary GraphQL, the schedule worker and cell
+//! callers dispatch typed commands through, in process or over HTTP.
 
-mod envelope;
-mod error;
 #[cfg(feature = "graphql")]
 mod host;
-mod local;
-mod remote;
+pub(crate) mod principal;
 
-pub use envelope::{
-    CommandDispatchEnvelope, CommandDispatchReceipt, COMMAND_DISPATCH_ENVELOPE_VERSION,
-};
-pub use error::CommandDispatchError;
 #[cfg(feature = "graphql")]
 pub(crate) use host::{validate_principal_session, validate_principal_session_if_present};
 #[cfg(feature = "graphql")]
-pub use host::{CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost};
-pub use local::LocalCommandDispatcher;
-pub use remote::{
-    RemoteCommandDispatcher, RemoteDispatchConfig, RemoteTrustMode,
-    APPROVED_REMOTE_DISPATCH_PROFILE,
+pub use host::{
+    CellRequestContext, CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost,
+    TrustedRequestMetadata,
 };
+pub use principal::{InvalidPrincipal, VerifiedPrincipal};
 
-use crate::microsvc::{CommandRequest, CommandResponse};
-use async_trait::async_trait;
-use std::sync::Arc;
-
-/// Object-safe async command dispatcher shared by GraphQL and process hosts.
-#[async_trait]
-pub trait CommandDispatcher: Send + Sync {
-    /// Dispatch one versioned command request and return the durable response.
-    async fn dispatch(
-        &self,
-        request: &CommandRequest,
-    ) -> Result<CommandResponse, CommandDispatchError>;
-
-    /// Human-stable dispatcher kind for inspection/metrics.
-    fn kind(&self) -> &'static str;
+/// The command ID of work an ingress starts from a request that can be
+/// delivered again (a provider webhook): one sequence of `parts` always
+/// yields one ID, so the ledger replays a redelivery instead of running it.
+///
+/// `parts` must name the request and nothing that changes between
+/// deliveries of it; start them with a tag of the ingress so two sources
+/// cannot derive the same ID. The ledger scopes the ID to the service and the
+/// principal. A dispatch nothing can repeat takes a fresh UUIDv7 instead.
+pub fn deterministic_command_id(parts: &[&str]) -> String {
+    use sha2::Digest;
+    let mut key = sha2::Sha256::new();
+    key.update(b"distributed.ingress-command");
+    for part in parts {
+        key.update((part.len() as u64).to_be_bytes());
+        key.update(part.as_bytes());
+    }
+    crate::command_ledger::deterministic_command_id(key)
 }
-
-/// Shared handle used by GraphQL engines and runtimes.
-pub type SharedCommandDispatcher = Arc<dyn CommandDispatcher>;

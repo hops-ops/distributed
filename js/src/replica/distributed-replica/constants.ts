@@ -11,3 +11,6 @@ export const EMPTY_CACHE_SNAPSHOT = Object.freeze({
 	records: Object.freeze([]),
 	indexes: Object.freeze([])
 });
+/** Reopen backoff after a live failure frame (`docs/live-query-delivery.md`). */
+export const LIVE_FAILURE_RETRY_BASE_MS = 1_000;
+export const LIVE_FAILURE_RETRY_MAX_MS = 30_000;

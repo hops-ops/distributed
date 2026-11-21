@@ -6,7 +6,8 @@ import {
 	createDistributedSvelteKitServer,
 	DistributedSvelteKitBoundaryController,
 	defineDistributedBoundaryBinding,
-	defineDistributedBoundaryOperation
+	defineDistributedBoundaryOperation,
+	searchParam
 } from '../dist/sveltekit/index.js';
 import { createDistributedReplica } from '../dist/replica/index.js';
 import {
@@ -62,12 +63,12 @@ const BoundTodosArtifact = Object.freeze({
 function binding(limit = 20) {
 	return defineDistributedBoundaryBinding(BoundTodosArtifact, {
 		id: { kind: 'route_param', name: 'itemId' },
-		limit: { kind: 'constant', value: limit },
+		limit: typeof limit === 'number' ? { kind: 'constant', value: limit } : limit,
 		nil: { kind: 'constant', value: null },
 		omitted: { kind: 'omit' },
 		owner: { kind: 'trusted_session', path: ['user', 'id'] },
 		payload: { kind: 'forwarded_prop', path: ['filters'] },
-		tags: { kind: 'search_param', name: 'tag', mode: 'all' }
+		tags: searchParam('tag', 'String', 'all')
 	});
 }
 
@@ -137,8 +138,8 @@ test('one boundary binding canonicalizes route, search, session, constant, and f
 	assert.equal(first.canonicalBytes(context()), JSON.stringify(variables));
 	assert.deepEqual(
 		first.resolve({ ...context(), search: {} }).tags,
-		[],
-		'an absent record-backed multi-value search parameter matches URLSearchParams.getAll'
+		undefined,
+		'an absent multi-value search parameter is omitted so operation defaults can apply'
 	);
 	assert.equal(binding().id, first.id, 'equivalent bindings have stable fingerprints');
 	assert.notEqual(binding(21).id, first.id, 'binding contract changes alter hydration identity');
@@ -187,7 +188,7 @@ test('boundary binding fails closed for missing values, hostile keys, accessors,
 });
 
 test('SSR, hydration, component use, navigation read, and prefetch share canonical boundary variables', async () => {
-	const boundary = operation();
+	const boundary = operation(binding(searchParam('pageSize', 'Int')));
 	const sent = [];
 	const server = createDistributedSvelteKitServer({
 		boundaries: [boundary],
@@ -195,6 +196,7 @@ test('SSR, hydration, component use, navigation read, and prefetch share canonic
 		getRole: () => 'user'
 	});
 	const serverContext = context();
+	serverContext.search.set('pageSize', '20');
 	const page = await server.load({
 		locals: { session: serverContext.session },
 		route: { id: '/items/[itemId]' },
@@ -220,6 +222,7 @@ test('SSR, hydration, component use, navigation read, and prefetch share canonic
 	assert.equal(page.gqlError, null);
 	assert.deepEqual(page.distributed.bindings, [boundary.binding.id]);
 	assert.deepEqual(sent, [boundary.binding.resolve(serverContext)]);
+	assert.equal(sent[0].limit, 20, 'URL text becomes a GraphQL Int before SSR transport');
 
 	let browserFetches = 0;
 	const client = createDistributedSvelteKit({

@@ -1,0 +1,11 @@
+error: ticket claim field `userId` looks like identity: identity is only ever the verified `sub`, and rewards and economy values are decided by command handlers, never vouched for in a ticket
+ --> tests/compile_fail/ticket_extension_identity.rs:7:5
+  |
+7 |     userId: String,
+  |     ^^^^^^
+
+error: ticket claim field `Gold` looks like an economy value: identity is only ever the verified `sub`, and rewards and economy values are decided by command handlers, never vouched for in a ticket
+ --> tests/compile_fail/ticket_extension_identity.rs:8:22
+  |
+8 |     #[serde(rename = "Gold")]
+  |                      ^^^^^^

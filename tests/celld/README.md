@@ -1,4 +1,4 @@
-# celld 0.4 aggregate cells, Queue, and bus relay
+# celld aggregate cells, Queue, and bus relay
 
 This fixture exercises the write side of the Distributed flow:
 
@@ -8,41 +8,88 @@ command -> AggregateCell -> domain event -> same-cell outbox
 ```
 
 The aggregate Worker owns one SQLite Durable Object per Todo or Chat shard.
-`AggregateCell::durable_state` assembles the event log, command ledger,
-snapshot/sealed state, and outbox into one versioned envelope. The Worker saves
-that envelope with one SQLite upsert, so the aggregate mutation and its outbox
-are one cell commit. The host attaches `CelldOutbox::from_env(&env, "OUTBOX")`
-to the `AggregateCell`, then `persist_and_drain_outbox` owns the complete
-persist, watchdog, Queue dispatch, settlement persistence, and alarm-rearming
-lifecycle. celld's output gate holds Queue egress until the cell write is
-durable. If settlement persistence is interrupted, the same stable event id may
-be delivered again; consumers must deduplicate by that id.
+The same SQL operations used by native repositories append event rows, maintain
+snapshots, fence command receipts and enqueue pending delivery rows. Each
+command commits those participants inside one `storage.transactionSync`.
+There is no whole-cell JSON value, authoritative in-memory shadow, or host
+persistence callback.
 
 ```rust,ignore
-let cell = AggregateCell::<Todo>::new_with_snapshots(shard, 1)?
+let cell = AggregateCell::<Todo>::from_state_with_snapshots(state, 100)?
     .mount(create())
     .mount(complete())
     .with_celld_outbox(CelldOutbox::from_env(&env, "OUTBOX")?);
 
-let drain = cell.persist_and_drain_outbox(&env, &storage, |state| {
-    persist_cell_state(&sql, state)
-})
-.await?;
-for error in drain.deferred {
-    worker::console_error!("outbox drain deferred: {error}");
+// Dispatch arms the durable watchdog before invoking the command.
+let result = cell.dispatch_idempotent(command, &identity, input, session).await?;
+
+// Optional immediate delivery after commit. A drain error is diagnostic here:
+// it cannot turn an already committed command into a rejection.
+match cell.drain_outbox(&env).await {
+    Ok(drain) => {
+        for error in drain.deferred {
+            worker::console_error!("outbox drain deferred: {error}");
+        }
+    }
+    Err(error) => worker::console_error!("outbox drain deferred: {error}"),
 }
+
+// The Durable Object alarm handler calls cell.alarm(&env): it fires due cell
+// alarms (see docs/coordination-primitives.md) and then drains the outbox.
 ```
 
-The same `persist_and_drain_outbox` call runs after a command and from the
-Durable Object alarm. It persists the full state before Queue egress, arms the
-watchdog before publishing, persists any settlements even when a later store
-operation errors, and clears the alarm only when no retryable rows remain.
-Failure to persist that first state or arm its watchdog rejects the request.
-After both are established, the command is durably accepted: Queue, settlement,
-or later alarm-operation failures are returned in
-`CelldOutboxDrainOutcome::deferred` for diagnostics while the already-armed
-watchdog owns retry. Released Queue outcomes likewise stay pending. Neither can
-turn an already committed command into an HTTP error.
+Domain cell alarms share the one Durable Object alarm with the outbox
+watchdog; every wake is set to the earliest of the two. `alarm-worker/` is a
+Ticker cell that arms, re-arms and cancels alarms, and `alarms.mjs` proves it
+on an isolated `celld dev` (including a crash and restart):
+
+```sh
+(cd tests/celld/alarm-worker && worker-build --release)
+CELLD_BIN=celld node tests/celld/alarms.mjs
+```
+
+The Queue lives in another cell: its acceptance is **not** part of the
+aggregate's SQLite transaction. celld's output gate orders Queue egress after
+the aggregate write becomes durable. The prearmed alarm covers the gap between
+that commit and Queue acceptance, including process loss without another request.
+
+A drain claims rows, sends them, and deletes each matching lease-fenced row
+after acceptance. A crash after acceptance but before deletion can deliver the
+same stable event ID again; consumers must deduplicate. Queue publication or
+settlement failures retain pending/in-flight work for the watchdog. An alarm
+keeps a wake scheduled while commands are running, including suspended commands.
+An empty drain never deletes another command's alarm; the last scheduled wake
+simply finds no work and stops.
+
+Snapshots use the ordinary repository cache validation, upcasting and tail
+loader on both native and cell command paths. A valid snapshot avoids loading
+old event payloads; an unusable cache rebuilds from the authoritative events.
+
+### Breaking storage and host API change
+
+Workers now open cells with `AggregateCell::from_state` or
+`from_state_with_snapshots`, and use `drain_outbox` from their alarm handler.
+The whole-state export/restore and `persist_and_drain_outbox` APIs are not
+available on the Worker host. Native in-process conformance fixtures are not a
+production persistence adapter.
+
+### No native durable cells
+
+Durable cells run on celld only, for local development (`celld dev`) and
+deployment alike. The native `cell-sqlite` backend (one rusqlite file per
+cell) was removed in v5: a native build has only the in-process reference
+host, for unit tests (`CellStreamStore::for_identity`, whole-state
+export/restore, `ManualClock` alarms). A native process that needs durable
+aggregates talks to celld over the internal path (`CelldCommandHost`,
+`distributed_game::celld::CelldFactSink`); see `examples/game/cells` for a
+zone server's cells.
+
+Existing `cell_state` databases are rejected with an explicit migration-required
+error. They are not silently reset or opened through a legacy adapter. Back up
+retained development data and migrate it explicitly before changing an existing
+fleet; creating a fresh test namespace is appropriate only for disposable data.
+The SQL migration inventory and checksums also reject incompatible or newer
+schemas.
 
 Queue is intentionally not modeled as a full Distributed `Bus`: it has one
 consumer and no fanout. `CelldQueueRelay` is generic over `MessagePublisher`,
@@ -51,6 +98,19 @@ consumer POSTs the canonical envelope to the authenticated native relay route.
 The e2e-celld host wires that one route to `BusPublisher<NatsBus>`. Kafka,
 RabbitMQ, and Knative use the same Queue consumer and relay contract; only the
 native `BusPublisher<B>` changes.
+
+## Command retry receipts
+
+The wait-path response gets its projection inputs from
+`CausalDispatchResult::projection_events()`, stored atomically with the command's
+terminal retry receipt. It does not scan the outbox. A retry therefore returns
+the same result and projection inputs even when delivery has removed the outbox
+rows. Receipt evidence follows the existing command replay retention; event
+history belongs in the event store, not in delivery records.
+
+This changes the internal successful cell replay payload. Previously persisted
+successful receipts are not silently accepted as the new format. The public
+HTTP response shape is unchanged.
 
 ## Queue naming and sharding
 
@@ -94,7 +154,8 @@ correctness.
 
 ## Local celld
 
-Prerequisites: Docker (for NATS), celld 0.4, `worker-build`, and the
+Prerequisites: Docker (for NATS), celld (the version in `/.celld-version`,
+checked by `scripts/celld.sh`; `CELLD_BIN` selects the binary), `worker-build`, and the
 `wasm32-unknown-unknown` Rust target.
 
 ```sh
@@ -103,7 +164,7 @@ make -C tests/celld test
 make -C tests/celld down
 ```
 
-celld 0.4 development mode supplies its own local object store; Azurite, MinIO,
+celld development mode supplies its own local object store; Azurite, MinIO,
 and an external S3 endpoint are not used. The canonical profile stores cell and
 Queue data in `tests/celld/worker/.celld/dev`. `make down` and `make reload`
 preserve that directory.
@@ -120,6 +181,50 @@ and consumer deployments as separate scripts without changing the relay code.
 Without `CELLD_URL`, `cargo test --test celld` checks the fixtures and skips the
 live HTTP round trips.
 
+The independent storage proof owns a temporary celld fleet and deliberately
+kills only the processes it starts:
+
+```sh
+(cd tests/celld/worker && worker-build --release --features storage-conformance)
+node tests/celld/storage-conformance.mjs
+```
+
+It requires Node.js, sqlite3, esbuild and celld in addition to the Worker
+toolchain. It tests final-write rollback across multi-chunk event/outbox inserts
+(the Worker uses at most 100 bound parameters per SQL statement), lease fencing during commit,
+Queue-acceptance/delete crash redelivery with stable IDs, prearmed-alarm
+recovery without another cell request, and receipt replay after delivery. It
+also retains 1,101 unsent messages and more than 8 MiB of event payload in one
+snapshot-backed cell, restarts it, and verifies that alarms drain the backlog
+without another aggregate request. Events and receipts remain; delivered
+outbox rows do not.
+Queue row visibility is not a local settlement barrier: publication and deletion
+are separate awaited operations, and a competing replay drain may find every row
+already claimed by an alarm. The crash proof uses bounded read-only probes to
+observe zero local outbox rows before replay or another command. Exact zero-row,
+stable-envelope and event-count assertions remain; no sleep substitutes for
+observing settlement.
+It prints and retains its temporary artifact directory. Fault probes are
+feature-gated out of ordinary Worker builds. CI runs this proof separately
+from the full Queue/NATS/browser profile.
+
 Every non-health aggregate route requires `DISTRIBUTED_INTERNAL_SECRET`. The
 checked-in value is loopback test data only; production requires a separately
 provisioned secret plus the normal network policy.
+
+## Zones as celld objects
+
+`zone-worker/` hosts a small tally zone with `distributed_game`'s
+`celld-zone` feature (one Durable Object per zone, `celld_zone_object!`),
+its `Tally` cells and the `ZoneActivity` cell. `distributed_game`'s
+`celld_zone` test drives it over WebSockets: on `celld dev` (join, input,
+facts, dormant → hibernated, wake with state, single-use tickets, a
+doorway handoff) and on a three-node production-mode fleet on one RustFS
+bucket started with docker compose (a forwarded socket closes with 1012
+when the owner node is killed, the zone recovers on another node, and 200
+in-flight facts reach the cell exactly once):
+
+```sh
+(cd tests/celld/zone-worker && worker-build --release)
+CELLD_BIN=… CELLD_ESBUILD=… cargo test -p distributed_game --features celld,net --test celld_zone
+```

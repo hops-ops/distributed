@@ -5,15 +5,15 @@
 //! with compile-time reject remaining as defense-in-depth.
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{
     comparison_op_fields, include_postgres_json_comparison_ops, read, GraphqlEngine,
     ModelPermissions, POSTGRES_JSON_COMPARISON_OPS,
 };
 use distributed::ReadModel;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePoolOptions;
 
-use super::common::{assert_no_sql_leak, error_messages, session};
+use super::common::{assert_no_sql_leak, error_messages, session, Db};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("docs")]
@@ -24,23 +24,15 @@ struct DocView {
     payload: serde_json::Value,
 }
 
-async fn seed_docs() -> sqlx::SqlitePool {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE docs (doc_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
-         INSERT INTO docs VALUES ('d1', '{\"a\":1}');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    pool
-}
-
-fn engine(pool: sqlx::SqlitePool) -> GraphqlEngine {
-    GraphqlEngine::builder(pool)
+async fn engine() -> GraphqlEngine {
+    let db = Db::sqlite().await;
+    db.seed([DocView {
+        doc_id: "d1".into(),
+        payload: serde_json::json!({ "a": 1 }),
+    }])
+    .await;
+    GraphqlEngine::builder(db.pool())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<DocView>(ModelPermissions::new().grant("user", read().all_columns()))
         .build()
@@ -60,7 +52,7 @@ fn naming_matrix_sqlite_omits_pg_json_ops() {
 /// SQLite runtime: `_contains` is not a field on JSON_comparison_exp.
 #[tokio::test]
 async fn sqlite_json_contains_is_unknown_field() {
-    let engine = engine(seed_docs().await);
+    let engine = engine().await;
     let s = session("user", "u");
     let resp = engine
         .execute(
@@ -83,7 +75,7 @@ async fn sqlite_json_contains_is_unknown_field() {
 
 #[tokio::test]
 async fn sqlite_json_has_key_is_unknown_field() {
-    let engine = engine(seed_docs().await);
+    let engine = engine().await;
     let s = session("user", "u");
     let resp = engine
         .execute(
@@ -102,7 +94,7 @@ async fn sqlite_json_has_key_is_unknown_field() {
 
 #[tokio::test]
 async fn sqlite_json_contained_in_is_unknown_field() {
-    let engine = engine(seed_docs().await);
+    let engine = engine().await;
     let s = session("user", "u");
     let resp = engine
         .execute(
@@ -119,7 +111,7 @@ async fn sqlite_json_contained_in_is_unknown_field() {
 /// Portable `_eq` is a known field on JSON_comparison_exp (SQLite).
 #[tokio::test]
 async fn sqlite_json_eq_is_known_field() {
-    let engine = engine(seed_docs().await);
+    let engine = engine().await;
     let s = session("user", "u");
     let resp = engine
         .execute(

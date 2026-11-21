@@ -16,14 +16,14 @@ mod tests {
     };
     use crate::projection_protocol::{
         ProjectionCheckpointProbe, ProjectionExecutionSnapshotBatchRequest,
-        ProjectionGraphSnapshotRequest, ProjectionObservationRequest,
+        ProjectionGraphSnapshotRequest, ProjectionLiveRecordRequest, ProjectionObservationRequest,
         ProjectionQuerySnapshotRequest, ProjectionRecordMutation, ProjectionScopeCodec,
     };
     use crate::repository::{CommitBatch, ReadModelWritePlanStore, TransactionalCommit};
     use crate::table::{
         ColumnType, DeleteTableRowMutation, ExpectedVersion, ForeignKey, PrimaryKey,
-        RelationshipDef, RelationshipKind, RowKey, RowValue, RowValues, RowWriteMode,
-        TableColumn, TableKind, TableRowMutation, TableSchema, TableSchemaRegistry,
+        RelationshipDef, RelationshipKind, RowKey, RowValue, RowValues, RowWriteMode, TableColumn,
+        TableKind, TableRowMutation, TableSchema, TableSchemaRegistry,
     };
 
     fn topology() -> ProjectorTopologyId {
@@ -34,7 +34,7 @@ mod tests {
         ProjectorTopologyId::new(1, "other_sql_todo_projector", [99; 32]).unwrap()
     }
 
-    fn partition() -> ProjectionPartition {
+    fn partition() -> PartitionId {
         ProjectionScopeCodec::new(topology())
             .encode_partition(Some(&serde_json::json!("tenant-sql")))
             .unwrap()
@@ -162,6 +162,7 @@ mod tests {
             indexes: Vec::new(),
             relationships: vec![
                 RelationshipDef {
+                    references: None,
                     field_name: "children".into(),
                     kind: RelationshipKind::HasMany,
                     target_model: "SqlGraphChildView".into(),
@@ -170,6 +171,7 @@ mod tests {
                     target_foreign_key: None,
                 },
                 RelationshipDef {
+                    references: None,
                     field_name: "featured_children".into(),
                     kind: RelationshipKind::HasMany,
                     target_model: "SqlGraphChildView".into(),
@@ -228,12 +230,14 @@ mod tests {
     fn graph_key(model: &str) -> RowKey {
         RowKey::new([(
             "id",
-            RowValue::String(match model {
-                "SqlGraphParentView" => "parent-1",
-                "SqlGraphChildView" => "child-1",
-                other => panic!("unknown SQL graph model {other}"),
-            }
-            .into()),
+            RowValue::String(
+                match model {
+                    "SqlGraphParentView" => "parent-1",
+                    "SqlGraphChildView" => "child-1",
+                    other => panic!("unknown SQL graph model {other}"),
+                }
+                .into(),
+            ),
         )])
     }
 
@@ -269,7 +273,7 @@ mod tests {
                 mode: RowWriteMode::Upsert,
             }),
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
         .unwrap()
     }
@@ -286,10 +290,7 @@ mod tests {
         ProjectionGraphSnapshotRequest::new(
             root,
             [
-                (
-                    "children".into(),
-                    Arc::new(graph_child_schema().clone()),
-                ),
+                ("children".into(), Arc::new(graph_child_schema().clone())),
                 (
                     "featured_children".into(),
                     Arc::new(graph_child_schema().clone()),
@@ -342,7 +343,7 @@ mod tests {
                 mode: RowWriteMode::Upsert,
             }),
             expectation,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
         .unwrap()
     }
@@ -360,6 +361,12 @@ mod tests {
 
     fn ownership() -> ProjectionModelOwnership {
         ProjectionModelOwnership::new("SqlTodoView", "sql_todo_views").unwrap()
+    }
+
+    fn semantic_program_id(fill: char) -> crate::ProjectionProgramId {
+        let hex = std::iter::repeat_n(fill, 64).collect::<String>();
+        crate::ProjectionProgramId::parse(&format!("pp1:sha256:{hex}"))
+            .expect("test semantic program ID is canonical")
     }
 
     #[derive(Clone, Copy)]
@@ -380,7 +387,7 @@ mod tests {
             other_topology()
         }
 
-        fn partition(&self) -> ProjectionPartition {
+        fn partition(&self) -> PartitionId {
             partition()
         }
 
@@ -395,7 +402,7 @@ mod tests {
         fn mutation(
             &self,
             expectation: ProjectionRecordExpectation,
-            kind: ProjectionMutationKind,
+            kind: RecordTransition,
         ) -> ProjectionRecordMutation {
             mutation(expectation, kind)
         }
@@ -463,6 +470,33 @@ mod tests {
             .await
             .unwrap();
         (repository, database_path)
+    }
+
+    async fn reopen_wal_repository(path: &Path) -> SqlxRepository<sqlx::Sqlite> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(false)
+                    .journal_mode(SqliteJournalMode::Wal),
+            )
+            .await
+            .unwrap();
+        let repository = SqlxRepository::<sqlx::Sqlite>::new(pool)
+            .with_projection_change_retention(ProjectionChangeRetention::new(16).unwrap());
+        repository.migrate().await.unwrap();
+        let mut registry = TableSchemaRegistry::new();
+        registry.register_schema(schema().clone()).unwrap();
+        repository
+            .bootstrap_table_schema_for_dev(&registry)
+            .await
+            .unwrap();
+        repository
+            .register_projection_models(&topology(), &[ownership()])
+            .await
+            .unwrap();
+        repository
     }
 
     async fn remove_wal_database(repository: SqlxRepository<sqlx::Sqlite>, path: &Path) {
@@ -548,7 +582,7 @@ mod tests {
                 mode: RowWriteMode::Upsert,
             }),
             expectation,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
         .unwrap()
     }
@@ -572,15 +606,15 @@ mod tests {
 
     fn mutation(
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
     ) -> ProjectionRecordMutation {
         let table = match kind {
-            ProjectionMutationKind::Delete => TableMutation::DeleteRow(DeleteTableRowMutation {
+            RecordTransition::Delete => TableMutation::DeleteRow(DeleteTableRowMutation {
                 schema: schema(),
                 key: RowKey::new([("id", RowValue::String("todo-1".into()))]),
                 expected_version: ExpectedVersion::Any,
             }),
-            ProjectionMutationKind::Upsert | ProjectionMutationKind::Recreate => {
+            RecordTransition::Upsert | RecordTransition::Recreate => {
                 upsert_table_mutation("todo-1")
             }
         };
@@ -716,6 +750,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_identical_redelivery_advances_only_broker_checkpoint() {
+        crate::projection_protocol::scenario_tests::identical_redelivery_advances_only_broker_checkpoint(ProjectionScenario).await;
+    }
+
+    #[tokio::test]
     async fn sqlite_obligation_and_unpartitioned_live_evidence_are_exact_and_durable() {
         let evidence_repository = repository().await;
         let scope = record_scope();
@@ -737,7 +776,7 @@ mod tests {
             vec![None]
         );
 
-        let created = evidence_repository
+        evidence_repository
             .commit_projection(batch(
                 input(
                     1,
@@ -748,7 +787,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 vec![ProjectionObservationRequest {
                     kind: ProjectionObservationKind::Record,
@@ -769,77 +808,6 @@ mod tests {
                 .scope(),
             &scope
         );
-        let observed = crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-            "evidence-cause",
-            scope.clone(),
-            ProjectionObservationKind::Record,
-        )
-        .unwrap();
-        let pending = crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-            "pending-cause",
-            scope.clone(),
-            ProjectionObservationKind::Record,
-        )
-        .unwrap();
-        let before_failure = evidence_repository
-            .projection_obligation_evidence_batch(
-                &ProjectionObligationEvidenceBatchRequest::new(vec![
-                    observed.clone(),
-                    pending.clone(),
-                ])
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            &before_failure.evidence[0],
-            ProjectionObligationEvidence::Observed(observation)
-                if observation.change == created.changes[0].cursor
-        ));
-        assert_eq!(
-            before_failure.evidence[1],
-            ProjectionObligationEvidence::Pending
-        );
-
-        let failure = evidence_repository
-            .record_projection_failure(
-                ProjectionFailureBatch::new(
-                    input(
-                        2,
-                        b"evidence-failed",
-                        "evidence-message-2",
-                        "evidence-cause",
-                        ProjectionGeneration::initial(),
-                    ),
-                    change_epoch(),
-                    "evidence-failure",
-                    "decode_error",
-                    b"bad evidence payload".to_vec(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        evidence_repository
-            .compact_projection_changes(&failure.change)
-            .await
-            .unwrap();
-        let after_failure = evidence_repository
-            .projection_obligation_evidence_batch(
-                &ProjectionObligationEvidenceBatchRequest::new(vec![observed, pending]).unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            &after_failure.evidence[0],
-            ProjectionObligationEvidence::TerminalFailure(stored)
-                if stored == &failure
-        ));
-        assert_eq!(
-            after_failure.evidence[1],
-            ProjectionObligationEvidence::Pending
-        );
-
         let moved_repository = repository().await;
         let old_scope = record_scope();
         let old = moved_repository
@@ -853,7 +821,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -872,7 +840,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Exact(old.revision),
-                    ProjectionMutationKind::Delete,
+                    RecordTransition::Delete,
                 )],
                 Vec::new(),
             ))
@@ -918,7 +886,7 @@ mod tests {
                     new_scope.clone(),
                     upsert_table_mutation("todo-1"),
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )
                 .unwrap()],
                 observations: Vec::new(),
@@ -986,7 +954,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -1016,6 +984,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_modeled_projection_identity_is_durable_across_restart_and_null_history_stays_readable(
+    ) {
+        let (repository, database_path) = wal_repository_with_retention(16).await;
+        let program_a = semantic_program_id('a');
+        let scope = record_scope();
+        let result = repository
+            .commit_projection(ProjectionCommitBatch {
+                input: input(
+                    1,
+                    b"semantic-identity-a",
+                    "semantic-identity-message-a",
+                    "semantic-identity-cause-a",
+                    ProjectionGeneration::initial(),
+                ),
+                change_epoch: change_epoch(),
+                ownership: vec![ownership().with_program_id(program_a)],
+                mutations: vec![mutation(
+                    ProjectionRecordExpectation::Missing,
+                    RecordTransition::Upsert,
+                )],
+                observations: vec![ProjectionObservationRequest {
+                    kind: ProjectionObservationKind::Record,
+                    target: ProjectionObservationTarget::StagedRecord(scope.clone()),
+                }],
+            })
+            .await
+            .unwrap();
+        assert!(result
+            .changes
+            .iter()
+            .all(|change| change.program_id == Some(program_a)));
+
+        let selected =
+            ProjectionCausationEvidenceRequest::new("semantic-identity-cause-a", vec![topology()])
+                .unwrap();
+        let evidence = repository
+            .projection_causation_evidence(&selected)
+            .await
+            .unwrap();
+        assert_eq!(evidence.observations.len(), 1);
+        assert_eq!(evidence.observations[0].program_id, Some(program_a));
+
+        repository.pool().close().await;
+        let reopened = reopen_wal_repository(&database_path).await;
+        let changes = match reopened
+            .projection_changes(&topology(), &partition(), None, 100)
+            .await
+            .unwrap()
+        {
+            ProjectionChangeRead::Changes { changes, .. } => changes,
+            other => panic!("restarted repository must retain projection changes: {other:?}"),
+        };
+        assert_eq!(
+            changes.len(),
+            1,
+            "the staged observation shares the record change"
+        );
+        assert!(changes
+            .iter()
+            .all(|change| change.program_id == Some(program_a)));
+        let evidence = reopened
+            .projection_causation_evidence(&selected)
+            .await
+            .unwrap();
+        assert_eq!(evidence.observations.len(), 1);
+        assert_eq!(evidence.observations[0].program_id, Some(program_a));
+
+        // Rows written before semantic identities existed remain useful after
+        // migration, but their null identity cannot mint modeled proof.
+        sqlx::query("UPDATE projection_changes SET program_id = NULL WHERE causation_id = ?")
+            .bind("semantic-identity-cause-a")
+            .execute(reopened.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE projection_observations SET program_id = NULL WHERE causation_id = ?")
+            .bind("semantic-identity-cause-a")
+            .execute(reopened.pool())
+            .await
+            .unwrap();
+        let null_history = reopened
+            .projection_causation_evidence(&selected)
+            .await
+            .unwrap();
+        assert_eq!(null_history.observations.len(), 1);
+        assert_eq!(null_history.observations[0].program_id, None);
+        let readable = reopened
+            .projection_live_record_batch(
+                &ProjectionLiveRecordBatchRequest::new(vec![ProjectionLiveRecordRequest::new(
+                    &scope_codec(),
+                    "SqlTodoView",
+                    record_key(),
+                )
+                .unwrap()])
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            readable.records[0].is_some(),
+            "unversioned rows remain readable"
+        );
+        assert_eq!(
+            readable.records[0].as_ref().unwrap().revision.scope(),
+            &scope
+        );
+
+        remove_wal_database(reopened, &database_path).await;
+    }
+
+    #[tokio::test]
     async fn sqlite_receipts_source_fences_and_raw_write_fence_are_exact() {
         let repository = repository().await;
         let raw_error = repository
@@ -1038,7 +1116,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -1269,7 +1347,7 @@ mod tests {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Missing,
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
@@ -1303,7 +1381,7 @@ mod tests {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Missing,
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
@@ -1394,7 +1472,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 vec![ProjectionObservationRequest {
                     kind: ProjectionObservationKind::Record,
@@ -1422,7 +1500,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Exact(created.records[0].revision.clone()),
-                    ProjectionMutationKind::Delete,
+                    RecordTransition::Delete,
                 )],
                 vec![ProjectionObservationRequest {
                     kind: ProjectionObservationKind::Record,
@@ -1453,7 +1531,7 @@ mod tests {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Exact(deleted.records[0].revision.clone(),),
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
@@ -1471,7 +1549,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Exact(deleted.records[0].revision.clone()),
-                    ProjectionMutationKind::Recreate,
+                    RecordTransition::Recreate,
                 )],
                 vec![ProjectionObservationRequest {
                     kind: ProjectionObservationKind::Dependency,
@@ -2121,9 +2199,9 @@ mod tests {
             assert!(
                 matches!(
                     repository.commit_projection(failed_batch()).await,
-                    Err(ProjectionProtocolError::Table(TableStoreError::BackendStorage {
-                        ..
-                    }))
+                    Err(ProjectionProtocolError::Table(
+                        TableStoreError::BackendStorage { .. }
+                    ))
                 ),
                 "failure position {fail_at}"
             );
@@ -2148,7 +2226,10 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-            assert_eq!(physical_after, physical_before, "failure position {fail_at}");
+            assert_eq!(
+                physical_after, physical_before,
+                "failure position {fail_at}"
+            );
             for (index, expected) in snapshots_before.iter().enumerate() {
                 assert_eq!(
                     &repository
@@ -2344,7 +2425,7 @@ mod tests {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -2367,7 +2448,7 @@ mod tests {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Exact(created.records[0].revision.clone()),
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
@@ -2415,7 +2496,7 @@ mod tests {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Missing,
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
@@ -2813,6 +2894,21 @@ mod tests {
     #[tokio::test]
     async fn sqlite_direct_projection_and_ledger_replay_commit_atomically() {
         let repository = repository().await;
+        #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+        let (cache_store, cache_pool, cache_tables, cache_before) = {
+            let pool = crate::graphql::GraphqlPool::Sqlite(repository.pool().clone());
+            let tables = vec!["sql_todo_views".to_owned()];
+            let store = crate::graphql::delivery::GatewayVersionStore::install(
+                &pool,
+                "atomic-cache-test",
+                tables.clone(),
+            )
+            .await
+            .unwrap();
+            let before =
+                serde_json::to_value(store.current(&pool, &tables).await.unwrap()).unwrap();
+            (store, pool, tables, before)
+        };
         let command_id = uuid::Uuid::now_v7().hyphenated().to_string();
         let key = CommandLedgerKey::new(
             "projection-runtime-test",
@@ -2862,6 +2958,21 @@ mod tests {
             .await
             .unwrap();
 
+        #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+        let cache_committed = {
+            let committed = serde_json::to_value(
+                cache_store
+                    .current(&cache_pool, &cache_tables)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_ne!(
+                committed, cache_before,
+                "Atomic result and cache dependency versions commit together"
+            );
+            committed
+        };
         let metadata = repository
             .projection_record(&record_scope())
             .await
@@ -2956,6 +3067,18 @@ mod tests {
                 .unwrap(),
             CommandLookup::InProgress { .. }
         ));
+        #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+        assert_eq!(
+            serde_json::to_value(
+                cache_store
+                    .current(&cache_pool, &cache_tables)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            cache_committed,
+            "failed Atomic ledger completion must roll back cache versions too"
+        );
         sqlx::query("DROP TRIGGER fail_direct_ledger_completion")
             .execute(repository.pool())
             .await

@@ -1,4 +1,4 @@
-//! Context passed to handlers.
+//! Context passed to event handlers.
 //!
 //! Carries the message, parsed JSON payload when available, session variables,
 //! and a reference to the service dependencies. Handlers access everything they
@@ -11,8 +11,10 @@ use super::dependencies::{HasReadModelStore, HasRepo};
 use super::error::HandlerError;
 use super::session::Session;
 use crate::bus::Message;
+use crate::Aggregate;
 
-/// The context passed to every handler.
+/// The context passed to every event handler. A typed command handler
+/// receives a [`CausalCommandContext`](super::CausalCommandContext) instead.
 ///
 /// Generic over `D` (the service dependency type) so handlers can access the
 /// repository, read-model store, or custom dependencies the service is
@@ -24,8 +26,7 @@ use crate::bus::Message;
 /// pub async fn handle(
 ///     ctx: &Context<'_, Repo>,
 /// ) -> Result<Value, HandlerError> {
-///     let user_id = ctx.user_id()?;
-///     let input = ctx.input::<CreateOrderInput>()?;
+///     let input = ctx.input::<OrderCreated>()?;
 ///     let repo = ctx.repo();
 ///     // ... commit via repo.commit(&mut agg).await? ...
 /// }
@@ -67,11 +68,6 @@ impl<'a, D> Context<'a, D> {
         &self.input
     }
 
-    /// Get the command name.
-    pub fn command_name(&self) -> &str {
-        self.message.name()
-    }
-
     /// Get the message name.
     pub fn message_name(&self) -> &str {
         self.message.name()
@@ -80,6 +76,22 @@ impl<'a, D> Context<'a, D> {
     /// Get the full message, including id, raw payload bytes, and metadata.
     pub fn message(&self) -> &Message {
         self.message
+    }
+
+    /// Carry the current message's causal command identity into events emitted
+    /// by a downstream aggregate.
+    ///
+    /// Event-driven policies should call this before invoking aggregate
+    /// transitions. Captured and explicitly published domain events then retain
+    /// the same causal projection qualification as the event being handled.
+    pub fn inherit_causation<A: Aggregate>(&self, aggregate: &mut A) -> Result<(), HandlerError> {
+        let causation_id = self.message.causation_id().ok_or_else(|| {
+            HandlerError::DecodeFailed(
+                "causal event handler input is missing a causation ID".into(),
+            )
+        })?;
+        aggregate.entity_mut().set_causation_id(causation_id);
+        Ok(())
     }
 
     /// Get the session.
@@ -128,5 +140,72 @@ impl<'a, D> Context<'a, D> {
     /// Check if the raw input contains all specified fields.
     pub fn has_fields(&self, fields: &[&str]) -> bool {
         fields.iter().all(|f| self.has_field(f))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::MessageKind;
+    use crate::trace_context::CAUSATION_ID;
+    use crate::{Entity, EventRecord};
+
+    #[derive(Default)]
+    struct DownstreamAggregate {
+        entity: Entity,
+    }
+
+    impl Aggregate for DownstreamAggregate {
+        type ReplayError = String;
+
+        fn entity(&self) -> &Entity {
+            &self.entity
+        }
+
+        fn entity_mut(&mut self) -> &mut Entity {
+            &mut self.entity
+        }
+
+        fn replay_event(&mut self, _event: &EventRecord) -> Result<(), Self::ReplayError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn handler_context_propagates_causation_to_new_events() {
+        let message = Message::new("source.event", MessageKind::Event, b"{}".to_vec())
+            .with_metadata(CAUSATION_ID, "cause-1");
+        let dependencies = ();
+        let context = Context::new(
+            &message,
+            Value::Object(Default::default()),
+            Session::new(),
+            &dependencies,
+        );
+        let mut aggregate = DownstreamAggregate::default();
+
+        context.inherit_causation(&mut aggregate).unwrap();
+        aggregate
+            .entity
+            .digest_empty("downstream.recorded")
+            .unwrap();
+
+        assert_eq!(aggregate.entity.events()[0].causation_id(), Some("cause-1"));
+    }
+
+    #[test]
+    fn handler_context_rejects_missing_causation() {
+        let message = Message::new("source.event", MessageKind::Event, b"{}".to_vec());
+        let dependencies = ();
+        let context = Context::new(
+            &message,
+            Value::Object(Default::default()),
+            Session::new(),
+            &dependencies,
+        );
+        let mut aggregate = DownstreamAggregate::default();
+
+        assert!(context.inherit_causation(&mut aggregate).is_err());
+        assert!(aggregate.entity.events().is_empty());
     }
 }

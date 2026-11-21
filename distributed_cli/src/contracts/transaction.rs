@@ -5,9 +5,7 @@
 
 use super::catalog::ContractCatalog;
 use super::chain::{check_predecessor_chain, ObservedPredecessor};
-use super::diagnostic::{
-    ContractCheckResult, ContractDiagnostic, ContractDiagnosticCode,
-};
+use super::diagnostic::{ContractCheckResult, ContractDiagnostic, ContractDiagnosticCode};
 use super::ContractArtifactKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,7 +23,9 @@ pub enum ContractAcceptScope {
     ApplicationManifest,
     DeploymentPlan,
     /// Exact client-program scope: `program:<id>`.
-    Program { id: String },
+    Program {
+        id: String,
+    },
 }
 
 impl ContractAcceptScope {
@@ -190,10 +190,7 @@ pub fn contracts_accept(
     })
 }
 
-fn rollback(
-    root: &Path,
-    prior: &BTreeMap<String, Option<Vec<u8>>>,
-) -> Result<(), String> {
+fn rollback(root: &Path, prior: &BTreeMap<String, Option<Vec<u8>>>) -> Result<(), String> {
     for (relative, contents) in prior {
         let path = resolve_under_root(root, relative)?;
         match contents {
@@ -224,9 +221,7 @@ fn resolve_under_root(root: &Path, relative: &str) -> Result<PathBuf, String> {
             "accept path `{relative}` escapes or is not a portable relative path"
         ));
     }
-    let root = root
-        .canonicalize()
-        .unwrap_or_else(|_| root.to_path_buf());
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let candidate = root.join(relative);
     if let Ok(canonical) = candidate.canonicalize() {
         if !canonical.starts_with(&root) {
@@ -272,14 +267,15 @@ pub fn unknown_scope_diagnostic(scope: &str) -> ContractDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("distributed-contracts-accept-{nanos}"));
+        // Unique per call: tests run in parallel and the clock alone repeats.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "distributed-contracts-accept-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         fs::create_dir_all(&root).unwrap();
         root
     }

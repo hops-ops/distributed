@@ -12,14 +12,12 @@ use std::ops::Deref;
 
 use sha2::{Digest, Sha256};
 
-use super::command_contract::{
-    compiled_direct_projection_target, validate_projection_confirmation_count, CommandConsistency,
-    CommandDirectProjectionTarget, CommandEffect, CommandEffects, CommandInputDefault,
-    CommandProjectedModel, CommandProjectionConfirmation, CommandProjectionEvents,
-    CommandProjectionPreviewSource, CompiledDirectProjectionTarget, EffectExpression,
-    EffectFieldValue, EffectKey, EffectRelationship,
-};
 use super::filter::{validate_row_policy_operand_literal, FilterExpr, Operand};
+use crate::command::{
+    compiled_direct_projection_target, CommandConsistency, CommandDirectProjectionTarget,
+    CommandInputDefault, CommandProjectedModel, CommandProjectionEvents,
+    CommandProjectionPreviewSource, CompiledDirectProjectionTarget, EffectExpression,
+};
 use crate::projection_protocol::ProjectionModelOwnership;
 use crate::projection_protocol::ProjectionPartitionSpec;
 use crate::table::{
@@ -38,6 +36,7 @@ mod build;
 mod commands;
 mod effects;
 mod identity;
+mod leaderboard;
 mod projections;
 mod roots;
 mod types;
@@ -47,10 +46,15 @@ mod validation;
 mod tests;
 
 pub use application::{
-    role_grants_for_role, surface_for_application, surface_for_application_contract,
-    surface_for_role, RoleGrant,
+    surface_for_application, surface_for_application_contract, surface_for_role,
 };
 pub use build::build_surface;
+pub use leaderboard::{
+    leaderboard_change_key, order_str as leaderboard_order_str, LeaderboardArgument,
+    LeaderboardBoards, LeaderboardGrant, LeaderboardOperation, LeaderboardRoot, LeaderboardSurface,
+    LEADERBOARD_DEFAULT_FIRST, LEADERBOARD_ENTRY_TYPE, LEADERBOARD_MAX_FIRST,
+    LEADERBOARD_MAX_RADIUS, MAX_LEADERBOARD_KEY_LEN,
+};
 pub use projections::SurfaceModeledProjection;
 pub(crate) use projections::{
     compile_projection_owner_topology, modeled_owner_partition_contract,
@@ -67,7 +71,7 @@ pub use types::{
 pub(crate) use commands::projected_output_reuses_surface_model;
 pub(in crate::graphql::surface) use commands::{
     bind_surface_direct_projection_targets, validate_and_canonicalize_commands,
-    validate_command_confirmation_topology,
+    validate_command_projection_topology,
 };
 pub(in crate::graphql::surface) use effects::*;
 pub(in crate::graphql::surface) use identity::*;

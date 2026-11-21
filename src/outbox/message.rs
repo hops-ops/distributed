@@ -125,6 +125,13 @@ pub struct OutboxMessage {
     pub source_aggregate_type: Option<String>,
     pub source_aggregate_id: Option<String>,
     pub source_sequence: Option<u64>,
+    /// Earliest time a worker may claim this message (a durable timer /
+    /// scheduled command). `None` means immediately deliverable. SQL stores
+    /// persist it in the existing `next_available_at` column, so a scheduled
+    /// message survives restart and is skipped by every claim query until it
+    /// is due. See [`OutboxMessage::deliver_at()`].
+    #[serde(default)]
+    pub deliver_at: Option<SystemTime>,
 }
 
 impl Default for OutboxMessage {
@@ -146,6 +153,7 @@ impl Default for OutboxMessage {
             source_aggregate_type: None,
             source_aggregate_id: None,
             source_sequence: None,
+            deliver_at: None,
         }
     }
 }
@@ -297,9 +305,11 @@ impl OutboxMessage {
                 ),
             )
             .map_err(|error| DomainEventCaptureError::BodyEncoding(error.to_string()))?;
-        message.source_aggregate_type = Some(occurrence.aggregate_type().to_string());
-        message.source_aggregate_id = Some(occurrence.aggregate_id().to_string());
-        message.source_sequence = Some(occurrence.aggregate_sequence());
+        if occurrence.external_source().is_none() {
+            message.source_aggregate_type = Some(occurrence.aggregate_type().to_string());
+            message.source_aggregate_id = Some(occurrence.aggregate_id().to_string());
+            message.source_sequence = Some(occurrence.aggregate_sequence());
+        }
         Ok(message)
     }
 
@@ -372,8 +382,37 @@ impl OutboxMessage {
         self.is_in_flight() && self.leased_until.map(|until| until <= now).unwrap_or(true)
     }
 
+    /// Whether the message is claimable at `now`: pending and due (see
+    /// [`deliver_at`](Self::deliver_at())), or in flight with an expired lease.
     pub fn is_claimable_at(&self, now: SystemTime) -> bool {
-        self.is_pending() || self.has_expired_lease_at(now)
+        (self.is_pending() && self.is_due_at(now)) || self.has_expired_lease_at(now)
+    }
+
+    /// Whether the scheduled delivery time (if any) has been reached.
+    pub fn is_due_at(&self, now: SystemTime) -> bool {
+        self.deliver_at.is_none_or(|at| at <= now)
+    }
+
+    /// Schedule this message: no worker claims it before `at`. This is the
+    /// durable-timer primitive — commit the message with the aggregate change
+    /// that arms the timer, and it survives restarts like any outbox row.
+    /// Times in the past (or `None` via [`deliver_now`](Self::deliver_now))
+    /// are immediately deliverable.
+    pub fn deliver_at(mut self, at: SystemTime) -> Self {
+        self.deliver_at = Some(at);
+        self
+    }
+
+    /// Schedule this message `delay` after `now` (see [`deliver_at`](Self::deliver_at())).
+    pub fn deliver_after(self, now: SystemTime, delay: Duration) -> Self {
+        let at = now.checked_add(delay).unwrap_or(now);
+        self.deliver_at(at)
+    }
+
+    /// Clear any schedule so the message is immediately deliverable.
+    pub fn deliver_now(mut self) -> Self {
+        self.deliver_at = None;
+        self
     }
 
     pub fn is_claimed_by(&self, worker_id: &str) -> bool {
@@ -439,6 +478,7 @@ impl OutboxMessage {
         self.source_aggregate_type = None;
         self.source_aggregate_id = None;
         self.source_sequence = None;
+        self.deliver_at = None;
         Ok(())
     }
 
@@ -528,13 +568,16 @@ impl OutboxMessage {
         Ok(())
     }
 
-    pub fn release(&mut self, error: String) -> SourcedResult {
+    /// Hand an in-flight message back for another attempt, claimable from
+    /// `available_at` on.
+    pub fn release(&mut self, error: String, available_at: SystemTime) -> SourcedResult {
         if !self.is_in_flight() {
             return Err(EventRecordError {
                 message: format!("outbox message `{}` is not in flight", self.id),
             });
         }
         self.status = OutboxMessageStatus::Pending;
+        self.deliver_at = Some(available_at);
         self.last_error = if error.is_empty() { None } else { Some(error) };
         self.worker_id = None;
         self.leased_until = None;
@@ -551,6 +594,20 @@ impl OutboxMessage {
         self.last_error = if error.is_empty() { None } else { Some(error) };
         self.worker_id = None;
         self.leased_until = None;
+        Ok(())
+    }
+
+    /// Put a failed message back in the queue with a fresh attempt count,
+    /// claimable at once.
+    pub fn requeue(&mut self) -> SourcedResult {
+        if self.status != OutboxMessageStatus::Failed {
+            return Err(EventRecordError {
+                message: format!("outbox message `{}` is not failed", self.id),
+            });
+        }
+        self.status = OutboxMessageStatus::Pending;
+        self.attempts = 0;
+        self.deliver_at = None;
         Ok(())
     }
 
@@ -870,7 +927,9 @@ mod tests {
             .claim_for("worker-1", Duration::from_secs(60))
             .unwrap();
 
-        message.release("timeout".into()).unwrap();
+        message
+            .release("timeout".into(), SystemTime::UNIX_EPOCH)
+            .unwrap();
         assert!(message.is_pending());
         assert_eq!(message.last_error.as_deref(), Some("timeout"));
 

@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use super::kafka::{KafkaPublisher, KafkaSource};
 use super::{
-    run_source, Bus, BusConsumer, BusTopologyConfig, MessagePublisher, MessageRouter, RunOptions,
-    TransportError,
+    run_source, Bus, BusConsumer, BusTopologyConfig, MessagePublisher, MessageRouter,
+    PublishDeadLetters, RunOptions, TransportError,
 };
 use super::{Message, MessageKind};
 
@@ -180,6 +180,7 @@ impl KafkaBus {
             .await?
             .with_fetch_timeout(self.fetch_timeout)
             .with_strip_prefix(prefix);
+        let options = options.or_dead_letters(|| Arc::new(PublishDeadLetters(self.clone())));
         run_source(router, source, options).await
     }
 }
@@ -255,14 +256,14 @@ mod tests {
     async fn listen_returns_ok_for_empty_plan_without_group() {
         let bus = test_bus();
         let router = Arc::new(EmptyRouter);
-        bus.listen(router, RunOptions::idempotent()).await.unwrap();
+        bus.listen(router, RunOptions::until_idle()).await.unwrap();
     }
 
     #[tokio::test]
     async fn subscribe_returns_ok_for_empty_plan_without_group() {
         let bus = test_bus();
         let router = Arc::new(EmptyRouter);
-        bus.subscribe(router, RunOptions::idempotent())
+        bus.subscribe(router, RunOptions::until_idle())
             .await
             .unwrap();
     }

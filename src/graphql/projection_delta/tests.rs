@@ -17,9 +17,10 @@ use super::types::{
     ProjectionMutationSource,
 };
 use super::*;
+
 use crate::graphql::{
-    build_surface, surface_for_role, DistributedClientSurfaceExport, RoleGrant,
-    SurfaceDirectProjection, SurfaceOptions, SurfaceProjector,
+    build_surface, read, surface_for_role, DistributedClientSurfaceExport, SurfaceDirectProjection,
+    SurfaceOptions, SurfaceProjector,
 };
 use crate::projection::catalog::ProjectionBindingActivation;
 use crate::projection::placement::{
@@ -36,8 +37,8 @@ use crate::table::{
 };
 use crate::{
     DomainEventBodyDescriptor, DomainEventBodyKind, DomainEventDescriptor, DomainEventEnvelope,
-    DomainEventOccurrence, ProjectionAssignment, ProjectionExpression, ProjectionInvalidation,
-    ProjectionKeyField, ProjectionMutationKind, ProjectionProgram, ProjectionRelationship,
+    DomainEventOccurrence, MutationKind, ProjectionAssignment, ProjectionExpression,
+    ProjectionInvalidation, ProjectionKeyField, ProjectionProgram, ProjectionRelationship,
     ProjectionRelationshipEffect, ProjectionValue, ProjectionValueType, ResolvedProjectionMutation,
     ResolvedProjectionRelationshipEffect, DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
     MAX_PROJECTION_EXPRESSION_DEPTH,
@@ -50,12 +51,12 @@ const FOREIGN_CAUSATION_ID: &str = "0190a000-0000-7000-8000-000000000018";
 const TEST_COMMAND_NAME: &str = "todo.modeled";
 
 #[allow(dead_code)]
-#[derive(Deserialize, crate::GraphqlInput)]
+#[derive(Deserialize, crate::CommandInput)]
 struct ModeledCommandInput {
     todo_id: String,
 }
 
-#[derive(Serialize, crate::GraphqlOutput)]
+#[derive(Serialize, crate::CommandOutput)]
 struct ModeledCommandOutput {
     accepted: bool,
 }
@@ -479,53 +480,116 @@ fn production_authority_binds_partition_and_obligation_tokens_to_request_scope()
     ));
 }
 
-#[test]
+/// Lower one actual occurrence for a caller whose `TodoView` grant carries
+/// `policy`, with `x-user-id` set to `claim`.
 #[cfg(feature = "graphql")]
-fn production_predicate_authorizes_only_complete_actual_after_rows() {
+fn lower_under_row_policy(
+    fixture: &ModeledFixture,
+    occurrence: DomainEventOccurrence,
+    claim: Option<&str>,
+    policy: crate::graphql::FilterExpr,
+) -> ProjectionDelta {
     use super::runtime::ProtocolProjectionDeltaRequestAuthority;
     use crate::graphql::protocol::{
         DistributedTrustedPreset, ProtocolTokenCodec, ProtocolTokenPurpose,
     };
 
-    fn lower(
-        fixture: &ModeledFixture,
-        occurrence: DomainEventOccurrence,
-        claim: Option<&str>,
-    ) -> ProjectionDelta {
-        let selected = selected_export_with_owner_policy(&fixture.surface);
-        let codec = ProtocolTokenCodec::new([0x6a; 32]);
-        let cache_scope = codec
-            .issue(ProtocolTokenPurpose::CacheScope, &("owner-policy", claim))
-            .unwrap();
-        let trusted_presets = claim
-            .map(|value| {
-                vec![DistributedTrustedPreset {
-                    name: "x-user-id".into(),
-                    codec: "string".into(),
-                    value: serde_json::Value::String(value.into()),
-                }]
-            })
-            .unwrap_or_default();
-        let request = ProtocolProjectionDeltaRequestAuthority::try_new(
-            selected,
-            codec,
-            crate::command_ledger::PrincipalPartitionId::new("owner-policy-principal").unwrap(),
-            "owner-policy-generation",
-            &cache_scope,
-            crate::command_ledger::CausationId::parse_stored(TEST_CAUSATION_ID.to_owned()).unwrap(),
-            1_000,
-            1_000,
-            2_000,
+    let selected = selected_export_with_row_policy(&fixture.surface, policy);
+    let codec = ProtocolTokenCodec::new([0x6a; 32]);
+    let cache_scope = codec
+        .issue(ProtocolTokenPurpose::CacheScope, &("owner-policy", claim))
+        .unwrap();
+    let trusted_presets = claim
+        .map(|value| {
+            vec![DistributedTrustedPreset {
+                name: "x-user-id".into(),
+                codec: "string".into(),
+                value: serde_json::Value::String(value.into()),
+            }]
+        })
+        .unwrap_or_default();
+    let request = ProtocolProjectionDeltaRequestAuthority::try_new(
+        selected,
+        codec,
+        crate::command_ledger::PrincipalPartitionId::new("owner-policy-principal").unwrap(),
+        "owner-policy-generation",
+        &cache_scope,
+        crate::command_ledger::CausationId::parse_stored(TEST_CAUSATION_ID.to_owned()).unwrap(),
+        1_000,
+        1_000,
+        2_000,
+    )
+    .unwrap()
+    .with_trusted_presets(trusted_presets);
+    let authority = ProjectionDeltaAuthority::try_new(request.export(), &request).unwrap();
+    let modeled = request.export().surface().projectors[0].modeled[0].clone();
+    let source = authority.source(&modeled).unwrap();
+    let plan = crate::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
+    let occurrence = ProjectionDeltaPlanOccurrence::actual(vec![(&source, &plan)]).unwrap();
+    authority.lower(&[occurrence]).unwrap()
+}
+
+/// The command-delta path decides a row policy as the query's SQL does. An
+/// `Upsert` carries every granted column, so anything short of TRUE must not
+/// produce one.
+#[test]
+#[cfg(feature = "graphql")]
+fn delta_row_policy_follows_sql_three_valued_logic() {
+    use crate::graphql::{claim, col, lit, FilterExpr, LitValue};
+
+    let fixture = modeled_fixture(
+        ProjectionBindingState::Active,
+        ProjectionExecutionClass::Causal,
+    );
+    let upserts = |policy: FilterExpr, caller: &str| {
+        lower_under_row_policy(
+            &fixture,
+            state_occurrence(7, "todo-1", "visible"),
+            Some(caller),
+            policy,
         )
-        .unwrap()
-        .with_trusted_presets(trusted_presets);
-        let authority = ProjectionDeltaAuthority::try_new(request.export(), &request).unwrap();
-        let modeled = request.export().surface().projectors[0].modeled[0].clone();
-        let source = authority.source(&modeled).unwrap();
-        let plan = crate::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
-        let occurrence = ProjectionDeltaPlanOccurrence::actual(vec![(&source, &plan)]).unwrap();
-        authority.lower(&[occurrence]).unwrap()
-    }
+        .operations
+        .iter()
+        .any(|operation| matches!(operation.mutation, ProjectionDeltaMutation::Upsert { .. }))
+    };
+    // The occurrence's row is owned by `owner-secret`.
+    let owner = || col("owner_id");
+    assert!(upserts(owner().neq(claim("x-user-id")), "someone-else"));
+    assert!(!upserts(owner().neq(claim("x-user-id")), "owner-secret"));
+    assert!(upserts(owner().is_in([claim("x-user-id")]), "owner-secret"));
+    assert!(!upserts(
+        owner().is_in([claim("x-user-id")]),
+        "someone-else"
+    ));
+
+    // A comparison with NULL is unknown, and so is its negation.
+    let null = || lit(LitValue::Null);
+    assert!(!upserts(owner().neq(null()), "owner-secret"));
+    assert!(!upserts(
+        FilterExpr::Not(Box::new(owner().eq(null()))),
+        "owner-secret"
+    ));
+    assert!(!upserts(
+        FilterExpr::In {
+            column: "owner_id".into(),
+            values: vec![lit("someone-else").into(), null().into()],
+            negated: true,
+        },
+        "owner-secret"
+    ));
+}
+
+#[test]
+#[cfg(feature = "graphql")]
+fn production_predicate_authorizes_only_complete_actual_after_rows() {
+    let lower = |fixture: &ModeledFixture, occurrence, claim| {
+        lower_under_row_policy(
+            fixture,
+            occurrence,
+            claim,
+            crate::graphql::col("owner_id").eq(crate::graphql::claim("x-user-id")),
+        )
+    };
 
     let complete = modeled_fixture(
         ProjectionBindingState::Active,
@@ -567,7 +631,7 @@ fn production_predicate_authorizes_only_complete_actual_after_rows() {
     let patch = modeled_fixture_with_kind(
         ProjectionBindingState::Active,
         ProjectionExecutionClass::Causal,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
     );
     let delta = lower(
         &patch,
@@ -600,14 +664,15 @@ fn application_wire_surface_uses_authenticated_role_policy_for_actual_rows() {
     let user_grants = BTreeMap::from([
         (
             "TodoView".into(),
-            RoleGrant::all_columns()
+            read()
+                .all_columns()
                 .rows(crate::graphql::col("owner_id").eq(crate::graphql::claim("x-user-id"))),
         ),
-        ("UserView".into(), RoleGrant::all_columns()),
+        ("UserView".into(), read().all_columns()),
     ]);
     let admin_grants = BTreeMap::from([
-        ("TodoView".into(), RoleGrant::all_columns()),
-        ("UserView".into(), RoleGrant::all_columns()),
+        ("TodoView".into(), read().all_columns()),
+        ("UserView".into(), read().all_columns()),
     ]);
     let grants_by_role = BTreeMap::from([
         ("delta-admin".into(), admin_grants),
@@ -624,7 +689,7 @@ fn application_wire_surface_uses_authenticated_role_policy_for_actual_rows() {
     .unwrap();
     assert!(matches!(
         application_surface.models["TodoView"].row_policy,
-        crate::graphql::surface::SurfaceRowPolicy::ServerOnly
+        crate::graphql::surface::SurfaceRowPolicy::ServerOnly(_)
     ));
     let export =
         DistributedClientSurfaceExport::from_selected("delta-service", application_surface)
@@ -687,9 +752,8 @@ fn zero_obligation_modeled_metadata_is_revalidated_on_every_receipt_emission() {
             command_id: "0190a000-0000-7000-8000-000000000011".into(),
             command_name: Some(TEST_COMMAND_NAME.into()),
             causation_id: Some(TEST_CAUSATION_ID.into()),
-            consistency: Some(crate::graphql::command_contract::CommandConsistency::Eventual),
+            consistency: Some(crate::command::CommandConsistency::Eventual),
             outcome: None,
-            obligations: Vec::new(),
             projection_metadata: Some(metadata),
             projection_revalidate: false,
             evidence: Vec::new(),
@@ -702,10 +766,9 @@ fn zero_obligation_modeled_metadata_is_revalidated_on_every_receipt_emission() {
             command_id: "modeled-status-command".into(),
             command_name: TEST_COMMAND_NAME.into(),
             causation_id: TEST_CAUSATION_ID.into(),
-            consistency: crate::graphql::command_contract::CommandConsistency::Eventual,
+            consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::SucceededPendingProjection,
             outcome: serde_json::json!({"ok": true}),
-            obligations: Vec::new(),
             projection_metadata: Some(metadata),
             direct_projection: None,
         }
@@ -880,10 +943,9 @@ fn zero_occurrence_metadata_is_classified_from_the_current_causal_command_contra
             command_id: "0190a000-0000-7000-8000-000000000012".into(),
             command_name: TEST_COMMAND_NAME.into(),
             causation_id: TEST_CAUSATION_ID.into(),
-            consistency: crate::graphql::command_contract::CommandConsistency::Eventual,
+            consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::Succeeded,
             outcome: serde_json::json!({"accepted": true}),
-            obligations: Vec::new(),
             projection_metadata: Some(metadata),
             direct_projection: None,
         }
@@ -1027,6 +1089,468 @@ fn zero_occurrence_metadata_is_classified_from_the_current_causal_command_contra
     assert_eq!(draining_command["projectionDisposition"], "revalidate");
     assert!(draining_command.get("projection").is_none());
     assert_eq!(draining_command["expects"], serde_json::json!([]));
+}
+
+#[cfg(feature = "graphql")]
+fn wait_path_fixture() -> (
+    crate::graphql::protocol::ProtocolResponseAccumulator,
+    crate::command::TypedCommandContract,
+    crate::OutboxMessage,
+) {
+    use std::sync::Arc;
+
+    use super::runtime::{ProtocolProjectionProgramRegistry, ProtocolProjectionRequestSeed};
+    use crate::graphql::protocol::{
+        DistributedEnvelopeV1, ProtocolResponseAccumulator, ProtocolTokenCodec,
+        ProtocolTokenPurpose,
+    };
+
+    let fixture = modeled_fixture(
+        ProjectionBindingState::Active,
+        ProjectionExecutionClass::Causal,
+    );
+    let registry =
+        Arc::new(ProtocolProjectionProgramRegistry::try_from_surface(&fixture.surface).unwrap());
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let seed = ProtocolProjectionRequestSeed::new(
+        selected_export(&fixture.surface),
+        registry,
+        crate::command_ledger::PrincipalPartitionId::new("wait-path-principal").unwrap(),
+        "wait-path-generation",
+        Vec::new(),
+        now_unix_ms,
+    )
+    .unwrap();
+    let codec = ProtocolTokenCodec::new([0x70; 32]);
+    let cache_scope = codec
+        .issue(ProtocolTokenPurpose::CacheScope, &("wait-path", "cache"))
+        .unwrap();
+    let accumulator = ProtocolResponseAccumulator::new(
+        DistributedEnvelopeV1::new("sha256:wait-path", "wait-path-auth", cache_scope, None),
+        codec,
+    );
+    accumulator.bind_projection_request(seed).unwrap();
+    let occurrence = state_occurrence(13, "todo-wait-path", "wait-path");
+    let event = crate::OutboxMessage::from_domain_event_occurrence(&occurrence).unwrap();
+    let contract = crate::command::typed_command::<
+        ModeledCommandInput,
+        crate::command::Eventual<ModeledCommandOutput>,
+    >(TEST_COMMAND_NAME)
+    .roles(["delta-user"])
+    .emits(crate::command::__command_projection_events([Ok(
+        event_descriptor(),
+    )]))
+    .into_contract();
+    (accumulator, contract, event)
+}
+
+#[test]
+#[cfg(feature = "graphql")]
+fn wait_path_sealing_retains_event_obligations_and_status_stays_pending_without_observation() {
+    use crate::command::CommandConsistency;
+    use crate::command_ledger::CommandLedgerState;
+    use crate::microsvc::{
+        CausalCommandPublicState, CausalCommandReceiptSource, CausalDispatchResult,
+    };
+
+    let (protocol, contract, event) = wait_path_fixture();
+    let result = CausalDispatchResult {
+        replayed: false,
+        payload: json!({"accepted": true}),
+        receipt: CausalCommandReceiptSource {
+            command_id: "wait-path-command".into(),
+            command_name: String::new(),
+            causation_id: String::new(),
+            consistency: CommandConsistency::Eventual,
+            state: CommandLedgerState::Succeeded,
+            outcome: json!({"accepted": true}),
+            projection_metadata: None,
+            direct_projection: None,
+        },
+        projection_events: vec![
+            crate::microsvc::cell_host::CellProjectionEventWireItem::from_message(&event),
+        ],
+    };
+
+    let result = result
+        .seal_wait_path_protocol(&protocol, &contract, Duration::from_secs(60))
+        .unwrap();
+    let metadata = result
+        .receipt
+        .projection_metadata
+        .as_ref()
+        .expect("an emitted modeled event must retain its exact metadata");
+    assert_eq!(metadata.obligations.len(), 1);
+    assert_eq!(metadata.obligations[0].projection_ref, 0);
+    assert_eq!(metadata.obligations[0].model, "TodoView");
+    assert!(metadata.obligations[0]
+        .scope_token
+        .as_str()
+        .starts_with("v1.projection-obligation."));
+    assert_eq!(result.receipt.state, CommandLedgerState::Succeeded);
+
+    let status = result.public_status();
+    assert_eq!(status.state, CausalCommandPublicState::Succeeded);
+    assert!(status.evidence.is_empty());
+    assert_eq!(
+        status
+            .projection_metadata
+            .as_ref()
+            .expect("status must carry modeled metadata")
+            .obligations
+            .len(),
+        1
+    );
+
+    protocol.record_status(&status).unwrap();
+    let command = serde_json::to_value(protocol.snapshot().unwrap()).unwrap()["command"].clone();
+    assert_eq!(command["state"], "succeeded");
+    assert_eq!(command["expects"].as_array().unwrap().len(), 1);
+    assert!(command.get("observations").is_none());
+}
+
+#[test]
+#[cfg(feature = "graphql")]
+fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity() {
+    use std::sync::Arc;
+
+    use crate::command::CommandConsistency;
+    use crate::command_ledger::CommandLedgerState;
+    use crate::graphql::protocol::{ProtocolTokenCodec, ProtocolTokenPurpose};
+    use crate::microsvc::{
+        CausalCommandProjectionEvidence, CausalCommandPublicState, CausalCommandPublicStatus,
+        CausalCommandReceiptSource, CausalDispatchResult, CausalProjectionEvidenceState,
+    };
+    use crate::projection_protocol::{
+        ProjectionCausationEvidenceBatch, ProjectionChangeCursor, ProjectionEpoch,
+        ProjectionObservation, ProjectionObservationKind, ProjectionScopeCodec,
+        ProjectorTopologyId, RecordRevision,
+    };
+    use crate::ProjectionProgramId;
+
+    let (protocol, contract, event) = wait_path_fixture();
+    let result = CausalDispatchResult {
+        replayed: false,
+        payload: json!({"accepted": true}),
+        receipt: CausalCommandReceiptSource {
+            command_id: "wait-path-identity-command".into(),
+            command_name: String::new(),
+            causation_id: String::new(),
+            consistency: CommandConsistency::Eventual,
+            state: CommandLedgerState::Succeeded,
+            outcome: json!({"accepted": true}),
+            projection_metadata: None,
+            direct_projection: None,
+        },
+        projection_events: vec![
+            crate::microsvc::cell_host::CellProjectionEventWireItem::from_message(&event),
+        ],
+    }
+    .seal_wait_path_protocol(&protocol, &contract, Duration::from_secs(60))
+    .unwrap();
+    let metadata = result
+        .receipt
+        .projection_metadata
+        .clone()
+        .expect("the real wait-path event produces modeled metadata");
+    let semantic_program = ProjectionProgramId::parse(&metadata.delta.projections[0].program_id)
+        .expect("metadata carries the canonical semantic program identity");
+    let wrong_program = ProjectionProgramId::parse(
+        "pp1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    .unwrap();
+    let topology = ProjectorTopologyId::new(1, "projection-delta-test", [0x44; 32]).unwrap();
+    let todo_schema = todos();
+    let user_schema = users();
+    let observation_codec = ProjectionScopeCodec::with_models(
+        topology.clone(),
+        [("TodoView", &todo_schema), ("UserView", &user_schema)],
+    )
+    .unwrap();
+    let scope = observation_codec
+        .encode_row_scope(
+            "projection-delta-test",
+            "TodoView",
+            Some(&json!("tenant-a")),
+            &crate::table::RowKey::new([(
+                "todo_id",
+                crate::table::RowValue::String("todo-wait-path".into()),
+            )]),
+        )
+        .unwrap();
+    let revision = RecordRevision::new(scope.clone(), 1, 1).unwrap();
+    let change = ProjectionChangeCursor::new(
+        topology,
+        scope.projection_partition().clone(),
+        ProjectionEpoch::new("projection-delta-v1").unwrap(),
+        1,
+    )
+    .unwrap();
+    let candidate = ProjectionObservation {
+        causation_id: result.causation_id().into(),
+        kind: ProjectionObservationKind::Record,
+        revision: Some(revision),
+        scope: scope.clone(),
+        change,
+        program_id: Some(semantic_program),
+    };
+    let disposition = protocol
+        .modeled_projection_evidence_topologies(TEST_COMMAND_NAME, result.causation_id(), &metadata)
+        .unwrap()
+        .disposition;
+    let evidence = protocol
+        .modeled_projection_evidence(
+            TEST_COMMAND_NAME,
+            result.causation_id(),
+            &metadata,
+            &ProjectionCausationEvidenceBatch {
+                observations: vec![candidate.clone()],
+                terminal_failure_topologies: Vec::new(),
+            },
+            disposition,
+        )
+        .unwrap();
+    assert!(matches!(
+        evidence.as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Observed(observation)]
+            if observation.program_id == Some(semantic_program)
+    ));
+    assert_ne!(
+        candidate.scope.topology().name(),
+        semantic_program.to_string(),
+        "the physical projector name and semantic author identity are distinct"
+    );
+
+    let mut mismatched_program = candidate.clone();
+    mismatched_program.program_id = Some(wrong_program);
+    let pending_for = |observation: ProjectionObservation| {
+        protocol
+            .modeled_projection_evidence(
+                TEST_COMMAND_NAME,
+                result.causation_id(),
+                &metadata,
+                &ProjectionCausationEvidenceBatch {
+                    observations: vec![observation],
+                    terminal_failure_topologies: Vec::new(),
+                },
+                disposition,
+            )
+            .unwrap()
+    };
+    assert!(matches!(
+        pending_for(mismatched_program).as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Pending]
+    ));
+    let mut unversioned = candidate.clone();
+    unversioned.program_id = None;
+    assert!(matches!(
+        pending_for(unversioned).as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Pending]
+    ));
+    let mut wrong_causation = candidate.clone();
+    wrong_causation.causation_id = FOREIGN_CAUSATION_ID.into();
+    assert!(matches!(
+        pending_for(wrong_causation).as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Pending]
+    ));
+    let wrong_scope = observation_codec
+        .encode_row_scope(
+            "projection-delta-test",
+            "UserView",
+            Some(&json!("tenant-a")),
+            &crate::table::RowKey::new([(
+                "user_id",
+                crate::table::RowValue::String("owner-secret".into()),
+            )]),
+        )
+        .unwrap();
+    let mut wrong_model = candidate.clone();
+    wrong_model.scope = wrong_scope;
+    wrong_model.revision = None;
+    assert!(matches!(
+        pending_for(wrong_model).as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Pending]
+    ));
+
+    // A cold restart with the same mounted program can still prove the
+    // persisted observation. Replacing only the program behavior while keeping
+    // the physical projector name/topology does not: the semantic ID is the
+    // durable authoring boundary, not a current-name lookup.
+    let restarted_fixture = modeled_fixture_deployment(
+        ProjectionBindingState::Active,
+        ProjectionExecutionClass::Causal,
+        MutationKind::Upsert,
+        false,
+        "delta-service",
+        "projection-delta-test",
+        [0x44; 32],
+    );
+    let restart_codec = ProtocolTokenCodec::new([0x70; 32]);
+    let restart_cache = restart_codec
+        .issue(ProtocolTokenPurpose::CacheScope, &("wait-path", "cache"))
+        .unwrap();
+    let restart_seed = super::runtime::ProtocolProjectionRequestSeed::new(
+        selected_export(&restarted_fixture.surface),
+        Arc::new(
+            super::runtime::ProtocolProjectionProgramRegistry::try_from_surface(
+                &restarted_fixture.surface,
+            )
+            .unwrap(),
+        ),
+        crate::command_ledger::PrincipalPartitionId::new("wait-path-principal").unwrap(),
+        "wait-path-generation",
+        Vec::new(),
+        1,
+    )
+    .unwrap();
+    let restart_disposition = restart_seed
+        .modeled_evidence_topologies(
+            &restart_codec,
+            &restart_cache,
+            TEST_COMMAND_NAME,
+            result.causation_id(),
+            &metadata,
+        )
+        .unwrap()
+        .disposition;
+    assert!(matches!(
+        restart_seed
+            .modeled_evidence(
+                &restart_codec,
+                &restart_cache,
+                TEST_COMMAND_NAME,
+                result.causation_id(),
+                &metadata,
+                &ProjectionCausationEvidenceBatch {
+                    observations: vec![candidate.clone()],
+                    terminal_failure_topologies: Vec::new(),
+                },
+                restart_disposition,
+            )
+            .unwrap()
+            .as_slice(),
+        [super::runtime::ModeledProjectionEvidence::Observed(_)]
+    ));
+    let changed_fixture = modeled_fixture_deployment(
+        ProjectionBindingState::Active,
+        ProjectionExecutionClass::Causal,
+        MutationKind::Patch,
+        false,
+        "delta-service",
+        "projection-delta-test",
+        [0x44; 32],
+    );
+    assert_ne!(
+        restarted_fixture.program.id(),
+        changed_fixture.program.id(),
+        "the cold-restarted replacement must have a distinct semantic identity"
+    );
+    let changed_seed = super::runtime::ProtocolProjectionRequestSeed::new(
+        selected_export(&changed_fixture.surface),
+        Arc::new(
+            super::runtime::ProtocolProjectionProgramRegistry::try_from_surface(
+                &changed_fixture.surface,
+            )
+            .unwrap(),
+        ),
+        crate::command_ledger::PrincipalPartitionId::new("wait-path-principal").unwrap(),
+        "wait-path-generation",
+        Vec::new(),
+        1,
+    )
+    .unwrap();
+    let changed_result = changed_seed.modeled_evidence_topologies(
+        &restart_codec,
+        &restart_cache,
+        TEST_COMMAND_NAME,
+        result.causation_id(),
+        &metadata,
+    );
+    assert!(
+        changed_result.is_err(),
+        "changed program identity cannot reuse old metadata"
+    );
+
+    let status = CausalCommandPublicStatus {
+        state: CausalCommandPublicState::Succeeded,
+        command_id: result.command_id().into(),
+        command_name: Some(TEST_COMMAND_NAME.into()),
+        causation_id: Some(result.causation_id().into()),
+        consistency: Some(CommandConsistency::Eventual),
+        outcome: Some(json!({"accepted": true})),
+        projection_metadata: Some(metadata),
+        projection_revalidate: false,
+        evidence: vec![CausalCommandProjectionEvidence {
+            obligation_index: 0,
+            state: CausalProjectionEvidenceState::Observed,
+            incarnation: Some(1),
+            revision: Some(1),
+        }],
+        direct_projection: None,
+    };
+    protocol.record_status(&status).unwrap();
+    let command = serde_json::to_value(protocol.snapshot().unwrap()).unwrap()["command"].clone();
+    assert_eq!(command["observations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        command["observations"][0]["causationId"],
+        result.causation_id()
+    );
+}
+
+#[test]
+#[cfg(feature = "graphql")]
+fn wait_path_sealing_keeps_atomic_and_unselected_commands_without_metadata() {
+    use crate::command::CommandConsistency;
+    use crate::command_ledger::CommandLedgerState;
+    use crate::microsvc::{CausalCommandReceiptSource, CausalDispatchResult};
+
+    let (protocol, contract, event) = wait_path_fixture();
+    let result_for = |contract: crate::command::TypedCommandContract,
+                      events: Vec<crate::OutboxMessage>|
+     -> CausalDispatchResult {
+        CausalDispatchResult {
+            replayed: false,
+            payload: json!({"accepted": true}),
+            receipt: CausalCommandReceiptSource {
+                command_id: "wait-path-bypass".into(),
+                command_name: String::new(),
+                causation_id: String::new(),
+                consistency: CommandConsistency::Eventual,
+                state: CommandLedgerState::Succeeded,
+                outcome: json!({"accepted": true}),
+                projection_metadata: None,
+                direct_projection: None,
+            },
+            projection_events: events
+                .iter()
+                .map(crate::microsvc::cell_host::CellProjectionEventWireItem::from_message)
+                .collect(),
+        }
+        .seal_wait_path_protocol(&protocol, &contract, Duration::from_secs(60))
+        .unwrap()
+    };
+
+    let mut atomic_contract = contract.clone();
+    atomic_contract.consistency = CommandConsistency::Atomic;
+    let atomic = result_for(atomic_contract, vec![event.clone()]);
+    assert_eq!(atomic.receipt.consistency, CommandConsistency::Atomic);
+    assert!(atomic.receipt.projection_metadata.is_none());
+    assert_eq!(atomic.receipt.state, CommandLedgerState::Succeeded);
+
+    let mut unselected_contract = contract.clone();
+    unselected_contract.projections.selectors.clear();
+    let unselected = result_for(unselected_contract, vec![event.clone()]);
+    assert_eq!(unselected.receipt.consistency, CommandConsistency::Eventual);
+    assert!(unselected.receipt.projection_metadata.is_none());
+    assert_eq!(unselected.receipt.state, CommandLedgerState::Succeeded);
+
+    let no_events = result_for(contract, Vec::new());
+    assert_eq!(no_events.receipt.consistency, CommandConsistency::Eventual);
+    assert!(no_events.receipt.projection_metadata.is_none());
+    assert_eq!(no_events.receipt.state, CommandLedgerState::Succeeded);
 }
 
 #[test]
@@ -1424,10 +1948,9 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
             command_id: "0190a000-0000-7000-8000-000000000018".into(),
             command_name: TEST_COMMAND_NAME.into(),
             causation_id: TEST_CAUSATION_ID.into(),
-            consistency: crate::graphql::command_contract::CommandConsistency::Eventual,
+            consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::Atomic,
             outcome: serde_json::json!({"id": "todo-draining-status"}),
-            obligations: Vec::new(),
             projection_metadata: Some(exact_scope_metadata),
             direct_projection: None,
         })
@@ -1485,9 +2008,8 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
             command_id: "0190a000-0000-7000-8000-000000000019".into(),
             command_name: Some(TEST_COMMAND_NAME.into()),
             causation_id: Some(TEST_CAUSATION_ID.into()),
-            consistency: Some(crate::graphql::command_contract::CommandConsistency::Eventual),
+            consistency: Some(crate::command::CommandConsistency::Eventual),
             outcome: None,
-            obligations: Vec::new(),
             projection_metadata: Some(metadata.clone()),
             projection_revalidate: true,
             evidence: vec![CausalCommandProjectionEvidence {
@@ -1523,10 +2045,9 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
             command_id: "0190a000-0000-7000-8000-000000000019".into(),
             command_name: TEST_COMMAND_NAME.into(),
             causation_id: TEST_CAUSATION_ID.into(),
-            consistency: crate::graphql::command_contract::CommandConsistency::Eventual,
+            consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::SucceededPendingProjection,
             outcome: serde_json::json!({"id": "todo-draining-status"}),
-            obligations: Vec::new(),
             projection_metadata: Some(metadata),
             direct_projection: None,
         })
@@ -1591,10 +2112,9 @@ fn lifecycle_status_rejects_changed_deployment_identity_and_mixed_fanout_tamperi
                 command_id: "0190a000-0000-7000-8000-000000000020".into(),
                 command_name: TEST_COMMAND_NAME.into(),
                 causation_id: TEST_CAUSATION_ID.into(),
-                consistency: crate::graphql::command_contract::CommandConsistency::Eventual,
+                consistency: crate::command::CommandConsistency::Eventual,
                 state: crate::command_ledger::CommandLedgerState::SucceededPendingProjection,
                 outcome: serde_json::json!({"id": "todo-lifecycle-hostile"}),
-                obligations: Vec::new(),
                 projection_metadata: Some(metadata),
                 direct_projection: None,
             })
@@ -1690,7 +2210,7 @@ fn lifecycle_status_rejects_changed_deployment_identity_and_mixed_fanout_tamperi
         modeled_fixture_deployment(
             ProjectionBindingState::Draining,
             ProjectionExecutionClass::Causal,
-            ProjectionMutationKind::Upsert,
+            MutationKind::Upsert,
             false,
             "changed-route",
             "projection-delta-test",
@@ -1699,7 +2219,7 @@ fn lifecycle_status_rejects_changed_deployment_identity_and_mixed_fanout_tamperi
         modeled_fixture_deployment(
             ProjectionBindingState::Draining,
             ProjectionExecutionClass::Causal,
-            ProjectionMutationKind::Upsert,
+            MutationKind::Upsert,
             false,
             "delta-service",
             "changed-topology",
@@ -1912,7 +2432,7 @@ fn sparse_patch_program_preview_lowers_to_conditional_patch_with_missing_record_
     let fixture = modeled_fixture_with_kind(
         ProjectionBindingState::Active,
         ProjectionExecutionClass::Causal,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
     );
     let selected = selected_export(&fixture.surface);
     let request = TestRequestAuthority::authorized("auth-generation-7");
@@ -2096,8 +2616,7 @@ fn reversed_nonconflicting_fanout_plan_input_produces_identical_delta_bytes() {
             modeled
                 .iter()
                 .find(|modeled| {
-                    modeled.program_id().to_string()
-                        == fixture.todo_program.id().unwrap().to_string()
+                    modeled.program_id().to_string() == fixture.todo_program.id().to_string()
                 })
                 .unwrap(),
         )
@@ -2107,8 +2626,7 @@ fn reversed_nonconflicting_fanout_plan_input_produces_identical_delta_bytes() {
             modeled
                 .iter()
                 .find(|modeled| {
-                    modeled.program_id().to_string()
-                        == fixture.user_program.id().unwrap().to_string()
+                    modeled.program_id().to_string() == fixture.user_program.id().to_string()
                 })
                 .unwrap(),
         )
@@ -2742,7 +3260,7 @@ fn lowerer_rejects_wrong_program_binding_arm_occurrence_and_duplicate_program_so
     let other = modeled_fixture_with_kind(
         ProjectionBindingState::Active,
         ProjectionExecutionClass::Causal,
-        ProjectionMutationKind::Patch,
+        MutationKind::Patch,
     );
     let wrong_program_plan = crate::ResolvedProjectionPlan::resolve(
         &other.program,
@@ -2781,8 +3299,8 @@ fn lowerer_rejects_wrong_program_binding_arm_occurrence_and_duplicate_program_so
         &fixture.surface,
         "delta-user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -2963,7 +3481,7 @@ fn modeled_direct_fixture() -> ModeledFixture {
     let operation = ProjectionOperation::try_new(
         "upsert-todo-direct",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         ProjectionTarget::try_new("TodoView", "todos").unwrap(),
         vec![projection_key(0, "todo_id", "todo_id")],
         vec![
@@ -3039,7 +3557,7 @@ fn modeled_join_fixture() -> ModeledFixture {
     let operation = ProjectionOperation::try_new(
         "insert-todo-owner-link",
         0,
-        ProjectionMutationKind::InsertRelated,
+        MutationKind::InsertRelated,
         ProjectionTarget::try_new("TodoOwnerLink", "private_todo_owner_links").unwrap(),
         vec![
             projection_key(0, "todo_id", "todo_id"),
@@ -3122,7 +3640,7 @@ fn modeled_fixture(
     state: ProjectionBindingState,
     execution: ProjectionExecutionClass,
 ) -> ModeledFixture {
-    modeled_fixture_config(state, execution, ProjectionMutationKind::Upsert, false)
+    modeled_fixture_config(state, execution, MutationKind::Upsert, false)
 }
 
 #[cfg(feature = "graphql")]
@@ -3152,7 +3670,7 @@ fn modeled_fixture_with_opaque_fallback(state: ProjectionBindingState) -> Modele
 fn modeled_fixture_with_kind(
     state: ProjectionBindingState,
     execution: ProjectionExecutionClass,
-    mutation_kind: ProjectionMutationKind,
+    mutation_kind: MutationKind,
 ) -> ModeledFixture {
     modeled_fixture_config(state, execution, mutation_kind, false)
 }
@@ -3161,13 +3679,13 @@ fn modeled_fixture_with_relationship_invalidation(
     state: ProjectionBindingState,
     execution: ProjectionExecutionClass,
 ) -> ModeledFixture {
-    modeled_fixture_config(state, execution, ProjectionMutationKind::Upsert, true)
+    modeled_fixture_config(state, execution, MutationKind::Upsert, true)
 }
 
 fn modeled_fixture_config(
     state: ProjectionBindingState,
     execution: ProjectionExecutionClass,
-    mutation_kind: ProjectionMutationKind,
+    mutation_kind: MutationKind,
     invalidate_relationship: bool,
 ) -> ModeledFixture {
     modeled_fixture_deployment(
@@ -3184,7 +3702,7 @@ fn modeled_fixture_config(
 fn modeled_fixture_deployment(
     state: ProjectionBindingState,
     execution: ProjectionExecutionClass,
-    mutation_kind: ProjectionMutationKind,
+    mutation_kind: MutationKind,
     invalidate_relationship: bool,
     route: &str,
     topology_name: &str,
@@ -3312,7 +3830,7 @@ fn fanout_fixture_states(
     let todo_operation = ProjectionOperation::try_new(
         "fanout-todo",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         ProjectionTarget::try_new("TodoView", "todos").unwrap(),
         vec![projection_key(0, "todo_id", "todo_id")],
         vec![
@@ -3328,7 +3846,7 @@ fn fanout_fixture_states(
     let user_operation = ProjectionOperation::try_new(
         "fanout-user",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         ProjectionTarget::try_new("UserView", "users").unwrap(),
         vec![projection_key(0, "user_id", "owner_id")],
         vec![
@@ -3447,8 +3965,8 @@ fn selected_export(surface: &crate::graphql::Surface) -> DistributedClientSurfac
         &surface,
         "delta-user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -3456,20 +3974,17 @@ fn selected_export(surface: &crate::graphql::Surface) -> DistributedClientSurfac
 }
 
 #[cfg(feature = "graphql")]
-fn selected_export_with_owner_policy(
+fn selected_export_with_row_policy(
     surface: &crate::graphql::Surface,
+    policy: crate::graphql::FilterExpr,
 ) -> DistributedClientSurfaceExport {
     let surface = surface_with_modeled_command(surface);
     let selected = surface_for_role(
         &surface,
         "delta-user",
         &BTreeMap::from([
-            (
-                "TodoView".into(),
-                RoleGrant::all_columns()
-                    .rows(crate::graphql::col("owner_id").eq(crate::graphql::claim("x-user-id"))),
-            ),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns().rows(policy)),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -3484,8 +3999,8 @@ fn selected_export_with_embedded_target(
         &surface,
         "delta-user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::columns(["display_name"])),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().columns(["display_name"])),
         ]),
     )
     .unwrap();
@@ -3502,9 +4017,9 @@ fn selected_export_with_embedded_source(
         &BTreeMap::from([
             (
                 "TodoView".into(),
-                RoleGrant::columns(["owner_id", "status", "title"]),
+                read().columns(["owner_id", "status", "title"]),
             ),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -3517,9 +4032,9 @@ fn selected_export_join(surface: &crate::graphql::Surface) -> DistributedClientS
         &surface,
         "delta-user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
-            ("TodoOwnerLink".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
+            ("TodoOwnerLink".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -3527,16 +4042,16 @@ fn selected_export_join(surface: &crate::graphql::Surface) -> DistributedClientS
 }
 
 fn surface_with_modeled_command(surface: &crate::graphql::Surface) -> crate::graphql::Surface {
-    let contract = crate::graphql::typed_command::<
+    let contract = crate::command::typed_command::<
         ModeledCommandInput,
-        crate::graphql::Eventual<ModeledCommandOutput>,
+        crate::command::Eventual<ModeledCommandOutput>,
     >(TEST_COMMAND_NAME)
     .roles(["delta-user"])
-    .emits(crate::graphql::__command_projection_events([Ok(
+    .emits(crate::command::__command_projection_events([Ok(
         event_descriptor(),
     )]))
     .into_contract();
-    let binding = crate::graphql::command_contract::TypedServiceCommandBinding::from_contracts(
+    let binding = crate::command::TypedServiceCommandBinding::from_contracts(
         "delta-service",
         std::slice::from_ref(&contract),
     )
@@ -3674,6 +4189,7 @@ fn todos() -> TableSchema {
         foreign_keys: vec![],
         indexes: vec![],
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "owner".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "UserView".into(),

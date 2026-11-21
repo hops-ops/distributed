@@ -10,7 +10,7 @@ use super::{Lock, LockError};
 /// Postgres advisory locks, or another lease backend.
 pub trait LockManager: Send + Sync {
     /// The concrete lock type returned by this manager.
-    type Lock: Lock;
+    type Lock: Lock + 'static;
 
     /// Get (or create) a lock for the given identifier.
     ///

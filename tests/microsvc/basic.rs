@@ -1,100 +1,132 @@
 //! Basic microsvc integration tests — exercises dispatch with a real repository.
 
-use distributed::microsvc::{Context, HandlerError, Routes, Service, Session};
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::{
+    CausalCommandContext, Context, HandlerError, Routes, Service, Session,
+};
 use distributed::{AggregateBuilder, InMemoryRepository};
+use serde::Serialize;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use crate::commands::dispatch;
 use crate::models::counter::{Counter, CreateCounter, DecrementCounter, IncrementCounter};
+
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+struct Created {
+    id: String,
+}
+
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+struct CounterValue {
+    value: i64,
+}
+
+async fn initialize(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: CreateCounter,
+) -> Result<PreparedCommand<Succeeded<Created>>, HandlerError> {
+    let mut counter = ctx.repo().create();
+    counter.create(input.id.clone())?;
+    ctx.repo()
+        .commit(counter)?
+        .succeeded(Created { id: input.id })
+}
+
+async fn increment(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: IncrementCounter,
+) -> Result<PreparedCommand<Succeeded<CounterValue>>, HandlerError> {
+    let mut counter = ctx
+        .repo()
+        .get(&input.id)
+        .await?
+        .ok_or_else(|| HandlerError::NotFound(input.id.clone()))?;
+    counter.increment(input.amount)?;
+    let value = counter.value;
+    ctx.repo()
+        .commit(counter)?
+        .succeeded(CounterValue { value })
+}
+
+async fn decrement(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: DecrementCounter,
+) -> Result<PreparedCommand<Succeeded<CounterValue>>, HandlerError> {
+    let mut counter = ctx
+        .repo()
+        .get(&input.id)
+        .await?
+        .ok_or_else(|| HandlerError::NotFound(input.id.clone()))?;
+    counter.decrement(input.amount)?;
+    let value = counter.value;
+    ctx.repo()
+        .commit(counter)?
+        .succeeded(CounterValue { value })
+}
 
 #[tokio::test]
 async fn full_lifecycle() {
     let repo = InMemoryRepository::new();
     let counter_repo = repo.clone().aggregate::<Counter>();
-    let service = Service::new().routes(
+    let service = Service::new().named("counters").routes(
         Routes::new()
-            .with_dependencies(repo)
-            .command("counter.initialize")
-            .handle(|ctx: &Context<InMemoryRepository>| {
-                let input = ctx.input::<CreateCounter>();
-                let counter_repo = ctx.repo().clone().aggregate::<Counter>();
-                async move {
-                    let input = input?;
-                    let mut counter = Counter::default();
-                    counter.create(input.id.clone())?;
-                    counter_repo.commit(&mut counter).await?;
-                    Ok(json!({ "id": input.id }))
-                }
-            })
-            .command("counter.increment")
-            .handle(|ctx: &Context<InMemoryRepository>| {
-                let input = ctx.input::<IncrementCounter>();
-                let counter_repo = ctx.repo().clone().aggregate::<Counter>();
-                async move {
-                    let input = input?;
-                    let mut counter: Counter = counter_repo
-                        .get(&input.id)
-                        .await?
-                        .ok_or_else(|| HandlerError::NotFound(input.id.clone()))?;
-                    counter.increment(input.amount)?;
-                    counter_repo.commit(&mut counter).await?;
-                    Ok(json!({ "value": counter.value }))
-                }
-            })
-            .command("counter.decrement")
-            .handle(|ctx: &Context<InMemoryRepository>| {
-                let input = ctx.input::<DecrementCounter>();
-                let counter_repo = ctx.repo().clone().aggregate::<Counter>();
-                async move {
-                    let input = input?;
-                    let mut counter: Counter = counter_repo
-                        .get(&input.id)
-                        .await?
-                        .ok_or_else(|| HandlerError::NotFound(input.id.clone()))?;
-                    counter.decrement(input.amount)?;
-                    counter_repo.commit(&mut counter).await?;
-                    Ok(json!({ "value": counter.value }))
-                }
-            }),
+            .with_repo(repo.aggregate::<Counter>())
+            .typed_command(typed_command::<CreateCounter, Succeeded<Created>>(
+                "counter.initialize",
+            ))
+            .handle(initialize)
+            .typed_command(typed_command::<IncrementCounter, Succeeded<CounterValue>>(
+                "counter.increment",
+            ))
+            .handle(increment)
+            .typed_command(typed_command::<DecrementCounter, Succeeded<CounterValue>>(
+                "counter.decrement",
+            ))
+            .handle(decrement),
     );
 
     // Create
-    let result = service
-        .dispatch("counter.initialize", json!({ "id": "c1" }), Session::new())
-        .await
-        .unwrap();
+    let result = dispatch(
+        &service,
+        "counter.initialize",
+        json!({ "id": "c1" }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(result, json!({ "id": "c1" }));
 
     // Increment twice
-    let result = service
-        .dispatch(
-            "counter.increment",
-            json!({ "id": "c1", "amount": 5 }),
-            Session::new(),
-        )
-        .await
-        .unwrap();
+    let result = dispatch(
+        &service,
+        "counter.increment",
+        json!({ "id": "c1", "amount": 5 }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(result, json!({ "value": 5 }));
 
-    service
-        .dispatch(
-            "counter.increment",
-            json!({ "id": "c1", "amount": 3 }),
-            Session::new(),
-        )
-        .await
-        .unwrap();
+    dispatch(
+        &service,
+        "counter.increment",
+        json!({ "id": "c1", "amount": 3 }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
 
     // Decrement
-    let result = service
-        .dispatch(
-            "counter.decrement",
-            json!({ "id": "c1", "amount": 2 }),
-            Session::new(),
-        )
-        .await
-        .unwrap();
+    let result = dispatch(
+        &service,
+        "counter.decrement",
+        json!({ "id": "c1", "amount": 2 }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(result, json!({ "value": 6 }));
 
     // Verify final state via repo

@@ -1,0 +1,3 @@
+mutation SaveDerived {
+  upsert_derived_rows(object: $input.row)
+}

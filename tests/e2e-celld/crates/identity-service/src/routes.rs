@@ -1,48 +1,34 @@
 //! Zitadel ingress/scrape commands + AuthUsers projector.
+//!
+//! No aggregate: the commands publish provider messages, which commit with
+//! their ledger receipts.
 
-use distributed::microsvc::{
-    ConfigurableOutboxPublisher, HasOutboxStore, HasRepo, RepoReadModelDependencies, Routes,
-};
-use distributed::{AggregateBuilder, AggregateRepository, QueuedRepository};
+use distributed::microsvc::{ConfigurableOutboxPublisher, HasOutboxStore, HasRepo, Routes};
+use distributed::AggregateRepository;
 
-use crate::aggregate::Identity;
-use crate::bounds::{EventStore, Locks, ReadStore};
-use crate::handlers;
+use crate::bounds::{EventStore, ReadStore};
+use crate::deps::AuthDeps;
+use crate::handlers::events::project_auth_user;
+use crate::handlers::ingestors::{zitadel, zitadel_scrape};
 
 pub const MODULE_ID: &str = "identity";
 
-type IdentityRoutes<R, L, S> =
-    Routes<RepoReadModelDependencies<AggregateRepository<QueuedRepository<R, L>, Identity>, S>>;
+/// Prefix of this module's command names (they are named for the provider).
+pub const COMMAND_PREFIX: &str = "zitadel.";
 
-pub fn routes<R, L, S>(repo: R, locks: L, read_models: S) -> IdentityRoutes<R, L, S>
+pub fn routes<R, S>(repo: R, read_models: S) -> Routes<AuthDeps<R, S>>
 where
     R: EventStore,
-    L: Locks,
     S: ReadStore,
-    QueuedRepository<R, L>: Clone
-        + AggregateBuilder
-        + HasOutboxStore
-        + distributed::TransactionalCommit
-        + Send
-        + Sync
-        + 'static,
-    AggregateRepository<QueuedRepository<R, L>, Identity>:
+    AggregateRepository<R, ()>:
         HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
 {
-    Routes::for_aggregate::<R, L, Identity, S>(repo, locks, read_models)
-        .command(handlers::ingestors::zitadel::COMMAND)
-        .guarded(
-            handlers::ingestors::zitadel::guard,
-            handlers::ingestors::zitadel::handle,
-        )
-        .command(handlers::ingestors::zitadel_scrape::COMMAND)
-        .guarded(
-            handlers::ingestors::zitadel_scrape::guard,
-            handlers::ingestors::zitadel_scrape::handle,
-        )
-        .events(handlers::events::project_auth_user::EVENTS)
-        .guarded(
-            handlers::events::project_auth_user::guard,
-            handlers::events::project_auth_user::handle,
-        )
+    let scrape = zitadel_scrape::Scrape(read_models.clone());
+    Routes::for_stores(repo, read_models)
+        .typed_command(zitadel::command())
+        .handle(zitadel::handle)
+        .typed_command(zitadel_scrape::command())
+        .handle(scrape)
+        .events(project_auth_user::EVENTS)
+        .guarded(project_auth_user::guard, project_auth_user::handle)
 }

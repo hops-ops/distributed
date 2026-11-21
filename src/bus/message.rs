@@ -206,6 +206,11 @@ impl Message {
 ///
 /// Transports that carry the id outside the headers (RabbitMQ's `message_id`
 /// property) pass `id_key: None` and set the id on the returned message.
+/// Header that carries [`Message::content_type`] on transports with no
+/// native property for it.
+#[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
+pub(crate) const CONTENT_TYPE_HEADER: &str = "content-type";
+
 #[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
 pub(crate) fn message_from_wire(
     name: String,
@@ -216,12 +221,16 @@ pub(crate) fn message_from_wire(
 ) -> Message {
     let mut id = None;
     let mut kind = MessageKind::Event;
+    let mut content_type = None;
     let mut metadata = Vec::new();
     for (key, value) in headers {
-        if id_key == Some(key.as_str()) {
+        if id_key.is_some_and(|id_key| key.eq_ignore_ascii_case(id_key)) {
             id = Some(value);
-        } else if key == kind_key {
+        } else if key.eq_ignore_ascii_case(kind_key) {
             kind = MessageKind::from_str_lossy(&value);
+        } else if key.eq_ignore_ascii_case(CONTENT_TYPE_HEADER) {
+            // The first spelling wins; it never reaches user metadata.
+            content_type.get_or_insert(value);
         } else {
             metadata.push((key, value));
         }
@@ -229,6 +238,9 @@ pub(crate) fn message_from_wire(
     let mut message = Message::new(name, kind, payload);
     message.id = id;
     message.metadata = metadata;
+    if let Some(content_type) = content_type {
+        message.content_type = content_type;
+    }
     message
 }
 
@@ -291,5 +303,24 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
+    #[test]
+    fn wire_reserved_headers_are_case_insensitive() {
+        let message = message_from_wire(
+            "checkout.started".into(),
+            Vec::new(),
+            Some("Nats-Msg-Id"),
+            "X-Sourced-Kind",
+            [
+                ("nats-msg-id".into(), "event-1".into()),
+                ("x-sourced-kind".into(), "command".into()),
+            ],
+        );
+
+        assert_eq!(message.id(), Some("event-1"));
+        assert_eq!(message.kind, MessageKind::Command);
+        assert!(message.metadata.is_empty());
     }
 }

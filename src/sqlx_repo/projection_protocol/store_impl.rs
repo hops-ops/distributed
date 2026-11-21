@@ -13,6 +13,22 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
+    #[cfg(feature = "graphql")]
+    async fn projection_rebuild_records(
+        &self,
+        context: &crate::projection::rebuild::RebuildContext,
+    ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
+        self.snapshot_rebuild_records(context).await
+    }
+
+    #[cfg(feature = "graphql")]
+    async fn commit_projection_rebuild(
+        &self,
+        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> Result<usize, ProjectionProtocolError> {
+        self.apply_snapshot_rebuild(plan).await
+    }
+
     fn register_projection_models<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
@@ -316,12 +332,12 @@ where
 
     fn commit_projection(
         &self,
-        batch: ProjectionCommitBatch,
+        mut batch: ProjectionCommitBatch,
     ) -> impl Future<Output = Result<ProjectionCommitResult, ProjectionProtocolError>> + Send + '_
     {
         async move {
             batch.validate()?;
-            let write_plan = TableWritePlan::new(
+            let mut write_plan = TableWritePlan::new(
                 batch
                     .mutations
                     .iter()
@@ -341,24 +357,35 @@ where
                 lock_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch).await?;
             validate_input_identity_in_tx(&mut tx, &batch.input).await?;
             ensure_active_input(&state, &batch.input)?;
-            match classify_validated_input_in_tx(&mut tx, &batch.input, &state).await? {
-                InputDisposition::Duplicate(checkpoint) => {
-                    return Ok(ProjectionCommitResult::not_applied(
-                        ProjectionCommitOutcome::Duplicate,
-                        Some(checkpoint),
-                    ));
-                }
-                InputDisposition::Stale(checkpoint) => {
-                    return Ok(ProjectionCommitResult::not_applied(
-                        ProjectionCommitOutcome::StaleInput,
-                        Some(checkpoint),
-                    ));
-                }
-                InputDisposition::New => {
-                    ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
-                }
+            let redelivery =
+                match classify_validated_input_in_tx(&mut tx, &batch.input, &state).await? {
+                    InputDisposition::Duplicate(checkpoint) => {
+                        return Ok(ProjectionCommitResult::not_applied(
+                            ProjectionCommitOutcome::Duplicate,
+                            Some(checkpoint),
+                        ));
+                    }
+                    InputDisposition::Stale(checkpoint) => {
+                        return Ok(ProjectionCommitResult::not_applied(
+                            ProjectionCommitOutcome::StaleInput,
+                            Some(checkpoint),
+                        ));
+                    }
+                    InputDisposition::New => {
+                        ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
+                        false
+                    }
+                    InputDisposition::Redelivery => {
+                        ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
+                        batch.mutations.clear();
+                        batch.observations.clear();
+                        write_plan = TableWritePlan::new(Vec::new());
+                        true
+                    }
+                };
+            if !redelivery {
+                ensure_inbox_available_in_tx(&mut tx, &batch.input).await?;
             }
-            ensure_inbox_available_in_tx(&mut tx, &batch.input).await?;
             ensure_partition_ownership_in_tx(&mut tx, &topology, &partition, &batch.ownership)
                 .await?;
 
@@ -410,6 +437,11 @@ where
                     &mutation.expectation,
                     mutation.kind,
                     current.as_ref(),
+                    mutation.source_snapshot.is_some(),
+                )?;
+                crate::projection_protocol::validate_snapshot_write(
+                    current.as_ref().map(|record| &record.metadata),
+                    mutation.source_snapshot.as_ref(),
                 )?;
                 let change = allocate_change(
                     &mut state,
@@ -421,11 +453,13 @@ where
                     Some(mutation.scope.clone()),
                     Some(revision.clone()),
                     None,
+                    program_id_for_model(&batch.ownership, mutation.scope.model()),
                 )?;
                 let metadata = ProjectionRecordMetadata {
                     revision,
                     tombstone,
                     change: change.cursor.clone(),
+                    source_snapshot: mutation.source_snapshot.clone(),
                 };
                 records_by_scope.insert(mutation.scope.clone(), metadata.clone());
                 records.push(metadata);
@@ -469,7 +503,7 @@ where
                                 actual_revision: metadata.revision.revision(),
                             });
                         }
-                        if metadata.tombstone {
+                        if metadata.tombstone && metadata.source_snapshot.is_none() {
                             return Err(ProjectionProtocolError::RecordTombstoned {
                                 model: expected.scope().model().to_string(),
                             });
@@ -508,17 +542,20 @@ where
                         Some(scope.clone()),
                         revision.clone(),
                         None,
+                        program_id_for_model(&batch.ownership, scope.model()),
                     )?;
                     let cursor = change.cursor.clone();
                     changes.push(change);
                     cursor
                 };
+                let program_id = program_id_for_model(&batch.ownership, scope.model());
                 observations.push(ProjectionObservation {
                     causation_id: batch.input.causation_id.clone(),
                     kind: request.kind,
                     revision,
                     scope,
                     change: change_cursor,
+                    program_id,
                 });
             }
 
@@ -529,6 +566,7 @@ where
                     &partition,
                     ProjectionChangeKind::Checkpoint,
                     batch.input.causation_id.clone(),
+                    None,
                     None,
                     None,
                     None,
@@ -558,9 +596,11 @@ where
             }
             store_input_cursor_in_tx(&mut tx, &batch.input, &final_change).await?;
             insert_input_identity_in_tx(&mut tx, &batch.input).await?;
-            insert_input_receipt_in_tx(&mut tx, &batch.input, "applied", None, &final_change)
-                .await?;
-            insert_inbox_in_tx(&mut tx, &batch.input).await?;
+            if !redelivery {
+                insert_input_receipt_in_tx(&mut tx, &batch.input, "applied", None, &final_change)
+                    .await?;
+                insert_inbox_in_tx(&mut tx, &batch.input).await?;
+            }
             update_partition_head_in_tx(
                 &mut tx,
                 &topology,
@@ -594,7 +634,11 @@ where
                 tables: changed_tables,
             });
             Ok(ProjectionCommitResult {
-                outcome: ProjectionCommitOutcome::Applied,
+                outcome: if redelivery {
+                    ProjectionCommitOutcome::Duplicate
+                } else {
+                    ProjectionCommitOutcome::Applied
+                },
                 checkpoint: Some(checkpoint),
                 records,
                 changes,
@@ -683,7 +727,9 @@ where
                 InputDisposition::New => {
                     ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
                 }
-                InputDisposition::Duplicate(_) | InputDisposition::Stale(_) => {
+                InputDisposition::Duplicate(_)
+                | InputDisposition::Stale(_)
+                | InputDisposition::Redelivery => {
                     return Err(ProjectionProtocolError::InvalidBatch(
                         "cannot record terminal failure for an already processed input".into(),
                     ));
@@ -700,6 +746,7 @@ where
                 None,
                 None,
                 Some(batch.failure_id.clone()),
+                None,
             )?;
             insert_change_in_tx(&mut tx, &change).await?;
             insert_failure_in_tx(&mut tx, &batch, &change.cursor).await?;
@@ -879,6 +926,10 @@ where
                         ensure_pending_retry_input_in_tx(&mut tx, &state, input).await?;
                         Ok(ProjectionInputDisposition::Pending)
                     }
+                    InputDisposition::Redelivery => {
+                        ensure_pending_retry_input_in_tx(&mut tx, &state, input).await?;
+                        Ok(ProjectionInputDisposition::Redelivery)
+                    }
                     InputDisposition::Duplicate(checkpoint) => {
                         Ok(ProjectionInputDisposition::Duplicate(checkpoint))
                     }
@@ -983,27 +1034,6 @@ where
         }
     }
 
-    fn projection_obligation_evidence_batch<'a>(
-        &'a self,
-        request: &'a ProjectionObligationEvidenceBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        let request = request.clone();
-        async move {
-            request.validate()?;
-            with_projection_read_snapshot(self.pool(), move |connection| {
-                Box::pin(async move {
-                    read_projection_obligation_evidence_batch_in_executor::<DB>(
-                        connection, &request,
-                    )
-                    .await
-                })
-            })
-            .await
-        }
-    }
-
     fn projection_causation_evidence<'a>(
         &'a self,
         request: &'a ProjectionCausationEvidenceRequest,
@@ -1042,7 +1072,7 @@ where
     fn projection_partition_runtime_state<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
     ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>>
            + Send
            + 'a {
@@ -1072,7 +1102,7 @@ where
     fn projection_changes<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         after: Option<&'a ProjectionChangeCursor>,
         limit: usize,
     ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a
@@ -1096,7 +1126,7 @@ where
     fn repair_projection<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a
     {
@@ -1384,7 +1414,7 @@ where
     fn projection_failure<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a
     {
@@ -1451,7 +1481,7 @@ where
             let partition_bytes: Vec<u8> = row.try_get("partition_bytes").map_err(|error| {
                 protocol_storage_error::<DB>("decode repair partition bytes", error)
             })?;
-            let partition = ProjectionPartition::new(partition_bytes)?;
+            let partition = PartitionId::new(partition_bytes)?;
             let partition_hash: Vec<u8> = row.try_get("partition_hash").map_err(|error| {
                 protocol_storage_error::<DB>("decode repair partition hash", error)
             })?;

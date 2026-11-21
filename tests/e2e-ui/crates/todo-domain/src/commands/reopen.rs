@@ -1,18 +1,18 @@
-use distributed::graphql::Eventual;
-use distributed::portable_command;
+use distributed::command;
+use distributed::command::Eventual;
 use serde::Deserialize;
 
 use super::TodoStatusPayload;
 use crate::{domain_commands, Todo};
 
-#[derive(Debug, Deserialize, distributed::GraphqlInput)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct TodoReopenInput {
     pub todo_id: String,
 }
 
 pub type TodoReopenPayload = TodoStatusPayload;
 
-portable_command! {
+command! {
     name: "todo.reopen",
     transition: domain_commands::Reopen,
     aggregate: Todo,
@@ -23,7 +23,7 @@ portable_command! {
     roles: ["user", "admin"],
     field: "todos_reopen",
     invoke: |todo, _input, principal| todo.reopen(principal),
-    payload: |todo| TodoStatusPayload::from_todo(&**todo),
+    payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }
 
 #[cfg(test)]

@@ -11,25 +11,156 @@ mod postgres_tests {
     };
     use crate::projection_protocol::{
         ProjectionCheckpointProbe, ProjectionExecutionSnapshotBatchRequest,
-        ProjectionGraphSnapshotRequest, ProjectionQuerySnapshotRequest,
-        ProjectionObservationRequest, ProjectionRecordMutation, ProjectionScopeCodec,
+        ProjectionGraphSnapshotRequest, ProjectionObservationRequest,
+        ProjectionQuerySnapshotRequest, ProjectionRecordMutation, ProjectionScopeCodec,
     };
     use crate::repository::{CommitBatch, ReadModelWritePlanStore};
     use crate::table::{
         ColumnType, DeleteTableRowMutation, ExpectedVersion, ForeignKey, PrimaryKey,
-        RelationshipDef, RelationshipKind, RowKey, RowValue, RowValues, RowWriteMode,
-        TableColumn, TableKind, TableRowMutation, TableSchema, TableSchemaRegistry,
-        TableStoreError, TableWritePlan,
+        RelationshipDef, RelationshipKind, RowKey, RowValue, RowValues, RowWriteMode, TableColumn,
+        TableKind, TableRowMutation, TableSchema, TableSchemaRegistry, TableStoreError,
+        TableWritePlan,
     };
 
     static POSTGRES_PROJECTION_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
 
+    /// A request dropped while `begin` waits for the server must not hand
+    /// the next read snapshot a connection that is already in a transaction.
+    #[tokio::test]
+    async fn postgres_cancelled_begin_does_not_poison_the_next_read_snapshot() {
+        let Some(url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
+            return;
+        };
+        let pool = <sqlx::Postgres as crate::sqlx_repo::repo::SqlxRepoBackend>::pool_options(
+            sqlx::postgres::PgPoolOptions::new().max_connections(1),
+        )
+        .connect(&url)
+        .await
+        .unwrap();
+        for micros in (0..3000).step_by(10) {
+            let cancelled = std::time::Duration::from_micros(micros);
+            let _ = tokio::time::timeout(cancelled, pool.begin()).await;
+            sqlx::query("SELECT 1").execute(&pool).await.unwrap();
+            let mut snapshot = pool.begin().await.unwrap();
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *snapshot)
+                .await
+                .unwrap_or_else(|error| panic!("begin cancelled at {micros}us: {error}"));
+            snapshot.rollback().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_redelivery_identity_is_atomic_across_partition_and_cursor_races() {
+        let Some(url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        let repository = SqlxRepository::<sqlx::Postgres>::connect_and_migrate(&url)
+            .await
+            .unwrap();
+        let mut registry = TableSchemaRegistry::new();
+        registry.register_schema(schema().clone()).unwrap();
+        repository
+            .bootstrap_table_schema_for_dev(&registry)
+            .await
+            .unwrap();
+        repository
+            .register_projection_models(&topology(), &[ownership()])
+            .await
+            .unwrap();
+        let unique = uuid::Uuid::now_v7().to_string();
+        let topology = topology();
+        let input = |partition: &str, position: u64, id: &str, bytes: &[u8]| {
+            TrustedProjectionInput::mint(
+                ProjectionInputCursor::new(
+                    topology.clone(),
+                    PartitionId::new(format!("{unique}-{partition}").into_bytes()).unwrap(),
+                    ProjectionSource::new("broker", b"retained-stream".to_vec()).unwrap(),
+                    ProjectionEpoch::new("broker-v1").unwrap(),
+                    position,
+                )
+                .unwrap(),
+                ProjectionInputFingerprint::from_canonical_bytes(bytes),
+                format!("{unique}-{id}"),
+                "cause",
+                ProjectionGeneration::initial(),
+                false,
+            )
+            .unwrap()
+        };
+        let batch = |input| ProjectionCommitBatch {
+            input,
+            change_epoch: ProjectionEpoch::new("changes-v1").unwrap(),
+            ownership: vec![ownership()],
+            mutations: Vec::new(),
+            observations: Vec::new(),
+        };
+        // The canonical unique topology/message binding arbitrates different
+        // partition locks: only one scope/content may ever claim this identity.
+        let (a, b) = tokio::join!(
+            repository.commit_projection(batch(input("a", 1, "shared", b"one"))),
+            repository.commit_projection(batch(input("b", 1, "shared", b"two"))),
+        );
+        assert_eq!(
+            usize::from(a.is_ok()) + usize::from(b.is_ok()),
+            1,
+            "a={a:?}, b={b:?}"
+        );
+        let (partition, bytes) = if a.is_ok() {
+            ("a", b"one".as_slice())
+        } else {
+            ("b", b"two".as_slice())
+        };
+        let duplicate = input(partition, 2, "shared", bytes);
+        assert_eq!(
+            repository
+                .projection_input_disposition(&duplicate)
+                .await
+                .unwrap(),
+            ProjectionInputDisposition::Redelivery
+        );
+        // Alias and new canonical input race for exactly the same broker cursor.
+        // Partition serialization must forbid a cross-table double binding.
+        let (alias, canonical) = tokio::join!(
+            repository.commit_projection(batch(duplicate.clone())),
+            repository.commit_projection(batch(input(partition, 2, "different", b"different"))),
+        );
+        assert_eq!(
+            usize::from(alias.is_ok()) + usize::from(canonical.is_ok()),
+            1
+        );
+        let loser = if alias.is_ok() {
+            input(partition, 2, "different", b"different")
+        } else {
+            duplicate
+        };
+        assert!(matches!(
+            repository.projection_input_disposition(&loser).await,
+            Err(ProjectionProtocolError::InputCorruption)
+        ));
+        let repeated = repository
+            .commit_projection(batch(input(partition, 3, "shared", bytes)))
+            .await
+            .unwrap();
+        assert_eq!(repeated.outcome, ProjectionCommitOutcome::Duplicate);
+        assert_eq!(repeated.checkpoint.unwrap().input().position(), 3);
+        assert_eq!(repeated.changes.len(), 1);
+        assert_eq!(repeated.changes[0].kind, ProjectionChangeKind::Checkpoint);
+    }
+
     fn topology() -> ProjectorTopologyId {
         ProjectorTopologyId::new(1, "postgres_projection_runtime", [71; 32]).unwrap()
     }
 
-    fn partition() -> ProjectionPartition {
+    fn partition() -> PartitionId {
         ProjectionScopeCodec::new(topology())
             .encode_partition(Some(&serde_json::json!("postgres-runtime-tenant")))
             .unwrap()
@@ -64,7 +195,7 @@ mod postgres_tests {
         ProjectorTopologyId::new(1, "postgres_graph_runtime", [72; 32]).unwrap()
     }
 
-    fn graph_partition() -> ProjectionPartition {
+    fn graph_partition() -> PartitionId {
         ProjectionScopeCodec::new(graph_topology())
             .encode_partition(Some(&serde_json::json!("postgres-graph-tenant")))
             .unwrap()
@@ -87,6 +218,7 @@ mod postgres_tests {
             indexes: Vec::new(),
             relationships: vec![
                 RelationshipDef {
+                    references: None,
                     field_name: "children".into(),
                     kind: RelationshipKind::HasMany,
                     target_model: "PostgresGraphChildView".into(),
@@ -95,6 +227,7 @@ mod postgres_tests {
                     target_foreign_key: None,
                 },
                 RelationshipDef {
+                    references: None,
                     field_name: "featured_children".into(),
                     kind: RelationshipKind::HasMany,
                     target_model: "PostgresGraphChildView".into(),
@@ -134,16 +267,10 @@ mod postgres_tests {
 
     fn graph_ownership() -> Vec<ProjectionModelOwnership> {
         vec![
-            ProjectionModelOwnership::new(
-                "PostgresGraphParentView",
-                "postgres_graph_parent_views",
-            )
-            .unwrap(),
-            ProjectionModelOwnership::new(
-                "PostgresGraphChildView",
-                "postgres_graph_child_views",
-            )
-            .unwrap(),
+            ProjectionModelOwnership::new("PostgresGraphParentView", "postgres_graph_parent_views")
+                .unwrap(),
+            ProjectionModelOwnership::new("PostgresGraphChildView", "postgres_graph_child_views")
+                .unwrap(),
         ]
     }
 
@@ -161,12 +288,14 @@ mod postgres_tests {
     fn graph_key(model: &str) -> RowKey {
         RowKey::new([(
             "id",
-            RowValue::String(match model {
-                "PostgresGraphParentView" => "parent-1",
-                "PostgresGraphChildView" => "child-1",
-                other => panic!("unknown PostgreSQL graph model {other}"),
-            }
-            .into()),
+            RowValue::String(
+                match model {
+                    "PostgresGraphParentView" => "parent-1",
+                    "PostgresGraphChildView" => "child-1",
+                    other => panic!("unknown PostgreSQL graph model {other}"),
+                }
+                .into(),
+            ),
         )])
     }
 
@@ -202,7 +331,7 @@ mod postgres_tests {
                 mode: RowWriteMode::Upsert,
             }),
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
         .unwrap()
     }
@@ -238,10 +367,7 @@ mod postgres_tests {
         ProjectionGraphSnapshotRequest::new(
             root,
             [
-                (
-                    "children".into(),
-                    Arc::new(graph_child_schema().clone()),
-                ),
+                ("children".into(), Arc::new(graph_child_schema().clone())),
                 (
                     "featured_children".into(),
                     Arc::new(graph_child_schema().clone()),
@@ -266,7 +392,7 @@ mod postgres_tests {
         RowKey::new([("id", RowValue::String("runtime-row".into()))])
     }
 
-    fn matrix_partition(scenario: usize) -> ProjectionPartition {
+    fn matrix_partition(scenario: usize) -> PartitionId {
         ProjectionScopeCodec::new(matrix_topology())
             .encode_partition(Some(&serde_json::json!(format!(
                 "postgres-matrix-{scenario}"
@@ -316,10 +442,7 @@ mod postgres_tests {
     }
 
     fn matrix_key(scenario: usize, index: usize) -> RowKey {
-        RowKey::new([(
-            "id",
-            RowValue::String(format!("matrix-{scenario}-{index}")),
-        )])
+        RowKey::new([("id", RowValue::String(format!("matrix-{scenario}-{index}")))])
     }
 
     fn matrix_scope(scenario: usize, index: usize) -> ProjectionRecordScope {
@@ -339,10 +462,7 @@ mod postgres_tests {
         expectation: ProjectionRecordExpectation,
     ) -> ProjectionRecordMutation {
         let mut values = RowValues::new();
-        values.insert(
-            "id",
-            RowValue::String(format!("matrix-{scenario}-{index}")),
-        );
+        values.insert("id", RowValue::String(format!("matrix-{scenario}-{index}")));
         values.insert("value", RowValue::String(value.into()));
         ProjectionRecordMutation::new(
             matrix_scope(scenario, index),
@@ -354,7 +474,7 @@ mod postgres_tests {
                 mode: RowWriteMode::Upsert,
             }),
             expectation,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
         .unwrap()
     }
@@ -384,15 +504,10 @@ mod postgres_tests {
         .unwrap()
     }
 
-    fn matrix_snapshot_request(
-        scenario: usize,
-        index: usize,
-    ) -> ProjectionQuerySnapshotRequest {
+    fn matrix_snapshot_request(scenario: usize, index: usize) -> ProjectionQuerySnapshotRequest {
         ProjectionQuerySnapshotRequest::new(
             &matrix_codec(),
-            Some(&serde_json::json!(format!(
-                "postgres-matrix-{scenario}"
-            ))),
+            Some(&serde_json::json!(format!("postgres-matrix-{scenario}"))),
             "PostgresProjectionMatrixView",
             matrix_key(scenario, index),
             Vec::new(),
@@ -473,7 +588,7 @@ mod postgres_tests {
     fn upsert_mutation(
         value: &str,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
     ) -> ProjectionRecordMutation {
         ProjectionRecordMutation::new(scope(), upsert_table_mutation(value), expectation, kind)
             .unwrap()
@@ -488,7 +603,7 @@ mod postgres_tests {
                 expected_version: ExpectedVersion::Any,
             }),
             ProjectionRecordExpectation::Exact(expected),
-            ProjectionMutationKind::Delete,
+            RecordTransition::Delete,
         )
         .unwrap()
     }
@@ -533,7 +648,10 @@ mod postgres_tests {
     #[tokio::test]
     async fn postgres_coherent_execution_and_graph_snapshots_use_fk_references_and_unique_budgets()
     {
-        let Ok(database_url) = std::env::var("DISTRIBUTED_TEST_POSTGRES_URL") else {
+        let Some(database_url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
             return;
         };
         let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
@@ -644,7 +762,10 @@ mod postgres_tests {
     async fn four_position_postgres_projection_commit_failure_matrix_rolls_back_every_side_effect()
     {
         const PHYSICAL_MUTATION_POSITIONS: usize = 4;
-        let Ok(database_url) = std::env::var("DISTRIBUTED_TEST_POSTGRES_URL") else {
+        let Some(database_url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
             return;
         };
         let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
@@ -786,9 +907,9 @@ mod postgres_tests {
             assert!(
                 matches!(
                     repository.commit_projection(failed_batch()).await,
-                    Err(ProjectionProtocolError::Table(TableStoreError::BackendStorage {
-                        ..
-                    }))
+                    Err(ProjectionProtocolError::Table(
+                        TableStoreError::BackendStorage { .. }
+                    ))
                 ),
                 "failure position {fail_at}"
             );
@@ -820,7 +941,10 @@ mod postgres_tests {
                 )
             })
             .collect::<Vec<_>>();
-            assert_eq!(physical_after, physical_before, "failure position {fail_at}");
+            assert_eq!(
+                physical_after, physical_before,
+                "failure position {fail_at}"
+            );
             for (index, expected) in snapshots_before.iter().enumerate() {
                 assert_eq!(
                     &repository
@@ -902,7 +1026,10 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn postgres_projection_protocol_runtime_conforms() {
-        let Ok(database_url) = std::env::var("DISTRIBUTED_TEST_POSTGRES_URL") else {
+        let Some(database_url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
             return;
         };
         let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
@@ -994,7 +1121,7 @@ mod postgres_tests {
             vec![upsert_mutation(
                 "5",
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
         );
         initial.observations = vec![crate::projection_protocol::ProjectionObservationRequest {
@@ -1032,25 +1159,6 @@ mod postgres_tests {
             1,
             5,
         );
-        let causal_probe = crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-            "postgres-cause-5",
-            scope(),
-            ProjectionObservationKind::Record,
-        )
-        .unwrap();
-        assert!(matches!(
-            repository
-                .projection_obligation_evidence_batch(
-                    &ProjectionObligationEvidenceBatchRequest::new(vec![causal_probe.clone()])
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-                .evidence
-                .as_slice(),
-            [ProjectionObligationEvidence::Observed(_)]
-        ));
-
         assert_eq!(
             repository
                 .commit_projection(batch(
@@ -1064,7 +1172,7 @@ mod postgres_tests {
                     vec![upsert_mutation(
                         "ignored-duplicate",
                         ProjectionRecordExpectation::Missing,
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                 ))
                 .await
@@ -1174,7 +1282,7 @@ mod postgres_tests {
                 vec![upsert_mutation(
                     "7",
                     ProjectionRecordExpectation::Exact(deleted.records[0].revision.clone()),
-                    ProjectionMutationKind::Recreate,
+                    RecordTransition::Recreate,
                 )],
             ))
             .await
@@ -1267,7 +1375,7 @@ mod postgres_tests {
                     vec![upsert_mutation(
                         "must-not-run-before-retry",
                         ProjectionRecordExpectation::Exact(recreated.records[0].revision.clone(),),
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                 ))
                 .await,
@@ -1294,7 +1402,7 @@ mod postgres_tests {
                     vec![upsert_mutation(
                         "10",
                         ProjectionRecordExpectation::Exact(recreated.records[0].revision.clone()),
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                 ))
                 .await
@@ -1350,7 +1458,7 @@ mod postgres_tests {
                     ProjectionRecordExpectation::Exact(
                         before_rollback.record.as_ref().unwrap().revision.clone(),
                     ),
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
             ))
             .await
@@ -1408,7 +1516,7 @@ mod postgres_tests {
                     ProjectionRecordExpectation::Exact(
                         before_rollback.record.as_ref().unwrap().revision.clone(),
                     ),
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
             ))
             .await
@@ -1465,7 +1573,7 @@ mod postgres_tests {
                             vec![upsert_mutation(
                                 "12",
                                 ProjectionRecordExpectation::Exact(repeatable_expectation),
-                                ProjectionMutationKind::Upsert,
+                                RecordTransition::Upsert,
                             )],
                         ))
                         .await?;
@@ -1523,19 +1631,6 @@ mod postgres_tests {
             retained_failure_change, 0,
             "bounded retention must compact the failure change before evidence lookup"
         );
-        assert!(matches!(
-            repository
-                .projection_obligation_evidence_batch(
-                    &ProjectionObligationEvidenceBatchRequest::new(vec![causal_probe]).unwrap(),
-                )
-                .await
-                .unwrap()
-                .evidence
-                .as_slice(),
-            [ProjectionObligationEvidence::TerminalFailure(stored)]
-                if stored == &failure
-        ));
-
         let physical_version: i64 = sqlx::query_scalar(
             "SELECT _sourced_version FROM postgres_projection_views WHERE id = $1",
         )

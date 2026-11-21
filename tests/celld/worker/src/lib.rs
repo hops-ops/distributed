@@ -1,44 +1,36 @@
 //! Todo and Chat Durable Object classes backed by `AggregateCell`.
 //!
 //! HTTP is command-named wait-path (`POST /{command}` with
-//! `{ commandId, input }`) plus GET of the sealed row. GraphQL and
+//! `{ commandId, input }`) plus GET of the aggregate state. GraphQL and
 //! projectors are not methods on this class (`PCH-REQ-005`). Chat `@live`
 //! stays on the GraphQL host.
 
 use chat_domain::{post, ChatMessage, ChatMessageState};
 use distributed::cell_host::{
-    cell_projection_event_evidence, AggregateCell, CellCommandIdentity, CellDispatchError,
-    CellDispatchResult, CellWaitPathRequest, CelldOutbox, DurableAggregateCellState,
-    InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
-    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
+    AggregateCell, CausalDispatchError, CausalDispatchResult, CellCommandIdentity,
+    CellWaitPathRequest, CelldOutbox, InternalHttpSecret, CELL_CAUSATION_ID_HEADER,
+    CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
+    CELL_SERVICE_ID_HEADER,
 };
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use todo_domain::{
     archive, complete, create, force_archive, purge, rename, reopen, Todo, TodoState,
 };
 use worker::*;
 
+#[cfg(feature = "storage-conformance")]
+mod storage_conformance;
+
 const MAX_CELL_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
-const STATE_DDL: &str = "CREATE TABLE IF NOT EXISTS cell_state (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  body TEXT NOT NULL
-)";
-
-async fn persist_and_drain_cell<A>(
-    sql: &SqlStorage,
-    storage: &Storage,
-    env: &Env,
-    cell: &AggregateCell<A>,
-) -> Result<()>
+async fn drain_cell<A>(env: &Env, cell: &AggregateCell<A>) -> Result<()>
 where
     A: distributed::Aggregate + Send + Sync + 'static,
 {
     let outcome = cell
-        .persist_and_drain_outbox(env, storage, |state| persist_cell_state(sql, state))
+        .drain_outbox(env)
         .await
         .map_err(|error| Error::RustError(error.to_string()))?;
     for error in outcome.deferred {
@@ -51,23 +43,72 @@ where
     Ok(())
 }
 
+/// Durable Object alarm: fire due cell alarms, then drain the outbox. The one
+/// alarm slot is shared by both, always set to the earliest due time.
+async fn alarm_cell<A>(env: &Env, cell: &AggregateCell<A>) -> Result<()>
+where
+    A: distributed::Aggregate + Send + Sync + 'static,
+{
+    let wake = cell
+        .alarm(env)
+        .await
+        .map_err(|error| Error::RustError(error.to_string()))?;
+    for failed in wake.schedules.failed.iter().chain(&wake.schedules.retried) {
+        worker::console_error!(
+            "cell alarm {} on {} failed: {} {}",
+            failed.name,
+            cell.instance_name(),
+            failed.code,
+            failed.message
+        );
+    }
+    for error in wake.drain.deferred {
+        worker::console_error!(
+            "celld outbox alarm drain deferred for {}: {}",
+            cell.instance_name(),
+            error
+        );
+    }
+    Ok(())
+}
+
+async fn drain_after_command<A>(env: &Env, cell: &AggregateCell<A>, request: &Request)
+where
+    A: distributed::Aggregate + Send + Sync + 'static,
+{
+    #[cfg(feature = "storage-conformance")]
+    if request
+        .headers()
+        .get("x-distributed-test-defer-drain")
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("1")
+    {
+        return;
+    }
+    #[cfg(not(feature = "storage-conformance"))]
+    let _ = request;
+    if let Err(error) = drain_cell(env, cell).await {
+        worker::console_error!("post-commit Queue drain deferred: {}", error);
+    }
+}
+
 #[durable_object]
 pub struct TodoCell {
     cell: AggregateCell<Todo>,
+    #[cfg(feature = "storage-conformance")]
     sql: SqlStorage,
-    storage: Storage,
     env: Env,
 }
 
 impl DurableObject for TodoCell {
     fn new(state: State, env: Env) -> Self {
         console_error_panic_hook::set_once();
-        let storage = state.storage();
-        let sql = storage.sql();
-        sql.exec(STATE_DDL, None).expect("create cell_state");
-        let shard = state.id().name().unwrap_or_else(|| "todo".to_string());
+        #[cfg(feature = "storage-conformance")]
+        let sql = state.storage().sql();
         let outbox = CelldOutbox::from_env(&env, "OUTBOX").expect("OUTBOX Queue binding");
-        let cell = AggregateCell::<Todo>::new_with_snapshots(shard.clone(), 1)
+        let cell = AggregateCell::<Todo>::from_state_with_snapshots(state, 1)
             .expect("todo cell identity")
             .mount(create())
             .mount(rename())
@@ -77,11 +118,14 @@ impl DurableObject for TodoCell {
             .mount(force_archive())
             .mount(purge())
             .with_celld_outbox(outbox);
-        let _ = restore_cell_state(&sql, &cell);
+        #[cfg(feature = "storage-conformance")]
+        storage_conformance::reset_faults_on_activation(&sql).expect("reset test faults");
+        #[cfg(feature = "storage-conformance")]
+        let cell = cell.mount(storage_conformance::test_batch());
         Self {
             cell,
+            #[cfg(feature = "storage-conformance")]
             sql,
-            storage,
             env,
         }
     }
@@ -89,9 +133,6 @@ impl DurableObject for TodoCell {
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         if let Err(error) = authenticate_internal_request(&req, &self.env) {
             return internal_auth_error(error);
-        }
-        if let Err(error) = restore_cell_state(&self.sql, &self.cell) {
-            return json_status(json!({ "error": error }), 500);
         }
         let url = req.url()?;
         let parts: Vec<String> = url
@@ -105,18 +146,22 @@ impl DurableObject for TodoCell {
             _ => return json_status(json!({ "error": "missing todo id" }), 400),
         };
 
+        #[cfg(feature = "storage-conformance")]
+        if parts.get(2).map(String::as_str) == Some("__storage_test") {
+            return match storage_conformance::handle(&self.sql, &mut req).await {
+                Ok(response) => Ok(response),
+                Err(error) => Response::error(error.to_string(), 500),
+            };
+        }
+
         match (req.method(), parts.get(2).map(String::as_str)) {
             (Method::Get, None) => get_todo(&self.cell, &id).await,
+            #[cfg(feature = "storage-conformance")]
+            (Method::Post, Some("todo.test_batch")) => {
+                transition_todo(&self.env, &self.cell, &id, "todo.test_batch", &mut req).await
+            }
             (Method::Post, Some("todo.create")) => {
-                create_todo(
-                    &self.sql,
-                    &self.storage,
-                    &self.env,
-                    &self.cell,
-                    &id,
-                    &mut req,
-                )
-                .await
+                create_todo(&self.env, &self.cell, &id, &mut req).await
             }
             (Method::Post, Some(command))
                 if matches!(
@@ -129,26 +174,14 @@ impl DurableObject for TodoCell {
                         | "todo.purge"
                 ) =>
             {
-                transition_todo(
-                    &self.sql,
-                    &self.storage,
-                    &self.env,
-                    &self.cell,
-                    &id,
-                    command,
-                    &mut req,
-                )
-                .await
+                transition_todo(&self.env, &self.cell, &id, command, &mut req).await
             }
             _ => json_status(json!({ "error": "not found" }), 404),
         }
     }
 
     async fn alarm(&self) -> Result<Response> {
-        if let Err(error) = restore_cell_state(&self.sql, &self.cell) {
-            return json_status(json!({ "error": error }), 500);
-        }
-        persist_and_drain_cell(&self.sql, &self.storage, &self.env, &self.cell).await?;
+        alarm_cell(&self.env, &self.cell).await?;
         Response::ok("ok")
     }
 }
@@ -156,38 +189,23 @@ impl DurableObject for TodoCell {
 #[durable_object]
 pub struct ChatCell {
     cell: AggregateCell<ChatMessage>,
-    sql: SqlStorage,
-    storage: Storage,
     env: Env,
 }
 
 impl DurableObject for ChatCell {
     fn new(state: State, env: Env) -> Self {
         console_error_panic_hook::set_once();
-        let storage = state.storage();
-        let sql = storage.sql();
-        sql.exec(STATE_DDL, None).expect("create cell_state");
-        let shard = state.id().name().unwrap_or_else(|| "chat".to_string());
         let outbox = CelldOutbox::from_env(&env, "OUTBOX").expect("OUTBOX Queue binding");
-        let cell = AggregateCell::<ChatMessage>::new(shard.clone())
+        let cell = AggregateCell::<ChatMessage>::from_state(state)
             .expect("chat cell identity")
             .mount(post())
             .with_celld_outbox(outbox);
-        let _ = restore_cell_state(&sql, &cell);
-        Self {
-            cell,
-            sql,
-            storage,
-            env,
-        }
+        Self { cell, env }
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         if let Err(error) = authenticate_internal_request(&req, &self.env) {
             return internal_auth_error(error);
-        }
-        if let Err(error) = restore_cell_state(&self.sql, &self.cell) {
-            return json_status(json!({ "error": error }), 500);
         }
         let url = req.url()?;
         let parts: Vec<String> = url
@@ -204,25 +222,14 @@ impl DurableObject for ChatCell {
         match (req.method(), parts.get(2).map(String::as_str)) {
             (Method::Get, None) => get_chat(&self.cell, &id).await,
             (Method::Post, Some("chat.post")) => {
-                post_chat(
-                    &self.sql,
-                    &self.storage,
-                    &self.env,
-                    &self.cell,
-                    &id,
-                    &mut req,
-                )
-                .await
+                post_chat(&self.env, &self.cell, &id, &mut req).await
             }
             _ => json_status(json!({ "error": "not found" }), 404),
         }
     }
 
     async fn alarm(&self) -> Result<Response> {
-        if let Err(error) = restore_cell_state(&self.sql, &self.cell) {
-            return json_status(json!({ "error": error }), 500);
-        }
-        persist_and_drain_cell(&self.sql, &self.storage, &self.env, &self.cell).await?;
+        alarm_cell(&self.env, &self.cell).await?;
         Response::ok("ok")
     }
 }
@@ -254,7 +261,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 fn authenticate_internal_request(
     req: &Request,
     env: &Env,
-) -> std::result::Result<(), CellDispatchError> {
+) -> std::result::Result<(), CausalDispatchError> {
     let configured = env
         .secret(CELL_INTERNAL_SECRET_ENV)
         .map(|value| value.to_string())
@@ -263,23 +270,23 @@ fn authenticate_internal_request(
                 .map(|value| value.to_string())
         })
         .map_err(|_| {
-            CellDispatchError::Internal(format!("{CELL_INTERNAL_SECRET_ENV} is required"))
+            CausalDispatchError::Internal(format!("{CELL_INTERNAL_SECRET_ENV} is required"))
         })?;
-    let secret = InternalHttpSecret::new(configured).map_err(CellDispatchError::Internal)?;
+    let secret = InternalHttpSecret::new(configured).map_err(CausalDispatchError::Internal)?;
     let candidate = req
         .headers()
         .get(CELL_INTERNAL_SECRET_HEADER)
-        .map_err(|_| CellDispatchError::Unauthorized)?
-        .ok_or(CellDispatchError::Unauthorized)?;
+        .map_err(|_| CausalDispatchError::Unauthorized)?
+        .ok_or(CausalDispatchError::Unauthorized)?;
     if !secret.matches(&candidate) {
-        return Err(CellDispatchError::Unauthorized);
+        return Err(CausalDispatchError::Unauthorized);
     }
     Ok(())
 }
 
-fn internal_auth_error(error: CellDispatchError) -> Result<Response> {
+fn internal_auth_error(error: CausalDispatchError) -> Result<Response> {
     match error {
-        CellDispatchError::Unauthorized => json_status(
+        CausalDispatchError::Unauthorized => json_status(
             json!({ "code": "UNAUTHORIZED", "error": "unauthorized" }),
             401,
         ),
@@ -318,9 +325,6 @@ fn request_session(req: &Request) -> Session {
 }
 
 async fn get_chat(cell: &AggregateCell<ChatMessage>, id: &str) -> Result<Response> {
-    if let Ok(Some(row)) = cell.sealed_row() {
-        return json_status(row, 200);
-    }
     match cell.load().await {
         Ok(Some(message)) => json_status(http_chat(&ChatMessageState::from(&message)), 200),
         Ok(None) => json_status(json!({ "error": "not found", "id": id }), 404),
@@ -329,8 +333,6 @@ async fn get_chat(cell: &AggregateCell<ChatMessage>, id: &str) -> Result<Respons
 }
 
 async fn post_chat(
-    sql: &SqlStorage,
-    storage: &Storage,
     env: &Env,
     cell: &AggregateCell<ChatMessage>,
     id: &str,
@@ -339,7 +341,7 @@ async fn post_chat(
     let session = request_session(req);
     let body = match bounded_json::<Value>(req).await {
         Ok(body) => body,
-        Err(error) => return map_cell_error(CellDispatchError::BadRequest(error.into()), cell),
+        Err(error) => return map_cell_error(CausalDispatchError::BadRequest(error.into()), cell),
     };
     let (command_id, mut input) = match wait_path_parts(&body) {
         Ok(parts) => parts,
@@ -359,13 +361,12 @@ async fn post_chat(
         .await
     {
         Ok(dispatch) => {
-            seal_chat_from_load(cell).await;
-            persist_and_drain_cell(sql, storage, env, cell).await?;
-            let events = projection_events_wire(cell, dispatch.causation_id())?;
+            drain_after_command(env, cell, req).await;
+            let events = serde_json::to_value(dispatch.projection_events())?;
             wait_path_ok(dispatch.payload().clone(), &dispatch, 201, events)
         }
         Err(error) => {
-            persist_and_drain_cell(sql, storage, env, cell).await?;
+            drain_after_command(env, cell, req).await;
             map_cell_error(error, cell)
         }
     }
@@ -381,30 +382,7 @@ fn http_chat(state: &ChatMessageState) -> Value {
     })
 }
 
-fn restore_cell_state<A>(
-    sql: &SqlStorage,
-    cell: &AggregateCell<A>,
-) -> std::result::Result<(), String>
-where
-    A: distributed::Aggregate + Send + Sync + 'static,
-{
-    if let Some(state) = load_cell_state(sql).map_err(|error| error.to_string())? {
-        cell.restore_durable_state(state)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
-async fn seal_chat_from_load(cell: &AggregateCell<ChatMessage>) {
-    if let Ok(Some(message)) = cell.load().await {
-        let _ = cell.replace_sealed_row(http_chat(&ChatMessageState::from(&message)));
-    }
-}
-
 async fn get_todo(cell: &AggregateCell<Todo>, id: &str) -> Result<Response> {
-    if let Ok(Some(row)) = cell.sealed_row() {
-        return json_status(row, 200);
-    }
     match cell.load().await {
         Ok(Some(todo)) => json_status(http_todo(&TodoState::from(&todo)), 200),
         Ok(None) => json_status(json!({ "error": "not found", "id": id }), 404),
@@ -412,38 +390,58 @@ async fn get_todo(cell: &AggregateCell<Todo>, id: &str) -> Result<Response> {
     }
 }
 
-fn wait_path_parts(body: &Value) -> std::result::Result<(String, Value), CellDispatchError> {
+fn wait_path_parts(body: &Value) -> std::result::Result<(String, Value), CausalDispatchError> {
     let request =
-        CellWaitPathRequest::parse(body.clone()).map_err(CellDispatchError::BadRequest)?;
+        CellWaitPathRequest::parse(body.clone()).map_err(CausalDispatchError::BadRequest)?;
     Ok((request.command_id, request.input))
 }
 
 fn request_cell_identity(
     req: &Request,
     command_id: &str,
-) -> std::result::Result<CellCommandIdentity, CellDispatchError> {
+) -> std::result::Result<CellCommandIdentity, CausalDispatchError> {
     let service_id = required_internal_header(req, CELL_SERVICE_ID_HEADER)?;
     let principal_partition = required_internal_header(req, CELL_PRINCIPAL_PARTITION_HEADER)?;
-    CellCommandIdentity::new(service_id, principal_partition, command_id)
+    let identity = CellCommandIdentity::new(service_id, principal_partition, command_id)?;
+    match optional_internal_header(req, CELL_CAUSATION_ID_HEADER)? {
+        Some(causation_id) => identity.with_causation_id(causation_id),
+        None => Ok(identity),
+    }
 }
 
 fn required_internal_header(
     req: &Request,
     name: &str,
-) -> std::result::Result<String, CellDispatchError> {
+) -> std::result::Result<String, CausalDispatchError> {
     req.headers()
         .get(name)
         .map_err(|error| {
-            CellDispatchError::Internal(format!("could not read internal cell header: {error}"))
+            CausalDispatchError::Internal(format!("could not read internal cell header: {error}"))
         })?
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or(CellDispatchError::Unauthorized)
+        .ok_or(CausalDispatchError::Unauthorized)
+}
+
+fn optional_internal_header(
+    req: &Request,
+    name: &str,
+) -> std::result::Result<Option<String>, CausalDispatchError> {
+    req.headers()
+        .get(name)
+        .map_err(|error| {
+            CausalDispatchError::Internal(format!("could not read internal cell header: {error}"))
+        })
+        .map(|value| {
+            value
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
 }
 
 fn wait_path_ok(
     payload: Value,
-    dispatch: &CellDispatchResult,
+    dispatch: &CausalDispatchResult,
     status: u16,
     events: Value,
 ) -> Result<Response> {
@@ -462,22 +460,7 @@ fn wait_path_ok(
     )
 }
 
-fn projection_events_wire<A>(cell: &AggregateCell<A>, causation_id: &str) -> Result<Value>
-where
-    A: distributed::Aggregate + Send + Sync + 'static,
-{
-    let rows = cell
-        .durable_outbox()
-        .map_err(|error| Error::RustError(error.to_string()))?;
-    serde_json::to_value(
-        cell_projection_event_evidence(&rows, causation_id).map_err(Error::RustError)?,
-    )
-    .map_err(|error| Error::RustError(error.to_string()))
-}
-
 async fn create_todo(
-    sql: &SqlStorage,
-    storage: &Storage,
     env: &Env,
     cell: &AggregateCell<Todo>,
     id: &str,
@@ -485,7 +468,7 @@ async fn create_todo(
 ) -> Result<Response> {
     let body = match bounded_json::<Value>(req).await {
         Ok(body) => body,
-        Err(error) => return map_cell_error(CellDispatchError::BadRequest(error.into()), cell),
+        Err(error) => return map_cell_error(CausalDispatchError::BadRequest(error.into()), cell),
     };
     let (command_id, input) = match wait_path_parts(&body) {
         Ok(parts) => parts,
@@ -510,9 +493,8 @@ async fn create_todo(
         .await
     {
         Ok(dispatch) => {
-            seal_from_load(cell).await;
-            persist_and_drain_cell(sql, storage, env, cell).await?;
-            let events = projection_events_wire(cell, dispatch.causation_id())?;
+            drain_after_command(env, cell, req).await;
+            let events = serde_json::to_value(dispatch.projection_events())?;
             wait_path_ok(
                 http_from_command(id, dispatch.payload(), &title),
                 &dispatch,
@@ -521,15 +503,13 @@ async fn create_todo(
             )
         }
         Err(error) => {
-            persist_and_drain_cell(sql, storage, env, cell).await?;
+            drain_after_command(env, cell, req).await;
             map_cell_error(error, cell)
         }
     }
 }
 
 async fn transition_todo(
-    sql: &SqlStorage,
-    storage: &Storage,
     env: &Env,
     cell: &AggregateCell<Todo>,
     id: &str,
@@ -538,7 +518,7 @@ async fn transition_todo(
 ) -> Result<Response> {
     let body = match bounded_json::<Value>(req).await {
         Ok(body) => body,
-        Err(error) => return map_cell_error(CellDispatchError::BadRequest(error.into()), cell),
+        Err(error) => return map_cell_error(CausalDispatchError::BadRequest(error.into()), cell),
     };
     let (command_id, mut input) = match wait_path_parts(&body) {
         Ok(parts) => parts,
@@ -550,7 +530,7 @@ async fn transition_todo(
     };
     let Some(input_object) = input.as_object_mut() else {
         return map_cell_error(
-            CellDispatchError::BadRequest("input must be an object".into()),
+            CausalDispatchError::BadRequest("input must be an object".into()),
             cell,
         );
     };
@@ -562,9 +542,8 @@ async fn transition_todo(
         .await
     {
         Ok(dispatch) => {
-            seal_from_load(cell).await;
-            persist_and_drain_cell(sql, storage, env, cell).await?;
-            let events = projection_events_wire(cell, dispatch.causation_id())?;
+            drain_after_command(env, cell, req).await;
+            let events = serde_json::to_value(dispatch.projection_events())?;
             let title = cell
                 .load()
                 .await
@@ -580,7 +559,7 @@ async fn transition_todo(
             )
         }
         Err(error) => {
-            persist_and_drain_cell(sql, storage, env, cell).await?;
+            drain_after_command(env, cell, req).await;
             map_cell_error(error, cell)
         }
     }
@@ -608,7 +587,7 @@ fn http_from_command(id: &str, payload: &Value, fallback_title: &str) -> Value {
     Value::Object(body)
 }
 
-fn map_cell_error<A>(error: CellDispatchError, _cell: &AggregateCell<A>) -> Result<Response>
+fn map_cell_error<A>(error: CausalDispatchError, _cell: &AggregateCell<A>) -> Result<Response>
 where
     A: distributed::Aggregate + Send + Sync + 'static,
 {
@@ -647,37 +626,4 @@ async fn bounded_json<T: DeserializeOwned>(
         return Err("cell request exceeds 2 MiB");
     }
     serde_json::from_slice(&bytes).map_err(|_| "invalid cell request JSON")
-}
-
-async fn seal_from_load(cell: &AggregateCell<Todo>) {
-    if let Ok(Some(todo)) = cell.load().await {
-        let _ = cell.replace_sealed_row(http_todo(&TodoState::from(&todo)));
-    }
-}
-
-fn persist_cell_state(sql: &SqlStorage, state: &DurableAggregateCellState) -> Result<()> {
-    let body = serde_json::to_string(state).map_err(|error| Error::RustError(error.to_string()))?;
-    sql.exec(
-        "INSERT INTO cell_state (id, body) VALUES (1, ?) \
-         ON CONFLICT(id) DO UPDATE SET body = excluded.body",
-        Some(vec![body.into()]),
-    )?;
-    Ok(())
-}
-
-fn load_cell_state(sql: &SqlStorage) -> Result<Option<DurableAggregateCellState>> {
-    let rows: Vec<StateRow> = sql
-        .exec("SELECT body FROM cell_state WHERE id = 1", None)?
-        .to_array()?;
-    rows.into_iter()
-        .next()
-        .map(|row| {
-            serde_json::from_str(&row.body).map_err(|error| Error::RustError(error.to_string()))
-        })
-        .transpose()
-}
-
-#[derive(Deserialize)]
-struct StateRow {
-    body: String,
 }

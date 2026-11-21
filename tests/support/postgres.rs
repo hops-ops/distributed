@@ -1,12 +1,14 @@
 #![cfg(feature = "postgres")]
 
-use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use distributed::PostgresRepository;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
+
+#[path = "env.rs"]
+mod env_support;
 
 static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -16,11 +18,8 @@ pub struct PostgresTestSchema {
 }
 
 impl PostgresTestSchema {
-    pub async fn create_from_env(prefix: &str, skip_message: &str) -> Option<Self> {
-        let Ok(database_url) = env::var("DATABASE_URL") else {
-            eprintln!("{skip_message}: DATABASE_URL is not set");
-            return None;
-        };
+    pub async fn create_from_env(prefix: &str, what: &str) -> Option<Self> {
+        let database_url = env_support::require_service("DATABASE_URL", what)?;
 
         Some(
             Self::create(&database_url, prefix)

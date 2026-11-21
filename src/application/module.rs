@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use super::command::{CommandDefinition, CommandMount, CommandSpec, CommandTypeSpec, EventSpec};
 use super::error::{ApplicationError, ApplicationResult};
 use super::identity::{canonical_json, sha256_fingerprint, LogicalId};
-use crate::graphql::command_contract::TypedCommandContract;
+use crate::command::TypedCommandContract;
 use crate::graphql::surface::{
     RootKind, Surface, SurfaceArgument, SurfaceCommand, SurfaceCommandShape,
     SurfaceProjectionOwner, SurfaceRelationshipKeys, SurfaceSelection, SurfaceTypeDef,
@@ -84,10 +84,7 @@ impl ModelSpec {
         let table = LogicalId::try_new("model table", table)?.into_string();
         let mut fields = fields.into_iter().collect::<Vec<_>>();
         fields.sort_by(|left, right| left.name.cmp(&right.name));
-        let mut primary_key = primary_key
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>();
+        let mut primary_key = primary_key.into_iter().map(Into::into).collect::<Vec<_>>();
         primary_key.sort();
         primary_key.dedup();
         if fields.is_empty() {
@@ -127,7 +124,6 @@ impl ModelSpec {
         self.fingerprint = sha256_fingerprint(&serde_json::to_vec(&canonical_json(&value))?);
         Ok(())
     }
-
 }
 
 /// Portable projection-owner identity aggregated into a module.
@@ -258,11 +254,13 @@ impl ProjectionSpec {
     pub fn canonical_bytes(&self) -> ApplicationResult<Vec<u8>> {
         let mut value = serde_json::to_value(self)?;
         if let serde_json::Value::Object(fields) = &mut value {
-            fields.insert("fingerprint".into(), serde_json::Value::String(String::new()));
+            fields.insert(
+                "fingerprint".into(),
+                serde_json::Value::String(String::new()),
+            );
         }
         serde_json::to_vec(&canonical_json(&value)).map_err(Into::into)
     }
-
 }
 
 /// A root field identity retained by a surface contract.
@@ -289,15 +287,12 @@ pub struct SurfaceCommandSpec {
     pub roles: Vec<String>,
     pub input: Option<CommandTypeSpec>,
     pub output: Option<CommandTypeSpec>,
-    pub consistency: crate::graphql::CommandConsistency,
+    pub consistency: crate::command::CommandConsistency,
     pub defaults: serde_json::Value,
-    pub effects: serde_json::Value,
-    pub confirmations: serde_json::Value,
     pub projection_contract: serde_json::Value,
     pub applies: serde_json::Value,
     pub direct_projection: Option<serde_json::Value>,
     pub projected_model: Option<String>,
-    pub confirmation_unavailable: bool,
 }
 
 /// Authorized, placement-independent surface identity.
@@ -320,6 +315,11 @@ pub struct SurfaceSpec {
     pub comparison_ops: BTreeMap<String, Vec<String>>,
     pub commands_attached: bool,
     pub projectors_attached: bool,
+    /// Canonical leaderboard sections (`LeaderboardSurface`), in contract
+    /// order. Absent when empty, so manifests without leaderboards keep
+    /// their bytes and fingerprints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub leaderboards: Vec<serde_json::Value>,
     /// Canonical lossless Surface IR snapshot. It is the identity authority
     /// for SDL/client compilation and must never be reconstructed from tables.
     pub contract: serde_json::Value,
@@ -346,6 +346,7 @@ impl SurfaceSpec {
             comparison_ops: BTreeMap::new(),
             commands_attached: false,
             projectors_attached: false,
+            leaderboards: Vec::new(),
             contract: serde_json::json!({
                 "version": 1,
                 "selection": {"kind": "catalog"},
@@ -423,7 +424,8 @@ impl SurfaceSpec {
                 spec.fields
                     .sort_by(|left, right| left.name.cmp(&right.name));
                 spec.primary_key.sort();
-                spec.relationships.sort_by(|left, right| left.name.cmp(&right.name));
+                spec.relationships
+                    .sort_by(|left, right| left.name.cmp(&right.name));
                 spec.refresh_fingerprint()?;
                 Ok(spec)
             })
@@ -434,7 +436,12 @@ impl SurfaceSpec {
             .query_fields
             .iter()
             .map(|root| ("query", root))
-            .chain(surface.subscription_fields.iter().map(|root| ("subscription", root)))
+            .chain(
+                surface
+                    .subscription_fields
+                    .iter()
+                    .map(|root| ("subscription", root)),
+            )
             .map(|(operation, root)| SurfaceRootSpec {
                 operation: operation.into(),
                 name: root.name.clone(),
@@ -488,6 +495,11 @@ impl SurfaceSpec {
             comparison_ops: surface.comparison_ops.clone(),
             commands_attached: surface.commands_attached,
             projectors_attached: surface.projectors_attached,
+            leaderboards: surface
+                .leaderboards
+                .iter()
+                .map(crate::graphql::surface::LeaderboardSurface::canonical_value)
+                .collect(),
             contract: surface
                 .canonical_contract_value()
                 .map_err(ApplicationError::InvalidSpec)?,
@@ -512,7 +524,10 @@ impl SurfaceSpec {
     pub fn canonical_bytes(&self) -> ApplicationResult<Vec<u8>> {
         let mut value = serde_json::to_value(self)?;
         if let serde_json::Value::Object(fields) = &mut value {
-            fields.insert("fingerprint".into(), serde_json::Value::String(String::new()));
+            fields.insert(
+                "fingerprint".into(),
+                serde_json::Value::String(String::new()),
+            );
         }
         serde_json::to_vec(&canonical_json(&value)).map_err(Into::into)
     }
@@ -527,19 +542,16 @@ fn surface_command_spec(command: &SurfaceCommand) -> ApplicationResult<SurfaceCo
         output: surface_shape_spec(&command.output),
         consistency: command.consistency,
         defaults: serde_json::to_value(&command.input_defaults)?,
-        effects: serde_json::to_value(&command.effects)?,
-        confirmations: serde_json::to_value(&command.confirmations)?,
         projection_contract: serde_json::to_value(&command.projections)?,
         applies: serde_json::to_value(&command.projections.previews)?,
         direct_projection: command
             .direct_projection
             .as_ref()
-            .map(crate::graphql::command_contract::CommandDirectProjectionTarget::canonical_value),
+            .map(crate::command::CommandDirectProjectionTarget::canonical_value),
         projected_model: command
             .projected_model
             .as_ref()
             .map(|model| model.model.clone()),
-        confirmation_unavailable: command.confirmation_unavailable,
     })
 }
 
@@ -577,16 +589,19 @@ fn surface_relationship_spec(
             .collect(),
         keys: surface_relationship_keys(&relationship.keys),
         dependencies: relationship.dependencies.clone(),
-        aggregate: relationship.aggregate.as_ref().map(|aggregate| SurfaceAggregateSpec {
-            name: aggregate.name.clone(),
-            type_name: aggregate.type_name.clone(),
-            arguments: aggregate
-                .arguments
-                .iter()
-                .map(surface_argument_spec)
-                .collect(),
-            dependencies: aggregate.dependencies.clone(),
-        }),
+        aggregate: relationship
+            .aggregate
+            .as_ref()
+            .map(|aggregate| SurfaceAggregateSpec {
+                name: aggregate.name.clone(),
+                type_name: aggregate.type_name.clone(),
+                arguments: aggregate
+                    .arguments
+                    .iter()
+                    .map(surface_argument_spec)
+                    .collect(),
+                dependencies: aggregate.dependencies.clone(),
+            }),
     })
 }
 
@@ -634,7 +649,7 @@ fn surface_row_policy(
             "kind": "predicate",
             "expression": predicate,
         }),
-        crate::graphql::surface::SurfaceRowPolicy::ServerOnly => {
+        crate::graphql::surface::SurfaceRowPolicy::ServerOnly(_) => {
             serde_json::json!({"kind": "server_only"})
         }
     })
@@ -654,6 +669,7 @@ fn surface_type_spec(definition: &SurfaceTypeDef) -> CommandTypeSpec {
             .fields
             .iter()
             .map(|field| super::command::CommandTypeField {
+                unsigned_integer: field.unsigned_integer,
                 name: field.name.clone(),
                 type_name: field.type_name.clone(),
                 nullable: field.nullable,
@@ -973,7 +989,9 @@ impl ModuleBuilder {
                 .flat_map(|surface| surface.projections.iter().cloned()),
         );
         projections.sort_by(|left, right| left.id.cmp(&right.id));
-        projections = dedup_identical("projection", projections, |projection| projection.id.clone())?;
+        projections = dedup_identical("projection", projections, |projection| {
+            projection.id.clone()
+        })?;
 
         let mut events = commands
             .iter()

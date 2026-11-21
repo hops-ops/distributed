@@ -196,6 +196,30 @@ macro_rules! repository_conformance_tests {
         }
 
         #[tokio::test]
+        async fn broker_outage_keeps_the_backlog_pending_with_growing_delay() {
+            let Some(repo) = repository().await else {
+                return;
+            };
+            conformance::outbox::broker_outage_keeps_the_backlog_pending_with_growing_delay(
+                repo.clone(),
+                repo.outbox_store(),
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn failed_row_is_requeued_and_delivered() {
+            let Some(repo) = repository().await else {
+                return;
+            };
+            conformance::outbox::failed_row_is_requeued_and_delivered(
+                repo.clone(),
+                repo.outbox_store(),
+            )
+            .await;
+        }
+
+        #[tokio::test]
         async fn worker_completes_claims_in_one_batch() {
             let Some(repo) = repository().await else {
                 return;

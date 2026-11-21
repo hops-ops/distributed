@@ -57,13 +57,18 @@ impl GraphqlEngine {
         self.inner.service_id.as_deref()
     }
 
+    /// The lifecycle gate taken from the bound service.
+    pub(crate) fn lifecycle(&self) -> &crate::microsvc::LifecycleGate {
+        &self.inner.lifecycle
+    }
+
     pub(crate) fn typed_command_binding(&self) -> Option<&TypedServiceCommandBinding> {
         self.inner.command_binding.as_ref()
     }
 
     pub(crate) fn typed_command_contracts_for_service(
         &self,
-    ) -> Result<Vec<crate::graphql::command_contract::TypedCommandContract>, String> {
+    ) -> Result<Vec<crate::command::TypedCommandContract>, String> {
         Ok(self.inner.typed_commands.contracts_for_binding())
     }
 
@@ -189,11 +194,16 @@ impl GraphqlEngine {
 
     /// Identity configuration used by GraphQL HTTP handlers.
     pub fn identity_config(&self) -> &IdentityConfig {
+        self.inner.identity.config()
+    }
+
+    pub(crate) fn identity(&self) -> &IdentityResolver {
         &self.inner.identity
     }
 
-    pub(crate) fn identity_validator(&self) -> Option<&OidcValidator> {
-        self.inner.identity_validator.as_ref()
+    /// Bounds applied to each origin WebSocket connection.
+    pub fn websocket_limits(&self) -> WebsocketLimits {
+        self.inner.websocket
     }
 
     /// Whether unknown/ungranted client `where` and `order_by` keys fail closed.

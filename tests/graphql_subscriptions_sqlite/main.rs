@@ -2,6 +2,7 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
+use distributed::graphql::IdentityConfig;
 use std::time::Duration;
 
 use async_graphql::Request;
@@ -14,6 +15,10 @@ use distributed::{
 };
 use futures_util::StreamExt;
 use sqlx::sqlite::SqlitePoolOptions;
+
+#[path = "../support/graphql.rs"]
+mod graphql_support;
+use graphql_support::Db;
 
 fn items_schema() -> TableSchema {
     TableSchema {
@@ -45,27 +50,19 @@ async fn setup_fixed() -> (
         .await
         .unwrap();
     let pool = repo.pool().clone();
-    sqlx::query(
-        "CREATE TABLE items (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            status TEXT NOT NULL,
-            _sourced_version INTEGER NOT NULL DEFAULT 0
-        );
-        INSERT INTO items (id, name, status, _sourced_version) VALUES
-            ('i1', 'alpha', 'open', 1),
-            ('i2', 'beta', 'closed', 1);",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    Db::Sqlite(repo.clone())
+        .table(
+            &items_schema(),
+            serde_json::json!([["i1", "alpha", "open"], ["i2", "beta", "closed"]]),
+        )
+        .await;
 
     let change_rx = repo.read_model_changes();
 
-    let manifest =
-        distributed::ReadModelCatalog::new("items").table_schema(items_schema());
+    let manifest = distributed::ReadModelCatalog::new("items").table_schema(items_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool.clone())
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .change_stream(change_rx)
@@ -249,24 +246,22 @@ async fn subscription_claim_isolation_across_tenants() {
         .await
         .unwrap();
     let pool = repo.pool().clone();
-    sqlx::query(
-        "CREATE TABLE notes (
-            note_id TEXT PRIMARY KEY,
-            owner_id TEXT NOT NULL,
-            body TEXT NOT NULL,
-            _sourced_version INTEGER NOT NULL DEFAULT 0
-        );
-        INSERT INTO notes (note_id, owner_id, body, _sourced_version) VALUES
-            ('n-a1', 'tenant-a', 'a1', 1),
-            ('n-b1', 'tenant-b', 'b1', 1);",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    Db::Sqlite(repo.clone())
+        .seed(
+            [("n-a1", "tenant-a", "a1"), ("n-b1", "tenant-b", "b1")].map(
+                |(note_id, owner_id, body)| NoteView {
+                    note_id: note_id.into(),
+                    owner_id: owner_id.into(),
+                    body: body.into(),
+                },
+            ),
+        )
+        .await;
 
     let change_rx = repo.read_model_changes();
 
     let engine = GraphqlEngine::builder(pool.clone())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<NoteView>(
             ModelPermissions::new().grant(

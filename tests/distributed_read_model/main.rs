@@ -1,5 +1,9 @@
 mod checkout;
 mod checkout_saga_service;
+#[path = "../support/commands.rs"]
+mod commands;
+#[path = "../support/env.rs"]
+mod env_support;
 #[path = "../support/ids.rs"]
 mod ids;
 #[cfg(feature = "postgres")]
@@ -43,14 +47,14 @@ async fn dispatch<C>(service: &Service, command: &str, input: C)
 where
     C: Serialize,
 {
-    service
-        .dispatch(
-            command,
-            serde_json::to_value(input).expect("command should encode"),
-            Session::new(),
-        )
-        .await
-        .unwrap_or_else(|err| panic!("{command} should dispatch: {err:?}"));
+    commands::dispatch(
+        service,
+        command,
+        serde_json::to_value(input).expect("command should encode"),
+        Session::new(),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{command} should dispatch: {err:?}"));
 }
 
 struct FlowIds {
@@ -515,23 +519,23 @@ async fn seat_checkout_saga_reserves_seat_and_projects_user_screen() {
 
     publish_pending_outbox(&seat_store.outbox_store(), &bus).await;
     publish_pending_outbox(&checkout_store.outbox_store(), &bus).await;
-    bus.subscribe(projection_svc.clone(), RunOptions::idempotent())
+    bus.subscribe(projection_svc.clone(), RunOptions::until_idle())
         .await
         .expect("projection drains the opening events");
-    bus.subscribe(seat_service.clone(), RunOptions::idempotent())
+    bus.subscribe(seat_service.clone(), RunOptions::until_idle())
         .await
         .expect("seat service reacts to the started checkout");
 
     publish_pending_outbox(&seat_store.outbox_store(), &bus).await;
-    bus.subscribe(projection_svc.clone(), RunOptions::idempotent())
+    bus.subscribe(projection_svc.clone(), RunOptions::until_idle())
         .await
         .expect("projection drains the reservation");
-    bus.subscribe(checkout_service.clone(), RunOptions::idempotent())
+    bus.subscribe(checkout_service.clone(), RunOptions::until_idle())
         .await
         .expect("saga records the seat reservation");
 
     publish_pending_outbox(&checkout_store.outbox_store(), &bus).await;
-    bus.subscribe(projection_svc.clone(), RunOptions::idempotent())
+    bus.subscribe(projection_svc.clone(), RunOptions::until_idle())
         .await
         .expect("projection drains the completion");
 
@@ -612,7 +616,7 @@ async fn sqlite_checkout_flow_projects_relational_read_models() {
 async fn postgres_checkout_flow_projects_relational_read_models() {
     let Some(schema) = postgres::PostgresTestSchema::create_from_env(
         "distributed_read",
-        "skipping Postgres distributed read-model test",
+        "Postgres distributed read-model test",
     )
     .await
     else {
@@ -656,11 +660,16 @@ async fn checkout_commands_can_be_http_service() {
     let client = reqwest::Client::new();
     let started = client
         .post(format!("{base}/{}", checkout_command::START))
-        .json(&StartCheckout {
-            checkout_id: "checkout-http".to_string(),
-            seat_id: "B-2".to_string(),
-            seat_category: "floor".to_string(),
-        })
+        // The identity a trusted proxy injects.
+        .header("x-user-id", "user-1")
+        .json(&serde_json::json!({
+            "commandId": commands::command_id(),
+            "input": StartCheckout {
+                checkout_id: "checkout-http".to_string(),
+                seat_id: "B-2".to_string(),
+                seat_category: "floor".to_string(),
+            },
+        }))
         .send()
         .await
         .expect("HTTP checkout service should accept start request");
@@ -687,13 +696,17 @@ async fn checkout_commands_can_be_grpc_service() {
     let started = client
         .dispatch(distributed::microsvc::grpc::GrpcRequest {
             command: checkout_command::START.to_string(),
-            input: serde_json::to_string(&StartCheckout {
-                checkout_id: "checkout-grpc".to_string(),
-                seat_id: "C-4".to_string(),
-                seat_category: "box".to_string(),
+            input: serde_json::json!({
+                "commandId": commands::command_id(),
+                "input": StartCheckout {
+                    checkout_id: "checkout-grpc".to_string(),
+                    seat_id: "C-4".to_string(),
+                    seat_category: "box".to_string(),
+                },
             })
-            .expect("start command should encode"),
-            session_variables: Default::default(),
+            .to_string(),
+            // The identity a trusted gateway supplies.
+            session_variables: [("x-user-id".to_string(), "user-1".to_string())].into(),
         })
         .await
         .expect("gRPC checkout service should accept start request")
@@ -809,7 +822,7 @@ async fn run_checkout_over_bus<B, R>(
             .expect("event should publish over the bus");
     }
 
-    bus.subscribe(collector, RunOptions::idempotent())
+    bus.subscribe(collector, RunOptions::until_idle())
         .await
         .expect("subscriber should drain the bus");
 
@@ -982,7 +995,7 @@ async fn matrix_sqlite_persistence_over_knative() {
 
 #[cfg(feature = "nats")]
 fn nats_url() -> Option<String> {
-    std::env::var("NATS_URL").ok()
+    env_support::require_service("NATS_URL", "NATS read-model matrix cell")
 }
 
 #[cfg(feature = "nats")]
@@ -1030,7 +1043,7 @@ async fn matrix_sqlite_persistence_over_nats_bus() {
 
 #[cfg(feature = "rabbitmq")]
 fn amqp_url() -> Option<String> {
-    std::env::var("AMQP_URL").ok()
+    env_support::require_service("AMQP_URL", "RabbitMQ read-model matrix cell")
 }
 
 #[cfg(feature = "rabbitmq")]
@@ -1088,7 +1101,7 @@ async fn matrix_sqlite_persistence_over_rabbit_bus() {
 
 #[cfg(feature = "kafka")]
 fn kafka_brokers() -> Option<String> {
-    std::env::var("KAFKA_BROKERS").ok()
+    env_support::require_service("KAFKA_BROKERS", "Kafka read-model matrix cell")
 }
 
 #[cfg(feature = "kafka")]
@@ -1136,11 +1149,9 @@ async fn matrix_sqlite_persistence_over_kafka_bus() {
 #[tokio::test]
 async fn matrix_in_memory_persistence_over_postgres_bus() {
     use distributed::bus::PostgresBus;
-    let Some(schema) = postgres::PostgresTestSchema::create_from_env(
-        "matrix_pgbus",
-        "skipping Postgres-bus matrix cell",
-    )
-    .await
+    let Some(schema) =
+        postgres::PostgresTestSchema::create_from_env("matrix_pgbus", "Postgres-bus matrix cell")
+            .await
     else {
         return;
     };
@@ -1156,7 +1167,7 @@ async fn matrix_postgres_persistence_over_in_memory_bus() {
     use distributed::bus::InMemoryBus;
     let Some(schema) = postgres::PostgresTestSchema::create_from_env(
         "matrix_pg",
-        "skipping Postgres-persistence matrix cell",
+        "Postgres-persistence matrix cell",
     )
     .await
     else {
@@ -1177,7 +1188,7 @@ async fn postgres_matrix_repo() -> Option<(
 )> {
     let schema = postgres::PostgresTestSchema::create_from_env(
         "matrix_pg",
-        "skipping Postgres-persistence matrix cell",
+        "Postgres-persistence matrix cell",
     )
     .await?;
     let repo = schema.repository().await;
@@ -1191,11 +1202,9 @@ async fn postgres_matrix_repo() -> Option<(
 #[cfg(feature = "postgres")]
 async fn postgres_matrix_bus() -> Option<distributed::bus::PostgresBus> {
     use distributed::bus::PostgresBus;
-    let schema = postgres::PostgresTestSchema::create_from_env(
-        "matrix_pgbus",
-        "skipping Postgres-bus matrix cell",
-    )
-    .await?;
+    let schema =
+        postgres::PostgresTestSchema::create_from_env("matrix_pgbus", "Postgres-bus matrix cell")
+            .await?;
     let bus = PostgresBus::new(schema.repository().await.pool().clone()).group("matrix");
     bus.ensure_tables().await.expect("postgres bus tables");
     // The schema has no Drop, so the bus's tables outlive this fixture.

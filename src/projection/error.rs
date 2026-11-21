@@ -4,6 +4,8 @@ use std::fmt;
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProjectionProgramError {
+    /// Derived facts are not new authoritative aggregate snapshots.
+    DerivedSourceSnapshot,
     /// A stable name, identifier, field, or storage name was empty.
     EmptyName(&'static str),
     /// A declared version must be non-zero.
@@ -67,6 +69,11 @@ pub enum ProjectionProgramError {
     },
     /// Two arms selected the same exact event contract.
     DuplicateSelector,
+    /// A mutation input was bound by no event expression.
+    MissingInput {
+        /// Dotted mutation input path.
+        path: String,
+    },
     /// No arm accepted the supplied event occurrence.
     NoMatchingArm,
     /// More than one arm accepted the supplied event occurrence.
@@ -118,6 +125,9 @@ pub enum ProjectionProgramError {
 impl fmt::Display for ProjectionProgramError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DerivedSourceSnapshot => {
+                formatter.write_str("derived facts cannot establish an aggregate source snapshot")
+            }
             Self::EmptyName(kind) => write!(formatter, "{kind} must not be empty"),
             Self::ZeroVersion(kind) => write!(formatter, "{kind} must be non-zero"),
             Self::InvalidBodyFingerprint => formatter.write_str(
@@ -153,6 +163,12 @@ impl fmt::Display for ProjectionProgramError {
                 write!(formatter, "duplicate {kind} name `{name}`")
             }
             Self::DuplicateSelector => formatter.write_str("duplicate exact event selector"),
+            Self::MissingInput { path } => {
+                write!(
+                    formatter,
+                    "no event expression fills mutation input `{path}`"
+                )
+            }
             Self::NoMatchingArm => formatter.write_str("no projection arm matched the occurrence"),
             Self::MultipleMatchingArms => {
                 formatter.write_str("multiple projection arms matched the occurrence")

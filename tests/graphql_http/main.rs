@@ -2,14 +2,18 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
+use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 
 use distributed::graphql::{graphiql_enabled_from_env_vars, read, GraphqlEngine, ModelPermissions};
 use distributed::microsvc::{router, Service};
 use distributed::ReadModel;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePoolOptions;
 use tower::util::ServiceExt;
+
+#[path = "../support/graphql.rs"]
+mod graphql_support;
+use graphql_support::Db;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("http_items")]
@@ -20,18 +24,15 @@ struct HttpItem {
 }
 
 async fn service_with_graphiql(on: bool) -> Arc<Service> {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE http_items (id TEXT PRIMARY KEY, name TEXT NOT NULL);
-         INSERT INTO http_items VALUES ('1', 'n');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let db = Db::sqlite().await;
+    db.seed([HttpItem {
+        id: "1".into(),
+        name: "n".into(),
+    }])
+    .await;
+    let pool = db.pool();
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .service_id("http-gql")
         .roles(&["user"])
         .model::<HttpItem>(ModelPermissions::new().grant("user", read().all_columns()))

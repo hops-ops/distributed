@@ -44,6 +44,27 @@ fn sqlite_bus(pool: &SqlitePool, group: &str) -> SqliteBus {
     }
 }
 
+/// One temporary database per test; every bus shares its pool.
+struct Sqlite {
+    _db: TempDb,
+    pool: SqlitePool,
+}
+
+impl conformance::bus::BusHarness for Sqlite {
+    type Bus = SqliteBus;
+
+    async fn start() -> Option<Self> {
+        let (db, pool, _bus) = bus().await;
+        Some(Self { _db: db, pool })
+    }
+
+    async fn bus(&self, group: &str) -> SqliteBus {
+        sqlite_bus(&self.pool, group)
+    }
+}
+
+conformance::bus::bus_conformance_tests!(Sqlite);
+
 #[derive(Default)]
 struct OrderedEvidenceRecorder {
     observed: Mutex<Vec<(String, u64)>>,
@@ -190,25 +211,11 @@ async fn recreate_nullable_log_table(pool: &SqlitePool) {
     .expect("create stable message ID index");
 }
 
-async fn corrupt_latest_queue_name(pool: &SqlitePool) {
-    sqlx::query("UPDATE bus_queue SET name = NULL WHERE seq = (SELECT max(seq) FROM bus_queue)")
-        .execute(pool)
-        .await
-        .expect("null out queue name");
-}
-
 async fn corrupt_latest_queue_kind(pool: &SqlitePool) {
     sqlx::query("UPDATE bus_queue SET kind = 'bogus' WHERE seq = (SELECT max(seq) FROM bus_queue)")
         .execute(pool)
         .await
         .expect("corrupt queue kind");
-}
-
-async fn corrupt_latest_log_name(pool: &SqlitePool) {
-    sqlx::query("UPDATE bus_log SET name = NULL WHERE seq = (SELECT max(seq) FROM bus_log)")
-        .execute(pool)
-        .await
-        .expect("null out log name");
 }
 
 async fn corrupt_latest_log_kind(pool: &SqlitePool) {
@@ -267,43 +274,6 @@ async fn bus_subscribe_uses_named_service_as_consumer_group() {
 }
 
 #[tokio::test]
-async fn retryable_command_failure_redelivers_then_completes() {
-    let (_db, pool, bus) = bus().await;
-    bus.send_message(command("c1")).await.expect("send command");
-
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let seen = attempts.clone();
-    let handlers = Arc::new(
-        Handlers::new().on_command(COMMAND_NAME, move |_: &Message| {
-            let seen = seen.clone();
-            async move {
-                let previous = seen.fetch_add(1, Ordering::SeqCst);
-                if previous == 0 {
-                    Err(TransportError::retryable("transient"))
-                } else {
-                    Ok(())
-                }
-            }
-        }),
-    );
-
-    bus.listen(handlers, RunOptions::idempotent())
-        .await
-        .expect("listener drains after retry");
-
-    assert_eq!(
-        attempts.load(Ordering::SeqCst),
-        2,
-        "message was retried once after nack"
-    );
-    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM bus_queue")
-        .fetch_one(&pool)
-        .await
-        .expect("count queue");
-    assert_eq!(remaining, 0, "retried command was acked and deleted");
-}
-
-#[tokio::test]
 async fn retryable_event_failure_does_not_advance_offset() {
     let (_db, pool, bus) = bus().await;
     bus.publish_message(event("e1"))
@@ -328,7 +298,7 @@ async fn retryable_event_failure_does_not_advance_offset() {
     ));
 
     SqliteBus::new(pool.clone())
-        .subscribe(handlers, RunOptions::idempotent())
+        .subscribe(handlers, RunOptions::until_idle())
         .await
         .expect("subscriber drains after retry");
 
@@ -417,7 +387,7 @@ async fn bus_listen_dead_letters_corrupt_queue_row_not_silently() {
     bus.send_message(command("poison"))
         .await
         .expect("send poison");
-    corrupt_latest_queue_name(&pool).await;
+    corrupt_latest_queue_kind(&pool).await;
     bus.send_message(command("poison-kind"))
         .await
         .expect("send poison kind");
@@ -427,7 +397,7 @@ async fn bus_listen_dead_letters_corrupt_queue_row_not_silently() {
     let rec = Arc::new(Mutex::new(Vec::new()));
     bus.listen(
         recording_for(COMMAND_NAME, MessageKind::Command, rec.clone()),
-        RunOptions::idempotent(),
+        RunOptions::until_idle(),
     )
     .await
     .expect("listen drains without surfacing corrupt row as fatal");
@@ -445,6 +415,17 @@ async fn bus_listen_dead_letters_corrupt_queue_row_not_silently() {
         remaining, 0,
         "corrupt row routed through policy, not redelivered forever"
     );
+    let dead_letters: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT payload FROM bus_log WHERE name = 'distributed.dead_letter' ORDER BY seq",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read dead letters");
+    assert_eq!(dead_letters.len(), 2, "every corrupt row was stored");
+    let dead: distributed::bus::DeadLetter =
+        serde_json::from_slice(&dead_letters[0]).expect("dead letter payload");
+    assert!(dead.reason.contains("corrupt row"), "{}", dead.reason);
+    assert_eq!(dead.attempts, 1);
 }
 
 #[tokio::test]
@@ -455,12 +436,12 @@ async fn bus_subscribe_dead_letters_corrupt_log_row_not_silently() {
     bus.publish_message(event("poison"))
         .await
         .expect("publish leading poison");
-    corrupt_latest_log_name(&pool).await;
+    corrupt_latest_log_kind(&pool).await;
     bus.publish_message(event("ok")).await.expect("publish ok");
     bus.publish_message(event("poison-tail"))
         .await
         .expect("publish trailing poison");
-    corrupt_latest_log_name(&pool).await;
+    corrupt_latest_log_kind(&pool).await;
     bus.publish_message(event("poison-kind"))
         .await
         .expect("publish corrupt kind");
@@ -479,7 +460,7 @@ async fn bus_subscribe_dead_letters_corrupt_log_row_not_silently() {
         .group("projections")
         .subscribe(
             recording_for(EVENT_NAME, MessageKind::Event, rec.clone()),
-            RunOptions::idempotent(),
+            RunOptions::until_idle(),
         )
         .await
         .expect("subscribe drains past corrupt entries");
@@ -494,14 +475,24 @@ async fn bus_subscribe_dead_letters_corrupt_log_row_not_silently() {
             .fetch_optional(&pool)
             .await
             .expect("read offset");
-    let max_seq: i64 = sqlx::query_scalar("SELECT max(seq) FROM bus_log")
-        .fetch_one(&pool)
-        .await
-        .expect("max seq");
+    let max_seq: i64 =
+        sqlx::query_scalar("SELECT max(seq) FROM bus_log WHERE name <> 'distributed.dead_letter'")
+            .fetch_one(&pool)
+            .await
+            .expect("max seq");
     assert_eq!(
         offset,
         Some(max_seq),
         "offset advanced past corrupt entries through the failure policy"
+    );
+    let dead_letters: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM bus_log WHERE name = 'distributed.dead_letter'")
+            .fetch_one(&pool)
+            .await
+            .expect("count dead letters");
+    assert_eq!(
+        dead_letters, 5,
+        "every corrupt entry was stored, not dropped"
     );
 }
 
@@ -611,104 +602,6 @@ async fn concurrent_stable_log_retries_share_one_original_cursor() {
 }
 
 #[tokio::test]
-async fn legacy_equivalent_stable_id_duplicates_retain_the_minimum_cursor() {
-    let (_db, pool, bus) = bus().await;
-    sqlx::query("DROP INDEX bus_log_message_id_unique_idx")
-        .execute(&pool)
-        .await
-        .expect("simulate legacy schema without uniqueness");
-    let first_metadata = serde_json::to_string(&vec![
-        (CAUSATION_ID, "legacy-command"),
-        (TRACEPARENT, "legacy-first"),
-    ])
-    .unwrap();
-    let retry_metadata = serde_json::to_string(&vec![
-        (CAUSATION_ID, "legacy-command"),
-        (TRACEPARENT, "legacy-retry"),
-    ])
-    .unwrap();
-    for metadata in [&first_metadata, &retry_metadata] {
-        sqlx::query(
-            "INSERT INTO bus_log \
-                 (name, message_id, kind, payload, content_type, metadata) \
-             VALUES (?, 'legacy-stable', 'event', ?, 'application/json', ?)",
-        )
-        .bind(EVENT_NAME)
-        .bind(PAYLOAD)
-        .bind(metadata)
-        .execute(&pool)
-        .await
-        .expect("seed equivalent legacy duplicate");
-    }
-
-    bus.ensure_tables()
-        .await
-        .expect("equivalent duplicates are migrated safely");
-    let retained: (i64, String, i64) = sqlx::query_as(
-        "SELECT MIN(seq), MIN(metadata), COUNT(*) \
-         FROM bus_log WHERE message_id = 'legacy-stable'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("read migrated legacy row");
-    assert_eq!(retained.0, 1, "the minimum legacy cursor is authoritative");
-    assert_eq!(retained.2, 1);
-    assert!(
-        retained.1.contains("legacy-first"),
-        "the first committed envelope is retained"
-    );
-    let unique_index: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master \
-         WHERE type = 'index' AND name = 'bus_log_message_id_unique_idx'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("inspect stable ID index");
-    assert_eq!(unique_index, 1);
-}
-
-#[tokio::test]
-async fn legacy_conflicting_stable_id_duplicates_fail_preflight_without_mutation() {
-    let (_db, pool, bus) = bus().await;
-    sqlx::query("DROP INDEX bus_log_message_id_unique_idx")
-        .execute(&pool)
-        .await
-        .expect("simulate legacy schema without uniqueness");
-    for payload in [br#"{}"#.as_slice(), br#"{"different":true}"#.as_slice()] {
-        sqlx::query(
-            "INSERT INTO bus_log \
-                 (name, message_id, kind, payload, content_type, metadata) \
-             VALUES (?, 'legacy-conflict', 'event', ?, 'application/json', '[]')",
-        )
-        .bind(EVENT_NAME)
-        .bind(payload)
-        .execute(&pool)
-        .await
-        .expect("seed conflicting legacy duplicate");
-    }
-
-    let error = bus
-        .ensure_tables()
-        .await
-        .expect_err("conflicting legacy duplicates fail closed");
-    assert!(error.is_permanent());
-    let rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM bus_log WHERE message_id = 'legacy-conflict'")
-            .fetch_one(&pool)
-            .await
-            .expect("count untouched conflicting rows");
-    let unique_index: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master \
-         WHERE type = 'index' AND name = 'bus_log_message_id_unique_idx'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("inspect absent stable ID index");
-    assert_eq!(rows, 2, "failed preflight rolls back deduplication");
-    assert_eq!(unique_index, 0, "no unsafe uniqueness fence was installed");
-}
-
-#[tokio::test]
 async fn nonempty_log_identity_adoption_must_be_explicit_and_retires_offsets() {
     let (_db, pool, bus) = bus().await;
     bus.publish_message(event("identity-loss"))
@@ -798,7 +691,7 @@ async fn configured_epoch_initializes_but_cannot_relabel_an_existing_log() {
         .await
         .expect("append under configured epoch");
     let recorder = Arc::new(OrderedEvidenceRecorder::default());
-    bus.subscribe(recorder.clone(), RunOptions::idempotent())
+    bus.subscribe(recorder.clone(), RunOptions::until_idle())
         .await
         .expect("deliver ordered row");
     assert_eq!(
@@ -961,7 +854,7 @@ async fn running_subscriber_stops_before_cached_rows_after_epoch_rotation() {
     let subscriber = SqliteBus::new(pool.clone()).group("rotation-observer");
     let running = tokio::spawn({
         let router = router.clone();
-        async move { subscriber.subscribe(router, RunOptions::idempotent()).await }
+        async move { subscriber.subscribe(router, RunOptions::until_idle()).await }
     });
     tokio::time::timeout(Duration::from_secs(2), router.first_started.notified())
         .await
@@ -1049,7 +942,7 @@ async fn expired_queue_claim_cannot_be_settled_by_stale_worker() {
     let first = tokio::spawn({
         let bus = bus.clone();
         let handlers = handlers.clone();
-        async move { bus.listen(handlers, RunOptions::idempotent()).await }
+        async move { bus.listen(handlers, RunOptions::until_idle()).await }
     });
     tokio::time::timeout(Duration::from_secs(2), first_claimed.notified())
         .await
@@ -1059,7 +952,7 @@ async fn expired_queue_claim_cannot_be_settled_by_stale_worker() {
     let second = tokio::spawn({
         let bus = bus.clone();
         let handlers = handlers.clone();
-        async move { bus.listen(handlers, RunOptions::idempotent()).await }
+        async move { bus.listen(handlers, RunOptions::until_idle()).await }
     });
     tokio::time::timeout(Duration::from_secs(2), second_claimed.notified())
         .await

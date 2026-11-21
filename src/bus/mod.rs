@@ -32,16 +32,10 @@
 //! - [`TransportError`] / [`TransportErrorKind`] — retryable vs permanent
 //!   classification the runner uses to decide between redelivery and the
 //!   failure policy.
-//! - [`FailurePolicy`] / [`FailureAction`] — what happens to a permanent
-//!   failure: dead-letter, park, log-and-ack, retry, or stop.
-//! - [`RunOptions`] / [`ConsumerDeliveryMode`] / [`InboxHook`] — idempotent
-//!   dispatch by default, with a placeholder hook for the future consumer
-//!   inbox.
-//! - [`TransportCapabilities`] — how each transport differs in receive
-//!   durability, publish confirmation, retry ownership, acknowledgement, and
-//!   Knative integration.
-//! - [`validate_stable_message_id`] — the rules an inbox-enabled run uses to
-//!   reject messages that lack a usable deduplication key.
+//! - [`RunOptions`] — when a consumer run ends, how it spaces retries, when
+//!   it gives up, and where a given-up message goes ([`DeadLetterSink`]).
+//! - [`validate_stable_message_id`] — the rules for an id usable as a
+//!   deduplication key.
 //!
 //! # Two confirmation thresholds
 //!
@@ -70,11 +64,11 @@
 //! - the handler's aggregate / read-model / outbox writes committed;
 //! - in inbox mode, the inbox receipt committed atomically with those effects.
 //!
-//! How that acknowledgement maps back to the transport is adapter-owned and
-//! described by [`ConsumerAckKind`]: a row completion, a delivery ack, an offset
-//! commit, a stream ack, or a 2xx HTTP response. The default never silently
-//! acknowledges a handler error — retryable failures redeliver and permanent
-//! failures go through the [`FailurePolicy`].
+//! How that acknowledgement maps back to the transport is adapter-owned: a
+//! row completion, a delivery ack, an offset commit, a stream ack, or a 2xx
+//! HTTP response. The default never silently acknowledges a handler error —
+//! retryable failures redeliver and permanent failures go through the
+//! [`FailurePolicy`].
 //!
 //! Producer-side immediate dispatch is *not* a transport acknowledgement: it is
 //! best-effort delivery after the local transaction commits. Consumer-side
@@ -82,8 +76,8 @@
 //! publish guarantee.
 
 mod bus;
-mod capabilities;
 mod celld_queue;
+mod dead_letter;
 mod error;
 mod failure_policy;
 mod handlers;
@@ -110,9 +104,12 @@ mod publisher;
 mod rabbitmq;
 #[cfg(feature = "rabbitmq")]
 mod rabbitmq_bus;
+#[cfg(feature = "redis")]
+mod redis_streams;
 mod router;
 mod run_options;
 mod runner;
+mod shutdown;
 mod source;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod sql_bus_common;
@@ -139,7 +136,6 @@ pub use rabbitmq::{RabbitPublisher, RabbitReceived, RabbitSource};
 pub use rabbitmq_bus::{RabbitBus, RabbitBusConnect};
 
 pub use bus::{Bus, BusConsumer};
-pub use capabilities::{ConsumerAckKind, KnativeIntegrationKind, TransportCapabilities};
 #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
 pub use celld_queue::CelldQueueHttpPublisher;
 #[cfg(feature = "workers-rs")]
@@ -148,6 +144,9 @@ pub use celld_queue::{
     celld_queue_relay_handler, CelldQueueEnvelope, CelldQueueRelay, CelldQueueRelayHandler,
     CELLD_QUEUE_ENVELOPE_VERSION, CELLD_QUEUE_MAX_BODY_BYTES, CELLD_QUEUE_RELAY_PATH,
 };
+pub use dead_letter::{
+    DeadLetter, DeadLetterSink, InMemoryDeadLetters, PublishDeadLetters, DEAD_LETTER_EVENT,
+};
 #[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
 pub(crate) use error::retryable;
 pub use error::{TransportError, TransportErrorKind};
@@ -155,16 +154,24 @@ pub use failure_policy::{FailureAction, FailurePolicy};
 pub use handlers::{Handlers, MessageHandler};
 pub use in_memory_bus::{InMemoryBus, InMemoryReceived};
 #[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
-pub(crate) use message::{message_from_wire, strip_address_prefix};
+pub(crate) use message::{message_from_wire, strip_address_prefix, CONTENT_TYPE_HEADER};
 pub use message::{Message, MessageKind, PayloadDecodeError, SubscriptionPlan};
 pub use message_name::{validate_message_name, MessageNameError, MAX_MESSAGE_NAME_LEN};
 pub use ordered_delivery::OrderedDelivery;
 #[cfg(feature = "postgres")]
 pub use postgres_bus::{LogReceived, PostgresBus, QueueReceived};
 pub use publisher::MessagePublisher;
-pub use router::MessageRouter;
-pub use run_options::{ConsumerDeliveryMode, InboxHook, NoInbox, RunOptions};
+#[cfg(feature = "redis")]
+pub use redis_streams::{
+    RedisStreamPublisher, DEFAULT_REDIS_DEDUPE_TTL, DEFAULT_REDIS_STREAM_PREFIX,
+};
+pub use router::{LaneSet, MessageRouter};
+pub use run_options::{
+    RetryBackoff, RunOptions, RunUntil, DEFAULT_LANE_WINDOW, DEFAULT_RETRY_BACKOFF_BASE,
+    DEFAULT_RETRY_BACKOFF_MAX,
+};
 pub use runner::run_source;
+pub use shutdown::Shutdown;
 pub use source::{MessageSource, ReceivedMessage};
 #[cfg(feature = "sqlite")]
 pub use sqlite_bus::{SqliteBus, SqliteLogReceived, SqliteQueueReceived};

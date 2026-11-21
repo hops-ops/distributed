@@ -1,0 +1,5 @@
+error: expected `ease`, `ease = MS`, `snap` or `replace` (with `ease`: `snap_above = M`) in #[correct(..)]
+ --> tests/compile_fail/replicated_unknown_correction.rs:6:15
+  |
+6 |     #[correct(wobble)]
+  |               ^^^^^^

@@ -1,5 +1,8 @@
 //! microsvc integration tests.
 
+#[path = "../support/commands.rs"]
+mod commands;
+
 mod basic;
 mod convention;
 mod handlers;

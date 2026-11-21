@@ -82,7 +82,7 @@ tokio = {{ version = "1", features = ["macros", "net", "rt-multi-thread"] }}
     }
 
     pub(super) fn lib_rs(&self) -> String {
-        let models = if !self.models.is_empty() || (self.query_api && !self.commands.is_empty()) {
+        let models = if !self.models.is_empty() || !self.commands.is_empty() {
             "pub mod models;\n"
         } else {
             ""
@@ -213,7 +213,7 @@ async fn main() -> Result<(), {error_type}> {{
             .map(|model| format!("        .read_model::<{}>()\n", model.view_ident))
             .collect::<String>();
         format!(
-r#"use distributed::{{
+            r#"use distributed::{{
     Application, ApplicationManifest, ReadModelCatalog, SurfaceSpec,
 }};
 
@@ -256,7 +256,11 @@ pub fn service_descriptor() -> distributed::microsvc::ServiceDescriptor {{
             "InMemoryRepository"
         };
         let mut manifest_imports = vec![
-            "microsvc::{Routes, Service}",
+            if self.commands.is_empty() && self.events.is_empty() {
+                "microsvc::Service"
+            } else {
+                "microsvc::{Routes, Service}"
+            },
             repo_import,
             "ServiceDescriptor",
         ];
@@ -266,20 +270,10 @@ pub fn service_descriptor() -> distributed::microsvc::ServiceDescriptor {{
         if self.tracing {
             manifest_imports.push("TracingDescriptor");
         }
-        if self.query_api && !self.commands.is_empty() {
+        if !self.commands.is_empty() {
             manifest_imports.push("AggregateRepository");
         }
         let manifest_imports = manifest_imports.join(", ");
-        let registrations = self
-            .commands
-            .iter()
-            .map(|handler| format!("        command handlers::{},\n", handler.module_ident))
-            .chain(
-                self.events
-                    .iter()
-                    .map(|handler| format!("        event handlers::{},\n", handler.module_ident)),
-            )
-            .collect::<String>();
         let event_registrations = self
             .events
             .iter()
@@ -415,8 +409,10 @@ pub fn build(repo: ServiceRepo) -> Arc<Service> {{
 }}
 
 fn build_service(repo: ServiceRepo) -> Service {{
+    // Under `distributed dev`, only the active generation may write.
     let service = Service::new()
-        .named({service_name});
+        .named({service_name})
+        .with_lifecycle(distributed::microsvc::LifecycleGate::from_env());
 {typed_route_attachments}{event_route_attachment}    service
 }}
 
@@ -458,10 +454,11 @@ pub fn in_memory() -> Arc<Service> {{
 }}
 
 pub fn build(repo: ServiceRepo) -> Arc<Service> {{
-    let routes = distributed::routes!(
-        Routes::new().with_dependencies(repo),
-{registrations}    );
-    Arc::new(Service::new().named({service_name}){http_command_opt_in}.routes(routes))
+    // Under `distributed dev`, only the active generation may write.
+    let service = Service::new()
+        .named({service_name})
+        .with_lifecycle(distributed::microsvc::LifecycleGate::from_env()){http_command_opt_in};
+{typed_route_attachments}{event_route_attachment}    Arc::new(service)
 }}
 
 pub fn descriptor() -> ServiceDescriptor {{
@@ -472,7 +469,7 @@ pub fn descriptor() -> ServiceDescriptor {{
             service_name = rust_string(&self.names.package_name),
             transport = rust_string(transport),
             http_command_opt_in = match self.transport {
-                ServiceTransport::Http => ".with_http_command_routes()",
+                ServiceTransport::Http => "\n        .with_http_command_routes()",
                 ServiceTransport::Knative => "",
             },
         )
@@ -492,9 +489,8 @@ pub fn descriptor() -> ServiceDescriptor {{
             .collect::<Vec<_>>()
             .join("");
 
-        let fallback_aggregate =
-            if self.query_api && self.models.is_empty() && !self.commands.is_empty() {
-                r#"
+        let fallback_aggregate = if self.models.is_empty() && !self.commands.is_empty() {
+            r#"
 use distributed::{sourced, Entity, Snapshot};
 
 #[derive(Default, Snapshot)]
@@ -514,34 +510,24 @@ impl CommandAggregate {
     }
 }
 "#
-            } else {
-                ""
-            };
+        } else {
+            ""
+        };
 
-        let command_types = if self.query_api {
-            r#"#[derive(Clone, Debug, Deserialize, distributed::GraphqlInput)]
+        let command_types = r#"#[derive(Clone, Debug, Deserialize, distributed::CommandInput)]
 pub struct CommandInput {
     pub id: String,
     pub name: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, distributed::GraphqlOutput)]
+#[derive(Clone, Debug, Serialize, distributed::CommandOutput)]
 pub struct CommandOutput {
     pub command: String,
     pub id: String,
     pub model: String,
     pub name: Option<String>,
 }
-"#
-        } else {
-            r#"#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CommandInput {
-    pub id: String,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-"#
-        };
+"#;
 
         format!(
             r#"{modules}
@@ -591,14 +577,22 @@ impl {model_struct} {{
     }
 
     pub(super) fn command_handler_rs(&self, handler: &MessageHandler) -> String {
-        if self.query_api {
-            let (model_type, model_name) = self
-                .command_model(handler)
-                .map(|model| (model.type_ident.as_str(), model.name.as_str()))
-                .unwrap_or(("CommandAggregate", "CommandAggregate"));
-            return format!(
-                r#"use distributed::graphql::{{typed_command, Succeeded, PreparedCommand, TypedCommand}};
-use distributed::microsvc::{{CausalCommandContext, HandlerError}};
+        let (model_type, model_name) = self
+            .command_model(handler)
+            .map(|model| (model.type_ident.as_str(), model.name.as_str()))
+            .unwrap_or(("CommandAggregate", "CommandAggregate"));
+        // A Knative trigger delivers the command as the transport identity,
+        // which runs only commands that declare its role.
+        let (microsvc_imports, roles) = match self.transport {
+            ServiceTransport::Http => ("CausalCommandContext, HandlerError", r#"["user"]"#),
+            ServiceTransport::Knative => (
+                "CausalCommandContext, HandlerError, TRANSPORT_ROLE",
+                r#"["user", TRANSPORT_ROLE]"#,
+            ),
+        };
+        format!(
+            r#"use distributed::command::{{typed_command, Succeeded, PreparedCommand, TypedCommand}};
+use distributed::microsvc::{{{microsvc_imports}}};
 
 use crate::models::{{CommandInput, CommandOutput, {model_type}}};
 
@@ -606,7 +600,7 @@ pub const COMMAND: &str = {message_name};
 pub const MODEL: &str = {model_name};
 
 pub fn command() -> TypedCommand<CommandInput, Succeeded<CommandOutput>> {{
-    typed_command::<CommandInput, Succeeded<CommandOutput>>(COMMAND).roles(["user"])
+    typed_command::<CommandInput, Succeeded<CommandOutput>>(COMMAND).roles({roles})
 }}
 
 pub async fn handle(
@@ -626,64 +620,9 @@ pub async fn handle(
     }})
 }}
 "#,
-                message_name = rust_string(&handler.message_name),
-                model_name = rust_string(model_name),
-            );
-        }
-
-        if let Some(model) = self.command_model(handler) {
-            format!(
-                r#"use distributed::{{
-    microsvc::{{Context, HandlerError}}, Aggregate, CommitBatch, StreamIdentity, StreamWrite,
-    TransactionalCommit,
-}};
-use serde_json::{{json, Value}};
-
-use crate::models::{{CommandInput, {model_type}}};
-use crate::service::ServiceRepo;
-
-pub const COMMAND: &str = {message_name};
-pub const MODEL: &str = {model_name};
-
-pub fn guard(ctx: &Context<ServiceRepo>) -> bool {{
-    ctx.has_fields(&["id"])
-}}
-
-pub async fn handle(ctx: &Context<'_, ServiceRepo>) -> Result<Value, HandlerError> {{
-    let input = ctx.input::<CommandInput>()?;
-    let mut aggregate = {model_type}::default();
-    aggregate.record_command(COMMAND.to_string(), input.id.clone(), input.name.clone())?;
-    let identity = StreamIdentity::new({model_type}::aggregate_type(), aggregate.entity().id())?;
-    let stream = StreamWrite::new(identity, aggregate.entity_mut());
-    ctx.repo().commit_batch(CommitBatch::new(vec![stream])).await?;
-    Ok(json!({{ "command": COMMAND, "id": input.id, "model": MODEL, "name": input.name }}))
-}}
-"#,
-                model_type = model.type_ident,
-                message_name = rust_string(&handler.message_name),
-                model_name = rust_string(&model.name),
-            )
-        } else {
-            format!(
-                r#"use distributed::microsvc::{{Context, HandlerError}};
-use serde_json::{{json, Value}};
-
-use crate::service::ServiceRepo;
-
-pub const COMMAND: &str = {message_name};
-
-pub fn guard(_ctx: &Context<ServiceRepo>) -> bool {{
-    true
-}}
-
-pub async fn handle(ctx: &Context<'_, ServiceRepo>) -> Result<Value, HandlerError> {{
-    let input = ctx.input::<Value>()?;
-    Ok(json!({{ "command": COMMAND, "input": input }}))
-}}
-"#,
-                message_name = rust_string(&handler.message_name),
-            )
-        }
+            message_name = rust_string(&handler.message_name),
+            model_name = rust_string(model_name),
+        )
     }
 
     pub(super) fn event_handler_rs(&self, handler: &MessageHandler) -> String {
@@ -766,7 +705,7 @@ use serde::{{Deserialize, Serialize}};
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "// Tighten grants by replacing grant_all with:\n//   distributed::graphql_models!(builder, {names})\n// after filling permissions() in each model module.\n"
+                "// Tighten grants by replacing grant_all with one\n//   .model::<module::Model>(module::permissions())\n// per model ({names}) after filling permissions() in each model module.\n"
             )
         };
         let protocol_key_parameter = if self.commands.is_empty() {
@@ -804,7 +743,7 @@ pub fn build_engine(
     // Public GraphQL identity (D6/D7): always OidcBearer + require_auth=true.
     // Set OIDC_ISSUER + OIDC_AUDIENCE (or OIDC_CLIENT_ID). Unset → placeholder
     // issuer (still OidcBearer; ambient headers never trusted). For local
-    // GraphiQL ambient headers only, pass IdentityMode::DevHeaders explicitly.
+    // GraphiQL ambient headers only, pass `IdentityConfig::DevHeaders` explicitly.
     let identity = distributed::graphql::public_oidc_identity_from_env();
     GraphqlEngine::from_schema_catalog(&crate::read_model_catalog(), source)?
         .service(service){protocol_key_builder}

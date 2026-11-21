@@ -32,7 +32,6 @@ pub struct OutboxSource<S> {
     store: Arc<S>,
     worker_id: String,
     lease: Duration,
-    max_attempts: u32,
     batch_size: usize,
     destination: Option<String>,
     buffer: VecDeque<OutboxMessage>,
@@ -44,12 +43,11 @@ where
 {
     /// Create a source. `worker_id` scopes claims; `max_attempts` is the
     /// retryable-failure ceiling before a row is failed.
-    pub fn new(store: Arc<S>, worker_id: impl Into<String>, max_attempts: u32) -> Self {
+    pub fn new(store: Arc<S>, worker_id: impl Into<String>) -> Self {
         Self {
             store,
             worker_id: worker_id.into(),
             lease: DEFAULT_OUTBOX_SOURCE_LEASE,
-            max_attempts,
             batch_size: DEFAULT_OUTBOX_SOURCE_BATCH,
             destination: None,
             buffer: VecDeque::new(),
@@ -122,7 +120,6 @@ where
                     store: self.store.clone(),
                     message: Message::from(row),
                     claim,
-                    max_attempts: self.max_attempts,
                 }))
             }
             None => Ok(None),
@@ -135,7 +132,6 @@ pub struct ReceivedOutboxMessage<S> {
     store: Arc<S>,
     message: Message,
     claim: OutboxClaimRef,
-    max_attempts: u32,
 }
 
 impl<S> ReceivedMessage for ReceivedOutboxMessage<S>
@@ -147,29 +143,21 @@ where
     }
 
     /// Complete the row (transport delivery succeeded).
+    fn attempts(&self) -> u32 {
+        self.claim.attempt
+    }
+
     async fn ack(self) -> Result<(), TransportError> {
         self.store.complete(&self.claim).await?;
         Ok(())
     }
 
     /// Release for retry, or fail once the attempt ceiling is reached.
-    async fn nack(self, reason: &str) -> Result<(), TransportError> {
+    /// Releases the row; it is claimable again after `delay`.
+    async fn nack(self, delay: Duration) -> Result<(), TransportError> {
         self.store
-            .record_failure(&self.claim, reason, self.max_attempts)
+            .release(&self.claim, "redelivery requested by the consumer", delay)
             .await?;
-        Ok(())
-    }
-
-    /// Fail the row terminally (the outbox `Failed` status is the DLQ/archive).
-    async fn dead_letter(self, reason: &str) -> Result<(), TransportError> {
-        self.store.fail(&self.claim, reason).await?;
-        Ok(())
-    }
-
-    /// Park terminally for manual inspection (same `Failed` status as dead-letter
-    /// in the outbox's state model).
-    async fn park(self, reason: &str) -> Result<(), TransportError> {
-        self.store.fail(&self.claim, reason).await?;
         Ok(())
     }
 }
@@ -211,7 +199,7 @@ mod tests {
     }
 
     fn source(repo: &InMemoryRepository) -> OutboxSource<crate::InMemoryOutboxStore> {
-        OutboxSource::new(Arc::new(repo.outbox_store()), "pg-transport", 3)
+        OutboxSource::new(Arc::new(repo.outbox_store()), "pg-transport")
     }
 
     #[test]
@@ -256,7 +244,7 @@ mod tests {
         let mut src = source(&repo);
         let received = block_on(src.recv()).unwrap().unwrap();
         block_on(received.ack()).unwrap();
-        assert_eq!(status(&repo, "m1"), Some(OutboxMessageStatus::Published));
+        assert_eq!(status(&repo, "m1"), None);
     }
 
     #[test]
@@ -265,18 +253,9 @@ mod tests {
         store_row(&repo, "m1", "evt");
         let mut src = source(&repo);
         let received = block_on(src.recv()).unwrap().unwrap();
-        block_on(received.nack("transient")).unwrap();
+        assert_eq!(received.attempts(), 1);
+        block_on(received.nack(Duration::ZERO)).unwrap();
         assert_eq!(status(&repo, "m1"), Some(OutboxMessageStatus::Pending));
-    }
-
-    #[test]
-    fn dead_letter_fails_the_row() {
-        let repo = InMemoryRepository::new();
-        store_row(&repo, "m1", "evt");
-        let mut src = source(&repo);
-        let received = block_on(src.recv()).unwrap().unwrap();
-        block_on(received.dead_letter("poison")).unwrap();
-        assert_eq!(status(&repo, "m1"), Some(OutboxMessageStatus::Failed));
     }
 
     #[test]
@@ -303,13 +282,13 @@ mod tests {
             ),
         );
 
-        block_on(run_source(service, source(&repo), RunOptions::idempotent())).unwrap();
+        block_on(run_source(service, source(&repo), RunOptions::until_idle())).unwrap();
 
         let mut ids = handled.lock().unwrap().clone();
         ids.sort();
         assert_eq!(ids, vec!["m1".to_string(), "m2".to_string()]);
-        assert_eq!(status(&repo, "m1"), Some(OutboxMessageStatus::Published));
-        assert_eq!(status(&repo, "m2"), Some(OutboxMessageStatus::Published));
+        assert_eq!(status(&repo, "m1"), None);
+        assert_eq!(status(&repo, "m2"), None);
     }
 
     #[test]
@@ -326,7 +305,7 @@ mod tests {
                     .handle(|_: &crate::microsvc::Context<()>| async move { Ok(json!({})) }),
             ),
         );
-        block_on(run_source(service, source(&repo), RunOptions::idempotent())).unwrap();
-        assert_eq!(status(&repo, "m1"), Some(OutboxMessageStatus::Published));
+        block_on(run_source(service, source(&repo), RunOptions::until_idle())).unwrap();
+        assert_eq!(status(&repo, "m1"), None);
     }
 }

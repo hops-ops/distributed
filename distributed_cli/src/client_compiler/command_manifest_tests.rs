@@ -3,11 +3,10 @@ use std::collections::BTreeMap;
 use super::command_manifest::validate_command_manifest;
 use super::manifest::{
     hash_bytes, ManifestCommand, ManifestCommandConsistency, ManifestCommandExtensions,
-    ManifestCommandShape, ManifestConfirmationKind, ManifestConfirmations, ManifestConsistencyKind,
-    ManifestEffects, ManifestField, ManifestFilterField, ManifestFilterInput, ManifestInputDefault,
-    ManifestInputDefaultGenerator, ManifestInputDefaults, ManifestKeyField, ManifestModel,
-    ManifestNormalization, ManifestProjector, ManifestProtocolOperation,
-    ManifestProtocolOperations, ManifestRevalidationFallback, ManifestRowPolicy,
+    ManifestCommandShape, ManifestConsistencyKind, ManifestField, ManifestFilterField,
+    ManifestFilterInput, ManifestInputDefault, ManifestInputDefaultGenerator,
+    ManifestInputDefaults, ManifestKeyField, ManifestModel, ManifestNormalization,
+    ManifestProjector, ManifestProtocolOperation, ManifestProtocolOperations, ManifestRowPolicy,
     ManifestTrustedPresetDescriptor, ManifestTypeDef, ManifestTypeField,
 };
 
@@ -158,8 +157,6 @@ fn command() -> ManifestCommand {
                     generator: ManifestInputDefaultGenerator::UuidV7,
                 }],
             }),
-            effects: None,
-            confirmations: None,
             projection: None,
             trusted_presets: Vec::new(),
         },
@@ -173,7 +170,6 @@ fn projector() -> ManifestProjector {
         facts: vec!["TodoCreated".into()],
         models: vec!["Todo".into()],
         dependencies: vec!["todos".into()],
-        causal_confirmation: true,
     }
 }
 
@@ -258,30 +254,11 @@ fn unreferenced_trusted_preset_descriptors_fail_closed() {
 }
 
 #[test]
-fn legacy_command_authority_has_no_v2_decoder() {
+fn command_extensions_v1_has_no_decoder() {
     let mut old_version = command();
     old_version.extensions.version = 1;
     let error = validate(&old_version).expect_err("extensions v1 must fail closed");
     assert_eq!(error.code, "client.manifest.command_extensions");
-
-    let mut effects = command();
-    effects.extensions.effects = Some(ManifestEffects {
-        version: 1,
-        operations: Vec::new(),
-        fallback: ManifestRevalidationFallback::Revalidate,
-    });
-    let error = validate(&effects).expect_err("legacy effects must fail closed");
-    assert_eq!(error.code, "client.manifest.legacy_command_authority");
-
-    let mut confirmations = command();
-    confirmations.extensions.confirmations = Some(ManifestConfirmations {
-        version: 1,
-        kind: ManifestConfirmationKind::Unavailable,
-        expected: Vec::new(),
-        fallback: ManifestRevalidationFallback::Revalidate,
-    });
-    let error = validate(&confirmations).expect_err("legacy confirmations must fail closed");
-    assert_eq!(error.code, "client.manifest.legacy_command_authority");
 }
 
 #[test]

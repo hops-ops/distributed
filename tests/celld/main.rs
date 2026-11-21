@@ -76,14 +76,19 @@ fn worker_declares_sqlite_todo_and_chat_cells() {
     assert!(!source.contains("outbox.release"));
     assert!(!source.contains("CREATE TABLE IF NOT EXISTS cell_outbox"));
     assert!(!source.contains("CREATE TABLE IF NOT EXISTS cell_commands"));
-    assert!(source.contains("CREATE TABLE IF NOT EXISTS cell_state"));
-    assert!(source.contains("durable_state"));
-    assert!(source.contains("restore_durable_state"));
-    assert!(source.contains("ON CONFLICT(id) DO UPDATE SET body = excluded.body"));
+    assert!(!source.contains("CREATE TABLE IF NOT EXISTS cell_state"));
+    assert!(!source.contains("durable_state"));
+    assert!(!source.contains("restore_durable_state"));
+    assert!(!source.contains("ON CONFLICT(id) DO UPDATE SET body = excluded.body"));
     assert!(source.contains("dispatch_idempotent"));
     assert!(source.contains("CelldOutbox::from_env(&env, \"OUTBOX\")"));
     assert!(source.contains("with_celld_outbox(outbox)"));
-    assert!(source.contains("persist_and_drain_outbox"));
+    assert!(source.contains(".drain_outbox(env)"));
+    assert!(
+        source.contains("cell\n        .alarm(env)"),
+        "the Durable Object alarm handler fires cell alarms and drains through AggregateCell::alarm"
+    );
+    assert!(!source.contains("persist_and_drain_outbox"));
     assert!(!source.contains("CelldQueuePublisher::from_env"));
     assert!(!source.contains("drain_outbox_to_queue"));
     assert!(!source.contains("arm_drain_alarm"));
@@ -91,15 +96,44 @@ fn worker_declares_sqlite_todo_and_chat_cells() {
         !source.contains("outcome.released") && !source.contains("outcome.failed"),
         "retryable Queue outcomes must stay alarm-owned, not fail a committed command"
     );
-    assert!(source.contains("cell_projection_event_evidence"));
+    assert!(source.contains("dispatch.projection_events()"));
     assert!(source.contains("\"events\": events"));
     assert!(!source.contains("CellOutboxWireItem"));
     assert!(!source.contains("restore_durable_commands"));
-    assert!(source.contains("sealed_row"));
-    assert!(source.contains("new_with_snapshots"));
+    assert!(!source.contains("sealed_row"));
+    assert!(source.contains("from_state_with_snapshots"));
     assert!(!source.contains("restore_durable_events"));
     assert!(!source.contains("restore_durable_snapshots"));
-    assert!(source.contains("restore_cell_state"));
+    assert!(!source.contains("restore_cell_state"));
+}
+
+#[test]
+fn alarm_worker_arms_cell_alarms_and_shares_the_durable_object_alarm() {
+    let dir = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/celld/alarm-worker"
+    ));
+    let wrangler = std::fs::read_to_string(dir.join("wrangler.jsonc")).expect("wrangler.jsonc");
+    let spec: Value = serde_json::from_str(&wrangler).expect("wrangler json");
+    assert_eq!(
+        spec["durable_objects"]["bindings"][0]["class_name"],
+        "TickerCell"
+    );
+    assert_eq!(spec["migrations"][0]["new_sqlite_classes"][0], "TickerCell");
+    assert_eq!(spec["queues"]["producers"][0]["binding"], "OUTBOX");
+    let source = std::fs::read_to_string(dir.join("src/lib.rs")).expect("lib.rs");
+    assert!(source.contains("ctx.schedule("));
+    assert!(source.contains("schedule_guard::<Ticker>"));
+    assert!(source.contains(".requires(Capability::Scheduling)"));
+    assert!(source.contains(".alarm(&self.env)"));
+    assert!(source.contains("with_celld_outbox(outbox)"));
+    let harness = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/celld/alarms.mjs"
+    ))
+    .expect("alarms.mjs");
+    assert!(harness.contains("fires once across restart"));
+    assert!(harness.contains("watchdog not starved by a far domain alarm"));
 }
 
 #[test]
@@ -150,7 +184,8 @@ fn local_entrypoint_delegates_to_the_single_persistent_profile() {
 
 #[tokio::test]
 async fn live_cell_private_routes_reject_missing_forged_and_malformed_authority() {
-    let Some(base) = env_support::broker_env("CELLD_URL", "celld live security boundary") else {
+    let Some(base) = env_support::require_service("CELLD_URL", "celld live security boundary")
+    else {
         return;
     };
     let base = base.trim_end_matches('/').to_string();
@@ -214,7 +249,7 @@ async fn live_cell_private_routes_reject_missing_forged_and_malformed_authority(
 
 #[tokio::test]
 async fn live_todo_cell_create_complete_reopen_archive_and_isolate() {
-    let Some(base) = env_support::broker_env("CELLD_URL", "celld live Todo cell") else {
+    let Some(base) = env_support::require_service("CELLD_URL", "celld live Todo cell") else {
         return;
     };
     let base = base.trim_end_matches('/').to_string();
@@ -376,7 +411,7 @@ async fn live_todo_cell_create_complete_reopen_archive_and_isolate() {
 
 #[tokio::test]
 async fn live_independent_todo_cells_accept_bursts_while_queue_drain_is_busy() {
-    let Some(base) = env_support::broker_env("CELLD_URL", "celld live Todo burst") else {
+    let Some(base) = env_support::require_service("CELLD_URL", "celld live Todo burst") else {
         return;
     };
     let base = base.trim_end_matches('/').to_string();
@@ -475,7 +510,7 @@ async fn live_independent_todo_cells_accept_bursts_while_queue_drain_is_busy() {
 
 #[tokio::test]
 async fn live_chat_cell_post_and_isolate() {
-    let Some(base) = env_support::broker_env("CELLD_URL", "celld live Chat cell") else {
+    let Some(base) = env_support::require_service("CELLD_URL", "celld live Chat cell") else {
         return;
     };
     let base = base.trim_end_matches('/').to_string();

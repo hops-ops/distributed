@@ -1,58 +1,29 @@
 //! In-memory reference run of the async-transport conformance harness.
 //!
-//! Proves the shared transport contract (source runner + outbox dispatcher)
-//! against adapter-neutral fakes, with no external broker. Concrete adapters
-//! reuse the harness in [`transport_conformance`] for their own targets.
+//! Runs the bus contract against `InMemoryBus` and the outbox dispatcher
+//! contract against adapter-neutral fakes, with no external broker.
 
 #[path = "../transport_conformance/mod.rs"]
 mod conformance;
 
-// --- source runner contract -------------------------------------------------
+use distributed::bus::InMemoryBus;
 
-#[tokio::test]
-async fn source_dispatches_before_ack() {
-    conformance::source_dispatches_before_ack().await;
+/// Every bus is a clone of one in-memory bus; it has no consumer groups.
+struct InMemory(InMemoryBus);
+
+impl conformance::bus::BusHarness for InMemory {
+    type Bus = InMemoryBus;
+
+    async fn start() -> Option<Self> {
+        Some(Self(InMemoryBus::new()))
+    }
+
+    async fn bus(&self, _group: &str) -> InMemoryBus {
+        self.0.clone()
+    }
 }
 
-#[tokio::test]
-async fn source_retryable_failure_nacks_without_ack() {
-    conformance::source_retryable_failure_nacks_without_ack().await;
-}
-
-#[tokio::test]
-async fn source_permanent_failure_dead_letters_by_default() {
-    conformance::source_permanent_failure_dead_letters_by_default().await;
-}
-
-#[tokio::test]
-async fn source_permanent_failure_stops_under_stop_policy() {
-    conformance::source_permanent_failure_stops_under_stop_policy().await;
-}
-
-#[tokio::test]
-async fn source_unhandled_message_is_acked_and_ignored() {
-    conformance::source_unhandled_message_is_acked_and_ignored().await;
-}
-
-#[tokio::test]
-async fn source_inbox_mode_rejects_missing_stable_id() {
-    conformance::source_inbox_mode_rejects_missing_stable_id().await;
-}
-
-#[tokio::test]
-async fn source_inbox_mode_dispatches_with_stable_id() {
-    conformance::source_inbox_mode_dispatches_with_stable_id().await;
-}
-
-#[tokio::test]
-async fn source_propagates_recv_errors() {
-    conformance::source_propagates_recv_errors().await;
-}
-
-#[tokio::test]
-async fn source_propagates_settle_errors() {
-    conformance::source_propagates_settle_errors().await;
-}
+conformance::bus::bus_conformance_tests!(InMemory);
 
 // --- publisher / outbox dispatcher contract ---------------------------------
 

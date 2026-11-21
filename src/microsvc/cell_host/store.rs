@@ -1,40 +1,44 @@
-//! Per-shard stream store: in-process stand-in for one cell's private SQLite.
-//!
-//! Production celld wraps rusqlite (or workers-rs storage) the same way: sync
-//! calls inside async fns. This is **not** `feature = "sqlite"` (sqlx pool) and
-//! **not** a `celld` dialect.
+//! One cell's private command-side repository, with enforced stream ownership.
+//! Workers (celld) use runtime-owned SQLite. Native builds have only the
+//! in-process reference host, for unit tests; durable cells run on celld.
+//! Ownership checks below apply to both.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+use std::sync::Mutex;
 
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 use serde_json::Value;
 
+#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+use super::sql_store::CellSqlRepository;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
-    CausalStorageIdentity, CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey,
-    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation, ReservationOutcome,
+    CausalStorageIdentity, CausalTransactionalCommit, CommandCompletion, CommandLedgerError,
+    CommandLedgerKey, CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
+    ExternalCommandCompletion, ReservationOutcome,
 };
-use crate::entity::{Entity, EventRecord};
+use crate::entity::Entity;
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+use crate::entity::EventRecord;
 use crate::microsvc::HasOutboxStore;
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 use crate::outbox::OutboxMessage;
-use crate::projection_protocol::{
-    ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch,
-    ProjectionCommitResult, ProjectionFailure, ProjectionFailureBatch, ProjectionFailureLocation,
-    ProjectionGeneration, ProjectionInputCursor, ProjectionInputDisposition,
-    ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest, ProjectionModelOwnership,
-    ProjectionObligationEvidenceBatch, ProjectionObligationEvidenceBatchRequest,
-    ProjectionObservation, ProjectionObservationKind, ProjectionPartition,
-    ProjectionPartitionRuntimeState, ProjectionProtocolError, ProjectionProtocolStore,
-    ProjectionQuerySnapshot, ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
-    ProjectionQuerySnapshotRequest, ProjectionRecordMetadata, ProjectionRecordScope,
-    ProjectorTopologyId, TrustedProjectionInput,
-};
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+use crate::repository::{validate_commit_batch, PreparedEventAppend};
 use crate::repository::{
     CommitBatch, GetStream, RepositoryError, SnapshotStore, SnapshotWrite, StreamIdentity,
     TransactionalCommit,
 };
 use crate::snapshot::SnapshotRecord;
-use crate::{InMemoryOutboxStore, InMemoryRepository};
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+use crate::InMemoryRepository;
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+type CellRepository = InMemoryRepository;
+#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+type CellRepository = CellSqlRepository;
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -49,31 +53,17 @@ enum CellOwnership {
     },
 }
 
-/// Private SQLite stand-in for one cell instance (`{aggregate_type}:{shard}`).
-///
-/// Exclusive cells reject any stream that is not this cell's shard. Parent
-/// cells (`for_parent_shard`) hold sibling streams of one game and commit
-/// them in one [`CommitBatch`].
-///
-/// ```compile_fail
-/// fn two_cell_transaction_does_not_exist(
-///     left: &distributed::cell_host::CellStreamStore,
-///     right: &distributed::cell_host::CellStreamStore,
-///     batch: distributed::CommitBatch<'_>,
-/// ) {
-///     let _ = left.commit_across(right, batch);
-/// }
-/// ```
-
-/// One stream's event records for Durable Object SQLite persistence.
+/// One stream's event records in a native restart-test export.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 pub struct DurableCellEvents {
     pub stream: String,
     pub events: Vec<EventRecord>,
 }
 
-/// Snapshot cache record for Durable Object SQLite persistence.
+/// Snapshot cache record in a native restart-test export.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 pub struct DurableCellSnapshot {
     pub stream: String,
     pub aggregate_type: String,
@@ -85,24 +75,34 @@ pub struct DurableCellSnapshot {
     pub payload: Vec<u8>,
 }
 
-/// One versioned command-ledger row for Durable Object SQLite persistence.
+/// One versioned command-ledger row in a native restart-test export.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 pub struct DurableCellCommand {
     pub id: String,
     pub body: String,
 }
 
-/// Current persisted aggregate-cell state envelope version.
+/// Sealed read-model row reducer run in the same transaction as a command's
+/// events (native hosts). Receives the current row and the event appends of
+/// the commit; `Ok(Some(row))` replaces the row, `Ok(None)` keeps it, and an
+/// error rolls the whole command back.
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+pub type SealedRowReducer = Arc<
+    dyn Fn(Option<&Value>, &[PreparedEventAppend<'_>]) -> Result<Option<Value>, RepositoryError>
+        + Send
+        + Sync,
+>;
+
+/// Current native restart-test export version.
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 pub const DURABLE_AGGREGATE_CELL_STATE_VERSION: u16 = 1;
 
-/// Complete durable working copy for one aggregate cell.
-///
-/// Hosts should serialize this value and persist it with one storage write.
-/// That makes the event log, snapshot cache, command ledger, outbox, and sealed
-/// row one commit even when a Worker SDK does not expose celld's
-/// `transactionSync` API.
+/// Export of the native in-process reference host for restart conformance tests.
+/// This is not a production cell persistence API; Workers use SQLite rows.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
 pub struct DurableAggregateCellState {
     pub version: u16,
     pub events: Vec<DurableCellEvents>,
@@ -110,30 +110,59 @@ pub struct DurableAggregateCellState {
     pub commands: Vec<DurableCellCommand>,
     pub outbox: Vec<OutboxMessage>,
     pub sealed_row: Option<Value>,
+    /// Alarm rows, including disarmed ones so generations never repeat.
+    #[serde(default)]
+    pub alarms: Vec<super::alarm::DurableSchedule>,
 }
 
+/// Private command-side repository for one cell instance (`{aggregate_type}:{shard}`).
+///
+/// Exclusive cells reject any stream that is not this cell's shard. Parent
+/// cells hold sibling streams and commit them in one [`CommitBatch`].
+///
+/// ```compile_fail
+/// fn two_cell_transaction_does_not_exist(
+///     left: &distributed::cell_host::CellStreamStore,
+///     right: &distributed::cell_host::CellStreamStore,
+///     batch: distributed::CommitBatch<'_>,
+/// ) {
+///     let _ = left.commit_across(right, batch);
+/// }
+/// ```
 #[derive(Clone)]
 pub struct CellStreamStore {
     ownership: CellOwnership,
-    inner: InMemoryRepository,
+    inner: CellRepository,
+    /// Resolves relative alarm due times at commit and drives alarm firing.
+    clock: Arc<dyn crate::Clock>,
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     sealed_row: Arc<Mutex<Option<Value>>>,
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    sealed_row_reducer: Option<SealedRowReducer>,
+    /// Reference-host alarm table (SQL cells keep alarms in their database).
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    alarms: Arc<Mutex<super::alarm::MemorySchedules>>,
 }
 
 impl CellStreamStore {
-    /// Bind a store to one exact stream identity.
-    pub fn for_identity(identity: StreamIdentity) -> Self {
-        Self {
+    /// Open this runtime-owned SQLite database; no storage export callback exists.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    pub fn from_state(
+        state: worker::State,
+        identity: StreamIdentity,
+    ) -> Result<Self, RepositoryError> {
+        Ok(Self {
             ownership: CellOwnership::Exclusive(identity),
-            inner: InMemoryRepository::new(),
-            sealed_row: Arc::new(Mutex::new(None)),
-        }
+            inner: CellSqlRepository::from_state(state)?,
+            clock: Arc::new(crate::SystemClock),
+        })
     }
 
-    /// Parent-shard cell: `"{parent_type}:{parent_id}"` (bomberman `game:{id}`).
-    ///
-    /// Child streams of any aggregate type live in this cell's SQLite. A
-    /// transaction across two parent cells does not exist.
-    pub fn for_parent_shard(
+    /// Open a parent-shard SQL cell. All owned sibling streams share this one
+    /// database; the predicate never grants access to another cell's storage.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    pub fn from_parent_state(
+        state: worker::State,
         parent_type: impl Into<String>,
         parent_id: impl Into<String>,
         owns: impl Fn(&StreamIdentity) -> bool + Send + Sync + 'static,
@@ -143,12 +172,93 @@ impl CellStreamStore {
                 name: StreamIdentity::new(parent_type, parent_id)?,
                 owns: Arc::new(owns),
             },
-            inner: InMemoryRepository::new(),
-            sealed_row: Arc::new(Mutex::new(None)),
+            inner: CellSqlRepository::from_state(state)?,
+            clock: Arc::new(crate::SystemClock),
         })
     }
 
+    /// Bind a store to one exact stream identity.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub fn for_identity(identity: StreamIdentity) -> Self {
+        Self::native(CellOwnership::Exclusive(identity), memory_repository())
+    }
+
+    /// Parent-shard cell: `"{parent_type}:{parent_id}"` (bomberman `game:{id}`).
+    ///
+    /// Child streams of any aggregate type live in this cell's SQLite. A
+    /// transaction across two parent cells does not exist.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub fn for_parent_shard(
+        parent_type: impl Into<String>,
+        parent_id: impl Into<String>,
+        owns: impl Fn(&StreamIdentity) -> bool + Send + Sync + 'static,
+    ) -> Result<Self, RepositoryError> {
+        Ok(Self::native(
+            CellOwnership::Parent {
+                name: StreamIdentity::new(parent_type, parent_id)?,
+                owns: Arc::new(owns),
+            },
+            memory_repository(),
+        ))
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn native(ownership: CellOwnership, inner: CellRepository) -> Self {
+        Self {
+            ownership,
+            inner,
+            clock: Arc::new(crate::SystemClock),
+            sealed_row: Arc::new(Mutex::new(None)),
+            sealed_row_reducer: None,
+            alarms: Arc::new(Mutex::new(Default::default())),
+        }
+    }
+
+    /// Maintain the sealed read-model row from each commit's events, inside
+    /// the command's transaction (SQLite cells) or alongside its in-memory
+    /// commit (reference host). A reducer error rejects the command.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    pub fn with_sealed_row_reducer(
+        mut self,
+        reducer: impl Fn(Option<&Value>, &[PreparedEventAppend<'_>]) -> Result<Option<Value>, RepositoryError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        let reducer: SealedRowReducer = Arc::new(reducer);
+        self.sealed_row_reducer = Some(reducer);
+        self
+    }
+
+    /// The in-process reference repository backing whole-state export.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn memory(&self) -> Result<&InMemoryRepository, RepositoryError> {
+        Ok(&self.inner)
+    }
+
+    /// Reference-host sealed-row reduction. SQLite cells reduce inside their
+    /// commit transaction instead, so this returns `None` for them.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn reduce_memory_sealed_row(
+        &self,
+        batch: &CommitBatch<'_>,
+    ) -> Result<Option<Value>, RepositoryError> {
+        let Some(reducer) = &self.sealed_row_reducer else {
+            return Ok(None);
+        };
+        if self.memory().is_err() {
+            return Ok(None);
+        }
+        let prepared = validate_commit_batch(batch)?;
+        if prepared.iter().all(|append| append.events.is_empty()) {
+            return Ok(None);
+        }
+        let current = self.sealed_row()?;
+        reducer(current.as_ref(), &prepared)
+    }
+
     /// Named exclusive-cell constructor used by [`super::AggregateCell`].
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn new(
         aggregate_type: impl Into<String>,
         shard_id: impl Into<String>,
@@ -157,6 +267,22 @@ impl CellStreamStore {
             aggregate_type,
             shard_id,
         )?))
+    }
+
+    /// Replace the cell clock (default: the system clock). The reference host
+    /// takes a [`ManualClock`](crate::ManualClock) so alarm tests are
+    /// deterministic; it resolves [`Schedule::after`](super::Schedule::after)
+    /// at commit and is what [`AggregateCell::fire_due_schedules`] reads.
+    ///
+    /// [`AggregateCell::fire_due_schedules`]: super::AggregateCell::fire_due_schedules
+    pub fn with_clock(mut self, clock: impl crate::Clock + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    /// The cell clock's current time.
+    pub fn now(&self) -> std::time::SystemTime {
+        self.clock.now()
     }
 
     /// Cell instance name (`type:id`).
@@ -190,6 +316,7 @@ impl CellStreamStore {
     }
 
     /// Sealed read-model row for GET on this cell instance.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn sealed_row(&self) -> Result<Option<Value>, RepositoryError> {
         self.sealed_row
             .lock()
@@ -198,6 +325,7 @@ impl CellStreamStore {
     }
 
     /// Replace the sealed read-model row (Atomic board / Todo view).
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn replace_sealed_row(&self, row: Value) -> Result<(), RepositoryError> {
         let mut guard = self
             .sealed_row
@@ -208,9 +336,10 @@ impl CellStreamStore {
     }
 
     /// Event log for Durable Object SQLite. Memory remains the working copy.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_events(&self) -> Result<Vec<DurableCellEvents>, RepositoryError> {
         Ok(self
-            .inner
+            .memory()?
             .clone_events()?
             .into_iter()
             .map(|(stream, events)| DurableCellEvents { stream, events })
@@ -218,24 +347,27 @@ impl CellStreamStore {
     }
 
     /// Outbox rows committed with this cell's events (same private SQLite).
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_outbox(&self) -> Result<Vec<OutboxMessage>, RepositoryError> {
-        self.inner.clone_outbox()
+        self.memory()?.clone_outbox()
     }
 
     /// Restore outbox rows from Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_outbox(
         &self,
         messages: Vec<OutboxMessage>,
     ) -> Result<(), RepositoryError> {
-        self.inner.replace_outbox(messages)
+        self.memory()?.replace_outbox(messages)
     }
 
     /// Replace the working event log from Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_events(
         &self,
         events: Vec<DurableCellEvents>,
     ) -> Result<(), RepositoryError> {
-        self.inner.replace_events(
+        self.memory()?.replace_events(
             events
                 .into_iter()
                 .map(|row| (row.stream, row.events))
@@ -244,9 +376,10 @@ impl CellStreamStore {
     }
 
     /// Snapshot cache for Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_snapshots(&self) -> Result<Vec<DurableCellSnapshot>, RepositoryError> {
         Ok(self
-            .inner
+            .memory()?
             .clone_snapshots()?
             .into_iter()
             .map(|(stream, record)| DurableCellSnapshot {
@@ -263,11 +396,12 @@ impl CellStreamStore {
     }
 
     /// Replace the working snapshot cache from Durable Object SQLite.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_snapshots(
         &self,
         snapshots: Vec<DurableCellSnapshot>,
     ) -> Result<(), RepositoryError> {
-        self.inner.replace_snapshots(
+        self.memory()?.replace_snapshots(
             snapshots
                 .into_iter()
                 .map(|row| {
@@ -291,8 +425,9 @@ impl CellStreamStore {
     }
 
     /// Fenced command rows committed with this cell's domain effects.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_commands(&self) -> Result<Vec<DurableCellCommand>, RepositoryError> {
-        self.inner
+        self.memory()?
             .clone_command_ledger()?
             .into_iter()
             .map(|record| {
@@ -306,6 +441,7 @@ impl CellStreamStore {
     }
 
     /// Restore the complete command ledger before accepting another request.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_commands(
         &self,
         commands: Vec<DurableCellCommand>,
@@ -322,10 +458,11 @@ impl CellStreamStore {
             }
             records.push(record);
         }
-        self.inner.replace_command_ledger(records)
+        self.memory()?.replace_command_ledger(records)
     }
 
     /// Export every durable concern as one versioned persistence envelope.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn durable_state(&self) -> Result<DurableAggregateCellState, RepositoryError> {
         Ok(DurableAggregateCellState {
             version: DURABLE_AGGREGATE_CELL_STATE_VERSION,
@@ -334,10 +471,12 @@ impl CellStreamStore {
             commands: self.durable_commands()?,
             outbox: self.durable_outbox()?,
             sealed_row: self.sealed_row()?,
+            alarms: self.lock_alarms()?.export(),
         })
     }
 
     /// Replace the complete working copy from one persisted envelope.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
     pub fn restore_durable_state(
         &self,
         state: DurableAggregateCellState,
@@ -360,6 +499,109 @@ impl CellStreamStore {
             .lock()
             .map_err(|_| RepositoryError::Model("cell sealed row lock poisoned".into()))?;
         *sealed = state.sealed_row;
+        *self.lock_alarms()? = super::alarm::MemorySchedules::restore(state.alarms);
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn lock_alarms(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, super::alarm::MemorySchedules>, RepositoryError> {
+        self.alarms
+            .lock()
+            .map_err(|_| RepositoryError::Model("cell alarm table lock poisoned".into()))
+    }
+
+    /// The SQL database holding alarms (the Durable Object's); `None` on
+    /// the reference host, which keeps them in memory.
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    fn alarm_sql(&self) -> Option<&super::sql_store::CellSqlRepository> {
+        Some(&self.inner)
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn alarm_sql(&self) -> Option<&std::convert::Infallible> {
+        None
+    }
+
+    /// Armed alarms, earliest first.
+    pub fn armed_schedules(&self) -> Result<Vec<super::ArmedSchedule>, RepositoryError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        if let Some(sql) = self.alarm_sql() {
+            return sql.armed_alarms();
+        }
+        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        return Ok(self.lock_alarms()?.armed());
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        Ok(Vec::new())
+    }
+
+    /// Armed alarms due at or before `now_ms`, earliest first, at most `limit`.
+    pub(super) fn due_alarms(
+        &self,
+        now_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<super::ArmedSchedule>, RepositoryError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        if let Some(sql) = self.alarm_sql() {
+            return sql.due_alarms(now_ms, limit);
+        }
+        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        return Ok(self.lock_alarms()?.due(now_ms, limit));
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        Ok(Vec::new())
+    }
+
+    /// Due time (epoch ms) of the earliest armed alarm.
+    pub(super) fn next_alarm_due_ms(&self) -> Result<Option<i64>, RepositoryError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        if let Some(sql) = self.alarm_sql() {
+            return sql.next_alarm_due_ms();
+        }
+        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        return Ok(self.lock_alarms()?.next_due_ms());
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        Ok(None)
+    }
+
+    pub(super) fn settle_alarm(
+        &self,
+        name: &str,
+        generation: u64,
+        settlement: &super::alarm::ScheduleSettlement,
+    ) -> Result<(), RepositoryError> {
+        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        if let Some(sql) = self.alarm_sql() {
+            return sql.settle_alarm(name, generation, settlement);
+        }
+        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        self.lock_alarms()?.settle(name, generation, settlement);
+        Ok(())
+    }
+
+    /// Reference host: validate and plan alarm writes before the commit so a
+    /// rejected plan aborts it; install the plan only after the commit.
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn plan_memory_alarms(
+        &self,
+        batch: &mut CommitBatch<'_>,
+    ) -> Result<Option<super::alarm::MemorySchedules>, RepositoryError> {
+        if self.alarm_sql().is_some() || batch.schedules.is_empty() {
+            return Ok(None);
+        }
+        let writes = std::mem::take(&mut batch.schedules);
+        super::alarm::validate_schedule_writes(&writes)?;
+        self.lock_alarms()?.plan(&writes).map(Some)
+    }
+
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    fn install_memory_alarms(
+        &self,
+        planned: Option<super::alarm::MemorySchedules>,
+    ) -> Result<(), RepositoryError> {
+        if let Some(planned) = planned {
+            *self.lock_alarms()? = planned;
+        }
         Ok(())
     }
 
@@ -377,6 +619,19 @@ impl CellStreamStore {
 }
 
 impl CausalGetStream for CellStreamStore {
+    fn get_causal_stream_tail<'a>(
+        &'a self,
+        identity: &'a StreamIdentity,
+        after_version: u64,
+    ) -> impl std::future::Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a
+    {
+        async move {
+            self.ensure_identity(identity)?;
+            self.inner
+                .get_causal_stream_tail(identity, after_version)
+                .await
+        }
+    }
     fn get_causal_stream<'a>(
         &'a self,
         identity: &'a StreamIdentity,
@@ -485,6 +740,13 @@ impl CommandLedgerStore for CellStreamStore {
         CommandLedgerStore::mark_retryable_unknown(&self.inner, attempt)
     }
 
+    fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
+        CommandLedgerStore::complete_external_command(&self.inner, completion)
+    }
+
     fn compact_expired_commands(
         &self,
         limit: usize,
@@ -493,14 +755,43 @@ impl CommandLedgerStore for CellStreamStore {
     }
 }
 
+/// A cell dispatches its due schedules (the Durable Object alarm on celld,
+/// `AggregateCell::fire_due_schedules` on the reference host) and stamps the
+/// cell clock.
+impl crate::microsvc::BackendHost for CellStreamStore {
+    fn capabilities(&self) -> crate::schedule::Capabilities {
+        crate::schedule::Capabilities::ALL
+    }
+
+    fn host_now(
+        &self,
+    ) -> impl Future<Output = Result<std::time::SystemTime, RepositoryError>> + Send + '_ {
+        std::future::ready(Ok(self.now()))
+    }
+}
+
 impl TransactionalCommit for CellStreamStore {
     fn commit_batch<'a>(
         &'a self,
         batch: CommitBatch<'a>,
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
+        let mut batch = batch;
         async move {
             self.ensure_batch(&batch)?;
-            TransactionalCommit::commit_batch(&self.inner, batch).await
+            crate::schedule::schedule_owner(&batch)?;
+            super::alarm::resolve_schedule_writes(&mut batch.schedules, self.clock.now())?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            let sealed = self.reduce_memory_sealed_row(&batch)?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            let alarms = self.plan_memory_alarms(&mut batch)?;
+            TransactionalCommit::commit_batch(&self.inner, batch).await?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            if let Some(row) = sealed {
+                self.replace_sealed_row(row)?;
+            }
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            self.install_memory_alarms(alarms)?;
+            Ok(())
         }
     }
 }
@@ -509,174 +800,64 @@ impl CausalTransactionalCommit for CellStreamStore {
     fn commit_causal_batch<'a>(
         &'a self,
         batch: CausalCommitBatch<'a>,
-    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + 'a {
+    ) -> impl Future<Output = Result<CommandCompletion<'a>, CommandLedgerError>> + Send + 'a {
+        let mut batch = batch;
         async move {
             self.ensure_batch(&batch.domain)
                 .map_err(CommandLedgerError::Storage)?;
-            CausalTransactionalCommit::commit_causal_batch(&self.inner, batch).await
+            crate::schedule::schedule_owner(&batch.domain).map_err(CommandLedgerError::Storage)?;
+            super::alarm::resolve_schedule_writes(&mut batch.domain.schedules, self.clock.now())
+                .map_err(CommandLedgerError::Storage)?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            let sealed = self
+                .reduce_memory_sealed_row(&batch.domain)
+                .map_err(CommandLedgerError::Storage)?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            let alarms = self
+                .plan_memory_alarms(&mut batch.domain)
+                .map_err(CommandLedgerError::Storage)?;
+            let completion =
+                CausalTransactionalCommit::commit_causal_batch(&self.inner, batch).await?;
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            if let Some(row) = sealed {
+                self.replace_sealed_row(row)
+                    .map_err(CommandLedgerError::Storage)?;
+            }
+            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            self.install_memory_alarms(alarms)
+                .map_err(CommandLedgerError::Storage)?;
+            Ok(completion)
         }
     }
 }
 
 impl HasOutboxStore for CellStreamStore {
-    type OutboxStore = InMemoryOutboxStore;
+    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    type OutboxStore = crate::InMemoryOutboxStore;
+    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    type OutboxStore = super::sql_store::CellSqlOutboxStore;
 
     fn outbox_store(&self) -> Self::OutboxStore {
         self.inner.outbox_store()
     }
 }
 
-impl ProjectionProtocolStore for CellStreamStore {
-    fn register_projection_models<'a>(
-        &'a self,
-        topology: &'a ProjectorTopologyId,
-        ownership: &'a [ProjectionModelOwnership],
-    ) -> impl Future<Output = Result<(), ProjectionProtocolError>> + Send + 'a {
-        self.inner.register_projection_models(topology, ownership)
-    }
-
-    fn commit_projection(
+// A command-only cell cannot bootstrap same-transaction read-model projections.
+impl crate::microsvc::dependencies::CausalHostProjections for CellStreamStore {
+    async fn __register_direct_projection_models(
         &self,
-        batch: ProjectionCommitBatch,
-    ) -> impl Future<Output = Result<ProjectionCommitResult, ProjectionProtocolError>> + Send + '_
-    {
-        self.inner.commit_projection(batch)
+        _topology: &crate::projection_protocol::ProjectorTopologyId,
+        _ownership: &[crate::projection_protocol::ProjectionModelOwnership],
+    ) -> Result<(), crate::projection_protocol::ProjectionProtocolError> {
+        Err(
+            crate::projection_protocol::ProjectionProtocolError::InvalidBatch(
+                "aggregate cells do not execute read-model projections".into(),
+            ),
+        )
     }
+}
 
-    fn record_projection_failure(
-        &self,
-        batch: ProjectionFailureBatch,
-    ) -> impl Future<Output = Result<ProjectionFailure, ProjectionProtocolError>> + Send + '_ {
-        self.inner.record_projection_failure(batch)
-    }
-
-    fn projection_checkpoint<'a>(
-        &'a self,
-        cursor_scope: &'a ProjectionInputCursor,
-        generation: ProjectionGeneration,
-    ) -> impl Future<Output = Result<Option<ProjectionCheckpoint>, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_checkpoint(cursor_scope, generation)
-    }
-
-    fn projection_record<'a>(
-        &'a self,
-        scope: &'a ProjectionRecordScope,
-    ) -> impl Future<Output = Result<Option<ProjectionRecordMetadata>, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner.projection_record(scope)
-    }
-
-    fn projection_input_disposition<'a>(
-        &'a self,
-        input: &'a TrustedProjectionInput,
-    ) -> impl Future<Output = Result<ProjectionInputDisposition, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_input_disposition(input)
-    }
-
-    fn projection_query_snapshot<'a>(
-        &'a self,
-        request: &'a ProjectionQuerySnapshotRequest,
-    ) -> impl Future<Output = Result<ProjectionQuerySnapshot, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_query_snapshot(request)
-    }
-
-    fn projection_query_snapshot_batch<'a>(
-        &'a self,
-        request: &'a ProjectionQuerySnapshotBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionQuerySnapshotBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_query_snapshot_batch(request)
-    }
-
-    fn projection_obligation_evidence_batch<'a>(
-        &'a self,
-        request: &'a ProjectionObligationEvidenceBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner.projection_obligation_evidence_batch(request)
-    }
-
-    fn projection_live_record_batch<'a>(
-        &'a self,
-        request: &'a ProjectionLiveRecordBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionLiveRecordBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_live_record_batch(request)
-    }
-
-    fn projection_partition_runtime_state<'a>(
-        &'a self,
-        topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
-    ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner
-            .projection_partition_runtime_state(topology, partition)
-    }
-
-    fn projection_observation<'a>(
-        &'a self,
-        causation_id: &'a str,
-        scope: &'a ProjectionRecordScope,
-        kind: ProjectionObservationKind,
-    ) -> impl Future<Output = Result<Option<ProjectionObservation>, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_observation(causation_id, scope, kind)
-    }
-
-    fn projection_changes<'a>(
-        &'a self,
-        topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
-        after: Option<&'a ProjectionChangeCursor>,
-        limit: usize,
-    ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner
-            .projection_changes(topology, partition, after, limit)
-    }
-
-    fn repair_projection<'a>(
-        &'a self,
-        topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
-        failure_id: &'a str,
-    ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner
-            .repair_projection(topology, partition, failure_id)
-    }
-
-    fn compact_projection_changes<'a>(
-        &'a self,
-        through: &'a ProjectionChangeCursor,
-    ) -> impl Future<Output = Result<u64, ProjectionProtocolError>> + Send + 'a {
-        self.inner.compact_projection_changes(through)
-    }
-
-    fn projection_failure<'a>(
-        &'a self,
-        topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
-        failure_id: &'a str,
-    ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner
-            .projection_failure(topology, partition, failure_id)
-    }
-
-    fn projection_failure_location<'a>(
-        &'a self,
-        failure_id: &'a str,
-    ) -> impl Future<Output = Result<Option<ProjectionFailureLocation>, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner.projection_failure_location(failure_id)
-    }
+#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+fn memory_repository() -> CellRepository {
+    InMemoryRepository::new()
 }

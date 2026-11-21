@@ -28,7 +28,7 @@ fn other_topology() -> ProjectorTopologyId {
     ProjectorTopologyId::new(1, "other_projector", [8; 32]).unwrap()
 }
 
-fn partition() -> ProjectionPartition {
+fn partition() -> PartitionId {
     ProjectionScopeCodec::new(topology())
         .encode_partition(Some(&serde_json::json!("tenant-a")))
         .unwrap()
@@ -116,6 +116,7 @@ fn graph_parent_schema() -> &'static TableSchema {
         indexes: Vec::new(),
         relationships: vec![
             RelationshipDef {
+                references: None,
                 field_name: "children".into(),
                 kind: RelationshipKind::HasMany,
                 target_model: "GraphChildView".into(),
@@ -124,6 +125,7 @@ fn graph_parent_schema() -> &'static TableSchema {
                 target_foreign_key: None,
             },
             RelationshipDef {
+                references: None,
                 field_name: "featured_children".into(),
                 kind: RelationshipKind::HasMany,
                 target_model: "GraphChildView".into(),
@@ -227,7 +229,7 @@ fn graph_mutation(model: &str) -> ProjectionRecordMutation {
             mode: RowWriteMode::Upsert,
         }),
         ProjectionRecordExpectation::Missing,
-        ProjectionMutationKind::Upsert,
+        RecordTransition::Upsert,
     )
     .unwrap()
 }
@@ -253,6 +255,146 @@ fn graph_snapshot_request(max_unique: usize) -> ProjectionGraphSnapshotRequest {
         max_unique,
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn graph_snapshots_follow_composite_candidate_keys_and_keep_pk_scopes() {
+    let mut parent = graph_parent_schema().clone();
+    parent.relationships.truncate(1);
+    parent.relationships[0].foreign_key = Some("tenant,key".into());
+    parent.relationships[0].references = Some("tenant,key".into());
+    let mut child = graph_child_schema().clone();
+    child.relationships.push(RelationshipDef {
+        field_name: "parent".into(),
+        kind: RelationshipKind::BelongsTo,
+        target_model: parent.model_name.clone(),
+        foreign_key: Some("tenant,key".into()),
+        references: Some("tenant,key".into()),
+        through: None,
+        target_foreign_key: None,
+    });
+    for schema in [&mut parent, &mut child] {
+        schema
+            .columns
+            .push(TableColumn::new("tenant", "tenant", ColumnType::Text));
+        schema.columns.push(TableColumn {
+            nullable: true,
+            ..TableColumn::new("key", "key", ColumnType::Text)
+        });
+    }
+    parent.indexes.push(crate::table::TableIndex {
+        name: None,
+        columns: vec!["tenant".into(), "key".into()],
+        unique: true,
+    });
+    let parent: &'static TableSchema = Box::leak(Box::new(parent));
+    let child: &'static TableSchema = Box::leak(Box::new(child));
+    let codec = ProjectionScopeCodec::with_models(
+        topology(),
+        [
+            (parent.model_name.as_str(), parent),
+            (child.model_name.as_str(), child),
+        ],
+    )
+    .unwrap();
+    let key = |id: &str| RowKey::new([("id", RowValue::String(id.into()))]);
+    let mutation =
+        |schema: &'static TableSchema, id: &str, tenant: &str, candidate: Option<&str>| {
+            let row_key = key(id);
+            let mut values = RowValues::new();
+            values.insert("id", RowValue::String(id.into()));
+            values.insert("parent_id", RowValue::String("unused".into()));
+            values.insert("tenant", RowValue::String(tenant.into()));
+            values.insert(
+                "key",
+                candidate
+                    .map(|v| RowValue::String(v.into()))
+                    .unwrap_or(RowValue::Null),
+            );
+            ProjectionRecordMutation::new(
+                codec
+                    .encode_row_scope_in_partition(&schema.model_name, partition(), &row_key)
+                    .unwrap(),
+                TableMutation::UpsertRow(TableRowMutation {
+                    schema,
+                    key: row_key,
+                    values,
+                    expected_version: ExpectedVersion::Any,
+                    mode: RowWriteMode::Upsert,
+                }),
+                ProjectionRecordExpectation::Missing,
+                RecordTransition::Upsert,
+            )
+            .unwrap()
+        };
+    let repository = InMemoryRepository::new();
+    repository
+        .register_projection_models(&topology(), &graph_ownership())
+        .await
+        .unwrap();
+    repository
+        .commit_projection(ProjectionCommitBatch {
+            input: input(
+                1,
+                b"candidate-graph",
+                "candidate-message",
+                "candidate-cause",
+                ProjectionGeneration::initial(),
+            ),
+            change_epoch: change_epoch(),
+            ownership: graph_ownership(),
+            observations: vec![],
+            mutations: vec![
+                mutation(parent, "opaque-a", "a", Some("same")),
+                mutation(parent, "opaque-b", "b", Some("same")),
+                mutation(parent, "null-target", "a", None),
+                mutation(child, "source", "a", Some("same")),
+                mutation(child, "null-source", "a", None),
+            ],
+        })
+        .await
+        .unwrap();
+    for (schema, id, field, target, expected) in [
+        (child, "source", "parent", parent, Some("opaque-a")),
+        (parent, "opaque-a", "children", child, Some("source")),
+        (parent, "opaque-b", "children", child, None),
+        (child, "null-source", "parent", parent, None),
+        (parent, "null-target", "children", child, None),
+    ] {
+        let root = ProjectionQuerySnapshotRequest::new(
+            &codec,
+            Some(&serde_json::json!("tenant-a")),
+            &schema.model_name,
+            key(id),
+            vec![],
+        )
+        .unwrap();
+        let request = ProjectionGraphSnapshotRequest::new(
+            root,
+            [(field.into(), Arc::new(target.clone()))],
+            2,
+        )
+        .unwrap();
+        let snapshot = repository
+            .projection_graph_snapshot(&request)
+            .await
+            .unwrap();
+        let rows = &snapshot.includes[field].rows;
+        assert_eq!(rows.len(), usize::from(expected.is_some()), "{id}/{field}");
+        if let Some(expected) = expected {
+            assert_eq!(
+                rows[0].row.as_ref().unwrap().get("id"),
+                Some(&RowValue::String(expected.into()))
+            );
+            assert_eq!(
+                rows[0].scope,
+                codec
+                    .encode_row_scope_in_partition(&target.model_name, partition(), &key(expected))
+                    .unwrap()
+            );
+            assert!(rows[0].record.is_some());
+        }
+    }
 }
 
 fn fanout_schemas() -> &'static [TableSchema] {
@@ -319,7 +461,7 @@ fn fanout_mutation(index: usize) -> ProjectionRecordMutation {
             mode: RowWriteMode::Upsert,
         }),
         ProjectionRecordExpectation::Missing,
-        ProjectionMutationKind::Upsert,
+        RecordTransition::Upsert,
     )
     .unwrap()
 }
@@ -376,7 +518,7 @@ fn matrix_mutation(
             mode: RowWriteMode::Upsert,
         }),
         expectation,
-        ProjectionMutationKind::Upsert,
+        RecordTransition::Upsert,
     )
     .unwrap()
 }
@@ -414,7 +556,7 @@ impl crate::projection_protocol::scenario_tests::ProjectionProtocolScenario for 
         other_topology()
     }
 
-    fn partition(&self) -> ProjectionPartition {
+    fn partition(&self) -> PartitionId {
         partition()
     }
 
@@ -429,7 +571,7 @@ impl crate::projection_protocol::scenario_tests::ProjectionProtocolScenario for 
     fn mutation(
         &self,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
     ) -> ProjectionRecordMutation {
         mutation(expectation, kind)
     }
@@ -490,7 +632,7 @@ fn valued_mutation(
             mode: RowWriteMode::Upsert,
         }),
         expectation,
-        ProjectionMutationKind::Upsert,
+        RecordTransition::Upsert,
     )
     .unwrap()
 }
@@ -514,17 +656,15 @@ fn snapshot_request() -> ProjectionQuerySnapshotRequest {
 
 fn mutation(
     expectation: ProjectionRecordExpectation,
-    kind: ProjectionMutationKind,
+    kind: RecordTransition,
 ) -> ProjectionRecordMutation {
     let table = match kind {
-        ProjectionMutationKind::Delete => TableMutation::DeleteRow(DeleteTableRowMutation {
+        RecordTransition::Delete => TableMutation::DeleteRow(DeleteTableRowMutation {
             schema: schema(),
             key: RowKey::new([("id", RowValue::String("todo-1".into()))]),
             expected_version: ExpectedVersion::Any,
         }),
-        ProjectionMutationKind::Upsert | ProjectionMutationKind::Recreate => {
-            upsert_table_mutation(true)
-        }
+        RecordTransition::Upsert | RecordTransition::Recreate => upsert_table_mutation(true),
     };
     ProjectionRecordMutation::new(record_scope(), table, expectation, kind).unwrap()
 }
@@ -540,7 +680,7 @@ fn patch_mutation(expected: RecordRevision) -> ProjectionRecordMutation {
             mode: PatchMode::UpdateExisting,
         }),
         ProjectionRecordExpectation::Exact(expected),
-        ProjectionMutationKind::Upsert,
+        RecordTransition::Upsert,
     )
     .unwrap()
 }
@@ -704,51 +844,6 @@ fn query_snapshot_probe_and_batch_bounds_are_explicit() {
             if message.contains("maximum")
     ));
 
-    let evidence = (0..crate::projection_protocol::MAX_PROJECTION_EVIDENCE_BATCH_ITEMS)
-        .map(|index| {
-            crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-                format!("cause-{index}"),
-                record_scope(),
-                ProjectionObservationKind::Record,
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        crate::projection_protocol::ProjectionObligationEvidenceBatchRequest::new(evidence.clone())
-            .is_ok()
-    );
-    let mut too_many_evidence = evidence;
-    too_many_evidence.push(
-        crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-            "cause-over-limit",
-            record_scope(),
-            ProjectionObservationKind::Record,
-        )
-        .unwrap(),
-    );
-    assert!(matches!(
-        crate::projection_protocol::ProjectionObligationEvidenceBatchRequest::new(
-            too_many_evidence
-        ),
-        Err(ProjectionProtocolError::InvalidBatch(message))
-            if message.contains("maximum")
-    ));
-    let duplicate = crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-        "duplicate-cause",
-        record_scope(),
-        ProjectionObservationKind::Record,
-    )
-    .unwrap();
-    assert!(matches!(
-        crate::projection_protocol::ProjectionObligationEvidenceBatchRequest::new(vec![
-            duplicate.clone(),
-            duplicate,
-        ]),
-        Err(ProjectionProtocolError::InvalidBatch(message))
-            if message.contains("repeats")
-    ));
-
     let live = (0..crate::projection_protocol::MAX_PROJECTION_EVIDENCE_BATCH_ITEMS)
         .map(|index| {
             crate::projection_protocol::ProjectionLiveRecordRequest::new(
@@ -853,106 +948,6 @@ async fn query_snapshot_never_mixes_row_revision_checkpoint_or_resume_head() {
 }
 
 #[tokio::test]
-async fn obligation_evidence_is_exact_bounded_and_failure_wins_after_compaction() {
-    let repository = repository().await;
-    let scope = record_scope();
-    let observed = repository
-        .commit_projection(batch(
-            input(
-                1,
-                b"observed",
-                "evidence-message-1",
-                "evidence-cause",
-                ProjectionGeneration::initial(),
-            ),
-            vec![mutation(
-                ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
-            )],
-            vec![ProjectionObservationRequest {
-                kind: ProjectionObservationKind::Record,
-                target: ProjectionObservationTarget::StagedRecord(scope.clone()),
-            }],
-        ))
-        .await
-        .unwrap();
-    let observed_probe = crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-        "evidence-cause",
-        scope.clone(),
-        ProjectionObservationKind::Record,
-    )
-    .unwrap();
-    let pending_probe = crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-        "pending-cause",
-        scope,
-        ProjectionObservationKind::Record,
-    )
-    .unwrap();
-    let before_failure = repository
-        .projection_obligation_evidence_batch(
-            &crate::projection_protocol::ProjectionObligationEvidenceBatchRequest::new(vec![
-                observed_probe.clone(),
-                pending_probe.clone(),
-            ])
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        &before_failure.evidence[0],
-        ProjectionObligationEvidence::Observed(observation)
-            if observation.change == observed.changes[0].cursor
-    ));
-    assert_eq!(
-        before_failure.evidence[1],
-        ProjectionObligationEvidence::Pending
-    );
-
-    let failure = repository
-        .record_projection_failure(
-            ProjectionFailureBatch::new(
-                input(
-                    2,
-                    b"failed",
-                    "evidence-message-2",
-                    "evidence-cause",
-                    ProjectionGeneration::initial(),
-                ),
-                change_epoch(),
-                "evidence-failure",
-                "decode_error",
-                b"bad evidence payload".to_vec(),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    repository
-        .compact_projection_changes(&failure.change)
-        .await
-        .unwrap();
-    let after_failure = repository
-        .projection_obligation_evidence_batch(
-            &crate::projection_protocol::ProjectionObligationEvidenceBatchRequest::new(vec![
-                observed_probe,
-                pending_probe,
-            ])
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        &after_failure.evidence[0],
-        ProjectionObligationEvidence::TerminalFailure(stored)
-            if stored == &failure
-    ));
-    assert_eq!(
-        after_failure.evidence[1],
-        ProjectionObligationEvidence::Pending
-    );
-}
-
-#[tokio::test]
 async fn unpartitioned_live_record_follows_tombstone_partition_move_and_rejects_ambiguity() {
     let repository = repository().await;
     let old_scope = record_scope();
@@ -967,7 +962,7 @@ async fn unpartitioned_live_record_follows_tombstone_partition_move_and_rejects_
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             Vec::new(),
         ))
@@ -1004,7 +999,7 @@ async fn unpartitioned_live_record_follows_tombstone_partition_move_and_rejects_
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Exact(created.revision),
-                ProjectionMutationKind::Delete,
+                RecordTransition::Delete,
             )],
             Vec::new(),
         ))
@@ -1048,7 +1043,7 @@ async fn unpartitioned_live_record_follows_tombstone_partition_move_and_rejects_
                 new_scope.clone(),
                 upsert_table_mutation(true),
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )
             .unwrap()],
             Vec::new(),
@@ -1239,7 +1234,7 @@ async fn direct_projection_reports_typed_physical_metadata_drift() {
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             Vec::new(),
         ))
@@ -1514,7 +1509,7 @@ async fn automatic_retention_failure_rolls_back_rows_protocol_and_inbox() {
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             Vec::new(),
         ))
@@ -1546,7 +1541,7 @@ async fn automatic_retention_failure_rolls_back_rows_protocol_and_inbox() {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Exact(created.revision.clone()),
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -1652,6 +1647,7 @@ async fn lengthening_retention_never_restores_a_compacted_prefix() {
                 scope: None,
                 revision: None,
                 failure_id: None,
+                program_id: None,
             }],
         }
     );
@@ -1864,7 +1860,7 @@ async fn cursor_fences_are_exact_and_non_mutating() {
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             Vec::new(),
         ))
@@ -1884,7 +1880,7 @@ async fn cursor_fences_are_exact_and_non_mutating() {
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             Vec::new(),
         ))
@@ -2169,6 +2165,11 @@ async fn input_disposition_is_read_only_exact_and_repair_fenced() {
         ProjectionScenario,
     )
     .await;
+}
+
+#[tokio::test]
+async fn identical_redelivery_advances_only_broker_checkpoint() {
+    crate::projection_protocol::scenario_tests::identical_redelivery_advances_only_broker_checkpoint(ProjectionScenario).await;
 }
 
 #[tokio::test]
@@ -2484,7 +2485,7 @@ async fn physical_rows_must_match_projection_record_metadata() {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -2522,7 +2523,7 @@ async fn physical_rows_must_match_projection_record_metadata() {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Missing,
-                    ProjectionMutationKind::Upsert,
+                    RecordTransition::Upsert,
                 )],
                 Vec::new(),
             ))
@@ -2538,12 +2539,12 @@ async fn physical_rows_must_match_projection_record_metadata() {
         let attempted = match operation {
             "save" => mutation(
                 ProjectionRecordExpectation::Exact(metadata.revision.clone()),
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             ),
             "patch" => patch_mutation(metadata.revision.clone()),
             "delete" => mutation(
                 ProjectionRecordExpectation::Exact(metadata.revision.clone()),
-                ProjectionMutationKind::Delete,
+                RecordTransition::Delete,
             ),
             _ => unreachable!(),
         };
@@ -2600,7 +2601,7 @@ async fn physical_rows_must_match_projection_record_metadata() {
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             Vec::new(),
         ))
@@ -2619,7 +2620,7 @@ async fn physical_rows_must_match_projection_record_metadata() {
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Exact(created.revision),
-                ProjectionMutationKind::Delete,
+                RecordTransition::Delete,
             )],
             Vec::new(),
         ))
@@ -2645,7 +2646,7 @@ async fn physical_rows_must_match_projection_record_metadata() {
                 ),
                 vec![mutation(
                     ProjectionRecordExpectation::Exact(deleted.revision.clone()),
-                    ProjectionMutationKind::Recreate,
+                    RecordTransition::Recreate,
                 )],
                 Vec::new(),
             ))
@@ -2678,7 +2679,7 @@ async fn table_failure_rolls_back_rows_protocol_and_inbox() {
         record_scope(),
         upsert_table_mutation(false),
         ProjectionRecordExpectation::Missing,
-        ProjectionMutationKind::Upsert,
+        RecordTransition::Upsert,
     )
     .unwrap();
     assert!(matches!(
@@ -2758,7 +2759,7 @@ async fn concurrent_same_input_applies_once() {
                     ),
                     vec![mutation(
                         ProjectionRecordExpectation::Missing,
-                        ProjectionMutationKind::Upsert,
+                        RecordTransition::Upsert,
                     )],
                     Vec::new(),
                 ))
@@ -2812,7 +2813,7 @@ async fn observations_are_immutable_and_staged_records_reuse_row_changes() {
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             vec![ProjectionObservationRequest {
                 kind: ProjectionObservationKind::Record,
@@ -2842,7 +2843,7 @@ async fn observations_are_immutable_and_staged_records_reuse_row_changes() {
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Exact(first.records[0].revision.clone()),
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             vec![ProjectionObservationRequest {
                 kind: ProjectionObservationKind::Record,
@@ -2933,7 +2934,7 @@ async fn causation_evidence_is_topology_allowlisted_and_repair_clears_terminal_f
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             vec![ProjectionObservationRequest {
                 kind: ProjectionObservationKind::Record,
@@ -3210,7 +3211,7 @@ async fn causal_owned_table_rejects_every_legacy_commit_path() {
             ),
             vec![mutation(
                 ProjectionRecordExpectation::Missing,
-                ProjectionMutationKind::Upsert,
+                RecordTransition::Upsert,
             )],
             Vec::new(),
         ))

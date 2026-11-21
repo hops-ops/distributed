@@ -29,6 +29,7 @@ mod capabilities;
 pub mod change;
 pub(crate) mod in_memory;
 mod load;
+mod scan;
 mod plan;
 mod workspace;
 
@@ -90,6 +91,7 @@ pub trait RelationalReadModelIncludes: RelationalReadModel {
 }
 
 pub use capabilities::ReadModelQueryCapabilities;
+pub use scan::{ReadModelScanCursor, ReadModelScanPage, ReadModelScanRequest};
 pub use in_memory::InMemoryReadModelStore;
 pub use load::{
     ReadModelIncludeRows, ReadModelLoadBuilder, ReadModelLoadGraph, ReadModelLoadRequest,

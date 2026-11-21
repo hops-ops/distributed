@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use base64::Engine as _;
 use distributed::graphql::{
-    graphql_router, read, resolve_session, AuthError, GraphqlEngine, IdentityConfig, IdentityMode,
-    ModelPermissions, OidcConfig, OidcValidator, ValidationError,
+    graphql_router, read, AuthError, GraphqlEngine, GraphqlPoolSource, IdentityConfig,
+    IdentityResolver, ModelPermissions, OidcConfig, OidcValidator, ValidationError,
 };
 use distributed::ReadModel;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
@@ -19,8 +19,11 @@ use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::sqlite::SqlitePoolOptions;
 use tower::util::ServiceExt;
+
+#[path = "../support/graphql.rs"]
+mod graphql_support;
+use graphql_support::Db;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("oidc_e2e_items")]
@@ -28,6 +31,19 @@ pub struct OidcE2eItem {
     #[id("id")]
     pub id: String,
     pub owner: String,
+}
+
+/// `oidc_e2e_items` created from its read-model declaration, holding `rows`
+/// of `(id, owner)`.
+async fn items(rows: &[(&str, &str)]) -> GraphqlPoolSource {
+    let db = Db::sqlite().await;
+    db.seed::<OidcE2eItem>([]).await;
+    db.seed(rows.iter().map(|(id, owner)| OidcE2eItem {
+        id: (*id).into(),
+        owner: (*owner).into(),
+    }))
+    .await;
+    db.pool()
 }
 
 pub fn gate_enabled(name: &str) -> bool {
@@ -59,18 +75,7 @@ pub async fn discovery_ready(issuer: &str) -> bool {
 }
 
 pub async fn engine_oidc(oidc: OidcConfig) -> Arc<GraphqlEngine> {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE oidc_e2e_items (id TEXT PRIMARY KEY, owner TEXT NOT NULL);
-         INSERT INTO oidc_e2e_items VALUES ('1', 'subject-a');
-         INSERT INTO oidc_e2e_items VALUES ('2', 'subject-b');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let pool = items(&[("1", "subject-a"), ("2", "subject-b")]).await;
     let mut oidc = oidc;
     oidc.require_auth = true;
     oidc.claim_map.engine_roles = vec!["admin".into(), "customer".into(), "user".into()];
@@ -149,22 +154,7 @@ pub async fn run_e1_through_e8(
     assert!(!token_a.is_empty() && !token_b.is_empty());
 
     // Seed DB owners to match minted subjects.
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query("CREATE TABLE oidc_e2e_items (id TEXT PRIMARY KEY, owner TEXT NOT NULL);")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO oidc_e2e_items VALUES (?1, ?2), (?3, ?4)")
-        .bind("1")
-        .bind(&sub_a)
-        .bind("2")
-        .bind(&sub_b)
-        .execute(&pool)
-        .await
-        .unwrap();
+    let pool = items(&[("1", &sub_a), ("2", &sub_b)]).await;
 
     let mut oidc_cfg = oidc.clone();
     oidc_cfg.require_auth = true;
@@ -251,7 +241,8 @@ pub async fn run_e1_through_e8(
         let mut h = bearer_headers(&token_a);
         h.insert("x-user-id", HeaderValue::from_static("evil-spoof"));
         h.insert("x-roles", HeaderValue::from_static("admin"));
-        let session = resolve_session(&h, engine.identity_config())
+        let session = IdentityResolver::new(engine.identity_config().clone())
+            .resolve_session(&h)
             .await
             .expect("E2 resolve");
         assert_eq!(session.user_id(), Some(sub_a.as_str()), "E2 spoof ignored");
@@ -318,14 +309,7 @@ pub async fn run_e1_through_e8(
             "E5 must be Expired (not signature/malformed), got {err:?}"
         );
         // HTTP path with engine wired to the same static JWKS → 401
-        let pool = SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::query("CREATE TABLE oidc_e2e_items (id TEXT PRIMARY KEY, owner TEXT NOT NULL);")
-            .execute(&pool)
-            .await
-            .unwrap();
+        let pool = items(&[]).await;
         let mut http_cfg =
             OidcConfig::new(&oidc_cfg.issuer, &oidc_cfg.audience).with_static_jwks(&keys.jwks_json);
         http_cfg.require_auth = true;
@@ -409,7 +393,6 @@ pub async fn run_e1_through_e8(
         eprintln!("E8 ok");
     }
 
-    let _ = IdentityMode::OidcBearer;
     let _ = AuthError::Unauthorized;
 }
 

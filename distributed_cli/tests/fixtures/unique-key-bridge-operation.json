@@ -1,0 +1,333 @@
+{
+  "id": "sha256:64d793257325afec58385b9e2e5e3d55fa778bc4d01753a123bd6fab2b67b010",
+  "document": "query UniqueKeyBridge {\n  todos(limit: 25) {\n    id\n    title\n    owner {\n      id\n      title\n      _distributed_tenantId: tenantId\n      _distributed_typename: __typename\n    }\n    _distributed_tenantId: tenantId\n    _distributed_typename: __typename\n    _distributed_ownerTitle: ownerTitle\n  }\n}\n",
+  "source": {
+    "path": "src/routes/unique-key/+page.graphql",
+    "line": 1,
+    "column": 1
+  },
+  "variableCodec": {
+    "version": 2,
+    "limits": {
+      "maxDepth": 8,
+      "maxBoolWidth": 256,
+      "maxInList": 1000
+    },
+    "variables": {},
+    "defaults": {},
+    "inputs": {}
+  },
+  "roots": [
+    {
+      "responseKey": "todos",
+      "field": "todos",
+      "cardinality": "many",
+      "nullable": false,
+      "arguments": {
+        "limit": {
+          "kind": "literal",
+          "value": 25
+        }
+      },
+      "dependencies": [
+        "todo_rows"
+      ],
+      "coverage": {
+        "kind": "offset",
+        "offsetArgument": "offset",
+        "limitArgument": "limit",
+        "defaultLimit": 25,
+        "maxLimit": 100
+      },
+      "filter": {
+        "fields": [
+          {
+            "field": "completed",
+            "scalar": "Boolean",
+            "codec": "boolean",
+            "nullable": false,
+            "operators": [
+              "_eq"
+            ]
+          },
+          {
+            "field": "id",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false,
+            "operators": [
+              "_eq"
+            ]
+          },
+          {
+            "field": "ownerTitle",
+            "scalar": "String",
+            "codec": "string",
+            "nullable": true,
+            "operators": [
+              "_eq"
+            ]
+          },
+          {
+            "field": "priority",
+            "scalar": "Int",
+            "codec": "int32",
+            "nullable": false,
+            "operators": [
+              "_eq",
+              "_in",
+              "_nin"
+            ]
+          },
+          {
+            "field": "tenantId",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false,
+            "operators": [
+              "_eq"
+            ]
+          },
+          {
+            "field": "title",
+            "scalar": "String",
+            "codec": "string",
+            "nullable": true,
+            "operators": [
+              "_eq"
+            ]
+          }
+        ],
+        "relationships": [
+          {
+            "field": "owner",
+            "targetModel": "Todo",
+            "kind": "belongs_to",
+            "keyMapping": {
+              "kind": "direct",
+              "local": [
+                "tenantId",
+                "ownerTitle"
+              ],
+              "remote": [
+                "tenantId",
+                "title"
+              ]
+            },
+            "maintenance": "local",
+            "dependencies": [
+              "todo_rows"
+            ]
+          }
+        ],
+        "rowPolicy": {
+          "kind": "unrestricted"
+        }
+      },
+      "order": {
+        "fields": [
+          {
+            "field": "completed",
+            "scalar": "Boolean",
+            "codec": "boolean",
+            "nullable": false
+          },
+          {
+            "field": "id",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false
+          },
+          {
+            "field": "ownerTitle",
+            "scalar": "String",
+            "codec": "string",
+            "nullable": true
+          },
+          {
+            "field": "priority",
+            "scalar": "Int",
+            "codec": "int32",
+            "nullable": false
+          },
+          {
+            "field": "tenantId",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false
+          },
+          {
+            "field": "title",
+            "scalar": "String",
+            "codec": "string",
+            "nullable": true
+          }
+        ],
+        "tieBreakers": [
+          {
+            "field": "tenantId",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false
+          },
+          {
+            "field": "id",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false
+          }
+        ]
+      },
+      "pagination": {
+        "kind": "offset",
+        "insert": "local",
+        "delete": "local",
+        "reorder": "local",
+        "stableUpdate": "local"
+      },
+      "selection": {
+        "typename": "todo",
+        "storage": {
+          "kind": "normalized",
+          "model": "Todo",
+          "identityFields": [
+            "tenantId",
+            "id"
+          ]
+        },
+        "members": [
+          {
+            "kind": "scalar",
+            "responseKey": "id",
+            "field": "id",
+            "codec": "string",
+            "nullable": false
+          },
+          {
+            "kind": "scalar",
+            "responseKey": "title",
+            "field": "title",
+            "codec": "string",
+            "nullable": true
+          },
+          {
+            "kind": "branch",
+            "semantic": "relationship",
+            "responseKey": "owner",
+            "field": "owner",
+            "cardinality": "one",
+            "nullable": true,
+            "dependencies": [
+              "todo_rows"
+            ],
+            "coverage": {
+              "kind": "complete"
+            },
+            "relationship": {
+              "field": "owner",
+              "targetModel": "Todo",
+              "kind": "belongs_to",
+              "keyMapping": {
+                "kind": "direct",
+                "local": [
+                  "tenantId",
+                  "ownerTitle"
+                ],
+                "remote": [
+                  "tenantId",
+                  "title"
+                ]
+              },
+              "maintenance": "local",
+              "dependencies": [
+                "todo_rows"
+              ]
+            },
+            "selection": {
+              "typename": "todo",
+              "storage": {
+                "kind": "normalized",
+                "model": "Todo",
+                "identityFields": [
+                  "tenantId",
+                  "id"
+                ]
+              },
+              "members": [
+                {
+                  "kind": "scalar",
+                  "responseKey": "id",
+                  "field": "id",
+                  "codec": "string",
+                  "nullable": false
+                },
+                {
+                  "kind": "scalar",
+                  "responseKey": "title",
+                  "field": "title",
+                  "codec": "string",
+                  "nullable": true
+                },
+                {
+                  "kind": "scalar",
+                  "responseKey": "_distributed_tenantId",
+                  "field": "tenantId",
+                  "codec": "string",
+                  "nullable": false,
+                  "expose": false
+                },
+                {
+                  "kind": "scalar",
+                  "responseKey": "_distributed_typename",
+                  "field": "__typename",
+                  "codec": "string",
+                  "nullable": false,
+                  "expose": false
+                }
+              ]
+            }
+          },
+          {
+            "kind": "scalar",
+            "responseKey": "_distributed_tenantId",
+            "field": "tenantId",
+            "codec": "string",
+            "nullable": false,
+            "expose": false
+          },
+          {
+            "kind": "scalar",
+            "responseKey": "_distributed_typename",
+            "field": "__typename",
+            "codec": "string",
+            "nullable": false,
+            "expose": false
+          },
+          {
+            "kind": "scalar",
+            "responseKey": "_distributed_ownerTitle",
+            "field": "ownerTitle",
+            "codec": "string",
+            "nullable": true,
+            "expose": false
+          }
+        ]
+      }
+    }
+  ],
+  "protocol": {
+    "version": 1,
+    "schemaHash": "sha256:d43d65b233d9839f28271b4bdee7326f03b660cac3002013d8f058204e188415",
+    "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
+    "surface": {
+      "kind": "role",
+      "name": "user"
+    },
+    "operation": "sha256:64d793257325afec58385b9e2e5e3d55fa778bc4d01753a123bd6fab2b67b010",
+    "trustedPresets": []
+  },
+  "live": {
+    "id": "sha256:5f1d6c2a80bd0417bfd53ba757436a319fc6d9801af10247cd91cd32a6ac48e9",
+    "document": "subscription UniqueKeyBridge_Live {\n  todos(limit: 25) {\n    id\n    title\n    owner {\n      id\n      title\n      _distributed_tenantId: tenantId\n      _distributed_typename: __typename\n    }\n    _distributed_tenantId: tenantId\n    _distributed_typename: __typename\n    _distributed_ownerTitle: ownerTitle\n  }\n}\n"
+  }
+}

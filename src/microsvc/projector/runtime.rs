@@ -292,16 +292,29 @@ where
             )?;
             match store.projection_input_disposition(&trusted).await? {
                 ProjectionInputDisposition::Pending => {}
+                ProjectionInputDisposition::Redelivery => {
+                    store
+                        .commit_projection(crate::projection_protocol::ProjectionCommitBatch {
+                            input: trusted,
+                            change_epoch: self.change_epoch.clone(),
+                            ownership: self.compiled.ownership().to_vec(),
+                            mutations: Vec::new(),
+                            observations: Vec::new(),
+                        })
+                        .await?;
+                    return Ok(());
+                }
                 ProjectionInputDisposition::Duplicate(_) | ProjectionInputDisposition::Stale(_) => {
                     return Ok(())
                 }
             }
             let failure_input = trusted.clone();
-            let workspace = ProjectionWorkspace::new(
+            let workspace = ProjectionWorkspace::new_with_program_id(
                 self.compiled.codec(),
                 partition_value,
                 trusted,
                 self.change_epoch.clone(),
+                Some(self.executor.program_id),
             )?;
             let (context, workspace) =
                 CausalProjectorContext::new(message, D::Store::clone(store), workspace);
@@ -567,6 +580,18 @@ where
             )?;
             match store.projection_input_disposition(&trusted).await? {
                 ProjectionInputDisposition::Pending => {}
+                ProjectionInputDisposition::Redelivery => {
+                    store
+                        .commit_projection(crate::projection_protocol::ProjectionCommitBatch {
+                            input: trusted,
+                            change_epoch: self.change_epoch.clone(),
+                            ownership: self.compiled.ownership().to_vec(),
+                            mutations: Vec::new(),
+                            observations: Vec::new(),
+                        })
+                        .await?;
+                    return Ok(());
+                }
                 ProjectionInputDisposition::Duplicate(_) | ProjectionInputDisposition::Stale(_) => {
                     return Ok(())
                 }

@@ -1,0 +1,23 @@
+error[E0277]: `#[buttons]` needs a u8, u16 or u32 field, not `f32`
+ --> tests/compile_fail/input_buttons_on_float.rs:6:14
+  |
+6 |     buttons: f32,
+  |     ---------^^^
+  |     |        |
+  |     |        button bits live in an unsigned integer
+  |     `f32` doesn't satisfy the trait bound
+  |
+  = help: the trait `ButtonBits` is not implemented for `f32`
+help: the following other types implement trait `ButtonBits`
+ --> $WORKSPACE/distributed_game/src/codec.rs
+  |
+  |         impl ButtonBits for $ty {
+  |         ^^^^^^^^^^^^^^^^^^^^^^^
+  |         |
+  |         `u16`
+  |         `u32`
+  |         `u8`
+...
+  | button_bits!(u8, u16, u32);
+  | -------------------------- in this macro invocation
+  = note: this error originates in the macro `button_bits` (in Nightly builds, run with -Z macro-backtrace for more info)

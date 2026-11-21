@@ -1,0 +1,5 @@
+error: #[derive(TicketExtension)] does not support `flatten`; declare every claim as a field
+  --> tests/compile_fail/ticket_extension_flatten.rs:11:13
+   |
+11 |     #[serde(flatten)]
+   |             ^^^^^^^

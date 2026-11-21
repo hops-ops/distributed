@@ -158,7 +158,12 @@ pub fn application_manifest() -> ApplicationManifest {
     let modules = E2E_UI_MODULE_IDS
         .iter()
         .map(|module_id| {
-            let prefix = format!("{module_id}.");
+            // A module's commands are named `{module}.…`; the identity
+            // module's are named for their provider.
+            let prefix = match *module_id {
+                e2e_celld_identity::MODULE_ID => e2e_celld_identity::COMMAND_PREFIX.to_string(),
+                module_id => format!("{module_id}."),
+            };
             let definitions = commands
                 .iter()
                 .filter(|command| command.id.starts_with(&prefix))
@@ -589,7 +594,6 @@ mod client_surface_tests {
             .find(|projector| projector.name == "project_blob")
             .expect("Blob direct owner should be exported");
         assert!(owner.facts.is_empty());
-        assert!(!owner.causal_confirmation);
 
         let repository = InMemoryRepository::new();
         let service = build_service(

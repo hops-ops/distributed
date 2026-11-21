@@ -20,6 +20,22 @@ pub const USER_ID_KEY: &str = "x-user-id";
 /// Convenience only — not required. See [`USER_ID_KEY`].
 pub const ROLE_KEY: &str = "x-roles";
 
+/// Role carried by the session of a typed command a transport delivered
+/// (a bus consumer or the Knative ingress). A command opts in to transport
+/// delivery by declaring this role; without it the delivery is refused.
+pub const TRANSPORT_ROLE: &str = "transport";
+/// User id of the session of a transport-delivered typed command.
+///
+/// The transport authenticates nobody: whoever may publish to the broker is
+/// this one subject. Identity and role keys a message carries are discarded.
+pub const TRANSPORT_USER_ID: &str = "system:transport";
+/// Session claim with the transport's id of the delivered message (the id
+/// the command ledger deduplicates on). Set only by the host.
+pub const TRANSPORT_MESSAGE_ID_CLAIM: &str = "x-distributed-message-id";
+/// Prefix of the session claims only the host sets. A delivered message
+/// cannot supply one.
+pub(crate) const HOST_CLAIM_PREFIX: &str = "x-distributed-";
+
 /// Parsed session variables from the incoming request.
 ///
 /// Built from whatever the transport provides: HTTP headers, gRPC metadata,
@@ -136,7 +152,12 @@ impl Session {
         self.variables.insert(key.into(), value.into());
     }
 
-    /// Check if a session variable exists.
+    /// Remove a variable, returning its value.
+    pub fn remove(&mut self, key: &str) -> Option<String> {
+        self.variables.remove(key)
+    }
+
+    /// Whether `key` is set.
     pub fn has(&self, key: &str) -> bool {
         self.variables.contains_key(key)
     }

@@ -33,6 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &database_url,
         HostOptions {
             bind,
+            public_origin: env::var("PUBLIC_ORIGIN")
+                .unwrap_or_else(|_| "http://localhost:8791".into()),
+            ui_origin: env::var("UI_INTERNAL_ORIGIN")
+                .unwrap_or_else(|_| "http://localhost:5180".into()),
             identity: identity_from_env(),
             celld_url,
             nats_url,

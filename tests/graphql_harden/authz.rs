@@ -2,21 +2,20 @@
 //! Drives shipped `GraphqlEngine::execute`.
 
 use async_graphql::Request;
-use distributed::graphql::{claim, col, read, GraphqlEngine, ModelPermissions};
-use distributed::{
-    ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-};
+use distributed::graphql::IdentityConfig;
+use distributed::graphql::{claim, col, read, GraphqlEngine, GraphqlPoolSource, ModelPermissions};
+use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
 
 use super::common::{
-    engine_all_columns, error_messages, exec_json, seed_orders, session, ChildView, OrderView,
-    ParentView,
+    child, engine_all_columns, error_messages, exec_json, parent, seed_orders, session, ChildView,
+    Db, OrderView, ParentView,
 };
 
 /// A1: claim row filter on list (existing harden case).
-#[tokio::test]
-async fn claim_row_filter_isolates_tenants() {
-    let pool = seed_orders().await;
+pub async fn claim_row_filter_isolates_tenants(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .model::<OrderView>(
             ModelPermissions::new().grant(
@@ -55,10 +54,10 @@ async fn claim_row_filter_isolates_tenants() {
 }
 
 /// A2 focused: claim filter on by_pk of own vs other tenant.
-#[tokio::test]
-async fn a2_claim_filter_on_by_pk_isolates_tenants() {
-    let pool = seed_orders().await;
+pub async fn a2_claim_filter_on_by_pk_isolates_tenants(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(
             ModelPermissions::new().grant(
@@ -95,10 +94,10 @@ async fn a2_claim_filter_on_by_pk_isolates_tenants() {
 }
 
 /// A3: claim filter on aggregate count.
-#[tokio::test]
-async fn a3_claim_filter_on_aggregate_count() {
-    let pool = seed_orders().await;
+pub async fn a3_claim_filter_on_aggregate_count(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(
             ModelPermissions::new().grant(
@@ -128,10 +127,10 @@ async fn a3_claim_filter_on_aggregate_count() {
 }
 
 /// Column allowlist on root list (existing).
-#[tokio::test]
-async fn column_allowlist_denies_ungranted_fields() {
-    let pool = seed_orders().await;
+pub async fn column_allowlist_denies_ungranted_fields(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["restricted", "user"])
         .model::<OrderView>(
             ModelPermissions::new()
@@ -167,28 +166,14 @@ async fn column_allowlist_denies_ungranted_fields() {
 }
 
 /// A5: nested relationship cannot project ungranted child columns.
-#[tokio::test]
-async fn a5_nested_relationship_column_allowlist_denies() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE parents (parent_id TEXT PRIMARY KEY, name TEXT NOT NULL);
-         CREATE TABLE children (
-            child_id TEXT PRIMARY KEY,
-            parent_id TEXT NOT NULL,
-            name TEXT NOT NULL
-         );
-         INSERT INTO parents VALUES ('p1', 'P');
-         INSERT INTO children VALUES ('c1', 'p1', 'secret-name');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+pub async fn a5_nested_relationship_column_allowlist_denies(db: Db) {
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "secret-name")]).await;
+    let pool = db.pool();
 
     let mut parent = ParentView::schema().clone();
     parent.relationships = vec![RelationshipDef {
+        references: None,
         field_name: "children".into(),
         kind: RelationshipKind::HasMany,
         target_model: "ChildView".into(),
@@ -204,6 +189,7 @@ async fn a5_nested_relationship_column_allowlist_denies() {
     // Parent: all columns; child: only child_id (not name).
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .permission::<ParentView>("user", read().all_columns())
         .permission::<ChildView>("user", read().columns(["child_id", "parent_id"]))
@@ -241,9 +227,10 @@ async fn a5_nested_relationship_column_allowlist_denies() {
     assert!(children[0].get("name").is_none());
 }
 
-fn parent_child_engine(pool: sqlx::SqlitePool) -> GraphqlEngine {
+fn parent_child_engine(pool: GraphqlPoolSource) -> GraphqlEngine {
     let mut parent = ParentView::schema().clone();
     parent.relationships = vec![RelationshipDef {
+        references: None,
         field_name: "children".into(),
         kind: RelationshipKind::HasMany,
         target_model: "ChildView".into(),
@@ -258,36 +245,22 @@ fn parent_child_engine(pool: sqlx::SqlitePool) -> GraphqlEngine {
 
     GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .build()
         .expect("build")
 }
 
-async fn seed_parents_children() -> sqlx::SqlitePool {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE parents (parent_id TEXT PRIMARY KEY, name TEXT NOT NULL);
-         CREATE TABLE children (
-            child_id TEXT PRIMARY KEY,
-            parent_id TEXT NOT NULL,
-            name TEXT NOT NULL
-         );
-         INSERT INTO parents VALUES ('p1', 'P');
-         INSERT INTO children VALUES ('c1', 'p1', 'C1'), ('c2', 'p1', 'C2');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    pool
+async fn seed_parents_children(db: &Db) -> GraphqlPoolSource {
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "C1"), child("c2", "p1", "C2")])
+        .await;
+    db.pool()
 }
 
-#[tokio::test]
-async fn nested_has_many_relationship_e2e() {
-    let pool = seed_parents_children().await;
+pub async fn nested_has_many_relationship_e2e(db: Db) {
+    let pool = seed_parents_children(&db).await;
     let engine = parent_child_engine(pool);
     let s = session("user", "u");
     let data = exec_json(
@@ -302,9 +275,8 @@ async fn nested_has_many_relationship_e2e() {
 
 /// Regression: by_pk with nested has_many must keep SQLite `?` binds aligned
 /// (projection subquery LIMIT/OFFSET appear before outer WHERE in SQL text).
-#[tokio::test]
-async fn by_pk_with_nested_children_returns_row() {
-    let pool = seed_parents_children().await;
+pub async fn by_pk_with_nested_children_returns_row(db: Db) {
+    let pool = seed_parents_children(&db).await;
     let engine = parent_child_engine(pool);
     let s = session("user", "u");
     let data = exec_json(
@@ -329,9 +301,8 @@ async fn by_pk_with_nested_children_returns_row() {
     assert!(ids.contains(&"c1") && ids.contains(&"c2"), "{data}");
 }
 
-#[tokio::test]
-async fn json_looking_string_column_stays_string() {
-    let pool = seed_orders().await;
+pub async fn json_looking_string_column_stays_string(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     let s = session("user", "tenant-a");
     let data = exec_json(&engine, &s, r#"{ orders_by_pk(order_id: "o1") { note } }"#).await;
@@ -341,4 +312,78 @@ async fn json_looking_string_column_stays_string() {
         data["orders_by_pk"]["note"]
     );
     assert_eq!(data["orders_by_pk"]["note"], "{\"looks\":\"json\"}");
+}
+
+/// A multi-role application surface executes with the intersection of its
+/// schema roles' row policies: every opener is held to the most restrictive
+/// combination, never to whichever role sorts first.
+pub async fn application_surface_with_differing_row_policies_applies_all_of_them(db: Db) {
+    let pool = seed_orders(&db).await;
+    let roles = ["admin".to_string(), "user".to_string()];
+    let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
+        .service_id("orders-service")
+        .roles(&["admin", "user"])
+        .model::<OrderView>(
+            ModelPermissions::new()
+                .grant("admin", read().all_columns().aggregations())
+                .grant(
+                    "user",
+                    read()
+                        .all_columns()
+                        .aggregations()
+                        .rows(col("customer_id").eq(claim("x-user-id"))),
+                ),
+        )
+        .client_application_surface("console", roles.clone(), roles.clone())
+        .protocol_token_key([7; 32])
+        .build()
+        .unwrap();
+    let manifest = engine
+        .client_manifest_for_application("console", &["admin", "user"], &["admin", "user"])
+        .unwrap();
+    let request = |query: &str| -> Request {
+        serde_json::from_value(serde_json::json!({
+            "query": query,
+            "extensions": { "distributed": { "client": {
+                "surface": {
+                    "kind": "application",
+                    "name": "console",
+                    "eligible_roles": roles,
+                    "schema_roles": roles,
+                },
+                "schemaHash": manifest.schema_fingerprint,
+            }}}
+        }))
+        .unwrap()
+    };
+
+    for role in ["user", "admin"] {
+        let principal = session(role, "tenant-b");
+        for (query, expected) in [
+            (
+                "{ orders { order_id customer_id } }",
+                serde_json::json!({ "orders": [{ "order_id": "o3", "customer_id": "tenant-b" }] }),
+            ),
+            (
+                r#"{ orders_by_pk(order_id: "o1") { order_id } }"#,
+                serde_json::json!({ "orders_by_pk": null }),
+            ),
+            (
+                "{ orders_aggregate { aggregate { count } nodes { order_id } } }",
+                serde_json::json!({ "orders_aggregate": {
+                    "aggregate": { "count": 1 },
+                    "nodes": [{ "order_id": "o3" }],
+                }}),
+            ),
+        ] {
+            let resp = engine.execute(&principal, request(query)).await;
+            assert!(resp.errors.is_empty(), "{role} {query}: {:?}", resp.errors);
+            assert_eq!(
+                serde_json::to_value(&resp.data).unwrap(),
+                expected,
+                "{role} {query}"
+            );
+        }
+    }
 }

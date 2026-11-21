@@ -7,8 +7,8 @@ use distributed::read_model::ReadModelWritePlanBuilder;
 #[cfg(feature = "sqlite")]
 use distributed::table::TableSchemaRegistry;
 use distributed::{
-    Entity, InMemoryRepository, ProjectionArm, ProjectionEventSet, ProjectionExpression,
-    ProjectionMutationKind, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
+    Entity, InMemoryRepository, MutationKind, ProjectionArm, ProjectionEventSet,
+    ProjectionExpression, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
     ProjectionProgramError, ProjectionValue, ReadModelWorkspaceExt, ReadModelWritePlanStore,
     RowKey, RowValue, TableMutation, TableWritePlan,
 };
@@ -144,7 +144,7 @@ fn player_program() -> Result<ProjectionProgram, ProjectionProgramError> {
     let summary = model_operation::<PlayerSummary>(
         "upsert-summary",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         vec![projected("player_id")?],
         vec![ProjectionAuthoringField::set(
             "weapon_count",
@@ -154,14 +154,14 @@ fn player_program() -> Result<ProjectionProgram, ProjectionProgramError> {
     let player = model_operation::<Players>(
         "upsert-player",
         1,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         vec![projected("player_id")?],
         vec![projected("display_name")?],
     )?;
     let weapon = related_operation::<__DistributedPlayersEffectRelationship_weapons>(
         "upsert-weapon",
         2,
-        ProjectionMutationKind::UpsertRelated,
+        MutationKind::UpsertRelated,
         &player,
         vec![projected("weapon_id")?],
         vec![projected("acquired_at")?],
@@ -169,7 +169,7 @@ fn player_program() -> Result<ProjectionProgram, ProjectionProgramError> {
     let link = model_operation::<PlayerWeaponLinks>(
         "insert-link",
         3,
-        ProjectionMutationKind::Insert,
+        MutationKind::Insert,
         vec![projected("player_id")?, projected("weapon_id")?],
         Vec::new(),
     )?;
@@ -310,7 +310,7 @@ fn collision_projection_plan() -> TableWritePlan {
     let parent = model_operation::<CollisionParent>(
         "upsert-collision-parent",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         vec![ProjectionAuthoringField::set(
             "id",
             body_path::<PlayerState>("player_id").expect("player ID path"),
@@ -324,7 +324,7 @@ fn collision_projection_plan() -> TableWritePlan {
     let child = related_operation::<__DistributedCollisionParentEffectRelationship_children>(
         "upsert-collision-child",
         1,
-        ProjectionMutationKind::UpsertRelated,
+        MutationKind::UpsertRelated,
         &parent,
         vec![ProjectionAuthoringField::set(
             "child_id",

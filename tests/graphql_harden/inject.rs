@@ -1,16 +1,16 @@
 //! S* Injection red-team suite — real `GraphqlEngine::execute` only.
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 
 use super::common::{
-    assert_no_sql_leak, engine_all_columns, exec_json, seed_orders, session, OrderView,
+    assert_no_sql_leak, engine_all_columns, exec_json, seed_orders, session, Db, OrderView,
 };
 
 /// S1: response keys are GraphQL Names; free-form injection cannot reach SQL keys.
-#[tokio::test]
-async fn s1_response_key_field_selection_safe_roundtrip() {
-    let pool = seed_orders().await;
+pub async fn s1_response_key_field_selection_safe_roundtrip(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     let s = session("user", "x");
     let data = exec_json(&engine, &s, "{ orders { order_id status } }").await;
@@ -31,9 +31,8 @@ async fn s1_response_key_field_selection_safe_roundtrip() {
 }
 
 /// S2: unknown where keys fail closed under default strict_where (no silent ignore).
-#[tokio::test]
-async fn s2_unknown_where_key_fails_closed_without_sql_leak() {
-    let pool = seed_orders().await;
+pub async fn s2_unknown_where_key_fails_closed_without_sql_leak(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     let s = session("user", "x");
     assert!(engine.strict_where());
@@ -53,9 +52,8 @@ async fn s2_unknown_where_key_fails_closed_without_sql_leak() {
 }
 
 /// S3: `_like` wildcards are bound parameters, not SQL concatenation.
-#[tokio::test]
-async fn s3_like_wildcards_are_bound_and_safe() {
-    let pool = seed_orders().await;
+pub async fn s3_like_wildcards_are_bound_and_safe(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     let s = session("user", "x");
     let data = exec_json(
@@ -86,9 +84,8 @@ async fn s3_like_wildcards_are_bound_and_safe() {
 }
 
 /// S4: JSON-looking text column stays a GraphQL String (not re-typed).
-#[tokio::test]
-async fn s4_json_looking_string_stays_string() {
-    let pool = seed_orders().await;
+pub async fn s4_json_looking_string_stays_string(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     let s = session("user", "tenant-a");
     let data = exec_json(&engine, &s, r#"{ orders_by_pk(order_id: "o1") { note } }"#).await;
@@ -97,9 +94,8 @@ async fn s4_json_looking_string_stays_string() {
 }
 
 /// S5: garbage order_by direction coerces safely (no raw SQL direction).
-#[tokio::test]
-async fn s5_order_by_junk_direction_is_safe() {
-    let pool = seed_orders().await;
+pub async fn s5_order_by_junk_direction_is_safe(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     let s = session("user", "x");
     // Unknown enum may fail GraphQL validation or coerce — either way no SQL leak.
@@ -119,9 +115,8 @@ async fn s5_order_by_junk_direction_is_safe() {
 }
 
 /// S6: PK type confusion — wrong type yields error or empty without SQL leak.
-#[tokio::test]
-async fn s6_pk_type_confusion_does_not_leak_sql() {
-    let pool = seed_orders().await;
+pub async fn s6_pk_type_confusion_does_not_leak_sql(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     let s = session("user", "x");
     // order_id is Text; pass a non-string via variable-less int if schema allows —
@@ -139,10 +134,10 @@ async fn s6_pk_type_confusion_does_not_leak_sql() {
 }
 
 /// S2b: denied where column fails closed under default strict_where.
-#[tokio::test]
-async fn s2_denied_where_column_fails_closed() {
-    let pool = seed_orders().await;
+pub async fn s2_denied_where_column_fails_closed(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["restricted"])
         .model::<OrderView>(
             ModelPermissions::new().grant("restricted", read().columns(["order_id", "status"])),

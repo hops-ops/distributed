@@ -40,7 +40,7 @@ pub struct EmbeddedSkill {
     pub files: &'static [EmbeddedFile],
 }
 
-static SKILLS: [EmbeddedSkill; 4] = [
+static SKILLS: [EmbeddedSkill; 5] = [
     EmbeddedSkill {
         name: "distributed-usage",
         description: "Build Distributed CQRS/event-sourced Rust services where you mostly write models and handlers while the framework and distributed generate persistence, transports, manifests, and deploy wiring. Use model-first TDD to specify plain aggregate behavior with fast unit tests before implementing models and thin handlers. Use when designing, testing, writing, or modifying a Distributed service or domain model.",
@@ -71,6 +71,13 @@ static SKILLS: [EmbeddedSkill; 4] = [
         files: &[EmbeddedFile {
             relative_path: "SKILL.md",
             contents: include_str!("../skills/distributed-graphql/SKILL.md"),
+        }],
+    },    EmbeddedSkill {
+        name: "distributed-game",
+        description: "Build authoritative game zones with distributed_game - a plain Rust Zone for the simulation, replicated entities with interest management, durable facts settled into cells, and zones that watch world cells as pushed read models. Use when writing or scaling a game zone, its facts, its replication, or its world cells (native host or celld).",
+        files: &[EmbeddedFile {
+            relative_path: "SKILL.md",
+            contents: include_str!("../skills/distributed-game/SKILL.md"),
         }],
     },
 ];

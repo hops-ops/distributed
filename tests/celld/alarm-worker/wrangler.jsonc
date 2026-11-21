@@ -1,0 +1,22 @@
+{
+  "name": "distributed-ticker-cell",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "TICKER", "class_name": "TickerCell" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["TickerCell"] }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "OUTBOX", "queue": "distributed-ticker-outbox" }
+    ]
+  },
+  "vars": {
+    "DISTRIBUTED_INTERNAL_SECRET": "test-only-internal-secret-change-me-2026",
+    "OUTBOX_DRAIN_INTERVAL_MS": "5000"
+  }
+}

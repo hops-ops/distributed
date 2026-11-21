@@ -70,10 +70,7 @@ mod tests {
 
     #[test]
     fn local_chain_closeout_accepts_matching_predecessors() {
-        let app = ArtifactIdentity::new(
-            ContractArtifactKind::ApplicationManifest,
-            "sha256:app",
-        );
+        let app = ArtifactIdentity::new(ContractArtifactKind::ApplicationManifest, "sha256:app");
         let plan = ArtifactIdentity::new(ContractArtifactKind::DeploymentPlan, "sha256:plan");
         let result = close_local_contract_chain(&app, &plan, true, None);
         assert!(result.diagnostics.is_empty());
@@ -90,10 +87,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("a.js"), b"1").unwrap();
-        let app = ArtifactIdentity::new(
-            ContractArtifactKind::ApplicationManifest,
-            "sha256:app",
-        );
+        let app = ArtifactIdentity::new(ContractArtifactKind::ApplicationManifest, "sha256:app");
         let plan = ArtifactIdentity::new(ContractArtifactKind::DeploymentPlan, "sha256:plan");
         let program = ClientProgramDescriptor::builder("e2e-ui")
             .surface(ClientProgramSurface {

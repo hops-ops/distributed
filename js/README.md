@@ -51,6 +51,12 @@ to validate that committed artifacts are current without rewriting them.
 
 A co-located route document can opt into SSR and live continuation:
 
+Row-filtered `@live` queries remain subscribed using authorized replacement
+snapshots; cursor-capable queries retain resumable delivery. Neither requires
+application polling. The v5 wire protocol uses `live.mode` (`snapshot` or
+`resumable`), replacing `live.supported`; upgrade client and server together.
+See [live query delivery](../docs/live-query-delivery.md).
+
 ```graphql
 query Todos @load @live {
   todos(order_by: [{ status: asc }, { todo_id: asc }]) {
@@ -167,7 +173,8 @@ import {
 } from '@hops-ops/distributed/sveltekit';
 
 export default defineGraphqlIslandBindings({
-  query: searchParam('q'),
+  query: searchParam('q', 'String'),
+  offset: searchParam('offset', 'Int'),
   viewerId: sessionClaim('user', 'id'),
   filters: forwardedProp('filters')
 });
@@ -180,6 +187,31 @@ then sidecar/route sources, then GraphQL defaults. A non-null variable without
 any of those sources fails generation before transport. Central `boundaries`
 registrations remain an explicit-placement escape hatch and cannot be combined
 with a sidecar for the same operation.
+
+Search bindings require an explicit built-in GraphQL scalar: `String`, `ID`,
+`Int`, `Float`, or `Boolean`. Generation and runtime registration reject a
+scalar or list shape that differs from the operation variable. For example,
+`$offset: Int! = 0` with `searchParam('offset', 'Int')` resolves `?offset=20`
+to the number `20`; an absent parameter retains the GraphQL default `0`.
+`searchParam('id', 'ID', 'all')` binds repeated parameters to an `[ID!]` list
+in URL order. Default `first` mode selects the first repeated value. Absent
+parameters are omitted in both modes; nullable omission and required-variable
+errors follow the operation codec. An empty string is a present value.
+
+Int and Float use strict decimal syntax, with no trimming, partial parsing,
+hexadecimal, or leading plus/zeroes. Float additionally accepts a fraction
+and/or exponent. Boolean accepts only `true` and `false`; String and ID retain
+decoded URL text. Invalid values fail before transport, and errors omit their
+contents. The operation codec still enforces Int's signed 32-bit range, list
+limits, defaults, and canonical identity. JSON, enum and custom-scalar decoding
+are not inferred from URL text.
+
+This is a breaking binding/adapter-plan v2 change: migrate `searchParam('q')`
+to `searchParam('q', 'String')`, and the old second `all` argument to the third
+argument after the scalar. Raw `search_param` sources must also include
+`scalar`. Regenerate all boundary plans together with the runtime; v1 plans
+and hydration fingerprints cannot be reused. Missing multi-value parameters
+now preserve GraphQL defaults instead of producing an empty list.
 
 The application lifecycle runs the client compiler before Vite starts and after
 declared GraphQL, binding, or Svelte ownership inputs change. Vite consumes the
@@ -304,6 +336,36 @@ await client.prefetchLocation(target.pathname, {
 });
 ```
 
+### Optional lazy command loading
+
+For read-heavy applications, switch the root layout's generated provider import:
+
+```ts
+import { provideDistributedLazy as provideDistributed } from '$distributed';
+```
+
+Use the same provider options and `useCommands()` methods. The lazy provider
+registers the generated surface authority immediately after hydration, and imports
+one shared command runtime and its definitions on the first command. Queries,
+SSR, hydration, and route prefetch keep their existing behavior. The default
+`provideDistributed` and framework-neutral `createCommands` remain eager.
+
+To load command code before an interaction, call `await client.preloadCommands()`
+when opening an editor or focusing an editing control. This imports code without
+sending a command. The first cold command waits for this import before optimistic
+feedback can appear; failed imports reject and can be retried. Imports never
+replay commands. Pending receipts and status recovery remain owned by the shared
+client across route changes. On controlled reload, an existing
+`reload.recoverPendingCommands` callback runs after lazy command code is ready;
+applications still own that callback's recovery policy.
+
+Regenerate the client with the matching CLI/runtime release to obtain
+`provideDistributedLazy` and `createLazyCommands`. Framework-neutral consumers
+can use `createLazyCommands` from the generated `lazy-commands.js` module and
+call its `preload()` method. Directly importing `COMMANDS`, command artifacts,
+`createCommands`, or command-dependent pure functions elsewhere in the browser
+can keep those definitions eager. Verify the production bundle for your app.
+
 Route components import only their generated surface. Static operation wrappers
 resolve the nearest tree-local client when used:
 
@@ -325,8 +387,23 @@ once. Components do not generate IDs or maintain optimistic/cache recipes.
 `@load` results are normalized on the server, dehydrated, and restored in the
 browser without a duplicate first request. Hydration cannot authorize itself:
 the server sends a separate authority value, and the adapter requires both
-values to match. Session, token, tenant, or role changes abort HTTP and live
-work, discard the old generation, and reconnect under server-issued scope.
+values to match. Credential changes abort old HTTP and live work. Without fresh
+server evidence, they also discard the old generation. A refreshed credential
+received together with a new authorized seed for the exact active scope can
+keep the warm replica and pending optimism. The seed proves authorization;
+its data does not overwrite newer local command results or freshness floors.
+`createPageDataSessionSource`
+provides that transfer automatically; custom session sources can supply
+`getHydration()` alongside `getAuth()`. Never derive this authority from a JWT
+or reuse an old transfer. Logout, changed scopes, and invalid hydration still
+purge the generation.
+
+The sample auth refresh endpoint returns an authorized seed for the current
+route before invalidating SvelteKit page data. Follow-up data loads and ordinary
+SPA navigation execute their bounded server selections too: those requests can
+rotate credentials independently and need their own fresh authority. Routes
+without selections still do no GraphQL work. See
+[session refresh continuity](../docs/session-refresh-continuity.md).
 
 Confirmed records and indexes under an active scope stay until auth/scope
 change, stale+revalidate, or a newer authoritative write. Same-scope soft
@@ -336,6 +413,184 @@ keys the seed omitted (a page dehydrate is only the subset for that route).
 Use a separate generated surface and replica for elevated routes. A normal
 client cannot import or mix admin artifacts. Configure it as a separate virtual
 module such as `$distributed/admin` and provide it only in the elevated layout.
+
+### Game zones in SvelteKit
+
+`distributed_game` zones get three pieces; the canvas, render loop and
+entity drawing stay outside Svelte, and game state is never server-rendered.
+Svelte 5.7+ is required (`svelte/reactivity`). A runnable example is
+[`examples/game/sveltekit`](../examples/game/sveltekit); it also reads the
+players' settled progress from a Distributed service's SQL read model with
+generated `@load @live` GraphQL (`clients` next to `games`, under
+`distributed dev|build`).
+
+**1. Generated game clients from the Vite plugin.** Add `games` to the same
+plugin. Each surface runs `distributed game-manifest` → `game-client` →
+`game-wasm` (the `#[predict]` step and `#[game_pure]` functions) when Vite
+starts, when the zone's Rust sources change (a full reload follows only if
+an output changed), and once per `vite build`. In `vite dev` a failing run
+(a Rust compile error, say) is logged and shown in the error overlay — also
+to overlays opened later — and the server keeps serving the last generated
+client until the next change succeeds; `vite build` (and `build --watch`)
+fails instead; Vite emits the WebAssembly as
+an asset through the generated `new URL('./wasm/<surface>.wasm',
+import.meta.url)`. Game surfaces are not lifecycle outputs, so a games-only
+app runs under plain `vite dev` / `vite build`; GraphQL `clients` still need
+`distributed dev` / `distributed build`.
+
+```js
+// distributed.config.js
+export const distributedViteOptions = {
+  games: [{
+    manifest: {
+      args: ['game-manifest', '--manifest-path', '../game/Cargo.toml',
+        '--entrypoint', 'my_game::pit::game_surface']
+    },
+    out: 'src/lib/generated/pit',
+    watch: ['../game-sim'] // extra crates whose changes regenerate (optional)
+    // wasm: 'auto' (default) | false | { manifestPath }
+    // importExtension: 'ts' (default) | 'js' | 'none'
+  }]
+};
+// vite.config.ts: plugins: [distributedSvelteKit(distributedViteOptions), sveltekit()]
+```
+
+Generated game clients are build outputs, like the GraphQL clients: gitignore
+the whole `out` directory (TypeScript and `wasm/`) and never commit it, so it
+cannot drift from the Rust surface. Anything that type-checks before Vite
+runs (`svelte-check`, `tsc`) generates first with
+`generateDistributedGames(distributedViteOptions)` from
+`@hops-ops/distributed/sveltekit/vite` (the full pipeline once), e.g. a
+`scripts/games.mjs` run by your `check` script. `checkDistributedGames`
+(`game-client --check`, never writes) after a generation verifies it is
+deterministic. `command` / `commandArgs` choose the CLI exactly as for
+GraphQL clients.
+
+Outside SvelteKit, any Vite app uses `@hops-ops/distributed/game/vite`:
+`distributedGames({ cwd, command, commandArgs, games })` is the same
+games-only plugin, with `generateDistributedGames` / `checkDistributedGames`
+taking the same options:
+
+```ts
+// vite.config.ts
+import { distributedGames } from '@hops-ops/distributed/game/vite';
+export default defineConfig({ plugins: [distributedGames({ games: [/* … */] })] });
+```
+
+**2. Session-bound tickets** (`@hops-ops/distributed/sveltekit/game/server`,
+server-only). The route mints the zone server's HS256 admission ticket
+(PROTOCOL.md §8) with WebCrypto, so the shared secret stays on the SvelteKit
+server and no extra admission service is needed:
+
+```ts
+// src/lib/server/game.ts
+import { env } from '$env/dynamic/private';
+import { createGameTicketHandler } from '@hops-ops/distributed/sveltekit/game/server';
+
+export const tickets = createGameTicketHandler({
+  secret: () => env.GAME_TICKET_SECRET,          // the zone servers' TicketKey (>= 32 bytes)
+  getSession: (event) => event.locals.auth(),    // the same session source as GraphQL
+  zone: ({ principal, requested }) => zoneFor(principal) // decided here, never by the body
+});
+// src/routes/api/game/ticket/+server.ts
+export const POST = tickets;
+// a +page.server.ts load: const { zone, principal } = await tickets.resolve(event)
+```
+
+The principal is `session.user.id` (override with `principal(session)`;
+`name(session)` sets the ticket's display name). The handler answers 403
+unless the `Origin` is the app's own (`allowedOrigins` adds more) and
+`Sec-Fetch-Site`, when sent, is `same-origin`; 401 without a session; 429
+over the per-principal limit (default 10 per minute, in memory;
+`rateLimit: { max, windowMs }`, a custom `{ take(key, now) }` returning a
+boolean or a promise of one, or `false`); 400 for any body field other than
+`zone` / `role` (so a body cannot name the principal, an owner or a reward);
+409 with the server's zone when the requested zone differs; 403 when `zone`
+returns nothing; 503 without a valid secret. Every response is
+`cache-control: no-store`. Tickets live 60 s by default (`ttlSeconds` ≤ 300)
+and are single use on the zone server.
+`mintGameTicket({ secret, principal, zone, role, name, extensions })` signs one directly.
+
+Extension claims (match id, team, party) come from the server-side
+`claims({ principal, zone, role, session, event })` callback — never from the
+body — and are signed under the ticket's `ext`; the zone server admits them
+only against its declared `TicketExtension` schema
+(`ServerConfig::with_ticket_extensions`). Names that look like identity,
+rewards or economy values (`TRUSTED_FIELD_DENYLIST`, the same list as the
+Rust derives) and objects over 2 KiB are refused with 400 `invalid_claims`.
+
+The default limiter counts per process, so N instances behind a load
+balancer allow N× the budget. Share it through Redis (or any store that runs
+Redis Lua) with `createRedisGameTicketRateLimiter`. It imports no Redis
+package: pass your connected node-redis client (`sendCommand`) or ioredis
+client (`call`), or `eval(script, keys, args)` for anything else (cluster
+clients, a pooled wrapper):
+
+```ts
+import { createClient } from 'redis';
+import {
+  createGameTicketHandler,
+  createRedisGameTicketRateLimiter
+} from '@hops-ops/distributed/sveltekit/game/server';
+
+const redis = await createClient({ url: env.REDIS_URL }).connect();
+export const tickets = createGameTicketHandler({
+  // …
+  rateLimit: createRedisGameTicketRateLimiter({
+    client: redis,
+    prefix: 'mygame:ticket:',  // default 'distributed:game-ticket:' + principal
+    limit: 10,
+    windowMs: 60_000,
+    timeoutMs: 1_000,          // slower store calls count as errors (default)
+    onUnavailable: 'closed',   // default; 'open' = no limit while the store is down
+    onError: (error) => log.warn({ error }, 'ticket limiter store')
+  })
+});
+```
+
+One atomic `EVAL` (`GAME_TICKET_RATE_LIMIT_SCRIPT`) keeps a sliding-window
+log per principal in a sorted set: it drops entries older than the window,
+refuses when `limit` remain, else adds one, and expires the key with the
+window. Refused requests are not counted, matching the in-memory limiter.
+The timestamp is the instance clock, so keep instances NTP-synchronized.
+
+**Store unreachable:** a store error, a timeout or an unexpected reply makes
+the limiter reject, and the handler answers **503 `rate_limit_unavailable`**
+(fail closed — ticket issuance stops rather than run unlimited; the message
+carries no store details, which go to `onError`). `onUnavailable: 'open'`
+admits instead. The same applies to any custom limiter: a `take` that
+throws or rejects is a 503, never an allow.
+
+**3. Runes state for the UI around the game**
+(`@hops-ops/distributed/sveltekit/game`, browser-safe):
+
+```svelte
+<script lang="ts">
+  import { gameTicketSource, useGame } from '@hops-ops/distributed/sveltekit/game';
+  import { createPitClient, EVENTS } from '$lib/generated/pit/index.ts';
+  let { data } = $props();
+  const game = useGame(
+    () => createPitClient({ url: (z) => `${data.zonesUrl}/zones/${z}`, ticket: gameTicketSource() }),
+    { zone: () => data.zone, events: EVENTS }
+  );
+  const profile = game.latest('profile');          // typed by the generated EVENTS
+  const kills = game.events('kill', { limit: 10 }); // newest first
+  $effect(() => game.client && startRenderLoop(canvas, game.client)); // your rAF loop
+</script>
+<p>{game.status} · {game.zone} · {game.rttMs ?? '–'} ms · {game.predictionReady ? 'predicted' : '…'}</p>
+<p>XP {profile.current?.xp ?? 0} · last kills {kills.items.length}</p>
+```
+
+`useGame` builds the client on mount (browser only, nothing during SSR),
+joins the zone and closes it on destroy, which includes navigation.
+`createGameState(source | factory, { events })` is the same state without the
+lifecycle (`connect(zone)`, `dispose()`). Getters — `status`, `connected`,
+`zone` (follows handoffs), `rttMs`, `jitterMs`, `predictionReady`, `error`,
+`client`, `source` — and `latest(name).current` / `events(name).items` are
+reactive through `createSubscriber`: an unchanged value does not re-run
+effects. `on(name, handler)` subscribes a callback (e.g. to set the
+controlled entity from a `hello`). `gameTicketSource({ endpoint })` POSTs
+`{ zone, role }` to the ticket route with the session cookie.
 
 ## Framework-neutral replica
 
@@ -394,6 +649,14 @@ same replica and GraphQL transport. A command call:
      (`confirmDirectProjection`) before the call settles. The server waited in
      the command handler because it could; an event handler cannot.
 
+An Eventual command may be terminal `succeeded` at a cell boundary while its
+status envelope already carries every exact projection observation. Those
+observations settle `receipt.projected` because they prove delivery of the
+projection obligation; they do not retire the accepted optimistic layer. The
+layer is retired only by a matching canonical query or live frame, so an
+`@load` operation does not need to become `@live` merely to complete a causal
+wait. A later query or navigation can still supply that canonical frame.
+
 Applications do not provide list targets, merge functions, mutation update
 callbacks, board simulators, or invalidation maps. If the compiler cannot prove
 safe maintenance, the generated plan marks the affected projection stale and
@@ -449,6 +712,26 @@ confirmed-state-only, and governed by generated/application model policy.
 Optimistic layers, command inputs, credentials, cache authority, and live
 connections are never persisted as replica data.
 
+The same persistence object offers an opt-in durable command outbox for
+offline use. It decorates the command transport: commands whose policy is
+explicitly `{ durable: true, sensitive: false }` are written to IndexedDB
+before they are sent and drained in order with their original command ids
+(the server's receipts deduplicate resends). Rejections surface to the live
+caller as `REPLICA_COMMAND_REJECTED` and, for commands replayed after a
+reload, through `onSettled`. Only the prepared request is stored — never
+optimistic state — and entries replay only under the same cache scope.
+
+```ts
+const outbox = persistence.commandOutbox({
+  transport,                       // the network command transport
+  scope: () => currentAuthoritativeScope,
+  policy: { commands: { 'todo.create': { durable: true, sensitive: false } } },
+  onSettled: ({ commandId, outcome }) => console.info(commandId, outcome)
+});
+const commands = createCommands(replica, outbox.transport);
+addEventListener('online', () => void outbox.drain());
+```
+
 Diagnostics are also opt-in:
 
 ```ts
@@ -467,6 +750,150 @@ collection. Defaults pseudonymize identities and omit values, arguments,
 credentials, trusted presets, raw command inputs, and cache scope. Revealing
 additional development detail requires an in-process capability plus an
 explicit redactor.
+
+## Game zones
+
+`@hops-ops/distributed/game` speaks the `distributed_game` binary protocol
+(golden-tested against the Rust fixtures). In SvelteKit, see
+[game zones in SvelteKit](#game-zones-in-sveltekit) for session tickets,
+Vite-generated clients and runes state. The app supplies tickets — a
+function, so a fresh single-use ticket is fetched whenever a reconnect token
+can no longer be used — and a pure `predict` for its own entity. With a
+[generated client](#generated-game-clients) that `predict` is the zone's
+own Rust step compiled to WebAssembly; the hand-written form below is the
+low-level API.
+
+```ts
+import { GameClient, InputPacer } from '@hops-ops/distributed/game';
+
+const game = new GameClient<{ dx: number; dy: number }>({
+  url: (zone) => `wss://game.example/zones/${zone}`,
+  ticket: ({ zoneId, role }) => api.mintZoneTicket(zoneId, role),
+  prediction: {
+    encodeInput: ({ dx, dy }) => new Uint8Array([dx & 0xff, dy & 0xff]),
+    predict: (s, i, dt) => ({ x: s.x + i.dx * 10 * dt / 1000, y: s.y + i.dy * 10 * dt / 1000 }),
+    // `snapAbove`: a larger error (a respawn, a teleport) cuts instead of sliding.
+    corrections: { avatar: { x: { mode: 'ease', durationMs: 120, snapAbove: 2 }, hp: { mode: 'replace' } } }
+  }
+});
+await game.connect('room-1');
+game.on('event', (zone, e) => { /* e.g. announce the controlled entity */ });
+game.setControlledEntity(myEntityId);
+// One input per server tick, whatever the display refresh rate.
+const pacer = new InputPacer({ tickRate: () => game.authority?.connection.welcome?.tickRate });
+requestAnimationFrame(function frame(now) {
+  pacer.update(now, (dtMs) => game.sendInput(readStick(), dtMs));
+  draw(game.render());
+  requestAnimationFrame(frame);
+});
+```
+
+`render()` merges the authoritative zone and observed neighbours (`observe`;
+`watchZones(game, around)` keeps the zones `around(authority)` observed
+across handoffs, lets go of closed ones and retries them every 3 s — zones
+hosted as celld objects treat observers as passive watchers that never wake
+a sleeping zone, which refuses them with `GameErrorCode.ASLEEP`; unless
+they are *near*: `watch.setNear(zones)` / `game.setNear(zone, near)` /
+`observe(zone, { near: true })` tell the zone without reconnecting, and a
+near watcher whose ticket grants `wake` — `mintGameTicket({ wake })`, the
+ticket handler's server-side `wake(context)` — wakes the zone and keeps it
+awake; a sleeping zone that becomes near is retried at once)
+sampled at `serverNow − interpolationDelay`, with the controlled entity at
+its predicted state. The delay is **adaptive** per zone by default
+(`AdaptiveDelay`: `rtt / 2 + 2 patch intervals + 2 × jitter`, clamped to
+`[2 patches, 800 ms]`, slewed ≤ 25 ms per 100 ms; tune with
+`adaptiveDelay: { minMs, maxMs, slewMs, patchIntervals, jitterFactor }`,
+inspect with `client.adaptiveDelay(zone)`): the clock estimates the
+server's *present*, so a fixed delay below the one-way latency would ask
+for states not yet received. A fixed `interpolationDelayMs: 100` (or a
+function of the zone) is still accepted. `client.setPredictionEnabled(false)`
+renders the controlled entity like any other (interpolated, one RTT behind
+the keys) while inputs keep being recorded, so switching back is seamless. Reconciliation rebases on
+every Delta's `ack_seq`; per-field `ease`, `snap` or `replace` resolves the
+divergence. A server Handoff connects to the target zone with the transfer
+ticket (following `Redirect`s) and swaps authority while the previous world
+keeps rendering; if the target refuses or stays silent the same Hello goes
+back to the source zone, then a fresh ticket. Meanwhile the controlled
+entity is held at its last predicted state; with `prediction.handoffFrame`
+(its predicted fields re-expressed in the target zone's frame, e.g. a cell
+offset for zone-local positions) it is predicted on instead, the inputs of
+the transfer go to the target once it welcomes the player, and the switch
+to the target's state is eased, so a border crossing shows no hold or jump.
+Inputs recorded before the controlled entity is known are replayed when it
+binds. `Kick(RELOAD)` and handshake
+`VERSION_MISMATCH` emit `reloadRequired`; supply `reloadContent` (or call
+`connection.resumeAfterReload(version)`) to rejoin with the new content.
+`client.contentVersion` follows the reload, so later handoff targets and
+observers present the new version; a client that patches content live
+(e.g. on a `resume` with a new version) calls `client.setContentVersion(v)`.
+`encodeInput(input, ctx)` receives the interpolation delay and view tick for
+server-side lag compensation (`replica.interpolationDelayMs`,
+`client.inputContext()`).
+`connection.stats` exposes cumulative bytes/messages in and out (Delta bytes
+separately) for bandwidth HUDs.
+
+### Generated game clients
+
+Rather than writing `encodeInput`, field names, event ids, correction
+tables or the prediction step by hand, generate them from the zone's Rust
+definitions: `distributed game-manifest` + `distributed game-client`
+(see the [`distributed_game` README](../distributed_game/README.md#generated-clients))
+write a typed module per zone that wraps this `GameClient` —
+`createArenaClient(options)`, `playerFields(entity)`, `encodeInput`,
+`sanitizeInput`, typed `on('hello', …)`. It builds on the SDK's typed
+payload codec (`encodePayload`, `decodePayload`, `sanitizePayload`,
+`WireType`) and helpers (`onGameEvent`, `decodeGameEvent`, `fieldNumber`,
+`mergeCorrections`), which hand-written code may use directly.
+
+**Prediction from WebAssembly.** When the zone declares its step with
+`#[predict]`, `distributed game-wasm` compiles it to
+`<generated>/wasm/<surface>.wasm` and the generated `create<Name>Client`
+predicts with it by default (`prediction: false` turns prediction off, a
+`predict` in `prediction` replaces it, `wasm` overrides where the module
+is loaded from). The client exposes the step as `prediction`:
+
+```ts
+const grid = createGridClient({ url, ticket });            // loads wasm/grid.wasm
+await grid.prediction?.ready;                              // instantiated
+grid.prediction?.setContext({ seed, cx: 3, cy: -2 });      // steps with a context
+```
+
+Underneath, `createWasmPrediction({ source, exportName, state, context,
+encodeInput })` wraps a `PredictModule` (`loadPredictModule(source)`:
+URL, `file:` URL in Node, bytes, `Response` or compiled module; one
+instance per URL) as a `PredictFn`. The ABI is binary: the controlled
+entity's predicted fields (`PredictStateLayout`, binary32 floats), the
+input payload and the context are written into the module's scratch
+buffer and the next state is read back — no JSON, no allocation across the
+boundary. Until the module is ready (and, for steps with a context, until
+`setContext`), `predict` leaves the state unchanged; the next
+reconciliation replays every pending input through the step. Cost
+(Node 24 / Chrome 156, Apple silicon): ~0.8–1.2 µs per predicted step, ~8–12 µs
+for a reconciliation replaying 10 pending inputs — well under 0.1 % of a
+33 ms frame at 30 Hz. Bundlers emit the module as an asset through
+`new URL('./wasm/<surface>.wasm', import.meta.url)` (Vite does out of the
+box); with `--import-extension js` copy `wasm/` next to the emitted
+JavaScript.
+
+**Shared logic and data.** Pure functions the zone declares with
+`#[game_pure]` are compiled into the same module; the generated
+`create<Name>Pures()` returns one typed, synchronous wrapper per function
+(plus `ready`, `loaded()`, `module()`) and shares the instance the
+prediction already loaded:
+
+```ts
+const pures = createGridPures();
+await pures.ready;
+const cell = pures.gridCell({ seed, cx: 3, cy: -2 }); // the server's own world generation
+```
+
+Underneath, `createWasmPures(source, specs)` calls
+`PredictModule.call(exportName, argBytes)` (`dg_pure_<fn>`, payload codec in
+and out; calls before `ready` throw). Static data the zone exports with
+`GameSurface::constant` arrives as generated constants (`constants.ts`), and
+records it serves (e.g. a content pack over HTTP) get generated
+`decode<Record>` / `encode<Record>` functions over `decodeValue` /
+`encodeValue`.
 
 ## Protocol and security boundaries
 
@@ -493,13 +920,29 @@ duplicated as decision documents in this package.
   primitives.
 - `@hops-ops/distributed/replica` — replica, GraphQL transport, generated
   command runtime, query-plan helpers, and optional persistence.
+- `@hops-ops/distributed/replica/lazy` — `createLazyReplicaCommandRuntime`
+  only, so a client that loads commands on demand (the generated lazy
+  `commands.ts`) keeps eager command exports out of its first import graph.
 - `@hops-ops/distributed/diagnostics` — redacted support snapshots and artifact
   inspection.
 - `@hops-ops/distributed/sveltekit` — Svelte stores, island SSR composition,
   hydration, auth lifecycle, and tree-local generated bindings.
-- `@hops-ops/distributed/sveltekit/vite` — public Vite plugin, virtual module
-  aliases, and GraphQL HTTP/WebSocket proxy helpers.
+- `@hops-ops/distributed/sveltekit/vite` — public Vite plugin (GraphQL
+  clients and `games` surfaces), virtual module aliases, GraphQL
+  HTTP/WebSocket proxy helpers, `generateDistributedGames` /
+  `checkDistributedGames`.
+- `@hops-ops/distributed/sveltekit/game` — runes state for the UI around a
+  game zone (`useGame`, `createGameState`) and `gameTicketSource`.
+- `@hops-ops/distributed/sveltekit/game/server` — server-only
+  `createGameTicketHandler` and `mintGameTicket` (session-bound zone tickets).
 - `@hops-ops/distributed/react` — provider and query hook over the same replica.
+- `@hops-ops/distributed/game` — binary `distributed_game` zone protocol
+  client: codec, `GameConnection` (handshake, reconnect, clock sync),
+  interpolating `EntityReplica`, `Predictor` reconciliation (with
+  `createWasmPrediction` for steps compiled from Rust, and `createWasmPures`
+  for pure functions compiled alongside them) and the multi-zone
+  `GameClient` with handoff, `AdaptiveDelay` and `InputPacer`.
+  See `distributed_game/PROTOCOL.md`.
 
 All other subpaths are private and blocked by the package export map.
 

@@ -50,121 +50,52 @@ struct MalformedView {
 fn generated_modeled_projector_program(
 ) -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
     use crate::mutation::{
-        body_field_binding, compile_projection, MutationAssignment, MutationConflictTarget,
-        MutationEventBinding, MutationExpression, MutationField, MutationKeyField, MutationKind,
-        MutationOperation, MutationProgram, ProjectionHandler,
+        body_field_binding, compile_projection, MutationColumn, MutationKind, MutationOperation,
+        MutationProgram, ProjectionHandler,
     };
     use crate::projection::{
         ProjectionEventSelector, ProjectionPartition, ProjectionTarget, ProjectionValueType,
     };
 
-    let string_path = |segments: &[&str]| {
-        MutationExpression::input_path(
-            ProjectionValueType::String,
-            segments.iter().copied().map(str::to_owned),
-        )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "task11-generated-multi-table".into(),
-            reason: e.to_string(),
-        })
-    };
-    let key_id = || {
-        MutationKeyField::try_new(0, "id", string_path(&["id"])?).map_err(|e| {
-            crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            }
-        })
-    };
-    let field = |ordinal, name, path: &[&str]| {
-        MutationField::try_new(ordinal, name, MutationAssignment::set(string_path(path)?)).map_err(
-            |e| crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            },
-        )
-    };
-    let primary = MutationOperation::try_new(
-        "upsert-primary",
-        0,
-        MutationKind::Upsert,
-        ProjectionTarget::try_new("PrimaryView", "task15_primary_views")?,
-        vec![key_id()?],
-        vec![field(0, "id", &["id"])?, field(1, "title", &["title"])?],
-        Some(MutationConflictTarget::PrimaryKey),
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "task11-generated-multi-table".into(),
-        reason: e.to_string(),
-    })?;
-    let secondary = MutationOperation::try_new(
-        "upsert-secondary",
+    let column = |name: &str| MutationColumn::try_new(name, ProjectionValueType::String, [name]);
+    let mutation = MutationProgram::try_new(
+        "task11_multi_mutation",
         1,
-        MutationKind::Upsert,
-        ProjectionTarget::try_new("SecondaryView", "task15_secondary_views")?,
-        vec![key_id()?],
-        vec![field(0, "id", &["id"])?, field(1, "title", &["title"])?],
-        Some(MutationConflictTarget::PrimaryKey),
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "task11-generated-multi-table".into(),
-        reason: e.to_string(),
-    })?;
-    let mutation_program =
-        MutationProgram::try_new("task11_multi_mutation", 1, vec![primary, secondary]).map_err(
-            |e| crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            },
-        )?;
+        vec![
+            MutationOperation::try_new(
+                "upsert-primary",
+                MutationKind::Upsert,
+                ProjectionTarget::try_new("PrimaryView", "task15_primary_views")?,
+                vec![column("id")?],
+                vec![column("id")?, column("title")?],
+            )?,
+            MutationOperation::try_new(
+                "upsert-secondary",
+                MutationKind::Upsert,
+                ProjectionTarget::try_new("SecondaryView", "task15_secondary_views")?,
+                vec![column("id")?],
+                vec![column("id")?, column("title")?],
+            )?,
+        ],
+    )?;
     let selector =
         ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor::state::<
             TodoChanged,
         >("task15.todo_changed", 1))?;
-    let bindings = vec![
-        body_field_binding(["id"], ["id"], ProjectionValueType::String).map_err(|e| {
-            crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            }
-        })?,
-        body_field_binding(["title"], ["title"], ProjectionValueType::String).map_err(|e| {
-            crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            }
-        })?,
-    ];
-    let binding =
-        MutationEventBinding::try_new(selector, bindings, mutation_program).map_err(|e| {
-            crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            }
-        })?;
     compile_projection(
         "task11-generated-multi-table",
         1,
         ProjectionPartition::Unit,
-        [ProjectionHandler::from_binding("changed", binding)],
+        [ProjectionHandler::try_new(
+            "changed",
+            selector,
+            vec![
+                body_field_binding(["id"], ["id"], ProjectionValueType::String)?,
+                body_field_binding(["title"], ["title"], ProjectionValueType::String)?,
+            ],
+            mutation,
+        )?],
     )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "task11-generated-multi-table".into(),
-        reason: e.to_string(),
-    })
-}
-
-#[cfg(feature = "graphql")]
-fn generated_modeled_projector_resolve(
-    occurrence: &crate::DomainEventOccurrence,
-) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-    crate::mutation::resolve_mutation_program(&generated_modeled_projector_program()?, occurrence)
 }
 
 #[cfg(feature = "graphql")]
@@ -208,12 +139,15 @@ fn generated_modeled_projector_inventory() -> Result<
 #[cfg(feature = "graphql")]
 const GENERATED_MODELED_PROJECTOR: crate::projection::lower::ProjectionDescriptor<
     crate::projection::lower::EventualOnly,
-> = crate::mutation::descriptor_from_factories(
+> = crate::projection::lower::ProjectionDescriptor::new(
     "task11-generated-multi-table",
     1,
     "task11-generated-v1",
-    generated_modeled_projector_program,
-    generated_modeled_projector_resolve,
+    || {
+        static PROGRAM: crate::projection::lower::ProjectionProgramCell =
+            crate::projection::lower::ProjectionProgramCell::new();
+        PROGRAM.get_or_build(generated_modeled_projector_program)
+    },
     generated_modeled_projector_lower,
     generated_modeled_projector_inventory,
 );
@@ -354,7 +288,7 @@ async fn explicit_modeled_projector_handler_applies_the_compiled_projection() {
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     assert!(invoked.load(Ordering::Acquire));
     let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
@@ -515,7 +449,7 @@ async fn the_same_catalog_program_executes_in_a_separate_projector_service() {
         .await
         .unwrap();
     projector_service
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .unwrap();
 
@@ -613,7 +547,7 @@ async fn generated_mount_applies_both_modeled_rows_through_one_causal_commit() {
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
     let primary = repository
@@ -683,7 +617,7 @@ async fn same_name_different_version_is_an_empty_unit_checkpoint_not_a_failure()
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
     let snapshot = repository
@@ -768,7 +702,7 @@ async fn public_builder_fans_one_fact_out_and_replays_partial_success_exactly() 
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
     assert_eq!(
         *calls.lock().unwrap(),
         vec!["primary", "secondary", "secondary"],
@@ -878,7 +812,7 @@ async fn service_fans_same_fact_out_across_projector_only_route_bundles() {
     bus.publish_message(fact_message("todo-2", "cross bundle"))
         .await
         .unwrap();
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     assert_eq!(INFERRED_PRIMARY_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
@@ -932,7 +866,7 @@ async fn malformed_ingress_emits_safe_handle_and_repair_restart_stays_terminal()
 
     let first = malformed_service(repository.clone(), Arc::clone(&invoked))
         .with_bus(bus.clone())
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect_err("malformed ingress must retain its exact position and stop");
     let first_handle = repair_handle(&first);
@@ -961,7 +895,7 @@ async fn malformed_ingress_emits_safe_handle_and_repair_restart_stays_terminal()
     );
     let second = repaired
         .with_bus(bus)
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect_err("unchanged malformed bytes must stop the repaired generation again");
     let second_handle = repair_handle(&second);
@@ -1012,7 +946,7 @@ async fn unrecorded_permanent_projector_failure_retains_and_stops_under_drop_pol
         .unwrap();
 
         let error = service
-            .run(RunOptions::idempotent().with_failure_policy(policy))
+            .run(RunOptions::until_idle().with_failure_policy(policy))
             .await
             .expect_err("unrecorded permanent projector failure must stop the runner");
         assert!(error.is_permanent());

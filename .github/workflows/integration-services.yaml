@@ -1,0 +1,39 @@
+name: Workspace Tests Against Real Services
+
+# Reusable workflow: referenced from the PR-quality and push-to-main pipelines.
+#
+# Runs the whole workspace with all features against the services in
+# compose.yaml (Postgres, RabbitMQ, Kafka, NATS, Redis) through
+# `make test-local`, the same command a developer runs.
+#
+# `make test-local` sets DISTRIBUTED_REQUIRE_SERVICES, so a test that cannot
+# reach its service fails here instead of returning early and reporting a
+# pass (tests/support/env.rs). There is no list of test targets to maintain:
+# a new service-backed test runs here as soon as it exists.
+on:
+  workflow_call:
+
+jobs:
+  services:
+    name: Workspace Tests (all features, real services)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-services
+      # --all-features compiles rdkafka; librdkafka's bundled cmake build needs
+      # curl/curl.h (the runner has libcurl's runtime but not its headers).
+      - name: Install librdkafka build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      - name: Run the workspace against compose services
+        run: make test-local CARGO_TEST_ARGS="--workspace --all-features --verbose"

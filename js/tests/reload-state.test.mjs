@@ -75,7 +75,7 @@ test('reload waits for replica authority and a resumed stale document reloads', 
 		participants: [{
 			key: 'public-surface',
 			replica: { records: [] },
-			pendingCommandIds: [],
+			pendingCommandIds: ['pending-command'],
 			state: []
 		}]
 	}));
@@ -124,8 +124,15 @@ test('reload waits for replica authority and a resumed stale document reloads', 
 			return true;
 		}
 	};
-	const unregister = registerDistributedReloadClient(replica, undefined, {
-		key: 'public-surface'
+	const recoveryOrder = [];
+	const unregister = registerDistributedReloadClient(replica, {
+		async preload() { recoveryOrder.push('preload'); },
+	}, {
+		key: 'public-surface',
+		async recoverPendingCommands(ids) {
+			assert.deepEqual(ids, ['pending-command']);
+			recoveryOrder.push('recover');
+		}
 	});
 	try {
 		await new Promise((resolve) => setTimeout(resolve, 50));
@@ -135,6 +142,7 @@ test('reload waits for replica authority and a resumed stale document reloads', 
 		scope = { tenant: 'tenant-1', roles: [] };
 		await waitFor(() => hydrations === 1, 'replica restoration was not retried');
 		assert.equal(values.get(capsuleKey), undefined);
+		assert.deepEqual(recoveryOrder, ['preload', 'recover']);
 
 		activeGeneration = 'generation-c';
 		await waitFor(() => reloads === 1, 'stale document did not reload after activation');

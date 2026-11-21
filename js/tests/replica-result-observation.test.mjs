@@ -116,7 +116,7 @@ function frame(revision, value, operation = Query.id) {
 				...(operation === Query.live.id
 					? {
 							live: {
-								supported: true,
+								mode: 'resumable',
 								reset: false,
 								cursors: [
 									{

@@ -6,8 +6,6 @@
 //! evidence, wraps its ordinary [`CommitBatch`] in the command-ledger fence,
 //! and is the only code allowed to commit it.
 
-#![cfg_attr(not(feature = "graphql"), allow(dead_code))]
-
 use std::collections::HashSet;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
@@ -16,19 +14,17 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
-use crate::aggregate::{hydrate, Aggregate, AggregateRepository};
+use crate::aggregate::{Aggregate, AggregateRepository};
+use crate::command::{
+    validate_resolved_direct_plan, Atomic, CommandCommitProofError, CommandOutcome,
+    PrepareCommandError, PreparedCommand, ProjectionCommitProof, ResolvedDirectProjectionTarget,
+    TypedCommandContract,
+};
 use crate::command_ledger::CausalGetStream;
 use crate::domain_event::{DomainEventCaptureError, DomainEventCommitGuardError};
-use crate::graphql::command_contract::{
-    validate_resolved_direct_plan, CommandCommitProofError, CommandOutcome, ProjectionCommitProof,
-    ResolvedDirectProjectionTarget, TypedCommandContract,
-};
-use crate::graphql::{Atomic, PrepareCommandError, PreparedCommand};
+use crate::microsvc::cell_host::ScheduleWrite;
 use crate::outbox::{OutboxMessage, PreparedDomainEvent};
-use crate::projection::lower::{
-    DirectCandidate, LoweredProjectionPlan, ProjectionDescriptor,
-    ProjectionServerExecutorDescriptor,
-};
+use crate::projection::lower::{LoweredProjectionPlan, ProjectionServerExecutorDescriptor};
 use crate::projection_protocol::SameTransactionProjectionBatch;
 use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
 use crate::repository::{CommitBatch, RepositoryError, SnapshotWrite, StreamIdentity, StreamWrite};
@@ -39,13 +35,20 @@ type LoadAggregateFuture<'a, A> =
 
 /// Erases the concrete backend from the handler-facing workspace while
 /// retaining the repository's explicitly non-locking causal load capability.
+///
+/// Both methods exist only for an aggregate: a route bundle with none (`()`)
+/// holds the same store and can call neither.
 trait CausalAggregateStore<A>: Send + Sync {
-    fn load<'a>(&'a self, identity: &'a StreamIdentity) -> LoadAggregateFuture<'a, A>;
+    fn load<'a>(&'a self, identity: &'a StreamIdentity) -> LoadAggregateFuture<'a, A>
+    where
+        A: Aggregate + Send + Sync + 'static;
 
     fn snapshot_writes(
         &self,
         aggregate: &A,
-    ) -> Result<(Vec<SnapshotWrite>, Option<u64>), RepositoryError>;
+    ) -> Result<(Vec<SnapshotWrite>, Option<u64>), RepositoryError>
+    where
+        A: Aggregate + Send + Sync + 'static;
 }
 
 struct AggregateStoreRef<'repo, R, A> {
@@ -55,22 +58,59 @@ struct AggregateStoreRef<'repo, R, A> {
 impl<R, A> CausalAggregateStore<A> for AggregateStoreRef<'_, R, A>
 where
     R: CausalGetStream,
-    A: Aggregate + Send + Sync + 'static,
+    A: Send + Sync + 'static,
 {
-    fn load<'a>(&'a self, identity: &'a StreamIdentity) -> LoadAggregateFuture<'a, A> {
-        Box::pin(async move {
-            let Some(entity) = self.repository.repo().get_causal_stream(identity).await? else {
-                return Ok(None);
-            };
-            hydrate::<A>(entity).map(Some)
-        })
+    fn load<'a>(&'a self, identity: &'a StreamIdentity) -> LoadAggregateFuture<'a, A>
+    where
+        A: Aggregate + Send + Sync + 'static,
+    {
+        Box::pin(async move { self.repository.get_causal(identity).await })
     }
 
     fn snapshot_writes(
         &self,
         aggregate: &A,
-    ) -> Result<(Vec<SnapshotWrite>, Option<u64>), RepositoryError> {
+    ) -> Result<(Vec<SnapshotWrite>, Option<u64>), RepositoryError>
+    where
+        A: Aggregate + Send + Sync + 'static,
+    {
         self.repository.snapshot_writes_for(aggregate)
+    }
+}
+
+/// A staged aggregate as the committer uses it. The workspace keeps staged
+/// aggregates behind this, so what it commits does not depend on the route
+/// bundle's aggregate type, or on there being one.
+trait StagedStream: Send + Sync {
+    fn staged_entity(&self) -> &crate::Entity;
+    fn staged_entity_mut(&mut self) -> &mut crate::Entity;
+    fn bind_event(
+        &self,
+        event: &PreparedDomainEvent,
+        ordinal: u32,
+    ) -> Result<crate::DomainEventOccurrence, DomainEventCaptureError>;
+    fn stamp_source(&self, message: &mut OutboxMessage);
+}
+
+impl<A: Aggregate + Send + Sync> StagedStream for A {
+    fn staged_entity(&self) -> &crate::Entity {
+        Aggregate::entity(self)
+    }
+
+    fn staged_entity_mut(&mut self) -> &mut crate::Entity {
+        Aggregate::entity_mut(self)
+    }
+
+    fn bind_event(
+        &self,
+        event: &PreparedDomainEvent,
+        ordinal: u32,
+    ) -> Result<crate::DomainEventOccurrence, DomainEventCaptureError> {
+        event.bind(self, ordinal)
+    }
+
+    fn stamp_source(&self, message: &mut OutboxMessage) {
+        message.set_source(self);
     }
 }
 
@@ -160,11 +200,13 @@ pub(crate) enum CausalWorkspaceError {
     DomainPublicationsAlreadyPrepared,
     DomainPublicationsNotPrepared,
     CommitBatchAlreadyPrepared,
+    Schedule(crate::schedule::ScheduleError),
 }
 
 impl std::fmt::Display for CausalWorkspaceError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Schedule(error) => write!(formatter, "schedule staging failed: {error}"),
             Self::Repository(error) => write!(formatter, "causal aggregate load failed: {error}"),
             Self::Table(error) => write!(formatter, "causal read-model staging failed: {error}"),
             Self::DomainEventCapture(error) => {
@@ -221,6 +263,7 @@ impl std::error::Error for CausalWorkspaceError {
             Self::DomainEventCapture(error) => Some(error),
             Self::DomainEventGuard(error) => Some(error),
             Self::Prepare(error) => Some(error),
+            Self::Schedule(error) => Some(error),
             Self::Poisoned
             | Self::IdentityChanged { .. }
             | Self::CommittedVersionChanged { .. }
@@ -265,9 +308,9 @@ impl From<PrepareCommandError> for CausalWorkspaceError {
     }
 }
 
-struct StagedAggregate<A> {
+struct StagedAggregate {
     identity: StreamIdentity,
-    aggregate: A,
+    aggregate: Box<dyn StagedStream>,
     snapshot_version: Option<u64>,
     publication: AggregatePublication,
 }
@@ -279,43 +322,32 @@ pub(crate) struct AggregatePublication {
     pub(crate) explicit_events: Vec<PreparedDomainEvent>,
 }
 
-struct WorkspaceState<A> {
-    aggregates: Vec<StagedAggregate<A>>,
+#[derive(Default)]
+struct WorkspaceState {
+    aggregates: Vec<StagedAggregate>,
     identities: HashSet<StreamIdentity>,
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
+    schedules: Vec<ScheduleWrite>,
     projection_staged: bool,
     modeled_direct_projection: Option<ProjectionServerExecutorDescriptor>,
 }
 
-impl<A> Default for WorkspaceState<A> {
-    fn default() -> Self {
-        Self {
-            aggregates: Vec::new(),
-            identities: HashSet::new(),
-            outbox_messages: Vec::new(),
-            read_model_plans: Vec::new(),
-            snapshots: Vec::new(),
-            projection_staged: false,
-            modeled_direct_projection: None,
-        }
-    }
-}
-
 /// A handler-scoped unit of work. The concrete repository is erased and never
 /// exposed through this type.
-pub(crate) struct CausalWorkspace<'repo, A>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
+///
+/// `A` is the route bundle's aggregate, or `()` for a bundle with none: such
+/// a workspace stages outbox messages and read-model plans, and no stream.
+pub(crate) struct CausalWorkspace<'repo, A> {
     store: Box<dyn CausalAggregateStore<A> + 'repo>,
-    state: Mutex<WorkspaceState<A>>,
+    state: Mutex<WorkspaceState>,
+    scheduling_declared: bool,
 }
 
 impl<'repo, A> CausalWorkspace<'repo, A>
 where
-    A: Aggregate + Send + Sync + 'static,
+    A: Send + Sync + 'static,
 {
     pub(crate) fn new<R>(repository: &'repo AggregateRepository<R, A>) -> Self
     where
@@ -324,9 +356,23 @@ where
         Self {
             store: Box::new(AggregateStoreRef { repository }),
             state: Mutex::new(WorkspaceState::default()),
+            scheduling_declared: false,
         }
     }
 
+    /// Whether the route declared `Capability::Scheduling` (schedule writes
+    /// are refused otherwise, so a host that cannot dispatch them is caught
+    /// at registration).
+    pub(crate) fn with_scheduling_declared(mut self, declared: bool) -> Self {
+        self.scheduling_declared = declared;
+        self
+    }
+}
+
+impl<A> CausalWorkspace<'_, A>
+where
+    A: Aggregate + Send + Sync + 'static,
+{
     /// Load a full stream through the explicit causal/non-locking capability.
     pub(crate) async fn load(
         &self,
@@ -403,19 +449,42 @@ where
         state.snapshots.append(&mut snapshots);
         state.aggregates.push(StagedAggregate {
             identity,
-            aggregate,
+            aggregate: Box::new(aggregate),
             snapshot_version,
             publication,
         });
         Ok(())
     }
+}
 
+impl<A> CausalWorkspace<'_, A> {
     pub(crate) fn stage_outbox(&self, message: OutboxMessage) -> Result<(), CausalWorkspaceError> {
         self.state
             .lock()
             .map_err(|_| CausalWorkspaceError::Poisoned)?
             .outbox_messages
             .push(message);
+        Ok(())
+    }
+
+    /// Stage a schedule write. It commits with the command's events or not at
+    /// all; the batch is bounded by `MAX_SCHEDULE_WRITES_PER_COMMAND`.
+    pub(crate) fn stage_schedule(&self, write: ScheduleWrite) -> Result<(), CausalWorkspaceError> {
+        if !self.scheduling_declared {
+            return Err(CausalWorkspaceError::Schedule(
+                crate::schedule::ScheduleError::NotDeclared,
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CausalWorkspaceError::Poisoned)?;
+        if state.schedules.len() >= crate::schedule::MAX_SCHEDULE_WRITES_PER_COMMAND {
+            return Err(CausalWorkspaceError::Schedule(
+                crate::schedule::ScheduleError::TooManyWrites,
+            ));
+        }
+        state.schedules.push(write);
         Ok(())
     }
 
@@ -465,22 +534,6 @@ where
         state.projection_staged = true;
         state.read_model_plans.push(plan);
         Ok(prepared)
-    }
-
-    /// Prepare a projected result whose exact row will be resolved from the
-    /// authoritative domain-event occurrence after the dispatcher stamps its
-    /// ledger causation.
-    pub(crate) fn prepare_modeled_atomic<M>(
-        &self,
-        projection: ProjectionDescriptor<DirectCandidate>,
-    ) -> Result<PreparedCommand<Atomic<M>>, CausalWorkspaceError>
-    where
-        M: RelationalReadModel + Serialize + Send + Sync + 'static,
-    {
-        let executor = projection
-            .server_executor()
-            .map_err(|error| CausalWorkspaceError::ModeledDirectProjection(error.to_string()))?;
-        self.prepare_modeled_atomic_from_executor(executor)
     }
 
     /// Placement-selected direct projection: the service registration chose the
@@ -540,7 +593,7 @@ where
         Ok(prepared)
     }
 
-    pub(crate) fn into_parts(self) -> Result<CausalWorkspaceParts<A>, CausalWorkspaceError> {
+    pub(crate) fn into_parts(self) -> Result<CausalWorkspaceParts, CausalWorkspaceError> {
         let state = self
             .state
             .into_inner()
@@ -550,6 +603,7 @@ where
             outbox_messages: state.outbox_messages,
             read_model_plans: state.read_model_plans,
             snapshots: state.snapshots,
+            schedules: state.schedules,
             domain_event_occurrences: Vec::new(),
             unpublished_direct_occurrences: HashSet::new(),
             modeled_direct_projection: state.modeled_direct_projection,
@@ -562,11 +616,12 @@ where
 
 /// Owned staged work retained by the dispatcher between handler completion and
 /// construction of the ledger-fenced commit batch.
-pub(crate) struct CausalWorkspaceParts<A> {
-    aggregates: Vec<StagedAggregate<A>>,
+pub(crate) struct CausalWorkspaceParts {
+    aggregates: Vec<StagedAggregate>,
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
+    schedules: Vec<ScheduleWrite>,
     /// Exact ledger-causation-stamped outward occurrences in publication order.
     domain_event_occurrences: Vec<crate::DomainEventOccurrence>,
     /// Captured occurrences consumed only by a direct modeled projection.
@@ -580,10 +635,7 @@ pub(crate) struct CausalWorkspaceParts<A> {
     batch_prepared: bool,
 }
 
-impl<A> CausalWorkspaceParts<A>
-where
-    A: Aggregate,
-{
+impl CausalWorkspaceParts {
     /// Bind publication intent to each aggregate's exact final transition after
     /// applying the ledger's authoritative causation ID.
     pub(crate) fn prepare_domain_publications(
@@ -599,9 +651,9 @@ where
         for staged in &mut self.aggregates {
             staged
                 .aggregate
-                .entity_mut()
+                .staged_entity_mut()
                 .overwrite_new_event_causation_id(causation_id);
-            let entity = staged.aggregate.entity();
+            let entity = staged.aggregate.staged_entity();
             entity.domain_event_commit_guard()?;
             let pending = entity.pending_domain_events_for_commit()?;
             if !pending.is_empty()
@@ -629,7 +681,7 @@ where
                     .extend(pending.iter().map(|occurrence| occurrence.id().to_owned()));
             }
 
-            let current_sequence = staged.aggregate.entity().version();
+            let current_sequence = staged.aggregate.staged_entity().version();
             let ordinal_base = pending
                 .iter()
                 .filter(|occurrence| occurrence.aggregate_sequence() == current_sequence)
@@ -639,7 +691,7 @@ where
                     .checked_add(offset)
                     .and_then(|ordinal| ordinal.try_into().ok())
                     .ok_or(DomainEventCaptureError::PublicationOrdinalOverflow)?;
-                let occurrence = event.bind(&staged.aggregate, ordinal)?;
+                let occurrence = staged.aggregate.bind_event(event, ordinal)?;
                 self.domain_event_occurrences.push(occurrence.clone());
                 self.outbox_messages
                     .push(OutboxMessage::from_domain_event_occurrence(&occurrence)?);
@@ -670,7 +722,7 @@ where
             contract,
             self.aggregates
                 .iter()
-                .any(|staged| !staged.aggregate.entity().new_events().is_empty()),
+                .any(|staged| !staged.aggregate.staged_entity().new_events().is_empty()),
             &self.outbox_messages,
             &self.read_model_plans,
             self.resolved_direct_projection.as_ref(),
@@ -774,7 +826,7 @@ where
                     && message.source_aggregate_id.is_none()
                     && message.source_sequence.is_none()
                 {
-                    message.set_source(&staged.aggregate);
+                    staged.aggregate.stamp_source(message);
                 }
             }
         }
@@ -782,12 +834,18 @@ where
         let streams = self
             .aggregates
             .iter_mut()
-            .map(|staged| StreamWrite::new(staged.identity.clone(), staged.aggregate.entity_mut()))
+            .map(|staged| {
+                StreamWrite::new(
+                    staged.identity.clone(),
+                    staged.aggregate.staged_entity_mut(),
+                )
+            })
             .collect();
         let mut batch = CommitBatch::new(streams);
         batch.outbox_messages = std::mem::take(&mut self.outbox_messages);
         batch.read_model_plans = std::mem::take(&mut self.read_model_plans);
         batch.snapshots = std::mem::take(&mut self.snapshots);
+        batch.schedules = std::mem::take(&mut self.schedules);
         Ok(batch)
     }
 
@@ -795,11 +853,14 @@ where
     pub(crate) fn mark_committed_state(&mut self) -> Result<(), CausalWorkspaceError> {
         for staged in &mut self.aggregates {
             if let Some(version) = staged.snapshot_version {
-                staged.aggregate.entity_mut().set_snapshot_version(version);
+                staged
+                    .aggregate
+                    .staged_entity_mut()
+                    .set_snapshot_version(version);
             }
             staged
                 .aggregate
-                .entity_mut()
+                .staged_entity_mut()
                 .mark_domain_events_committed()?;
         }
         Ok(())
@@ -816,8 +877,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::command::CommandTypeDef;
     use crate::entity::{Entity, EventRecord};
-    use crate::graphql::GraphqlTypeDef;
     use crate::table::{
         ColumnType, PrimaryKey, RowKey, RowValue, RowValues, TableColumn, TableKind, TableMutation,
         TableSchema,
@@ -897,85 +958,50 @@ mod tests {
         title: String,
     }
 
+    static MODELED_DIRECT_BUILDS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
     fn modeled_direct_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
         use crate::mutation::{
-            body_bindings_for_model, compile_projection, state_upsert_program_for_model,
-            MutationEventBinding, ProjectionHandler,
+            compile_projection, state_upsert_program_for_model, ProjectionHandler,
+            ProjectionInputSource,
         };
         use crate::projection::ProjectionEventSelector;
 
-        let program = state_upsert_program_for_model::<ModeledDirectView>(
-            "save_modeled_direct",
-            1,
-            "upsert-view",
-            "view",
-        )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "modeled-direct".into(),
-            reason: e.to_string(),
-        })?;
+        MODELED_DIRECT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let selector =
             ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor::state::<
                 CausalPublishedState,
             >("causal.created", 1))?;
-        let binding = MutationEventBinding::try_new(
-            selector,
-            body_bindings_for_model::<ModeledDirectView>("view").map_err(|e| {
-                crate::ProjectionProgramError::InvalidOperation {
-                    operation: "modeled-direct".into(),
-                    reason: e.to_string(),
-                }
-            })?,
-            program,
-        )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "modeled-direct".into(),
-            reason: e.to_string(),
-        })?;
         compile_projection(
             "modeled-direct-workspace",
             1,
             crate::ProjectionPartition::Unit,
-            [ProjectionHandler::from_binding("created", binding)],
+            [ProjectionHandler::try_new(
+                "created",
+                selector,
+                vec![ProjectionInputSource::Body.binding("view")?],
+                state_upsert_program_for_model::<ModeledDirectView>(
+                    "save_modeled_direct",
+                    1,
+                    "upsert-view",
+                    "view",
+                )?,
+            )?],
         )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "modeled-direct".into(),
-            reason: e.to_string(),
-        })
     }
 
-    fn modeled_direct_resolve(
-        occurrence: &crate::DomainEventOccurrence,
-    ) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-        crate::mutation::resolve_mutation_program(&modeled_direct_program()?, occurrence)
+    crate::projection! {
+        const MODELED_DIRECT: crate::projection::lower::ProjectionDescriptor<
+            crate::projection::lower::DirectCandidate,
+        > = {
+            name: "modeled-direct-workspace",
+            version: 1,
+            epoch: "modeled-direct-workspace-v1",
+            model: ModeledDirectView,
+            program: modeled_direct_program,
+        };
     }
-
-    fn modeled_direct_lower(
-        plan: &crate::ResolvedProjectionPlan,
-    ) -> Result<
-        crate::projection::lower::LoweredProjectionPlan,
-        crate::projection::lower::ProjectionLoweringError,
-    > {
-        crate::mutation::lower_single_model::<ModeledDirectView>(plan)
-    }
-
-    fn modeled_direct_inventory() -> Result<
-        crate::projection::lower::ProjectionOutputInventory,
-        crate::projection::lower::ProjectionLoweringError,
-    > {
-        crate::mutation::inventory_single_model::<ModeledDirectView>()
-    }
-
-    const MODELED_DIRECT: ProjectionDescriptor<DirectCandidate> =
-        crate::mutation::descriptor_from_factories(
-            "modeled-direct-workspace",
-            1,
-            "modeled-direct-workspace-v1",
-            modeled_direct_program,
-            modeled_direct_resolve,
-            modeled_direct_lower,
-            modeled_direct_inventory,
-        );
 
     #[derive(Clone, Debug, Serialize, crate::DomainEvent)]
     #[domain_event(name = "causal.background", version = 1)]
@@ -1005,6 +1031,13 @@ mod tests {
     }
 
     impl CausalGetStream for TestRepo {
+        async fn get_causal_stream_tail(
+            &self,
+            _identity: &StreamIdentity,
+            _after_version: u64,
+        ) -> Result<Option<Entity>, RepositoryError> {
+            panic!("this fixture does not configure snapshots")
+        }
         async fn get_causal_stream<'a>(
             &'a self,
             identity: &'a StreamIdentity,
@@ -1067,9 +1100,9 @@ mod tests {
     #[derive(serde::Deserialize)]
     struct TestInput {}
 
-    impl crate::graphql::GraphqlInputType for TestInput {
-        fn graphql_type() -> GraphqlTypeDef {
-            GraphqlTypeDef::new("TestInput", Vec::new())
+    impl crate::command::CommandInputType for TestInput {
+        fn command_type() -> CommandTypeDef {
+            CommandTypeDef::new("TestInput", Vec::new())
                 .with_type_id(std::any::TypeId::of::<Self>())
         }
     }
@@ -1221,14 +1254,14 @@ mod tests {
 
         assert!(parts.aggregates.iter().all(|staged| staged
             .aggregate
-            .entity
+            .staged_entity()
             .pending_domain_events()
             .len()
             == 1));
         parts.mark_committed_state().unwrap();
         assert!(parts.aggregates.iter().all(|staged| staged
             .aggregate
-            .entity
+            .staged_entity()
             .pending_domain_events()
             .is_empty()));
     }
@@ -1266,14 +1299,14 @@ mod tests {
         assert_eq!(
             parts.aggregates[0]
                 .aggregate
-                .entity
+                .staged_entity()
                 .pending_domain_events()
                 .len(),
             0
         );
         assert!(parts.aggregates[0]
             .aggregate
-            .entity
+            .staged_entity()
             .domain_event_poison()
             .is_some());
     }
@@ -1292,7 +1325,7 @@ mod tests {
         workspace.stage(aggregate).unwrap();
         let mut parts = workspace.into_parts().unwrap();
 
-        let contract = crate::graphql::typed_command::<TestInput, Atomic<TestView>>("test.project")
+        let contract = crate::command::typed_command::<TestInput, Atomic<TestView>>("test.project")
             .into_contract();
         parts.validate_prepared(&contract, &mut prepared).unwrap();
     }
@@ -1308,7 +1341,7 @@ mod tests {
             })
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
-        let contract = crate::graphql::typed_command::<TestInput, Atomic<TestView>>("test.project")
+        let contract = crate::command::typed_command::<TestInput, Atomic<TestView>>("test.project")
             .into_contract();
 
         assert!(matches!(
@@ -1339,7 +1372,7 @@ mod tests {
             .unwrap();
         workspace.stage_read_models(conflicting).unwrap();
         let mut parts = workspace.into_parts().unwrap();
-        let contract = crate::graphql::typed_command::<TestInput, Atomic<TestView>>("test.project")
+        let contract = crate::command::typed_command::<TestInput, Atomic<TestView>>("test.project")
             .into_contract();
 
         assert!(matches!(
@@ -1368,7 +1401,7 @@ mod tests {
         mutation
             .values
             .insert("title", RowValue::String("different".into()));
-        let contract = crate::graphql::typed_command::<TestInput, Atomic<TestView>>("test.project")
+        let contract = crate::command::typed_command::<TestInput, Atomic<TestView>>("test.project")
             .into_contract();
 
         assert!(matches!(
@@ -1384,7 +1417,7 @@ mod tests {
     }
 
     fn modeled_direct_contract() -> TypedCommandContract {
-        crate::graphql::typed_command::<TestInput, Atomic<ModeledDirectView>>("test.modeled-direct")
+        crate::command::typed_command::<TestInput, Atomic<ModeledDirectView>>("test.modeled-direct")
             .into_contract()
     }
 
@@ -1416,6 +1449,37 @@ mod tests {
     }
 
     #[test]
+    fn a_descriptor_builds_its_program_once_and_resolves_by_reference() {
+        let repository = modeled_direct_repository();
+        let workspace = CausalWorkspace::new(&repository);
+        let mut aggregate = workspace.create();
+        aggregate.create("once-1".into(), "first".into()).unwrap();
+        workspace.stage(aggregate).unwrap();
+        let _prepared = workspace
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
+            .unwrap();
+        let mut parts = workspace.into_parts().unwrap();
+        parts.prepare_domain_publications("once").unwrap();
+        let occurrence = &parts.domain_event_occurrences[0];
+
+        let first = MODELED_DIRECT.program().unwrap();
+        let executor = MODELED_DIRECT.server_executor().unwrap();
+        for _ in 0..3 {
+            let plan = MODELED_DIRECT.resolve(occurrence).unwrap();
+            assert_eq!(plan.program_id(), first.id());
+            executor.plan(occurrence).unwrap();
+        }
+        assert!(std::ptr::eq(first, MODELED_DIRECT.program().unwrap()));
+        assert_eq!(
+            MODELED_DIRECT_BUILDS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "every resolve in this process read the one compiled program"
+        );
+    }
+
+    #[test]
     fn modeled_direct_resolves_one_internal_state_occurrence_to_one_exact_upsert() {
         let repository = modeled_direct_repository();
         let workspace = CausalWorkspace::new(&repository);
@@ -1425,7 +1489,9 @@ mod tests {
             .unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
 
         let mut parts = workspace.into_parts().unwrap();
@@ -1473,7 +1539,9 @@ mod tests {
             .unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut separate = ReadModelWritePlanBuilder::new();
         separate
@@ -1505,7 +1573,9 @@ mod tests {
             .unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
 
         let mut parts = workspace.into_parts().unwrap();
@@ -1533,7 +1603,9 @@ mod tests {
             .unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
         parts
@@ -1556,7 +1628,9 @@ mod tests {
             .unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
         parts
@@ -1580,7 +1654,9 @@ mod tests {
         aggregate.rename("renamed".into()).unwrap();
         workspace.stage(aggregate).unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
         parts
@@ -1611,7 +1687,9 @@ mod tests {
             )
             .unwrap();
         let mut prepared = workspace
-            .prepare_modeled_atomic::<ModeledDirectView>(MODELED_DIRECT)
+            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
+                MODELED_DIRECT.server_executor().unwrap(),
+            )
             .unwrap();
         let mut parts = workspace.into_parts().unwrap();
         parts

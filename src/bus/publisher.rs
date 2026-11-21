@@ -32,26 +32,6 @@ pub trait MessagePublisher: Send + Sync {
         &self,
         message: Message,
     ) -> impl Future<Output = Result<(), TransportError>> + Send + '_;
-
-    /// Publish a batch of messages.
-    ///
-    /// The default publishes sequentially and stops at the first error, so a
-    /// partial batch may have been published when this returns `Err`; the
-    /// caller settles each outbox row by its own claim, so partial progress is
-    /// safe. Adapters with native batching (a Kafka producer batch, a single
-    /// multi-row transaction) should override this.
-    #[allow(clippy::manual_async_fn)]
-    fn publish_batch(
-        &self,
-        messages: Vec<Message>,
-    ) -> impl Future<Output = Result<(), TransportError>> + Send + '_ {
-        async move {
-            for message in messages {
-                self.publish(message).await?;
-            }
-            Ok(())
-        }
-    }
 }
 
 #[cfg(test)]
@@ -102,24 +82,13 @@ mod tests {
     }
 
     #[test]
-    fn publish_batch_publishes_all_on_success() {
+    fn publish_reports_the_adapter_error() {
         let publisher = CountingPublisher {
             published: Mutex::new(Vec::new()),
-            fail_at: None,
+            fail_at: Some(1),
         };
-        block_on(publisher.publish_batch(vec![msg("a"), msg("b"), msg("c")])).unwrap();
-        assert_eq!(*publisher.published.lock().unwrap(), vec!["a", "b", "c"]);
-    }
-
-    #[test]
-    fn publish_batch_stops_at_first_error_with_partial_progress() {
-        let publisher = CountingPublisher {
-            published: Mutex::new(Vec::new()),
-            fail_at: Some(1), // fail on the second message
-        };
-        let result = block_on(publisher.publish_batch(vec![msg("a"), msg("b"), msg("c")]));
-        assert!(result.is_err());
-        // Only the first message was published before the error.
+        block_on(publisher.publish(msg("a"))).unwrap();
+        assert!(block_on(publisher.publish(msg("b"))).is_err());
         assert_eq!(*publisher.published.lock().unwrap(), vec!["a"]);
     }
 }

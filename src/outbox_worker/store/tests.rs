@@ -248,6 +248,14 @@ async fn default_backlog_stats_scan_is_bounded() {
             &'a self,
             _claim: &'a OutboxClaimRef,
             _error: &'a str,
+            _retry_after: Duration,
+        ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
+            async move { unimplemented!("probe store only lists") }
+        }
+
+        fn requeue_failed<'a>(
+            &'a self,
+            _message_id: &'a str,
         ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
             async move { unimplemented!("probe store only lists") }
         }
@@ -310,7 +318,7 @@ async fn competing_workers_only_claim_message_once() {
 }
 
 #[tokio::test]
-async fn publish_failure_releases_until_retry_ceiling_then_fails() {
+async fn permanent_publish_failure_releases_until_the_ceiling_then_fails() {
     let repo = InMemoryRepository::new();
     let message = OutboxMessage::create("msg-1", "Event", b"{}".to_vec()).unwrap();
     let id = store_message(&repo, message).await;
@@ -326,7 +334,7 @@ async fn publish_failure_releases_until_retry_ceiling_then_fails() {
         .unwrap();
     let claim = OutboxClaimRef::from_message(&claimed[0]).unwrap();
     let action = store
-        .record_failure(&claim, "first failure", 2)
+        .record_failure(&claim, "first failure", false, 2)
         .await
         .unwrap();
     assert_eq!(action, OutboxPublishFailureAction::Released);
@@ -336,6 +344,8 @@ async fn publish_failure_releases_until_retry_ceiling_then_fails() {
     assert_eq!(stored.attempts, 1);
     assert_eq!(stored.last_error.as_deref(), Some("first failure"));
 
+    // The released row waits out its backoff before it is claimable.
+    tokio::time::sleep(OUTBOX_RETRY.delay(1) + Duration::from_millis(30)).await;
     let claimed = store
         .claim(ClaimOutboxMessages::new(
             "worker-1",
@@ -346,7 +356,7 @@ async fn publish_failure_releases_until_retry_ceiling_then_fails() {
         .unwrap();
     let claim = OutboxClaimRef::from_message(&claimed[0]).unwrap();
     let action = store
-        .record_failure(&claim, "second failure", 2)
+        .record_failure(&claim, "second failure", false, 2)
         .await
         .unwrap();
     assert_eq!(action, OutboxPublishFailureAction::Failed);
@@ -373,7 +383,10 @@ async fn missing_message_updates_return_not_found() {
         |err: RepositoryError| matches!(&err, RepositoryError::NotFound { id } if id == "missing");
     assert!(is_missing(store.complete(&claim).await.unwrap_err()));
     assert!(is_missing(
-        store.release(&claim, "error").await.unwrap_err()
+        store
+            .release(&claim, "error", Duration::ZERO)
+            .await
+            .unwrap_err()
     ));
     assert!(is_missing(store.fail(&claim, "error").await.unwrap_err()));
 }
@@ -425,7 +438,10 @@ async fn stale_attempt_claims_cannot_complete_later_claims() {
         .await
         .unwrap();
     let stale_claim = OutboxClaimRef::from_message(&claimed[0]).unwrap();
-    store.release(&stale_claim, "retry").await.unwrap();
+    store
+        .release(&stale_claim, "retry", Duration::ZERO)
+        .await
+        .unwrap();
 
     let claimed = store
         .claim(ClaimOutboxMessages::new(
@@ -471,7 +487,7 @@ async fn complete_many_completes_the_whole_batch() {
     store.complete_many(&claims).await.unwrap();
 
     for id in ["msg-1", "msg-2", "msg-3"] {
-        assert!(load_message(&repo, id).is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key(id));
     }
 }
 
@@ -496,9 +512,9 @@ async fn complete_many_rejects_stale_and_missing_claims() {
     let claims = vec![OutboxClaimRef::from_message(&claimed[0]).unwrap()];
 
     store.complete_many(&claims).await.unwrap();
-    // Re-settling the now-published row is a stale claim, same as `complete`.
+    // Re-settling a deleted delivery row is NotFound, same as `complete`.
     let err = store.complete_many(&claims).await.unwrap_err();
-    assert!(matches!(err, RepositoryError::InvalidState { .. }));
+    assert!(matches!(err, RepositoryError::NotFound { .. }));
 
     let missing = vec![OutboxClaimRef {
         message_id: "missing".into(),
@@ -529,5 +545,5 @@ async fn already_published_message_is_not_completed_again() {
     store.complete(&claim).await.unwrap();
 
     let err = store.complete(&claim).await.unwrap_err();
-    assert!(matches!(err, RepositoryError::InvalidState { .. }));
+    assert!(matches!(err, RepositoryError::NotFound { .. }));
 }

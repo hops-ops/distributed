@@ -2,9 +2,7 @@ use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 
 use super::manifest::{refresh_schema_fingerprint, ClientManifest};
-use super::{
-    compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector,
-};
+use super::{compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector};
 
 fn fingerprint(label: &str) -> String {
     let digest = Sha256::digest(label.as_bytes());
@@ -268,7 +266,7 @@ pub(super) fn manifest() -> JsonValue {
         "service_id": "todos-service",
         "surface": {"kind": "role", "name": "user"},
         "schema_fingerprint": fingerprint("schema"),
-        "protocol_fingerprint": "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782",
+        "protocol_fingerprint": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
         "execution": {
             "max_depth": 8,
             "max_complexity": 500,
@@ -611,8 +609,7 @@ fn projected_manifest() -> JsonValue {
         "name": "todos",
         "facts": [],
         "models": ["Todo"],
-        "dependencies": ["todo_rows"],
-        "causal_confirmation": false
+        "dependencies": ["todo_rows"]
     }]);
     value["protocol_operations"] = json!({
         "version": 1,
@@ -758,6 +755,279 @@ fn generated_command_types_manifest() -> JsonValue {
     });
     refresh_schema_fingerprint(&mut value);
     value
+}
+
+fn retained_projection_catalog(arm_count: usize) -> JsonValue {
+    let mut value = generated_command_types_manifest();
+    let arms = value["projection_programs"][0]["arms"]
+        .as_array_mut()
+        .unwrap();
+    let template = arms[0].clone();
+    for index in 1..arm_count {
+        let mut arm = template.clone();
+        arm["arm"] = json!(format!("retained-{index:03}"));
+        arm["event"] = json!({
+            "id": format!("event:todo.retained:v{index:03}"),
+            "name": "todo.retained",
+            "version": index
+        });
+        arm["operations"][0]["operation"] = json!(format!("retained-upsert-{index:03}"));
+        arms.push(arm);
+    }
+    refresh_schema_fingerprint(&mut value);
+    value
+}
+
+#[test]
+fn retained_projection_catalog_compiles_134_and_256_arms_with_one_selected_capability() {
+    let selected_preview = |manifest: &ClientManifest| {
+        let command = manifest
+            .commands
+            .iter()
+            .find(|command| command.extensions.projection.is_some())
+            .unwrap();
+        serde_json::to_value(
+            super::projection_delta::compile_command_preview(command, manifest)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let baseline = ClientManifest::parse(
+        generated_command_types_manifest(),
+        &ClientSurfaceSelector::role("user"),
+    )
+    .unwrap();
+    let expected = selected_preview(&baseline);
+    assert_eq!(
+        expected["capabilities"]["arms"].as_array().unwrap().len(),
+        1
+    );
+    for count in [128, 134, 256] {
+        let value = retained_projection_catalog(count);
+        let manifest = ClientManifest::parse(value.clone(), &ClientSurfaceSelector::role("user"))
+            .unwrap_or_else(|error| panic!("{count} retained arms: {error}"));
+        assert_eq!(manifest.projection_programs[0].arms.len(), count);
+        assert_eq!(selected_preview(&manifest), expected);
+        compile_client(ClientCompileInput::new(
+            value,
+            ClientSurfaceSelector::role("user"),
+            vec![ClientDocument::new(
+                "src/routes/todos/+page.graphql",
+                "query Todo { todo(id: \"1\", tenantId: \"tenant\") { id tenantId } }",
+            )],
+        ))
+        .unwrap_or_else(|error| panic!("compile {count} retained arms: {error}"));
+    }
+}
+
+#[test]
+fn retained_projection_catalog_rejects_257_arms_and_preserves_nested_limits() {
+    let error = ClientManifest::parse(
+        retained_projection_catalog(257),
+        &ClientSurfaceSelector::role("user"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "client.manifest.projection_program_arms");
+    for (mutation, expected) in [
+        (0, "client.manifest.projection_arm_id"),
+        (1, "client.manifest.projection_arm_order"),
+        (2, "client.manifest.projection_operation_id"),
+        (3, "client.manifest.projection_operations"),
+        (4, "client.manifest.command_projection_inventory"),
+    ] {
+        let mut value = retained_projection_catalog(134);
+        let arms = value["projection_programs"][0]["arms"]
+            .as_array_mut()
+            .unwrap();
+        match mutation {
+            0 => arms[1]["arm"] = arms[0]["arm"].clone(),
+            1 => arms.swap(0, 1),
+            2 => {
+                arms[1]["operations"][0]["operation"] =
+                    arms[0]["operations"][0]["operation"].clone()
+            }
+            3 => arms[1]["operations"] = json!(vec![arms[1]["operations"][0].clone(); 129]),
+            4 => {
+                let projection = &mut value["commands"][0]["extensions"]["projection"];
+                projection["program_arms"] =
+                    json!(vec![projection["program_arms"][0].clone(); 129]);
+            }
+            _ => unreachable!(),
+        }
+        refresh_schema_fingerprint(&mut value);
+        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user")).unwrap_err();
+        assert_eq!(error.code, expected, "mutation {mutation}");
+    }
+}
+
+fn key_only_projection_manifest(composite: bool) -> JsonValue {
+    let mut value = generated_command_types_manifest();
+    value["capabilities"]["live_queries"] = json!(false);
+    value["capabilities"]["live_resume"] = json!(false);
+    value["commands"][0]["extensions"]["consistency"]["kind"] = json!("eventual");
+    value["commands"][0]["extensions"]
+        .as_object_mut()
+        .unwrap()
+        .remove("direct_projection");
+    value["commands"][0]["output"]["definition"]["name"] = json!("ProjectTodoPayload");
+    let key_names = if composite {
+        vec!["tenantId", "id"]
+    } else {
+        vec!["id"]
+    };
+    value["models"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    value["models"][0]["normalization"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    value["models"][0]["filter_input"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    value["roots"] = json!([by_pk_root()]);
+    value["roots"][0]["arguments"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    let arm = &mut value["projection_programs"][0]["arms"][0];
+    arm["partition"] = json!({"kind": "unit"});
+    arm["operations"][0]["fields"] = json!([]);
+    let key = arm["operations"][0]["key"].as_array_mut().unwrap();
+    key.retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    for (ordinal, field) in key.iter_mut().enumerate() {
+        field["ordinal"] = json!(ordinal);
+    }
+    value["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]["values"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|slot| {
+            key_names
+                .iter()
+                .any(|name| slot["slot"] == format!("state.{name}"))
+        });
+    refresh_schema_fingerprint(&mut value);
+    value
+}
+
+#[test]
+fn key_only_complete_projections_compile_identity_only_upserts() {
+    for composite in [false, true] {
+        for kind in [
+            "insert",
+            "upsert",
+            "recreate",
+            "insert_related",
+            "upsert_related",
+        ] {
+            let mut value = key_only_projection_manifest(composite);
+            value["projection_programs"][0]["arms"][0]["operations"][0]["kind"] = json!(kind);
+            refresh_schema_fingerprint(&mut value);
+            let manifest =
+                ClientManifest::parse(value.clone(), &ClientSurfaceSelector::role("user"))
+                    .unwrap_or_else(|error| panic!("{kind}, composite={composite}: {error}"));
+            let command = manifest
+                .commands
+                .iter()
+                .find(|command| command.extensions.projection.is_some())
+                .expect("modeled command");
+            let preview = super::projection_delta::compile_command_preview(command, &manifest)
+                .expect("compile identity-only preview")
+                .expect("projection preview");
+            let preview = serde_json::to_value(preview).unwrap();
+            assert_eq!(
+                preview["preview"]["operations"].as_array().unwrap().len(),
+                1
+            );
+            let mutation = &preview["preview"]["operations"][0]["mutation"];
+            assert_eq!(mutation["op"], "upsert");
+            assert_eq!(mutation["fields"], json!([]));
+            assert_eq!(mutation["replace"], json!([]));
+            assert_eq!(
+                mutation["scope"]["key"].as_array().unwrap().len(),
+                if composite { 2 } else { 1 }
+            );
+            assert_eq!(preview["preview"]["recoveries"], json!([]));
+            let query = if composite {
+                "query Todo { todo(id: \"1\", tenantId: \"tenant\") { id tenantId } }"
+            } else {
+                "query Todo { todo(id: \"1\") { id } }"
+            };
+            let project = compile_client(ClientCompileInput::new(
+                value,
+                ClientSurfaceSelector::role("user"),
+                vec![ClientDocument::new("src/routes/todos/+page.graphql", query)],
+            ))
+            .expect("generate identity-only client");
+            let commands = file(&project, "commands.ts");
+            assert!(commands.contains("\"op\": \"upsert\""));
+            assert!(commands.contains("\"fields\": []"));
+            assert!(commands.contains("\"replace\": []"));
+        }
+    }
+}
+
+#[test]
+fn key_only_projection_exception_preserves_field_mask_validation() {
+    for kind in [
+        "insert",
+        "upsert",
+        "recreate",
+        "insert_related",
+        "upsert_related",
+        "patch",
+        "upsert_patch",
+    ] {
+        let mut value = generated_command_types_manifest();
+        let operation = &mut value["projection_programs"][0]["arms"][0]["operations"][0];
+        operation["kind"] = json!(kind);
+        operation["fields"] = json!([]);
+        refresh_schema_fingerprint(&mut value);
+        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+            .expect_err("non-key fields still require a field mask");
+        assert_eq!(
+            error.code, "client.manifest.projection_field_mask",
+            "{kind}"
+        );
+    }
+    for kind in ["patch", "upsert_patch"] {
+        let mut value = key_only_projection_manifest(true);
+        value["projection_programs"][0]["arms"][0]["operations"][0]["kind"] = json!(kind);
+        refresh_schema_fingerprint(&mut value);
+        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+            .expect_err("key-only models do not allow empty patches");
+        assert_eq!(error.code, "client.manifest.projection_field_mask");
+    }
+    let mut value = key_only_projection_manifest(true);
+    value["projection_programs"][0]["arms"][0]["operations"][0]["fields"] = json!([{
+        "ordinal": 0, "name": "id", "assignment": {"kind": "set", "expression": {
+            "kind": "slot", "slot": "state.id", "value_type": {"type": "string"}
+        }}
+    }]);
+    refresh_schema_fingerprint(&mut value);
+    let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+        .expect_err("identity must remain outside the field mask");
+    assert_eq!(error.code, "client.manifest.projection_field_mask");
+}
+
+#[test]
+fn key_only_projection_still_requires_the_exact_identity() {
+    for key in [
+        json!([]),
+        json!([{"ordinal": 0, "name": "id", "expression": {
+            "kind": "slot", "slot": "state.id", "value_type": {"type": "string"}
+        }}]),
+    ] {
+        let mut value = key_only_projection_manifest(true);
+        value["projection_programs"][0]["arms"][0]["operations"][0]["key"] = key;
+        refresh_schema_fingerprint(&mut value);
+        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+            .expect_err("missing composite identity fields must reject");
+        assert_eq!(error.code, "client.manifest.projection_key");
+    }
 }
 
 fn embedded_model_invalidation_manifest() -> JsonValue {
@@ -1183,22 +1453,20 @@ fn component_load_compiles_to_a_framework_neutral_island_inventory() {
 
 #[test]
 fn multiple_load_islands_may_share_one_future_boundary() {
-    let project = compile_client(
-        ClientCompileInput::new(
-            manifest(),
-            ClientSurfaceSelector::role("user"),
-            vec![
-                ClientDocument::new(
-                    "src/lib/todos/TodoCount.graphql",
-                    "query TodoCount @load { todos { id } }",
-                ),
-                ClientDocument::new(
-                    "src/lib/todos/TodoTitles.graphql",
-                    "query TodoTitles @load { todos { title } }",
-                ),
-            ],
-        ),
-    )
+    let project = compile_client(ClientCompileInput::new(
+        manifest(),
+        ClientSurfaceSelector::role("user"),
+        vec![
+            ClientDocument::new(
+                "src/lib/todos/TodoCount.graphql",
+                "query TodoCount @load { todos { id } }",
+            ),
+            ClientDocument::new(
+                "src/lib/todos/TodoTitles.graphql",
+                "query TodoTitles @load { todos { title } }",
+            ),
+        ],
+    ))
     .expect("route ownership is no longer one-operation-per-route");
 
     assert_eq!(project.islands.len(), 2);
@@ -2935,8 +3203,7 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
         "name": "todos",
         "facts": ["TodoCreated"],
         "models": ["Todo"],
-        "dependencies": ["todo_rows"],
-        "causal_confirmation": true
+        "dependencies": ["todo_rows"]
     }]);
     value["protocol_operations"] = json!({
         "version": 1,
@@ -3110,10 +3377,118 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
         ["values"][2]["source"] =
         json!({"kind": "trusted_preset", "name": "priority", "codec": "int32"});
     refresh_schema_fingerprint(&mut preset_i64_value);
+    // An unknown record identity drops the mutation, including its preset
+    // expression. The generated inventory must follow the compiled result,
+    // while the surface retains the complete trusted context contract.
+    let mut recovery_preset = preset_i64_value.clone();
+    recovery_preset["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]
+        ["values"][1]["source"] = json!({"kind": "unknown"});
+    refresh_schema_fingerprint(&mut recovery_preset);
+    for (fixture, retained) in [(preset_i64_value.clone(), true), (recovery_preset, false)] {
+        let compiled = compile_client(input_with_manifest(fixture, "query Todos { todos { id } }"))
+            .expect("compile preset inventory after preview lowering");
+        let source = file(&compiled, "commands.ts");
+        let declaration = source
+            .split("export const Command_createTodo:")
+            .nth(1)
+            .unwrap();
+        let body = declaration
+            .split_once(" = ")
+            .unwrap()
+            .1
+            .split_once("\n};")
+            .unwrap()
+            .0;
+        let artifact: JsonValue = serde_json::from_str(&format!("{body}\n}}")).unwrap();
+        assert_eq!(
+            artifact["protocol"]["trustedPresets"],
+            json!([{"name": "priority", "codec": "int32"}])
+        );
+        if retained {
+            assert_eq!(
+                artifact["trustedPresets"],
+                json!([{"name": "priority", "codec": "int32"}])
+            );
+            assert!(!artifact["projection"]["preview"]["operations"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        } else {
+            let fixture: JsonValue = serde_json::from_str(include_str!(
+                "../../tests/fixtures/generated-recovery-preset-command.json"
+            ))
+            .unwrap();
+            assert_eq!(
+                artifact, fixture,
+                "JS bridge fixture must match compiler output"
+            );
+            assert!(artifact.get("trustedPresets").is_none());
+            assert!(artifact["projection"]["preview"]["operations"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            assert!(!artifact["projection"]["preview"]["recoveries"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
+    }
     let mut invalid_u64_source = input_i64_value.clone();
     invalid_u64_source["projection_programs"][0]["arms"][0]["operations"][0]["fields"][1]
         ["assignment"]["expression"]["value_type"] = json!({"type": "u64"});
     refresh_schema_fingerprint(&mut invalid_u64_source);
+    for codec in ["uint8", "uint16", "uint32", "uint64_safe_integer"] {
+        let mut unsigned = invalid_u64_source.clone();
+        unsigned["commands"][0]["input"]["definition"]["fields"][1]["type_name"] = json!("BigInt");
+        unsigned["commands"][0]["input"]["definition"]["fields"][1]["codec"] = json!(codec);
+        unsigned["models"][0]["fields"][2]["scalar"] = json!("BigInt");
+        unsigned["models"][0]["fields"][2]["codec"] = json!("json_number_precision_limited");
+        refresh_schema_fingerprint(&mut unsigned);
+        let compiled = compile_client(input_with_manifest(
+            unsigned.clone(),
+            "query Todos { todos { id priority } }",
+        ))
+        .expect("unsigned refined inputs prove U64 slots");
+        let source = file(&compiled, "commands.ts");
+        assert!(source.contains("readonly \"priority\": number;"));
+        let body = source
+            .split("export const Command_createTodo:")
+            .nth(1)
+            .unwrap()
+            .split_once(" = ")
+            .unwrap()
+            .1
+            .split_once("\n};")
+            .unwrap()
+            .0;
+        let artifact: JsonValue = serde_json::from_str(&format!("{body}\n}}")).unwrap();
+        assert_eq!(artifact["input"]["definition"]["fields"][1]["codec"], codec);
+        assert_eq!(
+            artifact["projection"]["preview"]["operations"][0]["mutation"]["fields"][1]["value"]
+                ["kind"],
+            "input"
+        );
+        if codec == "uint64_safe_integer" {
+            let fixture: JsonValue = serde_json::from_str(include_str!(
+                "../../tests/fixtures/generated-unsigned-command.json"
+            ))
+            .unwrap();
+            assert_eq!(
+                artifact, fixture,
+                "unsigned JS bridge must match generated output"
+            );
+        }
+        unsigned["commands"][0]["extensions"]["trusted_presets"] =
+            json!([{"name": "priority", "codec": codec}]);
+        unsigned["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]["values"]
+            [2]["source"] = json!({"kind": "trusted_preset", "name": "priority", "codec": codec});
+        refresh_schema_fingerprint(&mut unsigned);
+        compile_client(input_with_manifest(
+            unsigned,
+            "query Todos { todos { id priority } }",
+        ))
+        .expect("unsigned trusted preset codec proves U64 slot");
+    }
     let mut invalid_constant_source = value.clone();
     invalid_constant_source["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]
         ["values"][2]["source"] =
@@ -3604,8 +3979,6 @@ fn manifest_v2_parses_exact_projection_program_binding_and_preview_contract() {
         super::manifest::ManifestProjectionPartition::Expression { .. }
     ));
     assert_eq!(parsed.projection_bindings.len(), 1);
-    assert!(parsed.commands[0].extensions.effects.is_none());
-    assert!(parsed.commands[0].extensions.confirmations.is_none());
     assert_eq!(
         parsed.commands[0]
             .extensions
@@ -3634,11 +4007,11 @@ fn manifest_v2_has_no_legacy_projection_or_command_authority_decoder() {
         .expect_err("command extensions v1 must fail closed");
     assert_eq!(error.code, "client.manifest.command_extensions");
 
-    let mut legacy_effects = projected_manifest();
-    legacy_effects["commands"][0]["extensions"]["effects"] =
+    let mut unknown_extension = projected_manifest();
+    unknown_extension["commands"][0]["extensions"]["effects"] =
         json!({"version": 1, "operations": [], "fallback": "revalidate"});
-    let error = ClientManifest::parse(legacy_effects, &ClientSurfaceSelector::role("user"))
-        .expect_err("legacy effects must not deserialize");
+    let error = ClientManifest::parse(unknown_extension, &ClientSurfaceSelector::role("user"))
+        .expect_err("unknown command extension slots must not deserialize");
     assert_eq!(error.code, "client.manifest.invalid");
 
     let mut unknown_projection_field = manifest();
@@ -3720,7 +4093,6 @@ fn projected_command_requires_exact_role_safe_direct_projection() {
     let parsed = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
         .expect("valid projected direct target");
     assert!(parsed.projectors[0].facts.is_empty());
-    assert!(!parsed.projectors[0].causal_confirmation);
     let direct = parsed.commands[0]
         .extensions
         .direct_projection
@@ -3761,16 +4133,6 @@ fn projected_command_requires_exact_role_safe_direct_projection() {
     let error = ClientManifest::parse(non_projected, &ClientSurfaceSelector::role("user"))
         .expect_err("succeeded commands cannot carry direct projection metadata");
     assert_eq!(error.code, "client.manifest.direct_projection_unexpected");
-
-    let mut impossible_confirmation = projected_manifest();
-    impossible_confirmation["projectors"][0]["causal_confirmation"] = json!(true);
-    refresh_schema_fingerprint(&mut impossible_confirmation);
-    let error = ClientManifest::parse(
-        impossible_confirmation,
-        &ClientSurfaceSelector::role("user"),
-    )
-    .expect_err("a direct-only owner cannot confirm asynchronous work");
-    assert_eq!(error.code, "client.manifest.projector_inventory");
 
     let mut embedded = projected_manifest();
     embedded["models"][0]["normalization"] = json!({"kind": "embedded"});
@@ -4078,4 +4440,175 @@ fn source_paths_fail_closed_before_they_can_inject_generated_typescript() {
     .expect_err("reject adversarial source path");
     assert_eq!(error.code, "client.documents.invalid_path");
     assert!(!error.message.contains("export const compromised"));
+}
+
+#[test]
+fn generated_lazy_commands_defer_definitions_and_preserve_command_signatures() {
+    let project = compile_client(ClientCompileInput::new(
+        generated_command_types_manifest(),
+        ClientSurfaceSelector::role("user"),
+        vec![ClientDocument::new(
+            "todos.graphql",
+            "query Todos { todos { id } }",
+        )],
+    ))
+    .expect("compile lazy commands");
+    let lazy = file(&project, "lazy-commands.ts");
+    assert!(lazy.contains("import type { COMMANDS, GeneratedCommandRuntimeOptions }"));
+    assert!(lazy.contains("import('./commands.js')"));
+    assert!(lazy.contains("\"hasInput\": false"));
+    assert!(lazy.contains("\"hasInput\": true"));
+    let wrapper = file(&project, "sveltekit.ts");
+    assert!(wrapper.contains("export function provideDistributedLazy("));
+    assert!(wrapper.contains("createCommands: createLazyCommands"));
+    assert!(wrapper.contains("createCommands: createGeneratedCommands"));
+    assert_eq!(
+        lazy.replace("'./commands.js'", "'./generated-commands.js'"),
+        include_str!("../../tests/fixtures/generated-lazy-commands.ts")
+    );
+}
+
+fn leaderboard_manifest() -> JsonValue {
+    let mut value = manifest();
+    value["leaderboards"] = json!([
+        {
+            "name": "xp",
+            "entry_typename": "LeaderboardEntry",
+            "order": "high_first",
+            "boards": "single",
+            "default_first": 3,
+            "max_first": 5,
+            "max_radius": 2,
+            "roots": [
+                {"name": "xpLeaderboard", "operation": "top", "list": true, "live": true,
+                 "arguments": [{"name": "first", "type_name": "Int", "nullable": true}]},
+                {"name": "xpMyRank", "operation": "my_rank", "list": false, "live": true,
+                 "arguments": []}
+            ]
+        },
+        {
+            "name": "season",
+            "entry_typename": "LeaderboardEntry",
+            "order": "low_first",
+            "boards": "family",
+            "default_first": 10,
+            "max_first": 100,
+            "max_radius": 25,
+            "roots": [
+                {"name": "seasonRank", "operation": "rank", "list": false, "live": false,
+                 "arguments": [
+                    {"name": "board", "type_name": "String", "nullable": false},
+                    {"name": "member", "type_name": "String", "nullable": false}
+                 ]}
+            ]
+        }
+    ]);
+    super::manifest::refresh_schema_fingerprint(&mut value);
+    value
+}
+
+const LEADERBOARD_PAGE: &str = r#"
+  query Todos($limit: Int!) {
+    todos(limit: $limit) { title }
+  }
+"#;
+
+#[test]
+fn leaderboard_roots_generate_typed_documents() {
+    let project = compile_client(input_with_manifest(
+        leaderboard_manifest(),
+        LEADERBOARD_PAGE,
+    ))
+    .unwrap();
+    let generated = file(&project, "leaderboards.ts");
+    assert!(generated.contains("export interface LeaderboardEntry {"));
+    assert!(generated
+        .contains("export type XpLeaderboardVariables = { readonly first?: number | null; };"));
+    assert!(generated.contains(
+        "export type XpLeaderboardData = { readonly xpLeaderboard: readonly LeaderboardEntry[] };"
+    ));
+    assert!(generated.contains(
+        r#"document: "query XpLeaderboard($first: Int) { xpLeaderboard(first: $first) { rank member score } }","#
+    ));
+    assert!(generated.contains(
+        r#"liveDocument: "subscription XpLeaderboard_Live($first: Int) { xpLeaderboard(first: $first) { rank member score } }","#
+    ));
+    // The viewer's rank takes no member argument: the server binds it from
+    // the verified session.
+    assert!(generated.contains("export type XpMyRankVariables = {};"));
+    assert!(generated.contains(r#"document: "query XpMyRank { xpMyRank { rank member score } }","#));
+    assert!(generated.contains(
+        "export type SeasonRankVariables = { readonly board: string; readonly member: string; };"
+    ));
+    assert!(generated.contains("liveDocument: null,"));
+    assert!(generated.contains("\"xpLeaderboard\": XpLeaderboardLeaderboard,"));
+    assert!(file(&project, "index.ts").contains("export * from './leaderboards.js';"));
+    assert_eq!(
+        generated,
+        include_str!("../../tests/fixtures/generated-leaderboards.ts"),
+        "the checked-in TypeScript consumer fixture must remain byte-exact"
+    );
+}
+
+#[test]
+fn manifests_without_leaderboards_generate_no_module() {
+    let project = compile_client(input(LEADERBOARD_PAGE)).unwrap();
+    assert!(project
+        .files
+        .iter()
+        .all(|file| file.path != "leaderboards.ts"));
+    assert!(!file(&project, "index.ts").contains("leaderboards"));
+}
+
+type ManifestMutation = Box<dyn Fn(&mut JsonValue)>;
+
+#[test]
+fn malformed_leaderboard_sections_are_refused() {
+    let cases: Vec<(&str, ManifestMutation)> = vec![
+        (
+            "a member argument on my_rank",
+            Box::new(|value: &mut JsonValue| {
+                value["leaderboards"][0]["roots"][1]["arguments"] =
+                    json!([{"name": "member", "type_name": "String", "nullable": false}]);
+            }),
+        ),
+        (
+            "a live rank root",
+            Box::new(|value: &mut JsonValue| {
+                value["leaderboards"][1]["roots"][0]["live"] = json!(true);
+            }),
+        ),
+        (
+            "an unknown operation",
+            Box::new(|value: &mut JsonValue| {
+                value["leaderboards"][0]["roots"][0]["operation"] = json!("everyone");
+            }),
+        ),
+        (
+            "a root colliding with a read-model root",
+            Box::new(|value: &mut JsonValue| {
+                value["leaderboards"][0]["roots"][0]["name"] = json!("todos");
+            }),
+        ),
+        (
+            "a family root without board",
+            Box::new(|value: &mut JsonValue| {
+                value["leaderboards"][1]["roots"][0]["arguments"] =
+                    json!([{"name": "member", "type_name": "String", "nullable": false}]);
+            }),
+        ),
+    ];
+    for (case, mutate) in cases {
+        let mut value = leaderboard_manifest();
+        mutate(&mut value);
+        super::manifest::refresh_schema_fingerprint(&mut value);
+        let error = compile_client(input_with_manifest(value, LEADERBOARD_PAGE)).expect_err(case);
+        assert_eq!(error.code, "client.manifest.leaderboard", "{case}: {error}");
+    }
+
+    // A stale fingerprint is still caught.
+    let mut tampered = leaderboard_manifest();
+    tampered["leaderboards"][0]["max_first"] = json!(50);
+    let error = compile_client(input_with_manifest(tampered, LEADERBOARD_PAGE)).unwrap_err();
+    assert_eq!(error.code, "client.manifest.schema_fingerprint");
 }

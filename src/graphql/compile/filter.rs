@@ -2,44 +2,68 @@ use async_graphql::Value;
 
 use crate::graphql::filter::{CmpOp, FilterExpr};
 use crate::microsvc::Session;
-use crate::table::{resolve_m2m_join_keys, ColumnType, RelationshipKind, TableSchema};
+use crate::table::{ColumnType, TableSchema};
 
 use super::super::engine::EngineInner;
-use super::super::permissions::ReadPermission;
 use super::binds::{operand_to_bind, value_to_bind, BindValue};
-use super::dialect::{join_predicate_m2m_pairs, placeholder, SqlDialect};
-use super::relationship::{compile_belongs_to_join, compile_has_many_join};
+use super::dialect::{comparison_operand, placeholder, text_pattern, SqlDialect};
+use super::scan::{relationship_link, ModelScan, ScanLink};
 
-pub(super) fn compile_where(
-    inner: &EngineInner,
-    session: &Session,
-    role: &str,
-    schema: &TableSchema,
-    perm: &ReadPermission,
-    client_where: Option<&Value>,
-    alias: &str,
-    binds: &mut Vec<BindValue>,
-    tables: &mut Vec<String>,
-    depth: usize,
-) -> Result<String, String> {
-    if depth > inner.max_depth {
-        return Err("max depth exceeded".into());
-    }
-    let mut preds = Vec::new();
-    if let Some(filter) = &perm.row_filter {
-        preds.push(compile_filter_expr(
-            inner, session, schema, filter, alias, binds, tables, depth,
-        )?);
-    }
-    if let Some(w) = client_where {
-        preds.push(compile_client_where(
-            inner, session, role, schema, perm, w, alias, binds, tables, depth,
-        )?);
-    }
-    if preds.is_empty() {
-        Ok("TRUE".into())
-    } else {
-        Ok(preds.join(" AND "))
+impl ModelScan<'_> {
+    /// `FROM "table" alias [JOIN …] WHERE [link AND] (row policy AND where)`.
+    ///
+    /// Every `SELECT` over a model is built from this, so the row policy is
+    /// applied on every access path. Binds are pushed here: call it where the
+    /// clause appears in the statement text.
+    pub(super) fn visible_rows(
+        &self,
+        alias: &str,
+        link: &ScanLink,
+        client_where: Option<&Value>,
+        binds: &mut Vec<BindValue>,
+        tables: &mut Vec<String>,
+        depth: usize,
+    ) -> Result<String, String> {
+        if depth > self.inner.max_depth {
+            return Err("max depth exceeded".into());
+        }
+        let mut preds = Vec::new();
+        if let Some(policy) = self.grant.row_policy.filter() {
+            preds.push(compile_filter_expr(
+                self.inner,
+                self.session,
+                self.schema,
+                policy,
+                alias,
+                binds,
+                tables,
+                depth,
+            )?);
+        }
+        if let Some(client_where) = client_where {
+            preds.push(compile_client_where(
+                *self,
+                client_where,
+                alias,
+                binds,
+                tables,
+                depth,
+            )?);
+        }
+        let visible = if preds.is_empty() {
+            "TRUE".to_string()
+        } else {
+            preds.join(" AND ")
+        };
+        let on = if link.on.is_empty() {
+            String::new()
+        } else {
+            format!("{} AND ", link.on)
+        };
+        Ok(format!(
+            "FROM \"{}\" {alias}{} WHERE {on}({visible})",
+            self.schema.table_name, link.join
+        ))
     }
 }
 
@@ -89,9 +113,21 @@ fn compile_filter_expr(
                 .find(|c| c.column_name == *column)
                 .ok_or_else(|| format!("unknown column `{column}`"))?;
             let bind = operand_to_bind(rhs, session, &col.column_type)?;
-            binds.push(bind);
-            let ph = placeholder(inner.dialect, binds.len());
             let col_ref = format!("{alias}.\"{column}\"");
+            if matches!(op, CmpOp::Like | CmpOp::Ilike) {
+                let BindValue::Text(pattern) = bind else {
+                    return Err("a pattern comparison requires a string".into());
+                };
+                return compile_text_pattern(
+                    inner.dialect,
+                    &col_ref,
+                    &pattern,
+                    '\\',
+                    *op == CmpOp::Like,
+                    binds,
+                );
+            }
+            let ph = comparand(inner.dialect, bind, binds);
             let sql_op = match op {
                 CmpOp::Eq => "=",
                 CmpOp::Neq => "<>",
@@ -99,8 +135,7 @@ fn compile_filter_expr(
                 CmpOp::Gte => ">=",
                 CmpOp::Lt => "<",
                 CmpOp::Lte => "<=",
-                CmpOp::Like => "LIKE",
-                CmpOp::Ilike => inner.dialect.ops().ilike_op,
+                CmpOp::Like | CmpOp::Ilike => unreachable!("compiled above"),
                 CmpOp::Contains => {
                     require_postgres_json_op(inner.dialect, "_contains")?;
                     "@>"
@@ -115,6 +150,15 @@ fn compile_filter_expr(
                 }
             };
             let cast_ph = cast_placeholder(inner.dialect, &col.column_type, &ph);
+            let col_ref = match op {
+                CmpOp::Eq | CmpOp::Neq => {
+                    comparison_operand(inner.dialect, &col.column_type, &col_ref, false)
+                }
+                CmpOp::Gt | CmpOp::Gte | CmpOp::Lt | CmpOp::Lte => {
+                    comparison_operand(inner.dialect, &col.column_type, &col_ref, true)
+                }
+                _ => col_ref,
+            };
             Ok(format!("{col_ref} {sql_op} {cast_ph}"))
         }
         FilterExpr::In {
@@ -142,29 +186,14 @@ fn compile_filter_expr(
                 .find(|c| c.column_name == *column)
                 .ok_or_else(|| format!("unknown column `{column}`"))?;
             let col_ref = format!("{alias}.\"{column}\"");
-            match inner.dialect {
-                SqlDialect::Postgres => {
-                    // Expand as IN for simplicity (array bind is dialect-specific).
-                    let mut phs = Vec::new();
-                    for v in values {
-                        let bind = operand_to_bind(v, session, &col.column_type)?;
-                        binds.push(bind);
-                        phs.push(placeholder(inner.dialect, binds.len()));
-                    }
-                    let op = if *negated { "NOT IN" } else { "IN" };
-                    Ok(format!("{col_ref} {op} ({})", phs.join(", ")))
-                }
-                SqlDialect::Sqlite => {
-                    let mut phs = Vec::new();
-                    for v in values {
-                        let bind = operand_to_bind(v, session, &col.column_type)?;
-                        binds.push(bind);
-                        phs.push(placeholder(inner.dialect, binds.len()));
-                    }
-                    let op = if *negated { "NOT IN" } else { "IN" };
-                    Ok(format!("{col_ref} {op} ({})", phs.join(", ")))
-                }
+            let col_ref = comparison_operand(inner.dialect, &col.column_type, &col_ref, false);
+            let mut phs = Vec::new();
+            for v in values {
+                let bind = operand_to_bind(v, session, &col.column_type)?;
+                phs.push(comparand(inner.dialect, bind, binds));
             }
+            let op = if *negated { "NOT IN" } else { "IN" };
+            Ok(format!("{col_ref} {op} ({})", phs.join(", ")))
         }
         FilterExpr::IsNull { column, is_null } => {
             let col_ref = format!("{alias}.\"{column}\"");
@@ -180,11 +209,12 @@ fn compile_filter_expr(
                 .iter()
                 .find(|r| r.field_name == *field)
                 .ok_or_else(|| format!("unknown relationship `{field}`"))?;
+            // A row policy is authored, trusted server logic: it reads the
+            // related model directly, not as the requesting privilege does.
             let target = inner
                 .catalog
                 .get(&rel.target_model)
                 .ok_or_else(|| format!("rel target `{}` not in catalog", rel.target_model))?;
-            tables.push(target.schema.table_name.clone());
             let child_alias = format!("r{depth}");
             let inner_pred = compile_filter_expr(
                 inner,
@@ -196,61 +226,33 @@ fn compile_filter_expr(
                 tables,
                 depth + 1,
             )?;
-            match rel.kind {
-                RelationshipKind::HasMany => {
-                    let join_pred =
-                        compile_has_many_join(schema, rel, &target.schema, alias, &child_alias)?;
-                    Ok(format!(
-                        "EXISTS (SELECT 1 FROM \"{}\" {child_alias} WHERE {join_pred} AND ({inner_pred}))",
-                        target.schema.table_name
-                    ))
-                }
-                RelationshipKind::BelongsTo => {
-                    let join_pred =
-                        compile_belongs_to_join(schema, rel, &target.schema, alias, &child_alias)?;
-                    Ok(format!(
-                        "EXISTS (SELECT 1 FROM \"{}\" {child_alias} WHERE {join_pred} AND ({inner_pred}))",
-                        target.schema.table_name
-                    ))
-                }
-                RelationshipKind::ManyToMany => {
-                    let through = rel
-                        .through
-                        .as_deref()
-                        .ok_or_else(|| "m2m rel missing through".to_string())?;
-                    let through_entry = inner
-                        .by_table
-                        .get(through)
-                        .and_then(|m| inner.catalog.get(m))
-                        .ok_or_else(|| format!("through `{through}` missing"))?;
-                    let join =
-                        resolve_m2m_join_keys(schema, rel, &through_entry.schema, &target.schema)
-                            .map_err(|error| error.to_string())?;
-                    let j = format!("j{depth}");
-                    let on_target = join_predicate_m2m_pairs(&j, &child_alias, &join.target)?;
-                    let parent_pred = join_predicate_m2m_pairs(&j, alias, &join.parent)?;
-                    Ok(format!(
-                        "EXISTS (SELECT 1 FROM \"{through}\" {j} JOIN \"{}\" {child_alias} ON {on_target} WHERE {parent_pred} AND ({inner_pred}))",
-                        target.schema.table_name
-                    ))
-                }
-            }
+            let link = relationship_link(
+                inner,
+                schema,
+                rel,
+                &target.schema,
+                alias,
+                &child_alias,
+                &format!("j{depth}"),
+                tables,
+            )?;
+            Ok(format!(
+                "EXISTS (SELECT 1 FROM \"{}\" {child_alias}{} WHERE {} AND ({inner_pred}))",
+                target.schema.table_name, link.join, link.on
+            ))
         }
     }
 }
 
 fn compile_client_where(
-    inner: &EngineInner,
-    session: &Session,
-    role: &str,
-    schema: &TableSchema,
-    perm: &ReadPermission,
+    scan: ModelScan<'_>,
     value: &Value,
     alias: &str,
     binds: &mut Vec<BindValue>,
     tables: &mut Vec<String>,
     depth: usize,
 ) -> Result<String, String> {
+    let (inner, session, schema) = (scan.inner, scan.session, scan.schema);
     if depth > inner.max_depth {
         return Err("max depth exceeded".into());
     }
@@ -271,11 +273,7 @@ fn compile_client_where(
                     }
                     for item in items {
                         preds.push(compile_client_where(
-                            inner,
-                            session,
-                            role,
-                            schema,
-                            perm,
+                            scan,
                             item,
                             alias,
                             binds,
@@ -297,11 +295,7 @@ fn compile_client_where(
                     let mut parts = Vec::new();
                     for item in items {
                         parts.push(compile_client_where(
-                            inner,
-                            session,
-                            role,
-                            schema,
-                            perm,
+                            scan,
                             item,
                             alias,
                             binds,
@@ -317,23 +311,12 @@ fn compile_client_where(
             "_not" => {
                 preds.push(format!(
                     "NOT ({})",
-                    compile_client_where(
-                        inner,
-                        session,
-                        role,
-                        schema,
-                        perm,
-                        val,
-                        alias,
-                        binds,
-                        tables,
-                        depth + 1,
-                    )?
+                    compile_client_where(scan, val, alias, binds, tables, depth + 1,)?
                 ));
             }
             col_name => {
                 if let Some(col) = schema.columns.iter().find(|c| c.column_name == *col_name) {
-                    if !perm.allows_column(col_name) {
+                    if !scan.allows_column(col_name) {
                         if inner.strict_where {
                             return Err(format!("ungranted where column `{col_name}`"));
                         }
@@ -358,103 +341,37 @@ fn compile_client_where(
                     .iter()
                     .find(|r| r.field_name == *col_name)
                 {
-                    // Relationship predicate → EXISTS
-                    let target = match inner.catalog.get(&rel.target_model) {
-                        Some(t) => t,
-                        None => {
-                            if inner.strict_where {
-                                return Err(format!(
-                                    "unknown where field `{col_name}` (relationship target missing)"
-                                ));
-                            }
-                            continue;
+                    // Relationship predicate → EXISTS over the target as this
+                    // privilege reads it, so the target's row policy cannot be
+                    // bypassed by a source-model predicate.
+                    let Some(target) = scan.target(rel) else {
+                        if inner.strict_where {
+                            return Err(format!("ungranted where relationship `{col_name}`"));
                         }
-                    };
-                    tables.push(target.schema.table_name.clone());
-                    let target_perm = match inner
-                        .permissions
-                        .get(&(rel.target_model.clone(), role.to_string()))
-                    {
-                        Some(p) => &p.permission,
-                        None => {
-                            if inner.strict_where {
-                                return Err(format!("ungranted where relationship `{col_name}`"));
-                            }
-                            continue;
-                        }
+                        continue;
                     };
                     let child_alias = format!("cw{depth}");
-                    // Entering a relationship is a new target-model access path.
-                    // Compile the complete target WHERE so its row policy cannot
-                    // be bypassed by a source-model client predicate.
-                    let inner_pred = compile_where(
+                    let link = relationship_link(
                         inner,
-                        session,
-                        role,
-                        &target.schema,
-                        target_perm,
-                        Some(val),
+                        schema,
+                        rel,
+                        target.schema,
+                        alias,
                         &child_alias,
-                        binds,
+                        &format!("cwj{depth}"),
                         tables,
-                        depth + 1,
                     )?;
-                    match rel.kind {
-                        RelationshipKind::HasMany => {
-                            let join_pred = compile_has_many_join(
-                                schema,
-                                rel,
-                                &target.schema,
-                                alias,
-                                &child_alias,
-                            )?;
-                            preds.push(format!(
-                                "EXISTS (SELECT 1 FROM \"{}\" {child_alias} WHERE {join_pred} AND ({inner_pred}))",
-                                target.schema.table_name
-                            ));
-                        }
-                        RelationshipKind::BelongsTo => {
-                            let join_pred = compile_belongs_to_join(
-                                schema,
-                                rel,
-                                &target.schema,
-                                alias,
-                                &child_alias,
-                            )?;
-                            preds.push(format!(
-                                "EXISTS (SELECT 1 FROM \"{}\" {child_alias} WHERE {join_pred} AND ({inner_pred}))",
-                                target.schema.table_name
-                            ));
-                        }
-                        RelationshipKind::ManyToMany => {
-                            let through = rel
-                                .through
-                                .as_deref()
-                                .ok_or_else(|| "m2m rel missing through".to_string())?;
-                            let through_entry = inner
-                                .by_table
-                                .get(through)
-                                .and_then(|m| inner.catalog.get(m))
-                                .ok_or_else(|| format!("through `{through}` missing"))?;
-                            let join = resolve_m2m_join_keys(
-                                schema,
-                                rel,
-                                &through_entry.schema,
-                                &target.schema,
-                            )
-                            .map_err(|error| error.to_string())?;
-                            let join_alias = format!("cwj{depth}");
-                            tables.push(through.to_string());
-                            let on_target =
-                                join_predicate_m2m_pairs(&join_alias, &child_alias, &join.target)?;
-                            let parent_pred =
-                                join_predicate_m2m_pairs(&join_alias, alias, &join.parent)?;
-                            preds.push(format!(
-                                "EXISTS (SELECT 1 FROM \"{through}\" {join_alias} JOIN \"{}\" {child_alias} ON {on_target} WHERE {parent_pred} AND ({inner_pred}))",
-                                target.schema.table_name
-                            ));
-                        }
-                    }
+                    preds.push(format!(
+                        "EXISTS (SELECT 1 {})",
+                        target.visible_rows(
+                            &child_alias,
+                            &link,
+                            Some(val),
+                            binds,
+                            tables,
+                            depth + 1
+                        )?
+                    ));
                 } else if inner.strict_where {
                     return Err(format!("unknown where field `{col_name}`"));
                 }
@@ -481,6 +398,28 @@ fn compile_client_op(
 ) -> Result<String, String> {
     let col_ref = format!("{alias}.\"{column}\"");
     match op {
+        "_icontains" => {
+            let Value::String(text) = rhs else {
+                return Err("_icontains requires a string".into());
+            };
+            // Use an explicit escape character on both dialects. The operand
+            // stays a bind parameter; user text never becomes SQL or a wildcard.
+            let mut pattern = String::from("%");
+            for ch in text.chars() {
+                if matches!(ch, '!' | '%' | '_') {
+                    pattern.push('!');
+                }
+                pattern.push(ch);
+            }
+            pattern.push('%');
+            compile_text_pattern(inner.dialect, &col_ref, &pattern, '!', false, binds)
+        }
+        "_like" | "_ilike" => {
+            let Value::String(pattern) = rhs else {
+                return Err(format!("{op} requires a string"));
+            };
+            compile_text_pattern(inner.dialect, &col_ref, pattern, '\\', op == "_like", binds)
+        }
         "_is_null" => {
             let yes = matches!(rhs, Value::Boolean(true));
             Ok(if yes {
@@ -509,10 +448,14 @@ fn compile_client_op(
             }
             let mut phs = Vec::new();
             for item in items {
-                binds.push(value_to_bind(item, column_type)?);
-                phs.push(placeholder(inner.dialect, binds.len()));
+                phs.push(comparand(
+                    inner.dialect,
+                    value_to_bind(item, column_type)?,
+                    binds,
+                ));
             }
             let sql_op = if op == "_in" { "IN" } else { "NOT IN" };
+            let col_ref = comparison_operand(inner.dialect, column_type, &col_ref, false);
             Ok(format!("{col_ref} {sql_op} ({})", phs.join(", ")))
         }
         other => {
@@ -523,8 +466,6 @@ fn compile_client_op(
                 "_gte" => ">=",
                 "_lt" => "<",
                 "_lte" => "<=",
-                "_like" => "LIKE",
-                "_ilike" => inner.dialect.ops().ilike_op,
                 "_contains" => {
                     require_postgres_json_op(inner.dialect, "_contains")?;
                     "@>"
@@ -539,9 +480,15 @@ fn compile_client_op(
                 }
                 _ => return Err(format!("unknown comparison op `{other}`")),
             };
-            binds.push(value_to_bind(rhs, column_type)?);
-            let ph = placeholder(inner.dialect, binds.len());
+            let ph = comparand(inner.dialect, value_to_bind(rhs, column_type)?, binds);
             let cast_ph = cast_placeholder(inner.dialect, column_type, &ph);
+            let col_ref = match other {
+                "_eq" | "_neq" => comparison_operand(inner.dialect, column_type, &col_ref, false),
+                "_gt" | "_gte" | "_lt" | "_lte" => {
+                    comparison_operand(inner.dialect, column_type, &col_ref, true)
+                }
+                _ => col_ref,
+            };
             Ok(format!("{col_ref} {sql_op} {cast_ph}"))
         }
     }
@@ -557,6 +504,34 @@ fn require_postgres_json_op(dialect: SqlDialect, op: &str) -> Result<(), String>
             "unknown comparison op `{op}` is not supported on sqlite"
         )),
     }
+}
+
+/// Push the pattern bind and return the predicate; see [`text_pattern`].
+fn compile_text_pattern(
+    dialect: SqlDialect,
+    col_ref: &str,
+    pattern: &str,
+    escape: char,
+    case_sensitive: bool,
+    binds: &mut Vec<BindValue>,
+) -> Result<String, String> {
+    let ph = placeholder(dialect, binds.len() + 1);
+    let (sql, bind) = text_pattern(dialect, col_ref, &ph, pattern, escape, case_sensitive)?;
+    binds.push(BindValue::Text(bind));
+    Ok(sql)
+}
+
+/// The right side of a comparison: a placeholder for `bind`, or `NULL`.
+///
+/// A NULL is written into the statement rather than bound. A bound NULL has
+/// to be given some type, and Postgres then rejects it against a column of
+/// any other type instead of answering unknown as SQLite does.
+fn comparand(dialect: SqlDialect, bind: BindValue, binds: &mut Vec<BindValue>) -> String {
+    if matches!(bind, BindValue::Null) {
+        return "NULL".into();
+    }
+    binds.push(bind);
+    placeholder(dialect, binds.len())
 }
 
 fn cast_placeholder(dialect: SqlDialect, column_type: &ColumnType, ph: &str) -> String {

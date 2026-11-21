@@ -12,8 +12,8 @@ mod tests;
 mod token;
 mod types;
 
-pub use accumulator::ProtocolResponseAccumulator;
 pub(crate) use accumulator::issue_projection_obligation_token;
+pub use accumulator::ProtocolResponseAccumulator;
 pub(crate) use projection_metadata::{
     CommandProjectionLifecycleProofV1, CommandProjectionMetadataError, CommandProjectionMetadataV1,
     CommandProjectionObligationV1, MAX_COMMAND_PROJECTION_OBLIGATIONS,
@@ -25,7 +25,7 @@ pub(crate) use token::{
 pub(crate) use types::{
     DistributedCommandConsistency, DistributedCommandMetadata, DistributedCommandState,
     DistributedEnvelopeV1, DistributedIndexRevision, DistributedLiveCursor,
-    DistributedLiveMetadata, DistributedProjectionDisposition, DistributedProjectionExpectation,
-    DistributedProjectionObservation, DistributedQuerySnapshot, DistributedRecordRevision,
-    DistributedTrustedPreset, RequestedLiveResume,
+    DistributedLiveMetadata, DistributedLiveMode, DistributedProjectionDisposition,
+    DistributedProjectionExpectation, DistributedProjectionObservation, DistributedQuerySnapshot,
+    DistributedRecordRevision, DistributedTrustedPreset, RequestedLiveResume,
 };

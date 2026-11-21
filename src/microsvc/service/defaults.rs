@@ -25,10 +25,7 @@ impl Routes<()> {
         locks: L,
         read_models: S,
     ) -> Routes<
-        RepoReadModelDependencies<
-            crate::AggregateRepository<crate::QueuedRepository<R, L>, A>,
-            S,
-        >,
+        RepoReadModelDependencies<crate::AggregateRepository<crate::QueuedRepository<R, L>, A>, S>,
     >
     where
         R: crate::GetStream + crate::TransactionalCommit + Clone + Send + Sync + 'static,
@@ -48,6 +45,28 @@ impl Routes<()> {
         use crate::{AggregateBuilder, Queueable};
         Routes::new()
             .with_repo(repo.queued_with(locks).aggregate::<A>())
+            .with_read_model_store(read_models)
+    }
+
+    /// Wire a repository and a read-model store with no aggregate, for
+    /// commands that own no stream (a provider webhook, a reconciliation).
+    ///
+    /// Typed commands registered here run the same ledgered pipeline as an
+    /// aggregate's. Their handlers receive `CausalCommandContext<'_, ()>` and
+    /// seal outbox messages and read-model plans with
+    /// `ctx.outbox(message).commit()`, or return `PreparedCommand::prepare`
+    /// when they stage nothing.
+    pub fn for_stores<R, S>(
+        repo: R,
+        read_models: S,
+    ) -> Routes<RepoReadModelDependencies<crate::AggregateRepository<R, ()>, S>>
+    where
+        S: HasReadModelStore + Send + Sync + 'static,
+        crate::AggregateRepository<R, ()>:
+            HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
+    {
+        Routes::new()
+            .with_repo(crate::AggregateRepository::new(repo))
             .with_read_model_store(read_models)
     }
 

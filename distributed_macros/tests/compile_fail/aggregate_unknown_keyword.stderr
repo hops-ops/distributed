@@ -1,5 +1,0 @@
-error: expected `aggregate_type`
-  --> tests/compile_fail/aggregate_unknown_keyword.rs:16:26
-   |
-16 | aggregate!(Todo, entity, aggregate_kind = "todos" {
-   |                          ^^^^^^^^^^^^^^

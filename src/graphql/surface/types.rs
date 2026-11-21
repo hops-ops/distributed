@@ -47,17 +47,29 @@ impl SurfaceOptions {
     }
 }
 
-/// Row-authorization semantics retained on the role/application surface.
+/// Row authorization for one model on a selected role/application surface.
 ///
-/// `ServerOnly` is the fail-closed representation when a predicate differs
-/// across application roles or references a field that is not authorized on
-/// the selected surface. Clients may revalidate such collections but must not
-/// evaluate membership locally.
+/// The server executes [`filter`](Self::filter) on every access path. The
+/// variant says what the client contract may learn: a `Predicate` is exported
+/// and evaluated locally; a `ServerOnly` predicate is never exported, because
+/// it differs across the application's schema roles or references something
+/// the selected surface does not authorize. Clients may revalidate such
+/// collections but must not evaluate membership locally.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SurfaceRowPolicy {
     Unrestricted,
     Predicate(FilterExpr),
-    ServerOnly,
+    ServerOnly(FilterExpr),
+}
+
+impl SurfaceRowPolicy {
+    /// The predicate the server enforces, whether or not it is exported.
+    pub fn filter(&self) -> Option<&FilterExpr> {
+        match self {
+            Self::Unrestricted => None,
+            Self::Predicate(filter) | Self::ServerOnly(filter) => Some(filter),
+        }
+    }
 }
 
 /// Semantic category for one GraphQL field argument.
@@ -172,6 +184,7 @@ pub struct SurfaceTypeField {
     pub nullable: bool,
     pub list: bool,
     pub item_nullable: bool,
+    pub unsigned_integer: Option<crate::command::CommandUnsignedInteger>,
     pub nested: Option<Box<SurfaceTypeDef>>,
 }
 
@@ -197,14 +210,9 @@ pub struct SurfaceCommand {
     pub output: SurfaceCommandShape,
     pub consistency: CommandConsistency,
     pub(crate) input_defaults: Vec<CommandInputDefault>,
-    pub(crate) effects: Option<CommandEffects>,
-    pub(crate) confirmations: Vec<CommandProjectionConfirmation>,
     pub(crate) projected_model: Option<CommandProjectedModel>,
     pub(crate) direct_projection: Option<CommandDirectProjectionTarget>,
     pub(crate) projections: CommandProjectionEvents,
-    /// Authorization selection erased at least one required confirmation.
-    /// No hidden projector/model/key IDs may survive into client artifacts.
-    pub(crate) confirmation_unavailable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,6 +488,20 @@ pub struct SurfaceModel {
     pub(crate) schema: TableSchema,
 }
 
+impl SurfaceModel {
+    /// Stop exporting the row predicate; the server keeps enforcing it.
+    pub(crate) fn keep_row_policy_server_only(&mut self) {
+        if let SurfaceRowPolicy::Predicate(filter) = &self.row_policy {
+            self.row_policy = SurfaceRowPolicy::ServerOnly(filter.clone());
+        }
+    }
+
+    /// Whether this privilege may read `column`.
+    pub(crate) fn allows_column(&self, column: &str) -> bool {
+        self.columns.iter().any(|field| field.name == column)
+    }
+}
+
 /// Whether this selected Surface exposes a complete client-safe normalized
 /// identity for the model. Both manifest normalization and keyed optimistic
 /// effects use this single predicate so an embedded model can never receive an
@@ -540,8 +562,10 @@ pub struct Surface {
     pub(crate) projectors_attached: bool,
     /// Non-serializable provenance proving typed commands came from one
     /// executable Service inventory rather than a lookalike command list.
-    pub(crate) service_binding:
-        Option<crate::graphql::command_contract::TypedServiceCommandBinding>,
+    pub(crate) service_binding: Option<crate::command::TypedServiceCommandBinding>,
+    /// Leaderboard surfaces ([`super::LeaderboardSurface`]). On a role or
+    /// application surface each one carries only that selection's grant.
+    pub(crate) leaderboards: Vec<super::LeaderboardSurface>,
 }
 
 /// Debug output is intentionally limited to already-authorized public IDs.
@@ -564,7 +588,9 @@ impl std::fmt::Debug for Surface {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SurfaceSelection {
     Catalog,
-    Role { name: String },
+    Role {
+        name: String,
+    },
     Application {
         name: String,
         eligible_roles: Vec<String>,
@@ -640,7 +666,8 @@ impl Surface {
                         })
                     })
                     .collect::<Vec<_>>();
-                relationships.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+                relationships
+                    .sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
                 serde_json::json!({
                     "model_name": model.model_name,
                     "table_name": model.table_name,
@@ -658,7 +685,11 @@ impl Surface {
             .query_fields
             .iter()
             .map(|root| root_value("query", root))
-            .chain(self.subscription_fields.iter().map(|root| root_value("subscription", root)))
+            .chain(
+                self.subscription_fields
+                    .iter()
+                    .map(|root| root_value("subscription", root)),
+            )
             .collect::<Vec<_>>();
         roots.sort_by(|left, right| {
             (left["operation"].as_str(), left["name"].as_str())
@@ -676,16 +707,17 @@ impl Surface {
                     "output": command_shape_value(&command.output),
                     "consistency": command.consistency,
                     "input_defaults": command.input_defaults,
-                    "effects": command.effects,
-                    "confirmations": command.confirmations,
                     "projected_model": command.projected_model.as_ref().map(|model| model.model.clone()),
                     "direct_projection": command.direct_projection.as_ref().map(|target| target.canonical_value()),
                     "projections": command.projections,
-                    "confirmation_unavailable": command.confirmation_unavailable,
                 })
             })
             .collect::<Vec<_>>();
-        commands.sort_by(|left, right| left["command_name"].as_str().cmp(&right["command_name"].as_str()));
+        commands.sort_by(|left, right| {
+            left["command_name"]
+                .as_str()
+                .cmp(&right["command_name"].as_str())
+        });
         let mut projectors = self
             .projectors
             .iter()
@@ -708,7 +740,7 @@ impl Surface {
             })
             .collect::<Result<Vec<_>, _>>()?;
         projectors.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "version": 1,
             "selection": selection,
             "dialect": format!("{:?}", self.dialect).to_ascii_lowercase(),
@@ -724,6 +756,16 @@ impl Surface {
             "projectors": projectors,
             "projectors_attached": self.projectors_attached,
         });
+        // Absent (not empty) without leaderboards, so existing contract
+        // identities and fingerprints are unchanged.
+        if !self.leaderboards.is_empty() {
+            value["leaderboards"] = serde_json::Value::Array(
+                self.leaderboards
+                    .iter()
+                    .map(super::LeaderboardSurface::canonical_value)
+                    .collect(),
+            );
+        }
         Ok(crate::application::canonical_json(&value))
     }
 
@@ -789,7 +831,7 @@ impl Surface {
                 &self.projectors,
                 &self.models,
             )?;
-            validate_command_confirmation_topology(&self.commands, &self.projectors, &self.models)?;
+            validate_command_projection_topology(&self.commands, &self.projectors, &self.models)?;
         }
         self.commands_attached = true;
         Ok(self)
@@ -805,10 +847,7 @@ impl Surface {
 
     /// Bind several explicit logical modules before role/application
     /// authorization selection.
-    pub fn with_modules<'a, I>(
-        mut self,
-        modules: I,
-    ) -> Result<Self, String>
+    pub fn with_modules<'a, I>(mut self, modules: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = &'a crate::application::Module>,
     {
@@ -825,7 +864,8 @@ impl Surface {
         for module in modules {
             contracts.extend(module.typed_command_contracts()?);
         }
-        let inventory = crate::graphql::commands::TypedCommandInventory::from_contracts(&contracts)?;
+        let inventory =
+            crate::graphql::commands::TypedCommandInventory::from_contracts(&contracts)?;
         self = self.with_typed_commands(&inventory)?;
         Ok(self)
     }
@@ -856,7 +896,7 @@ impl Surface {
     #[cfg(any(test, feature = "graphql"))]
     pub(crate) fn with_service_binding(
         mut self,
-        binding: Option<crate::graphql::command_contract::TypedServiceCommandBinding>,
+        binding: Option<crate::command::TypedServiceCommandBinding>,
     ) -> Self {
         self.service_binding = binding;
         self
@@ -873,6 +913,45 @@ impl Surface {
 
     /// Attach and validate a mixed registry of asynchronous projectors and
     /// same-transaction-only projection owners.
+    /// Attach leaderboard surfaces to the unselected catalog Surface. Role and
+    /// application selection keep each one only where it is granted.
+    pub fn with_leaderboards(
+        mut self,
+        leaderboards: impl IntoIterator<Item = super::LeaderboardSurface>,
+    ) -> Result<Self, String> {
+        if !matches!(self.selection, SurfaceSelection::Catalog) {
+            return Err(
+                "leaderboards can only be attached to the unselected catalog Surface before authorization selection"
+                    .into(),
+            );
+        }
+        let leaderboards = leaderboards.into_iter().collect::<Vec<_>>();
+        let roots = self
+            .query_fields
+            .iter()
+            .chain(&self.subscription_fields)
+            .map(|root| root.name.as_str())
+            .chain(
+                self.commands
+                    .iter()
+                    .map(|command| command.field_name.as_str()),
+            )
+            .collect::<Vec<_>>();
+        let types = self
+            .models
+            .values()
+            .map(|model| model.object_name.as_str())
+            .collect::<Vec<_>>();
+        super::leaderboard::validate_leaderboards(&leaderboards, &roots, &types)?;
+        self.leaderboards = leaderboards;
+        Ok(self)
+    }
+
+    /// Leaderboard surfaces visible on this selection.
+    pub fn leaderboards(&self) -> &[super::LeaderboardSurface] {
+        &self.leaderboards
+    }
+
     pub fn with_projection_owners(
         mut self,
         projectors: impl IntoIterator<Item = SurfaceProjectionOwner>,
@@ -1004,7 +1083,7 @@ impl Surface {
         bind_surface_direct_projection_targets(&mut self.commands, &out, &self.models)?;
         self.projectors = out;
         self.projectors_attached = true;
-        validate_command_confirmation_topology(&self.commands, &self.projectors, &self.models)?;
+        validate_command_projection_topology(&self.commands, &self.projectors, &self.models)?;
         Ok(self)
     }
 }
@@ -1057,14 +1136,20 @@ fn command_shape_value(shape: &SurfaceCommandShape) -> serde_json::Value {
 fn type_def_value(definition: &SurfaceTypeDef) -> serde_json::Value {
     serde_json::json!({
         "name": definition.name,
-        "fields": definition.fields.iter().map(|field| serde_json::json!({
+        "fields": definition.fields.iter().map(|field| {
+            let mut value = serde_json::json!({
             "name": field.name,
             "type_name": field.type_name,
             "nullable": field.nullable,
             "list": field.list,
             "item_nullable": field.item_nullable,
             "nested": field.nested.as_deref().map(type_def_value),
-        })).collect::<Vec<_>>(),
+            });
+            if let Some(unsigned) = field.unsigned_integer {
+                value["unsigned_integer"] = serde_json::json!(unsigned);
+            }
+            value
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -1074,7 +1159,7 @@ fn row_policy_value(policy: &SurfaceRowPolicy) -> serde_json::Value {
         SurfaceRowPolicy::Predicate(predicate) => {
             serde_json::json!({"kind": "predicate", "expression": predicate})
         }
-        SurfaceRowPolicy::ServerOnly => serde_json::json!({"kind": "server_only"}),
+        SurfaceRowPolicy::ServerOnly(_) => serde_json::json!({"kind": "server_only"}),
     }
 }
 

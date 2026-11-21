@@ -7,14 +7,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::claims::{map_claims_to_session_with_provenance, ClaimMapConfig};
+use crate::command_dispatch::principal::{
+    normalize_issuer, VerifiedAudience, VerifiedAudienceSource,
+};
+pub use crate::command_dispatch::principal::{InvalidPrincipal, VerifiedPrincipal};
 use crate::microsvc::Session;
 
 const DEFAULT_JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 const DEFAULT_JWKS_FORCED_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+const DEFAULT_JWKS_REFRESH_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const OIDC_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// OIDC validation configuration (behavior normative; field names free).
@@ -30,6 +34,9 @@ pub struct OidcConfig {
     pub jwks_cache_ttl: Duration,
     /// Minimum interval between refreshes forced by tokens with unknown key IDs.
     pub jwks_forced_refresh_cooldown: Duration,
+    /// After a failed refresh, how long to keep serving the keys already held
+    /// (or keep failing, when there are none) before asking the issuer again.
+    pub jwks_refresh_failure_backoff: Duration,
     pub clock_skew: Duration,
     pub alg_allowlist: Vec<String>,
     /// When true (default), missing Bearer → Unauthorized.
@@ -54,6 +61,7 @@ impl OidcConfig {
             jwks_uri: None,
             jwks_cache_ttl: DEFAULT_JWKS_CACHE_TTL,
             jwks_forced_refresh_cooldown: DEFAULT_JWKS_FORCED_REFRESH_COOLDOWN,
+            jwks_refresh_failure_backoff: DEFAULT_JWKS_REFRESH_FAILURE_BACKOFF,
             clock_skew: Duration::from_secs(60),
             alg_allowlist: vec!["RS256".into(), "ES256".into()],
             require_auth: true,
@@ -95,122 +103,6 @@ impl OidcConfig {
     ) -> Self {
         self.principal_tenant_claims = claims.into_iter().map(Into::into).collect();
         self
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum VerifiedAudienceSource {
-    Aud,
-    AuthorizedParty,
-    ClientId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct VerifiedAudience {
-    source: VerifiedAudienceSource,
-    value: String,
-}
-
-/// Authentication proof admitted to durable causal dispatch.
-///
-/// There is no deserializer and no constructor from a [`Session`] or header
-/// map. Production callers obtain this only from the OIDC/identity adapters.
-/// [`Self::test_oidc`] exists so wait-path tests can invoke causal dispatch
-/// without forging identity headers.
-#[derive(Clone, PartialEq, Eq)]
-pub struct VerifiedPrincipal {
-    issuer: String,
-    subject: String,
-    audiences: Vec<VerifiedAudience>,
-    tenant_partitions: Vec<(String, Value)>,
-}
-
-impl VerifiedPrincipal {
-    /// Reconstruct a wait-path principal from a trusted transport subject
-    /// (HTTP headers / gRPC metadata after the proxy has stripped forgeries).
-    /// Not a constructor from client JSON.
-    pub fn from_trusted_transport(subject: &str) -> Self {
-        Self::test_oidc(
-            "https://distributed.local/wait-path",
-            subject,
-            &["distributed-wait-path"],
-        )
-    }
-
-    /// Test-only OIDC principal. Not a production identity constructor.
-    pub fn test_oidc(issuer: &str, subject: &str, audiences: &[&str]) -> Self {
-        assert!(
-            !issuer.trim().is_empty(),
-            "test OIDC issuer must not be empty"
-        );
-        assert!(
-            !subject.trim().is_empty(),
-            "test OIDC subject must not be empty"
-        );
-        assert!(
-            !audiences.is_empty() && audiences.iter().all(|value| !value.trim().is_empty()),
-            "test OIDC audiences must contain only non-empty values"
-        );
-        Self {
-            issuer: normalize_issuer(issuer),
-            subject: subject.to_string(),
-            audiences: audiences
-                .iter()
-                .map(|value| VerifiedAudience {
-                    source: VerifiedAudienceSource::Aud,
-                    value: (*value).to_string(),
-                })
-                .collect(),
-            tenant_partitions: Vec::new(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn issuer(&self) -> &str {
-        &self.issuer
-    }
-
-    #[cfg(test)]
-    pub(crate) fn subject(&self) -> &str {
-        &self.subject
-    }
-
-    pub(crate) fn subject_matches(&self, subject: &str) -> bool {
-        self.subject == subject
-    }
-
-    /// Versioned, domain-separated partition for one exact service identity.
-    pub(crate) fn partition_for_service(&self, service_id: &str) -> String {
-        let mut audiences = self
-            .audiences
-            .iter()
-            .map(|audience| audience.value.as_str())
-            .collect::<Vec<_>>();
-        audiences.sort_unstable();
-        audiences.dedup();
-        let canonical = serde_json::to_vec(&serde_json::json!({
-            "domain": "distributed.principal-partition",
-            "version": 1,
-            "service_id": service_id,
-            "issuer": self.issuer,
-            "subject": self.subject,
-            "audiences": audiences,
-            "tenant_partitions": self.tenant_partitions,
-        }))
-        .expect("verified principal partition values are JSON serializable");
-        format!("v1:sha256:{:x}", Sha256::digest(canonical))
-    }
-}
-
-impl std::fmt::Debug for VerifiedPrincipal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("VerifiedPrincipal")
-            .field("issuer", &self.issuer)
-            .field("subject", &"[redacted]")
-            .field("audiences", &"[redacted]")
-            .field("tenant_partitions", &"[redacted]")
-            .finish()
     }
 }
 
@@ -268,19 +160,25 @@ struct JwkKey {
     crv: Option<String>,
     x: Option<String>,
     y: Option<String>,
-    #[allow(dead_code)]
-    #[serde(rename = "use")]
-    use_: Option<String>,
 }
 
 struct JwksCache {
     keys: HashMap<String, DecodingKey>,
     refreshed_at: Option<Instant>,
     last_forced_refresh: Option<Instant>,
+    last_failed_refresh: Option<Instant>,
     generation: u64,
 }
 
 impl JwksCache {
+    fn usable_or_unavailable(&self) -> Result<(), ValidationError> {
+        if self.keys.is_empty() {
+            Err(ValidationError::Jwks)
+        } else {
+            Ok(())
+        }
+    }
+
     fn is_fresh(&self, ttl: Duration) -> bool {
         !self.keys.is_empty()
             && self
@@ -306,6 +204,7 @@ impl OidcValidator {
                 keys: HashMap::new(),
                 refreshed_at: None,
                 last_forced_refresh: None,
+                last_failed_refresh: None,
                 generation: 0,
             }),
             refresh: AsyncMutex::new(()),
@@ -327,6 +226,7 @@ impl OidcValidator {
         let mut cache = self.cache.write().map_err(|_| ValidationError::Jwks)?;
         cache.keys = keys;
         cache.refreshed_at = Some(Instant::now());
+        cache.last_failed_refresh = None;
         cache.generation = cache.generation.wrapping_add(1);
         Ok(())
     }
@@ -415,6 +315,15 @@ impl OidcValidator {
             if cache.generation != observed_generation {
                 return Ok(());
             }
+            // The issuer failed recently: do not queue every request behind
+            // another timeout. Keys already held stay good for signature
+            // checks; with none, fail at once.
+            if cache
+                .last_failed_refresh
+                .is_some_and(|failed| failed.elapsed() < self.config.jwks_refresh_failure_backoff)
+            {
+                return cache.usable_or_unavailable();
+            }
             if unknown_kid {
                 if cache.last_forced_refresh.is_some_and(|last_refresh| {
                     last_refresh.elapsed() < self.config.jwks_forced_refresh_cooldown
@@ -428,6 +337,15 @@ impl OidcValidator {
             }
         }
 
+        if self.fetch_jwks().await.is_ok() {
+            return Ok(());
+        }
+        let mut cache = self.cache.write().map_err(|_| ValidationError::Jwks)?;
+        cache.last_failed_refresh = Some(Instant::now());
+        cache.usable_or_unavailable()
+    }
+
+    async fn fetch_jwks(&self) -> Result<(), ValidationError> {
         if let Some(jwks) = &self.config.static_jwks {
             return self.load_jwks_json(jwks);
         }
@@ -614,10 +532,6 @@ fn parse_jwks_keys(jwks: &str) -> Result<HashMap<String, DecodingKey>, Validatio
     Ok(keys)
 }
 
-fn normalize_issuer(iss: &str) -> String {
-    iss.trim_end_matches('/').to_string()
-}
-
 fn jwk_alg_matches(jwk_alg: Option<&str>, expected: &str) -> bool {
     jwk_alg.is_none_or(|alg| alg.eq_ignore_ascii_case(expected))
 }
@@ -731,12 +645,13 @@ fn verified_principal(
         tenant_partitions.push((path.to_string(), canonical_json_value(value)));
     }
 
-    Ok(VerifiedPrincipal {
+    Ok(VerifiedPrincipal::oidc(
         issuer,
         subject,
         audiences,
         tenant_partitions,
-    })
+        claims.get("exp").and_then(Value::as_u64),
+    ))
 }
 
 fn claim_at_path<'a>(claims: &'a Value, path: &str) -> Option<&'a Value> {

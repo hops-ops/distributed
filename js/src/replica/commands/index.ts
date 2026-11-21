@@ -14,16 +14,10 @@ export {
 export type {
 	PrepareReplicaCommandOptions,
 	ReplicaCommandArtifact,
-	ReplicaCommandConfirmation,
-	ReplicaCommandConfirmations,
 	ReplicaCommandContractErrorCode,
 	ReplicaCommandDirectProjection,
-	ReplicaCommandEffect,
 	ReplicaCommandEffectExpression,
-	ReplicaCommandEffectField,
-	ReplicaCommandEffectKey,
 	ReplicaCommandEffectRelationship,
-	ReplicaCommandEffects,
 	ReplicaCommandGenerators,
 	ReplicaCommandInputDefault,
 	ReplicaCommandInputDefaults,
@@ -35,11 +29,6 @@ export type {
 	ReplicaCommandVariables,
 	ReplicaMatchedTrustedPresetInventory,
 	ReplicaPreparedCommand,
-	ReplicaPreparedCommandEffect,
-	ReplicaPreparedConfirmation,
-	ReplicaPreparedConfirmations,
-	ReplicaPreparedEffectField,
-	ReplicaPreparedEffectKey,
 	ReplicaReceiptVerification,
 	ReplicaTrustedPresetDescriptor
 } from './types.js';

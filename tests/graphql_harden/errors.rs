@@ -1,5 +1,6 @@
 //! E* Error-leakage red-team suite.
 
+use distributed::graphql::IdentityConfig;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,15 +8,15 @@ use async_graphql::Request;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 
 use super::common::{
-    assert_no_sql_leak, engine_all_columns, error_messages, extension_code, seed_orders, session,
-    OrderView,
+    assert_no_sql_leak, engine_all_columns, error_messages, extension_code, order, seed_orders,
+    session, Db, OrderView,
 };
 
 /// Compile errors must not leak SQL.
-#[tokio::test]
-async fn compile_errors_do_not_leak_sql() {
-    let pool = seed_orders().await;
+pub async fn compile_errors_do_not_leak_sql(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .max_in_list(1)
@@ -38,36 +39,22 @@ async fn e3_sqlite_statement_timeout_returns_timeout_code() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("graphql_harden_timeout_e3");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let db = dir.join("orders.db");
-    let url = format!("sqlite:{}?mode=rwc", db.display());
+    let url = format!("sqlite:{}?mode=rwc", dir.join("orders.db").display());
 
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE orders (
-            order_id TEXT PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            status TEXT NOT NULL,
-            total_cents INTEGER NOT NULL,
-            note TEXT NOT NULL
-        );
-        INSERT INTO orders VALUES
-            ('o1', 'tenant-a', 'open', 100, 'n');",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    let db = Db::sqlite_at(&url).await;
+    db.seed([order("o1", "tenant-a", "open", 100, "n")]).await;
+    let Db::Sqlite(repository) = &db else {
+        unreachable!()
+    };
 
-    let mut hold = pool.acquire().await.unwrap();
+    let mut hold = repository.pool().acquire().await.unwrap();
     sqlx::query("BEGIN EXCLUSIVE")
         .execute(&mut *hold)
         .await
         .unwrap();
 
-    let engine = GraphqlEngine::builder(pool.clone())
+    let engine = GraphqlEngine::builder(db.pool())
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .statement_timeout(Duration::from_millis(80))
@@ -106,15 +93,10 @@ async fn e3_sqlite_statement_timeout_returns_timeout_code() {
 }
 
 /// E2: execute failure (missing table) maps to INTERNAL without SQL/schema leak.
-#[tokio::test]
-async fn e2_execute_failure_is_internal_without_sql_leak() {
-    let pool = seed_orders().await;
-    let engine = engine_all_columns(pool.clone());
+pub async fn e2_execute_failure_is_internal_without_sql_leak(db: Db) {
+    let engine = engine_all_columns(seed_orders(&db).await);
     // Drop table so the compiler-produced SELECT fails at execute time.
-    sqlx::query("DROP TABLE orders")
-        .execute(&pool)
-        .await
-        .unwrap();
+    db.execute("DROP TABLE orders").await;
 
     let s = session("user", "x");
     let resp = engine
@@ -128,7 +110,7 @@ async fn e2_execute_failure_is_internal_without_sql_leak() {
     for e in &resp.errors {
         let m = e.message.to_ascii_lowercase();
         assert!(
-            !m.contains("no such table") && !m.contains("orders"),
+            !m.contains("no such table") && !m.contains("does not exist") && !m.contains("orders"),
             "must not leak table/schema detail: {}",
             e.message
         );

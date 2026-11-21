@@ -9,17 +9,17 @@
 //! reject keys absent from `*_bool_exp` / `*_order_by` before compile runs.
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 
 use super::common::{
     assert_no_sql_leak, engine_all_columns, error_messages, extension_code, seed_orders, session,
-    OrderView,
+    Db, OrderView,
 };
 
 /// Default builder is fail-closed.
-#[tokio::test]
-async fn default_engine_has_strict_where_on() {
-    let pool = seed_orders().await;
+pub async fn default_engine_has_strict_where_on(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     assert!(
         engine.strict_where(),
@@ -28,9 +28,8 @@ async fn default_engine_has_strict_where_on() {
 }
 
 /// Unknown where key → error under default settings (not silent success).
-#[tokio::test]
-async fn strict_unknown_where_key_errors() {
-    let pool = seed_orders().await;
+pub async fn strict_unknown_where_key_errors(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     let s = session("user", "x");
     let resp = engine
@@ -55,10 +54,10 @@ async fn strict_unknown_where_key_errors() {
 }
 
 /// Denied where column → error under default settings.
-#[tokio::test]
-async fn strict_denied_where_column_errors() {
-    let pool = seed_orders().await;
+pub async fn strict_denied_where_column_errors(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["restricted"])
         .model::<OrderView>(
             ModelPermissions::new().grant("restricted", read().columns(["order_id", "status"])),
@@ -88,9 +87,8 @@ async fn strict_denied_where_column_errors() {
 }
 
 /// Junk order_by column → error under default settings.
-#[tokio::test]
-async fn strict_junk_order_by_column_errors() {
-    let pool = seed_orders().await;
+pub async fn strict_junk_order_by_column_errors(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     let s = session("user", "x");
     let resp = engine
@@ -114,9 +112,8 @@ async fn strict_junk_order_by_column_errors() {
 }
 
 /// Valid where + order_by still work under strict defaults.
-#[tokio::test]
-async fn strict_valid_where_and_order_still_work() {
-    let pool = seed_orders().await;
+pub async fn strict_valid_where_and_order_still_work(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);
     let s = session("user", "x");
     let resp = engine
@@ -135,10 +132,10 @@ async fn strict_valid_where_and_order_still_work() {
 }
 
 /// Escape hatch: strict_where(false) is opt-in and recorded on the engine.
-#[tokio::test]
-async fn soft_skip_mode_is_opt_in_only() {
-    let pool = seed_orders().await;
+pub async fn soft_skip_mode_is_opt_in_only(db: Db) {
+    let pool = seed_orders(&db).await;
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
         .strict_where(false)

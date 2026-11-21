@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS bus_log (
     CHECK (content_type <> '')
 );
 CREATE INDEX IF NOT EXISTS bus_log_name_seq_idx ON bus_log (name, seq);
+CREATE UNIQUE INDEX IF NOT EXISTS bus_log_message_id_unique_idx
+    ON bus_log (message_id) WHERE message_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS bus_offset (
     consumer TEXT PRIMARY KEY,
     source_epoch TEXT NOT NULL,
@@ -93,16 +95,16 @@ fn db_err(context: &str, err: sqlx::Error) -> TransportError {
     sql_db_err(SqliteBusDialect::BACKEND, context, err)
 }
 
-/// Push `(name IN (…) OR name IS NULL)` with one bind per name.
+/// Push `name IN (…)` with one bind per name.
 fn push_name_filter(query: &mut QueryBuilder<Sqlite>, names: &[String]) {
-    query.push("(name IN (");
+    query.push("name IN (");
     {
         let mut separated = query.separated(", ");
         for name in names {
             separated.push_bind(name.as_str());
         }
     }
-    query.push(") OR name IS NULL)");
+    query.push(")");
 }
 
 /// SQLite [`Bus`](super::Bus) + [`BusConsumer`](super::BusConsumer). Cheap to
@@ -110,13 +112,12 @@ fn push_name_filter(query: &mut QueryBuilder<Sqlite>, names: &[String]) {
 pub type SqliteBus = SqlBus<SqliteBusDialect>;
 
 /// A claimed SQLite `bus_queue` row: `ack` deletes it (done); `nack` makes it
-/// available again (redelivery); `dead_letter`/`park` delete it (stop
-/// redelivery). Settlement is fenced by the claim token.
+/// available again after the requested delay. Settlement is fenced by the
+/// claim token.
 pub type SqliteQueueReceived = SqlQueueReceived<SqliteBusDialect>;
 
 /// A SQLite `bus_log` entry: `ack` advances this consumer's offset to its
-/// `seq`; `nack` leaves the offset (redelivery); `dead_letter`/`park` advance
-/// past it (skip, don't get stuck).
+/// `seq`; `nack` leaves the offset, so the entry is read again.
 pub type SqliteLogReceived = SqlLogReceived<SqliteBusDialect>;
 
 impl SqliteBus {
@@ -285,94 +286,6 @@ impl SqlBusDialect for SqliteBusDialect {
             .execute(&self.pool)
             .await
             .map_err(|err| db_err("ensure_tables", err))?;
-        Ok(())
-    }
-
-    async fn ensure_ordered_log_schema(&self) -> Result<(), TransportError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|err| db_err("begin ordered-log schema upgrade", err))?;
-        // Acquire SQLite's writer reservation before inspecting legacy rows so
-        // duplicate validation, deletion, and unique-index creation are one
-        // serialized migration.
-        sqlx::query("UPDATE bus_log SET seq = seq WHERE 0")
-            .execute(&mut *transaction)
-            .await
-            .map_err(|err| db_err("lock ordered log for schema upgrade", err))?;
-        let offset_columns = sqlx::query("PRAGMA table_info(bus_offset)")
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(|err| db_err("inspect offset schema", err))?;
-        let has_source_epoch = offset_columns.iter().any(|column| {
-            column
-                .try_get::<String, _>("name")
-                .map(|name| name == "source_epoch")
-                .unwrap_or(false)
-        });
-        if !has_source_epoch {
-            sqlx::query("ALTER TABLE bus_offset ADD COLUMN source_epoch TEXT")
-                .execute(&mut *transaction)
-                .await
-                .map_err(|err| db_err("add offset epoch", err))?;
-        }
-        sqlx::query("DELETE FROM bus_offset WHERE source_epoch IS NULL OR source_epoch = ''")
-            .execute(&mut *transaction)
-            .await
-            .map_err(|err| db_err("clear legacy unbound offsets", err))?;
-
-        let duplicate_rows = sqlx::query(
-            "SELECT seq, name, message_id, kind, payload, content_type, metadata \
-             FROM bus_log \
-             WHERE message_id IN ( \
-                 SELECT message_id FROM bus_log \
-                 WHERE message_id IS NOT NULL \
-                 GROUP BY message_id HAVING COUNT(*) > 1 \
-             ) \
-             ORDER BY message_id, seq",
-        )
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(|err| db_err("inspect legacy stable message IDs", err))?;
-        let mut authoritative: Option<(String, Message)> = None;
-        let mut redundant = Vec::new();
-        for row in &duplicate_rows {
-            let message_id: String = row
-                .try_get("message_id")
-                .map_err(|err| db_err("decode legacy stable message ID", err))?;
-            let message = message_from_row(Self::BACKEND, row)?;
-            match authoritative.as_ref() {
-                Some((authoritative_id, authoritative_message))
-                    if authoritative_id == &message_id =>
-                {
-                    validate_log_retry(Self::BACKEND, authoritative_message, &message)?;
-                    redundant.push(
-                        row.try_get::<i64, _>("seq")
-                            .map_err(|err| db_err("decode redundant log position", err))?,
-                    );
-                }
-                _ => authoritative = Some((message_id, message)),
-            }
-        }
-        for seq in redundant {
-            sqlx::query("DELETE FROM bus_log WHERE seq = ?")
-                .bind(seq)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|err| db_err("deduplicate legacy stable message IDs", err))?;
-        }
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS bus_log_message_id_unique_idx \
-             ON bus_log (message_id) WHERE message_id IS NOT NULL",
-        )
-        .execute(&mut *transaction)
-        .await
-        .map_err(|err| db_err("fence stable message IDs", err))?;
-        transaction
-            .commit()
-            .await
-            .map_err(|err| db_err("commit ordered-log schema upgrade", err))?;
         Ok(())
     }
 
@@ -583,7 +496,7 @@ impl SqlBusDialect for SqliteBusDialect {
         query.push_bind(limit);
         query.push(
             ") \
-             RETURNING seq, claim_token, name, message_id, kind, payload, content_type, metadata",
+             RETURNING seq, claim_token, attempts, name, message_id, kind, payload, content_type, metadata",
         );
 
         let rows = query
@@ -597,9 +510,13 @@ impl SqlBusDialect for SqliteBusDialect {
                 let claim_token = row
                     .try_get("claim_token")
                     .map_err(|err| db_err("claim token", err))?;
+                let attempts: i64 = row
+                    .try_get("attempts")
+                    .map_err(|err| db_err("claim attempts", err))?;
                 Ok(ClaimedRow {
-                    row: ReceivedRow::from_row(Self::BACKEND, &row),
+                    row: ReceivedRow::from_row(Self::BACKEND, &row)?,
                     claim_token,
+                    attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
                 })
             })
             .collect()
@@ -641,10 +558,9 @@ impl SqlBusDialect for SqliteBusDialect {
             .await
             .map_err(|err| db_err("commit log read", err))?;
 
-        Ok(rows
-            .iter()
+        rows.iter()
             .map(|row| ReceivedRow::from_row(Self::BACKEND, row))
-            .collect())
+            .collect()
     }
 
     async fn verify_log_epoch(
@@ -674,12 +590,19 @@ impl SqlBusDialect for SqliteBusDialect {
         Ok(())
     }
 
-    async fn release_claim(&self, seq: i64, claim_token: &str) -> Result<(), TransportError> {
+    async fn release_claim(
+        &self,
+        seq: i64,
+        claim_token: &str,
+        delay_secs: f64,
+    ) -> Result<(), TransportError> {
         sqlx::query(
             "UPDATE bus_queue \
-             SET locked_until = NULL, claim_token = NULL \
+             SET locked_until = NULL, claim_token = NULL, \
+                 available_at = unixepoch('now','subsec') + ? \
              WHERE seq = ? AND claim_token = ?",
         )
+        .bind(delay_secs)
         .bind(seq)
         .bind(claim_token)
         .execute(&self.pool)

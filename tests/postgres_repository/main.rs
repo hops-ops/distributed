@@ -93,11 +93,9 @@ struct RelationalCounterView {
 }
 
 async fn repository() -> Option<(postgres::PostgresTestSchema, PostgresRepository)> {
-    let schema = postgres::PostgresTestSchema::create_from_env(
-        "postgres_repo",
-        "skipping Postgres integration test",
-    )
-    .await?;
+    let schema =
+        postgres::PostgresTestSchema::create_from_env("postgres_repo", "Postgres integration test")
+            .await?;
     let repo = schema.repository().await;
     Some((schema, repo))
 }
@@ -191,7 +189,7 @@ async fn migration_is_idempotent_and_uses_postgres_column_types() {
 async fn projected_command_ledger_rows_upgrade_to_atomic_and_preserve_checks() {
     let Some(schema) = postgres::PostgresTestSchema::create_from_env(
         "postgres_ledger_upgrade",
-        "skipping Postgres command-ledger upgrade test",
+        "Postgres command-ledger upgrade test",
     )
     .await
     else {
@@ -234,7 +232,7 @@ async fn projected_command_ledger_rows_upgrade_to_atomic_and_preserve_checks() {
         .fetch_one(repo.pool())
         .await
         .unwrap();
-    assert_eq!(latest_version, 4);
+    assert_eq!(latest_version, 13);
 
     let invalid_service = sqlx::query(
         r#"
@@ -337,6 +335,7 @@ async fn read_model_failure_mid_plan_rolls_back_events_and_outbox() {
     let err = repo
         .commit_batch(CommitBatch {
             inbox_receipts: Vec::new(),
+            schedules: Vec::new(),
             streams: vec![StreamWrite::new(identity.clone(), projection.entity_mut())],
             outbox_messages: vec![outbox_message],
             read_model_plans: vec![read_models.into_write_plan().unwrap()],

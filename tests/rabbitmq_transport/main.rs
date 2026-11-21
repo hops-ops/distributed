@@ -4,18 +4,15 @@
 //! `RabbitSource` (`basic_get`) against a broker. Skips when `AMQP_URL` is unset.
 #![cfg(feature = "rabbitmq")]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use distributed::bus::{
     run_source, Bus, BusConsumer, Handlers, MessagePublisher, RabbitBus, RabbitPublisher,
     RabbitSource, RunOptions, TransportError,
 };
 use distributed::microsvc::{Context, Message, MessageKind, Routes, Service};
-use distributed::TRACEPARENT;
-use lapin::options::{BasicGetOptions, BasicPublishOptions, QueueDeclareOptions};
-use lapin::types::{AMQPValue, FieldTable, ShortString};
+use lapin::options::{BasicPublishOptions, QueueDeclareOptions};
+use lapin::types::{FieldTable, ShortString};
 use lapin::{BasicProperties, Connection, ConnectionProperties};
 use serde_json::json;
 
@@ -27,7 +24,30 @@ use conformance::{named_recording_for, recording_for, unique};
 mod env_support;
 
 fn amqp_url() -> Option<String> {
-    env_support::broker_env("AMQP_URL", "rabbitmq transport test")
+    env_support::require_service("AMQP_URL", "rabbitmq transport test")
+}
+
+/// Options that drain to idle and keep dead letters where the test can read
+/// them.
+fn storing_dead_letters() -> (Arc<distributed::bus::InMemoryDeadLetters>, RunOptions) {
+    let dead = Arc::new(distributed::bus::InMemoryDeadLetters::new());
+    let options = RunOptions::until_idle().with_dead_letters(dead.clone());
+    (dead, options)
+}
+
+/// The one stored dead letter: its message id (if any), payload and reason.
+fn only_dead_letter(
+    dead: &distributed::bus::InMemoryDeadLetters,
+) -> (Option<String>, Vec<u8>, String) {
+    let mut all = dead.all();
+    assert_eq!(all.len(), 1, "exactly one message was dead-lettered");
+    let dead = all.remove(0);
+    assert_eq!(dead.attempts, 1);
+    (
+        dead.message.id().map(str::to_owned),
+        dead.message.payload().to_vec(),
+        dead.reason,
+    )
 }
 
 #[tokio::test]
@@ -64,7 +84,7 @@ async fn publish_then_consume_round_trips_through_rabbitmq() {
                 }),
         ),
     );
-    run_source(service, source, RunOptions::idempotent())
+    run_source(service, source, RunOptions::until_idle())
         .await
         .expect("run_source drains the queue");
 
@@ -76,67 +96,33 @@ async fn publish_then_consume_round_trips_through_rabbitmq() {
     );
 }
 
-#[tokio::test]
-async fn message_id_and_metadata_survive_the_round_trip() {
-    let Some(url) = amqp_url() else { return };
-    let queue = unique("order.initialized");
-
-    let source = RabbitSource::connect(&url, &queue)
-        .await
-        .expect("connect source");
-    let publisher = RabbitPublisher::connect(&url)
-        .await
-        .expect("connect publisher");
-    // Use a non-default content type to prove it survives the AMQP round-trip
-    // (Message::new defaults to application/json).
-    let mut message = Message::new(&queue, MessageKind::Event, br#"{"k":"v"}"#.to_vec())
-        .with_id("evt-1")
-        .with_metadata("correlation_id", "corr-9")
-        .with_metadata(
-            TRACEPARENT,
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-        );
-    message.content_type = "application/cloudevents+json".to_string();
-    publisher.publish(message).await.expect("publish");
-
-    let observed = Arc::new(Mutex::new(None));
-    let o = observed.clone();
-    let service = Arc::new(
-        Service::new().routes(
-            Routes::new()
-                .with_dependencies(())
-                .event(Box::leak(queue.clone().into_boxed_str()))
-                .handle(move |ctx: &Context<()>| {
-                    let m = ctx.message();
-                    let recorded = Some((
-                        m.id().map(str::to_string),
-                        m.correlation_id().map(str::to_string),
-                        m.traceparent().map(str::to_string),
-                        m.payload().to_vec(),
-                        m.content_type.clone(),
-                    ));
-                    *o.lock().unwrap() = recorded;
-                    async move { Ok(json!({})) }
-                }),
-        ),
-    );
-    run_source(service, source, RunOptions::idempotent())
-        .await
-        .unwrap();
-
-    let got = observed.lock().unwrap().clone().expect("handler ran");
-    assert_eq!(got.0.as_deref(), Some("evt-1"));
-    assert_eq!(got.1.as_deref(), Some("corr-9"));
-    assert_eq!(
-        got.2.as_deref(),
-        Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
-    );
-    assert_eq!(got.3, br#"{"k":"v"}"#.to_vec());
-    assert_eq!(
-        got.4, "application/cloudevents+json",
-        "content_type round-trips"
-    );
+/// One namespace (exchange and queue prefix) per test; every bus is its own
+/// connection.
+struct Rabbit {
+    url: String,
+    namespace: String,
 }
+
+impl conformance::bus::BusHarness for Rabbit {
+    type Bus = RabbitBus;
+
+    async fn start() -> Option<Self> {
+        Some(Self {
+            url: amqp_url()?,
+            namespace: unique("ns").to_lowercase(),
+        })
+    }
+
+    async fn bus(&self, group: &str) -> RabbitBus {
+        RabbitBus::connect(&self.url)
+            .group(group)
+            .namespace(&self.namespace)
+            .await
+            .expect("connect bus")
+    }
+}
+
+conformance::bus::bus_conformance_tests!(Rabbit);
 
 // ---- RabbitBus: send/listen (default exchange) + publish/subscribe (topic exchange) ----
 
@@ -212,11 +198,11 @@ async fn bus_publish_subscribe_fans_out_across_groups() {
     }
 
     bus_proj
-        .subscribe(svc_proj, RunOptions::idempotent())
+        .subscribe(svc_proj, RunOptions::until_idle())
         .await
         .expect("proj drains");
     bus_audit
-        .subscribe(svc_audit, RunOptions::idempotent())
+        .subscribe(svc_audit, RunOptions::until_idle())
         .await
         .expect("audit drains");
 
@@ -263,7 +249,7 @@ async fn bus_subscribe_uses_named_service_as_consumer_group() {
             .expect("publish event");
     }
 
-    bus.subscribe(service, RunOptions::idempotent())
+    bus.subscribe(service, RunOptions::until_idle())
         .await
         .expect("subscriber drains");
 
@@ -277,34 +263,14 @@ async fn bus_subscribe_uses_named_service_as_consumer_group() {
 
 // ---- failure paths: redelivery, dead-letter routing, undecodable payloads ----
 
-/// Declare `dlq` (durable, plain) and `queue` (durable, dead-lettering to `dlq`
-/// via the default exchange), and return a source over `queue`. The connection
-/// is returned so it outlives the source's channel.
-async fn source_with_dlq(url: &str, queue: &str, dlq: &str) -> (Connection, RabbitSource) {
+/// Declare the durable `queue` and return a source over it. The connection is
+/// returned so it outlives the source's channel and the test can publish raw
+/// bytes on it.
+async fn source_with_connection(url: &str, queue: &str) -> (Connection, RabbitSource) {
     let connection = Connection::connect(url, ConnectionProperties::default())
         .await
         .expect("amqp connect");
     let channel = connection.create_channel().await.expect("amqp channel");
-    channel
-        .queue_declare(
-            ShortString::from(dlq),
-            QueueDeclareOptions {
-                durable: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
-        .await
-        .expect("declare dlq");
-    let mut args = FieldTable::default();
-    args.insert(
-        ShortString::from("x-dead-letter-exchange"),
-        AMQPValue::LongString("".into()),
-    );
-    args.insert(
-        ShortString::from("x-dead-letter-routing-key"),
-        AMQPValue::LongString(dlq.into()),
-    );
     channel
         .queue_declare(
             ShortString::from(queue),
@@ -312,131 +278,18 @@ async fn source_with_dlq(url: &str, queue: &str, dlq: &str) -> (Connection, Rabb
                 durable: true,
                 ..Default::default()
             },
-            args,
+            FieldTable::default(),
         )
         .await
-        .expect("declare queue with dead-letter route");
-    let source = RabbitSource::new(channel, queue);
-    (connection, source)
-}
-
-/// Poll `dlq` until a dead-lettered delivery arrives (the DLX route is
-/// asynchronous on the broker side).
-async fn dlq_receive(connection: &Connection, dlq: &str) -> lapin::message::Delivery {
-    let channel = connection.create_channel().await.expect("dlq channel");
-    for _ in 0..50 {
-        if let Some(get) = channel
-            .basic_get(ShortString::from(dlq), BasicGetOptions::default())
-            .await
-            .expect("dlq basic_get")
-        {
-            return get.delivery;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("dead-letter queue never received the message");
-}
-
-#[tokio::test]
-async fn retryable_failure_is_redelivered_then_succeeds() {
-    let Some(url) = amqp_url() else { return };
-    let queue = unique("delivery.retry");
-
-    let source = RabbitSource::connect(&url, &queue)
-        .await
-        .expect("connect source");
-    let publisher = RabbitPublisher::connect(&url)
-        .await
-        .expect("connect publisher");
-    publisher
-        .publish(Message::new(&queue, MessageKind::Event, b"{}".to_vec()).with_id("m1"))
-        .await
-        .expect("publish");
-
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let seen = attempts.clone();
-    let handlers = Arc::new(Handlers::new().on_event(queue.clone(), move |_: &Message| {
-        let seen = seen.clone();
-        async move {
-            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(TransportError::retryable("transient"))
-            } else {
-                Ok(())
-            }
-        }
-    }));
-    run_source(handlers, source, RunOptions::idempotent())
-        .await
-        .expect("run drains after the requeued redelivery succeeds");
-
-    assert_eq!(
-        attempts.load(Ordering::SeqCst),
-        2,
-        "the nacked message was requeued and redelivered exactly once"
-    );
-}
-
-#[tokio::test]
-async fn permanent_failure_routes_to_dead_letter_destination() {
-    let Some(url) = amqp_url() else { return };
-    let queue = unique("delivery.poison");
-    let dlq = unique("delivery.poison.dlq");
-    let (connection, source) = source_with_dlq(&url, &queue, &dlq).await;
-
-    let publisher = RabbitPublisher::connect(&url)
-        .await
-        .expect("connect publisher");
-    for id in ["poison", "ok"] {
-        publisher
-            .publish(Message::new(&queue, MessageKind::Event, b"{}".to_vec()).with_id(id))
-            .await
-            .expect("publish");
-    }
-
-    let rec = Arc::new(Mutex::new(Vec::new()));
-    let seen = rec.clone();
-    let handlers = Arc::new(
-        Handlers::new().on_event(queue.clone(), move |message: &Message| {
-            let id = message.id().unwrap_or_default().to_string();
-            let seen = seen.clone();
-            async move {
-                if id == "poison" {
-                    Err(TransportError::permanent("unprocessable"))
-                } else {
-                    seen.lock().unwrap().push(id);
-                    Ok(())
-                }
-            }
-        }),
-    );
-    run_source(handlers, source, RunOptions::idempotent())
-        .await
-        .expect("run drains past the poison message");
-    assert_eq!(
-        rec.lock().unwrap().clone(),
-        vec!["ok".to_string()],
-        "subsequent messages still flow after the dead-letter"
-    );
-
-    // The reject-without-requeue routed the message to the configured DLQ.
-    let dead = dlq_receive(&connection, &dlq).await;
-    assert_eq!(
-        dead.properties
-            .message_id()
-            .as_ref()
-            .map(|s| s.to_string())
-            .as_deref(),
-        Some("poison"),
-        "the rejected message landed in the dead-letter queue"
-    );
+        .expect("declare queue");
+    (connection, RabbitSource::new(channel, queue))
 }
 
 #[tokio::test]
 async fn undecodable_payload_dead_letters_without_blocking() {
     let Some(url) = amqp_url() else { return };
     let queue = unique("delivery.garbage");
-    let dlq = unique("delivery.garbage.dlq");
-    let (connection, source) = source_with_dlq(&url, &queue, &dlq).await;
+    let (connection, source) = source_with_connection(&url, &queue).await;
 
     // Raw garbage straight onto the queue: no properties, invalid JSON payload.
     let garbage: &[u8] = &[0xff, 0xfe, b'{'];
@@ -466,6 +319,7 @@ async fn undecodable_payload_dead_letters_without_blocking() {
     // the decode point: `Service::dispatch_message` substitutes Null input for
     // non-JSON payloads rather than failing), so it dead-letters instead of
     // being requeued forever.
+    let (dead, options) = storing_dead_letters();
     let rec = Arc::new(Mutex::new(Vec::new()));
     let seen = rec.clone();
     let handlers = Arc::new(
@@ -482,7 +336,7 @@ async fn undecodable_payload_dead_letters_without_blocking() {
             }
         }),
     );
-    run_source(handlers, source, RunOptions::idempotent())
+    run_source(handlers, source, options)
         .await
         .expect("run drains: the undecodable payload is rejected, not redelivered forever");
     assert_eq!(
@@ -491,9 +345,10 @@ async fn undecodable_payload_dead_letters_without_blocking() {
         "the message behind the garbage is still handled"
     );
 
-    let dead = dlq_receive(&connection, &dlq).await;
+    let (_, payload, reason) = only_dead_letter(&dead);
     assert_eq!(
-        dead.data, garbage,
-        "the undecodable payload landed in the dead-letter queue"
+        payload, garbage,
+        "the undecodable payload itself was stored"
     );
+    assert!(reason.contains("undecodable payload"), "{reason}");
 }

@@ -11,16 +11,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use distributed::bus::{PostgresBus, SqliteBus};
-use distributed::command_dispatch::LocalCommandDispatcher;
 use distributed::graphql::IdentityConfig;
 use distributed::microsvc::{
-    spawn_outbox_publish_loop, spawn_service_consumer_loop, CONSUMER_IDLE_POLL,
+    spawn_outbox_publish_loop, spawn_service_consumer_loop, LifecycleGate, Service,
 };
 use distributed::{PostgresLockManager, PostgresRepository, SqliteLockManager, SqliteRepository};
 
 use crate::{
-    build_graphql_engine, build_service, distributed_manifest, serve, spawn_scrape_loop,
-    ZitadelScrapeConfig, E2E_UI_APPLICATION,
+    build_service, distributed_manifest, serve, spawn_scrape_loop, ZitadelScrapeConfig,
+    E2E_UI_APPLICATION,
 };
 
 const BUS_GROUP: &str = "e2e-ui";
@@ -29,6 +28,9 @@ const BUS_GROUP: &str = "e2e-ui";
 pub struct HostOptions {
     pub bind: String,
     pub identity: IdentityConfig,
+    pub public_origin: String,
+    pub ui_origin: String,
+    pub delivery: distributed::gateway::DeliveryCapabilities,
 }
 
 /// Start the e2e-ui full-local process for SQLite or Postgres from `DATABASE_URL`.
@@ -61,11 +63,36 @@ async fn run_sqlite(
     bus.ensure_tables().await?;
 
     let change_rx = repo.read_model_changes();
+    // Under `distributed dev`, only the active generation may write.
+    let lifecycle = LifecycleGate::from_env();
     let service = build_service(repo.clone(), locks.clone(), repo.clone())
+        .with_lifecycle(lifecycle.clone())
         .with_bus(SqliteBus::new(repo.pool().clone()).group(BUS_GROUP));
-    let gql = build_graphql_engine(&repo, &service, options.identity.clone(), Some(change_rx))?;
+    let versions = if options.delivery != distributed::gateway::DeliveryCapabilities::default() {
+        Some(
+            distributed::graphql::delivery::GatewayVersionStore::install(
+                &distributed::graphql::GraphqlPool::from(repo.pool().clone()),
+                "e2e-ui-gateway-v1",
+                [
+                    "todos".into(),
+                    "chat_messages".into(),
+                    "blob_games".into(),
+                    "auth_users".into(),
+                ],
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let gql = crate::modules::graphql::build_graphql_engine_with_delivery(
+        &repo,
+        &service,
+        options.identity.clone(),
+        Some(change_rx),
+        versions,
+    )?;
     let service = Arc::new(service.try_with_graphql(gql)?);
-    let _dispatcher = Arc::new(LocalCommandDispatcher::new(Arc::clone(&service)));
 
     spawn_outbox_publish_loop(
         repo.outbox_store(),
@@ -78,16 +105,16 @@ async fn run_sqlite(
         let repo = repo.clone();
         let locks = locks.clone();
         spawn_service_consumer_loop(move || {
-            let bus = SqliteBus::new(repo.pool().clone())
-                .group(BUS_GROUP)
-                .with_idle_poll(CONSUMER_IDLE_POLL);
-            build_service(repo.clone(), locks.clone(), repo.clone()).with_bus(bus)
+            let bus = SqliteBus::new(repo.pool().clone()).group(BUS_GROUP);
+            build_service(repo.clone(), locks.clone(), repo.clone())
+                .with_lifecycle(lifecycle.clone())
+                .with_bus(bus)
         });
     }
-    spawn_zitadel_scrape(repo.clone());
+    spawn_zitadel_scrape(service.clone());
 
     eprintln!("e2e-ui (sqlite) listening on http://{}", options.bind);
-    serve(service, &options.bind).await?;
+    serve(service, &options).await?;
     Ok(())
 }
 
@@ -105,11 +132,36 @@ async fn run_postgres(
     bus.ensure_tables().await?;
 
     let change_rx = repo.read_model_changes();
+    // Under `distributed dev`, only the active generation may write.
+    let lifecycle = LifecycleGate::from_env();
     let service = build_service(repo.clone(), locks.clone(), repo.clone())
+        .with_lifecycle(lifecycle.clone())
         .with_bus(PostgresBus::new(repo.pool().clone()).group(BUS_GROUP));
-    let gql = build_graphql_engine(&repo, &service, options.identity.clone(), Some(change_rx))?;
+    let versions = if options.delivery != distributed::gateway::DeliveryCapabilities::default() {
+        Some(
+            distributed::graphql::delivery::GatewayVersionStore::install(
+                &distributed::graphql::GraphqlPool::from(repo.pool().clone()),
+                "e2e-ui-gateway-v1",
+                [
+                    "todos".into(),
+                    "chat_messages".into(),
+                    "blob_games".into(),
+                    "auth_users".into(),
+                ],
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let gql = crate::modules::graphql::build_graphql_engine_with_delivery(
+        &repo,
+        &service,
+        options.identity.clone(),
+        Some(change_rx),
+        versions,
+    )?;
     let service = Arc::new(service.try_with_graphql(gql)?);
-    let _dispatcher = Arc::new(LocalCommandDispatcher::new(Arc::clone(&service)));
 
     spawn_outbox_publish_loop(
         repo.outbox_store(),
@@ -122,28 +174,20 @@ async fn run_postgres(
         let repo = repo.clone();
         let locks = locks.clone();
         spawn_service_consumer_loop(move || {
-            let bus = PostgresBus::new(repo.pool().clone())
-                .group(BUS_GROUP)
-                .with_idle_poll(CONSUMER_IDLE_POLL);
-            build_service(repo.clone(), locks.clone(), repo.clone()).with_bus(bus)
+            let bus = PostgresBus::new(repo.pool().clone()).group(BUS_GROUP);
+            build_service(repo.clone(), locks.clone(), repo.clone())
+                .with_lifecycle(lifecycle.clone())
+                .with_bus(bus)
         });
     }
-    spawn_zitadel_scrape(repo.clone());
+    spawn_zitadel_scrape(service.clone());
 
     eprintln!("e2e-ui (postgres) listening on http://{}", options.bind);
-    serve(service, &options.bind).await?;
+    serve(service, &options).await?;
     Ok(())
 }
 
-fn spawn_zitadel_scrape<R>(repo: R)
-where
-    R: distributed::TransactionalCommit
-        + distributed::ReadModelWritePlanStore
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
+fn spawn_zitadel_scrape(service: Arc<Service>) {
     match ZitadelScrapeConfig::from_env() {
         Some(cfg) if cfg.background_enabled() || cfg.on_start => {
             eprintln!(
@@ -152,7 +196,7 @@ where
                 cfg.interval.as_secs(),
                 cfg.on_start
             );
-            spawn_scrape_loop(repo, cfg);
+            spawn_scrape_loop(service, cfg);
         }
         Some(_) => {
             eprintln!(

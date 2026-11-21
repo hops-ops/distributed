@@ -95,12 +95,12 @@ pub fn graphql_sdl_from_surface(surface: &super::surface::Surface) -> Result<Str
 /// ```
 ///
 /// Prefer this over filtering full SDL as text. `grants` maps model_name →
-/// [`RoleGrant`](super::surface::RoleGrant) for the role.
+/// [`ReadPermission`](super::permissions::ReadPermission) for the role.
 pub fn graphql_sdl_for_role(
     tables: &[TableSchema],
     options: &SdlOptions,
     role: &str,
-    grants: &std::collections::BTreeMap<String, super::surface::RoleGrant>,
+    grants: &std::collections::BTreeMap<String, super::permissions::ReadPermission>,
 ) -> Result<String, String> {
     let surface_opts = super::surface::SurfaceOptions {
         dialect: if options.jsonb_operators {
@@ -116,6 +116,32 @@ pub fn graphql_sdl_for_role(
     let full = super::surface::build_surface(tables, &surface_opts)?;
     let role_surface = super::surface::surface_for_role(&full, role, grants)?;
     graphql_sdl_from_surface(&role_surface)
+}
+
+fn leaderboard_root_sdl(root: &super::surface::LeaderboardRoot) -> String {
+    let arguments = if root.arguments.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "({})",
+            root.arguments
+                .iter()
+                .map(|argument| format!(
+                    "{}: {}{}",
+                    argument.name,
+                    argument.type_name,
+                    if argument.nullable { "" } else { "!" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let result = if root.operation.is_list() {
+        format!("[{}!]!", super::surface::LEADERBOARD_ENTRY_TYPE)
+    } else {
+        super::surface::LEADERBOARD_ENTRY_TYPE.to_string()
+    };
+    format!("  {}{arguments}: {result}\n", root.name)
 }
 
 /// Internal renderer over an already IR-filtered set of read models.
@@ -188,6 +214,20 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     for root in &surface.subscription_fields {
         claim_name(&mut subscription_fields, &root.name)?;
     }
+    let leaderboard_roots = surface
+        .leaderboards
+        .iter()
+        .flat_map(|leaderboard| leaderboard.roots(leaderboard.selected_grant()))
+        .collect::<Vec<_>>();
+    if !leaderboard_roots.is_empty() {
+        claim_name(&mut type_names, super::surface::LEADERBOARD_ENTRY_TYPE)?;
+    }
+    for root in &leaderboard_roots {
+        claim_name(&mut query_fields, &root.name)?;
+        if surface.subscriptions && root.operation.is_live() {
+            claim_name(&mut subscription_fields, &root.name)?;
+        }
+    }
 
     let mut out = String::new();
 
@@ -228,6 +268,13 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
         }
     }
 
+    if !leaderboard_roots.is_empty() {
+        out.push_str(&format!(
+            "type {} {{\n  rank: Int!\n  member: String!\n  score: Float!\n}}\n\n",
+            super::surface::LEADERBOARD_ENTRY_TYPE
+        ));
+    }
+
     emit_command_types(&mut out, &surface.commands, &surface.models)?;
     if has_causal_commands {
         emit_causal_command_protocol_types(&mut out);
@@ -237,7 +284,7 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     // schemas. This is what keeps hidden/partial by-PK identity and per-model
     // aggregate grants aligned with runtime and client manifest output.
     out.push_str("type Query {\n");
-    if surface.query_fields.is_empty() && !has_causal_commands {
+    if surface.query_fields.is_empty() && leaderboard_roots.is_empty() && !has_causal_commands {
         // async-graphql requires a non-empty Query object and the runtime uses
         // this same fail-closed sentinel for roles with no readable models.
         // It is intentionally not a client-manifest root.
@@ -247,6 +294,9 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
             out.push_str(&surface_root_sdl(field));
             out.push('\n');
         }
+        for root in &leaderboard_roots {
+            out.push_str(&leaderboard_root_sdl(root));
+        }
         if has_causal_commands {
             out.push_str(&format!(
                 "  {COMMAND_STATUS_ROOT_FIELD}(commandId: ID!): {DISTRIBUTED_COMMAND_STATUS_TYPE}!\n"
@@ -255,11 +305,18 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     }
     out.push_str("}\n");
 
-    if !surface.subscription_fields.is_empty() {
+    let live_leaderboard_roots = leaderboard_roots
+        .iter()
+        .filter(|root| surface.subscriptions && root.operation.is_live())
+        .collect::<Vec<_>>();
+    if !surface.subscription_fields.is_empty() || !live_leaderboard_roots.is_empty() {
         out.push_str("\ntype Subscription {\n");
         for field in &surface.subscription_fields {
             out.push_str(&surface_root_sdl(field));
             out.push('\n');
+        }
+        for root in live_leaderboard_roots {
+            out.push_str(&leaderboard_root_sdl(root));
         }
         out.push_str("}\n");
     }
@@ -456,7 +513,7 @@ fn emit_comparison_exp(out: &mut String, scalar: &str, operators: &[String]) {
         let operand = match operator.as_str() {
             "_in" | "_nin" => format!("[{scalar}!]"),
             "_is_null" => "Boolean".into(),
-            "_like" | "_ilike" | "_has_key" => "String".into(),
+            "_like" | "_ilike" | "_icontains" | "_has_key" => "String".into(),
             _ => scalar.to_string(),
         };
         out.push_str(&format!("  {operator}: {operand}\n"));
@@ -588,7 +645,7 @@ pub fn graphql_sdl_from_schemas(
 #[cfg(test)]
 mod causal_command_sdl_tests {
     use super::*;
-    use crate::graphql::command_contract::{CommandConsistency, CommandEffects};
+    use crate::command::CommandConsistency;
     use crate::graphql::surface::{SurfaceCommandShape, SurfaceTypeDef};
 
     fn command_surface() -> crate::graphql::surface::Surface {
@@ -615,6 +672,7 @@ mod causal_command_sdl_tests {
                 input: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoInput".into(),
                     fields: vec![crate::graphql::surface::SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -626,6 +684,7 @@ mod causal_command_sdl_tests {
                 output: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoPayload".into(),
                     fields: vec![crate::graphql::surface::SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -636,17 +695,15 @@ mod causal_command_sdl_tests {
                 }),
                 consistency: CommandConsistency::Succeeded,
                 input_defaults: Vec::new(),
-                effects: Some(CommandEffects::revalidate()),
-                confirmations: Vec::new(),
                 projected_model: None,
                 direct_projection: None,
                 projections: Default::default(),
-                confirmation_unavailable: false,
             }],
             commands_attached: true,
             projectors: Vec::new(),
             projectors_attached: false,
             service_binding: None,
+            leaderboards: Vec::new(),
         }
     }
 

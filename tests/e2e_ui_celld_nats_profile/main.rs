@@ -77,11 +77,12 @@ mod live {
         CelldCommandHost, CelldRoute, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,
         CELL_INTERNAL_SECRET_HEADER,
     };
-    use distributed::command_dispatch::SharedCommandHost;
-    use distributed::graphql::{
-        read, typed_command, GraphqlEngine, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef,
-        GraphqlTypeField, ModelPermissions, Succeeded, VerifiedPrincipal,
+    use distributed::command::{
+        typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
+        Succeeded,
     };
+    use distributed::command_dispatch::SharedCommandHost;
+    use distributed::graphql::{read, GraphqlEngine, ModelPermissions, VerifiedPrincipal};
     use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
     use distributed::{
         Aggregate, AggregateBuilder, Entity, InMemoryRepository, ReadModel, Snapshot,
@@ -156,12 +157,13 @@ mod live {
         title: String,
     }
 
-    impl GraphqlInputType for CreateInput {
-        fn graphql_type() -> GraphqlTypeDef {
-            GraphqlTypeDef::new(
+    impl CommandInputType for CreateInput {
+        fn command_type() -> CommandTypeDef {
+            CommandTypeDef::new(
                 "CreateInput",
                 vec![
-                    GraphqlTypeField {
+                    CommandTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -169,7 +171,8 @@ mod live {
                         item_nullable: false,
                         nested: None,
                     },
-                    GraphqlTypeField {
+                    CommandTypeField {
+                        unsigned_integer: None,
                         name: "title".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -188,11 +191,12 @@ mod live {
         id: String,
     }
 
-    impl GraphqlOutputType for IdPayload {
-        fn graphql_type() -> GraphqlTypeDef {
-            GraphqlTypeDef::new(
+    impl CommandOutputType for IdPayload {
+        fn command_type() -> CommandTypeDef {
+            CommandTypeDef::new(
                 "IdPayload",
-                vec![GraphqlTypeField {
+                vec![CommandTypeField {
+                    unsigned_integer: None,
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -220,7 +224,7 @@ mod live {
                         aggregate.record(input.id.clone())?;
                         Ok::<_, distributed::EventRecordError>(())
                     })
-                    .succeeded(|aggregate| IdPayload {
+                    .succeeded(|aggregate, _principal| IdPayload {
                         id: aggregate.entity().id().to_string(),
                     }),
             )
@@ -228,10 +232,12 @@ mod live {
 
     #[tokio::test]
     async fn optional_profile_smoke_graphql_wait_path_and_sql_list() {
-        let Some(celld) = env_support::broker_env("CELLD_URL", "optional celld+NATS smoke") else {
+        let Some(celld) = env_support::require_service("CELLD_URL", "optional celld+NATS smoke")
+        else {
             return;
         };
-        let Some(nats) = env_support::broker_env("NATS_URL", "optional celld+NATS smoke") else {
+        let Some(nats) = env_support::require_service("NATS_URL", "optional celld+NATS smoke")
+        else {
             return;
         };
 
@@ -278,6 +284,7 @@ mod live {
                 )),
         );
         let engine = GraphqlEngine::builder(pool)
+            .identity(distributed::graphql::IdentityConfig::dev_headers())
             .protocol_token_key([0x5a; 32])
             .roles(&["user"])
             .model::<Todos>(ModelPermissions::new().grant("user", read().all_columns()))
@@ -288,7 +295,7 @@ mod live {
         let mut session = Session::new();
         session.set(USER_ID_KEY, "alice");
         session.set(ROLE_KEY, "user");
-        let principal = VerifiedPrincipal::from_trusted_transport("alice");
+        let principal = VerifiedPrincipal::internal("alice").unwrap();
         let command_id = "0190a000-0000-7000-8000-000000000310";
         let mutation = engine
             .execute(

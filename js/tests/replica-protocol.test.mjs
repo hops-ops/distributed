@@ -416,11 +416,11 @@ function wireFrame(options = {}) {
 		options.live === undefined
 			? undefined
 			: {
-					supported: options.live.supported ?? true,
+					mode: options.live.mode ?? 'resumable',
 					reset: options.live.reset ?? false,
 					cursors:
 						options.live.cursors ??
-						(options.live.supported === false ? [] : [resume])
+						(options.live.mode === 'snapshot' ? [] : [resume])
 				};
 	return {
 		data: { todos: rows },
@@ -725,7 +725,7 @@ test('comparable live snapshot cannot drop an Eventual list row after confirmati
 			position: '2',
 			operation: Todos.live.id,
 			rows: [{ id: 'todo-1', title: 'first' }],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live'
 	);
@@ -750,7 +750,7 @@ test('comparable live snapshot cannot drop an Eventual list row after confirmati
 				{ id: 'todo-1', title: 'first' },
 				{ id: 'todo-2', title: 'posted' }
 			],
-			live: { supported: true },
+			live: { mode: "resumable" },
 			records: [
 				{
 					path: ['todos', '0'],
@@ -832,7 +832,7 @@ test('Eventual membership fences are independent per index', () => {
 				{ id: 'todo-1', title: 'first' },
 				{ id: 'todo-2', title: 'posted' }
 			],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live'
 	);
@@ -845,7 +845,7 @@ test('Eventual membership fences are independent per index', () => {
 			indexScope: 'index:todos-open',
 			snapshotScope: 'snapshot:todos-open',
 			rows: [{ id: 'todo-1', title: 'first' }],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live',
 		TodosOpen
@@ -867,7 +867,7 @@ test('Eventual membership fences are independent per index', () => {
 				{ id: 'todo-1', title: 'first' },
 				{ id: 'todo-2', title: 'posted' }
 			],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live',
 		TodosOpen
@@ -915,7 +915,7 @@ test('overlapping Eventual commands retain every membership-fence owner', () => 
 			position: '2',
 			operation: Todos.live.id,
 			rows: [{ id: 'todo-1', title: 'first' }],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live'
 	);
@@ -1438,7 +1438,7 @@ test('a comparable shared root cannot promote an incomparable nested sibling', a
 			ownerName: 'unfenced live frame',
 			operation: GamesWithOwnerLiveOperation.live.id,
 			live: {
-				supported: true,
+				mode: "resumable",
 				reset: false,
 				cursors: [
 					{
@@ -1469,7 +1469,7 @@ test('an older operation reset cannot erase a shared index owned by a newer arti
 			operation: Todos.live.id,
 			position: '5',
 			rows: [{ id: 'todo-live', title: 'old live owner' }],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live'
 	);
@@ -1490,7 +1490,7 @@ test('an older operation reset cannot erase a shared index owned by a newer arti
 			operation: Todos.live.id,
 			position: '8',
 			rows: [{ id: 'todo-reset', title: 'older reset' }],
-			live: { supported: true, reset: true }
+			live: { mode: "resumable", reset: true }
 		},
 		'live'
 	);
@@ -1508,7 +1508,7 @@ test('reset preserves an equal-vector index with another operation co-owner', ()
 			operation: Todos.live.id,
 			position: '5',
 			rows: [{ id: 'todo-shared', title: 'shared snapshot' }],
-			live: { supported: true }
+			live: { mode: "resumable" }
 		},
 		'live'
 	);
@@ -1529,7 +1529,7 @@ test('reset preserves an equal-vector index with another operation co-owner', ()
 			operation: Todos.live.id,
 			position: '4',
 			rows: [{ id: 'todo-reset', title: 'older reset' }],
-			live: { supported: true, reset: true }
+			live: { mode: "resumable", reset: true }
 		},
 		'live'
 	);
@@ -1785,7 +1785,7 @@ test('a live handoff fences an HTTP response launched in the prior generation', 
 	watch.destroy();
 });
 
-test('unsupported live fallback cannot fence HTTP membership or later revalidation', async () => {
+test('snapshot live stays attached and fences overlapping HTTP membership', async () => {
 	const fetches = [];
 	const subscriptions = [];
 	let unsubscribeCount = 0;
@@ -1819,14 +1819,14 @@ test('unsupported live fallback cannot fence HTTP membership or later revalidati
 			rows: [{ id: 'todo-live', title: 'provisional live fallback' }],
 			recordScope: 'record:live',
 			indexesComparable: false,
-			live: { supported: false, reset: true }
+			live: { mode: "snapshot", reset: true }
 		})
 	);
 	assert.deepEqual(replica.read(Todos, {}).data.todos, [
 		{ id: 'todo-live', title: 'provisional live fallback' }
 	]);
-	assert.equal(watch.get().live, 'off');
-	assert.equal(unsubscribeCount, 1);
+	assert.equal(watch.get().live, 'active');
+	assert.equal(unsubscribeCount, 0);
 
 	await Promise.resolve();
 	fetches[0].resolve(
@@ -1839,12 +1839,12 @@ test('unsupported live fallback cannot fence HTTP membership or later revalidati
 	);
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(replica.read(Todos, {}).data.todos, [
-		{ id: 'todo-http', title: 'newer HTTP membership' }
+		{ id: 'todo-live', title: 'provisional live fallback' }
 	]);
 	assert.equal(
 		subscriptions.length,
 		1,
-		'query fallback must not immediately reopen an unsupported stream'
+		'snapshot delivery must keep the original subscription attached'
 	);
 
 	const revalidation = replica.revalidate({
@@ -1866,13 +1866,19 @@ test('unsupported live fallback cannot fence HTTP membership or later revalidati
 	assert.deepEqual(replica.read(Todos, {}).data.todos, [
 		{ id: 'todo-revalidated', title: 'revalidated membership' }
 	]);
-	assert.equal(subscriptions.length, 1);
+	assert.equal(subscriptions.length, 2, 'refresh restarts the snapshot stream');
+	assert.equal(subscriptions[1].request.resume, undefined);
+	subscriptions[0].observer.next(wireFrame({
+		operation: 'live:todos', rows: [], indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }
+	}));
+	assert.equal(replica.read(Todos, {}).data.todos[0].id, 'todo-revalidated');
 
 	watch.destroy();
-	assert.equal(unsubscribeCount, 1);
+	assert.equal(unsubscribeCount, 2);
 });
 
-test('conflicting provisional live fallbacks still close and yield to HTTP', async () => {
+test('snapshot live cannot supersede an incomparable sibling index owner', async () => {
 	const fetches = [];
 	let liveObserver;
 	let unsubscribeCount = 0;
@@ -1902,7 +1908,7 @@ test('conflicting provisional live fallbacks still close and yield to HTTP', asy
 			rows: [{ id: 'todo-other', title: 'other provisional membership' }],
 			recordScope: 'record:other',
 			indexesComparable: false,
-			live: { supported: false, reset: true }
+			live: { mode: "snapshot", reset: true }
 		}),
 		'live'
 	);
@@ -1915,30 +1921,771 @@ test('conflicting provisional live fallbacks still close and yield to HTTP', asy
 			rows: [{ id: 'todo-live', title: 'conflicting provisional membership' }],
 			recordScope: 'record:live',
 			indexesComparable: false,
-			live: { supported: false, reset: true }
+			live: { mode: "snapshot", reset: true }
 		})
 	);
-	assert.equal(watch.get().live, 'off');
-	assert.equal(unsubscribeCount, 1);
+	assert.equal(watch.get().live, 'active');
+	assert.equal(unsubscribeCount, 0);
 
-	await Promise.resolve();
-	fetches[0].resolve(
-		wireFrame({
-			rows: [{ id: 'todo-http', title: 'authoritative HTTP membership' }],
-			recordScope: 'record:http',
-			indexesComparable: false
-		})
-	);
-	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(fetches.length, 0, 'a complete live result needs no HTTP fallback');
 	assert.deepEqual(replica.read(Todos, {}).data.todos, [
-		{ id: 'todo-http', title: 'authoritative HTTP membership' }
+		{ id: 'todo-other', title: 'other provisional membership' }
 	]);
+	liveObserver.next(wireFrame({
+		operation: 'live:todos', rows: [], indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }
+	}));
+	assert.deepEqual(replica.read(Todos, {}).data.todos, [
+		{ id: 'todo-other', title: 'other provisional membership' }
+	]);
+	assert.equal(watch.get().live, 'active');
+	assert.equal(unsubscribeCount, 0);
 
 	watch.destroy();
 	assert.equal(unsubscribeCount, 1);
 });
 
-test('completed supported live streams relinquish ownership and fall back to HTTP', async () => {
+// A layout and a page commonly open independent snapshot streams over the same
+// root row and select different relationships below it.
+const GamesRootLive = Object.freeze({
+	...GamesWithOwner,
+	id: 'query:games-root-live',
+	document: 'query GamesRoot { games { id owner_id } }',
+	protocol: Object.freeze({
+		...GamesWithOwner.protocol,
+		operation: 'query:games-root-live'
+	}),
+	live: Object.freeze({
+		id: 'live:games-root',
+		document: 'subscription GamesRootLive { games { id owner_id } }'
+	}),
+	roots: Object.freeze([
+		Object.freeze({
+			...GamesWithOwner.roots[0],
+			selection: Object.freeze({
+				...GamesWithOwner.roots[0].selection,
+				members: Object.freeze(
+					GamesWithOwner.roots[0].selection.members.filter(
+						(member) => member.kind === 'scalar'
+					)
+				)
+			})
+		})
+	])
+});
+
+function sharedGamesFrame({ artifact, games, revision = '1', withOwner }) {
+	const records = games.flatMap((game, index) => [
+		{
+			path: ['games', String(index)],
+			model: 'GameView',
+			scopeToken: `record:${game.id}`,
+			incarnation: '1',
+			revision,
+			tombstone: false
+		},
+		...(withOwner
+			? [{
+					path: ['games', String(index), 'owner'],
+					model: 'UserView',
+					scopeToken: `record:${game.owner_id}`,
+					incarnation: '1',
+					revision,
+					tombstone: false
+				}]
+			: [])
+	]);
+	return {
+		data: {
+			games: games.map((game) => withOwner
+				? { id: game.id, owner_id: game.owner_id, owner: { id: game.owner_id, name: game.name } }
+				: { id: game.id, owner_id: game.owner_id })
+		},
+		extensions: {
+			distributed: {
+				protocolVersion: DISTRIBUTED_PROTOCOL_VERSION,
+				schemaHash: 'schema-a',
+				authorizationGeneration: 'auth-1',
+				cacheScope: 'cache:a',
+				operation: artifact.live.id,
+				snapshot: {
+					scopeToken: `snapshot:${artifact.id}`,
+					recordsComplete: true,
+					indexesComparable: false,
+					records,
+					indexes: [],
+					observations: []
+				},
+				live: { mode: 'snapshot', reset: true, cursors: [] }
+			}
+		}
+	};
+}
+
+function sharedGamesHarness() {
+	const subscriptions = [];
+	const replica = createDistributedReplica({
+		transport: {
+			fetch() {
+				return new Promise(() => {});
+			},
+			subscribe(request, observer) {
+				const subscription = { operation: request.operationId, observer, closed: false };
+				subscriptions.push(subscription);
+				return () => {
+					subscription.closed = true;
+				};
+			}
+		}
+	});
+	const latest = (operation) =>
+		subscriptions.filter((entry) => entry.operation === operation).at(-1);
+	return { replica, subscriptions, latest };
+}
+
+test('snapshot live admits a frame whose shared membership matches an independent owner', () => {
+	const { replica, latest } = sharedGamesHarness();
+	const layout = replica.watch(GamesRootLive, {}, { live: true });
+	latest('live:games-root').observer.next(sharedGamesFrame({
+		artifact: GamesRootLive, games: [{ id: 'game-1', owner_id: 'user-1' }]
+	}));
+	const page = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	const pageStream = latest('live:games-with-owner');
+	pageStream.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true,
+		games: [{ id: 'game-1', owner_id: 'user-1', name: 'Owner' }]
+	}));
+	assert.deepEqual(replica.read(GamesWithOwnerLiveOperation, {}).data.games, [
+		{ id: 'game-1', owner_id: 'user-1', owner: { id: 'user-1', name: 'Owner' } }
+	], 'the first page frame renders although the layout owns the shared root');
+
+	// A later page frame changes only its own relationship below the shared row.
+	pageStream.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true, revision: '2',
+		games: [{ id: 'game-1', owner_id: 'user-2', name: 'Second' }]
+	}));
+	assert.deepEqual(replica.read(GamesWithOwnerLiveOperation, {}).data.games, [
+		{ id: 'game-1', owner_id: 'user-2', owner: { id: 'user-2', name: 'Second' } }
+	], 'a live update to a relationship-joined row is delivered');
+
+	// The admitted page stream did not take the shared root from the layout.
+	latest('live:games-root').observer.next(sharedGamesFrame({
+		artifact: GamesRootLive, revision: '3',
+		games: [{ id: 'game-1', owner_id: 'user-2' }, { id: 'game-3', owner_id: 'user-3' }]
+	}));
+	assert.deepEqual(
+		replica.read(GamesRootLive, {}).data.games.map((game) => game.id),
+		['game-1', 'game-3']
+	);
+	pageStream.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true, revision: '3',
+		games: [
+			{ id: 'game-1', owner_id: 'user-2', name: 'Second' },
+			{ id: 'game-3', owner_id: 'user-3', name: 'Third' }
+		]
+	}));
+	assert.deepEqual(
+		replica.read(GamesWithOwnerLiveOperation, {}).data.games.map((game) => game.owner.name),
+		['Second', 'Third']
+	);
+	assert.equal(page.get().live, 'active');
+	assert.equal(pageStream.closed, false, 'agreeing frames never reopen the stream');
+	page.destroy();
+	layout.destroy();
+});
+
+test('snapshot live keeps a disagreeing frame fenced and reopens after the owner catches up', () => {
+	const { replica, subscriptions, latest } = sharedGamesHarness();
+	const layout = replica.watch(GamesRootLive, {}, { live: true });
+	latest('live:games-root').observer.next(sharedGamesFrame({
+		artifact: GamesRootLive, games: [{ id: 'game-1', owner_id: 'user-1' }]
+	}));
+	const page = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	const firstPageStream = latest('live:games-with-owner');
+	// The page stream observed a newer membership than the layout owner.
+	firstPageStream.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true, revision: '2',
+		games: [
+			{ id: 'game-1', owner_id: 'user-1', name: 'Owner' },
+			{ id: 'game-2', owner_id: 'user-2', name: 'Second' }
+		]
+	}));
+	assert.deepEqual(
+		replica.read(GamesRootLive, {}).data.games.map((game) => game.id),
+		['game-1'],
+		'a disagreeing frame cannot replace the independent owner membership'
+	);
+	assert.equal(firstPageStream.closed, false);
+	const subscriptionCount = subscriptions.length;
+
+	latest('live:games-root').observer.next(sharedGamesFrame({
+		artifact: GamesRootLive, revision: '2',
+		games: [{ id: 'game-1', owner_id: 'user-1' }, { id: 'game-2', owner_id: 'user-2' }]
+	}));
+	assert.equal(firstPageStream.closed, true, 'the owner rewrite reopens the fenced stream');
+	assert.equal(subscriptions.length, subscriptionCount + 1);
+	const reopened = latest('live:games-with-owner');
+	assert.notEqual(reopened, firstPageStream);
+
+	// A late frame from the closed stream stays fenced.
+	firstPageStream.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true, revision: '2',
+		games: [{ id: 'game-1', owner_id: 'user-1', name: 'Late' }]
+	}));
+	reopened.observer.next(sharedGamesFrame({
+		artifact: GamesWithOwnerLiveOperation, withOwner: true, revision: '2',
+		games: [
+			{ id: 'game-1', owner_id: 'user-1', name: 'Owner' },
+			{ id: 'game-2', owner_id: 'user-2', name: 'Second' }
+		]
+	}));
+	assert.deepEqual(
+		replica.read(GamesWithOwnerLiveOperation, {}).data.games.map((game) => game.owner.name),
+		['Owner', 'Second']
+	);
+	assert.equal(page.get().live, 'active');
+	page.destroy();
+	layout.destroy();
+});
+
+test('snapshot live replaces SSR membership, updates and removes rows, and fences disposal', () => {
+	let observer;
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, next) { observer = next; return () => {}; }
+	} });
+	replica.writeResult(Todos, {}, wireFrame({
+		rows: [{ id: 'todo-1', title: 'SSR title' }], indexesComparable: false
+	}), 'ssr');
+	const watch = replica.watch(Todos, {}, { live: true });
+	observer.next(wireFrame({
+		operation: 'live:todos', rows: [{ id: 'todo-1', title: 'updated title' }],
+		revision: '2', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }
+	}));
+	assert.equal(replica.read(Todos, {}).data.todos[0].title, 'updated title');
+	observer.next(wireFrame({
+		operation: 'live:todos', rows: [], indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }
+	}));
+	assert.deepEqual(replica.read(Todos, {}).data.todos, []);
+	assert.equal(watch.get().live, 'active');
+	watch.destroy();
+	observer.next(wireFrame({
+		operation: 'live:todos', rows: [{ id: 'late', title: 'disposed callback' }],
+		indexesComparable: false, live: { mode: 'snapshot', reset: true }
+	}));
+	assert.deepEqual(replica.read(Todos, {}).data.todos, []);
+});
+
+test('snapshot live takes over a nested graph from a disposed page subscription', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner', document: 'subscription FeaturedOwner { featuredGames { id owner { id name } } }' }
+	};
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) { observers.push(observer); return () => {}; }
+	} });
+	const oldFrame = (position, ownerName = 'Owner') => gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames',
+		operation: previousPage.live.id, position,
+		ownerId: 'user-1', ownerName, indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	replica.writeResult(previousPage, {}, gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	}), 'ssr');
+	const oldWatch = replica.watch(previousPage, {}, { live: true });
+	observers[0].next(oldFrame('2'));
+	oldWatch.destroy();
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const current = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '3',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(current.get().errors, []);
+	assert.equal(current.get().complete, true);
+	assert.equal(current.get().data.games.length, 1, 'disposed page must not permanently own the shared relationship');
+	observers[0].next(oldFrame('4', 'Late disposed callback'));
+	assert.equal(current.get().data.games[0].owner.name, 'Owner');
+	current.destroy();
+});
+
+test('snapshot live keeps a stream started before disposal behind the retired owner', () => {
+	const observers = [];
+	const closed = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner-before-disposal', document: 'subscription FeaturedOwnerBeforeDisposal { featuredGames { id owner { id name } } }' }
+	};
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) { observers.push(observer); return () => { closed.push(observer); }; }
+	} });
+	const oldFrame = (ownerName) => gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames', operation: previousPage.live.id,
+		position: '2', ownerId: 'user-1', ownerName, indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	const oldWatch = replica.watch(previousPage, {}, { live: true });
+	observers[0].next(oldFrame('active owner'));
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const current = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	// The contender disagrees with the active owner's shared owner membership;
+	// agreeing frames are admitted (docs/live-query-delivery.md).
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '3',
+		ownerId: 'user-2', ownerName: 'started before disposal', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(current.get().data.games, []);
+	const layout = replica.watch(Todos, {}, { live: true });
+	observers[2].next(wireFrame({ operation: Todos.live.id, indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }, rows: [{ id: 'retained', title: 'layout' }] }));
+	oldWatch.destroy();
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '4',
+		ownerId: 'user-2', ownerName: 'still started before disposal', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(current.get().data.games, []);
+	assert.equal(observers.length, 4, 'retired ownership must reopen only the contender after the disposal fence');
+	assert.deepEqual(closed, [observers[0], observers[1]]);
+	assert.equal(layout.get().live, 'active');
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '5',
+		ownerId: 'user-2', ownerName: 'queued old receiver', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(current.get().data.games, [], 'old receiver stays fenced after reopening');
+	observers[3].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '6',
+		ownerId: 'user-1', ownerName: 'fresh authoritative receiver', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.equal(current.get().data.games[0].owner.name, 'fresh authoritative receiver');
+	assert.equal(observers.length, 4, 'the same retirement boundary cannot reopen repeatedly');
+	observers[2].next(wireFrame({ operation: Todos.live.id, indexesComparable: false,
+		live: { mode: 'snapshot', reset: true }, revision: '2', rows: [{ id: 'retained', title: 'continued layout' }] }));
+	assert.equal(layout.get().data.todos[0].title, 'continued layout');
+	current.destroy();
+	layout.destroy();
+	assert.deepEqual(closed, [observers[0], observers[1], observers[3], observers[2]]);
+});
+
+test('reopening a retired live owner restores its ownership fence', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner-reopened', document: 'subscription FeaturedOwnerReopened { featuredGames { id owner { id name } } }' }
+	};
+	const frame = (artifact, responseKey, operation, position, ownerName, ownerId = 'user-1') => gamesFrame({
+		artifact, responseKey, operation, position, ownerId, ownerName,
+		indexesComparable: false, live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) {
+		observers.push(observer);
+		if (observers.length === 2) {
+			observer.next(frame(previousPage, 'featuredGames', previousPage.live.id, '3', 'reopened owner'));
+		}
+		return () => {};
+	} } });
+	const first = replica.watch(previousPage, {}, { live: true });
+	observers[0].next(frame(previousPage, 'featuredGames', previousPage.live.id, '2', 'first owner'));
+	first.destroy();
+	const reopened = replica.watch(previousPage, {}, { live: true });
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const current = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	observers[2].next(frame(
+		GamesWithOwnerLiveOperation,
+		'games',
+		GamesWithOwnerLiveOperation.live.id,
+		'4',
+		'current contender',
+		// Disagrees with the reopened owner; an agreeing frame is admitted.
+		'user-2'
+	));
+	assert.deepEqual(current.get().data.games, []);
+	reopened.destroy();
+	current.destroy();
+});
+
+test('reopening a retired live owner clears the marker before its first frame', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner-reopened-empty', document: 'subscription FeaturedOwnerReopenedEmpty { featuredGames { id owner { id name } } }' }
+	};
+	const frame = (artifact, responseKey, operation, position, ownerName) => gamesFrame({
+		artifact, responseKey, operation, position, ownerId: 'user-1', ownerName,
+		indexesComparable: false, live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) { observers.push(observer); return () => {}; }
+	} });
+	const first = replica.watch(previousPage, {}, { live: true });
+	observers[0].next(frame(previousPage, 'featuredGames', previousPage.live.id, '2', 'first owner'));
+	first.destroy();
+	// Reopen the operation, but do not deliver a frame yet. The replacement
+	// stream must still be treated as an active owner immediately.
+	const reopened = replica.watch(previousPage, {}, { live: true });
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const contender = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	observers[1].next(frame(
+		GamesWithOwnerLiveOperation,
+		'games',
+		GamesWithOwnerLiveOperation.live.id,
+		'3',
+		'contender before reopened frame'
+	));
+	assert.deepEqual(contender.get().data.games, []);
+	reopened.destroy();
+	contender.destroy();
+});
+
+test('two watches retire shared live ownership only after final disposal', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner-refcount', document: 'subscription FeaturedOwnerRefcount { featuredGames { id owner { id name } } }' }
+	};
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) { observers.push(observer); return () => {}; }
+	} });
+	const oldFrame = (ownerName) => gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames', operation: previousPage.live.id,
+		position: '2', ownerId: 'user-1', ownerName, indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	const first = replica.watch(previousPage, {}, { live: true });
+	const second = replica.watch(previousPage, {}, { live: true });
+	assert.equal(observers.length, 1, 'same operation shares one live transport');
+	observers[0].next(oldFrame('active owner'));
+	first.destroy();
+
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+		ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const startedBeforeFinalRelease = replica.watch(
+		GamesWithOwnerLiveOperation,
+		{},
+		{ live: true }
+	);
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '3',
+		// Disagrees with the owner; an agreeing frame is admitted.
+		ownerId: 'user-2', ownerName: 'before final release', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(startedBeforeFinalRelease.get().data.games, []);
+	second.destroy();
+	observers[0].next(oldFrame('late disposed callback'));
+	observers[1].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '4',
+		ownerId: 'user-2', ownerName: 'still before final release', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(startedBeforeFinalRelease.get().data.games, []);
+	assert.equal(observers.length, 3, 'the final release enables one fresh contender receiver');
+	startedBeforeFinalRelease.destroy();
+
+	const afterFinalRelease = replica.watch(
+		GamesWithOwnerLiveOperation,
+		{},
+		{ live: true }
+	);
+	assert.equal(observers.length, 4, 'reopening after disposal creates another receiver');
+	observers[3].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '5',
+		ownerId: 'user-1', ownerName: 'after final release', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.equal(afterFinalRelease.get().data.games[0].owner.name, 'after final release');
+	afterFinalRelease.destroy();
+});
+
+test('terminal live retirement permits a later snapshot handoff', () => {
+	for (const terminal of ['error', 'complete']) {
+		const observers = [];
+		const previousPage = {
+			...FeaturedGamesWithOwner,
+			live: { id: `live:featured-owner-${terminal}`, document: `subscription FeaturedOwner${terminal} { featuredGames { id owner { id name } } }` }
+		};
+		const replica = createDistributedReplica({ transport: {
+			fetch() { throw new Error('terminal stream test does not need HTTP fallback'); },
+			subscribe(_request, observer) { observers.push(observer); return () => {}; }
+		} });
+		const oldFrame = gamesFrame({
+			artifact: previousPage, responseKey: 'featuredGames', operation: previousPage.live.id,
+			position: '2', ownerId: 'user-1', ownerName: `${terminal} owner`, indexesComparable: false,
+			live: { mode: 'snapshot', reset: true, cursors: [] }
+		});
+		replica.writeResult(previousPage, {}, gamesFrame({
+			artifact: previousPage, responseKey: 'featuredGames', position: '1',
+			ownerId: 'user-1', ownerName: `${terminal} owner`, indexesComparable: false
+		}), 'ssr');
+		const oldWatch = replica.watch(previousPage, {}, { live: true });
+		observers[0].next(oldFrame);
+		if (terminal === 'error') observers[0].error(new Error('terminal test error'));
+		else observers[0].complete();
+		// A terminal transport is no longer the page's live request. Dispose the
+		// watcher before another page seeds the same shared index; an error may
+		// otherwise be intentionally resumed by the replica on the next write.
+		oldWatch.destroy();
+
+		const empty = gamesFrame({
+			artifact: GamesWithOwnerLiveOperation, responseKey: 'games', position: '1',
+			ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+		});
+		empty.data.games = [];
+		empty.extensions.distributed.snapshot.records = [];
+		replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+		const current = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+		observers[1].next(gamesFrame({
+			artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+			operation: GamesWithOwnerLiveOperation.live.id, position: '3',
+			ownerId: 'user-1', ownerName: `${terminal} handoff`, indexesComparable: false,
+			live: { mode: 'snapshot', reset: true, cursors: [] }
+		}));
+		assert.equal(current.get().data.games.length, 1, `${terminal} handoff should replace the retired owner`);
+		assert.equal(current.get().data.games[0].owner.name, `${terminal} handoff`);
+		observers[0].next(oldFrame);
+		assert.equal(current.get().data.games[0].owner.name, `${terminal} handoff`);
+		current.destroy();
+	}
+});
+
+test('retired live ownership survives dehydration before a later handoff', () => {
+	const observers = [];
+	const previousPage = {
+		...FeaturedGamesWithOwner,
+		live: { id: 'live:featured-owner-hydrated', document: 'subscription FeaturedOwnerHydrated { featuredGames { id owner { id name } } }' }
+	};
+	const transport = {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, observer) { observers.push(observer); return () => {}; }
+	};
+	const replica = createDistributedReplica({ transport });
+	const oldFrame = gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames',
+		operation: previousPage.live.id, position: '2', ownerId: 'user-1',
+		ownerName: 'retired owner', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	replica.writeResult(previousPage, {}, gamesFrame({
+		artifact: previousPage, responseKey: 'featuredGames', position: '1',
+		ownerId: 'user-1', ownerName: 'retired owner', indexesComparable: false
+	}), 'ssr');
+	replica.read(previousPage, {});
+	const oldWatch = replica.watch(previousPage, {}, { live: true });
+	observers[0].next(oldFrame);
+	oldWatch.destroy();
+	const dehydrated = replica.dehydrate();
+	const oldProtocol = dehydrated.payload.operations.find((entry) =>
+		entry.live?.retiredAtRevision !== undefined
+	);
+	assert.ok(oldProtocol?.live?.retiredAtRevision !== undefined);
+
+	const restoredObservers = [];
+	const restored = createDistributedReplica({
+		transport: {
+			fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+			subscribe(_request, observer) { restoredObservers.push(observer); return () => {}; }
+		}
+	});
+	assert.equal(restored.hydrate(dehydrated, dehydrated.scope), true);
+	const current = restored.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	restoredObservers[0].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '3',
+		ownerId: 'user-1', ownerName: 'hydrated handoff', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.equal(current.get().data.games.length, 1);
+	assert.equal(restored.hydrate(dehydrated, dehydrated.scope), true);
+	assert.equal(current.get().data.games[0].owner.name, 'hydrated handoff');
+	assert.equal(restoredObservers.length, 1, 'same-scope hydration retains the active receiver');
+	restoredObservers[0].next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id, position: '4',
+		ownerId: 'user-1', ownerName: 'active receiver after hydrate', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	const contender = restored.watch(previousPage, {}, { live: true });
+	restoredObservers[1].next(oldFrame);
+	assert.equal(current.get().data.games[0].owner.name, 'active receiver after hydrate');
+	contender.destroy();
+	current.destroy();
+});
+
+test('snapshot live adds a row with an unchanged SSR-owned nested relationship', () => {
+	let observer;
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, next) { observer = next; return () => {}; }
+	} });
+	replica.writeResult(FeaturedGamesWithOwner, {}, gamesFrame({
+		artifact: FeaturedGamesWithOwner, responseKey: 'featuredGames',
+		position: '1', ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	}), 'ssr');
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		position: '1', ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const watch = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	observer.next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id,
+		position: '2', ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(watch.get().errors, []);
+	assert.equal(watch.get().complete, true);
+	assert.equal(watch.get().data.games.length, 1, 'unchanged sibling relationship must not freeze an empty root');
+	assert.equal(watch.get().data.games[0].owner.name, 'Owner');
+	assert.equal(replica.read(FeaturedGamesWithOwner, {}).data.featuredGames[0].owner.name, 'Owner');
+	observer.next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id,
+		position: '3', ownerId: 'user-2', ownerName: 'Changed', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.equal(watch.get().data.games[0].owner.name, 'Changed');
+	const removed = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id,
+		position: '4', ownerId: 'user-2', ownerName: 'Changed', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	});
+	removed.data.games = [];
+	removed.extensions.distributed.snapshot.records = [];
+	observer.next(removed);
+	assert.deepEqual(watch.get().data.games, []);
+	assert.equal(watch.get().live, 'active');
+	watch.destroy();
+});
+
+test('snapshot live cannot take over query ownership acquired after stream start', () => {
+	let observer;
+	const replica = createDistributedReplica({ transport: {
+		fetch() { throw new Error('complete snapshot must not force HTTP fallback'); },
+		subscribe(_request, next) { observer = next; return () => {}; }
+	} });
+	const empty = gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		position: '1', ownerId: 'user-1', ownerName: 'Owner', indexesComparable: false
+	});
+	empty.data.games = [];
+	empty.extensions.distributed.snapshot.records = [];
+	replica.writeResult(GamesWithOwnerLiveOperation, {}, empty, 'ssr');
+	const watch = replica.watch(GamesWithOwnerLiveOperation, {}, { live: true });
+	replica.writeResult(FeaturedGamesWithOwner, {}, gamesFrame({
+		artifact: FeaturedGamesWithOwner, responseKey: 'featuredGames',
+		position: '2', ownerId: 'user-2', ownerName: 'New query', indexesComparable: false
+	}), 'network');
+	observer.next(gamesFrame({
+		artifact: GamesWithOwnerLiveOperation, responseKey: 'games',
+		operation: GamesWithOwnerLiveOperation.live.id,
+		position: '1', ownerId: 'user-1', ownerName: 'Old stream', indexesComparable: false,
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	}));
+	assert.deepEqual(watch.get().errors, []);
+	assert.deepEqual(watch.get().data.games, []);
+	assert.equal(replica.read(FeaturedGamesWithOwner, {}).data.featuredGames[0].owner.name, 'New query');
+	watch.destroy();
+});
+
+test('snapshot authorization changes discard the old stream and reconnect without cursors', async () => {
+	const subscriptions = [];
+	const requests = [];
+	const replica = createDistributedReplica({ transport: {
+		fetch(request) {
+			return new Promise((resolve) => requests.push({ request, resolve }));
+		},
+		subscribe(request, observer) {
+			subscriptions.push({ request, observer });
+			return () => {};
+		}
+	} });
+	write(replica, { rows: [{ id: 'alice', title: 'private alice' }], indexesComparable: false }, 'ssr');
+	const watch = replica.watch(Todos, {}, { live: true });
+	subscriptions[0].observer.next(wireFrame({
+		operation: 'live:todos', rows: [{ id: 'alice', title: 'private alice' }],
+		indexesComparable: false, live: { mode: 'snapshot', reset: true }
+	}));
+	replica.invalidateAuthorization();
+	await Promise.resolve();
+	assert.equal(requests.length, 1);
+	subscriptions[0].observer.next(wireFrame({
+		operation: 'live:todos', rows: [{ id: 'alice', title: 'late private alice' }],
+		indexesComparable: false, live: { mode: 'snapshot', reset: true }
+	}));
+	assert.equal(watch.get().complete, false);
+	requests[0].resolve(wireFrame({
+		cacheScope: 'cache:b', rows: [{ id: 'bob', title: 'private bob' }],
+		recordScope: 'record:b', indexesComparable: false
+	}));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(subscriptions.length, 2);
+	assert.equal(subscriptions[1].request.resume, undefined);
+	assert.equal(watch.get().data.todos[0].id, 'bob');
+	subscriptions[1].observer.next(wireFrame({
+		operation: 'live:todos', cacheScope: 'cache:b', rows: [],
+		indexesComparable: false, live: { mode: 'snapshot', reset: true }
+	}));
+	assert.deepEqual(watch.get().data.todos, []);
+	watch.destroy();
+});
+
+test('completed resumable live streams relinquish ownership and fall back to HTTP', async () => {
 	const fetches = [];
 	const subscriptions = [];
 	let unsubscribeCount = 0;
@@ -1971,7 +2718,7 @@ test('completed supported live streams relinquish ownership and fall back to HTT
 			position: '2',
 			rows: [{ id: 'todo-live', title: 'supported live membership' }],
 			recordScope: 'record:live',
-			live: { supported: true, reset: true }
+			live: { mode: "resumable", reset: true }
 		})
 	);
 	assert.deepEqual(replica.read(Todos, {}).data.todos, [
@@ -2061,6 +2808,251 @@ test('terminal live errors close their stream and allow a later HTTP retry', asy
 
 	watch.destroy();
 	assert.equal(unsubscribeCount, 2);
+});
+
+/** Error-only live failure frame: base envelope, no snapshot/live/command. */
+function liveFailureFrame(options = {}) {
+	return {
+		...(options.omitData ? {} : { data: null }),
+		...(options.omitErrors
+			? {}
+			: {
+					errors: options.errors ?? [
+						{
+							message: 'statement timeout',
+							path: ['todos'],
+							extensions: { code: 'TIMEOUT' }
+						}
+					]
+				}),
+		...(options.data === undefined ? {} : { data: options.data }),
+		extensions: {
+			distributed: {
+				protocolVersion: DISTRIBUTED_PROTOCOL_VERSION,
+				schemaHash: 'schema-a',
+				authorizationGeneration: 'auth-1',
+				cacheScope: 'cache:a',
+				operation: options.operation ?? 'live:todos',
+				...options.distributed
+			}
+		}
+	};
+}
+
+function liveFailureHarness() {
+	const fetches = [];
+	const subscriptions = [];
+	let unsubscribeCount = 0;
+	const replica = createDistributedReplica({
+		transport: {
+			fetch() {
+				let resolve;
+				const promise = new Promise((done) => {
+					resolve = done;
+				});
+				fetches.push({ resolve });
+				return promise;
+			},
+			subscribe(request, observer) {
+				subscriptions.push({ request, observer });
+				return () => {
+					unsubscribeCount += 1;
+				};
+			}
+		}
+	});
+	return {
+		replica,
+		fetches,
+		subscriptions,
+		unsubscribes: () => unsubscribeCount
+	};
+}
+
+test('live failure frames surface the GraphQL error, admit nothing, and reopen with backoff', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const { replica, fetches, subscriptions, unsubscribes } = liveFailureHarness();
+	const watch = replica.watch(Todos, {}, { live: true });
+	await Promise.resolve();
+	assert.equal(subscriptions.length, 1);
+	subscriptions[0].observer.next(
+		wireFrame({
+			operation: 'live:todos',
+			position: '2',
+			rows: [{ id: 'todo-live', title: 'admitted before failure' }],
+			recordScope: 'record:live',
+			live: { mode: 'resumable', reset: true }
+		})
+	);
+	const admitted = [{ id: 'todo-live', title: 'admitted before failure' }];
+	assert.deepEqual(watch.get().data.todos, admitted);
+	assert.deepEqual(watch.get().errors, []);
+	const fetchesBeforeFailure = fetches.length;
+
+	subscriptions[0].observer.next(liveFailureFrame());
+	assert.equal(watch.get().errors[0].message, 'statement timeout');
+	assert.equal(watch.get().errors[0].extensions.code, 'TIMEOUT');
+	assert.equal(watch.get().live, 'error');
+	assert.deepEqual(watch.get().data.todos, admitted);
+	assert.deepEqual(replica.read(Todos, {}).data.todos, admitted);
+	// The failure is terminal: the stream is closed and the server's trailing
+	// complete neither falls back to HTTP nor reopens outside the backoff.
+	assert.equal(unsubscribes(), 1);
+	subscriptions[0].observer.complete();
+	assert.equal(fetches.length, fetchesBeforeFailure);
+	assert.equal(watch.get().live, 'error');
+	// Receipt-only ingestion (here a failing HTTP read) resumes live watches;
+	// the failed one keeps waiting for its backoff.
+	replica.writeResult(
+		Todos,
+		{},
+		liveFailureFrame({ operation: 'query:todos' }),
+		'network'
+	);
+	assert.equal(subscriptions.length, 1);
+	assert.deepEqual(replica.read(Todos, {}).data.todos, admitted);
+
+	t.mock.timers.tick(999);
+	assert.equal(subscriptions.length, 1);
+	t.mock.timers.tick(1);
+	assert.equal(subscriptions.length, 2);
+	// No cursor or ownership moved: the reopen resumes at the admitted cursor.
+	assert.deepEqual(subscriptions[1].request.resume, [
+		{ projection: 'todos-projector', position: '2', token: 'resume:2' }
+	]);
+	assert.equal(watch.get().errors[0].message, 'statement timeout');
+
+	subscriptions[1].observer.next(liveFailureFrame({ omitData: true }));
+	assert.equal(unsubscribes(), 2);
+	t.mock.timers.tick(1999);
+	assert.equal(subscriptions.length, 2, 'consecutive failures double the backoff');
+	t.mock.timers.tick(1);
+	assert.equal(subscriptions.length, 3);
+
+	subscriptions[2].observer.next(
+		wireFrame({
+			operation: 'live:todos',
+			position: '3',
+			rows: [{ id: 'todo-live', title: 'recovered' }],
+			recordScope: 'record:live',
+			live: { mode: 'resumable' }
+		})
+	);
+	assert.deepEqual(watch.get().errors, []);
+	assert.equal(watch.get().live, 'active');
+	assert.deepEqual(watch.get().data.todos, [
+		{ id: 'todo-live', title: 'recovered' }
+	]);
+
+	subscriptions[2].observer.next(liveFailureFrame());
+	t.mock.timers.tick(1000);
+	assert.equal(subscriptions.length, 4, 'an admitted frame resets the backoff');
+
+	subscriptions[3].observer.next(liveFailureFrame());
+	watch.destroy();
+	t.mock.timers.tick(30_000);
+	assert.equal(subscriptions.length, 4, 'disposing the last watch cancels the reopen');
+});
+
+test('authorization invalidation cancels a pending live failure reopen', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const { replica, subscriptions } = liveFailureHarness();
+	const watch = replica.watch(Todos, {}, { live: true });
+	await Promise.resolve();
+	subscriptions[0].observer.next(liveFailureFrame());
+	assert.equal(watch.get().errors[0].message, 'statement timeout');
+	replica.invalidateAuthorization();
+	t.mock.timers.tick(30_000);
+	assert.equal(subscriptions.length, 1);
+	watch.destroy();
+});
+
+test('live frames that are not error-only failures stay strict and admit nothing', async () => {
+	const cases = [
+		{
+			name: 'partial data with errors and no live metadata',
+			frame: liveFailureFrame({
+				data: { todos: [{ id: 'todo-partial', title: 'partial' }] }
+			}),
+			path: 'extensions.distributed.live'
+		},
+		{
+			name: 'data-bearing snapshot without live metadata',
+			frame: wireFrame({
+				operation: 'live:todos',
+				position: '9',
+				rows: [{ id: 'todo-unscoped', title: 'unscoped' }]
+			}),
+			path: 'extensions.distributed.live'
+		},
+		{
+			name: 'empty errors',
+			frame: liveFailureFrame({ errors: [] }),
+			path: 'extensions.distributed.live'
+		},
+		{
+			name: 'null data without errors',
+			frame: liveFailureFrame({ omitErrors: true }),
+			path: 'extensions.distributed.live'
+		},
+		{
+			name: 'errors without a string message',
+			frame: liveFailureFrame({ errors: [{ message: 42 }] }),
+			path: 'extensions.distributed.live'
+		},
+		{
+			name: 'command receipt on a failure frame',
+			frame: liveFailureFrame({
+				distributed: { command: commandReceipt() }
+			}),
+			path: 'extensions.distributed.command'
+		},
+		{
+			name: 'failure frame for another operation',
+			frame: liveFailureFrame({ operation: 'live:todos-other' }),
+			path: 'extensions.distributed.operation'
+		},
+		{
+			name: 'failure frame without the distributed envelope',
+			frame: {
+				data: null,
+				errors: [{ message: 'statement timeout' }]
+			},
+			path: 'extensions.distributed'
+		}
+	];
+	for (const { name, frame, path } of cases) {
+		const { replica, fetches, subscriptions, unsubscribes } =
+			liveFailureHarness();
+		const watch = replica.watch(Todos, {}, { live: true });
+		await Promise.resolve();
+		subscriptions[0].observer.next(
+			wireFrame({
+				operation: 'live:todos',
+				position: '2',
+				rows: [{ id: 'todo-live', title: 'admitted' }],
+				recordScope: 'record:live',
+				live: { mode: 'resumable', reset: true }
+			})
+		);
+		const fetchCount = fetches.length;
+		subscriptions[0].observer.next(frame);
+		assert.equal(watch.get().live, 'error', name);
+		assert.equal(
+			watch.get().errors[0].message,
+			`Invalid Distributed GraphQL protocol envelope at ${path}`,
+			name
+		);
+		assert.deepEqual(
+			replica.read(Todos, {}).data.todos,
+			[{ id: 'todo-live', title: 'admitted' }],
+			name
+		);
+		assert.equal(unsubscribes(), 0, `${name}: not a terminal failure frame`);
+		assert.equal(fetches.length, fetchCount, name);
+		assert.equal(subscriptions.length, 1, name);
+		watch.destroy();
+	}
 });
 
 test('live advancement fences an overlapping refresh while a later clean refresh succeeds', async () => {
@@ -2760,4 +3752,51 @@ test('protocol record scopes remain opaque and never become replica identities',
 		replica.inspectRecord(Todo, 'opaque:tenant/key/partition'),
 		undefined
 	);
+});
+
+test('issuing-user freshness keeps pending effects separate from confirmed floors', async () => {
+	const { replicaCommandFreshness } = await import('../dist/replica/command-runtime/symbols.js');
+	const artifact = { ...Todos, protocol: { ...Todos.protocol, protocolHash: 'protocol-a' } };
+	const requests = [];
+	let candidate = wireFrame({ position: '1', rows: [{ id: 'todo-1', title: 'base' }] });
+	const replica = createDistributedReplica({ transport: { async fetch(request) { requests.push(request); return candidate; } } });
+	write(replica, { position: '1', rows: [{ id: 'todo-1', title: 'base' }] }, 'network', artifact);
+	const watch = replica.watch(artifact, {});
+	const plan = { dependencies: ['todos'], models: [Todo.id], relationships: [] };
+	replica[replicaCommandFreshness]('cmd-1', plan);
+	replica.createOptimisticLayer('cmd-1', writer => writer.writeRecord(Todo, 'todo-1', { fields: { title: 'preview' } }));
+	replica.markOptimisticLayerAccepted('cmd-1', commandMetadata());
+	await watch.refresh();
+	assert.equal(requests.at(-1).extensions.gatewayFreshness.pending.length, 1);
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'preview');
+	candidate = wireFrame({ position: '2', revision: '2', rows: [{ id: 'todo-1', title: 'committed' }], observations: [{ causationId: 'cause-1', projection: 'todos-projector', model: Todo.id, scopeToken: 'expect:todo-1' }] });
+	await watch.refresh();
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'committed');
+	candidate = wireFrame({ position: '1', rows: [{ id: 'todo-1', title: 'lagging' }] });
+	await watch.refresh();
+	const context = requests.at(-1).extensions.gatewayFreshness;
+	assert.equal(context.pending.length, 0);
+	assert(context.minimum.some(floor => floor.kind === 'index' && floor.position === '2'));
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'committed');
+	watch.destroy();
+});
+
+test('Atomic installs a retained outgoing floor without an automatic fetch', async () => {
+	const { replicaCommandFreshness } = await import('../dist/replica/command-runtime/symbols.js');
+	const artifact = { ...Todos, protocol: { ...Todos.protocol, protocolHash: 'protocol-a' } };
+	const requests = [];
+	const replica = createDistributedReplica({ transport: { async fetch(request) { requests.push(request); return wireFrame({ position: '1', rows: [{ id: 'todo-1', title: 'lagging' }] }); } } });
+	write(replica, { position: '1', rows: [{ id: 'todo-1', title: 'base' }] }, 'network', artifact);
+	const watch = replica.watch(artifact, {});
+	replica[replicaCommandFreshness]('atomic', { dependencies: ['todos'], models: [Todo.id], relationships: [] });
+	replica.createOptimisticLayer('atomic', writer => writer.writeRecord(Todo, 'todo-1', { fields: { title: 'preview' } }));
+	replica[replicaCommandDirectProjection]('atomic', { model: Todo, identity: 'todo-1', evidence: { model: Todo.id, scopeToken: 'record:todo-1', incarnation: '1', revision: '2', tombstone: false }, fields: { id: 'todo-1', title: 'committed', __typename: Todo.id } });
+	assert.equal(requests.length, 0);
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'committed');
+	await watch.refresh();
+	const context = requests.at(-1).extensions.gatewayFreshness;
+	assert.equal(context.pending.length, 0);
+	assert(context.minimum.some(floor => floor.kind === 'record' && floor.revision === '2'));
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'committed');
+	watch.destroy();
 });

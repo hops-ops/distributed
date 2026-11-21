@@ -1,5 +1,0 @@
-error: serde kebab-case field names cannot be represented in GraphQL; use camelCase or snake_case
- --> tests/graphql_compile_fail/serde_kebab_case.rs:4:22
-  |
-4 | #[serde(rename_all = "kebab-case")]
-  |                      ^^^^^^^^^^^^

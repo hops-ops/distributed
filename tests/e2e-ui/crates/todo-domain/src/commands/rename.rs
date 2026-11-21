@@ -1,23 +1,23 @@
-use distributed::graphql::Eventual;
-use distributed::portable_command;
+use distributed::command;
+use distributed::command::Eventual;
 use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, Todo, TodoState};
 
-#[derive(Debug, Deserialize, distributed::GraphqlInput)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct TodoRenameInput {
     pub todo_id: String,
     pub title: String,
 }
 
-#[derive(Debug, Serialize, distributed::GraphqlOutput)]
+#[derive(Debug, Serialize, distributed::CommandOutput)]
 pub struct TodoRenamePayload {
     pub todo_id: String,
     pub title: String,
     pub status: String,
 }
 
-portable_command! {
+command! {
     name: "todo.rename",
     transition: domain_commands::Rename,
     aggregate: Todo,
@@ -28,7 +28,7 @@ portable_command! {
     roles: ["user", "admin"],
     field: "todos_rename",
     invoke: |todo, input, principal| todo.rename(principal, &input.title),
-    payload: |todo| {
+    payload: |todo, _principal| {
         let state = TodoState::from(&**todo);
         TodoRenamePayload {
             todo_id: state.todo_id,

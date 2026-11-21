@@ -2,16 +2,17 @@
 //!
 //! Each handler lives in its own file under `handlers/` and exports:
 //! - `COMMAND: &str` — the command name
-//! - `guard(ctx) -> bool` — input validation
-//! - `handle(ctx) -> Result<Value, HandlerError>` — the handler
+//! - `command()` — the typed declaration: input, outcome and roles
+//! - `handle(ctx, input)` — the handler
 //!
-//! Registration uses the `routes!` macro.
+//! Registration is `.typed_command(module::command()).handle(module::handle)`.
 
-use distributed::microsvc::{Routes, Service, Session};
+use distributed::microsvc::{CausalDispatchError, Routes, Service};
 use distributed::{AggregateBuilder, InMemoryRepository, OutboxStore, Queueable};
 use serde_json::json;
 
-use crate::handlers;
+use crate::commands::dispatch;
+use crate::handlers::{self, user_session};
 use crate::models::counter::Counter;
 
 // ============================================================================
@@ -19,34 +20,41 @@ use crate::models::counter::Counter;
 // ============================================================================
 
 #[tokio::test]
-async fn routes_macro_registers_handlers_and_dispatches() {
+async fn handler_modules_register_and_dispatch() {
     let store = InMemoryRepository::new();
-    let service = Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(store.clone().queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-        command handlers::counter_increment,
-    ));
+    let service = Service::new().named("counters").routes(
+        Routes::new()
+            .with_repo(store.clone().queued().aggregate::<Counter>())
+            .typed_command(handlers::counter_create::command())
+            .handle(handlers::counter_create::handle)
+            .typed_command(handlers::counter_increment::command())
+            .handle(handlers::counter_increment::handle),
+    );
 
     let mut cmds = service.command_names();
     cmds.sort();
     assert_eq!(cmds, vec!["counter.increment", "counter.initialize"]);
 
     // Create
-    let result = service
-        .dispatch("counter.initialize", json!({ "id": "c1" }), Session::new())
-        .await
-        .unwrap();
+    let result = dispatch(
+        &service,
+        "counter.initialize",
+        json!({ "id": "c1" }),
+        user_session("user-1"),
+    )
+    .await
+    .unwrap();
     assert_eq!(result, json!({ "id": "c1" }));
 
     // Increment
-    let result = service
-        .dispatch(
-            "counter.increment",
-            json!({ "id": "c1", "amount": 10 }),
-            Session::new(),
-        )
-        .await
-        .unwrap();
+    let result = dispatch(
+        &service,
+        "counter.increment",
+        json!({ "id": "c1", "amount": 10 }),
+        user_session("user-1"),
+    )
+    .await
+    .unwrap();
     assert_eq!(result, json!({ "id": "c1", "value": 10 }));
 
     // Verify state via repo
@@ -61,34 +69,59 @@ async fn routes_macro_registers_handlers_and_dispatches() {
 }
 
 #[tokio::test]
-async fn guard_rejects_bad_input() {
-    let service = Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(InMemoryRepository::new().queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-    ));
+async fn bad_input_is_refused_before_the_handler() {
+    let service = Service::new().named("counters").routes(
+        Routes::new()
+            .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
+            .typed_command(handlers::counter_create::command())
+            .handle(handlers::counter_create::handle),
+    );
 
-    let result = service
-        .dispatch("counter.initialize", json!({ "wrong": 1 }), Session::new())
-        .await;
-    assert!(result.is_err());
+    let result = dispatch(
+        &service,
+        "counter.initialize",
+        json!({ "wrong": 1 }),
+        user_session("user-1"),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(CausalDispatchError::BadRequest(_))),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]
 async fn handler_rejects_duplicate_create() {
-    let service = Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(InMemoryRepository::new().queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-    ));
+    let service = Service::new().named("counters").routes(
+        Routes::new()
+            .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
+            .typed_command(handlers::counter_create::command())
+            .handle(handlers::counter_create::handle),
+    );
 
-    service
-        .dispatch("counter.initialize", json!({ "id": "c1" }), Session::new())
-        .await
-        .unwrap();
+    dispatch(
+        &service,
+        "counter.initialize",
+        json!({ "id": "c1" }),
+        user_session("user-1"),
+    )
+    .await
+    .unwrap();
 
-    let result = service
-        .dispatch("counter.initialize", json!({ "id": "c1" }), Session::new())
-        .await;
-    assert!(result.is_err());
+    let result = dispatch(
+        &service,
+        "counter.initialize",
+        json!({ "id": "c1" }),
+        user_session("user-1"),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(CausalDispatchError::Rejected { status: 422, .. })
+        ),
+        "{result:?}"
+    );
 }
 
 // ============================================================================
@@ -98,15 +131,21 @@ async fn handler_rejects_duplicate_create() {
 #[tokio::test]
 async fn create_persists_outbox_message() {
     let store = InMemoryRepository::new();
-    let service = Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(store.clone().queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-    ));
+    let service = Service::new().named("counters").routes(
+        Routes::new()
+            .with_repo(store.clone().queued().aggregate::<Counter>())
+            .typed_command(handlers::counter_create::command())
+            .handle(handlers::counter_create::handle),
+    );
 
-    let result = service
-        .dispatch("counter.initialize", json!({ "id": "c1" }), Session::new())
-        .await
-        .unwrap();
+    let result = dispatch(
+        &service,
+        "counter.initialize",
+        json!({ "id": "c1" }),
+        user_session("user-1"),
+    )
+    .await
+    .unwrap();
     assert_eq!(result, json!({ "id": "c1" }));
 
     // Aggregate was persisted
@@ -129,21 +168,37 @@ async fn create_persists_outbox_message() {
 #[tokio::test]
 async fn duplicate_create_leaves_single_outbox_message() {
     let store = InMemoryRepository::new();
-    let service = Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(store.clone().queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-    ));
+    let service = Service::new().named("counters").routes(
+        Routes::new()
+            .with_repo(store.clone().queued().aggregate::<Counter>())
+            .typed_command(handlers::counter_create::command())
+            .handle(handlers::counter_create::handle),
+    );
 
-    service
-        .dispatch("counter.initialize", json!({ "id": "c1" }), Session::new())
-        .await
-        .unwrap();
+    dispatch(
+        &service,
+        "counter.initialize",
+        json!({ "id": "c1" }),
+        user_session("user-1"),
+    )
+    .await
+    .unwrap();
 
     // Second create fails — no duplicate outbox message
-    let result = service
-        .dispatch("counter.initialize", json!({ "id": "c1" }), Session::new())
-        .await;
-    assert!(result.is_err());
+    let result = dispatch(
+        &service,
+        "counter.initialize",
+        json!({ "id": "c1" }),
+        user_session("user-1"),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(CausalDispatchError::Rejected { status: 422, .. })
+        ),
+        "{result:?}"
+    );
 
     let pending = store.outbox_store().pending(usize::MAX).await.unwrap();
     assert_eq!(pending.len(), 1);
@@ -152,25 +207,32 @@ async fn duplicate_create_leaves_single_outbox_message() {
 #[tokio::test]
 async fn increment_persists_outbox_message() {
     let store = InMemoryRepository::new();
-    let service = Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(store.clone().queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-        command handlers::counter_increment,
-    ));
+    let service = Service::new().named("counters").routes(
+        Routes::new()
+            .with_repo(store.clone().queued().aggregate::<Counter>())
+            .typed_command(handlers::counter_create::command())
+            .handle(handlers::counter_create::handle)
+            .typed_command(handlers::counter_increment::command())
+            .handle(handlers::counter_increment::handle),
+    );
 
-    service
-        .dispatch("counter.initialize", json!({ "id": "c1" }), Session::new())
-        .await
-        .unwrap();
+    dispatch(
+        &service,
+        "counter.initialize",
+        json!({ "id": "c1" }),
+        user_session("user-1"),
+    )
+    .await
+    .unwrap();
 
-    service
-        .dispatch(
-            "counter.increment",
-            json!({ "id": "c1", "amount": 7 }),
-            Session::new(),
-        )
-        .await
-        .unwrap();
+    dispatch(
+        &service,
+        "counter.increment",
+        json!({ "id": "c1", "amount": 7 }),
+        user_session("user-1"),
+    )
+    .await
+    .unwrap();
 
     // Aggregate state is correct
     let counter: Counter = store

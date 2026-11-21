@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use super::{
     ProjectionCommitBatch, ProjectionEpoch, ProjectionExecutionSnapshotBatchRequest,
-    ProjectionGraphSnapshotRequest, ProjectionModelOwnership, ProjectionMutationKind,
-    ProjectionObservationKind, ProjectionObservationRequest, ProjectionObservationTarget,
-    ProjectionProtocolError, ProjectionQuerySnapshotRequest, ProjectionRecordExpectation,
-    ProjectionRecordMutation, ProjectionRecordScope, ProjectionScopeCodec, RecordRevision,
+    ProjectionGraphSnapshotRequest, ProjectionModelOwnership, ProjectionObservationKind,
+    ProjectionObservationRequest, ProjectionObservationTarget, ProjectionProtocolError,
+    ProjectionQuerySnapshotRequest, ProjectionRecordExpectation, ProjectionRecordMutation,
+    ProjectionRecordScope, ProjectionScopeCodec, RecordRevision, RecordTransition,
     TrustedProjectionInput,
 };
 use crate::read_model::{RelationalReadModel, RelationalReadModelIncludes};
@@ -21,6 +21,7 @@ use crate::table::{
     DeleteTableRowMutation, ExpectedVersion, PatchMode, PatchTableRowMutation, RowKey, RowPatch,
     RowWriteMode, TableMutation, TableRowMutation, TableSchema,
 };
+use crate::ProjectionProgramId;
 
 /// Typed, commit-less workspace passed to a causal projector handler.
 ///
@@ -33,6 +34,7 @@ pub struct ProjectionWorkspace {
     partition_value: Option<serde_json::Value>,
     input: TrustedProjectionInput,
     change_epoch: ProjectionEpoch,
+    program_id: Option<ProjectionProgramId>,
     ownership: BTreeMap<String, String>,
     mutations: Vec<ProjectionRecordMutation>,
     observations: Vec<ProjectionObservationRequest>,
@@ -45,6 +47,16 @@ impl ProjectionWorkspace {
         partition_value: Option<serde_json::Value>,
         input: TrustedProjectionInput,
         change_epoch: ProjectionEpoch,
+    ) -> Result<Self, ProjectionProtocolError> {
+        Self::new_with_program_id(codec, partition_value, input, change_epoch, None)
+    }
+
+    pub(crate) fn new_with_program_id(
+        codec: Arc<ProjectionScopeCodec>,
+        partition_value: Option<serde_json::Value>,
+        input: TrustedProjectionInput,
+        change_epoch: ProjectionEpoch,
+        program_id: Option<ProjectionProgramId>,
     ) -> Result<Self, ProjectionProtocolError> {
         if codec.topology() != input.cursor.topology() {
             return Err(ProjectionProtocolError::ScopeMismatch {
@@ -64,6 +76,7 @@ impl ProjectionWorkspace {
             partition_value,
             input,
             change_epoch,
+            program_id,
             ownership: BTreeMap::new(),
             mutations: Vec::new(),
             observations: Vec::new(),
@@ -92,7 +105,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
     }
 
@@ -124,7 +137,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected.clone()),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
     }
 
@@ -153,7 +166,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected.clone()),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
     }
 
@@ -179,7 +192,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected.clone()),
-            ProjectionMutationKind::Delete,
+            RecordTransition::Delete,
         )
     }
 
@@ -210,7 +223,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected_tombstone.clone()),
-            ProjectionMutationKind::Recreate,
+            RecordTransition::Recreate,
         )
     }
 
@@ -316,12 +329,22 @@ impl ProjectionWorkspace {
         &mut self,
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
+        source: Option<super::SourceSnapshotVersion>,
     ) -> Result<&mut Self, ProjectionProtocolError> {
         validate_execution_mutation_shape(&mutation, &expectation, kind)?;
         let (schema, key) = mutation_schema_key(&mutation);
         let scope = self.record_scope(schema, key)?;
-        self.stage(schema, scope, mutation, expectation, kind)
+        self.push_staged(
+            schema,
+            ProjectionRecordMutation::with_source_snapshot(
+                scope,
+                mutation,
+                expectation,
+                kind,
+                source,
+            )?,
+        )
     }
 
     #[allow(dead_code)]
@@ -357,7 +380,13 @@ impl ProjectionWorkspace {
     ) -> Result<Vec<ProjectionModelOwnership>, ProjectionProtocolError> {
         self.ownership
             .iter()
-            .map(|(model, table)| ProjectionModelOwnership::new(model.clone(), table.clone()))
+            .map(|(model, table)| {
+                let ownership = ProjectionModelOwnership::new(model.clone(), table.clone())?;
+                Ok(self
+                    .program_id
+                    .map(|program_id| ownership.clone().with_program_id(program_id))
+                    .unwrap_or(ownership))
+            })
             .collect()
     }
 
@@ -432,8 +461,20 @@ impl ProjectionWorkspace {
         scope: ProjectionRecordScope,
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
     ) -> Result<&mut Self, ProjectionProtocolError> {
+        self.push_staged(
+            schema,
+            ProjectionRecordMutation::new(scope, mutation, expectation, kind)?,
+        )
+    }
+
+    fn push_staged(
+        &mut self,
+        schema: &'static TableSchema,
+        mutation: ProjectionRecordMutation,
+    ) -> Result<&mut Self, ProjectionProtocolError> {
+        let scope = mutation.scope.clone();
         if !self.staged_scopes.insert(scope.clone()) {
             return Err(ProjectionProtocolError::InvalidBatch(format!(
                 "projection workspace repeats model `{}` record scope",
@@ -441,12 +482,7 @@ impl ProjectionWorkspace {
             )));
         }
         self.register_ownership(schema)?;
-        self.mutations.push(ProjectionRecordMutation::new(
-            scope.clone(),
-            mutation,
-            expectation,
-            kind,
-        )?);
+        self.mutations.push(mutation);
         self.observations.push(ProjectionObservationRequest {
             kind: ProjectionObservationKind::Record,
             target: ProjectionObservationTarget::StagedRecord(scope),
@@ -466,33 +502,33 @@ fn mutation_schema_key(mutation: &TableMutation) -> (&'static TableSchema, &RowK
 fn validate_execution_mutation_shape(
     mutation: &TableMutation,
     expectation: &ProjectionRecordExpectation,
-    kind: ProjectionMutationKind,
+    kind: RecordTransition,
 ) -> Result<(), ProjectionProtocolError> {
     let valid = match (mutation, expectation, kind) {
         (
             TableMutation::UpsertRow(row),
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         ) => row.mode == RowWriteMode::Insert && row.expected_version == ExpectedVersion::NotExists,
         (
             TableMutation::UpsertRow(row),
             ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         ) => row.mode == RowWriteMode::Upsert && row.expected_version == ExpectedVersion::Any,
         (
             TableMutation::PatchRow(row),
             ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         ) => row.mode == PatchMode::UpdateExisting && row.expected_version == ExpectedVersion::Any,
         (
             TableMutation::DeleteRow(row),
-            ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Delete,
+            ProjectionRecordExpectation::Exact(_) | ProjectionRecordExpectation::Missing,
+            RecordTransition::Delete,
         ) => row.expected_version == ExpectedVersion::Any,
         (
             TableMutation::UpsertRow(row),
             ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Recreate,
+            RecordTransition::Recreate,
         ) => row.mode == RowWriteMode::Insert && row.expected_version == ExpectedVersion::NotExists,
         _ => false,
     };

@@ -1,7 +1,7 @@
-use distributed::{command_input_defaults, GraphqlInput};
+use distributed::{command_input_defaults, CommandInput};
 use serde::Deserialize;
 
-#[derive(Deserialize, GraphqlInput)]
+#[derive(Deserialize, CommandInput)]
 struct Input {
     id: Option<String>,
 }

@@ -1,78 +1,5 @@
 use super::*;
-
-/// Role grant used by [`surface_for_role`] (feature-free; maps from `ReadPermission`
-/// when the `graphql` feature is enabled).
-#[derive(Clone, Debug)]
-pub struct RoleGrant {
-    pub all_columns: bool,
-    pub columns: BTreeSet<String>,
-    pub aggregations: bool,
-    pub row_policy: SurfaceRowPolicy,
-    pub limit: Option<u64>,
-}
-
-impl RoleGrant {
-    pub fn all_columns() -> Self {
-        Self {
-            all_columns: true,
-            columns: BTreeSet::new(),
-            aggregations: false,
-            row_policy: SurfaceRowPolicy::Unrestricted,
-            limit: None,
-        }
-    }
-
-    pub fn columns<I: IntoIterator<Item = impl Into<String>>>(cols: I) -> Self {
-        Self {
-            all_columns: false,
-            columns: cols.into_iter().map(Into::into).collect(),
-            aggregations: false,
-            row_policy: SurfaceRowPolicy::Unrestricted,
-            limit: None,
-        }
-    }
-
-    pub fn with_aggregations(mut self) -> Self {
-        self.aggregations = true;
-        self
-    }
-
-    pub fn rows(mut self, predicate: FilterExpr) -> Self {
-        self.row_policy = SurfaceRowPolicy::Predicate(predicate);
-        self
-    }
-
-    pub fn server_only_rows(mut self) -> Self {
-        self.row_policy = SurfaceRowPolicy::ServerOnly;
-        self
-    }
-
-    pub fn limit(mut self, limit: u64) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-
-    pub fn allows_column(&self, name: &str) -> bool {
-        self.all_columns || self.columns.contains(name)
-    }
-}
-
-/// Build a role→grant map for one role from `(model_name, role) → grant` entries.
-///
-/// Entries whose role does not match are ignored. Used by export/SDL and engine
-/// adapters that already store grants keyed by `(model, role)`.
-pub fn role_grants_for_role(
-    role: &str,
-    model_role_grants: &BTreeMap<(String, String), RoleGrant>,
-) -> BTreeMap<String, RoleGrant> {
-    let mut out = BTreeMap::new();
-    for ((model, r), grant) in model_role_grants {
-        if r == role {
-            out.insert(model.clone(), grant.clone());
-        }
-    }
-    out
-}
+use crate::graphql::permissions::ReadPermission;
 
 /// Apply role grants: drop ungranted models and columns (and relationships to
 /// dropped models). Aggregate roots omitted when `aggregations` is false.
@@ -83,16 +10,10 @@ pub fn role_grants_for_role(
 pub fn surface_for_role(
     surface: &Surface,
     role: &str,
-    grants: &BTreeMap<String, RoleGrant>,
+    grants: &BTreeMap<String, ReadPermission>,
 ) -> Result<Surface, String> {
     // Validate the complete declared topology before authorization filtering.
-    // Only a projector hidden by a valid role selection may become
-    // `confirmation_unavailable`; an omitted catalog topology is an error.
-    validate_command_confirmation_topology(
-        &surface.commands,
-        &surface.projectors,
-        &surface.models,
-    )?;
+    validate_command_projection_topology(&surface.commands, &surface.projectors, &surface.models)?;
     validate_role_grants(surface, role, grants)?;
     let mut models: BTreeMap<String, SurfaceModel> = BTreeMap::new();
 
@@ -131,7 +52,10 @@ pub fn surface_for_role(
                 columns,
                 relationships: model.relationships.clone(),
                 primary_key: model.primary_key.clone(),
-                row_policy: grant.row_policy.clone(),
+                row_policy: match &grant.row_filter {
+                    None => SurfaceRowPolicy::Unrestricted,
+                    Some(filter) => SurfaceRowPolicy::Predicate(filter.clone()),
+                },
                 role_limit: grant.limit,
                 aggregations: grant.aggregations,
                 schema,
@@ -177,17 +101,22 @@ pub fn surface_for_role(
     // A row predicate is portable only when every referenced model/field is
     // present on this selected surface. Otherwise retain the authorization
     // fact as `ServerOnly` without leaking the hidden dependency.
-    let model_names: Vec<String> = models.keys().cloned().collect();
-    for model_name in model_names {
-        let policy = models[&model_name].row_policy.clone();
-        if let SurfaceRowPolicy::Predicate(predicate) = &policy {
-            if !filter_is_surface_visible(predicate, &model_name, &models)
-                || !predicate.is_client_portable()
-            {
-                models.get_mut(&model_name).expect("model key").row_policy =
-                    SurfaceRowPolicy::ServerOnly;
+    let server_only: Vec<String> = models
+        .iter()
+        .filter(|(name, model)| match &model.row_policy {
+            SurfaceRowPolicy::Predicate(predicate) => {
+                !filter_is_surface_visible(predicate, name, &models)
+                    || !predicate.is_client_portable()
             }
-        }
+            _ => false,
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    for model_name in server_only {
+        models
+            .get_mut(&model_name)
+            .expect("model key")
+            .keep_row_policy_server_only();
     }
 
     let mut query_fields = Vec::new();
@@ -269,7 +198,6 @@ pub fn surface_for_role(
     for command in &mut commands {
         command.roles = vec![role.to_string()];
     }
-    sanitize_command_effects_for_models(&mut commands, &models);
 
     let mut projectors = Vec::new();
     for projector in &surface.projectors {
@@ -335,7 +263,6 @@ pub fn surface_for_role(
             modeled,
         });
     }
-    sanitize_command_confirmations(&mut commands, &projectors, &models);
 
     Ok(Surface {
         selection: SurfaceSelection::Role {
@@ -356,6 +283,11 @@ pub fn surface_for_role(
         projectors,
         projectors_attached: surface.projectors_attached,
         service_binding: surface.service_binding.clone(),
+        leaderboards: surface
+            .leaderboards
+            .iter()
+            .filter_map(|leaderboard| leaderboard.for_role(role))
+            .collect(),
     })
 }
 
@@ -388,7 +320,7 @@ pub(in crate::graphql::surface) fn validate_selected_composite_relationships(
 pub(in crate::graphql::surface) fn validate_role_grants(
     surface: &Surface,
     role: &str,
-    grants: &BTreeMap<String, RoleGrant>,
+    grants: &BTreeMap<String, ReadPermission>,
 ) -> Result<(), String> {
     for (model, grant) in grants {
         let selected_model = surface
@@ -397,7 +329,7 @@ pub(in crate::graphql::surface) fn validate_role_grants(
             .ok_or_else(|| format!("permission for unknown model `{model}` in surface `{role}`"))?;
 
         if !grant.all_columns {
-            for column in &grant.columns {
+            for column in grant.columns.iter().flatten() {
                 if !selected_model
                     .schema
                     .columns
@@ -411,7 +343,7 @@ pub(in crate::graphql::surface) fn validate_role_grants(
             }
         }
 
-        if let SurfaceRowPolicy::Predicate(predicate) = &grant.row_policy {
+        if let Some(predicate) = &grant.row_filter {
             predicate.validate_row_policy_literals().map_err(|error| {
                 format!("invalid row policy for model `{model}` in surface `{role}`: {error}")
             })?;
@@ -552,9 +484,10 @@ pub(in crate::graphql::surface) fn validate_surface_filter(
 /// of its declared schema roles, with a separate eligible opener set.
 ///
 /// A missing role declaration is an error rather than an accidental empty or
-/// admin surface. Commands must be granted to every schema role; differing row
-/// predicates become `ServerOnly`, so the client revalidates membership without
-/// learning another role's policy.
+/// admin surface. Commands must be granted to every schema role. Differing row
+/// predicates are all enforced (their conjunction) and exported as
+/// `ServerOnly`, so the client revalidates membership without learning another
+/// role's policy.
 ///
 /// Prefer [`surface_for_application_contract`] when eligible principals are a
 /// superset of the schema privilege set (portable multi-role principals).
@@ -563,7 +496,7 @@ pub fn surface_for_application(
     application: &str,
     eligible_roles: &[String],
     schema_roles: &[String],
-    grants_by_role: &BTreeMap<String, BTreeMap<String, RoleGrant>>,
+    grants_by_role: &BTreeMap<String, BTreeMap<String, ReadPermission>>,
 ) -> Result<Surface, String> {
     surface_for_application_contract(
         surface,
@@ -589,7 +522,7 @@ pub fn surface_for_application_contract(
     application: &str,
     eligible_roles: &[String],
     schema_roles: &[String],
-    grants_by_role: &BTreeMap<String, BTreeMap<String, RoleGrant>>,
+    grants_by_role: &BTreeMap<String, BTreeMap<String, ReadPermission>>,
 ) -> Result<Surface, String> {
     if application.trim().is_empty() {
         return Err("application surface name must not be empty".into());
@@ -658,9 +591,12 @@ pub fn surface_for_application_contract(
         let _ = surface_for_role(surface, role, grants)?;
     }
 
+    // The application privilege is the intersection of its schema roles: a
+    // column every role may read, a row every role may read.
     let mut common = BTreeMap::new();
+    let mut differing_row_policies = Vec::new();
     for (model_name, model) in &surface.models {
-        let grants: Option<Vec<&RoleGrant>> = schema_roles
+        let grants: Option<Vec<&ReadPermission>> = schema_roles
             .iter()
             .map(|role| {
                 grants_by_role
@@ -672,33 +608,49 @@ pub fn surface_for_application_contract(
             continue;
         };
 
-        let columns: BTreeSet<String> = model
-            .columns
+        let mut filters: Vec<FilterExpr> = Vec::new();
+        for filter in grants.iter().filter_map(|grant| grant.row_filter.as_ref()) {
+            if !filters.contains(filter) {
+                filters.push(filter.clone());
+            }
+        }
+        if grants
             .iter()
-            .map(|column| column.name.clone())
-            .filter(|column| grants.iter().all(|grant| grant.allows_column(column)))
-            .collect();
-        let aggregations = grants.iter().all(|grant| grant.aggregations);
-        let first_policy = grants[0].row_policy.clone();
-        let row_policy = if grants.iter().all(|grant| grant.row_policy == first_policy) {
-            first_policy
-        } else {
-            SurfaceRowPolicy::ServerOnly
-        };
-        let limit = grants.iter().filter_map(|grant| grant.limit).min();
+            .any(|grant| grant.row_filter != grants[0].row_filter)
+        {
+            differing_row_policies.push(model_name.clone());
+        }
         common.insert(
             model_name.clone(),
-            RoleGrant {
+            ReadPermission {
                 all_columns: false,
-                columns,
-                aggregations,
-                row_policy,
-                limit,
+                columns: Some(
+                    model
+                        .columns
+                        .iter()
+                        .map(|column| column.name.clone())
+                        .filter(|column| grants.iter().all(|grant| grant.allows_column(column)))
+                        .collect(),
+                ),
+                row_filter: match filters.len() {
+                    0 => None,
+                    1 => filters.pop(),
+                    _ => Some(FilterExpr::And(filters)),
+                },
+                limit: grants.iter().filter_map(|grant| grant.limit).min(),
+                aggregations: grants.iter().all(|grant| grant.aggregations),
             },
         );
     }
 
     let mut selected = surface_for_role(surface, application, &common)?;
+    // One role's policy must not be disclosed to a client that holds another:
+    // the server enforces the conjunction, the contract exports none of it.
+    for model_name in differing_row_policies {
+        if let Some(model) = selected.models.get_mut(&model_name) {
+            model.keep_row_policy_server_only();
+        }
+    }
     // Commands on the client contract must be granted for every schema role.
     selected.commands = surface
         .commands
@@ -716,15 +668,16 @@ pub fn surface_for_application_contract(
             command
         })
         .collect();
-    sanitize_command_effects_for_models(&mut selected.commands, &selected.models);
-    sanitize_command_confirmations(
-        &mut selected.commands,
-        &selected.projectors,
-        &selected.models,
-    );
     selected
         .commands
         .sort_by(|a, b| a.command_name.cmp(&b.command_name));
+    // Leaderboard operations on the client contract are those every schema
+    // role is granted.
+    selected.leaderboards = surface
+        .leaderboards
+        .iter()
+        .filter_map(|leaderboard| leaderboard.for_roles(application, &schema_roles))
+        .collect();
     selected.selection = SurfaceSelection::Application {
         name: application.to_string(),
         eligible_roles,

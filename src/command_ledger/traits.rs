@@ -4,8 +4,9 @@ use crate::entity::Entity;
 use crate::repository::{RepositoryError, StreamIdentity};
 
 use super::{
-    AttemptFence, CausalCommitBatch, CausalStorageIdentity, CommandLedgerError, CommandLedgerKey,
-    CommandLookup, CommandLookupScope, CommandReservation, ReservationOutcome,
+    AttemptFence, CausalCommitBatch, CausalStorageIdentity, CommandCompletion, CommandLedgerError,
+    CommandLedgerKey, CommandLookup, CommandLookupScope, CommandReservation,
+    ExternalCommandCompletion, ReservationOutcome,
 };
 
 /// Read capability used by the causal workspace. Unlike ordinary
@@ -15,6 +16,13 @@ pub(crate) trait CausalGetStream: Send + Sync {
     fn get_causal_stream<'a>(
         &'a self,
         identity: &'a StreamIdentity,
+    ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a;
+
+    /// Fetch only the post-snapshot tail without retaining wrapper queue locks.
+    fn get_causal_stream_tail<'a>(
+        &'a self,
+        identity: &'a StreamIdentity,
+        after_version: u64,
     ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a;
 }
 
@@ -44,7 +52,18 @@ pub(crate) trait CommandLedgerStore: Send + Sync {
         attempt: AttemptFence,
     ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_;
 
-    #[allow(dead_code)]
+    /// Record a terminal receipt for a remote aggregate-cell command. This
+    /// updates only the ledger row and is never a substitute for a local
+    /// domain commit.
+    fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_;
+
+    /// Tombstone up to `limit` rows whose retention has lapsed, oldest
+    /// first: the replay payload is dropped and the row stays `expired`, so
+    /// its command ID is never accepted again. Driven by the service's
+    /// background worker, never by a dispatch.
     fn compact_expired_commands(
         &self,
         limit: usize,
@@ -54,8 +73,10 @@ pub(crate) trait CommandLedgerStore: Send + Sync {
 /// Private transaction capability that makes terminal ledger completion an
 /// inseparable participant in the domain commit.
 pub(crate) trait CausalTransactionalCommit: Send + Sync {
+    /// Returns the completion as committed, including evidence the adapter
+    /// allocated inside the transaction.
     fn commit_causal_batch<'a>(
         &'a self,
         batch: CausalCommitBatch<'a>,
-    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + 'a;
+    ) -> impl Future<Output = Result<CommandCompletion<'a>, CommandLedgerError>> + Send + 'a;
 }

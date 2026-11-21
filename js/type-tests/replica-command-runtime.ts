@@ -1,5 +1,7 @@
+import { createLazyReplicaCommandRuntime } from '@hops-ops/distributed/replica/lazy';
 import {
 	createReplicaCommandRuntime,
+	type ReplicaCommandStatusArtifact,
 	type DistributedReplica,
 	type ReplicaCommandArtifact,
 	type ReplicaCommandTransport
@@ -54,3 +56,18 @@ runtime.commands.create();
 runtime.commands.ping({ id: 'todo-1' });
 // @ts-expect-error Result types cannot bleed between generated commands.
 runtime.commands.create({ id: 'todo-1' }).then((receipt) => receipt.result.pong);
+
+
+declare const status: ReplicaCommandStatusArtifact;
+const lazy = createLazyReplicaCommandRuntime(replica, transport, {
+ commands: { 'todo.create': { operationHash: 'hash', hasInput: true }, 'todo.ping': { operationHash: 'hash', hasInput: false } }, status
+}, async () => ({ entries: { 'todo.create': createArtifact, 'todo.ping': pingArtifact } }));
+lazy.commands.todo.create({ id: 'todo-1' }).then(receipt => { const ok: boolean = receipt.result.ok; return ok; });
+lazy.commands.todo.ping({ commandId: 'id' }).then(receipt => { const pong: true = receipt.result.pong; return pong; });
+lazy.preload();
+// @ts-expect-error Lazy commands preserve required input.
+lazy.commands.todo.create();
+// @ts-expect-error No-input commands still accept only options.
+lazy.commands.todo.ping({ id: 'todo-1' });
+// @ts-expect-error Lazy output inference stays specific to each command.
+lazy.commands.todo.create({ id: 'todo-1' }).then(receipt => receipt.result.pong);

@@ -43,7 +43,7 @@ pub fn permissions() -> ModelPermissions<OrderView> {
 }
 ```
 
-3. Register it in `src/query/mod.rs` via `graphql_models!(builder, order_view)` or
+3. Register it in `src/query/mod.rs` with
    `.model::<OrderView>(order_view::permissions())`.
 
 ### Roles
@@ -100,9 +100,10 @@ ambient `DevHeaders` on the public scaffold path.
 | Mode | Use |
 |---|---|
 | `OidcBearer` | Public API — validate `Authorization: Bearer` JWT (access token) |
-| `Hybrid` | Bearer preferred; else gateway-injected headers |
-| `TrustedProxy` | Mesh — strip client identity denylist at process |
+| `Gateway` | Behind an authenticating gateway — `IdentityConfig::gateway(header, secret)`; headers are trusted only with the shared secret |
 | `DevHeaders` | Local GraphiQL / unit tests only (explicit opt-in) |
+
+There is no default mode: `build()` fails without `.identity(..)`.
 
 Wire via `.identity(distributed::graphql::public_oidc_identity_from_env())`.
 Never trust raw client `x-user-id` / `x-roles` on a public edge.

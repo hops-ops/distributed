@@ -3,14 +3,81 @@
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
 use async_graphql::Request;
+use distributed::graphql::IdentityConfig;
 use distributed::{
-    graphql::{col, read, rel, GraphqlEngine, ModelPermissions},
+    graphql::{col, read, rel, GraphqlEngine, GraphqlPoolSource, ModelPermissions},
     microsvc::Session,
-    ColumnType, ForeignKey, PrimaryKey, ReadModel, RelationshipDef, RelationshipKind, TableColumn,
-    TableKind, TableSchema, ROLE_KEY, USER_ID_KEY,
+    ColumnType, ForeignKey, PrimaryKey, ReadModel, RelationalReadModel, RelationshipDef,
+    RelationshipKind, TableColumn, TableKind, TableSchema, ROLE_KEY, USER_ID_KEY,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqlitePoolOptions;
+use serde_json::json;
+
+#[path = "../support/graphql.rs"]
+mod common;
+use common::Db;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
+#[table("boxed_accounts")]
+struct BoxedAccount {
+    id: String,
+    #[readmodel(belongs_to = "BoxedProfile", foreign_key = "id")]
+    profile: Option<Box<BoxedProfile>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
+#[table("boxed_profiles")]
+struct BoxedProfile {
+    id: String,
+    owner_id: String,
+    #[readmodel(belongs_to = "BoxedAccount", foreign_key = "id")]
+    account: Option<BoxedAccount>,
+}
+
+#[tokio::test]
+async fn boxed_singular_cycles_preserve_nested_graphql_permissions() {
+    let db = Db::sqlite().await;
+    db.table(BoxedAccount::schema(), json!([["a"], ["b"]]))
+        .await;
+    db.table(
+        BoxedProfile::schema(),
+        json!([["a", "alice"], ["b", "bob"]]),
+    )
+    .await;
+    let pool = db.pool();
+    let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
+        .model::<BoxedAccount>(ModelPermissions::new().grant("user", read().all_columns()))
+        .model::<BoxedProfile>(
+            ModelPermissions::new().grant(
+                "user",
+                read()
+                    .all_columns()
+                    .rows(col("owner_id").eq(distributed::graphql::claim("x-user-id"))),
+            ),
+        )
+        .roles(&["user"])
+        .build()
+        .unwrap();
+    let response = engine
+        .execute(
+            &session_role("user", "alice"),
+            Request::new(
+                "{ boxed_accounts(order_by: [{ id: asc }]) { id profile { id account { id } } } }",
+            ),
+        )
+        .await;
+    assert!(!response.is_err(), "{:?}", response.errors);
+    assert_eq!(
+        serde_json::to_value(response.data).unwrap(),
+        serde_json::json!({
+            "boxed_accounts": [
+                {"id": "a", "profile": {"id": "a", "account": {"id": "a"}}},
+                {"id": "b", "profile": null}
+            ]
+        })
+    );
+}
 
 fn orders_schema() -> TableSchema {
     TableSchema {
@@ -37,27 +104,18 @@ fn orders_schema() -> TableSchema {
     }
 }
 
-async fn setup_pool() -> sqlx::SqlitePool {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TABLE orders (
-            order_id TEXT PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            status TEXT NOT NULL,
-            total_cents INTEGER NOT NULL
-        );
-        INSERT INTO orders VALUES
-            ('o1', 'c1', 'open', 1000),
-            ('o2', 'c1', 'shipped', 2000),
-            ('o3', 'c2', 'open', 500);",
+async fn setup_pool() -> GraphqlPoolSource {
+    let db = Db::sqlite().await;
+    db.table(
+        &orders_schema(),
+        json!([
+            ["o1", "c1", "open", 1000],
+            ["o2", "c1", "shipped", 2000],
+            ["o3", "c2", "open", 500]
+        ]),
     )
-    .execute(&pool)
-    .await
-    .unwrap();
-    pool
+    .await;
+    db.pool()
 }
 
 fn session_role(role: &str, user: &str) -> Session {
@@ -121,6 +179,7 @@ async fn list_filter_and_by_pk() {
     let pool = setup_pool().await;
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .grant_all("user")
         .build()
@@ -154,22 +213,22 @@ async fn list_filter_and_by_pk() {
 
 #[tokio::test]
 async fn m2m_permission_filter_resolves_through_field_names_to_columns() {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    for sql in [
-        "CREATE TABLE m2m_players (player_id TEXT PRIMARY KEY, name TEXT NOT NULL)",
-        "CREATE TABLE m2m_weapons (weapon_id TEXT PRIMARY KEY, name TEXT NOT NULL)",
-        "CREATE TABLE m2m_player_weapon_links (player_ref TEXT NOT NULL, weapon_ref TEXT NOT NULL)",
-        "INSERT INTO m2m_players VALUES ('p1', 'Ada'), ('p2', 'Grace')",
-        "INSERT INTO m2m_weapons VALUES ('w1', 'Compiler'), ('w2', 'Debugger')",
-        "INSERT INTO m2m_player_weapon_links VALUES ('p1', 'w1'), ('p2', 'w2')",
-    ] {
-        sqlx::query(sql).execute(&pool).await.unwrap();
-    }
+    let db = Db::sqlite().await;
+    let links = m2m_link_schema();
+    db.create_tables([M2mPlayer::schema(), M2mWeapon::schema(), &links])
+        .await;
+    db.rows(M2mPlayer::schema(), json!([["p1", "Ada"], ["p2", "Grace"]]))
+        .await;
+    db.rows(
+        M2mWeapon::schema(),
+        json!([["w1", "Compiler"], ["w2", "Debugger"]]),
+    )
+    .await;
+    db.rows(&links, json!([["p1", "w1"], ["p2", "w2"]])).await;
+    let pool = db.pool();
 
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .table_schema(m2m_link_schema())
         .model::<M2mPlayer>(
             ModelPermissions::new().grant(
@@ -199,22 +258,29 @@ async fn m2m_permission_filter_resolves_through_field_names_to_columns() {
 /// Client `where` with m2m relationship predicate (EXISTS through join table).
 #[tokio::test]
 async fn m2m_client_where_relationship_predicate() {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    for sql in [
-        "CREATE TABLE m2m_players (player_id TEXT PRIMARY KEY, name TEXT NOT NULL)",
-        "CREATE TABLE m2m_weapons (weapon_id TEXT PRIMARY KEY, name TEXT NOT NULL)",
-        "CREATE TABLE m2m_player_weapon_links (player_ref TEXT NOT NULL, weapon_ref TEXT NOT NULL)",
-        "INSERT INTO m2m_players VALUES ('p1', 'Ada'), ('p2', 'Grace'), ('p3', 'Both')",
-        "INSERT INTO m2m_weapons VALUES ('w1', 'Compiler'), ('w2', 'Debugger')",
-        "INSERT INTO m2m_player_weapon_links VALUES ('p1', 'w1'), ('p2', 'w2'), ('p3', 'w1'), ('p3', 'w2')",
-    ] {
-        sqlx::query(sql).execute(&pool).await.unwrap();
-    }
+    let db = Db::sqlite().await;
+    let links = m2m_link_schema();
+    db.create_tables([M2mPlayer::schema(), M2mWeapon::schema(), &links])
+        .await;
+    db.rows(
+        M2mPlayer::schema(),
+        json!([["p1", "Ada"], ["p2", "Grace"], ["p3", "Both"]]),
+    )
+    .await;
+    db.rows(
+        M2mWeapon::schema(),
+        json!([["w1", "Compiler"], ["w2", "Debugger"]]),
+    )
+    .await;
+    db.rows(
+        &links,
+        json!([["p1", "w1"], ["p2", "w2"], ["p3", "w1"], ["p3", "w2"]]),
+    )
+    .await;
+    let pool = db.pool();
 
     let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
         .table_schema(m2m_link_schema())
         .model::<M2mPlayer>(ModelPermissions::new().grant("user", read().all_columns()))
         .model::<M2mWeapon>(ModelPermissions::new().grant("user", read().all_columns()))
@@ -260,6 +326,7 @@ fn parent_schema() -> TableSchema {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "children".into(),
             kind: RelationshipKind::HasMany,
             target_model: "ChildView".into(),
@@ -294,24 +361,22 @@ fn child_schema() -> TableSchema {
 
 #[tokio::test]
 async fn sqlite_binds_follow_projection_then_where_order_for_relationships() {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    for sql in [
-        "CREATE TABLE parents (id TEXT PRIMARY KEY, name TEXT NOT NULL)",
-        "CREATE TABLE children (child_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL, name TEXT NOT NULL)",
-        "INSERT INTO parents VALUES ('p1', 'P'), ('p2', 'Other')",
-        "INSERT INTO children VALUES ('c1', 'p1', 'C1'), ('c2', 'p1', 'C2'), ('c3', 'p2', 'C2')",
-    ] {
-        sqlx::query(sql).execute(&pool).await.unwrap();
-    }
+    let db = Db::sqlite().await;
+    db.table(&parent_schema(), json!([["p1", "P"], ["p2", "Other"]]))
+        .await;
+    db.table(
+        &child_schema(),
+        json!([["c1", "p1", "C1"], ["c2", "p1", "C2"], ["c3", "p2", "C2"]]),
+    )
+    .await;
+    let pool = db.pool();
 
     let manifest = distributed::ReadModelCatalog::new("rel")
         .table_schema(parent_schema())
         .table_schema(child_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .build()
@@ -488,6 +553,7 @@ fn post_schema() -> TableSchema {
         foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "author".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "AuthorView".into(),
@@ -501,24 +567,18 @@ fn post_schema() -> TableSchema {
 
 #[tokio::test]
 async fn belongs_to_joins_source_fk_to_target_primary_key() {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    for sql in [
-        "CREATE TABLE authors (id TEXT PRIMARY KEY, name TEXT NOT NULL)",
-        "CREATE TABLE posts (post_id TEXT PRIMARY KEY, author_id TEXT NOT NULL, title TEXT NOT NULL)",
-        "INSERT INTO authors VALUES ('a1', 'Ada')",
-        "INSERT INTO posts VALUES ('p1', 'a1', 'GraphQL')",
-    ] {
-        sqlx::query(sql).execute(&pool).await.unwrap();
-    }
+    let db = Db::sqlite().await;
+    db.table(&author_schema(), json!([["a1", "Ada"]])).await;
+    db.table(&post_schema(), json!([["p1", "a1", "GraphQL"]]))
+        .await;
+    let pool = db.pool();
 
     let manifest = distributed::ReadModelCatalog::new("posts")
         .table_schema(author_schema())
         .table_schema(post_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .build()
@@ -540,8 +600,7 @@ async fn belongs_to_joins_source_fk_to_target_primary_key() {
 #[tokio::test]
 async fn permissions_filter_by_claim() {
     let schema = orders_schema();
-    let manifest =
-        distributed::ReadModelCatalog::new("orders").table_schema(schema.clone());
+    let manifest = distributed::ReadModelCatalog::new("orders").table_schema(schema.clone());
     let pool = setup_pool().await;
 
     // Value-based path: grant_all then we need typed permission — use builder
@@ -552,6 +611,7 @@ async fn permissions_filter_by_claim() {
     // For fixture without derive, use grant_all and a second role without grants.
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user", "anonymous"])
         .grant_all("user")
         .build()
@@ -597,28 +657,21 @@ async fn domain_service_shaped_fixture() {
             kind: TableKind::ReadModel,
         });
     }
+    let db = Db::sqlite().await;
     let mut manifest = distributed::ReadModelCatalog::new("domain");
-    for t in tables {
-        manifest = manifest.table_schema(t);
+    for (table, row) in tables.into_iter().zip([
+        json!([["ns1", "acme"]]),
+        json!([["u1", "ada"]]),
+        json!([["o1", "widget"]]),
+    ]) {
+        db.table(&table, row).await;
+        manifest = manifest.table_schema(table);
     }
-
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    for ddl in [
-        "CREATE TABLE namespaces (namespace_id TEXT PRIMARY KEY, name TEXT NOT NULL);",
-        "CREATE TABLE users (user_id TEXT PRIMARY KEY, name TEXT NOT NULL);",
-        "CREATE TABLE orders (order_id TEXT PRIMARY KEY, name TEXT NOT NULL);",
-        "INSERT INTO namespaces VALUES ('ns1', 'acme');",
-        "INSERT INTO users VALUES ('u1', 'ada');",
-        "INSERT INTO orders VALUES ('o1', 'widget');",
-    ] {
-        sqlx::query(ddl).execute(&pool).await.unwrap();
-    }
+    let pool = db.pool();
 
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
+        .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
         .grant_all("user")
         .build()
@@ -638,4 +691,82 @@ async fn domain_service_shaped_fixture() {
     assert_eq!(data["namespaces"][0]["name"], "acme");
     assert_eq!(data["users"][0]["name"], "ada");
     assert_eq!(data["orders"][0]["name"], "widget");
+}
+
+#[cfg(feature = "gateway-delivery")]
+#[tokio::test]
+async fn gateway_dependency_inventory_includes_empty_relationship_filters() {
+    use distributed::graphql::delivery::GatewayVersionStore;
+    use serde_json::{json, Value};
+    let db = Db::sqlite().await;
+    let links = m2m_link_schema();
+    db.create_tables([M2mPlayer::schema(), M2mWeapon::schema(), &links])
+        .await;
+    db.rows(M2mPlayer::schema(), json!([["p1", "Ada"]])).await;
+    db.rows(M2mWeapon::schema(), json!([["w1", "Compiler"]]))
+        .await;
+    db.rows(&links, json!([])).await;
+    let pool = db.pool();
+    let store = GatewayVersionStore::install(
+        &db.graphql_pool(),
+        "relationship-test",
+        [
+            "m2m_players".into(),
+            "m2m_weapons".into(),
+            "m2m_player_weapon_links".into(),
+        ],
+    )
+    .await
+    .unwrap();
+    let engine = GraphqlEngine::builder(pool.clone())
+        .identity(IdentityConfig::dev_headers())
+        .service_id("relationship-test")
+        .protocol_token_key([17; 32])
+        .table_schema(m2m_link_schema())
+        .model::<M2mPlayer>(ModelPermissions::new().grant("user", read().all_columns()))
+        .model::<M2mWeapon>(ModelPermissions::new().grant("user", read().all_columns()))
+        .roles(&["user"])
+        .gateway_versions(store)
+        .build()
+        .unwrap();
+    let document = r#"{ m2m_players(where: { weapons: { name: { _eq: "Compiler" } } }) { name } }"#;
+    let validate = || async {
+        let mut request = Request::new(document);
+        request.extensions.insert(
+            "gatewayDelivery".into(),
+            async_graphql::Value::from_json(json!({"action":"validate"})).unwrap(),
+        );
+        let response: Value =
+            serde_json::to_value(engine.execute(&session_role("user", "u1"), request).await)
+                .unwrap();
+        assert_eq!(
+            response["extensions"]["gatewayDelivery"]["eligible"], true,
+            "{response}"
+        );
+        response["extensions"]["gatewayDelivery"]["admission"]["validator"].clone()
+    };
+    let empty = validate().await;
+    db.execute("INSERT INTO m2m_player_weapon_links (player_ref, weapon_ref) VALUES ('p1','w1')")
+        .await;
+    let linked = validate().await;
+    assert_ne!(linked, empty);
+    let rows = engine
+        .execute(&session_role("user", "u1"), Request::new(document))
+        .await;
+    assert_eq!(
+        serde_json::to_value(rows.data).unwrap()["m2m_players"],
+        json!([{"name":"Ada"}])
+    );
+    db.execute("UPDATE m2m_weapons SET name='Debugger'").await;
+    let changed_target = validate().await;
+    assert_ne!(changed_target, linked);
+    db.execute("DELETE FROM m2m_player_weapon_links").await;
+    assert_ne!(validate().await, changed_target);
+    let response = engine
+        .execute(&session_role("user", "u1"), Request::new(document))
+        .await;
+    assert_eq!(
+        serde_json::to_value(response.data).unwrap()["m2m_players"],
+        json!([])
+    );
 }

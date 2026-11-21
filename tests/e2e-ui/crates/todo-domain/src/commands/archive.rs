@@ -1,18 +1,18 @@
-use distributed::graphql::Eventual;
-use distributed::portable_command;
+use distributed::command;
+use distributed::command::Eventual;
 use serde::Deserialize;
 
 use super::TodoStatusPayload;
 use crate::{domain_commands, Todo};
 
-#[derive(Debug, Deserialize, distributed::GraphqlInput)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct TodoArchiveInput {
     pub todo_id: String,
 }
 
 pub type TodoArchivePayload = TodoStatusPayload;
 
-portable_command! {
+command! {
     name: "todo.archive",
     transition: domain_commands::Archive,
     aggregate: Todo,
@@ -23,7 +23,7 @@ portable_command! {
     roles: ["user", "admin"],
     field: "todos_archive",
     invoke: |todo, _input, principal| todo.archive(principal),
-    payload: |todo| TodoStatusPayload::from_todo(&**todo),
+    payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }
 
 #[cfg(test)]

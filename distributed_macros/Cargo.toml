@@ -9,10 +9,6 @@ repository.workspace = true
 [lib]
 proc-macro = true
 
-[features]
-application-runtime = ["distributed/application-runtime"]
-runtime = ["application-runtime"]
-
 [dependencies]
 proc-macro-crate = "3.5"
 proc-macro2 = "1.0"

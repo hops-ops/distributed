@@ -27,6 +27,9 @@ struct ManifestWire {
     projectors: Vec<ManifestProjector>,
     projection_programs: Vec<ManifestProjectionProgram>,
     projection_bindings: Vec<ManifestProjectionBinding>,
+    /// Absent on manifests without leaderboards (fingerprints unchanged).
+    #[serde(default)]
+    leaderboards: Vec<ManifestLeaderboard>,
 }
 
 #[derive(Serialize)]
@@ -45,6 +48,8 @@ struct ManifestSchemaMaterial<'a> {
     projectors: &'a [ManifestProjector],
     projection_programs: &'a [ManifestProjectionProgram],
     projection_bindings: &'a [ManifestProjectionBinding],
+    #[serde(skip_serializing_if = "<[ManifestLeaderboard]>::is_empty")]
+    leaderboards: &'a [ManifestLeaderboard],
 }
 
 impl ClientManifest {
@@ -205,7 +210,12 @@ impl ClientManifest {
                 &projectors,
             )?);
         let trusted_presets = derive_trusted_preset_descriptors(&models, &commands)?;
-        validate_derived_capabilities(&wire.capabilities, &roots, &commands)?;
+        validate_leaderboards(&wire.leaderboards, &roots, &typenames)?;
+        let live_leaderboards = wire
+            .leaderboards
+            .iter()
+            .any(|leaderboard| leaderboard.roots.iter().any(|root| root.live));
+        validate_derived_capabilities(&wire.capabilities, &roots, &commands, live_leaderboards)?;
         if wire.schema_fingerprint != computed_schema_fingerprint {
             return Err(ClientCompileError::manifest(
                 "client.manifest.schema_fingerprint",
@@ -233,6 +243,7 @@ impl ClientManifest {
             projectors,
             projection_programs,
             projection_bindings,
+            leaderboards: wire.leaderboards,
         })
     }
 
@@ -257,6 +268,7 @@ fn schema_fingerprint(wire: &ManifestWire) -> Result<String, ClientCompileError>
         projectors: &wire.projectors,
         projection_programs: &wire.projection_programs,
         projection_bindings: &wire.projection_bindings,
+        leaderboards: &wire.leaderboards,
     };
     serde_json::to_vec(&material)
         .map(|bytes| hash_bytes(&bytes))

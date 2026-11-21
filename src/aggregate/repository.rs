@@ -2,9 +2,10 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 
+use crate::command_ledger::CausalGetStream;
 use crate::entity::Entity;
 use crate::outbox::OutboxPublisherConfig;
-use crate::queued_repo::{GetAllWithOpts, GetWithOpts, ReadOpts, UnlockableRepository};
+use crate::queued_repo::{GetAllWithOpts, GetWithOpts, ReadOpts};
 use crate::repository::{
     CommitBatch, GetStream, RepositoryError, SnapshotWrite, StreamIdentity, StreamWrite,
     TransactionalCommit,
@@ -69,9 +70,40 @@ type HydrateAllFn<R, A> =
 type LoadFn<R, A> = for<'a> fn(
     &'a R,
     &'a StreamIdentity,
+    StreamReads<R>,
 ) -> Pin<
     Box<dyn Future<Output = Result<Option<A>, RepositoryError>> + Send + 'a>,
 >;
+
+type StreamReadFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a>>;
+
+/// The same snapshot algorithm uses ordinary or explicitly non-locking reads.
+/// Capturing the functions keeps with_snapshots independent of causal bounds.
+pub(crate) struct StreamReads<R> {
+    pub full: for<'a> fn(&'a R, &'a StreamIdentity) -> StreamReadFuture<'a>,
+    pub tail: for<'a> fn(&'a R, &'a StreamIdentity, u64) -> StreamReadFuture<'a>,
+}
+
+impl<R: GetStream> StreamReads<R> {
+    fn ordinary() -> Self {
+        Self {
+            full: |repo, identity| Box::pin(repo.get_stream(identity)),
+            tail: |repo, identity, version| Box::pin(repo.get_stream_tail(identity, version)),
+        }
+    }
+}
+
+impl<R: CausalGetStream> StreamReads<R> {
+    fn causal() -> Self {
+        Self {
+            full: |repo, identity| Box::pin(repo.get_causal_stream(identity)),
+            tail: |repo, identity, version| {
+                Box::pin(repo.get_causal_stream_tail(identity, version))
+            },
+        }
+    }
+}
 
 impl<R, A> SnapshotPolicy<R, A> {
     /// Construct a policy from its captured hooks. Called by `with_snapshots`,
@@ -194,6 +226,30 @@ where
 
 impl<R, A> AggregateRepository<R, A>
 where
+    A: Aggregate + Send,
+{
+    /// Causal handlers use the same snapshot policy, with non-locking reads.
+    pub(crate) async fn get_causal(
+        &self,
+        identity: &StreamIdentity,
+    ) -> Result<Option<A>, RepositoryError>
+    where
+        R: CausalGetStream,
+    {
+        match &self.snapshot {
+            Some(policy) => (policy.load)(&self.repo, identity, StreamReads::causal()).await,
+            None => self
+                .repo
+                .get_causal_stream(identity)
+                .await?
+                .map(hydrate::<A>)
+                .transpose(),
+        }
+    }
+}
+
+impl<R, A> AggregateRepository<R, A>
+where
     R: GetStream,
     A: Aggregate + Send,
 {
@@ -204,7 +260,7 @@ where
         // and decode of already-snapshotted events). Without one, a plain full
         // stream load. Same hydrated aggregate either way.
         match &self.snapshot {
-            Some(policy) => (policy.load)(&self.repo, &identity).await,
+            Some(policy) => (policy.load)(&self.repo, &identity, StreamReads::ordinary()).await,
             None => {
                 let Some(entity) = self.repo.get_stream(&identity).await? else {
                     return Ok(None);
@@ -353,26 +409,5 @@ where
     /// Non-locking multi-read (alias for `get_all_with(ReadOpts::no_lock())`).
     pub async fn peek_all(&self, ids: &[&str]) -> Result<Vec<A>, RepositoryError> {
         self.get_all_with(ids, ReadOpts::no_lock()).await
-    }
-}
-
-impl<R, A> AggregateRepository<R, A>
-where
-    R: UnlockableRepository,
-    A: Aggregate,
-{
-    /// Release the lock held for an aggregate after an aborted load.
-    pub async fn abort(&self, aggregate: &A) -> Result<(), RepositoryError> {
-        let identity = stream_identity_for::<A>(aggregate.entity().id())?;
-        // Forward to the repo's `abort` hook (not `unlock`) so an
-        // `UnlockableRepository` that overrides `abort` for extra cleanup
-        // is honored. The default `abort` delegates to `unlock`.
-        self.repo.abort(&identity).await
-    }
-
-    /// Release the lock held for an aggregate id.
-    pub async fn unlock(&self, id: &str) -> Result<(), RepositoryError> {
-        let identity = stream_identity_for::<A>(id)?;
-        self.repo.unlock(&identity).await
     }
 }

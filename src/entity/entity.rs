@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::SystemTime;
@@ -14,6 +15,25 @@ use crate::trace_context::{TraceContext, CAUSATION_ID, CORRELATION_ID};
 use crate::SourcedResult;
 
 use super::{BitcodePayloadCodec, EventRecord, EventRecordError, PayloadCodec};
+
+/// Position and time of an event recorded by the current unit of work
+/// ([`Entity::last_recorded`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    /// Stream sequence (1-based; equals the stream version after commit).
+    pub sequence: u64,
+    /// Event time.
+    pub timestamp: SystemTime,
+}
+
+impl Recorded {
+    /// Event time as Unix milliseconds (0 before the epoch).
+    pub fn unix_ms(&self) -> u64 {
+        self.timestamp
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64)
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Entity {
@@ -42,6 +62,11 @@ pub struct Entity {
     pending_domain_events: Vec<DomainEventOccurrence>,
     #[serde(skip, default)]
     domain_event_poison: Option<DomainEventCapturePoison>,
+    /// Something the repository that loaded this entity keeps alive for as
+    /// long as the entity lives, such as the stream lock of a queued
+    /// repository. Dropped with the entity; never cloned or serialized.
+    #[serde(skip, default)]
+    hold: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl Default for Entity {
@@ -58,6 +83,7 @@ impl Default for Entity {
             metadata: HashMap::new(),
             pending_domain_events: Vec::new(),
             domain_event_poison: None,
+            hold: None,
         }
     }
 }
@@ -94,6 +120,8 @@ impl Clone for Entity {
             metadata: self.metadata.clone(),
             pending_domain_events: self.pending_domain_events.clone(),
             domain_event_poison: self.domain_event_poison.clone(),
+            // A copy does not own what the original holds.
+            hold: None,
         }
     }
 }
@@ -141,6 +169,16 @@ impl Entity {
 
     pub fn snapshot_version(&self) -> u64 {
         self.snapshot_version
+    }
+
+    /// Keep `hold` alive for as long as this entity lives.
+    pub(crate) fn hold_with(&mut self, hold: Box<dyn Any + Send + Sync>) {
+        self.hold = Some(hold);
+    }
+
+    /// Take what [`hold_with`](Self::hold_with) attached.
+    pub(crate) fn take_hold(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        self.hold.take()
     }
 
     pub fn set_snapshot_version(&mut self, snapshot_version: u64) {
@@ -328,6 +366,18 @@ impl Entity {
         );
         let start = (self.committed_version - self.prefix_version) as usize;
         &self.events[start..]
+    }
+
+    /// Where and when the latest event recorded by the current unit of work
+    /// (not yet committed) lands in the stream: its sequence and timestamp,
+    /// as they will be committed. `None` when nothing was recorded. Command
+    /// results (receipts, leaderboard occurrences) read this instead of
+    /// digging through [`events`](Self::events).
+    pub fn last_recorded(&self) -> Option<Recorded> {
+        self.new_events().last().map(|record| Recorded {
+            sequence: record.sequence,
+            timestamp: record.timestamp,
+        })
     }
 
     /// Mark all current events as committed. Called by repository after successful commit.

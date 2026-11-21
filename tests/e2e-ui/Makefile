@@ -19,7 +19,9 @@ API_PORT     ?= 8791
 BASE_URL     ?= http://127.0.0.1:8791
 UI_PORT      ?= 5180
 # localhost required for Auth.js cookies over HTTP (SvelteKit Secure default)
-UI_URL       ?= http://localhost:5180
+PUBLIC_ORIGIN ?= http://localhost:8791
+UI_INTERNAL_ORIGIN ?= http://localhost:$(UI_PORT)
+UI_URL       ?= $(PUBLIC_ORIGIN)
 UI_HOST      ?= localhost
 ENV_FILE     ?= e2e-ui.env
 NPM          ?= npm
@@ -27,12 +29,14 @@ JS_DIR       ?= ../../js
 DISTRIBUTED  ?= cargo run --quiet --manifest-path ../../Cargo.toml -p distributed_cli --bin distributed --
 CARGO_TEST_FLAGS ?= -- --nocapture
 
-DATABASE_URL ?= sqlite:./e2e-ui.db?mode=rwc
-
 # Optional celld+NATS profile (same UI, not the one-process playground).
 REPO_ROOT        := $(abspath ../..)
 PROFILE_COMPOSE  := celld-nats-profile/docker-compose.yml
-CELLD_HTTP_PORT  ?= 18080
+# 18080 is Zitadel's edge (docker/docker-compose.yml); celld uses 18880.
+CELLD_HTTP_PORT  ?= 18880
+# celld binary; scripts/celld.sh requires the version in .celld-version.
+CELLD_BIN        ?= celld
+CELLD_CHECK      := $(REPO_ROOT)/scripts/celld.sh check
 NATS_PORT        ?= 14222
 CELLD_URL        ?= http://127.0.0.1:$(CELLD_HTTP_PORT)
 NATS_URL         ?= nats://127.0.0.1:$(NATS_PORT)
@@ -56,36 +60,34 @@ down:
 ## Coherent application build + actual API/UI supervision.
 ## Vite still owns Svelte, CSS, and GraphQL hot updates.
 run:
-	cargo run --quiet --manifest-path ../../Cargo.toml -p distributed_cli --bin distributed -- dev .
+	@if [ -f $(ENV_FILE) ]; then set -a; . ./$(ENV_FILE); set +a; fi; \
+	PUBLIC_ORIGIN="$${PUBLIC_ORIGIN:-$(PUBLIC_ORIGIN)}" UI_URL="$${PUBLIC_ORIGIN:-$(PUBLIC_ORIGIN)}" UI_INTERNAL_ORIGIN="$${UI_INTERNAL_ORIGIN:-$(UI_INTERNAL_ORIGIN)}" cargo run --quiet --manifest-path ../../Cargo.toml -p distributed_cli --bin distributed -- dev .
 
 run-api:
 	@if [ -f $(ENV_FILE) ]; then set -a; . ./$(ENV_FILE); set +a; fi; \
 	cargo run -p e2e-runner
 
 stop:
-	@stop_pidfile() { \
-		[ -f "$$1" ] || return 0; \
-		_pid=$$(cat "$$1"); \
-		for _child in $$(pgrep -P "$$_pid" 2>/dev/null); do \
-		  pkill -P "$$_child" 2>/dev/null || true; \
-		  kill "$$_child" 2>/dev/null || true; \
-		done; \
-		kill "$$_pid" 2>/dev/null || true; \
-		rm -f "$$1"; \
-	}; \
-	stop_pidfile .make-ui.pid; \
-	stop_pidfile .make-runner.pid; \
-	lsof -ti:$(API_PORT) 2>/dev/null | xargs kill -9 2>/dev/null || true; \
+	@lsof -ti:$(API_PORT) 2>/dev/null | xargs kill -9 2>/dev/null || true; \
 	lsof -ti:$(UI_PORT) 2>/dev/null | xargs kill -9 2>/dev/null || true; \
 	echo stopped
 
 ## Optional celld + NATS profile of the same UI. Does NOT replace make run.
-## celld 0.4 keeps its local object store under tests/celld/worker/.celld/dev.
+## celld (version pinned in .celld-version) keeps its local object store under
+## tests/celld/worker/.celld/dev.
 up-celld-nats:
 	@set -e; \
 	command -v docker >/dev/null || { echo "docker required"; exit 1; }; \
-	command -v celld >/dev/null || { echo "celld CLI required: curl -fsSL https://celld.dev/install.sh | sh"; exit 1; }; \
-	celld dev --help >/dev/null 2>&1 || { echo "celld 0.4.0+ required (missing 'celld dev')"; exit 1; }; \
+	celld=$$($(CELLD_CHECK) "$(CELLD_BIN)"); \
+	if [ -z "$${CELLD_ESBUILD:-}" ] && ! command -v esbuild >/dev/null; then \
+		if [ -x "$(REPO_ROOT)/js/node_modules/.bin/esbuild" ]; then \
+			export CELLD_ESBUILD="$(REPO_ROOT)/js/node_modules/.bin/esbuild"; \
+		else \
+			echo "esbuild required (celld bundles Workers with it): npm install -g esbuild,"; \
+			echo "make js-install (uses js/node_modules), or CELLD_ESBUILD=<path>"; \
+			exit 1; \
+		fi; \
+	fi; \
 	command -v worker-build >/dev/null || { echo "worker-build required: cargo install worker-build"; exit 1; }; \
 	$(MAKE) --no-print-directory down-celld; \
 	if lsof -tiTCP:$(CELLD_HTTP_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
@@ -111,7 +113,7 @@ up-celld-nats:
 	mkdir -p $(CELLD_PROJECT)/build/relay-worker; \
 	cp -R $(CELLD_RELAY_PROJECT)/build/. $(CELLD_PROJECT)/build/relay-worker; \
 	echo "registering Queue consumer in the persistent celld dev store…"; \
-	celld dev $(CELLD_PROJECT)/relay.wrangler.jsonc --host 127.0.0.1 --port $(CELLD_HTTP_PORT) --logs > $(CELLD_RELAY_LOG) 2>&1 & \
+	"$$celld" dev $(CELLD_PROJECT)/relay.wrangler.jsonc --host 127.0.0.1 --port $(CELLD_HTTP_PORT) --logs > $(CELLD_RELAY_LOG) 2>&1 & \
 	relay_launcher_pid=$$!; \
 	relay_ok=0; \
 	for i in $$(seq 1 120); do \
@@ -147,7 +149,7 @@ up-celld-nats:
 		echo "celld relay listener remained after TERM and KILL"; exit 1; \
 	fi; \
 	echo "starting aggregate Worker from the same celld dev store…"; \
-	celld dev $(CELLD_PROJECT) --host 127.0.0.1 --port $(CELLD_HTTP_PORT) --logs > $(CELLD_LOG) 2>&1 & \
+	"$$celld" dev $(CELLD_PROJECT) --host 127.0.0.1 --port $(CELLD_HTTP_PORT) --logs > $(CELLD_LOG) 2>&1 & \
 	launcher_pid=$$!; \
 	ok=0; \
 	for i in $$(seq 1 120); do \
@@ -183,12 +185,12 @@ down-celld:
 		launcher_command=$$(ps -p "$$launcher_pid" -o command= 2>/dev/null || true); \
 		node_command=$$(ps -p "$$node_pid" -o command= 2>/dev/null || true); \
 		case "$$launcher_command" in \
-			*"celld dev $(CELLD_PROJECT) --host 127.0.0.1 --port $(CELLD_HTTP_PORT)"*) kill "$$launcher_pid" 2>/dev/null || true ;; \
+			*" dev $(CELLD_PROJECT) --host 127.0.0.1 --port $(CELLD_HTTP_PORT)"*) kill "$$launcher_pid" 2>/dev/null || true ;; \
 			"") ;; \
 			*) echo "refusing to stop unexpected tracked process $$launcher_pid: $$launcher_command"; exit 1 ;; \
 		esac; \
 		case "$$node_command" in \
-			*"celld --no-control-plane --bucket celld-dev --listen 127.0.0.1:$(CELLD_HTTP_PORT)"*) kill "$$node_pid" 2>/dev/null || true ;; \
+			*"--listen 127.0.0.1:$(CELLD_HTTP_PORT)"*) kill "$$node_pid" 2>/dev/null || true ;; \
 			"") ;; \
 			*) echo "refusing to stop unexpected celld node $$node_pid: $$node_command"; exit 1 ;; \
 		esac; \
@@ -253,7 +255,8 @@ test-domain:
 test-suite:
 	cargo test -p e2e-suite --test behavioral $(CARGO_TEST_FLAGS)
 
-## Browser e2e (Playwright). Requires make up + make run (UI :5180, API :8791).
+## Browser e2e (Playwright). Requires make up + make run; the browser uses
+## PUBLIC_ORIGIN (:8791), which serves the API and proxies the UI.
 test-browser-install:
 	$(NPM) install
 	npx playwright install chromium
@@ -278,13 +281,9 @@ ui-install: js-build
 ui-test:
 	cd ui && $(NPM) test
 
-## Aggregate read-only contract check (repo root catalog when present).
+## Aggregate read-only contract check (the repository's distributed.contracts.json).
 contracts-check:
-	@if [ -f ../../contracts/catalog.json ] || [ -f contracts/catalog.json ]; then \
-	  $(MAKE) -C ../.. contracts-check; \
-	else \
-	  echo "contracts-check: no catalog yet; skipping aggregate gate"; \
-	fi
+	$(MAKE) -C ../.. contracts-check
 
 check: application-build
 	cargo check --workspace
@@ -293,7 +292,7 @@ check: application-build
 
 clean: stop
 	cargo clean
-	rm -f .make-runner.log e2e-ui.db
+	rm -f e2e-ui.db
 	rm -rf ui/node_modules ui/build ui/.svelte-kit ui/src/lib/blob/pkg
 
 help:
@@ -304,6 +303,7 @@ help:
 	@echo "  make ci-offline coherent build + offline suites with safe pipeline overlap"
 	@echo "  make down       playground docker compose down (not celld/NATS)"
 	@echo "  make up-celld-nats    optional celld+NATS profile (not make run)"
+	@echo "                        celld :18880, version in /.celld-version; CELLD_BIN=<path>"
 	@echo "  rebuild/restart with make up-celld-nats after Worker source changes"
 	@echo "  make test-celld      live --test celld + e2e_ui_celld_nats_profile (CI)"
 	@echo "  make test-celld-nats  cargo test --test e2e_ui_celld_nats_profile"

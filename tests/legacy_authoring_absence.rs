@@ -100,6 +100,7 @@ fn projection_read_model_workspace_is_gone() {
 #[test]
 fn dead_effects_authoring_types_are_not_publicly_reexported() {
     let graphql_mod = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/graphql/mod.rs"));
+    let command_mod = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/command/mod.rs"));
     for forbidden in [
         "CompiledCommandEffects",
         "CompiledConfirmationPlan",
@@ -109,8 +110,8 @@ fn dead_effects_authoring_types_are_not_publicly_reexported() {
         "__effect_patch",
     ] {
         assert!(
-            !graphql_mod.contains(forbidden),
-            "{forbidden} must not be re-exported from graphql::"
+            !graphql_mod.contains(forbidden) && !command_mod.contains(forbidden),
+            "{forbidden} must not be re-exported from command:: or graphql::"
         );
     }
 }
@@ -119,7 +120,7 @@ fn dead_effects_authoring_types_are_not_publicly_reexported() {
 fn typed_command_has_no_public_effects_or_confirmations_builder() {
     let typed = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/src/graphql/command_contract/typed_command.rs"
+        "/src/command/typed_command.rs"
     ));
     assert!(
         !typed.contains("pub fn effects("),
