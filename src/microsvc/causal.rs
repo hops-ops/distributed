@@ -6,8 +6,6 @@
 //! evidence, wraps its ordinary [`CommitBatch`] in the command-ledger fence,
 //! and is the only code allowed to commit it.
 
-#![cfg_attr(not(feature = "graphql"), allow(dead_code))]
-
 use std::collections::HashSet;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};

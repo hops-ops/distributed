@@ -657,7 +657,6 @@ pub trait CommandMountRegistrar {
 /// transport variant is deliberately unable to execute a typed causal mount;
 /// only the authenticated variant carries the framework-issued principal and
 /// bearer-scoped command identity needed by the existing causal ledger path.
-#[cfg(feature = "graphql")]
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum CommandMountInvocation {
@@ -665,18 +664,10 @@ pub(crate) enum CommandMountInvocation {
     Authenticated {
         command_id: String,
         session: crate::microsvc::Session,
-        principal: crate::graphql::identity::VerifiedPrincipal,
+        principal: crate::command_dispatch::VerifiedPrincipal,
     },
 }
 
-#[cfg(not(feature = "graphql"))]
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountInvocation {
-    Transport,
-}
-
-#[cfg(feature = "graphql")]
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum CommandMountExecutionResult {
@@ -684,26 +675,11 @@ pub(crate) enum CommandMountExecutionResult {
     Causal(crate::microsvc::CausalDispatchResult),
 }
 
-#[cfg(not(feature = "graphql"))]
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountExecutionResult {
-    Transport(crate::microsvc::CommandResponse),
-}
-
-#[cfg(feature = "graphql")]
 #[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum CommandMountExecutionError {
     Handler(crate::microsvc::HandlerError),
     Causal(crate::microsvc::CausalDispatchError),
-}
-
-#[cfg(not(feature = "graphql"))]
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountExecutionError {
-    Handler(crate::microsvc::HandlerError),
 }
 
 #[allow(dead_code)]

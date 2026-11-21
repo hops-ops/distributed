@@ -361,16 +361,7 @@ pub use outbox::{
 // `DEFAULT_OUTBOX_SOURCE_BATCH`, `DEFAULT_OUTBOX_SOURCE_LEASE`) stay reachable
 // under `distributed::outbox_worker::*` and are intentionally NOT re-exported
 // at the crate root.
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka",
-    test,
-))]
+#[cfg(any(background_workers, test))]
 pub use outbox_worker::{
     drain_worker_id, OutboxDrainHandle, OutboxDrainRunner, OutboxPublishMailbox,
     DEFAULT_OUTBOX_HINT_CAPACITY,

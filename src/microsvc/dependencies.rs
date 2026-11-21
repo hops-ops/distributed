@@ -115,7 +115,7 @@ macro_rules! direct_causal_projection_methods {
         }
     };
 }
-#[cfg(all(test, feature = "graphql"))]
+#[cfg(test)]
 pub(crate) use direct_causal_projection_methods;
 
 impl CausalHostProjections for crate::InMemoryRepository {

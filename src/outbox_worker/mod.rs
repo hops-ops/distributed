@@ -25,16 +25,7 @@
 //! ```
 
 mod bus_publisher;
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka",
-    test,
-))]
+#[cfg(any(background_workers, test))]
 mod drain;
 mod outbox_dispatch;
 mod outbox_source;
@@ -51,16 +42,7 @@ pub use store::{
 
 // Outbox -> bus bridge (moved out of the bus module; depends up on bus traits).
 pub use bus_publisher::BusPublisher;
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka",
-    test,
-))]
+#[cfg(any(background_workers, test))]
 pub use drain::{
     drain_worker_id, OutboxDrainHandle, OutboxDrainRunner, OutboxPublishMailbox,
     DEFAULT_DRAIN_BATCH_SIZE, DEFAULT_DRAIN_ERROR_BACKOFF, DEFAULT_DRAIN_LEASE,

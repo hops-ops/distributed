@@ -169,7 +169,6 @@ impl CommandService for GrpcHandler {
         // [`build_session`] and the `Session` trust-boundary docs.
         let session = build_session(&metadata, req.session_variables);
 
-        #[cfg(feature = "graphql")]
         let wait_path = match super::wait_path::parse_wait_path_body(&input) {
             Ok(wait_path) => wait_path,
             Err(error) => {
@@ -179,7 +178,6 @@ impl CommandService for GrpcHandler {
                 }));
             }
         };
-        #[cfg(feature = "graphql")]
         if let Some((command_id, wait_input)) = wait_path {
             return match super::wait_path::dispatch_wait_path(
                 self.service.as_ref(),

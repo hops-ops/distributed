@@ -70,15 +70,7 @@ mod service;
 mod session;
 // Worker loops need a Tokio runtime (spawn/sleep); only compile when a feature
 // that enables the optional `tokio` dep is active (default feature set does not).
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka",
-))]
+#[cfg(background_workers)]
 mod workers;
 
 pub use crate::bus::{Message, MessageKind, PayloadDecodeError, SubscriptionPlan};
@@ -123,19 +115,11 @@ pub(crate) use service::{
     CausalCommandPublicState, CausalCommandReceiptSource, CausalProjectionEvidenceState,
 };
 pub use service::{CausalDispatchError, CausalDispatchResult};
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka",
-))]
+#[cfg(background_workers)]
 pub use workers::{
     spawn_outbox_publish_loop, spawn_service_consumer_loop, spawn_service_consumer_loop_until,
 };
-#[cfg(feature = "graphql")]
+#[cfg(any(feature = "http", feature = "grpc"))]
 pub(crate) mod wait_path;
 pub use session::{Session, ROLE_KEY, USER_ID_KEY};
 
