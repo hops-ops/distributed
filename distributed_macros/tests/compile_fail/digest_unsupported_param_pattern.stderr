@@ -1,5 +1,0 @@
-error: unsupported parameter pattern in #[digest] method — use a plain identifier
-  --> tests/compile_fail/digest_unsupported_param_pattern.rs:12:34
-   |
-12 |     pub fn initialize(&mut self, _: String) {}
-   |                                  ^

@@ -201,7 +201,7 @@ fn collect_wasm_pures(manifest: &Value) -> Result<BTreeSet<WasmPure>, Box<dyn Er
                             .filter(|package| !package.is_empty())
                             .ok_or_else(|| {
                                 format!(
-                                    "WASM pure `{import}` does not identify its declaring Cargo package; declare it through `portable_command!`"
+                                    "WASM pure `{import}` does not identify its declaring Cargo package; declare it through `command!`"
                                 )
                             })?;
                         found.insert(WasmPure {

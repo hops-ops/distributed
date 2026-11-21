@@ -27,30 +27,6 @@ impl Versioned {
     }
 }
 
-#[derive(Default, Serialize, Deserialize, distributed::Snapshot)]
-struct Registered {
-    entity: Entity,
-    value: String,
-}
-
-impl Registered {
-    #[distributed::digest("renamed", version = 2)]
-    fn rename(&mut self, value: String) {
-        self.value = value;
-    }
-
-    #[distributed::digest("cleared")]
-    fn clear(&mut self) {
-        self.value.clear();
-    }
-}
-
-distributed::aggregate!(Registered, entity {
-    "renamed"(value), version = 2 => rename,
-    "cleared"() => clear(),
-    "ignored"(payload), version = 2 => clear(),
-});
-
 #[test]
 fn sourced_rejects_same_shaped_older_and_future_events_before_mutation() {
     for version in [0, 1, 3, u64::MAX] {
@@ -76,26 +52,6 @@ fn sourced_rejects_same_shaped_older_and_future_events_before_mutation() {
     }
 }
 
-#[test]
-fn aggregate_macro_rejects_same_shaped_versions_before_mutation() {
-    for (name, expected) in [("renamed", 2), ("cleared", 1), ("ignored", 2)] {
-        for version in [expected - 1, expected + 1, u64::MAX] {
-            let mut aggregate = Registered::default();
-            aggregate.rename("unchanged".into()).unwrap();
-            let before = serde_json::to_value(&aggregate.entity).unwrap();
-            let event = EventRecord::new_versioned(
-                name,
-                bitcode::serialize(&("changed".to_owned(),)).unwrap(),
-                2,
-                version,
-            );
-            assert!(aggregate.replay_event(&event).is_err());
-            assert_eq!(aggregate.value, "unchanged");
-            assert_eq!(serde_json::to_value(&aggregate.entity).unwrap(), before);
-        }
-    }
-}
-
 fn rename_event(version: u64, sequence: u64) -> EventRecord {
     EventRecord::new_versioned(
         "renamed",
@@ -106,14 +62,12 @@ fn rename_event(version: u64, sequence: u64) -> EventRecord {
 }
 
 #[test]
-fn exact_version_replays_with_both_macros() {
+fn exact_version_replays() {
     let mut entity = Entity::new();
     entity.load_from_history(vec![rename_event(2, 1)]);
-    let sourced = hydrate::<Versioned>(entity.clone()).unwrap();
-    let registered = hydrate::<Registered>(entity).unwrap();
+    let sourced = hydrate::<Versioned>(entity).unwrap();
     assert_eq!(sourced.value, "changed");
     assert_eq!(sourced.calls, 1);
-    assert_eq!(registered.value, "changed");
     assert_eq!(sourced.entity.version(), 1);
     assert!(sourced.entity.new_events().is_empty());
 }
@@ -152,9 +106,8 @@ fn check_snapshot_tail<A: Snapshottable>() {
 }
 
 #[test]
-fn snapshot_prefix_tail_checks_versions_for_both_macros() {
+fn snapshot_prefix_tail_checks_versions() {
     check_snapshot_tail::<Versioned>();
-    check_snapshot_tail::<Registered>();
 }
 
 #[derive(Default, Serialize, Deserialize, distributed::Snapshot)]
@@ -162,25 +115,6 @@ struct Upcasted {
     entity: Entity,
     value: String,
 }
-
-#[derive(Default)]
-struct RegisteredUpcast {
-    entity: Entity,
-    value: String,
-}
-
-impl RegisteredUpcast {
-    #[distributed::digest("renamed", version = 2)]
-    fn rename(&mut self, value: String) {
-        self.value = value;
-    }
-}
-
-distributed::aggregate!(RegisteredUpcast, entity {
-    "renamed"(value), version = 2 => rename,
-} upcasters [
-    ("renamed", 1 => 2, (String,) => (String,), convert_semantics),
-]);
 
 #[derive(Default)]
 struct IncompleteUpcast {
@@ -227,13 +161,6 @@ fn same_shaped_upcast_precedes_guard_and_preserves_stored_history() {
     let mut entity = Entity::new();
     entity.load_from_history(vec![event.clone()]);
     let aggregate = hydrate::<Upcasted>(entity).unwrap();
-    assert_eq!(aggregate.value, "v2:changed");
-    assert_eq!(aggregate.entity.events(), &[event]);
-
-    let mut entity = Entity::new();
-    let event = rename_event(1, 1);
-    entity.load_from_history(vec![event.clone()]);
-    let aggregate = hydrate::<RegisteredUpcast>(entity).unwrap();
     assert_eq!(aggregate.value, "v2:changed");
     assert_eq!(aggregate.entity.events(), &[event]);
 

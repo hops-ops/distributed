@@ -158,7 +158,7 @@ impl Parse for Args {
     }
 }
 
-fn validate_name(name: &LitStr) -> syn::Result<()> {
+pub(crate) fn validate_name(name: &LitStr) -> syn::Result<()> {
     let value = name.value();
     let segments: Vec<&str> = value.split('.').collect();
     if segments.len() < 2
@@ -203,7 +203,7 @@ fn parse_outcome(ty: Type) -> syn::Result<Outcome> {
     }
 }
 
-fn role_list(expr: &Expr) -> syn::Result<Vec<LitStr>> {
+pub(crate) fn role_list(expr: &Expr) -> syn::Result<Vec<LitStr>> {
     let Expr::Array(array) = expr else {
         return Err(syn::Error::new_spanned(
             expr,
@@ -469,20 +469,9 @@ pub(crate) fn expand(
         quote!(Self::shard(&input))
     };
     let load = match args.load {
-        Load::Required => quote! {
-            let __id = #shard_expr;
-            let mut __checkout = #fw::microsvc::require_loaded(ctx.get(&__id).await?, __id)?;
-        },
-        Load::OrCreate => quote! {
-            let __id = #shard_expr;
-            let mut __checkout = match ctx.get(&__id).await? {
-                ::std::option::Option::Some(checkout) => checkout,
-                ::std::option::Option::None => ctx.create(),
-            };
-        },
-        Load::Create => quote! {
-            let mut __checkout = ctx.create();
-        },
+        Load::Required => quote!(#fw::microsvc::CommandLoad::Required(#shard_expr)),
+        Load::OrCreate => quote!(#fw::microsvc::CommandLoad::OrCreate(#shard_expr)),
+        Load::Create => quote!(#fw::microsvc::CommandLoad::Create(::std::option::Option::None)),
     };
 
     // Call arguments.
@@ -584,7 +573,7 @@ pub(crate) fn expand(
             > {
                 // The principal: the verified session only.
                 let __principal: ::std::string::String = ctx.user_id()?.to_owned();
-                #load
+                let mut __checkout = #fw::microsvc::load_for_command(ctx, #load).await?;
                 let __out = __checkout
                     .aggregate_mut()
                     .#method(#(#args_in_order),*)

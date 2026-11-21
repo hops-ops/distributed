@@ -28,8 +28,7 @@ plane — not open-coded per dialect in `main`.
 **Always reach for the highest-level API first.** The macros and one-call
 conveniences are the recommended surface, not sugar:
 
-- `#[sourced]` — not `#[digest]` + `aggregate!()` (its lower-level building
-  blocks, still supported but only for granular control you actually need)
+- `#[sourced]` — not a hand-written `Aggregate` impl and replay match
 - `#[derive(Snapshot)]` / `#[derive(ReadModel)]` — not hand-written snapshot
   payloads or table plumbing
 - `routes!` + `Service::routes(..)` — not manual handler registration
@@ -149,8 +148,10 @@ Rules that prevent real bugs:
 - **Always set an explicit `aggregate_type`** — the default is the Rust type
   name, which silently changes the durable stream identity if the type is
   renamed.
-- **Event methods become fallible.** `#[event]`/`#[digest]` methods return
-  `SourcedResult` even without a declared return type — call them with `?`.
+- **Event methods become fallible.** An `#[event]` method declares no return
+  type and may not use `?` or `return`; the macro makes it return
+  `SourcedResult`, so call it with `?`. Validate in the public method that
+  calls it.
 - Event names are lowercase past-tense facts (`"initialized"`, `"completed"`).
   Use `when = <expr>` for intentional idempotent/no-op transitions so they
   record nothing; use explicit validation when the API promises a rejection.

@@ -151,15 +151,5 @@ mod tests {
             inline.program().unwrap(),
             "mutation_file! and inline GraphQL-looking mutation! must share IR"
         );
-        let classic = mutation! {
-            name: "SaveTodo";
-            version: 1;
-            upsert Todos from input.todo;
-        };
-        assert_eq!(
-            from_file,
-            classic.program().unwrap(),
-            "GraphQL-looking and classic sugar must share IR"
-        );
     }
 }

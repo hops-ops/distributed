@@ -1,16 +1,11 @@
 mod aggregate;
 mod aggregate_command;
-mod application;
 mod command;
 mod command_input_defaults;
 mod command_types;
-mod digest;
 mod domain_event;
 mod domain_state;
-mod enqueue;
-mod module;
 mod mutation;
-mod portable_command;
 // Event-owning `projection!` authoring removed (mutation projectors cutover).
 mod read_model;
 mod shared;
@@ -20,71 +15,16 @@ mod sourced;
 use proc_macro::TokenStream;
 use syn::DeriveInput;
 
-/// Generate one typed command's portable contract and optional executable
-/// mount from the same handler declaration (`#[command(id = "..", ..)]` on
-/// an async handler function).
+/// Declare a command on an aggregate transition: name, shard, load, payload
+/// and outcome, with `handle:` for a hand-written handler.
 ///
-/// The aggregate-method form, `#[command("aggregate.verb", shard = ..,
-/// load = .., outcome = ..)]` on a method inside a `#[sourced]` impl, is
-/// handled by `#[sourced]` (see the `aggregate_command` module docs): it
-/// generates the handler, binding the `#[principal]` parameter from the
-/// verified session, and the portable mount.
-#[proc_macro_attribute]
-pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
-    command::expand(attr.into(), item.into())
-        .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Domain-owned portable command mount (`PCH-DEC-001`).
-///
-/// Spec sketches used `command!`; that name is the handler attribute
-/// [`command`]. This is the function-like form for shard + invoke + Eventual
-/// (or a `handle:` escape hatch).
+/// The method form, `#[command("aggregate.verb", ..)]` on a method inside a
+/// `#[sourced]` impl, is read by `#[sourced]` and declares the same thing
+/// next to the transition.
 #[proc_macro]
-pub fn portable_command(input: TokenStream) -> TokenStream {
-    portable_command::expand(input.into())
+pub fn command(input: TokenStream) -> TokenStream {
+    command::expand(input.into())
         .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Register an explicit logical module.
-#[proc_macro]
-pub fn module(input: TokenStream) -> TokenStream {
-    module::expand(input.into())
-        .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Register an explicit application and its selected modules/surfaces.
-#[proc_macro]
-pub fn application(input: TokenStream) -> TokenStream {
-    application::expand(input.into())
-        .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Attribute macro that automatically queues a local event for emission.
-#[proc_macro_attribute]
-pub fn enqueue(attr: TokenStream, item: TokenStream) -> TokenStream {
-    enqueue::expand_enqueue(attr.into(), item.into())
-        .unwrap_or_else(|e| e.to_compile_error())
-        .into()
-}
-
-/// Attribute macro that automatically inserts a digest call at the beginning of a method.
-#[proc_macro_attribute]
-pub fn digest(attr: TokenStream, item: TokenStream) -> TokenStream {
-    digest::expand_digest(attr.into(), item.into())
-        .unwrap_or_else(|e| e.to_compile_error())
-        .into()
-}
-
-/// Generates the Aggregate trait impl with replay logic.
-#[proc_macro]
-pub fn aggregate(input: TokenStream) -> TokenStream {
-    aggregate::expand_aggregate(input.into())
-        .unwrap_or_else(|e| e.to_compile_error())
         .into()
 }
 
@@ -157,16 +97,6 @@ pub fn command_input_defaults(input: TokenStream) -> TokenStream {
 ///     mutation SaveTodo {
 ///         upsert_todos(object: $input.todo)
 ///     }
-/// }
-/// ```
-///
-/// Classic sugar still works:
-///
-/// ```ignore
-/// mutation! {
-///     name: "SaveTodo";
-///     version: 1;
-///     upsert Todos from input.todo;
 /// }
 /// ```
 #[proc_macro]

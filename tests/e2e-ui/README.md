@@ -9,7 +9,7 @@ SQLite · celld + NATS (optional profile) · OIDC via Zitadel
 
 Default is **one command** (`make run`). The same UI can wait-dispatch Todo
 create/complete and `chat.post` to celld from [`../e2e-celld`](../e2e-celld).
-Todo commands are `portable_command!` declarations in `todo-domain`; hosts
+Todo commands are `command!` declarations in `todo-domain`; hosts
 only `.mount` them. Chat is a small cell so `@live` still coming from GraphQL
 is the demo.
 
@@ -202,13 +202,13 @@ recovery or revalidation. Actual emitted occurrences—not the declaration—min
 exact obligations for the active projector binding. A no-op command therefore
 emits zero occurrences, mints zero obligations, and completes as `Succeeded`.
 
-Todo commands are `portable_command!` declarations
+Todo commands are `command!` declarations
 (`crates/todo-domain/src/commands/complete.rs`). The macro loads the
 aggregate, calls the domain method with the session principal, commits, and
 returns the payload; the projector applies the mutation later (`Eventual`):
 
 ```rust
-portable_command! {
+command! {
     name: "todo.complete",
     transition: domain_commands::Complete,
     aggregate: Todo,
@@ -219,7 +219,7 @@ portable_command! {
     roles: ["user", "admin"],
     field: "todos_complete",
     invoke: |todo, _input, principal| todo.complete(principal),
-    payload: |todo| TodoStatusPayload::from_todo(&**todo),
+    payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }
 ```
 
@@ -343,7 +343,7 @@ the normal GraphQL command result.
 | `crates/readmodels/` | Query shapes, relationships, and model-owned read RBAC. |
 | `crates/projections/` | Todo, Chat, and Blob event-to-read-model programs. |
 | `crates/service/src/handlers/events/` | Explicit projector handlers that apply modeled programs. |
-| `crates/*-domain/src/commands/` | `portable_command!` handlers: repository → get/create → domain operation → fluent commit. |
+| `crates/*-domain/src/commands/` | `command!` handlers: repository → get/create → domain operation → fluent commit. |
 | `crates/service/src/application.rs` | Composition root: client surfaces and the module inventory. |
 | `crates/service/src/modules/` | One module per bounded context (`todo`, `chat`, `blob`) mounting its typed commands and projectors; `compose.rs` lists them. |
 | `crates/service/src/host.rs` | Infrastructure: SQL dialect, outbox, OIDC, serving. |

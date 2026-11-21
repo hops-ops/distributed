@@ -88,7 +88,7 @@ export const todosWalkthrough: DemoWalkthrough = {
 	title: 'Todos',
 	kicker: 'Query, then command, then domain, then projection',
 	summary:
-		'This page loads one GraphQL query into the client replica. Todo commands are Eventual. The client shows a safe preview from the command input and the domain transition. The event handler applies the same mutation program later. The client waits for projection obligations. The client does not wait for a response row. The same portable_command! declarations mount on a local Service (tests/e2e-ui) or wait-dispatch every Todo transition to a cell (tests/e2e-celld).',
+		'This page loads one GraphQL query into the client replica. Todo commands are Eventual. The client shows a safe preview from the command input and the domain transition. The event handler applies the same mutation program later. The client waits for projection obligations. The client does not wait for a response row. The same command! declarations mount on a local Service (tests/e2e-ui) or wait-dispatch every Todo transition to a cell (tests/e2e-celld).',
 	tabs: [
 {
 			id: 'query',
@@ -168,7 +168,7 @@ await commands.todo.complete({ todo_id });`
 				{
 					file: 'todo-domain/src/commands/complete.rs',
 					caption: 'A thin portable command is shard + invoke + Eventual. The host does not write a handler body.',
-					code: `portable_command! {
+					code: `command! {
   name: "todo.complete",
   transition: domain_commands::Complete,
   aggregate: Todo,
@@ -179,7 +179,7 @@ await commands.todo.complete({ todo_id });`
   roles: ["user", "admin"],
   field: "todos_complete",
   invoke: |todo, _input, principal| todo.complete(principal),
-  payload: |todo| TodoStatusPayload::from_todo(&**todo),
+  payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }`
 				},
 				{
@@ -195,44 +195,34 @@ await commands.todo.complete({ todo_id });`
 {
 			id: 'handlers',
 			label: '3 · Handlers',
-			lede: 'Most Todo commands are thin: load or create, invoke one domain method, commit Eventual. The framework writes that handler. `todo.create` and `todo.force_archive` still use a handle function when the body needs extra checks or payload fields. Either way, ctx.repo() is the capability. The host is SQLite, Postgres, or a cell.',
+			lede: 'Todo commands are thin: load or create, invoke one domain method, commit Eventual. The framework writes that handler. A command that needs more, like `chat.post`, names a handle function. Either way, ctx.repo() is the capability. The host is SQLite, Postgres, or a cell.',
 			principle: 'A command changes the write model. A table is only for reads.',
 			samples: [
 				{
 					file: 'todo-domain/src/commands/complete.rs · thin',
 					caption: 'No CausalCommandContext body. The mount loads by shard, invokes the domain, and commits Eventual.',
-					code: `portable_command! {
+					code: `command! {
   name: "todo.complete",
   // …
   load: required,
   invoke: |todo, _input, principal| todo.complete(principal),
-  payload: |todo| TodoStatusPayload::from_todo(&**todo),
+  payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }`
 				},
 				{
-					file: 'todo-domain/src/commands/create.rs · handle_create',
-					caption: 'Escape hatch: get the principal, create the aggregate, call the domain, commit Eventual.',
-					code: `portable_command! {
+					file: 'todo-domain/src/commands/create.rs · thin',
+					caption: 'Still thin. `load: create` rejects an id that already has a todo. The principal comes from the session, never from the input.',
+					code: `command! {
   name: "todo.create",
   // …
+  load: create,
   guard: authenticated_user,
-  handle: handle_create,
+  invoke: |todo, input, principal| todo.create(&input.todo_id, principal, &input.title),
+  payload: |todo, _principal| { /* TodoCreatePayload from the todo */ },
   defaults: command_input_defaults! {
     input: TodoCreateInput;
     default input.todo_id = uuid_v7();
   },
-}
-
-pub async fn handle_create(
-  ctx: &CausalCommandContext<'_, Todo>,
-  input: TodoCreateInput,
-) -> Result<PreparedCommand<Eventual<TodoCreatePayload>>, HandlerError> {
-  let owner = principal(ctx)?;
-  let repo = ctx.repo();
-  let mut todo = repo.create();
-  todo.create(&input.todo_id, &owner, &input.title)
-    .map_err(rejected)?;
-  repo.publish_events().commit(todo)?.eventual(/* payload */)
 }`
 				}
 			]
@@ -1180,33 +1170,28 @@ pub struct Todos {
 {
 			id: 'handlers',
 			label: '3 · Handlers',
-			lede: 'The handler loads the aggregate. Then it calls `force_archive`. Then it commits Eventual. Authorization is the role, the surface, and the mount guard. There is no special HTTP path.',
+			lede: 'The command loads the aggregate. Then it calls `force_archive`. Then it commits Eventual. Authorization is the role, the surface, and the mount guard. There is no special HTTP path.',
 			principle: 'Use the signed-in principal. Do not trust the request body for identity.',
 			samples: [
 				{
-					file: 'todo-domain/src/commands/force_archive.rs · handle_force_archive',
-					caption: 'Get the admin principal. Load the todo. Call the domain. Commit Eventual.',
-					code: `pub async fn handle_force_archive(
-  ctx: &CausalCommandContext<'_, Todo>,
-  input: TodoForceArchiveInput,
-) -> Result<PreparedCommand<Eventual<TodoForceArchivePayload>>, HandlerError> {
-  let admin = principal(ctx)?;
-  let repo = ctx.repo();
-  let mut todo = repo
-    .get(&input.todo_id)
-    .await?
-    .ok_or_else(|| HandlerError::NotFound(input.todo_id.clone()))?;
-
-  todo.force_archive().map_err(rejected)?;
-  let state = TodoState::from(&*todo);
-  repo.publish_events()
-    .commit(todo)?
-    .eventual(TodoForceArchivePayload {
+					file: 'todo-domain/src/commands/force_archive.rs · thin',
+					caption: 'Admins only. Load the todo. Call the domain. The payload names the admin from the session.',
+					code: `command! {
+  name: "todo.force_archive",
+  // …
+  load: required,
+  roles: ["admin"],
+  guard: admin_user,
+  invoke: |todo, _input, _principal| todo.force_archive(),
+  payload: |todo, principal| {
+    let state = TodoState::from(&**todo);
+    TodoForceArchivePayload {
       todo_id: state.todo_id,
       owner_id: state.owner_id,
       status: state.status,
-      archived_by: admin,
-    })
+      archived_by: principal.to_string(),
+    }
+  },
 }`
 				}
 			]

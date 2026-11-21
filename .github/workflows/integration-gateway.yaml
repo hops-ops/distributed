@@ -189,7 +189,7 @@ jobs:
           cd tests/gateway-auth
           npx playwright install --with-deps chromium
       - name: Verify explicit application mounts
-        run: cargo test --no-default-features --features graphql,sqlite,application-runtime,gateway --test application_composition --test application_plans --test gateway_mounts
+        run: cargo test --no-default-features --features graphql,sqlite,gateway --test application_composition --test application_plans --test gateway_mounts
       - name: Build coherent application and run public-origin browser flows
         run: node tests/e2e-ui/gateway/run.mjs
       - name: Verify dev lifecycle and browser flows through the gateway

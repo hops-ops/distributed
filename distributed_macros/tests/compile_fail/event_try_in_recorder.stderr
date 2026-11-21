@@ -1,0 +1,5 @@
+error: #[event] methods cannot use `?`: the event is already recorded when the body runs, so the body cannot fail
+  --> tests/compile_fail/event_try_in_recorder.rs:18:9
+   |
+18 |         self.validate()?;
+   |         ^^^^^^^^^^^^^^^^

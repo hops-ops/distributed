@@ -317,12 +317,14 @@ pub fn complete(&mut self, #[principal] owner_id: &str) -> Result<(), TodoError>
 ```
 
 The Todo playground spells the same registration out with
-`portable_command!` — shard, invoke one domain method, commit Eventual.
-`todo.create` keeps a `handle:` escape hatch when the body needs extra
-checks.
+`command!` — shard, invoke one domain method, commit Eventual. `load:`
+is `required`, `or_create` or `create` (an id that already has a stream
+is rejected); `guard:` adds a check on top of the roles; the payload
+closure also receives the session principal. `handle:` remains the
+escape hatch for a body that does more than one domain call.
 
 ```rust,ignore
-portable_command! {
+command! {
     name: "todo.complete",
     transition: domain_commands::Complete,
     aggregate: Todo,
@@ -333,7 +335,7 @@ portable_command! {
     roles: ["user", "admin"],
     field: "todos_complete",
     invoke: |todo, _input, principal| todo.complete(principal),
-    payload: |todo| TodoStatusPayload::from_todo(&**todo),
+    payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }
 ```
 
@@ -346,7 +348,7 @@ A module mounts one bounded context — commands, guards, projectors. A
 playground is one `Service`, one host, one runner that only reads env and
 calls `run`. You do not set a runtime role flag.
 
-Todo commands are `portable_command!` declarations in `todo-domain`. This
+Todo commands are `command!` declarations in `todo-domain`. This
 playground mounts them on a local Service. The sibling example
 [`tests/e2e-celld`](tests/e2e-celld) mounts the same declarations and
 wait-dispatches create, complete, and `chat.post` to a **cell** (one private
@@ -549,7 +551,7 @@ Start here in the code:
 | [`ui/src/lib/components/blob/SelectedBlobGame.graphql`](tests/e2e-ui/ui/src/lib/components/blob/SelectedBlobGame.graphql) | Reusable component island promoted to the nearest static route boundary; one route-param binding drives SSR and component reads. |
 | [`ui/src/routes/blob/[[gameId]]/+page.svelte`](tests/e2e-ui/ui/src/routes/blob/[[gameId]]/+page.svelte) | Arrow keys → `commands.blob.move`; board from `BlobGames.use()`. |
 | [`crates/service/src/modules/compose.rs`](tests/e2e-ui/crates/service/src/modules/compose.rs) | One `Service` lists modules. No `Runtime::role`. |
-| [`crates/blob-domain/src/commands/move_dir.rs`](tests/e2e-ui/crates/blob-domain/src/commands/move_dir.rs) | `portable_command!` returning `Atomic<BlobGames>`: the map/score row commits with the event, and a WASM pure previews the move. |
+| [`crates/blob-domain/src/commands/move_dir.rs`](tests/e2e-ui/crates/blob-domain/src/commands/move_dir.rs) | `command!` returning `Atomic<BlobGames>`: the map/score row commits with the event, and a WASM pure previews the move. |
 | [`crates/todo-domain/src/models/todo.rs`](tests/e2e-ui/crates/todo-domain/src/models/todo.rs) | Plain aggregate — no GraphQL in the domain. |
 | [`ui/src/auth.ts`](tests/e2e-ui/ui/src/auth.ts) | Auth.js + Zitadel scopes/groups → engine roles. |
 
@@ -633,7 +635,7 @@ inherit it from member crates. Keep the root dependency feature-light, then
 enable service-specific features only in the service crates.
 
 Most application crates should depend on `distributed` only. The proc
-macros (`#[sourced]`, `#[digest]`, `#[derive(ReadModel)]`,
+macros (`#[sourced]`, `command!`, `#[derive(ReadModel)]`,
 `#[derive(Snapshot)]`) are re-exported from `distributed`; do not add
 `distributed_macros` directly unless you are working on the macro crate
 itself. The `distributed_cli` crate installs the `distributed` tooling
@@ -651,7 +653,6 @@ network servers.
 
 | Feature | Default | Adds |
 |---|---:|---|
-| `emitter` | No | In-process event emission and `#[enqueue]`. |
 | `http` | No | Axum HTTP transport for `microsvc` + the Knative/CloudEvents ingress router. |
 | `grpc` | No | Tonic gRPC transport for `microsvc`. |
 | `graphql` | No | GraphQL query service over read models (pulls in `http` + WebSocket). Pair with `sqlite` and/or `postgres` for a dialect. |
@@ -665,7 +666,6 @@ network servers.
 | `metrics` | No | `distributed::metrics`: framework counters and gauges with Prometheus text exposition (no SDK dependency); with `http`, a scrape handler. Bus receive loops record into it. |
 | `otel` | No | OpenTelemetry tracing spans for bus receive loops and `microsvc` dispatch/handlers (`opentelemetry`, `tracing-opentelemetry`). |
 | `workers-rs` | No | Cloudflare `worker` crate bindings for celld cells: the aggregate cell host and the celld Queue publisher/relay (`bus::CelldQueue*`) on `wasm32`. |
-| `application-runtime` (alias `runtime`) | No | Checked by `#[command]`/`portable_command!` output in the **declaring** crate: enable it in that crate's features to emit the runtime mounts (`*_mount`, `register_*`, `CommandDefinition`). Contract-only packages leave it off. |
 | `gateway` | No | `distributed::gateway`: portable gateway declarations (bindings, routes, dispatch). Starts no listeners. |
 | `gateway-native` | No | Native HTTP gateway adapter (hyper/tower), independent of GraphQL and SQL. |
 | `gateway-graphql` | No | Whole-operation GraphQL selection for the gateway (parser only). |
@@ -697,7 +697,7 @@ network servers.
 
 ## Terminology And CQRS Boundaries
 
-Event sourcing is the model-level persistence strategy: aggregates record replayable `EventRecord`s when command methods such as `#[event]` (within `#[sourced]`) or `#[digest]` methods succeed. Those records are the write-side history used to hydrate the aggregate.
+Event sourcing is the model-level persistence strategy: aggregates record replayable `EventRecord`s when command methods such as `#[event]` (within `#[sourced]`) succeed. Those records are the write-side history used to hydrate the aggregate.
 
 CQRS is the architectural split between write-side aggregates and query-side read models. Repositories load aggregate event streams by ID for command handling; production business queries should read from `ReadModel` projections shaped for that query.
 
@@ -757,7 +757,7 @@ All in-memory defaults are `Clone` and `Send + Sync`, so they work in single-tas
 
 ## The `#[sourced]` Macro
 
-The `#[sourced]` attribute macro is the recommended way to define event-sourced aggregates. Place it on an impl block and annotate command methods with lowercase, past-tense aggregate event names such as `#[event("initialized")]`. It replaces both `#[digest]` and `aggregate!()`, and auto-generates a typed event enum plus the `Aggregate` impl.
+The `#[sourced]` attribute macro is the recommended way to define event-sourced aggregates. Place it on an impl block and annotate command methods with lowercase, past-tense aggregate event names such as `#[event("initialized")]`. It generates a typed event enum plus the `Aggregate` impl.
 
 Event methods are rewritten to return `SourcedResult`, even when the source method omits an explicit return type. Call them with `?` in application code so serialization and event-recording failures are propagated.
 
@@ -813,9 +813,7 @@ impl Aggregate for Todo { /* ... */ }
 
 ### Flat events and optimistic updates
 
-With `domain = event`, recorder parameters are the flat outward event body.
-Literal arguments in public transitions also inform generated optimistic
-projections—there is no second status mapping to maintain:
+With `domain = event`, recorder parameters are the flat outward event body:
 
 ```rust,ignore
 #[sourced(entity, aggregate_type = "review")]
@@ -834,19 +832,21 @@ impl Review {
 }
 ```
 
-A portable command selecting `domain_commands::Approve` carries the known
-`status = "approved"` into its projection preview. The projection still defines
-which read-model fields it updates; permissions and confirmed events still
-decide what the client can ultimately retain.
+Optimistic projections need to know what a command will leave behind before
+the event exists. That is declared, never read out of a method body. A state
+recorder (`domain`) lists the values it always sets, in the field grammar of
+`state_preview!`:
 
-Inference recognizes scalar literals, literal string ownership conversions,
-and optional literals using fully qualified standard constructors (for example,
-`::core::option::Option::Some(true)`). Bare `Some`/`None` remain unknown because
-they can be shadowed. Inference preserves numeric types. Computed IDs, clocks,
-variables, arbitrary calls, and unsupported expressions stay unknown. When
-calls to the same recorder disagree, only their shared constants are retained.
-This does not predict authorization or guarantee an event will occur. Snapshot
-events continue to infer known values from recorder state assignments.
+```rust,ignore
+#[event("todo.completed", version = 1, domain, known(status: "completed"))]
+fn completed(&mut self) { self.status = TodoStatus::Completed; }
+```
+
+A command over a flat event declares its preview on the registration, with
+`.applies(event_preview! { ReviewStatusRecorded => ReviewStatusRecorded {
+id: input.id, status: "approved", ..unknown } })`. Both are checked against the
+body's fields when the command is registered. Neither predicts authorization
+or guarantees that the event will occur.
 
 Public transitions can delegate to shared decision helpers in the same
 `#[sourced]` impl. For example, `leave` and an owner-authorized `remove_member`
@@ -855,10 +855,9 @@ can both call a private `self.remove_member_decision(...)`. Each gets its own
 the outward events reachable through those helpers. Discovery follows static
 `self.method(...)` calls, deduplicates events, and terminates on recursive helper
 graphs. It does not follow foreign receivers or helpers outside the impl, and
-does not propagate argument values through helpers. Literal arguments at the
-recorder call still participate in the same conservative inference. Custom
+does not propagate argument values through helpers. Custom
 `domain = with(Body, adapter)` events use the declared body contract, including
-qualified or relative type paths; adapter output is not inferred as constants.
+qualified or relative type paths.
 
 For an event whose body contains the authenticated principal, bind that one
 field using the existing command API:
@@ -872,7 +871,7 @@ command_transition::<domain_commands::Leave, LeaveInput, Eventual<LeaveOutput>>(
 
 The second type is the exact serialized body. Use the flat event itself for
 `domain = event` or `#[derive(DomainEvent)]`; state-capture events continue to
-use their `DomainState` type. The equivalent `portable_command!` entry is:
+use their `DomainState` type. The equivalent `command!` entry is:
 
 ```rust,ignore
 authenticated_user_field: (
@@ -971,121 +970,15 @@ impl MyAggregate {
 }
 ```
 
-### With `enqueue` for Choreography
-
-Add `enqueue` to `#[sourced]` to automatically queue events for in-process emission alongside digest. Every `#[event]` method both records to the entity stream and enqueues for emission:
-
-```rust,ignore
-use distributed::{sourced, Entity};
-use distributed::emitter::EntityEmitter;
-
-#[derive(Default)]
-struct Order {
-    entity: Entity,
-    emitter: EntityEmitter,
-    status: String,
-}
-
-#[sourced(entity, enqueue)]
-impl Order {
-    #[event("initialized")]
-    fn create(&mut self, order_id: String, customer: String) {
-        self.entity.set_id(&order_id);
-        self.status = "created".into();
-    }
-
-    #[event("shipped", when = self.status == "created")]
-    fn ship(&mut self) {
-        self.status = "shipped".into();
-    }
-}
-```
-
-**Custom emitter field** — when your emitter field isn't named `emitter`:
-
-```rust,ignore
-#[sourced(entity, enqueue(my_emitter))]
-impl Notifier {
-    #[event("sent")]
-    fn send(&mut self, id: String, message: String) {
-        self.entity.set_id(&id);
-        self.message = message;
-    }
-}
-```
-
-## The `#[digest]` Macro and `aggregate!()` Macro
-
-The `#[digest]` and `aggregate!()` macros are the lower-level building blocks that `#[sourced]` replaces. They're still fully supported and useful when you want more granular control. Like `#[event]` methods, `#[digest]` methods become fallible and should be called with `?`.
-
-### The `#[digest]` Macro
-
-```rust,ignore
-// Basic — captures function parameters
-#[digest("initialized")]
-fn initialize(&mut self, id: String, user_id: String, task: String) {
-    self.entity.set_id(&id);
-    self.user_id = user_id;
-    self.task = task;
-}
-
-// Guard conditions — only emit when the condition is true
-#[digest("completed", when = !self.completed)]
-fn complete(&mut self) {
-    self.completed = true;
-}
-
-// Versioned events
-#[digest("initialized", version = 2)]
-fn initialize(&mut self, id: String, task: String, priority: u8) { /* ... */ }
-
-// Custom entity field
-#[digest(my_entity, "initialized")]
-fn create(&mut self, name: String) { /* uses self.my_entity */ }
-```
-
-### The `aggregate!` Macro
-
-Generates the `Aggregate` trait implementation with replay logic:
-
-```rust,ignore
-aggregate!(Todo, entity, aggregate_type = "todo" {
-    "initialized"(id, user_id, task) => initialize,
-    "completed"() => complete(),
-});
-```
-
-With [upcasters](#event-upcasting--versioning) for event schema evolution:
-
-```rust,ignore
-type InitV1 = (String, String);
-type InitV2 = (String, String, u8);
-
-fn upcast_initialized_v1_v2((id, task): InitV1) -> InitV2 {
-    (id, task, 0)
-}
-
-aggregate!(Todo, entity {
-    "initialized"(id, task, priority), version = 2 => initialize,
-    "completed"() => complete(),
-} upcasters [
-    ("initialized", 1 => 2, InitV1 => InitV2, upcast_initialized_v1_v2),
-]);
-```
+### Replay and event versions
 
 Replay requires each event's schema version to match its registered handler
-after upcasting. `#[sourced]` reads this version from `#[event(..., version = N)]`;
-`aggregate!` declares it on the registration as above and must match the
-corresponding `#[digest(..., version = N)]`. Omitted versions default to 1.
+after upcasting. `#[sourced]` reads this version from
+`#[event(..., version = N)]`. Omitted versions default to 1.
 Older events need an explicit upcaster chain to the registered version; future
 versions are rejected. Matching payload layouts do not bypass this check.
 The check runs before payload decoding or handler invocation, including when
 loading only the event tail after a snapshot in a native repository or cell.
-
-**Breaking change:** an `aggregate!` registration for a versioned handler must
-now declare its current version. Histories with unsupported versions fail replay
-instead of being interpreted using the current payload shape. Stored events are
-unchanged; add the appropriate upcasters to read supported older versions.
 
 ## Event Metadata
 
@@ -1093,7 +986,7 @@ Metadata lets you attach cross-cutting context — correlation IDs, causation ID
 
 ### Setting Metadata on an Entity
 
-Set metadata on the entity before calling command methods. Every event produced by `#[event]` or `#[digest]` automatically inherits it:
+Set metadata on the entity before calling command methods. Every event produced by `#[event]` automatically inherits it:
 
 ```rust,ignore
 let mut todo = Todo::default();
@@ -1128,7 +1021,7 @@ The metadata flows through the full chain:
 
 ```text
 Entity.set_correlation_id("req-123")
-  → #[event] / #[digest] → EventRecord.metadata
+  → #[event] → EventRecord.metadata
   → encode_for_entity → OutboxMessage.metadata
   → OutboxDispatcher → transport Message.metadata
   → subscriber receives the message with correlation_id() == "req-123"
@@ -1148,74 +1041,6 @@ event_record.meta("user_id")
 message.correlation_id()
 message.meta("trace_id")
 ```
-
-## In-Process Event Choreography (requires `emitter` feature)
-
-The `emitter` feature adds in-process event-driven choreography — queue local events during commands and emit them after commit for reactive workflows within a single process.
-
-### With `#[sourced(entity, enqueue)]`
-
-Every `#[event]` method automatically records to the entity stream (for replay) and enqueues for in-process emission:
-
-```rust,ignore
-use serde::{Deserialize, Serialize};
-use distributed::{sourced, Entity};
-use distributed::emitter::EntityEmitter;
-
-#[derive(Default, Serialize, Deserialize)]
-struct OrderSaga {
-    entity: Entity,
-    #[serde(skip, default)]
-    emitter: EntityEmitter,
-    order_id: String,
-    status: String,
-}
-
-#[sourced(entity, enqueue)]
-impl OrderSaga {
-    #[event("started")]
-    fn start(&mut self, order_id: String) {
-        self.entity.set_id(&order_id);
-        self.order_id = order_id;
-        self.status = "started".into();
-    }
-
-    #[event("completed", when = self.status == "started")]
-    fn complete_step(&mut self) {
-        self.status = "completed".into();
-    }
-}
-```
-
-### Emitting After Commit
-
-Queued events are held until you explicitly emit them after a successful commit:
-
-```rust,ignore
-let mut saga = OrderSaga::default();
-saga.start("order-1".into())?;
-
-// Commit the aggregate...
-repo.commit(&mut saga).await?;
-
-// Then emit queued events to registered listeners
-saga.emitter.emit_queued();
-```
-
-### Registering Listeners
-
-```rust,ignore
-let shared_state = Arc::new(Mutex::new(Vec::new()));
-let state = Arc::clone(&shared_state);
-
-saga.emitter.on("started", move |payload: String| {
-    if let Ok(mut events) = state.lock() {
-        events.push(payload);
-    }
-});
-```
-
-This pattern is useful for reactive workflows within the same process. For cross-service messaging, use the [Outbox Pattern](#outbox-pattern) and [Service Bus](#service-bus).
 
 ## Queued Repository
 
@@ -1292,7 +1117,7 @@ the durable transport (`PostgresBus`).
 
 Streams are keyed by full **stream identity** `(aggregate_type, aggregate_id)`,
 not bare IDs. Prefer an explicit durable `aggregate_type` in production
-(`impl_aggregate!(..., aggregate_type = "...")` or the sourced/aggregate macros).
+(`#[sourced(entity, aggregate_type = "...")]`).
 
 | Trait | Role |
 | --- | --- |
@@ -1640,7 +1465,7 @@ The generated registration is exactly the hand-written one
 (`command_transition::<domain_commands::X, I, K>(name)` + `field_name`,
 `roles`, `guarded`/`handle`): the command specs, GraphQL SDL and client
 manifest are identical (`tests/aggregate_command`). For unusual bodies write
-the handler and register it with `portable_command! { .., handle: f }` or
+the handler and register it with `command! { .., handle: f }` or
 the builder below.
 
 **Contracts.** Command semantics live in `distributed::command`, independently of the query
@@ -2454,7 +2279,7 @@ struct Todo {
 }
 ```
 
-Fields with `#[serde(skip)]` (like `emitter: EntityEmitter`) are automatically excluded.
+Fields with `#[serde(skip)]` are automatically excluded.
 
 **Custom ID key** — when the entity ID maps to a domain field like `sku`:
 
@@ -2791,7 +2616,6 @@ src/
   command_ledger/     # Durable command identity and fenced commit primitives (crate-private)
   commit_builder/     # Transactional batches for aggregates, outbox, and read models
   domain_event/       # Typed outward domain events, separate from replay bytes
-  emitter/            # In-process event emitter helpers (feature = "emitter")
   entity/             # Entity, event records, metadata, upcasting codecs
   gateway/            # Portable application gateway contracts (feature = "gateway*")
   graphql/            # Query service: engine, permissions, identity, SDL, HTTP/WS (feature = "graphql")
@@ -2820,8 +2644,7 @@ src/
   time.rs             # Wall clock that also works on wasm32
   trace_context.rs    # W3C trace-context metadata helpers
   lib.rs              # Public exports
-distributed_macros/   # Proc macros: sourced, digest, aggregate, enqueue, command, portable_command,
-                      #   module, application, mutation!, ReadModel, Snapshot, DomainState,
+distributed_macros/   # Proc macros: sourced, command!, mutation!, ReadModel, Snapshot, DomainState,
                       #   DomainEvent, CommandInput, CommandOutput (projection! is in src/lib.rs)
 distributed_cli/      # The `distributed` CLI (build/dev lifecycle, client codegen, contracts
                       #   check/accept, game-manifest/game-client/game-wasm); also a library
@@ -2840,7 +2663,6 @@ compose.yaml          # Local postgres / rabbitmq / kafka / nats / redis for int
 
 ```bash
 cargo test                  # default feature set
-cargo test --features emitter
 cargo test --features http
 cargo test --features grpc
 make test                 # starts compose and runs full local coverage

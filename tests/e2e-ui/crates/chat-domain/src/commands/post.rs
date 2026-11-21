@@ -1,6 +1,6 @@
 use distributed::command::{Eventual, PreparedCommand};
 use distributed::microsvc::{CausalCommandContext, HandlerError};
-use distributed::portable_command;
+use distributed::command;
 use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, ChatMessage, ChatMessagePostedDomainEvent, ChatMessageState};
@@ -105,7 +105,7 @@ pub fn canonical_near_unix_millis(value: &str) -> Result<String, HandlerError> {
     Ok(value.to_string())
 }
 
-portable_command! {
+command! {
     name: "chat.post",
     transition: domain_commands::Post,
     aggregate: ChatMessage,

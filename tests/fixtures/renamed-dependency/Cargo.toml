@@ -1,15 +1,11 @@
 [package]
-name = "renamed-dependency-trybuild"
+name = "renamed-dependency"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
-[workspace]
-
-[features]
-application-runtime = []
-
+# The framework under another name: every path a macro generates must follow
+# it, so nothing here may name `distributed`.
 [dev-dependencies]
 framework = { package = "distributed", path = "../../.." }
 serde = { version = "1", features = ["derive"] }
-trybuild = "=1.0.118"

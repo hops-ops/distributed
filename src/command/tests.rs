@@ -284,7 +284,7 @@ fn authenticated_user_field_reuses_generated_event_schema_metadata() {
     );
     assert_eq!(field.body_nullable, Some(false));
     assert_eq!(field.body_always_present, Some(true));
-    let previous = __command_projection_state_known_values::<TodoStateChanged, TodoState>(vec![(
+    let previous = __command_projection_state_preview::<TodoStateChanged, TodoState>(vec![(
         "status",
         CommandProjectionPreviewSource::trusted("x-user-id", "string"),
     )]);
@@ -367,7 +367,7 @@ fn authenticated_flat_event_field_preserves_wire_name_and_rejects_invalid_bindin
 fn authenticated_user_field_merges_with_known_values_and_rejects_unknown_fields() {
     let mut projections = CommandProjectionEvents::default();
     projections.add_event_set(crate::events![TodoStateChanged]);
-    projections.add_inferred_values(__command_projection_state_known_values::<
+    projections.add_inferred_values(__command_projection_state_preview::<
         TodoStateChanged,
         TodoState,
     >(vec![(
@@ -376,7 +376,7 @@ fn authenticated_user_field_merges_with_known_values_and_rejects_unknown_fields(
     )]));
     projections.add_authenticated_user_field(
         "status",
-        __command_projection_state_known_values::<TodoStateChanged, TodoState>(vec![(
+        __command_projection_state_preview::<TodoStateChanged, TodoState>(vec![(
             "status",
             CommandProjectionPreviewSource::trusted("x-user-id", "string"),
         )]),

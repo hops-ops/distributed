@@ -40,7 +40,7 @@ async fn handle_batch(
         .eventual(BatchPayload { title })
 }
 
-distributed::portable_command! {
+distributed::command! {
     name: "todo.test_batch",
     transition: todo_domain::domain_commands::Rename,
     aggregate: todo_domain::Todo,

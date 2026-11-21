@@ -1,5 +1,5 @@
+use distributed::command;
 use distributed::command::Eventual;
-use distributed::portable_command;
 use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, Todo, TodoState};
@@ -26,7 +26,7 @@ impl TodoStatusPayload {
     }
 }
 
-portable_command! {
+command! {
     name: "todo.complete",
     transition: domain_commands::Complete,
     aggregate: Todo,
@@ -37,7 +37,7 @@ portable_command! {
     roles: ["user", "admin"],
     field: "todos_complete",
     invoke: |todo, _input, principal| todo.complete(principal),
-    payload: |todo| TodoStatusPayload::from_todo(&**todo),
+    payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }
 
 #[cfg(test)]

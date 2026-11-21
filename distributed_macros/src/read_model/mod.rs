@@ -19,6 +19,7 @@ pub fn derive_read_model(input: TokenStream) -> TokenStream {
 }
 
 pub(crate) fn expand_read_model(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let framework = crate::shared::framework_path()?;
     let name = &input.ident;
     let visibility = &input.vis;
     let struct_attrs = StructAttrs::from_input(&input)?;
@@ -40,7 +41,7 @@ pub(crate) fn expand_read_model(input: DeriveInput) -> syn::Result<proc_macro2::
 
     let read_model_impl = if let Some(id_field) = &id_field {
         Some(quote! {
-            impl distributed::ReadModel for #name {
+            impl #framework::ReadModel for #name {
                 const COLLECTION: &'static str = #collection;
 
                 fn id(&self) -> &str {

@@ -104,7 +104,7 @@ async fn public_causal_invoke_returns_receipt_without_sqlx_or_celld() {
             aggregate.record(input.id.clone())?;
             Ok::<_, distributed::EventRecordError>(())
         })
-        .succeeded(|aggregate| CompletePayload {
+        .succeeded(|aggregate, _principal| CompletePayload {
             id: aggregate.entity().id().to_string(),
         })
         .typed_command(typed_command::<CompleteInput, Succeeded<CompletePayload>>(
@@ -115,7 +115,7 @@ async fn public_causal_invoke_returns_receipt_without_sqlx_or_celld() {
             aggregate.record(input.id.clone())?;
             Ok::<_, distributed::EventRecordError>(())
         })
-        .succeeded(|aggregate| CompletePayload {
+        .succeeded(|aggregate, _principal| CompletePayload {
             id: aggregate.entity().id().to_string(),
         });
 

@@ -1,5 +1,0 @@
-error: command declarations derive their optional runtime mount; maintain one `commands: [*_DEFINITION]` list and remove `mounts`
- --> tests/compile_fail/application_module_missing_spec.rs:5:9
-  |
-5 |         mounts: [MISSING_COMMAND_MOUNT],
-  |         ^^^^^^

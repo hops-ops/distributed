@@ -1,5 +1,0 @@
-error: unsupported key `versoin` in #[digest(...)]; expected `when` or `version`
-  --> tests/compile_fail/unknown_digest_key.rs:10:19
-   |
-10 |     #[digest("x", versoin = 2)]
-   |                   ^^^^^^^

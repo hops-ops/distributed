@@ -1,5 +1,0 @@
-error: unknown module field `unknown`
- --> tests/compile_fail/application_module_unknown_field.rs:4:9
-  |
-4 |         unknown: [],
-  |         ^^^^^^^

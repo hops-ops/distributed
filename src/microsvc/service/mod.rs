@@ -53,7 +53,7 @@ pub use handlers::{
     direct_read_model, CausalCommandContext, CausalCommitBuilder, CausalRepository,
     DirectReadModelProjection, PreparedCausalCommit, PreparedCommandHandler,
 };
-pub use invoke::{invoke_transition, require_loaded};
+pub use invoke::{invoke_transition, load_for_command, require_loaded, CommandLoad};
 pub use request::{CommandRequest, CommandResponse};
 pub(crate) use routes::DynBusPublisher;
 pub use routes::{

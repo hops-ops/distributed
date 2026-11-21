@@ -43,7 +43,7 @@ pub fn permissions() -> ModelPermissions<OrderView> {
 }
 ```
 
-3. Register it in `src/query/mod.rs` via `graphql_models!(builder, order_view)` or
+3. Register it in `src/query/mod.rs` with
    `.model::<OrderView>(order_view::permissions())`.
 
 ### Roles

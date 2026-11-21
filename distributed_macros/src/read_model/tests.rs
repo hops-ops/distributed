@@ -70,7 +70,7 @@ fn expand_read_model_accepts_named_id_field() {
 
     let expanded = expand_read_model(input).unwrap().to_string();
 
-    assert!(expanded.contains("impl distributed :: ReadModel for CounterView"));
+    assert!(expanded.contains("impl :: distributed :: ReadModel for CounterView"));
     assert!(expanded.contains("fn id"));
 }
 
@@ -312,8 +312,8 @@ fn expand_read_model_allows_composite_relational_models_without_string_id() {
 
     let expanded = expand_read_model(input).unwrap().to_string();
 
-    assert!(expanded.contains("impl distributed :: RelationalReadModel for PlayerWeapon"));
-    assert!(!expanded.contains("impl distributed :: ReadModel for PlayerWeapon"));
+    assert!(expanded.contains("impl :: distributed :: RelationalReadModel for PlayerWeapon"));
+    assert!(!expanded.contains("impl :: distributed :: ReadModel for PlayerWeapon"));
 }
 
 #[test]

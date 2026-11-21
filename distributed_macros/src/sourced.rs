@@ -3,7 +3,7 @@ use quote::{format_ident, quote};
 use syn::{
     parse::{ParseStream, Parser},
     visit::Visit,
-    Expr, FnArg, Ident, ItemImpl, LitStr, Member, Path, Stmt, Token, Type,
+    Expr, FnArg, Ident, ItemImpl, LitStr, Path, Token, Type,
 };
 
 use crate::aggregate::{
@@ -11,10 +11,9 @@ use crate::aggregate::{
     validate_aggregate_type_literal, UpcasterDef,
 };
 use crate::shared::{
-    canonical_object_schema, ensure_sourced_result_signature, extract_params_with_types,
-    framework_path, generate_digest_call, generate_enqueue_call, projection_body_metadata_tokens,
-    schema_fingerprint, validate_domain_event_name_literal,
-    wrap_result_body_with_guard_and_postlude,
+    canonical_object_schema, ensure_infallible_recorder_signature, extract_params_with_types,
+    framework_path, generate_digest_call, projection_body_metadata_tokens, schema_fingerprint,
+    validate_domain_event_name_literal, wrap_recorder_body,
 };
 
 pub(crate) struct SourcedArgs {
@@ -22,7 +21,6 @@ pub(crate) struct SourcedArgs {
     enum_name: Option<LitStr>,
     aggregate_type: Option<LitStr>,
     domain_state: Option<Type>,
-    enqueue: Option<Ident>, // Some(emitter_field) if enqueue enabled
     pub(crate) upcasters: Vec<UpcasterDef>,
 }
 
@@ -36,7 +34,6 @@ pub(crate) fn parse_sourced_args(input: ParseStream) -> syn::Result<SourcedArgs>
     let mut enum_name = None;
     let mut aggregate_type = None;
     let mut domain_state = None;
-    let mut enqueue = None;
     let mut upcasters = Vec::new();
 
     while input.peek(Token![,]) {
@@ -63,15 +60,6 @@ pub(crate) fn parse_sourced_args(input: ParseStream) -> syn::Result<SourcedArgs>
             }
             input.parse::<Token![=]>()?;
             domain_state = Some(input.parse::<Type>()?);
-        } else if kw == "enqueue" {
-            // Optional custom emitter field: enqueue(my_emitter)
-            if input.peek(syn::token::Paren) {
-                let inner;
-                syn::parenthesized!(inner in input);
-                enqueue = Some(inner.parse::<Ident>()?);
-            } else {
-                enqueue = Some(format_ident!("emitter"));
-            }
         } else if kw == "upcasters" {
             let upcaster_content;
             syn::parenthesized!(upcaster_content in input);
@@ -80,7 +68,7 @@ pub(crate) fn parse_sourced_args(input: ParseStream) -> syn::Result<SourcedArgs>
             return Err(syn::Error::new_spanned(
                 &kw,
                 format!(
-                    "unsupported key `{kw}` in #[sourced(...)]; expected `events`, `aggregate_type`, `domain_state`, `enqueue`, or `upcasters`"
+                    "unsupported key `{kw}` in #[sourced(...)]; expected `events`, `aggregate_type`, `domain_state`, or `upcasters`"
                 ),
             ));
         }
@@ -91,7 +79,6 @@ pub(crate) fn parse_sourced_args(input: ParseStream) -> syn::Result<SourcedArgs>
         enum_name,
         aggregate_type,
         domain_state,
-        enqueue,
         upcasters,
     })
 }
@@ -101,6 +88,9 @@ pub(crate) struct EventAttr {
     guard: Option<Expr>,
     version: Option<syn::LitInt>,
     domain: Option<DomainMode>,
+    /// `known(field: value, ..)`: state fields this recorder always leaves at
+    /// a fixed value, in the field grammar of `state_preview!`.
+    known: Option<TokenStream2>,
 }
 
 enum DomainMode {
@@ -115,6 +105,7 @@ pub(crate) fn parse_event_args(input: ParseStream) -> syn::Result<EventAttr> {
     let mut guard = None;
     let mut version: Option<syn::LitInt> = None;
     let mut domain = None;
+    let mut known: Option<(Ident, TokenStream2)> = None;
 
     while input.peek(Token![,]) {
         input.parse::<Token![,]>()?;
@@ -166,12 +157,44 @@ pub(crate) fn parse_event_args(input: ParseStream) -> syn::Result<EventAttr> {
             } else {
                 DomainMode::State
             });
+        } else if ident == "known" {
+            if known.is_some() {
+                return Err(syn::Error::new_spanned(
+                    &ident,
+                    "duplicate `known(...)` in #[event(...)]",
+                ));
+            }
+            let content;
+            syn::parenthesized!(content in input);
+            // `state_preview!` wants every field followed by one comma.
+            let mut fields: Vec<proc_macro2::TokenTree> =
+                content.parse::<TokenStream2>()?.into_iter().collect();
+            if matches!(fields.last(), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == ',')
+            {
+                fields.pop();
+            }
+            if fields.is_empty() {
+                return Err(syn::Error::new_spanned(
+                    &ident,
+                    "`known(...)` needs at least one `field: value`",
+                ));
+            }
+            known = Some((ident, quote!(#(#fields)* ,)));
         } else {
             return Err(syn::Error::new_spanned(
                 &ident,
                 format!(
-                    "unsupported key `{ident}` in #[event(...)]; expected `when`, `version`, or `domain`"
+                    "unsupported key `{ident}` in #[event(...)]; expected `when`, `version`, `domain`, or `known`"
                 ),
+            ));
+        }
+    }
+
+    if let Some((key, _)) = &known {
+        if !matches!(domain, Some(DomainMode::State)) {
+            return Err(syn::Error::new_spanned(
+                key,
+                "`known(...)` names fields of the domain state, so it needs `domain` (state mode) on the same #[event]",
             ));
         }
     }
@@ -193,6 +216,7 @@ pub(crate) fn parse_event_args(input: ParseStream) -> syn::Result<EventAttr> {
         guard,
         version,
         domain,
+        known: known.map(|(_, fields)| fields),
     })
 }
 
@@ -224,21 +248,7 @@ struct EventMethodInfo {
 struct DomainCommandEvent {
     domain_event_type: Type,
     domain_state: Option<Type>,
-    known_state_values: Vec<KnownStateValue>,
-    body_params: Vec<(Ident, Type)>,
-    known_body_values: Vec<KnownStateValue>,
-}
-
-#[derive(Clone)]
-struct KnownStateValue {
-    field: Ident,
-    source: KnownStateValueSource,
-}
-
-#[derive(Clone)]
-enum KnownStateValueSource {
-    Constant(Expr),
-    Null,
+    known: Option<TokenStream2>,
 }
 
 /// Public aggregate method that may capture one or more domain events.
@@ -254,7 +264,7 @@ struct DomainExpansion {
     uses_deletion_identity: bool,
 }
 
-fn ensure_domain_body_has_no_early_exit(block: &syn::Block) -> syn::Result<()> {
+fn ensure_recorder_body_has_no_early_exit(block: &syn::Block) -> syn::Result<()> {
     #[derive(Default)]
     struct EarlyExitVisitor {
         error: Option<syn::Error>,
@@ -265,7 +275,7 @@ fn ensure_domain_body_has_no_early_exit(block: &syn::Block) -> syn::Result<()> {
             if self.error.is_none() {
                 self.error = Some(syn::Error::new_spanned(
                     expression,
-                    "domain-marked #[event] methods cannot use `?` in version one because it may skip post-transition capture",
+                    "#[event] methods cannot use `?`: the event is already recorded when the body runs, so the body cannot fail",
                 ));
             }
         }
@@ -274,7 +284,7 @@ fn ensure_domain_body_has_no_early_exit(block: &syn::Block) -> syn::Result<()> {
             if self.error.is_none() {
                 self.error = Some(syn::Error::new_spanned(
                     expression,
-                    "domain-marked #[event] methods cannot use `return` in version one because it skips post-transition capture",
+                    "#[event] methods cannot use `return`: it would skip the rest of the recorded transition",
                 ));
             }
         }
@@ -288,9 +298,9 @@ fn ensure_domain_body_has_no_early_exit(block: &syn::Block) -> syn::Result<()> {
     }
 }
 
-fn domain_capture_error(expression: TokenStream2) -> TokenStream2 {
+fn domain_capture_error(framework: &TokenStream2, expression: TokenStream2) -> TokenStream2 {
     quote! {
-        #expression.map_err(|error| distributed::EventRecordError {
+        #expression.map_err(|error| #framework::EventRecordError {
             message: format!("domain-event capture failed: {error}"),
         })?;
     }
@@ -356,13 +366,16 @@ fn expand_domain_capture(
                 )
             })?;
             let event_type = identity_domain_event_type(aggregate, event_name)?;
-            let capture = domain_capture_error(quote! {
-                self.#entity_field.capture_domain_state(
-                    #aggregate_type,
-                    distributed::DomainEventDescriptor::state::<#state>(#event_name, #version),
-                    &__distributed_domain_state,
-                )
-            });
+            let capture = domain_capture_error(
+                &framework,
+                quote! {
+                    self.#entity_field.capture_domain_state(
+                        #aggregate_type,
+                        #framework::DomainEventDescriptor::state::<#state>(#event_name, #version),
+                        &__distributed_domain_state,
+                    )
+                },
+            );
             Ok(DomainExpansion {
                 prepare: TokenStream2::new(),
                 capture: quote! {
@@ -376,19 +389,19 @@ fn expand_domain_capture(
                     /// Exact outward event marker for this state-backed transition.
                     pub enum #event_type {}
 
-                    impl distributed::domain_event::DomainEventContract for #event_type {
+                    impl #framework::domain_event::DomainEventContract for #event_type {
                         const EVENT_NAME: &'static str = #event_name;
                         const EVENT_VERSION: u64 = #version;
 
-                        fn descriptor() -> distributed::DomainEventDescriptor {
-                            distributed::DomainEventDescriptor::state::<#state>(
+                        fn descriptor() -> #framework::DomainEventDescriptor {
+                            #framework::DomainEventDescriptor::state::<#state>(
                                 #event_name,
                                 #version,
                             )
                         }
                     }
 
-                    impl distributed::domain_event::DomainEventBodyContract<#state>
+                    impl #framework::domain_event::DomainEventBodyContract<#state>
                         for #event_type
                     {
                     }
@@ -432,13 +445,13 @@ fn expand_domain_capture(
                     #(#field_definitions),*
                 }
 
-                impl distributed::DomainEvent for #body_type {
-                    const DESCRIPTOR: distributed::DomainEventDescriptor =
-                        distributed::DomainEventDescriptor {
+                impl #framework::DomainEvent for #body_type {
+                    const DESCRIPTOR: #framework::DomainEventDescriptor =
+                        #framework::DomainEventDescriptor {
                             name: std::borrow::Cow::Borrowed(#event_name),
                             version: #version,
-                            body: distributed::DomainEventBodyDescriptor::distributed_json(
-                                distributed::DomainEventBodyKind::Event,
+                            body: #framework::DomainEventBodyDescriptor::distributed_json(
+                                #framework::DomainEventBodyKind::Event,
                                 #body_type_name,
                                 #version,
                                 #schema,
@@ -447,36 +460,39 @@ fn expand_domain_capture(
                         };
                 }
 
-                impl distributed::domain_event::DomainEventContract for #body_type {
+                impl #framework::domain_event::DomainEventContract for #body_type {
                     const EVENT_NAME: &'static str = #event_name;
                     const EVENT_VERSION: u64 = #version;
 
-                    fn descriptor() -> distributed::DomainEventDescriptor {
-                        <Self as distributed::DomainEvent>::DESCRIPTOR.clone()
+                    fn descriptor() -> #framework::DomainEventDescriptor {
+                        <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
                     }
                 }
 
-                impl distributed::domain_event::DomainEventBodyContract<Self> for #body_type {}
+                impl #framework::domain_event::DomainEventBodyContract<Self> for #body_type {}
 
-                impl distributed::command::CommandProjectionBody for #body_type {
+                impl #framework::command::CommandProjectionBody for #body_type {
                     fn command_projection_descriptor(
                         _: &'static str,
                         _: u64,
-                    ) -> distributed::DomainEventDescriptor {
-                        <Self as distributed::DomainEvent>::DESCRIPTOR.clone()
+                    ) -> #framework::DomainEventDescriptor {
+                        <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
                     }
                 }
 
-                impl distributed::projection::lower::ProjectionBodyMetadata for #body_type {
+                impl #framework::projection::lower::ProjectionBodyMetadata for #body_type {
                     #projection_metadata
                 }
             };
-            let capture = domain_capture_error(quote! {
-                self.#entity_field.capture_domain_event(
-                    #aggregate_type,
-                    &__distributed_domain_event_body,
-                )
-            });
+            let capture = domain_capture_error(
+                &framework,
+                quote! {
+                    self.#entity_field.capture_domain_event(
+                        #aggregate_type,
+                        &__distributed_domain_event_body,
+                    )
+                },
+            );
             Ok(DomainExpansion {
                 prepare: quote! {
                     let __distributed_domain_event_body =
@@ -521,16 +537,16 @@ fn expand_domain_capture(
                 /// Exact outward event marker for this deletion transition.
                 pub enum #event_type {}
 
-                impl distributed::domain_event::DomainEventContract for #event_type {
+                impl #framework::domain_event::DomainEventContract for #event_type {
                     const EVENT_NAME: &'static str = #event_name;
                     const EVENT_VERSION: u64 = #version;
 
-                    fn descriptor() -> distributed::DomainEventDescriptor {
-                        distributed::DomainEventDescriptor {
+                    fn descriptor() -> #framework::DomainEventDescriptor {
+                        #framework::DomainEventDescriptor {
                             name: std::borrow::Cow::Borrowed(#event_name),
                             version: #version,
-                            body: distributed::DomainEventBodyDescriptor::distributed_json(
-                                distributed::DomainEventBodyKind::Deletion,
+                            body: #framework::DomainEventBodyDescriptor::distributed_json(
+                                #framework::DomainEventBodyKind::Deletion,
                                 #deletion_type_name,
                                 1,
                                 #schema,
@@ -540,41 +556,44 @@ fn expand_domain_capture(
                     }
                 }
 
-                impl distributed::domain_event::DomainEventBodyContract<
-                    distributed::DomainDeletion<#identity>
+                impl #framework::domain_event::DomainEventBodyContract<
+                    #framework::DomainDeletion<#identity>
                 > for #event_type
                 {
                 }
             };
-            let capture = domain_capture_error(quote! {
-                self.#entity_field.capture_domain_deletion(
-                    #aggregate_type,
-                    distributed::DomainEventDescriptor {
-                        name: std::borrow::Cow::Borrowed(#event_name),
-                        version: #version,
-                        body: distributed::DomainEventBodyDescriptor::distributed_json(
-                            distributed::DomainEventBodyKind::Deletion,
-                            #deletion_type_name,
-                            1,
-                            #schema,
-                            #fingerprint,
-                        ),
-                    },
-                    &__distributed_domain_deletion,
-                )
-            });
+            let capture = domain_capture_error(
+                &framework,
+                quote! {
+                    self.#entity_field.capture_domain_deletion(
+                        #aggregate_type,
+                        #framework::DomainEventDescriptor {
+                            name: std::borrow::Cow::Borrowed(#event_name),
+                            version: #version,
+                            body: #framework::DomainEventBodyDescriptor::distributed_json(
+                                #framework::DomainEventBodyKind::Deletion,
+                                #deletion_type_name,
+                                1,
+                                #schema,
+                                #fingerprint,
+                            ),
+                        },
+                        &__distributed_domain_deletion,
+                    )
+                },
+            );
             Ok(DomainExpansion {
                 prepare: TokenStream2::new(),
                 capture: quote! {
                     if !self.#entity_field.is_replaying() {
                         let __distributed_domain_deletion =
-                            distributed::DomainDeletion::new(
+                            #framework::DomainDeletion::new(
                                 #identity {
                                     aggregate_id: self.#entity_field.id().to_owned(),
                                 },
                                 self.#entity_field.version(),
                             )
-                            .map_err(|error| distributed::EventRecordError {
+                            .map_err(|error| #framework::EventRecordError {
                                 message: format!("domain-event capture failed: {error}"),
                             })?;
                         #capture
@@ -592,12 +611,15 @@ fn expand_domain_capture(
                 let fields = params.iter().map(|(name, _)| quote!(#name: #name.clone()));
                 quote!(#event_enum::#variant { #(#fields),* })
             };
-            let capture = domain_capture_error(quote! {
-                self.#entity_field.capture_domain_event(
-                    #aggregate_type,
-                    &__distributed_domain_event_body,
-                )
-            });
+            let capture = domain_capture_error(
+                &framework,
+                quote! {
+                    self.#entity_field.capture_domain_event(
+                        #aggregate_type,
+                        &__distributed_domain_event_body,
+                    )
+                },
+            );
             Ok(DomainExpansion {
                 prepare: quote! {
                     let __distributed_domain_event_source =
@@ -609,8 +631,8 @@ fn expand_domain_capture(
                     {
                         fn __distributed_assert_domain_event_contract<T>()
                         where
-                            T: distributed::DomainEvent
-                                + distributed::domain_event::DomainEventBodyContract<T>,
+                            T: #framework::DomainEvent
+                                + #framework::domain_event::DomainEventBodyContract<T>,
                         {
                         }
                         __distributed_assert_domain_event_contract::<#output>();
@@ -621,10 +643,10 @@ fn expand_domain_capture(
                                 &*self,
                                 __distributed_domain_event_source,
                             );
-                        if <#output as distributed::domain_event::DomainEventContract>::descriptor()
-                            != <#output as distributed::DomainEvent>::DESCRIPTOR
+                        if <#output as #framework::domain_event::DomainEventContract>::descriptor()
+                            != <#output as #framework::DomainEvent>::DESCRIPTOR
                         {
-                            return Err(distributed::EventRecordError {
+                            return Err(#framework::EventRecordError {
                                 message: "domain-event capture failed: adapter output contract differs from its DomainEvent descriptor".to_owned(),
                             });
                         }
@@ -653,12 +675,12 @@ fn expand_domain_capture(
                         }
 
                         if !__distributed_same_str(
-                            <#output as distributed::domain_event::DomainEventContract>::EVENT_NAME,
+                            <#output as #framework::domain_event::DomainEventContract>::EVENT_NAME,
                             #event_name,
                         ) {
                             panic!("domain adapter output event name differs from #[event]");
                         }
-                        if <#output as distributed::domain_event::DomainEventContract>::EVENT_VERSION
+                        if <#output as #framework::domain_event::DomainEventContract>::EVENT_VERSION
                             != #version
                         {
                             panic!("domain adapter output event version differs from #[event]");
@@ -758,40 +780,14 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                     }
                     seen_variants.insert(variant.to_string(), event_attr.event_name.clone());
 
-                    if event_attr.domain.is_some()
-                        && !matches!(method.sig.output, syn::ReturnType::Default)
-                    {
-                        return Err(syn::Error::new_spanned(
-                            &method.sig.output,
-                            "domain-marked #[event] methods must omit the return type in version one; fallible recorders cannot prove post-transition capture safety",
-                        ));
-                    }
-                    if event_attr.domain.is_some() {
-                        ensure_domain_body_has_no_early_exit(&method.block)?;
-                    }
+                    ensure_infallible_recorder_signature(&mut method.sig, &framework)?;
+                    ensure_recorder_body_has_no_early_exit(&method.block)?;
                     let state_domain =
                         matches!(event_attr.domain.as_ref(), Some(DomainMode::State));
-                    let known_state_values = if state_domain {
-                        infer_unconditional_known_state_values(&method.block)
-                    } else {
-                        Vec::new()
-                    };
-                    let signature_synthesized =
-                        ensure_sourced_result_signature(&mut method.sig, "event", &framework)?;
-
                     let params = extract_params_with_types(&method.sig, "event")?;
                     let param_name_refs: Vec<&Ident> =
                         params.iter().map(|(name, _)| name).collect();
 
-                    // Build prepend: optional enqueue + digest
-                    let enqueue_call = args.enqueue.as_ref().map(|emitter_field| {
-                        generate_enqueue_call(
-                            &args.entity_field,
-                            emitter_field,
-                            &event_attr.event_name,
-                            &param_name_refs,
-                        )
-                    });
                     let digest_call = generate_digest_call(
                         &args.entity_field,
                         &event_attr.event_name,
@@ -814,17 +810,15 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                     let domain_prepare = domain.prepare;
                     let domain_capture = domain.capture;
                     let prepend = quote! {
-                        #enqueue_call
                         #digest_call
                         #domain_prepare
                     };
 
-                    let new_body = wrap_result_body_with_guard_and_postlude(
+                    let new_body = wrap_recorder_body(
                         event_attr.guard.as_ref(),
                         prepend,
                         &method.block,
                         domain_capture,
-                        signature_synthesized,
                     );
                     method.block = new_body;
 
@@ -842,13 +836,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                         Some(DomainCommandEvent {
                             domain_event_type,
                             domain_state: state_domain.then(|| args.domain_state.clone()).flatten(),
-                            known_state_values,
-                            body_params: if matches!(event_attr.domain, Some(DomainMode::Event)) {
-                                params.clone()
-                            } else {
-                                Vec::new()
-                            },
-                            known_body_values: Vec::new(),
+                            known: event_attr.known.clone(),
                         })
                     } else {
                         None
@@ -927,7 +915,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                 pub aggregate_id: String,
             }
 
-            impl distributed::projection::lower::ProjectionDeletionMetadata for #identity {
+            impl #framework::projection::lower::ProjectionDeletionMetadata for #identity {
                 const BODY_TYPE_NAME: &'static str = #deletion_type_name;
                 const BODY_SCHEMA: &'static str = #deletion_schema;
                 const BODY_FINGERPRINT: &'static str = #deletion_fingerprint;
@@ -1005,9 +993,9 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
     });
 
     let try_from_impl = quote! {
-        impl TryFrom<&distributed::EventRecord> for #enum_name {
+        impl TryFrom<&#framework::EventRecord> for #enum_name {
             type Error = String;
-            fn try_from(event: &distributed::EventRecord) -> Result<Self, Self::Error> {
+            fn try_from(event: &#framework::EventRecord) -> Result<Self, Self::Error> {
                 match event.event_name.as_str() {
                     #(#try_from_arms)*
                     _ => Err(format!("Unknown event: {}", event.event_name)),
@@ -1058,7 +1046,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
         .collect();
 
     let (upcaster_wrappers, upcasters_method) =
-        generate_upcaster_tokens(&struct_name, &args.upcasters);
+        generate_upcaster_tokens(&framework, &struct_name, &args.upcasters);
     let aggregate_type_method = args.aggregate_type.as_ref().map(|aggregate_type| {
         quote! {
             fn aggregate_type() -> &'static str {
@@ -1069,6 +1057,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
 
     // ReplayError stays `String` — see the rationale on `expand_aggregate`.
     let aggregate_impl = aggregate_impl_tokens(
+        &framework,
         &struct_name,
         entity_field,
         &aggregate_type_method,
@@ -1078,7 +1067,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
     );
 
     let domain_commands_module =
-        expand_domain_commands_module(&struct_name, &domain_command_transitions);
+        expand_domain_commands_module(&framework, &struct_name, &domain_command_transitions);
 
     let expanded = quote! {
         #impl_block
@@ -1094,97 +1083,6 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
     };
 
     Ok(expanded)
-}
-
-/// Collect only straight-line recorder assignments whose serialized value is
-/// independent of command input and current aggregate state. Nested control
-/// flow and arbitrary Rust expressions deliberately remain unknown.
-fn infer_unconditional_known_state_values(block: &syn::Block) -> Vec<KnownStateValue> {
-    let mut values =
-        std::collections::BTreeMap::<String, (Ident, Option<KnownStateValueSource>)>::new();
-    for statement in &block.stmts {
-        let Stmt::Expr(Expr::Assign(assign), _) = statement else {
-            continue;
-        };
-        let Expr::Field(field) = ungroup_expr(&assign.left) else {
-            continue;
-        };
-        if !is_self_receiver(&field.base) {
-            continue;
-        }
-        let Member::Named(name) = &field.member else {
-            continue;
-        };
-        values.insert(
-            name.to_string(),
-            (name.clone(), known_state_value_source(&assign.right)),
-        );
-    }
-    values
-        .into_values()
-        .filter_map(|(field, source)| source.map(|source| KnownStateValue { field, source }))
-        .collect()
-}
-
-fn known_state_value_source(expression: &Expr) -> Option<KnownStateValueSource> {
-    let expression = ungroup_expr(expression);
-    match expression {
-        Expr::Path(path) if path.path.is_ident("None") => Some(KnownStateValueSource::Null),
-        // Qualified paths cover enum variants and associated constants without
-        // treating a local variable as a compile-time value.
-        Expr::Path(path) if path.path.segments.len() >= 2 => {
-            Some(KnownStateValueSource::Constant(expression.clone()))
-        }
-        Expr::Lit(literal)
-            if matches!(
-                literal.lit,
-                syn::Lit::Bool(_) | syn::Lit::Str(_) | syn::Lit::Char(_)
-            ) =>
-        {
-            Some(KnownStateValueSource::Constant(expression.clone()))
-        }
-        Expr::Call(call)
-            if call.args.len() == 1
-                && matches!(
-                    ungroup_expr(&call.func),
-                    Expr::Path(path)
-                        if path.path.segments.len() == 4
-                            && path.path.segments[0].ident == "std"
-                            && path.path.segments[1].ident == "string"
-                            && path.path.segments[2].ident == "String"
-                            && path.path.segments[3].ident == "from"
-                )
-                && matches!(
-                    call.args.first().map(ungroup_expr),
-                    Some(Expr::Lit(syn::ExprLit {
-                        lit: syn::Lit::Str(_),
-                        ..
-                    }))
-                ) =>
-        {
-            Some(KnownStateValueSource::Constant(expression.clone()))
-        }
-        Expr::Call(call)
-            if call.args.len() == 1
-                && matches!(
-                    ungroup_expr(&call.func),
-                    Expr::Path(path) if path.path.is_ident("Some")
-                )
-                && known_state_value_source(call.args.first().expect("one Some argument"))
-                    .is_some() =>
-        {
-            Some(KnownStateValueSource::Constant(expression.clone()))
-        }
-        _ => None,
-    }
-}
-
-fn ungroup_expr(expression: &Expr) -> &Expr {
-    match expression {
-        Expr::Paren(paren) => ungroup_expr(&paren.expr),
-        Expr::Group(group) => ungroup_expr(&group.expr),
-        other => other,
-    }
 }
 
 fn discover_domain_command_transitions(
@@ -1271,156 +1169,16 @@ impl<'ast> Visit<'ast> for DomainEventCallFinder<'_> {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if is_self_receiver(&node.receiver) {
             if let Some(command_event) = self.recorders.get(&node.method.to_string()) {
-                let mut candidate = command_event.clone();
-                candidate.known_body_values = candidate
-                    .body_params
-                    .iter()
-                    .zip(&node.args)
-                    .filter_map(|((field, ty), arg)| {
-                        flat_literal(arg, ty).map(|source| KnownStateValue {
-                            field: field.clone(),
-                            source,
-                        })
-                    })
-                    .collect();
                 let event_type = &command_event.domain_event_type;
                 self.found
                     .entry(quote!(#event_type).to_string())
-                    .and_modify(|existing| {
-                        // A single event type can occur more than once, including
-                        // through branches. Only values shared by every call are known.
-                        existing.known_body_values.retain(|value| {
-                            candidate.known_body_values.iter().any(|other| {
-                                value.field == other.field
-                                    && same_known_value(&value.source, &other.source)
-                            })
-                        });
-                    })
-                    .or_insert(candidate);
+                    .or_insert_with(|| command_event.clone());
             } else {
                 self.calls.insert(node.method.to_string());
             }
         }
         syn::visit::visit_expr_method_call(self, node);
     }
-}
-
-fn same_known_value(left: &KnownStateValueSource, right: &KnownStateValueSource) -> bool {
-    match (left, right) {
-        (KnownStateValueSource::Null, KnownStateValueSource::Null) => true,
-        (KnownStateValueSource::Constant(left), KnownStateValueSource::Constant(right)) => {
-            quote!(#left).to_string() == quote!(#right).to_string()
-        }
-        _ => false,
-    }
-}
-
-/// Recognize data, not executable expressions. In particular, never hoist
-/// arbitrary calls/paths or replay a user conversion while building metadata.
-fn flat_literal(expression: &Expr, ty: &Type) -> Option<KnownStateValueSource> {
-    let Type::Path(ty) = ty else { return None };
-    let segment = ty.path.segments.last()?;
-    let name = segment.ident.to_string();
-    let path = ty
-        .path
-        .segments
-        .iter()
-        .map(|part| part.ident.to_string())
-        .collect::<Vec<_>>()
-        .join("::");
-    let standard = path == name
-        || match name.as_str() {
-            "String" => matches!(
-                path.as_str(),
-                "std::string::String" | "alloc::string::String"
-            ),
-            "Option" => matches!(
-                path.as_str(),
-                "std::option::Option" | "core::option::Option"
-            ),
-            _ => {
-                path == format!("core::primitive::{name}")
-                    || path == format!("std::primitive::{name}")
-            }
-        };
-    if !standard {
-        return None;
-    }
-    let expression = ungroup_expr(expression);
-    if name == "Option" {
-        let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
-            return None;
-        };
-        let Some(syn::GenericArgument::Type(inner)) = args.args.first() else {
-            return None;
-        };
-        if matches!(expression, Expr::Path(path) if standard_option_variant(&path.path, "None")) {
-            return Some(KnownStateValueSource::Null);
-        }
-        if let Expr::Call(call) = expression {
-            if call.args.len() == 1
-                && matches!(&*call.func, Expr::Path(path) if standard_option_variant(&path.path, "Some"))
-            {
-                return flat_literal(call.args.first()?, inner);
-            }
-        }
-        return None;
-    }
-    let literal = match expression {
-        Expr::Lit(literal) => literal,
-        Expr::MethodCall(call)
-            if name == "String"
-                && call.args.is_empty()
-                && call.turbofish.is_none()
-                && matches!(
-                    call.method.to_string().as_str(),
-                    "into" | "to_owned" | "to_string"
-                ) =>
-        {
-            let Expr::Lit(literal) = ungroup_expr(&call.receiver) else {
-                return None;
-            };
-            literal
-        }
-        _ => return None,
-    };
-    let supported = match &literal.lit {
-        syn::Lit::Str(_) => name == "String",
-        syn::Lit::Bool(_) => name == "bool",
-        syn::Lit::Char(_) => name == "char",
-        syn::Lit::Int(_) => matches!(
-            name.as_str(),
-            "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize"
-        ),
-        syn::Lit::Float(_) => matches!(name.as_str(), "f32" | "f64"),
-        _ => false,
-    };
-    supported.then(|| {
-        let expression = if matches!(&literal.lit, syn::Lit::Int(_) | syn::Lit::Float(_)) {
-            let primitive = &segment.ident;
-            // Preserve contextual numeric typing (notably unsuffixed f32 and
-            // large u64 literals) without evaluating a user-defined conversion.
-            syn::parse_quote!({ let value: ::core::primitive::#primitive = #literal; value })
-        } else {
-            Expr::Lit(literal.clone())
-        };
-        KnownStateValueSource::Constant(expression)
-    })
-}
-
-fn standard_option_variant(path: &syn::Path, variant: &str) -> bool {
-    // Bare Some/None can be locally shadowed; do not execute or guess them.
-    let names = path
-        .segments
-        .iter()
-        .map(|part| part.ident.to_string())
-        .collect::<Vec<_>>();
-    path.leading_colon.is_some()
-        && names.len() == 4
-        && matches!(names[0].as_str(), "core" | "std")
-        && names[1] == "option"
-        && names[2] == "Option"
-        && names[3] == variant
 }
 
 fn is_self_receiver(expression: &Expr) -> bool {
@@ -1449,6 +1207,7 @@ fn method_name_to_type_ident(method_name: &Ident) -> Ident {
 }
 
 fn expand_domain_commands_module(
+    framework: &TokenStream2,
     aggregate: &Ident,
     transitions: &[DomainCommandTransition],
 ) -> TokenStream2 {
@@ -1467,40 +1226,21 @@ fn expand_domain_commands_module(
             .iter()
             .map(|event| &event.domain_event_type)
             .collect::<Vec<_>>();
+        // `known(..)` on a state recorder: declared once next to the
+        // transition, checked against the state's fields when the command is
+        // registered.
         let known_value_items = transition.events.iter().filter_map(|event| {
-            let values = if event.domain_state.is_some() { &event.known_state_values } else { &event.known_body_values };
-            if values.is_empty() {
-                return None;
-            }
+            let (fields, state) = (event.known.as_ref()?, event.domain_state.as_ref()?);
             let event_type = &event.domain_event_type;
-            let helper = if let Some(state) = &event.domain_state {
-                quote!(distributed::command::__command_projection_state_known_values::<#event_type, #state>)
-            } else {
-                quote!(distributed::command::__command_projection_event_preview::<#event_type, #event_type>)
-            };
-            let fields = values.iter().map(|value| {
-                let field = value.field.to_string();
-                let source = match &value.source {
-                    KnownStateValueSource::Constant(expression) => quote! {
-                        distributed::command::__command_projection_preview_constant(#expression)
-                    },
-                    KnownStateValueSource::Null => quote! {
-                        distributed::command::CommandProjectionPreviewSource::Null
-                    },
-                };
-                quote! { (#field, #source) }
-            });
             Some(quote! {
-                #helper(vec![#(#fields),*])
+                #framework::state_preview! { #event_type => #state { #fields } }
             })
         });
-        let has_known_values = transition.events.iter().any(|event| {
-            !event.known_state_values.is_empty() || !event.known_body_values.is_empty()
-        });
+        let has_known_values = transition.events.iter().any(|event| event.known.is_some());
         let known_values_method = has_known_values.then(|| {
             quote! {
                 fn command_event_known_values(
-                ) -> Vec<distributed::command::CommandProjectionPreview> {
+                ) -> Vec<#framework::command::CommandProjectionPreview> {
                     vec![#(#known_value_items),*]
                 }
             }
@@ -1520,11 +1260,11 @@ fn expand_domain_commands_module(
         // would silently change its meaning (and generated aliases do not exist
         // for custom bodies). The public witness still lives in that module.
         transition_impls.push(quote! {
-            impl distributed::command::CommandEventSet for domain_commands::#type_name {
-                fn command_event_set() -> distributed::command::CommandProjectionEventSet {
-                    distributed::command::__command_projection_events([
+            impl #framework::command::CommandEventSet for domain_commands::#type_name {
+                fn command_event_set() -> #framework::command::CommandProjectionEventSet {
+                    #framework::command::__command_projection_events([
                         #(
-                            distributed::command::__command_projection_event_descriptor::<
+                            #framework::command::__command_projection_event_descriptor::<
                                 #event_types,
                             >()
                         ),*

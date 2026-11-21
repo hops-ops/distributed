@@ -22,16 +22,6 @@ impl Todo {
         self.completed = true;
     }
 
-    #[event("tail_validated")]
-    pub fn validate_tail(&mut self) {
-        self.completed = true;
-        self.tail_check()?
-    }
-
-    fn tail_check(&self) -> distributed::SourcedResult {
-        Ok(())
-    }
-
     // Non-event method should pass through unchanged
     pub fn snapshot(&self) -> TodoSnapshot {
         TodoSnapshot {
